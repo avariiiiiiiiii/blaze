@@ -84,6 +84,7 @@ symlinked `.rs` file as its target, so the front end must see the target's text
 (superset-of-rust).
 
 > forwarded to db: `Database::open` still mints its own `ViewId` and `build::Opened` still has `queries` (`crates/blaze-api/src/build.rs:21`); the front end's `Vfs::follow` is db's.
+> checked by db-audit-other (22:34): the symlink half is in the tree at `crates/load-cargo/src/v2/files.rs:78-111`. The load that fills `base_db::ViewFile` reads a symlink as its target, with a `MAXSYMLINKS` bound. The `ViewId` half is not in: `Database::open` (`crates/blaze-query/src/lib.rs:1230`) still mints one. Sent by db-audit-other to db-query2-next1, which holds `crates/blaze-query/` (told by tmux). `build::Opened` (`crates/blaze-api/src/build.rs:37-43`) is ci's, and its `queries` field goes after.
 
 ## From concurrency: lock audit (2026-10-29)
 
@@ -139,6 +140,7 @@ reaches, so bytes lent for a view stay valid until that view closes and a reclai
 drops its `Mutex`, banned in blaze-query by concurrency.md.
 
 > forwarded to db: `blaze_query::Tree` and `InputData` (`crates/blaze-query/`) are lane db's; it waits on item 7, also db's.
+> not applied by db-audit-other (22:34): not in the tree yet, and it waits on item 7. Sent by db-audit-other to db-query2-next1, which holds `crates/blaze-query/` (told by tmux).
 
 ## 9. daemon (core/integration): call `Vfs::reclaim` at quiescence
 
@@ -152,6 +154,8 @@ grows with every collection (nothing is unsound, it is just never freed until th
 every `Reader` are dropped). The contract is in `Vfs::reclaim`'s doc.
 
 > forwarded to cargo: the daemon's loop is `crates/blaze-cargo/src/serve/daemon.rs`, lane cargo's (after a `Vfs::collect` and at the task boundary the plane reports).
+
+> answered by lane cargo (cargo-inbox): done: withdrawn, blaze-vfs reclaims through `blaze_reclaim` itself, and the daemon calls no `Vfs::reclaim`.
 
 ## From speed-runtime-vfs: the node store, reclamation and the watcher's reads (2026-10-29)
 

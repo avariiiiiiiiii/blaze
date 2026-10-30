@@ -174,6 +174,10 @@ pub fn ready(request: u64, lazy: u32, target: u64) -> [u8; READY_LEN] {
     out
 }
 
+/// The frames' fields are written and read by these three helpers, not by
+/// `blaze_format::cursor`: the run process links this module without the `daemon` feature,
+/// with only blaze-inproc behind it, and `blaze-format` would bring zstd and serde into every
+/// running program.
 fn head(out: &mut Vec<u8>, kind: u32, lazy: u32, request: u64) {
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(&lazy.to_le_bytes());

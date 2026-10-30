@@ -12,7 +12,7 @@ use crate::{
     next_solver::{Const, DbInterner, ErrorGuaranteed, Region, RegionExt, StoredTy, Ty, TyKind},
 };
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// `expected` and `found` with what is known of them now, the types of undecided numeric
     /// literals as `FreshIntTy` / `FreshFloatTy` and any other variable an error; `None` when
     /// neither holds such a literal's type, so writeback's resolved types say the same.

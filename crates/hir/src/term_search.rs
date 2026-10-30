@@ -1,5 +1,7 @@
 //! Term search
 
+use std::collections::hash_map::Entry;
+
 use base_db::Db;
 use hir_def::type_ref::Mutability;
 use hir_ide::db::HirDatabase;
@@ -48,8 +50,18 @@ impl<'db> AlternativeExprs<'db> {
     /// `ty` - Type of expressions queried (this is used to give type to `Expr::Many`)
     fn exprs(&self, ty: &Type<'db>) -> Vec<Expr<'db>> {
         match self {
+            // alloc: the candidates a tactic combines; the table is written to while they live.
             AlternativeExprs::Few(exprs) => exprs.iter().cloned().collect(),
+            // alloc: the one candidate; clone: `Type` is an ID and an interned `Ty` (`Copy` requested)
             AlternativeExprs::Many => vec![Expr::Many(ty.clone())],
+        }
+    }
+
+    /// How many expressions `exprs` would return.
+    fn len(&self) -> usize {
+        match self {
+            AlternativeExprs::Few(exprs) => exprs.len(),
+            AlternativeExprs::Many => 1,
         }
     }
 
@@ -104,32 +116,28 @@ impl<'db> LookupTable<'db> {
     /// Initialize lookup table
     fn new(many_threshold: usize, goal: Type<'db>) -> Self {
         let mut res = Self { many_threshold, ..Default::default() };
-        res.new_types.insert(NewTypesKey::ImplMethod, Vec::new());
-        res.new_types.insert(NewTypesKey::StructProjection, Vec::new());
+        res.new_types.insert(NewTypesKey::ImplMethod, Vec::new()); // alloc: empty
+        res.new_types.insert(NewTypesKey::StructProjection, Vec::new()); // alloc: empty
         res.types_wishlist.insert(goal);
         res
     }
 
     /// Find all `Expr`s that unify with the `ty`
     fn find(&mut self, db: &'db Db, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
-        let res = self
-            .data
-            .iter()
-            .find(|(t, _)| t.could_unify_with_deeply(db, ty))
-            .map(|(t, tts)| tts.exprs(t));
-
-        if res.is_none() {
+        let Some((t, tts)) = self.data.iter().find(|(t, _)| t.could_unify_with_deeply(db, ty))
+        else {
+            // clone: `Type` is an ID and an interned `Ty`, no allocation (`Copy` requested)
             self.types_wishlist.insert(ty.clone());
-        }
+            return None;
+        };
 
         // Collapse suggestions if there are many
-        if let Some(res) = &res
-            && res.len() > self.many_threshold
-        {
+        if tts.len() > self.many_threshold {
+            // alloc: the one candidate; clone: `Type` is an ID and an interned `Ty`
             return Some(vec![Expr::Many(ty.clone())]);
         }
 
-        res
+        Some(tts.exprs(t))
     }
 
     /// Same as find but automatically creates shared reference of types in the lookup
@@ -137,37 +145,30 @@ impl<'db> LookupTable<'db> {
     /// For example if we have type `i32` in data and we query for `&i32` it map all the type
     /// trees we have for `i32` with `Expr::Reference` and returns them.
     fn find_autoref(&mut self, db: &'db Db, ty: &Type<'db>) -> Option<Vec<Expr<'db>>> {
-        let res = self
-            .data
-            .iter()
-            .find(|(t, _)| t.could_unify_with_deeply(db, ty))
-            .map(|(t, it)| it.exprs(t))
-            .or_else(|| {
-                self.data
-                    .iter()
-                    .find(|(t, _)| {
-                        t.add_reference(db, Mutability::Shared).could_unify_with_deeply(db, ty)
-                    })
-                    .map(|(t, it)| {
-                        it.exprs(t)
-                            .into_iter()
-                            .map(|expr| Expr::Reference(Box::new(expr)))
-                            .collect()
-                    })
-            });
-
-        if res.is_none() {
-            self.types_wishlist.insert(ty.clone());
+        if let Some((t, tts)) = self.data.iter().find(|(t, _)| t.could_unify_with_deeply(db, ty)) {
+            // Collapse suggestions if there are many
+            if tts.len() > self.many_threshold {
+                // alloc: the one candidate; clone: `Type` is an ID and an interned `Ty`
+                return Some(vec![Expr::Many(ty.clone())]);
+            }
+            return Some(tts.exprs(t));
         }
 
-        // Collapse suggestions if there are many
-        if let Some(res) = &res
-            && res.len() > self.many_threshold
-        {
-            return Some(vec![Expr::Many(ty.clone())]);
+        if let Some((t, tts)) = self.data.iter().find(|(t, _)| {
+            t.add_reference(db, Mutability::Shared).could_unify_with_deeply(db, ty)
+        }) {
+            if tts.len() > self.many_threshold {
+                // alloc: the one candidate; clone: `Type` is an ID and an interned `Ty`
+                return Some(vec![Expr::Many(ty.clone())]);
+            }
+            let exprs = tts.exprs(t).into_iter();
+            // alloc: collected in place over `exprs`'s buffer, a box per candidate's `&`
+            return Some(exprs.map(|expr| Expr::Reference(Box::new(expr))).collect());
         }
 
-        res
+        // clone: `Type` is an ID and an interned `Ty`, no allocation (`Copy` requested)
+        self.types_wishlist.insert(ty.clone());
+        None
     }
 
     /// Insert new type trees for type
@@ -182,40 +183,39 @@ impl<'db> LookupTable<'db> {
         exprs: impl Iterator<Item = Expr<'db>>,
     ) {
         let ty = ty.instantiate_with_errors(db);
-        match self.data.get_mut(&ty) {
-            Some(it) => {
+        match self.data.entry(ty) {
+            Entry::Occupied(mut entry) => {
+                let it = entry.get_mut();
                 it.extend_with_threshold(self.many_threshold, exprs);
                 if it.is_many() {
-                    self.types_wishlist.remove(&ty);
+                    self.types_wishlist.remove(entry.key());
                 }
             }
-            None => {
-                self.data.insert(ty.clone(), AlternativeExprs::new(self.many_threshold, exprs));
+            Entry::Vacant(entry) => {
                 for it in self.new_types.values_mut() {
-                    it.push(ty.clone());
+                    // clone: `Type` is an ID and an interned `Ty`, no allocation (`Copy` requested)
+                    it.push(entry.key().clone());
                 }
+                entry.insert(AlternativeExprs::new(self.many_threshold, exprs));
             }
         }
     }
 
-    /// Iterate all the reachable types
-    fn iter_types(&self) -> impl Iterator<Item = Type<'db>> + '_ {
-        self.data.keys().cloned()
-    }
-
-    /// Query new types reached since last query by key
+    /// Query new types reached since last query by key, into `out` (cleared first); the
+    /// table keeps `out`'s old buffer for the next types it reaches.
     ///
     /// Create new key if you wish to query it to avoid conflicting with existing queries.
-    fn new_types(&mut self, key: NewTypesKey) -> Vec<Type<'db>> {
-        match self.new_types.get_mut(&key) {
-            Some(it) => std::mem::take(it),
-            None => Vec::new(),
+    fn new_types(&mut self, key: NewTypesKey, out: &mut Vec<Type<'db>>) {
+        out.clear();
+        if let Some(it) = self.new_types.get_mut(&key) {
+            std::mem::swap(it, out);
         }
     }
 
-    /// Types queried but not found
-    fn types_wishlist(&mut self) -> &FxHashSet<Type<'db>> {
-        &self.types_wishlist
+    /// Fill `out` (cleared first) with the types queried but not found, in the set's order.
+    fn wishlist_into(&self, out: &mut Vec<Type<'db>>) {
+        out.clear();
+        out.extend(self.types_wishlist.iter().cloned());
     }
 }
 
@@ -244,6 +244,25 @@ pub struct TermSearchConfig {
 impl Default for TermSearchConfig {
     fn default() -> Self {
         Self { many_alternatives_threshold: 1, fuel: 1200 }
+    }
+}
+
+/// The units of work a term search has left: it stops iterating when they run out.
+struct Fuel(std::cell::Cell<u64>);
+
+impl Fuel {
+    fn new(units: u64) -> Fuel {
+        Fuel(std::cell::Cell::new(units))
+    }
+
+    /// Spends a unit; whether there was one to spend.
+    fn should_continue(&self) -> bool {
+        let remaining = self.0.get();
+        self.0.set(remaining.saturating_sub(1));
+        if remaining == 0 {
+            tracing::debug!("fuel exhausted");
+        }
+        remaining > 0
     }
 }
 
@@ -277,32 +296,43 @@ pub fn term_search<'db>(ctx: &TermSearchCtx<'_, 'db>) -> Vec<Expr<'db>> {
         defs.insert(def);
     });
 
+    // clone: once a search; `Type` is an ID and an interned `Ty` (`Copy` requested)
     let mut lookup = LookupTable::new(ctx.config.many_alternatives_threshold, ctx.goal.clone());
-    let fuel = std::cell::Cell::new(ctx.config.fuel);
-
-    let should_continue = &|| {
-        let remaining = fuel.get();
-        fuel.set(remaining.saturating_sub(1));
-        if remaining == 0 {
-            tracing::debug!("fuel exhausted");
-        }
-        remaining > 0
-    };
+    let fuel = &Fuel::new(ctx.config.fuel);
+    // The types each tactic walks this iteration, reused across tactics and iterations.
+    let mut types = Vec::new(); // alloc: empty
 
     // Try trivial tactic first, also populates lookup table
+    // alloc: the result list, once a search
     let mut solutions: Vec<Expr<'db>> = tactics::trivial(ctx, &defs, &mut lookup).collect();
     // Use well known types tactic before iterations as it does not depend on other tactics
     solutions.extend(tactics::famous_types(ctx, &defs, &mut lookup));
     solutions.extend(tactics::assoc_const(ctx, &defs, &mut lookup));
 
-    while should_continue() {
-        solutions.extend(tactics::data_constructor(ctx, &defs, &mut lookup, should_continue));
-        solutions.extend(tactics::free_function(ctx, &defs, &mut lookup, should_continue));
-        solutions.extend(tactics::impl_method(ctx, &defs, &mut lookup, should_continue));
-        solutions.extend(tactics::struct_projection(ctx, &defs, &mut lookup, should_continue));
-        solutions.extend(tactics::impl_static_method(ctx, &defs, &mut lookup, should_continue));
-        solutions.extend(tactics::make_tuple(ctx, &defs, &mut lookup, should_continue));
+    while fuel.should_continue() {
+        solutions.extend(tactics::data_constructor(ctx, &defs, &mut lookup, &mut types, fuel));
+        solutions.extend(tactics::free_function(ctx, &defs, &mut lookup, fuel));
+        solutions.extend(tactics::impl_method(ctx, &defs, &mut lookup, &mut types, fuel));
+        solutions.extend(tactics::struct_projection(ctx, &defs, &mut lookup, &mut types, fuel));
+        solutions.extend(tactics::impl_static_method(ctx, &defs, &mut lookup, &mut types, fuel));
+        solutions.extend(tactics::make_tuple(ctx, &defs, &mut lookup, &mut types, fuel));
     }
 
+    // alloc: the returned suggestions, once a search
     solutions.into_iter().filter(|it| !it.is_many()).unique().collect()
+}
+
+#[cfg(test)]
+mod fuel_tests {
+    use super::Fuel;
+
+    #[test]
+    fn fuel_lets_as_many_steps_as_it_has_units() {
+        let fuel = Fuel::new(2);
+        assert!(fuel.should_continue());
+        assert!(fuel.should_continue());
+        assert!(!fuel.should_continue());
+        assert!(!fuel.should_continue(), "spent fuel stays spent");
+        assert!(!Fuel::new(0).should_continue());
+    }
 }

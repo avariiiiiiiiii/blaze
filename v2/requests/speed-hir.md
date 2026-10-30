@@ -379,6 +379,7 @@ hold them. Status: scheduled by speed-hir-store (2026-10-29 18:50).
   and stmts writes hir-ty-mir's edits on top of the pending codegen request.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> mem-format-fwd: already in. Statements are columns with `Statement<'a>`/`Statements<'a>` views (`hir.rs`, `hir/columns.rs`, `Lists::statements_since`); the back maps are `BackPushes` frozen into dense `BackMap` columns and `patterns_for_binding` is the CSR `BindingPats` (`expr_store/source_map.rs`), encoded in `expr_store/persist/source_map.rs`; paths are `PathColumns` rows named by `PathIdx` with `Path<'_>` views (`expr_store/path.rs`).
 
 ## for speed-hir-items (from speed-hir): `Attr::path` is `ModPath` now
 
@@ -501,6 +502,12 @@ table read only on demand.
 > `hir-ty-mir/src/mir/lower.rs:4467`, `hir-ty-codegen/places.rs:160,228`, `unmoved_source_map`)
 > is lowered twice, once per query.
 
+> applied (signatures, db's part): by db-expand-sigs; see `v2/requests/db.md` "frontend: what
+> frontend.md items 7-12", item 6. `*Signature::of` lowers with `BodyLowering::Body` (no map)
+> into its memo, `with_source_map` lowers again with the map and asserts the signature equal,
+> and `signatures/alone_tests.rs` covers every signature fixture. Left: `relative`/
+> `with_source_map` still return `Arc<Self>`. Checked by db-next2, 2026-10-29 22:18.
+
 ## speed-hir-store-srcmap: format_args and asm skip the source map too (to speed-hir-store-lower)
 
 What: `crates/hir-def/src/expr_store/lower/format_args.rs` (the `template_map` pushes at :73 and
@@ -516,6 +523,7 @@ Why: a body with a `format_args!` lowered by `Body::of` (no map) still allocates
 > into a local per macro). Without it the `mappings` vectors stay empty too: `format_args!`'s
 > capture spans aren't pushed, and `asm!` doesn't grow one vector per template piece.
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> mem-format-fwd: already in (`expr_store/lower/format_args.rs` L61 `let record = self.store.record;`, its writes at ~L80, ~L93, ~L114, ~L585; `expr_store/lower/asm.rs` L196, ~L232, ~L366).
 
 ## speed-hir-store-srcmap: invalidation (b) after `Body::of` stops reading `relative` (to speed-hir-store-readers)
 
@@ -531,6 +539,7 @@ allocation now).
 
 > forwarded to format: speed-hir-store-readers is DONE, and `hir-def/src/expr_store/` is format's.
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> mem-format-fwd: already in (`expr_store/tests/invalidation.rs` ~L147 `before: Vec<(*const Body, Vec<u8>)>`, ~L169 `Body::of_`/`ExprScopes::body_expr_scopes_` once, ~L172 `Body::relative_` zero times), as the status line below says.
 
 Status: done by speed-hir-store, as written. `before` is a `(*const Body, Vec<u8>)` from `Body::of`, and the post-edit checks compare bytes and `ptr::eq`. `Body::of_` and `ExprScopes::body_expr_scopes_` run once, and `Body::relative_` zero times. (a) and (c) still read `Body::relative` directly and are unchanged.
 
@@ -544,6 +553,7 @@ Why: `Body::of` no longer reads `Body::relative`.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 > applied (`requests`): put on the first-compile list in `/tmp/blaze-lanes/v2-requests.md`: regenerate `hir-ide/src/tests/incremental.rs` with `UPDATE_EXPECT=1` and check each `Body::relative_` that goes is a body where only `Body::of` was read. Nothing can be checked by hand before a build.
+> mem-format-fwd: information, nothing to apply (`hir-ide/src/tests/incremental.rs` is outside `expr_store*`/`hir*`, and the regeneration is on the coordinator's first-compile list).
 
 ## for speed-hir-store (from speed-hir-defs-sigs): signature lowering with relative maps
 
@@ -609,6 +619,7 @@ Status: done by speed-hir-store (2026-10-29 19:20), items 1-4 as written, not co
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 > applied: by speed-hir-store (its status line above); nothing for requests.
+> mem-format-fwd: already in (`expr_store/lower.rs` ~L288 `lower_generic_params_within`, ~L761 `pub(crate) fn with_maps`; `expr_store.rs` L54 `pub(crate) use self::source_map::Move;`), and `signatures.rs` now passes `maps` to all five `lower_*` (~L940, ~L1044, ~L1134, ~L1258, ~L1400, ~L1566).
 
 ## for speed-hir-defs-sigs (from speed-hir-store): one BLAKE3 pass for a signature's tree hash
 
@@ -651,6 +662,7 @@ value is new. Being exact, it also can't collide and reuse a stale signature. No
 `docs/v2/plan/lanes/db/speed-of-light.md`, section "hir-def signatures".
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> mem-format-fwd: overtaken by `SignatureSyntax`/`FileOutline` comparing the tree by content (`FlatTree: PartialEq`); `signatures.rs` has no `tree_hash`. `body::subtree_hash` is now `tree.subtree_hash(at)` (`expr_store/body.rs` ~L491). Nothing to apply.
 
 ## dedup: `import_map.rs`'s counting sort onto `blaze_ids::radix::Csr`
 
@@ -683,6 +695,7 @@ below as now.) Why: one counting sort in the tree.
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 > forwarded by speed-hir to db-expand (`import_map.rs` is db-expand's again, in progress):
 > `v2/requests/db-expand.md`, "## speed-hir: four edits", item 1; told by tmux.
+> mem-format-fwd: not mem-format's (`import_map.rs`); already forwarded, now to db (the "four edits" section says "forwarded to db (from requests, pass 17)"). Still open: `import_map.rs` has no `Csr`. Told db-next3.
 
 ## dedup: base-db's `Table` onto `blaze_mem::swiss::Index` (via `intern::swiss`)
 
@@ -752,6 +765,7 @@ The tests in `crates/base-db/src/tests.rs` (`Table`, `hash_of`) touch no interna
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 > forwarded by speed-hir to db-expand (base-db is db-expand's again, in progress):
 > `v2/requests/db-expand.md`, "## speed-hir: four edits", item 2; told by tmux.
+> mem-format-fwd: not mem-format's (`crates/base-db/src/table.rs`); already forwarded, now to db (pass 17). Still open: `table.rs` keeps its own `grow`/levels, no `swiss::Index`. Told db-next3.
 
 ## speed-hir-sol-defs: hir-def's allocation-budget harness (to every speed-hir-sol sibling)
 
@@ -777,6 +791,7 @@ held to 0 allocations.
 > `v2/requests/db-expand.md` "## speed-hir-sol-defs: hot_lint and budgets" item 1, and the
 > `paths.rs` port in "## speed-hir-sol-nameres: hot_lint and budgets". Not applied yet (no
 > `mod alloc_budgets` in `lib.rs`; `paths.rs:718` still has its own `#[global_allocator]`).
+> mem-format-fwd: information, nothing to apply in `expr_store*`/`hir*`. Mostly in since: `blaze-alloc-count` is a dev-dependency of `crates/hir-def/Cargo.toml`, `lib.rs` ~L1967 has the `#[cfg(test)] #[global_allocator]`, and `nameres/tests/paths.rs` has no allocator of its own. Still missing: `#[cfg(test)] mod alloc_budgets;` in `lib.rs` (the file exists). Told db-next3.
 
 ## speed-hir-sol-defs: a gap in the "hir-def signatures" speed-of-light section (to its author, speed-hir-defs-sigs)
 
@@ -793,6 +808,7 @@ Status: done by speed-hir-defs-sigs. The section's "Now" bullet and summary row 
 lands.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> mem-format-fwd: information, nothing to apply (a doc gap in `docs/v2/plan/lanes/db/speed-of-light.md`, closed by speed-hir-defs-sigs as the status line says).
 
 ## speed-hir-sol-defs: for speed-hir-store (store bits upvars needs)
 
@@ -815,3 +831,4 @@ Costs are in `db/speed-of-light.md`, section "hir-def: attributes, interned locs
 > with the `upvars.rs` caller in `v2/requests/db-expand.md`, "## speed-hir: four edits", item 3.
 > The second (a path's resolved local kept at lowering, rustc's `Res::Local`) changes lowering
 > and the store's encoding; it is listed as open in `docs/v2/plan/lanes/db/speed-hir.md`.
+> mem-format-fwd: the first bit is in, better than asked: `ExpressionStore::kinds_present()` is a `u64` with a bit per `ExprKind`, made once in `finish` and on decode, and `has_closures()` is one bit test (`expr_store.rs`). The `upvars.rs` caller is db's ("four edits" item 3). The second bit (rustc's `Res::Local` kept at lowering) is not applied. It is not a written change: lowering has no scopes today (`ExprScopes` is built from the finished store), so keeping it means resolving locals during lowering under macro hygiene, exactly as rustc does, plus a new persisted column. That needs its own design and differential tests, so it stays open in `docs/v2/plan/lanes/db/speed-hir.md`.

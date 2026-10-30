@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_api::{Edit, How, Target};
 use blaze_vfs::Op;
-use syntax::{Edition, SourceFile, SyntaxNode};
+use syntax::{Edition, SourceFile, view::Node};
 
 use super::{assert_fresh, roots};
 use crate::{
@@ -72,10 +72,10 @@ fn target(item: &str) -> Target {
 /// compared by path. A module, impl or trait whose own text differs, and the file, changed in
 /// scope; any other item changed; one on one side only was added or removed.
 fn diff(before: &str, after: &str) -> BTreeSet<(String, &'static str)> {
-    fn own(node: &SyntaxNode) -> String {
-        let mut text = node.text().to_string();
+    fn own(node: Node<'_>) -> String {
+        let mut text = node.text().to_owned();
         let start = usize::from(node.text_range().start());
-        let mut members: Vec<SyntaxNode> = path::members(node).into_iter().filter(path::is_top).collect();
+        let mut members: Vec<Node<'_>> = path::members(node).filter(|it| path::is_top(*it)).collect();
         members.sort_unstable_by_key(|it| std::cmp::Reverse(it.text_range().start()));
         for member in members {
             let range = member.text_range();
@@ -83,21 +83,21 @@ fn diff(before: &str, after: &str) -> BTreeSet<(String, &'static str)> {
         }
         text
     }
-    fn walk(node: &SyntaxNode, out: &mut BTreeMap<String, (bool, String)>) {
-        for member in path::members(node).into_iter().filter(path::is_top) {
+    fn walk(node: Node<'_>, out: &mut BTreeMap<String, (bool, String)>) {
+        for member in path::members(node).filter(|it| path::is_top(*it)) {
             let container = matches!(
                 member.kind(),
                 syntax::SyntaxKind::MODULE | syntax::SyntaxKind::IMPL | syntax::SyntaxKind::TRAIT
             );
-            out.insert(path::of(&member), (container, own(&member)));
-            walk(&member, out);
+            out.insert(path::of(member), (container, own(member)));
+            walk(member, out);
         }
     }
     let tops = |text: &str| {
-        let root = SourceFile::parse(text, Edition::CURRENT).syntax_node();
+        let parse = SourceFile::parse(text, Edition::CURRENT);
         let mut out = BTreeMap::new();
-        out.insert(String::new(), (true, own(&root)));
-        walk(&root, &mut out);
+        out.insert(String::new(), (true, own(parse.root())));
+        walk(parse.root(), &mut out);
         out
     };
     let (old, new) = (tops(before), tops(after));

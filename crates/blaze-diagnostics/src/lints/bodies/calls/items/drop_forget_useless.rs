@@ -127,12 +127,17 @@ impl LatePass for DropForgetUseless {
             return;
         };
         let Some(arg_ty) = util::print_ty(b, arg, arg_ty) else { return };
+        // clone: a span, for the lint's diagnostic
         let mut diag = Diag::lint(lint, message, call.clone());
+        // alloc: the lint's diagnostic
         diag.span_label(arg_span.clone(), format!("argument has type `{arg_ty}`"));
         if lint == "undropped_manually_drops" {
             diag.suggestion_with_style(
+                // alloc: the lint's diagnostic
                 vec![
+                    // alloc: the lint's diagnostic
                     (arg_span.shrink_to_lo(), "std::mem::ManuallyDrop::into_inner(".to_owned()),
+                    // alloc: the lint's diagnostic
                     (arg_span.shrink_to_hi(), ")".to_owned()),
                 ],
                 "use `std::mem::ManuallyDrop::into_inner` to get the inner value",
@@ -146,8 +151,11 @@ impl LatePass for DropForgetUseless {
             };
             match inside {
                 Some(arg_at) => diag.suggestion_with_style(
+                    // alloc: the lint's diagnostic
                     vec![
+                        // alloc: the lint's diagnostic
                         (call.with_hi(arg_at.lo), "let _ = ".to_owned()),
+                        // alloc: the lint's diagnostic
                         (arg_at.with_lo(arg_at.hi).with_hi(call.hi), String::new()),
                     ],
                     IGNORE,
@@ -158,6 +166,7 @@ impl LatePass for DropForgetUseless {
             };
         }
         let called = b.cx.def_path(ModuleDefId::FunctionId(def).into());
+        // alloc: the lint's diagnostic
         diag.fact(Fact::Signature(b.cx.key(ItemId::Function(def))), format!("the signature of `{called}`"));
         out.push(b.lint(diag, Phase::Late, at));
     }
@@ -173,6 +182,7 @@ fn is_manually_drop<'db>(solver: &util::Solver<'db>, ty: Ty<'db>) -> bool {
 /// from, and of the macro that call came from, .., the first inside `outer` and of the same
 /// expansion.
 fn ancestor_inside_same_ctxt(span: &Span, outer: &Span) -> Option<Span> {
+    // clone: a span, for the lint's diagnostic
     let mut at = span.clone();
     loop {
         let inside = at.file == outer.file && outer.lo <= at.lo && at.hi <= outer.hi;

@@ -1,95 +1,65 @@
 use arbitrary::{Arbitrary, Unstructured};
 use expect_test::{Expect, expect};
 use intern::Symbol;
-use syntax::{AstNode, Edition, ast, view::AstNode as _};
+use syntax::{AstNode, Edition, SourceFile, ast, view, view::AstNode as _};
 use syntax_bridge::{
-    DocCommentDesugarMode,
+    DocCommentDesugarMode, call_input,
     dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
-    syntax_node_to_token_tree,
 };
 
 use crate::{CfgAtom, CfgExpr, CfgOptions, DnfExpr};
 
+/// The first predicate of `input`, read from its token tree and from its view. The handle's
+/// reading (`parse_from_ast`), the reference until the handles are deleted, must be the view's.
+/// `clean`: `input` must parse without errors.
 #[track_caller]
-fn parse_ast_cfg(pred: ast::CfgPredicate) -> CfgExpr {
-    CfgExpr::parse_from_ast(pred)
+fn cfgs(input: &str, clean: bool) -> (CfgExpr, CfgExpr) {
+    let parse = SourceFile::parse(input, Edition::CURRENT);
+    if clean {
+        assert!(parse.errors().is_empty(), "{input}");
+    }
+    let pred = parse.root().descendants().find_map(view::CfgPredicate::cast).unwrap();
+    let tt = call_input(pred.syntax(), DummyTestSpanMap, DUMMY, DocCommentDesugarMode::ProcMacro);
+    let from_view = CfgExpr::parse_from_view(pred);
+    let handle = parse.syntax_node().descendants().find_map(ast::CfgPredicate::cast).unwrap();
+    assert_eq!(CfgExpr::parse_from_ast(handle), from_view, "{input}");
+    (CfgExpr::parse(&tt), from_view)
 }
 
 #[track_caller]
 fn assert_parse_result(input: &str, expected: CfgExpr) {
-    let source_file = ast::SourceFile::parse(input, Edition::CURRENT).syntax_node();
-    let pred_ast = source_file.descendants().find_map(ast::CfgPredicate::cast).unwrap();
-    let tt = syntax_node_to_token_tree(
-        pred_ast.syntax(),
-        DummyTestSpanMap,
-        DUMMY,
-        DocCommentDesugarMode::ProcMacro,
-    );
-    let cfg = CfgExpr::parse(&tt);
-    assert_eq!(cfg, expected);
-    let cfg = parse_ast_cfg(pred_ast);
-    assert_eq!(cfg, expected);
-    let parse = ast::SourceFile::parse(input, Edition::CURRENT);
-    let pred_view = parse.root().descendants().find_map(syntax::view::CfgPredicate::cast).unwrap();
-    assert_eq!(CfgExpr::parse_from_view(pred_view), expected);
+    let (from_tt, from_view) = cfgs(input, false);
+    assert_eq!(from_tt, expected);
+    assert_eq!(from_view, expected);
 }
 
 #[track_caller]
 fn check_dnf(input: &str, expect: Expect) {
-    let source_file = ast::SourceFile::parse(input, Edition::CURRENT).ok().unwrap();
-    let pred_ast = source_file.syntax().descendants().find_map(ast::CfgPredicate::cast).unwrap();
-    let tt = syntax_node_to_token_tree(
-        pred_ast.syntax(),
-        DummyTestSpanMap,
-        DUMMY,
-        DocCommentDesugarMode::ProcMacro,
-    );
-    let cfg = CfgExpr::parse(&tt);
-    let actual = format!("#![cfg({})]", DnfExpr::new(&cfg));
-    expect.assert_eq(&actual);
-    let cfg = parse_ast_cfg(pred_ast);
-    let actual = format!("#![cfg({})]", DnfExpr::new(&cfg));
-    expect.assert_eq(&actual);
+    let (from_tt, from_view) = cfgs(input, true);
+    for cfg in [from_tt, from_view] {
+        let actual = format!("#![cfg({})]", DnfExpr::new(&cfg));
+        expect.assert_eq(&actual);
+    }
 }
 
 #[track_caller]
 fn check_why_inactive(input: &str, opts: &CfgOptions, expect: Expect) {
-    let source_file = ast::SourceFile::parse(input, Edition::CURRENT).ok().unwrap();
-    let pred_ast = source_file.syntax().descendants().find_map(ast::CfgPredicate::cast).unwrap();
-    let tt = syntax_node_to_token_tree(
-        pred_ast.syntax(),
-        DummyTestSpanMap,
-        DUMMY,
-        DocCommentDesugarMode::ProcMacro,
-    );
-    let cfg = CfgExpr::parse(&tt);
-    let dnf = DnfExpr::new(&cfg);
-    let why_inactive = dnf.why_inactive(opts).unwrap().to_string();
-    expect.assert_eq(&why_inactive);
-    let cfg = parse_ast_cfg(pred_ast);
-    let dnf = DnfExpr::new(&cfg);
-    let why_inactive = dnf.why_inactive(opts).unwrap().to_string();
-    expect.assert_eq(&why_inactive);
+    let (from_tt, from_view) = cfgs(input, true);
+    for cfg in [from_tt, from_view] {
+        let dnf = DnfExpr::new(&cfg);
+        let why_inactive = dnf.why_inactive(opts).unwrap().to_string();
+        expect.assert_eq(&why_inactive);
+    }
 }
 
 #[track_caller]
 fn check_enable_hints(input: &str, opts: &CfgOptions, expected_hints: &[&str]) {
-    let source_file = ast::SourceFile::parse(input, Edition::CURRENT).ok().unwrap();
-    let pred_ast = source_file.syntax().descendants().find_map(ast::CfgPredicate::cast).unwrap();
-    let tt = syntax_node_to_token_tree(
-        pred_ast.syntax(),
-        DummyTestSpanMap,
-        DUMMY,
-        DocCommentDesugarMode::ProcMacro,
-    );
-    let cfg = CfgExpr::parse(&tt);
-    let dnf = DnfExpr::new(&cfg);
-    let hints = dnf.compute_enable_hints(opts).map(|diff| diff.to_string()).collect::<Vec<_>>();
-    assert_eq!(hints, expected_hints);
-    let cfg = parse_ast_cfg(pred_ast);
-    let dnf = DnfExpr::new(&cfg);
-    let hints = dnf.compute_enable_hints(opts).map(|diff| diff.to_string()).collect::<Vec<_>>();
-    assert_eq!(hints, expected_hints);
+    let (from_tt, from_view) = cfgs(input, true);
+    for cfg in [from_tt, from_view] {
+        let dnf = DnfExpr::new(&cfg);
+        let hints = dnf.compute_enable_hints(opts).map(|diff| diff.to_string()).collect::<Vec<_>>();
+        assert_eq!(hints, expected_hints);
+    }
 }
 
 #[test]
@@ -245,6 +215,38 @@ fn why_inactive() {
         &opts,
         expect![["test and test2 are enabled and a is disabled"]],
     );
+}
+
+/// `fold` answers each variant: an atom by the query, `all`/`any`/`not` by their predicates, and
+/// `Invalid` (or any predicate under it) with no answer. `check` folds with the enabled set.
+#[test]
+fn fold_answers_every_variant() {
+    let mut opts = CfgOptions::default();
+    opts.insert_atom(Symbol::intern("on"));
+    let cases = [
+        ("#![cfg(on)]", Some(true)),
+        ("#![cfg(off)]", Some(false)),
+        ("#![cfg(all(on, off))]", Some(false)),
+        ("#![cfg(all(on, on))]", Some(true)),
+        ("#![cfg(any(off, on))]", Some(true)),
+        ("#![cfg(any(off, off))]", Some(false)),
+        ("#![cfg(not(off))]", Some(true)),
+        ("#![cfg(all())]", Some(true)),
+        ("#![cfg(any())]", Some(false)),
+    ];
+    for (input, expected) in cases {
+        let (from_tt, from_view) = cfgs(input, true);
+        for cfg in [from_tt, from_view] {
+            assert_eq!(opts.check(&cfg), expected, "{input}");
+            assert_eq!(cfg.fold(&|atom| opts.check_atom(atom)), expected, "{input}");
+        }
+    }
+    assert_eq!(CfgExpr::Invalid.fold(&|_| true), None);
+    let under_not = CfgExpr::Not(Box::new(CfgExpr::Invalid));
+    assert_eq!(under_not.fold(&|_| true), None);
+    let on: CfgExpr = CfgAtom::Flag(Symbol::intern("on")).into();
+    let under_all = CfgExpr::All(vec![on, CfgExpr::Invalid].into());
+    assert_eq!(under_all.fold(&|_| true), None);
 }
 
 #[test]

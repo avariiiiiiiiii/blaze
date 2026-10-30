@@ -493,28 +493,35 @@ mod tests {
     fn a_unit_with_a_link_or_a_file_of_another_is_refused() {
         let outside = scratch("link-outside");
         std::fs::create_dir_all(&outside).unwrap();
-        let link = |tar: &mut tar::Builder<Vec<u8>>| {
-            let mut header = header(tar::EntryType::Symlink, 0);
-            tar.append_link(&mut header, format!("build/{UNIT}"), &outside).unwrap();
-            let inside = format!("build/{UNIT}/planted");
-            tar.append_data(&mut self::header(tar::EntryType::Regular, 1), inside, &b"x"[..])
-                .unwrap();
+        enum Planted {
+            Link,
+            Other,
+            Elsewhere,
+        }
+        let entries = |planted: &Planted, tar: &mut tar::Builder<Vec<u8>>| match planted {
+            Planted::Link => {
+                let mut header = header(tar::EntryType::Symlink, 0);
+                tar.append_link(&mut header, format!("build/{UNIT}"), &outside).unwrap();
+                let inside = format!("build/{UNIT}/planted");
+                tar.append_data(&mut self::header(tar::EntryType::Regular, 1), inside, &b"x"[..])
+                    .unwrap();
+            }
+            Planted::Other => {
+                let name = "deps/libother-0123456789abcdef.rlib";
+                tar.append_data(&mut header(tar::EntryType::Regular, 1), name, &b"x"[..]).unwrap();
+            }
+            Planted::Elsewhere => {
+                let mut header = header(tar::EntryType::Regular, 1);
+                let name = format!("build/{UNIT}/../../../planted");
+                header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+                header.set_cksum();
+                tar.append(&header, &b"x"[..]).unwrap();
+            }
         };
-        let other = |tar: &mut tar::Builder<Vec<u8>>| {
-            let name = "deps/libother-0123456789abcdef.rlib";
-            tar.append_data(&mut header(tar::EntryType::Regular, 1), name, &b"x"[..]).unwrap();
-        };
-        let elsewhere = |tar: &mut tar::Builder<Vec<u8>>| {
-            let mut header = header(tar::EntryType::Regular, 1);
-            let name = format!("build/{UNIT}/../../../planted");
-            header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
-            header.set_cksum();
-            tar.append(&header, &b"x"[..]).unwrap();
-        };
-        let archives: [(&str, &dyn Fn(&mut tar::Builder<Vec<u8>>)); 3] =
-            [("link", &link), ("other", &other), ("elsewhere", &elsewhere)];
-        for (name, entries) in archives {
-            let (remote, top, _) = remote_with(name, 1 << 20, entries);
+        let archives =
+            [("link", Planted::Link), ("other", Planted::Other), ("elsewhere", Planted::Elsewhere)];
+        for (name, planted) in archives {
+            let (remote, top, _) = remote_with(name, 1 << 20, |tar| entries(&planted, tar));
             let dir = top.join("out/target/debug");
             assert!(pulled(&dir, &remote, Some(1 << 20)).is_err(), "{name}");
             assert!(!outside.join("planted").exists(), "{name}");

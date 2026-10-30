@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, anyhow, bail};
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::{Context, Workspace};
+use blaze_manifest::files::Disk;
 use blaze_resolve::{PackageId, PackageIdSpec, SourceId, closest};
 use toml_edit::{DocumentMut, Item};
 use url::Url;
@@ -226,7 +227,6 @@ fn remove(read: &Read, list: bool) -> anyhow::Result<()> {
         build: None,
         platform: None,
         offline: read.has("--offline") || read.has("--frozen"),
-        store: None,
         rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let unused = blaze_metadata::relock(&asked, "remove", locked)?;
@@ -237,7 +237,7 @@ fn remove(read: &Read, list: bool) -> anyhow::Result<()> {
 }
 
 /// The manifest of the one package `-p` or the default members select.
-fn selected(ws: &Workspace<'_>, spec: Option<&str>) -> anyhow::Result<PathBuf> {
+fn selected(ws: &Workspace<'_, Disk>, spec: Option<&str>) -> anyhow::Result<PathBuf> {
     let mut picked = Vec::new();
     match spec {
         Some(spec) => {
@@ -535,7 +535,7 @@ struct Dep {
 }
 
 impl Dep {
-    fn from_toml(ctx: &Context, crate_root: &Path, key: &str, item: &Item) -> anyhow::Result<Dep> {
+    fn from_toml(ctx: &Context<Disk>, crate_root: &Path, key: &str, item: &Item) -> anyhow::Result<Dep> {
         let mut dep =
             Dep { key: key.to_owned(), name: key.to_owned(), version: None, source: None };
         if let Some(version) = item.as_str() {
@@ -570,7 +570,7 @@ impl Dep {
     }
 }
 
-fn registry_url(ctx: &Context, name: &str) -> anyhow::Result<Url> {
+fn registry_url(ctx: &Context<Disk>, name: &str) -> anyhow::Result<Url> {
     if name == "crates-io" {
         return Ok(SourceId::crates_io().url().clone());
     }
@@ -598,7 +598,7 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// Removes from the workspace's root manifest the `[workspace.dependencies]`,
 /// `[profile.*.package]` and `[replace]` entries no member's dependency uses any more.
-fn gc_workspace(ctx: &Context, root_manifest: &Path, members: &[PathBuf]) -> anyhow::Result<()> {
+fn gc_workspace(ctx: &Context<Disk>, root_manifest: &Path, members: &[PathBuf]) -> anyhow::Result<()> {
     let mut root = Local::read(root_manifest)?;
     let root_dir = root_manifest.parent().context("the workspace's directory")?;
     let mut deps = Vec::new();
@@ -680,7 +680,7 @@ fn spec_has_match(spec: &PackageIdSpec, deps: &[Dep]) -> anyhow::Result<bool> {
 
 /// Removes the `[patch]` entries the resolve did not use. Whether it removed any.
 fn gc_unused_patches(
-    ctx: &Context,
+    ctx: &Context<Disk>,
     root_manifest: &Path,
     unused: &[PackageId],
 ) -> anyhow::Result<bool> {

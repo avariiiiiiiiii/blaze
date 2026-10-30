@@ -30,6 +30,7 @@ mod check_enums;
 mod check_pointers;
 mod copy_prop;
 mod dse;
+mod inline;
 mod inst_simplify;
 mod locals;
 
@@ -39,22 +40,19 @@ use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 
 use std::cell::Cell;
 
-use crate::{
-    InferBodyId,
-    db::{HirDatabase, InternedClosureId, InternedCoroutineId},
-    traits::StoredParamEnvAndCrate,
-};
+use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};
 
 use crate::next_solver::StoredGenericArgs;
 
 use super::{
-    BasicBlockId, LocalId, MirBody, MirLowerError, MirOptLevel, MirOptions, OperandKind,
-    ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
+    BasicBlockId, InlinedBody, LocalId, MirBody, MirLowerError, MirOptLevel, MirOptions, MirOwner,
+    MirStage, OperandKind, ProjectionElem, Rvalue, StatementKind, StoredPlace, TerminatorKind,
     budget::Pass,
     framed::{Bits, bits_in, block_id, block_index, local_index},
-    monomorphization::monomorphized,
     transform::Ctx,
 };
+
+pub use inline::{CallerLocation, caller_location, owner_of, source_span, written_checked_at};
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
@@ -70,7 +68,6 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
         ],
         MirOptLevel::Release => &[
             "ForceInline",
-            "Inline",
             "RemoveZsts",
             "UnreachableEnumBranching",
             "ReferencePropagation",
@@ -92,13 +89,16 @@ pub fn passes_not_ported(level: MirOptLevel) -> &'static [&'static str] {
 ///
 /// A pass run only at [`MirOptLevel::Release`] never adds a call, constant, static, drop or
 /// vtable the body does not have at [`MirOptLevel::Debug`]: those passes only remove code or
-/// replace a local by another holding the same value. The code generator's walk of what a unit
-/// references reads `Debug` bodies for every level and relies on this; `tests/mir/references.rs`
-/// holds it.
+/// replace a local by another holding the same value. The one exception is `Inline`
+/// (`options.inline`, only at `Release`): an inlined callee brings what its own body
+/// references, which the `Debug` body reaches through the call, and lists the callee in
+/// `body.inlined.callees`. The code generator's walk of what a unit references reads `Debug`
+/// bodies for every level and relies on this; `tests/mir/references.rs` holds it.
 pub(super) fn optimize<'db>(
     db: &'db Db,
     body: &MirBody<'db>,
     options: MirOptions,
+    caller: Option<InlinedBody<'db>>,
 ) -> Result<'db, MirBody<'db>> {
     // clone: the copy the query keeps, which the passes change in place
     let mut body = body.clone();
@@ -107,7 +107,7 @@ pub(super) fn optimize<'db>(
         return Ok(body);
     }
     frame::task(Tag::Mir, |outer| {
-        passes(&Ctx::new(db, body.owner, outer), &mut body, options, optimizing)
+        passes(&Ctx::new(db, body.owner, outer), &mut body, options, caller, optimizing)
     })?;
     Ok(body)
 }
@@ -116,6 +116,7 @@ fn passes<'db>(
     ctx: &Ctx<'_, 'db>,
     body: &mut MirBody<'db>,
     options: MirOptions,
+    caller: Option<InlinedBody<'db>>,
     optimizing: bool,
 ) -> Result<'db, ()> {
     let release = options.level >= MirOptLevel::Release;
@@ -151,6 +152,16 @@ fn passes<'db>(
 
     run!("LowerSliceLenCalls", |frame| inst_simplify::lower_slice_len_calls(ctx, body, frame));
     run!("InstSimplify", |frame| inst_simplify::inst_simplify(ctx, body, frame));
+    // `options.inline` is set only at `Release` (rustc's `Inline::is_enabled`).
+    if options.inline
+        && let Some(caller) = caller
+    {
+        run!("Inline", |frame| {
+            if inline::inline(ctx, body, caller, options) {
+                cfg::simplify_cfg(body, frame);
+            }
+        });
+    }
     // rustc keeps storage markers only where it gives the backend lifetimes.
     if !options.lifetime_markers {
         run!("RemoveStorageMarkers", |frame| locals::remove_storage_markers(body, frame));
@@ -214,82 +225,6 @@ pub(super) fn run_one<'db>(
     Ok(())
 }
 
-pub(crate) fn compute_optimized_mir_body<'db>(
-    db: &'db Db,
-    def: InferBodyId<'db>,
-    options: MirOptions,
-) -> Result<'db, MirBody<'db>> {
-    optimize(db, db.runtime_mir_body(def)?, options)
-}
-
-pub(crate) fn compute_optimized_mir_body_for_closure<'db>(
-    db: &'db Db,
-    closure: InternedClosureId<'db>,
-    options: MirOptions,
-) -> Result<'db, MirBody<'db>> {
-    optimize(db, db.runtime_mir_body_for_closure(closure)?, options)
-}
-
-pub(crate) fn compute_monomorphized_optimized_mir_body<'db>(
-    db: &'db Db,
-    def: InferBodyId<'db>,
-    options: MirOptions,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.optimized_mir_body(def, options)?, &subst, &trait_env)
-}
-
-pub(crate) fn compute_monomorphized_optimized_mir_body_for_closure<'db>(
-    db: &'db Db,
-    closure: InternedClosureId<'db>,
-    options: MirOptions,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.optimized_mir_body_for_closure(closure, options)?, &subst, &trait_env)
-}
-
-/// The body of an `async` block's `poll` with `options`: of the passes, only the UB checks run
-/// on a coroutine body.
-pub(crate) fn compute_optimized_mir_body_for_coroutine<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    options: MirOptions,
-) -> Result<'db, MirBody<'db>> {
-    optimize(db, db.runtime_mir_body_for_coroutine(coroutine)?, options)
-}
-
-pub(crate) fn compute_optimized_mir_body_for_coroutine_by_move<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    options: MirOptions,
-) -> Result<'db, MirBody<'db>> {
-    optimize(db, db.runtime_mir_body_for_coroutine_by_move(coroutine)?, options)
-}
-
-pub(crate) fn compute_monomorphized_optimized_mir_body_for_coroutine<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    options: MirOptions,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    let body = db.optimized_mir_body_for_coroutine(coroutine, options)?;
-    monomorphized(db, body, &subst, &trait_env)
-}
-
-pub(crate) fn compute_monomorphized_optimized_mir_body_for_coroutine_by_move<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    options: MirOptions,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    let body = db.optimized_mir_body_for_coroutine_by_move(coroutine, options)?;
-    monomorphized(db, body, &subst, &trait_env)
-}
-
 thread_local! {
     /// The level the interpreter runs functions and closures at on this thread, which is
     /// [`MirOptLevel::Off`] unless a test of these passes sets it.
@@ -305,33 +240,19 @@ fn interpreter_level() -> MirOptLevel {
     INTERPRETER_LEVEL.with(Cell::get)
 }
 
-/// The body the interpreter runs of a function: the runtime body, or that body optimized at
-/// the level [`set_interpreter_mir_opt_level`] set.
+/// The body the interpreter runs of `owner`: the runtime body, or that body optimized at the
+/// level [`set_interpreter_mir_opt_level`] set.
 pub(super) fn interpreted_body<'db>(
     db: &'db Db,
-    def: InferBodyId<'db>,
+    owner: MirOwner<'db>,
     subst: StoredGenericArgs,
     env: StoredParamEnvAndCrate,
 ) -> Result<'db, &'db MirBody<'db>> {
-    match interpreter_level() {
-        MirOptLevel::Off => db.monomorphized_runtime_mir_body(def, subst, env),
-        level => db.monomorphized_optimized_mir_body(def, MirOptions::at(level), subst, env),
-    }
-}
-
-pub(super) fn interpreted_closure_body<'db>(
-    db: &'db Db,
-    closure: InternedClosureId<'db>,
-    subst: StoredGenericArgs,
-    env: StoredParamEnvAndCrate,
-) -> Result<'db, &'db MirBody<'db>> {
-    match interpreter_level() {
-        MirOptLevel::Off => db.monomorphized_runtime_mir_body_for_closure(closure, subst, env),
-        level => {
-            let options = MirOptions::at(level);
-            db.monomorphized_optimized_mir_body_for_closure(closure, options, subst, env)
-        }
-    }
+    let stage = match interpreter_level() {
+        MirOptLevel::Off => MirStage::Runtime,
+        level => MirStage::Optimized(MirOptions::at(level)),
+    };
+    db.monomorphized_mir(owner, stage, subst, env)
 }
 
 /// What every pass leaves: each local and block a body names is one it has, and each block
@@ -841,6 +762,8 @@ fn renumber_locals(
     body.promoted_constants.retain_mut(renumber);
     body.scope_ends.retain_mut(renumber);
     body.upvars_in_place.retain_mut(|(local, _)| renumber(local));
+    body.inlined.bindings.retain_mut(|it| renumber(&mut it.local));
+    body.inlined.promoted.retain_mut(|it| renumber(&mut it.local));
     body.upvar_locals.retain(|_, locals| {
         locals.retain_mut(|(local, _)| renumber(local));
         !locals.is_empty()

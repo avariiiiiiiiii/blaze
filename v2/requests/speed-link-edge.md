@@ -53,6 +53,8 @@ after:
 
 > forwarded to speed-link-edge (from requests, pass 16; told by tmux).
 
+> applied: (speed-link-edge, 2026-10-29) as written, both streams in `remote.rs`'s `tests` module.
+
 ## dedup: seeded RNG onto blaze_ids::rng
 
 From `dedup-codec-rng` (report `/tmp/blaze-lanes/v2-dedup-codec-rng.md`). `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/src/rng.rs`) is the one seeded test RNG: `new`, `next_u64`, `below` (`% n`, 0 for 0), `index`, `one_in`, `shuffle`, `fill`, and more. Each local copy below gives the same stream; please delete it and use the shared one.
@@ -68,3 +70,5 @@ Every user (`bench.rs`, `wire.rs`, `columns.rs`, `bytes.rs`, `tests.rs`, `crates
 > forwarded to speed-link-edge (from requests, pass 16; told by tmux).
 
 > applied by dedup-codec-rng at 20:59, after speed-link-edge-sol-proof said it had stopped editing the crate. This also covers its new users in `bench.rs`, `join.rs` tests, `wire.rs` tests and `bytes.rs` tests, which call only `new`, `next_u64` and `below(u64)`.
+
+> applied: (speed-link-edge, 2026-10-29; done by dedup-codec-rng) checked. `crates/blaze-v2-proof/src/lib.rs:469` is `pub use blaze_ids::rng::SplitMix64 as Rng;`, and no local `Rng` is left. Nothing more to do.

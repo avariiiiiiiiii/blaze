@@ -77,7 +77,7 @@ import subprocess
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -246,14 +246,21 @@ class Said:
 @dataclass(frozen=True)
 class Batch:
     """What came of the workspace `ws`: what blaze said of each unit, the units that could not be
-    laid out as a package (and why), where each unit's package is, and a daemon that would not
-    stop."""
+    laid out as a package (and why), where each unit's package is, a daemon that would not
+    stop, and what the run that checked each unit printed on stdout (by label; one run's for
+    every unit of a `whole` batch)."""
 
     ws: str
     said: tuple[tuple[Unit, Said], ...] = ()
     out: tuple[tuple[Unit, str], ...] = ()
     packages: dict[str, str] = field(default_factory=dict[str, str])
     stopped: str | None = None
+    stdout: dict[str, str] = field(default_factory=dict[str, str])
+
+
+# What a caller adds to a workspace once its members are written (`run_batch`'s `layout`): given
+# the workspace and its members by package name, the members it could not lay out, with why.
+type Layout = Callable[[Path, dict[str, Unit]], list[tuple[str, str]]]
 
 
 def directives(text: str) -> list[Directive]:
@@ -805,18 +812,24 @@ def reference(unit: Unit, scratch: Path, env: dict[str, str], kept: engine.Kept,
 
 
 def run_batch(eng: engine.Engine, index: int, units: Sequence[Unit], work: Path, store: Path, whole: bool,
-              command: Literal["check", "build"] = "check") -> Batch:
+              command: Literal["check", "build"] = "check", layout: Layout | None = None) -> Batch:
     """`blaze COMMAND` (check, or build where the programs are to be run) of a workspace of
-    `units`, under its own daemon; the daemon is stopped at the end."""
+    `units`, under its own daemon; the daemon is stopped at the end. `layout` adds to the
+    workspace what its members need beside themselves (cases.py's dependencies)."""
     ws, home = work / "ws" / str(index), work / "h" / str(index)
     shutil.rmtree(ws, ignore_errors=True)
     members, out = write_workspace(ws, index, units)
+    if layout is not None:
+        for name, why in layout(ws, dict(members)):
+            out.append((members.pop(name), why))
+            shutil.rmtree(ws / "crates" / name, ignore_errors=True)
     packages = {unit.label: str(ws / "crates" / name) for name, unit in members.items()}
     if not members:
         return Batch(str(ws), out=tuple(out), packages=packages)
     roots = {name: root_of(ws, name, unit) for name, unit in members.items()}
     env = eng.env(home, store, extra={"RUSTFLAGS": " ".join((*COMMON, *units[0].flags))})
     said: list[tuple[Unit, Said]] = []
+    printed: dict[str, str] = {}
     stopped: str | None = None
     try:
         if whole:
@@ -825,12 +838,14 @@ def run_batch(eng: engine.Engine, index: int, units: Sequence[Unit], work: Path,
                             command=command, timeout=CHECK_SECS)
             got = said_together(ran.stdout, roots, ws, ran.said(600), eng.not_blazes(ran), command)
             said += [(unit, got[name]) for name, unit in members.items()]
+            printed.update((unit.label, ran.stdout) for unit in members.values())
         else:
             for name, unit in members.items():
                 ran = eng.build(f"blaze {command} of {unit.label}", ws, env, check_args(unit, name), command=command,
                                 timeout=CHECK_SECS)
                 said.append((unit, said_alone(ran.returncode, ran.stdout, ran.said(600), eng.not_blazes(ran), ws,
                                               roots[name], command)))
+                printed[unit.label] = ran.stdout
     except (engine.Unmeasurable, engine.Failed) as e:
         why = f"unmeasured: {e}" if isinstance(e, engine.Unmeasurable) else str(e)
         done = {unit.label for unit, _ in said}
@@ -840,7 +855,7 @@ def run_batch(eng: engine.Engine, index: int, units: Sequence[Unit], work: Path,
             eng.stop(ws, env)
         except engine.Failed as e:
             stopped = str(e)
-    return Batch(str(ws), tuple(said), tuple(out), packages, stopped)
+    return Batch(str(ws), tuple(said), tuple(out), packages, stopped, printed)
 
 
 def rustc_commit(env: dict[str, str]) -> str:

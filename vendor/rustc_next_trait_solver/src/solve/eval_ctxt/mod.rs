@@ -12,8 +12,8 @@ use rustc_type_ir::search_graph::{
     CandidateHeadUsages, LowerAvailableDepth, PathKind, RequiredDepth,
 };
 use rustc_type_ir::solve::{
-    AccessedOpaques, ExternalRegionConstraints, FetchEligibleAssocItemResponse, MaybeInfo,
-    NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunCondition,
+    AccessedOpaques, ExternalRegionConstraints, FastPathDepth, FetchEligibleAssocItemResponse,
+    MaybeInfo, NoSolutionOrRerunNonErased, OpaqueTypesJank, QueryResultOrRerunNonErased, RerunCondition,
     RerunNonErased, RerunReason, RerunResultExt, SmallCopySet, TyOrConstInferVar,
 };
 use rustc_type_ir::transmute::Answer;
@@ -252,7 +252,12 @@ where
         // immediately when adding new goals. If we didn't check `stalled_on` here we'd be trying
         // the fast path twice for some goals.
         if stalled_on.is_some()
-            && let Some(res) = compute_goal_fast_path_cold(self, goal, span)
+            && let Some((res, _)) = compute_goal_fast_path_cold(
+                self,
+                goal,
+                span,
+                FastPathDepth::Any(Some(self.cx().recursion_limit())),
+            )
         {
             return Ok(res);
         }
@@ -467,12 +472,13 @@ where
         origin_span: I::Span,
         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> R,
     ) -> R {
-        let mut search_graph = SearchGraph::new(root_depth);
+        let mut search_graph = SearchGraph::new_in(root_depth, delegate.obtain_search_storage());
+        let nested_goals = search_graph.scratch().take_nested_goals();
 
         let mut ecx = EvalCtxt {
             delegate,
             search_graph: &mut search_graph,
-            nested_goals: Default::default(),
+            nested_goals,
             inspect: inspect::EvaluationStepBuilder::new_noop(),
 
             // Only relevant when canonicalizing the response,
@@ -492,7 +498,9 @@ where
             "root `EvalCtxt` should not have any goals added to it"
         );
         assert!(!ecx.opaque_accesses.might_rerun());
+        ecx.search_graph.scratch().give_nested_goals(mem::take(&mut ecx.nested_goals));
         assert!(search_graph.is_empty());
+        delegate.release_search_storage(search_graph.into_storage());
         result
     }
 
@@ -538,6 +546,7 @@ where
             assert!(delegate.clone_opaque_types_lookup_table().is_empty());
         }
 
+        let nested_goals = search_graph.scratch().take_nested_goals();
         let mut ecx = EvalCtxt {
             delegate,
             var_kinds: canonical_input.canonical.var_kinds,
@@ -546,7 +555,7 @@ where
             max_input_universe: canonical_input.canonical.max_universe,
             initial_opaque_types_storage_num_entries,
             search_graph,
-            nested_goals: Default::default(),
+            nested_goals,
             origin_span: I::Span::dummy(),
             tainted: Ok(()),
             inspect: proof_tree_builder.new_evaluation_step(var_values),
@@ -556,6 +565,7 @@ where
         let result = f(&mut ecx, input.goal);
         ecx.inspect.probe_final_state(ecx.delegate, ecx.max_input_universe);
         proof_tree_builder.finish_evaluation_step(ecx.inspect);
+        ecx.search_graph.scratch().give_nested_goals(mem::take(&mut ecx.nested_goals));
 
         if canonical_input.typing_mode.0.is_erased_not_coherence() {
             debug_assert!(delegate.clone_opaque_types_lookup_table().is_empty());
@@ -606,12 +616,25 @@ where
             });
         }
 
-        // No need to try the fast path if stalled_on is `None`, since we already try the fast path
-        // immediately when adding new goals. If we didn't check `stalled_on` here we'd be trying
-        // the fast path twice for some goals.
-        if stalled_on.is_some()
-            && let Some(res) = compute_goal_fast_path_cold(self.delegate, goal, self.origin_span)
+        // `add_goal` already asked for the answers that cost no depth. Only here is the
+        // depth the goal is evaluated with known, so the answers that cost depth are asked
+        // here, and a stalled goal's rerun asks for both.
+        let available = if self.inspect.is_noop() {
+            self.search_graph.nested_available_depth(self.lower_available_depth(goal.predicate))
+        } else {
+            None
+        };
+        let depth = match stalled_on {
+            Some(_) => FastPathDepth::Any(available),
+            None => FastPathDepth::Evaluating(available),
+        };
+        if let Some((res, required_depth)) =
+            compute_goal_fast_path_cold(self.delegate, goal, self.origin_span, depth)
         {
+            if let Some(required_depth) = required_depth {
+                let available = available.expect("`compute_goal_fast_path` checked it");
+                self.search_graph.charge_answered_nested(available, required_depth);
+            }
             return Ok(res);
         }
 
@@ -631,105 +654,110 @@ where
         Ok(goal_evaluation)
     }
 
+    /// Whether a nested goal with this predicate is evaluated one level deeper.
+    fn lower_available_depth(&self, predicate: I::Predicate) -> LowerAvailableDepth {
+        match predicate.kind().skip_binder() {
+            // We don't lower the available depth for the `NormalizesTo` goal, as evaluating
+            // it is an extra step only exists in the new solver that behaves like a function
+            // call rather than an independent nested goal evaluation. So, decreasing the
+            // available depth may end up regressions which hit the recursion limits for crates
+            // compiled well with the old solver.
+            ty::PredicateKind::NormalizesTo(_) => LowerAvailableDepth::No,
+            // We also don't lower depth for witness and rigid opaque when proving auto traits.
+            // This is to mitigate the overflow FCW warnings in deeply nested async calls.
+            // See #159228.
+            //
+            // We're eventually going to remove the witness type so it's okay to ignore the
+            // depth.
+            // For rigid opaques, revealing hidden types can be viewed as normalization so it's
+            // consistent with the `NormalizesTo` reasoning above.
+            ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) => {
+                if self.cx().trait_is_auto(pred.trait_ref.def_id) {
+                    match pred.self_ty().kind() {
+                        ty::CoroutineWitness(..) => LowerAvailableDepth::No,
+                        ty::Alias(
+                            ty::IsRigid::Yes,
+                            ty::AliasTy { kind: ty::Opaque { def_id, .. }, .. },
+                        ) => {
+                            // We only want to skip lowering depth when the proving is done via
+                            // auto trait leakage. If the goal can be proved via item bounds,
+                            // we should lower depth faithfully.
+                            //
+                            // FIXME: We can have param env candidates via TAIT or RTN.
+                            // Ideally we'd instead lower the depth for the nested goal instead.
+                            // Implementing this is a bit harder.
+                            if self
+                                .cx()
+                                .item_self_bounds(def_id.into())
+                                .skip_binder()
+                                .into_iter()
+                                .any(|bound| {
+                                    bound
+                                        .as_trait_clause()
+                                        .is_some_and(|b| b.def_id() == pred.def_id())
+                                })
+                            {
+                                LowerAvailableDepth::Yes
+                            } else {
+                                LowerAvailableDepth::No
+                            }
+                        }
+                        ty::Bool
+                        | ty::Char
+                        | ty::Int(..)
+                        | ty::Uint(..)
+                        | ty::Float(..)
+                        | ty::Str
+                        | ty::Pat(..)
+                        | ty::FnPtr(..)
+                        | ty::Array(..)
+                        | ty::Slice(..)
+                        | ty::RawPtr(..)
+                        | ty::Never
+                        | ty::Tuple(..)
+                        | ty::UnsafeBinder(_)
+                        | ty::Param(..)
+                        | ty::Placeholder(..)
+                        | ty::Bound(..)
+                        | ty::Infer(..)
+                        | ty::Alias(_, _)
+                        | ty::Ref(_, _, _)
+                        | ty::Adt(_, _)
+                        | ty::Foreign(_)
+                        | ty::Dynamic(..)
+                        | ty::Error(_)
+                        | ty::FnDef(..)
+                        | ty::Closure(..)
+                        | ty::CoroutineClosure(..)
+                        | ty::Coroutine(..) => LowerAvailableDepth::Yes,
+                    }
+                } else {
+                    LowerAvailableDepth::Yes
+                }
+            }
+            ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(_))
+            | ty::PredicateKind::Clause(ty::ClauseKind::Projection(_))
+            | ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(_))
+            | ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(_))
+            | ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(_, _))
+            | ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_))
+            | ty::PredicateKind::Subtype(_)
+            | ty::PredicateKind::Coerce(_)
+            | ty::PredicateKind::DynCompatible(_)
+            | ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(_))
+            | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(_))
+            | ty::PredicateKind::ConstEquate(_, _)
+            | ty::PredicateKind::Ambiguous => LowerAvailableDepth::Yes,
+        }
+    }
+
     fn evaluate_in_search_graph(
         &mut self,
         canonical_goal: I::CanonicalInput,
         step_kind: PathKind,
     ) -> (Result<CanonicalResponse<I>, NoSolution>, AccessedOpaques<I>) {
         let increase_depth_for_nested =
-            match canonical_goal.canonical.value.goal.predicate.kind().skip_binder() {
-                // We don't lower the available depth for the `NormalizesTo` goal, as evaluating
-                // it is an extra step only exists in the new solver that behaves like a function
-                // call rather than an independent nested goal evaluation. So, decreasing the
-                // available depth may end up regressions which hit the recursion limits for crates
-                // compiled well with the old solver.
-                ty::PredicateKind::NormalizesTo(_) => LowerAvailableDepth::No,
-                // We also don't lower depth for witness and rigid opaque when proving auto traits.
-                // This is to mitigate the overflow FCW warnings in deeply nested async calls.
-                // See #159228.
-                //
-                // We're eventually going to remove the witness type so it's okay to ignore the
-                // depth.
-                // For rigid opaques, revealing hidden types can be viewed as normalization so it's
-                // consistent with the `NormalizesTo` reasoning above.
-                ty::PredicateKind::Clause(ty::ClauseKind::Trait(pred)) => {
-                    if self.cx().trait_is_auto(pred.trait_ref.def_id) {
-                        match pred.self_ty().kind() {
-                            ty::CoroutineWitness(..) => LowerAvailableDepth::No,
-                            ty::Alias(
-                                ty::IsRigid::Yes,
-                                ty::AliasTy { kind: ty::Opaque { def_id, .. }, .. },
-                            ) => {
-                                // We only want to skip lowering depth when the proving is done via
-                                // auto trait leakage. If the goal can be proved via item bounds,
-                                // we should lower depth faithfully.
-                                //
-                                // FIXME: We can have param env candidates via TAIT or RTN.
-                                // Ideally we'd instead lower the depth for the nested goal instead.
-                                // Implementing this is a bit harder.
-                                if self
-                                    .cx()
-                                    .item_self_bounds(def_id.into())
-                                    .skip_binder()
-                                    .into_iter()
-                                    .any(|bound| {
-                                        bound
-                                            .as_trait_clause()
-                                            .is_some_and(|b| b.def_id() == pred.def_id())
-                                    })
-                                {
-                                    LowerAvailableDepth::Yes
-                                } else {
-                                    LowerAvailableDepth::No
-                                }
-                            }
-                            ty::Bool
-                            | ty::Char
-                            | ty::Int(..)
-                            | ty::Uint(..)
-                            | ty::Float(..)
-                            | ty::Str
-                            | ty::Pat(..)
-                            | ty::FnPtr(..)
-                            | ty::Array(..)
-                            | ty::Slice(..)
-                            | ty::RawPtr(..)
-                            | ty::Never
-                            | ty::Tuple(..)
-                            | ty::UnsafeBinder(_)
-                            | ty::Param(..)
-                            | ty::Placeholder(..)
-                            | ty::Bound(..)
-                            | ty::Infer(..)
-                            | ty::Alias(_, _)
-                            | ty::Ref(_, _, _)
-                            | ty::Adt(_, _)
-                            | ty::Foreign(_)
-                            | ty::Dynamic(..)
-                            | ty::Error(_)
-                            | ty::FnDef(..)
-                            | ty::Closure(..)
-                            | ty::CoroutineClosure(..)
-                            | ty::Coroutine(..) => LowerAvailableDepth::Yes,
-                        }
-                    } else {
-                        LowerAvailableDepth::Yes
-                    }
-                }
-                ty::PredicateKind::Clause(ty::ClauseKind::HostEffect(_))
-                | ty::PredicateKind::Clause(ty::ClauseKind::Projection(_))
-                | ty::PredicateKind::Clause(ty::ClauseKind::TypeOutlives(_))
-                | ty::PredicateKind::Clause(ty::ClauseKind::RegionOutlives(_))
-                | ty::PredicateKind::Clause(ty::ClauseKind::ConstArgHasType(_, _))
-                | ty::PredicateKind::Clause(ty::ClauseKind::UnstableFeature(_))
-                | ty::PredicateKind::Subtype(_)
-                | ty::PredicateKind::Coerce(_)
-                | ty::PredicateKind::DynCompatible(_)
-                | ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(_))
-                | ty::PredicateKind::Clause(ty::ClauseKind::ConstEvaluatable(_))
-                | ty::PredicateKind::ConstEquate(_, _)
-                | ty::PredicateKind::Ambiguous => LowerAvailableDepth::Yes,
-            };
+            self.lower_available_depth(canonical_goal.canonical.value.goal.predicate);
         self.search_graph.evaluate_goal(
             self.cx(),
             canonical_goal,
@@ -815,6 +843,7 @@ where
                     goal,
                     &[],
                     TypingMode::ErasedNotCoherence(MayBeErased),
+                    self.search_graph.scratch().take_args(),
                 );
 
                 let (canonical_result, accessed_opaques) =
@@ -826,7 +855,10 @@ where
                     &opaque_types,
                 );
                 match should_rerun {
-                    RerunDecision::Yes => debug!("rerunning in original typing mode"),
+                    RerunDecision::Yes => {
+                        debug!("rerunning in original typing mode");
+                        self.search_graph.scratch().give_args(orig_values);
+                    }
                     RerunDecision::No => {
                         break 'retry_canonicalize (
                             canonical_result,
@@ -836,7 +868,10 @@ where
                         );
                     }
                     RerunDecision::EagerlyPropagateToParent => {
-                        self.opaque_accesses.update(accessed_opaques)?;
+                        if let Err(e) = self.opaque_accesses.update(accessed_opaques) {
+                            self.search_graph.scratch().give_args(orig_values);
+                            return Err(e.into());
+                        }
                         break 'retry_canonicalize (
                             canonical_result,
                             orig_values,
@@ -849,8 +884,13 @@ where
                 }
             }
 
-            let (orig_values, canonical_goal) =
-                canonicalize_goal(self.delegate, goal, &opaque_types, typing_mode);
+            let (orig_values, canonical_goal) = canonicalize_goal(
+                self.delegate,
+                goal,
+                &opaque_types,
+                typing_mode,
+                self.search_graph.scratch().take_args(),
+            );
 
             let (canonical_result, accessed_opaques) =
                 self.evaluate_in_search_graph(canonical_goal, step_kind);
@@ -870,6 +910,7 @@ where
             }
             Err(NoSolution) => {
                 debug!("normal failure");
+                self.search_graph.scratch().give_args(orig_values);
                 return Err(NoSolution.into());
             }
         };
@@ -879,12 +920,15 @@ where
         let has_changed =
             if !has_only_region_constraints(response) { HasChanged::Yes } else { HasChanged::No };
 
+        let mut opt_values = self.search_graph.scratch().take_opt_args();
         let (normalization_nested_goals, certainty) = instantiate_and_apply_query_response(
             self.delegate,
             &orig_values,
             response,
             self.origin_span,
+            &mut opt_values,
         );
+        self.search_graph.scratch().give_opt_args(opt_values);
 
         // FIXME: We previously had an assert here that checked that recomputing
         // a goal after applying its constraints did not change its response.
@@ -907,11 +951,12 @@ where
                 HasChanged::No => Some(self.build_stalled_on(
                     canonical_goal,
                     maybe_info,
-                    orig_values,
+                    &orig_values,
                     succeeded_in_erased,
                 )),
             },
         };
+        self.search_graph.scratch().give_args(orig_values);
 
         Ok((
             normalization_nested_goals,
@@ -923,13 +968,14 @@ where
         &self,
         canonical_goal: I::CanonicalInput,
         maybe_info: MaybeInfo,
-        stalled_vars: ThinVec<I::GenericArg>,
+        stalled_vars: &[I::GenericArg],
         previously_succeeded_in_erased: SucceededInErased<I>,
     ) -> GoalStalledOn<I> {
         // Remove the canonicalized universal vars, since we only care about stalled existentials.
         let mut sub_roots = ThinVec::new();
         let stalled_vars = stalled_vars
-            .into_iter()
+            .iter()
+            .copied()
             .filter_map(|arg| match arg.kind() {
                 // Lifetimes can never stall goals.
                 ty::GenericArgKind::Lifetime(_) => None,
@@ -1052,12 +1098,22 @@ where
     fn evaluate_added_goals_step(
         &mut self,
     ) -> Result<Option<Certainty>, NoSolutionOrRerunNonErased> {
+        // The goals of this step are taken out and an emptied list from the scratch takes
+        // their place, so goals still pending push into warm room and neither list is freed.
+        let spare = self.search_graph.scratch().take_nested_goals();
+        let mut goals = mem::replace(&mut self.nested_goals, spare);
+        let result = self.evaluate_goals_of_step(&mut goals);
+        self.search_graph.scratch().give_nested_goals(goals);
+        result
+    }
+
+    fn evaluate_goals_of_step(
+        &mut self,
+        goals: &mut Vec<(GoalSource, Goal<I, I::Predicate>, Option<GoalStalledOn<I>>)>,
+    ) -> Result<Option<Certainty>, NoSolutionOrRerunNonErased> {
         // If this loop did not result in any progress, what's our final certainty.
         let mut unchanged_certainty = Some(Certainty::Yes);
-        // This mem::take seems super inefficient, given that we push to it again later.
-        // Despite that, replacing it has no effect on performance. We tried.
-        // (https://github.com/rust-lang/rust/pull/158126)
-        for (source, goal, stalled_on) in mem::take(&mut self.nested_goals) {
+        for (source, goal, stalled_on) in goals.drain(..) {
             // We never handle `NormalizesTo` as a nested goal
             debug_assert!(!matches!(
                 goal.predicate.kind().skip_binder(),
@@ -1101,8 +1157,8 @@ where
             self.normalize(goal.param_env, ty::Unnormalized::new_wip(goal.predicate))?;
         self.inspect.add_goal(self.delegate, self.max_input_universe, source, goal);
 
-        if let Some(GoalEvaluation { goal, certainty, has_changed: _, stalled_on }) =
-            compute_goal_fast_path(self.delegate, goal, self.origin_span)
+        if let Some((GoalEvaluation { goal, certainty, has_changed: _, stalled_on }, _)) =
+            compute_goal_fast_path(self.delegate, goal, self.origin_span, FastPathDepth::Added)
         {
             match certainty {
                 // We're done here
@@ -1656,18 +1712,17 @@ where
                 // uplifting its nested goals. This is the case if the `shallow_certainty` is
                 // `Certainty::Yes`.
                 (CurrentGoalKind::ProjectionComputeAssocTermCandidate, Certainty::Yes) => {
-                    let goals = std::mem::take(&mut self.nested_goals);
+                    let mut goals = std::mem::take(&mut self.nested_goals);
                     // As we return all ambiguous nested goals, we can ignore the certainty
                     // returned by `self.try_evaluate_added_goals()`.
                     if goals.is_empty() {
                         assert!(matches!(goals_certainty, Certainty::Yes));
                     }
-                    (
-                        Certainty::Yes,
-                        NestedNormalizationGoals(
-                            goals.into_iter().map(|(s, g, _)| (s, g)).collect(),
-                        ),
-                    )
+                    let scratch = self.search_graph.scratch();
+                    let mut normalization_goals = scratch.take_normalization_goals();
+                    normalization_goals.extend(goals.drain(..).map(|(s, g, _)| (s, g)));
+                    scratch.give_nested_goals(goals);
+                    (Certainty::Yes, NestedNormalizationGoals(normalization_goals))
                 }
                 _ => {
                     let certainty = shallow_certainty.and(goals_certainty);
@@ -1694,6 +1749,7 @@ where
             //
             // Changing this to retain some constraints in the future
             // won't be a breaking change, so this is good enough for now.
+            self.search_graph.scratch().give_normalization_goals(normalization_nested_goals.0);
             return Ok(self.make_ambiguous_response_no_constraints(maybe_info));
         }
 
@@ -1704,21 +1760,37 @@ where
             .deeply_resolve_via_unification_table((self.var_values, external_constraints));
 
         // Remove any trivial or duplicated region constraints once we've resolved regions
-        let mut unique = HashSet::default();
+        let mut unique = self.search_graph.scratch().take_seen_outlives();
         if let ExternalRegionConstraints::Old(r) = &mut external_constraints.region_constraints {
             r.retain(|(outlives, _)| !outlives.is_trivial() && unique.insert(*outlives));
         }
+        self.search_graph.scratch().give_seen_outlives(unique);
 
-        filter_irrelevant_region_constraints(self.delegate, var_values, &mut external_constraints);
+        let mut region_vars = self.search_graph.scratch().take_region_vars();
+        filter_irrelevant_region_constraints(
+            self.delegate,
+            var_values,
+            &mut external_constraints,
+            &mut region_vars,
+        );
+        self.search_graph.scratch().give_region_vars(region_vars);
+
+        // Interned from the borrow, so a response the interner has already costs no copy, and
+        // the lists go back to the scratch.
+        let interned = self.cx().mk_external_constraints_ref(&external_constraints);
+        let ExternalConstraintsData { region_constraints, opaque_types, normalization_nested_goals } =
+            external_constraints;
+        let scratch = self.search_graph.scratch();
+        if let ExternalRegionConstraints::Old(region_constraints) = region_constraints {
+            scratch.give_region_constraints(region_constraints);
+        }
+        scratch.give_opaque_types(opaque_types);
+        scratch.give_normalization_goals(normalization_nested_goals.0);
 
         let canonical = canonicalize_response(
             self.delegate,
             self.max_input_universe,
-            Response {
-                var_values,
-                certainty,
-                external_constraints: self.cx().mk_external_constraints(external_constraints),
-            },
+            Response { var_values, certainty, external_constraints: interned },
         );
 
         Ok(canonical)
@@ -1749,7 +1821,7 @@ where
     /// values.
     #[instrument(level = "trace", skip(self), ret)]
     fn compute_external_query_constraints(
-        &self,
+        &mut self,
         certainty: Certainty,
         normalization_nested_goals: NestedNormalizationGoals<I>,
     ) -> ExternalConstraintsData<I> {
@@ -1770,7 +1842,9 @@ where
             })
         } else {
             ExternalRegionConstraints::Old(if let Certainty::Yes = certainty {
-                self.delegate.make_deduplicated_region_constraints()
+                let mut region_constraints = self.search_graph.scratch().take_region_constraints();
+                self.delegate.make_deduplicated_region_constraints_into(&mut region_constraints);
+                region_constraints
             } else {
                 vec![]
             })
@@ -1780,9 +1854,11 @@ where
         //
         // Constraints for any existing opaque types are already tracked by changes
         // to the `var_values`.
-        let opaque_types = self
-            .delegate
-            .clone_opaque_types_added_since(self.initial_opaque_types_storage_num_entries);
+        let mut opaque_types = self.search_graph.scratch().take_opaque_types();
+        self.delegate.clone_opaque_types_added_since_into(
+            self.initial_opaque_types_storage_num_entries,
+            &mut opaque_types,
+        );
 
         if self.typing_mode().is_erased_not_coherence() {
             assert!(opaque_types.is_empty());
@@ -1830,15 +1906,15 @@ fn filter_irrelevant_region_constraints<D, I>(
     delegate: &D,
     var_values: I::GenericArgs,
     external_constraints: &mut ExternalConstraintsData<I>,
+    vars: &mut HashSet<RegionVid>,
 ) where
     D: SolverDelegate<Interner = I>,
     I: Interner,
 {
-    #[derive(Default)]
-    struct NonTrivialVars {
-        vars: HashSet<RegionVid>,
+    struct NonTrivialVars<'a> {
+        vars: &'a mut HashSet<RegionVid>,
     }
-    impl<I> TypeVisitor<I> for NonTrivialVars
+    impl<I> TypeVisitor<I> for NonTrivialVars<'_>
     where
         I: Interner,
     {
@@ -1875,7 +1951,7 @@ fn filter_irrelevant_region_constraints<D, I>(
     if let ExternalRegionConstraints::Old(r) = region_constraints
         && !r.is_empty()
     {
-        let mut vis = NonTrivialVars::default();
+        let mut vis = NonTrivialVars { vars };
         var_values.visit_with(&mut vis);
         // We have to visit each component of `external_constraints` individually here
         // because we skip the RHS of outlives constraints, and `TypeVisitor` doesn't
@@ -2040,14 +2116,14 @@ pub(super) fn evaluate_root_goal_for_proof_tree<D: SolverDelegate<Interner = I>,
     let typing_mode = delegate.typing_mode_raw().assert_not_erased();
 
     let (orig_values, canonical_goal) =
-        canonicalize_goal(delegate, goal, &opaque_types, typing_mode.into());
+        canonicalize_goal(delegate, goal, &opaque_types, typing_mode.into(), Vec::new());
 
     let (canonical_result, final_revision, required_depth) =
         delegate.cx().evaluate_root_goal_for_proof_tree_raw(canonical_goal, root_depth);
 
     let proof_tree = inspect::GoalEvaluation {
         uncanonicalized_goal: goal,
-        orig_values,
+        orig_values: orig_values.into(),
         final_revision,
         result: canonical_result,
         required_depth,
@@ -2063,6 +2139,7 @@ pub(super) fn evaluate_root_goal_for_proof_tree<D: SolverDelegate<Interner = I>,
         &proof_tree.orig_values,
         response,
         origin_span,
+        &mut Vec::new(),
     );
 
     (Ok(normalization_nested_goals), proof_tree)

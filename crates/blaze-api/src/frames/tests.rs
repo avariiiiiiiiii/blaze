@@ -72,6 +72,12 @@ impl Model {
         }
         (4 + len as usize).saturating_sub(held).min(held).max(least)
     }
+
+    fn ready(&self) -> bool {
+        let Some(head) = self.bytes.get(..4) else { return false };
+        let len = u32::from_be_bytes(head.try_into().unwrap());
+        len > LONGEST_REQUEST || self.bytes.len() >= 4 + len as usize
+    }
 }
 
 /// A reader that gives at most `most` bytes a read.
@@ -125,10 +131,13 @@ fn every_way_in_gives_what_the_old_frames_gave() {
             at += len;
             assert_eq!(frames.held(), model.bytes.len(), "seed {seed}");
             assert_eq!(frames.wanted(64), model.wanted(64), "seed {seed}");
+            assert_eq!(frames.ready(), model.ready(), "seed {seed}");
             while let Some(item) = frames.next_ref().unwrap() {
                 assert_eq!(Some(item.to_vec()), model.next(), "seed {seed}");
+                assert_eq!(frames.ready(), model.ready(), "seed {seed}");
             }
             assert_eq!(model.next(), None, "seed {seed}");
+            assert!(!frames.ready(), "seed {seed}");
         }
         assert_eq!(frames.held(), 0, "seed {seed}");
     }

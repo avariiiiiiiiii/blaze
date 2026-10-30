@@ -67,6 +67,7 @@ struct Frame {
 
 /// rustc's names for anonymous regions, `'a` to `'z`.
 static LETTERS: LazyLock<[Symbol; 26]> =
+    // alloc: setup, once per process
     LazyLock::new(|| std::array::from_fn(|i| Symbol::intern(&format!("'{}", (b'a' + i as u8) as char))));
 
 pub(crate) struct Printer<'p, 'a, 'db, 't> {
@@ -105,11 +106,11 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             paths: cx.paths(),
             mode,
             in_value,
-            out: String::new(),
+            out: String::new(), // alloc: the text printed, the edge
             empty_path: false,
             no_visible: false,
             printed_type_count: 0,
-            frames: Vec::new(),
+            frames: Vec::new(), // alloc: empty, allocates nothing
             used_names: FxHashSet::default(),
             region_index: 0,
         }
@@ -170,7 +171,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     fn bound_name(&self, d: DebruijnIndex, br: BoundRegion<'t>) -> Option<Symbol> {
         let frame = self.frames.len().checked_sub(1 + d.as_usize())?;
         let var = br.var.as_u32();
-        self.frames[frame].names.iter().find(|(v, _)| *v == var).map(|(_, name)| name.clone())
+        self.frames[frame].names.iter().find(|(v, _)| *v == var).map(|&(_, name)| name)
     }
 
     /// rustc's `should_print_optional_region`: whether `&'a T` and `dyn Trait + 'a` show it.
@@ -232,6 +233,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
         value.visit_with(&mut bound);
 
         let letters: SmallVec<[&Symbol; 26]> =
+            // alloc: none, at most 26 inline in the `SmallVec`
             LETTERS.iter().filter(|it| !self.used_names.contains(*it)).collect();
         let mut taken = 0;
         let mut region_index = self.region_index;
@@ -247,8 +249,9 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 let name = match letters.get(taken) {
                     Some(it) => {
                         taken += 1;
-                        (*it).clone()
+                        **it
                     }
+                    // alloc: a region past `'z` named, printing a type, the edge
                     None => Symbol::intern(&format!("'z{}", region_index - letters.len())),
                 };
                 region_index += 1;
@@ -747,7 +750,7 @@ fn early_name(db: &Db, p: EarlyParamRegion) -> Option<Symbol> {
     if p.id.local_id.into_raw().into_u32() as usize >= generics.len_lifetimes() {
         return None;
     }
-    Some(generics[p.id.local_id].name.symbol().clone())
+    Some(*generics[p.id.local_id].name.symbol())
 }
 
 /// The name of a late-bound lifetime of a function: the `var`th late-bound lifetime parameter
@@ -756,7 +759,7 @@ fn late_name(db: &Db, br: BoundRegion<'_>) -> Option<Symbol> {
     let BoundRegionKind::Named(def) = br.kind else { return None };
     let def = GenericDefId::try_from(def).ok()?;
     let (_, data) = GenericParams::of(db, def).iter_late_bound_lt().nth(br.var.as_usize())?;
-    (data.name.as_str() != "'_").then(|| data.name.symbol().clone())
+    (data.name.as_str() != "'_").then(|| *data.name.symbol())
 }
 
 /// The regions a binder at `depth` binds, in the order rustc's `RegionFolder` reaches them.

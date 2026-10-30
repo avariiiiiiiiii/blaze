@@ -37,7 +37,10 @@ use std::ops::ControlFlow;
 use blaze_items::Fact;
 use hir::{HirFileId, InFile};
 use rustc_hash::FxHashSet;
-use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::{
+    NodeOrToken, SyntaxKind, TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
     cx::Cx,
@@ -125,18 +128,23 @@ impl Features {
     }
 
     fn enable_lang(&mut self, name: &str, at: InFile<TextRange>, since: Option<&'static str>) {
+        // alloc: setup, once per `#![feature]`, once per check
         self.names.insert(name.to_owned());
+        // alloc: as above
         self.lang.push(Enabled { name: name.to_owned(), at, since });
     }
 
     fn enable_lib(&mut self, name: &str, at: InFile<TextRange>) {
+        // alloc: setup, once per `#![feature]`, once per check
         self.names.insert(name.to_owned());
+        // alloc: as above
         self.lib.push(Enabled { name: name.to_owned(), at, since: None });
     }
 }
 
 /// The crate's `#![feature(..)]`s: each feature it names, with the attribute it is in.
 fn crate_features<'a>(owners: &'a [Owner]) -> Vec<Named<'a>> {
+    // alloc: setup, the crate's `#![feature]`s, once per caller per check
     owners.iter().find(|it| it.target == Target::Crate).map(|it| named(it).collect()).unwrap_or_default()
 }
 
@@ -145,12 +153,14 @@ fn crate_features<'a>(owners: &'a [Owner]) -> Vec<Named<'a>> {
 /// (E0725).
 pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner], flags: &Flags) -> (Features, Vec<Found>) {
     let bootstrap = cx.krate.base().env(cx.db).get("RUSTC_BOOTSTRAP");
+    // alloc: setup, the crate's name, once per check
     let crate_name = cx.krate.display_name(cx.db).map(|it| it.crate_name().to_string());
     let mut features = Features {
         nightly: nightly_build(bootstrap.as_deref(), None),
         crate_nightly: nightly_build(bootstrap.as_deref(), crate_name.as_deref()),
         ..Features::default()
     };
+    // alloc: empty, allocates only when a feature is in error
     let mut found = Vec::new();
     for feature in crate_features(owners) {
         let name = feature.name.as_str();
@@ -158,12 +168,15 @@ pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner], flags: &Flags) -> (F
         let lang = table::lang(name);
         if let Some((reason, pull)) = table::removed(name) {
             let span = cx.span(at);
+            // clone: the error's span
             let mut diag = Diag::error(Some("E0557"), "feature has been removed", span.clone());
             diag.span_label(span, "feature has been removed");
             let since = lang.map_or("", |it| it.since);
             let pull_note = pull
+                // alloc: the error's note
                 .map(|pull| format!("; see <https://github.com/rust-lang/rust/pull/{pull}> for more information"))
                 .unwrap_or_default();
+            // alloc: the error's note
             diag.note(format!("removed in {since}{pull_note}"));
             if let Some(reason) = reason {
                 diag.note(reason);
@@ -179,6 +192,7 @@ pub(crate) fn configured(cx: &Cx<'_, '_>, owners: &[Owner], flags: &Flags) -> (F
         if let Some(allowed) = &flags.allow_features
             && allowed.iter().all(|it| it != name)
         {
+            // alloc: the error's message
             let message = format!("the feature `{name}` is not in the list of allowed features");
             let mut diag = Diag::error(Some("E0725"), message, cx.span(at));
             crate_fact(cx, &mut diag);
@@ -218,6 +232,7 @@ const DEPENDENT_FEATURES: &[(&str, &[&str])] = &[
 /// `maybe_stage_features` (E0554), `check_incompatible_features`, `check_dependent_features`,
 /// `check_new_solver_banned_features`, `check_features_requiring_new_solver`.
 pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features, flags: &Flags) -> Vec<Found> {
+    // alloc: empty, allocates only when a feature is in error
     let mut diags = Vec::new();
     if !features.crate_nightly
         && features.in_stable_order().next().is_some()
@@ -228,6 +243,7 @@ pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features, fla
     for (f1, f2) in INCOMPATIBLE_FEATURES {
         let first = |name: &str| features.in_stable_order().find(|it| it.name == name);
         if let (Some(a), Some(b)) = (first(f1), first(f2)) {
+            // alloc: the error's message
             let message = format!("`{f1}` and `{f2}` are incompatible, using them at the same time is not allowed");
             let mut diag = Diag::error(None, message, cx.span(a.at));
             diag.primary(cx.span(b.at));
@@ -241,7 +257,9 @@ pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features, fla
         }
         let Some(at) = features.in_stable_order().find(|it| it.name == *parent) else { continue };
         let missing: Vec<String> =
+            // alloc: the error's message
             children.iter().filter(|it| !features.enabled(it)).map(|it| format!("`{it}`")).collect();
+        // alloc: the error's message
         let message = format!("`{parent}` requires {} to be enabled", missing.join(", "));
         let mut diag = Diag::error(None, message, cx.span(at.at));
         diag.help("enable all of these features");
@@ -269,6 +287,7 @@ pub(crate) fn staged(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features, fla
             crate_fact(cx, &mut diag);
             Found::new(diag, Phase::Resolve)
         })
+        // alloc: empty unless a feature is in error
         .collect()
 }
 
@@ -283,12 +302,14 @@ fn on_non_nightly(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> Opt
         .and_then(|krate| krate.attrs.iter().find(|it| it.is("feature")))
         .map(|attr| cx.span(attr.in_file(attr.range())))?;
     let message = "`#![feature]` may not be used on the nightly release channel";
+    // clone: the error's span
     let mut diag = Diag::error(Some("E0554"), message, first.clone());
     let mut all_stable = true;
     for feature in &named {
         let since = features.lang.iter().find(|it| it.name == feature.name).and_then(|it| it.since);
         match since {
             Some(since) => {
+                // alloc: the error's help
                 diag.help(format!(
                     "the feature `{}` has been stable since `{since}` and no longer requires an attribute to enable",
                     feature.name
@@ -312,6 +333,7 @@ pub(crate) fn feature_err(
     span: impl Into<MultiSpan>,
     explain: impl Into<String>,
 ) -> Diag {
+    // alloc: the error's code
     let mut diag = Diag::new(Level::Error, Some(Code::Error("E0658".to_owned())), explain);
     diag.span = span.into();
     feature_notes(&mut diag, features, feature);
@@ -334,11 +356,14 @@ pub(crate) fn feature_warn(features: &Features, feature: &str, span: Span, expla
 /// `add_feature_diagnostics_for_issue` of a language feature.
 fn feature_notes(diag: &mut Diag, features: &Features, feature: &str) {
     if let Some(n) = table::issue(feature) {
+        // alloc: the error's note
         diag.note(format!("see issue #{n} <https://github.com/rust-lang/rust/issues/{n}> for more information"));
     }
     if features.nightly {
+        // alloc: the error's help
         diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));
         if feature != "rustc_attrs" {
+            // alloc: the error's note
             diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
         }
     }
@@ -357,10 +382,10 @@ pub(crate) fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange
     let ctxt = file.span_map(db).span_for_range(range).ctx;
     let Some(call) = ctxt.outer_expn(db) else { return false };
     let def = hir_expand::MacroCallId::from(call).loc(db).def;
-    let node: SyntaxNode = match def.kind {
+    let node: ast::Node<'_> = match def.kind {
         MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => match def.ast_id() {
-            either::Either::Left(id) => id.to_node(db).syntax().clone(),
-            either::Either::Right(id) => id.to_node(db).syntax().clone(),
+            either::Either::Left(id) => id.to_view(db).syntax(),
+            either::Either::Right(id) => id.to_view(db).syntax(),
         },
         MacroDefKind::BuiltIn(..)
         | MacroDefKind::BuiltInAttr(..)
@@ -370,17 +395,17 @@ pub(crate) fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange
     };
     let Some(owner) = ast::AnyHasAttrs::cast(node) else { return false };
     let cfg = hir::Crate::from(def.krate).cfg(db);
-    hir_expand::attrs::expand_cfg_attr(ast::attrs_including_inner(&owner), || cfg, |meta, _| {
-        let allowed = matches!(&meta, ast::Meta::TokenTreeMeta(it)
+    hir_expand::attrs::expand_cfg_attr_view(ast::attrs_including_inner(&owner), || cfg, |meta, _| {
+        let allowed = matches!(meta, ast::Meta::TokenTreeMeta(it)
             if it.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "allow_internal_unstable")
-                && it.token_tree().is_some_and(|tt| names_feature(&tt, feature)));
+                && it.token_tree().is_some_and(|tt| names_feature(tt, feature)));
         if allowed { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
     })
     .is_some()
 }
 
 /// Whether the list `tt` of `#[allow_internal_unstable(..)]` has the word `feature`.
-fn names_feature(tt: &ast::TokenTree, feature: &str) -> bool {
+fn names_feature(tt: ast::TokenTree<'_>, feature: &str) -> bool {
     tt.syntax().children_with_tokens().any(|it| match it {
         NodeOrToken::Token(token) => {
             token.kind() == SyntaxKind::IDENT && token.text().strip_prefix("r#").unwrap_or(token.text()) == feature

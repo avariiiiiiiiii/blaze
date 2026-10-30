@@ -8,12 +8,17 @@
 
 mod confirm;
 pub mod frozen;
+mod pick_cache;
 mod probe;
+#[cfg(test)]
+mod relevant_tests;
+pub mod scope_sets;
 
 use std::{hash::BuildHasher, ops::Range};
 
 use crate::next_solver::StoredGenericArgs;
 use blaze_ids::radix;
+use blaze_mem::Frame;
 use either::Either;
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
@@ -36,7 +41,7 @@ use hir_def::{
     signatures::{ConstSignature, FunctionSignature},
     unstable_features::UnstableFeatures,
 };
-use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
+use rustc_hash::FxBuildHasher;
 use rustc_type_ir::{
     TypeFoldable, TypeVisitableExt, VisitorResult,
     fast_reject::{TreatParams, simplify_type},
@@ -67,20 +72,28 @@ use crate::{
     traits::ParamEnvAndCrate,
 };
 
-pub use self::probe::{
-    AutorefOrPtrAdjustment, Candidate, CandidateKind, CandidateStep, CandidateWithPrivate, Mode,
-    Pick, PickKind,
+pub use self::{
+    probe::{
+        AutorefOrPtrAdjustment, Candidate, CandidateKind, CandidateStep, CandidateWithPrivate,
+        Mode, Pick, PickKind,
+    },
+    scope_sets::{TraitSet, TraitsInScope},
 };
+pub use crate::specialization::ImplPair;
+pub(crate) use crate::{FrameMap, FrameSet};
 
 pub struct MethodResolutionContext<'a, 'db> {
     pub infcx: &'a InferCtxt<'db>,
     pub resolver: &'a Resolver<'db>,
     pub param_env: ParamEnv<'db>,
-    pub traits_in_scope: &'a FxHashSet<TraitId>,
+    pub traits_in_scope: TraitsInScope,
     pub edition: Edition,
     pub features: &'a UnstableFeatures,
     pub call_span: Span,
     pub receiver_span: Span,
+    /// The frame the probe's temporaries live in: the inference run's, or the task a caller
+    /// outside inference opened.
+    pub frame: &'a Frame,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -137,7 +150,7 @@ pub enum CandidateSource {
     Trait(TraitId),
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Performs method lookup. If lookup is successful, it will return the callee
     /// and store an appropriate adjustment for the self-expr. In some cases it may
     /// report an error (e.g., invoking the `drop` method).
@@ -153,6 +166,7 @@ impl<'db> InferenceContext<'db> {
         let (pick, is_visible) = match self.lookup_probe(call_expr, receiver, name, self_ty) {
             Ok(it) => {
                 self.write_unstable_candidates(call_expr.into(), &it);
+                self.record_trait_pick(call_expr.into(), &it);
                 self.lint_edition_dependent_dot_call(self_ty, call_expr, receiver, &it);
                 (it, true)
             }
@@ -171,7 +185,7 @@ impl<'db> InferenceContext<'db> {
             self.push_illegal_sized_bound(&pick, self_ty, call_expr, receiver, method, bound);
         }
 
-        self.write_expr_adj(receiver, result.adjustments);
+        self.write_expr_adj(receiver, &result.adjustments);
         self.write_method_resolution(call_expr, result.callee.def_id, result.callee.args);
 
         Ok((result.callee, is_visible))
@@ -197,20 +211,16 @@ impl<'db> InferenceContext<'db> {
         receiver_span: Span,
         f: impl FnOnce(&MethodResolutionContext<'_, 'db>) -> R,
     ) -> R {
-        let traits_in_scope = self.get_traits_in_scope();
-        let traits_in_scope = match &traits_in_scope {
-            Either::Left(it) => std::borrow::Borrow::<FxHashSet<TraitId>>::borrow(it),
-            Either::Right(it) => *it,
-        };
         let ctx = MethodResolutionContext {
             infcx: &self.table.infer_ctxt,
             resolver: &self.resolver,
             param_env: self.table.param_env,
-            traits_in_scope,
+            traits_in_scope: TraitsInScope::of_resolver(self.db, &self.resolver),
             edition: self.edition,
             features: self.features,
             call_span,
             receiver_span,
+            frame: self.frame,
         };
         f(&ctx)
     }
@@ -431,7 +441,7 @@ pub(crate) type StoredImplMethod =
 /// [`lookup_impl_method_query`], memoized: codegen asks the same trait method with the same
 /// arguments many times per build and again on every edit, and each ask re-runs trait
 /// selection in a fresh inference context.
-#[salsa::tracked(cycle_result = lookup_impl_method_cycle_result, returns(clone))]
+#[salsa::tracked(cycle_result = lookup_impl_method_cycle_result, returns(clone), mem_tag = Infer)]
 pub(crate) fn lookup_impl_method_stored(
     db: &Db,
     env: crate::traits::StoredParamEnvAndCrate,
@@ -533,7 +543,7 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
         db.impl_trait(parent)?.instantiate(infcx.interner, parent_args).skip_norm_wip();
     let mut ocx = ObligationCtxt::new(infcx);
     ocx.eq(&ObligationCause::dummy(), env, trait_ref, parent_trait_ref).ok()?;
-    let parent_args = infcx.resolve_vars_if_possible(parent_args);
+    let parent_args = infcx.deeply_resolve_ignoring_regions(parent_args);
     if parent_args.has_non_region_infer() {
         return None;
     }
@@ -544,13 +554,13 @@ fn lookup_impl_assoc_item_for_trait_ref<'db>(
 /// The function or constant of `impl_` named `name`, the first if there are more: all that a
 /// lookup of `name` reads of the impl, so an item of another name added to it leaves the
 /// lookup as it was.
-#[salsa::tracked]
+#[salsa::tracked(mem_tag = Infer)]
 pub fn impl_value_item(db: &Db, impl_: ImplId, name: Name) -> Option<CandidateId> {
     value_item_named(&impl_.impl_items(db).items, &name)
 }
 
 /// As [`impl_value_item`], of a trait.
-#[salsa::tracked]
+#[salsa::tracked(mem_tag = Infer)]
 pub fn trait_value_item(
     db: &Db,
     trait_: TraitId,
@@ -562,31 +572,36 @@ pub fn trait_value_item(
 /// For every trait declared in a module of `krate` (not in a block), what [`trait_value_item`]
 /// answers for each name its items have, sorted by name and then trait. Built once per crate,
 /// so a probe asks one query per crate of its traits in scope instead of one per trait.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn trait_value_items(db: &Db, krate: Crate) -> Box<[(Name, TraitId, CandidateId)]> {
-    let mut items: Vec<(Name, TraitId, CandidateId)> = Vec::new();
-    for (_, module) in crate_def_map(db, krate).modules(db) {
-        for def in module.scope(db).declarations() {
-            let ModuleDefId::TraitId(trait_) = def else { continue };
-            items.extend(trait_.trait_items(db).items.iter().filter_map(|&(name, item)| {
-                match item {
-                    AssocItemId::FunctionId(it) => Some((name, trait_, it.into())),
-                    AssocItemId::ConstId(it) => Some((name, trait_, it.into())),
-                    AssocItemId::TypeAliasId(_) => None,
+    blaze_mem::frame::current(|frame| {
+        // Each with where it was found: of a trait's items of one name the first stays first,
+        // as `value_item_named` takes it.
+        let mut items: Vec<(Name, TraitId, usize, CandidateId), &Frame> = Vec::new_in(frame);
+        for (_, module) in crate_def_map(db, krate).modules(db) {
+            for def in module.scope(db).declarations() {
+                let ModuleDefId::TraitId(trait_) = def else { continue };
+                for &(name, item) in trait_.trait_items(db).items.iter() {
+                    let item = match item {
+                        AssocItemId::FunctionId(it) => CandidateId::from(it),
+                        AssocItemId::ConstId(it) => CandidateId::from(it),
+                        AssocItemId::TypeAliasId(_) => continue,
+                    };
+                    let at = items.len();
+                    items.push((name, trait_, at, item));
                 }
-            }));
+            }
         }
-    }
-    // Stable, so of a trait's items of one name the first stays first, as `value_item_named`
-    // takes it.
-    items.sort_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
-    items.dedup_by(|later, first| (later.0, later.1) == (first.0, first.1));
-    items.into()
+        items.sort_unstable_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        items.dedup_by(|later, first| (later.0, later.1) == (first.0, first.1));
+        // alloc: the memo's result, one exact block
+        items.iter().map(|&(name, trait_, _, item)| (name, trait_, item)).collect()
+    })
 }
 
 /// The run of [`trait_value_items`] named `name`, sorted by trait: an item of another name
 /// added to a trait of `krate` leaves it as it was.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 pub(crate) fn in_crate_trait_value_items(
     db: &Db,
     krate: Crate,
@@ -594,18 +609,24 @@ pub(crate) fn in_crate_trait_value_items(
 ) -> Box<[(TraitId, CandidateId)]> {
     let items = trait_value_items(db, krate);
     let start = items.partition_point(|&(it, _, _)| it < name);
-    items[start..].iter().take_while(|&&(it, _, _)| it == name).map(|&(_, t, i)| (t, i)).collect()
+    let end = items.partition_point(|&(it, _, _)| it <= name);
+    // alloc: the memo's result, one exact block (none when empty)
+    items[start..end].iter().map(|&(_, t, i)| (t, i)).collect()
 }
 
 /// [`trait_value_item`] for each trait a probe asks of, through one
 /// [`in_crate_trait_value_items`] per crate and a binary search per trait. A trait in a block is
 /// asked of alone.
-#[derive(Debug, Default)]
-pub struct TraitValueItems<'db> {
-    runs: smallvec::SmallVec<[(Crate, &'db [(TraitId, CandidateId)]); 4]>,
+#[derive(Debug)]
+pub struct TraitValueItems<'db, 'f> {
+    runs: Vec<(Crate, &'db [(TraitId, CandidateId)]), &'f Frame>,
 }
 
-impl<'db> TraitValueItems<'db> {
+impl<'db, 'f> TraitValueItems<'db, 'f> {
+    pub fn new_in(frame: &'f Frame) -> Self {
+        TraitValueItems { runs: Vec::new_in(frame) }
+    }
+
     pub fn get(
         &mut self,
         db: &'db Db,
@@ -659,7 +680,7 @@ pub(crate) fn find_matching_impl<'db>(
         return None;
     }
 
-    let impl_source = infcx.resolve_vars_if_possible(impl_source);
+    let impl_source = infcx.deeply_resolve_ignoring_regions(impl_source);
     if impl_source.has_non_region_infer() {
         return None;
     }
@@ -686,86 +707,88 @@ pub(crate) fn find_matching_impl<'db>(
 /// Named is by the identifiers of `krate`'s files and of what the macros of other crates
 /// expand to among its items, which is more than rustc resolves (a local of the same name
 /// does) and less where such a macro in a body alone names the dependency.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
     let _p = tracing::info_span!("loaded_crates").entered();
-    let data = krate.data(db);
-    let mut unnamed: Vec<_> = data
-        .dependencies
-        .iter()
-        .filter(|dep| {
+    blaze_mem::frame::current(|frame| {
+        let data = krate.data(db);
+        let mut unnamed = Vec::new_in(frame);
+        unnamed.extend(data.dependencies.iter().filter(|dep| {
             let data = dep.crate_id.data(db);
             !(dep.is_sysroot() || data.origin.is_lang() || data.target_kind.is_proc_macro())
-        })
-        .collect();
-    // Few files name a dependency, and a file's text tells which may without its tree. A file
-    // `include!` puts among the items is one of the crate's as well: a root that is only
-    // `include!("../../app/main.rs");` names its dependencies there.
-    let included = hir_def::include_macro_invoc(db, krate);
-    let def_map = crate_def_map(db, krate);
-    let mut files = def_map
-        .modules(db)
-        .filter_map(|(_, module)| module.origin.file_id())
-        .chain(included.iter().map(|&(_, file)| file));
-    let named_in = |unnamed: &mut Vec<&base_db::BuiltDependency>, root: &syntax::SyntaxNode| {
-        let root = root.to_flat();
-        let (tree, at) = root.flat().expect("a flat tree");
-        // Few dependencies are left unnamed: each identifier is compared with them, and the
-        // walk ends when none is left.
-        let mut identifiers = (at..tree.end(at))
-            .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16);
+        }));
+        // Few files name a dependency, and a file's text tells which may without its tree. A
+        // file `include!` puts among the items is one of the crate's as well: a root that is
+        // only `include!("../../app/main.rs");` names its dependencies there.
+        let included = hir_def::include_macro_invoc(db, krate);
+        let def_map = crate_def_map(db, krate);
+        let mut files = def_map
+            .modules(db)
+            .filter_map(|(_, module)| module.origin.file_id())
+            .chain(included.iter().map(|&(_, file)| file));
+        let named_in = |unnamed: &mut Vec<&base_db::BuiltDependency, &Frame>,
+                        root: syntax::view::Node<'_>| {
+            let (tree, at) = root.flat();
+            // Few dependencies are left unnamed: each identifier is compared with them, and the
+            // walk ends when none is left.
+            let mut identifiers = (at..tree.end(at))
+                .filter(|&it| tree.is_token(it) && tree.kind(it).0 == SyntaxKind::IDENT as u16);
+            while !unnamed.is_empty()
+                && let Some(it) = identifiers.next()
+            {
+                let text = tree.token_text(it);
+                unnamed.retain(|dep| dep.name.symbol().as_str() != text);
+            }
+        };
         while !unnamed.is_empty()
-            && let Some(it) = identifiers.next()
+            && let Some(file) = files.next()
         {
-            let text = tree.token_text(it);
-            unnamed.retain(|dep| dep.name.symbol().as_str() != text);
+            let text = db.file_text(file.file_id(db)).text(db);
+            if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
+                continue;
+            }
+            named_in(&mut unnamed, file.parse(db).root());
         }
-    };
-    while !unnamed.is_empty()
-        && let Some(file) = files.next()
-    {
-        let text = db.file_text(file.file_id(db)).text(db);
-        if !unnamed.iter().any(|dep| text.contains(dep.name.symbol().as_str())) {
-            continue;
-        }
-        named_in(&mut unnamed, &file.parse(db).syntax_node());
-    }
-    // rustc loads the crate a path in a macro's output names too, as in the `impl
-    // dep::Trait for ..` a derive of a proc macro writes. A `macro_rules!` of `krate` writes
-    // nothing its files do not, nor does a built-in macro but `include!`, whose files are
-    // above.
-    let mut calls = def_map
-        .modules(db)
-        .flat_map(|(_, module)| module.scope(db).all_macro_calls().collect::<Vec<_>>())
-        .filter(|call| {
-            let def = call.loc(db).def;
-            def.krate != krate
-                && matches!(
-                    def.kind,
-                    hir_expand::MacroDefKind::ProcMacro(..)
-                        | hir_expand::MacroDefKind::Declarative(..)
-                )
-        });
-    while !unnamed.is_empty()
-        && let Some(call) = calls.next()
-    {
-        named_in(&mut unnamed, &call.parse_macro_expansion(db).value.0.syntax_node());
-    }
-    let mut loaded = FxHashSet::default();
-    let mut ordered = vec![krate];
-    loaded.insert(krate);
-    for dep in &data.dependencies {
-        if unnamed.iter().any(|it| std::ptr::eq(*it, dep)) {
-            continue;
-        }
-        // The same of the dependency: the crates of its tests and benches are among its own.
-        for &dep in loaded_crates(db, dep.crate_id) {
-            if loaded.insert(dep) {
-                ordered.push(dep);
+        // rustc loads the crate a path in a macro's output names too, as in the `impl
+        // dep::Trait for ..` a derive of a proc macro writes. A `macro_rules!` of `krate`
+        // writes nothing its files do not, nor does a built-in macro but `include!`, whose
+        // files are above.
+        'modules: for (_, module) in def_map.modules(db) {
+            for call in module.scope(db).all_macro_calls() {
+                if unnamed.is_empty() {
+                    break 'modules;
+                }
+                let def = call.loc(db).def;
+                if def.krate == krate
+                    || !matches!(
+                        def.kind,
+                        hir_expand::MacroDefKind::ProcMacro(..)
+                            | hir_expand::MacroDefKind::Declarative(..)
+                    )
+                {
+                    continue;
+                }
+                named_in(&mut unnamed, call.parse_macro_expansion(db).value.0.root());
             }
         }
-    }
-    ordered.into()
+        let mut loaded = crate::frame_set(frame);
+        let mut ordered = Vec::new_in(frame);
+        ordered.push(krate);
+        loaded.insert(krate);
+        for dep in &data.dependencies {
+            if unnamed.iter().any(|it| std::ptr::eq(*it, dep)) {
+                continue;
+            }
+            // The same of the dependency: the crates of its tests and benches are among its own.
+            for &dep in loaded_crates(db, dep.crate_id) {
+                if loaded.insert(dep) {
+                    ordered.push(dep);
+                }
+            }
+        }
+        // alloc: the memo's result, one exact block
+        ordered.iter().copied().collect()
+    })
 }
 
 /// The items of `scope` whose bodies may hold impls: an impl is one of its crate wherever it
@@ -778,8 +801,14 @@ pub fn loaded_crates(db: &Db, krate: Crate) -> Box<[Crate]> {
 /// `EnumAccess` for `&mut Deserializer`, and a `#[derive]` on a struct in a body or a
 /// procedural macro called there writes one with no `impl` in the text. A module's constants
 /// are all looked into: lexing finds no initializer after `const _`.
-fn impl_holders(db: &Db, krate: Crate, scope: &ItemScope) -> Vec<DefWithBodyId> {
-    let mut holders: Vec<DefWithBodyId> = scope.consts().map(DefWithBodyId::from).collect();
+fn impl_holders<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    krate: Crate,
+    scope: &ItemScope,
+) -> Vec<DefWithBodyId, &'f Frame> {
+    let mut holders = Vec::new_in(frame);
+    holders.extend(scope.consts().map(DefWithBodyId::from));
     let declared = scope.declarations().filter_map(|def| match def {
         ModuleDefId::FunctionId(it) if may_hold(db, krate, it.loc(db).id, true) => {
             Some(DefWithBodyId::from(it))
@@ -845,6 +874,24 @@ enum BodyMark {
     Attribute(Symbol),
 }
 
+/// The `macro_rules!` of a file ([`macro_definitions`]): each one's name, whether it may write
+/// an impl, and the end of its run in `calls`, the names of the other macros it calls.
+#[derive(Debug, Default, PartialEq, Eq, SalsaValue)]
+struct MacroDefinitions {
+    defs: Box<[(Symbol, bool, u32)]>,
+    calls: Box<[Symbol]>,
+}
+
+impl MacroDefinitions {
+    fn iter(&self) -> impl Iterator<Item = (&Symbol, bool, &[Symbol])> + '_ {
+        self.defs.iter().scan(0, |start, (name, writes, end)| {
+            let calls = &self.calls[*start as usize..*end as usize];
+            *start = *end;
+            Some((name, *writes, calls))
+        })
+    }
+}
+
 /// Whether the body of `id` may hold an impl (or, without `impls`, an item a macro or an
 /// attribute writes): its text has an `impl`, a call of a macro not proven to write none
 /// ([`macro_is_inert`]) or an attribute that is not inert. An item a macro writes has no text
@@ -890,101 +937,105 @@ fn macro_is_inert(db: &Db, krate: Crate, name: &Symbol) -> bool {
 /// attribute inside the braces that follow `fn name`, or between the `=` and the `;` of a
 /// `const` or `static`. An `impl Trait` type is found as well, which costs a lowering and
 /// nothing else.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn impls_in_bodies(
     db: &Db,
     file: base_db::EditionedFileId,
 ) -> Box<[(TextSize, BodyMark)]> {
-    let text = db.file_text(file.file_id(db)).text(db);
-    let lexed = syntax::LexedStr::new(file.edition(db), text);
-    let tokens: Vec<usize> = (0..lexed.len()).filter(|&i| !lexed.kind(i).is_trivia()).collect();
-    let kind = |at: usize| tokens.get(at).map_or(SyntaxKind::EOF, |&i| lexed.kind(i));
-    let start = |at: usize| TextSize::from(lexed.text_start(tokens[at]) as u32);
-    // For each open brace, whether it is a function's body.
-    let mut braces = Vec::new();
-    let mut bodies = 0usize;
-    // The parentheses and brackets open: a `;` in `-> [u8; 4]` does not end the signature.
-    let mut nested = 0usize;
-    let mut signature = None;
-    // Every delimiter open, and the depths at which a `const` or `static` initializer is.
-    let mut depth = 0usize;
-    let mut constant = None;
-    let mut initializers: Vec<usize> = Vec::new();
-    let mut found = Vec::new();
-    for at in 0..tokens.len() {
-        let previous = if at == 0 { SyntaxKind::EOF } else { kind(at - 1) };
-        let in_body = bodies > 0 || !initializers.is_empty();
-        match kind(at) {
-            SyntaxKind::IDENT if previous == T![fn] => signature = Some(nested),
-            SyntaxKind::IDENT if matches!(previous, T![const] | T![static] | T![mut]) => {
-                constant = Some(depth)
-            }
-            T![=] if constant == Some(depth) => {
-                constant = None;
-                initializers.push(depth);
-            }
-            T!['('] | T!['['] => {
-                nested += 1;
-                depth += 1;
-            }
-            T![')'] | T![']'] => {
-                nested = nested.saturating_sub(1);
-                depth = depth.saturating_sub(1);
-                initializers.retain(|&it| it <= depth);
-            }
-            T![;] => {
-                if signature == Some(nested) {
-                    signature = None;
+    blaze_mem::frame::current(|frame| {
+        let text = db.file_text(file.file_id(db)).text(db);
+        let lexed = syntax::LexedStr::new(file.edition(db), text);
+        let mut tokens: Vec<usize, &Frame> = Vec::with_capacity_in(lexed.len(), frame);
+        tokens.extend((0..lexed.len()).filter(|&i| !lexed.kind(i).is_trivia()));
+        let kind = |at: usize| tokens.get(at).map_or(SyntaxKind::EOF, |&i| lexed.kind(i));
+        let start = |at: usize| TextSize::from(lexed.text_start(tokens[at]) as u32);
+        // For each open brace, whether it is a function's body.
+        let mut braces = Vec::new_in(frame);
+        let mut bodies = 0usize;
+        // The parentheses and brackets open: a `;` in `-> [u8; 4]` does not end the signature.
+        let mut nested = 0usize;
+        let mut signature = None;
+        // Every delimiter open, and the depths at which a `const` or `static` initializer is.
+        let mut depth = 0usize;
+        let mut constant = None;
+        let mut initializers: Vec<usize, &Frame> = Vec::new_in(frame);
+        let mut found = Vec::new_in(frame);
+        for at in 0..tokens.len() {
+            let previous = if at == 0 { SyntaxKind::EOF } else { kind(at - 1) };
+            let in_body = bodies > 0 || !initializers.is_empty();
+            match kind(at) {
+                SyntaxKind::IDENT if previous == T![fn] => signature = Some(nested),
+                SyntaxKind::IDENT if matches!(previous, T![const] | T![static] | T![mut]) => {
+                    constant = Some(depth)
                 }
-                if constant == Some(depth) {
+                T![=] if constant == Some(depth) => {
                     constant = None;
+                    initializers.push(depth);
                 }
-                if initializers.last() == Some(&depth) {
-                    initializers.pop();
+                T!['('] | T!['['] => {
+                    nested += 1;
+                    depth += 1;
                 }
-            }
-            T!['{'] => {
-                // A block inside brackets (`-> [u8; { N }]`) is no body. One after `<`, `,` or
-                // `=` may be a const argument (`-> impl Tr<{ N }>`): counted as a body, it
-                // leaves the brace after it one as well.
-                let body = signature == Some(nested);
-                if body && !matches!(previous, T![<] | T![,] | T![=]) {
-                    signature = None;
+                T![')'] | T![']'] => {
+                    nested = nested.saturating_sub(1);
+                    depth = depth.saturating_sub(1);
+                    initializers.retain(|&it| it <= depth);
                 }
-                bodies += usize::from(body);
-                braces.push(body);
-                depth += 1;
+                T![;] => {
+                    if signature == Some(nested) {
+                        signature = None;
+                    }
+                    if constant == Some(depth) {
+                        constant = None;
+                    }
+                    if initializers.last() == Some(&depth) {
+                        initializers.pop();
+                    }
+                }
+                T!['{'] => {
+                    // A block inside brackets (`-> [u8; { N }]`) is no body. One after `<`,
+                    // `,` or `=` may be a const argument (`-> impl Tr<{ N }>`): counted as a
+                    // body, it leaves the brace after it one as well.
+                    let body = signature == Some(nested);
+                    if body && !matches!(previous, T![<] | T![,] | T![=]) {
+                        signature = None;
+                    }
+                    bodies += usize::from(body);
+                    braces.push(body);
+                    depth += 1;
+                }
+                T!['}'] => {
+                    bodies -= usize::from(braces.pop().unwrap_or(false));
+                    depth = depth.saturating_sub(1);
+                    initializers.retain(|&it| it <= depth);
+                }
+                _ => {}
             }
-            T!['}'] => {
-                bodies -= usize::from(braces.pop().unwrap_or(false));
-                depth = depth.saturating_sub(1);
-                initializers.retain(|&it| it <= depth);
+            if !in_body {
+                continue;
             }
-            _ => {}
+            match kind(at) {
+                T![impl] => found.push((start(at), BodyMark::Impl)),
+                T![!] if previous == SyntaxKind::IDENT => {
+                    let name = Symbol::intern(lexed.text(tokens[at - 1]));
+                    found.push((start(at - 1), BodyMark::Call(name)));
+                }
+                T![#] => {
+                    let open = if kind(at + 1) == T![!] { at + 2 } else { at + 1 };
+                    if kind(open) == T!['['] {
+                        let name = match kind(open + 1) {
+                            SyntaxKind::IDENT => lexed.text(tokens[open + 1]),
+                            _ => "",
+                        };
+                        found.push((start(at), BodyMark::Attribute(Symbol::intern(name))));
+                    }
+                }
+                _ => {}
+            }
         }
-        if !in_body {
-            continue;
-        }
-        match kind(at) {
-            T![impl] => found.push((start(at), BodyMark::Impl)),
-            T![!] if previous == SyntaxKind::IDENT => {
-                let name = Symbol::intern(lexed.text(tokens[at - 1]));
-                found.push((start(at - 1), BodyMark::Call(name)));
-            }
-            T![#] => {
-                let open = if kind(at + 1) == T![!] { at + 2 } else { at + 1 };
-                if kind(open) == T!['['] {
-                    let name = match kind(open + 1) {
-                        SyntaxKind::IDENT => lexed.text(tokens[open + 1]),
-                        _ => "",
-                    };
-                    found.push((start(at), BodyMark::Attribute(Symbol::intern(name))));
-                }
-            }
-            _ => {}
-        }
-    }
-    found.into()
+        // alloc: the memo's result, one exact block (none when empty)
+        found.drain(..).collect()
+    })
 }
 
 /// Every `macro_rules!` name of `krate` and of its dependencies, and every procedural macro
@@ -995,159 +1046,170 @@ fn impls_in_bodies(
 /// turn (dtoa's `dtoa!`, called in the body of `<f64 as Sealed>::write`, calls `diyfp!`, which
 /// writes `impl DiyFp` there). Known by name, so a name that may costs a lowering and nothing
 /// else.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn macros_writing_impls(db: &Db, krate: Crate) -> Box<[(Symbol, bool)]> {
-    fn add(known: &mut FxHashMap<Symbol, bool>, name: &Symbol, writes: bool) {
-        *known.entry(name.clone()).or_default() |= writes;
+    fn add<'a>(known: &mut FrameMap<'_, &'a Symbol, bool>, name: &'a Symbol, writes: bool) {
+        *known.entry(name).or_default() |= writes;
     }
-    let mut known = FxHashMap::default();
-    for dep in &krate.data(db).dependencies {
-        for (name, writes) in macros_writing_impls(db, dep.crate_id) {
-            add(&mut known, name, *writes);
-        }
-        if dep.crate_id.data(db).target_kind.is_proc_macro() {
-            for (_, module) in crate_def_map(db, dep.crate_id).modules(db) {
-                for (name, item) in module.scope(db).macros() {
-                    if matches!(item.def, MacroId::ProcMacroId(_)) {
-                        add(&mut known, name.symbol(), true);
+    blaze_mem::frame::current(|frame| {
+        // Keyed by the names the queries below hold: a name is cloned once, into the result.
+        let mut known = crate::frame_map(frame);
+        for dep in &krate.data(db).dependencies {
+            for (name, writes) in macros_writing_impls(db, dep.crate_id) {
+                add(&mut known, name, *writes);
+            }
+            if dep.crate_id.data(db).target_kind.is_proc_macro() {
+                for (_, module) in crate_def_map(db, dep.crate_id).modules(db) {
+                    for (name, item) in module.scope(db).macros() {
+                        if matches!(item.def, MacroId::ProcMacroId(_)) {
+                            add(&mut known, name.symbol(), true);
+                        }
                     }
                 }
             }
         }
-    }
-    let mut calling = Vec::new();
-    let mut files = FxHashSet::default();
-    for (_, module) in crate_def_map(db, krate).modules(db) {
-        let Some(file) = module.origin.file_id() else { continue };
-        if !files.insert(file) {
-            continue;
-        }
-        for (name, writes, calls) in macro_definitions(db, file) {
-            add(&mut known, name, *writes);
-            if !*writes {
-                calling.push((name, calls));
+        let mut calling = Vec::new_in(frame);
+        let mut files = crate::frame_set(frame);
+        for (_, module) in crate_def_map(db, krate).modules(db) {
+            let Some(file) = module.origin.file_id() else { continue };
+            if !files.insert(file) {
+                continue;
+            }
+            for (name, writes, calls) in macro_definitions(db, file).iter() {
+                add(&mut known, name, writes);
+                if !writes {
+                    calling.push((name, calls));
+                }
             }
         }
-    }
-    let may_write = |known: &FxHashMap<Symbol, bool>, call: &Symbol| {
-        if *call == sym::macro_rules {
-            false
-        } else if *call == sym::include {
-            true
-        } else {
-            known.get(call).copied().unwrap_or(true)
-        }
-    };
-    loop {
-        let before = calling.len();
-        calling.retain(|&(name, calls)| {
-            let writes = calls.iter().any(|it| may_write(&known, it));
-            if writes {
-                known.insert(name.clone(), true);
+        let may_write = |known: &FrameMap<'_, &Symbol, bool>, call: &Symbol| {
+            if *call == sym::macro_rules {
+                false
+            } else if *call == sym::include {
+                true
+            } else {
+                known.get(call).copied().unwrap_or(true)
             }
-            !writes
-        });
-        if calling.len() == before {
-            break;
+        };
+        loop {
+            let before = calling.len();
+            calling.retain(|&(name, calls)| {
+                let writes = calls.iter().any(|it| may_write(&known, it));
+                if writes {
+                    known.insert(name, true);
+                }
+                !writes
+            });
+            if calling.len() == before {
+                break;
+            }
         }
-    }
-    let mut known = known.into_iter().collect::<Vec<_>>();
-    known.sort_unstable_by(|a, b| a.0.cmp_order(&b.0));
-    known.into()
+        let mut sorted = Vec::with_capacity_in(known.len(), frame);
+        sorted.extend(known.iter().map(|(&name, &writes)| (name, writes)));
+        sorted.sort_unstable_by(|a: &(&Symbol, bool), b| a.0.cmp_order(b.0));
+        // alloc: clone: the memo's result, one exact block holding each name once
+        sorted.iter().map(|&(name, writes)| (name.clone(), writes)).collect()
+    })
 }
 
 /// The `macro_rules!` of `file`, found by its tokens: each one's name, whether its
 /// transcribers write an impl (an `impl` after `{`, `}`, `;`, `(`, `*`, an attribute or
 /// `unsafe`), an attribute that is not inert or one from a fragment, or call a macro passed in
 /// as `$name!`, and the names of the other macros they call.
-#[salsa::tracked(returns(deref))]
-fn macro_definitions(
-    db: &Db,
-    file: base_db::EditionedFileId,
-) -> Box<[(Symbol, bool, Box<[Symbol]>)]> {
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
+fn macro_definitions(db: &Db, file: base_db::EditionedFileId) -> MacroDefinitions {
     let text = db.file_text(file.file_id(db)).text(db);
     if !text.contains("macro_rules") {
-        return Box::default();
+        return MacroDefinitions::default();
     }
-    let lexed = syntax::LexedStr::new(file.edition(db), text);
-    let tokens: Vec<usize> = (0..lexed.len()).filter(|&i| !lexed.kind(i).is_trivia()).collect();
-    let kind = |at: usize| tokens.get(at).map_or(SyntaxKind::EOF, |&i| lexed.kind(i));
-    let mut found = Vec::new();
-    let mut at = 0;
-    while at < tokens.len() {
-        let definition = kind(at) == SyntaxKind::IDENT
-            && lexed.text(tokens[at]) == "macro_rules"
-            && kind(at + 1) == T![!]
-            && kind(at + 2) == SyntaxKind::IDENT
-            && matches!(kind(at + 3), T!['{'] | T!['('] | T!['[']);
-        if !definition {
-            at += 1;
-            continue;
-        }
-        let name = Symbol::intern(lexed.text(tokens[at + 2]));
-        // The rules alternate, a matcher then a transcriber, each a group at depth 1.
-        let (mut writes, mut calls, mut depth, mut groups) = (false, Vec::new(), 0usize, 0usize);
-        at += 3;
+    blaze_mem::frame::current(|frame| {
+        let lexed = syntax::LexedStr::new(file.edition(db), text);
+        let mut tokens: Vec<usize, &Frame> = Vec::with_capacity_in(lexed.len(), frame);
+        tokens.extend((0..lexed.len()).filter(|&i| !lexed.kind(i).is_trivia()));
+        let kind = |at: usize| tokens.get(at).map_or(SyntaxKind::EOF, |&i| lexed.kind(i));
+        let mut found = Vec::new_in(frame);
+        let mut calls = Vec::new_in(frame);
+        let mut at = 0;
         while at < tokens.len() {
-            let transcriber = depth >= 2 && groups % 2 == 0;
-            match kind(at) {
-                T!['{'] | T!['('] | T!['['] => {
-                    if depth == 1 {
-                        groups += 1;
-                    }
-                    depth += 1;
-                }
-                T!['}'] | T![')'] | T![']'] => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                T![impl]
-                    if transcriber
-                        && matches!(
-                            kind(at - 1),
-                            T!['{'] | T!['}'] | T![;] | T!['('] | T![*] | T![']'] | T![unsafe]
-                        ) =>
-                {
-                    writes = true
-                }
-                T![#] if transcriber => {
-                    let open = if kind(at + 1) == T![!] { at + 2 } else { at + 1 };
-                    let inert = kind(open + 1) == SyntaxKind::IDENT
-                        && attribute_is_inert(lexed.text(tokens[open + 1]));
-                    if kind(open) == T!['['] && !inert {
-                        writes = true;
-                    }
-                }
-                T![!] if transcriber && kind(at - 1) == SyntaxKind::IDENT => {
-                    if kind(at - 2) == T![$] {
-                        writes = true;
-                    } else {
-                        calls.push(Symbol::intern(lexed.text(tokens[at - 1])));
-                    }
-                }
-                _ => {}
+            let definition = kind(at) == SyntaxKind::IDENT
+                && lexed.text(tokens[at]) == "macro_rules"
+                && kind(at + 1) == T![!]
+                && kind(at + 2) == SyntaxKind::IDENT
+                && matches!(kind(at + 3), T!['{'] | T!['('] | T!['[']);
+            if !definition {
+                at += 1;
+                continue;
             }
+            let name = Symbol::intern(lexed.text(tokens[at + 2]));
+            // The rules alternate, a matcher then a transcriber, each a group at depth 1.
+            let (mut writes, mut depth, mut groups) = (false, 0usize, 0usize);
+            at += 3;
+            while at < tokens.len() {
+                let transcriber = depth >= 2 && groups % 2 == 0;
+                match kind(at) {
+                    T!['{'] | T!['('] | T!['['] => {
+                        if depth == 1 {
+                            groups += 1;
+                        }
+                        depth += 1;
+                    }
+                    T!['}'] | T![')'] | T![']'] => {
+                        depth -= 1;
+                        if depth == 0 {
+                            break;
+                        }
+                    }
+                    T![impl]
+                        if transcriber
+                            && matches!(
+                                kind(at - 1),
+                                T!['{'] | T!['}'] | T![;] | T!['('] | T![*] | T![']'] | T![unsafe]
+                            ) =>
+                    {
+                        writes = true
+                    }
+                    T![#] if transcriber => {
+                        let open = if kind(at + 1) == T![!] { at + 2 } else { at + 1 };
+                        let inert = kind(open + 1) == SyntaxKind::IDENT
+                            && attribute_is_inert(lexed.text(tokens[open + 1]));
+                        if kind(open) == T!['['] && !inert {
+                            writes = true;
+                        }
+                    }
+                    T![!] if transcriber && kind(at - 1) == SyntaxKind::IDENT => {
+                        if kind(at - 2) == T![$] {
+                            writes = true;
+                        } else {
+                            calls.push(Symbol::intern(lexed.text(tokens[at - 1])));
+                        }
+                    }
+                    _ => {}
+                }
+                at += 1;
+            }
+            let end = u32::try_from(calls.len()).expect("more than 2^32 macro calls in a file");
+            found.push((name, writes, end));
             at += 1;
         }
-        found.push((name, writes, calls.into()));
-        at += 1;
-    }
-    found.into()
+        // alloc: the memo's result, one exact block per column
+        MacroDefinitions { defs: found.drain(..).collect(), calls: calls.drain(..).collect() }
+    })
 }
 
 /// What finding the impls of `krate` asks of each impl and of each body that may hold one.
 /// Each is its own query, so [`ImplWork::run`] on many threads leaves the finding little to do.
 pub fn impl_work(db: &Db, krate: Crate) -> Vec<ImplWork> {
-    let def_map = crate_def_map(db, krate);
-    let mut work = Vec::new();
-    for (_, module) in def_map.modules(db) {
-        let scope = module.scope(db);
-        work.extend(scope.impls().map(ImplWork::Impl));
-        work.extend(impl_holders(db, krate, scope).into_iter().map(ImplWork::Holder));
-    }
-    work
+    blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+        let def_map = crate_def_map(db, krate);
+        let mut work = Vec::new_in(frame);
+        for (_, module) in def_map.modules(db) {
+            let scope = module.scope(db);
+            work.extend(scope.impls().map(ImplWork::Impl));
+            work.extend(impl_holders(db, frame, krate, scope).into_iter().map(ImplWork::Holder));
+        }
+        // alloc: the caller's list, one exact block per crate
+        work.iter().copied().collect()
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -1168,12 +1230,19 @@ impl ImplWork {
     }
 }
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
 fn crates_containing_incoherent_inherent_impls(db: &Db, krate: Crate) -> Box<[Crate]> {
-    let _p = tracing::info_span!("crates_containing_incoherent_inherent_impls").entered();
-    // We assume that only sysroot crates contain `#[rustc_has_incoherent_inherent_impls]`
-    // impls, since this is an internal feature and only std uses it.
-    krate.transitive_deps(db).into_iter().filter(|krate| krate.data(db).origin.is_lang()).collect()
+    blaze_mem::frame::current(|frame| {
+        let _p = tracing::info_span!("crates_containing_incoherent_inherent_impls").entered();
+        // We assume that only sysroot crates contain `#[rustc_has_incoherent_inherent_impls]`
+        // impls, since this is an internal feature and only std uses it.
+        let mut lang = Vec::new_in(frame);
+        lang.extend(
+            krate.transitive_deps(db).iter().copied().filter(|krate| krate.data(db).origin.is_lang()),
+        );
+        // alloc: the memo's value, once at its length.
+        lang.iter().copied().collect()
+    })
 }
 
 pub fn with_incoherent_inherent_impls<'db>(
@@ -1233,22 +1302,65 @@ struct Runs<V> {
 }
 
 impl<V: Copy> Runs<V> {
-    fn new<'a>(runs: impl IntoIterator<Item = &'a [V]>) -> Self
-    where
-        V: 'a,
-    {
-        let mut starts = vec![0];
-        let mut values = Vec::new();
-        for run in runs {
-            values.extend_from_slice(run);
-            starts.push(u32::try_from(values.len()).expect("more than 2^32 impls in a crate"));
+    /// The runs of `values`, each `(group, value)`: run `rank[group]` holds a group's values in
+    /// the order they come. Counted first, so each column is allocated once at its size.
+    fn from_groups(frame: &Frame, rank: &[u32], values: &[(u32, V)]) -> Self {
+        u32::try_from(values.len()).expect("more than 2^32 impls in a crate");
+        let ends = frame.alloc_slice_fill_with(rank.len() + 1, |_| 0u32);
+        for &(group, _) in values {
+            ends[rank[group as usize] as usize + 1] += 1;
         }
-        Runs { starts: starts.into_boxed_slice(), values: values.into_boxed_slice() }
+        for run in 1..ends.len() {
+            ends[run] += ends[run - 1];
+        }
+        let starts = Box::<[u32]>::from(&*ends);
+        let Some(&(_, first)) = values.first() else {
+            return Runs { starts, values: Box::default() };
+        };
+        // `ends[run]` is now where run `run` starts, and is moved past each value placed.
+        let placed = frame.alloc_slice_fill_with(values.len(), |_| first);
+        for &(group, value) in values {
+            let next = &mut ends[rank[group as usize] as usize];
+            placed[*next as usize] = value;
+            *next += 1;
+        }
+        Runs { starts, values: Box::from(&*placed) }
     }
 
     fn run(&self, i: usize) -> &[V] {
         &self.values[self.starts[i] as usize..self.starts[i + 1] as usize]
     }
+}
+
+/// Where each group goes: `rank[order[i]] == i`.
+fn ranks<'f>(frame: &'f Frame, order: &[u32]) -> &'f mut [u32] {
+    let rank = frame.alloc_slice_fill_with(order.len(), |_| 0u32);
+    for (at, &group) in order.iter().enumerate() {
+        rank[group as usize] = at as u32;
+    }
+    rank
+}
+
+/// The number of `trait_`, numbered as first seen: a new one is pushed on `trait_ids`.
+fn trait_number(
+    traits: &mut FrameMap<'_, TraitId, u32>,
+    trait_ids: &mut Vec<TraitId, &Frame>,
+    trait_: TraitId,
+) -> u32 {
+    *traits.entry(trait_).or_insert_with(|| {
+        trait_ids.push(trait_);
+        u32::try_from(trait_ids.len() - 1).expect("more than 2^32 traits in a crate")
+    })
+}
+
+/// The traits `trait_ids` in the order [`TraitImpls::traits`] holds them, as indices.
+fn order_by_trait_id<'f>(frame: &'f Frame, trait_ids: &[TraitId]) -> &'f mut [u32] {
+    let order = frame.alloc_slice_fill_with(trait_ids.len(), |t| t as u32);
+    order.sort_unstable_by_key(|&t| {
+        let id = trait_ids[t as usize].as_id();
+        radix::pack_32(id.index(), id.generation())
+    });
+    order
 }
 
 fn hash_self_ty(self_ty: &SimplifiedType<'_>) -> u64 {
@@ -1264,9 +1376,14 @@ struct SelfTys<'db> {
 }
 
 impl<'db> SelfTys<'db> {
-    fn new(self_tys: Vec<SimplifiedType<'db>>) -> Self {
-        let hashes = self_tys.iter().map(hash_self_ty).collect();
-        SelfTys { hashes, self_tys: self_tys.into_boxed_slice() }
+    /// The self types of `groups` (each with its hash) in the order `order` gives.
+    fn in_order(groups: &[(u64, SimplifiedType<'db>)], order: &[u32]) -> Self {
+        SelfTys {
+            // alloc: the memo's two columns, each once at its length.
+            hashes: order.iter().map(|&group| groups[group as usize].0).collect(),
+            // alloc: as above.
+            self_tys: order.iter().map(|&group| groups[group as usize].1).collect(),
+        }
     }
 
     fn len(&self) -> usize {
@@ -1280,6 +1397,7 @@ impl<'db> SelfTys<'db> {
     /// The index of `self_ty` in `range`, which is sorted by hash.
     fn find(&self, range: Range<usize>, self_ty: &SimplifiedType<'db>) -> Option<usize> {
         let hash = hash_self_ty(self_ty);
+        // clone: a `Range<usize>`, two words.
         let first = range.start + self.hashes[range.clone()].partition_point(|&it| it < hash);
         (first..range.end)
             .take_while(|&i| self.hashes[i] == hash)
@@ -1287,35 +1405,71 @@ impl<'db> SelfTys<'db> {
     }
 }
 
-/// Values grouped by simplified self type while impls are found, each type where it was first
-/// seen.
-struct SelfTyGroups<'db, T> {
-    index: FxHashMap<SimplifiedType<'db>, usize>,
-    groups: Vec<(SimplifiedType<'db>, T)>,
+/// The group of `self_ty`, numbered as first seen: a new one is pushed on `self_tys` with its
+/// hash.
+fn group_of<'db>(
+    groups: &mut FrameMap<'_, SimplifiedType<'db>, u32>,
+    self_tys: &mut Vec<(u64, SimplifiedType<'db>), &Frame>,
+    self_ty: SimplifiedType<'db>,
+) -> u32 {
+    *groups.entry(self_ty).or_insert_with(|| {
+        self_tys.push((hash_self_ty(&self_ty), self_ty));
+        u32::try_from(self_tys.len() - 1).expect("more than 2^32 self types in a crate")
+    })
 }
 
-impl<T> Default for SelfTyGroups<'_, T> {
-    fn default() -> Self {
-        SelfTyGroups { index: FxHashMap::default(), groups: Vec::new() }
+/// The groups sorted by the hash of their type; types of equal hash stay in the order they
+/// were first seen.
+fn order_by_hash<'f>(frame: &'f Frame, self_tys: &[(u64, SimplifiedType<'_>)]) -> &'f mut [u32] {
+    let order = frame.alloc_slice_fill_with(self_tys.len(), |group| group as u32);
+    order.sort_unstable_by_key(|&group| (self_tys[group as usize].0, group));
+    order
+}
+
+/// Values grouped by simplified self type while they are found or read, every temporary in
+/// the query's frame: the self types sorted by hash, each with its run of values in the order
+/// they came.
+struct SelfTyRunsBuilder<'db, 'f, V> {
+    frame: &'f Frame,
+    groups: FrameMap<'f, SimplifiedType<'db>, u32>,
+    /// Each self type with its hash, in the order first seen.
+    self_tys: Vec<(u64, SimplifiedType<'db>), &'f Frame>,
+    /// Each value with its group, in the order found.
+    values: Vec<(u32, V), &'f Frame>,
+}
+
+/// The inherent impls of a crate, a module or a block while they are found or read.
+type InherentImplsBuilder<'db, 'f> = SelfTyRunsBuilder<'db, 'f, ImplId>;
+
+impl<'db, 'f, V: Copy> SelfTyRunsBuilder<'db, 'f, V> {
+    fn new(frame: &'f Frame) -> Self {
+        SelfTyRunsBuilder {
+            frame,
+            groups: crate::frame_map(frame),
+            self_tys: Vec::new_in(frame),
+            values: Vec::new_in(frame),
+        }
+    }
+
+    fn group(&mut self, self_ty: SimplifiedType<'db>) -> u32 {
+        group_of(&mut self.groups, &mut self.self_tys, self_ty)
+    }
+
+    fn push(&mut self, group: u32, value: V) {
+        self.values.push((group, value));
+    }
+
+    fn columns(self) -> (SelfTys<'db>, Runs<V>) {
+        let order = order_by_hash(self.frame, &self.self_tys);
+        let rank = ranks(self.frame, order);
+        (SelfTys::in_order(&self.self_tys, order), Runs::from_groups(self.frame, rank, &self.values))
     }
 }
 
-impl<'db, T: Default> SelfTyGroups<'db, T> {
-    fn entry(&mut self, self_ty: SimplifiedType<'db>) -> &mut T {
-        let groups = &mut self.groups;
-        let i = *self.index.entry(self_ty).or_insert_with(|| {
-            groups.push((self_ty, T::default()));
-            groups.len() - 1
-        });
-        &mut self.groups[i].1
-    }
-
-    /// The groups sorted by the hash of their type; types of equal hash stay in the order they
-    /// were first seen.
-    fn into_sorted(self) -> Vec<(SimplifiedType<'db>, T)> {
-        let mut groups = self.groups;
-        radix::sort_by_key(&mut groups, |(self_ty, _)| hash_self_ty(self_ty));
-        groups
+impl<'db> InherentImplsBuilder<'db, '_> {
+    fn finish(self) -> InherentImpls<'db> {
+        let (self_tys, impls) = self.columns();
+        InherentImpls { self_tys, impls }
     }
 }
 
@@ -1335,47 +1489,55 @@ pub struct InherentImpls<'db> {
 
 #[salsa::tracked]
 impl<'db> InherentImpls<'db> {
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_crate(db: &'db Db, krate: Crate) -> InherentImpls<'db> {
-        let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
-        if let Some(frozen) = frozen::inherent_impls(db, krate) {
-            return frozen;
-        }
+        blaze_mem::frame::current(|frame| {
+            let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
+            if let Some(frozen) = frozen::inherent_impls(db, frame, krate) {
+                return frozen;
+            }
 
-        let mut groups = SelfTyGroups::default();
-        for (module, _) in crate_def_map(db, krate).modules(db) {
-            Self::for_module(db, module).merge_into(&mut groups);
-        }
-        Self::from_groups(groups)
+            let mut builder = InherentImplsBuilder::new(frame);
+            for (module, _) in crate_def_map(db, krate).modules(db) {
+                Self::for_module(db, module).merge_into(&mut builder);
+            }
+            builder.finish()
+        })
     }
 
     /// The inherent impls one module of a crate or block def map gives its table: its own
     /// ([`module_impls`]) and those of the blocks in the bodies it holds, in the order
     /// [`Self::for_crate`] holds them. Reruns when the module's scope changes, and is equal
     /// unless one of those impls is added, removed or changes its self type.
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_module(db: &'db Db, module: ModuleId) -> InherentImpls<'db> {
-        let mut groups = SelfTyGroups::default();
-        Self::collect_module(db, module, &mut groups);
-        Self::from_groups(groups)
+        blaze_mem::frame::current(|frame| {
+            let mut builder = InherentImplsBuilder::new(frame);
+            Self::collect_module(db, module, &mut builder);
+            builder.finish()
+        })
     }
 
     /// The modules of `krate` with an inherent impl for each simplified self type, in module
     /// order. Equal unless a module gains its first impl for a type or loses its last.
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
     fn modules_by_self_ty(db: &'db Db, krate: Crate) -> SelfTyModules<'db> {
-        let mut groups: SelfTyGroups<'db, Vec<ModuleId>> = SelfTyGroups::default();
-        for (module, _) in crate_def_map(db, krate).modules(db) {
-            for (self_ty, _) in Self::for_module(db, module).iter() {
-                groups.entry(*self_ty).push(module);
+        blaze_mem::frame::current(|frame| {
+            let mut builder = SelfTyRunsBuilder::new(frame);
+            for (module, _) in crate_def_map(db, krate).modules(db) {
+                for (self_ty, _) in Self::for_module(db, module).iter() {
+                    let group = builder.group(*self_ty);
+                    builder.push(group, module);
+                }
             }
-        }
-        SelfTyModules::new(groups)
+            let (self_tys, modules) = builder.columns();
+            SelfTyModules { self_tys, modules }
+        })
     }
 
     /// The modules of `krate` with an inherent impl for one type: equal unless that list
     /// changes, whatever other types gain.
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     fn modules_of_self_ty(
         db: &'db Db,
         krate: Crate,
@@ -1386,7 +1548,7 @@ impl<'db> InherentImpls<'db> {
 
     /// The inherent impls of `module` for one type: equal unless one for that type is added
     /// there or removed.
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     fn in_module_for_self_ty(
         db: &'db Db,
         module: ModuleId,
@@ -1399,7 +1561,7 @@ impl<'db> InherentImpls<'db> {
     /// them. Reads only the modules with impls for the type, so an impl added for another type,
     /// or anything else added anywhere, leaves this as it was. A frozen crate's are read from
     /// its frozen table.
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_for_self_ty(
         db: &'db Db,
         krate: Crate,
@@ -1408,27 +1570,37 @@ impl<'db> InherentImpls<'db> {
         if frozen::served(db, krate) {
             return Self::for_crate(db, krate).for_self_ty(&self_ty.0).into();
         }
-        let mut found = Vec::new();
-        for &module in Self::modules_of_self_ty(db, krate, self_ty) {
-            found.extend_from_slice(Self::in_module_for_self_ty(db, module, self_ty));
+        let modules = Self::modules_of_self_ty(db, krate, self_ty);
+        if let &[module] = modules {
+            return Self::in_module_for_self_ty(db, module, self_ty).into();
         }
-        found.into()
+        blaze_mem::frame::current(|frame| {
+            let mut found = Vec::new_in(frame);
+            for &module in modules {
+                found.extend_from_slice(Self::in_module_for_self_ty(db, module, self_ty));
+            }
+            // alloc: the memo's value, once at its length.
+            found.iter().copied().collect()
+        })
     }
 
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_block(
         db: &'db Db,
         block: BlockIdLt<'db>,
     ) -> Option<Box<InherentImpls<'db>>> {
-        let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
+        blaze_mem::frame::current(|frame| {
+            let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
 
-        let block_def_map = block_def_map(db, block);
-        let result = Self::collect_def_map(db, block_def_map);
-        if result.self_tys.is_empty() { None } else { Some(Box::new(result)) }
+            let block_def_map = block_def_map(db, block);
+            let result = Self::collect_def_map(db, frame, block_def_map);
+            // alloc: the memo's handle, one per block with impls.
+            if result.self_tys.is_empty() { None } else { Some(Box::new(result)) }
+        })
     }
 
     /// The inherent impls of `block` for one type, as [`Self::in_crate_for_self_ty`].
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_block_for_self_ty(
         db: &'db Db,
         block: BlockIdLt<'db>,
@@ -1442,20 +1614,17 @@ impl<'db> InherentImpls<'db> {
 }
 
 impl<'db> InherentImpls<'db> {
-    fn collect_def_map(db: &'db Db, def_map: &'db DefMap) -> Self {
-        let mut map = SelfTyGroups::default();
+    fn collect_def_map(db: &'db Db, frame: &Frame, def_map: &'db DefMap) -> Self {
+        let mut builder = InherentImplsBuilder::new(frame);
         for (module, _) in def_map.modules(db) {
-            Self::collect_module(db, module, &mut map);
+            Self::collect_module(db, module, &mut builder);
         }
-        Self::from_groups(map)
+        builder.finish()
     }
 
-    /// Adds the inherent impls of `module` and of the blocks in the bodies it holds to `map`.
-    fn collect_module(
-        db: &'db Db,
-        module: ModuleId,
-        map: &mut SelfTyGroups<'db, Vec<ImplId>>,
-    ) {
+    /// Adds the inherent impls of `module` and of the blocks in the bodies it holds to
+    /// `builder`.
+    fn collect_module(db: &'db Db, module: ModuleId, builder: &mut InherentImplsBuilder<'db, '_>) {
         let interner = DbInterner::new_no_crate(db);
         for &impl_id in module_impls(db, module).inherent_impls.iter() {
             let self_ty = db.impl_self_ty(impl_id);
@@ -1463,32 +1632,29 @@ impl<'db> InherentImpls<'db> {
             if let Some(self_ty) =
                 simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer)
             {
-                map.entry(self_ty).push(impl_id);
+                let group = builder.group(self_ty);
+                builder.push(group, impl_id);
             }
         }
 
         let scope = module.def_map(db).module(db, module).scope(db);
-        for owner in impl_holders(db, module.krate(db), scope) {
+        for owner in impl_holders(db, builder.frame, module.krate(db), scope) {
             for (_, block_def_map) in Body::of(db, owner).blocks(db) {
                 for (block_module, _) in block_def_map.modules(db) {
-                    Self::collect_module(db, block_module, map);
+                    Self::collect_module(db, block_module, builder);
                 }
             }
         }
     }
 
-    /// Adds every impl of this table to `groups`, each type's after those already there.
-    fn merge_into(&self, groups: &mut SelfTyGroups<'db, Vec<ImplId>>) {
+    /// Adds every impl of this table to `builder`, each type's after those already there.
+    fn merge_into(&self, builder: &mut InherentImplsBuilder<'db, '_>) {
         for (self_ty, impls) in self.iter() {
-            groups.entry(*self_ty).extend_from_slice(impls);
+            let group = builder.group(*self_ty);
+            for &impl_id in impls {
+                builder.push(group, impl_id);
+            }
         }
-    }
-
-    fn from_groups(groups: SelfTyGroups<'db, Vec<ImplId>>) -> Self {
-        let groups = groups.into_sorted();
-        let impls = Runs::new(groups.iter().map(|(_, impls)| &**impls));
-        let self_tys = SelfTys::new(groups.into_iter().map(|(self_ty, _)| self_ty).collect());
-        Self { self_tys, impls }
     }
 
     pub fn for_self_ty(&self, self_ty: &SimplifiedType<'db>) -> &[ImplId] {
@@ -1515,10 +1681,151 @@ impl<'db> InherentImpls<'db> {
     }
 }
 
-#[derive(Default)]
-struct OneTraitImplsBuilder<'db> {
-    non_blanket_impls: SelfTyGroups<'db, (Vec<ImplId>, Vec<BuiltinDeriveImplId>)>,
-    blanket_impls: Vec<ImplId>,
+/// Modules by simplified self type, as columns: the self types sorted by hash, each with its
+/// run of modules in module order.
+#[derive(Debug, PartialEq, Eq, SalsaValue)]
+struct SelfTyModules<'db> {
+    // SAFETY: as for `InherentImpls::self_tys`: salsa may keep this column past `'db` only if
+    // nothing in it borrows from the database. `SelfTys<'db>` holds `u64`s and
+    // `SimplifiedType<'db>`s, which are `fast_reject::SimplifiedType<SolverDefId<'db>>`
+    // (`next_solver/ty.rs`), whose variants (`vendor/rustc_type_ir/src/fast_reject.rs`) hold
+    // only plain data and `SolverDefId<'db>`, which is `SalsaValue`; no `&'db`.
+    #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
+    self_tys: SelfTys<'db>,
+    modules: Runs<ModuleId>,
+}
+
+impl<'db> SelfTyModules<'db> {
+    fn of(&self, self_ty: &SimplifiedType<'db>) -> &[ModuleId] {
+        match self.self_tys.find(0..self.self_tys.len(), self_ty) {
+            Some(i) => self.modules.run(i),
+            None => &[],
+        }
+    }
+}
+
+/// Modules by trait, as columns: the traits sorted as [`TraitImpls`] sorts them, each with its
+/// run of modules in module order.
+#[derive(Debug, PartialEq, Eq)]
+struct TraitModules {
+    traits: Box<[TraitId]>,
+    modules: Runs<ModuleId>,
+}
+
+impl TraitModules {
+    /// The modules of each trait, from `found`: each `(trait, module)` in module order.
+    fn from_found(frame: &Frame, found: impl IntoIterator<Item = (TraitId, ModuleId)>) -> Self {
+        let mut traits = crate::frame_map(frame);
+        let mut trait_ids = Vec::new_in(frame);
+        let mut modules = Vec::new_in(frame);
+        for (trait_, module) in found {
+            modules.push((trait_number(&mut traits, &mut trait_ids, trait_), module));
+        }
+        let order = order_by_trait_id(frame, &trait_ids);
+        let rank = ranks(frame, order);
+        TraitModules {
+            // alloc: the memo's column, once at its length.
+            traits: order.iter().map(|&t| trait_ids[t as usize]).collect(),
+            modules: Runs::from_groups(frame, rank, &modules),
+        }
+    }
+
+    fn of(&self, trait_: TraitId) -> &[ModuleId] {
+        match self.traits.binary_search(&trait_) {
+            Ok(t) => self.modules.run(t),
+            Err(_) => &[],
+        }
+    }
+}
+
+/// The trait impls of a crate, a module or a block while they are found or read, every
+/// temporary in the query's frame. A trait and a row (trait, self type) are numbered as first
+/// seen.
+struct TraitImplsBuilder<'db, 'f> {
+    frame: &'f Frame,
+    traits: FrameMap<'f, TraitId, u32>,
+    trait_ids: Vec<TraitId, &'f Frame>,
+    rows: FrameMap<'f, (u32, SimplifiedType<'db>), u32>,
+    /// Each row's trait, and its self type with its hash, in the order first seen.
+    row_keys: Vec<(u32, (u64, SimplifiedType<'db>)), &'f Frame>,
+    impls: Vec<(u32, ImplId), &'f Frame>,
+    derives: Vec<(u32, BuiltinDeriveImplId), &'f Frame>,
+    /// Each blanket impl with its trait.
+    blanket: Vec<(u32, ImplId), &'f Frame>,
+}
+
+impl<'db, 'f> TraitImplsBuilder<'db, 'f> {
+    fn new(frame: &'f Frame) -> Self {
+        TraitImplsBuilder {
+            frame,
+            traits: crate::frame_map(frame),
+            trait_ids: Vec::new_in(frame),
+            rows: crate::frame_map(frame),
+            row_keys: Vec::new_in(frame),
+            impls: Vec::new_in(frame),
+            derives: Vec::new_in(frame),
+            blanket: Vec::new_in(frame),
+        }
+    }
+
+    fn trait_(&mut self, trait_: TraitId) -> u32 {
+        trait_number(&mut self.traits, &mut self.trait_ids, trait_)
+    }
+
+    fn row(&mut self, t: u32, self_ty: SimplifiedType<'db>) -> u32 {
+        let row_keys = &mut self.row_keys;
+        *self.rows.entry((t, self_ty)).or_insert_with(|| {
+            row_keys.push((t, (hash_self_ty(&self_ty), self_ty)));
+            u32::try_from(row_keys.len() - 1).expect("more than 2^32 impls in a crate")
+        })
+    }
+
+    fn push_impl(&mut self, row: u32, impl_id: ImplId) {
+        self.impls.push((row, impl_id));
+    }
+
+    fn push_derive(&mut self, row: u32, impl_id: BuiltinDeriveImplId) {
+        self.derives.push((row, impl_id));
+    }
+
+    fn push_blanket(&mut self, t: u32, impl_id: ImplId) {
+        self.blanket.push((t, impl_id));
+    }
+
+    fn finish(self) -> TraitImpls<'db> {
+        let frame = self.frame;
+        let trait_ids = &self.trait_ids;
+        let trait_order = order_by_trait_id(frame, trait_ids);
+        let trait_rank = ranks(frame, trait_order);
+        let row_keys = &self.row_keys;
+        let row_order = frame.alloc_slice_fill_with(row_keys.len(), |r| r as u32);
+        row_order.sort_unstable_by_key(|&r| {
+            let (t, (hash, _)) = row_keys[r as usize];
+            (trait_rank[t as usize], hash, r)
+        });
+        let row_rank = ranks(frame, row_order);
+        let trait_rows = frame.alloc_slice_fill_with(trait_ids.len() + 1, |_| 0u32);
+        for &(t, _) in row_keys.iter() {
+            trait_rows[trait_rank[t as usize] as usize + 1] += 1;
+        }
+        for t in 1..trait_rows.len() {
+            trait_rows[t] += trait_rows[t - 1];
+        }
+        TraitImpls {
+            // alloc: the memo's columns, each once at its length.
+            traits: trait_order.iter().map(|&t| trait_ids[t as usize]).collect(),
+            trait_rows: Box::from(&*trait_rows),
+            blanket: Runs::from_groups(frame, trait_rank, &self.blanket),
+            self_tys: SelfTys {
+                // alloc: as above.
+                hashes: row_order.iter().map(|&r| row_keys[r as usize].1.0).collect(),
+                // alloc: as above.
+                self_tys: row_order.iter().map(|&r| row_keys[r as usize].1.1).collect(),
+            },
+            impls: Runs::from_groups(frame, row_rank, &self.impls),
+            derives: Runs::from_groups(frame, row_rank, &self.derives),
+        }
+    }
 }
 
 /// The trait impls of a crate or block, as columns. The traits are sorted; trait `t` has the
@@ -1542,35 +1849,6 @@ pub struct TraitImpls<'db> {
 }
 
 impl<'db> TraitImpls<'db> {
-    fn from_traits(traits: FxHashMap<TraitId, OneTraitImplsBuilder<'db>>) -> Self {
-        let mut traits = traits.into_iter().collect::<Vec<_>>();
-        radix::sort_by_key(&mut traits, |&(trait_, _)| {
-            let id = trait_.as_id();
-            radix::pack_32(id.index(), id.generation())
-        });
-        let mut trait_rows = vec![0];
-        let mut blanket = Vec::with_capacity(traits.len());
-        let mut rows = Vec::new();
-        let traits = traits
-            .into_iter()
-            .map(|(trait_, one)| {
-                rows.extend(one.non_blanket_impls.into_sorted());
-                let end = u32::try_from(rows.len()).expect("more than 2^32 impls in a crate");
-                trait_rows.push(end);
-                blanket.push(one.blanket_impls);
-                trait_
-            })
-            .collect::<Box<[_]>>();
-        TraitImpls {
-            traits,
-            trait_rows: trait_rows.into_boxed_slice(),
-            blanket: Runs::new(blanket.iter().map(|it| &**it)),
-            impls: Runs::new(rows.iter().map(|(_, (impls, _))| &**impls)),
-            derives: Runs::new(rows.iter().map(|(_, (_, derives))| &**derives)),
-            self_tys: SelfTys::new(rows.into_iter().map(|(self_ty, _)| self_ty).collect()),
-        }
-    }
-
     fn trait_index(&self, trait_: TraitId) -> Option<usize> {
         self.traits.binary_search(&trait_).ok()
     }
@@ -1602,80 +1880,177 @@ impl<'db> TraitImpls<'db> {
 
 #[salsa::tracked]
 impl<'db> TraitImpls<'db> {
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
     pub fn for_crate(db: &'db Db, krate: Crate) -> Arc<TraitImpls<'db>> {
-        let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
-        if let Some(frozen) = frozen::trait_impls(db, krate) {
-            return Arc::new(frozen);
-        }
+        blaze_mem::frame::current(|frame| {
+            let _p = tracing::info_span!("inherent_impls_in_crate_query", ?krate).entered();
+            if let Some(frozen) = frozen::trait_impls(db, frame, krate) {
+                // alloc: the memo's handle, shared by `for_crate_and_deps`.
+                return Arc::new(frozen);
+            }
 
-        let crate_def_map = crate_def_map(db, krate);
-        let result = Self::collect_def_map(db, crate_def_map);
-        Arc::new(result)
+            let mut builder = TraitImplsBuilder::new(frame);
+            for (module, _) in crate_def_map(db, krate).modules(db) {
+                Self::for_module(db, module).merge_into(&mut builder);
+            }
+            // alloc: the memo's handle, shared by `for_crate_and_deps`.
+            Arc::new(builder.finish())
+        })
     }
 
-    #[salsa::tracked(returns(as_deref))]
+    /// The trait impls one module of a crate or block def map gives its tables: its own
+    /// ([`module_impls`]) and those of the blocks in the bodies it holds, in the order
+    /// [`Self::for_crate`] holds them. Reruns when the module's scope changes, and is equal
+    /// unless one of those impls is added, removed or changes its trait or self type.
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    pub fn for_module(db: &'db Db, module: ModuleId) -> TraitImpls<'db> {
+        blaze_mem::frame::current(|frame| {
+            let lang_items = hir_def::lang_item::lang_items(db, module.krate(db));
+            let mut builder = TraitImplsBuilder::new(frame);
+            Self::collect_module(db, module, lang_items, &mut builder);
+            builder.finish()
+        })
+    }
+
+    /// The modules of `krate` with an impl of each trait, in module order. Equal unless a
+    /// module gains its first impl of a trait or loses its last.
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    fn modules_by_trait(db: &'db Db, krate: Crate) -> TraitModules {
+        blaze_mem::frame::current(|frame| {
+            let found = crate_def_map(db, krate).modules(db).flat_map(|(module, _)| {
+                Self::for_module(db, module).traits.iter().map(move |&trait_| (trait_, module))
+            });
+            TraitModules::from_found(frame, found)
+        })
+    }
+
+    /// The modules of `krate` with an impl of `trait_`: equal unless that list changes,
+    /// whatever other traits gain.
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
+    fn modules_of_trait(db: &'db Db, krate: Crate, trait_: TraitId) -> Box<[ModuleId]> {
+        Self::modules_by_trait(db, krate).of(trait_).into()
+    }
+
+    /// The impls of `trait_` in `module`, as a table of that trait alone: equal unless one of
+    /// them is added, removed or changes its self type.
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    fn in_module_for_trait(
+        db: &'db Db,
+        module: ModuleId,
+        trait_: TraitId,
+    ) -> TraitImpls<'db> {
+        blaze_mem::frame::current(|frame| {
+            let mut builder = TraitImplsBuilder::new(frame);
+            Self::for_module(db, module).merge_trait_into(trait_, &mut builder);
+            builder.finish()
+        })
+    }
+
+    /// The impls of `trait_` in `krate`, as a table of that trait alone, in the order
+    /// [`Self::for_crate`] holds them: the bucket every narrow memo of one crate reads. Reads
+    /// only the modules with impls of `trait_`, so an impl of another trait, or anything else
+    /// added anywhere, leaves this as it was. A frozen crate's is read from its frozen table.
+    #[salsa::tracked(returns(ref), mem_tag = Infer)]
+    pub fn for_crate_and_trait(
+        db: &'db Db,
+        krate: Crate,
+        trait_: TraitId,
+    ) -> TraitImpls<'db> {
+        blaze_mem::frame::current(|frame| {
+            let mut builder = TraitImplsBuilder::new(frame);
+            if frozen::served(db, krate) {
+                Self::for_crate(db, krate).merge_trait_into(trait_, &mut builder);
+            } else {
+                for &module in Self::modules_of_trait(db, krate, trait_) {
+                    Self::in_module_for_trait(db, module, trait_)
+                        .merge_trait_into(trait_, &mut builder);
+                }
+            }
+            builder.finish()
+        })
+    }
+
+    #[salsa::tracked(returns(as_deref), mem_tag = Infer)]
     pub fn for_block(
         db: &'db Db,
         block: BlockIdLt<'db>,
     ) -> Option<Box<TraitImpls<'db>>> {
-        let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
+        blaze_mem::frame::current(|frame| {
+            let _p = tracing::info_span!("inherent_impls_in_block_query").entered();
 
-        let block_def_map = block_def_map(db, block);
-        let result = Self::collect_def_map(db, block_def_map);
-        if result.traits.is_empty() { None } else { Some(Box::new(result)) }
+            let block_def_map = block_def_map(db, block);
+            let result = Self::collect_def_map(db, frame, block_def_map);
+            // alloc: the memo's handle, one per block with impls.
+            if result.traits.is_empty() { None } else { Some(Box::new(result)) }
+        })
     }
 
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn for_crate_and_deps(db: &'db Db, krate: Crate) -> Box<[Arc<Self>]> {
+        // clone: an `Arc` count per crate into the memo's value, made once at its length.
         loaded_crates(db, krate).iter().map(|&dep| Self::for_crate(db, dep).clone()).collect()
     }
 
-    /// The impls of one trait for one type in `krate` and its dependencies. An impl added for
-    /// another trait or type changes `for_crate()`, and leaves this as it was.
-    #[salsa::tracked(returns(deref))]
+    /// The impls of one trait for one type in `krate` and its dependencies, in the order of
+    /// [`loaded_crates`]. Reads each crate's [`Self::for_crate_and_trait`], so an impl of
+    /// another trait anywhere leaves this unvalidated-equal, and one of `trait_` for another
+    /// type reruns it equal.
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_and_deps_for_trait_and_self_ty(
         db: &'db Db,
         krate: Crate,
         trait_: TraitId,
         self_ty: SelfTyKey<'db>,
     ) -> Box<[AnyImplId]> {
-        let mut found = Vec::new();
-        for impls in Self::for_crate_and_deps(db, krate) {
-            let (impls, builtin_derive_impls) = impls.for_trait_and_self_ty(trait_, &self_ty.0);
-            found.extend(impls.iter().map(|&it| AnyImplId::from(it)));
-            found.extend(builtin_derive_impls.iter().map(|&it| AnyImplId::from(it)));
-        }
-        found.into()
+        blaze_mem::frame::current(|frame| {
+            let mut found = Vec::new_in(frame);
+            for &dep in loaded_crates(db, krate) {
+                let impls = Self::for_crate_and_trait(db, dep, trait_);
+                let (impls, builtin_derive_impls) =
+                    impls.for_trait_and_self_ty(trait_, &self_ty.0);
+                found.extend(impls.iter().map(|&it| AnyImplId::from(it)));
+                found.extend(builtin_derive_impls.iter().map(|&it| AnyImplId::from(it)));
+            }
+            // alloc: the memo's value, once at its length.
+            found.iter().copied().collect()
+        })
     }
 
     /// The blanket impls of one trait in `krate` and its dependencies.
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn blanket_in_crate_and_deps(
         db: &'db Db,
         krate: Crate,
         trait_: TraitId,
     ) -> Box<[ImplId]> {
-        Self::for_crate_and_deps(db, krate)
-            .iter()
-            .flat_map(|impls| impls.blanket_impls(trait_))
-            .copied()
-            .collect()
+        blaze_mem::frame::current(|frame| {
+            let mut found = Vec::new_in(frame);
+            for &dep in loaded_crates(db, krate) {
+                found.extend_from_slice(
+                    Self::for_crate_and_trait(db, dep, trait_).blanket_impls(trait_),
+                );
+            }
+            // alloc: the memo's value, once at its length.
+            found.iter().copied().collect()
+        })
     }
 
     /// The impls of one trait for one type in `krate` alone, without the built-in derives.
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_for_trait_and_self_ty(
         db: &'db Db,
         krate: Crate,
         trait_: TraitId,
         self_ty: SelfTyKey<'db>,
     ) -> Box<[ImplId]> {
-        Self::for_crate(db, krate).for_trait_and_self_ty(trait_, &self_ty.0).0.into()
+        Self::for_crate_and_trait(db, krate, trait_)
+            .for_trait_and_self_ty(trait_, &self_ty.0)
+            .0
+            .into()
     }
 
     /// The impls of one trait for one type in `block` alone, without the built-in derives.
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_block_for_trait_and_self_ty(
         db: &'db Db,
         block: BlockIdLt<'db>,
@@ -1690,96 +2065,139 @@ impl<'db> TraitImpls<'db> {
 
     /// The impls of one trait in `krate` alone, without the built-in derives, in the order
     /// [`Self::for_trait`] gives them: the blanket impls first.
-    #[salsa::tracked(returns(deref))]
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_for_trait(
         db: &'db Db,
         krate: Crate,
         trait_: TraitId,
     ) -> Box<[ImplId]> {
-        let mut found = Vec::new();
-        Self::for_crate(db, krate).for_trait(trait_, |impls| {
-            if let Either::Left(impls) = impls {
-                found.extend_from_slice(impls);
-            }
-        });
-        found.into()
+        blaze_mem::frame::current(|frame| {
+            let mut found = Vec::new_in(frame);
+            Self::for_crate_and_trait(db, krate, trait_).for_trait(trait_, |impls| {
+                if let Either::Left(impls) = impls {
+                    found.extend_from_slice(impls);
+                }
+            });
+            // alloc: the memo's value, once at its length.
+            found.iter().copied().collect()
+        })
     }
 
     /// The impls of one trait in `krate` and its dependencies, each crate's as
-    /// [`Self::in_crate_for_trait`]. An impl of another trait changes `for_crate()` and
-    /// `in_crate_for_trait()` reruns equal, so this does not rerun.
-    #[salsa::tracked(returns(deref))]
+    /// [`Self::in_crate_for_trait`]. An impl of another trait leaves every crate's
+    /// [`Self::for_crate_and_trait`] for this one as it was, so this does not rerun.
+    #[salsa::tracked(returns(deref), mem_tag = Infer)]
     pub fn in_crate_and_deps_for_trait(
         db: &'db Db,
         krate: Crate,
         trait_: TraitId,
     ) -> Box<[ImplId]> {
-        loaded_crates(db, krate)
-            .iter()
-            .flat_map(|&dep| Self::in_crate_for_trait(db, dep, trait_))
-            .copied()
-            .collect()
+        blaze_mem::frame::current(|frame| {
+            let mut found = Vec::new_in(frame);
+            for &dep in loaded_crates(db, krate) {
+                found.extend_from_slice(Self::in_crate_for_trait(db, dep, trait_));
+            }
+            // alloc: the memo's value, once at its length.
+            found.iter().copied().collect()
+        })
     }
 }
 
 impl<'db> TraitImpls<'db> {
-    fn collect_def_map(db: &'db Db, def_map: &DefMap) -> Self {
+    fn collect_def_map(db: &'db Db, frame: &Frame, def_map: &DefMap) -> Self {
         let lang_items = hir_def::lang_item::lang_items(db, def_map.krate());
-        let mut map = FxHashMap::default();
-        collect(db, def_map, lang_items, &mut map);
-        return Self::from_traits(map);
+        let mut builder = TraitImplsBuilder::new(frame);
+        for (module, _) in def_map.modules(db) {
+            Self::collect_module(db, module, lang_items, &mut builder);
+        }
+        builder.finish()
+    }
 
-        fn collect<'db>(
-            db: &'db Db,
-            def_map: &DefMap,
-            lang_items: &LangItems,
-            map: &mut FxHashMap<TraitId, OneTraitImplsBuilder<'db>>,
-        ) {
-            for (_module_id, module_data) in def_map.modules(db) {
-                for impl_id in module_data.scope(db).trait_impls() {
-                    let trait_ref = match db.impl_trait(impl_id) {
-                        Some(tr) => tr.instantiate_identity().skip_norm_wip(),
-                        None => continue,
-                    };
-                    // Reservation impls should be ignored during trait resolution, so we never need
-                    // them during type analysis. See rust-lang/rust#64631 for details.
-                    //
-                    // FIXME: Reservation impls should be considered during coherence checks. If we are
-                    // (ever) to implement coherence checks, this filtering should be done by the trait
-                    // solver.
-                    if AttrFlags::query(db, impl_id.into())
-                        .contains(AttrFlags::RUSTC_RESERVATION_IMPL)
-                    {
-                        continue;
-                    }
+    /// Adds the trait impls of `module` and of the blocks in the bodies it holds to
+    /// `builder`.
+    fn collect_module(
+        db: &'db Db,
+        module: ModuleId,
+        lang_items: &LangItems,
+        builder: &mut TraitImplsBuilder<'db, '_>,
+    ) {
+        let impls = module_impls(db, module);
+        for &impl_id in impls.trait_impls.iter() {
+            let trait_ref = match db.impl_trait(impl_id) {
+                Some(tr) => tr.instantiate_identity().skip_norm_wip(),
+                None => continue,
+            };
+            // Reservation impls should be ignored during trait resolution, so we never need
+            // them during type analysis. See rust-lang/rust#64631 for details.
+            //
+            // FIXME: Reservation impls should be considered during coherence checks. If we are
+            // (ever) to implement coherence checks, this filtering should be done by the trait
+            // solver.
+            if AttrFlags::query(db, impl_id.into()).contains(AttrFlags::RUSTC_RESERVATION_IMPL) {
+                continue;
+            }
 
-                    let self_ty = trait_ref.self_ty();
-                    if self_ty_has_error_constructor(self_ty) {
-                        // If we see `impl Foo for NoSuchType`, just ignore it.
-                        continue;
-                    }
+            let self_ty = trait_ref.self_ty();
+            if self_ty_has_error_constructor(self_ty) {
+                // If we see `impl Foo for NoSuchType`, just ignore it.
+                continue;
+            }
 
-                    let interner = DbInterner::new_no_crate(db);
-                    let entry = map.entry(trait_ref.def_id.0).or_default();
-                    match simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer) {
-                        Some(self_ty) => entry.non_blanket_impls.entry(self_ty).0.push(impl_id),
-                        None => entry.blanket_impls.push(impl_id),
-                    }
+            let interner = DbInterner::new_no_crate(db);
+            let t = builder.trait_(trait_ref.def_id.0);
+            match simplify_type(interner, self_ty, TreatParams::InstantiateWithInfer) {
+                Some(self_ty) => {
+                    let row = builder.row(t, self_ty);
+                    builder.push_impl(row, impl_id);
                 }
+                None => builder.push_blanket(t, impl_id),
+            }
+        }
 
-                for impl_id in module_data.scope(db).builtin_derive_impls() {
-                    let loc = impl_id.loc(db);
-                    let Some(trait_id) = loc.trait_.get_id(lang_items) else { continue };
-                    let entry = map.entry(trait_id).or_default();
-                    let entry = entry.non_blanket_impls.entry(SimplifiedType::Adt(loc.adt.into()));
-                    entry.1.push(impl_id);
-                }
+        for &impl_id in impls.builtin_derive_impls.iter() {
+            let loc = impl_id.loc(db);
+            let Some(trait_id) = loc.trait_.get_id(lang_items) else { continue };
+            let t = builder.trait_(trait_id);
+            let row = builder.row(t, SimplifiedType::Adt(loc.adt.into()));
+            builder.push_derive(row, impl_id);
+        }
 
-                for owner in impl_holders(db, def_map.krate(), module_data.scope(db)) {
-                    for (_, block_def_map) in Body::of(db, owner).blocks(db) {
-                        collect(db, block_def_map, lang_items, map);
-                    }
+        let scope = module.def_map(db).module(db, module).scope(db);
+        for owner in impl_holders(db, builder.frame, module.krate(db), scope) {
+            for (_, block_def_map) in Body::of(db, owner).blocks(db) {
+                for (block_module, _) in block_def_map.modules(db) {
+                    Self::collect_module(db, block_module, lang_items, builder);
                 }
+            }
+        }
+    }
+
+    /// Adds every impl of this table to `builder`, each run after the runs already there.
+    fn merge_into(&self, builder: &mut TraitImplsBuilder<'db, '_>) {
+        for (trait_, t) in self.trait_indices() {
+            self.merge_at(t, builder.trait_(trait_), builder);
+        }
+    }
+
+    /// Adds this table's impls of `trait_` to `builder`, as [`Self::merge_into`] does.
+    fn merge_trait_into(&self, trait_: TraitId, builder: &mut TraitImplsBuilder<'db, '_>) {
+        if let Some(t) = self.trait_index(trait_) {
+            self.merge_at(t, builder.trait_(trait_), builder);
+        }
+    }
+
+    /// Adds the impls of the trait at index `t` here to trait `into` of `builder`.
+    fn merge_at(&self, t: usize, into: u32, builder: &mut TraitImplsBuilder<'db, '_>) {
+        for &impl_id in self.blanket.run(t) {
+            builder.push_blanket(into, impl_id);
+        }
+        for (self_ty, (impls, derives)) in self.rows_at(t) {
+            let row = builder.row(into, *self_ty);
+            for &impl_id in impls {
+                builder.push_impl(row, impl_id);
+            }
+            for &impl_id in derives {
+                builder.push_derive(row, impl_id);
             }
         }
     }
@@ -1923,6 +2341,105 @@ impl<'db> TraitImpls<'db> {
     }
 }
 
+/// The key of [`relevant_impls`]: a goal of `trait_` solved in `krate` whose self type
+/// simplifies to `self_ty`, or to nothing (a parameter, an alias, a placeholder) when `None`.
+#[salsa::interned(debug, revisions = usize::MAX)]
+pub struct RelevantImplsKey<'db> {
+    pub krate: Crate,
+    pub trait_: TraitId,
+    pub self_ty: Option<SelfTyKey<'db>>,
+}
+
+/// What [`relevant_impls`] gives: the impls for the self type, then the blanket ones.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RelevantImpls {
+    impls: Box<[AnyImplId]>,
+    blanket: u32,
+}
+
+impl RelevantImpls {
+    /// Every impl, in the order the solver considers them.
+    pub fn all(&self) -> &[AnyImplId] {
+        &self.impls
+    }
+
+    pub fn for_self_ty(&self) -> &[AnyImplId] {
+        &self.impls[..self.blanket as usize]
+    }
+
+    pub fn blanket(&self) -> &[AnyImplId] {
+        &self.impls[self.blanket as usize..]
+    }
+}
+
+/// The impls the trait solver considers for a goal of `key.trait_` in `key.krate`, in the
+/// order it considers them (`DbInterner::for_each_relevant_impl`): with a self type, those for
+/// it in the crate and the crates it loads, then those of the blocks around the trait and the
+/// type not among them; then the blanket impls of the blocks around the trait, then those of
+/// the crates not among them. With no self type, the blanket impls alone. One read names one
+/// trait and one simplified self type, as a goal's `Implements` fact does; the whole tables
+/// name neither.
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
+pub fn relevant_impls<'db>(db: &'db Db, key: RelevantImplsKey<'db>) -> RelevantImpls {
+    blaze_mem::frame::current(|frame| {
+        let (krate, trait_) = (key.krate(db), key.trait_(db));
+        let trait_block = trait_.loc(db).container.block(db);
+        let mut found = Vec::new_in(frame);
+        let blanket = match key.self_ty(db) {
+            Some(SelfTyKey(self_ty)) => {
+                found.extend_from_slice(TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
+                    db,
+                    krate,
+                    trait_,
+                    SelfTyKey(self_ty),
+                ));
+                let type_block = simplified_type_module(db, &self_ty).and_then(|it| it.block(db));
+                // The impls of a block are among those of its crate as well as its own, and
+                // the solver takes a second copy for an ambiguity.
+                TraitImpls::for_each_block_trait_and_type(
+                    db,
+                    type_block,
+                    trait_block,
+                    &mut |impls| {
+                        let (regular, derives) = impls.for_trait_and_self_ty(trait_, &self_ty);
+                        let in_block = regular
+                            .iter()
+                            .map(|&it| AnyImplId::from(it))
+                            .chain(derives.iter().map(|&it| AnyImplId::from(it)));
+                        for impl_ in in_block {
+                            if !found.contains(&impl_) {
+                                found.push(impl_);
+                            }
+                        }
+                    },
+                );
+                let blanket = found.len();
+                let none = RelevantImplsKey::new(db, krate, trait_, None);
+                found.extend_from_slice(relevant_impls(db, none).blanket());
+                blanket
+            }
+            None => {
+                TraitImpls::for_each_block(db, trait_block, &mut |impls| {
+                    found.extend(impls.blanket_impls(trait_).iter().map(|&it| AnyImplId::from(it)));
+                });
+                let in_blocks = found.len();
+                for &impl_ in TraitImpls::blanket_in_crate_and_deps(db, krate, trait_) {
+                    let impl_ = AnyImplId::from(impl_);
+                    if !found[..in_blocks].contains(&impl_) {
+                        found.push(impl_);
+                    }
+                }
+                0
+            }
+        };
+        RelevantImpls {
+            // alloc: the memo's value, once at its length.
+            impls: found.iter().copied().collect(),
+            blanket: u32::try_from(blanket).expect("fewer than 2^32 impls of a trait"),
+        }
+    })
+}
+
 fn self_ty_has_error_constructor<'db>(mut self_ty: Ty<'db>) -> bool {
     if !self_ty.references_non_lt_error() {
         return false;
@@ -1944,7 +2461,9 @@ fn self_ty_has_error_constructor<'db>(mut self_ty: Ty<'db>) -> bool {
 
 #[cfg(test)]
 mod inert_attribute_tests {
-    use super::{INERT_ATTRIBUTES, attribute_is_inert};
+    use intern::Symbol;
+
+    use super::{INERT_ATTRIBUTES, MacroDefinitions, attribute_is_inert};
 
     #[test]
     fn inert_attributes_as_a_linear_search() {
@@ -1964,5 +2483,88 @@ mod inert_attribute_tests {
             let by_search = INERT_ATTRIBUTES.contains(&name.as_str());
             assert_eq!(attribute_is_inert(name), by_search, "{name}");
         }
+    }
+
+    #[test]
+    fn macro_definitions_iterate_their_runs() {
+        let s = Symbol::intern;
+        let defs = MacroDefinitions {
+            defs: Box::new([(s("a"), false, 2), (s("b"), true, 2), (s("c"), false, 3)]),
+            calls: Box::new([s("x"), s("y"), s("z")]),
+        };
+        let runs: Vec<(Symbol, bool, Vec<Symbol>)> =
+            defs.iter().map(|(n, w, c)| (n.clone(), w, c.to_vec())).collect();
+        assert_eq!(runs, [
+            (s("a"), false, vec![s("x"), s("y")]),
+            (s("b"), true, vec![]),
+            (s("c"), false, vec![s("z")]),
+        ]);
+    }
+}
+
+#[cfg(test)]
+mod columns_tests {
+    use blaze_mem::{Tag, frame};
+    use rustc_type_ir::{IntTy, UintTy};
+
+    use super::{Runs, SimplifiedType, hash_self_ty, order_by_hash, ranks};
+
+    /// The old `Runs::new`: each run copied after the one before.
+    fn reference(runs: &[Vec<u32>]) -> (Vec<u32>, Vec<u32>) {
+        let mut starts = vec![0];
+        let mut values = Vec::new();
+        for run in runs {
+            values.extend_from_slice(run);
+            starts.push(values.len() as u32);
+        }
+        (starts, values)
+    }
+
+    #[test]
+    fn runs_from_groups_equal_runs_copied_in_order() {
+        frame::task(Tag::Infer, |frame| {
+            // Values of 4 groups, interleaved; groups go in the order 2, 0, 3, 1.
+            let values: [(u32, u32); 6] = [(0, 10), (2, 20), (0, 11), (3, 30), (2, 21), (0, 12)];
+            let order = [2u32, 0, 3, 1];
+            let rank = ranks(frame, &order);
+            let runs = Runs::from_groups(frame, rank, &values);
+            let by_group = |g: u32| -> Vec<u32> {
+                values.iter().filter(|it| it.0 == g).map(|it| it.1).collect()
+            };
+            let (starts, flat) = reference(&order.map(by_group));
+            assert_eq!(&*runs.starts, &starts[..]);
+            assert_eq!(&*runs.values, &flat[..]);
+            assert_eq!(runs.run(3), &[] as &[u32]);
+        });
+    }
+
+    #[test]
+    fn runs_of_nothing_have_one_start() {
+        frame::task(Tag::Infer, |frame| {
+            let runs = Runs::<u32>::from_groups(frame, &[], &[]);
+            assert_eq!(&*runs.starts, &[0]);
+            assert!(runs.values.is_empty());
+        });
+    }
+
+    #[test]
+    fn order_by_hash_is_the_stable_sort_by_hash() {
+        frame::task(Tag::Infer, |frame| {
+            let tys: [SimplifiedType<'static>; 6] = [
+                SimplifiedType::Bool,
+                SimplifiedType::Int(IntTy::I32),
+                SimplifiedType::Uint(UintTy::U8),
+                SimplifiedType::Char,
+                SimplifiedType::Str,
+                SimplifiedType::Never,
+            ];
+            // Six groups, three hashes: some share one, and ties keep first-seen order.
+            let groups: Vec<(u64, SimplifiedType<'static>)> =
+                tys.iter().map(|&ty| (hash_self_ty(&ty) % 3, ty)).collect();
+            let order = order_by_hash(frame, &groups);
+            let mut expected: Vec<u32> = (0..groups.len() as u32).collect();
+            expected.sort_by_key(|&g| groups[g as usize].0);
+            assert_eq!(&*order, &expected[..]);
+        });
     }
 }

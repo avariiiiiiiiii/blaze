@@ -25,15 +25,15 @@ mod unused;
 
 use base_db::Db;
 use blaze_items::ItemId;
-use hir::{HasSource as _, InFile};
+use hir::InFile;
 use hir_def::{
     expr_store::Body,
     nameres::demand::every_body,
 };
-use syntax::{SyntaxNode, TextRange, TextSize};
+use syntax::{TextRange, TextSize, view};
 
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view},
     lower::Found,
     model::Span,
 };
@@ -54,7 +54,7 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
         found.extend(unused::check(cx, adt));
         found.extend(infinite.check(cx, adt));
     }
-    for def in scopes.iter().flat_map(|module| module.declarations(cx.db)) {
+    for def in scopes.iter().flat_map(|module| module.declarations_iter(cx.db)) {
         if let hir::ModuleDef::TypeAlias(alias) = def {
             found.extend(unused::check_alias(cx, alias));
         }
@@ -86,22 +86,42 @@ pub(crate) fn is_block(cx: &Cx<'_, '_>, module: hir::Module) -> bool {
 fn adts(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<hir::Adt> {
     scopes
         .iter()
-        .flat_map(|module| module.declarations(cx.db))
+        .flat_map(|module| module.declarations_iter(cx.db))
         .filter_map(|def| match def {
-            hir::ModuleDef::Adt(adt) if adt.source(cx.db).is_some() => Some(adt),
+            hir::ModuleDef::Adt(adt) if cx.vsema.source(adt).is_some() => Some(adt),
             _ => None,
         })
+        // alloc: setup, once per check
         .collect()
 }
 
 /// rustc's `guess_head_span` of an item's span: up to its first `{`, unless that is all of it
-/// or spans lines.
-pub(crate) fn head_range(node: &SyntaxNode) -> TextRange {
-    let range = item_range(node);
-    head_of(&node.text().to_string(), node.text_range().start(), range)
+/// or spans lines. Read from the text the tree lends, up to the `{`, as [`head_of`] reads a
+/// copy.
+pub(crate) fn head_range_view(node: view::Node<'_>) -> TextRange {
+    let range = item_range_view(node);
+    let written = &node.text()[range - node.text_range().start()];
+    let head = &written[..written.find('{').unwrap_or(written.len())];
+    // The length up to its last character that is not white space, and whether a line ends
+    // before that.
+    let (mut len, mut at, mut newline, mut multiline) = (TextSize::new(0), TextSize::new(0), false, false);
+    for c in head.chars() {
+        at += TextSize::of(c);
+        if c == '\n' {
+            newline = true;
+        } else if !c.is_whitespace() {
+            multiline |= newline;
+            len = at;
+        }
+    }
+    match len > TextSize::new(0) && !multiline {
+        true => TextRange::at(range.start(), len),
+        false => range,
+    }
 }
 
 /// rustc's `span_until_char(range, '{')` of the text `text` of a node starting at `base`.
+#[cfg(test)]
 pub(crate) fn head_of(text: &str, base: TextSize, range: TextRange) -> TextRange {
     let start = usize::from(range.start() - base);
     let end = usize::from(range.end() - base);
@@ -115,8 +135,8 @@ pub(crate) fn head_of(text: &str, base: TextSize, range: TextRange) -> TextRange
 }
 
 /// The span of rustc's `guess_head_span` of `node`.
-pub(crate) fn head_span(cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>) -> Span {
-    cx.span(node.map(head_range))
+pub(crate) fn head_span(cx: &Cx<'_, '_>, node: InFile<view::Node<'_>>) -> Span {
+    cx.span(node.map(head_range_view))
 }
 
 /// The item a definition is, for its key in a fact.
@@ -149,5 +169,35 @@ mod tests {
         let text = "fn f<T>()\nwhere T: Copy {}";
         let range = TextRange::up_to(TextSize::of(text));
         assert_eq!(&text[head_of(text, 0.into(), range)], text);
+    }
+
+    /// The head read from the tokens is the one the text's copy gives, for heads on one line,
+    /// over several, with none, after attributes and with a `{` in a comment.
+    #[test]
+    fn the_head_read_in_place_is_the_copys() {
+        use syntax::{
+            Edition, SourceFile,
+            view::{self as ast, AstNode as _},
+        };
+
+        let text = r#"
+#[derive(Clone)]
+struct One { x: u8 }
+struct Two;
+enum Three /* { */ { A }
+fn four<T>()
+where T: Copy {}
+trait Five   
+{}
+impl Five for Two {}
+"#;
+        let parse = SourceFile::parse(text, Edition::Edition2021);
+        let mut compared = 0;
+        for node in parse.root().descendants().filter(|it| ast::Item::can_cast(it.kind())) {
+            let plain = head_of(node.text(), node.text_range().start(), item_range_view(node));
+            assert_eq!(head_range_view(node), plain, "at {node:?}");
+            compared += 1;
+        }
+        assert!(compared >= 6, "the text has six items: {compared}");
     }
 }

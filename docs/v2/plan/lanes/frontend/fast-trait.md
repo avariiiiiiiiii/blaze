@@ -10,7 +10,8 @@ Section 2 of [fast.md](fast.md). Code: `crates/hir-ty/src/next_solver/global_goa
 and `goal_store/` (the persistent cache, child `frontend-fast-trait-store`), cases in
 `harness/v2/frontend/cases/trait/` (child `frontend-fast-trait-cases`). The hooks in files of lane
 db (`solver.rs`, `fulfill.rs`, `interner.rs`, `interner/tls_cache.rs`, `next_solver.rs`,
-`infer/mod.rs`) are requests in `v2/requests/db-ty.md` under `## frontend-fast-trait: ...`.
+`infer/mod.rs`) and in the vendored solver (`rustc_type_ir`, `rustc_next_trait_solver`, lane db's
+solver-sync series) are requests in `v2/requests/db-ty.md` under `## frontend-fast-trait: ...`.
 
 Nothing here was run. Costs are counted from the code with the machine of
 [../db/speed-of-light.md](../db/speed-of-light.md): about 3.5 GHz, L1 in 4 to 5 cycles, L2 in 14,
@@ -74,7 +75,13 @@ variables (`HAS_INFER`), no placeholders (`HAS_PLACEHOLDER`), no bound variables
 free local regions (`HAS_FREE_LOCAL_REGIONS`: region parameters, region inference variables
 and placeholders; `'static` and erased regions are allowed) and no error (`HAS_ERROR`).
 Parameters are allowed: `T: Sized` under a param env is a goal like any other, and its
-canonical form keeps `T`. Two flag tests, no fold.
+canonical form keeps `T`. The test is on the goal resolved through the unification table
+(`deeply_resolve_via_unification_table`, a fold only when the goal has inference variables),
+the resolution the solver's `evaluate_goal_raw` makes first and whose result is the
+evaluation's goal: a goal whose variables are all unified with global types, as a method
+probe's impl where clauses are once its receiver is (frontend-fast-method's section 7), is
+the global goal it stands for, and a hit returns the resolved goal as the solver would. Then
+two flag tests.
 
 **The key** is one `u64`:
 
@@ -134,11 +141,11 @@ is per database, crate and `regions` flag, replaced on the first use in a later 
 freed through the same limbo after its grace.
 
 **The table** (`global_goals/table.rs`): open addressing with linear probing over 64-byte slots
-(the key word, the answer, the 32-byte `Reads`), one slot to a half line. It starts empty and
+(the key word, the answer, the 32-byte `Reads`), one slot to a cache line. It starts empty and
 allocates its first level (2^12 slots, 256 KB, zeroed pages) on the first insert, so making a
 generation allocates nothing for it. A full level (half its slots used) is never rehashed: a new
 level four times larger is added (docs/v2/plan/design/concurrency.md: "A full table grows by
-adding a level"), and inserts go to the newest. Up to five levels (about 1.4 million goals); past
+adding a level"), and inserts go to the newest. Up to five levels (about 700,000 goals at half load); past
 that inserts stop, which costs solves, never an answer. Lookups probe levels oldest first, since
 the goals asked first are asked most. A reader does plain acquire loads: no lock and no write on
 the read path. A writer claims an empty slot with a compare-and-swap to the key with bit 63 set,
@@ -148,8 +155,10 @@ returns.
 
 ### 2. The shape table (`global_goals/shape.rs`)
 
-In `compute_goal_fast_path`, for a positive trait goal whose self type has no inference
-variables, placeholders, free local regions or errors, outside `Coherence`:
+In `compute_goal_fast_path`, where it is asked for answers that cost depth ("Depth" below), for
+a positive trait goal whose self type has no inference
+variables, placeholders, regions (not even `'static`), parameters, errors or escaping bound
+variables, outside `Coherence` and `Reflection` (which assembles no built-in candidate):
 
 - **`Sized`, `MetaSized`**: rustc's own fast path (`sizedness_fast_path`, `has_trivial_sizedness`
   with the per-ADT `sizedness_constraint`) already is the shape table for sizedness; kept as is.
@@ -176,28 +185,66 @@ variables, placeholders, free local regions or errors, outside `Coherence`:
   - a (trait, type) pair already on the walk's stack holds: auto traits are coinductive
     (`TraitFlags::AUTO | COINDUCTIVE`, `CurrentGoalKind::CoinductiveTrait`), and the solver's
     coinductive cycles hold unless a leaf fails, which is what the walk computes;
-  - the walk stops with no answer past 16 levels or 256 nodes.
+  - the walk stops with no answer past 24 levels on its stack, past the depth the goal is
+    evaluated with (below), or past 512 nodes.
 
-  For an ADT the verdict is a query, `adt_auto_trait_holds(adt, trait)`, computed once per
-  revision from its fields with identity arguments, run with an interner of the ADT's own crate
-  (impls of an auto trait for an ADT are in its crate or, for core's types, in core: E0321). A
-  verdict that holds with identity arguments holds for every instantiation: the walk reached no
-  parameter whose answer it used, which is the brief's "no generic dependence". A goal on an ADT
-  instance whose verdict does not hold is walked inline with its arguments.
+  For an ADT the verdict is a query, `auto_trait_depth(adt, trait, crate)`, computed once per
+  revision from its fields with identity arguments, with the asking crate's interner: a user
+  auto trait's impls for a foreign type sit in the trait's crate, which the ADT's crate need not
+  see, so only the asking crate sees what the solver sees. A verdict that holds with identity
+  arguments holds for every instantiation: the walk reached no parameter whose answer it used,
+  which is the brief's "no generic dependence". The verdict is the number of levels the walk
+  used (0: no answer). An instance can close a cycle sooner than the identity walk, never later,
+  so the instance needs at most that many.
+  The fast path answers an ADT instance from the verdict alone and never walks it inline: that
+  would instantiate and intern field types on every ask, and the canonical path's cache answers
+  those instances once. Inside the verdict query the walk is inline (no query per field ADT, so
+  no query cycle). `Copy`/`Clone` have their own query, `copy_clone_impl(adt, trait, crate)`.
 
-**Allocation.** A hit allocates nothing: the per-ADT verdict is a `Copy` memo; the inline walk
-keeps its stack in a fixed array of 16.
+**Allocation.** A hit allocates nothing: the per-ADT verdict is a `Copy` memo, the walk keeps its
+stack in a fixed array of 24, and the impl lookup allocates only for impls inside bodies.
 
-**What it must keep of rustc, and the one edge.** Every answer it gives is `Certainty::Yes`
+**What it must keep of rustc.** Every answer it gives is `Certainty::Yes`
 with no constraints, which the solver gives on the same goal: same candidates (impl or auto),
-same nested goals, coinduction for cycles. Param-env candidates would also hold for the same goal
-(the type has no free local regions or inference variables, so they constrain nothing). The edge
-is the recursion limit: rustc's search graph charges each nested goal one level, and a nested
-goal answered by this table charges none. rustc's own sizedness fast path does the same. A
-program can tell only if a goal sits within 16 levels of the recursion limit (default 128) when
-it reaches the shape: rustc then overflows, reruns with twice the limit and warns
-(`recursion_depth_exceeding_limit`), and blaze holds without the warning; at twice the limit,
-rustc's error comes up to 16 levels later in blaze. No real program sits there.
+same nested goals, coinduction for cycles. Param-env candidates are the one way the solver's
+answer could differ: the new solver prefers a non-global where-bound, and one whose only local
+names are regions (`Wrap<&'a u8>: Send`) unifies with a nested goal on `Wrap<&'static u8>` and
+adds `'a == 'static`, an error rustc reports. A where-bound with a type or const parameter never
+unifies with the walk's goals, which have none. So no auto-trait goal is answered under a param
+env holding an auto-trait clause whose only local names are regions; `Copy`/`Clone` of a
+non-generic ADT has no region for such a clause to meet.
+
+**Depth.** Every goal this table answers is one rustc evaluates through the search graph, which
+gives it a depth and charges it. rustc's own fast paths (sizedness, trivially `Copy`, stalls)
+answer in `add_goal` and charge nothing, and rustc does the same. So the table charges what the
+evaluation would:
+
+- the walk counts levels: the goal is level 1, each goal it steps to one more, a cycle hit
+  included (the solver evaluates that goal and finds it on its stack), and a sizedness clause
+  the sizedness fast path proves none. A verdict adds its levels at the ADT's level;
+- it answers only when the levels below the goal fit in the depth the goal is evaluated with:
+  `allowed_depth_for_nested` (the parent's depth minus one, divided by 4 once the parent has
+  overflowed, none at 0), or the crate's limit at the root. It returns them
+  (`HoldsWithin { required_depth }`), and the solver charges the parent goal as for a global
+  cache hit of that depth with no nested goals (`charge_answered_nested`). The parent's cache
+  entry then records the depth rustc's does, and is reused at the same depths;
+- that depth is known only when the goal is evaluated, not when it is added: a sibling that
+  overflows in between divides it. So `add_goal` asks only for answers that cost no depth
+  (`FastPathDepth::Added`). The nested goal loop asks for the depth-costing ones with the depth
+  the search graph would give (`Evaluating`), and the root and stalled reruns ask for both
+  (`Any`). With a proof tree being built, nothing depth-costing is answered;
+- `Copy`/`Clone` through the one impl costs the goal's own level, so it is depth-costing too.
+
+What the walk does not see, it overcounts, never undercounts: a cycle the solver closes through a
+goal further up its own stack, and a repeat its provisional cache answers, cost the solver one
+level where the walk counts the whole subtree. The walk then declines where the solver would
+still fit, and the solver evaluates the goal as rustc does. A larger charge only makes a cache
+entry apply at fewer depths, and recomputing gives rustc's result (the search graph's
+cache-independence, which its validation mode checks). The vendored edits are in
+`v2/requests/db-ty.md`, "the shape table charges search-graph depth as rustc does". Before them,
+a goal nested within 24 levels of the limit held in blaze where rustc overflowed:
+`harness/v2/frontend/cases/trait/recursion_send_nested_past_twice_small_limit_rejects.rs` is
+that program, and `recursion_*` pins the limits around it.
 
 ### 3. The persistent cache by content (`goal_store.rs`, child `frontend-fast-trait-store`)
 
@@ -225,16 +272,27 @@ requested of lane items, and the store holds no goal whose reads it cannot expre
 ## What proves it
 
 - `global_goals/tests.rs`:
-  - the key's packing round-trips, and each non-keyed shape (inference variables, placeholders,
-    local regions, erased mode, a defining scope, opaques in storage) has no key;
+  - the key's packing round-trips in all seven keyed modes, and the non-keyed shapes (an
+    inference variable, an env with a region parameter, the erased mode, a defining scope) have
+    no key;
   - the table against a `Mutex<HashMap>` reference under eight threads of inserts and lookups,
     level growth included;
-  - a table hit and a shape hit allocate nothing (`blaze-alloc-count`);
-  - the differential test: a generated crate (impls with and without where clauses, auto traits,
-    negative impls, `PhantomData`, `PhantomPinned`, `UnsafeCell`, generic and recursive ADTs) and
-    random global goals over it, each answered with the tables and through the plain solver
-    (tables switched off, caches cleared between), which must agree on every goal; and the shape
-    walker against the solver on every (auto trait, ADT) pair of the crate.
+  - a table hit and a shape hit allocate nothing (`blaze-alloc-count`); a table hit's
+    `replay_reads` appends to the asking query's edges as any read does;
+  - the differential test: eight generated crates of 24 ADTs each (derived and written
+    `Clone`/`Copy`, negative and explicit auto-trait impls, a `!Sync` and a `!Unpin` stand-in for
+    `UnsafeCell` and `PhantomPinned`, `PhantomData`, generic wrappers with and without bounds,
+    recursion through references) and every (trait, type) goal of `Send`, `Sync`, `Unpin`,
+    `Copy`, `Clone` and `Sized` over each ADT, the built-in types around it and the wrappers,
+    each asked twice in two typing modes, once with the tables and once on a fresh database with
+    them switched off; the answers must be equal, and every goal the shape table answers must be
+    `EvaluatedToOk` in the plain run;
+  - a region-only auto-trait where-bound in the env turns the shape table off for the goal;
+  - near the limit: under `#![recursion_limit = "8"]`, each link of a 20-link `Send` chain is
+    answered exactly when its depth fits (0, 5, 8, 16 and 128 levels available). The chain's
+    goals at the root and nested under 0 to 16 `W<..>: Deep` wrappers give the plain solver's
+    answers and overflow warnings with the tables on. The plain run has a quiet hold, a warned
+    hold and a failure among them.
 - `goal_store`'s tests: the record read back from the store equals the computed one, and a
   changed fact refuses it.
 - `harness/v2/frontend/cases/trait/`: programs through rustc and blaze, every shape the tables

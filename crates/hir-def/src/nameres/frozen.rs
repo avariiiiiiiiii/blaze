@@ -94,7 +94,7 @@ pub enum Mode {
 /// The frozen `DefMap` of a crate.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Frozen {
-    pub bytes: Arc<[u8]>,
+    pub bytes: crate::deps::PartBytes,
     pub mode: Mode,
 }
 
@@ -108,6 +108,7 @@ pub struct FrozenDefMaps {
 /// Has name resolution use `maps`.
 pub fn set(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
     use salsa::{Durability, Setter};
+    // alloc: Check/Verify only, which record differences; never when serving
     let maps = Arc::new(maps);
     match FrozenDefMaps::try_get(db) {
         Some(it) => {
@@ -146,10 +147,12 @@ impl Differences {
     }
 }
 
+// alloc: Check/Verify only, which record differences; never when serving
 static DIFFERENCES: Differences = Differences(Mutex::new(Vec::new()));
 
 /// The differences [`Mode::Check`] and [`Mode::Verify`] found since this was last called.
 pub fn differences() -> Vec<String> {
+    // alloc: Check/Verify only, which record differences; never when serving
     DIFFERENCES.take().into_iter().map(|(_, _, it)| it).collect()
 }
 
@@ -172,7 +175,9 @@ pub fn record_difference(
     frozen: &[u8],
 ) {
     let at = written.iter().zip(frozen).position(|(a, b)| a != b).unwrap_or(written.len());
+    // alloc: Check/Verify only, which record differences; never when serving
     let name = krate.extra_data(db).display_name.as_ref().map(|it| it.to_string());
+    // alloc: Check/Verify only, which record differences; never when serving
     let said = format!(
         "the frozen {kind} of `{}` differs from {what}: {} bytes against {}, first at byte {at}",
         name.as_deref().unwrap_or("?"),
@@ -182,10 +187,43 @@ pub fn record_difference(
     DIFFERENCES.record(krate, kind, Some(said));
 }
 
+/// Records a difference between `frozen`, the bytes of `krate`'s `kind`, and what `encode`
+/// writes now: the live ones in [`Mode::Check`], what was read of them in [`Mode::Verify`].
+pub fn check_frozen(
+    db: &Db,
+    krate: Crate,
+    kind: &'static str,
+    frozen: &Frozen,
+    encode: impl FnOnce() -> Result<Vec<u8>, String>,
+) {
+    let what = match frozen.mode {
+        Mode::Serve => return,
+        Mode::Check => "the live ones",
+        Mode::Verify => "what was read of them",
+    };
+    match encode() {
+        Ok(written) if *written == *frozen.bytes => {}
+        Ok(written) => record_difference(db, krate, kind, what, &written, &frozen.bytes),
+        Err(why) => {
+            // alloc: Check/Verify only, which record differences; never when serving
+            let what = format!("{what}, which cannot be written ({why})");
+            record_difference(db, krate, kind, &what, &[], &[])
+        }
+    }
+}
+
+/// The frozen `DefMap` of `krate`, by value: a [`set`] that leaves it as it was is backdated
+/// here, so it runs none of the queries of `krate` again.
+#[salsa::tracked]
+fn frozen_def_map(db: &Db, krate: Crate) -> Option<Frozen> {
+    // clone: a count of the image the bytes are in, or of their own buffer
+    FrozenDefMaps::try_get(db)?.maps(db).get(&krate).cloned()
+}
+
 /// What [`super::crate_local_def_map`] serves for `krate` instead of resolving it, when its
 /// `DefMap` is frozen.
 pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
-    let frozen = FrozenDefMaps::try_get(db)?.maps(db).get(&krate)?.clone();
+    let frozen = frozen_def_map(db, krate)?;
     if frozen.mode == Mode::Check {
         return None;
     }
@@ -195,6 +233,7 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
         match encode_maps(db, krate, &def_map, &local) {
             Ok(written) if *written == *frozen.bytes => {}
             Ok(written) => differs(db, krate, "what was read of it", &written, &frozen.bytes),
+            // alloc: error path
             Err(why) => differs(db, krate, &format!("what was read of it ({why})"), &[], &[]),
         }
     }
@@ -204,10 +243,7 @@ pub(super) fn served(db: &Db, krate: Crate) -> Option<(DefMap, LocalDefMap)> {
 /// Records a difference between the `DefMap` resolving found and the frozen one, in
 /// [`Mode::Check`].
 pub(super) fn check(db: &Db, krate: Crate, def_map: &DefMap, local: &LocalDefMap) {
-    let Some(frozen) = FrozenDefMaps::try_get(db).and_then(|it| it.maps(db).get(&krate).cloned())
-    else {
-        return;
-    };
+    let Some(frozen) = frozen_def_map(db, krate) else { return };
     if frozen.mode != Mode::Check {
         return;
     }
@@ -215,6 +251,7 @@ pub(super) fn check(db: &Db, krate: Crate, def_map: &DefMap, local: &LocalDefMap
         Ok(written) if *written == *frozen.bytes => agrees(krate, "def map"),
         Ok(written) => differs(db, krate, "the live one", &written, &frozen.bytes),
         Err(why) => {
+            // alloc: Check/Verify only, which record differences; never when serving
             differs(db, krate, &format!("the live one, which it cannot write ({why})"), &[], &[])
         }
     }
@@ -237,6 +274,7 @@ pub struct FrozenLangItems {
 /// Has finding the lang items of a crate use `maps`.
 pub fn set_lang_items(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
     use salsa::{Durability, Setter};
+    // alloc: once per load of the frozen bytes
     let maps = Arc::new(maps);
     match FrozenLangItems::try_get(db) {
         Some(it) => {
@@ -248,7 +286,10 @@ pub fn set_lang_items(db: &mut Db, maps: FxHashMap<Crate, Frozen>) {
     }
 }
 
+/// The frozen lang items of `krate`, by value, as [`frozen_def_map`] is.
+#[salsa::tracked]
 fn frozen_lang_items(db: &Db, krate: Crate) -> Option<Frozen> {
+    // clone: a count of the image the bytes are in, or of their own buffer
     FrozenLangItems::try_get(db)?.maps(db).get(&krate).cloned()
 }
 
@@ -265,15 +306,18 @@ pub(crate) fn served_lang_items(
             let mut items = LangItems::default();
             let n = dec.len()?;
             if n != LangItemEnum::ALL.len() {
+                // alloc: error path
                 return Err(format!("{n} lang items"));
             }
             for &which in LangItemEnum::ALL {
                 if let Some(target) = dec.option(Dec::lang_item_target)?
                     && !items.set(which, target)
                 {
+                    // alloc: error path
                     return Err(format!("a lang item {which:?} of another kind"));
                 }
             }
+            // alloc: once per load of the frozen bytes
             Ok(Box::new(items))
         })?;
         dec.finish()?;
@@ -300,19 +344,7 @@ pub fn encode_lang_items(db: &Db, krate: Crate) -> R<Vec<u8>> {
 /// [`Mode::Check`], or what was read of them in [`Mode::Verify`].
 pub fn check_lang_items(db: &Db, krate: Crate) {
     let Some(frozen) = frozen_lang_items(db, krate) else { return };
-    let what = match frozen.mode {
-        Mode::Serve => return,
-        Mode::Check => "the live ones",
-        Mode::Verify => "what was read of them",
-    };
-    match encode_lang_items(db, krate) {
-        Ok(written) if *written == *frozen.bytes => {}
-        Ok(written) => record_difference(db, krate, "lang items", what, &written, &frozen.bytes),
-        Err(why) => {
-            let what = format!("{what}, which cannot be written ({why})");
-            record_difference(db, krate, "lang items", &what, &[], &[])
-        }
-    }
+    check_frozen(db, krate, "lang items", &frozen, || encode_lang_items(db, krate));
 }
 
 /// The bytes of the `DefMap` of `krate` as name resolution computes it, or why it cannot be
@@ -325,7 +357,9 @@ pub fn encode(db: &Db, krate: Crate) -> R<Vec<u8>> {
 /// `krate` and the crates it depends on, transitively, breadth first in the order the crate
 /// graph lists dependencies: the crates frozen bytes name by index.
 fn closure(db: &Db, krate: Crate) -> Vec<Crate> {
+    // alloc: encoding, once per crate per image write (not on a build's path)
     let mut order = vec![krate];
+    // alloc: encoding, once per crate per image write (not on a build's path)
     let mut seen: FxHashSet<Crate> = order.iter().copied().collect();
     let mut at = 0;
     while let Some(&next) = order.get(at) {
@@ -349,14 +383,17 @@ fn root_dir(db: &Db, krate: Crate) -> R<(String, bool, base_db::SourceRootId)> {
     let real = path.as_path().is_some();
     let path = on_disk(&path)?;
     let dir =
+        // alloc: encoding, once per crate per image write (not on a build's path)
         path.rsplit_once('/').map(|it| it.0.to_owned()).ok_or("a crate root in no directory")?;
     Ok((dir, real, source_root))
 }
 
 /// The text of `path`, which [`vfs_path`] reads back.
 fn on_disk(path: &VfsPath) -> R<String> {
+    // alloc: encoding, once per crate per image write (not on a build's path)
     let text = path.to_string();
     if !text.starts_with('/') {
+        // alloc: error path
         return Err(format!("a file with a path that is not absolute: {text}"));
     }
     Ok(text)
@@ -378,12 +415,14 @@ const OUT: &str = "\0OUT_DIR";
 fn out_dir(db: &Db, krate: Crate) -> Option<String> {
     let out = krate.env(db).get("OUT_DIR")?;
     let out = out.trim_end_matches('/');
+    // alloc: encoding, once per crate per image write (not on a build's path)
     (!out.is_empty()).then(|| out.to_owned())
 }
 
 /// The `OUT_DIR` of each crate of `closure` that has one, by its index there.
 fn out_dirs(db: &Db, closure: &[Crate]) -> Vec<(u32, String)> {
     let dirs = closure.iter().enumerate();
+    // alloc: encoding, once per crate per image write (not on a build's path)
     dirs.filter_map(|(index, &krate)| Some((index as u32, out_dir(db, krate)?))).collect()
 }
 
@@ -393,9 +432,12 @@ fn holds(bytes: &[u8], part: &[u8]) -> bool {
 
 /// `to` from the directory `from`, with `..` where it is not under it.
 fn relative(from: &str, to: &str) -> String {
+    // alloc: encoding, once per crate per image write (not on a build's path)
     let from: Vec<_> = from.split('/').filter(|it| !it.is_empty()).collect();
+    // alloc: encoding, once per crate per image write (not on a build's path)
     let to: Vec<_> = to.split('/').filter(|it| !it.is_empty()).collect();
     let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    // alloc: encoding, once per crate per image write (not on a build's path)
     let mut parts: Vec<&str> = vec![".."; from.len() - common];
     parts.extend(&to[common..]);
     parts.join("/")
@@ -403,6 +445,7 @@ fn relative(from: &str, to: &str) -> String {
 
 /// `relative` from the directory `from`: what [`relative`] gave back.
 fn joined(from: &str, relative: &str) -> String {
+    // alloc: encoding, once per crate per image write (not on a build's path)
     let mut parts: Vec<_> = from.split('/').filter(|it| !it.is_empty()).collect();
     for part in relative.split('/') {
         match part {
@@ -413,6 +456,7 @@ fn joined(from: &str, relative: &str) -> String {
             it => parts.push(it),
         }
     }
+    // alloc: encoding, once per crate per image write (not on a build's path)
     format!("/{}", parts.join("/"))
 }
 
@@ -489,10 +533,12 @@ impl<'a> Enc<'a> {
     /// Writes values of `krate`, which names its dependencies by their index in its closure.
     pub fn new(db: &'a Db, krate: Crate) -> Self {
         let closure = closure(db, krate);
+        // alloc: encoding, once per crate per image write (not on a build's path)
         let crates = closure.iter().enumerate().map(|(i, &it)| (it, i as u32)).collect();
         let out_dirs = out_dirs(db, &closure);
         Enc {
             db,
+            // alloc: encoding, once per crate per image write (not on a build's path)
             out: Vec::new(),
             fingerprinting: false,
             crates,
@@ -501,6 +547,7 @@ impl<'a> Enc<'a> {
             owners: FxHashMap::default(),
             file_names: FxHashMap::default(),
             files: FxHashMap::default(),
+            // alloc: encoding, once per crate per image write (not on a build's path)
             file_order: Vec::new(),
             calls: FxHashMap::default(),
             contexts: FxHashMap::default(),
@@ -518,13 +565,16 @@ impl<'a> Enc<'a> {
         // The target directories the closure's build scripts wrote below, which nothing the
         // bytes say may name: they are of one checkout.
         let mut places: Vec<String> = (self.out_dirs.iter())
+            // alloc: encoding, once per crate per image write (not on a build's path)
             .map(|(_, out)| out.find("/build/").map_or(out.clone(), |at| out[..at + 1].to_owned()))
+            // alloc: encoding, once per crate per image write (not on a build's path)
             .collect();
         places.sort_unstable();
         places.dedup();
         let body = std::mem::take(&mut self.out);
         self.usize(self.file_order.len())?;
         for file in std::mem::take(&mut self.file_order) {
+            // clone: encoding, once per crate per image write (not on a build's path)
             let (owner, path) = self.file_names[&file].clone();
             self.u32(owner);
             self.str(&path)?;
@@ -539,12 +589,14 @@ impl<'a> Enc<'a> {
             if !path.starts_with(OUT) {
                 let full = joined(&self.dirs[&owner], &path);
                 if let Some(place) = places.iter().find(|it| full.starts_with(it.as_str())) {
+                    // alloc: error path
                     return Err(format!("a file below {place}, a place of one checkout: {full}"));
                 }
             }
         }
         self.out.extend_from_slice(&body);
         if let Some(place) = places.iter().find(|it| holds(&self.out, it.as_bytes())) {
+            // alloc: error path
             return Err(format!("the bytes name {place}, a place of one checkout"));
         }
         Ok(self.out)
@@ -555,15 +607,18 @@ impl<'a> Enc<'a> {
     fn unplaced(&self, text: &Symbol) -> R<Symbol> {
         let written = text.as_str();
         if written.contains('\0') {
+            // alloc: error path
             return Err("a literal holding a NUL".to_owned());
         }
+        // alloc: encoding, once per crate per image write (not on a build's path)
         let mut unplaced = written.to_owned();
         for (index, out) in &self.out_dirs {
             if unplaced.contains(out.as_str()) {
+                // alloc: encoding, once per crate per image write (not on a build's path)
                 unplaced = unplaced.replace(out.as_str(), &format!("{OUT} {index}\0"));
             }
         }
-        Ok(if unplaced == written { text.clone() } else { Symbol::intern(&unplaced) })
+        Ok(if unplaced == written { *text } else { Symbol::intern(&unplaced) })
     }
 }
 
@@ -625,17 +680,20 @@ impl Enc<'_> {
         entries: impl Iterator<Item = (K, V)>,
         key: impl Fn(&mut Self, &K) -> R,
     ) -> R<Vec<(K, V)>> {
+        // alloc: encoding, once per crate per image write (not on a build's path)
         let mut keyed = Vec::new();
         for (k, v) in entries {
             let print = self.fingerprint(|enc| key(enc, &k))?;
             keyed.push((print, k, v));
         }
         keyed.sort_by(|a, b| a.0.cmp(&b.0));
+        // alloc: encoding, once per crate per image write (not on a build's path)
         Ok(keyed.into_iter().map(|(_, k, v)| (k, v)).collect())
     }
 
     fn file_name(&mut self, file: FileId) -> R<(u32, String)> {
         if let Some(it) = self.file_names.get(&file) {
+            // clone: encoding, once per crate per image write (not on a build's path)
             return Ok(it.clone());
         }
         let db = self.db;
@@ -652,13 +710,16 @@ impl Enc<'_> {
         let owner = *self
             .owners
             .get(&source_root)
+            // alloc: error path
             .ok_or_else(|| format!("a file of no crate of the closure: {path}"))?;
         // Named from the crate whose build script wrote it, whichever crate's root is beside it.
         let below_out = self.out_dirs.iter().find_map(|(index, out)| {
             let rest = path.strip_prefix(out.as_str())?;
+            // alloc: encoding, once per crate per image write (not on a build's path)
             rest.starts_with('/').then(|| (*index, format!("{OUT}{rest}")))
         });
         let name = below_out.unwrap_or_else(|| (owner, relative(&self.dirs[&owner], &path)));
+        // clone: encoding, once per crate per image write (not on a build's path)
         self.file_names.insert(file, name.clone());
         Ok(name)
     }
@@ -736,6 +797,7 @@ impl Enc<'_> {
     }
 
     fn call_loc(&mut self, call: MacroCallId) -> R {
+        // clone: encoding, once per crate per image write (not on a build's path)
         let loc = call.loc(self.db).clone();
         let included = includes(&loc).then(|| loc.include_file_id(self.db, call));
         let MacroCallLoc { def, krate, kind, ctxt, macro_depth } = loc;
@@ -749,6 +811,7 @@ impl Enc<'_> {
         match included {
             None => {}
             Some(Some(file)) => self.file(file)?,
+            // alloc: error path
             Some(None) => return Err("an include! of a file that is not loaded".to_owned()),
         }
         Ok(())
@@ -771,6 +834,7 @@ impl Enc<'_> {
                     Some(eager) => {
                         let EagerCallInfo { arg, arg_id, error, span } = &*eager;
                         if error.is_some() {
+                            // alloc: error path
                             return Err("an eager macro call whose argument failed".to_owned());
                         }
                         self.u8(1);
@@ -931,6 +995,7 @@ impl Enc<'_> {
     }
 
     fn subtree(&mut self, it: &tt::TopSubtree) -> R {
+        // alloc: encoding, once per crate per image write (not on a build's path)
         let tokens: Vec<_> = it.as_token_trees().iter_flat_tokens().collect();
         self.usize(tokens.len())?;
         for token in tokens {
@@ -951,19 +1016,7 @@ impl Enc<'_> {
                     self.u8(1);
                     let text_and_suffix = self.unplaced(&text_and_suffix)?;
                     self.symbol(&text_and_suffix)?;
-                    let (kind, hashes) = match kind {
-                        LitKind::Byte => (0, 0),
-                        LitKind::Char => (1, 0),
-                        LitKind::Integer => (2, 0),
-                        LitKind::Float => (3, 0),
-                        LitKind::Str => (4, 0),
-                        LitKind::StrRaw(n) => (5, n),
-                        LitKind::ByteStr => (6, 0),
-                        LitKind::ByteStrRaw(n) => (7, n),
-                        LitKind::CStr => (8, 0),
-                        LitKind::CStrRaw(n) => (9, n),
-                        LitKind::Err(()) => (10, 0),
-                    };
+                    let (kind, hashes) = kind.code();
                     self.u8(kind);
                     self.u8(hashes);
                     self.u8(suffix_len);
@@ -1301,6 +1354,7 @@ impl Enc<'_> {
     }
 
     pub fn variant(&mut self, it: EnumVariantId) -> R {
+        // clone: encoding, once per crate per image write (not on a build's path)
         let EnumVariantLoc { id, parent, name } = it.lookup(self.db).clone();
         self.ast_id(id)?;
         self.adt(AdtId::EnumId(parent))?;
@@ -1472,6 +1526,7 @@ impl Enc<'_> {
             self.visibility(vis)?;
             self.option(import, Self::import_or_extern_crate)?;
         }
+        // alloc: encoding, once per crate per image write (not on a build's path)
         let mut names: Vec<&str> = unresolved.iter().map(|it| it.symbol().as_str()).collect();
         names.sort_unstable();
         self.usize(names.len())?;
@@ -1485,8 +1540,8 @@ impl Enc<'_> {
         self.usize(impls.len())?;
         for (at, &it) in impls.iter().enumerate() {
             self.impl_id(it)?;
-            self.bool(trait_impl.get(at));
-            self.bool(reservation_impl.get(at));
+            self.bool(trait_impl.contains(at));
+            self.bool(reservation_impl.contains(at));
         }
         self.usize(builtin_derive_impls.len())?;
         for &it in builtin_derive_impls {
@@ -1555,6 +1610,7 @@ impl Enc<'_> {
         for &it in extern_crate_decls {
             self.extern_crate(it)?;
         }
+        // alloc: encoding, once per crate per image write (not on a build's path)
         let mut legacy: Vec<_> = legacy_macros.iter().collect();
         legacy.sort_unstable_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
         self.usize(legacy.len())?;
@@ -1606,6 +1662,7 @@ impl Enc<'_> {
 
     fn tree_id(&mut self, it: TreeId) -> R {
         if it.is_block() {
+            // alloc: error path
             return Err("an item tree of a block".to_owned());
         }
         self.hir_file(it.file_id())
@@ -1630,6 +1687,7 @@ impl Enc<'_> {
                 self.erased_ast_id(definition.erase());
                 Ok(())
             }
+            // alloc: error path
             ModuleOrigin::BlockExpr { .. } => Err("a block module".to_owned()),
         }
     }
@@ -1711,6 +1769,7 @@ impl Enc<'_> {
             }
             DefDiagnosticKind::UnresolvedMacroCall { ast, path } => {
                 self.u8(4);
+                // clone: encoding, once per crate per image write (not on a build's path)
                 self.call_kind(ast.clone())?;
                 self.mod_path(path)?;
             }
@@ -1822,18 +1881,22 @@ impl Enc<'_> {
             modules: _,
             prelude,
             macro_use_prelude,
-            derive_helpers_in_scope,
-            diagnostics,
+            derive_helpers_in_scope: _,
+            diagnostics: _,
             diagnostics_by_module: _,
+            records: _,
             data,
             session_macros,
-            names,
+            names: _,
         } = it;
         let db = self.db;
+        let super::Records { names, diagnostics, derive_helpers_in_scope, .. } = it.records(db);
         if *session_macros {
+            // alloc: error path
             return Err("compilation-local macro state".to_owned());
         }
         if block.is_some() {
+            // alloc: error path
             return Err("a def map of a block".to_owned());
         }
         let DefMapCrateData {
@@ -1850,6 +1913,7 @@ impl Enc<'_> {
             recursion_limit,
         } = &**data;
         if fn_proc_macro_mapping.len() != fn_proc_macro_mapping_back.len() {
+            // alloc: error path
             return Err("procedural macros of more than one function".to_owned());
         }
         self.edition(*edition);
@@ -1865,6 +1929,7 @@ impl Enc<'_> {
         for it in registered_tools {
             self.symbol(it)?;
         }
+        // alloc: encoding, once per crate per image write (not on a build's path)
         let mut features: Vec<Symbol> = unstable_features.iter().collect();
         features.sort_unstable_by(Symbol::cmp_order);
         self.usize(features.len())?;
@@ -1875,13 +1940,16 @@ impl Enc<'_> {
         // The modules first, so that everything after can name any of them.
         let table = it.table(db);
         if table.get_index(0).map(|it| *it.0) != Some(*root) {
+            // alloc: error path
             return Err("a def map whose root is not its first module".to_owned());
         }
         self.usize(table.len())?;
         let index: FxHashMap<ModuleId, u32> =
+            // alloc: encoding, once per crate per image write (not on a build's path)
             table.keys().enumerate().map(|(i, &it)| (it, i as u32)).collect();
         for (id, data) in table.iter() {
             if id.krate(db) != *krate {
+                // alloc: error path
                 return Err("a module of another crate in a def map".to_owned());
             }
             match data.parent {
@@ -1911,6 +1979,7 @@ impl Enc<'_> {
             enc.module(module)?;
             enc.option(use_, Self::use_id)
         })?;
+        // alloc: encoding, once per crate per image write (not on a build's path)
         let mut macro_use: Vec<_> = macro_use_prelude.iter().collect();
         macro_use.sort_unstable_by(|a, b| a.0.symbol().cmp_order(b.0.symbol()));
         self.usize(macro_use.len())?;
@@ -2070,9 +2139,13 @@ impl<'a> Dec<'a> {
             krate,
             closure: closure(db, krate),
             paths: FxHashMap::default(),
+            // alloc: the decoded map's own storage, once per crate served
             files: Vec::new(),
+            // alloc: the decoded map's own storage, once per crate served
             calls: Vec::new(),
+            // alloc: the decoded map's own storage, once per crate served
             contexts: Vec::new(),
+            // alloc: the decoded map's own storage, once per crate served
             own: Vec::new(),
             in_def_map: false,
             modules: FxHashMap::default(),
@@ -2091,6 +2164,7 @@ impl<'a> Dec<'a> {
         if !text.as_str().contains('\0') {
             return Ok(text);
         }
+        // alloc: the decoded map's own storage, once per crate served
         let (mut placed, mut rest) = (String::new(), text.as_str());
         while let Some(at) = rest.find(OUT) {
             placed.push_str(&rest[..at]);
@@ -2109,6 +2183,7 @@ impl<'a> Dec<'a> {
     pub fn finish(&self) -> R {
         match self.r.left() {
             0 => Ok(()),
+            // alloc: error path
             left => Err(format!("{left} bytes left over")),
         }
     }
@@ -2145,6 +2220,7 @@ impl Dec<'_> {
     pub fn str(&mut self) -> R<&str> {
         let len = self.len()?;
         let bytes = self.r.take(len)?;
+        // alloc: error path
         std::str::from_utf8(bytes).map_err(|_| "a string that is not UTF-8".to_owned())
     }
 
@@ -2158,16 +2234,19 @@ impl Dec<'_> {
 
     fn edition(&mut self) -> R<Edition> {
         let it = self.u8()?;
+        // alloc: error path
         Edition::iter().find(|e| *e as u8 == it).ok_or_else(|| format!("edition {it}"))
     }
 
     pub fn krate(&mut self) -> R<Crate> {
         let index = self.len()?;
+        // alloc: error path
         self.closure.get(index).copied().ok_or_else(|| format!("crate {index}"))
     }
 
     pub fn index<T: Copy>(&mut self, all: &[T]) -> R<T> {
         let index = self.len()?;
+        // alloc: error path
         all.get(index).copied().ok_or_else(|| format!("variant {index}"))
     }
 
@@ -2180,6 +2259,7 @@ impl Dec<'_> {
         let mut not_loaded = None;
         for _ in 0..n {
             let owner = self.u32()?;
+            // alloc: the decoded map's own storage, once per crate served
             let path = self.str()?.to_owned();
             let written = match self.bool()? {
                 true => Some(self.r.u128()?),
@@ -2193,22 +2273,26 @@ impl Dec<'_> {
             let krate = self.closure[owner as usize];
             let full = match path.strip_prefix(OUT) {
                 Some(rest) => {
+                    // alloc: error path
                     format!("{}{rest}", out_dir(self.db, krate).ok_or("a crate with no OUT_DIR")?)
                 }
                 None => joined(dir, &path),
             };
             let source_root = self.db.source_root(*source_root).source_root(self.db);
+            // clone: the decoded map's own storage, once per crate served
             let found = source_root.file_for_path(&vfs_path(*real, full.clone())).copied();
             let Some(found) = found else {
                 let anchor = krate.data(self.db).root_file_id;
                 let path = if path.starts_with(OUT) { &full } else { &path };
                 self.db.include_source(base_db::AnchoredPath { anchor, path }, krate);
+                // alloc: error path
                 not_loaded.get_or_insert_with(|| format!("{full} is not loaded"));
                 continue;
             };
             if let Some(written) = written
                 && hash128(self.db.file_text(found).text(self.db).as_bytes()) != written
             {
+                // alloc: error path
                 return Err(format!("{full} is not the file that was written"));
             }
             self.files.push(found);
@@ -2227,6 +2311,7 @@ impl Dec<'_> {
         match self.u8()? {
             0 => Ok(HirFileId::FileId(self.file()?)),
             1 => Ok(HirFileId::MacroFile(self.call()?)),
+            // alloc: error path
             it => Err(format!("hir file tag {it}")),
         }
     }
@@ -2245,6 +2330,7 @@ impl Dec<'_> {
         match self.u8()? {
             SEEN => {
                 let index = self.len()?;
+                // alloc: error path
                 self.calls.get(index).copied().ok_or_else(|| "a macro call not read".to_owned())
             }
             NEW => {
@@ -2254,12 +2340,14 @@ impl Dec<'_> {
                 if include {
                     let written = self.file()?;
                     if call.loc(self.db).include_file_id(self.db, call) != Some(written) {
+                        // alloc: error path
                         return Err("an include! of another file than was written".to_owned());
                     }
                 }
                 self.calls.push(call);
                 Ok(call)
             }
+            // alloc: error path
             it => Err(format!("macro call tag {it}")),
         }
     }
@@ -2283,6 +2371,7 @@ impl Dec<'_> {
                     2 => ExpandTo::Pattern,
                     3 => ExpandTo::Type,
                     4 => ExpandTo::Expr,
+                    // alloc: error path
                     it => return Err(format!("expand-to {it}")),
                 };
                 let eager = match self.u8()? {
@@ -2291,7 +2380,7 @@ impl Dec<'_> {
                         let arg = self.subtree()?;
                         let arg_id = self.call()?;
                         let span = self.span()?;
-                        Some(Box::new(EagerCallInfo { arg, arg_id, error: None, span }))
+                        Some(EagerCallInfo { arg, arg_id, error: None, span }.into())
                     }
                 };
                 MacroCallKind::FnLike { ast_id, expand_to, eager }
@@ -2306,7 +2395,7 @@ impl Dec<'_> {
                 let ast_id = self.ast_id()?;
                 let attr_args = match self.u8()? {
                     0 => None,
-                    _ => Some(Box::new(self.subtree()?)),
+                    _ => Some(self.subtree()?.into()),
                 };
                 let n = self.len()?;
                 let mut ids = Vec::with_capacity(n);
@@ -2316,6 +2405,7 @@ impl Dec<'_> {
                 let censored_attr_ids = hir_expand::AttrMacroAttrIds::from_many(&ids);
                 MacroCallKind::Attr { ast_id, attr_args, censored_attr_ids }
             }
+            // alloc: error path
             it => return Err(format!("macro call kind {it}")),
         })
     }
@@ -2343,6 +2433,7 @@ impl Dec<'_> {
                 let (expander, kind) = self.proc_macro()?;
                 MacroDefKind::ProcMacro(ast_id, expander, kind)
             }
+            // alloc: error path
             it => return Err(format!("macro def kind {it}")),
         };
         Ok(MacroDefId { krate, edition, kind, local_inner, allow_internal_unsafe, edition_panic })
@@ -2357,6 +2448,7 @@ impl Dec<'_> {
                     0 => Transparency::Transparent,
                     1 => Transparency::SemiOpaque,
                     2 => Transparency::Opaque,
+                    // alloc: error path
                     it => return Err(format!("transparency {it}")),
                 };
                 let edition = self.edition()?;
@@ -2381,8 +2473,10 @@ impl Dec<'_> {
             }
             2 => {
                 let index = self.len()?;
+                // alloc: error path
                 self.contexts.get(index).copied().ok_or_else(|| "a context not read".to_owned())
             }
+            // alloc: error path
             it => Err(format!("context tag {it}")),
         }
     }
@@ -2407,6 +2501,7 @@ impl Dec<'_> {
                         1 => DelimiterKind::Brace,
                         2 => DelimiterKind::Bracket,
                         3 => DelimiterKind::Invisible,
+                        // alloc: error path
                         it => return Err(format!("delimiter {it}")),
                     };
                     let len = self.u32()?;
@@ -2419,20 +2514,8 @@ impl Dec<'_> {
                     let text_and_suffix = self.placed(text_and_suffix)?;
                     let kind = self.u8()?;
                     let hashes = self.u8()?;
-                    let kind = match kind {
-                        0 => LitKind::Byte,
-                        1 => LitKind::Char,
-                        2 => LitKind::Integer,
-                        3 => LitKind::Float,
-                        4 => LitKind::Str,
-                        5 => LitKind::StrRaw(hashes),
-                        6 => LitKind::ByteStr,
-                        7 => LitKind::ByteStrRaw(hashes),
-                        8 => LitKind::CStr,
-                        9 => LitKind::CStrRaw(hashes),
-                        10 => LitKind::Err(()),
-                        it => return Err(format!("literal kind {it}")),
-                    };
+                    // alloc: error path
+                    let kind = LitKind::from_code(kind, hashes).ok_or_else(|| format!("literal kind {kind}"))?;
                     let suffix_len = self.u8()?;
                     let span = self.span()?;
                     TokenTree::Leaf(Leaf::Literal(tt::Literal {
@@ -2448,6 +2531,7 @@ impl Dec<'_> {
                         0 => Spacing::Alone,
                         1 => Spacing::Joint,
                         2 => Spacing::JointHidden,
+                        // alloc: error path
                         it => return Err(format!("spacing {it}")),
                     };
                     let span = self.span()?;
@@ -2459,11 +2543,13 @@ impl Dec<'_> {
                     let span = self.span()?;
                     TokenTree::Leaf(Leaf::Ident(tt::Ident { sym, span, is_raw }))
                 }
+                // alloc: error path
                 it => return Err(format!("token tag {it}")),
             };
             tokens.push(token);
         }
         if !matches!(tokens.first(), Some(TokenTree::Subtree(_))) {
+            // alloc: error path
             return Err("a token tree with no top subtree".to_owned());
         }
         Ok(tt::TopSubtree::from_serialized(tokens))
@@ -2480,18 +2566,22 @@ impl Dec<'_> {
                 .find(|(it, _)| it.ast_id(db) == block)
                 .ok_or("a block not in its body")?;
             let module = def_map.table(db).keys().nth(index).copied();
+            // alloc: error path
             return module.ok_or_else(|| format!("module {index} of a block"));
         }
         let owner = self.u32()?;
         let index = self.len()?;
         if owner == 0 && self.in_def_map {
+            // alloc: error path
             return self.own.get(index).copied().ok_or_else(|| format!("own module {index}"));
         }
         if !self.modules.contains_key(&owner) {
             let krate = *self.closure.get(owner as usize).ok_or("a module's crate")?;
             let table = super::crate_def_map(self.db, krate).table(self.db);
+            // alloc: the decoded map's own storage, once per crate served
             self.modules.insert(owner, table.keys().copied().collect());
         }
+        // alloc: error path
         self.modules[&owner].get(index).copied().ok_or_else(|| format!("module {index}"))
     }
 
@@ -2508,11 +2598,13 @@ impl Dec<'_> {
                 ModuleDefId::TypeAliasId(it) => it.into(),
                 ModuleDefId::TraitId(it) => it.into(),
                 ModuleDefId::ConstId(it) => it.into(),
+                // alloc: error path
                 _ => return Err("a lang item that is no item".to_owned()),
             },
             2 => self.variant()?.into(),
             3 => self.impl_id()?.into(),
             4 => self.macro_id()?.into(),
+            // alloc: error path
             it => return Err(format!("lang item {it}")),
         })
     }
@@ -2523,9 +2615,11 @@ impl Dec<'_> {
                 ModuleDefId::FunctionId(it) => it.into(),
                 ModuleDefId::StaticId(it) => it.into(),
                 ModuleDefId::ConstId(it) => it.into(),
+                // alloc: error path
                 _ => return Err("a body of an item with none".to_owned()),
             },
             1 => DefWithBodyId::VariantId(self.variant()?),
+            // alloc: error path
             it => return Err(format!("body {it}")),
         })
     }
@@ -2536,6 +2630,7 @@ impl Dec<'_> {
             1 => Visibility::Module(self.module()?, VisibilityExplicitness::Implicit),
             2 => Visibility::PubCrate(self.krate()?),
             3 => Visibility::Public,
+            // alloc: error path
             it => return Err(format!("visibility {it}")),
         })
     }
@@ -2549,6 +2644,7 @@ impl Dec<'_> {
                 TraitLoc { container: self.module()?, id: self.ast_id()? }.intern(db),
             ),
             3 => ItemContainerId::ExternBlockId(self.extern_block()?),
+            // alloc: error path
             it => return Err(format!("container {it}")),
         })
     }
@@ -2573,6 +2669,7 @@ impl Dec<'_> {
             2 => {
                 AdtId::EnumId(EnumLoc { container: self.module()?, id: self.ast_id()? }.intern(db))
             }
+            // alloc: error path
             it => return Err(format!("adt {it}")),
         })
     }
@@ -2587,6 +2684,7 @@ impl Dec<'_> {
             3 => MacroExpander::BuiltInDerive(self.index(BuiltinDeriveExpander::ALL)?),
             4 => MacroExpander::BuiltInEager(self.index(EagerExpander::ALL)?),
             5 => MacroExpander::UnimplementedBuiltIn,
+            // alloc: error path
             it => return Err(format!("expander {it}")),
         })
     }
@@ -2624,6 +2722,7 @@ impl Dec<'_> {
                     ProcMacroLoc { container, id, expander, kind, edition }.intern(db),
                 )
             }
+            // alloc: error path
             it => return Err(format!("macro {it}")),
         })
     }
@@ -2631,12 +2730,14 @@ impl Dec<'_> {
     fn proc_macro(&mut self) -> R<(CustomProcMacroExpander, ProcMacroKind)> {
         let listed = self.u32()?;
         if listed >= !2 {
+            // alloc: error path
             return Err(format!("procedural macro {listed}"));
         }
         let kind = match self.u8()? {
             0 => ProcMacroKind::CustomDerive,
             1 => ProcMacroKind::Bang,
             2 => ProcMacroKind::Attr,
+            // alloc: error path
             it => return Err(format!("procedural macro kind {it}")),
         };
         Ok((CustomProcMacroExpander::new(listed), kind))
@@ -2669,6 +2770,7 @@ impl Dec<'_> {
                 ModuleDefId::BuiltinType(all.get(index).ok_or("a builtin type")?.1)
             }
             9 => ModuleDefId::MacroId(self.macro_id()?),
+            // alloc: error path
             it => return Err(format!("def {it}")),
         })
     }
@@ -2676,6 +2778,7 @@ impl Dec<'_> {
     pub fn variant(&mut self) -> R<EnumVariantId> {
         let id = self.ast_id()?;
         let AdtId::EnumId(parent) = self.adt()? else {
+            // alloc: error path
             return Err("a variant of no enum".to_owned());
         };
         let name = self.name()?;
@@ -2706,6 +2809,7 @@ impl Dec<'_> {
                 ImportOrExternCrate::Import(ImportId { use_, idx })
             }
             2 => ImportOrExternCrate::ExternCrate(self.extern_crate()?),
+            // alloc: error path
             it => return Err(format!("import {it}")),
         })
     }
@@ -2716,6 +2820,7 @@ impl Dec<'_> {
         Ok(match tag {
             0 => ImportOrGlob::Glob(GlobId { use_, idx }),
             1 => ImportOrGlob::Import(ImportId { use_, idx }),
+            // alloc: error path
             it => return Err(format!("import {it}")),
         })
     }
@@ -2742,6 +2847,7 @@ impl Dec<'_> {
             }
             2 => ImportOrDef::ExternCrate(self.extern_crate()?),
             3 => ImportOrDef::Def(self.def()?),
+            // alloc: error path
             it => return Err(format!("import {it}")),
         })
     }
@@ -2841,8 +2947,8 @@ impl Dec<'_> {
         scope.impls.reserve_exact(room);
         for at in 0..n {
             scope.impls.push(self.impl_id()?);
-            scope.trait_impl.push(at, self.bool()?);
-            scope.reservation_impl.push(at, self.bool()?);
+            scope.trait_impl.set_growing(at, self.bool()?);
+            scope.reservation_impl.set_growing(at, self.bool()?);
         }
         self.fill(
             &mut scope.builtin_derive_impls,
@@ -2852,10 +2958,12 @@ impl Dec<'_> {
         self.fill(&mut scope.extern_blocks, ThinVec::reserve_exact, Self::extern_block)?;
         self.fill(&mut scope.unnamed_consts, ThinVec::reserve_exact, |dec| match dec.def()? {
             ModuleDefId::ConstId(it) => Ok(it),
+            // alloc: error path
             _ => Err("an unnamed const that is not one".to_owned()),
         })?;
         self.fill(&mut scope.unnamed_trait_imports, ThinVec::reserve_exact, |dec| {
             let ModuleDefId::TraitId(it) = dec.def()? else {
+                // alloc: error path
                 return Err("a trait import of no trait".to_owned());
             };
             let vis = dec.visibility()?;
@@ -2933,6 +3041,7 @@ impl Dec<'_> {
                         0 => None,
                         1 => Some(Either::Left(dec.call()?)),
                         2 => Some(Either::Right(dec.builtin_derive_impl()?)),
+                        // alloc: error path
                         it => return Err(format!("derive call {it}")),
                     })
                 })?;
@@ -2963,6 +3072,7 @@ impl Dec<'_> {
                 let definition = FileAstId::from_erased_unchecked(self.erased_ast_id()?);
                 ModuleOrigin::Inline { definition_tree_id, definition }
             }
+            // alloc: error path
             it => return Err(format!("origin {it}")),
         })
     }
@@ -2974,6 +3084,7 @@ impl Dec<'_> {
             2 => PathKind::Crate,
             3 => PathKind::Abs,
             4 => PathKind::DollarCrate(self.krate()?),
+            // alloc: error path
             it => return Err(format!("path kind {it}")),
         };
         let segments = self.many(Self::name)?;
@@ -2991,7 +3102,9 @@ impl Dec<'_> {
             }
             3 => CfgExpr::All(self.many(Self::cfg)?.into_boxed_slice()),
             4 => CfgExpr::Any(self.many(Self::cfg)?.into_boxed_slice()),
+            // alloc: the decoded map's own storage, once per crate served
             5 => CfgExpr::Not(Box::new(self.cfg()?)),
+            // alloc: error path
             it => return Err(format!("cfg {it}")),
         })
     }
@@ -3001,6 +3114,7 @@ impl Dec<'_> {
         let kind = match self.u8()? {
             0 => {
                 let ast = self.ast_id()?;
+                // alloc: the decoded map's own storage, once per crate served
                 let candidates = self.many(|dec| Ok(dec.str()?.to_owned()))?;
                 DefDiagnosticKind::UnresolvedModule { ast, candidates: candidates.into() }
             }
@@ -3037,6 +3151,7 @@ impl Dec<'_> {
             }
             8 => {
                 let ast = self.ast_id()?;
+                // alloc: the decoded map's own storage, once per crate served
                 DefDiagnosticKind::MacroDefError { ast, message: self.str()?.to_owned() }
             }
             9 => {
@@ -3054,6 +3169,7 @@ impl Dec<'_> {
                     8 => {
                         let message = self.str()?.into();
                         let code = self.option(|dec| {
+                            // alloc: error path
                             u16::try_from(dec.u32()?).map_err(|_| "an error code over u16".to_owned())
                         })?;
                         let also_at_len = self.len()?;
@@ -3071,6 +3187,7 @@ impl Dec<'_> {
                             })
                             .collect::<R<Box<[_]>>>()?;
                         let derive = self.bool()?;
+                        // alloc: the decoded map's own storage, once per crate served
                         ExpandErrorKind::Builtin(Box::new(BuiltinError {
                             message,
                             code,
@@ -3081,10 +3198,12 @@ impl Dec<'_> {
                     }
                     9 => ExpandErrorKind::ProcMacroPanic(self.str()?.into()),
                     10 => ExpandErrorKind::Mbe(self.mbe_error()?),
+                    // alloc: error path
                     it => return Err(format!("macro error {it}")),
                 };
                 DefDiagnosticKind::MacroError { ast, path, err }
             }
+            // alloc: error path
             it => return Err(format!("diagnostic {it}")),
         };
         Ok(DefDiagnostic { in_module, kind })
@@ -3092,7 +3211,9 @@ impl Dec<'_> {
 
     fn mbe_error(&mut self) -> R<MbeErrorKind> {
         Ok(match self.u8()? {
+            // alloc: the decoded map's own storage, once per crate served
             0 => MbeErrorKind::BindingError(Box::new(self.str()?.into())),
+            // alloc: the decoded map's own storage, once per crate served
             1 => MbeErrorKind::UnresolvedBinding(Box::new(self.str()?.into())),
             2 => MbeErrorKind::LeftoverTokens,
             3 => MbeErrorKind::LimitExceeded,
@@ -3103,6 +3224,7 @@ impl Dec<'_> {
                 let remaining = self.str()?.into();
                 let remaining_span = self.option(Self::span)?;
                 let missing_comma = self.option(Self::span)?;
+                // alloc: the decoded map's own storage, once per crate served
                 MbeErrorKind::MatchFailure(Box::new(MatchFailure {
                     token,
                     remaining,
@@ -3110,6 +3232,7 @@ impl Dec<'_> {
                     missing_comma,
                 }))
             }
+            // alloc: error path
             it => return Err(format!("macro_rules! error {it}")),
         })
     }
@@ -3150,6 +3273,7 @@ impl Dec<'_> {
         for (parent, name) in skeleton.iter().skip(1) {
             let parent = parent.ok_or("a module with no parent")? as usize;
             let parent = *self.own.get(parent).ok_or("a module before its parent")?;
+            // clone: the decoded map's own storage, once per crate served
             let name = name.clone().ok_or("a module with no name")?;
             let module =
                 // SAFETY: `to_static` needs the id not to outlive the query computation it was
@@ -3173,7 +3297,15 @@ impl Dec<'_> {
                 children.insert(name, *self.own.get(child).ok_or("a child not read")?);
             }
             let parent = parent.map(|it| self.own[it as usize]);
-            let module = ModuleData::with_scope(origin, visibility, parent, scope, children);
+            let module = ModuleData::collected(
+                self.db,
+                self.own[index],
+                origin,
+                visibility,
+                parent,
+                scope,
+                children,
+            );
             table.insert(self.own[index], module);
         }
         def_map.modules = ModulesSlot::Building(table);
@@ -3189,6 +3321,7 @@ impl Dec<'_> {
                 Ok((name, (id, dec.option(Self::extern_crate)?)))
             })?
             .into_iter()
+            // alloc: the decoded map's own storage, once per crate served
             .collect();
         def_map.derive_helpers_in_scope = self
             .many(|dec| {
@@ -3199,6 +3332,7 @@ impl Dec<'_> {
                     let call = match dec.u8()? {
                         0 => Either::Left(dec.call()?),
                         1 => Either::Right(dec.builtin_derive_impl()?),
+                        // alloc: error path
                         it => return Err(format!("derive helper {it}")),
                     };
                     Ok((name, id, call))
@@ -3206,6 +3340,7 @@ impl Dec<'_> {
                 Ok((ast_id, helpers))
             })?
             .into_iter()
+            // alloc: the decoded map's own storage, once per crate served
             .collect();
         let exported = self.many(|dec| {
             let id = dec.macro_id()?;
@@ -3213,16 +3348,21 @@ impl Dec<'_> {
         })?;
         let functions = self.many(|dec| {
             let ModuleDefId::FunctionId(function) = dec.def()? else {
+                // alloc: error path
                 return Err("a procedural macro of no function".to_owned());
             };
             let MacroId::ProcMacroId(id) = dec.macro_id()? else {
+                // alloc: error path
                 return Err("a function of a macro no procedural one".to_owned());
             };
             Ok((function, id))
         })?;
         let data = TArc::get_mut(&mut def_map.data).ok_or("the def map's crate data is shared")?;
+        // alloc: the decoded map's own storage, once per crate served
         data.exported_derives = exported.into_iter().collect();
+        // alloc: the decoded map's own storage, once per crate served
         data.fn_proc_macro_mapping_back = functions.iter().map(|&(f, id)| (id, f)).collect();
+        // alloc: the decoded map's own storage, once per crate served
         data.fn_proc_macro_mapping = functions.into_iter().collect();
         def_map.names = self.name_records()?;
         def_map.diagnostics = self.many(Self::diagnostic)?;
@@ -3294,6 +3434,7 @@ impl Dec<'_> {
             let module = dec.module()?;
             Ok((name, (module, dec.option(Self::extern_crate)?)))
         })?;
+        // alloc: the decoded map's own storage, once per crate served
         Ok(LocalDefMap { extern_prelude: extern_prelude.into_iter().collect() })
     }
 }
@@ -3492,7 +3633,7 @@ pub mod prelude { pub mod rust_2018 { pub use crate::{Clone, Debug, derive}; } }
         let live = TestDB::with_files(FIXTURE);
         let served = with(Mode::Serve, &bytes);
         let main = |db: &TestDB| super::super::crate_def_map(db, crate_named(db, "main"));
-        let records = main(&live).name_records();
+        let records = main(&live).name_records(&live);
         assert!(!records.uses.is_empty() && !records.glob_targets.is_empty());
         assert!(!records.macro_calls.is_empty() && !records.not_introducing.is_empty());
         let scopes = |db: &TestDB| {

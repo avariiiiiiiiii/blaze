@@ -62,6 +62,12 @@ crate of `#[blaze::cache]`. A line keeps the cost with a reason: `// clone: <why
 `tools/v2/hot_lint.py` is deleted at integration once these build and its fixtures pass as
 their tests.
 
+`parallelizable` and `serial_dependence` (child `lints-parallel`,
+[lints/parallel.md](lints/parallel.md)) are judged on MIR, in `crates/blaze-lints/src/blaze/parallel*`.
+They are the same kind of `blaze::Lint` (in `Lint::ALL`, with a bit of `On` past the hot lints',
+`allow` by default, opted in by `[lints.blaze]`), but in no group: `blaze::hot` stays the four
+hot lints.
+
 ## Done when
 
 - `rg 'ide_db|RootDatabase|FamousDefs' crates/blaze-lints` finds nothing; every query takes

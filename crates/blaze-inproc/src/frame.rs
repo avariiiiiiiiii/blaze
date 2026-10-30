@@ -154,7 +154,9 @@ pub fn decode(bytes: &[u8]) -> Result<Option<(Frame<'_>, usize)>, FrameError> {
     Ok(Some((Frame { kind: header.kind, seq: header.seq, body }, end)))
 }
 
-/// Writes the fields of a body, little-endian.
+/// Writes the fields of a body, little-endian. Not `blaze_format::cursor`'s `Put`, nor
+/// [`Reader`] its `Reader`: the run process links this crate with only `blaze-mem`, and
+/// `blaze-format` would bring zstd and serde into every running program.
 pub struct Writer<'a> {
     out: &'a mut Vec<u8>,
 }

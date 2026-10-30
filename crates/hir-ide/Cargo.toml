@@ -50,6 +50,7 @@ project-model.workspace = true
 
 # local deps
 blaze-hashcons.workspace = true
+blaze-alloc-count.workspace = true
 test-utils.workspace = true
 test-fixture.workspace = true
 

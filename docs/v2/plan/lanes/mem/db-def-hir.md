@@ -80,7 +80,10 @@ Path: `crates/hir/`, held by db-next2. Every change is a request:
 under a budget of 0: `descend_into_macros` (also into a `macro_rules!` call), `resolve_path` of
 an expression path and a type path, `to_def` of a struct, a field and a module, and every
 accessor's iterator form. Two further tests check that `kmerge2` matches `kmerge_by` (ties
-included) and that `recycle` keeps the allocation.
+included) and that `recycle` keeps the allocation. The tests find what they ask about through
+`syntax::view`, once and outside the measured calls, and keep it as ranges and pointers. They
+make a handle only where `Semantics`' API still takes one, and stop doing so once frontend-tree
+moves `Semantics` to views.
 
 ## Speed of light
 

@@ -119,12 +119,15 @@ impl ModDir {
 
         let candidate_files: Box<[String]> = match attr_path {
             Some(attr_path) => {
+                // alloc: once per out-of-line `mod` while collecting; the not-found diagnostic keeps them
                 let mut path = String::new();
                 self.dir_path.join_attr(attr_path, self.root_non_dir_owner, &mut path);
+                // alloc: once per out-of-line `mod` while collecting; the not-found diagnostic keeps them
                 Box::new([path])
             }
             None => {
                 let dir = self.dir_path.as_str();
+                // alloc: once per out-of-line `mod` while collecting; the not-found diagnostic keeps them
                 Box::new([format!("{dir}{name}.rs"), format!("{dir}{name}/mod.rs")])
             }
         };

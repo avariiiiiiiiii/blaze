@@ -71,13 +71,18 @@ Design: docs/v2/plan/lanes/lints.md, docs/v2/plan/lanes/lints/cx.md.
 ## diagnostics: register blaze's new lints and the group `blaze::hot`
 
 - What: in `crates/blaze-diagnostics/src/lints/registry/lints.rs`, next to
-  `blaze::const_impure`, four lints, each `Allow` by default, and a group:
+  `blaze::const_impure`, six lints, each `Allow` by default, and a group:
   - `blaze::hot_clone`: "detects a `.clone()` that allocates or bumps a reference count in hot code";
   - `blaze::hot_alloc`: "detects a call that reaches the global allocator in hot code";
   - `blaze::hot_dyn`: "detects a call through `dyn` in hot code";
   - `blaze::std_hashmap`: "detects std's `HashMap` and `HashSet` with their default hasher";
-  - group `blaze::hot` = all four (`hot_clone`, `hot_alloc`, `hot_dyn`, `std_hashmap`).
+  - `blaze::parallelizable`: "detects a sequential loop or iterator chain whose iterations are
+    independent and worth running in parallel";
+  - `blaze::serial_dependence`: "detects a hot loop kept serial by one loop-carried dependence";
+  - group `blaze::hot` = the four hot lints (`hot_clone`, `hot_alloc`, `hot_dyn`,
+    `std_hashmap`); the two parallel lints are in no group.
   The command line accepts `--warn=blaze::hot_alloc` and the rest (from `[lints.blaze]`).
+  (Updated 2026-10-29 for child `lints-parallel`; `blaze_lints::blaze::Lint::ALL` has the same six.)
 - Why: they run in blaze-lints (`blaze clippy`), but rustc's level machinery in
   blaze-diagnostics sees `#[deny(blaze::hot)]` and `--deny=blaze::hot_alloc`: without them
   registered, it says `unknown_lints`. Allow by default, so nothing changes for a crate that
@@ -197,6 +202,12 @@ for `Db`.
 > applied by frontend-db-hir (item 1): `hir::Semantics<'db>` is non-generic, `pub db: &'db Db`, made by `Semantics::new(db: &'db Db)` or `new_within`; `new_dyn` is gone. `blaze-lints/src/check.rs`'s `Semantics<'db, RootDatabase>` became `Semantics<'db>`.
 
 ## dedyn: crates/blaze-lints: `dyn Fn` sweep (second sweep item 5, 2026-10-29): none is per item; `// dyn:` lines
+> APPLIED by dedyn-misc 2026-10-29 21:50, re-decided: `check.rs`'s `NameOf` and the four
+> `name_of: &dyn Fn` in `diag.rs` keep `dyn` with a `// dyn:` line (once per file and per span
+> leaving its file; a generic would copy the ~500-line driver per caller). `serve.rs`'s
+> `answer` takes `path_of: &impl Fn` (one production caller, blaze-engine), no comment needed.
+> Being applied in the tree by dedyn-misc (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.
+
 
 Read for where each is called: once per diagnostic span or per file, never per node a lint
 walks. No code change; add the line above each:
@@ -208,3 +219,40 @@ walks. No code change; add the line above each:
 
 (`src/blaze/tests.rs:512` and `src/lints/more_types_tests.rs:258` are lint test fixtures: text
 about the Rust being checked, left alone.)
+
+> lints, 2026-10-29 21:25: the line numbers predate the dedup with blaze-diagnostics (applied
+> 21:12). `src/emit.rs` is deleted, so it has no `read` comment. `src/serve.rs`'s `written` takes
+> `read: impl Fn`, so no line is needed there. In `src/diag.rs`, `name_of` is now a parameter of
+> the free functions `place_diag`, `place_multi`, `place` and `place_expansion`, so the comment
+> goes above each `name_of: &dyn Fn` there. `check.rs`'s `NameOf` and `serve.rs`'s `path_of`
+> are as listed.
+> forwarded to dedyn (dedyn-misc is applying it, per the note above; requests, pass 23).
+
+## frontend-tree: blaze-lints check.rs: onto views (1) (2026-10-29)
+
+From frontend-tree-move-expand (`docs/v2/plan/lanes/frontend/tree-move-expand.md`). Needs
+`## frontend-tree: hir-expand lib.rs + files.rs: original_call_node_view, and the handle functions
+nobody calls go (9)` in `v2/requests/db-expand.md` first (it adds
+`HirFileId::original_call_node_view`). `lint_body` reads only the outer call's file and range, so
+the view does the same with no handle made.
+
+File `crates/blaze-lints/src/check.rs`. Old:
+
+```rust
+                let Some(outer) = file_id.original_call_node(db) else { return };
+```
+
+New:
+
+```rust
+                let Some(outer) = file_id.original_call_node_view(db) else { return };
+```
+
+Why: the outermost call in the real file, as a view (`InRealFile<view::Node<'_>>`); `outer.file_id`
+and `outer.value.text_range()` read the same values. `crates/hir-expand/src/view_tests.rs`
+compares `original_call_node_view` with `original_call_node` on every macro file of its fixture.
+
+> forwarded to lints (lints-driver-next1, its live window; lane lints is DONE, and blaze-lints is otherwise the coordinator's); told by tmux (requests, pass 28).
+> accepted, waiting (lints-driver, 2026-10-29 22:09): `HirFileId::original_call_node_view` is
+> not in `crates/hir-expand/src/lib.rs` yet, so the line stays until db-expand's request 9 lands;
+> then it is the one line as written. Logged as pending in /tmp/blaze-lanes/v2-lints-driver.md.

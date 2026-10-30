@@ -16,6 +16,7 @@ use base_db::Db;
 use cfg::CfgOptions;
 use hir::{InFile, Semantics};
 use hir_expand::MacroCallKind;
+use intern::Symbol;
 use smallvec::SmallVec;
 use span::Edition;
 use syntax::{
@@ -42,6 +43,9 @@ pub(super) enum Read {
 /// The elements of a list, inline for the usual few.
 pub(super) type Items = SmallVec<[Item; 4]>;
 
+/// The lint attributes of one node: one or two nearly always.
+pub(super) type Reads = SmallVec<[Read; 2]>;
+
 /// A path's segments, inline for a lint's (one) and a tool's lint's (two).
 pub(super) type Path = SmallVec<[Segment; 2]>;
 
@@ -55,7 +59,7 @@ pub(super) enum ItemKind {
     /// A path: a lint, a group or a tool's lint.
     Word(Path),
     /// `path = literal`: the literal's value when it is a string, and where the literal is.
-    NameValue { path: Path, string: Option<String>, value: TextRange },
+    NameValue { path: Path, string: Option<Symbol>, value: TextRange },
     /// `path(..)`.
     List(Path),
     /// A literal alone.
@@ -116,6 +120,7 @@ pub(super) fn owner(node: &SyntaxNode, generics: bool) -> Option<ast::AnyHasAttr
     if !may_be_owner(kind, generics) {
         return None;
     }
+    // clone: a reference count on the tree, of a node whose kind may own attributes
     let owner = ast::AnyHasAttrs::cast(node.clone())?;
     let inner_of_outer = matches!(kind, STMT_LIST | ITEM_LIST | ASSOC_ITEM_LIST | MATCH_ARM_LIST | EXTERN_ITEM_LIST)
         && node.ancestors().skip(1).take(2).any(|it| {
@@ -151,8 +156,8 @@ fn attrs_of(owner: &ast::AnyHasAttrs) -> impl Iterator<Item = ast::Attr> {
 
 /// The lint attributes of `owner`, `cfg_attr` expanded against `cfg`, outer then inner, in
 /// order.
-pub(super) fn read(owner: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition) -> Vec<Read> {
-    let mut found = Vec::new();
+pub(super) fn read(owner: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition) -> Reads {
+    let mut found = Reads::new();
     hir_expand::attrs::expand_cfg_attr(attrs_of(owner), || cfg, |meta, top| {
         let direct = top.meta().is_some_and(|it| it.syntax() == meta.syntax());
         if let Some(read) = read_meta(&meta, edition, direct) {
@@ -228,6 +233,7 @@ fn read_meta(meta: &ast::Meta, edition: Edition, direct: bool) -> Option<Read> {
 /// when it is not one, and rustc's lint levels pass the attribute by.
 pub(super) fn list(tt: &ast::TokenTree, edition: Edition) -> Option<Items> {
     let children: SmallVec<[SyntaxElement; 16]> =
+        // alloc: none up to 16 tokens, a `SmallVec`
         tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
     let (first, last) = (children.first()?, children.last()?);
     if first.kind() != SyntaxKind::L_PAREN || last.kind() != SyntaxKind::R_PAREN || children.len() < 2 {
@@ -260,7 +266,8 @@ fn item(elements: &[SyntaxElement], edition: Edition) -> Option<Item> {
         [NodeOrToken::Token(eq), NodeOrToken::Token(value)]
             if eq.kind() == SyntaxKind::EQ && is_literal(value.kind()) =>
         {
-            let string = ast::String::cast(value.clone()).and_then(|it| it.value().ok().map(|it| it.into_owned()));
+            // clone: a reference count on the tree, of a literal after `=`
+            let string = ast::String::cast(value.clone()).and_then(|it| it.value().ok().map(|it| Symbol::intern(&it)));
             ItemKind::NameValue { path, string, value: value.text_range() }
         }
         [NodeOrToken::Node(tt)] if tt.kind() == SyntaxKind::TOKEN_TREE => {
@@ -289,6 +296,7 @@ fn path(elements: &[SyntaxElement], edition: Edition) -> Option<(Path, &[SyntaxE
         if !is_segment(token.kind(), edition) {
             return None;
         }
+        // clone: a reference count on the tree; the name is read in place
         segments.push(Segment { token: Some(token.clone()), range: token.text_range() });
         rest = after;
         match colons(rest) {
@@ -326,6 +334,7 @@ fn is_literal(kind: SyntaxKind) -> bool {
 
 /// The tools of the crate's `#![register_tool(..)]`s.
 pub(super) fn registered_tools(root: &ast::AnyHasAttrs, cfg: &CfgOptions, edition: Edition) -> Vec<String> {
+    // alloc: setup, once per check, the crate root's tools
     let mut tools = Vec::new();
     hir_expand::attrs::expand_cfg_attr::<()>(ast::attrs_including_inner(root), || cfg, |meta, _| {
         if let ast::Meta::TokenTreeMeta(meta) = meta
@@ -336,6 +345,7 @@ pub(super) fn registered_tools(root: &ast::AnyHasAttrs, cfg: &CfgOptions, editio
                 if let ItemKind::Word(path) = item.kind
                     && let [tool] = &path[..]
                 {
+                    // alloc: as above
                     tools.push(tool.name().to_owned());
                 }
             }
@@ -376,6 +386,7 @@ pub(super) fn parent(
 /// calls it is reached through, outermost first, then its own. What a derive makes comes after
 /// the item it is on.
 pub(super) fn place(sema: &Semantics<'_>, node: &InFile<SyntaxNode>) -> Vec<(u32, u32)> {
+    // alloc: made only for a diagnostic's place, or once per `#[expect]` name
     let mut place = vec![entered(node.value.text_range())];
     let mut file = node.file_id;
     loop {

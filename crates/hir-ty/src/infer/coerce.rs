@@ -73,6 +73,11 @@ use crate::{
     utils::TargetFeatureIsSafeInTarget,
 };
 
+mod fast;
+
+pub(super) use fast::UnsizeMemo;
+use fast::{UnsizeFailed, UnsizeResult};
+
 trait CoerceDelegate<'db> {
     fn infcx(&self) -> &InferCtxt<'db>;
     fn param_env(&self) -> ParamEnv<'db>;
@@ -81,6 +86,9 @@ trait CoerceDelegate<'db> {
     fn set_diverging(&mut self, diverging_ty: Ty<'db>);
 
     fn type_var_is_sized(&self, var: TyVid) -> bool;
+
+    /// The body's record of failed unsizing coercions; none outside a body.
+    fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>>;
 }
 
 struct Coerce<'f, D> {
@@ -158,6 +166,10 @@ where
 
     fn unify_raw(&self, a: Ty<'db>, b: Ty<'db>) -> InferResult<'db, Ty<'db>> {
         debug!("unify(a: {:?}, b: {:?}, use_lub: {})", a, b, self.use_lub);
+        // Relating a type to itself returns it with no goal and no write.
+        if a == b && fast::shortcuts() {
+            return Ok(InferOk { value: b, obligations: PredicateObligations::new() });
+        }
         self.infcx().commit_if_ok(|_| {
             let at = self.infcx().at(&self.cause, self.param_env());
 
@@ -172,6 +184,7 @@ where
             // more types, but we emit possibly impossible-to-satisfy obligations.
             // Filter these cases out to make sure our coercion is more accurate.
             match res {
+                Ok(ok) if ok.obligations.is_empty() && fast::shortcuts() => Ok(ok),
                 Ok(InferOk { value, obligations }) => {
                     let mut ocx = ObligationCtxt::new(self.infcx());
                     ocx.register_obligations(obligations);
@@ -217,85 +230,8 @@ where
         let a = self.infcx().shallow_resolve(a);
         let b = self.infcx().shallow_resolve(b);
         debug!("Coerce.tys({:?} => {:?})", a, b);
-
-        // Coercing from `!` to any type is allowed:
-        if a.is_never() {
-            // If we're coercing into an inference var, mark it as possibly diverging.
-            if b.is_infer() {
-                self.delegate.set_diverging(b);
-            }
-
-            if self.coerce_never {
-                let mut adjustments = Vec::with_capacity_in(1, self.frame);
-                adjustments.push(Adjustment { kind: Adjust::NeverToAny, target: b.store() });
-                return success(adjustments, b, PredicateObligations::new());
-            } else {
-                // Otherwise the only coercion we can do is unification.
-                return self.unify(a, b);
-            }
-        }
-
-        // Coercing *from* an unresolved inference variable means that
-        // we have no information about the source type. This will always
-        // ultimately fall back to some form of subtyping.
-        if a.is_infer() {
-            return self.coerce_from_inference_variable(a, b);
-        }
-
-        // Consider coercing the subtype to a DST
-        //
-        // NOTE: this is wrapped in a `commit_if_ok` because it creates
-        // a "spurious" type variable, and we don't want to have that
-        // type variable in memory if the coercion fails.
-        let unsize = self.commit_if_ok(|this| this.coerce_unsized(a, b));
-        match unsize {
-            Ok(_) => {
-                debug!("coerce: unsize successful");
-                return unsize;
-            }
-            Err(error) => {
-                debug!(?error, "coerce: unsize failed");
-            }
-        }
-
-        // Examine the supertype and consider type-specific coercions, such
-        // as auto-borrowing, coercing pointer mutability, a `dyn*` coercion,
-        // or pin-ergonomics.
-        match b.kind() {
-            TyKind::RawPtr(_, b_mutbl) => {
-                return self.coerce_raw_ptr(a, b, b_mutbl);
-            }
-            TyKind::Ref(r_b, _, mutbl_b) => {
-                return self.coerce_borrowed_pointer(a, b, r_b, mutbl_b);
-            }
-            _ => {}
-        }
-
-        match a.kind() {
-            TyKind::FnDef(..) => {
-                // Function items are coercible to any closure
-                // type; function pointers are not (that would
-                // require double indirection).
-                // Additionally, we permit coercion of function
-                // items to drop the unsafe qualifier.
-                self.coerce_from_fn_item(a, b)
-            }
-            TyKind::FnPtr(a_sig_tys, a_hdr) => {
-                // We permit coercion of fn pointers to drop the
-                // unsafe qualifier.
-                self.coerce_from_fn_pointer(a_sig_tys.with(a_hdr), b)
-            }
-            TyKind::Closure(closure_def_id_a, args_a) => {
-                // Non-capturing closures are coercible to
-                // function pointers or unsafe function pointers.
-                // It cannot convert closures that require unsafe.
-                self.coerce_closure_to_fn(a, closure_def_id_a.0, args_a, b)
-            }
-            _ => {
-                // Otherwise, just use unification rules.
-                self.unify(a, b)
-            }
-        }
+        let head = self.head(a, b);
+        self.coerce_head(a, b, head)
     }
 
     /// Coercing *from* an inference variable. In this case, we have no information
@@ -543,76 +479,17 @@ where
     ///
     /// [unsized coercion](https://doc.rust-lang.org/reference/type-coercions.html#unsized-coercions)
     #[instrument(skip(self), level = "debug")]
-    fn coerce_unsized(&mut self, source: Ty<'db>, target: Ty<'db>) -> CoerceResult<'db, 'f> {
+    /// Called once `unsize_rejected_up_front` let the pair through.
+    fn coerce_unsized(&mut self, source: Ty<'db>, target: Ty<'db>) -> UnsizeResult<'db, 'f> {
         debug!(?source, ?target);
         debug_assert!(self.infcx().shallow_resolve(source) == source);
         debug_assert!(self.infcx().shallow_resolve(target) == target);
-
-        // We don't apply any coercions incase either the source or target
-        // aren't sufficiently well known but tend to instead just equate
-        // them both.
-        if source.is_infer() {
-            debug!("coerce_unsized: source is a TyVar, bailing out");
-            return Err(TypeError::Mismatch);
-        }
-        if target.is_infer() {
-            debug!("coerce_unsized: target is a TyVar, bailing out");
-            return Err(TypeError::Mismatch);
-        }
-
-        // This is an optimization because coercion is one of the most common
-        // operations that we do in typeck, since it happens at every assignment
-        // and call arg (among other positions).
-        //
-        // These targets are known to never be RHS in `LHS: CoerceUnsized<RHS>`.
-        // That's because these are built-in types for which a core-provided impl
-        // doesn't exist, and for which a user-written impl is invalid.
-        //
-        // This is technically incomplete when users write impossible bounds like
-        // `where T: CoerceUnsized<usize>`, for example, but that trait is unstable
-        // and coercion is allowed to be incomplete. The only case where this matters
-        // is impossible bounds.
-        //
-        // Note that some of these types implement `LHS: Unsize<RHS>`, but they
-        // do not implement *`CoerceUnsized`* which is the root obligation of the
-        // check below.
-        match target.kind() {
-            TyKind::Bool
-            | TyKind::Char
-            | TyKind::Int(_)
-            | TyKind::Uint(_)
-            | TyKind::Float(_)
-            | TyKind::Infer(rustc_type_ir::IntVar(_) | rustc_type_ir::FloatVar(_))
-            | TyKind::Str
-            | TyKind::Array(_, _)
-            | TyKind::Slice(_)
-            | TyKind::FnDef(_, _)
-            | TyKind::FnPtr(_, _)
-            | TyKind::Dynamic(_, _)
-            | TyKind::Closure(_, _)
-            | TyKind::CoroutineClosure(_, _)
-            | TyKind::Coroutine(_, _)
-            | TyKind::CoroutineWitness(_, _)
-            | TyKind::Never
-            | TyKind::Tuple(_) => return Err(TypeError::Mismatch),
-            _ => {}
-        }
-        // Additionally, we ignore `&str -> &str` coercions, which happen very
-        // commonly since strings are one of the most used argument types in Rust,
-        // we do coercions when type checking call expressions.
-        if let TyKind::Ref(_, source_pointee, Mutability::Not) = source.kind()
-            && source_pointee.is_str()
-            && let TyKind::Ref(_, target_pointee, Mutability::Not) = target.kind()
-            && target_pointee.is_str()
-        {
-            return Err(TypeError::Mismatch);
-        }
 
         let lang_items = self.interner().lang_items();
         let traits = (lang_items.Unsize, lang_items.CoerceUnsized);
         let (Some(unsize_did), Some(coerce_unsized_did)) = traits else {
             debug!("missing Unsize or CoerceUnsized traits");
-            return Err(TypeError::Mismatch);
+            return Err(TypeError::Mismatch.into());
         };
 
         // Note, we want to avoid unnecessary unsizing. We don't want to coerce to
@@ -679,22 +556,21 @@ where
 
         coercion.obligations.push(obligation);
 
+        let mut visitor = CoerceVisitor {
+            delegate: &self.delegate,
+            errored: false,
+            read_table: false,
+            unsize_did,
+            coerce_unsized_did,
+            span: self.cause.span(),
+        };
         if self
             .delegate
             .infcx()
-            .visit_proof_tree(
-                Goal::new(self.infcx().interner, self.param_env(), pred),
-                &mut CoerceVisitor {
-                    delegate: &self.delegate,
-                    errored: false,
-                    unsize_did,
-                    coerce_unsized_did,
-                    span: self.cause.span(),
-                },
-            )
+            .visit_proof_tree(Goal::new(self.infcx().interner, self.param_env(), pred), &mut visitor)
             .is_break()
         {
-            return Err(TypeError::Mismatch);
+            return Err(UnsizeFailed { read_table: visitor.read_table });
         }
 
         Ok(coercion)
@@ -708,7 +584,7 @@ where
     ) -> CoerceResult<'db, 'f> {
         debug_assert!(self.infcx().shallow_resolve(b) == b);
 
-        self.commit_if_ok(|this| {
+        self.rule_snapshot(|this| {
             if let TyKind::FnPtr(_, hdr_b) = b.kind()
                 && fn_ty_a.safety().is_safe()
                 && !hdr_b.safety().is_safe()
@@ -883,6 +759,11 @@ impl<'db> CoerceDelegate<'db> for InferenceCoercionDelegate<'_, 'db, '_> {
     fn type_var_is_sized(&self, var: TyVid) -> bool {
         self.0.table.type_var_is_sized(var)
     }
+
+    #[inline]
+    fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>> {
+        Some(&mut self.0.unsize_memo)
+    }
 }
 
 impl<'db, 'f> InferenceContext<'db, 'f> {
@@ -913,7 +794,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             coerce_never,
             use_lub: false,
         };
-        let ok = coerce.commit_if_ok(|coerce| coerce.coerce(source, target))?;
+        let ok = coerce.coerce_at_root(source, target)?;
 
         let (adjustments, _) = self.table.register_infer_ok(ok);
         self.write_expr_adj(expr, &adjustments);
@@ -957,7 +838,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         let sig = ty.fn_sig(self.table.interner());
         match ty.kind() {
             TyKind::FnDef(def, _) if let CallableDefId::FunctionId(function) = def.0 => {
-                crate::lower::bind_elided_lifetimes(self.db, function, sig)
+                crate::lower::bind_elided_lifetimes(self.db, function, sig, self.frame)
             }
             _ => sig,
         }
@@ -1098,6 +979,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             for &expr in exprs {
                 self.write_expr_adj(
                     expr,
+                    // clone: `Adjust` is plain `Copy` data, `Copy` requested in `infer.rs`
                     &[Adjustment { kind: prev_adjustment.clone(), target: fn_ptr.store() }],
                 );
             }
@@ -1130,7 +1012,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
         // but only if the new expression has no coercion already applied to it.
         let mut first_error = None;
         if !coerce.delegate.0.result.expr_adjustments.contains_key(&new) {
-            let result = coerce.commit_if_ok(|coerce| coerce.coerce(new_ty, prev_ty));
+            let result = coerce.coerce_at_root(new_ty, prev_ty);
             match result {
                 Ok(ok) => {
                     let (adjustments, target) = self.table.register_infer_ok(ok);
@@ -1145,7 +1027,7 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
             }
         }
 
-        match coerce.commit_if_ok(|coerce| coerce.coerce(prev_ty, new_ty)) {
+        match coerce.coerce_at_root(prev_ty, new_ty) {
             Err(_) => {
                 // Avoid giving strange errors on failed attempts.
                 if let Some(e) = first_error {
@@ -1447,11 +1329,9 @@ impl<'db, 'exprs> CoerceMany<'db, 'exprs> {
                 self.final_ty = Some(icx.types.types.error);
 
                 let expression = icx.innermost_tail_expr(expression);
-                if label_expression_as_expected {
-                    icx.emit_type_mismatch(expression.into(), found, expected);
-                } else {
-                    icx.emit_type_mismatch(expression.into(), expected, found);
-                }
+                let (expected, found) =
+                    if label_expression_as_expected { (found, expected) } else { (expected, found) };
+                icx.emit_type_mismatch_with_cause(expression.into(), expected, found, cause.code());
             }
         }
 
@@ -1520,6 +1400,9 @@ impl<'db> CoerceDelegate<'db> for HirCoercionDelegate<'_, 'db> {
     fn type_var_is_sized(&self, _var: TyVid) -> bool {
         false
     }
+    fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>> {
+        None
+    }
 }
 
 fn is_capturing_closure(db: &Db, closure: InternedClosureId<'_>) -> bool {
@@ -1537,6 +1420,9 @@ struct CoerceVisitor<'a, D> {
     /// coerce in these cases to emit better errors. This changes the behavior
     /// when hitting the recursion limit.
     errored: bool,
+    /// Whether the outcome read the table's sizedness of a variable, so it is not a function
+    /// of the two types alone.
+    read_table: bool,
     unsize_did: TraitId,
     coerce_unsized_did: TraitId,
     span: Span,
@@ -1581,7 +1467,10 @@ impl<'a, 'db, D: CoerceDelegate<'db>> ProofTreeVisitor<'db> for CoerceVisitor<'a
                 if def_id == self.unsize_did
                     && let TyKind::Dynamic(..) = pred.skip_binder().trait_ref.args.type_at(1).kind()
                     && let TyKind::Infer(InferTy::TyVar(vid)) = pred.self_ty().skip_binder().kind()
-                    && self.delegate.type_var_is_sized(vid)
+                    && {
+                        self.read_table = true;
+                        self.delegate.type_var_is_sized(vid)
+                    }
                 {
                     // We get here when trying to unsize a type variable to a `dyn Trait`,
                     // knowing that that variable is sized. Unsizing definitely has to happen in that case.

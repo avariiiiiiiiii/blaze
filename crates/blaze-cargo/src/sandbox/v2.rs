@@ -192,7 +192,7 @@ fn run(spec: &confine::Spec, live: &Live) -> Result<i32, String> {
     // clone: as above.
     program.push(spec.program.clone().into_os_string());
     program.extend(spec.args.iter().cloned());
-    let also = super::Also { network: spec.network, live: Some(live), env: Some(&spec.env) };
+    let also = super::Also { network: spec.network, live: Some(live), env: Some(&spec.env), services: &spec.services };
     super::backend(&made, Some(&program), also)
 }
 
@@ -340,6 +340,7 @@ mod tests {
             write: vec![out],
             network: false,
             trace,
+            services: Vec::new(),
             live: dir.join("live"),
             report: dir.join("report"),
             not_inputs: vec![program.into()],

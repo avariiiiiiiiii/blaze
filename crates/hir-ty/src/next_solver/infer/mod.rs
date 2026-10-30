@@ -1,6 +1,7 @@
 //! Infer context the next-trait-solver.
 
 use std::cell::{Cell, RefCell};
+use std::mem;
 use std::ops::Range;
 use std::range::RangeInclusive;
 use std::sync::Arc;
@@ -39,6 +40,7 @@ use crate::{
         fold::BoundVarReplacerDelegate,
         infer::{at::ToTrace, select::EvaluationResult, traits::PredicateObligation},
         obligation_ctxt::ObligationCtxt,
+        recycle,
     },
 };
 
@@ -62,6 +64,7 @@ pub mod resolve;
 pub mod select;
 pub(crate) mod snapshot;
 pub mod traits;
+pub(crate) mod touched;
 mod type_variable;
 mod unify_key;
 mod union_find;
@@ -89,7 +92,6 @@ fn iter_idx_range<T: From<u32> + Into<u32>>(range: Range<T>) -> impl Iterator<It
 /// `RefCell` and are involved with taking/rolling back snapshots. Snapshot
 /// operations are hot enough that we want only one call to `borrow_mut` per
 /// call to `start_snapshot` and `rollback_to`.
-#[derive(Clone)]
 pub struct InferCtxtInner<'db> {
     pub(crate) undo_log: InferCtxtUndoLogs,
 
@@ -163,8 +165,45 @@ pub struct InferCtxtInner<'db> {
     pub(crate) opaque_type_storage: OpaqueTypeStorage<'db>,
 }
 
+impl Clone for InferCtxtInner<'_> {
+    fn clone(&self) -> Self {
+        let mut inner = InferCtxtInner::empty_unallocated();
+        inner.clone_from(self);
+        inner
+    }
+
+    /// Field by field into `self`'s tables, keeping their capacity: a fork into the worker's
+    /// warm tables (`InferCtxt::fork`) allocates nothing.
+    fn clone_from(&mut self, source: &Self) {
+        let InferCtxtInner {
+            undo_log,
+            type_variable_storage,
+            const_unification_storage,
+            const_var_params,
+            int_unification_storage,
+            float_unification_storage,
+            region_constraint_storage,
+            region_obligations,
+            region_assumptions,
+            opaque_type_storage,
+        } = self;
+        *undo_log = source.undo_log;
+        type_variable_storage.clone_from(&source.type_variable_storage);
+        const_unification_storage.clone_from(&source.const_unification_storage);
+        const_var_params.clone_from(&source.const_var_params);
+        int_unification_storage.clone_from(&source.int_unification_storage);
+        float_unification_storage.clone_from(&source.float_unification_storage);
+        region_constraint_storage.clone_from(&source.region_constraint_storage);
+        region_obligations.clone_from(&source.region_obligations);
+        region_assumptions.clone_from(&source.region_assumptions);
+        opaque_type_storage.clone_from(&source.opaque_type_storage);
+    }
+}
+
 impl<'db> InferCtxtInner<'db> {
-    fn new() -> InferCtxtInner<'db> {
+    /// Tables that hold nothing and have allocated nothing. A context takes warm ones from its
+    /// worker instead (`next_solver::recycle`).
+    pub(crate) fn empty_unallocated() -> InferCtxtInner<'db> {
         InferCtxtInner {
             undo_log: InferCtxtUndoLogs::default(),
 
@@ -180,6 +219,49 @@ impl<'db> InferCtxtInner<'db> {
             region_assumptions: Default::default(),
             opaque_type_storage: Default::default(),
         }
+    }
+
+    /// Back to `empty_unallocated()` in every observable field, each table's capacity kept.
+    pub(crate) fn empty(&mut self) {
+        let InferCtxtInner {
+            undo_log,
+            type_variable_storage,
+            const_unification_storage,
+            const_var_params,
+            int_unification_storage,
+            float_unification_storage,
+            region_constraint_storage,
+            region_obligations,
+            region_assumptions,
+            opaque_type_storage,
+        } = self;
+        *undo_log = InferCtxtUndoLogs::default();
+        type_variable_storage.empty();
+        const_unification_storage.empty();
+        const_var_params.clear();
+        int_unification_storage.empty();
+        float_unification_storage.empty();
+        match region_constraint_storage {
+            Some(storage) => storage.empty(),
+            // Taken when regions were resolved.
+            None => *region_constraint_storage = Some(Default::default()),
+        }
+        region_obligations.clear();
+        region_assumptions.clear();
+        opaque_type_storage.empty();
+    }
+
+    /// Bytes its tables hold room for.
+    pub(crate) fn held(&self) -> usize {
+        self.type_variable_storage.held()
+            + self.const_unification_storage.held()
+            + self.const_var_params.capacity() * size_of::<(ConstVid, ConstParamId)>()
+            + self.int_unification_storage.held()
+            + self.float_unification_storage.held()
+            + self.region_constraint_storage.as_ref().map_or(0, RegionConstraintStorage::held)
+            + self.region_obligations.capacity() * size_of::<TypeOutlivesConstraint<'db>>()
+            + self.region_assumptions.capacity() * size_of::<ArgOutlivesClause<'db>>()
+            + self.opaque_type_storage.held()
     }
 
     /// Grows whenever a type, const, int or float variable is instantiated or unified, an
@@ -244,6 +326,55 @@ impl<'db> InferCtxtInner<'db> {
             .as_mut()
             .expect("region constraints already solved")
             .collector(in_snapshot)
+    }
+}
+
+/// What an `InferCtxt` allocates: taken from the worker's shelf when one is built, and put
+/// back emptied when it drops (`next_solver::recycle`), so a warm worker builds contexts
+/// without allocating.
+pub(crate) struct InferTables<'db> {
+    pub(crate) inner: InferCtxtInner<'db>,
+    pub(crate) canonicalizer: CanonicalizerState<DbInterner<'db>>,
+    pub(crate) placeholder_assumptions: FxIndexMap<UniverseIndex, Assumptions<DbInterner<'db>>>,
+    pub(crate) next_solver_overflows: Vec<NextSolverOverflow<'db>>,
+}
+
+impl Default for InferTables<'_> {
+    fn default() -> Self {
+        InferTables {
+            inner: InferCtxtInner::empty_unallocated(),
+            canonicalizer: Default::default(),
+            placeholder_assumptions: Default::default(),
+            // alloc: an empty `Vec` does not allocate.
+            next_solver_overflows: Vec::new(),
+        }
+    }
+}
+
+impl<'db> InferTables<'db> {
+    /// Drops every value, keeping each table's capacity.
+    pub(crate) fn empty(&mut self) {
+        let InferTables { inner, canonicalizer, placeholder_assumptions, next_solver_overflows } =
+            self;
+        inner.empty();
+        canonicalizer.clear();
+        placeholder_assumptions.clear();
+        next_solver_overflows.clear();
+    }
+
+    /// Bytes it holds room for: what a shelf keeps the largest of.
+    pub(crate) fn held(&self) -> usize {
+        let canonicalizer = &self.canonicalizer;
+        self.inner.held()
+            + canonicalizer.variables.capacity() * size_of::<GenericArg<'db>>()
+            + canonicalizer.var_kinds.capacity()
+                * size_of::<rustc_type_ir::CanonicalVarKind<DbInterner<'db>>>()
+            + canonicalizer.variable_lookup_table.capacity()
+                * size_of::<(GenericArg<'db>, usize)>()
+            + canonicalizer.sub_root_lookup_table.capacity() * size_of::<(TyVid, usize)>()
+            + self.placeholder_assumptions.capacity()
+                * (size_of::<(UniverseIndex, Assumptions<DbInterner<'db>>)>() + size_of::<usize>())
+            + self.next_solver_overflows.capacity() * size_of::<NextSolverOverflow<'db>>()
     }
 }
 
@@ -403,19 +534,35 @@ impl<'db> InferCtxtBuilder<'db> {
         // Solving needs the crate's trait environment and solver cache.
         self.interner.expect_crate();
         let InferCtxtBuilder { interner, enable_next_solver_overflow_fcw } = *self;
+        let InferTables { inner, canonicalizer, placeholder_assumptions, next_solver_overflows } =
+            recycle::infer_tables();
         InferCtxt {
             interner,
             typing_mode,
-            inner: RefCell::new(InferCtxtInner::new()),
+            inner: RefCell::new(inner),
             tainted_by_errors: Cell::new(None),
             universe: Cell::new(UniverseIndex::ROOT),
-            placeholder_assumptions: RefCell::new(Default::default()),
+            placeholder_assumptions: RefCell::new(placeholder_assumptions),
             enable_next_solver_overflow_fcw: Cell::new(enable_next_solver_overflow_fcw),
-            // alloc: an empty `Vec` does not allocate.
-            next_solver_overflows: RefCell::new(Vec::new()),
+            next_solver_overflows: RefCell::new(next_solver_overflows),
             obligation_inspector: Cell::new(None),
-            canonicalizer_state: Default::default(),
+            canonicalizer_state: RefCell::new(canonicalizer),
         }
+    }
+}
+
+impl Drop for InferCtxt<'_> {
+    fn drop(&mut self) {
+        // A context dropped by an unwind may be mid-change; its tables are freed, not kept.
+        if std::thread::panicking() {
+            return;
+        }
+        recycle::give_infer_tables(InferTables {
+            inner: mem::replace(self.inner.get_mut(), InferCtxtInner::empty_unallocated()),
+            canonicalizer: mem::take(self.canonicalizer_state.get_mut()),
+            placeholder_assumptions: mem::take(self.placeholder_assumptions.get_mut()),
+            next_solver_overflows: mem::take(self.next_solver_overflows.get_mut()),
+        });
     }
 }
 
@@ -1495,6 +1642,16 @@ impl<'db> InferCtxt<'db> {
         std::mem::take(&mut *self.next_solver_overflows.borrow_mut())
     }
 
+    /// How many overflow warnings are recorded and not yet taken; an evaluation that records
+    /// one changes it.
+    pub(crate) fn next_solver_overflow_count(&self) -> usize {
+        self.next_solver_overflows.borrow().len()
+    }
+
+    pub(crate) fn has_obligation_inspector(&self) -> bool {
+        self.obligation_inspector.get().is_some()
+    }
+
     /// Attach a callback to be invoked on each root obligation evaluated in the new trait solver.
     pub fn attach_obligation_inspector(&self, inspector: ObligationInspector<'db>) {
         debug_assert!(
@@ -1564,4 +1721,136 @@ pub struct MemberConstraint<'db> {
 
     /// The options `O1..On`.
     pub choice_regions: Arc<Vec<Region<'db>>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DbInternerInferExt, InferCtxt, TypingMode, traits::ObligationCause};
+    use crate::{
+        Span,
+        next_solver::{DbInterner, ParamEnv, budget_tests::fixture, recycle},
+    };
+
+    /// What a context's tables show from outside, for comparing one with a never-used one.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Observed {
+        open_snapshots: usize,
+        ty_vars: usize,
+        const_vars: usize,
+        int_vars: usize,
+        float_vars: usize,
+        region_vars: usize,
+        state_changes: u64,
+        const_var_params: usize,
+        region_obligations: usize,
+        region_assumptions: usize,
+        opaque_types: super::opaque_types::table::OpaqueTypeStorageEntries,
+        region_constraints: (usize, usize, usize),
+        placeholder_assumptions: usize,
+        overflows: usize,
+    }
+
+    fn observed(infcx: &InferCtxt<'_>) -> Observed {
+        let mut inner = infcx.inner.borrow_mut();
+        let region_constraints = {
+            let collector = inner.unwrap_region_constraints();
+            let data = collector.region_constraint_data();
+            (data.constraints.len(), data.member_constraints.len(), data.verifys.len())
+        };
+        Observed {
+            open_snapshots: inner.undo_log.num_open_snapshots(),
+            ty_vars: inner.type_variables().num_vars(),
+            const_vars: inner.const_unification_storage.len(),
+            int_vars: inner.int_unification_storage.len(),
+            float_vars: inner.float_unification_storage.len(),
+            region_vars: inner.unwrap_region_constraints().num_region_vars(),
+            state_changes: inner.state_changes(),
+            const_var_params: inner.const_var_params.len(),
+            region_obligations: inner.region_obligations.len(),
+            region_assumptions: inner.region_assumptions.len(),
+            opaque_types: inner.opaque_type_storage.num_entries(),
+            region_constraints,
+            placeholder_assumptions: infcx.placeholder_assumptions.borrow().len(),
+            overflows: infcx.next_solver_overflows.borrow().len(),
+        }
+    }
+
+    /// New type, int and const variables, two unified, a snapshot opened and rolled back
+    /// around more of them, and a region obligation.
+    fn use_context(infcx: &InferCtxt<'_>) {
+        let cause = ObligationCause::dummy();
+        let (a, b) = (infcx.next_ty_var(Span::Dummy), infcx.next_ty_var(Span::Dummy));
+        let _ = infcx.next_int_var();
+        let _ = infcx.next_const_var(Span::Dummy);
+        let ok = infcx.at(&cause, ParamEnv::empty()).eq(a, b).expect("two fresh variables unify");
+        assert!(ok.obligations.is_empty());
+        let snapshot = infcx.start_snapshot();
+        let c = infcx.next_ty_var(Span::Dummy);
+        let _ = infcx.at(&cause, ParamEnv::empty()).eq(a, c).expect("unify in the snapshot");
+        let _ = infcx.next_region_var(Span::Dummy);
+        infcx.rollback_to(snapshot);
+        infcx.register_type_outlives_constraint(a, infcx.interner.default_types().regions.statik);
+    }
+
+    fn build<'db>(interner: DbInterner<'db>) -> InferCtxt<'db> {
+        interner.infer_ctxt().build(TypingMode::non_body_analysis())
+    }
+
+    #[test]
+    fn a_recycled_context_is_a_new_one() {
+        let (db, krate) = fixture();
+        let interner = DbInterner::new_with(&db, krate);
+        // Each test runs on a thread of its own: this one's tables are new.
+        let fresh = observed(&build(interner));
+        let used = build(interner);
+        use_context(&used);
+        assert_ne!(observed(&used), fresh);
+        drop(used);
+        let recycled = build(interner);
+        assert!(recycled.inner.borrow().held() > 0, "the used context's tables came back");
+        assert_eq!(observed(&recycled), fresh);
+        // And it behaves as a new one.
+        use_context(&recycled);
+    }
+
+    #[test]
+    fn a_warm_context_allocates_nothing() {
+        let (db, krate) = fixture();
+        let interner = DbInterner::new_with(&db, krate);
+        let infcx = build(interner);
+        use_context(&infcx);
+        drop(infcx);
+        blaze_alloc_count::assert_at_most(0, "a warm inference context", || {
+            let infcx = build(interner);
+            use_context(&infcx);
+        });
+    }
+
+    #[test]
+    fn a_warm_fork_allocates_nothing() {
+        let (db, krate) = fixture();
+        let interner = DbInterner::new_with(&db, krate);
+        let infcx = build(interner);
+        for _ in 0..100 {
+            let _ = infcx.next_ty_var(Span::Dummy);
+        }
+        use_context(&infcx);
+        drop(infcx.fork());
+        blaze_alloc_count::assert_at_most(0, "a warm fork", || {
+            let fork = infcx.fork();
+            assert_eq!(fork.num_ty_vars(), infcx.num_ty_vars());
+        });
+    }
+
+    #[test]
+    fn a_huge_context_is_not_kept() {
+        let (db, krate) = fixture();
+        let interner = DbInterner::new_with(&db, krate);
+        let infcx = build(interner);
+        let rows = recycle::KEEP_AT_MOST / size_of::<super::TypeOutlivesConstraint<'_>>() + 1;
+        infcx.inner.borrow_mut().region_obligations.reserve_exact(rows);
+        assert!(infcx.inner.borrow().held() > recycle::KEEP_AT_MOST);
+        drop(infcx);
+        assert_eq!(recycle::infer_tables().held(), 0);
+    }
 }

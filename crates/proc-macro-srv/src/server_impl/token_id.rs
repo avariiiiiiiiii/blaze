@@ -56,6 +56,7 @@ impl server::Server for SpanIdServer<'_> {
 
     fn literal_from_str(&mut self, s: &str) -> Result<Literal<Self::Span>, String> {
         literal_from_str(s, self.call_site)
+            // alloc: error path, the message the macro is given.
             .map_err(|()| "cannot parse string into literal".to_string())
     }
 
@@ -66,6 +67,7 @@ impl server::Server for SpanIdServer<'_> {
     }
 
     fn ts_clone(&mut self, stream: &Self::TokenStream) -> Self::TokenStream {
+        // clone: the stream's `Arc`, which the bridge asks a second handle of.
         stream.clone()
     }
 
@@ -74,16 +76,19 @@ impl server::Server for SpanIdServer<'_> {
     }
     fn ts_from_str(&mut self, src: &str) -> Result<Self::TokenStream, String> {
         Self::TokenStream::from_str(src, self.call_site)
+            // alloc: error path, the message the macro is given.
             .map_err(|e| format!("failed to parse str to token stream: {e}"))
     }
     fn ts_to_string(&mut self, stream: &Self::TokenStream) -> String {
+        // alloc: the text the macro asks for, which it owns.
         stream.to_string()
     }
     fn ts_from_token_tree(&mut self, tree: TokenTree<Self::Span>) -> Self::TokenStream {
-        Self::TokenStream::new(vec![tree])
+        Self::TokenStream::of_tree(tree)
     }
 
     fn ts_expand_expr(&mut self, self_: &Self::TokenStream) -> Result<Self::TokenStream, ()> {
+        // clone: the stream's `Arc`, given back unexpanded.
         Ok(self_.clone())
     }
 
@@ -92,15 +97,7 @@ impl server::Server for SpanIdServer<'_> {
         base: Option<Self::TokenStream>,
         trees: Vec<TokenTree<Self::Span>>,
     ) -> Self::TokenStream {
-        match base {
-            Some(mut base) => {
-                for tt in trees {
-                    base.push_tree(tt);
-                }
-                base
-            }
-            None => Self::TokenStream::new(trees),
-        }
+        Self::TokenStream::concat_trees(base, trees)
     }
 
     fn ts_concat_streams(
@@ -108,21 +105,19 @@ impl server::Server for SpanIdServer<'_> {
         base: Option<Self::TokenStream>,
         streams: Vec<Self::TokenStream>,
     ) -> Self::TokenStream {
-        let mut stream = base.unwrap_or_default();
-        for s in streams {
-            stream.push_stream(s);
-        }
-        stream
+        Self::TokenStream::concat_streams(base, streams)
     }
 
     fn ts_into_trees(&mut self, stream: Self::TokenStream) -> Vec<TokenTree<Self::Span>> {
-        (*stream.0).clone()
+        stream.into_trees()
     }
 
     fn span_debug(&mut self, span: Self::Span) -> String {
+        // alloc: the text the macro asks for, which it owns.
         format!("{:?}", span.0)
     }
     fn span_file(&mut self, _span: Self::Span) -> String {
+        // alloc: none, an empty `String` the bridge's signature asks for.
         String::new()
     }
     fn span_local_file(&mut self, _span: Self::Span) -> Option<String> {

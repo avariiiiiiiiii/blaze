@@ -14,7 +14,8 @@
 //! and only from the daemon it connected to.
 //!
 //! A sandboxed run needs `(allow mach-lookup (global-name "dev.blaze.inproc.<pid>"))` in its
-//! profile; looking the service up is all it does.
+//! profile; looking the service up is all it does. `Host::launch` names it in the command's
+//! `Sandbox::On::services` ([`super::service`]), which blaze-core's profile allows.
 //!
 //! The messages are encoded and decoded here as bytes ([`Message`]), by safe functions the
 //! tests run over any bytes.

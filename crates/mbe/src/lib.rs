@@ -1,6 +1,6 @@
 //! `mbe` (short for Macro By Example) crate contains code for handling
 //! `macro_rules` macros. It uses `TokenTree` (from `tt` package) as the
-//! interface, although it contains some code to bridge `SyntaxNode`s and
+//! interface, although it contains some code to bridge syntax trees and
 //! `TokenTree`s as well!
 //!
 //! The tests for this functionality live in another crate:
@@ -31,10 +31,13 @@ mod tests;
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use base_db::Db;
+use blaze_mem::frame::Frame;
+use smallvec::SmallVec;
 use span::{Edition, Span, SyntaxContext};
 use tt::DelimSpan;
 use tt::iter::TtIter;
 
+use std::alloc::Allocator;
 use std::fmt;
 use std::sync::Arc;
 
@@ -178,13 +181,13 @@ pub type MatchedArmIndex = Option<u32>;
 /// be very confusing is that AST has almost exactly the same shape as
 /// `tt::TokenTree`, but there's a crucial difference: in macro rules, `$ident`
 /// and `$()*` have special meaning (see `Var` and `Repeat` data structures)
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DeclarativeMacro {
     rules: Box<[Rule]>,
     err: Option<Box<ParseError>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct Rule {
     /// Is this a normal fn-like rule, an `attr()` rule, or a `derive()` rule?
     style: MacroCallStyle,
@@ -201,83 +204,18 @@ impl DeclarativeMacro {
     }
 
     /// The old, `macro_rules! m {}` flavor.
-    pub fn parse_macro_rules(
-        tt: &tt::TopSubtree,
+    pub fn parse_macro_rules<A: Allocator>(
+        tt: &tt::TopSubtree<A>,
         ctx_edition: impl Copy + Fn(SyntaxContext) -> Edition,
     ) -> DeclarativeMacro {
-        // Note: this parsing can be implemented using mbe machinery itself, by
-        // matching against `$($lhs:tt => $rhs:tt);*` pattern, but implementing
-        // manually seems easier.
-        let mut src = tt.iter();
-        // alloc: the rules, once per rule, when the macro is defined.
-        let mut rules = Vec::new();
-        let mut err = None;
+        blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+            // Note: this parsing can be implemented using mbe machinery itself, by
+            // matching against `$($lhs:tt => $rhs:tt);*` pattern, but implementing
+            // manually seems easier.
+            let mut src = tt.iter();
+            let mut rules = Vec::new_in(frame);
+            let mut err = None;
 
-        while !src.is_empty() {
-            let rule = match Rule::parse(ctx_edition, &mut src) {
-                Ok(it) => it,
-                Err(e) => {
-                    // alloc: an error.
-                    err = Some(Box::new(e));
-                    break;
-                }
-            };
-            rules.push(rule);
-            if let Err(()) = src.expect_char(';') {
-                if !src.is_empty() {
-                    // alloc: an error.
-                    err = Some(Box::new(ParseError::expected("expected `;`")));
-                }
-                break;
-            }
-        }
-
-        for Rule { lhs, .. } in &rules {
-            if let Err(e) = validate(lhs) {
-                // alloc: an error.
-                err = Some(Box::new(e));
-                break;
-            }
-        }
-
-        DeclarativeMacro { rules: rules.into_boxed_slice(), err }
-    }
-
-    /// The new, unstable `macro m {}` flavor.
-    pub fn parse_macro2(
-        args: Option<&tt::TopSubtree>,
-        body: &tt::TopSubtree,
-        ctx_edition: impl Copy + Fn(SyntaxContext) -> Edition,
-    ) -> DeclarativeMacro {
-        // alloc: the rules, once per rule, when the macro is defined.
-        let mut rules = Vec::new();
-        let mut err = None;
-
-        if let Some(args) = args {
-            // The presence of an argument list means that this macro uses the
-            // "simple" syntax, where the body is the RHS of a single rule.
-            cov_mark::hit!(parse_macro_def_simple);
-
-            let rule = (|| {
-                let lhs = MetaTemplate::parse_pattern(ctx_edition, args.iter())?;
-                let rhs = MetaTemplate::parse_template(ctx_edition, body.iter())?;
-
-                // In the "simple" syntax, there is apparently no way to specify
-                // that the single rule is an attribute or derive rule, so it
-                // must be a function-like rule.
-                Ok(crate::Rule::new(MacroCallStyle::FnLike, lhs, rhs))
-            })();
-
-            match rule {
-                Ok(rule) => rules.push(rule),
-                // alloc: an error.
-                Err(e) => err = Some(Box::new(e)),
-            }
-        } else {
-            // There was no top-level argument list, so this macro uses the
-            // list-of-rules syntax, similar to `macro_rules!`.
-            cov_mark::hit!(parse_macro_def_rules);
-            let mut src = body.iter();
             while !src.is_empty() {
                 let rule = match Rule::parse(ctx_edition, &mut src) {
                     Ok(it) => it,
@@ -288,27 +226,98 @@ impl DeclarativeMacro {
                     }
                 };
                 rules.push(rule);
-                if let Err(()) = src.expect_any_char(&[';', ',']) {
+                if let Err(()) = src.expect_char(';') {
                     if !src.is_empty() {
                         // alloc: an error.
-                        err = Some(Box::new(ParseError::expected(
-                            "expected `;` or `,` to delimit rules",
-                        )));
+                        err = Some(Box::new(ParseError::expected("expected `;`")));
                     }
                     break;
                 }
             }
-        }
 
-        for Rule { lhs, .. } in &rules {
-            if let Err(e) = validate(lhs) {
-                // alloc: an error.
-                err = Some(Box::new(e));
-                break;
+            for Rule { lhs, .. } in &rules {
+                if let Err(e) = validate(lhs) {
+                    // alloc: an error.
+                    err = Some(Box::new(e));
+                    break;
+                }
             }
-        }
 
-        DeclarativeMacro { rules: rules.into_boxed_slice(), err }
+            // alloc: the definition's rules, its memo, once at their exact length.
+            let rules: Box<[Rule]> = rules.drain(..).collect();
+            DeclarativeMacro { rules, err }
+        })
+    }
+
+    /// The new, unstable `macro m {}` flavor.
+    pub fn parse_macro2<A: Allocator, B: Allocator>(
+        args: Option<&tt::TopSubtree<A>>,
+        body: &tt::TopSubtree<B>,
+        ctx_edition: impl Copy + Fn(SyntaxContext) -> Edition,
+    ) -> DeclarativeMacro {
+        blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+            let mut rules = Vec::new_in(frame);
+            let mut err = None;
+
+            if let Some(args) = args {
+                // The presence of an argument list means that this macro uses the
+                // "simple" syntax, where the body is the RHS of a single rule.
+                cov_mark::hit!(parse_macro_def_simple);
+
+                let rule = (|| {
+                    let lhs = MetaTemplate::parse_pattern(ctx_edition, args.iter())?;
+                    let rhs = MetaTemplate::parse_template(ctx_edition, body.iter())?;
+
+                    // In the "simple" syntax, there is apparently no way to specify
+                    // that the single rule is an attribute or derive rule, so it
+                    // must be a function-like rule.
+                    Ok(crate::Rule::new(MacroCallStyle::FnLike, lhs, rhs))
+                })();
+
+                match rule {
+                    Ok(rule) => rules.push(rule),
+                    // alloc: an error.
+                    Err(e) => err = Some(Box::new(e)),
+                }
+            } else {
+                // There was no top-level argument list, so this macro uses the
+                // list-of-rules syntax, similar to `macro_rules!`.
+                cov_mark::hit!(parse_macro_def_rules);
+                let mut src = body.iter();
+                while !src.is_empty() {
+                    let rule = match Rule::parse(ctx_edition, &mut src) {
+                        Ok(it) => it,
+                        Err(e) => {
+                            // alloc: an error.
+                            err = Some(Box::new(e));
+                            break;
+                        }
+                    };
+                    rules.push(rule);
+                    if let Err(()) = src.expect_any_char(&[';', ',']) {
+                        if !src.is_empty() {
+                            // alloc: an error.
+                            err = Some(Box::new(ParseError::expected(
+                                "expected `;` or `,` to delimit rules",
+                            )));
+                        }
+                        break;
+                    }
+                }
+            }
+
+            for Rule { lhs, .. } in &rules {
+                if let Err(e) = validate(lhs) {
+                    // alloc: an error.
+                    err = Some(Box::new(e));
+                    break;
+                }
+            }
+
+            // alloc: the definition's rules, its memo, once at their exact length.
+            let rules: Box<[Rule]> = rules.drain(..).collect();
+            DeclarativeMacro { rules, err }
+        })
     }
 
     pub fn err(&self) -> Option<&ParseError> {
@@ -340,9 +349,57 @@ impl DeclarativeMacro {
         call_style: MacroCallStyle,
         call_site: Span,
     ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
+        self.expand_making(db, tt, marker, call_style, call_site).map(|(tree, arm, _)| (tree, arm))
+    }
+
+    /// [`Self::expand`], with the spans of the identifiers the expansion's `${concat(..)}`s made.
+    pub fn expand_making(
+        &self,
+        db: &Db,
+        tt: &tt::TopSubtree,
+        marker: impl Fn(&mut Span) + Copy,
+        call_style: MacroCallStyle,
+        call_site: Span,
+    ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex, MadeIdents)> {
         expander::expand_rules(db, &self.rules, tt, marker, call_style, call_site)
     }
+
+    /// [`Self::expand`] with the output in `frame`, a temporary of the caller's task; the
+    /// match's own temporaries are in a task of their own, so they are gone when this returns.
+    pub fn expand_in<'f>(
+        &self,
+        frame: &'f Frame,
+        db: &Db,
+        tt: &tt::TopSubtree,
+        marker: impl Fn(&mut Span) + Copy,
+        call_style: MacroCallStyle,
+        call_site: Span,
+    ) -> ExpandResult<(tt::TopSubtree<&'f Frame>, MatchedArmIndex)> {
+        self.expand_making_in(frame, db, tt, marker, call_style, call_site)
+            .map(|(tree, arm, _)| (tree, arm))
+    }
+
+    /// [`Self::expand_making`] with the output in `frame`, as [`Self::expand_in`].
+    pub fn expand_making_in<'f>(
+        &self,
+        frame: &'f Frame,
+        db: &Db,
+        tt: &tt::TopSubtree,
+        marker: impl Fn(&mut Span) + Copy,
+        call_style: MacroCallStyle,
+        call_site: Span,
+    ) -> ExpandResult<(tt::TopSubtree<&'f Frame>, MatchedArmIndex, MadeIdents)> {
+        let build = move |builder: tt::TopSubtreeBuilder| builder.build_in(frame);
+        blaze_mem::frame::task(blaze_mem::Tag::Expand, |scratch| {
+            let rules = &self.rules;
+            expander::expand_rules_in(scratch, build, db, rules, tt, marker, call_style, call_site)
+        })
+    }
 }
+
+/// The spans of the identifiers an expansion made with `${concat(..)}`, in the order it made
+/// them: tokens no source has, which only the transcriber can tell from the others.
+pub type MadeIdents = SmallVec<[Span; 2]>;
 
 impl Rule {
     fn parse(

@@ -204,7 +204,7 @@ impl Sink for Keeping<'_> {
         path: &[u8],
         executable: bool,
         size: u64,
-        contents: &mut dyn Read,
+        contents: &mut impl Read,
     ) -> anyhow::Result<()> {
         let mut pieces = Vec::with_capacity(size.div_ceil(PIECE_MAX as u64) as usize);
         let mut piece = vec![0; PIECE_MAX];

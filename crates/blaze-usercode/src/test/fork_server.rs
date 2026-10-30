@@ -773,6 +773,8 @@ mod unix {
         unsafe { _exit(code) }
     }
 
+    /// Tells the sandbox which test this thread runs. Outside a sandbox nothing sees the call,
+    /// which fails on a path that is not there and changes nothing.
     fn mark(name: &str) {
         let mut path = Vec::with_capacity(MARK.len() + name.len() + 1);
         path.extend_from_slice(MARK.as_bytes());
@@ -802,6 +804,7 @@ mod unix {
         Panicked(Option<&'a str>),
     }
 
+    // dyn: a panic's payload, read once per test that panicked.
     fn payload_str(payload: &(dyn ::std::any::Any + Send)) -> Option<&str> {
         if let Some(text) = payload.downcast_ref::<String>() {
             return Some(text.as_str());

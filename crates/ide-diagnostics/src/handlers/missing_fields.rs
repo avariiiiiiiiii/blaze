@@ -1,9 +1,7 @@
 use either::Either;
-use hir::{
-    AssocItem, FindPathConfig, HasVisibility, HirDisplay, InFile, Type, db::HirDatabase, sym,
-};
+use hir::{AssocItem, FindPathConfig, HasVisibility, HirDisplay, InFile, Type, sym};
 use ide_db::{
-    FxHashMap,
+    FxHashMap, RootDatabase,
     assists::{Assist, ExprFillDefaultMode},
     famous_defs::FamousDefs,
     imports::import_assets::item_for_path_search,
@@ -201,7 +199,7 @@ fn fixes(ctx: &DiagnosticsContext<'_, '_>, d: &hir::MissingFields) -> Option<Vec
 
 fn make_ty(
     ty: &hir::Type<'_>,
-    db: &dyn HirDatabase,
+    db: &RootDatabase,
     module: hir::Module,
     edition: Edition,
 ) -> ast::Type {

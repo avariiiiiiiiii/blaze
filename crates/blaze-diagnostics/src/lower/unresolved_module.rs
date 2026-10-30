@@ -7,42 +7,51 @@
 //! `compiler/rustc_parse/src/lib.rs` (`new_parser_from_file`) (MIT or Apache-2.0).
 
 use hir::InFile;
-use syntax::{AstNode, ast::HasName as _};
+use syntax::view::{AstNode as _, HasName as _};
 
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view as item_range},
     lower::{Found, Phase},
     model::Diag,
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedModule) -> Vec<Found> {
-    let node = cx.node(d.decl);
+    let node = cx.node_view(d.decl);
+    // alloc: empty, allocates nothing
     let Some(name) = node.value.name() else { return Vec::new() };
-    let name = name.text().to_owned();
+    let name = name.text();
     let span = cx.span(InFile::new(node.file_id, item_range(node.value.syntax())));
     // The candidates are relative to the directory of the file the declaration is in.
     let anchor = node.file_id.original_file_respecting_includes(cx.db).file_id(cx.db);
     let dir = match cx.file_name(anchor).rsplit_once('/') {
+        // alloc: the error's text, for an error hir found
         Some((dir, _)) => format!("{dir}/"),
+        // alloc: the error's text, for an error hir found
         None => String::new(),
     };
     let diag = match &*d.candidates {
+        // alloc: the error's text, for an error hir found
         [file] => Diag::error(None, format!("couldn't find file `{dir}{file}`"), span),
         [default, secondary, ..] => {
             let mut diag = Diag::error(
                 Some("E0583"),
+                // alloc: the error's text, for an error hir found
                 format!("file not found for module `{name}`"),
                 span,
             );
+            // alloc: the error's text, for an error hir found
             diag.help(format!(
                 "to create the module `{name}`, create file \"{dir}{default}\" or \"{dir}{secondary}\""
             ));
+            // alloc: the error's text, for an error hir found
             diag.note(format!(
                 "if there is a `mod {name}` elsewhere in the crate already, import it with `use crate::...` instead"
             ));
             diag
         }
+        // alloc: the error's text, for an error hir found
         [] => Diag::error(Some("E0583"), format!("file not found for module `{name}`"), span),
     };
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Expand)]
 }

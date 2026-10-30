@@ -109,7 +109,7 @@ impl HasSource for Field {
     fn source(self, db: &Db) -> Option<InFile<Self::Ast>> {
         let var = VariantId::from(self.parent);
         let src = var.child_source(db);
-        let field_source = src.map(|it| match it[self.id].clone() {
+        let field_source = src.map(|mut it| match it.remove(self.id).expect("field has a source") {
             Either::Left(it) => FieldSource::Pos(it),
             Either::Right(it) => FieldSource::Named(it),
         });

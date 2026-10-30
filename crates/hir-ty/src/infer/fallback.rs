@@ -1,7 +1,6 @@
 //! Fallback of infer vars to `!` and `i32`/`f64`.
 
-use blaze_ids::bits::BitSet;
-use rustc_hash::FxHashMap;
+use blaze_ids::bits::Bits;
 use rustc_type_ir::{
     TyVid,
     inherent::{IntoKind, Ty as _},
@@ -9,11 +8,14 @@ use rustc_type_ir::{
 use tracing::debug;
 
 use crate::{
-    infer::InferenceContext,
+    infer::{
+        InferenceContext,
+        columns::{FrameMap, frame_map},
+    },
     next_solver::{Ty, TyKind},
 };
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(super) fn type_inference_fallback(&mut self) {
         debug!(
             "type-inference-fallback start obligations: {:#?}",
@@ -70,12 +72,15 @@ impl<'db> InferenceContext<'db> {
         }
 
         let interner = self.interner();
-        let unresolved_variables: Vec<Ty<'db>> = unresolved_ty
-            .into_iter()
-            .map(|vid| Ty::new_var(interner, vid))
-            .chain(unresolved_int.into_iter().map(|vid| Ty::new_int_var(interner, vid)))
-            .chain(unresolved_float.into_iter().map(|vid| Ty::new_float_var(interner, vid)))
-            .collect();
+        let mut unresolved_variables = Vec::with_capacity_in(
+            unresolved_ty.len() + unresolved_int.len() + unresolved_float.len(),
+            self.frame,
+        );
+        unresolved_variables.extend(unresolved_ty.into_iter().map(|vid| Ty::new_var(interner, vid)));
+        unresolved_variables
+            .extend(unresolved_int.into_iter().map(|vid| Ty::new_int_var(interner, vid)));
+        unresolved_variables
+            .extend(unresolved_float.into_iter().map(|vid| Ty::new_float_var(interner, vid)));
 
         let diverging_fallback = self.calculate_diverging_fallback(&unresolved_variables);
 
@@ -108,7 +113,7 @@ impl<'db> InferenceContext<'db> {
     fn fallback_if_possible(
         &mut self,
         ty: Ty<'db>,
-        diverging_fallback: &FxHashMap<Ty<'db>, Ty<'db>>,
+        diverging_fallback: &FrameMap<'_, Ty<'db>, Ty<'db>>,
     ) -> bool {
         // Careful: we do NOT shallow-resolve `ty`. We know that `ty`
         // is an unsolved variable, and we determine its fallback
@@ -150,14 +155,14 @@ impl<'db> InferenceContext<'db> {
     fn calculate_diverging_fallback(
         &self,
         unresolved_variables: &[Ty<'db>],
-    ) -> FxHashMap<Ty<'db>, Ty<'db>> {
+    ) -> FrameMap<'f, Ty<'db>, Ty<'db>> {
         debug!("calculate_diverging_fallback({:?})", unresolved_variables);
 
         // The root vids of the type variables that (a) are the target of a coercion from a `!`
         // type and (b) have not yet been solved.
         let interner = self.interner();
-        let mut diverging_roots = BitSet::<u32>::default();
-        for var in self.table.diverging_type_vars.iter() {
+        let mut diverging_roots = Bits::<_, u32>::from_words(Vec::<u64, _>::new_in(self.frame));
+        for var in self.table.diverging_type_vars().iter() {
             let ty = self.shallow_resolve(Ty::new_var(interner, TyVid::from_u32(var)));
             if let Some(vid) = ty.ty_vid() {
                 diverging_roots.insert_growing(self.table.infer_ctxt.root_var(vid).as_u32());
@@ -165,7 +170,7 @@ impl<'db> InferenceContext<'db> {
         }
         debug!("calculate_diverging_fallback: diverging_roots={:?}", diverging_roots);
 
-        let mut diverging_fallback = FxHashMap::default();
+        let mut diverging_fallback = frame_map(self.frame);
         for vid in unresolved_variables.iter().filter_map(|ty| ty.ty_vid()) {
             if diverging_roots.contains(self.table.infer_ctxt.root_var(vid).as_u32()) {
                 debug!("fallback to !: {:?}", vid);

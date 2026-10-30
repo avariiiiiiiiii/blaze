@@ -17,8 +17,10 @@ and the reasons.
 ## The design
 
 A collecting query (`crate_local_def_map`, `block_def_map`, every facts query, `TraitItems`,
-`ImplItems`, `used_imports`, the demand queries) opens `blaze_mem::frame::current` as its first
-line. It passes `&'f Frame` to whatever does the work: `DefCollector<'db, 'f>`,
+`ImplItems`, `used_imports`, the demand queries) wraps its body in
+`blaze_mem::frame::task(Tag::Nameres, ..)`. Salsa's `execute` opens no frame, and
+`frame::current` would stop outside a task and, inside a nested query, hand out the outer query's
+frame. It passes `&'f Frame` to whatever does the work: `DefCollector<'db, 'f>`,
 `CollectCx<'db, 'f>`, `AssocItemCollector<'db, 'f>`, `frozen::Dec<'a, &'f Frame>`. Three kinds of
 data are then told apart.
 

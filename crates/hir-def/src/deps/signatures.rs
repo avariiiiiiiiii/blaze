@@ -18,8 +18,11 @@
 //! in every mode.
 
 mod codes;
+mod ids;
 mod key;
 mod table;
+
+pub use self::ids::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableIds, body_key};
 #[cfg(test)]
 mod tests;
 
@@ -38,9 +41,10 @@ use self::{codes::Sig, key::Item, table::StoreBytes};
 use crate::{
     AdtId, AssocItemId, ConstId, EnumId, FunctionId, ImplId, ModuleDefId, StaticId, StructId,
     TraitId, TypeAliasId, UnionId, VariantId,
-    deps::{DepImages, Part, serve::crate_name},
+    deps::{Part, serve::crate_name},
     expr_store::ExpressionStore,
     hir::persist::{Column, Read, Relocation, Words, WordsRec, relocating},
+    item_scope::ItemScope,
     item_tree::ItemTree,
     nameres::{
         assoc::{ImplItems, TraitItems},
@@ -97,7 +101,7 @@ const _: () = {
 /// each signature, the store's buffer, the item tree's codes (visibilities, shapes), the key and
 /// the frozen encoding of the table.
 pub(crate) const SCHEMA: SchemaHash = blaze_format::schema_of(&[
-    SchemaPart::Str("blaze v2 dependency signatures 1"),
+    SchemaPart::Str("blaze v2 dependency signatures 2"),
     SchemaPart::Schema(<PartRoot as Record>::SCHEMA),
     SchemaPart::Schema(<RecordRoot as Record>::SCHEMA),
     SchemaPart::Schema(<ExpressionStore as Persist>::SCHEMA),
@@ -163,42 +167,64 @@ fn items(db: &Db, krate: Crate) -> Vec<Item> {
     // alloc: the items of one crate, listed once at store time.
     let mut items = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
-        let scope = module.scope(db);
-        for def in scope.declarations() {
-            match def {
-                ModuleDefId::FunctionId(it) => items.push(Item::Function(it)),
-                ModuleDefId::AdtId(AdtId::StructId(it)) => {
-                    items.extend([Item::Struct(it), Item::Fields(VariantId::StructId(it))]);
-                }
-                ModuleDefId::AdtId(AdtId::UnionId(it)) => {
-                    items.extend([Item::Union(it), Item::Fields(VariantId::UnionId(it))]);
-                }
-                ModuleDefId::AdtId(AdtId::EnumId(it)) => {
-                    items.extend([Item::Enum(it), Item::Variants(it)]);
-                    for &(variant, _) in EnumVariants::of(db, it).0.variants.values() {
-                        items.push(Item::Fields(VariantId::EnumVariantId(variant)));
-                    }
-                }
-                ModuleDefId::ConstId(it) => items.push(Item::Const(it)),
-                ModuleDefId::StaticId(it) => items.push(Item::Static(it)),
-                ModuleDefId::TraitId(it) => {
-                    items.push(Item::Trait(it));
-                    assoc(&mut items, &TraitItems::query(db, it).items);
-                }
-                ModuleDefId::TypeAliasId(it) => items.push(Item::TypeAlias(it)),
-                ModuleDefId::ModuleId(_)
-                | ModuleDefId::EnumVariantId(_)
-                | ModuleDefId::BuiltinType(_)
-                | ModuleDefId::MacroId(_) => {}
-            }
-        }
-        items.extend(scope.unnamed_consts().map(Item::Const));
-        for it in scope.impls() {
-            items.push(Item::Impl(it));
-            assoc(&mut items, &ImplItems::of(db, it).0.items);
-        }
+        scope_items(db, module.scope(db), &mut items);
     }
     items
+}
+
+/// Appends to `items` each signature query of the items `scope` declares, its impls' and its
+/// traits' too.
+pub(super) fn scope_items(db: &Db, scope: &ItemScope, items: &mut Vec<Item>) {
+    for def in scope.declarations() {
+        match def {
+            ModuleDefId::FunctionId(it) => items.push(Item::Function(it)),
+            ModuleDefId::AdtId(AdtId::StructId(it)) => {
+                items.extend([Item::Struct(it), Item::Fields(VariantId::StructId(it))]);
+            }
+            ModuleDefId::AdtId(AdtId::UnionId(it)) => {
+                items.extend([Item::Union(it), Item::Fields(VariantId::UnionId(it))]);
+            }
+            ModuleDefId::AdtId(AdtId::EnumId(it)) => {
+                items.extend([Item::Enum(it), Item::Variants(it)]);
+                for &(variant, _) in EnumVariants::of(db, it).0.variants.values() {
+                    items.push(Item::Fields(VariantId::EnumVariantId(variant)));
+                }
+            }
+            ModuleDefId::ConstId(it) => items.push(Item::Const(it)),
+            ModuleDefId::StaticId(it) => items.push(Item::Static(it)),
+            ModuleDefId::TraitId(it) => {
+                items.push(Item::Trait(it));
+                assoc(items, &TraitItems::query(db, it).items);
+            }
+            ModuleDefId::TypeAliasId(it) => items.push(Item::TypeAlias(it)),
+            ModuleDefId::ModuleId(_)
+            | ModuleDefId::EnumVariantId(_)
+            | ModuleDefId::BuiltinType(_)
+            | ModuleDefId::MacroId(_) => {}
+        }
+    }
+    items.extend(scope.unnamed_consts().map(Item::Const));
+    for it in scope.impls() {
+        items.push(Item::Impl(it));
+        assoc(items, &ImplItems::of(db, it).0.items);
+    }
+}
+
+/// The store of the signature `item` asks for: `None` for [`Item::Variants`], which has none.
+pub(super) fn store_of(db: &Db, item: Item) -> Option<&ExpressionStore> {
+    Some(match item {
+        Item::Struct(id) => &StructSignature::of(db, id).store,
+        Item::Union(id) => &UnionSignature::of(db, id).store,
+        Item::Enum(id) => &EnumSignature::of(db, id).store,
+        Item::Const(id) => &ConstSignature::of(db, id).store,
+        Item::Static(id) => &StaticSignature::of(db, id).store,
+        Item::Impl(id) => &ImplSignature::of(db, id).store,
+        Item::Trait(id) => &TraitSignature::of(db, id).store,
+        Item::Function(id) => &FunctionSignature::of(db, id).store,
+        Item::TypeAlias(id) => &TypeAliasSignature::of(db, id).store,
+        Item::Fields(id) => &VariantFields::of(db, id).store,
+        Item::Variants(_) => return None,
+    })
 }
 
 fn assoc(items: &mut Vec<Item>, assoc: &[(Name, AssocItemId)]) {
@@ -308,6 +334,13 @@ fn format_error(error: FormatError) -> String {
     error.to_string()
 }
 
+/// The key of the record of `id`'s signature, the same in every process: what a value made
+/// from the constant is filed by beside its crate's key (`hir_ty::consteval::deps`). `None`
+/// for a constant in a block.
+pub(crate) fn const_key(db: &Db, id: ConstId) -> Option<ContentId> {
+    key::of(db, Item::Const(id)).map(|(_, key)| key)
+}
+
 /// The record of `item` in `part`, the signatures part of its crate's image: two plain columns
 /// checked in place, a key hashed and a binary search, nothing allocated.
 fn find<'a>(db: &Db, part: &'a [u8], item: Item) -> R<&'a [u8]> {
@@ -390,7 +423,7 @@ fn served<S: Sig>(db: &Db, item: Item, live: impl FnOnce(Crate) -> R<Vec<u8>>) -
         return None;
     }
     let krate = module.krate(db);
-    let image = DepImages::try_get(db)?.images(db).get(&krate)?;
+    let image = super::image_of(db, krate).as_ref()?;
     let what = item.what();
     let part = image.view().part(Part::Signatures);
     let record = find(db, part, item).unwrap_or_else(|why| corrupt(db, krate, item, &why));
@@ -434,7 +467,7 @@ macro_rules! served {
         pub(crate) fn $name(db: &Db, id: $id) -> Option<Arc<$sig>> {
             let item = Item::$code(id);
             served::<codes::$code>(db, item, |krate| {
-                record::<codes::$code>(db, krate, item.what(), &$sig::with_source_map(db, id).0)
+                record::<codes::$code>(db, krate, item.what(), &$sig::lower_alone(db, id))
             })
         }
     )*};

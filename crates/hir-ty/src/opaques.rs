@@ -1,6 +1,7 @@
 //! Handling of opaque types, detection of defining scope and hidden type.
 
 use base_db::{Db, Crate};
+use blaze_mem::Frame;
 use hir_def::{
     AssocItemId, AssocItemLoc, DefWithBodyId, FunctionId, HasModule, ImplId, ItemContainerId,
     ModuleDefId, TraitId, TypeAliasId,
@@ -117,44 +118,51 @@ impl SelfAndAssocBounds {
 
 /// The associated types of an impl, in order: what a body in it reads of its items for the
 /// opaque types it may define. A function or constant added to the impl leaves this equal.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn impl_type_aliases(db: &Db, impl_id: ImplId) -> Box<[TypeAliasId]> {
-    type_aliases_of(&impl_id.impl_items(db).items)
+    blaze_mem::frame::current(|frame| type_aliases_of(frame, &impl_id.impl_items(db).items))
 }
 
 /// As [`impl_type_aliases`], of a trait.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn trait_type_aliases(db: &Db, trait_id: TraitId) -> Box<[TypeAliasId]> {
-    type_aliases_of(&trait_id.trait_items(db).items)
+    blaze_mem::frame::current(|frame| type_aliases_of(frame, &trait_id.trait_items(db).items))
 }
 
-fn type_aliases_of(items: &[(Name, AssocItemId)]) -> Box<[TypeAliasId]> {
-    items
-        .iter()
-        .filter_map(|&(_, assoc_id)| match assoc_id {
-            AssocItemId::TypeAliasId(it) => Some(it),
-            AssocItemId::FunctionId(_) | AssocItemId::ConstId(_) => None,
-        })
-        .collect()
+fn type_aliases_of(frame: &Frame, items: &[(Name, AssocItemId)]) -> Box<[TypeAliasId]> {
+    let mut aliases = Vec::new_in(frame);
+    aliases.extend(items.iter().filter_map(|&(_, assoc_id)| match assoc_id {
+        AssocItemId::TypeAliasId(it) => Some(it),
+        AssocItemId::FunctionId(_) | AssocItemId::ConstId(_) => None,
+    }));
+    // alloc: the memo, one block at its size
+    aliases.iter().copied().collect()
 }
 
 // These are firewall queries to prevent drawing dependencies between infers:
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
 pub fn rpit_hidden_types(
     db: &Db,
     function: FunctionId,
 ) -> ArenaMap<ImplTraitIdx, StoredEarlyBinder<StoredTy>> {
     let infer = InferenceResult::of(db, DefWithBodyId::from(function));
-    let mut result = ArenaMap::new();
+    // `insert` grows the map to the index it is given: sized once to the highest, nothing is
+    // shrunk after.
+    let len = infer
+        .return_position_impl_trait_types(db)
+        .map(|(opaque, _)| opaque.into_raw().into_u32() as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let interner = DbInterner::new_no_crate(db);
+    let mut result = ArenaMap::with_capacity(len);
     for (opaque, hidden_type) in infer.return_position_impl_trait_types(db) {
-        result.insert(opaque, StoredEarlyBinder::bind(hidden_type.store()));
+        result.insert(opaque, StoredEarlyBinder::bind(interner, hidden_type.store()));
     }
-    result.shrink_to_fit();
     result
 }
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
 pub fn tait_hidden_types(
     db: &Db,
     type_alias: TypeAliasId,
@@ -190,7 +198,7 @@ pub fn tait_hidden_types(
             let hidden_type = infcx.insert_type_vars(hidden_type.as_ref());
             match result.entry(opaque_idx) {
                 la_arena::Entry::Vacant(entry) => {
-                    entry.insert(StoredEarlyBinder::bind(hidden_type.store()));
+                    entry.insert(StoredEarlyBinder::bind(interner, hidden_type.store()));
                 }
                 la_arena::Entry::Occupied(entry) => {
                     _ = ocx.eq(
@@ -212,14 +220,16 @@ pub fn tait_hidden_types(
         match result.entry(idx) {
             la_arena::Entry::Vacant(entry) => {
                 entry.insert(StoredEarlyBinder::bind(
+                    interner,
                     Ty::new_error(interner, ErrorGuaranteed).store(),
                 ));
             }
             la_arena::Entry::Occupied(mut entry) => {
                 let hidden_type = entry.get().get().skip_binder();
-                let hidden_type =
-                    infcx.resolve_vars_if_possible(hidden_type).replace_infer_with_error(interner);
-                *entry.get_mut() = StoredEarlyBinder::bind(hidden_type.store());
+                let hidden_type = infcx
+                    .deeply_resolve_ignoring_regions(hidden_type)
+                    .replace_infer_with_error(interner);
+                *entry.get_mut() = StoredEarlyBinder::bind(interner, hidden_type.store());
             }
         }
     }
@@ -264,13 +274,19 @@ fn for_each_defining_body(
 /// The functions of the type alias's crate whose `#[define_opaque(..)]` names it: what its
 /// hidden types read of [`define_opaque_functions`], so another type alias's defining
 /// function added or removed leaves them as they were.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn defining_functions(db: &Db, type_alias: TypeAliasId) -> Box<[FunctionId]> {
-    define_opaque_functions(db, type_alias.loc(db).module(db).krate(db))
-        .iter()
-        .copied()
-        .filter(|&func| defined_type_aliases(db, func).any(|alias| alias == type_alias))
-        .collect()
+    blaze_mem::frame::current(|frame| {
+        let mut found = Vec::new_in(frame);
+        found.extend(
+            define_opaque_functions(db, type_alias.loc(db).module(db).krate(db))
+                .iter()
+                .copied()
+                .filter(|&func| defined_type_aliases(db, func).any(|alias| alias == type_alias)),
+        );
+        // alloc: the memo, one block at its size
+        found.iter().copied().collect()
+    })
 }
 
 /// The type aliases `func` names in its `#[define_opaque(..)]`.
@@ -293,19 +309,22 @@ fn defined_type_aliases(
 /// defines `SplitPathsRef` inside it. Of a crate that is not local, a body is lowered for its
 /// blocks when its text says `define_opaque` or may have it written by a macro or an attribute
 /// ([`may_hold`]), and always when a macro wrote the body itself.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn define_opaque_functions(db: &Db, krate: Crate) -> Box<[FunctionId]> {
     let local = krate.data(db).origin.is_local();
-    let mut result = Vec::new();
-    collect(db, krate, crate_def_map(db, krate), local, &mut result);
-    return result.into_boxed_slice();
+    return blaze_mem::frame::current(|frame| {
+        let mut result = Vec::new_in(frame);
+        collect(db, krate, crate_def_map(db, krate), local, &mut result);
+        // alloc: the memo, one block at its size
+        result.iter().copied().collect()
+    });
 
     fn collect(
         db: &Db,
         krate: Crate,
         def_map: &DefMap,
         local: bool,
-        result: &mut Vec<FunctionId>,
+        result: &mut Vec<FunctionId, &Frame>,
     ) {
         for (_, module) in def_map.modules(db) {
             let scope = module.scope(db);
@@ -334,7 +353,7 @@ fn define_opaque_functions(db: &Db, krate: Crate) -> Box<[FunctionId]> {
         krate: Crate,
         owner: DefWithBodyId,
         local: bool,
-        result: &mut Vec<FunctionId>,
+        result: &mut Vec<FunctionId, &Frame>,
     ) {
         if let DefWithBodyId::FunctionId(func) = owner
             && !AttrFlags::define_opaque(db, func).is_empty()
@@ -377,9 +396,13 @@ fn text_may_define_opaque<N: syntax::AstNode>(
 }
 
 /// Where the text of `file` says `define_opaque`.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn define_opaque_at(db: &Db, file: base_db::EditionedFileId) -> Box<[TextSize]> {
     let text = db.file_text(file.file_id(db)).text(db);
-    let found = text.match_indices("define_opaque").map(|(at, _)| TextSize::from(at as u32));
-    found.collect()
+    blaze_mem::frame::current(|frame| {
+        let mut found = Vec::new_in(frame);
+        found.extend(text.match_indices("define_opaque").map(|(at, _)| TextSize::from(at as u32)));
+        // alloc: the memo, one block at its size
+        found.iter().copied().collect()
+    })
 }

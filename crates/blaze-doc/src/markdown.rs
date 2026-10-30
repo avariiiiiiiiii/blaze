@@ -11,9 +11,9 @@ use pulldown_cmark::{
 use rustc_hash::FxHashMap;
 
 use crate::{
-    html::escape,
+    html::{Writer, escape},
     links,
-    model::{Doc, Target},
+    model::Doc,
 };
 
 /// The ids a page has used, so a heading in docs gets one of its own.
@@ -40,24 +40,24 @@ impl Ids {
 }
 
 /// How links and headings in one block of docs render.
-pub(crate) struct Context<'a> {
-    /// The URL of a target from the page, `None` where it has no documentation to point at.
-    pub(crate) url: &'a dyn Fn(&Target) -> Option<String>,
-    /// The title a resolved link shows on hover: `struct serde::Serialize`.
-    pub(crate) title: &'a dyn Fn(&Target) -> String,
+pub(crate) struct Context<'a, 'w> {
+    /// The page: a target's URL from it ([`Writer::url`], `None` where it has no documentation
+    /// to point at) and the title a resolved link shows on hover ([`Writer::title`]).
+    pub(crate) writer: &'a Writer<'w>,
     /// How far down a `#` heading goes: 1 makes it an `<h2>`.
     pub(crate) heading_offset: u32,
 }
 
 fn parser<'a, 'b>(
     markdown: &'a str,
+    // dyn: pulldown-cmark 0.9's `BrokenLinkCallback`, made once per block of docs.
     callback: &'b mut dyn FnMut(BrokenLink<'a>) -> Option<(CowStr<'a>, CowStr<'a>)>,
 ) -> Parser<'a, 'b> {
     Parser::new_with_broken_link_callback(markdown, links::options(), Some(callback))
 }
 
 /// The docs as a block of HTML.
-pub(crate) fn render(doc: &Doc, cx: &Context<'_>, ids: &mut Ids) -> String {
+pub(crate) fn render(doc: &Doc, cx: &Context<'_, '_>, ids: &mut Ids) -> String {
     let mut callback =
         |broken: BrokenLink<'_>| Some((broken.reference.to_string().into(), "".into()));
     let events: Vec<Event<'_>> = parser(&doc.markdown, &mut callback).collect();
@@ -68,7 +68,7 @@ pub(crate) fn render(doc: &Doc, cx: &Context<'_>, ids: &mut Ids) -> String {
 }
 
 /// The first paragraph as one line of HTML, for lists of items.
-pub(crate) fn summary(doc: &Doc, cx: &Context<'_>) -> String {
+pub(crate) fn summary(doc: &Doc, cx: &Context<'_, '_>) -> String {
     let first = crate::model::first_paragraph(&doc.markdown);
     // A reference link of the first paragraph is often defined further down.
     let mut none = |_: BrokenLink<'_>| None;
@@ -114,7 +114,7 @@ pub(crate) fn plain_summary(markdown: &str, limit: usize) -> String {
 fn rewrite<'a>(
     events: Vec<Event<'a>>,
     doc: &Doc,
-    cx: &Context<'_>,
+    cx: &Context<'_, '_>,
     mut ids: Option<&mut Ids>,
     inline: bool,
 ) -> Vec<Event<'a>> {
@@ -142,9 +142,9 @@ fn rewrite<'a>(
                             }
                             _ => inner,
                         };
-                        match (cx.url)(target) {
+                        match cx.writer.url(target) {
                             Some(url) => {
-                                let title: CowStr<'a> = (cx.title)(target).into();
+                                let title: CowStr<'a> = Writer::title(target).into();
                                 out.push(Event::Start(Tag::Link(
                                     LinkType::Inline,
                                     url.clone().into(),

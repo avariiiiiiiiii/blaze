@@ -2,26 +2,27 @@
 //! the syntax of a def's interface, and the module a `pub` item's own visibility and its
 //! modules' restrict it to.
 
-use hir::{Adt, FieldSource, HasSource, HasVisibility, InFile, ModuleDef, Visibility};
-use syntax::{AstNode, AstPtr, SyntaxNode, ast};
+use hir::{Adt, HasVisibility, InFile, ModuleDef, Visibility};
+use syntax::view::{self as ast, AstNode};
 
 use super::walk::Item;
 use crate::{cx::Cx, lints::names::effective::Def};
 
 /// The def of a walked item, as visibilities are kept.
-pub(super) fn def(cx: &Cx<'_, '_>, item: &Item) -> Option<Def> {
-    let node = item.node.as_ref();
+pub(super) fn def<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Option<Def> {
+    let node = item.node;
+    let sema = &cx.vsema;
     let def: ModuleDef = match node.value {
-        ast::Item::Fn(it) => cx.sema.to_def2(node.with_value(it))?.into(),
-        ast::Item::Struct(it) => Adt::from(cx.sema.to_def2(node.with_value(it))?).into(),
-        ast::Item::Enum(it) => Adt::from(cx.sema.to_def2(node.with_value(it))?).into(),
-        ast::Item::Union(it) => Adt::from(cx.sema.to_def2(node.with_value(it))?).into(),
-        ast::Item::Trait(it) => cx.sema.to_def2(node.with_value(it))?.into(),
-        ast::Item::Const(it) => cx.sema.to_def2(node.with_value(it))?.into(),
-        ast::Item::Static(it) => cx.sema.to_def2(node.with_value(it))?.into(),
-        ast::Item::TypeAlias(it) => cx.sema.to_def2(node.with_value(it))?.into(),
-        ast::Item::Module(it) => cx.sema.to_def2(node.with_value(it))?.into(),
-        ast::Item::Impl(it) => return Some(Def::Impl(cx.sema.to_def2(node.with_value(it))?)),
+        ast::Item::Fn(it) => sema.to_def2(node.with_value(it))?.into(),
+        ast::Item::Struct(it) => Adt::from(sema.to_def2(node.with_value(it))?).into(),
+        ast::Item::Enum(it) => Adt::from(sema.to_def2(node.with_value(it))?).into(),
+        ast::Item::Union(it) => Adt::from(sema.to_def2(node.with_value(it))?).into(),
+        ast::Item::Trait(it) => sema.to_def2(node.with_value(it))?.into(),
+        ast::Item::Const(it) => sema.to_def2(node.with_value(it))?.into(),
+        ast::Item::Static(it) => sema.to_def2(node.with_value(it))?.into(),
+        ast::Item::TypeAlias(it) => sema.to_def2(node.with_value(it))?.into(),
+        ast::Item::Module(it) => sema.to_def2(node.with_value(it))?.into(),
+        ast::Item::Impl(it) => return Some(Def::Impl(sema.to_def2(node.with_value(it))?)),
         _ => return None,
     };
     Some(Def::Item(def))
@@ -30,7 +31,7 @@ pub(super) fn def(cx: &Cx<'_, '_>, item: &Item) -> Option<Def> {
 /// The module a def is visible in as its own visibility and its modules' say, `None` for
 /// everywhere: rustc's effective visibility of a `pub` item that is not reachable, without
 /// what `use`s re-export it to.
-pub(super) fn restricted_to(cx: &Cx<'_, '_>, item: &Item) -> Option<hir::Module> {
+pub(super) fn restricted_to<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Option<hir::Module> {
     if item.in_body.is_some() {
         return Some(cx.krate.root_module(cx.db));
     }
@@ -68,27 +69,22 @@ fn deeper(cx: &Cx<'_, '_>, at: Option<hir::Module>, other: hir::Module) -> hir::
 }
 
 /// The syntax of a def's interface, parsed as the semantics have it.
-pub(super) fn interface_node(cx: &Cx<'_, '_>, def: Def) -> Option<InFile<SyntaxNode>> {
-    fn of<N: AstNode>(cx: &Cx<'_, '_>, src: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
-        let src = src?;
-        let node = cx.node(src.as_ref().map(AstPtr::new));
-        Some(node.map(|it| it.syntax().clone()))
+pub(super) fn interface_node<'db>(cx: &Cx<'_, 'db>, def: Def) -> Option<InFile<ast::Node<'db>>> {
+    fn of<'db, N: AstNode<'db>>(src: Option<InFile<N>>) -> Option<InFile<ast::Node<'db>>> {
+        Some(src?.map(|it| it.syntax()))
     }
-    let db = cx.db;
+    let sema = &cx.vsema;
     match def {
-        Def::Item(ModuleDef::Function(it)) => of(cx, it.source(db)),
-        Def::Item(ModuleDef::Adt(Adt::Struct(it))) => of(cx, it.source(db)),
-        Def::Item(ModuleDef::Adt(Adt::Union(it))) => of(cx, it.source(db)),
-        Def::Item(ModuleDef::Adt(Adt::Enum(it))) => of(cx, it.source(db)),
-        Def::Item(ModuleDef::Trait(it)) => of(cx, it.source(db)),
-        Def::Item(ModuleDef::TypeAlias(it)) => of(cx, it.source(db)),
-        Def::Item(ModuleDef::Const(it)) => of(cx, it.source(db)),
-        Def::Item(ModuleDef::Static(it)) => of(cx, it.source(db)),
-        Def::Impl(it) => of(cx, it.source(db)),
-        Def::Field(it) => match it.source(db)? {
-            InFile { file_id, value: FieldSource::Named(it) } => of(cx, Some(InFile::new(file_id, it))),
-            InFile { file_id, value: FieldSource::Pos(it) } => of(cx, Some(InFile::new(file_id, it))),
-        },
+        Def::Item(ModuleDef::Function(it)) => of(sema.source(it)),
+        Def::Item(ModuleDef::Adt(Adt::Struct(it))) => of(sema.source(it)),
+        Def::Item(ModuleDef::Adt(Adt::Union(it))) => of(sema.source(it)),
+        Def::Item(ModuleDef::Adt(Adt::Enum(it))) => of(sema.source(it)),
+        Def::Item(ModuleDef::Trait(it)) => of(sema.source(it)),
+        Def::Item(ModuleDef::TypeAlias(it)) => of(sema.source(it)),
+        Def::Item(ModuleDef::Const(it)) => of(sema.source(it)),
+        Def::Item(ModuleDef::Static(it)) => of(sema.source(it)),
+        Def::Impl(it) => of(sema.source(it)),
+        Def::Field(it) => of(sema.source(it)),
         _ => None,
     }
 }

@@ -20,6 +20,7 @@ Why: `rg '\bena::' crates/hir-ty` finds nothing; only comments mention it.
 it.
 
 > forwarded to db: `crates/hir-ty/Cargo.toml` is lane db's.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree: `crates/hir-ty/Cargo.toml` has no `ena`.
 
 ## 2. db-ty-hir (sibling), `crates/hir-ty-wfcheck/src/outlives.rs`, `Wfcx::needs_since`
 
@@ -45,6 +46,7 @@ with
 `mark()`'s `.constraints.len()` compiles unchanged.
 
 > forwarded to db: `crates/hir-ty-wfcheck/` is lane db's.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/src/outlives.rs:489-492`: `.constraints.iter_from(mark.1)`, collected into the task's frame (`mem::collect`) rather than a heap `Vec`.
 
 ## 3. db-ty-borrowck (sibling), `crates/hir-ty-borrowck/src/regions.rs`
 
@@ -69,6 +71,7 @@ with
 The `.constraints.len()` calls compile unchanged.
 
 > forwarded to db: `crates/hir-ty-borrowck/` is lane db's.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-borrowck/src/regions.rs:6590` (`constraint_pairs` takes an iterator, extending a frame `FVec` in place of returning a `Vec`), callers at :6348, :6647, :7368 (`iter_from`) and :7551; `rg 'constraints\['` finds no slicing left.
 
 ## 4. db-ty-solver (sibling), `crates/hir-ty/src/next_solver/solver.rs`
 
@@ -96,3 +99,4 @@ cache in `InferCtxtBuilder::build` now reads "Solving needs the crate's trait en
 solver cache."
 
 > forwarded to db: `next_solver/solver.rs` is lane db's.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/next_solver/solver.rs:465-495` (`make_deduplicated_region_constraints_into` takes `query_region_constraints()`'s rows by value with each row's visibility, no `match *constraint`) and `:344-348` (`InferCtxt::leak_check(&self.0, max_input_universe, None)`).

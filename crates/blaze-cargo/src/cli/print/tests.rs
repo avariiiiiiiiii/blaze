@@ -1,12 +1,28 @@
 use std::time::Duration;
 
 use blaze_api::{
-    ApiError, Artifact, Diagnostic, Level, Response, Span, UnitOf, UnitProfile, UnitStarted, Verb,
+    ApiError, Artifact, ArtifactKind, Diagnostic, Level, Response, Span, UnitOf, UnitProfile, UnitStarted, Verb,
 };
 use blaze_ids::ContentId;
 
 use super::*;
 use crate::cli::say::tests::target;
+
+/// `response` printed as the client reads it: from the bytes the daemon sends, in place.
+fn on<O: Write, E: Write>(printer: &mut Printer<'_, O, E>, response: &Response) -> io::Result<()> {
+    let bytes = blaze_protocol::cbor::to_vec(response).unwrap();
+    printer.on(blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(&bytes).unwrap())
+}
+
+/// The daemon's index of the package and of its lib unit, by name: `foo` 0, `bar` 1, `p<n>`
+/// `n + 2`.
+fn id_of(name: &str) -> u32 {
+    match name {
+        "foo" => 0,
+        "bar" => 1,
+        other => other[1..].parse::<u32>().unwrap() + 2,
+    }
+}
 
 #[test]
 fn message_formats_as_cargo_reads_them() {
@@ -35,11 +51,13 @@ fn started(name: &str, verb: Verb) -> Response {
         version: "0.1.0".to_owned(),
         source: Some(format!("(/w/{name})")),
         verb,
+        package: id_of(name),
     })
 }
 
 fn lib_of(name: &str) -> UnitOf {
     UnitOf {
+        id: id_of(name),
         package_id: format!("path+file:///w/{name}#0.1.0"),
         manifest_path: format!("/w/{name}/Cargo.toml"),
         target: target("lib", name),
@@ -57,6 +75,7 @@ fn diagnostic(level: Level, message: &str, rendered: &str, unit: Option<UnitOf>)
         facts: Vec::new(),
         rendered: rendered.to_owned(),
         unit,
+        explanation: None,
     }
 }
 
@@ -72,7 +91,7 @@ fn fixable(mut warning: Diagnostic) -> Diagnostic {
         byte_end: 5,
         primary: true,
         replacement: Some("_x".to_owned()),
-        applicability: Some("MachineApplicable".to_owned()),
+        applicability: Some(Applicability::MachineApplicable),
     };
     let mut help = diagnostic(Level::Help, "prefix it with an underscore", "", None);
     help.spans.push(span);
@@ -83,7 +102,7 @@ fn fixable(mut warning: Diagnostic) -> Diagnostic {
 fn built() -> Response {
     let artifact = Artifact {
         package: "path+file:///w/foo#0.1.0".to_owned(),
-        kind: "lib".to_owned(),
+        kind: ArtifactKind::Lib,
         path: "/w/foo/target/debug/libfoo.rlib".to_owned(),
         content: ContentId([0; 32]),
         manifest_path: "/w/foo/Cargo.toml".to_owned(),
@@ -111,7 +130,7 @@ fn printed(shown: Shown, responses: &[Response], ok: bool) -> (String, String) {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut err);
     for response in responses {
-        printer.on(response.clone()).unwrap();
+        on(&mut printer, response).unwrap();
     }
     printer.finish(ok, Duration::from_millis(1234)).unwrap();
     drop(printer);
@@ -181,11 +200,12 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
         found: 3,
         green: 40,
         reran: 2,
+        served: Vec::new(),
         compiled: 1,
         critical_path_us: 1500,
     };
     let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
-    let (out, _) = printed(json, &[Response::Work(worked), Response::Done { ok: true }], true);
+    let (out, _) = printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
     assert_eq!(
         out,
         "{\"reason\": \"blaze-work\", \"reran\": 2, \"green\": 40, \"compiled\": 1, \"found\": 3, \"link\": \
@@ -193,6 +213,44 @@ fn what_a_request_did_is_one_json_line_of_blazes() {
     );
     let (out, _) = printed(Shown::default(), &[Response::Work(worked), Response::Done { ok: true }], true);
     assert_eq!(out, "", "under the human format it is not printed");
+}
+
+#[test]
+fn each_dependency_crate_is_one_served_line_after_the_work() {
+    use blaze_api::{ServedCrate, ServedPart};
+    let worked = blaze_api::Worked {
+        link: blaze_api::LinkKind::Placed,
+        found: 0,
+        green: 0,
+        reran: 1,
+        served: vec![
+            ServedCrate { why: None, bodies: ServedPart::Served, outcome: ServedPart::Served, package: "itoa".to_owned() },
+            ServedCrate {
+                why: Some("the \"std\" feature".to_owned()),
+                bodies: ServedPart::Refused,
+                outcome: ServedPart::Checked,
+                package: "serde".to_owned(),
+            },
+        ],
+        compiled: 0,
+        critical_path_us: 7,
+    };
+    let json = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: false }, ..Shown::default() };
+    let (out, _) = printed(json, &[Response::Work(worked.clone()), Response::Done { ok: true }], true);
+    assert_eq!(
+        out,
+        concat!(
+            "{\"reason\": \"blaze-work\", \"reran\": 1, \"green\": 0, \"compiled\": 0, \"found\": 0, \"link\": \
+             \"placed\", \"critical_path_us\": 7}\n",
+            "{\"reason\": \"blaze-served\", \"package\": \"itoa\", \"outcome\": \"served\", \"bodies\": \"served\", \
+             \"why\": null}\n",
+            "{\"reason\": \"blaze-served\", \"package\": \"serde\", \"outcome\": \"checked\", \"bodies\": \"refused\", \
+             \"why\": \"the \\\"std\\\" feature\"}\n",
+            "{\"reason\":\"build-finished\",\"success\":true}\n",
+        )
+    );
+    let (out, _) = printed(Shown::default(), &[Response::Work(worked), Response::Done { ok: true }], true);
+    assert_eq!(out, "", "under the human format none is printed");
 }
 
 #[test]
@@ -255,6 +313,16 @@ fn rustcs_summary_is_skipped_under_json_too() {
 }
 
 #[test]
+fn the_note_to_explain_that_short_leaves_empty_is_not_written() {
+    let explain = "For more information about this error, try `rustc --explain E0425`.";
+    let short_json = Shown { format: Format::Json { short: true, ansi: false, render_diagnostics: false }, ..Shown::default() };
+    for shown in [Shown { format: Format::Short, ..Shown::default() }, short_json] {
+        let note = diagnostic(Level::FailureNote, explain, "", Some(lib_of("foo")));
+        assert_eq!(printed(shown, &[Response::Diagnostic(note)], true), printed(shown, &[], true));
+    }
+}
+
+#[test]
 fn one_rendered_text_is_printed_once_with_or_without_its_newline() {
     let first = diagnostic(Level::Warning, "unused variable: `x`", "warning: a\n", Some(lib_of("foo")));
     let second = diagnostic(Level::Warning, "unused variable: `x`", "warning: a", Some(lib_of("foo")));
@@ -266,13 +334,51 @@ fn one_rendered_text_is_printed_once_with_or_without_its_newline() {
 #[test]
 fn units_of_one_package_are_told_apart() {
     let lib = diagnostic(Level::Warning, "a", "warning: a\n", Some(lib_of("foo")));
-    let test = diagnostic(Level::Warning, "a", "warning: b\n", Some(UnitOf { test: true, ..lib_of("foo") }));
+    let test = diagnostic(Level::Warning, "a", "warning: b\n", Some(UnitOf { id: 100, test: true, ..lib_of("foo") }));
     let responses = [Response::Diagnostic(lib), Response::Diagnostic(test), Response::Done { ok: true }];
     let (_, err) = printed(Shown::default(), &responses, true);
     assert_eq!(
         err,
         "warning: a\nwarning: b\nwarning: `foo` (lib) generated 1 warning\nwarning: `foo` (lib test) generated 1 warning\n"
     );
+}
+
+/// Each `write` call, with whether it went to stdout.
+struct Logged<'a> {
+    out: bool,
+    log: &'a std::cell::RefCell<Vec<(bool, String)>>,
+}
+
+impl Write for Logged<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.log.borrow_mut().push((self.out, String::from_utf8(bytes.to_vec()).unwrap()));
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn lines_of_one_stream_in_one_write_and_both_in_the_order_made() {
+    let log = std::cell::RefCell::new(Vec::new());
+    let (mut out, mut err) = (Logged { out: true, log: &log }, Logged { out: false, log: &log });
+    let shown = Shown { format: Format::Json { short: false, ansi: false, render_diagnostics: true }, ..Shown::default() };
+    let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut err);
+    let warning = diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(lib_of("foo")));
+    for response in [started("foo", Verb::Compiling), started("bar", Verb::Compiling), built(), Response::Diagnostic(warning)] {
+        on(&mut printer, &response).unwrap();
+    }
+    printer.finish(true, Duration::from_millis(1234)).unwrap();
+    drop(printer);
+    let log = log.into_inner();
+    let streams: Vec<bool> = log.iter().map(|it| it.0).collect();
+    assert_eq!(streams, [false, true, false, true], "{log:#?}");
+    assert_eq!(log[0].1, "   Compiling foo v0.1.0 (/w/foo)\n   Compiling bar v0.1.0 (/w/bar)\n");
+    assert!(log[1].1.starts_with("{\"reason\":\"compiler-artifact\""), "{}", log[1].1);
+    assert!(log[2].1.starts_with("warning: unused variable") && log[2].1.ends_with("Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.23s\n"), "{}", log[2].1);
+    assert_eq!(log[3].1, "{\"reason\":\"build-finished\",\"success\":true}\n");
 }
 
 /// A build's responses: each unit starting, warnings, artifacts, a unit ending.
@@ -292,7 +398,8 @@ fn a_build(n: usize) -> Vec<Response> {
 }
 
 /// The printer allocates per request, not per response: once its buffers have grown and the
-/// units are known, printing a build's responses allocates nothing, in every format.
+/// units are known, reading a build's responses where they lie in the daemon's bytes and
+/// printing them allocates nothing, in every format.
 #[test]
 fn printing_responses_warm_allocates_nothing() {
     let formats = [
@@ -301,27 +408,47 @@ fn printing_responses_warm_allocates_nothing() {
         Format::Json { short: false, ansi: false, render_diagnostics: false },
         Format::Json { short: false, ansi: true, render_diagnostics: true },
     ];
+    let sent: Vec<Vec<u8>> = a_build(64).iter().map(|it| blaze_protocol::cbor::to_vec(it).unwrap()).collect();
     for format in formats {
         for verbose in [0, 1] {
             let shown = Shown { format, verbose, color: true, ..Shown::default() };
             let (mut out, mut err) = (Vec::with_capacity(1 << 20), Vec::with_capacity(1 << 20));
             let mut printer = Printer::new(shown, Path::new("/w"), &mut out, &mut err);
-            for response in a_build(64) {
-                printer.on(response).unwrap();
+            for bytes in &sent {
+                printer.on(blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(bytes).unwrap()).unwrap();
             }
+            printer.flush().unwrap();
             printer.printed.clear();
-            printer.named.clear();
-            for seen in &mut printer.units {
-                seen.counted = Counted::default();
+            printer.packages.clear();
+            for counted in &mut printer.counted {
+                *counted = Counted::default();
             }
-            let responses = a_build(64);
             blaze_alloc_count::assert_at_most(0, "printing a warm build's responses", || {
-                for response in responses {
-                    printer.on(response).unwrap();
+                for bytes in &sent {
+                    printer.on(blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(bytes).unwrap()).unwrap();
                 }
             });
+            assert!(!printer.refused());
         }
     }
+}
+
+#[test]
+fn a_unit_or_package_numbered_past_any_request_fails_the_build_naming_it() {
+    let far = UnitOf { id: u32::MAX, ..lib_of("foo") };
+    let warning = diagnostic(Level::Warning, "unused variable: `x`", UNUSED, Some(far));
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut printer = Printer::new(Shown::default(), Path::new("/w"), &mut out, &mut err);
+    on(&mut printer, &Response::Diagnostic(warning)).unwrap();
+    assert!(printer.refused());
+    printer.finish(false, Duration::from_millis(1)).unwrap();
+    drop(printer);
+    let err = String::from_utf8(err).unwrap();
+    assert!(err.ends_with("error: the daemon numbered a unit 4294967295, past the 16777216 a request's indexes stay under\n"), "{err}");
+
+    let Response::Unit(unit) = started("foo", Verb::Compiling) else { unreachable!() };
+    let (_, err) = printed(Shown::default(), &[Response::Unit(UnitStarted { package: 1 << 24, ..unit })], false);
+    assert_eq!(err, "error: the daemon numbered a package 16777216, past the 16777216 a request's indexes stay under\n");
 }
 
 #[test]

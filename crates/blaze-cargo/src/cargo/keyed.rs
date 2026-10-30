@@ -17,6 +17,8 @@ use std::path::Path;
 
 use sha2::{Digest as _, Sha256};
 
+use crate::content::hex;
+
 /// How many read sets one first key may have: past that, what is made is not kept.
 const SLOTS: u32 = 16;
 
@@ -129,10 +131,6 @@ pub fn toolchain(sysroot: &Path) -> String {
     format!("{manifest}/{lib}")
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|it| format!("{it:02x}")).collect()
-}
-
 fn slot(first: &[u8; 32], at: u32) -> [u8; 32] {
     let mut key = Key::new("read set");
     key.field(first).field(&at.to_le_bytes());
@@ -140,7 +138,7 @@ fn slot(first: &[u8; 32], at: u32) -> [u8; 32] {
 }
 
 /// The second key: of `first`, the paths of `reads` and what each has now, as `now` says.
-fn second(first: &[u8; 32], reads: &[String], now: &dyn Fn(&str) -> String) -> [u8; 32] {
+fn second(first: &[u8; 32], reads: &[String], now: &impl Fn(&str) -> String) -> [u8; 32] {
     let mut key = Key::new("made of");
     key.field(first);
     for path in reads {
@@ -166,7 +164,7 @@ fn set_of(bytes: &[u8]) -> Option<Vec<String>> {
 pub fn find(
     store: &blaze_store::Store,
     first: &[u8; 32],
-    now: &dyn Fn(&str) -> String,
+    now: &impl Fn(&str) -> String,
 ) -> Option<(Vec<u8>, Vec<String>)> {
     for at in 0..SLOTS {
         let reads = set_of(&store.get(&slot(first, at))?)?;
@@ -184,7 +182,7 @@ pub fn keep(
     store: &blaze_store::Store,
     first: &[u8; 32],
     reads: &[String],
-    now: &dyn Fn(&str) -> String,
+    now: &impl Fn(&str) -> String,
     value: &[u8],
 ) {
     let mut reads = reads.to_vec();
@@ -253,15 +251,68 @@ mod tests {
     }
 
     #[test]
+    fn a_closure_now_keys_as_its_answers_say() {
+        let first = Key::new("test").done();
+        let reads = vec!["a".to_owned(), "b".to_owned()];
+        let one = |path: &str| format!("{path}=1");
+        let same = |path: &str| format!("{path}=1");
+        let other = |path: &str| format!("{path}=2");
+        assert_eq!(second(&first, &reads, &one), second(&first, &reads, &same));
+        assert_ne!(second(&first, &reads, &one), second(&first, &reads, &other));
+        let name = format!("BLAZE_KEYED_TEST_{}", std::process::id());
+        let wrapped = |path: &str| digest(path);
+        let unset = vec![var(&name)];
+        assert_eq!(second(&first, &unset, &wrapped), second(&first, &unset, &digest));
+    }
+
+    #[test]
     fn a_variable_read_is_its_value() {
+        use std::ffi::OsStr;
         let name = format!("BLAZE_KEYED_TEST_{}", std::process::id());
         assert_eq!(digest(&var(&name)), "-");
-        // SAFETY: no other thread of this test reads this variable.
-        unsafe { std::env::set_var(&name, "1") };
-        let set = digest(&var(&name));
+        let path = std::env::var_os("PATH");
+        assert_eq!(digest(&var("PATH")), value_digest(path.as_deref()));
+        let set = value_digest(Some(OsStr::new("1")));
         assert!(set.starts_with('='), "{set}");
-        unsafe { std::env::set_var(&name, "2") };
-        assert_ne!(digest(&var(&name)), set);
-        unsafe { std::env::remove_var(&name) };
+        assert_eq!(value_digest(Some(OsStr::new("1"))), set);
+        assert_ne!(value_digest(Some(OsStr::new("2"))), set);
+        assert_eq!(value_digest(None), "-");
+    }
+
+    /// The variable a run of [`a_variable_read_in_a_child_is_its_value`] in a child process
+    /// reads, which the parent gives it with `Command::env`: no test sets the environment of
+    /// its own process, which another test's C code could be reading.
+    const CHILD_VAR: &str = "BLAZE_KEYED_TEST_CHILD_VAR";
+    /// What the child is to find `digest` say of [`CHILD_VAR`]; set only in the child.
+    const CHILD_WANTS: &str = "BLAZE_KEYED_TEST_CHILD_WANTS";
+
+    #[test]
+    fn a_variable_read_in_a_child_is_its_value() {
+        if let Some(wants) = std::env::var_os(CHILD_WANTS) {
+            assert_eq!(digest(&var(CHILD_VAR)), wants.to_str().unwrap());
+            return;
+        }
+        let child = |value: Option<&str>, wants: &str| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", "cargo::keyed::tests::a_variable_read_in_a_child_is_its_value"])
+                .args(["--test-threads=1", "--quiet"])
+                .env(CHILD_WANTS, wants)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            match value {
+                Some(value) => command.env(CHILD_VAR, value),
+                None => command.env_remove(CHILD_VAR),
+            };
+            command.status().unwrap().success()
+        };
+        let one = value_digest(Some(std::ffi::OsStr::new("1")));
+        let two = value_digest(Some(std::ffi::OsStr::new("2")));
+        assert!(child(Some("1"), &one));
+        assert!(child(Some("2"), &two));
+        assert!(child(None, "-"));
+        // The child runs the check: one told to want another value fails.
+        assert!(!child(Some("1"), &two));
     }
 }

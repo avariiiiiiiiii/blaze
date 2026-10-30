@@ -17,16 +17,21 @@ use blaze_diagnostics::{Options, lints::CommandLine};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::CodeHash;
 use blaze_units::schema::Unit;
+use hir_ty_codegen::v2::BodyChecks;
 use load_cargo::v2::{ProcMacroLoadResult, ProcMacroLoadingError};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Job, UnitReader, artifact, checks_only, graph,
+    Job, Real, UnitReader, artifact,
+    checks::Checking,
+    checks_only, graph,
     codegen::{self, Makes},
     files::Mounted,
     say, script,
 };
-use crate::serve::work::{Compiled, Failed, Goal, Image, Output, Put};
+use crate::serve::work::{Compiled, Failed, Goal, Output, Put};
+
+type Image = crate::serve::work::Image<Real>;
 
 /// What a compiled unit made that later work of the job reads.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
@@ -53,7 +58,8 @@ pub(crate) struct TestOf {
     pub(crate) bench: bool,
     /// It reaches the outside world, as codegen marks it: it always runs.
     pub(crate) outside: bool,
-    /// The code hashes of what it reaches, in the walk's order.
+    /// What it reaches, sorted and each once: every code hash, argument and static value
+    /// (`Built::reached`), and a hash of each span table of its binary.
     pub(crate) reached: Vec<CodeHash>,
 }
 
@@ -79,6 +85,8 @@ struct RecordRef<'a> {
 
 const RECORD: &str = "blaze v2 cargo unit record 3";
 const OUTPUT: &str = "blaze v2 cargo output 1";
+/// A span table's anchor and content, as a test's selection holds it.
+const SPANS: &str = "blaze v2 cargo test spans 1";
 
 /// The record's fixed header, which `fresh` reads where the store has it, allocating nothing:
 /// `MAGIC`, the count of outputs and of native inputs (`u32` LE each), each output's key
@@ -179,6 +187,8 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
         Goal::Reach => 4,
     };
     let runs = runs(job, unit);
+    // An inert script's compile makes nothing, unless `BLAZE_ELIDE=verify` builds it to run it.
+    let verified = u.target.is_custom_build() && script::verifies(job)? && script::inert(job, unit).is_some();
     let mut hasher = Hasher::new(RECORD);
     hasher.id(&identity);
     // The unit, its plan and its run environment, each encoded into one buffer kept per
@@ -188,8 +198,15 @@ fn work_out_key(job: &Job, unit: usize, identity: ContentId) -> Result<Key, ApiE
         hash_cbor(&mut hasher, scratch, plan, "plan", unit)?;
         hash_cbor(&mut hasher, scratch, &runs.env, "run environment", unit)
     })?;
-    hasher.id(&toolchain.id).update(&[goal, u8::from(job.input.color), u8::from(job.input.short)]);
+    hasher.id(&toolchain.id).update(&[goal, u8::from(job.input.color), u8::from(job.input.short), u8::from(verified)]);
     Ok(Key(hasher.finish()))
+}
+
+/// Whether `unit` is a build script elision found inert, so neither built nor run: under
+/// `BLAZE_ELIDE=verify` it is built and run as well.
+fn elided_unbuilt(job: &Job, unit: usize) -> Result<bool, ApiError> {
+    let custom_build = job.unit(unit)?.target.is_custom_build();
+    Ok(custom_build && !script::verifies(job)? && script::inert(job, unit).is_some())
 }
 
 fn hash_cbor<T: Serialize + ?Sized>(
@@ -368,6 +385,13 @@ fn macros(job: &Job, unit: usize, compiled: &Compiled, made: &Made) -> Option<Pr
     }
 }
 
+/// The lint flags of unit `unit`'s check, as `make` gives them.
+pub(crate) fn unit_lint_flags(job: &Job, unit: usize) -> Result<Vec<String>, ApiError> {
+    let u = job.unit(unit)?;
+    let package = job.package(u)?;
+    Ok(lint_flags(u, job.plan(unit)?, local(package.source.as_deref())))
+}
+
 /// The lint flags of `unit`'s rustc: cargo's `[lints]`, those of its rustflags, its
 /// `--check-cfg`s, and `--cap-lints allow` for a package cargo shows no warnings of (one not
 /// from a path, and the standard library).
@@ -420,18 +444,61 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
     let u = job.unit(unit)?;
     let plan = job.plan(unit)?;
     let package = job.package(u)?;
-    let unit_of = job.unit_of(u)?;
+    let unit_of = job.unit_of(unit)?;
     let color = job.input.color;
     let krate = job.crates.krate(unit).ok_or_else(|| {
         ApiError::new(format!("unit {unit} (`{}`) has no crate in the front end", u.target.name), None)
     })?;
     let mounted = &job.mounted;
     let files = blaze_diagnostics::Files::new(reader.paths(), mounted.root());
-    let lints = CommandLine::parse(&lint_flags(u, plan, local(package.source.as_deref())))
+    let flags = lint_flags(u, plan, local(package.source.as_deref()));
+    let mut lints = CommandLine::parse(&flags)
         .map_err(|why| ApiError::new(why, Some(format!("the lint flags of `{}`", u.target.name))))?;
+    // Every crate blaze builds is built as cargo builds it, with `CARGO_CRATE_NAME` set.
+    lints.check_cfg.cargo = true;
     let options = Options { lints, ..Options::default() };
     let db = reader.db();
-    let diags = blaze_diagnostics::check_crate(db, hir::Crate::from(krate), files, &options);
+    let inert = elided_unbuilt(job, unit)?;
+    let builds_code = !inert && !checks_only(job.input.goal, u);
+    let served = blaze_diagnostics::cache::read(db, reader.checks(), krate, mounted.root());
+    // Declared before `generated`: the build's front end borrows it until `generated` is dropped.
+    let checking;
+    let (diags, generated) = match served {
+        Some(Err(why)) => return Err(ApiError::new(why, Some(u.target.name.clone())).into()),
+        // A dependency's check outcome from the store: no check runs, and codegen reads the
+        // bodies' records served with it.
+        Some(Ok(outcome)) => {
+            let generated = builds_code.then(|| {
+                let makes = codegen::makes(u)?;
+                Ok::<_, String>((makes, codegen::generate(job, reader, unit, &makes, mounted, None)))
+            });
+            (outcome.diags, generated)
+        }
+        None => {
+            checking = Checking::new(db, hir::Crate::from(krate));
+            let (diags, generated) = match builds_code {
+                false => (checking.alone(db, files, &options), None),
+                true => {
+                    let (diags, generated) = checking.alongside(db, files, &options, || {
+                        let makes = codegen::makes(u)?;
+                        // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
+                        let checks: &dyn BodyChecks = &checking;
+                        let generated = codegen::generate(job, reader, unit, &makes, mounted, Some(checks));
+                        Ok::<_, String>((makes, generated))
+                    });
+                    (diags, Some(generated))
+                }
+            };
+            if hir_def::deps::eligible(db, krate) {
+                let paths = blaze_diagnostics::cache::Paths::of(db, krate);
+                // alloc: the outcome encoded once more per dependency crate checked, for its report line
+                let refused = blaze_diagnostics::cache::encode(&diags, &paths, mounted.root()).err().map(|it| it.to_string());
+                // clone: once per dependency crate checked this build
+                job.check_later(krate, flags, diags.clone(), refused);
+            }
+            (diags, generated)
+        }
+    };
     let sources = mounted.sources(&diags);
     let style = blaze_diagnostics::emit::Style { ansi: color, short: job.input.short, ..Default::default() };
     let diagnostics: Vec<Diagnostic> = diags
@@ -459,69 +526,92 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
     // What each file rustc would write holds: (path, bytes, executable).
     let mut files: Vec<(String, Vec<u8>, bool)> = Vec::new();
     let identity = identity(job, unit);
-    if u.target.is_custom_build() && script::inert(job, unit).is_some() {
+    if inert {
         // A build script that does nothing is not run, so not built: what it prints is known.
         return Ok(nothing(diagnostics, true, made));
     }
-    if checks_only(job.input.goal, u) {
-        for path in artifact::made(plan) {
-            files.push((path.to_owned(), crate_record(u, identity, &[]), false));
-        }
-    } else {
-        let makes = match codegen::makes(u) {
-            Ok(it) => it,
-            Err(what) => {
-                diagnostics.push(say::refused(what, Some(unit_of), color));
-                return Ok(nothing(diagnostics, false, made));
+    match generated {
+        None => {
+            for path in artifact::made(plan) {
+                files.push((path.to_owned(), crate_record(u, identity, &[]), false));
             }
-        };
-        let mut generated = match codegen::generate(job, reader, unit, &makes, mounted)
-            .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?
-        {
-            Ok(it) => it,
-            Err(errors) => {
-                let what = crate::refused_error(&u.target.name, errors.len(), errors.into_iter());
-                diagnostics.push(say::refused(what, Some(unit_of), color));
-                return Ok(nothing(diagnostics, false, made));
-            }
-        };
-        if job.cancelled() {
-            return Err(Failed::Again);
         }
-        let built_puts = std::mem::take(&mut generated.built.puts);
-        puts.reserve(built_puts.len() + plan.outputs.len());
-        puts.extend(built_puts.into_iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes }));
-        made.context = Some(context(&generated.policy));
-        made.inputs = generated.built.inputs.iter().map(|(key, code)| (key.0, code.0)).collect();
-        for test in &generated.roots.tests {
-            let root = generated.built.roots.get(test.root).ok_or_else(|| {
-                ApiError::new(format!("test `{}` has no root among the build's", test.name), Some(u.target.name.clone()))
-            })?;
-            let reached = generated.built.reached(root);
-            made.tests.push(TestOf {
-                name: test.name.clone(),
-                ignore: test.ignore,
-                should_panic: test.should_panic.clone(),
-                bench: test.bench,
-                outside: test.outside,
-                reached,
-            });
+        Some(Err(what)) => {
+            diagnostics.push(say::refused(what, Some(unit_of), color));
+            return Ok(nothing(diagnostics, false, made));
         }
-        let roots: Vec<ContentId> = generated.built.roots.iter().map(|it| it.0).collect();
-        for path in artifact::made(plan) {
-            let library = path.ends_with(".rlib") || path.ends_with(".rmeta");
-            if library || makes == Makes::Library {
-                files.push((path.to_owned(), crate_record(u, identity, &roots), false));
-                continue;
+        Some(Ok((makes, generated))) => {
+            let mut generated =
+                match generated.map_err(|what| ApiError::new(what, Some(u.target.name.clone())))? {
+                    Ok(it) => it,
+                    Err(errors) => {
+                        let what = crate::refused_error(&u.target.name, errors.len(), errors.into_iter());
+                        diagnostics.push(say::refused(what, Some(unit_of), color));
+                        return Ok(nothing(diagnostics, false, made));
+                    }
+                };
+            if job.cancelled() {
+                return Err(Failed::Again);
             }
-            match codegen::link(job, unit, path, &makes, &generated, images) {
-                Ok((bytes, read)) => {
-                    natives.extend(read);
-                    files.push((path.to_owned(), bytes, true));
+            let built_puts = std::mem::take(&mut generated.built.puts);
+            puts.reserve(built_puts.len() + plan.outputs.len());
+            puts.extend(built_puts.into_iter().map(|it| Put { key: it.key, kind: it.kind, bytes: it.bytes }));
+            made.context = Some(context(&generated.policy));
+            made.inputs = generated.built.inputs.iter().map(|(key, code)| (key.0, code.0)).collect();
+            // A test's output prints positions (a panic's `file:line:col`), which no code hash
+            // has: a reformat that moves a `panic!` changes its message. Every span table of the
+            // binary is in each test's selection, so such an edit runs its tests again.
+            // alloc: once per test unit, one hash per span table
+            let spans: Vec<CodeHash> = match generated.roots.tests.is_empty() {
+                true => Vec::new(),
+                false => generated
+                    .side()
+                    .map_err(|what| ApiError::new(what, Some(u.target.name.clone())))?
+                    .spans
+                    .iter()
+                    .map(|(anchor, table)| {
+                        let mut hasher = Hasher::new(SPANS);
+                        hasher.id(anchor).part(table);
+                        CodeHash(hasher.finish())
+                    })
+                    .collect(),
+            };
+            for test in &generated.roots.tests {
+                let root = generated.built.roots.get(test.root).ok_or_else(|| {
+                    ApiError::new(
+                        format!("test `{}` has no root among the build's", test.name),
+                        Some(u.target.name.clone()),
+                    )
+                })?;
+                let mut reached = generated.built.reached(root);
+                reached.extend_from_slice(&spans);
+                reached.sort_unstable();
+                reached.dedup();
+                made.tests.push(TestOf {
+                    name: test.name.clone(),
+                    ignore: test.ignore,
+                    should_panic: test.should_panic.clone(),
+                    bench: test.bench,
+                    outside: test.outside,
+                    reached,
+                });
+            }
+            let roots: Vec<ContentId> = generated.built.roots.iter().map(|it| it.0).collect();
+            for path in artifact::made(plan) {
+                let library = path.ends_with(".rlib") || path.ends_with(".rmeta");
+                if library || makes == Makes::Library {
+                    files.push((path.to_owned(), crate_record(u, identity, &roots), false));
+                    continue;
                 }
-                Err(what) => {
-                    diagnostics.push(say::refused(what, Some(unit_of), color));
-                    return Ok(nothing(diagnostics, false, made));
+                match codegen::link(job, unit, path, &makes, &generated, images) {
+                    Ok((bytes, read)) => {
+                        natives.extend(read);
+                        files.push((path.to_owned(), bytes, true));
+                    }
+                    Err(what) => {
+                        diagnostics.push(say::refused(what, Some(unit_of), color));
+                        return Ok(nothing(diagnostics, false, made));
+                    }
                 }
             }
         }
@@ -569,7 +659,7 @@ fn make(job: &Job, reader: &UnitReader, unit: usize, images: &mut Vec<Image>) ->
         _ => None,
     };
     let artifact = match (&main, main_key) {
-        (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false, runs(job, unit))),
+        (Some(path), Some(key)) => Some(artifact::artifact(u, plan, package, path, key.0, false, runs(job, unit))?),
         _ => None,
     };
     Ok(Made2 { compiled: Compiled { diagnostics, ok: true, puts, outputs, artifact, macros: None }, made, natives })

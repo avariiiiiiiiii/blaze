@@ -3,9 +3,9 @@
 use std::mem::offset_of;
 
 use base_db::{Db, Crate};
-use blaze_format::{FormatError, Record, Slice, Writer};
+use blaze_format::{FormatError, Placed, Slice, Writer};
 use hir_def::{
-    ConstId, EnumVariantId, ExpressionStoreOwnerId, HasModule, ItemContainerId, StaticId,
+    ConstId, EnumVariantId, ExpressionStoreOwnerId, ItemContainerId, StaticId,
     attrs::AttrFlags,
     expr_store::{Body, ExpressionStore, HygieneId, path::Path},
     hir::{Expr, ExprId, Literal},
@@ -34,6 +34,9 @@ use crate::{
     },
     traits::StoredParamEnvAndCrate,
 };
+
+pub mod deps;
+pub mod hir_eval;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, SalsaValue)]
 pub enum ConstEvalError<'db> {
@@ -314,7 +317,7 @@ pub(crate) enum CreateConstError<'db> {
 pub(crate) fn path_to_const<'a, 'db>(
     db: &'db Db,
     resolver: &Resolver<'db>,
-    generics: &dyn Fn() -> &'a Generics<'db>,
+    generics: &impl Fn() -> &'a Generics<'db>,
     forbid_params_after: Option<u32>,
     path: Path<'_>,
 ) -> Result<Const<'db>, CreateConstError<'db>> {
@@ -365,8 +368,8 @@ pub(crate) fn create_anon_const<'a, 'db>(
     expr_id: ExprId,
     resolver: &Resolver<'db>,
     expected_ty: Ty<'db>,
-    generics: &dyn Fn() -> &'a Generics<'db>,
-    create_var: Option<&mut dyn FnMut(Span) -> Const<'db>>,
+    generics: &impl Fn() -> &'a Generics<'db>,
+    create_var: Option<&mut impl FnMut(Span) -> Const<'db>>,
     lowering_mode: LoweringMode,
     forbid_params_after: Option<u32>,
     allow_anon_const_using_generic_params: bool,
@@ -428,7 +431,7 @@ pub(crate) fn create_anon_const<'a, 'db>(
     }
 }
 
-#[salsa::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone))]
+#[salsa::tracked(cycle_result = const_eval_discriminant_cycle_result, returns(clone), mem_tag = Infer)]
 pub(crate) fn const_eval_discriminant_variant<'db>(
     db: &'db Db,
     variant_id: EnumVariantId,
@@ -450,16 +453,7 @@ pub(crate) fn const_eval_discriminant_variant<'db>(
     let repr = AttrFlags::repr(db, loc.parent.into());
     let is_signed = repr.and_then(|repr| repr.int).is_none_or(|int| int.is_signed());
 
-    let mir_body = db.monomorphized_runtime_mir_body(
-        def.into(),
-        GenericArgs::empty().store(),
-        ParamEnvAndCrate {
-            param_env: db.trait_environment(def.generic_def(db)),
-            krate: def.krate(db),
-        }
-        .store(),
-    )?;
-    let c = db.interpret_mir(mir_body, false, None)?;
+    let c = hir_eval::value(db, def.into(), GenericArgs::empty(), None)?;
     let c = if is_signed { allocation_as_isize(c) } else { allocation_as_usize(c) as i128 };
     Ok(c)
 }
@@ -496,11 +490,11 @@ pub(crate) fn const_eval<'db>(
     let _request = trace_const(db, def, false);
     match const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
-        Err(err) => Err(err.clone()),
+        Err(err) => Err(err.clone()), // clone: error path
     }
 }
 
-#[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0)]
+#[salsa::tracked(returns(ref), cycle_result = const_eval_cycle_result, lru = 0, mem_tag = Infer)]
 pub(crate) fn const_eval_query<'db>(
     db: &'db Db,
     def: ConstId,
@@ -508,19 +502,14 @@ pub(crate) fn const_eval_query<'db>(
     trait_env: Option<StoredParamEnvAndCrate>,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
     let _execution = trace_const(db, def, true);
-    let body = db.monomorphized_runtime_mir_body(
-        def.into(),
-        subst,
-        // The crate the constant is evaluated for, not the one it is in: the impls its
-        // generic arguments select can be in crates its own doesn't depend on.
-        ParamEnvAndCrate {
-            param_env: db.trait_environment(def.into()),
-            krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
-        }
-        .store(),
-    )?;
-    let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
-    Ok(c.store())
+    let subst = subst.as_ref();
+    if let Some(kept) = deps::cached(db, def, subst)? {
+        return Ok(kept.store());
+    }
+    let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
+    let value = hir_eval::value(db, def.into(), subst, trait_env).map(|it| it.store());
+    deps::record(db, def, subst, &value);
+    value
 }
 
 fn const_eval_cycle_result<'db>(
@@ -541,28 +530,19 @@ pub(crate) fn anon_const_eval<'db>(
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
     match anon_const_eval_query(db, def, subst.store(), trait_env.map(|env| env.store())) {
         Ok(konst) => Ok(konst.as_ref()),
-        Err(err) => Err(err.clone()),
+        Err(err) => Err(err.clone()), // clone: error path
     }
 }
 
-#[salsa::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, lru = 0)]
+#[salsa::tracked(returns(ref), cycle_result = anon_const_eval_cycle_result, lru = 0, mem_tag = Infer)]
 pub(crate) fn anon_const_eval_query<'db>(
     db: &'db Db,
     def: AnonConstId<'db>,
     subst: StoredGenericArgs,
     trait_env: Option<StoredParamEnvAndCrate>,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-    let body = db.monomorphized_runtime_mir_body(
-        def.into(),
-        subst,
-        ParamEnvAndCrate {
-            param_env: db.trait_environment(def.loc(db).owner.generic_def(db)),
-            krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
-        }
-        .store(),
-    )?;
-    let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
-    Ok(c.store())
+    let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
+    Ok(hir_eval::value(db, def.into(), subst.as_ref(), trait_env)?.store())
 }
 
 fn anon_const_eval_cycle_result<'db>(
@@ -581,23 +561,16 @@ pub(crate) fn const_eval_static<'db>(
 ) -> Result<Allocation<'db>, ConstEvalError<'db>> {
     match const_eval_static_query(db, def) {
         Ok(konst) => Ok(konst.as_ref()),
-        Err(err) => Err(err.clone()),
+        Err(err) => Err(err.clone()), // clone: error path
     }
 }
 
-#[salsa::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, lru = 0)]
+#[salsa::tracked(returns(ref), cycle_result = const_eval_static_cycle_result, lru = 0, mem_tag = Infer)]
 pub(crate) fn const_eval_static_query<'db>(
     db: &'db Db,
     def: StaticId,
 ) -> Result<StoredAllocation, ConstEvalError<'db>> {
-    let body = db.monomorphized_runtime_mir_body(
-        def.into(),
-        GenericArgs::empty().store(),
-        ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
-            .store(),
-    )?;
-    let c = db.interpret_mir(body, false, None)?;
-    Ok(c.store())
+    Ok(hir_eval::value(db, def.into(), GenericArgs::empty(), None)?.store())
 }
 
 fn const_eval_static_cycle_result<'db>(
@@ -704,47 +677,6 @@ pub fn read_allocation<'db>(
     Ok(Allocation::new(AllocationData { ty, memory, memory_map }))
 }
 
-/// Where a column was written: nowhere when it is empty.
-#[derive(Clone, Copy)]
-struct Placed {
-    at: u64,
-    len: usize,
-}
-
-impl Placed {
-    fn push<T: Record>(out: &mut Writer, values: &[T]) -> Placed {
-        match values.is_empty() {
-            true => Placed { at: 0, len: 0 },
-            false => Placed { at: out.push_slice(values), len: values.len() },
-        }
-    }
-
-    /// Pushes the `len` values of `values` straight into `out`, one after another: a record's
-    /// size is a multiple of its alignment, so none needs padding after the first.
-    fn push_each<T: Record>(out: &mut Writer, len: usize, values: impl Iterator<Item = T>) -> Placed {
-        if len == 0 {
-            return Placed { at: 0, len: 0 };
-        }
-        out.bytes.reserve(align_of::<T>() + len * size_of::<T>());
-        let at = out.next::<T>();
-        let mut pushed = 0;
-        for value in values {
-            out.push(&value);
-            pushed += 1;
-        }
-        debug_assert_eq!(pushed, len);
-        debug_assert_eq!(out.bytes.len() as u64, at + (len * size_of::<T>()) as u64);
-        Placed { at, len }
-    }
-
-    fn slice<T>(self, field_at: u64) -> Slice<T> {
-        match self.len {
-            0 => Slice::EMPTY,
-            len => Slice::between(field_at, self.at, len),
-        }
-    }
-}
-
 /// The columns of a [`MemoryMapRec`], written.
 struct MapColumns {
     kind: u32,
@@ -776,7 +708,7 @@ impl MapColumns {
 fn write_memory_map<'db>(
     out: &mut Writer,
     map: &MemoryMap<'db>,
-    ty: &mut dyn FnMut(Ty<'db>) -> u32,
+    ty: &mut impl FnMut(Ty<'db>) -> u32,
 ) -> MapColumns {
     let none = Placed { at: 0, len: 0 };
     let mut columns = MapColumns {
@@ -853,7 +785,7 @@ fn write_memory_map<'db>(
 fn read_memory_map<'db>(
     record: &MemoryMapRec,
     buffer: &[u8],
-    ty: &dyn Fn(u32) -> Result<Ty<'db>, FormatError>,
+    ty: &impl Fn(u32) -> Result<Ty<'db>, FormatError>,
 ) -> Result<MemoryMap<'db>, FormatError> {
     let at = (record as *const MemoryMapRec as usize).wrapping_sub(buffer.as_ptr() as usize) as u64;
     let invalid = |what| FormatError::Invalid { at, what };
@@ -891,6 +823,7 @@ fn read_memory_map<'db>(
         extents.push(crate::Extent { start, len });
     }
     let mut map = ComplexMemoryMap {
+        // alloc: the owned allocation read back from the image, once, at its size
         memory: crate::MemoryPieces::from_columns(bytes.to_vec(), addresses, extents),
         aligns: Vec::with_capacity(aligns.len()),
         statics: Vec::with_capacity(statics.len()),
@@ -924,7 +857,7 @@ fn read_memory_map<'db>(
             at => Some(ty(at - 1)?),
         });
     }
-    Ok(MemoryMap::Complex(Box::new(map)))
+    Ok(MemoryMap::Complex(Box::new(map))) // alloc: the owned allocation read back, once
 }
 
 #[cfg(test)]

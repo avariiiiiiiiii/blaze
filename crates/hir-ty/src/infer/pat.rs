@@ -1,11 +1,8 @@
 //! Type inference for patterns.
 
-use std::{
-    cmp,
-    collections::hash_map::Entry::{Occupied, Vacant},
-    iter,
-};
+use std::{cmp, iter};
 
+use hashbrown::hash_map::Entry::{Occupied, Vacant};
 use hir_def::{
     AdtId, LocalFieldId, VariantId,
     expr_store::path::Path,
@@ -16,8 +13,9 @@ use hir_def::{
     resolver::ValueNs,
     signatures::VariantFields,
 };
+use rustc_abi::HasDataLayout as _;
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxBuildHasher;
 use rustc_type_ir::{
     TypeVisitableExt as _,
     inherent::{IntoKind as _, Ty as _},
@@ -37,7 +35,7 @@ use crate::{
         Const, ConstExt, IsRigid, TraitRef, Ty, TyKind, Tys,
         infer::{
             InferOk,
-            traits::{Obligation, ObligationCause},
+            traits::{Obligation, ObligationCause, ObligationCauseCode},
         },
     },
     utils::EnumerateAndAdjustIterator,
@@ -239,7 +237,7 @@ impl<'db> ResolvedPat<'db> {
     }
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Experimental pattern feature: after matching against a shared reference, do we limit the
     /// default binding mode in subpatterns to be `ref` when it would otherwise be `ref mut`?
     /// This corresponds to Rule 3 of RFC 3627.
@@ -973,6 +971,13 @@ impl<'db> InferenceContext<'db> {
             self.write_binding_ty(var_id, local_ty);
         }
 
+        // rustc's `GatherLocalsVisitor`: a parameter's top binding has the parameter's own
+        // `Sized` (`collect_fn`, `infer_closure`), which `unsized_fn_params` lifts alike; every
+        // other binding, a parameter's nested ones too, is a local.
+        if self.param_top_pat != Some(pat) {
+            self.require_type_is_sized(local_ty, pat.into(), ObligationCauseCode::LetType);
+        }
+
         if let Some(p) = sub {
             self.infer_pat(p, expected, pat_info);
         }
@@ -1004,6 +1009,7 @@ impl<'db> InferenceContext<'db> {
     fn resolve_record_pat(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {
         // Resolve the path and check the definition for errors.
         let (pat_ty, Some(variant)) = self.resolve_variant(pat.into(), path, false) else {
+            self.report_unresolved_pat_path(pat, path);
             return Err(());
         };
         self.write_variant_resolution(pat.into(), variant);
@@ -1028,8 +1034,17 @@ impl<'db> InferenceContext<'db> {
         pat_ty
     }
 
+    fn report_unresolved_pat_path(&mut self, pat: PatId, path: Path<'_>) {
+        if let Some(segment) = self.first_unresolved_segment(path, pat.into()) {
+            self.push_diagnostic(InferenceDiagnostic::UnresolvedPath { id: pat.into(), segment });
+        }
+    }
+
     fn resolve_pat_path(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {
-        let (res, pat_ty) = self.infer_path(path, pat.into()).ok_or(())?;
+        let Some((res, pat_ty)) = self.infer_path(path, pat.into()) else {
+            self.report_unresolved_pat_path(pat, path);
+            return Err(());
+        };
         match res {
             ValueNs::FunctionId(_)
             | ValueNs::GenericParam(_)
@@ -1062,6 +1077,7 @@ impl<'db> InferenceContext<'db> {
     ) -> Result<ResolvedPat<'db>, ()> {
         // Resolve the path and check the definition for errors.
         let (pat_ty, Some(variant)) = self.resolve_variant(pat.into(), path, true) else {
+            self.report_unresolved_pat_path(pat, path);
             return Err(());
         };
         self.write_variant_resolution(pat.into(), variant);
@@ -1191,21 +1207,23 @@ impl<'db> InferenceContext<'db> {
 
         // Index the struct fields' types.
         let variant_fields = variant.fields(self.db);
-        let field_map = variant_fields
-            .fields()
-            .iter()
-            .map(|(i, field)| (field.name.clone(), i))
-            .collect::<FxHashMap<_, _>>();
+        let mut field_map = hashbrown::HashMap::with_capacity_and_hasher_in(
+            variant_fields.len(),
+            FxBuildHasher,
+            self.frame,
+        );
+        field_map.extend(variant_fields.fields().iter().map(|(i, field)| (&field.name, i)));
         let variant_field_tys = self.db.field_types(variant);
         let variant_fields_vis = VariantFields::field_visibilities(self.db, variant);
 
         // Keep track of which fields have already appeared in the pattern.
-        let mut used_fields = FxHashMap::default();
+        let mut used_fields =
+            hashbrown::HashMap::with_capacity_and_hasher_in(fields.len(), FxBuildHasher, self.frame);
 
-        let mut inexistent_fields = vec![];
+        let mut inexistent_fields = Vec::new_in(self.frame);
         // Typecheck each field.
         for (field_idx, field) in fields.iter().enumerate() {
-            match used_fields.entry(field.name.clone()) {
+            match used_fields.entry(&field.name) {
                 Occupied(_occupied) => {
                     self.push_diagnostic(InferenceDiagnostic::DuplicateField {
                         field: field.pat.into(),
@@ -1238,12 +1256,6 @@ impl<'db> InferenceContext<'db> {
             self.infer_pat(field.pat, field_ty, pat_info);
         }
 
-        let unmentioned_fields = variant_fields
-            .fields()
-            .iter()
-            .filter(|(_, field)| !used_fields.contains_key(&field.name))
-            .collect::<Vec<_>>();
-
         // Require `..` if struct has non_exhaustive attribute.
         let non_exhaustive = self.has_applicable_non_exhaustive(variant.into());
         if non_exhaustive && !has_rest_pat {
@@ -1269,15 +1281,20 @@ impl<'db> InferenceContext<'db> {
         }
 
         // Report an error if an incorrect number of fields was specified.
-        if !matches!(variant, VariantId::UnionId(_))
-            && !unmentioned_fields.is_empty()
-            && !has_rest_pat
-        {
-            self.push_diagnostic(InferenceDiagnostic::RecordMissingFields {
-                record: ExprOrPatId::PatId(pat),
-                variant,
-                missed_fields: unmentioned_fields.into_iter().map(|f| f.0).collect(),
-            })
+        if !matches!(variant, VariantId::UnionId(_)) && !has_rest_pat {
+            let missed_fields: Vec<LocalFieldId> = variant_fields
+                .fields()
+                .iter()
+                .filter(|(_, field)| !used_fields.contains_key(&field.name))
+                .map(|(id, _)| id)
+                .collect(); // alloc: the diagnostic's own list, only when fields are missing
+            if !missed_fields.is_empty() {
+                self.push_diagnostic(InferenceDiagnostic::RecordMissingFields {
+                    record: ExprOrPatId::PatId(pat),
+                    variant,
+                    missed_fields,
+                })
+            }
         }
     }
 
@@ -1345,6 +1362,7 @@ impl<'db> InferenceContext<'db> {
         inner: PatId,
         derefed_tys: impl IntoIterator<Item = Ty<'db>>,
     ) -> InferOk<'db, ()> {
+        // alloc: empty unless a deref pattern binds `ref mut`
         let mut infer_ok = InferOk { value: (), obligations: Vec::new() };
         if self.pat_has_ref_mut_binding(inner) {
             let Some(deref_mut) = self.lang_items.DerefMut else { return infer_ok };
@@ -1691,7 +1709,9 @@ impl<'db> InferenceContext<'db> {
     ) -> (Option<Ty<'db>>, Ty<'db>) {
         let len = self.table.try_structurally_resolve_const(pat.into(), len);
 
-        if let Some(len) = len.try_to_target_usize(self.interner()) {
+        let interner = self.interner();
+        let data_layout = interner.data_layout();
+        if let Some(len) = len.try_to_value().and_then(|it| it.try_to_target_usize(data_layout)) {
             // Now we know the length...
             if slice.is_none() {
                 // ...and since there is no variable-length pattern,

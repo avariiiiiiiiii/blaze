@@ -466,6 +466,36 @@ fn wrap<'ctx>(
     Ok(())
 }
 
+/// The CPU of this host and its features as LLVM names them (`+avx2,-avx512f,...`).
+pub(crate) fn host_cpu() -> (String, String) {
+    use inkwell::llvm_sys::{core::LLVMDisposeMessage, target_machine as tm};
+    /// The text of `message`, which is then disposed of.
+    ///
+    /// # Safety
+    ///
+    /// `message` is a NUL-terminated string that LLVM allocated, that the caller owns and
+    /// that nothing reads after this.
+    unsafe fn owned(message: *mut std::ffi::c_char) -> String {
+        // SAFETY: the caller's: `message` is NUL-terminated and live until disposed of below.
+        let text = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy().into_owned();
+        // SAFETY: the caller's: LLVM allocated `message`, and nothing reads it after this.
+        unsafe { LLVMDisposeMessage(message) };
+        text
+    }
+    // SAFETY: it reads only the host's CPU and needs no LLVM state set up first.
+    let name = unsafe { tm::LLVMGetHostCPUName() };
+    // SAFETY: `name` is LLVM's string from just above, owned here and taken once.
+    let name = unsafe { owned(name) };
+    // SAFETY: LLVMGetHostCPUFeatures only reads the host CPU and needs no LLVM state set
+    // up first; it returns a string LLVM allocated, which this code now owns.
+    let features = unsafe { tm::LLVMGetHostCPUFeatures() };
+    // SAFETY: `features` is the NUL-terminated string LLVMGetHostCPUFeatures just
+    // allocated, owned here and given to `owned` once, which disposes of it; a second use
+    // would read freed memory.
+    let features = unsafe { owned(features) };
+    (name, features)
+}
+
 /// The kind of LLVM's attribute `name`. LLVM answers 0 for a name it does not know (one it
 /// renamed or removed, as LLVM 21 did `nocapture`), and an attribute of kind 0 crashes its
 /// verifier, so an unknown name stops here.

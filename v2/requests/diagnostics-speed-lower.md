@@ -4,6 +4,8 @@
 
 > done by diagnostics-speed-lower, 2026-10-29, as written below (both this one and the next).
 
+> diagnostics-lints, 2026-10-29: since then `diagnostics-lints-mir-speed` moved `missing_match_arms.rs` onto hir's structured witnesses (`rustc_pattern_analysis` output), which removed `Witness`, `Fields` and `fields()` entirely; no `dyn` or `Box` is left in the file. Nothing to reapply (dedyn-diag was told by tmux, window 118).
+
 From `dedyn-diag` (report `/tmp/blaze-lanes/v2-dedyn-diag.md`), 2026-10-29, based on the file as
 of 21:00. `missing_match_arms.rs` is also named by `diagnostics-lints-next1`'s brief; told too.
 

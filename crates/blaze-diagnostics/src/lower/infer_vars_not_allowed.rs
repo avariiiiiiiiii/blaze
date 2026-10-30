@@ -10,7 +10,10 @@
 //! diagnostics.rs` (`PlaceholderNotAllowedItemSignatures`) (MIT or Apache-2.0).
 
 use hir::{CallableKind, FnTrait, InFile, LangItem};
-use syntax::{AstNode, SyntaxNode, TextRange, ast};
+use syntax::{
+    TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
     cx::Cx,
@@ -20,7 +23,7 @@ use crate::{
 
 /// The placeholders under `node` in source order (a preorder walk; placeholders don't nest):
 /// rustc's `HirPlaceholderCollector`, of `_` types and of `_` const arguments and array lengths.
-fn placeholders(node: &SyntaxNode) -> impl Iterator<Item = TextRange> {
+fn placeholders(node: ast::Node<'_>) -> impl Iterator<Item = TextRange> {
     node.descendants()
         .filter(|it| {
             ast::InferType::can_cast(it.kind())
@@ -33,12 +36,15 @@ fn placeholders(node: &SyntaxNode) -> impl Iterator<Item = TextRange> {
 /// rustc's `bad_placeholder`: `kind` pluralized, the spans sorted, each labelled.
 fn bad_placeholder(cx: &Cx<'_, '_>, file: hir::HirFileId, spans: &[TextRange], kind: &str) -> Diag {
     let kind = match kind.ends_with('s') {
+        // alloc: the error's text, for an error hir found
         true => format!("{kind}es"),
+        // alloc: the error's text, for an error hir found
         false => format!("{kind}s"),
     };
     let span = |range: TextRange| cx.span(InFile::new(file, range));
     let mut diag = Diag::error(
         Some("E0121"),
+        // alloc: the error's text, for an error hir found
         format!("the placeholder `_` is not allowed within types on item signatures for {kind}"),
         span(spans[0]),
     );
@@ -51,12 +57,12 @@ fn bad_placeholder(cx: &Cx<'_, '_>, file: hir::HirFileId, spans: &[TextRange], k
     diag
 }
 
-fn in_assoc(item: &ast::Item) -> bool {
+fn in_assoc(item: ast::Item<'_>) -> bool {
     item.syntax().parent().is_some_and(|it| ast::AssocItemList::can_cast(it.kind()))
 }
 
 /// rustc's `def_descr` of the item a signature is of.
-fn item_descr(item: &ast::Item) -> &'static str {
+fn item_descr(item: ast::Item<'_>) -> &'static str {
     match item {
         ast::Item::Fn(it) if in_assoc(item) => {
             match it.param_list().and_then(|it| it.self_param()).is_some() {
@@ -108,10 +114,11 @@ fn impl_trait(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
         if !ty.impls_trait(db, trait_, &[]) {
             return None;
         }
-        let alias = trait_.items(db).into_iter().filter_map(|it| it.as_type_alias()).find(|it| {
+        let alias = trait_.items_iter(db).filter_map(|it| it.as_type_alias()).find(|it| {
             it.name(db).as_str() == assoc
         })?;
         let item = ty.normalize_trait_assoc_type(db, &[], alias)?;
+        // alloc: the suggestion's text, for an error hir found
         Some(format!(
             "impl {}<{assoc} = {}>",
             trait_.name(db).display(db, cx.edition),
@@ -137,6 +144,7 @@ fn impl_trait(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
         CallableKind::Function(_) | CallableKind::TupleStruct(_) | CallableKind::TupleEnumVariant(_) => "Fn",
         _ => return None,
     };
+    // alloc: the suggestion's text, for an error hir found
     let mut out = format!("impl {trait_name}(");
     for (i, param) in callable.params().iter().enumerate() {
         if !suggestable(cx, param.ty()) {
@@ -157,53 +165,57 @@ fn impl_trait(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<String> {
 }
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InferVarsNotAllowed) -> Vec<Found> {
-    let node = cx.syntax(d.node);
+    let node = cx.syntax_view(d.node);
     let file = node.file_id;
     let at = node.value.text_range();
     let span = |range: TextRange| cx.span(InFile::new(file, range));
     let Some(item) = node.value.ancestors().find_map(ast::Item::cast) else {
         let mut diag = bad_placeholder(cx, file, &[at], "item");
-        site_fact(cx, &mut diag, node.as_ref());
+        site_fact(cx, &mut diag, node);
+        // alloc: the error's parts, for an error hir found
         return vec![Found::new(diag, Phase::Items)];
     };
 
     // The type of a const or a static with a body, and a function's return type, are
     // inferred from the body and their placeholders reported together.
-    let grouped = match &item {
+    let grouped = match item {
         ast::Item::Const(it) => it.ty().zip(it.body()).map(|(ty, body)| {
-            let kind = if in_assoc(&item) { "associated constant" } else { "constant" };
-            (ty.syntax().clone(), body, kind, false)
+            let kind = if in_assoc(item) { "associated constant" } else { "constant" };
+            (ty.syntax(), body, kind, false)
         }),
         ast::Item::Static(it) => {
-            it.ty().zip(it.body()).map(|(ty, body)| (ty.syntax().clone(), body, "static variable", false))
+            it.ty().zip(it.body()).map(|(ty, body)| (ty.syntax(), body, "static variable", false))
         }
         ast::Item::Fn(it) => it.ret_type().and_then(|ret| ret.ty()).zip(it.body()).map(|(ty, body)| {
-            (ty.syntax().clone(), ast::Expr::BlockExpr(body), "return type", true)
+            (ty.syntax(), ast::Expr::BlockExpr(body), "return type", true)
         }),
         _ => None,
     }
     .filter(|(ty, ..)| ty.text_range().contains_range(at));
 
     let Some((ty, body, kind, is_return)) = grouped else {
-        let in_variant = node.value.ancestors().take_while(|it| it != item.syntax()).any(|it| {
+        let in_variant = node.value.ancestors().take_while(|it| *it != item.syntax()).any(|it| {
             ast::Variant::can_cast(it.kind())
         });
-        let kind = if in_variant { "variant" } else { item_descr(&item) };
+        let kind = if in_variant { "variant" } else { item_descr(item) };
         let mut diag = bad_placeholder(cx, file, &[at], kind);
-        site_fact(cx, &mut diag, node.as_ref());
+        site_fact(cx, &mut diag, node);
+        // alloc: the error's parts, for an error hir found
         return vec![Found::new(diag, Phase::Items)];
     };
     // Every placeholder of the type has its own hir diagnostic; only the first one's builds the
     // error, and the others stop at the first node of the walk.
-    if placeholders(&ty).next().is_some_and(|first| first != at) {
+    if placeholders(ty).next().is_some_and(|first| first != at) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
-    let mut spans: Vec<TextRange> = placeholders(&ty).collect();
+    // alloc: the error's spans, for an error hir found
+    let mut spans: Vec<TextRange> = placeholders(ty).collect();
     if spans.is_empty() {
         spans.push(at);
     }
     let mut diag = bad_placeholder(cx, file, &spans, kind);
-    let inferred = cx.sema.type_of_expr(&body).map(|it| it.original());
+    let inferred = cx.vsema.type_of_expr(body).map(|it| it.original());
     let ty_span = span(ty.text_range());
     match (is_return, inferred) {
         (_, None) => {}
@@ -244,11 +256,13 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::InferVarsNotAllowed) -> Vec<Found>
             } else {
                 diag.span_note(
                     span(body.syntax().text_range()),
+                    // alloc: the error's text, for an error hir found
                     format!("however, the inferred type `{}` cannot be named", cx.ty(&inferred)),
                 );
             }
         }
     }
-    site_fact(cx, &mut diag, node.as_ref());
+    site_fact(cx, &mut diag, node);
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Items)]
 }

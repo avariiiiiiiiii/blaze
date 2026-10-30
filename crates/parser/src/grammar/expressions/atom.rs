@@ -308,6 +308,21 @@ fn builtin_expr(p: &mut Parser<'_>) -> Option<CompletedMarker> {
         // test include_bytes
         // fn foo() { builtin # include_bytes }
         Some(m.complete(p, INCLUDE_BYTES_EXPR))
+    } else if p.eat_contextual_kw(T![wrap_binder]) || p.eat_contextual_kw(T![unwrap_binder]) {
+        // As rustc's `parse_expr_unsafe_binder_cast`: an expression, then a type after a comma
+        // or nothing; no trailing comma.
+        // test unsafe_binder_cast
+        // fn foo() {
+        //     builtin # wrap_binder(x);
+        //     builtin # unwrap_binder(x, &u32);
+        // }
+        p.expect(T!['(']);
+        expr(p);
+        if p.eat(T![,]) {
+            type_(p);
+        }
+        p.expect(T![')']);
+        Some(m.complete(p, UNSAFE_BINDER_CAST_EXPR))
     } else if p.eat_contextual_kw(T![cfg]) {
         p.expect(T!['(']);
         attributes::cfg_predicate(p);

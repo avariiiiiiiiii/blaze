@@ -2,10 +2,7 @@
 
 pub mod msg;
 
-use std::{
-    io::{BufRead, Write},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use paths::AbsPath;
 use span::Span;
@@ -16,7 +13,7 @@ use crate::{
         ExpandMacro, ExpandMacroData, ExpnGlobals, FlatTree, Message, Request, Response,
         ServerConfig, SpanDataIndexMap, flat::serialize_span_data_index_map,
     },
-    process::Claimed,
+    process::{Claimed, Reader, Writer},
     version,
     wire::{ExpandMacroWire, Sent, WireSpan, flat_answer, read_tree, write_tree},
 };
@@ -41,6 +38,7 @@ pub(crate) fn version_check(srv: &Claimed<'_>) -> Result<u32, ServerError> {
 
     match response {
         Response::ApiVersionCheck(version) => Ok(version),
+        // alloc: error path.
         _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
     }
 }
@@ -54,6 +52,7 @@ pub(crate) fn enable_rust_analyzer_spans(
 
     match response {
         Response::SetConfig(ServerConfig { span_mode }) => Ok(span_mode),
+        // alloc: error path.
         _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
     }
 }
@@ -69,6 +68,7 @@ pub(crate) fn find_proc_macros(
 
     match response {
         Response::ListMacros(it) => Ok(it),
+        // alloc: error path.
         _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
     }
 }
@@ -104,17 +104,20 @@ pub(crate) fn expand(
             }
             Response::ExpandMacroWire(Err(msg)) => Ok(Err(msg.0)),
             // alloc: error path.
-            _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+            // alloc: error path.
+        _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
         };
     }
     let mut span_data_table = SpanDataIndexMap::default();
     let def_site = span_data_table.insert_full(def_site).0;
     let call_site = span_data_table.insert_full(call_site).0;
     let mixed_site = span_data_table.insert_full(mixed_site).0;
+    // An older JSON server's request, which owns what it sends (the edge): the connection
+    // speaks postcard, and expands over its own buffers (`Claimed::expand_wire`).
     let task = ExpandMacro {
         data: ExpandMacroData {
             macro_body: FlatTree::from_subtree(subtree, version, &mut span_data_table),
-            macro_name: proc_macro.name.to_string(),
+            macro_name: proc_macro.name.to_string(), // alloc: as above.
             attributes: attr
                 .map(|subtree| FlatTree::from_subtree(subtree, version, &mut span_data_table)),
             has_global_spans: ExpnGlobals {
@@ -126,7 +129,7 @@ pub(crate) fn expand(
             span_data_table: if process.rust_analyzer_spans() {
                 serialize_span_data_index_map(&span_data_table)
             } else {
-                Vec::new()
+                Vec::new() // alloc: none, empty.
             },
         },
         lib: proc_macro.dylib_path.to_path_buf().into(),
@@ -134,6 +137,7 @@ pub(crate) fn expand(
         current_dir: Some(current_dir),
     };
 
+    // alloc: as above.
     let response = send_task(process, Request::ExpandMacro(Box::new(task)))?;
 
     let (tree, answered) = match response {
@@ -200,6 +204,7 @@ impl ExpandMacroWire {
 /// Sends a request to the proc-macro server and waits for a response.
 fn send_task(srv: &Claimed<'_>, req: Request) -> Result<Response, ServerError> {
     if let Some(server_error) = srv.exited() {
+        // clone: error path, the server's exit told to each caller.
         return Err(server_error.clone());
     }
 
@@ -208,18 +213,18 @@ fn send_task(srv: &Claimed<'_>, req: Request) -> Result<Response, ServerError> {
 
 /// Sends a request to the server and reads the response.
 fn send_request(
-    mut writer: &mut dyn Write,
-    mut reader: &mut dyn BufRead,
+    writer: &mut Writer,
+    reader: &mut Reader,
     req: Request,
     buf: &mut String,
 ) -> Result<Option<Response>, ServerError> {
-    req.write(&mut writer).map_err(|err| ServerError {
+    req.write(writer).map_err(|err| ServerError {
         message: "failed to write request".into(),
-        io: Some(Arc::new(err)),
+        io: Some(Arc::new(err)), // alloc: error path.
     })?;
-    let res = Response::read(&mut reader, buf).map_err(|err| ServerError {
+    let res = Response::read(reader, buf).map_err(|err| ServerError {
         message: "failed to read response".into(),
-        io: Some(Arc::new(err)),
+        io: Some(Arc::new(err)), // alloc: error path.
     })?;
     Ok(res)
 }

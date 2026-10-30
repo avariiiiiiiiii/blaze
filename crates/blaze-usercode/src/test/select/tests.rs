@@ -60,6 +60,9 @@ impl World {
 
 impl Inputs for World {
     type Error = String;
+    fn entry(&mut self, _: &Path) -> Result<crate::trace::Entry, String> {
+        Ok(crate::trace::Entry::Missing)
+    }
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
         Ok(self.files.get(path).copied())

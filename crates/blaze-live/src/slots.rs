@@ -39,6 +39,7 @@ use crate::patch::{
 use os::backtrace;
 use switch::{KEPT, Layout, Switch};
 
+mod column;
 mod hook;
 mod image;
 mod switch;
@@ -140,6 +141,35 @@ mod os {
     }
 
     pub(super) fn backtrace(_: &mut Vec<u64>) {}
+
+    pub(super) const GRAIN: usize = 64 << 10;
+
+    /// No address space is reserved here: the switch's columns, and so the switch, can't be
+    /// made.
+    pub(super) enum Reserved {}
+
+    impl Reserved {
+        pub(super) fn new(_: usize) -> Result<Reserved, String> {
+            // alloc: error path, once at start on a platform it doesn't run on
+            Err(PLATFORMS.to_owned())
+        }
+
+        pub(super) fn base(&self) -> u64 {
+            match *self {}
+        }
+
+        pub(super) fn len(&self) -> usize {
+            match *self {}
+        }
+
+        pub(super) fn committed(&self) -> usize {
+            match *self {}
+        }
+
+        pub(super) fn commit(&mut self, _: usize) -> Result<(), String> {
+            match *self {}
+        }
+    }
 }
 
 /// What became of a message, or of a panic under [`Live::guard`].
@@ -275,7 +305,10 @@ pub struct Live {
 
 impl Live {
     /// Finds this image's descriptor, readies its patch code region for writes, installs the
-    /// panic hook [`Live::guard`] needs and starts watching for messages.
+    /// panic hook [`Live::guard`] needs and starts watching for messages. It reserves about
+    /// 435 MiB of address space for the log of generations, which costs memory only as
+    /// patches fill it; under a `ulimit -v` that leaves less, it fails naming the call and
+    /// the size.
     pub fn start() -> Result<Live, String> {
         if STARTED.swap(true, Ordering::AcqRel) {
             // alloc: error path

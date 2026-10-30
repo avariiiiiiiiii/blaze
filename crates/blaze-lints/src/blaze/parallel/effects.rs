@@ -30,7 +30,8 @@
 
 use base_db::Db;
 use hir_def::{
-    AdtId, BuiltinDeriveImplId, CallableDefId, FunctionId, ItemContainerId, StaticId, attrs::AttrFlags, builtin_derive::BuiltinDeriveImplMethod, lang_item::lang_items,
+    AdtId, BuiltinDeriveImplId, CallableDefId, FunctionId, ItemContainerId, StaticId,
+    attrs::AttrFlags, builtin_derive::BuiltinDeriveImplMethod, lang_item::lang_items,
     signatures::{FunctionSignature, StaticFlags, StaticSignature},
 };
 use hir_ty::{
@@ -46,7 +47,7 @@ use hir_ty::{
     },
     traits::StoredParamEnvAndCrate,
 };
-use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, SliceLike as _};
+use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind as _};
 
 use super::super::alloc::{self, Resolved};
 use super::region::Cycles;
@@ -155,11 +156,10 @@ pub(crate) enum Culprit {
     Yield,
 }
 
-/// The first effect that rules a loop out, what had it, and the function called on the way to
-/// it from the body summarized, if it is not that body's own.
+/// What had the first effect that rules a loop out, and the function called on the way to it
+/// from the body summarized, if it is not that body's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Why {
-    pub(crate) effect: Effect,
     pub(crate) culprit: Culprit,
     pub(crate) through: Option<FunctionId>,
 }
@@ -227,7 +227,7 @@ impl Effects {
             kinds: Effect::Unknown.bit(),
             writes: 0,
             returns: UNKNOWN,
-            why: Some(Why { effect: Effect::Unknown, culprit, through: None }),
+            why: Some(Why { culprit, through: None }),
         }
     }
 
@@ -240,10 +240,17 @@ impl Effects {
         self.kinds & RULED_OUT == 0
     }
 
+    /// Whether what it does that rules a loop out is all known, and seen by other iterations
+    /// only in the order they run: I/O, a static that changes, an atomic. Not what blaze
+    /// can't see into, a raw write it can't trace, or assembly.
+    pub(crate) fn only_ordered(&self) -> bool {
+        self.kinds & (Effect::Unknown.bit() | Effect::RawWrite.bit() | Effect::Asm.bit()) == 0
+    }
+
     fn add(&mut self, effect: Effect, culprit: Culprit) {
         self.kinds |= effect.bit();
         if effect.bit() & RULED_OUT != 0 && self.why.is_none() {
-            self.why = Some(Why { effect, culprit, through: None });
+            self.why = Some(Why { culprit, through: None });
         }
     }
 

@@ -9,3 +9,5 @@ From `dedup-codec-rng` (report `/tmp/blaze-lanes/v2-dedup-codec-rng.md`). `blaze
 3. `Rng(7)` -> `Rng::new(7)`, `Rng(11)` -> `Rng::new(11)`. `fn lines(rng: &mut Rng, ..)` and the `rng.below(..)` calls stay as they are.
 
 > forwarded to cargo-inbox-tests (writing `serve/unit/test/tests.rs`) (requests, pass 20; told by tmux).
+
+> applied (cargo-inbox-tests): all three edits, as written. `crates/blaze-cargo/src/serve/unit/test/tests.rs:8` imports `blaze_ids::{ContentId, rng::SplitMix64 as Rng}`, the local `Rng` is deleted, and the seeds are `Rng::new(7)` and `Rng::new(11)`. The values are the same: no `below` is ever asked for 0.

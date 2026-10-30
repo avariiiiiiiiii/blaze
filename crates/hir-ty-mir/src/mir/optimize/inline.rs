@@ -21,15 +21,14 @@ mod tests;
 
 use std::ops::Range;
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db};
 use either::Either;
 use hir_def::{
-    CallableDefId, DefWithBodyId, FunctionId, HasModule, ItemContainerId, Lookup,
-    attrs::AttrFlags, expr_store::Body, signatures::FunctionSignature,
+    CallableDefId, FunctionId, HasModule, ItemContainerId, Lookup, attrs::AttrFlags,
+    signatures::FunctionSignature,
 };
 use intern::Symbol;
 use rustc_abi::ExternAbi;
-use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::{
     ClosureKind, FloatTy, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
@@ -39,7 +38,6 @@ use rustc_type_ir::{
 use smallvec::SmallVec;
 
 use crate::{
-    InferenceResult,
     db::HirDatabase,
     method_resolution::is_dyn_method,
     mir::{
@@ -783,21 +781,12 @@ pub(super) fn resolve<'db>(
 }
 
 /// The type of `operand` in `body`, normalized with its lifetimes erased.
-pub(super) fn operand_ty<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, operand: &Operand) -> Ty<'db> {
-    let ty = match &operand.kind {
-        OperandKind::Copy(place) | OperandKind::Move(place) => {
-            place.as_ref().ty(body, &ctx.infcx, ctx.env).ty
-        }
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        &OperandKind::Static(static_) => {
-            let interner = ctx.infcx.interner;
-            let ty = InferenceResult::of(ctx.db, DefWithBodyId::from(static_))
-                .expr_ty(Body::of(ctx.db, static_.into()).root_expr());
-            Ty::new_ref(interner, Region::new_static(interner), ty, Mutability::Not)
-        }
-    };
-    normalize_ty(ctx, ty)
+pub(super) fn operand_ty<'db>(
+    ctx: &Ctx<'_, 'db>,
+    body: &MirBody<'db>,
+    operand: &Operand,
+) -> Ty<'db> {
+    normalize_ty(ctx, ctx.operand_ty(body, operand))
 }
 
 /// `value`, of the body `args` instantiate, in the terms of the body `args` are of: `None`

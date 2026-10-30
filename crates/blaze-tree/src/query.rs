@@ -10,6 +10,7 @@ use blaze_units::query::{Cbor, Fetch, LoadError, Versioned, producer};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 
+use crate::packages::Reads;
 use crate::{DepKind, DisplayDepth, EdgeKind, Input, Kinds, Options, Packages, Platformed, Prefix, Target};
 
 /// `cargo tree`'s command line, as cargo reads it: everything of [`Options`] and the
@@ -73,6 +74,7 @@ impl Versioned for Printed {
 }
 
 impl TreeAsk {
+    /// The options of `cargo tree`, made once per query from its key, which it outlives.
     fn options(&self) -> Options {
         let edge_kinds: FxHashSet<EdgeKind> = self
             .edges
@@ -83,19 +85,26 @@ impl TreeAsk {
                 Edge::Dev => EdgeKind::Dep(DepKind::Development),
                 Edge::Features => EdgeKind::Feature,
             })
+            // alloc: the edge kinds, at most four.
             .collect();
         let ask = &self.resolve;
         Options {
             packages: match (ask.workspace, ask.exclude.is_empty(), ask.packages.is_empty()) {
                 (false, true, true) => Packages::Default,
+                // clone: the key's `-p`s, once per query.
                 (false, true, false) => Packages::Packages(ask.packages.clone()),
+                // clone: as above.
                 (true, true, _) => Packages::All(ask.packages.clone()),
+                // clone: the key's `--exclude`s.
                 (_, false, _) => Packages::OptOut(ask.exclude.clone()),
             },
+            // clone: the key's `--target`s.
             target: Target::from_cli(self.targets.clone()),
             graph_features: edge_kinds.contains(&EdgeKind::Feature),
             edge_kinds,
+            // clone: the key's `-i`s.
             invert: self.invert.clone(),
+            // clone: the key's `--prune`s.
             pkgs_to_prune: self.prune.clone(),
             prefix: match self.prefix {
                 TreePrefix::None => Prefix::None,
@@ -104,6 +113,7 @@ impl TreeAsk {
             },
             no_dedupe: self.no_dedupe,
             duplicates: self.duplicates,
+            // clone: the key's `--format`.
             format: self.format.clone(),
             display_depth: match self.depth {
                 TreeDepth::Max(depth) => DisplayDepth::MaxDisplayDepth(depth),
@@ -134,9 +144,11 @@ impl Query for Tree {
     fn execute(cx: &mut Cx<'_>, ask: &TreeAsk) -> Result<Cbor<Printed>, Cancelled> {
         let opts = ask.options();
         if opts.graph_features && opts.duplicates {
+            // alloc: cargo's error.
             let what = "the `-e features` flag does not support `--duplicates`".to_owned();
             return Ok(Cbor(Printed::Failed(LoadError { what, at: None })));
         }
+        // clone: the key's resolve, once per query.
         let resolve = ResolveAsk { dev_units: ask.edges.contains(&Edge::Dev), ..ask.resolve.clone() };
         Ok(Cbor(match resolve_view(cx, &resolve, |view| print_view(view, &opts))? {
             Resolving::Done((out, warnings)) => Printed::Ready { out, warnings },
@@ -147,18 +159,32 @@ impl Query for Tree {
 }
 
 fn print_view(view: &ViewResolved<'_>, opts: &Options) -> Result<(String, Vec<String>), LoadError> {
+    let (input, kinds) = view_input(view, opts)?;
+    // alloc: the text the query returns, one buffer sized for a line per package.
+    let mut out = String::with_capacity(crate::LINE * view.resolve.len());
+    // alloc: the warnings the query returns, the load's first.
+    let mut warnings = view.warnings.to_vec();
+    // alloc: a warning, rare.
+    crate::print_resolved(&input, opts, &kinds, &mut out, &mut |it: &str| warnings.push(it.to_owned()))
+        .map_err(|error| load_error(&error, None))?;
+    Ok((out, warnings))
+}
+
+/// The view's workspace as [`crate::print_resolved`] reads it, and its platforms.
+fn view_input<'a>(view: &ViewResolved<'a>, opts: &Options) -> Result<(Input<'a>, Kinds), LoadError> {
     let targets: &[String] = match &opts.target {
         Target::Specific(triples) => triples,
         Target::Host | Target::All => &[],
     };
     let platformed = |triple: &str, target: Option<&str>| -> Result<Platformed, LoadError> {
         let cfg = platform_cfg(view.config, triple, view.host, target)?;
+        // alloc: a platform's triple, once per `cargo tree`.
         Ok(Platformed { triple: triple.to_owned(), cfg })
     };
-    let kinds = Kinds {
-        host: platformed(view.host, targets.first().map(String::as_str))?,
-        targets: targets.iter().map(|it| platformed(it, Some(it))).collect::<Result<_, _>>()?,
-    };
+    let mut kinds = Kinds { host: platformed(view.host, targets.first().map(String::as_str))?, targets: Vec::with_capacity(targets.len()) };
+    for it in targets {
+        kinds.targets.push(platformed(it, Some(it))?);
+    }
     let input = Input {
         resolve: view.resolve,
         members: view.members,
@@ -167,13 +193,9 @@ fn print_view(view: &ViewResolved<'_>, opts: &Options) -> Result<(String, Vec<St
         cli_features: view.cli_features,
         behavior: view.behavior,
         unification: view.unification,
-        packages: view.reads,
+        packages: Reads::Units(view.reads),
     };
-    let mut out = String::new();
-    let mut warnings = view.warnings.to_vec();
-    crate::print_resolved(&input, opts, &kinds, &mut out, &mut |it| warnings.push(it.to_owned()))
-        .map_err(|error| load_error(&error, None))?;
-    Ok((out, warnings))
+    Ok((input, kinds))
 }
 
 /// Registers [`Tree`]; the load's queries it reads are blaze-units' (`blaze_units::load::register`).

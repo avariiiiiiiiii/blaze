@@ -409,7 +409,7 @@ impl Runtime {
 }
 
 impl Cell {
-    fn read(&mut self, thread: Tid, clock: &Clock, at: At, what: &dyn Fn() -> String) -> Result<(), String> {
+    fn read(&mut self, thread: Tid, clock: &Clock, at: At, what: &impl Fn() -> String) -> Result<(), String> {
         if !self.write.before(clock) {
             return Err(format!(
                 "data race on {}: a read at {at} by thread {thread} races with the write at {} by \
@@ -424,7 +424,7 @@ impl Cell {
         Ok(())
     }
 
-    fn write(&mut self, thread: Tid, clock: &Clock, at: At, what: &dyn Fn() -> String) -> Result<(), String> {
+    fn write(&mut self, thread: Tid, clock: &Clock, at: At, what: &impl Fn() -> String) -> Result<(), String> {
         if !self.write.before(clock) {
             return Err(format!(
                 "data race on {}: a write at {at} by thread {thread} races with the write at {} by \

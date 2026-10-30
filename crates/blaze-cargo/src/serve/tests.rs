@@ -5,15 +5,14 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    any::Any,
     cell::{Cell, RefCell},
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
 use blaze_api::{
-    ApiError, Artifact, Diagnostic, Envelope, FetchVerb, Level, Reach, Request, Response, SCHEMA, Table, Targets,
-    TestOutcome, TestResult, Ub, UnitOf, UnitTarget, Verb, ViewRef,
+    ApiError, Artifact, CrateType, Diagnostic, Envelope, FetchVerb, Level, Reach, Request, Response, SCHEMA, Table,
+    TargetKind, Targets, TestOutcome, TestResult, Ub, UnitOf, UnitTarget, Verb, ViewRef,
     frames::{self, Frames},
 };
 use blaze_cas::Store;
@@ -31,11 +30,10 @@ use blaze_vfs::{Change, Op, ViewId};
 
 use super::{
     Daemon, Options,
-    job::Value,
-    plane::Inline,
+    plane::{Inline, Runner},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, KeptFront, Library, Output, Put, Reader, Runs,
-        Selection, Source, SourceFile, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Output, Put, Runs, Selection, Source,
+        SourceFile, Steps, Writer,
     },
 };
 
@@ -87,15 +85,15 @@ const APP_AT: &str = "/w/target/debug/app";
 fn warning_of_app(message: &str) -> Diagnostic {
     let target = UnitTarget {
         doc: true,
-        kind: vec!["bin".into()],
+        kind: TargetKind::Bin,
         name: "app".into(),
         test: true,
         doctest: false,
         edition: "2021".into(),
         src_path: "/w/src/main.rs".into(),
-        crate_types: vec!["bin".into()],
+        crate_types: vec![CrateType::Bin],
     };
-    let unit = UnitOf { test: false, target, package_id: "app".into(), manifest_path: "/w/Cargo.toml".into() };
+    let unit = UnitOf { id: 0, test: false, target, package_id: "app".into(), manifest_path: "/w/Cargo.toml".into() };
     Diagnostic {
         level: Level::Warning,
         code: None,
@@ -105,6 +103,7 @@ fn warning_of_app(message: &str) -> Diagnostic {
         facts: Vec::new(),
         rendered: format!("warning: {message}\n\n"),
         unit: Some(unit),
+        explanation: None,
     }
 }
 
@@ -286,6 +285,13 @@ struct Fake {
 }
 
 impl Steps for Fake {
+    type Front = FakeFront;
+    type Writer = FakeWriter;
+    type Reader = FakeReader;
+    type KeptFront = FakeInputs;
+    type Linked = NoImage;
+    type Runs = FakeRuns;
+
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         *self.fetched.lock().unwrap().entry(fetch.at.clone()).or_default() += 1;
         let source = match fetch.kind {
@@ -315,8 +321,8 @@ impl Steps for Fake {
         Ok(Library { at: LIBRARY.into(), fingerprint, source: Some(Source { files: vec![file], under: String::new() }) })
     }
 
-    fn lower(&self, job: &JobInput, kept: Option<KeptFront>) -> Result<FrontEnd, Failed> {
-        let inputs = match kept.and_then(KeptFront::take::<FakeInputs>) {
+    fn lower(&self, job: &JobInput, kept: Option<FakeInputs>) -> Result<FrontEnd<Fake>, Failed> {
+        let inputs = match kept {
             Some(inputs) => {
                 INTO_KEPT.set(INTO_KEPT.get() + 1);
                 inputs
@@ -327,7 +333,7 @@ impl Steps for Fake {
             }
         };
         let writer = FakeWriter { inputs: Arc::new(inputs), asked: Vec::new() };
-        Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer: Box::new(writer) })
+        Ok(FrontEnd { front: Arc::new(FakeFront { goal: job.goal }), writer, puts: Vec::new() })
     }
 
     fn register(&self, db: &mut Database) {
@@ -368,9 +374,18 @@ struct FakeWriter {
 /// A shared reference to the inputs, as the loop posted a task with it.
 struct FakeReader(Arc<FakeInputs>);
 
-impl Writer for FakeWriter {
-    fn reader(&self) -> Option<Reader> {
-        (!self.waiting()).then(|| Reader::new(FakeReader(Arc::clone(&self.inputs))))
+/// The fakes link nothing: no image is ever kept.
+enum NoImage {}
+
+impl Kept for NoImage {
+    fn tables(&self) -> Vec<(&'static str, u64, u64)> {
+        match *self {}
+    }
+}
+
+impl Writer<Fake> for FakeWriter {
+    fn reader(&self) -> Option<FakeReader> {
+        (!self.waiting()).then(|| FakeReader(Arc::clone(&self.inputs)))
     }
 
     fn ran(&mut self, run: usize, _: load_cargo::v2::Ran) -> Result<(), ApiError> {
@@ -385,6 +400,10 @@ impl Writer for FakeWriter {
 
     fn waiting(&self) -> bool {
         !self.asked.is_empty()
+    }
+
+    fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
+        Ok(Vec::new()) // the fakes read no dependency from the store
     }
 
     fn apply(&mut self) -> Result<bool, ApiError> {
@@ -404,19 +423,68 @@ impl Writer for FakeWriter {
         }
     }
 
-    fn keep(mut self: Box<Self>) -> Option<KeptFront> {
+    fn keep(mut self) -> Option<FakeInputs> {
         if !matches!(self.apply(), Ok(true)) {
             return None;
         }
-        Arc::into_inner(self.inputs).map(KeptFront::new)
+        Arc::into_inner(self.inputs)
+    }
+}
+
+/// The fakes' user code: a build script's run, or what is over as it starts.
+enum FakeRuns {
+    Script(Script),
+    Over(Over),
+}
+
+impl Runs<Fake> for FakeRuns {
+    fn start(
+        &mut self,
+        store: &Store,
+        writer: Option<&mut FakeWriter>,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
+        match self {
+            FakeRuns::Script(it) => it.start(store, writer, effects, out),
+            FakeRuns::Over(it) => it.start(store, writer, effects, out),
+        }
+    }
+
+    fn owns(&self, tag: Tag) -> bool {
+        match self {
+            FakeRuns::Script(it) => it.owns(tag),
+            FakeRuns::Over(it) => it.owns(tag),
+        }
+    }
+
+    fn complete(
+        &mut self,
+        completion: Completion,
+        store: &mut Store,
+        writer: Option<&mut FakeWriter>,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
+        match self {
+            FakeRuns::Script(it) => it.complete(completion, store, writer, effects, out),
+            FakeRuns::Over(it) => it.complete(completion, store, writer, effects, out),
+        }
+    }
+
+    fn cancel(&mut self, effects: &mut Vec<Effect>) -> Option<bool> {
+        match self {
+            FakeRuns::Script(it) => it.cancel(effects),
+            FakeRuns::Over(it) => it.cancel(effects),
+        }
     }
 }
 
 /// A build script's run that is over as it starts, its run asked of the writer.
 struct Script(usize);
 
-impl Runs for Script {
-    fn start(&mut self, _: &Store, writer: Option<&mut dyn Writer>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
+impl Runs<Fake> for Script {
+    fn start(&mut self, _: &Store, writer: Option<&mut FakeWriter>, _: &mut Vec<Effect>, _: &mut Vec<Response>) -> Option<bool> {
         let writer = writer.expect("a build script's run is given its job's writer");
         Some(writer.ran(self.0, load_cargo::v2::Ran::default()).is_ok())
     }
@@ -429,7 +497,7 @@ impl Runs for Script {
         &mut self,
         _: Completion,
         _: &mut Store,
-        _: Option<&mut dyn Writer>,
+        _: Option<&mut FakeWriter>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -444,8 +512,8 @@ impl Runs for Script {
 /// User code that is over as it starts.
 struct Over(Vec<Response>);
 
-impl Runs for Over {
-    fn start(&mut self, _: &Store, _: Option<&mut dyn Writer>, _: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
+impl Runs<Fake> for Over {
+    fn start(&mut self, _: &Store, _: Option<&mut FakeWriter>, _: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
         out.append(&mut self.0);
         Some(true)
     }
@@ -458,7 +526,7 @@ impl Runs for Over {
         &mut self,
         _: Completion,
         _: &mut Store,
-        _: Option<&mut dyn Writer>,
+        _: Option<&mut FakeWriter>,
         _: &mut Vec<Effect>,
         _: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -470,17 +538,12 @@ impl Runs for Over {
     }
 }
 
-impl Front for FakeFront {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
+impl Front<Fake> for FakeFront {
     fn fresh(&self, _: usize) -> bool {
         false
     }
 
-    fn compile(&self, reader: Reader, unit: usize, _: &mut Vec<Image>) -> Result<Compiled, Failed> {
-        let reader: FakeReader = reader.take();
+    fn compile(&self, reader: FakeReader, unit: usize, _: &mut Vec<Image<Fake>>) -> Result<Compiled, Failed> {
         assert_ne!(self.goal, Goal::Reach, "a reach compiles nothing");
         SEEN.with(|it| it.borrow_mut().push((unit, reader.0.runs.clone())));
         if unit == 0 && KEEP.get() {
@@ -499,45 +562,59 @@ impl Front for FakeFront {
         Ok(Compiled { diagnostics, ok: true, puts, outputs, artifact: None, macros: None })
     }
 
-    fn script(&self, unit: usize, _: u64) -> Result<Box<dyn Runs>, ApiError> {
-        Ok(Box::new(Script(unit)))
+    fn script(&self, unit: usize, _: u64) -> Result<FakeRuns, ApiError> {
+        Ok(FakeRuns::Script(Script(unit)))
     }
 
-    fn tests(&self, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<Box<dyn Runs>, ApiError> {
+    fn tests(&self, _: &[Artifact], selection: Selection<'_>, _: u64) -> Result<FakeRuns, ApiError> {
         assert!(selection.ub.is_none(), "tests under the evaluator are evaluated, not run");
-        Ok(Box::new(Over(Vec::new())))
+        Ok(FakeRuns::Over(Over(Vec::new())))
     }
 
-    fn ub_tests(&self, reader: Reader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
-        let FakeReader(_) = reader.take();
+    fn ub_tests(&self, FakeReader(_): FakeReader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
         assert_eq!(self.goal, Goal::Check, "tests under the evaluator only check their units");
         let all = ["a::adds", "a::overflows", "b::reads"];
         Ok(all.iter().filter(|it| selection.filter.iter().all(|filter| it.contains(&**filter))).map(|it| (*it).to_owned()).collect())
     }
 
-    fn evaluate(&self, reader: Reader, test: &str, ub: Ub) -> Result<TestResult, Failed> {
-        let FakeReader(_) = reader.take();
+    fn evaluate(&self, FakeReader(_): FakeReader, test: &str, ub: Ub) -> Result<TestResult, Failed> {
         let (outcome, output) = match test {
             "a::overflows" => (TestOutcome::Failed, format!("undefined behavior\nseed: {}\n", ub.seed.unwrap_or(0)).into_bytes()),
             _ => (TestOutcome::Passed, Vec::new()),
         };
-        Ok(TestResult { name: test.to_owned(), binary: "a".into(), millis: 0, output, outcome, cached: None })
+        Ok(TestResult {
+            name: test.to_owned(),
+            binary: "a".into(),
+            executable: 0,
+            millis: 0,
+            output,
+            outcome,
+            cached: None,
+            outside: false,
+        })
     }
 
-    fn run(&self, _: &[Artifact], _: Option<&str>, _: &[String], _: u64) -> Result<Box<dyn Runs>, ApiError> {
-        Ok(Box::new(Over(vec![Response::Ran { code: Some(0), stdout: b"hi\n".to_vec(), stderr: Vec::new() }])))
+    fn run(&self, _: &[Artifact], _: Option<&str>, _: &[String], _: u64) -> Result<FakeRuns, ApiError> {
+        Ok(FakeRuns::Over(Over(vec![Response::Ran { code: Some(0), stdout: b"hi\n".to_vec(), stderr: Vec::new() }])))
     }
 
-    fn reach(&self, reader: Reader, _: &dyn Front, from: Reader, changes: &[Change]) -> Result<Reach, Failed> {
-        let (FakeReader(_), FakeReader(_)) = (reader.take(), from.take());
+    fn reach(&self, FakeReader(_): FakeReader, _: &FakeFront, FakeReader(_): FakeReader, changes: &[Change]) -> Result<Reach, Failed> {
         Ok(Reach { changes: changes.to_vec(), items: Vec::new(), compiled: Vec::new(), tests: Vec::new() })
     }
 
-    fn codegen_inputs(&self, _: Reader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
+    fn edit(&self, FakeReader(_): FakeReader, _: &[blaze_api::Edit]) -> Result<blaze_api::Edited, Failed> {
+        Ok(blaze_api::Edited { ops: Vec::new(), items: Vec::new() })
+    }
+
+    fn ahead(&self, FakeReader(_): FakeReader, filter: &[String]) -> Result<Vec<u32>, Failed> {
+        Ok(if filter.iter().all(|it| "a::adds".contains(&**it)) { vec![0] } else { Vec::new() })
+    }
+
+    fn codegen_inputs(&self, _: FakeReader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
         Ok(Vec::new())
     }
 
-    fn tables(&self, mut writer: Box<dyn Writer>, _: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
+    fn tables(&self, mut writer: FakeWriter, _: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
         let counted = writer.tables()?;
         Ok(counted.into_iter().map(|(name, elements, bytes)| Table { name: name.to_owned(), elements, bytes }).collect())
     }
@@ -566,9 +643,11 @@ fn checkout(sim: &mut Sim, manifest: &str) {
     sim.change(&name("w/src/main.rs"), b"fn main() {}\n");
 }
 
-fn start(sim: Sim, steps: &Arc<Fake>, seed: u64) -> Daemon<Sim> {
-    let steps: Arc<dyn Steps> = steps.clone();
-    Daemon::start(sim, options(), steps, Box::new(Inline::<Value>::new(seed))).unwrap_or_else(|why| panic!("{why}"))
+/// The simulation's daemon: on [`Sim`], building with the fakes.
+type SimDaemon = Daemon<Sim, Fake>;
+
+fn start(sim: Sim, steps: &Arc<Fake>, seed: u64) -> SimDaemon {
+    Daemon::start(sim, options(), steps.clone(), Runner::Inline(Inline::new(seed))).unwrap_or_else(|why| panic!("{why}"))
 }
 
 struct Client {
@@ -578,7 +657,7 @@ struct Client {
     got: Vec<(u64, Response)>,
 }
 
-fn dial(daemon: &mut Daemon<Sim>) -> Client {
+fn dial(daemon: &mut SimDaemon) -> Client {
     for _ in 0..TURNS {
         if let Ok(conn) = daemon.driver().dial(&Address::Unix(name(SOCKET))) {
             return Client { conn, frames: Frames::new(), next: 1, got: Vec::new() };
@@ -589,7 +668,7 @@ fn dial(daemon: &mut Daemon<Sim>) -> Client {
 }
 
 impl Client {
-    fn send(&mut self, daemon: &mut Daemon<Sim>, request: Request) -> u64 {
+    fn send(&mut self, daemon: &mut SimDaemon, request: Request) -> u64 {
         let id = self.next;
         self.next += 1;
         let bytes = frames::encode(&Envelope { schema: SCHEMA, id, body: request }).unwrap();
@@ -597,7 +676,7 @@ impl Client {
         id
     }
 
-    fn take(&mut self, daemon: &mut Daemon<Sim>) {
+    fn take(&mut self, daemon: &mut SimDaemon) {
         self.frames.push(&daemon.driver().peer_received(self.conn));
         while let Some(item) = self.frames.next().unwrap() {
             let envelope: Envelope<Response> = frames::decode(&item).unwrap();
@@ -614,7 +693,7 @@ impl Client {
     }
 
     /// Turns the daemon until request `id` is done; what it got.
-    fn wait(&mut self, daemon: &mut Daemon<Sim>, id: u64) -> Vec<Response> {
+    fn wait(&mut self, daemon: &mut SimDaemon, id: u64) -> Vec<Response> {
         for _ in 0..TURNS {
             daemon.turn();
             self.take(daemon);
@@ -648,7 +727,7 @@ fn warnings(responses: &[Response]) -> Vec<String> {
         .collect()
 }
 
-fn turn_until(daemon: &mut Daemon<Sim>, mut what: impl FnMut(&mut Daemon<Sim>) -> bool) {
+fn turn_until(daemon: &mut SimDaemon, mut what: impl FnMut(&mut SimDaemon) -> bool) {
     for _ in 0..TURNS {
         if what(daemon) {
             return;
@@ -659,7 +738,7 @@ fn turn_until(daemon: &mut Daemon<Sim>, mut what: impl FnMut(&mut Daemon<Sim>) -
 }
 
 /// Stops it as `blaze stop` would, and starts another on the same disk.
-fn restart(mut daemon: Daemon<Sim>, steps: &Arc<Fake>, seed: u64) -> Daemon<Sim> {
+fn restart(mut daemon: SimDaemon, steps: &Arc<Fake>, seed: u64) -> SimDaemon {
     daemon.stop();
     let mut turns = 0;
     while daemon.turn() {
@@ -753,7 +832,7 @@ fn the_mount_table_survives_a_restart() {
     let mut client = dial(&mut daemon);
     let id = client.send(&mut daemon, Request::Check { view: ViewRef::Head("/w".into()), targets: agent() });
     assert_eq!(client.wait(&mut daemon, id).last(), Some(&Response::Done { ok: true }));
-    let sorted = |daemon: &Daemon<Sim>| {
+    let sorted = |daemon: &SimDaemon| {
         let mut all: Vec<_> = daemon.mounts().all().cloned().collect();
         all.sort_by(|a, b| a.at.cmp(&b.at));
         all
@@ -914,6 +993,64 @@ fn tests_under_the_evaluator_are_each_evaluated_and_one_failing_fails_the_job() 
     assert_eq!(got.last(), Some(&Response::Done { ok: true }));
 }
 
+#[test]
+fn each_kind_of_batch_runs_its_own_step_of_the_front_end() {
+    use std::sync::atomic::AtomicBool;
+
+    use super::{
+        job::{Does, Step, Value},
+        plane::{Did, Work as _},
+        work::Readers,
+    };
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let front = Arc::new(FakeFront { goal: Goal::Check });
+    let inputs = Arc::new(FakeInputs { runs: vec![4, 7] });
+    let reading = || Readers::<Fake> { this: Some(FakeReader(inputs.clone())), ..Readers::default() };
+    let run = |does: Does<Fake>, readers: Readers<Fake>| match Step::of(&cancelled, does).run(0, readers) {
+        Some(Did { outcome: blaze_graph::Outcome::Built, value }) => value,
+        _ => panic!("a step of the fakes is built at once"),
+    };
+    let answered = |value: Value<Fake>| match value {
+        Value::Answer(Ok(response)) => response,
+        _ => panic!("the step gave no answer"),
+    };
+    let ub = Ub { seed: Some(5), schedules: None };
+
+    let from = Readers::<Fake> { from: Some(FakeReader(inputs.clone())), ..reading() };
+    let reached = answered(run(Does::Reach { to: front.clone(), from: front.clone(), changes: Vec::new() }, from));
+    assert!(matches!(&reached, Response::Reached(Reach { changes, .. }) if changes.is_empty()), "{reached:?}");
+
+    let codegen = answered(run(Does::CodegenInputs { front: front.clone() }, reading()));
+    assert_eq!(codegen, Response::CodegenInputs(Vec::new()));
+
+    let writer = FakeWriter { inputs: Arc::new(FakeInputs { runs: vec![1, 2, 3] }), asked: Vec::new() };
+    let tables = Does::Tables { front: front.clone(), images: Vec::new() };
+    let tables = answered(run(tables, Readers { writer: Some(writer), ..Readers::default() }));
+    assert_eq!(tables, Response::Tables(vec![Table { name: "run".into(), elements: 3, bytes: 0 }]));
+
+    let db = Arc::new(Database::new(blaze_query::Config::memory()));
+    let queries = db.open_with(blaze_vfs::View { root: ContentId([0; 32]) }, b"");
+    let traced = answered(run(Does::Trace { db, queries, root: Fake::default().plan_key() }, Readers::default()));
+    assert_eq!(traced, Response::Trace(Vec::new()), "a view no query ran in traces nothing");
+
+    let select = Does::Select { front: front.clone(), filter: vec!["a::".into()], args: Vec::new(), all: true, ub };
+    match run(select, reading()) {
+        Value::Selected(Ok(tests)) => assert_eq!(tests, ["a::adds", "a::overflows"]),
+        _ => panic!("the selection gave no tests"),
+    }
+    let evaluate = Does::Evaluate { front: front.clone(), tests: vec!["a::overflows".to_owned()].into(), ub };
+    match run(evaluate, reading()) {
+        Value::Evaluated(Ok(result)) => assert_eq!((result.name.as_str(), result.outcome), ("a::overflows", TestOutcome::Failed)),
+        _ => panic!("the evaluation gave no result"),
+    }
+
+    match run(Does::Compile { front: Arc::new(FakeFront { goal: Goal::Build }) }, reading()) {
+        Value::Compiled(0, Ok(compiled), images) => assert!(compiled.ok && images.is_empty()),
+        _ => panic!("the compile gave no unit"),
+    }
+}
+
 /// The units each compile saw the runs of, by unit, the runs sorted.
 fn seen() -> Vec<(usize, Vec<usize>)> {
     SEEN.with(|it| it.borrow().iter().map(|(unit, runs)| (*unit, sorted(runs.clone()))).collect())
@@ -976,7 +1113,7 @@ fn a_build_of_an_unchanged_checkout_asks_no_plan_and_lowers_into_the_last_front_
     let steps = Arc::new(Fake::default());
     let mut daemon = start(sim, &steps, 11);
     let mut client = dial(&mut daemon);
-    let build = |client: &mut Client, daemon: &mut Daemon<Sim>| {
+    let build = |client: &mut Client, daemon: &mut SimDaemon| {
         let id = client.send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
         let got = client.wait(daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
@@ -1005,7 +1142,7 @@ fn an_output_is_placed_again_once_its_file_is_not_as_placed() {
     OUTPUT.set(true);
     let mut client = dial(&mut daemon);
     let app = name(&APP_AT[1..]);
-    let mut build = |daemon: &mut Daemon<Sim>| {
+    let mut build = |daemon: &mut SimDaemon| {
         let id = client.send(daemon, Request::Build { view: ViewRef::Head("/w".into()), targets: agent() });
         let got = client.wait(daemon, id);
         assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");

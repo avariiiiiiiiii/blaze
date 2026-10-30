@@ -8,8 +8,8 @@ use hir_expand::name::{AsName, Name};
 use intern::sym;
 use la_arena::Arena;
 use syntax::{
-    AstPtr,
-    ast::{self, HasName, HasTypeBounds},
+    AstPtr, ast as tag,
+    view::{self as ast, HasName, HasTypeBounds},
 };
 
 use crate::{
@@ -31,10 +31,60 @@ use crate::{
     },
 };
 
-/// Lowers an `impl Trait` type whose bounds are on the builder's bound stack above the mark.
-/// It consumes them: the stack is back at the mark when it returns.
-pub(crate) type ImplTraitLowerFn<'l> =
-    &'l mut dyn for<'ec, 'db> FnMut(&'ec mut ExprCollector<'db>, TypePtr, ListMark) -> TypeRefId;
+/// How an `impl Trait` type is lowered where it is written. Its bounds are on the builder's
+/// bound stack above the mark [`ImplTraitLowering::lower`] is given, and lowering consumes
+/// them: the stack is back at the mark when it returns.
+pub enum ImplTraitLowering<'l> {
+    /// An opaque type of its bounds (`TypeRef::ImplTrait`): a return type, an alias.
+    Opaque,
+    /// Not allowed here: an error type, its bounds dropped.
+    Error,
+    /// An argument's: a new type parameter of the generics being collected, its bounds that
+    /// parameter's where predicates.
+    Argument {
+        type_or_consts: &'l mut Arena<TypeOrConstParamData>,
+        where_predicates: &'l mut Vec<WherePredicate>,
+        parent: GenericDefId,
+    },
+}
+
+impl ImplTraitLowering<'_> {
+    pub(crate) fn lower(
+        &mut self,
+        ec: &mut ExprCollector<'_>,
+        ptr: TypePtr,
+        bounds: ListMark,
+    ) -> TypeRefId {
+        match self {
+            ImplTraitLowering::Opaque => {
+                let id = ec.with_lists(bounds, |ec, lists| {
+                    ec.store.alloc_type_ref(TypeRef::ImplTrait(lists.bounds_since(bounds)))
+                });
+                ec.map_type_ref(id, ptr, false)
+            }
+            ImplTraitLowering::Error => {
+                ec.store.truncate_to(bounds);
+                ec.alloc_type_ref(TypeRef::Error, ptr)
+            }
+            ImplTraitLowering::Argument { type_or_consts, where_predicates, parent } => {
+                let param = TypeParamData {
+                    name: None,
+                    default: None,
+                    provenance: TypeParamProvenance::ArgumentImplTrait,
+                };
+                let param_id = TypeRef::TypeParam(TypeParamId::from_unchecked(TypeOrConstParamId {
+                    parent: *parent,
+                    local_id: type_or_consts.alloc(param.into()),
+                }));
+                let type_ref = ec.alloc_type_ref(param_id, ptr);
+                where_predicates.extend(ec.store.drain_bounds(bounds).map(|bound| {
+                    WherePredicate::TypeBound { lifetimes: None, target: type_ref, bound }
+                }));
+                type_ref
+            }
+        }
+    }
+}
 
 pub(crate) struct GenericParamsCollector {
     type_or_consts: Arena<TypeOrConstParamData>,
@@ -55,7 +105,7 @@ impl GenericParamsCollector {
     pub(crate) fn with_self_param(
         ec: &mut ExprCollector<'_>,
         parent: GenericDefId,
-        bounds: Option<ast::TypeBoundList>,
+        bounds: Option<ast::TypeBoundList<'_>>,
     ) -> Self {
         let mut this = Self::new(parent);
         this.fill_self_param(ec, bounds);
@@ -65,8 +115,8 @@ impl GenericParamsCollector {
     pub(crate) fn lower(
         &mut self,
         ec: &mut ExprCollector<'_>,
-        generic_param_list: Option<ast::GenericParamList>,
-        where_clause: Option<ast::WhereClause>,
+        generic_param_list: Option<ast::GenericParamList<'_>>,
+        where_clause: Option<ast::WhereClause<'_>>,
     ) {
         if let Some(params) = generic_param_list {
             self.lower_param_list(ec, params)
@@ -79,16 +129,9 @@ impl GenericParamsCollector {
     pub(crate) fn collect_impl_trait<R>(
         &mut self,
         ec: &mut ExprCollector<'_>,
-        cb: impl FnOnce(&mut ExprCollector<'_>, ImplTraitLowerFn<'_>) -> R,
+        cb: impl FnOnce(&mut ExprCollector<'_>, &mut ImplTraitLowering<'_>) -> R,
     ) -> R {
-        cb(
-            ec,
-            &mut Self::lower_argument_impl_trait(
-                &mut self.type_or_consts,
-                &mut self.where_predicates,
-                self.parent,
-            ),
-        )
+        cb(ec, &mut self.argument_impl_trait())
     }
 
     pub(crate) fn finish(self) -> GenericParams {
@@ -106,9 +149,9 @@ impl GenericParamsCollector {
         }
     }
 
-    fn lower_param_list(&mut self, ec: &mut ExprCollector<'_>, params: ast::GenericParamList) {
+    fn lower_param_list(&mut self, ec: &mut ExprCollector<'_>, params: ast::GenericParamList<'_>) {
         for generic_param in params.generic_params() {
-            let enabled = ec.check_cfg(&generic_param);
+            let enabled = ec.check_cfg(generic_param);
             if !enabled {
                 continue;
             }
@@ -117,7 +160,7 @@ impl GenericParamsCollector {
                 ast::GenericParam::TypeParam(type_param) => {
                     let name = type_param.name().map_or_else(Name::missing, |it| it.as_name());
                     let default = type_param.default_type().map(|it| {
-                        ec.lower_type_ref(it, &mut ExprCollector::impl_trait_error_allocator)
+                        ec.lower_type_ref(it, &mut ImplTraitLowering::Error)
                     });
                     let param = TypeParamData {
                         name: Some(name),
@@ -139,7 +182,7 @@ impl GenericParamsCollector {
                     let name = const_param.name().map_or_else(Name::missing, |it| it.as_name());
                     let ty = ec.lower_type_ref_opt(
                         const_param.ty(),
-                        &mut ExprCollector::impl_trait_error_allocator,
+                        &mut ImplTraitLowering::Error,
                     );
                     let default = const_param.default_val().map(|it| ec.lower_const_arg(it));
                     let param = ConstParamData { name, ty, default };
@@ -149,7 +192,7 @@ impl GenericParamsCollector {
                     let lifetime = ec.lower_lifetime_ref_opt(lifetime_param.lifetime());
                     if let LifetimeRef::Named(name) = &ec.store.lifetimes[lifetime] {
                         let param = LifetimeParamData {
-                            name: name.clone(), // clone: the parameter owns its interned name
+                            name: *name,
                             bound_type: LifetimeBoundType::EarlyBound,
                         };
                         let _idx = self.lifetimes.alloc(param);
@@ -169,13 +212,13 @@ impl GenericParamsCollector {
     fn lower_where_predicates(
         &mut self,
         ec: &mut ExprCollector<'_>,
-        where_clause: ast::WhereClause,
+        where_clause: ast::WhereClause<'_>,
     ) {
         ec.with_lifetime_bound_scope(LifetimeBoundScope::WhereClause, |ec| {
             for pred in where_clause.predicates() {
                 let target = if let Some(type_ref) = pred.ty() {
                     Either::Left(
-                        ec.lower_type_ref(type_ref, &mut ExprCollector::impl_trait_error_allocator),
+                        ec.lower_type_ref(type_ref, &mut ImplTraitLowering::Error),
                     )
                 } else if let Some(lifetime) = pred.lifetime() {
                     Either::Right(ec.lower_lifetime_ref(lifetime))
@@ -204,7 +247,7 @@ impl GenericParamsCollector {
     fn lower_bounds(
         &mut self,
         ec: &mut ExprCollector<'_>,
-        type_bounds: Option<ast::TypeBoundList>,
+        type_bounds: Option<ast::TypeBoundList<'_>>,
         target: Either<TypeRefId, LifetimeRefId>,
     ) {
         for bound in type_bounds.iter().flat_map(|type_bound_list| type_bound_list.bounds()) {
@@ -215,18 +258,11 @@ impl GenericParamsCollector {
     fn lower_type_bound_as_predicate(
         &mut self,
         ec: &mut ExprCollector<'_>,
-        bound: ast::TypeBound,
+        bound: ast::TypeBound<'_>,
         hrtb_lifetimes: Option<Names>,
         target: Either<TypeRefId, LifetimeRefId>,
     ) {
-        let bound = ec.lower_type_bound(
-            bound,
-            &mut Self::lower_argument_impl_trait(
-                &mut self.type_or_consts,
-                &mut self.where_predicates,
-                self.parent,
-            ),
-        );
+        let bound = ec.lower_type_bound(bound, &mut self.argument_impl_trait());
         let predicate = match (target, bound) {
             (_, TypeBound::Error | TypeBound::Use(_)) => return,
             (Either::Left(type_ref), bound) => {
@@ -243,30 +279,19 @@ impl GenericParamsCollector {
         self.where_predicates.push(predicate);
     }
 
-    fn lower_argument_impl_trait(
-        type_or_consts: &mut Arena<TypeOrConstParamData>,
-        where_predicates: &mut Vec<WherePredicate>,
-        parent: GenericDefId,
-    ) -> impl for<'ec, 'db> FnMut(&'ec mut ExprCollector<'db>, TypePtr, ListMark) -> TypeRefId {
-        move |ec, ptr, impl_trait_bounds| {
-            let param = TypeParamData {
-                name: None,
-                default: None,
-                provenance: TypeParamProvenance::ArgumentImplTrait,
-            };
-            let param_id = TypeRef::TypeParam(TypeParamId::from_unchecked(TypeOrConstParamId {
-                parent,
-                local_id: type_or_consts.alloc(param.into()),
-            }));
-            let type_ref = ec.alloc_type_ref(param_id, ptr);
-            where_predicates.extend(ec.store.drain_bounds(impl_trait_bounds).map(|bound| {
-                WherePredicate::TypeBound { lifetimes: None, target: type_ref, bound }
-            }));
-            type_ref
+    fn argument_impl_trait(&mut self) -> ImplTraitLowering<'_> {
+        ImplTraitLowering::Argument {
+            type_or_consts: &mut self.type_or_consts,
+            where_predicates: &mut self.where_predicates,
+            parent: self.parent,
         }
     }
 
-    fn fill_self_param(&mut self, ec: &mut ExprCollector<'_>, bounds: Option<ast::TypeBoundList>) {
+    fn fill_self_param(
+        &mut self,
+        ec: &mut ExprCollector<'_>,
+        bounds: Option<ast::TypeBoundList<'_>>,
+    ) {
         let self_ = Name::new_symbol_root(sym::Self_);
         let idx = self.type_or_consts.alloc(
             TypeParamData {
@@ -313,8 +338,8 @@ impl ExprCollector<'_> {
     /// paths, so the bound itself is a plain record.
     pub(super) fn lower_type_bound(
         &mut self,
-        node: ast::TypeBound,
-        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+        node: ast::TypeBound<'_>,
+        impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> TypeBound {
         let Some(kind) = node.kind() else { return TypeBound::Error };
         match kind {
@@ -330,11 +355,11 @@ impl ExprCollector<'_> {
                     TraitBoundModifier::Const
                 };
                 let Some(path) =
-                    path_type.path().and_then(|it| self.lower_path(it, impl_trait_lower_fn))
+                    path_type.path().and_then(|it| self.lower_path_view(it, impl_trait_lower_fn))
                 else {
                     return TypeBound::Error;
                 };
-                let path = self.alloc_path(path, AstPtr::new(&path_type).upcast());
+                let path = self.alloc_path(path, AstPtr::<tag::PathType>::of(path_type).upcast());
                 if binder.is_empty() {
                     TypeBound::Path(path, m)
                 } else {
@@ -363,7 +388,7 @@ impl ExprCollector<'_> {
     }
 
     /// The lifetimes of a bound's `for<..>`, as a run of names (empty without a binder).
-    fn lower_bound_binder(&mut self, binder: Option<ast::ForBinder>) -> Names {
+    fn lower_bound_binder(&mut self, binder: Option<ast::ForBinder<'_>>) -> Names {
         let Some(params) = binder.and_then(|it| it.generic_param_list()) else {
             return Names::EMPTY;
         };

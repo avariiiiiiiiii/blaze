@@ -20,14 +20,18 @@
 //!   the workers whose placer it uses.
 //!
 //! Workers take compiles from the fetcher, compile with no lock held, place one at a time,
-//! and send the answers after the fetcher's lock is let go. A compile that panics or fails
+//! and send the answers after the fetcher's lock is let go, before queuing the callees or
+//! binding the tier-up. A worker with nothing to do spins a while before it sleeps (one at a
+//! time), and a queued compile wakes one sleeper, not all. A compile that panics or fails
 //! answers `Failed` naming the function; a run that called it is stopped with that error,
 //! never left to run something else. The fetcher's lock ([`Shared::state`]) is held only to
 //! take or record a compile, never across one; the placer's only across one placement.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
 use blaze_inproc::CellView;
@@ -97,7 +101,7 @@ pub struct Cells(pub CellView);
 
 impl tier::Cells for Cells {
     fn load(&self, offset: u64) -> Result<u64, String> {
-        self.0.load(offset).map_err(|it| it.to_string())
+        self.0.load(offset).map_err(|it| it.to_string()) // alloc: only for a load that failed
     }
 }
 
@@ -111,7 +115,7 @@ impl<C: Compiler, P: Placer, A: Answers> tier::Recompile for Recompiler<C, P, A>
     fn recompile(&self, function: u32, to: Tier) -> Result<Option<u64>, String> {
         let shared = self
             .0
-            .upgrade()
+            .upgrade() // alloc: below, only once the runner closed
             .ok_or_else(|| format!("tier-up of lazy function {function}: the lazy runner closed"))?;
         shared.recompile(LazyId(function), to)
     }
@@ -129,13 +133,27 @@ struct State {
     fetcher: Fetcher,
     closing: bool,
     idle_queued: bool,
+    /// Workers asleep on [`Shared::wake`].
+    parked: u32,
 }
+
+/// How long a worker that ran out of compiles watches [`Shared::jobs`] before it sleeps: past
+/// the gap between two first calls of one thread (the asker's wake-up, the resolver, the run up
+/// to its next call), so a burst of first calls is taken without a wake-up per ask.
+const SPIN: Duration = Duration::from_micros(50);
+/// Loads of [`Shared::jobs`] between two looks at the clock.
+const SPIN_LOADS: u32 = 64;
 
 struct Shared<C: Compiler, P: Placer, A: Answers> {
     session: Session,
     /// The fetcher's state: held only to take or record a compile, never across one.
     state: Mutex<State>,
     wake: Condvar,
+    /// Bumped, under the fetcher's lock, whenever a compile is queued or the runner closes:
+    /// what the spinning worker watches.
+    jobs: AtomicU64,
+    /// Whether a worker is spinning on `jobs`: at most one is.
+    spinning: AtomicBool,
     compiler: C,
     /// Held across one placement: the image is placed into one function at a time.
     placer: Mutex<P>,
@@ -187,35 +205,39 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         for &(id, priority) in first {
             fetcher.want(id, priority);
         }
+        // alloc: setup, once per run.
         let shared = Arc::new(Shared {
             session,
-            state: Mutex::new(State { fetcher, closing: false, idle_queued: false }),
+            state: Mutex::new(State { fetcher, closing: false, idle_queued: false, parked: 0 }),
             wake: Condvar::new(),
+            jobs: AtomicU64::new(0),
+            spinning: AtomicBool::new(false),
             compiler,
             placer: Mutex::new(placer),
             answers,
             idle: config.idle,
             tier: Mutex::new(None),
-            unbound: Mutex::new(Vec::new()),
+            unbound: Mutex::new(Vec::new()), // alloc: setup; grows only for a failed bind
         });
         if let Some(up) = tier {
             let recompiler = Recompiler(Arc::downgrade(&shared));
             let runner = tier::Runner::start(functions, up.policy, up.config, Cells(up.cells), recompiler)?;
             *lock(&shared.tier) = Some(Tiered {
                 runner,
-                bound: vec![false; functions as usize],
+                bound: vec![false; functions as usize], // alloc: setup, once per run
                 remembered: FxHashMap::default(),
             });
         }
         let mut threads = Vec::with_capacity(workers as usize);
         for n in 0..workers {
             let worker = Arc::clone(&shared);
-            let spawned =
-                std::thread::Builder::new().name(format!("blaze-lazy-{n}")).spawn(move || worker.work());
+            let name = format!("blaze-lazy-{n}"); // alloc: setup, a name per worker
+            let spawned = std::thread::Builder::new().name(name).spawn(move || worker.work());
             match spawned {
                 Ok(thread) => threads.push(thread),
                 Err(error) => {
                     drop(Runner { shared, threads });
+                    // alloc: the error of a failed start.
                     return Err(format!("starting a lazy compile thread: {error}"));
                 }
             }
@@ -229,9 +251,10 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
         loop {
             let frame = match reader.recv() {
                 Ok(frame) => frame,
-                Err(error) => return error.to_string(),
+                Err(error) => return error.to_string(), // alloc: the run's end
             };
             if let Err(error) = self.frame(client, frame.kind, frame.seq, frame.body) {
+                // alloc: the run's end.
                 return format!("process {client} asked what is not a lazy function's code: {error}");
             }
         }
@@ -257,11 +280,14 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
     /// Queues `ids` at `priority`: the daemon's prefetches, such as an agent's declared intent.
     pub fn want(&self, ids: &[LazyId], priority: Priority) {
         let mut state = lock(&self.shared.state);
+        let mut queued = 0;
         for &id in ids {
+            queued += u32::from(!state.fetcher.started(id));
             state.fetcher.want(id, priority);
         }
+        let wakes = self.shared.queued(&state, queued);
         drop(state);
-        self.shared.wake.notify_all();
+        self.shared.rouse(wakes);
     }
 
     /// Where `key`'s code was published, once it was.
@@ -275,10 +301,12 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
     pub fn remembered(&self, id: LazyId, tier: Tier) -> Result<(), String> {
         let mut tiered = lock(&self.shared.tier);
         let Some(tiered) = tiered.as_mut() else {
+            // alloc: the daemon's mistake, reported.
             return Err(format!("remembering {tier:?} for lazy function {}: the run is not tiered", id.0));
         };
         match tiered.bound.get(id.index()) {
             None => {
+                // alloc: the daemon's mistake, reported.
                 Err(format!("remembering {tier:?} for lazy function {}, of {}", id.0, tiered.bound.len()))
             }
             Some(true) => {
@@ -299,7 +327,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
 
     /// The ids of the lazy functions whose code is among `reached`.
     pub fn reached(&self, reached: &[CodeHash]) -> Vec<LazyId> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(reached.len()); // alloc: once per run, from history
         self.shared.session.plan().reached(reached, &mut out);
         out
     }
@@ -309,8 +337,7 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
     pub fn close(mut self) -> Closed {
         let tiered = lock(&self.shared.tier).take();
         let tier = tiered.map(|it| it.runner.close());
-        lock(&self.shared.state).closing = true;
-        self.shared.wake.notify_all();
+        self.shared.shut();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -320,8 +347,8 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             failures: state
                 .fetcher
                 .failures()
-                .map(|(id, why)| (plan.key(id), plan.item(id), why.to_owned()))
-                .collect(),
+                .map(|(id, why)| (plan.key(id), plan.item(id), why.to_owned())) // alloc: the close's report
+                .collect(), // alloc: the close's report
             compiles: state.fetcher.compiles(),
             tier,
             unbound: std::mem::take(&mut *lock(&self.shared.unbound)),
@@ -336,8 +363,7 @@ impl<C: Compiler, P: Placer, A: Answers> Drop for Runner<C, P, A> {
         if self.threads.is_empty() {
             return;
         }
-        lock(&self.shared.state).closing = true;
-        self.shared.wake.notify_all();
+        self.shared.shut();
         for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
@@ -352,55 +378,121 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
             self.answers.send(to.client, to.seq, wire::READY_KIND, &wire::ready(to.request, lazy, target));
             return;
         }
-        let mut actions = Vec::new();
+        let queued = u32::from(!state.fetcher.started(LazyId(lazy)) && lazy < state.fetcher.len());
+        let mut actions = Vec::new(); // alloc: only for a failure; a wait or a queue pushes nothing
         state.fetcher.ask(to, lazy, &mut actions);
+        let wakes = self.queued(&state, queued);
         drop(state);
+        self.rouse(wakes);
+        self.act(&actions, &mut Vec::new()); // alloc: only to encode a failure
+    }
+
+    /// After `queued` compiles were queued, with the fetcher's lock held: tells the spinning
+    /// worker, and says how many sleeping workers to wake ([`Shared::rouse`], once the lock is
+    /// let go): one per compile the spinner doesn't take. A worker that finishes a compile takes
+    /// the next itself, so a wake too few costs parallelism, never a compile.
+    fn queued(&self, state: &State, queued: u32) -> u32 {
+        if queued == 0 {
+            return 0;
+        }
+        self.jobs.fetch_add(1, Ordering::Release);
+        let spinner = u32::from(self.spinning.load(Ordering::Acquire));
+        queued.saturating_sub(spinner).min(state.parked)
+    }
+
+    fn rouse(&self, wakes: u32) {
+        for _ in 0..wakes {
+            self.wake.notify_one();
+        }
+    }
+
+    /// Closes the runner: every worker ends once its compile does.
+    fn shut(&self) {
+        lock(&self.state).closing = true;
+        self.jobs.fetch_add(1, Ordering::Release);
         self.wake.notify_all();
-        self.act(&actions, &mut Vec::with_capacity(64));
+    }
+
+    /// The next compile, waiting for one; none once the runner closes. A worker that finds
+    /// none spins on [`Shared::jobs`] for up to [`SPIN`] when no other worker does, then
+    /// sleeps: an ask that comes meanwhile is taken without waking a thread.
+    fn take(&self) -> Option<LazyId> {
+        let mut state = lock(&self.state);
+        let mut spun = false;
+        loop {
+            if state.closing {
+                return None;
+            }
+            if let Some((id, _)) = state.fetcher.next() {
+                return Some(id);
+            }
+            if self.idle && !state.idle_queued && state.fetcher.idle() {
+                state.idle_queued = true;
+                for id in 0..state.fetcher.len() {
+                    state.fetcher.want(LazyId(id), Priority::Idle);
+                }
+                self.jobs.fetch_add(1, Ordering::Release);
+                self.wake.notify_all();
+                continue;
+            }
+            if !spun && !self.spinning.swap(true, Ordering::AcqRel) {
+                let seen = self.jobs.load(Ordering::Acquire);
+                drop(state);
+                spun = !self.spin(seen);
+                self.spinning.store(false, Ordering::Release);
+                state = lock(&self.state);
+                continue;
+            }
+            state.parked += 1;
+            state = self.wake.wait(state).unwrap_or_else(PoisonError::into_inner);
+            state.parked -= 1;
+            spun = false;
+        }
+    }
+
+    /// Watches [`Shared::jobs`] move from `seen`, for up to [`SPIN`]: whether it did.
+    fn spin(&self, seen: u64) -> bool {
+        let start = Instant::now();
+        loop {
+            for _ in 0..SPIN_LOADS {
+                if self.jobs.load(Ordering::Acquire) != seen {
+                    return true;
+                }
+                std::hint::spin_loop();
+            }
+            if start.elapsed() >= SPIN {
+                return false;
+            }
+        }
     }
 
     fn work(&self) {
-        let mut actions = Vec::new();
-        let mut callees = Vec::new();
-        let mut frame = Vec::with_capacity(64);
-        loop {
-            let (id, _) = {
-                let mut state = lock(&self.state);
-                loop {
-                    if state.closing {
-                        return;
-                    }
-                    if let Some(job) = state.fetcher.next() {
-                        break job;
-                    }
-                    if self.idle && !state.idle_queued && state.fetcher.idle() {
-                        state.idle_queued = true;
-                        for id in 0..state.fetcher.len() {
-                            state.fetcher.want(LazyId(id), Priority::Idle);
-                        }
-                        continue;
-                    }
-                    state = self.wake.wait(state).unwrap_or_else(PoisonError::into_inner);
-                }
-            };
+        // alloc: each worker's buffers, made once and reused for every compile.
+        let (mut actions, mut callees, mut frame) = (Vec::new(), Vec::new(), Vec::new());
+        while let Some(id) = self.take() {
             let placed = self.compile_and_place(id);
-            callees.clear();
-            if let Ok((_, function, _)) = &placed {
-                self.session.plan().callees(function, &mut callees);
-            }
             actions.clear();
             let mut state = lock(&self.state);
             let result = placed.as_ref().map(|it| it.0).map_err(String::as_str);
             state.fetcher.done(id, result, &mut actions);
-            for &callee in &callees {
-                state.fetcher.want(callee, Priority::Callee);
-            }
             drop(state);
-            self.wake.notify_all();
-            if let Ok((_, _, cells)) = placed {
-                self.bind(id, cells);
-            }
+            // The askers wait on nothing else: answered before the prefetch and the tier-up.
             self.act(&actions, &mut frame);
+            let Ok((_, function, cells)) = placed else { continue };
+            callees.clear();
+            self.session.plan().callees(&function, &mut callees);
+            if !callees.is_empty() {
+                let mut state = lock(&self.state);
+                let mut queued = 0;
+                for &callee in &callees {
+                    queued += u32::from(!state.fetcher.started(callee));
+                    state.fetcher.want(callee, Priority::Callee);
+                }
+                let wakes = self.queued(&state, queued);
+                drop(state);
+                self.rouse(wakes);
+            }
+            self.bind(id, cells);
         }
     }
 
@@ -470,14 +562,15 @@ impl<C: Compiler, P: Placer, A: Answers> Shared<C, P, A> {
         let plan = self.session.plan();
         for action in actions {
             match action {
-                Action::Answer { to, lazy, outcome } => {
+                Action::Answer { to, lazy, outcome: Outcome::Ready(target) } => {
+                    let ready = wire::ready(to.request, *lazy, *target);
+                    self.answers.send(to.client, to.seq, wire::READY_KIND, &ready);
+                }
+                Action::Answer { to, lazy, outcome: Outcome::Failed(why) } => {
                     frame.clear();
-                    let answer = match outcome {
-                        Outcome::Ready(target) => Frame::Ready { request: to.request, lazy: *lazy, target: *target },
-                        Outcome::Failed(why) => Frame::Failed { request: to.request, lazy: *lazy, why: fit(why) },
-                    };
+                    let answer = Frame::Failed { request: to.request, lazy: *lazy, why: fit(why) };
                     answer.encode(frame);
-                    self.answers.send(to.client, to.seq, wire::channel_kind(&answer), frame);
+                    self.answers.send(to.client, to.seq, wire::FAILED_KIND, frame);
                 }
                 Action::Stop { lazy, why } => {
                     let function = (*lazy < plan.len()).then(|| (plan.key(LazyId(*lazy)), plan.item(LazyId(*lazy))));
@@ -544,6 +637,7 @@ impl Answers for Runs {
     }
 }
 
+// dyn: a panic's payload, which is what `catch_unwind` gives.
 fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
     match payload.downcast_ref::<&str>() {
         Some(text) => (*text).to_owned(),

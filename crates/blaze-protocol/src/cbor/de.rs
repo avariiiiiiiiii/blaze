@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use serde::de::{self, Deserialize, DeserializeSeed, IntoDeserializer as _, Visitor};
 
 use super::{
-    ARRAY, BYTES, Error, MAP, NAN, NEGATIVE, NULL, SIMPLE, TEXT, UNSIGNED, check, from_half,
+    ARRAY, BYTES, Error, MAP, NAN, NEGATIVE, NULL, RAW, SIMPLE, TEXT, UNSIGNED, check, from_half,
     half_of, key_order,
 };
 use super::check::{DEEPEST, item};
@@ -23,6 +23,24 @@ pub fn from_slice<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error
         false => Err(decoder.offence("bytes after the item")),
     });
     read.map_err(|error| check(bytes).err().unwrap_or(error))
+}
+
+/// The value of type `T` that the item at the start of `bytes` encodes, and how many bytes the
+/// item is. For bytes already checked (a [`super::Raw`]'s), so an error is what the type found.
+pub(super) fn from_front<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<(T, usize), Error> {
+    let mut decoder = Decoder { bytes, at: 0, depth: 0 };
+    let value = T::deserialize(&mut decoder)?;
+    Ok((value, decoder.at))
+}
+
+/// The count of the array at the start of `bytes` and how many bytes its head is; `None` when
+/// the item there is not an array.
+pub(super) fn array_head(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut decoder = Decoder { bytes, at: 0, depth: 0 };
+    match decoder.head() {
+        Ok((ARRAY, _, n)) => Some((n, decoder.at)),
+        _ => None,
+    }
 }
 
 struct Decoder<'de> {
@@ -176,11 +194,18 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
         }
     }
 
+    /// A [`super::Raw`] is handed its item's bytes, checked as far down as any item is (depth
+    /// included) and passed over.
     fn deserialize_newtype_struct<V: Visitor<'de>>(
         self,
-        _: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Error> {
+        if name == RAW {
+            let start = self.at;
+            self.pass()?;
+            return visitor.visit_borrowed_bytes(&self.bytes[start..self.at]);
+        }
         visitor.visit_newtype_struct(self)
     }
 

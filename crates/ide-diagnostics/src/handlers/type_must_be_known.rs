@@ -48,7 +48,11 @@ pub(crate) fn type_must_be_known<'db>(
     };
     Diagnostic::new_with_syntax_node_ptr(
         ctx,
-        DiagnosticCode::RustcHardError("E0282"),
+        DiagnosticCode::RustcHardError(match d.kind {
+            hir::TypeAnnotationNeeded::E0282 => "E0282",
+            hir::TypeAnnotationNeeded::E0283 => "E0283",
+            hir::TypeAnnotationNeeded::E0284 => "E0284",
+        }),
         message,
         at_point,
     )

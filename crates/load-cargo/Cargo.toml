@@ -40,6 +40,7 @@ blaze-query.workspace = true
 blaze-units = { workspace = true, features = ["query"] }
 blaze-vfs.workspace = true
 hir.workspace = true
+hir-def.workspace = true
 rustc-hash.workspace = true
 salsa.workspace = true
 toml.workspace = true

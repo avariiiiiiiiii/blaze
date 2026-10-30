@@ -5,7 +5,7 @@
 
 #![forbid(unsafe_code)]
 
-use blaze_api::{Artifact, UnitProfile};
+use blaze_api::{ApiError, Artifact, ArtifactKind, UnitProfile};
 use blaze_ids::ContentId;
 use blaze_units::{
     query::{PackagePlan, UnitPlan},
@@ -30,19 +30,19 @@ pub(crate) fn artifact(
     content: ContentId,
     fresh: bool,
     runs: Runs,
-) -> Artifact {
+) -> Result<Artifact, ApiError> {
     let executable = executable(unit, plan);
     let runs = match executable {
         Some(_) => runs,
         None => Runs::default(),
     };
-    Artifact {
+    Ok(Artifact {
         package: unit.pkg_id.clone(),
-        kind: kind(unit),
+        kind: kind(unit)?,
         path: path.to_owned(),
         content,
         manifest_path: package.manifest_path.clone(),
-        target: unit_target(unit),
+        target: unit_target(unit)?,
         profile: profile(unit),
         features: unit.features.clone(),
         filenames: filenames(unit, plan),
@@ -51,7 +51,7 @@ pub(crate) fn artifact(
         runner: runs.runner,
         env: runs.env,
         harness: plan.harness,
-    }
+    })
 }
 
 /// The variable of the dynamic library search path on `os` (cargo's `dylib_path_envvar`).
@@ -106,19 +106,24 @@ pub(crate) fn run_env(
     env
 }
 
-/// What the artifact is, as the agent API names it.
-pub(crate) fn kind(unit: &Unit) -> String {
+/// What the artifact is, as the agent API names it; a target kind blaze doesn't know is an
+/// error naming it.
+pub(crate) fn kind(unit: &Unit) -> Result<ArtifactKind, ApiError> {
     let kinds = &unit.target.kind;
     if matches!(unit.mode, Mode::Test) {
-        return "test".to_owned();
+        return Ok(ArtifactKind::Test);
     }
     if kinds.iter().any(|it| it == "proc-macro") {
-        return "proc-macro".to_owned();
+        return Ok(ArtifactKind::ProcMacro);
     }
     if kinds.iter().any(|it| matches!(it.as_str(), "lib" | "rlib" | "dylib" | "cdylib" | "staticlib")) {
-        return "lib".to_owned();
+        return Ok(ArtifactKind::Lib);
     }
-    kinds.first().cloned().unwrap_or_default()
+    let first = kinds.first().map_or("", String::as_str);
+    ArtifactKind::named(first).ok_or_else(|| {
+        // alloc: error path
+        ApiError::new(format!("target `{}` is of the kind `{first}`, which blaze doesn't know", unit.target.name), None)
+    })
 }
 
 /// cargo's `ArtifactProfile`.

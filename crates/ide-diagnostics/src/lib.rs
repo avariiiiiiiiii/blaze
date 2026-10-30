@@ -42,11 +42,13 @@ mod handlers {
     pub(crate) mod closure_kind_mismatch;
     pub(crate) mod const_check;
     pub(crate) mod duplicate_field;
+    pub(crate) mod edition_dependent_method_call;
     pub(crate) mod elided_lifetimes_in_path;
     pub(crate) mod expected_array_or_slice_pat;
     pub(crate) mod expected_function;
     pub(crate) mod explicit_drop_method_use;
     pub(crate) mod fru_in_destructuring_assignment;
+    pub(crate) mod fully_qualified_call_from_2018;
     pub(crate) mod functional_record_update_on_non_struct;
     pub(crate) mod generic_args_prohibited;
     pub(crate) mod generic_default_refers_to_self;
@@ -88,6 +90,7 @@ mod handlers {
     pub(crate) mod trait_impl_missing_assoc_item;
     pub(crate) mod trait_impl_orphan;
     pub(crate) mod trait_impl_redundant_assoc_item;
+    pub(crate) mod trait_solver_error;
     pub(crate) mod type_mismatch;
     pub(crate) mod type_must_be_known;
     pub(crate) mod typed_hole;
@@ -107,6 +110,7 @@ mod handlers {
     pub(crate) mod unresolved_macro_call;
     pub(crate) mod unresolved_method;
     pub(crate) mod unresolved_module;
+    pub(crate) mod unresolved_path;
     pub(crate) mod unused_must_use;
     pub(crate) mod yield_outside_coroutine;
 
@@ -395,7 +399,9 @@ pub fn semantic_diagnostics_within(
     file_id: FileId,
     within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
 ) -> Vec<Diagnostic> {
-    semantic_diagnostics_asked(db, config, resolve, file_id, within, None)
+    semantic_diagnostics_asked::<fn(hir::DefWithBody) -> bool>(
+        db, config, resolve, file_id, within, None,
+    )
 }
 
 /// [`semantic_diagnostics_within`], of the bodies only those `bodies` asks for, for a caller
@@ -407,18 +413,18 @@ pub fn semantic_diagnostics_of_bodies(
     resolve: &AssistResolveStrategy,
     file_id: FileId,
     within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
-    bodies: &dyn Fn(hir::DefWithBody) -> bool,
+    bodies: &impl Fn(hir::DefWithBody) -> bool,
 ) -> Vec<Diagnostic> {
     semantic_diagnostics_asked(db, config, resolve, file_id, within, Some(bodies))
 }
 
-fn semantic_diagnostics_asked(
+fn semantic_diagnostics_asked<F: Fn(hir::DefWithBody) -> bool>(
     db: &RootDatabase,
     config: &DiagnosticsConfig,
     resolve: &AssistResolveStrategy,
     file_id: FileId,
     within: Option<std::sync::Arc<ide_db::FxHashSet<ide_db::base_db::Crate>>>,
-    bodies: Option<&dyn Fn(hir::DefWithBody) -> bool>,
+    bodies: Option<&F>,
 ) -> Vec<Diagnostic> {
     let _p = tracing::info_span!("semantic_diagnostics").entered();
     let sema = match within {
@@ -503,6 +509,8 @@ fn semantic_diagnostics_asked(
             AnyDiagnostic::ExpectedArrayOrSlicePat(d) => handlers::expected_array_or_slice_pat::expected_array_or_slice_pat(&ctx, &d),
             AnyDiagnostic::ExpectedFunction(d) => handlers::expected_function::expected_function(&ctx, &d),
             AnyDiagnostic::FunctionalRecordUpdateOnNonStruct(d) => handlers::functional_record_update_on_non_struct::functional_record_update_on_non_struct(&ctx, &d),
+            AnyDiagnostic::EditionDependentMethodCall(d) => handlers::edition_dependent_method_call::edition_dependent_method_call(&ctx, &d),
+            AnyDiagnostic::FullyQualifiedCallFrom2018(d) => handlers::fully_qualified_call_from_2018::fully_qualified_call_from_2018(&ctx, &d),
             AnyDiagnostic::InactiveCode(d) => match handlers::inactive_code::inactive_code(&ctx, &d) {
                 Some(it) => it,
                 None => continue,
@@ -565,6 +573,7 @@ fn semantic_diagnostics_asked(
             AnyDiagnostic::UnresolvedMacroCall(d) => handlers::unresolved_macro_call::unresolved_macro_call(&ctx, &d),
             AnyDiagnostic::UnresolvedMethodCall(d) => handlers::unresolved_method::unresolved_method(&ctx, &d),
             AnyDiagnostic::UnresolvedModule(d) => handlers::unresolved_module::unresolved_module(&ctx, &d),
+            AnyDiagnostic::UnresolvedPath(d) => handlers::unresolved_path::unresolved_path(&ctx, &d),
             AnyDiagnostic::UnusedMustUse(d) => handlers::unused_must_use::unused_must_use(&ctx, &d),
             AnyDiagnostic::BreakOutsideOfLoop(d) => handlers::break_outside_of_loop::break_outside_of_loop(&ctx, &d),
             AnyDiagnostic::MismatchedTupleStructPatArgCount(d) => handlers::mismatched_arg_count::mismatched_tuple_struct_pat_arg_count(&ctx, &d),
@@ -587,6 +596,7 @@ fn semantic_diagnostics_asked(
             AnyDiagnostic::InvalidLhsOfAssignment(d) => handlers::invalid_lhs_of_assignment::invalid_lhs_of_assignment(&ctx, &d),
             AnyDiagnostic::InvalidRangePatType(d) => handlers::invalid_range_pat_type::invalid_range_pat_type(&ctx, &d),
             AnyDiagnostic::TypeMustBeKnown(d) => handlers::type_must_be_known::type_must_be_known(&ctx, &d),
+            AnyDiagnostic::TraitSolverError(d) => handlers::trait_solver_error::trait_solver_error(&ctx, &d),
             AnyDiagnostic::PatternArgInExternFn(d) => handlers::pattern_arg_in_extern_fn::pattern_arg_in_extern_fn(&ctx, &d),
             AnyDiagnostic::UnionExprMustHaveExactlyOneField(d) => handlers::union_expr_must_have_exactly_one_field::union_expr_must_have_exactly_one_field(&ctx, &d),
             AnyDiagnostic::UnionPatMustHaveExactlyOneField(d) => {
@@ -908,7 +918,7 @@ fn unresolved_fix(id: &'static str, label: &str, target: TextRange) -> Assist {
 fn adjusted_display_range<N: AstNode>(
     ctx: &DiagnosticsContext<'_, '_>,
     diag_ptr: InFile<AstPtr<N>>,
-    adj: &dyn Fn(N) -> Option<TextRange>,
+    adj: &impl Fn(N) -> Option<TextRange>,
 ) -> FileRange {
     let source_file = ctx.sema.parse_or_expand(diag_ptr.file_id);
     let node = diag_ptr.value.to_node(&source_file);

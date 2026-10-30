@@ -161,6 +161,15 @@ pub trait Interner:
         data: ExternalConstraintsData<Self>,
     ) -> Self::ExternalConstraints;
 
+    /// Interns external constraints given by reference: an implementation that finds them
+    /// interned already copies nothing. The default clones them into the owned form.
+    fn mk_external_constraints_ref(
+        self,
+        data: &ExternalConstraintsData<Self>,
+    ) -> Self::ExternalConstraints {
+        self.mk_external_constraints(data.clone())
+    }
+
     type DepNodeIndex;
     type Tracked<T: Debug + Clone>: Debug;
     fn mk_tracked<T: Debug + Clone>(

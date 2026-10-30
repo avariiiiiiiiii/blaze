@@ -216,6 +216,17 @@ impl Db {
         files.set_appended_root_module(self, file_id, module, durability);
     }
 
+    /// See [`Files::set_crate_attr_files`].
+    pub(crate) fn set_crate_attr_files(
+        &mut self,
+        krate: Crate,
+        gone: bool,
+        durability: Option<Durability>,
+    ) {
+        let files = Arc::clone(&self.files);
+        files.set_crate_attr_files(self, krate, gone, durability);
+    }
+
     /// Sets the inputs of one view's files, writing only those that changed: see
     /// [`Files::set_view_root`].
     pub fn set_view_root(&mut self, view: ViewRoot<'_>) -> Result<ViewChange, ViewError> {
@@ -251,6 +262,15 @@ impl Db {
         let durability = if root.is_library { Durability::HIGH } else { Durability::LOW };
         let path = anchor.parent()?.absolutize(path.path);
         Some(self.files.included_file(self, krate, &path, durability))
+    }
+
+    /// The path [`Db::included_file`] reads, as rustc writes it in an error: the anchor's
+    /// directory joined with `path`, not normalized.
+    pub fn included_path(&self, path: AnchoredPath<'_>) -> Option<vfs::AbsPathBuf> {
+        let root = self.source_root(self.file_source_root(path.anchor).source_root_id(self));
+        let root = root.source_root_ref(self);
+        let anchor = root.path_for_file(&path.anchor)?.as_path()?;
+        Some(anchor.parent()?.join(path.path))
     }
 
     /// Notes that `include!` or a module declaration in `krate` names a file

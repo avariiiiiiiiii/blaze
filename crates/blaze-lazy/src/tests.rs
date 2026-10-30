@@ -1,5 +1,7 @@
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod abi;
+#[cfg(not(blaze_check))]
+mod budget;
 #[cfg(all(unix, any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod exec;
 mod flight;
@@ -7,6 +9,7 @@ mod plan;
 mod refuse;
 mod sim;
 mod stubs;
+mod wake;
 mod wire;
 
 use std::collections::BTreeMap;

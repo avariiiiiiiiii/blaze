@@ -56,6 +56,7 @@ impl<'a, 'w> Builtin<'a, 'w> {
             anonymous: cx.edition == Edition::Edition2015,
             unsafe_code: cx.lint_may_fire(LintId::named("unsafe_code")),
             negative_literals: cx.lint_may_fire(LintId::named("ambiguous_negative_literals")),
+            // alloc: empty at setup; one buffer reused across blocks
             stmts: Vec::new(),
             linted_ref: None,
         }
@@ -138,25 +139,35 @@ fn range_of(node: &SyntaxNode) -> TextRange {
 
 /// `while true { .. }`: `WhileTrue`.
 fn while_true(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
+    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
     let Some(it) = ast::WhileExpr::cast(node.clone()) else { return };
     let Some(cond) = it.condition() else { return };
-    let mut peeled = cond.clone();
-    while let ast::Expr::ParenExpr(paren) = &peeled {
-        let Some(inner) = paren.expr() else { return };
-        peeled = inner;
-    }
-    let ast::Expr::Literal(lit) = &peeled else { return };
-    if lit.kind() != LiteralKind::Bool(true) || from_expansion(cx, InFile::new(tree.file, cond.syntax())) {
+    let is_true = |e: &ast::Expr| matches!(e, ast::Expr::Literal(lit) if lit.kind() == LiteralKind::Bool(true));
+    let literal_true = match &cond {
+        ast::Expr::ParenExpr(paren) => {
+            let mut inner = paren.expr();
+            while let Some(ast::Expr::ParenExpr(it)) = &inner {
+                inner = it.expr();
+            }
+            inner.is_some_and(|it| is_true(&it))
+        }
+        other => is_true(other),
+    };
+    if !literal_true || from_expansion(cx, InFile::new(tree.file, cond.syntax())) {
         return;
     }
     let range = TextRange::new(range_of(node).start(), cond.syntax().text_range().end());
     let span = cx.span(InFile::new(tree.file, range));
     let replace = match it.label().and_then(|it| it.lifetime()) {
+        // alloc: the lint's text, for a lint found
         Some(label) => format!("{}: loop", label.text()),
+        // alloc: the lint's text, for a lint found
         None => "loop".to_owned(),
     };
+    // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("while_true", "denote infinite loops with `loop { ... }`", span.clone());
     diag.suggestion_with_style(
+        // alloc: the lint's text, for a lint found
         vec![(span, replace)],
         "use `loop`",
         Applicability::MachineApplicable,
@@ -174,6 +185,7 @@ fn unsafe_code(cx: &Cx<'_, '_>, walk: &Walk<'_>, tree: &Tree, node: &SyntaxNode,
         SyntaxKind::BLOCK_EXPR if unsafe_token(T![unsafe]) => (range_of(node), "usage of an `unsafe` block"),
         SyntaxKind::TRAIT if unsafe_token(T![unsafe]) => (range_of(node), "declaration of an `unsafe` trait"),
         SyntaxKind::IMPL
+            // clone: a cursor's refcount (no allocation), only for an `unsafe impl`
             if unsafe_token(T![unsafe]) && ast::Impl::cast(node.clone()).is_some_and(|it| it.trait_().is_some()) =>
         {
             (range_of(node), "implementation of an `unsafe` trait")
@@ -212,6 +224,7 @@ fn allow_internal_unsafe(walk: &Walk<'_>, node: &SyntaxNode) -> Option<TextRange
     if !node.children().any(|it| it.kind() == SyntaxKind::ATTR) {
         return None;
     }
+    // clone: a cursor's refcount (no allocation), only for a macro definition with attributes
     let owner = ast::AnyHasAttrs::cast(node.clone())?;
     hir_expand::attrs::expand_cfg_attr(ast::attrs_including_inner(&owner), || walk.cfg, |meta, attr| {
         let named = meta.path().filter(|it| it.qualifier().is_none()).and_then(|it| it.segment()).and_then(|it| {
@@ -233,6 +246,7 @@ fn global_asm(cx: &Cx<'_, '_>, tree: &Tree, out: &mut Vec<Emitted>) {
         return;
     }
     let node = loc.to_node(cx.db);
+    // clone: a cursor's refcount (no allocation), only for a `global_asm!` call
     let Some(macro_call) = ast::MacroCall::cast(node.value.clone()) else { return };
     let start = range_of(&node.value).start();
     let end = macro_call.token_tree().map_or(node.value.text_range().end(), |it| it.syntax().text_range().end());
@@ -251,9 +265,11 @@ fn special_module_names(cx: &Cx<'_, '_>, walk: &Walk<'_>, expansions: &Expansion
     let root = cx.krate.root_module(cx.db);
     let Some(file) = root.as_source_file_id(cx.db) else { return };
     let Some(tree) = walk.tree(HirFileId::from(file)) else { return };
+    // alloc: setup, once per crate
     let mut items = Vec::new();
     crate_items(tree, &tree.root, expansions, &mut items);
     for (in_tree, item) in items {
+        // clone: a cursor's refcount (no allocation), once per item of the crate root
         let Some(module) = ast::Module::cast(item.clone()) else { continue };
         if module.item_list().is_some() {
             continue;
@@ -264,6 +280,7 @@ fn special_module_names(cx: &Cx<'_, '_>, walk: &Walk<'_>, expansions: &Expansion
         if name != "lib" && name != "main" {
             continue;
         }
+        // clone: a cursor's refcount (no allocation), only for `mod lib;` or `mod main;`
         let Some(owner) = ast::AnyHasAttrs::cast(item.clone()) else { continue };
         if walk.attrs(&owner).iter().any(|(meta, _)| meta.simple_name().as_deref() == Some("path")) {
             continue;
@@ -309,6 +326,7 @@ fn crate_items<'w>(tree: &'w Tree, parent: &SyntaxNode, expansions: &Expansions<
 /// A trait method's parameter with a type and no name, in the 2015 edition:
 /// `AnonymousParameters`.
 fn anonymous_parameters(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
+    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
     let Some(it) = ast::Fn::cast(node.clone()) else { return };
     let in_trait = node
         .parent()
@@ -326,14 +344,18 @@ fn anonymous_parameters(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &m
         let Some(ty) = param.ty() else { continue };
         let span = cx.span(InFile::new(tree.file, ty.syntax().text_range()));
         let (ty_snip, applicability) = match cx.snippet(&span) {
+            // alloc: the lint's text, for a lint found
             Some(snip) => (snip.to_owned(), Applicability::MachineApplicable),
+            // alloc: the lint's text, for a lint found
             None => ("<type>".to_owned(), Applicability::HasPlaceholders),
         };
         let mut diag = Diag::lint(
             "anonymous_parameters",
             "anonymous parameters are deprecated and will be removed in the next edition",
+            // clone: a lint's span, for a lint found
             span.clone(),
         );
+        // alloc: the lint's text, for a lint found
         diag.suggestion(span, "try naming the parameter or explicitly ignoring it", format!("_: {ty_snip}"), applicability);
         out.push(emitted(cx, diag, Pass::Early, tree.ptr(node)));
     }
@@ -347,8 +369,10 @@ fn ellipsis_range(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec
         let ast::Pat::RangePat(range) = pat else { return None };
         let op = range.op_token().filter(|it| it.kind() == T![...])?;
         let end = range.end()?;
+        // clone: a cursor's refcount (no allocation), only for a `...` pattern, which is linted
         Some((range.clone(), op, end))
     };
+    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
     let pat = ast::Pat::cast(node.clone())?;
     let (parenthesise, (range, join, end)) = match &pat {
         ast::Pat::RefPat(it) => (true, ellipsis(&it.pat()?)?),
@@ -361,26 +385,35 @@ fn ellipsis_range(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec
     let suggestion = "use `..=` for an inclusive range";
     let at = tree.ptr(node);
     let mut diag = if parenthesise {
+        // alloc: the lint's text, for a lint found
         let end = end.syntax().text().to_string();
         let replace = match range.start() {
+            // alloc: the lint's text, for a lint found
             Some(start) => format!("&({}..={end})", start.syntax().text()),
+            // alloc: the lint's text, for a lint found
             None => format!("&(..={end})"),
         };
         if edition >= Edition::Edition2021 {
+            // clone: a lint's span, for a lint found
             let mut diag = Diag::error(Some("E0783"), message, pat_span.clone());
+            // alloc: the lint's text, for a lint found
             diag.suggestion_with_style(vec![(pat_span, replace)], suggestion, Applicability::MachineApplicable, SuggestionStyle::HideCodeInline);
             diag
         } else {
+            // clone: a lint's span, for a lint found
             let mut diag = Diag::lint("ellipsis_inclusive_range_patterns", message, pat_span.clone());
             diag.suggestion(pat_span, suggestion, replace, Applicability::MachineApplicable);
             diag
         }
     } else if edition >= Edition::Edition2021 {
         let mut diag = Diag::error(Some("E0783"), message, pat_span);
+        // alloc: the lint's text, for a lint found
         diag.suggestion_with_style(vec![(join_span, "..=".to_owned())], suggestion, Applicability::MachineApplicable, SuggestionStyle::HideCodeInline);
         diag
     } else {
+        // clone: a lint's span, for a lint found
         let mut diag = Diag::lint("ellipsis_inclusive_range_patterns", message, join_span.clone());
+        // alloc: the lint's text, for a lint found
         diag.suggestion_with_style(vec![(join_span, "..=".to_owned())], suggestion, Applicability::MachineApplicable, SuggestionStyle::HideCodeInline);
         diag
     };
@@ -395,6 +428,7 @@ fn ellipsis_range(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec
 /// `--x`, linted at the innermost `--` of a chain of `-`: `DoubleNegations`.
 fn double_negation(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
     let neg = |it: &ast::PrefixExpr| it.op_kind() == Some(UnaryOp::Neg);
+    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
     let Some(outer) = ast::PrefixExpr::cast(node.clone()).filter(neg) else { return };
     let Some(ast::Expr::PrefixExpr(inner)) = outer.expr() else { return };
     if !neg(&inner) {
@@ -414,8 +448,11 @@ fn double_negation(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Ve
     diag.note("the prefix `--` could be misinterpreted as a decrement operator which exists in other languages");
     diag.note("use `-= 1` if you meant to decrement the value");
     diag.suggestion_with_style(
+        // alloc: the lint's text, for a lint found
         vec![
+            // alloc: the lint's text, for a lint found
             (at(TextRange::empty(inner_range.start())), "(".to_owned()),
+            // alloc: the lint's text, for a lint found
             (at(TextRange::empty(inner_range.end())), ")".to_owned()),
         ],
         "add parentheses for clarity",
@@ -427,20 +464,20 @@ fn double_negation(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Ve
 
 /// `-1.abs()`: a `-` before method calls on a number literal: `Precedence`.
 fn ambiguous_negative_literal(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
+    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
     let Some(expr) = ast::PrefixExpr::cast(node.clone()) else { return };
     if expr.op_kind() != Some(UnaryOp::Neg) {
         return;
     }
     let Some(operand) = expr.expr() else { return };
-    let mut arg = operand.clone();
-    let mut at_least_one = false;
+    let ast::Expr::MethodCallExpr(first) = &operand else { return };
+    let Some(mut arg) = first.receiver() else { return };
     while let ast::Expr::MethodCallExpr(call) = &arg {
-        at_least_one = true;
         let Some(receiver) = call.receiver() else { return };
         arg = receiver;
     }
     let ast::Expr::Literal(lit) = &arg else { return };
-    if !at_least_one || !matches!(lit.kind(), LiteralKind::IntNumber(_) | LiteralKind::FloatNumber(_)) {
+    if !matches!(lit.kind(), LiteralKind::IntNumber(_) | LiteralKind::FloatNumber(_)) {
         return;
     }
     let at = |range: TextRange| cx.span(InFile::new(tree.file, range));
@@ -452,8 +489,11 @@ fn ambiguous_negative_literal(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, o
     );
     diag.note("e.g. `-4.abs()` equals `-4`; while `(-4).abs()` equals `4`");
     diag.suggestion_with_style(
+        // alloc: the lint's text, for a lint found
         vec![
+            // alloc: the lint's text, for a lint found
             (at(TextRange::empty(expr_range.start())), "(".to_owned()),
+            // alloc: the lint's text, for a lint found
             (at(TextRange::empty(arg_range.end())), ")".to_owned()),
         ],
         "add parentheses around the `-` and the literal to call the method on a negative literal",
@@ -461,8 +501,11 @@ fn ambiguous_negative_literal(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, o
         SuggestionStyle::ShowCode,
     );
     diag.suggestion_with_style(
+        // alloc: the lint's text, for a lint found
         vec![
+            // alloc: the lint's text, for a lint found
             (at(TextRange::empty(operand_range.start())), "(".to_owned()),
+            // alloc: the lint's text, for a lint found
             (at(TextRange::empty(operand_range.end())), ")".to_owned()),
         ],
         "add parentheses around the literal and the method call to keep the current behavior",
@@ -500,6 +543,7 @@ fn redundant_semicolons(
             true => "unnecessary trailing semicolons",
             false => "unnecessary trailing semicolon",
         };
+        // clone: a lint's span, for a lint found
         let mut diag = Diag::lint("redundant_semicolons", message, span.clone());
         if !range_from_expansion(cx, range) {
             let remove = match multiple {

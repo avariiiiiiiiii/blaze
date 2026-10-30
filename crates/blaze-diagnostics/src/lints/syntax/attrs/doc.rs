@@ -21,15 +21,20 @@
 pub(super) mod comments;
 mod meta;
 
+use std::borrow::Cow;
+
 use hir::InFile;
 use rustc_hash::FxHashSet;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
+    view::{self as ast, AstNode},
+};
 
 use self::meta::{Item, Lit, List, MetaArgs, MetaItem};
 use super::super::{Emitted, Pass, Walk, source_fact};
 use super::{Args, Attr, Owner, Target, checked, parsed};
 use crate::{
-    cx::{Cx, def_range, item_range, signature_range},
+    cx::{Cx, def_range_view, item_range_view, signature_range_view},
     lower::Phase,
     model::{Applicability, Diag, SuggestionStyle},
 };
@@ -69,7 +74,8 @@ const FORMS: [&str; 25] = [
 ];
 
 /// The lints of the `#[doc]` attributes and doc comments of `owners`.
-pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<Emitted> {
+pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner<'_>]) -> Vec<Emitted> {
+    // alloc: empty, allocates nothing until a lint
     let mut emitted = Vec::new();
     let mut modules = comments::Modules::default();
     for owner in owners {
@@ -93,11 +99,12 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<
 /// rustc's `InvocationCollector::check_attributes`, for what it says of `#[doc]`: each
 /// attribute of the macro call parsed alone, and `unused_doc_comments` for its doc strings,
 /// a run of them as one, from the call's first attribute on.
-fn macro_call(cx: &Cx<'_, '_>, owner: &Owner, modules: &mut comments::Modules, emitted: &mut Vec<Emitted>) {
-    let at = comments::lint_node(cx, &owner.node, modules);
+fn macro_call(cx: &Cx<'_, '_>, owner: &Owner<'_>, modules: &mut comments::Modules, emitted: &mut Vec<Emitted>) {
+    let at = comments::lint_node(cx, owner.node, modules);
     let mut span: Option<InFile<TextRange>> = None;
     for (i, attr) in owner.attrs.iter().enumerate() {
         let mut parser =
+            // clone: a pointer, copied; once per attribute of a macro call
             Parser { cx, owner, buffered_at: Some(at.clone()), state: State::default(), emitted: &mut *emitted };
         parser.attr(attr);
         let range = attr.in_file(attr.range());
@@ -111,21 +118,23 @@ fn macro_call(cx: &Cx<'_, '_>, owner: &Owner, modules: &mut comments::Modules, e
         }
         if is_doc_str(attr) {
             let mut diag = comments::macro_call(cx, current, range);
+            // clone: a pointer, copied for a lint emitted
             source_fact(cx, &mut diag, at.clone());
+            // clone: as above
             emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()));
         }
     }
 }
 
 /// rustc's `Attribute::doc_str`: a doc comment, or `#[doc = "string"]`.
-fn is_doc_str(attr: &Attr) -> bool {
+fn is_doc_str(attr: &Attr<'_>) -> bool {
     attr.is_doc_comment()
         || (is_doc(attr)
             && matches!(attr.args(), Args::NameValue(Some(ast::Expr::Literal(it))) if (Lit { token: it.token() }).str().is_some()))
 }
 
 /// Whether `attr` is `#[doc..]`, not a doc comment.
-fn is_doc(attr: &Attr) -> bool {
+fn is_doc(attr: &Attr<'_>) -> bool {
     let Some(path) = attr.meta().and_then(|it| it.path()) else { return false };
     path.qualifier().is_none()
         && path.segment().is_some_and(|it| {
@@ -150,7 +159,7 @@ struct State {
 /// rustc's `DocParser` over a node's `#[doc]` attributes.
 struct Parser<'p, 'a, 'b> {
     cx: &'p Cx<'a, 'b>,
-    owner: &'p Owner,
+    owner: &'p Owner<'p>,
     /// For a macro call's attributes, the node expansion buffers their lints at.
     buffered_at: Option<InFile<SyntaxNodePtr>>,
     state: State,
@@ -165,7 +174,9 @@ impl Parser<'_, '_, '_> {
     fn emit(&mut self, mut diag: Diag) {
         match &self.buffered_at {
             Some(at) => {
+                // clone: a pointer, copied for a lint emitted
                 source_fact(self.cx, &mut diag, at.clone());
+                // clone: as above
                 self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at.clone()));
             }
             None => {
@@ -196,7 +207,7 @@ impl Parser<'_, '_, '_> {
     }
 
     /// `as_no_args`: whether `meta` has no arguments, else the lint at them.
-    fn no_args(&mut self, attr: &Attr, meta: &MetaItem) -> bool {
+    fn no_args(&mut self, attr: &Attr<'_>, meta: &MetaItem<'_>) -> bool {
         match meta.args.range() {
             None => true,
             Some(range) => {
@@ -218,7 +229,7 @@ impl Parser<'_, '_, '_> {
     }
 
     /// `DocParser`'s `accept_single_doc_attr`.
-    fn attr(&mut self, attr: &Attr) {
+    fn attr(&mut self, attr: &Attr<'_>) {
         if !is_doc(attr) {
             return;
         }
@@ -226,7 +237,7 @@ impl Parser<'_, '_, '_> {
             Args::Word => self.ill_formed(attr),
             Args::List(tree) => {
                 // A list rustc's parser refuses is an error, and the attribute is not parsed.
-                let Some(list) = meta::list(&tree) else { return };
+                let Some(list) = meta::list(tree) else { return };
                 for item in &list.items {
                     match item {
                         Item::Meta(meta) => {
@@ -252,20 +263,24 @@ impl Parser<'_, '_, '_> {
     }
 
     /// The `IllFormedAttributeInput` of a bare `#[doc]`: the template's forms, sorted.
-    fn ill_formed(&mut self, attr: &Attr) {
+    fn ill_formed(&mut self, attr: &Attr<'_>) {
         let (open, close) = if attr.is_unsafe() { ("unsafe(", ")") } else { ("", "") };
+        // alloc: the diagnostic's text, as is all of `ill_formed`'s
         let mut forms: Vec<String> = FORMS.iter().map(|it| format!("`{open}doc({it}){close}`")).collect();
+        // alloc: as above
         forms.push(format!("`{open}doc = \"string\"{close}`"));
         forms.sort_unstable();
+        // alloc: as above
         let message = format!("valid forms for the attribute are {}", and_list(&forms));
         let diag = self.diag(INVALID, message, attr.in_file(attr.inner_range()));
         self.emit(diag);
     }
 
     /// `parse_single_doc_attr_item`.
-    fn item(&mut self, attr: &Attr, meta: &MetaItem) {
+    fn item(&mut self, attr: &Attr<'_>, meta: &MetaItem<'_>) {
         let path = attr.in_file(meta.path.range);
         let Some(word) = meta.path.word() else {
+            // alloc: the diagnostic's text
             let diag = self.diag(INVALID, format!("unknown `doc` attribute `{}`", meta.path.name()), path);
             self.emit(diag);
             return;
@@ -323,6 +338,7 @@ impl Parser<'_, '_, '_> {
                 diag.note("`doc(spotlight)` was renamed to `doc(notable_trait)`");
                 diag.note("`doc(spotlight)` is now a no-op");
                 diag.suggestion_with_style(
+                    // alloc: the diagnostic's text
                     vec![(self.cx.span(path), "notable_trait".to_owned())],
                     "use `notable_trait` instead",
                     Applicability::MachineApplicable,
@@ -337,17 +353,21 @@ impl Parser<'_, '_, '_> {
                 diag.suggestion(
                     self.cx.span(path),
                     "use `doc = include_str!` instead",
+                    // alloc: the diagnostic's text
                     format!("#{inner}[doc = include_str!(\"{}\")]", value.symbol()),
                     Applicability::MaybeIncorrect,
                 );
                 self.emit(diag);
             }
             "passes" | "no_default_passes" => {
+                // alloc: the diagnostic's text, as each note below
                 let mut diag = self.diag(INVALID, format!("unknown `doc` attribute `{word}`"), path);
                 diag.span_label(self.cx.span(path), "no longer functions");
+                // alloc: as above
                 diag.note(format!(
                     "`doc` attribute `{word}` no longer functions; see issue #44136 <https://github.com/rust-lang/rust/issues/44136>"
                 ));
+                // alloc: as above
                 diag.note(format!("`doc({word})` is now a no-op"));
                 self.emit(diag);
             }
@@ -361,6 +381,7 @@ impl Parser<'_, '_, '_> {
                 self.emit(diag);
             }
             _ => {
+                // alloc: the diagnostic's text
                 let diag = self.diag(INVALID, format!("unknown `doc` attribute `{word}`"), path);
                 self.emit(diag);
             }
@@ -369,7 +390,7 @@ impl Parser<'_, '_, '_> {
 
     /// `string_arg_and_crate_level`'s and `parse_keyword_and_attribute`'s reading of
     /// `name = "value"`: the value, else the lint.
-    fn string_value(&mut self, attr: &Attr, meta: &MetaItem) -> Option<String> {
+    fn string_value<'t>(&mut self, attr: &Attr<'_>, meta: &MetaItem<'t>) -> Option<Cow<'t, str>> {
         let MetaArgs::NameValue { value, .. } = &meta.args else {
             self.expected_name_value(attr.in_file(meta.args.range().unwrap_or(meta.path.range)));
             return None;
@@ -383,7 +404,7 @@ impl Parser<'_, '_, '_> {
 
     /// `parse_alias`, `add_alias`: what is not a string, is empty, has a quote or a whitespace
     /// but a space, starts or ends with a space, or is on the crate is an error.
-    fn alias(&mut self, attr: &Attr, meta: &MetaItem) {
+    fn alias(&mut self, attr: &Attr<'_>, meta: &MetaItem<'_>) {
         match &meta.args {
             MetaArgs::None => {}
             MetaArgs::List(list) => {
@@ -403,7 +424,7 @@ impl Parser<'_, '_, '_> {
         }
     }
 
-    fn add_alias(&mut self, alias: String, at: InFile<TextRange>) {
+    fn add_alias(&mut self, alias: Cow<'_, str>, at: InFile<TextRange>) {
         let bad = |c: char| c == '"' || c == '\'' || (c.is_whitespace() && c != ' ');
         if alias.is_empty()
             || alias.chars().any(bad)
@@ -414,7 +435,7 @@ impl Parser<'_, '_, '_> {
             return;
         }
         let Some(index) = self.state.aliases.iter().position(|(it, _)| *it == alias) else {
-            self.state.aliases.push((alias, at));
+            self.state.aliases.push((alias.into_owned(), at));
             return;
         };
         let first = std::mem::replace(&mut self.state.aliases[index].1, at);
@@ -424,7 +445,7 @@ impl Parser<'_, '_, '_> {
     }
 
     /// `parse_single_test_doc_attr_item`: an item of `test(..)`.
-    fn test(&mut self, attr: &Attr, meta: &MetaItem) {
+    fn test(&mut self, attr: &Attr<'_>, meta: &MetaItem<'_>) {
         let path = attr.in_file(meta.path.range);
         match meta.path.word() {
             Some("no_crate_inject") => {
@@ -449,6 +470,7 @@ impl Parser<'_, '_, '_> {
                 }
             }
             Some(name) => {
+                // alloc: the diagnostic's text
                 let diag = self.diag(INVALID, format!("unknown `doc(test)` attribute `{name}`"), path);
                 self.emit(diag);
             }
@@ -460,12 +482,13 @@ impl Parser<'_, '_, '_> {
     }
 
     /// `parse_auto_cfg`.
-    fn auto_cfg(&mut self, attr: &Attr, meta: &MetaItem) {
+    fn auto_cfg(&mut self, attr: &Attr<'_>, meta: &MetaItem<'_>) {
         let expects_hide_or_show = |this: &mut Self, at: TextRange| {
             let diag = this.diag(INVALID, "only `hide` or `show` are allowed in `#[doc(auto_cfg(...))]`", attr.in_file(at));
             this.emit(diag);
         };
         let unexpected = |this: &mut Self, name: &str, at: TextRange| {
+            // alloc: the diagnostic's text
             let message = format!("`#![doc(auto_cfg({name}(...)))]` only accepts identifiers or `values(...)`");
             let diag = this.diag(INVALID, message, attr.in_file(at));
             this.emit(diag);
@@ -494,6 +517,7 @@ impl Parser<'_, '_, '_> {
                 }
             };
             let MetaArgs::List(names) = &item.args else {
+                // alloc: the diagnostic's text
                 let message = format!("`#![doc(auto_cfg({name}(...)))]` expects a list of items");
                 let diag = self.diag(INVALID, message, attr.in_file(item.range()));
                 self.emit(diag);
@@ -538,13 +562,14 @@ impl Parser<'_, '_, '_> {
     }
 
     /// `parse_auto_cfg_values`: the items of `values(..)`, as `DocCfgHideShow` gathers them.
-    fn auto_cfg_values(&mut self, attr: &Attr, list: &List) {
+    fn auto_cfg_values(&mut self, attr: &Attr<'_>, list: &List<'_>) {
         let mix = |this: &mut Self, at: TextRange, value: TextRange| {
             let mut diag = this.diag(INVALID, "`any()` was used when other values were provided", attr.in_file(at));
             diag.span_label(this.cx.span(attr.in_file(value)), "value declared here");
             this.emit(diag);
         };
         let unexpected = |this: &mut Self, name: &str, at: TextRange| {
+            // alloc: the diagnostic's text
             let message = format!("`#![doc(auto_cfg({name}(...)))]` only accepts identifiers or `values(...)`");
             let diag = this.diag(INVALID, message, attr.in_file(at));
             this.emit(diag);
@@ -554,7 +579,7 @@ impl Parser<'_, '_, '_> {
         let mut any: Option<TextRange> = None;
         let mut first: Option<TextRange> = None;
         let mut has_none = false;
-        let mut seen: FxHashSet<String> = FxHashSet::default();
+        let mut seen: FxHashSet<Cow<'_, str>> = FxHashSet::default();
         for item in &list.items {
             match item {
                 Item::Lit(lit) => match lit.str() {
@@ -594,7 +619,7 @@ impl Parser<'_, '_, '_> {
 
 /// `check_doc_attrs`' lints: `check_doc_inline` and `check_doc_masked`; the rest of what it
 /// checks are errors.
-fn check(cx: &Cx<'_, '_>, owner: &Owner, state: &State, emitted: &mut Vec<Emitted>) {
+fn check(cx: &Cx<'_, '_>, owner: &Owner<'_>, state: &State, emitted: &mut Vec<Emitted>) {
     let mut emit = |mut diag: Diag| {
         source_fact(cx, &mut diag, owner.at());
         emitted.push(checked(diag, owner));
@@ -604,6 +629,7 @@ fn check(cx: &Cx<'_, '_>, owner: &Owner, state: &State, emitted: &mut Vec<Emitte
         && !matches!(owner.target, Target::Use | Target::ExternCrate)
     {
         let span = cx.span(*span);
+        // clone: the diagnostic's span, as below
         let mut diag = Diag::lint(INVALID, "this attribute can only be applied to a `use` item", span.clone());
         diag.span_label(span, "only applicable on `use` items");
         diag.span_label(cx.span(hir_span(owner)), "not a `use` item");
@@ -613,15 +639,17 @@ fn check(cx: &Cx<'_, '_>, owner: &Owner, state: &State, emitted: &mut Vec<Emitte
     if let Some(span) = state.masked {
         let span = cx.span(span);
         if owner.target != Target::ExternCrate {
+            // clone: as above
             let mut diag = Diag::lint(INVALID, "this attribute can only be applied to an `extern crate` item", span.clone());
             diag.span_label(span, "only applicable on `extern crate` items");
             diag.span_label(cx.span(hir_span(owner)), "not an `extern crate` item");
             diag.note("read <https://doc.rust-lang.org/unstable-book/language-features/doc-masked.html> for more information");
             emit(diag);
-        } else if ast::ExternCrate::cast(owner.node.value.clone())
+        } else if ast::ExternCrate::cast(owner.node.value)
             .and_then(|it| it.name_ref())
             .is_some_and(|it| it.self_token().is_some())
         {
+            // clone: as above
             let mut diag = Diag::lint(INVALID, "this attribute cannot be applied to an `extern crate self` item", span.clone());
             diag.span_label(span, "not applicable on `extern crate self` items");
             diag.span_label(cx.span(hir_span(owner)), "`extern crate self` defined here");
@@ -631,9 +659,9 @@ fn check(cx: &Cx<'_, '_>, owner: &Owner, state: &State, emitted: &mut Vec<Emitte
 }
 
 /// rustc's `hir_span`: what a lint labels as the node `owner` is.
-fn hir_span(owner: &Owner) -> InFile<TextRange> {
-    let node = &owner.node.value;
-    let range = item_range(node);
+fn hir_span(owner: &Owner<'_>) -> InFile<TextRange> {
+    let node = owner.node.value;
+    let range = item_range_view(node);
     let until = |end: Option<TextSize>| match end {
         Some(end) if end > range.start() => TextRange::new(range.start(), end),
         _ => range,
@@ -643,19 +671,19 @@ fn hir_span(owner: &Owner) -> InFile<TextRange> {
     let named = || until(end_of(SyntaxKind::NAME).max(end_of(SyntaxKind::GENERIC_PARAM_LIST)));
     let value = match node.kind() {
         SyntaxKind::SOURCE_FILE => inner_span(node),
-        SyntaxKind::FN => ast::Fn::cast(node.clone()).map_or(range, |it| signature_range(&it)),
-        SyntaxKind::IMPL => def_range(node),
+        SyntaxKind::FN => ast::Fn::cast(node).map_or(range, signature_range_view),
+        SyntaxKind::IMPL => def_range_view(node),
         SyntaxKind::CONST | SyntaxKind::STATIC => {
             until(node.children().find(|it| ast::Type::can_cast(it.kind())).map(|it| it.text_range().end()))
         }
-        SyntaxKind::TRAIT if ast::Trait::cast(node.clone()).is_some_and(|it| it.eq_token().is_some()) => named(),
+        SyntaxKind::TRAIT if ast::Trait::cast(node).is_some_and(|it| it.eq_token().is_some()) => named(),
         SyntaxKind::TRAIT => until(end_of(SyntaxKind::TYPE_BOUND_LIST).or_else(|| Some(named().end()))),
         SyntaxKind::TYPE_ALIAS if is_trait_item(node) => {
             until(end_of(SyntaxKind::TYPE_BOUND_LIST).or_else(|| Some(named().end())))
         }
         SyntaxKind::USE => {
             let tree = node.children().find(|it| it.kind() == SyntaxKind::USE_TREE);
-            let path = tree.as_ref().and_then(|it| it.children().find(|it| it.kind() == SyntaxKind::PATH));
+            let path = tree.and_then(|it| it.children().find(|it| it.kind() == SyntaxKind::PATH));
             path.or(tree).map_or(range, |it| it.text_range())
         }
         SyntaxKind::EXTERN_CRATE => {
@@ -682,7 +710,7 @@ fn hir_span(owner: &Owner) -> InFile<TextRange> {
 }
 
 /// Whether `node` is an item of a trait.
-fn is_trait_item(node: &SyntaxNode) -> bool {
+fn is_trait_item(node: ast::Node<'_>) -> bool {
     node.parent()
         .filter(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST)
         .and_then(|it| it.parent())
@@ -690,19 +718,23 @@ fn is_trait_item(node: &SyntaxNode) -> bool {
 }
 
 /// The crate's `inner_span`: from its first token to its last, comments left out.
-fn inner_span(node: &SyntaxNode) -> TextRange {
+fn inner_span(node: ast::Node<'_>) -> TextRange {
     let mut elements = node.children_with_tokens().filter(|it| !it.kind().is_trivia());
     let Some(first) = elements.next() else { return TextRange::empty(node.text_range().start()) };
-    let last = elements.last().unwrap_or_else(|| first.clone());
+    let last = elements.last().unwrap_or(first);
     first.text_range().cover(last.text_range())
 }
 
 /// rustc's `StrListSepByAnd`: `a`, `a and b`, `a, b, and c`.
 fn and_list(items: &[String]) -> String {
     match items {
+        // alloc: empty, allocates nothing
         [] => String::new(),
+        // clone: a diagnostic's text, as is all of `and_list`'s
         [one] => one.clone(),
+        // alloc: as above
         [a, b] => format!("{a} and {b}"),
+        // alloc: as above
         [init @ .., last] => format!("{}, and {last}", init.join(", ")),
     }
 }

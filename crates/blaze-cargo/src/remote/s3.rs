@@ -393,6 +393,7 @@ where
 }
 
 /// Whether the error is the other end's certificate being turned down.
+// dyn: an error chain, walked once per failed request.
 fn is_distrust(error: &(dyn std::error::Error + 'static)) -> bool {
     if matches!(error.downcast_ref(), Some(rustls::Error::InvalidCertificate(_))) {
         return true;
@@ -403,6 +404,7 @@ fn is_distrust(error: &(dyn std::error::Error + 'static)) -> bool {
 }
 
 /// An error and what it was caused by, each as it describes itself.
+// dyn: an error chain, said once per failed request.
 fn causes(error: &dyn std::error::Error) -> String {
     let mut said = error.to_string();
     let mut cause = error.source();

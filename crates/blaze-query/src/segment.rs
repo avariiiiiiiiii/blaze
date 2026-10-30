@@ -18,13 +18,16 @@ use std::{
     cell::UnsafeCell,
     mem::ManuallyDrop,
     ptr::{self, NonNull},
+};
+
+use crate::{
     sync::{
         OnceLock,
         atomic::{AtomicBool, AtomicI64, Ordering},
+        freed_bytes, read_bytes, thread_local, wrote_bytes,
     },
+    table::ShortLock,
 };
-
-use crate::table::ShortLock;
 
 struct LaneIds {
     next: u32,
@@ -128,6 +131,7 @@ impl Segment {
 
 impl Drop for Segment {
     fn drop(&mut self) {
+        freed_bytes(self.base.as_ptr(), self.cap);
         // SAFETY: allocated in `Segment::new` with this size and alignment, freed once here.
         unsafe { alloc::dealloc(self.base.as_ptr(), Layout::from_size_align_unchecked(self.cap, SEGMENT_ALIGN)) };
     }
@@ -178,6 +182,7 @@ impl Span {
     }
 
     pub(crate) fn bytes(&self) -> &[u8] {
+        read_bytes(self.ptr.as_ptr(), self.len);
         // SAFETY: `len` bytes copied in at `ptr` before the span was made, which never change
         // and stay while its hold does (or while the database keeps the mapping they are in).
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
@@ -317,6 +322,7 @@ impl Segments {
         // SAFETY: `at..at + len` is inside the segment, and past what its lane copied in
         // before, so no reader has these bytes.
         let to = unsafe { segment.base.as_ptr().add(at) };
+        wrote_bytes(to, bytes.len());
         // SAFETY: as above; `bytes` is another allocation.
         unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len()) };
         Span {

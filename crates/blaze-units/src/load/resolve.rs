@@ -6,10 +6,9 @@
 //! lock file did not pin located in turn.
 
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use anyhow::Context as _;
-use blaze_manifest::config::schema::{CargoResolverConfig, FeatureUnification, IncompatibleRustVersions};
+use blaze_manifest::config::schema::{CargoResolverConfig, FeatureUnification};
 use blaze_manifest::files::Files;
 use blaze_manifest::manifest::{EitherManifest, Manifest, read_manifest};
 use blaze_manifest::metadata::export_package;
@@ -19,25 +18,16 @@ use blaze_resolve::lockfile::{self, PathDeps};
 use blaze_resolve::resolver::{CliFeatures, HasDevUnits, Members, ResolveBehavior, VersionOrdering, members_with_features};
 use blaze_resolve::workspace_resolve::{PackageRegistry, resolve_ws};
 use blaze_resolve::{
-    Dependency, IndexSummary, MemRegistry, PackageId, PackageIdSpec, PartialVersion, QueryKind, Registry, Resolve,
+    Dependency, IndexSummary, MemRegistry, PackageId, PackageIdSpec, QueryKind, Registry, Resolve,
     ResolveVersion, RustVersion, SourceId, Summary,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
-use super::files::Reads;
-use super::manifest::manifest_source;
+use super::files::{Reads, Snap};
 use super::source::{Index, Located, Sources};
-use super::summary::{self, Read};
 use super::{Select, Spec, Staged, load_error};
 use crate::query::{Fetch, LockWrite, LoadError};
-
-/// A package read for the resolve: its manifest, and the source the lock file pins it to when
-/// it is not a path package.
-pub(crate) struct Package {
-    pub manifest_path: PathBuf,
-    pub manifest: Box<Manifest>,
-    pub locked_source: Option<String>,
-}
+use crate::read::{self as summary, Package, Read, manifest_source, path_packages, rust_versions};
 
 /// The workspace resolved, as the unit graph is made from it.
 pub(crate) struct Resolved<'a> {
@@ -69,9 +59,9 @@ pub(crate) struct Resolved<'a> {
 /// Resolves the workspace `ws` as `spec` asks and hands the result to `then`.
 pub(crate) fn resolved<'db, R>(
     cx: &mut Cx<'db>,
-    ctx: &Context,
-    ws: &Workspace<'_>,
-    files: &Rc<dyn Files>,
+    ctx: &Context<Snap>,
+    ws: &Workspace<'_, Snap>,
+    files: &Snap,
     reads: &Reads<'_>,
     spec: &Spec,
     then: impl FnOnce(&mut Cx<'db>, Resolved<'_>) -> Result<Staged<R>, Cancelled>,
@@ -120,9 +110,10 @@ pub(crate) fn resolved<'db, R>(
         }
     }
     let members: Vec<(&Path, &Manifest)> = ws.members().collect();
-    let mut reads: FxHashMap<PackageId, Read> = FxHashMap::default();
+    let known = members.len() + owned.len();
+    let mut reads: FxHashMap<PackageId, Read> = FxHashMap::with_capacity_and_hasher(known, Default::default());
     // Of each of `members` then `owned`, in order, its id.
-    let mut ids: Vec<PackageId> = Vec::new();
+    let mut ids: Vec<PackageId> = Vec::with_capacity(known);
     let all = members.iter().map(|(path, m)| (*path, *m, None)).chain(
         owned.iter().map(|it| (it.manifest_path.as_path(), &*it.manifest, it.locked_source.as_deref())),
     );
@@ -166,7 +157,7 @@ pub(crate) fn resolved<'db, R>(
         Err(error) => return Ok(fail(error)),
     };
     let lowest_rust_version = member_rust_versions.iter().min().cloned();
-    let rust_versions = match rust_versions(ctx, behavior, &member_rust_versions, &spec.rustc_version) {
+    let rust_versions = match rust_versions(ctx, behavior, &member_rust_versions, Some(spec.rustc_version.as_str())) {
         Ok(it) => it,
         Err(error) => return Ok(fail(error)),
     };
@@ -283,7 +274,7 @@ pub(crate) fn resolved<'db, R>(
 struct Through<'i, R>(&'i R);
 
 impl<R: Registry> Registry for Through<'_, R> {
-    async fn query(&self, dep: &Dependency, kind: QueryKind, f: &mut dyn FnMut(IndexSummary)) -> anyhow::Result<()> {
+    async fn query(&self, dep: &Dependency, kind: QueryKind, f: &mut impl FnMut(IndexSummary)) -> anyhow::Result<()> {
         self.0.query(dep, kind, f).await
     }
 
@@ -305,9 +296,9 @@ struct Prepared {
 }
 
 fn prepare(
-    ws: &Workspace<'_>,
+    ws: &Workspace<'_, Snap>,
     root: &summary::Root<'_>,
-    ctx: &Context,
+    ctx: &Context<Snap>,
     lock_text: Option<&str>,
 ) -> anyhow::Result<Prepared> {
     let replace = summary::replace_table(root)?;
@@ -332,40 +323,10 @@ fn read_of(path: &Path, manifest: &Manifest, source: Option<&str>, lock: Option<
     if let Some(source) = source {
         package.set_source(source.to_owned());
     }
-    let mut read = summary::read(&serde_json::to_value(&package)?)?;
+    let mut read = summary::read(&package)?;
     let id = read.summary.package_id();
     if let Some(Some(checksum)) = lock.and_then(|it| it.checksums().get(&id)) {
         read.summary.set_checksum(checksum.clone());
-    }
-    Ok(read)
-}
-
-/// The path packages that are not members: those the members and the root's `[patch]` and
-/// `[replace]` name by path, and theirs in turn.
-fn path_packages(
-    ws: &Workspace<'_>,
-    root: &summary::Root<'_>,
-    replace: &[(PackageIdSpec, Dependency)],
-    ctx: &Context,
-) -> anyhow::Result<Vec<Package>> {
-    let mut seen: FxHashSet<PathBuf> = ws.members().filter_map(|(path, _)| path.parent().map(Path::to_owned)).collect();
-    let mut queue = summary::patch_paths(root);
-    queue.extend(summary::replace_paths(replace));
-    for (path, m) in ws.members() {
-        queue.extend(summary::path_dependencies(&serde_json::to_value(export_package(path, m))?));
-    }
-    let mut read = Vec::new();
-    while let Some(dir) = queue.pop() {
-        if !seen.insert(dir.clone()) {
-            continue;
-        }
-        let manifest_path = dir.join("Cargo.toml");
-        let source = blaze_manifest::source::SourceId::for_path(&dir)?;
-        let EitherManifest::Real(manifest) = read_manifest(&manifest_path, source, ctx)? else {
-            anyhow::bail!("{} is a path dependency with no package", manifest_path.display());
-        };
-        queue.extend(summary::path_dependencies(&serde_json::to_value(export_package(&manifest_path, &manifest))?));
-        read.push(Package { manifest_path, manifest, locked_source: None });
     }
     Ok(read)
 }
@@ -382,7 +343,7 @@ fn locked_ids(lock: &Resolve) -> Vec<PackageId> {
 /// step runs once however many packages there are, never once more for each.
 fn locate_all(
     cx: &mut Cx<'_>,
-    ctx: &Context,
+    ctx: &Context<Snap>,
     reads: &Reads<'_>,
     sources: &Sources,
     ids: &[PackageId],
@@ -428,7 +389,7 @@ fn locate_all(
 /// The members `select` selects, as cargo's `Packages::from_flags` and
 /// `Packages::to_package_id_specs` select them.
 fn selected(
-    ws: &Workspace<'_>,
+    ws: &Workspace<'_, Snap>,
     member_ids: &[PackageId],
     select: &Select,
     warnings: &mut Vec<String>,
@@ -523,36 +484,11 @@ fn feature_roots(
 
 /// `resolver.feature-unification`, which nightly cargo reads only with `-Zfeature-unification`
 /// (`unstable.feature-unification`); `selected` otherwise.
-fn feature_unification(config: &blaze_manifest::Config) -> anyhow::Result<FeatureUnification> {
+fn feature_unification(config: &blaze_manifest::Config<Snap>) -> anyhow::Result<FeatureUnification> {
     let resolver = config.get::<CargoResolverConfig>("resolver")?;
     let unstable = config.get::<Option<bool>>("unstable.feature-unification")?;
     Ok(match (unstable, resolver.feature_unification) {
         (Some(true), Some(it)) => it,
         _ => FeatureUnification::Selected,
     })
-}
-
-/// The Rust versions the resolve prefers packages to support, as cargo's `resolve_with_previous`
-/// gives them: when `resolver.incompatible-rust-versions` is `fallback`, or unset with resolver
-/// 3, the members' `rust-version`s, or rustc's release if none names one.
-fn rust_versions(
-    ctx: &Context,
-    behavior: ResolveBehavior,
-    members: &[RustVersion],
-    rustc_version: &str,
-) -> anyhow::Result<Option<Vec<PartialVersion>>> {
-    let config: CargoResolverConfig = ctx.config.get("resolver")?;
-    let honours = match config.incompatible_rust_versions {
-        Some(IncompatibleRustVersions::Allow) => false,
-        Some(IncompatibleRustVersions::Fallback) => true,
-        None => behavior == ResolveBehavior::V3,
-    };
-    if !honours {
-        return Ok(None);
-    }
-    if members.is_empty() {
-        let release = rustc_version.split(' ').next().unwrap_or(rustc_version);
-        return Ok(Some(vec![release.parse()?]));
-    }
-    Ok(Some(members.iter().map(RustVersion::to_partial).collect()))
 }

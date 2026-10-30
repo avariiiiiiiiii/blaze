@@ -24,6 +24,8 @@
 
 use std::fmt;
 
+use blaze_ids::bits::BitSet;
+
 use crate::Revision;
 use crate::database::Database;
 use crate::durability::Durability;
@@ -257,8 +259,8 @@ struct Frame {
     base: u32,
     /// Positions in the query's edge set that the frame read, in first-read order.
     read: Vec<u32>,
-    /// Bits of the positions below `base` that `read` holds; all clear in a spare frame.
-    old: Vec<u64>,
+    /// The positions below `base` that `read` holds; empty in a spare frame.
+    old: BitSet<u32>,
     durability: Durability,
     changed_at: Revision,
     shareable: bool,
@@ -277,12 +279,10 @@ impl Frame {
     /// Pushes `position`, below `base`, unless the frame holds it.
     #[inline]
     fn read_old(&mut self, position: u32) {
-        let (word, bit) = ((position / 64) as usize, 1u64 << (position % 64));
-        if self.old.len() <= word {
-            self.old.resize(self.base.div_ceil(64) as usize, 0);
+        if self.old.capacity() <= position as usize {
+            self.old.grow(self.base as usize);
         }
-        if self.old[word] & bit == 0 {
-            self.old[word] |= bit;
+        if self.old.insert(position) {
             self.read.push(position);
         }
     }
@@ -306,7 +306,7 @@ impl Frame {
     fn recycle(&mut self) {
         for &position in &self.read {
             if position < self.base {
-                self.old[(position / 64) as usize] = 0;
+                self.old.remove(position);
             }
         }
         self.read.clear();
@@ -335,8 +335,8 @@ impl Captures {
                 base,
                 // alloc: `Vec::new` allocates nothing; a frame's buffers are reused by later captures
                 read: Vec::new(),
-                // alloc: `Vec::new` allocates nothing; a frame's buffers are reused by later captures
-                old: Vec::new(),
+                // alloc: an empty set allocates nothing; a frame's buffers are reused by later captures
+                old: BitSet::default(),
                 durability: Durability::MAX,
                 changed_at: Revision::start(),
                 shareable: true,
@@ -511,7 +511,7 @@ mod tests {
         let mut inner = captures.open.pop().unwrap();
         inner.merge_into(captures.open.last_mut().unwrap());
         inner.recycle();
-        assert!(inner.old.iter().all(|&word| word == 0));
+        assert!(inner.old.is_empty());
         assert_eq!(positions(&captures), [2, 0, 1, 3]);
         assert_eq!(captures.open[0].changed_at, Revision::from(7));
     }

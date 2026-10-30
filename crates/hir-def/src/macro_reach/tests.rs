@@ -162,20 +162,22 @@ fn each_pass_walks_one_module_further_up() {
     let def_map = main_def_map(&db);
     let names = Names::of(&db, &[def_map]);
     let defining = macro_reach_module(&db, names.macros["mac"]).unwrap();
-    let mut reachable = MacroReachable::default();
-    let mut pass = || {
-        let mut reached = Vec::new();
-        reachable.update_from_macro(&db, defining, |it| reached.push(names.reached(&db, it)));
-        reached.sort();
-        reached
-    };
-    assert_eq!(
-        pass(),
-        ["S", "S.a", "S.b", "T", "T.x", "deep", "f", "h", "hidden", "inner", "mac", "private"]
-    );
-    assert_eq!(pass(), ["helper", "m", "outer_private", "sibling"]);
-    assert_eq!(pass(), ["g", "mac", "outer", "semi", "top"]);
-    assert!(pass().is_empty());
+    blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+        let mut reachable = MacroReachable::new_in(frame);
+        let mut pass = || {
+            let mut reached = Vec::new();
+            reachable.update_from_macro(&db, defining, |it| reached.push(names.reached(&db, it)));
+            reached.sort();
+            reached
+        };
+        assert_eq!(
+            pass(),
+            ["S", "S.a", "S.b", "T", "T.x", "deep", "f", "h", "hidden", "inner", "mac", "private"]
+        );
+        assert_eq!(pass(), ["helper", "m", "outer_private", "sibling"]);
+        assert_eq!(pass(), ["g", "mac", "outer", "semi", "top"]);
+        assert!(pass().is_empty());
+    });
 }
 
 /// The walked pairs are kept per macro's module: a second macro of another module walks the
@@ -187,20 +189,22 @@ fn walked_modules_are_kept_per_macros_module() {
     let names = Names::of(&db, &[def_map]);
     let m = names.module("m");
     let root = def_map.root_module_id();
-    let mut reachable = MacroReachable::default();
-    let mut walk = |module: ModuleId, defining: ModuleId| {
-        let mut reached = Vec::new();
-        let new = reachable.update_macro_reachable(&db, module, defining, &mut |it| {
-            reached.push(names.reached(&db, it))
-        });
-        reached.sort();
-        (new, reached)
-    };
-    let (new, from_m) = walk(m, m);
-    assert!(new);
-    assert!(from_m.contains(&"private".to_owned()));
-    assert_eq!(walk(m, m), (false, Vec::new()));
-    let (new, from_root) = walk(m, root);
-    assert!(new);
-    assert_eq!(from_root, ["S", "S.a", "f", "mac"]);
+    blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+        let mut reachable = MacroReachable::new_in(frame);
+        let mut walk = |module: ModuleId, defining: ModuleId| {
+            let mut reached = Vec::new();
+            let new = reachable.update_macro_reachable(&db, module, defining, &mut |it| {
+                reached.push(names.reached(&db, it))
+            });
+            reached.sort();
+            (new, reached)
+        };
+        let (new, from_m) = walk(m, m);
+        assert!(new);
+        assert!(from_m.contains(&"private".to_owned()));
+        assert_eq!(walk(m, m), (false, Vec::new()));
+        let (new, from_root) = walk(m, root);
+        assert!(new);
+        assert_eq!(from_root, ["S", "S.a", "f", "mac"]);
+    });
 }

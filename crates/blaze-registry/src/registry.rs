@@ -364,7 +364,7 @@ impl Registry {
             std::fs::metadata(self.crate_file(name, version)).is_ok_and(|it| it.len() > 0);
         in_cache
             || crate::download::parse_checksum(checksum)
-                .is_some_and(|key| self.context.store.as_ref().is_some_and(|store| store.has(&key)))
+                .is_some_and(|key| self.context.store.is_some_and(|store| store.has(&key)))
     }
 }
 

@@ -133,9 +133,9 @@ fn main() {
     let mut placed = source_map
         .macro_calls()
         .map(|(_, call)| {
-            let written = call.loc(&db).to_node(&db).value.to_string();
+            let written = call.loc(&db).to_node_view(&db).value.to_string();
             let expansion = call.parse_macro_expansion(&db);
-            (written, expansion.value.0.syntax_node().to_string(), expansion.err.is_some())
+            (written, expansion.value.0.root().to_string(), expansion.err.is_some())
         })
         .filter(|(_, expanded, _)| expanded.ends_with("u32"))
         .collect::<Vec<_>>();
@@ -164,8 +164,8 @@ fn line_and_column_after_a_byte_order_mark_and_crlf_lines() {
     let mut placed = super::builtin_errors::macro_calls(&db)
         .into_iter()
         .map(|call| {
-            let written = call.loc(&db).to_node(&db).value.to_string();
-            (written, call.parse_macro_expansion(&db).value.0.syntax_node().to_string())
+            let written = call.loc(&db).to_node_view(&db).value.to_string();
+            (written, call.parse_macro_expansion(&db).value.0.root().to_string())
         })
         .collect::<Vec<_>>();
     placed.sort();

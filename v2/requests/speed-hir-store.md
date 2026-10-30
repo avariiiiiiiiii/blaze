@@ -72,6 +72,7 @@ are reserved exactly, so boxing them does not reallocate). The doc comment's "on
 one to sum, one to place" stays true. Why: one counting sort in the tree.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> applied by mem-format-fwd: `BindingPats::from_pushed` is `blaze_ids::radix::csr::group_into` (the counting sort under `Csr::rebuild`) into two fresh `Vec`s, which it reserves exactly, so the boxing after does not reallocate. Adapted: `Csr::build` allocates its cursors on every call, one more allocation per store than before, so `from_pushed` takes `cursors: &mut Vec<u32>`, a new field of the pooled `FreezeScratch` (cleared, counted in `capacity`). Lowering's allocations stay as they were. Callers: `finish` passes `&mut freeze.cursors`; the model test `binding_patterns_are_their_pushes_in_order` keeps one buffer across its seeds.
 
 ## speed-hir-sol-items: `hir/persist.rs` costs the item tree's decode and encode pay (2026-10-29)
 
@@ -187,3 +188,4 @@ The arithmetic is in `docs/v2/plan/lanes/format/speed-of-light.md`, "The item tr
 Status: open
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> mem-format-fwd: held, all three items are in `hir/persist.rs`. Item 3 overlaps `v2/requests/mem-format-hir.md` section 5 (`Words` on per-thread scratch, names without a `Box<str>` each), which waits on lane db's ok (`> db: ok` there). Items 1 and 2 (`Read::seq` at its length, `Read::boxed`, `ModPath` segments into a `SmallVec`) are not in the tree (`rg 'fn boxed|struct Values' hir/persist.rs` finds nothing) and go with that section. Status: open.

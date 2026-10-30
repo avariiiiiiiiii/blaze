@@ -337,14 +337,21 @@ impl SwitchTargets {
         targets: impl Iterator<Item = (u128, BasicBlockId)>,
         otherwise: BasicBlockId,
     ) -> Self {
-        let (values, mut targets): (SmallVec<_>, SmallVec<_>) = targets.unzip();
-        targets.push(otherwise);
-        Self { values, targets }
+        let count = targets.size_hint().0;
+        let mut values = SmallVec::with_capacity(count);
+        let mut blocks = SmallVec::with_capacity(count + 1);
+        for (value, target) in targets {
+            values.push(value);
+            blocks.push(target);
+        }
+        blocks.push(otherwise);
+        Self { values, targets: blocks }
     }
 
     /// Builds a switch targets definition that jumps to `then` if the tested value equals `value`,
     /// and to `else_` if not.
     pub fn static_if(value: u128, then: BasicBlockId, else_: BasicBlockId) -> Self {
+        // alloc: none, both lists fit inline
         Self { values: smallvec![value], targets: smallvec![then, else_] }
     }
 
@@ -458,6 +465,40 @@ impl AssertKind {
         }
     }
 }
+
+/// The blocks control goes to from a terminator, borrowed from it: what
+/// [`TerminatorKind::successors`] gives, in the same order.
+#[derive(Debug, Clone)]
+pub struct Successors<'a> {
+    /// The targets of a terminator with at most two, `None` where it has fewer.
+    pair: [Option<BasicBlockId>; 2],
+    at: usize,
+    /// A switch's targets.
+    switch: std::slice::Iter<'a, BasicBlockId>,
+}
+
+impl Iterator for Successors<'_> {
+    type Item = BasicBlockId;
+
+    #[inline]
+    fn next(&mut self) -> Option<BasicBlockId> {
+        while self.at < 2 {
+            let it = self.pair[self.at];
+            self.at += 1;
+            if it.is_some() {
+                return it;
+            }
+        }
+        self.switch.next().copied()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.pair[self.at.min(2)..].iter().flatten().count() + self.switch.len();
+        (len, Some(len))
+    }
+}
+
+impl ExactSizeIterator for Successors<'_> {}
 
 #[derive(Debug, PartialEq, Eq, Hash, Clone)]
 pub enum TerminatorKind {
@@ -1314,25 +1355,24 @@ impl TerminatorKind {
 
     /// The blocks control goes to from here when nothing unwinds, and the coroutine is not
     /// dropped where it yields.
-    pub fn successors(&self) -> SmallVec<[BasicBlockId; 2]> {
-        match self {
+    pub fn successors(&self) -> Successors<'_> {
+        let (pair, switch): ([Option<BasicBlockId>; 2], &[BasicBlockId]) = match self {
             TerminatorKind::Goto { target }
             | TerminatorKind::Drop { target, .. }
             | TerminatorKind::DropAndReplace { target, .. }
             | TerminatorKind::Assert { target, .. }
             | TerminatorKind::FalseEdge { real_target: target, .. }
-            | TerminatorKind::FalseUnwind { real_target: target, .. } => smallvec![*target],
-            TerminatorKind::SwitchInt { targets, .. } => targets.all_targets().into(),
-            TerminatorKind::Call { target, .. } => target.iter().copied().collect(),
-            TerminatorKind::Yield { resume, drop, .. } => {
-                std::iter::once(*resume).chain(*drop).collect()
-            }
+            | TerminatorKind::FalseUnwind { real_target: target, .. } => ([Some(*target), None], &[]),
+            TerminatorKind::SwitchInt { targets, .. } => ([None, None], targets.all_targets()),
+            TerminatorKind::Call { target, .. } => ([*target, None], &[]),
+            TerminatorKind::Yield { resume, drop, .. } => ([Some(*resume), *drop], &[]),
             TerminatorKind::UnwindResume
             | TerminatorKind::Abort
             | TerminatorKind::Return
             | TerminatorKind::Unreachable
-            | TerminatorKind::CoroutineDrop => smallvec![],
-        }
+            | TerminatorKind::CoroutineDrop => ([None, None], &[]),
+        };
+        Successors { pair, at: 0, switch: switch.iter() }
     }
 
     /// The cleanup block this terminator unwinds to, if it names one.
@@ -1353,10 +1393,11 @@ impl TerminatorKind {
     pub fn all_successors(&self) -> SmallVec<[BasicBlockId; 2]> {
         match self {
             TerminatorKind::FalseEdge { real_target, imaginary_target } => {
-                smallvec![*real_target, *imaginary_target]
+                smallvec![*real_target, *imaginary_target] // alloc: two blocks, inline in the SmallVec
             }
             _ => {
-                let mut all = self.successors();
+                // alloc: inline in the SmallVec but for a switch of two or more values
+                let mut all: SmallVec<[BasicBlockId; 2]> = self.successors().collect();
                 all.extend(self.unwind());
                 all
             }
@@ -1548,7 +1589,12 @@ impl Hash for MirBody<'_> {
         start_block.hash(state);
         owner.hash(state);
         binding_locals.hash(state);
-        hash_by_key(upvar_locals.iter(), state);
+        hash_by_key(
+            upvar_locals,
+            |binding| binding.into_raw().into_u32(),
+            |raw| BindingId::from_raw(RawIdx::from_u32(raw)),
+            state,
+        );
         param_locals.hash(state);
         promoted_locals.hash(state);
         closures.hash(state);
@@ -1565,20 +1611,26 @@ impl Hash for MirBody<'_> {
     }
 }
 
-/// Hashes the entries of a map (distinct keys) in the order of their keys, so that maps that
-/// are `==` hash the same whatever order they iterate in. Straight into `state`, with no
-/// hasher per entry; up to 8 entries sort on the stack.
-fn hash_by_key<'a, K: Hash + Ord + 'a, V: Hash + 'a, H: Hasher>(
-    entries: impl Iterator<Item = (&'a K, &'a V)>,
+/// Hashes the entries of `map` in the order of their keys, so that maps that are `==` hash the
+/// same whatever order they iterate in. The keys sort as `u32`s in the worker's scratch buffer,
+/// `raw` keeping their order, and each value is found again by its key; straight into `state`,
+/// with no hasher per entry.
+fn hash_by_key<K: Hash + Eq + Copy, V: Hash, H: Hasher>(
+    map: &FxHashMap<K, V>,
+    raw: impl Fn(K) -> u32,
+    from_raw: impl Fn(u32) -> K,
     state: &mut H,
 ) {
-    let mut entries: SmallVec<[(&K, &V); 8]> = entries.collect();
-    entries.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    state.write_usize(entries.len());
-    for (key, value) in entries {
-        key.hash(state);
-        value.hash(state);
-    }
+    blaze_mem::scratch::with_u32s(|keys| {
+        keys.extend(map.keys().map(|&key| raw(key)));
+        keys.sort_unstable();
+        state.write_usize(keys.len());
+        for &key in keys.iter() {
+            let key = from_raw(key);
+            key.hash(state);
+            map[&key].hash(state);
+        }
+    })
 }
 
 /// What a body means, which depends on the passes it has been through. The IDE only ever
@@ -1775,9 +1827,10 @@ impl MirBody<'_> {
                 self.param_locals.push(local);
                 Operand { kind: OperandKind::Move(Place::from(local).store()), span: None }
             })
-            .collect();
+            .collect(); // alloc: the owned shim body's aggregate, once per `rust-call` shim
         let span = MirSpan::Unknown;
         self.start_block = self.basic_blocks.alloc(BasicBlock {
+            // alloc: the owned shim body's one statement
             statements: vec![Statement {
                 kind: StatementKind::Assign(
                     Place::from(tuple).store(),
@@ -1795,7 +1848,12 @@ impl MirBody<'_> {
     }
 
     pub fn local_to_binding_map(&self) -> ArenaMap<LocalId, BindingId> {
-        self.binding_locals.iter().map(|(it, y)| (*y, it)).collect()
+        // alloc: the caller's map, one block over the body's locals
+        let mut map = ArenaMap::with_capacity(self.locals.len());
+        for (binding, &local) in self.binding_locals.iter() {
+            map.insert(local, binding);
+        }
+        map
     }
 
     places_walker!(
@@ -1833,6 +1891,7 @@ impl<'db> MirBody<'db> {
             let is_copy =
                 *copy.entry(ty).or_insert_with(|| infcx.type_is_copy_modulo_regions(env, ty));
             if !is_copy {
+                // clone: a `StoredPlace` is a local and an interned projection handle
                 operand.kind = OperandKind::Move(place.clone());
             }
         };
@@ -2246,8 +2305,8 @@ impl Budget {
     pub fn setting(&self) -> String {
         let key = base_db::ConstEvalBudget::KEY;
         match self {
-            Budget::Steps(_) => format!("`{key}.steps`"),
-            Budget::Memory(_) => format!("`{key}.memory`"),
+            Budget::Steps(_) => format!("`{key}.steps`"), // alloc: error path
+            Budget::Memory(_) => format!("`{key}.memory`"), // alloc: error path
         }
     }
 }
@@ -2397,6 +2456,86 @@ impl MirOptions {
             inline: false,
         }
     }
+
+    /// Whether these ask for nothing beyond the runtime body: no passes and no checks.
+    pub fn is_runtime(self) -> bool {
+        self.level == MirOptLevel::Off && !self.ub_checks
+    }
+}
+
+/// Whose MIR body: a function's or constant's, a closure's, or an `async` block's, as the
+/// `Future::poll` of the block's type or (by move) as that of the future an `async` closure
+/// gives when called by value though it could be called again, which owns what the closure
+/// captured where the block itself borrows from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirOwner<'db> {
+    Body(InferBodyId<'db>),
+    Closure(InternedClosureId<'db>),
+    Coroutine(InternedCoroutineId<'db>),
+    CoroutineByMove(InternedCoroutineId<'db>),
+}
+
+impl<'db> MirOwner<'db> {
+    /// The body of the future of type `args` that the `async` block `coroutine` gives.
+    pub fn coroutine(
+        db: &'db Db,
+        coroutine: InternedCoroutineId<'db>,
+        args: CoroutineArgs<DbInterner<'db>>,
+    ) -> MirOwner<'db> {
+        match is_by_move_coroutine(db, coroutine, args) {
+            true => MirOwner::CoroutineByMove(coroutine),
+            false => MirOwner::Coroutine(coroutine),
+        }
+    }
+
+    /// The body this one is written in: itself for a function or constant, else the body the
+    /// closure or block is an expression of.
+    pub fn written_in(self, db: &'db Db) -> InferBodyId<'db> {
+        match self {
+            MirOwner::Body(def) => def,
+            MirOwner::Closure(closure) => closure.loc(db).owner,
+            MirOwner::Coroutine(coroutine) | MirOwner::CoroutineByMove(coroutine) => {
+                coroutine.loc(db).owner
+            }
+        }
+    }
+
+    /// The body inlining sees as the caller when this owner's MIR is optimized: a function or a
+    /// closure. A const, static or anon const body is evaluated by the interpreter, which does
+    /// not read `Inlined`, and a coroutine body inlines nothing (rustc's
+    /// `check_caller_mir_body`).
+    pub fn caller(self) -> Option<InlinedBody<'db>> {
+        match self {
+            MirOwner::Body(def) => def.as_function().map(InlinedBody::Fn),
+            MirOwner::Closure(closure) => Some(InlinedBody::Closure(closure)),
+            MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => None,
+        }
+    }
+}
+
+/// How far a body has gone: built from its HIR, through the runtime passes, or optimized and
+/// checked with the options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirStage {
+    Built,
+    Runtime,
+    Optimized(MirOptions),
+}
+
+impl MirStage {
+    /// The stage the code generator compiles `owner` at under `options`: the runtime body when
+    /// they ask for nothing beyond it, else the body optimized with them. Of the passes only
+    /// the UB checks run on a coroutine, so without them its runtime body serves every level.
+    pub fn compiled(owner: MirOwner<'_>, options: MirOptions) -> MirStage {
+        let runtime = match owner {
+            MirOwner::Body(_) | MirOwner::Closure(_) => options.is_runtime(),
+            MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => !options.ub_checks,
+        };
+        match runtime {
+            true => MirStage::Runtime,
+            false => MirStage::Optimized(options),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2445,25 +2584,60 @@ mod tests {
         {
             assert_eq!(
                 MirOptions::at(level),
-                MirOptions { level, ub_checks: false, lifetime_markers }
+                MirOptions { level, ub_checks: false, lifetime_markers, inline: false }
             );
         }
     }
 
-    fn digest<'a>(entries: impl Iterator<Item = (&'a u32, &'a Vec<u32>)>) -> (u64, u64) {
+    #[test]
+    fn what_a_body_inlined_is_part_of_its_hash() {
+        use hir_def::hir::ExprId;
+
+        use super::{Inlined, InlinedPromoted, InlinedScope, InlinedSpan, MirSpan};
+
+        let expr = |n: u32| MirSpan::ExprId(ExprId::from_raw(RawIdx::from(n)));
+        let hash = |inlined: &Inlined<'_>| {
+            let mut hasher = salsa::StableHasher::new();
+            std::hash::Hash::hash(inlined, &mut hasher);
+            hasher.finish128()
+        };
+        let empty = Inlined::default();
+        assert!(empty.is_empty());
+        let mut scoped = Inlined::default();
+        scoped.scopes.push(InlinedScope { callee: 0, call_site: expr(1) });
+        scoped.spans.push(InlinedSpan { scope: 0, span: expr(2) });
+        let mut nested = Inlined::default();
+        nested.scopes.push(InlinedScope { callee: 0, call_site: MirSpan::Inlined(0) });
+        nested.spans.push(InlinedSpan { scope: 0, span: expr(2) });
+        let mut promoted = scoped.clone();
+        promoted.promoted.push(InlinedPromoted {
+            local: Idx::from_raw(RawIdx::from(3)),
+            callee: 0,
+            expr: ExprId::from_raw(RawIdx::from(4)),
+        });
+        let hashes = [hash(&empty), hash(&scoped), hash(&nested), hash(&promoted)];
+        for (i, a) in hashes.iter().enumerate() {
+            for b in &hashes[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(hash(&scoped), hash(&scoped.clone()));
+    }
+
+    fn digest(map: &FxHashMap<u32, Vec<u32>>) -> (u64, u64) {
         let mut hasher = salsa::StableHasher::new();
-        hash_by_key(entries, &mut hasher);
+        hash_by_key(map, |key| key, |raw| raw, &mut hasher);
         hasher.finish128()
     }
 
     #[test]
-    fn a_small_map_hashes_by_key_on_the_stack_too() {
+    fn a_small_map_hashes_by_key() {
         let forward = map((0..3).map(|key| (key, vec![key])), 0);
         let backward = map((0..3).rev().map(|key| (key, vec![key])), 64);
-        assert_eq!(digest(forward.iter()), digest(backward.iter()));
-        assert_ne!(digest(forward.iter()), digest(map([(0, vec![0])], 0).iter()));
+        assert_eq!(digest(&forward), digest(&backward));
+        assert_ne!(digest(&forward), digest(&map([(0, vec![0])], 0)));
         let empty = map(std::iter::empty::<(u32, Vec<u32>)>(), 0);
-        assert_ne!(digest(empty.iter()), digest(map([(0, vec![])], 0).iter()));
+        assert_ne!(digest(&empty), digest(&map([(0, vec![])], 0)));
     }
 
     fn map(
@@ -2484,12 +2658,7 @@ mod tests {
         let forward = map(entries(), 0);
         let backward = map(entries().into_iter().rev(), 256);
         assert_eq!(forward, backward);
-        assert_eq!(digest(forward.iter()), digest(backward.iter()));
-
-        let pairs = entries();
-        let refs: Vec<(&u32, &Vec<u32>)> = pairs.iter().map(|(key, value)| (key, value)).collect();
-        assert_eq!(digest(refs.iter().copied()), digest(refs.iter().rev().copied()));
-        assert_eq!(digest(refs.iter().copied()), digest(forward.iter()));
+        assert_eq!(digest(&forward), digest(&backward));
     }
 
     #[test]
@@ -2499,15 +2668,15 @@ mod tests {
         let mut changed = base.clone();
         changed.get_mut(&17).unwrap()[1] += 1;
         assert_ne!(base, changed);
-        assert_ne!(digest(base.iter()), digest(changed.iter()));
+        assert_ne!(digest(&base), digest(&changed));
 
         let mut rekeyed = base.clone();
         let value = rekeyed.remove(&17).unwrap();
         rekeyed.insert(1000, value);
-        assert_ne!(digest(base.iter()), digest(rekeyed.iter()));
+        assert_ne!(digest(&base), digest(&rekeyed));
 
         let mut fewer = base.clone();
         fewer.remove(&17);
-        assert_ne!(digest(base.iter()), digest(fewer.iter()));
+        assert_ne!(digest(&base), digest(&fewer));
     }
 }

@@ -29,17 +29,17 @@ mod early;
 pub use check_cfg::CheckCfg;
 pub(crate) use self::early::validation::pretty;
 
-use std::{collections::hash_map::Entry, ops::ControlFlow};
+use std::collections::hash_map::Entry;
 
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
 use cfg::{CfgExpr, CfgOptions};
-use hir::{HirFileId, InFile, MacroCallId};
+use hir::{HirFileId, InFile, MacroCallId, ModuleSourceView};
 use hir_def::AdtId;
 use rustc_hash::FxHashMap;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, WalkEvent,
-    ast::{self, HasAttrs as _, HasName as _},
+    FlatTree, SyntaxKind, SyntaxNodePtr, TextRange, WalkEvent,
+    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
 };
 
 use crate::{
@@ -104,15 +104,16 @@ impl Emitted {
 }
 
 /// A syntax tree rustc's early lint pass walks: a file of the crate's modules, or what a macro
-/// call, an attribute macro or a derive in one expands to.
-pub(crate) struct Tree {
+/// call, an attribute macro or a derive in one expands to. Its nodes are views of the tree the
+/// database keeps, borrowed for `'db`, of a tree `cx.vsema` handed out.
+pub(crate) struct Tree<'db> {
     pub(crate) file: HirFileId,
-    pub(crate) root: SyntaxNode,
+    pub(crate) root: ast::Node<'db>,
     /// The macro call it is the expansion of, when it is one.
     pub(crate) call: Option<MacroCallId>,
     /// Its nodes rustc's walk comes to, in pre-order: not those `cfg` removes, nor an item an
     /// attribute macro replaces (what that expands to is a tree of its own).
-    pub(crate) nodes: Vec<SyntaxNode>,
+    pub(crate) nodes: Vec<ast::Node<'db>>,
     /// The kind of each of `nodes`, by index: a pass that looks at a few kinds scans these 2
     /// bytes a node, not the nodes ([`Tree::of_kind`]).
     pub(crate) kinds: Vec<SyntaxKind>,
@@ -121,9 +122,9 @@ pub(crate) struct Tree {
     /// (`fn f() { #![..] }`), so this is true of the three nodes above each `ATTR`.
     pub(crate) attrs: Vec<bool>,
     /// The outermost nodes `cfg` removes: their `cfg`s are evaluated, nothing in them is.
-    pub(crate) off: Vec<SyntaxNode>,
+    pub(crate) off: Vec<ast::Node<'db>>,
     /// The items an attribute macro replaces with its expansion.
-    pub(crate) replaced: Vec<SyntaxNode>,
+    pub(crate) replaced: Vec<ast::Node<'db>>,
     /// The ranges of `off` and `replaced`, disjoint, by where they start.
     skips: Vec<TextRange>,
     /// Where the walk comes to the tree: the places of the `mod` items and macro calls it is
@@ -131,7 +132,7 @@ pub(crate) struct Tree {
     place: Vec<(u32, u32)>,
 }
 
-impl Tree {
+impl<'db> Tree<'db> {
     /// Whether the tree is a file's own, not a macro's expansion.
     pub(crate) fn in_file(&self) -> bool {
         self.call.is_none()
@@ -146,28 +147,28 @@ impl Tree {
 
     /// The nodes whose kind `wanted` holds, in pre-order: a scan of the kind column, each node
     /// read only when it is wanted.
-    pub(crate) fn of_kind(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = &SyntaxNode> {
-        self.kinds.iter().zip(&self.nodes).filter(move |(kind, _)| wanted(**kind)).map(|(_, node)| node)
+    pub(crate) fn of_kind(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = ast::Node<'db>> {
+        self.kinds.iter().zip(&self.nodes).filter(move |(kind, _)| wanted(**kind)).map(|(_, &node)| node)
     }
 
     /// The nodes whose kind `wanted` holds and which may have an attribute ([`Tree::attrs`]),
     /// in pre-order: a scan of two columns, each node read only when it is wanted.
-    pub(crate) fn with_attrs(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = &SyntaxNode> {
+    pub(crate) fn with_attrs(&self, wanted: impl Fn(SyntaxKind) -> bool) -> impl Iterator<Item = ast::Node<'db>> {
         (self.kinds.iter().zip(&self.attrs).zip(&self.nodes))
             .filter(move |((kind, attrs), _)| **attrs && wanted(**kind))
-            .map(|(_, node)| node)
+            .map(|(_, &node)| node)
     }
 
     /// `node` of the tree, as the [`InFile`] the rest of the crate takes.
-    pub(crate) fn ptr(&self, node: &SyntaxNode) -> InFile<SyntaxNodePtr> {
-        InFile::new(self.file, SyntaxNodePtr::new(node))
+    pub(crate) fn ptr(&self, node: ast::Node<'_>) -> InFile<SyntaxNodePtr> {
+        InFile::new(self.file, ast::ptr(node))
     }
 }
 
 /// The crate as rustc's early lint pass walks it: every file of its modules and every
 /// expansion in them, in the order the walk comes to them, each with what `cfg` keeps of it.
 pub(crate) struct Walk<'db> {
-    pub(crate) trees: Vec<Tree>,
+    pub(crate) trees: Vec<Tree<'db>>,
     /// The crate's cfg: `--cfg` and the target's.
     pub(crate) cfg: &'db CfgOptions,
     index: FxHashMap<HirFileId, usize>,
@@ -179,9 +180,11 @@ impl<'db> Walk<'db> {
     pub(crate) fn of(cx: &Cx<'_, 'db>) -> Walk<'db> {
         let modules = crate::checks::modules(cx);
         let mut walk = Walk {
+            // alloc: setup, the walk is made once per check (`Cx::walk`)
             trees: Vec::new(),
             cfg: cx.krate.cfg(cx.db),
             index: FxHashMap::default(),
+            // alloc: setup, as above
             modules: modules.iter().enumerate().map(|(rank, it)| (*it, rank)).collect(),
         };
         let mut places: FxHashMap<HirFileId, Vec<(u32, u32)>> = FxHashMap::default();
@@ -191,35 +194,45 @@ impl<'db> Walk<'db> {
             if walk.index.contains_key(&file_id) {
                 continue;
             }
+            // alloc: setup, once per file of the crate
             let mut place = Vec::new();
             if let Some(declared) = module.declaration_source_range(cx.db) {
                 let declared = declared.original_node_file_range_rooted(cx.db);
                 place = places.get(&HirFileId::from(declared.file_id)).cloned().unwrap_or_default();
                 place.push(entered(declared.range));
             }
+            // clone: setup, as above
             places.insert(file_id, place.clone());
-            let root = cx.sema.parse(file).syntax().clone();
+            let root = cx.vsema.parse(file).syntax();
             walk.add(cx, file_id, root, place);
         }
         walk
     }
 
     /// Adds the tree `root` of `file`, and the trees of what the macros in it expand to.
-    fn add(&mut self, cx: &Cx<'_, 'db>, file: HirFileId, root: SyntaxNode, place: Vec<(u32, u32)>) {
+    fn add(&mut self, cx: &Cx<'_, 'db>, file: HirFileId, root: ast::Node<'db>, place: Vec<(u32, u32)>) {
         // The tree's index is taken now: what it expands to is added after it is pushed.
         match self.index.entry(file) {
             Entry::Occupied(_) => return,
             Entry::Vacant(it) => it.insert(self.trees.len()),
         };
-        // About one node per 16 bytes of Rust source.
-        let mut nodes = Vec::with_capacity(usize::from(root.text_range().len()) / 16);
-        let mut kinds = Vec::with_capacity(nodes.capacity());
-        let mut attrs = Vec::with_capacity(nodes.capacity());
-        // The indices in `nodes` of the nodes the walk is in, innermost last.
-        let mut open: Vec<u32> = Vec::new();
+        let capacity = node_count(root);
+        // alloc: setup, once per tree of the walk, the tree's columns, sized once
+        let mut nodes = Vec::with_capacity(capacity);
+        // alloc: as above
+        let mut kinds = Vec::with_capacity(capacity);
+        // alloc: as above
+        let mut attrs = Vec::with_capacity(capacity);
+        // The indices in `nodes` of the nodes the walk is in, innermost last: deeper than 64 is
+        // rare in written Rust.
+        // alloc: setup, once per tree of the walk
+        let mut open: Vec<u32> = Vec::with_capacity(64);
+        // alloc: setup, once per tree of the walk, the tree's columns
         let mut off = Vec::new();
+        // alloc: as above
         let mut replaced = Vec::new();
-        let mut expansions: Vec<((u32, u32), InFile<SyntaxNode>)> = Vec::new();
+        // alloc: as above
+        let mut expansions: Vec<((u32, u32), InFile<ast::Node<'db>>)> = Vec::new();
         let mut events = root.preorder();
         while let Some(event) = events.next() {
             let node = match event {
@@ -232,17 +245,16 @@ impl<'db> Walk<'db> {
                 }
             };
             let kind = node.kind();
-            if ast::AnyHasAttrs::can_cast(kind)
-                && !self.on(&ast::AnyHasAttrs::cast(node.clone()).expect("checked by kind"))
+            if let Some(owner) = ast::AnyHasAttrs::cast(node)
+                && !self.on(owner)
             {
                 off.push(node);
                 events.skip_subtree();
                 continue;
             }
-            if ast::Item::can_cast(kind)
-                && let Some(item) = ast::Item::cast(node.clone())
+            if let Some(item) = ast::Item::cast(node)
                 && item.attrs().next().is_some()
-                && let Some(expanded) = cx.sema.expand_attr_macro(&item)
+                && let Some(expanded) = cx.vsema.expand_attr_macro(item)
             {
                 expansions.push((entered(node.text_range()), expanded.value));
                 replaced.push(node);
@@ -250,25 +262,30 @@ impl<'db> Walk<'db> {
                 continue;
             }
             if kind == SyntaxKind::MACRO_CALL
-                && let Some(call) = ast::MacroCall::cast(node.clone())
-                && let Some(expanded) = cx.sema.expand_macro_call(&call)
+                && let Some(call) = ast::MacroCall::cast(node)
+                && let Some(expanded) = cx.vsema.expand_macro_call(call)
             {
                 expansions.push((entered(node.text_range()), expanded));
             }
+            if kind == SyntaxKind::MODULE
+                && let Some(module) = self.block_module(cx, file, node)
+            {
+                expansions.push((entered(node.text_range()), module));
+            }
             if ast::Adt::can_cast(kind)
-                && let Some(owner) = ast::AnyHasAttrs::cast(node.clone())
+                && let Some(owner) = ast::AnyHasAttrs::cast(node)
             {
                 // What a derive makes comes after the item it is on.
                 let after = (u32::from(node.text_range().end()), 1);
-                for (meta, _) in self.attrs(&owner) {
-                    let is_derive = matches!(&meta, ast::Meta::TokenTreeMeta(it)
+                for (meta, _) in self.attrs(owner) {
+                    let is_derive = matches!(meta, ast::Meta::TokenTreeMeta(it)
                         if it.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "derive"));
                     if !is_derive {
                         continue;
                     }
-                    let Some(derived) = cx.sema.expand_derive_macro(&meta) else { continue };
+                    let Some(derived) = cx.vsema.expand_derive_macro(meta) else { continue };
                     for root in derived.into_iter().flatten() {
-                        let file = cx.sema.hir_file_for(&root.value);
+                        let file = cx.vsema.hir_file_for(root.value);
                         if file.is_macro() {
                             expansions.push((after, InFile::new(file, root.value)));
                         }
@@ -286,6 +303,7 @@ impl<'db> Walk<'db> {
             kinds.push(kind);
             attrs.push(false);
         }
+        // alloc: setup, once per tree, as above
         let mut skips: Vec<TextRange> = off.iter().chain(&replaced).map(|it| it.text_range()).collect();
         radix::sort_copy_by_key(&mut skips, |it| radix::pack_32(it.start().into(), it.end().into()));
         self.trees.push(Tree {
@@ -298,58 +316,64 @@ impl<'db> Walk<'db> {
             off,
             replaced,
             skips,
+            // clone: setup, once per tree, its place
             place: place.clone(),
         });
         for (at, expanded) in expansions {
+            // clone: setup, once per tree, as above
             let mut place = place.clone();
             place.push(at);
             self.add(cx, expanded.file_id, expanded.value, place);
         }
     }
 
+    /// The file of the out-of-line module `node` declares in a block (`fn f() { mod m; }`): it
+    /// is in a block's def map, not the crate's, so only the walk coming to `node` finds it.
+    fn block_module(&self, cx: &Cx<'_, 'db>, file: HirFileId, node: ast::Node<'db>) -> Option<InFile<ast::Node<'db>>> {
+        let module = ast::Module::cast(node)?;
+        if module.item_list().is_some() {
+            return None;
+        }
+        let def = cx.vsema.to_def2(InFile::new(file, module))?;
+        if self.modules.contains_key(&def) {
+            return None;
+        }
+        let source = def.definition_source_view(cx.db);
+        match source.value {
+            // The root `cx.vsema` hands out, so what is found under it maps back to its file.
+            ModuleSourceView::SourceFile(_) => Some(InFile::new(source.file_id, cx.root(source.file_id))),
+            ModuleSourceView::Module(_) | ModuleSourceView::BlockExpr(_) => None,
+        }
+    }
+
     /// Whether `cfg` keeps `owner`: each of its `#[cfg]`s, those `cfg_attr` gives included,
     /// holds, as rustc evaluates them in order and stops at the first that does not.
-    pub(crate) fn on(&self, owner: &ast::AnyHasAttrs) -> bool {
-        let cfg = self.cfg;
-        hir_expand::attrs::expand_cfg_attr(
-            ast::attrs_including_inner(owner),
-            || cfg,
-            |meta, _| match meta {
-                ast::Meta::CfgMeta(meta)
-                    if meta
-                        .cfg_predicate()
-                        .is_some_and(|it| cfg.check(&CfgExpr::parse_from_ast(it)) == Some(false)) =>
-                {
-                    ControlFlow::Break(())
-                }
-                _ => ControlFlow::Continue(()),
-            },
-        )
-        .is_none()
+    pub(crate) fn on(&self, owner: ast::AnyHasAttrs<'_>) -> bool {
+        self.attrs(owner).all(|(meta, _)| match meta {
+            ast::Meta::CfgMeta(meta) => !meta
+                .cfg_predicate()
+                .is_some_and(|it| self.cfg.check(&CfgExpr::parse_from_view(it)) == Some(false)),
+            _ => true,
+        })
     }
 
     /// The attributes of `owner` as rustc sees them once `cfg_attr` is expanded, outer then
-    /// inner, in order: each with the attribute it is written in.
-    pub(crate) fn attrs(&self, owner: &ast::AnyHasAttrs) -> Vec<(ast::Meta, ast::Attr)> {
-        let mut attrs = Vec::new();
-        hir_expand::attrs::expand_cfg_attr::<()>(
-            ast::attrs_including_inner(owner),
-            || self.cfg,
-            |meta, attr| {
-                attrs.push((meta, attr));
-                ControlFlow::Continue(())
-            },
-        );
-        attrs
+    /// inner, in order: each with the attribute it is written in. Read off the tree as the
+    /// caller iterates; nothing is gathered.
+    pub(crate) fn attrs<'t>(
+        &self,
+        owner: ast::AnyHasAttrs<'t>,
+    ) -> impl Iterator<Item = (ast::Meta<'t>, ast::Attr<'t>)> + use<'t, 'db> {
+        hir_expand::attrs::cfg_attrs_view(ast::attrs_including_inner(&owner), self.cfg)
     }
 
     /// The tree of `file`, if the walk has it.
-    pub(crate) fn tree(&self, file: HirFileId) -> Option<&Tree> {
+    pub(crate) fn tree(&self, file: HirFileId) -> Option<&Tree<'db>> {
         self.index.get(&file).map(|&it| &self.trees[it])
     }
 
     /// The trees of the crate's files, not of expansions.
-    pub(crate) fn files(&self) -> impl Iterator<Item = &Tree> {
+    pub(crate) fn files(&self) -> impl Iterator<Item = &Tree<'db>> {
         self.trees.iter().filter(|it| it.in_file())
     }
 
@@ -360,6 +384,7 @@ impl<'db> Walk<'db> {
         let (mut file, mut range) = (at.file_id, at.value.text_range());
         loop {
             if let Some(tree) = self.tree(file) {
+                // clone: once per diagnostic placed (`lints`'s sort key)
                 let mut place = tree.place.clone();
                 place.push(match pass {
                     Pass::Post => (u32::from(range.end()), 0),
@@ -367,8 +392,11 @@ impl<'db> Walk<'db> {
                 });
                 return place;
             }
-            let Some(call) = file.macro_file() else { return Vec::new() };
-            let node = call.loc(cx.db).to_node(cx.db);
+            if file.macro_file().is_none() {
+                // alloc: empty, allocates nothing
+                return Vec::new();
+            }
+            let node = cx.vsema.find_parent_file(file).expect("an expansion has its call");
             (file, range) = (node.file_id, node.value.text_range());
         }
     }
@@ -379,10 +407,29 @@ fn entered(range: TextRange) -> (u32, u32) {
     (u32::from(range.start()), u32::MAX - u32::from(range.end()))
 }
 
+/// How many nodes the walk of `root`'s tree may come to, the bound its columns are sized to:
+/// a scan of the token flags of the file's tree and of each part already parsed. A part not
+/// parsed yet is not parsed for this (what `cfg` removes stays unparsed); it is counted as one
+/// node per three bytes of its text, about what written Rust has.
+fn node_count(root: ast::Node<'_>) -> usize {
+    fn nodes(tree: &FlatTree) -> usize {
+        (0..tree.len()).filter(|&at| !tree.is_token(at)).count()
+    }
+    let file = root.file();
+    let parts: usize = (file.lazy_nodes().iter())
+        .map(|&at| match file.is_parsed(at) {
+            // A part's root stands for its lazy node, counted in the file's tree.
+            true => nodes(file.part(at)) - 1,
+            false => file.text_len(at) as usize / 3,
+        })
+        .sum();
+    nodes(file) + parts
+}
+
 /// Whether rustc's span of `node` is of a macro's making (`Span::from_expansion`): it is in
 /// an expansion and not written, whole, in what the call was handed or in an attribute
 /// macro's item.
-pub(crate) fn from_expansion(cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>) -> bool {
+pub(crate) fn from_expansion(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> bool {
     match node.file_id.macro_file() {
         None => false,
         Some(_) => !node
@@ -400,6 +447,7 @@ pub(crate) fn source_fact(cx: &Cx<'_, '_>, diag: &mut Diag, at: InFile<SyntaxNod
         return;
     }
     if let Some((item, name)) = signature_item(cx, at) {
+        // alloc: the diagnostic's fact
         diag.fact(Fact::Signature(cx.key(item)), format!("the signature of `{name}`"));
     }
 }
@@ -407,45 +455,50 @@ pub(crate) fn source_fact(cx: &Cx<'_, '_>, diag: &mut Diag, at: InFile<SyntaxNod
 /// The innermost item `at` is in or is, and its name, through a macro's expansion to where it
 /// was called.
 fn signature_item(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(ItemId, String)> {
-    let mut node: InFile<SyntaxNode> = cx.syntax(at);
+    // Every caller is building a diagnostic's fact (`source_fact`).
+    fn name(it: Option<ast::Name<'_>>) -> Option<String> {
+        // alloc: the item's name, for a diagnostic's fact
+        it.map(|it| it.text().to_owned())
+    }
+    let mut node = cx.syntax_view(at);
     loop {
         for ancestor in node.value.ancestors() {
-            let name = |it: Option<ast::Name>| it.map(|it| it.text().to_string());
-            if let Some(it) = ast::Fn::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
+            if let Some(it) = ast::Fn::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
                 let id = hir_def::FunctionId::try_from(def).ok()?;
                 return Some((ItemId::Function(id), name(it.name())?));
             }
-            if let Some(it) = ast::Adt::cast(ancestor.clone()) {
-                let id = match cx.sema.to_def2(node.with_value(&it))? {
+            if let Some(it) = ast::Adt::cast(ancestor) {
+                let id = match cx.vsema.to_def2(node.with_value(it))? {
                     hir::Adt::Struct(it) => AdtId::StructId(it.into()),
                     hir::Adt::Enum(it) => AdtId::EnumId(it.into()),
                     hir::Adt::Union(it) => AdtId::UnionId(it.into()),
                 };
                 return Some((ItemId::Adt(id), name(it.name())?));
             }
-            if let Some(it) = ast::Trait::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
+            if let Some(it) = ast::Trait::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
                 return Some((ItemId::Trait(def.into()), name(it.name())?));
             }
-            if let Some(it) = ast::TypeAlias::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
+            if let Some(it) = ast::TypeAlias::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
                 return Some((ItemId::Alias(def.into()), name(it.name())?));
             }
-            if let Some(it) = ast::Const::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
+            if let Some(it) = ast::Const::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
+                // alloc: the name of an unnamed const, as above
                 return Some((ItemId::Const(def.into()), name(it.name()).unwrap_or_else(|| "_".to_owned())));
             }
-            if let Some(it) = ast::Static::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
+            if let Some(it) = ast::Static::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
                 return Some((ItemId::Static(def.into()), name(it.name())?));
             }
             if ast::Impl::can_cast(ancestor.kind()) || ast::Module::can_cast(ancestor.kind()) {
                 return None;
             }
         }
-        let call = node.file_id.macro_file()?;
-        node = call.loc(cx.db).to_node(cx.db);
+        node.file_id.macro_file()?;
+        node = cx.vsema.find_parent_file(node.file_id)?;
     }
 }
 
@@ -475,8 +528,10 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
             let rank = found.diag.lint_name().map_or(EARLY_PASSES.len(), pass_rank);
             ((found.phase, group, module, place, pass, rank), found)
         })
+        // alloc: per diagnostic found, nothing when there is none
         .collect();
     keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    // alloc: as above
     keyed.into_iter().map(|(_, found)| found).collect()
 }
 
@@ -485,23 +540,23 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine) -> Vec<Found> {
 /// crate root the crate's own attributes. A module file's inner attributes are of its `mod`
 /// item, checked in the module that has it.
 fn checked_in(cx: &Cx<'_, '_>, modules: &FxHashMap<hir::Module, usize>, at: InFile<SyntaxNodePtr>) -> (usize, bool) {
-    let node = cx.syntax(at);
+    let node = cx.syntax_view(at);
     let rank = |module: hir::Module| modules.get(&module).copied().unwrap_or(usize::MAX);
-    if let Some(file) = ast::SourceFile::cast(node.value.clone()) {
-        let Some(module) = cx.sema.to_def2(node.with_value(&file)) else { return (usize::MAX, false) };
+    if let Some(file) = ast::SourceFile::cast(node.value) {
+        let Some(module) = cx.vsema.to_def2(node.with_value(file)) else { return (usize::MAX, false) };
         return match module.parent(cx.db) {
             None => (rank(module), true),
             Some(parent) => (rank(parent), false),
         };
     }
-    for ancestor in cx.sema.ancestors_with_macros_file(node.clone()).skip(1) {
-        if let Some(module) = ast::Module::cast(ancestor.value.clone())
+    for ancestor in cx.vsema.ancestors_with_macros_file(node).skip(1) {
+        if let Some(module) = ast::Module::cast(ancestor.value)
             && module.item_list().is_some()
         {
-            return (cx.sema.to_def2(ancestor.with_value(&module)).map_or(usize::MAX, rank), false);
+            return (cx.vsema.to_def2(ancestor.with_value(module)).map_or(usize::MAX, rank), false);
         }
-        if let Some(file) = ast::SourceFile::cast(ancestor.value.clone()) {
-            return (cx.sema.to_def2(ancestor.with_value(&file)).map_or(usize::MAX, rank), false);
+        if let Some(file) = ast::SourceFile::cast(ancestor.value) {
+            return (cx.vsema.to_def2(ancestor.with_value(file)).map_or(usize::MAX, rank), false);
         }
     }
     (usize::MAX, false)
@@ -537,7 +592,10 @@ fn pass_rank(lint: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use hir::Semantics;
-    use syntax::TextSize;
+    use syntax::{
+        TextSize,
+        view::{AstNode as _, HasName as _},
+    };
 
     use super::*;
 
@@ -555,13 +613,13 @@ mod tests {
     }
 
     /// Each function the walk comes to, by name, with its tree and node.
-    fn fns<'w>(walk: &'w Walk<'_>) -> Vec<(String, &'w Tree, SyntaxNode)> {
+    fn fns<'w, 'db>(walk: &'w Walk<'db>) -> Vec<(String, &'w Tree<'db>, ast::Node<'db>)> {
         walk.trees
             .iter()
-            .flat_map(|tree| tree.nodes.iter().map(move |node| (tree, node)))
+            .flat_map(|tree| tree.nodes.iter().map(move |&node| (tree, node)))
             .filter_map(|(tree, node)| {
-                let name = ast::Fn::cast(node.clone())?.name()?.text().to_string();
-                Some((name, tree, node.clone()))
+                let name = ast::Fn::cast(node)?.name()?.text().to_owned();
+                Some((name, tree, node))
             })
             .collect()
     }
@@ -569,7 +627,7 @@ mod tests {
     fn place_of(cx: &Cx<'_, '_>, walk: &Walk<'_>, name: &str) -> Vec<(u32, u32)> {
         let fns = fns(walk);
         let (_, tree, node) = fns.iter().find(|(it, ..)| it == name).unwrap_or_else(|| panic!("no `{name}`"));
-        walk.place(cx, tree.ptr(node), Pass::Early)
+        walk.place(cx, tree.ptr(*node), Pass::Early)
     }
 
     #[test]
@@ -613,6 +671,59 @@ fn inside() {}
     }
 
     #[test]
+    fn a_module_file_declared_in_a_block_is_walked_where_it_is_declared() {
+        walked(
+            r#"
+//- /main.rs crate:main
+fn before() {}
+fn outer() { mod a; }
+fn after() {}
+//- /a.rs
+fn inside() {}
+"#,
+            |cx, walk| {
+                assert_eq!(walk.files().count(), 2);
+                let before = place_of(cx, walk, "before");
+                let inside = place_of(cx, walk, "inside");
+                let after = place_of(cx, walk, "after");
+                assert!(before < inside && inside < after, "{before:?} {inside:?} {after:?}");
+            },
+        );
+    }
+
+    /// The early lints and the stability check, which read only the walk's trees, both reach
+    /// the file of a `#[path]` module declared in a block.
+    #[test]
+    fn the_early_lints_and_stability_reach_a_path_module_declared_in_a_block() {
+        let checked = crate::tests::checked(
+            r#"
+//- /main.rs crate:main edition:2021
+#[deprecated]
+pub fn d() {}
+fn main() {
+    #[path = "m.rs"]
+    mod m;
+}
+//- /m.rs
+pub fn inner() {
+    crate::d();
+    while true {}
+}
+"#,
+        );
+        let mut messages: Vec<String> = checked
+            .messages()
+            .into_iter()
+            .filter(|it| it.starts_with("while_true") || it.starts_with("deprecated") || it.starts_with("blaze can't"))
+            .collect();
+        messages.sort();
+        assert_eq!(
+            messages,
+            ["deprecated: use of deprecated function `d`", "while_true: denote infinite loops with `loop { ... }`"]
+        );
+    }
+
+    #[test]
     fn an_expansion_is_walked_where_it_is_called() {
         walked(
             r#"
@@ -626,8 +737,8 @@ fn after() {}
                 let fns = fns(walk);
                 let (_, tree, made) = fns.iter().find(|(it, ..)| it == "made").unwrap();
                 assert!(tree.call.is_some() && !tree.in_file());
-                assert!(from_expansion(cx, InFile::new(tree.file, made)));
-                let sum = tree.nodes.iter().find(|it| ast::BinExpr::can_cast(it.kind())).unwrap();
+                assert!(from_expansion(cx, InFile::new(tree.file, *made)));
+                let sum = tree.nodes.iter().copied().find(|it| ast::BinExpr::can_cast(it.kind())).unwrap();
                 assert!(!from_expansion(cx, InFile::new(tree.file, sum)));
                 let (before, made, after) =
                     (place_of(cx, walk, "before"), place_of(cx, walk, "made"), place_of(cx, walk, "after"));
@@ -706,8 +817,8 @@ extern "C" {
             let mut owners = 0;
             for tree in &walk.trees {
                 assert_eq!(tree.attrs.len(), tree.nodes.len());
-                for (node, &marked) in tree.nodes.iter().zip(&tree.attrs) {
-                    let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { continue };
+                for (&node, &marked) in tree.nodes.iter().zip(&tree.attrs) {
+                    let Some(owner) = ast::AnyHasAttrs::cast(node) else { continue };
                     if ast::attrs_including_inner(&owner).next().is_some() {
                         assert!(marked, "{node:?} has an attribute");
                         owners += 1;
@@ -718,6 +829,101 @@ extern "C" {
         });
         walked(&crate::lints::quiet_crate(3), |_, walk| {
             assert!(walk.trees.iter().all(|tree| tree.attrs.iter().all(|&it| !it)));
+        });
+    }
+
+    /// The walk of a tree allocates its three columns and its stack, sized once from the flat
+    /// tree, and nothing per node: the same count at 4 functions and at 400.
+    #[test]
+    fn walking_a_tree_allocates_only_its_columns() {
+        for fns in [4, 400] {
+            walked(&crate::lints::quiet_crate(fns), |cx, walk| {
+                let tree = walk.files().next().unwrap();
+                let mut again = Walk {
+                    trees: Vec::with_capacity(1),
+                    cfg: walk.cfg,
+                    index: FxHashMap::with_capacity_and_hasher(1, Default::default()),
+                    modules: FxHashMap::default(),
+                };
+                blaze_alloc_count::assert_at_most(4, "the walk of a tree", || {
+                    again.add(cx, tree.file, tree.root, Vec::new());
+                });
+                assert_eq!(again.trees[0].nodes, tree.nodes);
+                assert!(tree.nodes.len() > 10 * fns, "{}", tree.nodes.len());
+            });
+        }
+    }
+
+    /// The walk over views comes to the nodes a preorder over the handles of the same file comes
+    /// to, in the same order, and skips the same subtrees for `cfg`, `cfg_attr` included.
+    #[test]
+    fn walk_matches_the_handle_walk() {
+        use std::ops::ControlFlow;
+        use syntax::ast::{self as handle, AstNode as _};
+
+        const FIXTURE: &str = r#"
+//- /main.rs crate:main
+#![allow(unused)]
+macro_rules! m { ($e:expr) => { $e } }
+#[cfg(any())]
+fn off() { let x = 1; }
+#[cfg_attr(all(), cfg(any()))]
+fn off_too() {}
+#[cfg_attr(any(), cfg(any()))]
+fn kept() {}
+#[cfg_attr(all(), cfg_attr(all(), cfg(any())))]
+mod nested_off {}
+mod inner_off {
+    #![cfg(any())]
+    fn f() {}
+}
+struct S { #[cfg(any())] a: u8, b: u8 }
+fn body() {
+    #[cfg(any())]
+    let y = 2;
+    let z = match 1 { #[cfg(any())] 0 => 1, _ => 2 };
+    m!(1 + 2);
+}
+"#;
+        walked(FIXTURE, |cx, walk| {
+            for tree in walk.files() {
+                let root = cx.sema.parse_or_expand(tree.file);
+                let on = |owner: &handle::AnyHasAttrs| {
+                    hir_expand::attrs::expand_cfg_attr(
+                        handle::attrs_including_inner(owner),
+                        || walk.cfg,
+                        |meta, _| match meta {
+                            handle::Meta::CfgMeta(meta)
+                                if meta.cfg_predicate().is_some_and(|it| {
+                                    walk.cfg.check(&CfgExpr::parse_from_ast(it)) == Some(false)
+                                }) =>
+                            {
+                                ControlFlow::Break(())
+                            }
+                            _ => ControlFlow::Continue(()),
+                        },
+                    )
+                    .is_none()
+                };
+                let (mut nodes, mut off) = (Vec::new(), Vec::new());
+                let mut events = root.preorder();
+                while let Some(event) = events.next() {
+                    let WalkEvent::Enter(node) = event else { continue };
+                    if let Some(owner) = handle::AnyHasAttrs::cast(node.clone())
+                        && !on(&owner)
+                    {
+                        off.push(node.text_range());
+                        events.skip_subtree();
+                        continue;
+                    }
+                    nodes.push((node.kind(), node.text_range()));
+                }
+                let viewed: Vec<_> = tree.nodes.iter().map(|it| (it.kind(), it.text_range())).collect();
+                assert_eq!(viewed, nodes);
+                let viewed_off: Vec<_> = tree.off.iter().map(|it| it.text_range()).collect();
+                assert_eq!(viewed_off, off);
+                assert_eq!(off.len(), 7, "{off:?}");
+            }
         });
     }
 

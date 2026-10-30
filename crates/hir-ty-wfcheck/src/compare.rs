@@ -17,13 +17,11 @@ use rustc_type_ir::{
     error::{ExpectedFound, TypeError},
     inherent::{GenericArgs as _, IntoKind as _},
 };
-use smallvec::SmallVec;
-
 use hir_ty::{
     GenericPredicates, Span,
     db::HirDatabase as _,
     next_solver::{
-        Clause, Clauses, DbInterner, FnSig, GenericArgKind, GenericArgs, ParamEnv, Region,
+        Clauses, DbInterner, FnSig, GenericArgKind, GenericArgs, ParamEnv, Region,
         RegionExt as _, RegionKind, SolverDefId, Ty, TypingMode,
         infer::{BoundRegionConversionTime, DbInternerInferExt as _, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
@@ -140,17 +138,16 @@ pub fn compare_impl_method_signature<'db>(
     let own = |def: FunctionId, parent: SolverDefId<'db>| {
         let all = GenericArgs::identity_for_item(interner, SolverDefId::FunctionId(def));
         let parent = GenericArgs::identity_for_item(interner, parent).len();
-        all.iter().skip(parent).collect::<SmallVec<[_; 4]>>()
+        all.iter().skip(parent)
     };
-    let trait_own = own(trait_method, SolverDefId::TraitId(trait_ref.def_id.0));
-    let impl_own = own(impl_method, SolverDefId::ImplId(impl_));
     let kind = |arg: GenericArgKind<'db>| match arg {
         GenericArgKind::Lifetime(_) => 0u8,
         GenericArgKind::Type(_) => 1,
         GenericArgKind::Const(_) => 2,
     };
-    if trait_own.len() != impl_own.len()
-        || trait_own.iter().zip(&impl_own).any(|(a, b)| kind(a.kind()) != kind(b.kind()))
+    if !own(trait_method, SolverDefId::TraitId(trait_ref.def_id.0))
+        .map(|it| kind(it.kind()))
+        .eq(own(impl_method, SolverDefId::ImplId(impl_)).map(|it| kind(it.kind())))
     {
         return None;
     }
@@ -170,9 +167,8 @@ pub fn compare_impl_method_signature<'db>(
                         if it.provenance == TypeParamProvenance::ArgumentImplTrait
                 )
             })
-            .collect::<SmallVec<[bool; 4]>>()
     };
-    if synthetic(impl_method) != synthetic(trait_method) {
+    if !synthetic(impl_method).eq(synthetic(trait_method)) {
         return None;
     }
     let trait_to_impl_args =
@@ -196,18 +192,16 @@ pub fn compare_impl_method_signature<'db>(
     }
 
     // The impl's where clauses, and the trait method's own instantiated for the impl's.
-    let hybrid: SmallVec<[Clause<'db>; 8]> = GenericPredicates::query_all(db, impl_.into())
+    let hybrid = GenericPredicates::query_all(db, impl_.into())
         .iter_identity()
         .map(|it| it.skip_norm_wip())
         .chain(
             GenericPredicates::query_own_explicit(db, trait_method.into())
                 .iter_instantiated(interner, trait_to_impl_args.as_slice())
                 .map(|it| it.skip_norm_wip()),
-        )
-        .collect();
+        );
     let param_env = ParamEnv::new(Clauses::new_from_iter(rustc_type_ir::elaborate::elaborate(
-        interner,
-        hybrid.into_iter(),
+        interner, hybrid,
     )));
 
     let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());

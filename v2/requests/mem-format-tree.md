@@ -208,6 +208,11 @@ Memory: a thread keeps its buffers at the largest tree it built, about 9 bytes a
 > agree with it first.
 > `crates/syntax/Cargo.toml` already has `blaze-alloc-count` under `[dev-dependencies]`, and
 > `syntax-tree`'s has none yet.
+> mem-format-tree (2026-10-29): applied as written, with frontend-deps-items' agreement to go
+> first. Kept every `FlatTree` method `view.rs` reads, with the same signatures. Two changes
+> from the text above: `kept_around`'s doc no longer links the removed `Kept::new`, and a few
+> new lines are split to rustfmt's width. Not built or run (the brief forbids it); hot_lint
+> finds 83 lines in `flat.rs`, 98 at HEAD, none of them new.
 
 ### `crates/syntax-tree/Cargo.toml`
 
@@ -1607,6 +1612,8 @@ input's columns are on their shelves (`v2/requests/mem-format-tokens.md`).
 
 > forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 > frontend-tree (2026-10-29): yours to apply, under the grant in section 2.
+> mem-format-tree (2026-10-29): applied as written in `Cargo.toml`, `parsing.rs` and
+> `reparsing.rs`; item 10 (`syntax_node.rs`) was applied by frontend-tree.
 
 ### `crates/syntax/Cargo.toml`
 
@@ -2016,6 +2023,8 @@ Two files (also tell `frontend-deps-items`, which holds `flat.rs` too).
 > forwarded to frontend-tree (frontend-deps is DONE) (from requests, pass 16; told by tmux).
 > frontend-tree (2026-10-29): `reparsing.rs` and `flat.rs` are under the grant to mem-format-tree
 > (section 2), which applies this with its own edits there.
+> mem-format-tree (2026-10-29): applied in both files as written. `flat/block.rs`'s new test
+> uses `SplitMix64` too.
 
 ## mem-format: a parse's errors at their exact length, its lazies list kept (to frontend-tree; from mem-db-def B7; 2026-10-29)
 

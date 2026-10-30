@@ -2,8 +2,8 @@
 //! rustc ignores after the expression a macro other than a `macro_rules!` one expands to: each as
 //! rustc prints it, its message and code, the text at each of its primary spans, and the notes and
 //! helps under it. The macros' cases are rustc's `tests/ui/macros/macros-nonfatal-errors.rs`.
-//! Also what a `macro_rules!` call no rule matches carries of the rule that got furthest, and
-//! where a macro fragment's node maps up to.
+//! Also what a `macro_rules!` call no rule matches carries of the rule that got furthest, where a
+//! macro fragment's node maps up to, and which identifiers `${concat(..)}` made.
 
 use expect_test::{Expect, expect};
 use hir_expand::{
@@ -12,19 +12,22 @@ use hir_expand::{
 };
 use span::Span;
 use stdx::format_to;
-use syntax::{AstNode, AstPtr, SyntaxKind, TextSize, ast};
+use syntax::{
+    AstPtr, SyntaxKind, TextSize, ast as tag,
+    view::{self as ast, AstNode},
+};
 use test_fixture::WithFixture;
 
 use super::resolve_macro_call_id;
 use crate::{
-    nameres::{ModuleSource, crate_def_map},
+    nameres::{ModuleSourceView, crate_def_map},
     test_db::{TestDB, TestDBExt},
 };
 
 /// The text `span` covers.
 fn text_at(db: &TestDB, span: Span) -> String {
     let FileRange { file_id, range } = resolve_span(db, span);
-    file_id.parse(db).syntax_node().text().slice(range).to_string()
+    file_id.parse(db).root().text()[range].to_owned()
 }
 
 /// The macro calls of the test crate: those written in its root file, in items and in bodies,
@@ -32,12 +35,15 @@ fn text_at(db: &TestDB, span: Span) -> String {
 pub(super) fn macro_calls(db: &TestDB) -> Vec<MacroCallId> {
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(db, krate);
-    let source = def_map.module(db, def_map.root).definition_source(db);
-    let ModuleSource::SourceFile(file) = source.value else { panic!("the root module is a file") };
+    let source = def_map.module(db, def_map.root).definition_source_view(db);
+    let ModuleSourceView::SourceFile(file) = source.value else {
+        panic!("the root module is a file")
+    };
     let mut calls = Vec::new();
     for call in file.syntax().descendants().filter_map(ast::MacroCall::cast) {
-        let ast_id = InFile::new(source.file_id, source.file_id.ast_id_map(db).ast_id(&call));
-        let ptr = InFile::new(source.file_id, AstPtr::new(&call));
+        let ast_id = source.file_id.ast_id_map(db).ast_id_of_view::<tag::MacroCall>(call);
+        let ast_id = InFile::new(source.file_id, ast_id);
+        let ptr = InFile::new(source.file_id, AstPtr::<tag::MacroCall>::of(call));
         calls.extend(resolve_macro_call_id(db, def_map, ast_id, ptr));
     }
     let in_scopes = def_map.modules(db).flat_map(|(_, module)| module.scope(db).all_macro_calls());
@@ -277,7 +283,7 @@ fn main() { concat_bytes!(b'A', [66]); }
     let [call] = macro_calls(&db)[..] else { panic!("one call") };
     let (parse, map) = &call.parse_macro_expansion(&db).value;
     let literal = parse
-        .syntax_node()
+        .root()
         .descendants_with_tokens()
         .filter_map(|it| it.into_token())
         .find(|it| it.kind() == SyntaxKind::BYTE_STRING)
@@ -351,7 +357,7 @@ fn main() {
         let map = call.expansion_span_map(&db);
         found.push(map.dropped_semicolon.map(|span| {
             let FileRange { file_id, range } = resolve_span(&db, span);
-            let written = file_id.parse(&db).syntax_node().text().to_string();
+            let written = file_id.parse(&db).root().text();
             let body = written.find("1; }").expect("m's body");
             (usize::from(range.start()) - body, text_at(&db, span))
         }));
@@ -361,6 +367,35 @@ fn main() {
 
 /// rustc's `failed_to_match_macro`: the token the rule that got furthest stopped at, what it
 /// was trying to match there, and whether a `,` makes a rule match, carried in the error's kind.
+/// rustc's `expand_include_str` refuses a file that isn't UTF-8, at the call.
+#[test]
+fn include_str_of_a_file_that_is_not_utf_8_is_an_error() {
+    let file = std::env::temp_dir().join(format!("blaze-include-str-{}.bin", std::process::id()));
+    std::fs::write(&file, [b'a', 0xff, 0xfe]).expect("the temporary file");
+    let path = file.to_str().expect("a UTF-8 temporary path");
+    let text = format!(
+        r#"
+#[rustc_builtin_macro]
+macro_rules! include_str {{() => {{}}}}
+
+fn main() {{
+    include_str!({path:?});
+}}
+"#
+    );
+    let db = TestDB::with_files(&text);
+    let errors: Vec<_> = macro_calls(&db)
+        .into_iter()
+        .filter_map(|call| call.parse_macro_expansion(&db).err.clone())
+        .map(|err| (err.render_to_string(&db).message, text_at(&db, err.span())))
+        .collect();
+    std::fs::remove_file(&file).expect("the temporary file");
+    assert_eq!(
+        errors,
+        [(format!("`{path}` wasn't a utf-8 file"), format!("include_str!({path:?})"))]
+    );
+}
+
 #[test]
 fn a_call_no_rule_matches_carries_the_best_failure() {
     let text = r#"
@@ -379,7 +414,7 @@ n!(x y);
         let comma = failure.missing_comma.map(|span| {
             let FileRange { file_id, range } = resolve_span(&db, span);
             assert!(range.is_empty(), "the comma's place is empty");
-            let written = file_id.parse(&db).syntax_node().text().to_string();
+            let written = file_id.parse(&db).root().text();
             let call = written.find("n!(x y)").expect("n's call");
             written[call..usize::from(range.start())].to_owned()
         });
@@ -431,15 +466,37 @@ fn main() {
     let [call] = macro_calls(&db)[..] else { panic!("one call") };
     let (parse, map) = &call.parse_macro_expansion(&db).value;
     let stmt = parse
-        .syntax_node()
+        .root()
         .descendants()
         .find(|it| it.kind() == SyntaxKind::LET_STMT)
         .expect("a `let` statement");
     let (FileRange { file_id, range }, _) =
         hir_expand::map_node_range_up(&db, map, stmt.text_range()).expect("the node maps up");
-    let written = file_id.parse(&db).syntax_node().text().to_string();
+    let written = file_id.parse(&db).root().text();
     let metavariable = written.find("{ $s }").expect("m's body") + 2;
     assert_eq!((usize::from(range.start()), &written[range]), (metavariable, "$s"));
+}
+
+/// The lexer lints skip an identifier `${concat(..)}` made, so the expansion keeps which.
+#[test]
+fn the_identifiers_concat_made_are_in_the_expansion_span_map() {
+    let text = r#"
+macro_rules! m { ($a:ident) => { let ${concat($a, é)} = 1; } }
+
+fn main() {
+    m!(x);
+}
+"#;
+    let db = TestDB::with_files(text);
+    let [call] = macro_calls(&db)[..] else { panic!("one call") };
+    let (parse, map) = &call.parse_macro_expansion(&db).value;
+    let made = parse
+        .root()
+        .descendants_with_tokens()
+        .filter_map(|it| it.into_token())
+        .find(|it| it.kind() == SyntaxKind::IDENT && it.text() == "xé")
+        .expect("the made identifier");
+    assert_eq!(&*map.made_idents, [map.span_at(made.text_range().start())]);
 }
 
 #[test]

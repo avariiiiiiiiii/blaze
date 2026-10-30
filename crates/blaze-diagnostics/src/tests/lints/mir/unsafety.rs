@@ -38,6 +38,32 @@ For more information about this error, try `rustc --explain E0133`.
 }
 
 #[test]
+fn the_words_follow_the_level_of_unsafe_op_in_unsafe_fn_at_the_operation() {
+    // rustc's `unsafe_op_in_unsafe_fn_allowed`: the level there, not the edition's default.
+    let error = |needs: &str| {
+        format!(
+            r##"error[E0133]: call to unsafe function `f` is unsafe and requires unsafe {needs}
+  --> $DIR/levels.rs:6:5
+   |
+LL |     f();
+   |     ^^^ call to unsafe function
+   |
+   = note: consult the function's documentation for information on how to avoid undefined behavior
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0133`.
+"##
+        )
+    };
+    let source = |attr: &str| {
+        format!("#![{attr}(unsafe_op_in_unsafe_fn)]\n\nunsafe fn f() {{}}\n\nfn main() {{\n    f();\n    //~^ ERROR E0133\n}}\n")
+    };
+    assert_eq!(ui("levels.rs", "2021", &source("deny")), error("block"));
+    assert_eq!(ui("levels.rs", "2024", &source("allow")), error("function or block"));
+}
+
+#[test]
 fn the_error_code_e0133() {
     // tests/ui/error-codes/E0133.rs
     let source = r##"unsafe fn f() { return; }

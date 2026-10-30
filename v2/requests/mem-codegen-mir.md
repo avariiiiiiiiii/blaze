@@ -1056,6 +1056,8 @@ Each lowering entry opens the frame:
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir-store-lower (2026-10-29), uncompiled: `MirLowerCtx<'a, 'f, 'db>` builds in `Building<'f, 'db>` (frame `Vec`s for blocks, locals, `binding_locals` by binding index and the other lists), `finish` copies each into the body at its length, and `lower_closure_body`, `promoted_mir_body_query` and `lower_to_mir_with_store` each run in one `frame::task(Tag::Mir, ..)` ending in `finish` then `mark_moves` without `shrink_to_fit`, with `lower_body(db, def)` being `compute_mir_body` without its span, `copy` an `FxHashMap` until D2, and constants on `from_bytes`/`from_concrete_const` (through one `const_bytes` helper) until D1.
+
 ### 5.2 The per-body maps and lists of `MirLowerCtx` (lines 140-224)
 
 | Field | Before | After |
@@ -1126,6 +1128,8 @@ does, so the probe finds the entry.
   sequence.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir-store-lower (2026-10-29), uncompiled: as written, with `framed::{FrameMap, FrameSet}`; `exit_nodes` probes with `ExitKey` and copies the key's slice into the frame on insert.
 
 ### 5.3 The per-statement unwind path (lines 2997-3043)
 
@@ -1203,6 +1207,8 @@ fn in_scope_into(&self, out: &mut Vec<LocalId, &Frame>) {
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir-store-lower (2026-10-29), uncompiled: as written; `declare_operands_last`, `end_arguments` and `outlive_block` move operands to the end with one in-place `move_to_end` through a reused `picked_buf`.
+
 ### 5.4 Leaving scopes early (`exit_to`, `drop_until_scope`, `exits_end_at`, `emit_drop_and_storage_dead_for_scope`)
 
 - `exit_to` (4042-4091): the `storage` `Vec`, `ended` (4060, a collect per local) and `before`
@@ -1236,6 +1242,8 @@ fn in_scope_into(&self, out: &mut Vec<LocalId, &Frame>) {
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
 
+> applied by codegen-mir-store-lower (2026-10-29), uncompiled: as written, except that `exits_end_at` reads the popped scope's `exits` in place without the sort and dedup (a block met twice gets the same spans again), `drop_until_scope` and `emit_drop_and_storage_dead_for_scope` share `emit_drops(locals, current, span, written: Option<&mut Vec<BasicBlockId, &Frame>>)`, `exit_to` reuses four buffers, and call arguments, aggregates and closure captures are built at their final size.
+
 ### 5.5 `match_tree.rs` and `pattern_matching.rs`
 
 The match tree is built per `match` and dropped once the arms are lowered, so all of it goes in
@@ -1256,6 +1264,8 @@ the frame:
   of frame `Vec`s), 364 (above), 1022 and 1076: frame `Vec`s.
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir-store-lower (2026-10-29), uncompiled: frame `Pair<'t>`, `Ask<'t>` and `Candidate<'t>`, except that `then` is an index into the tree's own `thens` list instead of a leaked slice, `Ask::Equal` borrows the store's `&Literal` with a negated flag instead of cloning it, `test` takes the first candidate's pair by value instead of cloning it, and `reached_arms` returns a frame `Bits<'f>` by value, read with `contains`.
 
 ### 5.6 `mir_body_query`'s tracing detail (lines 4920-4941)
 
@@ -2172,6 +2182,8 @@ Notes:
 > `Passes::run` go through `optimize::run_one` (§6.1). `lower`/`lowering_setup` are left
 > out until the lowering budget test that calls them lands (§5, after D1/D2).
 
+> applied by codegen-mir-store (2026-10-29), uncompiled: the rest of it, `budget::lower` (calls `lower.rs`'s `pub(crate) fn lower_body`, which `compute_mir_body` calls without its span) and `budget::lowering_setup`, as written.
+
 ### 10.2 `tests/mir/main.rs`
 
 ```rust
@@ -2507,6 +2519,8 @@ by `shrink_to_fit`, §3.2). The analyses that decide them are held to 0 by
 > with §5 (step 6, after D1/D2).
 
 > forwarded to codegen-mir (the MIR crate's holder) (from requests, pass 16; told by tmux).
+
+> applied by codegen-mir-store (2026-10-29), uncompiled: the lowering test too (`straight`, `lowering_extra`, `lowering_allocates_the_kept_body_and_its_setup_only`), with the tail read through the column view (`body.expr(body.root_expr())`, `tail: Option<ExprId>` by value).
 
 ## 11. Needed from outside this crate
 

@@ -148,23 +148,166 @@ fn an_unknown_flag() {
         "error: unexpected argument '--frobnicate' found\n\nUsage: cargo build [OPTIONS]\n\nFor more \
          information, try '--help'.\n"
     );
+    // clap adds the flag it suggests to the usage line ("smart usage").
     assert_eq!(
         refused(&["build", "--relese"]),
         "error: unexpected argument '--relese' found\n\n  tip: a similar argument exists: '--release'\n\n\
-         Usage: cargo build [OPTIONS]\n\nFor more information, try '--help'.\n"
+         Usage: cargo build --release\n\nFor more information, try '--help'.\n"
     );
+    // A second positional of `test` is no flag: no `--` tip.
     assert_eq!(
         refused(&["test", "a", "b"]),
-        "error: unexpected argument 'b' found\n\n  tip: to pass 'b' as a value, use '-- b'\n\nUsage: cargo \
-         test [OPTIONS] [TESTNAME] [-- [ARGS]...]\n\nFor more information, try '--help'.\n"
-    );
-    assert_eq!(
-        refused(&["check", "-x"]),
-        "error: unexpected argument '-x' found\n\nUsage: cargo check [OPTIONS]\n\nFor more information, try '--help'.\n"
+        "error: unexpected argument 'b' found\n\nUsage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]\n\nFor \
+         more information, try '--help'.\n"
     );
     // `--doc` and `--reached` are `test`'s alone.
     assert!(parse(os(&["build", "--reached"])).is_err());
     assert!(parse(os(&["build", "--", "x"])).is_err());
+}
+
+#[test]
+fn an_unknown_flag_of_a_command_with_positionals() {
+    assert_eq!(
+        refused(&["test", "--frobnicate"]),
+        "error: unexpected argument '--frobnicate' found\n\n  tip: to pass '--frobnicate' as a value, use '-- \
+         --frobnicate'\n\nUsage: cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]\n\nFor more information, try '--help'.\n"
+    );
+    assert_eq!(
+        refused(&["test", "parse", "--relese"]),
+        "error: unexpected argument '--relese' found\n\n  tip: a similar argument exists: '--release'\n  tip: to \
+         pass '--relese' as a value, use '-- --relese'\n\nUsage: cargo test --release <TESTNAME> [-- [ARGS]...]\n\nFor \
+         more information, try '--help'.\n"
+    );
+    assert_eq!(
+        refused(&["run", "-y"]),
+        "error: unexpected argument '-y' found\n\n  tip: to pass '-y' as a value, use '-- -y'\n\nUsage: cargo run \
+         [OPTIONS] [ARGS]...\n\nFor more information, try '--help'.\n"
+    );
+}
+
+#[test]
+fn hidden_flags_that_point_elsewhere() {
+    let tip = |words: &[&str], arg: &str, tip: &str, usage: &str| {
+        let expected = format!(
+            "error: unexpected argument '{arg}' found\n\n  tip: {tip}\n\nUsage: {usage}\n\nFor more information, try '--help'.\n"
+        );
+        assert_eq!(refused(words), expected, "{words:?}");
+    };
+    let similar = |to: &str| format!("a similar argument exists: '{to}'");
+    tip(&["check", "-x", "a"], "-x", &similar("--exclude"), "cargo check [OPTIONS]");
+    tip(&["build", "-s"], "--silent", &similar("--quiet"), "cargo build [OPTIONS]");
+    tip(&["run", "--silent"], "--silent", &similar("--quiet"), "cargo run [OPTIONS] [ARGS]...");
+    tip(&["build", "-t", "x"], "-t", &similar("--target"), "cargo build [OPTIONS]");
+    tip(&["build", "--path", "x"], "--path", &similar("--manifest-path"), "cargo build [OPTIONS]");
+    tip(&["build", "--out-dir", "x"], "--out-dir", &similar("--artifact-dir"), "cargo build [OPTIONS]");
+    tip(&["build", "-O"], "-O", &similar("--artifact-dir"), "cargo build [OPTIONS]");
+    tip(&["build", "-c", "x"], "-c", &similar("--config"), "cargo build [OPTIONS]");
+    tip(&["check", "-z", "x"], "-z", &similar("-Z"), "cargo check [OPTIONS]");
+    tip(
+        &["build", "--debug"],
+        "--debug",
+        "`--debug` is the default for `cargo build`; instead `--release` is supported",
+        "cargo build [OPTIONS]",
+    );
+    let keep_going = "use `--no-fail-fast` to run as many tests as possible regardless of failure";
+    tip(&["test", "--keep-going"], "--keep-going", keep_going, "cargo test [OPTIONS] [TESTNAME] [-- [ARGS]...]");
+    tip(&["bench", "--keep-going"], "--keep-going", keep_going, "cargo bench [OPTIONS] [BENCHNAME] [-- [ARGS]...]");
+    // `test`'s `-q` is its own, and it has no `-s`; `check` has no `--debug`.
+    assert!(refused(&["test", "-s"]).starts_with("error: unexpected argument '-s' found\n\n  tip: to pass '-s'"));
+    assert!(parse(os(&["check", "--debug"])).is_err());
+    assert!(cargo(&["build", "--keep-going"]).args == ["--keep-going"]);
+}
+
+#[test]
+fn flags_as_cargos_prelude_has_them() {
+    let asked = cargo(&["build", "-m", "a/Cargo.toml", "-j", "-1", "--timings", "--compile-time-deps"]);
+    assert_eq!(asked.flags.manifest_path.as_deref(), Some("a/Cargo.toml"));
+    assert_eq!(asked.args, ["-m", "a/Cargo.toml", "-j", "-1", "--timings", "--compile-time-deps"]);
+    assert!(cargo(&["check", "--compile-time-deps"]).args == ["--compile-time-deps"]);
+    assert_eq!(
+        refused(&["build", "--timings=html"]),
+        "error: unexpected value 'html' for '--timings' found; no more were expected\n\nUsage: cargo build \
+         [OPTIONS]\n\nFor more information, try '--help'.\n"
+    );
+    for gone in ["--lockfile-path", "--build-plan"] {
+        assert!(refused(&["build", gone]).starts_with(&format!("error: unexpected argument '{gone}' found")), "{gone}");
+    }
+    // `bench` has no `--release` and no `--future-incompat-report`; `test` has the report.
+    assert!(parse(os(&["bench", "--release"])).is_err());
+    assert!(parse(os(&["bench", "--future-incompat-report"])).is_err());
+    assert!(parse(os(&["test", "--future-incompat-report"])).is_ok());
+    assert!(parse(os(&["check", "--artifact-dir", "x"])).is_err());
+    assert_eq!(cargo(&["build", "--color", "ALWAYS"]).flags.color.as_deref(), Some("ALWAYS"));
+    let help = help(Command::Build);
+    assert!(help.contains("Usage: cargo build [OPTIONS]\n") && help.contains("  -m, --manifest-path <PATH>\n"), "{help}");
+    assert!(!help.contains("--silent") && !help.contains("compile-time-deps"), "{help}");
+}
+
+#[test]
+fn a_flag_given_twice() {
+    assert_eq!(
+        refused(&["build", "--release", "-r"]),
+        "error: the argument '--release' cannot be used multiple times\n\nUsage: cargo build [OPTIONS]\n\nFor more \
+         information, try '--help'.\n"
+    );
+    assert!(refused(&["run", "-p", "a", "-p", "b"]).starts_with("error: the argument '--package [<SPEC>]' cannot be used multiple times"));
+    assert!(refused(&["build", "--profile", "a", "--profile=b"]).contains("'--profile <PROFILE-NAME>' cannot be used multiple times"));
+    // Appended, counted, or once before the command and once after it (clap's parent and child).
+    assert_eq!(cargo(&["build", "-p", "a", "-p", "b", "-F", "x", "-F", "y"]).flags.packages, ["a", "b"]);
+    assert_eq!(cargo(&["build", "-v", "--verbose", "-v"]).flags.verbose, 3);
+    assert!(cargo(&["-q", "build", "-q"]).flags.quiet);
+    assert_eq!(cargo(&["--color", "never", "build", "--color", "always"]).flags.color.as_deref(), Some("always"));
+}
+
+#[test]
+fn release_and_profile_conflict() {
+    assert_eq!(
+        refused(&["build", "-v", "--release", "--profile", "dev"]),
+        "error: the argument '--release' cannot be used with '--profile <PROFILE-NAME>'\n\nUsage: cargo build \
+         --verbose... --release\n\nFor more information, try '--help'.\n"
+    );
+    assert_eq!(
+        refused(&["test", "--profile", "dev", "parse", "-r"]),
+        "error: the argument '--profile <PROFILE-NAME>' cannot be used with '--release'\n\nUsage: cargo test \
+         --profile <PROFILE-NAME> <TESTNAME> [-- [ARGS]...]\n\nFor more information, try '--help'.\n"
+    );
+    // A refusal while reading comes first.
+    assert!(refused(&["build", "--release", "--profile", "dev", "--frobnicate"]).contains("'--frobnicate'"));
+}
+
+#[test]
+fn change_directory_before_the_command() {
+    let asked = cargo(&["-C", "sub", "-Zunstable-options", "build", "--release"]);
+    assert_eq!(asked.directory, Some(OsString::from("sub")));
+    assert!(asked.unstable_options);
+    assert_eq!(asked.args, ["-Zunstable-options", "--release"], "`-C` is the client's, not the load's");
+    let asked = cargo(&["-Csub", "-Z", "unstable-options", "check"]);
+    assert_eq!((asked.directory, asked.unstable_options), (Some(OsString::from("sub")), true));
+    let asked = cargo(&["-C=sub", "build", "-Zunstable-options"]);
+    assert!(!asked.unstable_options, "cargo looks for it before the command only");
+    assert_eq!(
+        refusal(&parse(os(&["-C"])).unwrap_err(), false),
+        "error: a value is required for '-C <DIRECTORY>' but none was supplied\n\nFor more information, try '--help'.\n"
+    );
+}
+
+#[test]
+fn what_cargos_commands_refuse_before_building() {
+    let refused_of = |words: &[&str]| super::refused(&cargo(words));
+    assert_eq!(refused_of(&["test", "--doc", "--lib"]).as_deref(), Some("can't mix --doc with other target selecting options"));
+    assert_eq!(refused_of(&["test", "--doc", "--test", "x"]).as_deref(), Some("can't mix --doc with other target selecting options"));
+    assert_eq!(refused_of(&["test", "--doc", "--no-run"]).as_deref(), Some("can't skip running doc tests with --no-run"));
+    assert_eq!(refused_of(&["test", "--doc", "-p", "foo"]), None);
+    assert_eq!(
+        refused_of(&["run", "-p", "foo*"]).as_deref(),
+        Some("`cargo run` does not support glob pattern `foo*` on package selection")
+    );
+    assert_eq!(
+        refused_of(&["run", "--bin", "a?"]).as_deref(),
+        Some("`cargo run` does not support glob patterns on target selection")
+    );
+    assert_eq!(refused_of(&["run", "--bin", "a", "--", "*"]), None);
+    assert_eq!(refused_of(&["build", "--bin", "a*"]), None, "cargo's build takes globs");
 }
 
 #[test]
@@ -210,6 +353,25 @@ fn refusals_in_cargos_colors() {
         "{colored:?}"
     );
     assert!(colored.contains("\x1b[1m\x1b[92mUsage:\x1b[0m \x1b[1m\x1b[96mcargo build\x1b[0m \x1b[36m[OPTIONS]\x1b[0m"));
+    // `Arg::stylized` and clap's `[-- ...]`: literal brackets and dashes, placeholder values.
+    let colored = refusal(&parse(os(&["test", "-y"])).unwrap_err(), true);
+    assert!(colored.contains(
+        "\x1b[36m[TESTNAME]\x1b[0m \x1b[1m\x1b[96m[--\x1b[0m \x1b[36m[ARGS]...\x1b[0m\x1b[1m\x1b[96m]\x1b[0m"
+    ), "{colored:?}");
+    assert!(colored.contains("to pass '\x1b[1m\x1b[93m-y\x1b[0m' as a value"), "{colored:?}");
+    let colored = refusal(&parse(os(&["build", "-v", "-r", "--profile", "a"])).unwrap_err(), true);
+    assert!(colored.contains("\x1b[1m\x1b[96m--verbose\x1b[0m\x1b[36m...\x1b[0m \x1b[1m\x1b[96m--release\x1b[0m"), "{colored:?}");
+}
+
+#[test]
+fn a_flag_is_painted_only_in_color() {
+    let flag = Flag::new("features", None, Takes::Value, "FEATURES");
+    assert_eq!(flag.painted(false), "--features <FEATURES>");
+    assert_eq!(flag.shown(), flag.painted(false));
+    assert_eq!(
+        flag.painted(true),
+        "\x1b[1m\x1b[96m--features\x1b[0m\x1b[36m \x1b[0m\x1b[36m<FEATURES>\x1b[0m"
+    );
 }
 
 #[test]

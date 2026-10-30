@@ -4,14 +4,10 @@ use base_db::Db;
 use intern::Symbol;
 use rustc_hash::FxHashMap;
 use stdx::itertools::Itertools;
-use syntax::{
-    AstNode,
-    ast::{self, HasName},
-};
+use syntax::view::{self as ast, AstNode as _, HasName as _};
 use syntax_bridge::{
-    DocCommentDesugarMode,
+    DocCommentDesugarMode, call_input,
     dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
-    syntax_node_to_token_tree,
 };
 use test_utils::{bench, bench_fixture, skip_slow_tests};
 
@@ -72,15 +68,16 @@ pub(crate) fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
 
 fn macro_rules_fixtures_tt() -> FxHashMap<String, tt::TopSubtree> {
     let fixture = bench_fixture::numerous_macro_rules();
-    let source_file = ast::SourceFile::parse(&fixture, span::Edition::CURRENT).ok().unwrap();
+    let parse = syntax::SourceFile::parse(&fixture, span::Edition::CURRENT);
+    assert!(parse.errors().is_empty(), "the macro_rules fixture parses");
 
-    source_file
-        .syntax()
+    parse
+        .root()
         .descendants()
         .filter_map(ast::MacroRules::cast)
         .map(|rule| {
-            let id = rule.name().unwrap().to_string();
-            let def_tt = syntax_node_to_token_tree(
+            let id = rule.name().unwrap().text().to_owned();
+            let def_tt = call_input(
                 rule.token_tree().unwrap().syntax(),
                 DummyTestSpanMap,
                 DUMMY,

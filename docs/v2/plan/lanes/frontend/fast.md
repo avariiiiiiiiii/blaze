@@ -132,18 +132,19 @@ of the inputs take one cheap shape. Those are the areas below.
 
 ## 5. Which bodies are checked, where and when
 
-- **Lower bound.** A build checks only the bodies reachable from what it builds (compile-time.md
-  1 and 16), in parallel on the plane's pool up to the core count, and after an edit only the
-  bodies whose own text or whose read signatures changed. A dependency from crates.io is checked
-  once per toolchain for everyone (compile-time.md 8).
+- **Lower bound.** A build checks every body of the crates it compiles (rustc rejects an error
+  in a function nothing calls), in parallel on the plane's pool up to the core count, the bodies
+  reachable from what it builds first (compile-time.md 1 and 16), as they feed codegen; after an
+  edit only the bodies whose own text or whose read signatures changed. A dependency from
+  crates.io is checked once per toolchain for everyone (compile-time.md 8).
 - **Design.**
   1. A body's inference reads its own HIR and the signatures it names; nothing crate-wide. Then
      its memo's edges are exactly those, and early cutoff on signature fingerprints (lane db)
      skips it when they are unchanged. The child audits every crate-wide read in `infer`,
      `method_resolution` and the solver glue, and replaces each with a per-item or per-bucket
      read (impls by (trait, simplified self type), items' facts).
-  2. Bodies are checked as one plane task each, scheduled from the reachable set, not from a
-     crate-wide loop.
+  2. Bodies are checked as one plane task each, the reachable set first, not from a crate-wide
+     loop; the unit's outcome waits for every body.
   3. The check results of a dependency (inference, MIR, borrowck outcome) are stored in the
      global cache keyed by the crate's content and the toolchain, beside frontend-deps'
      signatures.

@@ -12,7 +12,7 @@
 use std::iter;
 
 use canonicalizer::Canonicalizer;
-use rustc_index::IndexVec;
+use rustc_index::IndexSlice;
 use rustc_type_ir::inherent::*;
 use rustc_type_ir::relate::{
     self, Relate, RelateResult, TypeRelation, VarianceDiagInfo, relate_args_invariantly,
@@ -49,7 +49,7 @@ impl<I: Interner, T> ResponseT<I> for inspect::State<I, T> {
 }
 
 /// Canonicalizes the goal remembering the original values
-/// for each bound variable.
+/// for each bound variable, appended to `orig_values` (empty, room to reuse).
 ///
 /// This expects `goal` and `opaque_types` to be eager resolved.
 pub(super) fn canonicalize_goal<D, I>(
@@ -57,7 +57,8 @@ pub(super) fn canonicalize_goal<D, I>(
     goal: Goal<I, I::Predicate>,
     opaque_types: &[(ty::OpaqueTypeKey<I>, I::Ty)],
     typing_mode: TypingMode<I>,
-) -> (ThinVec<I::GenericArg>, I::CanonicalInput)
+    orig_values: Vec<I::GenericArg>,
+) -> (Vec<I::GenericArg>, I::CanonicalInput)
 where
     D: SolverDelegate<Interner = I>,
     I: Interner,
@@ -68,6 +69,7 @@ where
             goal,
             predefined_opaques_in_body: delegate.cx().mk_predefined_opaques_in_body(opaque_types),
         },
+        orig_values,
     );
 
     let query_input = delegate.cx().mk_canonical_input(ty::CanonicalQueryInput {
@@ -98,18 +100,26 @@ where
 /// - we unify the `var_values` of the response with the `original_values`
 /// - we apply the `external_constraints` returned by the query, returning
 ///   the `normalization_nested_goals`
+///
+/// `opt_values` is room the instantiation reuses; it is left in an unspecified state.
 pub(super) fn instantiate_and_apply_query_response<D, I>(
     delegate: &D,
     original_values: &[I::GenericArg],
     response: CanonicalResponse<I>,
     span: I::Span,
+    opt_values: &mut Vec<Option<I::GenericArg>>,
 ) -> (NestedNormalizationGoals<I>, Certainty)
 where
     D: SolverDelegate<Interner = I>,
     I: Interner,
 {
-    let instantiation =
-        compute_query_response_instantiation_values(delegate, &original_values, &response, span);
+    let instantiation = compute_query_response_instantiation_values(
+        delegate,
+        &original_values,
+        &response,
+        span,
+        opt_values,
+    );
 
     let Response { var_values, external_constraints, certainty } =
         delegate.instantiate_canonical(response, instantiation);
@@ -150,6 +160,7 @@ fn compute_query_response_instantiation_values<D, I, T>(
     original_values: &[I::GenericArg],
     response: &Canonical<I, T>,
     span: I::Span,
+    opt_values: &mut Vec<Option<I::GenericArg>>,
 ) -> CanonicalVarValues<I>
 where
     D: SolverDelegate<Interner = I>,
@@ -184,6 +195,7 @@ where
         response,
         span,
         prev_universe,
+        opt_values,
     )
 }
 
@@ -193,6 +205,7 @@ fn compute_query_response_instantiation_values_in_universe<D, I, T>(
     response: &Canonical<I, T>,
     span: I::Span,
     prev_universe: ty::UniverseIndex,
+    opt_values: &mut Vec<Option<I::GenericArg>>,
 ) -> CanonicalVarValues<I>
 where
     D: SolverDelegate<Interner = I>,
@@ -209,7 +222,9 @@ where
     //
     // We therefore instantiate the existential variable in the canonical response with the
     // inference variable of the input right away, which is more performant.
-    let mut opt_values = IndexVec::from_elem_n(None, response.var_kinds.len());
+    opt_values.clear();
+    opt_values.resize(response.var_kinds.len(), None);
+    let opt_values = IndexSlice::<ty::BoundVar, _>::from_raw_mut(opt_values);
     for (original_value, result_value) in iter::zip(original_values, var_values.iter()) {
         match result_value.kind() {
             ty::GenericArgKind::Type(t) => {
@@ -606,6 +621,7 @@ where
         &state,
         span,
         prev_universe,
+        &mut Vec::new(),
     );
 
     let inspect::State { var_values, data } = delegate.instantiate_canonical(state, instantiation);

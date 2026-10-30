@@ -13,7 +13,7 @@ use crate::radix;
 
 /// The order key of a name: its first 8 bytes big-endian, zero-padded. Two keys compare as the
 /// names' first 8 bytes do, so `order_key(a) < order_key(b)` implies `a < b` and only equal
-/// keys need the bytes compared. The same key as `intern::order_key`.
+/// keys need the bytes compared. `intern` re-exports it as `intern::order_key`.
 #[inline]
 pub const fn order_key(bytes: &[u8]) -> u64 {
     let mut key = [0u8; 8];

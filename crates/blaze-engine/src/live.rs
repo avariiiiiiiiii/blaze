@@ -197,6 +197,7 @@ fn wake(dir: &std::path::Path) {
 
 /// The same on Windows, through the event the program waits on ([`format::wake_event`]).
 #[cfg(windows)]
+#[allow(unsafe_code)]
 fn wake(dir: &std::path::Path) {
     use windows_sys::Win32::{
         Foundation::CloseHandle,

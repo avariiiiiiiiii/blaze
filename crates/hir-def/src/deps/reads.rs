@@ -64,6 +64,17 @@ impl Reads {
         for (_, module) in crate_def_map(db, krate).modules(db) {
             todo.extend(module.scope(db).all_macro_calls());
         }
+        Reads::of_calls(db, krate, todo)
+    }
+
+    /// The reads of `krate` from the proc-macro expansions of `todo` and of each call any of
+    /// them is in the expansion of, and every process variable the database noted the crate's
+    /// `env!`s read.
+    pub(crate) fn of_calls(
+        db: &Db,
+        krate: Crate,
+        mut todo: Vec<MacroCallId>,
+    ) -> Result<Reads, Refused> {
         let own = krate.env(db);
         let mut seen = FxHashSet::default();
         let mut reads = Reads::default();

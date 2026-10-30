@@ -276,6 +276,7 @@ impl Run {
         field(&mut request, &stdin);
         let ran = call(&request)?;
         // What the child wrote to a stream it shares with this process, or to a file.
+        // dyn: this process's stdout or stderr, written once per child.
         let to = |to: Stdio, inherited: &mut dyn Write, bytes: &[u8]| -> io::Result<()> {
             match to {
                 Stdio::Inherit => inherited.write_all(bytes),

@@ -296,7 +296,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
         &self,
         dep: &Dependency,
         kind: QueryKind,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         assert!(self.patches_locked);
 
@@ -602,6 +602,9 @@ pub struct Workspace<'a> {
     pub rust_versions: Option<Vec<PartialVersion>>,
     /// The encoding of a new lock file, from the members' lowest `rust-version`.
     pub resolve_version: ResolveVersion,
+    /// `--offline`, `--frozen`, or `net.offline` as `--offline`: a failed resolve then says
+    /// offline mode may be why.
+    pub offline_flag: Option<&'a str>,
 }
 
 impl Workspace<'_> {
@@ -609,10 +612,6 @@ impl Workspace<'_> {
         self.members.members.iter().any(|m| m.package_id() == id)
     }
 }
-
-/// Filters the package ids of a previous resolve to keep locked (all but those
-/// `cargo update` names).
-pub type Keep<'a> = &'a dyn Fn(&PackageId) -> bool;
 
 /// The two resolves cargo makes of a workspace (`resolve_ws_with_opts`, without
 /// `--ignore-lock`): first every member with all its features and dev-dependencies, the
@@ -632,7 +631,6 @@ pub fn resolve_ws<R: Registry>(
         &CliFeatures::new_all(true),
         HasDevUnits::Yes,
         lock,
-        None,
         &[],
         true,
     )?;
@@ -642,7 +640,6 @@ pub fn resolve_ws<R: Registry>(
         cli_features,
         has_dev_units,
         Some(&resolve),
-        None,
         specs,
         false,
     )?;
@@ -650,12 +647,10 @@ pub fn resolve_ws<R: Registry>(
 }
 
 /// Resolves all dependencies for a package using an optional previous instance
-/// of resolve to guide the resolution process.
-///
-/// This also takes an optional filter `keep_previous`, which informs the `registry`
-/// which package ID should be locked to the previous instance of resolve
-/// (often used in pairings with updates). See comments in [`register_previous_locks`]
-/// for scenarios that might override this.
+/// of resolve to guide the resolution process. Every package of the previous
+/// resolve is kept locked to it, but for those [`register_previous_locks`] and
+/// [`register_patch_entries`] find changed (cargo's `keep_previous` without
+/// `cargo update`).
 ///
 /// The previous resolve normally comes from a lock file. This function does not
 /// read or write lock files from the filesystem.
@@ -672,13 +667,9 @@ pub fn resolve_with_previous<R: Registry>(
     cli_features: &CliFeatures,
     has_dev_units: HasDevUnits,
     previous: Option<&Resolve>,
-    keep_previous: Option<Keep<'_>>,
     specs: &[PackageIdSpec],
     register_patches: bool,
 ) -> Result<Resolve> {
-    // Try to keep all from previous resolve if no instruction given.
-    let keep_previous = keep_previous.unwrap_or(&|_| true);
-
     // While registering patches, we will record preferences for particular versions
     // of various packages.
     let mut version_prefs = VersionPreferences::default();
@@ -688,13 +679,13 @@ pub fn resolve_with_previous<R: Registry>(
     }
 
     let avoid_patch_ids = if register_patches {
-        register_patch_entries(registry, ws, previous, &mut version_prefs, keep_previous)?
+        register_patch_entries(registry, ws, previous, &mut version_prefs)?
     } else {
         FxHashSet::default()
     };
 
-    // Refine `keep` with patches that should avoid locking.
-    let keep = |p: &PackageId| keep_previous(p) && !avoid_patch_ids.contains(p);
+    // Keep all of the previous resolve but the patches that should avoid locking.
+    let keep = |p: &PackageId| !avoid_patch_ids.contains(p);
 
     let dev_deps = ws.require_optional_deps || has_dev_units == HasDevUnits::Yes;
 
@@ -734,7 +725,7 @@ pub fn resolve_with_previous<R: Registry>(
         &*registry,
         &version_prefs,
         ws.resolve_version,
-        &ResolveSettings::default(),
+        &ResolveSettings { offline_flag: ws.offline_flag, ..ResolveSettings::default() },
     )?;
 
     let patches = registry.patches().values().flat_map(|v| v.iter());
@@ -766,7 +757,7 @@ fn register_previous_locks<R: Registry>(
     ws: &Workspace<'_>,
     registry: &mut PackageRegistry<R>,
     resolve: &Resolve,
-    keep: Keep<'_>,
+    keep: &impl Fn(&PackageId) -> bool,
     dev_deps: bool,
 ) {
     let path_pkg = |id: SourceId| {
@@ -975,7 +966,6 @@ fn register_patch_entries<R: Registry>(
     ws: &Workspace<'_>,
     previous: Option<&Resolve>,
     version_prefs: &mut VersionPreferences,
-    keep_previous: Keep<'_>,
 ) -> Result<FxHashSet<PackageId>> {
     let mut avoid_patch_ids = FxHashSet::default();
     for (url, patches) in ws.patch.iter() {
@@ -1000,12 +990,7 @@ fn register_patch_entries<R: Registry>(
         let mut registrations = Vec::new();
         for patch in patches {
             let dep = &patch.dep;
-            let candidates = || {
-                previous
-                    .iter()
-                    .chain(previous.unused_patches().iter().cloned())
-                    .filter(&keep_previous)
-            };
+            let candidates = || previous.iter().chain(previous.unused_patches().iter().cloned());
 
             let lock = match candidates().find(|id| dep.matches_id(*id)) {
                 // If we found an exactly matching candidate in our list of
@@ -1086,7 +1071,7 @@ fn register_patch_entries<R: Registry>(
 fn lock_replacements(
     ws: &Workspace<'_>,
     previous: Option<&Resolve>,
-    keep: Keep<'_>,
+    keep: &impl Fn(&PackageId) -> bool,
 ) -> Vec<(PackageIdSpec, Dependency)> {
     match previous {
         Some(r) => ws

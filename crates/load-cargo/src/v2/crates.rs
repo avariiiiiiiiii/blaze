@@ -357,7 +357,7 @@ pub(crate) struct Root {
 /// The first manifest with a `[workspace]` that does not exclude the first member, from that
 /// member's directory up (cargo's `find_workspace_root`), else the member's own: read through
 /// the mounts, stopping where they end.
-pub(crate) fn root(units: &Units, tree: &files::Mounts<'_>) -> Result<Root, LowerError> {
+pub(crate) fn root<T: blaze_query::Tree>(units: &Units, tree: &files::Mounts<'_, T>) -> Result<Root, LowerError> {
     let Some(member) = units.packages.iter().find(|it| it.is_member) else {
         return Ok(Root { dir: None, const_eval: ConstEvalBudget::default() });
     };

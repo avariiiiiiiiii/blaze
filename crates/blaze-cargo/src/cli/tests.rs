@@ -26,7 +26,16 @@ fn place() -> Place {
 
 fn request_of(asked: &Invocation) -> Request {
     let env = vec![("PATH".to_owned(), "/usr/bin".to_owned())];
-    request(asked, place::cargo(asked, &place(), env, Vec::new(), false).unwrap()).unwrap()
+    request(asked, place::cargo(asked, &place(), env, Vec::new(), false, None).unwrap()).unwrap()
+}
+
+#[test]
+fn the_width_and_the_verbosity_go_with_the_command_line() {
+    let asked = invocation(words(os(&["blaze", "build", "-vv"])));
+    let cargo = place::cargo(&asked, &place(), Vec::new(), Vec::new(), true, Some(120)).unwrap();
+    assert_eq!((cargo.width, cargo.verbose, cargo.color), (Some(120), 2, true));
+    let quiet = invocation(words(os(&["blaze", "build", "-q"])));
+    assert_eq!(place::cargo(&quiet, &place(), Vec::new(), Vec::new(), false, None).unwrap().verbose, 0);
 }
 
 #[test]
@@ -82,7 +91,7 @@ fn ub_runs_every_selected_test_in_the_daemon() {
     assert_eq!(ub, None, "opt-in");
 
     let asked = invocation(words(os(&["blaze", "test", "--ub", "--no-run"])));
-    let cargo = place::cargo(&asked, &place(), Vec::new(), Vec::new(), false).unwrap();
+    let cargo = place::cargo(&asked, &place(), Vec::new(), Vec::new(), false, None).unwrap();
     assert!(request(&asked, cargo).unwrap_err().contains("--no-run"));
 }
 
@@ -95,6 +104,8 @@ fn ub_results_print_as_libtest_prints_them() {
         output: b"undefined behavior: a write through a reference that was retagged as shared\nseed: 7".to_vec(),
         millis: 0,
         cached: None,
+        outside: false,
+        executable: 0,
     };
     let passed = TestResult { name: "tests::fine".to_owned(), outcome: TestOutcome::Passed, output: Vec::new(), ..failed.clone() };
     let mut api = FakeApi::answering(vec![Response::TestResult(passed), Response::TestResult(failed), Response::Done { ok: true }]);
@@ -104,6 +115,38 @@ fn ub_results_print_as_libtest_prints_them() {
     assert!(out.contains("---- tests::aliasing stdout ----\nundefined behavior:"), "{out}");
     assert!(out.contains("seed: 7"), "{out}");
     assert_eq!(err, "", "nothing compiled, nothing run on this machine");
+}
+
+#[test]
+fn the_summary_names_the_tests_that_ran_outside_the_sandbox() {
+    let result = |name: &str, outside: bool| TestResult {
+        binary: "/w/target/debug/deps/foo-1".to_owned(),
+        name: name.to_owned(),
+        outcome: TestOutcome::Passed,
+        output: Vec::new(),
+        millis: 1,
+        cached: None,
+        outside,
+        executable: 0,
+    };
+    let responses = vec![
+        Response::TestResult(result("tests::inside", false)),
+        Response::TestResult(result("tests::writes_home", true)),
+        Response::TestResult(result("tests::dials", true)),
+        Response::Done { ok: true },
+    ];
+    let (then, out, err) = driven(&mut FakeApi::answering(responses.clone()), &["blaze", "test", "--reached"], &mut Fake::default());
+    assert_eq!(then, Then::Exit(0));
+    assert!(out.contains("test tests::writes_home ... ok\n"), "{out}");
+    assert!(
+        err.ends_with(
+            "note: 2 tests ran outside the sandbox, so they run every time and their passes are never kept: \
+             tests::writes_home, tests::dials\n"
+        ),
+        "{err}"
+    );
+    let (_, _, quiet) = driven(&mut FakeApi::answering(responses), &["blaze", "test", "--reached", "-q"], &mut Fake::default());
+    assert!(!quiet.contains("note:"), "cargo's notes are silent under -q: {quiet}");
 }
 
 #[test]
@@ -128,15 +171,9 @@ impl FakeApi {
 }
 
 impl daemon::Api for FakeApi {
-    fn call<F: FnMut(Response)>(&mut self, request: Request, mut on: F) -> Result<bool, ClientError> {
+    fn call<F: FnMut(ResponseRef<'_>, bool)>(&mut self, request: Request, on: F) -> Result<bool, ClientError> {
         self.asked.push(request);
-        let mut ok = false;
-        for response in &self.responses {
-            if let Response::Done { ok: it } = response {
-                ok = *it;
-            }
-            on(response.clone());
-        }
+        let ok = daemon::tests::hand(&self.responses, on);
         match self.hangs_up {
             true => Err(ClientError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "the daemon hung up"))),
             false => Ok(ok),
@@ -151,6 +188,7 @@ fn foo_compiling() -> Response {
         version: "0.1.0".to_owned(),
         source: Some("(/w/foo)".to_owned()),
         verb: Verb::Compiling,
+        package: 0,
     })
 }
 

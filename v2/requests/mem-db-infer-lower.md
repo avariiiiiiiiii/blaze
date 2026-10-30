@@ -47,6 +47,7 @@ pub(crate) fn exact_thin<T>(
 (If mem-db-infer prefers these in `lib.rs` for every part, they move there unchanged.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): the aliases are `lib.rs`'s (mem-db-infer 5): `lower.rs` has `pub(crate) use crate::{FrameMap, FrameSet};` and `use crate::{frame_map, frame_set};` (used in place of `with_hasher_in(FxBuildHasher, frame)` below), `exact_thin` as written, `use blaze_mem::Frame;`.
 
 ## 2. lane db: `TyLoweringContext` takes its run's frame (R2), `lower.rs`
 
@@ -187,6 +188,7 @@ allocates its names (`binder.to_vec()`). After this change no context makes a gl
 until it lowers something that has diagnostics.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, with `frame_set(frame)` for `unsized_types`; dedyn-ty's `infer_vars: Option<InferVars<'a, 'db>>` kept. Outside callers told: borrowck `regions.rs` (db-mem-borrowck), `traits.rs` (db-mem-infer-b), `source_analyzer/view.rs` (frontend-tree-move-hir-next1), `tests/infer_vars.rs` (dedyn-ty).
 
 ## 3. lane db: binder names in one list, `lower.rs`
 
@@ -324,6 +326,7 @@ type G = for<'a> fn(&'a u8, for<'a, 'b> fn(&'a u8, &'b u8));
 `lower.rs` imports them.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written; the `of_assoc_ty` arm keeps db-apply-ty's `let binder = self.store.names(binder);` first. Test in `crates/hir/src/tests/lower.rs`.
 
 ## 4. lane db: owned results made once, and the frame form of a lowering, `lower.rs`
 
@@ -480,6 +483,7 @@ and one new test:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written; `FrameLowered` derives `Debug` (`generic_predicates`' `tracing::instrument(.., ret)` prints it) and `empty` is `pub(crate)` (15 uses it).
 
 ## 5. lane db: `lower_closure_params` fills the caller's list, `lower.rs`
 
@@ -524,6 +528,7 @@ After:
 The caller (`infer/closure.rs`, part closure) is in 22.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written; `infer/closure.rs:1021` already calls it this way.
 
 ## 6. lane db: `lower_fn_ptr`'s arguments, `lower.rs`
 
@@ -532,6 +537,7 @@ Before: `let mut args = Vec::with_capacity(fn_.params.len());`. After:
 type, its length is exact (the parameters and the return type), and it is interned by `Tys`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written.
 
 ## 7. lane db: bounds without a list per bound, `lower.rs`
 
@@ -598,6 +604,7 @@ binders of the clauses are what they were. The type-check corpus and the existin
 tests hold them.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written.
 
 ## 8. lane db: `lower_dyn_trait`'s lists, `lower.rs`
 
@@ -678,6 +685,7 @@ map is read only by key and never iterated, so a frame hash map is the same as t
 projection order, which comes from `ordered_associated_types`, not from the map.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, the map as `frame_map(frame)`; the `// Skip `Self`` comment moved above the `let args`.
 
 ## 9. lane db: `lower_impl_trait` (the context's method), `lower.rs`
 
@@ -699,6 +707,7 @@ After:
 (the clauses are interned).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written.
 
 ## 10. lane db: the tracked queries of `lower.rs` (R1, R4, R6)
 
@@ -733,6 +742,7 @@ one more allocation when the item has diagnostics, or defines anonymous constant
 The per-query changes:
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): all 18 tags as `mem_tag = Infer` (salsa's option as filed, mem-db-salsa M2, takes a bare `blaze_mem::Tag` variant), not `crate::db::INFER_TAG`. Where a body is long or has early returns and `?` (`resolve_type_param_assoc_type_shorthand`, `type_alias_bounds_with_diagnostics`, `fn_sig_for_fn`, `elided_lifetimes`), the query is `blaze_mem::frame::current(|frame| <name>_in(.., frame))` and the body moved unchanged into `<name>_in`, as `infer_body_in` does; the same frame, the same allocations.
 
 ### 10a. `impl_trait_of_impl`, `lower_impl_trait` (the free fn)
 
@@ -802,6 +812,7 @@ pub(crate) fn lower_impl_trait<'db, 'f>(
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`.
 
 ### 10b. `impl_self_ty_of_impl`, `lower_impl_self_ty`
 
@@ -811,6 +822,7 @@ FrameLowered<'f, 'db, StoredEarlyBinder<StoredTy>>` ends with
 body is `blaze_mem::frame::current(|frame| lower_impl_self_ty(db, impl_id, frame).owned())`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`.
 
 ### 10c. `type_for_const_with_diagnostics`, `type_for_static_with_diagnostics`, `type_for_type_alias_with_diagnostics`, `resolve_type_param_assoc_type_shorthand`
 
@@ -820,6 +832,7 @@ use 4's new `from_ctx`). `type_for_type_alias_with_diagnostics` reads `take_defi
 which is exact after 4. Its `impl_traits: ThinVec::new()` arms (empty, no allocation) stay.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`; `type_for_type_alias_with_diagnostics` opens the frame in its non-extern arm only (the extern arm makes nothing); the shorthand query's body is `resolve_type_param_assoc_type_shorthand_in(.., frame)`.
 
 ### 10d. `const_param_types_with_diagnostics`: one exact column
 
@@ -906,6 +919,7 @@ struct S<T, const N: usize, U, const M: bool>([T; N], U);
 `DisplayTarget`/`display` helper if it has one.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): the column as written, `mem_tag = Infer`; `len` is computed first and an item without const parameters returns `TyLoweringResult::empty` before the frame (today's early return, same result). The test (in `crates/hir/src/tests/lower.rs`) compares `TyKind`s, not the `Debug` text.
 
 ### 10e. `field_types_of_variant`, `lower_field_types`
 
@@ -958,6 +972,7 @@ One allocation per variant with fields, as today, now made from the frame list a
 length.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`.
 
 ### 10f. `supertraits_info`: frame lists, two exact boxes
 
@@ -1058,6 +1073,7 @@ new test:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`; the two `Name` clones carry `// clone:` notes for hot_lint.
 
 ### 10g. `type_alias_bounds_with_diagnostics` and `remap_gat_vars_and_recurse_into_nested_projections`
 
@@ -1139,6 +1155,7 @@ and `impl<'db> TypeFolder<DbInterner<'db>> for MapAndCompressBoundVars<'db, '_>`
 (`tests/traits.rs` `gat_*`) hold the compressed binders.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`, the map `frame_map(frame)`; the body is `type_alias_bounds_in(db, type_alias, frame)`. The `FxIndexMap` and `FxHashSet` imports went (nothing else used them).
 
 ### 10h. `generic_predicates_of`, `generic_predicates`, `push_const_arg_has_type_predicates`
 
@@ -1222,6 +1239,7 @@ most the interner's for one `Clauses` and nothing for an item without findings, 
 mem-db-infer's `tests/budget.rs` (its request 4).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`; `generic_predicates`' `tracing::instrument` skips `frame` too.
 
 ### 10i. `const_conditions_query`
 
@@ -1231,6 +1249,7 @@ in `blaze_mem::frame::current(|frame| { .. })`, `let mut conditions = Vec::new_i
 context taking `frame`, and `Clauses::new_from_slice(&conditions)`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`.
 
 ### 10j. `generic_defaults_with_diagnostics`: one exact column
 
@@ -1297,6 +1316,7 @@ struct S<A, B = u8, C = u16>(A, B, C);
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`; the frame opens after the `has_no_params` early return. Test in `crates/hir/src/tests/lower.rs`.
 
 ### 10k. `fn_sig_for_fn`
 
@@ -1306,6 +1326,7 @@ unchanged (frame lists of the same lifetime). `take_defined_opaques` is exact af
 allocation if the function returns `impl Trait`, + d + a.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`, the body `fn_sig_for_fn_in(db, def, frame)`.
 
 ### 10l. `elided_lifetimes`, `input_lifetimes`, `path_lifetimes`
 
@@ -1427,12 +1448,14 @@ With this, `frame` is not needed by `path_lifetimes` itself, only passed on to
 `elided_lifetimes` tests (`tests/regression.rs`, the `impl Trait` capture tests) hold the result.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written, `mem_tag = Infer`, the body `elided_lifetimes_in(db, function, frame)`. `frame` is dropped from both `input_lifetimes` and `path_lifetimes`: once `path_lifetimes` collects nothing neither uses it; they take the frame lists only.
 
 ### 10m. `trait_environment_query`, the constructor signatures
 
 Only the tag. They make no temporaries of their own, so they open no frame.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): `mem_tag = Infer` on `trait_environment_query`, `fn_sig_for_struct_constructor`, `fn_sig_for_enum_variant_constructor`.
 
 ## 11. lane db: `ElidedLifetimes::regions` fills the caller's list, `lower.rs`
 
@@ -1466,6 +1489,7 @@ The body is otherwise unchanged (`regions.extend(..)` once per arm, with
 changes are in 22.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written; `with_elided_regions`' doc link now names `regions_into`. The three callers (borrowck `regions.rs:1225`, `:5816`, wfcheck `lib.rs:356`) told to db-mem-borrowck again at 21:51.
 
 ## 12. lane db: `bind_elided_lifetimes` takes its caller's frame, `lower.rs`
 
@@ -1503,6 +1527,7 @@ pub(crate) fn bind_elided_lifetimes<'db>(
 and at the end `BoundVarKinds::new_from_slice(&vars)` in place of `new_from_iter(vars)`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): as written; `infer/coerce.rs:960` told to db-mem-infer-a-next1 and db-mem-infer-a-expr.
 
 ## 13. lane db: the R7 helpers of `lower.rs` (no change)
 
@@ -1519,6 +1544,7 @@ These are called on the hit path of many queries and make nothing:
 Each reads memos or interns, and takes no frame.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): nothing to change.
 
 ## 14. lane db: `crates/hir-ty/src/lower/path.rs`
 
@@ -1526,6 +1552,7 @@ Each reads memos or interns, and takes no frame.
 `self.ctx.frame` (`&'b Frame`) and needs no field of its own (R2).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:56): nothing of its own (14a, 14b read `self.ctx.frame`).
 
 ### 14a. `substs_from_args_and_bindings` (the free fn): the run's frame
 
@@ -1549,6 +1576,7 @@ After (a new last parameter `frame: &Frame`):
 - `method_resolution/confirm.rs:464`, part method, passes its inference's frame (22).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:56): as written; the method reads `let frame = self.ctx.frame;` before the call (the `LowererCtx` argument reborrows `self`). `confirm.rs`'s caller is told to db-mem-infer-b.
 
 ### 14b. `assoc_type_bindings_from_type_bound`: the bounds of a binding
 
@@ -1584,6 +1612,7 @@ The return type `impl Iterator<..> + use<'a, 'b, 'db>` already covers `&'b Frame
 else uses `smallvec::SmallVec` in `path.rs`, its import goes.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:56): as written; the `smallvec::SmallVec` import went.
 
 ### 14c. Left as they are
 
@@ -1594,6 +1623,7 @@ else uses `smallvec::SmallVec` in `path.rs`, its import goes.
 - `binding.name.clone()`, `assoc_name.clone()`: a 4-byte `Name`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:56): nothing to change.
 
 ## 15. lane db: `crates/hir-ty/src/lower/batch.rs`
 
@@ -2053,6 +2083,7 @@ exact already, and the other two go through `exact(len, ..)`. Test: the existing
   rendering result, owned and cold.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:37): nothing to change (checked `utils.rs`, `lower/diagnostics.rs` and `generics.rs` as they are now).
 
 ## 18. lane db: `crates/hir-ty/src/variance.rs`: the solution in the frame
 
@@ -2136,6 +2167,7 @@ struct S<'a, A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R>(&'a A, fn(B),
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:28): with `mem_tag = Infer` (salsa M2's bare variant) in place of `crate::db::INFER_TAG`. `solve` keeps `mut self` (its variant closure calls `&mut self` methods), and the two `let mut variances` become `let variances` (a `&mut [_]` binding needs no `mut`). Test added to `crates/hir/src/tests/lower.rs`.
 
 ## 19. lane db: `crates/hir-ty/src/variance/unused.rs`
 
@@ -2245,6 +2277,7 @@ Its budget (one allocation, the returned list, once the queries it reads are war
 mem-db-infer's `tests/budget.rs`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:31): with `crate::frame_set(frame)` (mem-db-infer 5) in place of `FrameSet::with_hasher_in(FxBuildHasher, frame)`. Test added to `crates/hir/src/tests/lower.rs`.
 
 ## 20. lane db: `crates/hir-ty/src/dyn_compatibility.rs`
 
@@ -2252,6 +2285,7 @@ mem-db-infer's `tests/budget.rs`.
 They make no temporaries after this change and open no frame.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:34): `mem_tag = Infer` on both (salsa M2's bare variant, not `crate::db::INFER_TAG`).
 
 ### 20a. The supertraits are a memo already
 
@@ -2333,6 +2367,7 @@ trait G where Self: D + E {}
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:34): as written (both lists include the trait itself); test added to `crates/hir/src/tests/lower.rs`.
 
 ### 20b. The first `impl Trait` in the return type, without a set
 
@@ -2408,6 +2443,7 @@ dyn-compatibility tests (`dyn_compatibility/tests.rs`, `ReferencesImplTraitInTra
 the answer.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:34): as written; the `FxHashSet`, `SmallVec` and `InternedOpaqueTyId` imports went (nothing else used them).
 
 ### 20c. Left
 
@@ -2417,6 +2453,7 @@ allocations (mem-db-solver). The pub entry points `dyn_compatibility` and
 20a and 20b, so they open no task.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:34): nothing to change.
 
 ## 21. lane db: `crates/hir-ty/src/builtin_derive.rs` and `crates/hir-ty/src/effects.rs`
 
@@ -2466,6 +2503,8 @@ fn extend_assoc_type_bounds<'db>(
   It is owned, and it makes no other temporaries, so it opens no task.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:37): `builtin_derive.rs` as written, with `mem_tag = Infer` (salsa M2's bare variant); `frame::current` wraps the `match` only (the lets before it make nothing), so the arms keep their indentation.
+> applied by db-mem-infer-b-lower (21:52): `effects.rs`'s `const_param_env_query` tag, `mem_tag = Infer`.
 
 ## 22. Dependent edits in other parts' files
 
@@ -2485,6 +2524,8 @@ as the signature it follows, or the crate does not build. mem-db-infer passes th
 | `hir-ty-borrowck/src/regions.rs:1166`, `:5686`, `hir-ty-wfcheck/src/lib.rs:328` (mem-db-checks) | `.regions(&errors)` | `let mut regions = Vec::new_in(frame); elided.regions_into(&errors, &mut regions);` (or a global `Vec::new()` until that crate is on the frame) |
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): `hir/src/source_analyzer.rs`' three calls (`type_of_type`, `resolve_hir_path_`, `resolve_hir_path_qualifier`) each in `blaze_mem::frame::task(blaze_mem::Tag::Infer, ..)`, `store` taken before the task where it was `?`-ed (hir already depends on blaze-mem). The other rows are their owners': `infer/diagnostics.rs` and `infer/closure.rs` already match; `infer/coerce.rs` (db-mem-infer-a-next1/-expr), `confirm.rs` and `traits.rs` (db-mem-infer-b; `traits.rs` has its task, missing only the `frame` argument), borrowck `regions.rs` and wfcheck `lib.rs` (db-mem-borrowck) told by tmux at 21:51-21:53. Not in this table: frontend-tree-move-hir's new `hir/src/source_analyzer/view.rs:191` and dedyn-ty's new `hir-ty/src/tests/infer_vars.rs:97`, told the same way.
+> applied by db-mem-borrowck (22:02): the last two rows. Borrowck `regions.rs` `elided_groups` and the lowering helper pass `self.ctx.frame` last to `TyLoweringContext::new`; the two `.regions(&errors)` there and wfcheck `lib.rs`'s become `regions_into(&errors, &mut regions)` into a frame `Vec`. Both crates are on the frame, so `errors` is a frame list of frame lists too (borrowck `filled(frame, n, Vec::new_in(frame))`, wfcheck `mem::collect(frame, repeat_n(..))`), and the three `// alloc:` notes that waited on this are gone.
 
 ## 23. Every `TyLoweringContext::new` and the frame it passes
 
@@ -2510,6 +2551,7 @@ as the signature it follows, or the crate does not build. mem-db-infer passes th
 | `hir-ty-borrowck/src/regions.rs:4312`, `:4676` | borrowck's query | its run's frame (22) |
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): every `lower.rs` call passes its frame (checked with `rg`); the rest as 22 says.
 
 ## 24. R1 entry points of these files called outside queries
 
@@ -2522,6 +2564,7 @@ as the signature it follows, or the crate does not build. mem-db-infer passes th
 | `dyn_compatibility`, `dyn_compatibility_with_callback`, `builtin_derive::param_env`, `effects::non_const_calls`, `effects::const_call_error`, `effects::const_param_env` | hir, IDE, the interner | none: they make no temporaries of their own after 20 and 21 |
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): nothing more to change (19, 16, 11 and 22 carry them).
 
 ## 25. Tags
 
@@ -2546,6 +2589,7 @@ For one with more options, the tag goes last:
 `#[salsa::tracked(returns(ref), cycle_result = X, mem_tag = crate::db::INFER_TAG)]`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): all 28, each written `mem_tag = Infer` (salsa's option as filed, mem-db-salsa M2, takes a bare `blaze_mem::Tag` variant), last among the options.
 
 ## 26. What stays, and why
 
@@ -2580,6 +2624,7 @@ Every remaining `.clone()`, `Vec::new()`, `vec![`, `.collect()`, `.to_vec()`, `B
 | `effects.rs` `non_const_calls`' `Vec::new()`s and `found` | the returned list, owned |
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): nothing to change; hot_lint's remaining `lower.rs` findings are these `Name`/`Symbol` clones.
 
 ## 27. Speed
 
@@ -2625,3 +2670,4 @@ allocator under 2% of lowering, against about 10% for a lowering that allocated 
 globally.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-b-lower (21:52): nothing to change (notes only).

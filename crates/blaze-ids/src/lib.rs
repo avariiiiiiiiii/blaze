@@ -15,19 +15,23 @@
 
 use std::{fmt, hash, marker::PhantomData};
 
-use blake3::hazmat::{self, ContextKey, HasherExt};
 use blaze_mem::swiss::Index;
 
-use crate::sync::{
-    Mutex, OnceLock, PoisonError,
-    atomic::{AtomicU32, AtomicU64, Ordering},
+use crate::{
+    b3::ContextKey,
+    sync::{
+        Mutex, OnceLock, PoisonError,
+        atomic::{AtomicU32, AtomicU64, Ordering},
+    },
 };
 
+pub mod b3;
 pub mod bits;
 #[allow(unsafe_code)]
 pub mod crc32c;
 mod many;
 pub mod names;
+pub mod prehashed;
 pub use blaze_radix as radix;
 pub mod rng;
 mod std_hash;
@@ -52,16 +56,12 @@ impl ContentId {
     /// and the version of their schema (`"blaze v2 file 1"`): equal bytes of two domains have
     /// two IDs.
     pub fn of(domain: &'static str, bytes: &[u8]) -> ContentId {
-        let mut hasher = Hasher::new(domain);
-        hasher.update(bytes);
-        hasher.finish()
+        ContentId(b3::derive_key_with(context_key(domain), bytes))
     }
 
     /// [`ContentId::of`] for a [`Domain`], its context key read with one acquire load.
     pub fn of_domain(domain: &Domain, bytes: &[u8]) -> ContentId {
-        let mut hasher = Hasher::of(domain);
-        hasher.update(bytes);
-        hasher.finish()
+        ContentId(b3::derive_key_with(domain.key(), bytes))
     }
 
     /// `inputs.iter().map(|it| ContentId::of(domain, it))`, many inputs a SIMD lane each.
@@ -78,7 +78,7 @@ impl ContentId {
     /// [`ContentId::of_many`] into `out` (cleared first): a warm call with room allocates
     /// nothing.
     pub fn of_many_into(domain: &'static str, inputs: &[&[u8]], out: &mut Vec<ContentId>) {
-        many::of_many_into(context_key(domain), inputs, out)
+        many::of_many_into::<b3::Many>(context_key(domain), inputs, out)
     }
 
     /// The first 128 bits, as a result's fingerprint.
@@ -111,7 +111,7 @@ impl fmt::LowerHex for ContentId {
 
 /// Builds a [`ContentId`] from parts. It takes bytes and other content IDs only, so a dense
 /// [`Idx`] can't be hashed but by spelling out [`Idx::raw`], which a reviewer sees.
-pub struct Hasher(blake3::Hasher);
+pub struct Hasher(b3::Hasher);
 
 /// A hash domain whose BLAKE3 context key is derived once, on first use: what a domain hashed
 /// millions of times is declared as (`pub static KEY: Domain = Domain::new("blaze v2 key 1")`).
@@ -130,7 +130,7 @@ impl Domain {
     }
 
     fn key(&self) -> &ContextKey {
-        self.key.get_or_init(|| hazmat::hash_derive_key_context(self.name))
+        self.key.get_or_init(|| b3::context_key(self.name))
     }
 }
 
@@ -150,7 +150,7 @@ fn name_hash(name: &str) -> usize {
     }) as usize
 }
 
-/// `blake3::hazmat::hash_derive_key_context(domain)`, derived once per name.
+/// [`b3::context_key`]`(domain)`, derived once per name.
 fn context_key(domain: &'static str) -> &'static ContextKey {
     context_key_in(&DOMAIN_KEYS, domain)
 }
@@ -162,7 +162,7 @@ fn context_key_in<'a>(slots: &'a DomainKeys, domain: &'static str) -> &'a Contex
         let slot = &slots[at];
         let (name, key) = match slot.get() {
             Some(entry) => entry,
-            None => slot.get_or_init(|| (domain, hazmat::hash_derive_key_context(domain))),
+            None => slot.get_or_init(|| (domain, b3::context_key(domain))),
         };
         if std::ptr::eq(*name, domain) || *name == domain {
             return key;
@@ -174,11 +174,11 @@ fn context_key_in<'a>(slots: &'a DomainKeys, domain: &'static str) -> &'a Contex
 
 impl Hasher {
     pub fn new(domain: &'static str) -> Hasher {
-        Hasher(blake3::Hasher::new_from_context_key(context_key(domain)))
+        Hasher(b3::Hasher::new_from_context_key(context_key(domain)))
     }
 
     pub fn of(domain: &Domain) -> Hasher {
-        Hasher(blake3::Hasher::new_from_context_key(domain.key()))
+        Hasher(b3::Hasher::new_from_context_key(domain.key()))
     }
 
     pub fn update(&mut self, bytes: &[u8]) -> &mut Hasher {
@@ -199,7 +199,7 @@ impl Hasher {
     }
 
     pub fn finish(&self) -> ContentId {
-        ContentId(*self.0.finalize().as_bytes())
+        ContentId(self.0.finalize())
     }
 }
 
@@ -976,8 +976,8 @@ mod model {
             };
             let one = *context_key_in(&slots, first);
             let two = other.join().unwrap();
-            assert_eq!(one, hazmat::hash_derive_key_context(first));
-            assert_eq!(two, hazmat::hash_derive_key_context(second));
+            assert_eq!(one, blake3::hazmat::hash_derive_key_context(first));
+            assert_eq!(two, blake3::hazmat::hash_derive_key_context(second));
             assert_eq!(*context_key_in(&slots, first), one, "found again in its slot");
             assert_eq!(*context_key_in(&slots, second), two, "found again in its slot");
         });

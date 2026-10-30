@@ -26,7 +26,6 @@ use rustc_type_ir::{
     TypeVisitable, UniverseIndex,
     inherent::IntoKind,
 };
-use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 
 use super::{
@@ -54,6 +53,20 @@ pub(crate) trait Sink<'db> {
     fn node<N: Node<'db>>(&mut self, node: N);
     /// An ADT: in memory with its flags, persisted as its id alone.
     fn adt(&mut self, adt: AdtDef);
+    /// A salsa id as [`put_id`] writes it, unless the sink names ids otherwise.
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T)
+    where
+        Self: Sized,
+    {
+        put_id(self, id.as_id());
+    }
+    /// A definition: its variant and salsa id, unless the sink names definitions otherwise.
+    fn def(&mut self, def: SolverDefId<'db>)
+    where
+        Self: Sized,
+    {
+        put_def(self, def);
+    }
 }
 
 /// Where a value's words come from.
@@ -62,9 +75,23 @@ pub(crate) trait Source<'db> {
     fn word(&mut self) -> Result<u32, Self::Error>;
     fn node<N: Node<'db>>(&mut self) -> Result<N, Self::Error>;
     fn adt(&mut self) -> Result<AdtDef, Self::Error>;
+    /// A salsa id, as [`Sink::id`] wrote it.
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, Self::Error>
+    where
+        Self: Sized,
+    {
+        get_id(self).map(T::from_id)
+    }
     /// How many of something follow, each of at least one word.
     fn count(&mut self) -> Result<usize, Self::Error>;
     fn invalid(&self, what: &'static str) -> Self::Error;
+    /// A definition, as [`Sink::def`] wrote it.
+    fn def(&mut self) -> Result<SolverDefId<'db>, Self::Error>
+    where
+        Self: Sized,
+    {
+        get_def(self)
+    }
 }
 
 /// A value as words.
@@ -392,56 +419,118 @@ fn get_id<'db, S: Source<'db>>(source: &mut S) -> Result<salsa::Id, S::Error> {
 }
 
 impl<'db> Code<'db> for SolverDefId<'db> {
+    #[inline]
     fn put(&self, sink: &mut impl Sink<'db>) {
-        let (variant, id) = match *self {
-            SolverDefId::AdtId(AdtId::StructId(id)) => (0, id.as_id()),
-            SolverDefId::AdtId(AdtId::UnionId(id)) => (1, id.as_id()),
-            SolverDefId::AdtId(AdtId::EnumId(id)) => (2, id.as_id()),
-            SolverDefId::ConstId(id) => (3, id.as_id()),
-            SolverDefId::FunctionId(id) => (4, id.as_id()),
-            SolverDefId::ImplId(id) => (5, id.as_id()),
-            SolverDefId::BuiltinDeriveImplId(id) => (6, id.as_id()),
-            SolverDefId::StaticId(id) => (7, id.as_id()),
-            SolverDefId::AnonConstId(id) => (8, id.as_id()),
-            SolverDefId::TraitId(id) => (9, id.as_id()),
-            SolverDefId::TypeAliasId(id) => (10, id.as_id()),
-            SolverDefId::InternedClosureId(id) => (11, id.as_id()),
-            SolverDefId::InternedCoroutineId(id) => (12, id.as_id()),
-            SolverDefId::InternedCoroutineClosureId(id) => (13, id.as_id()),
-            SolverDefId::InternedOpaqueTyId(id) => (14, id.as_id()),
-            SolverDefId::EnumVariantId(id) => (15, id.as_id()),
-            SolverDefId::Ctor(Ctor::Struct(id)) => (16, id.as_id()),
-            SolverDefId::Ctor(Ctor::Enum(id)) => (17, id.as_id()),
-        };
-        sink.word(variant);
-        put_id(sink, id);
+        sink.def(*self);
     }
 
+    #[inline]
     fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
-        let variant = source.word()?;
-        let id = get_id(source)?;
-        Ok(match variant {
-            0 => SolverDefId::AdtId(AdtId::StructId(FromId::from_id(id))),
-            1 => SolverDefId::AdtId(AdtId::UnionId(FromId::from_id(id))),
-            2 => SolverDefId::AdtId(AdtId::EnumId(FromId::from_id(id))),
-            3 => SolverDefId::ConstId(FromId::from_id(id)),
-            4 => SolverDefId::FunctionId(FromId::from_id(id)),
-            5 => SolverDefId::ImplId(FromId::from_id(id)),
-            6 => SolverDefId::BuiltinDeriveImplId(FromId::from_id(id)),
-            7 => SolverDefId::StaticId(FromId::from_id(id)),
-            8 => SolverDefId::AnonConstId(FromId::from_id(id)),
-            9 => SolverDefId::TraitId(FromId::from_id(id)),
-            10 => SolverDefId::TypeAliasId(FromId::from_id(id)),
-            11 => SolverDefId::InternedClosureId(FromId::from_id(id)),
-            12 => SolverDefId::InternedCoroutineId(FromId::from_id(id)),
-            13 => SolverDefId::InternedCoroutineClosureId(FromId::from_id(id)),
-            14 => SolverDefId::InternedOpaqueTyId(FromId::from_id(id)),
-            15 => SolverDefId::EnumVariantId(FromId::from_id(id)),
-            16 => SolverDefId::Ctor(Ctor::Struct(FromId::from_id(id))),
-            17 => SolverDefId::Ctor(Ctor::Enum(FromId::from_id(id))),
-            _ => return Err(source.invalid("a definition")),
-        })
+        source.def()
     }
+}
+
+/// A definition as its variant and salsa id: [`Sink::def`]'s default.
+pub(crate) fn put_def<'db>(sink: &mut impl Sink<'db>, def: SolverDefId<'db>) {
+    match def {
+        SolverDefId::AdtId(AdtId::StructId(id)) => {
+            sink.word(0);
+            sink.id(id)
+        }
+        SolverDefId::AdtId(AdtId::UnionId(id)) => {
+            sink.word(1);
+            sink.id(id)
+        }
+        SolverDefId::AdtId(AdtId::EnumId(id)) => {
+            sink.word(2);
+            sink.id(id)
+        }
+        SolverDefId::ConstId(id) => {
+            sink.word(3);
+            sink.id(id)
+        }
+        SolverDefId::FunctionId(id) => {
+            sink.word(4);
+            sink.id(id)
+        }
+        SolverDefId::ImplId(id) => {
+            sink.word(5);
+            sink.id(id)
+        }
+        SolverDefId::BuiltinDeriveImplId(id) => {
+            sink.word(6);
+            sink.id(id)
+        }
+        SolverDefId::StaticId(id) => {
+            sink.word(7);
+            sink.id(id)
+        }
+        SolverDefId::AnonConstId(id) => {
+            sink.word(8);
+            sink.id(id)
+        }
+        SolverDefId::TraitId(id) => {
+            sink.word(9);
+            sink.id(id)
+        }
+        SolverDefId::TypeAliasId(id) => {
+            sink.word(10);
+            sink.id(id)
+        }
+        SolverDefId::InternedClosureId(id) => {
+            sink.word(11);
+            sink.id(id)
+        }
+        SolverDefId::InternedCoroutineId(id) => {
+            sink.word(12);
+            sink.id(id)
+        }
+        SolverDefId::InternedCoroutineClosureId(id) => {
+            sink.word(13);
+            sink.id(id)
+        }
+        SolverDefId::InternedOpaqueTyId(id) => {
+            sink.word(14);
+            sink.id(id)
+        }
+        SolverDefId::EnumVariantId(id) => {
+            sink.word(15);
+            sink.id(id)
+        }
+        SolverDefId::Ctor(Ctor::Struct(id)) => {
+            sink.word(16);
+            sink.id(id)
+        }
+        SolverDefId::Ctor(Ctor::Enum(id)) => {
+            sink.word(17);
+            sink.id(id)
+        }
+    }
+}
+
+/// [`put_def`]'s definition back: [`Source::def`]'s default.
+pub(crate) fn get_def<'db, S: Source<'db>>(source: &mut S) -> Result<SolverDefId<'db>, S::Error> {
+    Ok(match source.word()? {
+        0 => SolverDefId::AdtId(AdtId::StructId(source.id()?)),
+        1 => SolverDefId::AdtId(AdtId::UnionId(source.id()?)),
+        2 => SolverDefId::AdtId(AdtId::EnumId(source.id()?)),
+        3 => SolverDefId::ConstId(source.id()?),
+        4 => SolverDefId::FunctionId(source.id()?),
+        5 => SolverDefId::ImplId(source.id()?),
+        6 => SolverDefId::BuiltinDeriveImplId(source.id()?),
+        7 => SolverDefId::StaticId(source.id()?),
+        8 => SolverDefId::AnonConstId(source.id()?),
+        9 => SolverDefId::TraitId(source.id()?),
+        10 => SolverDefId::TypeAliasId(source.id()?),
+        11 => SolverDefId::InternedClosureId(source.id()?),
+        12 => SolverDefId::InternedCoroutineId(source.id()?),
+        13 => SolverDefId::InternedCoroutineClosureId(source.id()?),
+        14 => SolverDefId::InternedOpaqueTyId(source.id()?),
+        15 => SolverDefId::EnumVariantId(source.id()?),
+        16 => SolverDefId::Ctor(Ctor::Struct(source.id()?)),
+        17 => SolverDefId::Ctor(Ctor::Enum(source.id()?)),
+        _ => return Err(source.invalid("a definition")),
+    })
 }
 
 /// Ids that convert both ways with [`SolverDefId`]: as the one they convert to.
@@ -1596,9 +1685,47 @@ list_node!(
     Consts: Const<'db>,
     BoundVarKinds: BoundVariableKind<'db>,
     PatList: Pattern<'db>,
-    BoundExistentialPredicates: BoundExistentialPredicate<'db>,
     Clauses: Clause<'db>,
 );
+
+impl<'db> Node<'db> for BoundExistentialPredicates<'db> {
+    const KIND: Kind = Kind::BoundExistentialPredicates;
+    #[inline]
+    fn row(self) -> NonZeroU32 {
+        BoundExistentialPredicates::row(self)
+    }
+    #[inline]
+    fn at(row: NonZeroU32) -> Self {
+        BoundExistentialPredicates::at(row)
+    }
+    fn put_node(self, sink: &mut impl Sink<'db>) {
+        sink.word(self.len() as u32);
+        self.iter().for_each(|item| item.put(sink));
+    }
+    fn get_node<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
+        let len = source.count()?;
+        let mut items = (0..len)
+            .map(|_| BoundExistentialPredicate::get(source))
+            .collect::<Result<SmallVec<[BoundExistentialPredicate<'db>; 8]>, _>>()?;
+        if crate::check_cache::in_scope() {
+            // In lowering's order, by this database's ids: the principal, projections, auto traits.
+            items.sort_by(|a, b| {
+                use ExistentialPredicate as P;
+                use std::cmp::Ordering::{Greater, Less};
+                match (a.skip_binder(), b.skip_binder()) {
+                    (P::Trait(_), P::Trait(_)) => std::cmp::Ordering::Equal,
+                    (P::Trait(_), _) => Less,
+                    (_, P::Trait(_)) => Greater,
+                    (P::Projection(a), P::Projection(b)) => a.def_id.0.cmp(&b.def_id.0),
+                    (P::Projection(_), _) => Less,
+                    (_, P::Projection(_)) => Greater,
+                    (P::AutoTrait(a), P::AutoTrait(b)) => a.0.cmp(&b.0),
+                }
+            });
+        }
+        Ok(BoundExistentialPredicates::new_from_slice(&items))
+    }
+}
 
 blaze_format::record! {
     /// A value of a persisted table: which kind, and where its words start.
@@ -1748,6 +1875,12 @@ impl<'db> Sink<'db> for Children<'_, 'db> {
     fn adt(&mut self, adt: AdtDef) {
         SolverDefId::from(adt.def_id()).put(self);
     }
+
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+        let bits = crate::check_cache::id_bits(id);
+        self.word(bits as u32);
+        self.word((bits >> 32) as u32);
+    }
 }
 
 /// A table [`TyTableWriter`] wrote, read back: every value checked and interned when it is
@@ -1766,7 +1899,7 @@ impl<'a, 'db> TyTableReader<'a, 'db> {
         buffer: &'a [u8],
         at: u64,
     ) -> Result<Self, FormatError> {
-        Self::open_with(buffer, at, |id| AdtDef::new(id, interner))
+        Self::open_with(buffer, at, |id| crate::check_cache::outside(|| AdtDef::new(id, interner)))
     }
 
     /// As [`Self::open`], an ADT made by `adt`.
@@ -1905,6 +2038,13 @@ impl<'db, A: Fn(AdtId) -> AdtDef> Source<'db> for Reading<'_, A> {
         }
     }
 
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
+        let index = self.word()?;
+        let generation = self.word()?;
+        crate::check_cache::id_of(u64::from(index) | (u64::from(generation) << 32))
+            .ok_or_else(|| self.invalid("a salsa id of index 0 or not in the table"))
+    }
+
     fn count(&mut self) -> Result<usize, FormatError> {
         let count = self.word()? as usize;
         match count <= self.words.len() {
@@ -1925,6 +2065,7 @@ mod tests {
     use blaze_format::{Aligned, Writer};
     use hir_def::{CallableDefId, FunctionId, TypeAliasId};
     use rustc_type_ir::{FlagComputation, Flags, INNERMOST, TypeFlags};
+    use salsa::plumbing::FromId;
 
     use super::*;
     use crate::next_solver::TermId;

@@ -22,14 +22,17 @@ pub mod registry;
 pub(crate) mod syntax;
 
 pub(crate) use levels::{LevelMap, may_fire};
-pub(crate) use names::ItemWalk;
+pub(crate) use names::{Effective, EffectiveDef, ItemWalk, def_span};
 pub use levels::{CommandLine, Level};
 pub use self::syntax::CheckCfg;
 
 use blaze_items::{Fact, ItemId};
 use hir::InFile;
 use hir_def::{AdtId, ModuleDefId};
-use ::syntax::{AstNode, SyntaxNode, SyntaxNodePtr, ast, ast::HasName};
+use ::syntax::{
+    SyntaxNodePtr,
+    view::{self as ast, AstNode as _, HasName},
+};
 
 use crate::{
     cx::Cx,
@@ -76,34 +79,37 @@ pub fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, aborted: bo
 /// The item whose body `at` is in, and its name: a function, a const, a static, or the enum
 /// of a discriminant; through a macro's expansion to where it was called.
 pub(crate) fn body_item(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Option<(ItemId, String)> {
-    let mut node: InFile<SyntaxNode> = cx.syntax(at);
+    fn name<'t>(it: impl HasName<'t>) -> Option<String> {
+        // alloc: the item's name, for a diagnostic's fact (every caller is a diagnostic's)
+        it.name().map(|it| it.text().to_owned())
+    }
+    let mut node = cx.syntax_view(at);
     loop {
         for ancestor in node.value.ancestors() {
-            fn name(it: &impl HasName) -> Option<String> {
-                it.name().map(|it| it.text().to_string())
-            }
-            if let Some(it) = ast::Fn::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
+            if let Some(it) = ast::Fn::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
                 let id = hir_def::FunctionId::try_from(def).ok()?;
-                return Some((ItemId::Function(id), name(&it)?));
+                return Some((ItemId::Function(id), name(it)?));
             }
-            if let Some(it) = ast::Const::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
-                return Some((ItemId::Const(def.into()), name(&it).unwrap_or_else(|| "_".to_owned())));
+            if let Some(it) = ast::Const::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
+                // alloc: the name of an unnamed const, as above
+                return Some((ItemId::Const(def.into()), name(it).unwrap_or_else(|| "_".to_owned())));
             }
-            if let Some(it) = ast::Static::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
-                return Some((ItemId::Static(def.into()), name(&it)?));
+            if let Some(it) = ast::Static::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
+                return Some((ItemId::Static(def.into()), name(it)?));
             }
-            if let Some(it) = ast::Variant::cast(ancestor.clone()) {
-                let def = cx.sema.to_def2(node.with_value(&it))?;
+            if let Some(it) = ast::Variant::cast(ancestor) {
+                let def = cx.vsema.to_def2(node.with_value(it))?;
                 let parent = def.parent_enum(cx.db);
+                // alloc: the enum's name, as above
                 let name = parent.name(cx.db).display(cx.db, cx.edition).to_string();
                 return Some((ItemId::Adt(AdtId::EnumId(parent.into())), name));
             }
         }
-        let call = node.file_id.macro_file()?;
-        node = call.loc(cx.db).to_node(cx.db);
+        node.file_id.macro_file()?;
+        node = cx.vsema.find_parent_file(node.file_id)?;
     }
 }
 
@@ -154,6 +160,7 @@ pub(crate) fn quiet_crate(fns: usize) -> String {
 /// go away.
 pub(crate) fn code_fact(cx: &Cx<'_, '_>, diag: &mut Diag, at: InFile<SyntaxNodePtr>) {
     if let Some((item, name)) = body_item(cx, at) {
+        // alloc: the diagnostic's fact
         diag.fact(Fact::Code(cx.key(item)), format!("the code of `{name}`"));
     }
 }

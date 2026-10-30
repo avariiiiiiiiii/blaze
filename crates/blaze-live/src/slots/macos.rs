@@ -27,7 +27,7 @@ use std::{
     },
 };
 
-pub(super) use super::unix::{Reserved, backtrace, descriptor};
+pub(super) use super::unix::{GRAIN, Reserved, backtrace, descriptor};
 use super::{
     Events,
     switch::{Dwarf, Layout, Memory, Writes},

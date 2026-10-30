@@ -195,7 +195,7 @@ impl Layout {
     }
 
     /// Writes every site with what `resolve` gives its target; open names reach their cell.
-    fn apply(&mut self, resolve: &dyn Fn(&Target) -> Option<u64>) -> Result<(), PremapError> {
+    fn apply(&mut self, resolve: &impl Fn(&Target) -> Option<u64>) -> Result<(), PremapError> {
         for site in &self.sites {
             let value = match &site.target {
                 Target::Extern(_) | Target::Weak(_) => self.local(&site.target).map(|it| it.0),

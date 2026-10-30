@@ -29,6 +29,7 @@ A missed rename in C6 would compile and misread (the cursor's `u32()` is 4 fixed
 was a LEB128), so C6 lists every line; every other rename fails to build if missed.
 
 > forwarded to requests-link-next (holds `crates/blaze-link/`) (requests, pass 20; told by tmux).
+> applied by requests (child requests-link-next): C1-C9 applied (children requests-link-next-cursor-eh: C3-C5, requests-link-next-cursor-rest: C1, C2, C6-C9), each answered under its heading; C8 keeps the trie's error words, which `malformed_tries` checks.
 
 ### C1. `position.rs`: `Reader` (the span table's)
 
@@ -95,6 +96,8 @@ Add `use blaze_format::cursor::{Put, Reader};`. Delete `struct Reader` and its `
 ```
 
 Tests unchanged (`a_bad_table_is_refused_not_misread` checks `is_err` only).
+
+> applied by requests (child requests-link-next): as written (`Reader` gone; `encode` on `Put`, `Spans::new` on the cursor with `count_u32`/`str_u32`).
 
 ### C2. `macho/input.rs`: `Cursor`, `linker_option`, the test writers
 
@@ -216,6 +219,8 @@ Tests: delete `fn w16`, `fn w32`, `fn w64`; add `use blaze_format::cursor::Put;`
 every `w16(&mut x, v)` -> `x.put_u16(v)`, `w32(&mut x, v)` -> `x.put_u32(v)`, `w64(&mut x, v)`
 -> `x.put_u64(v)`, and where the first argument is already a `&mut Vec<u8>` (`w32(eh, 16)` in
 the FDE-building closures) `eh.put_u32(16)`. A missed call fails to build.
+
+> applied by requests (child requests-link-next): as written (`Cursor` gone, `skip_pointer`, `linker_option` on `cursor::Reader`, test `w16`/`w32`/`w64` -> `put_u*`). `DW_EH_PE_OMIT` imported from `crate::unwind`, which requests-link-next-cursor-eh made `pub(crate)` on request.
 
 ### C3. core `unwind.rs`: one `.eh_frame` pointer decoder, `split` and the writers on the cursor
 
@@ -348,6 +353,8 @@ and the rest of the loop body as it is, without the final `at = end;`.
 `finish`: `bytes[..4].copy_from_slice(&len.to_le_bytes());` -> `bytes.patch_u32(0, len);`.
 The `split` tests check `is_err` and "no CIE", both kept.
 
+> applied by requests (child requests-link-next): `unwind.rs` holds the one decoder (`cie_encoding`, `pointer_encoding`, `eh_value`, `eh_pointer` on `cursor::Reader`); `split` reads with `Reader`; `fde_into` and `finish` use `put_u32` and `patch_u32`. Differs: `DW_EH_PE_OMIT`, `DW_EH_PE_PCREL` and `pointer_encoding` are private (no caller outside). Same bytes, same accepted inputs; "no CIE" and the split errors kept.
+
 ### C4. `elf/dynamic.rs`: `Cursor` and the writer trait `Put` go (needs C3)
 
 - Delete `pub(crate) trait Put` and `impl Put for Vec<u8>` (`u8`, `u16`, `u32`, `u64`,
@@ -394,6 +401,8 @@ fn entry(bytes: &[u8], at: usize) -> Result<Option<(usize, usize)>, &'static str
 The tests (`fdes` against gimli and `reference`, the split walks, "offset 0x0", "where the core
 placed an FDE") read only `bad`'s and `walk`'s words, which stay.
 
+> applied by requests (child requests-link-next): the `Put` trait, `Cursor`, the decoder copy and the two constants are gone; writer calls are `put_*` in `elf/dynamic.rs` (versym, verneed, gnu_hash, dynamic, note, `build_hdr`) and `elf/image.rs` (`head`); `walk`, `entry` and `cie_at` as written. The `.eh_frame_hdr` patch (`patch_hdr`) reaches the decoder only through `entry` and `walk`, so it needed no edit of its own; the gimli differentials and patch-equals-build tests call unchanged functions.
+
 ### C5. `macho/unwind.rs`: `Reader` goes (needs C3)
 
 - Add `use blaze_format::cursor::{self, Reader};` and
@@ -410,6 +419,8 @@ placed an FDE") read only `bad`'s and `walk`'s words, which stay.
   `reader.value(encoding)` -> `eh_value(&mut reader, encoding)`.
 - `Out` (the `__unwind_info` writer over a slice sized up front, `put` at an offset) stays: it
   writes into exact room, not a `Vec`, which `Put` doesn't do.
+
+> applied by requests (child requests-link-next): `Reader`, `cie_encoding`, `valid`, the constants and the `LebError` import are gone. Differs: the parse moved from `fdes` into `record` (also called by the `Last` patch), whose `bad` takes only the words, so the readers map with `|it| bad(it.as_str())`; only `cursor::Reader` is imported (no `cursor::` path is used). "names no CIE" and "unknown version" kept.
 
 ### C6. `wasm/reader.rs` and its callers: `Reader` goes, wasm's own reads stay as a trait
 
@@ -515,6 +526,8 @@ Check after: `rg -n '\.(u32|u64|i32|i64)\(\)' crates/blaze-link/src/wasm/` finds
 `wasm/leb.rs` writers: `name`'s body -> `out.put_bytes_uleb(name.as_bytes());`; `section`'s ->
 `out.put_u8(id); out.put_bytes_uleb(contents);` (add `use blaze_format::cursor::Put;`).
 
+> applied by requests (child requests-link-next): as written, every call re-found with rg (code.rs, object.rs, module.rs, leb.rs, reader.rs tests); `rg "\.(u32|u64|i32|i64)\(\)" crates/blaze-link/src/wasm/` finds nothing. `wasm/leb.rs` `name`/`section` on `Put`.
+
 ### C7. `stage.rs`: `wasm_imports_in`'s walk
 
 The `(bytes, &mut at)` walk over a wasm code header becomes a `Reader`. Add
@@ -561,6 +574,8 @@ fn wasm_imports_in(code: &[u8]) -> Result<bool, String> {
 ```
 
 The test `the_wasm_header_scan_finds_imports_as_the_decoder_does` is unchanged.
+
+> applied by requests (child requests-link-next): as written (`in_header`, `skip_signature` and `wasm_imports_in` on `Reader`).
 
 ### C8. `macho/dylib.rs`: the export trie's `uleb`/`cstring`, the test writers
 
@@ -623,13 +638,15 @@ The words change from "a ULEB128 at 0x1c runs past the end" to "at byte 28: a LE
 early"-style (`cursor::Error`'s `Display`), the same in both walks. `read_allocation_budget`
 holds: the cursor allocates nothing.
 
+> applied by requests (child requests-link-next): both walks and `export` on `Reader`, `uleb_limits`/`u32le`/`u64le` gone. Differs: the words do not change. `malformed_tries` checks "too long" (an overlong ULEB128), which the cursor would say as "a LEB128 past the bits of its type", so one `trie_error(cursor::Error)` maps LEB and NUL errors back to the old words ("a ULEB128 at {at:#x} is too long" / "runs past the end", "a string at {at:#x} runs past the end"), used by both walks so the differential compares equal.
+
 ### C9. The writers: `macho.rs` `Out`, `pe/image.rs` `Buf`, `symbols.rs` `write_key`
 
 Apply after `requests-link-next-writers`' items in `macho.rs`.
 
 - `macho.rs`: add `use blaze_format::cursor::Put;`. In `impl Out`, delete `u8`, `u16`, `u32`,
-  `u64`; keep `name16` and `align` (Mach-O meaning; the cursor has no padding write, asked of
-  `dedup-cursor` as `Put::pad_to`). Add, after the `impl`:
+  `u64`; keep `name16` (`align` goes too: C10 moves it onto `Put::pad_to`). Add, after the
+  `impl`:
 
 ```rust
 impl std::ops::Deref for Out {
@@ -651,7 +668,7 @@ impl std::ops::DerefMut for Out {
 - `pe/image.rs`: add `use blaze_format::cursor::Put;`. In `impl Buf`, delete `u8`, `u16`, `u32`,
   `u64`, `bytes`; `string`'s body -> `self.0.put_bytes(text.as_bytes()); self.0.put_u8(0);`
   (not `put_cstr`, which panics on a NUL inside; the copy wrote it through); keep
-  `with_capacity`, `string`, `align`, `len`. Add the same `Deref`/`DerefMut` to `Vec<u8>` for
+  `with_capacity`, `string`, `len` (`align` per C10). Add the same `Deref`/`DerefMut` to `Vec<u8>` for
   `Buf`. Every writer call on a `Buf` in `pe/image.rs`, `pe.rs` and `pe/tests.rs` renames as
   above, and `.bytes(b)` -> `.put_bytes(b)` (with `use blaze_format::cursor::Put;` in
   `pe/tests.rs` and `pe.rs` where they call them). `Buf::len` (a `u64`) shadows `Vec::len` as
@@ -659,6 +676,8 @@ impl std::ops::DerefMut for Out {
 - `symbols.rs` `write_key`: the closures `name` and `word` go; add
   `use blaze_format::cursor::Put;`; `name(out, a)` -> `out.put_bytes_u64(self.str(a).as_bytes())`,
   `word(out, x)` -> `out.put_u32(x)` (same bytes: a `u64` length, then the name; a `u32`).
+
+> applied by requests (child requests-link-next): `Out` and `Buf` deref to `Vec<u8>` with their `u*`/`bytes` copies gone (79 calls in macho.rs, 90 + 7 in pe/image.rs, 48 + 11 in pe/tests.rs; pe.rs has none); `write_key` on `Put` (coverage keys kept, same bytes). Also: `macho/chained.rs` `fixups` (new since the request) drops its `put32` closure for `put_u16`/`put_u32`/`put_u64`/`patch_u32`, and `__LINKEDIT`s 8-byte padding in `append` is `pad_to(8)`.
 
 ### Kept on purpose (no change)
 
@@ -692,3 +711,5 @@ the body all three writers' `align` had. With C9's `Deref`/`DerefMut` to `Vec<u8
 Same bytes. A missed `.align(` on an `Out` or `Buf` fails to build.
 
 > forwarded to requests-link-next (requests, pass 21; told by tmux).
+> applied by requests (child requests-link-next) for `elf/dynamic.rs`: its `Put` with `align` (no caller) went with C4; nothing more there. The `macho.rs` and `pe` parts belong to `requests-link-next-cursor-rest`.
+> applied by requests (child requests-link-next): macho.rs and pe parts: `Out::align`/`Buf::align` gone, `linkedit`/`strings`/`out`/`buf` `.align(n)` -> `.pad_to(n)` (2 in macho.rs, 2 in pe/image.rs, 4 in pe/tests.rs). The elf part is requests-link-next-cursor-eh's.

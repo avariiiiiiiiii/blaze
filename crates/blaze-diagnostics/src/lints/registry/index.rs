@@ -275,26 +275,12 @@ impl Joined {
     }
 }
 
-const fn same(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
 /// The index of the lint named `name` among the first `end` of [`LINT_NAMES`], by a scan: for
 /// the tables built here and the named [`LintId`]s, at compile time.
 pub(super) const fn scan(name: &str, end: usize) -> Option<usize> {
     let mut at = 0;
     while at < end {
-        if same(LINT_NAMES[at].as_bytes(), name.as_bytes()) {
+        if blaze_phf::bytes_eq(LINT_NAMES[at].as_bytes(), name.as_bytes()) {
             return Some(at);
         }
         at += 1;
@@ -369,7 +355,7 @@ const TOOLS: ([(u16, u8); MOST_TOOLS], usize) = {
             while t < count {
                 let (first, first_len) = tools[t];
                 let (other, _) = LINT_NAMES[first as usize].as_bytes().split_at(first_len as usize);
-                known = known || same(name, other);
+                known = known || blaze_phf::bytes_eq(name, other);
                 t += 1;
             }
             if !known {

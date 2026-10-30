@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use blaze_manifest::metadata::{export_no_deps, root_manifest};
 use blaze_manifest::{Config, Context, Workspace};
+use blaze_manifest::files::Disk;
 
 use super::args::{Args, Read, switch, valued};
 
@@ -14,7 +15,7 @@ use super::args::{Args, Read, switch, valued};
 pub const USAGE: i32 = 1;
 
 /// The configuration of a `cargo <command>` run in this process, with its `--config`s.
-pub fn config(command: &str, read: &Read) -> anyhow::Result<Config> {
+pub fn config(command: &str, read: &Read) -> anyhow::Result<Config<Disk>> {
     let mut config = Config::from_process()?;
     config.start(command, &read.values("--config"))?;
     Ok(config)
@@ -143,7 +144,6 @@ fn resolved(read: &Read, manifest_path: Option<&Path>) -> anyhow::Result<String>
         build: None,
         platform,
         offline: read.has("--offline") || read.has("--frozen"),
-        store: None,
         rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     blaze_metadata::metadata(&asked)
@@ -295,7 +295,6 @@ pub fn pkgid(args: Args<'_>) -> anyhow::Result<i32> {
             build: None,
             platform: None,
             offline: true,
-            store: None,
             rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let locked = blaze_metadata::locked(&asked)?;
@@ -350,7 +349,6 @@ pub fn fetch(args: Args<'_>) -> anyhow::Result<i32> {
             build: None,
             platform: None,
             offline: read.has("--offline") || read.has("--frozen"),
-            store: None,
             rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         blaze_metadata::fetch_locked(&asked)?.context(

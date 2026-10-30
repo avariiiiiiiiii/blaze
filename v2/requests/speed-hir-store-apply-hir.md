@@ -21,3 +21,4 @@ walk, hir-ty-borrowck, hir-ty-codegen, blaze-items form.rs) are a different type
 as are the `Sym(_)` arms in hir-ide, hir-ty-unsafeck, blaze-diagnostics unsafety.
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> mem-format-fwd: information, nothing to apply in `hir*` (`hir.rs` has `Sym(PathIdx)`). Already in at all three readers: `hir-ty-mir/src/mir/lower.rs` ~L881 (`self.store.path_at(*path)`), `hir-ty/src/infer/expr.rs` ~L935 (`self.infer_path(self.store.path_at(path), ..)`), `blaze-diagnostics/.../dead/mark/body.rs` L162 (`store.path_at(*path)`).

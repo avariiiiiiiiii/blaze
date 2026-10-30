@@ -16,8 +16,9 @@ pub trait Tree: Send + Sync {
     /// bytes are a range of the mapped image that fails its check is `Err`, naming the
     /// image's section and group: never `None`, which would be a file that is not there.
     fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt>;
-    /// The names in the directory at `path` (`""` for the root), sorted, each with whether it
-    /// is a directory; `None` for none or a file.
+    /// The names in the directory at `path` (`""` for the root), each with whether it is a
+    /// directory; `None` for none or a file. In any order: the database sorts a listing by
+    /// name once, when a view first reads it (already-sorted listings are only checked).
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>>;
 }
 
@@ -32,10 +33,8 @@ impl Tree for blaze_vfs::Reader {
     }
 
     fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
-        let names = blaze_vfs::Reader::list(self, root, path)?;
-        // The trait's owned listing, once per directory per view (v2/requests/vfs.md item 8).
-        // alloc: see above.
-        Some(names.map(|(name, dir)| (name.to_owned(), dir)).collect())
+        // alloc: the reader's owned listing, collected in place, once per directory per view.
+        blaze_vfs::Reader::list(self, root, path).map(Iterator::collect)
     }
 }
 

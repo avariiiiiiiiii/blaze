@@ -17,7 +17,7 @@
 
 pub(crate) mod table;
 
-use syntax::{NodeOrToken, SyntaxKind, SyntaxToken, T, TextRange, ast};
+use syntax::{NodeOrToken, SyntaxKind, T, TextRange, view as ast};
 
 use super::{Args, Attr, Owner, Target};
 use crate::{
@@ -35,13 +35,14 @@ const HAS_MIN_FEATURES: &[&str] = &["specialization"];
 
 /// A feature `#[feature(..)]` names: its name and where it is written in the attribute's file.
 pub(crate) struct Named<'a> {
-    pub(crate) attr: &'a Attr,
-    pub(crate) name: String,
+    pub(crate) attr: &'a Attr<'a>,
+    pub(crate) name: &'a str,
     pub(crate) range: TextRange,
 }
 
 /// The feature lints of the crate.
-pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<Emitted> {
+pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner<'_>]) -> Vec<Emitted> {
+    // alloc: empty, allocates nothing until a lint
     let mut emitted = Vec::new();
     if let Some(krate) = owners.iter().find(|it| it.target == Target::Crate) {
         incomplete_or_internal(cx, krate, &mut emitted);
@@ -58,29 +59,34 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<
 
 /// `IncompleteInternalFeatures::check_crate`: each feature the crate enables that is
 /// incomplete or internal, the language ones first, each in the order written.
-fn incomplete_or_internal(cx: &Cx<'_, '_>, krate: &Owner, emitted: &mut Vec<Emitted>) {
-    let enabled: Vec<Named<'_>> = named(krate).filter(|it| table::removed(&it.name).is_none()).collect();
+fn incomplete_or_internal(cx: &Cx<'_, '_>, krate: &Owner<'_>, emitted: &mut Vec<Emitted>) {
+    // alloc: setup, once per crate: the features of its root
+    let enabled: Vec<Named<'_>> = named(krate).filter(|it| table::removed(it.name).is_none()).collect();
     let (lang, lib): (Vec<&Named<'_>>, Vec<&Named<'_>>) =
-        enabled.iter().partition(|it| table::is_lang(&it.name));
+        enabled.iter().partition(|it| table::is_lang(it.name));
     for feature in lang.into_iter().chain(lib) {
-        let name = feature.name.as_str();
+        let name = feature.name;
         let span = cx.span(feature.attr.in_file(feature.range));
         let mut diag = if table::incomplete(name) {
             let mut diag = Diag::lint(
                 "incomplete_features",
+                // alloc: the diagnostic's text, as is each below
                 format!("the feature `{name}` is incomplete and may not be safe to use and/or cause compiler crashes"),
                 span,
             );
             if let Some(n) = table::issue(name) {
+                // alloc: as above
                 diag.note(format!("see issue #{n} <https://github.com/rust-lang/rust/issues/{n}> for more information"));
             }
             if HAS_MIN_FEATURES.contains(&name) {
+                // alloc: as above
                 diag.help(format!("consider using `min_{name}` instead, which is more stable and complete"));
             }
             diag
         } else if table::internal(name) {
             let mut diag = Diag::lint(
                 "internal_features",
+                // alloc: as above
                 format!("the feature `{name}` is internal to the compiler or standard library"),
                 span,
             );
@@ -96,7 +102,7 @@ fn incomplete_or_internal(cx: &Cx<'_, '_>, krate: &Owner, emitted: &mut Vec<Emit
 
 /// `UnstableFeatures::check_attributes`: each feature `owner`'s `#[feature(..)]`s name, a
 /// removed one included.
-fn unstable(cx: &Cx<'_, '_>, owner: &Owner, emitted: &mut Vec<Emitted>) {
+fn unstable(cx: &Cx<'_, '_>, owner: &Owner<'_>, emitted: &mut Vec<Emitted>) {
     for feature in named(owner) {
         let span = cx.span(feature.attr.in_file(feature.range));
         let mut diag = Diag::lint("unstable_features", "use of an unstable feature", span);
@@ -107,15 +113,17 @@ fn unstable(cx: &Cx<'_, '_>, owner: &Owner, emitted: &mut Vec<Emitted>) {
 
 /// The features `owner`'s `#[feature(..)]`s name, in order: rustc's `FeatureParser` combines
 /// them into one list.
-pub(crate) fn named(owner: &Owner) -> impl Iterator<Item = Named<'_>> {
+pub(crate) fn named<'a>(owner: &'a Owner<'a>) -> impl Iterator<Item = Named<'a>> {
     owner.attrs.iter().filter(|it| is_feature(it)).flat_map(|attr| {
+        // alloc: empty, allocates nothing
         let Args::List(list) = attr.args() else { return Vec::new() };
-        features(&list).into_iter().map(|(name, range)| Named { attr, name, range }).collect()
+        // alloc: setup, the features of a `#[feature(..)]`, read once per check that asks
+        features(list).into_iter().map(|(name, range)| Named { attr, name, range }).collect()
     })
 }
 
 /// Whether `attr` is `#[feature..]`.
-fn is_feature(attr: &Attr) -> bool {
+fn is_feature(attr: &Attr<'_>) -> bool {
     attr.meta()
         .and_then(|it| it.path())
         .and_then(|it| it.as_single_name_ref())
@@ -125,14 +133,17 @@ fn is_feature(attr: &Attr) -> bool {
 /// The features a `feature(..)` list names, as rustc's `FeatureParser::extend` takes them: each
 /// item that is a single identifier with no arguments. A list in other delimiters, or one that
 /// is not a list of meta items, rustc does not parse: it names none.
-fn features(list: &ast::TokenTree) -> Vec<(String, TextRange)> {
+fn features(list: ast::TokenTree<'_>) -> Vec<(&str, TextRange)> {
     if list.left_delimiter_token().is_none_or(|it| it.kind() != T!['(']) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
-    let mut items: Vec<Vec<NodeOrToken<ast::TokenTree, SyntaxToken>>> = Vec::new();
+    // alloc: setup, as `named`: a `#[feature(..)]`'s items
+    let mut items: Vec<Vec<NodeOrToken<ast::TokenTree<'_>, ast::Token<'_>>>> = Vec::new();
+    // alloc: as above
     let mut item = Vec::new();
     for it in list.token_trees_and_tokens() {
-        match &it {
+        match it {
             NodeOrToken::Token(token) if token.kind().is_trivia() || is_delimiter(list, token) => {}
             NodeOrToken::Token(token) if token.kind() == T![,] => items.push(std::mem::take(&mut item)),
             _ => item.push(it),
@@ -143,6 +154,7 @@ fn features(list: &ast::TokenTree) -> Vec<(String, TextRange)> {
         items.pop();
     }
     if !items.iter().all(|it| is_meta_item(it)) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     items
@@ -150,26 +162,28 @@ fn features(list: &ast::TokenTree) -> Vec<(String, TextRange)> {
         .filter_map(|item| match item.as_slice() {
             [NodeOrToken::Token(token)] if is_ident(token.kind()) => {
                 let text = token.text();
-                Some((text.strip_prefix("r#").unwrap_or(text).to_owned(), token.text_range()))
+                // alloc: as above, a feature's name
+                Some((text.strip_prefix("r#").unwrap_or(text), token.text_range()))
             }
             _ => None,
         })
+        // alloc: as above
         .collect()
 }
 
 /// Whether `token` is one of the delimiters of `list` itself, not a token in it.
-fn is_delimiter(list: &ast::TokenTree, token: &SyntaxToken) -> bool {
-    list.left_delimiter_token().as_ref() == Some(token) || list.right_delimiter_token().as_ref() == Some(token)
+fn is_delimiter(list: ast::TokenTree<'_>, token: ast::Token<'_>) -> bool {
+    list.left_delimiter_token() == Some(token) || list.right_delimiter_token() == Some(token)
 }
 
 /// Whether rustc parses `item` as an item of a meta item list: a literal, or a path with no
 /// arguments, a delimited list of them, or `= value`.
-fn is_meta_item(item: &[NodeOrToken<ast::TokenTree, SyntaxToken>]) -> bool {
+fn is_meta_item(item: &[NodeOrToken<ast::TokenTree<'_>, ast::Token<'_>>]) -> bool {
     match item {
         [] => false,
         [NodeOrToken::Token(token)] if token.kind().is_literal() || matches!(token.kind(), T![true] | T![false]) => true,
         _ => {
-            let is_path = |it: &&NodeOrToken<ast::TokenTree, SyntaxToken>| {
+            let is_path = |it: &&NodeOrToken<ast::TokenTree<'_>, ast::Token<'_>>| {
                 matches!(it, NodeOrToken::Token(it) if is_ident(it.kind()) || matches!(it.kind(), T![:] | T![::]))
             };
             let path = item.iter().take_while(is_path).count();

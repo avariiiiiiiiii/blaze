@@ -15,7 +15,7 @@ use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 
 use super::code::{self, Parts, Sig};
-use super::reader::{self, Reader};
+use super::reader::{self, Reader, Wasm};
 use super::reloc::{self, Kind};
 use crate::model::{
     Apply, Archive, Binding, Class, Data, Group, Member, Name, Names, NativeFile, NativeFixup, Object,
@@ -234,7 +234,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                 id::CUSTOM => {
                     let name = r.name()?;
                     let payload = at + r.at()..section.range().end;
-                    let contents = r.rest();
+                    let contents = r.take_rest();
                     if name == "linking" {
                         parsed.linking = Some(contents);
                     } else if name.starts_with("reloc.") {
@@ -259,7 +259,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                         let module = r.name()?;
                         let field = r.name()?;
                         match r.u8()? {
-                            0 => parsed.imported.push(Imported { module, field, ty: r.u32()? }),
+                            0 => parsed.imported.push(Imported { module, field, ty: r.uleb32()? }),
                             1 => {
                                 r.u8()?;
                                 limits(&mut r)?;
@@ -287,7 +287,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                     let count = r.count()?;
                     parsed.functions.reserve_exact(count);
                     for _ in 0..count {
-                        parsed.functions.push(r.u32()?);
+                        parsed.functions.push(r.uleb32()?);
                     }
                 }
                 id::EXPORT => {
@@ -295,7 +295,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                     parsed.exports.reserve_exact(count);
                     for _ in 0..count {
                         let name = r.name()?;
-                        match (r.u8()?, r.u32()?) {
+                        match (r.u8()?, r.uleb32()?) {
                             (0, function) => {
                                 parsed.exports.push((function, name));
                             }
@@ -314,9 +314,9 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                     let count = r.count()?;
                     parsed.bodies.reserve_exact(count);
                     for _ in 0..count {
-                        let len = r.u32()? as usize;
+                        let len = r.uleb32()? as usize;
                         let start = at + r.at();
-                        r.bytes(len)?;
+                        r.take(len)?;
                         parsed.bodies.push(start..start + len);
                     }
                 }
@@ -325,13 +325,13 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                     let count = r.count()?;
                     parsed.segments.reserve_exact(count);
                     for _ in 0..count {
-                        match r.u32()? {
+                        match r.uleb32()? {
                             0 => {}
                             1 => {
                                 // alloc: error path
                                 return Err("a passive data segment (shared memory)".to_owned());
                             }
-                            2 => match r.u32()? {
+                            2 => match r.uleb32()? {
                                 0 => {}
                                 memory => {
                                     // alloc: error path
@@ -342,14 +342,14 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                             flags => return Err(format!("a data segment of flags {flags}")),
                         }
                         r.i32_const()?;
-                        let len = r.u32()? as usize;
+                        let len = r.uleb32()? as usize;
                         let start = at + r.at();
-                        r.bytes(len)?;
+                        r.take(len)?;
                         parsed.segments.push(start..start + len);
                     }
                 }
                 id::DATA_COUNT => {
-                    r.u32()?;
+                    r.uleb32()?;
                 }
                 id::TABLE | id::MEMORY | id::GLOBAL | id::START | id::ELEMENT | id::TAG => {
                     // alloc: error path
@@ -369,7 +369,7 @@ fn parse(bytes: &[u8]) -> Result<Parsed<'_>, String> {
                 // alloc: error path
                 other => return Err(format!("a section of the unknown id {other}")),
             }
-            if !r.done() {
+            if !r.is_done() {
                 // alloc: error path
                 return Err("bytes after its contents".to_owned());
             }
@@ -406,9 +406,9 @@ fn limits(r: &mut Reader<'_>) -> Result<(), String> {
         // alloc: error path
         return Err(format!("limits of flags {flags:#x}"));
     }
-    r.u64()?;
+    r.uleb()?;
     if flags & 1 != 0 {
-        r.u64()?;
+        r.uleb()?;
     }
     Ok(())
 }
@@ -444,24 +444,24 @@ struct Linking<'a> {
 
 fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
     let mut r = Reader::new(contents);
-    match r.u32()? {
+    match r.uleb32()? {
         LINKING_VERSION => {}
         // alloc: error path
         version => return Err(format!("a linking section of version {version}")),
     }
     let mut linking = Linking::default();
-    while !r.done() {
+    while !r.is_done() {
         let id = r.u8()?;
-        let len = r.u32()? as usize;
-        let mut s = Reader::new(r.bytes(len)?);
+        let len = r.uleb32()? as usize;
+        let mut s = Reader::new(r.take(len)?);
         match id {
             SEGMENT_INFO => {
                 let count = s.count()?;
                 linking.segments.reserve_exact(count);
                 for _ in 0..count {
                     let name = s.name()?;
-                    let align = s.u32()?;
-                    let flags = s.u32()?;
+                    let align = s.uleb32()?;
+                    let flags = s.uleb32()?;
                     linking.segments.push(SegmentInfo { name, align, flags });
                 }
             }
@@ -469,8 +469,8 @@ fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
                 let count = s.count()?;
                 linking.inits.reserve_exact(count);
                 for _ in 0..count {
-                    let priority = s.u32()?;
-                    linking.inits.push((priority, s.u32()?));
+                    let priority = s.uleb32()?;
+                    linking.inits.push((priority, s.uleb32()?));
                 }
             }
             COMDAT_INFO => {
@@ -480,7 +480,7 @@ fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
                 linking.comdat_entries.reserve(len / 2);
                 for _ in 0..count {
                     let name = s.name()?;
-                    match s.u32()? {
+                    match s.uleb32()? {
                         0 => {}
                         // alloc: error path
                         flags => return Err(format!("the COMDAT `{name}` of flags {flags}")),
@@ -488,7 +488,7 @@ fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
                     let start = linking.comdat_entries.len() as u32;
                     for _ in 0..s.count()? {
                         let kind = s.u8()?;
-                        linking.comdat_entries.push((kind, s.u32()?));
+                        linking.comdat_entries.push((kind, s.uleb32()?));
                     }
                     linking.comdats.push((name, start..linking.comdat_entries.len() as u32));
                 }
@@ -503,7 +503,7 @@ fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
             // alloc: error path
             other => return Err(format!("the linking subsection {other}")),
         }
-        if !s.done() {
+        if !s.is_done() {
             // alloc: error path
             return Err(format!("bytes after the linking subsection {id}"));
         }
@@ -513,11 +513,11 @@ fn linking<'a>(contents: &'a [u8]) -> Result<Linking<'a>, String> {
 
 fn symbol<'a>(r: &mut Reader<'a>) -> Result<WasmSymbol<'a>, String> {
     let kind = r.u8()?;
-    let flags = r.u32()?;
+    let flags = r.uleb32()?;
     let mut symbol = WasmSymbol { kind, flags, index: 0, name: None, data: None };
     match kind {
         SYM_FUNCTION | SYM_GLOBAL | SYM_TAG | SYM_TABLE => {
-            symbol.index = r.u32()?;
+            symbol.index = r.uleb32()?;
             if flags & UNDEFINED == 0 || flags & EXPLICIT_NAME != 0 {
                 symbol.name = Some(r.name()?);
             }
@@ -525,12 +525,12 @@ fn symbol<'a>(r: &mut Reader<'a>) -> Result<WasmSymbol<'a>, String> {
         SYM_DATA => {
             symbol.name = Some(r.name()?);
             if flags & UNDEFINED == 0 {
-                let segment = r.u32()?;
-                let offset = r.u64()?;
-                symbol.data = Some((segment, offset, r.u64()?));
+                let segment = r.uleb32()?;
+                let offset = r.uleb()?;
+                symbol.data = Some((segment, offset, r.uleb()?));
             }
         }
-        SYM_SECTION => symbol.index = r.u32()?,
+        SYM_SECTION => symbol.index = r.uleb32()?,
         // alloc: error path
         other => return Err(format!("a symbol of the unknown kind {other}")),
     }
@@ -559,7 +559,7 @@ struct FunctionNames<'a> {
 
 /// A relocation section's header: the section it is of and how many relocations it holds.
 fn relocs_header(r: &mut Reader<'_>) -> Result<(usize, usize), String> {
-    Ok((r.u32()? as usize, r.count()?))
+    Ok((r.uleb32()? as usize, r.count()?))
 }
 
 /// Appends a relocation section's relocations to `out` (which has room for them) and says
@@ -568,13 +568,13 @@ fn relocs(contents: &[u8], out: &mut Vec<Reloc>) -> Result<usize, String> {
     let mut r = Reader::new(contents);
     let (section, count) = relocs_header(&mut r)?;
     for _ in 0..count {
-        let r_type = r.u32()?;
-        let offset = r.u32()? as usize;
-        let index = r.u32()?;
-        let addend = if reloc::has_addend(r_type) { r.i64()? } else { 0 };
+        let r_type = r.uleb32()?;
+        let offset = r.uleb32()? as usize;
+        let index = r.uleb32()?;
+        let addend = if reloc::has_addend(r_type) { r.sleb()? } else { 0 };
         out.push(Reloc { r_type, offset, index, addend });
     }
-    if !r.done() {
+    if !r.is_done() {
         // alloc: error path
         return Err("bytes after the relocations".to_owned());
     }

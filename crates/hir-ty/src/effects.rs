@@ -16,7 +16,7 @@ use hir_def::{
     signatures::{FnFlags, FunctionSignature, ImplSignature, TraitFlags, TraitSignature},
 };
 use rustc_type_ir::{BoundConstness, ClauseKind, TypeVisitableExt, TypingMode, inherent::IntoKind};
-use syntax::ast;
+use syntax::view as ast;
 
 use crate::{
     InferenceResult, ParamEnvAndCrate,
@@ -80,8 +80,7 @@ fn closure_expr_is_const(
 ) -> bool {
     let (_, source_map) = ExpressionStore::with_source_map(db, owner);
     let Ok(source) = source_map.expr_syntax(expr) else { return false };
-    let root = source.file_id.parse_or_expand(db);
-    match source.value.to_node(&root) {
+    match source.value.to_view(source.file_id.root(db)) {
         Either::Left(ast::Expr::ClosureExpr(closure)) => closure.const_token().is_some(),
         _ => false,
     }
@@ -123,10 +122,11 @@ pub(crate) fn builtin_derive_const_conditions<'db>(
     impl_: hir_def::BuiltinDeriveImplId,
 ) -> Vec<Binder<'db, TraitRef<'db>>> {
     if !impl_is_const(db, impl_.into()) {
-        return Vec::new();
+        return Vec::new(); // alloc: empty
     }
     let loc = impl_.loc(db);
     let interner = DbInterner::new_with(db, loc.module(db).krate(db));
+    // alloc: empty
     let Some(trait_) = loc.trait_.get_id(interner.lang_items()) else { return Vec::new() };
     crate::builtin_derive::predicates(db, impl_)
         .all_predicates()
@@ -141,6 +141,7 @@ pub(crate) fn builtin_derive_const_conditions<'db>(
                 _ => None,
             }
         })
+        // alloc: only `#[derive_const]` impls, a nightly feature; the solver takes a `Vec`
         .collect()
 }
 
@@ -163,7 +164,7 @@ pub fn const_param_env<'db>(db: &'db Db, def: GenericDefId) -> ParamEnvAndCrate<
     ParamEnvAndCrate { param_env: ParamEnv { clauses }, krate }
 }
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
 fn const_param_env_query(db: &Db, def: GenericDefId) -> StoredClauses {
     let interner = DbInterner::new_with(db, def.module(db).krate(db));
     let env = crate::lower::trait_environment(db, def);
@@ -239,7 +240,7 @@ pub fn const_call_error<'db>(
         );
         !infcx.predicate_must_hold_modulo_regions(&obligation)
     })
-    .collect();
+    .collect(); // alloc: error path, empty (no allocation) unless a bound does not hold
     (!unsatisfied.is_empty()).then_some(NonConst::Unsatisfied(callee, unsatisfied))
 }
 
@@ -249,7 +250,7 @@ pub fn non_const_calls<'db>(
     db: &'db Db,
     def: DefWithBodyId,
 ) -> Vec<(ExprId, NonConst<'db>)> {
-    let Some(constness) = body_constness(db, def) else { return Vec::new() };
+    let Some(constness) = body_constness(db, def) else { return Vec::new() }; // alloc: empty
     let mut walk = Walk {
         db,
         owner: def.into(),
@@ -257,7 +258,7 @@ pub fn non_const_calls<'db>(
         infer: InferenceResult::of(db, def),
         env: const_param_env(db, def.generic_def(db)),
         constness,
-        found: Vec::new(),
+        found: Vec::new(), // alloc: error path, pushed only for a call that is not const
     };
     walk.expr(walk.body.root_expr());
     walk.found

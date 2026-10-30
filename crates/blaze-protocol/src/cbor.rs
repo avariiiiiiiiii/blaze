@@ -16,9 +16,11 @@
 //! [`from_slice`] refuses bytes that are not one item in this encoding, naming the first
 //! offence and where (as [`check`] does), rather than read an encoding the writer should not
 //! have sent. It reads them once, checking as it goes, and borrows text and byte strings from
-//! them for a type that borrows. [`append`] and a kept [`Writer`] write onto the end of a
-//! buffer the caller reuses, each item in place.
+//! them for a type that borrows; [`Raw`] and [`List`] read an item, or an array's items, where
+//! they lie. [`append`] and a kept [`Writer`] write onto the end of a buffer the caller reuses,
+//! each item in place.
 
+mod borrowed;
 mod check;
 mod de;
 #[cfg(any(test, feature = "reference"))]
@@ -28,9 +30,14 @@ mod ser;
 #[cfg(test)]
 mod tests;
 
+pub use borrowed::{Iter, List, Raw};
 pub use check::check;
 pub use de::from_slice;
 pub use ser::{Writer, append, to_vec};
+
+/// The name [`Raw`] is read under as a newtype struct: the decoders hand it its item's bytes,
+/// checked and passed over, rather than the item.
+const RAW: &str = "$blaze_protocol::cbor::Raw";
 
 use std::{cmp::Ordering, fmt};
 

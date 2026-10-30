@@ -9,6 +9,7 @@ use std::sync::Arc as StdArc;
 
 use base_db::{Db, Crate};
 use blaze_format::cursor::{Put, Reader};
+use blaze_mem::Frame;
 use hir_def::{
     ModuleDefId,
     nameres::frozen::{Dec, Enc, Frozen, Mode, record_difference},
@@ -16,7 +17,7 @@ use hir_def::{
 use rustc_hash::FxHashMap;
 use rustc_type_ir::{FloatTy, IntTy, Mutability, UintTy, fast_reject::SimplifiedType as S};
 
-use super::{InherentImpls, OneTraitImplsBuilder, SelfTyGroups, TraitImpls};
+use super::{InherentImpls, InherentImplsBuilder, TraitImpls, TraitImplsBuilder};
 use crate::{
     db::HirDatabase,
     next_solver::{SimplifiedType, SolverDefId},
@@ -77,48 +78,46 @@ fn read<'db, T>(
     Some(read().unwrap_or_else(|why| panic!("frozen impls do not read: {why}")))
 }
 
-pub(super) fn trait_impls<'db>(db: &'db Db, krate: Crate) -> Option<TraitImpls<'db>> {
+pub(super) fn trait_impls<'db>(
+    db: &'db Db,
+    frame: &Frame,
+    krate: Crate,
+) -> Option<TraitImpls<'db>> {
     read(db, krate, 0, |dec| {
         let n = dec.len()?;
-        let mut map = FxHashMap::default();
-        map.reserve(n);
+        let mut builder = TraitImplsBuilder::new(frame);
         for _ in 0..n {
             let ModuleDefId::TraitId(trait_) = dec.def()? else {
+                // alloc: the error on corrupt bytes.
                 return Err("impls of no trait".to_owned());
             };
-            let entries = dec.many(|dec| {
-                let self_ty = read_simplified(dec)?;
-                let impls = dec.many(|dec| dec.impl_id())?;
-                let derived = dec.many(|dec| dec.builtin_derive_impl())?;
-                Ok((self_ty, (impls, derived)))
+            let t = builder.trait_(trait_);
+            // `many` of `()` allocates nothing: each id goes straight into the builder.
+            dec.many(|dec| {
+                let row = builder.row(t, read_simplified(dec)?);
+                dec.many(|dec| Ok(builder.push_impl(row, dec.impl_id()?)))?;
+                dec.many(|dec| Ok(builder.push_derive(row, dec.builtin_derive_impl()?)))?;
+                Ok(())
             })?;
-            let mut one = OneTraitImplsBuilder::default();
-            for (self_ty, (impls, derived)) in entries {
-                let entry = one.non_blanket_impls.entry(self_ty);
-                entry.0.extend(impls);
-                entry.1.extend(derived);
-            }
-            one.blanket_impls = dec.many(|dec| dec.impl_id())?;
-            map.insert(trait_, one);
+            dec.many(|dec| Ok(builder.push_blanket(t, dec.impl_id()?)))?;
         }
-        Ok(TraitImpls::from_traits(map))
+        Ok(builder.finish())
     })
 }
 
 pub(super) fn inherent_impls<'db>(
     db: &'db Db,
+    frame: &Frame,
     krate: Crate,
 ) -> Option<InherentImpls<'db>> {
     read(db, krate, 1, |dec| {
-        let entries = dec.many(|dec| {
-            let self_ty = read_simplified(dec)?;
-            Ok((self_ty, dec.many(|dec| dec.impl_id())?))
+        let mut builder = InherentImplsBuilder::new(frame);
+        dec.many(|dec| {
+            let group = builder.group(read_simplified(dec)?);
+            dec.many(|dec| Ok(builder.push(group, dec.impl_id()?)))?;
+            Ok(())
         })?;
-        let mut groups = SelfTyGroups::default();
-        for (self_ty, impls) in entries {
-            groups.entry(self_ty).extend(impls);
-        }
-        Ok(InherentImpls::from_groups(groups))
+        Ok(builder.finish())
     })
 }
 

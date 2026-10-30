@@ -117,6 +117,13 @@ pub(crate) struct Options<A: AllowedOptions> {
     /// functions. This is merely used to refine the query name.
     pub self_ty: Option<syn::Type>,
 
+    /// The `mem_tag = <Tag>` option sets the `blaze_mem::Tag` a tracked function's runs count
+    /// against.
+    ///
+    /// If this is `Some`, the value is the tag: a `blaze_mem::Tag` variant's name, or a path to
+    /// a `Tag` constant.
+    pub mem_tag: Option<syn::Path>,
+
     /// Remember the `A` parameter, which plays no role after parsing.
     phantom: PhantomData<A>,
 }
@@ -158,6 +165,7 @@ impl<A: AllowedOptions> Default for Options<A> {
             revisions: Default::default(),
             heap_size_fn: Default::default(),
             self_ty: Default::default(),
+            mem_tag: Default::default(),
             persist: Default::default(),
         }
     }
@@ -183,6 +191,7 @@ pub(crate) trait AllowedOptions {
     const REVISIONS: bool;
     const HEAP_SIZE: bool;
     const SELF_TY: bool;
+    const MEM_TAG: bool;
     const PERSIST: AllowedPersistOptions;
 }
 
@@ -529,6 +538,22 @@ impl<A: AllowedOptions> syn::parse::Parse for Options<A> {
                         "`self_ty` option not allowed here",
                     ));
                 }
+            } else if ident == "mem_tag" {
+                if A::MEM_TAG {
+                    let _eq = Equals::parse(input)?;
+                    let tag = syn::Path::parse_mod_style(input)?;
+                    if let Some(old) = options.mem_tag.replace(tag) {
+                        return Err(syn::Error::new(
+                            old.segments[0].ident.span(),
+                            "option `mem_tag` provided twice",
+                        ));
+                    }
+                } else {
+                    return Err(syn::Error::new(
+                        ident.span(),
+                        "`mem_tag` option not allowed here",
+                    ));
+                }
             } else {
                 return Err(syn::Error::new(
                     ident.span(),
@@ -602,6 +627,7 @@ impl<A: AllowedOptions> quote::ToTokens for Options<A> {
             revisions,
             heap_size_fn,
             self_ty,
+            mem_tag,
             persist,
             phantom: _,
         } = self;
@@ -658,6 +684,9 @@ impl<A: AllowedOptions> quote::ToTokens for Options<A> {
         }
         if let Some(self_ty) = self_ty {
             tokens.extend(quote::quote! { self_ty = #self_ty, });
+        }
+        if let Some(mem_tag) = mem_tag {
+            tokens.extend(quote::quote! { mem_tag = #mem_tag, });
         }
         if let Some(persist) = persist {
             let mut args = proc_macro2::TokenStream::new();

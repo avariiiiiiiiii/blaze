@@ -14,6 +14,8 @@
 //! namespace the path is resolved in. Records are in the order collection and the walk made
 //! them, never sorted by salsa id, so they are the same bytes in every run.
 
+use std::alloc::Allocator;
+
 use base_db::{Db, Crate};
 use hir_expand::{
     HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefId,
@@ -163,7 +165,7 @@ impl DefMap {
         subns: Option<MacroSubNs>,
         ns: Option<Namespace>,
         around: bool,
-        out: &mut Vec<Use>,
+        out: &mut Vec<Use, impl Allocator>,
     ) {
         let (_, db, mode) = q;
         let segments = path.segments();
@@ -215,7 +217,7 @@ impl DefMap {
         ns: Namespace,
         subns: Option<MacroSubNs>,
         around: bool,
-        out: &mut Vec<Use>,
+        out: &mut Vec<Use, impl Allocator>,
     ) {
         let q = (local_def_map, db, ResolveMode::Other);
         let shadow = BuiltinShadowMode::Other;
@@ -473,7 +475,7 @@ pub(crate) fn trait_uses(
         out.push(Use { import, name, ns: Namespace::Types, used: Used::Other });
         let ImportOrExternCrate::Glob(glob) = import else { return };
         let module = glob.use_.lookup(db).container;
-        let names = &module.def_map(db).names;
+        let names = module.def_map(db).name_records(db);
         let Some(&(_, target)) = names.glob_targets.iter().find(|&&(it, _)| it == glob) else {
             return;
         };
@@ -506,7 +508,7 @@ impl<'db> Walk<'db> {
     /// The records of `def_map`, and the signatures of what its modules declare.
     fn def_map(&mut self, def_map: &'db DefMap) {
         let db = self.db;
-        let NameRecords { uses, unresolved, glob_targets, .. } = &def_map.names;
+        let NameRecords { uses, unresolved, glob_targets, .. } = def_map.name_records(db);
         self.uses.extend_from_slice(uses);
         self.unresolved.extend_from_slice(unresolved);
         self.glob_targets.extend(glob_targets.iter().copied());
@@ -616,7 +618,7 @@ impl<'db> Walk<'db> {
             let TypeRef::Path(path) = it else { continue };
             let hygiene = store.type_path_hygiene(ty);
             let resolver = resolver_at(&mut resolvers, db, owner, within.ty(ty));
-            resolver.record_path_uses(db, &path, Namespace::Types, hygiene, out);
+            resolver.record_path_uses(db, path, Namespace::Types, hygiene, out);
         }
         for (ptr, call) in source_map.macro_calls() {
             let root = ptr.file_id.parse_or_expand(db);
@@ -666,7 +668,7 @@ impl<'db> Walk<'db> {
 /// Marks each use in `walked` and `more`, in that order, following glob imports on to the
 /// binding they read (`find_transitive_imports`), into the crate's [`UsedImports`].
 fn finish(db: &Db, krate: Crate, walked: &CrateUses, more: &[Use]) -> UsedImports {
-    let not_introducing = &*crate_def_map(db, krate).names.not_introducing;
+    let not_introducing = &*crate_def_map(db, krate).name_records(db).not_introducing;
     // alloc: once per `finish`, which runs once per crate.
     let glob_targets: FxHashMap<GlobId, ModuleId> = walked.glob_targets.iter().copied().collect();
     let mut imports: FxIndexMap<ImportOrExternCrate, Used> = FxIndexMap::default();

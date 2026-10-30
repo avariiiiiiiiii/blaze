@@ -14,6 +14,7 @@
 //! or else the next block: a branch to it is dropped (a `jump`) or falls through (`brif`'s
 //! `Next`).
 
+use blaze_ids::bits::BitArray;
 use blaze_mem::frame::Frame;
 use cranelift_codegen::ir::{self, BlockArg};
 
@@ -262,10 +263,9 @@ pub(super) fn size<A: Glue>(
     let mut fixups = 0usize;
     let mut consts = 0usize;
     let mut insts = 0usize;
-    let mut codes = [0u64; 4];
+    let mut codes = BitArray::<4, u8>::EMPTY;
     let mut mark = |code: ir::TrapCode| {
-        let at = code.as_raw().get();
-        codes[usize::from(at / 64)] |= 1 << (at % 64);
+        codes.insert(code.as_raw().get());
     };
     let mut glue_stubs = 0usize;
     for block in func.layout.blocks() {
@@ -330,7 +330,7 @@ pub(super) fn size<A: Glue>(
             }
         }
     }
-    let stubs = codes.iter().map(|it| it.count_ones() as usize).sum::<usize>() + glue_stubs + 1;
+    let stubs = codes.count() + glue_stubs + 1;
     bytes += stubs * fixed + (consts + 1) * ALIGN as usize;
     let labels = func.dfg.num_blocks() + plan.edges.len() + stubs + consts;
     Ok(Size { bytes, labels, fixups: fixups + plan.edges.len(), lines: insts })

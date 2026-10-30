@@ -17,9 +17,9 @@
 //!   memo a view took from a slot just before it was unlinked stays while the view is open.
 
 use std::{
+    alloc::Allocator,
     cell::UnsafeCell,
     ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
 };
 
 use blaze_format::SchemaHash;
@@ -29,6 +29,10 @@ use blaze_reclaim::{Grace, Guard};
 use crate::{
     QueryKey, Stored,
     segment::{self, Lanes, Segment, Segments, Span, lane},
+    sync::{
+        atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering, fence},
+        read_bytes,
+    },
     table::{COLLECT_AT, EDGE_RECORD, EdgeRecord, Free, FxMap, Generations, Ids, Rows, ShortLock},
 };
 
@@ -74,6 +78,7 @@ pub(crate) struct MemoHot {
     code: u32,
 }
 
+#[cfg(not(blaze_check))]
 const _: () = assert!(size_of::<MemoHot>() == 64);
 
 // SAFETY: `edges` names records that never change once copied in and stay until the memo is
@@ -154,6 +159,7 @@ impl ValueRow {
     }
 
     fn bytes(&self) -> &[u8] {
+        read_bytes(self.bytes.as_ptr(), self.len);
         // SAFETY: see the `Send` impl: `len` bytes at `bytes`, unchanged while the row lives.
         unsafe { std::slice::from_raw_parts(self.bytes.as_ptr(), self.len) }
     }
@@ -397,6 +403,7 @@ impl Store {
     /// The memo's edges in the order they were read: one range, read in place.
     pub(crate) fn edges<'g>(&'g self, task: &'g Guard, memo: MemoId) -> &'g [EdgeRecord] {
         let hot = self.hot(task, memo);
+        read_bytes(hot.edges.as_ptr().cast(), hot.edge_len as usize * EDGE_RECORD);
         // SAFETY: `edge_len` records written at `edges` before the memo was published, held by
         // its cold row's segment hold (or in the image) until the memo is freed.
         unsafe { std::slice::from_raw_parts(hot.edges.as_ptr(), hot.edge_len as usize) }
@@ -414,6 +421,7 @@ impl Store {
     /// copy when it is current, else from the value's row.
     pub(crate) fn bytes<'g>(&'g self, task: &'g Guard, memo: MemoId) -> Option<&'g [u8]> {
         if let Some((bytes, len)) = self.hot(task, memo).inline() {
+            read_bytes(bytes, len);
             // SAFETY: the copy of the row the word named when this task loaded it (see
             // `MemoHot`): its bytes stay unchanged until that row is dropped, which is after a
             // grace begun once the word stops naming it.
@@ -424,10 +432,15 @@ impl Store {
 
     /// Rewrites the hot row's inline copy to the value the word names now, unless another
     /// writer is at it (which rereads the word when it is done).
+    ///
+    /// SeqCst: this load of `seen` after a swap's compare-and-swap of `value`, and the rewriter's
+    /// store of `seen` followed by its reload of `value`, are store buffering. Under acquire and
+    /// release both may read the old value (this swap sees `LOCKED`, the rewriter its own word
+    /// still in `value`), and the copy stays stale until the next swap.
     fn refresh(&self, task: &Guard, memo: MemoId) {
         let hot = self.hot(task, memo);
         loop {
-            let seen = hot.seen.load(Ordering::Relaxed);
+            let seen = hot.seen.load(Ordering::SeqCst);
             if seen == LOCKED || seen == hot.value.load(Ordering::Acquire) {
                 return;
             }
@@ -447,8 +460,8 @@ impl Store {
             };
             hot.bytes.store(bytes, Ordering::Relaxed);
             hot.len.store(len, Ordering::Relaxed);
-            hot.seen.store(word, Ordering::Release);
-            if hot.value.load(Ordering::Acquire) == word {
+            hot.seen.store(word, Ordering::SeqCst);
+            if hot.value.load(Ordering::SeqCst) == word {
                 return;
             }
         }
@@ -470,7 +483,8 @@ impl Store {
     /// Swaps the memo's word from `was` to `now`: the value let go of goes to the limbo, or,
     /// when the word no longer is `was`, `now`'s row (never published) is freed at once.
     fn swap_value(&self, task: &Guard, memo: MemoId, was: u64, now: u64) -> bool {
-        let swapped = self.hot(task, memo).value.compare_exchange(was, now, Ordering::AcqRel, Ordering::Acquire);
+        // SeqCst: see `refresh`.
+        let swapped = self.hot(task, memo).value.compare_exchange(was, now, Ordering::SeqCst, Ordering::Acquire);
         let (gone, unlinked) = match swapped {
             Ok(_) => (value_row(was), true),
             Err(_) => (value_row(now), false),
@@ -562,35 +576,35 @@ impl Store {
     }
 
     /// Memos just unlinked from their slots.
-    pub(crate) fn unlinked(&self, memos: Vec<MemoId>) {
+    pub(crate) fn unlinked(&self, memos: &[MemoId]) {
         if memos.is_empty() {
             return;
         }
         let grace = Grace::start();
-        self.dying.lock().unlinked.extend(memos.into_iter().map(|memo| (grace, memo)));
+        self.dying.lock().unlinked.extend(memos.iter().map(|&memo| (grace, memo)));
     }
 
-    /// The memos to check against the open views, before they are walked: those unlinked
-    /// whose grace has passed (no task that read them from a slot is left, so no view can gain
-    /// them any more), and those a view held at the last check.
-    pub(crate) fn to_check(&self) -> Vec<MemoId> {
+    /// The memos to check against the open views, before they are walked, added to `out`:
+    /// those unlinked whose grace has passed (no task that read them from a slot is left, so
+    /// no view can gain them any more), and those a view held at the last check.
+    pub(crate) fn to_check<A: Allocator>(&self, out: &mut Vec<MemoId, A>) {
         let mut dying = self.dying.lock();
-        let mut out = std::mem::take(&mut dying.held);
+        out.extend_from_slice(&dying.held);
+        dying.held.clear();
         let done = passed(&dying.unlinked);
         out.extend(dying.unlinked.drain(..done).map(|(_, memo)| memo));
-        out
     }
 
     /// After the open views were walked: those `held` says a view holds wait for the next
     /// check, and the rest are freed once a grace begun now has passed (a task in a view closed
     /// before the walk may still hold one).
-    pub(crate) fn checked(&self, memos: Vec<MemoId>, held: impl Fn(MemoId) -> bool) {
+    pub(crate) fn checked(&self, memos: &[MemoId], held: impl Fn(MemoId) -> bool) {
         if memos.is_empty() {
             return;
         }
         let grace = Grace::start();
         let mut dying = self.dying.lock();
-        for memo in memos {
+        for &memo in memos {
             if held(memo) {
                 dying.held.push(memo);
             } else {
@@ -622,25 +636,36 @@ impl Store {
     /// grace has passed (each lane reclaims its own as it writes; `reclaim` frees every
     /// lane's), and the segments left with nothing in them.
     pub(crate) fn sweep(&self) {
-        let ready: Vec<MemoId> = {
-            let mut dying = self.dying.lock();
-            let done = passed(&dying.checked);
-            // alloc: once a sweep that frees memos, so they are freed outside the lock.
-            dying.checked.drain(..done).map(|(_, memo)| memo).collect()
-        };
-        if !ready.is_empty() {
-            let (pinned, free): (Vec<MemoId>, Vec<MemoId>) = {
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+            // Freed outside the lock.
+            let mut ready: Vec<MemoId, _> = Vec::new_in(frame);
+            {
+                let mut dying = self.dying.lock();
+                let done = passed(&dying.checked);
+                ready.extend(dying.checked.drain(..done).map(|(_, memo)| memo));
+            }
+            if ready.is_empty() {
+                return;
+            }
+            let (mut pinned, mut free): (Vec<MemoId, _>, Vec<MemoId, _>) = (Vec::new_in(frame), Vec::new_in(frame));
+            {
                 let pins = self.pins.lock();
-                ready.into_iter().partition(|memo| pins.contains_key(memo))
-            };
-            for memo in free {
+                for &memo in &ready {
+                    if pins.contains_key(&memo) {
+                        pinned.push(memo);
+                    } else {
+                        free.push(memo);
+                    }
+                }
+            }
+            for &memo in &free {
                 self.free(memo);
             }
             if !pinned.is_empty() {
                 let grace = Grace::start();
-                self.dying.lock().checked.extend(pinned.into_iter().map(|memo| (grace, memo)));
+                self.dying.lock().checked.extend(pinned.iter().map(|&memo| (grace, memo)));
             }
-        }
+        });
         let values = &self.values;
         self.frees(|frees| {
             // SAFETY: a retired value row's grace has passed: no task that could reach it is left.

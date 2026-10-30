@@ -22,7 +22,9 @@ use hir_expand::{
 };
 use hir_ide::{
     db::HirDatabase,
-    method_resolution::{self, CandidateId, MethodError, MethodResolutionContext},
+    method_resolution::{
+        self, CandidateId, MethodError, MethodResolutionContext, TraitSet, TraitsInScope,
+    },
     next_solver::{DbInterner, TypingMode, infer::DbInternerInferExt},
 };
 use intern::Symbol;
@@ -553,18 +555,22 @@ fn resolve_impl_trait_item<'db>(
     let interner = DbInterner::new_with(db, param_env.krate);
     let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
     let features = resolver.top_level_def_map().features();
-    let ctx = MethodResolutionContext {
-        infcx: &infcx,
-        resolver: &resolver,
-        param_env: param_env.param_env,
-        traits_in_scope: &traits_in_scope,
-        edition: krate.data(db).edition,
-        features,
-        call_span: hir_ide::Span::Dummy,
-        receiver_span: hir_ide::Span::Dummy,
-    };
-    let resolution =
-        ctx.probe_for_name(method_resolution::Mode::Path, name.clone(), ty.ty.skip_binder());
+    let resolution = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+        let ctx = MethodResolutionContext {
+            infcx: &infcx,
+            resolver: &resolver,
+            param_env: param_env.param_env,
+            traits_in_scope: TraitsInScope::Set(TraitSet::collect(
+                traits_in_scope.iter().copied(),
+            )),
+            edition: krate.data(db).edition,
+            features,
+            call_span: hir_ide::Span::Dummy,
+            receiver_span: hir_ide::Span::Dummy,
+            frame,
+        };
+        ctx.probe_for_name(method_resolution::Mode::Path, *name, ty.ty.skip_binder())
+    });
     let resolution = match resolution {
         Ok(resolution) => resolution.item,
         Err(MethodError::PrivateMatch(resolution)) => resolution.item,

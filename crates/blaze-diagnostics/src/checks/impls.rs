@@ -20,13 +20,9 @@ mod compare;
 
 use blaze_ids::radix;
 use blaze_items::{Fact, ItemId};
-use hir::HasSource as _;
 use hir_def::{BuiltinDeriveImplId, attrs::AttrFlags, lang_item::lang_items};
 use rustc_hash::FxHashMap;
-use syntax::{
-    AstNode as _,
-    ast::{HasAttrs as _, HasName as _},
-};
+use syntax::view::{AstNode as _, HasAttrs as _, HasName as _};
 
 use crate::{
     cx::Cx,
@@ -35,25 +31,27 @@ use crate::{
 };
 
 /// Where an impl is: written in source, or made by a builtin derive of a type.
-pub(super) enum Origin {
-    Written(ImplAt),
+pub(super) enum Origin<'db> {
+    Written(ImplAt<'db>),
     Derive { id: BuiltinDeriveImplId, adt: hir::Adt },
 }
 
-impl Origin {
+impl<'db> Origin<'db> {
     /// The span rustc gives the impl's self type: as written, or for a derive the type's name
     /// in the derive's expansion.
     pub(super) fn self_ty_span(&self, cx: &Cx<'_, '_>) -> Option<Span> {
         match self {
             Origin::Written(at) => Some(at.self_ty_span(cx)),
             Origin::Derive { id, adt } => {
-                let source = adt.source(cx.db)?;
+                let source = cx.vsema.source(*adt)?;
                 let name = source.value.name()?;
                 let mut span = cx.span(source.with_value(name.syntax().text_range()));
                 let loc = id.loc(cx.db);
+                // alloc: the error's span; called only on an error path (`builtin`'s E0204, E0206, E0184)
                 span.expansion = Some(Box::new(Expansion {
                     call_site: cx.span(loc.source(cx.db)),
                     kind: MacroKind::Derive,
+                    // alloc: as above
                     name: loc.trait_.name().as_str().to_owned(),
                     def_site: None,
                 }));
@@ -70,7 +68,7 @@ impl Origin {
         }
     }
 
-    pub(super) fn written(&self) -> Option<&ImplAt> {
+    pub(super) fn written(&self) -> Option<&ImplAt<'db>> {
         match self {
             Origin::Written(at) => Some(at),
             Origin::Derive { .. } => None,
@@ -159,11 +157,11 @@ pub(crate) fn coherent(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
 
 /// The coherence checks of one impl of `trait_` (`coherent_trait`'s loop): what is given here,
 /// and whether hir gives an error of it (an orphan impl, a safety that is not the trait's).
-fn coherence(
-    cx: &Cx<'_, '_>,
-    builtin: &mut builtin::Builtin<'_, '_, '_>,
+fn coherence<'db>(
+    cx: &Cx<'_, 'db>,
+    builtin: &mut builtin::Builtin<'_, '_, 'db>,
     impl_: hir::Impl,
-    origin: &Origin,
+    origin: &Origin<'db>,
     trait_: hir::Trait,
     denied: bool,
 ) -> (Vec<Found>, bool) {
@@ -187,7 +185,7 @@ fn coherence(
 
 /// Whether hir gives `TraitImplIncorrectSafety` of the impl (rustc's `unsafety::check_item`):
 /// the same rule as hir's (`crates/hir/src/diagnostics.rs`), so that both agree.
-fn incorrect_safety(cx: &Cx<'_, '_>, at: &ImplAt, trait_: hir::Trait) -> bool {
+fn incorrect_safety(cx: &Cx<'_, '_>, at: &ImplAt<'_>, trait_: hir::Trait) -> bool {
     let db = cx.db;
     let impl_unsafe = at.impl_.is_unsafe(db);
     let negative = at.impl_.is_negative(db);
@@ -210,12 +208,12 @@ fn is_error(found: &Found) -> bool {
 
 /// The impls of the crate, in rustc's order: each scope's (`defs::scopes`), as they are
 /// written, a derive's where its type is.
-fn impls(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<(hir::Impl, Origin)> {
+fn impls<'db>(cx: &Cx<'_, 'db>, scopes: &[hir::Module]) -> Vec<(hir::Impl, Origin<'db>)> {
     let db = cx.db;
     // alloc: the crate's impls, and one buffer reused for each scope's, once per check.
     let mut all = Vec::new();
     // alloc: see above.
-    let mut here: Vec<(u32, hir::Impl, Origin)> = Vec::new();
+    let mut here: Vec<(u32, hir::Impl, Origin<'db>)> = Vec::new();
     for &module in scopes {
         let id = hir_def::ModuleId::from(module);
         let scope = id.def_map(db).module(db, id).scope(db);
@@ -237,7 +235,7 @@ fn impls(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<(hir::Impl, Origin)> {
 
 /// Whether the trait is marked `#[rustc_deny_explicit_impl]`.
 fn denies_explicit_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
-    let Some(source) = trait_.source(cx.db) else { return false };
+    let Some(source) = cx.vsema.source(trait_) else { return false };
     source.value.attrs().any(|attr| {
         attr.path().and_then(|path| path.as_single_name_ref()).is_some_and(|name| name.text() == "rustc_deny_explicit_impl")
     })
@@ -245,7 +243,7 @@ fn denies_explicit_impls(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
 
 /// `enforce_trait_manually_implementable`: E0322 (E0328 for `Unsize`) for an impl of a trait
 /// marked `#[rustc_deny_explicit_impl]`.
-fn explicit_impl(cx: &Cx<'_, '_>, at: &ImplAt, trait_: hir::Trait) -> Vec<Found> {
+fn explicit_impl(cx: &Cx<'_, '_>, at: &ImplAt<'_>, trait_: hir::Trait) -> Vec<Found> {
     let db = cx.db;
     let name = trait_.name(db);
     let name = name.as_str();
@@ -253,9 +251,13 @@ fn explicit_impl(cx: &Cx<'_, '_>, at: &ImplAt, trait_: hir::Trait) -> Vec<Found>
     let span = at.span(cx);
     let code = if unsize { "E0328" } else { "E0322" };
     let mut diag =
+        // alloc: clone: the error's message and span
         Diag::error(Some(code), format!("explicit impls for the `{name}` trait are not permitted"), span.clone());
+    // alloc: the error's label
     diag.span_label(span, format!("impl of `{name}` not allowed"));
+    // alloc: the error's fact
     diag.fact(Fact::Signature(cx.key(ItemId::Trait(trait_.into()))), format!("the attributes of `{name}`"));
     diag.fact(at.coherence(cx), "the header of the impl");
+    // alloc: the error
     vec![Found::new(diag, Phase::Items)]
 }

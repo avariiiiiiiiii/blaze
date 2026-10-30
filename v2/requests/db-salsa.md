@@ -471,3 +471,92 @@ are lock-free maps sharded by `blaze_ids::shard_count()`, with views in an appen
 > `:670`, `stdlib/tests.rs:407`). blaze-tree has no call. `rg` finds no `Database::get` left in
 > lane cargo's paths.
 
+
+## frontend-fast-trait-store: iterate a `Reads`' reads with their kind and name (vendor/salsa; 2026-10-29)
+
+From frontend-fast-trait-store (notes `docs/v2/plan/lanes/frontend/fast-trait-store.md`
+section 3; code `crates/hir-ty/src/next_solver/goal_store.rs`). The persistent goal cache
+(compile-time.md change 17) stores a global goal's answer only when every read its
+evaluation made is a fact of lane items or an interned value. It gets the reads as the
+`salsa::Reads` that `capture_reads` returned, and needs to walk them: today
+`Reads::edges` is `pub(crate)` and nothing outside salsa can tell an interned read from a
+query's. `JarKind` does not tell either (interned, input and tracked structs are all
+`Struct`). Called once per goal offered to the store, after a solve, never on a hit.
+
+1. `vendor/salsa/src/ingredient.rs`, a new enum beside the trait, and a method on
+   `Ingredient` after `fn jar_kind(&self) -> JarKind;`:
+   ```rust
+   /// What an ingredient holds, as a read of it is told apart.
+   #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+   pub enum ReadKind {
+       /// An input struct's field.
+       Input,
+       /// An interned value: a pure function of its fields, which it holds.
+       Interned,
+       /// A tracked struct or its field.
+       TrackedStruct,
+       /// A tracked function's memo.
+       Query,
+       Accumulator,
+   }
+   ```
+   ```rust
+       /// What this ingredient holds, for telling its reads apart.
+       fn read_kind(&self) -> ReadKind;
+   ```
+   with, in each impl:
+   - `interned.rs` `impl<C> Ingredient for IngredientImpl<C>`: `fn read_kind(&self) -> ReadKind { ReadKind::Interned }`
+   - `input.rs` `impl<C: Configuration> Ingredient for IngredientImpl<C>` and
+     `input/input_field.rs` `impl<C> Ingredient for FieldIngredientImpl<C>`: `ReadKind::Input`
+   - `tracked_struct.rs` `impl<C> Ingredient for IngredientImpl<C>` and
+     `tracked_struct/tracked_field.rs` `impl<C> Ingredient for FieldIngredientImpl<C>`:
+     `ReadKind::TrackedStruct`
+   - `function.rs` `impl<C> Ingredient for IngredientImpl<C>`: `ReadKind::Query`
+   - `accumulator.rs` `impl<A: Accumulator> Ingredient for IngredientImpl<A>`: `ReadKind::Accumulator`
+   (and any other `impl Ingredient` the tree has, by what it holds).
+2. `vendor/salsa/src/lib.rs`: `pub use self::ingredient::ReadKind;` beside
+   `pub use self::key::DatabaseKeyIndex;`.
+3. `vendor/salsa/src/capture.rs`, in `impl Reads` after `fn accumulated`:
+   ```rust
+   /// How many reads this holds.
+   pub fn len(&self) -> usize {
+       self.edges as usize
+   }
+
+   /// Calls `f` with each read, in read order: its key, what its ingredient holds and the
+   /// ingredient's debug name, until `f` breaks.
+   ///
+   /// # Panics
+   ///
+   /// If `self` was captured in another revision than `db`'s current one.
+   // dyn: the edge: salsa's public database handle, and one ingredient lookup per read
+   pub fn for_each_read(
+       &self,
+       db: &dyn Database,
+       mut f: impl FnMut(crate::DatabaseKeyIndex, crate::ReadKind, &'static str) -> std::ops::ControlFlow<()>,
+   ) -> std::ops::ControlFlow<()> {
+       let zalsa = db.zalsa();
+       assert!(
+           self.revision == zalsa.current_revision(),
+           "salsa: `Reads::for_each_read` of reads captured in revision {:?}, in revision {:?}",
+           self.revision,
+           zalsa.current_revision(),
+       );
+       for (edge, _) in self.edges(zalsa.graph()) {
+           let key = edge.key();
+           let ingredient = zalsa.lookup_ingredient(key.ingredient_index());
+           f(key, ingredient.read_kind(), ingredient.debug_name())?;
+       }
+       std::ops::ControlFlow::Continue(())
+   }
+   ```
+   (`ZalsaDatabase` is already imported there; `db.zalsa()` is its method.)
+
+A test, in salsa's capture tests: a tracked function that reads an input field, an interned
+value's field and another tracked function inside one `capture_reads`, then
+`for_each_read` gives three reads with kinds `Input`, `Interned` (if an interned read
+records an edge; otherwise two) and `Query`, in read order, with their ingredients' names.
+
+Status: open
+
+> forwarded to db (`vendor/salsa`; db-salsa is DONE; db-next3); told by tmux (requests, pass 26).

@@ -49,6 +49,7 @@ pub(crate) fn command() -> ! {
     std::process::exit(code)
 }
 
+#[allow(unsafe_code)]
 fn run(args: &[OsString]) -> anyhow::Result<i32> {
     let rustc = std::env::var_os(TOOLCHAIN)
         .with_context(|| format!("`{TOOLCHAIN}` does not name blaze's rustc"))?;

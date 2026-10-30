@@ -665,6 +665,16 @@ impl<T: Code> Code for Box<T> {
     }
 }
 
+impl<T: Code> Code for triomphe::Arc<T> {
+    fn put(&self, w: &mut Words) {
+        (**self).put(w);
+    }
+
+    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
+        T::get(r).map(triomphe::Arc::new)
+    }
+}
+
 impl<T: Code> Code for Box<[T]> {
     fn put(&self, w: &mut Words) {
         w.seq(self.iter());

@@ -218,8 +218,9 @@ impl Host {
         let mut env: Vec<(OsString, OsString)> = launch.env.iter().filter(|(name, _)| name != HOST_VAR).cloned().collect();
         env.push((HOST_VAR.into(), var));
         let mut sandbox = launch.sandbox.clone();
-        if let Sandbox::On { read, write, .. } = &mut sandbox {
+        if let Sandbox::On { read, write, services, .. } = &mut sandbox {
             read.push(launch.program.clone());
+            services.extend(sys::service());
             // Connecting to a Unix socket is a write of the socket alone: the program gets
             // neither the directory nor the other runs' sockets in it. A named pipe is not a
             // path the sandbox's file rules cover.

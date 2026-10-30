@@ -12,6 +12,7 @@ pub use salsa;
 
 mod change;
 mod content;
+pub mod crate_attrs;
 mod db;
 mod editioned_file_id;
 mod files;
@@ -26,16 +27,15 @@ mod budget_tests;
 mod tests;
 mod view;
 
-use std::{
-    cell::RefCell,
-    panic,
-    str::FromStr as _,
-    sync::{Once, atomic::AtomicUsize},
-};
+use std::{str::FromStr as _, sync::atomic::AtomicUsize};
 
 pub use crate::{
     change::FileChange,
     content::{CFG_OPTIONS_DOMAIN, InputId, cfg_options_content},
+    crate_attrs::{
+        CRATE_ATTR_FILE_NAME, CrateAttrError, applied_crate_attr_files, crate_attr_error,
+        crate_attr_files, crate_attr_owner,
+    },
     db::{Db, Reader, RunOrder, Shared, executions, run_on_pool, set_run_order},
     editioned_file_id::EditionedFileId,
     files::Files,
@@ -245,13 +245,37 @@ pub fn line_index(db: &Db, text: FileText) -> span::LineIndex {
     span::LineIndex::new(text.text(db))
 }
 
-/// The contents of a file named by `include_bytes!` or `include_str!`, `None` if it can't be read.
+/// Why a file `include_bytes!` or `include_str!` names could not be read: the error's kind and
+/// the OS's code where it has one, which is what rustc's "couldn't read" message prints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ReadError {
+    kind: std::io::ErrorKind,
+    os: Option<i32>,
+}
+
+impl ReadError {
+    pub fn of(error: &std::io::Error) -> ReadError {
+        ReadError { kind: error.kind(), os: error.raw_os_error() }
+    }
+}
+
+impl std::fmt::Display for ReadError {
+    /// As `std::io::Error` writes itself: "No such file or directory (os error 2)".
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.os {
+            Some(code) => std::fmt::Display::fmt(&std::io::Error::from_raw_os_error(code), f),
+            None => std::fmt::Display::fmt(&self.kind, f),
+        }
+    }
+}
+
+/// The contents of a file named by `include_bytes!` or `include_str!`, or why it can't be read.
 #[salsa::input(debug)]
 pub struct IncludedFile {
     #[returns(ref)]
-    #[get(bytes_field)]
-    #[set(set_bytes_field)]
-    bytes: Option<std::sync::Arc<[u8]>>,
+    #[get(read_field)]
+    #[set(set_read_field)]
+    read: Result<std::sync::Arc<[u8]>, ReadError>,
     #[returns(copy)]
     #[get(content_field)]
     #[set(set_content_field)]
@@ -259,23 +283,32 @@ pub struct IncludedFile {
 }
 
 impl IncludedFile {
-    /// Of its bytes (1 and the bytes), or that it could not be read (0).
-    pub const DOMAIN: &'static str = "blaze v2 included file 1";
+    /// Of its bytes (1 and the bytes), or of why it could not be read (0 and the error's
+    /// text): a message that names the error changes with it.
+    pub const DOMAIN: &'static str = "blaze v2 included file 2";
 
-    pub fn content_of(bytes: Option<&[u8]>) -> ContentId {
+    pub fn content_of(read: Result<&[u8], &ReadError>) -> ContentId {
         let mut hasher = Hasher::new(IncludedFile::DOMAIN);
-        match bytes {
-            None => hasher.update(&[0]),
-            Some(bytes) => hasher.update(&[1]).part(bytes),
+        match read {
+            // alloc: the error's text, on the error path
+            Err(error) => hasher.update(&[0]).part(error.to_string().as_bytes()),
+            Ok(bytes) => hasher.update(&[1]).part(bytes),
         };
         hasher.finish()
+    }
+
+    pub fn read<'db, Db: ?Sized + salsa::Database>(
+        self,
+        db: &'db Db,
+    ) -> &'db Result<std::sync::Arc<[u8]>, ReadError> {
+        self.read_field(db)
     }
 
     pub fn bytes<'db, Db: ?Sized + salsa::Database>(
         self,
         db: &'db Db,
-    ) -> &'db Option<std::sync::Arc<[u8]>> {
-        self.bytes_field(db)
+    ) -> Option<&'db std::sync::Arc<[u8]>> {
+        self.read_field(db).as_ref().ok()
     }
 
     pub fn content<Db: ?Sized + salsa::Database>(self, db: &Db) -> ContentId {
@@ -495,66 +528,18 @@ pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
     #[salsa::tracked(returns(deref))]
     pub fn source_root_crates(db: &Db, root: SourceRootInput) -> Box<[Crate]> {
         let crates = AllCrates::get(db).crates(db);
-        crates
-            .iter()
-            .copied()
-            .filter(|&krate| {
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+            let mut found = Vec::new_in(frame);
+            found.extend(crates.iter().copied().filter(|&krate| {
                 let root_file = krate.data(db).root_file_id;
                 db.source_root(db.file_source_root(root_file).source_root_id(db)) == root
-            })
-            .collect() // alloc: the memo's value, made again only when the crate graph changes.
+            }));
+            Box::from(&found[..]) // alloc: the memo's value, made again only when the crate graph changes.
+        })
     }
     source_root_crates(db, db.source_root(id))
 }
 
 pub fn relevant_crates(db: &Db, file_id: FileId) -> &[Crate] {
     source_root_crates(db, db.file_source_root(file_id).source_root_id(db))
-}
-
-#[must_use]
-#[non_exhaustive]
-pub struct DbPanicContext;
-
-impl Drop for DbPanicContext {
-    fn drop(&mut self) {
-        Self::with_ctx(|ctx| assert!(ctx.pop().is_some()));
-    }
-}
-
-impl DbPanicContext {
-    pub fn enter(frame: String) -> DbPanicContext {
-        #[expect(clippy::print_stderr, reason = "already panicking anyway")]
-        fn set_hook() {
-            let default_hook = panic::take_hook();
-            // alloc: the panic hook, set once per process.
-            panic::set_hook(Box::new(move |panic_info| {
-                default_hook(panic_info);
-                if let Some(backtrace) = salsa::Backtrace::capture() {
-                    eprintln!("{backtrace:#}");
-                }
-                DbPanicContext::with_ctx(|ctx| {
-                    if !ctx.is_empty() {
-                        eprintln!("additional context:");
-                        for (idx, frame) in ctx.iter().enumerate() {
-                            eprintln!("{idx:>4}: {frame}\n");
-                        }
-                    }
-                });
-            }));
-        }
-
-        static SET_HOOK: Once = Once::new();
-        SET_HOOK.call_once(set_hook);
-
-        Self::with_ctx(|ctx| ctx.push(frame));
-        DbPanicContext
-    }
-
-    fn with_ctx(f: impl FnOnce(&mut Vec<String>)) {
-        thread_local! {
-            // alloc: none: a `const` empty `Vec`.
-            static CTX: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-        }
-        CTX.with(|ctx| f(&mut ctx.borrow_mut()));
-    }
 }

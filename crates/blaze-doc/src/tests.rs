@@ -428,6 +428,10 @@ fn signatures_come_from_the_hir() {
     assert!(shape.starts_with("pub trait Shape: Clone {"), "{shape}");
     assert!(shape.contains("fn area(&self) -> u32;"), "{shape}");
     assert!(shape.contains("fn name(&self) -> &'static str { ... }"), "{shape}");
+    for group in ["// Required associated type", "// Associated constant", "// Required method", "// Provided method"] {
+        assert!(shape.contains(&format!("{group}\n")), "{group}: {shape}");
+    }
+    assert!(!shape.contains("// Provided associated type"), "{shape}");
 }
 
 #[test]
@@ -617,6 +621,11 @@ fn writes_pages_sources_and_search() {
         "a dependency's page, titled where the item is declared"
     );
     assert!(thing.contains("https://doc.rust-lang.org/nightly/core/option/enum.Option.html"));
+    let shape = std::fs::read_to_string(out.join("fixture/trait.Shape.html")).unwrap();
+    for id in ["required-associated-types", "associated-constants", "required-methods", "provided-methods"] {
+        assert!(shape.contains(&format!("<h2 id=\"{id}\" class=\"section-header\">")), "{id} section");
+    }
+    assert!(!shape.contains("id=\"provided-associated-types\""), "no provided associated type");
     let index = text(&std::fs::read_to_string(out.join("fixture/index.html")).unwrap());
     assert!(index.contains("let thing = fixture::Thing::new(1);"), "the example is there: {index}");
     assert!(!index.contains("let hidden"), "hidden example lines are not");

@@ -78,6 +78,7 @@
 
 pub mod ask;
 pub mod channel;
+pub mod exec;
 pub mod fence;
 pub mod frame;
 #[cfg(feature = "host")]

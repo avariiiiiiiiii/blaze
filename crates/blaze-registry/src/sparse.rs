@@ -61,6 +61,7 @@ pub struct SparseIndex {
     base: String,
     /// `$CARGO_HOME/registry/index/<name>`.
     dir: PathBuf,
+    // dyn: the I/O driver, chosen once per process; each call is a network round trip.
     http: Arc<dyn Http>,
     retry: Retry,
     offline: bool,
@@ -86,6 +87,7 @@ impl SparseIndex {
     pub fn new(
         source: SourceId,
         dir: PathBuf,
+        // dyn: the I/O driver, as on the field.
         http: Arc<dyn Http>,
         retry: Retry,
         offline: bool,

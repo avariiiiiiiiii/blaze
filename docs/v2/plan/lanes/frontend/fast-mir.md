@@ -184,22 +184,27 @@ locals.
 
 ### 3.2 Scheduling without the scan
 
-A `LocalSet` `scheduled` of every local ever put in a scope. `push_storage_live_for_local`
-scans the target scope only when the local is in it, which a fresh temporary never is: O(1)
-for temporaries and first declarations, the old scan only for a re-declared binding (a loop's
-body, or-pattern expansions).
+Each `ScopeLocals` keeps one more than the largest local index it holds (`bound`, recounted
+lazily after an `edit`). Locals are numbered in the order they are made, so a fresh temporary
+or a first declaration is at or above it and `holds` answers without the scan: O(1) for those,
+the old scan only for a re-declared binding (a loop's body, or-pattern expansions).
+`declare_last`, `guard_held` and `lower_guard` ask `holds` first and leave a scope untouched
+(and its unwind fold clean) when nothing moves.
 
 ### 3.3 The match tree
 
-- Candidates as a slice with a start index, not `remove(0)`;
-- a branch's index found through a small map keyed by `Branch` (linear for at most 8
-  branches, a frame `FrameMap` above it, as rustc's `FxIndexMap`), keeping the branches'
-  first-seen order, which is the order `run` visits them in;
-- `sort`'s check for a `Failure` candidate covering an `Int` answered by the ranges kept in a
-  sorted list per test: a binary search instead of a scan.
+- Candidates as a stack, the first one last (`Stack`): taking the first is a pop, and what a
+  test leaves stays where it is instead of being copied into a new list each time (an arm per
+  string constant made the old run quadratic). The lowest index of a candidate that starts
+  with an or-pattern is found once per run: candidates below the top are not changed while
+  they wait, so "any left" is a compare with the length.
+- `Branches`: a branch's index by a scan for at most 8 branches and through a frame `FrameMap`
+  above that, as rustc's `FxIndexMap`, keeping the first-seen order `run` visits them in; the
+  `Int` branch values kept sorted, and the ranges of the `Failure` candidates of an `Int` test
+  kept merged, so both of `sort`'s range checks are a binary search instead of a scan of every
+  branch's candidates.
 
-This is mem §5.5's file, being changed now; the edits go to its owner as exact requests once
-§5.5 is applied.
+`lower.rs` and `lower/` were handed to this lane by codegen-mir-store-lower once mem §5 was in.
 
 ## 4. What rustc behavior is kept, and how
 
@@ -221,9 +226,30 @@ diagnostics that name locals are unaffected. What could differ, and why it doesn
   tail, outlive, operand, unschedule) driven by generated operation sequences (nested scopes,
   loops with breaks, drops in every scope shape), with the old fold copied into the test
   module, asserting the same answer and the same sequence of node allocations at every ask.
-- `harness/v2/frontend/cases/mir/`: programs whose run output shows drop order on unwinding,
-  on `break`/`return`/`?`, in `match` guards, `let else`, temporaries in tails before and after
-  2024, coroutines; plus borrowck rejections whose span depends on the drop schedule.
+  Probe-count tests: asking twice with nothing changed probes nothing; 2000 `let`s with a call
+  after each probe at most once a local (the old fold: n² / 2).
+- Wiring: every write to a scope's list goes through `ScopeLocals::edit`, `push_new`,
+  `set_tail` or `take_list` (its fields are private to `lower/unwind.rs`, so the compiler holds
+  every write site), and `operand_locals` and `unscheduled` are written only through
+  `mark_operand`, `unschedule` and `reschedule`. `Unwinds::before` checks in debug builds that
+  the order `exit_to` drops in is the order it folded.
+- `lower/match_tree/tests.rs`: the old run copied into the test module against the new on 3000
+  generated matches (integers, overlapping ranges, `bool`s, constants, slice lengths with
+  elements, nested or-patterns, guards; `Variant` needs a database for its ids and is left out),
+  plus a 256-value byte match with ranges past the 8-branch index and 2000 constant arms: the
+  same arms reached and the same answer on falling through.
+- Why no whole-builder copy: the only algorithms replaced are the unwind fold and the match
+  tree's run, each copied whole into its test module and compared on generated inputs; every
+  other part of the builder is the same code before and after, so copying all of `lower.rs`
+  (5000 lines) into a test would compare a function with itself.
+- `harness/v2/frontend/cases/mir/` (52 programs, 47 accepted, 5 rejected): run output shows drop
+  order on unwinding out of calls, struct literals, method chains, indexing, division and drops
+  that panic during assignment; on `break`/`continue`/labeled breaks/`return`/`?`; in guards,
+  `let else`, `if let`, `while let` and `for`; temporaries in tails and `if let` scrutinees in
+  2021 and 2024; async bodies dropped at an await and panicking after one; a 26-`let` block; and
+  match trees on bytes, strings, overlapping ranges, slices and nested or-patterns; calls of an
+  empty enum (§8). Rejections: E0716, E0597 (a scope, a 2021 tail temporary, drop check) and
+  E0505.
 - Allocation budget: building a body allocates the kept body's buffers and a constant number
   more (mem §10.3's lowering test, equal at 8 and 64 statements); the chain's buffers are in the
   frame.
@@ -241,3 +267,59 @@ diagnostics that name locals are unaffected. What could differ, and why it doesn
   a payload array, `defer`/`errdefer` lowered by copying the deferred body at each exit, so
   its exits are O(deferred bodies). rustc's shared drop tree, which this keeps, shares exit
   drops between exits instead, which MIR's identity with rustc requires.
+
+## 7. Where each part stands (2026-10-29, uncompiled)
+
+| Part | State against its bound |
+|---|---|
+| Unwind path per site | `Unwinds`: about 5 cycles when nothing changed, one probe a local of a changed scope (rustc's cached unwind block, and a `let` is one step where rustc refolds the scope) |
+| Scope end and `exit_to`, per dropped local | the cached fold's position, O(1) when the prefix is clean |
+| Scheduling a temporary | O(1) through `ScopeLocals::holds` |
+| Match tree | O(pattern nodes + arms × tests): pops, indexed branches, binary-searched ranges |
+| Allocations | the kept body and a constant (codegen-mir-store's `lowering_allocates_the_kept_body_and_its_setup_only`, equal at 8 and 64 statements); every buffer here is in the frame |
+| Per-expression rest (path resolution again, adjustment probes) | codegen's request 12 to hir-ty, not this lane's |
+| `unreachable_after_calls` | zero extra work without a call of an uninhabited non-`!` type; one probe lowering with one (§8) |
+
+## 8. `MirBody::unreachable_after_calls` (`lower/uninhabited.rs`)
+
+db-ty-d-mir's fill (`v2/requests/db-ty.md`, "db-ty-d-mir", 1), from rustc's
+`compiler/rustc_mir_transform/src/lint_and_remove_uninhabited.rs` as read on rust-lang/rust
+master (2026-10-29). rustc builds what follows a call into the call's target block, then the
+pass cuts the edge of every call of an uninhabited type and, for one whose type is not `!` in a
+`fn` or associated `fn` whose return type is inhabited, walks from the target to the first user
+code (`find_unreachable_code_from`: past `()` constants, return-place assignments and storage
+markers; a `FakeRead` is "definition", anything else "expression"; through a `Goto` or `Drop`
+into a block only it leads to; nothing at a `Return`). Lowering here builds nothing after such
+a call, so:
+
+- the kept body is built as before; `lower_call` only notes that it gave a call of an
+  uninhabited type other than `!` no target (`uninhabited_call`);
+- when it did, in a function whose return type is inhabited, the body is lowered a second time
+  in the same frame with `probe` set: each call of an uninhabited type keeps a target block
+  nothing leads to and lowering goes on in it, and `push_assign_unit`'s statements are noted
+  (rustc writes those as a `()` constant it skips; blaze writes an empty aggregate, which a `()`
+  the user wrote also is). The walk runs over the probe's blocks, the calls in block order; only
+  the entries are kept. The kept body, its block and local numbering, and so borrowck and
+  codegen, are unchanged.
+
+Cost: nothing in a body without such a call (a flag, and a `None` check per `()` assignment);
+one more lowering of a body with one, which is rare (calls of an empty enum or `Infallible`
+type in a function that returns).
+
+The request's examples had `descr` the wrong way round. rustc's own
+`tests/ui/lint/dead-code/issue-85071.rs` gives "unreachable definition" at `x` for
+`let x = f();`, because the `FakeRead` of the `let` follows the call. The tests follow rustc.
+
+What it does not build: like the kept body, the probe builds nothing after a `return`, a
+`break`, a `continue` or a `!` expression other than a call, where rustc builds the rest into a
+block nothing reaches. So a call of an uninhabited type that only follows one of those gives no
+entry, where rustc lints it. Type checking already warns "unreachable statement" there.
+
+Proof: `lower/uninhabited/tests.rs` runs the walk against rustc's recursive one (copied there,
+with a predecessor list per edge) on hand-made blocks and 2000 generated block graphs (storage
+markers, `Goto` chains, blocks reached by more than one edge, imaginary and unwind edges,
+`Return`, cycles, unterminated blocks). `tests/mir/uninhabited.rs` covers rustc's two UI tests,
+a call after a statement, the order across two branches, none after a `!` call, in a function
+returning `Void`, where only the return value follows, or in a closure, and checks that the kept
+body still ends at the call. Harness cases `mir/051` and `mir/052`: run output across such a
+call, and no borrow check of the code after one.

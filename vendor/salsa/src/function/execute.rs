@@ -204,7 +204,10 @@ where
                         // for all cycle participants. This ensures that the results don't depend on the query call order, see
                         // https://github.com/salsa-rs/salsa/pull/798#issuecomment-2812855285.
                         if C::CYCLE_STRATEGY == CycleRecoveryStrategy::FallbackImmediate {
-                            new_value = C::cycle_initial(db, id, C::id_to_input(zalsa, id));
+                            let input = C::id_to_input(zalsa, id);
+                            new_value = blaze_mem::frame::task(C::MEM_TAG, |_| {
+                                C::cycle_initial(db, id, input)
+                            });
                         }
 
                         let completed_query = complete_cycle_participant(
@@ -259,7 +262,9 @@ where
             // For Fixpoint, ask the recovery function what value to use and check convergence.
             let value_converged = if C::CYCLE_STRATEGY == CycleRecoveryStrategy::FallbackImmediate {
                 // Use the fallback value instead of the computed value.
-                new_value = C::cycle_initial(db, id, C::id_to_input(zalsa, id));
+                let input = C::id_to_input(zalsa, id);
+                new_value =
+                    blaze_mem::frame::task(C::MEM_TAG, |_| C::cycle_initial(db, id, input));
                 true
             } else {
                 let cycle = Cycle {
@@ -269,13 +274,10 @@ where
                 };
                 // We are in a cycle that hasn't converged; ask the user's
                 // cycle-recovery function what to do (it may return the same value or a different one):
-                new_value = C::recover_from_cycle(
-                    db,
-                    &cycle,
-                    last_provisional_value,
-                    new_value,
-                    C::id_to_input(zalsa, id),
-                );
+                let input = C::id_to_input(zalsa, id);
+                new_value = blaze_mem::frame::task(C::MEM_TAG, |_| {
+                    C::recover_from_cycle(db, &cycle, last_provisional_value, new_value, input)
+                });
 
                 C::values_equal(&new_value, last_provisional_value)
             };
@@ -337,10 +339,8 @@ where
 
         // Query was not previously executed, or value is potentially
         // stale, or value is absent. Let's execute!
-        let new_value = C::execute(
-            db,
-            C::id_to_input(zalsa, active_query.database_key_index.key_index()),
-        );
+        let input = C::id_to_input(zalsa, active_query.database_key_index.key_index());
+        let new_value = blaze_mem::frame::task(C::MEM_TAG, |_| C::execute(db, input));
 
         (new_value, active_query)
     }
@@ -943,7 +943,8 @@ thread_local! {
     /// Pool the `seen` and `flattened` sets for reuse on the same thread.
     ///
     /// Benchmarks showed that repeatedly allocating and regrowing those sets is expensive.
-    static FLATTEN_MAPS: std::cell::Cell<Option<(FxIndexSet<QueryEdge>, FxHashSet<DatabaseKeyIndex>)>> = const { std::cell::Cell::new(None) };
+    #[allow(clippy::type_complexity)]
+    static FLATTEN_MAPS: std::cell::Cell<Option<(FxIndexSet<QueryEdge>, FxHashSet<DatabaseKeyIndex>, Vec<EdgeFingerprint>)>> = const { std::cell::Cell::new(None) };
 }
 
 fn complete_cycle_query(
@@ -951,7 +952,7 @@ fn complete_cycle_query(
     active_query: ActiveQueryGuard<'_>,
     iteration: IterationStamp,
 ) -> CompletedQuery {
-    let (mut flattened, mut seen) = FLATTEN_MAPS.take().unwrap_or_default();
+    let (mut flattened, mut seen, mut fingerprints) = FLATTEN_MAPS.take().unwrap_or_default();
 
     debug_assert!(flattened.is_empty());
     debug_assert!(seen.is_empty());
@@ -966,7 +967,7 @@ fn complete_cycle_query(
     );
 
     seen.clear();
-    let edge_fingerprints = flattened_edge_fingerprints(zalsa, &flattened);
+    let edge_fingerprints = flattened_edge_fingerprints(zalsa, &flattened, &mut fingerprints);
     let zalsa_local = detached_query.zalsa_local();
     let completion = detached_query
         .pop_completion(iteration, true)
@@ -980,7 +981,7 @@ fn complete_cycle_query(
             .is_empty(),
         "Fixpoint iteration doesn't support accumulated values because it doesn't preserve the original query dependency tree."
     );
-    FLATTEN_MAPS.set(Some((flattened, seen)));
+    FLATTEN_MAPS.set(Some((flattened, seen, fingerprints)));
     completed_query
 }
 
@@ -992,31 +993,28 @@ fn complete_cycle_query(
 fn flattened_edge_fingerprints(
     zalsa: &Zalsa,
     flattened: &FxIndexSet<QueryEdge>,
+    fingerprints: &mut Vec<EdgeFingerprint>,
 ) -> ThinVec<EdgeFingerprint> {
-    flattened
-        .iter()
-        .enumerate()
-        .filter_map(|(position, edge)| {
-            if !matches!(edge.kind(), QueryEdgeKind::Input) {
-                return None;
-            }
-            let input = edge.key();
-            let memo = zalsa
-                .lookup_ingredient(input.ingredient_index())
-                .as_function()?
-                .memo(zalsa, input.key_index())?;
-            let header = memo.header();
-            let fingerprint = header.revisions.value_fingerprint();
-            (fingerprint.is_value() && !header.may_be_provisional()).then(|| EdgeFingerprint {
-                edge: u32::try_from(position)
-                    .ok()
-                    .filter(|&edge| edge != EdgeFingerprint::VALUE)
-                    .expect("exceeded `u32::MAX - 1` query edges; this should never happen"),
-                fingerprint,
-            })
+    fingerprints.extend(flattened.iter().enumerate().filter_map(|(position, edge)| {
+        if !matches!(edge.kind(), QueryEdgeKind::Input) {
+            return None;
+        }
+        let input = edge.key();
+        let memo = zalsa
+            .lookup_ingredient(input.ingredient_index())
+            .as_function()?
+            .memo(zalsa, input.key_index())?;
+        let header = memo.header();
+        let fingerprint = header.revisions.value_fingerprint();
+        (fingerprint.is_value() && !header.may_be_provisional()).then(|| EdgeFingerprint {
+            edge: u32::try_from(position)
+                .ok()
+                .filter(|&edge| edge != EdgeFingerprint::VALUE)
+                .expect("exceeded `u32::MAX - 1` query edges; this should never happen"),
+            fingerprint,
         })
-        // alloc: once per cycle head that converges, for its flattened edges' fingerprints
-        .collect()
+    }));
+    crate::active_query::exact_thin_vec(fingerprints)
 }
 
 /// Flattens the dependencies of `head` so that `head`'s origin only depends on finalized queries,

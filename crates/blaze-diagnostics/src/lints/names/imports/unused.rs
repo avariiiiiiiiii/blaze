@@ -23,13 +23,14 @@
 use std::sync::LazyLock;
 
 use base_db::{CrateOrigin, LangCrateOrigin};
+use blaze_mem::Frame;
 use memchr::memmem;
 use cfg::CfgAtom;
 use hir::InFile;
 use hir_def::{ModuleDefId, ModuleId};
 use hir_expand::name::Name;
 use intern::sym;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use syntax::{
     AstNode, NodeOrToken, SyntaxNode, SyntaxNodePtr, TextRange,
@@ -57,8 +58,9 @@ pub(super) struct Unused {
 }
 
 impl Unused {
-    pub(super) fn of(cx: &Cx<'_, '_>, uses: &Uses) -> Unused {
+    pub(super) fn of(cx: &Cx<'_, '_>, uses: &Uses<'_>) -> Unused {
         let mut out =
+            // alloc: both hold only diagnostics that fire; empty, they allocate nothing
             Unused { resolve: Vec::new(), bodies: Vec::new(), unused: FxHashSet::default(), redundant: FxHashSet::default() };
         let extern_crates = cx.lint_may_fire(LintId::named("unused_extern_crates"));
         let mut maybe_unused_crates = FxHashSet::default();
@@ -74,7 +76,8 @@ impl Unused {
             }
         }
 
-        let mut candidates = Candidates::of(&uses.candidates);
+        let mut candidates = Candidates::of(cx.frame(), &uses.candidates);
+        // alloc: holds only the `use` items with an unused tree, each linted by `unused_imports`
         let mut unused_trees: Vec<(usize, Trees)> = Vec::new();
         for (i, item) in uses.items.iter().enumerate() {
             let mut unused = Trees::default();
@@ -130,10 +133,11 @@ impl Unused {
         // What is redundant is read by `unused_qualifications` too.
         let redundant = cx.lint_may_fire(LintId::named("redundant_imports"))
             || cx.lint_may_fire(LintId::named("unused_qualifications"));
-        let mut seen: FxHashSet<ModuleId> = match redundant {
-            true => FxHashSet::with_capacity_and_hasher(uses.by_module.len(), Default::default()),
-            false => FxHashSet::default(),
-        };
+        let mut seen: hashbrown::HashSet<ModuleId, FxBuildHasher, _> = hashbrown::HashSet::with_capacity_and_hasher_in(
+            if redundant { uses.by_module.len() } else { 0 },
+            FxBuildHasher,
+            cx.frame(),
+        );
         for module in uses.items.iter().map(|it| it.module).filter(|_| redundant) {
             if !seen.insert(module) {
                 continue;
@@ -160,23 +164,26 @@ impl Unused {
             let Some(path) = tree.node.path() else { continue };
             let span = cx.span(InFile::new(item.node.file_id, path.syntax().text_range()));
             let message = match cx.snippet(&span) {
+                // alloc: the message of a lint that fires
                 Some(snippet) => format!("unused import: `{snippet}`"),
+                // alloc: the message of a lint that fires
                 None => "unused import".to_owned(),
             };
             let mut diag = Diag::lint("unused_imports", message, span);
             if let Some(name) = &tree.name {
+                // alloc: the fact of a lint that fires
                 diag.fact(cx.resolves_fact(item.module.into(), name.as_str()), format!("what uses `{}`", name.as_str()));
             }
             let root = item.trees.first().is_some_and(|it| it.node == tree.node);
-            let at = if root { item.node.value.syntax().clone() } else { tree.node.syntax().clone() };
-            out.bodies.push(Found::lint(diag, Phase::Bodies, InFile::new(item.node.file_id, SyntaxNodePtr::new(&at))));
+            let at = if root { item.node.value.syntax() } else { tree.node.syntax() };
+            out.bodies.push(Found::lint(diag, Phase::Bodies, InFile::new(item.node.file_id, SyntaxNodePtr::new(at))));
         }
         out
     }
 
     /// The lints of the `#[macro_use]` imports of `krate`: rustc's `MACRO_USE_EXTERN_CRATE`
     /// for a used one, `UNUSED_IMPORTS` for one nothing is found through.
-    fn macro_use(&mut self, cx: &Cx<'_, '_>, uses: &Uses, krate: &ExternCrate) {
+    fn macro_use(&mut self, cx: &Cx<'_, '_>, uses: &Uses<'_>, krate: &ExternCrate) {
         let Some(loaded) = krate.krate else { return };
         let at = krate.node.as_ref().map(|it| SyntaxNodePtr::new(it.syntax()));
         for (range, name) in &krate.macro_use {
@@ -185,7 +192,7 @@ impl Unused {
             {
                 continue;
             }
-            let used = uses.macro_uses.contains(&(krate.id, name.clone()));
+            let used = uses.macro_uses.contains(&(krate.id, *name));
             let lint = match used {
                 true => LintId::named("macro_use_extern_crate"),
                 false => LintId::named("unused_imports"),
@@ -207,23 +214,26 @@ impl Unused {
             };
             let module = hir::Module::from(krate.module);
             let name = krate.name.as_str();
+            // alloc: the fact of a lint that fires
             diag.fact(cx.resolves_fact(module, name), format!("which macros of `{name}` are used"));
             self.resolve.push(Found::lint(diag, Phase::Resolve, at));
         }
     }
 
     /// `unused_extern_crates` of `krate`: unused, or one a `use` could replace.
-    fn extern_crate(&mut self, cx: &Cx<'_, '_>, uses: &Uses, krate: &ExternCrate, maybe_unused: &FxHashSet<hir_def::ExternCrateId>) {
+    fn extern_crate(&mut self, cx: &Cx<'_, '_>, uses: &Uses<'_>, krate: &ExternCrate, maybe_unused: &FxHashSet<hir_def::ExternCrateId>) {
         let node = &krate.node;
         let at = node.as_ref().map(|it| SyntaxNodePtr::new(it.syntax()));
         let name = krate.name.as_str();
         let module = hir::Module::from(krate.module);
         if !name.starts_with('_') && maybe_unused.contains(&krate.id) {
             let span = cx.span(node.as_ref().map(|it| item_range(it.syntax())));
+            // clone: the lint fires; its span is both the primary span and the label's
             let mut diag = Diag::lint("unused_extern_crates", "unused extern crate", span.clone());
             diag.span_label(span, "unused");
             let removal = cx.span(node.as_ref().map(|it| with_attrs(it.syntax())));
             diag.suggestion_verbose(removal, "remove the unused `extern crate`", "", Applicability::MachineApplicable);
+            // alloc: the fact of a lint that fires
             diag.fact(cx.resolves_fact(module, name), format!("what uses `{name}`"));
             self.resolve.push(Found::lint(diag, Phase::Resolve, at));
             return;
@@ -252,36 +262,46 @@ impl Unused {
             code,
             Applicability::MachineApplicable,
         );
+        // alloc: the fact of a lint that fires
         diag.fact(cx.resolves_fact(module, name), format!("what `{name}` is in the extern prelude"));
         self.resolve.push(Found::lint(diag, Phase::Resolve, at));
     }
 
-    /// The `unused_imports` diagnostic of `item`, whose trees `unused` are unused.
+    /// The `unused_imports` diagnostic of `item`, whose trees `unused` are unused: what it
+    /// builds is the lint's, which fires unless every tree turns out used.
     fn unused_imports(&mut self, cx: &Cx<'_, '_>, item: &UseItem, unused: &Trees) {
         let file = item.node.file_id;
         let children = children(item);
         let item_span = with_attrs(item.node.value.syntax());
         let (spans, remove) = match calc_unused_spans(item, &children, unused, 0, item_span) {
             Calc::Used => return,
+            // alloc: the removal of a lint that fires
             Calc::Unused { spans, remove } => (spans, vec![remove]),
             Calc::Partial { spans, remove } => (spans, remove),
         };
+        // alloc: the spans of a lint that fires
         let spans: Vec<Span> = spans.into_iter().map(|it| cx.span(InFile::new(file, it))).collect();
+        // alloc: the snippets of the message of a lint that fires
         let mut snippets: Vec<String> = spans.iter().filter_map(|it| cx.snippet(it)).map(|it| format!("`{it}`")).collect();
         snippets.sort();
         let list = and_list(&snippets);
         let message =
+            // alloc: the message of a lint that fires
             if snippets.len() == 1 { format!("unused import: {list}") } else { format!("unused imports: {list}") };
         let Some((first, rest)) = spans.split_first() else { return };
+        // clone: the lint fires; `spans` stays for the count of the suggestion's message
         let mut diag = Diag::lint("unused_imports", message, first.clone());
         for span in rest {
+            // clone: the lint fires; `spans` stays for the count of the suggestion's message
             diag.primary(span.clone());
         }
         let remove_whole_use = remove.len() == 1 && remove[0] == item_span;
+        // alloc: the removals of a lint that fires
         let remove: Vec<Span> = remove.into_iter().map(|it| cx.span(InFile::new(file, it))).collect();
         if remove.iter().all(|it| it.expansion.is_none()) {
             if remove_whole_use {
                 diag.suggestion_with_style(
+                    // clone: alloc: the suggestion of a lint that fires
                     vec![(remove[0].clone(), String::new())],
                     "remove the whole `use` item",
                     Applicability::MachineApplicable,
@@ -290,6 +310,7 @@ impl Unused {
             } else {
                 let message = if spans.len() == 1 { "remove the unused import" } else { "remove the unused imports" };
                 diag.suggestion_with_style(
+                    // alloc: the suggestion of a lint that fires
                     remove.into_iter().map(|it| (it, String::new())).collect(),
                     message,
                     Applicability::MachineApplicable,
@@ -305,6 +326,7 @@ impl Unused {
         let module = hir::Module::from(item.module);
         for j in unused.iter() {
             if let Some(name) = &item.trees[j].name {
+                // alloc: the fact of a lint that fires
                 diag.fact(cx.resolves_fact(module, name.as_str()), format!("what uses `{}`", name.as_str()));
             }
         }
@@ -315,15 +337,17 @@ impl Unused {
 
 /// rustc's `maybe_unused_trait_imports`, an `IndexSet`: the order, and each binding's place in
 /// it. `contains` and `swap_remove` are one FxHash lookup each.
-struct Candidates {
-    order: Vec<Binding>,
-    at: FxHashMap<Binding, u32>,
+struct Candidates<'f> {
+    order: Vec<Binding, &'f Frame>,
+    at: hashbrown::HashMap<Binding, u32, FxBuildHasher, &'f Frame>,
 }
 
-impl Candidates {
-    fn of(candidates: &[Binding]) -> Candidates {
-        let order = candidates.to_vec();
-        let at = order.iter().enumerate().map(|(i, it)| (*it, i as u32)).collect();
+impl<'f> Candidates<'f> {
+    fn of(frame: &'f Frame, candidates: &[Binding]) -> Candidates<'f> {
+        let mut order = Vec::with_capacity_in(candidates.len(), frame);
+        order.extend_from_slice(candidates);
+        let mut at = hashbrown::HashMap::with_capacity_and_hasher_in(candidates.len(), FxBuildHasher, frame);
+        at.extend(candidates.iter().enumerate().map(|(i, it)| (*it, i as u32)));
         Candidates { order, at }
     }
 
@@ -346,7 +370,7 @@ type Trees = SmallSet;
 
 /// Whether name resolution used `binding`, or it did not resolve (rustc's dummy binding of
 /// an unresolved import counts as used).
-fn is_used(uses: &Uses, binding: Binding, tree: &Tree) -> bool {
+fn is_used(uses: &Uses<'_>, binding: Binding, tree: &Tree) -> bool {
     if uses.used.contains_key(&binding) {
         return true;
     }
@@ -374,7 +398,8 @@ enum Calc {
     Partial { spans: Vec<TextRange>, remove: Vec<TextRange> },
 }
 
-/// rustc's `calc_unused_spans` of the tree `j` of `item`.
+/// rustc's `calc_unused_spans` of the tree `j` of `item`, for the `unused_imports` lint of an
+/// item with an unused tree.
 fn calc_unused_spans(
     item: &UseItem,
     children: &FxHashMap<usize, Vec<usize>>,
@@ -387,14 +412,18 @@ fn calc_unused_spans(
     let full_span = if j == 0 { item_span } else { span };
     match tree.kind {
         TreeKind::Simple | TreeKind::Glob => {
+            // alloc: the spans of a lint that fires
             if unused.contains(j) { Calc::Unused { spans: vec![span], remove: full_span } } else { Calc::Used }
         }
         TreeKind::List => {
             let nested = children.get(&j).map(Vec::as_slice).unwrap_or(&[]);
             if nested.is_empty() {
+                // alloc: the spans of a lint that fires
                 return Calc::Unused { spans: vec![span], remove: full_span };
             }
+            // alloc: the spans of a lint that fires; empty, it allocates nothing
             let mut unused_spans = Vec::new();
+            // alloc: the removals of a lint that fires; empty, it allocates nothing
             let mut to_remove: Vec<TextRange> = Vec::new();
             let mut used_children = 0;
             let mut contains_self = false;
@@ -465,7 +494,7 @@ fn calc_unused_spans(
 
 /// rustc's `redundant_imports` of the single import `tree`: each namespace it imports in
 /// resolves to the same without it.
-fn redundant(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree, binding: Binding) -> Option<Found> {
+fn redundant(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem, tree: &Tree, binding: Binding) -> Option<Found> {
     if tree.self_import
         || tree.underscore
         || item.node.file_id.is_macro()
@@ -487,48 +516,78 @@ fn redundant(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree, binding:
         if ns == Ns::Macros {
             return None;
         }
-        let (def, range, import) = without(cx, uses, item, binding, name, ns)?;
+        let (def, bound) = without(cx, uses, item, binding, name, ns)?;
         if def != mine.def {
             return None;
         }
+        let (range, import) = match bound {
+            Bound::Glob(range) => (Some(range), true),
+            Bound::Entry(found) => {
+                let (range, import) = binding_range(cx, uses, found)?;
+                (Some(range), import)
+            }
+            Bound::ExternCrate(krate) => (Some(krate.node.as_ref().map(|it| item_range(it.syntax()))), true),
+            Bound::Prelude => (None, false),
+        };
         ranges.push((range, import));
     }
     if ranges.is_empty() {
         return None;
     }
     let mut found: SmallVec<[(Option<Span>, bool); 3]> =
+        // alloc: the labels of a lint that fires, inline for the three namespaces
         ranges.into_iter().map(|(range, import)| (range.map(|it| cx.span(it)), import)).collect();
     found.sort_by_key(|(span, import)| (span.as_ref().map(|it| (it.lo, it.hi)), *import));
     found.dedup();
+    // alloc: the lint fires; the name goes into its message, labels and fact
     let text = source.text().to_string();
     let span = cx.span(InFile::new(item.node.file_id, tree.node.syntax().text_range()));
+    // clone: alloc: the message of a lint that fires, whose span its labels may share
     let mut diag = Diag::lint("redundant_imports", format!("the item `{text}` is imported redundantly"), span.clone());
     for (other, import) in found {
         let label = match (other.is_some(), import) {
+            // alloc: a label of a lint that fires
             (true, true) => format!("the item `{text}` is already imported here"),
+            // alloc: a label of a lint that fires
             (true, false) => format!("the item `{text}` is already defined here"),
+            // alloc: a label of a lint that fires
             (false, true) => format!("the item `{text}` is already imported by the extern prelude"),
+            // alloc: a label of a lint that fires
             (false, false) => format!("the item `{text}` is already defined by the extern prelude"),
         };
+        // clone: a label of a lint that fires, at the import when nothing else is placed
         diag.span_label(other.unwrap_or_else(|| span.clone()), label);
     }
+    // alloc: the fact of a lint that fires
     diag.fact(cx.resolves_fact(item.module.into(), &text), format!("what `{text}` is in scope as"));
     let at = InFile::new(item.node.file_id, SyntaxNodePtr::new(tree.node.syntax()));
     Some(Found::lint(diag, Phase::Resolve, at))
 }
 
+/// Where the binding [`without`] finds is: placed only once its definition is known to be
+/// the import's, since placing an item reads its source.
+enum Bound<'u> {
+    /// A glob import's, at its tree.
+    Glob(InFile<TextRange>),
+    /// One of a module around the item; [`binding_range`] places it.
+    Entry(Entry),
+    /// The crate root's `extern crate` item.
+    ExternCrate(&'u ExternCrate),
+    /// The extern prelude's or the builtin types'.
+    Prelude,
+}
+
 /// What `name` resolves to in `ns` where `item` is, were `binding` not there: rustc's
-/// `resolve_ident_in_scope_set` ignoring the import. The definition, where the binding found
-/// is (`None` for the extern prelude's and the builtin types'), and whether it is an import;
-/// `None` when it is not found, or not where this can tell.
-fn without(
+/// `resolve_ident_in_scope_set` ignoring the import. The definition and where the binding
+/// found is; `None` when it is not found, or not where this can tell.
+fn without<'u>(
     cx: &Cx<'_, '_>,
-    uses: &Uses,
+    uses: &'u Uses<'_>,
     item: &UseItem,
     binding: Binding,
     name: &Name,
     ns: Ns,
-) -> Option<(ModuleDefId, Option<InFile<TextRange>>, bool)> {
+) -> Option<(ModuleDefId, Bound<'u>)> {
     let db = cx.db;
     let in_glob = |from: ModuleDefId| match from {
         ModuleDefId::ModuleId(from) => entry(&from.def_map(db).module(db, from).name_in_scope(db, name), ns),
@@ -548,7 +607,7 @@ fn without(
                 if globs.any(|(_, _, it)| it.def != found.def) {
                     return None;
                 }
-                return Some((found.def, Some(InFile::new(glob_item.node.file_id, glob.node.syntax().text_range())), true));
+                return Some((found.def, Bound::Glob(InFile::new(glob_item.node.file_id, glob.node.syntax().text_range()))));
             }
         } else if let Some(found) = entry(&at.def_map(db).module(db, at).name_in_scope(db, name), ns) {
             if let Some(Binding::Glob(_)) = found.import
@@ -559,8 +618,7 @@ fn without(
             {
                 return None;
             }
-            let (range, import) = binding_range(cx, uses, found)?;
-            return Some((found.def, Some(range), import));
+            return Some((found.def, Bound::Entry(found)));
         }
         if !at.is_block_module(db) {
             break;
@@ -573,19 +631,18 @@ fn without(
     let root: ModuleId = cx.krate.root_module(db).into();
     if let Some(krate) = uses.crates.iter().find(|it| it.module == root && it.name == *name) {
         let loaded = krate.krate?;
-        let range = krate.node.as_ref().map(|it| item_range(it.syntax()));
-        return Some((ModuleDefId::ModuleId(loaded.root_module(db).into()), Some(range), true));
+        return Some((ModuleDefId::ModuleId(loaded.root_module(db).into()), Bound::ExternCrate(krate)));
     }
     if uses.extern_prelude.contains(name) {
-        let dep = cx.krate.dependencies(db).into_iter().find(|it| it.name == *name)?;
-        return Some((ModuleDefId::ModuleId(dep.krate.root_module(db).into()), None, false));
+        let dep = cx.krate.dependencies_iter(db).find(|it| it.name == *name)?;
+        return Some((ModuleDefId::ModuleId(dep.krate.root_module(db).into()), Bound::Prelude));
     }
     let builtin = hir_def::builtin_type::BuiltinType::by_name(name)?;
-    Some((ModuleDefId::BuiltinType(builtin), None, false))
+    Some((ModuleDefId::BuiltinType(builtin), Bound::Prelude))
 }
 
 /// Where the binding `found` is, and whether it is an import's.
-fn binding_range(cx: &Cx<'_, '_>, uses: &Uses, found: Entry) -> Option<(InFile<TextRange>, bool)> {
+fn binding_range(cx: &Cx<'_, '_>, uses: &Uses<'_>, found: Entry) -> Option<(InFile<TextRange>, bool)> {
     match found.import {
         Some(binding @ (Binding::Import(_) | Binding::Glob(_))) => {
             let (item, tree) = uses.tree(binding)?;
@@ -606,6 +663,7 @@ fn binding_range(cx: &Cx<'_, '_>, uses: &Uses, found: Entry) -> Option<(InFile<T
 fn def_item(cx: &Cx<'_, '_>, def: ModuleDefId) -> Option<InFile<SyntaxNode>> {
     use hir::HasSource;
     fn node<N: AstNode>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
+        // clone: a rowan cursor's refcount, for `redundant_imports` once it fires
         it.map(|it| it.map(|it| it.syntax().clone()))
     }
     let db = cx.db;
@@ -636,12 +694,17 @@ fn with_attrs(node: &SyntaxNode) -> TextRange {
     TextRange::new(start, node.text_range().end())
 }
 
-/// rustc's `StrListSepByAnd`: `a`, `a and b`, `a, b, and c`.
+/// rustc's `StrListSepByAnd`: `a`, `a and b`, `a, b, and c`, for the message of a lint that
+/// fires.
 fn and_list(items: &[String]) -> String {
     match items {
+        // alloc: empty, it allocates nothing
         [] => String::new(),
+        // clone: the message of a lint that fires
         [one] => one.clone(),
+        // alloc: the message of a lint that fires
         [a, b] => format!("{a} and {b}"),
+        // alloc: the message of a lint that fires
         [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
     }
 }
@@ -674,22 +737,30 @@ fn test_module(cx: &Cx<'_, '_>, module: ModuleId) -> Option<Span> {
     Some(span.with_hi(span.lo + head.len() as u32))
 }
 
-/// rustc's `module_to_string`: the names from the root to `module`, `None` for the root.
+/// rustc's `module_to_string`: the names from the root to `module`, `None` for the root. Only
+/// the `unused_imports` lint that fires asks, for its help.
 fn module_path(cx: &Cx<'_, '_>, module: ModuleId) -> Option<String> {
     let db = cx.db;
-    let mut names = Vec::new();
+    let mut names: SmallVec<[Name; 8]> = SmallVec::new();
     let mut at = Some(module);
     while let Some(it) = at {
         if let Some(name) = it.name(db) {
-            names.push(name.as_str().to_owned());
+            names.push(name);
         }
         at = it.def_map(db).module(db, it).parent;
     }
     if names.is_empty() {
         return None;
     }
-    names.reverse();
-    Some(names.join("::"))
+    // alloc: the help of a lint that fires
+    let mut path = String::with_capacity(32);
+    for (i, name) in names.iter().rev().enumerate() {
+        if i > 0 {
+            path.push_str("::");
+        }
+        path.push_str(name.as_str());
+    }
+    Some(path)
 }
 
 /// Whether `module`, or a module it is in, is `#![no_implicit_prelude]`.
@@ -699,20 +770,25 @@ fn no_implicit_prelude(cx: &Cx<'_, '_>, module: ModuleId) -> bool {
     while let Some(id) = at {
         let module = hir::Module::from(id);
         let source = module.definition_source(db).value;
-        let mut attrs: Vec<ast::Attr> = match &source {
-            hir::ModuleSource::SourceFile(it) => ast::attrs_including_inner(it).collect(),
-            hir::ModuleSource::Module(it) => ast::attrs_including_inner(it).collect(),
-            hir::ModuleSource::BlockExpr(_) => Vec::new(),
+        let inner = match &source {
+            hir::ModuleSource::SourceFile(it) => ast::attrs_including_inner(it).any(is_no_implicit_prelude),
+            hir::ModuleSource::Module(it) => ast::attrs_including_inner(it).any(is_no_implicit_prelude),
+            hir::ModuleSource::BlockExpr(_) => false,
         };
-        if let Some(declared) = module.declaration_source(db) {
-            attrs.extend(ast::HasAttrs::attrs(&declared.value));
-        }
-        if attrs.iter().any(|it| it.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "no_implicit_prelude")) {
+        if inner
+            || module
+                .declaration_source(db)
+                .is_some_and(|declared| ast::HasAttrs::attrs(&declared.value).any(is_no_implicit_prelude))
+        {
             return true;
         }
         at = id.def_map(db).containing_module(db, id);
     }
     false
+}
+
+fn is_no_implicit_prelude(attr: ast::Attr) -> bool {
+    attr.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == "no_implicit_prelude")
 }
 
 /// Whether the crate `krate` exports a macro named `name` at its root.
@@ -734,7 +810,7 @@ fn may_be_unused(cx: &Cx<'_, '_>, krate: hir::Crate) -> bool {
         CrateOrigin::Lang(_) => return false,
         _ => {}
     }
-    for module in krate.modules(db) {
+    for module in krate.modules_iter(db) {
         let Some(file) = module.as_source_file_id(db) else { continue };
         if mentions_kept(cx.file_text(file.file_id(db)).as_bytes()) {
             return false;

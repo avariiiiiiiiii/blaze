@@ -13,10 +13,11 @@ use anyhow::bail;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::{
     Dependency, IndexSummary, MemRegistry, OptVersionReq, QueryKind, Registry, SourceId,
+    query_pinned,
 };
 use rustc_hash::FxHashMap;
 
-use super::index::{IndexLine, index_summary, parse_file};
+use super::index::{Lines, index_summary};
 use super::{IndexFile, Sources};
 use crate::query::Fetch;
 
@@ -31,7 +32,7 @@ pub(crate) struct Index<'s, 'c, 'db> {
     cx: RefCell<&'c mut Cx<'db>>,
     pinned: MemRegistry,
     /// Each index file read, by its registry and the name asked for.
-    files: RefCell<FxHashMap<SourceId, FxHashMap<String, Rc<Vec<IndexLine>>>>>,
+    files: RefCell<FxHashMap<SourceId, FxHashMap<String, Rc<Lines>>>>,
     needs: RefCell<Vec<Fetch>>,
     cancelled: Cell<bool>,
 }
@@ -73,19 +74,19 @@ impl<'s, 'c, 'db> Index<'s, 'c, 'db> {
     }
 
     /// The lines of `name`'s index file in the registry `from`, read once.
-    fn lines(&self, from: SourceId, name: &str) -> anyhow::Result<Rc<Vec<IndexLine>>> {
+    fn lines(&self, from: SourceId, name: &str) -> anyhow::Result<Rc<Lines>> {
         if let Some(lines) = self.files.borrow().get(&from).and_then(|it| it.get(name)) {
             return Ok(lines.clone());
         }
         let lines = match self.read(|cx| self.sources.index_file(cx, from, name))? {
-            IndexFile::Here(bytes) => parse_file(&bytes),
-            IndexFile::Absent => Vec::new(),
+            IndexFile::Here(bytes) => Lines::new(bytes),
+            IndexFile::Absent => Lines::empty(),
             IndexFile::Needs(fetch) => {
                 let mut needs = self.needs.borrow_mut();
                 if !needs.iter().any(|it| it.at == fetch.at) {
                     needs.push(fetch);
                 }
-                Vec::new()
+                Lines::empty()
             }
             IndexFile::Failed(error) => return Err(error),
         };
@@ -104,10 +105,10 @@ impl<'s, 'c, 'db> Index<'s, 'c, 'db> {
         name: &str,
         req: &OptVersionReq,
         source: SourceId,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> anyhow::Result<()> {
         let lines = self.lines(from, name)?;
-        let lines: Vec<&IndexLine> = lines.iter().filter(|it| req.matches(&it.entry.version)).collect();
+        let lines: Vec<_> = lines.matching(|version| req.matches(version)).collect();
         if self.sources.offline().is_some() {
             let mut called = false;
             for line in &lines {
@@ -140,7 +141,7 @@ impl<'s, 'c, 'db> Index<'s, 'c, 'db> {
         kind: QueryKind,
         source: SourceId,
         from: SourceId,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> anyhow::Result<()> {
         let name = dep.package_name();
         let mut req = dep.version_req().clone();
@@ -194,29 +195,13 @@ impl Registry for Index<'_, '_, '_> {
         &self,
         dep: &Dependency,
         kind: QueryKind,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> anyhow::Result<()> {
         let source = dep.source_id();
         let registry = self.sources.registry_of(source)?;
-        if kind == QueryKind::Exact && (registry.is_none() || dep.version_req().is_locked()) {
-            let mut found = false;
-            self.pinned
-                .query(dep, kind, &mut |it| {
-                    found = true;
-                    f(it)
-                })
-                .await?;
-            if found || source.is_path() {
-                return Ok(());
-            }
-            if registry.is_none() {
-                bail!(
-                    "`{}` of {} is not pinned by Cargo.lock, and blaze reads that source only at \
-                     the versions Cargo.lock pins",
-                    dep.package_name(),
-                    self.describe_source(source)
-                );
-            }
+        let describe = |it: SourceId| self.describe_source(it);
+        if query_pinned(&self.pinned, registry.is_some(), dep, kind, f, describe).await? {
+            return Ok(());
         }
         match registry {
             Some(from) => self.query_registry(dep, kind, source, from, f),

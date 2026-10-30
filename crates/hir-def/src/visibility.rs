@@ -53,7 +53,6 @@ impl Visibility {
         matches!(self, Visibility::Public)
     }
 
-    #[tracing::instrument(skip_all)]
     pub fn is_visible_from<'db>(
         self,
         db: &'db Db,

@@ -10,6 +10,7 @@ use cargo_util_schemas::core::{GitReference, SourceKind};
 use url::Url;
 
 use super::{Config, SourceConfigDef, Value};
+use crate::files::Files;
 use crate::source::{CRATES_IO_REGISTRY, SourceId, into_url};
 
 const CRATES_IO_HTTP_INDEX: &str = "sparse+https://index.crates.io/";
@@ -33,7 +34,7 @@ pub enum Replacement {
     Registry(String),
 }
 
-impl Config {
+impl<F: Files> Config<F> {
     /// crates.io as cargo reaches it: its sparse index unless
     /// `registries.crates-io.protocol = "git"`.
     pub fn crates_io_maybe_sparse_http(&self) -> anyhow::Result<SourceId> {

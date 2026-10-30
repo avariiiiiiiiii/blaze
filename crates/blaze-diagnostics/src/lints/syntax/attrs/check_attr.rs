@@ -45,9 +45,16 @@
 
 mod meta;
 
+use std::borrow::Cow;
+
 use base_db::TargetKind;
+use hir::InFile;
+use smallvec::SmallVec;
 use span::Edition;
-use syntax::{AstNode, AstToken, SyntaxKind, SyntaxToken, ast};
+use syntax::{
+    SyntaxKind, TextRange,
+    view::{self as ast, AstNode, AstToken},
+};
 
 use self::meta::{Inner, ItemArgs};
 use super::super::{Emitted, Walk, source_fact};
@@ -59,10 +66,12 @@ use crate::{
 
 /// The lints `check_mod_attrs` gives of the attributes of `owners`, each node's in rustc's
 /// order.
-pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner]) -> Vec<Emitted> {
+pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner<'_>]) -> Vec<Emitted> {
     let types = CrateTypes::of(cx, owners);
+    // alloc: empty, allocates nothing until a lint
     let mut emitted = Vec::new();
-    let mut words: Vec<Option<SyntaxToken>> = Vec::new();
+    // alloc: one buffer for the crate, cleared for each owner
+    let mut words: Vec<Option<&str>> = Vec::new();
     // A macro call is expanded before HIR: `check_mod_attrs` never sees its attributes.
     for owner in owners.iter().filter(|it| it.target != Target::MacroCall) {
         words.clear();
@@ -74,7 +83,7 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner]) -> Vec<E
         };
         for (attr, word) in owner.attrs.iter().zip(&words) {
             if let Some(word) = word
-                && let Some(diag) = unused(cx, owner, attr, word.text(), types)
+                && let Some(diag) = unused(cx, owner, attr, word, types)
             {
                 emit(diag);
             }
@@ -99,34 +108,29 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner]) -> Vec<E
 
 /// A node being checked, with the one-word path of each of its attributes.
 struct Node<'a> {
-    owner: &'a Owner,
-    words: &'a [Option<SyntaxToken>],
+    owner: &'a Owner<'a>,
+    words: &'a [Option<&'a str>],
 }
 
 impl<'a> Node<'a> {
     /// Its attributes whose path is the one word `name`, in order.
-    fn named(&self, name: &'a str) -> impl Iterator<Item = &'a Attr> + 'a {
-        self.owner
-            .attrs
-            .iter()
-            .zip(self.words)
-            .filter(move |(_, word)| word.as_ref().is_some_and(|it| it.text() == name))
-            .map(|(attr, _)| attr)
+    fn named(&self, name: &'a str) -> impl Iterator<Item = &'a Attr<'a>> + 'a {
+        self.owner.attrs.iter().zip(self.words).filter(move |(_, word)| **word == Some(name)).map(|(attr, _)| attr)
     }
 }
 
 /// An attribute's path when it is one word (rustc's `name()` of a one-segment path): the
-/// token of that word.
-fn word(attr: &Attr) -> Option<SyntaxToken> {
+/// text of that word's token.
+fn word<'t>(attr: &Attr<'t>) -> Option<&'t str> {
     let path = attr.meta()?.path()?;
     if path.segment()?.coloncolon_token().is_some() {
         return None;
     }
-    path.as_single_name_ref()?.syntax().first_token()
+    Some(path.as_single_name_ref()?.syntax().first_token()?.text())
 }
 
 /// `attr`'s span, as rustc's `attr.span()`.
-fn span_of(cx: &Cx<'_, '_>, attr: &Attr) -> Span {
+fn span_of(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> Span {
     cx.span(attr.in_file(attr.range()))
 }
 
@@ -146,7 +150,7 @@ impl CrateTypes {
     /// rustc's `collect_crate_types`: `--test` builds an executable; else the `--crate-type`
     /// cargo gives for the target, else (a crate rustc is run on alone) the `#![crate_type]`s
     /// of the crate, else `bin`.
-    fn of(cx: &Cx<'_, '_>, owners: &[Owner]) -> CrateTypes {
+    fn of(cx: &Cx<'_, '_>, owners: &[Owner<'_>]) -> CrateTypes {
         match cx.krate.target_kind(cx.db) {
             TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::BuildScript => CrateTypes::BIN,
             TargetKind::Lib { is_proc_macro: true } => CrateTypes { executable: Some(false), needs_link: Some(true) },
@@ -158,12 +162,12 @@ impl CrateTypes {
         }
     }
 
-    fn from_attrs(owners: &[Owner]) -> CrateTypes {
+    fn from_attrs(owners: &[Owner<'_>]) -> CrateTypes {
         let Some(root) = owners.iter().find(|it| it.target == Target::Crate) else { return CrateTypes::BIN };
         let (mut any, mut executable, mut needs_link) = (false, false, false);
-        for attr in root.attrs.iter().filter(|it| it.inner && word(it).is_some_and(|it| it.text() == "crate_type")) {
+        for attr in root.attrs.iter().filter(|it| it.inner && word(it) == Some("crate_type")) {
             let Some(value) = string_value(attr) else { continue };
-            let (bin, linked) = match value.as_str() {
+            let (bin, linked) = match &*value {
                 "bin" => (true, true),
                 "lib" | "rlib" | "staticlib" => (false, false),
                 "dylib" | "cdylib" | "proc-macro" | "sdylib" => (false, true),
@@ -182,20 +186,22 @@ impl CrateTypes {
 
 /// rustc's `check_unused_attribute` of an attribute it leaves unparsed, whose path is the one
 /// word `name`.
-fn unused(cx: &Cx<'_, '_>, owner: &Owner, attr: &Attr, name: &str, types: CrateTypes) -> Option<Diag> {
+fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, attr: &Attr<'_>, name: &str, types: CrateTypes) -> Option<Diag> {
     let note = match name {
         "allow" | "expect" | "warn" | "deny" | "forbid" => {
             let Args::List(tt) = attr.args() else { return None };
-            let list = meta::list(&tt)?;
+            let list = meta::list(tt)?;
             let lints_named = |names: &[&str]| {
                 list.iter().any(|it| it.item().is_some_and(|it| names.iter().any(|name| it.is(name))))
             };
             if list.is_empty() {
+                // alloc: the diagnostic's text, as is each note below
                 format!("attribute `{name}` with an empty list has no effect")
             } else if let [Inner::Item(item)] = list.as_slice()
                 && matches!(item.args, ItemArgs::NameValue(_))
                 && item.is("reason")
             {
+                // alloc: as above
                 format!("attribute `{name}` without any lints has no effect")
             } else if lints_named(&["linker_messages", "linker_info"]) {
                 if owner.target != Target::Crate {
@@ -204,22 +210,26 @@ fn unused(cx: &Cx<'_, '_>, owner: &Owner, attr: &Attr, name: &str, types: CrateT
                 if types.needs_link != Some(false) {
                     return None;
                 }
+                // alloc: as above
                 "the `linker_messages` and `linker_info` lints can only be controlled at the root of a crate that needs to be linked".to_owned()
             } else if owner.target == Target::Crate
                 && lints_named(&["dead_code_pub_in_binary"])
                 && types.executable == Some(false)
             {
+                // alloc: as above
                 "the `dead_code_pub_in_binary` lint has no effect in library crates".to_owned()
             } else {
                 return None;
             }
         }
         "default_method_body_is_const" => {
+            // alloc: as above
             "`default_method_body_is_const` has been replaced with `const` on traits".to_owned()
         }
         _ => return None,
     };
     let span = span_of(cx, attr);
+    // clone: the diagnostic's span
     let mut diag = Diag::lint("unused_attributes", "unused attribute", span.clone());
     diag.suggestion(span, "remove this attribute", "", Applicability::MachineApplicable);
     diag.note(note);
@@ -228,13 +238,14 @@ fn unused(cx: &Cx<'_, '_>, owner: &Owner, attr: &Attr, name: &str, types: CrateT
 
 /// `linker_messages` or `linker_info` set below the crate root: rustc's `OuterCrateLevelAttr`
 /// with its `!` to add, or `InnerCrateLevelAttr`.
-fn crate_level(cx: &Cx<'_, '_>, attr: &Attr) -> Diag {
+fn crate_level(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> Diag {
     let span = span_of(cx, attr);
     if attr.inner {
         return Diag::lint("unused_attributes", "crate-level attribute should be in the root module", span);
     }
     let bang = until_bracket(cx, &span).shrink_to_hi();
     let mut diag = Diag::lint("unused_attributes", "crate-level attribute should be an inner attribute", span);
+    // alloc: the diagnostic's text
     diag.multipart_suggestion("add a `!`", vec![(bang, "!".to_owned())], Applicability::Unspecified);
     diag
 }
@@ -242,9 +253,11 @@ fn crate_level(cx: &Cx<'_, '_>, attr: &Attr) -> Diag {
 /// rustc's `span_until_char(span, '[')`: up to the first `[`, its white space trimmed; the
 /// whole span when that leaves nothing or more than one line.
 fn until_bracket(cx: &Cx<'_, '_>, span: &Span) -> Span {
+    // clone: the diagnostic's span (`crate_level`)
     let Some(text) = cx.snippet(span) else { return span.clone() };
     let before = text.split('[').next().unwrap_or_default().trim_end();
     if before.is_empty() || before.contains('\n') {
+        // clone: as above
         return span.clone();
     }
     span.with_hi(span.lo + before.len() as u32)
@@ -272,11 +285,11 @@ fn inline(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
 
 /// rustc's `InlineParser` of one `#[inline]`: whether it is `#[inline(never)]`; `None` for one
 /// it rejects (and so keeps the next).
-fn inline_never(attr: &Attr) -> Option<bool> {
+fn inline_never(attr: &Attr<'_>) -> Option<bool> {
     match attr.args() {
         Args::Word => Some(false),
         Args::List(tt) => {
-            let list = meta::list(&tt)?;
+            let list = meta::list(tt)?;
             let [Inner::Item(item)] = list.as_slice() else { return None };
             if !item.is_word() {
                 return None;
@@ -309,7 +322,7 @@ fn exported(node: &Node<'_>) -> bool {
 /// first written. Of several `#[lang]`s the first with a string is taken: one naming no lang
 /// item is an error (E0522) that would leave the next.
 fn weak_lang_item(node: &Node<'_>) -> bool {
-    let first_of = |name: &'static str| node.words.iter().position(|it| it.as_ref().is_some_and(|it| it.text() == name));
+    let first_of = |name: &'static str| node.words.iter().position(|it| *it == Some(name));
     let lang = node.named("lang").find_map(string_value);
     let weak = |lang: &str| matches!(lang, "panic_impl" | "eh_personality");
     match (lang, first_of("panic_handler")) {
@@ -321,12 +334,12 @@ fn weak_lang_item(node: &Node<'_>) -> bool {
 
 /// The name of a well-formed `#[export_name = ".."]`: rustc's `ExportNameParser` takes a string,
 /// neither empty nor with a NUL in it.
-fn export_name(attr: &Attr) -> Option<String> {
+fn export_name<'t>(attr: &Attr<'t>) -> Option<Cow<'t, str>> {
     string_value(attr).filter(|it| !it.is_empty() && !it.contains('\0'))
 }
 
 /// The linkage of a well-formed `#[linkage = ".."]` (rustc's `LinkageParser`).
-fn linkage(attr: &Attr) -> Option<String> {
+fn linkage<'t>(attr: &Attr<'t>) -> Option<Cow<'t, str>> {
     const LINKAGES: &[&str] = &[
         "available_externally",
         "common",
@@ -338,21 +351,21 @@ fn linkage(attr: &Attr) -> Option<String> {
         "weak",
         "weak_odr",
     ];
-    string_value(attr).filter(|it| LINKAGES.contains(&it.as_str()))
+    string_value(attr).filter(|it| LINKAGES.contains(&&**it))
 }
 
 /// The text of `#[path = ".."]`, unescaped, as rustc's `expect_string_literal` takes it.
-fn string_value(attr: &Attr) -> Option<String> {
+fn string_value<'t>(attr: &Attr<'t>) -> Option<Cow<'t, str>> {
     let Args::NameValue(Some(ast::Expr::Literal(lit))) = attr.args() else { return None };
     let ast::LiteralKind::String(text) = lit.kind() else { return None };
-    text.value().ok().map(|it| it.into_owned())
+    text.value().ok()
 }
 
 /// rustc's `check_link`: `#[link]` (any of them; the lint is at the first) on an `extern`
 /// block whose ABI is `Rust`.
 fn link(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
     let attr = node.named("link").next()?;
-    let block = ast::ExternBlock::cast(node.owner.node.value.clone())?;
+    let block = ast::ExternBlock::cast(node.owner.node.value)?;
     // Without a string the ABI is `C`; a string rustc does not know is lowered as `Rust`.
     let abi = block.abi()?.abi_string()?;
     if abi.value().is_ok_and(|it| &*it != "Rust" && ABIS.contains(&&*it)) {
@@ -422,10 +435,10 @@ fn macro_export(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
 
 /// Whether rustc's `MacroExportParser` takes `attr`: `#[macro_export]` or
 /// `#[macro_export(local_inner_macros)]`.
-fn macro_export_parses(attr: &Attr) -> bool {
+fn macro_export_parses(attr: &Attr<'_>) -> bool {
     match attr.args() {
         Args::Word => true,
-        Args::List(tt) => match meta::list(&tt).as_deref() {
+        Args::List(tt) => match meta::list(tt).as_deref() {
             Some([Inner::Item(item)]) => item.is_word() && item.is("local_inner_macros"),
             _ => false,
         },
@@ -446,10 +459,10 @@ enum Hint {
 
 /// rustc's `check_repr` lint: the hints of every `#[repr]` of the node, together, conflict.
 fn repr(cx: &Cx<'_, '_>, walk: &Walk<'_>, node: &Node<'_>) -> Option<Diag> {
-    let mut hints = Vec::new();
+    let mut hints: SmallVec<[(Hint, InFile<TextRange>); 4]> = SmallVec::new();
     for attr in node.named("repr") {
         let Args::List(tt) = attr.args() else { continue };
-        let Some(list) = meta::list(&tt) else { continue };
+        let Some(list) = meta::list(tt) else { continue };
         for inner in &list {
             if let Some(item) = inner.item()
                 && let Some(hint) = hint(item)
@@ -473,9 +486,9 @@ fn repr(cx: &Cx<'_, '_>, walk: &Walk<'_>, node: &Node<'_>) -> Option<Diag> {
 }
 
 /// rustc's `parse_repr` of one hint: what it counts as, or `None` for one it rejects.
-fn hint(item: &meta::Item) -> Option<Hint> {
+fn hint(item: &meta::Item<'_>) -> Option<Hint> {
     let word = item.word()?;
-    match (word, &item.args) {
+    match (word, item.args) {
         ("align", ItemArgs::List(tt)) | ("packed", ItemArgs::List(tt)) => alignment(tt).then_some(Hint::Other),
         ("packed", ItemArgs::Word) => Some(Hint::Other),
         (_, ItemArgs::Word) => match word {
@@ -493,21 +506,21 @@ fn hint(item: &meta::Item) -> Option<Hint> {
 
 /// rustc's `parse_repr_align`: one unsuffixed integer, a power of two of at most 2^29 (below
 /// `isize::MAX` on every target of 32 bits or more).
-fn alignment(tt: &ast::TokenTree) -> bool {
+fn alignment(tt: ast::TokenTree<'_>) -> bool {
     let Some(list) = meta::list(tt) else { return false };
     let [Inner::Lit(lit)] = list.as_slice() else { return false };
-    let Some(int) = ast::IntNumber::cast(lit.clone()) else { return false };
+    let Some(int) = ast::IntNumber::cast(*lit) else { return false };
     int.suffix().is_none() && int.value().is_ok_and(|it| it.is_power_of_two() && it <= 1 << 29)
 }
 
 /// rustc's `is_c_like_enum`: an enum none of whose variants (those `cfg` keeps) has fields,
 /// not even `()` or `{}`.
-fn c_like_enum(walk: &Walk<'_>, owner: &Owner) -> bool {
-    let Some(item) = ast::Enum::cast(owner.node.value.clone()) else { return false };
+fn c_like_enum(walk: &Walk<'_>, owner: &Owner<'_>) -> bool {
+    let Some(item) = ast::Enum::cast(owner.node.value) else { return false };
     let Some(variants) = item.variant_list() else { return true };
     variants
         .variants()
-        .filter(|it| walk.on(&ast::AnyHasAttrs::from(it.clone())))
+        .filter(|it| walk.on(ast::AnyHasAttrs::from(*it)))
         .all(|it| it.field_list().is_none())
 }
 
@@ -516,7 +529,7 @@ fn c_like_enum(walk: &Walk<'_>, owner: &Owner) -> bool {
 fn no_mangle_with_export_name(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> {
     let no_mangle = node.named("no_mangle").next()?;
     let export = node.named("export_name").find(|it| export_name(it).is_some())?;
-    let written = |attr: &Attr, safe: &'static str, unsafe_: &'static str| match attr.file.edition(cx.db) >= Edition::Edition2024 {
+    let written = |attr: &Attr<'_>, safe: &'static str, unsafe_: &'static str| match attr.file.edition(cx.db) >= Edition::Edition2024 {
         true => unsafe_,
         false => safe,
     };
@@ -525,13 +538,18 @@ fn no_mangle_with_export_name(cx: &Cx<'_, '_>, node: &Node<'_>) -> Option<Diag> 
     let no_mangle_span = span_of(cx, no_mangle);
     let mut diag = Diag::lint(
         "unused_attributes",
+        // alloc: the diagnostic's text and spans, as is all below
         format!("`{no_mangle_attr}` attribute may not be used in combination with `{export_name_attr}`"),
+        // clone: as above
         no_mangle_span.clone(),
     );
+    // alloc: as above
     diag.span_label(no_mangle_span.clone(), format!("`{no_mangle_attr}` is ignored"));
+    // alloc: as above
     diag.span_note(span_of(cx, export), format!("`{export_name_attr}` takes precedence"));
     diag.suggestion_verbose(
         no_mangle_span,
+        // alloc: as above
         format!("remove the `{no_mangle_attr}` attribute"),
         "",
         Applicability::MachineApplicable,

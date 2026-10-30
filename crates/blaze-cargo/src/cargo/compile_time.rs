@@ -1122,9 +1122,7 @@ impl<'a> Driver<'a> {
         if fresh(&stamp, &digest, std::iter::once(made.dep_info.as_path()).chain(inputs)) {
             return Ok(());
         }
-        let env = &crates[0].env;
-        let rustc_had = |name: &str| env.get(name).cloned().or_else(|| std::env::var(name).ok());
-        own_script::build_described(self.toolchain, crates, made, dir, &rustc_had)
+        own_script::build_described(self.toolchain, crates, made, dir)
             .map_err(|why| anyhow::anyhow!(why))?;
         write(&stamp, digest.as_bytes())
     }

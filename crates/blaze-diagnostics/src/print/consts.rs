@@ -51,7 +51,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             }
             ConstKind::Value(value) => self.print_valtree(value),
             ConstKind::Bound(index, bound) => {
-                let mut out = String::new();
+                let mut out = String::new(); // alloc: a bound constant printed, the edge
                 // Writing into a `String` does not fail.
                 let _ = rustc_type_ir::debug_bound_var(&mut out, index, bound.var);
                 self.write_str(&out);
@@ -71,7 +71,9 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                     self.print_byte_str(*consts)
                 }
                 TyKind::Str => {
+                    // alloc: a string constant printed, the edge
                     let bytes: Vec<u8> = bytes(*consts).collect();
+                    // alloc: none when the bytes are UTF-8; the constant printed, the edge
                     self.write_fmt(format_args!("{:?}", String::from_utf8_lossy(&bytes)));
                 }
                 _ => {
@@ -254,25 +256,26 @@ fn const_int(int: ScalarInt, signed: bool, ptr_sized: bool) -> String {
     let raw = int.to_bits_unchecked();
     let bits = size * 8;
     let name = |prefix: char| {
+        // alloc: an integer constant printed, the edge
         if ptr_sized { format!("{prefix}size") } else { format!("{prefix}{bits}") }
     };
     if signed {
         let min = 1u128 << (bits - 1);
         let max = min - 1;
         if raw == min {
-            return format!("{}::MIN", name('i'));
+            return format!("{}::MIN", name('i')); // alloc: an integer constant printed, the edge
         }
         if raw == max {
-            return format!("{}::MAX", name('i'));
+            return format!("{}::MAX", name('i')); // alloc: an integer constant printed, the edge
         }
         let shift = 128 - bits;
-        (((raw << shift) as i128) >> shift).to_string()
+        (((raw << shift) as i128) >> shift).to_string() // alloc: an integer constant printed, the edge
     } else {
         let max = if bits == 128 { u128::MAX } else { (1u128 << bits) - 1 };
         if raw == max {
-            return format!("{}::MAX", name('u'));
+            return format!("{}::MAX", name('u')); // alloc: an integer constant printed, the edge
         }
-        raw.to_string()
+        raw.to_string() // alloc: an integer constant printed, the edge
     }
 }
 

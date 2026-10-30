@@ -56,6 +56,50 @@ Why: blaze stops with an error, never a panic stub, on input rustc accepts
 (`docs/v2/plan/goals/principles.md`). Each answer is the one rustc's own rules give, or an
 `unreachable!` with the invariant that rules the case out.
 
+### 0004-solver-temporaries-recycled
+
+What: the eval context's temporaries come from `SolverScratch` (`solve/scratch.rs`), pools of
+emptied buffers kept in the search graph (`rustc_type_ir` patch `0006`) as its
+`Delegate::Scratch`. A buffer is taken, used and given back on every path out; one that never
+grew is not kept.
+- `SolverDelegate::obtain_search_storage` and `release_search_storage` (by default a fresh one,
+  and drop): `EvalCtxt::enter_root` builds its graph from the delegate's storage and returns it.
+- Pooled: nested goal lists (`enter_root`, `enter_canonical`, probes, each step of
+  `evaluate_added_goals`), candidate lists (assembly, `merge_trait_candidates`' picks), the
+  universes of `characterize_param_env_assumption`, the original values of `canonicalize_goal`,
+  the option list of the query response's instantiation, the outlives dedupe set, the region
+  variable set of `filter_irrelevant_region_constraints`, and the region constraints, opaque
+  types and normalization goals of external constraints, interned by
+  `mk_external_constraints_ref`.
+- `canonicalize_goal` and `canonicalize_input` fill a given `Vec`; `finalize` no longer takes
+  the canonicalizer's variables. `instantiate_and_apply_query_response` takes the option list.
+  `build_stalled_on` takes a slice.
+- `SolverDelegate::make_deduplicated_region_constraints_into(&mut Vec)`, by default extending
+  from `make_deduplicated_region_constraints`.
+- Upstream's comment in `evaluate_added_goals_step` on why the goal list is taken each step is
+  replaced by one on the spare list it now swaps in.
+- Tests (with `blaze-alloc-count`): a pool keeps capacity, drops a buffer that never grew, and a
+  warm take, push and give allocates nothing.
+
+Why: `v2/requests/mem-db-solver.md` sections 3 and 4. Each goal allocated these lists fresh;
+type inference solves millions of goals.
+
+### 0005-fast-path-depth
+
+What: `SolverDelegate::compute_goal_fast_path` takes a `FastPathDepth` (`rustc_type_ir` patch
+`0007-fast-path-depth`), and `fast_path::compute_goal_fast_path{,_cold}` take it too and return
+the levels a `HoldsWithin` answer needs beside the evaluation, asserting each answer is one the
+depth allows. `add_goal` asks with `Added` (only answers that cost no depth). The nested
+`evaluate_goal` asks with the depth the search graph gives the goal (`Evaluating`, or `Any` for
+a stalled goal's rerun; none while a proof tree is built) and charges the parent with
+`charge_answered_nested`. The root's stalled rerun asks with `Any` at the recursion limit.
+`evaluate_in_search_graph`'s choice of `LowerAvailableDepth` moves, unchanged, into
+`EvalCtxt::lower_available_depth`, which both use.
+
+Why: as `rustc_type_ir`'s `0007-fast-path-depth`: an answer that stands for a search-graph
+evaluation fits in, and costs, the depth it would be evaluated with, asked where the goal is
+evaluated, not added, since a sibling that overflows in between divides that depth.
+
 ## Dropped since the previous base (ra-ap-rustc_next_trait_solver 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#161380 (a constant sends a goal back to the caller's typing

@@ -271,7 +271,7 @@ impl Guard {
 /// `include_str!`d, is hashed as it is. `None` when it can't be read.
 fn without_tests(file: &Path) -> Option<String> {
     use sha2::Digest as _;
-    use syntax::{AstNode as _, ast};
+    use syntax::view::{self as ast, AstNode as _, HasAttrs as _};
     let text = std::fs::read_to_string(file).ok()?;
     if file.extension().is_none_or(|it| it != "rs") {
         let hash = sha2::Sha256::digest(&text);
@@ -282,15 +282,16 @@ fn without_tests(file: &Path) -> Option<String> {
     // discarded at the end of a line. A real space can belong to a multiline literal.
     const MASKED: u8 = 0xff;
     let mut bytes = text.into_bytes();
-    let only_tests = |item: &ast::Item| {
-        ast::HasAttrs::attrs(item).any(|attr| {
-            let attr: String =
-                attr.syntax().text().to_string().chars().filter(|it| !it.is_whitespace()).collect();
-            attr == "#[test]" || attr == "#[cfg(test)]"
+    let only_tests = |item: ast::Item<'_>| {
+        item.attrs().any(|attr| {
+            let attr = attr.syntax().text().chars().filter(|it| !it.is_whitespace());
+            let is = |want: &str| attr.clone().eq(want.chars());
+            is("#[test]") || is("#[cfg(test)]")
         })
     };
-    for item in parse.tree().syntax().descendants().filter_map(ast::Item::cast) {
-        if only_tests(&item) {
+    let root = parse.root();
+    for item in root.descendants().filter_map(ast::Item::cast) {
+        if only_tests(item) {
             let range = item.syntax().text_range();
             for byte in &mut bytes[usize::from(range.start())..usize::from(range.end())] {
                 if *byte != b'\n' {
@@ -300,7 +301,7 @@ fn without_tests(file: &Path) -> Option<String> {
         }
     }
     // Ignore tests and whitespace past the last production token, including appended tests.
-    let last = parse.tree().syntax().last_token();
+    let last = root.last_token();
     let end = std::iter::successors(last, |token| token.prev_token())
         .find(|token| {
             let range = token.text_range();

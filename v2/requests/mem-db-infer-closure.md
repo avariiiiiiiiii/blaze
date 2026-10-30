@@ -71,6 +71,7 @@ crates/`:
 The readers that do change are all in `infer.rs` and `persist.rs` (X2 to X4) and my files.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): a summary of the sections below, each applied with its own line.
 
 ## Prerequisites (other parts)
 
@@ -83,6 +84,7 @@ The readers that do change are all in `infer.rs` and `persist.rs` (X2 to X4) and
   `Frame: Debug`; otherwise a hand-written `Debug` that skips it).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): in the tree: hir-ty's `allocator_api`, `blaze-mem`, `hashbrown` (mem-db-infer 1-2), `frame` on `InferenceContext<'db, 'f>` (crates/hir-ty/src/infer.rs:2026, `#[derive(Debug)]`).
 
 ## Cross-part interfaces these files program against
 
@@ -90,6 +92,7 @@ Each is a change in a file of another part; the exact code is given so mem-db-in
 to that part's owner with the part's own entries.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): X1-X5 below, each in the tree.
 
 ### X1. `InferenceContext<'db, 'f>` (mem-db-infer-ctx, `infer.rs`)
 
@@ -98,6 +101,7 @@ InferenceContext<'db, 'f>` (entries C0, A0), and every `&mut InferenceContext<'d
 signature becomes `&mut InferenceContext<'db, 'f>` (entries A1, E3).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): in the tree: crates/hir-ty/src/infer.rs:2026; no `InferenceContext<'db>` header is left in `infer.rs` or `infer/`.
 
 ### X2. The result types (mem-db-infer-ctx, `infer.rs` about lines 1240 to 1510)
 
@@ -321,6 +325,8 @@ signature becomes `&mut InferenceContext<'db, 'f>` (entries A1, E3).
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
+> applied by db-mem-infer-a-ctx (21:36): items 1 to 6 in `infer.rs` as written (imports: `Hasher`, `FxIndexMap`, `SmallVec` gone; the test sits in `mod tests` with `use super::*;`, its `Idx` paths `la_arena::Idx::from_raw`).
+
 ### X3. `resolve_all` (mem-db-infer-ctx, `infer.rs` about line 2149)
 
 Before:
@@ -390,6 +396,8 @@ in-place fold and allocates nothing):
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+> applied by db-mem-infer-a-ctx (21:36): as written, after ctx A8 over the same loop (mem-db-infer.md section 6 item 2).
 
 ### X4. Persist (mem-db-infer-ctx, `infer/persist.rs`)
 
@@ -612,6 +620,10 @@ The format does not change (no version bump): same words in the same order.
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
+> applied by db-mem-infer-a-persist (21:58): X4 1 to 5 as written in `infer/persist.rs` (`closure(tys, frame)`
+> called with `decode_in`'s frame); `smallvec::SmallVec` import dropped (no other use left). Compiles
+> only once `infer.rs`'s X2 (`MinCaptures`, `from_slice`, `try_from_fn`, `Box<[..]>` fields) is in.
+
 ### X5. Re-export (mem-db-infer, `crates/hir-ty/src/lib.rs:126-132`)
 
 Before `CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, UpvarCapture,`; after
@@ -619,16 +631,19 @@ Before `CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, UpvarCaptur
 UpvarCapture,` (so the public field's type can be named outside).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a (21:26): as written (`MinCaptures`, `MinCapturesIter` come from closure X2 in `infer.rs`, db-mem-infer-a-ctx).
 
 ## `closure.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): C0-C2 applied below by db-mem-infer-a-closure.
 
 ### C0. Impl header (line 51)
 
 Before `impl<'db> InferenceContext<'db> {`; after `impl<'db, 'f> InferenceContext<'db, 'f> {`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:24): as written.
 
 ### C1. A new closure's data (lines 306-315, and the import on line 12)
 
@@ -651,6 +666,7 @@ indexmap::IndexMap;` is deleted. Analysis fills `min_captures` once (A4); `walk_
 removes and reinserts entries of `closures_data`, which allocates nothing.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:24): as written; also expr X4's `CoerceMany::new(liberated_sig.output(), self.frame)` at the return coercion.
 
 ### C2. Supplied closure signature (lines 1020-1041)
 
@@ -696,6 +712,7 @@ the same order, after `supplied_return`'s, as before):
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:24): in the combined form of `mem-db-infer.md` 6.1 (with lower 22: `supplied` is a frame `Vec` the call fills, `bound_vars` its return).
 
 ### What `closure.rs` still allocates, and whose it is
 
@@ -712,10 +729,12 @@ from other parts.
 | line 311 `Box::default()`, C1 `Default::default()` | empty results | none: no allocation |
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): notes, each row settled by its owner: `obligations_for_self_ty` stays (mem-db-infer-ctx.md U3, crates/hir-ty/src/infer/unify.rs:215), `lower_closure_params` fills the caller's `Extend` (crates/hir-ty/src/lower.rs:1195), the solver rows are mem-db-solver's.
 
 ## `closure/analysis/expr_use_visitor.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): E1-E8 applied below by db-mem-infer-a-closure.
 
 ### E1. Imports (lines 7-35)
 
@@ -726,6 +745,7 @@ smallvec};`; after `use smallvec::SmallVec;`. `CaptureSourceStack` stays importe
 `SourceStack::to_result`).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:48): as written (`rustc_type_ir` traits on a second `use` line next to the `inherent` one).
 
 ### E2. Types (lines 74-183)
 
@@ -1141,6 +1161,7 @@ impl<'f> PlaceWithOrigin<'f> {
 4 projections (64 bytes); deeper places grow it in place while it is the frame's top.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:48): as written; `Place`'s method docs kept; `PlaceWithOrigin::new` deleted (its one caller is E7's `of_capture`).
 
 ### E3. `Delegate` and the visitor's lifetimes (lines 293-428, 1158)
 
@@ -1170,6 +1191,7 @@ CatPatternPat)` bound of `cat_pattern`, the `walk_deref_pat` closure's parameter
 `PlaceWithOrigin<'f>`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:48): as written, which also covers ctx A0's `expr_use_visitor.rs` lines (the `Delegate` methods take `InferenceContext<'db, 'f>`, not `'_`, since they build frame values from `ctx.frame`).
 
 ### E4. Constructors take the frame (lines 1367-1370, 1396, 1414-1418, 1421-1423)
 
@@ -1179,6 +1201,7 @@ argument: the static item (line 1367), `cat_local` (line 1396), `cat_upvar` (lin
 is inline.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:48): as written, all four.
 
 ### E5. `match`: the last arm takes the place (lines 566-574)
 
@@ -1214,6 +1237,7 @@ After (same arms in the same order):
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:48): as written.
 
 ### E6. `walk_pat`: no copy of the scrutinee, discriminant reads copy only when they need to (lines 879-1029)
 
@@ -1247,6 +1271,7 @@ place.clone());`; lines 972, 976 (`Pat::Path`), 989 (`Pat::Lit | Pat::Range`), 9
 The order of delegate calls is unchanged.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:48): as written, all six calls.
 
 ### E7. `walk_captures`: a nested closure's result becomes frame values (lines 1060-1134)
 
@@ -1316,6 +1341,7 @@ After:
 The `remove` and `insert` of `closure_data` around it stay (borrowck; the map does not grow).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:48): as written.
 
 ### E8. `cat_pattern`: a leaf pattern takes the place (lines 1565-1574)
 
@@ -1351,6 +1377,7 @@ After (the leaf kinds are exactly the arm at lines 1693-1703 that does nothing a
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:48): as written; every place copy the file keeps (the table below) has a `// clone:` line for `hot_lint`.
 
 ### What `expr_use_visitor.rs` still allocates
 
@@ -1371,10 +1398,12 @@ No `Vec::new()`, `vec![`, `.collect()`, `.to_vec()`, `Box::new(`, `FxHashMap`, `
 the result's own allocations.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): notes: the copies E8's applier marked with `// clone:`; nothing to edit.
 
 ## `closure/analysis.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): A0-A8 applied below by db-mem-infer-a-closure.
 
 ### A0. Imports and the impl header (lines 33-71, 197)
 
@@ -1386,6 +1415,7 @@ unused; add `PlaceBuf, SourceStack, Sources` to the `expr_use_visitor::{..}` lis
 before `impl<'db> InferenceContext<'db> {`; after `impl<'db, 'f> InferenceContext<'db, 'f> {`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written; `CaptureSourceStack` and `Place` leave the import (unused), `MinCaptures` joins the `crate::infer` list (A1). Covers ctx A0's `analysis.rs` lines (`'f`, not `'_`, as E3).
 
 ### A1. Analysis-time capture types (lines 192-195, 1181-1213)
 
@@ -1502,6 +1532,7 @@ impl<'db, 'f> euv::Delegate<'db, 'f> for InferBorrowKind<'f> {
 `MinCaptures` is imported from `crate::infer` (X2).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written (the roots' `alloc:` comment sits on the line above `.collect()` for `hot_lint`).
 
 ### A2. The delegate takes its places, not copies (lines 1215-1306)
 
@@ -1586,6 +1617,7 @@ after:
 `mutate` only changes its signature.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written.
 
 ### A3. `normalize_capture_place` skips what normalizing would not change (lines 939-969)
 
@@ -1622,6 +1654,7 @@ obligations, after which the fresh `FulfillmentCtxt` has nothing to evaluate, re
 so the result is the same, without the copy and the `FulfillmentCtxt` per captured use.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written; the kept `place.clone()` and `vec![]` got `// clone:`/`// alloc:` lines.
 
 ### A4. `analyze_closure` builds the result once (lines 258-528)
 
@@ -1828,6 +1861,7 @@ after (`fake_reads` was taken out of the delegate above):
 delegate.capture_information);`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written; the fake reads' `alloc:` comment sits above `.collect()`. The deferred-call loop is unchanged (`mem-db-infer.md` 6.6).
 
 ### A5. `process_collected_capture_information` moves its input (lines 606-666)
 
@@ -1872,6 +1906,7 @@ per closure, when its kind goes up):
 The `usage` closure's parameter becomes `|place: &PlaceBuf<'f>|`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written (the map's body moved one level out, unchanged).
 
 ### A6. `compute_min_captures` works in the frame, in place (lines 740-937)
 
@@ -1961,6 +1996,7 @@ The sort is `sort_by` (stable, as rustc's; equal keys must keep their order): it
 buffer of 4 KiB, so it allocates (globally) only for a root with more than about 39 captures.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written; all three `determine_capture_sources` calls pass `frame`.
 
 ### A7. Helpers on frame values (lines 1110-1578)
 
@@ -2036,6 +2072,7 @@ fn determine_capture_sources<'f>(
 `child_prefix_matches_parent_projections` read the result and stay as they are.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written, including `determine_capture_info` and `determine_capture_mutability`.
 
 ### A8. Reading a closure's captures (lines 572-589, 971-981, 1588-1638)
 
@@ -2133,6 +2170,7 @@ fn analyze_coroutine_closure_captures<'a, 'f, T>(
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): as written.
 
 ### What `analysis.rs` still allocates
 
@@ -2150,6 +2188,7 @@ fn analyze_coroutine_closure_captures<'a, 'f, T>(
 | `Ty::new_tup`, `Ty::new_fn_ptr`, `mk_fn_sig([], ..)` | interning | the interner's |
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): notes; `remove_deferred_call_resolutions` returns a frame `Vec` now (crates/hir-ty/src/infer.rs:2726).
 
 ## Entry points, hit paths, tracked functions
 
@@ -2160,6 +2199,7 @@ fn analyze_coroutine_closure_captures<'a, 'f, T>(
 - Tracked functions: none in these files.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): notes: none in these files.
 
 ## Tests
 
@@ -2207,6 +2247,8 @@ fn analyze_coroutine_closure_captures<'a, 'f, T>(
   and the same body in an edition-2018 crate (the fake-capture path of A4).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-closure (21:50): no test lives in my files: the `CaptureSourceStack` test is for `infer.rs`'s test module (told db-mem-infer-a-ctx) and the budget fixture for the parent's `tests/budget.rs` (told db-mem-infer-a). Added beside the code: `expr_use_visitor.rs` `mod tests` (`SourceStack` push/truncate/`of`/`to_result` at lengths 1 to 6, `Sources` push/retain/`of`/`to_result` order). No new `crates/hir-ide` test: nothing to file.
+> applied by db-mem-infer-a (21:45): budget fixture in `crates/hir-ty/src/tests/budget.rs`, in crate `main` and again in an `edition:2018` crate `old`. Differences: minicore has no `String`/`Vec`, so `a.0` and `b` are two local non-`Copy` types with a `len(&self)`; `drop(a)` became `let _a = a;` (minicore's `drop` flag isn't on); `async_fn, future` added to the minicore line.
 
 ## Notes for other parts
 
@@ -2220,6 +2262,7 @@ fn analyze_coroutine_closure_captures<'a, 'f, T>(
 - mem-db-lower: `lower_closure_params` returns `Vec<Option<Ty>>`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): each settled: `obligations_for_self_ty` stays (ctx U3), `remove_deferred_call_resolutions` framed (crates/hir-ty/src/infer.rs:2726), `lower_closure_params` takes an `Extend` (crates/hir-ty/src/lower.rs:1195); the solver's are mem-db-solver's.
 
 ## Speed
 
@@ -2259,3 +2302,4 @@ branch to every projection access, so it is not taken. The result's allocations 
 parent's budget allows (its clone count).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:38): notes; nothing to edit.

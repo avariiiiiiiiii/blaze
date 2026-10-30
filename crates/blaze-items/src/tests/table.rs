@@ -13,7 +13,8 @@ fn id(n: u8) -> ContentId {
     ContentId([n; 32])
 }
 
-fn every_kind() -> Vec<Fact> {
+/// A fact of each kind, two of fields.
+pub(super) fn every_kind() -> Vec<Fact> {
     let (a, b) = (ItemKey(id(1)), ItemKey(id(2)));
     vec![
         Fact::Signature(a),
@@ -33,6 +34,7 @@ fn every_kind() -> Vec<Fact> {
         Fact::DropCheck(b),
         Fact::Vtable { trait_: a, self_ty: SimplifiedType(id(5)) },
         Fact::Derive(a),
+        Fact::Target(id(6)),
     ]
 }
 
@@ -73,6 +75,7 @@ fn order(fact: &Fact) -> (u16, QueryOrder) {
         | Fact::Specializes(it)
         | Fact::DropCheck(it)
         | Fact::Derive(it) => (it.0, None, None),
+        Fact::Target(it) => (it, None, None),
     };
     (fact.kind().0, parts)
 }

@@ -4,7 +4,7 @@
 //! `lower::parse` gives a file's parse errors in.
 
 use hir::InFile;
-use syntax::{AstNode, NodeOrToken, ast};
+use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
     cx::Cx,
@@ -13,26 +13,27 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MacroExpansionParseError) -> Vec<Found> {
+    // alloc: empty, allocates nothing
     let Some(error) = d.errors.first() else { return Vec::new() };
-    let root = cx.sema.parse_or_expand(d.range.file_id);
-    let call = match root.covering_element(d.range.value) {
-        NodeOrToken::Node(it) => Some(it),
-        NodeOrToken::Token(it) => it.parent(),
-    }
-    .and_then(|it| it.ancestors().find_map(ast::MacroCall::cast));
-    let expansion = call.as_ref().and_then(|call| cx.sema.expand_macro_call(call));
+    let root = cx.root(d.range.file_id);
+    let call = root.covering_element(d.range.value).ancestors().find_map(ast::MacroCall::cast);
+    let expansion = call.and_then(|call| cx.vsema.expand_macro_call(call));
     let (Some(call), Some(expansion)) = (call, expansion) else {
+        // alloc: the error's text, for an error hir found
         let message = format!("the expansion of this macro does not parse: {error}");
+        // alloc: the error's parts, for an error hir found
         return vec![Found::new(Diag::error(None, message, cx.span(d.range)), Phase::Expand)];
     };
     let site = cx.span(InFile::new(d.range.file_id, call.syntax().text_range()));
     let diag = parse::expansion_error(
         cx,
         expansion.file_id,
-        &expansion.value,
+        expansion.value,
         site,
+        // alloc: the error's text, for an error hir found
         &error.to_string(),
         error.range().start(),
     );
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Expand)]
 }

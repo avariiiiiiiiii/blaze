@@ -42,8 +42,6 @@ use crate::{
     utf8_stdout,
 };
 
-pub type FileLoader<'a> = &'a mut dyn for<'b> FnMut(&'b AbsPath) -> Option<FileId>;
-
 /// `PackageRoot` describes a package root folder.
 /// Which may be an external dependency, or a member of
 /// the current workspace.
@@ -179,19 +177,14 @@ impl fmt::Debug for ProjectWorkspace {
 }
 
 impl ProjectWorkspace {
-    pub fn load(
-        manifest: ProjectManifest,
-        config: &CargoConfig,
-        progress: &(dyn Fn(String) + Sync),
-    ) -> anyhow::Result<ProjectWorkspace> {
-        ProjectWorkspace::load_inner(&manifest, config, progress)
+    pub fn load(manifest: ProjectManifest, config: &CargoConfig) -> anyhow::Result<ProjectWorkspace> {
+        ProjectWorkspace::load_inner(&manifest, config)
             .with_context(|| format!("Failed to load the project at {manifest}"))
     }
 
     fn load_inner(
         manifest: &ProjectManifest,
         config: &CargoConfig,
-        progress: &(dyn Fn(String) + Sync),
     ) -> anyhow::Result<ProjectWorkspace> {
         let res = match manifest {
             ProjectManifest::ProjectJson(project_json) => {
@@ -202,13 +195,13 @@ impl ProjectWorkspace {
                 let project_location = project_json.parent().to_path_buf();
                 let project_json: ProjectJson =
                     ProjectJson::new(Some(project_json.clone()), &project_location, data);
-                ProjectWorkspace::load_inline(project_json, config, progress)
+                ProjectWorkspace::load_inline(project_json, config)
             }
             ProjectManifest::CargoScript(rust_file) => {
                 ProjectWorkspace::load_detached_file(rust_file, config)?
             }
             ProjectManifest::CargoToml(cargo_toml) => {
-                ProjectWorkspace::load_cargo(cargo_toml, config, progress)?
+                ProjectWorkspace::load_cargo(cargo_toml, config)?
             }
         };
 
@@ -218,9 +211,7 @@ impl ProjectWorkspace {
     fn load_cargo(
         cargo_toml: &ManifestPath,
         config: &CargoConfig,
-        progress: &(dyn Fn(String) + Sync),
     ) -> Result<ProjectWorkspace, anyhow::Error> {
-        progress("discovering sysroot".to_owned());
         let CargoConfig {
             features,
             rustc_source,
@@ -289,7 +280,6 @@ impl ProjectWorkspace {
         let workspace_dir = cargo_toml.parent();
 
         tracing::info!(workspace = %cargo_toml, src_root = ?sysroot.rust_lib_src_root(), root = ?sysroot.root(), "Using sysroot");
-        progress("querying project metadata".to_owned());
         let config_file =
             CargoConfigFile::load(cargo_toml, extra_env, &sysroot, config_path.as_deref());
         let config_file_ = config_file.clone();
@@ -405,7 +395,7 @@ impl ProjectWorkspace {
                         },
                         &sysroot,
                         *no_deps,
-                    ).exec(true, progress) {
+                    ).exec(true) {
                         Ok((meta, _error)) => {
                             let workspace = CargoWorkspace::new(
                                 meta,
@@ -440,7 +430,7 @@ impl ProjectWorkspace {
             let cargo_metadata = Builder::new()
                 .name("ProjectWorkspace::cargo_metadata".to_owned())
                 .spawn_scoped(s, || match fetch_metadata {
-                    Some(fetch_metadata) => fetch_metadata.exec(false, progress),
+                    Some(fetch_metadata) => fetch_metadata.exec(false),
                     None => Ok((own_metadata.expect("blaze's own metadata"), None)),
                 })
                 .expect("failed to spawn thread");
@@ -455,7 +445,6 @@ impl ProjectWorkspace {
                             toolchain.clone(),
                         )),
                         config.no_deps,
-                        progress,
                     )
                 })
                 .expect("failed to spawn thread");
@@ -543,14 +532,11 @@ impl ProjectWorkspace {
     pub fn load_inline(
         mut project_json: ProjectJson,
         config: &CargoConfig,
-        progress: &(dyn Fn(String) + Sync),
     ) -> ProjectWorkspace {
-        progress("discovering sysroot".to_owned());
         let mut sysroot =
             Sysroot::new(project_json.sysroot.clone(), project_json.sysroot_src.clone());
 
         tracing::info!(workspace = %project_json.manifest_or_root(), src_root = ?sysroot.rust_lib_src_root(), root = ?sysroot.root(), "Using sysroot");
-        progress("querying project metadata".to_owned());
         let sysroot_project = project_json.sysroot_project.take();
         let query_config = QueryConfig::Rustc(&sysroot, project_json.path().as_ref());
         let targets = target_tuple::get(query_config, config.target.as_deref(), &config.extra_env)
@@ -578,7 +564,6 @@ impl ProjectWorkspace {
                     sysroot.load_workspace(
                         &RustSourceWorkspaceConfig::Json(*sysroot_project),
                         config.no_deps,
-                        progress,
                     )
                 } else {
                     sysroot.load_workspace(
@@ -589,7 +574,6 @@ impl ProjectWorkspace {
                             toolchain.clone(),
                         )),
                         config.no_deps,
-                        progress,
                     )
                 }
             });
@@ -650,7 +634,6 @@ impl ProjectWorkspace {
                 toolchain.clone(),
             )),
             config.no_deps,
-            &|_| (),
         );
         sysroot.set_loaded(loaded_sysroot);
 
@@ -671,7 +654,7 @@ impl ProjectWorkspace {
             &sysroot,
             config.no_deps,
         );
-        let cargo_script = fetch_metadata.exec(false, &|_| ()).ok().map(|(ws, error)| {
+        let cargo_script = fetch_metadata.exec(false).ok().map(|(ws, error)| {
             let told = !config.extra_env_for_commands_only;
             let cargo_config_extra_env = cargo_config_env(&config_file, &config.extra_env, told);
             (
@@ -705,11 +688,7 @@ impl ProjectWorkspace {
     }
 
     /// Runs the build scripts for this [`ProjectWorkspace`].
-    pub fn run_build_scripts(
-        &self,
-        config: &CargoConfig,
-        progress: &dyn Fn(String),
-    ) -> anyhow::Result<WorkspaceBuildScripts> {
+    pub fn run_build_scripts(&self, config: &CargoConfig) -> anyhow::Result<WorkspaceBuildScripts> {
         match &self.kind {
             ProjectWorkspaceKind::DetachedFile { cargo: Some((cargo, _, None)), .. }
             | ProjectWorkspaceKind::Cargo { cargo, error: None, .. } => {
@@ -731,7 +710,6 @@ impl ProjectWorkspace {
                 WorkspaceBuildScripts::run_for_workspace(
                     config,
                     cargo,
-                    progress,
                     &self.sysroot,
                     self.toolchain.as_ref(),
                 )
@@ -748,13 +726,12 @@ impl ProjectWorkspace {
     pub fn run_all_build_scripts(
         workspaces: &[ProjectWorkspace],
         config: &CargoConfig,
-        progress: &dyn Fn(String),
         working_directory: &AbsPathBuf,
     ) -> Vec<anyhow::Result<WorkspaceBuildScripts>> {
         if matches!(config.invocation_strategy, InvocationStrategy::PerWorkspace)
             || config.run_build_script_command.is_none()
         {
-            return workspaces.iter().map(|it| it.run_build_scripts(config, progress)).collect();
+            return workspaces.iter().map(|it| it.run_build_scripts(config)).collect();
         }
 
         let cargo_ws: Vec<_> = workspaces
@@ -764,16 +741,12 @@ impl ProjectWorkspace {
                 _ => None,
             })
             .collect();
-        let outputs = &mut match WorkspaceBuildScripts::run_once(
-            config,
-            &cargo_ws,
-            progress,
-            working_directory,
-        ) {
-            Ok(it) => Ok(it.into_iter()),
-            // io::Error is not Clone?
-            Err(e) => Err(sync::Arc::new(e)),
-        };
+        let outputs =
+            &mut match WorkspaceBuildScripts::run_once(config, &cargo_ws, working_directory) {
+                Ok(it) => Ok(it.into_iter()),
+                // io::Error is not Clone?
+                Err(e) => Err(sync::Arc::new(e)),
+            };
 
         workspaces
             .iter()
@@ -1067,7 +1040,7 @@ impl ProjectWorkspace {
 
     pub fn to_crate_graph(
         &self,
-        load: FileLoader<'_>,
+        load: &mut impl FnMut(&AbsPath) -> Option<FileId>,
         extra_env: &FxHashMap<String, Option<String>>,
     ) -> (CrateGraphBuilder, ProcMacroPaths) {
         let _p = tracing::info_span!("ProjectWorkspace::to_crate_graph").entered();
@@ -1106,7 +1079,7 @@ impl ProjectWorkspace {
             ProjectWorkspaceKind::DetachedFile { file, cargo: cargo_script, .. } => {
                 if let Some((cargo, build_scripts, _)) = cargo_script {
                     cargo_to_crate_graph(
-                        &mut |path| load(path),
+                        load,
                         None,
                         cargo,
                         sysroot,
@@ -1186,7 +1159,7 @@ impl ProjectWorkspace {
 #[instrument(skip_all)]
 fn project_json_to_crate_graph(
     rustc_cfg: Vec<CfgAtom>,
-    load: FileLoader<'_>,
+    load: &mut impl FnMut(&AbsPath) -> Option<FileId>,
     project: &ProjectJson,
     sysroot: &Sysroot,
     extra_env: &FxHashMap<String, Option<String>>,
@@ -1372,7 +1345,7 @@ impl ProjectWorkspace {
 /// The crate of blaze's copy of `const-ast` ([`const_ast_dir`]): `no_std`, of `core` alone.
 fn const_ast_crate(
     crate_graph: &mut CrateGraphBuilder,
-    load: FileLoader<'_>,
+    load: &mut impl FnMut(&AbsPath) -> Option<FileId>,
     sysroot: &Sysroot,
     cfg_options: &CfgOptions,
     public_deps: &SysrootPublicDeps,
@@ -1399,7 +1372,7 @@ fn const_ast_crate(
 }
 
 fn cargo_to_crate_graph(
-    load: FileLoader<'_>,
+    load: &mut impl FnMut(&AbsPath) -> Option<FileId>,
     rustc: Option<&(CargoWorkspace, WorkspaceBuildScripts)>,
     cargo: &CargoWorkspace,
     sysroot: &Sysroot,
@@ -1766,7 +1739,7 @@ fn cargo_to_crate_graph(
 
 fn detached_file_to_crate_graph(
     rustc_cfg: Vec<CfgAtom>,
-    load: FileLoader<'_>,
+    load: &mut impl FnMut(&AbsPath) -> Option<FileId>,
     detached_file: &ManifestPath,
     sysroot: &Sysroot,
     override_cfg: &CfgOverrides,
@@ -1827,7 +1800,7 @@ fn handle_rustc_crates(
     crate_graph: &mut CrateGraphBuilder,
     proc_macros: &mut ProcMacroPaths,
     pkg_to_lib_crate: &mut FxHashMap<Package, CrateBuilderId>,
-    load: FileLoader<'_>,
+    load: &mut impl FnMut(&AbsPath) -> Option<FileId>,
     rustc_workspace: &CargoWorkspace,
     cargo: &CargoWorkspace,
     public_deps: &SysrootPublicDeps,
@@ -2116,7 +2089,7 @@ fn sysroot_to_crate_graph(
     crate_graph: &mut CrateGraphBuilder,
     sysroot: &Sysroot,
     rustc_cfg: Vec<CfgAtom>,
-    load: FileLoader<'_>,
+    load: &mut impl FnMut(&AbsPath) -> Option<FileId>,
     crate_ws_data: Arc<CrateWorkspaceData>,
 ) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
     let _p = tracing::info_span!("sysroot_to_crate_graph").entered();
@@ -2220,7 +2193,7 @@ fn sysroot_crates_to_crate_graph(
     crate_graph: &mut CrateGraphBuilder,
     sysroot: &Sysroot,
     rustc_cfg: Vec<CfgAtom>,
-    load: FileLoader<'_>,
+    load: &mut impl FnMut(&AbsPath) -> Option<FileId>,
     crate_ws_data: Arc<CrateWorkspaceData>,
 ) -> (SysrootPublicDeps, Option<CrateBuilderId>) {
     match sysroot.workspace() {

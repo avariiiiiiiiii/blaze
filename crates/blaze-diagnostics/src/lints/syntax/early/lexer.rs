@@ -26,6 +26,7 @@ mod lex;
 
 use std::borrow::Cow;
 
+use blaze_mem::Frame;
 use hir::{HirFileId, InFile};
 use hir_expand::MacroDefKind;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -45,15 +46,19 @@ use crate::{
 use self::lex::{Lexed, LexedFile};
 
 pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'_>) -> Vec<Emitted> {
+    // alloc: empty, allocates nothing
     let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
+    // alloc: empty, allocates nothing
     let Some(root) = walk.tree(HirFileId::from(root)) else { return Vec::new() };
     let krate = root.ptr(&root.root);
+    // alloc: empty until a lint fires; holds only what fires
     let mut emitted = Vec::new();
     for tree in walk.files() {
         keywords::lints(cx, tree, &mut emitted);
     }
     let sources = sources(cx, walk);
-    let ascii: Vec<bool> = sources.iter().map(|it| cx.file_text(it.file).is_ascii()).collect();
+    let mut ascii = Vec::with_capacity_in(sources.len(), cx.frame());
+    ascii.extend(sources.iter().map(|it| cx.file_text(it.file).is_ascii()));
     let gathered = gathers_idents(cx, walk, &ascii);
     let prefixes = cx.lint_may_fire(LintId::named("rust_2021_prefixes_incompatible_syntax"));
     let guarded = cx.lint_may_fire(LintId::named("rust_2024_guarded_string_incompatible_syntax"));
@@ -125,9 +130,9 @@ struct Source {
 
 /// The files rustc lexes, in the order it loads them: the crate's modules, then what
 /// `include!` reads.
-fn sources(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Source> {
+fn sources<'f>(cx: &Cx<'f, '_>, walk: &Walk<'_>) -> Vec<Source, &'f Frame> {
     let mut seen = FxHashSet::default();
-    let mut sources = Vec::new();
+    let mut sources = Vec::new_in(cx.frame());
     for tree in walk.files() {
         let Some(file) = tree.file.file_id() else { continue };
         let id = file.file_id(cx.db);
@@ -211,12 +216,13 @@ impl<'db> Gallery<'db> {
                     continue;
                 }
                 let range = InFile::new(tree.file, token.text_range());
-                let span = cx.span(range);
+                let (file, at) = cx.place(range);
                 let index = index.get_or_insert_with(|| {
+                    // alloc: setup, once per crate whose proc macros make a new identifier
                     sources.iter().enumerate().map(|(at, it)| (it.file, at as u32)).collect()
                 });
-                let file = cx.file_of(&span).and_then(|it| index.get(&it).copied()).unwrap_or(u32::MAX);
-                let order = (file, span.lo, span.hi);
+                let file = index.get(&file).copied().unwrap_or(u32::MAX);
+                let order = (file, at.start().into(), at.end().into());
                 self.symbols.insert(Cow::Owned(symbol.into_owned()), Entry { order, place: Place::Expansion(range) });
             }
         }
@@ -227,6 +233,7 @@ impl<'db> Gallery<'db> {
             .symbols
             .into_iter()
             .map(|(name, Entry { order, place })| Symbol { name, order, place })
+            // alloc: once per crate whose identifiers are gathered
             .collect();
         // Symbols a proc macro made share its call's span; rustc leaves those in hash order.
         symbols.sort_unstable_by(|a, b| a.order.cmp(&b.order).then_with(|| a.name.cmp(&b.name)));
@@ -247,7 +254,9 @@ fn invisible(count: usize) -> &'static str {
 
 /// A character as rustc's `{c:?}` writes it, without the quotes.
 fn escaped(c: char) -> String {
+    // alloc: the lint's text, for a lint found
     let debug = format!("{c:?}");
+    // alloc: the lint's text, for a lint found
     debug[1..debug.len() - 1].to_owned()
 }
 
@@ -261,13 +270,17 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
             let mut diag = Diag::lint(
                 "text_direction_codepoint_in_comment",
                 "unicode codepoint changing visible direction of text present in comment",
+                // clone: a lint's span, for a lint found
                 at.clone(),
             );
             diag.note(TEXT_FLOW_NOTE);
+            // alloc: the lint's text, for a lint found
             diag.span_label(at, format!("this comment contains {}", invisible(chars.len())));
             for &(c, range) in &chars {
+                // alloc: the lint's text, for a lint found
                 diag.span_label(span(range), format!("{c:?}"));
             }
+            // alloc: the lint's text, for a lint found
             let parts = chars.iter().map(|&(_, range)| (span(range), String::new())).collect();
             diag.suggestion_with_style(parts, REMOVE_THEM, Applicability::MachineApplicable, SuggestionStyle::HideCodeAlways);
             diag
@@ -276,17 +289,22 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
             let at = span(range);
             let mut diag = Diag::lint(
                 "text_direction_codepoint_in_literal",
+                // alloc: the lint's text, for a lint found
                 format!("unicode codepoint changing visible direction of text present in {label}"),
+                // clone: a lint's span, for a lint found
                 at.clone(),
             );
             diag.note(TEXT_FLOW_NOTE);
+            // alloc: the lint's text, for a lint found
             diag.span_label(at, format!("this {label} contains {}", invisible(chars.len())));
             if inner {
                 for &(c, range) in &chars {
+                    // alloc: the lint's text, for a lint found
                     diag.span_label(span(range), format!("{c:?}"));
                 }
             }
             if inner && !chars.is_empty() {
+                // alloc: the lint's text, for a lint found
                 let removed = chars.iter().map(|&(_, range)| (span(range), String::new())).collect();
                 diag.suggestion_with_style(
                     removed,
@@ -294,6 +312,7 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
                     Applicability::MachineApplicable,
                     SuggestionStyle::HideCodeAlways,
                 );
+                // alloc: the lint's text, for a lint found
                 let escapes = chars.iter().map(|&(c, range)| (span(range), escaped(c))).collect();
                 diag.multipart_suggestion(
                     "if you want to keep them but make them visible in your source code, you can escape them",
@@ -301,13 +320,16 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
                     Applicability::MachineApplicable,
                 );
             } else {
+                // alloc: the lint's text, for a lint found
                 let escaped: Vec<String> = chars.iter().map(|(c, _)| format!("{c:?}")).collect();
                 let escaped = escaped.join(", ");
                 diag.note(REMOVE_THEM);
                 match doc {
+                    // alloc: the lint's text, for a lint found
                     true => diag.note(format!(
                         "if you need to keep them and make them explicit in source, rewrite this doc comment as a `#[doc = \"...\"]` attribute and use Unicode escapes such as {escaped}"
                     )),
+                    // alloc: the lint's text, for a lint found
                     false => diag.note(format!(
                         "if you want to keep them but make them visible in your source code, you can escape them: {escaped}"
                     )),
@@ -319,7 +341,9 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
             let at = span(range);
             let mut diag = Diag::lint(
                 "rust_2021_prefixes_incompatible_syntax",
+                // alloc: the lint's text, for a lint found
                 format!("prefix `{}` is unknown", &text[range]),
+                // clone: a lint's span, for a lint found
                 at.clone(),
             );
             diag.span_label(at, "unknown prefix");
@@ -333,6 +357,7 @@ fn lexer_lint(cx: &Cx<'_, '_>, file: FileId, text: &str, lexed: Lexed, krate: In
         }
         Lexed::RawPrefix { range } => {
             let at = span(range);
+            // clone: a lint's span, for a lint found
             let mut diag = Diag::lint("rust_2021_prefixes_incompatible_syntax", "prefix `'r` is reserved", at.clone());
             diag.span_label(at, "reserved prefix");
             diag.suggestion(

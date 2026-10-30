@@ -1,15 +1,16 @@
 //! The agent API's responses ([`blaze_api::Response`]) as text for people: what a client of
 //! the API (the CLI, a CI log) prints. Diagnostics as rustc writes them, with the facts they
 //! read; tests as libtest writes them. JSON for programs is [`blaze_api::json`]'s, but for the
-//! forms lane proof's harness reads: [`work_json`], [`codegen_inputs_json`] and [`trace_cbor`].
+//! forms lane proof's harness reads: [`work_json`], [`served_json`], [`codegen_inputs_json`] and
+//! [`trace_cbor`].
 //!
 //! Every line is written into the one `String` it ends in, with no `String` of its own.
 
 use std::fmt;
 
 use blaze_api::{
-    Diagnostic, FetchVerb, How, Level, LinkKind, Ranked, Response, TestOutcome, TestResult,
-    Traced, Verb, Worked,
+    Diagnostic, FetchVerb, How, Level, LinkKind, Ranked, Response, ServedCrate, TestOutcome,
+    TestResult, Traced, Verb, Worked,
 };
 use blaze_ids::ContentId;
 use blaze_query::QueryKey;
@@ -43,7 +44,7 @@ pub fn lines_into(out: &mut String, response: &Response, color: bool) {
         Response::Diagnostic(diagnostic) => diagnostic_lines(out, diagnostic, 0, color),
         Response::Built { artifacts, profile, .. } => {
             for it in artifacts {
-                let (package, kind, path, content) = (&it.package, &it.kind, &it.path, &it.content);
+                let (package, kind, path, content) = (&it.package, it.kind.name(), &it.path, &it.content);
                 put!(out, "{} {package} {kind} at {path} ({content})\n", status("Built"));
             }
             put!(out, "{} {profile}\n", status("Finished"));
@@ -380,6 +381,53 @@ pub fn work_json(worked: &Worked) -> String {
     )
 }
 
+/// What became of each dependency crate's check ([`Worked::served`]), as the CLI prints it under
+/// `--message-format=json` after [`work_json`]'s line: one `blaze-served` line a crate, in its
+/// order, each newline ended; empty for none.
+pub fn served_json(served: &[ServedCrate]) -> String {
+    // alloc: the CLI's, once per request
+    let mut out = String::with_capacity(served.len() * 96);
+    for it in served {
+        out.push_str("{\"reason\": \"blaze-served\", \"package\": ");
+        quoted(&mut out, &it.package);
+        out.push_str(", \"outcome\": \"");
+        out.push_str(it.outcome.name());
+        out.push_str("\", \"bodies\": \"");
+        out.push_str(it.bodies.name());
+        out.push_str("\", \"why\": ");
+        match &it.why {
+            Some(why) => quoted(&mut out, why),
+            None => out.push_str("null"),
+        }
+        out.push_str("}\n");
+    }
+    out
+}
+
+/// `text` as a JSON string (RFC 8259): `"` and `\` escaped, and every control character.
+fn quoted(out: &mut String, text: &str) {
+    out.push('"');
+    for it in text.chars() {
+        match it {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            it if it < ' ' => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.push_str("\\u00");
+                out.push(char::from(HEX[usize::from(it as u8 >> 4)]));
+                out.push(char::from(HEX[usize::from(it as u8 & 15)]));
+            }
+            it => out.push(it),
+        }
+    }
+    out.push('"');
+}
+
 /// `blaze codegen-inputs --format=json`: one object from each instance key's hex to its code
 /// hash's hex, in the response's order (sorted by key), newline ended.
 pub fn codegen_inputs_json(inputs: &[(ContentId, ContentId)]) -> String {
@@ -458,10 +506,12 @@ mod tests {
                 facts: Vec::new(),
                 rendered: String::new(),
                 unit: None,
+                explanation: None,
             }],
             facts: vec![fact("the signature of `main::parse`")],
             rendered: String::new(),
             unit: None,
+            explanation: None,
         }
     }
 
@@ -499,6 +549,7 @@ mod tests {
         let worked = Worked {
             reran: 12,
             green: 300,
+            served: Vec::new(),
             compiled: 2,
             found: 40,
             link: LinkKind::Patched,
@@ -512,6 +563,48 @@ mod tests {
         );
         let value: serde_json::Value = serde_json::from_str(&line).unwrap();
         assert_eq!(value["link"], "patched");
+    }
+
+    /// One line a crate in the shape `harness/v2/frontend/cases.py` reads, its strings as
+    /// serde_json writes them.
+    #[test]
+    fn each_dependency_is_one_served_line() {
+        use blaze_api::ServedPart;
+        let served = [
+            ServedCrate {
+                why: None,
+                bodies: ServedPart::Served,
+                outcome: ServedPart::Served,
+                package: "u0_1_arith".to_owned(),
+            },
+            ServedCrate {
+                why: Some("a note in \"src/lib.rs\" of another package\\\n\u{1}\u{1f}é".to_owned()),
+                bodies: ServedPart::Checked,
+                outcome: ServedPart::Refused,
+                package: "bad_cross".to_owned(),
+            },
+        ];
+        let text = served_json(&served);
+        assert_eq!(
+            text.lines().next(),
+            Some(
+                "{\"reason\": \"blaze-served\", \"package\": \"u0_1_arith\", \"outcome\": \"served\", \
+                 \"bodies\": \"served\", \"why\": null}"
+            )
+        );
+        assert!(text.ends_with('\n'));
+        let lines: Vec<serde_json::Value> = text.lines().map(|it| serde_json::from_str(it).unwrap()).collect();
+        assert_eq!(lines.len(), 2);
+        for (line, it) in lines.iter().zip(&served) {
+            assert_eq!(line["reason"], "blaze-served");
+            assert_eq!(line["package"], it.package.as_str());
+            assert_eq!(line["outcome"], it.outcome.name());
+            assert_eq!(line["bodies"], it.bodies.name());
+            assert_eq!(line["why"].as_str(), it.why.as_deref());
+        }
+        let why = served[1].why.as_deref().unwrap();
+        assert!(text.contains(&serde_json::to_string(why).unwrap()), "{text}");
+        assert_eq!(served_json(&[]), "");
     }
 
     #[test]
@@ -567,6 +660,7 @@ mod tests {
             facts: vec![fact("what `x` in `main` resolves to")],
             rendered: "warning: unused variable: `x`\n --> src/main.rs:2:9\n".to_owned(),
             unit: None,
+            explanation: None,
         };
         assert_eq!(
             lines(&Response::Diagnostic(diagnostic), false),
@@ -584,6 +678,8 @@ mod tests {
             outcome: TestOutcome::Passed,
             output: b"noise\n".to_vec(),
             millis: 4,
+            outside: false,
+            executable: 0,
         };
         let passed = lines(&Response::TestResult(result.clone()), false);
         assert_eq!(passed, "test parses ... ok (4 ms)\n");

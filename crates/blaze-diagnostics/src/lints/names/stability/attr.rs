@@ -1,7 +1,8 @@
-//! `#[deprecated]`, `#[stable]`, `#[unstable]`, `#[rustc_allowed_through_unstable_modules]` and
-//! `#[allow_internal_unstable]` as written on a node, read as rustc's attribute parsers read
-//! them: an attribute rustc rejects as malformed gives nothing (its error is the attribute
-//! checks'), the first well-formed one of a kind is the one that counts.
+//! `#[deprecated]`, `#[stable]`, `#[unstable]`, `#[rustc_allowed_through_unstable_modules]`,
+//! `#[allow_internal_unstable]` and `#[unstable_feature_bound]` as written on a node, read as
+//! rustc's attribute parsers read them: an attribute rustc rejects as malformed gives nothing
+//! (its error is the attribute checks'), the first well-formed one of a kind is the one that
+//! counts.
 //!
 //! The attributes are visited in place (`expand_cfg_attr` over the syntax), nothing collected:
 //! a node with none costs one look at its children and allocates nothing. Only an attribute
@@ -12,13 +13,16 @@
 //! data_structures.rs` (`Deprecation`, `DeprecatedSince`) and `compiler/rustc_hir/src/
 //! stability.rs` (`Stability`, `StabilityLevel`) (MIT or Apache-2.0).
 
-use std::ops::ControlFlow;
+use std::{borrow::Cow, ops::ControlFlow};
 
 use cfg::CfgOptions;
-use hir_expand::attrs::{AstKeyValueMetaExt as _, expand_cfg_attr};
+use hir_expand::attrs::{AstKeyValueMetaExt as _, expand_cfg_attr_view};
 use intern::Symbol;
 use smallvec::SmallVec;
-use syntax::{AstToken, NodeOrToken, SyntaxKind, SyntaxNode, T, ast};
+use syntax::{
+    NodeOrToken, SyntaxKind, T, TextRange,
+    view::{self as ast, AstNode as _, AstToken as _, Node},
+};
 
 /// A rustc version, `RustcVersion`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -110,43 +114,43 @@ impl Stability {
 
 /// Calls `f` with each attribute of `node` once `cfg_attr` is expanded with `cfg`, outer then
 /// inner, with the attribute it is written in, until `f` breaks.
-pub(super) fn each<T>(
-    node: &SyntaxNode,
+pub(super) fn each<'t, T>(
+    node: Node<'t>,
     cfg: &CfgOptions,
-    f: impl FnMut(ast::Meta, ast::Attr) -> ControlFlow<T>,
+    f: impl FnMut(ast::Meta<'t>, ast::Attr<'t>) -> ControlFlow<T>,
 ) -> Option<T> {
-    let owner = ast::AnyHasAttrs::cast(node.clone())?;
-    expand_cfg_attr(ast::attrs_including_inner(&owner), || cfg, f)
+    let owner = ast::AnyHasAttrs::cast(node)?;
+    expand_cfg_attr_view(ast::attrs_including_inner(&owner), || cfg, f)
 }
 
 /// Whether `meta` is the attribute `name`, a path of one segment: a length check and a
 /// compare of the token's bytes, no hashing.
-pub(super) fn is(meta: &ast::Meta, name: &str) -> bool {
+pub(super) fn is(meta: &ast::Meta<'_>, name: &str) -> bool {
     meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == name)
 }
 
 /// The `#[deprecated]` of `node`, read as rustc reads it for a crate that is `staged` (has
 /// `#![feature(staged_api)]`) or not.
-pub(super) fn deprecation(node: &SyntaxNode, cfg: &CfgOptions, staged: bool) -> Option<Deprecation> {
+pub(super) fn deprecation(node: Node<'_>, cfg: &CfgOptions, staged: bool) -> Option<Deprecation> {
     each(node, cfg, |meta, _| match is(&meta, "deprecated").then(|| parse_deprecation(&meta, staged)).flatten() {
         Some(it) => ControlFlow::Break(it),
         None => ControlFlow::Continue(()),
     })
 }
 
-fn parse_deprecation(meta: &ast::Meta, staged: bool) -> Option<Deprecation> {
-    let mut since = None;
-    let mut note = None;
-    let mut suggestion = None;
+fn parse_deprecation(meta: &ast::Meta<'_>, staged: bool) -> Option<Deprecation> {
+    let (mut since, mut note, mut suggestion) = (None, None, None);
     match meta {
         ast::Meta::PathMeta(_) => {}
+        // alloc: the note of a `#[deprecated]` that is written, kept once per definition for the message
         ast::Meta::KeyValueMeta(meta) => note = Some(meta.value_string()?.to_string()),
         ast::Meta::TokenTreeMeta(meta) => {
-            for (key, value) in name_values(&meta.token_tree()?)? {
-                let slot = match key.as_str() {
-                    "since" => &mut since,
-                    "note" => &mut note,
-                    "suggestion" => &mut suggestion,
+            let (mut since_at, mut note_at, mut suggestion_at) = (None, None, None);
+            for (key, value) in name_values(meta.token_tree()?)? {
+                let slot = match key {
+                    Key::Since => &mut since_at,
+                    Key::Note => &mut note_at,
+                    Key::Suggestion => &mut suggestion_at,
                     _ => return None,
                 };
                 if slot.is_some() {
@@ -154,14 +158,17 @@ fn parse_deprecation(meta: &ast::Meta, staged: bool) -> Option<Deprecation> {
                 }
                 *slot = Some(value);
             }
+            since = since_at;
+            // alloc: the note and suggestion of a `#[deprecated]` that is written, kept once per definition for the message
+            (note, suggestion) = (note_at.map(|it| text(it).into_owned()), suggestion_at.map(|it| text(it).into_owned()));
         }
         _ => return None,
     }
-    let since = match since {
-        Some(since) if since == "TBD" => Since::Future,
+    let since = match since.map(text).as_deref() {
+        Some("TBD") => Since::Future,
         Some(_) if !staged => Since::NonStandard,
-        Some(since) if since == "CURRENT_RUSTC_VERSION" => Since::RustcVersion(CURRENT),
-        Some(since) => parse_version(&since).map_or(Since::Err, Since::RustcVersion),
+        Some("CURRENT_RUSTC_VERSION") => Since::RustcVersion(CURRENT),
+        Some(since) => parse_version(since).map_or(Since::Err, Since::RustcVersion),
         None if staged => Since::Err,
         None => Since::Unspecified,
     };
@@ -172,37 +179,49 @@ fn parse_deprecation(meta: &ast::Meta, staged: bool) -> Option<Deprecation> {
 }
 
 /// The stability the attributes of `node` give an item of a staged crate.
-pub(super) fn stability(node: &SyntaxNode, cfg: &CfgOptions) -> Option<Stability> {
+pub(super) fn stability(node: Node<'_>, cfg: &CfgOptions) -> Option<Stability> {
+    stability_written(node, cfg).map(|(it, _)| it)
+}
+
+/// [`stability`] with where its attribute is: the whole `#[...]`, or what a `cfg_attr` expands
+/// to (`expand_cfg_attr_item` gives the attribute its item's span).
+pub(super) fn stability_written(node: Node<'_>, cfg: &CfgOptions) -> Option<(Stability, TextRange)> {
     let mut stability = None;
     let mut through = None;
-    each::<()>(node, cfg, |meta, _| {
+    each::<()>(node, cfg, |meta, written| {
         if is(&meta, "stable") || is(&meta, "unstable") {
             if stability.is_none()
                 && let ast::Meta::TokenTreeMeta(list) = &meta
-                && let Some(items) = list.token_tree().and_then(|it| name_values(&it))
+                && let Some(items) = list.token_tree().and_then(name_values)
             {
-                stability = if is(&meta, "unstable") { parse_unstable(items) } else { parse_stable(items) };
+                let range = match meta.syntax().parent() {
+                    Some(parent) if parent == written.syntax() => written.syntax().text_range(),
+                    _ => meta.syntax().text_range(),
+                };
+                let parsed = if is(&meta, "unstable") { parse_unstable(items) } else { parse_stable(items) };
+                stability = parsed.map(|it| (it, range));
             }
         } else if is(&meta, "rustc_allowed_through_unstable_modules")
             && let ast::Meta::KeyValueMeta(meta) = &meta
         {
+            // alloc: the message of a `#[rustc_allowed_through_unstable_modules]` that is written, kept for the deprecation it gives
             through = meta.value_string().map(|it| it.to_string());
         }
         ControlFlow::Continue(())
     });
-    if let Some(Stability::Stable { allowed_through_unstable_modules }) = &mut stability {
+    if let Some((Stability::Stable { allowed_through_unstable_modules }, _)) = &mut stability {
         *allowed_through_unstable_modules = through;
     }
     stability
 }
 
-fn parse_stable(list: Items) -> Option<Stability> {
+fn parse_stable(list: Items<'_>) -> Option<Stability> {
     let mut feature = None;
     let mut since = None;
     for (key, value) in list {
-        let slot = match key.as_str() {
-            "feature" => &mut feature,
-            "since" => &mut since,
+        let slot = match key {
+            Key::Feature => &mut feature,
+            Key::Since => &mut since,
             _ => return None,
         };
         if slot.is_some() {
@@ -210,20 +229,20 @@ fn parse_stable(list: Items) -> Option<Stability> {
         }
         *slot = Some(value);
     }
-    feature.filter(|it| is_ident(it))?;
+    feature.filter(|it| is_ident(&text(*it)))?;
     Some(Stability::Stable { allowed_through_unstable_modules: None })
 }
 
-fn parse_unstable(list: Items) -> Option<Stability> {
+fn parse_unstable(list: Items<'_>) -> Option<Stability> {
     let (mut feature, mut reason, mut issue, mut implied_by) = (None, None, None, None);
     let mut _old_name = None;
     for (key, value) in list {
-        let slot = match key.as_str() {
-            "feature" => &mut feature,
-            "reason" => &mut reason,
-            "issue" => &mut issue,
-            "implied_by" => &mut implied_by,
-            "old_name" => &mut _old_name,
+        let slot = match key {
+            Key::Feature => &mut feature,
+            Key::Reason => &mut reason,
+            Key::Issue => &mut issue,
+            Key::ImpliedBy => &mut implied_by,
+            Key::OldName => &mut _old_name,
             _ => return None,
         };
         if slot.is_some() {
@@ -231,20 +250,38 @@ fn parse_unstable(list: Items) -> Option<Stability> {
         }
         *slot = Some(value);
     }
-    let feature = Symbol::intern(&feature.filter(|it| is_ident(it))?);
-    let issue = match issue?.as_str() {
+    let feature = feature?;
+    let feature = text(feature);
+    if !is_ident(&feature) {
+        return None;
+    }
+    let feature = Symbol::intern(&feature);
+    let issue = issue?;
+    let issue = match &*text(issue) {
         "none" => None,
         issue => Some(issue.parse::<std::num::NonZero<u32>>().ok()?.get()),
     };
-    let implied_by = implied_by.map(|it| Symbol::intern(&it));
+    let implied_by = implied_by.map(|it| Symbol::intern(&text(it)));
+    // alloc: the reason of an `#[unstable]` that is written, kept once per definition for the E0658 message
+    let reason = reason.map(|it| text(it).into_owned());
     Some(Stability::Unstable { feature, reason, issue, implied_by })
 }
 
 /// Whether `#[allow_internal_unstable(..)]` on `node` lets a macro's expansion use `feature`.
-pub(super) fn allows_internal_unstable(node: &SyntaxNode, cfg: &CfgOptions, feature: &Symbol) -> bool {
+pub(super) fn allows_internal_unstable(node: Node<'_>, cfg: &CfgOptions, feature: &Symbol) -> bool {
+    lists_feature(node, cfg, "allow_internal_unstable", feature)
+}
+
+/// Whether an `#[unstable_feature_bound(..)]` on `node` names `feature`.
+pub(super) fn unstable_feature_bound(node: Node<'_>, cfg: &CfgOptions, feature: &Symbol) -> bool {
+    lists_feature(node, cfg, "unstable_feature_bound", feature)
+}
+
+/// Whether an attribute `name(..)` on `node` lists `feature` among its identifiers.
+fn lists_feature(node: Node<'_>, cfg: &CfgOptions, name: &str, feature: &Symbol) -> bool {
     let feature = feature.as_str();
     each(node, cfg, |meta, _| {
-        if is(&meta, "allow_internal_unstable")
+        if is(&meta, name)
             && let ast::Meta::TokenTreeMeta(meta) = &meta
             && let Some(tt) = meta.token_tree()
             && tt.syntax().children_with_tokens().any(|it| {
@@ -259,16 +296,54 @@ pub(super) fn allows_internal_unstable(node: &SyntaxNode, cfg: &CfgOptions, feat
     .is_some()
 }
 
-/// An attribute's `key = "value"` items. Most have up to four (`feature`, `reason`, `issue`,
-/// `implied_by`), kept inline.
-type Items = SmallVec<[(String, String); 4]>;
+/// A key of an attribute's `key = "value"` items, of those the stability attributes read;
+/// every other is `Other`, which each of them rejects.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Since,
+    Note,
+    Suggestion,
+    Feature,
+    Reason,
+    Issue,
+    ImpliedBy,
+    OldName,
+    Other,
+}
+
+impl Key {
+    fn of(text: &str) -> Key {
+        match text {
+            "since" => Key::Since,
+            "note" => Key::Note,
+            "suggestion" => Key::Suggestion,
+            "feature" => Key::Feature,
+            "reason" => Key::Reason,
+            "issue" => Key::Issue,
+            "implied_by" => Key::ImpliedBy,
+            "old_name" => Key::OldName,
+            _ => Key::Other,
+        }
+    }
+}
+
+/// An attribute's `key = "value"` items, each value its string literal, unescaped only when
+/// read. Most have up to four (`feature`, `reason`, `issue`, `implied_by`), kept inline.
+type Items<'t> = SmallVec<[(Key, ast::String<'t>); 4]>;
+
+/// The value of a string literal [`name_values`] checked unescapes: borrowed unless it has
+/// an escape.
+fn text(value: ast::String<'_>) -> Cow<'_, str> {
+    value.value().unwrap_or_default()
+}
 
 /// The `key = "value"` items of an attribute's list, each value a string literal; `None` when
 /// an item is anything else (rustc's malformed-attribute errors).
-fn name_values(tt: &ast::TokenTree) -> Option<Items> {
+fn name_values(tt: ast::TokenTree<'_>) -> Option<Items<'_>> {
     let mut items = Items::new();
-    let mut tokens: SmallVec<[_; 16]> =
-        tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).skip(1).collect();
+    // Inline, no heap: five `key = "value"` items and their commas fit.
+    let mut tokens: SmallVec<[ast::Element<'_>; 24]> = SmallVec::new();
+    tokens.extend(tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).skip(1));
     if tokens.last().is_some_and(|it| it.kind() == T![')']) {
         tokens.pop();
     }
@@ -278,8 +353,11 @@ fn name_values(tt: &ast::TokenTree) -> Option<Items> {
             [NodeOrToken::Token(key), NodeOrToken::Token(eq), NodeOrToken::Token(value)]
                 if key.kind() == SyntaxKind::IDENT && eq.kind() == T![=] =>
             {
-                let value = ast::String::cast(value.clone())?.value().ok()?.into_owned();
-                items.push((key.text().trim_start_matches("r#").to_owned(), value));
+                let value = ast::String::cast(*value)?;
+                if value.value().is_err() {
+                    return None;
+                }
+                items.push((Key::of(key.text().trim_start_matches("r#")), value));
             }
             _ => return None,
         }

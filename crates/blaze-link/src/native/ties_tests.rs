@@ -78,6 +78,8 @@ fn output() -> Output {
         live: None,
         tags: 1 << 32,
         windows_subsystem: false,
+        dev_run: None,
+        triple: "x86_64-unknown-linux-gnu".into(),
         stack: None,
     }
 }

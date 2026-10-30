@@ -167,6 +167,8 @@ pub struct Shown {
     /// Whether a build began: a command that watches the daemon's builds is shown each in
     /// turn.
     began: bool,
+    /// What one read's records or one tick write, reused: one draw and one write each.
+    out: String,
 }
 
 enum Rendering {
@@ -177,46 +179,102 @@ enum Rendering {
 impl Shown {
     pub fn new() -> Shown {
         let held = std::io::stderr().is_terminal().then(String::new);
-        Shown { asked: Instant::now(), to: rendering(), held, records: Vec::new(), began: false }
+        Shown {
+            asked: Instant::now(),
+            to: rendering(),
+            held,
+            records: Vec::new(),
+            began: false,
+            out: String::new(),
+        }
     }
 
     fn now_ns(&self) -> u64 {
         u64::try_from(self.asked.elapsed().as_nanos()).unwrap_or(u64::MAX)
     }
 
-    pub fn record(&mut self, record: &blaze_protocol::events::Record) {
-        event_out(record);
-        let began = matches!(record.event, blaze_protocol::events::Event::Began { .. });
-        if began && std::mem::replace(&mut self.began, true) {
-            self.finish();
-            let to = rendering();
-            *self =
-                Shown { asked: Instant::now(), to, held: None, records: Vec::new(), began: true };
+    /// Shows `records`, which came in one read: one draw and one write for them all. A
+    /// `Began` past the first splits them: the records before it go to the build they are of,
+    /// which is finished, and the rest to the next one's.
+    pub fn records(&mut self, records: &[blaze_protocol::events::Record]) {
+        let mut from = 0;
+        for (at, record) in records.iter().enumerate() {
+            event_out(record);
+            let began = matches!(record.event, blaze_protocol::events::Event::Began { .. });
+            if began && std::mem::replace(&mut self.began, true) {
+                self.draw(&records[from..at]);
+                self.finish();
+                let out = std::mem::take(&mut self.out);
+                let to = rendering();
+                *self = Shown {
+                    asked: Instant::now(),
+                    to,
+                    held: None,
+                    records: Vec::new(),
+                    began: true,
+                    out,
+                };
+                from = at;
+            }
         }
-        self.records.push(record.clone());
-        let now_ns = self.now_ns();
-        let out = match &mut self.to {
-            Some(Rendering::Live(live)) => live.record(record, now_ns),
-            Some(Rendering::Plain(plain)) => plain.record(record),
-            None => return,
-        };
-        self.write(&out);
+        self.draw(&records[from..]);
     }
 
-    /// Draws the region again for the time that passed, or says a step is still under way.
+    /// One draw of `batch`, records of one build, and one write of it.
+    fn draw(&mut self, batch: &[blaze_protocol::events::Record]) {
+        if batch.is_empty() {
+            return;
+        }
+        // clone: kept for `blaze why`, once per record
+        self.records.extend_from_slice(batch);
+        let now_ns = self.now_ns();
+        let mut out = std::mem::take(&mut self.out);
+        out.clear();
+        match &mut self.to {
+            Some(Rendering::Live(live)) => live.records_into(batch, now_ns, &mut out),
+            Some(Rendering::Plain(plain)) => {
+                for record in batch {
+                    plain.record_into(record, &mut out);
+                }
+            }
+            None => {
+                self.out = out;
+                return;
+            }
+        }
+        self.write(&out);
+        self.out = out;
+    }
+
+    /// How long until the draw the terminal view held back is due, from now; `None` when
+    /// nothing is held, or the view is not a terminal's.
+    pub fn due(&self) -> Option<Duration> {
+        let Some(Rendering::Live(live)) = &self.to else { return None };
+        let due_ns = live.due_ns()?;
+        Some(Duration::from_nanos(due_ns.saturating_sub(self.now_ns())))
+    }
+
+    /// Draws the region again for the time that passed (and what was held back for a frame),
+    /// or says a step is still under way.
     pub fn tick(&mut self) {
         let now_ns = self.now_ns();
-        let out = match &mut self.to {
+        let mut out = std::mem::take(&mut self.out);
+        out.clear();
+        match &mut self.to {
             Some(Rendering::Live(live)) => {
                 if let Some(width) = terminal_width() {
                     live.resize(width);
                 }
-                live.tick(now_ns)
+                live.tick_into(now_ns, &mut out);
             }
-            Some(Rendering::Plain(plain)) => plain.tick(now_ns),
-            None => return,
-        };
+            Some(Rendering::Plain(plain)) => plain.tick_into(now_ns, &mut out),
+            None => {
+                self.out = out;
+                return;
+            }
+        }
         self.write(&out);
+        self.out = out;
     }
 
     /// The answer came: the region is taken away, and what was held back of a quick build is

@@ -50,7 +50,7 @@ use crate::cx::Cx;
 
 /// What has an effective visibility.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Def {
+pub(crate) enum Def {
     Item(ModuleDef),
     Field(hir::Field),
     Impl(hir::Impl),
@@ -106,7 +106,7 @@ impl Ev {
 
 /// The effective visibilities of the crate's definitions.
 #[derive(Default)]
-pub(super) struct Effective {
+pub(crate) struct Effective {
     ids: FxHashMap<Def, u32>,
     defs: Vec<Def>,
     /// rustc's table: `None` where it has no entry.
@@ -119,7 +119,7 @@ pub(super) struct Effective {
 }
 
 impl Effective {
-    pub(super) fn of(cx: &Cx<'_, '_>) -> Effective {
+    pub(crate) fn of(cx: &Cx<'_, '_>) -> Effective {
         let db = cx.db;
         let modules = crate::checks::modules(cx);
         // alloc: setup, once per crate: the scopes of blocks hold impls and `impl Trait`s too.
@@ -158,7 +158,7 @@ impl Effective {
     }
 
     /// rustc's `is_reachable`: another crate can name it or use it through what it can name.
-    pub(super) fn is_reachable(&self, def: Def) -> bool {
+    pub(crate) fn is_reachable(&self, def: Def) -> bool {
         self.is_public_at(def, Level::Reachable)
     }
 
@@ -380,7 +380,7 @@ impl<'db> Build<'_, '_, 'db> {
         for &module in modules {
             let id = self.id(Def::Item(ModuleDef::Module(module)));
             self.push(id);
-            for def in module.declarations(db) {
+            for def in module.declarations_iter(db) {
                 if matches!(def, ModuleDef::Adt(_) | ModuleDef::Trait(_)) {
                     let id = self.id(Def::Item(def));
                     self.push(id);
@@ -434,7 +434,7 @@ impl<'db> Build<'_, '_, 'db> {
                 }
                 for variant in variants {
                     let parent = self.id(Def::Item(ModuleDef::EnumVariant(variant)));
-                    for field in variant.fields(db) {
+                    for field in variant.fields_iter(db) {
                         self.update_field(field, parent, here);
                     }
                 }
@@ -442,8 +442,8 @@ impl<'db> Build<'_, '_, 'db> {
             Def::Item(ModuleDef::Adt(adt)) => {
                 let here = self.t.private[scope as usize];
                 let fields = match adt {
-                    hir::Adt::Struct(it) => it.fields(db),
-                    hir::Adt::Union(it) => it.fields(db),
+                    hir::Adt::Struct(it) => hir::Variant::from(it).fields_iter(db),
+                    hir::Adt::Union(it) => hir::Variant::from(it).fields_iter(db),
                     hir::Adt::Enum(_) => return,
                 };
                 for field in fields {
@@ -452,7 +452,7 @@ impl<'db> Build<'_, '_, 'db> {
             }
             Def::Item(ModuleDef::Trait(it)) => {
                 let here = self.t.private[scope as usize];
-                for item in it.items(db) {
+                for item in it.items_iter(db) {
                     let id = self.id(Def::Item(item.into()));
                     self.update_def(id, self.t.nominal[id as usize], scope_vis, here, inherited, Level::Direct);
                 }
@@ -536,7 +536,7 @@ impl<'db> Build<'_, '_, 'db> {
         let db = cx.db;
         let mut impls = Vec::new(); // alloc: setup, once per crate
         for &scope in scopes {
-            for imp in scope.impl_defs(db) {
+            for imp in scope.impl_defs_iter(db) {
                 let id = self.id(Def::Impl(imp));
                 impls.push(id);
                 for def in impl_defs(cx, imp, true) {
@@ -566,11 +566,11 @@ impl<'db> Build<'_, '_, 'db> {
     fn through_impl_trait(&mut self, scopes: &[hir::Module]) {
         let db = self.cx.db;
         for &scope in scopes {
-            for def in scope.declarations(db) {
+            for def in scope.declarations_iter(db) {
                 match def {
                     ModuleDef::Function(it) => self.hidden(it),
                     ModuleDef::Trait(it) => {
-                        for item in it.items(db) {
+                        for item in it.items_iter(db) {
                             if let AssocItem::Function(it) = item
                                 && it.has_body(db)
                             {
@@ -581,8 +581,8 @@ impl<'db> Build<'_, '_, 'db> {
                     _ => {}
                 }
             }
-            for imp in scope.impl_defs(db) {
-                for item in imp.items(db) {
+            for imp in scope.impl_defs_iter(db) {
+                for item in imp.items_iter(db) {
                     if let AssocItem::Function(it) = item {
                         self.hidden(it);
                     }
@@ -714,7 +714,7 @@ impl<'db> Build<'_, '_, 'db> {
                         names.push(Def::Item(ModuleDef::Trait(it)));
                     }
                 });
-                for item in trait_.items(db) {
+                for item in trait_.items_iter(db) {
                     let item_id = self.id(Def::Item(item.into()));
                     self.update_nominal(item_id, ev, Level::Reachable);
                     self.check_assoc(item, ev, None);
@@ -734,7 +734,7 @@ impl<'db> Build<'_, '_, 'db> {
                         names.trait_ref(imp);
                     }
                 });
-                for item in imp.items(db) {
+                for item in imp.items_iter(db) {
                     let item_id = self.id(Def::Item(item.into()));
                     let max = (!of_trait).then(|| self.t.nominal[item_id as usize]);
                     self.update_eff_vis(item_id, ev, max, Level::Direct);
@@ -750,13 +750,13 @@ impl<'db> Build<'_, '_, 'db> {
                         names.clauses(GenericDef::Adt(adt));
                     });
                 }
-                for variant in it.variants(db) {
+                for variant in it.variants_iter(db) {
                     let variant_id = self.id(Def::Item(ModuleDef::EnumVariant(variant)));
                     if let Some(ev) = ev {
                         self.update_nominal(variant_id, ev, Level::Reachable);
                     }
                     let Some(variant_ev) = self.t.ev[variant_id as usize] else { continue };
-                    for field in variant.fields(db) {
+                    for field in variant.fields_iter(db) {
                         let field_id = self.id(Def::Field(field));
                         self.update_nominal(field_id, variant_ev, Level::Reachable);
                         self.reach(variant_ev, Level::Reachable, |names| names.ty(field.ty(db).to_next_solver()));
@@ -773,8 +773,8 @@ impl<'db> Build<'_, '_, 'db> {
                     names.clauses(GenericDef::Adt(adt));
                 });
                 let fields = match adt {
-                    hir::Adt::Struct(it) => it.fields(db),
-                    hir::Adt::Union(it) => it.fields(db),
+                    hir::Adt::Struct(it) => hir::Variant::from(it).fields_iter(db),
+                    hir::Adt::Union(it) => hir::Variant::from(it).fields_iter(db),
                     hir::Adt::Enum(_) => return,
                 };
                 for field in fields {

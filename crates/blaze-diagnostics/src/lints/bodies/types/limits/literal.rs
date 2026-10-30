@@ -127,6 +127,7 @@ pub(super) fn lint_literal(b: &BodyCx<'_, '_>, expr: ExprId, negation: Option<Ex
         None => None,
     };
     let Some((lit, negated_pat)) = literal(b, expr) else { return };
+    // clone: a span or node handle, for a literal `may_overflow` found
     let negation = if negated_pat { Some(lit.span.clone()) } else { negation };
     match util::ty(b, expr).kind() {
         TyKind::Int(t) => {
@@ -160,7 +161,9 @@ pub(super) fn lint_literal(b: &BodyCx<'_, '_>, expr: ExprId, negation: Option<Ex
             }
             let ty = t.name_str();
             let written = snippet(b, &lit.span).unwrap_or(text);
+            // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
             let mut diag = Diag::lint(LINT, format!("literal out of range for `{ty}`"), lit.span.clone());
+            // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
             diag.note(format!(
                 "the literal `{written}` does not fit into the type `{ty}` and will be converted to `{ty}::INFINITY`"
             ));
@@ -174,12 +177,14 @@ pub(super) fn lint_literal(b: &BodyCx<'_, '_>, expr: ExprId, negation: Option<Ex
 fn literal(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<(Lit, bool)> {
     let at = b.expr_node(expr)?;
     let node = b.cx.syntax(at);
+    // clone: a span or node handle, for a literal `may_overflow` found
     let (lit, pat) = match ast::Literal::cast(node.value.clone()) {
         Some(lit) => {
             let pat = lit.syntax().parent().and_then(ast::LiteralPat::cast);
             (lit, pat)
         }
         None => {
+            // clone: a span or node handle, for a literal `may_overflow` found
             let pat = ast::LiteralPat::cast(node.value.clone())?;
             (pat.literal()?, Some(pat))
         }
@@ -345,16 +350,23 @@ fn report_bin_hex_error(
         IntType::Signed(t) => {
             let extended = sign_extend(value, bits);
             let actually = if negative { extended.wrapping_neg() } else { extended };
+            // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
             (t.name_str(), actually.to_string())
         }
+        // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
         IntType::Unsigned(t) => (t.name_str(), truncate(value, bits).to_string()),
     };
+    // clone: a span or node handle, for a literal `may_overflow` found
     let span = lit.span.clone();
+    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
     let mut diag = Diag::lint(LINT, format!("literal out of range for `{name}`"), span.clone());
     if negative {
+        // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
         diag.note(format!("the literal `{repr}` (decimal `{value}`) does not fit into the type `{name}`"));
+        // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
         diag.note(format!("and the value `-{repr}` will become `{actually}{name}`"));
     } else {
+        // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
         diag.note(format!(
             "the literal `{repr}` (decimal `{value}`) does not fit into the type `{name}` and will become `{actually}{name}`"
         ));
@@ -362,13 +374,16 @@ fn report_bin_hex_error(
     let lit_ty = util::ty(b, lit.expr);
     let suffix_at = repr.chars().position(|it| it == 'i' || it == 'u');
     if let Some(suggestion_ty) = type_suggestion(lit_ty, value, negative) {
+        // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
         let message = format!("consider using the type `{suggestion_ty}` instead");
         match suffix_at {
             Some(at) => {
                 let sans_suffix = &repr[..at];
                 diag.suggestion(
+                    // clone: a span or node handle, for a literal `may_overflow` found
                     span.clone(),
                     message,
+                    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
                     format!("{sans_suffix}{suggestion_ty}"),
                     Applicability::MachineApplicable,
                 );
@@ -391,13 +406,16 @@ fn report_bin_hex_error(
         let int_ty = int_ty.name_str();
         diag.suggestion(
             span,
+            // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
             format!(
                 "to use as a negative number (decimal `{actually}`), consider using the type `{uint_ty}` for the literal and cast it to `{int_ty}`"
             ),
+            // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
             format!("{lit_no_suffix}{uint_ty} as {int_ty}"),
             Applicability::MaybeIncorrect,
         );
     }
+    // clone: a span or node handle, for a literal `may_overflow` found
     out.push(b.lint(diag, Phase::Late, lit.at.clone()));
 }
 
@@ -424,6 +442,7 @@ fn lint_overflowing_range_endpoint(
             Some(span) => (cast, span),
             None => return false,
         },
+        // clone: a span or node handle, for a literal `may_overflow` found
         None => (lit.expr, lit.span.clone()),
     };
     let range = b.exprs().iter().copied().find(|&it| match b.store().expr(it) {
@@ -444,23 +463,27 @@ fn lint_overflowing_range_endpoint(
     let suffix = suffix.unwrap_or("");
     let literal = value - 1;
     let message = "use an inclusive range instead";
+    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
     let mut diag = Diag::lint(LINT, format!("range endpoint is out of range for `{ty}`"), range_span.clone());
     if span.lo == lit.span.lo {
         let Some(start) = b.expr_span(start.expr).and_then(|it| snippet(b, &it)) else { return false };
         diag.suggestion(
             range_span.shrink_to_lo().to(&lit.span.shrink_to_hi()),
             message,
+            // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
             format!("{start}..={literal}{suffix}"),
             Applicability::MachineApplicable,
         );
     } else {
         diag.suggestion_with_style(
+            // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
             vec![(span.shrink_to_lo(), "=".to_owned()), (lit.span.clone(), format!("{literal}{suffix}"))],
             message,
             Applicability::MachineApplicable,
             SuggestionStyle::ShowCode,
         );
     }
+    // clone: a span or node handle, for a literal `may_overflow` found
     out.push(b.lint(diag, Phase::Late, lit.at.clone()));
     true
 }
@@ -496,14 +519,20 @@ fn lint_int_literal(
     if lint_overflowing_range_endpoint(b, lit, number.suffix(), value, max, t.name_str(), out) {
         return;
     }
+    // clone: a span or node handle, for a literal `may_overflow` found
     let span = negation.unwrap_or_else(|| lit.span.clone());
+    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
     let written = snippet(b, &span).unwrap_or_else(|| if negative { format!("-{value}") } else { value.to_string() });
     let ty = t.name_str();
+    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
     let mut diag = Diag::lint(LINT, format!("literal out of range for `{ty}`"), span);
+    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
     diag.note(format!("the literal `{written}` does not fit into the type `{ty}` whose range is `{min}..={max}`"));
     if let Some(suggestion_ty) = type_suggestion(util::ty(b, lit.expr), value, negative) {
+        // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
         diag.help(format!("consider using the type `{suggestion_ty}` instead"));
     }
+    // clone: a span or node handle, for a literal `may_overflow` found
     out.push(b.lint(diag, Phase::Late, lit.at.clone()));
 }
 
@@ -538,15 +567,18 @@ fn lint_uint_literal(b: &BodyCx<'_, '_>, lit: &Lit, t: UintTy, out: &mut Vec<Fou
             diag.note("`0xD800..=0xDFFF` are reserved for Unicode surrogates and are not valid `char` values");
             diag
         } else {
+            // clone: a span or node handle, for a literal `may_overflow` found
             let mut diag = Diag::lint(LINT, "only `u8` can be cast into `char`", cast_span.clone());
             diag.suggestion(
                 cast_span,
                 "use a `char` literal instead",
+                // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
                 format!("'\\u{{{value:X}}}'"),
                 Applicability::MachineApplicable,
             );
             diag
         };
+        // clone: a span or node handle, for a literal `may_overflow` found
         out.push(b.lint(diag, Phase::Late, lit.at.clone()));
         return;
     }
@@ -559,8 +591,12 @@ fn lint_uint_literal(b: &BodyCx<'_, '_>, lit: &Lit, t: UintTy, out: &mut Vec<Fou
         return;
     }
     let ty = t.name_str();
+    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
     let written = snippet(b, &lit.span).unwrap_or_else(|| value.to_string());
+    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found; clone: a span or node handle, for a literal `may_overflow` found
     let mut diag = Diag::lint(LINT, format!("literal out of range for `{ty}`"), lit.span.clone());
+    // alloc: the overflowing_literals lint's text, for a literal `may_overflow` found
     diag.note(format!("the literal `{written}` does not fit into the type `{ty}` whose range is `0..={max}`"));
+    // clone: a span or node handle, for a literal `may_overflow` found
     out.push(b.lint(diag, Phase::Late, lit.at.clone()));
 }

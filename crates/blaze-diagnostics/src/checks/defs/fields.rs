@@ -4,51 +4,64 @@
 //! `lower_variant`) and its `FieldAlreadyDeclared::NotNested` (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
-use hir::{FieldSource, HasSource as _};
+use hir::{FieldSourceView, InFile, Name};
 use rustc_hash::FxHashMap;
-use syntax::AstNode;
+use syntax::{TextRange, view::AstNode as _};
 
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view as item_range},
     lower::{Found, Phase},
-    model::{Diag, Span},
+    model::Diag,
 };
 
 pub(super) fn check(cx: &Cx<'_, '_>, adts: &[hir::Adt]) -> Vec<Found> {
+    // alloc: empty, allocates only when a field is declared twice
     let mut found = Vec::new();
+    let mut seen = FxHashMap::default();
     for &adt in adts {
-        let variants: Vec<hir::Variant> = match adt {
-            hir::Adt::Struct(it) => vec![it.into()],
-            hir::Adt::Union(it) => vec![it.into()],
-            hir::Adt::Enum(it) => it.variants(cx.db).into_iter().map(Into::into).collect(),
-        };
-        for variant in variants {
-            found.extend(check_variant(cx, adt, variant));
+        match adt {
+            hir::Adt::Struct(it) => check_variant(cx, adt, it.into(), &mut seen, &mut found),
+            hir::Adt::Union(it) => check_variant(cx, adt, it.into(), &mut seen, &mut found),
+            hir::Adt::Enum(it) => {
+                for variant in it.variants_iter(cx.db) {
+                    check_variant(cx, adt, variant.into(), &mut seen, &mut found);
+                }
+            }
         }
     }
     found
 }
 
-/// Each named field of `variant` whose name an earlier field has.
-fn check_variant(cx: &Cx<'_, '_>, adt: hir::Adt, variant: hir::Variant) -> Vec<Found> {
-    let mut seen: FxHashMap<String, Span> = FxHashMap::default();
-    let mut found = Vec::new();
-    for field in variant.fields(cx.db) {
-        let Some(source) = field.source(cx.db) else { continue };
-        let FieldSource::Named(node) = &source.value else { continue };
-        let span = cx.span(source.with_value(item_range(node.syntax())));
-        let name = field.name(cx.db).as_str().to_owned();
-        let Some(prev) = seen.get(&name) else {
-            seen.insert(name, span);
+/// Each named field of `variant` whose name an earlier field has. `seen` is reused for each
+/// variant.
+fn check_variant(
+    cx: &Cx<'_, '_>,
+    adt: hir::Adt,
+    variant: hir::Variant,
+    seen: &mut FxHashMap<Name, InFile<TextRange>>,
+    found: &mut Vec<Found>,
+) {
+    seen.clear();
+    for field in variant.fields_iter(cx.db) {
+        let Some(source) = cx.vsema.source(field) else { continue };
+        let FieldSourceView::Named(node) = source.value else { continue };
+        let range = source.with_value(item_range(node.syntax()));
+        let name = field.name(cx.db);
+        let Some(&prev) = seen.get(&name) else {
+            seen.insert(name, range);
             continue;
         };
+        let name = name.as_str();
+        let span = cx.span(range);
         let mut diag =
+            // alloc: clone: the error's message and span
             Diag::error(Some("E0124"), format!("field `{name}` is already declared"), span.clone());
         diag.span_label(span, "field already declared");
-        diag.span_label(prev.clone(), format!("`{name}` first declared here"));
+        // alloc: the error's label
+        diag.span_label(cx.span(prev), format!("`{name}` first declared here"));
+        // alloc: the error's fact
         let what = format!("the fields of `{}`", cx.def_path(hir::ModuleDef::Adt(adt)));
         diag.fact(Fact::Layout(cx.key(ItemId::Adt(adt.into()))), what);
         found.push(Found::new(diag, Phase::Items));
     }
-    found
 }

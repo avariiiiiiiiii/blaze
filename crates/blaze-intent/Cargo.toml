@@ -29,6 +29,7 @@ hir-def.workspace = true
 syntax.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 blaze-core.workspace = true
 salsa.workspace = true
 span.workspace = true

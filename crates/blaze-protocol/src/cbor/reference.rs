@@ -9,8 +9,8 @@ pub use de::from_slice;
 pub use ser::to_vec;
 
 use super::{
-    ARRAY, BYTES, DOUBLE, Error, FALSE, HALF, MAP, NAN, NEGATIVE, NULL, SIMPLE, SINGLE, TEXT, TRUE,
-    UNSIGNED, check, from_half, half_of,
+    ARRAY, BYTES, DOUBLE, Error, FALSE, HALF, MAP, NAN, NEGATIVE, NULL, RAW, SIMPLE, SINGLE, TEXT,
+    TRUE, UNSIGNED, check, from_half, half_of,
 };
 
 fn head(out: &mut Vec<u8>, major: u8, n: u64) {

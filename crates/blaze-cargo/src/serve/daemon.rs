@@ -39,7 +39,7 @@ use blaze_vfs::{ImageUse, Outside, Ticket, Vfs};
 use super::{
     heads::{Heads, Out},
     image::{Images, Parts, on_pool},
-    job::{Jobs, Said, Setup, Value, World},
+    job::{Jobs, Said, Setup, Step, Value, World},
     mounts::Mounts,
     plane::{Happened, Plane, Runner},
     work::Steps,
@@ -145,7 +145,9 @@ enum Stopping {
     Over,
 }
 
-pub struct Daemon<D: Driver> {
+/// The daemon on driver `D`, building with `S`: `blaze serve`'s is `Daemon<Native, Real>`, the
+/// simulation's `Daemon<Sim, Fake>`.
+pub struct Daemon<D: Driver, S: Steps> {
     driver: D,
     effects: Vec<Effect>,
     done: Vec<Completion>,
@@ -156,14 +158,14 @@ pub struct Daemon<D: Driver> {
     db: Arc<Database>,
     /// Only the loop writes it; workers read it through [`Store::reader`], with no lock.
     store: Store,
-    plane: Plane<Value>,
+    plane: Plane<Step<S>, History>,
     mounts: Mounts,
     heads: Heads,
     images: Images,
-    jobs: Jobs,
-    steps: Arc<dyn Steps>,
+    jobs: Jobs<S>,
+    steps: Arc<S>,
     replies: Vec<Reply>,
-    spare: Spare,
+    spare: Spare<S>,
     stopping: Option<Stopping>,
     /// A `blaze stop` arrived: the daemon stops once its answer is sent.
     stop_asked: bool,
@@ -178,12 +180,17 @@ pub struct Daemon<D: Driver> {
 
 /// The buffers the loop's calls borrow and give back, so a warm turn allocates none: a call
 /// made inside another takes one of its own, so each holds as many as calls nest.
-#[derive(Default)]
-struct Spare {
+struct Spare<S: Steps> {
     said: Vec<Vec<Said>>,
     out: Vec<Vec<Out>>,
     arrived: Vec<Vec<Arrived>>,
-    happened: Vec<Happened<Value>>,
+    happened: Vec<Happened<Value<S>>>,
+}
+
+impl<S: Steps> Default for Spare<S> {
+    fn default() -> Spare<S> {
+        Spare { said: Vec::new(), out: Vec::new(), arrived: Vec::new(), happened: Vec::new() }
+    }
 }
 
 /// What the start read, each once it is in.
@@ -194,15 +201,10 @@ struct Read {
     socket_free: bool,
 }
 
-impl<D: Driver> Daemon<D> {
+impl<D: Driver, S: Steps> Daemon<D, S> {
     /// Recovers the VFS from its journal and the database from its image, opens the store,
     /// and listens. Fails naming what could not be read, or when another daemon listens.
-    pub fn start(
-        mut driver: D,
-        options: Options,
-        steps: Arc<dyn Steps>,
-        runner: Box<dyn Runner<Value>>,
-    ) -> Result<Daemon<D>, String> {
+    pub fn start(mut driver: D, options: Options, steps: Arc<S>, runner: Runner<Step<S>>) -> Result<Daemon<D, S>, String> {
         let state = options.state.clone();
         let journal = under(&state, "journal");
         let db_dir = under(&state, "db");
@@ -314,7 +316,7 @@ impl<D: Driver> Daemon<D> {
                 .map_err(|error| format!("the daemon image /{image}: {error}"))?,
         };
         let plane_config = PlaneConfig { io: options.io, work: options.threads.max(1), budget: options.budget, starve_after: 8 };
-        let plane = Plane::new(plane_config, Box::new(history), runner).map_err(|error| format!("the plane: {error}"))?;
+        let plane = Plane::new(plane_config, history, runner).map_err(|error| format!("the plane: {error}"))?;
         let mounts = Mounts::recover(&vfs);
         let mut listening = socket.clone();
         #[cfg(unix)]
@@ -345,7 +347,8 @@ impl<D: Driver> Daemon<D> {
             tags: JOBS,
             runs: RUNS,
             runs_end: RUNS_END,
-        });
+        })
+        .map_err(|error| format!("the jobs' tables: {error}"))?;
         Ok(Daemon {
             driver,
             effects,
@@ -452,9 +455,12 @@ impl<D: Driver> Daemon<D> {
         } else {
             Duration::from_millis(50)
         };
+        let until = self.session.deadline().map(|at| Duration::from_nanos(at.saturating_sub(ns(self.driver.now()))));
+        let wait = until.map_or(wait, |until| wait.min(until));
         self.driver.submit(&mut self.effects);
         let mut done = std::mem::take(&mut self.done);
         self.driver.poll(&mut done, wait);
+        self.tick();
         for completion in done.drain(..) {
             self.dispatch(completion);
         }
@@ -467,6 +473,17 @@ impl<D: Driver> Daemon<D> {
         self.stepping_stop();
         self.driver.submit(&mut self.effects);
         !matches!(self.stopping, Some(Stopping::Over))
+    }
+
+    /// The session told the time before anything else it is told this turn; intent whose
+    /// time is up is cancelled.
+    fn tick(&mut self) {
+        let now = ns(self.driver.now());
+        let due = self.session.deadline().is_some_and(|at| at <= now);
+        self.session.tick(&mut cx!(self), now);
+        if due {
+            self.after_session();
+        }
     }
 
     /// A completion to its part, by the block of tags it is in: compares on the tag alone,
@@ -538,6 +555,10 @@ impl<D: Driver> Daemon<D> {
                     self.after_session();
                 }
                 Out::Answer(reply) => self.server.reply(reply, &mut self.effects),
+                Out::Moved { head, root } => {
+                    self.session.head_moved(&mut cx!(self), &head, root);
+                    self.after_session();
+                }
             }
         }
         self.spare.out.push(out);
@@ -580,7 +601,9 @@ impl<D: Driver> Daemon<D> {
         for it in said.drain(..) {
             match it {
                 Said::Report(job, response) => self.session.report(&mut cx!(self), job, response, &mut replies),
-                Said::Finish(job, ok, error) => self.session.finish(&mut cx!(self), job, ok, error, &mut replies),
+                Said::Finish(job, ok, error, queries) => {
+                    self.session.finish_in(&mut cx!(self), job, ok, error, queries, &mut replies);
+                }
             }
         }
         self.spare.said.push(said);
@@ -616,6 +639,9 @@ impl<D: Driver> Daemon<D> {
         if self.jobs.ended {
             self.jobs.ended = false;
             self.db.collect(&[self.steps.plan_key()], &mut self.effects);
+            if let Some(db) = Arc::get_mut(&mut self.db) {
+                db.reclaim();
+            }
             self.vfs.collect(&self.mounts.roots());
             self.heads.sweep(&mut self.effects);
             for corrupt in self.db.take_corrupt() {

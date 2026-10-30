@@ -68,6 +68,7 @@ impl AllowedOptions for InternedStruct {
     const HEAP_SIZE: bool = true;
 
     const SELF_TY: bool = false;
+    const MEM_TAG: bool = false;
 
     const PERSIST: AllowedPersistOptions = AllowedPersistOptions::AllowedValue;
 }

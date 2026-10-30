@@ -199,6 +199,40 @@ pub enum Command {
     Run,
 }
 
+impl Command {
+    /// The command a word names, with cargo's aliases.
+    pub fn named(word: &str) -> Option<Command> {
+        match word {
+            "build" | "b" => Some(Command::Build),
+            "check" | "c" => Some(Command::Check),
+            "run" | "r" => Some(Command::Run),
+            "test" | "t" => Some(Command::Test),
+            "bench" => Some(Command::Bench),
+            _ => None,
+        }
+    }
+
+    /// The command as cargo names it, for `alias.<command>` and its messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            Command::Build => "build",
+            Command::Check => "check",
+            Command::Run => "run",
+            Command::Test => "test",
+            Command::Bench => "bench",
+        }
+    }
+
+    /// The profile cargo builds with when none is named.
+    pub fn profile(self) -> &'static str {
+        match self {
+            Command::Build | Command::Check | Command::Run => "dev",
+            Command::Test => "test",
+            Command::Bench => "bench",
+        }
+    }
+}
+
 /// A cargo command line as the client was run (`blaze_api::Cargo`), or one the daemon made of
 /// an agent's `blaze_api::Targets`.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -231,7 +265,7 @@ pub enum Planned {
 }
 
 impl Versioned for Planned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 2");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo planned 4");
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -283,10 +317,14 @@ pub struct Units {
     pub finished: String,
     /// The workspace's `build-script-link-dirs`, absolute.
     pub link_dirs: Vec<String>,
+    /// The workspace's root manifest lists `sandboxed-tests` in `experimental` under
+    /// `[workspace.metadata.blaze]`: every member's tests run sandboxed but those
+    /// [`TestSandbox`] takes out.
+    pub sandboxed_tests: bool,
 }
 
 impl Versioned for Units {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 2");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo units 4");
 }
 
 /// What cargo passes and writes for one unit.
@@ -337,6 +375,41 @@ pub struct PackagePlan {
     pub is_member: bool,
     /// The manifest's `package.default-run`.
     pub default_run: Option<String>,
+    /// For a crates.io package, the SHA-256 of its `.crate` as the lock file names it (what the
+    /// download was checked against); `None` for any other source. How `blaze_global::Rule`
+    /// names a public crate (`Origin::CratesIo`).
+    pub checksum: Option<[u8; 32]>,
+    /// What a member's `[package.metadata.blaze.sandbox]` says of its tests; nothing for any
+    /// other package.
+    pub tests: TestSandbox,
+}
+
+impl PackagePlan {
+    /// Whether the package's tests run sandboxed, when the build runs any so: `tests = true`
+    /// or the workspace's `sandboxed-tests` experiment ([`Units::sandboxed_tests`]), unless
+    /// `tests = false`.
+    pub fn tests_sandboxed(&self, experiment: bool) -> bool {
+        !self.tests.all && (self.tests.opted_in || experiment)
+    }
+}
+
+/// The tests keys of a member's `[package.metadata.blaze.sandbox]` (docs/cargo.md).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default, Debug)]
+pub struct TestSandbox {
+    /// `tests = false`: every test of the package runs outside.
+    pub all: bool,
+    /// `tests = true`: every test of the package runs sandboxed but those of `tests`, whether
+    /// or not the workspace opts in.
+    pub opted_in: bool,
+    /// `unsandboxed-tests`: the tests, by libtest's names, that run outside; sorted, each once.
+    pub tests: Vec<String>,
+}
+
+impl TestSandbox {
+    /// Whether `unsandboxed-tests` names `test`.
+    pub fn outside(&self, test: &str) -> bool {
+        self.tests.binary_search_by(|it| it.as_str().cmp(test)).is_ok()
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -387,8 +460,7 @@ impl StdKey {
     pub const DOMAIN: &'static str = "blaze v2 cargo std key 3";
 
     pub fn id(&self) -> ContentId {
-        let bytes = cbor::to_vec(self).unwrap_or_else(|error| panic!("a std key has no CBOR: {error}"));
-        ContentId::of(StdKey::DOMAIN, &bytes)
+        crate::load::key_id(StdKey::DOMAIN, self)
     }
 }
 
@@ -399,7 +471,7 @@ pub enum StdPlanned {
 }
 
 impl Versioned for StdPlanned {
-    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 2");
+    const SCHEMA: SchemaHash = blaze_format::schema("blaze v2 cargo std planned 4");
 }
 
 /// The standard library's units: a graph of their own, whose units the user's units depend on
@@ -428,10 +500,9 @@ pub const fn producer(what: &str) -> ContentId {
 }
 
 /// A query key's content ID (`blaze_query::Query::input`): its deterministic CBOR under
-/// `domain`.
-pub fn key_input<K: Serialize>(domain: &str, key: &K) -> ContentId {
-    let bytes = cbor::to_vec(key).unwrap_or_else(|error| panic!("a query key has no CBOR: {error}"));
-    ContentId::of(domain, &bytes)
+/// `domain`, hashed in this thread's buffer ([`crate::load::key_id`]), so it allocates nothing.
+pub fn key_input<K: Serialize>(domain: &'static str, key: &K) -> ContentId {
+    crate::load::key_id(domain, key)
 }
 
 #[cfg(test)]

@@ -31,7 +31,7 @@ static SEEN: Mutex<BTreeSet<PathBuf>> = Mutex::new(BTreeSet::new());
 /// manifest of their workspace takes out.
 pub(crate) fn install() {
     proc_macro_api::wrap::wrap_servers_with(wrapped);
-    load_cargo::unsandboxed_macros_with(Box::new(|workspace, crate_name, library| {
+    load_cargo::unsandboxed_macros_with(|workspace, crate_name, library| {
         let (workspace, library): (&Path, &Path) = (workspace.as_ref(), library.as_ref());
         if let Ok(mut seen) = SEEN.lock() {
             seen.insert(workspace.to_owned());
@@ -45,7 +45,7 @@ pub(crate) fn install() {
             // and says so.
             Err(_) => false,
         }
-    }));
+    });
 }
 
 /// `server`, the command a proc-macro server is started with, as `blaze sandbox SPEC --

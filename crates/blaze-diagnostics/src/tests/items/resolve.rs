@@ -1,5 +1,6 @@
 //! rustc's UI tests of names that do not resolve: imports (E0432), modules with no file (E0583),
-//! and the style lints of the names items are given.
+//! paths of bodies (E0425 in a module, E0433 of a prefix), and the style lints of the names
+//! items are given.
 
 use crate::tests::ui;
 
@@ -106,4 +107,97 @@ error: aborting due to 2 previous errors
 
 "#;
     assert_eq!(ui("lint-non-uppercase-statics.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_function_a_module_lacks_is_e0425_in_that_module() {
+    // tests/ui/namespace/namespaced-enum-glob-import-no-impls.rs
+    let source = r##"mod m2 {
+    pub enum Foo {
+        A,
+        B(isize),
+        C { a: isize },
+    }
+
+    impl Foo {
+        pub fn foo() {}
+        pub fn bar(&self) {}
+    }
+}
+
+mod m {
+    pub use crate::m2::Foo::*;
+}
+
+pub fn main() {
+    use crate::m2::Foo::*;
+
+    foo(); //~ ERROR cannot find function `foo` in this scope
+    m::foo(); //~ ERROR cannot find function `foo` in module `m`
+    bar(); //~ ERROR cannot find function `bar` in this scope
+    m::bar(); //~ ERROR cannot find function `bar` in module `m`
+}
+"##;
+    let stderr = r##"error[E0425]: cannot find function `foo` in module `m`
+  --> $DIR/namespaced-enum-glob-import-no-impls.rs:22:8
+   |
+LL |     m::foo();
+   |        ^^^ not found in `m`
+
+error[E0425]: cannot find function `bar` in module `m`
+  --> $DIR/namespaced-enum-glob-import-no-impls.rs:24:8
+   |
+LL |     m::bar();
+   |        ^^^ not found in `m`
+
+error[E0425]: cannot find function `foo` in this scope
+  --> $DIR/namespaced-enum-glob-import-no-impls.rs:21:5
+   |
+LL |     foo();
+   |     ^^^ not found in this scope
+
+error[E0425]: cannot find function `bar` in this scope
+  --> $DIR/namespaced-enum-glob-import-no-impls.rs:23:5
+   |
+LL |     bar();
+   |     ^^^ not found in this scope
+
+error: aborting due to 4 previous errors
+
+For more information about this error, try `rustc --explain E0425`.
+"##;
+    assert_eq!(ui("namespaced-enum-glob-import-no-impls.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_prefix_of_a_body_path_that_names_nothing_is_e0433() {
+    // tests/ui/resolve/export-fully-qualified-2018.rs
+    let source = r##"//@ edition:2018
+
+// In this test baz isn't resolved when called as foo.baz even though
+// it's called from inside foo. This is somewhat surprising and may
+// want to change eventually.
+
+mod foo {
+    pub fn bar() { foo::baz(); } //~ ERROR: cannot find
+    //~^ NOTE: use of unresolved module or unlinked crate `foo`
+
+    fn baz() { }
+}
+
+fn main() { }
+"##;
+    let stderr = r##"error[E0433]: cannot find module or crate `foo` in this scope
+  --> $DIR/export-fully-qualified-2018.rs:8:20
+   |
+LL |     pub fn bar() { foo::baz(); }
+   |                    ^^^ use of unresolved module or unlinked crate `foo`
+   |
+   = help: you might be missing a crate named `foo`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0433`.
+"##;
+    assert_eq!(ui("export-fully-qualified-2018.rs", "2018", source), stderr);
 }

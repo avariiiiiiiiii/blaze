@@ -41,6 +41,10 @@
 
 extern crate self as rustc_type_ir;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use std::fmt;
 use std::hash::Hash;
 

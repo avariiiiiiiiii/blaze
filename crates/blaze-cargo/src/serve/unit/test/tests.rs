@@ -5,7 +5,7 @@ use std::{
 };
 
 use blaze_core::Traced;
-use blaze_ids::ContentId;
+use blaze_ids::{ContentId, rng::SplitMix64 as Rng};
 use blaze_usercode::{
     test::{Lines, Trace},
     trace::{self, Inputs, Seen},
@@ -13,10 +13,8 @@ use blaze_usercode::{
 
 use super::traced::{Common, Splice};
 
-/// Counts allocations for the budget tests here; the only global allocator of blaze-cargo's
-/// tests.
-#[global_allocator]
-static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+// The budget tests here count through the test binary's one counting allocator,
+// `crate::sandbox`'s.
 
 /// The machine a test reads: `/w/p{n}` is nothing for `n % 3 == 0`, a file for 1 and a
 /// directory for 2; the environment is `V0` to `V3`.
@@ -53,29 +51,20 @@ impl Inputs for World {
         Ok((kind(path) == 2).then(|| hash("listing", path)))
     }
 
-    fn env(&mut self, name: &OsStr) -> Option<OsString> {
-        self.env.iter().find(|it| it.0 == name).map(|it| it.1.clone())
+    fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
+        self.env.iter().find(|it| it.0 == name).map(|it| it.1.as_os_str())
     }
 
     fn env_all(&mut self) -> &[(OsString, OsString)] {
         &self.env
     }
 
-    fn names(&mut self, _: &Path) -> Result<Option<Vec<(OsString, bool)>>, Infallible> {
-        Ok(None)
+    fn names(&mut self, _: &Path, _: &mut trace::Names<'_>) -> Result<bool, Infallible> {
+        Ok(false)
     }
-}
 
-/// splitmix64.
-struct Rng(u64);
-
-impl Rng {
-    fn below(&mut self, n: u64) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        (z ^ (z >> 31)) % n
+    fn entry(&mut self, _: &Path) -> Result<trace::Entry, Infallible> {
+        Ok(trace::Entry::Missing)
     }
 }
 
@@ -112,7 +101,7 @@ fn increasing<T: Ord>(list: &[T]) -> bool {
 /// out again, the shared part is as it was.
 #[test]
 fn a_splice_is_what_one_assembly_of_both_parts_gives() {
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     let mut splice = Splice::default();
     for _ in 0..2000 {
         let count = rng.below(48);
@@ -186,7 +175,7 @@ fn of(lines: &[(Seen, String)]) -> Lines {
 /// result.
 #[test]
 fn a_result_is_traced_as_its_trace_says() {
-    let mut rng = Rng(11);
+    let mut rng = Rng::new(11);
     let mut common = Common::default();
     let mut world = World::new();
     for _ in 0..200 {

@@ -22,6 +22,7 @@ blaze-codegen.workspace = true
 blaze-core.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
+blaze-inproc.workspace = true
 blaze-items.workspace = true
 blaze-live.workspace = true
 blaze-mem.workspace = true

@@ -8,6 +8,7 @@ mod paths;
 mod uses;
 mod worklist;
 mod batch_order;
+mod views;
 
 use expect_test::{Expect, expect};
 use test_fixture::WithFixture;
@@ -1045,13 +1046,13 @@ use missing::five;
             let mut with_any = 0;
             for (module, _) in def_map.modules(db) {
                 let filtered: Vec<_> =
-                    def_map.diagnostics().iter().filter(|it| it.in_module == module).collect();
-                let of: Vec<_> = def_map.diagnostics_of(module).collect();
+                    def_map.diagnostics(db).iter().filter(|it| it.in_module == module).collect();
+                let of: Vec<_> = def_map.diagnostics_of(db, module).collect();
                 assert_eq!(of, filtered);
                 seen += of.len();
                 with_any += usize::from(!of.is_empty());
             }
-            assert_eq!(seen, def_map.diagnostics().len());
+            assert_eq!(seen, def_map.diagnostics(db).len());
             assert_eq!(with_any, 3);
         },
     );
@@ -1065,7 +1066,7 @@ fn impls_keep_their_order_and_their_reservation_bit() {
         nameres::frozen::{self, Frozen, Mode},
         src::HasSource,
     };
-    use syntax::AstNode;
+    use syntax::view::AstNode;
 
     let mut db = TestDB::with_files(
         r#"
@@ -1088,7 +1089,8 @@ impl Tr for D {}
     {
         let def_map = crate_def_map(&db, krate);
         let scope = def_map.module(&db, def_map.root).scope(&db);
-        let start = |it: ImplId| it.lookup(&db).source(&db).value.syntax().text_range().start();
+        let start =
+            |it: ImplId| it.lookup(&db).source_view(&db).value.syntax().text_range().start();
         let impls: Vec<ImplId> = scope.impls().collect();
         assert_eq!(impls.len(), 5);
         assert!(impls.windows(2).all(|it| start(it[0]) < start(it[1])), "declaration order");
@@ -1112,4 +1114,40 @@ impl Tr for D {}
     let scope = def_map.module(&db, def_map.root).scope(&db);
     assert_eq!(scope.trait_impls_without_reservation().count(), 2);
     assert_eq!(frozen::differences(), Vec::<String>::new());
+}
+
+#[test]
+fn an_adts_variants_are_itself_or_its_enums_in_order() {
+    use hir_expand::name::Name;
+    use intern::Symbol;
+
+    use crate::{AdtId, ModuleDefId, VariantId};
+
+    let name = |s: &str| Name::new_symbol_root(Symbol::intern(s));
+    compute_crate_def_map(
+        r#"
+struct S;
+union U { a: u8 }
+enum E { A, B(u8), C {} }
+enum Empty {}
+"#,
+        |db, def_map| {
+            let scope = def_map.module(db, def_map.root).scope(db);
+            let adt = |s: &str| match scope.get(&name(s)).take_types() {
+                Some(ModuleDefId::AdtId(it)) => it,
+                it => panic!("`{s}` is not an adt: {it:?}"),
+            };
+            let variants = |s: &str| adt(s).variants(db).collect::<Vec<_>>();
+
+            let AdtId::StructId(s) = adt("S") else { panic!("`S` is a struct") };
+            assert_eq!(variants("S"), [VariantId::StructId(s)]);
+            let AdtId::UnionId(u) = adt("U") else { panic!("`U` is a union") };
+            assert_eq!(variants("U"), [VariantId::UnionId(u)]);
+            let AdtId::EnumId(e) = adt("E") else { panic!("`E` is an enum") };
+            let declared = &e.enum_variants(db).variants;
+            let of = |s: &str| VariantId::EnumVariantId(declared[&name(s)].0);
+            assert_eq!(variants("E"), [of("A"), of("B"), of("C")]);
+            assert_eq!(variants("Empty"), Vec::<VariantId>::new());
+        },
+    );
 }

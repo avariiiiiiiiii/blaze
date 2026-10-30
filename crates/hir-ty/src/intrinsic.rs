@@ -265,7 +265,7 @@ pub fn intrinsic_of(
     let name = FunctionSignature::of(db, func).name.symbol();
     match Intrinsic::from_symbol(name) {
         Some(intrinsic) => Ok(Some(intrinsic)),
-        None => Err(UnknownIntrinsic(name.clone())),
+        None => Err(UnknownIntrinsic(name.clone())), // clone: error path, the error names it
     }
 }
 

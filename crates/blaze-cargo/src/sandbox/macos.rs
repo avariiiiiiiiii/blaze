@@ -114,10 +114,11 @@ const RESOLVER_SERVICE: &str = "(global-name \"com.apple.dnssd.service\")";
 /// loopback (all of it with `network`, and the resolver's socket), a Unix socket outside the
 /// run's own and writable directories, and every Mach service but [`MACH_SERVICES`]. Paths
 /// come in as parameters (`WRITE0`, `WRITE1`, ..., the live record's `LIVE0`, ..., and
-/// `SOCKET0`, ..., each Unix socket the read set names, which it may connect to), which need
+/// `SOCKET0`, ..., each Unix socket the read set names, which it may connect to, and
+/// `SERVICE0`, ..., each Mach name it may look up beyond [`MACH_SERVICES`]), which need
 /// no quoting. No terminal is written by name: what the program prints goes to the
 /// descriptors it was given, which no rule checks again.
-fn profile(writes: usize, lives: usize, sockets: usize, network: bool) -> String {
+fn profile(writes: usize, lives: usize, sockets: usize, services: usize, network: bool) -> String {
     let mut text = String::with_capacity(4096 + 256 * (writes + lives + sockets));
     text.push_str("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*");
     for at in 0..writes {
@@ -162,6 +163,9 @@ fn profile(writes: usize, lives: usize, sockets: usize, network: bool) -> String
     for service in MACH_SERVICES.iter().chain(network.then_some(&RESOLVER_SERVICE)) {
         text.push_str("\n  ");
         text.push_str(service);
+    }
+    for at in 0..services {
+        _ = write!(text, "\n  (global-name (param \"SERVICE{at}\"))");
     }
     text.push_str(")\n");
     text
@@ -464,8 +468,14 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
         .flat_map(|it| spellings(it))
         // alloc: once per run, as above.
         .collect();
-    let profile = c(profile(writes.len(), lives.len(), sockets.len(), also.network).as_bytes());
-    let mut params = Vec::with_capacity(2 * (writes.len() + lives.len() + sockets.len()));
+    for service in also.services {
+        if service.is_empty() || service.contains('\0') {
+            // alloc: the error, once, and no sandbox is made.
+            return Err(format!("the Mach service {service:?} can't be named in a profile"));
+        }
+    }
+    let profile = c(profile(writes.len(), lives.len(), sockets.len(), also.services.len(), also.network).as_bytes());
+    let mut params = Vec::with_capacity(2 * (writes.len() + lives.len() + sockets.len() + also.services.len()));
     let mut name = String::with_capacity(16);
     for (kind, values) in [("WRITE", &writes), ("LIVE", &lives), ("SOCKET", &sockets)] {
         for (at, it) in values.iter().enumerate() {
@@ -473,6 +483,11 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             _ = write!(name, "{kind}{at}");
             params.extend([c(name.as_bytes()), c(it.as_bytes())]);
         }
+    }
+    for (at, it) in also.services.iter().enumerate() {
+        name.clear();
+        _ = write!(name, "SERVICE{at}");
+        params.extend([c(name.as_bytes()), c(it.as_bytes())]);
     }
     let mut param_ptrs: Vec<*const libc::c_char> = Vec::with_capacity(params.len() + 1);
     param_ptrs.extend(params.iter().map(|it| it.as_ptr()));
@@ -580,13 +595,32 @@ pub fn run(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) -> Result<
             // SAFETY: as for `_exit` above.
             unsafe { libc::_exit(super::COULD_NOT) };
         }
-        // SAFETY: `argv_ptrs` and `env_ptrs` end with a null pointer and each other entry is a
-        // nul-terminated string of `argv` or `env`, live in this frame for the call, which
-        // writes nothing through them; `argv_ptrs[0]` is the program's path (a run with a
-        // program has one).
-        unsafe { libc::execve(argv_ptrs[0], argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
-        let error = std::io::Error::last_os_error();
-        eprintln!("blaze: could not run {}: {error}", argv[0].to_string_lossy());
+        // The program is often the file blaze just wrote: an exec that meets a writer's
+        // descriptor not yet closed (`ETXTBSY`) is made again on blaze-core's schedule.
+        let (mut tried, mut waited) = (0, 0);
+        let said = loop {
+            // SAFETY: `argv_ptrs` and `env_ptrs` end with a null pointer and each other entry is a
+            // nul-terminated string of `argv` or `env`, live in this frame for the call, which
+            // writes nothing through them; `argv_ptrs[0]` is the program's path (a run with a
+            // program has one).
+            unsafe { libc::execve(argv_ptrs[0], argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ETXTBSY) {
+                // alloc: the error, once, and the program's process ends.
+                break error.to_string();
+            }
+            let Some(wait) = blaze_core::busy::next(tried, waited) else {
+                // alloc: as above.
+                break format!(
+                    "still open for writing after {} ms of tries: {error}",
+                    blaze_core::busy::MOST_NS / 1_000_000
+                );
+            };
+            std::thread::sleep(std::time::Duration::from_nanos(wait));
+            tried += 1;
+            waited += wait;
+        };
+        eprintln!("blaze: could not run {}: {said}", argv[0].to_string_lossy());
         // SAFETY: as for `_exit` above.
         unsafe { libc::_exit(127) };
     }
@@ -866,19 +900,34 @@ mod tests {
 
     #[test]
     fn the_profile_lets_the_live_record_be_written_and_the_network_through_when_given() {
-        let closed = super::profile(2, 1, 1, false);
+        let closed = super::profile(2, 1, 1, 0, false);
         assert!(closed.contains("(subpath (param \"WRITE1\"))"), "{closed}");
         assert!(closed.contains("(literal (param \"LIVE0\"))"), "{closed}");
         assert!(closed.contains("(remote unix-socket (path-literal (param \"SOCKET0\")))"), "{closed}");
         assert!(closed.contains("(remote ip \"localhost:*\")"), "{closed}");
         assert!(!closed.contains("\"*:*\"") && !closed.contains("mDNSResponder"), "{closed}");
         assert!(!closed.contains("com.apple.dnssd.service"), "{closed}");
-        let open = super::profile(1, 0, 0, true);
+        let open = super::profile(1, 0, 0, 0, true);
         assert!(!open.contains("LIVE0") && !open.contains("SOCKET0"), "{open}");
         assert!(open.contains("(allow network-outbound (remote ip \"*:*\"))"), "{open}");
         assert!(open.contains("/private/var/run/mDNSResponder"), "{open}");
         assert!(open.contains(super::RESOLVER_SERVICE), "{open}");
         assert!(open.contains("(deny mach-lookup)"), "the other services stay refused");
+        assert!(!open.contains("SERVICE0"), "{open}");
+    }
+
+    #[test]
+    fn each_mach_name_given_is_one_more_lookup_and_no_other_is_allowed() {
+        let profile = super::profile(0, 0, 0, 2, false);
+        let denied = profile.find("(deny mach-lookup)").expect("other lookups are refused");
+        let allowed = profile[denied..].find("(allow mach-lookup").expect("the profile's own are allowed") + denied;
+        // The allowed list is the profile's last form.
+        let list = &profile[allowed..];
+        assert!(list.ends_with(")\n"), "{profile}");
+        for at in 0..2 {
+            assert!(list.contains(&format!("(global-name (param \"SERVICE{at}\"))")), "{profile}");
+        }
+        assert!(!profile.contains("SERVICE2"), "{profile}");
     }
 
     #[test]
@@ -942,6 +991,7 @@ mod tests {
             write: vec![out.clone()],
             network: false,
             trace: true,
+            services: Vec::new(),
             live: dir.join("live"),
             report: dir.join("report"),
             not_inputs: vec![exe],

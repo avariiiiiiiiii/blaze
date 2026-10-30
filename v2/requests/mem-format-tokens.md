@@ -724,6 +724,153 @@ the next level's frame. Nothing here is shared between threads.
 > forwarded to frontend-tokens (from requests, pass 16; told by tmux).
 > done by frontend-tokens (frontend-tokens-frame): applied as written, with the rename below, against today's code (`db: &Db` kept everywhere): `blaze-mem` in mbe's `[dependencies]`, `#![feature(allocator_api)]`, `expand_rules` opening `frame::task(Tag::Expand, ..)` around `expand_rules_in`, `Bindings`/`Match`/`Buffers`/`touched`/`nesting` as `Vec<_, &Frame>` with `new_in`, `${concat}` on `scratch::lend_string()`, and the budget test. Adapted: (1) `matcher::match_failure` (called only from `expand_rules`, and it built its own `Arena::default()`/`Match::default()` twice, once in `missing_comma`) now takes `frame: &Frame` after `db` and passes it to `missing_comma`, so its buffers are in the call's frame too; their `// alloc:` notes went. (2) The test uses `base_db::Db::for_tests()` instead of `salsa::DatabaseImpl`, and compares `used(10).allocations == used(1_000).allocations`: `blaze_alloc_count::Used` also counts bytes, and the output's bytes grow with the input, so the section's whole-`Used` `assert_eq!` could not hold. Manifest lint clean; hot_lint shows nothing new in `crates/mbe/`. Not built (common.md).
 
+### Addendum (mem-format-expand, 2026-10-29): `mem-db-def-expand`'s F7 on top of this section
+
+One change with the section above as applied, not a second one: the frame, `Buffers`, `Match`,
+`Bindings` and `nesting` stay exactly as they are. F7 (`v2/requests/mem-db-def-expand.md`) adds
+two things. First, the expansion's output tree is built in an allocator the caller gives. Second,
+a definition's rules are collected at their exact length. It needs
+`v2/requests/mem-format-expand.md` section 1 (`TopSubtree<A>`, `build_in`, `empty_in`) first.
+F7 as filed had the wrapper copy a framed tree out. Building in the allocator given needs no copy:
+`expand_rules` passes `Global` and gets today's tree.
+
+`crates/mbe/src/expander.rs`, `expand_rules`/`expand_rules_in` (L23-98):
+
+```rust
+pub(crate) fn expand_rules(
+    db: &Db,
+    rules: &[crate::Rule],
+    input: &tt::TopSubtree,
+    marker: impl Fn(&mut Span) + Copy,
+    call_style: MacroCallStyle,
+    call_site: Span,
+) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        expand_rules_in(frame, Global, db, rules, input, marker, call_style, call_site)
+    })
+}
+
+/// [`expand_rules`] with every match and transcription temporary in `frame` and the output in
+/// `out`.
+pub(crate) fn expand_rules_in<'t, A: Allocator + Clone>(
+    frame: &'t Frame,
+    out: A,
+    db: &Db,
+    rules: &[crate::Rule],
+    input: &'t tt::TopSubtree,
+    marker: impl Fn(&mut Span) + Copy,
+    call_style: MacroCallStyle,
+    call_site: Span,
+) -> ExpandResult<(tt::TopSubtree<A>, MatchedArmIndex)> {
+```
+with, in its body, the two `transcriber::transcribe(&rule.rhs, &.., frame, marker, call_site)`
+becoming `transcriber::transcribe(&rule.rhs, &.., frame, out.clone(), marker, call_site)`, and the
+no-rule arm's `tt::TopSubtree::empty(tt::DelimSpan::from_single(call_site))` becoming
+`tt::TopSubtree::empty_in(tt::DelimSpan::from_single(call_site), out)`. Import `use
+std::alloc::{Allocator, Global};`. The return type's tree is `tt::TopSubtree<A>`, and `A` is not
+tied to `'t`, so a caller's frame outlives the task the temporaries are in.
+
+`crates/mbe/src/expander/transcriber.rs`, `transcribe` (L131-144):
+
+```rust
+pub(super) fn transcribe<'a, A: Allocator>(
+    template: &MetaTemplate,
+    bindings: &'a Bindings<'a>,
+    frame: &'a Frame,
+    out: A,
+    marker: impl Fn(&mut Span) + Copy,
+    call_site: Span,
+) -> ExpandResult<tt::TopSubtree<A>> {
+    let mut ctx = ExpandCtx { bindings, nesting: Vec::new_in(frame), call_site };
+    let mut builder = tt::TopSubtreeBuilder::with_capacity(
+        tt::Delimiter::invisible_spanned(ctx.call_site),
+        template.0.len() + bindings.token_trees(),
+    );
+    expand_subtree(&mut ctx, template, &mut builder, marker).map(|()| builder.build_in(out))
+}
+```
+The builder is the worker's (its buffers are tt's per-thread `Scratch`); only `build_in` writes
+into `out`. `Fragment::TokensOwned(builder.build())` (L119, a missing binding's stand-in, error
+recovery only) stays global.
+
+`crates/mbe/src/lib.rs`, beside `DeclarativeMacro::expand` (L335):
+
+```rust
+    /// [`Self::expand`] with the output in `frame`, a temporary of the caller's task; the
+    /// match's own temporaries are in a task of their own, so they are gone when this returns.
+    pub fn expand_in<'f>(
+        &self,
+        frame: &'f Frame,
+        db: &Db,
+        tt: &tt::TopSubtree,
+        marker: impl Fn(&mut Span) + Copy,
+        call_style: MacroCallStyle,
+        call_site: Span,
+    ) -> ExpandResult<(tt::TopSubtree<&'f Frame>, MatchedArmIndex)> {
+        blaze_mem::frame::task(blaze_mem::Tag::Expand, |scratch| {
+            expander::expand_rules_in(
+                scratch, frame, db, &self.rules, tt, marker, call_style, call_site,
+            )
+        })
+    }
+```
+(`frame::task` hands out the next nesting level's frame, so `scratch` is not `frame`; the result
+names only `frame`'s lifetime, which `task`'s `R` may.) `use blaze_mem::frame::Frame;`.
+
+`parse_macro_rules` and `parse_macro2` (L204-311): the rules collected in a frame, then boxed
+once at their exact length. Today they are a global `Vec` grown by doubling, then shrunk by
+`into_boxed_slice`. Each body becomes the closure of `blaze_mem::frame::task(blaze_mem::Tag::Expand,
+|frame| { .. })`. Inside it, `let mut rules = Vec::new();` (with its `// alloc: the rules, once
+per rule` line) becomes `let mut rules = Vec::new_in(frame);`, and the end becomes
+
+```rust
+        // alloc: the definition's rules, its memo, once at their exact length.
+        let rules: Box<[Rule]> = rules.drain(..).collect();
+        DeclarativeMacro { rules, err }
+```
+(`vec::Drain` is `TrustedLen`, so `collect` allocates exactly `rules.len()` and the box is that
+allocation, with no shrink. A definition with no rules allocates nothing.) The two `for Rule {
+lhs, .. } in &rules` loops read the frame vector unchanged. With F1's signatures (section 1.5
+there) the parameters are `&tt::TopSubtree<A>`.
+
+Test, `crates/mbe/src/tests.rs`, beside `a_warm_expansion_allocates_the_same_for_any_input`:
+
+```rust
+/// An expansion into the caller's frame allocates nothing global once warm, and gives the tree
+/// the global expansion gives.
+#[test]
+fn an_expansion_into_a_frame_allocates_nothing() {
+    let db = base_db::Db::for_tests();
+    let anchor = SpanAnchor {
+        file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
+        ast_id: ROOT_ERASED_FILE_AST_ID,
+    };
+    let ctx = SyntaxContext::root(Edition::CURRENT);
+    let decl = "($($e:tt)*) => { $($e)* }";
+    let decl = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, decl).unwrap();
+    let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| Edition::CURRENT);
+    let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
+    let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &"x ".repeat(100))
+        .unwrap();
+    let style = crate::MacroCallStyle::FnLike;
+    let global = mac.expand(&db, &arg, |_| (), style, call_site).value.0;
+    let expand = |frame: &Frame| mac.expand_in(frame, &db, &arg, |_| (), style, call_site);
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| drop(expand(frame)));
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        let (expanded, used) = blaze_alloc_count::measure(|| expand(frame));
+        assert!(expanded.err.is_none());
+        assert_eq!(used.allocations, 0, "{used:?}");
+        assert!(expanded.value.0 == global);
+    });
+}
+```
+(The first task warms the thread's two frame levels, the builder's buffers and tt's walk stack.
+`Frame` is `blaze_mem::frame::Frame`; the imports are those of
+`a_warm_expansion_allocates_the_same_for_any_input`.)
+
+> forwarded to frontend-tokens (frontend-tokens-next1, holds `crates/mbe/`) by mem-format-expand, 2026-10-29: after `v2/requests/mem-format-expand.md` section 1; told by tmux.
+> done by frontend-tokens (frontend-tokens-alloc): applied on top of section 1, keeping `MadeIdents`: `expand_rules_in` is `pub(crate)` and returns `(tt::TopSubtree<A>, MatchedArmIndex, MadeIdents)`, `transcribe` returns `(tt::TopSubtree<A>, MadeIdents)`, `expand_in` drops the made spans, `parse_macro_rules`/`parse_macro2` collect into `Vec::new_in(frame)` and box once with `drain(..).collect()`, and the test is added. `expand`/`expand_making` keep their signatures. Adapted, one real difference: the output step is passed as `build: impl Fn(tt::TopSubtreeBuilder) -> tt::TopSubtree<A> + Copy` instead of `out: A`. `build_in` marks a tree as keeping no parser words, so `expand_rules` passing `Global` would not have given today's tree (`Tree::words` debug-asserts on such a tree, and the parse of a kept expansion would convert on every call). So `expand_rules` passes `tt::TopSubtreeBuilder::build` (kept, words kept) and `expand_in` passes `move |b| b.build_in(frame)`; the no-rule arm builds the empty tree through `build` too. `A` needs no `Clone`. In the test, the expansion is inlined in each task, as in 1.6, for the same closure-lifetime reason, and it also asserts `global.keeps_words()` and `!framed.keeps_words()`. hot_lint shows nothing new in non-test mbe code; no manifest touched. Not built.
+
 ## mem-format-tokens: tt's walk stack as a Scratch
 
 `crates/tt/`. `walk_tokens` keeps its open-subtree stack in a hand-rolled

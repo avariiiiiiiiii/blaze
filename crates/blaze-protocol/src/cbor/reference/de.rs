@@ -2,7 +2,7 @@
 
 use serde::de::{self, Deserialize, DeserializeSeed, IntoDeserializer as _, Visitor};
 
-use super::{ARRAY, BYTES, Error, MAP, NEGATIVE, NULL, SIMPLE, TEXT, UNSIGNED, check, from_half};
+use super::{ARRAY, BYTES, Error, MAP, NEGATIVE, NULL, RAW, SIMPLE, TEXT, UNSIGNED, check, from_half};
 
 /// The value of type `T` that `bytes` encode: one item in the core deterministic encoding,
 /// or the first offence against it.
@@ -107,11 +107,17 @@ impl<'de> de::Deserializer<'de> for &mut Decoder<'de> {
         }
     }
 
+    /// A [`crate::cbor::Raw`] is handed its item's bytes, which [`check`] has passed.
     fn deserialize_newtype_struct<V: Visitor<'de>>(
         self,
-        _: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Error> {
+        if name == RAW {
+            let start = self.at;
+            crate::cbor::check::item(self.bytes, &mut self.at, 0)?;
+            return visitor.visit_borrowed_bytes(&self.bytes[start..self.at]);
+        }
         visitor.visit_newtype_struct(self)
     }
 

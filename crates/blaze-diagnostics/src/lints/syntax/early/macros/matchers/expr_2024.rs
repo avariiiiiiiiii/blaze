@@ -12,6 +12,7 @@ use super::tokens::{Ids, Kind, Punct, Tokens, Tt};
 /// The `expr`s of `$x:expr` in the body of a definition (matchers and transcribers alike), each
 /// in its token's edition.
 pub(super) fn exprs(tokens: &Tokens) -> Vec<TextRange> {
+    // alloc: empty until a lint fires; holds only what fires
     let mut out = Vec::new();
     walk(tokens, tokens.top, &mut out);
     out

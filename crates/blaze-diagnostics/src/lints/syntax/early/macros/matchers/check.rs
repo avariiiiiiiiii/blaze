@@ -78,6 +78,7 @@ impl<'a, T> Stack<'a, T> {
 impl Stack<'_, Kleene> {
     /// Outermost first.
     fn ops(&self) -> SmallVec<[Kleene; 1]> {
+        // alloc: inline, a `SmallVec` of one allocates nothing below two levels of repetition
         let mut ops: SmallVec<[Kleene; 1]> = self.iter().copied().collect();
         ops.reverse();
         ops
@@ -93,6 +94,7 @@ pub(super) struct Checker<'t> {
 
 impl<'t> Checker<'t> {
     pub(super) fn new(m: &'t Matchers, tokens: &'t Tokens) -> Checker<'t> {
+        // alloc: empty until a lint fires; holds only what fires
         Checker { m, tokens, misuses: Vec::new() }
     }
 
@@ -283,6 +285,7 @@ impl<'t> Checker<'t> {
         for state in macros.iter() {
             acc.push(&state.ops);
             if let Some(binder) = state.binders.get(key) {
+                // alloc: inline, a `SmallVec` of two allocates nothing below three levels of repetition
                 let occurrence: SmallVec<[Kleene; 2]> = acc.iter().rev().flat_map(|it| it.iter().copied()).collect();
                 if let Some(misuse) = ops_is_prefix(span, name, &binder.ops, &occurrence) {
                     self.misuses.push(misuse);

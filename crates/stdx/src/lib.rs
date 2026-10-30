@@ -7,7 +7,6 @@ use std::{cmp::Ordering, ops, time::Instant};
 
 mod macros;
 
-pub mod anymap;
 pub mod assert;
 pub mod non_empty_vec;
 pub mod panic_context;

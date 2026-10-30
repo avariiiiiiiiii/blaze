@@ -1182,9 +1182,12 @@ pub(crate) fn park(ended: &impl Fn() -> bool, take_jobs: bool) {
     }
 }
 
+/// Binds the calling worker to `cpu`, and its frames' chunks to the CPU's NUMA node
+/// ([`blaze_mem::chunks::set_thread_node`]): Linux's topology names the real node.
 #[cfg(target_os = "linux")]
 fn bind_to(cpu: &Cpu) -> io::Result<()> {
-    crate::topology::linux::bind(cpu.id)
+    crate::topology::linux::bind(cpu.id)?;
+    blaze_mem::chunks::set_thread_node(Some(cpu.node)).map_err(io::Error::other)
 }
 
 #[cfg(target_os = "macos")]

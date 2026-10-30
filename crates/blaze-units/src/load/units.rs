@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 use blaze_manifest::manifest::Manifest;
-use blaze_manifest::profiles::{Profiles, ProfilePackage, requested_profile};
+use blaze_manifest::profiles::{Profiles, requested_profile};
 use blaze_manifest::targets::TargetKind;
 use blaze_manifest::{Context, Workspace};
 use blaze_query::{Cancelled, Cx};
@@ -18,11 +18,13 @@ use cargo_util_schemas::manifest::{TomlProfile, TomlProfiles};
 use cargo_util_schemas::restricted_names::ProfileName;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use super::files::Snap;
 use super::manifest::WorkspaceRead;
 use super::resolve::Resolved;
-use super::summary::Read;
+use crate::read::Read;
 use super::{ForeignAsk, Spec, Staged, load_error};
-use crate::query::{LoadError, LockWrite, PackagePlan, StdGraph, StdKey, StdPlanned, StdUnits, UnitPlan};
+use super::sandbox::PackageOptOut;
+use crate::query::{LoadError, LockWrite, PackagePlan, StdGraph, StdKey, StdPlanned, StdUnits, TestSandbox, UnitPlan};
 use crate::schema::{self, Mode, Unit, UnitDep};
 use crate::stdlib::target::{self as platform, CfgArgs};
 use crate::stdlib::{STD_OUT, default_crates, default_features};
@@ -43,13 +45,15 @@ pub(crate) struct Built {
     pub roots: Vec<(String, usize)>,
     /// The workspace's `build-script-link-dirs`, absolute.
     pub link_dirs: Vec<String>,
+    /// The workspace's `sandboxed-tests` experiment ([`crate::query::Units::sandboxed_tests`]).
+    pub sandboxed_tests: bool,
 }
 
 /// The units of `resolved`, as `spec` asks for them.
 pub(crate) fn units(
     cx: &mut Cx<'_>,
-    ctx: &Context,
-    ws: &Workspace<'_>,
+    ctx: &Context<Snap>,
+    ws: &Workspace<'_, Snap>,
     spec: &Spec,
     read: &WorkspaceRead,
     resolved: Resolved<'_>,
@@ -84,9 +88,8 @@ pub(crate) fn units(
     warnings.extend(read.warnings.iter().cloned());
     warnings.extend(resolved.warnings.iter().cloned());
     {
-        let pkgs: Vec<crate::graph::ProfilePkg<'_>> =
-            resolved.resolve.iter().filter_map(|id| resolved.manifests.get(&id)).map(|(_, m)| crate::graph::ProfilePkg(&m.package_id)).collect();
-        let pkgs: Vec<&dyn ProfilePackage> = pkgs.iter().map(|it| it as &dyn ProfilePackage).collect();
+        let pkgs: Vec<&blaze_manifest::manifest::PackageId> =
+            resolved.resolve.iter().filter_map(|id| resolved.manifests.get(&id)).map(|(_, m)| &m.package_id).collect();
         if let Err(error) = profiles.validate_packages(manifest_profiles.as_ref(), &pkgs, &mut warnings) {
             return Ok(fail(error));
         }
@@ -136,16 +139,21 @@ pub(crate) fn units(
         Err(error) => return Ok(Staged::Failed(error)),
     };
     let mut unsandboxed: FxHashSet<&str> = FxHashSet::default();
+    // A member's tests keys, by id: a dependency's own table is not read (it can't opt out).
+    let mut test_sandbox: FxHashMap<PackageId, TestSandbox> = FxHashMap::default();
     for (spec, (id, package)) in &packages_by_spec {
         let own = match package.is_member {
-            true => match super::sandbox::build_script_outside(package.manifest.custom_metadata.as_ref(), resolved.manifests[id].0) {
+            true => match super::sandbox::package(package.manifest.custom_metadata.as_ref(), resolved.manifests[id].0) {
                 Ok(it) => it,
                 Err(error) => return Ok(Staged::Failed(error)),
             },
-            false => false,
+            false => PackageOptOut::default(),
         };
-        if own || opt_out.unsandboxed(id.name().as_str()) {
+        if own.build_script_outside || opt_out.unsandboxed(id.name().as_str()) {
             unsandboxed.insert(spec.as_str());
+        }
+        if own.tests != TestSandbox::default() {
+            test_sandbox.insert(*id, own.tests);
         }
     }
     let request = Request {
@@ -276,7 +284,13 @@ pub(crate) fn units(
         Ok(it) => it,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let mut plans = planned.plans;
+    let mut plans: Vec<UnitPlan> = Vec::with_capacity(planned.plans.len());
+    for (here, std) in planned.plans.into_iter().zip(std_plans) {
+        match here.or(std) {
+            Some(plan) => plans.push(plan),
+            None => return Ok(Staged::Failed(LoadError { what: "a unit has no plan".to_owned(), at: at.clone() })),
+        }
+    }
     if let Some(ask) = &spec.foreign {
         let ours = |at: &Path| at.display().to_string();
         let prefixes = [
@@ -288,9 +302,14 @@ pub(crate) fn units(
         }
     }
 
+    let checksums = resolved.resolve.checksums();
     let mut packages: Vec<PackagePlan> = by_id
         .iter()
-        .map(|(id, package)| package_plan(*id, package.manifest, resolved.manifests[id].0, package.is_member))
+        .map(|(id, package)| {
+            let checksum = checksums.get(id).and_then(Option::as_deref);
+            let tests = test_sandbox.remove(id).unwrap_or_default();
+            package_plan(*id, package.manifest, resolved.manifests[id].0, package.is_member, checksum, tests)
+        })
         .collect();
     packages.extend(std_packages);
     packages.sort_by(|a, b| a.id.cmp(&b.id));
@@ -306,12 +325,13 @@ pub(crate) fn units(
         finished: planned.finished,
         roots: named_roots,
         link_dirs: opt_out.link_dirs,
+        sandboxed_tests: opt_out.sandboxed_tests,
     }))
 }
 
 /// `-j` or `build.jobs` as cargo's `JobsConfig` reads it, when it names a number of jobs; none
 /// for cargo's default, the machine's parallelism (less `-N` of it), which the daemon has.
-fn jobs(config: &blaze_manifest::Config, asked: Option<u32>) -> anyhow::Result<Option<u32>> {
+fn jobs(config: &blaze_manifest::Config<Snap>, asked: Option<u32>) -> anyhow::Result<Option<u32>> {
     use blaze_manifest::config::schema::JobsConfig;
     if asked == Some(0) {
         anyhow::bail!("jobs may not be 0");
@@ -373,7 +393,7 @@ pub(crate) struct Platforms {
     pub target_flags: Vec<String>,
 }
 
-fn platforms(config: &blaze_manifest::Config, spec: &Spec) -> Result<Platforms, LoadError> {
+fn platforms(config: &blaze_manifest::Config<Snap>, spec: &Spec) -> Result<Platforms, LoadError> {
     let error = |what: String| LoadError { what, at: None };
     if let Some(ask) = &spec.foreign {
         let parse = |cfg: &[String]| -> Result<Vec<Cfg>, LoadError> {
@@ -700,8 +720,16 @@ fn foreign_profiles(profiles: Option<&TomlProfiles>, ask: &ForeignAsk) -> anyhow
     Ok(profiles)
 }
 
-/// A package as the build names it.
-fn package_plan(id: PackageId, manifest: &Manifest, manifest_path: &Path, is_member: bool) -> PackagePlan {
+/// A package as the build names it. `checksum` is the resolve's, in hex: kept only for a
+/// crates.io package, whose `.crate` it is the SHA-256 of.
+fn package_plan(
+    id: PackageId,
+    manifest: &Manifest,
+    manifest_path: &Path,
+    is_member: bool,
+    checksum: Option<&str>,
+    tests: TestSandbox,
+) -> PackagePlan {
     let named = format!("{} v{}", id.name(), id.version());
     let full = id.to_string();
     let source = full.strip_prefix(&named).map(str::trim).filter(|it| !it.is_empty()).map(str::to_owned);
@@ -713,5 +741,7 @@ fn package_plan(id: PackageId, manifest: &Manifest, manifest_path: &Path, is_mem
         source,
         is_member,
         default_run: manifest.default_run.clone(),
+        checksum: checksum.filter(|_| id.source_id().is_crates_io()).and_then(blaze_format::hex::decode::<32>),
+        tests,
     }
 }

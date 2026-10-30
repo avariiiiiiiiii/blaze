@@ -2,9 +2,10 @@
 
 use base_db::Db;
 use blaze_ids::radix;
+use blaze_mem::frame::Frame;
 use hir_expand::mod_path::{ModPath, PathKind};
 use intern::{Symbol, sym};
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
     DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, VariantId,
@@ -77,7 +78,7 @@ pub fn upvars_mentioned(
         ExpressionStoreOwnerId::VariantFields(owner) => variant_fields_upvars_mentioned(db, owner),
     };
 
-    #[salsa::tracked(returns(as_deref))]
+    #[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
     pub fn signature_upvars_mentioned(
         db: &Db,
         owner: GenericDefId,
@@ -85,7 +86,7 @@ pub fn upvars_mentioned(
         upvars_mentioned_impl(db, owner.into())
     }
 
-    #[salsa::tracked(returns(as_deref))]
+    #[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
     pub fn body_upvars_mentioned(
         db: &Db,
         owner: DefWithBodyId,
@@ -93,7 +94,7 @@ pub fn upvars_mentioned(
         upvars_mentioned_impl(db, owner.into())
     }
 
-    #[salsa::tracked(returns(as_deref))]
+    #[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
     pub fn variant_fields_upvars_mentioned(
         db: &Db,
         owner: VariantId,
@@ -102,52 +103,60 @@ pub fn upvars_mentioned(
     }
 }
 
-pub fn upvars_mentioned_impl(
+fn upvars_mentioned_impl(
     db: &Db,
     owner: ExpressionStoreOwnerId,
 ) -> Option<Box<FxHashMap<ExprId, Upvars>>> {
     let store = ExpressionStore::of(db, owner);
     store.expr_roots().next()?;
     // Most bodies have no closure: they need no resolver and no walk.
-    if !store.exprs().any(|(_, expr)| matches!(expr, Expr::Closure { .. })) {
+    if !store.has_closures() {
         return None;
     }
-    let mut visitor = UpvarsMentionedVisitor {
-        db,
-        resolver: owner.resolver(db),
-        owner,
-        store,
-        binding_names: store.bindings().map(|(_, binding)| *binding.name.symbol()).collect(),
-        closures_map: FxHashMap::default(),
-        current_closure: None,
-        mentioned: Vec::new(),
-    };
-    visitor.on_exprs(store.expr_roots());
-    let mut result = visitor.closures_map;
-    if result.is_empty() {
-        None
-    } else {
-        result.shrink_to_fit();
+    blaze_mem::frame::current(|frame| {
+        let mut binding_names = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        binding_names.extend(store.bindings().map(|(_, binding)| *binding.name.symbol()));
+        let mut visitor = UpvarsMentionedVisitor {
+            db,
+            resolver: owner.resolver(db),
+            owner,
+            store,
+            binding_names,
+            closures: Vec::new_in(frame),
+            current_closure: None,
+            mentioned: Vec::new_in(frame),
+        };
+        visitor.on_exprs(store.expr_roots());
+        if visitor.closures.is_empty() {
+            return None;
+        }
+        // alloc: the memo's map, exact
+        let mut result =
+            FxHashMap::with_capacity_and_hasher(visitor.closures.len(), FxBuildHasher);
+        result.extend(visitor.closures.drain(..));
+        // alloc: the memo's box, once per body with a capture
         Some(Box::new(result))
-    }
+    })
 }
 
-struct UpvarsMentionedVisitor<'db> {
+struct UpvarsMentionedVisitor<'db, 'f> {
     db: &'db Db,
     resolver: Resolver<'db>,
     owner: ExpressionStoreOwnerId,
     store: &'db ExpressionStore,
     /// The names of the store's bindings: a path that is none of them names no local.
-    binding_names: FxHashSet<Symbol>,
-    closures_map: FxHashMap<ExprId, Upvars>,
+    binding_names: hashbrown::HashSet<Symbol, FxBuildHasher, &'f Frame>,
+    /// Each closure with upvars and its upvars, in the order walked: a closure's `on_expr` is
+    /// its one visit.
+    closures: Vec<(ExprId, Upvars), &'f Frame>,
     /// The closure being walked, and where its upvars start in `mentioned`.
     current_closure: Option<(ExprId, usize)>,
     /// The upvars of every closure being walked, outermost first: one buffer for the body
     /// where each closure had a set.
-    mentioned: Vec<BindingId>,
+    mentioned: Vec<BindingId, &'f Frame>,
 }
 
-impl UpvarsMentionedVisitor<'_> {
+impl UpvarsMentionedVisitor<'_, '_> {
     fn resolve_maybe_upvar(&mut self, expr: ExprId, path: Path<'_>) {
         let Some((current_closure, _)) = self.current_closure else { return };
 
@@ -199,7 +208,7 @@ impl UpvarsMentionedVisitor<'_> {
     }
 }
 
-impl StoreVisitor for UpvarsMentionedVisitor<'_> {
+impl StoreVisitor for UpvarsMentionedVisitor<'_, '_> {
     fn on_expr(&mut self, expr: ExprId) {
         let store = self.store;
         match store.expr(expr) {
@@ -226,7 +235,8 @@ impl StoreVisitor for UpvarsMentionedVisitor<'_> {
 
                 self.sort_dedup_from(start);
                 if self.mentioned.len() > start {
-                    self.closures_map.insert(expr, Upvars(self.mentioned[start..].into()));
+                    // alloc: the closure's upvars in the memo, exact
+                    self.closures.push((expr, Upvars(self.mentioned[start..].into())));
                 }
                 match outer {
                     // All nested closure's upvars are also upvars of the parent closure, but

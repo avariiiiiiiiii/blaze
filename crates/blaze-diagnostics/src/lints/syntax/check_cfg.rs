@@ -84,16 +84,20 @@ impl CheckCfg {
 
     /// [`CheckCfg::add_in`], its error rustc's fatal error. Nothing is added when it fails.
     pub(crate) fn add_diag(&mut self, spec: &str, edition: Edition) -> Result<(), Diag> {
+        // alloc: the error's text; `add_diag` is setup, once per `--check-cfg`
         let error = |reason: &str| invalid(spec, vec![reason.to_owned()]);
         let in_arg = |arg: &meta::Inner<'_>, reason: &str| {
             let shown = arg.to_text();
             let what = match arg.lit() {
                 Some(lit) => {
                     let (article, descr) = lit.kind.described();
+                    // alloc: the error's text
                     format!("`{shown}` is {article} {descr} literal")
                 }
+                // alloc: the error's text
                 None => format!("`{shown}` is invalid"),
             };
+            // alloc: the error's text
             invalid(spec, vec![what, reason.to_owned()])
         };
         let expected = || error("expected `cfg(name, values(\"value1\", \"value2\", ... \"valueN\"))`");
@@ -109,7 +113,9 @@ impl CheckCfg {
             return Err(expected());
         }
 
+        // alloc: setup, once per `--check-cfg`
         let mut names: Vec<&str> = Vec::new();
+        // alloc: as above
         let mut values: Vec<Option<Cow<'_, str>>> = Vec::new();
         fn insert<'s>(values: &mut Vec<Option<Cow<'s, str>>>, value: Option<Cow<'s, str>>) {
             if !values.contains(&value) {
@@ -201,9 +207,11 @@ impl CheckCfg {
         for name in names {
             let given = || match values_any_specified {
                 true => Values::Any,
+                // alloc: setup, the expected values kept for the session
                 false => Values::Some(values.iter().map(|it| it.as_deref().map(str::to_owned)).collect()),
             };
             match self.expecteds.iter_mut().find(|(it, _)| it == name) {
+                // alloc: as above
                 None => self.expecteds.push((name.to_owned(), given())),
                 Some((_, expected)) => {
                     if values_any_specified {
@@ -227,6 +235,7 @@ impl CheckCfg {
 
 /// rustc's fatal error on a `--check-cfg` it cannot read.
 fn invalid(spec: &str, notes: Vec<String>) -> Diag {
+    // alloc: the error's text
     let mut diag = Diag::new(Level::Error, None, format!("invalid `--check-cfg` argument: `{spec}`"));
     for note in notes {
         diag.note(note);
@@ -243,6 +252,7 @@ fn rendered(diag: &Diag) -> String {
 /// One `--cfg` value as rustc's `parse_cfg` reads it for a crate of `edition`: its name, and
 /// its value when it has one; the error is rustc's fatal error.
 pub(crate) fn parse_cfg_diag(spec: &str, edition: Edition) -> Result<(String, Option<String>), Diag> {
+    // alloc: the error's text; `parse_cfg_diag` is setup, once per `--cfg`
     let error = |reason: &str| Diag::new(Level::Error, None, format!("invalid `--cfg` argument: `{spec}` ({reason})"));
     if let Some(tokens) = meta::lex(spec, edition) {
         let mut parser = meta::Parser::new(&tokens, edition);
@@ -266,6 +276,7 @@ pub(crate) fn parse_cfg_diag(spec: &str, edition: Edition) -> Result<(String, Op
                         meta::Kind::NameValue(lit) => lit.value_str().map(Cow::into_owned),
                         _ => None,
                     };
+                    // alloc: setup, as above
                     return Ok((name.to_owned(), value));
                 }
             }
@@ -283,9 +294,10 @@ pub(crate) fn parse_cfg_diag(spec: &str, edition: Edition) -> Result<(String, Op
 /// What this module lints: `explicit_builtin_cfgs_in_flags` of each `--cfg`, as the session is
 /// made, then `unexpected_cfgs` as expansion reads each cfg, when a `--check-cfg` was given.
 /// A `--cfg` rustc cannot parse is its fatal error, and nothing else is said.
-pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> Vec<Emitted> {
+pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, cmd: &CommandLine, walk: &Walk<'db>) -> Vec<Emitted> {
     let mut emitted = match builtin_cfgs(cx, &cmd.cfg, walk) {
         Ok(emitted) => emitted,
+        // alloc: the fatal error
         Err(fatal) => return vec![fatal],
     };
     if cmd.check_cfg.is_given() {
@@ -297,6 +309,7 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> Vec<
 /// rustc's `parse_cfg` of each `--cfg` (an `IndexSet`: each once, in the order first given),
 /// then its `disallow_cfgs`: a `--cfg` setting a cfg rustc sets itself, buffered for the crate.
 fn builtin_cfgs(cx: &Cx<'_, '_>, specs: &[String], walk: &Walk<'_>) -> Result<Vec<Emitted>, Emitted> {
+    // alloc: empty, allocates nothing until a lint
     let mut emitted = Vec::new();
     let mut cfgs: Vec<(String, Option<String>)> = Vec::with_capacity(specs.len());
     for spec in specs {
@@ -311,18 +324,23 @@ fn builtin_cfgs(cx: &Cx<'_, '_>, specs: &[String], walk: &Walk<'_>) -> Result<Ve
     }
     let root = cx.krate.root_module(cx.db).definition_source_file_id(cx.db);
     let Some(tree) = walk.tree(root) else { return Ok(emitted) };
-    let at = tree.ptr(&tree.root);
+    let at = tree.ptr(tree.root);
     for (name, value) in &cfgs {
         let Some(controlled_by) = controlled_by(name, value.as_deref()) else { continue };
         let shown = match &value {
+            // alloc: the diagnostic's text, as is all below
             Some(value) => format!(r#"{name}="{value}""#),
+            // clone: as above
             None => name.clone(),
         };
         let mut diag = Diag::new(
             Level::Warning,
+            // alloc: as above
             Some(Code::Lint("explicit_builtin_cfgs_in_flags".to_owned())),
+            // alloc: as above
             format!("unexpected `--cfg {shown}` flag"),
         );
+        // alloc: as above
         diag.note(format!("config `{name}` is only supposed to be controlled by `{controlled_by}`"));
         diag.note("manually setting a built-in cfg can and does create incoherent behaviors");
         emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));

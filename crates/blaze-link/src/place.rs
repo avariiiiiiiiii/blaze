@@ -20,9 +20,9 @@ use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
 use crate::arena::{FrameVec, collect_in};
-use crate::{Format, LinkError};
+use crate::{DevRun, Format, LinkError};
 use crate::cow::{CowBytes, IdSet};
-use crate::model::{Apply, Class, Counts, Region, Sym};
+use crate::model::{Apply, Class, Counts, Prot, Region, Reserve, Sym, reserved};
 use crate::stage::{Stage, error, function_of};
 use crate::state::{ClassId, PieceId, PieceRef, Sort, Space, State, What, zeroed};
 use crate::symbols::{SymKey, Symbols};
@@ -44,15 +44,27 @@ fn grows(class: &Class) -> bool {
             | Class::Tbss
             | Class::ThreadVars
             | Class::Named { .. }
+            | Class::PreinitArray
             | Class::InitArray
             | Class::FiniArray
             | Class::Synthetic(_)
     )
 }
 
+/// A dev run's reservations ([`crate::DevRun`]), in address order: each with its size rounded
+/// up to `page`, none for a size of 0. [`crate::Image::new`] checked that each rounds.
+pub(crate) fn reservations(dev_run: Option<&DevRun>, page: u64) -> impl Iterator<Item = (Reserve, u64)> + use<> {
+    let sizes = dev_run.map_or([0; 3], |it| [it.arena, it.cells, it.fixed]);
+    [Reserve::Arena, Reserve::Cells, Reserve::Fixed]
+        .into_iter()
+        .zip(sizes)
+        .filter(|it| it.1 != 0)
+        .map(move |(reserve, size)| (reserve, align_up_u64(size, page)))
+}
+
 /// Whether the program observes the order of a class's pieces: it is laid out again whole.
 fn ordered(class: &Class) -> bool {
-    matches!(class, Class::Named { .. } | Class::InitArray | Class::FiniArray)
+    matches!(class, Class::Named { .. } | Class::PreinitArray | Class::InitArray | Class::FiniArray)
 }
 
 /// What [`Counts`] sums over pieces, kept across links so an incremental link counts only
@@ -160,11 +172,13 @@ impl Entry {
 
 /// The first eight bytes of a symbol's place in [`Symbols::cmp`]: its variant, then the
 /// start of what the variant compares first (an id's bytes, a name's bytes zero-padded).
-/// Symbols with a smaller prefix are smaller; with equal ones, either.
+/// Symbols with a smaller prefix are smaller; with equal ones, either. The start hook, which
+/// [`Symbols::cmp`] puts before every other symbol, is 0.
 fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
     use SymKey::*;
     let key = symbols.key(sym);
     let tag: u64 = match key {
+        StartHook => return 0,
         Body(_) => 0,
         Slot(_) => 1,
         Data(_) => 2,
@@ -203,7 +217,7 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
         Local(obj, _) | Section(obj, _) | Frame(obj, ..) => seven(&symbols.content(obj.native).0),
         Name(name) | FileName(name) | IatEnd(name) | Common(name) => seven(symbols.str(name).as_bytes()),
         Got(kind, _) => (kind as u64) << 48,
-        Plt(_) | Generation | Cells | Stubs | Descriptor | LiveDir => 0,
+        Plt(_) | Generation | Cells | Stubs | Descriptor | LiveDir | StartHook => 0,
     };
     tag << 56 | rest
 }
@@ -358,6 +372,36 @@ impl<'a> Stage<'a> {
         if self.full { self.lay_out() } else { self.allocate() }
     }
 
+    /// A dev run's reservations, in address order ([`reservations`]).
+    fn reservations(&self) -> impl Iterator<Item = (Reserve, u64)> + use<> {
+        reservations(self.output.dev_run.as_ref(), self.plan.page)
+    }
+
+    /// The bytes a dev run reserves for `reserve`, rounded up to the page.
+    fn reservation(&self, reserve: Reserve) -> u64 {
+        self.reservations().find(|it| it.0 == reserve).map_or(0, |it| it.1)
+    }
+
+    /// The writer's order puts the reservations after every other class, in [`Reserve`]'s
+    /// order, with no access ([`crate::DevRun`]): the start hook finds them so.
+    fn check_reservations(&self, classes: &[Class]) -> Result<(), LinkError> {
+        let first = classes.iter().position(reserved).unwrap_or(classes.len());
+        let tail = &classes[first..];
+        if let Some(after) = tail.iter().find(|it| !reserved(it)) {
+            // alloc: error path
+            return Err(error(None, format!("the writer placed {after:?} after the dev run's reservations, which go last")));
+        }
+        if !tail.is_sorted() {
+            // alloc: error path
+            return Err(error(None, format!("the writer ordered the dev run's reservations {tail:?}: the arena, cells, fixed")));
+        }
+        if let Some(open) = tail.iter().find(|it| self.writer.prot(it) != Prot::NONE) {
+            // alloc: error path
+            return Err(error(None, format!("the writer gave {open:?} access: a dev run's reservation has none")));
+        }
+        Ok(())
+    }
+
     /// Whether a class is laid out again whole when it changes: as [`ordered`], and the GOT
     /// of an image whose GOT is its import address table, each DLL's cells together.
     fn ordered(&self, class: &Class) -> bool {
@@ -419,6 +463,9 @@ impl<'a> Stage<'a> {
                 extra.push(self.new.class_id(&Class::ThreadVars).0);
             }
         }
+        for (reserve, _) in self.reservations() {
+            extra.push(self.new.class_id(&Class::Reserve(reserve)).0);
+        }
         // alloc: a full link: a list of pieces per class, which the classes' sorts own
         let mut groups: Vec<Vec<PieceId>> = Vec::new();
         let mut present: FrameVec<'a, bool> = Vec::new_in(self.arena);
@@ -467,6 +514,7 @@ impl<'a> Stage<'a> {
             classes.push(self.new.class(ClassId(at as u16)).clone());
         }
         self.writer.order(&mut classes);
+        self.check_reservations(&classes)?;
         let mut spaces = Vec::with_capacity(classes.len());
         let mut addr = self.plan.base + self.plan.headers;
         let mut code_addr = 0;
@@ -482,12 +530,12 @@ impl<'a> Stage<'a> {
                 addr = align_up_u64(addr, self.plan.page);
                 prot = Some(this);
             }
-            let align = ids
-                .iter()
-                .map(|id| self.new.piece(*id).expect("live").align())
-                .max()
-                .unwrap_or(1)
-                .max(if matches!(class, Class::Synthetic(_)) { 8 } else { 1 });
+            let least = match class {
+                Class::Synthetic(_) => 8,
+                Class::Reserve(_) => self.plan.page,
+                _ => 1,
+            };
+            let align = ids.iter().map(|id| self.new.piece(*id).expect("live").align()).max().unwrap_or(1).max(least);
             let start = if indexed { code_addr } else { align_up_u64(addr, align) };
             let zero = zeroed(&class);
             let size = self.put(start, &ids, spaces.len() as u32, zero);
@@ -498,6 +546,7 @@ impl<'a> Stage<'a> {
             }
             let bound = synthetic.iter().find(|it| it.0 == class).map(|it| it.1);
             let capacity = match (&class, incremental) {
+                (Class::Reserve(reserve), _) => self.reservation(*reserve),
                 (Class::Patch, true) => align_up_u64(text_size.max(PATCH), self.plan.page),
                 (Class::PatchData, true) => align_up_u64(data_size.max(PATCH), self.plan.page),
                 (Class::Synthetic(_), true) => {

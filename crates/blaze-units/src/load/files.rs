@@ -746,19 +746,37 @@ impl Snapshot {
         files.chain(dirs).min().map(String::as_str)
     }
 
-    /// Every TOML file (manifests, config files) in its canonical form: its parsed table
-    /// written again, so an edit to a comment or the layout leaves the snapshot equal. A file
-    /// that does not parse stays as read, for its error.
-    pub fn canonical(mut self) -> Snapshot {
-        for (path, found) in self.files.iter_mut() {
+}
+
+/// What a [`run_over`] used, and which of its files it read as they are (`raw`); every other
+/// came from a snapshot a query kept, canonical already.
+pub(crate) struct Used {
+    snapshot: Snapshot,
+    raw: FxHashSet<String>,
+}
+
+impl Used {
+    /// The first path it used that is under no mount.
+    pub fn unmounted(&self) -> Option<&str> {
+        self.snapshot.unmounted()
+    }
+
+    /// The snapshot with every TOML file (manifests, config files) in its canonical form: its
+    /// parsed table written again, so an edit to a comment or the layout leaves the snapshot
+    /// equal. A file that does not parse stays as read, for its error. Only the files read
+    /// raw are parsed: one kept canonical is so already.
+    pub fn canonical(self) -> Snapshot {
+        let Used { mut snapshot, raw } = self;
+        for path in &raw {
             let toml = path.ends_with(".toml") || path.ends_with("/.cargo/config");
-            if let (true, Found::Here(bytes)) = (toml, &*found)
+            if let (true, Some(found)) = (toml, snapshot.files.get_mut(path))
+                && let Found::Here(bytes) = &*found
                 && let Some(text) = canonical_toml(bytes)
             {
                 *found = Found::Here(text.into_bytes());
             }
         }
-        self
+        snapshot
     }
 }
 
@@ -848,11 +866,13 @@ struct State {
     files: Column<Vec<u8>>,
     dirs: Column<Names>,
     missed: FxHashSet<Need>,
+    /// The files [`Reads`] read as they are during the run.
+    raw: FxHashSet<String>,
 }
 
 impl State {
     fn of(snapshot: Snapshot) -> State {
-        State { files: Column::of(snapshot.files), dirs: Column::of(snapshot.dirs), missed: FxHashSet::default() }
+        State { files: Column::of(snapshot.files), dirs: Column::of(snapshot.dirs), ..State::default() }
     }
 
     fn file(&mut self, path: &str) -> Option<&Found<Vec<u8>>> {
@@ -889,8 +909,10 @@ impl State {
     }
 }
 
-/// The `Files` blaze-manifest reads through: a [`Snapshot`] that records what it misses.
-struct Snap(Rc<RefCell<State>>);
+/// The `Files` blaze-manifest reads through in a load query: a [`Snapshot`] that records what
+/// it misses. A clone is another handle on the same snapshot.
+#[derive(Clone)]
+pub struct Snap(Rc<RefCell<State>>);
 
 fn not_found() -> std::io::Error {
     std::io::Error::from_raw_os_error(2)
@@ -940,6 +962,14 @@ impl Files for Snap {
             Some(Found::Absent) | None => Err(not_found()),
         }
     }
+
+    /// A view has no links, so a path that is there is its own canonical path.
+    fn canonicalize(&self, path: &Path) -> std::io::Result<std::path::PathBuf> {
+        match self.kind(path) {
+            Some(_) => Ok(std::path::PathBuf::from(normal_ref(path).ok_or_else(not_found)?.as_ref())),
+            None => Err(not_found()),
+        }
+    }
 }
 
 /// How a step's misses are read: through which configuration's mounts, and with which a
@@ -959,7 +989,8 @@ impl Fill<'_> {
         path.ends_with("/Cargo.toml") && self.own != Some(path)
     }
 
-    fn read(&self, cx: &mut Cx<'_>, need: &Need, into: &mut Snapshot) -> Result<(), Cancelled> {
+    /// `need` read into `into`; a file read as it is (not from a kept snapshot) is put in `raw`.
+    fn read(&self, cx: &mut Cx<'_>, need: &Need, into: &mut Snapshot, raw: &mut FxHashSet<String>) -> Result<(), Cancelled> {
         match need {
             Need::File(path) => {
                 if self.of_its_own(path) {
@@ -974,6 +1005,7 @@ impl Fill<'_> {
                 if !into.files.contains_key(path) {
                     let found = self.config.read_file(cx, path)?;
                     into.files.insert(path.clone(), found);
+                    raw.insert(path.clone());
                 }
             }
             Need::Dir(path) => {
@@ -989,7 +1021,7 @@ impl Fill<'_> {
     /// the first workspace member it cannot read, so without these a workspace of N members
     /// would take N runs; with them it takes as many as its members are deep. A manifest read
     /// this way that the next run does not use is left out of what it keeps.
-    fn beside(&self, cx: &mut Cx<'_>, missed: &[Need], into: &mut Snapshot) -> Result<(), Cancelled> {
+    fn beside(&self, cx: &mut Cx<'_>, missed: &[Need], into: &mut Snapshot, raw: &mut FxHashSet<String>) -> Result<(), Cancelled> {
         if !self.members {
             return Ok(());
         }
@@ -1018,7 +1050,7 @@ impl Fill<'_> {
         more.sort_unstable();
         more.dedup();
         for need in &more {
-            self.read(cx, need, into)?;
+            self.read(cx, need, into, raw)?;
         }
         Ok(())
     }
@@ -1040,9 +1072,11 @@ impl Reads<'_> {
         if self.state.borrow().files.has(&path) {
             return Ok(());
         }
-        let mut read = Snapshot::default();
-        self.fill.read(cx, &Need::File(path.into_owned()), &mut read)?;
-        self.state.borrow_mut().add(read);
+        let (mut read, mut raw) = (Snapshot::default(), FxHashSet::default());
+        self.fill.read(cx, &Need::File(path.into_owned()), &mut read, &mut raw)?;
+        let mut state = self.state.borrow_mut();
+        state.add(read);
+        state.raw.extend(raw);
         Ok(())
     }
 }
@@ -1055,25 +1089,28 @@ pub(crate) fn run_over<'db, R>(
     cx: &mut Cx<'db>,
     base: Snapshot,
     fill: &Fill<'_>,
-    mut step: impl FnMut(&mut Cx<'db>, Rc<dyn Files>, &Reads<'_>) -> Result<R, Cancelled>,
-) -> Result<(R, Snapshot), Cancelled> {
+    mut step: impl FnMut(&mut Cx<'db>, Snap, &Reads<'_>) -> Result<R, Cancelled>,
+) -> Result<(R, Used), Cancelled> {
     let mut snapshot = base;
+    let mut raw: FxHashSet<String> = FxHashSet::default();
     loop {
         let state = Rc::new(RefCell::new(State::of(snapshot)));
-        let files: Rc<dyn Files> = Rc::new(Snap(state.clone()));
+        let files = Snap(state.clone());
         let reads = Reads { state: state.clone(), fill };
         let answer = step(cx, files, &reads)?;
         drop(reads);
         let mut state = std::mem::take(&mut *state.borrow_mut());
+        raw.extend(state.raw.drain());
         let missed = state.take_missed();
         if missed.is_empty() {
-            return Ok((answer, Snapshot { files: state.files.used(), dirs: state.dirs.used() }));
+            let snapshot = Snapshot { files: state.files.used(), dirs: state.dirs.used() };
+            return Ok((answer, Used { snapshot, raw }));
         }
         snapshot = Snapshot { files: state.files.all(), dirs: state.dirs.all() };
         for need in &missed {
-            fill.read(cx, need, &mut snapshot)?;
+            fill.read(cx, need, &mut snapshot, &mut raw)?;
         }
-        fill.beside(cx, &missed, &mut snapshot)?;
+        fill.beside(cx, &missed, &mut snapshot, &mut raw)?;
     }
 }
 

@@ -48,7 +48,8 @@ fn written(
         bytes
     });
     let mut out = Vec::new();
-    let mut host = host::Host { db: None, parts: &mut parts, sites: words };
+    let mut ask = host::Ask { db: None };
+    let mut host = native_proc_macro::__native::Host { parts: &mut parts, sites: words, ask: &mut ask };
     with_host(&mut host, || {
         let read = |bytes: &[u8]| match bytes.len() {
             0 => TokenStream::new(),
@@ -327,19 +328,15 @@ fn a_warm_expansion_allocates_only_the_macros_streams_and_its_output() {
     let input = tokens("a + (b, 1)", at);
     let run = || expand(Expander::One(echo), None, &input, None, at, at, at).unwrap();
     // Warms this thread's span parts and the builder's scratch.
-    run();
-    let (out, used) = blaze_alloc_count::measure(run);
+    let out = run();
     let rebuild = || TopSubtree::from_token_trees(out.top_subtree().delimiter, out.token_trees());
     let (_, output) = blaze_alloc_count::measure(rebuild);
     // The macro's streams: two (the input's and its group's), each an `Rc` of a `Vec`, and
     // the text of `a`, `b` and `1`, an `Rc<str>` each.
     let streams = 7;
-    assert!(
-        used.allocations <= output.allocations + streams,
-        "a warm expansion made {} allocations, its output {} and the macro's streams {streams}",
-        used.allocations,
-        output.allocations,
-    );
+    let what = "a warm expansion, past its output and the macro's streams";
+    let again = blaze_alloc_count::assert_at_most(output.allocations + streams, what, run);
+    assert!(again == out);
 }
 
 /// The text from the first `from` to the next `to` after it.

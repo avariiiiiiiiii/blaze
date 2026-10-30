@@ -557,7 +557,7 @@ pub fn source_edit_from_references(
 fn source_edit_from_name(
     edit: &mut TextEditBuilder,
     name: &ast::Name,
-    new_name: &dyn Display,
+    new_name: &impl Display,
 ) -> bool {
     if ast::RecordPatField::for_field_name(name).is_some()
         && let Some(ident_pat) = name.syntax().parent().and_then(ast::IdentPat::cast)
@@ -578,7 +578,7 @@ fn source_edit_from_name(
 fn source_edit_from_name_ref(
     edit: &mut TextEditBuilder,
     name_ref: &ast::NameRef,
-    new_name: &dyn Display,
+    new_name: &impl Display,
     def: Definition<'_>,
 ) -> bool {
     if name_ref.super_token().is_some() {

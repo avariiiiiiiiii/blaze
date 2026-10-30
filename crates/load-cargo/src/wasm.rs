@@ -10,12 +10,12 @@ use ide_db::base_db::ProcMacroLoadingError;
 use vfs::AbsPath;
 
 /// Loads the macros of the module at a path.
-pub type LoadWasm = dyn Fn(&AbsPath) -> ProcMacroLoadResult + Send + Sync;
+pub type LoadWasm = fn(&AbsPath) -> ProcMacroLoadResult;
 
-static LOAD: OnceLock<Box<LoadWasm>> = OnceLock::new();
+static LOAD: OnceLock<LoadWasm> = OnceLock::new();
 
 /// Has every module of proc macros a load names loaded by `load`. The first call is kept.
-pub fn wasm_macros_with(load: Box<LoadWasm>) {
+pub fn wasm_macros_with(load: LoadWasm) {
     _ = LOAD.set(load);
 }
 

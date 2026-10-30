@@ -1,9 +1,11 @@
 //! The tests of a build ([`Front::tests`](crate::serve::work::Front::tests)), as
 //! `blaze_usercode::test` runs them: each test asked for ([`select::wanted`]) whose pass the
 //! store does not keep for the code it reaches and what it read ([`select::select`]) runs in
-//! a process of its own, forked from its binary's server in the sandbox, on one queue over
-//! every binary; the rest are reported unreached, unless every test is asked for. Each result
-//! is kept ([`select::record`]) and reported as a [`Response::TestResult`].
+//! a process of its own, forked from its binary's server, on one queue over every binary: in
+//! the sandbox where the workspace opts in, outside it otherwise (docs/cargo.md); the rest
+//! are reported unreached, unless every test is asked for. Each result is kept
+//! ([`select::record`]; a test run outside never is) and reported as a
+//! [`Response::TestResult`].
 //!
 //! `blaze test --ub` compiles nothing: [`ub_tests`] lists each test unit's tests as its harness
 //! would, and [`evaluate`] runs one in blaze's MIR evaluator under the checker of undefined
@@ -36,8 +38,8 @@ use blaze_usercode::{
 use blaze_units::schema::{Mode, Unit};
 use load_cargo::v2::Db;
 
-use super::{Job, UnitReader, compile::TestOf, graph::flag, package_of};
-use crate::serve::work::{Failed, Runs, Selection, Writer};
+use super::{Job, Real, UnitReader, UnitWriter, compile::TestOf, graph::flag, package_of};
+use crate::serve::work::{Failed, Runs, Selection};
 
 /// How long one test may run: libtest sets no limit, so a day, past which it is surely hung.
 const TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
@@ -179,18 +181,17 @@ pub(crate) fn ub_tests(job: &Job, reader: &UnitReader, selection: Selection<'_>)
         tests.reserve(roots.tests.len());
         for listed in &roots.tests {
             let attrs = Attrs { ignore: listed.ignore, should_panic: should_panic(&listed.should_panic), bench: listed.bench };
-            let probe = Test { name: listed.name.clone(), reached: Vec::new(), attrs, outside: listed.outside };
-            let ignored = match select::wanted(&probe, &filter) {
+            let ignored = match select::asked(&listed.name, &attrs, &filter) {
                 Wanted::Filtered => continue,
                 Wanted::Ignored => true,
                 Wanted::Yes => false,
             };
             tests.push(UbTest {
-                key: format!("{} {target} {}", package.name, probe.name),
+                key: format!("{} {target} {}", package.name, listed.name),
                 binary,
-                name: probe.name,
+                name: listed.name.clone(),
                 function: listed.function,
-                should_panic: probe.attrs.should_panic,
+                should_panic: attrs.should_panic,
                 bench: listed.bench,
                 ignored,
             });
@@ -347,8 +348,13 @@ struct Suited {
     name: String,
     given: blaze_ids::ContentId,
     listed: Listed,
-    /// Handed to the queue when it starts.
+    /// Handed to the queue when it starts: sandboxed when the package's tests are.
     binary: Option<Binary>,
+    /// The run of its `unsandboxed-tests`, outside, after every sandboxed test of the queue;
+    /// none when `binary` is outside already.
+    outside: Option<Binary>,
+    /// By `listed.tests`: whether the test runs in `binary` rather than in `outside`.
+    inside: Vec<bool>,
     /// The machine's files and the binary's environment, as what a test read is checked
     /// against: made once per binary.
     disk: blaze_usercode::inputs::Disk,
@@ -365,18 +371,21 @@ struct Listed {
 
 impl Listed {
     fn test(&self, name: &str) -> Option<&Test> {
-        let at = self.by_name.binary_search_by(|it| self.tests[*it as usize].name.as_str().cmp(name)).ok()?;
+        let at = self.by_name.binary_search_by(|it| self.tests[*it as usize].name().cmp(name)).ok()?;
         Some(&self.tests[self.by_name[at] as usize])
     }
 }
 
 /// The tests of `built`, filtered by `filter`, run on the loop.
-struct TestRun {
+pub(crate) struct TestRun {
     job: Arc<Job>,
     tags: u64,
     filter: Filter,
     all: bool,
     suites: Vec<Suited>,
+    /// By the queue's index of a binary: the suite it is of. A suite gives the queue one
+    /// binary, or two when some of its tests run outside the sandbox.
+    suite_of: Vec<u32>,
     queue: Option<Queue>,
     ok: bool,
 }
@@ -386,7 +395,7 @@ pub(crate) fn start(
     built: &[Artifact],
     selection: Selection<'_>,
     tags: u64,
-) -> Result<Box<dyn Runs>, ApiError> {
+) -> Result<TestRun, ApiError> {
     if selection.ub.is_some() {
         return Err(ApiError::new(
             "`blaze test --ub` runs its tests in the MIR evaluator (`ub_tests`, `evaluate`), not as compiled binaries",
@@ -395,13 +404,6 @@ pub(crate) fn start(
     }
     let filter = filter(&selection)?;
     let all = selection.all;
-    if job.sandbox_off() {
-        return Err(ApiError::new(
-            "`BLAZE_SANDBOX=off` asks for tests outside the sandbox, and blaze's test queue runs them \
-             only in it: run them with the sandbox on",
-            None,
-        ));
-    }
     let units = job.units();
     let config = &job.input.config;
     let mut suites = Vec::new();
@@ -419,15 +421,19 @@ pub(crate) fn start(
             return Err(ApiError::new(format!("the test binary `{program}` was not compiled by this job"), None));
         };
         let suite = Suite { package: package.name.clone(), target: target_name(unit), context };
+        let manifest_dir = PathBuf::from(&package.manifest_path).parent().map(PathBuf::from).unwrap_or_default();
+        let sandboxed = !job.sandbox_off() && package.tests_sandboxed(units.sandboxed_tests);
+        // alloc: one flag per test, once per binary
+        let inside: Vec<bool> = made.tests.iter().map(|it| sandboxed && !package.tests.outside(&it.name)).collect();
         let tests: Vec<Test> = made
             .tests
             .iter()
-            .map(|it| {
+            .zip(&inside)
+            .map(|(it, &inside)| {
                 let reached = Reached { test: it.name.clone(), binary: artifact.content, reached: it.reached.clone() };
-                Test::of(reached, attrs(it), it.outside)
+                Test::of(reached, attrs(it), it.outside || !inside)
             })
             .collect();
-        let manifest_dir = PathBuf::from(&package.manifest_path).parent().map(PathBuf::from).unwrap_or_default();
         if let Some(runner) = artifact.runner.first() {
             return Err(ApiError::new(
                 format!(
@@ -437,35 +443,45 @@ pub(crate) fn start(
                 None,
             ));
         }
+        let loaded: Option<test::Loaded> = match super::run::launch(job, at, false).map_err(|what| ApiError::new(what, None))? {
+            super::run::Launch::File => None,
+        };
         let env: Vec<(OsString, OsString)> =
             super::run::process_env(&config.invocation.env, artifact, std::env::consts::OS);
-        let binary = Binary {
+        // `Binary` is not `Clone`: a suite with tests on both sides is given two.
+        // clone: the binary's strings, once per binary and once more for one with tests outside
+        let make = |sandboxed: bool| Binary {
             id: artifact.content,
             name: program.clone(),
             program: PathBuf::from(program),
-            env,
+            env: env.clone(),
             dir: manifest_dir.clone(),
-            read: vec![PathBuf::from(&config.invocation.root), PathBuf::from(&units.target_dir), manifest_dir],
+            read: vec![PathBuf::from(&config.invocation.root), PathBuf::from(&units.target_dir), manifest_dir.clone()],
             write: Vec::new(),
             network: false,
             memory: None,
             mode: TestMode::Process,
             jobs: Vec::new(),
-            loaded: None,
+            loaded: loaded.clone(),
+            sandboxed,
         };
+        let binary = make(sandboxed);
+        let outside = (sandboxed && !package.tests.tests.is_empty()).then(|| make(false));
         let mut by_name: Vec<u32> = (0..tests.len() as u32).collect();
-        blaze_ids::names::sort_by_name_in(&mut by_name, |&it| tests[it as usize].name.as_bytes());
+        blaze_ids::names::sort_by_name_in(&mut by_name, |&it| tests[it as usize].name().as_bytes());
         let disk = blaze_usercode::inputs::Disk::new(binary.env.clone());
         suites.push(Suited {
             name: program.clone(),
             given: suite.given(),
             listed: Listed { tests, by_name },
             binary: Some(binary),
+            outside,
+            inside,
             disk,
             common: traced::Common::default(),
         });
     }
-    Ok(Box::new(TestRun { job: job.clone(), tags, filter, all, suites, queue: None, ok: true }))
+    Ok(TestRun { job: job.clone(), tags, filter, all, suites, suite_of: Vec::new(), queue: None, ok: true })
 }
 
 impl TestRun {
@@ -478,7 +494,7 @@ impl TestRun {
         let color = self.job.input.color;
         let refused = |what: String| Response::Diagnostic(super::say::refused(what, None, color));
         for done in finished {
-            let Some(suite) = self.suites.get_mut(done.binary) else {
+            let Some(suite) = self.suite_of.get(done.binary).and_then(|&at| self.suites.get_mut(at as usize)) else {
                 self.ok = false;
                 out.push(refused(format!("the test queue gave a result of its binary {}, which this run did not give it", done.binary)));
                 continue;
@@ -526,22 +542,28 @@ impl TestRun {
     }
 }
 
-impl Runs for TestRun {
+impl Runs<Real> for TestRun {
     fn start(
         &mut self,
         store: &Store,
-        _writer: Option<&mut dyn Writer>,
+        _writer: Option<&mut UnitWriter>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
         let mut binaries = Vec::with_capacity(self.suites.len());
-        for suite in &mut self.suites {
+        self.suite_of.clear();
+        for (at, suite) in self.suites.iter_mut().enumerate() {
             let Some(mut binary) = suite.binary.take() else { continue };
-            for test in &suite.listed.tests {
+            let mut outside = suite.outside.take();
+            for (test, &inside) in suite.listed.tests.iter().zip(&suite.inside) {
+                let binary = match (inside, &mut outside) {
+                    (false, Some(outside)) => outside,
+                    _ => &mut binary,
+                };
                 match select::wanted(test, &self.filter) {
                     Wanted::Filtered => continue,
                     Wanted::Ignored => {
-                        let report = test::report_unrun(&suite.name, &test.name, Reported::Ignored, None);
+                        let report = test::report_unrun(&suite.name, test.name(), Reported::Ignored, None);
                         out.push(Response::TestResult(result(report)));
                         continue;
                     }
@@ -549,10 +571,10 @@ impl Runs for TestRun {
                 }
                 match select::select(store, suite.given, test, self.all, &mut suite.disk) {
                     Ok(Decision::Skip { took }) => {
-                        out.push(Response::TestResult(cached(&suite.name, &test.name, took)));
+                        out.push(Response::TestResult(cached(&suite.name, test.name(), took)));
                     }
                     Ok(Decision::Run { expected, .. }) => binary.jobs.push(TestJob {
-                        name: test.name.clone(),
+                        name: test.name().to_owned(),
                         ignore: false,
                         expected: expected.unwrap_or_default(),
                         timeout: TIMEOUT,
@@ -561,14 +583,20 @@ impl Runs for TestRun {
                     Err(error) => {
                         self.ok = false;
                         out.push(Response::Diagnostic(super::say::refused(
-                            format!("whether test `{}` runs: {error}", test.name),
+                            format!("whether test `{}` runs: {error}", test.name()),
                             None,
                             self.job.input.color,
                         )));
                     }
                 }
             }
+            let at = u32::try_from(at).expect("under 2^32 suites");
             binaries.push(binary);
+            self.suite_of.push(at);
+            if let Some(outside) = outside {
+                binaries.push(outside);
+                self.suite_of.push(at);
+            }
         }
         let Some(dir) = FileName::new(&format!("tests/{:016x}", self.tags)) else { return self.end() };
         let config = Config {
@@ -597,7 +625,7 @@ impl Runs for TestRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        _writer: Option<&mut dyn Writer>,
+        _writer: Option<&mut UnitWriter>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

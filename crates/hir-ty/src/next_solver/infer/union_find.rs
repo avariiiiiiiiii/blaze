@@ -14,6 +14,8 @@
 use std::fmt;
 use std::marker::PhantomData;
 
+use super::touched::Touched;
+
 pub(crate) trait UnifyKey: Copy + Eq + fmt::Debug {
     fn index(self) -> u32;
     fn from_index(index: u32) -> Self;
@@ -43,6 +45,7 @@ pub(crate) struct UnionFindMark {
     len: u32,
     undo: u32,
     outer_floor: u32,
+    touched: u32,
 }
 
 /// Per variable: 4 bytes of `parent` (all `find` reads), 1 of `rank`, and the value. `find` is
@@ -58,6 +61,8 @@ pub(crate) struct UnionFind<K, V> {
     /// Grows on every write to a set or value and on every rollback that undoes something, and
     /// never shrinks, so an unchanged count means unchanged sets and values.
     changes: u64,
+    /// The rows `set` wrote, for readers waiting on a variable (`fulfill::watch`).
+    touched: Touched,
     key: PhantomData<fn(K) -> K>,
 }
 
@@ -74,6 +79,7 @@ impl<K, V> Default for UnionFind<K, V> {
             undo: Vec::new(),
             floor: 0,
             changes: 0,
+            touched: Touched::default(),
             key: PhantomData,
         }
     }
@@ -92,8 +98,43 @@ impl<K, V: Copy> Clone for UnionFind<K, V> {
             undo: self.undo.clone(),
             floor: self.floor,
             changes: self.changes,
+            // clone: only `InferCtxt::fork` copies a table.
+            touched: self.touched.clone(),
             key: PhantomData,
         }
+    }
+
+    /// Into `self`'s columns, keeping their capacity: a warm fork copies without allocating.
+    fn clone_from(&mut self, source: &Self) {
+        self.parent.clone_from(&source.parent);
+        self.rank.clone_from(&source.rank);
+        self.value.clone_from(&source.value);
+        self.undo.clone_from(&source.undo);
+        self.floor = source.floor;
+        self.changes = source.changes;
+        self.touched.clone_from(&source.touched);
+    }
+}
+
+impl<K, V> UnionFind<K, V> {
+    /// Back to `default()`, its columns' capacity kept.
+    pub(crate) fn empty(&mut self) {
+        self.parent.clear();
+        self.rank.clear();
+        self.value.clear();
+        self.undo.clear();
+        self.floor = 0;
+        self.changes = 0;
+        self.touched.empty();
+    }
+
+    /// Bytes its columns hold room for.
+    pub(crate) fn held(&self) -> usize {
+        self.parent.capacity() * size_of::<u32>()
+            + self.rank.capacity() * size_of::<u8>()
+            + self.value.capacity() * size_of::<V>()
+            + self.undo.capacity() * size_of::<UndoRow<V>>()
+            + self.touched.held()
     }
 }
 
@@ -118,6 +159,12 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
     #[inline]
     pub(crate) fn changes(&self) -> u64 {
         self.changes
+    }
+
+    /// The rows written; see `infer::touched`.
+    #[inline]
+    pub(crate) fn touched(&self) -> &Touched {
+        &self.touched
     }
 
     pub(crate) fn new_key(&mut self, value: V) -> K {
@@ -206,7 +253,12 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
 
     pub(crate) fn start_snapshot(&mut self) -> UnionFindMark {
         let len = self.parent.len() as u32;
-        let mark = UnionFindMark { len, undo: self.undo.len() as u32, outer_floor: self.floor };
+        let mark = UnionFindMark {
+            len,
+            undo: self.undo.len() as u32,
+            outer_floor: self.floor,
+            touched: self.touched.mark(),
+        };
         self.floor = len;
         mark
     }
@@ -228,10 +280,12 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
         self.rank.truncate(len);
         self.value.truncate(len);
         self.floor = mark.outer_floor;
+        self.touched.rollback_to(mark.touched);
     }
 
     pub(crate) fn commit(&mut self, mark: UnionFindMark) {
         self.floor = mark.outer_floor;
+        self.touched.commit();
         // Any rollback still possible truncates to no more than the floor, and every row is
         // of a variable at or above it.
         if self.floor == 0 {
@@ -288,6 +342,7 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
         self.rank[at] = rank;
         self.value[at] = value;
         self.changes += 1;
+        self.touched.push(index);
     }
 }
 
@@ -307,7 +362,7 @@ impl<K: UnifyKey, V: UnifyValue<Error = NoError>> UnionFind<K, V> {
     }
 }
 
-const _: () = assert!(size_of::<UnionFindMark>() == 12);
+const _: () = assert!(size_of::<UnionFindMark>() == 16);
 const _: () = assert!(size_of::<UndoRow<()>>() == 12);
 const _: () = assert!(size_of::<UndoRow<rustc_type_ir::IntVarValue>>() == 12);
 const _: () = assert!(size_of::<UndoRow<rustc_type_ir::FloatVarValue>>() == 12);

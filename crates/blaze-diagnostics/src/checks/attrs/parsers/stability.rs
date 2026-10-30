@@ -26,9 +26,16 @@
 use std::num::{IntErrorKind, NonZeroU32};
 
 use blaze_ids::radix;
-use hir::{HirFileId, InFile};
+use cfg::CfgAtom;
+use hir::{HirFileId, InFile, ModuleDef};
+use hir_def::{Lookup as _, UseId};
+use hir_expand::MacroCallKind;
+use intern::sym;
 use rustc_hash::FxHashMap;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
+};
 
 use super::{Accepted, Finalize, GroupId, no_args, parse_version};
 use crate::{
@@ -40,11 +47,14 @@ use crate::{
             DeprecatedSince, Parsed, ParsedAttr, Repr, RustcVersion, Stability, StabilityLevel, StableSince,
         },
     },
-    cx::{Cx, def_range, signature_range},
-    lints::syntax::attrs::{
-        Owner, Target,
-        features::table as features,
-        target::{GenericParamKind, MethodKind},
+    cx::{Cx, def_range_view as def_range, signature_range_view as signature_range},
+    lints::{
+        Effective, EffectiveDef, def_span,
+        syntax::attrs::{
+            Owner, Target,
+            features::table as features,
+            target::{GenericParamKind, MethodKind},
+        },
     },
     model::{Applicability, Diag},
 };
@@ -319,7 +329,7 @@ fn insert(cx: &mut Accept<'_, '_, '_>, param: &MetaItem, slot: &mut Option<Strin
         cx.duplicate_key(name.range, &name.name);
         return None;
     }
-    let (_, nv) = cx.expect_name_value_meta(param, Some(&name.name))?;
+    let (_, nv) = cx.expect_name_value_meta(param, Some(name.name.as_str()))?;
     let value = cx.expect_string_literal(nv)?;
     *slot = Some(value);
     Some(())
@@ -443,7 +453,9 @@ fn parse_unstability(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<(S
     let feature = feature?;
     if features::lang(&feature).is_some_and(|it| it.kind == features::Kind::Accepted) {
         let attr = cx.attr_span();
+        // clone: the error's span
         let mut diag = Diag::error(None, "can't mark as unstable using an already stable feature", attr.clone());
+        // clone: the error's span
         diag.span_label(attr.clone(), "this feature is already stable");
         diag.span_help(attr, "consider removing the attribute");
         diag.span_label(cx.target_span(), "the stability attribute annotates this item");
@@ -516,6 +528,7 @@ fn parse_since(since: &str, is_rustc: bool) -> DeprecatedSince {
     if since == "TBD" {
         DeprecatedSince::Future
     } else if !is_rustc {
+        // alloc: the value the parsed `#[deprecated]` keeps
         DeprecatedSince::NonStandard(since.to_owned())
     } else if since == VERSION_PLACEHOLDER {
         DeprecatedSince::RustcVersion(CURRENT)
@@ -553,9 +566,11 @@ fn deprecated(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
                 let shown = shown_str(cx, lit, text);
                 match parse_since(text, true) {
                     DeprecatedSince::Future | DeprecatedSince::RustcVersion(_) => {
+                        // alloc: the error's suggestion
                         cx.push_suggestion("try specifying a deprecated since version", elem.range(), format!("since = {shown}"));
                     }
                     _ => {
+                        // alloc: the error's suggestion
                         cx.push_suggestion("try using `=` instead", list.range, format!(" = {shown}"));
                     }
                 }
@@ -596,6 +611,7 @@ fn deprecated(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
                 cx.expected_string_literal(nv.value_range(), Some(nv.value_as_lit()));
                 return None;
             };
+            // alloc: the value the parsed `#[deprecated]` keeps
             note = Some(value.to_owned());
         }
     }
@@ -629,8 +645,10 @@ fn shown_str(cx: &Accept<'_, '_, '_>, lit: &Lit, value: &str) -> String {
     match written.strip_prefix('r') {
         Some(raw) => {
             let delim = "#".repeat(raw.chars().take_while(|it| *it == '#').count());
+            // alloc: the error's suggestion
             format!("r{delim}\"{value}\"{delim}")
         }
+        // alloc: the error's suggestion
         None => format!("\"{}\"", escape_string(value)),
     }
 }
@@ -647,6 +665,7 @@ fn escape_string(text: &str) -> String {
             '\'' => escaped.push_str("\\'"),
             '"' => escaped.push_str("\\\""),
             '\x20'..='\x7e' => escaped.push(c),
+            // alloc: the error's suggestion
             c => escaped.push_str(&format!("\\u{{{:x}}}", c as u32)),
         }
     }
@@ -657,12 +676,14 @@ fn escape_string(text: &str) -> String {
 /// `#[unstable_feature_bound(..)]` and `#[rustc_allow_const_fn_unstable(..)]`.
 fn feature_list(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, name: &str) {
     let Some(list) = args.as_list() else {
+        // alloc: the error's message
         let diag = cx.err(None, format!("`{name}` expects a list of feature names"), cx.attr_range());
         cx.emit_err(diag);
         return;
     };
     for param in list.mixed() {
         if param.meta_item_no_args().and_then(|it| it.path.word()).is_none() {
+            // alloc: the error's message
             let diag = cx.err(None, format!("`{name}` expects feature names"), param.range());
             cx.emit_err(diag);
         }
@@ -757,52 +778,303 @@ fn dump_layout(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
 
 /// `lower_constness`' `ConstComptimeFn`: `#[rustc_comptime]` on a `const fn`.
 fn const_comptime(fx: &mut Finalize<'_, '_, '_>, attr: usize) {
-    let node = &fx.owner.node.value;
-    let keyword = match ast::Fn::cast(node.clone()) {
+    let node = fx.owner.node.value;
+    let keyword = match ast::Fn::cast(node) {
         Some(function) => function.const_token(),
-        None => ast::Impl::cast(node.clone()).and_then(|it| it.const_token()),
+        None => ast::Impl::cast(node).and_then(|it| it.const_token()),
     };
     let Some(keyword) = keyword else { return };
     let span = fx.cx.span(InFile::new(fx.owner.node.file_id, keyword.text_range()));
+    // clone: the error's span
     let mut diag = Diag::error(None, "a function cannot be both `comptime` and `const`", span.clone());
+    // clone: the error's span
     diag.suggestion(span.clone(), "remove the `const`", "", Applicability::MachineApplicable);
     diag.span_note(span, "`const` implies the function can be called at runtime, too");
     diag.span_label(fx.attr_span(attr), "`comptime` because of this");
     fx.emit_err(diag);
 }
 
-/// The errors rustc's stability pass gives of the crate's parsed stability attributes, each
-/// with the owner whose attribute it is of: `check_compatible_stability` of each definition
-/// (E0549, `UselessStability`, `CannotStabilizeDeprecated`, `MissingConstErr`,
-/// `ConstStableNotStable`, `RustcConstStableIndirectPairing`), a module's after another.
-/// `parsed` is what each of `owners` is parsed to (nothing for a macro call). Only a crate with
-/// `#![feature(staged_api)]` has them.
-pub(crate) fn crate_checks(
-    cx: &Cx<'_, '_>,
+/// The errors rustc's stability pass (`MissingStabilityAnnotations`) gives of the crate's
+/// definitions, each with the node it is of, a module's after another: of each,
+/// `check_compatible_stability` of its parsed stability attributes (E0549, `UselessStability`,
+/// `CannotStabilizeDeprecated`, `MissingConstErr`, `ConstStableNotStable`,
+/// `RustcConstStableIndirectPairing`), then `check_missing_stability` and
+/// `check_missing_const_stability` (`MissingStabilityAttr`, `MissingConstStabAttr`), the crate
+/// root's missing stability first. `parsed` is what each of `owners` is parsed to (nothing for
+/// a macro call). Only a crate with `#![feature(staged_api)]` has them.
+pub(crate) fn crate_checks<'db>(
+    cx: &Cx<'_, 'db>,
     session: &Session,
-    owners: &[Owner],
+    owners: &[Owner<'db>],
     parsed: &Lowered<'_>,
-) -> Vec<(usize, Diag)> {
+) -> Vec<(InFile<SyntaxNodePtr>, Diag)> {
     if !session.feature("staged_api") {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
+    // alloc: empty, allocates nothing
     let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
-    let mut defs = Defs::new(cx, owners, parsed, HirFileId::from(root));
-    let mut keyed: Vec<((usize, u8), usize, Diag)> = Vec::new();
-    for (at, owner) in owners.iter().enumerate() {
-        if !visited(owner.target) {
-            continue;
-        }
-        let def = Def { node: owner.node.clone(), target: owner.target };
-        let key = defs.order_key(&def);
-        for diag in defs.compatible(at, &def) {
-            keyed.push((key, at, diag));
+    let crate_root = HirFileId::from(root);
+    let mut defs = Defs::new(cx, owners, parsed, crate_root);
+    let missing = Missing::new(cx);
+    // alloc: only a `staged_api` crate (the standard library) gets here, once; it holds errors
+    let mut keyed: Vec<((usize, u8), InFile<SyntaxNodePtr>, Diag)> = Vec::new();
+    for tree in &cx.walk().trees {
+        for node in tree.of_kind(is_def_kind) {
+            let Some(target) = Target::of(cx, InFile::new(tree.file, node), crate_root) else { continue };
+            // A module file's root is met as the definition of its `mod` declaration.
+            if !is_def(target) || (target == Target::Mod && node.kind() == SyntaxKind::SOURCE_FILE) {
+                continue;
+            }
+            let def = Def { node: InFile::new(tree.file, node), target };
+            let key = defs.order_key(&def);
+            let at = def.ptr();
+            if visited(target)
+                && let Some(owner) = defs.owner(&def)
+            {
+                for diag in defs.compatible(owner, &def) {
+                    keyed.push((key, at, diag));
+                }
+            }
+            for diag in missing.check(&mut defs, &def) {
+                keyed.push((key, at, diag));
+            }
         }
     }
     radix::sort_by_key(&mut keyed, |&((def, kind), _, _)| {
         radix::pack_64(def as u64, u64::from(kind))
     });
-    keyed.into_iter().map(|(_, at, diag)| (at, diag)).collect()
+    keyed.into_iter().map(|(_, at, diag)| (at, diag)).collect() // alloc: the errors, in place
+}
+
+/// The kinds of the nodes that can be a definition of rustc's `DefId` tree ([`is_def`]): a scan
+/// of the walk's kind column reads no other node.
+fn is_def_kind(kind: SyntaxKind) -> bool {
+    matches!(
+        kind,
+        SyntaxKind::SOURCE_FILE
+            | SyntaxKind::MODULE
+            | SyntaxKind::EXTERN_CRATE
+            | SyntaxKind::USE
+            | SyntaxKind::STATIC
+            | SyntaxKind::CONST
+            | SyntaxKind::FN
+            | SyntaxKind::TYPE_ALIAS
+            | SyntaxKind::EXTERN_BLOCK
+            | SyntaxKind::ENUM
+            | SyntaxKind::VARIANT
+            | SyntaxKind::STRUCT
+            | SyntaxKind::UNION
+            | SyntaxKind::RECORD_FIELD
+            | SyntaxKind::TUPLE_FIELD
+            | SyntaxKind::TRAIT
+            | SyntaxKind::IMPL
+            | SyntaxKind::MACRO_RULES
+            | SyntaxKind::MACRO_DEF
+            | SyntaxKind::TYPE_PARAM
+            | SyntaxKind::LIFETIME_PARAM
+            | SyntaxKind::CONST_PARAM
+    )
+}
+
+/// What `check_missing_stability` and `check_missing_const_stability` read besides the
+/// stability attributes: whether the crate is a test crate, its effective visibilities, and
+/// each of its modules' `use` items by where it starts.
+struct Missing<'a> {
+    test: bool,
+    effective: &'a Effective,
+    uses: FxHashMap<(HirFileId, TextSize), UseId>,
+}
+
+impl<'a> Missing<'a> {
+    fn new(cx: &'a Cx<'_, '_>) -> Missing<'a> {
+        let db = cx.db;
+        let mut uses = FxHashMap::default();
+        for module in crate::checks::modules(cx) {
+            let id = hir_def::ModuleId::from(module);
+            for use_ in id.def_map(db).module(db, id).scope(db).use_decls() {
+                let loc = use_.lookup(db);
+                uses.insert((loc.id.file_id, loc.id.to_ptr(db).text_range().start()), use_);
+            }
+        }
+        Missing { test: cx.krate.cfg(db).check_atom(&CfgAtom::Flag(sym::test)), effective: cx.effective(), uses }
+    }
+
+    /// What rustc's visitor checks of `def`, in its order: `check_missing_stability` of every
+    /// item but an inherent impl and a foreign module, of trait items and inherent impl items,
+    /// of variants (then of a tuple or unit variant's constructor), fields and foreign items, and
+    /// of the crate root; `check_missing_const_stability` of items and inherent impl items.
+    fn check<'db>(&self, defs: &mut Defs<'_, '_, 'db>, def: &Def<'db>) -> Vec<Diag> {
+        let cx = defs.cx;
+        let (stability, const_stability) = match def.target {
+            Target::Impl { of_trait: false }
+            | Target::ForeignMod
+            | Target::GenericParam { .. }
+            | Target::Method(MethodKind::TraitImpl) => (false, false),
+            Target::Method(MethodKind::Trait { .. }) => (true, false),
+            Target::Method(MethodKind::Inherent) => (true, true),
+            Target::AssocTy | Target::AssocConst => match defs.parent(def).map(|it| it.target) {
+                Some(Target::Trait) => (true, false),
+                Some(Target::Impl { of_trait: false }) => (true, true),
+                _ => (false, false),
+            },
+            Target::Crate
+            | Target::Variant
+            | Target::Field
+            | Target::ForeignFn
+            | Target::ForeignStatic
+            | Target::ForeignTy => (true, false),
+            _ => (true, true),
+        };
+        let mut errors = Vec::new(); // alloc: empty unless an error is found
+        let file = def.node.file_id;
+        if stability && !self.test && defs.lookup_stability(def).is_none() && self.reachable(cx, def) {
+            match def.target {
+                // Each name of a `use` is an import of its own, with the `use`'s attributes,
+                // spanned by its path; the list that holds them is never reachable.
+                Target::Use => {
+                    let leaves = def.node.value.descendants().filter_map(ast::UseTree::cast);
+                    for leaf in leaves.filter(|it| it.use_tree_list().is_none()) {
+                        let range = leaf.path().map_or(leaf.syntax().text_range(), |it| it.syntax().text_range());
+                        errors.push(missing_stability(cx, InFile::new(file, range), "import"));
+                    }
+                }
+                Target::Crate => {
+                    errors.push(missing_stability(cx, InFile::new(file, crate_range(def.node.value)), "module"));
+                }
+                _ => {
+                    let span = InFile::new(file, def_span(def.node.value));
+                    errors.push(missing_stability(cx, span, descr(def)));
+                    // The constructor inherits the variant's stability and is reachable with it,
+                    // unless `#[non_exhaustive]` keeps it in the crate; its span is the variant's.
+                    if def.target == Target::Variant
+                        && let Some(variant) = ast::Variant::cast(def.node.value)
+                        && !defs.owner(def).is_some_and(|at| defs.owners[at].attrs.iter().any(|it| it.is("non_exhaustive")))
+                    {
+                        let ctor = match variant.field_list() {
+                            Some(ast::FieldList::TupleFieldList(_)) => Some("tuple variant"),
+                            Some(ast::FieldList::RecordFieldList(_)) => None,
+                            None => Some("unit variant"),
+                        };
+                        if let Some(ctor) = ctor {
+                            errors.push(missing_stability(cx, span, ctor));
+                        }
+                    }
+                }
+            }
+        }
+        if const_stability && is_const(defs, def) && self.reachable(cx, def) && !defs.has_const_stability(def) {
+            let span = cx.span(InFile::new(file, def_span(def.node.value)));
+            // alloc: the error's message
+            errors.push(Diag::error(None, format!("{} has missing const stability attribute", descr(def)), span));
+        }
+        errors
+    }
+
+    /// rustc's `is_reachable` of `def`: another crate can name it or use it through what it can
+    /// name. An `extern crate` and a global `asm!` have no effective visibility.
+    fn reachable<'db>(&self, cx: &Cx<'_, 'db>, def: &Def<'db>) -> bool {
+        let node = def.node;
+        macro_rules! def_of {
+            ($ast:ty) => {
+                <$ast>::cast(node.value).and_then(|it| cx.vsema.to_def(it))
+            };
+        }
+        let found = match def.target {
+            Target::Crate => Some(EffectiveDef::Item(ModuleDef::Module(cx.krate.root_module(cx.db)))),
+            Target::Mod => def_of!(ast::Module).map(|it| EffectiveDef::Item(it.into())),
+            Target::Fn | Target::Method(_) | Target::ForeignFn => def_of!(ast::Fn).map(|it| EffectiveDef::Item(it.into())),
+            Target::Struct | Target::Enum | Target::Union => def_of!(ast::Adt).map(|it| EffectiveDef::Item(it.into())),
+            Target::Trait | Target::TraitAlias => def_of!(ast::Trait).map(|it| EffectiveDef::Item(it.into())),
+            Target::Const | Target::AssocConst => def_of!(ast::Const).map(|it| EffectiveDef::Item(it.into())),
+            Target::Static | Target::ForeignStatic => def_of!(ast::Static).map(|it| EffectiveDef::Item(it.into())),
+            Target::TyAlias | Target::AssocTy | Target::ForeignTy => {
+                def_of!(ast::TypeAlias).map(|it| EffectiveDef::Item(it.into()))
+            }
+            Target::Variant => def_of!(ast::Variant).map(|it| EffectiveDef::Item(ModuleDef::EnumVariant(it))),
+            Target::Field => def_of!(ast::RecordField).or_else(|| def_of!(ast::TupleField)).map(EffectiveDef::Field),
+            Target::Impl { .. } => def_of!(ast::Impl).map(EffectiveDef::Impl),
+            Target::MacroDef => def_of!(ast::Macro).map(|it| EffectiveDef::Item(ModuleDef::Macro(it))),
+            Target::Use => {
+                self.uses.get(&(node.file_id, node.value.text_range().start())).map(|&it| EffectiveDef::Use(it))
+            }
+            _ => None,
+        };
+        found.is_some_and(|it| self.effective.is_reachable(it))
+    }
+}
+
+/// `MissingStabilityAttr`.
+fn missing_stability(cx: &Cx<'_, '_>, range: InFile<TextRange>, descr: &str) -> Diag {
+    Diag::error(None, format!("{descr} has missing stability attribute"), cx.span(range)) // alloc: the error's message
+}
+
+/// rustc's `def_descr` of a definition the stability pass checks.
+fn descr(def: &Def<'_>) -> &'static str {
+    match def.target {
+        Target::Crate | Target::Mod => "module",
+        Target::ExternCrate => "extern crate",
+        Target::Use => "import",
+        Target::Static | Target::ForeignStatic => "static",
+        Target::Const => "constant",
+        Target::Fn | Target::ForeignFn => "function",
+        Target::GlobalAsm => "global assembly block",
+        Target::TyAlias => "type alias",
+        Target::Enum => "enum",
+        Target::Variant => "variant",
+        Target::Struct => "struct",
+        Target::Field => "field",
+        Target::Union => "union",
+        Target::Trait => "trait",
+        Target::TraitAlias => "trait alias",
+        Target::Impl { .. } => "implementation",
+        Target::AssocConst => "associated constant",
+        Target::AssocTy => "associated type",
+        Target::Method(_) => {
+            let method = ast::Fn::cast(def.node.value).and_then(|it| it.param_list()?.self_param()).is_some();
+            if method { "method" } else { "associated function" }
+        }
+        Target::ForeignTy => "foreign type",
+        Target::MacroDef => "macro",
+        Target::GenericParam { kind: GenericParamKind::Type, .. } => "type parameter",
+        Target::GenericParam { kind: GenericParamKind::Const, .. } => "const parameter",
+        Target::GenericParam { kind: GenericParamKind::Lifetime, .. } => "lifetime parameter",
+        other => other.name(),
+    }
+}
+
+/// rustc's `is_const_fn` of a function or an inherent impl's method (`const` there or on its
+/// impl), or `is_const_trait`.
+fn is_const<'db>(defs: &Defs<'_, '_, 'db>, def: &Def<'db>) -> bool {
+    let node = def.node.value;
+    let const_fn = || ast::Fn::cast(node).is_some_and(|it| it.const_token().is_some());
+    match def.target {
+        Target::Fn => const_fn(),
+        Target::Method(MethodKind::Inherent) => {
+            const_fn()
+                || defs.parent(def).and_then(|it| ast::Impl::cast(it.node.value)).is_some_and(|it| it.const_token().is_some())
+        }
+        Target::Trait => node.children_with_tokens().any(|it| it.kind() == SyntaxKind::CONST_KW),
+        _ => false,
+    }
+}
+
+/// rustc's `def_span` of the crate root: from its first token to its last, its inner
+/// attributes and doc comments included.
+fn crate_range(root: ast::Node<'_>) -> TextRange {
+    // Doc comments are tokens of their own kinds, not trivia.
+    let is_token = |token: ast::Token<'_>| !token.kind().is_trivia();
+    let mut first = root.first_token();
+    while let Some(token) = first.filter(|&it| !is_token(it)) {
+        first = token.next_token();
+    }
+    let mut last = root.last_token();
+    while let Some(token) = last.filter(|&it| !is_token(it)) {
+        last = token.prev_token();
+    }
+    match (first, last) {
+        (Some(first), Some(last)) => TextRange::new(first.text_range().start(), last.text_range().end()),
+        _ => TextRange::empty(root.text_range().start()),
+    }
 }
 
 /// Whether `MissingStabilityAnnotations` checks a definition of `target`: an item, a trait's or
@@ -847,30 +1119,30 @@ enum Annotation {
 }
 
 /// A definition: its node and target.
-#[derive(Clone)]
-struct Def {
-    node: InFile<SyntaxNode>,
+#[derive(Clone, Copy)]
+struct Def<'db> {
+    node: InFile<ast::Node<'db>>,
     target: Target,
 }
 
-impl Def {
+impl Def<'_> {
     fn ptr(&self) -> InFile<SyntaxNodePtr> {
-        self.node.as_ref().map(SyntaxNodePtr::new)
+        self.node.map(ast::ptr)
     }
 }
 
 /// The crate's definitions as rustc's stability pass looks them up, with what each inherits.
 struct Defs<'a, 'c, 'db> {
     cx: &'a Cx<'c, 'db>,
-    owners: &'a [Owner],
+    owners: &'a [Owner<'db>],
     parsed: &'a Lowered<'a>,
     crate_root: HirFileId,
     /// Each owner by its node.
     index: FxHashMap<InFile<SyntaxNodePtr>, usize>,
     /// The owner of a module file's root, when it has its own (its declaration has none).
     file_roots: FxHashMap<HirFileId, usize>,
-    /// The declaration of each module file.
-    declared: FxHashMap<HirFileId, InFile<SyntaxNode>>,
+    /// The declaration of each module file, in a tree `cx.vsema` handed out.
+    declared: FxHashMap<HirFileId, InFile<ast::Node<'db>>>,
     /// The file each declaration of a module file declares.
     declares: FxHashMap<InFile<SyntaxNodePtr>, HirFileId>,
     /// `lookup_stability`: the owner whose `Stability` it is.
@@ -882,7 +1154,7 @@ struct Defs<'a, 'c, 'db> {
 }
 
 impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
-    fn new(cx: &'a Cx<'c, 'db>, owners: &'a [Owner], parsed: &'a Lowered<'a>, crate_root: HirFileId) -> Self {
+    fn new(cx: &'a Cx<'c, 'db>, owners: &'a [Owner<'db>], parsed: &'a Lowered<'a>, crate_root: HirFileId) -> Self {
         let mut index = FxHashMap::default();
         let mut file_roots = FxHashMap::default();
         for (at, owner) in owners.iter().enumerate() {
@@ -895,10 +1167,13 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         let mut declares = FxHashMap::default();
         for module in crate::checks::modules(cx) {
             if let Some(file) = module.as_source_file_id(cx.db)
-                && let Some(declaration) = module.declaration_source(cx.db)
+                && let Some(declaration) = module.declaration_source_view(cx.db)
             {
-                let node = declaration.map(|it| it.syntax().clone());
-                declares.insert(node.as_ref().map(SyntaxNodePtr::new), HirFileId::from(file));
+                // The declaration's tree is given out by `vsema`, so `reachable` may ask it of
+                // the `mod` item.
+                cx.vsema.parse_or_expand(declaration.file_id);
+                let node = declaration.map(|it| it.syntax());
+                declares.insert(node.map(ast::ptr), HirFileId::from(file));
                 declared.insert(HirFileId::from(file), node);
             }
         }
@@ -922,7 +1197,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     }
 
     /// The owner of `def`'s attributes, if it has any.
-    fn owner(&self, def: &Def) -> Option<usize> {
+    fn owner(&self, def: &Def<'db>) -> Option<usize> {
         let ptr = def.ptr();
         if let Some(&at) = self.index.get(&ptr) {
             return Some(at);
@@ -931,35 +1206,57 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     }
 
     /// `opt_local_parent`: the definition `def` is in; through a module file to its
-    /// declaration and through an expansion to where the macro is called.
-    fn parent(&self, def: &Def) -> Option<Def> {
+    /// declaration and through an expansion to where the macro is called. What a derive makes
+    /// is beside the item it derives from, in that item's parent.
+    fn parent(&self, def: &Def<'db>) -> Option<Def<'db>> {
         let mut file = def.node.file_id;
         if def.node.value.kind() == SyntaxKind::SOURCE_FILE
             && file != self.crate_root
-            && let Some(declaration) = self.declared.get(&file)
+            && let Some(&declaration) = self.declared.get(&file)
         {
-            return self.parent(&Def { node: declaration.clone(), target: Target::Mod });
+            return self.parent(&Def { node: declaration, target: Target::Mod });
         }
         let mut at = def.node.value.parent();
         loop {
             let Some(node) = at else {
-                let call = file.macro_file()?;
-                let call = call.loc(self.cx.db).to_node(self.cx.db);
+                let db = self.cx.db;
+                let loc = file.macro_file()?.loc(db);
+                let call = match loc.kind {
+                    MacroCallKind::Derive { .. } => loc.to_node_item_view(db).map(|it| it.syntax()),
+                    _ => loc.to_node_view(db),
+                };
+                // The call's tree is given out by `vsema`, so `reachable` may ask it of the call.
+                self.cx.vsema.parse_or_expand(call.file_id);
                 file = call.file_id;
                 at = call.value.parent();
                 continue;
             };
             if node.kind() == SyntaxKind::SOURCE_FILE
                 && file != self.crate_root
-                && let Some(declaration) = self.declared.get(&file)
+                && let Some(&declaration) = self.declared.get(&file)
             {
-                return Some(Def { node: declaration.clone(), target: Target::Mod });
+                return Some(Def { node: declaration, target: Target::Mod });
             }
-            if let Some(target) = Target::of(self.cx, InFile::new(file, &node), self.crate_root).filter(|it| is_def(*it)) {
+            if let Some(target) = Target::of(self.cx, InFile::new(file, node), self.crate_root).filter(|it| is_def(*it)) {
                 return Some(Def { node: InFile::new(file, node), target });
             }
             at = node.parent();
         }
+    }
+
+    /// The item a derive made `def` of, when `def` is the impl it expands to: rustc's derives
+    /// copy the item's `#[stable]` and `#[unstable]` onto it (`create_derived_impl`).
+    fn derived_from(&self, def: &Def<'db>) -> Option<Def<'db>> {
+        if !matches!(def.target, Target::Impl { .. }) || def.node.value.parent()?.parent().is_some() {
+            return None;
+        }
+        let loc = def.node.file_id.macro_file()?.loc(self.cx.db);
+        let MacroCallKind::Derive { .. } = loc.kind else { return None };
+        let item = loc.to_node_item_view(self.cx.db).map(|it| it.syntax());
+        // The item's tree is given out by `vsema`, so `reachable` may ask it of the item.
+        self.cx.vsema.parse_or_expand(item.file_id);
+        let target = Target::of(self.cx, item, self.crate_root)?;
+        Some(Def { node: item, target })
     }
 
     fn own_stability(&self, owner: usize) -> Option<&'a Stability> {
@@ -967,6 +1264,34 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             Parsed::Stability(stability) => Some(stability),
             _ => None,
         })
+    }
+
+    fn own_const_stability(&self, owner: usize) -> Option<&'a Stability> {
+        self.parsed.of(owner).iter().find_map(|it| match &it.parsed {
+            Parsed::ConstStability(stability) => Some(stability),
+            _ => None,
+        })
+    }
+
+    /// `lookup_const_stability(..).is_some()`: its own `#[rustc_const_*]`; of a `const fn`, an
+    /// unstable stability it has or inherits; of an associated item of a trait or an impl, its
+    /// parent's own const instability.
+    fn has_const_stability(&mut self, def: &Def<'db>) -> bool {
+        if self.owner(def).is_some_and(|at| self.own_const_stability(at).is_some()) {
+            return true;
+        }
+        let const_fn = ast::Fn::cast(def.node.value).is_some_and(|it| it.const_token().is_some());
+        if const_fn && self.lookup_stability(def).is_some_and(|it| it.level == StabilityLevel::Unstable) {
+            return true;
+        }
+        if def.target.is_associated_item()
+            && let Some(parent) = self.parent(def)
+            && matches!(parent.target, Target::Trait | Target::Impl { .. })
+            && let Some(at) = self.owner(&parent)
+        {
+            return self.own_const_stability(at).is_some_and(|it| it.level == StabilityLevel::Unstable);
+        }
+        false
     }
 
     /// The node's `#[deprecated]` and its attribute.
@@ -979,7 +1304,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
 
     /// `lookup_stability`: its own, or its parent's where that is unstable, or for a field or
     /// a variant, whatever its parent's is.
-    fn lookup_stability(&mut self, def: &Def) -> Option<&'a Stability> {
+    fn lookup_stability(&mut self, def: &Def<'db>) -> Option<&'a Stability> {
         let ptr = def.ptr();
         let owner = match self.stability.get(&ptr) {
             Some(owner) => *owner,
@@ -992,8 +1317,14 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         owner.and_then(|it| self.own_stability(it))
     }
 
-    fn stability_owner(&mut self, def: &Def) -> Option<usize> {
+    fn stability_owner(&mut self, def: &Def<'db>) -> Option<usize> {
         if let Some(owner) = self.owner(def)
+            && self.own_stability(owner).is_some()
+        {
+            return Some(owner);
+        }
+        if let Some(item) = self.derived_from(def)
+            && let Some(owner) = self.owner(&item)
             && self.own_stability(owner).is_some()
         {
             return Some(owner);
@@ -1012,7 +1343,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     }
 
     /// `lookup_deprecation_entry`: its own, or its parent's.
-    fn lookup_deprecation(&mut self, def: &Def) -> Option<&'a DeprecatedSince> {
+    fn lookup_deprecation(&mut self, def: &Def<'db>) -> Option<&'a DeprecatedSince> {
         let ptr = def.ptr();
         let owner = match self.deprecation.get(&ptr) {
             Some(owner) => *owner,
@@ -1025,7 +1356,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
         owner.and_then(|it| self.own_deprecation(it)).map(|(since, _)| since)
     }
 
-    fn deprecation_owner(&mut self, def: &Def) -> Option<usize> {
+    fn deprecation_owner(&mut self, def: &Def<'db>) -> Option<usize> {
         if let Some(owner) = self.owner(def)
             && self.own_deprecation(owner).is_some()
         {
@@ -1040,7 +1371,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     }
 
     /// `annotation_kind`.
-    fn annotation(&self, def: &Def) -> Annotation {
+    fn annotation(&self, def: &Def<'db>) -> Annotation {
         match def.target {
             Target::Impl { of_trait: false } | Target::ForeignMod => Annotation::Container,
             Target::GenericParam { kind: GenericParamKind::Type | GenericParamKind::Const, has_default } => {
@@ -1058,9 +1389,9 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     /// The order rustc's visit of each module comes to `def` in: its module's place, and
     /// whether it is (or is in) an item, a trait's item, an impl's item or a foreign item
     /// (`hir_visit_item_likes_in_module`).
-    fn order_key(&mut self, def: &Def) -> (usize, u8) {
+    fn order_key(&mut self, def: &Def<'db>) -> (usize, u8) {
         let mut kind = None;
-        let mut at = def.clone();
+        let mut at = *def;
         loop {
             if kind.is_none() {
                 kind = match at.target {
@@ -1088,14 +1419,14 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
     }
 
     /// `check_compatible_stability` of the owner `at`, whose node is `def`.
-    fn compatible(&mut self, at: usize, def: &Def) -> Vec<Diag> {
+    fn compatible(&mut self, at: usize, def: &Def<'db>) -> Vec<Diag> {
         let stability = self.lookup_stability(def);
         let deprecation = self.lookup_deprecation(def);
         let kind = self.annotation(def);
         let own_stability = self.own_stability(at);
         let own_deprecation = self.own_deprecation(at);
         let cx: &'a Cx<'c, 'db> = self.cx;
-        let owners: &'a [Owner] = self.owners;
+        let owners: &'a [Owner<'db>] = self.owners;
         let all: &'a Lowered<'a> = self.parsed;
         let owner = &owners[at];
         let parsed = all.of(at);
@@ -1107,12 +1438,13 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             let attr = &owner.attrs[index];
             cx.span(attr.in_file(attr.path_range()))
         };
-        let item_span = || cx.span(InFile::new(def.node.file_id, def_range(&def.node.value)));
+        let item_span = || cx.span(InFile::new(def.node.file_id, def_range(def.node.value)));
         let const_stability = parsed.iter().find_map(|it| match &it.parsed {
             Parsed::ConstStability(stability) => Some(stability),
             _ => None,
         });
         let const_stable_indirect = parsed.iter().any(|it| matches!(it.parsed, Parsed::RustcConstStableIndirect));
+        // alloc: empty, allocates only when an annotation is in error
         let mut errors = Vec::new();
         if stability.is_none()
             && let Some((DeprecatedSince::RustcVersion(_), attr)) = own_deprecation
@@ -1124,6 +1456,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             let stable = matches!(stability.level, StabilityLevel::Stable(_));
             if kind == Annotation::Prohibited || kind == Annotation::Container && stable && deprecation.is_some() {
                 let span = attr_span(stability.attr);
+                // clone: the error's span
                 let mut diag = Diag::error(None, "this stability annotation is useless", span.clone());
                 diag.span_label(span, "useless stability annotation");
                 diag.span_label(item_span(), "the stability attribute annotates this item");
@@ -1139,6 +1472,7 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
                 };
                 if after {
                     let span = attr_span(stability.attr);
+                    // clone: the error's span
                     let mut diag = Diag::error(None, "an API can't be stabilized after it is deprecated", span.clone());
                     diag.span_label(span, "invalid version");
                     diag.span_label(item_span(), "the stability attribute annotates this item");
@@ -1147,17 +1481,19 @@ impl<'a, 'c, 'db> Defs<'a, 'c, 'db> {
             }
         }
         let function = match def.target {
-            Target::Fn | Target::Method(_) | Target::ForeignFn => ast::Fn::cast(def.node.value.clone()),
+            Target::Fn | Target::Method(_) | Target::ForeignFn => ast::Fn::cast(def.node.value),
             _ => None,
         };
-        if let Some(function) = &function
+        if let Some(function) = function
             && let Some(const_stability) = const_stability
         {
             let signature = cx.span(InFile::new(def.node.file_id, signature_range(function)));
             let comptime = owner.attrs.iter().any(|it| it.is("rustc_comptime"));
             if function.const_token().is_none() && !comptime {
                 let message = "attributes `#[rustc_const_unstable]`, `#[rustc_const_stable]` and `#[rustc_const_stable_indirect]` require the function or method to be `const`";
+                // clone: the error's span
                 let mut diag = Diag::error(None, message, signature.clone());
+                // clone: the error's span
                 diag.span_help(signature.clone(), "make the function or method const");
                 errors.push(diag);
             }
@@ -1217,6 +1553,20 @@ mod tests {
         assert_eq!(parse_since("1.2", true), DeprecatedSince::RustcVersion((1, 2, 0)));
         assert_eq!(parse_since("CURRENT_RUSTC_VERSION", true), DeprecatedSince::RustcVersion(CURRENT));
         assert_eq!(parse_since("1.2.3-beta", true), DeprecatedSince::Err);
+    }
+
+    /// The crate root is spanned from its first doc comment or attribute to its last item, the
+    /// plain comments and white space around them left out.
+    #[test]
+    fn the_crate_root_is_spanned_by_its_doc_comments_attributes_and_items() {
+        let text = "// a\n\n//! doc\n#![feature(staged_api)]\nfn f() {}\n/* b */\n";
+        let parse = syntax::SourceFile::parse(text, span::Edition::CURRENT);
+        assert_eq!(&text[crate_range(parse.root())], "//! doc\n#![feature(staged_api)]\nfn f() {}");
+        let text = "fn f() {}\n/// trailing\n";
+        let parse = syntax::SourceFile::parse(text, span::Edition::CURRENT);
+        assert_eq!(&text[crate_range(parse.root())], "fn f() {}\n/// trailing");
+        let parse = syntax::SourceFile::parse("// only\n", span::Edition::CURRENT);
+        assert_eq!(crate_range(parse.root()), TextRange::empty(0.into()));
     }
 
     #[test]

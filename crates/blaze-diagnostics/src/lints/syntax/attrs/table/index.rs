@@ -20,7 +20,7 @@ const RUNS: ([&str; COUNT], [u16; COUNT], usize) = {
     while at < COUNT {
         let path = BUILTINS[at].path;
         assert!(!path.is_empty(), "a builtin parser has an empty path");
-        if len == 0 || !same(firsts[len - 1].as_bytes(), path[0].as_bytes()) {
+        if len == 0 || !blaze_phf::bytes_eq(firsts[len - 1].as_bytes(), path[0].as_bytes()) {
             firsts[len] = path[0];
             len += 1;
         }
@@ -80,21 +80,7 @@ pub(crate) const fn same_path(a: &[&str], b: &[&str]) -> bool {
     }
     let mut at = 0;
     while at < a.len() {
-        if !same(a[at].as_bytes(), b[at].as_bytes()) {
-            return false;
-        }
-        at += 1;
-    }
-    true
-}
-
-const fn same(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut at = 0;
-    while at < a.len() {
-        if a[at] != b[at] {
+        if !blaze_phf::bytes_eq(a[at].as_bytes(), b[at].as_bytes()) {
             return false;
         }
         at += 1;

@@ -18,7 +18,10 @@ use std::cell::OnceCell;
 use blaze_items::Fact;
 use hir::{HasVisibility as _, InFile, ItemInNs, ModPath, ModuleDef, Name, PathKind, StructKind};
 use span::Edition;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{
+    NodeOrToken, SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
     cx::Cx,
@@ -83,52 +86,61 @@ struct ImportError {
     fact: Option<(Fact, String)>,
 }
 
-pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedImport) -> Vec<Found> {
-    let tree = cx.node(d.decl);
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnresolvedImport) -> Vec<Found> {
+    let tree = cx.node_view(d.decl);
     let file = tree.file_id;
-    let r = Resolver::new(cx, file, tree.value.syntax().clone());
-    let mine = r.failure(&r.import(&tree.value));
+    let r = Resolver::new(cx, file, tree.value.syntax());
+    let mine = r.failure(&r.import(tree.value));
     let error = match mine {
+        // alloc: the error's parts, for an error hir found
         Some(Failure::Path { at, error }) => return vec![Found::new(path_diag(&r, at, error), Phase::Resolve)],
         Some(Failure::Import(error)) => error,
         None => {
             // hir finds no way to it where this walk finds one: still the error, as rustc's
             // message says it, with nothing it cannot say.
-            let import = r.import(&tree.value);
+            let import = r.import(tree.value);
             let path = import_path(&import, None);
+            // alloc: the error's text, for an error hir found
             let diag = Diag::error(Some("E0432"), format!("unresolved import `{path}`"), r.span(import.range));
+            // alloc: the error's parts, for an error hir found
             return vec![Found::new(diag, Phase::Resolve)];
         }
     };
     // rustc gives the failed imports of one `use` item in one diagnostic, at the first: the
     // others give nothing of their own.
-    let leaves = tree.value.syntax().ancestors().find_map(ast::Use::cast).map_or_else(Vec::new, |it| leaves(&it));
+    let leaves = tree.value.syntax().ancestors().find_map(ast::Use::cast).map_or_else(Vec::new, leaves);
     let at = leaves.iter().position(|it| it.syntax() == tree.value.syntax()).unwrap_or(leaves.len());
-    let import_error = |leaf: &ast::UseTree| {
-        let r = Resolver::new(cx, file, leaf.syntax().clone());
-        match r.failure(&r.import(leaf)) {
+    let import_error = |leaf: &ast::UseTree<'db>| {
+        let r = Resolver::new(cx, file, leaf.syntax());
+        match r.failure(&r.import(*leaf)) {
             Some(Failure::Import(error)) => Some(error),
             _ => None,
         }
     };
     if leaves[..at].iter().any(|it| import_error(it).is_some()) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
+    // alloc: the error's parts, for an error hir found
     let mut group = vec![error];
     group.extend(leaves.iter().skip(at + 1).filter_map(import_error));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(unresolved_imports(&r, group), Phase::Resolve)]
 }
 
 /// rustc's `throw_unresolved_import_error` of the errors of one `use` item.
 fn unresolved_imports(r: &Resolver<'_, '_, '_>, errors: Vec<ImportError>) -> Diag {
+    // alloc: the error's text, for an error hir found
     let paths: Vec<String> = errors.iter().map(|it| format!("`{}`", it.path)).collect();
     let plural = if paths.len() == 1 { "" } else { "s" };
+    // alloc: the error's text, for an error hir found
     let message = format!("unresolved import{plural} {}", paths.join(", "));
     let mut spans = errors.iter().map(|it| r.span(it.span));
     let mut diag = Diag::error(Some("E0432"), message, spans.next().expect("one error at least"));
     spans.for_each(|it| {
         diag.primary(it);
     });
+    // clone: on the error path, for an error hir found
     if let Some(note) = errors.last().and_then(|it| it.note.clone()) {
         diag.note(note);
     }
@@ -149,6 +161,7 @@ fn unresolved_imports(r: &Resolver<'_, '_, '_>, errors: Vec<ImportError>) -> Dia
 /// E0433 of a path's segment at `at`, as rustc's `FailedToResolve` gives it.
 fn path_diag(r: &Resolver<'_, '_, '_>, at: TextRange, error: PathError) -> Diag {
     let at = r.span(at);
+    // clone: on the error path, for an error hir found
     let mut diag = Diag::error(Some("E0433"), error.message, at.clone());
     diag.span_label(at, error.label);
     if let Some(suggestion) = error.suggestion {
@@ -164,10 +177,10 @@ fn path_diag(r: &Resolver<'_, '_, '_>, at: TextRange, error: PathError) -> Diag 
 /// (`finalize_macro_resolutions`): E0433 at the segment not found, or at the whole path when it
 /// goes into an enum or a trait. `expected` is the macro's kind as rustc names it, with its
 /// article (`("a", "macro")`); `bang` whether it is called with `!`.
-pub(super) fn macro_path_error(
-    cx: &Cx<'_, '_>,
+pub(super) fn macro_path_error<'db>(
+    cx: &Cx<'_, 'db>,
     file: hir::HirFileId,
-    node: SyntaxNode,
+    node: ast::Node<'db>,
     path: &[Segment],
     range: TextRange,
     expected: (&str, &str),
@@ -185,13 +198,18 @@ pub(super) fn macro_path_error(
                 };
                 let unresolved = path.len() - at - 1;
                 let scope = match path[..unresolved].last() {
+                    // alloc: the error's text, for an error hir found
                     Some(prev) => format!("{found_descr} `{}`", prev.name),
+                    // alloc: the error's text, for an error hir found
                     None => found_descr.to_owned(),
                 };
                 let (expected_an, expected_descr) = expected;
+                // alloc: the error's text, for an error hir found
                 let message = format!("cannot find {expected_descr} `{}` in {scope}", path[unresolved].name);
                 let span = r.span(range);
+                // clone: on the error path, for an error hir found
                 let mut diag = Diag::error(Some("E0433"), message, span.clone());
+                // alloc: the error's text, for an error hir found
                 diag.span_label(span, format!("{expected_an} {expected_descr} can't exist within {found_an} {found_descr}"));
                 return diag;
             }
@@ -204,7 +222,9 @@ pub(super) fn macro_path_error(
         let bang_at = TextRange::at(last.range.end(), TextSize::of('!'));
         let names = names_to_string(path.iter().map(|it| it.name.as_str()));
         diag.multipart_suggestion(
+            // alloc: the error's text, for an error hir found
             format!("{names} is not a macro, but a {}, try to remove `!`", value_descr(cx, def)),
+            // alloc: the error's text, for an error hir found
             vec![(r.span(bang_at), String::new())],
             Applicability::MaybeIncorrect,
         );
@@ -220,13 +240,14 @@ fn suggest(diag: &mut Diag, suggestion: Suggestion) {
 }
 
 /// The use trees of `item` that import one thing each, in order.
-fn leaves(item: &ast::Use) -> Vec<ast::UseTree> {
-    fn walk(tree: ast::UseTree, out: &mut Vec<ast::UseTree>) {
+fn leaves(item: ast::Use<'_>) -> Vec<ast::UseTree<'_>> {
+    fn walk<'t>(tree: ast::UseTree<'t>, out: &mut Vec<ast::UseTree<'t>>) {
         match tree.use_tree_list() {
             Some(list) => list.use_trees().for_each(|it| walk(it, out)),
             None => out.push(tree),
         }
     }
+    // alloc: the error's parts, for an error hir found
     let mut out = Vec::new();
     if let Some(tree) = item.use_tree() {
         walk(tree, &mut out);
@@ -239,6 +260,7 @@ fn leaves(item: &ast::Use) -> Vec<ast::UseTree> {
 fn import_path(import: &Import, failed: Option<usize>) -> String {
     let global = import.module_path.first().is_some_and(|it| it.name == ROOT);
     let names = &import.module_path[usize::from(global)..];
+    // alloc: the error's parts, for an error hir found
     let names: Vec<&str> = names.iter().map(|it| it.name.as_str()).collect();
     if let Some(at) = failed {
         let at = at - usize::from(global);
@@ -246,13 +268,16 @@ fn import_path(import: &Import, failed: Option<usize>) -> String {
     }
     let source = import.source.as_ref().map_or("*", |it| it.name.as_str());
     match names.is_empty() {
+        // alloc: the error's text, for an error hir found
         true => source.to_owned(),
+        // alloc: the error's text, for an error hir found
         false => format!("{}::{source}", names.join("::")),
     }
 }
 
 /// rustc's `names_to_string`: the names joined by `::`, `{{root}}` written as nothing.
 fn names_to_string<'a>(names: impl IntoIterator<Item = &'a str>) -> String {
+    // alloc: the error's text, for an error hir found
     let mut out = String::new();
     for (i, name) in names.into_iter().enumerate().filter(|(_, it)| *it != ROOT) {
         if i > 0 {
@@ -271,13 +296,13 @@ fn is_path_segment_keyword(name: &str) -> bool {
 struct Resolver<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     file: hir::HirFileId,
-    node: SyntaxNode,
+    node: ast::Node<'db>,
     /// [`Resolver::current`], found once: each path the import resolves asks for it.
     current: OnceCell<Option<hir::Module>>,
 }
 
 impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
-    fn new(cx: &'c Cx<'a, 'db>, file: hir::HirFileId, node: SyntaxNode) -> Self {
+    fn new(cx: &'c Cx<'a, 'db>, file: hir::HirFileId, node: ast::Node<'db>) -> Self {
         Resolver { cx, file, node, current: OnceCell::new() }
     }
 
@@ -292,38 +317,22 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
     /// The module the import is in: `self` of its paths.
     fn current(&self) -> Option<hir::Module> {
         *self.current.get_or_init(|| {
-            Some(self.cx.sema.scope(&self.node)?.module().nearest_non_block_module(self.cx.db))
+            Some(self.cx.vsema.scope(self.node)?.module().nearest_non_block_module(self.cx.db))
         })
     }
 
     /// rustc's import of the leaf use tree `tree`: the paths of the trees it is nested in and
     /// its own, `{{root}}` before a 2015 path that does not start with a keyword.
-    fn import(&self, tree: &ast::UseTree) -> Import {
-        let mut trees = vec![tree.clone()];
-        let mut at = tree.clone();
-        while let Some(parent) = at.parent_use_tree_list().map(|it| it.parent_use_tree()) {
-            trees.push(parent.clone());
-            at = parent;
-        }
-        trees.reverse();
+    fn import(&self, tree: ast::UseTree<'_>) -> Import {
+        // alloc: the error's parts, for an error hir found
         let mut segments: Vec<Segment> = Vec::new();
-        for tree in &trees {
-            match tree.path() {
-                Some(path) => segments.extend(path_segments(&path)),
-                None => {
-                    if let Some(token) = tree.coloncolon_token()
-                        && segments.is_empty()
-                    {
-                        segments.push(Segment { name: ROOT.to_owned(), range: token.text_range() });
-                    }
-                }
-            }
-        }
+        let nested = nested_segments(tree, &mut segments) > 1;
         if self.edition() == Edition::Edition2015
             && let Some(first) = segments.first()
             && !is_path_segment_keyword(&first.name)
         {
             let range = TextRange::empty(first.range.start());
+            // alloc: the error's text, for an error hir found
             segments.insert(0, Segment { name: ROOT.to_owned(), range });
         }
         let range = tree.syntax().text_range();
@@ -331,7 +340,7 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
             return Import { module_path: segments, source: None, range };
         }
         // `a::{self}` imports `a`.
-        if segments.last().is_some_and(|it| it.name == "self") && trees.len() > 1 {
+        if segments.last().is_some_and(|it| it.name == "self") && nested {
             segments.pop();
         }
         let source = segments.pop();
@@ -358,7 +367,7 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
             };
         }
         let path = ModPath::from_segments(kind, rest.iter().map(|it| Name::new_root(&it.name)));
-        let mut items = self.cx.sema.resolve_mod_path(&self.node, &path)?;
+        let mut items = self.cx.vsema.resolve_mod_path(self.node, &path)?;
         items.find_map(|it| match it {
             ItemInNs::Types(def @ (ModuleDef::Module(_) | ModuleDef::Trait(_))) => Some(Scope::Def(def)),
             ItemInNs::Types(def @ ModuleDef::Adt(hir::Adt::Enum(_))) => Some(Scope::Def(def)),
@@ -369,10 +378,11 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
     /// What `name` names as a value in `scope`, or in the import's scope when there is none.
     fn value(&self, scope: Option<&[Segment]>, name: &str) -> Option<ModuleDef> {
         let mut path: Vec<Segment> = scope.map_or_else(Vec::new, <[Segment]>::to_vec);
+        // alloc: the error's text, for an error hir found
         path.push(Segment { name: name.to_owned(), range: TextRange::default() });
         let (kind, rest) = self.kind_of(&path);
         let path = ModPath::from_segments(kind, rest.iter().map(|it| Name::new_root(&it.name)));
-        let mut items = self.cx.sema.resolve_mod_path(&self.node, &path)?;
+        let mut items = self.cx.vsema.resolve_mod_path(self.node, &path)?;
         items.find_map(|it| match it {
             ItemInNs::Values(def) => Some(def),
             _ => None,
@@ -381,14 +391,16 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
 
     /// Whether the import's name is found in the module `scope`, in any namespace.
     fn found_in(&self, import: &Import, source: &Segment) -> bool {
+        // clone: on the error path, for an error hir found
         let mut path = import.module_path.clone();
+        // clone: on the error path, for an error hir found
         path.push(source.clone());
         let (kind, rest) = self.kind_of(&path);
         if rest.is_empty() {
             return true;
         }
         let path = ModPath::from_segments(kind, rest.iter().map(|it| Name::new_root(&it.name)));
-        self.cx.sema.resolve_mod_path(&self.node, &path).is_some_and(|mut it| it.next().is_some())
+        self.cx.vsema.resolve_mod_path(self.node, &path).is_some_and(|mut it| it.next().is_some())
     }
 
     /// The leading keywords of `path` as hir's path kind, and the names after them.
@@ -424,7 +436,9 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
                     let (label, note, suggestion) = match self.similar_path(path) {
                         Some((suggested, note)) => {
                             let suggested = names_to_string(suggested.iter().map(|it| it.name.as_str()));
+                            // alloc: the error's parts, for an error hir found
                             let parts = vec![(self.span(segment.range), suggested)];
+                            // alloc: the error's text, for an error hir found
                             (None, note, Some(Suggestion { parts, message: "a similar path exists".to_owned() }))
                         }
                         None => (Some(failed.label), None, failed.suggestion),
@@ -452,23 +466,31 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         };
         let label = match scope {
             Scope::Def(def) => match module_to_string(self.cx, def) {
+                // alloc: the error's text, for an error hir found
                 Some(module) => format!("no `{}` in `{module}`", source.name),
+                // alloc: the error's text, for an error hir found
                 None => format!("no `{}` in the root", source.name),
             },
             Scope::ExternPrelude if !is_path_segment_keyword(&source.name) => {
+                // alloc: the error's text, for an error hir found
                 format!("no external crate `{}`", source.name)
             }
+            // alloc: the error's text, for an error hir found
             Scope::ExternPrelude => format!("no `{}` in the root", source.name),
         };
         let names = self.names_in(scope, &source.name);
+        // alloc: the error's parts, for an error hir found
         let names: Vec<&str> = names.iter().map(Name::as_str).collect();
         let suggestion = find_best_match_for_name(&names, &source.name, None).map(|it| Suggestion {
+            // alloc: the error's text, for an error hir found
             parts: vec![(self.span(source.range), it.to_owned())],
+            // alloc: the error's text, for an error hir found
             message: "a similar name exists in the module".to_owned(),
         });
         let fact = match scope {
             Scope::Def(ModuleDef::Module(m)) => Some((
                 self.cx.resolves_fact(m, &source.name),
+                // alloc: the error's text, for an error hir found
                 format!("what `{}` names in `{}`", source.name, module_to_string(self.cx, ModuleDef::Module(m)).unwrap_or_else(|| "crate".to_owned())),
             )),
             _ => None,
@@ -494,9 +516,13 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
                 .into_iter()
                 .filter(|(_, def)| !matches!(def, hir::ScopeDef::Unknown))
                 .map(|(name, _)| name)
+                // alloc: the error's parts, for an error hir found
                 .collect(),
-            Scope::Def(ModuleDef::Adt(hir::Adt::Enum(e))) => e.variants(db).into_iter().map(|it| it.name(db)).collect(),
-            Scope::Def(ModuleDef::Trait(t)) => t.items(db).into_iter().filter_map(|it| it.name(db)).collect(),
+            // alloc: the error's parts, for an error hir found
+            Scope::Def(ModuleDef::Adt(hir::Adt::Enum(e))) => e.variants_iter(db).map(|it| it.name(db)).collect(),
+            // alloc: the error's parts, for an error hir found
+            Scope::Def(ModuleDef::Trait(t)) => t.items_iter(db).filter_map(|it| it.name(db)).collect(),
+            // alloc: empty, allocates nothing
             _ => Vec::new(),
         };
         names.retain(|it| it.as_str() != name && it.as_str() != "_");
@@ -508,16 +534,20 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
     /// rustc's `make_path_suggestion`: the path with `self`, `crate`, `super` or a crate's name
     /// first, when that names a module, and the note it gives with it.
     fn similar_path(&self, path: &[Segment]) -> Option<(Vec<Segment>, Option<String>)> {
+        // alloc: the error's parts, for an error hir found
         let mut path = path.to_vec();
         match path.as_slice() {
             [first, second, ..] if first.name == ROOT && !is_path_segment_keyword(&second.name) => {}
             [first, ..] if self.edition() > Edition::Edition2015 && !is_path_segment_keyword(&first.name) => {
+                // alloc: the error's text, for an error hir found
                 path.insert(0, Segment { name: String::new(), range: TextRange::default() });
             }
             _ => return None,
         }
         let with = |first: &str| {
+            // clone: on the error path, for an error hir found
             let mut path = path.clone();
+            // alloc: the error's text, for an error hir found
             path[0].name = first.to_owned();
             path
         };
@@ -540,7 +570,8 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
 
     /// The names of the crate's extern prelude: its dependencies.
     fn extern_prelude(&self) -> Vec<Name> {
-        self.cx.krate.dependencies(self.cx.db).into_iter().map(|it| it.name).collect()
+        // alloc: the error's parts, for an error hir found
+        self.cx.krate.dependencies_iter(self.cx.db).map(|it| it.name).collect()
     }
 
     /// rustc's `report_path_resolution_error` of the segment `at` of `path`, `module` what the
@@ -552,28 +583,37 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         let ident = &path[at];
         let name = ident.name.as_str();
         let scope = match path[..at].last() {
+            // alloc: the error's text, for an error hir found
             Some(prev) if prev.name == ROOT => "the crate root".to_owned(),
+            // alloc: the error's text, for an error hir found
             Some(prev) => format!("`{}`", prev.name),
+            // alloc: the error's text, for an error hir found
             None => "this scope".to_owned(),
         };
+        // alloc: the error's text, for an error hir found
         let message = format!("cannot find `{name}` in {scope}");
         let in_module = match module {
             Some(Scope::Def(ModuleDef::Module(m))) => Some(m),
             _ => self.current(),
         };
         let fact = in_module.map(|m| {
+            // alloc: the error's text, for an error hir found
             let of = module_to_string(cx, ModuleDef::Module(m)).map_or_else(|| "the crate root".to_owned(), |it| format!("`{it}`"));
+            // alloc: the error's text, for an error hir found
             (cx.resolves_fact(m, name), format!("what `{name}` names in {of}"))
         });
         let error = |message: String, label: String, suggestion: Option<Suggestion>| PathError {
             message,
             label,
             suggestion,
+            // clone: on the error path, for an error hir found
             fact: fact.clone(),
         };
         if name == "super" {
             return error(
+                // alloc: the error's text, for an error hir found
                 "too many leading `super` keywords".to_owned(),
+                // alloc: the error's text, for an error hir found
                 "there are too many leading `super` keywords".to_owned(),
                 None,
             );
@@ -581,78 +621,106 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         let crate_root = cx.krate.root_module(db);
         if module == Some(Scope::Def(ModuleDef::Module(crate_root))) {
             if let Some(candidate) = self.module_candidate(path, at) {
+                // alloc: the error's parts, for an error hir found
                 let parts = vec![(self.span(ident.range), candidate)];
                 return error(
                     message,
+                    // alloc: the error's text, for an error hir found
                     "unresolved import".to_owned(),
+                    // alloc: the error's text, for an error hir found
                     Some(Suggestion { parts, message: "a similar path exists".to_owned() }),
                 );
             }
             if name == "core" {
+                // alloc: the error's text, for an error hir found
                 let parts = vec![(self.span(ident.range), "std".to_owned())];
                 return error(
                     message,
+                    // alloc: the error's text, for an error hir found
                     "you might be missing crate `core`".to_owned(),
+                    // alloc: the error's text, for an error hir found
                     Some(Suggestion { parts, message: "try using `std` instead of `core`".to_owned() }),
                 );
             }
             if name == "_" {
                 return error(
+                    // alloc: the error's text, for an error hir found
                     "invalid crate or module name `_`".to_owned(),
+                    // alloc: the error's text, for an error hir found
                     "`_` is not a valid crate or module name".to_owned(),
                     None,
                 );
             }
             if self.edition() == Edition::Edition2015 {
+                // alloc: the error's text, for an error hir found
                 let parts = vec![(self.crate_insert_span(), format!("extern crate {name};\n"))];
                 return error(
+                    // alloc: the error's text, for an error hir found
                     format!("cannot find module or crate `{name}` in {scope}"),
+                    // alloc: the error's text, for an error hir found
                     format!("use of unresolved module or unlinked crate `{name}`"),
                     Some(Suggestion { parts, message: missing_crate_2015(cx, name) }),
                 );
             }
+            // alloc: the error's text, for an error hir found
             return error(message, format!("could not find `{name}` in the crate root"), None);
         }
         if at > 0 {
             let parent = match path[at - 1].name.as_str() {
+                // alloc: the error's text, for an error hir found
                 ROOT if self.edition() > Edition::Edition2015 => "the list of imported crates".to_owned(),
+                // alloc: the error's text, for an error hir found
                 ROOT | "crate" => "the crate root".to_owned(),
+                // alloc: the error's text, for an error hir found
                 parent => format!("`{parent}`"),
             };
             let in_types = !(macro_last && at + 1 == path.len());
             let label = match self.value(Some(&path[..at]), name).filter(|_| in_types) {
+                // alloc: the error's text, for an error hir found
                 Some(def) => format!("expected type, found {} `{name}` in {parent}", value_descr(cx, def)),
+                // alloc: the error's text, for an error hir found
                 None => format!("could not find `{name}` in {parent}"),
             };
             return error(message, label, None);
         }
         if name == "Self" {
+            // alloc: the error's text, for an error hir found
             return error(message, "`Self` cannot be used in imports".to_owned(), None);
         }
         if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
             return error(
+                // alloc: the error's text, for an error hir found
                 format!("cannot find type `{name}` in {scope}"),
+                // alloc: the error's text, for an error hir found
                 format!("use of undeclared type `{name}`"),
                 None,
             );
         }
         let mut suggestion = (name == "alloc").then(|| Suggestion {
+            // alloc: the error's parts, for an error hir found
             parts: Vec::new(),
+            // alloc: the error's text, for an error hir found
             message: "add `extern crate alloc` to use the `alloc` crate".to_owned(),
         });
         if suggestion.is_none() {
             suggestion = self.similar_module_or_crate(name).map(|it| Suggestion {
+                // alloc: the error's parts, for an error hir found
                 parts: vec![(self.span(ident.range), it)],
+                // alloc: the error's text, for an error hir found
                 message: "there is a crate or module with a similar name".to_owned(),
             });
         }
+        // alloc: the error's text, for an error hir found
         let message = format!("cannot find module or crate `{name}` in {scope}");
         if let Some(def) = self.value(None, name) {
+            // alloc: the error's text, for an error hir found
             let label = format!("{} `{name}` is not a crate or module", value_descr(cx, def));
             return error(message, label, suggestion);
         }
         let suggestion =
+            // alloc: the error's parts, for an error hir found
             suggestion.or_else(|| Some(Suggestion { parts: Vec::new(), message: missing_crate(cx, name) }));
+        // alloc: the error's text, for an error hir found
         error(message, format!("use of unresolved module or unlinked crate `{name}`"), suggestion)
     }
 
@@ -674,13 +742,17 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
             })
             .filter(|m| m.is_visible_from(db, current))
             .map(|m| {
+                // alloc: the error's parts, for an error hir found
                 let mut segments: Vec<String> = Vec::new();
                 if self.edition() > Edition::Edition2015 {
+                    // alloc: the error's text, for an error hir found
                     segments.push("crate".to_owned());
                 }
+                // alloc: the error's text, for an error hir found
                 segments.extend(m.path_segments(db).map(|it| it.as_str().to_owned()));
                 segments
             })
+            // alloc: the error's parts, for an error hir found
             .collect();
         candidates.sort_by_cached_key(|it| (it.len(), it.join("::")));
         let candidate = candidates.into_iter().next()?;
@@ -695,7 +767,7 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         let db = self.cx.db;
         let current = self.current()?;
         let mut candidates = self.extern_prelude();
-        for module in self.cx.krate.modules(db) {
+        for module in self.cx.krate.modules_iter(db) {
             let below = std::iter::successors(module.parent(db), |it| it.parent(db)).any(|it| it == current);
             if below && let Some(it) = module.name(db) {
                 candidates.push(it);
@@ -704,6 +776,7 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
         candidates.retain(|it| !it.as_str().is_empty());
         candidates.sort_unstable_by(|a, b| a.symbol().cmp_order(b.symbol()));
         candidates.dedup();
+        // alloc: the error's parts, for an error hir found
         let candidates: Vec<&str> = candidates.iter().map(Name::as_str).collect();
         find_best_match_for_name(&candidates, name, None).filter(|it| *it != name).map(str::to_owned)
     }
@@ -713,24 +786,22 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
     fn crate_insert_span(&self) -> Span {
         let cx = self.cx;
         let file = cx.krate.root_module(cx.db).definition_source_file_id(cx.db);
-        let source = cx.sema.parse_or_expand(file);
-        let is_token = |token: &syntax::SyntaxToken| match token.kind() {
-            SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG => false,
-            SyntaxKind::COMMENT => ast::Comment::cast(token.clone())
-                .and_then(|it| it.kind().doc)
-                .is_some_and(|doc| doc == ast::AttrKind::Outer),
-            _ => true,
+        let source = cx.root(file);
+        // A doc comment is a `DOC_COMMENT` node: an inner one is skipped with the inner
+        // attributes, an outer one's token counts.
+        let is_token = |token: &ast::Token<'_>| {
+            !matches!(token.kind(), SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG | SyntaxKind::COMMENT)
         };
         let at = source
             .children_with_tokens()
             .find_map(|it| match it {
-                syntax::NodeOrToken::Node(node) => {
-                    if ast::Attr::cast(node.clone()).is_some_and(|it| it.excl_token().is_some()) {
+                NodeOrToken::Node(node) => {
+                    if ast::AnyAttr::cast(node).is_some_and(|it| it.kind() == ast::AttrKind::Inner) {
                         return None;
                     }
-                    node.descendants_with_tokens().filter_map(syntax::NodeOrToken::into_token).find(is_token)
+                    node.descendants_with_tokens().filter_map(NodeOrToken::into_token).find(is_token)
                 }
-                syntax::NodeOrToken::Token(token) => is_token(&token).then_some(token),
+                NodeOrToken::Token(token) => is_token(&token).then_some(token),
             })
             .map_or(source.text_range().end(), |it| it.text_range().start());
         cx.span(InFile::new(file, TextRange::empty(at)))
@@ -742,8 +813,10 @@ impl<'c, 'a, 'db> Resolver<'c, 'a, 'db> {
 /// `cargo add` when cargo runs the compile.
 pub(crate) fn missing_crate(cx: &Cx<'_, '_>, name: &str) -> String {
     if cx.cargo() {
+        // alloc: the error's text, for an error hir found
         format!("if you wanted to use a crate named `{name}`, use `cargo add {name}` to add it to your `Cargo.toml`")
     } else {
+        // alloc: the error's text, for an error hir found
         format!("you might be missing a crate named `{name}`")
     }
 }
@@ -751,10 +824,12 @@ pub(crate) fn missing_crate(cx: &Cx<'_, '_>, name: &str) -> String {
 /// [`missing_crate`] on Rust 2015, where it comes with an `extern crate` to insert.
 pub(crate) fn missing_crate_2015(cx: &Cx<'_, '_>, name: &str) -> String {
     if cx.cargo() {
+        // alloc: the error's text, for an error hir found
         format!(
             "if you wanted to use a crate named `{name}`, use `cargo add {name}` to add it to your `Cargo.toml` and import it in your code"
         )
     } else {
+        // alloc: the error's text, for an error hir found
         format!("you might be missing a crate named `{name}`, add it to your project and import it in your code")
     }
 }
@@ -775,6 +850,7 @@ fn module_to_string(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<String> {
         def => (def.module(db)?, def.name(db)),
     };
     let names: Vec<String> =
+        // alloc: the error's text, for an error hir found
         module.path_segments(db).chain(own).map(|it| it.as_str().to_owned()).collect();
     (!names.is_empty()).then(|| names_to_string(names.iter().map(String::as_str)))
 }
@@ -802,19 +878,45 @@ pub(crate) fn value_descr(cx: &Cx<'_, '_>, def: ModuleDef) -> &'static str {
 }
 
 /// The segments of a path as written: `::` first as `{{root}}`, keywords as themselves.
-pub(super) fn path_segments(path: &ast::Path) -> Vec<Segment> {
+pub(super) fn path_segments(path: ast::Path<'_>) -> Vec<Segment> {
+    // alloc: the error's parts, for an error hir found
     let mut out = Vec::new();
+    push_path_segments(path, &mut out);
+    out
+}
+
+fn push_path_segments(path: ast::Path<'_>, out: &mut Vec<Segment>) {
     for (i, segment) in path.segments().enumerate() {
         if i == 0
             && let Some(token) = segment.coloncolon_token()
         {
+            // alloc: the error's text, for an error hir found
             out.push(Segment { name: ROOT.to_owned(), range: token.text_range() });
         }
         if let Some(name) = segment.name_ref() {
-            out.push(Segment { name: name.text().to_string(), range: name.syntax().text_range() });
+            // alloc: the error's text, for an error hir found
+            out.push(Segment { name: name.text().to_owned(), range: name.syntax().text_range() });
         }
     }
-    out
+}
+
+/// Pushes the segments of the paths of `tree` and of the use trees it is nested in, outermost
+/// first, as rustc's import has them: a `::` with no path before it as `{{root}}`. How many
+/// trees those are.
+fn nested_segments(tree: ast::UseTree<'_>, segments: &mut Vec<Segment>) -> usize {
+    let depth = tree.parent_use_tree_list().map_or(0, |it| nested_segments(it.parent_use_tree(), segments));
+    match tree.path() {
+        Some(path) => push_path_segments(path, segments),
+        None => {
+            if let Some(token) = tree.coloncolon_token()
+                && segments.is_empty()
+            {
+                // alloc: the error's text, for an error hir found
+                segments.push(Segment { name: ROOT.to_owned(), range: token.text_range() });
+            }
+        }
+    }
+    depth + 1
 }
 
 #[cfg(test)]
@@ -838,6 +940,66 @@ mod tests {
         assert_eq!(import_path(&glob, None), "a::b::*");
         let single = Import { module_path: vec![segment(ROOT)], source: Some(segment("foo")), range: TextRange::default() };
         assert_eq!(import_path(&single, None), "foo");
+    }
+
+    /// The handle walk [`nested_segments`] stands in for: the trees gathered from the leaf up,
+    /// then read outermost first.
+    fn handle_segments(tree: &syntax::ast::UseTree) -> (Vec<(String, TextRange)>, usize) {
+        use syntax::AstNode as _;
+        let mut trees = vec![tree.clone()];
+        let mut at = tree.clone();
+        while let Some(parent) = at.parent_use_tree_list().map(|it| it.parent_use_tree()) {
+            trees.push(parent.clone());
+            at = parent;
+        }
+        trees.reverse();
+        let mut out = Vec::new();
+        for tree in &trees {
+            match tree.path() {
+                Some(path) => {
+                    for (i, segment) in path.segments().enumerate() {
+                        if i == 0
+                            && let Some(token) = segment.coloncolon_token()
+                        {
+                            out.push((ROOT.to_owned(), token.text_range()));
+                        }
+                        if let Some(name) = segment.name_ref() {
+                            out.push((name.text().to_string(), name.syntax().text_range()));
+                        }
+                    }
+                }
+                None => {
+                    if let Some(token) = tree.coloncolon_token()
+                        && out.is_empty()
+                    {
+                        out.push((ROOT.to_owned(), token.text_range()));
+                    }
+                }
+            }
+        }
+        (out, trees.len())
+    }
+
+    #[test]
+    fn the_view_walk_gives_the_handle_walks_segments() {
+        use syntax::{AstNode as _, view::AstNode as _};
+        let text = "use ::a::{b, c::{self, d::e}, *};\nuse crate::{f::{g as h}, ::i};\n\
+                    use {j, k::l};\nuse super::super::m;\nuse ::{n, o::{}};\n";
+        let parse = syntax::SourceFile::parse(text, Edition::CURRENT);
+        let handles = parse.tree();
+        let mut compared = 0;
+        for (node, it) in handles.syntax().descendants().zip(parse.root().descendants()) {
+            assert_eq!((node.kind(), node.text_range()), (it.kind(), it.text_range()));
+            let (Some(handle), Some(view)) = (syntax::ast::UseTree::cast(node), ast::UseTree::cast(it)) else {
+                continue;
+            };
+            let mut segments = Vec::new();
+            let depth = nested_segments(view, &mut segments);
+            let segments: Vec<_> = segments.into_iter().map(|it| (it.name, it.range)).collect();
+            assert_eq!((segments, depth), handle_segments(&handle), "{}", &text[it.text_range()]);
+            compared += 1;
+        }
+        assert!(compared > 15, "the source has many use trees: {compared}");
     }
 
     #[test]

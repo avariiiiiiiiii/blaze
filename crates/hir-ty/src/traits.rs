@@ -399,70 +399,73 @@ pub fn where_predicate_must_hold<'db>(
     env: ParamEnvAndCrate<'db>,
     predicate: &WherePredicate,
 ) -> WherePredicateEvaluation {
-    let interner = DbInterner::new_with(db, env.krate);
-    let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
-    let generics = OnceCell::<Generics<'db>>::new();
-    let mut ctx = TyLoweringContext::new(
-        db,
-        resolver,
-        store,
-        def,
-        generic_def,
-        &generics,
-        LifetimeElisionKind::Infer,
-        LifetimeLoweringMode::Bound,
-    )
-    .with_interning_mode(LoweringMode::Ide);
-    let clauses =
-        ctx.lower_where_predicate(predicate, false).map(|(clause, _)| clause).collect::<Vec<_>>();
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        let interner = DbInterner::new_with(db, env.krate);
+        let infcx = interner.infer_ctxt().build(TypingMode::PostAnalysis);
+        let generics = OnceCell::<Generics<'db>>::new();
+        let mut ctx = TyLoweringContext::new(
+            db,
+            resolver,
+            store,
+            def,
+            generic_def,
+            &generics,
+            LifetimeElisionKind::Infer,
+            LifetimeLoweringMode::Bound,
+            frame,
+        )
+        .with_interning_mode(LoweringMode::Ide);
+        let mut clauses = Vec::new_in(frame);
+        clauses.extend(ctx.lower_where_predicate(predicate, false).map(|(clause, _)| clause));
 
-    if !ctx.diagnostics.is_empty()
-        || clauses.iter().any(|clause| clause.as_predicate().references_error())
-    {
-        return WherePredicateEvaluation::HasErrors;
-    }
-
-    if clauses.is_empty() {
-        return if ctx.unsized_types.is_empty() {
-            WherePredicateEvaluation::HasErrors
-        } else {
-            WherePredicateEvaluation::NoObligations
-        };
-    }
-
-    let result = infcx.probe(|snapshot| {
-        let mut ocx = ObligationCtxt::new(&infcx);
-        for clause in clauses {
-            let obligation = Obligation::new(
-                interner,
-                ObligationCause::dummy(),
-                env.param_env,
-                clause.as_predicate(),
-            );
-            ocx.register_obligation(obligation);
+        if !ctx.diagnostics.is_empty()
+            || clauses.iter().any(|clause| clause.as_predicate().references_error())
+        {
+            return WherePredicateEvaluation::HasErrors;
         }
 
-        let mut result = EvaluationResult::EvaluatedToOk;
-        for error in ocx.evaluate_obligations_error_on_ambiguity() {
-            if error.is_true_error() {
-                return EvaluationResult::EvaluatedToErr;
+        if clauses.is_empty() {
+            return if ctx.unsized_types.is_empty() {
+                WherePredicateEvaluation::HasErrors
+            } else {
+                WherePredicateEvaluation::NoObligations
+            };
+        }
+
+        let result = infcx.probe(|snapshot| {
+            let mut ocx = ObligationCtxt::new(&infcx);
+            for clause in clauses {
+                let obligation = Obligation::new(
+                    interner,
+                    ObligationCause::dummy(),
+                    env.param_env,
+                    clause.as_predicate(),
+                );
+                ocx.register_obligation(obligation);
             }
-            result = result.max(EvaluationResult::EvaluatedToAmbig);
-        }
-        if infcx.opaque_types_added_in_snapshot(snapshot) {
-            result.max(EvaluationResult::EvaluatedToOkModuloOpaqueTypes)
-        } else if infcx.region_constraints_added_in_snapshot(snapshot) {
-            result.max(EvaluationResult::EvaluatedToOkModuloRegions)
-        } else {
-            result
-        }
-    });
 
-    if result.must_apply_modulo_regions() {
-        WherePredicateEvaluation::Holds
-    } else {
-        WherePredicateEvaluation::NotProven
-    }
+            let mut result = EvaluationResult::EvaluatedToOk;
+            for error in ocx.evaluate_obligations_error_on_ambiguity() {
+                if error.is_true_error() {
+                    return EvaluationResult::EvaluatedToErr;
+                }
+                result = result.max(EvaluationResult::EvaluatedToAmbig);
+            }
+            if infcx.opaque_types_added_in_snapshot(snapshot) {
+                result.max(EvaluationResult::EvaluatedToOkModuloOpaqueTypes)
+            } else if infcx.region_constraints_added_in_snapshot(snapshot) {
+                result.max(EvaluationResult::EvaluatedToOkModuloRegions)
+            } else {
+                result
+            }
+        });
+
+        if result.must_apply_modulo_regions() {
+            WherePredicateEvaluation::Holds
+        } else {
+            WherePredicateEvaluation::NotProven
+        }
+    })
 }
 
 /// Whether the inherent impl `impl_id` may be written in the crate of `def_map`. The answer
@@ -472,7 +475,7 @@ pub fn is_inherent_impl_coherent(db: &Db, def_map: &DefMap, impl_id: ImplId) -> 
     inherent_impl_coherent(db, impl_id, def_map.krate(), def_map.is_rustc_coherence_is_core())
 }
 
-#[salsa::tracked]
+#[salsa::tracked(mem_tag = Infer)]
 fn inherent_impl_coherent(
     db: &Db,
     impl_id: ImplId,
@@ -566,7 +569,7 @@ pub fn check_orphan_rules<'db>(db: &'db Db, impl_: ImplId) -> bool {
     orphan_rules_hold(db, impl_)
 }
 
-#[salsa::tracked]
+#[salsa::tracked(mem_tag = Infer)]
 fn orphan_rules_hold(db: &Db, impl_: ImplId) -> bool {
     check_orphan_rules_uncached(db, impl_)
 }

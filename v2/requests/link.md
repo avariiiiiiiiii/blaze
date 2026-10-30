@@ -1212,6 +1212,10 @@ the same either way.
 
 > applied by requests (link is DONE): `Names::reserve(&mut self, bytes)` in `model.rs` beside `with_capacity`.
 
+> used by speed-link-edge (2026-10-29): `elf/read/archive.rs`, the no-symbol-table path. It
+> reserves once, after the parallel pass: the sum of the members' `.strtab` sizes, capped at
+> what `limit` leaves. Covered by `indexes_an_archive_without_a_symbol_table`.
+
 > safety-fuzz (2026-10-29): item 13 taken up. `fuzz/Cargo.toml` turns the `fuzz` feature on;
 > `link_macho_tbd` runs `fuzz_tbd_differential` on every UTF-8 input for both arches and
 > platforms 1, 2 and 6, and `link_macho_trie` runs `fuzz_trie_differential` on every trie,
@@ -1382,6 +1386,7 @@ With 1, a one-function edit on Linux is: the message read (`openat`, `statx`, on
 > taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
 > forwarded to requests-link-next (child requests-link-next-core) (requests, pass 18).
 > applied by requests (child requests-link-next): in part (place.rs, live.rs, stage.rs). An ELF patch places its blaze functions' new CIEs and FDEs in Class::Patch after the patch's code, and live.rs ends that run with its own zero terminator in the patch's code writes (item 1 for frames, item 2, and 12 b for blaze functions). Words of existing RelRo/Got pieces already stay in place (item 3, no change). Test: tests.rs a_patch_puts_its_frames_and_literals_in_the_patch_regions_and_ends_its_frames. Refused: Rodata and new RelRo already go to PatchData (writable, no mprotect); RelRo in the code segment is a text relocation on ELF PIE, and literals gain nothing from executable pages. Mach-O FDEs stay in __eh_frame because __unwind_info names them by offset there. Native objects' frames stay in .eh_frame because .eh_frame_hdr finds only those, so 12 b stays open for them. Open: requests-link-next-writers adds the out-of-.eh_frame FDEs to eh_frame_hdr (elf/dynamic.rs), sent as an exact edit.
+> requests-link-next: the open edit is in (requests-link-next-writers): `elf/dynamic.rs` `build_hdr` also lists the FDEs outside `.eh_frame` (an ELF patch's, in `Class::Patch`), a table holding one is not kept, and `patch_hdr` refuses a delta that splices one in, so such links build `.eh_frame_hdr` whole.
 
 ## 20. From speed-link-edge-sol-live: move v1's users onto `slots` (blaze-engine, `demo/`, `harness/live*`)
 
@@ -1444,6 +1449,7 @@ here is persisted or hashed; members, iteration order and panics are the same.
 
 > taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
 > applied by requests (child requests-link-next): 1, 3, 4, 5 as written; 2 in part (below).
+> applied by requests (child requests-link-next): item 2 in full now that `blaze_ids::bits` takes an allocator's `Vec`. `IdSet`'s two columns are `Bits<Vec<u64, A>, u32>`, made by `Bits::from_words(Vec::new_in(alloc))`, so they stay in the stage's frame. `insert` is `insert_growing` on both, `contains`/`remove` are `Bits'`s, and `locate` is no longer used here.
 
 ### 1. `crates/blaze-link/src/native.rs`: `Bits` over `CowVec<u64>` kept, renamed `CowFlags`
 
@@ -1868,3 +1874,103 @@ byte are zero, as `nul_mask` leaves them.)
 
 > taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
 > applied by requests (child requests-link-next): as written.
+
+## 21. From requests-link-next (2026-10-29): a writer's patched tables handed to the file without a copy (`model.rs` `File::parts`, `Writer::synthesize`, `file.rs`)
+
+Status: open. For whoever holds `crates/blaze-link/` next.
+
+Item 19.5 is in: each writer keeps its last tables and patches them from `Placed::delta`
+(`elf/dynamic.rs`, `elf/image.rs` `Elf::last`, `macho.rs` `Kept`, `macho/unwind.rs`
+`unwind::Last`). But `Writer::synthesize` and `File::parts` return owned `Vec<u8>`s, so every
+patch copies the kept table once into a new buffer: about 30 MB for ELF's `.symtab`/`.strtab`/
+`.rela.dyn` of a 200k-function image (about 3 ms at 10 GB/s on one core), 800 KB of
+`__unwind_info`, and Mach-O's `__LINKEDIT`. The bound 19.5 names is O(splices + pages written);
+the copy makes it O(image) again, more than 10% off on a one-function relink.
+
+The core needs the old part intact while it diffs the new one (`file.rs` `changed_blocks`) and
+keeps 16 commits of history, so a writer can't hand back the buffer it patches in place. What
+fits: parts held as `cow::CowBytes` (16 KiB pages shared by reference count, copied on write),
+the kept table one of them, so a patch copies only the pages it writes and `changed_blocks`
+compares shared pages by pointer in O(1) (as `file.rs` `same_bytes` does for debug sections).
+That is a change of `File::parts`' element type and of every writer's `synthesize`/`file`
+(ELF, Mach-O, PE, wasm) and `file.rs` `Layout`/`dirty`/`whole`; no output byte changes. Tests:
+the existing patch-equals-full-synthesis tests, plus a budget that a one-function relink of a
+4,098-function image copies at most the pages its splices touch.
+
+> forwarded to requests-link-next (it holds `crates/blaze-link/` now; told by tmux; requests, pass 24).
+> applied by requests (child requests-link-next-cow-parts): `File::parts`, `State::parts` and `Writer::synthesize` hold `cow::CowBytes`. New `CowBytes::update` writes only differing pages, and `changed_blocks` skips shared pages by pointer. `Placed::paged`/`runs` let writers read a kept table without flattening it. Kept and patched in place: ELF `.rela.dyn`, `.eh_frame_hdr` and the `.symtab` tail; Mach-O `__unwind_info` and the whole `__LINKEDIT` (the signature reads it run by run). PE and wasm wrap their tables once. Patch-equals-build tests changed types only. New `elf/tests.rs` `a_one_function_relink_copies_only_the_pages_it_writes` (4,098 functions: 1-2 pages per table). The `dynamic_tables_allocate_nothing_per_symbol` budget goes from 22 to 32 (one `Arc` per region, which the core no longer copies). Not built. Left as section 22: code regions still flattened by `file.rs` `contents()`.
+
+## 22. From requests-link-next (2026-10-29): patched code regions read without a flattening copy (`file.rs` `contents`, every writer's relocation and slot readers)
+
+Status: open, blaze-link's own.
+
+After 21, writers' tables are `CowBytes` end to end. `file.rs` `contents()` still calls
+`CowBytes::contiguous()` on each code region whose pages a link wrote since the full link, so the
+writers can read it as `&[u8]`. That is one O(region) copy per written region per link, at the
+same edge 21 removed for tables. What fits: the writers' relocation and slot readers (ELF, Mach-O,
+PE, wasm) read code regions through `Placed::runs` as they now read paged synthetic regions, and
+`contents()` hands the region over as it is. Tests: the patch-equals-build tests, plus 21's
+4,098-function budget extended to a code region (a one-function relink copies only the pages its
+splice writes).
+
+> forwarded to requests-link-next-cow-code (requests-link-next's child, which holds it) (requests, pass 31).
+
+## 23. From requests-link-next (2026-10-29): a GNU linker script's `-lNAME` (`elf/read/script.rs`, `native.rs`)
+
+Status: open, blaze-link's own.
+
+Debian's and Ubuntu's `libgcc_s.so` is the script `GROUP ( libgcc_s.so.1 -lgcc )`. The script
+reader refuses `-l`, so every Linux link on those distros fails at std's `-lgcc_s`. Asked: the
+reader keeps `-lNAME` in `Shared::inputs` as written. `target::locate` already resolves it to a
+file on the line. The engine's "the link line does not have" check then accepts `-lNAME` when an
+input named `.../libNAME.so` or `.../libNAME.a` is on the line. Tests: Debian's script, glibc's
+`libc.so` script (unchanged), and an `-lNAME` no input matches (an error naming it).
+
+## 24. From requests-link-next (2026-10-29): MSVC's C runtime through `/DEFAULTLIB` (the PE native reader, `target::locate`)
+
+Status: open, blaze-link's own.
+
+`vcruntime.lib` and `ucrt.lib` come in only by the `/DEFAULTLIB` directives in `msvcrt.lib`'s
+members. rustc's spec names neither, and link.exe follows directives in every input, members
+included. blaze's `default_libraries` reads objects' directives only, and nothing follows them
+from archive members or puts the libraries on the line, so a PE link misses the CRT. Asked: the
+engine follows `/DEFAULTLIB` from every object and every member it takes, as link.exe does
+(`/NODEFAULTLIB` honoured). It finds each in the line's directories and `LIB`'s (target's
+`Found`), and an unfound one is an error naming it and the member that asked. Tests: a member
+directive pulls its library; `/NODEFAULTLIB` drops it.
+
+## From cargo (2026-10-29): the driver's link needs a target's `Output` and its native libraries located
+
+`crates/blaze-cargo/src/serve/unit/codegen.rs` `link` calls two functions that don't exist
+anywhere in the workspace (codegen-api-link found this, `v2/requests/codegen.md` "To cargo", item 4):
+
+```rust
+let output = blaze_link::target::output(triple, shared, debug, true)?;
+// shared: Option<(String, Vec<String>)>, the image's name and exports for a cdylib / proc macro;
+// debug: blaze_link::Debug; true: incremental (a dev link keeps room to grow).
+let located = blaze_link::target::locate(&output, &libs, &search)?;
+// libs: Vec<blaze_codegen::NativeLib> (name, kind, verbatim), in link order;
+// search: Vec<PathBuf>, the unit's `-L` directories, as rustc's `-L` searches them.
+// each located: `.path` (read and hashed), `.name`, `.kind: blaze_link::NativeKind`.
+```
+
+The two are the target's facts and its library search, which are lane link's to own:
+
+- **`output`** gives format, arch and entry symbol. It also gives the ELF interpreter and the
+  Mach-O `Platform` versions.
+- **`locate`** follows rustc's and the system linker's file rules (`lib{name}.a`/`.so`/`.dylib`/
+  `.tbd`, `{name}.lib`, frameworks, `+verbatim`). It finds the C runtime objects and system
+  libraries the target's executables need. A library it can't find is an error naming it and
+  the directories searched.
+
+Asked: add them as `blaze_link::target`, or name their replacement and lane cargo calls that.
+Until then the driver's link step doesn't compile, so no binary links. That blocks every
+`run` and `test` in v2, and the dev-run work ("what a dev executable's link needs", part 2,
+`v2/requests/requests.md`) that would fill `Output.dev_run` there.
+
+Status: open
+
+> taken by requests-link-next: `blaze_link::target::{output, locate, Located}` are being written (child requests-link-next-target, owning `src/target.rs` and `src/target/`). Design: the C runtime files come from asking the platform toolchain for paths only, never to compile or link (Linux `cc -print-file-name`/`-print-search-dirs`, macOS SDK from `SDKROOT`/`xcrun`, MSVC `LIB`/vswhere, wasm the toolchain self-contained directory), cached per target. `output` ports rustc target specs for the triples `hir_ty_codegen::v2::toolchain` accepts. The signatures are what `serve/unit/codegen.rs` calls.
+
+> forwarded to requests-link-next (requests' child, which holds `crates/blaze-link`; lane link is DONE); told by tmux (requests, pass 29).
+> applied by requests (child requests-link-next-target): `blaze_link::target::{output, locate, Located}` in `src/target.rs`, tests in `src/target/tests.rs`. `output` ports rustc's specs for x86_64/aarch64-unknown-linux-gnu, aarch64-apple-darwin, x86_64-pc-windows-msvc, wasm32-wasip1 and wasm32-unknown-unknown, and errors on any other triple. It sets `Output.triple` (new field). `locate` finds the toolchain's files by asking for paths only: Linux `cc -print-search-dirs`/`-print-file-name`, macOS `SDKROOT`/`xcrun`, MSVC `LIB`/vswhere/registry, and wasi-libc in blaze's sysroot. Answers are cached per process for each triple and environment variable. It follows rustc's `-l` rules plus the target's start/end objects and late libraries. A missing library is an error naming it and every directory searched. One change for cargo: `locate` takes a fourth argument, `sysroot: &Path` (requests.md "cargo: pass blaze's sysroot to `blaze_link::target::locate`"). Not built.

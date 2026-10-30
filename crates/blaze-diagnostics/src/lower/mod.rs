@@ -46,10 +46,12 @@ pub(crate) mod cannot_index_into;
 pub(crate) mod cast_to_unsized;
 pub(crate) mod closure_kind_mismatch;
 pub(crate) mod duplicate_field;
+pub(crate) mod edition_dependent_method_call;
 pub(crate) mod expected_array_or_slice_pat;
 pub(crate) mod expected_function;
 pub(crate) mod explicit_drop_method_use;
 pub(crate) mod fru_in_destructuring_assignment;
+pub(crate) mod fully_qualified_call_from_2018;
 pub(crate) mod functional_record_update_on_non_struct;
 pub(crate) mod invalid_cast;
 pub(crate) mod invalid_lhs_of_assignment;
@@ -66,6 +68,8 @@ pub(crate) mod non_exhaustive_record_expr;
 pub(crate) mod non_exhaustive_record_pat;
 pub(crate) mod private_assoc_item;
 pub(crate) mod private_field;
+pub(crate) mod obligation_cause;
+pub(crate) mod trait_solver_error;
 pub(crate) mod type_mismatch;
 pub(crate) mod type_must_be_known;
 pub(crate) mod typed_hole;
@@ -78,6 +82,7 @@ pub(crate) mod unresolved_assoc_item;
 pub(crate) mod unresolved_field;
 pub(crate) mod unresolved_ident;
 pub(crate) mod unresolved_method_call;
+pub(crate) mod unresolved_path;
 
 pub(crate) mod await_outside_of_async;
 pub(crate) mod borrowck_error;
@@ -85,9 +90,13 @@ pub(crate) mod borrowck_skipped;
 pub(crate) mod break_outside_of_loop;
 pub(crate) mod const_check_error;
 pub(crate) mod const_impure;
+pub(crate) mod const_pattern_refused;
+pub(crate) mod empty_range_pattern;
 pub(crate) mod missing_match_arms;
 pub(crate) mod missing_unsafe;
+pub(crate) mod mixed_deref_patterns;
 pub(crate) mod non_exhaustive_let;
+pub(crate) mod pattern_complexity_limit;
 pub(crate) mod return_outside_function;
 pub(crate) mod undeclared_label;
 pub(crate) mod unreachable_label;
@@ -112,8 +121,8 @@ pub enum Phase {
     /// Name resolution's errors at the end of `resolve_crate`, the feature gates and the
     /// early lints.
     Resolve,
-    /// Lowering the AST to HIR (`rustc_ast_lowering`: E0728 `await` outside `async`, E0267
-    /// and E0268 `break` outside a loop, E0426 an undeclared label, E0767).
+    /// Lowering the AST to HIR (`rustc_ast_lowering`: E0728 `await` outside `async`, `yield`
+    /// outside a `#[coroutine]` closure).
     Lower,
     /// The checks of items (`rustc_hir_analysis`: collect, coherence, well-formedness).
     Items,
@@ -198,12 +207,14 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::CastToUnsized(d) => cast_to_unsized::lower(cx, &d),
         AnyDiagnostic::ClosureKindMismatch(d) => closure_kind_mismatch::lower(cx, &d),
         AnyDiagnostic::DuplicateField(d) => duplicate_field::lower(cx, &d),
+        AnyDiagnostic::EditionDependentMethodCall(d) => edition_dependent_method_call::lower(cx, &d),
         AnyDiagnostic::ExpectedArrayOrSlicePat(d) => expected_array_or_slice_pat::lower(cx, &d),
         AnyDiagnostic::ExpectedFunction(d) => expected_function::lower(cx, &d),
         AnyDiagnostic::ExplicitDropMethodUse(d) => explicit_drop_method_use::lower(cx, &d),
         AnyDiagnostic::FruInDestructuringAssignment(d) => {
             fru_in_destructuring_assignment::lower(cx, &d)
         }
+        AnyDiagnostic::FullyQualifiedCallFrom2018(d) => fully_qualified_call_from_2018::lower(cx, &d),
         AnyDiagnostic::FunctionalRecordUpdateOnNonStruct(d) => {
             functional_record_update_on_non_struct::lower(cx, &d)
         }
@@ -228,6 +239,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::PrivateField(d) => private_field::lower(cx, &d),
         AnyDiagnostic::TypeMismatch(d) => type_mismatch::lower(cx, &d),
         AnyDiagnostic::TypeMustBeKnown(d) => type_must_be_known::lower(cx, &d),
+        AnyDiagnostic::TraitSolverError(d) => trait_solver_error::lower(cx, &d),
         AnyDiagnostic::TypedHole(d) => typed_hole::lower(cx, &d),
         AnyDiagnostic::UnaryOperatorCannotBeApplied(d) => {
             unary_operator_cannot_be_applied::lower(cx, &d)
@@ -244,6 +256,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::UnresolvedField(d) => unresolved_field::lower(cx, &d),
         AnyDiagnostic::UnresolvedIdent(d) => unresolved_ident::lower(cx, &d),
         AnyDiagnostic::UnresolvedMethodCall(d) => unresolved_method_call::lower(cx, &d),
+        AnyDiagnostic::UnresolvedPath(d) => unresolved_path::lower(cx, &d),
 
         AnyDiagnostic::AwaitOutsideOfAsync(d) => await_outside_of_async::lower(cx, &d),
         AnyDiagnostic::BorrowckError(d) => borrowck_error::lower(cx, &d),
@@ -251,9 +264,13 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::BreakOutsideOfLoop(d) => break_outside_of_loop::lower(cx, &d),
         AnyDiagnostic::ConstCheckError(d) => const_check_error::lower(cx, &d),
         AnyDiagnostic::ConstImpure(d) => const_impure::lower(cx, &d),
+        AnyDiagnostic::ConstPatternRefused(d) => const_pattern_refused::lower(cx, &d),
+        AnyDiagnostic::EmptyRangePattern(d) => empty_range_pattern::lower(cx, &d),
         AnyDiagnostic::MissingMatchArms(d) => missing_match_arms::lower(cx, &d),
         AnyDiagnostic::MissingUnsafe(d) => missing_unsafe::lower(cx, &d),
+        AnyDiagnostic::MixedDerefPatterns(d) => mixed_deref_patterns::lower(cx, &d),
         AnyDiagnostic::NonExhaustiveLet(d) => non_exhaustive_let::lower(cx, &d),
+        AnyDiagnostic::PatternComplexityLimit(d) => pattern_complexity_limit::lower(cx, &d),
         AnyDiagnostic::ReturnOutsideFunction(d) => return_outside_function::lower(cx, &d),
         AnyDiagnostic::UndeclaredLabel(d) => undeclared_label::lower(cx, &d),
         AnyDiagnostic::UnreachableLabel(d) => unreachable_label::lower(cx, &d),
@@ -265,6 +282,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: AnyDiagnostic<'db>) -> Vec<Found> 
         AnyDiagnostic::InactiveCode(_)
         | AnyDiagnostic::RemoveTrailingReturn(_)
         | AnyDiagnostic::RemoveUnnecessaryElse(_)
+        // alloc: empty, allocates nothing
         | AnyDiagnostic::ReplaceFilterMapNextWithFindMap(_) => Vec::new(),
     }
 }

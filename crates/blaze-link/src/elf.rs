@@ -7,6 +7,13 @@
 //! loader writes and then makes read-only: `.data.rel.ro`, the init arrays, `.dynamic`, the
 //! GOT) and writable data with the TLS template and `.bss` last. A region's file offset is
 //! its address, so a region never moves in the file while its address stays.
+//!
+//! A dev executable ([`crate::DevRun`]) adds a `PT_LOAD` after these for each reservation, of
+//! no access and no file bytes, and its start hook's pointer is the first of
+//! `.preinit_array`. The layout above already puts its code on pages of its own, all in the
+//! file and never writable, and binds everything at load (`DF_BIND_NOW`, no lazy PLT): the
+//! writer checks each of these and refuses a dev executable that breaks one
+//! ([`image::file`]).
 
 #![forbid(unsafe_code)]
 
@@ -22,15 +29,16 @@ use std::sync::{Mutex, MutexGuard};
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 
-use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, SectionName, Special, Writer};
-use crate::{Format, LinkError, NativeKind, Output};
+use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer};
+use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
 /// The ELF header and the most program headers an image has: `PT_PHDR`, `PT_INTERP`, four
 /// `PT_LOAD`s, `PT_DYNAMIC`, `PT_GNU_RELRO`, `PT_GNU_EH_FRAME`, `PT_GNU_STACK`, `PT_TLS`,
-/// `PT_NOTE`.
+/// `PT_NOTE`; a dev executable's reservations add one `PT_LOAD` each ([`RESERVES`]).
 const EHDR: u64 = 64;
 const PHDR: u64 = 56;
 const PHDRS: u64 = 12;
+const RESERVES: u64 = 3;
 
 pub(crate) const INTERP: &str = ".interp";
 pub(crate) const BUILD_ID: &str = ".note.gnu.build-id";
@@ -43,7 +51,8 @@ pub(crate) const RELA_DYN: &str = ".rela.dyn";
 pub(crate) const DYNAMIC: &str = ".dynamic";
 pub(crate) const EH_FRAME_HDR: &str = ".eh_frame_hdr";
 
-/// The `Class::Named` section the loader reads before the program starts, so relro.
+/// [`Class::PreinitArray`]'s section: input sections of this name join a dev run's start
+/// hook there, so `DT_PREINIT_ARRAY` names one array.
 const PREINIT_ARRAY: &str = ".preinit_array";
 
 pub(crate) fn writer(output: &Output) -> Result<Elf, LinkError> {
@@ -82,6 +91,8 @@ pub(crate) enum Segment {
     Code,
     Relro,
     Write,
+    /// A dev run's reservation, one `PT_LOAD` each, after every other segment.
+    Reserve(Reserve),
 }
 
 impl Segment {
@@ -90,7 +101,7 @@ impl Segment {
             Class::Synthetic(DYNAMIC) => Segment::Relro,
             Class::Synthetic(_) | Class::Rodata | Class::EhFrame => Segment::Read,
             Class::Text | Class::Patch | Class::Stubs | Class::Plt | Class::Veneers => Segment::Code,
-            Class::RelRo | Class::InitArray | Class::FiniArray | Class::Got => Segment::Relro,
+            Class::RelRo | Class::PreinitArray | Class::InitArray | Class::FiniArray | Class::Got => Segment::Relro,
             Class::Table
             | Class::Data
             | Class::PatchData
@@ -98,12 +109,23 @@ impl Segment {
             | Class::Tdata
             | Class::Tbss
             | Class::Bss => Segment::Write,
-            Class::Named { name, write, exec } => match (name.as_str(), *write, *exec) {
-                (PREINIT_ARRAY, _, _) => Segment::Relro,
-                (_, _, true) => Segment::Code,
-                (_, true, false) => Segment::Write,
-                (_, false, false) => Segment::Read,
+            Class::Reserve(reserve) => Segment::Reserve(*reserve),
+            Class::Named { write, exec, .. } => match (*write, *exec) {
+                (_, true) => Segment::Code,
+                (true, false) => Segment::Write,
+                (false, false) => Segment::Read,
             },
+        }
+    }
+
+    /// Its place in address order, as a radix key.
+    fn rank(self) -> u32 {
+        match self {
+            Segment::Read => 0,
+            Segment::Code => 1,
+            Segment::Relro => 2,
+            Segment::Write => 3,
+            Segment::Reserve(reserve) => 4 + reserve as u32,
         }
     }
 
@@ -116,6 +138,7 @@ impl Segment {
             Segment::Read => R,
             Segment::Code => R | X,
             Segment::Relro | Segment::Write => R | W,
+            Segment::Reserve(_) => 0,
         }
     }
 
@@ -126,9 +149,9 @@ impl Segment {
 }
 
 /// Whether a region's bytes are in the file: everything but the zeroed tail of the writable
-/// segment.
+/// segment and the reservations.
 pub(crate) fn in_file(class: &Class) -> bool {
-    !matches!(class, Class::Tbss | Class::Bss)
+    !matches!(class, Class::Tbss | Class::Bss | Class::Reserve(_))
 }
 
 /// A class's place in the address space: its segment, its rank in it, then its name.
@@ -159,7 +182,7 @@ fn order_key(class: &Class) -> (Segment, u32, &str) {
         (Segment::Code, _) => 1,
 
         (Segment::Relro, Class::RelRo) => 0,
-        (Segment::Relro, Class::Named { .. }) => 1,
+        (Segment::Relro, Class::PreinitArray) => 1,
         (Segment::Relro, Class::InitArray) => 2,
         (Segment::Relro, Class::FiniArray) => 3,
         (Segment::Relro, Class::Synthetic(_)) => 4,
@@ -174,6 +197,8 @@ fn order_key(class: &Class) -> (Segment, u32, &str) {
         (Segment::Write, Class::Tbss) => 5,
         (Segment::Write, Class::Bss) => 6,
         (Segment::Write, _) => 2,
+
+        (Segment::Reserve(_), _) => 0,
     };
     let name = match class {
         Class::Named { name, .. } => name.as_str(),
@@ -215,7 +240,7 @@ pub(crate) fn section(name: &str, write: bool, exec: bool, tls: bool) -> Result<
     } else if under(".dtors") {
         (Class::FiniArray, priority(".dtors", true))
     } else if under(PREINIT_ARRAY) {
-        (Class::Named { name: PREINIT_ARRAY.into(), write: true, exec: false }, 0)
+        (Class::PreinitArray, 0)
     } else if under(".data.rel.ro") {
         (Class::RelRo, 0)
     } else if (under(".rodata") || under(".gcc_except_table")) && !write && !exec {
@@ -248,7 +273,7 @@ fn end(regions: &[Region], matches: impl Fn(&Class) -> bool) -> Option<u64> {
 }
 
 fn preinit(class: &Class) -> bool {
-    matches!(class, Class::Named { name, .. } if name == PREINIT_ARRAY)
+    *class == Class::PreinitArray
 }
 
 /// lld defines the bounds of an absent array at the image's start (address 0: `Plan::base`).
@@ -288,8 +313,9 @@ fn tls_start(regions: &[Region]) -> u64 {
 fn edata(regions: &[Region]) -> u64 {
     end(regions, in_file).unwrap_or(0)
 }
+/// The end of the image's own memory: a dev run's reservations are not its.
 fn image_end(regions: &[Region]) -> u64 {
-    end(regions, |_| true).unwrap_or(0)
+    end(regions, |it| !matches!(it, Class::Reserve(_))).unwrap_or(0)
 }
 fn bss_start(regions: &[Region]) -> u64 {
     start(regions, |it| *it == Class::Bss).unwrap_or_else(|| edata(regions))
@@ -310,7 +336,7 @@ impl Writer for Elf {
     fn plan(&self) -> Plan {
         Plan {
             base: 0,
-            headers: EHDR + PHDR * PHDRS,
+            headers: EHDR + PHDR * self.phdrs(),
             page: self.page(),
             indexed_code: false,
             got_by_library: false,
@@ -321,7 +347,7 @@ impl Writer for Elf {
     fn order(&self, classes: &mut Vec<Class>) {
         let rank = |class: &Class| {
             let (segment, rank, _) = order_key(class);
-            radix::pack_32(segment as u32, rank)
+            radix::pack_32(segment.rank(), rank)
         };
         radix::sort_by_key(classes, rank);
         for run in classes.chunk_by_mut(|a, b| rank(a) == rank(b)) {
@@ -336,11 +362,24 @@ impl Writer for Elf {
             Segment::Read | Segment::Relro => Prot::R,
             Segment::Code => Prot::RX,
             Segment::Write => Prot::RW,
+            Segment::Reserve(_) => Prot::NONE,
         }
     }
 
     fn section(&self, name: &str, write: bool, exec: bool, tls: bool) -> Result<(Class, u32), String> {
         section(name, write, exec, tls)
+    }
+
+    /// The first entry of `.preinit_array`: the loader calls it once every object is relocated
+    /// and before any initializer of the executable or of a shared library. A shared library's
+    /// `.preinit_array` is never called, so it has none.
+    fn start_hook(&self) -> Result<(Class, u32), String> {
+        match self.output.kind {
+            OutputKind::Executable { .. } => Ok((Class::PreinitArray, 0)),
+            OutputKind::Shared { .. } => {
+                Err("a shared library has no start hook: the loader calls only an executable's .preinit_array".into())
+            }
+        }
     }
 
     fn special(&self, name: &str) -> Option<Special> {
@@ -385,7 +424,7 @@ impl Writer for Elf {
         native::apply(self.output.arch, r_type, bytes, p, s, addend)
     }
 
-    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, crate::cow::CowBytes)>, LinkError> {
         Ok(dynamic::Tables::of(self, placed)?.regions(&self.output))
     }
 
@@ -410,6 +449,12 @@ impl Elf {
                 last
             }
         })
+    }
+
+    /// The program headers the headers have room for: a dev executable's reservations add
+    /// theirs, so every other image keeps the layout it had.
+    pub(crate) fn phdrs(&self) -> u64 {
+        PHDRS + if self.output.dev_run.is_some() { RESERVES } else { 0 }
     }
 
     /// lld's maximum page size: what a `PT_LOAD` is aligned to.

@@ -52,6 +52,7 @@ crate's layout, which is what inference must use.)
 
 > forwarded to db.
 > forwarded to db: `hir-ty/src/infer/` is its (told by tmux).
+> applied by db (db-next2, 2026-10-29 22:28): as asked, `infer/pat.rs` `check_array_pat_len`: `len.try_to_value().and_then(|it| it.try_to_target_usize(data_layout))` with the crate's layout (`interner.data_layout()`, which panics rather than defaulting). The interner form the file had read `target_data_layout_or_default`, a fallback: its last caller, `next_solver/consts/valtree.rs:333`, is asked of solver-sync (`v2/requests/solver-sync.md`). Not compiled.
 
 ## 3. `crates/hir-ty/src/layout.rs:1101`: `ValueConst::new` takes a `ValTree`
 
@@ -85,6 +86,7 @@ instead, so no `expect` is needed:
 
 > forwarded to db (`lower.rs`, `infer/persist.rs`); the `interner.rs` site is solver-sync-interner's (told by solver-sync-kinds).
 > forwarded to db (`lower.rs`, `infer/persist.rs`) and solver-sync (`next_solver/interner.rs`); db told by tmux.
+> checked by db (db-next2, 22:28): in the tree. `lower.rs:4120` is `FnSigKind::new(.., data.splatted, data.params.len())` (the `#[splat]` index is lowered now), the others are `FnSigKind::dummy()`/setters; `infer/persist.rs` stores and checks the index (see solver-sync-predicate 2). No three-argument `FnSigKind::new` is left in db's files.
 
 ## 5. `StoredEarlyBinder::bind` takes the interner and makes aliases non-rigid
 
@@ -107,6 +109,7 @@ So `bind` does the fold itself: no producer (`opaques.rs` included) calls
 bound type is foldable (listed there).
 
 > forwarded to db and codegen (the call sites: section 8).
+> checked by db (db-next2, 22:28): every `StoredEarlyBinder::bind` in db's files (hir-ty but next_solver and items' `opaques.rs`, hir, borrowck, wfcheck) takes the interner. Items' `opaques.rs:159,200,230` still call it with one argument: items'.
 
 ## 6. `BoundVarReplacerDelegate` is generic over the interner
 
@@ -135,6 +138,7 @@ outside `next_solver/{ty,fold}.rs` finds them.
 
 > forwarded to db (`lower.rs:3138`, `infer/unify.rs:792`, `:875`) and solver-sync (`next_solver/infer/canonical/instantiate.rs:171`); none in `requests`' paths.
 > forwarded to each implementor's owner (db and solver-sync; none in `hir-ide`, `ide-db` or `test-fixture`).
+> checked by db (db-next2, 22:28): `lower.rs:3492`, `infer/unify.rs:846`, `:945` are `fn fold_predicate<P: PredicateProxy<DbInterner<'db>>>(&mut self, p: P) -> P`. No `visit_predicate` override in db's files.
 
 ## 8. Every `StoredEarlyBinder::bind` call site (added 2026-10-29 19:30)
 
@@ -215,3 +219,4 @@ Every type bound here is `TypeFoldable`/`TypeVisitable`: `StoredTy`, `StoredGene
 TypeFoldable)]`); the `(TypeAliasId, StoredGenericArgs)` pair goes through `bind_assoc_ty`.
 
 > forwarded to db (`crates/hir-ty` outside `next_solver/`) and codegen (`crates/hir-ty-mir`), as it says.
+> checked by db (db-next2, 2026-10-29 22:31): a scan of every `StoredEarlyBinder::bind(` in hir-ty, hir, borrowck and hir-ty-mir, multi-line calls included, finds one-argument calls only in items' `opaques.rs:159,200,221,230` (asked in `v2/requests/items.md`) and codegen's `hir-ty-mir/src/mir/lower.rs:4652` (asked in `v2/requests/codegen.md`). db's sites are all ported.

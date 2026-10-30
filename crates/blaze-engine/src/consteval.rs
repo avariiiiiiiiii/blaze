@@ -57,8 +57,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         num_worker_threads: 1,
         proc_macro_processes: 1,
     };
-    let (mut db, vfs, _) =
-        load_cargo::load_workspace_at(&dir, &cargo_config, &load_config, &|_| ())?;
+    let (mut db, vfs, _) = load_cargo::load_workspace_at(&dir, &cargo_config, &load_config)?;
     let file = [root.clone(), dunce::canonicalize(&root)?]
         .into_iter()
         .find_map(|it| vfs.file_id(&VfsPath::from(AbsPathBuf::assert_utf8(it))))

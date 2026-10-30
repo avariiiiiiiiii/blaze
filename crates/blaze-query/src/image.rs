@@ -24,7 +24,7 @@
 //! but are not what [`write`] writes (a table slot past the memos, edges past the edge section)
 //! are a bug in [`write`], and stop the database naming it.
 
-use std::{ops::Range, sync::Arc};
+use std::{borrow::Cow, ops::Range, sync::Arc};
 
 use blaze_core::Mapping;
 use blaze_format::{SchemaHash, schema};
@@ -52,8 +52,9 @@ pub(crate) const EDGES: SchemaHash =
 pub(crate) const TABLE: SchemaHash =
     schema("blaze v2 db table 2: u64 1 + a key's first memo or 0; a power of two, probed linearly");
 pub(crate) const INPUTS: SchemaHash = schema(
-    "blaze v2 db inputs 2: input(kind u16, pad 6, input 32, what u8, pad 7, path at u64 in blob, \
-     path len u64) 64; sorted by key",
+    "blaze v2 db inputs 3: input(kind u16, pad 6, input 32, what u8 (0 file, 1 dir, 2 config, \
+     3 file at, 4 dir at), pad 7, path at u64 in blob, path len u64) 64; sorted by key; a file \
+     at's or dir at's path is its root's 32 bytes, then the path",
 );
 pub(crate) const BLOB: SchemaHash =
     schema("blaze v2 db blob 2: values at 16-byte boundaries, keys' bytes, paths");
@@ -88,11 +89,20 @@ fn put_u64(record: &mut [u8], at: usize, word: u64) {
     record[at..at + 8].copy_from_slice(&word.to_le_bytes());
 }
 
-fn path_of(input: &Input) -> (u8, &str) {
+fn path_of(input: &Input) -> (u8, Cow<'_, [u8]>) {
+    let at = |root: &ContentId, path: &str| {
+        // alloc: once per root input per image.
+        let mut bytes = Vec::with_capacity(32 + path.len());
+        bytes.extend_from_slice(&root.0);
+        bytes.extend_from_slice(path.as_bytes());
+        Cow::Owned(bytes)
+    };
     match input {
-        Input::File(path) => (0, path.as_str()),
-        Input::Dir(path) => (1, path.as_str()),
-        Input::Config => (2, ""),
+        Input::File(path) => (0, Cow::Borrowed(path.as_bytes())),
+        Input::Dir(path) => (1, Cow::Borrowed(path.as_bytes())),
+        Input::Config => (2, Cow::Borrowed(&b""[..])),
+        Input::FileAt { root, path } => (3, at(root, path)),
+        Input::DirAt { root, path } => (4, at(root, path)),
     }
 }
 
@@ -120,7 +130,7 @@ pub(crate) fn write(
     // alloc: once per image, as are the lists below.
     let mut values: Vec<Placed> = Vec::with_capacity(all.memos.len());
     let mut keys: Vec<(u64, u64)> = Vec::with_capacity(all.keys.len());
-    let mut paths: Vec<u64> = Vec::with_capacity(inputs.len());
+    let mut paths: Vec<(u8, u64, u64)> = Vec::with_capacity(inputs.len());
     {
         let mut blob = builder.section(SectionId::DB_BLOB, BLOB);
         for entry in &all.keys {
@@ -137,7 +147,8 @@ pub(crate) fn write(
             }
         }
         for (_, input) in inputs {
-            paths.push(blob.bytes(path_of(input).1.as_bytes()));
+            let (what, path) = path_of(input);
+            paths.push((what, blob.bytes(&path), path.len() as u64));
         }
     }
 
@@ -196,13 +207,12 @@ pub(crate) fn write(
     }
 
     let mut out = builder.section(SectionId::DB_INPUTS, INPUTS);
-    for ((key, input), &path_at) in inputs.iter().zip(&paths) {
-        let (what, path) = path_of(input);
+    for ((key, _), &(what, path_at, path_len)) in inputs.iter().zip(&paths) {
         let mut record = [0u8; INPUT_RECORD];
         put_key(&mut record, key);
         record[40] = what;
         put_u64(&mut record, 48, path_at);
-        put_u64(&mut record, 56, path.len() as u64);
+        put_u64(&mut record, 56, path_len);
         out.bytes(&record);
     }
 }
@@ -435,14 +445,21 @@ impl ImageMap {
             let record = self.read(&self.inputs, (index * INPUT_RECORD) as u64, INPUT_RECORD as u64)?;
             let key = key_at(record, 0);
             let path = self.read(&self.blob, u64_at(record, 48), u64_at(record, 56))?;
+            let (root, path) = match record[40] {
+                3 | 4 if path.len() >= 32 => (Some(id_at(path, 0)), &path[32..]),
+                3 | 4 => panic!("the daemon image's input {index} has no root before its path: a bug in its writer"),
+                _ => (None, path),
+            };
             let path = std::str::from_utf8(path).unwrap_or_else(|_| {
                 panic!("the daemon image's input {index} has a path that is not UTF-8: a bug in its writer")
             });
-            let input = match (record[40], key.kind) {
-                (0, kinds::FILE) => Input::File(path.to_owned()), // alloc: see above
-                (1, kinds::DIR) => Input::Dir(path.to_owned()),   // alloc: see above
-                (2, kinds::CONFIG) => Input::Config,
-                (what, kind) => panic!(
+            let input = match (record[40], key.kind, root) {
+                (0, kinds::FILE, _) => Input::File(path.to_owned()), // alloc: see above
+                (1, kinds::DIR, _) => Input::Dir(path.to_owned()),   // alloc: see above
+                (2, kinds::CONFIG, _) => Input::Config,
+                (3, kinds::FILE_AT, Some(root)) => Input::FileAt { root, path: path.to_owned() }, // alloc: see above
+                (4, kinds::DIR_AT, Some(root)) => Input::DirAt { root, path: path.to_owned() },   // alloc: see above
+                (what, kind, _) => panic!(
                     "the daemon image's input {index} is a {what} of kind {}: a bug in its writer",
                     kind.0
                 ),

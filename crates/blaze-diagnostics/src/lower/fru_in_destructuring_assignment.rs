@@ -15,8 +15,8 @@ use crate::{
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::FruInDestructuringAssignment) -> Vec<Found> {
     let span = cx.span_of_ptr(d.node);
     let message = "functional record updates are not allowed in destructuring assignments";
-    let mut diag = Diag::error(None, message, span.clone());
+    let mut diag = Diag::error(None, message, span.clone()); // clone: the error's span
     diag.suggestion(span, "consider removing the trailing pattern", "", Applicability::MachineApplicable);
     code_fact(cx, &mut diag, d.node.map(|it| it.syntax_node_ptr()));
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Resolve)] // alloc: the error found
 }

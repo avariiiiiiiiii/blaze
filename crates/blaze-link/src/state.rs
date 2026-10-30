@@ -124,7 +124,8 @@ pub(crate) enum What {
     /// A Mach-O TLV descriptor of a thread-local static.
     Tlv,
     /// The jump table's generation cell and stubs, the live descriptor and its directory:
-    /// made once per full link.
+    /// made once per full link. Also the SanitizerCoverage pieces (`SymKey::Coverage`,
+    /// `SymKey::CoveragePcs`), made per function.
     Fixed,
     /// The jump table's cells: no fixups. Entry `slot` holds the address of
     /// [`State::cell`] of it.
@@ -194,6 +195,8 @@ const _: () = assert!(size_of::<Lists>() == 36);
 const _: () = assert!(size_of::<Loader>() == 24);
 const _: () = assert!(size_of::<SymCold>() == 24);
 const _: () = assert!(size_of::<FunctionInfo>() <= 88);
+
+crate::cow::chunked!(Lists, Loader, SymCold, IdCold);
 
 /// A piece to add: [`State::add`] copies its lists into the arenas.
 #[derive(Clone, Copy, Debug)]
@@ -357,7 +360,10 @@ pub(crate) struct State {
     pub capacity: u32,
     pub tls: Option<Tls>,
     pub file_len: u64,
-    pub parts: Arc<Vec<(u64, Vec<u8>)>>,
+    /// The writer's parts ([`crate::model::File::parts`]): a kept table's pages are shared
+    /// with the writer and the states before, so this state's copy stays as it was when the
+    /// writer patches the next.
+    pub parts: Arc<Vec<(u64, CowBytes)>>,
     /// The debug sections in the file ([`crate::model::File::debug`]): (file offset, index into
     /// [`crate::write::Lists::debug`]).
     pub debug: Arc<Vec<(u64, usize)>>,
@@ -995,9 +1001,10 @@ impl State {
     }
 }
 
-/// Whether a class's regions are zeroed at load rather than read from the file.
+/// Whether a class's regions have no bytes in the file: zeroed at load, or a dev run's
+/// reservation ([`crate::model::reserved`]).
 pub(crate) fn zeroed(class: &Class) -> bool {
-    matches!(class, Class::Bss | Class::Tbss)
+    matches!(class, Class::Bss | Class::Tbss | Class::Reserve(_))
 }
 
 /// Whether a format reaches functions by address through stubs (not wasm's indexes).

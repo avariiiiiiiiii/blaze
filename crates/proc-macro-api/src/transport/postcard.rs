@@ -2,7 +2,7 @@
 
 use std::io::{self, BufRead, Write};
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{LONGEST, invalid, read_frame};
 
@@ -29,19 +29,85 @@ pub(crate) fn write<W: Write + ?Sized>(out: &mut W, buf: &[u8]) -> io::Result<()
     out.flush()
 }
 
+/// `msg` as one frame of its own: what [`Message::write`](crate::legacy_protocol::msg::Message)
+/// sends. A conversation's frames go through [`encode_into`] instead.
 pub(crate) fn encode<T: Serialize>(msg: &T) -> io::Result<Vec<u8>> {
-    postcard::to_allocvec_cobs(msg).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    // alloc: a message written whole, once per handshake or by a test.
+    let mut frame = Vec::new();
+    encode_into(msg, &mut frame)?;
+    Ok(frame)
+}
+
+/// `msg` as one COBS frame, its terminating zero last, in `frame`, which is cleared first and
+/// keeps its capacity: a connection encodes every frame into the one buffer.
+pub(crate) fn encode_into<T: Serialize + ?Sized>(msg: &T, frame: &mut Vec<u8>) -> io::Result<()> {
+    frame.clear();
+    let cobs = postcard::ser_flavors::Cobs::try_new(Filling(frame))
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    postcard::serialize_with_flavor(msg, cobs).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// A postcard flavor writing into a borrowed buffer, from its start: COBS goes back to fill in
+/// each block's code byte, so it indexes what it wrote.
+struct Filling<'a>(&'a mut Vec<u8>);
+
+impl postcard::ser_flavors::Flavor for Filling<'_> {
+    type Output = ();
+
+    #[inline]
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.0.extend_from_slice(data);
+        Ok(())
+    }
+
+    #[inline]
+    fn try_push(&mut self, data: u8) -> postcard::Result<()> {
+        self.0.push(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::ops::Index<usize> for Filling<'_> {
+    type Output = u8;
+
+    #[inline]
+    fn index(&self, at: usize) -> &u8 {
+        &self.0[at]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Filling<'_> {
+    #[inline]
+    fn index_mut(&mut self, at: usize) -> &mut u8 {
+        &mut self.0[at]
+    }
 }
 
 /// The one message of the frame `buf` ([`read`]'s, its zero last), decoded in place. A frame
 /// with bytes after its message is refused.
 pub(crate) fn decode<T: DeserializeOwned>(buf: &mut [u8]) -> io::Result<T> {
+    let len = unframe(buf)?;
+    parse(&buf[..len])
+}
+
+/// Undoes the COBS encoding of the frame `buf` ([`read`]'s, its zero last) in place, returning
+/// the length of the message's bytes at its start, which [`parse`] reads, as often as it likes.
+pub(crate) fn unframe(buf: &mut [u8]) -> io::Result<usize> {
     let Some((0, frame)) = buf.split_last_mut() else {
         // alloc: error path.
         return Err(invalid("a frame not ending in a zero".to_owned()));
     };
-    let len = unstuff(frame)?;
-    let (msg, rest) = postcard::take_from_bytes::<T>(&frame[..len])
+    unstuff(frame)
+}
+
+/// The one message of `bytes`, an [`unframe`]d frame's, borrowing from them what it can: a
+/// frame with bytes after its message is refused.
+pub(crate) fn parse<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> io::Result<T> {
+    let (msg, rest) = postcard::take_from_bytes::<T>(bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if !rest.is_empty() {
         // alloc: error path, naming the length.
@@ -92,6 +158,16 @@ mod tests {
         for message in messages {
             let mut frame = postcard::to_allocvec_cobs(&message).unwrap();
             assert_eq!(decode::<Vec<u8>>(&mut frame).unwrap(), message);
+        }
+    }
+
+    #[test]
+    fn a_frame_encoded_into_a_reused_buffer_is_postcards_own() {
+        let mut frame = vec![9; 3];
+        for message in [vec![], vec![0; 3], (0..=255).collect::<Vec<u8>>(), vec![7; 600]] {
+            encode_into(&message, &mut frame).unwrap();
+            assert_eq!(frame, postcard::to_allocvec_cobs(&message).unwrap());
+            assert_eq!(decode::<Vec<u8>>(&mut frame.clone()).unwrap(), message);
         }
     }
 

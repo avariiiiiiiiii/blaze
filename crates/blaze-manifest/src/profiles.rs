@@ -7,7 +7,6 @@
 //! What a unit is built for (`UnitFor`) is the unit graph's to compute; this module takes it.
 
 use std::collections::BTreeMap;
-use std::fmt;
 
 use anyhow::{Context as _, bail};
 use cargo_util_schemas::core::PackageIdSpec;
@@ -19,32 +18,26 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
 
 use crate::config::{CompileKind, Config};
+use crate::files::Files;
 use crate::features::{Feature, Features};
-use crate::source::SourceId;
+use crate::manifest::PackageId;
 
-/// A package as a `[profile.*.package.<spec>]` override is matched against it.
-pub trait ProfilePackage: fmt::Display {
-    fn name(&self) -> &str;
-    fn version(&self) -> &semver::Version;
-    fn source_id(&self) -> &SourceId;
-}
-
-fn spec_matches(spec: &PackageIdSpec, pkg: &dyn ProfilePackage) -> bool {
-    if spec.name() != pkg.name() {
+fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
+    if spec.name() != pkg.name {
         return false;
     }
     if let Some(v) = spec.partial_version()
-        && !v.matches(pkg.version())
+        && !v.matches(&pkg.version)
     {
         return false;
     }
     if let Some(u) = spec.url()
-        && *u != pkg.source_id().url
+        && *u != pkg.source_id.url
     {
         return false;
     }
     if let Some(k) = spec.kind()
-        && *k != pkg.source_id().kind
+        && *k != pkg.source_id.kind
     {
         return false;
     }
@@ -66,10 +59,10 @@ impl Profiles {
     /// The profiles of a workspace whose root manifest has `manifest_profiles` and the cargo
     /// features `features`, building with `requested_profile` on a rustc whose host is
     /// `rustc_host`. The warnings of config profiles go to `config`.
-    pub fn new(
+    pub fn new<F: Files>(
         manifest_profiles: Option<&TomlProfiles>,
         features: &Features,
-        config: &Config,
+        config: &Config<F>,
         requested_profile: &str,
         rustc_host: &str,
     ) -> anyhow::Result<Profiles> {
@@ -177,7 +170,7 @@ impl Profiles {
     /// The profile of a unit of `pkg`, as cargo's `Profiles::get_profile`.
     pub fn get_profile(
         &self,
-        pkg: &dyn ProfilePackage,
+        pkg: &PackageId,
         is_member: bool,
         is_local: bool,
         unit_for: UnitFor,
@@ -236,7 +229,7 @@ impl Profiles {
     pub fn validate_packages(
         &self,
         manifest_profiles: Option<&TomlProfiles>,
-        packages: &[&dyn ProfilePackage],
+        packages: &[&PackageId],
         warnings: &mut Vec<String>,
     ) -> anyhow::Result<()> {
         let mut names: Vec<&String> = self.by_name.keys().collect();
@@ -283,7 +276,7 @@ pub fn requested_profile(
     }
 }
 
-fn is_ci(config: &Config) -> bool {
+fn is_ci<F: Files>(config: &Config<F>) -> bool {
     config.env("CI").is_some() || config.env("TF_BUILD").is_some()
 }
 
@@ -318,7 +311,7 @@ struct ProfileMaker {
 impl ProfileMaker {
     fn get_profile(
         &self,
-        pkg: Option<&dyn ProfilePackage>,
+        pkg: Option<&PackageId>,
         is_member: bool,
         is_for_host: bool,
     ) -> Profile {
@@ -339,7 +332,7 @@ impl ProfileMaker {
 }
 
 fn merge_toml_overrides(
-    pkg: Option<&dyn ProfilePackage>,
+    pkg: Option<&PackageId>,
     is_member: bool,
     is_for_host: bool,
     profile: &mut Profile,
@@ -718,10 +711,10 @@ impl UnitFor {
 
 /// The manifest's profiles with the configuration's merged over them, and the profiles only the
 /// configuration defines that the requested one or the built-in ones reach.
-fn merge_config_profiles(
+fn merge_config_profiles<F: Files>(
     manifest_profiles: Option<&TomlProfiles>,
     features: &Features,
-    config: &Config,
+    config: &Config<F>,
     requested_profile: &str,
 ) -> anyhow::Result<BTreeMap<String, TomlProfile>> {
     let mut profiles: BTreeMap<String, TomlProfile> = match manifest_profiles {
@@ -760,9 +753,9 @@ fn merge_config_profiles(
     Ok(profiles)
 }
 
-fn get_config_profile(
+fn get_config_profile<F: Files>(
     features: &Features,
-    config: &Config,
+    config: &Config<F>,
     name: &str,
 ) -> anyhow::Result<Option<TomlProfile>> {
     let Some(profile) = config.config_profile(name)? else { return Ok(None) };
@@ -777,7 +770,7 @@ fn get_config_profile(
 }
 
 fn validate_packages_unique(
-    packages: &[&dyn ProfilePackage],
+    packages: &[&PackageId],
     name: &str,
     toml: Option<&TomlProfile>,
 ) -> anyhow::Result<Vec<PackageIdSpec>> {
@@ -811,7 +804,7 @@ fn validate_packages_unique(
 }
 
 fn validate_packages_unmatched(
-    packages: &[&dyn ProfilePackage],
+    packages: &[&PackageId],
     name: &str,
     toml: &TomlProfile,
     found: &[PackageIdSpec],
@@ -824,12 +817,12 @@ fn validate_packages_unmatched(
             continue;
         }
         let name_matches: Vec<String> =
-            packages.iter().filter(|p| p.name() == spec.name()).map(|p| p.to_string()).collect();
+            packages.iter().filter(|p| p.name == spec.name()).map(|p| p.to_string()).collect();
         if name_matches.is_empty() {
             let suggestion = crate::edit_distance::closest_msg(
                 spec.name(),
                 packages.iter(),
-                |p| p.name(),
+                |p| p.name.as_str(),
                 "package",
             );
             warnings.push(format!(

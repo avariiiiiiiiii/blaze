@@ -164,14 +164,15 @@ pub fn utf8(path: &Path) -> Result<String, String> {
 /// name alone: its value is never shown.
 pub fn env(vars: impl Iterator<Item = (OsString, OsString)>) -> Result<Vec<(String, String)>, String> {
     let mut env = Vec::with_capacity(vars.size_hint().0);
+    let refused = |named: &str| {
+        format!("the environment variable `{named}` is not UTF-8, which a request to the daemon can't carry")
+    };
     for (name, value) in vars {
-        let named = name.to_string_lossy().into_owned();
-        let (Ok(name), Ok(value)) = (name.into_string(), value.into_string()) else {
-            return Err(format!(
-                "the environment variable `{named}` is not UTF-8, which a request to the daemon can't carry"
-            ));
-        };
-        env.push((name, value));
+        match (name.into_string(), value.into_string()) {
+            (Ok(name), Ok(value)) => env.push((name, value)),
+            (Ok(name), Err(_)) => return Err(refused(&name)),
+            (Err(name), _) => return Err(refused(&name.to_string_lossy())),
+        }
     }
     env.sort_unstable();
     Ok(env)
@@ -189,7 +190,9 @@ pub fn color(flag: Option<&str>, var: impl Fn(&str) -> Option<String>, terminal:
         Some("always") => Ok(true),
         Some("never") => Ok(false),
         Some("auto") | None => Ok(auto(&var, terminal)),
-        Some(_) => Err("`CARGO_TERM_COLOR` must be auto, always, or never".to_owned()),
+        // cargo's `ColorChoice::from_str`, of `--color` (which clap took in any case) or
+        // `term.color`.
+        Some(other) => Err(format!("argument for --color must be auto, always, or never, but found `{other}`")),
     }
 }
 
@@ -209,8 +212,51 @@ fn auto(var: &impl Fn(&str) -> Option<String>, terminal: bool) -> bool {
     terminal && (term || clicolor == Some(true) || var("CI").is_some())
 }
 
-/// What the command sends of itself (`Targets::cargo`).
-pub fn cargo(asked: &Invocation, place: &Place, env: Vec<(String, String)>, files: Vec<(String, Vec<u8>)>, color: bool) -> Result<Cargo, String> {
+/// The columns diagnostics are rendered in: cargo's `Shell::err_width().diagnostic_terminal_width()`.
+/// cargo's own test override `__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS` first, then the width of
+/// the terminal stderr is (`columns`, asked only when stderr is a `terminal`), else `None`, which
+/// is rustc's own default. A terminal whose width is unknown is `None` too, as cargo's `NoTty`.
+pub fn width(var: impl Fn(&str) -> Option<String>, terminal: bool, columns: impl FnOnce() -> Option<u16>) -> Result<Option<u32>, String> {
+    const TEST: &str = "__CARGO_TEST_TTY_WIDTH_DO_NOT_USE_THIS";
+    if let Some(width) = var(TEST) {
+        return match width.parse::<u32>() {
+            Ok(width) => Ok(Some(width)),
+            Err(_) => Err(format!("`{TEST}` is `{width}`, which is no number of columns")),
+        };
+    }
+    Ok(terminal.then(columns).flatten().map(u32::from))
+}
+
+/// The columns of the terminal stderr is, as the system says.
+#[cfg(unix)]
+pub fn stderr_columns() -> Option<u16> {
+    crate::raw::system::stderr_columns()
+}
+
+/// The columns of the terminal stderr is: blaze's system calls ask it of Unix's `TIOCGWINSZ`
+/// only, so on Windows rustc renders in its own default width.
+#[cfg(not(unix))]
+pub fn stderr_columns() -> Option<u16> {
+    None
+}
+
+/// cargo's `Verbosity` as a count: how many `-v`, 0 under `-q`.
+pub fn verbose(asked: &Invocation) -> u8 {
+    match asked.flags.quiet {
+        true => 0,
+        false => u8::try_from(asked.flags.verbose).unwrap_or(u8::MAX),
+    }
+}
+
+/// What the command sends of itself (`Targets::cargo`). `width` is [`width`]'s.
+pub fn cargo(
+    asked: &Invocation,
+    place: &Place,
+    env: Vec<(String, String)>,
+    files: Vec<(String, Vec<u8>)>,
+    color: bool,
+    width: Option<u32>,
+) -> Result<Cargo, String> {
     Ok(Cargo {
         command: asked.command().name().to_owned(),
         args: asked.args.clone(),
@@ -219,6 +265,8 @@ pub fn cargo(asked: &Invocation, place: &Place, env: Vec<(String, String)>, file
         env,
         files,
         color,
+        width,
+        verbose: verbose(asked),
     })
 }
 

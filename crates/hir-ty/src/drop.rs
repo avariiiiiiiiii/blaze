@@ -1,12 +1,12 @@
 //! Utilities for computing drop info about types.
 
 use base_db::Db;
+use blaze_mem::Frame;
 use hir_def::{AdtId, ImplId, signatures::StructFlags};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{AdtDef, GenericArgs as _, IntoKind};
 
 use crate::{
-    consteval,
+    FrameSet, consteval, frame_set,
     db::HirDatabase,
     layout::{enum_variant_ids, struct_flags},
     method_resolution::{SelfTyKey, TraitImpls},
@@ -17,7 +17,7 @@ use crate::{
     },
 };
 
-#[salsa::tracked]
+#[salsa::tracked(mem_tag = Infer)]
 pub fn destructor(db: &Db, adt: AdtId) -> Option<ImplId> {
     let module = match adt {
         AdtId::EnumId(id) => id.loc(db).container,
@@ -97,15 +97,26 @@ pub fn is_freeze<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -
     }
 }
 
+/// [`has_drop_glue_in`] in a task of its own, for a caller with no frame at hand.
 pub fn has_drop_glue<'db>(infcx: &InferCtxt<'db>, ty: Ty<'db>, env: ParamEnv<'db>) -> DropGlue {
-    has_drop_glue_impl(infcx, ty, env, &mut FxHashSet::default())
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| has_drop_glue_in(frame, infcx, ty, env))
+}
+
+/// Whether dropping a `ty` runs code, its visited set in the caller's `frame`.
+pub fn has_drop_glue_in<'db>(
+    frame: &Frame,
+    infcx: &InferCtxt<'db>,
+    ty: Ty<'db>,
+    env: ParamEnv<'db>,
+) -> DropGlue {
+    has_drop_glue_impl(infcx, ty, env, &mut frame_set(frame))
 }
 
 fn has_drop_glue_impl<'db>(
     infcx: &InferCtxt<'db>,
     ty: Ty<'db>,
     env: ParamEnv<'db>,
-    visited: &mut FxHashSet<Ty<'db>>,
+    visited: &mut FrameSet<'_, Ty<'db>>,
 ) -> DropGlue {
     let mut ocx = ObligationCtxt::new(infcx);
     // An alias the solver can't decide under `env` comes back as the variable it was to equal,

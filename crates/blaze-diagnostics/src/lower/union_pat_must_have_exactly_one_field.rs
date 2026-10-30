@@ -16,5 +16,6 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnionPatMustHaveExactlyOneField) -
     let span = cx.span_of_ptr(d.pat);
     let mut diag = Diag::error(None, "union patterns should have exactly one field", span);
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }

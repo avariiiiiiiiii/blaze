@@ -68,8 +68,10 @@ impl Validation {
     /// After the nodes of `tree`: what the parser sees of it that the walk does not.
     pub(super) fn tree(&mut self, cx: &Cx<'_, '_>, tree: &Tree, index: u32) {
         let unseen = tree.off.iter().chain(&tree.replaced);
+        // clone: a chain of two slice iterators, no allocation
         for root in unseen.clone() {
             let range = root.text_range();
+            // clone: a chain of two slice iterators, no allocation
             let nested = unseen.clone().any(|it| it.text_range() != range && it.text_range().contains_range(range));
             if nested {
                 continue;
@@ -90,6 +92,7 @@ impl Validation {
 fn validate(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
     match node.kind() {
         SyntaxKind::EXTERN_BLOCK => {
+            // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
             let Some(block) = ast::ExternBlock::cast(node.clone()) else { return };
             if block.unsafe_token().is_none() && cx.lint_may_fire(LintId::named("missing_unsafe_on_extern")) {
                 missing_unsafe_on_extern(cx, tree, node, out);
@@ -99,6 +102,7 @@ fn validate(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitt
             }
         }
         SyntaxKind::FN => {
+            // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
             let Some(item) = ast::Fn::cast(node.clone()) else { return };
             if let Some(abi) = item.abi() {
                 missing_abi(cx, tree, &abi, node, out);
@@ -108,18 +112,22 @@ fn validate(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitt
             }
         }
         SyntaxKind::FN_PTR_TYPE => {
+            // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
             let Some(abi) = ast::FnPtrType::cast(node.clone()).and_then(|it| it.abi()) else { return };
             missing_abi(cx, tree, &abi, node, out);
         }
         SyntaxKind::CONST if !in_assoc_item_list(node) => {
+            // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
             let Some(item) = ast::Const::cast(node.clone()) else { return };
             unused_visibility(cx, tree, &item, out);
         }
         SyntaxKind::TYPE_ALIAS if in_assoc_item_list(node) => {
+            // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
             let Some(alias) = ast::TypeAlias::cast(node.clone()) else { return };
             where_clause_location(cx, tree, &alias, out);
         }
         SyntaxKind::TYPE_PARAM => {
+            // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
             let Some(param) = ast::TypeParam::cast(node.clone()) else { return };
             type_param_case(cx, tree, &param, out);
         }
@@ -182,6 +190,7 @@ fn missing_unsafe_on_extern(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out
         return;
     }
     let span = span(cx, tree, range);
+    // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("missing_unsafe_on_extern", "extern blocks should be unsafe", span.clone());
     diag.suggestion(
         span.shrink_to_lo(),
@@ -204,6 +213,7 @@ fn missing_abi(cx: &Cx<'_, '_>, tree: &Tree, abi: &ast::Abi, at: &SyntaxNode, ou
         return;
     }
     let mut diag =
+        // clone: a lint's span, for a lint found
         Diag::lint("missing_abi", "`extern` declarations without an explicit ABI are deprecated", span.clone());
     diag.suggestion(span, "explicitly specify the \"C\" ABI", "extern \"C\"", Applicability::MachineApplicable);
     emit(cx, diag, Pass::Buffered, tree.ptr(at), tree.ptr(at), out);
@@ -218,6 +228,7 @@ fn patterns_without_body(cx: &Cx<'_, '_>, tree: &Tree, item: &ast::Fn, out: &mut
         let span = span(cx, tree, range);
         let edition = edition_at(cx, tree.file, range.start());
         let mut diag =
+            // clone: a lint's span, for a lint found
             Diag::lint("patterns_in_fns_without_body", "patterns aren't allowed in functions without bodies", span.clone());
         diag.suggestion(
             span,
@@ -254,9 +265,11 @@ fn unused_visibility(cx: &Cx<'_, '_>, tree: &Tree, item: &ast::Const, out: &mut 
     }
     let span = span(cx, tree, vis_range);
     let mut diag =
+        // clone: a lint's span, for a lint found
         Diag::lint("unused_visibilities", "visibility qualifiers have no effect on `const _` declarations", span.clone());
     diag.note("`const _` does not declare a name, so there is nothing for the qualifier to apply to");
     diag.suggestion_with_style(
+        // alloc: the lint's text, for a lint found
         vec![(span, String::new())],
         "remove the qualifier",
         Applicability::MachineApplicable,
@@ -280,12 +293,14 @@ fn where_clause_location(cx: &Cx<'_, '_>, tree: &Tree, alias: &ast::TypeAlias, o
     let Some(before) = ast::WhereClause::cast(before) else { return };
     let after = clauses.next().and_then(ast::WhereClause::cast);
     let span = span(cx, tree, range);
+    // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("deprecated_where_clause_location", "where clause not allowed here", span.clone());
     diag.note("see issue #89122 <https://github.com/rust-lang/rust/issues/89122> for more information");
     let has_predicates = before.predicates().next().is_some();
     if has_predicates || after.is_none() {
         let edition = edition_at(cx, tree.file, range.start());
         let mut needs_comma = after.as_ref().is_some_and(|it| it.predicates().next().is_some());
+        // alloc: the lint's text, for a lint found
         let mut moved = String::new();
         match &after {
             None => moved.push_str(" where "),
@@ -305,6 +320,7 @@ fn where_clause_location(cx: &Cx<'_, '_>, tree: &Tree, alias: &ast::TypeAlias, o
         let right = cx.span(InFile::new(tree.file, TextRange::empty(end)));
         diag.multipart_suggestion(
             "move it to the end of the type declaration",
+            // alloc: the lint's text, for a lint found
             vec![(extended_back_over_white_space(cx, &span), String::new()), (right, moved)],
             Applicability::MachineApplicable,
         );
@@ -317,7 +333,9 @@ fn where_clause_location(cx: &Cx<'_, '_>, tree: &Tree, alias: &ast::TypeAlias, o
 /// rustc's `span_extend_prev_while(span, char::is_whitespace)`: `span` with the white space
 /// before it.
 fn extended_back_over_white_space(cx: &Cx<'_, '_>, span: &Span) -> Span {
+    // clone: a lint's span, for a lint found
     let Some(file) = cx.file_of(span) else { return span.clone() };
+    // clone: a lint's span, for a lint found
     let Some(before) = cx.file_text(file).get(..span.lo as usize) else { return span.clone() };
     let lo = before.trim_end_matches(char::is_whitespace).len();
     span.with_lo(lo as u32)
@@ -335,7 +353,9 @@ fn type_param_case(cx: &Cx<'_, '_>, tree: &Tree, param: &ast::TypeParam, out: &m
     let span = span(cx, tree, name.syntax().text_range());
     let mut diag = Diag::lint(
         "non_camel_case_types",
+        // alloc: the lint's text, for a lint found
         format!("type parameter `{name_str}` should have an upper camel case name"),
+        // clone: a lint's span, for a lint found
         span.clone(),
     );
     let camel = to_upper_camel_case(name_str);

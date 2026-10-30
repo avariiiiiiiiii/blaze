@@ -488,10 +488,35 @@ pub struct CfgArgs {
     /// Whether `proc-macro` is among the crate types: cargo's probe of a target
     /// (`TargetInfo::new`) has it, so cargo's cfgs of a target have `proc_macro`.
     pub proc_macro: bool,
+    /// The sanitizer `-Z sanitizer` turns on (its lists add up; [`SANITIZERS`] exclude each
+    /// other), which rustc sets `cfg(sanitize = "..")` for.
+    pub sanitizer: Option<&'static str>,
 }
 
+/// The sanitizers blaze's code generator instruments with, as `blaze_cargo::unstable` reads
+/// them, sorted; any two exclude each other, as in rustc.
+const SANITIZERS: [&str; 3] = ["address", "memory", "thread"];
+
+/// Sanitizers rustc has that blaze's code generator does not instrument with
+/// (`blaze_cargo::unstable`'s `UNSANITIZED`).
+const UNSANITIZED: [&str; 11] = [
+    "cfi",
+    "dataflow",
+    "hwaddress",
+    "kcfi",
+    "kernel-address",
+    "kernel-hwaddress",
+    "leak",
+    "memtag",
+    "realtime",
+    "safestack",
+    "shadow-call-stack",
+];
+
 /// The codegen options that decide no cfg.
-const NO_CFG_CODEGEN: [&str; 20] = [
+const NO_CFG_CODEGEN: [&str; 22] = [
+    "passes",
+    "llvm-args",
     "embed-bitcode",
     "debuginfo",
     "metadata",
@@ -611,10 +636,32 @@ impl CfgArgs {
                 }
                 "-Z" => {
                     let option = value()?;
-                    let name = option.split_once('=').map_or(option, |(name, _)| name);
-                    match name {
+                    let (name, value) = match option.split_once('=') {
+                        Some((name, value)) => (name, Some(value)),
+                        None => (option, None),
+                    };
+                    let name = if name.contains('_') { Cow::Owned(name.replace('_', "-")) } else { Cow::Borrowed(name) };
+                    match &*name {
                         "unstable-options" | "threads" | "macro-backtrace" | "time-passes" | "share-generics"
-                        | "external-clangrt" | "linker-features" => {}
+                        | "external-clangrt" | "linker-features" | "sanitizer-recover"
+                        | "sanitizer-memory-track-origins" => {}
+                        "sanitizer" => {
+                            let list = value.ok_or_else(|| {
+                                format!("-Z {option}: rustc wants a comma-separated list of sanitizers")
+                            })?;
+                            for name in list.split(',') {
+                                let on = sanitizer(name, option)?;
+                                match args.sanitizer {
+                                    Some(was) if was != on => {
+                                        let (a, b) = if was < on { (was, on) } else { (on, was) };
+                                        return Err(format!(
+                                            "`-Zsanitizer={a}` is incompatible with `-Zsanitizer={b}`"
+                                        ));
+                                    }
+                                    _ => args.sanitizer = Some(on),
+                                }
+                            }
+                        }
                         other => return Err(format!("blaze does not know which cfgs `-Z {other}` decides")),
                     }
                 }
@@ -630,6 +677,18 @@ impl CfgArgs {
 
     fn debug_assertions(&self) -> bool {
         self.debug_assertions.unwrap_or(matches!(self.opt_level.as_deref(), None | Some("0")))
+    }
+}
+
+/// A name of `-Z sanitizer`'s list (`given`) as rustc reads it (`parse_sanitizers`): one blaze
+/// instruments with, else an error naming it.
+fn sanitizer(name: &str, given: &str) -> Result<&'static str, String> {
+    match SANITIZERS.iter().find(|it| **it == name) {
+        Some(it) => Ok(*it),
+        None if UNSANITIZED.contains(&name) => {
+            Err(format!("-Z {given}: blaze's code generator does not instrument with the `{name}` sanitizer"))
+        }
+        None => Err(format!("-Z {given}: rustc has no sanitizer `{name}`")),
     }
 }
 
@@ -731,6 +790,11 @@ pub fn target_cfg(triple: &str, args: &CfgArgs) -> Result<Vec<String>, String> {
         ));
     }
     cfgs.push(format!("panic=\"{panic}\""));
+    // rustc's `cfg(sanitize)` of each sanitizer on; `cfg(sanitizer_cfi_*)` follow only from
+    // the `cfi` sanitizer, which `sanitizer` refuses.
+    if let Some(name) = args.sanitizer {
+        cfgs.push(format!("sanitize=\"{name}\""));
+    }
     if args.proc_macro {
         cfgs.push("proc_macro".to_owned());
         // A proc macro is a dynamic library, which a target that respects `crt-static` builds

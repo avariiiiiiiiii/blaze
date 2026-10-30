@@ -49,6 +49,7 @@ impl UnstableFeatures {
     /// Otherwise, use this, to not draw a dependency to the def map.
     #[salsa::tracked(returns(ref))]
     pub fn query(db: &Db, krate: Crate) -> UnstableFeatures {
+        // clone: once per def-map change of the crate; the copy lets its readers backdate
         crate::crate_def_map(db, krate).features().clone()
     }
 }
@@ -89,7 +90,9 @@ define_unstable_features! {
     ref_pat_eat_one_layer_2024,
     ref_pat_eat_one_layer_2024_structural,
     deref_patterns,
+    never_patterns,
     mut_ref,
     type_changing_struct_update,
     staged_api,
+    unsized_fn_params,
 }

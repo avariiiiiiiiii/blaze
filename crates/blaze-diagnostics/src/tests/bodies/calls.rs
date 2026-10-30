@@ -202,6 +202,138 @@ For more information about this error, try `rustc --explain E0620`.
 }
 
 #[test]
+fn a_cast_to_a_pointer_of_an_unknown_kind() {
+    // tests/ui/inference/order-dependent-cast-inference.rs
+    let source = r#"fn main() {
+    // Tests case where inference fails due to the order in which casts are checked.
+    // Ideally this would compile, see #48270.
+    let x = &"hello";
+    let mut y = 0 as *const _;
+    //~^ ERROR cannot cast to a pointer of an unknown kind
+    y = x as *const _;
+}
+"#;
+    let stderr = "error[E0641]: cannot cast to a pointer of an unknown kind
+  --> $DIR/order-dependent-cast-inference.rs:5:22
+   |
+LL |     let mut y = 0 as *const _;
+   |                      ^^^^^^^^ needs more type information
+   |
+   = note: the type information given here is insufficient to check whether the pointer cast is valid
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0641`.
+";
+    assert_eq!(ui_core("order-dependent-cast-inference.rs", "sized", source), stderr);
+}
+
+#[test]
+fn an_enum_with_drop_is_not_cast_to_an_integer() {
+    // tests/ui/enum/enum-drop-cast-error.rs
+    let source = r#"//! Check that trying to cast an enum with a Drop impl to an integer is rejected.
+//!
+//! Issue: <https://github.com/rust-lang/rust/issues/35941>
+
+enum E {
+    A = 0,
+}
+
+impl Drop for E {
+    fn drop(&mut self) {
+        println!("Drop");
+    }
+}
+
+fn main() {
+    let e = E::A;
+    let i = e as u32;
+    //~^ ERROR cannot cast enum `E` into integer `u32` because it implements `Drop`
+}
+"#;
+    let stderr = "error: cannot cast enum `E` into integer `u32` because it implements `Drop`
+  --> $DIR/enum-drop-cast-error.rs:17:13
+   |
+LL |     let i = e as u32;
+   |             ^^^^^^^^
+
+error: aborting due to 1 previous error
+
+";
+    let println = r#"pub mod io {
+    pub fn _print(_args: core::fmt::Arguments<'_>) {}
+}
+
+#[macro_export]
+macro_rules! println {
+    ($($arg:tt)*) => {{
+        $crate::io::_print(core::format_args_nl!($($arg)*));
+    }};
+}
+"#;
+    assert_eq!(ui_std("enum-drop-cast-error.rs", "sized, drop, fmt", println, source), stderr);
+}
+
+#[test]
+fn a_foreign_enum_with_a_non_exhaustive_variant_is_not_cast() {
+    // tests/ui/rfcs/rfc-2008-non-exhaustive/enum-as-cast.rs, with its auxiliary `enums.rs`'s
+    // enum, and `assert_eq!` as std's.
+    let fixture = r#"//- minicore: sized, default, eq, panic, fmt
+//- /enums.rs crate:enums
+#[repr(u8)]
+pub enum FieldLessWithNonExhaustiveVariant {
+    A,
+    B,
+    #[non_exhaustive]
+    C,
+}
+
+impl Default for FieldLessWithNonExhaustiveVariant {
+    fn default() -> Self { Self::A }
+}
+//- /std.rs crate:std deps:core
+pub mod prelude { pub mod rust_2015 { pub use core::prelude::rust_2015::*; } }
+#[macro_export]
+macro_rules! assert_eq {
+    ($left:expr, $right:expr $(,)?) => {
+        match (&$left, &$right) {
+            (left_val, right_val) => {
+                if !(*left_val == *right_val) {
+                    core::panic!()
+                }
+            }
+        }
+    };
+}
+//- /enum-as-cast.rs crate:main edition:2015 deps:std,enums
+//@ aux-build:enums.rs
+
+extern crate enums;
+
+use enums::FieldLessWithNonExhaustiveVariant;
+
+fn main() {
+    let e = FieldLessWithNonExhaustiveVariant::default();
+    let d = e as u8; //~ ERROR casting `FieldLessWithNonExhaustiveVariant` as `u8` is invalid [E0606]
+    assert_eq!(d, 0);
+}
+"#;
+    let stderr = "error[E0606]: casting `FieldLessWithNonExhaustiveVariant` as `u8` is invalid
+  --> $DIR/enum-as-cast.rs:9:13
+   |
+LL |     let d = e as u8;
+   |             ^^^^^^^
+   |
+   = note: cannot cast an enum with a non-exhaustive variant when it's defined in another crate
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0606`.
+";
+    assert_eq!(ui_fixture(fixture), stderr);
+}
+
+#[test]
 fn a_binary_operator_of_types_without_its_impl() {
     // tests/ui/binop/binop-typeck.rs
     let source = "// issue #500
@@ -476,4 +608,124 @@ error: aborting due to 2 previous errors
 
 ";
     assert_eq!(ui_core("regular.rs", "sized, unsize, coerce_unsized", source), stderr);
+}
+
+#[test]
+fn a_method_with_a_sized_bound_on_a_reference_of_the_other_mutability() {
+    // tests/ui/illegal-sized-bound/mutability-mismatch.rs
+    let source = r##"struct MutType;
+
+pub trait MutTrait {
+    fn function(&mut self)
+    where
+        Self: Sized;
+}
+
+impl MutTrait for MutType {
+    fn function(&mut self) {}
+}
+
+struct Type;
+
+pub trait Trait {
+    fn function(&self)
+    where
+        Self: Sized;
+}
+
+impl Trait for Type {
+    fn function(&self) {}
+}
+
+fn main() {
+    (&MutType as &dyn MutTrait).function();
+    //~^ ERROR the `function` method cannot be invoked on `&dyn MutTrait`
+    //~| HELP you need `&mut dyn MutTrait` instead of `&dyn MutTrait`
+    (&mut Type as &mut dyn Trait).function();
+    //~^ ERROR the `function` method cannot be invoked on `&mut dyn Trait`
+    //~| HELP you need `&dyn Trait` instead of `&mut dyn Trait`
+}
+"##;
+    let stderr = r##"error: the `function` method cannot be invoked on `&dyn MutTrait`
+  --> $DIR/mutability-mismatch.rs:26:33
+   |
+LL |     (&MutType as &dyn MutTrait).function();
+   |                                 ^^^^^^^^
+   |
+   = help: you need `&mut dyn MutTrait` instead of `&dyn MutTrait`
+
+error: the `function` method cannot be invoked on `&mut dyn Trait`
+  --> $DIR/mutability-mismatch.rs:29:35
+   |
+LL |     (&mut Type as &mut dyn Trait).function();
+   |                                   ^^^^^^^^
+   |
+   = help: you need `&dyn Trait` instead of `&mut dyn Trait`
+
+error: aborting due to 2 previous errors
+
+"##;
+    assert_eq!(ui_core("mutability-mismatch.rs", "sized, unsize, coerce_unsized", source), stderr);
+}
+
+#[test]
+fn a_method_with_a_sized_bound_of_a_trait_not_in_scope() {
+    // tests/ui/suggestions/trait-object-import-suggestion-on-method.rs, revision `unimported`
+    let source = r##"//! Regression test for <https://github.com/rust-lang/rust/issues/35976>.
+//! This used to emit spurious `Sized` bound unsatisfied error when trait
+//! was not imported, instead of suggestion to import it.
+//@ edition:2015
+//@ revisions: imported unimported
+//@[imported] check-pass
+
+mod private {
+    pub trait Future {
+        //[unimported]~^^ HELP perhaps add a `use` for it
+        fn wait(&self) where Self: Sized;
+    }
+
+    impl Future for Box<dyn Future> {
+        fn wait(&self) { }
+    }
+}
+
+#[cfg(imported)]
+use private::Future;
+
+fn bar(arg: Box<dyn private::Future>) {
+    // Importing the trait means that we don't autoderef `Box<dyn Future>`
+    arg.wait();
+    //[unimported]~^ ERROR the `wait` method cannot be invoked on a trait object
+}
+
+fn main() {}
+"##;
+    let stderr = r##"error: the `wait` method cannot be invoked on a trait object
+  --> $DIR/trait-object-import-suggestion-on-method.rs:24:9
+   |
+LL |         fn wait(&self) where Self: Sized;
+   |                                    ----- this has a `Sized` requirement
+...
+LL |     arg.wait();
+   |         ^^^^
+   |
+help: another candidate was found in the following trait, perhaps add a `use` for it:
+   |
+LL + use private::Future;
+   |
+
+error: aborting due to 1 previous error
+
+"##;
+    let fixture = format!(
+        "//- minicore: sized, unsize, coerce_unsized, deref\n//- /std.rs crate:std deps:core\n\
+         pub mod prelude {{ pub mod rust_2015 {{ pub use core::prelude::rust_2015::*; pub use crate::boxed::Box; }} }}\n\
+         pub mod boxed {{\n\
+         #[lang = \"owned_box\"]\n\
+         pub struct Box<T: ?Sized>(*mut T);\n\
+         impl<T: ?Sized> core::ops::Deref for Box<T> {{ type Target = T; fn deref(&self) -> &T {{ loop {{}} }} }}\n\
+         }}\n\
+         //- /trait-object-import-suggestion-on-method.rs crate:main edition:2015 deps:std\n{source}"
+    );
+    assert_eq!(ui_fixture(&fixture), stderr);
 }

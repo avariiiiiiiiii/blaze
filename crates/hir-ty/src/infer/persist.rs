@@ -14,13 +14,14 @@ use blaze_format::{
     ALIGN, Aligned, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as,
     schema_of,
 };
+use blaze_mem::{Frame, scratch};
 use hir_def::{
     AdtId, AssocItemId, ConstId, ConstParamId, EnumId, EnumVariantId, FieldId, FunctionId,
     GenericDefId, GenericParamId, ImplId, LifetimeParamId, StaticId, StructId, TraitId,
     TupleFieldId, TupleId, TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
     hir::{
-        ArithOp, BinaryOp, CmpOp, ExprId, ExprOrPatId, ExprOrPatIdPacked, LogicOp, Ordering,
-        UnaryOp,
+        ArithOp, BinaryOp, BindingId, CmpOp, ExprId, ExprOrPatId, ExprOrPatIdPacked, LogicOp,
+        Ordering, UnaryOp,
     },
     resolver::ValueNs,
 };
@@ -29,9 +30,9 @@ use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use rustc_ast_ir::Mutability;
+use rustc_hash::FxBuildHasher;
 use rustc_type_ir::{ClausePolarity, ClosureKind};
 use salsa::plumbing::{AsId, FromId};
-use smallvec::SmallVec;
 
 use crate::{
     Span,
@@ -39,8 +40,8 @@ use crate::{
     infer::{
         Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability, CallArguments, CaptureInfo,
         CaptureSourceStack, CapturedPlace, ClosureData, ExplicitDropMethodUseKind,
-        InferenceDiagnostic, InferenceResult, OverloadedDeref, PatAdjust, PatAdjustment,
-        PointerCast, ReturnKind, Unreachable, UnreachableAt,
+        InferenceDiagnostic, InferenceResult, MinCaptures, OverloadedDeref, PatAdjust,
+        PatAdjustment, PointerCast, ReturnKind, Unreachable, UnreachableAt,
         cast::{CastError, CastPointerKind, CastPointers},
         closure::analysis::{
             BorrowKind,
@@ -62,6 +63,7 @@ use crate::{
         StoredTy, StoredTys, TraitRef, Ty, Tys,
         AnyImplId, StoredGenericArg,
         abi::Safety,
+        infer::traits::ObligationCauseCode,
         persist::{TyTableReader, TyTableWriter},
     },
     solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredTraitPredicate},
@@ -118,6 +120,8 @@ columns! {
         CoercionCasts,
         ClosuresWithoutExpectation,
         AnonConsts,
+        /// The trait of each `traits_in_scope_used` pair, its node in `TraitsUsedNodes`.
+        TraitsUsedIds,
     }
 }
 
@@ -155,6 +159,8 @@ columns! {
         /// [`UNREACHABLE_WORDS`] words per `unreachable` entry: `[kind, expr, index, after kind,
         /// after, note]`.
         Unreachables,
+        /// `[kind, local]` per `traits_in_scope_used` pair, as a side table writes a node.
+        TraitsUsedNodes,
         ClosureExprs,
         /// The diagnostics, then the closures' data.
         Words,
@@ -262,9 +268,11 @@ fn table_words(bytes: &[u8]) -> Vec<u128> {
 /// The type table's buffer as the reader takes it, from [`table_words`]'s words: a copy, for
 /// a record that was never written.
 fn table_bytes(words: &[u128]) -> Aligned {
-    let mut bytes = Vec::with_capacity(words.len() * size_of::<u128>());
-    words.iter().for_each(|word| bytes.extend_from_slice(&word.to_le_bytes()));
-    Aligned::copy_from(&bytes)
+    scratch::with_bytes(|bytes| {
+        bytes.reserve(words.len() * size_of::<u128>());
+        words.iter().for_each(|word| bytes.extend_from_slice(&word.to_le_bytes()));
+        Aligned::copy_from(bytes)
+    })
 }
 
 /// The bytes of `table`, a slice [`Slice::follow`] gave out of `buffer`.
@@ -290,6 +298,22 @@ fn local<T>(id: Idx<T>) -> u32 {
 
 fn local_of<T>(raw: u32) -> Idx<T> {
     Idx::from_raw(RawIdx::from_u32(raw))
+}
+
+/// The values of `items`, `len` of them unless one is an error: one allocation of exactly `len`,
+/// none when it is 0. Every `len` here is bounded by the record (a column's length, or a count
+/// [`Source::len`] checked against the words left).
+fn exact<T>(
+    len: usize,
+    items: impl IntoIterator<Item = Result<T, FormatError>>,
+) -> Result<Vec<T>, FormatError> {
+    // alloc: a decoded column of the result, once at its length
+    let mut values = Vec::with_capacity(len);
+    for item in items {
+        values.push(item?);
+    }
+    debug_assert_eq!(values.len(), len, "a column of another length than counted");
+    Ok(values)
 }
 
 fn variant_key(variant: VariantId) -> (u8, u64) {
@@ -375,19 +399,6 @@ fn adjust_code(adjust: &Adjust) -> u8 {
     }
 }
 
-const ARITH_OPS: [ArithOp; 10] = [
-    ArithOp::Add,
-    ArithOp::Mul,
-    ArithOp::Sub,
-    ArithOp::Div,
-    ArithOp::Rem,
-    ArithOp::Shl,
-    ArithOp::Shr,
-    ArithOp::BitXor,
-    ArithOp::BitOr,
-    ArithOp::BitAnd,
-];
-
 fn arith_code(op: ArithOp) -> u32 {
     match op {
         ArithOp::Add => 0,
@@ -423,14 +434,14 @@ fn binary_of(code: u32) -> Option<BinaryOp> {
     Some(match code {
         0 => BinaryOp::LogicOp(LogicOp::And),
         1 => BinaryOp::LogicOp(LogicOp::Or),
-        2..12 => BinaryOp::ArithOp(ARITH_OPS[code as usize - 2]),
+        2..12 => BinaryOp::ArithOp(ArithOp::ALL[code as usize - 2]),
         12 | 13 => BinaryOp::CmpOp(CmpOp::Eq { negated: code == 13 }),
         14..18 => BinaryOp::CmpOp(CmpOp::Ord {
             ordering: if code >= 16 { Ordering::Greater } else { Ordering::Less },
             strict: code % 2 == 1,
         }),
         18 => BinaryOp::Assignment { op: None },
-        19..29 => BinaryOp::Assignment { op: Some(ARITH_OPS[code as usize - 19]) },
+        19..29 => BinaryOp::Assignment { op: Some(ArithOp::ALL[code as usize - 19]) },
         _ => return None,
     })
 }
@@ -529,6 +540,22 @@ fn unreachable_of(words: &[u32]) -> Option<Unreachable> {
     Some(Unreachable { what, after, note })
 }
 
+/// `[kind, local]`: 0 for an expression or 1 for a pattern, as [`Sink::expr_or_pat`] writes it.
+fn node_words(node: ExprOrPatId) -> [u32; 2] {
+    match node {
+        ExprOrPatId::ExprId(it) => [0, local(it)],
+        ExprOrPatId::PatId(it) => [1, local(it)],
+    }
+}
+
+fn node_of(words: &[u32]) -> Option<ExprOrPatId> {
+    match *words {
+        [0, it] => Some(ExprOrPatId::ExprId(local_of(it))),
+        [1, it] => Some(ExprOrPatId::PatId(local_of(it))),
+        _ => None,
+    }
+}
+
 /// Where a record's types go as it is made: the type table, or in tests a list.
 trait TyEncode<'db> {
     fn ty(&mut self, ty: Ty<'db>) -> u32;
@@ -607,18 +634,45 @@ impl<'db> InferenceResult<'db> {
     }
 }
 
-impl InferenceRecord {
-    fn empty() -> InferenceRecord {
-        InferenceRecord {
-            u64s: Vec::new(),
-            u32s: Vec::new(),
-            bytes: Vec::new(),
+/// An [`InferenceRecord`]'s three arrays while [`InferenceRecord::of`] writes them: the thread's
+/// scratch buffers, warm across records, each copied once at its length by [`Columns::finish`].
+struct Columns {
+    u64s: scratch::Lent<Vec<u64>>,
+    u32s: scratch::Lent<Vec<u32>>,
+    bytes: scratch::Lent<Vec<u8>>,
+    spans64: [[u32; 2]; N64],
+    spans32: [[u32; 2]; N32],
+    spans8: [[u32; 2]; N8],
+}
+
+impl Columns {
+    fn new() -> Columns {
+        Columns {
+            u64s: scratch::lend_u64s(),
+            u32s: scratch::lend_u32s(),
+            bytes: scratch::lend_bytes(),
             spans64: [[0; 2]; N64],
             spans32: [[0; 2]; N32],
             spans8: [[0; 2]; N8],
-            error_ty: 0,
-            flags: 0,
-            diagnostics: 0,
+        }
+    }
+
+    /// The record of these arrays, with no type table yet.
+    fn finish(self, error_ty: u32, flags: u32, diagnostics: u32) -> InferenceRecord {
+        InferenceRecord {
+            // alloc: the record's own arrays, each once at its length
+            u64s: self.u64s.to_vec(),
+            // alloc: as `u64s`
+            u32s: self.u32s.to_vec(),
+            // alloc: as `u64s`
+            bytes: self.bytes.to_vec(),
+            spans64: self.spans64,
+            spans32: self.spans32,
+            spans8: self.spans8,
+            error_ty,
+            flags,
+            diagnostics,
+            // alloc: empty, no allocation; `to_record` puts the table in
             table: Vec::new(),
             table_root: 0,
         }
@@ -700,7 +754,9 @@ impl InferenceRecord {
         self.put8(kinds, column.items().iter().map(|it| adjust_code(&it.kind)));
         self.put32(targets, column.items().iter().map(|it| tys.ty(it.target.as_ref())));
     }
+}
 
+impl InferenceRecord {
     /// `result` with its types written into `tys`.
     fn of<'db>(result: &InferenceResult<'db>, tys: &mut impl TyEncode<'db>) -> InferenceRecord {
         let InferenceResult {
@@ -719,6 +775,7 @@ impl InferenceRecord {
             has_errors,
             diagnostics,
             unreachable,
+            traits_in_scope_used,
             nodes_with_type_mismatches,
             error_ty,
             expr_adjustments,
@@ -732,7 +789,7 @@ impl InferenceRecord {
             closures_data,
             defined_anon_consts,
         } = result;
-        let mut record = InferenceRecord::empty();
+        let mut record = Columns::new();
 
         record.put64(C64::MethodPresent, method_resolutions.present().iter().copied());
         record.put64(C64::MethodFns, method_resolutions.rows().iter().map(|&(it, _)| id_bits(it)));
@@ -810,10 +867,12 @@ impl InferenceRecord {
                 .flat_map(|(&(asm, operand), ty)| [local(asm), operand, tys.ty(ty.as_ref())]),
         );
         record.put32(C32::Unreachables, unreachable.iter().flat_map(unreachable_words));
+        record.put32(C32::TraitsUsedNodes, traits_in_scope_used.iter().flat_map(|&(node, _)| node_words(node)));
+        record.put64(C64::TraitsUsedIds, traits_in_scope_used.iter().map(|&(_, trait_)| id_bits(trait_)));
 
-        let mut words = Sink::default();
+        let mut words = Sink::new();
         diagnostics.iter().for_each(|it| words.diagnostic(tys, it));
-        record.diagnostics = u32::try_from(diagnostics.len()).expect("2^32 diagnostics");
+        let diagnostic_count = u32::try_from(diagnostics.len()).expect("2^32 diagnostics");
         record.put32(C32::ClosureExprs, closures_data.keys().map(|&it| local(it)));
         closures_data.values().for_each(|it| words.closure(tys, it));
         words.len(value_resolutions.iter().count());
@@ -830,13 +889,12 @@ impl InferenceRecord {
                 words.symbol(feature);
             });
         });
-        record.put32(C32::Words, words.words);
-        record.put8(C8::Text, words.text);
+        record.put32(C32::Words, words.words.iter().copied());
+        record.put8(C8::Text, words.text.iter().copied());
 
         record.put64(C64::AnonConsts, defined_anon_consts.iter().map(|&it| id_bits(it)));
-        record.error_ty = tys.ty(error_ty.as_ref());
-        record.flags = u32::from(*has_errors);
-        record
+        let error_ty = tys.ty(error_ty.as_ref());
+        record.finish(error_ty, u32::from(*has_errors), diagnostic_count)
     }
 
     pub fn as_ref(&self) -> InferenceRecordRef<'_> {
@@ -883,7 +941,7 @@ impl Placed {
 impl Persist for InferenceRecord {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("InferenceRecord"),
-        Part::U64(6),
+        Part::U64(9),
         Part::Schema(<InferRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = InferenceRecordRef<'a>;
@@ -992,11 +1050,14 @@ impl<'a> InferenceRecordRef<'a> {
     fn variants<K: DenseKey>(&self, at: C64, kinds: C8, ids: C64) -> Result<IndexColumn<K, VariantId>, FormatError> {
         let (kinds, ids) = (self.u8s(kinds), self.u64s(ids));
         self.same_len(&[kinds.len(), ids.len()], "variant columns of different lengths")?;
-        let rows = kinds
-            .iter()
-            .zip(ids)
-            .map(|(&kind, &bits)| variant_of(kind, bits).ok_or(self.invalid("a variant of no kind or id 0")))
-            .collect::<Result<_, _>>()?;
+        let rows = exact(
+            kinds.len(),
+            kinds
+                .iter()
+                .zip(ids)
+                .map(|(&kind, &bits)| variant_of(kind, bits).ok_or(self.invalid("a variant of no kind or id 0"))),
+        )?
+        .into_boxed_slice();
         self.index_column(at, rows)
     }
 
@@ -1009,20 +1070,20 @@ impl<'a> InferenceRecordRef<'a> {
     ) -> Result<IndexColumn<K, (CandidateId, StoredGenericArgs)>, FormatError> {
         let (kinds, ids, args) = (self.u8s(kinds), self.u64s(ids), self.u32s(args));
         self.same_len(&[kinds.len(), ids.len(), args.len()], "item columns of different lengths")?;
-        let rows = kinds
-            .iter()
-            .zip(ids)
-            .zip(args)
-            .map(|((&kind, &bits), &args)| {
+        let rows = exact(
+            kinds.len(),
+            kinds.iter().zip(ids).zip(args).map(|((&kind, &bits), &args)| {
                 let candidate = candidate_of(kind, bits).ok_or(self.invalid("an item of no kind or id 0"))?;
                 Ok((candidate, tys.args(args)?))
-            })
-            .collect::<Result<_, FormatError>>()?;
+            }),
+        )?
+        .into_boxed_slice();
         self.index_column(at, rows)
     }
 
     fn tys(&self, tys: &impl TyDecode, column: C32) -> Result<Box<[StoredTy]>, FormatError> {
-        self.u32s(column).iter().map(|&it| tys.ty(it)).collect()
+        let column = self.u32s(column);
+        Ok(exact(column.len(), column.iter().map(|&it| tys.ty(it)))?.into_boxed_slice())
     }
 
     fn ty_column<K: DenseKey>(&self, tys: &impl TyDecode, [at, dictionary]: [C32; 2]) -> Result<TyColumn<K>, FormatError> {
@@ -1046,14 +1107,14 @@ impl<'a> InferenceRecordRef<'a> {
     ) -> Result<Csr<K, Adjustment>, FormatError> {
         let (kinds, targets) = (self.u8s(kinds), self.u32s(targets));
         self.same_len(&[kinds.len(), targets.len()], "adjustment columns of different lengths")?;
-        let items = kinds
-            .iter()
-            .zip(targets)
-            .map(|(&kind, &target)| {
+        let items = exact(
+            kinds.len(),
+            kinds.iter().zip(targets).map(|(&kind, &target)| {
                 let kind = ADJUSTS.get(kind as usize).cloned().ok_or(self.invalid("an adjustment of no kind"))?;
                 Ok(Adjustment { kind, target: tys.ty(target)? })
-            })
-            .collect::<Result<_, FormatError>>()?;
+            }),
+        )?
+        .into_boxed_slice();
         self.lists(present, ends, items)
     }
 
@@ -1071,14 +1132,24 @@ impl<'a> InferenceRecordRef<'a> {
         self.decode(&TableDecode { interner, table, at: self.at })
     }
 
+    /// [`Self::decode_in`] in a task of its own: decoding runs outside any query (R1).
     fn decode<'db>(&self, tys: &impl TyDecode) -> Result<InferenceResult<'db>, FormatError> {
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| self.decode_in(tys, frame))
+    }
+
+    /// The result of this record, its temporaries in `frame`.
+    fn decode_in<'db>(
+        &self,
+        tys: &impl TyDecode,
+        frame: &Frame,
+    ) -> Result<InferenceResult<'db>, FormatError> {
         let (fns, args) = (self.u64s(C64::MethodFns), self.u32s(C32::MethodArgs));
         self.same_len(&[fns.len(), args.len()], "method columns of different lengths")?;
-        let rows = fns
-            .iter()
-            .zip(args)
-            .map(|(&bits, &args)| Ok((self.id::<FunctionId>(bits)?, tys.args(args)?)))
-            .collect::<Result<_, FormatError>>()?;
+        let rows = exact(
+            fns.len(),
+            fns.iter().zip(args).map(|(&bits, &args)| Ok((self.id::<FunctionId>(bits)?, tys.args(args)?))),
+        )?
+        .into_boxed_slice();
         let method_resolutions = self.index_column(C64::MethodPresent, rows)?;
 
         let tuple_field_access_types = {
@@ -1086,7 +1157,7 @@ impl<'a> InferenceRecordRef<'a> {
             let total = lens.iter().try_fold(0usize, |sum, &len| sum.checked_add(len as usize));
             self.ensure(total == Some(items.len()), "tuple lengths that do not add up to their types")?;
             let mut start = 0;
-            let mut buffer = Vec::new();
+            let mut buffer = Vec::new_in(frame);
             lens.iter()
                 .map(|&len| {
                     buffer.clear();
@@ -1101,28 +1172,28 @@ impl<'a> InferenceRecordRef<'a> {
             let (kinds, variants, locals) =
                 (self.u8s(C8::FieldKinds), self.u64s(C64::FieldVariants), self.u32s(C32::FieldLocals));
             self.same_len(&[kinds.len(), variants.len(), locals.len()], "field columns of different lengths")?;
-            let fields = kinds
-                .iter()
-                .zip(variants)
-                .zip(locals)
-                .map(|((&kind, &bits), &local)| {
+            let fields = exact(
+                kinds.len(),
+                kinds.iter().zip(variants).zip(locals).map(|((&kind, &bits), &local)| {
                     let parent = variant_of(kind, bits).ok_or(self.invalid("a field of a variant of no kind"))?;
                     Ok(FieldId { parent, local_id: local_of(local) })
-                })
-                .collect::<Result<_, FormatError>>()?;
+                }),
+            )?
+            .into_boxed_slice();
             let words = self.u32s(C32::TupleFields);
             self.ensure(words.len() % 2 == 0, "a tuple field column of an odd number of words")?;
-            let tuple_fields = words
-                .chunks_exact(2)
-                .map(|it| {
+            let tuple_fields = exact(
+                words.len() / 2,
+                words.chunks_exact(2).map(|it| {
                     let tuple = tuple_field_access_types.get(it[0] as usize);
                     self.ensure(
                         tuple.is_some_and(|tuple| (it[1] as usize) < tuple.as_ref().len()),
                         "a tuple field past its tuple",
                     )?;
                     Ok(TupleFieldId { tuple: TupleId(it[0]), index: it[1] })
-                })
-                .collect::<Result<_, FormatError>>()?;
+                }),
+            )?
+            .into_boxed_slice();
             let (tags, data) = (self.u8s(C8::FieldTags), self.u32s(C32::FieldData));
             FieldColumn::from_parts(tags.into(), data.into(), fields, tuple_fields)
                 .map_err(|what| self.invalid(what))?
@@ -1140,65 +1211,81 @@ impl<'a> InferenceRecordRef<'a> {
         let type_of_opaque = {
             let (ids, opaque_tys) = (self.u64s(C64::OpaqueIds), self.u32s(C32::OpaqueTys));
             self.same_len(&[ids.len(), opaque_tys.len()], "opaque columns of different lengths")?;
-            let entries = ids
-                .iter()
-                .zip(opaque_tys)
-                .map(|(&bits, &ty)| Ok((self.id::<InternedOpaqueTyId<'db>>(bits)?, tys.ty(ty)?)))
-                .collect::<Result<_, FormatError>>()?;
+            let entries = exact(
+                ids.len(),
+                ids.iter()
+                    .zip(opaque_tys)
+                    .map(|(&bits, &ty)| Ok((self.id::<InternedOpaqueTyId<'db>>(bits)?, tys.ty(ty)?))),
+            )?;
             SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
         };
 
         let pat_adjustments = {
             let (kinds, sources) = (self.u8s(C8::PatAdjustKinds), self.u32s(C32::PatAdjustSources));
             self.same_len(&[kinds.len(), sources.len()], "pattern adjustment columns of different lengths")?;
-            let items = kinds
-                .iter()
-                .zip(sources)
-                .map(|(&kind, &source)| {
+            let items = exact(
+                kinds.len(),
+                kinds.iter().zip(sources).map(|(&kind, &source)| {
                     let kind = match kind {
                         0 => PatAdjust::BuiltinDeref,
                         1 => PatAdjust::OverloadedDeref,
                         _ => return Err(self.invalid("a pattern adjustment of no kind")),
                     };
                     Ok(PatAdjustment { kind, source: tys.ty(source)? })
-                })
-                .collect::<Result<_, FormatError>>()?;
+                }),
+            )?
+            .into_boxed_slice();
             self.lists(C64::PatAdjustPresent, C32::PatAdjustEnds, items)?
         };
 
         let asm_sym_tys = {
             let words = self.u32s(C32::AsmSyms);
             self.ensure(words.len() % 3 == 0, "a sym operand column of a partial operand")?;
-            let entries = words
-                .chunks_exact(3)
-                .map(|it| Ok(((local_of(it[0]), it[1]), tys.ty(it[2])?)))
-                .collect::<Result<_, FormatError>>()?;
+            let entries = exact(
+                words.len() / 3,
+                words.chunks_exact(3).map(|it| Ok(((local_of(it[0]), it[1]), tys.ty(it[2])?))),
+            )?;
             SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
         };
 
         let unreachable = {
             let words = self.u32s(C32::Unreachables);
             self.ensure(words.len() % UNREACHABLE_WORDS == 0, "an unreachable column of a partial entry")?;
-            words
-                .chunks_exact(UNREACHABLE_WORDS)
-                .map(|it| unreachable_of(it).ok_or(self.invalid("an unreachable entry of no kind")))
-                .collect::<Result<Box<[_]>, FormatError>>()?
+            exact(
+                words.len() / UNREACHABLE_WORDS,
+                words
+                    .chunks_exact(UNREACHABLE_WORDS)
+                    .map(|it| unreachable_of(it).ok_or(self.invalid("an unreachable entry of no kind"))),
+            )?
+            .into_boxed_slice()
         };
 
-        let mut words = Source { words: self.u32s(C32::Words), next: 0, text: self.u8s(C8::Text), at: self.at };
-        let diagnostics = (0..self.diagnostics)
-            .map(|_| words.diagnostic(tys))
-            .collect::<Result<Box<[_]>, _>>()?;
+        let traits_in_scope_used = {
+            let (nodes, ids) = (self.u32s(C32::TraitsUsedNodes), self.u64s(C64::TraitsUsedIds));
+            self.same_len(&[nodes.len(), 2 * ids.len()], "trait use columns of different lengths")?;
+            exact(
+                ids.len(),
+                nodes.chunks_exact(2).zip(ids).map(|(node, &bits)| {
+                    let node = node_of(node).ok_or(self.invalid("a trait use at a node of no kind"))?;
+                    Ok((node, self.id::<TraitId>(bits)?))
+                }),
+            )?
+            .into_boxed_slice()
+        };
+
+        let side = self.u32s(C32::Words);
+        let mut words = Source { words: side, next: 0, text: self.u8s(C8::Text), at: self.at, frame };
+        let count = self.diagnostics as usize;
+        self.ensure(count <= side.len(), "more diagnostics than side table words")?;
+        let diagnostics = exact(count, (0..count).map(|_| words.diagnostic(tys)))?.into_boxed_slice();
         let closures_data = {
-            let entries = self
-                .u32s(C32::ClosureExprs)
-                .iter()
-                .map(|&expr| Ok((local_of(expr), words.closure(tys)?)))
-                .collect::<Result<_, FormatError>>()?;
+            let exprs = self.u32s(C32::ClosureExprs);
+            let entries =
+                exact(exprs.len(), exprs.iter().map(|&expr| Ok((local_of(expr), words.closure(tys, frame)?))))?;
             SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
         };
         let value_resolutions = {
-            let mut map = ExprOrPatMap::default();
+            let mut map = ExprOrPatMap::new_in(frame);
             for _ in 0..words.len()? {
                 let node = words.node()?;
                 let value = words.value_ns()?;
@@ -1207,25 +1294,23 @@ impl<'a> InferenceRecordRef<'a> {
             map.freeze()
         };
         let unstable_candidates = {
-            let mut map = ExprOrPatMap::default();
+            let mut map = ExprOrPatMap::new_in(frame);
             for _ in 0..words.len()? {
                 let node = words.node()?;
                 let len = words.len()?;
                 self.ensure(len != 0, "a node that passed over no unstable items")?;
-                let candidates = (0..len)
-                    .map(|_| Ok((words.candidate()?, words.symbol()?)))
-                    .collect::<Result<Box<[_]>, FormatError>>()?;
+                let candidates =
+                    exact(len, (0..len).map(|_| Ok((words.candidate()?, words.symbol()?))))?.into_boxed_slice();
                 self.ensure(map.insert(node, candidates).is_none(), "a node with two unstable item lists")?;
             }
             map.freeze()
         };
         self.ensure(words.is_done(), "words after the last unstable item list")?;
 
-        let defined_anon_consts = self
-            .u64s(C64::AnonConsts)
-            .iter()
-            .map(|&bits| self.id::<AnonConstId<'db>>(bits))
-            .collect::<Result<_, _>>()?;
+        let anon_consts = self.u64s(C64::AnonConsts);
+        let defined_anon_consts =
+            exact(anon_consts.len(), anon_consts.iter().map(|&bits| self.id::<AnonConstId<'db>>(bits)))?
+                .into_boxed_slice();
         self.ensure(self.flags <= 1, "an inference record with unknown flags")?;
 
         Ok(InferenceResult {
@@ -1244,6 +1329,7 @@ impl<'a> InferenceRecordRef<'a> {
             has_errors: self.flags & 1 != 0,
             diagnostics,
             unreachable,
+            traits_in_scope_used,
             nodes_with_type_mismatches: ExprOrPatSet {
                 exprs: self.idx_set(C64::MismatchedExprs)?,
                 pats: self.idx_set(C64::MismatchedPats)?,
@@ -1274,14 +1360,18 @@ impl<'a> InferenceRecordRef<'a> {
     }
 }
 
-/// The side tables' words being written, and the text of the names in them.
-#[derive(Default)]
+/// The side tables' words being written, and the text of the names in them: the thread's
+/// scratch buffers, which [`InferenceRecord::of`] copies into the record's arrays.
 struct Sink {
-    words: Vec<u32>,
-    text: Vec<u8>,
+    words: scratch::Lent<Vec<u32>>,
+    text: scratch::Lent<Vec<u8>>,
 }
 
 impl Sink {
+    fn new() -> Sink {
+        Sink { words: scratch::lend_u32s(), text: scratch::lend_bytes() }
+    }
+
     fn word(&mut self, word: u32) {
         self.words.push(word);
     }
@@ -1721,6 +1811,11 @@ impl Sink {
                 self.word(11);
                 self.node(*id);
             }
+            D::UnresolvedPath { id, segment } => {
+                self.word(70);
+                self.node(*id);
+                self.word(*segment);
+            }
             D::BreakOutsideOfLoop { expr, is_break, bad_value_break } => {
                 self.words.extend([12, local(*expr)]);
                 self.bool(*is_break);
@@ -1903,7 +1998,7 @@ impl Sink {
                 let op = op.map_or(0, |op| 1 + arith_code(op));
                 self.words.extend([35, local(*lhs), local(*assign), op]);
             }
-            D::TypeMustBeKnown { at_point, top_term, kind, ambiguity } => {
+            D::TypeMustBeKnown { at_point, top_term, kind, ambiguity, origin } => {
                 self.word(36);
                 self.span(*at_point);
                 match top_term {
@@ -1927,9 +2022,14 @@ impl Sink {
                         ambiguity.related.iter().for_each(|it| self.ambiguity_note(tys, it));
                     }
                 }
+                self.bool(origin.is_some());
+                if let Some((span, param)) = origin {
+                    self.span(*span);
+                    self.generic_param(*param);
+                }
             }
             D::UnionExprMustHaveExactlyOneField { expr } => self.words.extend([37, local(*expr)]),
-            D::TypeMismatch { node, expected, found, at_error } => {
+            D::TypeMismatch { node, expected, found, at_error, cause } => {
                 self.word(38);
                 self.node(*node);
                 self.ty(tys, expected);
@@ -1942,16 +2042,24 @@ impl Sink {
                         self.ty(tys, found);
                     }
                 }
+                self.cause_code(*cause);
             }
-            D::SolverDiagnostic(SolverDiagnostic { span, kind }) => {
+            D::SolverDiagnostic(SolverDiagnostic { span, cause, kind }) => {
                 self.word(39);
                 self.span(*span);
+                self.cause_code(*cause);
                 match kind {
-                    SolverDiagnosticKind::TraitUnimplemented { trait_predicate, parent_trait_predicates } => {
+                    SolverDiagnosticKind::TraitUnimplemented {
+                        trait_predicate,
+                        parent_trait_predicates,
+                        parent_impls,
+                    } => {
                         self.word(0);
                         self.trait_predicate(tys, trait_predicate);
                         self.len(parent_trait_predicates.len());
                         parent_trait_predicates.iter().for_each(|it| self.trait_predicate(tys, it));
+                        debug_assert_eq!(parent_impls.len(), parent_trait_predicates.len());
+                        parent_impls.iter().for_each(|&it| self.optional_impl(it));
                     }
                     SolverDiagnosticKind::ClosureKindMismatch { expected, found, is_async, closure } => {
                         self.word(1);
@@ -2034,6 +2142,48 @@ impl Sink {
         });
     }
 
+    fn cause_code(&mut self, code: ObligationCauseCode) {
+        match code {
+            ObligationCauseCode::Misc => self.word(0),
+            ObligationCauseCode::WhereClauseInExpr { item, bound_index, arg_index } => {
+                self.word(1);
+                self.generic_def(item);
+                self.word(bound_index);
+                match arg_index {
+                    None => self.word(0),
+                    Some(arg_index) => {
+                        self.word(1);
+                        self.word(arg_index);
+                    }
+                }
+            }
+            ObligationCauseCode::SizedArgumentType => self.word(2),
+            ObligationCauseCode::BlockTailExpression => self.word(3),
+            ObligationCauseCode::ReturnValue => self.word(4),
+            ObligationCauseCode::IfExpression => self.word(5),
+            ObligationCauseCode::MatchExpressionArm { prior_arms } => {
+                self.word(6);
+                self.word(prior_arms);
+            }
+            ObligationCauseCode::LetType => self.word(7),
+            ObligationCauseCode::SizedReturnType => self.word(8),
+        }
+    }
+
+    fn optional_impl(&mut self, impl_: Option<AnyImplId>) {
+        match impl_ {
+            None => self.word(0),
+            Some(AnyImplId::ImplId(it)) => {
+                self.word(1);
+                self.id(it);
+            }
+            Some(AnyImplId::BuiltinDeriveImplId(it)) => {
+                self.word(2);
+                self.id(it);
+            }
+        }
+    }
+
     fn place<'db>(&mut self, tys: &mut impl TyEncode<'db>, place: &Place) {
         let Place { base_ty, base, projections } = place;
         self.ty(tys, base_ty);
@@ -2073,7 +2223,7 @@ impl Sink {
     fn closure<'db>(&mut self, tys: &mut impl TyEncode<'db>, closure: &ClosureData) {
         let ClosureData { min_captures, fake_reads, liberated_sig, kind_origin } = closure;
         self.len(min_captures.len());
-        for (&binding, captures) in min_captures {
+        for (binding, captures) in min_captures {
             self.local(binding);
             self.len(captures.len());
             for CapturedPlace { place, info, mutability } in captures {
@@ -2140,6 +2290,8 @@ struct Source<'a> {
     text: &'a [u8],
     /// Where the record's root is, for errors.
     at: u64,
+    /// The decode's frame, for the lists of types it interns.
+    frame: &'a Frame,
 }
 
 impl Source<'_> {
@@ -2203,8 +2355,10 @@ impl Source<'_> {
 
     fn tys(&mut self, tys: &impl TyDecode) -> Result<StoredTys, FormatError> {
         let len = self.len()?;
-        let list = (0..len).map(|_| self.ty(tys)).collect::<Result<Vec<_>, _>>()?;
-        let list: Vec<Ty<'_>> = list.iter().map(StoredTy::as_ref).collect();
+        let mut list = Vec::with_capacity_in(len, self.frame);
+        for _ in 0..len {
+            list.push(self.ty(tys)?.as_ref());
+        }
         Ok(Tys::new_from_slice(&list).store())
     }
 
@@ -2401,15 +2555,15 @@ impl Source<'_> {
         let c_variadic = self.bool()?;
         let mut tys_list = || -> Result<Box<[StoredTy]>, FormatError> {
             let len = self.len()?;
-            (0..len).map(|_| self.ty(tys)).collect()
+            Ok(exact(len, (0..len).map(|_| self.ty(tys)))?.into_boxed_slice())
         };
         let formal_inputs = tys_list()?;
         let expected_inputs = tys_list()?;
         let provided = tys_list()?;
         let compatible_ends: Box<[u32]> =
-            (0..provided.len()).map(|_| self.word()).collect::<Result<_, _>>()?;
+            exact(provided.len(), (0..provided.len()).map(|_| self.word()))?.into_boxed_slice();
         let len = self.len()?;
-        let compatible: Box<[u32]> = (0..len).map(|_| self.word()).collect::<Result<_, _>>()?;
+        let compatible: Box<[u32]> = exact(len, (0..len).map(|_| self.word()))?.into_boxed_slice();
         if formal_inputs.len() != expected_inputs.len()
             || compatible_ends.windows(2).any(|it| it[0] > it[1])
             || compatible_ends.last().map_or(0, |&it| it as usize) != compatible.len()
@@ -2453,16 +2607,17 @@ impl Source<'_> {
     fn ambiguity_note(&mut self, tys: &impl TyDecode) -> Result<AmbiguityNote, FormatError> {
         let goal = self.goal(tys)?;
         let len = self.len()?;
-        let candidates = (0..len)
-            .map(|_| {
+        let candidates = exact(
+            len,
+            (0..len).map(|_| {
                 Ok(match self.word()? {
                     0 => AmbiguityCandidate::Impl(AnyImplId::ImplId(self.id()?)),
                     1 => AmbiguityCandidate::Impl(AnyImplId::BuiltinDeriveImplId(self.id()?)),
                     2 => AmbiguityCandidate::ParamEnv { trait_: self.id()?, args: self.args(tys)? },
                     _ => return Err(self.invalid("an ambiguity candidate of no kind")),
                 })
-            })
-            .collect::<Result<_, _>>()?;
+            }),
+        )?;
         Ok(AmbiguityNote { goal, candidates })
     }
 
@@ -2553,6 +2708,7 @@ impl Source<'_> {
                 name: self.name()?,
             },
             11 => D::UnresolvedIdent { id: self.node()? },
+            70 => D::UnresolvedPath { id: self.node()?, segment: self.word()? },
             12 => D::BreakOutsideOfLoop {
                 expr: self.local()?,
                 is_break: self.bool()?,
@@ -2601,7 +2757,7 @@ impl Source<'_> {
                 at_error: self.opt_ty(tys)?,
                 unmet: {
                     let len = self.len()?;
-                    (0..len).map(|_| self.goal(tys)).collect::<Result<_, _>>()?
+                    exact(len, (0..len).map(|_| self.goal(tys)))?
                 },
             },
             23 => D::BinaryOperatorCannotBeApplied {
@@ -2619,7 +2775,7 @@ impl Source<'_> {
                 },
                 unmet: {
                     let len = self.len()?;
-                    (0..len).map(|_| self.goal(tys)).collect::<Result<_, _>>()?
+                    exact(len, (0..len).map(|_| self.goal(tys)))?
                 },
                 output: self.opt_ty(tys)?,
             },
@@ -2646,7 +2802,7 @@ impl Source<'_> {
                         cast: self.cast_pointer_kind()?,
                         added_auto_traits: {
                             let len = self.len()?;
-                            (0..len).map(|_| self.id()).collect::<Result<_, _>>()?
+                            exact(len, (0..len).map(|_| self.id()))?.into_boxed_slice()
                         },
                     }))
                 } else {
@@ -2672,7 +2828,7 @@ impl Source<'_> {
                 needs_mut: self.bool()?,
                 candidates: {
                     let len = self.len()?;
-                    (0..len).map(|_| self.id()).collect::<Result<_, _>>()?
+                    exact(len, (0..len).map(|_| self.id()))?.into_boxed_slice()
                 },
             },
             61 => D::EditionDependentMethodCall {
@@ -2715,7 +2871,7 @@ impl Source<'_> {
                 assign: self.local()?,
                 op: match self.word()? {
                     0 => None,
-                    code @ 1..11 => Some(ARITH_OPS[code as usize - 1]),
+                    code @ 1..11 => Some(ArithOp::ALL[code as usize - 1]),
                     _ => return Err(self.invalid("an assignment operator of no kind")),
                 },
             },
@@ -2743,12 +2899,12 @@ impl Source<'_> {
                     1 => {
                         let primary = self.ambiguity_note(tys)?;
                         let len = self.len()?;
-                        let related =
-                            (0..len).map(|_| self.ambiguity_note(tys)).collect::<Result<_, _>>()?;
+                        let related = exact(len, (0..len).map(|_| self.ambiguity_note(tys)))?;
                         Some(Box::new(Ambiguity { primary, related }))
                     }
                     _ => return Err(self.invalid("an optional ambiguity of no kind")),
                 },
+                origin: if self.bool()? { Some((self.span()?, self.generic_param()?)) } else { None },
             },
             37 => D::UnionExprMustHaveExactlyOneField { expr: self.local()? },
             38 => D::TypeMismatch {
@@ -2760,16 +2916,22 @@ impl Source<'_> {
                     1 => Some(Box::new((self.ty(tys)?, self.ty(tys)?))),
                     _ => return Err(self.invalid("optional types at an error of no kind")),
                 },
+                cause: self.cause_code()?,
             },
             39 => {
                 let span = self.span()?;
+                let cause = self.cause_code()?;
                 let kind = match self.word()? {
                     0 => {
                         let trait_predicate = self.trait_predicate(tys)?;
                         let len = self.len()?;
-                        let parent_trait_predicates =
-                            (0..len).map(|_| self.trait_predicate(tys)).collect::<Result<_, _>>()?;
-                        SolverDiagnosticKind::TraitUnimplemented { trait_predicate, parent_trait_predicates }
+                        let parent_trait_predicates = exact(len, (0..len).map(|_| self.trait_predicate(tys)))?;
+                        let parent_impls = exact(len, (0..len).map(|_| self.optional_impl()))?;
+                        SolverDiagnosticKind::TraitUnimplemented {
+                            trait_predicate,
+                            parent_trait_predicates,
+                            parent_impls,
+                        }
                     }
                     1 => SolverDiagnosticKind::ClosureKindMismatch {
                         expected: self.closure_kind()?,
@@ -2803,7 +2965,7 @@ impl Source<'_> {
                     },
                     _ => return Err(self.invalid("a solver diagnostic of no kind")),
                 };
-                D::SolverDiagnostic(SolverDiagnostic { span, kind })
+                D::SolverDiagnostic(SolverDiagnostic { span, cause, kind })
             }
             40 => D::ExplicitDropMethodUse {
                 kind: match self.word()? {
@@ -2826,7 +2988,7 @@ impl Source<'_> {
                 let record = self.expr_or_pat()?;
                 let variant = self.variant()?;
                 let len = self.len()?;
-                let missed_fields = (0..len).map(|_| self.local()).collect::<Result<_, _>>()?;
+                let missed_fields = exact(len, (0..len).map(|_| self.local()))?;
                 D::RecordMissingFields { record, variant, missed_fields }
             }
             _ => return Err(self.invalid("an inference diagnostic of no kind")),
@@ -2841,6 +3003,38 @@ impl Source<'_> {
         }
     }
 
+    fn cause_code(&mut self) -> Result<ObligationCauseCode, FormatError> {
+        Ok(match self.word()? {
+            0 => ObligationCauseCode::Misc,
+            1 => ObligationCauseCode::WhereClauseInExpr {
+                item: self.generic_def()?,
+                bound_index: self.word()?,
+                arg_index: match self.word()? {
+                    0 => None,
+                    1 => Some(self.word()?),
+                    _ => return Err(self.invalid("an optional argument index of no kind")),
+                },
+            },
+            2 => ObligationCauseCode::SizedArgumentType,
+            3 => ObligationCauseCode::BlockTailExpression,
+            4 => ObligationCauseCode::ReturnValue,
+            5 => ObligationCauseCode::IfExpression,
+            6 => ObligationCauseCode::MatchExpressionArm { prior_arms: self.word()? },
+            7 => ObligationCauseCode::LetType,
+            8 => ObligationCauseCode::SizedReturnType,
+            _ => return Err(self.invalid("an obligation cause of no kind")),
+        })
+    }
+
+    fn optional_impl(&mut self) -> Result<Option<AnyImplId>, FormatError> {
+        Ok(match self.word()? {
+            0 => None,
+            1 => Some(AnyImplId::ImplId(self.id()?)),
+            2 => Some(AnyImplId::BuiltinDeriveImplId(self.id()?)),
+            _ => return Err(self.invalid("an optional impl of no kind")),
+        })
+    }
+
     fn place(&mut self, tys: &impl TyDecode) -> Result<Place, FormatError> {
         let base_ty = self.ty(tys)?;
         let base = match self.word()? {
@@ -2851,81 +3045,86 @@ impl Source<'_> {
             _ => return Err(self.invalid("a place base of no kind")),
         };
         let len = self.len()?;
-        let projections = (0..len)
-            .map(|_| {
-                let ty = self.ty(tys)?;
-                let kind = match self.word()? {
-                    0 => ProjectionKind::Deref,
-                    1 => ProjectionKind::Field { field_idx: self.word()?, variant_idx: self.word()? },
-                    2 => ProjectionKind::Index,
-                    3 => ProjectionKind::Subslice,
-                    4 => ProjectionKind::UnwrapUnsafeBinder,
-                    _ => return Err(self.invalid("a projection of no kind")),
-                };
-                Ok(Projection { ty, kind })
-            })
-            .collect::<Result<_, FormatError>>()?;
-        Ok(Place { base_ty, base, projections })
-    }
-
-    fn sources(&mut self) -> Result<SmallVec<[CaptureSourceStack; 2]>, FormatError> {
-        let len = self.len()?;
-        (0..len)
-            .map(|_| {
-                let len = self.len()?;
-                if len == 0 {
-                    return Err(self.invalid("a capture source stack without a source"));
-                }
-                let mut stack = CaptureSourceStack::from_single(self.node()?);
-                for _ in 1..len {
-                    stack.push(self.node()?);
-                }
-                Ok(stack)
-            })
-            .collect()
-    }
-
-    fn closure(&mut self, tys: &impl TyDecode) -> Result<ClosureData, FormatError> {
-        let len = self.len()?;
-        let mut min_captures = crate::infer::RootVariableMinCaptureList::default();
+        // alloc: the decoded place's projections, once at their number
+        let mut projections = Vec::with_capacity(len);
         for _ in 0..len {
-            let binding = self.local()?;
+            let ty = self.ty(tys)?;
+            let kind = match self.word()? {
+                0 => ProjectionKind::Deref,
+                1 => ProjectionKind::Field { field_idx: self.word()?, variant_idx: self.word()? },
+                2 => ProjectionKind::Index,
+                3 => ProjectionKind::Subslice,
+                4 => ProjectionKind::UnwrapUnsafeBinder,
+                _ => return Err(self.invalid("a projection of no kind")),
+            };
+            projections.push(Projection { ty, kind });
+        }
+        Ok(Place { base_ty, base, projections: projections.into_boxed_slice() })
+    }
+
+    fn sources(&mut self) -> Result<Box<[CaptureSourceStack]>, FormatError> {
+        let len = self.len()?;
+        // alloc: the decoded sources, once at their number
+        let mut sources = Vec::with_capacity(len);
+        for _ in 0..len {
             let len = self.len()?;
-            let captures = (0..len)
-                .map(|_| {
-                    let place = self.place(tys)?;
-                    let sources = self.sources()?;
-                    let capture_kind = match self.word()? {
-                        0 => UpvarCapture::ByRef(BorrowKind::Immutable),
-                        1 => UpvarCapture::ByRef(BorrowKind::UniqueImmutable),
-                        2 => UpvarCapture::ByRef(BorrowKind::Mutable),
-                        3 => UpvarCapture::ByUse,
-                        4 => UpvarCapture::ByValue,
-                        _ => return Err(self.invalid("a capture of no kind")),
-                    };
-                    let info = CaptureInfo { sources, capture_kind };
-                    Ok(CapturedPlace { place, info, mutability: self.mutability()? })
-                })
-                .collect::<Result<_, FormatError>>()?;
-            if min_captures.insert(binding, captures).is_some() {
+            if len == 0 {
+                return Err(self.invalid("a capture source stack without a source"));
+            }
+            sources.push(CaptureSourceStack::try_from_fn(len, || self.node())?);
+        }
+        Ok(sources.into_boxed_slice())
+    }
+
+    fn closure(&mut self, tys: &impl TyDecode, frame: &Frame) -> Result<ClosureData, FormatError> {
+        let len = self.len()?;
+        // alloc: the decoded roots, once at their number
+        let mut roots = Vec::with_capacity(len);
+        let mut seen = hashbrown::HashSet::with_capacity_and_hasher_in(len, FxBuildHasher, frame);
+        let mut captures = Vec::new_in(frame);
+        for _ in 0..len {
+            let binding: BindingId = self.local()?;
+            if !seen.insert(binding) {
                 return Err(self.invalid("a closure that captures a variable twice"));
             }
-        }
-        let len = self.len()?;
-        let fake_reads = (0..len)
-            .map(|_| {
+            let len = self.len()?;
+            captures.reserve(len);
+            for _ in 0..len {
                 let place = self.place(tys)?;
-                let cause = match self.word()? {
-                    0 => FakeReadCause::ForMatchGuard,
-                    1 => FakeReadCause::ForMatchedPlace(self.opt_expr()?),
-                    2 => FakeReadCause::ForGuardBinding,
-                    3 => FakeReadCause::ForLet(self.opt_expr()?),
-                    4 => FakeReadCause::ForIndex,
-                    _ => return Err(self.invalid("a fake read of no cause")),
+                let sources = self.sources()?;
+                let capture_kind = match self.word()? {
+                    0 => UpvarCapture::ByRef(BorrowKind::Immutable),
+                    1 => UpvarCapture::ByRef(BorrowKind::UniqueImmutable),
+                    2 => UpvarCapture::ByRef(BorrowKind::Mutable),
+                    3 => UpvarCapture::ByUse,
+                    4 => UpvarCapture::ByValue,
+                    _ => return Err(self.invalid("a capture of no kind")),
                 };
-                Ok((place, cause, self.sources()?))
-            })
-            .collect::<Result<_, FormatError>>()?;
+                let info = CaptureInfo { sources, capture_kind };
+                captures.push(CapturedPlace { place, info, mutability: self.mutability()? });
+            }
+            let end = u32::try_from(captures.len())
+                .map_err(|_| self.invalid("a closure with 2^32 captures or more"))?;
+            roots.push((binding, end));
+        }
+        // alloc: the decoded captures, once at their number (a drain is `TrustedLen`)
+        let min_captures = MinCaptures::from_parts(roots.into_boxed_slice(), captures.drain(..).collect());
+        let len = self.len()?;
+        // alloc: the decoded fake reads, once at their number
+        let mut fake_reads = Vec::with_capacity(len);
+        for _ in 0..len {
+            let place = self.place(tys)?;
+            let cause = match self.word()? {
+                0 => FakeReadCause::ForMatchGuard,
+                1 => FakeReadCause::ForMatchedPlace(self.opt_expr()?),
+                2 => FakeReadCause::ForGuardBinding,
+                3 => FakeReadCause::ForLet(self.opt_expr()?),
+                4 => FakeReadCause::ForIndex,
+                _ => return Err(self.invalid("a fake read of no cause")),
+            };
+            fake_reads.push((place, cause, self.sources()?));
+        }
+        let fake_reads = fake_reads.into_boxed_slice();
         let inputs_and_output = self.tys(tys)?;
         let flags = self.word()?;
         let abi = flags & 0b11_1111;
@@ -3037,19 +3236,20 @@ mod tests {
         Place {
             base_ty: types.i32.store(),
             base,
-            projections: vec![
+            projections: Box::new([
                 Projection { ty: types.u8.store(), kind: ProjectionKind::Field { field_idx: 1, variant_idx: 0 } },
                 Projection { ty: types.bool.store(), kind: ProjectionKind::Deref },
-            ],
+            ]),
         }
     }
 
-    fn sources(lens: &[u32]) -> SmallVec<[CaptureSourceStack; 2]> {
+    fn sources(lens: &[u32]) -> Box<[CaptureSourceStack]> {
         lens.iter()
             .map(|&len| {
-                let mut stack = CaptureSourceStack::from_single(expr(1).into());
-                (1..len).for_each(|it| stack.push(if it % 2 == 0 { expr(it).into() } else { pat(it).into() }));
-                stack
+                let ids: Vec<ExprOrPatIdPacked> = std::iter::once(expr(1).into())
+                    .chain((1..len).map(|it| if it % 2 == 0 { expr(it).into() } else { pat(it).into() }))
+                    .collect();
+                CaptureSourceStack::from_slice(&ids)
             })
             .collect()
     }
@@ -3061,6 +3261,7 @@ mod tests {
         let variant: VariantId = StructId::from_id(id(4)).into();
         let enum_variant: VariantId = EnumVariantId::from_id(id(5)).into();
         let def: GenericDefId = ImplId::from_id(id(9)).into();
+        let causes = cause_codes();
         let param = TypeOrConstParamId { parent: def, local_id: local_of(2) };
         let segment = PathGenericsSource::Segment(1);
         let assoc = PathGenericsSource::AssocType { segment: 2, assoc_type: 3 };
@@ -3123,6 +3324,8 @@ mod tests {
                 name: Name::new_root("MISSING"),
             },
             D::UnresolvedIdent { id: expr(7).into() },
+            D::UnresolvedPath { id: expr(7).into(), segment: 0 },
+            D::UnresolvedPath { id: pat(6).into(), segment: 2 },
             D::BreakOutsideOfLoop { expr: expr(8), is_break: false, bad_value_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(8), is_break: true },
             D::UnlabeledJumpInLabeledBlock { expr: expr(9), is_break: false },
@@ -3282,6 +3485,7 @@ mod tests {
                 top_term: Some(arg_of(types.u8)),
                 kind: TypeAnnotationNeeded::E0282,
                 ambiguity: None,
+                origin: Some((Span::ExprId(expr(31)), TypeParamId::from_unchecked(param).into())),
             },
             D::TypeMustBeKnown {
                 at_point: Span::PatId(pat(1)),
@@ -3291,6 +3495,7 @@ mod tests {
                     primary: AmbiguityNote { goal: goals[2].clone(), candidates: Vec::new() },
                     related: Vec::new(),
                 })),
+                origin: Some((Span::Dummy, ConstParamId::from_unchecked(param).into())),
             },
             D::TypeMustBeKnown {
                 at_point: Span::ExprId(expr(30)),
@@ -3312,9 +3517,16 @@ mod tests {
                         .map(|goal| AmbiguityNote { goal: goal.clone(), candidates: Vec::new() })
                         .collect(),
                 })),
+                origin: None,
             },
             D::UnionExprMustHaveExactlyOneField { expr: expr(21) },
-            D::TypeMismatch { node: pat(13).into(), expected: ty(types.i32), found: ty(types.bool), at_error: None },
+            D::TypeMismatch {
+                node: pat(13).into(),
+                expected: ty(types.i32),
+                found: ty(types.bool),
+                at_error: None,
+                cause: causes[0],
+            },
             D::TypeMismatch {
                 node: expr(35).into(),
                 expected: ty(types.i32),
@@ -3323,9 +3535,11 @@ mod tests {
                     Ty::new_without_interner(TyKind::Infer(InferTy::FreshIntTy(0))).store(),
                     Ty::new_without_interner(TyKind::Infer(InferTy::FreshFloatTy(0))).store(),
                 ))),
+                cause: causes[7],
             },
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(22)),
+                cause: causes[1],
                 kind: SolverDiagnosticKind::ClosureKindMismatch {
                     expected: ClosureKind::Fn,
                     found: ClosureKind::FnOnce,
@@ -3335,18 +3549,22 @@ mod tests {
             }),
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::Dummy,
+                cause: causes[2],
                 kind: SolverDiagnosticKind::Overflow { goal: goals[3].clone(), suggest_increasing_limit: true },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(31)),
+                cause: causes[3],
                 kind: SolverDiagnosticKind::ProjectionMismatch { goal: goals[2].clone() },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::PatId(pat(17)),
+                cause: causes[4],
                 kind: SolverDiagnosticKind::TypesDiffer { expected: ty(types.u8), found: ty(types.i32) },
             }),
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(32)),
+                cause: causes[5],
                 kind: SolverDiagnosticKind::ConstArgHasWrongType {
                     ct: arg_of(types.u8),
                     ct_ty: ty(types.bool),
@@ -3355,6 +3573,7 @@ mod tests {
             }),
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::TypeRefId(local_of(5)),
+                cause: causes[6],
                 kind: SolverDiagnosticKind::HigherRankedOutlives,
             }),
             D::ExplicitDropMethodUse { kind: ExplicitDropMethodUseKind::MethodCall(expr(23)) },
@@ -3379,6 +3598,7 @@ mod tests {
         all.extend(goals.iter().map(|goal| {
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(33)),
+                cause: causes[8],
                 kind: SolverDiagnosticKind::GoalUnmet { goal: goal.clone() },
             })
         }));
@@ -3393,6 +3613,7 @@ mod tests {
         all.extend(unreported.map(|code| {
             D::SolverDiagnostic(SolverDiagnostic {
                 span: Span::ExprId(expr(34)),
+                cause: causes[2],
                 kind: SolverDiagnosticKind::Unreported { code },
             })
         }));
@@ -3410,7 +3631,7 @@ mod tests {
             unmet: if code % 2 == 0 { Vec::new() } else { goals.to_vec() },
             output: (code % 3 == 0).then(|| ty(types.bool)),
         }));
-        all.extend(ARITH_OPS.map(|op| D::InvalidLhsOfAssignment { lhs: expr(20), assign: expr(22), op: Some(op) }));
+        all.extend(ArithOp::ALL.map(|op| D::InvalidLhsOfAssignment { lhs: expr(20), assign: expr(22), op: Some(op) }));
         all.extend(CAST_ERRORS.iter().map(|error| D::InvalidCast {
             expr: expr(28),
             error: error.clone(),
@@ -3472,10 +3693,9 @@ mod tests {
 
     fn closure() -> ClosureData {
         let types = &default_types().types;
-        let mut min_captures = crate::infer::RootVariableMinCaptureList::default();
-        min_captures.insert(
-            binding(4),
-            vec![
+        let min_captures = crate::infer::MinCaptures::from_parts(
+            Box::new([(binding(4), 2), (binding(1), 2)]),
+            Box::new([
                 CapturedPlace {
                     place: place(PlaceBase::Upvar { closure: expr(3), var_id: binding(4) }),
                     info: CaptureInfo { sources: sources(&[1, 2, 5]), capture_kind: UpvarCapture::ByRef(BorrowKind::UniqueImmutable) },
@@ -3486,9 +3706,8 @@ mod tests {
                     info: CaptureInfo { sources: sources(&[3]), capture_kind: UpvarCapture::ByValue },
                     mutability: Mutability::Not,
                 },
-            ],
+            ]),
         );
-        min_captures.insert(binding(1), Vec::new());
         ClosureData {
             min_captures,
             fake_reads: Box::new([
@@ -3507,6 +3726,11 @@ mod tests {
 
     /// A result with something in every column.
     fn result() -> InferenceResult<'static> {
+        blaze_mem::frame::task(crate::db::INFER_TAG, result_in)
+    }
+
+    /// [`result`], its builders in `frame`.
+    fn result_in(frame: &Frame) -> InferenceResult<'static> {
         let types = &default_types().types;
         let args = |tys: &[Ty<'static>]| {
             let args: Vec<_> = tys.iter().map(|&it| GenericArg::from(it)).collect();
@@ -3516,12 +3740,12 @@ mod tests {
         for (at, ty) in [(0, types.i32), (2, types.u8), (3, types.i32), (7, types.bool)] {
             type_of_expr.insert(expr(at), ty.store());
         }
-        let mut expr_adjustments = CsrBuilder::default();
+        let mut expr_adjustments = CsrBuilder::new_in(frame);
         expr_adjustments.insert(expr(1), ADJUSTS.iter().map(|kind| Adjustment { kind: kind.clone(), target: types.u8.store() }));
         expr_adjustments.ensure(expr(4));
-        let mut assignment_coercions = CsrBuilder::default();
+        let mut assignment_coercions = CsrBuilder::new_in(frame);
         assignment_coercions.insert(expr(6), [Adjustment { kind: Adjust::NeverToAny, target: types.unit.store() }]);
-        let mut pat_adjustments = CsrBuilder::default();
+        let mut pat_adjustments = CsrBuilder::new_in(frame);
         pat_adjustments.push(pat(2), PatAdjustment { kind: PatAdjust::OverloadedDeref, source: types.i32.store() });
         pat_adjustments.push(pat(2), PatAdjustment { kind: PatAdjust::BuiltinDeref, source: types.u8.store() });
         let mut mismatches = ExprOrPatSet::default();
@@ -3543,7 +3767,7 @@ mod tests {
             },
             value_resolutions: {
                 let param = TypeOrConstParamId { parent: FunctionId::from_id(id(33)).into(), local_id: local_of(1) };
-                let mut values = ExprOrPatMap::default();
+                let mut values = ExprOrPatMap::new_in(frame);
                 values.insert(expr(12).into(), ValueNs::ImplSelf(ImplId::from_id(id(34))));
                 values.insert(expr(13).into(), ValueNs::LocalBinding(binding(2)));
                 values.insert(expr(14).into(), ValueNs::FunctionId(FunctionId::from_id(id(35))));
@@ -3555,7 +3779,7 @@ mod tests {
                 values.freeze()
             },
             unstable_candidates: {
-                let mut candidates = ExprOrPatMap::default();
+                let mut candidates = ExprOrPatMap::new_in(frame);
                 let call: Box<[(CandidateId, Symbol)]> = Box::new([
                     (CandidateId::FunctionId(FunctionId::from_id(id(44))), Symbol::intern("iter_flatten")),
                     (CandidateId::ConstId(ConstId::from_id(id(45))), Symbol::intern("int_roundings")),
@@ -3586,6 +3810,11 @@ mod tests {
             has_errors: true,
             diagnostics: every_diagnostic().into_boxed_slice(),
             unreachable: every_unreachable().into_boxed_slice(),
+            traits_in_scope_used: Box::new([
+                (ExprOrPatId::ExprId(expr(12)), TraitId::from_id(id(47))),
+                (ExprOrPatId::PatId(pat(6)), TraitId::from_id(id(48))),
+                (ExprOrPatId::ExprId(expr(12)), TraitId::from_id(id(48))),
+            ]),
             nodes_with_type_mismatches: mismatches,
             error_ty: types.unit.store(),
             expr_adjustments: expr_adjustments.freeze(),
@@ -3632,6 +3861,16 @@ mod tests {
         assert_eq!(salsa_hash(&back), salsa_hash(&result));
         assert_eq!(back.diagnostics.len(), every_diagnostic().len());
         assert_eq!(back.unreachable.len(), every_unreachable().len());
+        assert_eq!(back.traits_in_scope_used(), result.traits_in_scope_used(), "in their order");
+    }
+
+    #[test]
+    fn a_trait_use_at_a_node_of_no_kind_is_refused() {
+        assert_eq!(node_of(&[2, 0]), None, "no third kind");
+        assert_eq!(node_of(&[0]), None, "a partial node");
+        for node in [ExprOrPatId::ExprId(expr(5)), ExprOrPatId::PatId(pat(7))] {
+            assert_eq!(node_of(&node_words(node)), Some(node));
+        }
     }
 
     /// One entry of each kind, after an expression and after a pattern, with and without a
@@ -3726,21 +3965,63 @@ mod tests {
         }
     }
 
+    /// A trait reference needs an interner, so no `TraitUnimplemented` is in the fixture; its
+    /// parent impls round trip here.
+    #[test]
+    fn every_cause_and_parent_impl_round_trips() {
+        let causes = cause_codes();
+        let impls = [
+            None,
+            Some(AnyImplId::ImplId(ImplId::from_id(id(40)))),
+            Some(AnyImplId::BuiltinDeriveImplId(BuiltinDeriveImplId::from_id(id(41)))),
+        ];
+        let mut sink = Sink::new();
+        causes.iter().for_each(|&it| sink.cause_code(it));
+        impls.iter().for_each(|&it| sink.optional_impl(it));
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            let mut source = Source { words: &sink.words, next: 0, text: &sink.text, at: 0, frame };
+            let read_causes = causes.iter().map(|_| source.cause_code().unwrap()).collect::<Vec<_>>();
+            let read_impls = impls.iter().map(|_| source.optional_impl().unwrap()).collect::<Vec<_>>();
+            assert_eq!(read_causes, causes);
+            assert_eq!(read_impls, impls);
+            assert!(source.is_done());
+        });
+    }
+
+    fn cause_codes() -> [ObligationCauseCode; 10] {
+        let item: GenericDefId = ImplId::from_id(id(9)).into();
+        [
+            ObligationCauseCode::Misc,
+            ObligationCauseCode::WhereClauseInExpr { item, bound_index: 3, arg_index: None },
+            ObligationCauseCode::WhereClauseInExpr { item, bound_index: 0, arg_index: Some(2) },
+            ObligationCauseCode::SizedArgumentType,
+            ObligationCauseCode::BlockTailExpression,
+            ObligationCauseCode::ReturnValue,
+            ObligationCauseCode::IfExpression,
+            ObligationCauseCode::MatchExpressionArm { prior_arms: 4 },
+            ObligationCauseCode::LetType,
+            ObligationCauseCode::SizedReturnType,
+        ]
+    }
+
     #[test]
     fn truncated_words_are_refused_not_misread() {
         let mut model = Model::default();
-        let mut sink = Sink::default();
+        let mut sink = Sink::new();
         let diagnostics = every_diagnostic();
         diagnostics.iter().for_each(|it| sink.diagnostic(&mut model, it));
         sink.closure(&mut model, &closure());
-        for len in 0..sink.words.len() {
-            let mut source = Source { words: &sink.words[..len], next: 0, text: &sink.text, at: 0 };
-            let read = (0..diagnostics.len())
-                .map(|_| source.diagnostic(&model))
-                .collect::<Result<Vec<_>, _>>()
-                .and_then(|_| source.closure(&model));
-            assert!(read.is_err(), "{len} of {} words read as a whole", sink.words.len());
-        }
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            for len in 0..sink.words.len() {
+                let mut source =
+                    Source { words: &sink.words[..len], next: 0, text: &sink.text, at: 0, frame };
+                let read = (0..diagnostics.len())
+                    .map(|_| source.diagnostic(&model))
+                    .collect::<Result<Vec<_>, _>>()
+                    .and_then(|_| source.closure(&model, frame));
+                assert!(read.is_err(), "{len} of {} words read as a whole", sink.words.len());
+            }
+        });
     }
 
     #[test]
@@ -3778,6 +4059,25 @@ mod tests {
         }
 
         assert!(decodes(&record, &model));
+    }
+
+    #[test]
+    fn a_record_is_made_at_its_length_and_again_the_same() {
+        let mut model = Model::default();
+        let record = InferenceRecord::of(&result(), &mut model);
+        assert_eq!(record.u64s.capacity(), record.u64s.len());
+        assert_eq!(record.u32s.capacity(), record.u32s.len());
+        assert_eq!(record.bytes.capacity(), record.bytes.len());
+        let mut again = Model::default();
+        assert_eq!(InferenceRecord::of(&result(), &mut again), record);
+    }
+
+    #[test]
+    fn a_diagnostic_count_past_the_words_is_refused() {
+        let mut model = Model::default();
+        let mut record = InferenceRecord::of(&result(), &mut model);
+        record.diagnostics = u32::MAX;
+        assert!(!decodes(&record, &model));
     }
 
     fn decodes(record: &InferenceRecord, model: &Model) -> bool {

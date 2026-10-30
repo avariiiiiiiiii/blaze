@@ -13,6 +13,7 @@ group's word, so salsa keeps its own (shuttle) atomics and orderings. salsa alre
 proptest differential against the old copies.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): both files below, as written. Not built.
 
 ### `vendor/salsa/src/graph/nodes.rs`
 
@@ -53,6 +54,7 @@ proptest differential against the old copies.
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): as written (the old `tag`/`matching`/`empty` and their constants deleted). Not built.
 
 ### `vendor/salsa/src/interned/table.rs`
 
@@ -105,6 +107,7 @@ proptest differential against the old copies.
    `live_skips_empty_and_dead` (now in `blaze_mem::swiss`'s tests); the rest stay.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): as written, the three moved tests deleted. Not built.
 
 # From mem-db-salsa (to lane db, owner of `vendor/salsa*`; window `db-next2`)
 
@@ -199,6 +202,7 @@ No manifest change: salsa already depends on `blaze-mem` (`vendor/salsa/Cargo.to
 `frame::task` needs no `allocator_api` in salsa. Held by M8's `tests/mem_frames.rs`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): all five sites, `Configuration::MEM_TAG`, `plumbing::MemTag`. Not built.
 
 ## M2. The `mem_tag` option (`salsa-macros`, `salsa-macro-rules`)
 
@@ -273,6 +277,7 @@ front-end lanes add `mem_tag = ..` to their tracked attributes (mem-db-def, mem-
 mem-db-solver, mem-db-checks file those).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): in the amended form below (`mem_tag` takes a path; the glob `use $zalsa::MemTag::*`). Not built.
 
 > mem-db, amending M2: `mem_tag` takes a path, so both `mem_tag = Infer` and
 > `mem_tag = crate::db::INFER_TAG` work. mem-db-infer's files use the second form (80 places).
@@ -405,6 +410,7 @@ fn flattened_edge_fingerprints(
    and by M8's warm re-check budget.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): as written. Not built.
 
 ## M4. Frames past the spare depth (to lane mem, through mem-db; not a salsa change)
 
@@ -429,6 +435,7 @@ names that frame and its current tag. M8's `a_nested_run_has_a_frame_of_its_own`
 designs to the contract (the outer run's bytes and tag are unchanged by an inner run).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> speed-salsa (window 17, 2026-10-29 22:20): nothing for salsa, as mem-db says below.
 > mem-db: the problem is real; the shared frame is unsound (an outer frame vector pushed during an
 > inner task lands above its marker), so it goes to lane mem as a requirement instead:
 > `v2/requests/mem-db.md` request 10. Nothing for salsa to change; M1 stands.
@@ -780,6 +787,7 @@ gone):
 `boxcar` stays a dependency (`views.rs:18`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): adapted to rows by page (`drop_impl` keeps its `first_row`, `Page::new` takes the arena after `memo_types` and still sets `memo_rows`); `PageArena::alloc` returns the start it claimed. Needs M9 (`Column::get_mut`, lane mem, `v2/requests/mem-db.md` request 11) to compile. Not built.
 
 ## M6. Graph pages from the kernel, not the allocator (`graph.rs`, `graph/edges.rs`, `graph/nodes.rs`)
 
@@ -887,6 +895,7 @@ dedup-intern's request above rewrites the probe bodies of `graph/nodes.rs` and
 two apply in either order.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): as written, plus the generic `zeroed` it replaces deleted. Not built.
 
 ## M7. The claim-free walk reuses the thread's stack (`function/maybe_changed_after.rs`)
 
@@ -976,6 +985,7 @@ fn walk_unclaimed<'db>(
    `tests/unclaimed_verify.rs` (a 300-deep chain, backdating, eight threads).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): as written (`walk_unclaimed`, `take_stack`/`give_stack`; the thread-local has an `// alloc:` line). Not built.
 
 ## M8. Tests
 
@@ -1215,6 +1225,7 @@ fn an_immediate_fallback_runs_in_a_frame() {
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by speed-salsa (window 17, 2026-10-29 22:20): both `alloc_budget.rs` tests, `tests/mem_frames.rs` and its `[[test]]` entry, plus the amendment's test (`mem_tag = Parse` and `mem_tag = crate::PARSE_TAG`, a `Mir` constant). Not built.
 
 ## M9. `Column::get_mut` (to lane mem, `crates/blaze-mem/src/column.rs`; window `mem-next1`)
 
@@ -1247,3 +1258,7 @@ fn get_mut_changes_a_published_value() {
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> speed-salsa (window 17, 2026-10-29 22:20): lane mem's (`crates/blaze-mem`), not salsa's; forwarded as mem-db.md request 11 and still unapplied there. M5 is written against it.
+
+> done by mem (2026-10-29): as written (`crates/blaze-mem/src/column.rs`), with its test.
+

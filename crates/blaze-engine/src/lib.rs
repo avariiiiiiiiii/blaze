@@ -2,6 +2,9 @@
 //! functions to native code that links against rustc-built artifacts.
 
 #![allow(clippy::print_stderr, reason = "a command line program: stderr is where it speaks")]
+#![feature(allocator_api)]
+// Unsafe code is in the functions that allow it alone (docs/v2/plan/design/unsafe.md).
+#![deny(unsafe_code)]
 
 // The cargo drop-in and what it stands on are blaze-cargo's; here they are the engine's modules
 // as they were, `crate::cargo::...`.
@@ -28,6 +31,7 @@ mod live;
 mod macro_list;
 mod macro_sandbox;
 mod manifest;
+mod memo;
 mod mirdump;
 mod outline;
 mod pin;
@@ -43,13 +47,18 @@ mod whole;
 /// The daemon holds millions of small allocations and frees a file's worth of them on each
 /// edit, which the system allocator is slow at. jemalloc gives the system back more of what
 /// a build freed than mimalloc does. It is not built for Windows.
-#[cfg(unix)]
+#[cfg(all(unix, not(test)))]
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// The tests hold the hot paths to allocation budgets.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use ide_db::base_db::{CrateOrigin, LangCrateOrigin, TargetKind};
 use std::{
@@ -415,9 +424,9 @@ struct Resolver<'a> {
     /// For each crate asked about, the paths that functions written in its bodies share.
     /// Every thread of the build asks about the same crates, and one of them looks.
     shared_paths: SharedPaths,
-    /// The symbols of the functions asked about, for every thread of the build: the threads
-    /// that compile find them ahead of the one that puts the functions in the object.
-    named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
+    /// What the threads of the build ask again for every unit: the threads that compile find
+    /// the symbols ahead of the one that puts the functions in the object.
+    memos: Arc<Memos>,
     /// The places of the closures and statics of the definitions gone through, for every
     /// thread of the build.
     places: Places,
@@ -450,7 +459,7 @@ struct ResolverParts<'a> {
     apart: Option<PathBuf>,
     listed: &'a Listed,
     shared_paths: SharedPaths,
-    named: Arc<std::sync::Mutex<FxHashMap<FunctionId, Option<String>>>>,
+    memos: Arc<Memos>,
     places: Places,
     own_linked: Option<Arc<FxHashSet<String>>>,
     in_full: Arc<std::sync::atomic::AtomicBool>,
@@ -471,7 +480,7 @@ impl<'a> Resolver<'a> {
             apart: self.apart.clone(),
             listed: self.listed,
             shared_paths: self.shared_paths.clone(),
-            named: self.named.clone(),
+            memos: self.memos.clone(),
             places: self.places.clone(),
             own_linked: self.own_linked.clone(),
             in_full: self.in_full.clone(),
@@ -497,7 +506,7 @@ impl<'a> ResolverParts<'a> {
             apart,
             listed,
             shared_paths,
-            named,
+            memos,
             places,
             own_linked,
             in_full,
@@ -516,7 +525,7 @@ impl<'a> ResolverParts<'a> {
             apart,
             listed,
             shared_paths,
-            named,
+            memos,
             places,
             own_linked,
             in_full,
@@ -534,6 +543,44 @@ struct Prebuilt {
     defined: Arc<FxHashSet<String>>,
     /// Its crates, as [`library_unit`] has them.
     crates: FxHashSet<ide_db::base_db::Crate>,
+}
+
+/// What the code generator asks of the resolver again for every unit, each worked out once a
+/// build ([`memo::Memo`]).
+struct Memos {
+    /// By whether the build had turned out to be one in full ([`Resolver::in_full`]) when the
+    /// symbol was named: in full, what only the executable has is named no more.
+    functions: memo::Memo<(FunctionId, bool), Option<intern::Symbol>>,
+    privates: memo::Memo<FunctionId, bool>,
+    statics: memo::Memo<StaticId, Option<intern::Symbol>>,
+    sources: memo::Memo<vfs::FileId, Option<intern::Symbol>>,
+    crates: memo::Memo<ide_db::base_db::Crate, CrateFacts>,
+}
+
+impl Memos {
+    /// Address space for as many as a build of every crate of crates.io names: nothing is
+    /// committed until it is filled.
+    fn new() -> Memos {
+        Memos {
+            functions: memo::Memo::new(1 << 23),
+            privates: memo::Memo::new(1 << 22),
+            statics: memo::Memo::new(1 << 20),
+            sources: memo::Memo::new(1 << 18),
+            crates: memo::Memo::new(1 << 16),
+        }
+    }
+}
+
+/// What a build asks of a crate for every unit that names an item of it.
+struct CrateFacts {
+    /// rustc's `StableCrateId`, when rustc built something of it.
+    rustc_id: Option<u64>,
+    /// Blaze's id of a crate rustc built nothing of ([`Resolver::own_crate_id`]).
+    own_id: Option<u64>,
+    /// [`SymbolResolver::rustc_built`].
+    rustc_built: bool,
+    /// How the paths of symbols spell it ([`Resolver::crate_path`]).
+    path: Option<Box<str>>,
 }
 
 /// The crates of the standard library a program links, which blaze builds apart from it
@@ -596,7 +643,7 @@ fn library_linked_by(
         &["std"]
     };
     let name = |it: ide_db::base_db::Crate| Crate::from(it).display_name(db);
-    let mut linked: Vec<ide_db::base_db::Crate> = (krate.transitive_deps(db).into_iter())
+    let mut linked: Vec<ide_db::base_db::Crate> = (krate.transitive_deps(db).iter().copied())
         .filter(|&it| it.data(db).origin.is_lang())
         .filter(|&it| name(it).is_some_and(|it| injected.contains(&it.crate_name().as_str())))
         .collect();
@@ -855,7 +902,8 @@ impl<'a> Resolver<'a> {
             apart,
             listed,
             shared_paths: Default::default(),
-            named: Default::default(),
+            // alloc: once a build, shared by its threads.
+            memos: Arc::new(Memos::new()),
             places: Places::default(),
             own_linked,
             in_full: Arc::default(),
@@ -886,6 +934,70 @@ impl<'a> Resolver<'a> {
 }
 
 impl Resolver<'_> {
+    /// [`SymbolResolver::static_`], worked out.
+    fn static_named(&self, id: StaticId) -> Option<String> {
+        if self.prebuilt(hir_def::HasModule::krate(&id, self.db)) {
+            return self.in_prebuilt(self.own_static_name(id)?);
+        }
+        let ModuleDef::Static(it) = ModuleDef::from(ModuleDefId::StaticId(id)) else {
+            return None;
+        };
+        let module = it.module(self.db);
+        let name = it.name(self.db);
+        if module.nearest_non_block_module(self.db) == module {
+            let path = self.item_path(module, name.as_str())?;
+            return self.table.get(&path).map(str::to_owned);
+        }
+        // A static in a body is named after the items around it, which only the syntax knows.
+        let sema = self.sema();
+        let source = sema.source(it)?;
+        let mut names = vec![name.as_str().to_owned()];
+        let mut closures = Vec::new();
+        let mut around = Vec::new();
+        let mut owner = None;
+        for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
+            if is_closure(&node) {
+                closures.push(closure_number(&sema, &self.places, &node)?);
+                continue;
+            }
+            if let Some(func) = ast::Fn::cast(node.clone()) {
+                if func.async_token().is_some() {
+                    closures.push(0);
+                }
+                let func = self.function_at(&sema, module, &func)?;
+                owner = Some(self.path(func.try_into().ok()?)?);
+                break;
+            }
+            if let Some(name) = name_in_path(&node) {
+                around.push(place_in_definition(&sema, &node, Counts::InPath(&name))?.into());
+                names.push(name);
+            }
+        }
+        let owner = match owner {
+            Some(owner) => owner,
+            None => {
+                around.pop();
+                let outer = names.pop()?;
+                self.item_path(module.nearest_non_block_module(self.db), &outer)?
+            }
+        };
+        names.push(owner);
+        names.reverse();
+        closures.reverse();
+        around.reverse();
+        let path = names.join("::");
+        // Only a path through a closure or an anonymous constant has segments left out of it.
+        let named = Counts::Statics(name.as_str());
+        let counted = Counted::Statics(name.as_str().to_owned());
+        let place =
+            place_counted(&sema, &self.places, counted, source.value.syntax(), named)?.into();
+        let symbol = self
+            .table
+            .get_nested(&path, &closures, place, &around)
+            .or_else(|| self.table.get_at(&path, place, &around));
+        symbol.map(str::to_owned)
+    }
+
     /// What `path` is called in the checkout, when it is a file of it.
     fn inside<'a>(&self, path: &'a Path) -> Option<&'a Path> {
         let base = self.base.as_deref().and_then(|base| path.strip_prefix(base).ok());
@@ -1117,10 +1229,39 @@ impl Resolver<'_> {
         shared
     }
 
+    /// rustc's `StableCrateId` of a crate it built something of.
+    fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        self.crate_facts(krate).rustc_id
+    }
+
+    /// How the paths of symbols spell a crate.
+    fn crate_path(&self, krate: Crate) -> Option<&str> {
+        self.crate_facts(krate.into()).path.as_deref()
+    }
+
+    /// What stands for a crate of the checkout that rustc built nothing of.
+    fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        self.crate_facts(krate).own_id
+    }
+
+    fn crate_facts(&self, krate: ide_db::base_db::Crate) -> &CrateFacts {
+        self.memos.crates.get_or_insert_with(krate, || self.crate_facts_of(krate))
+    }
+
+    /// Asks nothing of `memos.crates`: it is what fills it.
+    fn crate_facts_of(&self, krate: ide_db::base_db::Crate) -> CrateFacts {
+        let rustc_id = self.rustc_crate_id_of(krate);
+        let own_id = self.own_crate_id_of(krate, rustc_id);
+        let rustc_built = self.rustc_built_of(krate, own_id);
+        // alloc: a miss, once per crate a build.
+        let path = self.crate_path_of(krate.into(), own_id).map(String::into_boxed_str);
+        CrateFacts { rustc_id, own_id, rustc_built, path }
+    }
+
     /// rustc's `StableCrateId` of a crate it built something of. A crate of the checkout is
     /// one rustc built when a file of the link is its own: the standard library has private
     /// copies of crates (memchr, hashbrown) whose names a dependency at a path has too.
-    fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+    fn rustc_crate_id_of(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
         let ours = !krate.data(self.db).origin.is_lang();
         let krate = Crate::from(krate);
         let name = krate.display_name(self.db)?;
@@ -1134,12 +1275,12 @@ impl Resolver<'_> {
     /// How the paths of symbols spell a crate. One of the checkout that rustc built nothing
     /// of is spelled with its own id, so that no symbol of another crate of its name (the
     /// standard library's memchr) is taken for one of its items.
-    fn crate_path(&self, krate: Crate) -> Option<String> {
+    fn crate_path_of(&self, krate: Crate, own_id: Option<u64>) -> Option<String> {
         let name = krate.display_name(self.db)?;
         if self.table.is_empty() && krate.origin(self.db).is_lang() {
             return Some(name.crate_name().to_string());
         }
-        match self.own_crate_id(krate.into()) {
+        match own_id {
             Some(own) => Some(format!("{}[{own:x}]", name.crate_name())),
             None => self.table.crate_path(name.crate_name().as_str(), &self.crate_root(krate)?),
         }
@@ -1149,9 +1290,9 @@ impl Resolver<'_> {
     /// every edit: its name and where in the checkout its source starts. One of the standard
     /// library, when the build has nothing of rustc's, by its name alone: a program has one
     /// of each name, wherever its source is.
-    fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+    fn own_crate_id_of(&self, krate: ide_db::base_db::Crate, rustc_id: Option<u64>) -> Option<u64> {
         let lang = krate.data(self.db).origin.is_lang();
-        if lang && !self.table.is_empty() || self.rustc_crate_id(krate).is_some() {
+        if lang && !self.table.is_empty() || rustc_id.is_some() {
             return None;
         }
         let name = Crate::from(krate).display_name(self.db)?;
@@ -1163,6 +1304,30 @@ impl Resolver<'_> {
         let place = crate_place(&root, self.inside(&root), home.as_deref());
         let named = format!("blaze crate {} {place}", name.crate_name());
         Some(short_hash(&named))
+    }
+
+    /// A crate rustc built may have no symbol that says which it is: one of generics alone,
+    /// when nothing rustc built gives them their types. Its functions are still not ours to
+    /// name.
+    fn rustc_built_of(&self, krate: ide_db::base_db::Crate, own_id: Option<u64>) -> bool {
+        // The standard library is rustc's prebuilt one, unless the build has nothing of rustc's,
+        // where it is blaze's, compiled with the program or before it.
+        if self.prebuilt(krate) {
+            return true;
+        }
+        // What the prebuilt unit leaves out ([`library_unit`]), `proc_macro` and `test`, is
+        // compiled with the program that links it.
+        if krate.data(self.db).origin.is_lang() {
+            return !self.table.is_empty();
+        }
+        if own_id.is_none() {
+            return true;
+        }
+        let named = Crate::from(krate).display_name(self.db);
+        let root = self.crate_root(krate.into());
+        named
+            .zip(root)
+            .is_some_and(|(name, root)| self.table.links(name.crate_name().as_str(), &root))
     }
 
     /// The file the crate's source starts at.
@@ -1219,7 +1384,8 @@ impl Resolver<'_> {
     /// function, closure, constant or static the block is in, which only the syntax knows.
     fn scope_path(&self, module: Module) -> Option<String> {
         if module.nearest_non_block_module(self.db) == module {
-            let mut path = self.crate_path(module.krate(self.db))?;
+            // alloc: a miss: the path is built once, into the memo of what asked for it.
+            let mut path = self.crate_path(module.krate(self.db))?.to_owned();
             for segment in module.path_segments(self.db) {
                 path.push_str("::");
                 path.push_str(segment.as_str());
@@ -1348,6 +1514,7 @@ const LIBRARY: [&str; 3] = ["libcore-", "liballoc-", "libstd-"];
 
 /// What of [`toolchain_identity`] the library's rlibs among `files` say: the name of `std`'s
 /// and what the metadata of each of [`LIBRARY`] says.
+#[allow(unsafe_code)]
 fn library_identity(files: &[PathBuf]) -> Vec<String> {
     let mut identity: Vec<String> = files
         .iter()
@@ -1426,6 +1593,7 @@ fn library_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 impl SymbolResolver for Resolver<'_> {
+    // dyn: a method of the object-safe `SymbolResolver`, run once per parallel phase of a build
     fn in_parallel_beside(&self, count: usize, work: &ParallelWork<'_>, beside: &mut dyn FnMut()) {
         let threads = std::thread::available_parallelism().map_or(1, |it| it.get()).min(count);
         // One alone is as soon done by whoever asks for what it computes.
@@ -1439,12 +1607,14 @@ impl SymbolResolver for Resolver<'_> {
         let counted = hir_ty_codegen::counted::now();
         // A worker's panic goes on as itself, a cancellation first: the scope would end in one
         // of its own, which callers can't tell from a bug.
-        let stopped = std::thread::scope(|scope| {
-            let workers: Vec<_> = (0..threads)
-                .map(|_| {
+        let stopped = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+            std::thread::scope(|scope| {
+                let mut workers = Vec::with_capacity_in(threads, frame);
+                for _ in 0..threads {
                     let (db, next, parts) = (self.db, &next, self.parts());
                     let counted = counted.clone();
-                    scope.spawn(move || {
+                    // alloc: a thread a core per batch of units, not per unit.
+                    workers.push(scope.spawn(move || {
                         let _worker = trace::cold_span("worker", batch);
                         let resolver = parts.over(db);
                         hir_ty_codegen::counted::within(counted, || {
@@ -1459,27 +1629,28 @@ impl SymbolResolver for Resolver<'_> {
                                 }
                             })
                         })
-                    })
-                })
-                .collect();
-            {
-                let _caller = trace::cold_span("caller", batch);
-                beside();
-            }
-            // From when the caller is done to when the last thread is.
-            join = trace::cold_span("join", batch);
-            let mut stopped: Option<Box<dyn std::any::Any + Send>> = None;
-            for worker in workers {
-                let Err(panic) = worker.join() else { continue };
-                let cancelled = panic.is::<ide_db::base_db::salsa::Cancelled>();
-                if stopped
-                    .as_ref()
-                    .is_none_or(|it| cancelled && !it.is::<ide_db::base_db::salsa::Cancelled>())
-                {
-                    stopped = Some(panic);
+                    }));
                 }
-            }
-            stopped
+                {
+                    let _caller = trace::cold_span("caller", batch);
+                    beside();
+                }
+                // From when the caller is done to when the last thread is.
+                join = trace::cold_span("join", batch);
+                // dyn: a worker's panic payload, only when a worker panics.
+                let mut stopped: Option<Box<dyn std::any::Any + Send>> = None;
+                for worker in workers {
+                    let Err(panic) = worker.join() else { continue };
+                    let cancelled = panic.is::<ide_db::base_db::salsa::Cancelled>();
+                    if stopped
+                        .as_ref()
+                        .is_none_or(|it| cancelled && !it.is::<ide_db::base_db::salsa::Cancelled>())
+                    {
+                        stopped = Some(panic);
+                    }
+                }
+                stopped
+            })
         });
         drop(join);
         if let Some(panic) = stopped {
@@ -1487,8 +1658,13 @@ impl SymbolResolver for Resolver<'_> {
         }
     }
 
-    fn source_path(&self, file: vfs::FileId) -> Option<String> {
-        source_path(self.db, &self.root, self.base.as_deref(), file)
+    fn source_path(&self, file: vfs::FileId) -> Option<intern::Symbol> {
+        // alloc: a miss, a file named and interned once a build.
+        let named = || {
+            source_path(self.db, &self.root, self.base.as_deref(), file)
+                .map(|it| intern::Symbol::intern(&it))
+        };
+        *self.memos.sources.get_or_insert_with(file, named)
     }
 
     fn debug_directory(&self) -> Option<String> {
@@ -1511,17 +1687,18 @@ impl SymbolResolver for Resolver<'_> {
         self.library
     }
 
-    fn function(&self, func: FunctionId) -> Option<String> {
-        if let Some(named) = self.named.lock().unwrap_or_else(|e| e.into_inner()).get(&func) {
-            return named.clone();
-        }
-        let named = self.function_named(func);
-        self.named.lock().unwrap_or_else(|e| e.into_inner()).insert(func, named.clone());
-        named
+    fn function(&self, func: FunctionId) -> Option<intern::Symbol> {
+        let in_full = self.in_full.load(std::sync::atomic::Ordering::Relaxed);
+        // alloc: a miss, the symbol named and interned once a build.
+        let named = || self.function_named(func).map(|it| intern::Symbol::intern(&it));
+        *self.memos.functions.get_or_insert_with((func, in_full), named)
     }
 
     fn private(&self, func: FunctionId) -> bool {
-        !self.is_generic(func) && self.path(func).is_some_and(|path| self.table.private(&path))
+        // alloc: a miss: the path is spelled once a build.
+        let private =
+            || !self.is_generic(func) && self.path(func).is_some_and(|path| self.table.private(&path));
+        *self.memos.privates.get_or_insert_with(func, private)
     }
 
     fn defines(&self, symbol: &str) -> bool {
@@ -1539,19 +1716,21 @@ impl SymbolResolver for Resolver<'_> {
     }
 
     fn in_full(&self) {
+        // Some were named after what only the executable has: from now on `function` asks
+        // under `in_full`, where none of them is.
         self.in_full.store(true, std::sync::atomic::Ordering::Relaxed);
-        // Some were named after what only the executable has.
-        self.named.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
-    fn closure(&self, owner: FunctionId, expr: hir_def::hir::ExprId) -> Option<String> {
+    fn closure(&self, owner: FunctionId, expr: hir_def::hir::ExprId) -> Option<intern::Symbol> {
         let source_map = &Body::with_source_map(self.db, owner.into()).1;
         let written = source_map.expr_syntax(expr).ok()?;
         let sema = self.sema();
         let node = written.value.to_node(&sema.parse_or_expand(written.file_id));
+        // alloc: a closure's path, once per unit that names it.
         let mut inner = Vec::new();
         for node in sema.ancestors_with_macros(node.syntax().clone()) {
             if is_closure(&node) {
+                // alloc: a closure's path, once per unit that names it.
                 inner.push(format!("{{closure#{}}}", closure_number(&sema, &self.places, &node)?));
                 continue;
             }
@@ -1568,43 +1747,25 @@ impl SymbolResolver for Resolver<'_> {
             path.push_str("::");
             path.push_str(segment);
         }
-        self.table.get(&path).map(str::to_owned)
+        self.table.get(&path).map(intern::Symbol::intern)
     }
 
-    fn makers(&self, function: &str) -> Vec<u64> {
-        self.table.makers(function).collect()
+    fn makers(&self, function: &str, out: &mut Vec<u64>) {
+        out.extend(self.table.makers(function));
     }
 
-    fn copies(&self, symbol: &str) -> Vec<(String, u64)> {
-        self.table.copies(symbol).map(|(copy, of)| (copy.to_owned(), of)).collect()
+    fn copies(&self, symbol: &str, out: &mut Vec<(intern::Symbol, u64)>) {
+        // Each copy was interned the first time it was asked for; after that, a lookup.
+        out.extend(self.table.copies(symbol).map(|(copy, of)| (intern::Symbol::intern(copy), of)));
     }
 
-    /// A crate rustc built may have no symbol that says which it is: one of generics alone,
-    /// when nothing rustc built gives them their types. Its functions are still not ours to
-    /// name.
     fn rustc_built(&self, krate: ide_db::base_db::Crate) -> bool {
-        // The standard library is rustc's prebuilt one, unless the build has nothing of rustc's,
-        // where it is blaze's, compiled with the program or before it.
-        if self.prebuilt(krate) {
-            return true;
-        }
-        // What the prebuilt unit leaves out ([`library_unit`]), `proc_macro` and `test`, is
-        // compiled with the program that links it.
-        if krate.data(self.db).origin.is_lang() {
-            return !self.table.is_empty();
-        }
-        if self.own_crate_id(krate).is_none() {
-            return true;
-        }
-        let named = Crate::from(krate).display_name(self.db);
-        let root = self.crate_root(krate.into());
-        named
-            .zip(root)
-            .is_some_and(|(name, root)| self.table.links(name.crate_name().as_str(), &root))
+        self.crate_facts(krate).rustc_built
     }
 
     fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
-        self.rustc_crate_id(krate).or_else(|| self.own_crate_id(krate))
+        let facts = self.crate_facts(krate);
+        facts.rustc_id.or(facts.own_id)
     }
 
     fn content_id(&self, krate: ide_db::base_db::Crate) -> Option<ContentId> {
@@ -1709,79 +1870,19 @@ impl SymbolResolver for Resolver<'_> {
         self.table.static_copy(symbol).cloned()
     }
 
-    fn static_(&self, id: StaticId) -> Option<String> {
-        if self.prebuilt(hir_def::HasModule::krate(&id, self.db)) {
-            return self.in_prebuilt(self.own_static_name(id)?);
-        }
-        let ModuleDef::Static(it) = ModuleDef::from(ModuleDefId::StaticId(id)) else {
-            return None;
-        };
-        let module = it.module(self.db);
-        let name = it.name(self.db);
-        if module.nearest_non_block_module(self.db) == module {
-            let path = self.item_path(module, name.as_str())?;
-            return self.table.get(&path).map(str::to_owned);
-        }
-        // A static in a body is named after the items around it, which only the syntax knows.
-        let sema = self.sema();
-        let source = sema.source(it)?;
-        let mut names = vec![name.as_str().to_owned()];
-        let mut closures = Vec::new();
-        let mut around = Vec::new();
-        let mut owner = None;
-        for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
-            if is_closure(&node) {
-                closures.push(closure_number(&sema, &self.places, &node)?);
-                continue;
-            }
-            if let Some(func) = ast::Fn::cast(node.clone()) {
-                if func.async_token().is_some() {
-                    closures.push(0);
-                }
-                let func = self.function_at(&sema, module, &func)?;
-                owner = Some(self.path(func.try_into().ok()?)?);
-                break;
-            }
-            if let Some(name) = name_in_path(&node) {
-                let named = |other: &SyntaxNode| name_in_path(other).as_ref() == Some(&name);
-                around.push(place_in_definition(&sema, &node, &named)?.into());
-                names.push(name);
-            }
-        }
-        let owner = match owner {
-            Some(owner) => owner,
-            None => {
-                around.pop();
-                let outer = names.pop()?;
-                self.item_path(module.nearest_non_block_module(self.db), &outer)?
-            }
-        };
-        names.push(owner);
-        names.reverse();
-        closures.reverse();
-        around.reverse();
-        let path = names.join("::");
-        // Only a path through a closure or an anonymous constant has segments left out of it.
-        let named = |node: &SyntaxNode| {
-            ast::Static::cast(node.clone())
-                .is_some_and(|it| it.name().is_some_and(|it| it.text() == name.as_str()))
-        };
-        let counted = Counted::Statics(name.as_str().to_owned());
-        let place =
-            place_counted(&sema, &self.places, counted, source.value.syntax(), &named)?.into();
-        let symbol = self
-            .table
-            .get_nested(&path, &closures, place, &around)
-            .or_else(|| self.table.get_at(&path, place, &around));
-        symbol.map(str::to_owned)
+    fn static_(&self, id: StaticId) -> Option<intern::Symbol> {
+        // alloc: a miss, a static named and interned once a build.
+        let named = || self.static_named(id).map(|it| intern::Symbol::intern(&it));
+        *self.memos.statics.get_or_insert_with(id, named)
     }
 
-    fn path(&self, path: &str) -> Option<String> {
-        self.table.get(path).map(str::to_owned)
+    fn path(&self, path: &str) -> Option<&str> {
+        self.table.get(path)
     }
 
     fn item(&self, item: ModuleDefId) -> Option<String> {
         let item = ModuleDef::from(item);
+        // alloc: an item's path, which the caller extends into the symbol it spells.
         self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
     }
 
@@ -1793,7 +1894,7 @@ impl SymbolResolver for Resolver<'_> {
         let name = segments.pop()?;
         Crate::all(db)
             .into_iter()
-            .filter(|&it| self.crate_path(it).as_deref() == Some(krate))
+            .filter(|&it| self.crate_path(it) == Some(krate))
             .find_map(|it| {
                 let mut module = it.root_module(db);
                 for segment in &segments {
@@ -1876,7 +1977,7 @@ fn is_definition(node: &SyntaxNode) -> bool {
 fn place_in_definition(
     sema: &hir::Semantics<'_>,
     target: &SyntaxNode,
-    counts: &dyn Fn(&SyntaxNode) -> bool,
+    counts: Counts<'_>,
 ) -> Option<u32> {
     let along: Vec<_> = sema.ancestors_with_macros(target.clone()).collect();
     let owner = owner_of(&along)?;
@@ -1907,7 +2008,7 @@ fn place_counted(
     places: &Places,
     counted: Counted,
     target: &SyntaxNode,
-    counts: &dyn Fn(&SyntaxNode) -> bool,
+    counts: Counts<'_>,
 ) -> Option<u32> {
     let along: Vec<_> = sema.ancestors_with_macros(target.clone()).collect();
     let owner = owner_of(&along)?;
@@ -1936,7 +2037,7 @@ fn place_counted(
 fn all_places(
     sema: &hir::Semantics<'_>,
     owner: &SyntaxNode,
-    counts: &dyn Fn(&SyntaxNode) -> bool,
+    counts: Counts<'_>,
 ) -> Option<FxHashMap<Spot, u32>> {
     let mut count = Count::new(sema, None, Vec::new(), counts, owner);
     count.places = Some(FxHashMap::default());
@@ -1993,6 +2094,27 @@ enum Counted {
     Closures,
     /// The statics of a name.
     Statics(String),
+}
+
+/// The nodes a count counts.
+#[derive(Clone, Copy)]
+enum Counts<'a> {
+    Closures,
+    /// The statics of a name.
+    Statics(&'a str),
+    /// The constants and statics [`name_in_path`] gives a name.
+    InPath(&'a str),
+}
+
+impl Counts<'_> {
+    fn holds(self, node: &SyntaxNode) -> bool {
+        match self {
+            Counts::Closures => is_closure(node),
+            Counts::Statics(name) => ast::Static::cast(node.clone())
+                .is_some_and(|it| it.name().is_some_and(|it| it.text() == name)),
+            Counts::InPath(name) => name_in_path(node).as_deref() == Some(name),
+        }
+    }
 }
 
 /// Where a node is in a definition: the macros it is expanded from, the outermost first,
@@ -2102,7 +2224,7 @@ struct Count<'a, 'db> {
     target: Option<&'a SyntaxNode>,
     /// The target and what it is in, the macros it is expanded from with their expansions.
     along: Vec<SyntaxNode>,
-    counts: &'a dyn Fn(&SyntaxNode) -> bool,
+    counts: Counts<'a>,
     late: LateImports,
     seen: u32,
     earlier: Option<u32>,
@@ -2120,7 +2242,7 @@ impl<'a, 'db> Count<'a, 'db> {
         sema: &'a hir::Semantics<'db>,
         target: Option<&'a SyntaxNode>,
         along: Vec<SyntaxNode>,
-        counts: &'a dyn Fn(&SyntaxNode) -> bool,
+        counts: Counts<'a>,
         owner: &SyntaxNode,
     ) -> Self {
         let late = LateImports::around(sema, owner);
@@ -2203,7 +2325,7 @@ impl<'a, 'db> Count<'a, 'db> {
             if target {
                 self.earlier = Some(self.seen);
             }
-            let counted = (self.counts)(&child);
+            let counted = self.counts.holds(&child);
             if counted && let Some(places) = &mut self.places {
                 let spot = (self.calls.clone(), child.text_range());
                 if places.insert(spot.clone(), self.seen).is_some() {
@@ -2368,7 +2490,7 @@ fn closure_number(
     places: &Places,
     closure: &SyntaxNode,
 ) -> Option<u32> {
-    place_counted(sema, places, Counted::Closures, closure, &is_closure)
+    place_counted(sema, places, Counted::Closures, closure, Counts::Closures)
 }
 
 /// The crates called `krate` that a build of the checkout at `checkout` compiles: a package's
@@ -2437,7 +2559,7 @@ fn checks_differ(db: &RootDatabase, built: &[Crate]) -> bool {
     let flag = cfg::CfgAtom::Flag(intern::sym::overflow_checks);
     let program: FxHashSet<ide_db::base_db::Crate> = built
         .iter()
-        .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db))
+        .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db).iter().copied())
         .filter(|it| !it.data(db).origin.is_lang())
         .collect();
     let mut checks = program.iter().map(|it| it.cfg_options(db).check_atom(&flag));
@@ -2568,7 +2690,7 @@ fn deps_of(
     db: &Db,
     krate: ide_db::base_db::Crate,
 ) -> FxHashSet<ide_db::base_db::Crate> {
-    krate.transitive_deps(db).into_iter().collect()
+    krate.transitive_deps(db).iter().copied().collect()
 }
 
 /// The crates called `krate` to build: the ones rustc built into this program, when it built
@@ -2774,7 +2896,7 @@ impl Checkouts {
         let root = AbsPathBuf::assert_utf8(self.roots[base].1.clone());
         let over = AbsPathBuf::assert_utf8(over.to_owned());
         if let ProjectWorkspaceKind::Cargo { cargo, .. } = &mut workspace.kind {
-            *cargo = cargo.placed(&root, &over, &|dir| {
+            *cargo = cargo.placed(&root, &over, |dir| {
                 dir.strip_prefix(&root).is_some_and(|it| own.contains(AsRef::<Path>::as_ref(&it)))
             });
         }
@@ -2824,7 +2946,7 @@ impl Checkouts {
         &self,
         project: &Path,
         overlay: Overlay,
-        quick: &dyn Fn(&Path, &Path) -> bool,
+        quick: &impl Fn(&Path, &Path) -> bool,
     ) -> Option<View> {
         let project = dunce::canonicalize(project).ok()?;
         if let Some((_, root)) = self.roots.iter().find(|(it, _)| *it == project) {
@@ -3276,7 +3398,7 @@ fn workspace_at(
     let start = Instant::now();
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(project));
     let manifest = ProjectManifest::discover_single(&root)?;
-    let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config, &|_| {})?;
+    let mut workspace = ProjectWorkspace::load(manifest.clone(), cargo_config)?;
     let described: &Path = manifest.manifest_path().as_ref();
     if workspace.is_json()
         && selection.target.as_deref() == Some(cargo::own_macro::WASM_TARGET)
@@ -3392,7 +3514,7 @@ fn workspace_at(
                     config = &own_config;
                 }
                 events::within(events::Step::BuildScripts, None, || {
-                    workspace.run_build_scripts(config, &|_| {})
+                    workspace.run_build_scripts(config)
                 })?
             }
         };
@@ -3544,7 +3666,8 @@ fn built_crates(db: &RootDatabase, args: &Args) -> anyhow::Result<Vec<ide_db::ba
     for name in args.crates() {
         for krate in crates_named(db, name, args)? {
             let krate: ide_db::base_db::Crate = krate.into();
-            crates.extend(krate.transitive_deps(db).into_iter().filter(|&dep| seen.insert(dep)));
+            let deps = krate.transitive_deps(db).iter().copied();
+            crates.extend(deps.filter(|&dep| seen.insert(dep)));
         }
     }
     Ok(crates)
@@ -4290,7 +4413,7 @@ impl Listed {
         // Asked before the lock is taken: a query that is cancelled unwinds, and would poison it.
         let seeing: Vec<Crate> = crates
             .iter()
-            .flat_map(|krate| krate.transitive_rev_deps(db).into_iter().map(Crate::from))
+            .flat_map(|krate| krate.transitive_rev_deps(db).iter().copied().map(Crate::from))
             .collect();
         let mut functions = lock(&self.functions);
         for krate in seeing {
@@ -5023,7 +5146,8 @@ fn link_executable(
             crates.extend(
                 ide_db::base_db::Crate::from(krate)
                     .transitive_deps(db)
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .filter(|it| {
                         let data = it.data(db);
                         !data.origin.is_lang() && !data.target_kind.is_proc_macro()
@@ -5228,6 +5352,7 @@ fn build(
     args: &Args,
     known: &mut Rejections,
     listed: &Listed,
+    // dyn: asked once per build, and a generic would copy all of `build` for each caller
     hold: Option<&dyn Fn() -> bool>,
 ) -> anyhow::Result<Option<Build>> {
     let start = Instant::now();
@@ -5288,7 +5413,7 @@ fn build(
         let tested = tests_linked(db, &local, of_tests(args));
         let own: FxHashSet<ide_db::base_db::Crate> = local
             .iter()
-            .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db))
+            .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db).iter().copied())
             .filter(|it| !it.data(db).origin.is_lang())
             .collect();
         let macros = macros_linked(db, &local, &own);
@@ -7975,6 +8100,7 @@ fn requested(stream: UnixStream) -> Option<Event> {
 
 /// Ends the process when its standard input ends: the daemon that started this worker holds
 /// the other end for as long as it lives, however it dies.
+#[allow(unsafe_code)]
 fn end_with_input() {
     while input_line().is_some() {}
     // The executables on disk get the last edits before the worker goes, and the store what
@@ -8240,6 +8366,7 @@ fn lower_until(
     listed: &Listed,
     threads: usize,
     follow: bool,
+    // dyn: asked per function compiled and per 5 ms wait; `compile_unnamed` takes it as `dyn`
     done: &(dyn Fn() -> bool + Sync),
 ) -> anyhow::Result<()> {
     use ide_db::base_db::salsa::Database as _;
@@ -8571,10 +8698,6 @@ impl Said {
         let (built, whole) = std::sync::mpsc::channel();
         let read = said.clone();
         std::thread::spawn(move || {
-            let tell = |told: &dyn Fn(&mut Lines)| {
-                told(&mut read.lines.lock().unwrap_or_else(|e| e.into_inner()));
-                read.more.notify_all();
-            };
             loop {
                 let line = input_line().and_then(|text| serde_json::from_str::<Line>(&text).ok());
                 match line {
@@ -8585,10 +8708,10 @@ impl Said {
                             .into_iter()
                             .map(|it| cargo::Record::kept_copy(&it).unwrap_or(it))
                             .for_each(symbols::read_ahead),
-                        None => tell(&|it| it.said.push(line.clone())),
+                        None => read.tell(Some(line)),
                     },
                     Some(Line::Whole(told)) => {
-                        tell(&|it| it.ended = true);
+                        read.tell(None);
                         _ = built.send(Args::parse(told.args.into_iter()));
                         return end_with_input();
                     }
@@ -8598,6 +8721,17 @@ impl Said {
             std::process::exit(0);
         });
         (said, whole)
+    }
+
+    /// Takes in a line cargo said, or with `None` that it is done saying.
+    fn tell(&self, said: Option<String>) {
+        let mut lines = self.lines.lock().unwrap_or_else(|e| e.into_inner());
+        match said {
+            Some(line) => lines.said.push(line),
+            None => lines.ended = true,
+        }
+        drop(lines);
+        self.more.notify_all();
     }
 
     /// The lines so far, and whether they are all there will be.
@@ -8739,7 +8873,7 @@ impl Beside {
         fn any_waits(
             cargo: &CargoWorkspace,
             package: project_model::Package,
-            waits: &dyn Fn(project_model::Package) -> bool,
+            waits: &impl Fn(project_model::Package) -> bool,
             waiting: &mut FxHashMap<project_model::Package, bool>,
         ) -> bool {
             if let Some(&known) = waiting.get(&package) {
@@ -8856,6 +8990,7 @@ fn follow_cargo(
 
 /// Loads the library of the toolchain, waits to be told a build, and runs as the worker of
 /// it. The process ends when its input does without a build.
+#[allow(unsafe_code)]
 fn spare(dir: &Path) -> anyhow::Result<()> {
     // A build may start while the library loads, and its lines are read as they come.
     std::sync::LazyLock::force(&INPUT);
@@ -8891,7 +9026,7 @@ fn process_wide() {
     // A proc macro rustc compiled, as cargo's builds do, is expanded with blaze's module or
     // library of it.
     if server.is_some() || cargo::own_macro::wasm() {
-        load_cargo::own_libraries_with(Box::new(|sysroot, workspace, libraries| {
+        load_cargo::own_libraries_with(|sysroot, workspace, libraries| {
             let libraries: Vec<_> = libraries
                 .iter()
                 .map(|it| cargo::own_macro::Compiled {
@@ -8907,7 +9042,7 @@ fn process_wide() {
                 _ => Err(format!("blaze made {} where a path is not text", it.display())),
             };
             made.into_iter().map(|it| it?.map(path).transpose()).collect()
-        }));
+        });
     }
 }
 
@@ -8917,7 +9052,7 @@ fn held_wide() {
     hir_def::nameres::EXPAND_BUILTIN_DERIVES.store(true, std::sync::atomic::Ordering::Relaxed);
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
     blaze_expand::install();
-    load_cargo::wasm_macros_with(Box::new(blaze_macro_wasm::load));
+    load_cargo::wasm_macros_with(blaze_macro_wasm::load);
     // Every proc-macro server is started in the sandbox.
     macro_sandbox::install();
 }
@@ -9385,7 +9520,7 @@ fn run_holding(
                     for krate in args.crates() {
                         for krate in crates_to_build(&db, &table, krate, &args)? {
                             let krate: ide_db::base_db::Crate = krate.into();
-                            within.extend(krate.transitive_deps(&db));
+                            within.extend(krate.transitive_deps(&db).iter().copied());
                         }
                     }
                     Arc::new(within)
@@ -10925,6 +11060,7 @@ struct Edit {
 }
 
 /// What a panic said, from what it unwound with.
+// dyn: a panic payload
 fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
     panic
         .downcast_ref::<String>()
@@ -10974,6 +11110,7 @@ impl Program {
     /// Takes a build that panicked as the build's error, not the worker's: the clients are
     /// told why, the worker stays, and the next build is a whole one, since what the build
     /// left of the patch base and of the executable may be half written.
+    // dyn: a panic payload
     fn panicked(&mut self, panic: &(dyn std::any::Any + Send)) -> Result<String, Refused> {
         self.known.start_again();
         self.unbuilt.stale = true;
@@ -11118,7 +11255,7 @@ impl Program {
         let table = &self.table;
         let used: FxHashSet<_> = built
             .iter()
-            .flat_map(|it| it.transitive_deps(db))
+            .flat_map(|it| it.transitive_deps(db).iter().copied())
             .filter(|&it| table.is_empty() || links(db, table, it.into()))
             .collect();
         let edited: Vec<_> = self
@@ -11130,7 +11267,7 @@ impl Program {
         if edited.is_empty() {
             return None;
         }
-        let mut stale: Vec<_> = edited.iter().flat_map(|it| it.transitive_rev_deps(db)).collect();
+        let mut stale: Vec<_> = edited.iter().flat_map(|it| it.transitive_rev_deps(db).iter().copied()).collect();
         stale.retain(|it| used.contains(it) && !built.contains(it));
         blaze_ids::radix::sort_copy_by_key(&mut stale, |it| {
             let id = salsa::plumbing::AsId::as_id(it);
@@ -11619,6 +11756,74 @@ mod tests {
         assert_eq!(splice::MOVED_STATIC, hir_ty_codegen::MOVED_STATIC);
     }
 
+    /// Each kind of node a count counts holds of its nodes alone: closures and `async` blocks,
+    /// the statics of a name, and the constants and statics of a name in a path (`_` for an
+    /// unnamed constant).
+    #[test]
+    fn a_count_counts_the_nodes_of_its_kind() {
+        let text = r#"
+static A: u8 = 0;
+static B: u8 = 0;
+const A: u8 = 0;
+const _: u8 = 0;
+fn f() { let _ = || 0; let _ = async {}; let _ = {}; }
+"#;
+        let tree = syntax::SourceFile::parse(text, syntax::Edition::CURRENT).syntax_node();
+        let held = |counts: Counts<'_>| {
+            let nodes = tree.descendants().filter(|it| counts.holds(it));
+            nodes.map(|it| it.text().to_string()).collect::<Vec<_>>()
+        };
+        assert_eq!(held(Counts::Closures), ["|| 0", "async {}"]);
+        assert_eq!(held(Counts::Statics("A")), ["static A: u8 = 0;"]);
+        assert_eq!(held(Counts::InPath("A")), ["static A: u8 = 0;", "const A: u8 = 0;"]);
+        assert_eq!(held(Counts::InPath("_")), ["const _: u8 = 0;"]);
+        assert!(held(Counts::Statics("C")).is_empty());
+    }
+
+    /// What cargo says is taken in line by line, and its end wakes who waits for more.
+    #[test]
+    fn what_cargo_says_is_kept_until_it_ends() {
+        let said = Said::default();
+        assert!(!said.more_than(0));
+        said.tell(Some("one".to_owned()));
+        said.tell(Some("two".to_owned()));
+        assert!(said.more_than(1) && !said.more_than(2));
+        assert_eq!(said.so_far(), (vec!["one".to_owned(), "two".to_owned()], false));
+        std::thread::scope(|scope| {
+            let waits = scope.spawn(|| said.wait_more_than(2));
+            said.tell(None);
+            waits.join().unwrap();
+        });
+        assert!(said.more_than(2));
+        assert_eq!(said.so_far(), (vec!["one".to_owned(), "two".to_owned()], true));
+    }
+
+    /// A package of the workspace is read beside cargo's build once cargo has run the build
+    /// scripts of every package it depends on.
+    #[test]
+    fn a_package_is_ready_once_the_build_scripts_it_depends_on_ran() {
+        use project_model::{CargoWorkspace, ManifestPath};
+        let json = include_str!("../../project-model/test_data/hello-world-metadata.json");
+        let meta: project_model::Metadata =
+            serde_json::from_str(&json.replace("$ROOT$", "/ROOT/")).unwrap();
+        let manifest = ManifestPath::try_from(AbsPathBuf::assert_utf8("/ROOT/".into())).unwrap();
+        let cargo = CargoWorkspace::new(meta, manifest, Default::default(), false);
+        let mut beside = Beside {
+            said: Arc::new(Said::default()),
+            at: 0,
+            awaited: FxHashSet::default(),
+            built: FxHashSet::default(),
+            applied: 0,
+        };
+        beside.awaits(&cargo, cargo.packages());
+        assert_eq!(beside.ready(&cargo, &[]), (FxHashSet::default(), false));
+        let libc = "libc 0.2.98 (registry+https://github.com/rust-lang/crates.io-index)";
+        let ran = format!(r#"{{"reason":"build-script-executed","package_id":"{libc}"}}"#);
+        let (ready, all) = beside.ready(&cargo, &[ran]);
+        assert!(all);
+        assert!(ready.contains(Path::new("/ROOT/hello-world/src/lib.rs")), "{ready:?}");
+    }
+
     #[test]
     fn a_directory_of_the_checkout_named_registry_is_watched() {
         let immutable = |path: &str| WatchedFile::immutable(Path::new(path));
@@ -11777,6 +11982,71 @@ fn main() {}
             assert_eq!(crates_of(&within(&[example]), shared), [example]);
             assert_eq!(crates_of(&within(&[app]), shared), [app]);
             assert_eq!(crates_of(&within(&[example]), main), [app]);
+        });
+    }
+
+    /// The questions a unit asks of the resolver for each function it calls, each panic it
+    /// can make and each crate, asked again by the same unit compiled again on the same
+    /// thread, allocate nothing: the first answers are the build's.
+    #[test]
+    fn a_warm_unit_asks_the_resolver_without_allocating() {
+        use test_fixture::WithFixture;
+        let (db, file) = RootDatabase::with_single_file(
+            r#"
+pub struct Point { x: u32 }
+pub fn callee(point: &Point) -> u32 { point.x }
+pub fn caller() -> u32 { callee(&Point { x: 1 }) }
+"#,
+        );
+        let args = ["/ws", "--crate", "ra_test_fixture", "--out", "/dev/null"].map(str::to_owned);
+        let args = Args::parse(args.into_iter()).unwrap();
+        let (table, contents, listed) =
+            (SymbolTable::default(), content::Contents::default(), Listed::default());
+        hir::attach_db(&db, || {
+            let resolver = Resolver::of_rustcs(&db, &table, &args, &contents, &listed);
+            let sema = hir::Semantics::new(&db);
+            let file = file.file_id(&db);
+            let module = sema.file_to_module_defs(file).next().unwrap();
+            let krate = ide_db::base_db::Crate::from(module.krate(&db));
+            let mut functions = Vec::new();
+            for def in module.declarations(&db) {
+                if let ModuleDef::Function(func) = def {
+                    functions.extend(FunctionId::try_from(func).ok());
+                }
+            }
+            assert_eq!(functions.len(), 2);
+            // The buffers the backend keeps across units (`spare::with_copies`).
+            let (mut makers, mut copies) = (Vec::with_capacity(8), Vec::with_capacity(8));
+            let mut ask = |resolver: &Resolver<'_>| {
+                for &func in &functions {
+                    std::hint::black_box(resolver.function(func));
+                    std::hint::black_box(resolver.private(func));
+                }
+                std::hint::black_box(SymbolResolver::source_path(resolver, file));
+                std::hint::black_box(resolver.stable_crate_id(krate));
+                std::hint::black_box(resolver.rustc_built(krate));
+                makers.clear();
+                resolver.makers("callee", &mut makers);
+                copies.clear();
+                resolver.copies("callee", &mut copies);
+                std::hint::black_box(SymbolResolver::path(resolver, "ra_test_fixture::callee"));
+            };
+            ask(&resolver);
+            blaze_alloc_count::assert_at_most(0, "a warm unit's questions of the resolver", || {
+                ask(&resolver)
+            });
+            // What the memos answer is what working it out again says.
+            for &func in &functions {
+                let again = resolver.function_named(func).map(|it| intern::Symbol::intern(&it));
+                assert_eq!(resolver.function(func), again);
+            }
+            // A build that turns out to be in full names every function again.
+            let named = resolver.memos.functions.len();
+            resolver.in_full();
+            for &func in &functions {
+                std::hint::black_box(resolver.function(func));
+            }
+            assert_eq!(resolver.memos.functions.len(), named + functions.len());
         });
     }
 

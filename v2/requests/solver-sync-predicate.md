@@ -22,6 +22,10 @@ one (cache key missing an input). Make each buffer schema include `TABLE_SCHEMA`
 
 > forwarded to db: `crates/hir-ty/src/{lower,infer}/persist.rs` are its.
 
+> applied by db (db-ty-port-ty; checked by db-next2, 2026-10-29 22:16): `lower/persist.rs:50`
+> and `infer/persist.rs:79` are `schema_of(&[Part::Str(..), .., Part::Schema(next_solver::persist::TABLE_SCHEMA)])`,
+> infer's with `Part::U64(2)` for its `splatted()` encoding. Not compiled.
+
 ## 2. `infer/persist.rs`'s closure signature drops `FnSigKind`'s splatted argument
 
 The nightly's `FnSigKind` has a second field, the splatted argument (`splatted() ->
@@ -42,3 +46,5 @@ the C-variadic flag) and checks it against the signature's inputs. `infer/persis
   .set_abi(..).set_safety(..).set_c_variadic(..)` where no splat is possible.
 
 > forwarded to db.
+
+> applied by db (db-ty-port-ty; checked by db-next2, 2026-10-29 22:28): writer `| u32::from(kind.splatted().unwrap_or(NO_SPLATTED_ARG_INDEX)) << 8` (`infer/persist.rs:2273`); reader refuses `flags >> 16 != 0`, a signature with no output, and an index past the inputs (`:3131-3147`); `TY_TABLE_SCHEMA` has `Part::U64(2)`. Tests: the round trip's closures with `Some(1)` and `None`. No three-argument `FnSigKind::new` left. Not compiled.

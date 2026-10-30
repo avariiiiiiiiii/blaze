@@ -139,6 +139,7 @@ fn hard_gated(cx: &Cx<'_, '_>, features: &Features, pre: Pre, feature: &str, at:
 
 /// The pre-expansion gates' errors, feature by feature in `check_crate`'s order.
 fn hard(cx: &Cx<'_, '_>, features: &Features, spans: &pre::Spans) -> Vec<Found> {
+    // alloc: empty, allocates only when a gate is hit
     let mut found = Vec::new();
     for (pre, gated_spans) in PRES.into_iter().zip(spans) {
         let Some((feature, explain, help)) = hard_gate(pre) else { continue };
@@ -231,6 +232,7 @@ fn soft(cx: &Cx<'_, '_>, features: &Features, spans: &pre::Spans) -> Stash {
     let mut stash = Stash::default();
     let warn = |stash: &mut Stash, feature: &str, gated: &Gated, explain: &str| {
         let span = cx.span(gated.at);
+        // clone: the warning's span, only when a soft gate is hit
         let mut diag = feature_warn(features, feature, span.clone(), explain);
         source_fact(cx, &mut diag, gated.node);
         stash.stash(span, diag);

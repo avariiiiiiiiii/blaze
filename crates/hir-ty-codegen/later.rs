@@ -161,7 +161,7 @@ impl<'db> Keeper<'_, 'db> {
 
     fn source_path(&mut self, file: base_db::FileId) -> Option<String> {
         let symbols = self.symbols;
-        let spelled = || symbols.source_path(file).map(|it| as_rustc_spells(&it));
+        let spelled = || symbols.source_path(file).map(|it| as_rustc_spells(it.as_str()));
         self.source_paths.entry(file).or_insert_with(spelled).clone()
     }
 
@@ -389,7 +389,7 @@ impl<'db> Keeper<'_, 'db> {
     }
 
     /// The function of the program that an instance without arguments is of, and its symbol.
-    fn root_named(&self, name: &str) -> Option<(FunctionId, String)> {
+    fn root_named(&self, name: &str) -> Option<(FunctionId, intern::Symbol)> {
         // A call names the lifetimes its callee has, which the root is named without.
         let erased = stable::StableNames::lifetimes_erased(name);
         if let Some(&Some(func)) = self.root_names.get(&*erased) {

@@ -1,6 +1,8 @@
 //! What a job of the daemon asks of the build (docs/v2/plan/lanes/cargo/notes.md section 6): the steps
 //! between a plan and its outputs, behind traits so the loop runs the same in the daemon
-//! ([`crate::serve::unit::Real`]) and in the simulation ([`crate::serve::tests`]).
+//! ([`crate::serve::unit::Real`]) and in the simulation ([`crate::serve::tests`]). The loop is
+//! generic over its [`Steps`], whose associated types are the front end's: `blaze serve` is
+//! one instance of it, on `Real`, with no trait object and no downcast.
 //!
 //! Where each is called is part of its contract:
 //!
@@ -8,7 +10,7 @@
 //!   the network or the disk; they touch no state of the loop.
 //! - **On a worker of the plane**: [`Steps::lower`], [`Front::compile`], [`Front::reach`],
 //!   [`Front::ub_tests`], [`Front::evaluate`], [`Front::codegen_inputs`], [`Front::tables`].
-//!   They read the front end through the [`Reader`] the loop made as it posted the task, the
+//!   They read the front end through the [`Steps::Reader`] the loop made as it posted the task, the
 //!   VFS's reader and the store through [`JobInput`], and give back what the loop writes
 //!   ([`Compiled::puts`]); a [`Failed::Again`] goes back to the loop, which posts it again
 //!   with a new reader. No worker locks to read.
@@ -23,7 +25,7 @@
 //! never cloned (docs/v2/plan/process/decisions.md). The tasks that read it are those of a
 //! batch added with `reads` ([`crate::serve::plane::Plane::add`]): every compile, the
 //! `--ub` selection and evaluations, a reach (of both its views) and the codegen inputs. Each
-//! is posted with a [`Reader`], a shared reference it holds for its run and drops as it ends,
+//! is posted with a [`Steps::Reader`], a shared reference it holds for its run and drops as it ends,
 //! with no lock, no clone of the database and no cancellation. The tables are measured, which
 //! salsa does only with the database exclusive: their task, the front end's last use, is
 //! handed the job's [`Writer`] itself.
@@ -45,12 +47,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    any::Any,
-    sync::{Arc, atomic::AtomicBool},
-};
+use std::sync::{Arc, atomic::AtomicBool};
 
-use blaze_api::{ApiError, Artifact, Diagnostic, Reach, Response, Table, TestResult, Ub};
+use blaze_api::{ApiError, Artifact, Diagnostic, Edit, Edited, Reach, Response, Table, TestResult, Ub};
 use blaze_cas::Store;
 use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
@@ -194,8 +193,25 @@ pub struct Compiled {
     pub macros: Option<load_cargo::v2::ProcMacroLoadResult>,
 }
 
-/// The build of one job, as the daemon has it: one value for every job.
-pub trait Steps: Send + Sync + 'static {
+/// The build of one job, as the daemon has it: one value for every job. Its associated types
+/// are its front end's, so the loop holds each by its own type.
+pub trait Steps: Sized + Send + Sync + 'static {
+    /// One job's front end, its units lowered: shared by the job's tasks.
+    type Front: Front<Self>;
+    /// What of a job's front end only the loop writes.
+    type Writer: Writer<Self>;
+    /// What a task reads the front end through: a shared reference to it, made by the loop as
+    /// it posted the task ([`Writer::reader`]) and dropped as the task ends. While one is
+    /// alive the front end is not written; a write waits for it ([`Writer::apply`]).
+    type Reader: Send + 'static;
+    /// A job's front end kept by the loop once the job is done with it ([`Writer::keep`]), for
+    /// the next job of the same head to lower into ([`Steps::lower`]).
+    type KeptFront: Send + 'static;
+    /// What the front keeps of a linked image ([`Image`]).
+    type Linked: Kept;
+    /// User code of a job run through the loop's driver ([`Runs`]).
+    type Runs: Runs<Self>;
+
     /// On an IO thread: the source `fetch` names, fetched and checked (a `.crate`'s sha256 and
     /// its paths kept inside it, a git tree at its commit, an index file as served).
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError>;
@@ -208,7 +224,7 @@ pub trait Steps: Send + Sync + 'static {
     /// the head's last build ([`Writer::keep`]): built from the same units and config, it is
     /// moved to the job's view, its memos kept, and what changed alone read again; else it
     /// is dropped and the units lowered anew.
-    fn lower(&self, job: &JobInput, kept: Option<KeptFront>) -> Result<FrontEnd, Failed>;
+    fn lower(&self, job: &JobInput, kept: Option<Self::KeptFront>) -> Result<FrontEnd<Self>, Failed>;
     /// On the loop, once at start: the queries of the daemon's database.
     fn register(&self, db: &mut Database) {
         blaze_units::query::register(db);
@@ -230,81 +246,50 @@ pub trait Steps: Send + Sync + 'static {
 
 /// One job's front end, lowered on a worker and handed to the loop in two: what every task
 /// shares, and what only the loop writes.
-pub struct FrontEnd {
-    pub front: Arc<dyn Front>,
-    pub writer: Box<dyn Writer>,
-}
-
-/// What a task reads the front end through: a shared reference to it, made by the loop as it
-/// posted the task and dropped as the task ends. While one is alive the front end is not
-/// written; a write waits for it ([`Writer::apply`]).
-pub struct Reader(Box<dyn Any + Send>);
-
-impl Reader {
-    pub fn new(it: impl Any + Send) -> Reader {
-        Reader(Box::new(it))
-    }
-
-    /// What [`Reader::new`] was given.
-    ///
-    /// # Panics
-    ///
-    /// When it was given another type: a reader of another front.
-    pub fn take<R: Any>(self) -> R {
-        match self.0.downcast() {
-            Ok(it) => *it,
-            Err(_) => panic!("a reader of another front than {}", std::any::type_name::<R>()),
-        }
-    }
-}
-
-/// A job's front end kept by the loop once the job is done with it, for the next job of the
-/// same head to lower into ([`Steps::lower`]).
-pub struct KeptFront(Box<dyn Any + Send>);
-
-impl KeptFront {
-    pub fn new(it: impl Any + Send) -> KeptFront {
-        KeptFront(Box::new(it))
-    }
-
-    /// What [`KeptFront::new`] was given; none for another type, kept by another front.
-    pub fn take<K: Any>(self) -> Option<K> {
-        self.0.downcast().ok().map(|it| *it)
-    }
+pub struct FrontEnd<S: Steps> {
+    pub front: Arc<S::Front>,
+    pub writer: S::Writer,
+    /// Values for the store the lowering made (the images of dependency crates the head's last
+    /// front end resolved), put by the loop as a compile's are.
+    pub puts: Vec<Put>,
 }
 
 /// The readers a task is posted with: of its job's front end, and for a reach, of the front it
 /// reaches from; for a compile, the images it relinks; for the tables, the job's writer itself.
-#[derive(Default)]
-pub struct Readers {
-    pub this: Option<Reader>,
-    pub from: Option<Reader>,
-    pub images: Vec<Image>,
-    pub writer: Option<Box<dyn Writer>>,
+pub struct Readers<S: Steps> {
+    pub this: Option<S::Reader>,
+    pub from: Option<S::Reader>,
+    pub images: Vec<Image<S>>,
+    pub writer: Option<S::Writer>,
+}
+
+impl<S: Steps> Default for Readers<S> {
+    fn default() -> Readers<S> {
+        Readers { this: None, from: None, images: Vec::new(), writer: None }
+    }
 }
 
 /// An image kept linked between jobs at the path cargo writes it, so the next link of it
 /// relinks only what changed. The loop owns every one; it moves it into the one compile that
 /// relinks it ([`Front::compile`]) and takes it back with what the compile made. One the
 /// compile does not give back (its link failed, or it gave way) is linked whole next time.
-pub struct Image {
+pub struct Image<S: Steps> {
     pub path: String,
-    pub kept: Box<dyn Kept>,
+    pub kept: S::Linked,
 }
 
 /// What a front keeps of a linked image.
-pub trait Kept: Any + Send {
+pub trait Kept: Send + 'static {
     /// Its tables as the linker counts them: name, elements, bytes ([`Response::Tables`]).
     fn tables(&self) -> Vec<(&'static str, u64, u64)>;
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send>;
 }
 
 /// What of a job's front end only the loop writes. Its writes are asked for, then applied
-/// together by [`Writer::apply`] once no [`Reader`] of it is alive (the module's docs).
-pub trait Writer: Send + 'static {
+/// together by [`Writer::apply`] once no [`Steps::Reader`] of it is alive (the module's docs).
+pub trait Writer<S: Steps>: Send + 'static {
     /// A reader of the front end as it stands, for one task about to be posted; none while a
     /// write is asked for and not applied, when the loop holds the task instead.
-    fn reader(&self) -> Option<Reader>;
+    fn reader(&self) -> Option<S::Reader>;
     /// Asks for the run of build script unit `run` applied to the units depending on it
     /// (`load_cargo::v2::Lowered::ran`): checked now, an error naming what is wrong with it,
     /// and applied by [`Writer::apply`].
@@ -322,15 +307,26 @@ pub trait Writer: Send + 'static {
     /// tables (name, elements, bytes), measured with it exclusive, as salsa measures; an
     /// error while a reader of it is alive.
     fn tables(&mut self) -> Result<Vec<(&'static str, u64, u64)>, Failed>;
+    /// On the loop, once every task of the job's build has ended and before it is kept: what
+    /// the build's front end found wrong only once all of it ran (a dependency's image that
+    /// differs from what its crate resolves to, under `BLAZE_DEP_IMAGES=check`), as the
+    /// build's error.
+    fn finished(&mut self) -> Result<(), ApiError> {
+        Ok(())
+    }
+    /// On the loop, once every task of the job's build has ended and before it is kept: each
+    /// library crate of the build that is not a workspace member, sorted by cargo package
+    /// name, with whether its check outcome and its bodies were served from the store,
+    /// checked, or refused ([`blaze_api::Worked::served`]).
+    fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError>;
     /// On the loop, once every task of the job's build has ended: the front end with every
     /// write applied, for the head's next build to lower into. None while a reader of it is
     /// alive or a write fails to apply: the next build lowers anew.
-    fn keep(self: Box<Self>) -> Option<KeptFront>;
+    fn keep(self) -> Option<S::KeptFront>;
 }
 
 /// One job's front end, its units lowered: shared by the job's tasks, read only.
-pub trait Front: Send + Sync + 'static {
-    fn as_any(&self) -> &dyn Any;
+pub trait Front<S: Steps>: Send + Sync + 'static {
     /// On the loop, as unit `unit` (an index into `Units::graph.units`) is about to start:
     /// whether nothing of it will be made again (cargo's `Fresh`).
     fn fresh(&self, unit: usize) -> bool;
@@ -339,52 +335,58 @@ pub trait Front: Send + Sync + 'static {
     /// is done, the runs of build scripts it depends on applied. `images` are the kept images
     /// at the unit's outputs (`UnitPlan::outputs`): it takes each it relinks and puts back
     /// what it linked.
-    fn compile(&self, reader: Reader, unit: usize, images: &mut Vec<Image>) -> Result<Compiled, Failed>;
+    fn compile(&self, reader: S::Reader, unit: usize, images: &mut Vec<Image<S>>) -> Result<Compiled, Failed>;
     /// On the loop: the run of build script unit `unit` (mode `RunCustomBuild`). Its run
     /// reports [`Response::BuildScript`] (and cargo's warnings as diagnostics), and before it
     /// ends applies its directives as cargo does to the units they reach (`rustc-cfg`,
     /// `rustc-env`, `rustc-link-lib`, `rustc-link-search`, `DEP_<links>_*` of dependents).
     /// It ends not ok for a script that failed, after the diagnostic cargo gives.
-    fn script(&self, unit: usize, tags: u64) -> Result<Box<dyn Runs>, ApiError>;
+    fn script(&self, unit: usize, tags: u64) -> Result<S::Runs, ApiError>;
     /// On the loop, once every unit is built: the tests of the build (their artifacts in
     /// `built`) that `selection` selects, each reported as a [`Response::TestResult`]; it ends
     /// not ok when one failed. It runs compiled binaries and reads nothing of the front end.
-    fn tests(&self, built: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<Box<dyn Runs>, ApiError>;
+    fn tests(&self, built: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<S::Runs, ApiError>;
     /// On a worker, for `blaze test --ub` once every unit is checked: the tests `selection`
     /// selects (as libtest would: its filters, `--exact`, `#[ignore]`), by name in libtest's
     /// order, each run by [`Front::evaluate`].
-    fn ub_tests(&self, reader: Reader, selection: Selection<'_>) -> Result<Vec<String>, Failed>;
+    fn ub_tests(&self, reader: S::Reader, selection: Selection<'_>) -> Result<Vec<String>, Failed>;
     /// On a worker: the test named `test` of [`Front::ub_tests`] run in blaze's MIR
     /// evaluator under `ub` (`hir_ty_ub::run_test`), nothing compiled. It passes, fails as a
     /// panicking test does (honoring `#[should_panic]`), or fails with the evaluator's report
     /// then `seed: N` as its output for undefined behavior, or with what the evaluator can't
     /// run: never a pass and never a compiled run in its place.
-    fn evaluate(&self, reader: Reader, test: &str, ub: Ub) -> Result<TestResult, Failed>;
+    fn evaluate(&self, reader: S::Reader, test: &str, ub: Ub) -> Result<TestResult, Failed>;
     /// On the loop, once every unit is built: `bin` (cargo's choice when none) run with
     /// `args`, reported as [`Response::Ran`].
-    fn run(&self, built: &[Artifact], bin: Option<&str>, args: &[String], tags: u64)
-    -> Result<Box<dyn Runs>, ApiError>;
+    fn run(&self, built: &[Artifact], bin: Option<&str>, args: &[String], tags: u64) -> Result<S::Runs, ApiError>;
     /// On a worker: what the change from `from`'s view to this one reaches, building nothing.
-    fn reach(&self, reader: Reader, from: &dyn Front, from_reader: Reader, changes: &[Change]) -> Result<Reach, Failed>;
+    fn reach(&self, reader: S::Reader, from: &Self, from_reader: S::Reader, changes: &[Change]) -> Result<Reach, Failed>;
+    /// On a worker: `edits` made in the view's files (`blaze_intent::apply`), building
+    /// nothing: what they change, for the session to commit ([`Response::Edited`]).
+    fn edit(&self, reader: S::Reader, edits: &[Edit]) -> Result<Edited, Failed>;
+    /// On a worker, for `Work::Ahead`: the units (by their place in the plan's graph) of the
+    /// test binaries holding a test `filter` selects, as libtest selects, to build ahead of a
+    /// run that has not been asked for.
+    fn ahead(&self, reader: S::Reader, filter: &[String]) -> Result<Vec<u32>, Failed>;
     /// On a worker: each codegen unit's inputs and output of the view's last build, as
     /// [`Response::CodegenInputs`] lists them.
-    fn codegen_inputs(&self, reader: Reader) -> Result<Vec<(ContentId, ContentId)>, Failed>;
+    fn codegen_inputs(&self, reader: S::Reader) -> Result<Vec<(ContentId, ContentId)>, Failed>;
     /// On a worker: the front end's tables, each by its owner, measured through the job's
     /// `writer` ([`Writer::tables`]), with `images`, the linker's tables of the images kept
     /// when the loop posted it ([`Response::Tables`]).
-    fn tables(&self, writer: Box<dyn Writer>, images: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed>;
+    fn tables(&self, writer: S::Writer, images: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed>;
 }
 
 /// User code of a job run through the loop's driver: it asks with effects whose tags are in
 /// the range it was given (`tags..tags + 2^32`), takes their completions, and reports. Each
 /// method that can end it says so with `Some(ok)`; after that it is asked nothing more. A
 /// build script's is given its job's [`Writer`] to apply its run with; tests and runs, none.
-pub trait Runs: Send {
+pub trait Runs<S: Steps>: Send + 'static {
     /// Asks for what it runs first; it may end at once (a result the store kept).
     fn start(
         &mut self,
         store: &Store,
-        writer: Option<&mut dyn Writer>,
+        writer: Option<&mut S::Writer>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool>;
@@ -393,7 +395,7 @@ pub trait Runs: Send {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut dyn Writer>,
+        writer: Option<&mut S::Writer>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool>;

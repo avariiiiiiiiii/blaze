@@ -309,7 +309,7 @@ fn f() { foo }
                 "file_item_tree_query",
                 "HirFileId::ast_id_map_",
                 "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::expand_proc_macro_",
+                "MacroCallId::proc_macro_expansion_",
                 "MacroCallId::macro_arg_",
                 "proc_macro_span",
             ]
@@ -321,7 +321,7 @@ fn f() { foo }
                 "file_item_tree_query",
                 "real_span_map",
                 "MacroCallId::macro_arg_",
-                "MacroCallId::expand_proc_macro_",
+                "MacroCallId::proc_macro_expansion_",
                 "MacroCallId::parse_macro_expansion_",
                 "HirFileId::ast_id_map_",
                 "file_item_tree_query",
@@ -447,7 +447,7 @@ pub struct S {}
                 "file_item_tree_query",
                 "HirFileId::ast_id_map_",
                 "MacroCallId::parse_macro_expansion_",
-                "MacroCallId::expand_proc_macro_",
+                "MacroCallId::proc_macro_expansion_",
                 "MacroCallId::macro_arg_",
                 "proc_macro_span",
             ]
@@ -669,8 +669,8 @@ fn execute_assert_events(
 fn item_after_impl_is_its_own_span_anchor() {
     use hir_expand::HirFileId;
     use syntax::{
-        AstNode,
-        ast::{self, HasModuleItem},
+        ast as tag,
+        view::{self as ast, AstNode, HasModuleItem},
     };
 
     let (db, pos) = TestDB::with_position(
@@ -684,10 +684,13 @@ struct AfterImpl;
 "#,
     );
     let file_id = HirFileId::from(pos.file_id);
-    let after_impl = pos.file_id.parse(&db).tree().items().last().unwrap();
+    let after_impl = pos.file_id.parse(&db).view().items().last().unwrap();
     assert!(matches!(after_impl, ast::Item::Struct(_)));
     let span = file_id.span_map(&db).span_for_range(after_impl.syntax().text_range());
 
-    assert_eq!(span.anchor.ast_id, file_id.ast_id_map(&db).ast_id(&after_impl).erase());
+    assert_eq!(
+        span.anchor.ast_id,
+        file_id.ast_id_map(&db).ast_id_of_view::<tag::Item>(after_impl).erase()
+    );
     assert_eq!(u32::from(span.range.start()), 0);
 }

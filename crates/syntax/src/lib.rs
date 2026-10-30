@@ -166,7 +166,7 @@ impl<T> Parse<T> {
         validation::validate_outline(
             &root,
             &lazies,
-            &mut |at, errors| {
+            |at, errors| {
                 if !all_bodies && !tree.is_parsed(at) {
                     return false;
                 }
@@ -440,31 +440,6 @@ impl SourceFile {
 
         assert_eq!(root.kind(), SyntaxKind::SOURCE_FILE);
         Parse::with_outline(tree, errors, Some(edition))
-    }
-
-    /// The parse of the file `key` names (a number the caller gives one file and edition, as
-    /// base-db's `EditionedFileId`), whose text is now `text`: in full, or an outline when
-    /// `outline`. Made by [`Parse::reparse_to`] from the last parse of `key` this process
-    /// kept, when it kept one of the same kind, else by a whole parse; kept for the next.
-    /// Either way it is the parse [`SourceFile::parse_shared`] or
-    /// [`SourceFile::parse_outline`] makes of `text`, so which one was kept (or whether one
-    /// was) changes how long it takes, never what it is.
-    pub fn parse_file(
-        key: u32,
-        text: impl Into<Text>,
-        edition: Edition,
-        outline: bool,
-    ) -> Parse<SourceFile> {
-        let text = text.into();
-        let parse = match parsing::kept::take(key).filter(|it| it.is_outline() == outline) {
-            Some(previous) => previous.reparse_to(text, edition),
-            None => match outline {
-                true => SourceFile::parse_outline(text, edition),
-                false => SourceFile::parse_shared(text, edition),
-            },
-        };
-        parsing::kept::keep(key, &parse);
-        parse
     }
 }
 

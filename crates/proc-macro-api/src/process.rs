@@ -2,7 +2,6 @@
 
 use std::{
     cell::RefCell,
-    ffi::OsString,
     fmt::Debug,
     io::{self, BufRead, BufReader, Read, Write},
     panic::AssertUnwindSafe,
@@ -18,13 +17,15 @@ use stdx::JodChild;
 use crate::{
     ProcMacro, ProcMacroKind, ProtocolFormat, ServerError,
     bidirectional_protocol::{
-        self, SubCallback,
-        msg::{BidirectionalMessage, SubResponse},
-        reject_subrequests,
+        self, SubCallback, answer, closed,
+        msg::{BidirectionalMessage, SubRequest, SubResponse},
+        reject_subrequests, unexpected, wrap_decode, wrap_encode, wrap_io,
     },
-    legacy_protocol::{self, SpanMode},
+    legacy_protocol::{self, SpanMode, answer_error},
+    transport::postcard,
     version,
     warm::{self, Environment, LinkExit, LinkReader, LinkWriter, Tracer, Warm},
+    wire::{Heard, HeardResponse, Sent, WireAsk, WireSpan, read_tree, write_tree},
 };
 
 /// Represents a process handling proc-macro communication.
@@ -103,8 +104,85 @@ impl From<ProtocolFormat> for Protocol {
     }
 }
 
-pub trait ProcessExit: Send + Sync {
-    fn exit_err(&mut self) -> Option<ServerError>;
+/// What tells a connection its server ended, by the way blaze reaches it.
+pub(crate) enum Exit {
+    /// A server process blaze started: its exit status.
+    Child(Process),
+    /// A warm server: its link, which the driver told.
+    Warm(LinkExit),
+}
+
+impl Exit {
+    fn exit_err(&mut self) -> Option<ServerError> {
+        match self {
+            Exit::Child(process) => process.exit_err(),
+            Exit::Warm(link) => link.exit_err(),
+        }
+    }
+}
+
+/// The end of a connection a request is written to.
+pub(crate) enum Writer {
+    /// A server process's stdin.
+    Child(ChildStdin),
+    /// A warm server's link.
+    Warm(LinkWriter),
+}
+
+impl Write for Writer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Writer::Child(it) => it.write(bytes),
+            Writer::Warm(it) => it.write(bytes),
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        match self {
+            Writer::Child(it) => it.write_all(bytes),
+            Writer::Warm(it) => it.write_all(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Writer::Child(it) => it.flush(),
+            Writer::Warm(it) => it.flush(),
+        }
+    }
+}
+
+/// The end of a connection an answer is read from.
+pub(crate) enum Reader {
+    /// A server process's stdout.
+    Child(BufReader<ChildStdout>),
+    /// A warm server's link.
+    Warm(LinkReader),
+}
+
+impl Read for Reader {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Reader::Child(it) => it.read(out),
+            Reader::Warm(it) => it.read(out),
+        }
+    }
+}
+
+impl BufRead for Reader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        match self {
+            Reader::Child(it) => it.fill_buf(),
+            Reader::Warm(it) => it.fill_buf(),
+        }
+    }
+
+    fn consume(&mut self, n: usize) {
+        match self {
+            Reader::Child(it) => it.consume(n),
+            Reader::Warm(it) => it.consume(n),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -115,16 +193,17 @@ mod tests {
         legacy_protocol::msg::{Message as _, ServerConfig},
     };
     use crate::pool::ProcMacroServerPool;
-    use std::{
-        io::Cursor,
-        sync::atomic::{AtomicUsize, Ordering},
-    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    struct Running;
-    impl ProcessExit for Running {
-        fn exit_err(&mut self) -> Option<ServerError> {
-            None
-        }
+    /// A connection to a server that plays `answers` and takes what it is sent.
+    fn scripted(answers: Vec<u8>) -> (Exit, Writer, Reader) {
+        let link = Arc::new(warm::Link::Script(warm::Script {
+            sent: Mutex::default(),
+            answers: Mutex::new([answers].into()),
+            ended: Mutex::default(),
+        }));
+        let (exit, writer) = (LinkExit(link.clone()), LinkWriter::new(link.clone()));
+        (Exit::Warm(exit), Writer::Warm(writer), Reader::Warm(LinkReader::new(link)))
     }
 
     fn connect(responses: Vec<Response>) -> io::Result<ProcMacroServerProcess> {
@@ -137,13 +216,57 @@ mod tests {
             |format| {
                 assert_eq!(attempts.fetch_add(1, Ordering::Relaxed), 0, "no protocol retry");
                 assert_eq!(format, Some(ProtocolFormat::BidirectionalPostcardPrototype));
-                Ok((Box::new(Running), Box::new(io::sink()), Box::new(Cursor::new(bytes.clone()))))
+                Ok(scripted(bytes.clone()))
             },
             None,
             || "test server".to_owned(),
         );
         assert_eq!(attempts.load(Ordering::Relaxed), 1);
         result
+    }
+
+    /// Writes a frame on `writer` and reads one back on `reader`: the server's answer.
+    fn round_trip(writer: &mut Writer, reader: &mut Reader) -> Option<BidirectionalMessage> {
+        BidirectionalMessage::Response(Response::ApiVersionCheck(7)).write(writer).unwrap();
+        writer.flush().unwrap();
+        BidirectionalMessage::read(reader, &mut Vec::new()).unwrap()
+    }
+
+    /// Each way a connection reaches its server writes, reads and tells when it ended: a
+    /// process's pipes (`cat`, which answers what it is sent) and a warm server's link.
+    #[cfg(unix)]
+    #[test]
+    fn each_way_to_a_server_writes_reads_and_tells_its_end() {
+        let answered = |it: Option<BidirectionalMessage>| {
+            matches!(it, Some(BidirectionalMessage::Response(Response::ApiVersionCheck(7))))
+        };
+
+        #[allow(clippy::disallowed_methods)]
+        let mut child = Command::new("cat").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut writer = Writer::Child(child.stdin.take().unwrap());
+        let mut reader = Reader::Child(BufReader::new(child.stdout.take().unwrap()));
+        let mut exit = Exit::Child(Process { child: JodChild(child) });
+        assert!(answered(round_trip(&mut writer, &mut reader)));
+        assert!(exit.exit_err().is_none());
+        if let Exit::Child(process) = &mut exit {
+            process.child.kill().unwrap();
+            process.child.wait().unwrap();
+        }
+        assert!(exit.exit_err().unwrap().message.contains("exited"));
+
+        let mut frame = Vec::new();
+        BidirectionalMessage::Response(Response::ApiVersionCheck(7)).write(&mut frame).unwrap();
+        let (mut exit, mut writer, mut reader) = scripted(frame.clone());
+        assert!(answered(round_trip(&mut writer, &mut reader)));
+        assert!(exit.exit_err().is_none());
+        let link = match &exit {
+            Exit::Warm(LinkExit(link)) => link.clone(),
+            Exit::Child(_) => panic!("a warm server's exit"),
+        };
+        let warm::Link::Script(script) = &*link else { panic!("a script") };
+        assert_eq!(*script.sent.lock().unwrap(), frame);
+        *script.ended.lock().unwrap() = Some("it exited with 3".to_owned());
+        assert!(exit.exit_err().unwrap().message.contains("exited with 3"));
     }
 
     #[test]
@@ -176,11 +299,11 @@ mod tests {
         ] {
             BidirectionalMessage::Response(response).write(&mut bytes).unwrap();
         }
-        let link = Arc::new(warm::Script {
+        let link = Arc::new(warm::Link::Script(warm::Script {
             sent: Mutex::default(),
             answers: Mutex::new([bytes].into()),
             ended: Mutex::default(),
-        });
+        }));
         ProcMacroServerProcess::warm(Warm { link, traced: None }, Environment::new())
     }
 
@@ -240,11 +363,12 @@ mod tests {
     }
 }
 
-impl ProcessExit for Process {
+impl Process {
     fn exit_err(&mut self) -> Option<ServerError> {
         match self.child.try_wait() {
             Ok(None) | Err(_) => None,
             Ok(Some(status)) => {
+                // alloc: error path, what the server said as it exited.
                 let mut msg = String::new();
                 if !status.success()
                     && let Some(stderr) = self.child.stderr.as_mut()
@@ -252,6 +376,7 @@ impl ProcessExit for Process {
                     _ = stderr.read_to_string(&mut msg);
                 }
                 Some(ServerError {
+                    // alloc: error path, as above.
                     message: format!(
                         "proc-macro server exited with {status}{}{msg}",
                         if msg.is_empty() { "" } else { ": " }
@@ -265,11 +390,26 @@ impl ProcessExit for Process {
 
 /// Maintains the state of the proc-macro server process.
 pub(crate) struct ProcessSrvState {
-    process: Box<dyn ProcessExit>,
-    stdin: Box<dyn Write + Send + Sync>,
-    stdout: Box<dyn BufRead + Send + Sync>,
+    process: Exit,
+    stdin: Writer,
+    stdout: Reader,
     /// Of a warm server in a sandbox that traces: its live record, read by scope.
     tracer: Option<Tracer>,
+    scratch: Scratch,
+}
+
+/// What each request of a connection reuses, each as long as the longest it held: once they
+/// are, a request allocates none of them.
+#[derive(Default)]
+struct Scratch {
+    /// A frame written or read whole, the one in flight.
+    frame: Vec<u8>,
+    /// A request's trees, as `write_wire` writes them.
+    trees: Vec<u8>,
+    /// An answer's tree when it doesn't start at a word, which `read_wire` asks for.
+    aligned: Vec<u8>,
+    /// What a request sent of span parts, which its answer may use.
+    sent: Sent,
 }
 
 impl ProcMacroServerProcess {
@@ -285,12 +425,13 @@ impl ProcMacroServerProcess {
             |format| {
                 let mut process = Process::run(
                     process_path,
-                    env.clone(),
+                    env.clone(), // clone: the variables' iterator, once per server started.
+                    // alloc: the format's name, once per server started.
                     format.map(|format| format.to_string()).as_deref(),
                 )?;
                 let (stdin, stdout) = process.stdio().expect("couldn't access child stdio");
 
-                Ok((Box::new(process), Box::new(stdin), Box::new(stdout)))
+                Ok((Exit::Child(process), Writer::Child(stdin), Reader::Child(stdout)))
             },
             version,
             || {
@@ -298,7 +439,9 @@ impl ProcMacroServerProcess {
                 Command::new(process_path)
                     .arg("--version")
                     .output()
+                    // alloc: error path, the server's version named in a refusal.
                     .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                    // alloc: as above.
                     .unwrap_or_else(|_| "unknown version".to_owned())
             },
         )
@@ -306,13 +449,7 @@ impl ProcMacroServerProcess {
 
     /// Invokes `spawn` and performs a version check.
     pub(crate) fn run(
-        spawn: impl Fn(
-            Option<ProtocolFormat>,
-        ) -> io::Result<(
-            Box<dyn ProcessExit>,
-            Box<dyn Write + Send + Sync>,
-            Box<dyn BufRead + Send + Sync>,
-        )>,
+        spawn: impl Fn(Option<ProtocolFormat>) -> io::Result<(Exit, Writer, Reader)>,
         _version: Option<&Version>,
         binary_server_version: impl Fn() -> String,
     ) -> io::Result<ProcMacroServerProcess> {
@@ -320,7 +457,8 @@ impl ProcMacroServerProcess {
         // JSON cannot ask for a span's text, file or position and would return placeholders.
         let format = ProtocolFormat::BidirectionalPostcardPrototype;
         let (process, stdin, stdout) = spawn(Some(format))?;
-        let state = ProcessSrvState { process, stdin, stdout, tracer: None };
+        let state =
+            ProcessSrvState { process, stdin, stdout, tracer: None, scratch: Scratch::default() };
         Self::start(state, version::RUST_ANALYZER_SPAN_SUPPORT, None, binary_server_version)
     }
 
@@ -332,12 +470,14 @@ impl ProcMacroServerProcess {
     ) -> io::Result<ProcMacroServerProcess> {
         let Warm { link, traced } = warm;
         let state = ProcessSrvState {
-            process: Box::new(LinkExit(link.clone())),
-            stdin: Box::new(LinkWriter::new(link.clone())),
-            stdout: Box::new(LinkReader::new(link)),
+            process: Exit::Warm(LinkExit(Arc::clone(&link))),
+            stdin: Writer::Warm(LinkWriter::new(Arc::clone(&link))),
+            stdout: Reader::Warm(LinkReader::new(link)),
             tracer: traced.map(|(live, socket)| Tracer::new(live, socket)),
+            scratch: Scratch::default(),
         };
         Self::start(state, version::SCOPED_EXPANSIONS, Some(environment), || {
+            // alloc: error path, the server named in a refusal.
             "a warm server".to_owned()
         })
     }
@@ -361,9 +501,11 @@ impl ProcMacroServerProcess {
             srv.claim().expect("a connection no one else has yet is free")
         }
         let v = claim(&srv).version_check(Some(&reject_subrequests)).map_err(|e| {
+            // alloc: error path, why the handshake failed.
             io::Error::other(format!("proc-macro server version check failed: {e}"))
         })?;
         if v > version::CURRENT_API_VERSION {
+            // alloc: error path, as above.
             return Err(io::Error::other(format!(
                 "proc-macro server is too new for blaze: API {v}, supported API {}, server {}",
                 version::CURRENT_API_VERSION,
@@ -371,11 +513,13 @@ impl ProcMacroServerProcess {
             )));
         }
         if v < version::RUST_ANALYZER_SPAN_SUPPORT {
+            // alloc: error path, as above.
             return Err(io::Error::other(format!(
                 "proc-macro server API {v} does not support source spans"
             )));
         }
         if v < least {
+            // alloc: error path, as above.
             return Err(io::Error::other(format!(
                 "proc-macro server API {v} does not mark the scope of each expansion, which a \
                  warm server must (API {least}): what an expansion read can't be told apart, so \
@@ -386,6 +530,7 @@ impl ProcMacroServerProcess {
         srv.version = v;
         let new_mode = claim(&srv)
             .enable_rust_analyzer_spans(Some(&reject_subrequests))
+            // alloc: error path, as above.
             .map_err(|e| io::Error::other(format!("proc-macro source-span setup failed: {e}")))?;
         if new_mode != SpanMode::RustAnalyzer {
             return Err(io::Error::other("proc-macro server did not enable source spans"));
@@ -450,6 +595,7 @@ impl Claimed<'_> {
             Protocol::BidirectionalPostcardPrototype { .. } => {
                 bidirectional_protocol::find_proc_macros(self, dylib_path, &|_| {
                     Ok(SubResponse::Cancel {
+                        // alloc: error path, a sub-request refused.
                         reason: String::from(
                             "Server should not do a sub request when loading proc-macros",
                         ),
@@ -489,7 +635,7 @@ impl Claimed<'_> {
         proc_macro: &ProcMacro,
         subtree: tt::SubtreeView<'_>,
         attr: Option<tt::SubtreeView<'_>>,
-        env: Vec<(String, String)>,
+        mut env: Vec<(String, String)>,
         def_site: Span,
         call_site: Span,
         mixed_site: Span,
@@ -497,14 +643,23 @@ impl Claimed<'_> {
         callback: Option<SubCallback<'_>>,
     ) -> Result<Result<tt::TopSubtree, String>, ServerError> {
         warm::set_traced(None);
-        let (env, seen) = match &self.process.environment {
-            Some(environment) => {
-                let passed = environment.passed();
-                let call = env.iter().map(|(name, value)| (name.as_str(), value.as_str()));
-                let seen = Environment::seen(passed, call);
-                (Environment::sent(passed, env), Some(seen))
-            }
-            None => (env, None),
+        let passed = self.process.environment.as_deref().map_or(&[][..], Environment::passed);
+        let bidirectional =
+            matches!(self.process.protocol, Protocol::BidirectionalPostcardPrototype { .. });
+        if bidirectional && self.version() >= version::WIRE_TREES {
+            return self.expand_wire(
+                proc_macro,
+                subtree,
+                attr,
+                [passed, &env],
+                [def_site, call_site, mixed_site],
+                &current_dir,
+                callback.expect("callback required for bidirectional protocol"),
+            );
+        }
+        let sent = match &self.process.environment {
+            Some(_) => Environment::sent(passed, &env),
+            None => std::mem::take(&mut env),
         };
         match self.process.protocol {
             Protocol::LegacyJson { .. } => legacy_protocol::expand(
@@ -512,7 +667,7 @@ impl Claimed<'_> {
                 self,
                 subtree,
                 attr,
-                env,
+                sent,
                 def_site,
                 call_site,
                 mixed_site,
@@ -523,35 +678,119 @@ impl Claimed<'_> {
                 self,
                 subtree,
                 attr,
-                env,
+                sent,
                 def_site,
                 call_site,
                 mixed_site,
                 current_dir,
                 callback.expect("callback required for bidirectional protocol"),
-                seen,
+                [passed, &env],
             ),
         }
+    }
+
+    /// An expansion by a server of [`version::WIRE_TREES`] over the connection's [`Scratch`]:
+    /// the request is written from what the caller holds, sub-requests are answered between,
+    /// and the answer's tree is read where it lies in its frame. Once the buffers are as long
+    /// as an expansion needs, it allocates only the tree it returns, what `callback` does, and
+    /// what the connection's pipe does per frame. Its environment is `passed`, then `call`.
+    fn expand_wire(
+        &self,
+        proc_macro: &ProcMacro,
+        subtree: tt::SubtreeView<'_>,
+        attr: Option<tt::SubtreeView<'_>>,
+        env @ [passed, call]: [&[(String, String)]; 2],
+        sites: [Span; 3],
+        current_dir: &str,
+        callback: SubCallback<'_>,
+    ) -> Result<Result<tt::TopSubtree, String>, ServerError> {
+        if let Some(err) = self.exited() {
+            // clone: error path, the server's exit told to each caller.
+            return Err(err.clone());
+        }
+        let scope = self.scope();
+        let answered = self.with_state(|state| {
+            let ProcessSrvState { stdin, stdout, scratch, .. } = state;
+            let Scratch { frame, trees, aligned, sent } = scratch;
+            sent.clear();
+            trees.clear();
+            for site in &sites {
+                sent.span(site);
+            }
+            write_tree(subtree, sent, trees);
+            if let Some(attr) = attr {
+                write_tree(attr, sent, trees);
+            }
+            let ask = WireAsk {
+                lib: proc_macro.dylib_path.as_str(),
+                passed,
+                call,
+                current_dir,
+                macro_name: &proc_macro.name,
+                trees,
+                has_attributes: attr.is_some(),
+                sites: sites.map(WireSpan::of),
+            };
+            postcard::encode_into(&ask.message(), frame).map_err(wrap_encode)?;
+            postcard::write(stdin, frame).map_err(wrap_io("failed to write initial request"))?;
+            loop {
+                let Some(read) =
+                    postcard::read(stdout, frame).map_err(wrap_io("failed to read message"))?
+                else {
+                    return Err(closed());
+                };
+                let len = postcard::unframe(read).map_err(wrap_decode)?;
+                let request = match postcard::parse::<Heard<'_>>(&frame[..len]) {
+                    Ok(Heard::Response(HeardResponse::ExpandMacroWire(Ok(reply)))) => {
+                        let tree = read_tree(reply.tree, sent, aligned).map_err(answer_error)?;
+                        return Ok(Ok(tree));
+                    }
+                    Ok(Heard::Response(HeardResponse::ExpandMacroWire(Err(panic)))) => {
+                        return Ok(Err(panic.0));
+                    }
+                    Ok(Heard::SubRequest(request)) => request,
+                    Ok(other) => return Err(unexpected(&other)),
+                    Err(err) => return Err(wrap_decode(err)),
+                };
+                let joined_in = match &request {
+                    SubRequest::SpanJoin { file_id, .. } => Some(*file_id),
+                    _ => None,
+                };
+                let response = answer(callback, request);
+                sent.sub_response(joined_in, &response);
+                let response = BidirectionalMessage::SubResponse(response);
+                postcard::encode_into(&response, frame).map_err(wrap_encode)?;
+                postcard::write(stdin, frame).map_err(wrap_io("failed to write sub-response"))?;
+            }
+        });
+        if answered.is_ok() {
+            self.trace(scope, env);
+        }
+        answered
     }
 
     pub(crate) fn send_task_legacy<Request, Response>(
         &self,
         send: impl FnOnce(
-            &mut dyn Write,
-            &mut dyn BufRead,
+            &mut Writer,
+            &mut Reader,
             Request,
             &mut String,
         ) -> Result<Option<Response>, ServerError>,
         req: Request,
     ) -> Result<Response, ServerError> {
-        self.with_io(String::new(), |writer, reader, buf| {
-            send(writer, reader, req, buf).and_then(|res| {
+        // alloc: an older server's JSON line, once per request; the connection speaks postcard.
+        let mut buf = String::new();
+        self.with_state(|state| {
+            send(&mut state.stdin, &mut state.stdout, req, &mut buf).and_then(|res| {
                 res.ok_or_else(|| {
+                    // alloc: error path.
                     let message = "proc-macro server did not respond with data".to_owned();
                     ServerError {
+                        // alloc: error path, as above.
                         io: Some(Arc::new(io::Error::new(
                             io::ErrorKind::BrokenPipe,
-                            message.clone(),
+                            message.clone(), // clone: error path, as above.
                         ))),
                         message,
                     }
@@ -560,21 +799,23 @@ impl Claimed<'_> {
         })
     }
 
-    /// Runs `f` on the connection's pipes. The state is borrowed from the claim alone, so the
+    /// Runs `f` on the connection's state. The state is borrowed from the claim alone, so the
     /// sub-requests `f` answers lock nothing.
-    fn with_io<R, B>(
+    fn with_state<R>(
         &self,
-        mut buf: B,
-        f: impl FnOnce(&mut dyn Write, &mut dyn BufRead, &mut B) -> Result<R, ServerError>,
+        f: impl FnOnce(&mut ProcessSrvState) -> Result<R, ServerError>,
     ) -> Result<R, ServerError> {
         let mut state = self.state.borrow_mut();
         let state = state.as_mut().expect("a claim holds its connection's state until dropped");
-        f(&mut state.stdin, &mut state.stdout, &mut buf).map_err(|e| {
+        f(&mut *state).map_err(|e| {
             if e.io.as_ref().map(|it| it.kind()) == Some(io::ErrorKind::BrokenPipe) {
                 match state.process.exit_err() {
                     None => e,
                     Some(server_error) => {
-                        self.process.exited.get_or_init(|| AssertUnwindSafe(server_error)).0.clone()
+                        let exited =
+                            self.process.exited.get_or_init(|| AssertUnwindSafe(server_error));
+                        // clone: error path, the server's exit told to each caller.
+                        exited.0.clone()
                     }
                 }
             } else {
@@ -588,42 +829,56 @@ impl Claimed<'_> {
         initial: BidirectionalMessage,
         callback: SubCallback<'_>,
     ) -> Result<BidirectionalMessage, ServerError> {
-        self.with_io(Vec::new(), |writer, reader, buf| {
-            bidirectional_protocol::run_conversation(writer, reader, buf, initial, callback)
+        self.with_state(|state| {
+            let ProcessSrvState { stdin, stdout, scratch, .. } = state;
+            bidirectional_protocol::run_conversation(
+                stdin,
+                stdout,
+                &mut scratch.frame,
+                initial,
+                callback,
+            )
         })
     }
 
-    /// Runs the conversation of one expansion. Of a traced warm server, it is the next scope
-    /// of the connection, and what it read is this thread's to take once the server answered
-    /// ([`warm::take_traced`]): it saw the environment `seen`.
+    /// Runs the conversation of one expansion by a server older than [`version::WIRE_TREES`].
+    /// Of a traced warm server, it is the next scope of the connection, and what it read is
+    /// this thread's to take once the server answered ([`warm::take_traced`]): it saw the
+    /// variables `env`, what the shell passed and then the crate's.
     pub(crate) fn run_expansion(
         &self,
         initial: BidirectionalMessage,
         callback: SubCallback<'_>,
-        seen: Option<Vec<(OsString, OsString)>>,
+        env: [&[(String, String)]; 2],
     ) -> Result<BidirectionalMessage, ServerError> {
-        fn tracer(state: &mut Option<ProcessSrvState>) -> Option<&mut Tracer> {
-            state.as_mut()?.tracer.as_mut()
-        }
-        let scope = tracer(&mut self.state.borrow_mut()).map(Tracer::scope);
-        let answered = self.with_io(Vec::new(), |writer, reader, buf| {
-            bidirectional_protocol::run_conversation(writer, reader, buf, initial, callback)
-        });
-        if answered.is_ok()
-            && let Some(scope) = scope
-        {
-            let mut state = self.state.borrow_mut();
-            if let Some(tracer) = tracer(&mut state) {
-                warm::set_traced(Some(tracer.traced(&scope, seen.unwrap_or_default())));
-            }
+        let scope = self.scope();
+        let answered = self.run_bidirectional(initial, callback);
+        if answered.is_ok() {
+            self.trace(scope, env);
         }
         answered
+    }
+
+    /// The scope the connection's next expansion runs in, if its server is traced.
+    fn scope(&self) -> Option<u64> {
+        let mut state = self.state.borrow_mut();
+        Some(state.as_mut()?.tracer.as_mut()?.scope())
+    }
+
+    /// Makes what the expansion in `scope` read this thread's to take: it saw the variables
+    /// `env`, what the shell passed and then the crate's.
+    fn trace(&self, scope: Option<u64>, env: [&[(String, String)]; 2]) {
+        let Some(scope) = scope else { return };
+        let mut state = self.state.borrow_mut();
+        if let Some(tracer) = state.as_mut().and_then(|state| state.tracer.as_mut()) {
+            warm::set_traced(Some(tracer.traced(scope, env)));
+        }
     }
 }
 
 /// Manages the execution of the proc-macro server process.
 #[derive(Debug)]
-struct Process {
+pub(crate) struct Process {
     child: JodChild,
 }
 

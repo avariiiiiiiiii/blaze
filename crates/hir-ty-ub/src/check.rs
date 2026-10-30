@@ -84,7 +84,7 @@ pub struct Sites<'db> {
     bodies: FxHashMap<InferBodyId<'db>, u32>,
     /// By the index in `bodies`: per span kind, the `SiteId` of each arena index
     /// (`SiteId::START` where not yet interned).
-    spans: Vec<[Vec<SiteId>; 6]>,
+    spans: Vec<[Vec<SiteId>; 7]>,
     current: Option<(InferBodyId<'db>, u32)>,
 }
 
@@ -102,6 +102,7 @@ impl<'db> Sites<'db> {
             MirSpan::BindingId(it) => (3, it.into_raw().into_u32()),
             MirSpan::SelfParam => (4, 0),
             MirSpan::Unknown => (5, 0),
+            MirSpan::Inlined(it) => (6, it),
         };
         let Sites { sites, spans, .. } = self;
         let column = &mut spans[body as usize][kind];
@@ -422,7 +423,7 @@ impl<'db> Machine<'db> for Checker<'db> {
         // every tag still held.
         if self.borrows.gc_due() {
             let mem = &self.mem;
-            self.borrows.gc(|visit| mem.tags(&mut |alloc, tag| visit(alloc, tag)));
+            self.borrows.gc(|live| mem.tags(&mut |_, tag| live.mark(tag)));
         }
     }
 
@@ -718,6 +719,8 @@ fn outcome<'db>(
     Some(match error? {
         // clone: the edge: the outcome of a run.
         MirEvalError::Panic(message) => Outcome::Failed { message: message.clone(), seed },
+        // clone: the edge: the outcome of a run. An abort fails the test, as under rustc's harness.
+        MirEvalError::Aborted(message) => Outcome::Failed { message: message.clone(), seed },
         // clone: the edge: the outcome of a run.
         MirEvalError::NotSupported(what) => Outcome::Unsupported { what: what.clone() },
         MirEvalError::MachineStop => Outcome::Error {

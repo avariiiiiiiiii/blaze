@@ -311,12 +311,15 @@ impl Relocs {
         Relocs { rows: Vec::with_capacity(capacity), wide: Vec::new(), spaces: Vec::new() }
     }
 
-    /// Cranelift's relocations of `func`'s code.
-    pub(super) fn of_mach(
+    /// Cranelift's relocations of `func`'s code after the rows it has, its rows grown once to
+    /// hold them: what emit writes into a new list for v1, and into the thread's kept list for
+    /// v2 ([`crate::spare::relocs`]).
+    pub(super) fn extend_mach(
+        &mut self,
         relocs: &[FinalizedMachReloc],
         func: &ir::Function,
-    ) -> std::result::Result<Relocs, RelocError> {
-        let mut rows = Relocs::with_capacity(relocs.len());
+    ) -> std::result::Result<(), RelocError> {
+        self.rows.reserve_exact(relocs.len());
         for reloc in relocs {
             let name = match &reloc.target {
                 FinalizedRelocTarget::ExternalName(ir::ExternalName::User(name)) => {
@@ -335,9 +338,21 @@ impl Relocs {
                 FinalizedRelocTarget::Func(offset) => RelocName::Own(*offset),
             };
             let (offset, kind, addend) = (reloc.offset, reloc.kind, reloc.addend);
-            rows.push(Reloc { offset, kind, name, addend, elf_type: None })?;
+            self.push(Reloc { offset, kind, name, addend, elf_type: None })?;
         }
-        Ok(rows)
+        Ok(())
+    }
+
+    /// Empties it, keeping its room.
+    pub(super) fn clear(&mut self) {
+        self.rows.clear();
+        self.wide.clear();
+        self.spaces.clear();
+    }
+
+    /// The rows it has room for.
+    pub(super) fn capacity(&self) -> usize {
+        self.rows.capacity()
     }
 
     /// `relocs`, with the ELF types of `elf_types` (by offset, in the order of `relocs`) given

@@ -1,24 +1,27 @@
 use std::{convert::Infallible, ops::ControlFlow};
 
 use base_db::Db;
+use either::Either;
 use hir_expand::{
-    Lookup,
-    attrs::{AstKeyValueMetaExt, AstPathExt},
+    HirFileId, Lookup,
+    attrs::{AstKeyValueMetaExt, AstPathExt, expand_cfg_attr, expand_cfg_attr_view},
 };
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use span::Edition;
 use syntax::{
-    AstNode, SourceFile,
-    ast::{self, HasName},
+    AstNode, AstPtr, Parse, SourceFile,
+    ast::{self, HasAttrs},
+    view::{self, AstNode as _, HasAttrs as _, HasName as _, Typed},
 };
 use test_fixture::WithFixture;
 
 use super::{
     AttrFlags, Completions, DocAtom, DocWord, LinkKey, LinkKind, LinkModifier, MacroStyle,
-    NativeLib, NativeLibKind, ReprWord, SkipDuringMethodDispatch, Word, extract_ra_completions,
-    extract_ra_macro_style, extract_rustc_skip_during_method_dispatch, link_cfg,
-    match_attr_flags, parse_link_tt, parse_repr_tt, symbol_attr, word,
+    NativeLib, NativeLibKind, ReprWord, SkipDuringMethodDispatch, Tree, Word, attrs_source,
+    collect_attrs_in, extract_ra_completions, extract_ra_macro_style,
+    extract_rustc_skip_during_method_dispatch, for_each_field, link_cfg, match_attr_flags,
+    parse_link_tt, parse_repr_tt, symbol_attr, word,
 };
 use crate::{
     AdtId, AttrDefId, FieldId, FunctionId, ModuleDefId, VariantId, nameres::crate_def_map,
@@ -126,9 +129,17 @@ fn other_names_are_no_word() {
 
 /// The flags of one attribute, as the walk before the word index computed them: by string
 /// `match`, through `AstPathExt`'s `SmolStr`s, `#[inline]`'s text and [`DocAtom`].
-fn old_match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<Infallible> {
-    fn old_extract_doc_tt_attr(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-        for atom in DocAtom::parse(tt) {
+fn old_match_attr_flags(
+    attr_flags: &mut AttrFlags,
+    root: view::Node<'_>,
+    attr: ast::Meta,
+) -> ControlFlow<Infallible> {
+    fn old_extract_doc_tt_attr(
+        attr_flags: &mut AttrFlags,
+        root: view::Node<'_>,
+        tt: ast::TokenTree,
+    ) {
+        for atom in DocAtom::parse(view_of(root, &tt)) {
             match atom {
                 DocAtom::Flag(flag) => match &*flag {
                     "notable_trait" => attr_flags.insert(AttrFlags::IS_DOC_NOTABLE_TRAIT),
@@ -186,9 +197,10 @@ fn old_match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlF
                     "inline" if tt.syntax().text().to_string().contains("never") => {
                         attr_flags.insert(AttrFlags::INLINE_NEVER)
                     }
-                    "doc" => old_extract_doc_tt_attr(attr_flags, tt),
+                    "doc" => old_extract_doc_tt_attr(attr_flags, root, tt),
                     "repr" | "rustc_scalable_vector" => attr_flags.insert(AttrFlags::HAS_REPR),
                     "target_feature" => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
+                    "link_ordinal" => attr_flags.insert(AttrFlags::HAS_LINK_ORDINAL),
                     "proc_macro_derive" | "rustc_builtin_macro" => {
                         attr_flags.insert(AttrFlags::IS_DERIVE_OR_BUILTIN_MACRO)
                     }
@@ -201,7 +213,7 @@ fn old_match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlF
                         attr_flags.insert(AttrFlags::HAS_LEGACY_CONST_GENERICS)
                     }
                     "rustc_skip_during_method_dispatch" => {
-                        extract_rustc_skip_during_method_dispatch(attr_flags, tt)
+                        extract_rustc_skip_during_method_dispatch(attr_flags, view_of(root, &tt))
                     }
                     "rustc_deprecated_safe_2024" => {
                         attr_flags.insert(AttrFlags::RUSTC_DEPRECATED_SAFE_2024)
@@ -213,8 +225,8 @@ fn old_match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlF
                 },
                 Some(second_segment) => match &*first_segment {
                     "rust_analyzer" => match &*second_segment {
-                        "completions" => extract_ra_completions(attr_flags, tt),
-                        "macro_style" => extract_ra_macro_style(attr_flags, tt),
+                        "completions" => extract_ra_completions(attr_flags, view_of(root, &tt)),
+                        "macro_style" => extract_ra_macro_style(attr_flags, view_of(root, &tt)),
                         "define_opaque" => attr_flags.insert(AttrFlags::HAS_DEFINE_OPAQUE),
                         _ => {}
                     },
@@ -335,22 +347,45 @@ fn gating_flags(meta: &ast::Meta) -> AttrFlags {
         ("linkage", AttrFlags::HAS_LINKAGE),
         ("rustc_diagnostic_item", AttrFlags::HAS_DIAGNOSTIC_ITEM),
     ];
+    // Every word flag set for one segment only, the old walk had none of them.
     const WORD: &[(&str, AttrFlags)] = &[
         ("rustc_nounwind", AttrFlags::RUSTC_NOUNWIND),
         ("rustc_comptime", AttrFlags::RUSTC_COMPTIME),
         ("panic_handler", AttrFlags::PANIC_HANDLER),
+        ("rustc_insignificant_dtor", AttrFlags::RUSTC_INSIGNIFICANT_DTOR),
+        ("rustc_as_ptr", AttrFlags::RUSTC_AS_PTR),
+        ("rustc_no_implicit_autorefs", AttrFlags::RUSTC_NO_IMPLICIT_AUTOREFS),
+        ("rustc_never_returns_null_ptr", AttrFlags::RUSTC_NEVER_RETURNS_NULL_PTR),
+        ("rustc_canonical_symbol", AttrFlags::RUSTC_CANONICAL_SYMBOL),
+        ("marker", AttrFlags::MARKER),
+        ("automatically_derived", AttrFlags::AUTOMATICALLY_DERIVED),
+        ("rustc_main", AttrFlags::RUSTC_MAIN),
+        ("default", AttrFlags::DEFAULT),
+        ("naked", AttrFlags::NAKED),
+        ("rustc_deny_explicit_impl", AttrFlags::RUSTC_DENY_EXPLICIT_IMPL),
+        ("rustc_no_mir_inline", AttrFlags::RUSTC_NO_MIR_INLINE),
+        ("cold", AttrFlags::COLD),
     ];
-    const TOKEN_TREE: &[(&str, AttrFlags)] = &[("sanitize", AttrFlags::HAS_SANITIZE)];
+    const TOKEN_TREE: &[(&str, AttrFlags)] = &[
+        ("sanitize", AttrFlags::HAS_SANITIZE),
+        ("instruction_set", AttrFlags::HAS_INSTRUCTION_SET),
+    ];
     let (path, names) = match meta {
         ast::Meta::KeyValueMeta(meta) => (meta.path(), KEY_VALUE),
         ast::Meta::PathMeta(meta) => (meta.path(), WORD),
         ast::Meta::TokenTreeMeta(meta) if meta.token_tree().is_some() => (meta.path(), TOKEN_TREE),
         _ => return AttrFlags::empty(),
     };
-    names
-        .iter()
-        .filter(|(name, _)| path.is1(name))
-        .fold(AttrFlags::empty(), |flags, &(_, flag)| flags | flag)
+    let optimize_none = match meta {
+        ast::Meta::TokenTreeMeta(meta) if path.is1("optimize") => {
+            meta.token_tree().is_some_and(|tt| {
+                tt.syntax().children_with_tokens().any(|it| it.as_token().is_some_and(|it| it.text() == "none"))
+            })
+        }
+        _ => false,
+    };
+    let flags = if optimize_none { AttrFlags::OPTIMIZE_NONE } else { AttrFlags::empty() };
+    names.iter().filter(|(name, _)| path.is1(name)).fold(flags, |flags, &(_, flag)| flags | flag)
 }
 
 const GATING: AttrFlags = AttrFlags::HAS_EXPORT_NAME
@@ -361,16 +396,53 @@ const GATING: AttrFlags = AttrFlags::HAS_EXPORT_NAME
     .union(AttrFlags::RUSTC_NOUNWIND)
     .union(AttrFlags::RUSTC_COMPTIME)
     .union(AttrFlags::PANIC_HANDLER)
-    .union(AttrFlags::HAS_SANITIZE);
+    .union(AttrFlags::HAS_SANITIZE)
+    .union(AttrFlags::RUSTC_INSIGNIFICANT_DTOR)
+    .union(AttrFlags::RUSTC_AS_PTR)
+    .union(AttrFlags::RUSTC_NO_IMPLICIT_AUTOREFS)
+    .union(AttrFlags::RUSTC_NEVER_RETURNS_NULL_PTR)
+    .union(AttrFlags::RUSTC_CANONICAL_SYMBOL)
+    .union(AttrFlags::MARKER)
+    .union(AttrFlags::AUTOMATICALLY_DERIVED)
+    .union(AttrFlags::RUSTC_MAIN)
+    .union(AttrFlags::DEFAULT)
+    .union(AttrFlags::NAKED)
+    .union(AttrFlags::RUSTC_DENY_EXPLICIT_IMPL)
+    .union(AttrFlags::RUSTC_NO_MIR_INLINE)
+    .union(AttrFlags::COLD)
+    .union(AttrFlags::OPTIMIZE_NONE)
+    .union(AttrFlags::HAS_INSTRUCTION_SET);
 
-fn meta_of(attr: &str) -> ast::Meta {
-    let text = format!("{attr} fn f() {{}}");
-    let file = SourceFile::parse(&text, Edition::CURRENT).tree();
-    file.syntax()
+/// `attr` on a function, parsed.
+fn parse_of(attr: &str) -> Parse<SourceFile> {
+    SourceFile::parse(&format!("{attr} fn f() {{}}"), Edition::CURRENT)
+}
+
+/// The view of `handle` in the tree `root` views: the same node, for the tests that feed one
+/// parse to a walk on handles and to a walk on views.
+fn view_of<'t, N: AstNode + Typed>(root: view::Node<'t>, handle: &N) -> N::Of<'t> {
+    AstPtr::new(handle).to_view(root)
+}
+
+/// The first attribute's meta in `parse`.
+fn meta_in(parse: &Parse<SourceFile>) -> view::Meta<'_> {
+    parse
+        .root()
+        .descendants()
+        .find_map(view::Attr::cast)
+        .and_then(|it| it.meta())
+        .unwrap_or_else(|| panic!("no attribute in {:?}", parse.root().text()))
+}
+
+/// [`meta_in`] as a handle, for the walks as they were.
+fn old_meta_in(parse: &Parse<SourceFile>) -> ast::Meta {
+    parse
+        .tree()
+        .syntax()
         .descendants()
         .find_map(ast::Attr::cast)
         .and_then(|it| it.meta())
-        .unwrap_or_else(|| panic!("no attribute in {text:?}"))
+        .unwrap_or_else(|| panic!("no attribute in {:?}", parse.root().text()))
 }
 
 /// Every word in every form an attribute takes, unknown names, and the `#[doc(..)]`, `#[test]`
@@ -429,6 +501,12 @@ fn corpus() -> Vec<String> {
         "#[rust_analyzer::completions(ignore_flyimport)]",
         "#[rust_analyzer::macro_style(parentheses)]",
         "#[export_name = \"ma\\u{69}n\"]",
+        "#[optimize(none)]",
+        "#[optimize(size)]",
+        "#[optimize(speed)]",
+        "#[r#optimize(none)]",
+        "#[a::optimize(none)]",
+        "#[instruction_set(arm::t32)]",
     ] {
         corpus.push(extra.to_owned());
     }
@@ -438,13 +516,14 @@ fn corpus() -> Vec<String> {
 #[test]
 fn the_word_index_flags_every_attribute_as_the_string_match_did() {
     for attr in corpus() {
-        let meta = meta_of(&attr);
+        let parse = parse_of(&attr);
+        let old_meta = old_meta_in(&parse);
         let mut old = AttrFlags::empty();
-        let _ = old_match_attr_flags(&mut old, meta.clone());
+        let _ = old_match_attr_flags(&mut old, parse.root(), old_meta.clone());
         let mut new = AttrFlags::empty();
-        let _ = match_attr_flags(&mut new, meta.clone());
+        let _ = match_attr_flags(&mut new, meta_in(&parse));
         assert_eq!(new - GATING, old, "{attr}");
-        assert_eq!(new & GATING, gating_flags(&meta), "{attr}");
+        assert_eq!(new & GATING, gating_flags(&old_meta), "{attr}");
     }
 }
 
@@ -472,9 +551,35 @@ fn gating_flags_of_known_shapes() {
         ("#[sanitize]", AttrFlags::empty()),
         ("#[a::sanitize(address = \"off\")]", AttrFlags::empty()),
         ("#[a::b::sanitize(address = \"off\")]", AttrFlags::empty()),
+        ("#[marker]", AttrFlags::MARKER),
+        ("#[automatically_derived]", AttrFlags::AUTOMATICALLY_DERIVED),
+        ("#[rustc_main]", AttrFlags::RUSTC_MAIN),
+        ("#[default]", AttrFlags::DEFAULT),
+        ("#[naked]", AttrFlags::NAKED),
+        ("#[a::naked]", AttrFlags::empty()),
+        ("#[rustc_deny_explicit_impl]", AttrFlags::RUSTC_DENY_EXPLICIT_IMPL),
+        ("#[r#rustc_deny_explicit_impl]", AttrFlags::RUSTC_DENY_EXPLICIT_IMPL),
+        ("#[a::rustc_deny_explicit_impl]", AttrFlags::empty()),
+        ("#[rustc_deny_explicit_impl(x)]", AttrFlags::empty()),
+        ("#[link_ordinal(1)]", AttrFlags::HAS_LINK_ORDINAL),
+        ("#[a::link_ordinal(1)]", AttrFlags::empty()),
+        ("#[link_ordinal]", AttrFlags::empty()),
+        ("#[rustc_no_mir_inline]", AttrFlags::RUSTC_NO_MIR_INLINE),
+        ("#[a::rustc_no_mir_inline]", AttrFlags::empty()),
+        ("#[cold]", AttrFlags::COLD),
+        ("#[r#cold]", AttrFlags::COLD),
+        ("#[a::cold]", AttrFlags::empty()),
+        ("#[optimize(none)]", AttrFlags::OPTIMIZE_NONE),
+        ("#[optimize(size)]", AttrFlags::empty()),
+        ("#[optimize(speed)]", AttrFlags::empty()),
+        ("#[a::optimize(none)]", AttrFlags::empty()),
+        ("#[instruction_set(arm::a32)]", AttrFlags::HAS_INSTRUCTION_SET),
+        ("#[instruction_set(arm::t32)]", AttrFlags::HAS_INSTRUCTION_SET),
+        ("#[a::instruction_set(arm::t32)]", AttrFlags::empty()),
+        ("#[instruction_set]", AttrFlags::empty()),
     ] {
         let mut new = AttrFlags::empty();
-        let _ = match_attr_flags(&mut new, meta_of(attr));
+        let _ = match_attr_flags(&mut new, meta_in(&parse_of(attr)));
         assert_eq!(new, flags, "{attr}");
     }
 }
@@ -486,7 +591,7 @@ fn functions(db: &TestDB) -> Vec<(String, FunctionId)> {
         .flat_map(|(_, module)| module.scope(db).declarations().collect::<Vec<_>>())
         .filter_map(|decl| match decl {
             ModuleDefId::FunctionId(func) => {
-                let name = func.lookup(db).source(db).value.name()?.text().to_string();
+                let name = func.lookup(db).source_view(db).value.name()?.text().to_owned();
                 Some((name, func))
             }
             _ => None,
@@ -509,6 +614,8 @@ const GATED: &str = r#"
 #[no_builtins] pub fn j() {}
 #[linkage = "extern_weak"] pub fn m() {}
 #[a::rustc_nounwind] #[export_name = 1] pub fn n() {}
+#[cold] #[rustc_no_mir_inline] pub fn o() {}
+#[cfg_attr(all(), cold)] pub fn p() {}
 pub fn plain() {}
 extern "C" {
     #[link_name = "real"] fn k();
@@ -541,6 +648,10 @@ fn gated_queries_read_what_the_source_says() {
     assert!(!AttrFlags::is_rustc_nounwind(&db, by_name("n")));
     assert_eq!(AttrFlags::export_name(&db, by_name("n").into()), None);
     assert_eq!(sym(AttrFlags::link_name(&db, by_name("k").into())).as_deref(), Some("real"));
+    let o = AttrFlags::query(&db, by_name("o").into());
+    assert!(o.contains(AttrFlags::COLD | AttrFlags::RUSTC_NO_MIR_INLINE));
+    assert!(AttrFlags::query(&db, by_name("p").into()).contains(AttrFlags::COLD));
+    assert!(!AttrFlags::query(&db, by_name("plain").into()).intersects(AttrFlags::COLD | AttrFlags::RUSTC_NO_MIR_INLINE));
 
     for (name, func) in &functions {
         let owner = AttrDefId::from(*func);
@@ -554,7 +665,9 @@ fn gated_queries_read_what_the_source_says() {
         ] {
             assert_eq!(read(&db, owner), symbol_attr(&db, owner, query), "{query} of {name}");
         }
-        for word in ["rustc_nounwind", "rustc_comptime", "panic_handler", "no_builtins", "inline"] {
+        for word in
+            ["rustc_nounwind", "rustc_comptime", "panic_handler", "no_builtins", "inline", "cold", "rustc_no_mir_inline"]
+        {
             assert_eq!(
                 AttrFlags::has_word(&db, owner, word),
                 AttrFlags::has_word_in_source(&db, owner, word),
@@ -618,10 +731,19 @@ pub fn documented() {
     assert!(docs.docs().contains("outer") && docs.docs().contains("inner"), "{:?}", docs.docs());
 }
 
-fn tt_of(attr: &str) -> ast::TokenTree {
-    match meta_of(attr) {
+/// The first attribute's token tree in `parse`.
+fn tt_in(parse: &Parse<SourceFile>) -> view::TokenTree<'_> {
+    match meta_in(parse) {
+        view::Meta::TokenTreeMeta(meta) => meta.token_tree().expect("a token tree"),
+        _ => panic!("no token tree in {:?}", parse.root().text()),
+    }
+}
+
+/// [`tt_in`] as a handle, for the walks as they were.
+fn old_tt_in(parse: &Parse<SourceFile>) -> ast::TokenTree {
+    match old_meta_in(parse) {
         ast::Meta::TokenTreeMeta(meta) => meta.token_tree().expect("a token tree"),
-        _ => panic!("no token tree in {attr:?}"),
+        _ => panic!("no token tree in {:?}", parse.root().text()),
     }
 }
 
@@ -693,31 +815,33 @@ fn option_sets_flag_as_the_string_match_did() {
         }
     }
 
-    type Extract = fn(&mut AttrFlags, ast::TokenTree);
+    type Extract = fn(&mut AttrFlags, view::TokenTree<'_>);
+    type OldExtract = fn(&mut AttrFlags, ast::TokenTree);
     for (path, texts, new, old) in [
         (
             "rust_analyzer::completions",
             Completions::TEXTS,
             extract_ra_completions as Extract,
-            old_ra_completions as Extract,
+            old_ra_completions as OldExtract,
         ),
         (
             "rust_analyzer::macro_style",
             MacroStyle::TEXTS,
             extract_ra_macro_style as Extract,
-            old_ra_macro_style as Extract,
+            old_ra_macro_style as OldExtract,
         ),
         (
             "rustc_skip_during_method_dispatch",
             SkipDuringMethodDispatch::TEXTS,
             extract_rustc_skip_during_method_dispatch as Extract,
-            old_skip_during_method_dispatch as Extract,
+            old_skip_during_method_dispatch as OldExtract,
         ),
     ] {
         for attr in option_corpus(path, texts) {
+            let parse = parse_of(&attr);
             let (mut got, mut want) = (AttrFlags::empty(), AttrFlags::empty());
-            new(&mut got, tt_of(&attr));
-            old(&mut want, tt_of(&attr));
+            new(&mut got, tt_in(&parse));
+            old(&mut want, old_tt_in(&parse));
             assert_eq!(got, want, "{attr}");
         }
     }
@@ -744,10 +868,10 @@ fn doc_atoms_flag_as_the_string_match_did() {
         }
     }
     for attr in corpus {
-        let meta = meta_of(&attr);
+        let parse = parse_of(&attr);
         let (mut old, mut new) = (AttrFlags::empty(), AttrFlags::empty());
-        let _ = old_match_attr_flags(&mut old, meta.clone());
-        let _ = match_attr_flags(&mut new, meta);
+        let _ = old_match_attr_flags(&mut old, parse.root(), old_meta_in(&parse));
+        let _ = match_attr_flags(&mut new, meta_in(&parse));
         assert_eq!(new - GATING, old, "{attr}");
     }
 }
@@ -860,13 +984,16 @@ fn repr_hints_read_as_the_string_match_did() {
         .map(str::to_owned),
     );
     for attr in corpus {
-        let tt = tt_of(&attr);
-        assert_eq!(parse_repr_tt(&tt), old_parse_repr_tt(&tt), "{attr}");
+        let parse = parse_of(&attr);
+        assert_eq!(parse_repr_tt(tt_in(&parse)), old_parse_repr_tt(&old_tt_in(&parse)), "{attr}");
     }
 }
 
 /// `parse_link_tt` as it was, by string `match`.
-fn old_parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<cfg::CfgExpr>)> {
+fn old_parse_link_tt(
+    root: view::Node<'_>,
+    tt: &ast::TokenTree,
+) -> Option<(NativeLib, Option<cfg::CfgExpr>)> {
     use syntax::{NodeOrToken, SyntaxKind, T, ast::TokenTreeChildren};
 
     let mut lib = NativeLib {
@@ -875,6 +1002,8 @@ fn old_parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<cfg::CfgE
         verbatim: false,
         whole_archive: false,
         bundle: true,
+        as_needed: None,
+        import_name_type: None,
     };
     let mut cfg = None;
     let mut named = false;
@@ -886,7 +1015,7 @@ fn old_parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<cfg::CfgE
         }
         match children.peek() {
             Some(NodeOrToken::Node(group)) if key.text() == "cfg" => {
-                cfg = link_cfg(group);
+                cfg = link_cfg(view_of(root, group));
                 children.next();
             }
             Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
@@ -908,9 +1037,10 @@ fn old_parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<cfg::CfgE
                             "dylib" => NativeLibKind::Dylib,
                             "framework" => NativeLibKind::Framework,
                             "raw-dylib" => NativeLibKind::RawDylib,
-                            _ => NativeLibKind::Unspecified,
+                            other => NativeLibKind::Other(Symbol::intern(other)),
                         }
                     }
+                    "import_name_type" => lib.import_name_type = Some(Symbol::intern(&value)),
                     "modifiers" => {
                         for modifier in value.split(',') {
                             let (on, name) = modifier.split_at(modifier.len().min(1));
@@ -918,6 +1048,7 @@ fn old_parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<cfg::CfgE
                                 "verbatim" => lib.verbatim = on == "+",
                                 "whole-archive" => lib.whole_archive = on == "+",
                                 "bundle" => lib.bundle = on == "+",
+                                "as-needed" => lib.as_needed = Some(on == "+"),
                                 _ => (),
                             }
                         }
@@ -940,7 +1071,9 @@ fn link_attrs_read_as_the_string_match_did() {
         corpus.push(format!("#[link(name = \"a\", {key}(unix))]"));
         corpus.push(format!("#[link(name = \"a\", {key} = 1)]"));
     }
-    let kinds = LinkKind::TEXTS.iter().chain(&["Static", "dylib_", "raw_dylib", "", "framewor"]);
+    let kinds = LinkKind::TEXTS
+        .iter()
+        .chain(&["Static", "dylib_", "raw_dylib", "", "framewor", "link-arg"]);
     for kind in kinds {
         corpus.push(format!("#[link(name = \"a\", kind = \"{kind}\")]"));
     }
@@ -954,6 +1087,8 @@ fn link_attrs_read_as_the_string_match_did() {
     corpus.extend(
         [
             "#[link(name = \"a\", modifiers = \"+verbatim,-bundle,+whole-archive\")]",
+            "#[link(name = \"a\", modifiers = \"+as-needed,-as-needed\")]",
+            "#[link(name = \"a\", kind = \"raw-dylib\", import_name_type = \"undecorated\")]",
             "#[link(name = \"a\", modifiers = \"\")]",
             "#[link(name = \"a\", kind = \"static\", kind = \"dylib\")]",
             "#[link(name = \"a\", cfg(target_os = \"linux\"))]",
@@ -964,9 +1099,23 @@ fn link_attrs_read_as_the_string_match_did() {
         .map(str::to_owned),
     );
     for attr in corpus {
-        let tt = tt_of(&attr);
-        assert_eq!(parse_link_tt(&tt), old_parse_link_tt(&tt), "{attr}");
+        let parse = parse_of(&attr);
+        let old = old_parse_link_tt(parse.root(), &old_tt_in(&parse));
+        assert_eq!(parse_link_tt(tt_in(&parse)), old, "{attr}");
     }
+}
+
+#[test]
+fn link_keeps_what_blaze_cannot_link() {
+    let lib = |attr: &str| parse_link_tt(tt_in(&parse_of(attr))).unwrap().0;
+    let other = lib("#[link(name = \"a\", kind = \"link-arg\")]");
+    assert_eq!(other.kind, NativeLibKind::Other(Symbol::intern("link-arg")));
+    assert_eq!(lib("#[link(name = \"a\")]").as_needed, None);
+    assert_eq!(lib("#[link(name = \"a\", modifiers = \"+as-needed\")]").as_needed, Some(true));
+    assert_eq!(lib("#[link(name = \"a\", modifiers = \"-as-needed\")]").as_needed, Some(false));
+    let raw = lib("#[link(name = \"a\", kind = \"raw-dylib\", import_name_type = \"noprefix\")]");
+    assert_eq!(raw.import_name_type, Some(Symbol::intern("noprefix")));
+    assert_eq!(lib("#[link(name = \"a\")]").import_name_type, None);
 }
 
 #[test]
@@ -1018,6 +1167,363 @@ pub fn two_segments() {}
     assert!(!flags("two_segments").contains(AttrFlags::RUSTC_AS_PTR));
 }
 
+/// The items of the root module of `db`'s test crate, their enums' variants and its impls.
+fn root_owners(db: &TestDB) -> Vec<AttrDefId> {
+    let def_map = crate_def_map(db, db.fetch_test_crate());
+    let scope = def_map.module(db, def_map.root).scope(db);
+    let mut owners = vec![AttrDefId::ModuleId(def_map.root)];
+    for def in scope.declarations() {
+        match def {
+            ModuleDefId::TraitId(it) => owners.push(it.into()),
+            ModuleDefId::FunctionId(it) => owners.push(it.into()),
+            ModuleDefId::ModuleId(it) => owners.push(AttrDefId::ModuleId(it)),
+            ModuleDefId::AdtId(AdtId::EnumId(it)) => {
+                owners.push(AdtId::EnumId(it).into());
+                owners.extend(it.enum_variants(db).variants.values().map(|&(v, _)| v.into()));
+            }
+            ModuleDefId::AdtId(it) => owners.push(it.into()),
+            ModuleDefId::ConstId(it) => owners.push(it.into()),
+            ModuleDefId::StaticId(it) => owners.push(it.into()),
+            _ => {}
+        }
+    }
+    owners.extend(scope.impls().map(AttrDefId::from));
+    owners
+}
+
+/// Each word `has_word` answers by a flag gives what the walk of the source gives.
+#[test]
+fn has_word_flags_match_the_source() {
+    let db = TestDB::with_files(
+        r#"
+#[marker] pub trait M {}
+#[automatically_derived] impl M for u8 {}
+#[rustc_main] fn main() {}
+pub enum E { #[default] A, B }
+#[naked] pub extern "C" fn n() {}
+#[unsafe(naked)] pub extern "C" fn u() {}
+#[cfg_attr(all(), naked)] pub extern "C" fn c() {}
+#[rustc_deny_explicit_impl] pub trait D {}
+#[rustc_canonical_symbol] extern "C" { fn f(); }
+#[rust_analyzer::marker] pub trait N {}
+#[a::rustc_deny_explicit_impl] pub trait Q {}
+pub struct Plain;
+"#,
+    );
+    let owners = root_owners(&db);
+    for word in [
+        "marker",
+        "automatically_derived",
+        "rustc_main",
+        "default",
+        "naked",
+        "rustc_deny_explicit_impl",
+        "rustc_canonical_symbol",
+    ] {
+        let mut found = 0;
+        for &owner in &owners {
+            let flag = AttrFlags::has_word(&db, owner, word);
+            assert_eq!(flag, AttrFlags::has_word_in_source(&db, owner, word), "{word} on {owner:?}");
+            found += usize::from(flag);
+        }
+        let want = match word {
+            "naked" => 3,
+            "rustc_canonical_symbol" => 0,
+            _ => 1,
+        };
+        assert_eq!(found, want, "{word}");
+    }
+}
+
+/// Every attribute lookup a later query or an IDE request makes, on an item asked once: a
+/// memo read and a bit test, no allocation.
+#[test]
+fn warm_attribute_lookups_allocate_nothing() {
+    let db = TestDB::with_files(
+        r#"
+#![feature(lang_items)]
+#[repr(C)]
+#[must_use = "use it"]
+#[doc(alias = "Ess")]
+pub struct S {
+    #[doc(hidden)]
+    pub a: u8,
+    #[cfg(any())]
+    pub b: u8,
+}
+#[lang = "sized"]
+#[marker]
+pub trait Sized {}
+#[rustc_diagnostic_item = "the_fn"]
+#[export_name = "named"]
+pub fn f() {}
+"#,
+    );
+    let (mut strukt, mut trait_, mut func) = (None, None, None);
+    for owner in root_owners(&db) {
+        match owner {
+            AttrDefId::AdtId(AdtId::StructId(it)) => strukt = Some(it),
+            AttrDefId::TraitId(it) => trait_ = Some(it),
+            AttrDefId::FunctionId(it) => func = Some(it),
+            _ => {}
+        }
+    }
+    let (strukt, trait_, func) = (strukt.unwrap(), trait_.unwrap(), func.unwrap());
+    let field =
+        FieldId { parent: VariantId::StructId(strukt), local_id: Idx::from_raw(RawIdx::from_u32(0)) };
+    let krate = db.fetch_test_crate();
+    let the_fn = Symbol::intern("the_fn");
+    let lookups = || {
+        let s = AttrFlags::query(&db, strukt.into());
+        assert!(s.contains(AttrFlags::HAS_REPR | AttrFlags::IS_MUST_USE));
+        assert!(AttrFlags::query_field(&db, field).contains(AttrFlags::IS_DOC_HIDDEN));
+        assert!(AttrFlags::repr(&db, AdtId::StructId(strukt)).is_some());
+        assert_eq!(AttrFlags::must_use_message(&db, strukt.into()), Some(Some("use it")));
+        assert_eq!(s.doc_aliases(&db, Either::Left(strukt.into())).len(), 1);
+        assert!(AttrFlags::lang_item(&db, trait_.into()).is_some());
+        assert!(AttrFlags::has_word(&db, trait_.into(), "marker"));
+        assert!(AttrFlags::diagnostic_item(&db, func.into()).is_some());
+        assert!(AttrFlags::export_name(&db, func.into()).is_some());
+        assert!(AttrFlags::docs(&db, strukt.into()).is_none());
+        assert!(crate::diagnostic_item::diagnostic_items(&db, krate).get(&the_fn).is_some());
+    };
+    lookups();
+    blaze_alloc_count::assert_at_most(0, "attribute lookups on a warm item", lookups);
+}
+
+/// The flags of `owner` read off its file's parse, as they were before the outline.
+fn live_flags(db: &TestDB, owner: AttrDefId) -> AttrFlags {
+    let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
+    let mut flags = AttrFlags::empty();
+    let _ = collect_attrs_in(db, source, outer_mod_decl, crate_attrs, krate, |attr, _| {
+        match_attr_flags(&mut flags, attr)
+    });
+    flags
+}
+
+/// The flags read off the outline are those of the file's parse, for items whose bodies it
+/// leaves out, keeps (an inner attribute may start them) or that are bodies themselves.
+#[test]
+fn outline_flags_are_the_live_flags() {
+    let db = TestDB::with_files(
+        r#"
+#![doc(hidden)]
+#[inline] pub fn a() -> u32 { 1 }
+pub fn inner() { #![rustc_nounwind] let _ = 2; }
+pub fn inner_after_comments() {
+    // a comment
+    /* another */ #![rustc_nounwind]
+}
+pub fn outer_on_a_statement() { #[cfg(any())] let _ = 3; }
+pub fn with_item() { #[rustc_nounwind] fn nested() {} nested(); }
+#[repr(C)] pub struct S { #[doc(hidden)] pub a: u8, #[cfg(any())] pub b: u8, pub c: u8 }
+pub enum E { #[default] A, #[deprecated] B(#[doc(hidden)] u8) }
+pub const C: u8 = { 1 };
+#[used] pub static ST: u8 = 2;
+pub mod m { #![doc(hidden)] #[must_use] pub fn b() -> u8 { 0 } }
+#[automatically_derived] impl S { #[inline] pub fn method(&self) { let _ = 3; } }
+"#,
+    );
+    let owners = root_owners(&db);
+    for &owner in &owners {
+        assert_eq!(AttrFlags::query(&db, owner), live_flags(&db, owner), "{owner:?}");
+        let variant = match owner {
+            AttrDefId::AdtId(AdtId::StructId(it)) => VariantId::StructId(it),
+            AttrDefId::EnumVariantId(it) => VariantId::EnumVariantId(it),
+            _ => continue,
+        };
+        let mut live = Vec::new();
+        for_each_field(&db, variant, Tree::Live, |_, cfg_options, field| {
+            let mut flags = AttrFlags::empty();
+            expand_cfg_attr_view(field.value.attrs(), || cfg_options, |attr, _| {
+                match_attr_flags(&mut flags, attr)
+            });
+            live.push(flags);
+        });
+        for (at, flags) in live.into_iter().enumerate() {
+            let local_id = Idx::from_raw(RawIdx::from_u32(at as u32));
+            assert_eq!(AttrFlags::query_field(&db, FieldId { parent: variant, local_id }), flags);
+        }
+    }
+    let by_name = |name: &str| {
+        let (_, func) = functions(&db).into_iter().find(|(it, _)| it == name).unwrap();
+        AttrFlags::query(&db, func.into())
+    };
+    assert!(by_name("inner").contains(AttrFlags::RUSTC_NOUNWIND));
+    assert!(by_name("inner_after_comments").contains(AttrFlags::RUSTC_NOUNWIND));
+    assert!(!by_name("with_item").contains(AttrFlags::RUSTC_NOUNWIND));
+    assert!(by_name("a").contains(AttrFlags::IS_INLINE));
+}
+
+/// An edit of a fn's body leaves the file's outline the same, so no attribute query of the
+/// file runs again, and each reads what it did.
+#[test]
+fn a_body_edit_runs_no_attribute_query() {
+    const CODE: &str = r#"
+#![doc(hidden)]
+#[inline] pub fn a() -> u32 { 1 }
+#[repr(C)] pub struct S { #[doc(hidden)] pub f: u8 }
+"#;
+    fn read(db: &TestDB) -> Vec<AttrFlags> {
+        let mut flags = Vec::new();
+        for owner in root_owners(db) {
+            flags.push(AttrFlags::query(db, owner));
+            if let AttrDefId::AdtId(AdtId::StructId(it)) = owner {
+                let local_id = Idx::from_raw(RawIdx::from_u32(0));
+                flags.push(AttrFlags::query_field(db, FieldId { parent: it.into(), local_id }));
+            }
+        }
+        flags
+    }
+    let (mut db, file) = TestDB::with_single_file(CODE);
+    let before = read(&db);
+    db.set_file_text(file.file_id(&db), &CODE.replace("{ 1 }", "{ 1 + 2 }"));
+    let mut after = Vec::new();
+    let log = db.executed_in_read_order(|| after = read(&db));
+    let attrs = |it: &&String| it.contains("AttrFlags::query") || it.contains("field_attr_flags");
+    assert_eq!(log.iter().filter(attrs).count(), 0, "{log:#?}");
+    assert_eq!(before, after);
+}
+
+/// The crate root's attributes, each with its file: rustc appends the crate attributes given
+/// on the command line to the root's own (`krate.attrs.push`), each read off its own file.
+fn root_attrs_with_files(db: &TestDB, module: crate::ModuleId) -> Vec<(String, HirFileId)> {
+    let (source, outer_mod_decl, crate_attrs, krate) =
+        attrs_source(db, AttrDefId::ModuleId(module), Tree::Live);
+    let mut seen = Vec::new();
+    let _ = collect_attrs_in(db, source, outer_mod_decl, crate_attrs, krate, |meta, file| {
+        seen.push((meta.syntax().text().to_owned(), file));
+        ControlFlow::<Infallible>::Continue(())
+    });
+    seen
+}
+
+#[test]
+fn crate_attrs_follow_the_roots_own() {
+    let (db, file_id) = TestDB::with_single_file(
+        "//- /lib.rs crate:foo crate-attr:feature(a) crate-attr:no_std\n#![doc(hidden)]\n",
+    );
+    let krate = db.fetch_test_crate();
+    let files = base_db::crate_attr_files(&db, krate);
+    assert_eq!(files.len(), 2);
+    assert_eq!(base_db::applied_crate_attr_files(&db, krate), files);
+    let module = db.module_for_file(file_id.file_id(&db));
+    let root = HirFileId::from(file_id);
+    assert_eq!(
+        root_attrs_with_files(&db, module),
+        [
+            ("doc(hidden)".to_owned(), root),
+            ("feature(a)".to_owned(), HirFileId::from(files[0])),
+            ("no_std".to_owned(), HirFileId::from(files[1])),
+        ]
+    );
+    for &file in files {
+        assert_eq!(file.edition(&db), krate.data(&db).edition);
+        assert_eq!(base_db::crate_attr_owner(&db, file.file_id(&db)), Some(krate));
+    }
+}
+
+/// A crate attribute rustc refuses is not applied and has its error; the others still are.
+#[test]
+fn a_refused_crate_attr_is_not_applied() {
+    let (db, file_id) = TestDB::with_single_file(
+        "//- /lib.rs crate:foo crate-attr:no_std crate-attr:a,b crate-attr:feature(x)\n",
+    );
+    let krate = db.fetch_test_crate();
+    let files = base_db::crate_attr_files(&db, krate);
+    assert_eq!(files.len(), 3);
+    assert_eq!(base_db::crate_attr_error(&db, files[0]), None);
+    assert_eq!(
+        base_db::crate_attr_error(&db, files[1]),
+        Some(base_db::CrateAttrError::Trailing {
+            range: syntax::TextRange::new(3.into(), 5.into())
+        })
+    );
+    assert_eq!(base_db::crate_attr_error(&db, files[2]), None);
+    assert_eq!(base_db::applied_crate_attr_files(&db, krate), [files[0], files[2]]);
+    let module = db.module_for_file(file_id.file_id(&db));
+    let attrs: Vec<_> = root_attrs_with_files(&db, module).into_iter().map(|(it, _)| it).collect();
+    assert_eq!(attrs, ["no_std", "feature(x)"]);
+    let flags = AttrFlags::query(&db, AttrDefId::ModuleId(module));
+    assert!(flags.contains(AttrFlags::IS_NO_STD));
+}
+
+/// `AttrFlags::is_cfg_enabled_for` as it was, on handles.
+fn old_is_cfg_enabled_for(
+    owner: &impl HasAttrs,
+    cfg_options: &cfg::CfgOptions,
+) -> Result<(), cfg::CfgExpr> {
+    let result = expand_cfg_attr(
+        ast::attrs_including_inner(owner),
+        || cfg_options,
+        |attr, _| {
+            if let ast::Meta::CfgMeta(attr) = attr
+                && let Some(cfg_predicate) = attr.cfg_predicate()
+                && let cfg = cfg::CfgExpr::parse_from_ast(cfg_predicate)
+                && cfg_options.check(&cfg) == Some(false)
+            {
+                ControlFlow::Break(cfg)
+            } else {
+                ControlFlow::Continue(())
+            }
+        },
+    );
+    match result {
+        Some(cfg) => Err(cfg),
+        None => Ok(()),
+    }
+}
+
+/// On views, `is_cfg_enabled_for` gives every attribute owner the answer, and stops at the
+/// `cfg`, the handle walk gave: through `cfg_attr` nests, inner attributes and fields.
+#[test]
+fn is_cfg_enabled_for_views_as_handles() {
+    let text = r#"
+#![cfg(x)]
+#[cfg(x)] fn a() {}
+#[cfg(not(x))] fn b() {}
+#[cfg_attr(all(), cfg(y))] fn c() {}
+#[cfg_attr(any(), cfg(y))] fn d() {}
+#[cfg_attr(x, cfg_attr(all(), cfg(any())))] fn e() {}
+#[cfg(all(x, y))] #[cfg(not(z))] fn f() {}
+#[cfg(x)] #[cfg(y)] fn g() {}
+fn h() { #![cfg(any())] let _ = 1; }
+fn i() { // a comment
+    #![cfg_attr(x, cfg(y))]
+}
+mod m { #![cfg(y)] }
+impl S { #![cfg(not(y))] #[cfg(y)] fn j() {} }
+extern "C" { #![cfg(x)] }
+struct S { #[cfg(x)] a: u8, #[cfg_attr(all(), cfg(any()))] b: u8, c: u8 }
+enum E { #[cfg(not(y))] A, #[cfg(z)] B(#[cfg(x)] u8, u8) }
+fn k<#[cfg(x)] 'a, #[cfg(y)] T>() { match () { #[cfg(y)] () => {} } }
+"#;
+    let parse = SourceFile::parse(text, Edition::CURRENT);
+    let mut cfg_options = cfg::CfgOptions::default();
+    cfg_options.insert_atom(Symbol::intern("x"));
+    let (mut owners, mut disabled) = (0, 0);
+    for handle in parse.tree().syntax().descendants().filter_map(ast::AnyHasAttrs::cast) {
+        let want = old_is_cfg_enabled_for(&handle, &cfg_options);
+        let got = AttrFlags::is_cfg_enabled_for(view_of(parse.root(), &handle), &cfg_options);
+        assert_eq!(got, want, "{}", handle.syntax());
+        owners += 1;
+        disabled += usize::from(want.is_err());
+    }
+    assert!(owners > 30 && disabled > 10, "{owners} owners, {disabled} disabled");
+}
+
+/// Matching an attribute's flags on views reads lent text and the name tables: no allocation,
+/// for every attribute of the corpus but those whose string value has an escape to undo.
+#[test]
+fn match_attr_flags_allocates_nothing() {
+    for attr in corpus().into_iter().filter(|it| !it.contains('\\')) {
+        let parse = parse_of(&attr);
+        let meta = meta_in(&parse);
+        let mut flags = AttrFlags::empty();
+        blaze_alloc_count::assert_at_most(0, &attr, || match_attr_flags(&mut flags, meta));
+    }
+}
+
 mod stability {
     use hir_expand::Lookup;
     use intern::Symbol;
@@ -1027,7 +1533,7 @@ mod stability {
         AdtId, AttrDefId, DefWithBodyId, FieldId, ModuleDefId, ModuleId, VariantId,
         attrs::stability::{
             DeprecatedSince, RustcVersion, Stability, StabilityDef, StabilityLevel, StableSince,
-            deprecation_entry, stability,
+            deprecation_entry, own_deprecation, own_stability, stability,
         },
         expr_store::Body,
         nameres::crate_def_map,
@@ -1208,11 +1714,47 @@ pub fn without_note() {}
         assert_eq!(*since, DeprecatedSince::RustcVersion(version));
         assert_eq!(origin(&db, def(&db, "without_note")), None, "a staged crate's needs a note");
     }
+
+    /// The `macro_rules!` `name` declared in `module`.
+    fn macro_in(db: &TestDB, module: StabilityDef, name: &str) -> StabilityDef {
+        let StabilityDef::Def(AttrDefId::ModuleId(module)) = module else { panic!("not a module") };
+        let scope = module.def_map(db).module(db, module).scope(db);
+        let (_, macros) = scope
+            .legacy_macros()
+            .find(|(it, _)| it.as_str() == name)
+            .unwrap_or_else(|| panic!("no `{name}!` in the module"));
+        AttrDefId::MacroId(*macros.last().unwrap()).into()
+    }
+
+    #[test]
+    fn a_macros_own_stability_and_deprecation_inherit_nothing() {
+        let db = TestDB::with_files(
+            r#"
+#![feature(staged_api)]
+#![stable(feature = "root", since = "1.0.0")]
+#[unstable(feature = "m", issue = "none")]
+pub mod m {
+    macro_rules! plain { () => {} }
+    #[deprecated = "x"]
+    macro_rules! old { () => {} }
+}
+"#,
+        );
+        let m = def(&db, "m");
+        let plain = macro_in(&db, m, "plain");
+        assert_eq!(feature(&db, plain), Some("m"), "`stability` inherits the module's");
+        assert_eq!(own_stability(&db, plain), None);
+        assert_eq!(own_deprecation(&db, plain), None);
+
+        let old = macro_in(&db, m, "old");
+        assert_eq!(own_deprecation(&db, old).unwrap().note, Some(Symbol::intern("x")));
+        assert_eq!(own_stability(&db, old), None);
+    }
 }
 
 mod sanitize {
     use hir_expand::Lookup;
-    use syntax::ast::HasName;
+    use syntax::view::HasName;
     use test_fixture::WithFixture;
 
     use crate::{
@@ -1278,7 +1820,11 @@ pub mod m {
 "#;
 
     fn name(db: &TestDB, func: FunctionId) -> String {
-        func.lookup(db).source(db).value.name().map_or_else(String::new, |it| it.text().to_string())
+        func.lookup(db)
+            .source_view(db)
+            .value
+            .name()
+            .map_or_else(String::new, |it| it.text().to_owned())
     }
 
     /// Every function of `def_map`'s modules and their impls, and of the blocks of their bodies,

@@ -332,15 +332,7 @@ fn download_once<'a>(
     let mut file = Hashing::new(Reading { runtime, body, piece: Vec::new(), at: 0 });
     let mut keeping = Keeping::new(store);
     let unpacked = {
-        let decompressed: Box<dyn Read + '_> = match info.compression {
-            Compression::Xz => Box::new(lzma_rust2::XzReader::new(
-                BufReader::with_capacity(1 << 20, &mut file),
-                false,
-            )),
-            Compression::Zstd => Box::new(zstd::stream::read::Decoder::new(&mut file)?),
-            Compression::None => Box::new(&mut file),
-        };
-        let mut nar = Hashing::new(decompressed);
+        let mut nar = Hashing::new(Decompressed::of(info.compression, &mut file)?);
         nar::read(BufReader::with_capacity(1 << 20, &mut nar), &mut keeping)
             .with_context(|| format!("the NAR of {}", info.store_path))?;
         io::copy(&mut nar, &mut io::sink())?;
@@ -364,4 +356,57 @@ fn download_once<'a>(
         bail!("its file {} is not the one its narinfo names", info.url);
     }
     Ok((file.len, unpacked, keeping))
+}
+
+/// The file of a NAR, read decompressed as its narinfo says it is compressed.
+enum Decompressed<R: Read> {
+    Xz(lzma_rust2::XzReader<BufReader<R>>),
+    Zstd(zstd::stream::read::Decoder<'static, BufReader<R>>),
+    None(R),
+}
+
+impl<R: Read> Decompressed<R> {
+    fn of(compression: Compression, file: R) -> io::Result<Decompressed<R>> {
+        Ok(match compression {
+            Compression::Xz => {
+                Decompressed::Xz(lzma_rust2::XzReader::new(BufReader::with_capacity(1 << 20, file), false))
+            }
+            Compression::Zstd => Decompressed::Zstd(zstd::stream::read::Decoder::new(file)?),
+            Compression::None => Decompressed::None(file),
+        })
+    }
+}
+
+impl<R: Read> Read for Decompressed<R> {
+    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Decompressed::Xz(it) => it.read(into),
+            Decompressed::Zstd(it) => it.read(into),
+            Decompressed::None(it) => it.read(into),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read as _, Write as _};
+
+    use super::{Compression, Decompressed};
+
+    #[test]
+    fn each_compression_reads_back_what_was_compressed() {
+        let nar: Vec<u8> = (0..100_000u32).map(|it| (it % 251) as u8).collect();
+        let mut xz = lzma_rust2::XzWriter::new(Vec::new(), Default::default()).unwrap();
+        xz.write_all(&nar).unwrap();
+        let files = [
+            (Compression::Xz, xz.finish().unwrap()),
+            (Compression::Zstd, zstd::encode_all(&nar[..], 3).unwrap()),
+            (Compression::None, nar.clone()),
+        ];
+        for (compression, file) in files {
+            let mut read = Vec::new();
+            Decompressed::of(compression, &file[..]).unwrap().read_to_end(&mut read).unwrap();
+            assert!(read == nar, "{compression:?}");
+        }
+    }
 }

@@ -297,6 +297,18 @@ Unchanged and not listed:
 
 ## db
 
+> checked by db (db-next2, 2026-10-29 22:36), the regenerated list against the code, line by line:
+> - 259 sites: the old text is gone from the file.
+> - 18 sites are already marked withdrawn (already ported). The `TyKind::Alias` ones that
+>   still matched the old text are ported multi-line calls, two fields
+>   (`dyn_compatibility.rs:242`, `:495`, `lower.rs:3293`).
+> - The R11 `GenericTypeVisitable` impls (`lib.rs:211`, `:383`, `mir.rs:229`) are
+>   `unsafe impl` with SAFETY lines.
+> - No `ConstKind::Unevaluated` or `Const::new_unevaluated` is left outside `next_solver/`.
+> - Every R10 `top` import is present except `hir/src/lib.rs`'s, now added.
+> - One suggestion is wrong and not applied: `mir.rs` L142 (see its section).
+> Not compiled.
+
 Window `db-next2`. 295 sites in 32 files.
 
 
@@ -329,6 +341,19 @@ Besides the sites below:
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
 > forwarded to db (told by solver-sync-callers; told again by requests).
 > applied by db-ty-port-ty: `mir_const_alias_kind`, the `#[splat]` index (lower.rs, waiting on hir-def's `FunctionSignature::splatted`, requested in `v2/requests/db-ty.md`), `splatted()` in infer/persist.rs, `TypingMode::Typeck` in infer/opaques.rs, both `TY_TABLE_SCHEMA`s. hir's `Type` item is hir's owner's.
+> checked by db (db-next2, 2026-10-29 22:12): every `###` file of this section has an applied
+> line, and hir's `Type` item is in too (every `EarlyBinder::bind` in `crates/hir/src` takes the
+> interner). Searching db's paths (hir, hir-ty but next_solver and items' files, borrowck,
+> wfcheck, matchck, unsafeck) finds none of the old forms: no `OutlivesPredicate`, no
+> one-field `TyKind::Alias(..)`, no `ConstKind::Unevaluated`. Still open: the `#[splat]`
+> index waits on hir-def's `FunctionSignature::splatted` (`v2/requests/db-ty.md`). Not
+> compiled.
+> checked by db (db-next2, 22:16), solver-sync-predicate's two items, both in the tree:
+> - `lower/persist.rs:50` and `infer/persist.rs:79` build `TY_TABLE_SCHEMA` with `schema_of`,
+>   folding in `next_solver::persist::TABLE_SCHEMA`; infer's also has `Part::U64(2)`.
+> - `infer/persist.rs` writes `splatted()` in bits 8-15 of the signature's flags
+>   (`NO_SPLATTED_ARG_INDEX` for none). The read refuses an index past the inputs (`:3147`).
+>   The round-trip test's closures cover both `Some(1)` and `None`.
 
 ### `crates/hir-ty-borrowck/src/check.rs`
 
@@ -756,6 +781,7 @@ Besides the sites below:
   R11: say in the SAFETY line which fields it visits; a manual impl that skips a field that holds a type is unsound now.
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
 > applied by db-ty-port-ty
+> checked by db (db-next2, 2026-10-29 22:36): L227 is `unsafe impl` with its SAFETY line (`mir.rs:229`). L142's suggestion is wrong, not applied: `Ty::new_fn_def(interner, def_id, args: GenericArgs)` wraps the args in `Binder::dummy` itself (`next_solver/ty.rs:235`), so the call stays as it is.
 
 ### `crates/hir-ty/src/solver_errors.rs`
 
@@ -824,6 +850,8 @@ Besides the sites below:
 - L6314: `rustc_type_ir::PredicatePolarity::Negative => PredicatePolarity::Negative,` → `rustc_type_ir::ClausePolarity::Negative => ClausePolarity::Negative,`
 > forwarded to db (told by tmux; regenerated list, check each line against the code first).
 > applied by db-ty-port-rest
+
+> applied by db (db-next2, 2026-10-29 22:36): the `top` import: `crates/hir/src/lib.rs` calls `Region::error(interner)` (`:5151`), which is `RegionExt`'s now (no inherent `error` in rustc_type_ir), so its `next_solver::{..}` import gains `RegionExt as _`.
 
 ### `crates/hir/src/source_analyzer.rs`
 

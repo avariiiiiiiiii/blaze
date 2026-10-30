@@ -93,6 +93,7 @@ hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
 hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
 hir-ty-codegen = { path = "crates/hir-ty-codegen" }
+rustc-symbols = { path = "crates/rustc-symbols" }
 blaze-expand = { path = "crates/blaze-expand" }
 # The `proc_macro` blaze's native expanders are built against (crates/blaze-expand/src/native/).
 native-proc-macro = { package = "blaze-native-proc-macro", path = "crates/blaze-expand/src/native/proc_macro" }
@@ -197,8 +198,15 @@ arrayvec = "0.7.6"
 bitflags = "2.9.1"
 # Per-task bump arenas in front-end crates, which can't depend on `blaze-graph`'s `arena::Bump`.
 bumpalo = { version = "3.20", features = ["collections"] }
-# `neon`: aarch64 picks NEON at compile time; x86_64 detects AVX-512 at run time without a feature.
+# Official BLAKE3: `blaze_ids::b3`'s backend where blake3-servil doesn't build (Windows, x86-64
+# macOS), and the reference beside it. `neon`: aarch64 picks NEON at compile time; x86_64
+# detects AVX-512 at run time without a feature.
 blake3 = { version = "1.8", default-features = false, features = ["std", "neon"] }
+# BLAKE3-Servil (johnservil/BLAKE3 `servil`, 0.8.0 on official 1.8.7): `blaze_ids::b3`'s
+# backend on x86-64 Linux and AArch64 Linux and macOS (docs/v2/plan/process/decisions.md).
+# Its kernels are chosen at run time; `std` alone, and its pool's threads start only in
+# `initialize_multithreaded`, which blaze never calls.
+blake3-servil = { git = "https://github.com/johnservil/BLAKE3", rev = "c6bd679a0911cc233cb28297f2b25875381215a1", default-features = false, features = ["std"] }
 cargo_metadata = "0.23.1"
 camino = "1.2.2"
 # The Cranelift hir-ty-codegen compiles with.

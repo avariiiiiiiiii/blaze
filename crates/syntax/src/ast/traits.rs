@@ -128,20 +128,46 @@ fn may_start_with_inner_attr(block: &SyntaxNode) -> bool {
 
 /// Returns all attributes of this node, including inner attributes that may not be directly under this node
 /// but under a child.
-pub fn attrs_with_doc_including_inner(
-    owner: &dyn HasAttrs,
-) -> impl Iterator<Item = ast::AnyAttr> + Clone {
-    owner.attrs_with_doc().filter(|attr| attr.kind().is_outer()).chain(
-        owner
-            .inner_attributes_node()
-            .into_iter()
-            .flat_map(|node| support::children::<ast::AnyAttr>(&node))
-            .filter(|attr| attr.kind().is_inner()),
-    )
+///
+/// Generic only in reading `owner`'s two nodes: the iterator is one type for every owner.
+#[inline]
+pub fn attrs_with_doc_including_inner(owner: &impl HasAttrs) -> AttrsWithDocIncludingInner {
+    AttrsWithDocIncludingInner {
+        outer: Some(owner.attrs_with_doc()),
+        inner: owner.inner_attributes_node().map(|node| support::children(&node)),
+    }
 }
 
-pub fn attrs_including_inner(owner: &dyn HasAttrs) -> impl Iterator<Item = ast::Attr> + Clone {
+#[inline]
+pub fn attrs_including_inner(owner: &impl HasAttrs) -> AttrsIncludingInner {
     AttrsIter::new(attrs_with_doc_including_inner(owner))
+}
+
+/// What [`attrs_including_inner`] gives, of any owner.
+pub type AttrsIncludingInner = AttrsIter<AttrsWithDocIncludingInner>;
+
+/// What [`attrs_with_doc_including_inner`] gives: the owner's outer attributes and doc
+/// comments, then the inner ones of the node holding them.
+#[derive(Clone)]
+pub struct AttrsWithDocIncludingInner {
+    /// `None` once its outer ones are done.
+    outer: Option<AstChildren<ast::AnyAttr>>,
+    inner: Option<AstChildren<ast::AnyAttr>>,
+}
+
+impl Iterator for AttrsWithDocIncludingInner {
+    type Item = ast::AnyAttr;
+
+    #[inline]
+    fn next(&mut self) -> Option<ast::AnyAttr> {
+        if let Some(outer) = &mut self.outer {
+            match outer.find(|attr| attr.kind().is_outer()) {
+                Some(attr) => return Some(attr),
+                None => self.outer = None,
+            }
+        }
+        self.inner.as_mut()?.find(|attr| attr.kind().is_inner())
+    }
 }
 
 #[derive(Clone)]
@@ -172,7 +198,9 @@ impl<A: HasName, B: HasName> HasName for Either<A, B> {}
 
 #[cfg(test)]
 mod tests {
-    use super::{HasAttrs, attrs_including_inner};
+    use super::{
+        AttrsIncludingInner, HasAttrs, attrs_including_inner, attrs_with_doc_including_inner,
+    };
     use crate::{
         AstNode, Edition, SourceFile, Text,
         ast::{self, HasModuleItem},
@@ -241,5 +269,32 @@ mod tests {
         assert!(fns[0].inner_attributes_node().is_none() && !parsed(&fns[0]));
         assert_eq!(attrs_including_inner(&fns[1]).count(), 1);
         assert!(parsed(&fns[1]));
+    }
+
+    #[test]
+    fn the_outer_attributes_come_first_then_the_inner_ones() {
+        let text = "/// outer\n#[a]\n#[b]\nmod m {\n    #![c]\n    //! inner\n    #![d]\n    #[e]\n    fn f() {}\n}\n";
+        let file = SourceFile::parse(text, Edition::CURRENT);
+        let module = file
+            .tree()
+            .items()
+            .find_map(|it| match it {
+                ast::Item::Module(it) => Some(it),
+                _ => None,
+            })
+            .unwrap();
+        let with_doc: Vec<(bool, bool)> = attrs_with_doc_including_inner(&module)
+            .map(|it| (it.kind().is_inner(), matches!(it, ast::AnyAttr::DocComment(_))))
+            .collect();
+        assert_eq!(
+            with_doc,
+            [(false, true), (false, false), (false, false), (true, false), (true, true), (true, false)]
+        );
+        let names = |attrs: AttrsIncludingInner| -> Vec<String> {
+            attrs.map(|it| it.meta().unwrap().syntax().text().to_string()).collect()
+        };
+        assert_eq!(names(attrs_including_inner(&module)), ["a", "b", "c", "d"]);
+        let any = ast::AnyHasAttrs::new(module);
+        assert_eq!(names(attrs_including_inner(&any)), ["a", "b", "c", "d"], "any owner, the same");
     }
 }

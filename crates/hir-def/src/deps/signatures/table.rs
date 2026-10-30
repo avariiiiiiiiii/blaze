@@ -8,10 +8,11 @@
 //! its ast id and its module: a module of the crate's `DefMap`, or the root of the `DefMap` of a
 //! block the table names before it. Reading interns each again in this database.
 //!
-//! A store's buffer holds four kinds of word outside its words: each block of `block_scopes`
-//! (its bits), the block of each `Expr::Block` (two words of `extra`), and the syntax context of
-//! each ident and type of its hygiene tables. Written, each becomes its index in the table
-//! (a block's plus one, so that no block is 0); read, the index is its id in this database
+//! A store's buffer holds five kinds of word outside its words: each block of `block_scopes`
+//! (its bits), each macro call of `macro_calls` (its bits), the block of each `Expr::Block`
+//! (two words of `extra`), and the syntax context of each ident and type of its hygiene tables.
+//! Written, each becomes its index in the table (a block's or a call's plus one, so that none is
+//! 0); read, the index is its id in this database
 //! again, in a copy of the buffer. A store with none is read in place.
 
 use base_db::{Crate, Db};
@@ -200,6 +201,8 @@ fn read_block(dec: &mut Dec<'_>, db: &Db, entries: &[(Kind, u64)]) -> R<u64> {
 struct Sites {
     /// Each `block_scopes` entry, a `u64`.
     scopes: Vec<usize>,
+    /// Each `macro_calls` entry, a `u64`.
+    calls: Vec<usize>,
     /// The two words of each `Expr::Block`'s id, the low one first.
     blocks: Vec<usize>,
     /// Each ident and type hygiene context, a `u32`.
@@ -208,7 +211,10 @@ struct Sites {
 
 impl Sites {
     fn is_empty(&self) -> bool {
-        self.scopes.is_empty() && self.blocks.is_empty() && self.contexts.is_empty()
+        self.scopes.is_empty()
+            && self.calls.is_empty()
+            && self.blocks.is_empty()
+            && self.contexts.is_empty()
     }
 }
 
@@ -221,6 +227,7 @@ fn sites(buffer: &[u8]) -> Result<Sites, FormatError> {
     let root = open_as::<StoreRoot>(buffer, <ExpressionStore as Persist>::SCHEMA)?;
     let mut sites = Sites::default();
     sites.scopes.extend(root.block_scopes.follow(buffer)?.iter().map(|it| place(it, buffer)));
+    sites.calls.extend(root.macro_calls.follow(buffer)?.iter().map(|it| place(it, buffer)));
     let (kinds, data) = (root.expr_kind.follow(buffer)?, root.expr_data.follow(buffer)?);
     let extra = root.extra.follow(buffer)?;
     for (&kind, &at) in kinds.iter().zip(data) {
@@ -260,6 +267,10 @@ pub(super) fn relocate_store(bytes: &mut [u8], table: &mut Relocation) {
     let sites = sites(&Aligned::copy_from(bytes)).expect("a store buffer just written reads");
     for at in sites.scopes {
         let index = table.index(Kind::Block, wide(bytes, at));
+        set_wide(bytes, at, u64::from(index) + 1);
+    }
+    for at in sites.calls {
+        let index = table.index(Kind::MacroCall, wide(bytes, at));
         set_wide(bytes, at, u64::from(index) + 1);
     }
     for at in sites.blocks {
@@ -304,12 +315,19 @@ pub(super) fn unrelocate_store<'a>(
         return Ok(StoreBytes::InPlace(bytes));
     }
     let invalid = |at: usize, what| FormatError::Invalid { at: at as u64, what };
-    // alloc: a store naming blocks or contexts is patched in a copy; the record is read-only.
+    // The record is read-only, so a store that names blocks, calls or contexts is patched here.
+    // alloc: one copy of a store that names ids, once a read
     let mut moved = bytes.to_vec();
     for at in sites.scopes {
         let index = wide(&moved, at).checked_sub(1).and_then(|it| u32::try_from(it).ok());
         let bits = index.and_then(|index| table.get(Kind::Block, index));
         let bits = bits.ok_or_else(|| invalid(at, "a block scope not in the table"))?;
+        set_wide(&mut moved, at, bits);
+    }
+    for at in sites.calls {
+        let index = wide(&moved, at).checked_sub(1).and_then(|it| u32::try_from(it).ok());
+        let bits = index.and_then(|index| table.get(Kind::MacroCall, index));
+        let bits = bits.ok_or_else(|| invalid(at, "a macro call not in the table"))?;
         set_wide(&mut moved, at, bits);
     }
     for at in sites.blocks {

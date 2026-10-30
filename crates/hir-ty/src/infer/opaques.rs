@@ -12,7 +12,7 @@ use crate::{
     },
 };
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// This takes all the opaque type uses during HIR typeck. It first computes
     /// the concrete hidden type by iterating over all defining uses.
     ///
@@ -63,7 +63,7 @@ impl<'db> UsageKind<'db> {
     }
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     fn compute_definition_site_hidden_types(
         &mut self,
         mut opaque_types: Vec<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)>,

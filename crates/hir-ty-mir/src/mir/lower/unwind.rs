@@ -1,21 +1,24 @@
-//! The unwind paths lowering writes, each folded once per change of what it drops: rustc's
-//! cached unwind block per scope (`Scope::cached_unwind_block`, `rustc_mir_build`'s
+//! The unwind paths lowering writes, each step folded once per change of what it drops, after
+//! rustc's cached unwind blocks (`Scope::cached_unwind_block`, `rustc_mir_build`'s
 //! `builder/scope.rs`).
 //!
 //! The way out of a point that may panic drops what every scope holds there, innermost first. It
 //! is a fold over the scopes' locals, outermost first, through `unwind_node`, whose memo makes
-//! each step's block depend only on the block before it, the local and the kind of step. So each
-//! scope keeps the block its fold ended at, and only the scopes that changed since are folded
-//! again. A fold over a prefix that has not changed allocates no block, then or when it was first
-//! folded, so blocks come out in the order the fold over everything at every ask gives them.
+//! each step's block depend only on the block before it, the local and the kind of step. So the
+//! block after each position of the scopes' order is kept, and when the order changes only the
+//! positions after the first one that differs are folded again. A fold over a prefix that has
+//! not changed allocates no block, then or when it was first folded, so blocks come out in the
+//! order the fold over everything at every ask gives them.
 //!
-//! A scope's fold depends on its locals and tail mark (`ScopeLocals`, which marks itself stale
-//! on every change), on which of them are pending operands (`operands`) and which are
-//! unscheduled temporaries (`unscheduled`). A change of either set goes through `Unwinds`, which
-//! marks stale the outermost listed scope holding the local; everything inside a stale scope is
-//! listed and folded again.
+//! rustc folds a scope's drops again whenever one is scheduled in it, which is quadratic in a
+//! block of many `let`s with a call after each; here a `let` is one step.
+//!
+//! What a fold depends on: each scope's locals and tail mark (`ScopeLocals`, which marks itself
+//! stale on every change), which locals are pending operands (`operands`: it changes the order)
+//! and which are unscheduled temporaries (`unscheduled`: it changes whether a step drops). Both
+//! sets change only through `Unwinds`.
 
-use std::ops::Deref;
+use std::{cell::Cell, ops::Deref};
 
 use blaze_mem::Frame;
 
@@ -73,7 +76,7 @@ impl<'f> LocalSet<'f> {
 
 /// The locals of a drop scope in the order they were declared, which is the reverse of the order
 /// they are dropped in, and its tail mark. Reads go through `Deref`; every change goes through
-/// `edit`, `push_new` or `set_tail`, which mark the scope for `Unwinds` to list and fold again.
+/// `edit`, `push_new` or `set_tail`, which mark the scope for `Unwinds` to list again.
 #[derive(Debug)]
 pub(super) struct ScopeLocals<'f> {
     list: Vec<LocalId, &'f Frame>,
@@ -83,45 +86,84 @@ pub(super) struct ScopeLocals<'f> {
     tail: Option<usize>,
     /// Changed since `Unwinds` last listed it.
     stale: bool,
+    /// Whether `list[..listed]` is as `Unwinds` last listed it, with only `push_new` since.
+    kept: bool,
+    listed: u32,
     /// One more than the largest local index in `list`, or `UNKNOWN` after an `edit`: a local
     /// at or above it is not in the scope.
-    bound: u32,
+    bound: Cell<u32>,
 }
 
 impl<'f> ScopeLocals<'f> {
     pub(super) fn new_in(frame: &'f Frame) -> Self {
-        ScopeLocals { list: Vec::new_in(frame), tail: None, stale: true, bound: 0 }
+        ScopeLocals {
+            list: Vec::new_in(frame),
+            tail: None,
+            stale: true,
+            kept: false,
+            listed: 0,
+            bound: Cell::new(0),
+        }
     }
 
     pub(super) fn from_slice_in(locals: &[LocalId], frame: &'f Frame) -> Self {
         let mut list = Vec::with_capacity_in(locals.len(), frame);
         list.extend_from_slice(locals);
-        ScopeLocals { list, tail: None, stale: true, bound: UNKNOWN }
+        ScopeLocals {
+            list,
+            tail: None,
+            stale: true,
+            kept: false,
+            listed: 0,
+            bound: Cell::new(UNKNOWN),
+        }
     }
 
     /// The list, to change.
     pub(super) fn edit(&mut self) -> &mut Vec<LocalId, &'f Frame> {
         self.stale = true;
-        self.bound = UNKNOWN;
+        self.kept = false;
+        self.bound.set(UNKNOWN);
         &mut self.list
+    }
+
+    /// Moves the list out, with no tail, leaving this scope empty with its tail. Both are
+    /// scopes `Unwinds` has not listed.
+    pub(super) fn take_list(&mut self) -> Self {
+        let frame = *self.list.allocator();
+        let list = std::mem::replace(&mut self.list, Vec::new_in(frame));
+        self.stale = true;
+        self.kept = false;
+        self.bound.set(0);
+        ScopeLocals {
+            list,
+            tail: None,
+            stale: true,
+            kept: false,
+            listed: 0,
+            bound: Cell::new(UNKNOWN),
+        }
     }
 
     /// Declares `local` last.
     pub(super) fn push_new(&mut self, local: LocalId) {
         self.stale = true;
-        if self.bound != UNKNOWN {
-            self.bound = self.bound.max(local_index(local) as u32 + 1);
+        let bound = self.bound.get();
+        if bound != UNKNOWN {
+            self.bound.set(bound.max(local_index(local) as u32 + 1));
         }
         self.list.push(local);
     }
 
     /// Whether `local` is in the scope. A local declared after everything in it, which a new
     /// temporary always is, is answered without a scan.
-    pub(super) fn holds(&mut self, local: LocalId) -> bool {
-        if self.bound == UNKNOWN {
-            self.bound = self.list.iter().map(|&it| local_index(it) as u32 + 1).max().unwrap_or(0);
+    pub(super) fn holds(&self, local: LocalId) -> bool {
+        let mut bound = self.bound.get();
+        if bound == UNKNOWN {
+            bound = self.list.iter().map(|&it| local_index(it) as u32 + 1).max().unwrap_or(0);
+            self.bound.set(bound);
         }
-        local_index(local) < self.bound as usize && self.list.contains(&local)
+        local_index(local) < bound as usize && self.list.contains(&local)
     }
 
     pub(super) fn tail(&self) -> Option<usize> {
@@ -130,6 +172,7 @@ impl<'f> ScopeLocals<'f> {
 
     pub(super) fn set_tail(&mut self, tail: Option<usize>) {
         self.stale = true;
+        self.kept = false;
         self.tail = tail;
     }
 
@@ -166,12 +209,30 @@ impl<'f> ScopeLocals<'f> {
         out.extend(head.iter().filter(|it| operands.contains(it)));
         out.extend(tail.iter().filter(|it| operands.contains(it)));
     }
+
+    /// Whether listing it again only appends what `push_new` added to both orders: nothing but
+    /// pushes since it was listed, no tail being lowered, and no operand in it then or now.
+    fn appends(&self, had_operands: bool, operands: &LocalSet<'_>) -> bool {
+        self.kept
+            && !had_operands
+            && self.parts().1.is_empty()
+            && self.list[self.listed as usize..].iter().all(|it| !operands.contains(it))
+    }
 }
 
 impl Clone for ScopeLocals<'_> {
     /// A copy is a scope `Unwinds` has not listed.
     fn clone(&self) -> Self {
-        ScopeLocals { list: self.list.clone(), tail: self.tail, stale: true, bound: self.bound }
+        let mut list = Vec::with_capacity_in(self.list.len(), *self.list.allocator());
+        list.extend_from_slice(&self.list);
+        ScopeLocals {
+            list,
+            tail: self.tail,
+            stale: true,
+            kept: false,
+            listed: 0,
+            bound: Cell::new(self.bound.get()),
+        }
     }
 }
 
@@ -223,26 +284,58 @@ enum Chain {
     Declared,
 }
 
-/// A listed scope: where its locals start in both orders, and the block its fold ends at in
-/// each, once folded.
-#[derive(Clone, Copy)]
-struct Link {
-    start: u32,
-    leaving_at: Option<BasicBlockId>,
-    declared_at: Option<BasicBlockId>,
+/// One order of every listed scope's locals, scope after scope, outermost first, and the block
+/// after folding each prefix of it.
+struct Order<'f> {
+    locals: Vec<LocalId, &'f Frame>,
+    /// `at[position]`: the block after folding `locals[..=position]`, for positions below
+    /// `folded`.
+    at: Vec<Option<BasicBlockId>, &'f Frame>,
+    folded: usize,
+    /// The next listing, before it replaces what changed.
+    scratch: Vec<LocalId, &'f Frame>,
 }
 
-impl Link {
-    fn at(&self, chain: Chain) -> Option<BasicBlockId> {
-        match chain {
-            Chain::Leaving => self.leaving_at,
-            Chain::Declared => self.declared_at,
+impl<'f> Order<'f> {
+    fn new_in(frame: &'f Frame) -> Self {
+        Order {
+            locals: Vec::new_in(frame),
+            at: Vec::new_in(frame),
+            folded: 0,
+            scratch: Vec::new_in(frame),
+        }
+    }
+
+    /// Replaces `locals[keep..]` with `scratch`, keeping the folds of the positions it leaves
+    /// as they were.
+    fn replace_from(&mut self, keep: usize) {
+        let common = common_prefix(&self.locals[keep.min(self.locals.len())..], &self.scratch);
+        self.folded = self.folded.min(keep + common);
+        self.locals.truncate(keep);
+        self.locals.extend_from_slice(&self.scratch);
+        self.at.resize(self.locals.len(), None);
+    }
+
+    fn before(&self, position: usize) -> Option<BasicBlockId> {
+        match position.checked_sub(1) {
+            Some(last) => self.at[last],
+            None => None,
         }
     }
 }
 
-/// The last fold past a chain's link: from `base`, through `seq`, with `at[i]` the block after
-/// the first `i` of them. It holds while no local's dropping changed (`epoch`).
+/// How many locals `a` and `b` start with in common.
+fn common_prefix(a: &[LocalId], b: &[LocalId]) -> usize {
+    let len = a.len().min(b.len());
+    if a[..len] == b[..len] {
+        return len;
+    }
+    a.iter().zip(b).take_while(|(x, y)| x == y).count()
+}
+
+/// The fold past the end of the listed scopes through the locals of a scope that was popped:
+/// from `base`, with `at[i]` the block after the first `i` of `seq`. It holds while no local's
+/// dropping changed (`epoch`).
 struct Memo<'f> {
     epoch: u32,
     base: Option<BasicBlockId>,
@@ -250,39 +343,14 @@ struct Memo<'f> {
     at: Vec<Option<BasicBlockId>, &'f Frame>,
 }
 
-impl<'f> Memo<'f> {
-    fn new_in(frame: &'f Frame) -> Self {
-        Memo { epoch: 0, base: None, seq: Vec::new_in(frame), at: Vec::new_in(frame) }
-    }
-}
-
-/// The locals a fold past a link goes through.
-#[derive(Clone, Copy)]
-enum Seq<'s> {
-    /// `declared[start..end]`.
-    Declared { start: usize, end: usize },
-    Given(&'s [LocalId]),
-}
-
-impl Seq<'_> {
-    fn len(&self) -> usize {
-        match *self {
-            Seq::Declared { start, end } => end - start,
-            Seq::Given(it) => it.len(),
-        }
-    }
-}
-
-/// The scopes as last listed, in both orders, and how far each order's links are folded.
+/// The scopes as last listed, in both orders, and how far each order is folded.
 pub(super) struct Unwinds<'f> {
-    /// Every listed scope's locals in `declared_into`'s order, scope after scope, outermost
-    /// first.
-    declared: Vec<LocalId, &'f Frame>,
-    /// The same in `leaving_into`'s order.
-    leaving: Vec<LocalId, &'f Frame>,
-    links: Vec<Link, &'f Frame>,
-    leaving_folded: usize,
-    declared_folded: usize,
+    declared: Order<'f>,
+    leaving: Order<'f>,
+    /// By listed scope: where its locals start in both orders.
+    starts: Vec<u32, &'f Frame>,
+    /// By listed scope: whether a pending operand was among its locals when it was listed.
+    had_operands: Vec<bool, &'f Frame>,
     /// By local index: its first position in `declared`, or `NONE`.
     first: Vec<u32, &'f Frame>,
     /// By local index: 0 not asked yet, 1 `Copy`, 2 dropped.
@@ -291,41 +359,43 @@ pub(super) struct Unwinds<'f> {
     storage: bool,
     /// Counts the changes of which locals a fold drops (`unscheduled`, `storage`).
     epoch: u32,
-    leaving_memo: Memo<'f>,
-    declared_memo: Memo<'f>,
+    memo: Memo<'f>,
 }
 
 impl<'f> Unwinds<'f> {
     pub(super) fn new_in(frame: &'f Frame) -> Self {
         Unwinds {
-            declared: Vec::new_in(frame),
-            leaving: Vec::new_in(frame),
-            links: Vec::new_in(frame),
-            leaving_folded: 0,
-            declared_folded: 0,
+            declared: Order::new_in(frame),
+            leaving: Order::new_in(frame),
+            starts: Vec::new_in(frame),
+            had_operands: Vec::new_in(frame),
             first: Vec::new_in(frame),
             copy: Vec::new_in(frame),
             storage: false,
             epoch: 0,
-            leaving_memo: Memo::new_in(frame),
-            declared_memo: Memo::new_in(frame),
+            memo: Memo {
+                epoch: 0,
+                base: None,
+                seq: Vec::new_in(frame),
+                at: Vec::new_in(frame),
+            },
         }
     }
 
-    /// Whether folds end storage on the way out. Every link is folded again when it changes.
+    /// Whether folds end storage on the way out. Everything is folded again when it changes.
     pub(super) fn sync_storage(&mut self, storage: bool) {
         if self.storage != storage {
             self.storage = storage;
-            self.leaving_folded = 0;
-            self.declared_folded = 0;
+            self.declared.folded = 0;
+            self.leaving.folded = 0;
             self.epoch = self.epoch.wrapping_add(1);
         }
     }
 
     /// Lists the scopes again from the outermost one that changed, or the first one past those
-    /// listed. Allocates no block: folding is left until a way out is asked for.
+    /// listed. Allocates no block: folding waits until a way out is asked for.
     pub(super) fn list<S: HasLocals<'f>>(&mut self, scopes: &mut [S], operands: &LocalSet<'_>) {
-        let listed = self.links.len();
+        let listed = self.starts.len();
         let mut depth = 0;
         while depth < listed && depth < scopes.len() && !scopes[depth].locals_mut().stale {
             depth += 1;
@@ -333,82 +403,100 @@ impl<'f> Unwinds<'f> {
         if depth == listed && depth == scopes.len() {
             return;
         }
-        let start = self.links.get(depth).map_or(self.declared.len(), |it| it.start as usize);
-        for &local in &self.declared[start..] {
+        let appends = depth < listed
+            && depth < scopes.len()
+            && scopes[depth].locals_mut().appends(self.had_operands[depth], operands);
+        let keep = match (appends, self.starts.get(depth)) {
+            (true, _) => self.end_of(depth),
+            (false, Some(&start)) => start as usize,
+            (false, None) => self.declared.locals.len(),
+        };
+        self.declared.scratch.clear();
+        self.leaving.scratch.clear();
+        self.starts.truncate(depth + usize::from(appends));
+        self.had_operands.truncate(depth + usize::from(appends));
+        let mut rest = &mut scopes[depth..];
+        if appends {
+            let (scope, inner) = rest.split_first_mut().expect("the scope that was appended to");
+            let scope = scope.locals_mut();
+            self.declared.scratch.extend_from_slice(&scope.list[scope.listed as usize..]);
+            self.leaving.scratch.extend_from_slice(&scope.list[scope.listed as usize..]);
+            scope.listed = scope.list.len() as u32;
+            scope.stale = false;
+            rest = inner;
+        }
+        for scope in rest {
+            let scope = scope.locals_mut();
+            self.starts.push((keep + self.declared.scratch.len()) as u32);
+            self.had_operands.push(scope.iter().any(|it| operands.contains(it)));
+            scope.declared_into(operands, &mut self.declared.scratch);
+            scope.leaving_into(operands, &mut self.leaving.scratch);
+            scope.listed = scope.list.len() as u32;
+            scope.kept = true;
+            scope.stale = false;
+        }
+        for &local in &self.declared.locals[keep.min(self.declared.locals.len())..] {
             let slot = &mut self.first[local_index(local)];
-            if *slot as usize >= start {
+            if *slot as usize >= keep {
                 *slot = NONE;
             }
         }
-        self.declared.truncate(start);
-        self.leaving.truncate(start);
-        self.links.truncate(depth);
-        self.leaving_folded = self.leaving_folded.min(depth);
-        self.declared_folded = self.declared_folded.min(depth);
-        for scope in &mut scopes[depth..] {
-            let scope = scope.locals_mut();
-            let start = self.declared.len();
-            scope.declared_into(operands, &mut self.declared);
-            scope.leaving_into(operands, &mut self.leaving);
-            for position in start..self.declared.len() {
-                let at = local_index(self.declared[position]);
-                if self.first.len() <= at {
-                    self.first.resize(at + 1, NONE);
-                }
-                if self.first[at] == NONE {
-                    self.first[at] = position as u32;
-                }
+        self.declared.replace_from(keep);
+        self.leaving.replace_from(keep);
+        for position in keep..self.declared.locals.len() {
+            let at = local_index(self.declared.locals[position]);
+            if self.first.len() <= at {
+                self.first.resize(at + 1, NONE);
             }
-            self.links.push(Link { start: start as u32, leaving_at: None, declared_at: None });
-            scope.stale = false;
+            if self.first[at] == NONE {
+                self.first[at] = position as u32;
+            }
         }
     }
 
-    /// Puts `local` in `operands`: what is in scope is dropped in another order from then.
+    /// Puts `local` in `operands`: what holds it is in another order from then.
     pub(super) fn mark_operand<S: HasLocals<'f>>(
         &mut self,
         scopes: &mut [S],
         operands: &mut LocalSet<'_>,
         local: LocalId,
     ) {
-        if operands.insert(local) {
-            self.restale(scopes, local);
+        if operands.insert(local)
+            && let Some(position) = self.first_of(local)
+            && let Some(scope) = scopes.get_mut(self.depth_of(position))
+        {
+            // The outermost listed scope holding it; the ones inside it are listed again with
+            // it. One that holds it and has not changed since it was listed holds it at or
+            // after its first position.
+            let scope = scope.locals_mut();
+            scope.stale = true;
+            scope.kept = false;
         }
     }
 
     /// Puts `local` in `unscheduled`: unwinding no longer drops it.
-    pub(super) fn unschedule<S: HasLocals<'f>>(
-        &mut self,
-        scopes: &mut [S],
-        unscheduled: &mut LocalSet<'_>,
-        local: LocalId,
-    ) {
+    pub(super) fn unschedule(&mut self, unscheduled: &mut LocalSet<'_>, local: LocalId) {
         if unscheduled.insert(local) {
-            self.restale(scopes, local);
-            self.epoch = self.epoch.wrapping_add(1);
+            self.dropping_changed(local);
         }
     }
 
     /// Takes `local` out of `unscheduled`: unwinding drops it again.
-    pub(super) fn reschedule<S: HasLocals<'f>>(
-        &mut self,
-        scopes: &mut [S],
-        unscheduled: &mut LocalSet<'_>,
-        local: LocalId,
-    ) {
+    pub(super) fn reschedule(&mut self, unscheduled: &mut LocalSet<'_>, local: LocalId) {
         if unscheduled.remove(local) {
-            self.restale(scopes, local);
-            self.epoch = self.epoch.wrapping_add(1);
+            self.dropping_changed(local);
         }
     }
 
-    /// Marks stale the outermost listed scope holding `local`. A scope that holds it and has not
-    /// changed since it was listed holds it at or after its first position, so it is that scope
-    /// or one inside it, and is listed again with it.
-    fn restale<S: HasLocals<'f>>(&mut self, scopes: &mut [S], local: LocalId) {
-        let Some(position) = self.first_of(local) else { return };
-        if let Some(scope) = scopes.get_mut(self.depth_of(position)) {
-            scope.locals_mut().stale = true;
+    /// Whether `local` is dropped changed: the folds from the start of the outermost listed
+    /// scope holding it go. A scope that gets it after it was listed changes its order there,
+    /// so listing it again folds from there.
+    fn dropping_changed(&mut self, local: LocalId) {
+        self.epoch = self.epoch.wrapping_add(1);
+        if let Some(position) = self.first_of(local) {
+            let start = self.starts[self.depth_of(position)] as usize;
+            self.declared.folded = self.declared.folded.min(start);
+            self.leaving.folded = self.leaving.folded.min(start);
         }
     }
 
@@ -419,20 +507,27 @@ impl<'f> Unwinds<'f> {
         }
     }
 
-    /// The listed scope `declared[position]` is in.
+    /// The listed scope `declared.locals[position]` is in.
     fn depth_of(&self, position: usize) -> usize {
-        self.links.partition_point(|it| it.start as usize <= position) - 1
+        self.starts.partition_point(|&it| it as usize <= position) - 1
     }
 
     /// Where the listed scope at `depth` ends in both orders.
     fn end_of(&self, depth: usize) -> usize {
-        self.links.get(depth + 1).map_or(self.declared.len(), |it| it.start as usize)
+        self.starts.get(depth + 1).map_or(self.declared.locals.len(), |&it| it as usize)
+    }
+
+    fn order(&mut self, chain: Chain) -> &mut Order<'f> {
+        match chain {
+            Chain::Leaving => &mut self.leaving,
+            Chain::Declared => &mut self.declared,
+        }
     }
 
     /// The way out from inside every listed scope, through their leaving orders. Call `list`
     /// first.
     pub(super) fn here<T: DropTree>(&mut self, tree: &mut T) -> Option<BasicBlockId> {
-        self.fold_chain(tree, Chain::Leaving, self.links.len())
+        self.fold_to(tree, Chain::Leaving, self.leaving.locals.len())
     }
 
     /// The way out of the drop of `locals[at]` at the end of a scope that drops `locals`: what
@@ -448,23 +543,18 @@ impl<'f> Unwinds<'f> {
     ) -> Option<BasicBlockId> {
         let local = locals[at];
         let unwind = match self.first_of(local) {
-            Some(position) => {
-                let depth = self.depth_of(position);
-                let base = self.fold_chain(tree, Chain::Declared, depth);
-                let start = self.links[depth].start as usize;
-                self.fold_memo(tree, Chain::Declared, base, Seq::Declared { start, end: position })
-            }
+            Some(position) => self.fold_to(tree, Chain::Declared, position),
             None => {
-                let base = self.fold_chain(tree, Chain::Declared, self.links.len());
-                self.fold_memo(tree, Chain::Declared, base, Seq::Given(&locals[..at]))
+                let base = self.fold_to(tree, Chain::Declared, self.declared.locals.len());
+                self.fold_popped(tree, base, &locals[..at])
             }
         };
         self.storage_step(tree, unwind, local)
     }
 
     /// The way out of the drop of `locals[position]` when leaving early through the scope at
-    /// `index`, whose leaving order is `locals`: every scope outside it, then `locals[..position]`,
-    /// then, in a coroutine, its own storage. Call `list` first.
+    /// `index`, whose leaving order `locals` is: every scope outside it, then
+    /// `locals[..position]`, then, in a coroutine, its own storage. Call `list` first.
     pub(super) fn before<T: DropTree>(
         &mut self,
         tree: &mut T,
@@ -472,8 +562,9 @@ impl<'f> Unwinds<'f> {
         locals: &[LocalId],
         position: usize,
     ) -> Option<BasicBlockId> {
-        let base = self.fold_chain(tree, Chain::Leaving, index);
-        let unwind = self.fold_memo(tree, Chain::Leaving, base, Seq::Given(&locals[..position]));
+        let start = self.starts[index] as usize;
+        debug_assert_eq!(locals, &self.leaving.locals[start..self.end_of(index)]);
+        let unwind = self.fold_to(tree, Chain::Leaving, start + position);
         self.storage_step(tree, unwind, locals[position])
     }
 
@@ -489,104 +580,51 @@ impl<'f> Unwinds<'f> {
         }
     }
 
-    /// Folds `chain`'s links up to the first `upto` scopes; the block after them.
-    fn fold_chain<T: DropTree>(
+    /// Folds `chain`'s order up to `upto`; the block after its first `upto` locals.
+    fn fold_to<T: DropTree>(
         &mut self,
         tree: &mut T,
         chain: Chain,
         upto: usize,
     ) -> Option<BasicBlockId> {
-        loop {
-            let depth = match chain {
-                Chain::Leaving => self.leaving_folded,
-                Chain::Declared => self.declared_folded,
-            };
-            if depth >= upto {
-                break;
-            }
-            let mut at = match depth.checked_sub(1) {
-                Some(outer) => self.links[outer].at(chain),
-                None => None,
-            };
-            for position in self.links[depth].start as usize..self.end_of(depth) {
-                let local = match chain {
-                    Chain::Leaving => self.leaving[position],
-                    Chain::Declared => self.declared[position],
-                };
-                at = self.step(tree, at, local);
-            }
-            match chain {
-                Chain::Leaving => {
-                    self.links[depth].leaving_at = at;
-                    self.leaving_folded = depth + 1;
-                }
-                Chain::Declared => {
-                    self.links[depth].declared_at = at;
-                    self.declared_folded = depth + 1;
-                }
-            }
+        let mut position = self.order(chain).folded;
+        while position < upto {
+            let order = self.order(chain);
+            let (at, local) = (order.before(position), order.locals[position]);
+            let at = self.step(tree, at, local);
+            self.order(chain).at[position] = at;
+            position += 1;
         }
-        match upto.checked_sub(1) {
-            Some(last) => self.links[last].at(chain),
-            None => None,
-        }
+        let order = self.order(chain);
+        order.folded = order.folded.max(upto);
+        order.before(upto)
     }
 
-    /// Folds `seq` from `base`, past what the last fold of `chain`'s memo shared with it.
-    fn fold_memo<T: DropTree>(
+    /// Folds `seq` from `base`, past what the last such fold shared with it.
+    fn fold_popped<T: DropTree>(
         &mut self,
         tree: &mut T,
-        chain: Chain,
         base: Option<BasicBlockId>,
-        seq: Seq<'_>,
+        seq: &[LocalId],
     ) -> Option<BasicBlockId> {
-        let (len, epoch) = (seq.len(), self.epoch);
-        let memo = self.memo_mut(chain);
-        if memo.at.is_empty() || memo.base != base || memo.epoch != epoch {
+        let memo = &mut self.memo;
+        if memo.at.is_empty() || memo.base != base || memo.epoch != self.epoch {
             memo.seq.clear();
             memo.at.clear();
             memo.at.push(base);
             memo.base = base;
-            memo.epoch = epoch;
+            memo.epoch = self.epoch;
         }
-        let known = self.memo(chain).seq.len().min(len);
-        let mut same = 0;
-        while same < known && self.memo(chain).seq[same] == self.seq_at(seq, same) {
-            same += 1;
-        }
-        let memo = self.memo_mut(chain);
+        let same = common_prefix(&memo.seq, seq);
         memo.seq.truncate(same);
         memo.at.truncate(same + 1);
         let mut at = memo.at[same];
-        for index in same..len {
-            let local = self.seq_at(seq, index);
+        for &local in &seq[same..] {
             at = self.step(tree, at, local);
-            let memo = self.memo_mut(chain);
-            memo.seq.push(local);
-            memo.at.push(at);
+            self.memo.seq.push(local);
+            self.memo.at.push(at);
         }
         at
-    }
-
-    fn memo(&self, chain: Chain) -> &Memo<'f> {
-        match chain {
-            Chain::Leaving => &self.leaving_memo,
-            Chain::Declared => &self.declared_memo,
-        }
-    }
-
-    fn memo_mut(&mut self, chain: Chain) -> &mut Memo<'f> {
-        match chain {
-            Chain::Leaving => &mut self.leaving_memo,
-            Chain::Declared => &mut self.declared_memo,
-        }
-    }
-
-    fn seq_at(&self, seq: Seq<'_>, index: usize) -> LocalId {
-        match seq {
-            Seq::Declared { start, .. } => self.declared[start + index],
-            Seq::Given(it) => it[index],
-        }
     }
 
     /// One local of a fold: its storage in a coroutine, then its value unless nothing drops it.
@@ -691,13 +729,13 @@ impl<'f> MirLowerCtx<'_, 'f, '_> {
     /// drop `local`'s value (rustc's `as_temp` schedules the drop once the expression is done).
     pub(super) fn unschedule(&mut self, local: LocalId) {
         let unwinds = self.unwinds.as_mut().expect("not inside a fold");
-        unwinds.unschedule(&mut self.drop_scopes[..], &mut self.unscheduled, local);
+        unwinds.unschedule(&mut self.unscheduled, local);
     }
 
     /// Once the expression written to `local` is done: unwinding drops it.
     pub(super) fn reschedule(&mut self, local: LocalId) {
         let unwinds = self.unwinds.as_mut().expect("not inside a fold");
-        unwinds.reschedule(&mut self.drop_scopes[..], &mut self.unscheduled, local);
+        unwinds.reschedule(&mut self.unscheduled, local);
     }
 }
 

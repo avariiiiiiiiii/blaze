@@ -6,7 +6,7 @@
 
 use blaze_items::{Fact, ItemId};
 use either::Either;
-use syntax::ast;
+use syntax::view as ast;
 
 use crate::{
     cx::Cx,
@@ -22,7 +22,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NonExhaustiveRecordPat) -> Vec<Fou
         hir::Variant::Union(_) => "union",
         hir::Variant::EnumVariant(_) => "variant",
     };
-    let no_fields = match cx.node(d.pat).value {
+    let no_fields = match cx.node_view(d.pat).value {
         Either::Right(ast::Pat::RecordPat(it)) => {
             it.record_pat_field_list().is_none_or(|it| it.fields().next().is_none())
         }
@@ -33,7 +33,9 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NonExhaustiveRecordPat) -> Vec<Fou
     };
     let mut diag = Diag::error(
         Some("E0638"),
+        // alloc: the error's text, for an error hir found
         format!("`..` required with {descr} marked as non-exhaustive"),
+        // clone: on the error path, for an error hir found
         span.clone(),
     );
     if span.hi > span.lo {
@@ -50,8 +52,10 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NonExhaustiveRecordPat) -> Vec<Fou
     let name = d.variant.name(cx.db);
     diag.fact(
         Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+        // alloc: the error's text, for an error hir found
         format!("whether `{}` is `#[non_exhaustive]`", name.display(cx.db, cx.edition)),
     );
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }

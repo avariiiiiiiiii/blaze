@@ -167,6 +167,7 @@ impl LatePass for CheckTransmutes {
             let mut diag = Diag::lint(
                 "ptr_to_integer_transmute_in_consts",
                 "pointers cannot be transmuted to integers during const eval",
+                // clone: a span, for the ptr_to_integer_transmute_in_consts lint
                 span.clone(),
             );
             diag.note("at compile-time, pointers do not have an integer value");
@@ -210,70 +211,93 @@ fn unnecessary_transmute(
     let byte = |ty: Ty<'_>| matches!(ty.kind(), TyKind::Uint(UintTy::U8));
     let (parts, help): (Vec<(Span, String)>, Option<&str>) = match (src.kind(), dst.kind()) {
         (TyKind::Array(elem, _), TyKind::Uint(_) | TyKind::Float(_) | TyKind::Int(_)) if byte(elem) => (
+            // alloc: the unnecessary_transmutes lint's suggestion
             vec![(callee_span, format!("{}::from_ne_bytes", primitive(dst)?))],
             Some("there's also `from_le_bytes` and `from_be_bytes` if you expect a particular byte order"),
         ),
         (TyKind::Uint(_) | TyKind::Float(_) | TyKind::Int(_), TyKind::Array(elem, _)) if byte(elem) => (
+            // alloc: the unnecessary_transmutes lint's suggestion
             vec![(callee_span, format!("{}::to_ne_bytes", primitive(src)?))],
             Some("there's also `to_le_bytes` and `to_be_bytes` if you expect a particular byte order"),
         ),
+        // alloc: the unnecessary_transmutes lint's suggestion
         (TyKind::Char, TyKind::Uint(UintTy::U32)) => (vec![(callee_span, "u32::from".to_owned())], None),
         (TyKind::Char, TyKind::Int(IntTy::I32)) => {
+            // alloc: the unnecessary_transmutes lint's suggestion
             (vec![(callee_span, "u32::from".to_owned()), (end, ".cast_signed()".to_owned())], None)
         }
         (TyKind::Uint(UintTy::U32), TyKind::Char) => (
+            // alloc: the unnecessary_transmutes lint's suggestion
             vec![(callee_span, "char::from_u32_unchecked".to_owned())],
             Some("consider using `char::from_u32(…).unwrap()`"),
         ),
         (TyKind::Int(IntTy::I32), TyKind::Char) => (
+            // alloc: the unnecessary_transmutes lint's suggestion
             vec![(callee_span, "char::from_u32_unchecked(i32::cast_unsigned".to_owned()), (end, ")".to_owned())],
             Some("consider using `char::from_u32(i32::cast_unsigned(…)).unwrap()`"),
         ),
         (TyKind::Uint(_), TyKind::Int(_)) => {
+            // alloc: the unnecessary_transmutes lint's suggestion
             (vec![(callee_span, format!("{}::cast_signed", primitive(src)?))], None)
         }
         (TyKind::Int(_), TyKind::Uint(_)) => {
+            // alloc: the unnecessary_transmutes lint's suggestion
             (vec![(callee_span, format!("{}::cast_unsigned", primitive(src)?))], None)
         }
         (TyKind::Float(_), TyKind::Uint(UintTy::Usize) | TyKind::Int(IntTy::Isize)) => (
+            // alloc: the unnecessary_transmutes lint's suggestion
             vec![
+                // alloc: the unnecessary_transmutes lint's suggestion
                 (callee_span, format!("{}::to_bits", primitive(src)?)),
+                // alloc: the unnecessary_transmutes lint's suggestion
                 (end, format!(" as {}", primitive(dst)?)),
             ],
             None,
         ),
         (TyKind::Float(_), TyKind::Int(_)) => (
+            // alloc: the unnecessary_transmutes lint's suggestion
             vec![(callee_span, format!("{}::to_bits", primitive(src)?)), (end, ".cast_signed()".to_owned())],
             None,
         ),
         (TyKind::Float(_), TyKind::Uint(_)) => {
+            // alloc: the unnecessary_transmutes lint's suggestion
             (vec![(callee_span, format!("{}::to_bits", primitive(src)?))], None)
         }
         (TyKind::Uint(UintTy::Usize) | TyKind::Int(IntTy::Isize), TyKind::Float(_)) => (
+            // alloc: the unnecessary_transmutes lint's suggestion
             vec![
+                // alloc: the unnecessary_transmutes lint's suggestion
                 (callee_span, format!("{}::from_bits", primitive(dst)?)),
+                // alloc: the unnecessary_transmutes lint's suggestion
                 (util::span(b, arg)?.shrink_to_hi(), " as _".to_owned()),
             ],
             None,
         ),
         (TyKind::Int(_), TyKind::Float(_)) => (
+            // alloc: the unnecessary_transmutes lint's suggestion
             vec![
+                // alloc: the unnecessary_transmutes lint's suggestion
                 (callee_span, format!("{}::from_bits({}::cast_unsigned", primitive(dst)?, primitive(src)?)),
+                // alloc: the unnecessary_transmutes lint's suggestion
                 (end, ")".to_owned()),
             ],
             None,
         ),
         (TyKind::Uint(_), TyKind::Float(_)) => {
+            // alloc: the unnecessary_transmutes lint's suggestion
             (vec![(callee_span, format!("{}::from_bits", primitive(dst)?))], None)
         }
         (TyKind::Bool, TyKind::Int(_) | TyKind::Uint(_)) if const_context => {
+            // alloc: the unnecessary_transmutes lint's suggestion
             (vec![(callee_span, String::new()), (end, format!(" as {}", primitive(dst)?))], None)
         }
         (TyKind::Bool, TyKind::Int(_) | TyKind::Uint(_)) => {
+            // alloc: the unnecessary_transmutes lint's suggestion
             (vec![(callee_span, format!("{}::from", primitive(dst)?))], None)
         }
         _ => return None,
     };
+    // clone: a span, for the unnecessary_transmutes lint
     let mut diag = Diag::lint("unnecessary_transmutes", "unnecessary transmute", span.clone());
     diag.multipart_suggestion("replace this with", parts, Applicability::MachineApplicable);
     if let Some(help) = help {
@@ -311,6 +335,7 @@ fn int_to_ptr_transmute<'db>(
     let mut diag = Diag::lint(
         "integer_to_ptr_transmutes",
         "transmuting an integer to a pointer creates a pointer without provenance",
+        // clone: a span, for the integer_to_ptr_transmutes lint
         span.clone(),
     );
     diag.note("this is dangerous because dereferencing the resulting pointer is undefined behavior");
@@ -322,18 +347,23 @@ fn int_to_ptr_transmute<'db>(
     diag.help("for more information about exposed provenance, see <https://doc.rust-lang.org/std/ptr/index.html#exposed-provenance>");
     let printed = super::print(b, expr, inner)?;
     if let TyKind::Adt(def, _) = inner.kind() {
+        // alloc: the integer_to_ptr_transmutes lint's text
         diag.fact(Fact::Layout(b.cx.key(ItemId::Adt(def.def_id()))), format!("the layout of `{printed}`"));
     }
     if !layout.is_unsized {
         let suffix = if mutbl.is_mut() { "_mut" } else { "" };
         let start_call = span.with_hi(util::span(b, arg)?.lo);
         let code = if is_ref {
+            // alloc: the integer_to_ptr_transmutes lint's text
             format!("&{}*std::ptr::with_exposed_provenance{suffix}::<{printed}>(", mutbl.prefix_str())
         } else {
+            // alloc: the integer_to_ptr_transmutes lint's text
             format!("std::ptr::with_exposed_provenance{suffix}::<{printed}>(")
         };
         diag.multipart_suggestion(
+            // alloc: the integer_to_ptr_transmutes lint's text
             format!("use `std::ptr::with_exposed_provenance{suffix}` instead to use a previously exposed provenance"),
+            // alloc: the integer_to_ptr_transmutes lint's text
             vec![(start_call, code)],
             Applicability::MachineApplicable,
         );

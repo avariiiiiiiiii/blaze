@@ -142,6 +142,8 @@ serve cargo's request 14 on Linux and macOS (the descriptors go with `SCM_RIGHTS
 
 > forwarded to mem-core (holds `crates/blaze-core/`; core is DONE) (requests, pass 20; told by tmux).
 
+> applied by mem-core (2026-10-29): `Confine::{warm, hand}`, `Handed`, `Answer` in lib.rs; the test in tests.rs (with `services: Vec::new()`, the field `Sandbox::On` gained since).
+
 ## 2. core: the IOCP driver hands sandboxed spawns to the warm launcher (`crates/blaze-core/src/iocp.rs`, `iocp/process.rs`)
 
 What: when the confine has a warm launcher, a sandboxed `Effect::Spawn` is handed to it instead
@@ -216,6 +218,8 @@ keeps its SIDs, its lock handle and its read checks across runs: about 176 syste
 down to about 70 (docs/v2/plan/lanes/usercode/speed-of-light.md, "The Windows sandbox").
 
 > forwarded to mem-core (holds `iocp.rs`, `iocp/*`) (requests, pass 20; told by tmux).
+>
+> applied by mem-core-warm (2026-10-29): items 1 to 10 in `iocp.rs` and `iocp/{warm,rundirs,process,sys}.rs` (not built or run). With `warm` `Some`, a `Sandbox::On` spawn is only handed: one launcher (`warm()`'s command, control pipe in, answers out, daemon's stderr, waited on with key `KEY_WARM`) in a `Slab<Warm>`; each run's job (memory limit, kill-on-close), three pipes and run directory made by the driver, the child's ends (inheritable) and the job duplicated in, `confine.hand`'s frame queued and written one at a time; the run an entry of the spawn slab with no process, found by `runs` from its answer. Kill seals the job (`ActiveProcessLimit` 0), then ends it. An answer for a run not in flight, or a frame that can't be written, ends the launcher; end of file on the answers ends it once its process has exited, so a run answered just before keeps its answer. Its runs then fail with `the sandbox's warm launcher <program> (process <pid>) ended with code <n> before the run did` (or `(<why>)`), jobs ended; the next spawn starts a new one. Nothing allocated in the driver beyond the frame (`a_warm_handed_run_allocates_only_its_frame_exit_and_output`). Launcher-side note: the driver closes the control pipe on drop or once answers end, and ends each run's job itself where the launcher ends first. Notes: docs/v2/plan/lanes/mem/core.md, "The warm launcher on Windows".
 
 ## 3. cargo: the daemon on Windows runs the IOCP driver (`crates/blaze-cargo/src/serve.rs`, `serve`)
 

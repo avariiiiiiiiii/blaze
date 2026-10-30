@@ -59,6 +59,45 @@ pub struct Dependency {
     pub default_features: bool,
     pub platform: Option<Platform>,
     pub explicit_name_in_toml: Option<String>,
+    /// `artifact = ..` with `-Z bindeps`.
+    pub artifact: Option<Artifact>,
+}
+
+/// An artifact dependency's `artifact`, `lib` and `target`, as cargo's `Artifact::parse` checks
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Artifact {
+    /// As written: `bin`, `bin:<name>`, `cdylib`, `staticlib`.
+    pub kinds: Vec<String>,
+    pub lib: bool,
+    /// `target = "<triple>"`, or `"target"` for the build's own.
+    pub target: Option<String>,
+}
+
+impl Artifact {
+    pub fn parse(kinds: &[String], lib: bool, target: Option<&str>) -> anyhow::Result<Artifact> {
+        for kind in kinds {
+            if !matches!(kind.as_str(), "bin" | "cdylib" | "staticlib") && !kind.starts_with("bin:") {
+                bail!("'{kind}' is not a valid artifact specifier");
+            }
+        }
+        if kinds.iter().any(|it| it == "bin") && kinds.iter().any(|it| it.starts_with("bin:")) {
+            bail!(
+                "Cannot specify both 'bin' and 'bin:<name>' binary artifacts, as 'bin' selects all available binaries."
+            );
+        }
+        let mut unique: Vec<&str> = kinds.iter().map(String::as_str).collect();
+        unique.sort_unstable();
+        unique.dedup();
+        let dupes = kinds.len() - unique.len();
+        if dupes != 0 {
+            bail!("Found {dupes} duplicate binary artifact{}", if dupes > 1 { "s" } else { "" });
+        }
+        if target == Some("") {
+            bail!("target was empty");
+        }
+        Ok(Artifact { kinds: kinds.to_vec(), lib, target: target.map(str::to_owned) })
+    }
 }
 
 impl Dependency {
@@ -82,6 +121,7 @@ impl Dependency {
             default_features: true,
             platform: None,
             explicit_name_in_toml: None,
+            artifact: None,
         })
     }
 
@@ -108,6 +148,7 @@ impl Dependency {
             optional: self.optional,
             uses_default_features: self.default_features,
             features: &self.features,
+            artifact: self.artifact.as_ref(),
             target: self.platform.as_ref(),
             registry: self.registry_id.as_ref().map(|id| id.url.to_string()),
             path: self.source_id.local_path(),
@@ -118,18 +159,20 @@ impl Dependency {
 /// A dependency as `cargo metadata` prints it, fields in cargo's order.
 #[derive(Serialize)]
 pub struct SerializedDependency<'a> {
-    name: &'a str,
-    pub(crate) source: Option<String>,
-    req: String,
-    kind: DepKind,
-    rename: Option<&'a str>,
-    optional: bool,
-    uses_default_features: bool,
-    features: &'a [String],
-    target: Option<&'a Platform>,
-    registry: Option<String>,
+    pub name: &'a str,
+    pub source: Option<String>,
+    pub req: String,
+    pub kind: DepKind,
+    pub rename: Option<&'a str>,
+    pub optional: bool,
+    pub uses_default_features: bool,
+    pub features: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<PathBuf>,
+    pub artifact: Option<&'a Artifact>,
+    pub target: Option<&'a Platform>,
+    pub registry: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 /// One entry of a feature's list.
@@ -334,4 +377,120 @@ pub fn build_summary_features(
     }
 
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::*;
+    use crate::files::tests::Mem;
+
+    fn kinds(kinds: &[&str]) -> Vec<String> {
+        kinds.iter().map(|it| (*it).to_owned()).collect()
+    }
+
+    #[test]
+    fn an_artifact_takes_cargo_s_kinds() {
+        let artifact = Artifact::parse(&kinds(&["bin:tool", "cdylib", "staticlib"]), true, Some("target"))
+            .unwrap();
+        assert_eq!(artifact.kinds, ["bin:tool", "cdylib", "staticlib"]);
+        assert!(artifact.lib);
+        assert_eq!(artifact.target.as_deref(), Some("target"));
+    }
+
+    #[test]
+    fn an_artifact_refuses_what_cargo_refuses() {
+        let error = |list: &[&str], target: Option<&str>| {
+            Artifact::parse(&kinds(list), false, target).unwrap_err().to_string()
+        };
+        assert_eq!(error(&["rlib"], None), "'rlib' is not a valid artifact specifier");
+        assert_eq!(error(&[""], None), "'' is not a valid artifact specifier");
+        assert_eq!(
+            error(&["bin", "bin:a"], None),
+            "Cannot specify both 'bin' and 'bin:<name>' binary artifacts, as 'bin' selects all available binaries."
+        );
+        assert_eq!(error(&["cdylib", "cdylib"], None), "Found 1 duplicate binary artifact");
+        assert_eq!(error(&["bin", "bin", "bin"], None), "Found 2 duplicate binary artifacts");
+        assert_eq!(error(&["bin"], Some("")), "target was empty");
+    }
+
+    const ROOT: &str = "/blaze-nowhere/bindeps";
+
+    fn files(config: &str, dependency: &str) -> Mem {
+        Mem::default()
+            .dir(&format!("{ROOT}/home"))
+            .file(&format!("{ROOT}/.cargo/config.toml"), config)
+            .file(
+                &format!("{ROOT}/Cargo.toml"),
+                &format!(
+                    "[package]\nname = \"a\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+                     [build-dependencies]\nb = {{ path = \"b\", {dependency} }}\n"
+                ),
+            )
+            .file(&format!("{ROOT}/src/lib.rs"), "")
+            .file(
+                &format!("{ROOT}/b/Cargo.toml"),
+                "[package]\nname = \"b\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+            )
+            .file(&format!("{ROOT}/b/src/main.rs"), "")
+    }
+
+    fn config(files: Mem, flags: &[&str]) -> anyhow::Result<crate::Config<Mem>> {
+        let env = [("CARGO_HOME".to_owned(), format!("{ROOT}/home"))];
+        let mut config = crate::Config::load_with(Path::new(ROOT), env, files)?;
+        config.cli_unstable(&kinds(flags))?;
+        Ok(config)
+    }
+
+    fn metadata(files: Mem, flags: &[&str]) -> anyhow::Result<String> {
+        let ctx = crate::Context::new(config(files, flags)?);
+        let manifest = crate::metadata::root_manifest(None, &ctx)?;
+        let ws = crate::Workspace::new(&manifest, &ctx)?;
+        Ok(serde_json::to_string(&crate::metadata::export_no_deps(&ws))?)
+    }
+
+    #[test]
+    fn the_unstable_table_comes_first_and_each_flag_after_it() {
+        let table = "[unstable]\nbindeps = true\nbuild-std = [\"std,core\", \"alloc\"]\n";
+        let read = config(files(table, "artifact = \"bin\""), &[]).unwrap();
+        assert!(read.bindeps());
+        assert_eq!(read.unstable().build_std.as_deref(), Some(&kinds(&["std", "core", "alloc"])[..]));
+        let read = config(files(table, "artifact = \"bin\""), &["bindeps=no", "build_std=core"]).unwrap();
+        assert!(!read.bindeps());
+        assert_eq!(read.unstable().build_std.as_deref(), Some(&kinds(&["core"])[..]));
+        let read = config(files("", "artifact = \"bin\""), &["unstable-options"]).unwrap();
+        assert!(read.unstable().unstable_options && !read.bindeps());
+    }
+
+    #[test]
+    fn a_flag_blaze_does_not_read_is_an_error_naming_it() {
+        let error = |flags: &[&str]| {
+            config(files("", "artifact = \"bin\""), flags).map(drop).unwrap_err().to_string()
+        };
+        assert_eq!(error(&["minimal-versions"]), "blaze does not read `-Z minimal-versions` yet");
+        assert_eq!(error(&["bindeps=maybe"]), "flag -Zbindeps expected `no` or `yes`, found: `maybe`");
+    }
+
+    #[test]
+    fn an_artifact_dependency_needs_bindeps() {
+        let error = metadata(files("", "artifact = \"bin\""), &[]).unwrap_err();
+        assert!(format!("{error:#}").contains("`artifact = …` requires `-Z bindeps` (b)"), "{error:#}");
+        let error = metadata(files("", "lib = true"), &[]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("'lib' specifier cannot be used without an 'artifact = …' value (b)"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn with_bindeps_cargo_metadata_says_the_artifact() {
+        let json = metadata(files("", "artifact = [\"bin\"], target = \"target\""), &["bindeps"]).unwrap();
+        assert!(
+            json.contains(r#""features":[],"artifact":{"kinds":["bin"],"lib":false,"target":"target"},"target":null"#),
+            "{json}"
+        );
+        let plain = metadata(files("", "version = \"0.1\""), &[]).unwrap();
+        assert!(!plain.contains("\"artifact\""), "{plain}");
+    }
 }

@@ -54,6 +54,7 @@ pub fn def_path_untrimmed(cx: &Cx<'_, '_>, def: hir::ModuleDef) -> String {
 
 fn def_path_in(cx: &Cx<'_, '_>, def: hir::ModuleDef, mode: Mode) -> String {
     if let hir::ModuleDef::BuiltinType(it) = def {
+        // alloc: the path printed, the edge
         return it.name().as_str().to_owned();
     }
     match ModuleDefId::try_from(def).ok().and_then(Def::of) {
@@ -109,10 +110,10 @@ pub fn trait_path(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>) -> String {
 
 /// rustc's `print_modifiers_and_trait_path`: `!` for a negative bound, then the trait with
 /// `Fn(u8)` sugar for a parenthesized trait (`TraitRefPrintSugared`).
-pub fn trait_path_sugared(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> String {
+pub fn trait_path_sugared(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> String {
     let pred = pred.to_next_solver();
     let mut p = Printer::new(cx, Mode::NORMAL, false);
-    if pred.polarity == rustc_type_ir::PredicatePolarity::Negative {
+    if pred.polarity == rustc_type_ir::ClausePolarity::Negative {
         p.write_str("!");
     }
     p.print_trait_sugared(pred.trait_ref);
@@ -120,10 +121,28 @@ pub fn trait_path_sugared(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> St
 }
 
 /// rustc's `TraitPredicate` printing: `T: Trait<U>`, `T: !Trait`, `F: Fn(u8)`.
-pub fn predicate(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> String {
+pub fn predicate(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> String {
     let pred = pred.to_next_solver();
     let mut p = Printer::new(cx, Mode::NORMAL, false);
     p.print_trait_predicate(pred);
+    p.finish()
+}
+
+/// rustc's `HostEffectPredicate` printing: `T: [const] Trait` (`maybe_const`), `T: const Trait`.
+pub fn host_effect(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>, maybe_const: bool) -> String {
+    let tr = tr.to_next_solver();
+    let mut p = Printer::new(cx, Mode::NORMAL, false);
+    p.print_type(tr.self_ty());
+    p.write_str(if maybe_const { ": [const] " } else { ": const " });
+    p.print_trait_sugared(tr);
+    p.finish()
+}
+
+/// rustc's `print_trait_sugared` of a trait reference: `Fn(u8)` for a parenthesized trait,
+/// else `Trait<U>`.
+pub fn trait_ref_sugared(cx: &Cx<'_, '_>, tr: &hir::TraitRef<'_>) -> String {
+    let mut p = Printer::new(cx, Mode::NORMAL, false);
+    p.print_trait_sugared(tr.to_next_solver());
     p.finish()
 }
 
@@ -147,13 +166,45 @@ pub fn sorts(cx: &Cx<'_, '_>, expected: &hir::Type<'_>, found: &hir::Type<'_>) -
     let e = types::sort_string(cx, expected, short);
     let f = types::sort_string(cx, found, short);
     if e != f {
-        return format!("expected {e}, found {f}");
+        return format!("expected {e}, found {f}"); // alloc: the label printed, the edge
     }
     let e = types::sort_string(cx, expected, Mode::NORMAL);
     let f = types::sort_string(cx, found, Mode::NORMAL);
     if e == f {
-        format!("expected {e}, found a different {f}")
+        format!("expected {e}, found a different {f}") // alloc: the label printed, the edge
     } else {
-        format!("expected {e}, found {f}")
+        format!("expected {e}, found {f}") // alloc: the label printed, the edge
     }
+}
+
+/// Whether a type printed as inference had it at the error holds an undecided integer or float
+/// literal's type.
+pub fn holds_literal(at_error: &str) -> bool {
+    at_error.contains("{integer}") || at_error.contains("{float}")
+}
+
+/// [`sorts`] of the two types as inference had them at the error (`hir::TypeMismatch::at_error`,
+/// expected then found): a side that is wholly an undecided literal's type is rustc's "integer"
+/// or "floating-point number" (`Ty::sort_string` of an `IntVar` / `FloatVar`), one that holds
+/// one is that type in backticks, and a side that holds none prints as in [`sorts`].
+pub fn sorts_at_error(
+    cx: &Cx<'_, '_>,
+    expected: &hir::Type<'_>,
+    found: &hir::Type<'_>,
+    at_error: Option<(&str, &str)>,
+) -> String {
+    let Some((expected_at, found_at)) = at_error else { return sorts(cx, expected, found) };
+    let short = Mode::ERASED.forced();
+    let side = |at: &str, ty: &hir::Type<'_>| match at {
+        "{integer}" => "integer".to_owned(), // alloc: the label printed, the edge
+        "{float}" => "floating-point number".to_owned(), // alloc: the label printed, the edge
+        _ if holds_literal(at) => format!("`{at}`"), // alloc: the label printed, the edge
+        _ => types::sort_string(cx, ty.to_next_solver(), short),
+    };
+    let e = side(expected_at, expected);
+    let f = side(found_at, found);
+    if e == f {
+        return sorts(cx, expected, found);
+    }
+    format!("expected {e}, found {f}") // alloc: the label printed, the edge
 }

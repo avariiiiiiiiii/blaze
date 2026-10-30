@@ -2,7 +2,7 @@
 
 use crate::{infer::InferenceContext, solver_errors::ambiguity_diagnostics};
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// E0282, E0283 and E0284 for every goal the solver could neither prove nor refute, as
     /// `TypeMustBeKnown` with the goal. rustc reports the pending goals only of a body with no
     /// error yet; those found while normalizing it reported where they were found, so of a body

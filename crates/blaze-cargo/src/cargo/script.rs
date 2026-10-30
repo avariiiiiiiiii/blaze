@@ -397,9 +397,8 @@ fn view_key(
             _ => key.field(&places.unplace(value.as_bytes())),
         };
     }
-    let unplace = |bytes: &[u8]| places.unplace(bytes);
     let InView { closure, hidden, deps } = in_view;
-    hermetic::key_of(&mut key, cwd, hidden, closure, deps, &unplace)?;
+    hermetic::key_of(&mut key, cwd, hidden, closure, deps, places)?;
     Ok(key.done())
 }
 

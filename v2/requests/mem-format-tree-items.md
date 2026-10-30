@@ -39,6 +39,33 @@ H3 (owner `db-expand-next2`; applied for hir-expand, not yet for hir-def). `bloc
 > (`Keyed`, `Rows`/`Marks`, `assemble` in one `build`), not from the withdrawn per-item diffs.
 > Still open: `blaze-mem` and `blaze-alloc-count` in hir-def (`mem-db-def.md` H1 to H3, owner
 > db). The child answers here when done.
+> frontend-deps-items-block (2026-10-29): applied, not yet built or tested. `block.rs` is
+> new as given, except `with_refs`/`Refs` and its test are left out, because only the withdrawn
+> per-item `assemble` used them. `item_tree.rs`, `lower.rs`, `persist.rs` and `tests.rs` are
+> applied on top of speed-hir-sol-items A to E (`top_attrs` held aside, `Scoped::seal`,
+> `attr_blocks`, decode's exact-length columns in one `try_build`) and dedyn's generics.
+> `items.rs` is ported onto the kept tree: `assemble` sums every column, then makes one `build`
+> that writes each run in `assemble_part`. `Marks.attrs` is now `attr_list` (rule 1), and
+> `same_top`/`Marks::ends` read through the accessors. Each budget is now one allocation a tree
+> (`a_warm_builder_lowers_a_file_in_one_allocation`,
+> `decoding_a_tree_allocates_its_block_and_its_paths`, `assembly_allocates_once_a_tree`),
+> `non_empty_columns` is removed, and `trees_asked_again_allocate_nothing` stays at 0.
+> `blaze-mem` and `blaze-alloc-count` have both landed in hir-def. hot_lint finds nothing in
+> `item_tree*`. Report: `/tmp/blaze-lanes/v2-frontend-deps-items-block.md`.
+> frontend-deps-items-block (2026-10-29): applied, not yet built or tested. `block.rs` is
+> new as given, except `with_refs`/`Refs` and its test are left out, because only the withdrawn
+> per-item `assemble` used them. `item_tree.rs`, `lower.rs`, `persist.rs` and `tests.rs` are
+> applied on top of speed-hir-sol-items A to E (`top_attrs` held aside, `Scoped::seal`,
+> `attr_blocks`, decode's exact-length columns in one `try_build`) and dedyn's generics.
+> `items.rs` is ported onto the kept tree: `assemble` sums every column, then makes one `build`
+> that writes each run in `assemble_part`. `Marks.attrs` is now `attr_list` (rule 1), and
+> `same_top`/`Marks::ends` read through the accessors. Each budget is now one allocation a tree
+> (`a_warm_builder_lowers_a_file_in_one_allocation`,
+> `decoding_a_tree_allocates_its_block_and_its_paths`, `assembly_allocates_once_a_tree`),
+> `non_empty_columns` is removed, and `trees_asked_again_allocate_nothing` stays at 0.
+> `blaze-mem` and `blaze-alloc-count` have both landed in hir-def. hot_lint finds nothing in
+> `item_tree*`. Report: `/tmp/blaze-lanes/v2-frontend-deps-items-block.md`.
+> applied by db-expand (db-expand-items, 2026-10-29): H1 to H3 for hir-def are met. `crates/hir-def/Cargo.toml` has `blaze-mem` in `[dependencies]` and `blaze-alloc-count` in `[dev-dependencies]`; `src/lib.rs` has `#![feature(allocator_api)]` and exactly one `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting` (at the end of the file; `rg global_allocator crates/hir-def/src` finds only it), and `nameres/tests/paths.rs` has no allocator of its own. `#[cfg(test)] mod alloc_budgets;` and `mod nameres_budgets;` are declared now too.
 
 ### Bases
 

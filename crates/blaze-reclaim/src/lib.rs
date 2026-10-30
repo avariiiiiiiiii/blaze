@@ -215,6 +215,8 @@ impl Grace {
 /// What it holds is `Sync` too, so a limbo is: an owner that is shared keeps it.
 #[derive(Default)]
 pub struct Limbo {
+    // One owner retires values of several types (blaze-cas: a view, chunks and owned values).
+    // dyn: boxed once per retire, on the writer's side, and only ever dropped.
     held: Vec<(Grace, Box<dyn Send + Sync>)>,
 }
 

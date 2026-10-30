@@ -70,9 +70,9 @@ fn convert<const FRAGMENTS: bool, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
 
 /// The parser's words of `tree`'s tokens, as a matcher's input of the whole tree makes them,
 /// with where each token slot's word is and the group of each fragment start: what
-/// [`tt::TopSubtree::words`] keeps, so that a view's input is a slice of them.
+/// [`tt::Tree::words`] keeps, so that a view's input is a slice of them.
 pub fn tree_words<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
-    tree: &tt::TopSubtree,
+    tree: &tt::Tree,
     span_to_edition: &mut F,
 ) -> tt::TreeWords {
     let mut res = parser::Input::with_capacity(tree.token_slots());
@@ -105,12 +105,23 @@ pub fn tree_words<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
 /// The kept words hold the editions their contexts were given when they were made. When
 /// `span_to_edition` gives any of those contexts another, the view's words are made afresh for
 /// this call, by the same conversion, and the kept ones are left as they are.
+///
+/// A tree that keeps no words (a task's, [`tt::Tree::keeps_words`]) has its view converted into
+/// `copy` on every call.
 pub fn view_tokens<'a, F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     view: tt::TokenTreesView<'a>,
     fragments: bool,
     span_to_edition: &mut F,
     copy: &'a mut parser::Input,
 ) -> parser::Tokens<'a> {
+    if !view.tree().keeps_words() {
+        match fragments {
+            true => to_matcher_input_into(view, span_to_edition, copy),
+            false => to_parser_input_into(view, span_to_edition, copy),
+        }
+        let copy: &'a parser::Input = copy;
+        return copy.tokens();
+    }
     let kept = view.tree_words(|tree| tree_words(tree, &mut *span_to_edition));
     let (tokens, first_fragment_counts) =
         match kept.editions().iter().all(|&(ctx, edition)| span_to_edition(ctx) == edition) {

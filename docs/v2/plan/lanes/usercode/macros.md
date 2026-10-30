@@ -56,7 +56,7 @@ A hit costs:
 
 It allocates nothing but the decoded expansion, apart from the call's environment, made
 only if a shape read a variable. The input crosses as the tree's own columns
-(`TopSubtree::write_wire` into the reused buffer, then its span parts rewritten to indices of
+(`Tree::write_wire` into the reused buffer, then its span parts rewritten to indices of
 the expansion's `Parts`), and the output is read back with `read_wire`, one pass over the
 columns into the tree. `check` compares by the hash of the kept bytes, also read in place. A
 miss runs the macro once and keeps what it made.

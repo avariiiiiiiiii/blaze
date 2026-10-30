@@ -50,6 +50,21 @@ Design notes for [the db lane](../db.md), as written on 2026-10-29. The code is
 - A job pumped under a waiting query is a task of its own and may ask the database. Only a
   query's own code may not: `Pinned::get` (from `Database::pin()`) inside `Query::execute`
   panics (ask through `Cx::get`, which records the edge).
+- `Cx::get_all(keys)` asks independent keys at once (a workspace's member manifests):
+  - It gives each key's value, with the same edges in the same order as a loop of `Cx::get`,
+    so verification and `why` see what a sequential caller makes.
+  - When the view has resolved every key, it is one results lookup a key and allocates only
+    the returned list.
+  - From the first key the view hasn't resolved, each later unresolved key is a job of the
+    plane's pool (`blaze_graph::exec::shared()`, in a scope) that resolves it ahead. Meanwhile
+    the asker asks every key in order and waits, as a `Cx::get` does, for one a job is
+    running.
+  - A job ahead never waits (`Flights::run_if_idle`). Any key another task runs, its own or
+    one it reads, makes it give way at once, and the asker meets that key in its turn. The
+    asker's wait for the scope's jobs is no edge of the wait graph, so a job that waited
+    could close a cycle no check sees.
+  - The first key that is cancelled or panics ends the call with that once the jobs have
+    ended. What they resolved stays as memos.
 
 ## Keys by bytes
 

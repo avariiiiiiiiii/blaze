@@ -22,6 +22,7 @@ macro_rules! shelves {
         pub(crate) struct $name(Vec<$elem>);
 
         thread_local! {
+            // alloc: none until a buffer is shelved; then one slot per buffer lent at once.
             static $shelf: RefCell<Vec<$name>> = const { RefCell::new(Vec::new()) };
         }
 
@@ -98,6 +99,7 @@ shelves! {
 pub(crate) fn recycle<T, U>(mut buffer: Vec<T>) -> Vec<U> {
     const { assert!(size_of::<T>() == size_of::<U>() && align_of::<T>() == align_of::<U>()) };
     buffer.clear();
+    // alloc: none, the `collect` reuses `buffer`'s allocation.
     buffer.into_iter().map(|_| -> U { unreachable!("the buffer was emptied") }).collect()
 }
 

@@ -2,14 +2,18 @@
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
 
-use std::{collections::VecDeque, fmt};
+use std::{
+    alloc::{Allocator, Global},
+    cell::Cell,
+    fmt,
+};
 
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use span::{Edition, Span, SpanAnchor, SpanMap, SyntaxContext};
 use stdx::never;
@@ -19,6 +23,13 @@ use syntax::{
     SyntaxNode, SyntaxToken, SyntaxTreeBuilder, T, TextRange, TextSize, WalkEvent, format_smolstr,
 };
 use tt::{Punct, buffer::Cursor, token_to_literal};
+
+/// The leaves a conversion's callback inserts at one event: at most three, inline.
+pub type Inserted = SmallVec<[tt::Leaf; 3]>;
+/// The leaves to append after an element (a `SyntaxElement`, or a view's `NodeId`), by element.
+pub type Appended<K, A = Global> = hashbrown::HashMap<K, Inserted, rustc_hash::FxBuildHasher, A>;
+/// The elements to leave out.
+pub type Removed<K, A = Global> = hashbrown::HashSet<K, rustc_hash::FxBuildHasher, A>;
 
 pub mod prettify_macro_expansion;
 #[cfg(any(test, feature = "reference"))]
@@ -154,14 +165,13 @@ where
     if let Some((tree, at)) = node.flat() {
         let mut c = FlatConverter::new(tree, at, map, span, mode);
         let len = c.tokens.len_hint();
-        return convert_tokens(&mut c, len);
+        return convert_tokens_kept(&mut c, len);
     }
+    let append = Appended::<SyntaxElement, Global>::default();
+    let remove = Removed::<SyntaxElement, Global>::default();
     let mut c =
-        Converter::new(node, map, Default::default(), Default::default(), span, mode, |_, _| {
-            // alloc: empty, which allocates nothing.
-            (true, Vec::new())
-        });
-    convert_tokens(&mut c, 0)
+        Converter::new(node, map, append, remove, span, mode, |_, _| (true, Inserted::new()));
+    convert_tokens_kept(&mut c, 0)
 }
 
 /// A macro's input, or any node's tokens as a token tree, from a view of the node
@@ -184,38 +194,55 @@ where
     let (tree, at) = node.flat();
     let mut c = FlatConverter::new(tree, at, map, call_site, mode);
     let len = c.tokens.len_hint();
-    convert_tokens(&mut c, len)
+    convert_tokens_kept(&mut c, len)
+}
+
+/// [`call_input`] into a tree in `alloc`: a task's temporary, which keeps no parser words.
+pub fn call_input_in<SpanMap, A: Allocator>(
+    node: syntax::view::Node<'_>,
+    map: SpanMap,
+    call_site: Span,
+    mode: DocCommentDesugarMode,
+    alloc: A,
+) -> tt::TopSubtree<A>
+where
+    SpanMap: SpanMapper,
+{
+    let (tree, at) = node.flat();
+    let mut c = FlatConverter::new(tree, at, map, call_site, mode);
+    let len = c.tokens.len_hint();
+    convert_tokens(&mut c, len, alloc)
 }
 
 /// Converts a syntax tree to a [`tt::Subtree`] using the provided span map to populate the
 /// subtree's spans. Additionally using the append and remove parameters, the additional tokens can
 /// be injected or hidden from the output.
-pub fn syntax_node_to_token_tree_modified<SpanMap, OnEvent>(
+pub fn syntax_node_to_token_tree_modified<SpanMap, OnEvent, A: Allocator + Clone>(
     node: &SyntaxNode,
     map: SpanMap,
-    append: FxHashMap<SyntaxElement, Vec<tt::Leaf>>,
-    remove: FxHashSet<SyntaxElement>,
+    append: Appended<SyntaxElement, A>,
+    remove: Removed<SyntaxElement, A>,
     call_site: Span,
     mode: DocCommentDesugarMode,
     on_enter: OnEvent,
 ) -> tt::TopSubtree
 where
     SpanMap: SpanMapper,
-    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Vec<tt::Leaf>),
+    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Inserted),
 {
     let mut c = Converter::new(node, map, append, remove, call_site, mode, on_enter);
-    convert_tokens(&mut c, 0)
+    convert_tokens_kept(&mut c, 0)
 }
 
 /// [`syntax_node_to_token_tree_modified`] on a view (cfg stripping and fixup of a macro's
 /// input): elements are removed and appended after by their [`syntax::view::NodeId`], which is
 /// unique within the file's tree `node` is in, and `on_event` sees the view's walk. No syntax
 /// handle is made and nothing is counted.
-pub fn call_input_modified<'t, SpanMap, OnEvent>(
+pub fn call_input_modified<'t, SpanMap, OnEvent, A: Allocator + Clone>(
     node: syntax::view::Node<'t>,
     map: SpanMap,
-    append: FxHashMap<syntax::view::NodeId, Vec<tt::Leaf>>,
-    remove: FxHashSet<syntax::view::NodeId>,
+    append: Appended<syntax::view::NodeId, A>,
+    remove: Removed<syntax::view::NodeId, A>,
     call_site: Span,
     mode: DocCommentDesugarMode,
     on_event: OnEvent,
@@ -225,10 +252,10 @@ where
     OnEvent: FnMut(
         &mut syntax::view::PreorderWithTokens<'t>,
         &WalkEvent<syntax::view::Element<'t>>,
-    ) -> (bool, Vec<tt::Leaf>),
+    ) -> (bool, Inserted),
 {
     let mut c = ViewConverter::new(node, map, append, remove, call_site, mode, on_event);
-    convert_tokens(&mut c, 0)
+    convert_tokens_kept(&mut c, 0)
 }
 
 // The following items are what `rustc` macro can be parsed into :
@@ -252,21 +279,36 @@ where
 /// thread's (`parser::Input`), is only filled when the words must be made afresh for other
 /// editions.
 pub fn token_tree_to_syntax_node<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
-    tt: &tt::TopSubtree,
+    tt: tt::SubtreeView<'_>,
     entry_point: parser::TopEntryPoint,
     span_to_edition: &mut F,
 ) -> (Parse<SyntaxNode>, SpanMap) {
-    let buffer = tt.view().strip_invisible();
-    let mut copy = parser::Input::with_capacity(0);
-    parse_tokens(buffer, entry_point, view_tokens(buffer, false, span_to_edition, &mut copy))
+    token_tree_to_syntax_node_in(tt, entry_point, span_to_edition, Global)
 }
 
-/// The tree of the tokens of `buffer`, `tokens` being their input.
-pub(crate) fn parse_tokens(
+/// [`token_tree_to_syntax_node`] of a view, its span map in `alloc`.
+pub fn token_tree_to_syntax_node_in<
+    F: FnMut(SyntaxContext) -> Edition + ?Sized,
+    A: Allocator + Clone,
+>(
+    tt: tt::SubtreeView<'_>,
+    entry_point: parser::TopEntryPoint,
+    span_to_edition: &mut F,
+    alloc: A,
+) -> (Parse<SyntaxNode>, SpanMap<A>) {
+    let buffer = tt.strip_invisible();
+    let mut copy = parser::Input::with_capacity(0);
+    let tokens = view_tokens(buffer, false, span_to_edition, &mut copy);
+    parse_tokens(buffer, entry_point, tokens, alloc)
+}
+
+/// The tree of the tokens of `buffer`, `tokens` being their input, its span map in `alloc`.
+pub(crate) fn parse_tokens<A: Allocator + Clone>(
     buffer: tt::TokenTreesView<'_>,
     entry_point: parser::TopEntryPoint,
     tokens: parser::Tokens<'_>,
-) -> (Parse<SyntaxNode>, SpanMap) {
+    alloc: A,
+) -> (Parse<SyntaxNode>, SpanMap<A>) {
     // It matters what edition we parse with even when we escape all identifiers correctly.
     let parser_output = entry_point.parse(tokens);
     let mut tree_sink = TtTreeSink::new(buffer.cursor(), tokens.len());
@@ -284,7 +326,7 @@ pub(crate) fn parse_tokens(
             parser::Step::Error { msg } => tree_sink.error(msg.to_owned()),
         }
     }
-    tree_sink.finish()
+    tree_sink.finish(alloc)
 }
 
 /// Convert a string to a `TokenTree`. The spans of the subtree will be anchored to the provided
@@ -302,7 +344,7 @@ pub fn parse_to_token_tree(
     let len = lexed.len();
     let tokens = LexedTokens::new(lexed, text);
     let mut conv = RawConverter { tokens, anchor, ctx, mode: DocCommentDesugarMode::ProcMacro };
-    Some(convert_tokens(&mut conv, len))
+    Some(convert_tokens_kept(&mut conv, len))
 }
 
 /// Convert a string to a `TokenTree`. The passed span will be used for all spans of the produced subtree.
@@ -318,11 +360,30 @@ pub fn parse_to_token_tree_static_span(
     let len = lexed.len();
     let tokens = LexedTokens::new(lexed, text);
     let mut conv = StaticRawConverter { tokens, span, mode: DocCommentDesugarMode::ProcMacro };
-    Some(convert_tokens(&mut conv, len))
+    Some(convert_tokens_kept(&mut conv, len))
 }
 
-/// Converts the tokens of `conv`, `len` being about how many token trees they make.
-fn convert_tokens<C>(conv: &mut C, len: usize) -> tt::TopSubtree
+/// Converts the tokens of `conv`, `len` being about how many token trees they make, into a tree
+/// that keeps its parser words.
+fn convert_tokens_kept<C>(conv: &mut C, len: usize) -> tt::TopSubtree
+where
+    C: TokenConverter,
+    C::Token: fmt::Debug,
+{
+    convert_into_builder(conv, len).build_skip_top_subtree()
+}
+
+/// [`convert_tokens_kept`] into a tree in `alloc`, a task's temporary that keeps no words.
+fn convert_tokens<C, A: Allocator>(conv: &mut C, len: usize, alloc: A) -> tt::TopSubtree<A>
+where
+    C: TokenConverter,
+    C::Token: fmt::Debug,
+{
+    convert_into_builder(conv, len).build_skip_top_subtree_in(alloc)
+}
+
+/// The builder holding the tokens of `conv`, every group closed.
+fn convert_into_builder<C>(conv: &mut C, len: usize) -> tt::TopSubtreeBuilder
 where
     C: TokenConverter,
     C::Token: fmt::Debug,
@@ -494,7 +555,7 @@ where
         // FIXME: record an error somewhere?
         builder.close(conv.call_site());
     }
-    builder.build_skip_top_subtree()
+    builder
 }
 
 /// Closes the `count` fragments that the token at `span` ended, of those that started in these
@@ -779,30 +840,30 @@ impl<'t> TokenConverter for StaticRawConverter<'t> {
     }
 }
 
-struct Converter<SpanMap, OnEvent> {
+struct Converter<SpanMap, OnEvent, A: Allocator + Clone> {
     current: Option<SyntaxToken>,
-    current_leaves: VecDeque<tt::Leaf>,
+    current_leaves: SmallVec<[tt::Leaf; 4]>,
     preorder: PreorderWithTokens,
     range: TextRange,
     punct_offset: Option<(SyntaxToken, TextSize)>,
     /// Used to make the emitted text ranges in the spans relative to the span anchor.
     map: SpanMap,
-    append: FxHashMap<SyntaxElement, Vec<tt::Leaf>>,
-    remove: FxHashSet<SyntaxElement>,
+    append: Appended<SyntaxElement, A>,
+    remove: Removed<SyntaxElement, A>,
     call_site: Span,
     mode: DocCommentDesugarMode,
     on_event: OnEvent,
 }
 
-impl<SpanMap, OnEvent> Converter<SpanMap, OnEvent>
+impl<SpanMap, OnEvent, A: Allocator + Clone> Converter<SpanMap, OnEvent, A>
 where
-    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Vec<tt::Leaf>),
+    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Inserted),
 {
     fn new(
         node: &SyntaxNode,
         map: SpanMap,
-        append: FxHashMap<SyntaxElement, Vec<tt::Leaf>>,
-        remove: FxHashSet<SyntaxElement>,
+        append: Appended<SyntaxElement, A>,
+        remove: Removed<SyntaxElement, A>,
         call_site: Span,
         mode: DocCommentDesugarMode,
         on_enter: OnEvent,
@@ -816,7 +877,7 @@ where
             append,
             remove,
             call_site,
-            current_leaves: VecDeque::new(),
+            current_leaves: SmallVec::new(),
             mode,
             on_event: on_enter,
         };
@@ -878,8 +939,10 @@ impl SynToken {
     }
 }
 
-impl<SpanMap, OnEvent> SrcToken<Converter<SpanMap, OnEvent>> for SynToken {
-    fn kind(&self, _ctx: &Converter<SpanMap, OnEvent>) -> SyntaxKind {
+impl<SpanMap, OnEvent, A: Allocator + Clone> SrcToken<Converter<SpanMap, OnEvent, A>>
+    for SynToken
+{
+    fn kind(&self, _ctx: &Converter<SpanMap, OnEvent, A>) -> SyntaxKind {
         match self {
             SynToken::Ordinary(token) => token.kind(),
             SynToken::Punct { token, offset: i } => {
@@ -891,14 +954,14 @@ impl<SpanMap, OnEvent> SrcToken<Converter<SpanMap, OnEvent>> for SynToken {
             }
         }
     }
-    fn to_char(&self, _ctx: &Converter<SpanMap, OnEvent>) -> Option<char> {
+    fn to_char(&self, _ctx: &Converter<SpanMap, OnEvent, A>) -> Option<char> {
         match self {
             SynToken::Ordinary(_) => None,
             SynToken::Punct { token: it, offset: i } => punct_char(it.text(), *i),
             SynToken::Leaf(_) => None,
         }
     }
-    fn to_text<'a>(&'a self, _ctx: &'a Converter<SpanMap, OnEvent>) -> &'a str {
+    fn to_text<'a>(&'a self, _ctx: &'a Converter<SpanMap, OnEvent, A>) -> &'a str {
         match self {
             SynToken::Ordinary(token) | SynToken::Punct { token, offset: _ } => token.text(),
             SynToken::Leaf(_) => {
@@ -915,10 +978,10 @@ impl<SpanMap, OnEvent> SrcToken<Converter<SpanMap, OnEvent>> for SynToken {
     }
 }
 
-impl<SpanMap, OnEvent> TokenConverter for Converter<SpanMap, OnEvent>
+impl<SpanMap, OnEvent, A: Allocator + Clone> TokenConverter for Converter<SpanMap, OnEvent, A>
 where
     SpanMap: SpanMapper,
-    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Vec<tt::Leaf>),
+    OnEvent: FnMut(&mut PreorderWithTokens, &WalkEvent<SyntaxElement>) -> (bool, Inserted),
 {
     type Token = SynToken;
     fn convert_doc_comment(
@@ -942,7 +1005,8 @@ where
             return Some((SynToken::Punct { token: punct.clone(), offset }, range));
         }
 
-        if let Some(leaf) = self.current_leaves.pop_front() {
+        if !self.current_leaves.is_empty() {
+            let leaf = self.current_leaves.remove(0);
             return Some((SynToken::Leaf(leaf), TextRange::empty(TextSize::new(0))));
         }
 
@@ -1198,32 +1262,32 @@ where
 }
 
 /// [`Converter`] on a view: the same walk, removals and appends, keyed by element id.
-struct ViewConverter<'t, SpanMap, OnEvent> {
+struct ViewConverter<'t, SpanMap, OnEvent, A: Allocator + Clone> {
     current: Option<syntax::view::Token<'t>>,
-    current_leaves: VecDeque<tt::Leaf>,
+    current_leaves: SmallVec<[tt::Leaf; 4]>,
     preorder: syntax::view::PreorderWithTokens<'t>,
     range: TextRange,
     punct_offset: Option<(syntax::view::Token<'t>, TextSize)>,
     map: SpanMap,
-    append: FxHashMap<syntax::view::NodeId, Vec<tt::Leaf>>,
-    remove: FxHashSet<syntax::view::NodeId>,
+    append: Appended<syntax::view::NodeId, A>,
+    remove: Removed<syntax::view::NodeId, A>,
     call_site: Span,
     mode: DocCommentDesugarMode,
     on_event: OnEvent,
 }
 
-impl<'t, SpanMap, OnEvent> ViewConverter<'t, SpanMap, OnEvent>
+impl<'t, SpanMap, OnEvent, A: Allocator + Clone> ViewConverter<'t, SpanMap, OnEvent, A>
 where
     OnEvent: FnMut(
         &mut syntax::view::PreorderWithTokens<'t>,
         &WalkEvent<syntax::view::Element<'t>>,
-    ) -> (bool, Vec<tt::Leaf>),
+    ) -> (bool, Inserted),
 {
     fn new(
         node: syntax::view::Node<'t>,
         map: SpanMap,
-        append: FxHashMap<syntax::view::NodeId, Vec<tt::Leaf>>,
-        remove: FxHashSet<syntax::view::NodeId>,
+        append: Appended<syntax::view::NodeId, A>,
+        remove: Removed<syntax::view::NodeId, A>,
         call_site: Span,
         mode: DocCommentDesugarMode,
         on_event: OnEvent,
@@ -1237,7 +1301,7 @@ where
             append,
             remove,
             call_site,
-            current_leaves: VecDeque::new(),
+            current_leaves: SmallVec::new(),
             mode,
             on_event,
         };
@@ -1294,8 +1358,10 @@ impl<'t> ViewToken<'t> {
     }
 }
 
-impl<'t, SpanMap, OnEvent> SrcToken<ViewConverter<'t, SpanMap, OnEvent>> for ViewToken<'t> {
-    fn kind(&self, _ctx: &ViewConverter<'t, SpanMap, OnEvent>) -> SyntaxKind {
+impl<'t, SpanMap, OnEvent, A: Allocator + Clone> SrcToken<ViewConverter<'t, SpanMap, OnEvent, A>>
+    for ViewToken<'t>
+{
+    fn kind(&self, _ctx: &ViewConverter<'t, SpanMap, OnEvent, A>) -> SyntaxKind {
         match self {
             ViewToken::Ordinary(token) => token.kind(),
             ViewToken::Punct { token, offset: i } => {
@@ -1307,13 +1373,13 @@ impl<'t, SpanMap, OnEvent> SrcToken<ViewConverter<'t, SpanMap, OnEvent>> for Vie
             }
         }
     }
-    fn to_char(&self, _ctx: &ViewConverter<'t, SpanMap, OnEvent>) -> Option<char> {
+    fn to_char(&self, _ctx: &ViewConverter<'t, SpanMap, OnEvent, A>) -> Option<char> {
         match self {
             ViewToken::Ordinary(_) | ViewToken::Leaf(_) => None,
             ViewToken::Punct { token, offset: i } => punct_char(token.text(), *i),
         }
     }
-    fn to_text<'a>(&'a self, _ctx: &'a ViewConverter<'t, SpanMap, OnEvent>) -> &'a str {
+    fn to_text<'a>(&'a self, _ctx: &'a ViewConverter<'t, SpanMap, OnEvent, A>) -> &'a str {
         match self {
             ViewToken::Ordinary(token) | ViewToken::Punct { token, offset: _ } => token.text(),
             ViewToken::Leaf(_) => {
@@ -1330,13 +1396,14 @@ impl<'t, SpanMap, OnEvent> SrcToken<ViewConverter<'t, SpanMap, OnEvent>> for Vie
     }
 }
 
-impl<'t, SpanMap, OnEvent> TokenConverter for ViewConverter<'t, SpanMap, OnEvent>
+impl<'t, SpanMap, OnEvent, A: Allocator + Clone> TokenConverter
+    for ViewConverter<'t, SpanMap, OnEvent, A>
 where
     SpanMap: SpanMapper,
     OnEvent: FnMut(
         &mut syntax::view::PreorderWithTokens<'t>,
         &WalkEvent<syntax::view::Element<'t>>,
-    ) -> (bool, Vec<tt::Leaf>),
+    ) -> (bool, Inserted),
 {
     type Token = ViewToken<'t>;
     fn convert_doc_comment(
@@ -1359,7 +1426,8 @@ where
             return Some((ViewToken::Punct { token: *punct, offset }, range));
         }
 
-        if let Some(leaf) = self.current_leaves.pop_front() {
+        if !self.current_leaves.is_empty() {
+            let leaf = self.current_leaves.remove(0);
             return Some((ViewToken::Leaf(leaf), TextRange::empty(TextSize::new(0))));
         }
 
@@ -1418,43 +1486,66 @@ struct TtTreeSink<'a> {
     text_pos: TextSize,
     inner: SyntaxTreeBuilder,
     token_map: SpanMap,
-    /// Where the token trees without delimiters start that the cursor is in, as `u32` offsets.
-    open_fragments: blaze_mem::scratch::Lent<Vec<u32>>,
+    /// Where the token trees without delimiters start that the cursor is in, each with its
+    /// group's span: an invisible delimiter has no text to keep it in the map.
+    open_fragments: SmallVec<[(TextSize, Span); 4]>,
     /// Where the last token ends, before the whitespace that may follow it.
     token_end: TextSize,
 }
 
 impl<'a> TtTreeSink<'a> {
-    /// A sink for the parse of the `tokens` input tokens `cursor` walks.
+    /// A sink for the parse of the `tokens` input tokens `cursor` walks, filling the worker's map.
     fn new(cursor: Cursor<'a>, tokens: usize) -> Self {
+        let token_map = match SINK_MAP.take() {
+            Some(mut map) => {
+                map.clear();
+                map.reserve(tokens);
+                map
+            }
+            None => SpanMap::with_capacity(tokens),
+        };
         TtTreeSink {
             buf: blaze_mem::scratch::lend_string(),
             cursor,
             text_pos: 0.into(),
             inner: SyntaxTreeBuilder::default(),
-            token_map: SpanMap::with_capacity(tokens),
-            open_fragments: blaze_mem::scratch::lend_u32s(),
+            token_map,
+            open_fragments: SmallVec::new(),
             token_end: 0.into(),
         }
     }
 
     /// Records the token tree without delimiters that the cursor leaves as a macro fragment.
     fn close_fragment(&mut self) {
-        if let Some(start) = self.open_fragments.pop().map(TextSize::new)
+        if let Some((start, span)) = self.open_fragments.pop()
             && start < self.token_end
         {
-            self.token_map.push_fragment(TextRange::new(start, self.token_end));
+            self.token_map.push_fragment(TextRange::new(start, self.token_end), span);
         }
     }
 
-    fn finish(mut self) -> (Parse<SyntaxNode>, SpanMap) {
+    /// The tree, and the map copied out of the worker's into `alloc` at its length; the worker
+    /// keeps its map for the next parse unless it grew past [`KEEP_MAP`].
+    fn finish<A: Allocator + Clone>(mut self, alloc: A) -> (Parse<SyntaxNode>, SpanMap<A>) {
         while !self.open_fragments.is_empty() {
             self.close_fragment();
         }
         self.token_map.finish();
-        (self.inner.finish(), self.token_map)
+        let map = self.token_map.copy_in(alloc);
+        if self.token_map.capacity() <= KEEP_MAP {
+            SINK_MAP.set(Some(self.token_map));
+        }
+        (self.inner.finish(), map)
     }
 }
+
+thread_local! {
+    /// The map a parse of a token tree fills, kept by the worker at the size it grew to.
+    pub(crate) static SINK_MAP: Cell<Option<SpanMap>> = const { Cell::new(None) };
+}
+
+/// The most pieces whose map the worker keeps for the next parse.
+const KEEP_MAP: usize = 1 << 16;
 
 fn delim_to_str(d: tt::DelimiterKind, closing: bool) -> Option<&'static str> {
     let texts = match d {
@@ -1587,7 +1678,7 @@ impl TtTreeSink<'_> {
                         match delim_to_str(subtree.delimiter.kind, false) {
                             Some(it) => (it, subtree.delimiter.open),
                             None => {
-                                self.open_fragments.push(u32::from(self.text_pos));
+                                self.open_fragments.push((self.text_pos, subtree.delimiter.open));
                                 continue;
                             }
                         }

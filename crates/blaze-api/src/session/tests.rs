@@ -165,6 +165,7 @@ fn diagnostic(level: Level) -> Response {
         facts: Vec::new(),
         rendered: "a diagnostic".to_owned(),
         unit: None,
+        explanation: None,
     })
 }
 
@@ -176,6 +177,8 @@ fn test_result(outcome: TestOutcome) -> Response {
         outcome,
         output: Vec::new(),
         millis: 1,
+        outside: false,
+        executable: 0,
     })
 }
 
@@ -646,6 +649,7 @@ fn worked() -> Response {
     Response::Work(crate::Worked {
         reran: 3,
         green: 9,
+        served: Vec::new(),
         compiled: 1,
         found: 4,
         link: crate::LinkKind::Placed,

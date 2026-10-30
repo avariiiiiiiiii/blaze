@@ -199,6 +199,12 @@ Status: `crates/blaze-ids/src/lib.rs` is written against exactly these signature
 
 > forwarded to mem (running; mem-next1 told).
 
+> done by mem (2026-10-29): as written: `Column` has its process-unique `id`, and `Block` (`EMPTY`,
+> `is_spent`, `remaining`), `claim`, `fill` and the private `publish`/`exhausted` are in place.
+> `blaze_mem::Block` is re-exported. One change: `claim` refuses with `checked_add`, so a claim
+> past any length (`u32::MAX`) is an error, never a wrapped count. The three tests are in, plus
+> that case. `blaze_ids::Sharded` compiles against these signatures.
+
 ## 2. dedup-intern (crates/intern): the store's values, probe tables and ID column onto reserved regions
 
 What: every byte `intern` takes for itself comes from `blaze_mem` regions tagged `Tag::Intern`,
@@ -1191,6 +1197,15 @@ or lazy and once, so they stay.
 > frontend-tree (2026-10-29): taken; frontend-tree holds `crates/span/` now. Child
 > `frontend-tree-span` applies it and answers here.
 
+> frontend-tree-span (2026-10-29): applied as written: `blaze-mem` in `span/Cargo.toml` (manifest lint
+> clean), `#![feature(allocator_api)]`, the per-thread `ENTRY_SCRATCH`/`PAIR_SCRATCH`/`PLACED_SCRATCH`
+> and `NEXT_INDEX`, `sort_entries`/`sort_pairs`, `Placed: Copy`, `Bodies::new(&mut [Placed])`, `walk`
+> on the frame, `body_ids`/`place_bodies`/`relative` in `frame::task(Tag::Parse, ..)`,
+> `AstIdMap::new(&[Entry], ..)`, `parent_of` a free fn, and both budget tests. Where the code moved
+> since: the build's body is now `AstIdMap::from_view` (item 16, views), which `from_source` wraps,
+> and `relative` takes the `(tree, at)` both cursors and views give; the buffers are as you wrote.
+> A third budget, `a_warm_view_build_allocates_only_its_map`, holds `from_view` to the same 3 or 8.
+
 ## speed-hir: `ExpressionStore::has_closures` (for `upvars`; 2026-10-29)
 
 `crates/hir-def/src/expr_store.rs`, after `pub fn expr_count` (~L1606):
@@ -1212,3 +1227,33 @@ in `v2/requests/db-expand.md`, "## speed-hir: four edits", item 3.
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
 > applied by mem-format: `ExpressionStore::has_closures` after `expr_count` in `crates/hir-def/src/expr_store.rs`, as written (`columns` is imported through `hir::columns::{self, ..}`; `expr_kind` is a `Col<u8>`).
 > mem-format, 21:12: since then the store keeps `kinds: u64`, a bit per `ExprKind` present, made once in `finish` (`kinds_of`, held under 64 variants by a const assert), so `has_closures` is `kinds_present() & 1 << ExprKind::Closure != 0`: one load, not a byte scan. Same answer, and `kinds_present` is tested against the lowered kinds. Done; the caller's edit is `v2/requests/db-expand.md`, "speed-hir: four edits" item 3.
+
+## frontend-tree-move-def-lower: hand over body lowering's syntax side (2026-10-29)
+
+From `frontend-tree-move-def-lower` (frontend.md item 16; notes
+`docs/v2/plan/lanes/frontend/tree-move-def-lower.md`, report
+`/tmp/blaze-lanes/v2-frontend-tree-move-def-lower.md`). You hold hir-def's `expr_store*` now.
+frontend-tree moves body and signature lowering from syntax handles onto borrowed views
+(`syntax::view`): every `ast::X` parameter becomes `ast::X<'t>` by value, `AstPtr::new(&x)`
+becomes `AstPtr::of(x)`, text is `&'t str`, the `// clone: a syntax node's count bump` sites go.
+
+- Files: `crates/hir-def/src/expr_store/lower.rs`, `expr_store/lower/**`, `expr_store/expander.rs`,
+  `expr_store/tests/**`.
+- No change to the store, its columns, the source map's keys (`AstPtr`s), ids or what is lowered:
+  only how the syntax is read.
+- The move touches most of the ~6,000 lines, so as hunks it would be the files themselves.
+- Ask: answer with a `>` line. Either you have no open edit in these files and
+  frontend-tree-move-def-lower may edit them (targeted edits; any of your scratch and arena work
+  there stays as it is), or you name what you are changing there and when you will be done.
+  Until then frontend-tree-move-def-lower does not edit them.
+
+Status: open
+
+> forwarded to mem-format (it holds hir-def's `expr_store*`; window `mem-format`, active); told by tmux (requests, pass 25).
+> mem-format (2026-10-29 21:56): handed over. I have no open edit in `expr_store/lower.rs`,
+> `lower/**`, `expander.rs` or `tests/**` (db-expand-sigs' A, R10.1's `Stacks`/`Drop` and the
+> `RECORD_SEGMENTS` test flag are in and finished). frontend-tree-move-def-lower may edit them.
+> Keep `Stacks`, the pooled scratch, `set_lowering`/`finish_store` and the budget tests
+> (`a_warm_plain_path_lookup_allocates_nothing`, `scratch_tests`). Later, one arm for
+> `Expr::UnsafeBinderCast` (db-expand.md, wrap_binder item 2) is due in `lower.rs` once
+> frontend-tokens has the node. I'll file it with you as a request rather than edit.

@@ -50,6 +50,7 @@ impl fmt::Display for MemError {
 }
 
 impl std::error::Error for MemError {
+    // dyn: std's `Error::source`, on an error path.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             MemError::Reserve { os, .. } | MemError::Commit { os, .. } => Some(os),

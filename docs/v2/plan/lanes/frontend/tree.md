@@ -140,3 +140,46 @@ each node or token of each kind with its handle twin by kind and range, and asse
 method gives the same node, token, text or value; `digits_value` is checked against
 `u128::from_str_radix` on every string of four bytes from `0 1 7 9 a f z _ + - é`, radixes 2,
 8, 10, 16, error kinds included, and the 2^128 edges.
+
+## span on views
+
+`crates/span/src/ast_id.rs` builds and reads `AstIdMap`s from views (frontend-tree-span):
+
+- `AstIdMap::from_view(root: syntax::view::Node<'_>)`, `relative_to_view(node, relative)` and
+  `relative_without_view(node, relative, elided: &[SyntaxNodePtr])`, plus
+  `ast_id_of_view::<N>(N::Of<'_>)` and `ast_id_for_block_view(view::BlockExpr<'_>)`. The walks
+  were already over `(tree, at)`: a view gives it as `flat()` with the shared tree
+  (`Node::shared_file`, or the parsed part's `Arc` for a node in a part), a cursor as `flat()`, so
+  both reach the same code. `from_source` makes the root's view and calls `from_view`;
+  `relative_to`/`relative_without` hand the cursors' `(tree, at)` to the same `relative`. They stay
+  until hir-def and hir-expand stop calling them.
+- Naming reads views, with no cursor per item: `ErasedFileAstId::ast_id_for`, `has_name_ast_id`,
+  the `Impl`/`Use`/`ExternBlock`/`AsmExpr` ids and the `register_*` macros' names take a
+  `view::Node`, cast with `use syntax::view as ast;`, and hash the same `&str`s (`Name::text`,
+  `NameRef::text` are the first token's text in both layers). An item is viewed as
+  `Node::at(tree, NodeId { part: FILE, at })`: items outside bodies are in the file's tree.
+- Kind tags (`AstIdNode` impls, `FileAstId<N>`, `AstPtr<N>`) stay on handle types.
+- A build's temporaries are on the task's `Frame` and its sorts on per-thread `Scratch`
+  (mem-format's request), so a warm build allocates its result alone: entries and two indexes,
+  and five body columns when there are bodies.
+
+Proof, in `ast_id.rs`' tests, over every `crates/parser/test_data/**/*.rs` and `crates/span/src/*.rs`
+in full and outline parses: `a_views_map_is_the_handles_map` (the `from_view` map equals
+`from_source`'s, its entries, bodies and every id, bodies' too; and replaying the entries in the
+walk's order, each item named by its handle with the naming as it was before views, `handle_id`,
+gives the stored id); `a_views_relative_maps_are_the_handles` (for each item, `relative_to_view`
+equals `relative_to` on the item as a tree of its own, and `relative_without_view` equals
+`relative_without` with its fn bodies elided); `a_warm_view_build_allocates_only_its_map` (3
+allocations, or 8 with bodies).
+
+## Moving the callers
+
+Split by crate into `frontend-tree-move-*` children, each with notes
+`tree-move-<part>.md` beside this file. Bottom-up: hir-expand's twins
+([tree-move-expand.md](tree-move-expand.md)) are what every layer above programs against, then
+hir-def's, then hir's. A twin sits beside its handle function under the name `<name>_view` (or
+`to_view` for `to_node`, `root` for `parse_or_expand`/`file_syntax`) and has its meaning
+exactly; the request that moves a handle function's last caller deletes it. One fixed name
+across layers: `MacroCallLoc::to_node_view(db) -> InFile<view::Node<'db>>`, beside
+`to_node_item_view`. `syntax::view::Typed` covers `Either<L, R>` (source maps' `AstPtr<Either<..>>`)
+and the hand-written `ast::Macro`.

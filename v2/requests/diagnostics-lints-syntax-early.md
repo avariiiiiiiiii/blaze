@@ -15,6 +15,7 @@ suggestion there, but at the wrong span; the test is left out of
 `tests/lints/syntax/early/builtin.rs` until this is in.
 
 > forwarded to db: `crates/hir-expand/` (the mbe transcription's spans) is lane db's.
+> forwarded to format (db-next2): the fix is in `crates/mbe` (`transcriber.rs`, a `stmt` fragment transcribed in an invisible group spanned by the metavariable) and `syntax-bridge`, both format's. hir-expand takes the span map as given. It is the same change as db-dispatch's "db-expand 16" forward to format.
 
 ## diagnostics-lints-syntax-early: the `;` hir-expand drops from an expression expansion (speed)
 

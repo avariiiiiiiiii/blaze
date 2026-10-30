@@ -121,7 +121,7 @@ impl Ran<'_> {
             // A relative one is relative to where rustc runs, the package's directory.
             return !dir.components().any(|it| it == std::path::Component::ParentDir);
         }
-        let dir = tidy(dir);
+        let dir = blaze_manifest::paths::normalize_path(dir);
         [self.out_dir, self.package_dir]
             .into_iter()
             .chain(self.build_dir())
@@ -278,20 +278,6 @@ pub fn refused_error(package: &str, refused: &[(String, String)]) -> String {
         lines.join("\n"),
         super::sandboxed::WORKSPACE_TABLE,
     )
-}
-
-/// `path` with `.` left out and `..` taken back.
-fn tidy(path: &Path) -> PathBuf {
-    use std::path::Component;
-    let mut out = PathBuf::new();
-    for part in path.components() {
-        match part {
-            Component::CurDir => {}
-            Component::ParentDir => _ = out.pop(),
-            other => out.push(other),
-        }
-    }
-    out
 }
 
 #[cfg(all(test, unix))]

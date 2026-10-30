@@ -425,7 +425,7 @@ mod m {
     "#,
         expect![[r#"
             (block scope)
-            - _ : type
+            - _ : type (import)
             - Tr : type
 
             crate

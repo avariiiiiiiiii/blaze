@@ -74,6 +74,7 @@ pub(super) fn definition(
         cx.lint_may_fire(INCOMPATIBLE_OR_PATTERNS),
         cx.lint_may_fire(EXPR_FRAGMENT_SPECIFIER),
     );
+    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
     let Some(def) = ast::Macro::cast(node.clone()) else { return };
     let at = tree.ptr(node);
     let map = tree.file.macro_file().map(|call| call.expansion_span_map(cx.db));
@@ -91,6 +92,7 @@ pub(super) fn definition(
     let (m, rules) = Matchers::rules(&tokens, macro_rules, span(start).0);
 
     let mut checker = Checker::new(&m, &tokens);
+    // alloc: empty until a lint fires; holds only what fires
     let mut found = Vec::new();
     for rule in &rules {
         if or_patterns {
@@ -113,11 +115,13 @@ pub(super) fn definition(
             let mut diag = Diag::lint(
                 "rust_2021_incompatible_or_patterns",
                 "the meaning of the `pat` fragment specifier is changing in Rust 2021, which may affect this macro",
+                // clone: a lint's span, for a lint found
                 span.clone(),
             );
             diag.suggestion(
                 span,
                 "use pat_param to preserve semantics",
+                // alloc: the lint's text, for a lint found
                 format!("${}:pat_param", printed(&tokens, it.name)),
                 Applicability::MachineApplicable,
             );
@@ -130,6 +134,7 @@ pub(super) fn definition(
         let mut diag = Diag::lint(
             "edition_2024_expr_fragment_specifier",
             "the `expr` fragment specifier will accept more expressions in the 2024 edition",
+            // clone: a lint's span, for a lint found
             span.clone(),
         );
         diag.suggestion(
@@ -154,12 +159,14 @@ fn misuse_diag(cx: &Cx<'_, '_>, tree: &Tree, tokens: &Tokens, misuse: &Misuse) -
         }
         Misuse::Unknown { span: at, name } => Diag::lint(
             "meta_variable_misuse",
+            // alloc: the lint's text, for a lint found
             format!("unknown macro variable `{}`", printed(tokens, name)),
             span(at),
         ),
         Misuse::StillRepeating { span: at, binder, name } => {
             let mut diag = Diag::lint(
                 "meta_variable_misuse",
+                // alloc: the lint's text, for a lint found
                 format!("variable `{}` is still repeating at this depth", printed(tokens, name)),
                 span(at),
             );
@@ -191,7 +198,9 @@ fn printed(tokens: &Tokens, ident: Token) -> String {
         _ => false,
     };
     match reserved {
+        // alloc: the lint's text, for a lint found
         true => format!("r#{name}"),
+        // alloc: the lint's text, for a lint found
         false => name.to_owned(),
     }
 }

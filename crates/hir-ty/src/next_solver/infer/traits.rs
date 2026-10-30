@@ -47,6 +47,8 @@ pub enum ObligationCauseCode {
     WhereClauseInExpr { item: GenericDefId, bound_index: u32, arg_index: Option<u32> },
     /// The type of a function argument must be `Sized`.
     SizedArgumentType,
+    /// The declared return type of a body must be `Sized`.
+    SizedReturnType,
     /// The tail expression of a block.
     BlockTailExpression,
     /// The value of a `return`, or a body's tail.

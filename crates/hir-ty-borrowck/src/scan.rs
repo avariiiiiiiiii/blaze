@@ -10,67 +10,65 @@ use hir_ty::{
     InferenceResult,
     next_solver::{DbInterner, Region, RegionExt as _, Ty},
 };
-use rustc_hash::FxHashMap;
-
 use crate::{
-    bitset::BitSet,
+    bitset::{BitSet, bits},
+    mem::{self, FMap, FVec, Frame},
     regions::{Annotation, spells_generics},
 };
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// In [`Scan::tested_at`], a pattern no `match` arm has; in a parent map, a root.
 const NONE: u32 = u32::MAX;
 
-pub(crate) struct Scan<'db> {
+pub(crate) struct Scan<'f, 'db> {
     /// The `match` expressions, and what they match, whose arms test the value: rustc reads the
     /// matched place on the edge taken when no arm matches, which a match of bindings alone
     /// lacks. By expression.
-    matched: BitSet,
+    matched: BitSet<'f>,
     /// By pattern, the scrutinee of the `match` an arm's pattern is in, [`NONE`] for none:
     /// rustc reads a discriminant and switches on a value at the scrutinee's span, where
     /// rust-analyzer gives the pattern's. Empty when the store has no `match`.
-    tested_at: Vec<u32>,
+    tested_at: FVec<'f, u32>,
     /// Record literals and the values of their fields, whose lowering assigns a field of the
     /// literal where rustc assigns the whole of it (it matters for a union). By expression.
-    union_literals: BitSet,
-    pub(crate) guarded: GuardedMatches,
+    union_literals: BitSet<'f>,
+    pub(crate) guarded: GuardedMatches<'f>,
     /// The expression a variable's pattern matches on, for each variable a `match`, a `let`
     /// with a pattern or an `if let` binds; `None` for a `let` of the variable alone.
-    scrutinees: FxHashMap<BindingId, Option<ExprId>>,
+    scrutinees: FMap<'f, BindingId, Option<ExprId>>,
     /// For each expression in a `match` arm's guard, the variables the arm's pattern binds:
     /// rustc binds them by reference in the guard, so it cannot move out of them.
-    guard_bindings: FxHashMap<ExprId, Vec<BindingId>>,
+    guard_bindings: FMap<'f, ExprId, FVec<'f, BindingId>>,
     /// The values of expression statements (`match x { None => &temp(), Some(it) => it };`),
     /// which lowering reads once the statement's temporaries are dropped, and rustc does not;
     /// with, for a `match`, the type of its value, its regions erased, which tells that read
     /// from the read of what it matches (they have the same span), where the two types differ.
-    statement_values: FxHashMap<ExprId, Option<Ty<'db>>>,
+    statement_values: FMap<'f, ExprId, Option<Ty<'db>>>,
     /// The `let`s with a type written out.
-    pub(crate) lets: Vec<Annotation>,
+    pub(crate) lets: FVec<'f, Annotation>,
     /// The whole patterns of a `let` without a type and of a `match` arm that are a struct,
     /// variant or constant path spelling out generic arguments, with what the `let` reads or
     /// the `match` matches.
-    pub(crate) spelled_patterns: Vec<(PatId, Option<ExprId>)>,
+    pub(crate) spelled_patterns: FVec<'f, (PatId, Option<ExprId>)>,
     /// The path expressions that spell out generic arguments, with the closure or `async`
     /// block each is directly in, `None` for the owner's body.
-    pub(crate) spelled_paths: Vec<(ExprId, Option<ExprId>)>,
+    pub(crate) spelled_paths: FVec<'f, (ExprId, Option<ExprId>)>,
 }
 
 /// The `match`es with a guard in some arm, numbered in the store's order, as the guards' checks
 /// need them of every body: which `match` each pattern of their arms is in, and their guards.
-#[derive(Default)]
-pub(crate) struct GuardedMatches {
+pub(crate) struct GuardedMatches<'f> {
     /// How many there are.
     pub(crate) matches: usize,
     /// The `match` each pattern of an arm is in.
-    pub(crate) tested_by: FxHashMap<PatId, usize>,
+    pub(crate) tested_by: FMap<'f, PatId, usize>,
     /// For each binding pattern of an arm, its `match` and its arm's guard, if it has one.
-    pub(crate) bound_by: FxHashMap<PatId, (usize, Option<usize>)>,
+    pub(crate) bound_by: FMap<'f, PatId, (usize, Option<usize>)>,
     /// Each guard, numbered by its place here, with its `match`; a `match`'s in the order of
     /// its arms, and the `match`es in order.
-    pub(crate) guards: Vec<(usize, ExprId)>,
+    pub(crate) guards: FVec<'f, (usize, ExprId)>,
 }
 
 #[inline]
@@ -93,8 +91,9 @@ fn spelled(pat: Pat<'_>) -> bool {
     }
 }
 
-impl<'db> Scan<'db> {
+impl<'f, 'db> Scan<'f, 'db> {
     pub(crate) fn new(
+        frame: &'f Frame,
         store: &ExpressionStore,
         infer: &InferenceResult<'db>,
         interner: DbInterner<'db>,
@@ -103,16 +102,22 @@ impl<'db> Scan<'db> {
             rustc_type_ir::fold_regions(interner, ty, |_, _| Region::new_erased(interner))
         };
         let count = store.expr_count();
-        let mut matched = BitSet::new(count);
-        let mut union_literals = BitSet::new(count);
-        let mut tested_at = Vec::new();
-        let mut guarded = GuardedMatches::default();
-        let mut scrutinees = FxHashMap::default();
-        let mut guard_bindings: FxHashMap<ExprId, Vec<BindingId>> = FxHashMap::default();
-        let mut statement_values = FxHashMap::default();
+        let mut matched = bits(frame, count);
+        let mut union_literals = bits(frame, count);
+        let mut tested_at = Vec::new_in(frame);
+        let mut guarded = GuardedMatches {
+            matches: 0,
+            tested_by: mem::map(frame),
+            bound_by: mem::map(frame),
+            guards: Vec::new_in(frame),
+        };
+        let mut scrutinees = mem::map(frame);
+        let mut guard_bindings: FMap<'f, ExprId, FVec<'f, BindingId>> = mem::map(frame);
+        let mut statement_values = mem::map(frame);
         let (mut lets, mut spelled_patterns, mut spelled_paths) =
-            (Vec::new(), Vec::new(), Vec::new());
-        let (mut bindings, mut stack) = (Vec::new(), Vec::new());
+            (Vec::new_in(frame), Vec::new_in(frame), Vec::new_in(frame));
+        let mut bindings: FVec<'_, BindingId> = Vec::new_in(frame);
+        let mut stack: FVec<'_, ExprId> = Vec::new_in(frame);
         for (id, expr) in store.exprs() {
             match expr {
                 Expr::Match { expr: scrutinee, arms } => {
@@ -157,7 +162,10 @@ impl<'db> Scan<'db> {
                         {
                             stack.push(guard);
                             while let Some(expr) = stack.pop() {
-                                guard_bindings.entry(expr).or_default().extend(&bindings);
+                                guard_bindings
+                                    .entry(expr)
+                                    .or_insert_with(|| Vec::new_in(frame))
+                                    .extend_from_slice(&bindings);
                                 store.walk_child_exprs(expr, |it| stack.push(it));
                             }
                         }
@@ -223,7 +231,7 @@ impl<'db> Scan<'db> {
             }
         }
         if !spelled_paths.is_empty() {
-            let mut parent = vec![NONE; count];
+            let parent = frame.alloc_slice_fill_with(count, |_| NONE);
             for expr in store.expr_ids() {
                 store.walk_child_exprs(expr, |child| parent[raw(child)] = raw(expr) as u32);
             }
@@ -273,7 +281,7 @@ impl<'db> Scan<'db> {
     }
 
     pub(crate) fn guard_bindings(&self, expr: ExprId) -> &[BindingId] {
-        self.guard_bindings.get(&expr).map_or(&[], Vec::as_slice)
+        self.guard_bindings.get(&expr).map_or(&[], |it| it.as_slice())
     }
 
     pub(crate) fn statement_value(&self, expr: ExprId) -> Option<Option<Ty<'db>>> {

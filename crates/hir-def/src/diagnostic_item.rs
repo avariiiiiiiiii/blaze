@@ -2,11 +2,11 @@
 //! `diagnostic_items` (one crate) and `all_diagnostic_items` (a crate and those it depends on)
 //! collect them. The name one item has is [`AttrFlags::diagnostic_item`].
 
-use std::collections::hash_map::Entry;
-
 use base_db::{Db, Crate};
+use blaze_mem::frame::Frame;
+use hashbrown::hash_map::Entry;
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 
 use crate::{
     AssocItemId, AttrDefId, HasModule, ModuleDefId, ModuleId,
@@ -38,19 +38,37 @@ impl DiagnosticItems {
     pub fn get(&self, name: &Symbol) -> Option<AttrDefId> {
         self.by_name.get(name).copied()
     }
+}
 
-    fn insert(&mut self, name: Symbol, owner: AttrDefId) {
-        match self.by_name.entry(name) {
-            Entry::Vacant(it) => {
-                it.insert(owner);
-            }
-            Entry::Occupied(it) => {
-                if *it.get() != owner {
-                    self.duplicates.push((it.key().clone(), *it.get(), owner));
-                }
+type FrameMap<'f> = hashbrown::HashMap<Symbol, AttrDefId, FxBuildHasher, &'f Frame>;
+type Duplicates<'f> = Vec<(Symbol, AttrDefId, AttrDefId), &'f Frame>;
+
+/// Gives `name` to `owner` unless an item has it already; a second item is a duplicate.
+fn insert(
+    by_name: &mut FrameMap<'_>,
+    duplicates: &mut Duplicates<'_>,
+    name: Symbol,
+    owner: AttrDefId,
+) {
+    match by_name.entry(name) {
+        Entry::Vacant(it) => {
+            it.insert(owner);
+        }
+        Entry::Occupied(it) => {
+            if *it.get() != owner {
+                duplicates.push((*it.key(), *it.get(), owner));
             }
         }
     }
+}
+
+/// The memo's value, made once at its size from what a run gathered in its frame.
+fn settle(mut by_name: FrameMap<'_>, mut duplicates: Duplicates<'_>) -> DiagnosticItems {
+    // alloc: the memo's map, exact
+    let mut result = FxHashMap::with_capacity_and_hasher(by_name.len(), FxBuildHasher);
+    result.extend(by_name.drain());
+    // alloc: the memo's duplicates, exact
+    DiagnosticItems { by_name: result, duplicates: duplicates.drain(..).collect() }
 }
 
 /// The diagnostic items of `krate`'s own items: every item rustc's `diagnostic_items` visits
@@ -58,65 +76,78 @@ impl DiagnosticItems {
 /// blocks, macros, `use`s and `extern crate`s, and those declared in bodies). Lowers only the
 /// bodies that may declare one ([`demand::walk_bodies_saying`]): those whose text says
 /// `rustc_diagnostic_item` or names a macro that may write it.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     let _p = tracing::info_span!("crate_diagnostic_items_query").entered();
-    let mut collect = Collect { db, items: DiagnosticItems::default() };
-    for (module, data) in crate_def_map(db, krate).modules(db) {
-        collect.module(module, data.scope(db));
-    }
-    demand::walk_bodies_saying(db, krate, Look::DiagnosticItems, |_, blocks| {
-        for &(_, def_map) in &blocks.blocks {
-            for (module, data) in def_map.modules(db) {
-                collect.module(module, data.scope(db));
-            }
+    blaze_mem::frame::current(|frame| {
+        let mut collect = Collect {
+            db,
+            by_name: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
+            duplicates: Vec::new_in(frame),
+        };
+        for (module, data) in crate_def_map(db, krate).modules(db) {
+            collect.module(module, data.scope(db));
         }
-    });
-    collect.items.by_name.shrink_to_fit();
-    collect.items
+        demand::walk_bodies_saying(db, krate, Look::DiagnosticItems, |_, blocks| {
+            for &(_, def_map) in &blocks.blocks {
+                for (module, data) in def_map.modules(db) {
+                    collect.module(module, data.scope(db));
+                }
+            }
+        });
+        settle(collect.by_name, collect.duplicates)
+    })
 }
 
 /// The diagnostic items `krate` sees, rustc's `all_diagnostic_items`: its own, then those of the
 /// crates in its extern prelude and, in turn, theirs, breadth first. A name given in two crates
 /// keeps the first; `duplicates` lists `krate`'s own and those across crates.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub fn diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     let _p = tracing::info_span!("diagnostic_items_query").entered();
-    let own = crate_diagnostic_items(db, krate);
-    let mut result = own.clone();
-    // `CrateData::dependencies` lists the sysroot crates even for `#![no_std]` and `#![no_core]`
-    // crates, which rustc does not load; the extern prelude is what name resolution settled on.
-    let mut seen: FxHashSet<Crate> = FxHashSet::default();
-    seen.insert(krate);
-    let mut queue = vec![krate];
-    let mut at = 0;
-    while let Some(&from) = queue.get(at) {
-        at += 1;
-        for (_, (module, _)) in crate_local_def_map(db, from).local(db).extern_prelude() {
-            let dep = module.krate(db);
-            if seen.insert(dep) {
-                queue.push(dep);
+    blaze_mem::frame::current(|frame| {
+        let own = crate_diagnostic_items(db, krate);
+        // `CrateData::dependencies` lists the sysroot crates even for `#![no_std]` and
+        // `#![no_core]` crates, which rustc does not load; the extern prelude is what name
+        // resolution settled on.
+        let mut seen = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        seen.insert(krate);
+        let mut queue = Vec::new_in(frame);
+        queue.push(krate);
+        let mut at = 0;
+        while let Some(&from) = queue.get(at) {
+            at += 1;
+            for (_, (module, _)) in crate_local_def_map(db, from).local(db).extern_prelude() {
+                let dep = module.krate(db);
+                if seen.insert(dep) {
+                    queue.push(dep);
+                }
             }
         }
-    }
-    for &dep in &queue[1..] {
-        for (name, &owner) in &crate_diagnostic_items(db, dep).by_name {
-            result.insert(name.clone(), owner);
+        let mut by_name = hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame);
+        by_name.extend(own.by_name.iter().map(|(&name, &owner)| (name, owner)));
+        let mut duplicates = Vec::new_in(frame);
+        duplicates.extend(own.duplicates.iter().copied());
+        for &dep in &queue[1..] {
+            for (&name, &owner) in &crate_diagnostic_items(db, dep).by_name {
+                insert(&mut by_name, &mut duplicates, name, owner);
+            }
         }
-    }
-    result
+        settle(by_name, duplicates)
+    })
 }
 
-struct Collect<'db> {
+struct Collect<'db, 'f> {
     db: &'db Db,
-    items: DiagnosticItems,
+    by_name: FrameMap<'f>,
+    duplicates: Duplicates<'f>,
 }
 
-impl Collect<'_> {
+impl Collect<'_, '_> {
     fn item(&mut self, owner: impl Into<AttrDefId>) {
         let owner = owner.into();
         if let Some(name) = AttrFlags::diagnostic_item(self.db, owner) {
-            self.items.insert(name, owner);
+            insert(&mut self.by_name, &mut self.duplicates, name, owner);
         }
     }
 

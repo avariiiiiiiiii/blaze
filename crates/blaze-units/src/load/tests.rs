@@ -9,14 +9,14 @@ use super::files::LoadFile;
 use super::invocation::{Asking, Invocation as InvocationQuery};
 use super::manifest::{ManifestKey, ManifestQuery, WorkspaceKey, WorkspaceQuery};
 use crate::query::{
-    BuildConfig, Command, Fetch, FetchKind, Invocation, Mount, Origin, Plan, Planned, Units, UnitPlan,
+    BuildConfig, Command, Fetch, FetchKind, Invocation, Mount, Origin, Plan, Planned, TestSandbox, Units, UnitPlan,
 };
 use crate::schema::{Mode, Unit};
 use crate::stdlib::{library_at, library_mount};
 
-const HOST: &str = "x86_64-unknown-linux-gnu";
-const WS: &str = "/home/u/ws";
-const COMMIT: &str = "16d1ffac17ad8b739e32483ac2e65fe7e1804977";
+pub(crate) const HOST: &str = "x86_64-unknown-linux-gnu";
+pub(crate) const WS: &str = "/home/u/ws";
+pub(crate) const COMMIT: &str = "16d1ffac17ad8b739e32483ac2e65fe7e1804977";
 const CRATES_IO: &str = "registry+https://github.com/rust-lang/crates.io-index";
 const CRATES_IO_SRC: &str = "/home/u/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f";
 const CRATES_IO_INDEX: &str = "/home/u/.cargo/registry/index/index.crates.io-1949cf8c6b5b557f";
@@ -31,7 +31,7 @@ fn package(name: &str, extra: &str) -> String {
 }
 
 /// A standard library of eight crates, laid out and locked as library/ is (cargo-std's).
-fn library(tree: &MemTree) -> ContentId {
+pub(crate) fn library(tree: &MemTree) -> ContentId {
     let manifest = "cargo-features = [\"profile-rustflags\"]\n\n[workspace]\nresolver = \"1\"\nmembers = [\"std\", \"sysroot\"]\n\n\
                     [profile.dev.package.panic_abort]\nrustflags = [\"-Cpanic=abort\"]\n\n\
                     [profile.release.package.panic_abort]\nrustflags = [\"-Cpanic=abort\"]\n";
@@ -385,10 +385,10 @@ impl Query for Rounds {
         let asked = cx.get::<Asking>(&())?.get().unwrap_or_else(|error| panic!("{}", error.what));
         let library = cx.get::<super::files::Mounts>(&())?.get(&asked.library);
         let spec = super::view_spec(&asked, library).unwrap_or_else(|error| panic!("{}", error.what));
-        let read = cx.get::<WorkspaceQuery>(&spec.workspace)?.get().unwrap_or_else(|error| panic!("{}", error.what));
+        let mut read = cx.get::<WorkspaceQuery>(&spec.workspace)?.get().unwrap_or_else(|error| panic!("{}", error.what));
         let mut rounds = 0;
-        let base = super::files::Snapshot::default();
-        let (outcome, _) = super::manifest::replay(cx, &read, &spec.workspace.config, &base, |cx, ctx, ws, files, reads| {
+        let base = std::mem::take(&mut read.snapshot);
+        let (outcome, _) = super::manifest::replay(cx, &read, base, &spec.workspace.config, |cx, ctx, ws, files, reads| {
             rounds += 1;
             super::resolve::resolved(cx, ctx, ws, &files, reads, &spec, |_, _| Ok(super::Staged::Done(())))
         })?;
@@ -645,6 +645,56 @@ fn the_sandbox_opt_outs_are_the_manifests() {
     let error = failed(fixture.plan(fixture.open(&ask(&files))));
     assert!(
         error.starts_with("[workspace.metadata.blaze.sandbox] in /home/u/ws/Cargo.toml: `unsandboxed-build-script` is not known"),
+        "{error}"
+    );
+}
+
+// The tests' opt-ins as the plan carries them: the workspace's `sandboxed-tests` experiment,
+// `a`'s `tests = true` with one test out, `b`'s `tests = false`, and `d`, outside the
+// workspace, whose own table is not read.
+#[test]
+fn the_tests_opt_ins_are_the_manifests() {
+    let fixture = Fixture::new();
+    let root = "[workspace]\nmembers = [\"a\", \"b\", \"c\"]\nresolver = \"3\"\n\n\
+                [workspace.metadata.blaze]\nexperimental = [\"sandboxed-tests\"]\n";
+    let package = |name: &str, extra: &str| format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2024\"\n{extra}");
+    let a = package(
+        "a",
+        "\n[package.metadata.blaze.sandbox]\ntests = true\nunsandboxed-tests = [\"net::reaches\"]\n\n\
+         [dependencies]\nd = { path = \"../../d\" }\n",
+    );
+    let b = package("b", "\n[package.metadata.blaze.sandbox]\ntests = false\n");
+    let c = package("c", "");
+    let d = package("d", "\n[package.metadata.blaze.sandbox]\ntests = false\n");
+    let files = [
+        ("ws/Cargo.toml", root),
+        ("ws/a/Cargo.toml", a.as_str()),
+        ("ws/a/src/lib.rs", ""),
+        ("ws/b/Cargo.toml", b.as_str()),
+        ("ws/b/src/lib.rs", ""),
+        ("ws/c/Cargo.toml", c.as_str()),
+        ("ws/c/src/lib.rs", ""),
+        ("d/Cargo.toml", d.as_str()),
+        ("d/src/lib.rs", ""),
+    ];
+    let units = ready(fixture.plan(fixture.open(&Ask { mounts: vec![mount("/home/u/d", "d")], ..ask(&files) })));
+    assert!(units.sandboxed_tests);
+    let of = |name: &str| units.packages.iter().find(|it| it.name == name).unwrap();
+    assert_eq!(of("a").tests, TestSandbox { all: false, opted_in: true, tests: vec!["net::reaches".to_owned()] });
+    assert_eq!(of("b").tests, TestSandbox { all: true, opted_in: false, tests: Vec::new() });
+    assert_eq!(of("c").tests, TestSandbox::default());
+    assert_eq!(of("d").tests, TestSandbox::default());
+    for (name, sandboxed) in [("a", true), ("b", false), ("c", true), ("d", true)] {
+        assert_eq!(of(name).tests_sandboxed(units.sandboxed_tests), sandboxed, "{name}");
+    }
+    assert!(!of("c").tests_sandboxed(false) && of("a").tests_sandboxed(false));
+    assert!(units.packages.iter().all(|it| it.checksum.is_none()), "no package is from crates.io");
+
+    let unknown = "[workspace]\nmembers = [\"c\"]\nresolver = \"3\"\n\n[workspace.metadata.blaze]\nexperimental = [\"sandboxed-test\"]\n";
+    let files = [("ws/Cargo.toml", unknown), ("ws/c/Cargo.toml", c.as_str()), ("ws/c/src/lib.rs", "")];
+    let error = failed(fixture.plan(fixture.open(&ask(&files))));
+    assert!(
+        error.starts_with("`experimental` in [workspace.metadata.blaze] of /home/u/ws/Cargo.toml: `sandboxed-test` is not known"),
         "{error}"
     );
 }

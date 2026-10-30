@@ -81,6 +81,23 @@ byte), keeping `rows`, `column` and `pad`, which are the wire's own.
 
 Same bytes accepted and refused, same `WireError`s and offsets.
 
-> not this lane's (usercode-wire-macros): every edit is in `crates/tt`, which is frontend-tokens'; this lane only asks for tt changes. Back to the requests pass to route to frontend-tokens.
+> not this lane (usercode-wire-macros): every edit is in `crates/tt`, which is frontend-tokens'; this lane only asks for tt changes. Back to the requests pass to route to frontend-tokens.
+
 > forwarded to frontend-tokens (frontend-tokens-next1, editing `crates/tt/`; format and usercode-wire-macros are DONE) (requests, pass 18; told by tmux).
 > done by frontend-tokens: every edit as written, against the current `wire.rs` (its `Words` was unchanged by the block rewrite). `blaze-format.workspace = true` in tt's `[dependencies]` (no cycle: blaze-format depends on blaze-ids, serde, zstd). `Reader::take`'s error `at` is the cursor position before the read, as `Truncated { at }` was. manifest_lint clean, hot_lint nothing in `wire.rs`. Nothing built.
+
+> dedup-cursor: routed to `v2/requests/frontend-tokens.md` (tt is frontend-tokens'); the reader
+> half is already applied, the writer half (`put_rows`) is requested there.
+
+## frontend-tokens: two doc links name the moved `write_wire`
+
+`tt::TopSubtree::write_wire` is now `tt::Tree::write_wire` (`TopSubtree<A>` derefs to the
+non-generic `Tree`, which holds the readers and wire writers). Two module docs still link the old
+path:
+- `crates/proc-macro-api/src/wire.rs:2`: `[`tt::TopSubtree::write_wire`]` should become `[`tt::Tree::write_wire`]`.
+- `crates/blaze-expand/src/bridge/wire.rs:3`: `` `tt::TopSubtree::write_wire` `` should become `` `tt::Tree::write_wire` ``.
+These are doc text only, with no code change.
+
+> forwarded to usercode (`proc-macro-api`, `blaze-expand`; usercode-next1); told by tmux (requests, pass 26).
+
+> applied (usercode, 2026-10-29): `proc-macro-api/src/wire.rs:2` now links `tt::Tree::write_wire`. `blaze-expand/src/bridge/wire.rs:3` already said `tt::Tree::write_wire`. `read_wire` on the same line stays `tt::TopSubtree::read_wire`, where it still is. Doc text only.

@@ -209,9 +209,9 @@ impl ChildBySource for VariantId {
         let parent = *self;
         for (local_id, source) in arena_map.value.iter() {
             let id = FieldId { parent, local_id };
-            match source.clone() {
-                Either::Left(source) => res[keys::TUPLE_FIELD].insert(AstPtr::new(&source), id),
-                Either::Right(source) => res[keys::RECORD_FIELD].insert(AstPtr::new(&source), id),
+            match source {
+                Either::Left(source) => res[keys::TUPLE_FIELD].insert(AstPtr::new(source), id),
+                Either::Right(source) => res[keys::RECORD_FIELD].insert(AstPtr::new(source), id),
             }
         }
         let (_, sm) = self.fields_with_source_map(db);
@@ -331,6 +331,7 @@ fn insert_item_loc<ID, N, Data>(
     ID: Lookup<Data = Data> + 'static,
     Data: AstIdLoc<Ast = N>,
     N: AstIdNode + 'static,
+    keys::AstPtrPolicy<N, ID>: keys::Slot<N, ID>,
 {
     let loc = id.lookup(db);
     if loc.ast_id().file_id == file_id {

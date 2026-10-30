@@ -34,9 +34,15 @@ fn lower(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (TestDB, DefWithBod
     (db, fn_def)
 }
 
-/// The body of `def` and its source maps, written and read back.
+/// The body of `def` and its source maps, written and read back; and the store's macro calls,
+/// which are the source map's.
 fn round_trip(db: &TestDB, def: DefWithBodyId) {
     let (body, source_map) = Body::with_source_map(db, def);
+    let in_store: rustc_hash::FxHashSet<_> = body.store.macro_calls().iter().copied().collect();
+    let in_map: rustc_hash::FxHashSet<_> =
+        source_map.store.macro_calls().map(|(_, call)| call).collect();
+    assert_eq!(in_store, in_map, "{def:?}: the store's macro calls are the source map's");
+    assert_eq!(Body::of(db, def).store.macro_calls(), body.store.macro_calls());
     crate::expr_store::persist::assert_round_trip(body, source_map);
     if let Some((body, source_map)) = Body::relative(db, def) {
         crate::expr_store::persist::assert_round_trip(body, source_map);

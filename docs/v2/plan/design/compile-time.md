@@ -20,8 +20,10 @@ hooks.
    whole, as rustc does.
 2. **Shared code across generic instances.** Instances whose type arguments have the same
    layout and the same trait-method resolutions share one compiled body. Rust doesn't
-   guarantee distinct function addresses for them. Statics, `TypeId`, `type_name` and anything
-   else whose result the program can observe as different stay per instance. MIR-level
+   guarantee distinct function addresses for them. `TypeId`, `type_name`, vtables and anything
+   else whose result the program can observe as different stay per instance. A static in a
+   generic function is already one item for every instance, so sharing changes nothing about
+   it. MIR-level
    analysis decides which instances can share (lane db, codegen).
 3. **Exact test selection.** Each test run records the code hashes of the functions it
    executed. After an edit, only tests that executed a changed function, or read a changed
@@ -42,12 +44,14 @@ hooks.
 
 ## Don't do it at all
 
-6. **No binary on disk for dev runs.** The daemon loads code straight into the process it
-   runs. Code pages are mapped twice from one memory object, writable in the daemon and
-   executable in the process, so a patch is a store with no `mprotect` and no link. Fences make
-   the change safe for running threads: the old function stays valid until no thread is in it
-   (plane task boundaries, [concurrency.md](concurrency.md)). The executable is written only
-   when a build asks for one.
+6. **No link and no rewrite for dev runs.** The dev executable is written once per content
+   key to cargo's path and started by the kernel, so the program sees itself as its own
+   executable (`current_exe`, backtraces) as under rustc. Its start hook lays the daemon's code
+   memory over its code before `main`: code pages are mapped twice from one memory object,
+   writable in the daemon and executable in the process, so a patch is a store with no
+   `mprotect`, no link and no file write. Fences make the change safe for running threads: the
+   old function stays valid until no thread is in it (plane task boundaries,
+   [concurrency.md](concurrency.md)). See [lanes/fastcompile/inproc.md](../lanes/fastcompile/inproc.md).
 7. **Dependencies as one premapped image.** Everything below the workspace members is
    prelinked once into one shared image, keyed by the dependency graph's hash and mapped by
    every dev run, so a dev link covers only the workspace's own code.

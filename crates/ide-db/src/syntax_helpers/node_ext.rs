@@ -33,7 +33,7 @@ pub fn block_as_lone_tail(block: &ast::BlockExpr) -> Option<ast::Expr> {
 }
 
 /// Preorder walk all the expression's child expressions.
-pub fn walk_expr(expr: &ast::Expr, cb: &mut dyn FnMut(ast::Expr)) {
+pub fn walk_expr(expr: &ast::Expr, cb: &mut impl FnMut(ast::Expr)) {
     preorder_expr(expr, &mut |ev| {
         if let WalkEvent::Enter(expr) = ev {
             cb(expr);
@@ -62,14 +62,14 @@ pub fn is_closure_or_blk_with_modif(expr: &ast::Expr) -> bool {
 /// Preorder walk all the expression's child expressions preserving events.
 /// If the callback returns true on an [`WalkEvent::Enter`], the subtree of the expression will be skipped.
 /// Note that the subtree may already be skipped due to the context analysis this function does.
-pub fn preorder_expr(start: &ast::Expr, cb: &mut dyn FnMut(WalkEvent<ast::Expr>) -> bool) {
+pub fn preorder_expr(start: &ast::Expr, cb: &mut impl FnMut(WalkEvent<ast::Expr>) -> bool) {
     preorder_expr_with_ctx_checker(start, &is_closure_or_blk_with_modif, cb);
 }
 
 pub fn preorder_expr_with_ctx_checker(
     start: &ast::Expr,
-    check_ctx: &dyn Fn(&ast::Expr) -> bool,
-    cb: &mut dyn FnMut(WalkEvent<ast::Expr>) -> bool,
+    check_ctx: &impl Fn(&ast::Expr) -> bool,
+    cb: &mut impl FnMut(WalkEvent<ast::Expr>) -> bool,
 ) {
     let mut preorder = start.syntax().preorder();
     while let Some(event) = preorder.next() {
@@ -113,7 +113,7 @@ pub fn preorder_expr_with_ctx_checker(
 }
 
 /// Preorder walk all the expression's child patterns.
-pub fn walk_patterns_in_expr(start: &ast::Expr, cb: &mut dyn FnMut(ast::Pat)) {
+pub fn walk_patterns_in_expr(start: &ast::Expr, cb: &mut impl FnMut(ast::Pat)) {
     let mut preorder = start.syntax().preorder();
     while let Some(event) = preorder.next() {
         let node = match event {
@@ -174,7 +174,7 @@ pub fn walk_patterns_in_expr(start: &ast::Expr, cb: &mut dyn FnMut(ast::Pat)) {
 /// Preorder walk all the pattern's sub patterns.
 pub fn walk_pat<T>(
     pat: &ast::Pat,
-    cb: &mut dyn FnMut(ast::Pat) -> ControlFlow<T>,
+    cb: &mut impl FnMut(ast::Pat) -> ControlFlow<T>,
 ) -> ControlFlow<T> {
     let mut preorder = pat.syntax().preorder();
     while let Some(event) = preorder.next() {
@@ -203,7 +203,7 @@ pub fn walk_pat<T>(
 
 /// Preorder walk all the type's sub types.
 // FIXME: Make the control flow more proper
-pub fn walk_ty(ty: &ast::Type, cb: &mut dyn FnMut(ast::Type) -> bool) {
+pub fn walk_ty(ty: &ast::Type, cb: &mut impl FnMut(ast::Type) -> bool) {
     let mut preorder = ty.syntax().preorder();
     while let Some(event) = preorder.next() {
         let node = match event {
@@ -280,8 +280,8 @@ pub fn is_pattern_cond(expr: ast::Expr) -> bool {
 /// Does not walk into `break` or `return` expressions.
 /// Note that modifying the tree while iterating it will cause undefined iteration which might
 /// potentially results in an out of bounds panic.
-pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
-    let walk_loop = |cb: &mut dyn FnMut(&ast::Expr), label, body: Option<ast::BlockExpr>| {
+pub fn for_each_tail_expr<F: FnMut(&ast::Expr)>(expr: &ast::Expr, cb: &mut F) {
+    let walk_loop = |cb: &mut F, label, body: Option<ast::BlockExpr>| {
         for_each_break_expr(label, body.and_then(|it| it.stmt_list()), &mut |b| {
             cb(&ast::Expr::BreakExpr(b))
         })
@@ -373,7 +373,7 @@ pub fn for_each_tail_expr(expr: &ast::Expr, cb: &mut dyn FnMut(&ast::Expr)) {
 pub fn for_each_break_and_continue_expr(
     label: Option<ast::Label>,
     body: Option<ast::StmtList>,
-    cb: &mut dyn FnMut(ast::Expr),
+    cb: &mut impl FnMut(ast::Expr),
 ) {
     let label = label.and_then(|lbl| lbl.lifetime());
     if let Some(b) = body {
@@ -401,7 +401,7 @@ pub fn for_each_break_and_continue_expr(
 fn for_each_break_expr(
     label: Option<ast::Label>,
     body: Option<ast::StmtList>,
-    cb: &mut dyn FnMut(ast::BreakExpr),
+    cb: &mut impl FnMut(ast::BreakExpr),
 ) {
     let label = label.and_then(|lbl| lbl.lifetime());
     if let Some(b) = body {
@@ -580,4 +580,93 @@ pub fn is_in_macro_matcher(token: &SyntaxToken) -> bool {
             && next_next.kind() == T![>]
             && tt.syntax().text_range().contains_range(range)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::ControlFlow;
+
+    use span::Edition;
+    use syntax::{
+        AstNode, WalkEvent,
+        ast::{self, HasLoopBody},
+    };
+
+    fn body(text: &str) -> ast::Expr {
+        let file = ast::SourceFile::parse(text, Edition::CURRENT).tree();
+        let func = file.syntax().descendants().find_map(ast::Fn::cast).unwrap();
+        ast::Expr::BlockExpr(func.body().unwrap())
+    }
+
+    #[test]
+    fn tail_exprs_through_branches_and_loops() {
+        let expr = body("fn f() { if a { 1 } else { match b { _ => 2, _ => loop { break 3 } } } }");
+        let mut tails = Vec::new();
+        super::for_each_tail_expr(&expr, &mut |it| tails.push(it.syntax().to_string()));
+        assert_eq!(tails, ["1", "2", "break 3"]);
+    }
+
+    #[test]
+    fn walks_skip_other_contexts() {
+        let expr = body("fn f() { let x = 1 + 2; || 3; }");
+        let mut seen = Vec::new();
+        super::walk_expr(&expr, &mut |it| seen.push(it.syntax().to_string()));
+        assert_eq!(seen, ["{ let x = 1 + 2; || 3; }", "1 + 2", "1", "2", "|| 3"]);
+
+        let mut events = 0;
+        super::preorder_expr(&expr, &mut |ev| {
+            events += 1;
+            matches!(ev, WalkEvent::Enter(ast::Expr::BinExpr(_)))
+        });
+        // Enter and Leave of the block, the binary expression (its operands skipped) and the
+        // closure.
+        assert_eq!(events, 6);
+
+        let mut pats = Vec::new();
+        super::walk_patterns_in_expr(&expr, &mut |it| pats.push(it.syntax().to_string()));
+        assert_eq!(pats, ["x"]);
+
+        let pat = ast::SourceFile::parse("fn f((a, b): ()) {}", Edition::CURRENT)
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::TuplePat::cast)
+            .unwrap();
+        let mut count = 0;
+        let flow = super::walk_pat(&ast::Pat::TuplePat(pat), &mut |_| {
+            count += 1;
+            if count == 2 { ControlFlow::Break(count) } else { ControlFlow::Continue(()) }
+        });
+        assert_eq!(flow, ControlFlow::Break(2));
+
+        let ty = ast::SourceFile::parse("type T = Vec<Option<u8>>;", Edition::CURRENT)
+            .tree()
+            .syntax()
+            .descendants()
+            .find_map(ast::Type::cast)
+            .unwrap();
+        let mut tys = Vec::new();
+        super::walk_ty(&ty, &mut |it| {
+            tys.push(it.syntax().to_string());
+            false
+        });
+        assert_eq!(tys, ["Vec<Option<u8>>", "Option<u8>", "u8"]);
+    }
+
+    #[test]
+    fn breaks_and_continues_of_a_loop_body() {
+        let file = ast::SourceFile::parse(
+            "fn f() { 'a: loop { break; continue 'a; loop { break; break 'a; } } }",
+            Edition::CURRENT,
+        )
+        .tree();
+        let outer = file.syntax().descendants().find_map(ast::LoopExpr::cast).unwrap();
+        let mut found = Vec::new();
+        super::for_each_break_and_continue_expr(
+            outer.label(),
+            outer.loop_body().and_then(|it| it.stmt_list()),
+            &mut |it| found.push(it.syntax().to_string()),
+        );
+        assert_eq!(found, ["break", "continue 'a", "break 'a"]);
+    }
 }

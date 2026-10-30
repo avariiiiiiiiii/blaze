@@ -149,8 +149,8 @@ pub struct Of<'a> {
     pub features: &'a [String],
     /// The package's directory.
     pub source: &'a Path,
-    /// The directory of a dependency of the package, by its name.
-    pub dependency: &'a dyn Fn(&str) -> Option<PathBuf>,
+    /// The directories of the package's dependencies, by name.
+    pub dependencies: &'a BTreeMap<String, PathBuf>,
 }
 
 impl Of<'_> {
@@ -357,7 +357,7 @@ fn ort(of: &Of<'_>) -> anyhow::Result<Option<Download>> {
 }
 
 fn webrtc(of: &Of<'_>) -> anyhow::Result<Option<Download>> {
-    let build = (of.dependency)("webrtc-sys-build").context("it has no webrtc-sys-build")?;
+    let build = of.dependencies.get("webrtc-sys-build").context("it has no webrtc-sys-build")?;
     let lib = build.join("src/lib.rs");
     let text =
         std::fs::read_to_string(&lib).with_context(|| format!("reading {}", lib.display()))?;
@@ -1069,7 +1069,7 @@ fn lock(
     locked: &[Locked],
     old: &Lock,
     store: &blaze_store::Store,
-    fetch: &dyn Fn(&str) -> anyhow::Result<Option<Vec<u8>>>,
+    fetch: &impl Fn(&str) -> anyhow::Result<Option<Vec<u8>>>,
 ) -> anyhow::Result<Lock> {
     let mut fetches = Vec::new();
     let mut downloaded: BTreeMap<String, (String, u64)> = BTreeMap::new();
@@ -1092,13 +1092,12 @@ fn lock(
                     .cloned()
                     .collect();
                 on.sort();
-                let dependency = |name: &str| package.dependencies.get(name).cloned();
                 let of = Of {
                     version: &package.locked.version,
                     target,
                     features: &on,
                     source: &package.source,
-                    dependency: &dependency,
+                    dependencies: &package.dependencies,
                 };
                 let what = || format!("the download of `{name}` {} for {target}", of.version);
                 let found = download(&of).with_context(what)?;
@@ -1316,7 +1315,6 @@ fn resolve(
         build,
         platform: Some(blaze_metadata::TargetPlatform { triple: target, cfg: &cfg }),
         offline: false,
-        store: None,
         rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let json = blaze_metadata::metadata(&asked)?;
@@ -1489,10 +1487,10 @@ mod tests {
 
     #[test]
     fn each_override_names_the_download_of_its_crate() {
-        let none = |_: &str| None;
+        let none = BTreeMap::new();
         let of = |version, target, features: &[String]| -> String {
             let of =
-                Of { version, target, features, source: Path::new("/nowhere"), dependency: &none };
+                Of { version, target, features, source: Path::new("/nowhere"), dependencies: &none };
             v8(&of).unwrap().unwrap().url
         };
         assert_eq!(
@@ -1513,13 +1511,13 @@ mod tests {
         )
         .unwrap();
         let build = dir.path().join("build");
-        let dependency = |name: &str| (name == "webrtc-sys-build").then(|| build.clone());
+        let dependency = BTreeMap::from([("webrtc-sys-build".to_owned(), build.clone())]);
         let of = Of {
             version: "0.3.23",
             target: "aarch64-unknown-linux-gnu",
             features: &[],
             source: dir.path(),
-            dependency: &dependency,
+            dependencies: &dependency,
         };
         let found = webrtc(&of).unwrap().unwrap();
         assert_eq!(
@@ -1527,6 +1525,8 @@ mod tests {
             "https://github.com/zed-industries/livekit-rust-sdks/releases/download/webrtc-0001d84-4/webrtc-linux-arm64-release.zip"
         );
         assert_eq!(found.names, "linux-arm64-release");
+        let lacking = webrtc(&Of { dependencies: &none, ..of }).err().unwrap();
+        assert!(lacking.to_string().contains("webrtc-sys-build"), "{lacking}");
         let of = Of { target: "aarch64-apple-darwin", ..of };
         assert!(webrtc(&of).unwrap().unwrap().url.ends_with("/webrtc-mac-arm64-release.zip"));
         std::fs::create_dir_all(dir.path().join("build/download")).unwrap();
@@ -1544,7 +1544,7 @@ mod tests {
                 target,
                 features,
                 source: dir.path(),
-                dependency: &none,
+                dependencies: &none,
             };
             ort(&of).map(|it| it.map(|it| it.url))
         };
@@ -1571,7 +1571,7 @@ mod tests {
                 target,
                 features: &features,
                 source: dir.path(),
-                dependency: &none,
+                dependencies: &none,
             };
             ffmpeg(&of).unwrap().map(|it| (it.url, it.may_be_absent))
         };
@@ -1606,7 +1606,7 @@ mod tests {
                 target: "x",
                 features: &features,
                 source: dir.path(),
-                dependency: &none,
+                dependencies: &none,
             };
             ffmpeg_source(&of).unwrap().map(|it| (it.url, it.names))
         };
@@ -1632,7 +1632,7 @@ mod tests {
                 target,
                 features: &features,
                 source: dir.path(),
-                dependency: &none,
+                dependencies: &none,
             };
             skia(&of).unwrap().map(|it| it.url)
         };

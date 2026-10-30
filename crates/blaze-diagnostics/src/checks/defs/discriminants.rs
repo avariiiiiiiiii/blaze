@@ -7,14 +7,15 @@
 //! `detect_discriminant_duplicate`) (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
-use hir::{HasSource as _, InFile};
+use hir::InFile;
+use smallvec::SmallVec;
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, TextRange,
-    ast::{self, HasAttrs as _, HasName as _},
+    NodeOrToken, SyntaxKind, TextRange,
+    view::{self as ast, AstNode as _, HasAttrs as _, HasName as _},
 };
 
 use crate::{
-    cx::{Cx, def_range},
+    cx::{Cx, def_range_view as def_range},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
@@ -54,59 +55,72 @@ impl Discr {
     }
 
     fn text(self) -> String {
+        // alloc: the errors' text, and tests'
         if self.signed { self.value().to_string() } else { self.bits.to_string() }
     }
 }
 
-/// A variant with its discriminant and what rustc's labels point at.
-struct Variant {
-    name: String,
+/// A variant with its discriminant, and its node for what rustc's labels point at.
+struct Variant<'db> {
+    variant: hir::EnumVariant,
+    node: InFile<ast::Variant<'db>>,
     discr: Discr,
-    name_span: Span,
-    /// The span of the expression assigning it, with the literal it is when it is one.
-    explicit: Option<(Span, Option<u128>)>,
+    /// Whether an expression assigns it, with the literal it is when it is one.
+    explicit: Option<Option<u128>>,
     /// The variant its value is counted up from and how many variants later it is, when it is
     /// not assigned.
     relative: usize,
 }
 
+/// The span of a variant's name, or of the variant without one.
+fn name_span(cx: &Cx<'_, '_>, node: InFile<ast::Variant<'_>>) -> Span {
+    match node.value.name() {
+        Some(it) => cx.span(node.with_value(it.syntax().text_range())),
+        None => cx.span(node.map(|it| it.syntax().text_range())),
+    }
+}
+
+/// The expression assigning a variant's discriminant.
+fn discr_expr(node: ast::Variant<'_>) -> Option<ast::Expr<'_>> {
+    node.const_arg().and_then(|it| it.expr())
+}
+
 pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
-    let Some(source) = enum_.source(cx.db) else { return Vec::new() };
-    let enum_span = cx.span(source.as_ref().map(|it| def_range(it.syntax())));
-    let what = format!("the variants of `{}`", cx.def_path(hir::ModuleDef::Adt(enum_.into())));
+    // alloc: empty, allocates nothing
+    let Some(source) = cx.vsema.source(enum_) else { return Vec::new() };
+    let enum_span = || cx.span(source.map(|it| def_range(it.syntax())));
+    // alloc: the errors' fact
+    let what = || format!("the variants of `{}`", cx.def_path(hir::ModuleDef::Adt(enum_.into())));
     let fact = Fact::Layout(cx.key(ItemId::Adt(hir::Adt::from(enum_).into())));
+    // alloc: empty unless there is an error
     let mut found = Vec::new();
     let variants = enum_.variants(cx.db);
     if variants.is_empty() {
-        if let Some(hint) = first_repr_hint(&source.value) {
+        if let Some(hint) = first_repr_hint(source.value) {
             let span = cx.span(source.with_value(hint));
             let mut diag =
                 Diag::error(Some("E0084"), "unsupported representation for zero-variant enum", span);
-            diag.span_label(enum_span, "zero-variant enum");
-            diag.fact(fact, what);
+            diag.span_label(enum_span(), "zero-variant enum");
+            diag.fact(fact, what());
             found.push(Found::new(diag, Phase::Items));
         }
         return found;
     }
-    let needs_repr = needs_repr_int(cx, enum_, &variants, &enum_span);
+    let needs_repr = needs_repr_int(cx, enum_, &variants, source);
     let Some((signed, width)) = repr_int(cx, enum_) else {
         found.extend(needs_repr.map(|mut diag| {
-            diag.fact(fact.clone(), what.clone());
+            // clone: the error's fact
+            diag.fact(fact.clone(), what());
             Found::new(diag, Phase::Items)
         }));
         return found;
     };
-    let mut discrs: Vec<Variant> = Vec::new();
+    let mut discrs: SmallVec<[Variant<'_>; 8]> = SmallVec::new();
     let mut prev: Option<Discr> = None;
     let mut last_explicit = 0;
     for (index, variant) in variants.iter().enumerate() {
-        let Some(node) = variant.source(cx.db) else { continue };
-        let name = variant.name(cx.db).as_str().to_owned();
-        let name_span = match node.value.name() {
-            Some(it) => cx.span(node.with_value(it.syntax().text_range())),
-            None => cx.span(node.as_ref().map(|it| it.syntax().text_range())),
-        };
-        let expr = node.value.const_arg().and_then(|it| it.expr());
+        let Some(node) = cx.vsema.source(*variant) else { continue };
+        let expr = discr_expr(node.value);
         let wrapped = match prev {
             Some(prev) => prev.next().0,
             None => Discr::of(0, signed, width),
@@ -115,44 +129,50 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
             Some(_) => variant.eval(cx.db).map(|it| Discr::of(it, signed, width)).unwrap_or(wrapped),
             None => match prev {
                 Some(prev) if prev.next().1 => {
+                    let name_span = name_span(cx, node);
                     let mut diag = Diag::error(
                         Some("E0370"),
                         "enum discriminant overflowed",
+                        // clone: the error's span
                         name_span.clone(),
                     );
-                    diag.span_label(name_span.clone(), format!("overflowed on value after {}", prev.text()));
+                    // alloc: the error's label
+                    diag.span_label(name_span, format!("overflowed on value after {}", prev.text()));
+                    let name = variant.name(cx.db);
+                    // alloc: the error's note
                     diag.note(format!(
-                        "explicitly set `{name} = {}` if that is desired outcome",
+                        "explicitly set `{} = {}` if that is desired outcome",
+                        name.as_str(),
                         wrapped.text()
                     ));
-                    diag.fact(fact.clone(), what.clone());
+                    // clone: the error's fact
+                    diag.fact(fact.clone(), what());
                     found.push(Found::new(diag, Phase::Items));
                     wrapped
                 }
                 _ => wrapped,
             },
         };
-        let explicit = expr.map(|expr| {
-            let span = cx.span(node.with_value(expr.syntax().text_range()));
-            (span, literal(&expr))
-        });
+        let explicit = expr.map(literal);
         if explicit.is_some() {
             last_explicit = index;
         }
         discrs.push(Variant {
-            name,
+            variant: *variant,
+            node,
             discr,
-            name_span,
             relative: if explicit.is_some() { 0 } else { index - last_explicit },
             explicit,
         });
         prev = Some(discr);
     }
     if let Some(mut diag) = needs_repr {
-        diag.fact(fact.clone(), what.clone());
+        // clone: the error's fact
+        diag.fact(fact.clone(), what());
         found.push(Found::new(diag, Phase::Items));
     }
-    let mut order: Vec<usize> = (0..discrs.len()).collect();
+    // alloc: inline up to 16 variants
+    let mut order: SmallVec<[usize; 16]> = (0..discrs.len()).collect();
     let mut i = 0;
     while i < order.len() {
         let first = order[i];
@@ -165,21 +185,23 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
                 continue;
             }
             let diag = diag.get_or_insert_with(|| {
+                // alloc: the error's message
                 let message = format!(
                     "discriminant value `{}` assigned more than once",
                     discrs[first].discr.text()
                 );
-                let mut diag = Diag::error(Some("E0081"), message, enum_span.clone());
-                label(&mut diag, &discrs, first);
+                let mut diag = Diag::error(Some("E0081"), message, enum_span());
+                label(cx, &mut diag, &discrs, first);
                 diag
             });
-            label(diag, &discrs, other);
+            label(cx, diag, &discrs, other);
             let last = *order.last().expect("not empty");
             order[o] = last;
             order.pop();
         }
         if let Some(mut diag) = diag {
-            diag.fact(fact.clone(), what.clone());
+            // clone: the error's fact
+            diag.fact(fact.clone(), what());
             found.push(Found::new(diag, Phase::Items));
         }
         i += 1;
@@ -189,46 +211,49 @@ pub(super) fn check(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Vec<Found> {
 
 /// `check_enum`'s E0732: an enum without a `repr` integer type whose non-unit variant has an
 /// explicit discriminant, or that has an explicit discriminant and a non-unit variant.
-fn needs_repr_int(cx: &Cx<'_, '_>, enum_: hir::Enum, variants: &[hir::EnumVariant], enum_span: &Span) -> Option<Diag> {
+fn needs_repr_int(
+    cx: &Cx<'_, '_>,
+    enum_: hir::Enum,
+    variants: &[hir::EnumVariant],
+    source: InFile<ast::Enum<'_>>,
+) -> Option<Diag> {
     if enum_.repr(cx.db).is_some_and(|it| it.int.is_some()) {
         return None;
     }
-    struct Seen {
-        name: Span,
-        discr: Option<Span>,
-        unit: bool,
+    // The first non-unit variant, and the first explicit discriminant of a unit and of a
+    // non-unit variant.
+    let mut non_unit: Option<InFile<ast::Variant<'_>>> = None;
+    let mut disr_unit: Option<InFile<ast::Expr<'_>>> = None;
+    let mut disr_non_unit: Option<InFile<ast::Expr<'_>>> = None;
+    for &variant in variants {
+        let Some(node) = cx.vsema.source(variant) else { continue };
+        let unit = variant.kind(cx.db) == hir::StructKind::Unit;
+        let disr = if unit { &mut disr_unit } else { &mut disr_non_unit };
+        if disr.is_none()
+            && let Some(expr) = discr_expr(node.value)
+        {
+            *disr = Some(node.with_value(expr));
+        }
+        if !unit && non_unit.is_none() {
+            non_unit = Some(node);
+        }
     }
-    let seen: Vec<Seen> = variants
-        .iter()
-        .filter_map(|variant| {
-            let node = variant.source(cx.db)?;
-            let name = match node.value.name() {
-                Some(it) => cx.span(node.with_value(it.syntax().text_range())),
-                None => cx.span(node.as_ref().map(|it| it.syntax().text_range())),
-            };
-            let discr = node.value.const_arg().and_then(|it| it.expr());
-            let discr = discr.map(|it| cx.span(node.with_value(it.syntax().text_range())));
-            Some(Seen { name, discr, unit: variant.kind(cx.db) == hir::StructKind::Unit })
-        })
-        .collect();
-    let non_unit = seen.iter().find(|it| !it.unit);
-    let disr_unit = seen.iter().filter(|it| it.unit).find_map(|it| it.discr.clone());
-    let disr_non_unit = seen.iter().filter(|it| !it.unit).find_map(|it| it.discr.clone());
     if disr_non_unit.is_none() && !(disr_unit.is_some() && non_unit.is_some()) {
         return None;
     }
+    let expr_span = |expr: InFile<ast::Expr<'_>>| cx.span(expr.map(|it| it.syntax().text_range()));
     let mut diag = Diag::error(
         Some("E0732"),
         "`#[repr(inttype)]` must be specified for enums with explicit discriminants and non-unit variants",
-        enum_span.clone(),
+        cx.span(source.map(|it| def_range(it.syntax()))),
     );
     match (disr_non_unit, disr_unit, non_unit) {
         (Some(at), _, _) => {
-            diag.span_label(at, "explicit discriminant on non-unit variant specified here");
+            diag.span_label(expr_span(at), "explicit discriminant on non-unit variant specified here");
         }
         (None, Some(at), Some(non_unit)) => {
-            diag.span_label(at, "explicit discriminant specified here");
-            diag.span_label(non_unit.name.clone(), "non-unit discriminant declared here");
+            diag.span_label(expr_span(at), "explicit discriminant specified here");
+            diag.span_label(name_span(cx, non_unit), "non-unit discriminant declared here");
         }
         _ => {}
     }
@@ -236,34 +261,45 @@ fn needs_repr_int(cx: &Cx<'_, '_>, enum_: hir::Enum, variants: &[hir::EnumVarian
 }
 
 /// rustc's `report` in `detect_discriminant_duplicate`: where `discrs[index]` gets its value.
-fn label(diag: &mut Diag, discrs: &[Variant], index: usize) {
+fn label(cx: &Cx<'_, '_>, diag: &mut Diag, discrs: &[Variant<'_>], index: usize) {
     let variant = &discrs[index];
     let value = variant.discr.text();
-    let (span, shown) = match &variant.explicit {
-        Some((span, Some(literal))) if *literal != variant.discr.bits => {
-            (span.clone(), format!("`{value}` (overflowed from `{literal}`)"))
-        }
-        Some((span, _)) => (span.clone(), format!("`{value}`")),
-        None if variant.relative == 0 => (variant.name_span.clone(), format!("`{value}`")),
+    let expr_span = || {
+        let expr = discr_expr(variant.node.value).expect("an explicit discriminant's expression");
+        cx.span(variant.node.with_value(expr.syntax().text_range()))
+    };
+    let (span, shown) = match variant.explicit {
+        // alloc: the error's label
+        Some(Some(literal)) if literal != variant.discr.bits => (expr_span(), format!("`{value}` (overflowed from `{literal}`)")),
+        // alloc: the error's label
+        Some(_) => (expr_span(), format!("`{value}`")),
+        // alloc: the error's label
+        None if variant.relative == 0 => (name_span(cx, variant.node), format!("`{value}`")),
         None => {
             let start = &discrs[index - variant.relative];
             let distance = variant.relative;
             let variants = if distance > 1 { "variants" } else { "variant" };
+            let (name, start_name) = (variant.variant.name(cx.db), start.variant.name(cx.db));
             diag.span_label(
-                start.name_span.clone(),
+                name_span(cx, start.node),
+                // alloc: the error's label
                 format!(
                     "discriminant for `{}` incremented from this startpoint (`{}` + {distance} {variants} later => `{}` = {value})",
-                    variant.name, start.name, variant.name
+                    name.as_str(),
+                    start_name.as_str(),
+                    name.as_str()
                 ),
             );
-            (variant.name_span.clone(), format!("`{value}`"))
+            // alloc: the error's label
+            (name_span(cx, variant.node), format!("`{value}`"))
         }
     };
+    // alloc: the error's label
     diag.span_label(span, format!("{shown} assigned here"));
 }
 
 /// The value of an integer literal, as rustc's check reads one.
-fn literal(expr: &ast::Expr) -> Option<u128> {
+fn literal(expr: ast::Expr<'_>) -> Option<u128> {
     let ast::Expr::Literal(literal) = expr else { return None };
     match literal.kind() {
         ast::LiteralKind::IntNumber(it) => it.value().ok(),
@@ -282,15 +318,15 @@ fn repr_int(cx: &Cx<'_, '_>, enum_: hir::Enum) -> Option<(bool, u32)> {
 }
 
 /// The span of the first hint of the first `#[repr(..)]` of `node`: `i32` of `#[repr(i32)]`.
-fn first_repr_hint(node: &ast::Enum) -> Option<TextRange> {
-    let attr = node.attrs().find(|it| it.simple_name().as_deref() == Some("repr"))?;
-    let tt = attr.meta()?.token_tree()?;
+fn first_repr_hint(node: ast::Enum<'_>) -> Option<TextRange> {
+    let attr = node.attrs().find(|it| it.simple_name() == Some("repr"))?;
+    let (_, tt) = attr.meta()?.as_simple_call()?;
     let mut start = None;
     let mut end = None;
     let mut depth = 0usize;
     for it in tt.syntax().children_with_tokens() {
         let range = it.text_range();
-        match &it {
+        match it {
             NodeOrToken::Token(token) if token.kind() == SyntaxKind::L_PAREN && depth == 0 => {
                 depth = 1;
                 continue;

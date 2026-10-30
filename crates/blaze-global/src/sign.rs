@@ -18,6 +18,8 @@ use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
 
 use crate::Refused;
 
+pub(crate) use blaze_format::hex::encode as hex;
+
 /// Key, kind, content, length.
 pub const RECORD_LEN: usize = 32 + 1 + 32 + 8;
 /// A record, its publisher's key and the signature.
@@ -223,16 +225,6 @@ impl Trust {
             .verify(&digest_message(what, digest), signature)
             .map_err(|_| format!("its signature is not {publisher}'s"))
     }
-}
-
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 15) as usize] as char);
-    }
-    out
 }
 
 #[cfg(test)]

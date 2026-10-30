@@ -19,6 +19,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
+use blaze_format::hex::decode;
 use blaze_store::write_file_whole;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use sha2::{Digest as _, Sha256};
@@ -64,7 +65,7 @@ impl Trust {
         };
         let trusted = std::env::var("BLAZE_REMOTE_TRUST").unwrap_or_default();
         let trusted = trusted.split(',').filter(|it| !it.is_empty()).map(|key| {
-            let bytes = unhex::<32>(key).context("BLAZE_REMOTE_TRUST holds what is not a key")?;
+            let bytes = decode::<32>(key).context("BLAZE_REMOTE_TRUST holds what is not a key")?;
             VerifyingKey::from_bytes(&bytes).context("BLAZE_REMOTE_TRUST holds what is not a key")
         });
         let unsigned = std::env::var_os("BLAZE_REMOTE_UNSIGNED").is_some_and(|it| it == "1");
@@ -149,7 +150,7 @@ impl Trust {
         let fields: Vec<&str> = signature.split(' ').collect();
         let signed = match fields[..] {
             [SIGNED, key, turn, signature] => {
-                unhex::<32>(key).zip(turn_of(turn)).zip(unhex::<64>(signature))
+                decode::<32>(key).zip(turn_of(turn)).zip(decode::<64>(signature))
             }
             _ => None,
         };
@@ -222,6 +223,7 @@ impl Turns {
     /// The highest turn taken of the list `name`, if any was.
     pub fn remembered(&self, name: &str) -> Result<Option<u64>, Unremembered> {
         let file = self.file(name);
+        // dyn: why the remembered turn could not be read, said once on that error.
         let unread = |why: &dyn std::fmt::Display| {
             Unremembered(format!(
                 "{}, where the turn of `{name}` is remembered, {why}: no list is taken in its \
@@ -307,7 +309,7 @@ pub fn keygen(file: &Path) -> anyhow::Result<()> {
 fn read_key(file: &Path) -> anyhow::Result<SigningKey> {
     let text = std::fs::read_to_string(file)
         .with_context(|| format!("reading the key in {}", file.display()))?;
-    let seed = unhex::<32>(text.trim())
+    let seed = decode::<32>(text.trim())
         .with_context(|| format!("{} does not hold a key", file.display()))?;
     Ok(SigningKey::from_bytes(&seed))
 }
@@ -316,17 +318,6 @@ fn read_key(file: &Path) -> anyhow::Result<SigningKey> {
 /// one for another, and the turn, so that nobody without the key makes an old list new.
 fn signed_bytes(name: &str, turn: u64, body: &str) -> Vec<u8> {
     format!("blaze list 2\n{name}\n{turn}\n{body}").into_bytes()
-}
-
-fn unhex<const N: usize>(text: &str) -> Option<[u8; N]> {
-    let mut bytes = [0; N];
-    if text.len() != N * 2 || !text.is_ascii() {
-        return None;
-    }
-    for (byte, pair) in bytes.iter_mut().zip(text.as_bytes().chunks(2)) {
-        *byte = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
-    }
-    Some(bytes)
 }
 
 #[cfg(test)]

@@ -60,7 +60,8 @@ use crate::{
 use super::{
     Binder, BoundExistentialPredicates, BoundTy, BoundTyKind, Clause, ClauseKind, Clauses, Const,
     ErrorGuaranteed, ExprConst, ExternalConstraints, GenericArg, GenericArgs, ParamConst, ParamEnv,
-    ParamTy, PredefinedOpaques, Predicate, SolverDefId, Term, Ty, TyKind, Tys, ValTree, ValueConst,
+    ParamTy, PredefinedOpaques, Predicate, SolverDefId, StoredTy, Term, Ty, TyKind, Tys, ValTree,
+    ValueConst,
     abi::Safety,
     fold::{BoundVarReplacer, BoundVarReplacerDelegate, FnMutDelegate},
     generics::{Generics, generics},
@@ -433,7 +434,7 @@ impl<'db> DbInterner<'db> {
             // As an approximation, when we call `new_with` we're trait solving, therefore we need the lang items.
             // This is also convenient since here we have a starting crate but not in `new_no_crate`.
             lang_items: Some(hir_def::lang_item::lang_items(db, krate)),
-            recursion_limit: hir_def::nameres::crate_def_map(db, krate).recursion_limit(),
+            recursion_limit: hir_def::nameres::crate_recursion_limit(db, krate),
             solved: tls_cache::Solved::new(),
             regions: false,
         }
@@ -448,6 +449,15 @@ impl<'db> DbInterner<'db> {
     #[inline]
     pub(crate) fn regions(&self) -> bool {
         self.regions
+    }
+
+    /// Runs `f` on this interner's global-goal table (see `global_goals`).
+    #[inline]
+    pub(crate) fn with_global_goals<R>(
+        self,
+        f: impl FnOnce(&super::global_goals::Goals) -> R,
+    ) -> R {
+        tls_cache::global_goals(self.db, self.krate, self.regions, f)
     }
 
     #[inline]
@@ -473,6 +483,12 @@ impl<'db> DbInterner<'db> {
     #[inline]
     pub(crate) fn expect_crate(&self) -> Crate {
         self.krate.expect("should have a crate")
+    }
+
+    /// The crate this interner solves for, if any.
+    #[inline]
+    pub(crate) fn krate(&self) -> Option<Crate> {
+        self.krate
     }
 }
 
@@ -2407,16 +2423,10 @@ impl<'db> Interner for DbInterner<'db> {
 
     fn coroutine_hidden_types(
         self,
-        _def_id: Self::CoroutineId,
+        def_id: Self::CoroutineId,
     ) -> EarlyBinder<Self, Binder<'db, CoroutineWitnessTypes<Self>>> {
-        // FIXME: Actually implement this.
-        EarlyBinder::bind(
-            self,
-            Binder::dummy(CoroutineWitnessTypes {
-                types: Tys::default(),
-                assumptions: RegionAssumptions::default(),
-            }),
-        )
+        let witnesses = self.db.coroutine_witnesses(def_id.0);
+        EarlyBinder::bind(self, bind_witness_regions(self, witnesses.iter().map(StoredTy::as_ref)))
     }
 
     fn is_default_trait(self, def_id: Self::TraitId) -> bool {
@@ -2565,6 +2575,38 @@ impl<'db> Interner for DbInterner<'db> {
     fn const_zst(self) -> Self::ValTree {
         ValTree::zst()
     }
+}
+
+/// rustc's `coroutine_hidden_types` over `mir_coroutine_witnesses`: the witness types under one
+/// binder, each free region erased (rustc's `erase_regions`) and then replaced by an anonymous
+/// bound region of its own, numbered in the order they are met; regions bound inside a witness
+/// stay. `assumptions` stays empty: rustc fills it (`compute_assumptions`) only for the old
+/// trait solver under `-Zhigher-ranked-assumptions`, and neither the new solver nor blaze reads
+/// it.
+pub(super) fn bind_witness_regions<'db>(
+    interner: DbInterner<'db>,
+    witnesses: impl Iterator<Item = Ty<'db>>,
+) -> Binder<'db, CoroutineWitnessTypes<DbInterner<'db>>> {
+    let mut vars = 0usize;
+    let types = Tys::new_from_iter(witnesses.map(|ty| {
+        rustc_type_ir::fold_regions(interner, ty, |region, debruijn| {
+            assert!(
+                !matches!(
+                    region.kind(),
+                    RegionKind::ReBound(..) | RegionKind::ReVar(_) | RegionKind::RePlaceholder(_)
+                ),
+                "a coroutine witness holds the region {region:?}, which MIR never keeps"
+            );
+            let var = BoundVar::from_usize(vars);
+            vars += 1;
+            Region::new_anon_bound(interner, debruijn, var)
+        })
+    }));
+    let anon = BoundVariableKind::Region(BoundRegionKind::Anon);
+    Binder::bind_with_vars(
+        CoroutineWitnessTypes { types, assumptions: RegionAssumptions::default() },
+        BoundVarKinds::new_from_iter(std::iter::repeat_n(anon, vars)),
+    )
 }
 
 fn is_ty_self(ty: Ty<'_>) -> bool {

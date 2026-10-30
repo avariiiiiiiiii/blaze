@@ -45,8 +45,9 @@ pub(crate) struct ActiveQuery {
     input_outputs: FxIndexSet<QueryEdge>,
 
     /// The value fingerprints of the inputs in `input_outputs` that were read with one, keyed by
-    /// the input's position there.
-    edge_fingerprints: ThinVec<EdgeFingerprint>,
+    /// the input's position there. Kept by the stack slot across runs; the memo gets a copy at
+    /// its exact length.
+    edge_fingerprints: Vec<EdgeFingerprint>,
 
     /// True if there was an untracked read.
     untracked_read: bool,
@@ -315,7 +316,8 @@ impl ActiveQuery {
             durability: Durability::MAX,
             changed_at: Revision::start(),
             input_outputs: FxIndexSet::default(),
-            edge_fingerprints: ThinVec::new(),
+            // alloc: `Vec::new` allocates nothing; the slot's runs reuse the buffer
+            edge_fingerprints: Vec::new(),
             untracked_read: false,
             disambiguator_map: Default::default(),
             tracked_struct_ids: Default::default(),
@@ -363,8 +365,7 @@ impl ActiveQuery {
             iteration,
             force_extra,
         );
-        let mut edge_fingerprints = mem::take(edge_fingerprints);
-        edge_fingerprints.shrink_to_fit();
+        let edge_fingerprints = exact_thin_vec(edge_fingerprints);
         QueryCompletion {
             changed_at,
             durability,
@@ -459,6 +460,18 @@ impl ActiveQuery {
             );
         }
     }
+}
+
+/// The memo's copy of a run's buffer, at its exact length and with nothing allocated for none,
+/// leaving the buffer empty and its capacity for the next run.
+pub(crate) fn exact_thin_vec<T>(buffer: &mut Vec<T>) -> ThinVec<T> {
+    if buffer.is_empty() {
+        return ThinVec::new();
+    }
+    // alloc: the memo's own fingerprints, made once at their exact length
+    let mut exact = ThinVec::with_capacity(buffer.len());
+    exact.extend(buffer.drain(..));
+    exact
 }
 
 pub(crate) struct DetachedInputOutputs(FxIndexSet<QueryEdge>);

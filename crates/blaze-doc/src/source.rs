@@ -5,7 +5,7 @@ use std::sync::Arc;
 use hir::{HirFileId, InFile};
 use ide_db::RootDatabase;
 use rustc_hash::FxHashMap;
-use syntax::{SyntaxNode, TextRange, TextSize};
+use syntax::{TextRange, TextSize, view as ast};
 
 use crate::{
     model::{SourceFile, Span},
@@ -61,8 +61,8 @@ impl Files {
     }
 
     /// The lines of a node, in the file it is written in (a macro's output maps to the call).
-    pub(crate) fn span(&self, db: &RootDatabase, node: InFile<&SyntaxNode>) -> Option<Span> {
-        let range = node.original_file_range_rooted(db);
+    pub(crate) fn span(&self, db: &RootDatabase, node: InFile<ast::Node<'_>>) -> Option<Span> {
+        let range = node.map(|it| it.text_range()).original_node_file_range_rooted(db);
         let file = range.file_id.file_id(db);
         let (krate, index, starts) = self.by_file.get(&file)?;
         let start = line_of(starts, range.range.start());

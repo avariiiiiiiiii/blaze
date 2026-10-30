@@ -3,7 +3,7 @@
 use std::{
     cmp::Ordering,
     fmt::{self, Display as _},
-    iter::{self, Peekable},
+    iter,
 };
 
 use crate::{
@@ -13,10 +13,12 @@ use crate::{
 };
 use base_db::{Db, Crate};
 use intern::{InternedSlice, Symbol, sym};
-use parser::T;
 use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
-use syntax::{AstNode, SyntaxToken, ast};
+use syntax::{
+    AstNode, ast,
+    view::{self, AstNode as _},
+};
 
 intern::impl_slice_internable!(PathSegments, (), Name);
 
@@ -30,8 +32,6 @@ pub struct ModPath {
 }
 
 const _: () = assert!(size_of::<ModPath>() == 16);
-
-intern::impl_internable!(ModPath);
 
 /// Segments are gathered here before they are interned: paths longer than this spill to the heap.
 type SegmentBuf = SmallVec<[Name; 8]>;
@@ -97,6 +97,15 @@ impl ModPath {
         span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
     ) -> Option<ModPath> {
         convert_path(db, path, span_for_range)
+    }
+
+    /// [`Self::from_src`] of a view.
+    pub fn from_src_view(
+        db: &Db,
+        path: view::Path<'_>,
+        span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
+    ) -> Option<ModPath> {
+        convert_path_view(db, path, span_for_range)
     }
 
     pub fn from_tt(db: &Db, tt: tt::TokenTreesView<'_>) -> Option<ModPath> {
@@ -381,6 +390,87 @@ fn convert_path(
     if names.len() == 1
         && kind == PathKind::Plain
         && let Some(_macro_call) = path.syntax().parent().and_then(ast::MacroCall::cast)
+    {
+        let syn_ctx = span_for_range(segment.syntax().text_range());
+        if let Some(macro_call_id) = syn_ctx.outer_expn(db)
+            && crate::MacroCallId::from(macro_call_id).loc(db).def.local_inner
+        {
+            kind = match resolve_crate_root(db, syn_ctx) {
+                Some(crate_root) => PathKind::DollarCrate(crate_root),
+                None => PathKind::Crate,
+            }
+        }
+    }
+
+    Some(ModPath { kind, segments: intern_segments(&names) })
+}
+
+/// [`convert_path`] of a view: the same body.
+fn convert_path_view(
+    db: &Db,
+    path: view::Path<'_>,
+    span_for_range: &mut (impl FnMut(::tt::TextRange) -> SyntaxContext + ?Sized),
+) -> Option<ModPath> {
+    let mut segments = path.segments();
+
+    let segment = segments.next()?;
+    let mut names = SegmentBuf::new_const();
+    let handle_super_kw = &mut |init_deg, names: &mut SegmentBuf| {
+        let mut deg = init_deg;
+        for segment in segments.by_ref() {
+            match segment.kind()? {
+                view::PathSegmentKind::SuperKw => deg += 1,
+                view::PathSegmentKind::Name(name) => {
+                    names.push(name.as_name());
+                    break;
+                }
+                view::PathSegmentKind::Type { .. }
+                | view::PathSegmentKind::SelfTypeKw
+                | view::PathSegmentKind::SelfKw
+                | view::PathSegmentKind::CrateKw => return None,
+            }
+        }
+        Some(PathKind::Super(deg))
+    };
+
+    let mut kind = match segment.kind()? {
+        view::PathSegmentKind::Name(name_ref) => {
+            if name_ref.text() == "$crate" {
+                resolve_crate_root(db, span_for_range(name_ref.syntax().text_range()))
+                    .map(PathKind::DollarCrate)
+                    .unwrap_or(PathKind::Crate)
+            } else {
+                names.push(name_ref.as_name());
+                segment.coloncolon_token().map_or(PathKind::Plain, |_| PathKind::Abs)
+            }
+        }
+        view::PathSegmentKind::SelfTypeKw => {
+            names.push(Name::new_symbol_root(sym::Self_));
+            PathKind::Plain
+        }
+        view::PathSegmentKind::CrateKw => PathKind::Crate,
+        view::PathSegmentKind::SelfKw => handle_super_kw(0, &mut names)?,
+        view::PathSegmentKind::SuperKw => handle_super_kw(1, &mut names)?,
+        view::PathSegmentKind::Type { .. } => {
+            // not allowed in imports
+            return None;
+        }
+    };
+
+    for segment in segments {
+        let name = match segment.kind()? {
+            view::PathSegmentKind::Name(name) => name.as_name(),
+            view::PathSegmentKind::SelfKw => continue,
+            view::PathSegmentKind::SelfTypeKw => Name::new_symbol_root(sym::Self_),
+            _ => return None,
+        };
+        names.push(name);
+    }
+
+    // `local_inner_macros`, as `convert_path` handles it.
+    if names.len() == 1
+        && kind == PathKind::Plain
+        && let Some(_macro_call) = path.syntax().parent().and_then(view::MacroCall::cast)
     {
         let syn_ctx = span_for_range(segment.syntax().text_range());
         if let Some(macro_call_id) = syn_ctx.outer_expn(db)

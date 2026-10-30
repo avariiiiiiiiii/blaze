@@ -5,7 +5,7 @@
 //! (MIT or Apache-2.0).
 
 use hir::InFile;
-use syntax::{AstNode, ast};
+use syntax::view::{self as ast, AstNode as _};
 
 use super::binary_operator_cannot_be_applied::code_fact;
 use crate::{
@@ -15,24 +15,25 @@ use crate::{
 };
 
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::CastToUnsized<'db>) -> Vec<Found> {
-    let node = cx.node(d.expr);
+    let node = cx.node_view(d.expr);
     let file = node.file_id;
     let span = cx.span_of_ptr(d.expr);
-    let cast = match node.value.clone().left() {
+    let cast = match node.value.left() {
         Some(ast::Expr::CastExpr(it)) => Some(it),
         _ => None,
     };
-    let operand = cast.as_ref().and_then(|it| it.expr());
-    let expr_ty = operand.as_ref().and_then(|it| cx.sema.type_of_expr(it)).map(|it| it.original);
-    let expr_span = operand.as_ref().map(|it| cx.span(InFile::new(file, it.syntax().text_range())));
+    let operand = cast.and_then(|it| it.expr());
+    let expr_ty = operand.and_then(|it| cx.vsema.type_of_expr(it)).map(|it| it.original);
+    let expr_span = operand.map(|it| cx.span(InFile::new(file, it.syntax().text_range())));
     let cast_span = cast
-        .as_ref()
         .and_then(|it| it.ty())
         .map(|it| cx.span(InFile::new(file, it.syntax().text_range())));
 
+    // alloc: a type printed for the error's message
     let expr_str = expr_ty.as_ref().map_or_else(|| "_".to_owned(), |it| cx.ty(it));
     let mut diag = Diag::error(
         Some("E0620"),
+        // alloc: the error's message
         format!("cast to unsized type: `{expr_str}` as `{}`", cx.ty(&d.cast_ty)),
         span,
     );
@@ -52,9 +53,10 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::CastToUnsized<'db>) -> Vec<F
         (Some(ty), Some(cast_span)) if is_box(cx, ty) => {
             diag.multipart_suggestion(
                 "you can cast to a `Box` instead",
+                // alloc: the suggestion's parts
                 vec![
-                    (cast_span.shrink_to_lo(), "Box<".to_owned()),
-                    (cast_span.shrink_to_hi(), ">".to_owned()),
+                    (cast_span.shrink_to_lo(), "Box<".to_owned()), // alloc: the suggestion's text
+                    (cast_span.shrink_to_hi(), ">".to_owned()),    // alloc: the suggestion's text
                 ],
                 Applicability::MachineApplicable,
             );
@@ -66,7 +68,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::CastToUnsized<'db>) -> Vec<F
         }
     }
     code_fact(cx, d.expr.map(|it| it.syntax_node_ptr()), &mut diag);
-    vec![Found::new(diag, Phase::Bodies)]
+    vec![Found::new(diag, Phase::Bodies)] // alloc: the error found
 }
 
 /// Whether `ty` is the lang item `owned_box`, rustc's `AdtDef::is_box`.

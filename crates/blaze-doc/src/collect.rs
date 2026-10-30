@@ -5,12 +5,15 @@ use std::cell::RefCell;
 
 use either::Either;
 use hir::{
-    AssocItem, Crate, HasAttrs, HasCrate, HasSource, HasVisibility, Impl, InFile, ModuleDef,
-    Visibility,
+    AssocItem, Crate, HasAttrs, HasCrate, HasVisibility, Impl, InFile, ModuleDef, Visibility,
+    view::HasSourceView,
 };
 use ide_db::RootDatabase;
 use rustc_hash::{FxHashMap, FxHashSet};
-use syntax::{AstNode, SyntaxKind, T, TextRange, TextSize, ast};
+use syntax::{
+    SyntaxKind, T, TextRange, TextSize,
+    view::{self as ast, AstNode},
+};
 
 use crate::{
     attrs,
@@ -591,54 +594,58 @@ impl Builder<'_> {
     fn source_and_notes(&self, def: ModuleDef) -> (Option<Span>, Notes) {
         let db = self.db;
         let mut notes = Notes::default();
-        let node: Option<InFile<ast::AnyHasAttrs>> = match def {
+        let node: Option<InFile<ast::AnyHasAttrs<'_>>> = match def {
             ModuleDef::Module(it) => {
-                it.declaration_source(db).map(|src| src.map(ast::AnyHasAttrs::new))
+                it.declaration_source_view(db).map(|src| src.map(ast::AnyHasAttrs::new))
             }
-            ModuleDef::Function(it) => it.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
+            ModuleDef::Function(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
             ModuleDef::Adt(hir::Adt::Struct(it)) => {
-                it.source(db).map(|s| s.map(ast::AnyHasAttrs::new))
+                it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new))
             }
             ModuleDef::Adt(hir::Adt::Enum(it)) => {
-                it.source(db).map(|s| s.map(ast::AnyHasAttrs::new))
+                it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new))
             }
             ModuleDef::Adt(hir::Adt::Union(it)) => {
-                it.source(db).map(|s| s.map(ast::AnyHasAttrs::new))
+                it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new))
             }
-            ModuleDef::Const(it) => it.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
-            ModuleDef::Static(it) => it.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
-            ModuleDef::Trait(it) => it.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
-            ModuleDef::TypeAlias(it) => it.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
-            ModuleDef::Macro(it) => it.source(db).map(|s| {
+            ModuleDef::Const(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
+            ModuleDef::Static(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
+            ModuleDef::Trait(it) => it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
+            ModuleDef::TypeAlias(it) => {
+                it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new))
+            }
+            ModuleDef::Macro(it) => it.source_view(db).map(|s| {
                 s.map(|it| match it {
                     Either::Left(mac) => ast::AnyHasAttrs::new(mac),
                     Either::Right(func) => ast::AnyHasAttrs::new(func),
                 })
             }),
-            ModuleDef::EnumVariant(it) => it.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
+            ModuleDef::EnumVariant(it) => {
+                it.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new))
+            }
             ModuleDef::BuiltinType(_) => None,
         };
-        let span = match (def, &node) {
+        let span = match (def, node) {
             // A module's lines are its file's, or its inline body's.
             (ModuleDef::Module(it), _) => {
-                let src = it.definition_source(db);
-                let syntax = match &src.value {
-                    hir::ModuleSource::SourceFile(file) => file.syntax().clone(),
-                    hir::ModuleSource::Module(module) => module.syntax().clone(),
-                    hir::ModuleSource::BlockExpr(block) => block.syntax().clone(),
+                let src = it.definition_source_view(db);
+                let syntax = match src.value {
+                    hir::ModuleSourceView::SourceFile(file) => file.syntax(),
+                    hir::ModuleSourceView::Module(module) => module.syntax(),
+                    hir::ModuleSourceView::BlockExpr(block) => block.syntax(),
                 };
-                self.files.span(db, src.with_value(&syntax))
+                self.files.span(db, src.with_value(syntax))
             }
-            (_, Some(node)) => self.files.span(db, node.as_ref().map(|it| it.syntax())),
+            (_, Some(node)) => self.files.span(db, node.map(|it| it.syntax())),
             _ => None,
         };
-        if let Some(node) = &node {
+        if let Some(node) = node {
             let flags = def.attrs(db);
             if flags.is_deprecated() {
                 notes.deprecated =
-                    attrs::deprecation(&node.value).or_else(|| Some(Default::default()));
+                    attrs::deprecation(node.value).or_else(|| Some(Default::default()));
             }
-            notes.cfg = attrs::doc_cfg(&node.value);
+            notes.cfg = attrs::doc_cfg(node.value);
         }
         notes.must_use = must_use(db, def);
         (span, notes)
@@ -646,16 +653,16 @@ impl Builder<'_> {
 
     fn member_notes(
         &self,
-        node: Option<InFile<ast::AnyHasAttrs>>,
+        node: Option<InFile<ast::AnyHasAttrs<'_>>>,
         deprecated: bool,
     ) -> (Option<Span>, Notes) {
         let mut notes = Notes::default();
         let Some(node) = node else { return (None, notes) };
-        let span = self.files.span(self.db, node.as_ref().map(|it| it.syntax()));
+        let span = self.files.span(self.db, node.map(|it| it.syntax()));
         if deprecated {
-            notes.deprecated = attrs::deprecation(&node.value).or_else(|| Some(Default::default()));
+            notes.deprecated = attrs::deprecation(node.value).or_else(|| Some(Default::default()));
         }
-        notes.cfg = attrs::doc_cfg(&node.value);
+        notes.cfg = attrs::doc_cfg(node.value);
         (span, notes)
     }
 
@@ -678,10 +685,10 @@ impl Builder<'_> {
         let mut decl = Code::default();
         decl.push(Piece::Name(name.clone(), Kind::StructField)).text(": ");
         decl.extend(sig::field_type(db, places, field));
-        let node = field.source(db).map(|src| {
+        let node = field.source_view(db).map(|src| {
             src.map(|it| match it {
-                hir::FieldSource::Named(it) => ast::AnyHasAttrs::new(it),
-                hir::FieldSource::Pos(it) => ast::AnyHasAttrs::new(it),
+                hir::FieldSourceView::Named(it) => ast::AnyHasAttrs::new(it),
+                hir::FieldSourceView::Pos(it) => ast::AnyHasAttrs::new(it),
             })
         });
         let (source, notes) = self.member_notes(node, field.attrs(db).is_deprecated());
@@ -733,7 +740,7 @@ impl Builder<'_> {
 
     fn variant(&self, variant: hir::EnumVariant, places: Linking<'_>) -> Member {
         let db = self.db;
-        let node = variant.source(db).map(|s| s.map(ast::AnyHasAttrs::new));
+        let node = variant.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new));
         let (source, notes) = self.member_notes(node, variant.attrs(db).is_deprecated());
         let fields = variant.fields(db);
         let named = variant.kind(db) == hir::StructKind::Record;
@@ -774,7 +781,7 @@ impl Builder<'_> {
                 (
                     kind,
                     decl,
-                    f.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
+                    f.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
                     in_trait && f.has_body(db),
                 )
             }
@@ -783,7 +790,7 @@ impl Builder<'_> {
                 (
                     Kind::AssocConst,
                     decl,
-                    c.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
+                    c.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
                     in_trait && c.has_body(db),
                 )
             }
@@ -792,7 +799,7 @@ impl Builder<'_> {
                 (
                     Kind::AssocType,
                     decl,
-                    t.source(db).map(|s| s.map(ast::AnyHasAttrs::new)),
+                    t.source_view(db).map(|s| s.map(ast::AnyHasAttrs::new)),
                     in_trait && t.has_type(db),
                 )
             }
@@ -851,28 +858,20 @@ impl Builder<'_> {
             return out;
         }
         out.text(if has_where { "\n{\n" } else { " {\n" });
-        let groups: [(&str, &str, Box<dyn Fn(&Member) -> bool>); 5] = [
+        let groups: [(&str, &str, fn(&Member) -> bool); 5] = [
             (
                 "Required associated type",
                 "Required associated types",
-                Box::new(|m: &Member| m.kind == Kind::AssocType && !m.provided),
+                |m: &Member| m.kind == Kind::AssocType && !m.provided,
             ),
             (
                 "Provided associated type",
                 "Provided associated types",
-                Box::new(|m: &Member| m.kind == Kind::AssocType && m.provided),
+                |m: &Member| m.kind == Kind::AssocType && m.provided,
             ),
-            (
-                "Associated constant",
-                "Associated constants",
-                Box::new(|m: &Member| m.kind == Kind::AssocConst),
-            ),
-            (
-                "Required method",
-                "Required methods",
-                Box::new(|m: &Member| m.kind == Kind::TyMethod),
-            ),
-            ("Provided method", "Provided methods", Box::new(|m: &Member| m.kind == Kind::Method)),
+            ("Associated constant", "Associated constants", |m: &Member| m.kind == Kind::AssocConst),
+            ("Required method", "Required methods", |m: &Member| m.kind == Kind::TyMethod),
+            ("Provided method", "Provided methods", |m: &Member| m.kind == Kind::Method),
         ];
         let mut first = true;
         for (one, many, wanted) in groups {
@@ -1031,8 +1030,8 @@ impl Builder<'_> {
         }
         let source = match hir_def::ImplId::try_from(imp) {
             Ok(_) => imp
-                .source(db)
-                .and_then(|src| self.files.span(db, src.as_ref().map(|it| it.syntax()))),
+                .source_view(db)
+                .and_then(|src| self.files.span(db, src.map(|it| it.syntax()))),
             Err(_) => None,
         };
         let docs = self.doc(imp, None);
@@ -1424,7 +1423,7 @@ impl Builder<'_> {
             out.text(" ").push(Piece::Comment("/* proc-macro */".to_owned())).text(" }");
             return out;
         }
-        let Some(source) = mac.source(db) else { return out };
+        let Some(source) = mac.source_view(db) else { return out };
         match source.value {
             Either::Left(ast::Macro::MacroRules(rules)) => {
                 out.kw("macro_rules!")
@@ -1432,7 +1431,7 @@ impl Builder<'_> {
                     .push(Piece::Name(name.to_owned(), Kind::Macro))
                     .text(" {\n");
                 if let Some(tt) = rules.token_tree() {
-                    for pattern in macro_rule_patterns(&tt) {
+                    for pattern in macro_rule_patterns(tt) {
                         out.text(format!("    {pattern} => {{ ... }};\n"));
                     }
                 }
@@ -1442,11 +1441,11 @@ impl Builder<'_> {
                 sig::visibility(db, &mut out, mac.visibility(db), mac.module(db));
                 out.kw("macro").text(" ").push(Piece::Name(name.to_owned(), Kind::Macro));
                 if let Some(args) = def.args() {
-                    out.text(squash(&args.syntax().text().to_string()));
+                    out.text(squash(args.syntax().text()));
                     out.text(" { ... }");
                 } else if let Some(body) = def.body() {
                     out.text(" {\n");
-                    for pattern in macro_rule_patterns(&body) {
+                    for pattern in macro_rule_patterns(body) {
                         out.text(format!("    {pattern} => {{ ... }},\n"));
                     }
                     out.text("}");
@@ -1599,14 +1598,14 @@ fn blanket_applies(db: &RootDatabase, imp: Impl, ty: &hir::Type<'_>, krate: Crat
 }
 
 /// The patterns of a `macro_rules!`'s rules, each as written on one line.
-fn macro_rule_patterns(tt: &ast::TokenTree) -> Vec<String> {
+fn macro_rule_patterns(tt: ast::TokenTree<'_>) -> Vec<String> {
     let mut out = vec![];
     let mut expect_pattern = true;
     for child in tt.syntax().children_with_tokens() {
         match child {
             syntax::NodeOrToken::Node(node) => {
                 if expect_pattern && let Some(pattern) = ast::TokenTree::cast(node) {
-                    out.push(squash(&pattern.syntax().text().to_string()));
+                    out.push(squash(pattern.syntax().text()));
                     expect_pattern = false;
                 }
             }

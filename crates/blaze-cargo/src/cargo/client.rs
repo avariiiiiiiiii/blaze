@@ -164,22 +164,28 @@ enum Got {
 /// `replaces` it, and answers as one of another version.
 fn exchange(stream: &mut UnixStream, envelope: &[u8], replaces: bool) -> anyhow::Result<Reply> {
     stream.write_all(envelope)?;
-    stream.set_read_timeout(Some(TICK))?;
+    let mut timeout = TICK;
+    stream.set_read_timeout(Some(timeout))?;
     let mut shown = say::Shown::new();
     // What was read and is not a whole frame yet.
     let mut got = Vec::new();
     let mut chunk = vec![0; 64 << 10];
+    // The records of one read, shown together.
+    let mut records = Vec::new();
     loop {
+        records.clear();
         while let Some(next) =
             next(&mut got).context("the daemon's answer is not one of this version")?
         {
             match next {
-                Got::Answer(Answer::Record(record)) => shown.record(&record),
+                Got::Answer(Answer::Record(record)) => records.push(record),
                 Got::Answer(Answer::Reply(reply)) => {
+                    shown.records(&records);
                     shown.done();
                     return Ok(reply);
                 }
                 Got::Older(line) => {
+                    shown.records(&records);
                     drop(shown);
                     let reply = serde_json::from_str::<Reply>(&line);
                     let version = match reply {
@@ -192,6 +198,14 @@ fn exchange(stream: &mut UnixStream, envelope: &[u8], replaces: bool) -> anyhow:
                     return Ok(Reply::Restart { version });
                 }
             }
+        }
+        shown.records(&records);
+        // A frame the view held back is drawn when it is due, not a whole tick later; the
+        // socket refuses a timeout of zero.
+        let wait = shown.due().map_or(TICK, |due| due.min(TICK)).max(Duration::from_millis(1));
+        if wait != timeout {
+            stream.set_read_timeout(Some(wait))?;
+            timeout = wait;
         }
         match std::io::Read::read(stream, &mut chunk) {
             Ok(0) => break,

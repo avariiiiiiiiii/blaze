@@ -25,12 +25,12 @@ use std::{any::Any, collections::hash_map::Entry, mem, path::Path, sync};
 
 use crossbeam_channel::unbounded;
 use hir_expand::proc_macro::{
-    ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
+    ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
 };
 use ide_db::{
     ChangeWithProcMacros, FxHashMap, FxHashSet, RootDatabase,
     base_db::{
-        Crate, CrateGraphBuilder, Db, Env, LibraryRoots, LocalRoots, ProcMacroLoadingError,
+        Crate, CrateGraphBuilder, Db, LibraryRoots, LocalRoots, ProcMacroLoadingError,
         SourceRoot, SourceRootId,
         salsa::{Database as _, Durability, Setter},
     },
@@ -74,15 +74,14 @@ pub fn load_workspace_at(
     root: &Path,
     cargo_config: &CargoConfig,
     load_config: &LoadCargoConfig,
-    progress: &(dyn Fn(String) + Sync),
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs, Option<ProcMacroClient>)> {
     let root = AbsPathBuf::assert_utf8(std::env::current_dir()?.join(root));
     let root = ProjectManifest::discover_single(&root)?;
     let manifest_path = root.manifest_path().clone();
-    let mut workspace = ProjectWorkspace::load(root, cargo_config, progress)?;
+    let mut workspace = ProjectWorkspace::load(root, cargo_config)?;
 
     if load_config.load_out_dirs_from_check {
-        let build_scripts = workspace.run_build_scripts(cargo_config, progress)?;
+        let build_scripts = workspace.run_build_scripts(cargo_config)?;
         if let Some(error) = build_scripts.error() {
             tracing::debug!(
                 "Errors occurred while running build scripts for {}: {}",
@@ -136,7 +135,7 @@ pub fn load_workspaces_into_db(
 
     if load_config.prefill_caches {
         let all = ide_db::base_db::all_crates(db);
-        prime_caches::parallel_prime_caches(db, &all, load_config.num_worker_threads, &|_| ());
+        prime_caches::parallel_prime_caches(db, &all, load_config.num_worker_threads);
     }
 
     Ok((vfs, loaded.proc_macro_server.and_then(Result::ok)))
@@ -914,13 +913,7 @@ impl ProcMacroExpander for Expander {
     fn expand(
         &self,
         db: &Db,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
+        ProcMacroCall { subtree, attrs, env, def_site, call_site, mixed_site, current_dir }: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         let cb = |req| Ok(answer(db, req));
         match self.0.expand(
@@ -930,7 +923,7 @@ impl ProcMacroExpander for Expander {
             def_site,
             call_site,
             mixed_site,
-            current_dir,
+            current_dir.to_owned(), // alloc: the proc-macro server's message owns its directory; once per call
             Some(&cb),
         ) {
             Ok(Ok(subtree)) => Ok(subtree),
@@ -939,8 +932,9 @@ impl ProcMacroExpander for Expander {
         }
     }
 
+    // dyn: hir-expand's comparison of expanders, when a crate's macros are set, not per expansion
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        (other as &dyn Any).downcast_ref::<Self>() == Some(self)
+        (other as &dyn Any).downcast_ref::<Self>() == Some(self) // dyn: as above
     }
 }
 
@@ -1160,7 +1154,7 @@ mod tests {
             num_worker_threads: 1,
             proc_macro_processes: 1,
         };
-        let workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_| {}).unwrap();
+        let workspace = ProjectWorkspace::load(manifest, &cargo_config).unwrap();
         let (db, _vfs, _proc_macro) =
             load_workspace(workspace, &cargo_config.extra_env, &load_cargo_config).unwrap();
 

@@ -13,16 +13,15 @@
 use blaze_items::{Fact, ItemId};
 use either::Either;
 use hir::{
-    Adt, AsAssocItem as _, AssocItemContainer, GenericDef, HasSource as _, HirFileId, InFile,
-    IncorrectGenericsLenKind,
+    Adt, AsAssocItem as _, AssocItemContainer, GenericDef, HirFileId, InFile, IncorrectGenericsLenKind,
 };
 use hir_def::{
     ImplId, TraitId,
     signatures::{TraitFlags, TraitSignature},
 };
 use syntax::{
-    AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, TextRange,
-    ast::{self, HasArgList as _, HasGenericArgs as _, HasName as _},
+    AstPtr, TextRange,
+    view::{self as ast, AstNode as _, HasArgList as _, HasGenericArgs as _, HasName as _},
 };
 
 use crate::{
@@ -33,50 +32,46 @@ use crate::{
 };
 
 /// The path segment, method call or associated type binding generic arguments are given to.
-pub(crate) struct Segment {
+pub(crate) struct Segment<'db> {
     pub(crate) file: HirFileId,
     /// Its name: the segment's, the method's or the associated type's.
-    pub(crate) name: ast::NameRef,
+    pub(crate) name: ast::NameRef<'db>,
     /// Its arguments in angle brackets, when it has them.
-    pub(crate) list: Option<ast::GenericArgList>,
+    pub(crate) list: Option<ast::GenericArgList<'db>>,
     /// The segment, the method call or the binding.
-    pub(crate) node: SyntaxNode,
+    pub(crate) node: ast::Node<'db>,
 }
 
-impl Segment {
+impl<'db> Segment<'db> {
     /// The segment hir's diagnostics point to by its arguments, or by its name when it has none.
     pub(crate) fn of(
-        cx: &Cx<'_, '_>,
-        ptr: InFile<AstPtr<Either<ast::GenericArgList, ast::NameRef>>>,
-    ) -> Option<Segment> {
-        let node = cx.node(ptr);
-        let file = node.file_id;
+        cx: &Cx<'_, 'db>,
+        ptr: InFile<AstPtr<Either<syntax::ast::GenericArgList, syntax::ast::NameRef>>>,
+    ) -> Option<Segment<'db>> {
+        let node = cx.node_view(ptr);
         let (list, owner) = match node.value {
-            Either::Left(list) => {
-                let owner = list.syntax().parent()?;
-                (Some(list), owner)
-            }
+            Either::Left(list) => (Some(list), list.syntax().parent()?),
             Either::Right(name) => (None, name.syntax().parent()?),
         };
-        Segment::of_node(file, owner, list)
+        Segment::of_node(node.file_id, owner, list)
     }
 
     /// The segment `node` is: a path segment, a method call or an associated type binding.
     pub(crate) fn of_node(
         file: HirFileId,
-        node: SyntaxNode,
-        list: Option<ast::GenericArgList>,
-    ) -> Option<Segment> {
-        let name = if let Some(it) = ast::PathSegment::cast(node.clone()) {
+        node: ast::Node<'db>,
+        list: Option<ast::GenericArgList<'db>>,
+    ) -> Option<Segment<'db>> {
+        let name = if let Some(it) = ast::PathSegment::cast(node) {
             it.name_ref()?
-        } else if let Some(it) = ast::MethodCallExpr::cast(node.clone()) {
+        } else if let Some(it) = ast::MethodCallExpr::cast(node) {
             it.name_ref()?
         } else {
-            ast::AssocTypeArg::cast(node.clone())?.name_ref()?
+            ast::AssocTypeArg::cast(node)?.name_ref()?
         };
         let list = match list {
             Some(it) => Some(it),
-            None => generic_arg_list(&node),
+            None => generic_arg_list(node),
         };
         Some(Segment { file, name, list, node })
     }
@@ -85,46 +80,51 @@ impl Segment {
         cx.span(InFile::new(self.file, range))
     }
 
-    pub(crate) fn span_of(&self, cx: &Cx<'_, '_>, node: &impl AstNode) -> Span {
+    pub(crate) fn span_of<'t>(&self, cx: &Cx<'_, '_>, node: impl ast::AstNode<'t>) -> Span {
         self.span(cx, node.syntax().text_range())
     }
 
     pub(crate) fn name_span(&self, cx: &Cx<'_, '_>) -> Span {
-        self.span_of(cx, &self.name)
+        self.span_of(cx, self.name)
     }
 
     pub(crate) fn name_text(&self) -> String {
+        // alloc: the error's text, for an error hir found
         self.name.text().to_string()
     }
 
     /// Its generic arguments, without the associated item constraints: rustc's
     /// `GenericArgs::args`.
-    pub(crate) fn args(&self) -> Vec<ast::GenericArg> {
-        let Some(list) = &self.list else { return Vec::new() };
+    pub(crate) fn args(&self) -> Vec<ast::GenericArg<'db>> {
+        // alloc: empty, allocates nothing
+        let Some(list) = self.list else { return Vec::new() };
+        // alloc: the arguments the error counts, for an error hir found
         list.generic_args().filter(|it| !matches!(it, ast::GenericArg::AssocTypeArg(_))).collect()
     }
 
     /// Its associated item constraints: rustc's `GenericArgs::constraints`.
-    pub(crate) fn constraints(&self) -> Vec<ast::AssocTypeArg> {
-        let Some(list) = &self.list else { return Vec::new() };
+    pub(crate) fn constraints(&self) -> Vec<ast::AssocTypeArg<'db>> {
+        // alloc: empty, allocates nothing
+        let Some(list) = self.list else { return Vec::new() };
         list.generic_args()
             .filter_map(|it| match it {
                 ast::GenericArg::AssocTypeArg(it) => Some(it),
                 _ => None,
             })
+            // alloc: the constraints the error counts, for an error hir found
             .collect()
     }
 
     /// The `Fn`-style arguments of a path segment, `Trait(A) -> B`.
-    pub(crate) fn parenthesized(&self) -> Option<ast::ParenthesizedArgList> {
-        ast::PathSegment::cast(self.node.clone())?.parenthesized_arg_list()
+    pub(crate) fn parenthesized(&self) -> Option<ast::ParenthesizedArgList<'db>> {
+        ast::PathSegment::cast(self.node)?.parenthesized_arg_list()
     }
 
     /// rustc's `GenericArgs::span_ext`: the arguments with their brackets, from `<` to `>` (the
     /// `::` of a turbofish left out), or the parentheses and the return type of `Fn`-style
     /// ones.
     pub(crate) fn span_ext(&self) -> Option<TextRange> {
-        if let Some(list) = &self.list {
+        if let Some(list) = self.list {
             let start = match list.l_angle_token() {
                 Some(it) => it.text_range().start(),
                 None => list.syntax().text_range().start(),
@@ -132,7 +132,7 @@ impl Segment {
             return Some(TextRange::new(start, list.syntax().text_range().end()));
         }
         let args = self.parenthesized()?;
-        let end = match ast::PathSegment::cast(self.node.clone()).and_then(|it| it.ret_type()) {
+        let end = match ast::PathSegment::cast(self.node).and_then(|it| it.ret_type()) {
             Some(ret) => ret.syntax().text_range().end(),
             None => args.syntax().text_range().end(),
         };
@@ -141,7 +141,7 @@ impl Segment {
 
     /// rustc's `GenericArgs::span`: what is between the angle brackets.
     pub(crate) fn inner_range(&self) -> Option<TextRange> {
-        let list = self.list.as_ref()?;
+        let list = self.list?;
         let start = list.l_angle_token()?.text_range().end();
         let end = match list.r_angle_token() {
             Some(it) => it.text_range().start(),
@@ -151,19 +151,19 @@ impl Segment {
     }
 
     /// The whole path the segment is of, when it is a path segment.
-    pub(crate) fn path(&self) -> Option<ast::Path> {
-        Some(ast::PathSegment::cast(self.node.clone())?.parent_path().top_path())
+    pub(crate) fn path(&self) -> Option<ast::Path<'db>> {
+        Some(ast::PathSegment::cast(self.node)?.parent_path().top_path())
     }
 }
 
-fn generic_arg_list(node: &SyntaxNode) -> Option<ast::GenericArgList> {
-    if let Some(it) = ast::PathSegment::cast(node.clone()) {
+fn generic_arg_list(node: ast::Node<'_>) -> Option<ast::GenericArgList<'_>> {
+    if let Some(it) = ast::PathSegment::cast(node) {
         return it.generic_arg_list();
     }
-    if let Some(it) = ast::MethodCallExpr::cast(node.clone()) {
+    if let Some(it) = ast::MethodCallExpr::cast(node) {
         return it.generic_arg_list();
     }
-    ast::AssocTypeArg::cast(node.clone())?.generic_arg_list()
+    ast::AssocTypeArg::cast(node)?.generic_arg_list()
 }
 
 /// rustc's `def_descr` of a definition: "struct", "trait", "method", "associated type", ..
@@ -214,6 +214,7 @@ pub(crate) fn module_def(def: GenericDef) -> Option<hir::ModuleDef> {
 pub(crate) fn def_path(cx: &Cx<'_, '_>, def: GenericDef) -> String {
     match module_def(def) {
         Some(it) => cx.def_path(it),
+        // alloc: the error's text, for an error hir found
         None => def_descr(cx, def).to_owned(),
     }
 }
@@ -221,7 +222,9 @@ pub(crate) fn def_path(cx: &Cx<'_, '_>, def: GenericDef) -> String {
 /// The definition's name as written, for "`Ty`" in a fact.
 pub(crate) fn def_name(cx: &Cx<'_, '_>, def: GenericDef) -> String {
     match def.name(cx.db) {
+        // alloc: the error's text, for an error hir found
         Some(it) => it.display(cx.db, cx.edition).to_string(),
+        // alloc: the error's text, for an error hir found
         None => def_descr(cx, def).to_owned(),
     }
 }
@@ -241,24 +244,25 @@ pub(crate) fn item_id(def: GenericDef) -> Option<ItemId> {
 /// Records the fact of the generics of `def`: what changes when its parameters do.
 pub(crate) fn generics_fact(cx: &Cx<'_, '_>, diag: &mut Diag, def: GenericDef) {
     if let Some(item) = item_id(def) {
+        // alloc: the error's text, for an error hir found
         diag.fact(Fact::Signature(cx.key(item)), format!("the generics of `{}`", def_name(cx, def)));
     }
 }
 
 /// rustc's `def_ident_span`: the definition's name where it is written.
 pub(crate) fn def_name_span(cx: &Cx<'_, '_>, def: GenericDef) -> Option<Span> {
-    let db = cx.db;
-    fn named<N: ast::HasName>(it: InFile<N>) -> Option<InFile<TextRange>> {
+    let sema = &cx.vsema;
+    fn named<'t, N: ast::HasName<'t>>(it: InFile<N>) -> Option<InFile<TextRange>> {
         let name = it.value.name()?;
         Some(it.with_value(name.syntax().text_range()))
     }
     let at = match def {
-        GenericDef::Function(it) => named(it.source(db)?),
-        GenericDef::Adt(it) => named(it.source(db)?),
-        GenericDef::Trait(it) => named(it.source(db)?),
-        GenericDef::TypeAlias(it) => named(it.source(db)?),
-        GenericDef::Const(it) => named(it.source(db)?),
-        GenericDef::Static(it) => named(it.source(db)?),
+        GenericDef::Function(it) => named(sema.source(it)?),
+        GenericDef::Adt(it) => named(sema.source(it)?),
+        GenericDef::Trait(it) => named(sema.source(it)?),
+        GenericDef::TypeAlias(it) => named(sema.source(it)?),
+        GenericDef::Const(it) => named(sema.source(it)?),
+        GenericDef::Static(it) => named(sema.source(it)?),
         GenericDef::Impl(_) => None,
     }?;
     Some(cx.span(at))
@@ -280,17 +284,19 @@ pub(crate) fn lifetime_params(cx: &Cx<'_, '_>, def: GenericDef) -> Vec<Param> {
     def.lifetime_params(db)
         .into_iter()
         .map(|param| {
-            let span = param.source(db).and_then(|src| {
+            let span = cx.vsema.source(param).and_then(|src| {
                 let lifetime = src.value.lifetime()?;
                 Some(cx.span(src.with_value(lifetime.syntax().text_range())))
             });
             Param {
+                // alloc: the error's text, for an error hir found
                 name: param.name(db).display(db, cx.edition).to_string(),
                 span,
                 is_type: false,
                 has_default: false,
             }
         })
+        // alloc: the parameters the error names, for an error hir found
         .collect()
 }
 
@@ -305,9 +311,10 @@ pub(crate) fn type_or_const_params(cx: &Cx<'_, '_>, def: GenericDef) -> Vec<Para
             Either::Right(it) => !it.is_implicit(db),
         })
         .map(|param| {
+            // alloc: the error's text, for an error hir found
             let name = param.name(db).display(db, cx.edition).to_string();
-            let source = param.source(db);
-            let (range, is_type, has_default) = match source.as_ref().map(|it| &it.value) {
+            let source = cx.vsema.source(param);
+            let (range, is_type, has_default) = match source.map(|it| it.value) {
                 Some(Either::Left(ast::TypeOrConstParam::Type(it))) => {
                     let start = match it.name() {
                         Some(name) => name.syntax().text_range().start(),
@@ -339,6 +346,7 @@ pub(crate) fn type_or_const_params(cx: &Cx<'_, '_>, def: GenericDef) -> Vec<Para
             };
             Param { name, span, is_type, has_default }
         })
+        // alloc: the parameters the error names, for an error hir found
         .collect()
 }
 
@@ -362,14 +370,14 @@ pub(crate) enum Site {
 
 /// Whether `node` is in a body (of a function, a const, a static, or an anonymous const in
 /// a signature) or in an item's signature.
-pub(crate) fn site(node: &SyntaxNode) -> Site {
+pub(crate) fn site(node: ast::Node<'_>) -> Site {
     let range = node.text_range();
     for ancestor in node.ancestors() {
         if ast::ConstArg::can_cast(ancestor.kind()) || ast::BlockExpr::can_cast(ancestor.kind()) {
             return Site::Body;
         }
         let Some(item) = ast::Item::cast(ancestor) else { continue };
-        let body = match &item {
+        let body = match item {
             ast::Item::Fn(it) => it.body().map(|it| it.syntax().text_range()),
             ast::Item::Const(it) => it.body().map(|it| it.syntax().text_range()),
             ast::Item::Static(it) => it.body().map(|it| it.syntax().text_range()),
@@ -385,7 +393,7 @@ pub(crate) fn site(node: &SyntaxNode) -> Site {
 
 /// The pass rustc gives an error of generic arguments in: the checks of items for a path in a
 /// signature, type checking for one in a body.
-pub(crate) fn phase_at(node: &SyntaxNode) -> Phase {
+pub(crate) fn phase_at(node: ast::Node<'_>) -> Phase {
     match site(node) {
         Site::Body => Phase::Bodies,
         Site::Signature => Phase::Items,
@@ -394,46 +402,49 @@ pub(crate) fn phase_at(node: &SyntaxNode) -> Phase {
 
 /// Records the fact of where `at` is written: the code of the body it is in, or the signature
 /// of the item.
-pub(crate) fn site_fact(cx: &Cx<'_, '_>, diag: &mut Diag, at: InFile<&SyntaxNode>) {
+pub(crate) fn site_fact<'db>(cx: &Cx<'_, 'db>, diag: &mut Diag, at: InFile<ast::Node<'db>>) {
     if let Site::Body = site(at.value) {
-        code_fact(cx, diag, at.map(SyntaxNodePtr::new));
+        code_fact(cx, diag, at.map(ast::ptr));
         return;
     }
     let Some(item) = at.value.ancestors().find_map(ast::Item::cast) else { return };
-    if let Some((id, what)) = item_of(cx, at.with_value(&item)) {
+    if let Some((id, what)) = item_of(cx, item) {
         diag.fact(Fact::Signature(cx.key(id)), what);
     }
 }
 
 /// The item `item` is, and its signature in words.
-fn item_of(cx: &Cx<'_, '_>, item: InFile<&ast::Item>) -> Option<(ItemId, String)> {
-    let sema = cx.sema;
-    let named = |name: Option<ast::Name>| match name {
+fn item_of<'db>(cx: &Cx<'_, 'db>, item: ast::Item<'db>) -> Option<(ItemId, String)> {
+    let sema = &cx.vsema;
+    let named = |name: Option<ast::Name<'_>>| match name {
+        // alloc: the error's text, for an error hir found
         Some(name) => format!("the signature of `{}`", name.text()),
+        // alloc: the error's text, for an error hir found
         None => "the signature of `_`".to_owned(),
     };
-    Some(match item.value {
+    Some(match item {
         ast::Item::Fn(it) => {
-            let def = sema.to_def2(item.with_value(it))?;
+            let def = sema.to_def(it)?;
             (ItemId::Function(hir_def::FunctionId::try_from(def).ok()?), named(it.name()))
         }
         ast::Item::Struct(it) => {
-            (ItemId::Adt(Adt::from(sema.to_def2(item.with_value(it))?).into()), named(it.name()))
+            (ItemId::Adt(Adt::from(sema.to_def(it)?).into()), named(it.name()))
         }
         ast::Item::Enum(it) => {
-            (ItemId::Adt(Adt::from(sema.to_def2(item.with_value(it))?).into()), named(it.name()))
+            (ItemId::Adt(Adt::from(sema.to_def(it)?).into()), named(it.name()))
         }
         ast::Item::Union(it) => {
-            (ItemId::Adt(Adt::from(sema.to_def2(item.with_value(it))?).into()), named(it.name()))
+            (ItemId::Adt(Adt::from(sema.to_def(it)?).into()), named(it.name()))
         }
-        ast::Item::Trait(it) => (ItemId::Trait(sema.to_def2(item.with_value(it))?.into()), named(it.name())),
+        ast::Item::Trait(it) => (ItemId::Trait(sema.to_def(it)?.into()), named(it.name())),
         ast::Item::TypeAlias(it) => {
-            (ItemId::Alias(sema.to_def2(item.with_value(it))?.into()), named(it.name()))
+            (ItemId::Alias(sema.to_def(it)?.into()), named(it.name()))
         }
-        ast::Item::Const(it) => (ItemId::Const(sema.to_def2(item.with_value(it))?.into()), named(it.name())),
-        ast::Item::Static(it) => (ItemId::Static(sema.to_def2(item.with_value(it))?.into()), named(it.name())),
+        ast::Item::Const(it) => (ItemId::Const(sema.to_def(it)?.into()), named(it.name())),
+        ast::Item::Static(it) => (ItemId::Static(sema.to_def(it)?.into()), named(it.name())),
         ast::Item::Impl(it) => {
-            let def = sema.to_def2(item.with_value(it))?;
+            let def = sema.to_def(it)?;
+            // alloc: the error's text, for an error hir found
             (ItemId::Impl(ImplId::try_from(def).ok()?), "the header of the impl".to_owned())
         }
         _ => return None,
@@ -462,19 +473,19 @@ enum Info {
 /// rustc's `WrongNumberOfGenericArgs`, of what hir found and the syntax of the segment.
 struct Wrong<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
-    seg: &'a Segment,
+    seg: &'a Segment<'db>,
     def: GenericDef,
     /// The const parameter the arguments are given to, which `def` is the parent of.
     param: Option<hir::ConstParam>,
     info: Info,
     /// The arguments written, constraints left out.
-    args: &'a [ast::GenericArg],
+    args: &'a [ast::GenericArg<'db>],
     /// `def`'s lifetime and written type or const parameters, read once per error.
     lifetimes: &'a [Param],
     types: &'a [Param],
 }
 
-impl Wrong<'_, '_, '_> {
+impl<'db> Wrong<'_, '_, 'db> {
     fn descr(&self) -> &'static str {
         match self.param {
             Some(_) => "const parameter",
@@ -484,8 +495,8 @@ impl Wrong<'_, '_, '_> {
 
     fn def_span(&self) -> Option<Span> {
         let Some(param) = self.param else { return def_name_span(self.cx, self.def) };
-        let src = param.merge().source(self.cx.db)?;
-        let Either::Left(ast::TypeOrConstParam::Const(it)) = &src.value else { return None };
+        let src = self.cx.vsema.source(param.merge())?;
+        let Either::Left(ast::TypeOrConstParam::Const(it)) = src.value else { return None };
         Some(self.cx.span(src.with_value(it.name()?.syntax().text_range())))
     }
 
@@ -607,13 +618,14 @@ impl Wrong<'_, '_, '_> {
         self.seg.span(self.cx, range)
     }
 
-    fn arg_range(arg: &ast::GenericArg) -> TextRange {
+    fn arg_range(arg: &ast::GenericArg<'_>) -> TextRange {
         arg.syntax().text_range()
     }
 
     fn message(&self) -> String {
         let descr = self.descr();
         if !self.has_brackets() {
+            // alloc: the error's text, for an error hir found
             return format!("missing generics for {descr} `{}`", def_path(self.cx, self.def));
         }
         let (quantifier, bound) = self.quantifier_and_bound();
@@ -621,13 +633,16 @@ impl Wrong<'_, '_, '_> {
         let provided = match self.missing_lifetimes() {
             true => {
                 let n = self.num_provided_lifetime_args();
+                // alloc: the error's text, for an error hir found
                 (format!("{n} lifetime argument{}", s(n)), was(n))
             }
             false => {
                 let n = self.num_provided_type_or_const_args();
+                // alloc: the error's text, for an error hir found
                 (format!("{n} generic argument{}", s(n)), was(n))
             }
         };
+        // alloc: the error's text, for an error hir found
         format!(
             "{descr} takes {quantifier}{bound} {kind} argument{} but {} {} supplied",
             s(bound),
@@ -641,6 +656,7 @@ impl Wrong<'_, '_, '_> {
         let provided = self.num_provided_args();
         diag.span_label(
             self.seg.name_span(self.cx),
+            // alloc: the error's text, for an error hir found
             format!("expected {quantifier}{bound} {} argument{}", self.kind(), s(bound)),
         );
         if self.too_many_args_provided() || self.parenthesized() {
@@ -649,7 +665,9 @@ impl Wrong<'_, '_, '_> {
         let args = self.args.iter().skip(self.lifetime_args_offset()).take(provided).enumerate();
         for (i, arg) in args {
             let label = match i + 1 == provided {
+                // alloc: the error's text, for an error hir found
                 true => format!("supplied {provided} {} argument{}", self.kind(), s(provided)),
+                // alloc: empty, allocates nothing
                 false => String::new(),
             };
             diag.span_label(self.span(Self::arg_range(arg)), label);
@@ -682,6 +700,7 @@ impl Wrong<'_, '_, '_> {
 
     fn suggest_adding_lifetime_args(&self, diag: &mut Diag) {
         let missing = self.num_expected_lifetime_args() - self.num_provided_lifetime_args();
+        // alloc: the suggestion's text, for an error hir found
         let msg = format!("add missing {} argument{}", self.kind(), s(missing));
         // hir reports lifetimes left out of a path entirely as `MissingLifetime` or
         // `ElidedLifetimesInPath`: here at least one is written, and rustc repeats the first.
@@ -691,7 +710,8 @@ impl Wrong<'_, '_, '_> {
         }) else {
             return;
         };
-        let lifetimes = vec![first.text().to_string(); missing].join(", ");
+        // alloc: the suggestion's text, for an error hir found
+        let lifetimes = vec![first.text(); missing].join(", ");
         let last = self
             .args
             .iter()
@@ -699,17 +719,20 @@ impl Wrong<'_, '_, '_> {
             .nth(self.num_provided_lifetime_args() - 1);
         let Some(last) = last else { return };
         let at = self.span(Self::arg_range(last)).shrink_to_hi();
+        // alloc: the suggestion's text, for an error hir found
         diag.suggestion_verbose(at, msg, format!(", {lifetimes}"), Applicability::HasPlaceholders);
     }
 
     fn suggest_adding_type_and_const_args(&self, diag: &mut Diag) {
         let missing = self.num_expected_type_or_const_args_including_defaults()
             - self.num_provided_type_or_const_args();
+        // alloc: the suggestion's text, for an error hir found
         let msg = format!("add missing {} argument{}", self.kind(), s(missing));
         let suggested = self.type_or_const_args_suggestions_from_param_names(missing);
-        match &self.seg.list {
+        match self.seg.list {
             None => {
                 let at = self.seg.name_span(self.cx).shrink_to_hi();
+                // alloc: the suggestion's text, for an error hir found
                 diag.suggestion_verbose(at, msg, format!("<{suggested}>"), Applicability::HasPlaceholders);
             }
             Some(_) => {
@@ -724,6 +747,7 @@ impl Wrong<'_, '_, '_> {
                 diag.suggestion_verbose(
                     at,
                     msg,
+                    // alloc: the suggestion's text, for an error hir found
                     format!("{prefix}{suggested}{suffix}"),
                     Applicability::HasPlaceholders,
                 );
@@ -737,12 +761,13 @@ impl Wrong<'_, '_, '_> {
     fn type_or_const_args_suggestions_from_param_names(&self, take: usize) -> String {
         let in_method_call = self.is_in_a_method_call();
         let inputs = self.fn_input_names();
+        // alloc: the suggestion's text, for an error hir found
         let mut out = String::new();
         for param in self.types.iter().skip(self.num_provided_type_or_const_args()).take(take) {
             if !out.is_empty() {
                 out.push_str(", ");
             }
-            match param.is_type && (in_method_call || inputs.contains(&param.name)) {
+            match param.is_type && (in_method_call || inputs.contains(&param.name.as_str())) {
                 true => out.push('_'),
                 false => out.push_str(&param.name),
             }
@@ -764,9 +789,12 @@ impl Wrong<'_, '_, '_> {
 
     /// The names of the function's parameters whose type is a bare path, `x: T`: rustc's
     /// `is_used_in_input`.
-    fn fn_input_names(&self) -> Vec<String> {
+    fn fn_input_names(&self) -> Vec<&'db str> {
+        // alloc: empty, allocates nothing
         let GenericDef::Function(f) = self.def else { return Vec::new() };
-        let Some(src) = f.source(self.cx.db) else { return Vec::new() };
+        // alloc: empty, allocates nothing
+        let Some(src) = self.cx.vsema.source(f) else { return Vec::new() };
+        // alloc: empty, allocates nothing
         let Some(params) = src.value.param_list() else { return Vec::new() };
         params
             .params()
@@ -777,10 +805,11 @@ impl Wrong<'_, '_, '_> {
                     if segment.generic_arg_list().is_some() {
                         return None;
                     }
-                    Some(segment.name_ref()?.text().to_string())
+                    Some(segment.name_ref()?.text())
                 }
                 _ => None,
             })
+            // alloc: the suggestion's names, for an error hir found
             .collect()
     }
 
@@ -797,6 +826,7 @@ impl Wrong<'_, '_, '_> {
         }
         let excess = self.num_excess_type_or_const_args() + self.num_excess_lifetime_args();
         let trait_generics = GenericDef::Trait(trait_).params(db).len().saturating_sub(1);
+        // alloc: the suggestion's text, for an error hir found
         let msg = format!(
             "consider moving {these} generic argument{s} to the `{name}` trait, which takes up to {num} argument{s}",
             these = if excess == 1 { "this" } else { "these" },
@@ -812,7 +842,7 @@ impl Wrong<'_, '_, '_> {
             && path.syntax().parent().is_some_and(|it| ast::PathExpr::can_cast(it.kind()))
         {
             let Some(first) = path.first_segment() else { return };
-            let supplied = Segment::of_node(self.seg.file, first.syntax().clone(), None)
+            let supplied = Segment::of_node(self.seg.file, first.syntax(), None)
                 .map_or(0, |it| {
                     it.args().iter().filter(|it| !matches!(it, ast::GenericArg::LifetimeArg(_))).count()
                 });
@@ -822,39 +852,45 @@ impl Wrong<'_, '_, '_> {
             let removed = self.span(TextRange::new(self.seg.name.syntax().text_range().end(), span_ext.end()));
             diag.multipart_suggestion(
                 msg,
+                // alloc: the suggestion's parts, for an error hir found
                 vec![(name_span, format!("{generics}::{name}")), (removed, String::new())],
                 Applicability::MaybeIncorrect,
             );
             return;
         }
-        let Some(call) = ast::MethodCallExpr::cast(self.seg.node.clone()) else { return };
+        let Some(call) = ast::MethodCallExpr::cast(self.seg.node) else { return };
         if excess != trait_generics {
             return;
         }
         let Some(receiver) = call.receiver() else { return };
-        let Some(rcvr) = self.cx.snippet(&self.span_of(&receiver)) else { return };
-        let args: Vec<ast::Expr> = call.arg_list().map(|it| it.args().collect()).unwrap_or_default();
-        let rest = match (args.first(), args.last()) {
+        let Some(rcvr) = self.cx.snippet(&self.span_of(receiver)) else { return };
+        let mut args = call.arg_list().into_iter().flat_map(|it| it.args());
+        let first = args.next();
+        let last = args.last().or(first);
+        let rest = match (first, last) {
             (Some(first), Some(last)) => {
                 let range = first.syntax().text_range().cover(last.syntax().text_range());
                 match self.cx.snippet(&self.span(range)) {
+                    // alloc: the suggestion's text, for an error hir found
                     Some(it) => it.to_owned(),
                     None => return,
                 }
             }
+            // alloc: empty, allocates nothing
             _ => String::new(),
         };
-        let comma = if args.is_empty() { "" } else { ", " };
+        let comma = if first.is_none() { "" } else { ", " };
         let trait_path = self.cx.def_path(trait_.into());
         diag.suggestion_verbose(
-            self.span_of(&call),
+            self.span_of(call),
             msg,
+            // alloc: the suggestion's text, for an error hir found
             format!("{trait_path}::{generics}::{name}({rcvr}{comma}{rest})"),
             Applicability::MaybeIncorrect,
         );
     }
 
-    fn span_of(&self, node: &impl AstNode) -> Span {
+    fn span_of<'t>(&self, node: impl ast::AstNode<'t>) -> Span {
         self.seg.span_of(self.cx, node)
     }
 
@@ -877,15 +913,18 @@ impl Wrong<'_, '_, '_> {
                 .filter_map(|arg| match arg {
                     ast::GenericArg::TypeArg(_) => {
                         let name = unbound.next()?;
+                        // alloc: the suggestion's text, for an error hir found
                         Some((self.span(Self::arg_range(arg)).shrink_to_lo(), format!("{name} = ")))
                     }
                     _ => None,
                 })
+                // alloc: the suggestion's parts, for an error hir found
                 .collect();
             if !parts.is_empty() {
                 let s = s(parts.len());
                 let article = if parts.len() == 1 { "an " } else { "" };
                 diag.multipart_suggestion(
+                    // alloc: the suggestion's text, for an error hir found
                     format!("turn the generic argument{s} into {article}associated item binding{s}"),
                     parts,
                     Applicability::MaybeIncorrect,
@@ -914,6 +953,7 @@ impl Wrong<'_, '_, '_> {
 
     fn remove_lifetime_args(&self, diag: &mut Diag) {
         let expected = self.num_expected_lifetime_args();
+        // alloc: the suggestion's spans, for an error hir found
         let mut spans = Vec::new();
         let mut found_redundant = false;
         for arg in self.args {
@@ -931,6 +971,7 @@ impl Wrong<'_, '_, '_> {
         let n = spans.len() - expected;
         diag.suggestion(
             self.span(range),
+            // alloc: the suggestion's text, for an error hir found
             format!("remove the lifetime argument{}", s(n)),
             "",
             Applicability::MaybeIncorrect,
@@ -939,6 +980,7 @@ impl Wrong<'_, '_, '_> {
 
     fn remove_type_or_const_args(&self, diag: &mut Diag) {
         let expected = self.num_expected_type_or_const_args();
+        // alloc: the suggestion's spans, for an error hir found
         let mut spans = Vec::new();
         let mut found_redundant = false;
         for arg in self.args {
@@ -958,6 +1000,7 @@ impl Wrong<'_, '_, '_> {
         let n = spans.len() - expected;
         diag.suggestion(
             self.span(range),
+            // alloc: the suggestion's text, for an error hir found
             format!("remove the unnecessary generic argument{}", s(n)),
             "",
             Applicability::MaybeIncorrect,
@@ -968,19 +1011,22 @@ impl Wrong<'_, '_, '_> {
     /// rustc's `get_unbound_associated_item`.
     fn unbound_associated_types(&self) -> Vec<String> {
         let db = self.cx.db;
+        // alloc: empty, allocates nothing
         let (GenericDef::Trait(trait_), None) = (self.def, self.param) else { return Vec::new() };
-        let bound: Vec<String> = self
+        let bound: Vec<&str> = self
             .seg
             .constraints()
             .iter()
-            .filter_map(|it| Some(it.name_ref()?.text().to_string()))
+            .filter_map(|it| Some(it.name_ref()?.text()))
+            // alloc: the suggestion's names, for an error hir found
             .collect();
         trait_
-            .items(db)
-            .into_iter()
+            .items_iter(db)
             .filter_map(|item| item.as_type_alias())
+            // alloc: the suggestion's names, for an error hir found
             .map(|it| it.name(db).display(db, self.cx.edition).to_string())
-            .filter(|name| !bound.contains(name))
+            .filter(|name| !bound.contains(&name.as_str()))
+            // alloc: the suggestion's names, for an error hir found
             .collect()
     }
 
@@ -1001,15 +1047,18 @@ impl Wrong<'_, '_, '_> {
         let mut spans = MultiSpan::of(def_span);
         let (quantifier, bound) = self.quantifier_and_bound();
         let params = match bound {
+            // alloc: empty, allocates nothing
             0 => String::new(),
             _ => {
                 let params = match self.missing_lifetimes() {
                     true => self.lifetimes,
                     false => self.types,
                 };
+                // alloc: the error's text, for an error hir found
                 let mut names = String::from(": ");
                 for (i, param) in params.iter().take(bound).enumerate() {
                     if let Some(span) = &param.span {
+                        // clone: on the error path, for an error hir found
                         spans.labels.push((span.clone(), String::new()));
                     }
                     if i > 0 {
@@ -1022,6 +1071,7 @@ impl Wrong<'_, '_, '_> {
                 names
             }
         };
+        // alloc: the error's text, for an error hir found
         let msg = format!(
             "{} defined here, with {quantifier}{bound} {} parameter{}{params}",
             self.descr(),
@@ -1050,16 +1100,18 @@ impl Wrong<'_, '_, '_> {
         if !in_impl || !matches!(self.info, Info::MissingTypesOrConsts { .. }) {
             return false;
         }
-        let constraints: Vec<String> = self
+        let constraints: Vec<&str> = self
             .seg
             .constraints()
             .iter()
-            .filter_map(|it| Some(it.name_ref()?.text().to_string()))
+            .filter_map(|it| Some(it.name_ref()?.text()))
+            // alloc: the names compared, for an error hir found
             .collect();
         let params: Vec<String> = self
             .lifetimes
             .iter()
             .chain(self.types)
+            // clone: the names compared, for an error hir found
             .map(|it| it.name.clone())
             .chain(
                 self.def
@@ -1067,10 +1119,12 @@ impl Wrong<'_, '_, '_> {
                     .into_iter()
                     .filter(|it| matches!(it.split(db), Either::Right(p) if p.is_implicit(db)))
                     .filter(|_| !matches!(self.def, GenericDef::Trait(_)))
+                    // alloc: the names compared, for an error hir found
                     .map(|it| it.name(db).display(db, self.cx.edition).to_string()),
             )
+            // alloc: the names compared, for an error hir found
             .collect();
-        if constraints != params {
+        if !constraints.iter().copied().eq(params.iter().map(String::as_str)) {
             return false;
         }
         let GenericDef::Trait(trait_) = self.def else { return true };
@@ -1078,15 +1132,16 @@ impl Wrong<'_, '_, '_> {
             .items_with_supertraits(db)
             .into_iter()
             .filter_map(|it| it.as_type_alias())
+            // alloc: the names compared, for an error hir found
             .map(|it| it.name(db).display(db, self.cx.edition).to_string())
+            // alloc: the names compared, for an error hir found
             .collect();
-        !constraints.iter().any(|it| assoc.contains(it))
+        !constraints.iter().any(|it| assoc.iter().any(|name| name == it))
     }
 }
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found> {
-    let node = cx.node(d.generics_or_segment);
-    let node_span = cx.span(node.as_ref().map(|it| it.syntax().text_range()));
+    let node_span = cx.span_of_ptr(d.generics_or_segment);
     let provided = d.provided as usize;
     let expected = d.expected as usize;
     let types = type_or_const_params(cx, d.def);
@@ -1112,6 +1167,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found
             IncorrectGenericsLenKind::Lifetimes => "lifetime",
             IncorrectGenericsLenKind::TypesAndConsts => "generic",
         };
+        // alloc: the error's text, for an error hir found
         let message = format!(
             "{} takes {expected} {kind} argument{} but {provided} {kind} argument{} {} supplied",
             def_descr(cx, d.def),
@@ -1121,6 +1177,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found
         );
         let mut diag = Diag::error(Some("E0107"), message, node_span);
         generics_fact(cx, &mut diag, d.def);
+        // alloc: the error's parts, for an error hir found
         return vec![Found::new(diag, Phase::Items)];
     };
     let args = seg.args();
@@ -1136,6 +1193,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found
         types: &types,
     };
     if wrong.all_params_are_bound() {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let mut diag = Diag::error(Some("E0107"), wrong.message(), seg.name_span(cx));
@@ -1144,16 +1202,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsLen) -> Vec<Found
     wrong.show_definition(&mut diag);
     wrong.note_synth_provided(&mut diag);
     generics_fact(cx, &mut diag, d.def);
-    site_fact(cx, &mut diag, InFile::new(seg.file, &seg.node));
-    vec![Found::new(diag, phase_at(&seg.node))]
+    site_fact(cx, &mut diag, InFile::new(seg.file, seg.node));
+    // alloc: the error's parts, for an error hir found
+    vec![Found::new(diag, phase_at(seg.node))]
 }
 
 /// E0107 of generic arguments given to a static or a const parameter named by a value path,
 /// which take none: rustc counts the last segment's arguments as any value's
 /// (`probe_generic_path_segments`), the lifetimes' error first, then the types' and consts'.
-pub(crate) fn takes_none(
-    cx: &Cx<'_, '_>,
-    seg: &Segment,
+pub(crate) fn takes_none<'db>(
+    cx: &Cx<'_, 'db>,
+    seg: &Segment<'db>,
     def: GenericDef,
     param: Option<hir::ConstParam>,
 ) -> Vec<Found> {
@@ -1171,6 +1230,7 @@ pub(crate) fn takes_none(
             synth_provided: false,
         }),
     ];
+    // alloc: the errors, at most two, for an error hir found
     let mut found = Vec::new();
     for info in infos.into_iter().flatten() {
         // A static and a const parameter take no generics: there are none to list.
@@ -1180,8 +1240,8 @@ pub(crate) fn takes_none(
         wrong.suggest(&mut diag);
         wrong.show_definition(&mut diag);
         generics_fact(cx, &mut diag, def);
-        site_fact(cx, &mut diag, InFile::new(seg.file, &seg.node));
-        found.push(Found::new(diag, phase_at(&seg.node)));
+        site_fact(cx, &mut diag, InFile::new(seg.file, seg.node));
+        found.push(Found::new(diag, phase_at(seg.node)));
     }
     found
 }

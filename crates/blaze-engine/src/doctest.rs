@@ -1016,7 +1016,7 @@ fn with_another_copy(db: &RootDatabase, library: hir::Crate) -> Vec<String> {
     let dependencies = library.data(db).dependencies.iter();
     let mixing = dependencies.filter(|dependency| {
         let linked = dependency.crate_id.transitive_deps(db);
-        linked.into_iter().any(|it| it != library && name(it).as_deref() == Some(own.as_str()))
+        linked.iter().copied().any(|it| it != library && name(it).as_deref() == Some(own.as_str()))
     });
     mixing.map(|it| it.name.as_str().to_owned()).collect()
 }
@@ -1111,7 +1111,8 @@ fn built_from(db: &RootDatabase, library: ide_db::base_db::Crate) -> String {
     use sha2::{Digest as _, Sha256};
     let mut crates: Vec<String> = library
         .transitive_deps(db)
-        .into_iter()
+        .iter()
+        .copied()
         .map(|krate| {
             let mut hasher = Sha256::new();
             hasher.update(crate::content::Contents::version(db, krate));

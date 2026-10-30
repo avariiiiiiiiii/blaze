@@ -87,6 +87,41 @@ fn a_variant_s_fields_have_the_type_s_arguments() {
 }
 
 #[test]
+fn a_direct_tag_enum_gives_its_tag_and_variant_sizes_in_order() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+//- /main.rs crate:main
+#[repr(u8)]
+enum Direct { A(u32), B, C([u8; 9]) }
+enum Niche { A(&'static u8), B }
+enum One { A(u32) }
+"#,
+    );
+    crate::attach_db(&db, || {
+        let layout = |name: &str| {
+            let ModuleDef::Adt(adt @ Adt::Enum(_)) = item(&db, name) else {
+                panic!("`{name}` is an enum")
+            };
+            adt.layout(&db).expect("a layout")
+        };
+        let direct = layout("Direct");
+        let (tag, sizes) =
+            direct.direct_tag_variant_sizes().expect("`repr(u8)` stores the tag directly");
+        let sizes: Vec<u64> = sizes.collect();
+        assert_eq!(tag, 1);
+        assert_eq!(sizes.len(), 3, "one size per variant: {sizes:?}");
+        assert!(sizes[1] < sizes[0] && sizes[0] < sizes[2], "declaration order: {sizes:?}");
+        let size = direct.size();
+        assert!(sizes.iter().all(|&it| tag <= it && it <= size), "{sizes:?} in {size}");
+        assert_eq!(direct.enum_tag_size(), Some(1));
+
+        assert!(layout("Niche").direct_tag_variant_sizes().is_none(), "a niche holds `Niche`'s tag");
+        assert!(layout("One").direct_tag_variant_sizes().is_none(), "one variant has no tag");
+    });
+}
+
+#[test]
 fn an_array_s_element_whatever_its_length() {
     let db = TestDB::with_files(ITEMS);
     crate::attach_db(&db, || {

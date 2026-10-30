@@ -36,21 +36,28 @@ pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
     // scan of the store's expression tags, before hir's set of unsafe operations is built.
     let has_block = || b.store().exprs().any(|(_, it)| matches!(it, Expr::Block { unsafe_: Unsafe::Yes, .. }));
     if !has_block() || b.tainted() {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
+    // alloc: empty, pushed to only for an unused block
     let mut visitor = Visitor { b, ops: operations(b), context: Context::Safe, warnings: Vec::new() };
     visitor.expr(b.body.root_expr());
     let mut warnings: Vec<(ExprId, Option<ExprId>)> = visitor.warnings;
+    // alloc: a block per unused one, empty when none is
     let blocks: Vec<_> = warnings.iter().map(|&(block, _)| (block, Block::of(b, block))).collect();
+    // clone: a lint's spans, for an unused block found
     let block_of = |id: ExprId| blocks.iter().find(|(it, _)| *it == id).and_then(|(_, it)| it.clone());
     let span_of = |id: ExprId| {
         blocks.iter().find(|(it, _)| *it == id).and_then(|(_, it)| it.as_ref()).map(|it| (&it.span.file, it.span.lo, it.span.hi))
     };
     warnings.sort_by(|&(a, _), &(b, _)| span_of(a).cmp(&span_of(b)));
+    // alloc: the lints found, empty until one is
     let mut found = Vec::new();
     for (block, enclosing) in warnings {
         let Some(at) = block_of(block) else { continue };
+        // clone: a lint's span, for a lint found
         let mut diag = Diag::lint("unused_unsafe", "unnecessary `unsafe` block", at.head.clone());
+        // clone: a lint's span, for a lint found
         diag.span_label(at.head.clone(), "unnecessary `unsafe` block");
         if let Some(outer) = enclosing.and_then(|it| Block::of(b, it)) {
             diag.span_label(outer.head, "because it's nested under this `unsafe` block");
@@ -117,6 +124,7 @@ impl Visitor<'_, '_, '_> {
         match store.expr(expr) {
             Expr::Block { unsafe_: Unsafe::Yes, .. } => {
                 let context = match Block::is_explicit(b, expr) {
+                    // alloc: empty, pushed to only for a used block nested in this one
                     true => Context::Block { block: expr, used: false, nested_used: Vec::new() },
                     false => Context::Builtin,
                 };
@@ -148,24 +156,29 @@ impl Visitor<'_, '_, '_> {
     }
 
     fn children(&mut self, expr: ExprId) {
-        let store = self.b.store();
-        let mut pats = Vec::new();
+        let b = self.b;
+        let store = b.store();
         match store.expr(expr) {
             Expr::Block { statements, .. } => {
                 for statement in statements {
                     if let Statement::Let { pat, .. } = statement {
-                        pats.push(pat);
+                        self.pat(pat);
                     }
                 }
             }
-            Expr::Match { arms, .. } => pats.extend(arms.iter().map(|it| it.pat)),
-            Expr::Let { pat, .. } => pats.push(pat),
-            Expr::Closure { args, .. } => pats.extend(args.iter().copied()),
-            Expr::Assignment { target, .. } => pats.push(target),
+            Expr::Match { arms, .. } => {
+                for arm in arms.iter() {
+                    self.pat(arm.pat);
+                }
+            }
+            Expr::Let { pat, .. } => self.pat(pat),
+            Expr::Closure { args, .. } => {
+                for &arg in args.iter() {
+                    self.pat(arg);
+                }
+            }
+            Expr::Assignment { target, .. } => self.pat(target),
             _ => {}
-        }
-        for pat in pats {
-            self.pat(pat);
         }
         store.walk_child_exprs_without_pats(expr, |it| stdx::ensure_sufficient_stack(|| self.expr(it)));
     }
@@ -244,9 +257,11 @@ impl Block {
     fn of(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Block> {
         let node = b.expr_node(expr)?;
         let syntax = b.cx.syntax(node);
+        // clone: a lint's span, for a lint found
         let block = ast::BlockExpr::cast(syntax.value.clone())?;
         let start = block.unsafe_token()?.text_range().start();
         let range = TextRange::new(start, block.syntax().text_range().end());
+        // alloc: for a lint found
         let text = block.syntax().text().to_string();
         let local = usize::from(start - block.syntax().text_range().start());
         let written = &text[local..];

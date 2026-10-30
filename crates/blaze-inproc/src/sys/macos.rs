@@ -384,6 +384,140 @@ impl View {
     }
 }
 
+/// Anonymous memory of this process: code in a `MAP_JIT` mapping, which macOS lets run
+/// unsigned under any code signing policy, and data in a mapping of its own right after it
+/// (`MAP_JIT` pages are writable or executable per thread together, so data among them would
+/// not be writable while code runs).
+pub(crate) struct Exec {
+    code: *mut u8,
+    code_pages: usize,
+    /// Null when there is no data.
+    data: *mut u8,
+    data_pages: usize,
+    data_len: usize,
+}
+
+// SAFETY: the code is never written once `Exec::new` returns, and the data only through
+// `&mut self`; nothing of the mappings is tied to a thread.
+unsafe impl Send for Exec {}
+// SAFETY: as above: `&self` reads only addresses.
+unsafe impl Sync for Exec {}
+
+impl Drop for Exec {
+    fn drop(&mut self) {
+        // SAFETY: this `Exec`'s own mappings; every slice of them borrowed `self` or ended with
+        // `Exec::new`'s `write`.
+        unsafe {
+            libc::munmap(self.code.cast(), self.code_pages);
+            if !self.data.is_null() {
+                libc::munmap(self.data.cast(), self.data_pages);
+            }
+        }
+    }
+}
+
+/// Makes this thread's view of every `MAP_JIT` page writable and not executable until dropped,
+/// so a `write` that panics leaves the thread as it found it.
+struct JitWritable;
+
+impl JitWritable {
+    fn new() -> JitWritable {
+        // SAFETY: changes only this thread's view of `MAP_JIT` pages; `Drop` turns it back.
+        unsafe { libc::pthread_jit_write_protect_np(0) };
+        JitWritable
+    }
+}
+
+impl Drop for JitWritable {
+    fn drop(&mut self) {
+        // SAFETY: as in `new`: this thread's `MAP_JIT` pages executable and not writable again.
+        unsafe { libc::pthread_jit_write_protect_np(1) };
+    }
+}
+
+impl Exec {
+    pub(crate) fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+        let page = page() as usize;
+        let code_pages = code.max(1).next_multiple_of(page);
+        let data_pages = data.next_multiple_of(page);
+        // SAFETY: an anonymous mapping at no fixed address: nothing of this process is replaced.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                code_pages,
+                libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
+                libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(Error::new(format!(
+                "mmap MAP_JIT of {code_pages:#x} bytes of code: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        let mut exec = Exec { code: at.cast(), code_pages, data: std::ptr::null_mut(), data_pages, data_len: data };
+        if data_pages != 0 {
+            // SAFETY: an anonymous mapping; the address is only a hint, so nothing is replaced,
+            // and where the kernel put it is checked below.
+            let at = unsafe {
+                libc::mmap(
+                    exec.code.wrapping_add(code_pages).cast(),
+                    data_pages,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANON,
+                    -1,
+                    0,
+                )
+            };
+            if at == libc::MAP_FAILED {
+                return Err(Error::new(format!("mmap of {data_pages:#x} bytes of data: {}", std::io::Error::last_os_error())));
+            }
+            exec.data = at.cast();
+            let far = (exec.data as usize).abs_diff(exec.code as usize) + code_pages.max(data_pages);
+            if far >= 1 << 30 {
+                return Err(Error::new(format!(
+                    "the data was mapped {far:#x} bytes from the code, past the 1 GiB a PC-relative reference reaches"
+                )));
+            }
+        }
+        {
+            let _writable = JitWritable::new();
+            // SAFETY: the fresh mappings, readable and writable on this thread while
+            // `_writable` lives, which nothing else refers to; `code <= code_pages` and
+            // `data <= data_pages`. `write` can't keep the slices past its return. A null
+            // `data` is only for `data == 0`, so its slice is the empty one at a dangling,
+            // aligned pointer.
+            let (code_bytes, data_bytes) = unsafe {
+                let data_at = if exec.data.is_null() { std::ptr::NonNull::dangling().as_ptr() } else { exec.data };
+                (std::slice::from_raw_parts_mut(exec.code, code), std::slice::from_raw_parts_mut(data_at, data))
+            };
+            write(code_bytes, data_bytes);
+        }
+        // SAFETY: the code's pages, mapped; the maintenance changes no value.
+        unsafe { sys_icache_invalidate(exec.code.cast(), code) };
+        Ok(exec)
+    }
+
+    pub(crate) fn code_address(&self) -> u64 {
+        self.code as u64
+    }
+
+    pub(crate) fn data_address(&self) -> u64 {
+        if self.data.is_null() { self.code as u64 + self.code_pages as u64 } else { self.data as u64 }
+    }
+
+    pub(crate) fn data(&mut self) -> &mut [u8] {
+        if self.data.is_null() {
+            return &mut [];
+        }
+        // SAFETY: the data mapping's first `data_len` bytes, writable, live as long as `self`;
+        // `&mut self` makes this the only borrow.
+        unsafe { std::slice::from_raw_parts_mut(self.data, self.data_len) }
+    }
+}
+
 /// Whether this process may run pages with no code signature: it must not enforce code
 /// signing on its whole map. Asked once.
 fn check_unsigned_code() -> Result<(), Error> {
@@ -574,6 +708,10 @@ pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
         }
         capacity *= 2;
     }
+}
+
+pub(crate) fn service() -> Option<String> {
+    Some(rendezvous::service_name(std::process::id()).to_string_lossy().into_owned())
 }
 
 pub(crate) fn thread_id() -> u64 {

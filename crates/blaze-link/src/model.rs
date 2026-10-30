@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use blaze_codegen::Arch;
 
+use crate::cow::CowBytes;
 use crate::{Format, LinkError, Output};
 
 /// A [`Class::Named`] section's name: a format's own (`"__LD,__compact_unwind"`) borrowed,
@@ -170,6 +171,12 @@ pub(crate) enum Class {
     /// Pointers the loader calls at start (`.init_array`, `__mod_init_func`), in order.
     InitArray,
     FiniArray,
+    /// ELF `.preinit_array`: called before every `.init_array` entry and every shared
+    /// library's initializers; only a dev run's start hook goes here ([`crate::DevRun`]).
+    PreinitArray,
+    /// A dev run's reserved address range ([`crate::DevRun`]): no bytes, no access, not in
+    /// the file.
+    Reserve(Reserve),
     /// Data placed by incremental links and live patches, as [`Class::Patch`] is for code.
     PatchData,
     /// A section a static or a native object names (`#[link_section]`), kept whole and in
@@ -188,6 +195,22 @@ pub(crate) enum Class {
     Synthetic(&'static str),
 }
 
+/// The reservations of a dev run, in address order.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub(crate) enum Reserve {
+    Arena,
+    Cells,
+    Fixed,
+}
+
+/// Whether a class is a dev run's reservation ([`Class::Reserve`]): no bytes in memory or in
+/// the file, unlike [`Class::Bss`], which is zeroed memory. Its region's `size` is 0 and its
+/// `capacity` the range reserved.
+#[inline]
+pub(crate) fn reserved(class: &Class) -> bool {
+    matches!(class, Class::Reserve(_))
+}
+
 /// What a region may be accessed as.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct Prot {
@@ -200,6 +223,7 @@ impl Prot {
     pub const RX: Prot = Prot { read: true, write: false, exec: true };
     pub const R: Prot = Prot { read: true, write: false, exec: false };
     pub const RW: Prot = Prot { read: true, write: true, exec: false };
+    pub const NONE: Prot = Prot { read: false, write: false, exec: false };
 }
 
 /// How a format lays an image out.
@@ -799,7 +823,8 @@ pub(crate) struct Export {
 pub(crate) struct Function {
     pub addr: u64,
     pub size: u64,
-    /// Its call frame information's FDE in [`Class::EhFrame`], when it has one.
+    /// Its call frame information's FDE, when it has one: in [`Class::EhFrame`], or on an ELF
+    /// patch in [`Class::Patch`] after the patch's code.
     pub fde: Option<u64>,
     /// Windows: its `UNWIND_INFO` in [`Class::Rodata`], and its handler and data, resolved.
     pub windows: Option<WindowsUnwind>,
@@ -846,9 +871,14 @@ pub(crate) struct Placed<'a> {
     /// identifier, an import library's DLL.
     pub name: &'a str,
     pub plan: &'a Plan,
-    /// In address order; each region's bytes are [`Placed::bytes`] of it.
+    /// In address order; each region's bytes are [`Placed::view`] of it.
     pub regions: &'a [Region],
     pub contents: &'a [&'a [u8]],
+    /// By region, the bytes of a region held in pages rather than one slice: a code or data
+    /// region whose pages a link wrote since the full link, or a writer's kept table, patched
+    /// ([`Writer::synthesize`]). Its `contents` entry is empty, and it is read through
+    /// [`Placed::view`]. Empty, or `None` for a region, where `contents` holds the bytes.
+    pub paged: &'a [Option<Pages<'a>>],
     /// Shared libraries imported from, in the order the loader loads them.
     pub libraries: &'a [Library],
     pub imports: &'a [Import],
@@ -931,14 +961,235 @@ impl Delta<'_> {
     }
 }
 
-impl Placed<'_> {
-    /// The bytes placed in `region` (index into [`Placed::regions`]): empty for zeroed ones.
+impl<'a> Placed<'a> {
+    /// The bytes placed in `region` (index into [`Placed::regions`]) when they are one slice:
+    /// a synthetic region a writer made whole. Empty for zeroed ones. Code and data regions,
+    /// and kept tables, may be in pages ([`Placed::paged`]): reading one here is a writer's
+    /// bug, and it reads them through [`Placed::view`].
     pub fn bytes(&self, region: usize) -> &[u8] {
+        assert!(self.paged(region).is_none(), "region {region}'s bytes are in pages: read them with `Placed::view`");
         self.contents[region]
+    }
+
+    /// The bytes of `region` when they are held in pages ([`Placed::paged`]).
+    #[inline]
+    pub fn paged(&self, region: usize) -> Option<Pages<'a>> {
+        self.paged.get(region).copied().flatten()
+    }
+
+    /// `region`'s bytes, one slice or in pages.
+    #[inline]
+    pub fn view(&self, region: usize) -> View<'a> {
+        View::of(self.contents, self.paged, region)
+    }
+
+    /// How many bytes are placed in `region`, paged or not.
+    pub fn len(&self, region: usize) -> usize {
+        self.view(region).len()
+    }
+
+    /// Each run of `region`'s bytes as (offset in the region, bytes), in order ([`View::runs`]).
+    pub fn runs(&self, region: usize, f: impl FnMut(usize, &'a [u8])) {
+        self.view(region).runs(f);
+    }
+
+    /// The 8 bytes at `addr` of the region holding them, little-endian: none outside every
+    /// region's placed bytes.
+    pub fn u64_at(&self, addr: u64) -> Option<u64> {
+        let index = self.regions.partition_point(|it| it.addr <= addr).checked_sub(1)?;
+        let at = usize::try_from(addr - self.regions[index].addr).ok()?;
+        self.view(index).u64(at)
     }
 
     pub fn region(&self, class: &Class) -> Option<(usize, &Region)> {
         self.regions.iter().enumerate().find(|(_, it)| &it.class == class)
+    }
+}
+
+/// A region's bytes held in pages ([`Placed::paged`]): the first `len` of `bytes`, which may
+/// hold more (a region that shrank keeps its pages).
+#[derive(Clone, Copy)]
+pub(crate) struct Pages<'a> {
+    pub bytes: &'a CowBytes,
+    pub len: usize,
+}
+
+impl<'a> Pages<'a> {
+    pub fn all(bytes: &'a CowBytes) -> Pages<'a> {
+        Pages { bytes, len: bytes.len() }
+    }
+}
+
+/// A region's bytes as a writer reads them ([`Placed::view`]): one slice, or pages, which are
+/// read run by run, a word at a time, or a record at a time through a reused buffer. Nothing
+/// is copied for a read that one run holds.
+#[derive(Clone, Copy)]
+pub(crate) enum View<'a> {
+    Slice(&'a [u8]),
+    Pages(Pages<'a>),
+}
+
+impl<'a> View<'a> {
+    /// Region `region`'s view of `contents` and `paged` ([`Placed::contents`], [`Placed::paged`]),
+    /// for what reads them where `Placed` can't go (another thread).
+    #[inline]
+    pub fn of(contents: &'a [&'a [u8]], paged: &'a [Option<Pages<'a>>], region: usize) -> View<'a> {
+        match paged.get(region).copied().flatten() {
+            Some(pages) => View::Pages(pages),
+            None => View::Slice(contents[region]),
+        }
+    }
+
+    #[inline]
+    pub fn len(self) -> usize {
+        match self {
+            View::Slice(bytes) => bytes.len(),
+            View::Pages(pages) => pages.len,
+        }
+    }
+
+    #[inline]
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    /// `at..at + len` borrowed, when it is within the bytes and one run holds it.
+    #[inline]
+    pub fn slice(self, at: usize, len: usize) -> Option<&'a [u8]> {
+        if at.checked_add(len)? > self.len() {
+            return None;
+        }
+        match self {
+            View::Slice(bytes) => Some(&bytes[at..at + len]),
+            View::Pages(pages) => pages.bytes.slice(at, len),
+        }
+    }
+
+    /// `self[at..at + out.len()]` into `out`; none of it past the end, which is a bug.
+    pub fn copy_to(self, at: usize, out: &mut [u8]) {
+        assert!(at + out.len() <= self.len(), "a read past the region's bytes");
+        match self {
+            View::Slice(bytes) => out.copy_from_slice(&bytes[at..at + out.len()]),
+            View::Pages(pages) => pages.bytes.copy_to(at, out),
+        }
+    }
+
+    /// `at..at + len`: borrowed when one run holds it, else copied into `scratch`, which
+    /// grows only to the longest such read and is reused across them. None past the end.
+    pub fn read<'s>(self, at: usize, len: usize, scratch: &'s mut Vec<u8>) -> Option<&'s [u8]>
+    where
+        'a: 's,
+    {
+        if at.checked_add(len)? > self.len() {
+            return None;
+        }
+        if let Some(bytes) = self.slice(at, len) {
+            return Some(bytes);
+        }
+        scratch.clear();
+        // alloc: none once `scratch` holds the longest read across pages (a record or a function)
+        scratch.resize(len, 0);
+        self.copy_to(at, scratch);
+        Some(scratch)
+    }
+
+    /// The `N` bytes at `at`, across a page boundary or not; none past the end.
+    #[inline]
+    pub fn array<const N: usize>(self, at: usize) -> Option<[u8; N]> {
+        if let Some(bytes) = self.slice(at, N) {
+            return bytes.try_into().ok();
+        }
+        if at.checked_add(N)? > self.len() {
+            return None;
+        }
+        let mut out = [0; N];
+        self.copy_to(at, &mut out);
+        Some(out)
+    }
+
+    #[inline]
+    pub fn u32(self, at: usize) -> Option<u32> {
+        self.array(at).map(u32::from_le_bytes)
+    }
+
+    #[inline]
+    pub fn u64(self, at: usize) -> Option<u64> {
+        self.array(at).map(u64::from_le_bytes)
+    }
+
+    /// Each run of the bytes as (offset, bytes), in order, none empty: the slice whole, or the
+    /// runs of the pages up to `len` ([`CowBytes::runs`]). Bytes in no run are zeros.
+    pub fn runs(self, mut f: impl FnMut(usize, &'a [u8])) {
+        match self {
+            View::Slice(bytes) if bytes.is_empty() => {}
+            View::Slice(bytes) => f(0, bytes),
+            View::Pages(Pages { bytes, len }) => bytes.runs(|at, run| {
+                if at < len {
+                    f(at, &run[..run.len().min(len - at)]);
+                }
+            }),
+        }
+    }
+
+    /// The first `len` bytes; none past the end.
+    pub fn prefix(self, len: usize) -> Option<View<'a>> {
+        (len <= self.len()).then_some(match self {
+            View::Slice(bytes) => View::Slice(&bytes[..len]),
+            View::Pages(pages) => View::Pages(Pages { bytes: pages.bytes, len }),
+        })
+    }
+
+    /// The `N`-byte chunks of `self[at..end]` in order, by value: read from a slice borrowed a
+    /// page at a time, and a chunk across two pages put together. `end - at` is a multiple of
+    /// `N`, within the bytes.
+    pub fn arrays<const N: usize>(self, at: usize, end: usize) -> Arrays<'a, N> {
+        assert!(at <= end && end <= self.len() && (end - at).is_multiple_of(N), "{N}-byte chunks of {at}..{end}");
+        let window = match self {
+            View::Slice(bytes) => &bytes[at..end],
+            View::Pages(_) => &[],
+        };
+        Arrays { view: self, at, end, window, window_at: at }
+    }
+}
+
+/// [`View::arrays`].
+pub(crate) struct Arrays<'a, const N: usize> {
+    view: View<'a>,
+    at: usize,
+    end: usize,
+    /// Borrowed bytes from `window_at`: the slice whole, or the rest of a page.
+    window: &'a [u8],
+    window_at: usize,
+}
+
+impl<const N: usize> Iterator for Arrays<'_, N> {
+    type Item = [u8; N];
+
+    #[inline]
+    fn next(&mut self) -> Option<[u8; N]> {
+        if self.at >= self.end {
+            return None;
+        }
+        let at = self.at;
+        self.at += N;
+        if at >= self.window_at && at + N <= self.window_at + self.window.len() {
+            let from = at - self.window_at;
+            return self.window[from..from + N].try_into().ok();
+        }
+        const PAGE: usize = CowBytes::PAGE;
+        let stop = ((at / PAGE + 1) * PAGE).min(self.end);
+        if let Some(window) = self.view.slice(at, stop - at) {
+            (self.window, self.window_at) = (window, at);
+            if at + N <= stop {
+                return window[..N].try_into().ok();
+            }
+        }
+        self.view.array(at)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = (self.end - self.at.min(self.end)) / N;
+        (left, Some(left))
     }
 }
 
@@ -980,8 +1231,9 @@ pub(crate) struct File {
     pub len: u64,
     /// Byte ranges of the file and what is in them: the headers, the synthetic regions'
     /// tables outside the address space (symbol tables, a signature). Regions themselves
-    /// are written by the core at [`Writer::offset`].
-    pub parts: Vec<(u64, Vec<u8>)>,
+    /// are written by the core at [`Writer::offset`]. A table the writer keeps across links
+    /// is a clone of what it keeps, so a patch shares every page it didn't write.
+    pub parts: Vec<(u64, CowBytes)>,
     /// The debug sections in the file, outside the address space: (file offset, index into
     /// [`Placed::debug`]). The core lays them from the sections it made, so no writer copies
     /// them, and compares them by block with the last link's as it does parts.
@@ -1012,6 +1264,11 @@ pub(crate) trait Writer: Send + Sync {
     /// The symbol the linker defines under `name`, if it defines one.
     fn special(&self, name: &str) -> Option<Special>;
 
+    /// The class and rank of a dev run's pointer to `blaze_inproc_start` ([`crate::DevRun`]),
+    /// which the core places before every other piece of that class and rank; an error for a
+    /// format with no start hook.
+    fn start_hook(&self) -> Result<(Class, u32), String>;
+
     /// The entry of a shared image, rooted and resolved as an executable's (PE's
     /// `_DllMainCRTStartup`, which runs a DLL's CRT and C++ initializers).
     fn shared_entry(&self) -> Option<&'static str> {
@@ -1037,8 +1294,10 @@ pub(crate) trait Writer: Send + Sync {
     fn apply(&self, r_type: u32, bytes: &mut [u8], p: u64, s: u64, addend: i64)
     -> Result<(), String>;
 
-    /// The contents of each synthetic region, the image placed and its other regions filled.
-    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError>;
+    /// The contents of each synthetic region, the image placed and its other regions filled. A
+    /// table the writer keeps across links is a clone of what it keeps, so a patch shares
+    /// every page it didn't write.
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, CowBytes)>, LinkError>;
 
     /// Where the region at `addr` is in the file: `None` for one not in the file (zeroed).
     fn offset(&self, placed: &Placed<'_>, region: &Region) -> Option<u64>;
@@ -1117,6 +1376,10 @@ impl Writer for Formats {
         each!(self, it => it.shared_entry())
     }
 
+    fn start_hook(&self) -> Result<(Class, u32), String> {
+        each!(self, it => it.start_hook())
+    }
+
     #[inline]
     fn own(&self, class: &Class) -> (Class, u32) {
         each!(self, it => it.own(class))
@@ -1135,7 +1398,7 @@ impl Writer for Formats {
         each!(self, it => it.apply(r_type, bytes, p, s, addend))
     }
 
-    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, CowBytes)>, LinkError> {
         each!(self, it => it.synthesize(placed))
     }
 
@@ -1165,6 +1428,43 @@ pub(crate) fn writer(output: &Output) -> Result<Formats, LinkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A region in pages, some written since its buffer and its end past the buffer, reads
+    /// as the same bytes in one slice do: words and records across page boundaries, chunks,
+    /// runs and a prefix.
+    #[test]
+    fn a_view_in_pages_reads_as_one_slice() {
+        let page = CowBytes::PAGE;
+        let mut flat: Vec<u8> = (0..3 * page + 100).map(|it| (it * 7 + 3) as u8).collect();
+        let mut paged = CowBytes::from_vec(flat[..3 * page].to_vec());
+        paged.resize(flat.len());
+        flat[3 * page..].fill(0);
+        for at in [page - 3, 2 * page + 9] {
+            paged.write(at, &flat[at..at + 6]);
+        }
+        let len = flat.len() - 40;
+        let views = [View::Slice(&flat[..len]), View::Pages(Pages { bytes: &paged, len })];
+        let [slice, pages] = views;
+        assert!(pages.slice(page - 3, 6).is_none(), "a word across a page boundary is not one run");
+        let mut scratch = Vec::new();
+        for at in [0, page - 8, page - 3, page - 1, 2 * page + 9, 3 * page - 2, len - 8, len - 7] {
+            assert_eq!(slice.u64(at), pages.u64(at), "u64 at {at}");
+            assert_eq!(slice.u32(at), pages.u32(at), "u32 at {at}");
+            let want = slice.read(at, 7.min(len - at), &mut Vec::new()).map(<[u8]>::to_vec);
+            assert_eq!(pages.read(at, 7.min(len - at), &mut scratch).map(<[u8]>::to_vec), want, "read at {at}");
+        }
+        assert_eq!((slice.u64(len - 7), pages.read(len - 3, 4, &mut scratch)), (None, None));
+        for (at, end) in [(0, len - len % 12), (4, 4 + 12 * 2000), (page - 6, page + 6)] {
+            let want: Vec<[u8; 12]> = slice.arrays(at, end).collect();
+            assert_eq!(pages.arrays::<12>(at, end).collect::<Vec<_>>(), want, "chunks of {at}..{end}");
+        }
+        let mut rebuilt = vec![0u8; len];
+        pages.runs(|at, run| rebuilt[at..at + run.len()].copy_from_slice(run));
+        assert_eq!(rebuilt, flat[..len]);
+        let short = pages.prefix(page + 1).unwrap();
+        assert_eq!((short.len(), short.u32(page - 3), short.u32(page - 2)), (page + 1, slice.u32(page - 3), None));
+        assert!(pages.prefix(len + 1).is_none());
+    }
 
     #[test]
     fn a_suffix_names_the_bytes_inside_a_name() {

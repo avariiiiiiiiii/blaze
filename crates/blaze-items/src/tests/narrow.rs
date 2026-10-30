@@ -18,7 +18,8 @@ use hir_ty::{
     drop::destructor,
     layout::layout_of_adt_query,
     method_resolution::{
-        ImplWork, InherentImpls, TraitImpls, TraitValueItems, impl_work, trait_value_item,
+        ImplWork, InherentImpls, SelfTyKey, TraitImpls, TraitValueItems, impl_work,
+        trait_value_item,
     },
     next_solver::{DbInterner, GenericArgs, SimplifiedType},
     traits::{implements_trait_unique, implements_traits_unique, is_inherent_impl_coherent},
@@ -226,7 +227,9 @@ fn an_impl_of_another_trait_leaves_the_impls_of_a_trait() {
 
     db.set_file_text(file, &format!("{SPECIALIZING}impl Other for S {{}}\n"));
     let warm = db.log_executed(|| assert_eq!(impls_of_trait(&db, tr), 2));
-    assert!(ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
+    assert!(ran(&warm, "::in_module_for_trait"), "{warm:#?}");
+    assert!(!ran(&warm, "::for_crate_and_trait"), "{warm:#?}");
+    assert!(!ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
     assert!(!ran(&warm, "::in_crate_and_deps_for_trait"), "{warm:#?}");
 }
 
@@ -411,6 +414,113 @@ fn impl_tables_keep_the_order_impls_are_found_in() {
         expected.sort();
         assert_eq!(found, expected);
     });
+}
+
+const MODULES: &str = "mod a;\nmod b;\npub trait T {}\npub trait U {}\n";
+const MODULE_A: &str = "pub struct A;\nimpl A {}\nimpl crate::T for A {}\n";
+const MODULE_B: &str = "pub struct B;\nimpl B {}\nimpl crate::T for B {}\nimpl crate::U for B {}\n";
+
+/// A crate of two modules with impls, and the files of `a` and `b`.
+fn modules_db() -> (TestDB, FileId, FileId) {
+    let (db, files) = TestDB::with_many_files(&format!(
+        "//- /main.rs crate:main\n{MODULES}//- /a.rs\n{MODULE_A}//- /b.rs\n{MODULE_B}"
+    ));
+    let (a, b) = (files[1].file_id(&db), files[2].file_id(&db));
+    (db, a, b)
+}
+
+/// The buckets built module by module hold what the crate's tables hold, in the same order.
+#[test]
+fn per_module_buckets_are_the_crate_tables() {
+    let (db, _, _) = modules_db();
+    let k = krate(&db);
+    let a = SimplifiedType::Adt(AdtId::from(struct_named(&db, "A")).into());
+    let b = SimplifiedType::Adt(AdtId::from(struct_named(&db, "B")).into());
+    let (t, u) = (trait_named(&db, "T"), trait_named(&db, "U"));
+    hir_ty::attach_db(&db, || {
+        let whole = &**TraitImpls::for_crate(&db, k);
+        let inherent = InherentImpls::for_crate(&db, k);
+        for trait_ in [t, u] {
+            let bucket = TraitImpls::for_crate_and_trait(&db, k, trait_);
+            for self_ty in [a, b, SimplifiedType::Str] {
+                let expected = whole.for_trait_and_self_ty(trait_, &self_ty);
+                assert_eq!(bucket.for_trait_and_self_ty(trait_, &self_ty), expected);
+                let narrow =
+                    TraitImpls::in_crate_for_trait_and_self_ty(&db, k, trait_, SelfTyKey(self_ty));
+                assert_eq!(narrow, expected.0);
+            }
+            assert_eq!(bucket.blanket_impls(trait_), whole.blanket_impls(trait_));
+        }
+        for self_ty in [a, b, SimplifiedType::Str] {
+            let narrow = InherentImpls::in_crate_for_self_ty(&db, k, SelfTyKey(self_ty));
+            assert_eq!(narrow, inherent.for_self_ty(&self_ty));
+        }
+        assert_eq!(whole.for_trait_and_self_ty(t, &a).0.len(), 1);
+        assert_eq!(whole.for_trait_and_self_ty(u, &b).0.len(), 1);
+        assert_eq!(inherent.for_self_ty(&b).len(), 1);
+    });
+}
+
+/// An impl of `U` added to `a` reruns `U`'s bucket and what reads it; `T`'s bucket and the
+/// inherent ones are left unexecuted, though `a`'s own tables rerun.
+#[test]
+fn an_impl_in_one_module_reruns_only_its_trait_bucket() {
+    let (mut db, a_file, _) = modules_db();
+    let k = krate(&db);
+    let (t, u) = (trait_named(&db, "T"), trait_named(&db, "U"));
+    let b = SimplifiedType::Adt(AdtId::from(struct_named(&db, "B")).into());
+    let read = |db: &TestDB| {
+        hir_ty::attach_db(db, || {
+            (
+                TraitImpls::for_crate_and_trait(db, k, t).blanket_impls(t).len(),
+                TraitImpls::in_crate_for_trait(db, k, u).len(),
+                InherentImpls::in_crate_for_self_ty(db, k, SelfTyKey(b)).len(),
+            )
+        })
+    };
+    assert_eq!(read(&db), (0, 1, 1));
+
+    db.set_file_text(a_file, &format!("{MODULE_A}impl crate::U for A {{}}\n"));
+    let warm = db.log_executed(|| assert_eq!(read(&db), (0, 2, 1)));
+    assert!(ran(&warm, "::for_module"), "{warm:#?}");
+    assert!(ran(&warm, "::in_crate_for_trait"), "{warm:#?}");
+    let buckets = warm.iter().filter(|it| it.contains("::for_crate_and_trait")).count();
+    assert_eq!(buckets, 1, "only `U`'s bucket reruns: {warm:#?}");
+    assert!(!ran(&warm, "::in_crate_for_self_ty"), "{warm:#?}");
+}
+
+/// Adding a function to `a` leaves every bucket and both crate tables unexecuted.
+#[test]
+fn an_item_that_is_no_impl_reruns_no_bucket() {
+    let (mut db, a_file, _) = modules_db();
+    let k = krate(&db);
+    let t = trait_named(&db, "T");
+    let a = SimplifiedType::Adt(AdtId::from(struct_named(&db, "A")).into());
+    let read = |db: &TestDB| {
+        hir_ty::attach_db(db, || {
+            _ = TraitImpls::for_crate(db, k);
+            _ = InherentImpls::for_crate(db, k);
+            (
+                TraitImpls::in_crate_for_trait_and_self_ty(db, k, t, SelfTyKey(a)).len(),
+                InherentImpls::in_crate_for_self_ty(db, k, SelfTyKey(a)).len(),
+            )
+        })
+    };
+    assert_eq!(read(&db), (1, 1));
+
+    db.set_file_text(a_file, &format!("{MODULE_A}pub fn added() {{}}\n"));
+    let warm = db.log_executed(|| assert_eq!(read(&db), (1, 1)));
+    assert!(ran(&warm, "::for_module"), "{warm:#?}");
+    for query in [
+        "::for_crate",
+        "::for_crate_and_trait",
+        "::modules_by_trait",
+        "::modules_by_self_ty",
+        "::in_crate_for_trait_and_self_ty",
+        "::in_crate_for_self_ty",
+    ] {
+        assert!(!ran(&warm, query), "{query} reran: {warm:#?}");
+    }
 }
 
 const AUTO: &str = r#"
@@ -610,11 +720,13 @@ fn the_trait_name_index_answers_as_each_trait_alone() {
         names.sort();
         names.dedup();
         for name in names {
-            let mut index = TraitValueItems::default();
-            for &trait_ in traits.iter().chain(traits.iter().rev()) {
-                let alone = trait_value_item(&db, trait_, name);
-                assert_eq!(index.get(&db, trait_, name), alone, "{trait_:?} {name:?}");
-            }
+            blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+                let mut index = TraitValueItems::new_in(frame);
+                for &trait_ in traits.iter().chain(traits.iter().rev()) {
+                    let alone = trait_value_item(&db, trait_, name);
+                    assert_eq!(index.get(&db, trait_, name), alone, "{trait_:?} {name:?}");
+                }
+            });
         }
     });
 }

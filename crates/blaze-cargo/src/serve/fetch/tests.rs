@@ -48,7 +48,7 @@ impl Http for Fake {
     }
 }
 
-fn fetcher(fake: &Arc<Fake>) -> Fetcher {
+fn fetcher(fake: &Arc<Fake>) -> Fetcher<Fake> {
     Fetcher::with_http(fake.clone(), std::env::temp_dir().join("blaze-fetch-tests")).retrying(Retry {
         retries: 3,
         quiet: true,
@@ -122,7 +122,7 @@ fn file(path: &str, bytes: &[u8], mode: Mode) -> SourceFile {
 #[test]
 fn a_fetcher_is_shared_by_the_io_threads() {
     fn shared<T: Send + Sync>() {}
-    shared::<Fetcher>();
+    shared::<Fetcher<blaze_registry::http::HyperHttp>>();
 }
 
 #[test]

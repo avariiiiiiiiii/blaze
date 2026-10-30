@@ -1,5 +1,10 @@
 
 ## dedyn: crates/blaze-expand/src/native/: the in-process host is a concrete type, `dyn` only for what asks the database (user's call, 2026-10-29)
+> Being applied in the tree by dedyn-macro (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.
+> APPLIED by dedyn-macro 2026-10-29 21:34: parts 1-5 as written (the `Host` methods `pub`, so
+> `sys` and tests reach them); test `a_span_function_the_bridge_answers_alone_gives_the_wasm_hosts_word`
+> in `crates/blaze-macro-wasm/src/lib.rs` (dev-dependency `native-proc-macro`).
+
 
 Why: `__native::HOST` holds `*mut dyn Host` and every `sys` function, every `word` (one `pack`
 per input token, `registered`/`stream`) and every `unpacked` (one `get` per output token) goes
@@ -43,6 +48,10 @@ pub use native_proc_macro::__native::{NARROW, NONE, Part, Parts, WIDE};
   (`FxHashMap`; keep what `relative`/`read` still use).
 
 > forwarded to usercode (requests, pass 22).
+> applied (usercode-dedyn-native): found in the tree as asked (by dedyn-macro), checked
+> against the current code: `rustc-hash` in `proc_macro/Cargo.toml`, `NONE`..`impl Parts` in
+> `__native` with `pub` `WIDE`/`NARROW`/`part_written`, `wire.rs` re-exports them and no longer
+> imports `FxHashMap` or the span names; the column wire and reused `Parts` kept.
 
 ### 2. `proc_macro/lib.rs` `__native`: replace `pub trait Host { .. }` (lines 295–327) with
 
@@ -217,6 +226,10 @@ pub use native_proc_macro::__native::{NARROW, NONE, Part, Parts, WIDE};
 database questions moved behind `ask`.)
 
 > forwarded to usercode (requests, pass 22).
+> applied (usercode-dedyn-native): `trait Ask` and the concrete `Host<'a>` are in
+> `proc_macro/lib.rs` `__native` as written, the methods `pub` (the `sys` functions and
+> `native/mod.rs` call them); the one `dyn` left is `ask`, with its `// dyn:` line. `sys` is
+> unchanged, so the guest's text and `the_two_sys_modules_declare_the_same_functions` hold.
 
 ### 3. The thread-local and its two functions
 
@@ -247,6 +260,9 @@ database questions moved behind `ask`.)
   inherent).
 
 > forwarded to usercode (requests, pass 22).
+> applied (usercode-dedyn-native): `HOST` holds `*mut Host<'static>`, `with_host` and `host`
+> take and give `&mut Host<'_>` with the `SAFETY` text on the deref in `host` only (the `cast`
+> line keeps it as a plain comment); no `dyn` left on that path.
 
 ### 4. `crates/blaze-expand/src/native/host.rs`
 
@@ -357,6 +373,9 @@ pub(super) struct Ask<'a> {
   imports and `NONE`.
 
 > forwarded to usercode (requests, pass 22).
+> applied (usercode-dedyn-native): `native/host.rs` is `Ask { db: Option<&Db> }` with the
+> inherent `ask`, the free `written`, and `impl __native::Ask` as written; `line_column` lives
+> in the trait impl alone (no inherent copy, so no clash to rename).
 
 ### 5. Callers
 
@@ -375,3 +394,77 @@ Tests: the existing `native/tests.rs` differential tests (bridge output equal to
 module's, span for span) cover it unchanged; nothing new to pin.
 
 > forwarded to usercode (requests, pass 22).
+> applied (usercode-dedyn-native): `native/mod.rs:62-63` and `native/tests.rs:51-52` build
+> `host::Ask` then `__native::Host`; `use self::host::Host;` is gone. No edit to `lib.rs` was
+> needed.
+
+## usercode-hot-macros, 2026-10-29: a kept output read off a 4-byte boundary copies into new memory
+
+Where: `crates/blaze-expand/src/bridge/wire.rs`, `read` (its `let mut room = Vec::new();` and
+`aligned`). Owner: usercode (`crates/blaze-expand/`, outside `native/`).
+
+What: a `read_in(bytes: &[u8], parts: &Parts, room: &mut Vec<u8>) -> Result<TopSubtree, String>`
+that is today's `read` with the caller's `room` (`read` stays, calling it with a new one).
+`crates/blaze-macro-wasm/src/lib.rs` `Shapes::read` then passes a room kept in its `Scratch`
+(next to `kept`), so a store hit copies into reused memory.
+
+Why: a hit reads the kept tree in place in the store, under the guard. The tree starts
+`4 + 8 × parts` bytes into the value, so it is aligned exactly when the store's value is. When it
+isn't, `aligned` allocates a copy on every hit: one allocation beyond what the output owns on the
+hit path the brief says allocates nothing else. The budget test
+`a_kept_expansion_is_found_with_nothing_allocated_but_its_output` allows that one copy, counted
+from the value's address, and goes to the output's count alone once `read_in` is used.
+
+> forwarded to usercode (told by tmux; requests, pass 23).
+
+> applied (usercode, 2026-10-29):
+> - `bridge::wire::read_in(bytes, parts, room)` is today's `read` with the caller's room, and
+>   `read` calls it with a new one.
+> - `Shapes::read` takes the room, and `Scratch` keeps it as `aligned: Vec<u8>`. `expand` lends
+>   it through a `Cell`, as it does `kept`.
+> - The budget test drops the copy: a hit is held to the output's count alone. The address
+>   probe it used for the copy (`find_answered` with a fresh `Room`) is gone.
+
+## usercode-hot-macros, 2026-10-29: `Inputs::env_all` lends owned strings
+
+Where: `crates/blaze-usercode/src/trace.rs`, `trait Inputs`, `fn env_all(&mut self) ->
+&[(OsString, OsString)]`. Owner: usercode (`crates/blaze-usercode/`).
+
+What: lend borrowed pairs, `&[(&OsStr, &OsStr)]`, as
+`env` already lends `Option<&OsStr>`.
+
+Why: the wasm host's environment is `&[(&str, &str)]` made from the session's `Env` with no
+copy. To lend it as `env_all` asks, `Now::env_all` (`crates/blaze-macro-wasm/src/lib.rs`) owns a
+copy in thread-local room, rebuilt only when the environment differs from the thread's last
+lookup: a run that read its whole environment (rare: a module calling `env::vars`) allocates
+the copy on the first lookup of each other environment. With borrowed pairs it lends the slice
+as it is.
+
+> forwarded to usercode (told by tmux; requests, pass 23).
+
+> declined (usercode, 2026-10-29): it moves the copy rather than removing it.
+> - `env_all` has 20 implementations, in blaze-usercode, blaze-expand, proc-macro-api, the
+>   tests and two other lanes' tests.
+> - All but the wasm host own `(OsString, OsString)` pairs: `inputs::Env`, blaze-expand's
+>   `Seen`, the traces. None of them can lend `&[(&OsStr, &OsStr)]` without building a second
+>   vector of borrows into itself, an allocation on every call where today there is none.
+> - The one case it helps is rare and already bounded: a wasm module that read its whole
+>   environment copies it once per thread per distinct environment, and never on a repeat
+>   lookup.
+> - The shape that would fit every implementor is an iterator over sorted borrowed pairs:
+>   `fn env_all(&mut self) -> impl Iterator<Item = (&OsStr, &OsStr)> + Clone`. `keyed` reads it
+>   twice (`names_hex`, then the merge), and `Clone` allows that. If that copy ever shows up in
+>   a profile, ask for that, and usercode makes the change across the trait.
+
+## usercode-hot-macros, 2026-10-29: the answer to a span question owns its text
+
+Where: `crates/load-cargo/src/lib.rs`, `SubResponse` (`FilePathResult { name: String }`,
+`SourceTextResult { text: Option<String> }`, `LocalFilePathResult { name: Option<String> }`),
+which `blaze-macro-wasm`'s `answer` gets from the database. Owner: not this lane's.
+
+What, and why: nothing to do now. A hit whose key asked a span's file or source text allocates
+that answer's `String` once per question in `answer`, before it is hashed (`keyed::hex` into
+reused room). A `SubResponse` lending `&str` from the database would make those hits allocate
+nothing; noted so the owner can weigh it, not asked for.
+
+> forwarded to cargo (`crates/load-cargo/`; it says nothing to do now: noted) (requests, pass 23).

@@ -5,6 +5,7 @@ use std::cell::LazyCell;
 use base_db::{Db, EditionedFileId};
 use bitflags::bitflags;
 use blaze_ids::bits::Bits;
+use blaze_mem::frame::Frame;
 use cfg::{CfgExpr, CfgOptions};
 use hir_expand::{
     AstId, HirFileId, InFile, Intern, Lookup,
@@ -30,10 +31,10 @@ use crate::{
     TraitId, TypeAliasId, UnionId, VariantId,
     attrs::AttrFlags,
     expr_store::{
-        ExpressionStore, ExpressionStoreSourceMap, Move,
+        ExpressionStore, ExpressionStoreSourceMap, Move, MoveTo,
         lower::{
-            ExprCollector, lower_function, lower_generic_params_within, lower_impl, lower_trait,
-            lower_type_alias, lower_type_ref,
+            BodyLowering, ExprCollector, ImplTraitLowering, lower_function,
+            lower_generic_params_within, lower_impl, lower_trait, lower_type_alias, lower_type_ref,
         },
     },
     hir::{ExprId, PatId, generics::GenericParams},
@@ -89,6 +90,122 @@ fn child_tokens<const N: usize>(node: &SyntaxNode, kinds: [SyntaxKind; N]) -> [b
 /// when it is lowered from its file.
 type Maps<'a> = Option<(&'a RealSpanMap, &'a AstIdMap)>;
 
+/// What a signature's (or a variant's fields') `of` keeps: the value its crate's image serves,
+/// in the `Arc` the image is read into, or the value lowered here without its source map, in
+/// the memo itself. Only `with_source_map` builds a map, lowering again.
+#[derive(Debug, PartialEq, Eq)]
+enum Kept<T> {
+    Served(Arc<T>),
+    Lowered(T),
+}
+
+impl<T> std::ops::Deref for Kept<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        match self {
+            Kept::Served(it) => it,
+            Kept::Lowered(it) => it,
+        }
+    }
+}
+
+impl<T: PartialEq + std::fmt::Debug> Kept<T> {
+    fn new(served: Option<Arc<T>>, lower: impl FnOnce() -> T) -> Kept<T> {
+        match served {
+            Some(it) => Kept::Served(it),
+            None => Kept::Lowered(lower()),
+        }
+    }
+
+    /// How to lower the value again with its source map, `store` being the kept value's: given
+    /// the blocks of the value lowered here, so both lowerings agree on every id. A value an
+    /// image serves has the image's blocks, not a lowering's: the map's lowering makes its own,
+    /// as the reference lowering from syntax it is.
+    fn lowering<'a>(&self, store: &'a ExpressionStore) -> BodyLowering<'a> {
+        match self {
+            Kept::Lowered(_) => BodyLowering::SourceMap { blocks: store.block_scopes() },
+            Kept::Served(_) => BodyLowering::Whole,
+        }
+    }
+
+    /// `value`, lowered again with its source map as [`Kept::lowering`] says, checked equal to
+    /// the value lowered here.
+    fn with_map(&self, value: T) -> Arc<T> {
+        if let Kept::Lowered(it) = self {
+            assert_eq!(value, *it, "lowered again with its source map");
+        }
+        // alloc: the value with a map, one per `with_source_map`/`relative` memo
+        Arc::new(value)
+    }
+}
+
+/// The queries of the signature `$Sig` of an `$Id`, which `$Sig::lower` lowers and
+/// `deps::signatures::$served` reads from its crate's image: `of` reads the signature, lowered
+/// without its source map; `relative` and `with_source_map` lower it again with the map.
+macro_rules! signature_queries {
+    ($Sig:ident, $Id:ident, $served:ident) => {
+        #[salsa::tracked]
+        impl $Sig {
+            /// What [`Self::of`] reads: the image's signature, or the one lowered alone.
+            #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+            fn kept(db: &Db, id: $Id) -> Kept<$Sig> {
+                Kept::new(crate::deps::signatures::$served(db, id), || Self::lower_alone(db, id))
+            }
+
+            /// The signature with where each part of it is written in its file.
+            #[salsa::tracked(returns(ref), lru = 1024, mem_tag = Nameres)]
+            pub fn with_source_map(db: &Db, id: $Id) -> (Arc<$Sig>, ExpressionStoreSourceMap) {
+                match Self::relative(db, id) {
+                    Some((it, map)) => {
+                        let map = moved_to_file(db, id.into(), id.lookup(db).id, map);
+                        (it.clone(), map) // clone: an `Arc` count, once per memo
+                    }
+                    None => {
+                        let kept = Self::kept(db, id);
+                        let source = id.lookup(db).source(db);
+                        let lowering = kept.lowering(&kept.store);
+                        let (it, map) = Self::lower(db, id, source, None, lowering);
+                        (kept.with_map(it), map)
+                    }
+                }
+            }
+
+            /// The signature lowered again from its [`signature_syntax`], with the source map
+            /// of that tree; `None` for one a macro writes.
+            #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+            pub fn relative(db: &Db, id: $Id) -> Option<(Arc<$Sig>, ExpressionStoreSourceMap)> {
+                let syntax = signature_syntax(db, id.into()).as_ref()?;
+                let kept = Self::kept(db, id);
+                let lowering = kept.lowering(&kept.store);
+                let (it, map) = Self::lower(db, id, syntax.node(), Some(syntax.maps()), lowering);
+                Some((kept.with_map(it), map))
+            }
+        }
+
+        impl $Sig {
+            /// The signature: its crate's image's, or lowered from its [`signature_syntax`] (its
+            /// file for one a macro writes) with no source map. A read of it builds no map.
+            #[inline]
+            pub fn of(db: &Db, id: $Id) -> &$Sig {
+                Self::kept(db, id)
+            }
+
+            /// The signature lowered from its syntax without its source map, outside any query
+            /// of its own: what [`Self::of`] keeps when no image serves it, and what checking an
+            /// image records.
+            pub(crate) fn lower_alone(db: &Db, id: $Id) -> $Sig {
+                let (source, maps) = match signature_syntax(db, id.into()) {
+                    Some(syntax) => (syntax.node(), Some(syntax.maps())),
+                    None => (id.lookup(db).source(db), None),
+                };
+                Self::lower(db, id, source, maps, BodyLowering::Body).0
+            }
+        }
+    };
+}
+
 /// What a signature is lowered from: its item written in a file, as a tree of its own whose
 /// text starts at the item, with what no signature reads replaced by an empty node of its kind
 /// (the body of a fn, const or static, the items of an impl or trait, and for
@@ -143,7 +260,12 @@ impl SignatureSyntax {
     /// The syntax of `item`, a node of `source`'s tree, with `elide`'s node of it left out when
     /// the item is its own anchor. An item anchored at one around it is that whole one, less
     /// the bodies `source` already left out of it.
-    fn new(source: Source<'_>, item: &SyntaxNode, elide: Elide) -> Option<SignatureSyntax> {
+    fn new(
+        source: Source<'_>,
+        item: &SyntaxNode,
+        elide: Elide,
+        frame: &Frame,
+    ) -> Option<SignatureSyntax> {
         let Source { file_id, span_map, ast_id_map, cuts } = source;
         let item_range = item.text_range();
         let (_, anchor) = span_map.anchor_at(item_range.start());
@@ -159,7 +281,7 @@ impl SignatureSyntax {
         // The ast id map walks an empty fn body it is not told is left out as a body it has,
         // so each of the outline's empty bodies in an anchor around the item is left out too.
         // They hold nothing and all come after the item: none moves what the item has.
-        let mut elided = SmallVec::<[SyntaxNode; 1]>::new();
+        let mut elided = Vec::with_capacity_in(1, frame);
         match own {
             true => elided.extend(elide(item)),
             false => bodies_under(&anchor, |body| {
@@ -188,14 +310,13 @@ impl SignatureSyntax {
             item.kind(),
             TextRange::new(item_range.start() - base, item_range.end() - base - removed),
         );
-        // alloc: inline for the one node an item leaves out
-        let ptrs = elided.iter().map(SyntaxNodePtr::new).collect::<SmallVec<[_; 1]>>();
+        let ptrs = frame.alloc_slice_from_iter(elided.iter().map(SyntaxNodePtr::new));
         Some(SignatureSyntax {
             file_id,
             tree,
             item: item_ptr,
             elided: placeholder,
-            ast_id_map: ast_id_map.relative_without(&anchor, &copy, &ptrs),
+            ast_id_map: ast_id_map.relative_without(&anchor, &copy, ptrs),
             span_map: span_map.within(TextRange::new(base, spans_end)),
         })
     }
@@ -226,20 +347,8 @@ impl SignatureSyntax {
         let removed = file.len() - relative.len();
         // Something is left out only of an item that is the tree's root, so the item is the
         // one node around the empty node.
-        let to = |ptr: SyntaxNodePtr| {
-            let range = match self.elided {
-                _ if ptr == self.item => return SyntaxNodePtr::from_parts(ptr.kind(), file),
-                Some(elided) if ptr == elided => {
-                    TextRange::at(elided.text_range().start(), removed)
-                }
-                Some(elided) if ptr.text_range().start() >= elided.text_range().start() => {
-                    ptr.text_range() + removed
-                }
-                _ => ptr.text_range(),
-            };
-            SyntaxNodePtr::from_parts(ptr.kind(), range + base)
-        };
-        source_map.moved(&Move { file: self.file_id, to: &to })
+        let to = MoveTo::Signature { item: self.item, elided: self.elided, file, removed, base };
+        source_map.moved(&Move { file: self.file_id, to })
     }
 }
 
@@ -266,6 +375,16 @@ fn left_out(item: &SyntaxNode) -> Option<SyntaxNode> {
         SyntaxKind::CONST | SyntaxKind::STATIC => item.child_where(ast::Expr::can_cast),
         _ => None,
     }
+}
+
+/// Whether a fn body's text may start with an inner attribute, as
+/// [`syntax::view::block_may_start_with_inner_attr`] reads it (comments skipped; a maybe for
+/// any text it can't rule out): such a body holds attributes of its fn, so the outline keeps
+/// it. Doc comments aren't attributes the outline is read for (the docs read the file).
+fn may_start_with_inner_attr(body: &SyntaxNode) -> bool {
+    body.flat().is_none_or(|(tree, at)| {
+        syntax::view::block_may_start_with_inner_attr(&tree.source()[tree.range(at)], false)
+    })
 }
 
 /// The [`left_out`] bodies of the items that can be span anchors under `node` (a file or an
@@ -336,55 +455,62 @@ impl FileOutline {
 
 /// The [`FileOutline`] of `file_id`: one pass over the file's items, and one over what is left
 /// of the file for the copy and each map.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
-    let file = HirFileId::from(file_id);
-    let root = file.parse_or_expand(db);
-    let ast_id_map = file.ast_id_map(db);
-    let SpanMap::RealSpanMap(span_map) = file.span_map(db) else {
-        unreachable!("the spans of a file, not a macro's, are a real span map")
-    };
-    // alloc: the bodies cut, once per file and edit
-    let mut bodies = Vec::new();
-    bodies_under(&root, |body| {
-        let item = body.parent().expect("a body is under its item");
-        let (start, anchor) = span_map.anchor_at(item.text_range().start());
-        let own = start == item.text_range().start()
-            && anchor != ROOT_ERASED_FILE_AST_ID
-            && ast_id_map.get_erased(anchor) == SyntaxNodePtr::new(&item);
-        if own {
-            bodies.push(body);
+    blaze_mem::frame::current(|frame| {
+        let file = HirFileId::from(file_id);
+        let root = file.parse_or_expand(db);
+        let ast_id_map = file.ast_id_map(db);
+        let SpanMap::RealSpanMap(span_map) = file.span_map(db) else {
+            unreachable!("the spans of a file, not a macro's, are a real span map")
+        };
+        let mut bodies = Vec::new_in(frame);
+        bodies_under(&root, |body| {
+            let item = body.parent().expect("a body is under its item");
+            if item.kind() == SyntaxKind::FN && may_start_with_inner_attr(&body) {
+                return;
+            }
+            let (start, anchor) = span_map.anchor_at(item.text_range().start());
+            let own = start == item.text_range().start()
+                && anchor != ROOT_ERASED_FILE_AST_ID
+                && ast_id_map.get_erased(anchor) == SyntaxNodePtr::new(&item);
+            if own {
+                bodies.push(body);
+            }
+        });
+        let outline = root.clone_subtree_without(&bodies);
+        let ptrs = frame.alloc_slice_from_iter(bodies.iter().map(SyntaxNodePtr::new));
+        let ranges = frame.alloc_slice_from_iter(ptrs.iter().map(SyntaxNodePtr::text_range));
+        let mut cut = TextSize::new(0);
+        let cuts = ptrs
+            .iter()
+            .map(|ptr| {
+                let at = ptr.text_range().start() - cut;
+                cut += ptr.text_range().len();
+                SyntaxNodePtr::from_parts(ptr.kind(), TextRange::empty(at))
+            })
+            // alloc: the memo's cuts, exact: a slice's length
+            .collect();
+        FileOutline {
+            ast_id_map: ast_id_map.relative_without(&root, &outline, ptrs),
+            span_map: span_map.without(ranges),
+            // clone: an `Arc` count of the outline tree
+            tree: outline.flat().expect("a cloned subtree is flat").0.clone(),
+            cuts,
         }
-    });
-    let outline = root.clone_subtree_without(&bodies);
-    // alloc: one pointer per body cut, once per file and edit
-    let ptrs = bodies.iter().map(SyntaxNodePtr::new).collect::<Vec<_>>();
-    // alloc: one range per body cut, as `ptrs`
-    let ranges = ptrs.iter().map(SyntaxNodePtr::text_range).collect::<Vec<_>>();
-    let mut cut = TextSize::new(0);
-    let cuts = ptrs
-        .iter()
-        .map(|ptr| {
-            let at = ptr.text_range().start() - cut;
-            cut += ptr.text_range().len();
-            SyntaxNodePtr::from_parts(ptr.kind(), TextRange::empty(at))
-        })
-        // alloc: as `ptrs`
-        .collect();
-    FileOutline {
-        ast_id_map: ast_id_map.relative_without(&root, &outline, &ptrs),
-        span_map: span_map.without(&ranges),
-        // clone: an `Arc` count of the outline tree
-        tree: outline.flat().expect("a cloned subtree is flat").0.clone(),
-        cuts,
-    }
+    })
 }
 
 /// The [`SignatureSyntax`] of the item at `id`, `elide`'s node of it left out when it is its
 /// own anchor: read off its file's [`FileOutline`], and so the same after any edit of a body
 /// left out of it. An item in such a body is not in the outline and is read off its file, as
 /// the body it is in is. `None` for an item a macro writes.
-fn item_syntax<N: AstIdNode>(db: &Db, id: AstId<N>, elide: Elide) -> Option<SignatureSyntax> {
+fn item_syntax<N: AstIdNode>(
+    db: &Db,
+    id: AstId<N>,
+    elide: Elide,
+    frame: &Frame,
+) -> Option<SignatureSyntax> {
     let HirFileId::FileId(file) = id.file_id else { return None };
     let outline = file_outline(db, file);
     if let Some(ptr) = outline.ast_id_map.try_get_erased(id.value.erase()) {
@@ -394,39 +520,60 @@ fn item_syntax<N: AstIdNode>(db: &Db, id: AstId<N>, elide: Elide) -> Option<Sign
             ast_id_map: &outline.ast_id_map,
             cuts: &outline.cuts,
         };
-        return SignatureSyntax::new(source, &ptr.to_node(&outline.root()), elide);
+        return SignatureSyntax::new(source, &ptr.to_node(&outline.root()), elide, frame);
     }
     let SpanMap::RealSpanMap(span_map) = id.file_id.span_map(db) else { return None };
     let ast_id_map = id.file_id.ast_id_map(db);
     let source = Source { file_id: id.file_id, span_map, ast_id_map, cuts: &[] };
-    SignatureSyntax::new(source, id.to_node(db).syntax(), elide)
+    SignatureSyntax::new(source, id.to_node(db).syntax(), elide, frame)
+}
+
+/// The node at `id` in its file's [`FileOutline`], when the outline has it: the item's
+/// attributes read the same off it as off the file, and a body edit leaves it the same.
+/// `None` for an item in a body the outline leaves out, or one a macro writes.
+pub(crate) fn outline_item<N: AstIdNode>(db: &Db, id: AstId<N>) -> Option<N> {
+    let HirFileId::FileId(file) = id.file_id else { return None };
+    let outline = file_outline(db, file);
+    let ptr = outline.ast_id_map.try_get_erased(id.value.erase())?;
+    N::cast(ptr.to_node(&outline.root()))
+}
+
+/// The root of `file`'s [`FileOutline`]: the file less the bodies it leaves out.
+pub(crate) fn outline_root(db: &Db, file: EditionedFileId) -> ast::SourceFile {
+    ast::SourceFile::cast(file_outline(db, file).root()).expect("an outline's root is a file")
 }
 
 /// The [`SignatureSyntax`] of `def`'s signature, `None` for an item a macro writes.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub fn signature_syntax(db: &Db, def: GenericDefId) -> Option<SignatureSyntax> {
     let nothing: Elide = |_| None;
     let items: Elide = |it| it.child_where(|kind| kind == SyntaxKind::ASSOC_ITEM_LIST);
     let variants: Elide = |it| it.child_where(|kind| kind == SyntaxKind::VARIANT_LIST);
-    match def {
-        GenericDefId::AdtId(AdtId::StructId(it)) => item_syntax(db, it.lookup(db).id, nothing),
-        GenericDefId::AdtId(AdtId::UnionId(it)) => item_syntax(db, it.lookup(db).id, nothing),
-        GenericDefId::AdtId(AdtId::EnumId(it)) => item_syntax(db, it.lookup(db).id, variants),
-        GenericDefId::FunctionId(it) => item_syntax(db, it.lookup(db).id, left_out),
-        GenericDefId::ConstId(it) => item_syntax(db, it.lookup(db).id, left_out),
-        GenericDefId::StaticId(it) => item_syntax(db, it.lookup(db).id, left_out),
-        GenericDefId::ImplId(it) => item_syntax(db, it.lookup(db).id, items),
-        GenericDefId::TraitId(it) => item_syntax(db, it.lookup(db).id, items),
-        GenericDefId::TypeAliasId(it) => item_syntax(db, it.lookup(db).id, nothing),
-    }
+    blaze_mem::frame::current(|frame| match def {
+        GenericDefId::AdtId(AdtId::StructId(it)) => {
+            item_syntax(db, it.lookup(db).id, nothing, frame)
+        }
+        GenericDefId::AdtId(AdtId::UnionId(it)) => {
+            item_syntax(db, it.lookup(db).id, nothing, frame)
+        }
+        GenericDefId::AdtId(AdtId::EnumId(it)) => {
+            item_syntax(db, it.lookup(db).id, variants, frame)
+        }
+        GenericDefId::FunctionId(it) => item_syntax(db, it.lookup(db).id, left_out, frame),
+        GenericDefId::ConstId(it) => item_syntax(db, it.lookup(db).id, left_out, frame),
+        GenericDefId::StaticId(it) => item_syntax(db, it.lookup(db).id, left_out, frame),
+        GenericDefId::ImplId(it) => item_syntax(db, it.lookup(db).id, items, frame),
+        GenericDefId::TraitId(it) => item_syntax(db, it.lookup(db).id, items, frame),
+        GenericDefId::TypeAliasId(it) => item_syntax(db, it.lookup(db).id, nothing, frame),
+    })
 }
 
 /// The [`SignatureSyntax`] of an enum with its variants, nothing left out: what its
 /// [`EnumVariants`] and the [`VariantFields`] of its variants are lowered from. `None` for an
 /// enum a macro writes.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub fn variants_syntax(db: &Db, def: EnumId) -> Option<SignatureSyntax> {
-    item_syntax(db, def.lookup(db).id, |_| None)
+    blaze_mem::frame::current(|frame| item_syntax(db, def.lookup(db).id, |_| None, frame))
 }
 
 /// `source_map`, of `def`'s signature lowered from its [`signature_syntax`], moved to `item`,
@@ -455,8 +602,9 @@ pub struct StructSignature {
     pub shape: FieldsShape,
 }
 
-// Each signature is one `Arc` (8 bytes of count before it) holding its store and generic
-// params (72 bytes each today) and its own fields, whose bytes are what these assert:
+// Each signature `of` keeps is in its memo (in an `Arc` only when an image serves it), and
+// holds its store and generic params (72 bytes each today) and its own fields, whose bytes are
+// what these assert:
 // 160 bytes for a struct, union, enum or trait, 184 for a function or type alias, 88 for a
 // const or static (no generic params), 160 for an impl.
 const _: () = assert!(
@@ -566,50 +714,16 @@ impl StructFlags {
     }
 }
 
-#[salsa::tracked]
+signature_queries!(StructSignature, StructId, served_struct);
+
 impl StructSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: StructId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_struct(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: StructId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`], with the source map of that tree;
-    /// `None` for a struct a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: StructId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
     fn lower(
         db: &Db,
         id: StructId,
         InFile { file_id, value: source }: InFile<ast::Struct>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
         let attrs = AttrFlags::query(db, id.into());
 
@@ -628,18 +742,10 @@ impl StructSignature {
             source.where_clause(),
             LoweringMode::Analysis,
             maps,
+            lowering,
         );
-        (
-            // alloc: the memo's value, one per signature
-            Arc::new(StructSignature {
-                generic_params,
-                store,
-                flags,
-                shape,
-                name: as_name_opt(source.name()),
-            }),
-            source_map,
-        )
+        let name = as_name_opt(source.name());
+        (StructSignature { generic_params, store, flags, shape, name }, source_map)
     }
 
     #[inline]
@@ -669,50 +775,16 @@ pub struct UnionSignature {
     pub flags: StructFlags,
 }
 
-#[salsa::tracked]
+signature_queries!(UnionSignature, UnionId, served_union);
+
 impl UnionSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: UnionId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_union(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: UnionId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`], with the source map of that tree;
-    /// `None` for a union a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: UnionId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
     fn lower(
         db: &Db,
         id: UnionId,
         InFile { file_id, value: source }: InFile<ast::Union>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
         let flags = StructFlags::from_attrs(AttrFlags::query(db, id.into()));
 
@@ -725,17 +797,10 @@ impl UnionSignature {
             source.where_clause(),
             LoweringMode::Analysis,
             maps,
+            lowering,
         );
-        (
-            // alloc: the memo's value, one per signature
-            Arc::new(UnionSignature {
-                generic_params,
-                store,
-                flags,
-                name: as_name_opt(source.name()),
-            }),
-            source_map,
-        )
+        let name = as_name_opt(source.name());
+        (UnionSignature { generic_params, store, flags, name }, source_map)
     }
 
     #[inline]
@@ -778,50 +843,17 @@ pub struct EnumSignature {
     pub flags: EnumFlags,
 }
 
-#[salsa::tracked]
+signature_queries!(EnumSignature, EnumId, served_enum);
+
 impl EnumSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: EnumId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_enum(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: EnumId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`] (its variants left out), with the
-    /// source map of that tree; `None` for an enum a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: EnumId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
+    /// Lowered from its [`signature_syntax`], its variants left out.
     fn lower(
         db: &Db,
         id: EnumId,
         InFile { file_id, value: source }: InFile<ast::Enum>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
         let flags = EnumFlags::from_attrs(AttrFlags::query(db, id.into()));
 
@@ -834,18 +866,10 @@ impl EnumSignature {
             source.where_clause(),
             LoweringMode::Analysis,
             maps,
+            lowering,
         );
-
-        (
-            // alloc: the memo's value, one per signature
-            Arc::new(EnumSignature {
-                generic_params,
-                store,
-                flags,
-                name: as_name_opt(source.name()),
-            }),
-            source_map,
-        )
+        let name = as_name_opt(source.name());
+        (EnumSignature { generic_params, store, flags, name }, source_map)
     }
 }
 
@@ -883,50 +907,17 @@ pub struct ConstSignature {
     pub flags: ConstFlags,
 }
 
-#[salsa::tracked]
+signature_queries!(ConstSignature, ConstId, served_const);
+
 impl ConstSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: ConstId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_const(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: ConstId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`] (its body left out), with the
-    /// source map of that tree; `None` for a const a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: ConstId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
+    /// Lowered from its [`signature_syntax`], its body left out.
     fn lower(
         db: &Db,
         id: ConstId,
         source: InFile<ast::Const>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
         let module = loc.container.module(db);
@@ -937,18 +928,9 @@ impl ConstSignature {
         flags.set(ConstFlags::HAS_BODY, source.value.body().is_some());
 
         let (store, source_map, type_ref) =
-            lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps);
-
-        (
-            // alloc: the memo's value, one per signature
-            Arc::new(ConstSignature {
-                store,
-                type_ref,
-                flags,
-                name: source.value.name().map(|it| it.as_name()),
-            }),
-            source_map,
-        )
+            lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps, lowering);
+        let name = source.value.name().map(|it| it.as_name());
+        (ConstSignature { store, type_ref, flags, name }, source_map)
     }
 }
 
@@ -980,50 +962,17 @@ pub struct StaticSignature {
     pub flags: StaticFlags,
 }
 
-#[salsa::tracked]
+signature_queries!(StaticSignature, StaticId, served_static);
+
 impl StaticSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: StaticId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_static(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: StaticId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`] (its body left out), with the
-    /// source map of that tree; `None` for a static a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: StaticId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
+    /// Lowered from its [`signature_syntax`], its body left out.
     fn lower(
         db: &Db,
         id: StaticId,
         source: InFile<ast::Static>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
         let module = loc.container.module(db);
@@ -1041,18 +990,9 @@ impl StaticSignature {
         flags.set(StaticFlags::EXPLICIT_SAFE, safe);
 
         let (store, source_map, type_ref) =
-            lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps);
-
-        (
-            // alloc: the memo's value, one per signature
-            Arc::new(StaticSignature {
-                store,
-                type_ref,
-                flags,
-                name: as_name_opt(source.value.name()),
-            }),
-            source_map,
-        )
+            lower_type_ref(db, module, source.as_ref().map(|it| it.ty()), maps, lowering);
+        let name = as_name_opt(source.value.name());
+        (StaticSignature { store, type_ref, flags, name }, source_map)
     }
 }
 
@@ -1076,50 +1016,17 @@ pub struct ImplSignature {
     pub flags: ImplFlags,
 }
 
-#[salsa::tracked]
+signature_queries!(ImplSignature, ImplId, served_impl);
+
 impl ImplSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: ImplId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_impl(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: ImplId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`] (its items left out), with the
-    /// source map of that tree; `None` for an impl a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: ImplId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
+    /// Lowered from its [`signature_syntax`], its items left out.
     fn lower(
         db: &Db,
         id: ImplId,
         src: InFile<ast::Impl>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
         let [unsafe_, negative, default, const_] =
@@ -1131,13 +1038,8 @@ impl ImplSignature {
         flags.set(ImplFlags::CONST, const_);
 
         let (store, source_map, self_ty, target_trait, generic_params) =
-            lower_impl(db, loc.container, src, id, maps);
-
-        (
-            // alloc: the memo's value, one per signature
-            Arc::new(ImplSignature { store, generic_params, self_ty, target_trait, flags }),
-            source_map,
-        )
+            lower_impl(db, loc.container, src, id, maps, lowering);
+        (ImplSignature { store, generic_params, self_ty, target_trait, flags }, source_map)
     }
 }
 
@@ -1172,6 +1074,8 @@ bitflags::bitflags! {
         const ALIAS = 1 << 9;
         /// `const trait Tr`.
         const CONST = 1 << 10;
+        /// `#[rustc_deny_explicit_impl]`: no impl of the trait may be written.
+        const DENY_EXPLICIT_IMPL = 1 << 11;
     }
 }
 
@@ -1184,6 +1088,7 @@ impl TraitFlags {
             RUSTC_COINDUCTIVE => COINDUCTIVE,
             RUSTC_SKIP_ARRAY_DURING_METHOD_DISPATCH => SKIP_ARRAY_DURING_METHOD_DISPATCH,
             RUSTC_SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH => SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH,
+            RUSTC_DENY_EXPLICIT_IMPL => DENY_EXPLICIT_IMPL,
         })
     }
 }
@@ -1196,50 +1101,17 @@ pub struct TraitSignature {
     pub flags: TraitFlags,
 }
 
-#[salsa::tracked]
+signature_queries!(TraitSignature, TraitId, served_trait);
+
 impl TraitSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: TraitId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_trait(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: TraitId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`] (its items left out), with the
-    /// source map of that tree; `None` for a trait a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: TraitId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
+    /// Lowered from its [`signature_syntax`], its items left out.
     fn lower(
         db: &Db,
         id: TraitId,
         source: InFile<ast::Trait>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
         let mut flags = TraitFlags::from_attrs(AttrFlags::query(db, id.into()));
@@ -1255,10 +1127,9 @@ impl TraitSignature {
         flags.set(TraitFlags::CONST, const_);
 
         let name = as_name_opt(source.value.name());
-        let (store, source_map, generic_params) = lower_trait(db, loc.container, source, id, maps);
-
-        // alloc: the memo's value, one per signature
-        (Arc::new(TraitSignature { store, generic_params, flags, name }), source_map)
+        let (store, source_map, generic_params) =
+            lower_trait(db, loc.container, source, id, maps, lowering);
+        (TraitSignature { store, generic_params, flags, name }, source_map)
     }
 }
 
@@ -1316,52 +1187,22 @@ pub struct FunctionSignature {
     pub ret_type: Option<TypeRefId>,
     pub abi: ExternAbi,
     pub flags: FnFlags,
+    /// rustc's `FnDecl::splatted`: the index into `params` (`self` first) of the first parameter
+    /// with `#[rustc_splat]`, below `u8::MAX`; `None` for a C-variadic function.
+    pub splatted: Option<u8>,
 }
 
-#[salsa::tracked]
+signature_queries!(FunctionSignature, FunctionId, served_function);
+
 impl FunctionSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: FunctionId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_function(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: FunctionId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`] (its body left out), with the
-    /// source map of that tree; `None` for a function a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: FunctionId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
+    /// Lowered from its [`signature_syntax`], its body left out.
     fn lower(
         db: &Db,
         id: FunctionId,
         source: InFile<ast::Fn>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
         let module = loc.container.module(db);
 
@@ -1396,21 +1237,12 @@ impl FunctionSignature {
                 | ItemContainerId::TraitId(_) => None,
             })
             .unwrap_or(ExternAbi::Rust);
-        let (store, source_map, generic_params, params, ret_type, self_param, variadic) =
-            lower_function(db, module, source, id, maps);
+        let (store, source_map, generic_params, params, ret_type, self_param, variadic, splatted) =
+            lower_function(db, module, source, id, maps, lowering);
         flags.set(FnFlags::HAS_SELF_PARAM, self_param);
         flags.set(FnFlags::HAS_VARARGS, variadic);
         (
-            // alloc: the memo's value, one per signature
-            Arc::new(FunctionSignature {
-                generic_params,
-                store,
-                params,
-                ret_type,
-                abi,
-                flags,
-                name,
-            }),
+            FunctionSignature { generic_params, store, params, ret_type, abi, flags, name, splatted },
             source_map,
         )
     }
@@ -1510,50 +1342,16 @@ pub struct TypeAliasSignature {
     pub flags: TypeAliasFlags,
 }
 
-#[salsa::tracked]
+signature_queries!(TypeAliasSignature, TypeAliasId, served_type_alias);
+
 impl TypeAliasSignature {
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: TypeAliasId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_type_alias(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
-        }
-    }
-
-    /// The signature with where each part of it is written in its file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
-    pub fn with_source_map(
-        db: &Db,
-        id: TypeAliasId,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        match Self::relative(db, id) {
-            // clone: an `Arc` count, once per memo
-            Some((it, map)) => (it.clone(), moved_to_file(db, id.into(), id.lookup(db).id, map)),
-            None => Self::lower(db, id, id.lookup(db).source(db), None),
-        }
-    }
-
-    /// The signature lowered from its [`signature_syntax`], with the source map of that tree;
-    /// `None` for a type alias a macro writes.
-    #[salsa::tracked(returns(ref))]
-    pub fn relative(
-        db: &Db,
-        id: TypeAliasId,
-    ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
-        let syntax = signature_syntax(db, id.into()).as_ref()?;
-        Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))
-    }
-
     fn lower(
         db: &Db,
         id: TypeAliasId,
         source: InFile<ast::TypeAlias>,
         maps: Maps<'_>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let loc = id.lookup(db);
 
         let mut flags = TypeAliasFlags::from_attrs(AttrFlags::query(db, id.into()));
@@ -1563,13 +1361,8 @@ impl TypeAliasSignature {
         );
         let name = as_name_opt(source.value.name());
         let (store, source_map, generic_params, bounds, ty) =
-            lower_type_alias(db, loc.container, source, id, maps);
-
-        (
-            // alloc: the memo's value, one per signature
-            Arc::new(TypeAliasSignature { store, generic_params, flags, bounds, name, ty }),
-            source_map,
-        )
+            lower_type_alias(db, loc.container, source, id, maps, lowering);
+        (TypeAliasSignature { store, generic_params, flags, bounds, name, ty }, source_map)
     }
 }
 
@@ -1607,7 +1400,7 @@ pub struct VariantFields {
     pub shape: FieldsShape,
 }
 
-// The field array (24 bytes), the shape and the store (72 bytes today): 104 bytes in one `Arc`.
+// The field array (24 bytes), the shape and the store (72 bytes today): 104 bytes in its memo.
 const _: () = assert!(size_of::<VariantFields>() == size_of::<ExpressionStore>() + 32);
 
 /// What the fields of `id` are lowered from: the [`variants_syntax`] of an enum variant's
@@ -1622,13 +1415,27 @@ fn variant_syntax(db: &Db, id: VariantId) -> Option<&SignatureSyntax> {
 
 #[salsa::tracked]
 impl VariantFields {
+    /// What [`Self::of`] reads: the image's fields, or those lowered alone.
+    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
+    fn kept(db: &Db, id: VariantId) -> Kept<VariantFields> {
+        Kept::new(crate::deps::signatures::served_variant_fields(db, id), || {
+            Self::lower_alone(db, id)
+        })
+    }
+
     /// The fields with where each part of them is written in their file.
-    #[salsa::tracked(returns(ref), lru = 1024)]
+    #[salsa::tracked(returns(ref), lru = 1024, mem_tag = Nameres)]
     pub fn with_source_map(
         db: &Db,
         id: VariantId,
     ) -> (Arc<Self>, ExpressionStoreSourceMap) {
-        let Some((it, map)) = Self::relative(db, id) else { return Self::lower(db, id, None) };
+        let Some((it, map)) = Self::relative(db, id) else {
+            let kept = Self::kept(db, id);
+            let lowering = kept.lowering(&kept.store);
+            let (it, map) =
+                blaze_mem::frame::current(|frame| Self::lower(db, id, None, lowering, frame));
+            return (kept.with_map(it), map);
+        };
         let file = match id {
             VariantId::EnumVariantId(it) => file_range(db, it.lookup(db).parent.lookup(db).id),
             VariantId::StructId(it) => file_range(db, it.lookup(db).id),
@@ -1640,20 +1447,43 @@ impl VariantFields {
 
     /// The fields lowered from their [`variant_syntax`], with the source map of that tree;
     /// `None` for a variant, struct or union a macro writes.
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
     pub fn relative(
         db: &Db,
         id: VariantId,
     ) -> Option<(Arc<Self>, ExpressionStoreSourceMap)> {
         let syntax = variant_syntax(db, id)?;
-        Some(Self::lower(db, id, Some(syntax)))
+        let kept = Self::kept(db, id);
+        let lowering = kept.lowering(&kept.store);
+        let (it, map) =
+            blaze_mem::frame::current(|frame| Self::lower(db, id, Some(syntax), lowering, frame));
+        Some((kept.with_map(it), map))
+    }
+}
+
+impl VariantFields {
+    /// The fields: their crate's image's, or lowered from their [`variant_syntax`] (their
+    /// file for those a macro writes) with no source map. A read of them builds no map.
+    #[inline]
+    pub fn of(db: &Db, id: VariantId) -> &VariantFields {
+        Self::kept(db, id)
+    }
+
+    /// The fields lowered from their syntax without their source map, outside any query of
+    /// their own: what [`Self::of`] keeps when no image serves them, and what checking an
+    /// image records.
+    pub(crate) fn lower_alone(db: &Db, id: VariantId) -> VariantFields {
+        let syntax = variant_syntax(db, id);
+        blaze_mem::frame::current(|frame| Self::lower(db, id, syntax, BodyLowering::Body, frame)).0
     }
 
     fn lower(
         db: &Db,
         id: VariantId,
         syntax: Option<&SignatureSyntax>,
-    ) -> (Arc<Self>, ExpressionStoreSourceMap) {
+        lowering: BodyLowering<'_>,
+        frame: &Frame,
+    ) -> (Self, ExpressionStoreSourceMap) {
         let maps = syntax.map(SignatureSyntax::maps);
         let (shape, result) = match id {
             VariantId::EnumVariantId(id) => {
@@ -1674,6 +1504,8 @@ impl VariantFields {
                     source.map(|src| src.field_list()),
                     enum_vis,
                     maps,
+                    lowering,
+                    frame,
                 );
                 (shape, fields)
             }
@@ -1687,6 +1519,8 @@ impl VariantFields {
                     source.map(|src| src.field_list()),
                     None,
                     maps,
+                    lowering,
+                    frame,
                 );
                 (shape, fields)
             }
@@ -1699,37 +1533,23 @@ impl VariantFields {
                     source.map(|src| src.record_field_list().map(ast::FieldList::RecordFieldList)),
                     None,
                     maps,
+                    lowering,
+                    frame,
                 );
                 (FieldsShape::Record, fields)
             }
         };
         match result {
-            Some((fields, store, source_map)) => {
-                // alloc: the memo's value, one per signature
-                (Arc::new(VariantFields { fields, store, shape }), source_map)
-            }
+            Some((fields, store, source_map)) => (VariantFields { fields, store, shape }, source_map),
             None => (
-                // alloc: the memo's value, one per signature
-                Arc::new(VariantFields {
+                VariantFields {
                     fields: Arena::default(),
                     // clone: of the empty store, which allocates nothing
                     store: ExpressionStore::empty().clone(),
                     shape,
-                }),
+                },
                 ExpressionStoreSourceMap::default(),
             ),
-        }
-    }
-
-    #[salsa::tracked(returns(deref))]
-    pub fn of(db: &Db, id: VariantId) -> Arc<Self> {
-        if let Some(it) = crate::deps::signatures::served_variant_fields(db, id) {
-            return it;
-        }
-        match Self::relative(db, id) {
-            Some((it, _)) => it.clone(), // clone: an `Arc` count, once per memo
-            // clone: an `Arc` count, for an item a macro writes
-            None => Self::with_source_map(db, id).0.clone(),
         }
     }
 }
@@ -1763,6 +1583,8 @@ fn lower_field_list(
     fields: InFile<Option<ast::FieldList>>,
     override_visibility: Option<Option<ast::Visibility>>,
     maps: Maps<'_>,
+    lowering: BodyLowering<'_>,
+    frame: &Frame,
 ) -> Option<(Arena<FieldData>, ExpressionStore, ExpressionStoreSourceMap)> {
     let file_id = fields.file_id;
     match fields.value? {
@@ -1775,6 +1597,8 @@ fn lower_field_list(
             |field| field.eq_token().and_then(|_| field.default_val()),
             override_visibility,
             maps,
+            lowering,
+            frame,
         ),
         ast::FieldList::TupleFieldList(fields) => lower_fields(
             db,
@@ -1785,6 +1609,8 @@ fn lower_field_list(
             |_| None,
             override_visibility,
             maps,
+            lowering,
+            frame,
         ),
     }
 }
@@ -1800,6 +1626,8 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
     mut default_value: impl FnMut(&Field) -> Option<ast::ConstArg>,
     override_visibility: Option<Option<ast::Visibility>>,
     maps: Maps<'_>,
+    lowering: BodyLowering<'_>,
+    frame: &Frame,
 ) -> Option<(Arena<FieldData>, ExpressionStore, ExpressionStoreSourceMap)> {
     if count == 0 {
         return None;
@@ -1807,6 +1635,7 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
     let cfg_options = module.krate(db).cfg_options(db);
     let mut col =
         ExprCollector::with_maps(db, module, fields.file_id, crate::LoweringMode::Analysis, maps);
+    col.set_lowering(lowering);
     let override_visibility = override_visibility.map(|vis| {
         LazyCell::new(|| {
             let span_map = match maps {
@@ -1817,13 +1646,13 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
         })
     });
 
-    let mut arena = Arena::with_capacity(count);
+    let mut lowered = Vec::with_capacity_in(count, frame);
     let mut idx = 0;
     for (ty, field) in fields.value {
         match AttrFlags::is_cfg_enabled_for(&field, cfg_options) {
             Ok(()) => {
                 let type_ref =
-                    col.lower_type_ref_opt(ty, &mut ExprCollector::impl_trait_error_allocator);
+                    col.lower_type_ref_opt(ty, &mut ImplTraitLowering::Error);
                 let visibility = override_visibility.as_ref().map_or_else(
                     || {
                         visibility_from_ast(db, field.visibility(), &mut |range| {
@@ -1836,7 +1665,7 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
                 let name = field_name(idx, &field);
                 let default_value = default_value(&field).map(|expr| col.lower_const_arg(expr));
 
-                arena.alloc(FieldData { name, type_ref, visibility, is_unsafe, default_value });
+                lowered.push(FieldData { name, type_ref, visibility, is_unsafe, default_value });
                 idx += 1;
             }
             Err(cfg) => {
@@ -1849,9 +1678,11 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
             }
         }
     }
-    let (store, source_map) = col.store.finish();
-    if arena.len() < count {
-        arena.shrink_to_fit();
+    let (store, source_map) = col.finish_store();
+    // alloc: the memo's fields, exact: those the cfg left in
+    let mut arena = Arena::with_capacity(lowered.len());
+    for field in lowered {
+        arena.alloc(field);
     }
     Some((arena, store, source_map))
 }
@@ -1893,7 +1724,7 @@ impl Eq for EnumVariants {}
 
 #[salsa::tracked]
 impl EnumVariants {
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
     pub(crate) fn of(
         db: &Db,
         e: EnumId,
@@ -1909,60 +1740,68 @@ impl EnumVariants {
     /// The variants lowered from syntax: what [`EnumVariants::of`] gives when no image serves
     /// them, and what checking an image compares its record with.
     pub(crate) fn lower(db: &Db, e: EnumId) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
-        let loc = e.lookup(db);
-        // The relative tree's ast ids are the file's: what a variant is interned by.
-        let (source, ast_id_map) = match variants_syntax(db, e) {
-            Some(syntax) => (syntax.node::<ast::Enum>(), &syntax.ast_id_map),
-            None => {
-                let source = loc.source(db);
-                let ast_id_map = source.file_id.ast_id_map(db);
-                (source, ast_id_map)
-            }
-        };
-
-        let mut diagnostics = ThinVec::new();
-        let cfg_options = loc.container.krate(db).cfg_options(db);
-        let Some(list) = source.value.variant_list() else {
-            let variants = FxIndexMap::default();
-            let explicit_discriminant = VariantBits::default();
-            return (EnumVariants { variants, explicit_discriminant }, ThinVec::new());
-        };
-        let count = list.variants().count();
-        let mut variants = FxIndexMap::with_capacity_and_hasher(count, Default::default());
-        let mut explicit_discriminant = VariantBits::new(count); // alloc: inline up to 64 variants
-        for variant in list.variants() {
-            let ast_id = ast_id_map.ast_id(&variant);
-            match AttrFlags::is_cfg_enabled_for(&variant, cfg_options) {
-                Ok(()) => {
-                    let name = as_name_opt(variant.name());
-                    let id = source.with_value(ast_id);
-                    // clone: a `Symbol` count: the loc and the map each keep the name
-                    let enum_variant = EnumVariantLoc { id, parent: e, name: name.clone() }.intern(db);
-                    let shape = adt_shape(variant.kind());
-                    // The expression the variant's body is lowered from, when it has one.
-                    let explicit = variant.const_arg().and_then(|it| it.expr()).is_some();
-                    // A name written twice keeps its first place and the last variant's value.
-                    let (index, _) = variants.insert_full(name, (enum_variant, shape));
-                    explicit_discriminant.set(index, explicit);
+        blaze_mem::frame::current(|frame| {
+            let loc = e.lookup(db);
+            // The relative tree's ast ids are the file's: what a variant is interned by.
+            let (source, ast_id_map) = match variants_syntax(db, e) {
+                Some(syntax) => (syntax.node::<ast::Enum>(), &syntax.ast_id_map),
+                None => {
+                    let source = loc.source(db);
+                    let ast_id_map = source.file_id.ast_id_map(db);
+                    (source, ast_id_map)
                 }
-                Err(cfg) => {
-                    diagnostics.push(InactiveEnumVariantCode {
+            };
+
+            let cfg_options = loc.container.krate(db).cfg_options(db);
+            let Some(list) = source.value.variant_list() else {
+                let variants = FxIndexMap::default();
+                let explicit_discriminant = VariantBits::default();
+                return (EnumVariants { variants, explicit_discriminant }, ThinVec::new());
+            };
+            let count = list.variants().count();
+            let mut kept = Vec::with_capacity_in(count, frame);
+            let mut inactive = Vec::new_in(frame);
+            for variant in list.variants() {
+                let ast_id = ast_id_map.ast_id(&variant);
+                match AttrFlags::is_cfg_enabled_for(&variant, cfg_options) {
+                    Ok(()) => {
+                        let name = as_name_opt(variant.name());
+                        let id = source.with_value(ast_id);
+                        // clone: a `Symbol` count: the loc and the map each keep the name
+                        let loc_name = name.clone();
+                        let enum_variant =
+                            EnumVariantLoc { id, parent: e, name: loc_name }.intern(db);
+                        // The expression the variant's body is lowered from, when it has one.
+                        let explicit = variant.const_arg().and_then(|it| it.expr()).is_some();
+                        kept.push((name, enum_variant, adt_shape(variant.kind()), explicit));
+                    }
+                    Err(cfg) => inactive.push(InactiveEnumVariantCode {
                         ast_id,
                         cfg,
                         // clone: error path, a cfg'd-out variant's diagnostic
                         opts: cfg_options.clone(),
-                    });
+                    }),
                 }
             }
-        }
-        if variants.len() < count {
-            variants.shrink_to_fit();
-            explicit_discriminant.truncate(variants.len());
-            explicit_discriminant.shrink_to_fit();
-        }
-        diagnostics.shrink_to_fit();
-
-        (EnumVariants { variants, explicit_discriminant }, diagnostics)
+            // alloc: the memo's map, exact unless a name is written twice (an error)
+            let mut variants = FxIndexMap::with_capacity_and_hasher(kept.len(), Default::default());
+            let kept_len = kept.len();
+            // alloc: the memo's bits, inline up to 64 variants
+            let mut explicit_discriminant = VariantBits::new(kept_len);
+            for (name, enum_variant, shape, explicit) in kept {
+                // A name written twice keeps its first place and the last variant's value.
+                let (index, _) = variants.insert_full(name, (enum_variant, shape));
+                explicit_discriminant.set(index, explicit);
+            }
+            if variants.len() < kept_len {
+                explicit_discriminant.truncate(variants.len());
+                explicit_discriminant.shrink_to_fit();
+            }
+            // alloc: the memo's diagnostics, exact; none unless a variant is cfg'd out
+            let mut diagnostics = ThinVec::with_capacity(inactive.len());
+            diagnostics.extend(inactive);
+            (EnumVariants { variants, explicit_discriminant }, diagnostics)
+        })
     }
 
     /// Variants read back from a dependency image; `explicit[i]` is whether variant `i` is
@@ -2032,7 +1871,7 @@ impl EnumVariants {
     }
 }
 
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn extern_block_abi(db: &Db, extern_block: ExternBlockId) -> ExternAbi {
     let source = extern_block.lookup(db).source(db);
     source
@@ -2110,6 +1949,9 @@ mod tests {
         }
         if attrs.contains(AttrFlags::RUSTC_SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH) {
             flags |= TraitFlags::SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH;
+        }
+        if attrs.contains(AttrFlags::RUSTC_DENY_EXPLICIT_IMPL) {
+            flags |= TraitFlags::DENY_EXPLICIT_IMPL;
         }
         flags
     }
@@ -2353,6 +2195,12 @@ struct Q(pub u8, u8);
     }
 }
 
+#[cfg(test)]
+mod budgets;
+
+#[cfg(test)]
+mod alone_tests;
+
 /// What an edit of a file lowers again of the signatures: each is lowered from its own
 /// [`SignatureSyntax`], so an edit of a body, or of another item, lowers none of them.
 #[cfg(test)]
@@ -2369,7 +2217,7 @@ mod relative_tests {
         test_db::{TestDB, TestDBExt},
     };
 
-    const CODE: &str = r#"
+    pub(super) const CODE: &str = r#"
 pub struct S<T> { a: T, b: u32 }
 pub union U { a: u32, b: f32 }
 pub enum E<T> { A = 1, B(T), C { c: u8 } }
@@ -2474,10 +2322,13 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         signatures.chain(variants).collect()
     }
 
-    /// The signature lowerings in `log`.
+    /// The signature lowerings in `log`: `kept` lowers what `of` reads, `relative` lowers it
+    /// again with its source map.
     fn lowerings(log: &[String]) -> Vec<&str> {
         let lowering = |it: &&String| {
-            it.contains("Signature::relative")
+            it.contains("Signature::kept")
+                || it.contains("Signature::relative")
+                || it.contains("VariantFields::kept")
                 || it.contains("VariantFields::relative")
                 || it.contains("EnumVariants::of")
         };
@@ -2510,8 +2361,8 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         let mut lowerings = lowerings(&log);
         lowerings.sort_unstable();
         assert_eq!(lowerings.len(), 2, "{log:#?}");
-        assert!(lowerings[0].contains("StructSignature::relative"), "{lowerings:?}");
-        assert!(lowerings[1].contains("VariantFields::relative"), "{lowerings:?}");
+        assert!(lowerings[0].contains("StructSignature::kept"), "{lowerings:?}");
+        assert!(lowerings[1].contains("VariantFields::kept"), "{lowerings:?}");
     }
 
     #[test]
@@ -2551,6 +2402,31 @@ impl S<u8> { fn h(&self) -> u8 { 0 } }
         }
     }
 
+    /// A fn body that may start with an inner attribute holds attributes of its fn, so the
+    /// outline keeps it; a comment first is skipped, and a const's block is its own.
+    #[test]
+    fn the_outline_keeps_a_body_an_inner_attribute_may_start() {
+        const INNER: &str = r#"
+pub fn kept() { #![rustc_nounwind] }
+pub fn after_comment() { // why
+    #![rustc_nounwind] }
+pub fn outer_first() { #[allow(unused)] let x = 1; }
+pub fn cut() { /* none */ 1; }
+pub const K: u8 = { #![allow(unused)] 1 };
+"#;
+        const LEFT: &str = r#"
+pub fn kept() { #![rustc_nounwind] }
+pub fn after_comment() { // why
+    #![rustc_nounwind] }
+pub fn outer_first() { #[allow(unused)] let x = 1; }
+pub fn cut() 
+pub const K: u8 = ;
+"#;
+        let (db, file) = TestDB::with_single_file(INNER);
+        assert_eq!(file_outline(&db, file).root().to_string(), LEFT);
+        assert_eq!(outline_root(&db, file).syntax().to_string(), LEFT);
+    }
+
     #[test]
     fn a_body_edit_runs_no_signature_syntax() {
         let (mut db, file) = TestDB::with_single_file(CODE);
@@ -2588,7 +2464,10 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
         ] {
             let item = named(name);
             let id = InFile::new(file_id, file_id.ast_id_map(&db).ast_id(&item));
-            let syntax = item_syntax(&db, id, nothing).unwrap_or_else(|| panic!("{name}"));
+            let syntax = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+                item_syntax(&db, id, nothing, frame)
+            })
+            .unwrap_or_else(|| panic!("{name}"));
             assert_eq!(syntax.root().to_string(), text, "{name}");
             assert_eq!(syntax.node::<ast::Struct>().value.syntax().to_string(), item.to_string());
             assert_eq!(syntax.ast_id_map.get_erased(id.value.erase()), syntax.item, "{name}");
@@ -2690,7 +2569,8 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
                 let id = $id;
                 let (signature, map) = $Signature::with_source_map(&$db, id);
                 let source = id.lookup(&$db).source(&$db);
-                let (whole, whole_map) = $Signature::lower(&$db, id, source, None);
+                let (whole, whole_map) =
+                    $Signature::lower(&$db, id, source, None, BodyLowering::Whole);
                 assert_eq!(**signature, *whole, "{id:?}");
                 assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
             }};
@@ -2715,7 +2595,9 @@ pub fn p(x: [u8; { struct InType; 1 }]) -> u8 { x[0] }
             }
             for id in variants {
                 let (fields, map) = VariantFields::with_source_map(&db, id);
-                let (whole, whole_map) = VariantFields::lower(&db, id, None);
+                let (whole, whole_map) = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+                    VariantFields::lower(&db, id, None, BodyLowering::Whole, frame)
+                });
                 assert_eq!(**fields, *whole, "{id:?}");
                 assert!(*map == whole_map, "{id:?}: {map:#?}\nfrom the file: {whole_map:#?}");
             }

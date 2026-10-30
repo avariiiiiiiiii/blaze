@@ -4,16 +4,43 @@
 //!
 //! The one unsafe block of the module is [`Lent::alloc`]'s; its API is safe.
 
-use std::{cell::RefCell, ops::Deref, sync::Arc};
+use std::{
+    alloc::{Allocator, Global},
+    cell::RefCell,
+    ops::Deref,
+    sync::Arc,
+};
 
 /// Values lent for as long as the list lives. Each is behind a pointer of its own, so the
 /// list growing moves the pointers, never what they point at. 24 bytes plus one pointer per
-/// value; nothing is taken out before the list is dropped.
-pub(crate) struct Lent<P>(RefCell<Vec<P>>);
+/// value; nothing is taken out before the list is dropped. The list's own pointers are
+/// `A`'s (a build's frame); what they point at is in allocations of its own.
+pub(crate) struct Lent<P, A: Allocator = Global>(RefCell<Vec<P, A>>);
 
 impl<P> Default for Lent<P> {
     fn default() -> Self {
         Lent(RefCell::new(Vec::new()))
+    }
+}
+
+impl<P, A: Allocator> Lent<P, A> {
+    /// An empty list whose pointers are kept in `alloc`.
+    pub(crate) fn new_in(alloc: A) -> Self {
+        Lent(RefCell::new(Vec::new_in(alloc)))
+    }
+
+    /// An empty list in `room`'s buffer: one a list before gave back ([`Self::into_room`]).
+    pub(crate) fn from_room(mut room: Vec<P, A>) -> Self {
+        room.clear();
+        Lent(RefCell::new(room))
+    }
+
+    /// Drops every value kept and gives back the emptied buffer. Taking `self` ends every
+    /// loan, so nothing lent is left to point at what this drops.
+    pub(crate) fn into_room(self) -> Vec<P, A> {
+        let mut room = self.0.into_inner();
+        room.clear();
+        room
     }
 }
 
@@ -33,7 +60,10 @@ unsafe impl<T> Stable for Arc<T> {}
 // place and which lives until the `Box` is dropped.
 unsafe impl<T> Stable for Box<T> {}
 
-impl<P: Stable> Lent<P> {
+// SAFETY: a shared reference's target is not where the reference is, and outlives it.
+unsafe impl<T> Stable for &T {}
+
+impl<P: Stable, A: Allocator> Lent<P, A> {
     /// Keeps `value` and lends its target for as long as the list lives.
     pub(crate) fn alloc(&self, value: P) -> &P::Target {
         let mut list = self.0.borrow_mut();
@@ -44,7 +74,9 @@ impl<P: Stable> Lent<P> {
         // the move into it, which would retag a `Box` and invalidate it under Stacked
         // Borrows). `P` is `Stable`, so later growth of the list moves the pointer and not its
         // target, and nothing is taken out of the list before it is dropped, which `&self`
-        // outlives. Taken out early, the target would be freed under a live reference.
+        // outlives. Taken out early, the target would be freed under a live reference. `A`
+        // holds only the list's buffer of pointers; a frame is reset only through
+        // `&mut Frame`, which can't be had while the list borrows it.
         unsafe { &*at }
     }
 }
@@ -76,5 +108,40 @@ mod tests {
         }
         assert!(lent.iter().map(|it| **it).eq(reference.iter().copied()));
         assert!(given.iter().map(|it| **it).eq(reference.iter().copied()));
+    }
+
+    /// A list kept in a frame lends as one on the heap does, and its pointers take nothing of
+    /// the global allocator once the frame is warm.
+    #[test]
+    fn a_lent_value_in_a_frame_list_is_the_one_kept() {
+        let boxes: Vec<Box<u64>> = (0..512).map(Box::new).collect();
+        let lend = |frame: &blaze_mem::Frame| {
+            let list: Lent<&u64, &blaze_mem::Frame> = Lent::new_in(frame);
+            boxes.iter().map(|it| std::ptr::eq(list.alloc(&**it), &**it)).all(|same| same)
+        };
+        assert!(blaze_mem::frame::task(blaze_mem::Tag::Codegen, &lend));
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm frame list of pointers", || {
+            blaze_mem::frame::task(blaze_mem::Tag::Codegen, &lend)
+        });
+        assert!(warm);
+    }
+
+    /// A list made from the room another gave back is empty, lends what it is given, and
+    /// grows into that room before it asks for more.
+    #[test]
+    fn a_list_in_given_back_room_starts_empty() {
+        let first: Lent<Box<u64>> = Lent::default();
+        for it in 0..64 {
+            first.alloc(Box::new(it));
+        }
+        let room = first.into_room();
+        assert!(room.is_empty());
+        let capacity = room.capacity();
+        let again = Lent::from_room(room);
+        let lent = again.alloc(Box::new(7));
+        assert_eq!(*lent, 7);
+        let room = again.into_room();
+        assert!(room.is_empty());
+        assert_eq!(room.capacity(), capacity);
     }
 }

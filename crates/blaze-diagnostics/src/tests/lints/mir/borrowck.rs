@@ -1,8 +1,6 @@
 //! rustc's borrow checker: its errors, from rustc's UI tests (`tests/ui/borrowck/`,
-//! `tests/ui/error-codes/`), and `unused_mut`. The errors are checked by code, where and
-//! message: the labels rustc puts on their other spans (the first borrow, its later use, the
-//! move) wait on hir-ty-borrowck giving those spans (v2/requests/diagnostics.md,
-//! diagnostics-lints).
+//! `tests/ui/error-codes/`), and `unused_mut`. Most errors are checked by code, where and
+//! message; `E0499.rs` by rustc's whole `.stderr`, with the labels hir-ty-borrowck gives.
 
 use crate::tests::{checked, ui};
 
@@ -45,6 +43,23 @@ trait Fake { fn use_mut(&mut self) { } fn use_ref(&self) { }  }
 impl<T> Fake for T { }
 "#;
     assert_eq!(errors(None, source), ["E0499 4:17 cannot borrow `i` as mutable more than once at a time"]);
+    // tests/ui/error-codes/E0499.stderr
+    let stderr = r#"error[E0499]: cannot borrow `i` as mutable more than once at a time
+  --> $DIR/E0499.rs:4:17
+   |
+LL |     let mut x = &mut i;
+   |                 ------ first mutable borrow occurs here
+LL |     let mut a = &mut i;
+   |                 ^^^^^^ second mutable borrow occurs here
+LL |     a.use_mut();
+LL |     x.use_mut();
+   |     - first borrow later used here
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0499`.
+"#;
+    assert_eq!(ui("E0499.rs", "2015", source), stderr);
 }
 
 #[test]

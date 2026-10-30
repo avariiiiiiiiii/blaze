@@ -24,28 +24,6 @@ const MAX_COMPRESSION_RATIO: u64 = 20;
 /// The time cargo gives the files `cargo package` makes, which a `.crate` has no time for.
 const DETERMINISTIC_TIMESTAMP: i64 = 1153704088;
 
-/// Values kept by the sha256 of their bytes: blaze's store, to which a `.crate` file is given
-/// by its checksum.
-pub trait Blobs: Send + Sync {
-    fn get(&self, sha256: &[u8; 32]) -> Option<Vec<u8>>;
-    fn has(&self, sha256: &[u8; 32]) -> bool;
-    fn put(&self, sha256: &[u8; 32], bytes: &[u8]);
-}
-
-impl Blobs for blaze_store::Store {
-    fn get(&self, sha256: &[u8; 32]) -> Option<Vec<u8>> {
-        blaze_store::Store::get(self, sha256)
-    }
-
-    fn has(&self, sha256: &[u8; 32]) -> bool {
-        blaze_store::Store::has(self, sha256)
-    }
-
-    fn put(&self, sha256: &[u8; 32], bytes: &[u8]) {
-        self.insert(sha256, bytes);
-    }
-}
-
 /// A package of a registry to fetch: the checksum is the lock file's, or the index's.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Package {
@@ -76,18 +54,7 @@ pub enum From {
 
 /// The 32 bytes of a checksum written in hex.
 pub fn parse_checksum(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0; 32];
-    for (at, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(at * 2..at * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|it| format!("{it:02x}")).collect()
+    blaze_format::hex::decode(hex)
 }
 
 /// The URL of a `.crate` file from a registry's `dl` template (cargo-util's `crate_url`).
@@ -159,7 +126,7 @@ impl Registry {
     pub fn crate_bytes(&self, package: &Package) -> anyhow::Result<(Vec<u8>, From)> {
         let key = parse_checksum(&package.checksum)
             .with_context(|| format!("`{}` is not a sha256 checksum", package.checksum))?;
-        let store = self.context().store.as_deref();
+        let store = self.context().store;
         let matches = |bytes: &[u8]| <[u8; 32]>::from(Sha256::digest(bytes)) == key;
         let cache_file = self.crate_file(&package.name, &package.version);
         if let Some(bytes) = store.and_then(|it| it.get(&key)).filter(|it| matches(it)) {
@@ -171,7 +138,7 @@ impl Registry {
         match std::fs::read(&cache_file) {
             Ok(bytes) if !bytes.is_empty() && matches(&bytes) => {
                 if let Some(store) = store {
-                    store.put(&key, &bytes);
+                    store.insert(&key, &bytes);
                 }
                 return Ok((bytes, From::CargoCache));
             }
@@ -210,7 +177,7 @@ impl Registry {
             bail!("failed to verify the checksum of `{package}`");
         }
         if let Some(store) = store {
-            store.put(&key, &bytes);
+            store.insert(&key, &bytes);
         }
         if self.context().keep_crate_files {
             keep_crate_file(&cache_file, &bytes);
@@ -261,7 +228,7 @@ fn is_unpacked(dst: &Path) -> anyhow::Result<bool> {
 pub fn unpack_package(tarball: &[u8], dst: &Path) -> anyhow::Result<u64> {
     std::fs::create_dir_all(dst)
         .with_context(|| format!("failed to create `{}`", dst.display()))?;
-    let written = unpack(tarball, dst, &|_| true)?;
+    let written = unpack(tarball, dst, |_| true)?;
     set_generated_mtimes(dst);
     let path = dst.join(PACKAGE_SOURCE_LOCK);
     let mut ok = OpenOptions::new()
@@ -280,7 +247,7 @@ pub fn unpack_package(tarball: &[u8], dst: &Path) -> anyhow::Result<u64> {
 pub fn unpack_package_in(
     tarball: &[u8],
     dst: &Path,
-    include: &dyn Fn(&Path) -> bool,
+    include: impl Fn(&Path) -> bool,
 ) -> anyhow::Result<u64> {
     let written = unpack(tarball, dst, include)?;
     set_generated_mtimes(dst);
@@ -299,7 +266,7 @@ fn set_generated_mtimes(dst: &Path) {
 /// Unpacks a tarball whose every entry is under `<name>-<version>/`, files and directories
 /// only, into the directory above `dst`, with no more than cargo lets one unpack to, but for
 /// the entries `include` leaves out.
-fn unpack(tarball: &[u8], dst: &Path, include: &dyn Fn(&Path) -> bool) -> anyhow::Result<u64> {
+fn unpack(tarball: &[u8], dst: &Path, include: impl Fn(&Path) -> bool) -> anyhow::Result<u64> {
     let limit = MAX_UNPACK_SIZE.max(tarball.len() as u64 * MAX_COMPRESSION_RATIO);
     let gz = flate2::read::GzDecoder::new(tarball);
     let mut tar = Archive::new(LimitErrorReader { inner: gz, left: limit });
@@ -391,5 +358,5 @@ fn is_windows_reserved_path(path: &Path) -> bool {
 
 /// The sha256 of some bytes in hex, as an index's `cksum` writes it.
 pub fn checksum(bytes: &[u8]) -> String {
-    hex(&Sha256::digest(bytes))
+    blaze_format::hex::encode(&Sha256::digest(bytes))
 }

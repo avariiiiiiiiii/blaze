@@ -13,6 +13,7 @@ use std::{error::Error, fs, path::Path};
 
 use blaze_wasm::{Compiler, MAIN, bundle, pack};
 
+// dyn: the CLI's error, printed once.
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();

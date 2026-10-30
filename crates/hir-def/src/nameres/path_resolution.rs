@@ -614,15 +614,15 @@ impl DefMap {
                         );
                     }
 
-                    let module_data = if module.block(db) == self.block_id() {
-                        self.module(db, module)
+                    let def_map = if module.block(db) == self.block_id() {
+                        self
                     } else {
-                        module.def_map(db).module(db, module)
+                        module.def_map(db)
                     };
 
                     // Since it is a qualified path here, it should not contains legacy macros
                     reads(PathRead::Slot(module, *segment));
-                    module_data.name_in_scope(db, segment)
+                    def_map.name_in_module(db, module, segment)
                 }
                 ModuleDefId::AdtId(AdtId::EnumId(e)) => {
                     // enum variant
@@ -727,7 +727,7 @@ impl DefMap {
             }
         };
         reads(PathRead::Slot(module, *name));
-        let from_scope = self.module(db, module).name_in_scope(db, name);
+        let from_scope = self.name_in_module(db, module, name);
         let from_scope = match types_only {
             true => from_scope,
             false => from_scope.filter_macro(db, expected_macro_subns),
@@ -839,11 +839,11 @@ impl DefMap {
             Some(_) => {
                 let def_map = self.crate_root(db).def_map(db);
                 reads(PathRead::Slot(def_map.root, *name));
-                def_map.module(db, def_map.root).name_in_scope(db, name)
+                def_map.name_in_module(db, def_map.root, name)
             }
             None => {
                 reads(PathRead::Slot(self.root, *name));
-                self.module(db, self.root).name_in_scope(db, name)
+                self.name_in_module(db, self.root, name)
             }
         };
         let done = if types_only { from_crate_root.types.is_some() } else { from_crate_root.is_full() };
@@ -868,7 +868,7 @@ impl DefMap {
         if let Some((prelude, _use)) = self.prelude {
             let def_map = if prelude.krate(db) == self.krate { self } else { prelude.def_map(db) };
             reads(PathRead::Slot(prelude, *name));
-            def_map.module(db, prelude).name_in_scope(db, name)
+            def_map.name_in_module(db, prelude, name)
         } else {
             PerNs::none()
         }

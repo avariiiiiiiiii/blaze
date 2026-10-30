@@ -23,7 +23,9 @@ use crate::{
     ModuleId, StaticId, StructId, TraitId, TypeAliasId, UnionId, VariantId, nameres::crate_def_map,
 };
 
-/// The domain of an item's key.
+/// The domain of an item's key. Its version goes up whenever what [`of`] hashes changes: the
+/// keys of values filed by an item's key (`deps::const_key`, `hir_ty::consteval::deps`) take
+/// the key as it is, so a new encoding must give new keys.
 pub(super) const KEY_DOMAIN: &str = "blaze v2 dependency signature key 1";
 
 /// [`KEY_DOMAIN`] with its context key derived once, not on every key a serve hashes.
@@ -83,7 +85,7 @@ impl Item {
 }
 
 /// The modules of `krate`'s `DefMap` by their index in it.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub(super) fn module_indexes(db: &Db, krate: Crate) -> FxHashMap<ModuleId, u32> {
     let modules = crate_def_map(db, krate).modules(db);
     // alloc: once per crate, the map every key of the crate reads.

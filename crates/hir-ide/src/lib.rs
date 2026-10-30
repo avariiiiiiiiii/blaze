@@ -18,6 +18,10 @@ mod test_db;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use base_db::Db;
 use hir_def::ModuleId;
 use hir_ty::next_solver::Const;

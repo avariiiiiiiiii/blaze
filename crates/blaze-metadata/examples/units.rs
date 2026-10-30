@@ -159,7 +159,6 @@ fn run() -> anyhow::Result<()> {
             cfg: &target.as_ref().unwrap_or(&host).cfg,
         }),
         offline: false,
-        store: None,
         rustc_version: flags.rustc_version.as_deref(),
     };
     let units = blaze_metadata::Units {

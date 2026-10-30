@@ -230,6 +230,7 @@ impl<'a> Inner<'a> {
 
     /// rustc's `pprust::meta_list_item_to_string`.
     pub(super) fn to_text(&self) -> String {
+        // alloc: the text of an invalid `--check-cfg` argument, for its error
         let mut out = String::new();
         print_inner(self, &mut out);
         out
@@ -405,6 +406,7 @@ impl<'t, 'a> Parser<'t, 'a> {
     pub(super) fn meta_item(&mut self) -> Option<MetaItem<'a>> {
         let start = self.peek()?.range.start();
         let global = self.eat_path_sep();
+        // alloc: of a command-line argument (setup) or a `cfg_select!` arm, never a tree's attribute
         let mut path = vec![self.segment()?];
         while self.eat_path_sep() {
             path.push(self.segment()?);
@@ -425,6 +427,7 @@ impl<'t, 'a> Parser<'t, 'a> {
         if !self.eat_single(SyntaxKind::L_PAREN) {
             return None;
         }
+        // alloc: as `meta_item`'s path
         let mut items = Vec::new();
         loop {
             if self.eat_single(SyntaxKind::R_PAREN) {
@@ -553,6 +556,7 @@ pub(super) fn is_reserved(name: &str, edition: Edition) -> bool {
 pub(super) fn shown(name: &str, edition: Edition) -> Cow<'_, str> {
     let can_be_raw = !name.is_empty() && name != "_" && !is_path_segment_keyword(name);
     match can_be_raw && is_reserved(name, edition) {
+        // alloc: a diagnostic's text, a reserved name shown raw
         true => Cow::Owned(format!("r#{name}")),
         false => Cow::Borrowed(name),
     }

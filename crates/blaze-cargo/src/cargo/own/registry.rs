@@ -9,6 +9,7 @@ use std::sync::Arc;
 use anyhow::{Context as _, anyhow, bail};
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::{Config, Context, Workspace};
+use blaze_manifest::files::Disk;
 use blaze_registry::api::Api;
 use blaze_registry::auth::{Auth, AuthorizationError, Named, Operation, Shell};
 use blaze_resolve::{CRATES_IO_REGISTRY, SourceId};
@@ -258,7 +259,7 @@ enum RegistryOrIndex {
 
 /// `--registry`, `--index`, or the `registry.default` configured, as cargo's
 /// `registry_or_index`.
-fn registry_or_index(read: &Read, config: &Config) -> anyhow::Result<Option<RegistryOrIndex>> {
+fn registry_or_index(read: &Read, config: &Config<Disk>) -> anyhow::Result<Option<RegistryOrIndex>> {
     Ok(match (read.value("--registry"), read.value("--index")) {
         (None, None) => config.default_registry()?.map(RegistryOrIndex::Registry),
         (None, Some(index)) => {
@@ -302,7 +303,7 @@ impl Target {
 
 /// cargo's `get_source_id`: the registry named, with only crates.io's own replacement (its
 /// sparse index); with none named, a `[source]` replacing crates.io is an error.
-fn target(ctx: &Context, asked: Option<&RegistryOrIndex>) -> anyhow::Result<Target> {
+fn target(ctx: &Context<Disk>, asked: Option<&RegistryOrIndex>) -> anyhow::Result<Target> {
     let crates_io = || (SourceId::crates_io(), Some(CRATES_IO_REGISTRY.to_owned()));
     let (original, name) = match asked {
         None => crates_io(),
@@ -334,7 +335,7 @@ fn target(ctx: &Context, asked: Option<&RegistryOrIndex>) -> anyhow::Result<Targ
 
 /// The last name of crates.io's chain of `replace-with`, and whether it is a `[registries]`
 /// name rather than a `[source]` one: cargo names a replacement by it.
-fn replaced_by(config: &Config) -> anyhow::Result<Option<(String, bool)>> {
+fn replaced_by(config: &Config<Disk>) -> anyhow::Result<Option<(String, bool)>> {
     let mut name = CRATES_IO_REGISTRY.to_owned();
     let mut last = None;
     while let Some(with) = config.get_string(&format!("source.{name}.replace-with"))? {
@@ -353,7 +354,7 @@ fn replaced_by(config: &Config) -> anyhow::Result<Option<(String, bool)>> {
 
 /// The run's flags every command reads, and its credentials.
 struct Run {
-    ctx: Context,
+    ctx: Context<Disk>,
     auth: Arc<Auth>,
     quiet: bool,
 }

@@ -41,6 +41,7 @@ impl LatePass for DerefNullPtr {
             Expr::UnaryOp { expr: pointer, op: UnaryOp::Deref } => {
                 if is_null_ptr(b, pointer) && !self.raw_borrowed.contains(&expr) {
                     let (Some(span), Some(at)) = (span(b, expr), b.expr_node(expr)) else { return };
+                    // clone: a lint's span, for a lint found
                     let mut diag = Diag::lint("deref_nullptr", "dereferencing a null pointer", span.clone());
                     diag.span_label(span, "this code causes undefined behavior when executed");
                     out.push(b.lint(diag, Phase::Late, at));

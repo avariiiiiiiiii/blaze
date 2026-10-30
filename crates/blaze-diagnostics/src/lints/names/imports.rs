@@ -28,7 +28,7 @@ mod used;
 use hir::{HirFileId, InFile};
 use hir_expand::MacroCallKind;
 use rustc_hash::FxHashMap;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 use syntax::{SyntaxNodePtr, TextRange};
 
 use crate::{
@@ -54,6 +54,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
         LintId::named("pub_use_of_private_extern_crate"),
     ]);
     if !cx.any_may_fire(&GIVES) {
+        // alloc: an empty `Vec` allocates nothing
         return Vec::new();
     }
     let walk = cx.walk();
@@ -66,12 +67,8 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
     if cx.lint_may_fire(LintId::named("unused_qualifications")) {
         buffered.extend(qualifications::lints(cx, walk, &uses, &unused));
     }
-    let mut keyed: Vec<_> = buffered
-        .into_iter()
-        .map(|found| (found.lint_at.clone().map(|at| places.place(cx, at)).unwrap_or_default(), found))
-        .collect();
-    keyed.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut found: Vec<Found> = keyed.into_iter().map(|(_, found)| found).collect();
+    let mut found = buffered;
+    found.sort_by_cached_key(|found| found.lint_at.map(|at| places.place(cx, at)).unwrap_or_default());
     debug_assert!(found.iter().all(|it| it.phase == Phase::Resolve));
     found.append(&mut unused.bodies);
     found
@@ -110,7 +107,8 @@ impl Places {
 
     /// The place of `at`.
     pub(super) fn place(&self, cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Place {
-        let mut inner: SmallVec<[(u32, u32); 2]> = smallvec![entered(at.value.text_range())];
+        let mut inner: SmallVec<[(u32, u32); 2]> = SmallVec::new();
+        inner.push(entered(at.value.text_range()));
         let mut file = at.file_id;
         while let Some(call) = file.macro_file() {
             let loc = call.loc(cx.db);

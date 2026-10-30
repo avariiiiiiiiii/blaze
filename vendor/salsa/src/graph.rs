@@ -177,54 +177,85 @@ impl Relocation<'_> {
     }
 }
 
-/// `len` zeroed words for a page of the node or edge columns, from a zeroed allocation: the part
-/// of a page that is never written is never touched, so it stays out of the resident set.
+/// The words of a page of the node or edge columns.
 #[cfg(not(feature = "shuttle"))]
-pub(crate) fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
-    // SAFETY: all-zero bits are an `AtomicU32` of 0.
-    unsafe { zeroed(len) }
+pub(crate) type Words<T> = Zeroed<T>;
+/// The words of a page of the node or edge columns; shuttle's atomics are objects of their own.
+#[cfg(feature = "shuttle")]
+pub(crate) type Words<T> = Box<[T]>;
+
+/// `len` zeroed words for a page of the node or edge columns.
+#[cfg(not(feature = "shuttle"))]
+pub(crate) fn zeroed_u32s(len: usize) -> Words<AtomicU32> {
+    // SAFETY: all-zero bits are an `AtomicU32` of 0, which needs no drop.
+    unsafe { Zeroed::new(len) }
 }
 
 /// `len` zeroed words, as [`zeroed_u32s`].
 #[cfg(not(feature = "shuttle"))]
-fn zeroed_u64s(len: usize) -> Box<[AtomicU64]> {
-    // SAFETY: all-zero bits are an `AtomicU64` of 0.
-    unsafe { zeroed(len) }
+fn zeroed_u64s(len: usize) -> Words<AtomicU64> {
+    // SAFETY: all-zero bits are an `AtomicU64` of 0, which needs no drop.
+    unsafe { Zeroed::new(len) }
 }
 
-/// A boxed slice of `len` `T`s from `alloc_zeroed`.
-///
-/// # Safety
-///
-/// All-zero bits must be a valid `T`.
+/// `len` `T`s on a region of their own, tagged `Query`: committed whole and zeroed by the
+/// kernel, so the part of a page never written is never touched and stays out of the resident
+/// set.
 #[cfg(not(feature = "shuttle"))]
-pub(crate) unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
-    let layout = std::alloc::Layout::array::<T>(len).expect("salsa: a graph page fits in memory");
-    if layout.size() == 0 {
-        // alloc: one page of the node or edge columns, made when the previous page fills
-        return Vec::new().into_boxed_slice();
+pub(crate) struct Zeroed<T> {
+    region: blaze_mem::Region,
+    len: usize,
+    _owns: std::marker::PhantomData<T>,
+}
+
+#[cfg(not(feature = "shuttle"))]
+impl<T> Zeroed<T> {
+    /// # Safety
+    ///
+    /// All-zero bits must be a valid `T`, and `T` must need no drop.
+    unsafe fn new(len: usize) -> Zeroed<T> {
+        debug_assert!(!std::mem::needs_drop::<T>());
+        assert!(std::mem::align_of::<T>() <= blaze_mem::page_size());
+        let bytes = std::mem::size_of::<T>()
+            .checked_mul(len)
+            .expect("salsa: a graph page fits in memory");
+        let region = blaze_mem::Region::reserve(bytes.max(1), blaze_mem::Tag::Query)
+            .unwrap_or_else(|err| panic!("salsa: reserving a graph page: {err}"));
+        region
+            .ensure(bytes)
+            .unwrap_or_else(|err| panic!("salsa: committing a graph page: {err}"));
+        Zeroed {
+            region,
+            len,
+            _owns: std::marker::PhantomData,
+        }
     }
-    // SAFETY: `layout` has a nonzero size.
-    let words = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<T>();
-    if words.is_null() {
-        std::alloc::handle_alloc_error(layout);
+}
+
+#[cfg(not(feature = "shuttle"))]
+impl<T> std::ops::Deref for Zeroed<T> {
+    type Target = [T];
+
+    #[inline]
+    fn deref(&self) -> &[T] {
+        // SAFETY: `new` committed `len * size_of::<T>()` bytes from the region's base, which is
+        // page-aligned (so aligned for `T`, checked in `new`); the kernel zeroed them, zero bits
+        // are a valid `T` (`new`'s contract), they change only through `T`'s interior
+        // mutability, and they live as long as `self.region`.
+        unsafe { std::slice::from_raw_parts(self.region.base().cast::<T>().as_ptr(), self.len) }
     }
-    // SAFETY: `words` is a live allocation of `layout`, `len` `T`s with `T`'s alignment, made by
-    // the global allocator the box frees it with; its zeroed bytes are valid `T`s (the caller's
-    // contract), and nothing else owns it.
-    unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(words, len)) }
 }
 
 /// `len` zeroed words; shuttle's atomics are not plain words, so they are made one by one.
 #[cfg(feature = "shuttle")]
-pub(crate) fn zeroed_u32s(len: usize) -> Box<[AtomicU32]> {
+pub(crate) fn zeroed_u32s(len: usize) -> Words<AtomicU32> {
     // alloc: one page of the node or edge columns, made when the previous page fills
     (0..len).map(|_| AtomicU32::new(0)).collect()
 }
 
 /// `len` zeroed words, as [`zeroed_u32s`].
 #[cfg(feature = "shuttle")]
-fn zeroed_u64s(len: usize) -> Box<[AtomicU64]> {
+fn zeroed_u64s(len: usize) -> Words<AtomicU64> {
     // alloc: one page of the node or edge columns, made when the previous page fills
     (0..len).map(|_| AtomicU64::new(0)).collect()
 }
@@ -252,6 +283,15 @@ mod tests {
             .iter()
             .map(|word| graph.decode(word.load(Ordering::Relaxed)))
             .collect()
+    }
+
+    #[test]
+    fn zeroed_pages_are_zero_and_writable() {
+        let words = super::zeroed_u32s(5000);
+        assert_eq!(words.len(), 5000);
+        assert!(words.iter().all(|word| word.load(Ordering::Relaxed) == 0));
+        words[4999].store(7, Ordering::Relaxed);
+        assert_eq!(words[4999].load(Ordering::Relaxed), 7);
     }
 
     #[test]

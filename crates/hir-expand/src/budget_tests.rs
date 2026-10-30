@@ -71,10 +71,10 @@ fn a_path_whose_segments_exist_allocates_nothing() {
 #[test]
 fn span_lookups_allocate_nothing() {
     let file_id = EditionedFileId::new(FileId::from_raw(7), Edition::CURRENT);
-    let anchors: Box<[_]> = (0..32u32)
+    let anchors: Vec<_> = (0..32u32)
         .map(|i| (TextSize::new(i * 40), ErasedFileAstId::from_raw(i)))
         .collect();
-    let real = RealSpanMap::from_file(file_id, anchors, TextSize::new(32 * 40));
+    let real = RealSpanMap::from_file(file_id, &anchors, TextSize::new(32 * 40));
     let mut expansion = ExpansionSpanMap::empty();
     let ranges: Vec<TextRange> =
         (0..320u32).map(|i| TextRange::new((i * 4).into(), (i * 4 + 3).into())).collect();
@@ -123,4 +123,71 @@ fn an_argument_costs_a_constant_number_of_allocations() {
     let (small, big) = (used(16), used(1024));
     assert!(small <= 12, "an argument of 16 tokens: {small} allocations, budget 12");
     assert_eq!(big, small, "1024 tokens against 16: no allocation grows with the argument");
+}
+
+/// Mapping up out of an expansion's span map and back down, warm: the first downmap builds the
+/// map's index by anchor and grows the worker's `u32`s once; after that nothing allocates.
+#[test]
+fn span_mapping_is_free_once_warm() {
+    let mut map = ExpansionSpanMap::empty();
+    let ranges: Vec<TextRange> =
+        (0..256u32).map(|i| TextRange::new((i * 4).into(), (i * 4 + 3).into())).collect();
+    for &range in &ranges {
+        map.push(range.end(), span(range));
+    }
+    map.finish();
+    let probe = |map: &ExpansionSpanMap| {
+        let mut found = 0usize;
+        for &range in ranges.iter().step_by(17) {
+            found += crate::map_node_range_up_rooted_span(map, range).is_some() as usize;
+            found += map.ranges_with_span(span(range)).count();
+            found += map.ranges_with_span_exact(span(range)).count();
+        }
+        found
+    };
+    let warm = probe(&map);
+    let again = blaze_alloc_count::assert_at_most(0, "warm span mapping", || probe(&map));
+    assert_eq!(again, warm);
+}
+
+/// An eager input's span map taken from the worker and given back: the second take reuses the
+/// first's columns.
+#[test]
+fn an_eager_span_map_is_reused() {
+    let fill = |map: &mut ExpansionSpanMap| {
+        for i in 1..=64u32 {
+            map.push((i * 4).into(), span(TextRange::new((i * 4 - 4).into(), (i * 4).into())));
+        }
+    };
+    {
+        let mut first = crate::eager::ArgMap::take();
+        fill(&mut first);
+    }
+    blaze_alloc_count::assert_at_most(0, "a reused eager span map", || {
+        let mut again = crate::eager::ArgMap::take();
+        fill(&mut again);
+        again.iter().count()
+    });
+}
+
+/// An expression expansion's tokens before its last `;`, in the run's frame: no global
+/// allocation, and the tokens are the input's.
+#[test]
+fn the_tokens_before_a_semicolon_are_framed() {
+    let text = "a + b ;";
+    let tt = syntax_bridge::parse_to_token_tree_static_span(
+        Edition::CURRENT,
+        span(TextRange::empty(TextSize::new(0))),
+        text,
+    )
+    .expect("tokens");
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        let (before, semicolon) =
+            blaze_alloc_count::assert_at_most(0, "the tokens before a `;`", || {
+                crate::without_last_semicolon(frame, tt.view())
+            })
+            .expect("ends in `;`");
+        assert_eq!(before.token_trees().len(), 3);
+        assert_eq!(semicolon, span(TextRange::empty(TextSize::new(0))));
+    });
 }

@@ -7,7 +7,10 @@
 //! `method/suggest.rs` (`note_unmet_impls_on_type`) (MIT or Apache-2.0).
 
 use hir::{InFile, LangItem};
-use syntax::{AstNode, SyntaxKind, ast};
+use syntax::{
+    SyntaxKind,
+    view::{self as ast, AstNode as _},
+};
 
 use super::binary_operator_cannot_be_applied::{
     code_fact, has_param, note_unmet_impl, parentheses_needed, restrict_param,
@@ -31,9 +34,12 @@ pub(crate) fn lower<'db>(
     let ty = cx.ty(&d.found);
     let mut diag = Diag::error(
         Some("E0600"),
+        // alloc: the error's text, for an error hir found
         format!("cannot apply unary operator `{op}` to type `{ty}`"),
+        // clone: on the error path, for an error hir found
         span.clone(),
     );
+    // alloc: the error's text, for an error hir found
     diag.span_label(span.clone(), format!("cannot apply unary operator `{op}`"));
     let trait_ = lang.and_then(|it| hir::Trait::lang(cx.db, cx.krate, it));
 
@@ -55,9 +61,11 @@ pub(crate) fn lower<'db>(
 
     if let Some(trait_) = trait_ {
         let name = cx.def_path(hir::ModuleDef::Trait(trait_));
+        // alloc: the error's text, for an error hir found
         diag.fact_opt(cx.implements_fact(trait_, &d.found), format!("whether `{ty}` implements `{name}`"));
     }
     code_fact(cx, d.expr.map(|it| it.syntax_node_ptr()), &mut diag);
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 
@@ -68,15 +76,15 @@ fn max_suggestion(
     ty: &str,
     diag: &mut Diag,
 ) {
-    let node = cx.node(d.expr);
-    let Some(ast::Expr::PrefixExpr(prefix)) = node.value.clone().left() else { return };
+    let node = cx.node_view(d.expr);
+    let Some(ast::Expr::PrefixExpr(prefix)) = node.value.left() else { return };
     let Some(ast::Expr::Literal(literal)) = prefix.expr() else { return };
     let ast::LiteralKind::IntNumber(number) = literal.kind() else { return };
     if number.value().ok() != Some(1) {
         return;
     }
     let mut parent = prefix.syntax().parent();
-    while let Some(it) = parent.clone()
+    while let Some(it) = parent
         && it.kind() == SyntaxKind::PAREN_EXPR
     {
         parent = it.parent();
@@ -87,7 +95,9 @@ fn max_suggestion(
     };
     diag.suggestion_verbose(
         cx.span(InFile::new(node.file_id, range)),
+        // alloc: the error's text, for an error hir found
         format!("you may have meant the maximum value of `{ty}`"),
+        // alloc: the error's text, for an error hir found
         format!("{ty}::MAX"),
         Applicability::MaybeIncorrect,
     );

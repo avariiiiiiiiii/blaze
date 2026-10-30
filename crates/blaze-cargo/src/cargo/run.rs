@@ -542,17 +542,12 @@ fn parts(
     sandboxed: bool,
     outside: &BTreeSet<String>,
     picked: Option<&[String]>,
-    bare: &dyn Fn() -> anyhow::Result<Command>,
+    bare: &impl Fn() -> anyhow::Result<Command>,
     running: &str,
 ) -> anyhow::Result<Vec<Part>> {
     let asked_args: Vec<String> = asked.program_args().cloned().collect();
-    let with = |more: &mut dyn Iterator<Item = String>| {
-        let mut args = asked_args.clone();
-        args.extend(more);
-        args
-    };
     let exact = |names: &[String]| {
-        with(&mut std::iter::once("--exact".to_owned()).chain(names.iter().cloned()))
+        joined(&asked_args, std::iter::once("--exact".to_owned()).chain(names.iter().cloned()))
     };
     let one = |sandboxed| {
         let args = match picked {
@@ -577,7 +572,7 @@ fn parts(
                 return Ok(one(true));
             }
             let skips = out.iter().flat_map(|it| ["--skip".to_owned(), it.clone()]);
-            let args = with(&mut std::iter::once("--exact".to_owned()).chain(skips));
+            let args = joined(&asked_args, std::iter::once("--exact".to_owned()).chain(skips));
             let outside_args = exact(&out);
             return Ok(vec![
                 Part { sandboxed: true, args, outside: Vec::new() },
@@ -606,9 +601,16 @@ fn parts(
     Ok(parts)
 }
 
+/// `first`, then `more`.
+fn joined(first: &[String], more: impl Iterator<Item = String>) -> Vec<String> {
+    let mut args = first.to_vec();
+    args.extend(more);
+    args
+}
+
 /// The names of the tests of `executable`, by libtest's `--list`, which runs none of them.
 fn listed(
-    bare: &dyn Fn() -> anyhow::Result<Command>,
+    bare: &impl Fn() -> anyhow::Result<Command>,
     executable: &Path,
 ) -> anyhow::Result<Vec<String>> {
     let mut command = bare()?;
@@ -660,7 +662,18 @@ pub fn exit_code(status: ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::failures;
+    use super::{failures, joined};
+
+    #[test]
+    fn the_asked_arguments_come_before_the_ones_added() {
+        let asked = vec!["--nocapture".to_owned()];
+        let names = ["a".to_owned(), "b".to_owned()];
+        let exact = joined(&asked, std::iter::once("--exact".to_owned()).chain(names.iter().cloned()));
+        assert_eq!(exact, ["--nocapture", "--exact", "a", "b"]);
+        let skips = names.iter().flat_map(|it| ["--skip".to_owned(), it.clone()]);
+        let skipped = joined(&asked, std::iter::once("--exact".to_owned()).chain(skips));
+        assert_eq!(skipped, ["--nocapture", "--exact", "--skip", "a", "--skip", "b"]);
+    }
 
     #[test]
     fn the_summary_names_the_failures() {

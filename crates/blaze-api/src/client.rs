@@ -14,8 +14,8 @@ use std::{
 use blaze_protocol::cbor;
 
 use crate::{
-    ApiError, Envelope, LONGEST_REQUEST, Request, Response, SCHEMA,
-    frames::{self, Frames},
+    ApiError, Envelope, LONGEST_REQUEST, Request, Response, ResponseRef, SCHEMA,
+    frames::{self, Frames, Refused},
     http::{self, ResponseParser},
 };
 
@@ -45,6 +45,7 @@ impl fmt::Display for ClientError {
 }
 
 impl std::error::Error for ClientError {
+    // dyn: `std::error::Error::source`, an error path
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             ClientError::Io(error) => Some(error),
@@ -230,6 +231,54 @@ impl Client {
         }
     }
 
+    /// Whether the next [`Client::receive`] gives a response with no read: one is kept, or a
+    /// whole frame is held. A caller that prints writes what it holds only when none is, so a
+    /// burst of responses from one read is one write.
+    pub fn buffered(&self) -> bool {
+        !self.kept.is_empty() || self.frames.ready()
+    }
+
+    /// [`Client::call`] with each response read where it lies in the frame ([`ResponseRef`])
+    /// and handed to `on` before the next read, with whether another whole response is already
+    /// held (the frame after it, of any request). A response streamed while building is read
+    /// with no allocation. Responses of other requests are kept, owned, for
+    /// [`Client::receive`].
+    pub fn call_ref(
+        &mut self,
+        request: Request,
+        mut on: impl FnMut(ResponseRef<'_>, bool),
+    ) -> Result<bool, ClientError> {
+        let id = self.send(request)?;
+        loop {
+            let Some(range) = self.frames.next_range().map_err(ClientError::Refused)? else {
+                if !self.more()? {
+                    return Err(over());
+                }
+                continue;
+            };
+            let item = self.frames.item(range);
+            let envelope = frames::decode::<ResponseRef<'_>>(item).map_err(|it| refusal(item, it))?;
+            let done = match envelope.body {
+                ResponseRef::Done { ok } => Some(ok),
+                _ => None,
+            };
+            if let (Link::Http(link), Some(_)) = (&mut self.link, done)
+                && link.waiting == Some(envelope.id)
+            {
+                link.waiting = None;
+            }
+            if envelope.id != id {
+                let Envelope { schema, id: theirs, body } = envelope;
+                self.kept.push_back(Envelope { schema, id: theirs, body: body.into_owned() });
+                continue;
+            }
+            on(envelope.body, self.frames.ready());
+            if let Some(ok) = done {
+                return Ok(ok);
+            }
+        }
+    }
+
     /// Waits for the daemon to hang up this connection, at most `patience`; responses that
     /// come first are kept for [`Client::receive`]. A daemon that stops hangs up every
     /// connection last, once its state is durable: where a service manager keeps its socket
@@ -276,8 +325,7 @@ impl Client {
                 return Ok(envelope);
             }
             if !self.more()? {
-                let said = "nothing more is coming: every request sent over HTTP has had its Done";
-                return Err(ClientError::Io(io::Error::new(io::ErrorKind::InvalidInput, said)));
+                return Err(over());
             }
         }
     }
@@ -299,10 +347,7 @@ impl Client {
         let Some(item) = self.frames.next_ref().map_err(ClientError::Refused)? else {
             return Ok(None);
         };
-        let envelope = frames::decode::<Response>(item).map_err(|refused| match frames::head(item) {
-            Ok((theirs, _)) if theirs != SCHEMA => ClientError::Schema { theirs },
-            _ => ClientError::Refused(refused.error),
-        })?;
+        let envelope = frames::decode::<Response>(item).map_err(|it| refusal(item, it))?;
         if let Link::Http(link) = &mut self.link
             && link.waiting == Some(envelope.id)
             && matches!(envelope.body, Response::Done { .. })
@@ -375,6 +420,21 @@ impl Client {
         self.frames.push_vec(response.take_body());
         Ok(true)
     }
+}
+
+/// Why the daemon's `item` was refused: its schema when that is another, else what the decode
+/// said.
+fn refusal(item: &[u8], refused: Refused) -> ClientError {
+    match frames::head(item) {
+        Ok((theirs, _)) if theirs != SCHEMA => ClientError::Schema { theirs },
+        _ => ClientError::Refused(refused.error),
+    }
+}
+
+/// Every request sent over HTTP has had its Done, and a read waits for another.
+fn over() -> ClientError {
+    let said = "nothing more is coming: every request sent over HTTP has had its Done";
+    ClientError::Io(io::Error::new(io::ErrorKind::InvalidInput, said))
 }
 
 fn http_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {

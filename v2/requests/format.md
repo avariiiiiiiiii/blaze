@@ -360,6 +360,8 @@ dependency; add it with the first use.
 > forwarded to db: `crates/hir-def/src/nameres/frozen.rs`.
 > forwarded to cargo: `load-cargo`'s persisted ids.
 
+> answered by lane cargo (cargo-inbox): item 2 needs nothing in `load-cargo`. Its raw ast ids (`crates/load-cargo/src/lib.rs:955-1018`, the proc-macro sub-requests) only cross the wire to a macro within one expansion of one blaze and are never persisted, so no encoding outlives a version.
+
 ## format-parse
 
 1. **`OutlineFn` can go** — `crates/hir-def/src/item_tree/attrs.rs` (format-hir): format-hir's
@@ -1791,6 +1793,24 @@ Status: open
 > `blaze_ids::bits`' `rank_in`/`ranks_of` and the `BitSet` splice for the edit's bitmap, and
 > places their results in the block. If `Ranked` can't live in the block, `Kept` keeps two
 > `Col`s read through `rank_in`. Same bits, ranks and `heap_size` either way.
+> applied by mem-format-tree (2026-10-29), inside the block of `mem-format-tree.md` section 2:
+> - The local `rank_in` is gone. `FlatTree::rank`, `pack`'s kept bits and `Kept::slot` call
+>   `blaze_ids::bits::rank_in`. `Kept::slot` is `BitSlice::contains(rank)` (false past the
+>   words, like the old `get(word)?`), then `hashes[rank_in(bits, ranks, rank)]`. `pack` checks
+>   each kept element is a node with `BitSlice::contains` and sets its bit with
+>   `BitSliceMut::insert`.
+> - `append_bits` is gone. The edit's node bits are three `or_range_at` calls into the
+>   thread's spare words, zeroed with `resize`, so a warm edit allocates nothing new. `pack`
+>   checks the count against `node_parents` (`debug_assert_eq!`, as before).
+> - Not `Ranked` or `ranks_of`, since each returns boxes of its own: a second and third
+>   allocation per tree on top of the block, which breaks
+>   `a_warm_build_copy_or_edit_allocates_its_block_alone`. `Kept` keeps its `bits` and
+>   `ranks` `Col`s, read through `rank_in` (this request's own alternative). `pack` fills
+>   `ranks` and the kept ranks in the block with `Block::fill`, using the same rule as
+>   `ranks_of`: the ones in the words before. The tree is already held under `NO_PARENT`
+>   elements, so the sum can't pass `u32::MAX`.
+> - Same bits, ranks and `heap_size`. `rustfmt --check` shows no diff in these hunks, and
+>   `hot_lint` finds nothing on them. Not built (no builds for this lane).
 
 ## dedup: bits: span `ast_id.rs` body slots onto `blaze_ids::bits::BitArray`, and `lines.rs`'s `below`
 
@@ -1893,6 +1913,11 @@ Status: open
 
 > frontend-tree (2026-10-29): taken; frontend-tree holds `crates/span/` now. Child
 > `frontend-tree-span` applies it and answers here.
+
+> frontend-tree-span (2026-10-29): applied as written. `ast_id.rs`: `type Slots = BitArray<{ (SLOTS / 64)
+> as usize }, u32>`, `take_slots(&mut Slots, ..)` with `contains`/`insert_range`, `Slots::EMPTY` in
+> `place_bodies`. `lines.rs`: `use blaze_ids::bits::below;`, the local `below` gone, `below(at)` at
+> both sites, the doc line on `LineIndex::bits`.
 
 ## dedup: bits: parser `TokenSet` onto `blaze_ids::bits::BitArray`, and `scan.rs` kept
 
@@ -2212,3 +2237,175 @@ The `use syntax::ast::{ArithOp, ..}` at L95 stays.
 Status: open
 
 > forwarded to mem-format (holds format's hir-def `hir/` files; format is DONE; told by tmux; requests, pass 22).
+> applied by mem-format-fwd: all four edits in `crates/hir-def/src/hir/columns.rs` as written: the const is gone, the decode at ~L559 and ~L566 and the test's two lines (~L2018) read `ArithOp::ALL`, whose order (`syntax/src/ast/operators.rs` L67) is the const's, so every code decodes as before. The `ArithOp` import stays. Status: applied.
+
+## dedup: `blaze_format::Placed`, a column written for a later `Slice` (from dedup-sim-front, 2026-10-29)
+
+hir-ty has three identical `struct Placed { at: u64, len: usize }` with `push` and `slice`
+(`consteval.rs`, which also has `push_each`, `infer/persist.rs`, `lower/persist.rs`): where a
+column of records was written with a `Writer`, read back as a `Slice`. That is blaze-format's
+kind of thing, so the one copy is a new file, already written: `crates/blaze-format/src/placed.rs`
+(`Placed`, `EMPTY`, `push`, `push_each`, `slice`, with a proptest against the old copy and
+`push_each` against `push`). Its module line is the one edit asked here, in
+`crates/blaze-format/src/lib.rs`:
+
+- after `pub mod leb;` add `mod placed;`
+- after `pub use crate::schema::{Part, SCHEMA_DOMAIN, schema, schema_of};` add
+  `pub use crate::placed::Placed;`
+
+The hir-ty side is `v2/requests/db.md` under the same heading. hir-def's
+`hir/persist.rs` `Column { at: u64, len: u32 }` stays its own: `u32` lengths, read across the
+crate, and it pushes an empty column too.
+
+> applied (requests, pass 30; lane format is DONE): `crates/blaze-format/src/lib.rs` has `mod placed;` after `pub mod leb;` and `pub use crate::placed::Placed;` after the schema re-export. proptest is already a dev-dependency.
+
+## dedup: `intern::order_key` is `blaze_ids::names::order_key` (from dedup-sim-front, 2026-10-29)
+
+`crates/intern/src/symbol.rs` `pub const fn order_key(bytes: &[u8]) -> u64` and
+`crates/blaze-ids/src/names.rs` `order_key` are the same function line for line (blaze-ids'
+doc says "The same key as `intern::order_key`"). fix-orderkeys kept two because intern was not
+to depend on blaze-ids; it does now (`symbol.rs` imports `blaze_ids::{ContentId, Hasher}`). In
+`crates/intern/src/symbol.rs`:
+
+- delete the doc comment, `#[inline]` and body of `pub const fn order_key`, and in their place
+  write `pub use blaze_ids::names::order_key;` (intern's `lib.rs` re-exports `order_key` from
+  this module; that line stays).
+- the `order_keys` test stays: it now checks `Symbol::order_key` against the shared function.
+
+Same keys: the function is the same, `const` included, so `Text { key: order_key(..), .. }` in
+a `const` context still compiles.
+
+> applied (requests, pass 31; lane format is DONE): `crates/intern/src/symbol.rs` has `pub use blaze_ids::names::order_key;` in place of its copy. blaze-ids' doc says intern re-exports it.
+
+## dedup: one persisted code per binary operator, `BinaryOp::code` (from dedup-sim-front, 2026-10-29)
+
+`crates/hir-def/src/hir/columns.rs` `binary_op_word`/`binary_op` and
+`crates/hir-ty/src/infer/persist.rs` `binary_code`/`binary_of` (with `arith_code`) are one table
+of the 29 binary operators, hir-def's word being hir-ty's code plus one (0 there is no
+operator). The table goes beside the operators, in syntax; each format keeps its words. The
+hir-ty half is `v2/requests/db.md` under the same heading.
+
+1. `crates/syntax/src/ast/operators.rs`: in `impl ArithOp` after `ALL`, add
+
+```rust
+    /// Its place in [`ArithOp::ALL`]: a persisted code, which never changes.
+    pub const fn code(self) -> u32 {
+        self as u32
+    }
+```
+
+   and after `impl ArithOp`, add
+
+```rust
+impl BinaryOp {
+    /// How many [`BinaryOp::code`]s there are.
+    pub const CODES: u32 = 29;
+
+    /// `&&` and `||` at 0 and 1, the ten arithmetic operators from 2 in [`ArithOp::ALL`]'s
+    /// order, `==` and `!=` at 12, `<=`, `<`, `>=`, `>` from 14, `=` at 18 and the compound
+    /// assignments from 19: persisted codes, which never change.
+    pub const fn code(self) -> u32 {
+        match self {
+            BinaryOp::LogicOp(LogicOp::And) => 0,
+            BinaryOp::LogicOp(LogicOp::Or) => 1,
+            BinaryOp::ArithOp(op) => 2 + op.code(),
+            BinaryOp::CmpOp(CmpOp::Eq { negated }) => 12 + negated as u32,
+            BinaryOp::CmpOp(CmpOp::Ord { ordering, strict }) => {
+                14 + 2 * ordering as u32 + strict as u32
+            }
+            BinaryOp::Assignment { op: None } => 18,
+            BinaryOp::Assignment { op: Some(op) } => 19 + op.code(),
+        }
+    }
+
+    /// The operator [`BinaryOp::code`] gave `code`.
+    pub const fn from_code(code: u32) -> Option<BinaryOp> {
+        Some(match code {
+            0 => BinaryOp::LogicOp(LogicOp::And),
+            1 => BinaryOp::LogicOp(LogicOp::Or),
+            2..12 => BinaryOp::ArithOp(ArithOp::ALL[code as usize - 2]),
+            12 | 13 => BinaryOp::CmpOp(CmpOp::Eq { negated: code == 13 }),
+            14..18 => BinaryOp::CmpOp(CmpOp::Ord {
+                ordering: if code >= 16 { Ordering::Greater } else { Ordering::Less },
+                strict: code % 2 == 1,
+            }),
+            18 => BinaryOp::Assignment { op: None },
+            19..29 => BinaryOp::Assignment { op: Some(ArithOp::ALL[code as usize - 19]) },
+            _ => return None,
+        })
+    }
+}
+```
+
+   and at the end of the file the tests, with both old encoders copied in as references:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// hir-ty's `binary_code`, as it was.
+    fn infer_code(op: BinaryOp) -> u32 {
+        let arith = |op: ArithOp| ArithOp::ALL.iter().position(|it| *it == op).unwrap() as u32;
+        match op {
+            BinaryOp::LogicOp(LogicOp::And) => 0,
+            BinaryOp::LogicOp(LogicOp::Or) => 1,
+            BinaryOp::ArithOp(op) => 2 + arith(op),
+            BinaryOp::CmpOp(CmpOp::Eq { negated }) => 12 + u32::from(negated),
+            BinaryOp::CmpOp(CmpOp::Ord { ordering, strict }) => {
+                14 + 2 * u32::from(ordering == Ordering::Greater) + u32::from(strict)
+            }
+            BinaryOp::Assignment { op: None } => 18,
+            BinaryOp::Assignment { op: Some(op) } => 19 + arith(op),
+        }
+    }
+
+    /// hir-def's `binary_op_word`, as it was.
+    fn column_word(op: Option<BinaryOp>) -> u32 {
+        match op {
+            None => 0,
+            Some(BinaryOp::LogicOp(LogicOp::And)) => 1,
+            Some(BinaryOp::LogicOp(LogicOp::Or)) => 2,
+            Some(BinaryOp::ArithOp(op)) => 3 + op as u32,
+            Some(BinaryOp::CmpOp(CmpOp::Eq { negated })) => 13 + negated as u32,
+            Some(BinaryOp::CmpOp(CmpOp::Ord { ordering, strict })) => {
+                15 + 2 * ordering as u32 + strict as u32
+            }
+            Some(BinaryOp::Assignment { op: None }) => 19,
+            Some(BinaryOp::Assignment { op: Some(op) }) => 20 + op as u32,
+        }
+    }
+
+    #[test]
+    fn codes_are_the_ones_persisted() {
+        for code in 0..BinaryOp::CODES {
+            let op = BinaryOp::from_code(code).expect("every code below CODES is an operator");
+            assert_eq!(op.code(), code);
+            assert_eq!(infer_code(op), code, "hir-ty's code of {op:?}");
+            assert_eq!(column_word(Some(op)), code + 1, "hir-def's word of {op:?}");
+        }
+        assert_eq!(BinaryOp::from_code(BinaryOp::CODES), None);
+        for (code, op) in ArithOp::ALL.into_iter().enumerate() {
+            assert_eq!(op.code() as usize, code);
+        }
+    }
+}
+```
+
+2. `crates/hir-def/src/hir/columns.rs`: `binary_op_word`'s body becomes
+   `op.map_or(0, |op| 1 + op.code())`, and `binary_op`'s
+
+```rust
+fn binary_op(word: u32) -> Checked<Option<BinaryOp>> {
+    match word {
+        0 => Ok(None),
+        word => BinaryOp::from_code(word - 1).map(Some).ok_or("a binary operator out of range"),
+    }
+}
+```
+
+   (`Ordering`, `LogicOp`, `CmpOp` and `ArithOp` leave this file's imports if `rg` finds no
+   other use there). The words written are the same: the test above holds `code + 1` to the old
+   `binary_op_word`.
+
+> applied (requests, pass 31; lane format is DONE): `ArithOp::code`, `BinaryOp::{CODES, code, from_code}` and the tests are in `crates/syntax/src/ast/operators.rs`. `hir-def/src/hir/columns.rs`'s `binary_op_word`/`binary_op` are as written. `ArithOp`, `CmpOp`, `LogicOp` and `Ordering` moved from the file's imports into its tests module, which still uses them.

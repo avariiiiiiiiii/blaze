@@ -17,6 +17,24 @@ compiletest's directives (`//@ edition: 2018`, `//@ compile-flags: ...`), read a
 reads `tests/ui`; `#![crate_type = "lib"]` makes the case a library, else it is a program with
 `fn main`. A case is one unit: no revisions, nothing out of scope.
 
+A case may depend on crates: `//@ aux-crate: dep=dep.rs` (compiletest's directive) names the
+file `auxiliary/dep.rs` beside it, which may name its own the same way and take `//@ edition:`
+(else 2015) and `#![crate_type = "proc-macro"]`. rustc builds each first, whole, with its lints
+capped (`--cap-lints allow`, as cargo builds a registry crate), and gives it to the case with
+`--extern`; a dependency rustc rejects is its answer, as cargo stops there. blaze gets each as
+a crates.io package vendored in the workspace (a `directory` source replacing crates.io), so
+it is a registry crate, as `hir_def::deps::eligible` wants of a crate it serves. A
+dependency's files are compared by name: its root file as `<dep NAME>`, any other by its path
+under `auxiliary/`.
+
+The cases of `bodies-cache/` are built by blaze twice, with one store and a fresh daemon,
+workspace and target: the first checks the dependencies and keeps what it can, the second must
+serve each from the store, which it says on stdout with a line per dependency,
+`{"reason": "blaze-served", "package": P, "outcome": W, "bodies": W, "why": null | "..."}`, W one
+of `served`, `checked`, `refused`. Both builds are compared with rustc; then each dependency
+must have both served, but those a `//@ refused: dep[, dep2]` names, of which one must be
+`refused` (the edges where the cache hands over to a check).
+
 rustc is asked first: a library with `--emit=dep-info,metadata` (what `cargo check` asks), a
 program built whole (`--emit=dep-info,link`, `-C debug-assertions=on` as cargo's dev profile)
 and, when it builds, run (RUN_SECS at most): its exit status, what it printed on stdout, and
@@ -30,7 +48,8 @@ whose program, when blaze builds it, is run as rustc's was. A case:
            (rejections.py's `verdict`); or accepted, and a program exits alike, prints the same
            and panics alike
     fail   blaze accepts what rustc rejects, rejects what rustc accepts, gives other codes,
-           puts them at other places, or its program runs otherwise; or the check was not blaze's
+           puts them at other places, or its program runs otherwise; or the check was not blaze's;
+           or a second build did not serve a dependency it should (or served one it should not)
     error  the case is wrong ("case wrong"), or the harness could not say (a timeout, a
            program blaze said it built and did not)
 
@@ -54,17 +73,20 @@ The input is one JSON object (inline, a file's path, or `-` for stdin):
 """
 
 import concurrent.futures
+import functools
+import hashlib
 import itertools
+import json
 import platform
 import re
 import shutil
 import sys
 import tempfile
 from collections import Counter
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 HERE = Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent), str(HERE.parent.parent)]
@@ -83,9 +105,26 @@ RUN_SECS = 10
 # rustc's builds with their programs' runs; rustc's checks are rejections.KEPT_KIND.
 KEPT_BUILDS = "rustc-builds"
 AT = re.compile(r"(.*):(\d+):(\d+)")
+AUX = re.compile(r"//@ *aux-crate: *(.*)")
+AUX_VALUE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)=([^\s=]+\.rs)")
+REFUSED = re.compile(r"//@ *refused: *(.*)")
+AUXILIARY = "auxiliary"
+# compiletest's directives of an auxiliary crate that change nothing here.
+AUX_INERT = frozenset({"force-host", "no-prefer-dynamic"})
+# The areas whose cases blaze builds twice, the second served from the store the first filled.
+TWICE = frozenset({"bodies-cache"})
+VERSION = "0.1.0"
+SOURCE = "blaze-cases"
+CONFIG = f'[source.crates-io]\nreplace-with = "{SOURCE}"\n\n[source.{SOURCE}]\ndirectory = "vendor"\n'
+CHECKSUMS = ".cargo-checksum.json"
+SERVED = "blaze-served"
+WAYS = ("served", "checked", "refused")
+# A proc-macro crate's file, by platform: what rustc's `--extern` takes.
+DYLIB = {"darwin": ("lib", ".dylib"), "win32": ("", ".dll")}.get(sys.platform, ("lib", ".so"))
 
 Category = Literal["same", "case wrong", "accepted what rustc rejects", "rejected what rustc accepts",
-                   "other codes", "other spans", "other run", "not blaze's", "error"]
+                   "other codes", "other spans", "other run", "not blaze's", "not served",
+                   "served what is refused", "error"]
 FROM_REJECTIONS: dict[rejections.Category, Category] = {
     "same": "same", "accepted": "accepted what rustc rejects", "other codes": "other codes",
     "other spans": "other spans", "not blaze's": "not blaze's", "error": "error"}
@@ -118,12 +157,30 @@ class Expect:
 
 
 @dataclass(frozen=True)
+class Dep:
+    """A crate a case (or a dependency) names with `//@ aux-crate: NAME=FILE`, FILE under
+    `auxiliary/` beside the case as compiletest has it: its extern name (and crate name), its
+    root file, its edition, whether it is a proc-macro crate, and the crates it names in turn."""
+
+    name: str
+    path: str
+    edition: str
+    proc_macro: bool = False
+    deps: tuple["Dep", ...] = ()
+
+
+@dataclass(frozen=True)
 class Case:
-    """A program compared: its unit (`unit.test` is its name, `<area>/<file>`), and what its
-    header says rustc does with it (None: a generated program, of which rustc is the truth)."""
+    """A program compared: its unit (`unit.test` is its name, `<area>/<file>`), what its header
+    says rustc does with it (None: a generated program, of which rustc is the truth), the crates
+    it depends on, and, for an area blaze builds twice (`twice`), the dependencies the second
+    build refuses rather than serves."""
 
     unit: rejections.Unit
     expect: Expect | None = None
+    deps: tuple[Dep, ...] = ()
+    refused: frozenset[str] = frozenset()
+    twice: bool = False
 
     @property
     def name(self) -> str:
@@ -181,17 +238,111 @@ def expect_of(first_line: str) -> Expect | str:
     return Expect(False, tokens)
 
 
+def aux_of(text: str) -> tuple[list[tuple[str, str]], list[str], str] | str:
+    """The `//@ aux-crate:` pairs (name, file) and the `//@ refused:` names of `text`, and `text`
+    with those lines emptied (rejections.classify leaves a test with an auxiliary crate out; the
+    rest it reads); or what is wrong with one of them."""
+    pairs: list[tuple[str, str]] = []
+    refused: list[str] = []
+    lines: list[str] = []
+    for line in text.split("\n"):
+        if m := AUX.fullmatch(line.strip()):
+            got = AUX_VALUE.fullmatch(m[1].strip())
+            if got is None:
+                return f"`{line.strip()}` is not `//@ aux-crate: NAME=FILE.rs`"
+            pairs.append((got[1], got[2]))
+            line = "//"
+        elif m := REFUSED.fullmatch(line.strip()):
+            refused += [word for word in re.split(r"[\s,]+", m[1].strip()) if word]
+            line = "//"
+        lines.append(line)
+    return pairs, refused, "\n".join(lines)
+
+
+def deps_of(pairs: Sequence[tuple[str, str]], aux: Path, seen: tuple[str, ...] = ()) -> tuple[Dep, ...] | str:
+    """The crates `pairs` name, each read from `aux` (with those it names), or what is wrong."""
+    found: list[Dep] = []
+    for name, file in pairs:
+        if file.startswith(("/", "..")) or "/../" in file or "\\" in file:
+            return f"the dependency {name}={file} is outside {AUXILIARY}/"
+        if any(d.name == name for d in found):
+            return f"two dependencies are named {name}"
+        path = aux / file
+        if str(path) in seen:
+            return f"its dependencies form a cycle through {file}"
+        if not path.is_file():
+            return f"names the dependency {name}={file}, and there is no {path}"
+        got = aux_of(path.read_text(errors="replace"))
+        if isinstance(got, str):
+            return f"{AUXILIARY}/{file}: {got}"
+        inner, refused, rest = got
+        if refused:
+            return f"{AUXILIARY}/{file}: `//@ refused:` is a case's, not a dependency's"
+        edition = "2015"
+        for d in rejections.directives(rest):
+            if d.name in AUX_INERT:
+                continue
+            if d.name != "edition" or d.revisions is not None:
+                return f"{AUXILIARY}/{file}: a dependency takes `//@ edition:` and `//@ aux-crate:` alone, not `{d.name}`"
+            year = rejections.edition_of(d.value)
+            if year is None:
+                return f"{AUXILIARY}/{file}: edition `{d.value}`"
+            edition = year
+        attribute = rejections.CRATE_TYPE.search(rest)
+        kind = attribute[1] if attribute else "lib"
+        if kind not in ("lib", "rlib", "proc-macro"):
+            return f"{AUXILIARY}/{file}: a dependency of crate type {kind}"
+        below = deps_of(inner, aux, (*seen, str(path)))
+        if isinstance(below, str):
+            return below
+        found.append(Dep(name, str(path), edition, kind == "proc-macro", below))
+    return tuple(found)
+
+
+def ordered(deps: Sequence[Dep]) -> list[Dep]:
+    """Every crate `deps` names, transitively, each once, each after the crates it names."""
+    out: list[Dep] = []
+
+    def visit(dep: Dep) -> None:
+        for inner in dep.deps:
+            visit(inner)
+        if dep not in out:
+            out.append(dep)
+
+    for dep in deps:
+        visit(dep)
+    return out
+
+
 def case_of(name: str, path: Path, text: str, host: frozenset[str]) -> Case | str:
     """The case at `path` named `name`, or what is wrong with it (the case's fault)."""
     expect = expect_of(text.split("\n", 1)[0])
     if isinstance(expect, str):
         return expect
-    found = rejections.classify(name, str(path), text, host)
+    got = aux_of(text)
+    if isinstance(got, str):
+        return got
+    pairs, refused, rest = got
+    deps = deps_of(pairs, path.parent / AUXILIARY)
+    if isinstance(deps, str):
+        return deps
+    every = ordered(deps)
+    if len({d.name for d in every}) != len(every):
+        return "two of its dependencies have one name"
+    area = name.split("/", 1)[0]
+    twice = area in TWICE
+    if twice and not deps:
+        return f"a case of {area} names a dependency (`//@ aux-crate:`) for blaze to serve"
+    if refused and not twice:
+        return f"`//@ refused:` is for the areas blaze builds twice ({', '.join(sorted(TWICE))})"
+    if unknown := sorted(set(refused) - {d.name for d in every}):
+        return f"`//@ refused:` names {', '.join(unknown)}, which it does not depend on"
+    found = rejections.classify(name, str(path), rest, host)
     if found.out:
         return f"out of scope as rejections.py reads it: {found.out[0][1]}"
     if found.passing or len(found.units) != 1:
         return "a case is one unit: no revisions, no `check-pass` or `run-pass`"
-    return Case(found.units[0], expect)
+    return Case(found.units[0], expect, deps, frozenset(refused), twice)
 
 
 def discover(root: Path, areas: Sequence[str], needle: str, host: frozenset[str]) -> tuple[list[Case], list[tuple[str, str]]]:
@@ -216,20 +367,25 @@ def discover(root: Path, areas: Sequence[str], needle: str, host: frozenset[str]
     return cases, wrong
 
 
-def panics_of(text: str, base: Path, root: Path) -> tuple[str, ...]:
-    """Each panic `text` reports, by thread, place (its file placed as rejections.place does)
-    and message, sorted: threads panic in any order."""
+def same_file(file: str) -> str:
+    return file
+
+
+def panics_of(text: str, base: Path, root: Path, rename: Callable[[str], str] = same_file) -> tuple[str, ...]:
+    """Each panic `text` reports, by thread, place (its file placed as rejections.place does,
+    then `rename`d) and message, sorted: threads panic in any order."""
     found: list[str] = []
     for m in PANIC.finditer(text):
         thread, at, colon, message = m.groups()
         where = AT.fullmatch(at)
         if where:
-            at = f"{rejections.place(where[1], base, root)}:{where[2]}:{where[3]}"
+            at = f"{rename(rejections.place(where[1], base, root))}:{where[2]}:{where[3]}"
         found.append(f"{thread} at {at}: {message}" if colon and message is not None else f"{thread} at {at}")
     return tuple(sorted(found))
 
 
-def run_program(program: Path, cwd: Path, env: dict[str, str], base: Path, root: Path) -> Run:
+def run_program(program: Path, cwd: Path, env: dict[str, str], base: Path, root: Path,
+                rename: Callable[[str], str] = same_file) -> Run:
     """`program` run in `cwd` with no input; its panics placed against `root` as built in `base`."""
     if not program.is_file():
         return Run(error=f"no program at {program}", started=False)
@@ -238,7 +394,7 @@ def run_program(program: Path, cwd: Path, env: dict[str, str], base: Path, root:
         ran = engine.run(f"running {program}", [str(program)], cwd, env, RUN_SECS)
     except engine.Failed as e:
         return Run(error=str(e).splitlines()[0])
-    return Run(ran.returncode, ran.stdout, panics_of(ran.stderr, base, root))
+    return Run(ran.returncode, ran.stdout, panics_of(ran.stderr, base, root, rename))
 
 
 def kept_run_of(run: Run | None) -> dict[str, object] | None:
@@ -286,6 +442,232 @@ def built_truth(unit: rejections.Unit, scratch: Path, env: dict[str, str], kept:
                                keys=sorted(ref.keys), out=ref.out, spans=rejections.kept_spans(ref.spans),
                                run=kept_run_of(run)))
     return Truth(ref, run)
+
+
+def dep_file(name: str) -> str:
+    """How a dependency's root file is compared, on both sides."""
+    return f"<dep {name}>"
+
+
+def renamed(spans: rejections.Placed, rename: Callable[[str], str]) -> rejections.Placed:
+    return rejections.placed_of([(key, replace(span, file=rename(span.file))) for key, span in spans])
+
+
+def rustc_names(case: Case) -> Callable[[str], str]:
+    """How rustc's spans and panics name a dependency's files (`dep_file`): placed as
+    rejections.place places them against the case's root, a dependency's root file is
+    `auxiliary/<file>`, which becomes its `dep_file`; its other files stay under `auxiliary/`."""
+    root = Path(case.unit.path)
+    named = {rejections.place(d.path, root.parent, root): dep_file(d.name) for d in ordered(case.deps)}
+    return lambda file: named.get(file, file)
+
+
+def package_of(member: str, dep: Dep) -> str:
+    """The vendored package of `dep` of the member `member`: one a member, as no two cases share one."""
+    return f"{member}_{dep.name}"
+
+
+def blaze_names(member: str, case: Case) -> Callable[[str], str]:
+    """How blaze's spans and panics name a dependency's files, vendored under
+    `vendor/<package>/src/`: its root file `lib.rs` as its `dep_file`, any other by its path
+    under `auxiliary/`, as `rustc_names` has them."""
+    under = {f"/vendor/{package_of(member, d)}/src/": d.name for d in ordered(case.deps)}
+
+    def rename(file: str) -> str:
+        path = "/" + file.replace("\\", "/")
+        for prefix, name in under.items():
+            if (at := path.find(prefix)) >= 0:
+                rest = path[at + len(prefix):]
+                return dep_file(name) if rest == "lib.rs" else f"{AUXILIARY}/{rest}"
+        return file
+
+    return rename
+
+
+def artifact(out: Path, dep: Dep) -> Path:
+    """Where rustc writes `dep` under `out`: a directory a crate, so each has one dep-info file."""
+    prefix, suffix = DYLIB if dep.proc_macro else ("lib", ".rlib")
+    return out / dep.name / f"{prefix}{dep.name}{suffix}"
+
+
+def externs(deps: Sequence[Dep], out: str) -> list[str]:
+    """rustc's `--extern` of each of `deps`, and `-L dependency=` of every crate below them, as
+    built under `out`."""
+    words: list[str] = []
+    for dep in deps:
+        words += ["--extern", f"{dep.name}={artifact(Path(out), dep)}"]
+    for dep in ordered(deps):
+        words += ["-L", f"dependency={Path(out) / dep.name}"]
+    return words
+
+
+def dep_argv(dep: Dep, out: str) -> list[str]:
+    """rustc on a dependency as cargo builds a registry crate: whole, its lints capped, with the
+    dev profile's flags."""
+    kind = ["--crate-type", "proc-macro", "--extern", "proc_macro"] if dep.proc_macro else ["--crate-type", "lib"]
+    return ["rustc", dep.path, "--crate-name", dep.name, "--edition", dep.edition, *kind, "--error-format=json",
+            f"--emit={BUILD_EMIT}", "-Zui-testing", *rejections.COMMON, *DEV, "--cap-lints", "allow",
+            *externs(dep.deps, out), "-o", str(artifact(Path(out), dep))]
+
+
+def case_argv(case: Case, out: str) -> list[str]:
+    """rustc on a case with dependencies built under `out`: checked, or built whole (a program)."""
+    unit, extra = case.unit, externs(case.deps, out)
+    if unit.kind == "bin":
+        return rejections.rustc_argv(unit, out, BUILD_EMIT, f"{out}/{PROGRAM}", (*DEV, *extra))
+    return rejections.rustc_argv(unit, out, extra=extra)
+
+
+def deps_truth(case: Case, scratch: Path, env: dict[str, str], kept: engine.Kept, toolchain: str) -> Truth:
+    """rustc's answer on a case with dependencies: each built in order, a dependency rustc
+    rejects being the answer (cargo stops there); else the case, checked or built and run
+    against them. Kept, as `built_truth` keeps a build, with every file any of the runs read."""
+    unit = case.unit
+    cwd, root = Path(unit.path).parent, Path(unit.path)
+    order = ordered(case.deps)
+    key = kept.key(toolchain, str(cwd), *(w for d in order for w in dep_argv(d, "{out}")), *case_argv(case, "{out}"))
+    entry = kept.get(key)
+    if (known := rejections.kept_reference(entry, env, str(kept.path(key)))) is not None:
+        return Truth(known, run_kept(entry, str(kept.path(key))), kept=True)
+    names = rustc_names(case)
+    files: set[tuple[str, str]] = set()
+    variables: set[tuple[str, str | None]] = set()
+    whole = True
+    with tempfile.TemporaryDirectory(dir=scratch) as out:
+        truth: Truth | None = None
+        for dep in order:
+            (Path(out) / dep.name).mkdir()
+            try:
+                ran = engine.run(f"rustc {unit.label}: its dependency {dep.name}", dep_argv(dep, out), cwd, env,
+                                 rejections.RUSTC_SECS)
+            except engine.Failed as e:
+                return Truth(rejections.Reference(error=str(e)))
+            ref = rejections.reference_of(ran.returncode, ran.stderr, root)
+            if ref.error is not None:
+                return Truth(rejections.Reference(error=f"its dependency {dep.name}: {ref.error}"))
+            if (read := rejections.what_was_read(Path(out) / dep.name, cwd)) is None:
+                whole = False
+            else:
+                files.update(read[0])
+                variables.update(read[1])
+            if ref.keys or ref.out == rejections.CRASHES:
+                truth = Truth(replace(ref, spans=renamed(ref.spans, names)))
+                break
+        if truth is None:
+            try:
+                ran = engine.run(f"rustc {unit.label}", case_argv(case, out), cwd, env, rejections.RUSTC_SECS)
+            except engine.Failed as e:
+                return Truth(rejections.Reference(error=str(e)))
+            ref = rejections.reference_of(ran.returncode, ran.stderr, root)
+            run = None
+            if unit.kind == "bin" and accepted(ref):
+                run = run_program(Path(out) / PROGRAM, scratch / "cwd", env, cwd, root, names)
+            if (read := rejections.what_was_read(Path(out), cwd)) is None:
+                whole = False
+            else:
+                files.update(read[0])
+                variables.update(read[1])
+            truth = Truth(replace(ref, spans=renamed(ref.spans, names)), run)
+    ref = truth.ref
+    if whole and ref.error is None and (truth.run is None or truth.run.error is None):
+        kept.put(key, dict(files=[list(f) for f in sorted(files)],
+                           env=[list(v) for v in sorted(variables, key=lambda v: (v[0], v[1] or ""))],
+                           keys=sorted(ref.keys), out=ref.out, spans=rejections.kept_spans(ref.spans),
+                           run=kept_run_of(truth.run)))
+    return truth
+
+
+def checksums(package: Path) -> dict[str, str]:
+    """The sha256 of each file of a vendored package but its checksum file, as cargo's
+    `DirectorySource` checks them."""
+    return {path.relative_to(package).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+            for path in sorted(package.rglob("*")) if path.is_file() and path.name != CHECKSUMS}
+
+
+def dependencies(member: str, deps: Sequence[Dep]) -> str:
+    """The `[dependencies]` of a member or a vendored package: each by its extern name, the
+    package it is renamed from pinned."""
+    if not deps:
+        return ""
+    return "\n[dependencies]\n" + "".join(
+        f'{d.name} = {{ package = "{package_of(member, d)}", version = "={VERSION}" }}\n' for d in deps)
+
+
+def dep_manifest(member: str, dep: Dep) -> str:
+    lib = f'[lib]\nname = "{dep.name}"\npath = "src/lib.rs"\ndoctest = false\n'
+    if dep.proc_macro:
+        lib += "proc-macro = true\n"
+    return (f'[package]\nname = "{package_of(member, dep)}"\nversion = "{VERSION}"\nedition = "{dep.edition}"\n'
+            f"autobins = false\nautoexamples = false\nautotests = false\nautobenches = false\n\n{lib}"
+            + dependencies(member, dep.deps))
+
+
+def vendor(ws: Path, members: dict[str, rejections.Unit], cases_of: dict[str, Case]) -> list[tuple[str, str]]:
+    """rejections.run_batch's `layout`: each dependency of the cases among `members` written as a
+    crates.io package vendored in `ws/vendor` (a `directory` source replacing crates.io: a
+    registry package, never a member or a path package), and each member's `[dependencies]`;
+    the members a dependency of which cannot be laid out, with why."""
+    wrong: list[tuple[str, str]] = []
+    vendored = False
+    for member, unit in members.items():
+        case = cases_of[unit.label]
+        if not case.deps:
+            continue
+        vendored = True
+        why: str | None = None
+        for dep in ordered(case.deps):
+            package = ws / "vendor" / package_of(member, dep)
+            (package / "src").mkdir(parents=True)
+            root = package / "src" / "lib.rs"
+            shutil.copyfile(dep.path, root)
+            if why := rejections.uitest.copy_named(dep.path, str(root), dep.path):
+                why = f"its dependency {dep.name} {why}"
+                break
+            (package / "Cargo.toml").write_text(dep_manifest(member, dep))
+            (package / CHECKSUMS).write_text(json.dumps({"files": checksums(package), "package": None}, sort_keys=True))
+        if why:
+            wrong.append((member, why))
+            continue
+        with open(ws / "crates" / member / "Cargo.toml", "a") as manifest:
+            manifest.write(dependencies(member, case.deps))
+    if vendored:
+        (ws / ".cargo").mkdir(exist_ok=True)
+        (ws / ".cargo" / "config.toml").write_text(CONFIG)
+    return wrong
+
+
+def served_lines(stdout: str) -> dict[str, dict[str, Any]]:
+    """The `blaze-served` lines of a run's stdout, by package."""
+    found: dict[str, dict[str, Any]] = {}
+    for line in stdout.splitlines():
+        m = rejections.json_line(line)
+        if m is not None and m.get("reason") == SERVED and isinstance(m.get("package"), str):
+            found[m["package"]] = m
+    return found
+
+
+def serving(case: Case, member: str, stdout: str) -> tuple[report.Verdict, Category, str] | None:
+    """None when the second build of `case` (the member `member`) served each of its
+    dependencies but those its `//@ refused:` names, which it refused; else what it did."""
+    lines = served_lines(stdout)
+    for dep in ordered(case.deps):
+        package = package_of(member, dep)
+        line = lines.get(package)
+        if line is None:
+            return "error", "error", f"the second build printed no `{SERVED}` line of the dependency {dep.name} ({package})"
+        outcome, bodies, why = line.get("outcome"), line.get("bodies"), line.get("why")
+        if outcome not in WAYS or bodies not in WAYS or not (why is None or isinstance(why, str)):
+            return "error", "error", f"a `{SERVED}` line of another shape: {line}"
+        shown = f"outcome {outcome}, bodies {bodies}" + (f": {why}" if why else "")
+        both = outcome == "served" and bodies == "served"
+        if dep.name in case.refused:
+            if both:
+                return "fail", "served what is refused", f"the second build served {dep.name}, which the case says is refused"
+            if "refused" not in (outcome, bodies):
+                return "fail", "not served", f"the second build neither served nor refused {dep.name}: {shown}"
+        elif not both:
+            return "fail", "not served", f"the second build did not serve {dep.name}: {shown}"
+    return None
 
 
 def accepted(ref: rejections.Reference) -> bool:
@@ -387,6 +769,9 @@ class Runner:
         (work / "rustc").mkdir(parents=True, exist_ok=True)
 
     def truth(self, case: Case) -> Truth:
+        if case.deps:
+            kept = self.builds if case.unit.kind == "bin" else self.checks
+            return deps_truth(case, self.work / "rustc", self.env, kept, self.toolchain)
         if case.unit.kind == "bin":
             return built_truth(case.unit, self.work / "rustc", self.env, self.builds, self.toolchain)
         ref, hit = rejections.reference(case.unit, self.work / "rustc", self.env, self.checks, self.toolchain)
@@ -407,25 +792,63 @@ class Runner:
             raise engine.Failed(f"two cases of one name among {len(cases)}: {sorted(Counter(labels) - Counter(set(labels)))[:3]}")
         truths = self.truths(cases)
         results: dict[str, Compared] = {}
-        sent: list[rejections.Unit] = []
+        once: list[rejections.Unit] = []
+        twice: list[rejections.Unit] = []
         for case, truth in zip(cases, truths):
             problem = rustc_problem(case, truth)
             if problem is not None:
                 results[case.unit.label] = Compared(case, truth, *problem)
             else:
-                sent.append(case.unit)
+                (twice if case.twice else once).append(case.unit)
         of = {c.unit.label: (c, t) for c, t in zip(cases, truths)}
-        chunks = [(next(self.indices), chunk) for chunk in rejections.batches_of(sent, self.batch)]
+        chunks = [(next(self.indices), chunk, again) for sent, again in ((once, False), (twice, True))
+                  for chunk in rejections.batches_of(sent, self.batch)]
         with concurrent.futures.ThreadPoolExecutor(self.jobs) as pool:
-            running = [pool.submit(self.blaze_side, i, chunk, of) for i, chunk in chunks]
+            running = [pool.submit(self.blaze_side, i, chunk, of, again) for i, chunk, again in chunks]
             for done in running:
                 for found in done.result():
                     results[found.case.unit.label] = found
         return [results[label] for label in labels]
 
-    def blaze_side(self, index: int, units: list[rejections.Unit], of: dict[str, tuple[Case, Truth]]) -> list[Compared]:
+    def blaze_side(self, index: int, units: list[rejections.Unit], of: dict[str, tuple[Case, Truth]],
+                   twice: bool = False) -> list[Compared]:
+        """blaze on a workspace of `units`, each compared with rustc; `twice`: built a second
+        time with a fresh daemon, workspace and target and the same store, compared again, and
+        held to serve each case's dependencies (`serving`)."""
         command: Literal["check", "build"] = "build" if units[0].kind == "bin" else "check"
-        batch = rejections.run_batch(self.eng, index, units, self.work, self.work / "store", self.whole, command)
+        cases_of = {unit.label: of[unit.label][0] for unit in units}
+        layout: rejections.Layout | None = None
+        if any(case.deps for case in cases_of.values()):
+            layout = functools.partial(vendor, cases_of=cases_of)
+        batch = rejections.run_batch(self.eng, index, units, self.work, self.work / "store", self.whole, command,
+                                     layout)
+        found = self.judged_batch(batch, of)
+        if twice:
+            shutil.rmtree(self.work / "h" / str(index), ignore_errors=True)
+            second = rejections.run_batch(self.eng, index, units, self.work, self.work / "store", self.whole,
+                                          command, layout)
+            again = {c.case.unit.label: c for c in self.judged_batch(second, of)}
+            found = [self.second(first, again[first.case.unit.label], second) for first in found]
+            batch = second
+        if not self.keep and all(f.verdict == "pass" for f in found):
+            shutil.rmtree(batch.ws, ignore_errors=True)
+        return found
+
+    def second(self, first: Compared, again: Compared, batch: rejections.Batch) -> Compared:
+        """A case built twice: the first build's comparison if it did not pass, else the second's,
+        else whether the second served what it should."""
+        if first.verdict != "pass":
+            return replace(first, detail=f"first build: {first.detail}")
+        if again.verdict != "pass":
+            return replace(again, detail=f"second build: {again.detail}")
+        label = again.case.unit.label
+        problem = serving(again.case, Path(batch.packages[label]).name, batch.stdout.get(label, ""))
+        if problem is None:
+            return replace(again, detail=f"{again.detail}; served on the second build")
+        verdict, category, detail = problem
+        return replace(again, verdict=verdict, category=category, detail=detail)
+
+    def judged_batch(self, batch: rejections.Batch, of: dict[str, tuple[Case, Truth]]) -> list[Compared]:
         if batch.stopped is not None:
             self.stopped.append((batch.ws, batch.stopped))
         found: list[Compared] = []
@@ -436,14 +859,15 @@ class Runner:
         for unit, said in batch.said:
             case, truth = of[unit.label]
             package = Path(batch.packages[unit.label])
+            rename = blaze_names(package.name, case) if case.deps else same_file
+            if case.deps:
+                said = replace(said, spans=renamed(said.spans, rename))
             ran = None
             if truth.run is not None and not said.keys and said.error is None and said.who is None:
                 ran = run_program(ws / "target" / "debug" / (package.name + engine.EXE), self.work / "cwd", self.env,
-                                  ws, rejections.root_of(ws, package.name, unit))
+                                  ws, rejections.root_of(ws, package.name, unit), rename)
             result, category, detail = judged(truth, said, ran)
             found.append(Compared(case, truth, result, category, detail, said, ran, str(package)))
-        if not self.keep and all(f.verdict == "pass" for f in found):
-            shutil.rmtree(ws, ignore_errors=True)
         return found
 
 
@@ -637,8 +1061,159 @@ def test_run_program() -> None:
             assert ran == Run(101, "one\n", ("main at <root>:2:3: boom",)), ran
 
 
+def dep_tree(root: Path) -> Path:
+    """An area `bodies-cache` under `root` whose `auxiliary/` has `dep.rs` (2021, naming `pm`,
+    a proc-macro crate, and a module `m`); its case's path."""
+    aux = root / "bodies-cache" / AUXILIARY
+    aux.mkdir(parents=True)
+    (aux / "dep.rs").write_text("//@ edition: 2021\n//@ aux-crate: pm=pm.rs\nmod m;\npub fn f() -> u8 { pm::two!() }\n")
+    (aux / "m.rs").write_text("pub fn g() {}\n")
+    (aux / "pm.rs").write_text('//@ edition: 2021\n//@ force-host\n#![crate_type = "proc-macro"]\n')
+    case = root / "bodies-cache" / "c.rs"
+    case.write_text("//@ expect: accept\n//@ edition: 2021\n//@ aux-crate: dep=dep.rs\n//@ refused: pm\n"
+                    "fn main() { println!(\"{}\", dep::f()); }\n")
+    return case
+
+
+def test_deps() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = dep_tree(root)
+        case = case_of("bodies-cache/c.rs", path, path.read_text(), HOST)
+        assert isinstance(case, Case), case
+        assert case.twice and case.refused == {"pm"} and case.unit.edition == "2021" and case.unit.kind == "bin"
+        (dep,) = case.deps
+        assert (dep.name, dep.edition, dep.proc_macro) == ("dep", "2021", False), dep
+        assert [(d.name, d.proc_macro) for d in ordered(case.deps)] == [("pm", True), ("dep", False)]
+        cases, wrong = discover(root, (), "", HOST)
+        assert [c.name for c in cases] == ["bodies-cache/c.rs"] and not wrong, (cases, wrong)
+
+        def wrong_with(text: str, name: str = "bodies-cache/w.rs") -> str:
+            at = root / name
+            at.parent.mkdir(parents=True, exist_ok=True)
+            at.write_text("//@ expect: accept\n//@ edition: 2021\n" + text + "fn main() {}\n")
+            got = case_of(name, at, at.read_text(), HOST)
+            assert isinstance(got, str), (text, got)
+            return got
+
+        assert "no " in wrong_with("//@ aux-crate: x=missing.rs\n")
+        assert "outside" in wrong_with("//@ aux-crate: x=../dep.rs\n")
+        assert "not `//@ aux-crate: NAME=FILE.rs`" in wrong_with("//@ aux-crate: dep.rs\n")
+        assert "two dependencies" in wrong_with("//@ aux-crate: dep=dep.rs\n//@ aux-crate: dep=m.rs\n")
+        assert "does not depend on" in wrong_with("//@ aux-crate: dep=dep.rs\n//@ refused: other\n")
+        assert "names a dependency" in wrong_with("")
+        (root / "nameres" / AUXILIARY).mkdir(parents=True)
+        (root / "nameres" / AUXILIARY / "dep.rs").write_text("pub fn f() {}\n")
+        assert "builds twice" in wrong_with("//@ aux-crate: dep=dep.rs\n//@ refused: dep\n", "nameres/w.rs")
+        (root / "bodies-cache" / AUXILIARY / "a.rs").write_text("//@ aux-crate: b=b.rs\n")
+        (root / "bodies-cache" / AUXILIARY / "b.rs").write_text("//@ aux-crate: a=a.rs\n")
+        assert "cycle" in wrong_with("//@ aux-crate: a=a.rs\n")
+        (root / "bodies-cache" / AUXILIARY / "flags.rs").write_text("//@ compile-flags: -O\n")
+        assert "alone" in wrong_with("//@ aux-crate: f=flags.rs\n")
+        plain = root / "nameres" / "p.rs"
+        plain.write_text("//@ expect: accept\n//@ aux-crate: dep=dep.rs\nfn main() {}\n")
+        once = case_of("nameres/p.rs", plain, plain.read_text(), HOST)
+        assert isinstance(once, Case) and not once.twice and once.deps[0].edition == "2015", once
+
+
+def test_dep_argv() -> None:
+    pm = Dep("pm", "/c/a/auxiliary/pm.rs", "2021", True)
+    dep = Dep("dep", "/c/a/auxiliary/dep.rs", "2018", False, (pm,))
+    argv = dep_argv(dep, "/o")
+    assert argv[:2] == ["rustc", dep.path] and "--cap-lints" in argv and argv[argv.index("--cap-lints") + 1] == "allow"
+    assert argv[argv.index("--crate-name") + 1] == "dep" and argv[argv.index("--edition") + 1] == "2018"
+    assert f"pm=/o/pm/{DYLIB[0]}pm{DYLIB[1]}" in argv and "dependency=/o/pm" in argv
+    assert argv[-2:] == ["-o", "/o/dep/libdep.rlib"], argv
+    macro = dep_argv(pm, "/o")
+    assert macro[macro.index("--crate-type") + 1] == "proc-macro" and "proc_macro" in macro
+    case = Case(rejections.Unit("a/t.rs", "/c/a/t.rs", None, "bin", "2021"), Expect(True), (dep,))
+    built = case_argv(case, "/o")
+    assert "dep=/o/dep/libdep.rlib" in built and "dependency=/o/pm" in built and built[-1] == f"/o/{PROGRAM}", built
+    lib = case_argv(replace(case, unit=replace(case.unit, kind="lib")), "/o")
+    assert f"--emit={rejections.CHECK_EMIT}" in lib and "--out-dir" in lib and "dep=/o/dep/libdep.rlib" in lib
+
+
+def test_vendor() -> None:
+    import tomllib
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        path = dep_tree(root / "cases")
+        case = case_of("bodies-cache/c.rs", path, path.read_text(), HOST)
+        assert isinstance(case, Case), case
+        ws = root / "ws"
+        members, out = rejections.write_workspace(ws, 0, [case.unit])
+        assert not out and list(members) == ["u0_0"], (members, out)
+        assert vendor(ws, members, {case.unit.label: case}) == []
+        config = tomllib.loads((ws / ".cargo" / "config.toml").read_text())
+        assert config["source"]["crates-io"]["replace-with"] == SOURCE and config["source"][SOURCE]["directory"] == "vendor"
+        member = tomllib.loads((ws / "crates" / "u0_0" / "Cargo.toml").read_text())
+        assert member["dependencies"] == {"dep": {"package": "u0_0_dep", "version": f"={VERSION}"}}, member
+        dep = tomllib.loads((ws / "vendor" / "u0_0_dep" / "Cargo.toml").read_text())
+        assert dep["package"]["name"] == "u0_0_dep" and dep["package"]["edition"] == "2021"
+        assert dep["lib"]["name"] == "dep" and "proc-macro" not in dep["lib"]
+        assert dep["dependencies"] == {"pm": {"package": "u0_0_pm", "version": f"={VERSION}"}}
+        pm = tomllib.loads((ws / "vendor" / "u0_0_pm" / "Cargo.toml").read_text())
+        assert pm["lib"]["proc-macro"] is True and "dependencies" not in pm
+        assert (ws / "vendor" / "u0_0_dep" / "src" / "m.rs").read_text() == "pub fn g() {}\n", "a module of a dependency"
+        sums = json.loads((ws / "vendor" / "u0_0_dep" / CHECKSUMS).read_text())
+        assert sums["package"] is None and set(sums["files"]) == {"Cargo.toml", "src/lib.rs", "src/m.rs"}, sums
+        for file, sha in sums["files"].items():
+            assert hashlib.sha256((ws / "vendor" / "u0_0_dep" / file).read_bytes()).hexdigest() == sha, file
+        plain = rejections.Unit("a/p.rs", str(path), None, "bin", "2021")
+        ws2 = root / "ws2"
+        members, _ = rejections.write_workspace(ws2, 1, [plain])
+        assert vendor(ws2, members, {plain.label: Case(plain)}) == [] and not (ws2 / ".cargo").exists()
+
+
+def test_names() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        path = dep_tree(Path(tmp))
+        case = case_of("bodies-cache/c.rs", path, path.read_text(), HOST)
+        assert isinstance(case, Case), case
+        theirs, ours = rustc_names(case), blaze_names("u3_1", case)
+        aux = path.parent / AUXILIARY
+        placed = rejections.place(str(aux / "dep.rs"), path.parent, path)
+        module = rejections.place(str(aux / "m.rs"), path.parent, path)
+        assert theirs(placed) == ours("/w/ws/3/vendor/u3_1_dep/src/lib.rs") == "<dep dep>", (placed, theirs(placed))
+        assert theirs(module) == ours("vendor\\u3_1_dep\\src\\m.rs") == f"{AUXILIARY}/m.rs", module
+        assert ours("/w/ws/3/vendor/u3_11_dep/src/lib.rs") == "/w/ws/3/vendor/u3_11_dep/src/lib.rs", "another member's"
+        assert theirs(rejections.ROOT_FILE) == ours(rejections.ROOT_FILE) == rejections.ROOT_FILE
+        at = rejections.Span("/w/ws/3/vendor/u3_1_dep/src/lib.rs", 4, 1, 4, 2)
+        assert renamed((("E0308", at),), ours) == (("E0308", replace(at, file="<dep dep>")),)
+        text = "thread 'main' panicked at /w/ws/3/vendor/u3_1_dep/src/lib.rs:4:5:\nboom\n"
+        assert panics_of(text, Path("/w/ws/3"), Path("/w/ws/3/crates/u3_1/src/main.rs"), ours) == (
+            "main at <dep dep>:4:5: boom",)
+
+
+def served(package: str, outcome: str, bodies: str, why: str | None = None) -> str:
+    return json.dumps({"reason": SERVED, "package": package, "outcome": outcome, "bodies": bodies, "why": why})
+
+
+def test_serving() -> None:
+    pm = Dep("pm", "/a/pm.rs", "2021", True)
+    dep = Dep("dep", "/a/dep.rs", "2021", False, (pm,))
+    case = Case(rejections.Unit("bodies-cache/c.rs", "/c.rs", None, "bin", "2021"), Expect(True), (dep,), twice=True)
+    both = "\n".join([served("u0_0_dep", "served", "served"), served("u0_0_pm", "served", "served"),
+                      '{"reason": "blaze-work"}', "not json"])
+    assert serving(case, "u0_0", both) is None
+    missing = serving(case, "u0_0", served("u0_0_dep", "served", "served"))
+    assert missing is not None and missing[:2] == ("error", "error") and "pm" in missing[2], missing
+    checked = serving(case, "u0_0", both.replace('"bodies": "served", "why": null}', '"bodies": "checked", "why": null}', 1))
+    assert checked is not None and checked[1] == "not served" and "dep" in checked[2], checked
+    odd = serving(case, "u0_0", served("u0_0_dep", "yes", "served") + "\n" + served("u0_0_pm", "served", "served"))
+    assert odd is not None and odd[:2] == ("error", "error"), odd
+    refuses = replace(case, refused=frozenset({"pm"}))
+    said = serving(refuses, "u0_0", both)
+    assert said is not None and said[1] == "served what is refused", said
+    edge = "\n".join([served("u0_0_dep", "served", "served"), served("u0_0_pm", "served", "refused", "block-local item")])
+    assert serving(refuses, "u0_0", edge) is None
+    neither = "\n".join([served("u0_0_dep", "served", "served"), served("u0_0_pm", "checked", "checked")])
+    assert (serving(refuses, "u0_0", neither) or ("", "", ""))[1] == "not served"
+
+
 SELFTESTS = (test_expect, test_case_of, test_tree, test_panics, test_judged, test_rustc_problem, test_kept_runs,
-             test_run_program)
+             test_run_program, test_deps, test_dep_argv, test_vendor, test_names, test_serving)
 
 
 def selftest() -> int:

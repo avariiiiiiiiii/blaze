@@ -27,8 +27,8 @@ use windows_sys::Win32::{
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetSecurityDescriptorDacl,
         GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_INFORMATION_CLASS,
-        TOKEN_QUERY, TokenOwner, TokenUser, WELL_KNOWN_SID_TYPE, WinBuiltinAdministratorsSid,
-        WinCreatorOwnerRightsSid, WinLocalSystemSid,
+        TOKEN_QUERY, TokenOwner, TokenUser, WinBuiltinAdministratorsSid, WinCreatorOwnerRightsSid,
+        WinLocalSystemSid,
     },
     System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE},
     System::Threading::{
@@ -77,20 +77,27 @@ impl Sid {
     fn written(&self) -> io::Result<String> {
         let mut text: *mut u16 = ptr::null_mut();
         // SAFETY: the identifier is alive while `self` is, and `text` is a live pointer for the
-        // call to write; what it points to then is freed by `_text` below, once.
+        // call to write; what it points to then is freed by the `LocalFree` below, once.
         if unsafe { ConvertSidToStringSidW(self.as_ptr(), &raw mut text) } == 0 {
             return Err(io::Error::last_os_error());
         }
-        let _text = Local(text.cast());
-        let mut len = 0;
-        // SAFETY: the text the system wrote ends with a zero, and `len` stops there, so no
-        // unit past its end is read; `_text` keeps it alive.
-        while unsafe { *text.wrapping_add(len) } != 0 {
-            len += 1;
-        }
-        // SAFETY: the `len` units before the zero are the text's, alive until `_text` drops.
-        let units = unsafe { std::slice::from_raw_parts(text, len) };
-        Ok(String::from_utf16_lossy(units))
+        let len = (0..)
+            .take_while(|&at| {
+                // SAFETY: `text` is the zero-ended UTF-16 `ConvertSidToStringSidW` allocated, and
+                // `take_while` stops at its zero, so `at` never passes the end of it.
+                let unit = unsafe { text.add(at) };
+                // SAFETY: `unit` points at a `u16` of that allocation, which lives until the
+                // `LocalFree` below.
+                unsafe { *unit } != 0
+            })
+            .count();
+        // SAFETY: the `len` units before the zero are initialized `u16`s of the allocation, which is
+        // not written to or freed until the `LocalFree` below.
+        let written = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, len) });
+        // SAFETY: the system allocated `text` for the caller to free with `LocalFree`, and this is
+        // its one free, after its last read; a second free would corrupt the heap.
+        unsafe { LocalFree(text.cast()) };
+        Ok(written)
     }
 }
 
@@ -125,13 +132,6 @@ fn own_token() -> io::Result<OwnedHandle> {
     // closed, so it is open for as long as it is used.
     let process = unsafe { GetCurrentProcess() };
     token_of(process)
-}
-
-/// Whether `sid`, an identifier alive for the call, is the well-known one `kind` names.
-fn is_well_known(sid: PSID, kind: WELL_KNOWN_SID_TYPE) -> bool {
-    // SAFETY: `sid` is alive for the call by the caller's word, which the one caller keeps by
-    // holding the descriptor it points into; a freed one would be read after it is freed.
-    unsafe { IsWellKnownSid(sid, kind) != 0 }
 }
 
 fn wide(path: &Path) -> Vec<u16> {
@@ -214,23 +214,24 @@ pub fn the_users_alone(path: &Path) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
         let entry = entry.cast::<ACCESS_ALLOWED_ACE>();
-        // SAFETY: `entry` is an entry of the live list, and every kind of entry begins with
-        // the header that is `ACCESS_ALLOWED_ACE`'s first field.
+        // SAFETY: `GetAce` set `entry` to an entry of `list`, which lives in `descriptor` until
+        // `_descriptor` drops at the end of this function; every entry begins with an `ACE_HEADER`,
+        // so this reads only the header.
         let kind = unsafe { (*entry).Header.AceType };
+        // SAFETY: the same entry; `&raw mut` makes no reference, and for the two kinds read further
+        // (allowed and denied) the identifier begins at `SidStart`. For any other kind it is never read.
+        let whose = unsafe { (&raw mut (*entry).SidStart).cast::<c_void>() };
         match u32::from(kind) {
             ACCESS_DENIED_ACE_TYPE => {}
-            ACCESS_ALLOWED_ACE_TYPE => {
-                // SAFETY: the entry is an `ACCESS_ALLOWED_ACE` (its kind says so), whose
-                // identifier starts at `SidStart`, within the entry; only its address is taken.
-                let whose = unsafe { (&raw mut (*entry).SidStart).cast::<c_void>() };
-                let theirs = user.is(whose)
-                    || is_well_known(whose, WinLocalSystemSid)
-                    || is_well_known(whose, WinBuiltinAdministratorsSid)
-                    || is_well_known(whose, WinCreatorOwnerRightsSid);
-                if !theirs {
-                    return refused("can be opened by other users (`icacls /inheritance:r` it)");
-                }
-            }
+            ACCESS_ALLOWED_ACE_TYPE
+                if user.is(whose)
+                    // SAFETY: `whose` is the identifier of an allowed entry of `list`, alive until
+                    // `_descriptor` drops; `IsWellKnownSid` only reads it.
+                    || unsafe { IsWellKnownSid(whose, WinLocalSystemSid) } != 0
+                    // SAFETY: the same identifier, only read.
+                    || unsafe { IsWellKnownSid(whose, WinBuiltinAdministratorsSid) } != 0
+                    // SAFETY: the same identifier, only read.
+                    || unsafe { IsWellKnownSid(whose, WinCreatorOwnerRightsSid) } != 0 => {}
             _ => return refused("can be opened by other users (`icacls /inheritance:r` it)"),
         }
     }

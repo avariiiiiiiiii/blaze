@@ -6,6 +6,7 @@ pub mod keyed;
 pub mod load_wrapper;
 
 pub mod affected;
+#[allow(unsafe_code, reason = "sets the environment before any thread starts")]
 pub mod backend;
 pub mod cli;
 pub mod client;
@@ -18,6 +19,7 @@ pub mod fetches;
 #[cfg(unix)]
 pub mod hermetic;
 pub mod home;
+#[allow(unsafe_code, reason = "sets the environment before any thread starts")]
 pub mod layout;
 pub mod messages;
 pub mod metadata;
@@ -34,6 +36,7 @@ pub mod say;
 pub mod script;
 pub mod script_sandbox;
 pub mod state;
+#[allow(unsafe_code, reason = "sets the environment before any thread starts")]
 pub mod toolchain;
 pub mod units;
 pub mod wasi_script;
@@ -59,6 +62,7 @@ pub use units::Record;
 /// the process's environment for the processes it starts, and a thread reading it meanwhile
 /// through the C library's `getenv` (which std's lock does not cover) could read a variable
 /// as it is freed.
+#[allow(unsafe_code, reason = "sets the environment before any thread starts")]
 pub unsafe fn command(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let args: Vec<String> = args.collect();
     let asked = Asked::parse(own::subcommand_first(args));

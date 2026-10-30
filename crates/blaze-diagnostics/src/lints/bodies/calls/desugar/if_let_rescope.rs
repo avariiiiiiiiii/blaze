@@ -137,6 +137,7 @@ impl IfLetRescope {
         let has_let = |&it: &ExprId| {
             matches!(store.expr(it), Expr::If { condition, .. } if matches!(store.expr(condition), Expr::Let { .. }))
         };
+        // clone: a copy of an iterator over IDs, allocates nothing
         if !chain.clone().any(|it| has_let(&it)) {
             self.skip.extend(chain);
             return;
@@ -145,13 +146,20 @@ impl IfLetRescope {
         let mut drops = SignificantDrops::new(b, &solver);
         let mut seen_dyn = false;
         let mut add_bracket_to_match_head = self.parents.get(&expr) == Some(&Parent::Else);
+        // alloc: empty, pushed to only once a significant dropper is found
         let mut significant_droppers = Vec::new();
+        // alloc: empty, pushed to only once a significant dropper is found
         let mut lifetime_ends = Vec::new();
         let mut closing_brackets = 0;
+        // alloc: empty, pushed to only once a significant dropper is found
         let mut alt_heads = Vec::new();
+        // alloc: empty, pushed to only once a significant dropper is found
         let mut match_heads = Vec::new();
+        // alloc: empty, pushed to only once a significant dropper is found
         let mut consequent_heads = Vec::new();
+        // alloc: empty, pushed to only once a significant dropper is found
         let mut destructors: Vec<(Option<Span>, &'static str)> = Vec::new();
+        // alloc: empty, pushed to only once a significant dropper is found
         let mut adts = Vec::new();
         let mut first_if_to_lint = None;
         let mut first_if_to_rewrite = false;
@@ -167,10 +175,10 @@ impl IfLetRescope {
                     util::span(b, then_branch),
                 )
             {
-                let if_let_pat = between(&take_while_parens(b, &expr_span), &init_span);
-                let before_conseq = conseq_span.shrink_to_lo();
-                let lifetime_end = end_point(b, &conseq_span);
                 if let Some((drop_span, drop_tys)) = FindSignificantDropper { b, drops: &mut drops }.check_if_let_scrutinee(init) {
+                    let if_let_pat = between(&take_while_parens(b, &expr_span), &init_span);
+                    let before_conseq = conseq_span.shrink_to_lo();
+                    let lifetime_end = end_point(b, &conseq_span);
                     for ty in drop_tys {
                         if let Some(span) = super::significant_drop::dtor_span(b, ty) {
                             destructors.push((Some(span), "value invokes this custom destructor"));
@@ -183,6 +191,7 @@ impl IfLetRescope {
                         }
                     }
                     if first_if_to_lint.is_none() {
+                        // clone: a span, for the lint's diagnostic
                         first_if_to_lint = b.expr_node(expr).map(|at| (let_span.clone(), at));
                     }
                     significant_droppers.push(drop_span);
@@ -196,13 +205,16 @@ impl IfLetRescope {
                             match add_bracket_to_match_head {
                                 true => {
                                     closing_brackets += 2;
+                                    // clone: a span, for the lint's diagnostic
                                     match_heads.push((if_let_pat.clone(), "{ match "));
                                 }
                                 false => {
                                     closing_brackets += 1;
+                                    // clone: a span, for the lint's diagnostic
                                     match_heads.push((if_let_pat.clone(), "match "));
                                 }
                             }
+                            // alloc: the lint's diagnostic
                             consequent_heads.push((before_conseq.clone(), format!("{{ {pat} => ")));
                             if let Some(alt_head) = alt_head {
                                 alt_heads.push(alt_head);
@@ -233,6 +245,7 @@ impl IfLetRescope {
             }
         }
         for query in drops.overflowed.drain(..) {
+            // alloc: the overflow error's message, an error path
             let message = format!("overflow while checking whether `{}` requires drop", b.ty(query));
             out.push(Found::new(Diag::new(Level::Error, None, message), Phase::Late));
         }
@@ -252,10 +265,14 @@ impl IfLetRescope {
             diag.span_help(span, DROPPED_HERE);
         }
         if first_if_to_rewrite {
+            // alloc: the lint's diagnostic
             let mut parts: Vec<(Span, String)> = Vec::new();
+            // alloc: the lint's diagnostic
             parts.extend(match_heads.into_iter().map(|(span, code)| (span, code.to_owned())));
             parts.extend(consequent_heads);
+            // alloc: the lint's diagnostic
             parts.extend(alt_heads.into_iter().map(|span| (span, " _ => ".to_owned())));
+            // alloc: the lint's diagnostic
             let mut closing = String::new();
             if empty_alt {
                 closing.push_str(" _ => {}");
@@ -270,6 +287,7 @@ impl IfLetRescope {
             );
         }
         for adt in adts {
+            // alloc: the lint's diagnostic
             let what = format!("the destructor of `{}`", b.cx.def_path(ModuleDefId::AdtId(adt).into()));
             diag.fact(Fact::DropCheck(b.cx.key(ItemId::Adt(adt))), what);
         }

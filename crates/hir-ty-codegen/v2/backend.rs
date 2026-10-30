@@ -93,18 +93,27 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
             toolchain.target
         )));
     }
-    if target.cpu() != toolchain.cpu {
+    let cranelift = spec.backend.is_cranelift();
+    // Cranelift knows no CPU by name: a named one is the features it has past the baseline,
+    // which `toolchain.features` lists. LLVM is told the baseline's name only.
+    if !cranelift && target.cpu() != toolchain.cpu {
         return Err(fail(format!(
-            "the process compiles for the CPU {}, the unit for {}",
+            "the process compiles for the CPU {}, the unit for {}: the LLVM back end is told \
+             no other CPU yet",
             target.cpu(),
             toolchain.cpu
         )));
     }
-    let cranelift = spec.backend.is_cranelift();
     if cranelift && target.features() != toolchain.features.as_slice() {
         return Err(fail(format!(
             "the process compiles with the target features {:?}, the unit with {:?}",
             target.features(),
+            toolchain.features
+        )));
+    }
+    if !cranelift && !toolchain.features.is_empty() {
+        return Err(fail(format!(
+            "the unit is for the target features {:?}: the LLVM back end is told none yet",
             toolchain.features
         )));
     }
@@ -123,6 +132,19 @@ fn check_spec(unit: &Unit, spec: &Spec) -> Result<(), CodegenError> {
         )));
     }
     let isa = isa(unit)?;
+    if cranelift && !toolchain.features.is_empty() {
+        // alloc: per unit of a build that names target features, the ISA's settings
+        let flags = isa.isa_flags();
+        for feature in &toolchain.features {
+            let Some((setting, on)) = target.cranelift_setting(feature).map_err(fail)? else { continue };
+            let set = flags.iter().find(|it| it.name == setting).and_then(|it| it.as_bool());
+            if set != Some(on) {
+                return Err(fail(format!(
+                    "the unit is for {feature}, and Cranelift's ISA has `{setting}` {set:?}"
+                )));
+            }
+        }
+    }
     let pic = isa.flags().is_pic();
     if pic != (toolchain.relocation == Relocation::Pic) {
         return Err(fail(format!(

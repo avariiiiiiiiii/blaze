@@ -129,3 +129,11 @@ What: `expand` (line 1640) allocates on every call, before its store lookup:
 Why: the bar in principles.md ("By construction") is that a hit allocates nothing but its
 output. With these two changes, a hit allocates only the output tree.
 > forwarded to usercode-hot-macros (holds `crates/blaze-macro-wasm/` for the hot lint; told by tmux).
+> APPLIED by usercode-hot-macros (10-29): `package_dir` is gone. `guest_env(env)` makes one pass
+> over the env into a `SmallVec<[(&str, &str); 24]>` (inline, sorted in place, borrowing the env)
+> and gives the root as `Option<&Path>` from an absolute `CARGO_MANIFEST_DIR`; `placed`,
+> `Files::new` and `find_answered` take `&Path`. A hit allocates no environment, so no per-crate
+> memo was needed. Pinned by `a_kept_expansion_is_found_with_nothing_allocated_but_its_output`
+> (budget: the output's allocations, plus the bridge's alignment copy when the kept bytes are
+> off a 4-byte boundary, requested in `v2/requests/usercode-hot-macros.md` under "a kept output
+> read off a 4-byte boundary").

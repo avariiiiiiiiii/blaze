@@ -130,7 +130,10 @@ pub(super) fn read(arch: Arch, name: &str, bytes: &[u8]) -> Result<Archive, Stri
                 .collect(); // alloc: once per archive without an index, in member order
             index.reserve(defined.iter().map(|it| it.as_ref().map_or(0, |(_, offsets)| offsets.len())).sum());
             // Then the names, in member order, each string of a member's `.strtab` pushed once:
-            // the arena is at most the archive (`limit` holds without a check).
+            // the arena is at most the archive (`limit` holds without a check), and at most
+            // the `.strtab`s, so it grows once, here, not by doubling.
+            let strtabs: usize = defined.iter().map(|it| it.as_ref().map_or(0, |(strtab, _)| strtab.len())).sum();
+            names.reserve(strtabs.min(limit.saturating_sub(names.bytes())));
             for (number, found) in defined.into_iter().enumerate() {
                 let (strtab, offsets) = found?;
                 let member = &members[number];

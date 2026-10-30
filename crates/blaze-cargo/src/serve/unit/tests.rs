@@ -6,7 +6,7 @@ use std::{
     sync::OnceLock,
 };
 
-use blaze_api::{Artifact, Level, UnitProfile};
+use blaze_api::{Artifact, ArtifactKind, Level, UnitProfile};
 use blaze_ids::ContentId;
 use blaze_units::{
     query::{PackagePlan, UnitPlan, Units},
@@ -178,8 +178,7 @@ fn a_scripts_directives_are_applied_as_cargo_applies_them() {
          cargo:rustc-link-search=native={out_dir}/lib\ncargo:warning=z is old\ncargo:include={out_dir}/include\n"
     );
     let env = script::inherited(&[], &units.plans[1]);
-    let began = blaze_build_script::run::elided(&z, Vec::new()).unwrap().began;
-    let judged = script::judge(&z, &env, &value(0, &printed, ""), began, Some(&[]), None, false);
+    let judged = script::judge(&z, &env, &value(0, &printed, ""), Some(&[]), None, false);
     let output = judged.output.expect("the run succeeded");
     assert_eq!(output.cfgs, ["has_z"]);
     assert_eq!(output.env, [("Z_VERSION".to_owned(), "1.3".to_owned())]);
@@ -214,13 +213,12 @@ fn a_directive_the_sandbox_refuses_fails_the_build() {
     let scripts = slots(&units);
     let tools = PathBuf::from("/state/tools");
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
-    let began = blaze_build_script::run::elided(&z, Vec::new()).unwrap().began;
     let printed = "cargo:rustc-link-search=native=/home/me/lib\n";
-    let judged = script::judge(&z, &[], &value(0, printed, ""), began, Some(&[]), None, false);
+    let judged = script::judge(&z, &[], &value(0, printed, ""), Some(&[]), None, false);
     assert!(judged.output.is_none());
     assert!(judged.diagnostics[0].message.starts_with("the build script of `z-sys` printed a directive"));
     // Outside the sandbox nothing is checked.
-    let judged = script::judge(&z, &[], &value(0, printed, ""), began, None, None, false);
+    let judged = script::judge(&z, &[], &value(0, printed, ""), None, None, false);
     assert!(judged.output.is_some());
 }
 
@@ -231,8 +229,7 @@ fn a_failed_script_says_what_cargo_says() {
     let scripts = slots(&units);
     let tools = PathBuf::from("/state/tools");
     let z = script::script_unit(&of(&units, &scripts, &tools), 1).unwrap();
-    let began = blaze_build_script::run::elided(&z, Vec::new()).unwrap().began;
-    let judged = script::judge(&z, &[], &value(101, "cargo:warning=no zlib\n", "thread 'main' panicked\n"), began, Some(&[]), None, false);
+    let judged = script::judge(&z, &[], &value(101, "cargo:warning=no zlib\n", "thread 'main' panicked\n"), Some(&[]), None, false);
     assert!(judged.output.is_none());
     let [warning, error] = judged.diagnostics.as_slice() else { panic!("{:?}", judged.diagnostics) };
     assert_eq!(warning.rendered, "warning: z-sys@0.1.0: no zlib\n");
@@ -246,7 +243,7 @@ fn a_failed_script_says_what_cargo_says() {
     assert!(error.rendered.starts_with("error: failed to run custom build command for `z-sys v0.1.0 (/w/z-sys)`\n"));
 
     // An error it logged fails it too, under cargo's cause.
-    let judged = script::judge(&z, &[], &value(0, "cargo::error=no zlib\n", ""), began, Some(&[]), None, true);
+    let judged = script::judge(&z, &[], &value(0, "cargo::error=no zlib\n", ""), Some(&[]), None, true);
     let [logged, error] = judged.diagnostics.as_slice() else { panic!("{:?}", judged.diagnostics) };
     assert_eq!(logged.message, "z-sys@0.1.0: no zlib");
     assert_eq!(logged.rendered, "\x1b[1m\x1b[91merror\x1b[0m\x1b[1m:\x1b[0m z-sys@0.1.0: no zlib\n");
@@ -289,8 +286,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
     assert_eq!(one.spec.key, two.spec.key);
     assert!(!one.given.iter().any(|it| it == "SECRET_TOKEN"));
     // Nor in anything said of the run.
-    let began = blaze_build_script::run::elided(&z, Vec::new()).unwrap().began;
-    let judged = script::judge(&z, &env, &value(1, "", ""), began, Some(&[]), None, false);
+    let judged = script::judge(&z, &env, &value(1, "", ""), Some(&[]), None, false);
     let said = blaze_protocol::cbor::to_vec(&judged.diagnostics).unwrap();
     assert!(!said.windows(7).any(|it| it == b"hunter2"));
 }
@@ -298,7 +294,7 @@ fn a_script_sees_the_jobs_environment_with_cargos_over_it_and_none_of_it_is_kept
 fn artifact_of(unit: &Unit, plan: &UnitPlan) -> Artifact {
     let package = package(&unit.pkg_id, "p", "/w/p");
     let main = artifact::main(unit, plan).unwrap();
-    artifact::artifact(unit, plan, &package, &main, ContentId::of("blaze v2 test 1", b"x"), false, artifact::Runs::default())
+    artifact::artifact(unit, plan, &package, &main, ContentId::of("blaze v2 test 1", b"x"), false, artifact::Runs::default()).unwrap()
 }
 
 #[test]
@@ -315,7 +311,7 @@ fn a_libs_artifact_is_cargos() {
         ],
     );
     let it = artifact_of(&lib, &plan);
-    assert_eq!(it.kind, "lib");
+    assert_eq!(it.kind, ArtifactKind::Lib);
     assert_eq!(it.filenames, ["/w/target/debug/libp.rlib", "/w/target/debug/deps/libp-0123.rmeta"]);
     assert_eq!(it.executable, None);
     assert_eq!(it.path, "/w/target/debug/libp.rlib");
@@ -323,7 +319,7 @@ fn a_libs_artifact_is_cargos() {
         it.profile,
         UnitProfile { opt_level: "0".into(), debuginfo: 2, debug_assertions: true, overflow_checks: true, test: false }
     );
-    assert_eq!(it.target, unit_target(&lib));
+    assert_eq!(it.target, unit_target(&lib).unwrap());
     assert_eq!(it.features, ["default"]);
     assert_eq!(it.manifest_path, "/w/p/Cargo.toml");
 }
@@ -336,7 +332,7 @@ fn a_bins_artifact_is_cargos() {
         &["/w/target/debug/deps/p-0123", "/w/target/debug/deps/p-0123.d", "/w/target/debug/p", "/w/target/debug/p.d"],
     );
     let it = artifact_of(&bin, &plan);
-    assert_eq!(it.kind, "bin");
+    assert_eq!(it.kind, ArtifactKind::Bin);
     assert_eq!(it.filenames, ["/w/target/debug/p"]);
     assert_eq!(it.executable.as_deref(), Some("/w/target/debug/p"));
     assert!(!it.profile.test);
@@ -347,7 +343,7 @@ fn a_tests_artifact_is_cargos() {
     let test = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Test, &[]);
     let plan = plan("-4567", &["/w/target/debug/deps/p-4567", "/w/target/debug/deps/p-4567.d"]);
     let it = artifact_of(&test, &plan);
-    assert_eq!(it.kind, "test");
+    assert_eq!(it.kind, ArtifactKind::Test);
     assert_eq!(it.filenames, ["/w/target/debug/deps/p-4567"]);
     assert_eq!(it.executable.as_deref(), Some("/w/target/debug/deps/p-4567"));
     assert!(it.profile.test);
@@ -365,7 +361,7 @@ fn a_build_scripts_artifact_is_cargos() {
         ],
     );
     let it = artifact_of(&script, &plan);
-    assert_eq!(it.kind, "custom-build");
+    assert_eq!(it.kind, ArtifactKind::CustomBuild);
     assert_eq!(it.filenames, ["/w/target/debug/build/p-89ab/build-script-build"]);
     assert_eq!(it.executable, None);
 }
@@ -400,7 +396,7 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
 
     let package = package(P, "p", "/w/p");
     let runs = artifact::Runs { runner: vec!["qemu-aarch64".to_owned()], env: env.clone() };
-    let it = artifact::artifact(&bin, &plan, &package, "/w/target/debug/p", ContentId::of("blaze v2 test 1", b"x"), false, runs);
+    let it = artifact::artifact(&bin, &plan, &package, "/w/target/debug/p", ContentId::of("blaze v2 test 1", b"x"), false, runs).unwrap();
     assert_eq!(it.runner, ["qemu-aarch64"]);
     assert!(it.harness);
     let job = [
@@ -421,7 +417,7 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
     let lib = unit(P, target("p", "lib", "/w/p/src/lib.rs"), Mode::Build, &[]);
     let lib_plan = self::plan("-0123", &["/w/target/debug/deps/libp-0123.rlib"]);
     let runs = artifact::Runs { runner: Vec::new(), env };
-    let it = artifact::artifact(&lib, &lib_plan, &package, "/w/target/debug/deps/libp-0123.rlib", ContentId::of("blaze v2 test 1", b"x"), false, runs);
+    let it = artifact::artifact(&lib, &lib_plan, &package, "/w/target/debug/deps/libp-0123.rlib", ContentId::of("blaze v2 test 1", b"x"), false, runs).unwrap();
     assert!(it.env.is_empty());
 }
 

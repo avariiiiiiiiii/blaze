@@ -123,16 +123,20 @@ use a::X;
     let round = RoundKey::new(&db, krate, 0);
     let modules = queries::round_modules(&db, round);
     assert_eq!(modules.order.len(), 2);
-    // `a` reads the root and not the other way around: the root comes first, and may not read `a`.
-    let partition = components(&ImportGraph::from_edges(2, &[(1, 0)]));
-    let component = partition.of(0);
-    assert!(!partition.may_read(component, partition.of(1)));
+    blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+        // `a` reads the root and not the other way around: the root comes first, and may not
+        // read `a`.
+        let partition = components(frame, &ImportGraph::from_edges(frame, 2, &[(1, 0)]));
+        let component = partition.of(0);
+        assert!(!partition.may_read(component, partition.of(1)));
 
-    let check = ReadCheck { partition: &partition, index: &modules.index, component };
-    let env = queries::round_env(&db, round);
-    let mut unit = Unit::component(&db, round, env, Some(check), UnitState::default(), None);
-    unit.replay_round(modules.order[0], 0);
-    unit.resolve_imports();
+        let check = ReadCheck { partition: &partition, index: &modules.index, component };
+        let env = queries::round_env(&db, round);
+        let state = UnitState::default();
+        let mut unit = Unit::component(&db, frame, round, env, Some(check), state, None);
+        unit.replay_round(modules.order[0], 0);
+        unit.resolve_imports();
+    });
 }
 
 /// The root's macro adds `g` to the root at round 1; `a` gains nothing and reads nothing.

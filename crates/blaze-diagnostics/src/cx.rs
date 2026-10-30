@@ -14,18 +14,20 @@ use std::{
 use base_db::Db;
 use blaze_items::{Fact, ItemId, ItemKey, NameHash, SimplifiedType};
 use blaze_mem::Frame;
-use hir::{DisplayTarget, InFile, MacroCallId, Semantics};
+use hir::{DisplayTarget, HirFileId, InFile, MacroCallId, Semantics};
 use hir_expand::{MacroCallKind, MacroDefKind};
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use span::{Edition, FileId};
 use syntax::{
-    AstNode, AstPtr, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
+    AstNode, AstPtr, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize,
     ast::{self, HasAttrs as _},
+    view::{self, AstNode as _, HasAttrs as _},
 };
 
 use crate::{
     lints::{
-        ItemWalk, LevelMap,
+        Effective, ItemWalk, LevelMap,
         registry::{LintId, LintSet},
         syntax::Walk,
     },
@@ -51,7 +53,9 @@ impl<'a> Files<'a> {
     /// has no path for is `<file N>`.
     pub fn name(&self, file: FileId) -> String {
         match self.paths.get(&file) {
+            // alloc: a span's file name, made only as a diagnostic is built
             Some(path) => Files::relative(path, self.root).to_owned(),
+            // alloc: as above
             None => format!("<file {}>", file.index()),
         }
     }
@@ -70,6 +74,9 @@ impl<'a> Files<'a> {
 /// A diagnostic of a crate being lowered.
 pub struct Cx<'a, 'db> {
     pub sema: &'a Semantics<'db>,
+    /// The `Semantics` of views. Every view handed to it is of a tree it gave out: roots are
+    /// taken through [`Cx::root`], never `HirFileId::root`.
+    pub vsema: hir::view::Semantics<'db>,
     pub db: &'db Db,
     pub krate: hir::Crate,
     pub edition: Edition,
@@ -88,7 +95,9 @@ pub struct Cx<'a, 'db> {
     /// The crate as rustc's early lint pass walks it, made the first time a pass asks.
     walk: OnceCell<Walk<'db>>,
     /// The crate's items as rustc's item passes visit them, made the first time a pass asks.
-    items: OnceCell<ItemWalk>,
+    items: OnceCell<ItemWalk<'db>>,
+    /// The crate's effective visibilities, made the first time a pass asks.
+    effective: OnceCell<Effective>,
     /// The HIR lint levels, made the first time a level is asked and filled in as levels are.
     levels: RefCell<Option<LevelMap<'db>>>,
     /// The lints that may fire anywhere in the crate, made the first time a pass asks.
@@ -105,6 +114,7 @@ impl<'a, 'db> Cx<'a, 'db> {
         let db = sema.db;
         Cx {
             sema,
+            vsema: hir::view::Semantics::new(db),
             db,
             krate,
             edition: krate.edition(db),
@@ -116,6 +126,7 @@ impl<'a, 'db> Cx<'a, 'db> {
             paths: OnceCell::new(),
             walk: OnceCell::new(),
             items: OnceCell::new(),
+            effective: OnceCell::new(),
             levels: RefCell::new(None),
             may_fire: OnceCell::new(),
         }
@@ -160,8 +171,14 @@ impl<'a, 'db> Cx<'a, 'db> {
 
     /// The crate's items in the order rustc's item passes visit them: made once per check, for
     /// the item lints before the abort and after it.
-    pub(crate) fn items(&self) -> &ItemWalk {
+    pub(crate) fn items(&self) -> &ItemWalk<'db> {
         self.items.get_or_init(|| ItemWalk::of(self))
+    }
+
+    /// The crate's effective visibilities (rustc's `effective_visibilities`): made once per
+    /// check, for the stability pass, the dead-code pass and the item lints after the abort.
+    pub(crate) fn effective(&self) -> &Effective {
+        self.effective.get_or_init(|| Effective::of(self))
     }
 
     /// The level `lint` has at `at`, from the attributes there and around it and the lint
@@ -250,6 +267,7 @@ impl<'a, 'db> Cx<'a, 'db> {
         let at = match mapped {
             Some((at, _)) if local => Span::new(&self.file_name(at.file_id.file_id(self.db)), at.range),
             _ => match &expansion {
+                // clone: the call site's span, on the path of a diagnostic
                 Some(it) => Span { expansion: None, ..it.call_site.clone() },
                 None => {
                     let at = loc.kind.original_call_range(self.db, loc.krate);
@@ -258,6 +276,30 @@ impl<'a, 'db> Cx<'a, 'db> {
             },
         };
         Span { expansion, ..at }
+    }
+
+    /// The file and range [`Cx::span`] gives `range`, without the span: no file name copied and
+    /// no expansion made, for a scan that orders places and writes nothing. Takes `span`'s cases
+    /// in its order.
+    pub fn place(&self, range: InFile<TextRange>) -> (FileId, TextRange) {
+        let Some(call) = range.file_id.macro_file() else {
+            let file = range.file_id.file_id().expect("a file that is not a macro's");
+            return (file.file_id(self.db), range.value);
+        };
+        let mapped = range.original_node_file_range_opt(self.db);
+        let loc = call.loc(self.db);
+        match mapped {
+            Some((at, ctxt)) if ctxt.is_root() || hir::Crate::from(loc.def.krate) == self.krate => {
+                (at.file_id.file_id(self.db), at.range)
+            }
+            _ => match self.call_of(call, false) {
+                Some((_, _, at)) => self.place(at),
+                None => {
+                    let at = loc.kind.original_call_range(self.db, loc.krate);
+                    (at.file_id.file_id(self.db), at.range)
+                }
+            },
+        }
     }
 
     /// [`Cx::span`] of a node.
@@ -282,37 +324,34 @@ impl<'a, 'db> Cx<'a, 'db> {
         ptr.map(|it| it.to_node(&root))
     }
 
+    /// The root of `file`, parsed or expanded, as a view of a tree [`Cx::vsema`] gave out.
+    pub fn root(&self, file: HirFileId) -> view::Node<'db> {
+        self.vsema.parse_or_expand(file)
+    }
+
+    /// The node `ptr` points to, as a view: [`Cx::node`] with no handle.
+    pub fn node_view<N: AstNode + view::Typed>(&self, ptr: InFile<AstPtr<N>>) -> InFile<N::Of<'db>> {
+        let root = self.root(ptr.file_id);
+        ptr.map(|it| it.to_view(root))
+    }
+
+    /// The syntax node `ptr` points to, as a view: [`Cx::syntax`] with no handle.
+    pub fn syntax_view(&self, ptr: InFile<SyntaxNodePtr>) -> InFile<view::Node<'db>> {
+        let root = self.root(ptr.file_id);
+        ptr.map(|it| view::to_node(it, root))
+    }
+
     /// What rustc says of the expansion of the macro call `call`: where it was called (itself
     /// in an expansion when it was), what it is and where it is defined.
     pub fn expansion_of(&self, call: MacroCallId) -> Option<Expansion> {
         let db = self.db;
         let loc = call.loc(db);
-        let node = loc.to_node(db);
-        let call_range = |range: TextRange| self.span(node.with_value(range));
-        let (kind, name, call_site) = match &loc.kind {
-            MacroCallKind::FnLike { .. } => {
-                let call = ast::MacroCall::cast(node.value.clone())?;
-                let name = call.path()?.segment()?.name_ref()?.text().to_string();
-                (MacroKind::Bang, name, call_range(node.value.text_range()))
-            }
-            MacroCallKind::Derive { derive_index, .. } => {
-                let attr = ast::Attr::cast(node.value.clone())?;
-                let (range, path) = derive_paths(&attr).into_iter().nth(*derive_index as usize)?;
-                let name = path.rsplit("::").next()?.to_owned();
-                (MacroKind::Derive, name, call_range(range))
-            }
-            MacroCallKind::Attr { .. } => {
-                let item = ast::Item::cast(node.value.clone())?;
-                let attr = item.attrs().next()?;
-                let name = attr.path()?.segment()?.name_ref()?.text().to_string();
-                (MacroKind::Attr, name, call_range(attr.syntax().text_range()))
-            }
-        };
+        let (kind, name, at) = self.call_of(call, true)?;
+        let call_site = self.span(at);
         let def_site = match loc.def.kind {
             MacroDefKind::ProcMacro(id, ..) => {
                 let file = id.file_id.file_id()?.file_id(db);
-                let item = id.to_node(db);
-                Some(self.span_in_file(file, signature_range(&item)))
+                Some(self.span_in_file(file, signature_range_view(id.to_view(db))))
             }
             MacroDefKind::Declarative(id, _)
             | MacroDefKind::BuiltIn(id, _)
@@ -320,11 +359,55 @@ impl<'a, 'db> Cx<'a, 'db> {
             | MacroDefKind::BuiltInDerive(id, _)
             | MacroDefKind::BuiltInEager(id, _)
             | MacroDefKind::UnimplementedBuiltIn(id) => {
-                let item = id.to_node(db);
-                Some(self.span(id.with_value(item_range(item.syntax()))))
+                Some(self.span(id.with_value(item_range_view(id.to_view(db).syntax()))))
             }
         };
         Some(Expansion { call_site, kind, name, def_site })
+    }
+
+    /// What the macro call `call` is, its name (empty unless `named`) and the range its call
+    /// site is shown at; none exactly where [`Cx::expansion_of`] tells nothing of it.
+    fn call_of(&self, call: MacroCallId, named: bool) -> Option<(MacroKind, String, InFile<TextRange>)> {
+        let db = self.db;
+        let loc = call.loc(db);
+        if let MacroDefKind::ProcMacro(id, ..) = loc.def.kind {
+            id.file_id.file_id()?;
+        }
+        let node = loc.to_node_view(db);
+        // alloc: the macro's name, kept in the diagnostic; none unless `named`
+        let owned = |text: &str| if named { text.to_owned() } else { String::new() };
+        let (kind, name, range) = match &loc.kind {
+            MacroCallKind::FnLike { .. } => {
+                let call = view::MacroCall::cast(node.value)?;
+                let text = call.path()?.segment()?.name_ref()?.text();
+                (MacroKind::Bang, owned(text), node.value.text_range())
+            }
+            MacroCallKind::Derive { derive_index, .. } => {
+                let attr = view::Attr::cast(node.value)?;
+                if named {
+                    let (range, path) = derive_paths_view(attr).into_iter().nth(*derive_index as usize)?;
+                    (MacroKind::Derive, owned(path.rsplit("::").next()?), range)
+                } else {
+                    let mut at = None;
+                    let mut k = 0u32;
+                    derive_path_tokens_view(attr, |range, _| {
+                        if k == *derive_index {
+                            at = Some(range);
+                        }
+                        k += 1;
+                    });
+                    // alloc: none, an empty name
+                    (MacroKind::Derive, String::new(), at?)
+                }
+            }
+            MacroCallKind::Attr { .. } => {
+                let item = view::Item::cast(node.value)?;
+                let attr = item.attrs().next()?;
+                let text = attr.path()?.segment()?.name_ref()?.text();
+                (MacroKind::Attr, owned(text), attr.syntax().text_range())
+            }
+        };
+        Some((kind, name, node.with_value(range)))
     }
 
     /// rustc's printing of `ty`: trimmed paths, `{integer}` for an integer variable, closures
@@ -376,35 +459,37 @@ impl<'a, 'db> Cx<'a, 'db> {
     }
 }
 
-/// The paths of a `#[derive(...)]`, in order, with where each is.
+/// The paths of a `#[derive(...)]`, in order, with where each is, as text: for a diagnostic
+/// naming a derive. A scan takes [`derive_path_tokens`].
 pub fn derive_paths(attr: &ast::Attr) -> Vec<(TextRange, String)> {
-    let Some((_, tt)) = attr.as_simple_call() else { return Vec::new() };
+    // alloc: the paths as text, for a diagnostic's name of a derive
     let mut paths = Vec::new();
-    let mut current: Option<(TextSize, TextSize, String)> = None;
+    derive_path_tokens(attr, |range, tokens| {
+        // alloc: as above
+        paths.push((range, tokens.iter().map(|it| it.text()).collect()));
+    });
+    paths
+}
+
+/// Each path of a `#[derive(...)]`, in order: where it is and its tokens (names, `::`). No
+/// allocation for a path of up to eight tokens.
+pub fn derive_path_tokens(attr: &ast::Attr, mut each: impl FnMut(TextRange, &[SyntaxToken])) {
+    let Some((_, tt)) = attr.as_simple_call() else { return };
+    let mut current: SmallVec<[SyntaxToken; 8]> = SmallVec::new();
+    let mut flush = |current: &mut SmallVec<[SyntaxToken; 8]>| {
+        if let (Some(first), Some(last)) = (current.first(), current.last()) {
+            each(TextRange::new(first.text_range().start(), last.text_range().end()), current);
+        }
+        current.clear();
+    };
     for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token) {
         match token.kind() {
-            SyntaxKind::IDENT | SyntaxKind::COLON2 | SyntaxKind::COLON => {
-                let range = token.text_range();
-                match &mut current {
-                    Some((_, end, text)) => {
-                        *end = range.end();
-                        text.push_str(token.text());
-                    }
-                    None => current = Some((range.start(), range.end(), token.text().to_owned())),
-                }
-            }
-            SyntaxKind::COMMA | SyntaxKind::R_PAREN => {
-                if let Some((start, end, text)) = current.take() {
-                    paths.push((TextRange::new(start, end), text));
-                }
-            }
+            SyntaxKind::IDENT | SyntaxKind::COLON2 | SyntaxKind::COLON => current.push(token),
+            SyntaxKind::COMMA | SyntaxKind::R_PAREN => flush(&mut current),
             _ => {}
         }
     }
-    if let Some((start, end, text)) = current {
-        paths.push((TextRange::new(start, end), text));
-    }
-    paths
+    flush(&mut current);
 }
 
 /// Where rustc's span of an item starts: after its attributes, doc comments and the comments
@@ -420,6 +505,20 @@ pub fn item_range(node: &SyntaxNode) -> TextRange {
         })
         .map_or(node.text_range().start(), |it| it.text_range().start());
     TextRange::new(start, node.text_range().end())
+}
+
+/// rustc's `def_span` of a closure (`fn_decl_span`): from after its attributes to the end of
+/// its return type, else of its parameters; [`item_range`] of a node that is not a closure.
+pub fn closure_decl_range(node: &SyntaxNode) -> TextRange {
+    let range = item_range(node);
+    let end = (node.kind() == SyntaxKind::CLOSURE_EXPR)
+        .then(|| {
+            let child = |kind| node.children().find(|it| it.kind() == kind);
+            child(SyntaxKind::RET_TYPE).or_else(|| child(SyntaxKind::PARAM_LIST))
+        })
+        .flatten()
+        .map_or(range.end(), |it| it.text_range().end());
+    TextRange::new(range.start(), end.max(range.start()))
 }
 
 /// The span rustc gives a function's definition (`def_span`): its signature, without its body.
@@ -447,7 +546,10 @@ pub fn signature_range(item: &ast::Fn) -> TextRange {
 /// a trait or an impl, from its first keyword to the end of its header, before `{` or `;`;
 /// else the whole item.
 pub fn def_range(node: &SyntaxNode) -> TextRange {
-    if let Some(item) = ast::Fn::cast(node.clone()) {
+    if node.kind() == SyntaxKind::FN
+        // clone: a reference count on the tree, of a function only
+        && let Some(item) = ast::Fn::cast(node.clone())
+    {
         return signature_range(&item);
     }
     let range = item_range(node);
@@ -466,16 +568,134 @@ pub fn def_range(node: &SyntaxNode) -> TextRange {
         })
         .map(|it| it.text_range().start());
     let Some(end) = header_end else { return range };
-    let text = node.to_string();
-    let base = node.text_range().start();
-    let header = &text[usize::from(range.start() - base)..usize::from(end - base)];
-    let trimmed = TextSize::of(header.trim_end());
-    TextRange::at(range.start(), trimmed)
+    // The header's text from `range`'s start to `end`, its trailing whitespace trimmed, read
+    // token by token in place.
+    let mut trimmed = range.start();
+    for token in node.descendants_with_tokens().filter_map(NodeOrToken::into_token) {
+        let at = token.text_range();
+        if at.end() <= range.start() {
+            continue;
+        }
+        if at.start() >= end {
+            break;
+        }
+        let text = token.text();
+        let from = usize::from(range.start().max(at.start()) - at.start());
+        let to = usize::from(end.min(at.end()) - at.start());
+        let kept = text[from..to].trim_end();
+        if !kept.is_empty() {
+            trimmed = at.start() + TextSize::of(&text[..from + kept.len()]);
+        }
+    }
+    TextRange::new(range.start(), trimmed)
+}
+
+/// [`derive_paths`] of a view.
+pub fn derive_paths_view(attr: view::Attr<'_>) -> Vec<(TextRange, String)> {
+    // alloc: the paths as text, for a diagnostic's name of a derive
+    let mut paths = Vec::new();
+    derive_path_tokens_view(attr, |range, tokens| {
+        // alloc: as above
+        paths.push((range, tokens.iter().map(|it| it.text()).collect()));
+    });
+    paths
+}
+
+/// [`derive_path_tokens`] of a view: the same paths, ranges and tokens, in order.
+pub fn derive_path_tokens_view<'t>(attr: view::Attr<'t>, mut each: impl FnMut(TextRange, &[view::Token<'t>])) {
+    let Some((_, tt)) = attr.as_simple_call() else { return };
+    let mut current: SmallVec<[view::Token<'t>; 8]> = SmallVec::new();
+    let mut flush = |current: &mut SmallVec<[view::Token<'t>; 8]>| {
+        if let (Some(first), Some(last)) = (current.first(), current.last()) {
+            each(TextRange::new(first.text_range().start(), last.text_range().end()), current);
+        }
+        current.clear();
+    };
+    for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token) {
+        match token.kind() {
+            SyntaxKind::IDENT | SyntaxKind::COLON2 | SyntaxKind::COLON => current.push(token),
+            SyntaxKind::COMMA | SyntaxKind::R_PAREN => flush(&mut current),
+            _ => {}
+        }
+    }
+    flush(&mut current);
+}
+
+/// [`item_range`] of a view.
+pub fn item_range_view(node: view::Node<'_>) -> TextRange {
+    let start = node
+        .children_with_tokens()
+        .find(|it| match it {
+            NodeOrToken::Node(node) => {
+                !matches!(node.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
+            }
+            NodeOrToken::Token(token) => !token.kind().is_trivia(),
+        })
+        .map_or(node.text_range().start(), |it| it.text_range().start());
+    TextRange::new(start, node.text_range().end())
+}
+
+/// [`closure_decl_range`] of a view.
+pub fn closure_decl_range_view(node: view::Node<'_>) -> TextRange {
+    let range = item_range_view(node);
+    let end = view::ClosureExpr::cast(node)
+        .and_then(|it| {
+            it.ret_type().map(|it| it.syntax().text_range().end()).or_else(|| it.param_list().map(|it| it.syntax().text_range().end()))
+        })
+        .unwrap_or(range.end());
+    TextRange::new(range.start(), end.max(range.start()))
+}
+
+/// [`signature_range`] of a view.
+pub fn signature_range_view(item: view::Fn<'_>) -> TextRange {
+    let range = item_range_view(item.syntax());
+    let end: TextSize = match item.body() {
+        Some(body) => {
+            let mut end = body.syntax().text_range().start();
+            let mut at = body.syntax().prev_sibling_or_token();
+            while let Some(it) = at {
+                if !it.kind().is_trivia() {
+                    end = it.text_range().end();
+                    break;
+                }
+                at = it.prev_sibling_or_token();
+            }
+            end
+        }
+        None => range.end(),
+    };
+    TextRange::new(range.start(), end.max(range.start()))
+}
+
+/// [`def_range`] of a view: the header's text is sliced from the text the tree lends, so
+/// nothing is copied.
+pub fn def_range_view(node: view::Node<'_>) -> TextRange {
+    if let Some(item) = view::Fn::cast(node) {
+        return signature_range_view(item);
+    }
+    let range = item_range_view(node);
+    let header_end = node
+        .children_with_tokens()
+        .filter(|it| it.text_range().start() >= range.start())
+        .find(|it| match it {
+            NodeOrToken::Node(node) => matches!(
+                node.kind(),
+                SyntaxKind::RECORD_FIELD_LIST
+                    | SyntaxKind::VARIANT_LIST
+                    | SyntaxKind::ASSOC_ITEM_LIST
+                    | SyntaxKind::ITEM_LIST
+            ),
+            NodeOrToken::Token(token) => token.kind() == SyntaxKind::SEMICOLON,
+        })
+        .map(|it| it.text_range().start());
+    let Some(end) = header_end else { return range };
+    let header = &node.text()[TextRange::new(range.start(), end) - node.text_range().start()];
+    TextRange::at(range.start(), TextSize::of(header.trim_end()))
 }
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstNode, SourceFile, ast};
+    use syntax::{AstNode, SourceFile, ast, view::AstNode as _};
 
     use super::*;
 
@@ -497,6 +717,54 @@ mod tests {
         assert_eq!(&text[def_range(node.syntax())], "pub struct S<T> where T: Copy");
         let text = "struct U;";
         assert_eq!(&text[def_range(first::<ast::Struct>(text).syntax())], "struct U");
+    }
+
+    /// A closure is spanned from after its attributes to its return type, else its parameters;
+    /// anything else by its item range. The view gives the same at every node.
+    #[test]
+    fn a_closure_is_spanned_by_its_declaration() {
+        let text = "fn f() { #[a] move |x| -> u8 { 0 }; |x| x; }";
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let handles = parse.tree();
+        let closures: Vec<_> = handles.syntax().descendants().filter_map(ast::ClosureExpr::cast).collect();
+        let spans: Vec<_> = closures.iter().map(|it| &text[closure_decl_range(it.syntax())]).collect();
+        assert_eq!(spans, ["move |x| -> u8", "|x|"]);
+        let function = first::<ast::Fn>(text);
+        assert_eq!(closure_decl_range(function.syntax()), item_range(function.syntax()));
+        for (node, it) in handles.syntax().descendants().zip(parse.root().descendants()) {
+            assert_eq!(closure_decl_range(&node), closure_decl_range_view(it));
+        }
+    }
+
+    fn first_view<'t, N: view::AstNode<'t>>(parse: &'t syntax::Parse<SourceFile>) -> N {
+        parse.root().descendants().find_map(N::cast).unwrap()
+    }
+
+    /// Each view twin gives what its handle version gives, at every node of the same source.
+    #[test]
+    fn the_views_give_the_handles_ranges() {
+        let text = "/// doc\n#[inline]\npub fn f(x: u32) -> u32 { x }\n\
+                    #[derive(Debug)]\npub struct S<T> where T: Copy {\n    a: T,\n}\n\
+                    struct U;\n// c\nimpl<T> Tr for S<T> { fn g(); }\n\
+                    #[derive(Debug, serde :: Serialize, ,)]\nenum E { A }\n";
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let handles = parse.tree();
+        let mut compared = 0;
+        for (node, it) in handles.syntax().descendants().zip(parse.root().descendants()) {
+            assert_eq!((node.kind(), node.text_range()), (it.kind(), it.text_range()));
+            assert_eq!(item_range(&node), item_range_view(it));
+            assert_eq!(def_range(&node), def_range_view(it));
+            if let (Some(f), Some(g)) = (ast::Fn::cast(node.clone()), view::Fn::cast(it)) {
+                assert_eq!(signature_range(&f), signature_range_view(g));
+            }
+            if let (Some(a), Some(b)) = (ast::Attr::cast(node.clone()), view::Attr::cast(it)) {
+                assert_eq!(derive_paths(&a), derive_paths_view(b));
+            }
+            compared += 1;
+        }
+        assert!(compared > 40, "the source has many nodes: {compared}");
+        let f: view::Fn<'_> = first_view(&parse);
+        assert_eq!(&text[signature_range_view(f)], "pub fn f(x: u32) -> u32");
     }
 
     #[test]

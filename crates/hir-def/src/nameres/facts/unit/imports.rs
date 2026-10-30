@@ -1,20 +1,29 @@
 //! A unit's imports and the worklist of their fixed point: the old collector's `Imports`, over
 //! owned [`ImportOp`]s so a unit's state is a plain query value carried from round to round.
+//!
+//! What is carried ([`Imports`]) is the imports and what each resolved to. The worklist
+//! ([`ImportQueues`]) is one run's: a unit makes it in its query's frame and drops it with the
+//! run. A run's fixed point ends with every queue empty and every attempt's waits stale for the
+//! next run, which starts by retrying every import it has (the fresh path pushes each one, the
+//! carried path wakes them all), so a new worklist resolves as the carried one did.
 
 use std::{
+    alloc::{Allocator, Global},
     cmp::Reverse,
-    collections::{BinaryHeap, hash_map::Entry},
+    collections::BinaryHeap,
     iter, mem,
 };
 
+use blaze_mem::Frame;
+use hashbrown::{HashMap, hash_map::Entry};
 use hir_expand::name::Name;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxBuildHasher;
 
 use crate::{
     ModuleId,
     item_scope::GlobId,
     item_tree::ImportKind,
-    nameres::facts::ops::ImportOp,
+    nameres::facts::{FrameMap, FrameVec, map_in, ops::ImportOp},
     per_ns::PerNs,
     visibility::Visibility,
 };
@@ -105,88 +114,65 @@ pub(super) enum Phase {
 const PENDING: u8 = 1;
 const DEFERRED: u8 = 2;
 
-/// Every import of the unit, and the queues of the fixed point over them. An import is a `u32`
-/// index into the columns; it moves between lists by its `list` entry only.
+/// Every import of the unit and what its attempts found: what a component carries from round to
+/// round (`A = Global`), or a block's, in its frame. An import is a `u32` index into the
+/// columns; it moves between lists by its `list` entry only.
 #[derive(Clone, Debug)]
-pub(super) struct Imports {
-    pub(super) directives: Vec<Directive>,
-    pub(super) list: Vec<ImportList>,
-    /// Bumped at each attempt to resolve the import.
-    generation: Vec<u32>,
-    /// `PENDING` and `DEFERRED` bits.
-    queued: Vec<u8>,
+pub(super) struct Imports<A: Allocator + Clone = Global> {
+    pub(super) directives: Vec<Directive, A>,
+    pub(super) list: Vec<ImportList, A>,
     /// Position in `indeterminate`, once the import was indeterminate.
-    pub(super) seq: Vec<u32>,
+    pub(super) seq: Vec<u32, A>,
     /// The imports that were indeterminate, in the order they became so, with what each last
     /// resolved to. One resolved since stays where it is; `list` says it is done.
-    pub(super) indeterminate: Vec<(u32, PerNs)>,
+    pub(super) indeterminate: Vec<(u32, PerNs), A>,
     /// Plain imports by the module and the name they bind, in index order: head and tail of a
     /// list linked through `next_named`.
-    named: FxHashMap<(ModuleId, Name), (u32, u32)>,
-    next_named: Vec<u32>,
+    named: HashMap<(ModuleId, Name), (u32, u32), FxBuildHasher, A>,
+    next_named: Vec<u32, A>,
+}
+
+/// One run's worklist over a unit's imports: made in the run's frame for the imports the unit
+/// starts with, grown with each it pushes, dropped when the run ends. Besides the queues it
+/// holds what keeps them consistent: each import's attempt count (what makes a wait stale), its
+/// queued bits, the phase, and the edges' free list.
+pub(super) struct ImportQueues<'f> {
+    /// Bumped at each attempt to resolve the import.
+    generation: FrameVec<'f, u32>,
+    /// `PENDING` and `DEFERRED` bits.
+    queued: FrameVec<'f, u8>,
     pub(super) phase: Phase,
-    pending_unresolved: BinaryHeap<Reverse<u32>>,
-    deferred_unresolved: Vec<u32>,
-    pending_indeterminate: BinaryHeap<Reverse<u32>>,
-    deferred_indeterminate: Vec<u32>,
+    pending_unresolved: BinaryHeap<Reverse<u32>, &'f Frame>,
+    deferred_unresolved: FrameVec<'f, u32>,
+    pending_indeterminate: BinaryHeap<Reverse<u32>, &'f Frame>,
+    deferred_indeterminate: FrameVec<'f, u32>,
     /// Head of each key's list of waiting imports in `edges`.
-    waits: FxHashMap<WaitOn, u32>,
-    edges: Vec<WaitEdge>,
+    waits: FrameMap<'f, WaitOn, u32>,
+    edges: FrameVec<'f, WaitEdge>,
     /// Head of the edges unlinked from every key, reused before `edges` grows.
     free_edge: u32,
     /// The imports, with the attempt, that read something without a key (a module's children,
     /// all its declarations): any write wakes them.
-    any_waiters: Vec<(u32, u32)>,
+    any_waiters: FrameVec<'f, (u32, u32)>,
     /// Scratch: the keys of the attempt being registered.
-    pub(super) keys: Vec<(WaitOn, u8)>,
+    pub(super) keys: FrameVec<'f, (WaitOn, u8)>,
     /// Scratch: whether the attempt being registered read something without a key.
     pub(super) keys_any: bool,
     /// Scratch: the imports a write woke.
-    woken: Vec<u32>,
+    woken: FrameVec<'f, u32>,
 }
 
-impl Default for Imports {
-    fn default() -> Self {
-        Imports::new()
-    }
-}
-
-impl Imports {
-    pub(super) fn new() -> Self {
+impl<A: Allocator + Clone> Imports<A> {
+    pub(super) fn new_in(alloc: A) -> Self {
+        // clone: the allocator, a `&Frame` or `Global`: no allocation.
+        let a = || alloc.clone();
         Imports {
-            // alloc: empty, grows with the unit's imports
-            directives: Vec::new(),
-            // alloc: as `directives`
-            list: Vec::new(),
-            // alloc: as `directives`
-            generation: Vec::new(),
-            // alloc: as `directives`
-            queued: Vec::new(),
-            // alloc: as `directives`
-            seq: Vec::new(),
-            // alloc: as `directives`
-            indeterminate: Vec::new(),
-            named: FxHashMap::default(),
-            // alloc: as `directives`
-            next_named: Vec::new(),
-            phase: Phase::Idle,
-            pending_unresolved: BinaryHeap::new(),
-            // alloc: empty, grows with the imports a pass defers
-            deferred_unresolved: Vec::new(),
-            pending_indeterminate: BinaryHeap::new(),
-            // alloc: as `deferred_unresolved`
-            deferred_indeterminate: Vec::new(),
-            waits: FxHashMap::default(),
-            // alloc: empty, grows with the reads imports wait on
-            edges: Vec::new(),
-            free_edge: NONE,
-            // alloc: as `edges`
-            any_waiters: Vec::new(),
-            // alloc: empty scratch, reused across attempts
-            keys: Vec::new(),
-            keys_any: false,
-            // alloc: as `keys`
-            woken: Vec::new(),
+            directives: Vec::new_in(a()),
+            list: Vec::new_in(a()),
+            seq: Vec::new_in(a()),
+            indeterminate: Vec::new_in(a()),
+            named: HashMap::with_hasher_in(FxBuildHasher, a()),
+            next_named: Vec::new_in(a()),
         }
     }
 
@@ -194,7 +180,8 @@ impl Imports {
         self.directives.len() as u32
     }
 
-    pub(super) fn push(&mut self, op: ImportOp) {
+    /// Adds `op`, unresolved, and queues it in `queues`.
+    pub(super) fn push(&mut self, queues: &mut ImportQueues<'_>, op: ImportOp) {
         let at = self.directives.len() as u32;
         if op.source.kind == ImportKind::Plain
             && let Some(name) = op.bound_name()
@@ -213,10 +200,10 @@ impl Imports {
         self.next_named.push(NONE);
         self.directives.push(Directive { op, status: PartialResolvedImport::Unresolved });
         self.list.push(ImportList::Unresolved);
-        self.generation.push(0);
-        self.queued.push(0);
         self.seq.push(NONE);
-        self.wake(at);
+        queues.generation.push(0);
+        queues.queued.push(0);
+        queues.wake(self, at);
     }
 
     /// The imports still unresolved, in order.
@@ -246,17 +233,43 @@ impl Imports {
             None
         })
     }
+}
 
-    /// Queues import `at` to be retried: in this pass if its phase has not reached it yet,
-    /// else in the next.
-    pub(super) fn wake(&mut self, at: u32) {
+impl<'f> ImportQueues<'f> {
+    /// An empty worklist over the `len` imports a unit starts with, none queued.
+    pub(super) fn new_in(frame: &'f Frame, len: u32) -> Self {
+        let mut generation = Vec::with_capacity_in(len as usize, frame);
+        generation.resize(len as usize, 0);
+        let mut queued = Vec::with_capacity_in(len as usize, frame);
+        queued.resize(len as usize, 0);
+        ImportQueues {
+            generation,
+            queued,
+            phase: Phase::Idle,
+            pending_unresolved: BinaryHeap::new_in(frame),
+            deferred_unresolved: Vec::new_in(frame),
+            pending_indeterminate: BinaryHeap::new_in(frame),
+            deferred_indeterminate: Vec::new_in(frame),
+            waits: map_in(frame),
+            edges: Vec::new_in(frame),
+            free_edge: NONE,
+            any_waiters: Vec::new_in(frame),
+            keys: Vec::new_in(frame),
+            keys_any: false,
+            woken: Vec::new_in(frame),
+        }
+    }
+
+    /// Queues import `at` of `imports` to be retried: in this pass if its phase has not reached
+    /// it yet, else in the next.
+    pub(super) fn wake<A: Allocator + Clone>(&mut self, imports: &Imports<A>, at: u32) {
         let i = at as usize;
-        let unresolved = match self.list[i] {
+        let unresolved = match imports.list[i] {
             ImportList::Resolved => return,
             ImportList::Unresolved => true,
             ImportList::Indeterminate => false,
         };
-        let key = if unresolved { at } else { self.seq[i] };
+        let key = if unresolved { at } else { imports.seq[i] };
         let now = match (self.phase, unresolved) {
             (Phase::Idle, _) | (Phase::Unresolved(_), false) => true,
             (Phase::Unresolved(from), true) | (Phase::Indeterminate(from), false) => key >= from,
@@ -279,19 +292,19 @@ impl Imports {
         }
     }
 
-    pub(super) fn begin_pass(&mut self) {
+    pub(super) fn begin_pass<A: Allocator + Clone>(&mut self, imports: &Imports<A>) {
         while let Some(at) = self.deferred_unresolved.pop() {
             let i = at as usize;
             self.queued[i] &= !DEFERRED;
-            if self.list[i] == ImportList::Unresolved && self.queued[i] & PENDING == 0 {
+            if imports.list[i] == ImportList::Unresolved && self.queued[i] & PENDING == 0 {
                 self.queued[i] |= PENDING;
                 self.pending_unresolved.push(Reverse(at));
             }
         }
         while let Some(seq) = self.deferred_indeterminate.pop() {
-            let i = self.indeterminate[seq as usize].0 as usize;
+            let i = imports.indeterminate[seq as usize].0 as usize;
             self.queued[i] &= !DEFERRED;
-            if self.list[i] == ImportList::Indeterminate && self.queued[i] & PENDING == 0 {
+            if imports.list[i] == ImportList::Indeterminate && self.queued[i] & PENDING == 0 {
                 self.queued[i] |= PENDING;
                 self.pending_indeterminate.push(Reverse(seq));
             }
@@ -300,12 +313,12 @@ impl Imports {
     }
 
     /// The next unresolved import of this pass, by index.
-    pub(super) fn next_unresolved(&mut self) -> Option<u32> {
+    pub(super) fn next_unresolved<A: Allocator + Clone>(&mut self, imports: &Imports<A>) -> Option<u32> {
         while let Some(Reverse(at)) = self.pending_unresolved.pop() {
             let i = at as usize;
             self.queued[i] &= !PENDING;
             self.phase = Phase::Unresolved(at + 1);
-            if self.list[i] == ImportList::Unresolved {
+            if imports.list[i] == ImportList::Unresolved {
                 return Some(at);
             }
         }
@@ -313,12 +326,12 @@ impl Imports {
     }
 
     /// The next indeterminate import of this pass, by the order they became so.
-    pub(super) fn next_indeterminate(&mut self) -> Option<u32> {
+    pub(super) fn next_indeterminate<A: Allocator + Clone>(&mut self, imports: &Imports<A>) -> Option<u32> {
         while let Some(Reverse(seq)) = self.pending_indeterminate.pop() {
-            let i = self.indeterminate[seq as usize].0 as usize;
+            let i = imports.indeterminate[seq as usize].0 as usize;
             self.queued[i] &= !PENDING;
             self.phase = Phase::Indeterminate(seq + 1);
-            if self.list[i] == ImportList::Indeterminate {
+            if imports.list[i] == ImportList::Indeterminate {
                 return Some(seq);
             }
         }
@@ -361,8 +374,8 @@ impl Imports {
 
     /// Wakes the current waiters of `key` that read one of the namespaces `ns`, and drops them
     /// and the stale ones from its list.
-    fn wake_on(&mut self, key: &WaitOn, ns: u8) {
-        let Imports { waits, edges, generation, free_edge, woken, .. } = self;
+    fn wake_on<A: Allocator + Clone>(&mut self, imports: &Imports<A>, key: &WaitOn, ns: u8) {
+        let ImportQueues { waits, edges, generation, free_edge, woken, .. } = self;
         let Some(head) = waits.get_mut(key) else { return };
         let mut prev = NONE;
         let mut cur = *head;
@@ -386,49 +399,56 @@ impl Imports {
             cur = edge.next;
         }
         while let Some(at) = self.woken.pop() {
-            self.wake(at);
+            self.wake(imports, at);
         }
     }
 
-    /// Wakes the imports whose attempt waits on any write; stale ones are dropped.
-    fn wake_any(&mut self) {
-        let mut waiters = mem::take(&mut self.any_waiters);
-        for (at, generation) in waiters.drain(..) {
+    /// Wakes the imports whose attempt waits on any write, and drops every waiter: a woken one
+    /// waits again at its next attempt. Waking queues an import and adds no waiter.
+    fn wake_any<A: Allocator + Clone>(&mut self, imports: &Imports<A>) {
+        for k in 0..self.any_waiters.len() {
+            let (at, generation) = self.any_waiters[k];
             if self.generation[at as usize] == generation {
-                self.wake(at);
+                self.wake(imports, at);
             }
         }
-        self.any_waiters = waiters;
+        self.any_waiters.clear();
     }
 
     /// A write of the namespaces `ns` of `name` in the scope of `module`.
-    pub(super) fn wake_slot(&mut self, module: ModuleId, name: Name, ns: u8) {
+    pub(super) fn wake_slot<A: Allocator + Clone>(
+        &mut self,
+        imports: &Imports<A>,
+        module: ModuleId,
+        name: Name,
+        ns: u8,
+    ) {
         if ns == 0 {
             return;
         }
         if !self.any_waiters.is_empty() {
-            self.wake_any();
+            self.wake_any(imports);
         }
         if !self.waits.is_empty() {
-            self.wake_on(&WaitOn::Slot(module, name), ns);
+            self.wake_on(imports, &WaitOn::Slot(module, name), ns);
         }
     }
 
     /// A new legacy macro, extern prelude or `macro_use` prelude entry named `name`.
-    pub(super) fn wake_env(&mut self, name: Name, ns: u8) {
+    pub(super) fn wake_env<A: Allocator + Clone>(&mut self, imports: &Imports<A>, name: Name, ns: u8) {
         if !self.any_waiters.is_empty() {
-            self.wake_any();
+            self.wake_any(imports);
         }
         if !self.waits.is_empty() {
-            self.wake_on(&WaitOn::Env(name), ns);
+            self.wake_on(imports, &WaitOn::Env(name), ns);
         }
     }
 
     /// A change every path may have read: the std prelude module, a module's children, or,
     /// when a unit carries on into a new round, any module of another component.
-    pub(super) fn wake_all(&mut self) {
-        for at in 0..self.directives.len() as u32 {
-            self.wake(at);
+    pub(super) fn wake_all<A: Allocator + Clone>(&mut self, imports: &Imports<A>) {
+        for at in 0..imports.len() {
+            self.wake(imports, at);
         }
     }
 }
@@ -445,26 +465,27 @@ pub(super) struct ImporterEdge<K, T> {
 /// linked per source. An edge is appended without moving the others, so a list is read in place
 /// while its importers are visited.
 #[derive(Clone, Debug)]
-pub(super) struct ImporterLists<K, T> {
-    edges: Vec<ImporterEdge<K, T>>,
+pub(super) struct ImporterLists<K, T, A: Allocator + Clone = Global> {
+    edges: Vec<ImporterEdge<K, T>, A>,
     /// Head and tail of each source's list.
-    heads: FxHashMap<K, (u32, u32)>,
+    heads: HashMap<K, (u32, u32), FxBuildHasher, A>,
     /// The edge of each `(source, importer)`.
-    by_pair: FxHashMap<(K, K), u32>,
+    by_pair: HashMap<(K, K), u32, FxBuildHasher, A>,
 }
 
-impl<K, T> Default for ImporterLists<K, T> {
-    fn default() -> Self {
+impl<K, T, A: Allocator + Clone> ImporterLists<K, T, A> {
+    pub(super) fn new_in(alloc: A) -> Self {
+        // clone: the allocator, a `&Frame` or `Global`: no allocation.
+        let a = || alloc.clone();
         ImporterLists {
-            // alloc: empty, grows with the importer edges
-            edges: Vec::new(),
-            heads: FxHashMap::default(),
-            by_pair: FxHashMap::default(),
+            edges: Vec::new_in(a()),
+            heads: HashMap::with_hasher_in(FxBuildHasher, a()),
+            by_pair: HashMap::with_hasher_in(FxBuildHasher, a()),
         }
     }
 }
 
-impl<K: Copy + Eq + std::hash::Hash, T: Copy> ImporterLists<K, T> {
+impl<K: Copy + Eq + std::hash::Hash, T: Copy, A: Allocator + Clone> ImporterLists<K, T, A> {
     /// Adds `importer` to the importers of `source`, or, if it is one already, lets `merge`
     /// update the data it has.
     pub(super) fn add(&mut self, source: K, importer: K, data: T, merge: impl FnOnce(&mut T)) {
@@ -501,4 +522,4 @@ impl<K: Copy + Eq + std::hash::Hash, T: Copy> ImporterLists<K, T> {
 /// The glob imports into the unit's modules: for each source module, the modules that
 /// glob-import it, with the visibility and the glob. A source may be a module of another
 /// component, whose scope the next round pulls again.
-pub(super) type GlobEdges = ImporterLists<ModuleId, (Visibility, GlobId)>;
+pub(super) type GlobEdges<A = Global> = ImporterLists<ModuleId, (Visibility, GlobId), A>;

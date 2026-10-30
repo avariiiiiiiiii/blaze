@@ -690,6 +690,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blake3-servil"
+version = "0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861"
+source = "git+https://github.com/johnservil/BLAKE3?rev=c6bd679a0911cc233cb28297f2b25875381215a1#c6bd679a0911cc233cb28297f2b25875381215a1"
+dependencies = [
+ "arrayvec",
+ "cc",
+ "cfg-if",
+ "constant_time_eq",
+ "libc",
+]
+
+[[package]]
 name = "blaze-api"
 version = "0.0.0"
 dependencies = [
@@ -1011,6 +1023,7 @@ name = "blaze-ids"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "blake3-servil",
  "serde",
 ]
 

@@ -44,7 +44,8 @@ mod tests;
 use std::fmt;
 
 use blaze_cas::Key;
-use blaze_core::{Address, Tag};
+pub(crate) use blaze_core::Tags;
+pub(crate) use blaze_ids::prehashed::ByHash;
 
 pub use crate::{
     bundle::{BundleId, BundleSpec, Download, Downloaded, Locked, Manifest},
@@ -66,56 +67,5 @@ pub struct Refused {
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "the global cache's value of {:x} is refused: {}", self.key.0, self.what)
-    }
-}
-
-/// The tags of one state machine: `base..base + 2^32`.
-pub(crate) struct Tags {
-    base: u64,
-    next: u64,
-}
-
-impl Tags {
-    pub(crate) fn new(base: u64) -> Tags {
-        Tags { base, next: 0 }
-    }
-
-    pub(crate) fn next(&mut self) -> Tag {
-        let tag = Tag(self.base + (self.next & 0xffff_ffff));
-        self.next = self.next.wrapping_add(1);
-        tag
-    }
-
-    pub(crate) fn owns(&self, tag: Tag) -> bool {
-        tag.0.wrapping_sub(self.base) < 1 << 32
-    }
-}
-
-/// Keys and content IDs are BLAKE3 hashes already: their first eight bytes index a table as
-/// well as any hash of them would.
-#[derive(Default, Clone, Copy)]
-pub(crate) struct Prehashed(u64);
-
-impl std::hash::Hasher for Prehashed {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        if let Some(word) = bytes.first_chunk::<8>() {
-            self.0 ^= u64::from_le_bytes(*word);
-        }
-    }
-
-    fn write_usize(&mut self, _: usize) {}
-}
-
-/// A map on BLAKE3 hashes, indexed by the hash itself.
-pub(crate) type ByHash<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Prehashed>>;
-
-pub(crate) fn place(at: &Address) -> String {
-    match at {
-        Address::Unix(name) => format!("unix:{name}"),
-        Address::Tcp(addr) => format!("tcp:{addr}"),
     }
 }

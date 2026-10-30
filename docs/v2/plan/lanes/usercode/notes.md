@@ -140,7 +140,9 @@ What each part matches or beats:
     `/`-separated.
   - A directory's entries say what they are from the listing (`d_type`), so only a link costs
     a `stat`.
-  - A package walk pushes and pops one path buffer.
+  - A package walk pushes and pops one path buffer. Its hash is a Merkle hash per directory,
+    by `blaze_query::TreeHash` (each entry by its view content ID and git mode, a link not
+    followed), so a tree walked on the disk and the same tree in a view hash alike.
 - **Tracing** is unprivileged seccomp user notification on Linux, with
   `SECCOMP_USER_NOTIF_FLAG_CONTINUE` (the kernel runs the call itself once the path is noted, no
   ptrace stop and no emulation) and `SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP` (the supervisor is
@@ -150,8 +152,10 @@ What each part matches or beats:
 - **Where it falls short:**
   - Outside paths until the daemon drives `blaze_vfs::Outside`: an unsettled table vouches
     for nothing, so each check `stat`s, as before.
-  - The package walk of a script keyed by its whole package: red-green revalidation makes it
-    O(1) when nothing changed. Request 10 asks db for a tree hash query.
+  - The package walk of a script keyed by its whole package, outside a view. Inside one,
+    `ViewInputs::tree` asks the view's own tree hash (`Cx::tree`, one query per directory), so
+    a check of an unchanged package is O(1) and an edit hashes again only the directories
+    above it.
 - **Tests** fork from a server per binary, as AFL's fork server does: 0.1 to 0.5 ms a test on
   Linux, against the few milliseconds of spawning one process per test as nextest does. One
   global queue runs the longest first across every binary.

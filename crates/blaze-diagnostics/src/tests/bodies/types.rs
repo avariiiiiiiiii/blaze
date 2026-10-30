@@ -382,7 +382,58 @@ For more information about this error, try `rustc --explain E0525`.
 }
 
 #[test]
-#[ignore = "the front end decides `{integer}` as `i32` before reporting (v2/requests/diagnostics.md, diagnostics-bodies-types 2)"]
+fn a_closure_that_moves_a_field_names_the_field() {
+    // tests/ui/closures/2229_closure_analysis/diagnostics/closure-origin-tuple-diagnostics.rs
+    let source = r##"//@ edition:2021
+
+struct S(String, String);
+
+fn expect_fn<F: Fn()>(_f: F) {}
+
+fn main() {
+    let s = S(format!("s"), format!("s"));
+    let c = || { //~ ERROR expected a closure that implements the `Fn`
+        let s = s.1;
+    };
+    expect_fn(c);
+}
+"##;
+    let stderr = r##"error[E0525]: expected a closure that implements the `Fn` trait, but this closure only implements `FnOnce`
+  --> $DIR/closure-origin-tuple-diagnostics.rs:9:13
+   |
+LL |     let c = || {
+   |             ^^ this closure implements `FnOnce`, not `Fn`
+LL |         let s = s.1;
+   |                 --- closure is `FnOnce` because it moves the variable `s.1` out of its environment
+LL |     };
+LL |     expect_fn(c);
+   |     --------- - the requirement to implement `Fn` derives from here
+   |     |
+   |     required by a bound introduced by this call
+   |
+note: required by a bound in `expect_fn`
+  --> $DIR/closure-origin-tuple-diagnostics.rs:5:17
+   |
+LL | fn expect_fn<F: Fn()>(_f: F) {}
+   |                 ^^^^ required by this bound in `expect_fn`
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0525`.
+"##;
+    let fixture = format!(
+        "//- minicore: fn\n//- /std.rs crate:std deps:core\n\
+         pub mod prelude {{ pub mod rust_2021 {{ pub use core::prelude::rust_2021::*; pub use crate::string::String; }} }}\n\
+         pub mod string {{ pub struct String; }}\n\
+         #[macro_export]\n\
+         macro_rules! format {{ ($($arg:tt)*) => {{ $crate::string::String }}; }}\n\
+         //- /closure-origin-tuple-diagnostics.rs crate:main edition:2021 deps:std\n{source}"
+    );
+    let checked = checked_with(&fixture, "$DIR/", &compiletest(Mode::Other, &Options::default()));
+    assert_eq!(normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() })), stderr);
+}
+
+#[test]
 fn match_arms_of_incompatible_types_skip_the_diverging_one() {
     // tests/ui/match/match-arm-resolving-to-never.rs, its fifth arm's call of std's macro that
     // panics as not implemented written `loop {}`, which diverges as it does.

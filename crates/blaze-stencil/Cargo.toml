@@ -16,6 +16,7 @@ doctest = false
 
 [dependencies]
 blaze-codegen.workspace = true
+blaze-ids.workspace = true
 blaze-mem.workspace = true
 cranelift-codegen.workspace = true
 smallvec.workspace = true
@@ -27,6 +28,8 @@ llvm-sys.workspace = true
 object.workspace = true
 # The library's id: the BLAKE3 hash of its bytes, which stencil units' settings carry.
 blake3.workspace = true
+# `src/table/format.rs`'s sets, as the patcher reads them.
+blaze-ids.workspace = true
 
 [dev-dependencies]
 cranelift-codegen = { workspace = true, features = ["x86", "arm64"] }
@@ -38,7 +41,8 @@ cranelift-reader.workspace = true
 gimli.workspace = true
 # The tests' global allocator, declared once in `src/tier/tests.rs`: proves hot paths allocate nothing.
 blaze-alloc-count.workspace = true
-blaze-ids.workspace = true
+# The executable memory the tests link units into (`src/tests/exec.rs`).
+blaze-inproc.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true

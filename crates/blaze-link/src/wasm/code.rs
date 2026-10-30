@@ -5,7 +5,7 @@
 use blaze_codegen::wasm::ValType;
 
 use super::leb::{self, uleb, uleb_len};
-use super::reader::Reader;
+use super::reader::{Reader, Wasm};
 
 /// 48 bytes on a 64-bit host: the piece and seven `u32` offsets into it. Reading a part walks
 /// it from its offset, O(its length): a function's lists are a few entries.
@@ -39,7 +39,7 @@ pub(super) fn signature<'a>(r: &mut Reader<'a>, bytes: &'a [u8]) -> Result<Sig<'
     }
     for _ in 0..2 {
         let count = r.count()?;
-        if let Some(&byte) = r.bytes(count)?.iter().find(|&&it| ValType::from_byte(it).is_none()) {
+        if let Some(&byte) = r.take(count)?.iter().find(|&&it| ValType::from_byte(it).is_none()) {
             // alloc: error path
             return Err(format!("the value type {byte:#04x}"));
         }
@@ -133,14 +133,14 @@ impl<'a> Header<'a> {
             return Err("a function of 4 GiB or more".to_owned());
         }
         let mut r = Reader::new(code);
-        let len = r.u32()? as usize;
+        let len = r.uleb32()? as usize;
         let end = r
             .at()
             .checked_add(len)
             .filter(|&end| end <= code.len())
             .ok_or("a truncated code header")?;
         let header = &code[..end];
-        let mut r = Reader::starting_at(header, r.at());
+        let mut r = Reader::starting_at(header, r.at())?;
         let at = |r: &Reader<'_>| r.at() as u32;
         let ty = at(&r);
         signature(&mut r, header)?;
@@ -150,12 +150,12 @@ impl<'a> Header<'a> {
         }
         let type_fixups = at(&r);
         for _ in 0..r.count()? {
-            r.u32()?;
-            r.u32()?;
+            r.uleb32()?;
+            r.uleb32()?;
         }
         let stack_pointer = at(&r);
         for _ in 0..r.count()? {
-            r.u32()?;
+            r.uleb32()?;
         }
         let imports = at(&r);
         for _ in 0..r.count()? {
@@ -173,7 +173,7 @@ impl<'a> Header<'a> {
             // alloc: error path
             tag => return Err(format!("a code header's export tag {tag}")),
         }
-        if !r.done() {
+        if !r.is_done() {
             // alloc: error path
             return Err("a code header longer than what it holds".to_owned());
         }
@@ -182,7 +182,7 @@ impl<'a> Header<'a> {
     }
 
     fn reader(&self, at: u32) -> Reader<'a> {
-        Reader::starting_at(&self.code[..self.body as usize], at as usize)
+        Reader::starting_at(&self.code[..self.body as usize], at as usize).expect(CHECKED)
     }
 
     /// The piece's length: the header and the body.
@@ -220,14 +220,14 @@ impl<'a> Header<'a> {
     pub(super) fn type_fixups(&self) -> impl Iterator<Item = (u32, u32)> + 'a {
         let mut r = self.reader(self.type_fixups);
         let count = r.count().expect(CHECKED);
-        (0..count).map(move |_| (r.u32().expect(CHECKED), r.u32().expect(CHECKED)))
+        (0..count).map(move |_| (r.uleb32().expect(CHECKED), r.uleb32().expect(CHECKED)))
     }
 
     /// Each place in the body that takes the index of `__stack_pointer`.
     pub(super) fn stack_pointer(&self) -> impl Iterator<Item = u32> + 'a {
         let mut r = self.reader(self.stack_pointer);
         let count = r.count().expect(CHECKED);
-        (0..count).map(move |_| r.u32().expect(CHECKED))
+        (0..count).map(move |_| r.uleb32().expect(CHECKED))
     }
 
     /// Each extern it names and what that is imported as: the name, the module, the field and

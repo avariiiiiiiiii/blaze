@@ -14,12 +14,12 @@
 //! The autoderef, the one step that asks the trait solver, runs last and only when a
 //! suggestion is still possible.
 
-use base_db::{CrateOrigin, LangCrateOrigin};
+use base_db::LangCrateOrigin;
 use hir::InFile;
 use intern::sym;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode,
-    ast::{self, BinaryOp},
+    SyntaxKind,
+    view::{self as ast, AstNode as _, BinaryOp},
 };
 
 use crate::{
@@ -32,18 +32,20 @@ use crate::{
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::ExpectedArrayOrSlicePat<'db>) -> Vec<Found> {
     let span = cx.span_of_ptr(d.pat);
     let ty = cx.ty(&d.found);
-    let mut diag =
-        Diag::error(Some("E0529"), format!("expected an array or slice, found `{ty}`"), span.clone());
+    // alloc: the error's message
+    let message = format!("expected an array or slice, found `{ty}`");
+    let mut diag = Diag::error(Some("E0529"), message, span.clone()); // clone: the error's span
+    // alloc: the error's label
     diag.span_label(span, format!("pattern cannot match with input type `{ty}`"));
     suggest(cx, d, &mut diag);
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
-    vec![Found::new(diag, Phase::Bodies)]
+    vec![Found::new(diag, Phase::Bodies)] // alloc: the error found
 }
 
 /// The scrutinee of the pattern a slice pattern is in, and whether the slice pattern is that
 /// pattern itself (rustc's `current_depth <= 1`).
-struct Origin {
-    expr: InFile<ast::Expr>,
+struct Origin<'db> {
+    expr: InFile<ast::Expr<'db>>,
     top_level: bool,
 }
 
@@ -54,8 +56,8 @@ fn suggest<'db>(cx: &Cx<'_, 'db>, d: &hir::ExpectedArrayOrSlicePat<'db>, diag: &
     {
         return;
     }
-    let Some(origin) = origin(cx, cx.syntax(d.pat.map(|it| it.syntax_node_ptr()))) else { return };
-    let Some(root) = cx.sema.type_of_expr(&origin.expr.value).map(|it| it.original) else {
+    let Some(origin) = origin(cx, cx.syntax_view(d.pat.map(|it| it.syntax_node_ptr()))) else { return };
+    let Some(root) = cx.vsema.type_of_expr(origin.expr.value).map(|it| it.original) else {
         return;
     };
     let (sequence, root) = slice_or_array_or_vector(cx, root);
@@ -64,7 +66,7 @@ fn suggest<'db>(cx: &Cx<'_, 'db>, d: &hir::ExpectedArrayOrSlicePat<'db>, diag: &
     if !(as_deref || slicing) || !found.autoderef(cx.db).any(|it| it.is_slice() || it.is_array()) {
         return;
     }
-    let at = cx.span(origin.expr.as_ref().map(|it| it.syntax().text_range())).shrink_to_hi();
+    let at = cx.span(origin.expr.map(|it| it.syntax().text_range())).shrink_to_hi();
     // At most one holds: `as_deref` wants an enum at the root, slicing a sequence.
     let (message, code) = match as_deref {
         true => ("consider using `as_deref` here", ".as_deref()"),
@@ -81,7 +83,7 @@ fn slice_or_array_or_vector<'db>(cx: &Cx<'_, 'db>, mut ty: hir::Type<'db>) -> (b
     }
     let vec = match ty.as_adt() {
         Some(hir::Adt::Struct(it)) => {
-            it.name(cx.db).as_str() == "Vec" && in_lang_crate(cx, it.module(cx.db), LangCrateOrigin::Alloc)
+            it.name(cx.db) == sym::Vec && in_lang_crate(cx, it.module(cx.db), LangCrateOrigin::Alloc)
         }
         _ => false,
     };
@@ -95,24 +97,23 @@ fn is_option_or_result(cx: &Cx<'_, '_>, it: hir::Enum) -> bool {
         && in_lang_crate(cx, it.module(cx.db), LangCrateOrigin::Core)
 }
 
-/// Asked only once the name matched: `Crate::origin` clones the crate's origin.
 fn in_lang_crate(cx: &Cx<'_, '_>, module: hir::Module, krate: LangCrateOrigin) -> bool {
-    module.krate(cx.db).origin(cx.db) == CrateOrigin::Lang(krate)
+    module.krate(cx.db).lang_origin(cx.db) == Some(krate)
 }
 
 /// rustc's `TopInfo` of the pattern `node` is in: the expression it matches, and whether
 /// `node` is the whole pattern, found by going up through the patterns (or, of a
 /// destructuring assignment, the expressions) around it. Each step matches on the node's kind;
 /// only the node the walk ends at is cast.
-fn origin(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<Origin> {
+fn origin<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option<Origin<'db>> {
     let is_pat = ast::Pat::can_cast(node.value.kind());
     let mut depth = 0u32;
     let mut prev = node.value.text_range();
-    for ancestor in cx.sema.ancestors_with_macros_file(node).skip(1) {
-        let it = &ancestor.value;
+    for ancestor in cx.vsema.ancestors_with_macros_file(node).skip(1) {
+        let it = ancestor.value;
         let top_level = depth == 0;
         let found =
-            |expr: Option<ast::Expr>| expr.map(|expr| Origin { expr: ancestor.with_value(expr), top_level });
+            |expr: Option<ast::Expr<'db>>| expr.map(|expr| Origin { expr: ancestor.with_value(expr), top_level });
         let kind = it.kind();
         if is_pat {
             match kind {
@@ -120,10 +121,10 @@ fn origin(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<Origin> {
                     return found(it.parent()?.parent().and_then(ast::MatchExpr::cast)?.expr());
                 }
                 SyntaxKind::LET_STMT => {
-                    let stmt = ast::LetStmt::cast(it.clone())?;
+                    let stmt = ast::LetStmt::cast(it)?;
                     return if stmt.ty().is_some() { None } else { found(stmt.initializer()) };
                 }
-                SyntaxKind::LET_EXPR => return found(ast::LetExpr::cast(it.clone())?.expr()),
+                SyntaxKind::LET_EXPR => return found(ast::LetExpr::cast(it)?.expr()),
                 SyntaxKind::PAREN_PAT
                 | SyntaxKind::MACRO_PAT
                 | SyntaxKind::RECORD_PAT_FIELD
@@ -136,7 +137,7 @@ fn origin(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<Origin> {
         } else {
             match kind {
                 SyntaxKind::BIN_EXPR => {
-                    let bin = ast::BinExpr::cast(it.clone())?;
+                    let bin = ast::BinExpr::cast(it)?;
                     if bin.op_kind() != Some(BinaryOp::Assignment { op: None })
                         || bin.lhs().is_none_or(|lhs| lhs.syntax().text_range() != prev)
                     {

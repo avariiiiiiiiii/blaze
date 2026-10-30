@@ -18,9 +18,8 @@ mod plan;
 mod resolve;
 mod sandbox;
 mod source;
-mod summary;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 mod units;
 mod view;
 
@@ -32,7 +31,6 @@ use blaze_query::{Cancelled, Cx, Database, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
 use self::config::ConfigOf;
-use self::files::Snapshot;
 use self::invocation::{Asked, Asking};
 use self::manifest::{WorkspaceKey, WorkspaceQuery, replay};
 use self::units::Built;
@@ -41,7 +39,7 @@ use crate::query::{
 };
 use crate::{Filter, Intent};
 
-pub use self::summary::Read;
+pub use self::files::Snap;
 pub use self::view::{ResolveAsk, Resolving, ViewResolved, platform_cfg, resolve_view};
 
 thread_local! {
@@ -260,11 +258,12 @@ fn foreign_spec(ask: &ForeignAsk) -> Spec {
 
 /// Loads the workspace `spec` names and makes its units.
 fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
-    let read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
+    let mut read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
         Ok(read) => read,
         Err(error) => return Ok(Staged::Failed(error)),
     };
-    let (outcome, used) = replay(cx, &read, &spec.workspace.config, &Snapshot::default(), |cx, ctx, ws, files, reads| {
+    let base = std::mem::take(&mut read.snapshot);
+    let (outcome, used) = replay(cx, &read, base, &spec.workspace.config, |cx, ctx, ws, files, reads| {
         resolve::resolved(cx, ctx, ws, &files, reads, spec, |cx, resolved| units::units(cx, ctx, ws, spec, &read, resolved))
     })?;
     if let Some(at) = used.unmounted() {
@@ -279,7 +278,7 @@ fn load(cx: &mut Cx<'_>, spec: &Spec) -> Result<Staged<Built>, Cancelled> {
 impl Query for Plan {
     const KIND: QueryKind = kinds::PLAN;
     const NAME: &'static str = "cargo plan";
-    const PRODUCER: ContentId = producer("blaze v2 cargo plan 2");
+    const PRODUCER: ContentId = producer("blaze v2 cargo plan 3");
     type Key = ();
     type Value = Cbor<Planned>;
 
@@ -308,6 +307,7 @@ impl Query for Plan {
                 build_dir: built.build_dir,
                 finished: built.finished,
                 link_dirs: built.link_dirs,
+                sandboxed_tests: built.sandboxed_tests,
             }),
             Staged::Needs(fetches) => Planned::Needs(fetches),
             Staged::Failed(error) => Planned::Failed(error),
@@ -377,7 +377,7 @@ pub struct ForeignProfile {
 impl Query for Foreign {
     const KIND: QueryKind = QueryKind(0x601a);
     const NAME: &'static str = "cargo foreign";
-    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 2");
+    const PRODUCER: ContentId = producer("blaze v2 cargo foreign 3");
     type Key = ForeignAsk;
     type Value = Cbor<StdPlanned>;
 

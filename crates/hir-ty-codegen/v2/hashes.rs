@@ -126,6 +126,10 @@ impl Hashes for ItemHashes {
         Ok(SpanRef { anchor: anchors(db, owner).0[table], index })
     }
 
+    fn anchors(&self, db: &Db, owner: DefWithBodyId) -> Result<[ContentId; TABLES], String> {
+        Ok(anchors(db, owner).0)
+    }
+
     fn declaration(&self, db: &Db, func: FunctionId) -> Result<SpanRef, String> {
         Ok(SpanRef { anchor: ItemHashes::declaration_table(db, func), index: 0 })
     }

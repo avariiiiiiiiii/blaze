@@ -4,8 +4,10 @@
 //!
 //! **Layout.** A record is 64 bytes, one cache line, in buckets of [`WAYS`]. A key's bucket is
 //! its own first eight bytes (it is a content hash already) mixed with its kind and masked, so
-//! a lookup hashes nothing and reads one bucket: four lines, two of the pairs that arm64 and
-//! x86 prefetch together. A bucket that is full when a new key comes drops its oldest record by
+//! a lookup hashes nothing and reads one bucket up to its first empty way: at most four lines,
+//! two of the pairs that arm64 and x86 prefetch together, and one for a key never seen in a
+//! bucket with room. A bucket fills from its first way and never empties one (bytes read back
+//! with a gap are refused). A bucket that is full when a new key comes drops its oldest record by
 //! the writer's clock (a count of observations, not time), so the table holds the keys seen
 //! most lately, never more than its fixed size, and the same observations leave the same
 //! records in the same slots.
@@ -33,7 +35,6 @@ use std::{
 };
 
 use blaze_graph::{Key, admission::TaskKind};
-use blaze_ids::radix;
 
 /// Records a bucket holds.
 pub const WAYS: usize = 4;
@@ -77,16 +78,19 @@ impl Record {
 
     /// The time its next run is predicted to take, in microseconds: the median of its last
     /// runs, the middle two's mean rounded up for an even count, so one slow or fast run
-    /// moves it little.
+    /// moves it little. Min and max only, with no branch on the times: every prediction of a
+    /// seen key pays it.
     pub fn ran_us(&self) -> u64 {
-        let count = (self.seen as usize).min(RUNS);
-        let mut runs = self.runs;
-        let last = &mut runs[..count];
-        radix::sort(last);
-        match count {
+        let [a, b, c, d] = self.runs.map(u64::from);
+        let (low, high) = (a.min(b), a.max(b));
+        match self.seen {
             0 => 0,
-            _ if count % 2 == 1 => u64::from(last[count / 2]),
-            _ => (u64::from(last[count / 2 - 1]) + u64::from(last[count / 2])).div_ceil(2),
+            1 => a,
+            2 => (a + b).div_ceil(2),
+            3 => low.max(high.min(c)),
+            // Of the pairs' lows the lesser is the least of all four and of their highs the
+            // greater the most, so the other low and the other high are the middle two.
+            _ => (low.max(c.min(d)) + high.min(c.max(d))).div_ceil(2),
         }
     }
 
@@ -176,6 +180,13 @@ impl Slot {
         }
         self.seq.store(seq.wrapping_add(2), Release);
     }
+
+    /// Puts `record` in it with plain stores and no fence: no reader shares it.
+    fn set(&mut self, record: &Record) {
+        for (word, value) in self.words.iter_mut().zip(pack(record)) {
+            *word.get_mut() = value;
+        }
+    }
 }
 
 /// The slots, `buckets * WAYS` of them: 64 bytes a key, a lookup one bucket.
@@ -208,7 +219,7 @@ impl Table {
             "a history's table has a power of two slots, at least {WAYS}, not {slots}"
         );
         Table {
-            slots: std::iter::repeat_with(Slot::empty).take(slots).collect(),
+            slots: std::iter::repeat_with(Slot::empty).take(slots).collect(), // alloc: the table's one region, at daemon start
             mask: (slots / WAYS - 1) as u64,
         }
     }
@@ -217,7 +228,9 @@ impl Table {
         bucket(self.mask, kind, key)
     }
 
-    /// The slot of `kind`'s `key` and its record, each slot of its bucket read by `read`.
+    /// The slot of `kind`'s `key` and its record, each slot of its bucket read by `read` up to
+    /// the first empty one: a bucket fills from its first way and never empties one, so no
+    /// record lies past an empty way.
     fn find(
         &self,
         kind: TaskKind,
@@ -225,9 +238,13 @@ impl Table {
         read: impl Fn(&Slot) -> Option<Record>,
     ) -> Option<(usize, Record)> {
         let first = self.bucket(kind, key);
-        (first..first + WAYS).find_map(|at| {
-            read(&self.slots[at]).filter(|it| it.kind == kind && it.key == key).map(|it| (at, it))
-        })
+        for at in first..first + WAYS {
+            let record = read(&self.slots[at])?;
+            if record.kind == kind && record.key == key {
+                return Some((at, record));
+            }
+        }
+        None
     }
 }
 
@@ -247,7 +264,7 @@ impl Writer {
     ///
     /// When `slots` is not such a number.
     pub fn new(slots: usize) -> Writer {
-        Writer { table: Arc::new(Table::new(slots)), clock: 0, evicted: 0, _one: PhantomData }
+        Writer { table: Arc::new(Table::new(slots)), clock: 0, evicted: 0, _one: PhantomData } // alloc: one per history, shared by its readers
     }
 
     pub fn slots(&self) -> usize {
@@ -266,7 +283,7 @@ impl Writer {
 
     /// A reader of the same table, for any thread: one reference count, taken once.
     pub fn reader(&self) -> Reader {
-        Reader { table: self.table.clone() }
+        Reader { table: self.table.clone() } // clone: one reference count per reader, taken once
     }
 
     /// The record of `kind`'s `key`, if the table holds it.
@@ -292,7 +309,10 @@ impl Writer {
                 }
                 Some(record) if record.stamp < oldest => (oldest, oldest_at) = (record.stamp, at),
                 Some(_) => {}
-                None => _ = free.get_or_insert(at),
+                None => {
+                    free = Some(at);
+                    break;
+                }
             }
         }
         let at = free.unwrap_or_else(|| {
@@ -307,35 +327,46 @@ impl Writer {
         self.table.slots.iter().enumerate().filter_map(|(at, slot)| Some((at, slot.peek()?)))
     }
 
-    /// The first slot of the bucket `record` belongs in.
-    pub(crate) fn bucket_of(&self, record: &Record) -> usize {
-        self.table.bucket(record.kind, record.key)
+    /// The table of a writer no [`Reader`] shares yet, to fill with plain stores: a table read
+    /// back, before [`Writer::reader`] is first called.
+    fn unshared(table: &mut Arc<Table>) -> &mut Table {
+        Arc::get_mut(table).expect("a history's table is read back before any reader shares it")
     }
 
-    /// Puts `record`, stamp and all, in slot `at` of its bucket: a table read back.
-    pub(crate) fn put_at(&mut self, at: usize, record: &Record) {
-        debug_assert_eq!(at - at % WAYS, self.bucket_of(record));
-        self.table.slots[at].write(record);
-    }
-
-    /// Puts `record`, stamp and all, where a new key of it would go: a table read back into
-    /// another size, its records given oldest first.
-    pub(crate) fn place(&mut self, record: &Record) {
-        let first = self.bucket_of(record);
-        let mut free = None;
-        let (mut oldest, mut oldest_at) = (u64::MAX, first);
-        for at in first..first + WAYS {
-            match self.table.slots[at].peek() {
-                Some(it) if it.stamp < oldest => (oldest, oldest_at) = (it.stamp, at),
-                Some(_) => {}
-                None => _ = free.get_or_insert(at),
-            }
+    /// Puts each of `records`, stamp and all, in its slot `at` of its bucket: a table read
+    /// back into the size it had.
+    pub(crate) fn put_all(&mut self, records: &[(usize, Record)]) {
+        let table = Writer::unshared(&mut self.table);
+        for (at, record) in records {
+            debug_assert_eq!(at - at % WAYS, table.bucket(record.kind, record.key));
+            table.slots[*at].set(record);
         }
-        let at = free.unwrap_or_else(|| {
-            self.evicted += 1;
-            oldest_at
-        });
-        self.table.slots[at].write(record);
+    }
+
+    /// Puts each of `records`, stamp and all, where a new key of it would go, in the order
+    /// given: a table read back into another size, its records given oldest first.
+    pub(crate) fn place_all(&mut self, records: impl Iterator<Item = Record>) {
+        let table = Writer::unshared(&mut self.table);
+        for record in records {
+            let first = table.bucket(record.kind, record.key);
+            let mut free = None;
+            let (mut oldest, mut oldest_at) = (u64::MAX, first);
+            for at in first..first + WAYS {
+                match table.slots[at].peek() {
+                    Some(it) if it.stamp < oldest => (oldest, oldest_at) = (it.stamp, at),
+                    Some(_) => {}
+                    None => {
+                        free = Some(at);
+                        break;
+                    }
+                }
+            }
+            let at = free.unwrap_or_else(|| {
+                self.evicted += 1;
+                oldest_at
+            });
+            table.slots[at].set(&record);
+        }
     }
 
     /// Its clock and count of records dropped, as a table read back had them.

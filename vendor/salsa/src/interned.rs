@@ -1464,6 +1464,8 @@ unsafe impl<C> Slot for Value<C>
 where
     C: Configuration,
 {
+    const MEM_TAG: blaze_mem::Tag = blaze_mem::Tag::Intern;
+
     #[inline(always)]
     unsafe fn memos(
         this: *const Self,

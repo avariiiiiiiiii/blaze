@@ -30,7 +30,7 @@ use hir_def::{
         InlineAsmKind, Pat, PatId, RecordSpread, Statement, UnaryOp, Unsafe,
     },
     lang_item::lang_items,
-    resolver::{HasResolver, ResolveValueResult, Resolver, ValueNs},
+    resolver::ValueNs,
     signatures::{FunctionSignature, StaticFlags, StaticSignature, VariantFields},
     type_ref::{self, Rawness},
 };
@@ -266,8 +266,6 @@ struct Walker<'a, 'db, 'i, S> {
     store: &'a ExpressionStore,
     owner: ExpressionStoreOwnerId,
     krate: Crate,
-    /// Made at the first path that may name a static.
-    resolver: Option<Resolver<'db>>,
     target_features: TargetFeatures<'db>,
     target_feature_is_safe: TargetFeatureIsSafeInTarget,
     /// Of the innermost block a macro wrote, as rustc takes it from a call's span.
@@ -311,7 +309,6 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
             store,
             owner,
             krate,
-            resolver: None,
             target_features,
             target_feature_is_safe,
             edition: krate.data(db).edition,
@@ -905,14 +902,10 @@ impl<'a, 'db, 'i, S: Sink> Walker<'a, 'db, 'i, S> {
         {
             return;
         }
-        let (db, owner) = (self.db, self.owner);
-        let resolver = self.resolver.get_or_insert_with(|| owner.resolver(db));
-        let guard = resolver.update_to_inner_scope(db, owner, current);
-        let hygiene = self.store.expr_path_hygiene(current);
-        let resolved = resolver.resolve_path_in_value_ns(db, path, hygiene);
-        resolver.reset_to_guard(guard);
-        let Some(ResolveValueResult::ValueNs(ValueNs::StaticId(id))) = resolved else { return };
-        let flags = StaticSignature::of(db, id).flags;
+        let Some(ValueNs::StaticId(id)) = self.infer.value_resolution(current.into()) else {
+            return;
+        };
+        let flags = StaticSignature::of(self.db, id).flags;
         if flags.contains(StaticFlags::MUTABLE) {
             self.requires_unsafe(current, UnsafetyReason::MutableStatic);
         } else if flags.contains(StaticFlags::EXTERN) && !flags.contains(StaticFlags::EXPLICIT_SAFE)

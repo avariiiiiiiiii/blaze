@@ -33,7 +33,7 @@ use ra_ap_rustc_parse_format::{ParseMode, Parser, Piece};
 use rustc_type_ir::inherent::IntoKind as _;
 use span::FileId;
 use syntax::{
-    AstNode as _, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange,
+    AstNode as _, SmolStr, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange,
     ast::{self, HasAttrs as _},
 };
 
@@ -145,7 +145,9 @@ fn check_panic_str(b: &BodyCx<'_, '_>, call: ExprId, f: &At, arg: ExprId, fmt: &
 
     let diag = if n_arguments > 0 && parser.errors.is_empty() {
         let spans = match &parser.arg_places[..] {
+            // alloc: the lint's diagnostic
             [] => vec![show(b, &fmt_span)],
+            // alloc: the lint's diagnostic
             places => places.iter().map(|it| inner(b, &fmt_span, it.start, it.end)).collect(),
         };
         let message = match n_arguments {
@@ -174,6 +176,7 @@ fn check_panic_str(b: &BodyCx<'_, '_>, call: ExprId, f: &At, arg: ExprId, fmt: &
             it.char_indices()
                 .filter(|&(_, c)| c == '{' || c == '}')
                 .map(|(i, _)| inner(b, &fmt_span, i, i + 1))
+                // alloc: the lint's diagnostic
                 .collect()
         });
         // Without the snippet, any number but one.
@@ -182,6 +185,7 @@ fn check_panic_str(b: &BodyCx<'_, '_>, call: ExprId, f: &At, arg: ExprId, fmt: &
             1 => "panic message contains a brace",
             _ => "panic message contains braces",
         };
+        // alloc: the lint's diagnostic
         let mut diag = lint(message, brace_spans.unwrap_or_else(|| vec![show(b, &span)]));
         diag.note("this message is not used as a format string, but will be in Rust 2021");
         if inside {
@@ -217,7 +221,9 @@ impl NotLiteral<'_> {
         let db = b.db();
         let NotLiteral { arg, ref arg_span, ref span, arg_macro, panic, symbol } = *self;
         let shown = show(b, arg_span);
+        // clone: a span, for the lint's diagnostic
         let mut diag = Diag::lint(LINT, "panic message is not a string literal", shown.clone());
+        // alloc: the lint's diagnostic
         diag.note(format!("this usage of `{symbol}!()` is deprecated; it will be a hard error in Rust 2021"));
         diag.note(MORE);
         if !is_arg_inside_call(arg_span, span) {
@@ -225,13 +231,17 @@ impl NotLiteral<'_> {
             return diag;
         }
         if arg_macro.and_then(|it| macro_item(db, it)).as_deref() == Some("format_macro") {
+            // alloc: the lint's diagnostic
             diag.note(format!(
+                // alloc: the lint's diagnostic
                 "the `{symbol}!()` macro supports formatting, so there's no need for the `format!()` macro here"
             ));
             if let Some((open, close, _)) = find_delimiters(b, arg_span) {
                 let len = usize::from(arg_span.range.len());
                 diag.multipart_suggestion(
+                    // alloc: the lint's diagnostic
                     "remove the `format!(..)` macro call",
+                    // alloc: the lint's diagnostic
                     vec![(inner(b, arg_span, 0, open + 1), String::new()), (inner(b, arg_span, close, len), String::new())],
                     Applicability::MachineApplicable,
                 );
@@ -245,6 +255,7 @@ impl NotLiteral<'_> {
         let is_str = matches!(ty.kind(), TyKind::Ref(_, inner, _) if inner.is_str())
             || ty.as_adt().is_some_and(|(adt, _)| lang.String.is_some_and(|it| AdtId::StructId(it) == adt));
         let solver = Solver::of(b);
+        // alloc: the lint's diagnostic
         let mut checked = Vec::new();
         let mut implements = |name: &'static str, it: Option<TraitId>| {
             let Some(it) = it else { return false };
@@ -268,6 +279,7 @@ impl NotLiteral<'_> {
         } else if suggest_debug {
             diag.suggestion_verbose(
                 shown.shrink_to_lo(),
+                // alloc: the lint's diagnostic
                 format!("add a \"{{:?}}\" format string to use the `Debug` implementation of `{}`", b.ty(ty)),
                 "\"{:?}\", ",
                 applicability,
@@ -280,9 +292,13 @@ impl NotLiteral<'_> {
                 "use std::panic::panic_any instead"
             };
             let parts = match delimiter {
+                // alloc: the lint's diagnostic
                 '(' => vec![(inner(b, span, 0, open), "std::panic::panic_any".to_owned())],
+                // alloc: the lint's diagnostic
                 _ => vec![
+                    // alloc: the lint's diagnostic
                     (inner(b, span, 0, open + 1), "std::panic::panic_any(".to_owned()),
+                    // alloc: the lint's diagnostic
                     (inner(b, span, close, close + 1), ")".to_owned()),
                 ],
             };
@@ -304,6 +320,7 @@ fn trait_facts<'db>(b: &BodyCx<'_, 'db>, diag: &mut Diag, arg: ExprId, ty: Ty<'d
     let ty = of.original.derived_from_next_solver(ty);
     let printed = b.cx.ty(&ty);
     for &(name, it) in checked {
+        // alloc: the lint's diagnostic
         let what = format!("whether `{printed}` implements `{name}`");
         diag.fact_opt(b.cx.implements_fact(hir::Trait::from(it), &ty), what);
     }
@@ -315,7 +332,7 @@ impl FmtTraits {
     fn of(b: &BodyCx<'_, '_>) -> FmtTraits {
         let db = b.db();
         let mut traits = FmtTraits { display: None, debug: None };
-        'crates: for krate in b.owner.krate(db).transitive_deps(db) {
+        'crates: for krate in b.owner.krate(db).transitive_deps(db).iter().copied() {
             for (_, module) in crate_def_map(db, krate).modules(db) {
                 for def in module.scope(db).declarations() {
                     let ModuleDefId::TraitId(it) = def else { continue };
@@ -336,7 +353,9 @@ impl FmtTraits {
 
 /// A lint of `message` at each of `spans`, which may be none.
 fn lint(message: &str, spans: Vec<Span>) -> Diag {
+    // alloc: the lint's diagnostic
     let mut diag = Diag::new(Level::Warning, Some(Code::Lint(LINT.to_owned())), message);
+    // alloc: the lint's diagnostic
     diag.span = MultiSpan { primary: spans, labels: Vec::new() };
     diag
 }
@@ -458,7 +477,7 @@ fn in_external_macro(b: &BodyCx<'_, '_>, at: &At) -> bool {
 /// macros that made it (`panic!`, `assert!`, `debug_assert!`, `unreachable!`, which a 2015
 /// macro was likely expanded from): the span of the outermost call, its macro's diagnostic item
 /// and its name as called.
-fn panic_call(b: &BodyCx<'_, '_>, f: &At) -> Option<(At, Option<String>, String)> {
+fn panic_call(b: &BodyCx<'_, '_>, f: &At) -> Option<(At, Option<SmolStr>, String)> {
     let db = b.db();
     let mut expn = f.expn?;
     let mut panic = None;
@@ -486,28 +505,30 @@ fn macro_symbol(b: &BodyCx<'_, '_>, call: MacroCallId) -> String {
     let name: Option<String> = match loc.kind {
         MacroCallKind::FnLike { .. } => ast::MacroCall::cast(loc.to_node(db).value)
             .and_then(|it| it.path())
+            // alloc: the macro's name as called, on the lint's path (a 2015 panic not given a plain literal)
             .map(|it| it.syntax().text().to_string().split_whitespace().collect()),
         _ => b.cx.expansion_of(call).map(|it| it.name),
     };
+    // alloc: the lint's diagnostic
     name.unwrap_or_else(|| "panic".to_owned())
 }
 
 /// The name `#[rustc_diagnostic_item = "name"]` gives the macro `def`, its `cfg_attr`s
 /// expanded: what rustc's `get_diagnostic_name` gives of a macro's `DefId`.
-fn macro_item(db: &Db, def: MacroDefId) -> Option<String> {
-    let attrs: Vec<ast::Attr> = match def.kind {
+fn macro_item(db: &Db, def: MacroDefId) -> Option<SmolStr> {
+    let attrs = match def.kind {
         MacroDefKind::Declarative(id, _)
         | MacroDefKind::BuiltIn(id, _)
         | MacroDefKind::BuiltInAttr(id, _)
         | MacroDefKind::BuiltInDerive(id, _)
         | MacroDefKind::BuiltInEager(id, _)
-        | MacroDefKind::UnimplementedBuiltIn(id) => id.to_node(db).attrs().collect(),
-        MacroDefKind::ProcMacro(id, ..) => id.to_node(db).attrs().collect(),
+        | MacroDefKind::UnimplementedBuiltIn(id) => id.to_node(db).attrs(),
+        MacroDefKind::ProcMacro(id, ..) => id.to_node(db).attrs(),
     };
     let cfg = def.krate.cfg_options(db);
-    expand_cfg_attr(attrs.into_iter(), || cfg, |meta, _| match meta {
+    expand_cfg_attr(attrs, || cfg, |meta, _| match meta {
         ast::Meta::KeyValueMeta(attr) if attr.path().is1("rustc_diagnostic_item") => match attr.value_string() {
-            Some(name) => ControlFlow::Break(name.to_string()),
+            Some(name) => ControlFlow::Break(name),
             None => ControlFlow::Continue(()),
         },
         _ => ControlFlow::Continue(()),

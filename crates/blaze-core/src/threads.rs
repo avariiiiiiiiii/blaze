@@ -48,6 +48,11 @@ const SPARE: usize = 16;
 #[cfg(unix)]
 const CONNECTIONS: u32 = 1 << 20;
 
+/// Why a process or a socket fails here.
+#[cfg(not(unix))]
+const UNIX_ONLY: &str =
+    "processes and sockets are built on Unix only; Windows' are lane usercode's (AppContainer and job objects)";
+
 /// Values in slots of their own, each named by a [`Tag`] and by a generational handle: what a
 /// driver keeps of the spawns, watches and listens in flight. A handle of one removed, or
 /// replaced by another of its tag, names nothing.
@@ -1073,6 +1078,7 @@ enum Errand {
     Recv {
         socket: Arc<crate::net::Socket>,
         most: usize,
+        into: Vec<u8>,
         tag: Tag,
     },
     Send {
@@ -1200,9 +1206,9 @@ impl Errand {
                 life.exited();
                 Some(Told::Exited { spawn, completion: Completion { tag, done } })
             }
-            Errand::Connect { tag, .. } | Errand::Recv { tag, .. } | Errand::Send { tag, .. } => {
-                Some(Told::Done(Completion { tag, done }))
-            }
+            Errand::Connect { tag, .. } => Some(Told::Done(Completion { tag, done })),
+            Errand::Recv { into, tag, .. } => Some(Told::Done(Completion { tag, done: Done::unread(into, why) })),
+            Errand::Send { bytes, tag, .. } => Some(Told::Done(Completion { tag, done: Done::unsent(bytes, why) })),
             Errand::Listen { listen, tag, .. } => Some(Told::Listened { listen, completion: Completion { tag, done } }),
             #[cfg(target_os = "linux")]
             Errand::Watch { control, .. } => {
@@ -1233,21 +1239,24 @@ impl Errand {
                 Ok(socket) => Told::Connected { tag, socket },
                 Err(error) => failed(tag, error),
             }),
-            Errand::Recv { socket, most, tag } => {
-                // alloc: the receive's payload.
-                let mut bytes = shared.payload(|| vec![0; most]);
-                Some(match socket.read(&mut bytes) {
-                    Ok(n) => {
-                        bytes.truncate(n);
-                        Told::Done(Completion { tag, done: Done::Read(bytes) })
-                    }
-                    Err(error) => failed(tag, error),
-                })
+            Errand::Recv { socket, most, mut into, tag } => {
+                // The asker's buffer, grown only where it has no room for `most` more.
+                let done = match shared.payload(|| socket.read_into(&mut into, most)) {
+                    Ok(_) => Done::Read(into),
+                    Err(error) => Done::unread(into, error),
+                };
+                Some(Told::Done(Completion { tag, done }))
             }
-            Errand::Send { socket, bytes, tag } => Some(match socket.write_all(&bytes) {
-                Ok(()) => Told::Done(Completion { tag, done: Done::Sent }),
-                Err(error) => failed(tag, error),
-            }),
+            Errand::Send { socket, mut bytes, tag } => {
+                let done = match socket.write_all(&bytes) {
+                    Ok(()) => {
+                        bytes.clear();
+                        Done::Sent(bytes)
+                    }
+                    Err(error) => Done::unsent(bytes, error),
+                };
+                Some(Told::Done(Completion { tag, done }))
+            }
             Errand::Listen { listener, stop, listen, tag } => {
                 let done = accept_until_stopped(shared, &listener, &stop, listen, tag)?;
                 Some(Told::Listened { listen, completion: Completion { tag, done } })
@@ -1684,13 +1693,12 @@ impl Driver for Threads {
                     self.dispatch(Errand::Connect { at, tag });
                 }
                 #[cfg(unix)]
-                Effect::Recv { conn, most, tag } => match self.socket(conn) {
+                Effect::Recv { conn, most, into, tag } => match self.socket(conn) {
                     Some(socket) => {
                         self.in_flight += 1;
-                        self.dispatch(Errand::Recv { socket, most, tag });
+                        self.dispatch(Errand::Recv { socket, most, into, tag });
                     }
-                    // alloc: an error path.
-                    None => self.tell(tag, Done::Failed(IoError(format!("no connection {conn:?}")))),
+                    None => self.tell(tag, Done::unread(into, format_args!("no connection {conn:?}"))),
                 },
                 #[cfg(unix)]
                 Effect::Send { conn, bytes, tag } => match self.socket(conn) {
@@ -1698,8 +1706,7 @@ impl Driver for Threads {
                         self.in_flight += 1;
                         self.dispatch(Errand::Send { socket, bytes, tag });
                     }
-                    // alloc: an error path.
-                    None => self.tell(tag, Done::Failed(IoError(format!("no connection {conn:?}")))),
+                    None => self.tell(tag, Done::unsent(bytes, format_args!("no connection {conn:?}"))),
                 },
                 #[cfg(unix)]
                 Effect::Hangup { conn, tag } => {
@@ -1718,21 +1725,18 @@ impl Driver for Threads {
                 #[cfg(not(unix))]
                 Effect::Kill { .. } => {}
                 #[cfg(not(unix))]
+                Effect::Recv { into, tag, .. } => self.tell(tag, Done::unread(into, UNIX_ONLY)),
+                #[cfg(not(unix))]
+                Effect::Send { bytes, tag, .. } => self.tell(tag, Done::unsent(bytes, UNIX_ONLY)),
+                #[cfg(not(unix))]
                 effect @ (Effect::Spawn { .. }
                 | Effect::Listen { .. }
                 | Effect::Unlisten { .. }
                 | Effect::Connect { .. }
-                | Effect::Recv { .. }
-                | Effect::Send { .. }
-                | Effect::Hangup { .. }) => self.tell(
-                    effect.tag(),
-                    Done::Failed(IoError(
-                        "processes and sockets are built on Unix only; Windows' are lane \
-                         usercode's (AppContainer and job objects)"
-                            // alloc: an error path.
-                            .into(),
-                    )),
-                ),
+                | Effect::Hangup { .. }) => {
+                    // alloc: an error path.
+                    self.tell(effect.tag(), Done::Failed(IoError(UNIX_ONLY.into())))
+                }
                 effect => {
                     self.in_flight += 1;
                     if self.shared.files.push(effect).is_err() {

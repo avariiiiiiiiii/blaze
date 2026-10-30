@@ -170,7 +170,8 @@ print what cargo prints, on the stream cargo prints it, with cargo's exit codes:
   `foo` (lib) generated 2 warnings`, `error: could not compile `foo` (bin "foo") due to 1 previous
   error`, `Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.12s`; with
   `--message-format json*`, cargo's JSON messages on stdout (`compiler-message`,
-  `compiler-artifact`, `build-script-executed`, `build-finished`).
+  `compiler-artifact`, `build-script-executed`, `build-finished`); with `short`, rustc's short
+  form of each diagnostic and cargo's own lines unchanged.
 - `run`: builds, prints `Running `target/debug/foo``, and runs the program itself with the
   terminal, its arguments and the command's environment, exiting with its code.
 - `test`/`bench`: builds the test targets, then runs each test executable (and the doc tests)
@@ -199,8 +200,9 @@ need no escape copied whole, and with rustc's color codes stripped in the same p
 mostly plain ASCII, so the table copy is the right tool. A source file a span points into is read
 once, with its lines indexed as 4-byte offsets found by `memchr` (core's `match_indices('\n')`).
 It is not mmapped, because a file edited while the build runs would fault (SIGBUS). A name seen
-before costs two Fx lookups by `&str` and allocates nothing. Diagnostics are deduplicated by a
-64-bit Fx hash of their text, as cargo's `DiagDedupe` does, and units are indexed by package.
+before costs one Fx hash of its directory and name, and one lookup, and allocates nothing.
+Diagnostics are deduplicated by a 64-bit Fx hash of their text, as cargo's `DiagDedupe` does, and
+units are found by a hash of their package, target and mode.
 `--reached` groups its results in one Fx pass, and libtest's text is built in one preallocated
 `String`.
 
@@ -213,13 +215,16 @@ the rules: [principles.md](../../goals/principles.md), "Fast code, line by line"
 |---|---|---|
 | Workspace load | Buck2's DICE, rust-analyzer's salsa project load, rustc's red-green graph | an edge per file read, early cutoff on canonical TOML and on directory listings, so a source edit reruns no load query |
 | Mounts and file reads | a kernel's mount hash | binary search per ancestor over sorted columns read in place; a hit allocates nothing |
-| Resolve | cargo's resolver guided by the lock | the lock taken as the answer, the resolve rerun only when a manifest's dependencies change |
+| Resolve | cargo's resolver guided by the lock | the lock taken as the answer, the resolve rerun only when a manifest's dependencies change; index lines parsed lazily per matching version, as cargo's index cache |
+| cargo tree (`blaze-tree`) | cargo's `ops/tree`, CSR graph traversal (GAP, Ligra) | CSR edges per kind built by counting sort, bitset visited and on-stack sets, specs matched once into bitsets over packages, one output buffer; the printed text is the query's value, so a repeat is a memo hit |
 | Standard library | `-Zbuild-std` | the same pipeline, keyed by none of the view: one graph per target and profile in the shared base layer |
+| Target table | rustc's built-in target specs | to match: the table compiled in, a lookup. Today `rustc.json` is parsed once per process (speed-of-light.md, the standard library) |
 | Daemon start | Bazel's and buck2's servers | the database image mapped in place; nothing loaded again on start |
+| Daemon's jobs (`serve/job.rs`) | `slotmap`'s and `thunderdome`'s generational arenas, a game engine's entity table | no hash lookup where an index works. A job is found by its `JobId`'s slot with one compare of the generation, so a late report for a cancelled or finished job is dropped, not a panic. An effect of the loop's own or a run of user code is a `blaze_mem::Slab` slot whose handle (slot and generation's low bits) its `Tag` carries, so a completion is an index and a compare. A node finds its job by binary search over the batches' first ids (one SoA column), and paths and checkouts are interned to `u32` once where they come in, each table after that a column. This replaces `FxHashMap<JobId, Job>` with an `.expect` per lookup, the `Tag`-keyed maps and `BTreeMap<u32, ..>` of nodes. The store's placement tags are its own, so they stay hashed |
 | Heads | watchman's cookies | one cookie per request through the watcher; nothing walked |
 | Front end per job | rust-analyzer's incremental database | one `Sync` database by reference, kept across jobs, new views applied as tree diffs; writes batched per wave |
 | Fetch | cargo's HTTP/2 multiplexed downloads | one connection per registry, checked and unpacked in memory, mounted as content-addressed roots |
-| CLI | buck2's and Bazel's thin clients | one socket round trip, one buffer per response, zero allocation per response once warm |
+| CLI | buck2's and Bazel's thin clients; sonic-rs and simdjson for JSON strings; a dense-id table (an ECS) for units | one socket round trip; lines held per stream and written once per batch, in the order made; the printer allocates nothing per response once warm, each unit hashed once and found with one probe; strings escaped by an 8-byte SWAR scan, byte for byte serde_json's; `--reached` grouped by counting sort. Not yet matched: the decode allocates each response's strings, units are found by hashing their ids rather than by index, and a write per response until the client says whether one is buffered (speed-of-light.md, the CLI) |
 
 Each child applies the rules to its code as written, not only to new code; the gaps left are in
 speed-of-light.md, each with its owner.

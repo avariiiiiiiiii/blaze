@@ -40,6 +40,7 @@ impl Response {
 }
 
 /// Work started at once and finished on whichever thread does it, awaited from any executor.
+// dyn: what `dyn Http` returns, one per network request, which costs far more than its box.
 pub type Pending<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 /// What asks servers for files. An error is one where no answer came, which is worth trying
@@ -138,6 +139,7 @@ impl Retry {
     /// other requests in between.
     pub async fn run_async<T, F: Future<Output = anyhow::Result<T>>>(
         &self,
+        // dyn: the I/O driver, asked only to sleep between tries of a failed request.
         http: &dyn Http,
         mut attempt: impl FnMut() -> F,
     ) -> anyhow::Result<T> {

@@ -63,7 +63,7 @@ pub(super) struct Catch {
 /// The program aborts, as rustc's `UnwindTerminate` does: nothing catches it.
 pub(super) fn abort<'db>(reason: &str) -> MirEvalError<'db> {
     // alloc: error path
-    MirEvalError::NotSupported(format!("the program aborted: {reason}"))
+    MirEvalError::Aborted(reason.to_owned())
 }
 
 /// Whether `error` is a panic, which unwinds; every other error stops the evaluation.

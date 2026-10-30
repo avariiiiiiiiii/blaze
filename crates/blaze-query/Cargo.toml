@@ -23,9 +23,13 @@ blaze-mem.workspace = true
 blaze-protocol.workspace = true
 blaze-reclaim.workspace = true
 blaze-vfs.workspace = true
+hashbrown.workspace = true
 intern.workspace = true
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

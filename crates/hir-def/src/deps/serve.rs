@@ -6,7 +6,7 @@
 //! giving it in place, so the front end depends on neither.
 //!
 //! A crate's image is under its key ([`keys`]) when it has no [`Reads`]; else under its key,
-//! the names it read (a slot's bytes) and their values ([`reads::image_key`]).
+//! the names it read (a slot's bytes) and their values ([`filed`]).
 
 use std::{
     ops::Range,
@@ -21,15 +21,15 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::{
     Lookup,
     deps::{
-        DepImages, Image,
+        DepImages, Image, filed,
         image::{ImageBuf, ImageRef, Part, PartBytes, write_image},
         key::{Base, keys},
-        reads::{self, Reads, SLOTS},
+        reads::Reads,
         signatures,
     },
     nameres::{
         crate_def_map,
-        frozen::{self, Frozen, Mode},
+        frozen::{self, Frozen, FrozenDefMaps, FrozenLangItems, Mode},
     },
 };
 
@@ -159,6 +159,10 @@ pub struct Stored {
     pub written: Vec<Crate>,
     /// The crates whose image was not, and why.
     pub refused: Vec<(Crate, Refused)>,
+    /// The key each crate of `written` has its image filed under ([`Image::key`]): what a
+    /// value made from the crate as this database resolved it is filed by
+    /// (`blaze_diagnostics::cache`).
+    pub filed: FxHashMap<Crate, ContentId>,
 }
 
 /// The name of `krate` in an error.
@@ -173,7 +177,11 @@ pub(crate) fn crate_name(db: &Db, krate: Crate) -> String {
 
 /// Reads each of `crates` that is [`eligible`] (and its dependencies) from the image `images`
 /// keep for it, by `build`, the blaze reading: `mode` says what is done with each image.
-/// Replaces the frozen def maps and lang items `db` was given.
+///
+/// Adds to what earlier calls served, so a driver serves crates as their inputs become final.
+/// A crate served before under the same key and mode keeps its image as it is and is not
+/// fetched again. One whose key or mode is another is fetched again, and loses its image when
+/// none is found. The frozen def maps and lang items `db` was given for other crates are kept.
 ///
 /// An image that does not read under the key it is filed by, or reads that do not decode, are
 /// an error naming the crate and why, never a crate resolved instead: the key covers what the
@@ -190,11 +198,18 @@ pub fn serve(
     mode: Mode,
 ) -> Result<Served, String> {
     let keys = keys(&*db, crates, build);
-    let mut order: Vec<(Crate, ContentId)> =
-        // alloc: setup: once per session
-        keys.iter().map(|(&krate, &key)| (krate, key)).collect();
+    // clone: the handle of the images served before, once per serve
+    let before = DepImages::try_get(&*db).map(|it| it.images(&*db).clone()).unwrap_or_default();
+    let kept = |krate: &Crate, key: &ContentId| {
+        before.get(krate).is_some_and(|it| it.base == *key && it.mode == mode)
+    };
+    let mut order: Vec<(Crate, ContentId)> = (keys.iter())
+        .filter(|(krate, key)| !kept(krate, key))
+        .map(|(&krate, &key)| (krate, key))
+        // alloc: setup: once per serve
+        .collect();
     order.sort_unstable_by_key(|&(_, key)| key);
-    // alloc: setup: one slot per crate, once per session
+    // alloc: setup: one slot per crate, once per serve
     let found: Vec<OnceLock<Fetched>> = order.iter().map(|_| OnceLock::new()).collect();
     {
         let db = &*db;
@@ -203,17 +218,27 @@ pub fn serve(
             _ = found[at].set(fetch(db, krate, key, images));
         });
     }
-    let mut served = FxHashMap::default();
-    let mut maps = FxHashMap::default();
-    let mut lang_items = FxHashMap::default();
-    // alloc: setup: once per session
-    let mut hits = Vec::with_capacity(order.len());
+    let mut hits: Vec<Crate> =
+        // alloc: setup: once per serve
+        keys.iter().filter(|(krate, key)| kept(krate, key)).map(|(&krate, _)| krate).collect();
+    if order.is_empty() {
+        hits.sort_unstable_by_key(|krate| keys[krate]);
+        // alloc: none: an empty `Vec` holds no buffer
+        return Ok(Served { keys, hits, stale: Vec::new() });
+    }
+    // clone: what was served before, once per serve that fetches a crate, to add to
+    let mut served = (*before).clone();
+    let mut maps = copied(FrozenDefMaps::try_get(&*db).map(|it| it.maps(&*db)));
+    let mut lang_items = copied(FrozenLangItems::try_get(&*db).map(|it| it.maps(&*db)));
     // alloc: setup, as above
     let mut stale = Vec::new();
-    for (&(krate, _), found) in order.iter().zip(found) {
+    for (&(krate, base), found) in order.iter().zip(found) {
         let found = found.into_inner().unwrap_or_else(|| {
             panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, krate))
         });
+        served.remove(&krate);
+        maps.remove(&krate);
+        lang_items.remove(&krate);
         let (bytes, parts, filed) = match found? {
             Found::Hit { bytes, parts, filed } => (bytes, parts, filed),
             Found::Miss { stale: true } => {
@@ -222,16 +247,23 @@ pub fn serve(
             }
             Found::Miss { stale: false } => continue,
         };
-        let part = |part| PartBytes::of(&bytes, &parts, part).into();
+        let part = |part| PartBytes::of(&bytes, &parts, part);
         maps.insert(krate, Frozen { bytes: part(Part::DefMap), mode });
         lang_items.insert(krate, Frozen { bytes: part(Part::LangItems), mode });
-        served.insert(krate, Image { key: filed, bytes, parts, mode });
+        served.insert(krate, Image { base, key: filed, bytes, parts, mode });
         hits.push(krate);
     }
+    hits.sort_unstable_by_key(|krate| keys[krate]);
     frozen::set(db, maps);
     frozen::set_lang_items(db, lang_items);
     set_images(db, served);
     Ok(Served { keys, hits, stale })
+}
+
+/// The frozen bytes a database was given, to add to.
+fn copied(maps: Option<&Arc<FxHashMap<Crate, Frozen>>>) -> FxHashMap<Crate, Frozen> {
+    // clone: what was served before, once per serve that fetches a crate, to add to
+    maps.map(|it| (**it).clone()).unwrap_or_default()
 }
 
 /// What one task of [`serve`] found of a crate.
@@ -245,37 +277,20 @@ enum Found {
 type Fetched = Result<Found, String>;
 
 /// The image of `krate`, whose key is `key`: under the key, or under the reads of one of its
-/// slots and their values now; opened and its def map's files checked.
+/// slots and their values now ([`filed::search`]); opened and its def map's files checked.
 // dyn: the driver's store, one call per crate per session
 fn fetch(db: &Db, krate: Crate, key: ContentId, images: &dyn ImageStore) -> Fetched {
-    let name = || crate_name(db, krate);
-    let get = |at: &ContentId, what: &str| {
-        images
-            .get(at)
+    let found = filed::search(db, krate, key, images, |at| {
+        let bytes = images.get(&at).map_err(|why| {
             // alloc: error text
-            .map_err(|why| format!("reading the {what} of crate {} (key {at:?}): {why}", name()))
-    };
-    if let Some(bytes) = get(&key, "image")? {
-        return open(db, krate, key, bytes);
-    }
-    let mut stale = false;
-    for n in 0..SLOTS {
-        let Some(record) = get(&reads::slot(key, n), "reads")? else { break };
-        let reads = Reads::decode(record.bytes()).map_err(|why| {
-            // alloc: error text
-            format!("the reads of crate {} in slot {n} of key {key:?}: {why}", name())
+            format!("reading the image of crate {} (key {at:?}): {why}", crate_name(db, krate))
         })?;
-        let values = reads.values_now(db, krate, images).map_err(|why| {
-            // alloc: error text
-            format!("the values of the reads of crate {} in slot {n}: {why}", name())
-        })?;
-        let filed = reads::image_key(key, record.bytes(), values);
-        if let Some(bytes) = get(&filed, "image")? {
-            return open(db, krate, filed, bytes);
-        }
-        stale = true;
+        Ok(bytes.map(|bytes| (at, bytes)))
+    })?;
+    match found {
+        Ok((filed, bytes)) => open(db, krate, filed, bytes),
+        Err(stale) => Ok(Found::Miss { stale }),
     }
-    Ok(Found::Miss { stale })
 }
 
 /// The image `bytes`, filed under `filed`, opened and its def map's files checked.
@@ -324,7 +339,7 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
         // alloc: setup: once per session
         .collect();
     order.sort_unstable_by_key(|&(_, key)| key);
-    let made: Vec<OnceLock<Result<Option<Refused>, String>>> =
+    let made: Vec<OnceLock<Result<Result<ContentId, Refused>, String>>> =
         // alloc: setup: one slot per crate, once per session
         order.iter().map(|_| OnceLock::new()).collect();
     images.for_each(order.len(), &|at| {
@@ -337,8 +352,11 @@ pub fn store(db: &Db, served: &Served, images: &dyn ImageStore) -> Result<Stored
             panic!("`ImageStore::for_each` did not run the task of crate {}", crate_name(db, krate))
         });
         match made? {
-            None => stored.written.push(krate),
-            Some(why) => stored.refused.push((krate, why)),
+            Ok(filed) => {
+                stored.written.push(krate);
+                stored.filed.insert(krate, filed);
+            }
+            Err(why) => stored.refused.push((krate, why)),
         }
     }
     Ok(stored)
@@ -352,76 +370,34 @@ fn make(
     key: ContentId,
     // dyn: the driver's store, one call per crate per session
     images: &dyn ImageStore,
-) -> Result<Option<Refused>, String> {
+) -> Result<Result<ContentId, Refused>, String> {
     if let Some(why) = refusal(db, krate) {
-        return Ok(Some(why));
+        return Ok(Err(why));
     }
     // alloc: setup: the macro calls the crate's signatures name, once per crate imaged
     let mut calls = Vec::new();
     let parts = match encode(db, krate, &mut calls) {
         Ok(parts) => parts,
-        Err(why) => return Ok(Some(why)),
+        Err(why) => return Ok(Err(why)),
     };
     if let Some(why) = Base::of(db, krate).held_by(&parts) {
-        return Ok(Some(why));
+        return Ok(Err(why));
     }
     let reads = match Reads::of(db, krate, &calls) {
         Ok(reads) => reads,
-        Err(why) => return Ok(Some(why)),
+        Err(why) => return Ok(Err(why)),
     };
-    let put = |at: ContentId, value: Vec<u8>| {
-        images.put(at, value).map_err(|why| {
-            // alloc: error text
-            format!("keeping the image of crate {} (key {at:?}): {why}", crate_name(db, krate))
-        })
-    };
-    let filed = match reads.is_empty() {
-        true => key,
-        false => {
-            let record = reads.encode();
-            if let Some(why) = keep_reads(db, krate, key, &record, images)? {
-                return Ok(Some(why));
-            }
-            reads::image_key(key, &record, reads.values_then(db))
-        }
+    let filed = match filed::file_by_reads(db, krate, key, &reads, images)? {
+        Ok(filed) => filed,
+        Err(why) => return Ok(Err(why)),
     };
     let image = write_image(filed, [&parts[0], &parts[1], &parts[2]]);
     drop(parts);
-    put(filed, image)?;
-    Ok(None)
-}
-
-/// Keeps `record`, the reads of `krate`, in the first slot of `key` that holds it or is free.
-/// Two writers that keep other reads in one slot at once each see the other's and move on.
-fn keep_reads(
-    db: &Db,
-    krate: Crate,
-    key: ContentId,
-    record: &[u8],
-    // dyn: the driver's store, one call per crate per session
-    images: &dyn ImageStore,
-) -> Result<Option<Refused>, String> {
-    let error = |what: &str, why: String| {
+    images.put(filed, image).map_err(|why| {
         // alloc: error text
-        format!("{what} the reads of crate {} (key {key:?}): {why}", crate_name(db, krate))
-    };
-    for n in 0..SLOTS {
-        let at = reads::slot(key, n);
-        match images.get(&at).map_err(|why| error("reading", why))? {
-            Some(kept) if kept.bytes() == record => return Ok(None),
-            Some(_) => continue,
-            // alloc: the slot's bytes, once per crate imaged
-            None => match images.put(at, record.to_vec()) {
-                Ok(()) => return Ok(None),
-                Err(why) => match images.get(&at).map_err(|why| error("reading", why))? {
-                    Some(kept) if kept.bytes() == record => return Ok(None),
-                    Some(_) => continue,
-                    None => return Err(error("keeping", why)),
-                },
-            },
-        }
-    }
-    Ok(Some(Refused::Reads { why: "every slot of its key holds other reads" }))
+        format!("keeping the image of crate {} (key {filed:?}): {why}", crate_name(db, krate))
+    })?;
+    Ok(Ok(filed))
 }
 
 /// The parts of the image of `krate`, in the order of [`Part::ALL`], and in `calls` the macro

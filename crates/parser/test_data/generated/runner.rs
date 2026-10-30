@@ -799,6 +799,10 @@ mod ok {
     #[test]
     fn unit_type() { run_and_expect_no_errors("test_data/parser/inline/ok/unit_type.rs"); }
     #[test]
+    fn unsafe_binder_cast() {
+        run_and_expect_no_errors("test_data/parser/inline/ok/unsafe_binder_cast.rs");
+    }
+    #[test]
     fn unsafe_mod() { run_and_expect_no_errors("test_data/parser/inline/ok/unsafe_mod.rs"); }
     #[test]
     fn use_item() { run_and_expect_no_errors("test_data/parser/inline/ok/use_item.rs"); }

@@ -161,7 +161,9 @@ impl ProcMacroExpander for Replay {
             .ok_or_else(|| ProcMacroExpansionError::System("the expansion does not lex".into()))
     }
 
+    // dyn: hir-expand's `ProcMacroExpander::eq_dyn`, when a crate's macros are set.
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        // dyn: as above, the one way to compare across expander types.
         (other as &dyn std::any::Any).downcast_ref::<Self>().is_some_and(|other| {
             self.krate == other.krate
                 && self.name == other.name

@@ -100,6 +100,7 @@ tar = "0.4.44"
 flate2 = { version = "1.1.9", default-features = false, features = ["rust_backend"] }
 zstd = "0.13.3"
 blaze-live = { path = "../blaze-live" }
+blaze-mem.workspace = true
 # blaze's std::process for build scripts compiled for wasm32-wasip1; its runner with the
 # feature `wasi`.
 blaze-wasi = { path = "../blaze-wasi" }
@@ -113,6 +114,7 @@ tikv-jemallocator = "0.5.4"
 blaze-sha256.workspace = true
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 tokio = { version = "1.47", features = ["net"] }
 object = { version = "0.37", default-features = false, features = ["write", "elf"] }
 test-fixture.workspace = true

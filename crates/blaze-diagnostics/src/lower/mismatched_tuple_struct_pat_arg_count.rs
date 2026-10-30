@@ -8,61 +8,70 @@
 //! `emit_err_pat_wrong_number_of_fields`), `compiler/rustc_ast_lowering/src/expr.rs`
 //! (`destructure_assign_mut`, `destructure_sequence`) for the destructuring-assignment form, and
 //! `compiler/rustc_middle/src/hir/map.rs` (`opt_ident`, `hir_span`, `named_span`) for the spans
-//! of the definition (MIT or Apache-2.0). The missing-parentheses suggestion reads the field's
-//! type with the pattern's type arguments; rustc also holds it back when the pattern's type did
-//! not match the scrutinee's, which the diagnostic does not say yet.
+//! of the definition (MIT or Apache-2.0). The struct or variant is the one inference checked the
+//! pattern against; the missing-parentheses suggestion reads the field's type with the pattern's
+//! type arguments, and is held back when the pattern's type did not match the scrutinee's.
 
 use blaze_items::{Fact, ItemId};
 use either::Either;
-use hir::{HasSource as _, InFile, ModuleDef, PathResolution};
+use hir::InFile;
 use syntax::{
-    AstNode, SyntaxNode, TextRange,
-    ast::{self, HasArgList as _, HasGenericParams as _, HasName as _, RangeItem as _},
+    TextRange,
+    view::{self as ast, AstNode as _, HasArgList as _, HasGenericParams as _, HasName as _, Node, RangeItem as _},
 };
 
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view as item_range},
     lints::code_fact,
     lower::{Found, Phase},
     model::{Applicability, Diag, Span},
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MismatchedTupleStructPatArgCount) -> Vec<Found> {
+    // alloc: empty, allocates nothing
     let Some(pat) = pat(cx, d) else { return Vec::new() };
     let Some(Def { descr, span: def_span, ident, mut field_spans, fields: field_ids }) =
         def(cx, pat.variant)
     else {
+        // alloc: empty, allocates nothing
         return Vec::new();
     };
     let subpats = pat.subpats.as_slice();
     let (found, fields) = (subpats.len(), field_ids.len());
-    let parentheses = missing_parentheses(cx, &pat, &field_ids);
+    let parentheses = !d.had_err && missing_parentheses(cx, &pat, &field_ids);
 
     let first_subpat = subpats.first().map_or(&pat.span, |it| &it.span);
     let last_subpat = subpats.last().map_or(&pat.span, |it| &it.span);
     let mut diag = Diag::error(
         Some("E0023"),
+        // alloc: the error's text, for an error hir found
         format!(
             "this pattern has {found} field{}, but the corresponding {descr} has {fields} field{}",
             s(found),
             s(fields),
         ),
+        // clone: on the error path, for an error hir found
         first_subpat.clone(),
     );
     for it in subpats.iter().skip(1) {
+        // clone: on the error path, for an error hir found
         diag.primary(it.span.clone());
     }
+    // alloc: clone: the error's parts, for an error hir found
     diag.span_label(last_subpat.clone(), format!("expected {fields} field{}, found {found}", s(fields)));
     if multiline(cx, &pat.path, last_subpat) {
+        // clone: on the error path, for an error hir found
         diag.span_label(pat.path.clone(), "");
     }
     let last_field = field_spans.pop().unwrap_or(def_span);
     if multiline(cx, &ident, &last_field) {
+        // alloc: the error's text, for an error hir found
         diag.span_label(ident, format!("{descr} defined here"));
     }
     for span in field_spans {
         diag.span_label(span, "");
     }
+    // alloc: the error's text, for an error hir found
     diag.span_label(last_field, format!("{descr} has {fields} field{}", s(fields)));
 
     if parentheses {
@@ -72,6 +81,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MismatchedTupleStructPatArgCount) 
         };
         diag.multipart_suggestion(
             "missing parentheses",
+            // alloc: the error's parts, for an error hir found
             vec![(left, "(".to_owned()), (right, ")".to_owned())],
             Applicability::MachineApplicable,
         );
@@ -83,8 +93,8 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MismatchedTupleStructPatArgCount) 
         let rest = (missing > 1 || all_wildcards).then(|| {
             if found == 0 || all_wildcards {
                 let all_fields = match subpats {
-                    [] => after_fields.clone(),
-                    [field] => field.span.clone(),
+                    [] => after_fields.clone(), // clone: on the error path, for an error hir found
+                    [field] => field.span.clone(), // clone: on the error path, for an error hir found
                     [first, .., last] => first.span.to(&last.span),
                 };
                 return (all_fields, "use `..` to ignore all fields", "..");
@@ -96,7 +106,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MismatchedTupleStructPatArgCount) 
                     (_, false) => None,
                 });
             let tail = match first_tail_wildcard {
-                None => after_fields.clone(),
+                None => after_fields.clone(), // clone: on the error path, for an error hir found
                 Some(0) => subpats[0].span.to(&after_fields),
                 Some(pos) => subpats[pos - 1].span.shrink_to_hi().to(&after_fields),
             };
@@ -117,9 +127,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MismatchedTupleStructPatArgCount) 
     let name = pat.variant.name(cx.db);
     diag.fact(
         Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+        // alloc: the error's text, for an error hir found
         format!("the fields of `{}`", name.display(cx.db, cx.edition)),
     );
     code_fact(cx, &mut diag, d.expr_or_pat.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 
@@ -154,10 +166,10 @@ struct Pat<'db> {
 }
 
 fn pat<'db>(cx: &Cx<'_, 'db>, d: &hir::MismatchedTupleStructPatArgCount) -> Option<Pat<'db>> {
-    let node = cx.node(d.expr_or_pat);
+    let node = cx.node_view(d.expr_or_pat);
     let file = node.file_id;
-    let span_of = |it: &SyntaxNode| cx.span(InFile::new(file, it.text_range()));
-    let (path, subpats, ty) = match &node.value {
+    let span_of = |it: Node<'_>| cx.span(InFile::new(file, it.text_range()));
+    let (path, subpats, ty) = match node.value {
         Either::Right(ast::Pat::TupleStructPat(it)) => {
             let subpats = it
                 .fields()
@@ -166,8 +178,9 @@ fn pat<'db>(cx: &Cx<'_, 'db>, d: &hir::MismatchedTupleStructPatArgCount) -> Opti
                     let it = strip_pat(it);
                     Subpat { span: span_of(it.syntax()), wild: matches!(it, ast::Pat::WildcardPat(_)) }
                 })
+                // alloc: the error's parts, for an error hir found
                 .collect();
-            let ty = cx.sema.type_of_pat(&ast::Pat::TupleStructPat(it.clone()));
+            let ty = cx.vsema.type_of_pat(ast::Pat::TupleStructPat(it));
             (it.path()?, subpats, ty)
         }
         Either::Left(ast::Expr::CallExpr(it)) => {
@@ -175,7 +188,7 @@ fn pat<'db>(cx: &Cx<'_, 'db>, d: &hir::MismatchedTupleStructPatArgCount) -> Opti
             let subpats = it
                 .arg_list()?
                 .args()
-                .filter(|it| !is_rest(it))
+                .filter(|it| !is_rest(*it))
                 .map(|it| {
                     let it = strip_expr(it);
                     Subpat {
@@ -183,32 +196,24 @@ fn pat<'db>(cx: &Cx<'_, 'db>, d: &hir::MismatchedTupleStructPatArgCount) -> Opti
                         wild: matches!(it, ast::Expr::UnderscoreExpr(_)),
                     }
                 })
+                // alloc: the error's parts, for an error hir found
                 .collect();
-            let ty = cx.sema.type_of_expr(&ast::Expr::CallExpr(it.clone()));
+            let ty = cx.vsema.type_of_expr(ast::Expr::CallExpr(it));
             (callee.path()?, subpats, ty)
         }
-        _ => return None,
-    };
-    let variant = match cx.sema.resolve_path(&path)? {
-        PathResolution::Def(ModuleDef::EnumVariant(it)) => hir::Variant::EnumVariant(it),
-        PathResolution::Def(ModuleDef::Adt(hir::Adt::Struct(it))) => hir::Variant::Struct(it),
-        PathResolution::SelfType(it) => match it.self_ty(cx.db).as_adt()? {
-            hir::Adt::Struct(it) => hir::Variant::Struct(it),
-            _ => return None,
-        },
         _ => return None,
     };
     Some(Pat {
         span: span_of(node.value.syntax()),
         path: span_of(path.syntax()),
         subpats,
-        variant,
+        variant: d.variant,
         ty: ty.map(|it| it.original),
     })
 }
 
-fn strip_pat(pat: ast::Pat) -> ast::Pat {
-    let inner = match &pat {
+fn strip_pat(pat: ast::Pat<'_>) -> ast::Pat<'_> {
+    let inner = match pat {
         ast::Pat::ParenPat(it) => it.pat(),
         _ => None,
     };
@@ -219,9 +224,9 @@ fn strip_pat(pat: ast::Pat) -> ast::Pat {
 }
 
 /// rustc lowers `(e)` on the left of an assignment as `e`, except `(..)`, a tuple pattern.
-fn strip_expr(expr: ast::Expr) -> ast::Expr {
-    let inner = match &expr {
-        ast::Expr::ParenExpr(it) => it.expr().filter(|it| !is_rest(it)),
+fn strip_expr(expr: ast::Expr<'_>) -> ast::Expr<'_> {
+    let inner = match expr {
+        ast::Expr::ParenExpr(it) => it.expr().filter(|it| !is_rest(*it)),
         _ => None,
     };
     match inner {
@@ -231,7 +236,7 @@ fn strip_expr(expr: ast::Expr) -> ast::Expr {
 }
 
 /// `..` on the left of an assignment.
-fn is_rest(expr: &ast::Expr) -> bool {
+fn is_rest(expr: ast::Expr<'_>) -> bool {
     matches!(expr, ast::Expr::RangeExpr(it)
         if it.start().is_none()
             && it.end().is_none()
@@ -256,24 +261,24 @@ struct Def {
 fn def(cx: &Cx<'_, '_>, variant: hir::Variant) -> Option<Def> {
     let (descr, file, node, name, generics) = match variant {
         hir::Variant::Struct(it) => {
-            let src = it.source(cx.db)?;
+            let src = cx.vsema.source(it)?;
             let it = src.value;
-            ("tuple struct", src.file_id, it.syntax().clone(), it.name()?, it.generic_param_list())
+            ("tuple struct", src.file_id, it.syntax(), it.name()?, it.generic_param_list())
         }
         hir::Variant::EnumVariant(it) => {
-            let src = it.source(cx.db)?;
+            let src = cx.vsema.source(it)?;
             let it = src.value;
-            ("tuple variant", src.file_id, it.syntax().clone(), it.name()?, None)
+            ("tuple variant", src.file_id, it.syntax(), it.name()?, None)
         }
         hir::Variant::Union(_) => return None,
     };
     let name = name.syntax().text_range();
     let end = generics.map_or(name.end(), |it| it.syntax().text_range().end().max(name.end()));
-    let span = cx.span(InFile::new(file, TextRange::new(item_range(&node).start(), end)));
+    let span = cx.span(InFile::new(file, TextRange::new(item_range(node).start(), end)));
     let fields = variant.fields(cx.db);
     let mut field_spans = Vec::with_capacity(fields.len());
-    for field in &fields {
-        let src = field.source(cx.db)?;
+    for &field in &fields {
+        let src = cx.vsema.source(field)?;
         field_spans.push(cx.span(src.map(|it| item_range(it.syntax()))));
     }
     Some(Def { descr, span, ident: cx.span(InFile::new(file, name)), field_spans, fields })

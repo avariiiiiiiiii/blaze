@@ -4,8 +4,10 @@
 //! trait bound `T: Trait` is not satisfied" and "the trait `Trait` is not implemented for `T`";
 //! "consider annotating `S` with `#[derive(Debug)]`" for a local type and a derivable trait;
 //! "this trait has no implementations"; the "required for `X` to implement `Y`" chain of the
-//! impls that needed the bound; and "required by a bound in `f`" on the callee's bound, the
-//! error pointed at the one argument the bound is of, as rustc's typeck adjusts it.
+//! impls that needed the bound, on a local impl's header with "unsatisfied trait bound
+//! introduced here" on its bound; and the obligation cause's notes (`obligation_cause.rs`:
+//! "required by a bound in `f`" on the callee's bound), the error pointed at the one argument
+//! the bound is of, as rustc's typeck adjusts it.
 //!
 //! Follows rustc's `compiler/rustc_trait_selection/src/error_reporting/traits/
 //! fulfillment_errors.rs` (`report_selection_error`, `get_standard_error_message`,
@@ -15,11 +17,10 @@
 //! arguments), and `compiler/rustc_hir_typeck/src/fn_ctxt/adjust_fulfillment_errors.rs`
 //! (`blame_specific_arg_if_possible`) (MIT or Apache-2.0).
 //!
-//! What the front end does not give yet (requested in `v2/requests/diagnostics.md`): the impl
-//! each "required for" step went through (rustc points at a local impl's header and the bound
-//! that failed), the obligation's cause (rustc's `ObligationCauseCode`, here found again from
-//! the syntax the bound was registered at), whether a span is of a format string's
-//! desugaring, and the ambiguous goals rustc reports as E0283.
+//! What the front end does not give yet (requested in `v2/requests/diagnostics.md` and
+//! `v2/requests/diagnostics-infer2-solver.md`): which bound of an impl a "required for" step
+//! went through (found again by its trait in the impl's syntax), the span of a derive's impl,
+//! and whether a span is of a format string's desugaring.
 //!
 //! Cost: nothing until the solver reports the error. Then O(the call's arguments, the
 //! callee's bounds and the trait's attributes): types compare as interned ids, never printed;
@@ -32,14 +33,17 @@ use hir::{AsAssocItem as _, InFile, LangItem, PathResolution};
 use hir_def::FunctionId;
 use hir_ty::method_resolution::TraitImpls;
 use syntax::{
-    AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, TextRange,
-    ast::{self, HasAttrs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+    NodeOrToken, SyntaxKind, TextRange,
+    view::{
+        self as ast, AstNode as _, AstToken as _, HasArgList as _, HasAttrs as _, HasGenericParams as _,
+        HasName as _, HasTypeBounds as _,
+    },
 };
 
 use crate::{
-    cx::{Cx, def_range},
+    cx::{Cx, def_range_view as def_range},
     lints::code_fact,
-    lower::{Found, Phase},
+    lower::{Found, Phase, obligation_cause},
     model::{Applicability, Diag, MultiSpan, Span},
     print,
 };
@@ -68,14 +72,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
     let main_is_leaf = std::ptr::eq(main, leaf);
     let direct = d.parent_trait_predicates.is_empty() || !main_is_leaf;
 
-    let at = cx.syntax(d.span.map(|it| it.syntax_node_ptr()));
-    let cause = Cause::of(cx, &at, |ty| {
+    let at = cx.syntax_view(d.span.map(|it| it.syntax_node_ptr()));
+    let cause = Cause::of(cx, at, |ty| {
         root_self.as_ref().is_some_and(|want| ty == want || ty.strip_references() == *want)
     });
     let custom = on_unimplemented(cx, main, direct);
+    // clone: on the error path, for an error hir found
     let message = custom.message.clone().unwrap_or_else(|| {
+        // alloc: the error's text, for an error hir found
         format!("the trait bound `{}` is not satisfied", print::predicate(cx, main))
     });
+    // clone: on the error path, for an error hir found
     let mut diag = Diag::error(Some("E0277"), message, cause.span.clone());
 
     let explanation = explanation(cx, leaf);
@@ -86,9 +93,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
     };
     match &custom.label {
         Some(label) => {
+            // clone: on the error path, for an error hir found
             diag.span_label(cause.span.clone(), label.clone());
             let is_param = leaf_self.as_ref().is_some_and(|it| it.as_type_param(cx.db).is_some());
             if !is_param {
+                // clone: on the error path, for an error hir found
                 match ty_span.clone() {
                     Some(at) => diag.span_help(at, explanation),
                     None => diag.help(explanation),
@@ -96,18 +105,22 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
             }
         }
         None if explanation.len() > DIAGNOSTIC_WIDTH || ty_span.is_some() => {
+            // clone: on the error path, for an error hir found
             diag.span_label(cause.span.clone(), "unsatisfied trait bound");
+            // clone: on the error path, for an error hir found
             match ty_span.clone() {
                 Some(at) => diag.span_help(at, explanation),
                 None => diag.help(explanation),
             };
         }
         None => {
+            // clone: on the error path, for an error hir found
             diag.span_label(cause.span.clone(), explanation);
         }
     }
     if !(main_is_leaf && derivable) {
         for note in &custom.notes {
+            // clone: on the error path, for an error hir found
             diag.note(note.clone());
         }
     }
@@ -118,20 +131,19 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
     if is_local_trait(cx, leaf_trait)
         && !has_impls(cx, leaf_trait)
         && !leaf_trait.is_auto(cx.db)
-        && leaf.polarity() == hir::PredicatePolarity::Positive
-        && let Some(src) = cx.sema.source(leaf_trait)
+        && leaf.polarity() == hir::ClausePolarity::Positive
+        && let Some(src) = cx.vsema.source(leaf_trait)
     {
-        let range = src.as_ref().map(|it| def_range(it.syntax()));
+        let range = src.map(|it| def_range(it.syntax()));
         diag.span_help(cx.span(range), "this trait has no implementations, consider adding one");
     }
     note_derived(cx, d, &mut diag);
-    if let Some(callee) = cause.callee {
-        where_clause_note(cx, &mut diag, callee, root_ref.trait_(), root_self.as_ref());
-    }
+    obligation_cause::note(cx, &mut diag, d.cause, Some(root_ref.trait_()), root_self.as_ref());
 
     for pred in std::iter::once(leaf).chain(&d.parent_trait_predicates) {
         let tr = pred.trait_ref();
         if let Some(self_ty) = tr.get_type_argument(0) {
+            // alloc: the error's text, for an error hir found
             let what = format!(
                 "whether `{}` implements `{}`",
                 cx.ty(&self_ty),
@@ -141,14 +153,16 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>) -> Vec<Fou
         }
     }
     code_fact(cx, &mut diag, d.span.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 
 /// rustc's `get_explanation_based_on_obligation`: "the trait `Trait` is not implemented for
 /// `T`".
-fn explanation(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> String {
+fn explanation(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> String {
     let tr = pred.trait_ref();
-    if pred.polarity() == hir::PredicatePolarity::Negative {
+    if pred.polarity() == hir::ClausePolarity::Negative {
+        // alloc: the error's text, for an error hir found
         return format!("the trait bound `{}` is not satisfied", print::predicate(cx, pred));
     }
     let self_ty = tr.get_type_argument(0);
@@ -165,6 +179,7 @@ fn explanation(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> String {
     };
     let unstable = if is_unstable(cx, tr.trait_()) { "nightly-only, unstable " } else { "" };
     let self_text = self_ty.as_ref().map(|it| cx.ty(it)).unwrap_or_default();
+    // alloc: the error's text, for an error hir found
     format!(
         "the {unstable}trait `{}` is not implemented for{desc} `{self_text}`",
         print::trait_path_sugared(cx, pred)
@@ -176,12 +191,8 @@ fn explanation(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> String {
 /// else where the bound was registered.
 pub(super) struct Cause {
     pub(super) span: Span,
-    /// The expression the span is of.
-    pub(super) node: InFile<SyntaxNode>,
     /// The span of the callee, when the error was moved to an argument.
     pub(super) callee_span: Option<Span>,
-    /// The function whose bound it is, when the bound was registered at a call of it.
-    pub(super) callee: Option<hir::Function>,
 }
 
 impl Cause {
@@ -189,46 +200,36 @@ impl Cause {
     /// holds of, when exactly one does.
     pub(super) fn of<'db>(
         cx: &Cx<'_, 'db>,
-        at: &InFile<SyntaxNode>,
+        at: InFile<ast::Node<'db>>,
         is_of: impl Fn(&hir::Type<'db>) -> bool,
     ) -> Cause {
         let plain = || Cause {
-            span: cx.span(at.as_ref().map(|it| it.text_range())),
-            node: at.clone(),
+            span: cx.span(at.map(|it| it.text_range())),
             callee_span: None,
-            callee: None,
         };
-        let (callee_range, callee, args): (TextRange, Option<hir::Function>, Option<ast::ArgList>) =
-            if let Some(path) = ast::PathExpr::cast(at.value.clone())
+        let (callee_range, args): (TextRange, Option<ast::ArgList<'db>>) =
+            if let Some(path) = ast::PathExpr::cast(at.value)
                 && let Some(call) = path.syntax().parent().and_then(ast::CallExpr::cast)
                 && call.expr().is_some_and(|it| it.syntax() == path.syntax())
             {
-                let callee = path.path().and_then(|it| cx.sema.resolve_path(&it)).and_then(|it| {
-                    match it {
-                        PathResolution::Def(hir::ModuleDef::Function(f)) => Some(f),
-                        _ => None,
-                    }
-                });
-                (path.syntax().text_range(), callee, call.arg_list())
-            } else if let Some(call) = ast::MethodCallExpr::cast(at.value.clone()) {
+                (path.syntax().text_range(), call.arg_list())
+            } else if let Some(call) = ast::MethodCallExpr::cast(at.value) {
                 let Some(name) = call.name_ref() else { return plain() };
-                (name.syntax().text_range(), cx.sema.resolve_method_call(&call), call.arg_list())
+                (name.syntax().text_range(), call.arg_list())
             } else {
                 return plain();
             };
         let callee_span = cx.span(at.with_value(callee_range));
         let mut blamed = args
-            .iter()
+            .into_iter()
             .flat_map(|it| it.args())
-            .filter(|arg| cx.sema.type_of_expr(arg).is_some_and(|it| is_of(&it.original)));
+            .filter(|arg| cx.vsema.type_of_expr(*arg).is_some_and(|it| is_of(&it.original)));
         match (blamed.next(), blamed.next()) {
             (Some(arg), None) => Cause {
                 span: cx.span(at.with_value(arg.syntax().text_range())),
-                node: at.with_value(arg.syntax().clone()),
                 callee_span: Some(callee_span),
-                callee,
             },
-            _ => Cause { span: callee_span, node: at.clone(), callee_span: None, callee },
+            _ => Cause { span: callee_span, callee_span: None },
         }
     }
 
@@ -238,26 +239,34 @@ impl Cause {
         if let Some(callee) = &self.callee_span
             && callee != &self.span
         {
+            // clone: on the error path, for an error hir found
             diag.span_label(callee.clone(), "required by a bound introduced by this call");
         }
     }
 }
 
 /// rustc's `ObligationCauseCode::ImplDerived` notes: for each impl that needed the bound, from
-/// the innermost out, "required for `X` to implement `Y`", the steps of a trait already named
-/// counted as "N redundant requirements hidden".
+/// the innermost out, "required for `X` to implement `Y`" (on a local impl's trait and self
+/// type, "unsatisfied trait bound introduced here" on its bound that did not hold), the steps
+/// of a trait already named counted as "N redundant requirements hidden".
 fn note_derived(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>, diag: &mut Diag) {
     let parents = &d.parent_trait_predicates;
-    let required = |pred: &hir::TraitPredicate<'_>| {
+    let required = |pred: &hir::TraitClause<'_>| {
         let tr = pred.trait_ref();
         let self_ty = tr.get_type_argument(0).map(|it| cx.ty(&it)).unwrap_or_default();
+        // alloc: the error's text, for an error hir found
         format!("required for `{self_ty}` to implement `{}`", print::trait_path_sugared(cx, pred))
     };
+    // alloc: the error's parts, for an error hir found
     let mut seen: Vec<hir::Trait> = Vec::new();
     let mut i = 0;
     while i < parents.len() {
         let trait_ = parents[i].trait_ref().trait_();
-        diag.note(required(&parents[i]));
+        let child = if i == 0 { &d.trait_predicate } else { &parents[i - 1] };
+        match d.parent_impls.get(i).copied().flatten().and_then(|it| impl_note(cx, it, child)) {
+            Some(at) => diag.span_note(at, required(&parents[i])),
+            None => diag.note(required(&parents[i])),
+        };
         if !seen.contains(&trait_) {
             seen.push(trait_);
         }
@@ -268,6 +277,7 @@ fn note_derived(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>, diag: &mut Dia
         let count = j - i - 1;
         if count > 0 {
             let s = if count == 1 { "" } else { "s" };
+            // alloc: the error's text, for an error hir found
             diag.note(format!("{count} redundant requirement{s} hidden"));
             diag.note(required(&parents[j - 1]));
         }
@@ -276,6 +286,82 @@ fn note_derived(cx: &Cx<'_, '_>, d: &hir::UnimplementedTrait<'_>, diag: &mut Dia
         }
         i = j;
     }
+}
+
+/// Where rustc puts "required for `X` to implement `Y`" for a local impl: on its trait and self
+/// type, "unsatisfied trait bound introduced here" on the bound of the impl `child` is of
+/// ("implicitly introduced here" on the type parameter for an implicit `Sized`). `None` for an
+/// impl of another crate or of a macro's expansion, which rustc notes without a span.
+fn impl_note(cx: &Cx<'_, '_>, impl_: hir::Impl, child: &hir::TraitClause<'_>) -> Option<MultiSpan> {
+    if impl_.module(cx.db).krate(cx.db) != cx.krate {
+        return None;
+    }
+    let src = cx.vsema.source(impl_)?;
+    if src.file_id.is_macro() {
+        return None;
+    }
+    let item = src.value;
+    let self_ty = item.self_ty()?;
+    let self_span = cx.span(src.with_value(self_ty.syntax().text_range()));
+    // alloc: the error's parts, for an error hir found
+    let mut primary = Vec::with_capacity(2);
+    if let Some(tr) = item.trait_() {
+        primary.push(cx.span(src.with_value(tr.syntax().text_range())));
+    }
+    // clone: on the error path, for an error hir found
+    primary.push(self_span.clone());
+    // alloc: empty, the error's labels, for an error hir found
+    let mut at = MultiSpan { primary, labels: Vec::new() };
+    let trait_ = child.trait_ref().trait_();
+    let mut bounds = generic_bounds(item.generic_param_list(), item.where_clause())
+        .filter(|bound| bound_trait(cx, *bound) == Some(trait_));
+    let label = match (bounds.next(), bounds.next()) {
+        (Some(bound), None) => {
+            Some((cx.span(src.with_value(bound.syntax().text_range())), "unsatisfied trait bound introduced here"))
+        }
+        (None, _) if is_lang(cx, trait_, LangItem::Sized) => {
+            let want = child.trait_ref().self_ty().as_type_param(cx.db).map(|it| it.name(cx.db));
+            item.generic_param_list()
+                .into_iter()
+                .flat_map(|it| it.type_or_const_params())
+                .find_map(|p| match p {
+                    ast::TypeOrConstParam::Type(it)
+                        if !is_maybe_sized(it)
+                            && want.as_ref().is_some_and(|w| it.name().is_some_and(|n| n.text() == w.as_str())) =>
+                    {
+                        it.name()
+                    }
+                    _ => None,
+                })
+                .map(|name| {
+                    (
+                        cx.span(src.with_value(name.syntax().text_range())),
+                        "unsatisfied trait bound implicitly introduced here",
+                    )
+                })
+        }
+        _ => None,
+    };
+    if let Some((span, label)) = label
+        && !overlaps(&span, &self_span)
+    {
+        // alloc: the error's text, for an error hir found
+        at.labels.push((span, label.to_owned()));
+    }
+    Some(at)
+}
+
+/// The bounds written on an item's type parameters and in its where clause, in order.
+fn generic_bounds<'t>(
+    params: Option<ast::GenericParamList<'t>>,
+    wheres: Option<ast::WhereClause<'t>>,
+) -> impl Iterator<Item = ast::TypeBound<'t>> {
+    let params = params.into_iter().flat_map(|it| it.type_or_const_params()).filter_map(|param| match param {
+        ast::TypeOrConstParam::Type(param) => param.type_bound_list(),
+        ast::TypeOrConstParam::Const(_) => None,
+    });
+    let wheres = wheres.into_iter().flat_map(|it| it.predicates()).filter_map(|pred| pred.type_bound_list());
+    params.chain(wheres).flat_map(|list| list.bounds())
 }
 
 /// rustc's note on the bound of `callee` that did not hold: "required by a bound in `f`", on
@@ -290,9 +376,9 @@ pub(super) fn where_clause_note<'db>(
     trait_: hir::Trait,
     self_ty: Option<&hir::Type<'db>>,
 ) {
-    let Some(src) = cx.sema.source(callee) else { return };
-    let item = &src.value;
-    let mut bounds = bounds_of(item).filter(|bound| bound_trait(cx, bound) == Some(trait_));
+    let Some(src) = cx.vsema.source(callee) else { return };
+    let item = src.value;
+    let mut bounds = bounds_of(item).filter(|bound| bound_trait(cx, *bound) == Some(trait_));
     let only = bounds.next();
     if only.is_some() && bounds.next().is_some() {
         return;
@@ -302,13 +388,15 @@ pub(super) fn where_clause_note<'db>(
     let (at, descr, label) = match only {
         Some(bound) => (
             cx.span(src.with_value(bound.syntax().text_range())),
+            // alloc: the error's text, for an error hir found
             format!("required by a bound in `{name}`"),
+            // alloc: the error's text, for an error hir found
             format!("required by this bound in `{name}`"),
         ),
         None if is_lang(cx, trait_, LangItem::Sized) => {
             let mut params = item.generic_param_list().into_iter().flat_map(|it| {
                 it.type_or_const_params().filter_map(|p| match p {
-                    ast::TypeOrConstParam::Type(it) if !is_maybe_sized(&it) => Some(it),
+                    ast::TypeOrConstParam::Type(it) if !is_maybe_sized(it) => Some(it),
                     _ => None,
                 })
             });
@@ -326,12 +414,15 @@ pub(super) fn where_clause_note<'db>(
             let range = param.name().map_or(param.syntax().text_range(), |it| it.syntax().text_range());
             (
                 cx.span(src.with_value(range)),
+                // alloc: the error's text, for an error hir found
                 format!("required by an implicit `Sized` bound in `{name}`"),
+                // alloc: the error's text, for an error hir found
                 format!("required by the implicit `Sized` requirement on this type parameter in `{name}`"),
             )
         }
         _ => return,
     };
+    // clone: on the error path, for an error hir found
     let mut span = MultiSpan::of(at.clone());
     if let Some(ident) = ident
         && !overlaps(&ident, &at)
@@ -344,18 +435,20 @@ pub(super) fn where_clause_note<'db>(
         } else {
             "function"
         };
+        // alloc: the error's text, for an error hir found
         span.labels.push((ident, format!("required by a bound in this {descr}")));
     }
     span.labels.push((at, label));
     diag.span_note(span, descr);
     if let Ok(id) = FunctionId::try_from(callee) {
+        // alloc: the error's text, for an error hir found
         diag.fact(Fact::Signature(cx.key(ItemId::Function(id))), format!("the signature of `{name}`"));
     }
 }
 
 /// The bounds written on a function's type parameters, in its parameters' `impl Trait` types
 /// and in its where clause, in order.
-fn bounds_of(item: &ast::Fn) -> impl Iterator<Item = ast::TypeBound> {
+fn bounds_of<'t>(item: ast::Fn<'t>) -> impl Iterator<Item = ast::TypeBound<'t>> {
     let params = item
         .generic_param_list()
         .into_iter()
@@ -380,16 +473,16 @@ fn bounds_of(item: &ast::Fn) -> impl Iterator<Item = ast::TypeBound> {
 }
 
 /// The trait a bound names.
-fn bound_trait(cx: &Cx<'_, '_>, bound: &ast::TypeBound) -> Option<hir::Trait> {
+fn bound_trait<'db>(cx: &Cx<'_, 'db>, bound: ast::TypeBound<'db>) -> Option<hir::Trait> {
     let ast::Type::PathType(ty) = bound.ty()? else { return None };
-    match cx.sema.resolve_path(&ty.path()?)? {
+    match cx.vsema.resolve_path(ty.path()?)? {
         PathResolution::Def(hir::ModuleDef::Trait(it)) => Some(it),
         _ => None,
     }
 }
 
 /// Whether a type parameter is written `?Sized`.
-fn is_maybe_sized(param: &ast::TypeParam) -> bool {
+fn is_maybe_sized(param: ast::TypeParam<'_>) -> bool {
     param.type_bound_list().is_some_and(|list| {
         list.bounds().any(|it| it.question_mark_token().is_some())
     })
@@ -429,10 +522,10 @@ enum Meta {
 }
 
 /// rustc's `OnUnimplementedDirective::evaluate` of the attributes of the trait of `pred`.
-fn on_unimplemented(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, direct: bool) -> Custom {
+fn on_unimplemented(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>, direct: bool) -> Custom {
     let tr = pred.trait_ref();
     let trait_ = tr.trait_();
-    let Some(src) = cx.sema.source(trait_) else { return Custom::default() };
+    let Some(src) = cx.vsema.source(trait_) else { return Custom::default() };
     let mut args = None;
     let mut custom = Custom::default();
     for attr in src.value.attrs() {
@@ -449,11 +542,14 @@ fn on_unimplemented(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, direct: boo
         // rustc walks the directive, then its `on(..)`s from the last to the first, each that
         // holds overriding the message and label before it and adding its notes: the first
         // `on` that holds wins, the directive's own fields are the default.
+        // alloc: the error's parts, for an error hir found
         let mut commands: Vec<(Option<&Meta>, Vec<&Meta>)> = vec![(None, Vec::new())];
         for meta in &metas {
             match meta {
                 Meta::List(name, inner) if name == "on" && is_rustc => {
+                    // alloc: the error's parts, for an error hir found
                     let (cond, fields) = inner.split_first().map_or((None, Vec::new()), |(c, f)| {
+                        // alloc: the error's parts, for an error hir found
                         (Some(c), f.iter().collect())
                     });
                     commands.push((cond, fields));
@@ -487,7 +583,8 @@ fn on_unimplemented(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, direct: boo
 }
 
 /// The parts of an attribute's token tree, `(a, b = "c", d(e))`.
-fn parse_metas(tt: &SyntaxNode) -> Vec<Meta> {
+fn parse_metas(tt: ast::Node<'_>) -> Vec<Meta> {
+    // alloc: the error's parts, for an error hir found
     let mut out = Vec::new();
     let mut name: Option<String> = None;
     let mut eq = false;
@@ -498,7 +595,7 @@ fn parse_metas(tt: &SyntaxNode) -> Vec<Meta> {
         match item {
             NodeOrToken::Node(node) if node.kind() == SyntaxKind::TOKEN_TREE => {
                 if let Some(name) = name.take() {
-                    out.push(Meta::List(name, parse_metas(&node)));
+                    out.push(Meta::List(name, parse_metas(node)));
                 }
                 eq = false;
             }
@@ -513,7 +610,7 @@ fn parse_metas(tt: &SyntaxNode) -> Vec<Meta> {
                 }
                 SyntaxKind::EQ => eq = true,
                 SyntaxKind::STRING => {
-                    let value = ast::String::cast(token.clone())
+                    let value = ast::String::cast(token)
                         .and_then(|it| it.value().ok().map(|it| it.into_owned()))
                         .unwrap_or_default();
                     if let (Some(n), true) = (name.take(), eq) {
@@ -522,6 +619,7 @@ fn parse_metas(tt: &SyntaxNode) -> Vec<Meta> {
                     eq = false;
                 }
                 _ => {
+                    // alloc: the error's text, for an error hir found
                     let text = token.text().to_owned();
                     name = Some(match name.take() {
                         Some(prefix) => prefix + &text,
@@ -554,10 +652,11 @@ struct Args {
 }
 
 impl Args {
-    fn of(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> Args {
+    fn of(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> Args {
         let tr = pred.trait_ref();
         let trait_ = tr.trait_();
         let self_ty = tr.get_type_argument(0);
+        // alloc: the error's parts, for an error hir found
         let mut self_matches = Vec::new();
         let mut crate_local = false;
         if let Some(ty) = &self_ty {
@@ -565,16 +664,22 @@ impl Args {
             if let Some(adt) = ty.as_adt() {
                 crate_local = is_local_adt(cx, adt);
                 if let Some(path) = full_path(cx, adt) {
+                    // alloc: the error's parts, for an error hir found
                     let args: Vec<String> = ty.type_arguments().map(|it| cx.ty(&it)).collect();
                     let params: Vec<String> = hir::GenericDef::Adt(adt)
                         .type_or_const_params(cx.db)
                         .into_iter()
+                        // alloc: the error's text, for an error hir found
                         .map(|it| it.name(cx.db).as_str().to_owned())
+                        // alloc: the error's parts, for an error hir found
                         .collect();
                     if args.is_empty() {
+                        // clone: on the error path, for an error hir found
                         self_matches.push(path.clone());
                     } else {
+                        // alloc: the error's text, for an error hir found
                         self_matches.push(format!("{path}<{}>", args.join(", ")));
+                        // alloc: the error's text, for an error hir found
                         self_matches.push(format!("{path}<{}>", params.join(", ")));
                     }
                 }
@@ -584,17 +689,22 @@ impl Args {
                         hir::Adt::Enum(_) => "{enum}",
                         hir::Adt::Union(_) => "{union}",
                     }
+                    // alloc: the error's text, for an error hir found
                     .to_owned(),
                 );
             } else if ty.is_int_or_uint() {
+                // alloc: the error's text, for an error hir found
                 self_matches.push("{integral}".to_owned());
             } else if ty.is_float() {
+                // alloc: the error's text, for an error hir found
                 self_matches.push("{float}".to_owned());
             }
         }
+        // alloc: the error's parts, for an error hir found
         let mut generics = Vec::new();
         let lifetimes = hir::GenericDef::Trait(trait_).lifetime_params(cx.db).len();
         for (i, param) in hir::GenericDef::Trait(trait_).type_or_const_params(cx.db).into_iter().enumerate() {
+            // alloc: the error's text, for an error hir found
             let name = param.name(cx.db).as_str().to_owned();
             if name == "Self" {
                 continue;
@@ -609,6 +719,7 @@ impl Args {
         Args {
             self_ty: self_ty.as_ref().map(|it| cx.ty(it)).unwrap_or_default(),
             self_matches,
+            // alloc: the error's text, for an error hir found
             this: trait_.name(cx.db).as_str().to_owned(),
             trait_path: print::trait_path(cx, &tr),
             generics,
@@ -688,6 +799,7 @@ impl Args {
 fn full_path(cx: &Cx<'_, '_>, adt: hir::Adt) -> Option<String> {
     let krate = adt.module(cx.db).krate(cx.db).display_name(cx.db)?;
     let path = hir::ModuleDef::Adt(adt).canonical_path(cx.db, cx.edition)?;
+    // alloc: the error's text, for an error hir found
     Some(format!("{krate}::{path}"))
 }
 
@@ -710,14 +822,14 @@ fn derivable_name(cx: &Cx<'_, '_>, trait_: hir::Trait) -> Option<&'static str> {
     {
         return Some(name);
     }
-    let src = cx.sema.source(trait_)?;
+    let src = cx.vsema.source(trait_)?;
     let named = src.value.attrs().find_map(|attr| match attr.meta()? {
         ast::Meta::KeyValueMeta(meta)
             if meta.path()?.syntax().text() == "rustc_diagnostic_item" =>
         {
             let ast::Expr::Literal(lit) = meta.expr()? else { return None };
             let ast::LiteralKind::String(s) = lit.kind() else { return None };
-            Some(s.value().ok()?.into_owned())
+            s.value().ok()
         }
         _ => None,
     })?;
@@ -726,8 +838,8 @@ fn derivable_name(cx: &Cx<'_, '_>, trait_: hir::Trait) -> Option<&'static str> {
 
 /// rustc's `can_suggest_derive`: the self type is a local ADT, the trait one it can derive,
 /// and every field implements it.
-fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> bool {
-    if pred.polarity() == hir::PredicatePolarity::Negative {
+fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>) -> bool {
+    if pred.polarity() == hir::ClausePolarity::Negative {
         return false;
     }
     let tr = pred.trait_ref();
@@ -749,6 +861,7 @@ fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> bool {
     if !derivable {
         return false;
     }
+    // alloc: the error's parts, for an error hir found
     let args: Vec<hir::Type<'_>> = self_ty.type_arguments().collect();
     let has_rhs = matches!(name, "PartialEq" | "PartialOrd");
     let holds = |field: hir::Field| {
@@ -757,16 +870,14 @@ fn can_suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>) -> bool {
         ty.impls_trait(cx.db, trait_, rhs)
     };
     match adt {
-        hir::Adt::Struct(it) => it.fields(cx.db).into_iter().all(holds),
-        hir::Adt::Union(it) => it.fields(cx.db).into_iter().all(holds),
-        hir::Adt::Enum(it) => {
-            it.variants(cx.db).into_iter().all(|v| v.fields(cx.db).into_iter().all(holds))
-        }
+        hir::Adt::Struct(it) => it.fields_iter(cx.db).all(holds),
+        hir::Adt::Union(it) => it.fields_iter(cx.db).all(holds),
+        hir::Adt::Enum(it) => it.variants_iter(cx.db).all(|v| v.fields_iter(cx.db).all(holds)),
     }
 }
 
 /// rustc's `suggest_derive`: "consider annotating `S` with `#[derive(Trait)]`".
-fn suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, diag: &mut Diag) {
+fn suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitClause<'_>, diag: &mut Diag) {
     let tr = pred.trait_ref();
     let Some(name) = derivable_name(cx, tr.trait_()) else { return };
     let Some(self_ty) = tr.get_type_argument(0) else { return };
@@ -774,7 +885,9 @@ fn suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, diag: &mut Di
     let Some(at) = adt_def_span(cx, adt) else { return };
     diag.suggestion_verbose(
         at.shrink_to_lo(),
+        // alloc: the error's text, for an error hir found
         format!("consider annotating `{}` with `#[derive({name})]`", cx.ty(&self_ty)),
+        // alloc: the error's text, for an error hir found
         format!("#[derive({name})]\n"),
         Applicability::MaybeIncorrect,
     );
@@ -782,8 +895,8 @@ fn suggest_derive(cx: &Cx<'_, '_>, pred: &hir::TraitPredicate<'_>, diag: &mut Di
 
 /// The span rustc's `def_span` gives an ADT: its header.
 fn adt_def_span(cx: &Cx<'_, '_>, adt: hir::Adt) -> Option<Span> {
-    let src = cx.sema.source(adt)?;
-    Some(cx.span(src.as_ref().map(|it| def_range(it.syntax()))))
+    let src = cx.vsema.source(adt)?;
+    Some(cx.span(src.map(|it| def_range(it.syntax()))))
 }
 
 fn is_local_adt(cx: &Cx<'_, '_>, adt: hir::Adt) -> bool {
@@ -817,6 +930,6 @@ pub(super) fn is_lang(cx: &Cx<'_, '_>, trait_: hir::Trait, item: LangItem) -> bo
 
 /// Whether the trait is `#[unstable]`: rustc then calls it "nightly-only, unstable".
 fn is_unstable(cx: &Cx<'_, '_>, trait_: hir::Trait) -> bool {
-    let Some(src) = cx.sema.source(trait_) else { return false };
+    let Some(src) = cx.vsema.source(trait_) else { return false };
     src.value.attrs().any(|attr| attr.path().is_some_and(|it| it.syntax().text() == "unstable"))
 }

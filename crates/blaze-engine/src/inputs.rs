@@ -295,7 +295,7 @@ impl Scripts {
             config.extra_env.insert(name.clone(), value);
         }
         let said = crate::events::within(crate::events::Step::BuildScripts, None, || {
-            self.workspace.run_build_scripts(&config, &|_| {})
+            self.workspace.run_build_scripts(&config)
         })?;
         if let Some(error) = said.error() {
             anyhow::bail!("a build script failed: {}", error.trim().replace('\n', " "));

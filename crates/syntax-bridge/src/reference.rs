@@ -9,33 +9,30 @@ use span::{Edition, SpanMap, SyntaxContext};
 use syntax::{Parse, SyntaxKind, SyntaxKind::*, SyntaxNode, T};
 
 /// [`crate::to_parser_input`] as it was.
-pub fn to_parser_input(
+pub fn to_parser_input<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     buffer: tt::TokenTreesView<'_>,
-    // dyn: a reference for tests, never on a build's path.
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
 ) -> parser::Input {
     convert(buffer, span_to_edition, false)
 }
 
 /// [`crate::to_matcher_input`] as it was.
-pub fn to_matcher_input(
+pub fn to_matcher_input<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     buffer: tt::TokenTreesView<'_>,
-    // dyn: a reference for tests, never on a build's path.
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
 ) -> parser::Input {
     convert(buffer, span_to_edition, true)
 }
 
 /// [`crate::token_tree_to_syntax_node`] parsing the input [`to_parser_input`] makes.
-pub fn token_tree_to_syntax_node(
+pub fn token_tree_to_syntax_node<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     tt: &tt::TopSubtree,
     entry_point: TopEntryPoint,
-    // dyn: a reference for tests, never on a build's path.
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
 ) -> (Parse<SyntaxNode>, SpanMap) {
     let buffer = tt.view().strip_invisible();
     let parser_input = to_parser_input(buffer, span_to_edition);
-    crate::parse_tokens(buffer, entry_point, parser_input.tokens())
+    crate::parse_tokens(buffer, entry_point, parser_input.tokens(), std::alloc::Global)
 }
 
 /// Whether two inputs are the same tokens, each the same to the parser.
@@ -43,10 +40,9 @@ pub fn same_input(a: &parser::Input, b: &parser::Input) -> bool {
     a.len() == b.len() && (0..a.len()).all(|i| a.token(i) == b.token(i))
 }
 
-fn convert(
+fn convert<F: FnMut(SyntaxContext) -> Edition + ?Sized>(
     buffer: tt::TokenTreesView<'_>,
-    // dyn: a reference for tests, never on a build's path.
-    span_to_edition: &mut dyn FnMut(SyntaxContext) -> Edition,
+    span_to_edition: &mut F,
     fragments: bool,
 ) -> parser::Input {
     let mut res = parser::Input::with_capacity(buffer.len());

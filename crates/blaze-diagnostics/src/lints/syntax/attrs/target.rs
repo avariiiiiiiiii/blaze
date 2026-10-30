@@ -6,7 +6,10 @@
 //! `compiler/rustc_ast_lowering` lowers the attributes of each node (MIT or Apache-2.0).
 
 use hir::{HirFileId, InFile};
-use syntax::{AstNode, SyntaxKind, SyntaxNode, ast};
+use syntax::{
+    SyntaxKind,
+    view::{self as ast, AstNode},
+};
 
 use crate::cx::Cx;
 
@@ -192,7 +195,7 @@ impl Target {
     /// a node whose attributes are another's (the lists inner attributes are written in, a
     /// function's body) or that rustc gives no attributes. `crate_root` is the crate's root
     /// file.
-    pub(crate) fn of(cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>, crate_root: HirFileId) -> Option<Target> {
+    pub(crate) fn of(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, crate_root: HirFileId) -> Option<Target> {
         let syntax = node.value;
         let target = match syntax.kind() {
             SyntaxKind::SOURCE_FILE => match node.file_id == crate_root {
@@ -211,7 +214,7 @@ impl Target {
                 _ => Target::Const,
             },
             SyntaxKind::FN => {
-                let body = ast::Fn::cast(syntax.clone())?.body().is_some();
+                let body = ast::Fn::cast(syntax)?.body().is_some();
                 match container(cx, node) {
                     Container::Extern => Target::ForeignFn,
                     Container::Trait => Target::Method(MethodKind::Trait { body }),
@@ -231,23 +234,23 @@ impl Target {
             SyntaxKind::STRUCT => Target::Struct,
             SyntaxKind::UNION => Target::Union,
             SyntaxKind::RECORD_FIELD | SyntaxKind::TUPLE_FIELD => Target::Field,
-            SyntaxKind::TRAIT => match ast::Trait::cast(syntax.clone())?.eq_token() {
+            SyntaxKind::TRAIT => match ast::Trait::cast(syntax)?.eq_token() {
                 Some(_) => Target::TraitAlias,
                 None => Target::Trait,
             },
-            SyntaxKind::IMPL => Target::Impl { of_trait: ast::Impl::cast(syntax.clone())?.trait_().is_some() },
+            SyntaxKind::IMPL => Target::Impl { of_trait: ast::Impl::cast(syntax)?.trait_().is_some() },
             SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => Target::MacroDef,
             SyntaxKind::MACRO_CALL => Target::MacroCall,
             SyntaxKind::TYPE_PARAM => Target::GenericParam {
                 kind: GenericParamKind::Type,
-                has_default: ast::TypeParam::cast(syntax.clone())?.default_type().is_some(),
+                has_default: ast::TypeParam::cast(syntax)?.default_type().is_some(),
             },
             SyntaxKind::LIFETIME_PARAM => {
                 Target::GenericParam { kind: GenericParamKind::Lifetime, has_default: false }
             }
             SyntaxKind::CONST_PARAM => Target::GenericParam {
                 kind: GenericParamKind::Const,
-                has_default: ast::ConstParam::cast(syntax.clone())?.default_val().is_some(),
+                has_default: ast::ConstParam::cast(syntax)?.default_val().is_some(),
             },
             SyntaxKind::PARAM | SyntaxKind::SELF_PARAM => Target::Param,
             SyntaxKind::RECORD_PAT_FIELD => Target::PatField,
@@ -256,7 +259,7 @@ impl Target {
             SyntaxKind::MATCH_ARM => Target::Arm,
             SyntaxKind::LET_STMT => Target::Statement,
             SyntaxKind::BLOCK_EXPR if is_fn_body(syntax) => return None,
-            _ => from_expr(&ast::Expr::cast(syntax.clone())?),
+            _ => from_expr(ast::Expr::cast(syntax)?),
         };
         Some(target)
     }
@@ -264,13 +267,13 @@ impl Target {
 
 /// rustc's `Target::from_expr`: a closure or an `async`/`gen` block is a closure, a loop of
 /// each kind its own, the rest an expression; through parentheses.
-fn from_expr(expr: &ast::Expr) -> Target {
+fn from_expr(expr: ast::Expr<'_>) -> Target {
     match expr {
         ast::Expr::ClosureExpr(_) => Target::Closure,
         ast::Expr::BlockExpr(block) if block.async_token().is_some() || block.gen_token().is_some() => {
             Target::Closure
         }
-        ast::Expr::ParenExpr(paren) => paren.expr().map_or(Target::Expression, |it| from_expr(&it)),
+        ast::Expr::ParenExpr(paren) => paren.expr().map_or(Target::Expression, from_expr),
         ast::Expr::ForExpr(_) => Target::ForLoop,
         ast::Expr::LoopExpr(_) => Target::Loop,
         ast::Expr::WhileExpr(_) => Target::While,
@@ -280,7 +283,7 @@ fn from_expr(expr: &ast::Expr) -> Target {
 }
 
 /// Whether `node` is the body of a function: its inner attributes are the function's.
-fn is_fn_body(node: &SyntaxNode) -> bool {
+fn is_fn_body(node: ast::Node<'_>) -> bool {
     node.parent().is_some_and(|it| it.kind() == SyntaxKind::FN)
 }
 
@@ -294,7 +297,7 @@ enum Container {
 
 /// What an item is written in: a trait, an impl, an `extern` block or none of them; for an
 /// item a macro made, what the macro was called in.
-fn container(cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>) -> Container {
+fn container(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> Container {
     let Some(parent) = node.value.parent() else { return Container::Other };
     match parent.kind() {
         SyntaxKind::ASSOC_ITEM_LIST => match parent.parent() {
@@ -308,8 +311,7 @@ fn container(cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>) -> Container {
         SyntaxKind::EXTERN_ITEM_LIST => Container::Extern,
         _ if parent.parent().is_none() => match node.file_id.macro_file() {
             Some(call) => {
-                let call = call.loc(cx.db).to_node(cx.db);
-                container(cx, call.as_ref())
+                container(cx, call.loc(cx.db).to_node_view(cx.db))
             }
             None => Container::Other,
         },

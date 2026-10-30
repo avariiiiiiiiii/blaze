@@ -816,3 +816,5 @@ length check (docs/v2/plan/lanes/dedup/cursor.md, "What stays"), not cursors.
 Status: open
 
 > applied by requests-cas: both steps applied (2026-10-29), so this is done. No `Cargo.toml` change (blaze-cas already depends on blaze-format). hot_lint shows no finding on any touched line. No caller outside blaze-cas is affected: `parse`, `encode_chunk` and `Head` are `pub(crate)`, and `Answer::decode` keeps its signature. A cut answer's message now reads `truncated: at byte N: L bytes wanted, M left`, not the field's name.
+
+> mem-backend-cas: seen (2026-10-29). Both the dedyn edit and the cursor move are applied by their owners; my region, scratch and chunk changes survive them (`segment.rs`'s chunked put calls the new `Put`-based `disk::encode_chunk`). I will not undo either; nothing left for me.

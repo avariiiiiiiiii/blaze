@@ -23,6 +23,7 @@
 //! unchanged. The key has no absolute path in it ([`key`]), so a checkout at another path, or
 //! another machine through the global cache ([`ReadThrough`]), finds the same image.
 
+mod filed;
 mod image;
 mod key;
 mod reads;
@@ -36,7 +37,9 @@ use std::sync::Arc;
 use base_db::{Crate, Db};
 use rustc_hash::FxHashMap;
 
+pub use crate::deps::signatures::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableIds, body_key};
 pub use crate::deps::{
+    filed::{checked_reads, file_by_reads, find_by_reads},
     image::{Held, IMAGE_SCHEMA, ImageBuf, ImageError, ImageRef, Part, PartBytes, write_image},
     key::{KEY_DOMAIN, PRODUCER, eligible, keys},
     reads::{READS_DOMAIN, Reads, SLOTS},
@@ -48,6 +51,8 @@ pub use crate::nameres::frozen::Mode;
 /// key it is filed under, where its parts are, and what is done with it.
 #[derive(Clone)]
 pub struct Image {
+    /// The crate's key ([`keys`]), which a later [`serve`] compares to keep the image.
+    base: base_db::ContentId,
     key: base_db::ContentId,
     bytes: ImageBuf,
     parts: [std::ops::Range<usize>; Part::ALL.len()],
@@ -79,7 +84,8 @@ impl Image {
 }
 
 /// Images compare by their key: the store gives the bytes of a key only after checking their
-/// content hash, so equal keys are equal bytes.
+/// content hash, so equal keys are equal bytes. The crate's key is one of what they were filed
+/// by, so equal filed keys are equal crate keys.
 impl PartialEq for Image {
     fn eq(&self, other: &Image) -> bool {
         self.key == other.key && self.mode == other.mode
@@ -112,14 +118,28 @@ pub struct DepImages {
     pub images: Arc<FxHashMap<Crate, Image>>,
 }
 
+/// The image `krate` is read from, if it is: what every reader of one crate's image goes
+/// through, so a [`serve`] that leaves the crate's image as it was re-runs none of its queries.
+#[salsa::tracked(returns(ref))]
+pub fn image_of(db: &Db, krate: Crate) -> Option<Image> {
+    // clone: two buffer handles and a few words, once per crate per serve that changes the set
+    DepImages::try_get(db)?.images(db).get(&krate).cloned()
+}
+
 /// The image `krate` is read from, if it is.
 pub(crate) fn image(db: &Db, krate: Crate) -> Option<ImageRef<'_>> {
-    DepImages::try_get(db)?.images(db).get(&krate).map(Image::view)
+    image_of(db, krate).as_ref().map(Image::view)
 }
 
 /// What is done with the image of `krate`, if it has one: [`Mode::Serve`] reads it in place of
 /// computing, [`Mode::Check`] computes as well and records a difference, [`Mode::Verify`]
 /// writes what was read and records a difference from the bytes.
 pub(crate) fn mode(db: &Db, krate: Crate) -> Option<Mode> {
-    DepImages::try_get(db)?.images(db).get(&krate).map(Image::mode)
+    image_of(db, krate).as_ref().map(Image::mode)
+}
+
+/// The stable key of `id`, a `const` item of a crate's modules ([`signatures`]): the same in
+/// every process and checkout. `None` for a constant in a block.
+pub fn const_key(db: &Db, id: crate::ConstId) -> Option<base_db::ContentId> {
+    signatures::const_key(db, id)
 }

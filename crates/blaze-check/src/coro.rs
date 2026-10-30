@@ -18,7 +18,9 @@ use std::{
     ptr,
 };
 
+// dyn: a modeled thread's body, any closure the test spawns, boxed once per spawn.
 pub(crate) type Job = Box<dyn FnOnce()>;
+// dyn: a panic's payload, as `catch_unwind` gives it.
 pub(crate) type Panic = Box<dyn Any + Send>;
 
 /// How a coroutine's run ended.

@@ -21,6 +21,7 @@ use std::{
 
 use blaze_format::cursor::Put;
 use blaze_ids::ContentId;
+use blaze_mem::{Frame, Tag, frame, scratch};
 use rustc_hash::FxHashMap;
 use salsa::{Durability, Setter};
 use smallvec::SmallVec;
@@ -28,8 +29,8 @@ use triomphe::Arc;
 use vfs::{AbsPath, AbsPathBuf, FileId, VfsPath};
 
 use crate::{
-    Crate, Db, FileSourceRootInput, FileText, IncludedFile, InputId, SourceRoot, SourceRootId,
-    SourceRootInput, content,
+    Crate, Db, FileSourceRootInput, FileText, IncludedFile, InputId, ReadError, SourceRoot,
+    SourceRootId, SourceRootInput, content,
     named::Named,
     reparse::Reparse,
     table::{Column, Log, Table, hash_of},
@@ -45,7 +46,7 @@ pub struct Files {
     /// Each file's text, while it has one. A file whose bytes are not UTF-8 has none here; its
     /// input waits in [`Writer::parked`].
     text: Column<FileText>,
-    file_source_roots: Column<FileSourceRootInput>,
+    pub(crate) file_source_roots: Column<FileSourceRootInput>,
     source_roots: Column<SourceRootInput>,
     /// What only the setters read and write. Every setter runs on `&mut` of the database and
     /// no query takes this lock, so no query waits on it. A setter holds it across the salsa
@@ -100,8 +101,13 @@ pub(crate) struct Writer {
     pub(crate) by_path: FxHashMap<VfsPath, FileId>,
     /// The blaze-vfs content ID each file was last set from by [`Files::set_view_root`].
     pub(crate) view_ids: ByFile<ContentId>,
-    /// Where [`Files::set_view_root`] starts looking for an unused file ID.
+    /// Where [`Files::unused_file_id`] starts looking for an unused file ID.
     pub(crate) next_file: u32,
+    /// The crate whose crate attribute each file holds ([`crate::crate_attrs`]).
+    pub(crate) crate_attrs: ByFile<Crate>,
+    /// Files of crate attributes taken out, with no text: the next attribute's file is one of
+    /// these.
+    pub(crate) free_crate_attrs: Vec<FileId>,
     /// The index of each view base's paths that [`Files::set_view_root`] keeps.
     pub(crate) views: FxHashMap<AbsPathBuf, ViewIndex>,
     /// `by_path` as queries read it, across source roots ([`crate::named`]).
@@ -189,13 +195,13 @@ impl Default for Files {
             file_source_roots: Column::new(),
             source_roots: Column::new(),
             writer: Mutex::default(),
-            included: Table::new(),
-            included_by: Table::new(),
-            included_sources: Table::new(),
-            sources_included_by: Table::new(),
-            env_read: Table::new(),
-            env_unset: Table::new(),
-            views: Log::new(),
+            included: Table::new(1 << 22),
+            included_by: Table::new(1 << 22),
+            included_sources: Table::new(1 << 22),
+            sources_included_by: Table::new(1 << 22),
+            env_read: Table::new(1 << 22),
+            env_unset: Table::new(1 << 22),
+            views: Log::new(1 << 16),
             view: AtomicU32::new(0),
         }
     }
@@ -250,17 +256,19 @@ impl Files {
         module: Option<&'static str>,
         durability: Durability,
     ) {
-        let mut writer = self.lock();
-        let input = self.file_text(file_id);
-        if input.appended_root_module(&*db) == module {
-            return;
-        }
-        let content = FileText::content_of(input.text(&*db), module);
-        input.set_appended_root_module_field(db).with_durability(durability).to(module);
-        input.set_content_field(db).with_durability(durability).to(InputId(content));
-        let mut changed = Roots::new();
-        index_file(&mut writer, file_id, content, &mut changed);
-        self.write_root_contents(&mut writer, db, &changed);
+        frame::task(Tag::Parse, |frame| {
+            let mut writer = self.lock();
+            let input = self.file_text(file_id);
+            if input.appended_root_module(&*db) == module {
+                return;
+            }
+            let content = FileText::content_of(input.text(&*db), module);
+            input.set_appended_root_module_field(db).with_durability(durability).to(module);
+            input.set_content_field(db).with_durability(durability).to(InputId(content));
+            let mut changed = Roots::new();
+            index_file(&mut writer, file_id, content, &mut changed);
+            self.write_root_contents(&mut writer, db, &changed, frame);
+        })
     }
 
     /// Sets a file's text from outside a view: what it was set from by a view is forgotten.
@@ -271,16 +279,20 @@ impl Files {
         text: &str,
         durability: Option<Durability>,
     ) {
-        let mut writer = self.lock();
-        writer.view_ids.remove(file_id);
-        let appended = self.input_of(&writer, file_id).and_then(|it| it.appended_root_module(&*db));
-        let file = ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes());
-        let content = FileText::content_of_file(file, appended);
-        let text = syntax::Text::from(text);
-        self.write_text(&mut writer, db, file_id, Some((text, file, content)), durability);
-        let mut changed = Roots::new();
-        index_file(&mut writer, file_id, content, &mut changed);
-        self.write_root_contents(&mut writer, db, &changed);
+        frame::task(Tag::Parse, |frame| {
+            let mut writer = self.lock();
+            self.refuse_crate_attr(&writer, file_id);
+            writer.view_ids.remove(file_id);
+            let appended =
+                self.input_of(&writer, file_id).and_then(|it| it.appended_root_module(&*db));
+            let file = ContentId::of(blaze_vfs::FILE_DOMAIN, text.as_bytes());
+            let content = FileText::content_of_file(file, appended);
+            let text = syntax::Text::from(text);
+            self.write_text(&mut writer, db, file_id, Some((text, file, content)), durability);
+            let mut changed = Roots::new();
+            index_file(&mut writer, file_id, content, &mut changed);
+            self.write_root_contents(&mut writer, db, &changed, frame);
+        })
     }
 
     /// The text input of `file` while it has text.
@@ -361,8 +373,9 @@ impl Files {
         writer: &mut Writer,
         db: &mut Db,
         roots: &[SourceRootId],
+        frame: &Frame,
     ) {
-        RootContent::refresh(&mut writer.root_contents, roots);
+        RootContent::refresh(&mut writer.root_contents, roots, frame);
         for &root in roots {
             let Some(index) = writer.root_contents.get(&root) else { continue };
             let Some(input) = self.source_roots.get(root.0) else { continue };
@@ -384,6 +397,7 @@ impl Files {
         db: &Db,
         id: SourceRootId,
         root: &SourceRoot,
+        frame: &Frame,
     ) -> RootContent {
         let old = writer.root_contents.remove(&id);
         if let Some(old) = &old {
@@ -393,7 +407,7 @@ impl Files {
                 }
             }
         }
-        let mut files = Vec::with_capacity(root.len());
+        let mut files = Vec::with_capacity_in(root.len(), frame);
         for file in root.iter() {
             let Some(path) = root.path_for_file(&file) else { continue };
             // A path two files were given is the last one's.
@@ -407,7 +421,7 @@ impl Files {
             }
             files.push((file, content::path_key(path), self.entry_content(db, file)));
         }
-        RootContent::new(root.is_library, files, old.as_ref())
+        RootContent::new(root.is_library, files, old.as_ref(), frame)
     }
 
     /// Has the files under `base` read from where they are under `over` from now on, but for
@@ -459,9 +473,9 @@ impl Files {
         let at = match self.included.find(hash, |it| it.path.as_path() == path) {
             Some(at) => at,
             None => {
-                let bytes = self.read_included(path);
-                let content = InputId(IncludedFile::content_of(bytes.as_deref()));
-                let file = IncludedFile::builder(bytes, content).durability(durability).new(db);
+                let read = self.read_included(path);
+                let content = InputId(IncludedFile::content_of(read.as_deref()));
+                let file = IncludedFile::builder(read, content).durability(durability).new(db);
                 let make = || Included { path: path.to_path_buf(), file };
                 self.included.insert(hash, |it| it.path.as_path() == path, make).0
             }
@@ -488,15 +502,15 @@ impl Files {
             .map(|&(_, at)| {
                 let included = self.included.get(at);
                 // clone: the edge: the list leaves base-db, read once per build (a path and a refcount each).
-                (included.path.clone(), included.file.bytes(db).clone())
+                (included.path.clone(), included.file.bytes(db).cloned())
             })
             .collect(); // alloc: the edge, as above.
         read.sort_by(|a, b| a.0.cmp(&b.0));
         read
     }
 
-    fn read_included(&self, path: &AbsPath) -> Option<std::sync::Arc<[u8]>> {
-        std::fs::read(self.on_disk(path.as_ref())).ok().map(Into::into)
+    fn read_included(&self, path: &AbsPath) -> Result<std::sync::Arc<[u8]>, ReadError> {
+        std::fs::read(self.on_disk(path.as_ref())).map(Into::into).map_err(|it| ReadError::of(&it))
     }
 
     fn find_included(&self, path: &AbsPath) -> Option<IncludedFile> {
@@ -568,17 +582,17 @@ impl Files {
     /// Whether the file on disk is what was read of it.
     pub fn included_is_read(&self, db: &Db, path: &AbsPath) -> bool {
         let Some(file) = self.find_included(path) else { return false };
-        *file.bytes(db) == self.read_included(path)
+        *file.read(db) == self.read_included(path)
     }
 
     /// Reads the file again, and says whether it changed.
     pub fn reload_included_file(&self, db: &mut Db, path: &AbsPath) -> bool {
         let Some(file) = self.find_included(path) else { return false };
-        let bytes = self.read_included(path);
-        let changed = *file.bytes(&*db) != bytes;
+        let read = self.read_included(path);
+        let changed = *file.read(&*db) != read;
         if changed {
-            let content = InputId(IncludedFile::content_of(bytes.as_deref()));
-            file.set_bytes_field(db).to(bytes);
+            let content = InputId(IncludedFile::content_of(read.as_deref()));
+            file.set_read_field(db).to(read);
             file.set_content_field(db).to(content);
         }
         changed
@@ -605,29 +619,34 @@ impl Files {
         source_root: Arc<SourceRoot>,
         durability: Durability,
     ) {
-        let mut writer = self.lock();
-        let index = self.index_root(&mut writer, &*db, source_root_id, &source_root);
-        let is_library = index.is_library;
-        writer.root_contents.insert(source_root_id, index);
-        RootContent::refresh(&mut writer.root_contents, &[source_root_id]);
-        let content = InputId(writer.root_contents[&source_root_id].content);
-        let content_durability = root_content_durability(is_library);
-        match self.source_roots.get(source_root_id.0) {
-            Some(input) => {
-                input.set_source_root_field(db).with_durability(durability).to(source_root);
-                if input.content_field(&*db) != content {
-                    input.set_content_field(db).with_durability(content_durability).to(content);
+        frame::task(Tag::Parse, |frame| {
+            let mut writer = self.lock();
+            for file in source_root.iter() {
+                self.refuse_crate_attr(&writer, file);
+            }
+            let index = self.index_root(&mut writer, &*db, source_root_id, &source_root, frame);
+            let is_library = index.is_library;
+            writer.root_contents.insert(source_root_id, index);
+            RootContent::refresh(&mut writer.root_contents, &[source_root_id], frame);
+            let content = InputId(writer.root_contents[&source_root_id].content);
+            let content_durability = root_content_durability(is_library);
+            match self.source_roots.get(source_root_id.0) {
+                Some(input) => {
+                    input.set_source_root_field(db).with_durability(durability).to(source_root);
+                    if input.content_field(&*db) != content {
+                        input.set_content_field(db).with_durability(content_durability).to(content);
+                    }
+                }
+                None => {
+                    let input = SourceRootInput::builder(source_root, content)
+                        .durability(durability)
+                        .content_durability(content_durability)
+                        .new(&*db);
+                    self.source_roots.set(source_root_id.0, Some(input));
                 }
             }
-            None => {
-                let input = SourceRootInput::builder(source_root, content)
-                    .durability(durability)
-                    .content_durability(content_durability)
-                    .new(&*db);
-                self.source_roots.set(source_root_id.0, Some(input));
-            }
-        }
-        writer.named.publish(db);
+            writer.named.publish(db, frame);
+        })
     }
 
     pub fn file_source_root(&self, db: &Db, id: FileId) -> FileSourceRootInput {
@@ -656,6 +675,7 @@ impl Files {
         durability: Durability,
     ) {
         let mut writer = self.lock();
+        self.refuse_crate_attr(&writer, id);
         self.set_file_source_root_in(&mut writer, db, id, source_root_id, durability);
     }
 
@@ -687,6 +707,21 @@ impl Files {
             || self.file_source_roots.get(id.index()).is_some()
             || writer.in_roots.contains_key(id)
             || writer.view_ids.contains_key(id)
+            || writer.crate_attrs.contains_key(id)
+    }
+
+    /// The first file ID from `next` on that nothing has: the one place base-db hands out file
+    /// IDs, for a view's new files ([`Files::set_view_root`]) and crate attributes' files
+    /// ([`crate::crate_attrs`]).
+    pub(crate) fn unused_file_id(&self, writer: &Writer, next: &mut u32) -> Option<FileId> {
+        while *next <= span::EditionedFileId::MAX_FILE_ID {
+            let id = FileId::from_raw(*next);
+            *next += 1;
+            if !self.is_used(writer, id) {
+                return Some(id);
+            }
+        }
+        None
     }
 }
 
@@ -757,12 +792,12 @@ impl RootContent {
     /// it in `old` keeps its bucket; the others' buckets are hashed in one batch.
     fn new(
         is_library: bool,
-        files: Vec<(FileId, Vec<u8>, ContentId)>,
+        files: Vec<(FileId, Box<[u8]>, ContentId), &Frame>,
         old: Option<&RootContent>,
+        frame: &Frame,
     ) -> RootContent {
-        let mut buckets = Vec::with_capacity(files.len());
-        // alloc: per source root set (setup): the keys not in the old content.
-        let mut hash = Vec::new();
+        let mut buckets = Vec::with_capacity_in(files.len(), frame);
+        let mut hash = Vec::new_in(frame);
         for (at, (file, key, _)) in files.iter().enumerate() {
             match old.and_then(|old| old.keys.get(file)) {
                 Some((bucket, known)) if **known == **key => buckets.push(*bucket),
@@ -772,18 +807,14 @@ impl RootContent {
                 }
             }
         }
-        if !hash.is_empty() {
-            // alloc: as above, one list for the batch.
-            let keys: Vec<&[u8]> = hash.iter().map(|&at| files[at].1.as_slice()).collect();
-            let hashes = ContentId::of_many(SourceRoot::PATH_DOMAIN, &keys);
-            for (&at, path) in hash.iter().zip(&hashes) {
-                buckets[at] = RootContent::bucket(path);
-            }
+        let keys = frame.alloc_slice_from_iter(hash.iter().map(|&at| &*files[at].1));
+        let hashes = content::hash_many(SourceRoot::PATH_DOMAIN, keys, frame);
+        for (&at, path) in hash.iter().zip(hashes) {
+            buckets[at] = RootContent::bucket(path);
         }
         let mut content = RootContent::empty(is_library);
         content.keys.reserve(files.len());
         for ((file, key, id), bucket) in files.into_iter().zip(buckets) {
-            let key = key.into_boxed_slice();
             // clone: the bucket's copy of a key, per file of a root set (setup).
             content.buckets[bucket as usize].insert(key.clone(), id);
             content.keys.insert(file, (bucket, key));
@@ -857,13 +888,14 @@ impl RootContent {
 
     /// Brings each of `roots`' content IDs up to date: every bucket out of date in any of them
     /// hashed in one batch, then the roots in another.
-    pub(crate) fn refresh(contents: &mut FxHashMap<SourceRootId, RootContent>, roots: &[SourceRootId]) {
-        // alloc: one batch per setter call, a constant per call: the dirty buckets, then the roots.
-        let mut bytes = Vec::new();
-        // alloc: as above.
-        let mut ranges: Vec<Range<usize>> = Vec::new();
-        // alloc: as above.
-        let mut places = Vec::new();
+    pub(crate) fn refresh(
+        contents: &mut FxHashMap<SourceRootId, RootContent>,
+        roots: &[SourceRootId],
+        frame: &Frame,
+    ) {
+        let mut bytes = scratch::lend_bytes();
+        let mut ranges: Vec<Range<usize>, &Frame> = Vec::new_in(frame);
+        let mut places = Vec::new_in(frame);
         for root in roots {
             let Some(index) = contents.get(root) else { continue };
             if places.iter().any(|(known, _)| known == root) {
@@ -882,8 +914,8 @@ impl RootContent {
         if places.is_empty() {
             return;
         }
-        let hashes = content::hash_ranges(SourceRoot::BUCKET_DOMAIN, &bytes, &ranges);
-        for (&(root, bucket), hash) in places.iter().zip(hashes) {
+        let hashes = content::hash_ranges(SourceRoot::BUCKET_DOMAIN, &bytes, &ranges, frame);
+        for (&(root, bucket), &hash) in places.iter().zip(hashes) {
             if let Some(index) = contents.get_mut(&root) {
                 index.hashes[bucket] = hash;
             }
@@ -891,8 +923,7 @@ impl RootContent {
 
         bytes.clear();
         ranges.clear();
-        // alloc: as above.
-        let mut refreshed = Vec::new();
+        let mut refreshed = Vec::new_in(frame);
         for root in roots {
             let Some(index) = contents.get_mut(root) else { continue };
             if index.dirty == 0 {
@@ -907,8 +938,8 @@ impl RootContent {
             ranges.push(start..bytes.len());
             refreshed.push(*root);
         }
-        let hashes = content::hash_ranges(SourceRoot::DOMAIN, &bytes, &ranges);
-        for (root, hash) in refreshed.into_iter().zip(hashes) {
+        let hashes = content::hash_ranges(SourceRoot::DOMAIN, &bytes, &ranges, frame);
+        for (root, &hash) in refreshed.into_iter().zip(hashes) {
             if let Some(index) = contents.get_mut(&root) {
                 index.content = hash;
             }

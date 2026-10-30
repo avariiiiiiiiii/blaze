@@ -49,11 +49,13 @@ pub(crate) unsafe fn follow_profile(asked: &Invocation) -> Result<(), String> {
              with Cranelift"
         ));
     }
-    // SAFETY: no other thread runs, by this function's contract, and reading the profile
-    // starts none.
+    // SAFETY: `set_var` races only with another thread using the environment; `follow_profile`
+    // runs from `cargo::command` (`cargo/mod.rs`) on the main thread, after `toolchain::settle`
+    // joined its scoped threads and before any other starts; were one running, its `getenv` could
+    // read freed memory.
     unsafe { std::env::set_var(BACKEND, "llvm") };
     if std::env::var_os(OPTIMIZATION).is_none() {
-        // SAFETY: as above.
+        // SAFETY: still on the main thread with no other running, as for `BACKEND` above.
         unsafe { std::env::set_var(OPTIMIZATION, level) };
     }
     Ok(())

@@ -52,18 +52,9 @@ fn write_builtin_derive_impl_method<'db>(
         f.write_str("impl")?;
         write_generic_params(loc.adt.into(), f)?;
         f.write_char(' ')?;
-        let trait_id = loc.trait_.get_id(f.lang_items());
-        if let Some(trait_id) = trait_id {
-            f.start_location_link(trait_id.into());
-        }
         write!(f, "{}", Name::new_symbol_root(loc.trait_.name()).display(db, f.edition()))?;
-        if trait_id.is_some() {
-            f.end_location_link();
-        }
         f.write_str(" for ")?;
-        f.start_location_link(loc.adt.into());
         write!(f, "{}", Adt::from(loc.adt).name(db).display(db, f.edition()))?;
-        f.end_location_link();
         write_generic_args(loc.adt.into(), f)?;
         f.write_char('\n')?;
     }
@@ -81,7 +72,10 @@ fn write_builtin_derive_impl_method<'db>(
 
         let predicates =
             hir_ide::builtin_derive::predicates(db, impl_).explicit_predicates().skip_binder();
-        write_params_bounds(f, &Vec::from_iter(predicates))?;
+        crate::scratch::with_clauses(|clauses| {
+            clauses.extend(predicates);
+            write_params_bounds(f, clauses)
+        })?;
     }
 
     Ok(())
@@ -372,19 +366,23 @@ impl<'db> HirDisplay<'db> for Struct {
         match self.kind(f.db) {
             StructKind::Tuple => {
                 f.write_char('(')?;
-                let (fields, hidden_fields) = visible_fields(self.fields(f.db), f);
-                let mut it = fields.iter().peekable();
+                let db = f.db;
+                crate::scratch::Fields::with(|fields| -> Result {
+                    let hidden_fields = visible_fields(self.fields_iter(db), fields, f);
+                    let mut it = fields.iter().peekable();
 
-                while let Some(field) = it.next() {
-                    write_visibility(module_id, field.visibility(f.db), f)?;
-                    field.ty(f.db).hir_fmt(f)?;
-                    if it.peek().is_some() || hidden_fields {
-                        f.write_str(", ")?;
+                    while let Some(field) = it.next() {
+                        write_visibility(module_id, field.visibility(f.db), f)?;
+                        field.ty(f.db).hir_fmt(f)?;
+                        if it.peek().is_some() || hidden_fields {
+                            f.write_str(", ")?;
+                        }
                     }
-                }
-                if hidden_fields {
-                    f.write_str("/* … */")?;
-                }
+                    if hidden_fields {
+                        f.write_str("/* … */")?;
+                    }
+                    Ok(())
+                })?;
 
                 f.write_char(')')?;
                 write_where_clause(def_id, f)?;
@@ -395,8 +393,11 @@ impl<'db> HirDisplay<'db> for Struct {
             StructKind::Record => {
                 let has_where_clause = write_where_clause(def_id, f)?;
                 if let Some(limit) = f.entity_limit {
-                    let (fields, hidden_fields) = visible_fields(self.fields(f.db), f);
-                    write_fields(&fields, hidden_fields, has_where_clause, limit, false, f)?;
+                    let db = f.db;
+                    crate::scratch::Fields::with(|fields| {
+                        let hidden_fields = visible_fields(self.fields_iter(db), fields, f);
+                        write_fields(fields, hidden_fields, has_where_clause, limit, false, f)
+                    })?;
                 }
             }
             StructKind::Unit => {
@@ -421,7 +422,10 @@ impl<'db> HirDisplay<'db> for Enum {
 
         let has_where_clause = write_where_clause(def_id, f)?;
         if let Some(limit) = f.entity_limit {
-            write_variants(&self.variants(f.db), has_where_clause, limit, f)?;
+            crate::scratch::Variants::with(|variants| {
+                variants.extend(self.variants_iter(f.db));
+                write_variants(variants, has_where_clause, limit, f)
+            })?;
         }
 
         Ok(())
@@ -438,28 +442,33 @@ impl<'db> HirDisplay<'db> for Union {
 
         let has_where_clause = write_where_clause(def_id, f)?;
         if let Some(limit) = f.entity_limit {
-            let (fields, hidden_fields) = visible_fields(self.fields(f.db), f);
-            write_fields(&fields, hidden_fields, has_where_clause, limit, false, f)?;
+            let db = f.db;
+            crate::scratch::Fields::with(|fields| {
+                let hidden_fields = visible_fields(self.fields_iter(db), fields, f);
+                write_fields(fields, hidden_fields, has_where_clause, limit, false, f)
+            })?;
         }
         Ok(())
     }
 }
 
-fn visible_fields<'db>(fields: Vec<Field>, f: &mut HirFormatter<'_, 'db>) -> (Vec<Field>, bool) {
+/// The fields of `fields` that `f` shows, in `shown`, and whether any was hidden.
+fn visible_fields<'db>(
+    fields: impl Iterator<Item = Field>,
+    shown: &mut Vec<Field>,
+    f: &mut HirFormatter<'_, 'db>,
+) -> bool {
     if f.render_private_fields() {
-        return (fields, false);
+        shown.extend(fields);
+        return false;
     }
-
     let mut hidden_fields = false;
-    let fields = fields
-        .into_iter()
-        .filter(|field| {
-            let is_public = field.visibility(f.db) == Visibility::Public;
-            hidden_fields |= !is_public;
-            is_public
-        })
-        .collect();
-    (fields, hidden_fields)
+    shown.extend(fields.filter(|field| {
+        let is_public = field.visibility(f.db) == Visibility::Public;
+        hidden_fields |= !is_public;
+        is_public
+    }));
+    hidden_fields
 }
 
 fn write_fields<'db>(
@@ -578,8 +587,11 @@ impl<'db> HirDisplay<'db> for EnumVariant {
             }
             FieldsShape::Record => {
                 if let Some(limit) = f.entity_limit {
-                    let (fields, hidden_fields) = visible_fields(self.fields(f.db), f);
-                    write_fields(&fields, hidden_fields, false, limit, true, f)?;
+                    let db = f.db;
+                    crate::scratch::Fields::with(|fields| {
+                        let hidden_fields = visible_fields(self.fields_iter(db), fields, f);
+                        write_fields(fields, hidden_fields, false, limit, true, f)
+                    })?;
                 }
             }
         }
@@ -630,62 +642,62 @@ impl<'db> HirDisplay<'db> for TypeParam {
         let param_data = &params[self.id.local_id()];
         let krate = self.id.parent().krate(f.db).id;
         let ty = self.ty(f.db).ty.skip_binder();
-        let predicates = GenericPredicates::query_all(f.db, self.id.parent());
-        let predicates = predicates
-            .iter_identity()
-            .map(Unnormalized::skip_norm_wip)
-            .filter(|wc| match wc.kind().skip_binder() {
-                ClauseKind::Trait(tr) => tr.self_ty() == ty,
-                ClauseKind::Projection(proj) => proj.self_ty() == ty,
-                ClauseKind::TypeOutlives(to) => to.0 == ty,
-                _ => false,
-            })
-            .collect::<Vec<_>>();
+        let all = GenericPredicates::query_all(f.db, self.id.parent());
+        crate::scratch::with_clauses(|predicates| {
+            predicates.extend(all.iter_identity().map(Unnormalized::skip_norm_wip).filter(
+                |wc| match wc.kind().skip_binder() {
+                    ClauseKind::Trait(tr) => tr.self_ty() == ty,
+                    ClauseKind::Projection(proj) => proj.self_ty() == ty,
+                    ClauseKind::TypeOutlives(to) => to.0 == ty,
+                    _ => false,
+                },
+            ));
 
-        match param_data {
-            TypeOrConstParamData::TypeParamData(p) => match p.provenance {
-                TypeParamProvenance::TypeParamList | TypeParamProvenance::TraitSelf => {
-                    write!(f, "{}", p.name.clone().unwrap().display(f.db, f.edition()))?
+            match param_data {
+                TypeOrConstParamData::TypeParamData(p) => match p.provenance {
+                    TypeParamProvenance::TypeParamList | TypeParamProvenance::TraitSelf => {
+                        write!(f, "{}", p.name.unwrap().display(f.db, f.edition()))?
+                    }
+                    TypeParamProvenance::ArgumentImplTrait => {
+                        return write_bounds_like_dyn_trait_with_prefix(
+                            f,
+                            "impl",
+                            Either::Left(ty),
+                            predicates,
+                            SizedByDefault::Sized { anchor: krate },
+                            false,
+                        );
+                    }
+                },
+                TypeOrConstParamData::ConstParamData(p) => {
+                    write!(f, "{}", p.name.display(f.db, f.edition()))?;
                 }
-                TypeParamProvenance::ArgumentImplTrait => {
-                    return write_bounds_like_dyn_trait_with_prefix(
-                        f,
-                        "impl",
-                        Either::Left(ty),
-                        &predicates,
-                        SizedByDefault::Sized { anchor: krate },
-                        false,
-                    );
-                }
-            },
-            TypeOrConstParamData::ConstParamData(p) => {
-                write!(f, "{}", p.name.display(f.db, f.edition()))?;
             }
-        }
 
-        if f.omit_verbose_types() {
-            return Ok(());
-        }
+            if f.omit_verbose_types() {
+                return Ok(());
+            }
 
-        let sized_trait = f.lang_items().Sized;
-        let has_only_sized_bound =
-            predicates.iter().all(move |pred| match pred.kind().skip_binder() {
-                ClauseKind::Trait(it) => Some(it.def_id().0) == sized_trait,
-                _ => false,
-            });
-        let has_only_not_sized_bound = predicates.is_empty();
-        if !has_only_sized_bound || has_only_not_sized_bound {
-            let default_sized = SizedByDefault::Sized { anchor: krate };
-            write_bounds_like_dyn_trait_with_prefix(
-                f,
-                ":",
-                Either::Left(ty),
-                &predicates,
-                default_sized,
-                false,
-            )?;
-        }
-        Ok(())
+            let sized_trait = f.lang_items().Sized;
+            let has_only_sized_bound =
+                predicates.iter().all(move |pred| match pred.kind().skip_binder() {
+                    ClauseKind::Trait(it) => Some(it.def_id().0) == sized_trait,
+                    _ => false,
+                });
+            let has_only_not_sized_bound = predicates.is_empty();
+            if !has_only_sized_bound || has_only_not_sized_bound {
+                let default_sized = SizedByDefault::Sized { anchor: krate };
+                write_bounds_like_dyn_trait_with_prefix(
+                    f,
+                    ":",
+                    Either::Left(ty),
+                    predicates,
+                    default_sized,
+                    false,
+                )?;
+            }
+            Ok(())
+        })
     }
 }
 

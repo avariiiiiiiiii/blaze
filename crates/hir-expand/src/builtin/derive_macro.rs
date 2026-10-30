@@ -7,11 +7,11 @@
 use std::ops::Range;
 
 use base_db::Db;
+use blaze_mem::Frame;
 use either::Either;
 use intern::{Symbol, sym};
 use itertools::Itertools;
 use parser::SyntaxKind;
-use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use span::{Edition, Span};
 use syntax_bridge::DocCommentDesugarMode;
@@ -52,7 +52,7 @@ macro_rules! register_builtin {
             /// Every variant, in declaration order.
             pub const ALL: &[Self] = &[$(Self::$trait),*];
 
-            pub fn expander(&self) -> fn(&Db, Span, &tt::TopSubtree) -> ExpandResult<tt::TopSubtree>  {
+            pub fn expander(&self) -> for<'f> fn(&Db, &'f Frame, Span, &tt::TopSubtree) -> ExpandResult<tt::TopSubtree<&'f Frame>>  {
                 match *self {
                     $( BuiltinDeriveExpander::$trait => $expand, )*
                 }
@@ -82,23 +82,28 @@ macro_rules! register_builtin {
 }
 
 impl BuiltinDeriveExpander {
-    pub fn expand(
+    pub fn expand<'f>(
         &self,
         db: &Db,
+        frame: &'f Frame,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
-    ) -> ExpandResult<tt::TopSubtree> {
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
         let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
         let expanded = if let BuiltinDeriveExpander::Clone = self
             && let MacroCallKind::Derive { ast_id, .. } = &id.loc(db).kind
             && derives_copy(&ast_id.to_node(db))
         {
-            clone_expand_with(db, span, tt, true)
+            clone_expand_with(db, frame, span, tt, true)
         } else {
-            self.expander()(db, span, tt)
+            self.expander()(db, frame, span, tt)
         };
-        if from_derive_const(db, id) { expanded.map(as_const_impls) } else { expanded }
+        if from_derive_const(db, id) {
+            expanded.map(|it| as_const_impls(frame, it))
+        } else {
+            expanded
+        }
     }
 }
 
@@ -112,7 +117,10 @@ fn from_derive_const(db: &Db, id: MacroCallId) -> bool {
 }
 
 /// `impl ..` items of a derive's expansion as `const impl ..`.
-fn as_const_impls(expanded: tt::TopSubtree) -> tt::TopSubtree {
+fn as_const_impls<'f>(
+    frame: &'f Frame,
+    expanded: tt::TopSubtree<&'f Frame>,
+) -> tt::TopSubtree<&'f Frame> {
     let mut builder = tt::TopSubtreeBuilder::new(expanded.top_subtree().delimiter);
     let mut items = expanded.token_trees().iter();
     while let Some(next) = items.peek() {
@@ -128,7 +136,7 @@ fn as_const_impls(expanded: tt::TopSubtree) -> tt::TopSubtree {
         let Some(item) = items.next_as_view() else { break };
         builder.extend_with_tt(item);
     }
-    builder.build()
+    builder.build_in(frame)
 }
 
 /// Whether the words of `attr`'s text (its runs of letters, digits and `_`, leaving out those in
@@ -696,7 +704,9 @@ fn to_adt_syntax(
     tt: &tt::TopSubtree,
     call_site: Span,
 ) -> Result<(ast::Adt, span::SpanMap), ExpandError> {
-    let (parsed, tm, _) = crate::token_tree_to_syntax_node(db, tt, crate::ExpandTo::Items);
+    let (parsed, tm, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        crate::token_tree_to_syntax_node(db, frame, tt.view(), crate::ExpandTo::Items)
+    });
     let macro_items = ast::MacroItems::cast(parsed.syntax_node())
         .ok_or_else(|| ExpandError::other(call_site, "invalid item definition"))?;
     let item =
@@ -721,19 +731,23 @@ fn name_to_token(
     Ok(name_token)
 }
 
-fn empty(span: Span) -> tt::TopSubtree {
-    tt::TopSubtree::empty(tt::DelimSpan::from_single(span))
+fn empty<'f>(frame: &'f Frame, span: Span) -> tt::TopSubtree<&'f Frame> {
+    tt::TopSubtree::empty_in(tt::DelimSpan::from_single(span), frame)
 }
 
 /// The builder of a derive's expansion, whose top subtree is dropped if it holds one subtree.
-fn write_derive(span: Span, f: impl FnOnce(&mut Builder)) -> tt::TopSubtree {
+fn write_derive<'f>(
+    frame: &'f Frame,
+    span: Span,
+    f: impl FnOnce(&mut Builder),
+) -> tt::TopSubtree<&'f Frame> {
     let mut b = Builder::new(tt::Delimiter {
         kind: tt::DelimiterKind::Invisible,
         open: span,
         close: span,
     });
     f(&mut b);
-    b.build_skip_top_subtree()
+    b.build_skip_top_subtree_in(frame)
 }
 
 /// Given that we are deriving a trait `DerivedTrait` for a type like:
@@ -767,36 +781,49 @@ fn write_derive(span: Span, f: impl FnOnce(&mut Builder)) -> tt::TopSubtree {
 ///
 /// where B1, ..., BN are the bounds given by `bounds_paths`. Z is a phantom type, and
 /// therefore does not get bound by the derived trait.
-fn expand_simple_derive<P: ToTokenTree + Copy>(
+fn expand_simple_derive<'f, P: ToTokenTree + Copy>(
+    frame: &'f Frame,
     invoc_span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
     trait_path: P,
     allow_unions: bool,
     copy_if_packed: bool,
     make_trait_body: impl FnOnce(&mut Builder, &BasicAdtInfo),
-) -> ExpandResult<tt::TopSubtree> {
-    let mut info = match info {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let mut info = match derivable(frame, invoc_span, info, allow_unions) {
         Ok(info) => info,
-        Err(e) => {
-            return ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan { open: invoc_span, close: invoc_span }),
-                e,
-            );
-        }
+        Err(refused) => return refused,
     };
-    if !allow_unions && matches!(info.shape.kind, AdtKind::Union) {
-        return ExpandResult::new(
-            empty(invoc_span),
-            ExpandError::builtin_derive(invoc_span, "this trait cannot be derived for unions"),
-        );
-    }
     info.copy_bounds = info.packed && copy_if_packed;
     let no_extra_params = group(invoc_span, |_| {});
-    ExpandResult::ok(write_derive(invoc_span, |b| {
+    ExpandResult::ok(write_derive(frame, invoc_span, |b| {
         write_impl(b, invoc_span, &info, trait_path, true, &no_extra_params, |b| {
             make_trait_body(b, &info)
         })
     }))
+}
+
+/// The item a derive is made of, or the expansion of a derive refused: the item's error, or a
+/// union's when the trait can't be derived for one.
+fn derivable<'f>(
+    frame: &'f Frame,
+    invoc_span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+    allow_unions: bool,
+) -> Result<BasicAdtInfo, ExpandResult<tt::TopSubtree<&'f Frame>>> {
+    let info = info.map_err(|e| {
+        ExpandResult::new(
+            tt::TopSubtree::empty_in(tt::DelimSpan { open: invoc_span, close: invoc_span }, frame),
+            e,
+        )
+    })?;
+    if !allow_unions && matches!(info.shape.kind, AdtKind::Union) {
+        return Err(ExpandResult::new(
+            empty(frame, invoc_span),
+            ExpandError::builtin_derive(invoc_span, "this trait cannot be derived for unions"),
+        ));
+    }
+    Ok(info)
 }
 
 /// `impl<..> Trait for Name<..> where .. { .. }`, the body written by `trait_body`.
@@ -858,58 +885,68 @@ fn write_impl<P: ToTokenTree + Copy, X: ToTokenTree + Copy>(
     delimited(b, tt::DelimiterKind::Brace, s, trait_body);
 }
 
-fn copy_expand(
+fn copy_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    copy_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    copy_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn copy_derive(
+fn copy_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::marker::Copy));
-    expand_simple_derive(span, info, &trait_path, true, false, |b, _| empty_group(b, span))
+    expand_simple_derive(frame, span, info, &trait_path, true, false, |b, _| empty_group(b, span))
 }
 
 /// `#[derive(ConstParamTy)]` (`adt_const_params`): the marker trait, named apart from the
 /// macro in `core::marker`.
-fn const_param_ty_expand(
+fn const_param_ty_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    const_param_ty_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    const_param_ty_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn const_param_ty_derive(
+fn const_param_ty_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::marker::ConstParamTy_));
-    expand_simple_derive(span, info, &trait_path, true, false, |b, _| empty_group(b, span))
+    expand_simple_derive(frame, span, info, &trait_path, true, false, |b, _| empty_group(b, span))
 }
 
 /// `#[derive(From)]` (`derive_from`): `From` of the type of a struct's one field, as rustc's
 /// (`deriving/from.rs`): the impl keeps the struct's generics and bounds, and adds no bound of
 /// its own.
-fn from_expand(
+fn from_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let (adt, span_map) = match to_adt_syntax(db, tt, span) {
         Ok(it) => it,
-        Err(err) => return ExpandResult::new(empty(span), err),
+        Err(err) => return ExpandResult::new(empty(frame, span), err),
     };
-    from_derive(span, &adt, &span_map)
+    from_derive(frame, span, &adt, &span_map)
 }
 
-fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandResult<tt::TopSubtree> {
+fn from_derive<'f>(
+    frame: &'f Frame,
+    span: Span,
+    adt: &ast::Adt,
+    span_map: &span::SpanMap,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     // rustc's `DeriveFromWrongTarget` and `DeriveFromWrongFieldCount`, at the derive and the
     // item's name.
     let refuse = |message: &str| {
@@ -917,7 +954,7 @@ fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandRe
         let error = BuiltinError::derive(message)
             .note("`#[derive(From)]` can only be used on structs with exactly one field")
             .also_at(name.into_iter().collect::<Box<[_]>>());
-        ExpandResult::new(empty(span), error.at(span))
+        ExpandResult::new(empty(frame, span), error.at(span))
     };
     let strukt = match adt {
         ast::Adt::Struct(it) => it,
@@ -942,14 +979,15 @@ fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandRe
             DocCommentDesugarMode::ProcMacro,
         ),
         [None] => {
-            return ExpandResult::new(empty(span), ExpandError::other(span, "missing field type"));
+            let err = ExpandError::other(span, "missing field type");
+            return ExpandResult::new(empty(frame, span), err);
         }
         [] => return refuse("`#[derive(From)]` used on a struct with no fields"),
         _ => return refuse("`#[derive(From)]` used on a struct with multiple fields"),
     };
     let info = match parse_adt_from_syntax(adt, span_map, span) {
         Ok(it) => it,
-        Err(err) => return ExpandResult::new(empty(span), err),
+        Err(err) => return ExpandResult::new(empty(frame, span), err),
     };
     let krate = &dollar_crate(span);
     let field_ty = &field_ty;
@@ -963,7 +1001,7 @@ fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandRe
     });
     let trait_path = group(span, |b| quote_into!(b, span => #krate::convert::From<#field_ty>));
     let no_extra_params = group(span, |_| {});
-    ExpandResult::ok(write_derive(span, |b| {
+    ExpandResult::ok(write_derive(frame, span, |b| {
         write_impl(b, span, &info, &trait_path, false, &no_extra_params, |b| {
             in_group(b, span, |b| {
                 quote_into!(b, span =>
@@ -975,43 +1013,46 @@ fn from_derive(span: Span, adt: &ast::Adt, span_map: &span::SpanMap) -> ExpandRe
     }))
 }
 
-fn reborrow_expand(
+fn reborrow_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    reborrow_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    reborrow_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn reborrow_derive(
+fn reborrow_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::marker::Reborrow));
-    expand_reborrow_marker_derive(span, info, &trait_path, "Reborrow")
+    expand_reborrow_marker_derive(frame, span, info, &trait_path, "Reborrow")
 }
 
-fn coerce_shared_expand(
+fn coerce_shared_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let (adt, span_map) = match to_adt_syntax(db, tt, span) {
         Ok(it) => it,
         Err(err) => {
-            return ExpandResult::new(empty(span), err);
+            return ExpandResult::new(empty(frame, span), err);
         }
     };
     let ast::Adt::Struct(strukt) = &adt else {
         return ExpandResult::new(
-            empty(span),
+            empty(frame, span),
             ExpandError::builtin_derive(span, "`CoerceShared` can only be derived on `struct`s"),
         );
     };
     let Some(target) = coerce_shared_target(db, span, strukt) else {
         return ExpandResult::new(
-            empty(span),
+            empty(frame, span),
             ExpandError::builtin_derive(
                 span,
                 "`derive(CoerceShared)` requires exactly one `#[coerce_shared(Target)]` attribute",
@@ -1021,7 +1062,7 @@ fn coerce_shared_expand(
     let info = match parse_adt_from_syntax(&adt, &span_map, span) {
         Ok(it) => it,
         Err(err) => {
-            return ExpandResult::new(empty(span), err);
+            return ExpandResult::new(empty(frame, span), err);
         }
     };
 
@@ -1030,26 +1071,27 @@ fn coerce_shared_expand(
     let trait_path =
         group(span, |b| quote_into!(b, span => #krate::marker::CoerceShared<#target>));
     let no_extra_params = group(span, |_| {});
-    ExpandResult::ok(write_derive(span, |b| {
+    ExpandResult::ok(write_derive(frame, span, |b| {
         write_impl(b, span, &info, &trait_path, false, &no_extra_params, |b| empty_group(b, span))
     }))
 }
 
-fn expand_reborrow_marker_derive<P: ToTokenTree + Copy>(
+fn expand_reborrow_marker_derive<'f, P: ToTokenTree + Copy>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
     trait_path: P,
     trait_name: &'static str,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let info = match info {
         Ok(info) => info,
         Err(err) => {
-            return ExpandResult::new(empty(span), err);
+            return ExpandResult::new(empty(frame, span), err);
         }
     };
     if !matches!(info.shape.kind, AdtKind::Struct) {
         return ExpandResult::new(
-            empty(span),
+            empty(frame, span),
             ExpandError::builtin_derive(
                 span,
                 format!("`{trait_name}` can only be derived on `struct`s"), // alloc: an error's message, on the error path
@@ -1058,7 +1100,7 @@ fn expand_reborrow_marker_derive<P: ToTokenTree + Copy>(
     }
 
     let no_extra_params = group(span, |_| {});
-    ExpandResult::ok(write_derive(span, |b| {
+    ExpandResult::ok(write_derive(frame, span, |b| {
         write_impl(b, span, &info, trait_path, false, &no_extra_params, |b| empty_group(b, span))
     }))
 }
@@ -1083,18 +1125,20 @@ fn coerce_shared_target(
     span_map.push(target_tokens.syntax().text_range().start(), span);
     span_map.push(target_tokens.syntax().text_range().end(), span);
 
-    let remove = FxHashSet::from_iter([l_paren.into(), r_paren.into()]);
+    let remove = syntax_bridge::Removed::<_>::from_iter([l_paren.into(), r_paren.into()]);
     let target = syntax_bridge::syntax_node_to_token_tree_modified(
         target_tokens.syntax(),
         &span_map,
-        FxHashMap::default(),
+        syntax_bridge::Appended::<_, std::alloc::Global>::default(),
         remove,
         span,
         DocCommentDesugarMode::ProcMacro,
-        |_, _| (true, Vec::new()), // alloc: none, an empty `Vec`
+        |_, _| (true, syntax_bridge::Inserted::new()),
     );
 
-    let (parse, _, _) = crate::token_tree_to_syntax_node(db, &target, crate::ExpandTo::Type);
+    let (parse, _, _) = blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        crate::token_tree_to_syntax_node(db, frame, target.view(), crate::ExpandTo::Type)
+    });
     if !parse.errors().is_empty() {
         return None;
     }
@@ -1102,33 +1146,36 @@ fn coerce_shared_target(
     Some(target)
 }
 
-fn clone_expand(
+fn clone_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    clone_expand_with(db, span, tt, false)
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    clone_expand_with(db, frame, span, tt, false)
 }
 
-fn clone_expand_with(
+fn clone_expand_with<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
     copy: bool,
-) -> ExpandResult<tt::TopSubtree> {
-    clone_derive(span, parse_adt(db, tt, span), copy)
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    clone_derive(frame, span, parse_adt(db, tt, span), copy)
 }
 
 /// `copy` is whether `Copy` is derived next to `Clone`, which makes cloning a copy for a type
 /// that has no type parameters.
-fn clone_derive(
+fn clone_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
     copy: bool,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::clone::Clone));
-    expand_simple_derive(span, info, &trait_path, true, true, |b, adt| {
+    expand_simple_derive(frame, span, info, &trait_path, true, true, |b, adt| {
         let copy = copy && adt.param_types.iter().all(|param| param.const_ty.is_some());
         let star = punct('*', tt::Spacing::Alone, span);
         if copy || matches!(adt.shape.kind, AdtKind::Union) {
@@ -1172,24 +1219,26 @@ fn clone_derive(
     })
 }
 
-fn default_expand(
+fn default_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    default_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    default_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn default_derive(
+fn default_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let adt = match info {
         Ok(info) => info,
         Err(e) => {
             return ExpandResult::new(
-                tt::TopSubtree::empty(tt::DelimSpan { open: span, close: span }),
+                tt::TopSubtree::empty_in(tt::DelimSpan { open: span, close: span }, frame),
                 e,
             );
         }
@@ -1199,20 +1248,20 @@ fn default_derive(
         AdtKind::Enum { default_variant: Some(d) } => (&adt.shape.variants[*d], false),
         AdtKind::Enum { default_variant: None } => {
             return ExpandResult::new(
-                empty(span),
+                empty(frame, span),
                 ExpandError::new(span, ExpandErrorKind::DefaultNoVariant),
             );
         }
         AdtKind::Union => {
             return ExpandResult::new(
-                empty(span),
+                empty(frame, span),
                 ExpandError::builtin_derive(span, "this trait cannot be derived for unions"),
             );
         }
     };
     let trait_path = group(span, |b| quote_into!(b, span => #krate::default::Default));
     let no_extra_params = group(span, |_| {});
-    ExpandResult::ok(write_derive(span, |b| {
+    ExpandResult::ok(write_derive(frame, span, |b| {
         write_impl(b, span, &adt, &trait_path, constrain_to_trait, &no_extra_params, |b| {
             in_group(b, span, |b| {
                 quote_into!(b, span => fn default() -> Self);
@@ -1228,21 +1277,23 @@ fn default_derive(
     }))
 }
 
-fn debug_expand(
+fn debug_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    debug_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    debug_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn debug_derive(
+fn debug_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::fmt::Debug));
-    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+    expand_simple_derive(frame, span, info, &trait_path, false, true, |b, adt| {
         if adt.is_empty_enum() {
             let star = punct('*', tt::Spacing::Alone, span);
             return in_group(b, span, |b| {
@@ -1317,21 +1368,23 @@ fn debug_derive(
     })
 }
 
-fn hash_expand(
+fn hash_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    hash_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    hash_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn hash_derive(
+fn hash_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::hash::Hash));
-    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+    expand_simple_derive(frame, span, info, &trait_path, false, true, |b, adt| {
         if adt.is_empty_enum() {
             let star = punct('*', tt::Spacing::Alone, span);
             return in_group(b, span, |b| {
@@ -1371,76 +1424,119 @@ fn hash_derive(
     })
 }
 
-fn eq_expand(
+fn eq_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    eq_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    eq_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn eq_derive(span: Span, info: Result<BasicAdtInfo, ExpandError>) -> ExpandResult<tt::TopSubtree> {
-    let krate = &dollar_crate(span);
-    let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::Eq));
-    expand_simple_derive(span, info, &trait_path, true, true, |b, _| empty_group(b, span))
-}
-
-fn partial_eq_expand(
-    db: &Db,
-    span: Span,
-    tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    partial_eq_derive(span, parse_adt(db, tt, span))
-}
-
-fn partial_eq_derive(
+fn eq_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
+    let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::Eq));
+    expand_simple_derive(frame, span, info, &trait_path, true, true, |b, _| empty_group(b, span))
+}
+
+fn partial_eq_expand<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    span: Span,
+    tt: &tt::TopSubtree,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    partial_eq_derive(frame, span, parse_adt(db, tt, span))
+}
+
+fn partial_eq_derive<'f>(
+    frame: &'f Frame,
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let mut info = match derivable(frame, span, info, true) {
+        Ok(info) => info,
+        Err(refused) => return refused,
+    };
+    let union = matches!(info.shape.kind, AdtKind::Union);
+    let krate = &dollar_crate(span);
+    let structural =
+        group(span, |b| quote_into!(b, span => #krate::marker::StructuralPartialEq));
     let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::PartialEq));
-    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
-        let selfs = adt.bindings("_self");
-        let others = adt.bindings("_other");
-        let bindings = (&selfs[..], &others[..]);
-        // As rustc's: an enum of several variants compares the discriminants, and then the
-        // fields of the variants that have any. A match of each variant against itself is a
-        // comparison for each, which LLVM leaves as a chain.
-        let discriminants = adt.is_enum() && adt.shape.variants.len() > 1;
-        let arms = || adt.shape.variants.iter().filter(move |v| !discriminants || !v.is_empty());
-        let fields_eq = |b: &mut Builder, v: &Variant| write_fields_eq(b, span, krate, v, bindings);
-        if discriminants {
-            let fielded = arms().next().is_some();
-            return in_group(b, span, |b| {
-                quote_into!(b, span => fn eq(&self, other: &Self) -> bool);
-                delimited(b, tt::DelimiterKind::Brace, span, |b| {
-                    quote_into!(b, span =>
-                        let __self_discr = #krate::intrinsics::discriminant_value(self);
-                        let __arg1_discr = #krate::intrinsics::discriminant_value(other);
-                        __self_discr
-                    );
-                    eq_eq(b, span);
-                    quote_into!(b, span => __arg1_discr);
-                    in_group(b, span, |b| {
-                        if fielded {
-                            and_and(b, span);
-                            adt.write_match_both(b, span, bindings, arms(), fields_eq, |b| {
-                                in_group(b, span, |b| quote_into!(b, span => true))
-                            });
-                        }
-                    });
-                });
+    let no_extra_params = group(span, |_| {});
+    // As rustc's `expand_deriving_partial_eq`: `StructuralPartialEq` first, which bounds no
+    // parameter by itself (`skip_path_as_bound`) and none by `Copy`, and is written for a union
+    // too, beside `PartialEq`'s error.
+    let value = write_derive(frame, span, |b| {
+        info.copy_bounds = false;
+        // In a group: `as_const_impls` makes only the top level's impls `const`, and rustc's is
+        // not (`is_const: false`).
+        in_group(b, span, |b| {
+            write_impl(b, span, &info, &structural, false, &no_extra_params, |b| {
+                empty_group(b, span)
+            })
+        });
+        if !union {
+            info.copy_bounds = info.packed;
+            write_impl(b, span, &info, &trait_path, true, &no_extra_params, |b| {
+                write_partial_eq_body(b, span, krate, &info)
             });
         }
-        in_group(b, span, |b| {
+    });
+    match union {
+        true => ExpandResult::new(
+            value,
+            ExpandError::builtin_derive(span, "this trait cannot be derived for unions"),
+        ),
+        false => ExpandResult::ok(value),
+    }
+}
+
+/// `PartialEq::eq` of `adt`.
+fn write_partial_eq_body(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdtInfo) {
+    let selfs = adt.bindings("_self");
+    let others = adt.bindings("_other");
+    let bindings = (&selfs[..], &others[..]);
+    // As rustc's: an enum of several variants compares the discriminants, and then the
+    // fields of the variants that have any. A match of each variant against itself is a
+    // comparison for each, which LLVM leaves as a chain.
+    let discriminants = adt.is_enum() && adt.shape.variants.len() > 1;
+    let arms = || adt.shape.variants.iter().filter(move |v| !discriminants || !v.is_empty());
+    let fields_eq = |b: &mut Builder, v: &Variant| write_fields_eq(b, span, krate, v, bindings);
+    if discriminants {
+        let fielded = arms().next().is_some();
+        return in_group(b, span, |b| {
             quote_into!(b, span => fn eq(&self, other: &Self) -> bool);
             delimited(b, tt::DelimiterKind::Brace, span, |b| {
-                adt.write_match_both(b, span, bindings, arms(), fields_eq, |b| {
-                    in_group(b, span, |b| quote_into!(b, span => false))
-                })
+                quote_into!(b, span =>
+                    let __self_discr = #krate::intrinsics::discriminant_value(self);
+                    let __arg1_discr = #krate::intrinsics::discriminant_value(other);
+                    __self_discr
+                );
+                eq_eq(b, span);
+                quote_into!(b, span => __arg1_discr);
+                in_group(b, span, |b| {
+                    if fielded {
+                        and_and(b, span);
+                        adt.write_match_both(b, span, bindings, arms(), fields_eq, |b| {
+                            in_group(b, span, |b| quote_into!(b, span => true))
+                        });
+                    }
+                });
             });
         });
-    })
+    }
+    in_group(b, span, |b| {
+        quote_into!(b, span => fn eq(&self, other: &Self) -> bool);
+        delimited(b, tt::DelimiterKind::Brace, span, |b| {
+            adt.write_match_both(b, span, bindings, arms(), fields_eq, |b| {
+                in_group(b, span, |b| quote_into!(b, span => false))
+            })
+        });
+    });
 }
 
 /// Whether the fields of `self`'s and `other`'s variant `v` are equal, each with the next. A
@@ -1573,18 +1669,23 @@ fn write_ordering(b: &mut Builder, span: Span, krate: &tt::Ident, adt: &BasicAdt
     }
 }
 
-fn ord_expand(
+fn ord_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    ord_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    ord_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn ord_derive(span: Span, info: Result<BasicAdtInfo, ExpandError>) -> ExpandResult<tt::TopSubtree> {
+fn ord_derive<'f>(
+    frame: &'f Frame,
+    span: Span,
+    info: Result<BasicAdtInfo, ExpandError>,
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::Ord));
-    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+    expand_simple_derive(frame, span, info, &trait_path, false, true, |b, adt| {
         in_group(b, span, |b| {
             quote_into!(b, span => fn cmp(&self, other: &Self) -> #krate::cmp::Ordering);
             delimited(b, tt::DelimiterKind::Brace, span, |b| {
@@ -1594,21 +1695,23 @@ fn ord_derive(span: Span, info: Result<BasicAdtInfo, ExpandError>) -> ExpandResu
     })
 }
 
-fn partial_ord_expand(
+fn partial_ord_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
-    partial_ord_derive(span, parse_adt(db, tt, span))
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    partial_ord_derive(frame, span, parse_adt(db, tt, span))
 }
 
-fn partial_ord_derive(
+fn partial_ord_derive<'f>(
+    frame: &'f Frame,
     span: Span,
     info: Result<BasicAdtInfo, ExpandError>,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let krate = &dollar_crate(span);
     let trait_path = group(span, |b| quote_into!(b, span => #krate::cmp::PartialOrd));
-    expand_simple_derive(span, info, &trait_path, false, true, |b, adt| {
+    expand_simple_derive(frame, span, info, &trait_path, false, true, |b, adt| {
         in_group(b, span, |b| {
             quote_into!(b, span =>
                 fn partial_cmp(&self, other: &Self) -> #krate::option::Option<#krate::cmp::Ordering>
@@ -1622,18 +1725,19 @@ fn partial_ord_derive(
 
 /// The `DispatchFromDyn` and `CoerceUnsized` impls of `CoercePointee`, each in a group of its
 /// own, from the struct with the `__S` bounds added.
-fn write_coerce_pointee_impls(
+fn write_coerce_pointee_impls<'f>(
+    frame: &'f Frame,
     span: Span,
     info: &BasicAdtInfo,
     self_for_traits: &tt::TopSubtree,
-) -> tt::TopSubtree {
+) -> tt::TopSubtree<&'f Frame> {
     let krate = &dollar_crate(span);
     let dispatch_from_dyn =
         group(span, |b| quote_into!(b, span => #krate::ops::DispatchFromDyn<#self_for_traits>));
     let coerce_unsized =
         group(span, |b| quote_into!(b, span => #krate::ops::CoerceUnsized<#self_for_traits>));
     let added_param = group(span, |b| quote_into!(b, span => __S));
-    write_derive(span, |b| {
+    write_derive(frame, span, |b| {
         in_group(b, span, |b| {
             write_impl(b, span, info, &dispatch_from_dyn, false, &added_param, |b| {
                 empty_group(b, span)
@@ -1657,15 +1761,16 @@ fn type_param_span(param: &ast::TypeParam) -> Option<TextRange> {
     })
 }
 
-fn coerce_pointee_expand(
+fn coerce_pointee_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     span: Span,
     tt: &tt::TopSubtree,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let (adt, span_map) = match to_adt_syntax(db, tt, span) {
         Ok(it) => it,
         Err(err) => {
-            return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err);
+            return ExpandResult::new(empty(frame, span), err);
         }
     };
     // The editor's copy of the item starts at 0, the item in `span_map` where it was parsed.
@@ -1680,7 +1785,7 @@ fn coerce_pointee_expand(
     let (editor, adt) = SyntaxEditor::with_ast_node(&adt);
     let make = editor.make();
     let refuse = |error: BuiltinError, at: Span| {
-        ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), error.at(at))
+        ExpandResult::new(empty(frame, span), error.at(at))
     };
     // rustc's `CoercePointee` errors are E0802.
     fn pointee_error(message: impl Into<Box<str>>) -> BuiltinError {
@@ -1767,7 +1872,7 @@ fn coerce_pointee_expand(
     let (Some(struct_name), Some(pointee_param_name)) = (strukt.name(), pointee_param.name())
     else {
         return ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+            tt::TopSubtree::empty_in(tt::DelimSpan::from_single(span), frame),
             ExpandError::other(span, "invalid item"),
         );
     };
@@ -2014,11 +2119,11 @@ fn coerce_pointee_expand(
     let info = match parse_adt_from_syntax(&adt, &span_map, span) {
         Ok(it) => it,
         Err(err) => {
-            return ExpandResult::new(tt::TopSubtree::empty(tt::DelimSpan::from_single(span)), err);
+            return ExpandResult::new(empty(frame, span), err);
         }
     };
 
-    return ExpandResult::ok(write_coerce_pointee_impls(span, &info, &self_for_traits));
+    return ExpandResult::ok(write_coerce_pointee_impls(frame, span, &info, &self_for_traits));
 
     fn is_maybe_sized_bound(bound: ast::TypeBound) -> bool {
         if bound.question_mark_token().is_none() {

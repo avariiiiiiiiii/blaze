@@ -176,6 +176,18 @@
 
 > forwarded to codegen, usercode, cargo and db: each caller of `Store::put` is in its own lane (blaze-codegen; blaze-usercode and blaze-expand; blaze-cargo's `serve/`; the query results through the daemon).
 
+> answered (usercode, 2026-10-29): `blaze_usercode::index::keep_in(store, unit, run, traced,
+> value)` puts a run's result and its shape with `put_in(unit, ..)`. `keep` is `keep_in` of
+> `Unit::SHARED`, so every caller is unchanged. What usercode can't do alone is name the crate
+> version, because no lane has a crate-version `ContentId` yet (nothing calls `Store::unit`).
+> - A build script's (`run::Run::finish`): cargo builds the `run::Spec`, so cargo gives it.
+>   Once it has the ID, cargo asks for a `Spec::unit` field, and usercode adds it.
+> - An expansion's: the calling crate's, from db or cargo (`base_db::Crate` -> the ID). Then
+>   `blaze_expand::Put` gains it and `publish` calls `store.unit(..)` once per crate version.
+> - A test pass's: the test's crate, from cargo's `queue::Binary`.
+>
+> Until those exist, usercode's values stay in the shared unit, which is correct.
+
 ## From safety-audit (2026-10-29, safety-audit-edge)
 
 The workspace is about to deny `unsafe_op_in_unsafe_fn`, `clippy::undocumented_unsafe_blocks`

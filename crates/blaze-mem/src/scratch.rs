@@ -23,39 +23,51 @@ use std::{
 /// Buffers kept per thread and kind: the nesting depth whose buffers stay warm.
 pub const DEPTH: usize = 4;
 
-struct Shelf<B> {
-    buffers: [B; DEPTH],
-    /// Buffers on the shelf; `buffers[..free]` are there, the rest are lent out.
+/// A thread's buffers of one kind, up to `N` (the nesting depth kept warm): what a
+/// [`Shelved`] implementation keeps in its `thread_local!`, as
+/// `const { RefCell::new(Shelf::new()) }`.
+pub struct Shelf<B: Shelved, const N: usize = DEPTH> {
+    /// `buffers[..free]` are on the shelf; the rest are `None`, lent out or never made.
+    buffers: [Option<B>; N],
     free: usize,
 }
 
-impl<B: Shelved> Shelf<B> {
-    fn take(&mut self) -> Option<B> {
+impl<B: Shelved, const N: usize> Shelf<B, N> {
+    /// An empty shelf: buffers join it as they come back.
+    pub const fn new() -> Self {
+        Shelf { buffers: [const { None }; N], free: 0 }
+    }
+
+    /// The top buffer, if the shelf has one.
+    pub fn take(&mut self) -> Option<B> {
         if self.free == 0 {
             return None;
         }
         self.free -= 1;
-        Some(mem::take(&mut self.buffers[self.free]))
+        self.buffers[self.free].take()
     }
 
     /// Shelves `buffer` on top. A full shelf (a buffer lent on another thread coming back
-    /// here) keeps its `DEPTH` largest and frees the smallest.
-    fn give(&mut self, buffer: B) {
-        if self.free < DEPTH {
-            self.buffers[self.free] = buffer;
+    /// here) keeps its `N` largest and frees the smallest.
+    pub fn give(&mut self, buffer: B) {
+        if self.free < N {
+            self.buffers[self.free] = Some(buffer);
             self.free += 1;
             return;
         }
-        let mut smallest = 0;
-        for at in 1..DEPTH {
-            if self.buffers[at].held() < self.buffers[smallest].held() {
-                smallest = at;
-            }
+        let held = |slot: &Option<B>| slot.as_ref().map_or(0, Shelved::held);
+        let Some(smallest) = (0..N).min_by_key(|&at| held(&self.buffers[at])) else {
+            return;
+        };
+        if buffer.held() > held(&self.buffers[smallest]) {
+            self.buffers[smallest] = Some(buffer);
         }
-        if buffer.held() > self.buffers[smallest].held() {
-            self.buffers.swap(smallest, DEPTH - 1);
-            self.buffers[DEPTH - 1] = buffer;
-        }
+    }
+}
+
+impl<B: Shelved, const N: usize> Default for Shelf<B, N> {
+    fn default() -> Self {
+        Shelf::new()
     }
 }
 
@@ -141,7 +153,7 @@ macro_rules! shelves {
         thread_local! {
             $(
                 static $shelf: RefCell<Shelf<$buffer>> = const {
-                    RefCell::new(Shelf { buffers: [const { <$buffer>::new() }; DEPTH], free: DEPTH })
+                    RefCell::new(Shelf::new())
                 };
             )*
         }
@@ -194,7 +206,7 @@ shelves! {
 
 thread_local! {
     static PATHS: RefCell<Shelf<PathBuf>> =
-        RefCell::new(Shelf { buffers: Default::default(), free: DEPTH });
+        const { RefCell::new(Shelf::new()) };
 }
 
 impl Shelved for PathBuf {

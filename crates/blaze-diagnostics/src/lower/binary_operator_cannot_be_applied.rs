@@ -17,15 +17,15 @@
 
 use blaze_items::Fact;
 use either::Either;
-use hir::{HasSource as _, InFile, LangItem};
+use hir::{InFile, LangItem};
 use rustc_type_ir::inherent::Ty as _;
 use syntax::{
-    AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange,
-    ast::{self, ArithOp, BinaryOp, CmpOp, HasTypeBounds as _},
+    AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, ast as tag,
+    view::{self as ast, ArithOp, AstNode as _, BinaryOp, CmpOp, HasGenericParams as _, HasName as _, HasTypeBounds as _},
 };
 
 use crate::{
-    cx::{Cx, def_range},
+    cx::{Cx, def_range_view as def_range},
     lower::{Found, Phase},
     model::{Applicability, Diag, MultiSpan, Span},
 };
@@ -34,25 +34,24 @@ pub(crate) fn lower<'db>(
     cx: &Cx<'_, 'db>,
     d: &hir::BinaryOperatorCannotBeApplied<'db>,
 ) -> Vec<Found> {
-    let node = cx.node(d.expr);
+    let node = cx.node_view(d.expr);
     let file = node.file_id;
     let at = |range: TextRange| cx.span(InFile::new(file, range));
     let whole = cx.span_of_ptr(d.expr);
-    let bin = match node.value.clone().left() {
+    let bin = match node.value.left() {
         Some(ast::Expr::BinExpr(it)) => Some(it),
         _ => None,
     };
-    let lhs_expr = bin.as_ref().and_then(|it| it.lhs());
-    let rhs_expr = bin.as_ref().and_then(|it| it.rhs());
+    let lhs_expr = bin.and_then(|it| it.lhs());
+    let rhs_expr = bin.and_then(|it| it.rhs());
     let op_span = bin
-        .as_ref()
         .and_then(|it| it.op_token())
-        .map_or_else(|| whole.clone(), |it| at(it.text_range()));
-    let lhs_span = lhs_expr.as_ref().map(|it| at(it.syntax().text_range()));
-    let rhs_span = rhs_expr.as_ref().map(|it| at(it.syntax().text_range()));
+        .map_or_else(|| whole.clone(), |it| at(it.text_range())); // clone: the error's span
+    let lhs_span = lhs_expr.map(|it| at(it.syntax().text_range()));
+    let rhs_span = rhs_expr.map(|it| at(it.syntax().text_range()));
     let lhs = cx.ty(&d.lhs);
     let rhs = cx.ty(&d.rhs);
-    let op_str = d.op.to_string();
+    let op_str = d.op.to_string(); // alloc: the operator, for the error's message
     let trait_ = lang_item(d.op).and_then(|it| hir::Trait::lang(cx.db, cx.krate, it));
     let assign = matches!(d.op, BinaryOp::Assignment { .. });
 
@@ -60,10 +59,12 @@ pub(crate) fn lower<'db>(
         BinaryOp::Assignment { .. } => {
             let mut diag = Diag::error(
                 Some("E0368"),
+                // alloc: the error's message
                 format!("binary assignment operation `{op_str}` cannot be applied to type `{lhs}`"),
-                whole.clone(),
+                whole.clone(), // clone: the error's span
             );
             if let Some(lhs_span) = &lhs_span {
+                // clone: the label's span; alloc: the error's label
                 diag.span_label(lhs_span.clone(), format!("cannot use `{op_str}` on type `{lhs}`"));
             }
             if let Some(trait_) = trait_ {
@@ -73,24 +74,33 @@ pub(crate) fn lower<'db>(
         }
         _ => {
             let message = match d.op {
+                // alloc: the error's message
                 BinaryOp::ArithOp(ArithOp::Add) => format!("cannot add `{rhs}` to `{lhs}`"),
+                // alloc: the error's message
                 BinaryOp::ArithOp(ArithOp::Sub) => format!("cannot subtract `{rhs}` from `{lhs}`"),
+                // alloc: the error's message
                 BinaryOp::ArithOp(ArithOp::Mul) => format!("cannot multiply `{lhs}` by `{rhs}`"),
+                // alloc: the error's message
                 BinaryOp::ArithOp(ArithOp::Div) => format!("cannot divide `{lhs}` by `{rhs}`"),
                 BinaryOp::ArithOp(ArithOp::Rem) => {
+                    // alloc: the error's message
                     format!("cannot calculate the remainder of `{lhs}` divided by `{rhs}`")
                 }
                 BinaryOp::ArithOp(
                     ArithOp::BitAnd | ArithOp::BitXor | ArithOp::BitOr | ArithOp::Shl | ArithOp::Shr,
-                ) => format!("no implementation for `{lhs} {op_str} {rhs}`"),
+                ) => {
+                    // alloc: the error's message
+                    format!("no implementation for `{lhs} {op_str} {rhs}`")
+                }
+                // alloc: the error's message
                 _ => format!("binary operation `{op_str}` cannot be applied to type `{lhs}`"),
             };
-            let mut diag = Diag::error(Some("E0369"), message, op_span.clone());
+            let mut diag = Diag::error(Some("E0369"), message, op_span.clone()); // clone: its span
             if let (Some(lhs_span), Some(rhs_span)) = (&lhs_span, &rhs_span)
                 && lhs_span != rhs_span
             {
-                diag.span_label(lhs_span.clone(), lhs.clone());
-                diag.span_label(rhs_span.clone(), rhs.clone());
+                diag.span_label(lhs_span.clone(), lhs.clone()); // clone: the error's label
+                diag.span_label(rhs_span.clone(), rhs.clone()); // clone: the error's label
             }
             if let Some(trait_) = trait_ {
                 let suggest_derive = d.lhs.could_unify_with(cx.db, &d.rhs);
@@ -100,15 +110,15 @@ pub(crate) fn lower<'db>(
         }
     };
 
-    if let Some(bin) = &bin
+    if let Some(bin) = bin
         && missing_semi(cx, file, bin, &mut diag)
         && is_lhs_of_assign_stmt(bin)
     {
         // rustc leaves this to the error on the assignment, which suggests the semicolon.
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
 
-    if let (Some(trait_), Some(lhs_expr), Some(rhs_expr)) = (trait_, &lhs_expr, &rhs_expr) {
+    if let (Some(trait_), Some(lhs_expr), Some(rhs_expr)) = (trait_, lhs_expr, rhs_expr) {
         suggest_deref_or_borrow(cx, &mut diag, d, trait_, &op_str, (lhs_expr, rhs_expr), file);
     }
 
@@ -118,7 +128,7 @@ pub(crate) fn lower<'db>(
             BinaryOp::ArithOp(ArithOp::Add) | BinaryOp::Assignment { op: Some(ArithOp::Add) }
         );
         let str_added = is_add
-            && match (&lhs_expr, &rhs_expr) {
+            && match (lhs_expr, rhs_expr) {
                 (Some(lhs_expr), Some(rhs_expr)) => {
                     str_addition(cx, &mut diag, d, (lhs_expr, rhs_expr), &op_span, assign, file)
                 }
@@ -129,7 +139,7 @@ pub(crate) fn lower<'db>(
         }
     }
 
-    if let (Some(lhs_expr), Some(rhs_expr)) = (&lhs_expr, &rhs_expr) {
+    if let (Some(lhs_expr), Some(rhs_expr)) = (lhs_expr, rhs_expr) {
         raw_ptr_arithmetic(cx, &mut diag, d, (lhs_expr, rhs_expr), file);
     }
 
@@ -137,11 +147,11 @@ pub(crate) fn lower<'db>(
         let name = cx.def_path(hir::ModuleDef::Trait(trait_));
         diag.fact_opt(
             cx.implements_fact(trait_, &d.lhs),
-            format!("whether `{lhs}` implements `{name}`"),
+            format!("whether `{lhs}` implements `{name}`"), // alloc: the error's fact
         );
     }
     code_fact(cx, d.expr.map(|it| it.syntax_node_ptr()), &mut diag);
-    vec![Found::new(diag, Phase::Bodies)]
+    vec![Found::new(diag, Phase::Bodies)] // alloc: the error found
 }
 
 /// The trait of an operator: rustc's `lang_item_for_binop`.
@@ -181,6 +191,7 @@ pub(crate) fn lang_item(op: BinaryOp) -> Option<LangItem> {
 /// type checking found it.
 pub(crate) fn code_fact(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>, diag: &mut Diag) {
     if let Some((item, name)) = crate::lints::body_item(cx, at) {
+        // alloc: the error's fact
         diag.fact(Fact::Code(cx.key(item)), format!("the code of `{name}`"));
     }
 }
@@ -188,8 +199,9 @@ pub(crate) fn code_fact(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>, diag: &mut D
 /// The generic arguments rustc's `print_trait_sugared` shows of an operator's trait: the right
 /// side's type, unless it is the default (`Self`, the left side's).
 fn trait_args<'db>(cx: &Cx<'_, 'db>, lhs: &hir::Type<'db>, rhs: Option<&hir::Type<'db>>) -> String {
-    let Some(rhs) = rhs else { return String::new() };
+    let Some(rhs) = rhs else { return String::new() }; // alloc: empty, allocates nothing
     let rhs = cx.ty(rhs);
+    // alloc: a trait's arguments, for the error
     if rhs == cx.ty(lhs) { String::new() } else { format!("<{rhs}>") }
 }
 
@@ -207,18 +219,21 @@ pub(crate) fn note_unmet_impl<'db>(
 ) {
     let Some(adt) = self_ty.as_adt() else { return };
     let trait_name = cx.def_path(hir::ModuleDef::Trait(trait_));
-    let sugared = format!("{trait_name}{}", trait_args(cx, self_ty, rhs));
+    let sugared = format!("{trait_name}{}", trait_args(cx, self_ty, rhs)); // alloc: for the note
     let ty = cx.ty(self_ty);
     let Some(adt_span) = adt_def_span(cx, adt) else { return };
     let local = adt.module(cx.db).krate(cx.db) == cx.krate;
     if local {
-        let mut span = MultiSpan::of(adt_span.clone());
+        let mut span = MultiSpan::of(adt_span.clone()); // clone: the note's span
+        // clone: the label's span; alloc: the note's label
         span.labels.push((adt_span.clone(), format!("must implement `{sugared}`")));
+        // alloc: the note
         diag.span_note(span, format!("an implementation of `{sugared}` might be missing for `{ty}`"));
     } else {
-        let mut span = MultiSpan::of(adt_span.clone());
+        let mut span = MultiSpan::of(adt_span.clone()); // clone: the note's span
+        // clone: the label's span; alloc: the note's label
         span.labels.push((adt_span.clone(), format!("`{ty}` is defined in another crate")));
-        diag.span_note(span, format!("`{ty}` does not implement `{sugared}`"));
+        diag.span_note(span, format!("`{ty}` does not implement `{sugared}`")); // alloc: the note
         return;
     }
 
@@ -228,14 +243,16 @@ pub(crate) fn note_unmet_impl<'db>(
                 let traits = traits.join(", ");
                 diag.suggestion_verbose(
                     adt_span.shrink_to_lo(),
+                    // alloc: the suggestion's message
                     format!("consider annotating `{ty}` with `#[derive({traits})]`"),
-                    format!("#[derive({traits})]\n"),
+                    format!("#[derive({traits})]\n"), // alloc: the suggestion's text
                     Applicability::MaybeIncorrect,
                 );
             }
         }
         None => {
             if let Some(trait_span) = trait_def_span(cx, trait_) {
+                // alloc: the note
                 diag.span_note(trait_span, format!("the trait `{trait_name}` must be implemented"));
             }
         }
@@ -250,18 +267,19 @@ fn derivable<'db>(
     adt: hir::Adt,
     self_ty: &hir::Type<'db>,
     trait_: hir::Trait,
-) -> Option<Vec<&'static str>> {
+) -> Option<&'static [&'static str]> {
     let lang = |item| hir::Trait::lang(cx.db, cx.krate, item);
-    let traits = if Some(trait_) == lang(LangItem::PartialEq) {
-        vec!["PartialEq"]
+    let traits: &'static [&'static str] = if Some(trait_) == lang(LangItem::PartialEq) {
+        &["PartialEq"]
     } else if Some(trait_) == lang(LangItem::PartialOrd) {
-        vec!["PartialEq", "PartialOrd"]
+        &["PartialEq", "PartialOrd"]
     } else {
         return None;
     };
     if matches!(adt, hir::Adt::Union(_)) {
         return None;
     }
+    // clone: the type, for the impl lookup on the error path
     let has_own_impl = hir::Impl::all_for_type(cx.db, self_ty.clone())
         .into_iter()
         .any(|it| it.trait_(cx.db) == Some(trait_) && it.self_ty(cx.db).as_adt() == Some(adt));
@@ -270,17 +288,17 @@ fn derivable<'db>(
 
 /// rustc's `def_span` of a type.
 pub(crate) fn adt_def_span(cx: &Cx<'_, '_>, adt: hir::Adt) -> Option<Span> {
-    let node = match adt {
-        hir::Adt::Struct(it) => it.source(cx.db)?.map(|it| it.syntax().clone()),
-        hir::Adt::Enum(it) => it.source(cx.db)?.map(|it| it.syntax().clone()),
-        hir::Adt::Union(it) => it.source(cx.db)?.map(|it| it.syntax().clone()),
+    let range = match adt {
+        hir::Adt::Struct(it) => cx.vsema.source(it)?.map(|it| def_range(it.syntax())),
+        hir::Adt::Enum(it) => cx.vsema.source(it)?.map(|it| def_range(it.syntax())),
+        hir::Adt::Union(it) => cx.vsema.source(it)?.map(|it| def_range(it.syntax())),
     };
-    Some(cx.span(node.map(|it| def_range(&it))))
+    Some(cx.span(range))
 }
 
 /// rustc's `def_span` of a trait.
 pub(crate) fn trait_def_span(cx: &Cx<'_, '_>, trait_: hir::Trait) -> Option<Span> {
-    let node = trait_.source(cx.db)?;
+    let node = cx.vsema.source(trait_)?;
     Some(cx.span(node.map(|it| def_range(it.syntax()))))
 }
 
@@ -295,7 +313,7 @@ pub(crate) fn full_path(cx: &Cx<'_, '_>, def: hir::ModuleDef) -> String {
     };
     let root = cx.krate.root_module(cx.db);
     if let Some(path) = root.find_path(cx.db, hir::ItemInNs::Types(def), config) {
-        return path.display(cx.db, cx.edition).to_string();
+        return path.display(cx.db, cx.edition).to_string(); // alloc: a path for the error
     }
     def.canonical_path(cx.db, cx.edition).unwrap_or_else(|| cx.def_path(def))
 }
@@ -315,14 +333,15 @@ pub(crate) fn restrict_param(
     args: &str,
 ) {
     let Some(param) = ty.as_type_param(cx.db) else { return };
-    let Some(source) = param.merge().source(cx.db) else { return };
-    let Either::Left(ast::TypeOrConstParam::Type(type_param)) = &source.value else { return };
+    let Some(source) = cx.vsema.source(param.merge()) else { return };
+    let Either::Left(ast::TypeOrConstParam::Type(type_param)) = source.value else { return };
     let Some(name) = type_param.name() else { return };
-    let name = name.text().to_string();
+    let name = name.text();
     let args = args.replace("{integer}", "i32").replace("{float}", "f64");
+    // alloc: the suggestion's text
     let constraint = format!("{}{args}", full_path(cx, hir::ModuleDef::Trait(trait_)));
     let trait_name = cx.def_path(hir::ModuleDef::Trait(trait_));
-    let post = format!("trait `{trait_name}`");
+    let post = format!("trait `{trait_name}`"); // alloc: the suggestion's message
     let at = |range: TextRange| cx.span(source.with_value(range));
 
     let generics = type_param
@@ -330,23 +349,24 @@ pub(crate) fn restrict_param(
         .parent()
         .and_then(|it| it.parent())
         .and_then(ast::AnyHasGenericParams::cast);
-    let where_clause = generics.as_ref().and_then(ast::HasGenericParams::where_clause);
+    let where_clause = generics.and_then(|it| it.where_clause());
     let where_bounds = where_clause.iter().flat_map(|it| it.predicates()).find_map(|pred| {
         let ty = pred.ty()?;
-        (ty.syntax().text() == name.as_str()).then(|| pred.type_bound_list()?.bounds().last())?
+        (ty.syntax().text() == name).then(|| pred.type_bound_list()?.bounds().last())?
     });
     let inline_last = type_param.type_bound_list().and_then(|it| it.bounds().last());
     let (span, message, code) = if let Some(last) = inline_last.or(where_bounds) {
         (
             at(last.syntax().text_range()).shrink_to_hi(),
-            "consider further restricting this bound".to_owned(),
-            format!(" + {constraint}"),
+            "consider further restricting this bound".to_owned(), // alloc: the message
+            format!(" + {constraint}"),                            // alloc: the suggestion's text
         )
-    } else if let Some(last) = where_clause.as_ref().and_then(|it| it.predicates().last()) {
+    } else if let Some(last) = where_clause.and_then(|it| it.predicates().last()) {
         (
             at(last.syntax().text_range()).shrink_to_hi(),
+            // alloc: the suggestion's message
             format!("consider further restricting type parameter `{name}` with {post}"),
-            format!(", {name}: {constraint}"),
+            format!(", {name}: {constraint}"), // alloc: the suggestion's text
         )
     } else if type_param.default_type().is_some() {
         // rustc's `where T: Bound` after the generics wants the tail of the item's header,
@@ -355,14 +375,16 @@ pub(crate) fn restrict_param(
     } else if let Some(colon) = type_param.colon_token() {
         (
             at(colon.text_range()).shrink_to_hi(),
+            // alloc: the suggestion's message
             format!("consider restricting type parameter `{name}` with {post}"),
-            format!(" {constraint}"),
+            format!(" {constraint}"), // alloc: the suggestion's text
         )
     } else {
         (
             at(type_param.syntax().text_range()).shrink_to_hi(),
+            // alloc: the suggestion's message
             format!("consider restricting type parameter `{name}` with {post}"),
-            format!(": {constraint}"),
+            format!(": {constraint}"), // alloc: the suggestion's text
         )
     };
     diag.suggestion_verbose(span, message, code, Applicability::MachineApplicable);
@@ -372,16 +394,16 @@ pub(crate) fn restrict_param(
 /// statement after a block-like one (`{ 2 } - 2`, `{ 2 } * x`): whether it was added.
 pub(crate) fn parentheses_needed(
     cx: &Cx<'_, '_>,
-    expr: InFile<AstPtr<Either<ast::Expr, ast::Pat>>>,
+    expr: InFile<AstPtr<Either<tag::Expr, tag::Pat>>>,
     diag: &mut Diag,
 ) -> bool {
-    let node = cx.node(expr);
-    let Some(ast::Expr::PrefixExpr(prefix)) = node.value.clone().left() else { return false };
+    let node = cx.node_view(expr);
+    let Some(ast::Expr::PrefixExpr(prefix)) = node.value.left() else { return false };
     if !matches!(prefix.op_kind(), Some(ast::UnaryOp::Deref | ast::UnaryOp::Neg)) {
         return false;
     }
     let start = prefix.syntax().text_range().start();
-    let mut stmt = prefix.syntax().clone();
+    let mut stmt = prefix.syntax();
     loop {
         let Some(parent) = stmt.parent() else { return false };
         if parent.kind() == SyntaxKind::STMT_LIST {
@@ -411,6 +433,7 @@ pub(crate) fn parentheses_needed(
     let span = cx.span(node.with_value(block.syntax().text_range()));
     diag.multipart_suggestion(
         "parentheses are required to parse this as an expression",
+        // alloc: the suggestion's parts
         vec![(span.shrink_to_lo(), "(".to_owned()), (span.shrink_to_hi(), ")".to_owned())],
         Applicability::MachineApplicable,
     );
@@ -418,22 +441,22 @@ pub(crate) fn parentheses_needed(
 }
 
 /// rustc's `check_for_missing_semi`: `foo()\n*bar = baz` read as a multiplication.
-pub(crate) fn missing_semi(
-    cx: &Cx<'_, '_>,
+pub(crate) fn missing_semi<'db>(
+    cx: &Cx<'_, 'db>,
     file: hir::HirFileId,
-    bin: &ast::BinExpr,
+    bin: ast::BinExpr<'db>,
     diag: &mut Diag,
 ) -> bool {
     if bin.op_kind() != Some(BinaryOp::ArithOp(ArithOp::Mul)) {
         return false;
     }
     let (Some(lhs), Some(rhs)) = (bin.lhs(), bin.rhs()) else { return false };
-    let text = bin.syntax().to_string();
+    let text = bin.syntax().text();
     let base = bin.syntax().text_range().start();
     let between = usize::from(lhs.syntax().text_range().end() - base)
         ..usize::from(rhs.syntax().text_range().start() - base);
     let multiline = text.get(between).is_some_and(|it| it.contains('\n'));
-    if !multiline || !is_syntactic_place(cx, &rhs) {
+    if !multiline || !is_syntactic_place(cx, rhs) {
         return false;
     }
     let span = cx.span(InFile::new(file, lhs.syntax().text_range())).shrink_to_hi();
@@ -447,12 +470,12 @@ pub(crate) fn missing_semi(
 }
 
 /// rustc's `is_syntactic_place_expr`: a local or a static, a dereference, a field or an index.
-pub(crate) fn is_syntactic_place(cx: &Cx<'_, '_>, expr: &ast::Expr) -> bool {
+pub(crate) fn is_syntactic_place<'db>(cx: &Cx<'_, 'db>, expr: ast::Expr<'db>) -> bool {
     match expr {
-        ast::Expr::ParenExpr(it) => it.expr().is_some_and(|it| is_syntactic_place(cx, &it)),
+        ast::Expr::ParenExpr(it) => it.expr().is_some_and(|it| is_syntactic_place(cx, it)),
         ast::Expr::PrefixExpr(it) => it.op_kind() == Some(ast::UnaryOp::Deref),
         ast::Expr::FieldExpr(_) | ast::Expr::IndexExpr(_) => true,
-        ast::Expr::PathExpr(it) => it.path().and_then(|it| cx.sema.resolve_path(&it)).is_some_and(
+        ast::Expr::PathExpr(it) => it.path().and_then(|it| cx.vsema.resolve_path(it)).is_some_and(
             |it| {
                 matches!(
                     it,
@@ -466,7 +489,7 @@ pub(crate) fn is_syntactic_place(cx: &Cx<'_, '_>, expr: &ast::Expr) -> bool {
 }
 
 /// rustc's `is_lhs_of_assign_stmt`.
-fn is_lhs_of_assign_stmt(bin: &ast::BinExpr) -> bool {
+fn is_lhs_of_assign_stmt(bin: ast::BinExpr<'_>) -> bool {
     let Some(parent) = bin.syntax().parent().and_then(ast::BinExpr::cast) else { return false };
     parent.op_kind() == Some(BinaryOp::Assignment { op: None })
         && parent.lhs().is_some_and(|it| it.syntax() == bin.syntax())
@@ -491,15 +514,17 @@ fn suggest_deref_or_borrow<'db>(
     d: &hir::BinaryOperatorCannotBeApplied<'db>,
     trait_: hir::Trait,
     op_str: &str,
-    (lhs_expr, rhs_expr): (&ast::Expr, &ast::Expr),
+    (lhs_expr, rhs_expr): (ast::Expr<'_>, ast::Expr<'_>),
     file: hir::HirFileId,
 ) {
-    let at = |expr: &ast::Expr| cx.span(InFile::new(file, expr.syntax().text_range()));
+    let at = |expr: ast::Expr<'_>| cx.span(InFile::new(file, expr.syntax().text_range()));
+    // clone: the type, for the trait query on the error path
     let works = |lhs: &hir::Type<'db>, rhs: &hir::Type<'db>| lhs.impls_trait(cx.db, trait_, &[rhs.clone()]);
     let deref_binop = |diag: &mut Diag, lhs_deref: &hir::Type<'db>| {
         if works(lhs_deref, &d.rhs) {
             diag.suggestion_verbose(
                 at(lhs_expr).shrink_to_lo(),
+                // alloc: the suggestion's message
                 format!(
                     "`{op_str}` can be used on `{}` if you dereference the left-hand side",
                     cx.ty(lhs_deref)
@@ -531,12 +556,16 @@ fn suggest_deref_or_borrow<'db>(
             if !works(lhs, rhs) {
                 return;
             }
+            // alloc: the note
             diag.note(format!("an implementation for `{} {op_str} {}` exists", cx.ty(lhs), cx.ty(rhs)));
             if lhs_new == Some(hir::Mutability::Shared) && rhs_new == Some(hir::Mutability::Shared) {
                 diag.multipart_suggestion(
                     "consider reborrowing both sides",
+                    // alloc: the suggestion's parts
                     vec![
+                        // alloc: the suggestion's text
                         (at(lhs_expr).shrink_to_lo(), "&*".to_owned()),
+                        // alloc: the suggestion's text
                         (at(rhs_expr).shrink_to_lo(), "&*".to_owned()),
                     ],
                     Applicability::MachineApplicable,
@@ -574,7 +603,7 @@ fn str_addition<'db>(
     cx: &Cx<'_, 'db>,
     diag: &mut Diag,
     d: &hir::BinaryOperatorCannotBeApplied<'db>,
-    (lhs_expr, rhs_expr): (&ast::Expr, &ast::Expr),
+    (lhs_expr, rhs_expr): (ast::Expr<'_>, ast::Expr<'_>),
     op_span: &Span,
     assign: bool,
     file: hir::HirFileId,
@@ -592,6 +621,7 @@ fn str_addition<'db>(
             let inner = it.expr().map_or(it.syntax().text_range().end(), |it| it.syntax().text_range().start());
             (at(TextRange::new(it.syntax().text_range().start(), inner)), None)
         }
+        // alloc: the suggestion's text
         _ => (at(lhs_expr.syntax().text_range()).shrink_to_hi(), Some(".to_owned()".to_owned())),
     };
     let Some((l_ty, _)) = d.lhs.as_reference() else { return false };
@@ -603,10 +633,12 @@ fn str_addition<'db>(
         && (is_str_like(r_ty) || r_ty.as_reference().is_some_and(|(it, _)| it.is_str()))
     {
         if !assign {
+            // clone: the label's span
             diag.span_label(op_span.clone(), "`+` cannot be used to concatenate two `&str` strings");
             diag.note(STR_CONCAT_NOTE);
             let (span, replacement) = owned();
             let (message, replacement) = match replacement {
+                // alloc: empty, allocates nothing
                 None => ("remove the borrow to obtain an owned `String`", String::new()),
                 Some(it) => ("create an owned `String` from a string reference", it),
             };
@@ -615,17 +647,21 @@ fn str_addition<'db>(
         return true;
     }
     if rhs_ref.is_none() && is_string(&d.rhs) {
+        // clone: the label's span
         diag.span_label(op_span.clone(), "`+` cannot be used to concatenate a `&str` with a `String`");
         if !assign {
             let (span, replacement) = owned();
             let (message, replacement) = match replacement {
+                // alloc: empty, allocates nothing
                 None => ("remove the borrow on the left and add one on the right", String::new()),
                 Some(it) => ("create an owned `String` on the left and add a borrow on the right", it),
             };
             diag.multipart_suggestion(
                 message,
+                // alloc: the suggestion's parts
                 vec![
                     (span, replacement),
+                    // alloc: the suggestion's text
                     (at(rhs_expr.syntax().text_range()).shrink_to_lo(), "&".to_owned()),
                 ],
                 Applicability::MachineApplicable,
@@ -643,7 +679,7 @@ fn raw_ptr_arithmetic<'db>(
     cx: &Cx<'_, 'db>,
     diag: &mut Diag,
     d: &hir::BinaryOperatorCannotBeApplied<'db>,
-    (lhs_expr, rhs_expr): (&ast::Expr, &ast::Expr),
+    (lhs_expr, rhs_expr): (ast::Expr<'_>, ast::Expr<'_>),
     file: hir::HirFileId,
 ) {
     let at = |range: TextRange| cx.span(InFile::new(file, range));
@@ -657,6 +693,7 @@ fn raw_ptr_arithmetic<'db>(
         BinaryOp::ArithOp(ArithOp::Add) if lhs_ptr && rhs_integral => {
             diag.multipart_suggestion(
                 "consider using `wrapping_add` or `add` for pointer + {integer}",
+                // alloc: the suggestion's parts
                 vec![(between, ".wrapping_add(".to_owned()), (rhs_end, ")".to_owned())],
                 Applicability::MaybeIncorrect,
             );
@@ -665,6 +702,7 @@ fn raw_ptr_arithmetic<'db>(
             if lhs_ptr && rhs_integral {
                 diag.multipart_suggestion(
                     "consider using `wrapping_sub` or `sub` for pointer - {integer}",
+                    // clone: the suggestion's spans; alloc: its parts
                     vec![(between.clone(), ".wrapping_sub(".to_owned()), (rhs_end.clone(), ")".to_owned())],
                     Applicability::MaybeIncorrect,
                 );
@@ -672,10 +710,11 @@ fn raw_ptr_arithmetic<'db>(
             if lhs_ptr && d.rhs.is_raw_ptr() {
                 diag.multipart_suggestion(
                     "consider using `offset_from` for pointer - pointer if the pointers point to the same allocation",
+                    // alloc: the suggestion's parts
                     vec![
-                        (at(lhs_range).shrink_to_lo(), "unsafe { ".to_owned()),
-                        (between, ".offset_from(".to_owned()),
-                        (rhs_end, ") }".to_owned()),
+                        (at(lhs_range).shrink_to_lo(), "unsafe { ".to_owned()), // alloc: its text
+                        (between, ".offset_from(".to_owned()),                  // alloc: its text
+                        (rhs_end, ") }".to_owned()),                            // alloc: its text
                     ],
                     Applicability::MaybeIncorrect,
                 );
@@ -691,15 +730,16 @@ fn raw_ptr_arithmetic<'db>(
                     .path()
                     .and_then(|it| it.segment())
                     .and_then(|it| it.name_ref())
-                    .map_or_else(|| "_".to_owned(), |it| it.text().to_string()),
-                _ => lhs_expr.syntax().text().to_string(),
+                    .map_or_else(|| "_".to_owned(), |it| it.text().to_owned()), // alloc: its text
+                _ => lhs_expr.syntax().text().to_owned(), // alloc: the suggestion's text
             };
             diag.multipart_suggestion(
                 message,
+                // alloc: the suggestion's parts
                 vec![
-                    (at(lhs_range).shrink_to_lo(), format!("{name} = ")),
-                    (between, format!(".{method}(")),
-                    (rhs_end, ")".to_owned()),
+                    (at(lhs_range).shrink_to_lo(), format!("{name} = ")), // alloc: its text
+                    (between, format!(".{method}(")),                     // alloc: its text
+                    (rhs_end, ")".to_owned()),                            // alloc: its text
                 ],
                 Applicability::MaybeIncorrect,
             );

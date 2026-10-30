@@ -10,10 +10,9 @@
 use base_db::Db;
 use blaze_items::ItemId;
 use hir::{
-    Adt, AsAssocItem as _, AssocItem, AssocItemContainer, HasSource as _, HasVisibility as _, InFile, ModuleDef,
-    StructKind, Variant,
+    Adt, AsAssocItem as _, AssocItem, AssocItemContainer, HasVisibility as _, InFile, ModuleDef, StructKind, Variant,
 };
-use syntax::{AstNode, SyntaxNode, ast, ast::HasName as _};
+use syntax::view::{self as ast, AstNode as _, HasGenericArgs as _, HasName as _, Node};
 
 use crate::cx::Cx;
 
@@ -151,39 +150,33 @@ impl Def {
     }
 
     /// The node `self` is written as, whose attributes are its own.
-    pub(super) fn source(self, cx: &Cx<'_, '_>) -> Option<InFile<SyntaxNode>> {
+    pub(super) fn source<'db>(self, cx: &Cx<'_, 'db>) -> Option<InFile<Node<'db>>> {
         let db = cx.db;
-        fn node<N: AstNode>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
-            it.map(|it| it.map(|it| it.syntax().clone()))
+        fn node<'db, N: ast::AstNode<'db>>(it: Option<InFile<N>>) -> Option<InFile<Node<'db>>> {
+            it.map(|it| it.map(|it| it.syntax()))
         }
         match self {
-            Def::Field(it) => it.source(db).map(|it| {
-                it.map(|it| match it {
-                    hir::FieldSource::Named(it) => it.syntax().clone(),
-                    hir::FieldSource::Pos(it) => it.syntax().clone(),
-                })
-            }),
+            Def::Field(it) => node(cx.vsema.source(it)),
             Def::Ctor(it) => Def::variant(it).source(cx),
             Def::Item(item) => match item {
-                ModuleDef::Module(it) => match it.declaration_source(db) {
-                    Some(decl) => node(Some(decl)),
-                    None => Some(it.definition_source(db).map(|it| it.node())),
+                ModuleDef::Module(it) => match it.declaration_source_view(db) {
+                    Some(decl) => {
+                        // records the declaring file's tree, so `cx.vsema` knows `decl`
+                        cx.vsema.parse_or_expand(decl.file_id);
+                        node(Some(decl))
+                    }
+                    None => Some(cx.vsema.module_definition_node(it)),
                 },
-                ModuleDef::Function(it) => node(it.source(db)),
-                ModuleDef::Adt(Adt::Struct(it)) => node(it.source(db)),
-                ModuleDef::Adt(Adt::Union(it)) => node(it.source(db)),
-                ModuleDef::Adt(Adt::Enum(it)) => node(it.source(db)),
-                ModuleDef::EnumVariant(it) => node(it.source(db)),
-                ModuleDef::Const(it) => node(it.source(db)),
-                ModuleDef::Static(it) => node(it.source(db)),
-                ModuleDef::Trait(it) => node(it.source(db)),
-                ModuleDef::TypeAlias(it) => node(it.source(db)),
-                ModuleDef::Macro(it) => it.source(db).map(|it| {
-                    it.map(|it| match it {
-                        either::Either::Left(it) => it.syntax().clone(),
-                        either::Either::Right(it) => it.syntax().clone(),
-                    })
-                }),
+                ModuleDef::Function(it) => node(cx.vsema.source(it)),
+                ModuleDef::Adt(Adt::Struct(it)) => node(cx.vsema.source(it)),
+                ModuleDef::Adt(Adt::Union(it)) => node(cx.vsema.source(it)),
+                ModuleDef::Adt(Adt::Enum(it)) => node(cx.vsema.source(it)),
+                ModuleDef::EnumVariant(it) => node(cx.vsema.source(it)),
+                ModuleDef::Const(it) => node(cx.vsema.source(it)),
+                ModuleDef::Static(it) => node(cx.vsema.source(it)),
+                ModuleDef::Trait(it) => node(cx.vsema.source(it)),
+                ModuleDef::TypeAlias(it) => node(cx.vsema.source(it)),
+                ModuleDef::Macro(it) => node(cx.vsema.source(it)),
                 ModuleDef::BuiltinType(_) => None,
             },
         }
@@ -213,7 +206,7 @@ pub(super) fn trait_item(db: &Db, item: ModuleDef) -> ModuleDef {
     let AssocItemContainer::Impl(imp) = assoc.container(db) else { return item };
     let Some(trait_) = imp.trait_(db) else { return item };
     let Some(name) = assoc.name(db) else { return item };
-    let found = trait_.items(db).into_iter().find(|it| {
+    let found = trait_.items_iter(db).find(|it| {
         it.name(db).as_ref() == Some(&name)
             && matches!(
                 (it, assoc),
@@ -235,16 +228,22 @@ pub(super) fn trait_item(db: &Db, item: ModuleDef) -> ModuleDef {
 /// from here; an associated item by what it is of, an inherent impl by its type when the
 /// impl is next to the type and as `<impl T>` in its parent else; a field or variant by
 /// what it is of; a constructor as its struct or variant.
+///
+/// Called only for a diagnostic that fires, as are the printers below it: their strings are
+/// the edge.
 pub(super) fn path(cx: &Cx<'_, '_>, def: Def) -> Option<String> {
     let db = cx.db;
+    // alloc: a segment of the path a firing diagnostic prints
     let name = |it: hir::Name| it.display(db, cx.edition).to_string();
     match def {
         Def::Ctor(it) => path(cx, Def::variant(it)),
         Def::Field(it) => {
+            // alloc: the path a firing diagnostic prints
             Some(format!("{}::{}", path(cx, Def::variant(it.parent_def(db)))?, name(it.name(db))))
         }
         Def::Item(ModuleDef::EnumVariant(it)) => {
             let parent = path(cx, Def::Item(ModuleDef::Adt(Adt::Enum(it.parent_enum(db)))))?;
+            // alloc: the path a firing diagnostic prints
             Some(format!("{parent}::{}", name(it.name(db))))
         }
         Def::Item(item) => {
@@ -261,6 +260,7 @@ pub(super) fn path(cx: &Cx<'_, '_>, def: Def) -> Option<String> {
                     AssocItemContainer::Trait(it) => path(cx, Def::Item(ModuleDef::Trait(it)))?,
                     AssocItemContainer::Impl(it) => impl_path(cx, it, value)?,
                 };
+                // alloc: the path a firing diagnostic prints
                 return Some(format!("{parent}::{own}"));
             }
             if def.krate(db)? == cx.krate {
@@ -283,19 +283,23 @@ fn visible_path(cx: &Cx<'_, '_>, item: ModuleDef) -> String {
         && it.is_crate_root(db)
         && let Some(dep) = deps.iter().find(|dep| dep.krate == it.krate(db))
     {
+        // alloc: the path a firing diagnostic prints
         return dep.name.display(db, cx.edition).to_string();
     }
     if let Some(found) = root.find_use_path(db, hir::ItemInNs::from(item), hir::PrefixKind::Plain, cfg)
         && found.kind == hir::PathKind::Plain
         && found.segments().first().is_some_and(|first| deps.iter().any(|dep| &dep.name == first))
     {
+        // alloc: the path a firing diagnostic prints
         return found.display(db, cx.edition).to_string();
     }
     let krate = item.module(db).map(|it| it.krate(db));
+    // alloc: the crate segment of the path a firing diagnostic prints
     let crate_name = krate.and_then(|it| it.display_name(db)).map(|it| it.crate_name().to_string()).unwrap_or_default();
     match item {
         ModuleDef::Module(it) if it.is_crate_root(db) => crate_name,
         _ => match item.canonical_path(db, cx.edition) {
+            // alloc: the path a firing diagnostic prints
             Some(path) => format!("{crate_name}::{path}"),
             None => crate_name,
         },
@@ -307,19 +311,23 @@ fn visible_path(cx: &Cx<'_, '_>, item: ModuleDef) -> String {
 fn impl_path(cx: &Cx<'_, '_>, imp: hir::Impl, value: bool) -> Option<String> {
     let db = cx.db;
     let self_ty = imp.self_ty(db);
-    let source = imp.source(db);
+    let source = cx.vsema.source(imp);
     if let Some(adt) = self_ty.as_adt()
         && adt.module(db) == imp.module(db)
     {
         let mut printed = path(cx, Def::Item(ModuleDef::Adt(adt)))?;
-        let args = source.as_ref().and_then(|it| match it.value.self_ty()? {
+        let args = source.and_then(|it| match it.value.self_ty()? {
             ast::Type::PathType(it) => it.path()?.segment()?.generic_arg_list(),
             _ => None,
         });
         if let Some(args) = args {
-            let args = args.generic_args().map(|it| it.syntax().text().to_string()).collect::<Vec<_>>().join(", ");
             printed.push_str(if value { "::<" } else { "<" });
-            printed.push_str(&args);
+            for (i, arg) in args.generic_args().enumerate() {
+                if i > 0 {
+                    printed.push_str(", ");
+                }
+                printed.push_str(arg.syntax().text());
+            }
             printed.push('>');
         }
         return Some(printed);
@@ -329,7 +337,7 @@ fn impl_path(cx: &Cx<'_, '_>, imp: hir::Impl, value: bool) -> Option<String> {
         None => cx.ty(&self_ty),
     };
     let parent = match source.filter(|_| imp.module(db).krate(db) == cx.krate) {
-        Some(source) => match def_parent(cx, source.map(|it| it.syntax().clone())) {
+        Some(source) => match def_parent(cx, source.map(|it| it.syntax())) {
             Some(parent) => Some(node_path(cx, parent)?),
             None => None,
         },
@@ -340,45 +348,51 @@ fn impl_path(cx: &Cx<'_, '_>, imp: hir::Impl, value: bool) -> Option<String> {
         }
     };
     Some(match parent {
+        // alloc: the path a firing diagnostic prints
         Some(parent) => format!("{parent}::<impl {ty}>"),
+        // alloc: the path a firing diagnostic prints
         None => format!("<impl {ty}>"),
     })
 }
 
 /// The path of the definition of this crate written at `node`, from the crate root.
-fn node_path(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<String> {
-    let own = match ast::Impl::cast(node.value.clone()) {
+fn node_path<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<String> {
+    let own = match ast::Impl::cast(node.value) {
         Some(it) => {
-            let imp = cx.sema.to_def2(node.with_value(&it))?;
+            let imp = cx.vsema.to_def(it)?;
             return impl_path(cx, imp, false);
         }
-        None => segment(cx, &node)?,
+        None => segment(cx, node)?,
     };
     match def_parent(cx, node) {
+        // alloc: the path a firing diagnostic prints
         Some(parent) => Some(format!("{}::{own}", node_path(cx, parent)?)),
         None => Some(own),
     }
 }
 
 /// The segment the definition at `node` adds to its parent's path.
-fn segment(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<String> {
+fn segment<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<String> {
     if ast::ClosureExpr::can_cast(node.value.kind()) {
-        let parent = def_parent(cx, node.clone());
-        let index = closure_index(cx, parent.as_ref(), node);
+        let parent = def_parent(cx, node);
+        let index = closure_index(cx, parent, node);
+        // alloc: the path a firing diagnostic prints
         return Some(format!("{{closure#{index}}}"));
     }
-    if let Some(it) = ast::Const::cast(node.value.clone())
+    if let Some(it) = ast::Const::cast(node.value)
         && it.name().is_none()
     {
+        // alloc: the path a firing diagnostic prints
         return Some("_".to_owned());
     }
-    let named = ast::AnyHasName::cast(node.value.clone())?;
+    let named = ast::AnyHasName::cast(node.value)?;
+    // alloc: the path a firing diagnostic prints
     Some(named.name()?.text().to_string())
 }
 
 /// Which of the closures of `parent` (the crate root when `None`) `closure` is, in the order
 /// rustc numbers them: as they are written.
-fn closure_index(cx: &Cx<'_, '_>, parent: Option<&InFile<SyntaxNode>>, closure: &InFile<SyntaxNode>) -> usize {
+fn closure_index<'db>(cx: &Cx<'_, 'db>, parent: Option<InFile<Node<'db>>>, closure: InFile<Node<'db>>) -> usize {
     let Some(parent) = parent.filter(|it| it.file_id == closure.file_id) else { return 0 };
     let mut index = 0;
     for node in parent.value.descendants() {
@@ -386,7 +400,7 @@ fn closure_index(cx: &Cx<'_, '_>, parent: Option<&InFile<SyntaxNode>>, closure: 
             return index;
         }
         if ast::ClosureExpr::can_cast(node.kind())
-            && def_parent(cx, closure.with_value(node.clone())).is_some_and(|it| it.value == parent.value)
+            && def_parent(cx, closure.with_value(node)).is_some_and(|it| it.value == parent.value)
         {
             index += 1;
         }
@@ -395,7 +409,7 @@ fn closure_index(cx: &Cx<'_, '_>, parent: Option<&InFile<SyntaxNode>>, closure: 
 }
 
 /// Whether a definition at `node` is the parent of the definitions written in it.
-pub(super) fn is_def_parent(node: &SyntaxNode) -> bool {
+pub(super) fn is_def_parent(node: Node<'_>) -> bool {
     use syntax::SyntaxKind::*;
     matches!(
         node.kind(),
@@ -406,39 +420,34 @@ pub(super) fn is_def_parent(node: &SyntaxNode) -> bool {
 /// The definition `node`'s is in (`opt_local_parent`): the nearest enclosing one, through a
 /// macro's expansion to where it was called and from a module's file to its `mod`; `None`
 /// at the crate root.
-pub(super) fn def_parent(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<InFile<SyntaxNode>> {
+pub(super) fn def_parent<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<InFile<Node<'db>>> {
     parent(cx, node, is_def_parent)
 }
 
 /// [`def_parent`], or the `extern` block in between: what deprecation is inherited from.
-pub(super) fn attr_parent(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<InFile<SyntaxNode>> {
+pub(super) fn attr_parent<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>) -> Option<InFile<Node<'db>>> {
     parent(cx, node, |it| is_def_parent(it) || it.kind() == syntax::SyntaxKind::EXTERN_BLOCK)
 }
 
-fn parent(
-    cx: &Cx<'_, '_>,
-    node: InFile<SyntaxNode>,
-    stop: impl Fn(&SyntaxNode) -> bool,
-) -> Option<InFile<SyntaxNode>> {
-    let db = cx.db;
+fn parent<'db>(
+    cx: &Cx<'_, 'db>,
+    node: InFile<Node<'db>>,
+    stop: impl Fn(Node<'db>) -> bool,
+) -> Option<InFile<Node<'db>>> {
     let (mut file, mut at) = (node.file_id, node.value.parent());
     loop {
         while let Some(node) = at {
-            if stop(&node) {
+            if stop(node) {
                 return Some(InFile::new(file, node));
             }
             at = node.parent();
         }
         match file.macro_file() {
-            Some(call) => {
-                let call = call.loc(db).to_node(db);
+            Some(_) => {
+                let call = cx.vsema.find_parent_file(file)?;
                 (file, at) = (call.file_id, call.value.parent());
             }
-            None => {
-                let module = cx.sema.hir_file_to_module_def(file)?;
-                let decl = module.declaration_source(db)?;
-                return Some(decl.map(|it| it.syntax().clone()));
-            }
+            None => return cx.vsema.find_parent_file(file),
         }
     }
 }

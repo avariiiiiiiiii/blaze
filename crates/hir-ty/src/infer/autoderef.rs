@@ -2,6 +2,7 @@
 
 use std::iter;
 
+use blaze_mem::Frame;
 use rustc_ast_ir::Mutability;
 
 use crate::{
@@ -29,29 +30,34 @@ impl<'db> InferenceTable<'db> {
 }
 
 impl<'db, Ctx: AutoderefCtx<'db>> GeneralAutoderef<'db, Ctx> {
-    pub(crate) fn adjust_steps_as_infer_ok(&mut self) -> InferOk<'db, Vec<Adjustment>> {
+    pub(crate) fn adjust_steps_as_infer_ok<'f>(
+        &mut self,
+        frame: &'f Frame,
+    ) -> InferOk<'db, Vec<Adjustment, &'f Frame>> {
         let steps = self.steps();
+        let mut adjustments = Vec::with_capacity_in(steps.len(), frame);
         if steps.is_empty() {
-            return InferOk { obligations: PredicateObligations::new(), value: vec![] };
+            return InferOk { obligations: PredicateObligations::new(), value: adjustments };
         }
 
         let targets = steps.iter().skip(1).map(|&(ty, _)| ty).chain(iter::once(self.final_ty()));
-        let steps: Vec<_> = steps
-            .iter()
-            .map(|&(_source, kind)| {
-                if let AutoderefKind::Overloaded = kind {
-                    Some(OverloadedDeref(Mutability::Not))
-                } else {
-                    None
-                }
-            })
-            .zip(targets)
-            .map(|(autoderef, target)| Adjustment {
-                kind: Adjust::Deref(autoderef),
-                target: target.store(),
-            })
-            .collect();
+        adjustments.extend(
+            steps
+                .iter()
+                .map(|&(_source, kind)| {
+                    if let AutoderefKind::Overloaded = kind {
+                        Some(OverloadedDeref(Mutability::Not))
+                    } else {
+                        None
+                    }
+                })
+                .zip(targets)
+                .map(|(autoderef, target)| Adjustment {
+                    kind: Adjust::Deref(autoderef),
+                    target: target.store(),
+                }),
+        );
 
-        InferOk { obligations: self.take_obligations(), value: steps }
+        InferOk { obligations: self.take_obligations(), value: adjustments }
     }
 }

@@ -44,7 +44,7 @@ pub enum FormatSpecifier {
 // FIXME: Remove this, we can use rustc_format_parse instead
 pub fn lex_format_specifiers(
     string: &ast::String,
-    mut callback: &mut dyn FnMut(TextRange, FormatSpecifier),
+    mut callback: &mut impl FnMut(TextRange, FormatSpecifier),
 ) {
     let mut char_ranges = Vec::new();
     string.escaped_char_ranges(&mut |range, res| char_ranges.push((range, res)));
@@ -295,5 +295,25 @@ pub fn lex_format_specifiers(
         let offset = TextSize::from(1);
         callback(TextRange::new(range.start() - offset, range.end()), FormatSpecifier::Escape);
         chars.next();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use span::Edition;
+    use syntax::{AstNode, AstToken, ast};
+
+    #[test]
+    fn lexes_an_escape_and_a_spec() {
+        let file = ast::SourceFile::parse(r#"fn f() { "{{{x:>5}"; }"#, Edition::CURRENT).tree();
+        let string = file
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find_map(ast::String::cast)
+            .unwrap();
+        let mut kinds = Vec::new();
+        super::lex_format_specifiers(&string, &mut |_, kind| kinds.push(format!("{kind:?}")));
+        assert_eq!(kinds, ["Escape", "Open", "Identifier", "Colon", "Align", "Integer", "Close"]);
     }
 }

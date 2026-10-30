@@ -17,6 +17,7 @@ mod eval_ctxt;
 pub mod inspect;
 mod normalizes_to;
 mod project_goals;
+mod scratch;
 mod search_graph;
 mod trait_goals;
 
@@ -33,6 +34,7 @@ pub use self::eval_ctxt::{
     EvalCtxt, GenerateProofTree, SolverDelegateEvalExt,
     evaluate_root_goal_for_proof_tree_raw_provider, fast_path,
 };
+pub use self::scratch::{SearchStorage, SolverScratch};
 use crate::delegate::SolverDelegate;
 use crate::solve::assembly::Candidate;
 

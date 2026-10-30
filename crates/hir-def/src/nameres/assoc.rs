@@ -56,6 +56,7 @@ impl TraitItems {
             // FIXME(trait-alias) probably needs special handling here
             return (
                 TraitItems { macro_calls: ThinVec::new(), items: Box::default() },
+                // alloc: empty; allocates nothing
                 DefDiagnostics::new(vec![]),
             );
         }
@@ -166,10 +167,12 @@ impl<'db> AssocItemCollector<'db> {
             cfg_options: module_id.krate(db).cfg_options(db),
             file_id,
             container,
+            // alloc: the query's result, once per trait or impl
             items: Vec::new(),
 
             macro_depth: file_id.macro_expansion_depth(db),
             macro_calls: ThinVec::new(),
+            // alloc: the query's result, once per trait or impl
             diagnostics: Vec::new(),
         }
     }
@@ -319,7 +322,9 @@ impl<'db> AssocItemCollector<'db> {
                         .take_macros()
                         .map(|it| it.definition(self.db))
                 };
-                match macro_call_as_call_id(
+                // alloc: none unless the call is eager and its input holds macro calls
+                let mut eager_calls = Vec::new();
+                let call_id = macro_call_as_call_id(
                     self.db,
                     ast_id,
                     &path,
@@ -329,10 +334,14 @@ impl<'db> AssocItemCollector<'db> {
                     self.macro_depth + 1,
                     self.def_map.recursion_limit(),
                     resolver,
-                    &mut |ptr, call_id| {
-                        self.macro_calls.push((ptr.map(|(_, it)| it.upcast()), call_id))
-                    },
-                ) {
+                    &mut eager_calls,
+                );
+                self.macro_calls.extend(
+                    eager_calls
+                        .into_iter()
+                        .map(|(ptr, call_id)| (ptr.map(|(_, it)| it.upcast()), call_id)),
+                );
+                match call_id {
                     // FIXME: Expansion error?
                     Ok(call_id) => match call_id.value {
                         Some(call_id) => {

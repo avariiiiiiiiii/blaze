@@ -12,6 +12,14 @@
 //! No PDB is written: the debug directory's CodeView entry names one by the image's GUID,
 //! and that PDB is the one thing a Windows debugger looks for that blaze does not make, so
 //! debuggers and `std`'s backtraces (dbghelp) show addresses, not names or lines.
+//!
+//! A dev run ([`crate::DevRun`]) lays the image out on 64 KiB granules, the unit a view of the
+//! code memory maps at: the headers take the first granule, the code sections are one run from
+//! the second, every change of protection after them starts a granule, and the reservations
+//! (`.barena`, `.bcells`, `.bfixed`: no access, no raw data) come last. Each section's
+//! `VirtualSize` reaches the next section, as the NT loader wants them adjacent. The start hook
+//! is the first TLS callback (`.CRT$XLAB`, after the CRT's `__xl_a`), the TLS directory is
+//! always there, no base relocation lands in code and there is no CFG.
 
 mod coff;
 mod image;
@@ -24,7 +32,9 @@ use std::sync::Mutex;
 use blaze_codegen::Arch;
 use blaze_ids::radix;
 
-use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, SectionName, Special, Writer};
+use crate::model::{
+    Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Reserve, SectionName, Special, Writer,
+};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
 
 /// Where link.exe loads an executable and a DLL when the loader does not move them.
@@ -32,6 +42,14 @@ const EXE_BASE: u64 = 0x1_4000_0000;
 const DLL_BASE: u64 = 0x1_8000_0000;
 /// `SectionAlignment`, and the room for the headers before the first section.
 pub(crate) const PAGE: u64 = 0x1000;
+/// Windows' allocation granularity: a dev run's views of the code memory map at it, so its
+/// code, the first section after the code and its reservations start on one.
+pub(crate) const GRANULE: u64 = 0x1_0000;
+/// The function a dev run's first TLS callback points at (`blaze_inproc::runtime`).
+pub(crate) const START_HOOK: &str = "blaze_inproc_start";
+/// Where the start hook's pointer goes: after the CRT's `__xl_a` (`.CRT$XLA`), before every
+/// other TLS callback (std's is `.CRT$XLB`).
+const START_HOOK_SECTION: &str = ".CRT$XLAB";
 
 pub(crate) const IDATA: &str = "pe.idata";
 pub(crate) const EDATA: &str = "pe.edata";
@@ -72,6 +90,9 @@ pub(crate) fn writer(output: &Output) -> Result<Pe, LinkError> {
             output.arch
         )));
     }
+    if output.dev_run.is_some() && !matches!(output.kind, OutputKind::Executable { .. }) {
+        return Err(error("a dev run of a DLL: only an executable has a start hook and a code memory"));
+    }
     // alloc: once per link: the writer's own copy of the output it makes
     Ok(Pe { output: output.clone(), descriptors: Mutex::default() })
 }
@@ -104,6 +125,10 @@ impl Pe {
     pub(crate) fn base(&self) -> u64 {
         if self.dll() { DLL_BASE } else { EXE_BASE }
     }
+
+    pub(crate) fn dev_run(&self) -> bool {
+        self.output.dev_run.is_some()
+    }
 }
 
 /// Which section of the image a class goes in, in address order.
@@ -116,6 +141,10 @@ pub(crate) enum Segment {
     Tls,
     Rsrc,
     Reloc,
+    /// A dev run's reservations, one section each, in [`Reserve`]'s order.
+    Arena,
+    Cells,
+    Fixed,
 }
 
 impl Segment {
@@ -128,7 +157,14 @@ impl Segment {
             Segment::Tls => b".tls",
             Segment::Rsrc => b".rsrc",
             Segment::Reloc => b".reloc",
+            Segment::Arena => b".barena",
+            Segment::Cells => b".bcells",
+            Segment::Fixed => b".bfixed",
         }
+    }
+
+    pub(crate) fn reserve(self) -> bool {
+        matches!(self, Segment::Arena | Segment::Cells | Segment::Fixed)
     }
 }
 
@@ -158,6 +194,8 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Got => (Segment::Data, 2, ""),
         Class::PatchData => (Segment::Data, 3, ""),
         Class::InitArray => (Segment::Data, 4, ""),
+        // ELF's alone: `image::sections` refuses one.
+        Class::PreinitArray => (Segment::Data, 4, ""),
         Class::FiniArray => (Segment::Data, 5, ""),
         Class::Named { name, .. } => (Segment::Data, 6, name),
         Class::Synthetic(TLS_INDEX) => (Segment::Data, 7, ""),
@@ -169,12 +207,15 @@ pub(crate) fn place(class: &Class) -> (Segment, u8, &str) {
         Class::Tbss => (Segment::Tls, 1, ""),
         Class::Synthetic(RELOC) => (Segment::Reloc, 0, ""),
         Class::Synthetic(name) => (Segment::Rdata, 8, name),
+        Class::Reserve(Reserve::Arena) => (Segment::Arena, 0, ""),
+        Class::Reserve(Reserve::Cells) => (Segment::Cells, 0, ""),
+        Class::Reserve(Reserve::Fixed) => (Segment::Fixed, 0, ""),
     }
 }
 
-/// Whether a class's regions are zeros not in the file.
+/// Whether a class's regions are not in the file: zeros, or a reservation.
 pub(crate) fn zeroed(class: &Class) -> bool {
-    matches!(class, Class::Bss | Class::Tbss)
+    matches!(class, Class::Bss | Class::Tbss | Class::Reserve(_))
 }
 
 /// The rank of a grouped section's `$` suffix: link.exe sorts the pieces of a section by the
@@ -204,10 +245,11 @@ impl Writer for Pe {
     }
 
     fn plan(&self) -> Plan {
+        let page = if self.dev_run() { GRANULE } else { PAGE };
         Plan {
             base: self.base(),
-            headers: PAGE,
-            page: PAGE,
+            headers: page,
+            page,
             indexed_code: false,
             got_by_library: true,
             tls_descriptors: false,
@@ -234,6 +276,7 @@ impl Writer for Pe {
             Segment::Text => Prot::RX,
             Segment::Data | Segment::Tls => Prot::RW,
             Segment::Rdata | Segment::Pdata | Segment::Rsrc | Segment::Reloc => Prot::R,
+            Segment::Arena | Segment::Cells | Segment::Fixed => Prot::NONE,
         }
     }
 
@@ -287,8 +330,12 @@ impl Writer for Pe {
         coff::read(self, name, bytes, kind)
     }
 
+    fn start_hook(&self) -> Result<(Class, u32), String> {
+        self.section(START_HOOK_SECTION, false, false, false)
+    }
+
     fn synthetic(&self, counts: &Counts) -> Vec<(Class, u64)> {
-        image::synthetic(counts)
+        image::synthetic(counts, self.dev_run())
     }
 
     fn apply(
@@ -307,7 +354,7 @@ impl Writer for Pe {
         ))
     }
 
-    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, crate::cow::CowBytes)>, LinkError> {
         image::synthesize(placed)
     }
 

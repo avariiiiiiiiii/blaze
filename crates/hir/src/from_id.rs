@@ -51,6 +51,7 @@ from_id![
     (hir_def::MacroId, crate::Macro),
     (hir_def::ExternCrateId, crate::ExternCrateDecl),
     (hir_def::ExternBlockId, crate::ExternBlock),
+    (hir_def::UseId, crate::UseDecl),
 ];
 
 impl_from!(AdtId { StructId => Struct, UnionId => Union, EnumId => Enum } for Adt);

@@ -372,7 +372,8 @@ impl Server {
         }
         let tag = self.tag();
         self.pending.insert(tag, Pending::Recv(conn));
-        effects.push(Effect::Recv { conn, most, tag });
+        // alloc: the room the driver reserves, which the frames then keep (`push_vec`).
+        effects.push(Effect::Recv { conn, most, into: Vec::new(), tag });
         if let Some(connection) = self.conns.get_mut(&conn) {
             connection.receiving = Some(tag);
         }
@@ -410,12 +411,16 @@ impl Server {
             return;
         }
         connection.sending = None;
-        if done != Done::Sent {
+        let Done::Sent(spare) = done else {
             return self.gone(conn, effects);
-        }
+        };
+        // The buffer sent is the queue's next, its room kept.
         if !connection.queue.is_empty() {
-            let bytes = std::mem::take(&mut connection.queue);
+            let bytes = std::mem::replace(&mut connection.queue, spare);
             return self.send(conn, bytes, effects);
+        }
+        if connection.queue.capacity() == 0 {
+            connection.queue = spare;
         }
         if connection.closing {
             return self.gone(conn, effects);
@@ -623,8 +628,8 @@ impl Server {
 /// A connection's queue, with room for a burst of replies when a send took it.
 fn room(queue: &mut Vec<u8>) -> &mut Vec<u8> {
     if queue.capacity() == 0 {
-        // alloc: one buffer for the replies queued until the next send, which takes it
-        // (`Effect::Send` owns its bytes; v2/requests/core.md K3 would hand it back).
+        // alloc: one buffer for the replies queued until the next send, which takes it; the
+        // send's end hands it back to the queue (`Server::sent`), so only the first allocates.
         queue.reserve(QUEUE);
     }
     queue

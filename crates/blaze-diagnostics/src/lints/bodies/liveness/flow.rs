@@ -48,7 +48,20 @@ pub(super) struct Places<'db> {
     locals: Vec<Index>,
     /// The closure's own local when the closure is borrowed, with the place of each capture
     /// it owns, which the body uses in place (`(*_1).f`).
-    in_closure: Option<(LocalId, Vec<Index>)>,
+    in_closure: Option<(LocalId, SmallVec<[Index; 4]>)>,
+}
+
+/// The tables of [`Places`], [`Cfg`] and the sightings, kept from body to body.
+#[derive(Default)]
+pub(super) struct Tables<'db> {
+    kinds: Vec<Kind>,
+    tys: Vec<Ty<'db>>,
+    locals: Vec<Index>,
+    succ: Vec<SmallVec<[BasicBlockId; 2]>>,
+    pred: Vec<SmallVec<[BasicBlockId; 2]>>,
+    postorder: Vec<BasicBlockId>,
+    stack: Vec<(BasicBlockId, usize)>,
+    pub(super) sightings: Vec<Sighting<'db>>,
 }
 
 pub(super) fn raw_local(local: LocalId) -> usize {
@@ -60,8 +73,22 @@ fn raw(block: BasicBlockId) -> usize {
 }
 
 impl<'db> Places<'db> {
-    pub(super) fn new(locals: usize) -> Places<'db> {
-        Places { kinds: Vec::new(), tys: Vec::new(), locals: vec![NONE; locals], in_closure: None }
+    pub(super) fn new(locals: usize, tables: &mut Tables<'db>) -> Places<'db> {
+        let mut kinds = std::mem::take(&mut tables.kinds);
+        kinds.clear();
+        let mut tys = std::mem::take(&mut tables.tys);
+        tys.clear();
+        let mut by_local = std::mem::take(&mut tables.locals);
+        by_local.clear();
+        by_local.resize(locals, NONE);
+        Places { kinds, tys, locals: by_local, in_closure: None }
+    }
+
+    /// Gives the tables back for the next body.
+    pub(super) fn give_back(self, tables: &mut Tables<'db>) {
+        tables.kinds = self.kinds;
+        tables.tys = self.tys;
+        tables.locals = self.locals;
     }
 
     pub(super) fn len(&self) -> usize {
@@ -82,7 +109,7 @@ impl<'db> Places<'db> {
     /// Makes the capture `at`, the field `field` of the borrowed closure `closure`, used in
     /// place.
     pub(super) fn in_closure(&mut self, closure: LocalId, field: u32, at: Index) {
-        let (_, fields) = self.in_closure.get_or_insert_with(|| (closure, Vec::new()));
+        let (_, fields) = self.in_closure.get_or_insert_with(|| (closure, SmallVec::new()));
         let field = field as usize;
         if fields.len() <= field {
             fields.resize(field + 1, NONE);
@@ -185,28 +212,36 @@ pub(super) struct Cfg {
 impl Cfg {
     /// The blocks reachable from the start, by every edge rustc's MIR has (unwinding, a
     /// match's false edges), but none into a block rustc builds no way into.
-    pub(super) fn new(mir: &MirBody<'_>, again: bool) -> Cfg {
+    pub(super) fn new(mir: &MirBody<'_>, again: bool, tables: &mut Tables<'_>) -> Cfg {
         let n = mir.basic_blocks.len();
         let start = mir.start_block;
         let mut unreached: BitSet = BitSet::new(n);
         for &it in &mir.unreached {
             unreached.insert(raw(it));
         }
-        let mut succ = vec![SmallVec::new(); n];
+        let mut succ = std::mem::take(&mut tables.succ);
+        succ.clear();
+        succ.resize_with(n, SmallVec::new);
         for (block, data) in mir.basic_blocks.iter() {
             let Some(terminator) = &data.terminator else { continue };
             let edges: SmallVec<[BasicBlockId; 2]> = match &terminator.kind {
+                // alloc: inline, a `SmallVec` of one allocates nothing
                 TerminatorKind::Return | TerminatorKind::UnwindResume if again => smallvec::smallvec![start],
                 TerminatorKind::FalseEdge { real_target, imaginary_target } => {
+                    // alloc: inline, a `SmallVec` of two allocates nothing
                     smallvec::smallvec![*real_target, *imaginary_target]
                 }
+                // alloc: into a `SmallVec` of two, inline but for a switch of more targets
                 kind => kind.successors().into_iter().chain(kind.unwind()).collect(),
             };
-            succ[raw(block)] = edges.into_iter().filter(|it| !unreached.contains(raw(*it))).collect();
+            succ[raw(block)].extend(edges.into_iter().filter(|it| !unreached.contains(raw(*it))));
         }
         let mut visited: BitSet = BitSet::new(n);
-        let mut postorder = Vec::new();
-        let mut stack: Vec<(BasicBlockId, usize)> = vec![(start, succ[raw(start)].len())];
+        let mut postorder = std::mem::take(&mut tables.postorder);
+        postorder.clear();
+        let mut stack = std::mem::take(&mut tables.stack);
+        stack.clear();
+        stack.push((start, succ[raw(start)].len()));
         visited.insert(raw(start));
         while let Some(top) = stack.len().checked_sub(1) {
             let (block, left) = stack[top];
@@ -221,7 +256,10 @@ impl Cfg {
                 stack.push((next, succ[raw(next)].len()));
             }
         }
-        let mut pred = vec![SmallVec::new(); n];
+        tables.stack = stack;
+        let mut pred = std::mem::take(&mut tables.pred);
+        pred.clear();
+        pred.resize_with(n, SmallVec::new);
         for &block in &postorder {
             for &next in &succ[raw(block)] {
                 pred[raw(next)].push(block);
@@ -230,12 +268,20 @@ impl Cfg {
         Cfg { succ, pred, postorder, start }
     }
 
+    /// Gives the tables back for the next body.
+    pub(super) fn give_back(self, tables: &mut Tables<'_>) {
+        tables.succ = self.succ;
+        tables.pred = self.pred;
+        tables.postorder = self.postorder;
+    }
+
     /// rustc's `Location::is_predecessor_of`: `to` can be reached from `from`.
     pub(super) fn reaches(&self, from: Loc, to: Loc) -> bool {
         if from.block == to.block && from.index < to.index {
             return true;
         }
         let mut visited: BitSet = BitSet::new(self.pred.len());
+        // alloc: asked only of a dead assignment found, which is reported
         let mut queue: Vec<BasicBlockId> = self.pred[raw(to.block)].to_vec();
         while let Some(block) = queue.pop() {
             if !visited.insert(raw(block)) {
@@ -503,9 +549,13 @@ impl<'m, 'p, 'db> Flow<'m, 'p, 'db> {
     /// Every assignment of a checked place in the blocks reachable from the start, with its
     /// liveness after it, and of the parameters and captures where the body starts: rustc's
     /// `find_dead_assignments`.
-    pub(super) fn assignments(&self, closures: &mut super::Liveness<'_, '_, 'db>) -> Seen<'m> {
+    pub(super) fn assignments(
+        &self,
+        closures: &mut super::Liveness<'_, '_, 'db>,
+        sightings: Vec<Sighting<'m>>,
+    ) -> Seen<'m> {
         let n = self.places.len();
-        let mut found = Seen { sightings: Vec::new(), ever_live: PlaceSet::new(n), ever_dropped: PlaceSet::new(n) };
+        let mut found = Seen { sightings, ever_live: PlaceSet::new(n), ever_dropped: PlaceSet::new(n) };
         let mut state = PlaceSet::new(n);
         let mir: &'m MirBody<'db> = self.mir;
         for &block in &self.cfg.postorder {

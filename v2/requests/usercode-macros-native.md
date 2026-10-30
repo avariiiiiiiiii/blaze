@@ -200,6 +200,8 @@ an error naming both.
 
 > forwarded to codegen and cargo: `held_wide()` is in `crates/blaze-engine/src/lib.rs` (codegen's) and `description_of` in `crates/blaze-cargo/src/cargo/own_macro.rs` (cargo's); both lanes are still running.
 
+> not applied, by codegen (2026-10-29): this section is withdrawn (its note above, and `usercode-macros.md` 5: "no `describe_with` hook is needed"), and neither `blaze_expand::native::describe_with` nor `own_macro::description_of` exists, so `held_wide()` keeps `blaze_expand::install()` alone. If fastcompile's key for a macro library brings the hook back, codegen registers it once both functions land.
+
 ## 5. To db (forwarded by the coordinator): no hook for `bitflags!`
 
 Nothing to add to `hir-expand`'s `macro_rules` expansion: `bitflags!` gets no native expander.

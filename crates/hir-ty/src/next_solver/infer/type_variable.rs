@@ -12,9 +12,10 @@ use tracing::debug;
 use crate::Span;
 use crate::next_solver::Ty;
 use crate::next_solver::infer::iter_idx_range;
+use crate::next_solver::infer::touched::Touched;
 use crate::next_solver::infer::union_find::{NoError, UnifyValue, UnionFind, UnionFindMark};
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct TypeVariableStorage<'db> {
     /// Two variables are unified in `eq_relations` when we have a
     /// constraint `?X == ?Y`. This table also stores, for each key,
@@ -80,7 +81,40 @@ impl<'db> TypeVariableValue<'db> {
     }
 }
 
+impl Clone for TypeVariableStorage<'_> {
+    fn clone(&self) -> Self {
+        TypeVariableStorage {
+            // clone: only `InferCtxt::fork` copies a table.
+            eq_relations: self.eq_relations.clone(),
+            // clone: only `InferCtxt::fork` copies a table.
+            sub_unification_table: self.sub_unification_table.clone(),
+            // clone: only `InferCtxt::fork` copies a table.
+            params: self.params.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.eq_relations.clone_from(&source.eq_relations);
+        self.sub_unification_table.clone_from(&source.sub_unification_table);
+        self.params.clone_from(&source.params);
+    }
+}
+
 impl<'db> TypeVariableStorage<'db> {
+    /// Back to `default()`, its capacity kept.
+    pub(crate) fn empty(&mut self) {
+        self.eq_relations.empty();
+        self.sub_unification_table.empty();
+        self.params.clear();
+    }
+
+    /// Bytes it holds room for.
+    pub(crate) fn held(&self) -> usize {
+        self.eq_relations.held()
+            + self.sub_unification_table.held()
+            + self.params.capacity() * size_of::<(TyVid, TypeParamId)>()
+    }
+
     #[inline]
     pub(crate) fn table(&mut self) -> TypeVariableTable<'_, 'db> {
         TypeVariableTable { storage: self }
@@ -103,6 +137,18 @@ impl<'db> TypeVariableStorage<'db> {
     #[inline]
     pub(crate) fn changes(&self) -> u64 {
         self.eq_relations.changes() + self.sub_unification_table.changes()
+    }
+
+    /// The rows written in the equality table; see `infer::touched`.
+    #[inline]
+    pub(crate) fn touched_eq(&self) -> &Touched {
+        self.eq_relations.touched()
+    }
+
+    /// The rows written in the sub-unification table.
+    #[inline]
+    pub(crate) fn touched_sub(&self) -> &Touched {
+        self.sub_unification_table.touched()
     }
 
     pub(crate) fn start_snapshot(&mut self) -> TypeVariableMark {

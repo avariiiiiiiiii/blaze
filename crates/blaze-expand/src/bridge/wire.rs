@@ -1,196 +1,17 @@
 //! The hosts' side of the encoding a stream crosses into and out of a macro's `proc_macro` in
 //! (`crates/blaze-expand/src/native/proc_macro/api.rs`, `wire`): a token tree's columns as
-//! `tt::TopSubtree::write_wire` lays them out, each span part named by its index in the
+//! `tt::Tree::write_wire` lays them out, each span part named by its index in the
 //! [`Parts`] of the expansion, and each span the macro holds a word of those parts. The wasm
 //! host writes and reads the bytes of every stream; the in-process bridge passes trees as they
 //! are, and writes bytes only of text a macro asks to be tokens of.
 
-use rustc_hash::FxHashMap;
-use span::{
-    EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange, TextSize,
-};
-use tt::{
-    DelimiterKind, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree, TopSubtreeBuilder,
-    WirePart,
-};
+use span::Span;
+use tt::{DelimiterKind, Leaf, LitKind, Spacing, Subtree, TokenTree, TopSubtree, TopSubtreeBuilder};
 
-/// The word of no span: a wide index never given out.
-pub const NONE: u64 = u64::MAX;
-/// A packed span's `len_part` that makes its `start` an index of the wide spans.
-const WIDE: u32 = u32::MAX;
-/// What a packed span's length and part each stay under.
-const NARROW: u32 = 0xFFFF;
-/// How many parts are found by a scan before a map is built.
-const SCAN: usize = 8;
+pub use native_proc_macro::__native::{NARROW, NONE, Part, Parts, WIDE};
+
 /// The words of a tree's header.
 const HEADER: usize = 6;
-
-/// A span's anchor and context: what the spans of an expansion share.
-pub type Part = (SpanAnchor, SyntaxContext);
-
-/// The span parts of an expansion, in the order first given out (the def, call and mixed
-/// sites, the input's, the attribute's, then what span operations make), and its spans too
-/// wide to pack. A span is a word: `start | len_part << 32`, `len_part` being `len | part << 16`
-/// when both are under [`NARROW`], else [`WIDE`] with `start` an index of the wide spans, as
-/// tt packs a span. Both tables hold each entry once and a span packs whenever it can, so
-/// equal spans have equal words.
-#[derive(Default)]
-pub struct Parts {
-    list: Vec<Part>,
-    /// Each part's index, once there are more than [`SCAN`].
-    map: FxHashMap<Part, u32>,
-    /// The part asked for last and its index: tokens near each other share one.
-    last: Option<(Part, u32)>,
-    wide: Vec<[u32; 3]>,
-    wides: FxHashMap<[u32; 3], u32>,
-}
-
-impl Parts {
-    /// Forgets every part and wide span, keeping the room, for the next expansion.
-    pub fn clear(&mut self) {
-        self.list.clear();
-        self.map.clear();
-        self.last = None;
-        self.wide.clear();
-        self.wides.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.list.len()
-    }
-
-    pub fn all(&self) -> &[Part] {
-        &self.list
-    }
-
-    /// The index of the part `(anchor, ctx)`, the next one when it is new.
-    #[inline]
-    pub fn part(&mut self, anchor: SpanAnchor, ctx: SyntaxContext) -> u32 {
-        let part = (anchor, ctx);
-        if let Some((last, index)) = self.last
-            && last == part
-        {
-            return index;
-        }
-        let index = self.index(part);
-        self.last = Some((part, index));
-        index
-    }
-
-    fn index(&mut self, part: Part) -> u32 {
-        if self.list.len() <= SCAN {
-            if let Some(at) = self.list.iter().position(|it| *it == part) {
-                return at as u32;
-            }
-            let at = self.list.len() as u32;
-            self.list.push(part);
-            if self.list.len() > SCAN {
-                self.map.reserve(4 * SCAN);
-                self.map.extend(self.list.iter().enumerate().map(|(at, &it)| (it, at as u32)));
-            }
-            return at;
-        }
-        let next = self.list.len() as u32;
-        let list = &mut self.list;
-        *self.map.entry(part).or_insert_with(|| {
-            list.push(part);
-            next
-        })
-    }
-
-    /// The word of `span`.
-    #[inline]
-    pub fn pack(&mut self, span: Span) -> u64 {
-        let part = self.part(span.anchor, span.ctx);
-        self.word(span.range.start().into(), span.range.len().into(), part)
-    }
-
-    /// The word of the span `start..start + len` of the part at `part`, which is one.
-    #[inline]
-    pub fn word(&mut self, start: u32, len: u32, part: u32) -> u64 {
-        if len < NARROW && part < NARROW {
-            return u64::from(start) | u64::from(len | part << 16) << 32;
-        }
-        self.wide_word([start, len, part])
-    }
-
-    #[cold]
-    fn wide_word(&mut self, span: [u32; 3]) -> u64 {
-        let next = self.wide.len() as u32;
-        let wide = &mut self.wide;
-        let at = *self.wides.entry(span).or_insert_with(|| {
-            wide.push(span);
-            next
-        });
-        u64::from(at) | u64::from(WIDE) << 32
-    }
-
-    /// The word the module asks for of `start`, `len` and `part` (`span_pack`): [`NONE`] for a
-    /// part it was never given or a span ending past 4 GiB.
-    pub fn pack_fields(&mut self, start: u32, len: u32, part: u32) -> u64 {
-        if part as usize >= self.list.len() || start.checked_add(len).is_none() {
-            return NONE;
-        }
-        self.word(start, len, part)
-    }
-
-    /// The span of `word`: `None` for a word no span of this expansion has, which a packed
-    /// span as long as only a wide one is, or of a part only a wide one has, is not either.
-    #[inline]
-    pub fn get(&self, word: u64) -> Option<Span> {
-        let [start, len, part] = self.fields_of(word)?;
-        let (anchor, ctx) = *self.list.get(part as usize)?;
-        let end = start.checked_add(len)?;
-        Some(Span { range: TextRange::new(TextSize::new(start), TextSize::new(end)), anchor, ctx })
-    }
-
-    fn fields_of(&self, word: u64) -> Option<[u32; 3]> {
-        let (start, len_part) = (word as u32, (word >> 32) as u32);
-        if len_part == WIDE {
-            return self.wide.get(start as usize).copied();
-        }
-        let (len, part) = (len_part & NARROW, len_part >> 16);
-        (len != NARROW && part != NARROW).then_some([start, len, part])
-    }
-
-    /// `[start, len, part]` of `word` (`span_unpack`), `[0, 0, u32::MAX]` for a word no span of
-    /// this expansion has: its part is then refused wherever the module names it.
-    pub fn fields(&self, word: u64) -> [u32; 3] {
-        match self.get(word) {
-            Some(_) => self.fields_of(word).expect("a span's word has its fields"),
-            None => [0, 0, u32::MAX],
-        }
-    }
-
-    /// The part a tree the module wrote names: `{ file_id: index, ast_id: 0, ctx: 0 }` with an
-    /// index of this expansion's parts, and nothing else.
-    pub fn named(&self, part: WirePart) -> Result<Part, String> {
-        match part {
-            WirePart { file_id, ast_id: 0, ctx: 0 } if (file_id as usize) < self.list.len() => {
-                Ok(self.list[file_id as usize])
-            }
-            // alloc: the message of a tree refused.
-            _ => Err(format!(
-                "the expansion has {} span parts, each named by its index alone",
-                self.list.len()
-            )),
-        }
-    }
-
-    /// The index of the part of the raw ids `write_wire` wrote of it.
-    fn part_written(&mut self, file_id: u32, ast_id: u32, ctx: u32) -> u32 {
-        let anchor = SpanAnchor {
-            file_id: EditionedFileId::from_raw(file_id),
-            ast_id: ErasedFileAstId::from_raw(ast_id),
-        };
-        // SAFETY: `from_u32` asks for a value `into_u32` gave of this process's contexts:
-        // `ctx` is what `write_wire` wrote of a part of a tree of this process the moment before
-        // (`relative`). Memory safety doesn't rest on it: a wrong value panics in `from_u32` or
-        // in salsa's checked lookup, or names another context's hygiene.
-        let ctx = unsafe { SyntaxContext::from_u32(ctx) };
-        self.part(anchor, ctx)
-    }
-}
 
 /// Where a tree's bytes hold its spans and what names its span parts: byte offsets, and counts.
 pub struct Sections {
@@ -303,8 +124,13 @@ fn aligned<'a>(bytes: &'a [u8], room: &'a mut Vec<u8>) -> &'a [u8] {
 /// what is wrong with them otherwise.
 pub fn read(bytes: &[u8], parts: &Parts) -> Result<TopSubtree, String> {
     // alloc: none: `room` takes memory only for bytes `aligned` copies.
-    let mut room = Vec::new();
-    let bytes = aligned(bytes, &mut room);
+    read_in(bytes, parts, &mut Vec::new())
+}
+
+/// [`read`], copying bytes off a 4-byte boundary into the caller's `room`, kept across
+/// reads, so a hit read from wherever the store has it takes no new memory for the copy.
+pub fn read_in(bytes: &[u8], parts: &Parts, room: &mut Vec<u8>) -> Result<TopSubtree, String> {
+    let bytes = aligned(bytes, room);
     let (tree, used) = TopSubtree::read_wire(bytes, &mut |part| parts.named(part))
         // alloc: the message of a tree refused.
         .map_err(|e| e.to_string())?;

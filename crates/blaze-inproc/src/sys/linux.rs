@@ -233,41 +233,129 @@ impl View {
         if range.start >= range.end || range.end > self.len {
             return;
         }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let ctr = ctr();
-            let (idc, dic) = (ctr & (1 << 28) != 0, ctr & (1 << 29) != 0);
-            let dline = 4usize << ((ctr >> 16) & 15);
-            let iline = 4usize << (ctr & 15);
-            let start = self.at as usize + range.start;
-            let end = self.at as usize + range.end;
-            if !idc {
-                let mut at = start & !(dline - 1);
-                while at < end {
-                    // SAFETY: `at` is in this view's mapping (within `range`, rounded down to a
-                    // line that starts in it); `dc cvau` cleans the line and changes no value.
-                    unsafe { std::arch::asm!("dc cvau, {}", in(reg) at, options(nostack, preserves_flags)) };
-                    at += dline;
-                }
+        // SAFETY: `range` is within this view's mapping (checked above), mapped while `self` lives.
+        unsafe { sync_icache(self.at as usize + range.start, self.at as usize + range.end) };
+    }
+}
+
+/// Makes code written at `start..end` right for instruction fetch on every core: on AArch64
+/// `dc cvau`, `dsb ish`, `ic ivau`, `dsb ish`, `isb` by the line sizes `CTR_EL0` gives (each
+/// step skipped when `CTR_EL0.IDC` or `DIC` says it is not needed); on x86-64, which keeps
+/// fetch coherent with stores, a fence.
+///
+/// # Safety
+///
+/// `start..end` is mapped readable: a maintenance operation on an unmapped line faults.
+unsafe fn sync_icache(start: usize, end: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let ctr = ctr();
+        let (idc, dic) = (ctr & (1 << 28) != 0, ctr & (1 << 29) != 0);
+        let dline = 4usize << ((ctr >> 16) & 15);
+        let iline = 4usize << (ctr & 15);
+        if !idc {
+            let mut at = start & !(dline - 1);
+            while at < end {
+                // SAFETY: `at` is in `start..end` rounded down to a line that starts in it,
+                // mapped (the caller's contract); `dc cvau` cleans the line and changes no value.
+                unsafe { std::arch::asm!("dc cvau, {}", in(reg) at, options(nostack, preserves_flags)) };
+                at += dline;
             }
-            // SAFETY: a barrier: it orders the cleans before what follows; touches no memory.
-            unsafe { std::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
-            if !dic {
-                let mut at = start & !(iline - 1);
-                while at < end {
-                    // SAFETY: as above; `ic ivau` invalidates instruction cache lines for the
-                    // physical memory of `at`, which every view of the object shares.
-                    unsafe { std::arch::asm!("ic ivau, {}", in(reg) at, options(nostack, preserves_flags)) };
-                    at += iline;
-                }
-                // SAFETY: a barrier, as above.
-                unsafe { std::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
-            }
-            // SAFETY: a context synchronization of this core only.
-            unsafe { std::arch::asm!("isb", options(nostack, preserves_flags)) };
         }
-        #[cfg(target_arch = "x86_64")]
+        // SAFETY: a barrier: it orders the cleans before what follows; touches no memory.
+        unsafe { std::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+        if !dic {
+            let mut at = start & !(iline - 1);
+            while at < end {
+                // SAFETY: as above; `ic ivau` invalidates instruction cache lines for the
+                // physical memory of `at`, which every view of it shares.
+                unsafe { std::arch::asm!("ic ivau, {}", in(reg) at, options(nostack, preserves_flags)) };
+                at += iline;
+            }
+            // SAFETY: a barrier, as above.
+            unsafe { std::arch::asm!("dsb ish", options(nostack, preserves_flags)) };
+        }
+        // SAFETY: a context synchronization of this core only.
+        unsafe { std::arch::asm!("isb", options(nostack, preserves_flags)) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let _ = (start, end);
         std::sync::atomic::fence(std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Anonymous memory of this process: code, then data right after it, in one mapping.
+pub(crate) struct Exec {
+    at: *mut u8,
+    /// The code's pages, then the data's.
+    code_pages: usize,
+    len: usize,
+    data: usize,
+}
+
+// SAFETY: the code is never written once `Exec::new` returns, and the data only through
+// `&mut self`; nothing of the mapping is tied to a thread.
+unsafe impl Send for Exec {}
+// SAFETY: as above: `&self` reads only addresses.
+unsafe impl Sync for Exec {}
+
+impl Drop for Exec {
+    fn drop(&mut self) {
+        // SAFETY: `at..at + len` is this `Exec`'s own mapping; every slice of it borrowed `self`
+        // or ended with `Exec::new`'s `write`.
+        unsafe { libc::munmap(self.at.cast(), self.len) };
+    }
+}
+
+impl Exec {
+    pub(crate) fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+        let page = page() as usize;
+        let code_pages = code.max(1).next_multiple_of(page);
+        let len = code_pages + data.next_multiple_of(page);
+        // SAFETY: an anonymous mapping at no fixed address: nothing of this process is replaced.
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(os(&format!("mmap of {len:#x} bytes of code and data")));
+        }
+        let exec = Exec { at: at.cast(), code_pages, len, data };
+        // SAFETY: the fresh mapping of `len` readable and writable bytes, which nothing else
+        // refers to; `code <= code_pages` and `code_pages + data <= len`, so the slices are
+        // disjoint and in it. `write` can't keep them past its return (they borrow for the call).
+        let (code_bytes, data_bytes) = unsafe {
+            (std::slice::from_raw_parts_mut(exec.at, code), std::slice::from_raw_parts_mut(exec.at.add(code_pages), data))
+        };
+        write(code_bytes, data_bytes);
+        // SAFETY: the code's pages of the mapping above, which nothing writes from here on.
+        if unsafe { libc::mprotect(exec.at.cast(), code_pages, libc::PROT_READ | libc::PROT_EXEC) } != 0 {
+            return Err(os(&format!("mprotect of {code_pages:#x} bytes of code to read and execute")));
+        }
+        // SAFETY: the code's pages, mapped readable.
+        unsafe { sync_icache(exec.at as usize, exec.at as usize + code) };
+        Ok(exec)
+    }
+
+    pub(crate) fn code_address(&self) -> u64 {
+        self.at as u64
+    }
+
+    pub(crate) fn data_address(&self) -> u64 {
+        self.at as u64 + self.code_pages as u64
+    }
+
+    pub(crate) fn data(&mut self) -> &mut [u8] {
+        // SAFETY: the data's `data` bytes after the code's pages, writable and in the mapping,
+        // which lives as long as `self`; `&mut self` makes this the only borrow.
+        unsafe { std::slice::from_raw_parts_mut(self.at.add(self.code_pages), self.data) }
     }
 }
 
@@ -525,6 +613,10 @@ pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+pub(crate) fn service() -> Option<String> {
+    None
 }
 
 pub(crate) fn thread_id() -> u64 {

@@ -10,7 +10,10 @@ use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef};
 use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
 use hir_ty_codegen::{SymbolResolver, exported_symbol, link_name};
 use ide_db::RootDatabase;
-use syntax::{AstNode, SyntaxNode, ast, ast::HasName, match_ast};
+use syntax::{
+    SyntaxKind, match_ast,
+    view::{self as ast, AstNode as _, HasName as _},
+};
 use vfs::FileId;
 
 use crate::symbols::SymbolTable;
@@ -96,18 +99,18 @@ impl Resolver<'_> {
     ///
     /// `Semantics::to_def` answers the same, but starts from every crate the file is part of,
     /// which for a package with tests and examples analyses all its dev-dependencies.
-    fn function_at(
+    fn function_at<'db>(
         &self,
-        sema: &hir::Semantics<'_>,
+        sema: &hir::view::Semantics<'db>,
         scope: Module,
-        func: &ast::Fn,
+        func: ast::Fn<'db>,
     ) -> Option<hir::Function> {
-        use hir::HasSource;
+        use hir::view::HasSourceView as _;
         let db = self.db;
         let file = sema.hir_file_for(func.syntax());
         let range = func.syntax().text_range();
         let is_it = |it: &hir::Function| {
-            it.source(db).is_some_and(|source| {
+            it.source_view(db).is_some_and(|source| {
                 source.file_id == file && source.value.syntax().text_range() == range
             })
         };
@@ -148,28 +151,25 @@ impl Resolver<'_> {
             }
             return Some(path);
         }
-        let sema = hir::Semantics::new(self.db);
-        let source = module.definition_source(self.db);
-        let hir::ModuleSource::BlockExpr(block) = source.value else { return None };
-        let range = block.syntax().text_range();
+        let sema = hir::view::Semantics::new(self.db);
+        // A block module's definition is its block.
+        let source = module.definition_source_range(self.db);
         let block = sema
             .parse_or_expand(source.file_id)
-            .covering_element(range)
-            .ancestors()
-            .find(|it| it.text_range() == range && ast::BlockExpr::can_cast(it.kind()))?;
+            .descendant_at_range(source.value, SyntaxKind::BLOCK_EXPR)?;
         let mut inner = Vec::new();
         let mut owner = None;
         for node in sema.ancestors_with_macros(block) {
-            if is_closure(&node) {
-                inner.push(format!("{{closure#{}}}", closure_number(&sema, &node)?));
+            if is_closure(node) {
+                inner.push(format!("{{closure#{}}}", closure_number(&sema, node)?));
                 continue;
             }
-            if let Some(func) = ast::Fn::cast(node.clone()) {
+            if let Some(func) = ast::Fn::cast(node) {
                 // The body of an `async fn` is a closure to rustc.
                 if func.async_token().is_some() {
                     inner.push("{closure#0}".to_owned());
                 }
-                let func = self.function_at(&sema, module, &func)?;
+                let func = self.function_at(&sema, module, func)?;
                 owner = Some(self.path(func.try_into().ok()?)?);
                 break;
             }
@@ -295,10 +295,10 @@ impl SymbolResolver for Resolver<'_> {
 
     fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
         let adt = hir::Adt::from(adt);
-        let sema = hir::Semantics::new(self.db);
+        let sema = hir::view::Semantics::new(self.db);
         let source = sema.source(adt)?;
-        let mut around = sema.ancestors_with_macros(source.value.syntax().clone()).skip(1);
-        let func = ast::Fn::cast(around.find(is_definition)?)?;
+        let mut around = sema.ancestors_with_macros(source.value.syntax()).skip(1);
+        let func = ast::Fn::cast(around.find(|it| is_definition(*it))?)?;
         // The body of an `async fn` is a closure to rustc.
         if func.async_token().is_some() {
             return None;
@@ -316,22 +316,22 @@ impl SymbolResolver for Resolver<'_> {
         if named_so.count() != 1 {
             return None;
         }
-        self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()
+        self.function_at(&sema, adt.module(self.db), func)?.try_into().ok()
     }
 
     fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
-        use hir::HasSource;
+        use hir::view::HasSourceView as _;
         let db = self.db;
         let it = hir::Impl::from(id);
-        let source = it.source(db)?;
+        let source = it.source_view(db)?;
         // FIXME: where rustc puts the `impl`s a macro makes among the ones written out.
         if source.file_id.is_macro() {
             return None;
         }
-        let start = |it: &hir::InFile<ast::Impl>| it.value.syntax().text_range().start();
+        let start = |it: &hir::InFile<ast::Impl<'_>>| it.value.syntax().text_range().start();
         let mut earlier = 0;
         for other in it.module(db).impl_defs(db) {
-            let other = other.source(db)?;
+            let other = other.source_view(db)?;
             // rustc numbers what a module has written out before what its macros and derives
             // make, which it only has once they are expanded.
             if other.file_id.is_macro() {
@@ -356,31 +356,31 @@ impl SymbolResolver for Resolver<'_> {
             return self.table.get(&path).map(str::to_owned);
         }
         // A static in a body is named after the items around it, which only the syntax knows.
-        let sema = hir::Semantics::new(self.db);
+        let sema = hir::view::Semantics::new(self.db);
         let source = sema.source(it)?;
         let mut names = vec![name.as_str().to_owned()];
         let mut closures = Vec::new();
         let mut around = Vec::new();
         let mut owner = None;
-        for node in sema.ancestors_with_macros(source.value.syntax().clone()).skip(1) {
-            if is_closure(&node) {
-                closures.push(closure_number(&sema, &node)?);
+        for node in sema.ancestors_with_macros(source.value.syntax()).skip(1) {
+            if is_closure(node) {
+                closures.push(closure_number(&sema, node)?);
                 continue;
             }
-            if let Some(func) = ast::Fn::cast(node.clone()) {
+            if let Some(func) = ast::Fn::cast(node) {
                 if func.async_token().is_some() {
                     closures.push(0);
                 }
                 // A function written in a body is one more name on the way out.
                 let in_body = sema
-                    .ancestors_with_macros(node.clone())
+                    .ancestors_with_macros(node)
                     .skip(1)
-                    .any(|it| ast::Fn::can_cast(it.kind()) || is_closure(&it));
+                    .any(|it| ast::Fn::can_cast(it.kind()) || is_closure(it));
                 if in_body {
                     names.extend(func.name().map(|it| it.text().to_string()));
                     continue;
                 }
-                let func = self.function_at(&sema, module, &func)?;
+                let func = self.function_at(&sema, module, func)?;
                 owner = Some(self.path(func.try_into().ok()?)?);
                 break;
             }
@@ -392,7 +392,7 @@ impl SymbolResolver for Resolver<'_> {
                 }
             };
             if let Some(name) = name {
-                let named = |other: &SyntaxNode| {
+                let named = |other: ast::Node<'_>| {
                     let other = match_ast! {
                         match other {
                             ast::Const(it) => it.name(),
@@ -402,7 +402,7 @@ impl SymbolResolver for Resolver<'_> {
                     };
                     other.is_some_and(|it| it.text() == name.text())
                 };
-                around.push(place_in_definition(&sema, &node, &named)?.into());
+                around.push(place_in_definition(&sema, node, &named)?.into());
                 names.push(name.text().to_string());
             }
         }
@@ -420,8 +420,8 @@ impl SymbolResolver for Resolver<'_> {
         around.reverse();
         let path = names.join("::");
         // Only a path through a closure or an anonymous constant has segments left out of it.
-        let named = |node: &SyntaxNode| {
-            ast::Static::cast(node.clone())
+        let named = |node: ast::Node<'_>| {
+            ast::Static::cast(node)
                 .is_some_and(|it| it.name().is_some_and(|it| it.text() == name.as_str()))
         };
         let place = place_in_definition(&sema, source.value.syntax(), &named)?.into();
@@ -443,79 +443,79 @@ impl SymbolResolver for Resolver<'_> {
 }
 
 /// Whether rustc numbers the node as a closure: a closure, or an `async` block.
-fn is_closure(node: &SyntaxNode) -> bool {
+fn is_closure(node: ast::Node<'_>) -> bool {
     ast::ClosureExpr::can_cast(node.kind())
-        || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.async_token().is_some())
+        || ast::BlockExpr::cast(node).is_some_and(|it| it.async_token().is_some())
 }
 
-fn is_definition(node: &SyntaxNode) -> bool {
+fn is_definition(node: ast::Node<'_>) -> bool {
     !ast::MacroCall::can_cast(node.kind())
         && (ast::Item::can_cast(node.kind())
             || ast::AssocItem::can_cast(node.kind())
             || ast::ConstArg::can_cast(node.kind())
             || is_closure(node)
-            || ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.const_token().is_some()))
+            || ast::BlockExpr::cast(node).is_some_and(|it| it.const_token().is_some()))
 }
 
 /// The place of a node among those of the definition it is written in that `counts` holds
 /// of, in the order rustc comes across them. This is how rustc tells apart the closures
 /// of a function, and the statics of one name that a macro used twice in it declares.
-fn place_in_definition(
-    sema: &hir::Semantics<'_>,
-    target: &SyntaxNode,
-    counts: &dyn Fn(&SyntaxNode) -> bool,
+fn place_in_definition<'db>(
+    sema: &hir::view::Semantics<'db>,
+    target: ast::Node<'db>,
+    counts: &impl Fn(ast::Node<'db>) -> bool,
 ) -> Option<u32> {
-    let mut around = sema.ancestors_with_macros(target.clone()).skip(1);
+    let mut around = sema.ancestors_with_macros(target).skip(1);
     let mut root = None;
-    let owner = around.find(|node| {
-        root = Some(node.clone());
+    let owner = around.find(|&node| {
+        root = Some(node);
         is_definition(node)
     });
     let mut earlier = 0;
     Place { sema, target, counts, earlier: &mut earlier }
-        .find_in(&owner.or(root)?)
+        .find_in(owner.or(root)?)
         .then_some(earlier)
 }
 
-struct Place<'a, 'db> {
-    sema: &'a hir::Semantics<'db>,
-    target: &'a SyntaxNode,
-    counts: &'a dyn Fn(&SyntaxNode) -> bool,
+struct Place<'a, 'db, F: Fn(ast::Node<'db>) -> bool> {
+    sema: &'a hir::view::Semantics<'db>,
+    target: ast::Node<'db>,
+    counts: &'a F,
     earlier: &'a mut u32,
 }
 
-impl Place<'_, '_> {
+impl<'db, F: Fn(ast::Node<'db>) -> bool> Place<'_, 'db, F> {
     /// Counts the nodes before the target in the definition `node` is of. Whether the target
     /// is there.
     ///
     /// rustc numbers what is written in the definition before what the macros used in it
     /// expand to, and then goes through the macros in turn, each the same way.
-    fn find_in(&mut self, node: &SyntaxNode) -> bool {
+    fn find_in(&mut self, node: ast::Node<'db>) -> bool {
         let mut calls = Vec::new();
         if self.find_written_in(node, &mut calls) {
             return true;
         }
-        calls.iter().any(|call| {
+        calls.iter().any(|&call| {
             self.sema
                 .expand_macro_call(call)
-                .is_some_and(|expansion| self.find_in(&expansion.value))
+                .is_some_and(|expansion| self.find_in(expansion.value))
         })
     }
 
     /// As `find_in`, of what is not in a macro: `calls` gets the macros come across.
-    fn find_written_in(&mut self, node: &SyntaxNode, calls: &mut Vec<ast::MacroCall>) -> bool {
+    fn find_written_in(&mut self, node: ast::Node<'db>, calls: &mut Vec<ast::MacroCall<'db>>) -> bool {
         for child in node.children() {
-            if let Some(call) = ast::MacroCall::cast(child.clone()) {
+            if let Some(call) = ast::MacroCall::cast(child) {
                 calls.push(call);
                 continue;
             }
-            if child == *self.target {
+            if child == self.target {
                 return true;
             }
-            if (self.counts)(&child) {
+            if (self.counts)(child) {
                 *self.earlier += 1;
             }
-            if !is_definition(&child) && self.find_written_in(&child, calls) {
+            if !is_definition(child) && self.find_written_in(child, calls) {
                 return true;
             }
         }
@@ -525,7 +525,7 @@ impl Place<'_, '_> {
 
 /// The `n` of the `{closure#n}` rustc names a closure: its place among the closures of the
 /// definition it is written in, a closure's own closures being counted apart.
-fn closure_number(sema: &hir::Semantics<'_>, closure: &SyntaxNode) -> Option<u32> {
+fn closure_number<'db>(sema: &hir::view::Semantics<'db>, closure: ast::Node<'db>) -> Option<u32> {
     place_in_definition(sema, closure, &is_closure)
 }
 

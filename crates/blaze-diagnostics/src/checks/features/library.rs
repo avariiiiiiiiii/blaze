@@ -28,7 +28,10 @@ mod unstable;
 use hir::InFile;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
-use syntax::{AstNode, AstToken, NodeOrToken, SyntaxKind, T, TextRange, ast};
+use syntax::{
+    NodeOrToken, SyntaxKind, T, TextRange,
+    view::{self as ast, AstNode as _, AstToken as _},
+};
 
 use super::{Features, crate_fact};
 use crate::{
@@ -57,8 +60,10 @@ const STABLE_FEATURES: LintId = LintId::named("stable_features");
 /// `check_unused_or_stable_features` of the crate: its diagnostics in rustc's order, each at
 /// `Phase::Items`, the lints at the crate root.
 pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> Vec<Found> {
+    // alloc: empty, allocates nothing
     let Some(root) = owners.iter().find(|it| it.target == Target::Crate) else { return Vec::new() };
     let lint_at = root.at();
+    // alloc: empty unless there is a diagnostic
     let mut found = Vec::new();
     let lint = |found: &mut Vec<Found>, mut diag: Diag| {
         crate_fact(cx, &mut diag);
@@ -85,6 +90,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> V
     remaining.swap_remove("test");
 
     let local = if features.enabled("staged_api") { collect(owners, Some((cx, &mut found))) } else { Library::default() };
+    // clone: once per check; empty unless the crate is staged
     let mut implications = local.implications.clone();
     if !remaining.is_empty() || !implications.is_empty() {
         // A dependency's library features are read (a walk of all of it) only when one the
@@ -122,30 +128,39 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> V
         if !remaining.is_empty() {
             libraries.load_all();
             let libraries: Vec<(hir::Crate, &Library)> = libraries.all();
+            // alloc: on the error path, an unknown feature
             let mut names: Vec<&str> = unstable::UNSTABLE.to_vec();
             for (_, library) in &libraries {
                 let start = names.len();
                 names.extend(library.features.keys().map(String::as_str));
                 names[start..].sort_unstable();
             }
+            // alloc: on the error path, as above
             let removed: Vec<&Removed> = libraries.iter().flat_map(|(_, library)| &library.removed).collect();
             for (feature, at) in std::mem::take(&mut remaining.entries) {
                 let span = cx.span(at);
                 let mut diag = match removed.iter().find(|it| it.feature == feature) {
                     Some(removed) => {
+                        // alloc: the error's message
                         let message = format!("feature `{feature}` has been removed");
+                        // clone: the error's span
                         let mut diag = Diag::error(Some("E0557"), message, span.clone());
                         diag.span_label(span, "feature has been removed");
+                        // alloc: the error's note
                         diag.note(format!("removed in {}; see <{}> for more information", removed.since, removed.link));
+                        // clone: the error's note
                         diag.note(removed.reason.clone());
                         diag
                     }
                     None => {
+                        // alloc: the error's message
                         let message = format!("unknown feature `{feature}`");
+                        // clone: the error's span
                         let mut diag = Diag::error(Some("E0635"), message, span.clone());
                         if let Some(similar) = similar(&names, &feature) {
                             diag.suggestion_verbose(
                                 span,
+                                // alloc: the error's suggestion
                                 format!("there is a feature with a similar name: `{similar}`"),
                                 similar,
                                 Applicability::MaybeIncorrect,
@@ -164,6 +179,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> V
         }
     }
 
+    // alloc: once per check; empty unless an implication names no feature, an error
     let mut left: Vec<(String, String)> = implications.into_iter().collect();
     left.sort_unstable();
     for (implied_by, feature) in left {
@@ -171,6 +187,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, owners: &[Owner], features: &Features) -> V
             .features
             .get(&feature)
             .expect("an implication's feature is among the crate's library features: `collect` records both");
+        // alloc: the error's message
         let message = format!("feature `{implied_by}` implying `{feature}` does not exist");
         let mut diag = Diag::error(None, message, cx.span(*at));
         crate_fact(cx, &mut diag);
@@ -215,6 +232,7 @@ struct Remaining<T = InFile<TextRange>> {
 
 impl<T> Default for Remaining<T> {
     fn default() -> Remaining<T> {
+        // alloc: empty, allocates nothing
         Remaining { entries: Vec::new() }
     }
 }
@@ -231,6 +249,7 @@ impl<T: Copy> Remaining<T> {
     fn insert(&mut self, name: &str, at: T) {
         match self.position(name) {
             Some(it) => self.entries[it].1 = at,
+            // alloc: setup, once per library feature the crate enables
             None => self.entries.push((name.to_owned(), at)),
         }
     }
@@ -281,6 +300,7 @@ impl<'a, 'c, 'db> Libraries<'a, 'c, 'db> {
     /// rustc's `all_implications`: the crate's own, then each crate's in order.
     fn implications(&mut self, local: &Library) -> FxHashMap<String, String> {
         self.load_all();
+        // clone: once per check, only when a stable feature is enabled
         let mut all = local.implications.clone();
         for library in self.loaded.iter().flatten() {
             // clone: once per implication of a staged crate, only when a stable feature is enabled.
@@ -343,6 +363,7 @@ impl Check<'_, '_, '_> {
             if let Stability::Unstable { old_name: Some(alias) } = stability
                 && let Some(at) = self.remaining.swap_remove(alias)
             {
+                // alloc: the error's message
                 let message = format!("feature `{alias}` has been renamed to `{feature}`");
                 let mut diag = Diag::error(Some("E0635"), message, self.cx.span(at));
                 crate_fact(self.cx, &mut diag);
@@ -358,6 +379,7 @@ impl Check<'_, '_, '_> {
 /// `unnecessary_stable_feature_lint`.
 fn stable(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str, since: &str) -> Diag {
     let since = if since == VERSION_PLACEHOLDER { CFG_RELEASE } else { since };
+    // alloc: the lint's message
     let message = format!("the feature `{feature}` has been stable since {since} and no longer requires an attribute to enable");
     Diag::lint("stable_features", message, cx.span(at))
 }
@@ -365,12 +387,16 @@ fn stable(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str, since: &str) ->
 /// `unnecessary_partially_stable_feature_lint`.
 fn partially_stable(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str, implies: &str, since: &str) -> Diag {
     let span = cx.span(at);
+    // alloc: the lint's message
     let message = format!(
         "the feature `{feature}` has been partially stabilized since {since} and is succeeded by the feature `{implies}`"
     );
+    // clone: the lint's span
     let mut diag = Diag::lint("stable_features", message, span.clone());
     diag.suggestion(
+        // clone: the lint's span
         span.clone(),
+        // alloc: the lint's suggestion
         format!("if you are using features which are still unstable, change to using `{implies}`"),
         implies,
         Applicability::MaybeIncorrect,
@@ -386,16 +412,19 @@ fn partially_stable(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str, impli
 
 /// `duplicate_feature_lint`.
 fn duplicate(cx: &Cx<'_, '_>, at: InFile<TextRange>, feature: &str) -> Diag {
+    // alloc: the lint's message
     Diag::lint("duplicate_features", format!("the feature `{feature}` has already been enabled"), cx.span(at))
 }
 
 /// `span_extend_to_line`: `span` grown to the start and the end of the lines it is on.
 fn line_of(cx: &Cx<'_, '_>, span: &Span) -> Span {
+    // clone: the lint's span
     let Some(file) = cx.file_of(span) else { return span.clone() };
     let text = cx.file_text(file);
     let (lo, hi) = (span.lo as usize, span.hi as usize);
     let next = text[hi..].split('\n').next().unwrap_or("");
     let prev = text[..lo].rsplit('\n').next().unwrap_or("");
+    // clone: the lint's span
     Span { lo: (lo - prev.len()) as u32, hi: (hi + next.len()) as u32, ..span.clone() }
 }
 
@@ -410,7 +439,9 @@ fn similar<'a>(names: &[&'a str], feature: &str) -> Option<&'a str> {
 fn crates(cx: &Cx<'_, '_>) -> Vec<hir::Crate> {
     let mut seen = FxHashSet::default();
     seen.insert(cx.krate);
+    // alloc: setup, once per check that enables a library feature
     let mut order = Vec::new();
+    // alloc: as above
     let mut stack: Vec<hir::Crate> = cx.krate.dependencies(cx.db).into_iter().rev().map(|it| it.krate).collect();
     while let Some(krate) = stack.pop() {
         if !seen.insert(krate) {
@@ -508,6 +539,7 @@ fn collect(owners: &[Owner], mut errors: Option<(&Cx<'_, '_>, &mut Vec<Found>)>)
                         && is_definition(owner.target)
                         && let Some(implied_by) = implied_by
                     {
+                        // clone: the library's table, once per staged crate read
                         library.implications.insert(implied_by, declared.feature.clone());
                     }
                     Some(Stability::Unstable { old_name })
@@ -520,17 +552,20 @@ fn collect(owners: &[Owner], mut errors: Option<(&Cx<'_, '_>, &mut Vec<Found>)>)
                     continue;
                 }
                 Some((Stability::Accepted(previous), _)) => match &stability {
+                    // alloc: the error's message
                     Stability::Accepted(since) if since != previous => format!(
                         "feature `{}` is declared stable since {since}, but was previously declared stable since {previous}",
                         declared.feature
                     ),
                     Stability::Accepted(_) => continue,
+                    // alloc: the error's message
                     Stability::Unstable { .. } => format!(
                         "feature `{}` is declared unstable, but was previously declared stable",
                         declared.feature
                     ),
                 },
                 Some((Stability::Unstable { .. }, _)) => match &stability {
+                    // alloc: the error's message
                     Stability::Accepted(_) => format!(
                         "feature `{}` is declared stable, but was previously declared unstable",
                         declared.feature
@@ -568,23 +603,24 @@ fn declared(owner: &Owner) -> SmallVec<[Declared; 3]> {
             groups[slot].2 = parse(attr, meta, name.text(), group);
         }
     }
+    // alloc: inline, up to three groups
     groups.into_iter().filter_map(|(_, _, it)| it).collect()
 }
 
 /// The attribute's path, when it is one segment.
-fn single_name(meta: &ast::Meta) -> Option<ast::NameRef> {
+fn single_name(meta: ast::Meta<'_>) -> Option<ast::NameRef<'_>> {
     meta.path()?.as_single_name_ref()
 }
 
 /// `parse_stability` or `parse_unstability` of the stability attribute `attr`.
-fn parse(attr: &Attr, meta: &ast::Meta, name: &str, group: Group) -> Option<Declared> {
+fn parse(attr: &Attr<'_>, meta: ast::Meta<'_>, name: &str, group: Group) -> Option<Declared> {
     let unstable = match name {
         "stable" | "rustc_const_stable" => false,
         "unstable" | "rustc_const_unstable" | "rustc_default_body_unstable" => true,
         _ => return None,
     };
     let ast::Meta::TokenTreeMeta(list) = meta else { return None };
-    let items = name_values(&list.token_tree()?)?;
+    let items = name_values(list.token_tree()?)?;
     let at = attr.in_file(if group == Group::Const { attr.path_range() } else { attr.range() });
     if !unstable {
         let mut feature = None;
@@ -601,6 +637,7 @@ fn parse(attr: &Attr, meta: &ast::Meta, name: &str, group: Group) -> Option<Decl
             *slot = Some(value);
         }
         let feature = feature.filter(|it| is_ident(it))?;
+        // alloc: the library's table, once per staged crate read
         let since = since.and_then(|it| if it == VERSION_PLACEHOLDER { Some(CFG_RELEASE.to_owned()) } else { version(&it) });
         return Some(Declared { group, feature, level: Level::Stable(since), at });
     }
@@ -633,14 +670,14 @@ fn parse(attr: &Attr, meta: &ast::Meta, name: &str, group: Group) -> Option<Decl
 }
 
 /// `UnstableRemovedParser` of one `#[unstable_removed(..)]`.
-fn removed(attr: &Attr) -> Option<Removed> {
+fn removed(attr: &Attr<'_>) -> Option<Removed> {
     let meta = attr.meta()?;
     if !single_name(meta).is_some_and(|it| it.text() == "unstable_removed") {
         return None;
     }
     let ast::Meta::TokenTreeMeta(list) = meta else { return None };
     let (mut feature, mut reason, mut link, mut since) = (None, None, None, None);
-    for (key, value) in name_values(&list.token_tree()?)? {
+    for (key, value) in name_values(list.token_tree()?)? {
         let slot = match key.as_str() {
             "feature" => &mut feature,
             "since" => &mut since,
@@ -668,14 +705,16 @@ fn version(text: &str) -> Option<String> {
     let major: u16 = digits.next()?.parse().ok()?;
     let minor: u16 = digits.next()?.parse().ok()?;
     let patch: u16 = digits.next().unwrap_or("0").parse().ok()?;
+    // alloc: the library's table, as above
     Some(format!("{major}.{minor}.{patch}"))
 }
 
 /// An attribute's `key = "value"` items, in order; `None` when one is anything else (rustc's
 /// malformed-attribute errors, which are the attribute checks').
-fn name_values(tt: &ast::TokenTree) -> Option<SmallVec<[(String, String); 4]>> {
+fn name_values(tt: ast::TokenTree<'_>) -> Option<SmallVec<[(String, String); 4]>> {
     let mut items = SmallVec::new();
     let mut tokens: SmallVec<[_; 16]> =
+        // alloc: inline up to 16 tokens
         tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).skip(1).collect();
     if tokens.last().is_some_and(|it| matches!(it.kind(), T![')'] | T![']'] | T!['}'])) {
         tokens.pop();
@@ -686,7 +725,9 @@ fn name_values(tt: &ast::TokenTree) -> Option<SmallVec<[(String, String); 4]>> {
             [NodeOrToken::Token(key), NodeOrToken::Token(eq), NodeOrToken::Token(value)]
                 if key.kind() == SyntaxKind::IDENT && eq.kind() == T![=] =>
             {
-                let value = ast::String::cast(value.clone())?.value().ok()?.into_owned();
+                // alloc: the library's table, once per staged crate read
+                let value = ast::String::cast(*value)?.value().ok()?.into_owned();
+                // alloc: as above
                 items.push((key.text().trim_start_matches("r#").to_owned(), value));
             }
             _ => return None,

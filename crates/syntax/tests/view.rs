@@ -142,16 +142,20 @@ fn check(path: &Path, parse: &Parse<SourceFile>) {
             _ => panic!("{}: a node in one walk and a token in the other", at()),
         }
     }
-    let events = |walk: &mut dyn Iterator<Item = (bool, Key)>| walk.collect::<Vec<_>>();
     assert_eq!(
-        events(&mut handle.preorder_with_tokens().map(|it| match it {
-            WalkEvent::Enter(it) => (true, key(&it)),
-            WalkEvent::Leave(it) => (false, key(&it)),
-        })),
-        events(&mut root.preorder_with_tokens().map(|it| match it {
-            WalkEvent::Enter(it) => (true, view_key(it)),
-            WalkEvent::Leave(it) => (false, view_key(it)),
-        })),
+        handle
+            .preorder_with_tokens()
+            .map(|it| match it {
+                WalkEvent::Enter(it) => (true, key(&it)),
+                WalkEvent::Leave(it) => (false, key(&it)),
+            })
+            .collect::<Vec<_>>(),
+        root.preorder_with_tokens()
+            .map(|it| match it {
+                WalkEvent::Enter(it) => (true, view_key(it)),
+                WalkEvent::Leave(it) => (false, view_key(it)),
+            })
+            .collect::<Vec<_>>(),
         "{path:?}: preorder"
     );
     let end = handle.text_range().end();

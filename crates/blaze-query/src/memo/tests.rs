@@ -29,8 +29,9 @@ fn read(records: &[EdgeRecord]) -> Vec<Edge> {
 fn until(store: &Store, what: &str, mut done: impl FnMut(&Store) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let check = store.to_check();
-        store.checked(check, |_| false);
+        let mut check = Vec::new();
+        store.to_check(&mut check);
+        store.checked(&check, |_| false);
         store.sweep();
         if done(store) {
             return;
@@ -105,6 +106,7 @@ fn a_memos_line_holds_where_its_current_value_is() {
 /// Each task's edges are copied once, with its memo, into its thread's edge segment: one
 /// thread's memos are adjacent ranges of one segment, and two threads write two segments.
 #[test]
+#[cfg_attr(blaze_check, ignore = "many threads, long loops: slow under the model checker's shims")]
 fn a_tasks_edges_are_one_range_of_its_threads_segment() {
     let store = Store::new();
     let code = store.code(SCHEMA, ContentId([1; 32]));
@@ -160,11 +162,11 @@ fn a_segment_is_freed_whole_once_nothing_in_it_is_held() {
     drop(task);
 
     let (kept, rest): (Vec<MemoId>, Vec<MemoId>) = memos.iter().partition(|&&memo| memo == memos[96]);
-    store.unlinked(rest);
+    store.unlinked(&rest);
     until(&store, "freeing all but one memo", |store| store.dying() == 0);
     assert_eq!(store.segments().0, 2, "memo 96 holds the first segment; the second is open");
 
-    store.unlinked(kept);
+    store.unlinked(&kept);
     until(&store, "freeing the last memo of the first segment", |store| store.segments().0 == 1);
     assert_eq!(store.dying(), 0);
 

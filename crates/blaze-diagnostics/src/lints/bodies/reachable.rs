@@ -24,6 +24,7 @@ use crate::{
 pub(super) const LINTS: super::LintSet = super::lint_set(["unreachable_code"]);
 
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
+    // alloc: the lints found, empty until one is
     b.infer.unreachable().iter().filter_map(|it| lint(b, it)).collect()
 }
 
@@ -32,9 +33,12 @@ pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
 /// None when the call is in a macro of another crate.
 pub(super) fn after_calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
     if b.mir_tainted() {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
+    // alloc: empty, allocates nothing
     let Some(mir) = b.mir() else { return Vec::new() };
+    // alloc: the lints found, empty until one is
     let mut found = Vec::new();
     for it in &mir.unreachable_after_calls {
         let (Some(call), Some(next)) = (b.mir_node(it.call), b.mir_node(it.next)) else { continue };
@@ -42,10 +46,14 @@ pub(super) fn after_calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
             continue;
         }
         let (Some(call_span), Some(next_span)) = (b.mir_span(it.call), b.mir_span(it.next)) else { continue };
+        // alloc: the lint's text, for a lint found
         let message = format!("unreachable {}", it.descr);
+        // clone: for a lint found
         let mut diag = Diag::lint("unreachable_code", message.clone(), next_span.clone());
         diag.span_label(next_span, message);
+        // clone: for a lint found
         diag.span_label(call_span.clone(), "any code following this expression is unreachable");
+        // alloc: the lint's text, for a lint found
         diag.span_note(call_span, format!("this expression has type `{}`, which is uninhabited", b.ty(it.ty.as_ref())));
         found.push(b.lint(diag, Phase::Mir, next));
     }
@@ -58,7 +66,9 @@ fn lint(b: &BodyCx<'_, '_>, unreachable: &Unreachable) -> Option<Found> {
         ExprOrPatId::ExprId(expr) => b.expr_span(expr)?,
         ExprOrPatId::PatId(pat) => b.pat_span(pat)?,
     };
+    // alloc: the lint's text, for a lint found
     let message = format!("unreachable {kind}");
+    // clone: for a lint found
     let mut diag = Diag::lint("unreachable_code", message.clone(), span.clone());
     diag.span_label(span, message);
     let note = unreachable.note.unwrap_or("any code following this expression is unreachable");
@@ -119,9 +129,12 @@ fn statement_node(b: &BodyCx<'_, '_>, statement: Statement<'_>) -> Option<InFile
         true => syntax.value.ancestors().find(|it| ast::LetStmt::can_cast(it.kind()))?,
         false => match syntax.value.parent().and_then(ast::ExprStmt::cast) {
             Some(stmt) => match stmt.expr() {
+                // clone: a node handle, a reference count, for a lint found
                 Some(ast::Expr::MacroExpr(call)) => call.syntax().clone(),
+                // clone: a node handle, a reference count, for a lint found
                 _ => stmt.syntax().clone(),
             },
+            // clone: a node handle, a reference count, for a lint found
             None => syntax.value.clone(),
         },
     };

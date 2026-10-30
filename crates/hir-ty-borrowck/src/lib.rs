@@ -12,6 +12,7 @@
 //! subtree is a range of words, and region inference over the SCCs of the outlives graph.
 
 #![forbid(unsafe_code)]
+#![feature(allocator_api)]
 
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate rustc_type_ir;
@@ -21,21 +22,34 @@ mod cfg;
 mod check;
 mod constraints;
 mod dataflow;
+mod decode;
 mod gate;
 mod inference;
 mod intervals;
 mod liveness;
 mod loans;
+mod mem;
 mod moves;
 mod names;
+mod places;
 mod polonius;
 mod qualifs;
 mod regions;
 mod relation;
+mod rows;
 mod scan;
 pub mod timings;
 
-use std::sync::LazyLock;
+#[cfg(test)]
+mod budget;
+#[cfg(test)]
+mod differential;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+use std::{cell::RefCell, sync::LazyLock};
 
 use base_db::{Db, Crate};
 use blaze_ids::radix;
@@ -44,7 +58,6 @@ use hir_def::{
     expr_store::ExpressionStore,
     hir::{BindingAnnotation, BindingId, ExprId},
 };
-use rustc_hash::FxHashMap;
 use salsa::SalsaValue;
 
 use hir_ty::{
@@ -63,6 +76,11 @@ use hir_ty_mir::mir::{
 
 pub use gate::{
     Checked, CheckedMir, Pending, Refused, Unchecked, UncheckedMir, checked, speculate,
+};
+
+use crate::{
+    bitset::bits,
+    mem::{ExactLen, FMap, FVec, Frame},
 };
 
 /// Which of rustc's borrow checkers to match: the one stable Rust has, or the location
@@ -88,7 +106,9 @@ pub fn mode() -> Mode {
 /// `BLAZE_BORROWCK_DEBUG=1` prints the regions, constraints and loans of every body checked,
 /// `BLAZE_BORROWCK_DEBUG=name` those of the functions called `name` and their closures.
 pub(crate) fn debugging(db: &Db, owner: InferBodyId<'_>) -> bool {
-    let Ok(wanted) = std::env::var("BLAZE_BORROWCK_DEBUG") else { return false };
+    static WANTED: LazyLock<Option<String>> =
+        LazyLock::new(|| std::env::var("BLAZE_BORROWCK_DEBUG").ok()); // alloc: once per process
+    let Some(wanted) = WANTED.as_deref() else { return false };
     match owner {
         InferBodyId::DefWithBodyId(DefWithBodyId::FunctionId(it)) if wanted != "1" => {
             hir_def::signatures::FunctionSignature::of(db, it).name.as_str() == wanted
@@ -182,9 +202,9 @@ impl BorrowckDiagnostic {
             span,
             message,
             at_signature: false,
-            labels: Vec::new(),
-            children: Vec::new(),
-            suggestions: Vec::new(),
+            labels: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
+            children: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
+            suggestions: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
         }
     }
 
@@ -196,8 +216,8 @@ impl BorrowckDiagnostic {
         self.children.push(Child {
             level: Sublevel::Note,
             message: message.into(),
-            spans: Vec::new(),
-            labels: Vec::new(),
+            spans: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
+            labels: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
         });
     }
 
@@ -205,8 +225,8 @@ impl BorrowckDiagnostic {
         self.children.push(Child {
             level: Sublevel::Help,
             message: message.into(),
-            spans: Vec::new(),
-            labels: Vec::new(),
+            spans: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
+            labels: Vec::new(), // alloc: the owned diagnostic; `Vec::new` takes no memory
         });
     }
 
@@ -253,6 +273,9 @@ pub enum NotChecked {
     /// Lowering found an error in it (a cast that is not one, `..base` in a destructuring
     /// assignment).
     LoweringErrors,
+    /// Match checking refused it (E0004, E0005, E0030, a constant pattern that does not
+    /// evaluate): rustc's `mir_built` gives such a body its error body, which nothing checks.
+    MatchErrors,
     /// A `static` of a type that is not `Sized`: rustc's E0277.
     UnsizedStatic,
     /// A const context drops a value of a type with drop glue: rustc's E0493.
@@ -277,6 +300,10 @@ pub fn borrowck<'db>(db: &'db Db, def: DefWithBodyId) -> BorrowckResult {
 
 /// [`borrowck`] in `mode`, not cached: for measuring the checker in each mode.
 pub fn borrowck_in_mode(db: &Db, def: DefWithBodyId, mode: Mode) -> BorrowckResult {
+    blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| check_def(db, def, mode, frame))
+}
+
+fn check_def(db: &Db, def: DefWithBodyId, mode: Mode, frame: &Frame) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     if mode == Mode::Off {
         result.not_checked = Some(NotChecked::Off);
@@ -299,6 +326,10 @@ pub fn borrowck_in_mode(db: &Db, def: DefWithBodyId, mode: Mode) -> BorrowckResu
         result.not_checked = Some(NotChecked::LoweringErrors);
         return result;
     }
+    if hir_ty_matchck::match_check(db, def).failed {
+        result.not_checked = Some(NotChecked::MatchErrors);
+        return result;
+    }
     // A `static` of a type that is not `Sized` is rustc's E0277, which keeps it from being
     // borrow checked; a `const` is checked all the same.
     if let DefWithBodyId::StaticId(it) = def
@@ -315,7 +346,7 @@ pub fn borrowck_in_mode(db: &Db, def: DefWithBodyId, mode: Mode) -> BorrowckResu
         result.not_checked = Some(NotChecked::UnsizedStatic);
         return result;
     }
-    check_owner(db, owner, Some(def), mode)
+    check_owner(db, owner, Some(def), mode, frame)
 }
 
 /// The errors rustc's borrow checker reports in a constant of a signature, as an array length
@@ -331,12 +362,17 @@ pub fn borrowck_anon_const<'db>(
     if mode() == Mode::Off {
         return BorrowckResult { not_checked: Some(NotChecked::Off), ..Default::default() };
     }
-    let owner = InferBodyId::AnonConstId(konst);
-    let infer = InferenceResult::of(db, owner);
-    if infer.has_type_mismatches() || infer.is_erroneous() {
-        return BorrowckResult { not_checked: Some(NotChecked::TypeErrors), ..Default::default() };
-    }
-    check_owner(db, owner, None, mode())
+    blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
+        let owner = InferBodyId::AnonConstId(konst);
+        let infer = InferenceResult::of(db, owner);
+        if infer.has_type_mismatches() || infer.is_erroneous() {
+            return BorrowckResult {
+                not_checked: Some(NotChecked::TypeErrors),
+                ..Default::default()
+            };
+        }
+        check_owner(db, owner, None, mode(), frame)
+    })
 }
 
 /// The errors in `owner`'s body and the closures, coroutines and `const { .. }` blocks in it;
@@ -346,38 +382,43 @@ fn check_owner<'db>(
     owner: InferBodyId<'db>,
     def: Option<DefWithBodyId>,
     mode: Mode,
+    frame: &Frame,
 ) -> BorrowckResult {
     let mut result = BorrowckResult::default();
     let infer = InferenceResult::of(db, owner);
     let body = match timings::phase(timings::Phase::Mir, || db.mir_body(owner)) {
         Ok(body) => body,
         Err(error) => {
+            // alloc: the owned result, once, when MIR lowering refuses the body
             result.skipped = Some(format!("{error:?}"));
             return result;
         }
     };
     let store = ExpressionStore::of(db, owner.expression_store_owner(db));
-    let mut bodies = vec![(body, None, None)];
+    let mut bodies: FVec<'_, _> = Vec::new_in(frame);
+    bodies.push((body, None, None));
     // What each body is written as: `None` for the owner's.
-    let mut written = vec![None];
-    let mut seen = rustc_hash::FxHashSet::default();
+    let mut written: FVec<'_, Option<ExprId>> = Vec::new_in(frame);
+    written.push(None);
+    let mut seen = mem::set(frame);
+    let mut nested: FVec<'_, Nested<'db>> = Vec::new_in(frame);
     let mut index = 0;
     while let Some(&(body, _, _)) = bodies.get(index) {
         let at = written[index];
         index += 1;
-        let mut nested = Vec::new();
+        nested.clear();
         nested.extend(body.closures.iter().map(|&it| Nested::Closure(it)));
         // The body of an `async` block or `async fn`, checked as rustc checks a coroutine: as
         // a closure of the body that makes it.
-        nested.extend(coroutines(body).into_iter().map(Nested::Coroutine));
+        coroutines(body, |it| nested.push(Nested::Coroutine(it)));
         // A `const { .. }` block, which MIR lowering makes a constant of its own, checked with
         // the body as rustc checks an inline const.
-        nested.extend(inline_consts(db, body).into_iter().map(Nested::Const));
+        inline_consts(db, body, |it| nested.push(Nested::Const(it)));
         // Those in code that is never reached, which MIR lowering leaves out: rustc borrow
         // checks every body nested in the item's (`nested_bodies_within`), so a closure after a
         // `return` is checked too.
-        nested.extend(nested_bodies_written(db, owner, store, infer, at));
-        for it in nested {
+        nested_bodies_written(db, owner, store, infer, at, frame, &mut nested);
+        for &it in nested.iter() {
             if !seen.insert(it) {
                 continue;
             }
@@ -404,42 +445,65 @@ fn check_owner<'db>(
                     bodies.push(it);
                 }
                 Err(error) => {
+                    // alloc: the owned result, once, when MIR lowering refuses a body
                     result.skipped.get_or_insert_with(|| format!("{what}: {error:?}"));
                 }
             }
         }
     }
     // A closure after the closures in it and before the body that makes it, which proves what
-    // the closure needs of it.
-    let mut requirements = FxHashMap::default();
-    let mut mut_upvars = FxHashMap::default();
-    let mut diagnostics: Vec<Vec<Option<BorrowckDiagnostic>>> = Vec::new();
+    // the closure needs of it. What a closure needs of its creator, and which of its captures
+    // it uses mutably: by the closure's expression, in the owner's frame.
+    let mut requirements: FMap<'_, ExprId, (usize, FVec<'_, regions::Requirement<'db>>)> =
+        mem::map(frame);
+    let mut mut_upvars: FMap<'_, ExprId, FVec<'_, usize>> = mem::map(frame);
+    let mut diagnostics: FVec<'_, FVec<'_, Option<BorrowckDiagnostic>>> = Vec::new_in(frame);
     // rustc's `buffered_move_errors`, one for the function and the closures in it: the body,
     // the error's place as rustc has it and where the error is, by the moves it is about.
-    let mut move_errors: FxHashMap<Vec<usize>, (usize, (LocalId, Vec<PlaceElem>), usize)> =
-        FxHashMap::default();
+    let mut move_errors: FMap<
+        '_,
+        FVec<'_, usize>,
+        (usize, (LocalId, FVec<'_, PlaceElem>), usize),
+    > = mem::map(frame);
     let scan = timings::phase(timings::Phase::Setup, || {
-        scan::Scan::new(store, infer, DbInterner::new_with(db, owner.krate(db)))
+        scan::Scan::new(frame, store, infer, DbInterner::new_with(db, owner.krate(db)))
     });
-    for (body, closure, inline_const) in bodies.into_iter().rev() {
-        let mut ctx = timings::phase(timings::Phase::Setup, || {
-            Ctx::new(db, owner, store, infer, &scan, body, closure, mode)
+    for &(body, closure, inline_const) in bodies.iter().rev() {
+        // Each body in a task of its own: its analyses' memory goes when it is checked, and
+        // what it hands the next body is in the owner's `frame`.
+        let checked = blaze_mem::frame::task(blaze_mem::Tag::Mir, |body_frame| {
+            let mut ctx = timings::phase(timings::Phase::Setup, || {
+                Ctx::new(db, owner, store, infer, &scan, body, closure, mode, body_frame)
+            });
+            ctx.inline_const = inline_const.is_some();
+            if closure.is_none() && inline_const.is_none() && drops_in_const(&ctx, def, body) {
+                return Err(NotChecked::DropInConst);
+            }
+            let mut found = Vec::new_in(frame);
+            let mut moved = Vec::new_in(frame);
+            let (count, needs, used_mut_upvars) = check::check(
+                &ctx,
+                frame,
+                body,
+                &requirements,
+                &mut_upvars,
+                &mut found,
+                &mut moved,
+            );
+            if ctx.tainted.get() {
+                return Err(NotChecked::Unproven);
+            }
+            Ok((found, moved, count, needs, used_mut_upvars))
         });
-        ctx.inline_const = inline_const.is_some();
-        if closure.is_none() && inline_const.is_none() && drops_in_const(&ctx, def, body) {
-            result.not_checked = Some(NotChecked::DropInConst);
-            return result;
-        }
-        let mut found = Vec::new();
-        let mut moved = Vec::new();
-        let (count, needs, used_mut_upvars) =
-            check::check(&ctx, body, &requirements, &mut_upvars, &mut found, &mut moved);
-        if ctx.tainted.get() {
-            result.not_checked = Some(NotChecked::Unproven);
-            return result;
-        }
+        let (found, moved, count, needs, used_mut_upvars) = match checked {
+            Ok(it) => it,
+            Err(why) => {
+                result.not_checked = Some(why);
+                return result;
+            }
+        };
         let this = diagnostics.len();
-        let mut found: Vec<_> = found.into_iter().map(Some).collect();
+        let mut found = mem::collect(frame, found.into_iter().map(Some));
         // rustc numbers the moves of each body from 0 but buffers the errors of all of them
         // by those numbers, so a use of a moved value whose moves are numbered as those of
         // an error a closure gave, of a place the closure's is in (the variable `_1` and the
@@ -465,7 +529,9 @@ fn check_owner<'db>(
             mut_upvars.insert(nested, used_mut_upvars);
         }
     }
-    result.diagnostics.extend(diagnostics.into_iter().rev().flatten().flatten());
+    let reported = diagnostics.iter().flatten().flatten().count();
+    result.diagnostics =
+        mem::owned(ExactLen::new(diagnostics.into_iter().rev().flatten().flatten(), reported));
     if debugging(db, owner) {
         if let Some(skipped) = &result.skipped {
             eprintln!("skipped {skipped}");
@@ -494,10 +560,10 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
     if !const_context {
         return false;
     }
-    let mut moved = rustc_hash::FxHashSet::default();
+    let mut moved = bits(ctx.frame, body.locals.len());
     let mut visit = |operand: &hir_ty_mir::mir::Operand| {
         if let OperandKind::Move(place) = &operand.kind {
-            moved.insert(place.local);
+            moved.insert(place.local.into_raw().into_u32() as usize);
         }
     };
     for (_, block) in body.basic_blocks.iter() {
@@ -513,30 +579,31 @@ fn drops_in_const(ctx: &Ctx<'_, '_>, def: Option<DefWithBodyId>, body: &MirBody<
         let TerminatorKind::Drop { place, .. } = &terminator.kind else { return false };
         place.projection.as_slice().is_empty()
             && place.local != return_slot()
-            && !moved.contains(&place.local)
+            && !moved.contains(place.local.into_raw().into_u32() as usize)
             && ctx.drop_glue(body.locals[place.local].ty.as_ref())
                 == hir_ty::drop::DropGlue::HasDropGlue
     })
 }
 
 /// The coroutines `body` makes, in the order it makes them.
-fn coroutines<'db>(body: &MirBody<'db>) -> Vec<InternedCoroutineId<'db>> {
+fn coroutines<'db>(body: &MirBody<'db>, mut found: impl FnMut(InternedCoroutineId<'db>)) {
     use hir_ty::next_solver::TyKind;
     use hir_ty_mir::mir::{AggregateKind, Rvalue, StatementKind};
     use rustc_type_ir::inherent::IntoKind;
-    let mut out = Vec::new();
+    // The caller drops one seen before; this drops the common repeat, the same one again.
+    let mut last = None;
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(_, Rvalue::Aggregate(AggregateKind::Closure(ty), _)) =
                 &statement.kind
                 && let TyKind::Coroutine(id, _) = ty.as_ref().kind()
-                && !out.contains(&id.0)
+                && last != Some(id.0)
             {
-                out.push(id.0);
+                last = Some(id.0);
+                found(id.0);
             }
         }
     }
-    out
 }
 
 /// A body checked with the one it is written in.
@@ -555,11 +622,13 @@ fn nested_bodies_written<'db>(
     store: &ExpressionStore,
     infer: &InferenceResult<'db>,
     at: Option<ExprId>,
-) -> Vec<Nested<'db>> {
+    frame: &Frame,
+    out: &mut FVec<'_, Nested<'db>>,
+) {
     use hir_def::hir::{ClosureKind, CoroutineKind, Expr};
     use hir_ty::next_solver::TyKind;
     use rustc_type_ir::inherent::IntoKind;
-    let mut stack = Vec::new();
+    let mut stack: FVec<'_, ExprId> = Vec::new_in(frame);
     match at {
         Some(at) => store.walk_child_exprs(at, |it| stack.push(it)),
         None => match owner {
@@ -569,7 +638,6 @@ fn nested_bodies_written<'db>(
             InferBodyId::AnonConstId(konst) => stack.push(konst.loc(db).expr),
         },
     }
-    let mut out = Vec::new();
     while let Some(expr) = stack.pop() {
         match store.expr(expr) {
             // The kinds MIR lowering makes a body of.
@@ -594,18 +662,19 @@ fn nested_bodies_written<'db>(
             _ => store.walk_child_exprs(expr, |it| stack.push(it)),
         }
     }
-    out
 }
 
 /// The `const { .. }` blocks `body` evaluates, in the order it does.
 fn inline_consts<'db>(
     db: &'db Db,
     body: &MirBody<'db>,
-) -> Vec<hir_ty::db::AnonConstId<'db>> {
+    mut found: impl FnMut(hir_ty::db::AnonConstId<'db>),
+) {
     use hir_ty::next_solver::{AnonConstIdWrapper, ConstKind};
     use hir_ty_mir::mir::{OperandKind, Rvalue, StatementKind};
     use rustc_type_ir::{AliasConstKind, inherent::IntoKind};
-    let mut out = Vec::new();
+    // As in `coroutines`: the caller drops one seen before.
+    let mut last = None;
     for (_, block) in body.basic_blocks.iter() {
         for statement in &block.statements {
             if let StatementKind::Assign(_, Rvalue::Use(operand)) = &statement.kind
@@ -613,13 +682,13 @@ fn inline_consts<'db>(
                 && let ConstKind::Alias(_, unevaluated) = konst.as_ref().kind()
                 && let AliasConstKind::Anon { def_id: AnonConstIdWrapper(id) } = unevaluated.kind
                 && id.is_inline_const(db)
-                && !out.contains(&id)
+                && last != Some(id)
             {
-                out.push(id);
+                last = Some(id);
+                found(id);
             }
         }
     }
-    out
 }
 
 /// What the checks ask of the types and the source of a body.
@@ -635,9 +704,9 @@ pub(crate) struct Ctx<'a, 'db> {
     #[allow(dead_code)]
     pub(crate) mode: Mode,
     /// The user variable each local is, if it is one.
-    pub(crate) bindings: FxHashMap<LocalId, BindingId>,
+    pub(crate) bindings: FMap<'a, LocalId, BindingId>,
     /// In the body of a closure, its captures, by field of the closure.
-    pub(crate) upvars: Vec<Upvar>,
+    pub(crate) upvars: FVec<'a, Upvar>,
     /// In the body of a closure, how it is called.
     pub(crate) closure_kind: Option<rustc_type_ir::ClosureKind>,
     pub(crate) closure_local: Option<LocalId>,
@@ -646,12 +715,16 @@ pub(crate) struct Ctx<'a, 'db> {
     /// This is the body of a `const { .. }` block, whose type's lifetimes are its function's.
     pub(crate) inline_const: bool,
     /// What the checks read of `store`, found in one pass for every body of the owner.
-    pub(crate) scan: &'a scan::Scan<'db>,
+    pub(crate) scan: &'a scan::Scan<'a, 'db>,
     /// A where clause of a call does not hold, rustc's E0277, which rust-analyzer does not
     /// report: rustc does not borrow check a body whose type check fails.
     pub(crate) tainted: std::cell::Cell<bool>,
-    copy: std::cell::RefCell<FxHashMap<Ty<'db>, bool>>,
-    glue: std::cell::RefCell<FxHashMap<Ty<'db>, hir_ty::drop::DropGlue>>,
+    copy: RefCell<FMap<'a, Ty<'db>, bool>>,
+    glue: RefCell<FMap<'a, Ty<'db>, hir_ty::drop::DropGlue>>,
+    /// The type of every place the checks name, each found once.
+    pub(crate) places: RefCell<places::Places<'a, 'db>>,
+    /// The body's task's frame: what the checks of this body build.
+    pub(crate) frame: &'a Frame,
 }
 
 /// A capture of a closure, in its body.
@@ -672,26 +745,30 @@ impl<'a, 'db> Ctx<'a, 'db> {
         owner: InferBodyId<'db>,
         store: &'a ExpressionStore,
         infer: &'a InferenceResult<'db>,
-        scan: &'a scan::Scan<'db>,
+        scan: &'a scan::Scan<'a, 'db>,
         body: &MirBody<'db>,
         closure: Option<ExprId>,
         mode: Mode,
+        frame: &'a Frame,
     ) -> Self {
         let krate = owner.krate(db);
         let interner = DbInterner::new_with(db, krate).with_regions();
         let env = normalized_env(interner, db.trait_environment(owner.generic_def(db)));
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
-        let bindings =
-            body.binding_locals.iter().map(|(binding, &local)| (local, binding)).collect();
-        let mut upvars = Vec::new();
+        let mut bindings = mem::map(frame);
+        bindings.reserve(body.binding_locals.values().count());
+        bindings.extend(body.binding_locals.iter().map(|(binding, &local)| (local, binding)));
+        let mut upvars = Vec::new_in(frame);
         let mut closure_kind = None;
         let mut closure_local = None;
         if let Some(expr) = closure {
             closure_kind = closure_kind_of(infer, expr);
             closure_local = body.param_locals.first().copied();
             if let Some(data) = infer.closures_data.get(&expr) {
-                let mut locals: Vec<LocalId> =
-                    body.upvar_locals.values().flatten().map(|(local, _)| *local).collect();
+                let mut locals = mem::collect(
+                    frame,
+                    body.upvar_locals.values().flatten().map(|(local, _)| *local),
+                );
                 radix::sort_copy_by_key(&mut locals, |it| it.into_raw().into_u32());
                 for (capture, local) in data.min_captures.values().flatten().zip(locals) {
                     upvars.push(Upvar {
@@ -705,6 +782,7 @@ impl<'a, 'db> Ctx<'a, 'db> {
                                 hir_ty::next_solver::TyKind::Adt(def, _) if def.is_box()
                             )
                         }),
+                        // clone: hir-ty's `CapturedPlace`, once per capture per closure body
                         place: capture.clone(),
                     });
                 }
@@ -727,8 +805,10 @@ impl<'a, 'db> Ctx<'a, 'db> {
             inline_const: false,
             scan,
             tainted: std::cell::Cell::new(false),
-            copy: Default::default(),
-            glue: Default::default(),
+            copy: RefCell::new(mem::map(frame)),
+            glue: RefCell::new(mem::map(frame)),
+            places: RefCell::new(places::Places::new(frame, body)),
+            frame,
         }
     }
 
@@ -760,15 +840,19 @@ impl<'a, 'db> Ctx<'a, 'db> {
 
     pub(crate) fn place_ty(
         &self,
-        body: &MirBody<'db>,
+        _body: &MirBody<'db>,
         local: LocalId,
         projection: &[PlaceElem],
     ) -> PlaceTy<'db> {
-        PlaceTy::from_ty(body.locals[local].ty.as_ref()).multi_projection_ty(
-            &self.infcx,
-            self.env,
-            projection,
-        )
+        let place = self.place(local, projection);
+        self.places.borrow().ty(place)
+    }
+
+    /// The place `local.projection` in the body's place column, made if new.
+    pub(crate) fn place(&self, local: LocalId, projection: &[PlaceElem]) -> places::PlaceId {
+        self.places.borrow_mut().intern(local, projection, |ty, elem| {
+            ty.projection_ty(&self.infcx, elem, self.env)
+        })
     }
 
     pub(crate) fn project(&self, ty: PlaceTy<'db>, elem: &PlaceElem) -> PlaceTy<'db> {
@@ -946,7 +1030,9 @@ fn normalized_env<'db>(interner: DbInterner<'db>, env: ParamEnv<'db>) -> ParamEn
             _ => clause,
         }
     });
-    ParamEnv::new(Clauses::new_from_iter(clauses.collect::<Vec<_>>()))
+    blaze_mem::frame::current(|frame| {
+        ParamEnv::new(Clauses::new_from_slice(frame.alloc_slice_from_iter(clauses)))
+    })
 }
 
 fn closure_kind_of(

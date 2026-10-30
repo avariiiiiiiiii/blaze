@@ -58,3 +58,14 @@ never per token, segment or expression.
 (`list[str]`); it never lints `hir-ty-codegen` (sources at the crate root) or
 `blaze-diagnostics`; `dyn\s+[A-Z]` misses path-qualified traits (`&dyn ast::HasAttrs`, about 25
 lines); and it flags modules declared `#[cfg(test)]` in their parent.
+
+## Outcome (2026-10-29 22:30)
+
+Every site is applied in the tree, by dedyn and its children under common.md's dedyn edit
+rule. Per site: `/tmp/blaze-lanes/v2-dedyn*.md`. hot_lint's `dyn` findings across the crates
+went from 444 to 13, all Rust text inside string literals. The `dyn` left in code (297 lines)
+each carries a `// dyn:` reason: crate-cycle edges called once per crate, build or request
+(`ImageStore`, `ProcMacroExpander`, `BodyChecks`, `GoalFacts`, blaze-api's `Builder`), panic
+payloads, `dyn Error`, the sandbox's `Confine`, CLI writers, cranelift's `TargetIsa`, and v1
+codegen's `SymbolResolver`. That last one goes when v1's rustc-symbol linking does
+(docs/no-rustc.md).

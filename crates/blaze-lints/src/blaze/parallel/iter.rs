@@ -66,15 +66,28 @@ pub(crate) struct Std {
 impl Std {
     pub(crate) fn new(cx: &Cx<'_, '_>) -> Std {
         let db = cx.db();
-        let adt = |path: &[&str]| match cx.std_def(path) {
+        // An item of `core` or `alloc` is also `std`'s, at the same path past the crate: a
+        // crate that has only `std` among its dependencies reaches them there.
+        let def = |path: &[&str]| {
+            cx.std_def(path).or_else(|| {
+                let mut in_std = Vec::with_capacity(path.len());
+                in_std.push("std");
+                in_std.extend_from_slice(path.get(1..)?);
+                cx.std_def(&in_std)
+            })
+        };
+        let adt = |path: &[&str]| match def(path) {
             Some(hir::ModuleDef::Adt(it)) => Some(AdtId::from(it)),
             _ => None,
         };
-        let function = |path: &[&str]| match cx.std_def(path) {
+        let function = |path: &[&str]| match def(path) {
             Some(hir::ModuleDef::Function(it)) => Some(FunctionId::from(it)),
             _ => None,
         };
-        let trait_ = |path: &[&str]| cx.std_trait(path).map(TraitId::from);
+        let trait_ = |path: &[&str]| match def(path) {
+            Some(hir::ModuleDef::Trait(it)) => Some(TraitId::from(it)),
+            _ => None,
+        };
         let lang = lang_items(db, cx.krate().into());
         Std {
             slice_iter: adt(&["core", "slice", "Iter"]),
@@ -110,7 +123,7 @@ impl Std {
             hash_map: adt(&["std", "collections", "HashMap"]),
             iterator: lang.Iterator,
             send: trait_(&["core", "marker", "Send"]),
-            sync: lang.Sync,
+            sync: trait_(&["core", "marker", "Sync"]).or(lang.Sync),
             index: lang.Index,
             index_mut: lang.IndexMut,
             ord: trait_(&["core", "cmp", "Ord"]),
@@ -263,7 +276,14 @@ impl<'db> Chain<'db> {
                 Step::Filter => {
                     closures.next_back();
                 }
-                Step::Zip | Step::Chain => {
+                // A `Zip`'s item is a pair: a write goes through one half, and a half from a
+                // shared source can't be written through at all (its memory has no
+                // `UnsafeCell`, which the item's ownership check refuses). A `Chain`'s items
+                // come from either.
+                Step::Zip => {
+                    disjoint |= others.next_back().is_some_and(|it| it.disjoint(returns_item));
+                }
+                Step::Chain => {
                     disjoint &= others.next_back().is_some_and(|it| it.disjoint(returns_item));
                 }
                 Step::Copied | Step::Cloned => disjoint = true,

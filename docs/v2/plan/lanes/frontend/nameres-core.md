@@ -130,21 +130,21 @@ the modules the sink holds.
 ```rust
 /// The constants of a collection of `krate` (`collect_defs`' prologue): deps, cfg, the crate's
 /// own proc macros (read with the root file's syntax context), the fast-path flag.
-pub(crate) fn cx<'db>(db: &'db dyn SourceDatabase, krate: Crate, in_block: bool) -> CollectCx<'db>;
-pub(crate) fn crate_data(db: &dyn SourceDatabase, krate: Crate) -> Arc<DefMapCrateData>;
-pub(crate) fn root_decl(db: &dyn SourceDatabase, krate: Crate) -> DeclKey;
-pub(crate) fn module_decls(db: &dyn SourceDatabase, key: DeclKey) -> ModuleDecls;
-pub(crate) fn decl_row(db: &dyn SourceDatabase, key: DeclKey, module: ModuleId) -> Option<ModuleData>;
+pub(crate) fn cx<'db, 'f>(db: &'db Db, frame: &'f Frame, krate: Crate, in_block: bool) -> CollectCx<'db, 'f>;
+pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData>;
+pub(crate) fn root_decl(db: &Db, frame: &Frame, krate: Crate) -> DeclKey;
+pub(crate) fn module_decls(db: &Db, frame: &Frame, key: DeclKey) -> ModuleDecls;
+pub(crate) fn decl_row(db: &Db, key: DeclKey, module: ModuleId) -> Option<ModuleData>;
 /// `ModCollector { .. }.collect(items, container)` through `sink`.
-pub(crate) fn collect_items<'db, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S, side: &mut SideTables,
+pub(crate) fn collect_items<'db, S: Sink<'db>, A: Allocator + Clone>(cx: &CollectCx<'db, '_>, sink: &mut S, side: &mut SideTables<A>,
     module: ModuleId, tree: TreeId, macro_depth: u32, mod_dir: ModDir, items: &[ModItemId], container: ItemContainerId);
 /// `collect_macro_expansion`.
-pub(crate) fn collect_expansion<'db, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S, side: &mut SideTables,
+pub(crate) fn collect_expansion<'db, S: Sink<'db>, A: Allocator + Clone>(cx: &CollectCx<'db, '_>, sink: &mut S, side: &mut SideTables<A>,
     module: ModuleId, call: MacroCallId, depth: u32, container: ItemContainerId, attr_macro_item: Option<AstId<ast::Item>>);
 /// `seed_with_inner` (a block).
-pub(crate) fn seed_block<'db, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S, side: &mut SideTables, tree: TreeId);
+pub(crate) fn seed_block<'db, S: Sink<'db>, A: Allocator + Clone>(cx: &CollectCx<'db, '_>, sink: &mut S, side: &mut SideTables<A>, tree: TreeId);
 /// The batched `expand_all` of `expand_round`.
-pub(crate) fn expand_all(db: &dyn SourceDatabase, krate: Crate, calls: &[MacroCallId]);
+pub(crate) fn expand_all(db: &Db, krate: Crate, calls: &[MacroCallId]);
 ```
 
 `module_decls` of the root runs `seed_with_top_level`'s item part, `inject_prelude`,
@@ -156,12 +156,12 @@ applies `subtree_macro_exports(key)` to its own scope; after a `#[macro_use] mod
 ### `unit.rs` (child `frontend-nameres-core-unit`)
 
 ```rust
-#[derive(Clone)] pub(crate) struct UnitState { /* members' rows, Imports, GlobEdges, from_glob_import, upstream reads */ }
-pub(crate) struct Unit<'db> { /* the view DefMap, LocalDefMap, state, Option<ReadCheck> */ }
-impl<'db> Unit<'db> {
+#[derive(Clone)] pub(crate) struct UnitState<A: Allocator + Clone = Global> { /* members' rows, Imports, GlobEdges, from_glob_import, upstream reads */ }
+pub(crate) struct Unit<'db, 'f, A: Allocator + Clone = Global> { /* the view DefMap, LocalDefMap, state, the run's ImportQueues<'f>, Option<ReadCheck> */ }
+impl<'db, 'f> Unit<'db, 'f, &'f Frame> {
     /// A block's unit: `def_map` is `block_def_map`'s empty map (`ModulesSlot::Building`),
     /// every module it holds is a member, no partition check.
-    pub(crate) fn block(cx: &CollectCx<'db>, def_map: DefMap, local: &'db LocalDefMap) -> Unit<'db>;
+    pub(crate) fn block(cx: &CollectCx<'db, 'f>, def_map: DefMap, local: &'db LocalDefMap) -> Unit<'db, 'f, &'f Frame>;
     /// The import fixed point (`resolve_imports` until `ReachedFixedPoint::Yes`).
     pub(crate) fn resolve_imports(&mut self);
     /// `collect`'s end: `record_resolved_import` of every still-unresolved import.
@@ -171,11 +171,11 @@ impl<'db> Unit<'db> {
     pub(crate) fn def_map_mut(&mut self) -> &mut DefMap;
     pub(crate) fn into_def_map(self) -> DefMap;
 }
-impl<'db> Sink<'db> for Unit<'db> { /* apply = the old DefCollector's mutation, Import -> worklist, Macro -> pending */ }
-pub(crate) fn local_scope(db: &dyn SourceDatabase, module: ModuleId, inherited: &Inherited, ops: &OpLog) -> BuildingScope;
-pub(crate) fn scc_state(db: &dyn SourceDatabase, key: SccKey) -> SccState;
-pub(crate) fn fact_handle(db: &dyn SourceDatabase, key: FactKey) -> salsa::Id;
-pub(crate) fn unresolved_named(db: &dyn SourceDatabase, key: FactKey) -> Box<[(Name, ModPath)]>;
+impl<'db, A: Allocator + Clone> Sink<'db> for Unit<'db, '_, A> { /* apply = the old DefCollector's mutation, Import -> worklist, Macro -> pending */ }
+pub(crate) fn local_scope(db: &Db, frame: &Frame, module: ModuleId, inherited: &Inherited, ops: &OpLog) -> BuildingScope;
+pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState;
+pub(crate) fn fact_handle(db: &Db, key: FactKey) -> salsa::Id;
+pub(crate) fn unresolved_named(db: &Db, key: FactKey) -> Box<[(Name, ModPath)]>;
 ```
 
 `scc_state(r, anchor)`, only for a component `round_active(r)` runs (else it stops, §9):
@@ -198,26 +198,26 @@ If no member scope changed since the carried state, return the carried handles a
 ### `macros.rs` (child `frontend-nameres-core-macros`)
 
 ```rust
-pub(crate) fn macro_step(db: &dyn SourceDatabase, key: FactKey) -> MacroStep;
+pub(crate) fn macro_step(db: &Db, frame: &Frame, key: FactKey) -> MacroStep;
 pub(crate) struct RoundResult { pub(crate) progress: bool, pub(crate) deferred_eager: bool }
 /// One `resolve_macros` over `pending` through `sink`: resolves each directive (all three
 /// kinds, eager calls, the builtin-derive fast path and its deferral), retains the rest,
 /// expands the resolved ones in one `collect::expand_all` batch, collects each expansion.
-pub(crate) fn resolve_round<'db, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S, side: &mut SideTables,
-    pending: &mut Vec<MacroOp>, eager_with_errors: bool) -> RoundResult;
+pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(cx: &CollectCx<'db, 'f>, sink: &mut S, side: &mut SideTables<A>,
+    pending: &mut FrameVec<'f, MacroOp>, eager_with_errors: bool) -> RoundResult;
 /// The first `Attr` directive's position, for `RoundOutcome::first_attr`.
 pub(crate) fn first_attr<'p>(pending: impl IntoIterator<Item = &'p MacroOp>) -> Option<u32>;
 /// `reseed_with_unresolved_attribute` of `pending[index]`.
-pub(crate) fn reseed_at<'db, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S, side: &mut SideTables,
-    pending: &mut Vec<MacroOp>, index: u32);
+pub(crate) fn reseed_at<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(cx: &CollectCx<'db, 'f>, sink: &mut S, side: &mut SideTables<A>,
+    pending: &mut FrameVec<'f, MacroOp>, index: u32);
 /// `finish`'s unresolved-macro diagnostics for `pending`, as `Diagnostic` ops through `sink`.
-pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(cx: &CollectCx<'db>, sink: &mut S,
+pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(cx: &CollectCx<'db, '_>, sink: &mut S,
     pending: impl IntoIterator<Item = &'p MacroOp>);
 /// What a module has as a round starts: its last step's directives and tables, or what it
 /// started with (§9).
 pub(crate) struct Carried<'a>;
 impl<'a> Carried<'a> {
-    pub(crate) fn at(db: &'a dyn SourceDatabase, krate: Crate, modules: &RoundModules, at: u32) -> Carried<'a>;
+    pub(crate) fn at(db: &'a Db, krate: Crate, modules: &RoundModules, at: u32) -> Carried<'a>;
     pub(crate) fn directives(&self) -> impl Iterator<Item = &'a MacroOp> + 'a;
     pub(crate) fn tables(&self) -> Arc<SideTables>;
 }
@@ -233,15 +233,15 @@ pending directive and no reseed returns at once, cloning nothing) and the module
 ### `driver.rs` (child `frontend-nameres-core-driver`)
 
 ```rust
-pub(crate) fn collect_crate(db: &dyn SourceDatabase, krate: Crate) -> (DefMap, LocalDefMap);
-pub(crate) fn collect_block(db: &dyn SourceDatabase, def_map: DefMap, tree_id: TreeId, local: &LocalDefMap) -> DefMap;
-pub(crate) fn round_modules(db: &dyn SourceDatabase, round: RoundKey) -> RoundModules;
-pub(crate) fn module_round(db: &dyn SourceDatabase, key: FactKey) -> ModuleRound;
-pub(crate) fn import_shape(db: &dyn SourceDatabase, round: RoundKey) -> ImportShape;
-pub(crate) fn round_env(db: &dyn SourceDatabase, round: RoundKey) -> CrateEnvKey;
-pub(crate) fn round_progress(db: &dyn SourceDatabase, round: RoundKey) -> RoundOutcome;
-pub(crate) fn round_kind(db: &dyn SourceDatabase, round: RoundKey) -> RoundKind;
-pub(crate) fn round_row(db: &dyn SourceDatabase, round: RoundKey, module: ModuleId) -> Option<ModuleData>;
+pub(crate) fn collect_crate(db: &Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap);
+pub(crate) fn collect_block(db: &Db, frame: &Frame, def_map: DefMap, tree_id: TreeId, local: &LocalDefMap) -> DefMap;
+pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundModules;
+pub(crate) fn module_round(db: &Db, frame: &Frame, key: FactKey) -> ModuleRound;
+pub(crate) fn import_shape(db: &Db, frame: &Frame, round: RoundKey) -> ImportShape;
+pub(crate) fn round_env(db: &Db, round: RoundKey) -> CrateEnvKey;
+pub(crate) fn round_progress(db: &Db, round: RoundKey) -> RoundOutcome;
+pub(crate) fn round_kind(db: &Db, round: RoundKey) -> RoundKind;
+pub(crate) fn round_row(db: &Db, round: RoundKey, module: ModuleId) -> Option<ModuleData>;
 ```
 
 `round_kind(0) = Normal`; for `r >= 1`, with `o = round_progress(r-1)`, `k = round_kind(r-1)`:
@@ -367,7 +367,7 @@ iterates `RoundModules::stepping`. `module_round` runs only for `GAINS` modules:
 copies the old shape of any other module, and `replay_round` and the quick path skip them.
 `unresolved_named` is asked only by a step.
 
-**Round 0's macro queries.** `OpLog` keeps two flags as ops are pushed. `has_children` means a
+**Round 0's macro queries.** `OpLog` keeps two flags, read off its ops once by `OpLog::from_frame`. `has_children` means a
 `Splice`. `writes_elsewhere` means a scope op of another module than the log's own, which in a
 round-0 log is a `#[macro_export]` or proc macro into the root. `subtree_macro_exports` returns
 at once for a log with neither flag. It reads a child without children of its own in place, and
@@ -378,3 +378,55 @@ children instead of a query. Its kind `0x2210` stays unused.
 
 **What still runs per round and module.** A `row` execution for each module an active view
 reads, and `RoundModules`' `O(m)` copy of its columns.
+
+## 10. Frames
+
+What a query makes and drops within its run goes in a `blaze_mem` frame. What it returns, and
+what one query carries to the next, stays owned and exact (`v2/requests/mem-db-def-collect.md`,
+Part C).
+
+**Who opens a frame.** Each tracked fn in `queries.rs` that has temporaries opens its own
+`frame::task(Tag::Nameres, |frame| ..)` and passes `frame` to its body. That is `root_decl`,
+`module_decls`, `round_modules`, `module_round`, `import_shape`, `partition`, `scc_state`,
+`macro_step`, `decl_handle` and `subtree_macro_exports`. `collect_crate` and `collect_block` take the
+frame of `crate_local_def_map`/`block_def_map`. Nothing in `facts/` calls `frame::current`: salsa
+opens no frame, and a query must not depend on its caller's. A query that another query calls
+gets a frame of its own, nested, so the inner reset frees only the inner query's memory. Queries
+with nothing to free open none (`round_env`, `legacy_exports`, `round_progress`, `round_kind`,
+`row`, `fact_handle`, `unresolved_named`). `CollectCx<'db, 'f>` carries the frame to the
+collection, and its `deps` are a frame list of `(Name, &'db BuiltDependency)`, looked up by
+`cx.dep(name)`.
+
+**The aliases.** `facts.rs` has `FrameVec<'f, T>`, `FrameMap<'f, K, V>` and `FrameSet<'f, K>`
+(hashbrown in the frame, with the Fx hasher), and `map_in`/`set_in`, as in
+`hir-ty-mir/src/mir/framed.rs`. `facts/` does not depend on hir-ty-mir.
+
+**Owned results, at exact size.** A result is a frame list copied once, either
+`frame_vec.into_iter().collect::<Box<[_]>>()` or `Box::from(&v[..])` for `Copy` items. A
+filtered list is counted first and then filled to its capacity. `OpLog { ops: Box<[DeclOp]> }` is
+made once by `OpLog::from_frame`, which reads `owner`, `has_children` and `writes_elsewhere` off
+the ops. Its producers are `DeclSink::finish`, `StepSink::into_step` and `module_round`. A def map's
+diagnostics, derive helpers and `NameRecords` are gathered in the frame and copied once at the
+end of `collect_crate`/`collect_block`.
+
+**Carried vs. per run.** `UnitState<A = Global>`, `SideTables<A = Global>`, `Imports<A>`,
+`ImporterLists<K, T, A>` and `GlobEdges<A>` take their allocator as a type parameter. Where a value
+carries them (`SccState.state`, `ModuleDecls.side`, `MacroStep.side`) they are `Global`. A block's
+are in the frame (`SideTablesIn<'f>`, `Unit<'db, 'f, &'f Frame>`), and so is `local_scope`'s.
+`ImportQueues<'f>` (`unit/imports.rs`) is one run's worklist over the imports: the pending and
+deferred queues, the waits and their edges, the wake keys, and also `generation`, `queued`,
+`phase` and `free_edge`. A `Unit` makes it from `Imports::len()` and drops it at its end. That gives
+the same results as carrying it, because a run's fixed point ends with every queue empty, and the
+next run attempts every import first: a fresh unit pushes each one, and a carried one calls
+`wake_all` after its replay.
+
+**The graph.** `ImportGraph<'f>` and `Solver<'a, 'f>` live in the frame. `from_edges` does its two
+counting sorts in the frame by itself, because `blaze_radix::Csr` takes no allocator. The DFS stack
+entry is `DfsFrame`. `partition`'s only global allocations are the three columns of `Partition`
+(`PARTITION_ALLOCATIONS = 3` in `facts/tests/graph.rs`).
+
+**Still global.** No temporary: the reused buffers (`eager_calls`, `name_records`' `found`) are in
+the frame, as `macro_call_as_call_id` and `DefMap::path_uses*` take any allocator. The final
+`def_map.shrink_to_fit()`, `local.shrink_to_fit()` and `Arc::make_mut(data).shrink_to_fit()` stay
+until A3/A4/A5's `publish`/`settle` (deferred with R10). `DefMap::shrink_to_fit` also settles
+glob ambiguities and scopes.

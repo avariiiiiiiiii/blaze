@@ -91,6 +91,7 @@ mod budget;
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a (21:26): as written; the one `#[global_allocator]` (solver-sync-glue 6's too).
 
 ## 3. lane db: the tags, `crates/hir-ty/src/db.rs`
 
@@ -132,6 +133,7 @@ implemented in hir-ty-mir (`hir_ty_mir::provide`, frontend-db's `hir_ty::provide
 is `MIR_TAG` there, which is mem-db-checks' or codegen's to file for hir-ty-mir, not here.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a (21:22): constants as written; `closure_exprs` gets `mem_tag = Infer`, not `crate::db::INFER_TAG`: mem-db-salsa M2 (not yet in `vendor/salsa*`) takes a bare `blaze_mem::Tag` variant (`$zalsa::MemTag::$mem_tag`). Every hir-ty tracked fn uses that form.
 
 ## 4. lane db: the budget tests, `crates/hir-ty/src/tests/budget.rs`
 
@@ -320,6 +322,7 @@ Notes for whoever applies it:
 - `peak()` is the most the frame's cursor was since the task began (`frame.rs:88`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a (21:26): `src/tests/budget.rs` as written. Needs `infer::infer_body_in(db, def, inspect, lowering_mode, frame)` from ctx A2 (db-mem-infer-a-ctx applies it) and, to pass, mem-db-salsa M1/M2.
 
 ## 5. lane db: one definition of the frame map and set, `crates/hir-ty/src/lib.rs`
 
@@ -356,6 +359,10 @@ and `blaze_mem::frame::Frame` are the same type (`crates/blaze-mem/src/lib.rs:59
 already imports `FxBuildHasher` or `Frame` when this is applied, drop the repeated `use`.
 
 > forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
+> applied by db-mem-infer-a (21:26): db-ty handed mem-db-infer-ctx and these to db-mem-infer-a. Definitions after `pub mod closure_analysis`; `FxBuildHasher` joins the existing `rustc_hash` import, `use blaze_mem::Frame;` after `base_db`. columns C2 re-exports them (db-mem-infer-a-columns).
+> outcome (db-ty-next2, 21:20): offered to db-mem-infer-a along with ctx A, since 7 puts it
+> before A. If db-mem-infer-a does not take it, db-ty applies it when 7's step 1 is due (after
+> mem-db-salsa's `mem_tag` and `frame::current` exist).
 
 ## 6. lane db: where two parts' entries meet
 
@@ -383,6 +390,7 @@ in another part's file without an entry of that part. The resolution is written 
 2. **`infer.rs` `resolve_all`'s closure-data loop:** ctx A8 keeps the `shrink_to_fit` calls on
    the closure data; closure X3 replaces that loop, since closure A4 builds each list once at its
    length. Apply ctx A8, then closure X3 over the same loop.
+   > applied by db-mem-infer-a-ctx (21:36): ctx A8, then closure X3, in that order.
 3. **`infer/coerce.rs` `reified_sig` (line 963 now):** lower 12 adds `frame: &Frame` last to
    `bind_elided_lifetimes`; expr has no entry for its caller. Before:
    `crate::lower::bind_elided_lifetimes(self.db, function, sig)`, after:
@@ -437,7 +445,15 @@ in another part's file without an entry of that part. The resolution is written 
    writer only; method I5 (`trait_impls`, `inherent_impls` readers, lines 80 to 122) quotes code
    it left as it was, so both apply.
 
+> applied by db-mem-infer-b-impls (22:05): item 8 with B6 in (`transitive_deps` returns `&[Crate]`): `crates_containing_incoherent_inherent_impls` keeps method I6's frame list with the `.iter().copied().filter(..)` line, result exact. Item 9: method I5's readers applied over dedup's cursor change, which stays.
+
 > forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
+> outcome (db-ty-next2, 21:20): proposed to db-mem-infer-a that each lane db applier applies
+> each resolution here together with the part it is applying, at that part's sites. Items 4, 5
+> and 8 are in items' `method_resolution*` files. db-ty applies any item that is still open when
+> the parts are in.
+> applied by db-mem-infer-a (21:50): item 3 as written (`coerce.rs` `reified_sig`; lower 12 is in `lower.rs`). Item 2 by db-mem-infer-a-ctx (its line under ctx A8/closure X3). Items 4, 5, 8 are db-mem-infer-b's (method); 7 and 9 need no edit.
+> applied by db-mem-infer-a-closure (21:52): item 1 as written in `infer/closure.rs` (lower 22's `lower_closure_params(&mut impl Extend<Option<Ty>>) -> bound vars` agrees; told db-mem-infer-b-lower). Item 6: no edit, the `analysis.rs` loop compiles with the frame `Vec`.
 
 ## 7. Order to apply
 
@@ -449,10 +465,18 @@ in another part's file without an entry of that part. The resolution is written 
 4. expr, closure, method, eval, with 6's resolutions at the sites it names.
 5. This file's 4 (the tests) last.
 
+Method I1 to I6 (the impl tables, `v2/requests/mem-db-infer-method.md`) are on hold until
+requests-impls finishes its per-module rewrite of `method_resolution.rs`; the rest of method's
+entries stand. The `mem_tag = crate::db::INFER_TAG` form is the one salsa M2 takes, as amended
+(`v2/requests/mem-db-salsa.md`, the note after M2: a path, or a variant name).
+
 mem-db-salsa's `mem_tag` option and lane mem's `frame::current` (mem-db's request 1) are needed
 by every part; until they exist nothing here compiles, so the parts land after them.
 
 > forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
+> outcome (db-ty-next2, 21:20): agreed, this is the order. Step 2 (ctx A0 to A13) is
+> db-mem-infer-a's.
+> applied by db-mem-infer-a (21:52): steps 1, 2 (A10/M1 superseded by frontend-fast-method's `TraitsInScope`, ctx's lines say how), 4's expr and closure, and 5 are in; 3 and 4's method/eval are db-mem-infer-b's. Compiling still waits on mem-db-salsa M1/M2.
 
 ## Tags of every query
 
@@ -477,6 +501,12 @@ memoized result:
 | `layout.rs`, `layout/adt.rs`, `layout/target.rs`, `consteval.rs`, `target_feature.rs` | 14 | eval "Tracked fns of these files" |
 
 > forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
+> outcome (db-ty-next2, 21:20): each `mem_tag` goes in with its part's entry, as the table says.
+> The `method_resolution.rs`, `traits.rs`, `specialization.rs`, `opaques.rs`, `drop.rs` and
+> `layout*` rows are items' files; `target_feature.rs` is db-unsafeck's. db-ty adds any tag in
+> its own files that is still missing once the parts are in. Every one waits on
+> mem-db-salsa's `mem_tag` option.
+> applied by db-mem-infer-a (21:52): `db.rs` and `infer.rs` rows in, as `mem_tag = Infer` (salsa M2's bare-variant form). At 21:52 `method_resolution.rs` and `method_resolution/scope_sets.rs` (items / db-mem-infer-b) have none yet; `providers.rs` (32 fns) and `check_cache.rs` (2) are not in this table: told db-next3.
 
 ## What the parts found
 

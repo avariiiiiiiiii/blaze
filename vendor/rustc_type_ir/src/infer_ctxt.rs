@@ -556,6 +556,15 @@ pub trait InferCtxtLike: Sized {
         &self,
         prev_entries: Self::OpaqueTypeStorageEntries,
     ) -> Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>;
+    /// [`Self::clone_opaque_types_added_since`], appended to `into`: an implementation that
+    /// writes them there directly allocates nothing once `into` has room.
+    fn clone_opaque_types_added_since_into(
+        &self,
+        prev_entries: Self::OpaqueTypeStorageEntries,
+        into: &mut Vec<(ty::OpaqueTypeKey<Self::Interner>, <Self::Interner as Interner>::Ty)>,
+    ) {
+        into.extend(self.clone_opaque_types_added_since(prev_entries));
+    }
     fn opaques_with_sub_unified_hidden_type(
         &self,
         ty: TyVid,

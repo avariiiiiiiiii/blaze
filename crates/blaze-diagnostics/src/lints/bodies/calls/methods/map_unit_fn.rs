@@ -63,26 +63,35 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
     {
         return None;
     }
-    let (function_label, ret_ty) = match b.infer.expr_ty(arg).kind() {
-        TyKind::Closure(closure, args) => (closure_span(b, closure.0.loc(b.db())), args.as_closure().sig().skip_binder().output()),
+    let arg_ty = b.infer.expr_ty(arg);
+    let ret_ty = match arg_ty.kind() {
+        TyKind::Closure(_, args) => args.as_closure().sig().skip_binder().output(),
         TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(function)), _) => {
             let sig = b.db().callable_item_signature(CallableDefId::FunctionId(function));
-            (fn_span(b, function), sig.skip_binder().skip_binder().output())
+            sig.skip_binder().skip_binder().output()
         }
         _ => return None,
     };
     if !returns_nothing(ret_ty) {
         return None;
     }
+    let function_label = match arg_ty.kind() {
+        TyKind::Closure(closure, _) => closure_span(b, closure.0.loc(b.db())),
+        TyKind::FnDef(CallableIdWrapper(CallableDefId::FunctionId(function)), _) => fn_span(b, function),
+        _ => None,
+    };
 
+    // clone: a node handle or span, once the lint fires
     let call = ast::MethodCallExpr::cast(node.value.clone())?;
     let name = call.name_ref()?;
     let name_span = b.cx.span(node.with_value(name.syntax().text_range()));
     let span = b.cx.span(node.with_value(TextRange::new(name.syntax().text_range().start(), node.value.text_range().end())));
     let arg_span = util::span(b, arg)?;
+    // clone: a node handle or span, once the lint fires
     let mut diag = Diag::lint("map_unit_fn", "`Iterator::map` call that discard the iterator's values", span.clone());
     diag.note("`Iterator::map`, like many of the methods on `Iterator`, gets executed lazily, meaning that its effects won't be visible until it is iterated");
     diag.span_label(
+        // clone: a node handle or span, once the lint fires
         function_label.unwrap_or_else(|| arg_span.clone()),
         "this function returns `()`, which is likely not what you wanted",
     );
@@ -93,6 +102,7 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
         && let Some(receiver_ty) = b.cx.sema.type_of_expr(&written)
     {
         let printed = b.cx.ty(&receiver_ty.original);
+        // alloc: the lint's diagnostic
         diag.fact_opt(b.cx.method_fact(&receiver_ty.original, "map"), format!("what `map` is on `{printed}`"));
     }
     Some(b.lint(diag, Phase::Late, stmt.map(|it| SyntaxNodePtr::new(&it))))
@@ -133,6 +143,7 @@ fn closure_span(b: &BodyCx<'_, '_>, closure: InternedClosure<'_>) -> Option<Span
         owner => expr_node(db, owner, closure.expr)?,
     };
     let node = b.cx.syntax(ptr);
+    // clone: a node handle or span, once the lint fires
     let written = ast::ClosureExpr::cast(node.value.clone())?;
     let start = node
         .value

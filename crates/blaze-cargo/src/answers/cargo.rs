@@ -17,6 +17,7 @@ use std::{
 use anyhow::Context as _;
 use blaze_manifest::config::CompileKind;
 use blaze_manifest::{Config, Context, Workspace};
+use blaze_manifest::files::Disk;
 
 /// What cargo is asked.
 #[derive(Debug, PartialEq, Eq)]
@@ -146,7 +147,7 @@ pub fn rustflags(command: &Command, triple: &str) -> anyhow::Result<Vec<String>>
     Ok(flags)
 }
 
-fn host(rustc: &mut dyn FnMut(&[String]) -> anyhow::Result<String>) -> anyhow::Result<String> {
+fn host(rustc: &mut impl FnMut(&[String]) -> anyhow::Result<String>) -> anyhow::Result<String> {
     let verbose = rustc(&["-vV".to_owned()])?;
     let host = verbose.lines().find_map(|it| it.strip_prefix("host: "));
     Ok(host.context("`rustc -vV` names no host")?.to_owned())
@@ -181,7 +182,7 @@ impl Asker {
         vars
     }
 
-    fn config(&self) -> anyhow::Result<Config> {
+    fn config(&self) -> anyhow::Result<Config<Disk>> {
         Config::load(&self.cwd, self.vars(), &[])
     }
 
@@ -212,7 +213,7 @@ impl Asker {
     /// rustc to blaze.
     fn rustc(
         &self,
-        config: &Config,
+        config: &Config<Disk>,
     ) -> anyhow::Result<impl FnMut(&[String]) -> anyhow::Result<String> + use<>> {
         let mut envs: Vec<(OsString, Option<OsString>)> = self.set.clone();
         for (key, value) in config.env_config()? {
@@ -220,12 +221,9 @@ impl Asker {
         }
         Ok(move |args: &[String]| {
             let asked: Vec<OsString> = args.iter().map(OsString::from).collect();
-            let var = |name: &str| match envs.iter().rev().find(|(it, _)| it == name) {
-                Some((_, value)) => value.clone(),
-                None => std::env::var_os(name),
-            };
+            let vars = super::own::Vars::Over(&envs);
             let answer =
-                super::own::answer(&asked, &[], &var).ok_or_else(|| super::no_answer(&asked))?;
+                super::own::answer(&asked, &[], vars).ok_or_else(|| super::no_answer(&asked))?;
             String::from_utf8(answer).context("rustc's answer is not UTF-8")
         })
     }

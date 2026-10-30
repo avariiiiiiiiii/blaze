@@ -3,13 +3,15 @@
 //! is given, and its output written as one tree. Both walk with a stack of their own, so a tree
 //! nested however deep costs no native stack.
 
+use blaze_mem::{Frame, Tag, frame};
 use intern::Symbol;
 use span::{Span, SpanAnchor, SyntaxContext};
 use tt::{TopSubtree, TopSubtreeBuilder, TtElement, WirePart};
 
 use crate::{
-    Delimiter, TokenStream, TokenStreamIter,
+    Delimiter, TokenStream,
     bridge::{DelimSpan, Group, Ident, IdentKind, LitKind, Literal, Punct, TokenTree},
+    token_stream::owned,
 };
 
 /// The longest suffix a token tree's literal holds: its node keeps the length in 18 bits.
@@ -32,11 +34,14 @@ impl TokenStream<Span> {
         // alloc: error path.
         let (tree, used) = TopSubtree::read_wire(bytes, part).map_err(|error| error.to_string())?;
         let top = tree.top_subtree().delimiter;
-        let stream = streams(tree.iter(), &join)?;
+        let trees = streams(tree.iter(), &join)?;
         let stream = match top.kind {
-            tt::DelimiterKind::Invisible => stream,
-            // alloc: the one group a macro is given, as the stream it owns.
-            _ => TokenStream::new(vec![TokenTree::Group(group(top, stream, &join))]),
+            tt::DelimiterKind::Invisible => TokenStream::new(trees),
+            _ => {
+                let mut one = Vec::with_capacity(1);
+                one.push(TokenTree::Group(group(top, trees, &join)));
+                TokenStream::new(one)
+            }
         };
         Ok((stream, used))
     }
@@ -45,47 +50,54 @@ impl TokenStream<Span> {
     /// subtree, else an invisible top at `call_site` holding it. A negative number is a `-` and
     /// its magnitude, as rustc's parser takes the literal a macro makes of one.
     pub fn write_wire(&self, call_site: Span, out: &mut Vec<u8>) -> Result<(), String> {
-        let empty = TokenStream::default();
         let (top, contents) = match self.as_single_group() {
-            Some(group) => (delimiter(group), group.stream.as_ref().unwrap_or(&empty)),
-            None => (tt::Delimiter::invisible_spanned(call_site), self),
+            Some(group) => (delimiter(group), contents(group)),
+            None => (tt::Delimiter::invisible_spanned(call_site), &self.0[..]),
         };
         let mut builder = TopSubtreeBuilder::new(top);
-        // alloc: one stack per output, as deep as its nesting; the output goes to the client.
-        let mut open: Vec<(TokenStreamIter<'_, Span>, Span)> = Vec::new();
-        let mut trees = contents.iter();
-        loop {
-            let Some(tree) = trees.next() else {
-                let Some((outer, close)) = open.pop() else { break };
-                builder.close(close);
-                trees = outer;
-                continue;
-            };
-            match tree {
-                TokenTree::Group(group) => {
-                    let inner = group.stream.as_ref().unwrap_or(&empty).iter();
-                    builder.open(delimiter(group).kind, group.span.open);
-                    open.push((std::mem::replace(&mut trees, inner), group.span.close));
+        // The stack and the rebuilt tree live in the expansion's frame; only `out` grows.
+        frame::task(Tag::Expand, |frame| {
+            let mut open: Vec<(std::slice::Iter<'_, TokenTree<Span>>, Span), &Frame> =
+                Vec::new_in(frame);
+            let mut trees = contents.iter();
+            loop {
+                let Some(tree) = trees.next() else {
+                    let Some((outer, close)) = open.pop() else { break };
+                    builder.close(close);
+                    trees = outer;
+                    continue;
+                };
+                match tree {
+                    TokenTree::Group(group) => {
+                        builder.open(delimiter(group).kind, group.span.open);
+                        let inner = contents(group).iter();
+                        open.push((std::mem::replace(&mut trees, inner), group.span.close));
+                    }
+                    TokenTree::Literal(literal) => push_literal(&mut builder, literal)?,
+                    TokenTree::Punct(punct) => builder.push(tt::Leaf::Punct(tt::Punct {
+                        char: char::from(punct.ch),
+                        spacing: if punct.joint { tt::Spacing::Joint } else { tt::Spacing::Alone },
+                        span: punct.span,
+                    })),
+                    TokenTree::Ident(ident) => builder.push(tt::Leaf::Ident(tt::Ident {
+                        sym: ident.sym,
+                        span: ident.span,
+                        is_raw: match ident.kind {
+                            IdentKind::Raw => tt::IdentIsRaw::Yes,
+                            _ => tt::IdentIsRaw::No,
+                        },
+                    })),
                 }
-                TokenTree::Literal(literal) => push_literal(&mut builder, literal)?,
-                TokenTree::Punct(punct) => builder.push(tt::Leaf::Punct(tt::Punct {
-                    char: char::from(punct.ch),
-                    spacing: if punct.joint { tt::Spacing::Joint } else { tt::Spacing::Alone },
-                    span: punct.span,
-                })),
-                TokenTree::Ident(ident) => builder.push(tt::Leaf::Ident(tt::Ident {
-                    sym: ident.sym,
-                    span: ident.span,
-                    is_raw: match ident.kind {
-                        IdentKind::Raw => tt::IdentIsRaw::Yes,
-                        _ => tt::IdentIsRaw::No,
-                    },
-                })),
             }
-        }
-        builder.build().write_wire(out);
-        Ok(())
+            builder.build_in(frame).write_wire(out);
+            Ok(())
+        })
     }
+}
+
+/// The trees a group holds, none when it has no stream.
+fn contents(group: &Group<Span>) -> &[TokenTree<Span>] {
+    group.stream.as_ref().map_or(&[], |stream| &stream.0[..])
 }
 
 fn push_literal(builder: &mut TopSubtreeBuilder, literal: &Literal<Span>) -> Result<(), String> {
@@ -136,38 +148,41 @@ fn aligned<'a>(bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
     &scratch[at..at + bytes.len()]
 }
 
-/// The streams of the token trees `top` walks, each subtree a group.
+/// The trees `top` walks, each subtree a group. Every open group's trees wait in one list in
+/// the expansion's frame and move, once the group closes, into a `Vec` of exactly their
+/// number: a macro owns its streams, and nothing else is left on the heap.
 fn streams(
     top: tt::TtIter<'_>,
     join: &impl Fn(Span, Span) -> Span,
-) -> Result<TokenStream<Span>, String> {
-    // alloc: one stack per input, as deep as its nesting.
-    let mut open: Vec<(Vec<TokenTree<Span>>, tt::TtIter<'_>, tt::Delimiter)> = Vec::new();
-    // alloc: a macro owns its streams, one `Vec` per group.
-    let mut trees = Vec::new();
-    let mut iter = top;
-    loop {
-        match iter.next() {
-            Some(TtElement::Leaf(leaf)) => trees.push(leaf_tree(leaf)?),
-            Some(TtElement::Subtree(subtree, inner)) => {
-                let outer = std::mem::replace(&mut iter, inner);
-                open.push((std::mem::take(&mut trees), outer, subtree.delimiter));
-            }
-            None => {
-                let Some((outer, rest, delimiter)) = open.pop() else {
-                    return Ok(TokenStream::new(trees));
-                };
-                let inner = TokenStream::new(std::mem::replace(&mut trees, outer));
-                trees.push(TokenTree::Group(group(delimiter, inner, join)));
-                iter = rest;
+) -> Result<Vec<TokenTree<Span>>, String> {
+    frame::task(Tag::Expand, |frame| {
+        let mut pending: Vec<TokenTree<Span>, &Frame> = Vec::new_in(frame);
+        // Where each open group's trees start in `pending`, the trees after it and its delimiter.
+        let mut open: Vec<(usize, tt::TtIter<'_>, tt::Delimiter), &Frame> = Vec::new_in(frame);
+        let mut iter = top;
+        loop {
+            match iter.next() {
+                Some(TtElement::Leaf(leaf)) => pending.push(leaf_tree(leaf)?),
+                Some(TtElement::Subtree(subtree, inner)) => {
+                    let outer = std::mem::replace(&mut iter, inner);
+                    open.push((pending.len(), outer, subtree.delimiter));
+                }
+                None => {
+                    let Some((start, rest, delimiter)) = open.pop() else {
+                        return Ok(owned(&mut pending, 0));
+                    };
+                    let inner = owned(&mut pending, start);
+                    pending.push(TokenTree::Group(group(delimiter, inner, join)));
+                    iter = rest;
+                }
             }
         }
-    }
+    })
 }
 
 fn group(
     delimiter: tt::Delimiter,
-    stream: TokenStream<Span>,
+    trees: Vec<TokenTree<Span>>,
     join: &impl Fn(Span, Span) -> Span,
 ) -> Group<Span> {
     Group {
@@ -177,7 +192,7 @@ fn group(
             tt::DelimiterKind::Bracket => Delimiter::Bracket,
             tt::DelimiterKind::Invisible => Delimiter::None,
         },
-        stream: if stream.is_empty() { None } else { Some(stream) },
+        stream: if trees.is_empty() { None } else { Some(TokenStream::new(trees)) },
         span: DelimSpan {
             open: delimiter.open,
             close: delimiter.close,
@@ -322,6 +337,52 @@ mod tests {
             assert_eq!(tokens(&back), tokens(&tree), "{kind:?}");
             assert_eq!(tokens(&back).len(), 104);
         }
+    }
+
+    /// Reading a request's tree allocates what the macro owns, a `Vec` and an `Arc` per
+    /// non-empty group and for the top stream, and what `tt::TopSubtree::read_wire` keeps until
+    /// it lends a frame: its block and its stack of subtree ends.
+    #[test]
+    fn a_tree_read_as_a_stream_allocates_only_the_streams_and_tts_temporaries() {
+        let tree = tree(tt::DelimiterKind::Brace);
+        let mut bytes = Vec::new();
+        tree.write_wire(&mut bytes);
+        let mut scratch = Vec::new();
+        let mut parts = parts(&tree);
+        let mut read =
+            || TokenStream::read_wire(&bytes, &mut scratch, &mut parts, |open, _| open).unwrap();
+        drop(read());
+        let groups = 100 + 1;
+        let top = 2;
+        let tts_block = 1;
+        // `vec![end]` and its growth to the 101 open subtrees: 1, 4, 8, 16, 32, 64, 128.
+        let tts_ends = 7;
+        let (stream, used) = blaze_alloc_count::assert_at_most(
+            2 * groups + top + tts_block + tts_ends,
+            "reading a request's tree as a macro's stream",
+            &mut read,
+        );
+        assert_eq!(used, bytes.len());
+        drop(stream);
+    }
+
+    /// Writing a macro's output allocates nothing once `out` has room: the walk's stack and
+    /// the rebuilt tree are in the expansion's frame.
+    #[test]
+    fn a_stream_written_back_allocates_nothing() {
+        let tree = tree(tt::DelimiterKind::Brace);
+        let mut bytes = Vec::new();
+        tree.write_wire(&mut bytes);
+        let (stream, _) =
+            TokenStream::read_wire(&bytes, &mut Vec::new(), &mut parts(&tree), |open, _| open)
+                .unwrap();
+        let mut out = Vec::new();
+        stream.write_wire(span(0, 0), &mut out).unwrap();
+        blaze_alloc_count::assert_at_most(0, "writing a macro's output to the wire", || {
+            out.clear();
+            stream.write_wire(span(0, 0), &mut out).unwrap();
+        });
+        assert_eq!(out, bytes);
     }
 
     #[test]

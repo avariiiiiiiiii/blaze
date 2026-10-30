@@ -39,6 +39,7 @@ triomphe.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 expect-test.workspace = true
+hir-ty-mir.workspace = true
 proptest.workspace = true
 test-fixture.workspace = true
 

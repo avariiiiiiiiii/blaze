@@ -11,10 +11,10 @@
 
 use blaze_ids::radix;
 use either::Either;
-use hir::{GenericArgKind, GenericDef, HasSource as _, InFile, ModuleDef, PathResolution};
+use hir::{GenericArgKind, GenericDef, InFile, ModuleDef, PathResolution};
 use syntax::{
-    AstNode, TextRange,
-    ast::{self, HasName as _},
+    TextRange,
+    view::{self as ast, AstNode as _, HasName as _},
 };
 
 use crate::{
@@ -36,7 +36,7 @@ enum Arg {
 }
 
 impl Arg {
-    fn of(arg: &ast::GenericArg) -> Option<Arg> {
+    fn of(arg: ast::GenericArg<'_>) -> Option<Arg> {
         Some(match arg {
             ast::GenericArg::LifetimeArg(_) => Arg::Lifetime,
             ast::GenericArg::ConstArg(_) => Arg::Const,
@@ -101,11 +101,13 @@ fn params(cx: &Cx<'_, '_>, def: GenericDef) -> Vec<Param> {
     let db = cx.db;
     let lifetimes = def.lifetime_params(db).into_iter().map(|it| Param {
         kind: GenericArgKind::Lifetime,
+        // alloc: the error's text, for an error hir found
         name: it.name(db).display(db, cx.edition).to_string(),
         synthetic: false,
         source: None,
     });
     let others = def.type_or_const_params(db).into_iter().filter_map(|it| {
+        // alloc: the error's text, for an error hir found
         let name = it.name(db).display(db, cx.edition).to_string();
         Some(match it.split(db) {
             Either::Left(param) => Param {
@@ -125,17 +127,18 @@ fn params(cx: &Cx<'_, '_>, def: GenericDef) -> Vec<Param> {
             },
         })
     });
+    // alloc: the parameters the error names, for an error hir found
     lifetimes.chain(others).collect()
 }
 
 /// The definition the arguments of `list` are given to.
-fn def_of(cx: &Cx<'_, '_>, list: &ast::GenericArgList) -> Option<GenericDef> {
+fn def_of<'db>(cx: &Cx<'_, 'db>, list: ast::GenericArgList<'db>) -> Option<GenericDef> {
     let owner = list.syntax().parent()?;
-    if let Some(call) = ast::MethodCallExpr::cast(owner.clone()) {
-        return Some(GenericDef::Function(cx.sema.resolve_method_call(&call)?));
+    if let Some(call) = ast::MethodCallExpr::cast(owner) {
+        return Some(GenericDef::Function(cx.vsema.resolve_method_call(call)?));
     }
     let segment = ast::PathSegment::cast(owner)?;
-    Some(match cx.sema.resolve_path(&segment.parent_path())? {
+    Some(match cx.vsema.resolve_path(segment.parent_path())? {
         PathResolution::Def(ModuleDef::Adt(it)) => it.into(),
         PathResolution::Def(ModuleDef::EnumVariant(it)) => it.parent_enum(cx.db).into(),
         PathResolution::Def(ModuleDef::Function(it)) => it.into(),
@@ -175,17 +178,23 @@ fn mismatch(args: &[Arg], params: &[Param]) -> Option<Mismatch> {
                 }
                 _ => {
                     let mut present: Vec<(u8, &Param)> =
+                        // alloc: the error's help, for an error hir found
                         params.iter().map(|it| (kind_ord(it.kind), it)).collect();
                     radix::sort_by_key(&mut present, |(ord, _)| *ord);
+                    // alloc: the error's help, for an error hir found
                     let mut ords: Vec<u8> = present.iter().map(|(ord, _)| *ord).collect();
                     ords.dedup();
+                    // alloc: the error's help, for an error hir found
                     let help = format!(
                         "reorder the arguments: {}: `<{}>`",
+                        // alloc: the error's help, for an error hir found
                         ords.iter().map(|it| format!("{}s", ord_name(*it))).collect::<Vec<_>>().join(", then "),
                         present
                             .iter()
                             .filter(|(_, it)| it.name != "Self")
+                            // clone: the error's help, for an error hir found
                             .map(|(_, it)| it.name.clone())
+                            // alloc: the error's help, for an error hir found
                             .collect::<Vec<_>>()
                             .join(", "),
                     );
@@ -204,7 +213,7 @@ fn mismatch(args: &[Arg], params: &[Param]) -> Option<Mismatch> {
 }
 
 /// rustc's `def_span` of a type parameter: its name, to the end of its default.
-fn type_param_range(param: &ast::TypeParam) -> Option<TextRange> {
+fn type_param_range(param: ast::TypeParam<'_>) -> Option<TextRange> {
     let name = param.name()?.syntax().text_range();
     Some(match param.default_type() {
         Some(default) => TextRange::new(name.start(), default.syntax().text_range().end()),
@@ -213,7 +222,7 @@ fn type_param_range(param: &ast::TypeParam) -> Option<TextRange> {
 }
 
 /// The function a const argument names, `{ f }`.
-fn const_arg_fn(cx: &Cx<'_, '_>, arg: &ast::ConstArg) -> Option<hir::Function> {
+fn const_arg_fn<'db>(cx: &Cx<'_, 'db>, arg: ast::ConstArg<'db>) -> Option<hir::Function> {
     let expr = match arg.expr()? {
         ast::Expr::BlockExpr(block) => {
             let list = block.stmt_list()?;
@@ -225,7 +234,7 @@ fn const_arg_fn(cx: &Cx<'_, '_>, arg: &ast::ConstArg) -> Option<hir::Function> {
         it => it,
     };
     let ast::Expr::PathExpr(path) = expr else { return None };
-    match cx.sema.resolve_path(&path.path()?)? {
+    match cx.vsema.resolve_path(path.path()?)? {
         PathResolution::Def(ModuleDef::Function(it)) => Some(it),
         _ => None,
     }
@@ -233,22 +242,22 @@ fn const_arg_fn(cx: &Cx<'_, '_>, arg: &ast::ConstArg) -> Option<hir::Function> {
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Found> {
     let db = cx.db;
-    let provided = cx.node(d.provided_arg);
+    let provided = cx.node_view(d.provided_arg);
     let file = provided.file_id;
     let span = |range: TextRange| cx.span(InFile::new(file, range));
     let arg_node = provided.value;
     let arg_range = arg_node.syntax().text_range();
-    let Some(arg_kind) = Arg::of(&arg_node) else { return Vec::new() };
+    // alloc: empty, allocates nothing
+    let Some(arg_kind) = Arg::of(arg_node) else { return Vec::new() };
 
     let list = arg_node.syntax().parent().and_then(ast::GenericArgList::cast);
-    let found = list.as_ref().and_then(|list| {
+    let found = list.and_then(|list| {
         let def = def_of(cx, list)?;
-        let written: Vec<(ast::GenericArg, Arg)> =
-            list.generic_args().filter_map(|it| Some((it.clone(), Arg::of(&it)?))).collect();
-        let kinds: Vec<Arg> = written.iter().map(|(_, it)| *it).collect();
+        // alloc: the arguments' kinds, on the error path
+        let kinds: Vec<Arg> = list.generic_args().filter_map(Arg::of).collect();
         let params = params(cx, def);
         let m = mismatch(&kinds, &params)?;
-        let at = written.get(m.arg)?.0.syntax().text_range();
+        let at = list.generic_args().filter(|it| Arg::of(*it).is_some()).nth(m.arg)?.syntax().text_range();
         (at == arg_range).then_some((m, params))
     });
 
@@ -258,6 +267,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
     };
     let mut diag = Diag::error(
         Some("E0747"),
+        // alloc: the error's text, for an error hir found
         format!("{} provided when a {expected_descr} was expected", arg_kind.descr()),
         span(arg_range),
     );
@@ -265,8 +275,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
     let braces = |diag: &mut Diag| {
         diag.multipart_suggestion(
             "if this generic argument was intended as a const parameter, surround it with braces",
+            // alloc: the suggestion's parts, for an error hir found
             vec![
+                // alloc: the suggestion's text, for an error hir found
                 (span(arg_range).shrink_to_lo(), "{ ".to_owned()),
+                // alloc: the suggestion's text, for an error hir found
                 (span(arg_range).shrink_to_hi(), " }".to_owned()),
             ],
             Applicability::MaybeIncorrect,
@@ -274,13 +287,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
     };
     let param = found.as_ref().map(|(m, params)| &params[m.param]);
     let expects_const = expected_descr == "constant";
-    match (&arg_node, expects_const) {
+    match (arg_node, expects_const) {
         (ast::GenericArg::TypeArg(it), true) => match it.ty() {
             Some(ast::Type::PathType(ty)) => {
-                let res = ty.path().and_then(|path| cx.sema.resolve_path(&path));
+                let res = ty.path().and_then(|path| cx.vsema.resolve_path(path));
                 match res {
                     None => {
                         braces(&mut diag);
+                        // alloc: the error's text, for an error hir found
                         diag.message = "unresolved item provided when a constant was expected".to_owned();
                     }
                     Some(PathResolution::TypeParam(src)) => {
@@ -288,20 +302,22 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
                             Some(Either::Right(it)) => Some(it),
                             _ => None,
                         });
-                        let src_range = src
-                            .merge()
-                            .source(db)
-                            .and_then(|it| match &it.value {
+                        let src_range = cx
+                            .vsema
+                            .source(src.merge())
+                            .and_then(|it| match it.value {
                                 Either::Left(ast::TypeOrConstParam::Type(p)) => {
                                     Some(it.with_value(type_param_range(p)?))
                                 }
                                 _ => None,
                             });
                         if let (Some(target), Some(src_range)) = (target, src_range) {
+                            // alloc: the suggestion's text, for an error hir found
                             let name = target.name(db).display(db, cx.edition).to_string();
                             diag.suggestion_verbose(
                                 cx.span(src_range),
                                 "consider changing this type parameter to a const parameter",
+                                // alloc: the suggestion's text, for an error hir found
                                 format!("const {name}: {}", cx.ty(&target.ty(db))),
                                 Applicability::MaybeIncorrect,
                             );
@@ -321,6 +337,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
                     diag.suggestion(
                         span(arg_range),
                         "array type provided where a `usize` was expected, try",
+                        // alloc: the suggestion's text, for an error hir found
                         format!("{{ {snippet} }}"),
                         Applicability::MaybeIncorrect,
                     );
@@ -330,6 +347,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
         },
         (ast::GenericArg::ConstArg(it), false) if expected_descr == "type" => {
             if let Some(f) = const_arg_fn(cx, it) {
+                // alloc: the error's text, for an error hir found
                 diag.help(format!(
                     "`{}` is a function item, not a type",
                     f.name(db).display(db, cx.edition)
@@ -348,11 +366,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectGenericsOrder) -> Vec<Fou
             true => (expected_descr, arg_kind.descr()),
             false => (arg_kind.descr(), expected_descr),
         };
+        // alloc: the error's text, for an error hir found
         diag.note(format!("{first} arguments must be provided before {last} arguments"));
         if let Some(help) = &m.help {
+            // clone: the error's text, for an error hir found
             diag.help(help.clone());
         }
     }
     site_fact(cx, &mut diag, InFile::new(file, arg_node.syntax()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, phase_at(arg_node.syntax()))]
 }

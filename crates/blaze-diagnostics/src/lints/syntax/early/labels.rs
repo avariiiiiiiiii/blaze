@@ -17,8 +17,7 @@ use hir::{HirFileId, InFile};
 use hir_def::{expr_store::Body, hir::Expr, nameres::demand::every_body};
 use span::SyntaxContext;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, T, TextRange,
-    ast::{self, HasLoopBody as _},
+    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, T, TextRange, ast,
 };
 
 use super::ctxt;
@@ -32,7 +31,9 @@ use crate::{
 /// `unused_labels`: each label of a loop or block no `break` or `continue` resolved to, but
 /// those whose name starts with `'_`. A desugared label (of a `try` block) is not one.
 pub(super) fn unused(cx: &Cx<'_, '_>) -> Vec<Emitted> {
+    // alloc: once per crate, empty until a label is unused
     let mut out = Vec::new();
+    // alloc: once per crate, reused across bodies
     let (mut declared, mut used) = (Vec::new(), BitSet::<u32>::default());
     for owner in every_body(cx.db, cx.krate.base()) {
         let (body, source_map) = Body::with_source_map(cx.db, owner);
@@ -79,16 +80,20 @@ pub(super) fn shadowing(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &m
     let Some(lifetime) = node.children().find_map(ast::Lifetime::cast) else { return };
     let Some(labeled) = node.parent() else { return };
     let range = lifetime.syntax().text_range();
-    let labeled = InFile::new(tree.file, labeled);
-    let Some(orig) = resolve(cx, &labeled, lifetime.text(), ctxt(cx, tree.file, range)) else { return };
+    let at = InFile::new(tree.file, SyntaxNodePtr::new(&labeled));
+    let hygiene = ctxt(cx, tree.file, range);
+    let Some(orig) = resolve(cx, InFile::new(tree.file, labeled), lifetime.text(), hygiene) else { return };
     let name = lifetime.text();
     let shadower = cx.span(InFile::new(tree.file, range));
     let mut diag =
+        // alloc: the diagnostic's text and span, as is the rest of `shadowing`
         Diag::new(Level::Warning, None, format!("label name `{name}` shadows a label name that is already in scope"));
+    // clone: as above
     diag.span = MultiSpan::of(shadower.clone());
     diag.span_label(cx.span(orig), "first declared here");
+    // alloc: as above
     diag.span_label(shadower, format!("label `{name}` already in scope"));
-    source_fact(cx, &mut diag, labeled.map(|it| SyntaxNodePtr::new(&it)));
+    source_fact(cx, &mut diag, at);
     out.push(Emitted::unplaced(diag, Phase::Resolve, Pass::Buffered));
 }
 
@@ -98,11 +103,11 @@ pub(super) fn shadowing(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &m
 /// are no rib.
 fn resolve(
     cx: &Cx<'_, '_>,
-    labeled: &InFile<SyntaxNode>,
+    labeled: InFile<SyntaxNode>,
     name: &str,
     mut hygiene: SyntaxContext,
 ) -> Option<InFile<TextRange>> {
-    let (mut file, mut child) = (labeled.file_id, labeled.value.clone());
+    let (mut file, mut child) = (labeled.file_id, labeled.value);
     let mut key: Option<SyntaxContext> = None;
     loop {
         let Some(parent) = child.parent() else {
@@ -134,19 +139,20 @@ fn resolve(
 /// `loop`'s body, a `while`'s condition and body, a `for`'s pattern and body (not what it
 /// iterates) and a block's statements.
 fn label_over(parent: &SyntaxNode, child: &SyntaxNode) -> Option<ast::Label> {
+    let label = || parent.children().find_map(ast::Label::cast);
+    let mut blocks = parent.children().filter(|it| it.kind() == SyntaxKind::BLOCK_EXPR);
     match parent.kind() {
-        SyntaxKind::LOOP_EXPR => {
-            let it = ast::LoopExpr::cast(parent.clone())?;
-            it.loop_body().filter(|body| body.syntax() == child).and(it.label())
-        }
-        SyntaxKind::WHILE_EXPR if child.kind() != SyntaxKind::LABEL => ast::WhileExpr::cast(parent.clone())?.label(),
+        // `LoopExpr::loop_body`: its first block.
+        SyntaxKind::LOOP_EXPR => blocks.next().filter(|body| body == child).and_then(|_| label()),
+        SyntaxKind::WHILE_EXPR if child.kind() != SyntaxKind::LABEL => label(),
         SyntaxKind::FOR_EXPR => {
-            let it = ast::ForExpr::cast(parent.clone())?;
-            let in_scope = it.loop_body().is_some_and(|body| body.syntax() == child)
-                || it.pat().is_some_and(|pat| pat.syntax() == child);
-            in_scope.then(|| it.label()).flatten()
+            // `ForExpr::loop_body`: its second block, else its first.
+            let (first, second) = (blocks.next(), blocks.next());
+            let in_scope = second.or(first).is_some_and(|body| &body == child)
+                || parent.children().find(|it| ast::Pat::can_cast(it.kind())).is_some_and(|pat| &pat == child);
+            in_scope.then(label).flatten()
         }
-        SyntaxKind::BLOCK_EXPR if child.kind() == SyntaxKind::STMT_LIST => ast::BlockExpr::cast(parent.clone())?.label(),
+        SyntaxKind::BLOCK_EXPR if child.kind() == SyntaxKind::STMT_LIST => label(),
         _ => None,
     }
 }

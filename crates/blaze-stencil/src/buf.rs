@@ -104,7 +104,7 @@ impl<'f> Buf<'f> {
     /// `0x90`; AArch64 `d503201f`) in code, so a padded gap is never executed as anything else.
     pub fn align(&mut self, align: u32, fill: &[u8]) {
         debug_assert!(align.is_power_of_two() && !fill.is_empty());
-        let pad = (align - self.len() % align) % align;
+        let pad = blaze_mem::align::padding_for_u32(self.len(), align);
         self.pad(pad, fill);
     }
 

@@ -378,6 +378,7 @@ impl Compiler {
         let on_demand: Vec<FunctionId> = library.values().copied().collect();
         let listing = start.elapsed();
         let (paths, rustc);
+        // dyn: `CodegenUnit::compile`'s resolver, one per build, chosen by whether there is a host.
         let resolver: &dyn SymbolResolver = match host {
             Some((_, table)) => {
                 rustc = names::Resolver { db, table };

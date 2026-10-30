@@ -87,7 +87,7 @@ pub fn plan<'a>(images: &mut Images, dev: &'a Dev<'a>) -> Result<Plan<'a>, Prema
 
 impl Job<'_> {
     /// The image, from `shelf` when it keeps it, else linked by `linker` and kept there.
-    pub fn make(&self, linker: &dyn Prelink, shelf: &mut dyn Shelf) -> Result<Ready, PremapError> {
+    pub fn make(&self, linker: &impl Prelink, shelf: &mut impl Shelf) -> Result<Ready, PremapError> {
         if let Some(bytes) = shelf.get_image(&self.key)? {
             return Ready::open(self.graph, self.key, bytes);
         }

@@ -10,7 +10,10 @@ code to find it by. The `db` parameters (`&'db Db` now, `&dyn HirDatabase` befor
 as they are wherever they appear; no entry depends on which it is. Lane dedyn's agents may edit
 these files to replace hot `dyn` with concrete types, enums or generics. Where one of their edits
 already does what an entry asks (L6, C2), that entry is done; where it changes a "before" quote,
-apply the entry to their text and keep their change. No entry here adds a `dyn`.
+apply the entry to their text and keep their change. No entry here adds a `dyn`. The same holds
+for lane frontend-tree's moves of `SyntaxNode` callers to `syntax::view`. None of these files
+holds a syntax handle; `lang_items.rs` reads only the `syntax::ast::BinaryOp` enum. No entry here
+walks syntax.
 
 ## What these files allocate, in short
 
@@ -42,6 +45,7 @@ the evaluator (`crates/hir-ty-mir/src/mir/eval.rs`, mem-codegen-mir's) builds th
 and `match`es; `mir/target.rs` is an atomic word).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:42): nothing to apply (summary of the entries below).
 
 ## Prerequisites
 
@@ -56,6 +60,7 @@ and `match`es; `mir/target.rs` is an atomic word).
   for it. Everything else applies without it.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-b-eval (21:42): prerequisites, not edits. State at 21:42: mem-db-infer 1 is in (`blaze-mem` in hir-ty's `Cargo.toml`); 2 (`allocator_api`) and 3 (`MIR_TAG`) are not yet (db-mem-infer-a's), and `held.rs`/`target_feature.rs` need them to compile; `blaze_mem::frame::current` is in (`frame.rs:495`); salsa's `mem_tag` (mem-db-salsa M2) is not yet in `vendor/salsa-macros`.
 
 ## Objection (sent to mem-db-infer): frames past nesting depth 8
 
@@ -74,6 +79,7 @@ much larger `DEPTH` (64). This file's entries are correct either way; only their
 it.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:42): nothing to apply in these files (an objection to lane mem, forwarded through mem-db request 10).
 
 ## R-abi: a request to the coordinator (`crates/rustc_abi`)
 
@@ -96,10 +102,12 @@ same values. Its test: `layout/adt.rs`' `one_flat_buffer_matches_a_buffer_per_va
 both shapes through the calculator and compares.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-b-eval (21:42): `crates/rustc_abi` is the coordinator's; filed in `v2/requests/db.md` under "mem-db-infer-eval, for the coordinator: `crates/rustc_abi` takes borrowed variants".
 
 ## `layout.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-b-eval (21:42): lane items' file (applied by requests-items-mem, below); what is left (L4 step 2, A2) is filed in `v2/requests/db.md` under "mem-db-infer-eval, for lane items".
 
 ### L1. `layout_of_ty_query` runs in the query's frame (R1, R6)
 
@@ -148,6 +156,7 @@ by `intern_layout` at the end (one node in the hash-cons arena, none when an equ
 already interned); `returns(clone)` clones a `Copy` handle.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `layout_of_ty_query` (tag `mem_tag = Infer`) opens `frame::current` and its body is `layout_of_ty_in(db, ty, trait_env, frame)`.
 
 ### L2. `univariant` and `univariant_of` lay out from the frame
 
@@ -256,6 +265,7 @@ and its comment at line 981 `// Up to twelve fields, past the eight kept on the 
 `// Up to twelve fields.`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `univariant`/`univariant_of` take the frame (frame `Vec` at the size hint, frame slice of references), both callers pass it, `FIELDS_INLINE` is gone; the test runs `univariant_of` in `frame::task(Tag::Infer, ..)` and its comment reads "Up to twelve fields."
 
 ### L3. `layout_of_scalable_vector_ty`'s field types in the frame
 
@@ -302,6 +312,7 @@ Its caller, line 397: `return layout_of_scalable_vector_ty(db, frame, s, &args, 
 (`lower.rs:2530, 2545`) make the frame `Vec` exactly as long as the fields.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `layout_of_scalable_vector_ty<'db, 'f>(db, frame, ..)`, `only_field` returns `Vec<Ty, &'f Frame>` at `fields.len()`; the caller passes `frame` second. (A named `'f` instead of the elided `&Frame` in the closure's return type, which a closure signature does not tie to the parameter.)
 
 ### L4. The coroutine branch builds its inputs in the frame
 
@@ -421,6 +432,8 @@ and the call becomes `cx.calc.layout_of_coroutine(locals, prefix, kept, &conflic
 task of its own.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: step 1 (`held_locals_in(frame)`, upvars and locals in frame `Vec`s, `prefix` one exact `IndexVec`, locals as frame slices, `kept` at its size, `conflicts_of`).
+> held by requests-items-mem: step 2 (`kept` as frame slices) waits on R-abi (`crates/rustc_abi` still takes `&IndexSlice<_, IndexVec<_, _>>`).
 
 ### L5. The `Or` pattern type's ranges in the frame
 
@@ -486,6 +499,7 @@ before its end). `sort_unstable` gives the same order as `sort` on `(u128, u128)
 where equal elements are identical) and allocates nothing, where `sort` may allocate a buffer.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: the ranges in a frame `Vec` at `variants.len()`, let-else on `Range`, `sort_unstable`.
 
 ### L6. `struct_tail_erasing_lifetimes` takes `impl Fn`
 
@@ -515,6 +529,7 @@ passes `&closure`): `layout.rs:513`, `crates/hir-ty-borrowck/src/check.rs:1051`,
 `crates/hir-ty-codegen/debuginfo/types.rs:509`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied already (seen by requests-items-mem): `struct_tail_erasing_lifetimes<'a, F: Fn(Ty<'a>) -> Ty<'a>>(.., normalize: &F)` is in the tree; nothing to change.
 
 ### L7. `variant_field_ids` and `enum_variant_ids` at exact size (R4, R6)
 
@@ -559,6 +574,7 @@ iterator whose length the standard library can't trust, so it could allocate and
 The memo is the `Box<[_]>`; it holds `LocalFieldId`s/`EnumVariantId`s only.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: both build their `Box<[_]>` from an exact `Vec::with_capacity`, tag `mem_tag = Infer`.
 
 ### L8. Tags of the other tracked fns (R6)
 
@@ -568,6 +584,7 @@ a `Copy` `StructFlags`. `struct_tail_may_be_unsized`'s is a `bool`; it builds an
 allocations are the solver's (mem-db-solver's), so it needs no frame of its own beyond the task's.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `struct_flags` and `struct_tail_may_be_unsized` take `mem_tag = Infer`.
 
 ### L9. Imports
 
@@ -575,10 +592,12 @@ Drop `use smallvec::SmallVec;` (line 26) once L2 and L4 are in; the tests' `Smal
 today) would need its own import. Add `use blaze_mem::Frame;`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `use smallvec::SmallVec;` dropped, `use blaze_mem::Frame;` added.
 
 ## `layout/adt.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-b-eval (21:42): lane items' file, as `layout.rs` above.
 
 ### A1. `layout_of_adt_query` in the query's frame (R1, R6)
 
@@ -701,6 +720,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `layout_of_adt_query` (tag `Infer`) opens `frame::current` into `layout_of_adt_in(.., frame)`; `ends` at the variant count and `fields` growing last in the frame; `variant_field_layouts` takes `&mut Vec<&'static Layout, &Frame>`; `SmallVec`/`FIELDS_INLINE` imports gone; the tests' `nested_with_vecs` collects a `Vec` and `flat` runs in `frame::task(Tag::Infer, ..)`.
 
 ### A2. `variants_of` in the frame (after R-abi)
 
@@ -786,10 +806,12 @@ the flat side, inside `frame::task(Tag::Infer, ..)`, calls it on `variants_of(fr
 &ends)`. The assertion compares the two `Result<Layout, _>`s as now.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> held by requests-items-mem: waits on R-abi (`crates/rustc_abi` `layout_of_struct_or_enum`/`layout_of_union` still take nested `IndexVec`s); `variants_of`'s per-variant `collect` carries an `// alloc:` note naming it.
 
 ## `layout/target.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-b-eval (21:43): lane items' file; T1 applied by requests-items-mem.
 
 ### T1. Tag only (R6)
 
@@ -799,10 +821,12 @@ Line 8: `#[salsa::tracked(returns(as_ref))]` becomes
 target spec that doesn't parse); left as they are.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `#[salsa::tracked(returns(as_ref), mem_tag = Infer)]`.
 
 ## `consteval.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): C1 to C3, below.
 
 ### C1. Tags (R6)
 
@@ -823,6 +847,7 @@ which allocates when the error holds a `String`; that is the error path. If want
 a reference.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:39): the four attributes gain `mem_tag = Infer` (the bare variant, as salsa's option is filed in mem-db-salsa M2), not `crate::db::INFER_TAG`. `returns(clone)` on `const_eval_discriminant_variant` left as is.
 
 ### C2. `write_memory_map` and `read_memory_map` take `impl` closures
 
@@ -865,6 +890,7 @@ unchanged; the two test closures that diverge (`unreachable!`) take their return
 bound. One indirect call per type in a memory map goes away; no allocation either way.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied (by lane dedyn, dedyn-ty, before db-mem-infer-b-eval got here; checked 21:39): both take `impl` closures as written.
 
 ### C3. Hit paths (R7) and what stays
 
@@ -894,10 +920,12 @@ If lane dedyn makes these generic or concrete first, their change stands and thi
 done.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:40): lane dedyn made `path_to_const`'s and `create_anon_const`'s parameters `impl` first, so the `// dyn:` notes are moot and their change stands. What stays now carries its reason for the hot lint: the three wrappers' `Err(err.clone())` (`// clone: error path`) and `read_memory_map`'s `bytes.to_vec()` and `Box::new(map)` (`// alloc:` the owned allocation read back once). Also `intrinsic.rs`' `name.clone()` in `intrinsic_of` (`// clone: error path`, as "evict.rs, intrinsic.rs, ..." below says).
 
 ## `mir.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): M1 to M4 and M6, below; M5 waits on the builder (mem-codegen-mir's).
 
 ### M1. `TerminatorKind::successors` returns a borrowing iterator
 
@@ -1020,6 +1048,7 @@ After (the same `SmallVec` it returned, built from the iterator):
 `smallvec!` stays imported for `SwitchTargets::static_if`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:34): `successors` and `Successors` as written. The borrowck edit is overtaken: `cfg.rs`'s own copy went with db.md's "dedup: TerminatorKind::all_successors", which put `all_successors` in `mir.rs`; that fn's non-`FalseEdge` arm now does this entry's `collect` into its `SmallVec<[BasicBlockId; 2]>` and extends with the unwind, so its callers (borrowck `cfg.rs:51`, hir-ty-mir, blaze-items) are unchanged. `// alloc:` notes on both of its arms (db-apply-ty's ask). Told db-mem-borrowck.
 
 ### M2. `hash_by_key` sorts the keys in the worker's scratch buffer
 
@@ -1101,6 +1130,7 @@ over `refs` (from `let pairs = entries();` to the second `assert_eq!` on `refs`)
 is no slice form left to compare (the forward/backward map assertion above them stays).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:34): as written (call, fn, tests); `Hash for MirBody` now also hashes `inlined` (codegen-inline section 1), untouched.
 
 ### M3. `SwitchTargets::new` builds both lists at their size (R4)
 
@@ -1141,6 +1171,7 @@ grows `targets` again; with an exact hint this is one block per spilled list, no
 switch. Same values in the same order.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:35): as written.
 
 ### M4. `local_to_binding_map` at its size
 
@@ -1170,6 +1201,7 @@ the map: hir-ide `mir_pretty`, `crates/hir-ty-codegen/debuginfo/types.rs:621`,
 `crates/hir-ty-codegen/v2/hashes.rs:265`; all run outside queries.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:35): as written.
 
 ### M5. `MirBody::shrink_to_fit` and `VTableMap::shrink_to_fit` (R4): for mem-codegen-mir
 
@@ -1180,6 +1212,7 @@ once at its size), which is mem-codegen-mir's file. These methods go when nothin
 change in `mir.rs` until then.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-b-eval (21:35): nothing in `mir.rs` until the builder stops calling them; the builder side is in `v2/requests/mem-codegen-mir.md` (its `shrink_to_fit` entries, lines 1040-1048), so nothing new is filed.
 
 ### M6. Left as they are
 
@@ -1196,10 +1229,12 @@ change in `mir.rs` until then.
   two-way switch stays inline, and M3 makes the spilled ones exact.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:35): left as they are, each now with its reason above as a `// alloc:` / `// clone:` mark (`static_if`, `spread_rust_call_tuple`'s two, `mark_moves`, `Budget::setting`), so the hot lint passes `mir.rs`.
 
 ## `mir/held.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): H1, below.
 
 ### H1. The analysis runs in a frame; the result is made once at its size
 
@@ -2154,11 +2189,12 @@ coroutine body would make it once; that is a new query in `db.rs` (mem-db-infer'
 callers' files, so it is only noted here.
 
 > forwarded to db (from requests, pass 17; told by tmux).
-> applied by db-mem-infer-b-eval (21:30): `mir/held.rs` as written, except the tests draw from `blaze_ids::rng::SplitMix64` (the file's tests had moved to it; a `members` helper in place of the local `Rng`), and `// alloc:` notes on the result's three exact-size lists. `task(crate::db::MIR_TAG, ..)` as written. db.md's "dedup: bits: hir-ty `mir/held.rs`" had not landed; this replaces its `DenseBitSet` set with frame sets, so that section is met (no `DenseBitSet` outside the tests' reference). Waits on mem-db-infer.md 2 (`allocator_api`) and 3 (`MIR_TAG`), db-mem-infer-a's.
+> applied by db-mem-infer-b-eval (21:17): `mir/held.rs` as written, except the tests draw from `blaze_ids::rng::SplitMix64` (the file's tests had moved to it; a `members` helper in place of the local `Rng`), and `// alloc:` notes on the result's three exact-size lists. `task(crate::db::MIR_TAG, ..)` as written. db.md's "dedup: bits: hir-ty `mir/held.rs`" had not landed; this replaces its `DenseBitSet` set with frame sets, so that section is met (no `DenseBitSet` outside the tests' reference). Waits on mem-db-infer.md 2 (`allocator_api`) and 3 (`MIR_TAG`), db-mem-infer-a's.
 
 ## `target_feature.rs` and `target_feature/tests.rs`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): F1 and F2, below.
 
 ### F1. `Declared::of` collects in the frame, makes the memo once (R1, R4, R6)
 
@@ -2238,6 +2274,7 @@ It compares every declared set against rustc's expansion of the same names, so i
 change.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:19): as written, with `mem_tag = Infer` (salsa's option as filed in mem-db-salsa M2 takes the bare variant; the amended form takes either) in place of `crate::db::INFER_TAG`. Also `target_feature/tests.rs:178-179` (`Declared::of` in `is_target_feature_call_safe`'s check, not named here) take a frame from one `task(Tag::Infer, ..)`. dedup-bits' `TargetFeatureSet` change had landed and is kept.
 
 ### F2. Tags of the other two (R6)
 
@@ -2248,6 +2285,7 @@ allocates nothing. `TargetFeatures::from_fn` and the `enables*` / `is_superset` 
 path (R7): they read the two memos and allocate nothing.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:19): both take `mem_tag = Infer` (the bare variant, as salsa's option is filed), not `crate::db::INFER_TAG`. `crate_target_features`' `collect` into the bit set gets `// alloc: none, the set is bits by value` for the hot lint.
 
 ## `solver_errors.rs`: a cold path
 
@@ -2271,6 +2309,7 @@ after:
 `elaborate`'s sets are the solver's (mem-db-solver's).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:20): the mark, as a trailing comment on the statement's `.collect::<Vec<_>>();` line (418) rather than above its first line (406): `hot_lint.py` reads a mark only on the flagged line or the one above it, and the file's other error-path marks trail their line.
 
 ## `evict.rs`, `intrinsic.rs`, `lang_items.rs`, `primitive.rs`, `mir/target.rs`
 
@@ -2282,6 +2321,7 @@ No change. `evict.rs`' `drop_inference`, `drop_all_inference`, `drop_statics`,
 `mir/target.rs` is an atomic word read and written by the driver.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:20): nothing to apply (no change asked).
 
 ## Tracked fns of these files and their tags (R6)
 
@@ -2306,6 +2346,7 @@ No change. `evict.rs`' `drop_inference`, `drop_all_inference`, `drop_statics`,
 `db.rs`, implemented in hir-ty-mir); `MIR_TAG` is used by `locals_held_across_yields`' task.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): lane db's seven (`consteval.rs` 4, `target_feature.rs` 3) take `mem_tag = Infer` (C1, F1, F2); the layout ones are lane items' (applied by requests-items-mem, also `mem_tag = Infer`).
 
 ## Entry points called outside any query (R1)
 
@@ -2321,6 +2362,7 @@ No change. `evict.rs`' `drop_inference`, `drop_all_inference`, `drop_statics`,
 | `trace_consts_with` (`consteval.rs`) | the driver, once | none |
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): the one that opens a task is H1's `locals_held_across_yields` (in); the rest need none, as listed.
 
 ## Hit-path helpers (R7)
 
@@ -2329,6 +2371,7 @@ None of them allocates, so none needs the caller's frame: `try_const_usize`, `ev
 `TargetFeatures::from_fn` and its `enables*`, `field_layout` (a memo read), `is_by_move_coroutine`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): nothing to apply (none allocates).
 
 ## Every remaining site, accounted for
 
@@ -2353,6 +2396,7 @@ the entries above:
 - `solver_errors.rs`: the diagnostics' own lists (cold path).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): each site of lane db's files that stays now carries its reason as a `// alloc:` / `// clone:` mark (C3, M1, M6, F2, `solver_errors.rs`, `intrinsic.rs`), and `hot_lint.py` reports nothing in `consteval.rs`, `mir.rs`, `mir/`, `intrinsic.rs`, `target_feature.rs`, `solver_errors.rs`, `evict.rs`, `lang_items.rs`, `primitive.rs`.
 
 ## Speed
 
@@ -2380,3 +2424,4 @@ a map and unmap of its frame (microseconds), which would outweigh every saving i
 deep layout and const-eval chains.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-eval (21:43): nothing to apply (the bound; it holds for the entries as applied).

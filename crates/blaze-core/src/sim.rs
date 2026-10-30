@@ -16,10 +16,10 @@
 //! are the [`Conn`], all tagged [`MemTag::Io`]. A warm cycle allocates nothing but what the
 //! completions carry. A completion told for an op that has ended by the time it is due (a
 //! change of a watch whose end came first, a receive on an end hung up meanwhile) names a stale
-//! handle: it is detected when due, the change dropped and the receive told empty, and counted
-//! ([`Sim::stale`]). The scheduler makes both races happen on some seeds: a watch that is
-//! ending is still told some of the changes made meanwhile, as a system that queued them before
-//! it saw the unwatch.
+//! handle: it is detected when due, the change dropped and the receive told with nothing
+//! appended to its buffer, and counted ([`Sim::stale`]). The scheduler makes both races happen
+//! on some seeds: a watch that is ending is still told some of the changes made meanwhile, as a
+//! system that queued them before it saw the unwatch.
 
 mod journal;
 
@@ -30,7 +30,7 @@ use rustc_hash::FxHashMap;
 
 pub use self::journal::Journal;
 use crate::{
-    Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Meta, Tag,
+    Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Meta, RECV_MOST, Tag,
     threads::tagged::{Id, Tagged},
     wheel::{self, Wheel},
 };
@@ -262,8 +262,9 @@ enum Of {
     Change(Id<Watching>),
     /// The watch's end: it ends as this is delivered.
     End(Id<Watching>),
-    /// What a receive on the end got: told empty if the end has hung up by then.
-    Recv(EndId),
+    /// What a receive on the end got, after the `kept` bytes its buffer held: told with
+    /// nothing appended if the end has hung up by then.
+    Recv { end: EndId, kept: usize },
 }
 
 struct Told {
@@ -272,11 +273,12 @@ struct Told {
     of: Of,
 }
 
-#[derive(Clone, Copy)]
 struct Receiving {
     tag: Tag,
     end: EndId,
     most: usize,
+    /// The asker's buffer, appended to.
+    into: Vec<u8>,
 }
 
 pub struct Sim {
@@ -428,7 +430,7 @@ impl Sim {
 
     /// Completions told for an op that had ended by the time they were due, and so detected
     /// as stale: changes of a watch whose end came first (dropped), and bytes a receive got
-    /// on an end that hung up before they were told (told empty).
+    /// on an end that hung up before they were told (told with nothing appended).
     pub fn stale(&self) -> u64 {
         self.stale
     }
@@ -684,26 +686,20 @@ impl Sim {
     fn wake(&mut self) {
         let mut at = 0;
         while at < self.receiving.len() {
-            let Receiving { tag, end, most } = self.receiving[at];
-            let done = match self.ends.get_mut(end) {
-                // alloc: none, an empty read.
-                None => Some(Done::Read(Vec::new())),
-                Some(it) if !it.inbox.is_empty() => {
-                    let n = most.min(it.inbox.len());
-                    // alloc: the receive's payload, which the completion carries.
-                    Some(Done::Read(it.inbox.drain(..n).collect()))
-                }
-                // alloc: none, an empty read.
-                Some(it) if it.closed || it.peer_closed => Some(Done::Read(Vec::new())),
-                Some(_) => None,
-            };
-            match done {
-                Some(done) => {
-                    self.receiving.remove(at);
-                    self.tell(tag, done, Of::Recv(end));
-                }
-                None => at += 1,
+            let Receiving { end, most, .. } = self.receiving[at];
+            let ready = self.ends.get(end).is_none_or(|it| !it.inbox.is_empty() || it.closed || it.peer_closed);
+            if !ready {
+                at += 1;
+                continue;
             }
+            let Receiving { tag, end, most: _, mut into } = self.receiving.remove(at);
+            let kept = into.len();
+            if let Some(it) = self.ends.get_mut(end) {
+                let n = most.min(RECV_MOST).min(it.inbox.len());
+                // alloc: none once the asker's buffer has room for what came.
+                into.extend(it.inbox.drain(..n));
+            }
+            self.tell(tag, Done::Read(into), Of::Recv { end, kept });
         }
     }
 
@@ -906,7 +902,7 @@ impl Sim {
     }
 
     /// The told completion as it is delivered: `None` for a change of a watch that ended
-    /// first, a receive's bytes emptied when its end hung up first.
+    /// first, a receive's bytes cut from its buffer when its end hung up first.
     fn deliver(&mut self, told: Told) -> Option<Completion> {
         let Told { completion, of, .. } = told;
         match of {
@@ -922,14 +918,14 @@ impl Sim {
                 }
                 Some(completion)
             }
-            Of::Recv(end) if self.ends.get(end).is_some_and(|it| !it.closed) => Some(completion),
-            Of::Recv(_) => match completion.done {
-                Done::Read(bytes) if !bytes.is_empty() => {
+            Of::Recv { end, .. } if self.ends.get(end).is_some_and(|it| !it.closed) => Some(completion),
+            Of::Recv { kept, .. } => match completion.done {
+                Done::Read(mut bytes) if bytes.len() > kept => {
                     self.stale += 1;
-                    // alloc: none, an empty read.
-                    Some(Completion { tag: completion.tag, done: Done::Read(Vec::new()) })
+                    bytes.truncate(kept);
+                    Some(Completion { tag: completion.tag, done: Done::Read(bytes) })
                 }
-                _ => Some(completion),
+                done => Some(Completion { tag: completion.tag, done }),
             },
         }
     }
@@ -1047,41 +1043,36 @@ impl Driver for Sim {
                     self.tell(tag, done, Of::Op);
                     continue;
                 }
-                Effect::Recv { conn, most, tag } => {
+                Effect::Recv { conn, most, into, tag } => {
                     let end = end_of(conn);
                     match self.ends.get(end).is_some_and(|it| !it.closed) {
                         true => {
-                            self.receiving.push(Receiving { tag, end, most });
+                            self.receiving.push(Receiving { tag, end, most, into });
                             self.wake();
                         }
-                        false => self.tell(
-                            tag,
-                            // alloc: an error's message.
-                            Done::Failed(IoError(format!("no connection {conn:?}"))),
-                            Of::Op,
-                        ),
+                        false => self.tell(tag, Done::unread(into, format_args!("no connection {conn:?}")), Of::Op),
                     }
                     continue;
                 }
-                Effect::Send { conn, bytes, tag } => {
+                Effect::Send { conn, mut bytes, tag } => {
                     let end = end_of(conn);
                     let done = match self.ends.get(end).map(|it| (it.closed, it.peer_closed, it.peer)) {
-                        // alloc: an error's message.
-                        None | Some((true, _, _)) => Done::Failed(IoError(format!("no connection {conn:?}"))),
-                        // alloc: an error's message.
-                        Some((_, true, _)) => Done::Failed(IoError(format!(
-                            "{conn:?}: the connection is hung up: broken pipe"
-                        ))),
+                        None | Some((true, _, _)) => Done::unsent(bytes, format_args!("no connection {conn:?}")),
+                        Some((_, true, _)) => {
+                            Done::unsent(bytes, format_args!("{conn:?}: the connection is hung up: broken pipe"))
+                        }
                         Some((_, _, None)) => {
                             let it = self.ends.get_mut(end).expect("looked up");
                             it.outbox.extend_from_slice(&bytes);
-                            Done::Sent
+                            bytes.clear();
+                            Done::Sent(bytes)
                         }
                         Some((_, _, Some(peer))) => {
                             if let Some(peer) = self.ends.get_mut(peer) {
                                 peer.inbox.extend_from_slice(&bytes);
                             }
-                            Done::Sent
+                            bytes.clear();
+                            Done::Sent(bytes)
                         }
                     };
                     self.tell(tag, done, Of::Op);
@@ -1374,6 +1365,8 @@ mod tests {
                 }
                 other => panic!("seed {seed}: {other:?}"),
             }
+            // From here what fails is what the disk says, which names the file.
+            sim.faults.fail_one_in = 0;
             assert_eq!(sim.contents(&file), b"cargo::rerun-if-changed=build.rs\n", "seed {seed}");
             let mut seen = BTreeMap::new();
             let mut effects = vec![
@@ -1381,12 +1374,9 @@ mod tests {
                 Effect::List { dir: name("target"), tag: Tag(3) },
             ];
             run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag.0, it.done));
-            if let Some(Done::Stat(stat)) = seen.get(&2) {
-                assert_eq!(*stat, Some(Meta { len: 33, dir: false, modified_ns: at }), "seed {seed}");
-            }
-            if let Some(Done::Listed(listed)) = seen.get(&3) {
-                assert!(listed.contains(&(file.clone(), Meta { len: 33, dir: false, modified_ns: at })), "seed {seed}");
-            }
+            assert_eq!(seen[&2], Done::Stat(Some(Meta { len: 33, dir: false, modified_ns: at })), "seed {seed}");
+            let Done::Listed(listed) = &seen[&3] else { panic!("seed {seed}: {:?}", seen[&3]) };
+            assert!(listed.contains(&(file.clone(), Meta { len: 33, dir: false, modified_ns: at })), "seed {seed}");
             sim.crash();
             assert_eq!(sim.stamp(&file).mtime_ns, at, "seed {seed}: the time is the inode's, which a crash keeps");
             let mut seen = BTreeMap::new();
@@ -1405,21 +1395,17 @@ mod tests {
                 "seed {seed}: {:?}",
                 seen[&4]
             );
-            if seen[&5] == Done::Renamed {
-                assert!(
-                    matches!(&seen[&6], Done::Failed(why) if why.0.contains("target/build/output")),
-                    "seed {seed}: {:?}",
-                    seen[&6]
-                );
-                assert_eq!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a rename keeps the time");
-                assert_eq!(sim.stamp(&file), Stamp::GONE, "seed {seed}: a failed set makes nothing");
-            }
+            assert_eq!(seen[&5], Done::Renamed, "seed {seed}");
+            assert!(
+                matches!(&seen[&6], Done::Failed(why) if why.0.contains("target/build/output")),
+                "seed {seed}: {:?}",
+                seen[&6]
+            );
+            assert_eq!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a rename keeps the time");
+            assert_eq!(sim.stamp(&file), crate::Stamp::GONE, "seed {seed}: a failed set makes nothing");
             let mut effects = vec![Effect::Write { file: moved.clone(), bytes: b"again".to_vec(), tag: Tag(7) }];
-            let mut written = false;
-            run_until_idle(&mut sim, &mut effects, |it, _| written = it.done == Done::Written);
-            if written {
-                assert_ne!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a write moves the mtime on");
-            }
+            run_until_idle(&mut sim, &mut effects, |it, _| assert_eq!(it.done, Done::Written, "seed {seed}"));
+            assert_ne!(sim.stamp(&moved).mtime_ns, at, "seed {seed}: a write moves the mtime on");
         }
     }
 
@@ -1607,6 +1593,7 @@ mod tests {
                 write: Vec::new(),
                 network: false,
                 trace: true,
+                services: Vec::new(),
             },
             memory,
         })
@@ -1736,7 +1723,7 @@ mod tests {
                         Done::Accepted { conn } => {
                             heard.insert(conn, (Vec::new(), false));
                             receiving.insert(Tag(next), conn);
-                            effects.push(Effect::Recv { conn, most: 4, tag: Tag(next) });
+                            effects.push(Effect::Recv { conn, most: 4, into: Vec::new(), tag: Tag(next) });
                             if conn == outside {
                                 let bytes = b"reply".to_vec();
                                 effects.push(Effect::Send { conn, bytes, tag: Tag(5) });
@@ -1747,25 +1734,28 @@ mod tests {
                             let bytes = b"hello".to_vec();
                             effects.push(Effect::Send { conn, bytes, tag: Tag(3) });
                         }
-                        Done::Sent if done.tag == Tag(3) => {
+                        Done::Sent(bytes) if done.tag == Tag(3) => {
+                            assert!(bytes.is_empty() && bytes.capacity() >= 5, "seed {seed}: {bytes:?}");
                             let conn = client.expect("connected");
                             effects.push(Effect::Hangup { conn, tag: Tag(4) });
                         }
-                        Done::Read(bytes) => {
+                        Done::Read(mut bytes) => {
                             let conn = receiving.remove(&done.tag).expect("a receive's");
                             let (got, ended) = heard.get_mut(&conn).expect("accepted");
                             match bytes.is_empty() {
                                 true => *ended = true,
                                 false => {
                                     assert!(bytes.len() <= 4, "seed {seed}");
-                                    got.extend(bytes);
+                                    got.extend_from_slice(&bytes);
+                                    // The buffer handed back is the next receive's.
+                                    bytes.clear();
                                     receiving.insert(Tag(next), conn);
-                                    effects.push(Effect::Recv { conn, most: 4, tag: Tag(next) });
+                                    effects.push(Effect::Recv { conn, most: 4, into: bytes, tag: Tag(next) });
                                 }
                             }
                         }
                         Done::Unlistened => unlistened = true,
-                        Done::Sent | Done::HungUp => {}
+                        Done::Sent(_) | Done::HungUp => {}
                         other => panic!("seed {seed}: {other:?}"),
                     }
                 }
@@ -1787,9 +1777,10 @@ mod tests {
     }
 
     /// The bytes a receive got, told after a delay, on an end the state machine hung up before
-    /// they were due name an end gone: the receive is told empty, as a receive in flight at a
-    /// hang-up is. A receive after the hang-up names nothing and fails. On some seeds the
-    /// bytes are due first and arrive whole.
+    /// they were due name an end gone: the receive is told with nothing appended to what its
+    /// buffer kept, as a receive in flight at a hang-up is. A receive after the hang-up names
+    /// nothing and fails, its buffer back. On some seeds the bytes are due first and arrive
+    /// whole, after what the buffer kept.
     #[test]
     fn a_hang_up_racing_a_receive_tells_it_empty() {
         let at = Address::Unix(name("s.sock"));
@@ -1805,7 +1796,7 @@ mod tests {
                 seen.extend(out.drain(..).map(|it| (it.tag, it.done)));
             }
             sim.peer_send(conn, b"bytes");
-            sim.submit(&mut vec![Effect::Recv { conn, most: 16, tag: Tag(2) }]);
+            sim.submit(&mut vec![Effect::Recv { conn, most: 16, into: b"kept:".to_vec(), tag: Tag(2) }]);
             if sim.rng().one_in(2) {
                 while !seen.contains_key(&Tag(2)) {
                     sim.poll(&mut out, Duration::ZERO);
@@ -1814,18 +1805,22 @@ mod tests {
             }
             let mut effects = vec![
                 Effect::Hangup { conn, tag: Tag(3) },
-                Effect::Recv { conn, most: 16, tag: Tag(4) },
+                Effect::Recv { conn, most: 16, into: b"again".to_vec(), tag: Tag(4) },
                 Effect::Unlisten { tag: Tag(1) },
             ];
             run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag, it.done));
             assert_eq!(seen[&Tag(3)], Done::HungUp, "seed {seed}");
-            assert!(matches!(&seen[&Tag(4)], Done::Failed(why) if why.0.contains("no connection")));
+            assert!(
+                matches!(&seen[&Tag(4)], Done::Broken { buffer, error } if buffer == b"again" && error.0.contains("no connection")),
+                "seed {seed}: {:?}",
+                seen[&Tag(4)]
+            );
             match &seen[&Tag(2)] {
-                Done::Read(bytes) if bytes == b"bytes" => clean += 1,
-                Done::Read(bytes) if bytes.is_empty() => raced += 1,
+                Done::Read(bytes) if bytes == b"kept:bytes" => clean += 1,
+                Done::Read(bytes) if bytes == b"kept:" => raced += 1,
                 other => panic!("seed {seed}: {other:?}"),
             }
-            assert_eq!(sim.stale(), u64::from(seen[&Tag(2)] == Done::Read(Vec::new())), "seed {seed}");
+            assert_eq!(sim.stale(), u64::from(seen[&Tag(2)] == Done::Read(b"kept:".to_vec())), "seed {seed}");
             assert!(sim.peer_hung_up_on(conn));
             sim.peer_hangup(conn);
             assert_eq!(sim.in_flight(), 0, "seed {seed}");
@@ -1882,7 +1877,11 @@ mod tests {
                             }
                             _ => false,
                         };
-                        assert_eq!(done == Done::Sent, want, "seed {seed} step {step}");
+                        assert_eq!(matches!(done, Done::Sent(_)), want, "seed {seed} step {step}");
+                        let (Done::Sent(buffer) | Done::Broken { buffer, .. }) = &done else {
+                            panic!("seed {seed} step {step}: {done:?}")
+                        };
+                        assert!(buffer.is_empty() && buffer.capacity() >= 1, "a send's buffer comes back cleared");
                     }
                     (2, Some(at)) => {
                         let done = until(&mut sim, Effect::Hangup { conn: conns[at], tag: Tag(1000 + step) });

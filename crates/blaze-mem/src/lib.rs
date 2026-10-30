@@ -54,7 +54,7 @@ pub mod tag;
 
 pub use append::AppendVec;
 pub use arena::{Arena, ArenaLocal};
-pub use column::Column;
+pub use column::{Block, Column};
 pub use error::MemError;
 pub use frame::{Frame, Marker};
 pub use handle::{Handle, Slab};

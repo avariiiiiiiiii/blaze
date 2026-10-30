@@ -15,8 +15,8 @@
 
 use hir::{HasSource, InFile, ModuleDef};
 use hir_def::{MacroId, ModuleDefId, ModuleId, visibility::Visibility};
-use hir_expand::mod_path::ModPath;
-use rustc_hash::FxHashSet;
+use hir_expand::{mod_path::ModPath, name::Name};
+use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 use syntax::{
     AstNode, SyntaxNode, SyntaxNodePtr,
@@ -32,7 +32,8 @@ use crate::{
 
 /// The lints of this module, in the order rustc buffers them: each import's as it is
 /// finalized, then each module's names'.
-pub(super) fn lints(cx: &Cx<'_, '_>, uses: &Uses) -> Vec<Found> {
+pub(super) fn lints(cx: &Cx<'_, '_>, uses: &Uses<'_>) -> Vec<Found> {
+    // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
     for item in &uses.items {
         for tree in &item.trees {
@@ -43,7 +44,8 @@ pub(super) fn lints(cx: &Cx<'_, '_>, uses: &Uses) -> Vec<Found> {
             }
         }
     }
-    let mut seen = FxHashSet::with_capacity_and_hasher(uses.globs.len(), Default::default());
+    let mut seen: hashbrown::HashSet<ModuleId, FxBuildHasher, _> =
+        hashbrown::HashSet::with_capacity_and_hasher_in(uses.globs.len(), FxBuildHasher, cx.frame());
     for module in uses.items.iter().map(|it| it.module) {
         if uses.globs.contains_key(&module) && seen.insert(module) {
             found.extend(reexports(cx, uses, module));
@@ -54,7 +56,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, uses: &Uses) -> Vec<Found> {
 
 /// rustc's check that a glob import re-exports something as visibly as it is declared: its
 /// visibility greater than `max_vis`, the greatest of those of what it imports.
-fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree) -> Option<Found> {
+fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem, tree: &Tree) -> Option<Found> {
     let db = cx.db;
     let Some(ModuleDefId::ModuleId(from)) = tree.source else { return None };
     // A private import is as visible as anything it can import, so `max_vis` never falls below it.
@@ -64,13 +66,11 @@ fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree) ->
     let home = nearest_module(cx, item.module);
     let import_vis = item_visibility(cx, uses, item)?;
     let scope = from.def_map(db).module(db, from).scope(db);
-    let named: Vec<hir_def::TraitId> = scope
-        .types()
-        .filter_map(|(_, it)| match it.def {
-            ModuleDefId::TraitId(it) => Some(it),
-            _ => None,
-        })
-        .collect();
+    let mut named: Vec<hir_def::TraitId, _> = Vec::new_in(cx.frame());
+    named.extend(scope.types().filter_map(|(_, it)| match it.def {
+        ModuleDefId::TraitId(it) => Some(it),
+        _ => None,
+    }));
     if from.def_map(db).module(db, from).traits_in_scope(db).any(|it| !named.contains(&it)) {
         return None;
     }
@@ -97,11 +97,14 @@ fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree) ->
         return None;
     }
     let span = cx.span(InFile::new(item.node.file_id, tree.node.syntax().text_range()));
+    // alloc: the message of a lint that fires
     let message = format!(
         "glob import doesn't reexport anything with visibility `{}` because no imported item is public enough",
         import_vis.to_string(cx, home)
     );
+    // clone: the lint fires; its span is both the primary span and the note's
     let mut diag = Diag::lint("unused_imports", message, span.clone());
+    // alloc: the note of a lint that fires
     diag.span_note(span, format!("the most public imported item is `{}`", max.to_string(cx, home)));
     diag.help("reduce the glob import's visibility or increase visibility of imported items");
     diag.fact(cx.resolves_fact(from.into(), "*"), "what the glob import brings in");
@@ -111,7 +114,7 @@ fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree) ->
 
 /// `pub_use_of_private_extern_crate`: a `pub` single import of nothing but an `extern crate`
 /// item less visible than it.
-fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree) -> Option<Found> {
+fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem, tree: &Tree) -> Option<Found> {
     if !item.public || tree.self_import || tree.binding.is_none() {
         return None;
     }
@@ -126,10 +129,12 @@ fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tre
         return None;
     }
     let path = tree.node.path()?;
+    // alloc: the lint fires from here on; the name goes into its message and fact
     let ident = path.segment()?.name_ref()?.text().to_string();
     let span = cx.span(InFile::new(item.node.file_id, tree.node.syntax().text_range()));
     let mut diag = Diag::lint(
         "pub_use_of_private_extern_crate",
+        // alloc: the message of a lint that fires
         format!("extern crate `{ident}` is private and cannot be re-exported"),
         span,
     );
@@ -141,14 +146,16 @@ fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tre
         "pub ",
         Applicability::MaybeIncorrect,
     );
+    // alloc: the fact of a lint that fires
     diag.fact(cx.resolves_fact(item.module.into(), &ident), format!("what `{ident}` is imported from"));
     let at = InFile::new(item.node.file_id, SyntaxNodePtr::new(tree.node.syntax()));
     Some(Found::lint(diag, Phase::Resolve, at))
 }
 
 /// `ambiguous_glob_reexports` and `hidden_glob_reexports` of the names of `module`.
-fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
+fn reexports(cx: &Cx<'_, '_>, uses: &Uses<'_>, module: ModuleId) -> Vec<Found> {
     let db = cx.db;
+    // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
     let globs: SmallVec<[(&UseItem, &Tree, ModuleId); 2]> = uses
         .globs_of(module)
@@ -156,22 +163,23 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
             Some(ModuleDefId::ModuleId(from)) if from != module => Some((item, tree, from)),
             _ => None,
         })
-        .collect();
+        .collect(); // alloc: inline for the two globs a module has at most, almost always
     // Both lints need a `pub` glob: the first of an ambiguity, or the one a private item hides.
     if !globs.iter().any(|(item, _, _)| item.public) {
         return found;
     }
     let here = module.def_map(db).module(db, module).scope(db);
-    let mut names: Vec<&hir_expand::name::Name> = Vec::new();
-    let mut seen: FxHashSet<&hir_expand::name::Name> = FxHashSet::default();
+    let frame = cx.frame();
+    let mut names: Vec<Name, _> = Vec::new_in(frame);
+    let mut seen: hashbrown::HashSet<Name, FxBuildHasher, _> = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
     for (_, _, from) in &globs {
         for (name, _) in from.def_map(db).module(db, *from).scope(db).entries() {
-            if seen.insert(name) {
-                names.push(name);
+            if seen.insert(*name) {
+                names.push(*name);
             }
         }
     }
-    for name in names {
+    for name in &names {
         let current = here.get(name);
         for ns in Ns::ALL {
             let Some(it) = entry(&current, ns) else { continue };
@@ -182,12 +190,12 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
                     let it = entry(&per, ns)?;
                     it.vis.is_visible_from(db, module).then_some((*item, *tree, it))
                 })
-                .collect();
+                .collect(); // alloc: inline, at most one per glob of the module, which has two at most almost always
             let Some(&(first_item, first_tree, first)) = imported.first() else { continue };
             match it {
                 it if matches!(it.import, Some(Binding::Glob(_))) => {
                     let public = first_item.public && first.vis == Visibility::Public;
-                    let exported = it.import.is_some_and(|it| uses.exported_names.contains(&(it, name.clone(), ns)));
+                    let exported = it.import.is_some_and(|it| uses.exported_names.contains(&(it, *name, ns)));
                     if !public || !exported {
                         continue;
                     }
@@ -197,17 +205,22 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
                     let root = first_item.trees.first().map(|it| it.node.syntax().text_range());
                     let Some(root) = root else { continue };
                     let span = cx.span(InFile::new(first_item.node.file_id, root));
+                    // alloc: the lint fires; the name goes into its labels and fact
                     let text = name.as_str().to_owned();
+                    // clone: the lint fires; its span is both the primary span and a label's
                     let mut diag = Diag::lint("ambiguous_glob_reexports", "ambiguous glob re-exports", span.clone());
                     diag.span_label(
                         span,
+                        // alloc: a label of a lint that fires
                         format!("the name `{text}` in the {} namespace is first re-exported here", ns.descr()),
                     );
                     let other = cx.span(InFile::new(first_item.node.file_id, other_tree.node.syntax().text_range()));
                     diag.span_label(
                         other,
+                        // alloc: a label of a lint that fires
                         format!("but the name `{text}` in the {} namespace is also re-exported here", ns.descr()),
                     );
+                    // alloc: the fact of a lint that fires
                     diag.fact(cx.resolves_fact(module.into(), &text), format!("what `{text}` is in the module"));
                     let at = InFile::new(first_item.node.file_id, SyntaxNodePtr::new(first_item.node.value.syntax()));
                     found.push(Found::lint(diag, Phase::Resolve, at));
@@ -224,19 +237,23 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
                         continue;
                     };
                     let Some(private) = binding_node(cx, uses, it) else { continue };
+                    // alloc: the lint fires; the name goes into its note and fact
                     let text = name.as_str().to_owned();
                     let span = cx.span(private.map(|it| item_span(&it)));
                     let mut diag =
+                        // clone: the lint fires; its span is both the primary span and a note's
                         Diag::lint("hidden_glob_reexports", "private item shadows public glob re-export", span.clone());
                     let glob = cx.span(InFile::new(glob_item.node.file_id, glob_tree.node.syntax().text_range()));
                     diag.span_note(
                         glob,
+                        // alloc: a note of a lint that fires
                         format!(
                             "the name `{text}` in the {} namespace is supposed to be publicly re-exported here",
                             ns.descr()
                         ),
                     );
                     diag.span_note(span, "but the private item here shadows it");
+                    // alloc: the fact of a lint that fires
                     diag.fact(cx.resolves_fact(module.into(), &text), format!("what `{text}` is in the module"));
                     found.push(Found::lint(diag, Phase::Resolve, private.map(|it| SyntaxNodePtr::new(&it))));
                 }
@@ -248,14 +265,16 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
 
 /// The node of what a name is bound to in a module, when it is not a glob's: the item that
 /// defines it, the `use` tree or the `extern crate` item that imports it.
-fn binding_node(cx: &Cx<'_, '_>, uses: &Uses, it: Entry) -> Option<InFile<SyntaxNode>> {
+fn binding_node(cx: &Cx<'_, '_>, uses: &Uses<'_>, it: Entry) -> Option<InFile<SyntaxNode>> {
     match it.import {
         Some(binding @ Binding::Import(_)) => {
             let (item, tree) = uses.tree(binding)?;
+            // clone: a rowan cursor's refcount, for `hidden_glob_reexports` once it fires
             Some(InFile::new(item.node.file_id, tree.node.syntax().clone()))
         }
         Some(Binding::ExternCrate(id)) => {
             let krate = uses.extern_crate_of(id)?;
+            // clone: a rowan cursor's refcount, for `hidden_glob_reexports` once it fires
             Some(krate.node.as_ref().map(|it| it.syntax().clone()))
         }
         Some(Binding::Glob(_)) => None,
@@ -266,6 +285,7 @@ fn binding_node(cx: &Cx<'_, '_>, uses: &Uses, it: Entry) -> Option<InFile<Syntax
 /// The item that defines `def`.
 fn def_node(cx: &Cx<'_, '_>, def: ModuleDefId) -> Option<InFile<SyntaxNode>> {
     fn node<N: AstNode>(it: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
+        // clone: a rowan cursor's refcount, for `hidden_glob_reexports` once it fires
         it.map(|it| it.map(|it| it.syntax().clone()))
     }
     let db = cx.db;
@@ -303,7 +323,7 @@ fn nearest_module(cx: &Cx<'_, '_>, module: ModuleId) -> ModuleId {
 }
 
 /// The visibility a `use` item is declared with, resolved.
-fn item_visibility(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem) -> Option<Vis> {
+fn item_visibility(cx: &Cx<'_, '_>, uses: &Uses<'_>, item: &UseItem) -> Option<Vis> {
     let db = cx.db;
     let home = nearest_module(cx, item.module);
     let Some(vis) = item.node.value.visibility() else { return Some(Vis::Module(home)) };
@@ -379,23 +399,35 @@ impl Vis {
         if Vis::at_least(cx, b, a) { a } else { b }
     }
 
-    /// rustc's `Visibility::to_string` for an item of `home`.
+    /// rustc's `Visibility::to_string` for an item of `home`, for the message of a lint that
+    /// fires.
     fn to_string(self, cx: &Cx<'_, '_>, home: ModuleId) -> String {
         match self {
+            // alloc: the message of a lint that fires
             Vis::Public => "pub".to_owned(),
+            // alloc: the message of a lint that fires
             Vis::Crate => "pub(crate)".to_owned(),
+            // alloc: the message of a lint that fires
             Vis::Module(module) if module == home => "pub(self)".to_owned(),
             Vis::Module(module) => {
-                let mut names = Vec::new();
+                let mut names: SmallVec<[Name; 8]> = SmallVec::new();
                 let mut at = Some(module);
                 while let Some(it) = at {
                     if let Some(name) = it.name(cx.db) {
-                        names.push(name.as_str().to_owned());
+                        names.push(name);
                     }
                     at = it.def_map(cx.db).module(cx.db, it).parent;
                 }
-                names.reverse();
-                format!("pub(in crate::{})", names.join("::"))
+                // alloc: the message of a lint that fires
+                let mut path = String::with_capacity(32);
+                for (i, name) in names.iter().rev().enumerate() {
+                    if i > 0 {
+                        path.push_str("::");
+                    }
+                    path.push_str(name.as_str());
+                }
+                // alloc: the message of a lint that fires
+                format!("pub(in crate::{path})")
             }
         }
     }

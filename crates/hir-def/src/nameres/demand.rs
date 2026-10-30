@@ -38,6 +38,7 @@ use crate::{
 /// and the functions and consts of its traits and impls. A function or static of an `extern`
 /// block has none.
 pub fn scope_body_owners(db: &Db, scope: &ItemScope) -> Vec<DefWithBodyId> {
+    // alloc: the query's result, once per execution (per crate or per body)
     let mut owners = Vec::new();
     push_scope_body_owners(db, scope, &mut owners);
     owners
@@ -114,6 +115,7 @@ pub fn module_body_owners(db: &Db, module: ModuleId) -> Vec<DefWithBodyId> {
 
 /// The items with a body declared in the modules of `krate`, outside any body. Lowers no body.
 pub fn crate_body_owners(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
+    // alloc: the query's result, once per execution (per crate or per body)
     let mut owners = Vec::new();
     for (_, module) in crate_def_map(db, krate).modules(db) {
         push_scope_body_owners(db, module.scope(db), &mut owners);
@@ -133,7 +135,9 @@ pub struct BodyBlocks<'db> {
 
 /// The blocks of the body of `owner` and what they declare, by lowering that body and no other.
 pub fn body_blocks(db: &Db, owner: DefWithBodyId) -> BodyBlocks<'_> {
+    // alloc: the query's result, once per execution (per crate or per body)
     let blocks: Vec<_> = Body::of(db, owner).blocks(db).collect();
+    // alloc: the query's result, once per execution (per crate or per body)
     let mut owners = Vec::new();
     for &(_, def_map) in &blocks {
         for (_, module) in def_map.modules(db) {
@@ -151,6 +155,7 @@ pub fn walk_bodies<'db>(
     mut lower: impl FnMut(DefWithBodyId) -> bool,
     mut each: impl FnMut(DefWithBodyId, &BodyBlocks<'db>),
 ) {
+    // alloc: the query's result, once per execution (per crate or per body)
     let mut seen: FxHashSet<DefWithBodyId> = roots.iter().copied().collect();
     let mut queue = roots;
     queue.reverse();
@@ -167,6 +172,7 @@ pub fn walk_bodies<'db>(
 /// Every body of `krate`, those declared in bodies included, each lowered: for a crate that is
 /// checked fully. The order is the def map's, each body before those declared in it.
 pub fn every_body(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
+    // alloc: the query's result, once per execution (per crate or per body)
     let mut bodies = Vec::new();
     walk_bodies(db, crate_body_owners(db, krate), |_| true, |owner, _| bodies.push(owner));
     bodies
@@ -176,6 +182,7 @@ pub fn every_body(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
 /// anything reaches them ([`may_declare_roots`]), and those declared in them that may too: the
 /// only bodies of a dependency a build lowers before codegen reaches them. Lowers no other body.
 pub fn bodies_declaring_roots(db: &Db, krate: Crate) -> Vec<DefWithBodyId> {
+    // alloc: the query's result, once per execution (per crate or per body)
     let mut bodies = Vec::new();
     walk_bodies_saying(db, krate, Look::Roots, |owner, _| bodies.push(owner));
     bodies
@@ -231,6 +238,7 @@ pub fn block_owner(db: &Db, block: BlockId) -> Result<DefWithBodyId, String> {
             // SAFETY: as for `module` above: a local of this walk, never stored.
             Some(outer) if module.is_block_module(db) => unsafe { outer.to_static() },
             _ => {
+                // alloc: error path
                 return Err(format!(
                     "the item a block is in is not declared around it ({:?})",
                     block.ast_id(db)
@@ -241,6 +249,7 @@ pub fn block_owner(db: &Db, block: BlockId) -> Result<DefWithBodyId, String> {
         module = unsafe { outer.module(db).to_static() };
     };
     if !Body::of(db, owner).blocks(db).any(|(it, _)| it == block) {
+        // alloc: error path
         return Err(format!("a block not in the body of the item it is in ({owner:?})"));
     }
     Ok(owner)
@@ -283,11 +292,13 @@ fn owning_item(
         it.syntax().text_range()
     }
     let mut file = block.file_id;
+    // clone: a node handle, a count bump
     let mut node: SyntaxNode = block.to_node(db).syntax().clone();
     loop {
         let at = node.text_range();
         let map = file.ast_id_map(db);
         for ancestor in node.ancestors() {
+            // clone: a node handle, a count bump
             if let Some(variant) = ast::Variant::cast(ancestor.clone()) {
                 within(variant.const_arg().map(range), at, "an enum variant's fields")?;
                 return Ok(InFile::new(file, map.ast_id(&variant).erase()));
@@ -300,12 +311,14 @@ fn owning_item(
                 // In a body these are expressions or statements, with the block around them:
                 // a macro call's arguments are tokens.
                 ast::Item::MacroCall(_) | ast::Item::AsmExpr(_) => continue,
+                // alloc: error path
                 _ => return Err(format!("a block in the signature of an item ({block:?})")),
             };
             within(body, at, "the signature of an item")?;
             return Ok(InFile::new(file, item));
         }
         let Some(call) = file.call_node(db) else {
+            // alloc: error path
             return Err(format!("a block in no item with a body ({block:?})"));
         };
         file = call.file_id;
@@ -317,6 +330,7 @@ fn owning_item(
 fn within(body: Option<TextRange>, at: TextRange, elsewhere: &str) -> Result<(), String> {
     match body {
         Some(body) if body.contains_range(at) => Ok(()),
+        // alloc: error path
         _ => Err(format!("a block in {elsewhere}, which is in no body")),
     }
 }
@@ -398,7 +412,9 @@ impl Look {
         scope: &ItemScope,
         declaring: &FxHashSet<SmolStr>,
     ) -> Vec<Symbol> {
+        // alloc: the query's result, once per execution (per crate or per body)
         let mut found = Vec::new();
+        // alloc: the query's result, once per execution (per crate or per body)
         let mut calling = Vec::new();
         for (name, id) in scope_macros(scope) {
             self.classify(db, name, id, &mut found, &mut calling);
@@ -429,20 +445,23 @@ impl Look {
     fn crate_macros(self, db: &Db, krate: Crate) -> Box<[Symbol]> {
         let mut known: FxHashSet<Symbol> = FxHashSet::default();
         for dep in &krate.data(db).dependencies {
-            known.extend(self.macros(db, dep.crate_id).iter().cloned());
+            known.extend(self.macros(db, dep.crate_id).iter().copied());
         }
+        // alloc: the query's result, once per execution (per crate or per body)
         let mut found = Vec::new();
+        // alloc: the query's result, once per execution (per crate or per body)
         let mut calling = Vec::new();
         let mut seen = FxHashSet::default();
         for (_, module) in crate_def_map(db, krate).modules(db) {
             for (name, id) in scope_macros(module.scope(db)) {
-                if seen.insert((name.clone(), id)) {
+                if seen.insert((name, id)) {
                     self.classify(db, name, id, &mut found, &mut calling);
                 }
             }
         }
         let settled = settle(found, calling, |word| known.contains(word));
         known.extend(settled);
+        // alloc: the query's result, once per execution (per crate or per body)
         let mut names: Vec<Symbol> = known.into_iter().collect();
         names.sort_unstable_by(Symbol::cmp_order);
         names.into()
@@ -472,6 +491,7 @@ fn any_word(node: &SyntaxNode, mut f: impl FnMut(&str) -> bool) -> bool {
 
 /// The words of `node` ([`any_word`]), interned: for a macro's definition, read once per macro.
 fn words(node: &SyntaxNode) -> Vec<Symbol> {
+    // alloc: the query's result, once per execution (per crate or per body)
     let mut words = Vec::new();
     any_word(node, |word| {
         words.push(Symbol::intern(word));
@@ -484,15 +504,19 @@ fn words(node: &SyntaxNode) -> Vec<Symbol> {
 fn body_syntax(db: &Db, owner: DefWithBodyId) -> Option<SyntaxNode> {
     match owner {
         DefWithBodyId::FunctionId(it) => {
+            // clone: a node handle, a count bump
             it.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
         }
         DefWithBodyId::ConstId(it) => {
+            // clone: a node handle, a count bump
             it.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
         }
         DefWithBodyId::StaticId(it) => {
+            // clone: a node handle, a count bump
             it.lookup(db).source(db).value.body().map(|it| it.syntax().clone())
         }
         DefWithBodyId::VariantId(it) => {
+            // clone: a node handle, a count bump
             it.lookup(db).source(db).value.const_arg().map(|it| it.syntax().clone())
         }
     }
@@ -549,10 +573,10 @@ fn macro_text(db: &Db, id: MacroId) -> MacroText {
 }
 
 fn scope_macros(scope: &ItemScope) -> impl Iterator<Item = (Symbol, MacroId)> + '_ {
-    let named = scope.macros().map(|(name, it)| (name.symbol().clone(), it.def));
+    let named = scope.macros().map(|(name, it)| (*name.symbol(), it.def));
     let legacy = scope
         .legacy_macros()
-        .flat_map(|(name, ids)| ids.iter().map(move |&id| (name.symbol().clone(), id)));
+        .flat_map(|(name, ids)| ids.iter().map(move |&id| (*name.symbol(), id)));
     named.chain(legacy)
 }
 
@@ -563,14 +587,15 @@ fn settle(
     mut calling: Vec<(Symbol, Vec<Symbol>)>,
     known: impl Fn(&Symbol) -> bool,
 ) -> Vec<Symbol> {
-    let mut writing: FxHashSet<Symbol> = found.iter().cloned().collect();
+    // alloc: the query's result, once per execution (per crate or per body)
+    let mut writing: FxHashSet<Symbol> = found.iter().copied().collect();
     loop {
         let before = found.len();
         calling.retain(|(name, words)| {
             let writes = words.iter().any(|it| known(it) || writing.contains(it));
             if writes {
-                found.push(name.clone());
-                writing.insert(name.clone());
+                found.push(*name);
+                writing.insert(*name);
             }
             !writes
         });

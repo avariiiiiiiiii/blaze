@@ -34,7 +34,7 @@ impl_from!(
 );
 
 /// Salsa query. This will look for lang items in a specific crate.
-#[salsa::tracked(returns(as_deref))]
+#[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
 pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
     if let Some(frozen) = crate::nameres::frozen::served_lang_items(db, krate) {
@@ -110,12 +110,13 @@ pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
 
     lang_items.resolve_manually(db);
 
+    // alloc: the memo's value, once per crate
     if lang_items.is_empty() { None } else { Some(Box::new(lang_items)) }
 }
 
 /// Salsa query. Look for a lang items, starting from the specified crate and recursively
 /// traversing its dependencies.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 pub fn lang_items(db: &Db, start_crate: Crate) -> LangItems {
     let _p = tracing::info_span!("lang_items_query").entered();
 
@@ -160,7 +161,7 @@ fn resolve_core_trait(
     let mut current = core_def_map.module(db, core_def_map.root);
     for module in modules {
         let Some((ModuleDefId::ModuleId(cur), _)) =
-            current.scope(db).type_(&Name::new_symbol_root(module.clone()))
+            current.scope(db).type_(&Name::new_symbol_root(*module))
         else {
             return None;
         };
@@ -186,7 +187,7 @@ fn resolve_core_macro(
     let mut current = core_def_map.module(db, core_def_map.root);
     for module in modules {
         let Some((ModuleDefId::ModuleId(cur), _)) =
-            current.scope(db).type_(&Name::new_symbol_root(module.clone()))
+            current.scope(db).type_(&Name::new_symbol_root(*module))
         else {
             return None;
         };
@@ -214,13 +215,13 @@ impl LangItems {
                 let trait_items = trait_.trait_items(db);
                 for (assoc_type, name) in assoc_types {
                     **assoc_type =
-                        trait_items.associated_type_by_name(&Name::new_symbol_root(name.clone()));
+                        trait_items.associated_type_by_name(&Name::new_symbol_root(*name));
                 }
             };
         let methods = |trait_: TraitId, assoc_types: &mut [(&mut Option<FunctionId>, Symbol)]| {
             let trait_items = trait_.trait_items(db);
             for (assoc_type, name) in assoc_types {
-                **assoc_type = trait_items.method_by_name(&Name::new_symbol_root(name.clone()));
+                **assoc_type = trait_items.method_by_name(&Name::new_symbol_root(*name));
             }
         };
         (|| {
@@ -320,23 +321,24 @@ impl LangItems {
     }
 }
 
-#[salsa::tracked(returns(as_deref))]
+#[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
 pub fn crate_notable_traits(db: &Db, krate: Crate) -> Option<Box<[TraitId]>> {
-    let mut traits = Vec::new();
-
-    let crate_def_map = crate_def_map(db, krate);
-
-    for (_, module_data) in crate_def_map.modules(db) {
-        for def in module_data.scope(db).declarations() {
-            if let ModuleDefId::TraitId(trait_) = def
-                && AttrFlags::query(db, trait_.into()).contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
-            {
-                traits.push(trait_);
+    blaze_mem::frame::current(|frame| {
+        let mut traits = Vec::new_in(frame);
+        let crate_def_map = crate_def_map(db, krate);
+        for (_, module_data) in crate_def_map.modules(db) {
+            for def in module_data.scope(db).declarations() {
+                if let ModuleDefId::TraitId(trait_) = def
+                    && AttrFlags::query(db, trait_.into())
+                        .contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
+                {
+                    traits.push(trait_);
+                }
             }
         }
-    }
-
-    if traits.is_empty() { None } else { Some(traits.into_iter().collect()) }
+        // alloc: the memo's traits, exact
+        if traits.is_empty() { None } else { Some(Box::from(&traits[..])) }
+    })
 }
 
 macro_rules! language_item_table {
@@ -922,5 +924,51 @@ pub struct MaybeDangling<P: ?Sized>(P);
                 "MaybeDangling"
             ]
         );
+    }
+
+    /// A lang-item lookup is a memo read and a field load.
+    #[test]
+    fn lang_item_lookup_allocates_nothing() {
+        let db = TestDB::with_files(
+            r#"
+#![feature(lang_items)]
+#[lang = "sized"]
+pub trait Sized {}
+#[lang = "global_alloc_ty"]
+pub struct Global;
+"#,
+        );
+        let krate = db.fetch_test_crate();
+        let _ = super::lang_items(&db, krate);
+        let (sized, global) = blaze_alloc_count::assert_at_most(0, "a warm lang-item lookup", || {
+            let items = super::lang_items(&db, krate);
+            (items.Sized, LangItemEnum::GlobalAlloc.from_lang_items(items))
+        });
+        assert!(sized.is_some() && global.is_some());
+    }
+
+    /// A miss of `crate_notable_traits`, its inputs warm, allocates its box and nothing else.
+    #[test]
+    fn notable_traits_miss_is_its_result() {
+        let db = TestDB::with_files(
+            r#"
+#[doc(notable_trait)]
+pub trait Read {}
+pub trait Other {}
+"#,
+        );
+        let krate = db.fetch_test_crate();
+        let def_map = crate::nameres::crate_def_map(&db, krate);
+        for (_, module) in def_map.modules(&db) {
+            for def in module.scope(&db).declarations() {
+                if let crate::ModuleDefId::TraitId(it) = def {
+                    let _ = crate::attrs::AttrFlags::query(&db, it.into());
+                }
+            }
+        }
+        let traits = blaze_alloc_count::assert_at_most(1, "a notable-traits miss", || {
+            super::crate_notable_traits(&db, krate).map(<[TraitId]>::len)
+        });
+        assert_eq!(traits, Some(1));
     }
 }

@@ -3,17 +3,22 @@
 //! through, and why two pointers' metadata differ), E0054 "cannot cast `i32` as `bool`" (compare
 //! with zero), E0604 "only `u8` can be cast as `char`" (`char::from_u32`), E0605
 //! "non-primitive cast" (the borrow or `From` to use), E0607 a thin to a wide pointer, E0606 an
-//! integer to a wide pointer, and E0804 an auto trait added to a `dyn` through a pointer cast.
+//! integer to a wide pointer, E0804 an auto trait added to a `dyn` through a pointer cast, E0641
+//! a pointer of an unknown kind, a field-less enum with `Drop` cast to an integer, and E0606 of a
+//! foreign enum with a non-exhaustive variant. The pointers' metadata and the added auto traits
+//! are hir's, as the cast check found them.
 //!
 //! Follows rustc's `compiler/rustc_hir_typeck/src/cast.rs` (`report_cast_error`,
 //! `try_suggest_collection_to_bool`) and `diagnostics.rs` (`CannotCastToBool`, `IntToWide`,
-//! `CastThinPointerToWidePointer`, `PtrCastAddAutoToObject`) (MIT or Apache-2.0).
+//! `CastThinPointerToWidePointer`, `PtrCastAddAutoToObject`, `CastUnknownPointer`,
+//! `CastEnumDrop`) (MIT or Apache-2.0).
 
 use hir::{CastError, InFile};
-use hir_ty::next_solver::TyKind;
 use intern::{Symbol, sym};
-use rustc_type_ir::inherent::{BoundExistentialPredicates as _, IntoKind as _};
-use syntax::{AstNode, TextRange, ast};
+use syntax::{
+    TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use super::binary_operator_cannot_be_applied::{adt_def_span, code_fact};
 use crate::{
@@ -30,32 +35,34 @@ struct Spans {
 }
 
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Found> {
-    let node = cx.node(d.expr);
+    let node = cx.node_view(d.expr);
     let file = node.file_id;
     let at = |range: TextRange| cx.span(InFile::new(file, range));
     let span = cx.span_of_ptr(d.expr);
-    let cast = match node.value.clone().left() {
+    let cast = match node.value.left() {
         Some(ast::Expr::CastExpr(it)) => Some(it),
         _ => None,
     };
-    let operand = cast.as_ref().and_then(|it| it.expr());
+    let operand = cast.and_then(|it| it.expr());
     let spans = Spans {
-        expr: operand.as_ref().map_or_else(|| span.clone(), |it| at(it.syntax().text_range())),
+        // clone: on the error path, for an error hir found
+        expr: operand.map_or_else(|| span.clone(), |it| at(it.syntax().text_range())),
         cast: cast
-            .as_ref()
             .and_then(|it| it.ty())
+            // clone: on the error path, for an error hir found
             .map_or_else(|| span.clone(), |it| at(it.syntax().text_range())),
         span,
     };
     let e = cx.ty(&d.expr_ty);
     let c = cx.ty(&d.cast_ty);
+    // alloc: the error's text, for an error hir found
     let invalid = || Diag::error(Some("E0606"), format!("casting `{e}` as `{c}` is invalid"), spans.span.clone());
     let operand_is_borrow = matches!(operand, Some(ast::Expr::RefExpr(_)));
 
     let mut diag = match d.error {
         CastError::NeedDeref => {
             let mut diag = invalid();
-            match &operand {
+            match operand {
                 Some(ast::Expr::RefExpr(borrow)) => {
                     let inner = peel_borrows(borrow);
                     let start = borrow.syntax().text_range().start();
@@ -109,6 +116,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
                         CastError::NeedViaPtr => "a raw pointer",
                         _ => "a thin pointer",
                     };
+                    // alloc: the error's text, for an error hir found
                     diag.help(format!("cast through {through} first"));
                 }
             }
@@ -123,16 +131,14 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
         CastError::IllegalCast | CastError::Unknown => invalid(),
         CastError::DifferingKinds => {
             let mut diag = invalid();
-            let src = pointee(&d.expr_ty).map(|it| metadata(cx, &it));
-            let dst = pointee(&d.cast_ty).map(|it| metadata(cx, &it));
-            use Metadata::*;
-            let note = match (src, dst) {
-                (Some(VTable), Some(VTable)) => Some("the trait objects may have different vtables"),
-                (Some(Param | Alias), Some(Param | Alias | VTable | Length))
-                | (Some(VTable | Length), Some(Param | Alias)) => {
+            use hir::CastPointerKind::*;
+            let note = match (d.expr_pointer, d.cast_pointer) {
+                (Some(VTable(_)), Some(VTable(_))) => Some("the trait objects may have different vtables"),
+                (Some(OfParam(_) | OfAlias), Some(OfParam(_) | OfAlias | VTable(_) | Length))
+                | (Some(VTable(_) | Length), Some(OfParam(_) | OfAlias)) => {
                     Some("the pointers may have different metadata")
                 }
-                (Some(VTable), Some(Length)) | (Some(Length), Some(VTable)) => {
+                (Some(VTable(_)), Some(Length)) | (Some(Length), Some(VTable(_))) => {
                     Some("the pointers have different metadata")
                 }
                 _ => None,
@@ -143,6 +149,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
             diag
         }
         CastError::CastToBool => {
+            // alloc: the error's text, for an error hir found
             let mut diag = Diag::error(Some("E0054"), format!("cannot cast `{e}` as `bool`"), spans.span.clone());
             if is_numeric(&d.expr_ty) {
                 diag.suggestion_verbose(
@@ -152,6 +159,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
                     Applicability::MachineApplicable,
                 );
             } else {
+                // clone: on the error path, for an error hir found
                 diag.span_label(spans.span.clone(), "unsupported cast");
             }
             diag
@@ -159,28 +167,36 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
         CastError::CastToChar => {
             let mut diag = Diag::error(
                 Some("E0604"),
+                // alloc: the error's text, for an error hir found
                 format!("only `u8` can be cast as `char`, not `{e}`"),
+                // clone: on the error path, for an error hir found
                 spans.span.clone(),
             );
+            // clone: on the error path, for an error hir found
             diag.span_label(spans.span.clone(), "invalid cast");
             if is_numeric(&d.expr_ty) {
-                let builtin = d.expr_ty.as_builtin().map(|it| it.name().as_str().to_owned());
-                match builtin.as_deref() {
+                let builtin = d.expr_ty.as_builtin().map(|it| it.name());
+                match builtin.as_ref().map(|it| it.as_str()) {
                     Some("u32") => {
                         diag.multipart_suggestion(
                             "consider using `char::from_u32` instead",
+                            // alloc: the suggestion's parts, for an error hir found
                             vec![
+                                // alloc: the suggestion's text, for an error hir found
                                 (spans.expr.shrink_to_lo(), "char::from_u32(".to_owned()),
+                                // alloc: the suggestion's text, for an error hir found
                                 (spans.expr.shrink_to_hi().to(&spans.cast), ")".to_owned()),
                             ],
                             Applicability::MachineApplicable,
                         );
                     }
                     Some("i8") => {
+                        // clone: on the error path, for an error hir found
                         diag.span_help(spans.span.clone(), "consider casting from `u8` instead");
                     }
                     _ => {
                         diag.span_help(
+                            // clone: on the error path, for an error hir found
                             spans.span.clone(),
                             "consider using `char::from_u32` instead (via a `u32`)",
                         );
@@ -189,40 +205,46 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
             }
             diag
         }
-        CastError::NonScalar => non_scalar(cx, d, &spans, &operand, &e, &c),
+        CastError::NonScalar => non_scalar(cx, d, &spans, operand, &e, &c),
         CastError::SizedUnsizedCast => Diag::error(
             Some("E0607"),
+            // alloc: the error's text, for an error hir found
             format!("cannot cast thin pointer `{e}` to wide pointer `{c}`"),
+            // clone: on the error path, for an error hir found
             spans.span.clone(),
         ),
         CastError::IntToWideCast => {
-            let kind = pointee(&d.cast_ty).map(|it| metadata(cx, &it));
-            let known = match kind {
-                Some(Metadata::VTable) => Some("a vtable"),
-                Some(Metadata::Length) => Some("a length"),
+            let known = match d.cast_pointer {
+                Some(hir::CastPointerKind::VTable(_)) => Some("a vtable"),
+                Some(hir::CastPointerKind::Length) => Some("a length"),
                 _ => None,
             };
             let wide = if known.is_some() { "is" } else { "may be" };
             let mut diag = Diag::error(
                 Some("E0606"),
+                // alloc: the error's text, for an error hir found
                 format!("cannot cast `{e}` to a pointer that {wide} wide"),
+                // clone: on the error path, for an error hir found
                 spans.cast.clone(),
             );
             diag.span_label(
+                // clone: on the error path, for an error hir found
                 spans.cast.clone(),
+                // alloc: the error's text, for an error hir found
                 format!(
                     "creating a `{c}` requires both an address and {}",
                     known.unwrap_or("type-specific metadata")
                 ),
             );
             diag.span_label(
+                // clone: on the error path, for an error hir found
                 spans.expr.clone(),
                 "consider casting this expression to `*const ()`, then using `core::ptr::from_raw_parts`",
             );
-            if known.is_none()
-                && let Some((pointee, _)) = d.cast_ty.as_raw_ptr()
-                && let Some(param) = pointee.as_type_param(cx.db)
+            if let Some(hir::CastPointerKind::OfParam(param)) = d.cast_pointer
+                && d.cast_ty.as_raw_ptr().is_some_and(|(pointee, _)| pointee.as_type_param(cx.db).is_some())
             {
+                // alloc: the error's text, for an error hir found
                 diag.note(format!(
                     "the type parameter `{}` is not known to be `Sized`, so this pointer may be wide",
                     param.name(cx.db).display(cx.db, cx.edition)
@@ -231,24 +253,66 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<Fou
             diag
         }
         CastError::PtrPtrAddingAutoTraits => {
-            let mut traits = added_auto_traits(cx, d);
+            let mut traits: Vec<String> = d
+                .added_auto_traits
+                .iter()
+                // alloc: the error's text, for an error hir found
+                .map(|&it| format!("`{}`", cx.def_path(hir::ModuleDef::Trait(it))))
+                // alloc: the error's text, for an error hir found
+                .collect();
             traits.sort();
             let list = match traits.as_slice() {
+                // alloc: the error's text, for an error hir found
                 [one] => format!("auto trait {one}"),
+                // alloc: the error's text, for an error hir found
                 _ => format!("auto traits {}", symbol_list(&traits)),
             };
             let mut diag = Diag::error(
                 Some("E0804"),
+                // alloc: the error's text, for an error hir found
                 format!("cannot add {list} to dyn bound via pointer cast"),
+                // clone: on the error path, for an error hir found
                 spans.span.clone(),
             );
+            // clone: on the error path, for an error hir found
             diag.span_label(spans.span.clone(), "unsupported cast");
             diag.note("this could allow UB elsewhere");
             diag.help("use `transmute` if you're sure this is sound");
             diag
         }
+        CastError::UnknownCastPtrKind => {
+            // clone: on the error path, for an error hir found
+            let mut diag = Diag::error(Some("E0641"), "cannot cast to a pointer of an unknown kind", spans.cast.clone());
+            // clone: on the error path, for an error hir found
+            diag.span_label(spans.cast.clone(), "needs more type information");
+            diag.note("the type information given here is insufficient to check whether the pointer cast is valid");
+            diag
+        }
+        CastError::UnknownExprPtrKind => {
+            // clone: on the error path, for an error hir found
+            let mut diag = Diag::error(Some("E0641"), "cannot cast from a pointer of an unknown kind", spans.cast.clone());
+            diag.span_label(
+                // clone: on the error path, for an error hir found
+                spans.span.clone(),
+                "the type information given here is insufficient to check whether the pointer cast is valid",
+            );
+            diag
+        }
+        CastError::CastEnumDrop => Diag::error(
+            None,
+            // alloc: the error's text, for an error hir found
+            format!("cannot cast enum `{e}` into integer `{c}` because it implements `Drop`"),
+            // clone: on the error path, for an error hir found
+            spans.span.clone(),
+        ),
+        CastError::ForeignNonExhaustiveAdt => {
+            let mut diag = invalid();
+            diag.note("cannot cast an enum with a non-exhaustive variant when it's defined in another crate");
+            diag
+        }
     };
     code_fact(cx, d.expr.map(|it| it.syntax_node_ptr()), &mut diag);
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 
@@ -257,14 +321,16 @@ fn non_scalar<'db>(
     cx: &Cx<'_, 'db>,
     d: &hir::InvalidCast<'db>,
     spans: &Spans,
-    operand: &Option<ast::Expr>,
+    operand: Option<ast::Expr<'_>>,
     e: &str,
     c: &str,
 ) -> Diag {
+    // alloc: the error's text, for an error hir found
     let mut diag = Diag::error(Some("E0605"), format!("non-primitive cast: `{e}` as `{c}`"), spans.span.clone());
     if let Some(ast::Expr::RefExpr(_)) = operand
         && let Some(snippet) = cx.snippet(&spans.expr)
     {
+        // alloc: the error's text, for an error hir found
         diag.note(format!("casting reference expression `{snippet}` because `&` binds tighter than `as`"));
     }
 
@@ -281,6 +347,7 @@ fn non_scalar<'db>(
         if let Some((pointee, _)) = d.expr_ty.as_raw_ptr()
             && coerces(&pointee, mutability)
         {
+            // alloc: the suggestion's text, for an error hir found
             sugg = Some((format!("&{}*", prefix(mutability)), cx.ty(&cast_inner) == cx.ty(&pointee)));
         } else if let Some((expr_inner, hir::Mutability::Shared)) = d.expr_ty.as_reference()
             && mutability == hir::Mutability::Mut
@@ -289,28 +356,37 @@ fn non_scalar<'db>(
             sugg_mutref = true;
         }
         if !sugg_mutref && sugg.is_none() && coerces(&d.expr_ty, mutability) {
+            // alloc: the suggestion's text, for an error hir found
             sugg = Some((format!("&{}", prefix(mutability)), false));
         }
     } else if let Some((_, mutability)) = d.cast_ty.as_raw_ptr()
         && coerces(&d.expr_ty, mutability)
     {
+        // alloc: the suggestion's text, for an error hir found
         sugg = Some((format!("&{}", prefix(mutability)), false));
     }
 
     if sugg_mutref {
+        // clone: on the error path, for an error hir found
         diag.span_label(spans.span.clone(), "invalid cast");
+        // clone: on the error path, for an error hir found
         diag.span_note(spans.expr.clone(), "this reference is immutable");
+        // clone: on the error path, for an error hir found
         diag.span_note(spans.cast.clone(), "trying to cast to a mutable reference type");
     } else if let Some((code, remove_cast)) = sugg {
+        // clone: on the error path, for an error hir found
         diag.span_label(spans.span.clone(), "invalid cast");
         let has_parens = cx.snippet(&spans.expr).is_some_and(|it| it.starts_with('('));
         let needs_parens = !has_parens && matches!(operand, Some(ast::Expr::CastExpr(_)));
+        // alloc: the suggestion's parts, for an error hir found
         let mut parts = vec![(spans.expr.shrink_to_lo(), code)];
         if needs_parens {
             parts[0].1 += "(";
+            // alloc: the suggestion's text, for an error hir found
             parts.push((spans.expr.shrink_to_hi(), ")".to_owned()));
         }
         if remove_cast {
+            // alloc: empty, allocates nothing
             parts.push((spans.expr.shrink_to_hi().to(&spans.cast), String::new()));
         }
         diag.multipart_suggestion("consider borrowing the value", parts, Applicability::MachineApplicable);
@@ -320,16 +396,22 @@ fn non_scalar<'db>(
         {
             let to = match d.cast_ty.as_adt() {
                 Some(adt) => {
+                    // alloc: the suggestion's text, for an error hir found
                     let args: Vec<String> = d.cast_ty.type_arguments().map(|it| cx.ty(&it)).collect();
                     let path = cx.def_path(hir::ModuleDef::Adt(adt));
+                    // alloc: the suggestion's text, for an error hir found
                     if args.is_empty() { path } else { format!("{path}::<{}>", args.join(", ")) }
                 }
+                // alloc: the suggestion's text, for an error hir found
                 None => c.to_owned(),
             };
             diag.multipart_suggestion(
                 "consider using the `From` trait instead",
+                // alloc: the suggestion's parts, for an error hir found
                 vec![
+                    // alloc: the suggestion's text, for an error hir found
                     (spans.expr.shrink_to_lo(), format!("{to}::from(")),
+                    // alloc: the suggestion's text, for an error hir found
                     (spans.expr.shrink_to_hi().to(&spans.cast), ")".to_owned()),
                 ],
                 Applicability::MaybeIncorrect,
@@ -337,17 +419,20 @@ fn non_scalar<'db>(
         }
         if matches!(d.expr_ty.as_adt(), Some(hir::Adt::Enum(_))) && is_numeric(&d.cast_ty) {
             diag.span_label(
+                // clone: on the error path, for an error hir found
                 spans.span.clone(),
                 "an `as` expression can be used to convert enum types to numeric types only if the enum type is unit-only or field-less",
             );
             diag.note("see https://doc.rust-lang.org/reference/items/enumerations.html#casting for more information");
         } else {
             diag.span_label(
+                // clone: on the error path, for an error hir found
                 spans.span.clone(),
                 "an `as` expression can only be used to convert between primitive types or to coerce to a specific trait object",
             );
         }
     } else {
+        // clone: on the error path, for an error hir found
         diag.span_label(spans.span.clone(), "invalid cast");
     }
     collection_to_bool(cx, d, spans, &mut diag);
@@ -363,17 +448,23 @@ fn collection_to_bool<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>, spans: &
     let deref_ty = cx.ty(&deref);
     if deref_ty != cx.ty(&d.expr_ty.strip_references()) {
         diag.span_note(
+            // clone: on the error path, for an error hir found
             spans.expr.clone(),
+            // alloc: the error's text, for an error hir found
             format!("this expression `Deref`s to `{deref_ty}` which implements `is_empty`"),
         );
     }
     diag.multipart_suggestion(
+        // alloc: the suggestion's text, for an error hir found
         format!(
             "consider using the `is_empty` method on `{}` to determine if it contains anything",
             cx.ty(&d.expr_ty)
         ),
+        // alloc: the suggestion's parts, for an error hir found
         vec![
+            // alloc: the suggestion's text, for an error hir found
             (spans.expr.shrink_to_lo(), "!".to_owned()),
+            // alloc: the suggestion's text, for an error hir found
             (spans.span.with_lo(spans.expr.hi), ".is_empty()".to_owned()),
         ],
         Applicability::MaybeIncorrect,
@@ -381,9 +472,9 @@ fn collection_to_bool<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>, spans: &
 }
 
 /// rustc's `Expr::peel_borrows`.
-fn peel_borrows(borrow: &ast::RefExpr) -> ast::Expr {
-    let mut inner = ast::Expr::RefExpr(borrow.clone());
-    while let ast::Expr::RefExpr(it) = &inner
+fn peel_borrows(borrow: ast::RefExpr<'_>) -> ast::Expr<'_> {
+    let mut inner = ast::Expr::RefExpr(borrow);
+    while let ast::Expr::RefExpr(it) = inner
         && let Some(next) = it.expr()
     {
         inner = next;
@@ -393,86 +484,23 @@ fn peel_borrows(borrow: &ast::RefExpr) -> ast::Expr {
 
 /// rustc's `AdtDef::is_payloadfree`: no variant has fields.
 fn payload_free(cx: &Cx<'_, '_>, enum_: hir::Enum) -> bool {
-    enum_.variants(cx.db).iter().all(|it| it.fields(cx.db).is_empty())
+    enum_.variants_iter(cx.db).all(|it| it.fields(cx.db).is_empty())
 }
 
 fn is_numeric(ty: &hir::Type<'_>) -> bool {
     ty.is_int_or_uint() || ty.is_float()
 }
 
-/// The type a raw pointer or a reference points to.
-fn pointee<'db>(ty: &hir::Type<'db>) -> Option<hir::Type<'db>> {
-    ty.as_raw_ptr().or_else(|| ty.as_reference()).map(|(it, _)| it)
-}
-
-/// rustc's `PointerKind` of a pointer to a type: the metadata it carries.
-#[derive(Clone, Copy)]
-enum Metadata {
-    Thin,
-    VTable,
-    Length,
-    Param,
-    Alias,
-}
-
-fn metadata<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>) -> Metadata {
-    if matches!(ty.to_next_solver().kind(), TyKind::Dynamic(..)) {
-        return Metadata::VTable;
-    }
-    if ty.is_slice() || ty.is_str() {
-        return Metadata::Length;
-    }
-    let sized = hir::Trait::lang(cx.db, cx.krate, hir::LangItem::Sized)
-        .is_some_and(|it| ty.impls_trait(cx.db, it, &[]));
-    if sized {
-        return Metadata::Thin;
-    }
-    if ty.as_type_param(cx.db).is_some() {
-        return Metadata::Param;
-    }
-    if let Some(hir::Adt::Struct(_)) = ty.as_adt() {
-        return match ty.fields(cx.db).pop() {
-            Some((_, last)) => metadata(cx, &last),
-            None => Metadata::Thin,
-        };
-    }
-    if ty.is_tuple() {
-        return match ty.tuple_fields(cx.db).pop() {
-            Some(last) => metadata(cx, &last),
-            None => Metadata::Thin,
-        };
-    }
-    Metadata::Alias
-}
-
-/// The auto traits the `dyn` the cast points to has and the `dyn` it casts from neither has nor
-/// implies through its principal's supertraits.
-fn added_auto_traits<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidCast<'db>) -> Vec<String> {
-    let autos = |ty: &hir::Type<'db>| -> Vec<hir::Trait> {
-        match pointee(ty).map(|it| it.to_next_solver().kind()) {
-            Some(TyKind::Dynamic(preds, _)) => {
-                preds.auto_traits().into_iter().map(|it| hir::Trait::from(hir_def::TraitId::from(it))).collect()
-            }
-            _ => Vec::new(),
-        }
-    };
-    let mut src = autos(&d.expr_ty);
-    if let Some(principal) = pointee(&d.expr_ty).and_then(|it| it.as_dyn_trait()) {
-        src.extend(principal.all_supertraits(cx.db).into_iter().filter(|it| it.is_auto(cx.db)));
-    }
-    autos(&d.cast_ty)
-        .into_iter()
-        .filter(|it| !src.contains(it))
-        .map(|it| format!("`{}`", cx.def_path(hir::ModuleDef::Trait(it))))
-        .collect()
-}
-
 /// rustc's `DiagSymbolList`, as its English list formatter joins it: `a and b`, `a, b, and c`.
 fn symbol_list(items: &[String]) -> String {
     match items {
+        // alloc: empty, allocates nothing
         [] => String::new(),
+        // clone: the error's text, for an error hir found
         [one] => one.clone(),
+        // alloc: the error's text, for an error hir found
         [first, second] => format!("{first} and {second}"),
+        // alloc: the error's text, for an error hir found
         [init @ .., last] => format!("{}, and {last}", init.join(", ")),
     }
 }

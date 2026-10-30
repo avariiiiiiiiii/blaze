@@ -9,7 +9,6 @@ use hir_def::{
     hir::{ClosureKind, CoroutineKind, CoroutineSource, ExprId, PatId},
     type_ref::TypeRefId,
 };
-use indexmap::IndexMap;
 use rustc_abi::ExternAbi;
 use rustc_type_ir::{
     AliasTyKind, ClosureArgs, ClosureArgsParts, CoroutineArgs, CoroutineArgsParts,
@@ -22,7 +21,7 @@ use tracing::{debug, instrument};
 use crate::{
     Span,
     db::{InternedClosure, InternedClosureId, InternedCoroutineClosureId, InternedCoroutineId},
-    infer::{BreakableKind, ClosureData, Diverges, coerce::CoerceMany, pat::PatOrigin},
+    infer::{BreakableKind, ClosureData, Diverges, coerce::CoerceMany},
     next_solver::{
         AliasTy, Binder, ClauseKind, DbInterner, ErrorGuaranteed, FnSig, GenericArg, PolyFnSig,
         PolyProjectionClause, Predicate, PredicateKind, SolverDefId, StoredFnSig, TermId, Ty,
@@ -30,7 +29,7 @@ use crate::{
         abi::Safety,
         infer::{
             BoundRegionConversionTime, InferOk, InferResult,
-            traits::{ObligationCause, PredicateObligations},
+            traits::{ObligationCause, ObligationCauseCode, PredicateObligations},
         },
     },
 };
@@ -48,7 +47,7 @@ struct ClosureSignatures<'db> {
     liberated_sig: FnSig<'db>,
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     fn poll_option_ty(&mut self, item_ty: Ty<'db>) -> Ty<'db> {
         let interner = self.interner();
 
@@ -152,7 +151,7 @@ impl<'db> InferenceContext<'db> {
                     ClosureKind::OldCoroutine(_)
                     | ClosureKind::Coroutine { kind: CoroutineKind::Gen, .. } => {
                         let yield_ty = self.table.next_ty_var(closure_expr.into());
-                        self.require_type_is_sized(yield_ty, closure_expr.into());
+                        self.require_type_is_sized(yield_ty, closure_expr.into(), ObligationCauseCode::Misc);
                         yield_ty
                     }
                     ClosureKind::Coroutine { kind: CoroutineKind::Async, .. } => {
@@ -160,7 +159,7 @@ impl<'db> InferenceContext<'db> {
                     }
                     ClosureKind::Coroutine { kind: CoroutineKind::AsyncGen, .. } => {
                         let yield_ty = self.table.next_ty_var(closure_expr.into());
-                        self.require_type_is_sized(yield_ty, closure_expr.into());
+                        self.require_type_is_sized(yield_ty, closure_expr.into(), ObligationCauseCode::Misc);
                         self.poll_option_ty(yield_ty)
                     }
                     _ => unreachable!(),
@@ -309,21 +308,29 @@ impl<'db> InferenceContext<'db> {
             ClosureData {
                 liberated_sig: StoredFnSig::new(liberated_sig),
                 fake_reads: Box::default(),
-                min_captures: IndexMap::default(),
+                min_captures: Default::default(),
                 kind_origin: None,
             },
         );
 
-        // Now go through the argument patterns
-        for (arg_pat, arg_ty) in args.iter().zip(liberated_sig.inputs()) {
-            self.infer_top_pat(*arg_pat, *arg_ty, PatOrigin::Param);
+        // Now go through the argument patterns. The rust-call ABI takes no unsized parameter, so
+        // `unsized_fn_params` doesn't lift a closure's.
+        let params = args.iter().zip(arg_types).zip(liberated_sig.inputs());
+        for ((arg_pat, arg_type), arg_ty) in params {
+            self.infer_param_pat(*arg_pat, *arg_ty);
+            let span = arg_type.map_or(Span::from(*arg_pat), Span::from);
+            self.require_type_is_sized(*arg_ty, span, ObligationCauseCode::SizedArgumentType);
         }
+        // A closure is a typeck child: wfcheck sees only its parent's signature.
+        let ret_span = ret_type.map_or(Span::from(body), Span::from);
+        let code = ObligationCauseCode::SizedReturnType;
+        self.require_type_is_sized(liberated_sig.output(), ret_span, code);
 
         // FIXME: lift these out into a struct
         let prev_diverges = mem::replace(&mut self.diverges, Diverges::Maybe);
         let prev_ret_ty = mem::replace(&mut self.return_ty, liberated_sig.output());
         let prev_ret_coercion =
-            self.return_coercion.replace(CoerceMany::new(liberated_sig.output()));
+            self.return_coercion.replace(CoerceMany::new(liberated_sig.output(), self.frame));
         let prev_resume_yield_tys = mem::replace(&mut self.resume_yield_tys, resume_yield_tys);
         let desugaring = match closure_kind {
             ClosureKind::Coroutine { kind, .. } => Some(kind),
@@ -1017,17 +1024,15 @@ impl<'db> InferenceContext<'db> {
             },
         };
         // First, convert the types that the user supplied (if any).
-        let (supplied, bound_vars) =
-            self.with_ty_lowering(|ctx| ctx.lower_closure_params(decl_inputs));
-        let supplied_arguments: Vec<_> = supplied
-            .into_iter()
-            .map(|input| match input {
-                // The solver takes no type with a lifetime bound outside it.
-                Some(ty) if ty.has_escaping_bound_vars() => self.table.insert_type_vars(ty),
-                Some(ty) => self.process_user_written_ty(ty),
-                None => self.table.next_ty_var(closure_expr.into()),
-            })
-            .collect();
+        let mut supplied = Vec::with_capacity_in(decl_inputs.len(), self.frame);
+        let bound_vars =
+            self.with_ty_lowering(|ctx| ctx.lower_closure_params(decl_inputs, &mut supplied));
+        let supplied_arguments = supplied.into_iter().map(|input| match input {
+            // The solver takes no type with a lifetime bound outside it.
+            Some(ty) if ty.has_escaping_bound_vars() => self.table.insert_type_vars(ty),
+            Some(ty) => self.process_user_written_ty(ty),
+            None => self.table.next_ty_var(closure_expr.into()),
+        });
 
         Binder::bind_with_vars(
             interner.mk_fn_sig(

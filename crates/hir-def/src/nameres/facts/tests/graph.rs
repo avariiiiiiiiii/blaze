@@ -12,6 +12,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use base_db::Crate;
+use blaze_mem::{Frame, Tag, frame};
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
@@ -156,8 +157,17 @@ impl Builder {
     }
 }
 
+/// Each test runs the graph code in a task of its own, as the `partition` query does.
+fn task<R>(f: impl FnOnce(&Frame) -> R) -> R {
+    frame::task(Tag::Nameres, f)
+}
+
 fn reads(shape: &ImportShape, module: u32) -> Vec<u32> {
-    import_graph(shape).reads(module).to_vec()
+    task(|frame| import_graph(frame, shape).reads(module).to_vec())
+}
+
+fn partition_of(shape: &ImportShape) -> Partition {
+    task(|frame| partition(frame, shape))
 }
 
 /// Every module in exactly one component, members ascending, the anchor the smallest.
@@ -254,48 +264,57 @@ fn pearce_equals_tarjan() {
     let graphs = (1u32..48).prop_flat_map(|n| (Just(n), collection::vec((0..n, 0..n), 0..160)));
     runner(1024)
         .run(&graphs, |(nodes, edges)| {
-            let partition = components(&ImportGraph::from_edges(nodes, &edges));
-            check_well_formed(&partition, nodes);
-            prop_assert_eq!(component_sets(&partition), tarjan(nodes, &edges));
-            for &(src, dst) in &edges {
-                prop_assert!(
-                    partition.of(dst) <= partition.of(src),
-                    "edge {} -> {} goes to a later component",
-                    src,
-                    dst
+            task(|frame| {
+                let partition = components(frame, &ImportGraph::from_edges(frame, nodes, &edges));
+                check_well_formed(&partition, nodes);
+                prop_assert_eq!(component_sets(&partition), tarjan(nodes, &edges));
+                for &(src, dst) in &edges {
+                    prop_assert!(
+                        partition.of(dst) <= partition.of(src),
+                        "edge {} -> {} goes to a later component",
+                        src,
+                        dst
+                    );
+                    prop_assert!(partition.may_read(partition.of(src), partition.of(dst)));
+                }
+                // The order of the edges and their repeats change nothing.
+                let mut shuffled: Vec<(u32, u32)> = edges.iter().rev().copied().collect();
+                shuffled.extend_from_slice(&edges);
+                prop_assert_eq!(
+                    ImportGraph::from_edges(frame, nodes, &shuffled),
+                    ImportGraph::from_edges(frame, nodes, &edges)
                 );
-                prop_assert!(partition.may_read(partition.of(src), partition.of(dst)));
-            }
-            // The order of the edges and their repeats change nothing.
-            let mut shuffled: Vec<(u32, u32)> = edges.iter().rev().copied().collect();
-            shuffled.extend_from_slice(&edges);
-            prop_assert_eq!(ImportGraph::from_edges(nodes, &shuffled), ImportGraph::from_edges(nodes, &edges));
-            prop_assert_eq!(components(&ImportGraph::from_edges(nodes, &shuffled)), partition);
-            Ok(())
+                prop_assert_eq!(components(frame, &ImportGraph::from_edges(frame, nodes, &shuffled)), partition);
+                Ok(())
+            })
         })
         .unwrap();
 }
 
 #[test]
 fn deep_chain_needs_no_recursion() {
-    let nodes = 200_000u32;
-    let edges: Vec<(u32, u32)> = (0..nodes - 1).map(|it| (it, it + 1)).collect();
-    let partition = components(&ImportGraph::from_edges(nodes, &edges));
-    assert_eq!(partition.len(), nodes);
-    for module in 0..nodes {
-        assert_eq!(partition.of(module), nodes - 1 - module);
-    }
+    task(|frame| {
+        let nodes = 200_000u32;
+        let edges: Vec<(u32, u32)> = (0..nodes - 1).map(|it| (it, it + 1)).collect();
+        let partition = components(frame, &ImportGraph::from_edges(frame, nodes, &edges));
+        assert_eq!(partition.len(), nodes);
+        for module in 0..nodes {
+            assert_eq!(partition.of(module), nodes - 1 - module);
+        }
+    });
 }
 
 #[test]
 fn empty_and_self_loops() {
-    let none = components(&ImportGraph::from_edges(0, &[]));
-    assert_eq!(none.len(), 0);
-    let graph = ImportGraph::from_edges(2, &[(0, 0), (1, 1), (1, 1)]);
-    assert_eq!(graph.edge_count(), 0);
-    let partition = components(&graph);
-    assert_eq!(partition.len(), 2);
-    check_well_formed(&partition, 2);
+    task(|frame| {
+        let none = components(frame, &ImportGraph::from_edges(frame, 0, &[]));
+        assert_eq!(none.len(), 0);
+        let graph = ImportGraph::from_edges(frame, 2, &[(0, 0), (1, 1), (1, 1)]);
+        assert_eq!(graph.edge_count(), 0);
+        let partition = components(frame, &graph);
+        assert_eq!(partition.len(), 2);
+        check_well_formed(&partition, 2);
+    });
 }
 
 #[test]
@@ -309,7 +328,7 @@ fn glob_cycle_is_one_component() {
     let shape = b.build();
     assert_eq!(reads(&shape, a), [Builder::ROOT, c]);
     assert_eq!(reads(&shape, c), [Builder::ROOT, a]);
-    let p = partition(&shape);
+    let p = partition_of(&shape);
     check_well_formed(&p, 3);
     assert_eq!(p.len(), 2);
     assert_eq!(p.of(a), p.of(c));
@@ -333,7 +352,7 @@ fn chain_is_three_components_in_order() {
     assert_eq!(reads(&shape, a), [middle]);
     assert_eq!(reads(&shape, middle), [last]);
     assert_eq!(reads(&shape, last), [] as [u32; 0]);
-    let p = partition(&shape);
+    let p = partition_of(&shape);
     assert_eq!(p.len(), 3);
     assert_eq!((p.of(last), p.of(middle), p.of(a)), (0, 1, 2));
 }
@@ -466,7 +485,7 @@ fn prelude_import_is_read_by_every_module() {
     assert_eq!(reads(&s2021, m), [Builder::ROOT, prelude]);
     assert_eq!(reads(&s2021, prelude), [Builder::ROOT]);
     assert_eq!(reads(&s2021, Builder::ROOT), [prelude]);
-    let p = partition(&s2021);
+    let p = partition_of(&s2021);
     assert_eq!(p.of(Builder::ROOT), p.of(prelude));
     assert!(p.of(prelude) < p.of(m) && p.of(prelude) < p.of(x));
     // A 2015 import's plain path starts at the root, not the std prelude.
@@ -540,7 +559,7 @@ fn enum_declaration_is_upstream() {
     b.import(d, PathKind::Crate, &["b", "E", "V"]);
     let shape = b.build();
     assert_eq!(reads(&shape, d), [Builder::ROOT, c]);
-    let p = partition(&shape);
+    let p = partition_of(&shape);
     assert!(p.may_read(p.of(d), p.of(a)));
 }
 
@@ -557,7 +576,7 @@ fn self_and_super_globs() {
     let shape = b.build();
     assert_eq!(reads(&shape, a), [child]);
     assert_eq!(reads(&shape, child), [a]);
-    let p = partition(&shape);
+    let p = partition_of(&shape);
     assert_eq!(p.members(p.of(a)), [a, child]);
 }
 
@@ -858,7 +877,7 @@ fn partition_allows_every_read_of_a_brute_force_resolver() {
             let world = world(&bytes, this, other);
             let mut model = Model::new(&world);
             model.run();
-            let p = partition(&world.shape);
+            let p = partition_of(&world.shape);
             check_well_formed(&p, world.shape.modules.len() as u32);
             for &(reader, read) in &model.reads {
                 prop_assert!(
@@ -886,25 +905,28 @@ fn chain(krate: Crate, len: u32) -> ImportShape {
     b.build()
 }
 
-/// `partition`'s allocations: one per table, none per edge, pair or fact. The solver's 12
-/// (paths, the levels' paths and first modules, the pair map and rows, the per-module pair and
-/// glob heads, the links, the seen set, the worklist, the prelude levels, the edge list), the
-/// CSR's 5 (the first pass's starts and sources by target, the cursors, offsets, targets) and
-/// the components' 5 (`rindex`, frames, stack, component starts, members). The fixed point's
-/// tables are sized from the shape (a few facts per path level) and only grow, by doubling, on
-/// a shape past that estimate.
-const PARTITION_ALLOCATIONS: u64 = 22;
+/// `partition`'s global allocations: the value's three columns (`of`, `starts`, `members`),
+/// each at exact size. Everything else is in the task's frame, which reserves its memory from
+/// the system and not the global heap: the solver's 12 tables (paths, the levels' paths and
+/// first modules, the pair map and rows, the per-module pair and glob heads, the links, the
+/// seen set, the worklist, the prelude levels, the edge list), the graph's 5 (the starts and
+/// sources by target, the cursors, offsets, targets) and the components' 5 (`rindex`, frames,
+/// stack, component starts, members), so none of them, nor any growth past the fixed point's
+/// estimate, is counted here.
+const PARTITION_ALLOCATIONS: u64 = 3;
 
 #[test]
 fn partition_allocations_do_not_grow_with_edges() {
     let (_db, this, _) = crates();
     let small = chain(this, 16);
     let large = chain(this, 4096);
-    assert!(import_graph(&large).edge_count() > 100 * import_graph(&small).edge_count());
-    // The first call interns the test harness's name.
-    partition(&small);
-    let (small_partition, small_used) = blaze_alloc_count::measure(|| partition(&small));
-    let (large_partition, large_used) = blaze_alloc_count::measure(|| partition(&large));
+    task(|frame| {
+        assert!(import_graph(frame, &large).edge_count() > 100 * import_graph(frame, &small).edge_count());
+    });
+    // The first call interns the test harness's name, and reserves the task's frame.
+    partition_of(&small);
+    let (small_partition, small_used) = blaze_alloc_count::measure(|| partition_of(&small));
+    let (large_partition, large_used) = blaze_alloc_count::measure(|| partition_of(&large));
     assert_eq!(small_partition.len(), 17);
     assert_eq!(large_partition.len(), 4097);
     assert_eq!(small_used.allocations, large_used.allocations, "{small_used:?} vs {large_used:?}");

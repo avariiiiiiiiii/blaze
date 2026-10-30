@@ -13,6 +13,8 @@
 //! distinct: those are [`Target::Static`], keyed by which item they are, never by content.
 
 #![feature(allocator_api)]
+// Unsafe code is in `memo` alone (docs/v2/plan/design/unsafe.md).
+#![deny(unsafe_code)]
 
 use blaze_format::SpanRef;
 use blaze_ids::{ContentId, Hasher};
@@ -30,6 +32,7 @@ pub mod dedupe;
 pub mod driver;
 pub mod fold;
 pub mod imports;
+#[allow(unsafe_code)]
 pub mod memo;
 pub mod plan;
 pub mod query;
@@ -293,6 +296,28 @@ pub enum Target {
     /// counters, 1 its flags, 2 its guards; the relocation's addend is into it. A function
     /// names no other's, and nothing else names one.
     Coverage(u32),
+}
+
+/// A native library a crate links against: a `#[link(..)]` of one of its `extern` blocks, a
+/// build script's `cargo:rustc-link-lib` or a `-l`, as rustc's `NativeLib` has it.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+pub struct NativeLib {
+    /// As written: `foo` for `libfoo.a`, `foo.dll` or `foo.framework`, unless `verbatim`.
+    pub name: String,
+    pub kind: NativeLibKind,
+    /// `+verbatim`: `name` is the file's, with no `lib` or extension added.
+    pub verbatim: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum NativeLibKind {
+    /// `dylib`, and no `kind`: the linker takes whichever it finds, as rustc passes `-l`.
+    Dylib,
+    /// `whole`: `+whole-archive`, every object linked, reached or not. `bundle`: not
+    /// `-bundle`, its objects go into the archive of an `rlib` or `staticlib` that links it.
+    Static { whole: bool, bundle: bool },
+    /// An Apple framework.
+    Framework,
 }
 
 /// Why a unit did not compile: names the instance and the item.

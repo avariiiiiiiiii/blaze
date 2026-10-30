@@ -30,6 +30,7 @@ pub(crate) fn ty(out: &mut String, ty: &ast::Type, edition: Edition) {
 
 /// rustc's `bounds_to_string` of `list`: the bounds joined with ` + `, appended to `out`.
 pub(crate) fn bounds(out: &mut String, list: &ast::TypeBoundList, edition: Edition) {
+    // clone: a cursor's refcount (no allocation), printing a diagnostic's text
     Printer { out, edition }.type_bounds("", Some(list.clone()));
 }
 

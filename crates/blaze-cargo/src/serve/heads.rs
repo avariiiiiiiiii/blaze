@@ -38,6 +38,8 @@ pub enum Out {
     Pass(Arrived),
     /// An answer the daemon sends itself, the session never having seen the request.
     Answer(Reply),
+    /// A checkout's watcher committed what the disk changed: `head` is at `root` now.
+    Moved { head: String, root: ContentId },
 }
 
 /// A request whose checkouts' watchers, or the watches outside views, have not caught up with
@@ -118,7 +120,9 @@ pub fn named(request: &Request) -> Vec<&str> {
         | Request::Verify { view, .. }
         | Request::CodegenInputs { view, .. }
         | Request::Trace { view, .. }
-        | Request::Tables { view } => view_heads(view, &mut heads),
+        | Request::Tables { view }
+        | Request::WillTest { view, .. } => view_heads(view, &mut heads),
+        Request::WillSave { head, .. } if is_checkout(head) => heads.push(head),
         Request::Diff { from, to } | Request::Reach { from, to, .. } => {
             view_heads(from, &mut heads);
             view_heads(to, &mut heads);
@@ -142,6 +146,8 @@ pub fn runs_user_code(request: &Request) -> bool {
             | Request::Run { .. }
             | Request::BestOf { .. }
             | Request::Verify { .. }
+            | Request::WillTest { .. }
+            | Request::WillSave { .. }
     )
 }
 
@@ -391,7 +397,8 @@ impl Heads {
         let mut ended = None;
         for it in watched {
             match it {
-                Watched::Committed(_) | Watched::Lost { .. } | Watched::Scanned => {}
+                Watched::Committed(commit) => out.push(Out::Moved { head: head.clone(), root: commit.root }),
+                Watched::Lost { .. } | Watched::Scanned => {}
                 Watched::Conflict { path } => {
                     eprintln!("blaze serve: {head}/{path} changed on disk and by a commit since; the head keeps the commit's");
                 }
@@ -649,9 +656,31 @@ mod tests {
         };
         assert!(runs_user_code(&Request::Check { view: view(), targets: targets.clone() }));
         assert!(runs_user_code(&Request::Verify { view: view(), targets: targets.clone() }));
+        let ahead = Request::WillTest { view: view(), filter: Vec::new(), targets: targets.clone(), wait_ms: 0 };
+        assert!(runs_user_code(&ahead));
         assert!(!runs_user_code(&Request::Trace { view: view(), targets }));
         assert!(!runs_user_code(&Request::Open { view: view() }));
         assert!(!runs_user_code(&Request::Status));
+    }
+
+    #[test]
+    fn intent_reads_the_heads_it_builds_ahead_on_and_an_edit_reads_none() {
+        let targets = || blaze_api::Targets {
+            packages: Vec::new(),
+            profile: String::new(),
+            target: None,
+            features: Vec::new(),
+            all_features: false,
+            no_default_features: false,
+            cargo: None,
+        };
+        let view = ViewRef::Head("/w".to_owned());
+        let ahead = Request::WillTest { view, filter: Vec::new(), targets: targets(), wait_ms: 0 };
+        assert_eq!(named(&ahead), ["/w"]);
+        let save = Request::WillSave { ops: Vec::new(), head: "/w".to_owned(), test: true, targets: targets(), wait_ms: 0 };
+        assert_eq!(named(&save), ["/w"]);
+        let edit = Request::Edit { base: ContentId::of("heads test", b"root"), head: "/w".to_owned(), edits: Vec::new() };
+        assert!(named(&edit).is_empty());
     }
 
     #[test]

@@ -18,6 +18,7 @@ use std::hash::Hasher as _;
 
 use blaze_codegen::InstanceKey;
 use blaze_format::SpanRef;
+use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, radix};
 use blaze_items::ItemKey;
 use blaze_mem::MemError;
@@ -111,6 +112,9 @@ pub(crate) enum SymKey {
     /// array's index ([`blaze_codegen::Target::Coverage`]), and its PC table's entries.
     Coverage(IdNo, u32),
     CoveragePcs(IdNo),
+    /// A dev run's pointer to `blaze_inproc_start` ([`crate::DevRun`]): before every other
+    /// key in [`Symbols::cmp_keys`], so first among the pieces of its class and rank.
+    StartHook,
 }
 
 const _: () = assert!(size_of::<SymKey>() == 20);
@@ -147,6 +151,7 @@ impl SymKey {
             LiveDir => [22, 0, 0, 0, 0],
             Coverage(a, b) => [23, a.0, b, 0, 0],
             CoveragePcs(a) => [24, a.0, 0, 0, 0],
+            StartHook => [25, 0, 0, 0, 0],
         }
     }
 }
@@ -472,6 +477,9 @@ impl Symbols {
             (Frame(x, s, i), Frame(y, t, j)) => obj(x, y).then(s.cmp(&t)).then(i.cmp(&j)),
             (Got(k, x), Got(l, y)) => k.cmp(&l).then_with(|| self.cmp(x, y)),
             (Plt(x), Plt(y)) => self.cmp(x, y),
+            (StartHook, StartHook) => Ordering::Equal,
+            (StartHook, _) => Ordering::Less,
+            (_, StartHook) => Ordering::Greater,
             _ => a.words()[0].cmp(&b.words()[0]),
         }
     }
@@ -552,6 +560,7 @@ impl Symbols {
             SymKey::LiveDir => write!(out, "LiveDir"),
             SymKey::Coverage(it, array) => write!(out, "Coverage({:?}, {array})", self.instance(it)),
             SymKey::CoveragePcs(it) => write!(out, "CoveragePcs({:?})", self.instance(it)),
+            SymKey::StartHook => write!(out, "StartHook"),
         }
     }
 
@@ -562,12 +571,6 @@ impl Symbols {
         let words = key.words();
         out.push(words[0] as u8);
         let id = |out: &mut Vec<u8>, it: IdNo| out.extend_from_slice(&self.content(it).0);
-        let name = |out: &mut Vec<u8>, it: NameId| {
-            let it = self.str(it);
-            out.extend_from_slice(&(it.len() as u64).to_le_bytes());
-            out.extend_from_slice(it.as_bytes());
-        };
-        let word = |out: &mut Vec<u8>, it: u32| out.extend_from_slice(&it.to_le_bytes());
         match key {
             SymKey::Body(a)
             | SymKey::Slot(a)
@@ -580,28 +583,35 @@ impl Symbols {
                 id(out, a);
                 id(out, b);
             }
-            SymKey::Name(a) | SymKey::FileName(a) | SymKey::IatEnd(a) | SymKey::Common(a) => name(out, a),
+            SymKey::Name(a) | SymKey::FileName(a) | SymKey::IatEnd(a) | SymKey::Common(a) => {
+                out.put_bytes_u64(self.str(a).as_bytes());
+            }
             SymKey::Local(o, a) | SymKey::Section(o, a) => {
                 id(out, o.native);
-                word(out, o.member);
-                word(out, a);
+                out.put_u32(o.member);
+                out.put_u32(a);
             }
             SymKey::Position(a, index) | SymKey::Coverage(a, index) => {
                 id(out, a);
-                word(out, index);
+                out.put_u32(index);
             }
             SymKey::Frame(o, section, at) => {
                 id(out, o.native);
-                word(out, o.member);
-                word(out, section);
-                word(out, at);
+                out.put_u32(o.member);
+                out.put_u32(section);
+                out.put_u32(at);
             }
             SymKey::Got(kind, target) => {
                 out.push(kind as u8);
                 self.write_key(target, out);
             }
             SymKey::Plt(target) => self.write_key(target, out),
-            SymKey::Generation | SymKey::Cells | SymKey::Stubs | SymKey::Descriptor | SymKey::LiveDir => {}
+            SymKey::Generation
+            | SymKey::Cells
+            | SymKey::Stubs
+            | SymKey::Descriptor
+            | SymKey::LiveDir
+            | SymKey::StartHook => {}
         }
     }
 

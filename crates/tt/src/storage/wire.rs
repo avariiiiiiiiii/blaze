@@ -13,17 +13,23 @@
 //! Reading checks everything a tree's methods rely on (tags, lengths nesting, ordinals, indices,
 //! chars, UTF-8, ranges) and that the columns are the ones the builder makes for those token
 //! trees, so that a tree read compares and hashes as the same tree built. Then it writes the
-//! tree's block, its one allocation, no larger than the bytes it is read from; the checks' own
-//! buffers are the only others.
+//! tree's block, its one allocation, no larger than the bytes it is read from, in the reader's
+//! allocator ([`TopSubtree::read_wire_in`]); the checks' own buffers are kept per thread.
 
-use blaze_format::cursor::Reader;
+use std::{
+    alloc::{Allocator, Global},
+    cell::Cell,
+};
+
+use blaze_format::cursor::{Put as _, Reader};
+use blaze_mem::scratch::Scratch as Stack;
 use intern::Symbol;
 use span::{SpanAnchor, SyntaxContext, TextRange, TextSize};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::{
     Columns, CompressedSpanPart, HEADER, IDENT, LITERAL, Layout, NARROW_LIMIT, Node, PUNCT,
-    PackedSpan, SUBTREE, SYMBOL_WINDOW, TopSubtree, WIDE, WideSpan, has_duplicates, symbol,
+    PackedSpan, SUBTREE, SYMBOL_WINDOW, TopSubtree, Tree, WIDE, WideSpan, has_duplicates, symbol,
 };
 
 /// The first word, naming the layout; a change to it changes this.
@@ -95,7 +101,7 @@ fn malformed<T>(what: &'static str, at: usize) -> Result<T, WireError> {
     Err(WireError::Malformed { what, at })
 }
 
-impl TopSubtree {
+impl Tree {
     /// Appends the tree's columns to `out`, as [`TopSubtree::read_wire`] reads them: at most one
     /// allocation, the nodes, spans, wide spans and parts one copy of the block's words, and the
     /// symbols and top spans written as rows.
@@ -103,7 +109,7 @@ impl TopSubtree {
         let len = |it: usize| u32::try_from(it).expect("a token tree column fits in u32");
         let columns = self.columns();
         let symbol_bytes: usize = columns.symbols.iter().map(|&it| symbol(it).as_str().len()).sum();
-        let rows = &self.block[HEADER..self.layout.symbols as usize];
+        let rows = &self.block()[HEADER..self.layout.symbols as usize];
         let words = HEADER_WORDS + rows.len() + columns.symbols.len() + 10;
         let base = out.len();
         let end_of_tree = base + 4 * words + symbol_bytes.next_multiple_of(4);
@@ -142,8 +148,10 @@ impl TopSubtree {
         debug_assert_eq!(out.len(), base + 4 * words + symbol_bytes, "the rows are the words counted");
         out.resize(end_of_tree, 0);
     }
+}
 
-    /// Reads a tree [`TopSubtree::write_wire`] wrote at the start of `bytes`, and how many bytes
+impl TopSubtree {
+    /// Reads a tree [`Tree::write_wire`] wrote at the start of `bytes`, and how many bytes
     /// it took. `part` turns each [`WirePart`] into the anchor and context it stands for here,
     /// or refuses it: the ids are the writer's, and only the reader knows which it may use.
     /// `bytes` start at a 4-byte boundary, as a heap buffer or a tree after another one does.
@@ -151,6 +159,27 @@ impl TopSubtree {
         bytes: &[u8],
         part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
     ) -> Result<(TopSubtree, usize), WireError> {
+        TopSubtree::read_wire_keeping(bytes, part, true, Global)
+    }
+}
+
+impl<A: Allocator> TopSubtree<A> {
+    /// [`TopSubtree::read_wire`] with the block in `alloc`: a task's temporary, which keeps no
+    /// parser words, as [`TopSubtreeBuilder::build_in`](super::TopSubtreeBuilder::build_in)'s.
+    pub fn read_wire_in(
+        bytes: &[u8],
+        part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
+        alloc: A,
+    ) -> Result<(TopSubtree<A>, usize), WireError> {
+        TopSubtree::read_wire_keeping(bytes, part, false, alloc)
+    }
+
+    fn read_wire_keeping(
+        bytes: &[u8],
+        part: &mut impl FnMut(WirePart) -> Result<(SpanAnchor, SyntaxContext), String>,
+        keeps_words: bool,
+        alloc: A,
+    ) -> Result<(TopSubtree<A>, usize), WireError> {
         let mut words = Words { read: Reader::new(bytes) };
         let [magic, nodes_len, wide_len, parts_len, symbols_len, symbol_bytes] =
             words.rows::<6>(1)?.next().expect("one header row is read");
@@ -209,8 +238,8 @@ impl TopSubtree {
             return malformed("a tree of 2^32 words or more", 0);
         }
         let layout = Layout::new(nodes_len, nodes_len + subtrees, wide_len, parts_len, symbols_len);
-        // alloc: the tree, one block of its exact size.
-        let mut block = Vec::with_capacity(layout.end as usize);
+        // alloc: the tree, one block of its exact size, in `alloc`.
+        let mut block = Vec::with_capacity_in(layout.end as usize, alloc);
         block.extend_from_slice(&layout.header());
         block.extend_from_slice(node_words);
         block.extend_from_slice(span_words);
@@ -238,13 +267,8 @@ impl TopSubtree {
             from = end;
         }
         debug_assert_eq!(block.len(), layout.end as usize, "the columns are the layout's");
-        let tree = TopSubtree {
-            block: block.into_boxed_slice(),
-            layout,
-            top_open,
-            top_close,
-            words: Default::default(),
-        };
+        let block = block.into_boxed_slice();
+        let tree = TopSubtree::from_block(block, layout, top_open, top_close, keeps_words);
         let columns = tree.columns();
         check_literals(columns)?;
         check_canonical(columns)?;
@@ -267,6 +291,23 @@ fn resolve(
 /// and ordinals count the subtrees in order. Returns how many subtrees there are, the top's
 /// aside.
 fn check_nodes(nodes: &[[u32; 2]], symbols: usize) -> Result<usize, WireError> {
+    let mut stack = ENDS.replace(Stack::new());
+    let checked = check_nesting(nodes, symbols, stack.take());
+    ENDS.set(stack);
+    checked
+}
+
+thread_local! {
+    /// [`check_nodes`]' stack of where each open subtree ends, kept for the next read.
+    // alloc: one buffer per thread, grown to the deepest nesting read.
+    static ENDS: Cell<Stack<usize>> = const { Cell::new(Stack::new()) };
+}
+
+fn check_nesting(
+    nodes: &[[u32; 2]],
+    symbols: usize,
+    ends: &mut Vec<usize>,
+) -> Result<usize, WireError> {
     let top = Node::from_row(nodes[0]);
     if top.tag() != SUBTREE
         || top != Node::subtree(top.delimiter_kind(), 0, top.data)
@@ -275,8 +316,7 @@ fn check_nodes(nodes: &[[u32; 2]], symbols: usize) -> Result<usize, WireError> {
         return malformed("a top subtree not holding the whole tree", 0);
     }
     // Where each open subtree ends, the innermost last.
-    // alloc: one buffer per tree read, as deep as its nesting.
-    let mut ends: Vec<usize> = vec![nodes.len()];
+    ends.push(nodes.len());
     let mut ordinal = 0;
     for (at, &row) in nodes.iter().enumerate().skip(1) {
         let node = Node::from_row(row);
@@ -451,13 +491,13 @@ impl Order {
     }
 }
 
-/// Where [`TopSubtree::write_wire`] writes next: the rest of its buffer.
+/// Where [`Tree::write_wire`] writes next: the rest of its buffer.
 /// Appends `rows` of `N` words to `out`, which has room for them.
 #[inline]
 fn put_rows<const N: usize>(out: &mut Vec<u8>, rows: impl IntoIterator<Item = [u32; N]>) {
     for row in rows {
         for word in row {
-            out.extend_from_slice(&word.to_le_bytes());
+            out.put_u32(word);
         }
     }
 }
@@ -510,7 +550,7 @@ impl<'a> Words<'a> {
 }
 
 #[cfg(test)]
-pub(super) fn parts_of(tree: &TopSubtree) -> Vec<(WirePart, (SpanAnchor, SyntaxContext))> {
+pub(super) fn parts_of(tree: &Tree) -> Vec<(WirePart, (SpanAnchor, SyntaxContext))> {
     tree.parts()
         .iter()
         .map(|&row| CompressedSpanPart::from_row(row))

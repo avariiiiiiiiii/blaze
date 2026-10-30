@@ -1649,9 +1649,27 @@ fn exec(made: &Made<'_>) -> String {
     // SAFETY: `made.socket` is this process's copy of the child's end of the supervisor's
     // pair, owned by no `OwnedFd`; the program is not to have it, and nothing uses it after.
     unsafe { raw::close(made.socket) };
-    raw::execve(made.argv, made.env);
-    // alloc: the error, once, and the program's process ends.
-    std::io::Error::last_os_error().to_string()
+    // The program is often the file blaze just wrote: an exec that meets a writer's
+    // descriptor not yet closed (`ETXTBSY`) is made again on blaze-core's schedule.
+    let (mut tried, mut waited) = (0, 0);
+    loop {
+        raw::execve(made.argv, made.env);
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ETXTBSY) {
+            // alloc: the error, once, and the program's process ends.
+            return error.to_string();
+        }
+        let Some(wait) = blaze_core::busy::next(tried, waited) else {
+            // alloc: as above.
+            return format!(
+                "still open for writing after {} ms of tries: {error}",
+                blaze_core::busy::MOST_NS / 1_000_000
+            );
+        };
+        std::thread::sleep(std::time::Duration::from_nanos(wait));
+        tried += 1;
+        waited += wait;
+    }
 }
 
 /// The seccomp filter of a run. On every run it refuses `TIOCSTI` and `TIOCLINUX`
@@ -2849,6 +2867,7 @@ for it in "$OUT"/*; do :; done
             write: vec![out.clone()],
             network: false,
             trace: true,
+            services: Vec::new(),
             live: dir.join("live"),
             report: dir.join("report"),
             not_inputs: vec!["/bin/sh".into()],
@@ -3028,6 +3047,48 @@ sleep 5 & kill -0 "$!" || fail "it could not signal its own child"
             let name = at(u64_at(header + 8)?, u64_at(header + 0x20)?)?;
             Some(PathBuf::from(OsStr::from_bytes(name.strip_suffix(&[0]).unwrap_or(name))))
         })
+    }
+
+    /// A program still open for writing when the sandbox execs it (`ETXTBSY`, as a file blaze
+    /// just wrote can be) runs once the writer closes it, and the sandbox stops trying, naming
+    /// it, when the writer does not close it within blaze-core's waits.
+    #[test]
+    fn a_program_still_open_for_writing_runs_once_it_is_closed() {
+        if let Err(why) = super::landlock::abi() {
+            let required = std::env::var("BLAZE_VIEW_TESTS").is_ok_and(|it| it == "require");
+            assert!(!required, "{why}");
+            eprintln!("skipped: {why}");
+            return;
+        }
+        let dir = scratch("busy");
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let spec = Spec {
+            cwd: out.clone(),
+            env: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+            writable: vec![out],
+            ..Spec::default()
+        };
+        let run = |name: &str, hold: std::time::Duration| {
+            let sh = dir.join(name);
+            std::fs::copy("/bin/sh", &sh).unwrap();
+            let writer = std::fs::OpenOptions::new().write(true).open(&sh).unwrap();
+            let held = std::thread::spawn(move || {
+                std::thread::sleep(hold);
+                drop(writer);
+            });
+            let program: Vec<OsString> = vec![sh.clone().into(), "-c".into(), "exit 3".into()];
+            let ran = alone::run_said(&spec, Some(&program));
+            held.join().unwrap();
+            (sh, ran)
+        };
+        let (_, (code, said)) = run("sh-briefly", std::time::Duration::from_millis(30));
+        assert_eq!(code, Ok(3), "{said}");
+        let most = std::time::Duration::from_nanos(blaze_core::busy::MOST_NS);
+        let (sh, (code, said)) = run("sh-held", most + most / 2);
+        assert_eq!(code, Ok(127), "{said}");
+        assert!(said.contains(&sh.display().to_string()) && said.contains("still open for writing"), "{said}");
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Runs `script` with `bash` in a sandbox that sees `view`, from `/out`, with `env`.

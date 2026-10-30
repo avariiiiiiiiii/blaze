@@ -7,7 +7,7 @@ use base_db::Db;
 use hir_expand::name::Name;
 use intern::Symbol;
 use salsa::plumbing::AsId;
-use syntax::{AstNode, ast};
+use syntax::view::{self as ast, AstNode};
 use test_fixture::WithFixture;
 
 use crate::{
@@ -17,11 +17,11 @@ use crate::{
 
 /// Each impl as written: `Trait for Type`, or `Type` for an inherent one.
 fn render(db: &TestDB, impls: &[ImplId]) -> Vec<String> {
-    let text = |ty: Option<ast::Type>| ty.map_or_else(String::new, |it| it.syntax().to_string());
+    let text = |ty: Option<ast::Type<'_>>| ty.map_or_else(String::new, |it| it.syntax().to_string());
     impls
         .iter()
         .map(|&it| {
-            let source = it.lookup(db).source(db).value;
+            let source = it.lookup(db).source_view(db).value;
             match source.trait_() {
                 Some(trait_) => format!("{} for {}", text(Some(trait_)), text(source.self_ty())),
                 None => text(source.self_ty()),

@@ -2,7 +2,7 @@
 //! splice, and the splices made, which are the text edits the VFS commits.
 
 use blaze_vfs::Op;
-use syntax::{Edition, Parse, SourceFile, SyntaxNode, TextRange, TextSize};
+use syntax::{Edition, Parse, SourceFile, TextRange, TextSize, view};
 
 /// `delete` replaced by `insert`, in the text as the splices before it left it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -11,43 +11,58 @@ pub struct Splice {
     pub insert: String,
 }
 
+/// The text is the one `parse`'s tree shares, never a copy: a splice's reparse makes the new
+/// text once, and nothing else here holds the file's bytes.
 pub struct Working {
     /// The file's path in the view.
     pub path: Box<str>,
     pub edition: Edition,
-    /// The view's bytes, then what the front end appends to a crate root (never edited).
-    pub text: String,
-    /// Where the view's bytes end in `text`.
+    /// Where the view's bytes end in [`Working::text`].
     pub end: usize,
     pub parse: Parse<SourceFile>,
-    /// The tree before any splice: where touched items are named and keyed.
-    pub base: SyntaxNode,
+    /// The parse before any splice, sharing the tree `parse` was made from: where touched items
+    /// are named and keyed.
+    pub base: Parse<SourceFile>,
     pub splices: Vec<Splice>,
 }
 
 impl Working {
-    /// A file whose view bytes are `text[..end]`, parsed as `parse`.
-    pub fn new(path: &str, edition: Edition, text: String, end: usize, parse: Parse<SourceFile>) -> Working {
-        let base = parse.syntax_node();
-        Working { path: path.into(), edition, text, end, parse, base, splices: Vec::new() }
+    /// A file whose view bytes are the first `end` of the text `parse` is of.
+    pub fn new(path: &str, edition: Edition, end: usize, parse: Parse<SourceFile>) -> Working {
+        assert!(parse.root().file().text().is_char_boundary(end), "the view's bytes end inside the text");
+        let base = parse.clone(); // clone: two `Arc` counts, once per file opened
+        Working { path: path.into(), edition, end, parse, base, splices: Vec::new() }
     }
 
     /// A file parsed here: for one the front end has not parsed, and for tests.
     pub fn parsed(path: &str, edition: Edition, text: &str) -> Working {
         let parse = SourceFile::parse(text, edition);
-        Working::new(path, edition, text.to_owned(), text.len(), parse)
+        Working::new(path, edition, text.len(), parse)
     }
 
-    pub fn root(&self) -> SyntaxNode {
-        self.parse.syntax_node()
+    /// The view's bytes, then what the front end appends to a crate root (never edited), as the
+    /// edits so far leave them.
+    pub fn text(&self) -> &str {
+        self.parse.root().file().text()
+    }
+
+    /// The tree as the edits so far leave it.
+    pub fn root(&self) -> view::Node<'_> {
+        self.parse.root()
+    }
+
+    /// The tree before any splice.
+    pub fn base(&self) -> view::Node<'_> {
+        self.base.root()
     }
 
     /// The view's bytes as the edits so far leave them.
     pub fn bytes(&self) -> &str {
-        &self.text[..self.end]
+        &self.text()[..self.end]
     }
 
-    /// Replaces `delete` by `insert` in the text and reparses only what it touched.
+    /// Replaces `delete` by `insert` in the text and reparses only what it touched: the
+    /// reparse makes the new text, which the new tree shares.
     pub fn splice(&mut self, delete: TextRange, insert: String) -> Result<(), String> {
         let start = usize::from(delete.start());
         let stop = usize::from(delete.end());
@@ -58,11 +73,13 @@ impl Working {
                 self.path
             ));
         }
-        if !self.text.is_char_boundary(start) || !self.text.is_char_boundary(stop) {
+        let text = self.text();
+        if !text.is_char_boundary(start) || !text.is_char_boundary(stop) {
             return Err(format!("an edit of {} splits a character", self.path));
         }
+        let len = text.len() - (stop - start) + insert.len();
         self.parse = self.parse.reparse(delete, &insert, self.edition);
-        self.text.replace_range(start..stop, &insert);
+        debug_assert_eq!(self.text().len(), len, "a reparse's text is the spliced text");
         self.end = self.end - (stop - start) + insert.len();
         self.splices.push(Splice { delete, insert });
         Ok(())
@@ -139,13 +156,39 @@ mod tests {
     }
 
     #[test]
+    fn reads_and_position_maps_allocate_nothing() {
+        let mut file = Working::parsed("lib.rs", Edition::CURRENT, "fn a() {}\nfn b() {}\n");
+        file.splice(TextRange::new(7.into(), 9.into()), "{ 1 }".to_owned()).unwrap();
+        let read = blaze_alloc_count::assert_at_most(0, "a working file's reads", || {
+            (
+                file.text().len() + file.bytes().len(),
+                file.to_now(TextRange::new(10.into(), 12.into())),
+                file.to_base(13.into()),
+                file.root().text_range(),
+                file.base().text_range(),
+            )
+        });
+        assert_eq!(read.0, 2 * 23);
+    }
+
+    #[test]
+    fn the_text_is_the_trees_never_a_copy() {
+        let text = syntax::Text::from("fn a() {}\n");
+        let parse = SourceFile::parse_shared(text.clone(), Edition::CURRENT);
+        let mut file = Working::new("lib.rs", Edition::CURRENT, text.len(), parse);
+        assert_eq!(file.text().as_ptr(), text.as_ptr());
+        file.splice(TextRange::new(7.into(), 9.into()), "{ 1 }".to_owned()).unwrap();
+        assert_eq!(file.text(), "fn a() { 1 }\n");
+        assert_eq!(file.base().file().text().as_ptr(), text.as_ptr());
+    }
+
+    #[test]
     fn the_appended_module_is_never_edited() {
-        let text = "fn a() {}\nmod __appended {}\n".to_owned();
-        let parse = SourceFile::parse(&text, Edition::CURRENT);
-        let mut file = Working::new("lib.rs", Edition::CURRENT, text, 10, parse);
+        let parse = SourceFile::parse("fn a() {}\nmod __appended {}\n", Edition::CURRENT);
+        let mut file = Working::new("lib.rs", Edition::CURRENT, 10, parse);
         assert!(file.splice(TextRange::new(8.into(), 12.into()), String::new()).is_err());
         file.splice(TextRange::new(0.into(), 0.into()), "// x\n".to_owned()).unwrap();
         assert_eq!(file.bytes(), "// x\nfn a() {}\n");
-        assert_eq!(&file.text[file.end..], "mod __appended {}\n");
+        assert_eq!(&file.text()[file.end..], "mod __appended {}\n");
     }
 }

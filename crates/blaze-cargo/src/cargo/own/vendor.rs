@@ -197,7 +197,6 @@ fn sync(
             build: None,
             platform: None,
             offline: read.has("--offline") || read.has("--frozen"),
-            store: None,
             rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let packages =
@@ -267,14 +266,14 @@ fn sync(
         let tarball = std::fs::read(&copied.tarball)
             .with_context(|| format!("failed to open {}", copied.tarball.display()))?;
         if suffixed {
-            blaze_registry::download::unpack_package_in(&tarball, &dst, &vendor_this)?;
+            blaze_registry::download::unpack_package_in(&tarball, &dst, vendor_this)?;
         } else {
             let staging = vendor_dir.join(format!(".vendor-staging{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&staging);
             std::fs::create_dir_all(&staging)?;
             let inside = staging.join(&unpacked);
             let moved =
-                blaze_registry::download::unpack_package_in(&tarball, &inside, &vendor_this)
+                blaze_registry::download::unpack_package_in(&tarball, &inside, vendor_this)
                     .and_then(|_| {
                         std::fs::rename(&inside, &dst).with_context(|| {
                             format!("failed to move {} to {}", inside.display(), dst.display())

@@ -13,17 +13,14 @@
 //! Apache-2.0).
 
 use either::Either;
-use hir::{
-    Adt, AsAssocItem as _, GenericDef, HasSource as _, InFile, ModuleDef, PathResolution,
-    StructKind,
-};
+use hir::{Adt, AsAssocItem as _, GenericDef, InFile, ModuleDef, PathResolution, StructKind};
 use syntax::{
-    AstNode, TextRange,
-    ast::{self, HasGenericArgs as _, HasName as _},
+    TextRange,
+    view::{self as ast, AstNode as _, HasGenericArgs as _, HasName as _},
 };
 
 use crate::{
-    cx::{Cx, def_range},
+    cx::{Cx, def_range_view as def_range},
     lower::{
         Found,
         incorrect_generics_len::{Segment, def_name_span, phase_at, s, site_fact, takes_none},
@@ -42,7 +39,7 @@ enum ArgKind {
 
 /// A segment of the path, the path up to it, and what that resolves to.
 struct Seg<'db> {
-    segment: ast::PathSegment,
+    segment: ast::PathSegment<'db>,
     res: Option<PathResolution<'db>>,
 }
 
@@ -57,9 +54,9 @@ enum Extend {
 }
 
 /// The segments of `top`, first to last, each with what the path up to it resolves to.
-fn segments<'db>(cx: &Cx<'_, 'db>, top: &ast::Path) -> Vec<Seg<'db>> {
-    let mut paths = Vec::new();
-    let mut at = Some(top.clone());
+fn segments<'db>(cx: &Cx<'_, 'db>, top: ast::Path<'db>) -> Vec<Seg<'db>> {
+    let mut paths = Vec::new(); // alloc: the path's prefixes, on the error path
+    let mut at = Some(top);
     while let Some(path) = at {
         at = path.qualifier();
         paths.push(path);
@@ -69,25 +66,25 @@ fn segments<'db>(cx: &Cx<'_, 'db>, top: &ast::Path) -> Vec<Seg<'db>> {
         .into_iter()
         .filter_map(|prefix| {
             let segment = prefix.segment()?;
-            Some(Seg { segment, res: cx.sema.resolve_path(&prefix) })
+            Some(Seg { segment, res: cx.vsema.resolve_path(prefix) })
         })
-        .collect()
+        .collect() // alloc: the path's segments, on the error path
 }
 
-fn has_args(segment: &ast::PathSegment) -> bool {
+fn has_args(segment: ast::PathSegment<'_>) -> bool {
     segment.generic_arg_list().is_some() || segment.parenthesized_arg_list().is_some()
 }
 
 /// The generic arguments of a segment, constraints left out: rustc's `GenericArgs::args`, the
 /// inputs of `Fn`-style ones a tuple type.
-fn args(segment: &ast::PathSegment) -> Vec<(ArgKind, TextRange)> {
+fn args(segment: ast::PathSegment<'_>) -> Vec<(ArgKind, TextRange)> {
     if let Some(list) = segment.parenthesized_arg_list() {
-        return vec![(ArgKind::Type, list.syntax().text_range())];
+        return vec![(ArgKind::Type, list.syntax().text_range())]; // alloc: on the error path
     }
-    let Some(list) = segment.generic_arg_list() else { return Vec::new() };
+    let Some(list) = segment.generic_arg_list() else { return Vec::new() }; // alloc: empty
     list.generic_args()
         .filter_map(|arg| {
-            let kind = match &arg {
+            let kind = match arg {
                 ast::GenericArg::AssocTypeArg(_) => return None,
                 ast::GenericArg::LifetimeArg(_) => ArgKind::Lifetime,
                 ast::GenericArg::ConstArg(_) => ArgKind::Const,
@@ -98,7 +95,7 @@ fn args(segment: &ast::PathSegment) -> Vec<(ArgKind, TextRange)> {
             };
             Some((kind, arg.syntax().text_range()))
         })
-        .collect()
+        .collect() // alloc: a segment's arguments, on the error path
 }
 
 fn is_trait_self(cx: &Cx<'_, '_>, param: hir::TypeParam) -> bool {
@@ -106,7 +103,7 @@ fn is_trait_self(cx: &Cx<'_, '_>, param: hir::TypeParam) -> bool {
 }
 
 /// Whether `path` is of a value: an expression or a pattern that is not a struct's.
-fn in_value(path: &ast::Path) -> bool {
+fn in_value(path: ast::Path<'_>) -> bool {
     path.syntax().parent().is_some_and(|it| {
         ast::PathExpr::can_cast(it.kind())
             || ast::PathPat::can_cast(it.kind())
@@ -120,22 +117,22 @@ fn is_enum(res: &Option<PathResolution<'_>>) -> bool {
 
 /// The segments rustc allows arguments on for a variant: its enum's when the enum has them,
 /// else the variant's.
-fn variant_allowed(segs: &[Seg]) -> Vec<usize> {
+fn variant_allowed(segs: &[Seg<'_>]) -> Vec<usize> {
     let last = segs.len() - 1;
     match last.checked_sub(1) {
-        Some(i) if has_args(&segs[i].segment) && is_enum(&segs[i].res) => vec![i],
-        _ => vec![last],
+        Some(i) if has_args(segs[i].segment) && is_enum(&segs[i].res) => vec![i], // alloc: error path
+        _ => vec![last], // alloc: on the error path
     }
 }
 
 /// The segments rustc checks together, the ones that may have arguments among them, and its
 /// extension of the error.
-fn checked(cx: &Cx<'_, '_>, segs: &[Seg], value: bool) -> (Vec<usize>, Extend) {
+fn checked(cx: &Cx<'_, '_>, segs: &[Seg<'_>], value: bool) -> (Vec<usize>, Extend) {
     let db = cx.db;
     let last = segs.len() - 1;
-    let all: Vec<usize> = (0..segs.len()).collect();
+    let all: Vec<usize> = (0..segs.len()).collect(); // alloc: on the error path
     let but = |allowed: Vec<usize>| -> Vec<usize> {
-        (0..segs.len()).filter(|it| !allowed.contains(it)).collect()
+        (0..segs.len()).filter(|it| !allowed.contains(it)).collect() // alloc: on the error path
     };
     let last_seg = &segs[last];
     let is_self = last_seg.segment.self_type_token().is_some();
@@ -148,17 +145,19 @@ fn checked(cx: &Cx<'_, '_>, segs: &[Seg], value: bool) -> (Vec<usize>, Extend) {
                 (but(variant_allowed(segs)), Extend::DefVariant)
             }
             Some(PathResolution::Def(ModuleDef::Function(it))) if it.as_assoc_item(db).is_some() => {
+                // alloc: on the error path
                 (but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()), Extend::None)
             }
             Some(PathResolution::Def(ModuleDef::Const(it))) if it.as_assoc_item(db).is_some() => {
+                // alloc: on the error path
                 (but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()), Extend::None)
             }
-            _ => (but(vec![last]), Extend::None),
+            _ => (but(vec![last]), Extend::None), // alloc: on the error path
         };
     }
     match &last_seg.res {
         Some(PathResolution::TypeParam(it)) if is_trait_self(cx, *it) => {
-            let single = segs.len() == 1 && has_args(&last_seg.segment);
+            let single = segs.len() == 1 && has_args(last_seg.segment);
             (all, if single { Extend::SelfTyParam } else { Extend::None })
         }
         Some(PathResolution::TypeParam(it)) => (all, Extend::Param(*it)),
@@ -167,35 +166,41 @@ fn checked(cx: &Cx<'_, '_>, segs: &[Seg], value: bool) -> (Vec<usize>, Extend) {
             (all, Extend::SelfTyAlias(Either::Right(*it)))
         }
         Some(PathResolution::Def(ModuleDef::BuiltinType(it))) => {
+            // alloc: a name for the error
             (all, Extend::PrimTy(it.name().display(db, cx.edition).to_string()))
         }
         Some(PathResolution::Def(ModuleDef::EnumVariant(_))) => {
             (but(variant_allowed(segs)), Extend::DefVariant)
         }
         Some(PathResolution::Def(ModuleDef::TypeAlias(it))) if it.as_assoc_item(db).is_some() => {
+            // alloc: on the error path
             (but([last.checked_sub(1), Some(last)].into_iter().flatten().collect()), Extend::None)
         }
-        _ => (but(vec![last]), Extend::None),
+        _ => (but(vec![last]), Extend::None), // alloc: on the error path
     }
 }
 
 /// rustc's `Res::descr`, with the name of a definition: "module `m`", "builtin type `u8`".
-fn what(cx: &Cx<'_, '_>, seg: &Seg, value_last: bool) -> String {
+fn what(cx: &Cx<'_, '_>, seg: &Seg<'_>, value_last: bool) -> String {
     let db = cx.db;
+    // alloc: a label of the error
     let named = |descr: &str, name: hir::Name| format!("{descr} `{}`", name.display(db, cx.edition));
     match &seg.res {
-        None => "this type".to_owned(),
-        Some(PathResolution::Local(_)) => "local variable".to_owned(),
+        None => "this type".to_owned(), // alloc: a label of the error
+        Some(PathResolution::Local(_)) => "local variable".to_owned(), // alloc: a label of the error
+        // alloc: a label of the error
         Some(PathResolution::SelfType(_)) if value_last => "self constructor".to_owned(),
-        Some(PathResolution::SelfType(_)) => "self type".to_owned(),
+        Some(PathResolution::SelfType(_)) => "self type".to_owned(), // alloc: a label of the error
+        // alloc: a label of the error
         Some(PathResolution::TypeParam(it)) if is_trait_self(cx, *it) => "self type".to_owned(),
         Some(PathResolution::TypeParam(it)) => named("type parameter", it.name(db)),
         Some(PathResolution::ConstParam(it)) => named("const parameter", it.name(db)),
         Some(PathResolution::Def(def)) => match def {
+            // alloc: a label of the error
             ModuleDef::Adt(_) if seg.segment.self_type_token().is_some() => "self type".to_owned(),
             ModuleDef::Module(it) => match it.name(db) {
                 Some(name) => named("module", name),
-                None => "module".to_owned(),
+                None => "module".to_owned(), // alloc: a label of the error
             },
             ModuleDef::Adt(Adt::Struct(it)) => named("struct", it.name(db)),
             ModuleDef::Adt(Adt::Enum(it)) => named("enum", it.name(db)),
@@ -216,7 +221,7 @@ fn what(cx: &Cx<'_, '_>, seg: &Seg, value_last: bool) -> String {
                 let descr = if it.as_assoc_item(db).is_some() { "associated constant" } else { "constant" };
                 match it.name(db) {
                     Some(name) => named(descr, name),
-                    None => descr.to_owned(),
+                    None => descr.to_owned(), // alloc: a label of the error
                 }
             }
             ModuleDef::Static(it) => named("static", it.name(db)),
@@ -228,20 +233,20 @@ fn what(cx: &Cx<'_, '_>, seg: &Seg, value_last: bool) -> String {
             ModuleDef::BuiltinType(it) => named("builtin type", it.name()),
             ModuleDef::Macro(it) => named("macro", it.name(db)),
         },
-        Some(_) => "this type".to_owned(),
+        Some(_) => "this type".to_owned(), // alloc: a label of the error
     }
 }
 
-fn listify(list: &[String]) -> String {
+fn listify(list: &[&str]) -> String {
     match list {
-        [only] => only.clone(),
-        [others @ .., last] => format!("{} and {last}", others.join(", ")),
-        [] => String::new(),
+        [only] => (*only).to_owned(), // alloc: the error's message
+        [others @ .., last] => format!("{} and {last}", others.join(", ")), // alloc: the message
+        [] => String::new(), // alloc: empty, allocates nothing
     }
 }
 
 /// From the end of the segment's name to the end of its arguments: `::<T>`, `<T>`, `(A)`.
-fn args_after_name(segment: &ast::PathSegment) -> Option<TextRange> {
+fn args_after_name(segment: ast::PathSegment<'_>) -> Option<TextRange> {
     let start = segment.name_ref()?.syntax().text_range().end();
     let end = match (segment.generic_arg_list(), segment.parenthesized_arg_list()) {
         (Some(list), _) => list.syntax().text_range().end(),
@@ -256,7 +261,7 @@ fn args_after_name(segment: &ast::PathSegment) -> Option<TextRange> {
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Found> {
     let db = cx.db;
-    let node = cx.node(d.args);
+    let node = cx.node_view(d.args);
     let file = node.file_id;
     let span = |range: TextRange| cx.span(InFile::new(file, range));
     let owner = node.value.syntax().parent().and_then(ast::PathSegment::cast);
@@ -265,13 +270,13 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
         let mut diag = Diag::error(Some("E0109"), "type arguments are not allowed on this type", span(range));
         diag.span_label(span(range), "type argument not allowed");
         site_fact(cx, &mut diag, InFile::new(file, node.value.syntax()));
-        return vec![Found::new(diag, phase_at(node.value.syntax()))];
+        return vec![Found::new(diag, phase_at(node.value.syntax()))]; // alloc: the error found
     };
     let top = segment.parent_path().top_path();
-    let value = in_value(&top);
-    let segs = segments(cx, &top);
+    let value = in_value(top);
+    let segs = segments(cx, top);
     let Some(h) = segs.iter().position(|it| it.segment.syntax() == segment.syntax()) else {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     };
     let last = segs.len() - 1;
 
@@ -279,11 +284,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
     if value && h == last {
         let found = match &segs[last].res {
             Some(PathResolution::Def(ModuleDef::Static(it))) => {
-                Segment::of_node(file, segment.syntax().clone(), None)
+                Segment::of_node(file, segment.syntax(), None)
                     .map(|seg| takes_none(cx, &seg, GenericDef::Static(*it), None))
             }
             Some(PathResolution::ConstParam(it)) => {
-                Segment::of_node(file, segment.syntax().clone(), None)
+                Segment::of_node(file, segment.syntax(), None)
                     .map(|seg| takes_none(cx, &seg, it.parent(db), Some(*it)))
             }
             _ => None,
@@ -296,21 +301,22 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
     let (checked, extend) = checked(cx, &segs, value);
     let (checked, extend) = match checked.contains(&h) {
         true => (checked, extend),
-        false => (vec![h], Extend::None),
+        false => (vec![h], Extend::None), // alloc: on the error path
     };
-    let with_args: Vec<usize> = checked.iter().copied().filter(|&i| has_args(&segs[i].segment)).collect();
+    // alloc: on the error path
+    let with_args: Vec<usize> = checked.iter().copied().filter(|&i| has_args(segs[i].segment)).collect();
     // The segments checked together are one error, given with the first.
     if with_args.first() != Some(&h) {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
 
-    let mut found = Vec::new();
-    let mut kinds: Vec<ArgKind> = Vec::new();
-    let mut arg_spans: Vec<TextRange> = Vec::new();
-    let mut types_and_spans: Vec<(String, TextRange)> = Vec::new();
+    let mut found = Vec::new(); // alloc: the errors found
+    let mut kinds: Vec<ArgKind> = Vec::new(); // alloc: for the error's message
+    let mut arg_spans: Vec<TextRange> = Vec::new(); // alloc: the error's spans
+    let mut types_and_spans: Vec<(String, TextRange)> = Vec::new(); // alloc: the error's labels
     for &i in &with_args {
         let seg = &segs[i];
-        let seg_args = args(&seg.segment);
+        let seg_args = args(seg.segment);
         if seg_args.is_empty() {
             continue;
         }
@@ -326,31 +332,30 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
     }
 
     if let Some(&last_span) = arg_spans.last() {
-        let kind_names: Vec<String> = kinds
+        let kind_names: Vec<&str> = kinds
             .iter()
-            .map(|it| {
-                match it {
-                    ArgKind::Lifetime => "lifetime",
-                    ArgKind::Type => "type",
-                    ArgKind::Const => "const",
-                    ArgKind::Infer => "generic",
-                }
-                .to_owned()
+            .map(|it| match it {
+                ArgKind::Lifetime => "lifetime",
+                ArgKind::Type => "type",
+                ArgKind::Const => "const",
+                ArgKind::Infer => "generic",
             })
-            .collect();
+            .collect(); // alloc: for the error's message
         let kind = listify(&kind_names);
-        let this_type = listify(&types_and_spans.iter().map(|(it, _)| it.clone()).collect::<Vec<_>>());
+        // alloc: for the error's message
+        let this_type = listify(&types_and_spans.iter().map(|(it, _)| it.as_str()).collect::<Vec<_>>());
         let mut diag = Diag::error(
             Some("E0109"),
-            format!("{kind} arguments are not allowed on {this_type}"),
+            format!("{kind} arguments are not allowed on {this_type}"), // alloc: the error's message
             span(arg_spans[0]),
         );
         for range in &arg_spans[1..] {
             diag.primary(span(*range));
         }
+        // alloc: the error's label
         diag.span_label(span(last_span), format!("{kind} argument{} not allowed", s(kinds.len())));
         for (what, range) in &types_and_spans {
-            diag.span_label(span(*range), format!("not allowed on {what}"));
+            diag.span_label(span(*range), format!("not allowed on {what}")); // alloc: its label
         }
         extend_err(cx, &mut diag, &segs, &checked, extend, file);
         site_fact(cx, &mut diag, InFile::new(file, segment.syntax()));
@@ -379,7 +384,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericArgsProhibited) -> Vec<Foun
 fn extend_err(
     cx: &Cx<'_, '_>,
     diag: &mut Diag,
-    segs: &[Seg],
+    segs: &[Seg<'_>],
     checked: &[usize],
     extend: Extend,
     file: hir::HirFileId,
@@ -389,17 +394,18 @@ fn extend_err(
     match extend {
         Extend::None => {}
         Extend::Param(param) => {
-            let Some(src) = param.merge().source(db) else { return };
-            let Either::Left(ast::TypeOrConstParam::Type(it)) = &src.value else { return };
+            let Some(src) = cx.vsema.source(param.merge()) else { return };
+            let Either::Left(ast::TypeOrConstParam::Type(it)) = src.value else { return };
             let Some(name) = it.name() else { return };
             let at = cx.span(src.with_value(name.syntax().text_range()));
             diag.span_note(
                 at,
+                // alloc: the note
                 format!("type parameter `{}` defined here", param.name(db).display(db, cx.edition)),
             );
         }
         Extend::SelfTyParam => {
-            let Some(range) = args_after_name(&segs[0].segment) else { return };
+            let Some(range) = args_after_name(segs[0].segment) else { return };
             diag.suggestion_verbose(
                 span(range),
                 "the `Self` type doesn't accept type parameters",
@@ -409,9 +415,10 @@ fn extend_err(
         }
         Extend::PrimTy(name) => {
             for &i in checked {
-                let Some(range) = args_after_name(&segs[i].segment) else { continue };
+                let Some(range) = args_after_name(segs[i].segment) else { continue };
                 diag.suggestion_verbose(
                     span(range),
+                    // alloc: the suggestion's message
                     format!("primitive type `{name}` doesn't have generic parameters"),
                     "",
                     Applicability::MaybeIncorrect,
@@ -428,8 +435,8 @@ fn extend_err(
                             | Some(PathResolution::Def(ModuleDef::Adt(Adt::Enum(_))))
                     )
                 })
-                .filter_map(|it| args_after_name(&it.segment))
-                .collect();
+                .filter_map(|it| args_after_name(it.segment))
+                .collect(); // alloc: on the error path
             if args.len() > 1
                 && let Some(&range) = args.last()
             {
@@ -448,18 +455,17 @@ fn extend_err(
         Extend::SelfTyAlias(of) => {
             let (ty, impl_span) = match of {
                 Either::Left(impl_) => {
-                    let impl_span = impl_
-                        .source(db)
-                        .map(|src| cx.span(src.as_ref().map(|it| def_range(it.syntax()))));
+                    let impl_span =
+                        cx.vsema.source(impl_).map(|src| cx.span(src.map(|it| def_range(it.syntax()))));
                     (impl_.self_ty(db), impl_span)
                 }
                 Either::Right(adt) => (adt.ty(db), None),
             };
             let Some(adt) = ty.as_adt() else { return };
-            let type_name = adt.name(db).display(db, cx.edition).to_string();
+            let type_name = adt.name(db).display(db, cx.edition).to_string(); // alloc: for the note
             let ty_span = def_name_span(cx, GenericDef::Adt(adt));
             let generics = GenericDef::Adt(adt).params(db).len();
-            let msg = format!("`Self` is of type `{}`", cx.ty(&ty));
+            let msg = format!("`Self` is of type `{}`", cx.ty(&ty)); // alloc: the note
             match (impl_span, ty_span) {
                 (Some(impl_span), Some(ty_span)) => {
                     let postfix = match generics {
@@ -467,9 +473,12 @@ fn extend_err(
                         _ => "",
                     };
                     let spans = MultiSpan {
-                        primary: vec![ty_span.clone()],
+                        primary: vec![ty_span.clone()], // clone: the note's span; alloc: its spans
+                        // alloc: the note's labels
                         labels: vec![
+                            // alloc: the note's label
                             (impl_span, format!("`Self` is on type `{type_name}` in this `impl`")),
+                            // alloc: the note's label
                             (ty_span, format!("`Self` corresponds to this type{postfix}")),
                         ],
                     };
@@ -483,7 +492,7 @@ fn extend_err(
                 if seg.segment.self_type_token().is_none() {
                     continue;
                 }
-                let Some(range) = args_after_name(&seg.segment) else { continue };
+                let Some(range) = args_after_name(seg.segment) else { continue };
                 if generics == 0 {
                     diag.suggestion_verbose(
                         span(range),
@@ -496,11 +505,12 @@ fn extend_err(
                 let Some(token) = seg.segment.self_type_token() else { continue };
                 diag.suggestion_verbose(
                     span(token.text_range()),
+                    // alloc: the suggestion's message
                     format!(
                         "the `Self` type doesn't accept type parameters, use the concrete type's \
                          name `{type_name}` instead if you want to specify its type parameters"
                     ),
-                    type_name.clone(),
+                    type_name.clone(), // clone: the suggestion's text
                     Applicability::MaybeIncorrect,
                 );
             }

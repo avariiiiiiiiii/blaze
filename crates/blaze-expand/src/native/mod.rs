@@ -1,6 +1,7 @@
 //! blaze's in-process proc-macro bridge: the `proc_macro` a macro's own code runs against
-//! (`proc_macro/`, blaze's WebAssembly guest's with its imports answered in process) and the
-//! host that answers it ([`host`]), for the proc macros that run on blaze's own compiler
+//! (`proc_macro/`, blaze's WebAssembly guest's with its imports answered in process by its
+//! `__native::Host`) and what answers that host's questions of the database and the lexer
+//! ([`host`]), for the proc macros that run on blaze's own compiler
 //! (docs/v2/plan/design/compile-time.md, change 20). A macro sees what it sees as a module:
 //! the same span words (of the def, call and mixed sites' parts, then the input's and the
 //! attribute's as they first appear, as [`Parts`] gives them), the same answers to what
@@ -25,7 +26,6 @@ pub use native_proc_macro::TokenStream;
 use span::Span;
 use tt::{Leaf, TokenTree, TopSubtree};
 
-use self::host::Host;
 use crate::bridge::wire::Parts;
 
 /// A macro's entry point, compiled against the bridge's `proc_macro`.
@@ -60,7 +60,8 @@ pub fn expand(
     // As the wasm host gives them out: the sites' first, then the input's and the
     // attribute's (`expand1` and `expand2`).
     let sites = [def_site, call_site, mixed_site].map(|span| parts.pack(span));
-    let mut host = Host { db, parts: &mut parts, sites };
+    let mut ask = host::Ask { db };
+    let mut host = native_proc_macro::__native::Host { parts: &mut parts, sites, ask: &mut ask };
     // rust-analyzer gives an attribute written without arguments (`#[tokio::main]`) none,
     // which the macro is given as an empty stream.
     let ran = native_proc_macro::__native::with_host(&mut host, || match expander {
@@ -144,11 +145,12 @@ fn tree_difference(ours: &TokenTree, theirs: &TokenTree) -> Option<String> {
     }
 }
 
+fn differs(what: &str, a: impl std::fmt::Debug, b: impl std::fmt::Debug) -> Option<String> {
+    // alloc: the message of a difference, made only when there is one.
+    Some(format!("its {what} is {a:?} natively and {b:?} by the macro"))
+}
+
 fn leaf_difference(ours: &Leaf, theirs: &Leaf) -> Option<String> {
-    let differs = |what: &str, a: &dyn std::fmt::Debug, b: &dyn std::fmt::Debug| {
-        // alloc: the message of a difference, made only when there is one.
-        Some(format!("its {what} is {a:?} natively and {b:?} by the macro"))
-    };
     match (ours, theirs) {
         (Leaf::Ident(a), Leaf::Ident(b)) => {
             if a.sym != b.sym {

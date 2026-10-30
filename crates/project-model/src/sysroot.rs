@@ -234,7 +234,6 @@ impl Sysroot {
         &self,
         sysroot_source_config: &RustSourceWorkspaceConfig,
         no_deps: bool,
-        progress: &dyn Fn(String),
     ) -> Result<Option<RustLibSrcWorkspace>> {
         assert!(matches!(self.workspace, RustLibSrcWorkspace::Empty), "workspace already loaded");
         let Self { root: _, rust_lib_src_root: Some(src_root), workspace: _, error: _ } = self
@@ -260,7 +259,6 @@ impl Sysroot {
                     src_root,
                     cargo_config,
                     no_deps,
-                    progress,
                 ) {
                     Ok(loaded) => return Ok(Some(loaded)),
                     Err(e) => {
@@ -393,7 +391,6 @@ impl Sysroot {
         current_dir: &AbsPath,
         cargo_config: &CargoMetadataConfig,
         no_deps: bool,
-        progress: &dyn Fn(String),
     ) -> Result<RustLibSrcWorkspace> {
         tracing::debug!("Loading library metadata: {library_manifest}");
         let mut cargo_config = cargo_config.clone();
@@ -407,7 +404,7 @@ impl Sysroot {
         let locked = true;
         let (res, err) =
             FetchMetadata::new(library_manifest, current_dir, &cargo_config, self, no_deps)
-                .exec(locked, progress)?;
+                .exec(locked)?;
         Ok(Self::library_workspace(res, library_manifest, err))
     }
 

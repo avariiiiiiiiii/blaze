@@ -1,6 +1,6 @@
 //! The key map of an interned ingredient: per shard, a SwissTable read with no lock.
 //!
-//! Ported from `crates/intern/src/arena.rs` (salsa can't depend on `intern`), the SwissTable
+//! Probed with `blaze_mem::swiss`, the SwissTable
 //! layout of docs/v2/plan/design/hardware.md, "interner and memo lookups": slots in groups of
 //! seven, each group one cache line holding a control word of tag bytes and the seven value
 //! pointers. Only the holder of a shard's lock writes, and each slot of a table at most once to
@@ -8,9 +8,9 @@
 //! reader that loads the control word with `Acquire` and sees the tag sees the slot and the
 //! value's bytes behind it.
 //!
-//! Interned values are reused, so a key can leave: its tag becomes [`DEAD`], which probes walk
-//! past and nothing refills in that table. A reader that loaded the tag before it died still
-//! reads the pointer it was published with, which stays a live value of the ingredient.
+//! Interned values are reused, so a key can leave: its tag becomes [`swiss::DEAD`], which probes
+//! walk past and nothing refills in that table. A reader that loaded the tag before it died
+//! still reads the pointer it was published with, which stays a live value of the ingredient.
 //!
 //! A table grows by copying its live slots into a new one, twice the size (or the same size when
 //! most of its slots are dead), published once full. The tables it outgrew stay readable, as a
@@ -27,6 +27,7 @@
 
 use std::ptr::{self, NonNull};
 
+use blaze_mem::swiss::{self, Ctrl};
 use crossbeam_utils::CachePadded;
 
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
@@ -36,17 +37,11 @@ use crate::sync::{Mutex, MutexGuard};
 /// masked out of every match.
 const GROUP: usize = 7;
 const FIRST_GROUPS: usize = 2;
-const LOW_BITS: u64 = 0x0001_0101_0101_0101;
-const HIGH_BITS: u64 = 0x0080_8080_8080_8080;
-
-/// The tag of a slot whose key left: full, so probes continue past it, and never a key's tag
-/// (those are `0x81..=0xff`).
-const DEAD: u64 = 0x80;
 
 /// Seven slots and their tags in one cache line.
 ///
-/// `ctrl` byte `i` (from the least significant) is slot `i`'s tag: 0 when empty, [`DEAD`] when
-/// its key left, [`tag`] of the key's hash when full.
+/// `ctrl` byte `i` (from the least significant) is slot `i`'s tag: 0 when empty, [`swiss::DEAD`]
+/// when its key left, [`swiss::live_tag`] of the key's hash when full.
 #[repr(C, align(64))]
 struct Group {
     ctrl: AtomicU64,
@@ -69,34 +64,6 @@ struct Groups {
     groups: Box<[Group]>,
     /// The hash of slot `i` (`groups[i / GROUP].slots[i % GROUP]`), written with it.
     hashes: Box<[AtomicU64]>,
-}
-
-/// A key's tag: the hash's top seven bits, `0` folded into `1` so no tag is [`DEAD`].
-#[inline]
-fn tag(hash: u64) -> u64 {
-    0x80 | (hash >> 57).max(1)
-}
-
-/// A byte's high bit set for each slot byte of `word` that may equal `tag`: every equal byte,
-/// and rarely the byte above one (the borrow of the subtraction), which the caller checks.
-#[inline]
-fn matching(word: u64, tag: u64) -> u64 {
-    let x = word ^ (LOW_BITS * tag);
-    x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS
-}
-
-/// A byte's high bit set for each empty slot byte of `word`: full and dead bytes have their
-/// high bit set.
-#[inline]
-fn empty(word: u64) -> u64 {
-    !word & HIGH_BITS
-}
-
-/// A byte's high bit set for each slot byte of `word` holding a key: full, and not [`DEAD`]
-/// (whose low seven bits are all zero). No byte's sum carries into the next.
-#[inline]
-fn live(word: u64) -> u64 {
-    word & HIGH_BITS & ((word & !HIGH_BITS).wrapping_add(LOW_BITS * 0x7f) & HIGH_BITS)
 }
 
 /// A slot whose tag matched a lookup's.
@@ -144,89 +111,45 @@ impl Groups {
         hash: u64,
         matches: &mut impl FnMut(Candidate<'_>) -> bool,
     ) -> Option<NonNull<()>> {
-        let mask = self.groups.len() - 1;
-        let tag = tag(hash);
-        let mut at = hash as usize & mask;
-        loop {
-            let group = &self.groups[at];
-            let word = group.ctrl.load(Ordering::Acquire);
-            let mut hits = matching(word, tag);
-            while hits != 0 {
-                let byte = (hits.trailing_zeros() / 8) as usize;
-                hits &= hits - 1;
-                // A byte matched only by the borrow may be a slot not published in `word`,
-                // which a writer may be filling: only a published tag orders its slot.
-                if (word >> (byte * 8)) & 0xff != tag {
-                    continue;
-                }
-                // Relaxed: the tag's `Acquire` above ordered the slot's writes before us.
-                let value = NonNull::new(group.slots[byte].load(Ordering::Relaxed))
-                    .expect("a published slot holds a value");
-                let candidate = Candidate {
-                    value,
-                    hash: &self.hashes[at * GROUP + byte],
-                };
-                if matches(candidate) {
-                    return Some(value);
-                }
-            }
-            if empty(word) != 0 {
-                return None;
-            }
-            at = (at + 1) & mask;
-        }
+        let ctrl = |at: usize| Ctrl::<GROUP>(self.groups[at].ctrl.load(Ordering::Acquire));
+        swiss::find(hash, swiss::live_tag(hash), self.groups.len(), ctrl, |at| {
+            // Relaxed: the tag's `Acquire` above ordered the slot's writes before us; only tags
+            // published in the loaded word are matched.
+            let value = NonNull::new(self.groups[at.group].slots[at.slot].load(Ordering::Relaxed))
+                .expect("a published slot holds a value");
+            matches(Candidate { value, hash: &self.hashes[at.index()] }).then_some(value)
+        })
     }
 
     /// Fills the first empty slot from `hash`'s home group. Called by the holder of the shard's
     /// lock, the only writer, on a table that stays at most half used.
     fn put(&self, hash: u64, value: NonNull<()>, publish: Ordering) {
-        let mask = self.groups.len() - 1;
-        let mut at = hash as usize & mask;
-        loop {
-            let group = &self.groups[at];
-            let word = group.ctrl.load(Ordering::Relaxed);
-            let free = empty(word);
-            if free != 0 {
-                let byte = (free.trailing_zeros() / 8) as usize;
-                group.slots[byte].store(value.as_ptr(), Ordering::Relaxed);
-                self.hashes[at * GROUP + byte].store(hash, Ordering::Relaxed);
-                group
-                    .ctrl
-                    .store(word | (tag(hash) << (byte * 8)), publish);
-                return;
-            }
-            at = (at + 1) & mask;
-        }
+        let at = swiss::vacant(hash, self.groups.len(), |at: usize| {
+            Ctrl::<GROUP>(self.groups[at].ctrl.load(Ordering::Relaxed))
+        });
+        let group = &self.groups[at.group];
+        group.slots[at.slot].store(value.as_ptr(), Ordering::Relaxed);
+        self.hashes[at.index()].store(hash, Ordering::Relaxed);
+        group.ctrl.store(at.tagged(swiss::live_tag(hash)).0, publish);
     }
 
     /// Marks dead the slot holding `value` under `hash`; `false` if there is none. Called by
     /// the holder of the shard's lock.
     fn kill(&self, hash: u64, value: NonNull<()>) -> bool {
-        let mask = self.groups.len() - 1;
-        let tag = tag(hash);
-        let mut at = hash as usize & mask;
-        loop {
-            let group = &self.groups[at];
-            let word = group.ctrl.load(Ordering::Relaxed);
-            let mut hits = matching(word, tag);
-            while hits != 0 {
-                let byte = (hits.trailing_zeros() / 8) as usize;
-                hits &= hits - 1;
-                let shift = byte * 8;
-                if (word >> shift) & 0xff == tag
-                    && group.slots[byte].load(Ordering::Relaxed) == value.as_ptr()
-                    && self.hashes[at * GROUP + byte].load(Ordering::Relaxed) == hash
-                {
-                    let dead = (word & !(0xff << shift)) | (DEAD << shift);
-                    group.ctrl.store(dead, Ordering::Release);
-                    return true;
-                }
-            }
-            if empty(word) != 0 {
-                return false;
-            }
-            at = (at + 1) & mask;
-        }
+        let ctrl = |at: usize| Ctrl::<GROUP>(self.groups[at].ctrl.load(Ordering::Relaxed));
+        let found = swiss::find(hash, swiss::live_tag(hash), self.groups.len(), ctrl, |at| {
+            let same = self.groups[at.group].slots[at.slot].load(Ordering::Relaxed)
+                == value.as_ptr()
+                && self.hashes[at.index()].load(Ordering::Relaxed) == hash;
+            same.then_some(at)
+        });
+        let Some(at) = found else {
+            return false;
+        };
+        self.groups[at.group]
+            .ctrl
+            .store(at.tagged(swiss::DEAD).0, Ordering::Release);
+        true
     }
 }
 
@@ -435,10 +358,7 @@ impl<S> Locked<'_, S> {
         if let Some(old) = current {
             // Relaxed: every write to the table was made by a holder of the lock we hold.
             for (at, group) in old.groups.iter().enumerate() {
-                let mut keys = live(group.ctrl.load(Ordering::Relaxed));
-                while keys != 0 {
-                    let byte = (keys.trailing_zeros() / 8) as usize;
-                    keys &= keys - 1;
+                for byte in Ctrl::<GROUP>(group.ctrl.load(Ordering::Relaxed)).live() {
                     let hash = old.hashes[at * GROUP + byte].load(Ordering::Relaxed);
                     let value = NonNull::new(group.slots[byte].load(Ordering::Relaxed))
                         .expect("a live slot holds a value");
@@ -685,59 +605,5 @@ mod tests {
         }
         let len: usize = (0..SHARDS).map(|shard| table.lock(shard).len()).sum();
         assert_eq!(len, one.len());
-    }
-
-    #[test]
-    fn tags_are_never_dead() {
-        for top in 0..128u64 {
-            let tag = tag(top << 57);
-            assert!((0x81..=0xff).contains(&tag), "{tag:x}");
-        }
-    }
-
-    #[test]
-    fn matching_finds_every_equal_byte() {
-        for tag in [0x81u64, 0x82, 0xfe, 0xff] {
-            for slots in 0..=127u64 {
-                let mut word = 0;
-                let mut want = 0;
-                for byte in 0..GROUP {
-                    if slots & (1 << byte) != 0 {
-                        word |= tag << (byte * 8);
-                        want |= 0x80 << (byte * 8);
-                    } else if byte % 3 == 0 {
-                        word |= (tag ^ 1) << (byte * 8);
-                    } else if byte % 3 == 1 {
-                        word |= DEAD << (byte * 8);
-                    }
-                }
-                let hits = matching(word, tag);
-                assert_eq!(hits & want, want, "{word:x} {tag:x}");
-                assert_eq!(hits & !HIGH_BITS, 0, "only slot bytes match");
-            }
-        }
-        assert_eq!(empty(0x0000_ff00_0081_0000), 0x0080_0080_8000_8080);
-        assert_eq!(empty(0x00ff_ffff_ffff_ffff), 0, "byte 7 is never a free slot");
-        assert_eq!(empty(0x0000_0000_0000_0080), 0x0080_8080_8080_8000, "dead is not free");
-    }
-
-    #[test]
-    fn live_skips_empty_and_dead() {
-        for word in [
-            0u64,
-            0x0000_0000_0000_0080,
-            0x0081_80ff_0000_8082,
-            0x00ff_ffff_ffff_ffff,
-            0x0080_8080_8080_8080,
-        ] {
-            let mut want = 0;
-            for byte in 0..GROUP {
-                let b = (word >> (byte * 8)) & 0xff;
-                if b & 0x80 != 0 && b != DEAD {
-                    want |= 0x80 << (byte * 8);
-                }
-            }
-            assert_eq!(live(word), want, "{word:x}");
-        }
     }
 }

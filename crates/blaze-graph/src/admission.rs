@@ -371,15 +371,6 @@ impl Predict for Estimates {
     }
 }
 
-/// A task's arena: where everything the task allocates while it runs goes, so its peak is
-/// measured and its results, once written into the zero-copy format, outlive it.
-pub trait Arena {
-    /// The most bytes it held at once.
-    fn peak(&self) -> u64;
-    /// The bytes it holds now.
-    fn held(&self) -> u64;
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;

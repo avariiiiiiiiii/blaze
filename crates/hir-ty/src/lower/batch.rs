@@ -374,6 +374,7 @@ fn crate_impl_self_tys_cycle<'db>(
     let error = StoredEarlyBinder::bind_no_rigid_aliases(
         Ty::new_error(DbInterner::new_no_crate(db), ErrorGuaranteed).store(),
     );
+    // clone: an interned row, on a cycle only code rustc rejects reaches
     Batch::filled(&module_impls(db, krate, std::alloc::Global), || error.clone())
 }
 
@@ -422,7 +423,7 @@ fn crate_impl_predicates_cycle<'db>(
 ) -> CrateImplPredicates<'db> {
     let empty = StoredEarlyBinder::bind_no_rigid_aliases(Clauses::empty().store());
     Batch::filled(&module_impls(db, krate, std::alloc::Global), || {
-        GenericPredicates::from_explicit_own_predicates(empty.clone())
+        GenericPredicates::from_explicit_own_predicates(empty.clone()) // clone: an interned row, on a cycle
     })
 }
 

@@ -200,3 +200,36 @@ and substitute the generic arguments in every type, constant and argument list.
 STATUS of this section: the bounds are written; one gap closed (the `Assert` overflow query);
 the evaluator's decoded bodies, monomorphization's memo and the runnable bitset are the next
 changes, in that order; MIR lowering's two gaps are requests to hir-ty.
+
+## codegen-api-roots: a unit's roots (`crates/hir-ty-codegen/v2/roots.rs`, `v2/roots/`)
+
+**Work.** Once a unit a build: choose what it starts from. For a program, the C `main`, the
+allocator shim and every linked crate's kept symbols; for a library, what another crate names;
+for a test harness, the tests, listed and checked against the harness in the root file, and
+for each whether it reaches a process, the network or assembly.
+
+- **Kept symbols.** A walk of every item of a crate, bodies' block scopes included, which is
+  work the front end did to build the def maps. **Bound:** a probe of the attribute flags per
+  item (about 20 cycles), done once a crate a revision: `kept` is a salsa query, so a warm
+  build of a program over the standard library reads a memo per crate, about 50 ns each.
+  **Where the code is:** at the bound; the cold walk is one pass, and the attribute flags are
+  hir-def's own memo.
+- **The test listing.** One pass over the crate's modules (the walk above) plus, per test,
+  its attributes' syntax and the line of its name. **Bound:** the tests' count times a
+  syntax-tree lookup (about 1 µs), so 1 ms for a thousand tests. **Where the code is:**
+  at the bound for the read; it runs twice a unit (`harness` writes the text, `roots` checks
+  its digest), both on the same memoized syntax, so within 2× of it. Gap: a salsa query of
+  the listing would make the second free and a warm unchanged crate free; small, next.
+- **`outside`.** Tarjan's over the program's reference graph, one visit a function or static
+  and one hash probe an edge. Each node's references are `refs::walked`'s memo, the same walk
+  the build does. **Bound:** the edges' count times a probe (about 25 cycles): for 50 000
+  instances of 10 references, about 5 ms on one core. **Where the code is:** the walk is
+  linear, but it copies each node's references (`into_owned`, an allocation a node) and keys
+  its map by the instance (a hash of its arguments a probe), about 2 to 3× the bound; and a
+  static's references come from evaluating it, which the build does too. **What removes it:**
+  the build's own walk answering it (`Built::reached` with the classifier as it places a
+  symbol), which makes it free: the walk is paid once. That needs the driver's reached set
+  (codegen-api-link's), so it is the next change after it lands.
+
+STATUS of this section: the bounds are written; kept symbols are at the bound, the listing
+within 2×, `outside` 2 to 3× until it folds into the build's walk.

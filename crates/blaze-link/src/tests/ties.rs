@@ -134,7 +134,7 @@ fn start(calls: &[&str]) -> blaze_codegen::CompiledFunction {
 /// What a full link of `object` and a `_start` calling `calls` gives: the counters' bytes, the
 /// PC table's `(pc, flags)` entries, each called function's address, and how many native
 /// sections the image has.
-fn linked(object: &[u8], calls: &[&str]) -> (Vec<u8>, Vec<(u64, u64)>, Vec<u64>, usize) {
+fn linked(object: &std::sync::Arc<[u8]>, calls: &[&str]) -> (Vec<u8>, Vec<(u64, u64)>, Vec<u64>, usize) {
     let start = start(calls);
     let mut image = Image::new(name(TO), output(false)).unwrap();
     let mut disk = Disk::default();
@@ -170,7 +170,7 @@ fn entries(functions: &[(&Covered, u64)]) -> Vec<(u64, u64)> {
 fn a_dropped_function_s_counters_and_pcs_go_with_it_and_the_rest_keep_its_order() {
     // Counters written c, b, a and PC tables c, a, b: the image has them in the order of the
     // functions' sections, a then c, not their own.
-    let object = object(&[A, B, C], &[2, 1, 0], &[2, 0, 1]);
+    let object: std::sync::Arc<[u8]> = object(&[A, B, C], &[2, 1, 0], &[2, 0, 1]).into();
     let (counters, pcs, called, natives) = linked(&object, &["a", "c"]);
     let (a, c) = (called[0], called[1]);
     assert_eq!(counters, [A.counters, C.counters].concat(), "b's counter is gone; a's come first");
@@ -181,7 +181,7 @@ fn a_dropped_function_s_counters_and_pcs_go_with_it_and_the_rest_keep_its_order(
 
 #[test]
 fn every_function_kept_keeps_every_entry_in_the_functions_order() {
-    let object = object(&[A, B, C], &[2, 1, 0], &[1, 2, 0]);
+    let object: std::sync::Arc<[u8]> = object(&[A, B, C], &[2, 1, 0], &[1, 2, 0]).into();
     let (counters, pcs, called, natives) = linked(&object, &["c", "a", "b"]);
     let (c, a, b) = (called[0], called[1], called[2]);
     assert_eq!(counters, [A.counters, B.counters, C.counters].concat());
@@ -191,7 +191,7 @@ fn every_function_kept_keeps_every_entry_in_the_functions_order() {
 
 #[test]
 fn a_tied_section_keeps_nothing_alive_by_itself() {
-    let object = object(&[A, B, C], &[0, 1, 2], &[0, 1, 2]);
+    let object: std::sync::Arc<[u8]> = object(&[A, B, C], &[0, 1, 2], &[0, 1, 2]).into();
     let (counters, pcs, called, natives) = linked(&object, &["b"]);
     assert_eq!(counters, B.counters);
     assert_eq!(pcs, entries(&[(&B, called[0])]));
@@ -210,6 +210,7 @@ fn link_order_to_a_section_the_link_leaves_out_is_an_error() {
     b.append_section_data(counters, &[0], 1);
     let mut bytes = b.write().unwrap();
     link(&mut bytes, "__sancov_cntrs", 0, ".debug_a");
+    let bytes: std::sync::Arc<[u8]> = bytes.into();
     let start = function(1, &returns(0), Vec::new());
     let mut image = Image::new(name(TO), output(false)).unwrap();
     let change = Change {

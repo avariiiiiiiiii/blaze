@@ -15,7 +15,8 @@
 
 use std::sync::Arc;
 
-use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Reloc, Static, Target, Unwind};
+use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Relocs, Static, Target, Unwind};
+use blaze_format::cursor::{self, Reader};
 use blaze_ids::{Hasher, radix};
 use blaze_mem::Frame;
 use rayon::prelude::*;
@@ -34,6 +35,9 @@ use crate::{Change, Format, LinkError, Output};
 
 const CIE_DOMAIN: &str = "blaze v2 link cie 1";
 
+/// The relocations of a zeroed static.
+static NO_RELOCS: Relocs = Relocs::new();
+
 /// SanitizerCoverage's sections as LLVM's `getSectionName` names them in each format: the
 /// counters, flags and guards (one array per covered function each), then the PC table.
 const SANCOV_ELF: [&str; 4] = ["__sancov_cntrs", "__sancov_bools", "__sancov_guards", "__sancov_pcs"];
@@ -42,6 +46,10 @@ const SANCOV_MACHO: [&str; 4] =
 const SANCOV_COFF: [&str; 4] = [".SCOV$CM", ".SCOV$BM", ".SCOV$GM", ".SCOVP$M"];
 /// [`Stage::sancov`]'s index of the PC table, after the arrays.
 const SANCOV_PCS: usize = Covered::ARRAYS as usize;
+
+/// The dev runtime's start hook (`blaze_inproc::runtime`), which a dev run's first initializer
+/// points at.
+pub(crate) const START_HOOK: &str = "blaze_inproc_start";
 
 /// What a stage made or rewrote a piece as: bytes borrowed from the change or the stage's
 /// arena, or zeros (a GOT cell, the cells array, a descriptor: nothing allocated).
@@ -199,7 +207,8 @@ fn wide<'t>(target: &'t Target, table: bool, of: Option<&'t InstanceKey>) -> Opt
 }
 
 /// The keys of a function's symbols, in the order [`Stage::add_function`] reads them: its
-/// body, its relocations' targets, then each datum and its relocations' targets.
+/// body, its relocations' targets (each once, by index), then each datum and its
+/// relocations' targets.
 fn function_keys<'f>(function: &'f CompiledFunction, table: bool, out: &mut [Wide<'f>]) {
     let mut at = 0;
     let mut put = |key: Wide<'f>| {
@@ -208,19 +217,20 @@ fn function_keys<'f>(function: &'f CompiledFunction, table: bool, out: &mut [Wid
     };
     let of = Some(&function.key);
     put(Wide::Body(&function.key));
-    for reloc in &function.relocs {
-        put(wide(reloc.target, table, of).expect("a function's own target").0);
+    for target in function.relocs.targets() {
+        put(wide(target, table, of).expect("a function's own target").0);
     }
     for data in &function.data {
         put(Wide::Data(&data.id));
-        for reloc in &data.relocs {
-            put(wide(reloc.target, table, of).expect("a function's own target").0);
+        for target in data.relocs.targets() {
+            put(wide(target, table, of).expect("a function's own target").0);
         }
     }
 }
 
 fn key_count(function: &CompiledFunction) -> usize {
-    1 + function.relocs.len() + function.data.iter().map(|it| 1 + it.relocs.len()).sum::<usize>()
+    1 + function.relocs.targets().len()
+        + function.data.iter().map(|it| 1 + it.relocs.targets().len()).sum::<usize>()
 }
 
 impl<'a> Stage<'a> {
@@ -251,11 +261,11 @@ impl<'a> Stage<'a> {
         Ok(self.symbols.intern(key))
     }
 
-    /// The symbols of relocations' targets, in the stage's arena.
-    fn reloc_syms(&mut self, relocs: &[Reloc]) -> Result<&'a [Sym], LinkError> {
-        let mut out = Vec::with_capacity_in(relocs.len(), self.arena);
-        for reloc in relocs {
-            out.push(self.target_sym(&reloc.target)?);
+    /// The symbols of a table's targets, by target index, in the stage's arena.
+    fn reloc_syms(&mut self, relocs: &Relocs) -> Result<&'a [Sym], LinkError> {
+        let mut out = Vec::with_capacity_in(relocs.targets().len(), self.arena);
+        for target in relocs.targets() {
+            out.push(self.target_sym(target)?);
         }
         Ok(out.leak())
     }
@@ -432,6 +442,29 @@ impl<'a> Stage<'a> {
         }
     }
 
+    /// A dev run's pointer to [`START_HOOK`] ([`crate::DevRun`]), first among the pieces of the
+    /// class and rank the writer gives it: made once, kept by every later stage. Its fixup is a
+    /// reference of the core's, so the name is resolved, and the native section defining it
+    /// kept, as any strong reference is.
+    pub fn start_hook(&mut self) -> Result<(), LinkError> {
+        if self.output.dev_run.is_none() {
+            return Ok(());
+        }
+        let sym = self.sym(SymKey::StartHook);
+        if self.new.home(sym).is_some() {
+            return Ok(());
+        }
+        let (class, rank) = self.writer.start_hook().map_err(|what| error(None, what))?;
+        let target = self.sym_name(START_HOOK);
+        let fixups = self.fixup_slice([Fixup { at: 0, apply: Apply::Abs64, target, addend: 0, minus: None }]);
+        let mut piece = self.piece(sym, &class, 8, 8, fixups, What::Fixed);
+        piece.rank = rank;
+        piece.order = [0; 3];
+        self.make(&piece, Content::Zero);
+        self.new.see(target);
+        Ok(())
+    }
+
     /// The jump table's generation cell, cells and stubs, with room for `functions` and
     /// what incremental links add.
     fn fixed(&mut self, functions: u64) -> Result<(), LinkError> {
@@ -598,21 +631,26 @@ impl<'a> Stage<'a> {
         Ok(())
     }
 
+    /// `relocs` as fixups, `syms` being the symbols of its targets by index
+    /// ([`Stage::reloc_syms`]), and the weak ones among them.
     fn fixups(
         &self,
-        relocs: &[Reloc],
+        relocs: &Relocs,
         syms: &[Sym],
         function: Option<InstanceKey>,
         in_code: bool,
     ) -> Result<(&'a [Fixup], &'a [Sym]), LinkError> {
         let mut fixups = Vec::with_capacity_in(relocs.len(), self.arena);
         let mut weak = Vec::new_in(self.arena);
-        for (reloc, sym) in relocs.iter().zip(syms) {
-            let apply = reloc::of_kind(reloc.kind, self.output.format, self.arch(), in_code).map_err(|it| error(function, it))?;
-            if matches!(reloc.target, Target::Weak(_)) {
+        for (target, sym) in relocs.targets().iter().zip(syms) {
+            if matches!(target, Target::Weak(_)) {
                 weak.push(*sym);
             }
-            fixups.push(Fixup { at: u64::from(reloc.at), apply, target: *sym, addend: reloc.addend, minus: None });
+        }
+        for (row, reloc) in relocs.rows().iter().zip(relocs.iter()) {
+            let apply = reloc::of_kind(reloc.kind, self.output.format, self.arch(), in_code).map_err(|it| error(function, it))?;
+            let target = syms[row.target as usize];
+            fixups.push(Fixup { at: u64::from(reloc.at), apply, target, addend: reloc.addend, minus: None });
         }
         weak.sort_unstable();
         weak.dedup();
@@ -622,18 +660,18 @@ impl<'a> Stage<'a> {
     fn add_function(&mut self, function: &'a CompiledFunction, syms: &[Sym]) -> Result<(), LinkError> {
         let key = Some(function.key);
         let body = syms[0];
-        let (fixups, weak) = self.fixups(&function.relocs, &syms[1..=function.relocs.len()], key, true)?;
+        let (fixups, weak) = self.fixups(&function.relocs, &syms[1..=function.relocs.targets().len()], key, true)?;
         if self.arch() == Arch::Wasm32 && wasm_imports_in(&function.code).map_err(|it| error(key, it))? {
             let (code, _) = blaze_codegen::wasm::Code::decode(&function.code)
                 // alloc: error path
                 .map_err(|it| error(key, format!("its wasm header: {it}")))?;
             self.wasm_imports(&code.imports);
         }
-        let mut at = 1 + function.relocs.len();
+        let mut at = 1 + function.relocs.targets().len();
         for data in &function.data {
             let sym = syms[at];
-            let relocs = &syms[at + 1..at + 1 + data.relocs.len()];
-            at += 1 + data.relocs.len();
+            let relocs = &syms[at + 1..at + 1 + data.relocs.targets().len()];
+            at += 1 + data.relocs.targets().len();
             self.add_data(data, sym, relocs, key)?;
         }
         let mut fde_sym = None;
@@ -885,9 +923,9 @@ impl<'a> Stage<'a> {
             let relocs = self.reloc_syms(&data.relocs)?;
             self.add_data(data, data_sym, relocs, None)?;
         }
-        let (bytes, relocs, size, zero): (&'a [u8], &'a [Reloc], u64, bool) = match &it.init {
-            Init::Bytes { bytes, relocs } => (&bytes[..], &relocs[..], bytes.len() as u64, false),
-            Init::Zeroed { size } => (&[][..], &[][..], *size, true),
+        let (bytes, relocs, size, zero): (&'a [u8], &'a Relocs, u64, bool) = match &it.init {
+            Init::Bytes { bytes, relocs } => (&bytes[..], relocs, bytes.len() as u64, false),
+            Init::Zeroed { size } => (&[][..], &NO_RELOCS, *size, true),
         };
         let syms = self.reloc_syms(relocs)?;
         let (fixups, weak) = self.fixups(relocs, syms, None, false)?;
@@ -1396,22 +1434,20 @@ fn special_at(state: &State, mut sym: Sym) -> Option<(Sym, u32)> {
     None
 }
 
-/// Reads a LEB128 at `*at`, moving past it.
-fn uleb(bytes: &[u8], at: &mut usize) -> Result<u64, String> {
+/// A code header's read error, as the stage says it.
+fn in_header(error: cursor::Error) -> String {
     // alloc: error path
-    blaze_format::leb::read_u64(bytes, at).map_err(|error| format!("wasm: {error} in a code header"))
+    format!("wasm: {error} in a code header")
 }
 
-/// Moves `*at` past a function type (`0x60`, the parameters, the results).
-fn skip_signature(bytes: &[u8], at: &mut usize) -> Result<(), String> {
-    if bytes.get(*at) != Some(&0x60) {
+/// Moves past a function type (`0x60`, the parameters, the results).
+fn skip_signature(header: &mut Reader<'_>) -> Result<(), String> {
+    if header.u8().map_err(in_header)? != 0x60 {
         // alloc: error path
         return Err("wasm: a type that is not a function type".to_owned());
     }
-    *at += 1;
     for _ in 0..2 {
-        let n = usize::try_from(uleb(bytes, at)?).map_err(|_| "wasm: a truncated code header")?;
-        *at = at.checked_add(n).filter(|it| *it <= bytes.len()).ok_or("wasm: a truncated code header")?;
+        header.bytes_uleb().map_err(in_header)?;
     }
     Ok(())
 }
@@ -1420,22 +1456,19 @@ fn skip_signature(bytes: &[u8], at: &mut usize) -> Result<(), String> {
 /// read past its type, types, type fixups and stack pointer fixups without decoding them,
 /// so a function without imports allocates nothing.
 fn wasm_imports_in(code: &[u8]) -> Result<bool, String> {
-    let mut at = 0;
-    let len = usize::try_from(uleb(code, &mut at)?).map_err(|_| "wasm: a truncated code header")?;
-    let end = at.checked_add(len).filter(|it| *it <= code.len()).ok_or("wasm: a truncated code header")?;
-    let header = &code[..end];
-    skip_signature(header, &mut at)?;
-    for _ in 0..uleb(header, &mut at)? {
-        skip_signature(header, &mut at)?;
+    let mut header = Reader::new(Reader::new(code).bytes_uleb().map_err(in_header)?);
+    skip_signature(&mut header)?;
+    for _ in 0..header.uleb().map_err(in_header)? {
+        skip_signature(&mut header)?;
     }
-    for _ in 0..uleb(header, &mut at)? {
-        uleb(header, &mut at)?;
-        uleb(header, &mut at)?;
+    for _ in 0..header.uleb().map_err(in_header)? {
+        header.uleb().map_err(in_header)?;
+        header.uleb().map_err(in_header)?;
     }
-    for _ in 0..uleb(header, &mut at)? {
-        uleb(header, &mut at)?;
+    for _ in 0..header.uleb().map_err(in_header)? {
+        header.uleb().map_err(in_header)?;
     }
-    Ok(uleb(header, &mut at)? > 0)
+    Ok(header.uleb().map_err(in_header)? > 0)
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, Reloc, RelocKind, Static, Target, Unwind};
+use blaze_codegen::{Arch, CompiledFunction, Covered, Data, Init, InstanceKey, Line, RelocKind, Relocs, Static, Target, Unwind};
 use blaze_core::{Completion, Done, Effect, FileName, IoError};
 use blaze_format::SpanRef;
 use blaze_ids::ContentId;
@@ -46,6 +46,8 @@ fn output(incremental: bool) -> Output {
         live: None,
         tags: 1 << 32,
         windows_subsystem: false,
+        dev_run: None,
+        triple: "x86_64-unknown-linux-gnu".into(),
         stack: None,
     }
 }
@@ -54,13 +56,13 @@ fn live() -> Output {
     Output { live: Some(Live { dir: name("live"), path: "/tmp/blaze-link-test/live".into() }), ..output(true) }
 }
 
-fn function(n: u8, code: &[u8], relocs: Vec<Reloc>) -> CompiledFunction {
+fn function(n: u8, code: &[u8], relocs: Vec<blaze_codegen::Relocation>) -> CompiledFunction {
     CompiledFunction {
         key: key(n),
         arch: Arch::X86_64,
         align: 16,
         code: code.to_vec(),
-        relocs,
+        relocs: relocs.into(),
         data: Vec::new(),
         inlined: Vec::new(),
         side: None,
@@ -71,8 +73,8 @@ fn function(n: u8, code: &[u8], relocs: Vec<Reloc>) -> CompiledFunction {
 }
 
 /// A 32-bit field relative to its end, at `at`.
-fn rel32(at: u32, target: Target) -> Reloc {
-    Reloc { at, kind: RelocKind::PcRel32, target, addend: -4 }
+fn rel32(at: u32, target: Target) -> blaze_codegen::Relocation {
+    blaze_codegen::Relocation { at, kind: RelocKind::PcRel32, target, addend: -4 }
 }
 
 /// `call rel32; ret`.
@@ -742,7 +744,7 @@ fn start_and_stop_symbols_bound_a_named_section() {
         item: ItemKey(id(n)),
         instance: id(n + 100),
         align: 8,
-        init: Init::Bytes { bytes: vec![value; 8], relocs: Vec::new() },
+        init: Init::Bytes { bytes: vec![value; 8], relocs: Relocs::new() },
         data: Vec::new(),
         mutable: false,
         thread_local: false,
@@ -827,7 +829,7 @@ fn c_object() -> Vec<u8> {
 
 #[test]
 fn a_c_object_and_rust_code_call_each_other_by_name() {
-    let object = c_object();
+    let object: std::sync::Arc<[u8]> = c_object().into();
     let start = function(1, &CALLER, vec![rel32(1, Target::Extern("c_helper".into()))]);
     let rust = function(2, &returns(3), Vec::new());
     let mut image = Image::new(name(TO), output(false)).unwrap();
@@ -1014,6 +1016,8 @@ fn slot_and_generation_allocate_nothing() {
 }
 
 mod ties;
+
+mod dev_run;
 
 /// The state's columns, read and written as a stage does.
 mod columns {
@@ -1252,7 +1256,7 @@ mod resolution {
         out
     }
 
-    fn native<'a>(n: u8, file: &'a str, bytes: &'a [u8], kind: NativeKind) -> Native<'a> {
+    fn native<'a>(n: u8, file: &'a str, bytes: &'a std::sync::Arc<[u8]>, kind: NativeKind) -> Native<'a> {
         Native { id: id(n), name: file, bytes, kind, order: u32::from(n) }
     }
 
@@ -1263,7 +1267,7 @@ mod resolution {
 
     #[test]
     fn a_body_edit_resolves_nothing() {
-        let object = super::c_object();
+        let object: std::sync::Arc<[u8]> = super::c_object().into();
         let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("c_helper".into()))]);
         let (rust, rust2) = (function(2, &returns(3), Vec::new()), function(3, &returns(4), Vec::new()));
         let mut image = Image::new(name(TO), incremental()).unwrap();
@@ -1292,7 +1296,7 @@ mod resolution {
     }
 
     /// (b)'s two links: `start` calling `c_one`, then `more` calling `c_two` too.
-    fn grow(image: &mut Image, disk: &mut Disk, object: &[u8]) {
+    fn grow(image: &mut Image, disk: &mut Disk, object: &std::sync::Arc<[u8]>) {
         let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("c_one".into()))]);
         let change = Change {
             added: vec![&start],
@@ -1309,7 +1313,7 @@ mod resolution {
 
     #[test]
     fn a_new_reference_to_a_loaded_name_grows_the_image_and_dropping_it_collects() {
-        let object = object(&[("c_one", 1), ("c_two", 2)], &[]);
+        let object: std::sync::Arc<[u8]> = object(&[("c_one", 1), ("c_two", 2)], &[]).into();
         let mut image = Image::new(name(TO), incremental()).unwrap();
         let mut disk = Disk::default();
         let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("c_one".into()))]);
@@ -1345,7 +1349,7 @@ mod resolution {
     fn an_archive_member_is_pulled_only_while_something_needs_it() {
         let a = object(&[("need_a", 1)], &["need_a"]);
         let b = object(&[("need_b", 2)], &["need_b"]);
-        let library = archive(&[("a.o", &a, &["need_a"]), ("b.o", &b, &["need_b"])]);
+        let library: std::sync::Arc<[u8]> = archive(&[("a.o", &a, &["need_a"]), ("b.o", &b, &["need_b"])]).into();
         let mut image = Image::new(name(TO), incremental()).unwrap();
         let mut disk = Disk::default();
         let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("need_a".into()))]);
@@ -1385,7 +1389,7 @@ mod resolution {
 
     #[test]
     fn resolution_is_the_same_on_any_number_of_threads() {
-        let object = object(&[("c_one", 1), ("c_two", 2)], &[]);
+        let object: std::sync::Arc<[u8]> = object(&[("c_one", 1), ("c_two", 2)], &[]).into();
         let run = |threads: usize| {
             let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
             pool.install(|| {

@@ -252,7 +252,10 @@ fn a_warm_times_set_allocates_nothing() {
     times_rounds(&mut threads, WARM);
     threads.off_thread();
     assert_eq!(times_rounds(&mut threads, ROUNDS), 0, "threads: {ROUNDS} warm sets of times, on the polling thread");
-    assert_eq!(threads.off_thread(), (0, 0), "threads: the file thread's utimensat or SetFileTime");
+    // On Windows the file thread makes its path with `sys::path`, which allocates; `Iocp`, the
+    // native driver there, sets times on its polling thread and is held to zero below.
+    #[cfg(unix)]
+    assert_eq!(threads.off_thread(), (0, 0), "threads: the file thread's utimensat");
     drop(threads);
     std::fs::remove_dir_all(root).unwrap();
     #[cfg(target_os = "linux")]
@@ -467,13 +470,13 @@ fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
             )),
             (4, Done::Accepted { conn }) => {
                 server = Some(conn);
-                effects.push(Effect::Recv { conn, most: 16, tag: Tag(next) });
+                effects.push(Effect::Recv { conn, most: 16, into: Vec::new(), tag: Tag(next) });
             }
             (5, Done::Connected { conn }) => {
                 client = Some(conn);
                 effects.push(Effect::Send { conn, bytes: b"ping".to_vec(), tag: Tag(6) });
             }
-            (6, Done::Sent) => seen.push("sent".to_owned()),
+            (6, Done::Sent(bytes)) => seen.push(format!("sent, {} bytes back", bytes.len())),
             (7, Done::HungUp) => seen.push("hung up".to_owned()),
             (4, Done::Unlistened) => seen.push("unlistened".to_owned()),
             (_, Done::Read(bytes)) if bytes.is_empty() => {
@@ -481,13 +484,14 @@ fn processes_and_sockets(driver: &mut impl Driver) -> Vec<String> {
                 seen.push(format!("received {:?}, then the end", String::from_utf8_lossy(&got)));
                 effects.push(Effect::Unlisten { tag: Tag(4) });
             }
-            (_, Done::Read(bytes)) => {
-                got.extend(bytes);
+            (_, Done::Read(mut bytes)) => {
+                got.extend_from_slice(&bytes);
+                bytes.clear();
                 let conn = server.expect("accepted");
                 if got.len() == 4 {
                     effects.push(Effect::Hangup { conn: client.expect("connected"), tag: Tag(7) });
                 }
-                effects.push(Effect::Recv { conn, most: 16, tag: Tag(next) });
+                effects.push(Effect::Recv { conn, most: 16, into: bytes, tag: Tag(next) });
             }
             (tag, other) => seen.push(format!("{tag}: {other:?}")),
         }
@@ -521,7 +525,7 @@ fn every_driver_runs_processes_and_sockets_the_same() {
             "hung up",
             "mapped [112, 97, 99, 107, 101, 100]",
             "received \"ping\", then the end",
-            "sent",
+            "sent, 0 bytes back",
             "unlistened",
             "written",
         ]
@@ -578,7 +582,7 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
             env: Vec::new(),
             dir: "/".into(),
             stdin: Vec::new(),
-            sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true },
+            sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true, services: Vec::new() },
             memory: None,
         })
     }
@@ -622,6 +626,37 @@ fn a_sandbox_is_made_by_the_confine_or_refused() {
             run(&mut crate::kqueue::Kqueue::new(&root, 1).unwrap().confined(Arc::new(Shell))),
         );
     }
+}
+
+#[test]
+fn an_answer_is_its_bytes_and_a_confine_hands_nothing_unless_it_says() {
+    use crate::{Answer, Command, Confine, Confined, Handed, Sandbox, Traced};
+    let answers = [Answer { run: 0, code: 0 }, Answer { run: u64::MAX, code: -1 }, Answer { run: 7, code: 125 }];
+    for answer in answers {
+        assert_eq!(Answer::from_bytes(answer.to_bytes()), answer);
+    }
+    assert_eq!(Answer { run: 1, code: 2 }.to_bytes(), [1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0]);
+    struct Cold;
+    impl Confine for Cold {
+        fn confine(&self, _: &Command, _: &std::path::Path) -> Result<Confined, String> {
+            Err("no".into())
+        }
+        fn traced(&self, _: &Command, _: &std::path::Path) -> Result<Traced, String> {
+            Ok(Traced::default())
+        }
+    }
+    let command = Command {
+        program: "x".into(),
+        args: Vec::new(),
+        env: Vec::new(),
+        dir: ".".into(),
+        stdin: Vec::new(),
+        sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() },
+        memory: None,
+    };
+    assert!(Cold.warm().is_none());
+    let handed = Handed { run: 1, stdin: 0, stdout: 0, stderr: 0, job: 0 };
+    assert!(Cold.hand(&command, std::path::Path::new("."), &handed).is_err());
 }
 
 #[test]
@@ -850,36 +885,46 @@ fn connected(driver: &mut impl Driver, at: &crate::Address, connect: Tag, listen
     (server.expect("accepted"), client.expect("connected"))
 }
 
-/// `rounds` of "ping" sent on `client` and received on `server`: what they allocated on the
-/// polling thread.
+/// `rounds` of "ping" sent on `client` and received on `server`, the send's buffer and the
+/// receive's (`buffers`) handed back by each round and given to the next: what they allocated
+/// on the polling thread.
 #[cfg(unix)]
-fn send_rounds(driver: &mut impl Driver, (server, client): (crate::Conn, crate::Conn), rounds: u64) -> u64 {
+fn send_rounds(
+    driver: &mut impl Driver,
+    (server, client): (crate::Conn, crate::Conn),
+    rounds: u64,
+    buffers: &mut [Vec<u8>; 2],
+) -> u64 {
     let (mut effects, mut out) = (Vec::with_capacity(2), Vec::with_capacity(16));
     let mut used = 0;
     for round in 0..rounds {
-        // The caller's: made before the cycle.
-        effects.push(Effect::Send { conn: client, bytes: b"ping".to_vec(), tag: Tag(10) });
-        effects.push(Effect::Recv { conn: server, most: 64, tag: Tag(11) });
+        let [sending, receiving] = buffers;
+        sending.extend_from_slice(b"ping");
+        receiving.clear();
         let ((), cycle) = blaze_alloc_count::measure(|| {
+            effects.push(Effect::Send { conn: client, bytes: std::mem::take(sending), tag: Tag(10) });
+            effects.push(Effect::Recv { conn: server, most: 64, into: std::mem::take(receiving), tag: Tag(11) });
             driver.submit(&mut effects);
             poll_for(driver, &mut out, 2);
         });
         used += cycle.allocations;
         out.sort_by_key(|it| it.tag);
-        assert!(
-            matches!(
-                out.as_slice(),
-                [Completion { done: Done::Sent, .. }, Completion { done: Done::Read(bytes), .. }] if bytes == b"ping"
-            ),
-            "round {round}: {out:?}"
-        );
+        match &mut out[..] {
+            [Completion { done: Done::Sent(sent), .. }, Completion { done: Done::Read(read), .. }]
+                if sent.is_empty() && read == b"ping" =>
+            {
+                *buffers = [std::mem::take(sent), std::mem::take(read)];
+            }
+            other => panic!("round {round}: {other:?}"),
+        }
         out.clear();
     }
     used
 }
 
 /// Both ends of a connection hung up, and a new connection made in their slots: the old
-/// `Conn`s name nothing, a receive and a send on them fail, and the new one carries bytes.
+/// `Conn`s name nothing, a receive and a send on them fail with their buffers back, and the
+/// new one carries bytes.
 #[cfg(unix)]
 fn hung_up_conns_name_nothing(driver: &mut impl Driver, at: &crate::Address, (server, client): (crate::Conn, crate::Conn)) {
     let mut effects = vec![Effect::Hangup { conn: client, tag: Tag(20) }, Effect::Hangup { conn: server, tag: Tag(21) }];
@@ -891,15 +936,26 @@ fn hung_up_conns_name_nothing(driver: &mut impl Driver, at: &crate::Address, (se
     let again = connected(driver, at, Tag(3), false);
     assert!(again.0 != server && again.0 != client && again.1 != server && again.1 != client);
     effects.extend([
-        Effect::Recv { conn: client, most: 8, tag: Tag(30) },
+        Effect::Recv { conn: client, most: 8, into: b"kept".to_vec(), tag: Tag(30) },
         Effect::Send { conn: server, bytes: b"x".to_vec(), tag: Tag(31) },
         Effect::Hangup { conn: client, tag: Tag(32) },
     ]);
     driver.submit(&mut effects);
     poll_for(driver, &mut out, 3);
-    assert!(out.iter().all(|it| matches!(it.done, Done::Failed(_))), "stale: {out:?}");
+    out.sort_by_key(|it| it.tag);
+    assert!(
+        matches!(
+            &out[..],
+            [
+                Completion { done: Done::Broken { buffer: kept, .. }, .. },
+                Completion { done: Done::Broken { buffer: sent, .. }, .. },
+                Completion { done: Done::Failed(_), .. },
+            ] if kept == b"kept" && sent.is_empty() && sent.capacity() >= 1
+        ),
+        "stale: {out:?}"
+    );
     out.clear();
-    send_rounds(driver, again, 1);
+    send_rounds(driver, again, 1, &mut Default::default());
     effects.extend([
         Effect::Hangup { conn: again.0, tag: Tag(40) },
         Effect::Hangup { conn: again.1, tag: Tag(41) },
@@ -910,32 +966,30 @@ fn hung_up_conns_name_nothing(driver: &mut impl Driver, at: &crate::Address, (se
     assert_eq!(done, BTreeMap::from([(1, Done::Unlistened), (40, Done::HungUp), (41, Done::HungUp)]));
 }
 
-/// A send on one end and a receive on the other of a warm connection: only the received
-/// bytes allocated, on `Sim` by the poll and on `Threads` by the receive's errand, nothing on
-/// its polling thread. Then the connection's `Conn`s are stale once hung up.
+/// A send on one end and a receive on the other of a warm connection, each buffer handed back
+/// and given to the next: nothing allocated, on `Sim` by the poll and on `Threads` by the
+/// errands or on its polling thread. Then the connection's `Conn`s are stale once hung up.
 #[cfg(unix)]
 #[test]
-fn a_warm_send_and_receive_allocates_only_the_bytes_received() {
+fn a_warm_send_and_receive_allocates_nothing() {
     let at = crate::Address::Unix(name("s"));
     let mut sim = Sim::new(14, Faults::default());
     let conns = connected(&mut sim, &at, Tag(2), true);
-    send_rounds(&mut sim, conns, WARM);
-    let used = send_rounds(&mut sim, conns, ROUNDS);
-    assert!(
-        used <= ROUNDS,
-        "the simulation: {used} allocations over {ROUNDS} warm sends and receives; each may make the received Vec<u8> only"
-    );
+    let mut buffers = Default::default();
+    send_rounds(&mut sim, conns, WARM, &mut buffers);
+    let used = send_rounds(&mut sim, conns, ROUNDS, &mut buffers);
+    assert_eq!(used, 0, "the simulation: {ROUNDS} warm sends and receives, their buffers reused");
     hung_up_conns_name_nothing(&mut sim, &at, conns);
     let root = dir("budget-conn");
     let mut threads = Threads::new(&root, 1);
     let conns = connected(&mut threads, &at, Tag(2), true);
-    send_rounds(&mut threads, conns, WARM);
+    let mut buffers = Default::default();
+    send_rounds(&mut threads, conns, WARM, &mut buffers);
     threads.off_thread();
-    let used = send_rounds(&mut threads, conns, ROUNDS);
+    let used = send_rounds(&mut threads, conns, ROUNDS, &mut buffers);
     assert_eq!(used, 0, "threads: {ROUNDS} warm sends and receives, on the polling thread");
     let (off, payload) = threads.off_thread();
-    assert_eq!(off - payload, 0, "threads: the errands made {off} allocations, {payload} of them the received bytes");
-    assert!(payload <= ROUNDS, "threads: {payload} allocations of received bytes over {ROUNDS} receives");
+    assert_eq!((off, payload), (0, 0), "threads: the errands' allocations, and of them the receives' buffers");
     hung_up_conns_name_nothing(&mut threads, &at, conns);
     drop(threads);
     std::fs::remove_dir_all(root).unwrap();

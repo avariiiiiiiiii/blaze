@@ -5,11 +5,11 @@
 //! - A node (content ID, index, value) is set once in its slot, under its shard's lock, before
 //!   the table entry naming it is published with one release store; a reader that loads the
 //!   entry with acquire sees the node whole.
-//! - The fingerprint picks the shard (its bits 0..32), tags the entry (32..64), so a probe
-//!   rarely loads a node it doesn't match, and places it (64..128).
-//! - A full table is copied into one twice its size under the lock and published by one
-//!   release store of its level. The tables it outgrew stay until the interner is dropped (a
-//!   reader may still be probing one), so they cost at most what the last one does.
+//! - The fingerprint picks the shard (its bits 0..32) and is the node's hash in the shard's
+//!   `blaze_mem::swiss::Index` (bits 64..128: the probe's start and tag).
+//! - A full index is copied into one twice its size under the lock and published with one
+//!   release store. The tables it outgrew stay until the interner is dropped (a reader may
+//!   still be probing one), so they cost at most what the last one does.
 //! - An [`Idx`] is the node's place in its shard's arena shifted past the shard bits, ored with
 //!   the shard: an index to a node is arithmetic and two acquire loads.
 
@@ -20,11 +20,12 @@ use std::{
     ptr,
     sync::{
         OnceLock, PoisonError,
-        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, Ordering},
     },
 };
 
 use blaze_ids::{ContentId, Fingerprint, Hasher, Idx, Interner};
+use blaze_mem::swiss::Index;
 
 use crate::{Consed, content_of};
 
@@ -32,9 +33,6 @@ use crate::{Consed, content_of};
 /// arithmetic and 27 chunks hold every `u32`.
 pub(crate) const FIRST: usize = 64;
 pub(crate) const CHUNKS: usize = 27;
-/// Table `k` of a shard has `TABLE << k` places: 28 hold more than a `u32` of entries.
-const TABLE: usize = 16;
-const TABLES: usize = 28;
 
 /// One interned value, with its content ID and the index it was given.
 struct Node<T> {
@@ -72,11 +70,9 @@ struct Shard<T> {
     /// How many nodes the arena has: written under `lock`, with release after each node is
     /// set.
     len: AtomicU32,
-    /// Which of `tables` is the one in use.
-    level: AtomicUsize,
-    /// A place is 0 when empty, else the entry's tag in the high 32 bits and its arena place
-    /// plus one in the low 32.
-    tables: [OnceLock<Box<[AtomicU64]>>; TABLES],
+    /// The shard's nodes by their fingerprint's bits 64..128: a find is one control word and
+    /// one slot, then the node's fingerprint compared only on a tag match.
+    index: Index,
     nodes: [OnceLock<Chunk<T>>; CHUNKS],
 }
 
@@ -86,49 +82,30 @@ pub(crate) fn chunk_of(local: u32) -> (usize, usize) {
     (chunk, local as usize - FIRST * ((1 << chunk) - 1))
 }
 
-fn empty_table(len: usize) -> Box<[AtomicU64]> {
-    (0..len).map(|_| AtomicU64::new(0)).collect()
-}
-
-/// Where a fingerprint goes: its shard, its entry's tag and where its probe starts.
+/// Where a fingerprint goes: its shard and its hash in the shard's index.
 #[derive(Clone, Copy)]
 struct Key {
     fingerprint: Fingerprint,
     shard: usize,
-    tag: u32,
-    home: usize,
+    hash: u64,
 }
 
 impl Key {
     fn of(content: &ContentId, mask: usize) -> Key {
         let fingerprint = content.fingerprint();
         let bits = fingerprint.0;
-        Key {
-            fingerprint,
-            shard: bits as u32 as usize & mask,
-            tag: (bits >> 32) as u32,
-            home: (bits >> 64) as u64 as usize,
-        }
-    }
-
-    fn entry(&self, local: u32) -> u64 {
-        (u64::from(self.tag) << 32) | u64::from(local + 1)
+        Key { fingerprint, shard: bits as u32 as usize & mask, hash: (bits >> 64) as u64 }
     }
 }
 
 impl<T> Shard<T> {
     fn new() -> Shard<T> {
-        let shard = Shard {
+        Shard {
             lock: ShardLock::new(),
             len: AtomicU32::new(0),
-            level: AtomicUsize::new(0),
-            tables: std::array::from_fn(|_| OnceLock::new()),
+            index: Index::new(),
             nodes: std::array::from_fn(|_| OnceLock::new()),
-        };
-        if shard.tables[0].set(empty_table(TABLE)).is_err() {
-            unreachable!("a new shard's first table set twice");
         }
-        shard
     }
 
     fn node(&self, local: u32) -> Option<&Node<T>> {
@@ -136,59 +113,12 @@ impl<T> Shard<T> {
         self.nodes[chunk].get()?.get(at)?.get()
     }
 
-    fn table(&self, level: usize) -> &[AtomicU64] {
-        self.tables[level].get().expect("a table level published before it is used")
-    }
-
-    /// The node whose fingerprint is `key`'s, or the empty place where it would go.
-    fn probe(&self, table: &[AtomicU64], key: &Key) -> Result<&Node<T>, usize> {
-        let mask = table.len() - 1;
-        let mut at = key.home & mask;
-        loop {
-            let entry = table[at].load(Ordering::Acquire);
-            if entry == 0 {
-                return Err(at);
-            }
-            if (entry >> 32) as u32 == key.tag {
-                let node = self.node(entry as u32 - 1).expect("a table entry before its node");
-                if node.content.fingerprint() == key.fingerprint {
-                    return Ok(node);
-                }
-            }
-            at = (at + 1) & mask;
-        }
-    }
-
-    /// [`Shard::probe`] of the table in use, taking no lock.
+    /// The node whose fingerprint is `key`'s, taking no lock.
     fn find(&self, key: &Key) -> Option<&Node<T>> {
-        let level = self.level.load(Ordering::Acquire);
-        self.probe(self.table(level), key).ok()
-    }
-
-    /// Moves the entries of table `level` into one twice its size and makes it the one in
-    /// use. Called with the shard locked.
-    fn grow(&self, level: usize) -> usize {
-        assert!(level + 1 < TABLES, "a hash-cons shard of more than 2^30 values");
-        let old = self.table(level);
-        let new = empty_table(TABLE << (level + 1));
-        let mask = new.len() - 1;
-        for place in old {
-            let entry = place.load(Ordering::Relaxed);
-            if entry == 0 {
-                continue;
-            }
-            let node = self.node(entry as u32 - 1).expect("a table entry before its node");
-            let mut at = (node.content.fingerprint().0 >> 64) as u64 as usize & mask;
-            while new[at].load(Ordering::Relaxed) != 0 {
-                at = (at + 1) & mask;
-            }
-            new[at].store(entry, Ordering::Relaxed);
-        }
-        if self.tables[level + 1].set(new).is_err() {
-            unreachable!("table level {} published twice", level + 1);
-        }
-        self.level.store(level + 1, Ordering::Release);
-        level + 1
+        let is = |local: u32| {
+            self.node(local).expect("an index entry before its node").content.fingerprint() == key.fingerprint
+        };
+        self.node(self.index.find(key.hash, is)?)
     }
 }
 
@@ -234,29 +164,18 @@ impl<T: Consed> HashCons<T> {
             return matched(node, &content, value);
         }
         let held = shard.lock.lock();
-        let level = shard.level.load(Ordering::Acquire);
-        let found = shard.probe(shard.table(level), &key);
-        let node = match found {
-            Ok(node) => {
-                drop(held);
-                return matched(node, &content, value);
-            }
-            Err(_) => self.append(shard, &key, content, value, level),
-        };
+        if let Some(node) = shard.find(&key) {
+            drop(held);
+            return matched(node, &content, value);
+        }
+        let node = self.append(shard, &key, content, value);
         drop(held);
         Interned { node }
     }
 
     /// Appends a node to `shard`'s arena and publishes its entry. Called with the shard
-    /// locked and `key` absent from its table at `level`, the one in use.
-    fn append<'s>(
-        &self,
-        shard: &'s Shard<T>,
-        key: &Key,
-        content: ContentId,
-        value: T,
-        level: usize,
-    ) -> &'s Node<T> {
+    /// locked and `key` absent from its index.
+    fn append<'s>(&self, shard: &'s Shard<T>, key: &Key, content: ContentId, value: T) -> &'s Node<T> {
         let local = shard.len.load(Ordering::Relaxed);
         assert!(
             local < u32::MAX >> self.shift,
@@ -270,13 +189,10 @@ impl<T: Consed> HashCons<T> {
             unreachable!("index {raw} handed out twice");
         }
         let node = nodes[at].get().expect("a node just set");
-        let level = match (local as usize + 1) * 2 > TABLE << level {
-            true => shard.grow(level),
-            false => level,
+        let hash_of = |local: u32| {
+            (shard.node(local).expect("an index entry before its node").content.fingerprint().0 >> 64) as u64
         };
-        let table = shard.table(level);
-        let Err(empty) = shard.probe(table, key) else { unreachable!("a value appended twice under its shard's lock") };
-        table[empty].store(key.entry(local), Ordering::Release);
+        shard.index.insert(local as usize, key.hash, local, hash_of);
         shard.len.store(local + 1, Ordering::Release);
         node
     }

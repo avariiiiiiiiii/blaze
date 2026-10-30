@@ -11,6 +11,7 @@ pub mod dependency;
 pub mod diagnostic;
 mod edit_distance;
 pub mod features;
+pub mod files;
 pub mod manifest;
 pub mod metadata;
 pub mod paths;

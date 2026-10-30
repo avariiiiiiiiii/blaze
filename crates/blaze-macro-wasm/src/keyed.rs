@@ -38,29 +38,11 @@ pub(crate) fn sha256_of(parts: &[&[u8]]) -> [u8; 32] {
     hash.finalize().into()
 }
 
-/// What a file of `bytes` has: short, the same for the same bytes ([`hex`] writes it).
+/// What a file of `bytes` has: short, the same for the same bytes ([`blaze_format::hex::encode_into`]
+/// writes it).
 pub(crate) fn digest_bytes(bytes: &[u8]) -> [u8; 16] {
     let digest = sha256_of(&[b"f", bytes]);
     digest[..16].try_into().expect("16 of 32 bytes")
-}
-
-const DIGITS: &[u8; 16] = b"0123456789abcdef";
-
-/// Appends `bytes` to `out` in lowercase hexadecimal.
-pub(crate) fn hex(bytes: &[u8], out: &mut String) {
-    out.reserve(2 * bytes.len());
-    for &byte in bytes {
-        out.push(DIGITS[usize::from(byte >> 4)] as char);
-        out.push(DIGITS[usize::from(byte & 15)] as char);
-    }
-}
-
-/// Whether `text` is what [`hex`] writes of `bytes`.
-pub(crate) fn is_hex(text: &str, bytes: &[u8]) -> bool {
-    text.len() == 2 * bytes.len()
-        && text.as_bytes().as_chunks::<2>().0.iter().zip(bytes).all(|(pair, &byte)| {
-            *pair == [DIGITS[usize::from(byte >> 4)], DIGITS[usize::from(byte & 15)]]
-        })
 }
 
 #[cfg(test)]
@@ -68,18 +50,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_digest_is_written_as_its_hexadecimal() {
-        let mut out = String::new();
-        hex(&[0x00, 0x0f, 0xa5, 0xff], &mut out);
-        assert_eq!(out, "000fa5ff");
+    fn a_files_digest_is_the_first_half_of_its_sha256() {
         let mut said = String::new();
-        hex(&digest_bytes(b"x"), &mut said);
+        blaze_format::hex::encode_into(&digest_bytes(b"x"), &mut said);
         let whole = Sha256::digest(b"fx");
         let want: String = whole.iter().take(16).map(|it| format!("{it:02x}")).collect();
         assert_eq!(said, want);
-        assert!(is_hex(&said, &digest_bytes(b"x")));
-        assert!(!is_hex(&said.to_uppercase(), &digest_bytes(b"x")));
-        assert!(!is_hex(&said[2..], &digest_bytes(b"x")));
-        assert!(!is_hex(&said, &digest_bytes(b"y")));
     }
 }

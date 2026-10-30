@@ -10,7 +10,7 @@
 
 use hir_ty::db::HirDatabase;
 use blaze_items::{Fact, ItemId};
-use hir::{HasSource as _, ModuleDef};
+use hir::{ModuleDef, view::HasSourceView as _};
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, FunctionId, GenericDefId, ItemContainerId, Lookup as _, StaticId,
     attrs::AttrFlags, hir::generics::GenericParams, lang_item::lang_items,
@@ -26,14 +26,11 @@ use rustc_type_ir::{
     Interner as _,
     inherent::{GenericArgs as _, IntoKind as _, Ty as _},
 };
-use syntax::{
-    AstNode, SyntaxNodePtr,
-    ast::{self, HasAttrs},
-};
+use syntax::view::{self as ast, AstNode, HasAttrs};
 
 use super::walk::{Container, Item};
 use crate::{
-    cx::{Cx, item_range, signature_range},
+    cx::{Cx, item_range_view, signature_range_view},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -48,7 +45,7 @@ pub(super) struct Canonical {
 impl Canonical {
     /// rustc's `all_canonical_symbols`, read only for the symbols `items` define, so that a
     /// crate defining none reads no other crate.
-    pub(super) fn of(cx: &Cx<'_, '_>, items: &[Item]) -> Canonical {
+    pub(super) fn of<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Canonical {
         let mut wanted = FxHashSet::default();
         for item in items {
             if let Some(candidate) = candidate(cx, item) {
@@ -60,12 +57,12 @@ impl Canonical {
             return Canonical { symbols };
         }
         let db = cx.db;
-        for krate in cx.krate.base().transitive_deps(db) {
+        for krate in cx.krate.base().transitive_deps(db).iter().copied() {
             if !UnstableFeatures::query(db, krate).is_enabled(&sym::rustc_attrs) {
                 continue;
             }
-            for module in hir::Crate::from(krate).modules(db) {
-                for decl in module.declarations(db) {
+            for module in hir::Crate::from(krate).modules_iter(db) {
+                for decl in module.declarations_iter(db) {
                     let ModuleDef::Function(f) = decl else { continue };
                     let Ok(id) = FunctionId::try_from(f) else { continue };
                     if !matches!(id.lookup(db).container, ItemContainerId::ExternBlockId(_)) {
@@ -85,7 +82,7 @@ impl Canonical {
 
 /// Whether a foreign function is declared `#[rustc_canonical_symbol]`.
 fn is_canonical(cx: &Cx<'_, '_>, f: hir::Function) -> bool {
-    let Some(source) = f.source(cx.db) else { return false };
+    let Some(source) = f.source_view(cx.db) else { return false };
     source.value.attrs().any(|attr| attr.simple_name().is_some_and(|name| name == "rustc_canonical_symbol"))
 }
 
@@ -93,7 +90,7 @@ fn is_canonical(cx: &Cx<'_, '_>, f: hir::Function) -> bool {
 fn foreign_symbol(cx: &Cx<'_, '_>, owner: AttrDefId, name: &hir::Name) -> Symbol {
     match AttrFlags::link_name(cx.db, owner) {
         Some(it) => it,
-        None => name.symbol().clone(),
+        None => *name.symbol(),
     }
 }
 
@@ -104,7 +101,7 @@ fn defined_symbol(cx: &Cx<'_, '_>, owner: AttrDefId, name: &hir::Name) -> Option
     if let Some(it) = AttrFlags::export_name(cx.db, owner) {
         return Some(it);
     }
-    AttrFlags::query(cx.db, owner).contains(AttrFlags::NO_MANGLE).then(|| name.symbol().clone())
+    AttrFlags::query(cx.db, owner).contains(AttrFlags::NO_MANGLE).then(|| *name.symbol())
 }
 
 /// What of an item is checked: a function or a static, with its symbol.
@@ -123,16 +120,16 @@ enum Def {
 /// not generic or a static, defined here with a symbol of its own, or declared in an `extern`
 /// block (a static only with a `#[linkage]`, as `std`'s `weak!` declares them). A function's
 /// symbol, from its attribute flags, is read before its signature: most have none of their own.
-fn candidate(cx: &Cx<'_, '_>, item: &Item) -> Option<Candidate> {
+fn candidate<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Option<Candidate> {
     let db = cx.db;
     let foreign = match item.container {
         Container::Module => false,
         Container::Extern(_) => true,
         Container::Trait(_) | Container::Impl(_) => return None,
     };
-    match &item.node.value {
+    match item.node.value {
         ast::Item::Fn(f) => {
-            let def = cx.sema.to_def2(item.node.with_value(f))?;
+            let def = cx.vsema.to_def2(item.node.with_value(f))?;
             let id = FunctionId::try_from(def).ok()?;
             let name = &FunctionSignature::of(db, id).name;
             let symbol = if foreign {
@@ -151,7 +148,7 @@ fn candidate(cx: &Cx<'_, '_>, item: &Item) -> Option<Candidate> {
             Some(Candidate { symbol, def: Def::Fn(def, id) })
         }
         ast::Item::Static(s) => {
-            let def = cx.sema.to_def2(item.node.with_value(s))?;
+            let def = cx.vsema.to_def2(item.node.with_value(s))?;
             let id: StaticId = def.into();
             let owner = AttrDefId::StaticId(id);
             let name = def.name(db);
@@ -172,10 +169,11 @@ fn candidate(cx: &Cx<'_, '_>, item: &Item) -> Option<Candidate> {
 /// The lints of `item` at rustc's `check_item`: of itself when it is a function or a static, of
 /// its foreign items (`foreign`, the items after it) when it is an `extern` block, emitted at the
 /// block.
-pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, foreign: &[Item], canonical: &Canonical) -> Vec<Found> {
+pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, foreign: &[Item<'db>], canonical: &Canonical) -> Vec<Found> {
     if canonical.symbols.is_empty() {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, no allocation
     }
+    // alloc: empty, no allocation, unless a definition fires a lint
     let mut found = Vec::new();
     match &item.node.value {
         ast::Item::Fn(_) | ast::Item::Static(_) if matches!(item.container, Container::Module) => {
@@ -192,7 +190,7 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, foreign: &[Item], canonical: &C
 }
 
 /// rustc's `check_fn` and `check_static` of `item`, linted at `at`.
-fn check(cx: &Cx<'_, '_>, item: &Item, at: &Item, canonical: &Canonical, found: &mut Vec<Found>) {
+fn check<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, at: &Item<'db>, canonical: &Canonical, found: &mut Vec<Found>) {
     let Some(candidate) = candidate(cx, item) else { return };
     let Some(&expected_id) = canonical.symbols.get(&candidate.symbol) else { return };
     let db = cx.db;
@@ -209,8 +207,8 @@ fn check(cx: &Cx<'_, '_>, item: &Item, at: &Item, canonical: &Canonical, found: 
     let expected = sig_of(expected_id);
     let (printer, user, span) = match candidate.def {
         Def::Fn(def, id) => {
-            let ast::Item::Fn(f) = &item.node.value else { return };
-            (def.ret_type(db), Ok(sig_of(id)), item.node.with_value(signature_range(f)))
+            let ast::Item::Fn(f) = item.node.value else { return };
+            (def.ret_type(db), Ok(sig_of(id)), item.node.with_value(signature_range_view(f)))
         }
         Def::Static(def, id) => {
             let ty = types.normalize(db.type_for_static(id).skip_binder());
@@ -225,7 +223,7 @@ fn check(cx: &Cx<'_, '_>, item: &Item, at: &Item, canonical: &Canonical, found: 
                 }
                 _ => Err(ty),
             };
-            (def.ty(db), user, item.node.as_ref().map(|it| item_range(it.syntax())))
+            (def.ty(db), user, item.node.map(|it| item_range_view(it.syntax())))
         }
     };
     let fn_ptr = |sig| Ty::new_fn_ptr(interner, Binder::dummy(sig));
@@ -247,13 +245,16 @@ fn check(cx: &Cx<'_, '_>, item: &Item, at: &Item, canonical: &Canonical, found: 
         true => ("invalid_runtime_symbol_definitions", "invalid"),
         false => ("suspicious_runtime_symbol_definitions", "suspicious"),
     };
+    // alloc: a lint that fires
     let message = format!("{what} definition of the runtime `{symbol}` symbol used by the standard library");
     let mut diag = Diag::lint(lint, message, cx.span(span));
+    // alloc: a lint that fires
     diag.note(format!(
         "expected `{}` (for the current target)\nfound    `{}`",
         print(fn_ptr(expected)),
         print(found_ty)
     ));
+    // alloc: a lint that fires
     diag.help(format!(
         "either fix the signature or remove any attributes like `#[unsafe(no_mangle)]`, \
          `#[unsafe(export_name = \"{symbol}\")]`, or `#[link_name = \"{symbol}\"]`"
@@ -262,12 +263,14 @@ fn check(cx: &Cx<'_, '_>, item: &Item, at: &Item, canonical: &Canonical, found: 
         diag.help("allow this lint if the signature is compatible");
     }
     let (id, name) = match candidate.def {
+        // alloc: the name in a fact of a lint that fires
         Def::Fn(_, id) => (ItemId::Function(id), FunctionSignature::of(db, id).name.as_str().to_owned()),
-        Def::Static(def, id) => (ItemId::Static(id), def.name(db).as_str().to_owned()),
+        Def::Static(def, id) => (ItemId::Static(id), def.name(db).as_str().to_owned()), // alloc: as above
     };
+    // alloc: a lint that fires
     diag.fact(Fact::Signature(cx.key(ItemId::Function(expected_id))), format!("the signature of the runtime `{symbol}`"));
-    diag.fact(Fact::Signature(cx.key(id)), format!("the signature of `{name}`"));
-    let at = at.node.as_ref().map(|it| SyntaxNodePtr::new(it.syntax()));
+    diag.fact(Fact::Signature(cx.key(id)), format!("the signature of `{name}`")); // alloc: a lint that fires
+    let at = at.node.map(|it| ast::ptr(it.syntax()));
     found.push(Found::lint(diag, Phase::Late, at));
 }
 

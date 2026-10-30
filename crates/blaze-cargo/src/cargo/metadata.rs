@@ -7,6 +7,7 @@ use anyhow::Context as _;
 use blaze_manifest::diagnostic::ManifestDiagnostic;
 use blaze_manifest::metadata::{export_no_deps, root_manifest};
 use blaze_manifest::{Config, Context, Workspace};
+use blaze_manifest::files::Disk;
 use cargo_metadata::Metadata;
 
 /// The workspace found from the current directory, or from `manifest_path`, with cargo's
@@ -27,7 +28,7 @@ pub fn no_deps(manifest_path: Option<&Path>, config: &[String]) -> Metadata {
     }
 }
 
-fn read(config: Config, manifest_path: Option<&Path>) -> anyhow::Result<Metadata> {
+fn read(config: Config<Disk>, manifest_path: Option<&Path>) -> anyhow::Result<Metadata> {
     let ctx = Context::new(config);
     let root = root_manifest(manifest_path, &ctx)?;
     let ws = Workspace::new(&root, &ctx)?;
@@ -90,7 +91,6 @@ pub fn own(selection: &crate::plan::Selection) -> Option<project_model::OwnMetad
             }),
             platform: Some(blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
             offline: false,
-            store: None,
             rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let json = blaze_metadata::metadata(&asked)?;
@@ -183,7 +183,6 @@ fn library_read(
         build: None,
         platform: triple.map(|triple| blaze_metadata::TargetPlatform { triple, cfg: &cfg }),
         offline: false,
-        store: None,
         rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let json = match no_deps {
@@ -359,7 +358,6 @@ fn resolved_programs(
             }),
             platform: Some(blaze_metadata::TargetPlatform { triple: &triple, cfg: &cfg }),
             offline: false,
-            store: None,
             rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         blaze_metadata::programs(&asked, targets)
@@ -434,7 +432,6 @@ pub fn units(
             cfg: &platformed.cfg,
         }),
         offline: false,
-        store: None,
         rustc_version: Some(crate::cargo::toolchain::ours_release()),
     };
     let units = blaze_metadata::Units {
@@ -536,7 +533,6 @@ pub fn checked(
             cfg: &built_for.cfg,
         }),
         offline: false,
-        store: None,
         rustc_version: told.lines().find_map(|it| it.strip_prefix("release: ")),
     };
     let units = blaze_metadata::Units {
@@ -707,7 +703,6 @@ mod tests {
                 cfg: &[],
             }),
             offline: true,
-            store: None,
             rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let made = blaze_metadata::metadata(&asked);

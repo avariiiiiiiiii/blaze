@@ -348,10 +348,31 @@ unsafe impl<T: Send> Send for Pooled<'_, T> {}
 // SAFETY: `&Pooled<T>` gives only `&T`.
 unsafe impl<T: Sync> Sync for Pooled<'_, T> {}
 
-impl<T> Pooled<'_, T> {
+impl<'p, T> Pooled<'p, T> {
     /// The slot's index: a `u32` ID, stable while this owns it.
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// The value's address, its slot kept: for a table that publishes it by pointer.
+    /// [`Pooled::from_raw`] takes it back.
+    pub fn into_raw(self) -> NonNull<T> {
+        mem::ManuallyDrop::new(self).ptr
+    }
+
+    /// The `Pooled` [`Pooled::into_raw`] gave `ptr` for.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` came from `into_raw` of a `Pooled` of `pool`, and is taken back once.
+    pub unsafe fn from_raw(pool: &'p Pool<T>, ptr: NonNull<T>) -> Pooled<'p, T> {
+        let offset = (ptr.as_ptr() as usize).wrapping_sub(pool.slots.base().as_ptr() as usize);
+        let index = offset / Pool::<T>::SIZE;
+        debug_assert!(
+            offset % Pool::<T>::SIZE == 0 && index < pool.max as usize,
+            "a pointer into another pool"
+        );
+        Pooled { pool, index: index as u32, ptr }
     }
 
     /// Takes the value out; the slot goes back to the pool.

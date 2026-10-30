@@ -467,6 +467,29 @@ impl<V: Clone + Send + Sync + 'static> Flights<V> {
         result
     }
 
+    /// As [`Flights::get_or_run`], but never waits: `None`, running nothing, when another task
+    /// runs `key` now.
+    pub fn run_if_idle(
+        &self,
+        key: Key,
+        run: impl FnOnce() -> Result<V, Cancelled>,
+    ) -> Option<Result<V, Cancelled>> {
+        let me = current();
+        match self.shard(&key).lock().entry(key) {
+            Entry::Vacant(slot) => {
+                slot.insert(InFlight { runner: me, waiters: Waiters(ptr::null()) });
+            }
+            Entry::Occupied(slot) if slot.get().runner == me => {
+                panic!("key {} is asked by the task that runs it: its value depends on itself", hex(&key))
+            }
+            Entry::Occupied(_) => return None,
+        }
+        let mut ending = Ending { flights: self, key, runner: me, ended: false };
+        let result = run();
+        ending.end(result.as_ref().ok());
+        Some(result)
+    }
+
     /// How many keys are running now.
     pub fn running(&self) -> usize {
         self.shards.iter().map(|it| it.0.lock().len()).sum()
@@ -760,6 +783,33 @@ mod tests {
             assert_eq!(value, Ok(n + 1));
         }
         assert_eq!(WAITS_TAKEN.with(std::cell::Cell::get), before);
+        assert_eq!(flights.running(), 0);
+    }
+
+    /// A run ahead runs a key nobody runs, and gives way at once, running nothing, to a key
+    /// another task runs; the key is free again after.
+    #[test]
+    fn a_run_if_idle_never_waits() {
+        let flights = Arc::new(Flights::<u32>::new());
+        assert_eq!(flights.run_if_idle(key(1), || Ok(7)), Some(Ok(7)));
+        let (started, finish) = (Arc::new(Barrier::new(2)), Arc::new(Barrier::new(2)));
+        let runner = std::thread::spawn({
+            let (flights, started, finish) = (flights.clone(), started.clone(), finish.clone());
+            move || {
+                flights.get_or_run(key(2), || {
+                    started.wait();
+                    finish.wait();
+                    Ok(2)
+                })
+            }
+        });
+        started.wait();
+        let before = WAITS_TAKEN.with(std::cell::Cell::get);
+        assert_eq!(flights.run_if_idle(key(2), || panic!("ran a key another task runs")), None);
+        assert_eq!(WAITS_TAKEN.with(std::cell::Cell::get), before, "giving way takes no lock");
+        finish.wait();
+        assert_eq!(runner.join().unwrap(), Ok(2));
+        assert_eq!(flights.run_if_idle(key(2), || Ok(3)), Some(Ok(3)));
         assert_eq!(flights.running(), 0);
     }
 

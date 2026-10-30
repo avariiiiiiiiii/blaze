@@ -14,6 +14,8 @@ pub mod format_proof_tree;
 pub mod fulfill;
 mod generic_arg;
 pub mod generics;
+mod global_goals;
+pub mod goal_store;
 pub mod infer;
 pub(crate) mod inspect;
 pub mod interner;
@@ -23,11 +25,17 @@ pub mod obligation_ctxt;
 mod opaques;
 pub mod persist;
 pub mod predicate;
+mod recycle;
 mod region;
 mod solver;
 mod structural_normalize;
 mod ty;
 pub mod util;
+
+#[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
+mod coroutine_witness_tests;
 
 use std::sync::OnceLock;
 

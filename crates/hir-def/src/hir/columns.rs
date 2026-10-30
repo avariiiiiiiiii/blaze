@@ -92,7 +92,7 @@ use crate::{
     type_ref::{Mutability, Rawness, TypeRefId},
 };
 use hir_expand::{MacroDefId, name::Name};
-use syntax::ast::{ArithOp, BinaryOp, CmpOp, LogicOp, Ordering, RangeOp, UnaryOp};
+use syntax::ast::{BinaryOp, RangeOp, UnaryOp};
 
 /// What a column of [`HirColumns`] is: a `Vec` while a store is built, a [`Col`] after.
 pub(crate) trait ColumnVec: Sized {
@@ -517,18 +517,6 @@ fn block(low: u32, high: u32) -> Checked<Option<BlockId>> {
     }
 }
 
-const ARITH_OPS: [ArithOp; 10] = [
-    ArithOp::Add,
-    ArithOp::Mul,
-    ArithOp::Sub,
-    ArithOp::Div,
-    ArithOp::Rem,
-    ArithOp::Shl,
-    ArithOp::Shr,
-    ArithOp::BitXor,
-    ArithOp::BitOr,
-    ArithOp::BitAnd,
-];
 const UNARY_OPS: [UnaryOp; 3] = [UnaryOp::Deref, UnaryOp::Not, UnaryOp::Neg];
 const RANGE_OPS: [RangeOp; 2] = [RangeOp::Exclusive, RangeOp::Inclusive];
 const LOOP_SOURCES: [LoopSource; 3] = [LoopSource::Loop, LoopSource::While, LoopSource::ForLoop];
@@ -549,35 +537,14 @@ fn from_table<T: Copy>(table: &[T], word: u32, what: &'static str) -> Checked<T>
 /// 13 and 14 `==` and `!=`, 15 to 18 the orderings (`2 * ordering + strict`), 19 `=` and 20 to 29
 /// the compound assignments.
 fn binary_op_word(op: Option<BinaryOp>) -> u32 {
-    match op {
-        None => 0,
-        Some(BinaryOp::LogicOp(LogicOp::And)) => 1,
-        Some(BinaryOp::LogicOp(LogicOp::Or)) => 2,
-        Some(BinaryOp::ArithOp(op)) => 3 + op as u32,
-        Some(BinaryOp::CmpOp(CmpOp::Eq { negated })) => 13 + negated as u32,
-        Some(BinaryOp::CmpOp(CmpOp::Ord { ordering, strict })) => {
-            15 + 2 * ordering as u32 + strict as u32
-        }
-        Some(BinaryOp::Assignment { op: None }) => 19,
-        Some(BinaryOp::Assignment { op: Some(op) }) => 20 + op as u32,
-    }
+    op.map_or(0, |op| 1 + op.code())
 }
 
 fn binary_op(word: u32) -> Checked<Option<BinaryOp>> {
-    Ok(Some(match word {
-        0 => return Ok(None),
-        1 => BinaryOp::LogicOp(LogicOp::And),
-        2 => BinaryOp::LogicOp(LogicOp::Or),
-        3..=12 => BinaryOp::ArithOp(ARITH_OPS[(word - 3) as usize]),
-        13 | 14 => BinaryOp::CmpOp(CmpOp::Eq { negated: word == 14 }),
-        15..=18 => BinaryOp::CmpOp(CmpOp::Ord {
-            ordering: if word < 17 { Ordering::Less } else { Ordering::Greater },
-            strict: (word - 15) % 2 == 1,
-        }),
-        19 => BinaryOp::Assignment { op: None },
-        20..=29 => BinaryOp::Assignment { op: Some(ARITH_OPS[(word - 20) as usize]) },
-        _ => return Err("a binary operator out of range"),
-    }))
+    match word {
+        0 => Ok(None),
+        word => BinaryOp::from_code(word - 1).map(Some).ok_or("a binary operator out of range"),
+    }
 }
 
 /// A closure's kinds as one word: bits 0-1 the variant of [`ClosureKind`], bits 2-3 and 4-5 its
@@ -1869,6 +1836,7 @@ impl HirColumns<Frozen> {
 mod tests {
     use hir_expand::mod_path::{ModPath, PathKind};
     use intern::Symbol;
+    use syntax::ast::{ArithOp, CmpOp, LogicOp, Ordering};
 
     use super::*;
     use crate::{
@@ -2027,8 +1995,9 @@ mod tests {
     /// Every variant of [`Expr`], with every optional field both set and not, every packed enum
     /// at its ends and every list empty and not.
     fn every_expr(v: &Values) -> Vec<Expr<'_>> {
-        let arith = ARITH_OPS.into_iter().map(|op| Some(BinaryOp::ArithOp(op)));
-        let assign = ARITH_OPS.into_iter().map(|op| Some(BinaryOp::Assignment { op: Some(op) }));
+        let arith = ArithOp::ALL.into_iter().map(|op| Some(BinaryOp::ArithOp(op)));
+        let assign =
+            ArithOp::ALL.into_iter().map(|op| Some(BinaryOp::Assignment { op: Some(op) }));
         let ops = [
             None,
             Some(BinaryOp::LogicOp(LogicOp::And)),

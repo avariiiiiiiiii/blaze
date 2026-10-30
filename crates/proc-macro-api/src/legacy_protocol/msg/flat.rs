@@ -54,18 +54,17 @@ pub type SpanDataIndexMap =
     indexmap::IndexSet<Span, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 pub fn serialize_span_data_index_map(map: &SpanDataIndexMap) -> Vec<u32> {
-    map.iter()
-        .map(|span| {
-            [
-                span.anchor.file_id.as_u32(),
-                span.anchor.ast_id.into_raw(),
-                span.range.start().into(),
-                span.range.end().into(),
-                span.ctx.into_u32(),
-            ]
-        })
-        .collect::<Vec<_>>()
-        .into_flattened()
+    let mut out = Vec::with_capacity(5 * map.len());
+    for span in map {
+        out.extend_from_slice(&[
+            span.anchor.file_id.as_u32(),
+            span.anchor.ast_id.into_raw(),
+            span.range.start().into(),
+            span.range.end().into(),
+            span.ctx.into_u32(),
+        ]);
+    }
+    out
 }
 
 /// The span table [`serialize_span_data_index_map`] wrote, each span's ids checked to be ones
@@ -147,41 +146,9 @@ impl FlatTree {
         version: u32,
         span_data_table: &mut SpanDataIndexMap,
     ) -> FlatTree {
-        let mut w = Writer::<Span, _> {
-            string_table: FxHashMap::default(),
-            work: VecDeque::new(),
-            span_data_table,
-
-            subtree: Vec::new(),
-            literal: Vec::new(),
-            punct: Vec::new(),
-            ident: Vec::new(),
-            token_tree: Vec::new(),
-            text: Vec::new(),
-            version,
-        };
+        let mut w = Writer::<Span, _>::new(span_data_table, version);
         w.write_subtree(subtree);
-
-        FlatTree {
-            subtree: if version >= ENCODE_CLOSE_SPAN_VERSION {
-                write_vec(w.subtree, SubtreeRepr::write_with_close_span)
-            } else {
-                write_vec(w.subtree, SubtreeRepr::write)
-            },
-            literal: if version >= EXTENDED_LEAF_DATA {
-                write_vec(w.literal, LiteralRepr::write_with_kind)
-            } else {
-                write_vec(w.literal, LiteralRepr::write)
-            },
-            punct: write_vec(w.punct, PunctRepr::write),
-            ident: if version >= EXTENDED_LEAF_DATA {
-                write_vec(w.ident, IdentRepr::write_with_rawness)
-            } else {
-                write_vec(w.ident, IdentRepr::write)
-            },
-            token_tree: w.token_tree,
-            text: w.text,
-        }
+        w.finish()
     }
 
     /// The tree, its span ids looked up in `span_data_table`. Columns that are not what the
@@ -235,41 +202,9 @@ impl FlatTree {
         call_site: Span,
         span_data_table: &mut SpanDataIndexMap,
     ) -> FlatTree {
-        let mut w = Writer::<Span, _> {
-            string_table: FxHashMap::default(),
-            work: VecDeque::new(),
-            span_data_table,
-
-            subtree: Vec::new(),
-            literal: Vec::new(),
-            punct: Vec::new(),
-            ident: Vec::new(),
-            token_tree: Vec::new(),
-            text: Vec::new(),
-            version,
-        };
+        let mut w = Writer::<Span, _>::new(span_data_table, version);
         w.write_tokenstream(call_site, &tokenstream);
-
-        FlatTree {
-            subtree: if version >= ENCODE_CLOSE_SPAN_VERSION {
-                write_vec(w.subtree, SubtreeRepr::write_with_close_span)
-            } else {
-                write_vec(w.subtree, SubtreeRepr::write)
-            },
-            literal: if version >= EXTENDED_LEAF_DATA {
-                write_vec(w.literal, LiteralRepr::write_with_kind)
-            } else {
-                write_vec(w.literal, LiteralRepr::write)
-            },
-            punct: write_vec(w.punct, PunctRepr::write),
-            ident: if version >= EXTENDED_LEAF_DATA {
-                write_vec(w.ident, IdentRepr::write_with_rawness)
-            } else {
-                write_vec(w.ident, IdentRepr::write)
-            },
-            token_tree: w.token_tree,
-            text: w.text,
-        }
+        w.finish()
     }
 
     pub fn from_tokenstream_raw<T: SpanTransformer<Table = ()>>(
@@ -277,41 +212,10 @@ impl FlatTree {
         call_site: T::Span,
         version: u32,
     ) -> FlatTree {
-        let mut w = Writer::<T, _> {
-            string_table: FxHashMap::default(),
-            work: VecDeque::new(),
-            span_data_table: &mut (),
-
-            subtree: Vec::new(),
-            literal: Vec::new(),
-            punct: Vec::new(),
-            ident: Vec::new(),
-            token_tree: Vec::new(),
-            text: Vec::new(),
-            version,
-        };
+        let mut no_table = ();
+        let mut w = Writer::<T, _>::new(&mut no_table, version);
         w.write_tokenstream(call_site, &tokenstream);
-
-        FlatTree {
-            subtree: if version >= ENCODE_CLOSE_SPAN_VERSION {
-                write_vec(w.subtree, SubtreeRepr::write_with_close_span)
-            } else {
-                write_vec(w.subtree, SubtreeRepr::write)
-            },
-            literal: if version >= EXTENDED_LEAF_DATA {
-                write_vec(w.literal, LiteralRepr::write_with_kind)
-            } else {
-                write_vec(w.literal, LiteralRepr::write)
-            },
-            punct: write_vec(w.punct, PunctRepr::write),
-            ident: if version >= EXTENDED_LEAF_DATA {
-                write_vec(w.ident, IdentRepr::write_with_rawness)
-            } else {
-                write_vec(w.ident, IdentRepr::write)
-            },
-            token_tree: w.token_tree,
-            text: w.text,
-        }
+        w.finish()
     }
 
     pub fn to_tokenstream_unresolved<T: SpanTransformer<Table = ()>>(
@@ -384,7 +288,11 @@ fn lit_kind(kind: u16) -> Result<tt::LitKind, String> {
 }
 
 fn write_vec<T, F: Fn(T) -> [u32; N], const N: usize>(xs: Vec<T>, f: F) -> Vec<u32> {
-    xs.into_iter().map(f).collect::<Vec<_>>().into_flattened()
+    let mut out = Vec::with_capacity(N * xs.len());
+    for x in xs {
+        out.extend_from_slice(&f(x));
+    }
+    out
 }
 
 impl SubtreeRepr {
@@ -558,14 +466,12 @@ impl<'a, T: SpanTransformer<Span = span::Span>> Writer<'a, '_, T, tt::iter::TtIt
                         let (text, suffix) = if self.version >= EXTENDED_LEAF_DATA {
                             let (text, suffix) = lit.text_and_suffix();
                             (
-                                self.intern_owned(text.to_owned()),
-                                if suffix.is_empty() {
-                                    !0
-                                } else {
-                                    self.intern_owned(suffix.to_owned())
-                                },
+                                self.intern_str(text),
+                                if suffix.is_empty() { !0 } else { self.intern_str(suffix) },
                             )
                         } else {
+                            // A literal as a server older than `EXTENDED_LEAF_DATA` reads it.
+                            // alloc: the edge, as above.
                             (self.intern_owned(format!("{lit}")), !0)
                         };
                         self.literal.push(LiteralRepr {
@@ -597,12 +503,11 @@ impl<'a, T: SpanTransformer<Span = span::Span>> Writer<'a, '_, T, tt::iter::TtIt
                     tt::Leaf::Ident(ident) => {
                         let idx = self.ident.len() as u32;
                         let id = self.token_id_of(ident.span);
-                        let text = if self.version >= EXTENDED_LEAF_DATA {
-                            self.intern_owned(ident.sym.as_str().to_owned())
-                        } else if ident.is_raw.yes() {
-                            self.intern_owned(format!("r#{}", ident.sym.as_str(),))
+                        let text = if self.version >= EXTENDED_LEAF_DATA || !ident.is_raw.yes() {
+                            self.intern_str(ident.sym.as_str())
                         } else {
-                            self.intern_owned(ident.sym.as_str().to_owned())
+                            // alloc: the edge, a raw ident as an older server reads it.
+                            self.intern_owned(format!("r#{}", ident.sym.as_str(),))
                         };
                         self.ident.push(IdentRepr { id, text, is_raw: ident.is_raw.yes() });
                         (idx << 2) | 0b11
@@ -620,8 +525,10 @@ impl<'a, T: SpanTransformer<Span = span::Span>> Writer<'a, '_, T, tt::iter::TtIt
         let close = self.token_id_of(subtree.delimiter.close);
         let delimiter_kind = subtree.delimiter.kind;
         self.subtree.push(SubtreeRepr { open, close, kind: delimiter_kind, tt: [!0, !0] });
+        // clone: a slice iterator, no allocation.
         let contents = fragment_contents(subtree, contents.clone()).unwrap_or(contents);
         // FIXME: `count()` walks over the entire iterator.
+        // clone: as above.
         self.work.push_back((idx, contents.clone().count(), contents));
         idx as u32
     }
@@ -646,7 +553,50 @@ pub(crate) fn fragment_contents<'a>(
     (wrapper && contents.next().is_none()).then_some(inner_contents)
 }
 
-impl<'a, T: SpanTransformer, U> Writer<'a, '_, T, U> {
+impl<'a, 'span, T: SpanTransformer, U> Writer<'a, 'span, T, U> {
+    /// A writer of a tree for a server or client of `version`, the spans it meets added to
+    /// `span_data_table`. Its columns are the [`FlatTree`] it makes (the edge, to or from an
+    /// older peer: [`crate::version::WIRE_TREES`] writes a tree's columns whole instead).
+    fn new(span_data_table: &'span mut T::Table, version: u32) -> Self {
+        Writer {
+            string_table: FxHashMap::default(),
+            work: VecDeque::new(),
+            span_data_table,
+            version,
+            subtree: Vec::new(), // alloc: the edge, as above.
+            literal: Vec::new(), // alloc: as above.
+            punct: Vec::new(), // alloc: as above.
+            ident: Vec::new(), // alloc: as above.
+            token_tree: Vec::new(), // alloc: as above.
+            text: Vec::new(), // alloc: as above.
+        }
+    }
+
+    /// The tree written, its rows encoded as `version` reads them.
+    fn finish(self) -> FlatTree {
+        let version = self.version;
+        FlatTree {
+            subtree: if version >= ENCODE_CLOSE_SPAN_VERSION {
+                write_vec(self.subtree, SubtreeRepr::write_with_close_span)
+            } else {
+                write_vec(self.subtree, SubtreeRepr::write)
+            },
+            literal: if version >= EXTENDED_LEAF_DATA {
+                write_vec(self.literal, LiteralRepr::write_with_kind)
+            } else {
+                write_vec(self.literal, LiteralRepr::write)
+            },
+            punct: write_vec(self.punct, PunctRepr::write),
+            ident: if version >= EXTENDED_LEAF_DATA {
+                write_vec(self.ident, IdentRepr::write_with_rawness)
+            } else {
+                write_vec(self.ident, IdentRepr::write)
+            },
+            token_tree: self.token_tree,
+            text: self.text,
+        }
+    }
+
     fn token_id_of(&mut self, span: T::Span) -> SpanId {
         T::token_id_of(self.span_data_table, span)
     }
@@ -656,18 +606,28 @@ impl<'a, T: SpanTransformer, U> Writer<'a, '_, T, U> {
         let table = &mut self.text;
         *self.string_table.entry(text.into()).or_insert_with(|| {
             let idx = table.len();
-            table.push(text.to_owned());
+            table.push(text.to_owned()); // alloc: the edge, the column's copy of each new text.
             idx as u32
         })
     }
 
+    /// The index of `text` in the text column, which copies it only when it is new.
+    pub(crate) fn intern_str(&mut self, text: &str) -> u32 {
+        if let Some(&idx) = self.string_table.get(text) {
+            return idx;
+        }
+        self.intern_owned(text.to_owned()) // alloc: the edge, as `intern_owned`.
+    }
+
     pub(crate) fn intern_owned(&mut self, text: String) -> u32 {
-        let table = &mut self.text;
-        *self.string_table.entry(text.clone().into()).or_insert_with(|| {
-            let idx = table.len();
-            table.push(text);
-            idx as u32
-        })
+        if let Some(&idx) = self.string_table.get(text.as_str()) {
+            return idx;
+        }
+        let idx = self.text.len() as u32;
+        // clone: the edge, the table's key and the column's copy of each new text.
+        self.string_table.insert(std::borrow::Cow::Owned(text.clone()), idx);
+        self.text.push(text);
+        idx
     }
 }
 
@@ -764,6 +724,7 @@ impl<'a, T: SpanTransformer>
                     let text = if self.version >= EXTENDED_LEAF_DATA {
                         self.intern(ident.sym.as_str())
                     } else if is_raw {
+                        // alloc: the edge, a raw ident as an older client reads it.
                         self.intern_owned(format!("r#{}", ident.sym.as_str(),))
                     } else {
                         self.intern(ident.sym.as_str())
@@ -1002,6 +963,7 @@ impl<T: SpanTransformer> Reader<'_, T> {
         self,
         span_join: impl Fn(T::Span, T::Span) -> T::Span,
     ) -> Result<proc_macro_srv::TokenStream<T::Span>, String> {
+        // alloc: an older client's tree, once a request; `WIRE_TREES` reads into the streams.
         let mut res: Vec<Option<proc_macro_srv::Group<T::Span>>> = vec![None; self.subtree.len()];
         for i in (0..self.subtree.len()).rev() {
             let repr = &self.subtree[i];
@@ -1067,6 +1029,7 @@ impl<T: SpanTransformer> Reader<'_, T> {
         Ok(if group.delimiter == proc_macro_srv::Delimiter::None {
             group.stream.unwrap_or_default()
         } else {
+            // alloc: the stream returned, which the macro takes.
             TokenStream::new(vec![proc_macro_srv::TokenTree::Group(group)])
         })
     }
@@ -1273,7 +1236,7 @@ mod tests {
         for version in RUST_ANALYZER_SPAN_SUPPORT..=CURRENT_API_VERSION {
             let mut table = SpanDataIndexMap::default();
             let flat = FlatTree::from_subtree(tree.view(), version, &mut table);
-            assert_eq!(flat.to_subtree_resolved(version, &table), Ok(tree.clone()), "{version}");
+            assert_eq!(flat.to_subtree_resolved(version, &table), Ok(tree.copy()), "{version}");
         }
     }
 }

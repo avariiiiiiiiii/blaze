@@ -25,15 +25,15 @@ mod meta;
 use hir::{HirFileId, InFile, PathResolution};
 use span::Edition;
 use syntax::{
-    AstNode, SyntaxKind, TextRange,
-    ast::{self, HasGenericParams, HasName},
+    SyntaxKind, TextRange,
+    view::{self as ast, AstNode, HasGenericParams, HasName},
 };
 
 use self::directive::Directive;
 use super::super::{Emitted, Pass, Walk, source_fact};
 use super::{Attr, Owner, Target, checked, lint_at, parsed};
 use crate::{
-    cx::{Cx, def_range},
+    cx::{Cx, def_range_view},
     lints::edit_distance::find_best_match_for_name,
     lower::Phase,
     model::{Applicability, Diag, Span},
@@ -141,7 +141,7 @@ impl Kind {
 /// Where the lints of one owner's attributes go, and the file of the attribute being parsed.
 struct Sink<'a, 'c, 'db> {
     cx: &'a Cx<'c, 'db>,
-    owner: &'a Owner,
+    owner: &'a Owner<'db>,
     file: HirFileId,
     out: &'a mut Vec<Emitted>,
 }
@@ -187,7 +187,8 @@ struct State {
 }
 
 /// The lints of the diagnostic attributes of `owners`.
-pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<Emitted> {
+pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, _walk: &Walk<'db>, owners: &[Owner<'db>]) -> Vec<Emitted> {
+    // alloc: empty, allocates nothing until a lint
     let mut out = Vec::new();
     let mut enabled: Option<[bool; KNOWN.len()]> = None;
     for owner in owners {
@@ -195,10 +196,10 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<
         let mut any = false;
         for attr in &owner.attrs {
             let Some(path) = attr.meta().and_then(|it| it.path()) else { continue };
-            let Some(kind) = classify(cx, &mut enabled, owner, attr, &path, &mut out) else { continue };
+            let Some(kind) = classify(cx, &mut enabled, owner, attr, path, &mut out) else { continue };
             any = true;
             let mut sink = Sink { cx, owner, file: attr.file, out: &mut out };
-            parse(&mut sink, &mut state, kind, attr, &path);
+            parse(&mut sink, &mut state, kind, attr, path);
         }
         if any {
             let mut sink = Sink { cx, owner, file: owner.node.file_id, out: &mut out };
@@ -210,12 +211,12 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<
 
 /// The parser of the attribute at `path`, if it has one here and its feature is enabled; an
 /// unknown `diagnostic::..` linted.
-fn classify(
-    cx: &Cx<'_, '_>,
+fn classify<'db>(
+    cx: &Cx<'_, 'db>,
     enabled: &mut Option<[bool; KNOWN.len()]>,
-    owner: &Owner,
-    attr: &Attr,
-    path: &ast::Path,
+    owner: &Owner<'_>,
+    attr: &Attr<'_>,
+    path: ast::Path<'db>,
     out: &mut Vec<Emitted>,
 ) -> Option<Kind> {
     let mut segments = path.segments();
@@ -241,7 +242,7 @@ fn classify(
     });
     let known = KNOWN.iter().position(|(it, _)| *it == name);
     if !known.is_some_and(|it| enabled[it]) {
-        unknown(cx, owner, attr, path, &second, &enabled, out);
+        unknown(cx, owner, attr, path, second, &enabled, out);
         return None;
     }
     if segments.next().is_some() {
@@ -251,25 +252,28 @@ fn classify(
 }
 
 /// rustc_resolve's `UnknownDiagnosticAttribute` of `path`, `diagnostic::` and `second`.
-fn unknown(
-    cx: &Cx<'_, '_>,
-    owner: &Owner,
-    attr: &Attr,
-    path: &ast::Path,
-    second: &ast::PathSegment,
+fn unknown<'db>(
+    cx: &Cx<'_, 'db>,
+    owner: &Owner<'_>,
+    attr: &Attr<'_>,
+    path: ast::Path<'db>,
+    second: ast::PathSegment<'_>,
     enabled: &[bool; KNOWN.len()],
     out: &mut Vec<Emitted>,
 ) {
     let Some(name_ref) = second.name_ref() else { return };
     let name = unraw(name_ref.text());
-    if !matches!(cx.sema.resolve_path(path), Some(PathResolution::ToolModule(_))) {
+    if !matches!(cx.vsema.resolve_path(path), Some(PathResolution::ToolModule(_))) {
         return;
     }
     let span = cx.span(attr.in_file(name_ref.syntax().text_range()));
+    // clone: the diagnostic's span, as is all below
     let mut diag = Diag::lint("unknown_diagnostic_attributes", "unknown diagnostic attribute", span.clone());
     if let Some((_, Some(feature))) = KNOWN.iter().find(|(it, feature)| *it == name && feature.is_some()) {
+        // alloc: as above
         diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));
     } else {
+        // alloc: as above
         let candidates: Vec<&str> = KNOWN.iter().zip(enabled).filter(|(_, on)| **on).map(|((it, _), _)| *it).collect();
         if let Some(typo) = find_best_match_for_name(&candidates, name, None) {
             let message = "an attribute with a similar name exists";
@@ -281,7 +285,7 @@ fn unknown(
 }
 
 /// The parser of `attr`, a `kind` attribute.
-fn parse(sink: &mut Sink<'_, '_, '_>, state: &mut State, kind: Kind, attr: &Attr, path: &ast::Path) {
+fn parse(sink: &mut Sink<'_, '_, '_>, state: &mut State, kind: Kind, attr: &Attr<'_>, path: ast::Path<'_>) {
     let Some(args) = meta::args(attr.args(), path.qualifier().is_some()) else { return };
     let attr_range = attr.range();
     let mode = match kind {
@@ -301,6 +305,7 @@ fn parse(sink: &mut Sink<'_, '_, '_>, state: &mut State, kind: Kind, attr: &Attr
             let at = sink.at(attr_range);
             if let Some(earlier) = state.opaque {
                 let span = sink.span(attr_range);
+                // clone: the diagnostic's span
                 let mut diag = Diag::lint("unused_attributes", "unused attribute", span.clone());
                 diag.suggestion(span, "remove this attribute", "", Applicability::MachineApplicable);
                 diag.span_note(sink.cx.span(earlier), "attribute also specified here");
@@ -341,10 +346,10 @@ fn parse(sink: &mut Sink<'_, '_, '_>, state: &mut State, kind: Kind, attr: &Attr
 /// `check_mod_attrs`' checks of what the parsers kept.
 fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
     let owner = sink.owner;
-    let node = &owner.node.value;
+    let node = owner.node.value;
     if let Some(directive) = &state.on_unimplemented
         && owner.target == Target::Trait
-        && let Some(item) = ast::Trait::cast(node.clone())
+        && let Some(item) = ast::Trait::cast(node)
     {
         let params = generic_params(&item);
         let edition = owner.node.file_id.edition(sink.cx.db);
@@ -355,6 +360,7 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
             }
             let mut diag = Diag::lint(
                 "malformed_diagnostic_format_literals",
+                // alloc: the diagnostic's text
                 format!("there is no parameter `{}` on trait `{name}`", printable(param, sink.cx.edition)),
                 sink.cx.span(at),
             );
@@ -366,7 +372,7 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
     }
     if let Some((path_range, directive)) = &state.on_const
         && owner.target == (Target::Impl { of_trait: true })
-        && let Some(item) = ast::Impl::cast(node.clone())
+        && let Some(item) = ast::Impl::cast(node)
     {
         if let Some(directive) = directive {
             unknown_params(sink, directive, &generic_params(&item), &[], SELF_HELP);
@@ -377,13 +383,13 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
                 "the `diagnostic::on_const` attribute can only be applied to non-const trait implementations",
                 sink.cx.span(*path_range),
             );
-            let item_span = sink.cx.span(InFile::new(owner.node.file_id, def_range(node)));
+            let item_span = sink.cx.span(InFile::new(owner.node.file_id, def_range_view(node)));
             diag.span_label(item_span, "this is a const trait implementation");
             sink.checked(diag);
         }
     }
     let adt = matches!(owner.target, Target::Struct | Target::Enum | Target::Union)
-        .then(|| ast::Adt::cast(node.clone()))
+        .then(|| ast::Adt::cast(node))
         .flatten();
     let Some(adt) = adt else { return };
     if let Some(directive) = &state.on_move {
@@ -394,10 +400,11 @@ fn check(sink: &mut Sink<'_, '_, '_>, state: State) {
         if params.len() != 1 {
             let range = match adt.generic_param_list() {
                 Some(list) => list.syntax().text_range(),
-                None => adt.name().map_or(def_range(node), |it| TextRange::empty(it.syntax().text_range().end())),
+                None => adt.name().map_or(def_range_view(node), |it| TextRange::empty(it.syntax().text_range().end())),
             };
             let diag = Diag::lint(
                 "malformed_diagnostic_attributes",
+                // alloc: the diagnostic's text
                 format!(
                     "`#[diagnostic::on_type_error]` only supports exactly one ADT generic parameter, but found `{}`",
                     params.len()
@@ -426,6 +433,7 @@ fn unknown_params(sink: &mut Sink<'_, '_, '_>, directive: &Directive, params: &[
         if params.iter().any(|it| it == param) || allowed.contains(&param) {
             return;
         }
+        // alloc: the diagnostic's text
         let message = format!("unknown parameter `{}`", printable(param, sink.cx.edition));
         let mut diag = Diag::lint("malformed_diagnostic_format_literals", message, sink.cx.span(at));
         diag.help(help);
@@ -434,8 +442,10 @@ fn unknown_params(sink: &mut Sink<'_, '_, '_>, directive: &Directive, params: &[
 }
 
 /// The names of the type and const parameters of `item`.
-fn generic_params(item: &impl HasGenericParams) -> Vec<String> {
+fn generic_params<'t>(item: &impl HasGenericParams<'t>) -> Vec<String> {
+    // alloc: empty, allocates nothing
     let Some(list) = item.generic_param_list() else { return Vec::new() };
+    // alloc: of an item with a diagnostic attribute that names parameters
     list.type_or_const_params().filter_map(|it| Some(unraw(it.name()?.text()).to_owned())).collect()
 }
 
@@ -448,7 +458,9 @@ fn printable(text: &str, edition: Edition) -> String {
     let name = unraw(text);
     let can_be_raw = !matches!(name, "_" | "crate" | "self" | "Self" | "super");
     match can_be_raw && SyntaxKind::from_keyword(name, edition).is_some() {
+        // alloc: a diagnostic's text
         true => format!("r#{name}"),
+        // alloc: as above
         false => name.to_owned(),
     }
 }

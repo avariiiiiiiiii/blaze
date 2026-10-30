@@ -167,7 +167,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
         // one buffer for what each field needs.
         let mut wfcx = None;
         let mut found = Vec::new_in(self.frame);
-        for variant in outlives::variants(self.db, adt) {
+        for variant in adt.variants(self.db) {
             for (field, ty) in self.db.field_types(variant).iter() {
                 let ty = ty.ty().instantiate_identity().skip_norm_wip();
                 if ty.references_error() {
@@ -312,8 +312,10 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
         // each a lifetime parameter of its own.
         let interner = self.interner();
         let mut anonymous = 0;
-        // alloc: hir-ty's ElidedLifetimes::regions takes vectors (asked of mem-db)
-        let mut errors = vec![Vec::new(); sig.inputs().len()];
+        let mut errors = mem::collect(
+            self.frame,
+            std::iter::repeat_n(Vec::new_in(self.frame), sig.inputs().len()),
+        );
         let inputs = mem::collect(
             self.frame,
             sig.inputs().iter().zip(&mut errors).map(|(&ty, errors)| {
@@ -353,7 +355,8 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
         }
         assumed.retain(|ty| !ty.references_error());
         // An `impl Trait` it returns has those lifetimes too.
-        let regions = hir_ty::elided_lifetimes(db, function).regions(&errors);
+        let mut regions = Vec::new_in(self.frame);
+        hir_ty::elided_lifetimes(db, function).regions_into(&errors, &mut regions);
         let output = hir_ty::with_elided_regions(db, sig.output(), function, &regions);
         if output.references_error() {
             return;
@@ -436,8 +439,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
             }
             let ty = outlives::without_body_regions(interner, outlives::outlived_as(db, ty));
             let site = Site::Opaque(function, index.into_raw().into_u32());
-            let mut needs = Vec::new();
-            let mut found = Vec::new();
+            found.clear();
             outlives::wf(db, &mut self.inferred, ty, &mut found);
             let bounds = rustc_type_ir::Interner::item_bounds(interner, opaque.into());
             for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
@@ -457,7 +459,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
                     found.push(Needs::Type(ty, region));
                 }
             }
-            needs.extend(found.into_iter().map(|it| (it, site)));
+            let needs = mem::collect(self.frame, found.drain(..).map(|it| (it, site)));
             self.resolve(known, needs);
         }
     }
@@ -468,11 +470,12 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
     /// `trait MyTrait<T, U>` needs `T` and `U` to outlive the lifetime of `&self` (E0311), as
     /// only `Self` is known to. An `impl Trait` with no outlives bound outlives as its
     /// arguments do: `&'static impl T` needs `Self: 'static` (E0310).
-    fn trait_opaques(&mut self, function: FunctionId, output: Ty<'db>, known: &Known<'db>) {
+    fn trait_opaques(&mut self, function: FunctionId, output: Ty<'db>, known: &Known<'f, 'db>) {
         let db = self.db;
         let interner = self.interner();
-        let mut opaques = Vec::new();
+        let mut opaques = Vec::new_in(self.frame);
         outlives::opaques(output, &mut opaques);
+        let mut found = Vec::new_in(self.frame);
         for alias in opaques {
             let AliasTyKind::Opaque { def_id: OpaqueTyIdWrapper(opaque) } = alias.kind else {
                 continue;
@@ -481,7 +484,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
             if owner != function {
                 continue;
             }
-            let mut found = Vec::new();
+            found.clear();
             let bounds = rustc_type_ir::Interner::item_bounds(interner, opaque.into());
             for clause in bounds.iter_instantiated(interner, alias.args.as_slice()) {
                 let (args, term) = match clause.kind().skip_binder() {
@@ -506,28 +509,32 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
                 }
             }
             let site = Site::Opaque(function, index.into_raw().into_u32());
-            let needs = found
-                .into_iter()
-                .map(|it| match it {
-                    Needs::Type(ty, region) => Needs::Type(outlives::outlived_as(db, ty), region),
-                    Needs::Region(..) => it,
-                })
-                .map(|it| (it, site))
-                .collect();
+            let needs = mem::collect(
+                self.frame,
+                found
+                    .drain(..)
+                    .map(|it| match it {
+                        Needs::Type(ty, region) => {
+                            Needs::Type(outlives::outlived_as(db, ty), region)
+                        }
+                        Needs::Region(..) => it,
+                    })
+                    .map(|it| (it, site)),
+            );
             self.resolve(known, needs);
         }
     }
 
     /// What the well-formedness of `def`'s own where clauses needs: of each type in them,
     /// and of a trait bound the trait's outlives bounds.
-    fn where_needs(&mut self, def: GenericDefId) -> Vec<(Needs<'db>, Site)> {
+    fn where_needs(&mut self, def: GenericDefId) -> FVec<'f, (Needs<'db>, Site)> {
         let db = self.db;
         let clauses = GenericPredicates::query_own_explicit(db, def)
             .iter_identity()
             .map(|it| it.skip_norm_wip());
-        let mut needs = Vec::new();
-        let mut found = Vec::new();
-        let mut tys = Vec::new();
+        let mut needs = Vec::new_in(self.frame);
+        let mut found = Vec::new_in(self.frame);
+        let mut tys = Vec::new_in(self.frame);
         for clause in clauses {
             found.clear();
             tys.clear();
@@ -609,7 +616,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
         let db = self.db;
         let params = GenericParams::of(db, def);
         let store = ExpressionStore::of(db, def.into());
-        let trait_name = trait_.map(|it| TraitSignature::of(db, it).name.clone());
+        let trait_name = trait_.map(|it| TraitSignature::of(db, it).name.clone()); // clone: a `Name` is an interned `Symbol`, a reference count
         let param = match self_ty.map(|it| it.kind()) {
             Some(TyKind::Param(param)) => Some(param.id),
             _ => None,
@@ -638,7 +645,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
     /// E0309, E0310 or E0311 (an anonymous lifetime) for each type parameter not known to
     /// outlive a region it must, unless a region must outlive one it is not known to: rustc's
     /// `process_errors` keeps only that error of one check, as the others follow from it.
-    fn resolve(&mut self, known: &Known<'db>, needs: Vec<(Needs<'db>, Site)>) {
+    fn resolve(&mut self, known: &Known<'f, 'db>, needs: FVec<'f, (Needs<'db>, Site)>) {
         let region_fails = needs.iter().any(|&(need, _)| match need {
             Needs::Region(longer, shorter) => !known.region_outlives(longer, shorter),
             Needs::Type(..) => false,
@@ -649,7 +656,7 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
         // A type that outlives a region only if a lifetime in it does, which it is not known
         // to: rustc's `ConcreteFailure` of a `RelateParamBound`, E0477, which also keeps the
         // errors of type parameters from being reported.
-        let mut concrete = Vec::new();
+        let mut concrete: FVec<'_, Site> = Vec::new_in(self.frame);
         for &(need, site) in &needs {
             let Needs::Type(ty, region) = need else { continue };
             let fails = outlives::components(ty).into_iter().any(|it| {
@@ -659,17 +666,18 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
             if !fails {
                 continue;
             }
-            let message = "the type does not fulfill the required lifetime".to_owned();
-            let diagnostic = WfDiagnostic { code: "E0477", message, site };
-            if !concrete.contains(&diagnostic) {
-                concrete.push(diagnostic);
+            if !concrete.contains(&site) {
+                concrete.push(site);
             }
         }
         if !concrete.is_empty() {
-            for diagnostic in concrete {
-                if !self.found.contains(&diagnostic) {
-                    self.found.push(diagnostic);
-                }
+            for &site in concrete.iter() {
+                push_new(
+                    self.found,
+                    "E0477",
+                    format_args!("the type does not fulfill the required lifetime"),
+                    site,
+                );
             }
             return;
         }
@@ -685,29 +693,62 @@ impl<'f, 'db> Check<'_, 'f, 'db> {
                 _ => "E0309",
             };
             for _ in known.failing_aliases(self.db, ty, region) {
-                let message = "the associated type may not live long enough".to_owned();
-                let diagnostic = WfDiagnostic { code, message, site };
-                if !self.found.contains(&diagnostic) {
-                    self.found.push(diagnostic);
-                }
+                push_new(
+                    self.found,
+                    code,
+                    format_args!("the associated type may not live long enough"),
+                    site,
+                );
             }
             for param in known.failing_params(ty, region) {
                 let TyKind::Param(param) = param.kind() else { continue };
                 let params = GenericParams::of(self.db, param.id.parent());
                 let name = params[param.id.local_id()].name().map_or("_", |it| it.as_str());
-                let message = format!("the parameter type `{name}` may not live long enough");
-                let diagnostic = WfDiagnostic { code, message, site };
-                if !self.found.contains(&diagnostic) {
-                    self.found.push(diagnostic);
-                }
+                push_new(
+                    self.found,
+                    code,
+                    format_args!("the parameter type `{name}` may not live long enough"),
+                    site,
+                );
             }
         }
     }
 }
 
+/// Adds the diagnostic unless `found` has it, making its message only then.
+fn push_new(
+    found: &mut FVec<'_, WfDiagnostic>,
+    code: &'static str,
+    message: std::fmt::Arguments<'_>,
+    site: Site,
+) {
+    if found
+        .iter()
+        .any(|it| it.code == code && it.site == site && formats_to(&it.message, message))
+    {
+        return;
+    }
+    // alloc: the result's own text, once per diagnostic reported
+    found.push(WfDiagnostic { code, message: message.to_string(), site });
+}
+
+/// Whether `message` formats to `text`, compared piece by piece as it formats.
+fn formats_to(text: &str, message: std::fmt::Arguments<'_>) -> bool {
+    struct Rest<'t>(&'t str);
+    impl std::fmt::Write for Rest<'_> {
+        fn write_str(&mut self, piece: &str) -> std::fmt::Result {
+            self.0 = self.0.strip_prefix(piece).ok_or(std::fmt::Error)?;
+            Ok(())
+        }
+    }
+    let mut rest = Rest(text);
+    std::fmt::write(&mut rest, message).is_ok() && rest.0.is_empty()
+}
+
 /// The lifetime elision gives a lifetime the return type elides: `&self`'s, else the one
 /// lifetime of the arguments.
 fn elided_output<'db>(
+    frame: &Frame,
     db: &'db Db,
     function: FunctionId,
     inputs: &[Ty<'db>],
@@ -717,7 +758,7 @@ fn elided_output<'db>(
     {
         return Some(region);
     }
-    let mut regions = Vec::new();
+    let mut regions: FVec<'_, Region<'db>> = Vec::new_in(frame);
     for &input in inputs {
         rustc_type_ir::fold_regions(DbInterner::new_no_crate(db), input, |region, _| {
             if !matches!(region.kind(), RegionKind::ReBound(..)) && !regions.contains(&region) {

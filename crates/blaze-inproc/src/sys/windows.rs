@@ -289,6 +289,82 @@ impl Drop for View {
     }
 }
 
+/// Private memory of this process: code, then data right after it, in one allocation.
+pub(crate) struct Exec {
+    at: *mut u8,
+    code_pages: usize,
+    data: usize,
+}
+
+// SAFETY: the code is never written once `Exec::new` returns, and the data only through
+// `&mut self`; nothing of the allocation is tied to a thread.
+unsafe impl Send for Exec {}
+// SAFETY: as above: `&self` reads only addresses.
+unsafe impl Sync for Exec {}
+
+impl Drop for Exec {
+    fn drop(&mut self) {
+        // SAFETY: `at` is the base of this `Exec`'s own allocation; every slice of it borrowed
+        // `self` or ended with `Exec::new`'s `write`.
+        unsafe { VirtualFreeEx(GetCurrentProcess(), self.at.cast::<c_void>(), 0, MEM_RELEASE) };
+    }
+}
+
+impl Exec {
+    pub(crate) fn new(code: usize, data: usize, write: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+        let page = page() as usize;
+        let code_pages = code.max(1).next_multiple_of(page);
+        let len = code_pages + data.next_multiple_of(page);
+        // SAFETY: reserves and commits fresh private memory wherever the system finds room:
+        // nothing of this process is replaced.
+        let at = unsafe {
+            VirtualAlloc2(
+                GetCurrentProcess(),
+                std::ptr::null(),
+                len,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if at.is_null() {
+            return Err(os(format_args!("VirtualAlloc2 of {len:#x} bytes of code and data")));
+        }
+        let exec = Exec { at: at.cast::<u8>(), code_pages, data };
+        // SAFETY: the fresh allocation of `len` readable and writable bytes, which nothing else
+        // refers to; `code <= code_pages` and `code_pages + data <= len`, so the slices are
+        // disjoint and in it. `write` can't keep them past its return.
+        let (code_bytes, data_bytes) = unsafe {
+            (std::slice::from_raw_parts_mut(exec.at, code), std::slice::from_raw_parts_mut(exec.at.add(code_pages), data))
+        };
+        write(code_bytes, data_bytes);
+        let mut old = 0;
+        // SAFETY: the code's pages of the allocation above, which nothing writes from here on.
+        if unsafe { VirtualProtectEx(GetCurrentProcess(), exec.at as *const c_void, code_pages, PAGE_EXECUTE_READ, &mut old) } == 0
+        {
+            return Err(os(format_args!("VirtualProtectEx of {code_pages:#x} bytes of code to execute and read")));
+        }
+        // SAFETY: a range of the allocation; FlushInstructionCache reads nothing of it.
+        unsafe { FlushInstructionCache(GetCurrentProcess(), exec.at as *const c_void, code) };
+        Ok(exec)
+    }
+
+    pub(crate) fn code_address(&self) -> u64 {
+        self.at as u64
+    }
+
+    pub(crate) fn data_address(&self) -> u64 {
+        self.at as u64 + self.code_pages as u64
+    }
+
+    pub(crate) fn data(&mut self) -> &mut [u8] {
+        // SAFETY: the data's `data` bytes after the code's pages, committed writable, live as
+        // long as `self`; `&mut self` makes this the only borrow.
+        unsafe { std::slice::from_raw_parts_mut(self.at.add(self.code_pages), self.data) }
+    }
+}
+
 /// What the daemon keeps to act in a run process: the process, and the objects it was granted
 /// with their rights.
 pub(crate) struct Remote {
@@ -855,6 +931,10 @@ pub(crate) fn threads(pid: u32, out: &mut Vec<u64>) -> Result<(), Error> {
             return Err(Error::new(format!("Windows: Thread32Next: {error}")));
         }
     }
+}
+
+pub(crate) fn service() -> Option<String> {
+    None
 }
 
 pub(crate) fn thread_id() -> u64 {

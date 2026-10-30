@@ -3,7 +3,10 @@
 
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
 };
 
 use blaze_ids::{ContentId, Hasher};
@@ -33,6 +36,9 @@ struct Program {
     functions: HashMap<u32, Function>,
     /// Each static's value byte and section.
     statics: HashMap<u32, (u8, Option<String>)>,
+    /// The functions of each level the walk reached, in the order it told them.
+    reached: Mutex<Vec<Vec<u32>>>,
+    stop: AtomicBool,
 }
 
 impl Program {
@@ -90,6 +96,7 @@ impl Frontend for Program {
             symbol: function.symbol.clone(),
             refs,
             built_in: function.built_in.clone(),
+            name: format!("f{id}"),
         })
     }
 
@@ -106,6 +113,14 @@ impl Frontend for Program {
             symbol: None,
             refs: Vec::new(),
         })
+    }
+
+    fn reached(&self, functions: &[(u32, Origin)], _: &[u32]) {
+        self.reached.lock().unwrap().push(functions.iter().map(|it| it.0).collect());
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -354,6 +369,20 @@ fn a_cold_build_compiles_once_per_shape_and_a_warm_one_compiles_nothing() {
 }
 
 #[test]
+fn the_front_end_hears_each_level_before_it_and_a_stop_ends_the_build() {
+    let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
+    let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
+    build(&program, &machine, &policy, &memo, &store).unwrap();
+    assert_eq!(*program.reached.lock().unwrap(), [vec![1], vec![2, 3], vec![4, 5]]);
+
+    program.stop.store(true, Ordering::Relaxed);
+    let stopped = Machine::default();
+    let errors = build(&program, &stopped, &policy, &Memo::new(), &store).unwrap_err();
+    assert!(errors.iter().all(|it| it.what.starts_with("stopped")), "{errors:?}");
+    assert_eq!(stopped.prepared.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn a_callee_edit_renames_its_callers_and_compiles_only_it() {
     let policy = policy(OptLevel::O0, Mode::Output);
     let mut program = program();
@@ -392,6 +421,42 @@ fn equal_code_is_one_function_unless_its_address_is_significant() {
     let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
     assert!(built.deduped.merged.is_empty());
     assert_eq!(built.functions.len(), 3);
+}
+
+#[test]
+fn a_root_reaches_what_it_calls_and_an_edit_elsewhere_changes_nothing_it_reaches() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = program();
+    let built = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    let key = |built: &Built, name: &str| built.debug_names.iter().find(|it| it.1 == name).unwrap().0;
+    assert_eq!(built.inputs.len(), 5);
+    assert!(built.inputs.is_sorted_by_key(|it| it.0));
+    assert_eq!(built.debug_names.len(), 5);
+    let all = built.reached(&built.roots[0]);
+    let two = built.reached(&key(&built, "f2"));
+    // 2's code and 4's, and the arguments both have.
+    assert_eq!(two.len(), 3);
+    assert!(two.iter().all(|it| all.contains(it)) && two.len() < all.len());
+    assert!(all.is_sorted());
+
+    program.functions.get_mut(&5).unwrap().body = 0x56;
+    let after = build(&program, &Machine::default(), &policy, &Memo::new(), &Store::default()).unwrap();
+    assert_eq!(after.reached(&key(&after, "f2")), two);
+    assert_ne!(after.reached(&after.roots[0]), all);
+}
+
+#[test]
+fn a_static_root_is_built_though_no_code_names_it() {
+    let policy = policy(OptLevel::O0, Mode::Output);
+    let mut program = program();
+    program.statics.insert(7, (0xaa, None));
+    let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
+    let without = build(&program, &machine, &policy, &memo, &store).unwrap();
+    assert!(without.statics.is_empty());
+    let with = Build::new(&machine, &program, &policy, &memo).run_with_statics(&[(1, member())], &[7], &store).unwrap();
+    assert_eq!(with.statics.len(), 1);
+    assert_eq!(with.statics[0].item, static_item(7));
+    assert_eq!(with.functions.len(), without.functions.len());
 }
 
 #[test]

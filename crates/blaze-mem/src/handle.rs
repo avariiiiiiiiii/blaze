@@ -106,6 +106,13 @@ impl<T> Entry<T> {
     fn occupied(&self) -> bool {
         self.generation & 1 == 1
     }
+
+    /// Whether the entry holds the value `handle` names. The occupied check is what keeps a
+    /// handle made by [`Handle::from_bits`] with an even generation off a free slot.
+    #[inline]
+    fn holds(&self, handle: Handle<T>) -> bool {
+        self.generation == handle.generation && self.occupied()
+    }
 }
 
 /// Values named by generational [`Handle`]s, for one owner.
@@ -182,22 +189,22 @@ impl<T> Slab<T> {
     }
 
     fn entry(&self, handle: Handle<T>) -> Option<&Entry<T>> {
-        self.entries.get(handle.index as usize).filter(|entry| entry.generation == handle.generation)
+        self.entries.get(handle.index as usize).filter(|entry| entry.holds(handle))
     }
 
     /// The value `handle` names, if it is still there.
     #[inline]
     pub fn get(&self, handle: Handle<T>) -> Option<&T> {
         let entry = self.entry(handle)?;
-        // SAFETY: the generations match and handles are issued with odd generations only, so
-        // the entry holds a value.
+        // SAFETY: `holds` checked the generations match and the entry's is odd, so it holds a
+        // value.
         Some(unsafe { entry.value.assume_init_ref() })
     }
 
     #[inline]
     pub fn get_mut(&mut self, handle: Handle<T>) -> Option<&mut T> {
         let entry = self.entries.get_mut(handle.index as usize)?;
-        if entry.generation != handle.generation {
+        if !entry.holds(handle) {
             return None;
         }
         // SAFETY: as for `get`.
@@ -218,7 +225,7 @@ impl<T> Slab<T> {
     /// Takes the value `handle` names out; every handle to it is stale from now on.
     pub fn remove(&mut self, handle: Handle<T>) -> Option<T> {
         let entry = self.entries.get_mut(handle.index as usize)?;
-        if entry.generation != handle.generation {
+        if !entry.holds(handle) {
             return None;
         }
         // SAFETY: as for `get`; the generation moves on below, so the value is read out once.

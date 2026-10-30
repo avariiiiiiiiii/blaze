@@ -68,6 +68,10 @@ macro_rules! setup_tracked_fn {
         // The function used to implement `C::heap_size`.
         heap_size_fn: $($heap_size_fn:path)?,
 
+        // The `blaze_mem::Tag` the function's runs count against, when given: a variant's name
+        // or a path to a `Tag` constant.
+        mem_tag: $($mem_tag:path)?,
+
         // The eviction policy type for this function
         eviction: $Eviction:ty,
 
@@ -336,6 +340,13 @@ macro_rules! setup_tracked_fn {
                 };
                 const DEBUG_NAME: &'static str = concat!($(stringify!($self_ty), "::", )? stringify!($fn_name));
                 const PERSIST: bool = $persist;
+                $(
+                    const MEM_TAG: $zalsa::MemTag = {
+                        #[allow(unused_imports)]
+                        use $zalsa::MemTag::*;
+                        $mem_tag
+                    };
+                )?
 
                 type DbView = $DbView;
 

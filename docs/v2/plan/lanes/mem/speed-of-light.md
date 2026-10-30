@@ -19,18 +19,45 @@ design it is held against.
 - **Bound**: a bump allocation has to read the cursor, align it, add the size, compare with the
   end and store the cursor. That is five dependent operations. With the cursor in memory (a
   `Cell` behind `&self`), the critical path between two allocations is the store-forward of the
-  cursor plus the add and the mask: about 7 cycles, under 2 ns.
-- **Design**: exactly that path. The committed end is cached in `limit`, so the common case
-  reads no atomic. Growth is a cold call. The peak update (a compare and a store) is off the
-  cursor's dependency chain, so it costs issue slots, not latency. Freeing or growing the top
-  allocation moves the cursor in place, so a `Vec<T, &Frame>` pushed in a loop never copies.
-- **A task**: two thread-local accesses (take and give a spare frame) and one store to reset.
-  Under 10 ns, against a task of at least microseconds.
-- **State of the art**: bumpalo (bumps downward to save one instruction, but chunk-chained, so
-  it has to allocate a new chunk from the global allocator when one fills) and game-engine
-  frame allocators (one reserved range per frame). blaze's frame is the latter: one reserved
-  range of 4 GB on huge pages per frame, so it never chains, never calls the global allocator
-  and never copies.
+  cursor plus the add and the mask: about 7 cycles, under 2 ns. A task needs at least its own
+  frame state (cursor, end, a link to the enclosing frame) written at start and read back at
+  end, and memory that is already warm: about ten stores and loads, a few ns.
+- **Design**: exactly that path. The frame is a chain of blocks (2 MB chunks, and for an
+  allocation over 1 MB a span: a region of its own reserved four times past it), and the bump's
+  end is cached in `end` (the chunk's end, a span's committed end, or the frame's limit), so the
+  common case reads no atomic and touches no line another core writes. Moving to the next
+  block is a cold call. The peak update (a compare and a store) is off the cursor's dependency
+  chain. Freeing or growing the top allocation moves the cursor in place, so a
+  `Vec<T, &Frame>` pushed in a loop never copies within a chunk, and in a span never copies at
+  all: growth there commits more of the reservation, one system call per step of a quarter of
+  what is committed (at least 2 MB), so 0.5 µs per 2 MB or less.
+- **A task**: its frame is a header on `frame::task`'s stack. An inner task starts in the rest
+  of its enclosing task's chunk (four stores to the outer frame and the inner one's own), so
+  nested small tasks take no block at all: 300 nested tasks of 1 KB each use 300 × (1 KB + at
+  most 64 bytes of alignment) ≈ 320 KB of one chunk. A task that needs a block takes it from
+  the thread's shelf (`SHELF` = 8 chunks, 64 spans; a thread-local array, no atomic) and only
+  past that from the process's chunk cache (one compare-and-swap, about 20 cycles). Its end
+  puts two thread-local words back and gives its blocks back the same way. Warm, a task makes
+  no system call and no global allocation at any depth: about 10 ns plus
+  `tag::task_ended`'s two relaxed atomics on the tag's line (shared by every worker; about
+  20 cycles each uncontended, more when many workers end tasks of one tag at once), against a
+  task of at least microseconds.
+- **Measure** (`frame::measure`): counted at task and measure boundaries only (a few loads,
+  adds and stores each), never per allocation. An enclosing frame that grows while an inner
+  task runs counts on top of the inner peak, so it errs high by at most that growth.
+- **The cap** (`frame::Cap`): a thread's first `SHELF` chunks are outside it, so a warm task
+  reserves nothing. Past that, a chunk or a span's commit step is one compare-and-swap on the
+  cap's total for a thread already holding bytes (about 20 cycles per 2 MB); starting or ending
+  a holding, a wait and a give-back while someone waits take its lock.
+- **State of the art**: bumpalo (bumps downward to save one instruction; chunk-chained, a new
+  chunk from the global allocator when one fills, chunks doubling), rustc's `DroplessArena`
+  (the same, per arena rather than per task), LLVM's `BumpPtrAllocator` (slabs from the
+  global allocator, one custom-sized slab per big allocation, like a span) and game-engine
+  frame allocators (one reserved range per frame, reset per frame). blaze's frame takes the
+  chain of the first three without their global allocator (blocks come from a thread's shelf
+  and a lock-free chunk cache), the big-allocation slab of LLVM's grown in place by commit,
+  and a stack allocator's nesting: an inner task borrows the rest of its outer task's chunk
+  and gives it back when it ends, so nesting depth costs neither memory nor system calls.
 
 ## Request arena (`ArenaLocal`, `Arena::blocks`, `chunks`)
 

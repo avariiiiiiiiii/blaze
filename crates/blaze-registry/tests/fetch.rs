@@ -2,14 +2,15 @@
 //! packages fetched, checked and unpacked where cargo unpacks them.
 
 use std::{
+    cell::Cell,
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
 use blaze_registry::{
-    Blobs, Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
-    download::{From, checksum, crate_url},
+    Context, Locked, Package, Registry, SourceConfig, SourceDef, Sources,
+    download::{From, checksum, crate_url, parse_checksum, unpack_package_in},
     http::{Http, Response},
     index::Status,
 };
@@ -57,19 +58,10 @@ impl Http for Server {
     }
 }
 
-#[derive(Default)]
-struct Memory(Mutex<HashMap<[u8; 32], Vec<u8>>>);
-
-impl Blobs for Memory {
-    fn get(&self, sha256: &[u8; 32]) -> Option<Vec<u8>> {
-        self.0.lock().unwrap().get(sha256).cloned()
-    }
-    fn has(&self, sha256: &[u8; 32]) -> bool {
-        self.0.lock().unwrap().contains_key(sha256)
-    }
-    fn put(&self, sha256: &[u8; 32], bytes: &[u8]) {
-        self.0.lock().unwrap().insert(*sha256, bytes.to_vec());
-    }
+/// A store of its own in `dir`, kept for the rest of the test process as the process's store
+/// is.
+fn store(dir: &Path) -> &'static blaze_store::Store {
+    Box::leak(Box::new(blaze_store::Store::open_by_content(dir).unwrap()))
 }
 
 fn temporary(name: &str) -> PathBuf {
@@ -104,7 +96,7 @@ fn line(name: &str, version: &str, cksum: &str, extra: &str) -> String {
 
 struct Fixture {
     server: Arc<Server>,
-    store: Arc<Memory>,
+    store: &'static blaze_store::Store,
     home: PathBuf,
     source: SourceId,
 }
@@ -118,12 +110,17 @@ impl Fixture {
             "c1",
         );
         let source = blaze_registry::registry_source(&format!("sparse+{BASE}")).unwrap();
-        Fixture { server, store: Arc::default(), home: temporary(name), source }
+        let home = temporary(name);
+        Fixture { server, store: store(&home.join("store")), home, source }
     }
 
     fn registry(&self, offline: bool) -> Registry {
+        self.registry_with(offline, self.store)
+    }
+
+    fn registry_with(&self, offline: bool, store: &'static blaze_store::Store) -> Registry {
         let mut context = Context::new(self.home.clone(), self.server.clone());
-        context.store = Some(self.store.clone());
+        context.store = Some(store);
         context.net.offline = offline;
         context.net.retry.quiet = true;
         Registry::remote(self.source, Arc::new(context)).unwrap()
@@ -241,7 +238,9 @@ fn fetches_into_cargos_directories_and_the_store() {
     let crate_file =
         fixture.home.join("registry/cache").join(registry.dir_name()).join("Demo-1.0.0.crate");
     assert_eq!(checksum(&std::fs::read(&crate_file).unwrap()), package.checksum);
-    assert_eq!(fixture.store.0.lock().unwrap().len(), 1);
+    let key = parse_checksum(&package.checksum).unwrap();
+    fixture.store.seal();
+    assert!(fixture.store.has(&key));
 
     // Unpacked already: nothing read.
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::Unpacked);
@@ -252,10 +251,13 @@ fn fetches_into_cargos_directories_and_the_store() {
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::Store);
     assert!(fixture.server.take_asked().is_empty());
     assert!(crate_file.is_file());
-    // From cargo's cache when the store does not have it.
+    // From cargo's cache when the store does not have it, which then keeps it.
     std::fs::remove_dir_all(&src).unwrap();
-    fixture.store.0.lock().unwrap().clear();
+    let empty = store(&fixture.home.join("empty-store"));
+    let registry = fixture.registry_with(false, empty);
     assert_eq!(registry.fetch_one(&package).unwrap().1, From::CargoCache);
+    empty.seal();
+    assert!(empty.has(&key));
     // An unpacking cut short (no `.cargo-ok`) is done again.
     std::fs::remove_file(src.join(".cargo-ok")).unwrap();
     std::fs::write(src.join("stray"), b"").unwrap();
@@ -342,6 +344,30 @@ fn download_urls() {
         format!("https://x/Ab/Cd/ab/cd/AbCd/AbCd-0.1.0.crate?{sum}")
     );
     assert_eq!(crate_url("https://x/{crate}", "abc", "1.0.0", &sum), "https://x/abc");
+}
+
+#[test]
+fn unpacks_in_only_what_is_included() {
+    let dir = temporary("unpack-in");
+    let bytes = tarball(&[
+        ("only-1.0.0/Cargo.toml", b"[package]\n", 0o644),
+        ("only-1.0.0/src/lib.rs", b"pub fn f() {}\n", 0o644),
+        ("only-1.0.0/.gitignore", b"target\n", 0o644),
+    ]);
+    let dst = dir.join("only-1.0.0");
+    let asked = Cell::new(0);
+    let left_out = Path::new(".gitignore");
+    let written = unpack_package_in(&bytes, &dst, |path: &Path| {
+        asked.set(asked.get() + 1);
+        path != left_out
+    })
+    .unwrap();
+    assert_eq!(asked.get(), 3);
+    assert_eq!(written, (b"[package]\n".len() + b"pub fn f() {}\n".len()) as u64);
+    assert_eq!(std::fs::read(dst.join("src/lib.rs")).unwrap(), b"pub fn f() {}\n");
+    assert!(dst.join("Cargo.toml").is_file());
+    assert!(!dst.join(".gitignore").exists());
+    assert!(!dst.join(".cargo-ok").exists());
 }
 
 /// A vendored package as `cargo vendor` writes it: its files and a `.cargo-checksum.json`.

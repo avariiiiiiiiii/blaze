@@ -29,9 +29,9 @@ pub mod wire;
 
 use std::{io::Write as _, time::Duration};
 
-pub use queue::{Binary, Config, Failure, Finished, Job, Lines, Loaded, Mode, Outcome, Queue, Trace};
+pub use queue::{Binary, Config, Failure, Finished, Job, Lines, Loaded, Mode, OUTSIDE, Outcome, Queue, Trace};
 pub use select::{
-    Attrs, Decision, Filter, Ignored, Input, Passes, ShouldPanic, Suite, Test, Wanted, Why,
+    Attrs, Decision, Filter, Ignored, Input, Passes, ShouldPanic, Suite, Test, Wanted, Why, changed_input,
 };
 pub use wire::Executed;
 

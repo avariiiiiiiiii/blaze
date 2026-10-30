@@ -1,13 +1,14 @@
 use std::time::Duration;
 
-use blaze_api::UnitTarget;
+use blaze_api::{CrateType, UnitTarget};
 
 use super::*;
 
+/// A target of cargo's `kind` word (`lib`, `bin`, `custom-build`, ...).
 pub(crate) fn target(kind: &str, name: &str) -> UnitTarget {
     UnitTarget {
-        kind: vec![kind.to_owned()],
-        crate_types: vec![if kind == "lib" { "lib" } else { "bin" }.to_owned()],
+        kind: TargetKind::named(kind).unwrap(),
+        crate_types: vec![if kind == "lib" { CrateType::Lib } else { CrateType::Bin }],
         name: name.to_owned(),
         src_path: format!("/w/{name}/src/main.rs"),
         edition: "2021".to_owned(),
@@ -38,9 +39,33 @@ fn compiling_a_path_a_git_and_a_registry_package() {
 #[test]
 fn errors_and_warnings_as_cargos_shell() {
     assert_eq!(error("what", false), "error: what\n");
-    assert_eq!(error("what", true), "\x1b[1m\x1b[91merror\x1b[0m\x1b[1m:\x1b[0m what\n");
+    assert_eq!(error("what", true), "\x1b[1m\x1b[91merror\x1b[0m: what\n");
     assert_eq!(warning("what", false), "warning: what\n");
-    assert_eq!(warning("what", true), "\x1b[1m\x1b[93mwarning\x1b[0m\x1b[1m:\x1b[0m what\n");
+    assert_eq!(warning("what", true), "\x1b[1m\x1b[93mwarning\x1b[0m: what\n");
+    let mut note = String::new();
+    note_into(&mut note, "what", true);
+    assert_eq!(note, "\x1b[1m\x1b[92mnote\x1b[0m: what\n");
+}
+
+#[test]
+fn texts_into_a_buffer_as_their_own() {
+    let bin = target("bin", "foo");
+    let mut out = String::new();
+    finished_into(&mut out, "`dev` profile [unoptimized + debuginfo]", std::time::Duration::from_millis(1234));
+    assert_eq!(out, finished("`dev` profile [unoptimized + debuginfo]", std::time::Duration::from_millis(1234)));
+    out.clear();
+    could_not_compile_into(&mut out, "foo", &bin, false, 1, 0);
+    assert_eq!(out, could_not_compile("foo", &bin, false, 1, 0));
+    out.clear();
+    assert!(!generated_into(&mut out, "foo", &bin, false, true, Warned::default()));
+    assert_eq!(out, "", "nothing for a unit without warnings");
+}
+
+#[cfg(not(windows))]
+#[test]
+fn a_command_with_cargos_variables_sorted() {
+    let env = [("ZED".to_owned(), "a b".to_owned()), ("CARGO_PKG_NAME".to_owned(), "foo".to_owned())];
+    assert_eq!(command_line_with(&env, "target/debug/foo", &["x".to_owned()]), "`CARGO_PKG_NAME=foo ZED='a b' target/debug/foo x`");
 }
 
 #[test]
@@ -54,7 +79,7 @@ fn generated_warnings() {
     let fixable = Warned { total: 2, duplicates: 1, fixable: Some(1) };
     assert_eq!(
         generated("foo", &bin, false, true, fixable).unwrap(),
-        "`foo` (bin \"foo\") generated 2 warnings (1 duplicate) (run `cargo fix --bin \"foo\"` to apply 1 suggestion)"
+        "`foo` (bin \"foo\") generated 2 warnings (1 duplicate) (run `cargo fix --bin \"foo\" -p foo` to apply 1 suggestion)"
     );
     let lib_fixable = Warned { total: 3, duplicates: 2, fixable: Some(2) };
     assert_eq!(
@@ -65,6 +90,12 @@ fn generated_warnings() {
         generated("foo", &lib, true, true, one).unwrap(),
         "`foo` (lib test) generated 1 warning"
     );
+    // A test or bench target is always compiled with `--test`, and named without " test".
+    for kind in ["test", "bench"] {
+        let tests = target(kind, "it");
+        assert_eq!(generated("foo", &tests, true, true, one).unwrap(), format!("`foo` ({kind} \"it\") generated 1 warning"));
+        assert_eq!(could_not_compile("foo", &tests, true, 1, 0), format!("could not compile `foo` ({kind} \"it\") due to 1 previous error"));
+    }
     // Not local, or with an error: no hint.
     assert_eq!(generated("foo", &lib, false, false, lib_fixable).unwrap(), "`foo` (lib) generated 3 warnings (2 duplicates)");
     let errored = Warned { total: 1, duplicates: 0, fixable: None };

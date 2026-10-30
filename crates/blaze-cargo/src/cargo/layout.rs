@@ -38,7 +38,9 @@ const NEW_LAYOUT_KEY: &str = "build-dir-new-layout";
 /// std's lock does not cover) could read a variable as it is freed.
 pub unsafe fn first_unless_chosen(cwd: &Path, config: &[String], unstable: &[String]) {
     if !chosen(cwd, std::env::vars(), config, unstable) {
-        // SAFETY: no other thread runs, by this function's contract, and `chosen` starts none.
+        // SAFETY: `set_var` races only with another thread using the environment;
+        // `cargo::command` (`cargo/mod.rs`) calls this on the main thread before it starts any;
+        // were one running, its `getenv` could read freed memory.
         unsafe { std::env::set_var(NEW_LAYOUT, "false") };
     }
 }

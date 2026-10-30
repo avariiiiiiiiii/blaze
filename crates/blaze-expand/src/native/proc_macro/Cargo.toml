@@ -11,5 +11,6 @@ path = "lib.rs"
 
 [dependencies]
 intern.workspace = true
+rustc-hash.workspace = true
 span.workspace = true
 tt.workspace = true

@@ -1,5 +1,6 @@
 //! Builtin attributes.
 use base_db::Db;
+use blaze_mem::Frame;
 use intern::sym;
 use span::Span;
 
@@ -18,7 +19,7 @@ macro_rules! register_builtin {
             /// Every variant, in declaration order.
             pub const ALL: &[Self] = &[$(Self::$variant),*];
 
-            pub fn expander(&self) -> fn (&Db, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree>  {
+            pub fn expander(&self) -> for<'f> fn (&Db, &'f Frame, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree<&'f Frame>>  {
                 match *self {
                     $( BuiltinAttrExpander::$variant => $expand, )*
                 }
@@ -49,14 +50,15 @@ macro_rules! register_builtin {
 }
 
 impl BuiltinAttrExpander {
-    pub fn expand(
+    pub fn expand<'f>(
         &self,
         db: &Db,
+        frame: &'f Frame,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
-    ) -> ExpandResult<tt::TopSubtree> {
-        self.expander()(db, id, tt, span)
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+        self.expander()(db, frame, id, tt, span)
     }
 
     pub fn is_derive(self) -> bool {
@@ -90,25 +92,27 @@ pub fn find_builtin_attr(ident: &name::Name) -> Option<BuiltinAttrExpander> {
     BuiltinAttrExpander::find_by_name(ident)
 }
 
-fn dummy_attr_expand(
+fn dummy_attr_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     _span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    ExpandResult::ok(tt.clone()) // clone: the expansion is the input, written once
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    ExpandResult::ok(tt::TopSubtree::from_subtree_in(tt.view(), frame))
 }
 
 /// The static, and what calls it in the allocator's place: rustc's expansion defines `__rg_alloc`
 /// and the others, which its allocator shim calls. These have names of blaze's, which the
 /// stand-in rustc builds for a crate whose code is blaze's calls from a `#[global_allocator]`
 /// of its own (blaze's `stub.rs`).
-fn global_allocator_expand(
+fn global_allocator_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let ident = |it: tt::TtElement<'_>| match it {
         tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => Some(ident.clone()), // clone: a copy (symbol and span); `#[global_allocator]`, once per crate
         _ => None,
@@ -116,10 +120,10 @@ fn global_allocator_expand(
     let mut idents = tt.iter().filter_map(ident);
     idents.find(|it| it.sym.as_str() == "static");
     let Some(name) = idents.find(|it| it.sym.as_str() != "mut") else {
-        return ExpandResult::ok(tt.clone()); // clone: the expansion is the input, written once
+        return ExpandResult::ok(tt::TopSubtree::from_subtree_in(tt.view(), frame));
     };
     let name = &name;
-    let result = quote::quote! { span=>
+    let result = quote::quote_in! { frame, span=>
         #tt
         #[export_name = "__blaze_global_alloc"]
         unsafe extern "C" fn __blaze_global_alloc(size: usize, align: usize) -> *mut u8 {
@@ -171,30 +175,32 @@ fn global_allocator_expand(
 
 /// The item keeps the list as a tool attribute, which type inference reads and name resolution
 /// does not expand again.
-fn define_opaque_expand(
+fn define_opaque_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let MacroCallKind::Attr { attr_args: Some(args), .. } = &id.loc(db).kind else {
-        return ExpandResult::ok(tt.clone()); // clone: the expansion is the input, written once
+        return ExpandResult::ok(tt::TopSubtree::from_subtree_in(tt.view(), frame));
     };
     let args = &**args;
-    let result = quote::quote! { span=>
+    let result = quote::quote_in! { frame, span=>
         #[rust_analyzer::define_opaque(#args)]
         #tt
     };
     ExpandResult::ok(result)
 }
 
-fn dummy_gate_test_expand(
+fn dummy_gate_test_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    let result = quote::quote! { span=>
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let result = quote::quote_in! { frame, span=>
         #[cfg(test)]
         #tt
     };
@@ -222,32 +228,34 @@ fn dummy_gate_test_expand(
 /// always resolve as a derive without nameres recollecting them.
 /// So this hacky approach is a lot more friendly for us, though it does require a bit of support in
 /// hir::Semantics to make this work.
-fn derive_expand(
+fn derive_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let loc = id.loc(db);
     let derives = match &loc.kind {
         MacroCallKind::Attr { attr_args: Some(attr_args), .. } if loc.def.is_attribute_derive() => {
             attr_args
         }
         _ => {
-            return ExpandResult::ok(tt::TopSubtree::empty(tt::DelimSpan {
-                open: span,
-                close: span,
-            }));
+            return ExpandResult::ok(tt::TopSubtree::empty_in(
+                tt::DelimSpan { open: span, close: span },
+                frame,
+            ));
         }
     };
-    pseudo_derive_attr_expansion(tt, derives, span)
+    pseudo_derive_attr_expansion(frame, tt, derives, span)
 }
 
-pub fn pseudo_derive_attr_expansion(
+pub fn pseudo_derive_attr_expansion<'f>(
+    frame: &'f Frame,
     _: &tt::TopSubtree,
     args: &tt::TopSubtree,
     call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let mk_leaf =
         |char| tt::Leaf::Punct(tt::Punct { char, spacing: tt::Spacing::Alone, span: call_site });
 
@@ -265,7 +273,7 @@ pub fn pseudo_derive_attr_expansion(
         token_trees.extend_with_tt(tts);
         token_trees.close(call_site);
     }
-    ExpandResult::ok(token_trees.build())
+    ExpandResult::ok(token_trees.build_in(frame))
 }
 
 #[cfg(test)]

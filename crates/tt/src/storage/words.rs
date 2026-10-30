@@ -3,14 +3,14 @@
 //! (docs/v2/plan/lanes/frontend/tokens.md, "Item 4").
 //!
 //! `tt` does not know what a word means: whoever makes them (`syntax_bridge`) does, from the
-//! tokens [`TopSubtree::for_each_slotted_token`] gives. The tree only keeps them and finds a
+//! tokens [`Tree::for_each_slotted_token`] gives. The tree only keeps them and finds a
 //! view's.
 
 use std::{fmt, hash::Hash, sync::OnceLock};
 
 use span::{Edition, SyntaxContext};
 
-use super::{Node, SUBTREE, TopSubtree};
+use super::{Node, SUBTREE, Tree};
 use crate::{DelimiterKind, TokenTreesView};
 
 /// A tree's tokens as the parser's words, in the parser's order: an open and a close for each
@@ -20,7 +20,7 @@ use crate::{DelimiterKind, TokenTreesView};
 pub struct TreeWords {
     /// The words, then whatever their maker puts after the last (the parser's end padding).
     words: Box<[u32]>,
-    /// Per slot ([`TopSubtree::token_slots`]), the index of its token's word. The ident of a
+    /// Per slot ([`Tree::token_slots`]), the index of its token's word. The ident of a
     /// lifetime has its `'`'s; a token without a word (an invisible delimiter) the next word's.
     at: Box<[u32]>,
     /// Sorted: each word that starts a fragment, with the node of the invisible group whose
@@ -37,7 +37,7 @@ pub struct TreeWords {
 impl TreeWords {
     /// The words of `tree`, as described on [`TreeWords`].
     pub fn new(
-        tree: &TopSubtree,
+        tree: &Tree,
         words: Box<[u32]>,
         at: Box<[u32]>,
         fragment_starts: Box<[(u32, u32)]>,
@@ -85,13 +85,13 @@ impl<'w> ViewWords<'w> {
 impl<'a> TokenTreesView<'a> {
     /// The tree the view is of.
     #[inline]
-    pub fn tree(&self) -> &'a TopSubtree {
+    pub fn tree(&self) -> &'a Tree {
         self.tree
     }
 
-    /// The words the view's tree keeps ([`TopSubtree::words`], made by `make` the first time).
+    /// The words the view's tree keeps ([`Tree::words`], made by `make` the first time).
     #[inline]
-    pub fn tree_words(&self, make: impl FnOnce(&TopSubtree) -> TreeWords) -> &'a TreeWords {
+    pub fn tree_words(&self, make: impl FnOnce(&Tree) -> TreeWords) -> &'a TreeWords {
         self.tree.words(make)
     }
 
@@ -136,10 +136,11 @@ impl<'a> TokenTreesView<'a> {
     }
 }
 
-impl TopSubtree {
+impl Tree {
     /// The parser's words of the tree's tokens: `make`'s, the first time any are asked for.
     #[inline]
-    pub fn words(&self, make: impl FnOnce(&TopSubtree) -> TreeWords) -> &TreeWords {
+    pub fn words(&self, make: impl FnOnce(&Tree) -> TreeWords) -> &TreeWords {
+        debug_assert!(self.keeps_words(), "a task's tree keeps no words");
         self.words.0.get_or_init(|| make(self))
     }
 }

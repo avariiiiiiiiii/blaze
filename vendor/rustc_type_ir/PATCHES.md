@@ -75,6 +75,47 @@ Why: hir-ty keeps impls keyed by simplified self type in sorted tables (`v2/requ
 "items-hirty: simplified self types as `u32`"). The order is only a table key: no output may
 depend on it, since it follows `DefId`'s order.
 
+### 0006-solver-storage-recycled
+
+What: the search graph's per-goal temporaries live inline or in storage a worker keeps:
+- `CycleHeads` and `CandidateHeadUsages` are `SmallVec`s of `(StackDepth, _)` sorted by depth
+  (4 and 2 inline) instead of `BTreeMap`s; every lookup, insert and iteration keeps upstream's
+  depth order.
+- `SearchGraphStorage<X, S>` holds an emptied stack, provisional cache, the provisional cache's
+  spare entry lists and the delegate's `Delegate::Scratch`. `SearchGraph::new_in` builds a graph
+  from one, `into_storage` empties the graph back into one, keeping capacity; `new` is
+  `new_in` with empty storage. Entry lists the provisional cache drops go to the spares.
+- `Interner::mk_external_constraints_ref(&data)`, by default `mk_external_constraints` of a
+  clone, so an interner can intern from a borrow and the caller reuse the buffers.
+- `InferCtxtLike::clone_opaque_types_added_since_into(prev, &mut Vec)`, by default extending
+  from `clone_opaque_types_added_since`, so the caller's list can be a reused one.
+- Tests (with `blaze-alloc-count` as the test allocator): three cycle heads keep depth order
+  without allocating, merging two-head usages allocates nothing, a recycled graph holds what it
+  held and starts empty, and a recycled graph solves an acyclic goal without allocating.
+
+Why: `v2/requests/mem-db-solver.md` sections 1, 2 and 4. Every root goal built a fresh graph and
+`BTreeMap` nodes per cycle head; type inference solves millions of goals. The proof-tree entry
+(`evaluate_root_goal_for_proof_tree_raw`) still uses `new`: no delegate reaches it, and it is a
+diagnostics path.
+
+### 0007-fast-path-depth
+
+What: `solve::FastPathDepth` (`Added`, `Evaluating(Option<usize>)`, `Any(Option<usize>)`, with
+`depth_free` and `available`), which says what `SolverDelegate::compute_goal_fast_path` may
+answer where it is asked, and `ComputeGoalFastPathOutcome::HoldsWithin { required_depth }`.
+`SearchGraph::nested_available_depth(lower_available_depth)` gives the depth a nested goal
+evaluated now gets (`evaluate_goal`'s `allowed_depth_for_nested`), and
+`SearchGraph::charge_answered_nested(available, required)` charges the current goal as a
+global cache hit of that required depth with no nested goals is charged.
+`rustc_next_trait_solver`'s patch `0005-fast-path-depth` uses them.
+
+Why: hir-ty's shape table proves auto-trait and one-impl `Copy`/`Clone` goals that rustc
+proves through the search graph. Answered without charging depth, a goal near the recursion
+limit held in blaze where rustc overflows (E0275). An answer that stands for an evaluation now
+fits in, and costs, the depth the search graph would give it
+(`docs/v2/plan/lanes/frontend/fast-trait.md`, "Depth"; `v2/requests/db-ty.md`, "the shape table
+charges search-graph depth as rustc does").
+
 ## Dropped since the previous base (ra-ap-rustc_type_ir 0.166.0, rustc `ce89c898`)
 
 - The backport of rust-lang/rust#159228 (the retry with twice the recursion limit:

@@ -2,7 +2,8 @@
 //! definition (the crate's own or a dependency's: an item, a field, an associated item, a
 //! variant, a macro), E0658 of a use of an unstable one of a crate with
 //! `#![feature(staged_api)]`, `useless_deprecated` and the `unused_attributes` of a
-//! `#[deprecated]` that does nothing, and the warning of `#[macro_escape]`.
+//! `#[deprecated]` that does nothing, `ineffective_unstable_trait_impl` of an `#[unstable]`
+//! trait impl of stable types and traits, and the warning of `#[macro_escape]`.
 //!
 //! Each is reported where rustc reports it: a path name resolution resolves by the
 //! `Checker` of `check_mod_unstable_api_usage` after `check_mod_attrs`, module by module
@@ -79,6 +80,7 @@ fn deprecated(
     let kind = def.descr(cx.db);
     let path = def::path(cx, def)?;
     let mut diag = deprecation_diag(cx, depr, kind, &path, site.span, suggestion);
+    // alloc: the fact of a deprecation that fires
     diag.fact_opt(definition_fact(cx, def), format!("the attributes of `{path}`"));
     source_fact(cx, &mut diag, site.at);
     Some(Found::lint(diag, site.phase, site.at))
@@ -87,6 +89,10 @@ fn deprecated(
 /// `deprecated` of the parent segment `def` of a path to an item allowed through unstable
 /// modules, with the item's message (`Checker::visit_path`).
 fn deprecated_through(cx: &Cx<'_, '_>, def: Def, message: &str, site: Site) -> Option<Found> {
+    if !cx.lint_may_fire(LintId::named("deprecated")) {
+        return None;
+    }
+    // alloc: the note of a deprecation that may fire, past the level test
     let depr = Deprecation { since: Since::Unspecified, note: Some(message.to_owned()), suggestion: None };
     deprecated(cx, def, &depr, site, None)
 }
@@ -94,6 +100,7 @@ fn deprecated_through(cx: &Cx<'_, '_>, def: Def, message: &str, site: Site) -> O
 /// The macro deprecation of `early_report_macro_deprecation`: kind `macro`, the path as written.
 fn deprecated_macro(cx: &Cx<'_, '_>, mac: hir::Macro, depr: &Deprecation, path: &str, site: Site) -> Found {
     let mut diag = deprecation_diag(cx, depr, "macro", path, site.span, Some(site.span));
+    // alloc: the fact of a macro deprecation that fires
     diag.fact_opt(definition_fact(cx, Def::Item(ModuleDef::Macro(mac))), format!("the attributes of `{path}`"));
     source_fact(cx, &mut diag, site.at);
     Found::lint(diag, site.phase, site.at)
@@ -110,11 +117,29 @@ fn macro_escape(cx: &Cx<'_, '_>, range: InFile<TextRange>, inner: bool, at: InFi
     Found::new(diag, Phase::Resolve)
 }
 
+/// `IneffectiveUnstableImpl`: the `#[unstable]` at `span` of the trait impl at `at` has no
+/// effect, every definition its self type and trait name (`defs`) being stable.
+fn ineffective_unstable_impl(cx: &Cx<'_, '_>, span: InFile<TextRange>, at: InFile<SyntaxNodePtr>, defs: &[Def]) -> Found {
+    let mut diag =
+        Diag::lint("ineffective_unstable_trait_impl", "an `#[unstable]` annotation here has no effect", cx.span(span));
+    diag.note("see issue #55436 <https://github.com/rust-lang/rust/issues/55436> for more information");
+    for &def in defs {
+        if let Some(path) = def::path(cx, def) {
+            // alloc: the facts of an `ineffective_unstable_trait_impl` that fires
+            diag.fact_opt(definition_fact(cx, def), format!("the stability of `{path}`"));
+        }
+    }
+    source_fact(cx, &mut diag, at);
+    Found::lint(diag, Phase::Items, at)
+}
+
 /// `report_unstable` of a use of `def` (whose path, for the fact, is `path`).
 fn unstable(cx: &Cx<'_, '_>, def: Def, path: Option<&str>, stability: &Stability, site: Site) -> Option<Found> {
     let mut diag = unstable_diag(cx, stability, site.span)?;
+    // alloc: the path of an E0658 that fires, for its fact
     let path = path.map(str::to_owned).or_else(|| def::path(cx, def));
     if let Some(path) = path {
+        // alloc: the fact of an E0658 that fires
         diag.fact_opt(definition_fact(cx, def), format!("the stability of `{path}`"));
     }
     source_fact(cx, &mut diag, site.at);
@@ -138,15 +163,19 @@ fn deprecation_diag(
     span: InFile<TextRange>,
     suggestion: Option<InFile<TextRange>>,
 ) -> Diag {
+    // alloc: the message of a deprecation that fires
     let note = depr.note.as_ref().map(|it| format!(": {it}")).unwrap_or_default();
     let (lint, message) = match (&depr.since, depr.is_in_effect()) {
+        // alloc: the message of a deprecation that fires
         (_, true) => ("deprecated", format!("use of deprecated {kind} `{path}`{note}")),
         (Since::RustcVersion(version), false) => (
             "deprecated_in_future",
+            // alloc: the message of a deprecation that fires
             format!("use of {kind} `{path}` that will be deprecated in future version {version}{note}"),
         ),
         (_, false) => (
             "deprecated_in_future",
+            // alloc: the message of a deprecation that fires
             format!("use of {kind} `{path}` that will be deprecated in a future Rust version{note}"),
         ),
     };
@@ -156,7 +185,9 @@ fn deprecation_diag(
     {
         diag.suggestion_verbose(
             cx.span(at),
+            // alloc: the suggestion of a deprecation that fires
             format!("replace the use of the deprecated {kind}"),
+            // clone: the replacement text the firing diagnostic's suggestion owns; the index keeps its own
             replacement.clone(),
             Applicability::MachineApplicable,
         );
@@ -170,14 +201,19 @@ fn unstable_diag(cx: &Cx<'_, '_>, stability: &Stability, span: InFile<TextRange>
     let Stability::Unstable { feature, reason, issue, .. } = stability else { return None };
     let feature = feature.as_str();
     let message = match reason {
+        // alloc: the message of an E0658 that fires
         Some(reason) => format!("use of unstable library feature `{feature}`: {reason}"),
+        // alloc: the message of an E0658 that fires
         None => format!("use of unstable library feature `{feature}`"),
     };
     let mut diag = Diag::error(Some("E0658"), message, cx.span(span));
     if let Some(issue) = issue {
+        // alloc: the note of an E0658 that fires
         diag.note(format!("see issue #{issue} <https://github.com/rust-lang/rust/issues/{issue}> for more information"));
     }
+    // alloc: the help of an E0658 that fires
     diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));
+    // alloc: the note of an E0658 that fires
     diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
     Some(diag)
 }

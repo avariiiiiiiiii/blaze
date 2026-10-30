@@ -4,6 +4,7 @@ use std::{cell::OnceCell, fmt, ops::Deref, sync::LazyLock};
 
 use base_db::{Db, Crate};
 use blaze_hashcons::{Consed, HashCons, Interned};
+use blaze_mem::Frame;
 use blaze_ids::{Domain, Hasher};
 use hir_def::{
     AdtId, EnumId, EnumVariantId, LocalFieldId, StructId, VariantId,
@@ -23,7 +24,6 @@ use rustc_type_ir::{
     FloatTy, IntTy, TypeVisitableExt as _, UintTy,
     inherent::{GenericArgs as _, IntoKind},
 };
-use smallvec::SmallVec;
 
 use crate::{
     ParamEnvAndCrate,
@@ -171,7 +171,7 @@ impl<F> From<LayoutCalculatorError<F>> for LayoutError {
 
 /// What a layout reads of a struct's signature: its flags. A rename, or a change to its
 /// generics or their bounds, leaves this equal.
-#[salsa::tracked]
+#[salsa::tracked(mem_tag = Infer)]
 pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
     StructSignature::of(db, id).flags
 }
@@ -180,7 +180,7 @@ pub fn struct_flags(db: &Db, id: StructId) -> StructFlags {
 /// stays last for all of them, so that unsizing the struct does not move it. The answer reads
 /// the struct's own declaration and the crate's `Sized`, never a layout's generic arguments, so
 /// it is asked once per struct and crate rather than once per instantiation.
-#[salsa::tracked]
+#[salsa::tracked(mem_tag = Infer)]
 pub fn struct_tail_may_be_unsized(db: &Db, id: StructId, krate: Crate) -> bool {
     variant_field_ids(db, id.into()).last().is_some_and(|&fd| {
         let interner = DbInterner::new_with(db, krate);
@@ -192,15 +192,21 @@ pub fn struct_tail_may_be_unsized(db: &Db, id: StructId, krate: Crate) -> bool {
 
 /// The fields of a variant, in order: what a layout reads of them besides their types. A
 /// field's rename or visibility leaves this equal.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 pub fn variant_field_ids(db: &Db, variant: VariantId) -> Box<[LocalFieldId]> {
-    variant.fields(db).fields().iter().map(|(id, _)| id).collect()
+    let fields = variant.fields(db).fields();
+    let mut ids = Vec::with_capacity(fields.len());
+    ids.extend(fields.iter().map(|(id, _)| id));
+    ids.into_boxed_slice()
 }
 
 /// The variants of an enum, in order: what a layout reads of them besides their fields.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 pub fn enum_variant_ids(db: &Db, id: EnumId) -> Box<[EnumVariantId]> {
-    id.enum_variants(db).variants.values().map(|&(variant, _)| variant).collect()
+    let variants = &id.enum_variants(db).variants;
+    let mut ids = Vec::with_capacity(variants.len());
+    ids.extend(variants.values().map(|&(variant, _)| variant));
+    ids.into_boxed_slice()
 }
 
 struct LayoutCx<'a> {
@@ -247,17 +253,20 @@ fn layout_of_simd_ty<'db>(
 /// A `#[rustc_scalable_vector(N)] struct S(T)` or a `#[rustc_scalable_vector] struct Sx2(S, S)` of
 /// such: rustc's `scalable_vector_parts` and `layout_of_scalable_vector_type`. Its size is that
 /// of the vector at the least vector length, `size_of::<T>() * N` times the vectors of a tuple.
-fn layout_of_scalable_vector_ty<'db>(
+fn layout_of_scalable_vector_ty<'db, 'f>(
     db: &'db Db,
+    frame: &'f Frame,
     id: StructId,
     args: &GenericArgs<'db>,
     env: ParamEnvAndCrate<'db>,
     dl: &TargetDataLayout,
 ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     let interner = DbInterner::new_no_crate(db);
-    let only_field = |id: StructId| -> Result<Vec<Ty<'db>>, LayoutError> {
+    let only_field = |id: StructId| -> Result<Vec<Ty<'db>, &'f Frame>, LayoutError> {
         let fields = db.field_types(id.into());
-        Ok(fields.iter().map(|f| (*f.1).ty().instantiate(interner, args).skip_norm_wip()).collect())
+        let mut tys = Vec::with_capacity_in(fields.len(), frame);
+        tys.extend(fields.iter().map(|f| (*f.1).ty().instantiate(interner, args).skip_norm_wip()));
+        Ok(tys)
     };
     let repr = |id: StructId| AttrFlags::repr(db, id.into()).unwrap_or_default().scalable;
     let fields = only_field(id)?;
@@ -343,42 +352,51 @@ impl<'db> Normalizer<'db> {
     }
 }
 
-/// Fields a layout keeps on the stack before its buffers spill to the heap: each buffer is
-/// eight pointers, 64 bytes.
-const FIELDS_INLINE: usize = 8;
-
 /// A tuple's or closure's fields laid out as one variant.
 fn univariant<'db>(
     cx: &LayoutCx<'_>,
     db: &'db Db,
+    frame: &Frame,
     tys: impl Iterator<Item = Ty<'db>>,
     trait_env: &StoredParamEnvAndCrate,
     kind: StructKind,
 ) -> Result<Layout, LayoutError> {
-    let fields = tys
-        .map(|ty| field_layout(db, ty.store(), trait_env.clone()))
-        .collect::<Result<SmallVec<[&Layout; FIELDS_INLINE]>, _>>()?;
-    univariant_of(cx, &fields, kind)
+    let mut fields = Vec::with_capacity_in(tys.size_hint().0, frame);
+    for ty in tys {
+        // clone: the env is two `u32` handles
+        fields.push(field_layout(db, ty.store(), trait_env.clone())?);
+    }
+    univariant_of(cx, frame, &fields, kind)
 }
 
 fn univariant_of(
     cx: &LayoutCx<'_>,
+    frame: &Frame,
     fields: &[&Layout],
     kind: StructKind,
 ) -> Result<Layout, LayoutError> {
-    let fields: SmallVec<[&&Layout; FIELDS_INLINE]> = fields.iter().collect();
+    let fields: &[&&Layout] = frame.alloc_slice_from_iter(fields.iter());
     Ok(cx.calc.layout_of_univariant(
-        IndexSlice::<RustcFieldIdx, _>::from_raw(&fields),
+        IndexSlice::<RustcFieldIdx, _>::from_raw(fields),
         &ReprOptions::default(),
         kind,
     )?)
 }
 
-#[salsa::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone))]
+#[salsa::tracked(cycle_result = layout_of_ty_cycle_result, returns(clone), mem_tag = Infer)]
 pub fn layout_of_ty_query(
     db: &Db,
     ty: StoredTy,
     trait_env: StoredParamEnvAndCrate,
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
+    blaze_mem::frame::current(|frame| layout_of_ty_in(db, ty, trait_env, frame))
+}
+
+fn layout_of_ty_in(
+    db: &Db,
+    ty: StoredTy,
+    trait_env: StoredParamEnvAndCrate,
+    frame: &Frame,
 ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     let krate = trait_env.krate;
     let Ok(target) = db.target_data_layout(krate) else {
@@ -396,6 +414,7 @@ pub fn layout_of_ty_query(
                     if repr.scalable.is_some() {
                         return layout_of_scalable_vector_ty(
                             db,
+                            frame,
                             s,
                             &args,
                             trait_env.as_ref(db),
@@ -480,7 +499,7 @@ pub fn layout_of_ty_query(
         TyKind::Tuple(tys) => {
             let kind =
                 if tys.is_empty() { StructKind::AlwaysSized } else { StructKind::MaybeUnsized };
-            univariant(&cx, db, tys.iter(), &trait_env, kind)?
+            univariant(&cx, db, frame, tys.iter(), &trait_env, kind)?
         }
         TyKind::Array(element, count) => {
             let count = try_const_usize(db, count).ok_or(LayoutError::HasErrorConst)? as u64;
@@ -553,7 +572,7 @@ pub fn layout_of_ty_query(
             // so stays last, where a closure's fields are all free to move.
             let upvars = ty.closure_upvars_ty().expect("a closure");
             let upvars = rustc_type_ir::inherent::Ty::tuple_fields(upvars);
-            univariant(&cx, db, upvars.iter(), &trait_env, StructKind::AlwaysSized)?
+            univariant(&cx, db, frame, upvars.iter(), &trait_env, StructKind::AlwaysSized)?
         }
         TyKind::Coroutine(id, args) => {
             // Laid out as rustc's `coroutine_layout` lays it out: what was captured and where
@@ -562,52 +581,49 @@ pub fn layout_of_ty_query(
             // `CoroutineFrame` says which field is which.
             let args = args.as_coroutine();
             let parent_args = GenericArgs::new_from_slice(args.parent_args());
-            let body = if crate::mir::is_by_move_coroutine(db, id.0, args) {
-                db.monomorphized_runtime_mir_body_for_coroutine_by_move(
-                    id.0,
-                    parent_args.store(),
-                    trait_env.clone(),
-                )
-            } else {
-                db.monomorphized_runtime_mir_body_for_coroutine(
-                    id.0,
-                    parent_args.store(),
-                    trait_env.clone(),
-                )
+            let owner = crate::mir::MirOwner::coroutine(db, id.0, args);
+            let runtime = crate::mir::MirStage::Runtime;
+            let body = db
+                .monomorphized_mir(owner, runtime, parent_args.store(), trait_env.clone()) // clone: two `u32` handles
+                .map_err(|_| LayoutError::Unknown)?;
+            let held = body.held_locals_in(frame);
+            let upvar_tys = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty());
+            let mut upvars = Vec::with_capacity_in(upvar_tys.len(), frame);
+            for ty in upvar_tys.iter() {
+                // clone: the env is two `u32` handles
+                upvars.push(field_layout(db, ty.store(), trait_env.clone())?);
             }
-            .map_err(|_| LayoutError::Unknown)?;
-            let held = body.locals_held_across_yields();
-            let upvars = rustc_type_ir::inherent::Ty::tuple_fields(args.tupled_upvars_ty())
-                .iter()
-                .map(|ty| field_layout(db, ty.store(), trait_env.clone()))
-                .collect::<Result<SmallVec<[_; FIELDS_INLINE]>, _>>()?;
             // Each local is a `MaybeUninit` of its type, as rustc has it: nothing of it is a
             // niche.
-            let locals = held
-                .locals
-                .iter()
-                .map(|&local| {
-                    let of = field_layout(db, body.locals[local].ty.clone(), trait_env.clone())?;
-                    let mut layout = LayoutData::unit(dl, true);
-                    layout.size = of.size;
-                    layout.align = of.align;
-                    Ok(layout)
-                })
-                .collect::<Result<Vec<_>, LayoutError>>()?;
-            let prefix = upvars.iter().collect::<IndexVec<RustcFieldIdx, _>>();
-            let locals = locals.iter().collect::<SmallVec<[&Layout; FIELDS_INLINE]>>();
-            let locals = locals.iter().collect::<SmallVec<[&&Layout; FIELDS_INLINE]>>();
-            let locals = IndexSlice::<usize, _>::from_raw(&locals);
+            let mut locals = Vec::with_capacity_in(held.locals.len(), frame);
+            for &local in held.locals.iter() {
+                // clone: a stored type and the env are `u32` handles
+                let of = field_layout(db, body.locals[local].ty.clone(), trait_env.clone())?;
+                let mut layout = LayoutData::unit(dl, true);
+                layout.size = of.size;
+                layout.align = of.align;
+                locals.push(layout);
+            }
+            // alloc: `layout_of_coroutine` takes the prefix by value and pushes the state and the
+            // promoted locals onto it; this is its one block, at the most it can hold.
+            let mut prefix =
+                IndexVec::<RustcFieldIdx, _>::with_capacity(upvars.len() + 1 + locals.len());
+            prefix.extend(upvars.iter());
+            let locals: &[&Layout] = frame.alloc_slice_from_iter(locals.iter());
+            let locals: &[&&Layout] = frame.alloc_slice_from_iter(locals.iter());
+            let locals = IndexSlice::<usize, _>::from_raw(locals);
             // The body has not started, has returned or has panicked, and holds nothing then.
+            // alloc: `layout_of_coroutine` takes `IndexVec`s (R-abi lifts this)
             let mut kept: IndexVec<RustcEnumVariantIdx, IndexVec<RustcFieldIdx, usize>> =
-                IndexVec::from_elem_n(IndexVec::new(), CoroutineFrame::SUSPENDED);
+                IndexVec::with_capacity(CoroutineFrame::SUSPENDED + held.yields.len());
+            kept.extend((0..CoroutineFrame::SUSPENDED).map(|_| IndexVec::new()));
+            // alloc: one exact `IndexVec` per yield, as `layout_of_coroutine` takes them
             kept.extend(held.yields.iter().map(|it| it.kept.iter().copied().collect()));
+            // alloc: `layout_of_coroutine` reads the conflicts as a `BitMatrix`
             let mut conflicts = BitMatrix::new(locals.len(), locals.len());
             for a in 0..locals.len() {
-                for b in 0..locals.len() {
-                    if held.conflict(a, b) {
-                        conflicts.insert(a, b);
-                    }
+                for b in held.conflicts_of(a) {
+                    conflicts.insert(a, b);
                 }
             }
             let state = Layout::scalar(dl, CoroutineFrame::state_scalar(held.yields.len()));
@@ -683,27 +699,25 @@ pub fn layout_of_ty_query(
                 PatternKind::Or(variants) => match variants[0].kind() {
                     PatternKind::Range { .. } => {
                         if let BackendRepr::Scalar(scalar) = &mut layout.backend_repr {
-                            let variants: Result<Vec<_>, _> = variants
-                                .iter()
-                                .map(|pat| match pat.kind() {
-                                    PatternKind::Range { start, end } => Ok::<_, LayoutError>((
-                                        extract_const_value(start)?
-                                            .try_to_bits(db, trait_env.as_ref(db))
-                                            .ok_or(LayoutError::Unknown)?,
-                                        extract_const_value(end)?
-                                            .try_to_bits(db, trait_env.as_ref(db))
-                                            .ok_or(LayoutError::Unknown)?,
-                                    )),
-                                    PatternKind::NotNull | PatternKind::Or(_) => {
-                                        Err(LayoutError::Unknown)
-                                    }
-                                })
-                                .collect();
-                            let mut variants = variants?;
+                            let mut ranges = Vec::with_capacity_in(variants.len(), frame);
+                            for pat in variants.iter() {
+                                let PatternKind::Range { start, end } = pat.kind() else {
+                                    return Err(LayoutError::Unknown);
+                                };
+                                ranges.push((
+                                    extract_const_value(start)?
+                                        .try_to_bits(db, trait_env.as_ref(db))
+                                        .ok_or(LayoutError::Unknown)?,
+                                    extract_const_value(end)?
+                                        .try_to_bits(db, trait_env.as_ref(db))
+                                        .ok_or(LayoutError::Unknown)?,
+                                ));
+                            }
+                            let mut variants = ranges;
                             if !scalar.is_signed() {
                                 return Err(LayoutError::HasErrorType);
                             }
-                            variants.sort();
+                            variants.sort_unstable();
                             if variants.len() != 2 {
                                 return Err(LayoutError::HasErrorType);
                             }
@@ -978,7 +992,7 @@ mod tests {
         let tail = unsized_field(&dl);
         let mut seed = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         for case in 0..400 {
-            // Up to twelve fields, past the eight kept on the stack.
+            // Up to twelve fields.
             let len = seed.index(13);
             let mut fields: Vec<&Layout> = (0..len).map(|_| &pool[seed.index(pool.len())]).collect();
             let kinds: &[StructKind] = match case % 3 {
@@ -994,7 +1008,9 @@ mod tests {
             };
             for &kind in kinds {
                 assert_eq!(
-                    univariant_of(&cx, &fields, kind),
+                    blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+                        univariant_of(&cx, frame, &fields, kind)
+                    }),
                     univariant_with_vecs(&cx, &fields, kind),
                     "case {case}, {len} fields",
                 );

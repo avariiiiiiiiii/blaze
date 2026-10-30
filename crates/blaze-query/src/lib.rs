@@ -1,3 +1,4 @@
+#![feature(allocator_api)]
 //! blaze v2's query database (docs/v2/plan/lanes/db.md section 7, docs/v2/plan/lanes/items.md section 6.2), remade
 //! from `vendor/salsa`.
 //!
@@ -43,6 +44,8 @@
 mod image;
 mod memo;
 mod segment;
+mod subtree;
+mod sync;
 mod table;
 pub mod tree;
 
@@ -52,17 +55,21 @@ mod tests;
 use std::{
     any::{Any, TypeId},
     cell::{Cell, RefCell},
+    collections::VecDeque,
     fmt,
-    sync::{Arc, OnceLock, atomic::AtomicU64, atomic::Ordering},
+    sync::{Arc, OnceLock},
 };
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{FormatError, Persist, SchemaHash, Writer};
 use blaze_graph::pump::{self, Flights};
-use blaze_ids::{ContentId, Fingerprint, Hasher, Idx, bits::BitSet};
+use blaze_ids::{
+    ContentId, Fingerprint, Hasher, Idx,
+    bits::{BitSet, Bits},
+};
 use blaze_image::{Builder, Corrupt, Image, Refused, SectionId};
 use blaze_protocol::cbor;
-use blaze_reclaim::{Grace, Guard, Limbo};
+use blaze_reclaim::{Grace, Guard};
 use blaze_vfs::{View, ViewId};
 use serde::{Deserialize, Serialize};
 
@@ -70,9 +77,16 @@ use crate::{
     image::ImageMap,
     memo::{MemoId, Slot, Store},
     segment::Span,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        thread_local,
+    },
     table::{Column, EdgeRecord, Edit, FxMap, FxSet, Map, Rows, ShortLock},
 };
-pub use crate::tree::{MemTree, Tree};
+pub use crate::{
+    subtree::TreeHash,
+    tree::{MemTree, Tree},
+};
 
 /// A kind of query, by number. Numbers are given in `blaze-query`'s [`kinds`] for the
 /// database's own, and by the crate that defines the rest (facts are `blaze-items`'s); one
@@ -143,6 +157,14 @@ pub mod kinds {
     pub const DIR: QueryKind = QueryKind(2);
     /// The view's configuration (target, profile, features asked for): its content ID.
     pub const CONFIG: QueryKind = QueryKind(3);
+    /// The hash of everything below a directory of a view ([`crate::Cx::tree`]), one per
+    /// directory: the database's own query, not an input.
+    pub const TREE: QueryKind = QueryKind(4);
+    /// A file of an immutable root other than the view's, by root and path: its content ID.
+    pub const FILE_AT: QueryKind = QueryKind(5);
+    /// A directory of an immutable root other than the view's, by root and path: the content
+    /// ID of its sorted names.
+    pub const DIR_AT: QueryKind = QueryKind(6);
     /// Facts (`blaze-items`): `0x1000..0x2000`.
     pub const FACTS: std::ops::Range<u16> = 0x1000..0x2000;
     /// The front end's queries (parse, expand, resolve, infer, MIR): `0x2000..0x4000`.
@@ -151,10 +173,12 @@ pub mod kinds {
     pub const BACK: std::ops::Range<u16> = 0x4000..0x5000;
     /// Build scripts, proc macros and tests: `0x5000..0x6000`.
     pub const USER: std::ops::Range<u16> = 0x5000..0x6000;
+    /// The workspace load and the unit graph (lane cargo): `0x6000..0x6800`.
+    pub const CARGO: std::ops::Range<u16> = 0x6000..0x6800;
 }
 
 fn is_input(kind: QueryKind) -> bool {
-    matches!(kind, kinds::FILE | kinds::DIR | kinds::CONFIG)
+    matches!(kind, kinds::FILE | kinds::DIR | kinds::CONFIG | kinds::FILE_AT | kinds::DIR_AT)
 }
 
 /// What a query is asked of: its kind and the content ID of its arguments, which are content
@@ -184,8 +208,8 @@ impl QueryKey {
 /// One dependency of a result: the query it read, and that query's fingerprint when it did.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Edge {
-    pub read: QueryKey,
     pub saw: Fingerprint,
+    pub read: QueryKey,
 }
 
 /// What the database keeps of one result.
@@ -218,10 +242,16 @@ pub enum Input {
     File(String),
     Dir(String),
     Config,
+    /// A file under an immutable root of the tree other than the view's ([`Cx::file_at`]).
+    FileAt { root: ContentId, path: String },
+    /// A directory under an immutable root of the tree other than the view's ([`Cx::dir_at`]).
+    DirAt { root: ContentId, path: String },
 }
 
 /// The domain of an input's path in its [`QueryKey`].
 pub const PATH_DOMAIN: &str = "blaze v2 db input path 1";
+/// The domain of an immutable root and a path under it in an input's [`QueryKey`].
+pub const ROOT_PATH_DOMAIN: &str = "blaze v2 db input root path 1";
 pub const CONFIG_DOMAIN: &str = "blaze v2 db input config 1";
 /// The domain of a value's bytes: its content ID, and the first 128 bits of it its default
 /// fingerprint.
@@ -236,7 +266,19 @@ impl Input {
             Input::File(path) => Input::file_key(path),
             Input::Dir(path) => Input::dir_key(path),
             Input::Config => Input::config_key(),
+            Input::FileAt { root, path } => Input::file_at_key(*root, path),
+            Input::DirAt { root, path } => Input::dir_at_key(*root, path),
         }
+    }
+
+    /// [`Input::FileAt`]'s key, made without the input.
+    pub fn file_at_key(root: ContentId, path: &str) -> QueryKey {
+        QueryKey { kind: kinds::FILE_AT, input: Hasher::new(ROOT_PATH_DOMAIN).id(&root).part(path.as_bytes()).finish() }
+    }
+
+    /// [`Input::DirAt`]'s key, made without the input.
+    pub fn dir_at_key(root: ContentId, path: &str) -> QueryKey {
+        QueryKey { kind: kinds::DIR_AT, input: Hasher::new(ROOT_PATH_DOMAIN).id(&root).part(path.as_bytes()).finish() }
     }
 
     /// [`Input::File`]'s key, made without the input.
@@ -262,6 +304,9 @@ pub trait Query: 'static {
     /// The content ID of the code of the query's function, for [`Memo::producer`]; set by the
     /// build (blaze's own item hashes of it).
     const PRODUCER: ContentId;
+    /// The subsystem its runs allocate for: each run is a `blaze_mem::frame::task` of it, so
+    /// what the run's code takes through `blaze_mem::frame::current` counts there.
+    const TAG: blaze_mem::Tag = blaze_mem::Tag::Query;
     /// Kept as bytes (deterministic CBOR) beside the key's memos and in the image, so a
     /// dependency no one names again can still be run to verify an edge on it.
     type Key: Clone + Send + Sync + Serialize + serde::de::DeserializeOwned + 'static;
@@ -295,9 +340,9 @@ pub(crate) fn value_id(bytes: &[u8]) -> ContentId {
 /// A key handed to a query's runner: the caller's own, or the bytes the database kept.
 #[derive(Clone, Copy)]
 enum KeySource<'a> {
-    // dyn: kinds register at run time into a table of `Runner` fn pointers, so the caller's
-    // key is erased; read back by one `TypeId` compare when the query runs, never on a lookup
-    // that finds its memo.
+    // Kinds register at run time into a table of `Runner` fn pointers, so the caller's key is
+    // erased and read back by one `TypeId` compare when the query runs.
+    // dyn: only when a query runs, never on a lookup that finds its memo.
     Typed(&'a (dyn Any + Send + Sync)),
     Bytes(&'a [u8]),
 }
@@ -364,6 +409,8 @@ struct KindInfo {
     code: u32,
     query: TypeId,
     run: Runner,
+    /// The tag of the frame task each run is ([`Query::TAG`]).
+    tag: blaze_mem::Tag,
     /// The symbols a value of the kind names (`Persist::symbols`), marked live when an image
     /// is written.
     symbols: fn(&[u8], &mut Vec<u32>) -> Result<(), FormatError>,
@@ -464,11 +511,19 @@ impl Drop for Inside {
 #[derive(Clone, Copy)]
 struct Run {
     base: usize,
+    /// A run ahead of its asker ([`Cx::get_all`]): it never waits for a key another task runs
+    /// but gives way at once, so the asker, which waits for it unseen by the cycle check, never
+    /// waits on a chain that leads back to itself.
+    ahead: bool,
 }
 
 impl Run {
     fn new() -> Run {
-        Run { base: STACKS.with(|stacks| stacks.borrow().keys.len()) }
+        Run { base: STACKS.with(|stacks| stacks.borrow().keys.len()), ahead: false }
+    }
+
+    fn ahead() -> Run {
+        Run { ahead: true, ..Run::new() }
     }
 
     /// Panics, naming the chain, if `key` is running in this run already.
@@ -570,9 +625,80 @@ impl<'db> Cx<'db> {
         }
         let query = QueryKey { kind: Q::KIND, input: Q::input(key) };
         let memo = db.find::<Q>(task, state, query, self.run, key)?;
+        self.found::<Q>(query, memo, key)
+    }
+
+    /// Records the edge on `query`, whose memo in the view is `memo`, and reads its value.
+    fn found<Q: Query>(
+        &mut self,
+        query: QueryKey,
+        memo: MemoId,
+        key: &Q::Key,
+    ) -> Result<<Q::Value as Persist>::Ref<'db>, Cancelled> {
+        let (db, task, state) = (self.db, self.task, self.state);
         self.record(query, db.store.fingerprint(task, memo));
         let bytes = db.value_of(task, state, query, memo, self.run, key)?;
         Ok(read_value::<Q>(bytes))
+    }
+
+    /// Each key's value, as [`Cx::get`] of each in turn would give it, with the same edges in
+    /// the same order (so verification and [`Database::why`] see what a loop of `get` makes).
+    /// The keys the view has not resolved run at once: from the first, each other is a job of
+    /// the plane's pool that resolves it ahead, while this task asks them in order and waits
+    /// (pumping, a wait of the plane's) for one still running. A job ahead never waits: a key
+    /// that needs one another task runs is left for this task to ask. The first key that is
+    /// [`Cancelled`] cancels the call; what the jobs resolved stays as memos.
+    ///
+    /// When the view has resolved every key, it allocates only the list it returns.
+    pub fn get_all<Q: Query>(
+        &mut self,
+        keys: &[Q::Key],
+    ) -> Result<Vec<<Q::Value as Persist>::Ref<'db>>, Cancelled> {
+        let (db, task, state) = (self.db, self.task, self.state);
+        if db.kind_of::<Q>().is_none() {
+            panic!("query {} (kind {}) is asked but was never registered", Q::NAME, Q::KIND.0);
+        }
+        // alloc: the values, one list a call.
+        let mut values = Vec::with_capacity(keys.len());
+        for (at, key) in keys.iter().enumerate() {
+            let query = QueryKey { kind: Q::KIND, input: Q::input(key) };
+            let Some(resolved) = state.results.get(task, &query) else {
+                return self.get_rest::<Q>(&keys[at..], values);
+            };
+            let memo = resolved.memo;
+            values.push(self.found::<Q>(query, memo, key)?);
+        }
+        Ok(values)
+    }
+
+    /// [`Cx::get_all`] from its first key the view has not resolved, `keys[0]`: the rest the
+    /// view has not resolved either are resolved ahead by the pool while this task asks every
+    /// key in order.
+    fn get_rest<Q: Query>(
+        &mut self,
+        keys: &[Q::Key],
+        mut values: Vec<<Q::Value as Persist>::Ref<'db>>,
+    ) -> Result<Vec<<Q::Value as Persist>::Ref<'db>>, Cancelled> {
+        let (db, task, state) = (self.db, self.task, self.state);
+        let unresolved = |key: &Q::Key| state.results.get(task, &QueryKey { kind: Q::KIND, input: Q::input(key) }).is_none();
+        if !keys[1..].iter().any(unresolved) {
+            for key in keys {
+                values.push(self.get::<Q>(key)?);
+            }
+            return Ok(values);
+        }
+        let near = blaze_graph::pool::group();
+        blaze_graph::exec::shared().scope(|scope| {
+            for key in keys[1..].iter().filter(|key| unresolved(*key)) {
+                // A job that panics or gives way leaves its key unresolved: this task asks it
+                // in its turn below, runs it itself and meets the same panic.
+                scope.submit(near, move || db.ahead::<Q>(state, key), |_| {});
+            }
+            for key in keys {
+                values.push(self.get::<Q>(key)?);
+            }
+            Ok(values)
+        })
     }
 
     /// A file of the view: its content ID, mode and bytes; `None` for none. Records the edge.
@@ -600,6 +726,46 @@ impl<'db> Cx<'db> {
             InputData::Dir(Some(names)) => Some(&**names),
             _ => None,
         })
+    }
+
+    /// The file at `path` under `root`, a root of the database's tree other than the view's
+    /// (a registry package's source, the standard library's `library/`): its content ID, mode
+    /// and bytes; `None` for none. A root never changes, so this is a pure function of
+    /// `(root, path)`. Records the edge, keyed by both, whose fingerprint is the file's.
+    pub fn file_at(&mut self, root: ContentId, path: &str) -> Result<Option<blaze_vfs::File<'db>>, Cancelled> {
+        let key = Input::file_at_key(root, path);
+        // alloc: the path, only when the database first sees the input.
+        let value = self.db.input(self.task, self.state, key, || Input::FileAt { root, path: path.to_owned() })?;
+        self.record(key, value.fingerprint);
+        Ok(match &value.data {
+            InputData::File(Some((id, mode, bytes))) => {
+                Some(blaze_vfs::File { id: *id, mode: *mode, bytes: &**bytes })
+            }
+            _ => None,
+        })
+    }
+
+    /// The names in a directory under `root`, as [`Cx::dir`] and [`Cx::file_at`]. Records
+    /// the edge.
+    pub fn dir_at(&mut self, root: ContentId, path: &str) -> Result<Option<&'db [(String, bool)]>, Cancelled> {
+        let key = Input::dir_at_key(root, path);
+        // alloc: the path, only when the database first sees the input.
+        let value = self.db.input(self.task, self.state, key, || Input::DirAt { root, path: path.to_owned() })?;
+        self.record(key, value.fingerprint);
+        Ok(match &value.data {
+            InputData::Dir(Some(names)) => Some(&**names),
+            _ => None,
+        })
+    }
+
+    /// The hash of everything below `dir` in the view, `None` for no directory there; with
+    /// `package`, a package's tree as cargo watches it (no name starting with `.`, no top
+    /// `target`). One query per directory, so an edit reruns only the directories above it.
+    /// Records one edge, on `dir`'s query.
+    pub fn tree(&mut self, dir: &str, package: bool) -> Result<Option<[u8; 32]>, Cancelled> {
+        // alloc: the key's path, once per call; its runs make their children's the same way.
+        let key = subtree::SubtreeKey { dir: dir.trim_end_matches('/').to_owned(), package, top: true };
+        self.get::<subtree::Subtree>(&key)
     }
 
     /// The view's configuration, as it was opened with ([`Database::open_with`]). Records the
@@ -632,18 +798,18 @@ pub use blaze_graph::Cancelled;
 /// Why a query reran: from it, each edge whose fingerprint differed, back to an input.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Why {
-    pub query: QueryKey,
     /// The first is what `query` read that changed, the last an input.
     pub chain: Vec<Changed>,
     /// The input at the end, as the view names it.
     pub input: Option<Input>,
+    pub query: QueryKey,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Changed {
     pub key: QueryKey,
-    pub was: Fingerprint,
     pub now: Fingerprint,
+    pub was: Fingerprint,
 }
 
 /// Why the database could not answer.
@@ -696,8 +862,8 @@ impl fmt::Display for DbError {
 #[derive(Clone)]
 pub struct Config {
     /// The files of every view; `None` for a database no query of which reads a file.
-    // The driver's file tree, one a database, called only on an input's first read in a view.
-    // dyn: see above.
+    // The file source, chosen once when the database is made: the VFS's reader, or a `MemTree`.
+    // dyn: called once per input per view, beside hashing what it returns.
     pub tree: Option<Arc<dyn Tree>>,
     /// Its directory under the driver's root, for its cold packs (`<dir>/cold/<n>`). `None`
     /// keeps every value in memory. The image is the daemon's to write ([`Database::write_image`]).
@@ -775,6 +941,66 @@ impl ViewState {
         self.results.reclaim();
         self.inputs.reclaim();
         self.reruns.reclaim();
+    }
+
+    /// Empties it for another view, its maps' tables kept: no reader can be in it.
+    fn reset(&mut self) {
+        self.results.reset();
+        self.inputs.reset();
+        self.reruns.reset();
+    }
+
+    /// Makes it the state of `view`, as `ViewState::new` would.
+    fn reuse(&mut self, id: ViewId, view: View, config: &[u8]) {
+        self.id = id;
+        self.view = view;
+        if *self.config != *config {
+            // alloc: a configuration other than the one of the last view this state served.
+            self.config = Arc::from(config);
+        }
+    }
+}
+
+/// Closed views' states, kept to be the next views opened: each held until no task can still
+/// read it, then emptied, its maps' tables kept, so opening a view and resolving in it
+/// allocates nothing once the database has had as many views open at once.
+#[derive(Default)]
+struct SpareViews {
+    /// Oldest first.
+    held: VecDeque<(Grace, Box<ViewState>)>,
+    ready: Vec<Box<ViewState>>,
+}
+
+/// Emptied states kept; one more closed is freed.
+const SPARE_VIEWS: usize = 8;
+
+impl SpareViews {
+    /// Empties those whose grace has passed, keeping up to [`SPARE_VIEWS`] and freeing the rest.
+    fn sweep(&mut self) {
+        while self.held.front().is_some_and(|(grace, _)| grace.passed()) {
+            let Some((_, mut state)) = self.held.pop_front() else { break };
+            if self.ready.len() < SPARE_VIEWS {
+                state.reset();
+                self.ready.push(state);
+            }
+        }
+    }
+
+    /// An emptied state, emptying first those whose grace has passed.
+    fn take(&mut self) -> Option<Box<ViewState>> {
+        self.sweep();
+        self.ready.pop()
+    }
+
+    /// [`SpareViews::sweep`] of every state held, past its grace or not: for a database
+    /// borrowed `&mut`, which no task reads.
+    fn reclaim(&mut self) {
+        while let Some((_, mut state)) = self.held.pop_front() {
+            if self.ready.len() < SPARE_VIEWS {
+                state.reset();
+                self.ready.push(state);
+            }
+        }
     }
 }
 
@@ -865,8 +1091,9 @@ pub struct Database {
     views: Column<ViewState>,
     /// One run of a key at a time, whatever view asked, on the plane's wait graph (#1301).
     flights: Flights<()>,
-    /// Closed views, until every task that could hold them has ended.
-    limbo: ShortLock<Limbo>,
+    /// Closed views, until every task that could hold them has ended, then kept for the next
+    /// views opened.
+    spare_views: ShortLock<SpareViews>,
     /// Bumped by each collection; a key given a memo since one started is kept by it whole.
     generation: AtomicU64,
     /// The generation each key was last given a memo in: 48 bytes of row a key.
@@ -913,20 +1140,22 @@ impl Pinned<'_> {
 
 impl Database {
     fn blank(config: Config) -> Database {
-        Database {
+        let mut db = Database {
             config,
             kinds: Kinds::new(),
             slots: Map::hot(),
             inputs: Map::new(),
             views: Column::new(),
             flights: Flights::new(),
-            limbo: ShortLock::default(),
+            spare_views: ShortLock::default(),
             generation: AtomicU64::new(0),
             born: Map::new(),
             store: Store::new(),
             image: None,
             io: ShortLock::default(),
-        }
+        };
+        db.register::<subtree::Subtree>();
+        db
     }
 
     /// A database with nothing in it, in memory, that reads no files: for queries of content
@@ -997,6 +1226,7 @@ impl Database {
                 code: self.store.code(Q::Value::SCHEMA, Q::PRODUCER),
                 query: TypeId::of::<Q>(),
                 run: run_query::<Q>,
+                tag: Q::TAG,
                 symbols: <Q::Value as Persist>::symbols,
             },
         );
@@ -1009,14 +1239,30 @@ impl Database {
     /// Opens `view` with its configuration (target, profile, features asked for), what
     /// [`Cx::config`] reads.
     pub fn open_with(&self, view: View, config: &[u8]) -> ViewId {
-        let config: Arc<[u8]> = Arc::from(config);
-        Idx::from_raw(self.views.push(|index| ViewState::new(Idx::from_raw(index), view, config)))
+        let spare = self.spare_views.lock().take();
+        Idx::from_raw(self.views.push_boxed(|index| match spare {
+            Some(mut state) => {
+                state.reuse(Idx::from_raw(index), view, config);
+                state
+            }
+            // alloc: a view's state, until as many views were closed as are open at once.
+            None => Box::new(ViewState::new(Idx::from_raw(index), view, Arc::from(config))),
+        }))
     }
 
     pub fn close(&self, view: ViewId) {
         if let Some(state) = self.views.take(view.raw()) {
-            self.retire([state]);
+            // The take unlinked it: a grace begun now covers every task that could read it.
+            self.spare_views.lock().held.push_back((Grace::start(), state));
         }
+    }
+
+    /// Emptied view states ready for the next views opened.
+    #[cfg(test)]
+    fn ready_views(&self) -> usize {
+        let mut spare = self.spare_views.lock();
+        spare.sweep();
+        spare.ready.len()
     }
 
     /// The database for one request from outside any query: see [`Pinned`].
@@ -1069,119 +1315,130 @@ impl Database {
     pub fn collect(&self, kept: &[QueryKey], effects: &mut Vec<Effect>) {
         let task = blaze_reclaim::enter();
         let started = self.generation.fetch_add(1, Ordering::SeqCst);
-        // Before the views are walked: a memo unlinked earlier is checked against what they
-        // hold now (see `memo`'s comment).
-        let dying = self.store.to_check();
-        // alloc: one bitset a collection each, 1 bit a memo.
-        let mut reached = BitSet::<MemoId>::new(self.store.end() as usize);
-        let mut hot = BitSet::<MemoId>::new(self.store.end() as usize);
-        let mut inputs_kept: FxSet<QueryKey> = FxSet::default();
-        // alloc: once a collection, as are `live`, `unlinked` and `cold` below.
-        let mut work: Vec<MemoId> = Vec::new();
-        self.views.for_each(&task, |state| {
-            state.results.for_each(&task, |_, resolved| {
-                let memo = resolved.memo;
-                hot.insert_growing(memo);
-                work.push(memo);
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+            // Before the views are walked: a memo unlinked earlier is checked against what
+            // they hold now (see `memo`'s comment).
+            let mut dying: Vec<MemoId, _> = Vec::new_in(frame);
+            self.store.to_check(&mut dying);
+            // A bit a memo each.
+            let marks = || {
+                let mut marks = Bits::<_, MemoId>::from_words(Vec::<u64, _>::new_in(frame));
+                marks.grow(self.store.end() as usize);
+                marks
+            };
+            let (mut reached, mut hot) = (marks(), marks());
+            let mut inputs_kept = hashbrown::HashSet::with_hasher_in(rustc_hash::FxBuildHasher, frame);
+            let mut work: Vec<MemoId, _> = Vec::new_in(frame);
+            self.views.for_each(&task, |state| {
+                state.results.for_each(&task, |_, resolved| {
+                    let memo = resolved.memo;
+                    hot.insert_growing(memo);
+                    work.push(memo);
+                });
+                state.inputs.for_each(&task, |key, _| {
+                    inputs_kept.insert(*key);
+                });
             });
-            state.inputs.for_each(&task, |key, _| {
-                inputs_kept.insert(*key);
-            });
-        });
-        self.store.checked(dying, |memo| hot.contains(memo));
-        for key in kept {
-            if is_input(key.kind) {
-                inputs_kept.insert(*key);
-            } else if let Some(slot) = self.slot(&task, key) {
-                work.extend_from_slice(slot.memos());
+            self.store.checked(&dying, |memo| hot.contains(memo));
+            for key in kept {
+                if is_input(key.kind) {
+                    inputs_kept.insert(*key);
+                } else if let Some(slot) = self.slot(&task, key) {
+                    work.extend_from_slice(slot.memos());
+                }
             }
-        }
-        while let Some(memo) = work.pop() {
-            if !reached.insert_growing(memo) {
-                continue;
-            }
-            for edge in self.store.edges(&task, memo) {
-                let read = edge.read();
-                if is_input(read.kind) {
-                    inputs_kept.insert(read);
+            while let Some(memo) = work.pop() {
+                if !reached.insert_growing(memo) {
                     continue;
                 }
-                if let Some(slot) = self.slot(&task, &read) {
-                    let saw = edge.saw();
-                    work.extend(slot.memos().iter().copied().filter(|&it| self.store.fingerprint(&task, it) == saw));
+                for edge in self.store.edges(&task, memo) {
+                    let read = edge.read();
+                    if is_input(read.kind) {
+                        inputs_kept.insert(read);
+                        continue;
+                    }
+                    if let Some(slot) = self.slot(&task, &read) {
+                        let saw = edge.saw();
+                        work.extend(
+                            slot.memos().iter().copied().filter(|&it| self.store.fingerprint(&task, it) == saw),
+                        );
+                    }
                 }
             }
-        }
 
-        let young = |key: &QueryKey| self.born.get(&task, key).is_some_and(|born| *born > started);
-        let mut unlinked = Vec::new(); // alloc: see `work`
-        let mut live: Vec<MemoId> = Vec::new(); // alloc: see `work`; reused for every slot
-        self.slots.edit_all_with(
-            &task,
-            |key, slot| {
-                let memos = slot.memos();
-                if young(key) {
-                    for &memo in memos {
-                        for edge in self.store.edges(&task, memo) {
-                            if is_input(edge.read().kind) {
-                                inputs_kept.insert(edge.read());
+            let young = |key: &QueryKey| self.born.get(&task, key).is_some_and(|born| *born > started);
+            let mut unlinked: Vec<MemoId, _> = Vec::new_in(frame);
+            // Reused for every slot.
+            let mut live: Vec<MemoId, _> = Vec::new_in(frame);
+            self.slots.edit_all_with(
+                &task,
+                |key, slot| {
+                    let memos = slot.memos();
+                    if young(key) {
+                        for &memo in memos {
+                            for edge in self.store.edges(&task, memo) {
+                                if is_input(edge.read().kind) {
+                                    inputs_kept.insert(edge.read());
+                                }
                             }
                         }
+                        return Edit::Keep;
                     }
-                    return Edit::Keep;
-                }
-                live.clear();
-                live.extend(memos.iter().copied().filter(|&memo| reached.contains(memo)));
-                if live.len() == memos.len() {
-                    Edit::Keep
-                } else if !live.is_empty() {
-                    Edit::Replace(self.store.slot(slot.share_key(), &live))
-                } else if self.image.as_ref().is_some_and(|image| !matches!(image.find(key), Ok(None))) {
-                    // Left empty, not removed, so the image's memos of the key stay dropped.
-                    Edit::Replace(self.store.slot(slot.share_key(), &[]))
-                } else {
-                    Edit::Remove
-                }
-            },
-            |old, new| {
-                let still = new.map_or(&[][..], Slot::memos);
-                unlinked.extend(old.memos().iter().copied().filter(|memo| !still.contains(memo)));
-            },
-        );
-        self.store.unlinked(unlinked);
-        if let Some(image) = &self.image {
-            image.for_each_key(|key| {
-                self.slots.get_or_insert_with(&task, key, Slot::empty);
-            });
-        }
-        self.born.retain(&task, |_, born| *born > started);
-        self.inputs.retain(&task, |key, _| inputs_kept.contains(key));
+                    live.clear();
+                    live.extend(memos.iter().copied().filter(|&memo| reached.contains(memo)));
+                    if live.len() == memos.len() {
+                        Edit::Keep
+                    } else if !live.is_empty() {
+                        Edit::Replace(self.store.slot(slot.share_key(), &live))
+                    } else if self.image.as_ref().is_some_and(|image| !matches!(image.find(key), Ok(None))) {
+                        // Left empty, not removed, so the image's memos of the key stay dropped.
+                        Edit::Replace(self.store.slot(slot.share_key(), &[]))
+                    } else {
+                        Edit::Remove
+                    }
+                },
+                |old, new| {
+                    let still = new.map_or(&[][..], Slot::memos);
+                    unlinked.extend(old.memos().iter().copied().filter(|memo| !still.contains(memo)));
+                },
+            );
+            self.store.unlinked(&unlinked);
+            if let Some(image) = &self.image {
+                image.for_each_key(|key| {
+                    self.slots.get_or_insert_with(&task, key, Slot::empty);
+                });
+            }
+            self.born.retain(&task, |_, born| *born > started);
+            self.inputs.retain(&task, |key, _| inputs_kept.contains(key));
 
-        if self.config.dir.is_some() {
-            let mut cold: Vec<(QueryKey, Fingerprint, MemoId)> = reached
-                .iter()
-                .filter(|&memo| !hot.contains(memo) && self.store.stored(&task, memo) == Stored::Memory)
-                .map(|memo| (self.store.key(&task, memo), self.store.fingerprint(&task, memo), memo))
-                .collect(); // alloc: see `work`
-            cold.sort_unstable();
-            self.write_cold(&task, cold.into_iter().map(|(_, _, memo)| memo), effects);
-        }
-        self.collect_retired(&task);
+            if self.config.dir.is_some() {
+                let mut cold: Vec<(QueryKey, Fingerprint, MemoId), _> = Vec::new_in(frame);
+                cold.extend(
+                    reached
+                        .iter()
+                        .filter(|&memo| !hot.contains(memo) && self.store.stored(&task, memo) == Stored::Memory)
+                        .map(|memo| (self.store.key(&task, memo), self.store.fingerprint(&task, memo), memo)),
+                );
+                cold.sort_unstable();
+                self.write_cold(&task, cold.into_iter().map(|(_, _, memo)| memo), effects);
+            }
+            self.collect_retired(&task);
+        });
     }
 
     /// How many closed views and values let go of are still held, after freeing those past
     /// their grace.
     #[cfg(test)]
     fn held(&self) -> usize {
-        let mut limbo = self.limbo.lock();
-        limbo.collect();
-        limbo.len() + self.store.held()
+        let mut spare = self.spare_views.lock();
+        spare.sweep();
+        spare.held.len() + self.store.held()
     }
 
     /// Frees what the database's tables and store let go of whose grace has passed: the
     /// tables' rows first, as a slot's row holds spans of the store's segments.
     fn collect_retired(&self, task: &Guard) {
-        self.limbo.lock().collect(); // alloc: `Limbo::collect` frees, allocating nothing
+        self.spare_views.lock().sweep();
         self.slots.sweep();
         self.inputs.sweep();
         self.born.sweep();
@@ -1329,7 +1586,7 @@ impl Database {
 
     /// Frees everything let go of, past its grace or not: with `&mut`, nothing reads it.
     pub fn reclaim(&mut self) {
-        *self.limbo.get_mut() = Limbo::new();
+        self.spare_views.get_mut().reclaim();
         self.slots.reclaim();
         self.inputs.reclaim();
         self.born.reclaim();
@@ -1369,21 +1626,6 @@ impl Database {
         self.config.tree.as_deref().unwrap_or_else(|| {
             panic!("the database has no file tree to read a view's files from: make it with Database::new")
         })
-    }
-
-    /// Holds `things`, already unlinked, until every task that could hold them has ended, and
-    /// frees what earlier ones held that has passed its grace.
-    fn retire<T: Send + Sync + 'static>(&self, things: impl IntoIterator<Item = T>) {
-        let mut things = things.into_iter().peekable();
-        if things.peek().is_none() {
-            return;
-        }
-        let grace = Grace::start();
-        let mut limbo = self.limbo.lock();
-        for thing in things {
-            limbo.hold(grace, thing);
-        }
-        limbo.collect(); // alloc: `Limbo::collect` frees, allocating nothing
     }
 
     fn view_state<'g>(&'g self, task: &'g Guard, view: ViewId) -> Option<&'g ViewState> {
@@ -1469,8 +1711,9 @@ impl Database {
         if self.slot(task, &query).is_some_and(|slot| slot.key().is_some()) {
             return;
         }
-        let bytes =
-            cbor::to_vec(key).unwrap_or_else(|error| panic!("the key of query {} has no encoding: {error}", Q::NAME));
+        let mut bytes = blaze_mem::scratch::lend_bytes();
+        cbor::append(&mut bytes, key)
+            .unwrap_or_else(|error| panic!("the key of query {} has no encoding: {error}", Q::NAME));
         self.slots.update(task, query, |slot| match slot {
             Some(slot) if slot.key().is_some() => None,
             Some(slot) => Some(self.store.slot(Some(self.store.key_bytes(&bytes)), slot.memos())),
@@ -1482,7 +1725,10 @@ impl Database {
     /// equal one it had already (then `made`, never published, is freed).
     fn add_memo(&self, task: &Guard, key: QueryKey, made: MemoId) -> MemoId {
         self.slot(task, &key);
-        self.born.insert(task, key, self.generation.load(Ordering::SeqCst));
+        // Only ever raised: a giver that loaded the generation before `collect` bumped it must
+        // not lower the stamp of one that loaded it after, or `collect` drops a young memo.
+        let now = self.generation.load(Ordering::SeqCst);
+        self.born.update(task, key, |born| born.is_none_or(|born| *born < now).then_some(now));
         let kept = Cell::new(made);
         self.slots.update(task, key, |slot| {
             let memos = slot.map_or(&[][..], Slot::memos);
@@ -1491,10 +1737,11 @@ impl Database {
                 return None;
             }
             kept.set(made);
-            let mut all = Vec::with_capacity(memos.len() + 1);
-            all.extend_from_slice(memos);
-            all.push(made);
-            Some(self.store.slot(slot.and_then(Slot::share_key), &all))
+            Some(blaze_mem::scratch::with_u32s(|all| {
+                all.extend_from_slice(memos);
+                all.push(made);
+                self.store.slot(slot.and_then(Slot::share_key), all)
+            }))
         });
         let kept = kept.get();
         if kept != made {
@@ -1553,9 +1800,13 @@ impl Database {
 
     fn read_input(&self, state: &ViewState, input: &Input) -> Result<InputValue, Corrupt> {
         let absent = |what: &str| ContentId::of(ABSENT_DOMAIN, what.as_bytes()).fingerprint();
+        let root = match input {
+            Input::FileAt { root, .. } | Input::DirAt { root, .. } => *root,
+            _ => state.view.root,
+        };
         match input {
-            Input::File(path) => {
-                let file = self.tree().file(state.view.root, path)?;
+            Input::File(path) | Input::FileAt { path, .. } => {
+                let file = self.tree().file(root, path)?;
                 let fingerprint = match &file {
                     Some((id, mode, _)) => Hasher::new(FILE_DOMAIN)
                         .id(id)
@@ -1566,8 +1817,15 @@ impl Database {
                 };
                 Ok(InputValue { fingerprint, data: InputData::File(file) })
             }
-            Input::Dir(path) => {
-                let names = self.tree().list(state.view.root, path);
+            Input::Dir(path) | Input::DirAt { path, .. } => {
+                let mut names = self.tree().list(root, path);
+                // Once per directory per view, so neither `Cx::dir`'s callers nor the
+                // fingerprint below depend on the tree's listing order.
+                if let Some(names) = &mut names
+                    && !names.is_sorted_by(|a, b| a.0 <= b.0)
+                {
+                    names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                }
                 let fingerprint = match &names {
                     Some(names) => {
                         let mut hasher = Hasher::new(NAMES_DOMAIN);
@@ -1630,10 +1888,30 @@ impl Database {
 
     /// Runs `work` as the one run of `key`, or waits (pumping) for the run under way and
     /// returns without running it, for the caller to look again. A wait that would close a
-    /// cycle of tasks is [`Cancelled`].
+    /// cycle of tasks is [`Cancelled`]; a run ahead never waits, and a key another task runs
+    /// is [`Cancelled`] to it at once.
     fn single(&self, key: QueryKey, run: Run, work: impl FnOnce() -> Result<(), Cancelled>) -> Result<(), Cancelled> {
         run.check(key);
+        if run.ahead {
+            return self.flights.run_if_idle(key.task_key(), work).unwrap_or(Err(Cancelled));
+        }
         self.flights.get_or_run(key.task_key(), work)
+    }
+
+    /// Resolves `key` in the view as a job of [`Cx::get_all`]'s, in a task of its own, ahead of
+    /// the task that asked, which asks it again in its turn: whatever stops this run (a key
+    /// another task runs, a cancel, a file it can't read) leaves the key for that task.
+    fn ahead<Q: Query>(&self, state: &ViewState, key: &Q::Key) {
+        let task = blaze_reclaim::enter();
+        let query = QueryKey { kind: Q::KIND, input: Q::input(key) };
+        if state.results.get(&task, &query).is_some() {
+            return;
+        }
+        self.learn_key::<Q>(&task, query, key);
+        if self.resolve(&task, state, query, Run::ahead(), Some(key)).is_err() {
+            // Not this job's to report: the asker meets the same file and fails with it.
+            UNREADABLE.with(Cell::take);
+        }
     }
 
     /// [`Database::resolve`] while holding `key`.
@@ -1733,7 +2011,7 @@ impl Database {
         let recording = Recording::start();
         let mut cx = Cx { db: self, task, state, run };
         let _inside = Inside::enter();
-        let computed = (info.run)(&mut cx, source)?;
+        let computed = blaze_mem::frame::task(info.tag, |_| (info.run)(&mut cx, source))?;
         Ok(computed.map(|computed| (computed, recording)))
     }
 

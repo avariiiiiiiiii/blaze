@@ -10,8 +10,8 @@ use base_db::{Crate, CrateOrigin, Db, Env};
 use blaze_format::Aligned;
 use blaze_ids::ContentId;
 use hir_expand::proc_macro::{
-    ExpansionReads, ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
-    report_reads,
+    ExpansionReads, ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError,
+    ProcMacroKind, report_reads,
 };
 use rustc_hash::FxHashMap;
 use test_fixture::WithFixture;
@@ -230,6 +230,35 @@ fn every_dependency_is_stored_and_served() {
     assert_eq!(frozen::differences(), Vec::<String>::new());
 }
 
+/// The key `store` says each image is filed under is the one `serve` then gives it, with reads
+/// and without.
+#[test]
+fn a_stored_image_is_served_under_the_key_store_filed_it_by() {
+    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    for fixture in [FIXTURE, READING] {
+        let memory = Memory::default();
+        let open = || if fixture == READING { reading_db() } else { TestDB::with_files(fixture) };
+        let mut db = open();
+        let crates = all(&db);
+        let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+        let stored = store(&db, &served, &memory).unwrap();
+        assert_eq!(stored.filed.len(), stored.written.len());
+        let filed: FxHashMap<String, ContentId> = stored
+            .filed
+            .iter()
+            .map(|(&krate, &key)| (serve::crate_name(&db, krate), key))
+            .collect();
+        let mut db = open();
+        let crates = all(&db);
+        serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+        let raw: &Db = &db;
+        for (krate, image) in DepImages::try_get(raw).unwrap().images(raw).iter() {
+            assert_eq!(Some(&image.key()), filed.get(&serve::crate_name(raw, *krate)));
+        }
+        assert!(filed.contains_key("lib"), "{filed:?}");
+    }
+}
+
 /// The def maps (with their diagnostics) and lang items of a database that read every
 /// dependency from its image, as the frozen encoding writes them, against a fresh
 /// database's.
@@ -341,22 +370,17 @@ impl ProcMacroExpander for Reading {
     fn expand(
         &self,
         _: &Db,
-        subtree: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        _: span::Span,
-        _: span::Span,
-        _: span::Span,
-        _: String,
+        call: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         report_reads(ExpansionReads::Traced { shape: SHAPE.into(), values: values_of(SHAPE) });
-        Ok(subtree.clone())
+        Ok(call.subtree.copy())
     }
 
     fn code(&self) -> Option<ContentId> {
         Some(ContentId([LIBRARY.load(SeqCst); 32]))
     }
 
+    // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
         other.type_id() == TypeId::of::<Self>()
     }
@@ -620,6 +644,7 @@ impl ImageStore for Threads {
         self.0.put(key, image)
     }
 
+    // dyn: `ImageStore::for_each`'s signature, one call per batch of crates
     fn for_each(&self, count: usize, task: &(dyn Fn(usize) + Sync)) {
         std::thread::scope(|scope| {
             for first in 0..4 {
@@ -666,4 +691,123 @@ fn contents(memory: &Memory) -> Vec<(ContentId, Vec<u8>)> {
         memory.images.lock().unwrap().iter().map(|(&key, bytes)| (key, bytes.to_vec())).collect();
     kept.sort();
     kept
+}
+
+/// What `find_by_reads` finds in `memory`: the filed key, when a value is kept under it.
+fn found_in(db: &TestDB, lib: Crate, key: ContentId, memory: &Memory) -> Option<ContentId> {
+    find_by_reads(db, lib, key, memory, |at| Ok(memory.get(&at)?.map(|_| at))).unwrap()
+}
+
+/// A process variable a body's `env!` reads, not a signature's, files a value made from the
+/// crate's bodies in a slot: found while the variable is as it was, not once it changed.
+#[test]
+fn a_body_s_process_variable_files_a_value_in_a_slot() {
+    let mut db = TestDB::with_files(
+        "//- /lib.rs crate:lib new_source_root:library\n\
+         #[rustc_builtin_macro]\n\
+         macro_rules! env {() => {}}\n\
+         pub fn f() -> &'static str { env!(\"BLAZE_DEPS_BODY\") }\n",
+    );
+    let set = |db: &mut TestDB, value: &str| {
+        let vars = Env::from_iter([("BLAZE_DEPS_BODY".into(), value.into())]);
+        base_db::set_process_env(db, vars);
+    };
+    set(&mut db, "1");
+    let lib = crate_named(&db, "lib");
+    let reads = checked_reads(&db, lib).unwrap();
+    assert_eq!(reads, Reads::for_tests(&["BLAZE_DEPS_BODY"], &[]));
+    let memory = Memory::default();
+    let key = ContentId([5; 32]);
+    let filed = file_by_reads(&db, lib, key, &reads, &memory).unwrap().unwrap();
+    assert_ne!(filed, key);
+    assert!(memory.images.lock().unwrap().contains_key(&reads::slot(key, 0)));
+    memory.put(filed, b"a check".to_vec()).unwrap();
+    assert_eq!(found_in(&db, lib, key, &memory), Some(filed));
+    set(&mut db, "2");
+    assert_eq!(found_in(&db, lib, key, &memory), None);
+    set(&mut db, "1");
+    assert_eq!(found_in(&db, lib, key, &memory), Some(filed));
+}
+
+/// A proc macro in a body whose reads are not known refuses the crate's checked reads, though
+/// its modules and signatures read nothing.
+#[test]
+fn a_body_s_expansion_of_unknown_reads_is_refused() {
+    let db = TestDB::with_files(
+        "//- proc_macros: mirror\n\
+         //- /lib.rs crate:lib new_source_root:library\n\
+         pub fn f() -> u8 { proc_macros::mirror!(1) }\n",
+    );
+    let lib = crate_named(&db, "lib");
+    assert!(Reads::of(&db, lib, &[]).unwrap().is_empty());
+    let refused = checked_reads(&db, lib).unwrap_err();
+    assert!(
+        matches!(&refused, Refused::ProcMacro { call, .. } if call.contains("proc_macros")),
+        "{refused:?}"
+    );
+}
+
+/// A crate whose bodies read nothing is filed and found under the key alone, with no slot.
+#[test]
+fn a_crate_with_no_body_reads_is_found_under_its_key() {
+    let db = TestDB::with_files(FIXTURE);
+    let lib = crate_named(&db, "lib");
+    let reads = checked_reads(&db, lib).unwrap();
+    assert!(reads.is_empty(), "{reads:?}");
+    let memory = Memory::default();
+    let key = ContentId([6; 32]);
+    assert_eq!(file_by_reads(&db, lib, key, &reads, &memory).unwrap(), Ok(key));
+    assert!(memory.images.lock().unwrap().is_empty(), "no slot is written");
+    memory.put(key, b"a check".to_vec()).unwrap();
+    assert_eq!(found_in(&db, lib, key, &memory), Some(key));
+}
+
+/// A crate read from its image adds only its bodies' reads: what its modules and signatures
+/// read is in its image's key. Resolved, it has them all.
+#[test]
+fn an_imaged_crate_s_checked_reads_leave_out_what_its_image_covers() {
+    let _turn = TURN.lock().unwrap_or_else(|it| it.into_inner());
+    VALUE.store(0, SeqCst);
+    let memory = Memory::default();
+    store_reading(&memory);
+    let fresh = reading_db();
+    let live = crate_named(&fresh, "lib");
+    assert_eq!(checked_reads(&fresh, live).unwrap(), Reads::of(&fresh, live, &[]).unwrap());
+    let mut db = reading_db();
+    let crates = all(&db);
+    let served = serve(&mut db, &crates, BUILD, &memory, Mode::Serve).unwrap();
+    let lib = crate_named(&db, "lib");
+    assert!(served.hits.contains(&lib));
+    assert!(checked_reads(&db, lib).unwrap().is_empty());
+}
+
+/// Serving a crate at a time adds to what was served: a crate served before under the same key
+/// is kept, not fetched again, and one whose key changed is fetched again and, when missing,
+/// loses its image.
+#[test]
+fn serving_a_crate_at_a_time_adds_to_what_was_served() {
+    let (memory, _) = stored(FIXTURE);
+    let mut db = TestDB::with_files(FIXTURE);
+    let (lib, core) = (crate_named(&db, "lib"), crate_named(&db, "core"));
+    let first = serve(&mut db, &[core], BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(first.hits, [core]);
+    let gets = *memory.gets.lock().unwrap();
+    let second = serve(&mut db, &[lib], BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(names(&db, &second.hits), ["core", "lib"]);
+    assert_eq!(*memory.gets.lock().unwrap(), gets + 1, "core is kept, not fetched again");
+    let raw: &Db = &db;
+    let images = DepImages::try_get(raw).unwrap().images(raw);
+    assert!(images.contains_key(&lib) && images.contains_key(&core));
+    let maps = frozen::FrozenDefMaps::try_get(raw).unwrap().maps(raw);
+    assert!(maps.contains_key(&lib) && maps.contains_key(&core));
+    assert!(image_of(raw, core).is_some() && image_of(raw, lib).is_some());
+    let again = serve(&mut db, &[lib], BUILD, &memory, Mode::Serve).unwrap();
+    assert_eq!(*memory.gets.lock().unwrap(), gets + 1, "nothing is fetched again");
+    assert_eq!(again.hits, second.hits);
+    let other = serve(&mut db, &[lib], ContentId([8; 32]), &memory, Mode::Serve).unwrap();
+    assert!(other.hits.is_empty(), "another build has other keys, which have no image");
+    let raw: &Db = &db;
+    assert!(DepImages::try_get(raw).unwrap().images(raw).is_empty());
+    assert!(frozen::FrozenDefMaps::try_get(raw).unwrap().maps(raw).is_empty());
+    assert!(image_of(raw, core).is_none());
 }

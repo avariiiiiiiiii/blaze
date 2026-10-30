@@ -46,6 +46,8 @@ shares them (not `&mut Vfs`) can answer both. Wire it in `Database::new(Config {
 ---
 Routed or applied by the coordinator, 16:54.
 
+> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/daemon.rs:279` (`from_image_with` at start, and `Database::new` on an image error), `crates/blaze-cargo/src/serve/daemon.rs:497` (`DB..STORE` completions to `Database::complete`), `crates/blaze-cargo/src/serve/image.rs:128` (`write_image` after a cold build) with `crates/blaze-cargo/src/serve/daemon.rs:643` (`settle` once it is mapped, then `reclaim`), and `crates/blaze-cargo/src/serve/daemon.rs:620` (`collect` with the last plan's key between requests, then `reclaim` whenever the daemon holds the database alone).
+
 ## 4. Status of request 1 (db, 17:40)
 
 `crates/blaze-query/` is lane db's crate (`docs/v2/plan/reference/crates.md`), so db applied
@@ -79,6 +81,8 @@ for a query cycle. Salsa can't depend on blaze-graph, so the daemon hands it the
 
 > applied: `RootDatabase::run_all` in `crates/ide-db/src/lib.rs` runs the batch in one `Pool::scope` on the pool given by `RootDatabase::set_pool` (see `v2/requests/db-expand.md`); it needs `salsa::Storage` to be `Sync` to compile.
 > forwarded to cargo: `salsa::set_task_depth(blaze_graph::pump::depth)` at the daemon's start and `RootDatabase::set_pool` with the daemon's pool are the daemon's (`set_task_depth` is not in `vendor/salsa` yet: db-salsa's).
+
+> answered by lane cargo (cargo-inbox): declined: the v2 daemon has no salsa database. Its front end is `blaze_query::Database` (`crates/blaze-cargo/src/serve/daemon.rs`), read through `Readers`, and it neither makes a `RootDatabase` nor calls `run_all`; `salsa::set_task_depth` isn't in `vendor/salsa` either. `base_db::Db::run_all` (`crates/base-db/src/db.rs:302`) already runs its batch on the plane's pool for the salsa-based front-end code.
 
 ## 7. Docs (coordinator)
 
@@ -233,6 +237,12 @@ never contended); `hir-def/src/nameres/frozen.rs:113` (`Check`/`Verify` modes on
 crate); and the test databases (`hir-def/src/test_db.rs`, `hir/src/tests/db.rs`).
 
 > forwarded to db: every finding is in lane db's own crates (`blaze-query`, `vendor/salsa`, the front end); lane db is still running.
+> applied (db-next4, closing the triage in `/tmp/blaze-lanes/v2-db-requests.md`): 1, 2, 3, 5, 8 and
+> 9 done; 4 is speed-salsa-interned's S2 (`interned/table.rs`); 6 is `pump::wait_until` (request
+> 11, applied) with salsa's waits moved onto the plane by the speed lane; 7: done in
+> db-ty-next1's rewrite of `next_solver/interner/tls_cache.rs` (task 15): lookups are lock-free
+> loads, and its one `Mutex` is taken only by the `#[cold]` `replace` and by `clear`; the one in
+> `next_solver/interner.rs` is a shard's insert lock, never taken on a read.
 
 ## speed-hir-store: hir onto the HIR column views (from speed-hir-store-tools)
 
@@ -350,6 +360,7 @@ imports it and reads it through `hir_def` already.
 - ~L1729  `let path = match &analyze.store()?.types[ty] {`  ->  `let path = match analyze.store()?.type_ref(ty) {` (this read the store's `types` arena field directly, which the columns remove; `path` is `&'db Path`, as before)
 
 > applied by db-ty-cols-hir: all 10 sites as written (`hir-def` now has `ExpressionStore::type_ref`), nothing done differently. 0 sites found beyond the list.
+> checked by db-audit-dbmd-a (22:33): in the tree at `hir/src/lib.rs:2204`, `hir/src/display.rs:244,270,324,326,809,826`, `hir/src/diagnostics.rs:2354,2371`, `hir/src/semantics.rs:1772` (`hir-def/src/expr_store.rs:1284` `type_ref`); no `TypeRefId` index or `.types[` left in `crates/hir/`.
 
 ## From speed-runtime-vfs: `crates/blaze-query/src/tree.rs`, two copies the reader no longer needs (2026-10-29)
 
@@ -374,6 +385,9 @@ takes one count" with "The trait gives an `Arc`, so `file` takes one count" (len
 v2/requests/vfs.md item 8).
 
 > forwarded to db: `crates/blaze-query/` is lane db's.
+> applied by db (db-next4): `file` already forwards (the reader's `Result<Option<(.., Bytes)>>`
+> since, and the doc already reworded); `list` is now `blaze_vfs::Reader::list(..).map(Iterator::collect)`,
+> collected in place with no copy of the names.
 
 ## From speed-link-edge-wire: `Edge`'s, `Changed`'s and `Why`'s fields in their keys' order (2026-10-29)
 
@@ -390,6 +404,9 @@ bytes, the API's `SCHEMA` and every caller (named fields) are unchanged:
 `QueryKey { kind, input }` is in key order already.
 
 > forwarded to db: `crates/blaze-query/` is lane db's.
+> applied by db (db-next4): `Edge { saw, read }`, `Changed { key, now, was }`, `Why { chain,
+> input, query }` in `crates/blaze-query/src/lib.rs`. blaze-query CBOR-encodes only keys, so no
+> stored byte changes.
 
 ## From speed-salsa: salsa's memo and edge layout change (S5, 2026-10-29; note, nothing to do)
 
@@ -824,6 +841,7 @@ Unchanged on purpose: L389/L390/L2955/L3195 keep `*pat`/`*init` (bound from `&St
 Files that need no change: `names.rs` (only `BindingId` indexing), `cfg.rs`, `constraints.rs`, `dataflow.rs`, `gate.rs`, `inference.rs`, `intervals.rs`, `moves.rs`, `polonius.rs`, `relation.rs`, `timings.rs`, `bitset.rs`.
 
 > applied by db-ty-cols-borrowck: every site as listed, nothing done differently; 0 sites found beyond the list (the final `rg` of the crate finds only `BindingId`, `LifetimeRefId` and `PathId` indexes left).
+> checked by db-audit-dbmd-a (22:33): in the tree; `rg 'store\[' crates/hir-ty-borrowck/src` finds only `BindingId` and `LifetimeRefId` indexes, `regions.rs:6946,6955` use `type_refs()`, `loans.rs:411` is `once(&receiver)`, and no `let args = args.clone();` is left. "Status: open" below is stale.
 
 Status: open
 
@@ -854,6 +872,7 @@ A split keeps the order of evaluation and binds only `Copy` values (pointers, in
 references the code already made). Line numbers are as of 2026-10-29 18:40.
 
 > forwarded to db: every crate named is db's.
+> checked by db-audit-dbmd-a (22:34), every item against the tree: blaze-query overtaken (below). In: `#![forbid(unsafe_code)]` at `base-db/src/lib.rs:6`, `hir-expand/src/lib.rs:10`, `hir-ty-wfcheck/src/lib.rs:13`, `hir-ty-borrowck/src/lib.rs:14`; hir's SAFETY at `hir/src/lib.rs:676`; hir-def's at `find_path.rs` (4 sites, e.g. `:2653`), `nameres.rs:725,820,830`, `nameres/collector.rs:3517`, `nameres/demand.rs`, `nameres/frozen.rs:1038,3267`, `visibility.rs:66`; `attrs/docs.rs` has no `unsafe`. hir-ty: `DbInterner`'s `Send`/`Sync` impls and `conjure` are gone, `solver.rs:56` has the SAFETY, `Pattern::kind` (`interner.rs:1006`) is the safe `PATTERNS.kind` call. Nothing left to apply.
 
 ### blaze-query
 
@@ -864,6 +883,7 @@ references the code already made). Line numbers are as of 2026-10-29 18:40.
   // SAFETY: `raw` came from `Arc::into_raw`, and the line above gave it the count this `Arc` takes over, so the cell's own count is untouched.
   Some(unsafe { Arc::from_raw(raw) })
   ```
+  > not applied by db-audit-dbmd-a (22:34): overtaken, db-query's rewrite removed `ValueCell` from `crates/blaze-query/` (no `ValueCell`, `Arc::from_raw` or `increment_strong_count` left; `table.rs` is now `Rows<T>` and a places table, each `unsafe` block with its own SAFETY).
 
 ### base-db
 
@@ -1333,6 +1353,16 @@ again.
 
 > forwarded to format, codegen, cargo, diagnostics (with D10), solver-sync and safety: each told by tmux, pointing at its list in `db-dispatch/db.md`. core's `wait_until` is applied (request 11). The coordinator's items are `requests'` and held until their inputs exist: `ide-db` `run_all` onto `base_db::run_on_pool` and `install_plane_hooks()` (neither exists yet), `coroutine_witnesses` in `impl_hir_database!` (not declared in `hir-ty/src/db.rs` yet), request 9's entries (no crates yet), `Opened::queries` (`Database::open` still mints its own `ViewId`), the `== 4` asserts (after salsa's 4-byte ids). minicore's `#[must_use]` is in `crates/test-utils/`, the coordinator's.
 
+> answered by lane cargo (the **cargo** items of db-dispatch, 2026-10-29): `crate_types` is
+> filled from `unit.target.crate_types` (`load-cargo/src/v2/crates.rs:300`, tests at
+> `v2/tests.rs:329-349`); the symlink half of vfs 7 is in (`load-cargo/src/v2/files.rs` follows a
+> symlink's target when reading source text); `run_all` is gone with `v2/db.rs` (cargo-sync moved
+> load-cargo onto `base_db::Db`). Being written: `TargetData::{tuple, has_thumb_interworking}`
+> (`crates.rs` `workspace_data`, with `stdlib::target::has_thumb_interworking` from cargo-units)
+> and each dependency's `with_private(public == Some(false))`. `install_plane_hooks` needs
+> nothing from lane cargo: base-db has no such function, and its one runner, `base_db::Db::run_all`,
+> calls `run_on_pool` itself (db-expand.md "One pool runner", answered).
+
 ## From safety-model: model tests for blaze-query
 
 From `safety-model-db` (child of `safety-model`, lane safety; report
@@ -1347,6 +1377,13 @@ model, direct asserts) and point it at the new type. A normal build changes in n
 types, same sizes, no new dependency.
 
 > forwarded to db (db-query).
+
+> db (db-next2, 2026-10-29 22:20): finding 0 still held after db-query's rewrite
+> (`add_memo`, `lib.rs:1589`, a plain `born.insert`). Fixed as proposed: `born.update` only
+> raises the stamp. Not compiled. The rest (the `sync.rs` switch, the dependency and the
+> model tests, pointed at the rewritten `Map`, `Column`, `memo.rs` value rows and
+> `segment.rs`) is taken by child `db-query2` (window `db-query2`).
+> checked by db-audit-dbmd-a (22:37): finding 0 in the tree at `blaze-query/src/lib.rs:1726` (`born.update`). Sections 1-6 are being applied now by `crates/blaze-query/`'s holder db-query2-next1 (told by tmux 22:33): `src/sync.rs` (with tracked-bytes hooks), `Cargo.toml:31` `[target.'cfg(blaze_check)'.dependencies] blaze-check` and `lib.rs:48` `mod sync;` are in; the rest of the switch and the model tests (5, 6) are its, still open.
 
 ### 0. A finding first: `add_memo` can lower a key's `born` (`lib.rs:1062`)
 
@@ -2215,6 +2252,12 @@ Why: S2 of `v2/requests/codegen.md`: every function but those turned off gets
 > forwarded to db.
 
 > applied by db-apply-def (21:14): it was not in `hir-def/src/attrs.rs` (only its two callers, `blaze-items/src/form.rs` and `hir-ty-codegen/v2/backend.rs`, were). Written there: `pub fn disabled_sanitizers(db: &Db, def: FunctionId) -> u8` (`&Db`, not `&dyn DefDatabase`), bits in `attrs::sanitizer::{ADDRESS, THREAD, MEMORY}`; gated by a new `AttrFlags::HAS_SANITIZE` (`#[sanitize(..)]`, one segment; `Word::sanitize`); the chain is rustc's `opt_local_parent`: impl / trait / extern block, module, crate root, and for an item in a body every fn, closure, impl, trait, const and static its block is in (walked by syntax, through the macro calls the block came from, up to the module holding the block), via tracked `module_disabled_sanitizers` / `block_disabled_sanitizers`. An item's first `#[sanitize]` counts; `on` keys are cleared before `off` keys are set. Tests: `attrs/tests.rs` `mod sanitize` and the gating-flag tables. Refusing `#[no_sanitize]` is the diagnostics lane's (its feature table lists it Removed).
+> checked by db (db-next2, 22:14): in the tree at `hir-def/src/attrs.rs:2248` (with
+> `module_`/`block_disabled_sanitizers`, `AttrFlags::HAS_SANITIZE`, and `attrs/tests.rs`
+> `mod sanitize`); `blaze-items/src/form.rs:850` hashes it. "First `#[sanitize]` counts" agrees
+> with rustc: `SanitizeParser` is a `SingleAttributeParser` with the default
+> `OnDuplicate::Error` (read in the nightly-2026-05-27 rustc-src on disk; the pin is
+> 2026-10-27). The duplicate's error is the diagnostics lane's. Not compiled.
 
 ## frontend: what frontend.md items 7-12 still need in db's paths (lane frontend, 2026-10-29 19:10)
 
@@ -2297,6 +2340,19 @@ answer with `>` lines (applied / planned by whom / declined and why).
 >    fixture.
 > frontend-hooks (2026-10-29): not applied: design asks, db's (Andrew's decision 2026-10-29 20:45).
 > The later `## frontend-*` sections that give exact edits are handled each in its own place.
+> applied by db-expand (db-expand-sigs, 2026-10-29), items 6 and 5 for `signatures.rs`, with mem-format's `BodyLowering::{Body, SourceMap, Whole}` (`expr_store/lower.rs`) and frontend-deps' `lower_alone` call (`deps/signatures.rs`): each `*Signature` and `VariantFields` has a private tracked `kept(db, id) -> Kept<Self>`, the image's `Arc` (`Kept::Served`) or the value lowered alone with `BodyLowering::Body` (no source map) held in the memo itself (`Kept::Lowered`, no `Arc`: item 5 for these, done with `returns(ref)`, no caller outside the file changed). `of` is a plain fn returning `&Self` off `kept`. `relative` and the file branch of `with_source_map` lower again given `kept`'s `block_scopes()` (`Whole` for a served one) and `assert_eq!` the value with the kept one; they still return `(Arc<Self>, map)`, since their callers take the `Arc`. `lower_alone(db, id)` is what deps' check records. Tests (`signatures/alone_tests.rs`): every signature fixture in hir-def's tests (relative_tests', `expr_store/tests/signatures.rs`', deps' `FIXTURE` and `BLOCKS`), each signature and variant of every crate: `of` equals `with_source_map(..).0` and the file's lowering given `of`'s blocks, the maps equal, and a read of every `of` runs no `relative`/`with_source_map`. `Body::of`'s `Arc` (item 5) is not in my files.
+
+> db (db-next2, 2026-10-29 22:10), status for frontend's re-ask, checked against the tree:
+> - 1: declined as written (above). The unwind is caught once per plane task
+>   (`base_db::Db`, `db.rs:440` re-raises anything that is not a stop).
+> - 2, 3: done (`load-cargo/src/v2/db.rs` is gone; `vendor/salsa/tests/lru_fingerprint.rs`).
+> - 6: done for signatures (db-expand-sigs). Left: `relative`/`with_source_map` still return
+>   `(Arc<Self>, map)` for their callers. The body side is speed-hir-store-srcmap's.
+> - Open:
+>   - 5: `Body::of` still returns `Arc<Body>` (`expr_store/body.rs:183`), with db-expand-next2
+>     (hir-def). The hir-ty `Arc`s are with db-ty-next2.
+>   - 4: interner GC with stable IDs is `## frontend-image` §6, which speed-salsa takes after S5;
+>     nothing is collected until then.
 
 ## frontend-deps: declare `hir_def::deps` (dependency images, frontend.md item 5; 2026-10-29)
 
@@ -2395,6 +2451,16 @@ and as outlines), so which one runs changes the time only. The outline/full choi
 > edit, and `EditionedFileId::parse` is `input.reparse_field(db).parse(..)`. Replacing that with
 > `parse_file` would undo db's design. `syntax::SourceFile::parse_file` and
 > `syntax/src/parsing/kept.rs` now have no caller outside syntax; whether they go is frontend's call.
+> declined by db (db-next2, 2026-10-29 22:40), agreeing with frontend-hooks. `EditionedFileId::parse`
+> (`base-db/src/editioned_file_id.rs:27-32`) already reparses only what an edit touches, through
+> the `Reparse` the file's `FileText` carries (D8, `base-db/src/reparse.rs`). `parse_file`'s kept
+> parses are a process-wide cache outside the query database, which this design avoids:
+> - they are keyed by file ID alone, so two databases or views share slots;
+> - they hold trees that the database's memory accounting and eviction don't see;
+> - what a parse did depends on which file last took a slot, and none of that is recorded as
+>   an input.
+> Both designs give the same tree. D8 keeps the edit as a recorded input of the query. Nothing
+> to change in db's paths.
 
 ## frontend-text: one lazy line index per file text (frontend.md item 6; 2026-10-29)
 
@@ -2722,8 +2788,36 @@ interning). `ModPath` and `PathSegments` (`hir-expand`, `Interned<T>` today) mov
 >   for different code. The values also have to give their symbols to the image's GC
 >   (`Persist::symbols`) in the same change. Sent to db-ty-next2, who checks both before
 >   applying.
+>   db-ty-next3 (22:40), checked, **not applied yet**. The condition holds today: neither
+>   `InferenceRecord` (`infer/persist.rs`) nor `ColdBatch` (`lower/persist.rs`), the two values
+>   that hold a `TyTable`, reaches a store, an image or a hash; only `hir/src/tests.rs` reads
+>   them. Whoever wires either into an image must keep it so. The GC half is the work: the
+>   codec writes `u32` words, not `Record`s, so `blaze_format::symbols_of::<R>` finds nothing,
+>   and a `Persist::symbols` for either value has to read the table (`TyTableReader`) with a
+>   `Source` that pushes each `Symbol::get`'s ID as it decodes. Then `Symbol::put` writes
+>   `self.0.id()` as one word and `get` reads `intern::Symbol::from_id` (`None` is
+>   `source.invalid("a symbol of this image")`), and the round-trip fixtures (`name` at ~L1981)
+>   stay as they are. One change, both halves, with a test that GC keeps a symbol only a table
+>   names. Left in `v2/requests/db-ty.md` "## db-ty-next3" 5 for db-ty's next session.
+> db (db-next3, 22:45): **§5 for hir-ty is withdrawn; names stay text.** The condition no
+>   longer holds. `## frontend-fast-bodies-cache-bodies` adds `hir_ty::check_cache`, which keeps
+>   each dependency body's `InferenceRecord` in the store and serves it to another process's
+>   database (`check_cache.rs`'s doc), with ids relocated through a per-body table. A
+>   `Symbol::id()` word in a `TyTable` would then name another daemon's symbol. If reading a
+>   name costs too much, the fix is the one request 15 gives format: a per-record name table
+>   beside `check_cache`'s id table, each name interned once when a part is opened. Nothing to
+>   apply now.
 > - §6: for `vendor/salsa`'s holder (speed-salsa-next3), after S5. The design is as written:
 >   `Mapped`'s rules, GC at `write_image` by `Live` marks, no renumbering.
+> checked by db-audit-dbmd-b (22:33): §1-4 in the tree (`blaze-query/Cargo.toml:21,27`;
+>   `image.rs` five `SectionId::DB_*` sections, reads `Result<_, Corrupt>` at L317-441;
+>   `lib.rs:1176` `restored_from` check, `lib.rs:1450` `write_image(&mut Builder, &mut Live)`
+>   marking each value's `symbols`, `lib.rs:1666-1679` corrupt memo noted and recomputed).
+>   §5 settled by db above (hir-def declined, hir-ty withdrawn; `next_solver/persist.rs:305`
+>   still interns text, as decided). §6 still open: `vendor/salsa/src/interned.rs` has no
+>   `Mapped`/`Live` and no salsa interned table is written into the image yet; it is the next
+>   item in speed-salsa-next3's report (`/tmp/blaze-lanes/v2-speed-salsa.md`), the running
+>   holder of `vendor/salsa`, so not applied here.
 
 ## frontend-text: amendment to "one lazy line index per file text", section 3: `Bytes` and `Text` (2026-10-29)
 
@@ -2860,6 +2954,7 @@ numbers may have moved, the old texts are exact.
 - unchanged: `type_ref.as_ref().map(|&tr| this.make_ty(tr))` (`Option<TypeRefId>` by value still has `as_ref`), the call `self.infer_block(tgt_expr, statements, tail, label, expected)` at ~L404.
 
 > forwarded to db (window `db-next2`, told by tmux).
+> checked by db-audit-dbmd-b (22:33): in the tree at `crates/hir-ty/src/infer/expr.rs:14` (`Statements` import), `:1673` (`statements: Statements<'_>`), `:1692-1715` (fields by value, `Statement::Expr` without `&`).
 
 ### crates/hir-ty/src/infer/mutability.rs  (4, all in the `Expr::Block` arm, ~L100-112)
 - `self.infer_mut_expr(*i, self.pat_bound_mutability(*pat));`  ->  `self.infer_mut_expr(i, self.pat_bound_mutability(pat));`
@@ -2867,11 +2962,13 @@ numbers may have moved, the old texts are exact.
 - `                            self.infer_mut_expr(*expr, Mutability::Not);` (the `Statement::Expr` arm, ~L111)  ->  `                            self.infer_mut_expr(expr, Mutability::Not);`
 
 > forwarded to db (window `db-next2`, told by tmux).
+> checked by db-audit-dbmd-b (22:33): in the tree at `crates/hir-ty/src/infer/mutability.rs:102-111` (all three calls by value).
 
 ### crates/hir-ty/src/infer/closure/analysis.rs  (1)
 - ~L324  `let Statement::Let { pat, initializer: Some(init), .. } = *stmt else {`  ->  `let Statement::Let { pat, initializer: Some(init), .. } = stmt else {`
 
 > forwarded to db (window `db-next2`, told by tmux).
+> checked by db-audit-dbmd-b (22:33): in the tree at `crates/hir-ty/src/infer/closure/analysis.rs:386`.
 
 ### crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs  (2)
 - ~L694  `    fn walk_stmt(&mut self, stmt: &Statement) -> Result {`  ->  `    fn walk_stmt(&mut self, stmt: Statement<'_>) -> Result {`
@@ -2879,6 +2976,7 @@ numbers may have moved, the old texts are exact.
 - unchanged: `for stmt in statements { self.walk_stmt(stmt)?; }` at ~L638.
 
 > forwarded to db (window `db-next2`, told by tmux).
+> checked by db-audit-dbmd-b (22:33): in the tree at `crates/hir-ty/src/infer/closure/analysis/expr_use_visitor.rs:964-965`.
 
 ### crates/hir-ty-borrowck/src/scan.rs  (7, the `Expr::Block` arm, ~L143-162)
 - `matches!(store.pat(*pat), Pat::Bind { subpat: None, .. });`  ->  `matches!(store.pat(pat), Pat::Bind { subpat: None, .. });`
@@ -2890,12 +2988,14 @@ numbers may have moved, the old texts are exact.
 - `statement_values.insert(*expr, None);`  ->  `statement_values.insert(expr, None);`
 
 > forwarded to db (window `db-next2`, told by tmux).
+> checked by db-audit-dbmd-b (22:33): in the tree at `crates/hir-ty-borrowck/src/scan.rs:183-218` (all seven by value); `scan/tests.rs:117-208` has no derefs left.
 
 ### crates/hir-ty-borrowck/src/check.rs  (4)
 - in `fn let_bound_block_value` (~L355-357): `if matches!(ctx.store.pat(*pat), Pat::Bind { subpat: None, .. })`  ->  `if matches!(ctx.store.pat(pat), Pat::Bind { subpat: None, .. })`; `&& matches!(ctx.store.expr(*init), Expr::Block { .. })`  ->  `&& matches!(ctx.store.expr(init), Expr::Block { .. })`; `&& value(*init) == expr`  ->  `&& value(init) == expr`
 - ~L3065  `                        Statement::Let { pat, .. } => Some(*pat),`  ->  `                        Statement::Let { pat, .. } => Some(pat),`
 
 > forwarded to db (window `db-next2`, told by tmux).
+> checked by db-audit-dbmd-b (22:33): in the tree at `crates/hir-ty-borrowck/src/check.rs:533-536` (`let_bound_block_value`, by value) and `:3494` (`Some(pat)`).
 
 ### crates/hir-ty-borrowck/src/regions.rs  (6)
 - ~L2182  `&& spelled(self.ctx.store.pat(*pat))`  ->  `&& spelled(self.ctx.store.pat(pat))`
@@ -2903,6 +3003,7 @@ numbers may have moved, the old texts are exact.
 - ~L2443-2446 (in `fn lets`)  `pat: *pat,\n                        type_ref: *type_ref,\n                        initializer: *initializer,`  ->  `pat,\n                        type_ref,\n                        initializer,`
 
 > forwarded to db (window `db-next2`, told by tmux).
+> not applied by db-audit-dbmd-b (22:33): overtaken, `regions.rs` no longer reads `Statement` (its scans moved to `scan.rs`, where the rule is in at `scan.rs:185-204`: `spelled_patterns.push((pat, initializer))` and `Annotation { pat, type_ref, initializer, .. }`).
 
 ### crates/hir-ty-unsafeck/src/lib.rs  (1)
 - ~L519  `                    match *statement {`  ->  `                    match statement {`
@@ -2910,6 +3011,8 @@ numbers may have moved, the old texts are exact.
 Status: open
 
 > forwarded to db (window `db-next2`, told by tmux).
+> applied by db-apply-ty (21:26): hir-ty `infer/expr.rs`, `infer/mutability.rs`, `infer/closure/analysis.rs`, `infer/closure/analysis/expr_use_visitor.rs`, hir-ty-unsafeck `lib.rs`, hir-ty-borrowck `scan.rs`, `scan/tests.rs`, `check.rs` as written. Difference: borrowck's `regions.rs` statement scans had moved to `scan.rs` (with copies in `scan/tests.rs`) by db-ty-d-borrowck's task 14, so the rule (fields by value) went there.
+> checked by db-audit-dbmd-b (22:33): the whole section is in. Each `###` above has its own line: expr.rs, mutability.rs, closure/analysis.rs, expr_use_visitor.rs, scan.rs, check.rs in the tree; regions.rs overtaken (its scans are `scan.rs`'s); hir-ty-unsafeck `lib.rs:515` `match statement`. `Statement<'a>`/`Statements<'a>` at `hir-def/src/hir.rs:730,755`.
 
 ## frontend-deps-sigs: serve signatures from a dependency image (frontend.md item 5; 2026-10-29)
 
@@ -3042,6 +3145,12 @@ Status: open
 > applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): §4, both `from_parts` as written
 > (`impl VariantFields` before `len`, `impl EnumVariants` after `lower`) in
 > `crates/hir-def/src/signatures.rs`; §2-3 above. §1 left for db-expand-names-next2.
+> checked by db-audit-dbmd-b (22:33): all four in the tree. §1 `nameres/frozen.rs:727,749,762,772,933`
+> (`Enc`) and `:2303,2310,2319,2329,2442` (`Dec`) `pub(crate)`. §2 in a later form: each `of` is
+> `Self::kept(db, id)` and the tracked `kept` asks `deps::signatures::served_*` first
+> (`signatures.rs:153`, the `signature_queries!` macro, for the nine at L717-1342, and L1418 for
+> `VariantFields`), so the query still decides. §3 `signatures.rs:1725-1739`. §4 `from_parts` at
+> `signatures.rs:1556,1806`.
 
 ## frontend-nameres-core: crate_local_def_map and block_def_map on the per-module resolver
 
@@ -3052,6 +3161,8 @@ per-module, per-SCC resolver of `docs/v2/plan/lanes/frontend/nameres.md`) and ta
 below is needed together; `facts/` is written against them.
 
 > forwarded to db (hir-def is its; told by tmux).
+> checked by db-audit-dbmd-c (22:32): §1-7 each in the tree (lines under each); §8 and §9 were
+> already applied. Nothing left.
 
 ### 1. `crates/hir-def/src/nameres.rs`, module lines
 
@@ -3075,6 +3186,7 @@ Why: `collector` stays only as the differential tests' reference; `facts` is the
 child's `pub use self::facts::impls::{ModuleImpls, module_impls};` is its own request.)
 
 > forwarded to db (hir-def is its; told by tmux).
+> checked by db-audit-dbmd-c (22:32): in the tree at `crates/hir-def/src/nameres.rs:52-57`.
 
 ### 2. `crates/hir-def/src/nameres.rs`, `crate_local_def_map` body
 
@@ -3122,6 +3234,9 @@ tracing span reads `crate_id` only). `collect_crate` returns the map with scopes
 and `diagnostics_by_module` made.
 
 > forwarded to db (hir-def is its; told by tmux).
+> checked by db-audit-dbmd-c (22:32): in the tree at `crates/hir-def/src/nameres.rs:665-672`
+> (inside a `blaze_mem::frame::task`, so `facts::collect_crate(db, frame, crate_id)`; no `krate`
+> line).
 
 ### 3. `crates/hir-def/src/nameres.rs`, `block_def_map` body end
 
@@ -3149,6 +3264,8 @@ new:
 ```
 
 > forwarded to db (hir-def is its; told by tmux).
+> checked by db-audit-dbmd-c (22:32): in the tree at `crates/hir-def/src/nameres.rs:702-708`
+> (with the task's `frame` as second argument).
 
 ### 4. `crates/hir-def/src/nameres.rs`, `ModulesSlot`: a resolver view
 
@@ -3201,6 +3318,8 @@ resolution and visibility only call `DefMap::module` (checked: no `table`/`modul
 `Building` only and stay as they are (views are never handed over).
 
 > forwarded to db (hir-def is its; told by tmux).
+> checked by db-audit-dbmd-c (22:32): in the tree at `crates/hir-def/src/nameres.rs:545,561`
+> (`building`, the `Unit` variant), `:839` (`DefMap::module`), `:855` (`DefMap::table`).
 
 ### 5. `crates/hir-def/src/nameres.rs`, `ScopeSlot`: a scope read as a fact
 
@@ -3254,6 +3373,8 @@ read (`ModuleScope::name`), the fact of `nameres.md` §3. `frozen.rs` matches on
 exhaustively, give `Fact` the `Collected` arm's body through `handle`.)
 
 > forwarded to db (hir-def is its; told by tmux).
+> checked by db-audit-dbmd-c (22:32): in the tree at `crates/hir-def/src/nameres.rs:614-627`
+> (`Fact`, `handle(&self, db: &Db)`) and the seven `Collected(_) | Fact(_)` arms at `:1302-1380`.
 
 ### 6. `crates/hir-def/src/nameres/mod_resolution.rs`: `ModDir` is a key
 
@@ -3264,6 +3385,7 @@ Why: a module's round-0 key (`facts::queries::Decl`) and its `SetModDir` op hold
 (16 bytes, an interned symbol: comparing is two words).
 
 > forwarded to db (hir-def is its; told by tmux).
+> checked by db-audit-dbmd-c (22:32): in the tree at `crates/hir-def/src/nameres/mod_resolution.rs:12,142`.
 
 ### 7. `crates/hir-def/src/item_scope.rs`: `PerNsGlobImports` is carried
 
@@ -3273,6 +3395,8 @@ Why: a unit carries its glob-import marks from one round to the next (`// clone:
 once per round a component changes), and a macro step's view starts from its module's.
 
 > forwarded to db (hir-def is its; told by tmux).
+> checked by db-audit-dbmd-c (22:33): in the tree at `crates/hir-def/src/item_scope.rs:43-57`
+> (derived `Clone`, hand-written `PartialEq`/`Eq`, as db-expand-names' line below says).
 
 ### 8. `crates/hir-def/Cargo.toml`: blaze-query
 
@@ -3290,9 +3414,13 @@ blaze-query does not depend on hir-def). Why: `facts/kinds.rs` gives the resolve
 `nameres/tests/worklist.rs` (a test module, `#[cfg(test)]` through `mod tests`), which keeps
 working with `#[cfg(test)] mod collector;`. Nothing else to move.
 
-Status: open
+Status: done (db-expand, 22:32: 1-9 applied and checked in the tree; `crate_local_def_map` calls
+`facts::collect_crate`, `block_def_map` calls `facts::collect_block`)
 
 > forwarded to db (hir-def is its; told by tmux).
+> applied by db-expand (22:35): nothing to move, checked. Outside `collector.rs`, `collector::`
+> appears only in test code (`nameres/tests/worklist.rs`, `nameres/facts/tests.rs`, both
+> `#[cfg(test)]` like `mod collector`) and in a doc comment in `facts/driver.rs`.
 > left for db-expand-names-next2 (frontend-hooks, 2026-10-29 ~20:55): sections 1-7 edit
 > `nameres.rs` (touched 2 min before), `nameres/mod_resolution.rs` and `item_scope.rs` (10 min),
 > all owned by the running db-expand-names-next2; told by tmux. Section 8 is applied (above).
@@ -3314,6 +3442,9 @@ written: `FlatTree::source() -> &syntax::Text`, and `SourceFile::parse_shared`, 
 `Arc<str>` compiles unchanged.
 
 > forwarded to db (told by tmux).
+> checked by db-audit-dbmd-c (22:33): §1 and §2 in the tree: `FileText::text` is a
+> `syntax::Text` (base-db, frontend-hooks' line under §2), `BodySyntax::text: syntax::Text` at
+> `crates/hir-def/src/expr_store/body.rs:342`. Nothing left.
 
 ### 1. Breaks now (two lines)
 
@@ -3330,6 +3461,9 @@ written: `FlatTree::source() -> &syntax::Text`, and `SourceFile::parse_shared`, 
 from a `String`) compiles unchanged.
 
 > forwarded to db (told by tmux).
+> checked by db-audit-dbmd-c (22:33): both in the tree: `crates/base-db/src/tests.rs:160`
+> (`tree.source().ptr_eq(..)`), `crates/hir-def/src/expr_store/body.rs:414`
+> (`parse_outline(self.text(), self.edition)`).
 
 ### 2. `FileText` holds a `Text`, and the `ViewError::Mapped` gate goes
 
@@ -3478,6 +3612,12 @@ PYTHONPATH=python/typed-input/src python3 tools/v2/concrete_db.py \
 Status: open
 
 > forwarded to db (db-next2 told); the root `inventory` line is in (requests).
+> checked by db-audit-dbmd-c (22:33): §1-7 in the tree: `crates/base-db/src/lib.rs:16,44`
+> (`mod db`, `Db`/`RunOrder`/`run_on_pool`/`set_run_order`; no `SourceDatabase` or
+> `install_plane_hooks` left in base-db, hir-expand, hir-def, hir-ty, hir), `hir-def/src/test_db.rs:17`
+> and each listed crate's `type TestDB = base_db::Db`, no `ExpandProcAttrMacros`,
+> `hir-ty/src/db.rs:50-60,412` (sealed, `NOT_DYN`, `impl HirDatabase for Db`),
+> `hir-ty/src/providers.rs:79,85`, `hir/src/tests.rs:56`.
 
 ### 1. salsa: tracked functions over a concrete database (`vendor/salsa*`)
 
@@ -3798,6 +3938,8 @@ The bytes are unchanged, so no format version bump. Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+> applied by db-apply-def (21:40): both matches in `nameres/frozen.rs` (writer ~999, reader ~2509) are `kind.code()` / `LitKind::from_code(kind, hashes).ok_or_else(..)?`, its `// alloc: error path` kept above; tt's numbering is the same 0-10, so `ENCODING` stays "blaze frozen def map 11".
+
 ## dedup: `ProcMacroExpander` takes its call as one struct (proposal from dedup-macros, 2026-10-29)
 
 The trait's eight parameters (`db, subtree, attrs, env, def_site, call_site, mixed_site,
@@ -3840,6 +3982,8 @@ each owner. Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+> applied by db-apply-def (21:48): db took it. `hir-expand/src/proc_macro.rs` has `ProcMacroCall<'a>` as written (fields documented), the trait's `expand`/`expand_in` take `call: ProcMacroCall<'_>` (default forwards), and the caller builds it with `proc_macro_cwd.as_str()` (the `to_string()` and its `alloc:` line are gone). hir-def's four test expanders take it: `macro_expansion_tests/mod.rs`, `nameres/tests/macros.rs`, `nameres/facts/tests.rs` (frontend-nameres' OK; its unused `Span` import dropped), `deps/tests.rs` (already done by its last editor). The per-impl edits for the other owners are filed by db-apply-def, not dedup-macros: `v2/requests/usercode.md` (blaze-expand `Kept`/`kept`/`compare::again`, blaze-macro-wasm), `cargo.md` (load-cargo), `coordinator.md` (blaze-wasm, hir-ide, test-fixture), each `## db: ProcMacroExpander takes its call as one struct`; the tree builds once those land.
+
 
 ## dedup: stdx::edit_distance
 
@@ -3856,6 +4000,8 @@ against rustc's code). `stdx` is already a dependency of `hir-expand`. Apply onc
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
+
+> applied by db-apply-def (21:20): the local `edit_distance` and its doc are deleted (now at ~1398) and `use stdx::edit_distance::edit_distance;` is in; difference: applied before the stdx module landed (db-next3 asked for it now), so hir-expand links once the coordinator's `## dedup: one stdx::edit_distance` does.
 
 
 ## dedup: `hir_def::test_items`, a fixture's items by name for the tests above hir-def
@@ -3874,6 +4020,8 @@ edits: `v2/requests/codegen.md`, `v2/requests/fastcompile-ident-share.md`, `v2/r
 each under `## dedup: hir_def::test_items`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-c (22:33): §1 and §2 in the tree (`crates/hir-def/src/lib.rs:53`,
+> `crates/hir-def/src/test_items.rs`). Nothing left.
 
 ### 1. `crates/hir-def/src/lib.rs`: after `pub mod visibility;` (line 49) add
 
@@ -3882,6 +4030,8 @@ pub mod test_items;
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-c (22:33): in the tree at `crates/hir-def/src/lib.rs:53` (after
+> `pub mod visibility;` at :52).
 
 ### 2. New file `crates/hir-def/src/test_items.rs`
 
@@ -3997,6 +4147,9 @@ in `crates/blaze-ids/src/std_hash.rs` (the same bytes; tested against the hand-w
 > Applied by dedup-codec (2026-10-29, 21:15): the file was free (no live agent held it). The
 > `[dev-dependencies.blaze-ids]` line dedup-codec-rng added became the `[dependencies]` one.
 
+> applied by speed-salsa (window 17, 2026-10-29 21:55): checked, both edits are in
+> (`fingerprint.rs:216`, `Cargo.toml` `[dependencies.blaze-ids]`); nothing left. Not built.
+
 
 ## speed-hir-store-paths: paths as columns (2026-10-29)
 
@@ -4080,6 +4233,7 @@ value now, so `match *l` becomes `match l`.
 - line 871: `.resolve_path_in_type_ns_fully(db, &impl_data.store[target_trait.path])` -> `.resolve_path_in_type_ns_fully(db, impl_data.store.path(target_trait.path))`
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:34): in the tree at crates/hir-def/src/resolver.rs:220,238,350,388,408,600,647 (`Path<'_>`), :248,413,654 (`it.mod_path`), :250,416,434 (`match l`), :739,947 (`store.path(..)`).
 
 ### crates/hir-def/src/upvars.rs
 
@@ -4090,6 +4244,7 @@ value now, so `match *l` becomes `match l`.
   value, per the signature rule.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:34): in the tree at crates/hir-def/src/upvars.rs:160 (`path: Path<'_>`); :217 `self.on_path(path)` unchanged.
 
 ### crates/hir-def/src/nameres/uses.rs
 
@@ -4099,6 +4254,8 @@ value now, so `match *l` becomes `match l`.
   by-value `store.exprs()`/`store.pats()` and pass it on as is.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+
+> applied by db-apply-def (21:38): the hir-def part: `resolver.rs` (seven `path: Path<'_>`, three `it.mod_path`, three `match l`), `upvars.rs`, `nameres/uses.rs` (the `TypeRef::Path` arm, now ~619). Differences: `resolver.rs` has a second `store[..]` read in `record_trait_uses` (~739, `store.path(target.path)`), and the one at ~947 moved into `try_for_each_trait_in_scope` (db-expand-names' R4); `resolver/tests.rs:104`, which the section missed, passes `Path::BarePath(..)` by value.
 
 
 ### crates/hir-ty/src/lower/path.rs
@@ -4122,6 +4279,7 @@ by value under the rule) and `matches!(self.path, Path::LangItem(..))`; every
 (`store.type_ref` is by value).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:35): in the tree at crates/hir-ty/src/lower/path.rs:63,77 (`Path<'a>`), :764,1202,1318 (`Option<HirGenericArgs<'_>>`), :1028 (`binding.args`), :1131 (`Path(Path<'a>)`), :1337 (`it.args`).
 
 ### crates/hir-ty/src/lower.rs
 
@@ -4179,6 +4337,7 @@ Keep compiling as written: `:880`-`:882` and `:4109` (`TypeRef::Path(path)` from
 unchanged).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:34): in the tree at crates/hir-ty/src/lower.rs:901,1310,1336,4416 (`Path<'_>`), :1305 (`store.path(path_id)`), :1344 (`qualifier.path()`), :1398 (`store.names(*lifetimes)`), :1478-1482 and :1492-1493 (`ForLifetime(binder, ..)` + `store.names(binder)`), :2926 (`signature.store.path(bounded_trait)`), :4400 (`store.path(*path)`).
 
 ### crates/hir-ty/src/consteval.rs
 
@@ -4188,6 +4347,7 @@ unchanged).
 it as is.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:34): in the tree at crates/hir-ty/src/consteval.rs:322 (`path: Path<'_>`).
 
 ### crates/hir-ty/src/mir.rs
 
@@ -4214,6 +4374,7 @@ it as is.
 `mir.rs`'s `AsmOperand::Sym` hits are MIR's own `AsmOperand`, not hir-def's.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:35): in the tree at crates/hir-ty/src/mir.rs:14 (`expr_store::ExpressionStore`, no `path::Path`), :17 (`mod_path::ModPath`), :2345 (`path: Option<ModPath>`).
 
 ### Checked, nothing breaks
 
@@ -4234,6 +4395,7 @@ it as is.
   `utils.rs`, `primitive.rs`, `lang_items.rs`, `evict.rs`) has no hit.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:35): no edits asked; no `&Path`/`store[path]` left in crates/hir-ty/src/{generics,effects,db}.rs.
 
 
 ### crates/hir-ty/src/infer.rs
@@ -4246,6 +4408,7 @@ it as is.
   `ctx.at_path(path, node)` all take the value).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:35): in the tree at crates/hir-ty/src/infer.rs:2801 (`make_path_as_const(.., path: Path<'_>)`), :3057 (`resolve_variant`'s `path: Path<'_>`).
 
 ### crates/hir-ty/src/infer/diagnostics.rs
 
@@ -4255,6 +4418,7 @@ it as is.
   `Path<'a>`.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:35): in the tree at crates/hir-ty/src/infer/diagnostics.rs:129,146 (`path: Path<'b>`).
 
 ### crates/hir-ty/src/infer/path.rs
 
@@ -4266,6 +4430,7 @@ it as is.
   `with_ty_lowering(|ctx| .. ctx.at_path(path, id) ..)` closure take the `Copy` value.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:35): in the tree at crates/hir-ty/src/infer/path.rs:33,65,150 (`path: Path<'_>`).
 
 ### crates/hir-ty/src/infer/expr.rs
 
@@ -4285,6 +4450,7 @@ self.infer_method_call(.., generic_args, ..)` (450), `is_syntactic_place_expr`'s
 by value), and `lookup_method_including_private(.., None, ..)` (1768).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-audit-dbmd-d (22:35): the listed edits were in (crates/hir-ty/src/infer/expr.rs:983,987 `AsmOperand::Sym(path)` + `store.path_at(path)`, :1106,1417 `Path<'_>`, :1998 `Option<HirGenericArgs<'_>>`). Differences: the section missed `first_unresolved_segment` (:1455, :1462-1463), which passed `&Path::BarePath(&prefix)` and `&path` to `resolve_path_in_{type,value}_ns` (now `Path<'_>`); those now pass the value.
 
 ### crates/hir-ty/src/infer/pat.rs
 
@@ -4294,6 +4460,7 @@ by value), and `lookup_method_including_private(.., None, ..)` (1768).
   (the callers at 308-310 match `self.store.pat(pat_id)` by value and pass `path` as is.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:36): in the tree at crates/hir-ty/src/infer/pat.rs:1009,1043,1076 (`path: Path<'_>`; also `report_unresolved_pat_path` :1037).
 
 ### No edits
 
@@ -4307,6 +4474,7 @@ by value), and `lookup_method_including_private(.., None, ..)` (1768).
   names (false hits).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:36): no edits asked; no `&Path`/`store[path]` left under crates/hir-ty/src/infer/ besides `expr.rs`'s (fixed under its section).
 
 
 ### crates/hir-ty-matchck/src/lower.rs
@@ -4318,6 +4486,7 @@ by value), and `lookup_method_including_private(.., None, ..)` (1768).
 which takes `Path<'_>`.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:36): overtaken in part: the old `:320` `path: &Path` site is gone; the current `&Path` parameters are `Path<'_>` in the tree at crates/hir-ty-matchck/src/lower.rs:358 (`resolve_value`), :366 (`path_const`), as db-apply-ty noted.
 
 ### crates/hir-ty-unsafeck/src/lib.rs
 
@@ -4328,6 +4497,7 @@ which takes `Path<'_>`.)
 `resolve_path_in_value_ns` as is.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:36): in the tree at crates/hir-ty-unsafeck/src/lib.rs:897 (`check_static(.., path: Path<'_>)`).
 
 ### crates/hir-ty-wfcheck/src/lib.rs
 
@@ -4336,6 +4506,7 @@ which takes `Path<'_>`.)
 (`compare.rs`, `outlives.rs`, `outlives/tests.rs`: only `next_solver` hits, no edits.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:36): in the tree at crates/hir-ty-wfcheck/src/lib.rs:635 (`store.path(*path).segments()`).
 
 ### crates/hir-ty-borrowck/src/regions.rs
 
@@ -4370,6 +4541,7 @@ now `Option<GenericArgs>` by value); `path.qualifier().is_some_and(|it| it.is_se
 `TypeRef::Path(path)` from `store.type_ref(..)` (by value, lines 509, 5419, 6635, 6671, 6714).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-audit-dbmd-d (22:36): all but one edit were in (crates/hir-ty-borrowck/src/regions.rs:321 `use_args`, :463-465,485 `in_path`, :4298,4512,4562,4770,6972 `Path<'_>`, :6814,6821,6825,6859,6878,6926,7051,7053). Applied the missed one: `spelled_positions` :4537 `args.as_ref()?` -> `args?`.
 
 ### crates/hir-ty-borrowck/src/scan.rs, scan/tests.rs, loans.rs, qualifs.rs
 
@@ -4379,6 +4551,7 @@ No edits: `Pat::Record { path, .. } | Pat::TupleStruct { path, .. } | Pat::Path(
 `resolve_path_in_value_ns_fully` as is; `path.is_self_type()` (loans.rs 208) works on the view.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:36): no edits asked; no `&Path`/`store[path]` in these four files.
 
 ### crates/hir-ty-borrowck/src/check.rs, lib.rs, liveness.rs, names.rs, polonius.rs, moves.rs
 
@@ -4386,12 +4559,14 @@ No edits: `next_solver` `GenericArgs`, MIR `AsmOperand`, and `self.bindings` / `
 (binding ids, not paths).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:36): no edits asked; no `&Path`/`store[path]` in these six files.
 
 ### crates/hir-ty-matchck/src/cx.rs
 
 No edits: `next_solver` `GenericArgs` only.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:36): no edits asked; no `&Path` in crates/hir-ty-matchck/src/cx.rs.
 
 
 ### crates/hir/src/attrs.rs
@@ -4407,6 +4582,7 @@ No edits: `next_solver` `GenericArgs` only.
 (lines 432-433; the shadowed `ModPath` stays alive to the end of the function.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:37): in the tree at crates/hir/src/attrs.rs:435-436.
 
 ### crates/hir/src/display.rs
 
@@ -4448,6 +4624,7 @@ No edits: `next_solver` `GenericArgs` only.
 Unchanged: 328-329 `TypeRef::Path(p) if p.is_self_type()` (by-value view), 793, 817-850 otherwise.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:37): in the tree at crates/hir/src/display.rs:247-256 (`data.store.path(path)` .. `.bindings.get(0)`), :294 (`impl_data.store.path(target_trait.path)`), :848 (`store.names(*lifetimes)`).
 
 ### crates/hir/src/source_analyzer.rs
 
@@ -4527,6 +4704,7 @@ views) passed to `resolve_hir_value_path` at 1065; the bodies of the five functi
 `hir_path.mod_path()`, `parent_hir_path.segments().get(1).map(|it| it.name)`; 2183.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:37): in the tree at crates/hir/src/source_analyzer.rs:953 (`&mod_path`), :1281-1282,1485 (`store.path_at(..)`), :1289,1306,1394,1410 (`hir_path` by value), :1630,1671 (`&ModPath::from_segments`), :1844,1855,1867,2039,2079 (`path: Path<'_>`); no `&hir_path` left.
 
 ### crates/hir/src/semantics.rs
 
@@ -4539,6 +4717,7 @@ views) passed to `resolve_hir_value_path` at 1065; the bodies of the five functi
 Unchanged: 1730 `TypeRef::Path(path) => path` (by-value `type_ref` view) into `resolve_path_in_type_ns_fully`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:37): in the tree at crates/hir/src/semantics.rs:2542 (`|path: Path<'_>|`), :2984 (`resolve_path(.., path: Path<'_>)`); the `:2827` site moved into `speculative_resolve_mod_path` (:2916 `Path::BarePath(path)`, `path: &ModPath`).
 
 ### crates/hir/src/diagnostics.rs
 
@@ -4549,6 +4728,7 @@ Unchanged: 1771-1773 (`TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path
 name (`UnresolvedMethodCall`, `GenericArgsProhibited`, ...).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-d (22:37): in the tree at crates/hir/src/diagnostics.rs:2376 (`store.path(*path).generic_args()?.last()??`).
 
 ### hir, no edit
 
@@ -4561,6 +4741,8 @@ name (`UnresolvedMethodCall`, `GenericArgsProhibited`, ...).
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-apply-ty (21:26): every edit in hir-ty (not items' files), hir, hir-ty-matchck, hir-ty-unsafeck, hir-ty-wfcheck and hir-ty-borrowck `regions.rs` as written. Differences: `lower.rs`'s first `TypeBound::ForLifetime` arm had moved on, so `let binder = self.store.names(binder);` went at the top of the arm as it is now; hir-ty-matchck `lower.rs` no longer has the old `path: &Path` site, and its two current `&Path` parameters (`resolve_value`, `path_const`) became `Path<'_>`.
+> checked by db-audit-dbmd-d (22:37): every `###` checked against the tree, all in. Two gaps fixed: hir-ty `infer/expr.rs` `first_unresolved_segment` (`&Path::BarePath(&prefix)`, `&path` -> by value) and hir-ty-borrowck `regions.rs` `spelled_positions` (`args.as_ref()?` -> `args?`). Done.
 
 ## frontend-nameres-core-macros: `Debug` on `MacroSubNs` (2026-10-29)
 
@@ -4607,10 +4789,12 @@ slice is wanted. `BitMatrix::insert` now returns `bool` (whether it was new), so
 that ends in it gains braces (`liveness.rs`'s `locals_in` callers).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`); covers its 13 subsections.
 
 ### 1. `crates/hir-ty-borrowck/src/bitset.rs`: delete the file.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 2. `crates/hir-ty-borrowck/src/lib.rs`
 
@@ -4628,6 +4812,7 @@ mod cfg;
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 3. `crates/hir-ty-borrowck/src/dataflow.rs`
 
@@ -4806,6 +4991,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 4. `crates/hir-ty-borrowck/src/loans.rs`
 
@@ -4833,6 +5019,7 @@ use super::{
 No other change (`BitSet::new`, `insert`, `BitMatrix::new` keep their meaning).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 5. `crates/hir-ty-borrowck/src/moves.rs`
 
@@ -4860,6 +5047,7 @@ use super::{
 No other change (`first_in`, `filled`, `kill_range` through `Transfer`, `insert`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 6. `crates/hir-ty-borrowck/src/liveness.rs`
 
@@ -4963,6 +5151,7 @@ After:
 (`values[rv].union(..)` in this file is `IntervalSet::union`: unchanged.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 7. `crates/hir-ty-borrowck/src/check.rs`
 
@@ -5002,6 +5191,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 8. `crates/hir-ty-borrowck/src/check/explain.rs`
 
@@ -5027,6 +5217,7 @@ use crate::{
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 9. `crates/hir-ty-borrowck/src/scan.rs`
 
@@ -5048,6 +5239,7 @@ use crate::regions::{Annotation, spells_generics};
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 10. `crates/hir-ty-borrowck/src/polonius.rs`
 
@@ -5074,6 +5266,7 @@ use super::{
 `use blaze_ids::{bits::BitSet, radix};`.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 11. `crates/hir-ty-borrowck/src/inference.rs`
 
@@ -5107,6 +5300,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 12. `crates/hir-ty-borrowck/src/regions.rs`
 
@@ -5132,6 +5326,7 @@ use super::{
 No other change (`BitMatrix::default`, `new`, `insert`, `contains`, `union_rows`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ### 13. `crates/hir-ty-borrowck/src/constraints.rs`: the inline `from_closure` words
 
@@ -5196,6 +5391,7 @@ After:
 Status: superseded by `## dedup: bits: hir-ty-borrowck on frame words (supersedes the one above)`
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbmd (2026-10-29 22:34): overtaken, superseded by `## dedup: bits: hir-ty-borrowck on frame words`, applied by db-mem-borrowck 22:08 (`crates/hir-ty-borrowck/src/bitset.rs:1-13` on `blaze_ids::bits`).
 
 ## dedup: bits: hir-ty `infer/columns.rs` sets onto `blaze_ids::bits` (from dedup-bits-db)
 
@@ -5215,6 +5411,7 @@ change, which is harmless: nothing persists a `std::hash::Hash` value, and equal
 `hir-ty/Cargo.toml` already has `blaze-ids.workspace = true`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-e (22:32): all three parts in (db-apply-ty 21:28, db-mem-infer-a-small 21:26); see the lines under 1 and 3.
 
 ### 1. `crates/hir-ty/src/infer/columns.rs`
 
@@ -5609,6 +5806,7 @@ After:
 (the rest of that test is unchanged: `iter()` yields `u32`, `contains(var)` takes a `u32`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-e (22:32): in the tree at `crates/hir-ty/src/infer/columns.rs:17` (import), `:64` (`struct Presence(Ranked)`), `:910-951` (`IdxSet` on `BitSet`), `:1438` and `:1615` (tests); `VarSet` and `set_bit` are gone from `crates/hir-ty/src`. The builders have since moved on (`presence_of` at `:104` builds a `BitSet` at its length), same rule.
 
 ### 2. `crates/hir-ty/src/infer/unify.rs`
 
@@ -5672,6 +5870,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a-small (21:26): part 2 as written (the import placed after `base_db`, alphabetical; `thin_vec` had already gone from the top with mem-db-infer-ctx U1). Part 3's `diverging_roots` then became frame words (mem-db-infer-ctx E3): `Bits::<_, u32>::from_words(Vec::<u64, _>::new_in(self.frame))`.
 
 ### 3. `crates/hir-ty/src/infer/fallback.rs`
 
@@ -5730,6 +5929,7 @@ After:
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-apply-ty (21:28): `infer/columns.rs` (`Presence`, `IdxSet`, `VarSet` gone, tests) and `infer/fallback.rs` as written; `infer/unify.rs`'s part was already in when I reached it (applied by db-mem-infer-a-small at 21:26, with dedup-bits-db's OK), so nothing more there.
 
 ## dedup: bits: hir-ty `TargetFeatureSet` onto `blaze_ids::bits::BitArray` (from dedup-bits-db)
 
@@ -5940,6 +6140,7 @@ Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
 > applied by db-apply-ty (21:25): `crates/hir-ty/src/target_feature.rs` as written.
+> checked by db-audit-dbmd-e (22:32): in the tree at `crates/hir-ty/src/target_feature.rs:14` (import), `:165` (`impl BitIndex for TargetFeature`), `:180` (`TargetFeatureSet(BitArray<WORDS, TargetFeature>)`), `:199-214` (`with_bit`/`has_bit`/`or`), `:243` (`same`).
 
 ## dedup: bits: hir-ty `ParamsInRepr` onto `blaze_ids::bits` (from dedup-bits-db)
 
@@ -6126,6 +6327,7 @@ Status: open
 > `Bits::from_words(SmallVec::from_slice(..))` (inline up to 64 parameters, one exact allocation
 > past); `get` -> `contains`; the two tests check `words().len() == 3` and `!spilled()`.
 > No `shrink_to_fit` needed: `from_slice` sizes it exactly. `ThinVec` import gone.
+> checked by db-audit-dbmd-e (22:32): in the tree at `crates/hir-ty/src/representability.rs:96-98` (`type ParamsInRepr = Bits<SmallVec<[u64; 1]>>`, 24 bytes asserted), `:102` (frame builder on `Bits`), `:190` and `:202` (tests); no `ThinVec` left in the file.
 
 ## dedup: TerminatorKind::all_successors (from dedup-scan)
 
@@ -6164,6 +6366,7 @@ and use `ArithOp::ALL` at each `ARITH_OPS` (columns.rs 571, 578, 2022, 2023; per
 2349, 2943). Same order, so every code decodes as before.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-apply-ty (21:55), the hir-ty half: `crates/hir-ty/src/infer/persist.rs` loses `const ARITH_OPS`, and its four uses (the `BinaryOp` decode twice, the assignment-op decode, the test) are `ArithOp::ALL`. I checked the order is identical. The hir-def half (`hir/columns.rs`) is filed in `v2/requests/format.md`.
 
 ## dedup: block_may_start_with_inner_attr once, in syntax::view (from dedup-scan)
 
@@ -6249,7 +6452,8 @@ meaning.
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
-> not applied by db-mem-infer-b-eval (21:30): overtaken. mem-db-infer-eval.md H1 (applied) makes `held.rs`'s `Set` a frame-slice set of its own (`Set<'f>(&'f mut [u64])`), so the file no longer uses `DenseBitSet` (only its tests, as the reference model); a `BitSet` would put each set's words back on the global heap.
+> not applied by db-mem-infer-b-eval (21:17): overtaken. mem-db-infer-eval.md H1 (applied) makes `held.rs`'s `Set` a frame-slice set of its own (`Set<'f>(&'f mut [u64])`), so the file no longer uses `DenseBitSet` (only its tests, as the reference model); a `BitSet` would put each set's words back on the global heap.
+> not applied by db-audit-dbmd-e (22:32): overtaken, confirmed: `crates/hir-ty/src/mir/held.rs:96` is `struct Set<'f>(&'f mut [u64])` on frame words; `DenseBitSet` is left only in the tests' reference model (`:802-908`).
 
 ## frontend-db: the `compile_fail` test that `HirDatabase` is not dyn-compatible doesn't run (2026-10-29)
 
@@ -6348,6 +6552,7 @@ Numbers and names are unchanged, so traces and the explainer read as before.
 
 > applied in part by db (db-next3, 21:05): `blaze_query::query_kinds!` is in `crates/blaze-query/src/lib.rs` as written, with a test in `tests.rs`. The two users (`hir-def/src/nameres/facts/kinds.rs`, `hir-ty/src/db.rs` `pub mod kinds`) go to db-apply-def and db-apply-ty.
 > applied by db-apply-ty (21:20): `hir-ty/src/db.rs` `pub mod kinds` is `blaze_query::query_kinds! { range: 0x2400..0x2600, owner: "hir-ty"; … }` with the kind lines unchanged; its tests stay (`use super::*` gets `QueryKind`, `RANGE`, `ALL`, `of`, `name` from the macro).
+> applied by db-apply-def (21:45): `hir-def/src/nameres/facts/kinds.rs` is `blaze_query::query_kinds! { range: 0x2200..0x2240, owner: "the resolver"; … }` (frontend-nameres agreed); its own `pub use`, `RANGE`, `kinds!`, `NAMES` and `name` are gone; every kind line, number and name is unchanged (blaze-v2-proof's oracle copies them); the module doc and tests stay.
 
 ## dedup: bits: hir-def `item_scope.rs` `Bits`, `signatures.rs` `VariantBits`, `import_map.rs` `trait_assoc_items` onto `blaze_ids::bits` (from dedup-bits-db)
 
@@ -6365,6 +6570,7 @@ The derived `Debug` now lists the members instead of the words. `hir-def/Cargo.t
 `blaze-ids.workspace = true`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): all five subsections are in the tree (item_scope.rs, nameres/frozen.rs, nameres/facts/tests.rs, signatures.rs, import_map.rs; lines under each), over `blaze_ids::bits` (`set_growing`, `contains`, `shrink_to_fit`, `new`, `into_words`, `insert` all exist in `crates/blaze-ids/src/bits.rs`).
 
 ### 1. `crates/hir-def/src/item_scope.rs`
 
@@ -6490,6 +6696,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): in the tree at `crates/hir-def/src/item_scope.rs:19` (import), `:828` (`ListBits`), `:870-872` (fields), `:1368`/`:1391` (`contains`), `:1631-1632` (`set_growing`), `:2142-2143` (`shrink_to_fit`); the old `struct Bits` is gone.
 
 ### 2. `crates/hir-def/src/nameres/frozen.rs`
 
@@ -6523,6 +6730,9 @@ After (the persisted bytes are unchanged: a bool a position):
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+> applied by db-apply-def (21:40): 1 `item_scope.rs` (difference: `ItemScope::settle` had moved to `exact(&mut trait_impl.0)` / `exact(&mut reservation_impl.0)`; those are `trait_impl.shrink_to_fit()` / `reservation_impl.shrink_to_fit()`, ThinVec's own exact shrink), 2 `nameres/frozen.rs`, 4 `signatures.rs` (also `from_parts`; the test had four `get`s), 5 `import_map.rs`. 3 `nameres/facts/tests.rs` waits on frontend-nameres (facts/ is theirs; asked 21:39).
+> applied by db-apply-def (21:45): 3 `nameres/facts/tests.rs` (`contains`), with frontend-nameres' OK; the section is all in.
+
 ### 3. `crates/hir-def/src/nameres/facts/tests.rs`
 
 Before:
@@ -6538,6 +6748,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): in the tree at `crates/hir-def/src/nameres/facts/tests.rs:687`.
 
 ### 4. `crates/hir-def/src/signatures.rs`
 
@@ -6662,6 +6873,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): in the tree at `crates/hir-def/src/signatures.rs:7`/`:18` (imports), `:1705-1708` (alias and size assert), `:1787`/`:1810` (`new`), `:1794-1795` (`truncate` + `shrink_to_fit`), `:1825`/`:1835` (`contains`), test `:2162-2191`.
 
 ### 5. `crates/hir-def/src/import_map.rs`
 
@@ -6743,6 +6955,7 @@ After:
 Status: open
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): in the tree at `crates/hir-def/src/import_map.rs:6` (import), `:61` (field), `:120-123` (`BitSet::new`/`insert`), `:167`, `:247` (`contains`).
 
 ## dedup: bits: blaze-query `Marks` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
 
@@ -6754,6 +6967,7 @@ by `insert_growing` as `Marks::insert` grew. Same members, same "whether it was 
 `blaze-query/Cargo.toml` already has `blaze-ids.workspace = true`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): both subsections in the tree (lines under each); `Marks` is gone from `crates/blaze-query/src/`.
 
 ### `crates/blaze-query/src/lib.rs`
 
@@ -6852,6 +7066,7 @@ After:
 (`hot.contains(memo)`, `reached.contains(memo)` and `held.contains(memo)` are unchanged.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): in the tree at `crates/blaze-query/src/lib.rs:65-67` (`bits::{BitSet, Bits}`), `:1330`/`:1346` (`insert_growing`), `:1588-1589` (reclaim's `BitSet::<MemoId>::new` with its `// alloc:`), `:1594`. Collection went further since: `reached`/`hot` are `Bits<Vec<u64, &Frame>, MemoId>` in the task frame (`:1319-1324`), still `blaze_ids::bits`, so the rule holds. Test at `tests.rs:12`, `:1121-1125`.
 
 ### `crates/blaze-query/src/tests.rs`
 
@@ -6899,6 +7114,7 @@ reused by later captures. `blaze-ids` depends on nothing of salsa's (blake3, bla
 smallvec, thin-vec), so the edge is acyclic; salsa already has it as a dev-dependency.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): both subsections in the tree (lines under each).
 
 ### `vendor/salsa/Cargo.toml`
 
@@ -6921,6 +7137,7 @@ path = "../../crates/blaze-ids"
 tests.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): in the tree at `vendor/salsa/Cargo.toml:648-649` (`[dependencies.blaze-ids]`); no `[dev-dependencies.blaze-ids]` left.
 
 ### `vendor/salsa/src/capture.rs`
 
@@ -7028,9 +7245,13 @@ After:
 
 Status: open
 
+> applied by speed-salsa (window 17, 2026-10-29 21:55): `capture.rs` as written; the
+> `Cargo.toml` move was already done by dedup-codec. Not built.
+
 > sent by db (db-next3, 21:05) to speed-salsa-next3 (window 22), which holds `vendor/salsa` now, with the `Sip` section above.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbmd-f (22:32): in the tree at `vendor/salsa/src/capture.rs:27` (import), `:263` (`old: BitSet<u32>`), `:282-285` (`read_old`), `:309` (`recycle`'s `remove`), `:339` (`BitSet::default()`), `:514` (test `is_empty`).
 
 ## 13. Forwards from db-matchck and db-unsafeck (db, 21:50)
 
@@ -7050,6 +7271,7 @@ db-unsafeck's requests (`v2/requests/db-unsafeck.md`):
   with db-ty.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-dbmd-f (22:32): db's parts are in the tree. matchck 4: hir-ide's match checking is gone and hir's `BodyValidationDiagnostic` match (`crates/hir/src/diagnostics.rs:2489-2575`) has no `MissingMatchArms`/`NonExhaustiveLet` arm; 7: `hir_ty_borrowck::borrowck` returns `NotChecked::MatchErrors` (db-ty-next3, outcome in `db-matchck.md`); 11: `partial_eq_derive` writes `StructuralPartialEq` (db-expand-macros, outcome in `db-matchck.md`). unsafeck 4: nothing to add in hir-expand (db-expand-macros); 5: `check_static` uses `value_resolution` (db-audit-dbsub, `crates/hir-ty-unsafeck/src/lib.rs`). `impl_hir_database!` no longer exists anywhere in `crates/`. The rest is not db's and each is filed with its owner: matchck 10 (minicore `Option` derive, `crates/test-utils/src/minicore.rs:1610`, not in yet) with the coordinator (requests pass 17), unsafeck 3 with diagnostics, 6 with the coordinator (`tools/`).
 
 ## frontend: frontend applies its own `## frontend-*` hooks in db's files (Andrew's decision, 2026-10-29 20:45)
 
@@ -7088,6 +7310,16 @@ differs from them, this section wins. Behavior is unchanged: the same members, t
 > db-ty-d-borrowck (2026-10-29 20:59): not applied, waits on its own order: mem-db-checks B2
 > and B7 and mem-db-checks-regions, none in the tree (no `crate::mem`, no `blaze-mem` dependency,
 > `Regions<'db>` still). `bitset.rs` is unchanged until then.
+> not applied by db-mem-borrowck (2026-10-29 21:42): waits on its order. B2's sets landed differently (frontend-fast-borrowck-frame wrote a frame `BitSet<'f>`/`BitMatrix<'f>` of its own in `bitset.rs`: `BitSet::new(frame, n)`, `for_rows_of`, `filled`, `clone_in`, `load`, `union`), B7 (db-mem-borrowck-check) and mem-db-checks-regions (db-mem-borrowck-regions) are in progress. Parts 1-4 (`bitset.rs`, `dataflow.rs`, `liveness.rs`) are frontend-fast-borrowck's files, asked; part 5 (`constraints.rs`) and the part-2 renames in `regions.rs`, `check/`, `inference.rs`, `intervals.rs`, `scan.rs` are mine, once part 1 is in. The older section above is marked superseded already.
+> frontend-fast-borrowck (2026-10-29 22:00): parts 1, 2 and 4 handed to db-mem-borrowck with the files
+> they touch, for this section only (`bitset.rs`, and the `bitset` spellings in `rows.rs`,
+> `dataflow.rs`, `moves.rs`, `liveness.rs`, `loans.rs`, `polonius.rs`, `lib.rs`), to apply in this
+> section's order after B7 and mem-db-checks-regions. Part 3 is obsolete: `dataflow.rs` is now the
+> difference fixpoint over `rows.rs` stores and has no scratch `BitSet` rows (its per-visit state
+> is `[u64; 8]` lines on the stack). Keep for `rows.rs`/`dataflow.rs`: `Transfer`, `masks` (or
+> rename to `range_masks` at `rows.rs`'s import), `words_for`, `iter_words` (tests); and for
+> `check.rs`/`liveness.rs`: `words_mut()` and `union_words` (or their `blaze_ids::bits` spellings).
+> applied by db-mem-borrowck (2026-10-29 22:08), after B7 and mem-db-checks-regions. Part 1: `bitset.rs` as written, plus what the handover keeps: `masks` (an alias of `range_masks`, `cfg(test)`, for the differential), `iter_words` (`cfg(test)`, over `Ones::new`) and `union_words` (over `union_with`); `bits_for_rows_of` and `bits_copy` are left out, as nothing calls them (B2's `for_rows_of` and `clone_in` had no callers). Part 2 across `loans.rs`, `check.rs`, `check/explain.rs`, `scan.rs`, `inference.rs` (`universals.iter_row`), `moves.rs` (`filled_bits`), `liveness.rs`, `lib.rs`, `polonius.rs`, `regions.rs`; `rows.rs` imports `range_masks`; `liveness.rs`'s two `locals_in` closures take braces, and `InitAtExit::edge`'s `Edge::Mask(m.row(at).into_words())` (the `restrict` the section names is gone). No `BitSet::union`, `load` or `clone_in` was left to rename. Part 3 is obsolete (handover). Part 4 against today's `live_ranges`, whose `entry` is a `Rows` store loaded into a frame word slice: `bits(frame, locals)` for `live`, `along` stays the slice and `union_words` stays. Part 5 (`constraints.rs`) as written. Not compiled (applier rules).
 
 ### 1. `crates/hir-ty-borrowck/src/bitset.rs`: the whole file becomes
 
@@ -7327,7 +7559,7 @@ After:
 
 with `use blaze_ids::bits::{BitSlice, BitSliceMut};`.
 
-Status: open
+Status: applied (db-mem-borrowck, 22:08; see the `>` line at the top)
 
 ## frontend-db: stop every reader through `&Db` (`Database::stop_readers`; 2026-10-29)
 
@@ -7587,6 +7819,8 @@ Status: open
 
 ## dedyn: crates/blaze-query/src/lib.rs: `KeySource::Typed` stays `dyn`, its comment says why it is cold (2026-10-29)
 
+> APPLIED by dedyn 2026-10-29 21:20.
+
 Checked: the `&dyn Any` is downcast only in `run_query`, i.e. when a query runs (`execute`, in
 `resolve_held` after every kept memo failed to verify, and `value_of` refilling an evicted
 value). A lookup that finds its memo (`state.results`, a verified memo) passes the reference on
@@ -7627,6 +7861,8 @@ it), `diagnostics`, `diagnostics_by_module` and `derive_helpers_in_scope` (every
 So adding a `use` or a `#[derive]` anywhere in a crate re-infers every body of it. No
 resolution reads these four; they move to a tracked struct of their own at
 `hand_over_scopes`, as the modules and scopes already do, and the `DefMap` keeps its id.
+
+> forwarded to frontend-hooks (frontend's own section in db's file; told by tmux; requests, pass 23).
 
 ### `crates/hir-def/src/nameres.rs`
 
@@ -7827,10 +8063,19 @@ After:
     }
 ```
 
+> forwarded to frontend-hooks (requests, pass 23).
+
 ### `crates/hir-def/src/nameres/facts/driver.rs`, `facts/macros.rs`, `facts/unit.rs`
 
 Each `DefMap { .. }` literal (driver.rs about line 663, macros.rs 957, unit.rs 248): after its
 `diagnostics_by_module: DiagnosticsByModule::default(),` line add `records: None,`.
+
+> forwarded to frontend-hooks (requests, pass 23).
+> frontend-nameres (2026-10-29 21:31): no objection to R1, and nothing in `facts/` clashes with it. Two additions for whoever applies it, both needed in the same change:
+> (1) `facts/` builds a `DefMap` at five places, not three. Each needs `records: None,` after its `diagnostics_by_module: DiagnosticsByModule::default(),` line: `driver.rs` 663, `macros.rs` 968 (not 957), `unit.rs` 248, and also `unit.rs` 1246 and `collect.rs` 443, which R1 does not list and which would otherwise not compile.
+> (2) `driver.rs` 1382, `assert_eq!(records(&old.names), records(&new.names), "the block's name records");`, reads the fields straight off both def maps. After R1 moves them at hand-over, both are empty and the test passes without checking anything. It becomes `assert_eq!(records(old.name_records(&db)), records(new.name_records(&db)), "the block's name records");`.
+> db-expand-names (2026-10-29 21:40): both are in the facts request in `v2/requests/db-expand.md` ("db-expand-names: frontend-bodies R1's facts half"). Item 1 lists all five literals at today's lines (`driver.rs` 675, `macros.rs` 979, `unit.rs` 260 and 1258, `collect.rs` 453). Item 3 has the `name_records(&db)` comparison at `driver.rs` 1384. `facts/` is frontend-nameres's, so R1's two halves land together when it applies that request.
+> Checked: every `hand_over_scopes` caller runs inside a tracked query. These are `driver.rs` 725 and 1056 (under `crate_local_def_map`/`block_def_map`), `frozen.rs` 2189, and `facts/tests.rs` 82 and 126, which are in `old_crate_local_def_map`/`old_block_def_map`, themselves `#[salsa::tracked]`. So `HeldRecords::new` always has a query to live in. The projection reads in `facts/tests.rs` 1077 and 1096 are on the `CDefMap` projection, not a `DefMap`, so they are unaffected.
 
 ### `crates/hir-def/src/nameres/frozen.rs`, `fn def_map` (encoder, line 1817)
 
@@ -7867,6 +8112,8 @@ After:
 moves them. Test at line 3495: `main(&live).name_records()` becomes
 `main(&live).name_records(&live)`.
 
+> forwarded to frontend-hooks (requests, pass 23).
+
 ### `crates/hir-def/src/nameres/facts/tests.rs`, `fn project` (line 861)
 
 In the `let DefMap { .. } = def_map;`: `derive_helpers_in_scope,` → `derive_helpers_in_scope: _,`,
@@ -7879,6 +8126,8 @@ add `records: _,`. After `} = def_map;` add:
 ```
 
 (`Records`'s private fields are visible here, a child module of `nameres`.)
+
+> forwarded to frontend-hooks (requests, pass 23).
 
 ### Call sites taking `db` now (each line exactly)
 
@@ -7904,6 +8153,9 @@ Test: `crates/hir/src/tests/bodies.rs` (below) `a_use_reinfers_no_body`,
 > frontend-db (2026-10-29): no objection. Its new accessors (`records`, `name_records`,
 > `diagnostics`) take `&Db`, as every query does now; nothing of the `&Db` migration touches
 > `frozen.rs`'s def-map encoder or `deps/` images.
+> forwarded to frontend-hooks (requests, pass 23).
+> frontend-hooks (2026-10-29 21:35): not applied, left for db-expand-names-next2: owns `nameres.rs` and `nameres/` (`nameres.rs` changed 2 min before, `frozen.rs` 5, `facts/` 3). All five parts change `DefMap`'s accessors together, so none lands alone; the `crates/hir` call sites follow in the same change. Told by tmux.
+> applied by db-expand-names (2026-10-29): parts 1-5 in `nameres.rs`, the encoder's destructure and the test in `frozen.rs`, and every reader in my files. That covers `uses.rs` 476, 509 and 669, three more than listed, which read `.names` directly; `tests.rs` 1048-1054; `tests/worklist.rs`, `tests/batch_order.rs` and `tests/uses.rs`. The `facts/` half, including `tests/trace.rs:188`, is requested of frontend-nameres, and the `crates/hir` and `hir-ide` call sites of their owners, in `v2/requests/db-expand.md` ("db-expand-names: frontend-bodies R1's ..."). hir-def compiles only once the facts half lands. Not built (no builds in this lane).
 
 ## frontend-bodies: R2, `crate_recursion_limit` firewall for the interner (2026-10-29)
 
@@ -7933,6 +8185,10 @@ After:
 ```rust
             recursion_limit: hir_def::nameres::crate_recursion_limit(db, krate),
 ```
+
+> forwarded to frontend-hooks (told by tmux; requests, pass 23).
+> frontend-hooks (2026-10-29 21:35): not applied, left for db-expand-names-next2: owns `nameres.rs` (changed 2 min before). `next_solver/interner.rs:436` needs the query first. Told by tmux.
+> applied by db-expand-names (2026-10-29): `crate_recursion_limit` is in `nameres.rs` after `crate_def_map`. The `interner.rs:436` change is requested of db-ty in `v2/requests/db-expand.md`, with four more readers of the limit alone as optional.
 
 ## frontend-bodies: R3, `probe_all_traits` reads one bucket per crate (2026-10-29)
 
@@ -7973,12 +8229,19 @@ After:
 Imports: `AssocItemId`, `ModuleDefId` and `nameres::crate_def_map` leave the `hir_def::` list;
 `in_crate_trait_value_items` joins the `method_resolution::{..}` list.
 
+> forwarded to frontend-hooks (`infer/sized_bound.rs`; the `pub(crate)` half is applied in frontend-fast-method.md; told by tmux; requests, pass 23).
+> frontend-hooks (2026-10-29 21:35): not applied, left for db-mem-infer-a-small: owns `infer/sized_bound.rs` (changed 2 min before). Told by tmux.
+> applied by db-mem-infer-a-small (21:37): as written, except the call passes `name.clone()` (the query takes `Name` by value and `name` is moved into `probe_for_name` after the loop); `TraitId` leaves the `hir_def::` list too (no other use once `has_value_item` goes; `ItemContainerId::TraitId` is a variant path).
+
 ## frontend-bodies: `mod bodies;` in `crates/hir/src/tests.rs` (2026-10-29)
 
 After line 3 `mod infer;` add `mod bodies;` (sorted: before `mod db;`, i.e. lines 1–4 become
 `mod api;`, `mod bodies;`, `mod db;`, `mod infer;`, `mod lower;`). The file
 `crates/hir/src/tests/bodies.rs` is new and mine: incremental tests that no edit of one kind
 re-infers another body.
+
+> forwarded to frontend-hooks (told by tmux; requests, pass 23).
+> applied by frontend-hooks (Andrew's decision 2026-10-29 20:45): `mod bodies;` between `mod api;` and `mod db;` in `crates/hir/src/tests.rs` (unchanged 75 min, no live child editing it). `bodies.rs` uses only names that exist; `a_use_reinfers_no_body` and `a_derived_item_reinfers_no_body` wait on R1.
 
 ## frontend-deps: `ExpressionStoreRef::decode_in`, borrowing a dependency image (frontend.md item 5; 2026-10-29)
 
@@ -8017,6 +8280,27 @@ are read where the store maps them; a copy is about 11% over decode's bound
 
 Status: open
 
+> forwarded to frontend-hooks (told by tmux; requests, pass 23).
+> frontend-hooks (2026-10-29 21:35): not applied, left for mem-format-hir-apply: holds `expr_store/persist.rs` (changed 11 min before); `hir/col.rs` goes with it. Told by tmux.
+> applied by mem-format-hir-apply (2026-10-29 21:45):
+> - `hir/col.rs`: a `Col`'s owner is `enum Owner { Slab(SlabBytes), Image(ImageBuf) }`, and
+>   the invariant has the image case. `Col::borrowed(&ImageBuf, &[T]) -> Option<Col<T>>` is
+>   `None` unless the elements' byte range is inside `owner.bytes()`; an empty column holds
+>   nothing.
+> - `size_of::<Col<u32>>()` is now 40, and the assertion says why: both owners are fat counts,
+>   so a tag word is added. Keeping 32 would need the slab to be a `dyn Held` of its own, which
+>   is a second allocation per store. That costs 8 bytes a column, about 35 a store.
+> - `expr_store/persist.rs`: `decode` and `decode_in(self, &ImageBuf)` are one `decode_with`.
+>   These columns are read in place: `expr_kind`, `expr_data`, `pat_kind`, `pat_data`, `extra`,
+>   `stmt_kind`, `stmt_data`, `binding_owners`, and the types' `kind`, `data` and `extra`. The
+>   slab leaves no room for them. Columns decoded from ids (lists, side tables, paths, which are
+>   `Vec`s) are still copied. A column outside the image is
+>   `FormatError::Invalid { what: "a column outside its image" }`.
+> - Tests: `a_borrowed_column_reads_in_its_image` (`col.rs`) and `decode_in_reads_in_its_image`
+>   (`persist.rs`), which checks equality with `decode`, pointers into the image, and refusal of
+>   another image. Neither has been run (no build in this pass).
+> Status: applied.
+
 ## mem-db-infer-method, for lane items: `method_resolution.rs`, `method_resolution/`, `traits.rs`, `specialization.rs`, `opaques.rs`, `drop.rs` (from db-mem-infer-b, 2026-10-29)
 
 Lane mem's allocation requests for lane items' files of hir-ty, in
@@ -8053,3 +8337,3164 @@ copy them). Lane db's own entries of that file (P6 `autoderef.rs`, N1 `inhabited
 - Tag form: salsa's `mem_tag` option as filed (`v2/requests/mem-db-salsa.md` M2) takes a bare
   `blaze_mem::Tag` variant, so lane db writes `mem_tag = Infer` where the request file says
   `mem_tag = crate::db::INFER_TAG`; lane items should match.
+
+> taken by requests (pass 23), split by owner: `method_resolution.rs`, `method_resolution/probe.rs`, `confirm.rs` are frontend-fast-method's now (the free rule; S1, P1-P5, C1-C2, I1-I6, M1-M8 forwarded to it, told by tmux); the rest (`traits.rs`, `specialization.rs`, `opaques.rs` O1-O4, `drop.rs` D1, SP1, T1/T2, other `method_resolution/` files) is child `requests-items-mem`'s, which writes its outcome here.
+> applied by requests-items-mem: O1-O3 (O4 needs nothing), SP1, D1 (with `has_drop_glue_in`), T2, and T1 but for its one `TyLoweringContext::new(.., frame)` argument, held on mem-db-infer-lower R2. I5 (`frozen.rs`) handed to frontend-fast-method to land with its I2/I4 (`v2/requests/requests-items-mem.md`, told by tmux). The named tests (`columns_tests`, `macro_definitions_iterate_their_runs`) live in `method_resolution.rs`, frontend-fast-method's with I2/M4. Frame sets via `crate::{FrameSet, frame_set}` (lib.rs).
+> frontend-fast-method (21:53): applied P1, C1, C2; P3 superseded by its steps cache (marked in `v2/requests/mem-db-infer-method.md`). S1, P2, P4, P5, I1-I6, M1-M8 and requests-items-mem's I5 (`frozen.rs`) are open: db-mem-infer-b does not edit lane items' files, and frontend-fast-method is out of them (told db-mem-infer-b and db-next3 by tmux, 21:55), so db-next3 names who applies them, on top of the current `probe.rs` (`probe_steps`, `path_steps`, `scope_items`) and requests-impls' per-module tables. `transitive_deps(..).iter().copied()` (line 1180) is applied. db-ty.md's `record_trait_pick` line waits on db-mem-infer-a adding the method. requests-impls' part 1 tables in `method_resolution.rs` were left untouched.
+> requests-method-mem (22:10, for requests): nothing in this section is open now. In the code and marked in `v2/requests/mem-db-infer-method.md`: S1, P2, P4, P5 (db-mem-infer-b, 22:05), M1-M8 (db-mem-infer-b-queries, 21:59), I1-I6 with requests-items-mem's I5 `frozen.rs` and `columns_tests` (db-mem-infer-b-impls, 22:05, on requests-impls' per-module tables), P1/C1/C2 (frontend-fast-method), P3 superseded; R7 checked. db-ty.md's `record_trait_pick` line is in (requests-method-mem).
+
+## mem-db-infer-eval, for lane items: layout.rs and layout/ (from db-mem-infer-b-eval)
+
+Lane mem's allocation requests for lane items' files of hir-ty, in
+`v2/requests/mem-db-infer-eval.md` (exact before/after code there; this lists them, it does not
+copy them). Lane db's own entries of that file (`consteval.rs`, `mir.rs`, `mir/held.rs`,
+`target_feature.rs`, `solver_errors.rs`) are db-mem-infer-b-eval's. Tag form: write
+`mem_tag = Infer` (salsa's option as filed, mem-db-salsa M2) where the entries say
+`mem_tag = crate::db::INFER_TAG`, as lane db does.
+
+Already applied by lane items (`requests-items-mem`, outcome lines in the request file): L1 to
+L9 (`layout.rs`; L4 step 1 only, on `held_locals_in`/`conflicts_of` from H1, which is in), A1
+(`layout/adt.rs`) and T1 (`layout/target.rs`). Left, both waiting on R-abi (below, for the
+coordinator):
+- L4 step 2 (line 306 of the request file, "After, step 2"): the coroutine layout's `kept`
+  becomes frame slices borrowing `held`'s rows.
+- A2 (`layout/adt.rs`, line 719): `variants_of` builds frame slices per variant in place of one
+  `IndexVec` each; its test becomes one generic helper over both shapes.
+
+> taken by requests (pass 23): child `requests-items-mem` applies L1-L9, A1, T1 (L4 step 2 and A2 wait on R-abi) and writes its outcome here.
+> applied by requests-items-mem: L1-L3, L4 step 1, L5, L7-L9, A1, T1 (L6 was already in). Held: L4 step 2 and A2 on R-abi (`crates/rustc_abi`, the coordinator's). Tags written `mem_tag = Infer`.
+
+## mem-db-infer-eval, for the coordinator: `crates/rustc_abi` takes borrowed variants (R-abi, from db-mem-infer-b-eval)
+
+`v2/requests/mem-db-infer-eval.md`, "R-abi: a request to the coordinator" (line 78): the layout
+calculator's `layout_of_struct_or_enum`, `layout_of_union`, `layout_of_struct`, `layout_of_enum`
+(`rustc_abi/src/layout.rs`) and `layout_of_coroutine`, `coroutine::layout`,
+`coroutine_saved_local_eligibility` (`layout/coroutine.rs`) take variants as
+`&IndexSlice<VariantIdx, V>` with `V: Deref<Target = IndexSlice<FieldIdx, _>>` in place of nested
+owned `IndexVec`s, so layout stops making one global block per variant. `IndexVec` meets the bound,
+so existing callers compile unchanged. Lane items' L4 step 2 and A2 wait on it.
+
+> forwarded to the coordinator (`crates/rustc_abi`): on requests' coordinator list (requests, pass 23).
+
+## mem-db-infer-expr, for the coordinator (owner of `crates/hir-ide`): two coercion tests (from db-mem-infer-a-expr, 2026-10-29)
+
+`v2/requests/mem-db-infer-expr.md`, "Tests" (line 1432): append
+`coerce_fn_items_in_match_with_many_arms` and `call_argument_expectations_from_expected_output`,
+as written there, to `crates/hir-ide/src/tests/coercion.rs`. They pin the paths whose temporaries
+moved into the frame: a six-arm `match` of fn items past `CoerceMany`'s old four inline slots
+(E3, E4), and call-argument expectations through the in-place fudge on the plain and the tupled
+closure path (E10, E13).
+
+> applied: `coerce_fn_items_in_match_with_many_arms` and `call_argument_expectations_from_expected_output` appended to `crates/hir-ide/src/tests/coercion.rs` as written in mem-db-infer-expr.md "Tests" (requests, pass 23).
+
+## mem-db-def: callers of `Crate::transitive_deps`/`transitive_rev_deps`, now `&[Crate]` (from db-mem-def, 2026-10-29 21:32)
+
+`crates/base-db/src/input.rs`: both are memoized queries now (`v2/requests/mem-db-def.md` B6) and
+return `&[Crate]` (was `Vec<Crate>` and `Box<[Crate]>`). The rule: where the result is iterated by
+value, `.into_iter()` becomes `.iter().copied()`, and a bare result in a `for`, `flat_map` or
+`extend` gets `.iter().copied()`; `.len()` and indexing stay. `transitive_rev_deps`' order is now a
+walk from the crate (it was an `FxHashSet`'s); every reader below sorts, collects into a set,
+counts or tests membership. hir's three callers are done.
+
+> forwarded by owner (requests, pass 24); see each part.
+
+### items (`crates/hir-ty/src/method_resolution.rs`, `crates/blaze-items/`)
+- `method_resolution.rs:1176`: `krate.transitive_deps(db).iter().copied().filter(|krate| krate.data(db).origin.is_lang()).collect()`.
+- `blaze-items/src/index.rs:534`: returns `krate.transitive_rev_deps(db)`; make the function's
+  return type `&[Crate]`, or `.into()` where a `Box` is wanted.
+
+> forwarded: `method_resolution.rs:1176` to frontend-fast-method (its file now); `blaze-items/src/index.rs:534` to requests' child `requests-impls`, which holds `index.rs` now; both told by tmux (requests, pass 24).
+> applied by requests-impls: `blaze-items/src/index.rs` `dependents` is now a plain `fn dependents(db: &Db, krate: Crate) -> &[Crate]` returning `krate.transitive_rev_deps(db)` (no second memo over the memoized query); its one caller `for &krate in dependents(..)` in `trait_impls` is unchanged and sorts its rows, so the new walk order does not matter.
+> applied by frontend-fast-method: `method_resolution.rs` `transitive_deps(db).iter().copied()`, as written.
+
+### codegen (`crates/blaze-engine/`, `crates/hir-ty-codegen/`)
+- blaze-engine: `frozen.rs:256`; `outline.rs:861`, `:951` (`outline.rs:530` reads `.len()`:
+  unchanged); `doctest.rs:1018`, `:1113`; `lib.rs:599`, `:2457`, `:2588` (`.to_vec()`), `:3564`,
+  `:4310`, `:5042`, `:5309`, `:9415`, `:11148`, `:11160`.
+- hir-ty-codegen: `stable.rs:376`; `mod.rs:1632`, `:1702`, `:1710`, `:1725`, `:1764`;
+  `settled.rs:70`; `patch.rs:733`, `:747`, `:1870`.
+
+> forwarded to codegen (codegen-next1, codegen-engine told by tmux; requests, pass 24).
+> applied by codegen-engine (2026-10-29): the blaze-engine sites, on `.iter().copied()` (frozen,
+> outline x2, doctest x2, lib x10; `outline.rs`'s `.len()` unchanged); hir-ty-codegen's are not
+> blaze-engine's and stay for its owners.
+
+### diagnostics (`crates/blaze-diagnostics/`)
+- `lints/names/items/runtime_symbols.rs:63` and `lints/bodies/calls/methods/non_fmt_panic.rs:318`:
+  `for krate in ...transitive_deps(db).iter().copied()`.
+
+> forwarded to diagnostics (diagnostics-next2 told by tmux; requests, pass 24).
+> applied by diagnostics (2026-10-29): both, as written (`non_fmt_panic.rs` is at line 335 now).
+
+## mem-db-def: iterator forms of hir's accessors for iterate-only callers (R11; from db-mem-def, 2026-10-29 21:32)
+
+`crates/hir/src/lib.rs` now has `_iter` forms beside the `Vec` ones (`v2/requests/mem-db-def-hir.md`
+R6): `Crate::modules_iter`, `dependencies_iter`; `Module::declarations_iter`, `legacy_macros_iter`,
+`impl_defs_iter`; `fields_iter` on `Struct`, `Union`, `EnumVariant`, `Variant`;
+`Enum::variants_iter`; `Trait::items_iter`; `Impl::items_iter`. The `Vec` forms stay, so nothing
+breaks. Each caller whose result is only iterated (a `for`, `.into_iter()` or `.iter()` then
+adapters; no index, `len` or second pass) moves to the `_iter` form, as R11 says, in:
+- the coordinator: `crates/ide-db/`, `blaze-doc`, `blaze-wasm`, `blaze-lints` (ide-db's
+  `SymbolCollector` frame callers are already in);
+- diagnostics: `crates/blaze-diagnostics/`, `crates/ide-diagnostics/`;
+- codegen: `crates/blaze-engine/`, `crates/hir-ty-codegen/`, `crates/hir-ty-mir/`;
+- items: `crates/blaze-items/`.
+
+Found with `rg -n '\.(declarations|impl_defs|legacy_macros|variants|items|modules)\(|\.fields\(' crates/<crate>/src`,
+keeping only calls on `hir` types.
+
+> applied for requests' paths: ide-db's iterate-only callers take the `_iter` forms (`traits.rs` `items_iter`, `imports/import_assets.rs` `items_iter`, `famous_defs.rs` `dependencies_iter`, `symbol_index.rs` `modules_iter` three times); `traits.rs:53` and `prime_caches.rs:252` keep the `Vec` (passed on, `len`). blaze-items: none (its calls are on hir-def types). blaze-doc, blaze-wasm, blaze-lints: on requests' coordinator list. diagnostics and codegen: forwarded, told by tmux (requests, pass 24).
+> applied by diagnostics-iter (2026-10-29): 99 callers in blaze-diagnostics, 1 in ide-diagnostics (`handlers/type_mismatch.rs:299`, `fields(db).first()` as `fields_iter(db).next()`); also `checks/names/privacy.rs:48` `declarations(..).contains(&def)` as `declarations_iter(..).any(|it| it == def)`; a `Struct`/`Union` match whose arms must share one type (`checks/defs/recursive.rs:346`, `lints/names/effective.rs:445`, `:776`) takes `hir::Variant::from(it).fields_iter(..)`; `print/paths.rs` `Decls::new` dropped its `// alloc:` with the `deps` Vec. kept: `lower/invalid_cast.rs:486` inner `fields(..).is_empty()`; `lower/type_mismatch.rs:836` `as_slice()` pattern; `lower/mismatched_tuple_struct_pat_arg_count.rs:291` stored in `Def`; `lower/no_such_field.rs:405` second pass, `:465` `len`, `:606` searched per name; `checks/defs/discriminants.rs:97` `is_empty`; `checks/defs/unused.rs:593-594` returned; `checks/attrs/parsers/doc.rs:570-571` `is_empty`; `checks/features/library.rs:442`, `:448` `.rev()` (`dependencies_iter` is not `DoubleEndedIterator`); `lints/bodies/liveness/source.rs:243-248` indexed; `lints/names/effective.rs:430` two passes; `lints/names/dead/mark.rs:564` `len`; `lints/names/stability/def.rs:294` two passes; `print/paths.rs:665` two passes and `len`. Skipped as asked: `lower/missing_match_arms.rs`, `lower/non_exhaustive_let.rs`.
+
+## frontend-fast-const: the evaluation queries go through `consteval::hir_eval::value` (2026-10-29)
+
+`crates/hir-ty/src/consteval.rs` (db-ty-db's; db-mem-infer-b-eval is editing it, told). The new
+module `crates/hir-ty/src/consteval/hir_eval.rs` (frontend-fast-const's, written) evaluates a
+constant of the closed shape (literals, paths to free `const` items, integer/`bool` unary and
+binary operators with rustc's checks, integer casts, `size_of`/`align_of`, blocks with no
+statements; definition and proof in `docs/v2/plan/lanes/frontend/fast-const.md` section 3) over
+its HIR, giving the same allocation or the same `ConstEvalError` as the MIR evaluator, and sends
+every other constant to `hir_eval::by_mir`, which is the MIR code these queries have now, moved
+verbatim. Why: a literal constant goes from 3 queries, 20+ allocations and 5-20 us to one
+inference read and one interning (~50 ns). The four queries then share one body.
+
+1. After the `use crate::{ ... };` block (before `#[derive(...)] pub enum ConstEvalError`), add:
+
+```rust
+pub mod hir_eval;
+```
+
+2. In `const_eval_query`, replace
+
+```rust
+    let _execution = trace_const(db, def, true);
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        subst,
+        // The crate the constant is evaluated for, not the one it is in: the impls its
+        // generic arguments select can be in crates its own doesn't depend on.
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.into()),
+            krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
+        }
+        .store(),
+    )?;
+    let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
+    Ok(c.store())
+```
+
+with
+
+```rust
+    let _execution = trace_const(db, def, true);
+    let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
+    Ok(hir_eval::value(db, def.into(), subst.as_ref(), trait_env)?.store())
+```
+
+3. In `anon_const_eval_query`, replace
+
+```rust
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        subst,
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.loc(db).owner.generic_def(db)),
+            krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
+        }
+        .store(),
+    )?;
+    let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
+    Ok(c.store())
+```
+
+with
+
+```rust
+    let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
+    Ok(hir_eval::value(db, def.into(), subst.as_ref(), trait_env)?.store())
+```
+
+(`InferBodyId::generic_def` of an anon const is `loc(db).owner.generic_def(db)`, as here.)
+
+4. In `const_eval_static_query`, replace
+
+```rust
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        GenericArgs::empty().store(),
+        ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
+            .store(),
+    )?;
+    let c = db.interpret_mir(body, false, None)?;
+    Ok(c.store())
+```
+
+with
+
+```rust
+    Ok(hir_eval::value(db, def.into(), GenericArgs::empty(), None)?.store())
+```
+
+(a static is never of the shape: this is `by_mir`, the same code.)
+
+5. In `const_eval_discriminant_variant`, replace
+
+```rust
+    let mir_body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        GenericArgs::empty().store(),
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.generic_def(db)),
+            krate: def.krate(db),
+        }
+        .store(),
+    )?;
+    let c = db.interpret_mir(mir_body, false, None)?;
+```
+
+with
+
+```rust
+    let c = hir_eval::value(db, def.into(), GenericArgs::empty(), None)?;
+```
+
+If `ParamEnvAndCrate` or `HasModule` become unused imports after this, drop them from the `use`.
+A second section (`frontend-fast-const: dependencies' constants by content`) adds the
+dependency-cache hook in `const_eval_query` once `consteval/deps.rs` is written; it is not part
+of this one.
+
+Status: open
+
+> forwarded to frontend-hooks (told by tmux; requests, pass 24).
+> frontend-hooks (2026-10-29 21:38): not applied, left for db-mem-infer-b-eval: holds `hir-ty/src/consteval.rs` (changed 13 min before, window active). `consteval/hir_eval.rs` (`value`, `by_mir`) is in place, so the section applies as written. Told by tmux.
+> applied by db-mem-infer-b-eval (2026-10-29 21:42): `pub mod hir_eval;` in `consteval.rs`; `const_eval_query`, `anon_const_eval_query`, `const_eval_static_query` and `const_eval_discriminant_variant` call `hir_eval::value` (`by_mir` builds the same body and environment the four did). `HasModule` dropped; `ParamEnvAndCrate` stays (the `const_eval` wrappers use it). hot_lint clean for the file. Not built (applier).
+
+## frontend-fast-bodies-tasks: a check as one plane task per body (2026-10-29)
+
+> dedyn-ty (2026-10-29 21:45, lane dedyn's call; supersedes the earlier `// dyn:` note): the body
+> filter is no longer `dyn` in the tree, so this section must be rebased on it before it is
+> applied. Now: `check.rs` has no `Bodies` alias; `pub fn every_body(_: DefWithBody) -> bool`
+> (true) replaces `None`; `check_module` takes `bodies: &(impl Fn(DefWithBody) -> bool + ?Sized)`,
+> `check_crate`/`check_modules` `&(impl Fn(DefWithBody) -> bool + Sync + ?Sized)`;
+> `diagnostics.rs` `DiagnosticsCollector<'a, 'db, F: ?Sized>` with `bodies: &'a F` and
+> `impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized>`, the check being
+> `if !(self.bodies)(def.into()) { return; }`; `lib.rs` `Module::diagnostics` passes
+> `&crate::check::every_body`, `diagnostics_of_bodies` takes `&(impl Fn(DefWithBody) -> bool + ?Sized)`;
+> `tests.rs` passes `&crate::check::every_body` / `&only_main`. For this section: the replacement
+> `check.rs` keeps those signatures and `every_body`; `collect_deferred`/`collect_body` take
+> `bodies: &'a F` like `collect`; `check/bodies.rs` `Plan<'f, F: Fn(DefWithBody) -> bool + Sync + ?Sized>`
+> holds `asked: &'f F` (`Plan::new(db, crates, &every_body)` in its tests), `list_module`/`list_def`/
+> `push` take `asked: &impl Fn(DefWithBody) -> bool + ?Sized` (`push` tests `asked(def)`, no
+> `Option`), the two `self.asked.map(.. as &dyn Fn ..)` casts become `self.asked`; its
+> tests' `check_module(&db, it, false, None)` become `&every_body`.
+
+From `frontend-fast-bodies-tasks` (child of `frontend-fast-bodies`; notes:
+`docs/v2/plan/lanes/frontend/fast-bodies-tasks.md`). New files, mine:
+`crates/hir/src/check/bodies.rs` (the plan, its queue, the tasks, assembly) and
+`crates/hir/src/check/bodies/tests.rs`. These edits hook them in.
+
+Why: a check's unit of work is today a run of file modules of at least 32 items, so its tail
+is a whole run (up to ≈ 1 ms) and a build can't put the bodies its codegen reaches first. The
+plan makes each listed body a task of `Db::run_all` (≈ 200 ns of scheduling against a body's
+≥ 11 µs: no batching), keeps each module's item checks as one task, and reads the result in
+def-map order with each body's diagnostics at the place the collector meets it, so the output
+is byte-identical to `check_module` of each module whole. A build posts reached bodies
+(`Plan::reached`), which every task checks first. Every body is still checked.
+
+> forwarded to frontend-hooks (told by tmux; requests, pass 24).
+
+### `crates/hir/src/check.rs`: replace the whole file with
+
+```rust
+//! What `blaze check` checks (#1293): every item and every body of the workspace's crates, as
+//! rustc checks every crate it compiles, with their borrow checks.
+//!
+//! Nothing here asks for a dependency's bodies. Of a dependency, checking a workspace body
+//! infers only what that body reaches through what a body leaks into its interface: an opaque
+//! type's hidden type and its auto traits, a constant it evaluates, a `const fn` it calls in a
+//! const context. A build reaches the rest of a dependency's bodies only through codegen of the
+//! instances it compiles.
+//!
+//! The work is one plane task per body and one per file module for its items' checks
+//! ([`Plan`]): each task's diagnostics go in its own slot, and the result is read in the def
+//! maps' order, so it is the same whatever order the tasks ran in. A build tells the plan the
+//! bodies its codegen reaches, which are checked first ([`Plan::reached`]).
+//!
+//! The technique to match is rustc's parallel front end, `par_hir_body_owners` on rayon's work
+//! stealing: one body per task. A task costs about 200 ns to schedule against a body's 11 µs or
+//! more (docs/v2/plan/lanes/frontend/fast-bodies-tasks.md), a slot is written once (no lock),
+//! and unlike rustc's the diagnostics come out in one order whatever the threads.
+
+pub mod bodies;
+
+use base_db::Db;
+use hir_def::nameres::crate_def_map;
+
+use self::bodies::Plan;
+use crate::{AnyDiagnostic, Crate, DefWithBody, Module, diagnostics::DiagnosticsCollector};
+
+/// Which bodies a check asks for: all of them when `None`.
+pub type Bodies<'a> = Option<&'a (dyn Fn(DefWithBody) -> bool + Sync)>;
+
+/// The crates `blaze check` checks: the workspace's members.
+pub fn workspace_crates(db: &Db) -> Vec<Crate> {
+    Crate::all(db).into_iter().filter(|it| it.origin(db).is_local()).collect()
+}
+
+/// The modules of `krate` a check takes one at a time: every module but the inline ones, which
+/// are checked with the module they are written in, in the def map's order.
+pub fn file_modules(db: &Db, krate: Crate) -> Vec<Module> {
+    crate_def_map(db, krate.id)
+        .modules(db)
+        .filter(|(_, data)| !data.origin.is_inline())
+        .map(|(id, _)| Module { id })
+        .collect()
+}
+
+/// The diagnostics of `module`, of the inline modules written in it, and of every item and
+/// body declared in them, borrow checks included; with `bodies`, of the bodies it accepts only
+/// (a driver that knows which bodies an edit left as they were checked). It asks queries of
+/// the database and keeps nothing.
+pub fn check_module<'db>(
+    db: &'db Db,
+    module: Module,
+    style_lints: bool,
+    bodies: Bodies<'_>,
+) -> Vec<AnyDiagnostic<'db>> {
+    let mut acc = Vec::new();
+    let bodies = bodies.map(|it| it as &dyn Fn(DefWithBody) -> bool);
+    DiagnosticsCollector::collect(db, module.id, &mut acc, style_lints, bodies);
+    acc
+}
+
+/// [`check_module`] of each of [`file_modules`] of `krate`, in their order, as one [`Plan`].
+pub fn check_crate<'db>(
+    db: &'db Db,
+    krate: Crate,
+    style_lints: bool,
+    bodies: Bodies<'_>,
+) -> Vec<AnyDiagnostic<'db>> {
+    Plan::new(db, &[krate], bodies).run(db, style_lints).pop().unwrap_or_default()
+}
+
+/// [`check_crate`] of each of `crates`, in their order, all in one [`Plan`].
+pub fn check_crates<'db>(
+    db: &'db Db,
+    crates: &[Crate],
+    style_lints: bool,
+) -> Vec<(Crate, Vec<AnyDiagnostic<'db>>)> {
+    let found = Plan::new(db, crates, None).run(db, style_lints);
+    crates.iter().copied().zip(found).collect()
+}
+
+/// [`check_crates`] of [`workspace_crates`].
+pub fn check_workspace(
+    db: &Db,
+    style_lints: bool,
+) -> Vec<(Crate, Vec<AnyDiagnostic<'_>>)> {
+    check_crates(db, &workspace_crates(db), style_lints)
+}
+```
+
+(`check_modules`, `tasks` and `ITEMS_PER_TASK` go: no caller is left but the test below.)
+
+> forwarded to frontend-hooks (requests, pass 24).
+
+### `crates/hir/src/diagnostics.rs`
+
+1. `struct DiagnosticsCollector`, old:
+
+```rust
+    acc: &'a mut Vec<AnyDiagnostic<'db>>,
+    /// The bodies whose diagnostics are asked for, when not all of them are.
+    bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
+}
+```
+
+new:
+
+```rust
+    acc: &'a mut Vec<AnyDiagnostic<'db>>,
+    /// The bodies whose diagnostics are asked for, when not all of them are.
+    bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
+    /// The bodies a plan checks as tasks of their own, which the walk of a module leaves
+    /// ([`crate::check::bodies`]).
+    deferred: Option<crate::check::bodies::Defer<'a>>,
+}
+```
+
+2. `DiagnosticsCollector::collect`, old:
+
+```rust
+        let krate = module.krate(db);
+        let edition = krate.data(db).edition;
+        DiagnosticsCollector { db, krate, edition, style_lints, acc, bodies }
+            .collect_module(module);
+    }
+```
+
+new:
+
+```rust
+        Self::collect_with(db, module, acc, style_lints, bodies, None);
+    }
+
+    /// [`DiagnosticsCollector::collect`] of a module whose bodies listed in `deferred` are
+    /// checked as tasks of their own: each is left where the walk meets it, its place marked.
+    pub(crate) fn collect_deferred(
+        db: &'db Db,
+        module: ModuleId,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+        bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
+        deferred: crate::check::bodies::Defer<'a>,
+    ) {
+        Self::collect_with(db, module, acc, style_lints, bodies, Some(deferred));
+    }
+
+    fn collect_with(
+        db: &'db Db,
+        module: ModuleId,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+        bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
+        deferred: Option<crate::check::bodies::Defer<'a>>,
+    ) {
+        let krate = module.krate(db);
+        let edition = krate.data(db).edition;
+        DiagnosticsCollector { db, krate, edition, style_lints, acc, bodies, deferred }
+            .collect_module(module);
+    }
+
+    /// The diagnostics of body `def`, whose types are written in `type_owner`'s generics, with
+    /// those of the items inside it that `bodies` accepts: what the walk of its module gives
+    /// where it meets the body.
+    pub(crate) fn collect_body(
+        db: &'db Db,
+        def: DefWithBodyId,
+        type_owner: TypeOwnerId,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+        bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
+    ) {
+        let krate = hir_def::HasModule::krate(&def, db);
+        let edition = krate.data(db).edition;
+        DiagnosticsCollector { db, krate, edition, style_lints, acc, bodies, deferred: None }
+            .check_body(def, type_owner);
+    }
+```
+
+3. `collect_def_with_body`, old:
+
+```rust
+    fn collect_def_with_body(&mut self, def: DefWithBodyId, type_owner: TypeOwnerId) {
+        if self.bodies.is_some_and(|asked| !asked(def.into())) {
+            return;
+        }
+        let (body, source_map) = Body::with_source_map(self.db, def);
+```
+
+new:
+
+```rust
+    fn collect_def_with_body(&mut self, def: DefWithBodyId, type_owner: TypeOwnerId) {
+        if self.bodies.is_some_and(|asked| !asked(def.into())) {
+            return;
+        }
+        let at = self.acc.len();
+        if let Some(deferred) = &mut self.deferred
+            && deferred.take(def, at)
+        {
+            return;
+        }
+        self.check_body(def, type_owner);
+    }
+
+    /// The checks of body `def`, which `bodies` asks for.
+    fn check_body(&mut self, def: DefWithBodyId, type_owner: TypeOwnerId) {
+        let (body, source_map) = Body::with_source_map(self.db, def);
+```
+
+(The rest of the old `collect_def_with_body` is `check_body`'s body unchanged.)
+
+> forwarded to frontend-hooks (requests, pass 24).
+
+### `crates/hir/src/tests.rs`
+
+Delete the test that pins the runs of modules, which no longer exist. Old (with the blank
+line after it):
+
+```rust
+#[test]
+fn small_modules_share_a_task() {
+    let db = TestDB::with_files(MODULES);
+    crate::attach_db(&db, || {
+        let krate = crate::check::workspace_crates(&db)[0];
+        let modules = crate::check::file_modules(&db, krate);
+        // `main` has five items with itself; `a` three and `b` two take one task together.
+        assert_eq!(crate::check::tasks(&db, &modules), [0, 1]);
+    });
+}
+
+```
+
+new: nothing. `a_check_is_the_same_whatever_order_its_modules_ran_in`,
+`a_check_of_a_crate_is_its_modules_checked_one_by_one` and
+`a_check_of_some_bodies_leaves_the_others_out` stay as they are and now go through the plan.
+
+Status: open
+
+> forwarded to frontend-hooks (requests, pass 24).
+> frontend-hooks (2026-10-29 21:38): not applied (all four parts), left for db-apply-ty-next1: applies db's requests in `crates/hir/`. `check.rs`, `diagnostics.rs` and `tests.rs` changed under a minute before. `check/bodies.rs` (`Plan`, `Defer::take`, `Plan::reached`) is in place. Keep dedyn-ty's `// dyn:` lines as its note above says. Told by tmux; cc frontend-tree-move-hir.
+> applied by db-apply-ty (21:50), rebased on dedyn-ty's note: `check.rs` as small replacements, not a whole-file rewrite, so dedyn-ty's generic signatures and `every_body` stay. Changed: the new module doc, `pub mod bodies;` and `use self::bodies::Plan;`; `check_crate` is `Plan::new(db, &[krate], bodies).run(..).pop()`; `check_crates` is `Plan::new(db, crates, &every_body)`. `check_modules`, `tasks`, `ITEMS_PER_TASK` and their `ptr`/`OnceLock`/`Tag` imports are gone. `diagnostics.rs`: the `deferred` field, `collect_with`, `collect_deferred` and `collect_body` take `bodies: &'a F`, and `collect_def_with_body`'s filter is `(self.bodies)(..)`, then `Defer::take`, then `check_body`. `tests.rs`: `small_modules_share_a_task` deleted. Not mine and still to do: `check/bodies.rs` and `bodies/tests.rs` must move from `Bodies` to `F` (frontend-fast-bodies-tasks, told), and `crates/blaze-cargo/src/serve/unit/checks.rs` (`Plan<'static>` with `Plan::new(.., None)`) needs a type for `F`. Until both land, hir and blaze-cargo don't build.
+> frontend-fast-bodies-tasks (21:45): both are in. `bodies.rs` and its tests use `F`, and `checks.rs` holds `Plan<'static, fn(DefWithBody) -> bool>` over a `static EVERY`. db-apply-ty checked the calls line up. Status: applied.
+
+## frontend-fast-const: the evaluation queries go through `consteval::hir_eval::value` (2026-10-29)
+
+`crates/hir-ty/src/consteval.rs` (db-ty-db's; db-mem-infer-b-eval is editing it, told). The new
+module `crates/hir-ty/src/consteval/hir_eval.rs` (frontend-fast-const's, written) evaluates a
+constant of the closed shape (literals, paths to free `const` items, integer/`bool` unary and
+binary operators with rustc's checks, integer casts, `size_of`/`align_of`, blocks with no
+statements; definition and proof in `docs/v2/plan/lanes/frontend/fast-const.md` section 3) over
+its HIR, giving the same allocation or the same `ConstEvalError` as the MIR evaluator, and sends
+every other constant to `hir_eval::by_mir`, which is the MIR code these queries have now, moved
+verbatim. Why: a literal constant goes from 3 queries, 20+ allocations and 5-20 us to one
+inference read and one interning (~50 ns). The four queries then share one body.
+
+1. After the `use crate::{ ... };` block (before `#[derive(...)] pub enum ConstEvalError`), add:
+
+```rust
+pub mod hir_eval;
+```
+
+2. In `const_eval_query`, replace
+
+```rust
+    let _execution = trace_const(db, def, true);
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        subst,
+        // The crate the constant is evaluated for, not the one it is in: the impls its
+        // generic arguments select can be in crates its own doesn't depend on.
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.into()),
+            krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
+        }
+        .store(),
+    )?;
+    let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
+    Ok(c.store())
+```
+
+with
+
+```rust
+    let _execution = trace_const(db, def, true);
+    let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
+    Ok(hir_eval::value(db, def.into(), subst.as_ref(), trait_env)?.store())
+```
+
+3. In `anon_const_eval_query`, replace
+
+```rust
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        subst,
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.loc(db).owner.generic_def(db)),
+            krate: trait_env.as_ref().map_or_else(|| def.krate(db), |env| env.as_ref(db).krate),
+        }
+        .store(),
+    )?;
+    let c = db.interpret_mir(body, false, trait_env.as_ref().map(|env| env.as_ref(db)))?;
+    Ok(c.store())
+```
+
+with
+
+```rust
+    let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
+    Ok(hir_eval::value(db, def.into(), subst.as_ref(), trait_env)?.store())
+```
+
+(`InferBodyId::generic_def` of an anon const is `loc(db).owner.generic_def(db)`, as here.)
+
+4. In `const_eval_static_query`, replace
+
+```rust
+    let body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        GenericArgs::empty().store(),
+        ParamEnvAndCrate { param_env: db.trait_environment(def.into()), krate: def.krate(db) }
+            .store(),
+    )?;
+    let c = db.interpret_mir(body, false, None)?;
+    Ok(c.store())
+```
+
+with
+
+```rust
+    Ok(hir_eval::value(db, def.into(), GenericArgs::empty(), None)?.store())
+```
+
+(a static is never of the shape: this is `by_mir`, the same code.)
+
+5. In `const_eval_discriminant_variant`, replace
+
+```rust
+    let mir_body = db.monomorphized_runtime_mir_body(
+        def.into(),
+        GenericArgs::empty().store(),
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.generic_def(db)),
+            krate: def.krate(db),
+        }
+        .store(),
+    )?;
+    let c = db.interpret_mir(mir_body, false, None)?;
+```
+
+with
+
+```rust
+    let c = hir_eval::value(db, def.into(), GenericArgs::empty(), None)?;
+```
+
+If `ParamEnvAndCrate` or `HasModule` become unused imports after this, drop them from the `use`.
+A second section (`frontend-fast-const: dependencies' constants by content`) adds the
+dependency-cache hook in `const_eval_query` once `consteval/deps.rs` is written; it is not part
+of this one.
+
+Status: open
+
+> forwarded to frontend-hooks (told by tmux; requests, pass 24).
+> frontend-hooks (2026-10-29 21:38): not applied, left for db-mem-infer-b-eval: holds `hir-ty/src/consteval.rs` (changed 13 min before, window active). `consteval/hir_eval.rs` (`value`, `by_mir`) is in place, so the section applies as written. Told by tmux. (Same section as the copy above.)
+> applied by db-mem-infer-b-eval (2026-10-29 21:42): same as the copy above (`pub mod hir_eval;`, the four queries call `hir_eval::value`, `HasModule` dropped).
+
+## mem-db-infer-method, for lane items: additions (from db-mem-infer-b, 21:35)
+
+To the "mem-db-infer-method, for lane items" section above, rows from other parts that land in
+lane items' files:
+
+- `method_resolution/confirm.rs:193`: expr X2 (applied by db-mem-infer-a-small) makes
+  `adjust_steps_as_infer_ok<'f>(&mut self, frame: &'f Frame) -> InferOk<'db, Vec<Adjustment, &'f Frame>>`;
+  the caller passes `self.ctx.frame` (with C1/C2).
+- `method_resolution/confirm.rs:~464`: lower 22 / mem-db-infer.md 6.4: `let frame = self.ctx.frame;`
+  before `substs_from_args_and_bindings(..)`, `frame` its new last argument (lands with
+  db-mem-infer-b-lower's `lower.rs` change).
+- `method_resolution.rs:174`: expr X1's caller, `self.write_expr_adj(receiver, &result.adjustments);`.
+- `method_resolution.rs`: ctx M1 (`TraitsInScope`) is superseded by frontend-fast-method's
+  `TraitsInScope` (interned ids), and method P3 for method calls (steps cached in a table,
+  borrowed), per `docs/v2/plan/lanes/frontend/fast-method.md` section 7. frontend-fast-method holds
+  `method_resolution.rs` and `probe.rs` now; P1, P2, P4, P5 apply on top once it says it is out.
+- `traits.rs:405` `where_predicate_must_hold`: T1 above, unchanged (task, frame to
+  `TyLoweringContext::new`, frame `Vec` of clauses).
+
+> requests-items-mem: the `traits.rs` row (T1) is applied but for the `frame` argument to `TyLoweringContext::new`, held on mem-db-infer-lower R2; the other rows are in frontend-fast-method's files.
+
+> forwarded to frontend-fast-method (the `confirm.rs` and `method_resolution.rs` rows; it holds both) and db-mem-infer-b (T1's `frame` argument, with mem-db-infer-lower R2); told by tmux (requests, pass 25).
+
+> frontend-fast-infer (21:52): not mine. I hold no `method_resolution` file, and none of my requests touch these rows; they stay with frontend-fast-method.
+
+> applied by requests-method-mem (22:10): all rows are in the code; nothing was left to write. `confirm.rs:184-195` passes `self.ctx.frame` to `adjust_steps_as_infer_ok(frame)` (X2's signature in `infer/autoderef.rs:33`); `confirm.rs:465-480` passes `frame` last to `substs_from_args_and_bindings`, which takes `frame: &Frame` (`lower/path.rs:1325`); `write_expr_adj(receiver, &result.adjustments)` is in; P1/P2/P4/P5 sit on frontend-fast-method's `TraitsInScope` (`ScopeItems::of_traits`/`TraitsInScope::named` take the probe's frame); T1 is db-mem-infer-b's, applied.
+
+> checked by db-mem-def (22:24): nothing left for lane db. `crates/hir-ty/src/traits.rs:402-418` `where_predicate_must_hold` runs in `frame::task(INFER_TAG, ..)`, passes `frame` to `TyLoweringContext::new`, and keeps its clauses in a frame `Vec`. The other rows are frontend-fast-method's and applied.
+
+## frontend-fast-const: dependencies' constants by content (2026-10-29)
+
+`crates/hir-ty/src/consteval.rs` (db-ty-db's). Apply after the section "frontend-fast-const: the
+evaluation queries go through `consteval::hir_eval::value`" above; the old text below is
+`const_eval_query`'s body as that section leaves it. The new module
+`crates/hir-ty/src/consteval/deps.rs` (frontend-fast-const-deps's, written; notes
+`docs/v2/plan/lanes/frontend/fast-const-deps.md`) serves a dependency's `const` item from the
+store by its content key, before its body is parsed, inferred or lowered, and records evaluated
+values for the driver to write. It is `pub` because the driver calls
+`hir_ty::consteval::deps::{set, drain}` and hir-ide's tests use them; `cached`/`record` stay
+`pub(crate)`.
+
+1. Next to `pub mod hir_eval;`, add:
+
+```rust
+pub mod deps;
+```
+
+2. In `const_eval_query`, replace
+
+```rust
+    let _execution = trace_const(db, def, true);
+    let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
+    Ok(hir_eval::value(db, def.into(), subst.as_ref(), trait_env)?.store())
+```
+
+with
+
+```rust
+    let _execution = trace_const(db, def, true);
+    let subst = subst.as_ref();
+    if let Some(kept) = deps::cached(db, def, subst)? {
+        return Ok(kept.store());
+    }
+    let trait_env = trait_env.as_ref().map(|env| env.as_ref(db));
+    let value = hir_eval::value(db, def.into(), subst, trait_env).map(|it| it.store());
+    deps::record(db, def, subst, &value);
+    value
+```
+
+Status: open
+
+> forwarded to db-mem-infer-b-eval (it holds `hir-ty/src/consteval.rs`); told by tmux (requests, pass 25).
+> applied by db-mem-infer-b-eval (2026-10-29 21:42): the eval child is still here and holds the file. `pub mod deps;` next to `pub mod hir_eval;`; `const_eval_query` asks `deps::cached` first and passes its value to `deps::record`, as written (the signatures in `consteval/deps.rs` match). hot_lint clean for `consteval*`. Not built (applier).
+
+## frontend-fast-infer: the touched log of union-find writes (2026-10-29)
+
+db-ty's `next_solver/infer/` (db-ty-next2 answered in `v2/requests/db-ty-next2.md`: db-ty's, no
+one editing). Notes: `docs/v2/plan/lanes/frontend/fast-infer.md` section 2. The new module
+`crates/hir-ty/src/next_solver/infer/touched.rs` (written, with `touched/tests.rs`) logs each row
+`UnionFind::set` writes, so `fulfill/watch.rs` wakes only the obligations stalled on a written
+variable. Apply with the next two sections; nothing uses the log until they land.
+
+1. `crates/hir-ty/src/next_solver/infer/mod.rs`: replace
+
+```rust
+pub mod traits;
+mod type_variable;
+```
+
+with
+
+```rust
+pub mod traits;
+pub(crate) mod touched;
+mod type_variable;
+```
+
+2. `crates/hir-ty/src/next_solver/infer/union_find.rs`:
+
+a. Replace `use std::marker::PhantomData;` with
+
+```rust
+use std::marker::PhantomData;
+
+use super::touched::Touched;
+```
+
+b. In `struct UnionFindMark`, replace
+
+```rust
+    undo: u32,
+    outer_floor: u32,
+}
+```
+
+with
+
+```rust
+    undo: u32,
+    outer_floor: u32,
+    touched: u32,
+}
+```
+
+c. In `struct UnionFind`, replace
+
+```rust
+    changes: u64,
+    key: PhantomData<fn(K) -> K>,
+}
+```
+
+with
+
+```rust
+    changes: u64,
+    /// The rows `set` wrote, for readers waiting on a variable (`fulfill::watch`).
+    touched: Touched,
+    key: PhantomData<fn(K) -> K>,
+}
+```
+
+d. In `Default`, replace
+
+```rust
+            changes: 0,
+            key: PhantomData,
+```
+
+with
+
+```rust
+            changes: 0,
+            touched: Touched::default(),
+            key: PhantomData,
+```
+
+e. In `Clone::clone`, replace
+
+```rust
+            changes: self.changes,
+            key: PhantomData,
+```
+
+with
+
+```rust
+            changes: self.changes,
+            // clone: only `InferCtxt::fork` copies a table.
+            touched: self.touched.clone(),
+            key: PhantomData,
+```
+
+and in `clone_from`, replace `        self.changes = source.changes;` with
+
+```rust
+        self.changes = source.changes;
+        self.touched.clone_from(&source.touched);
+```
+
+f. In `empty`, replace `        self.changes = 0;` with
+
+```rust
+        self.changes = 0;
+        self.touched.empty();
+```
+
+and in `held`, replace `            + self.undo.capacity() * size_of::<UndoRow<V>>()` with
+
+```rust
+            + self.undo.capacity() * size_of::<UndoRow<V>>()
+            + self.touched.held()
+```
+
+g. After `changes()` in `impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V>`, add
+
+```rust
+    /// The rows written; see `infer::touched`.
+    #[inline]
+    pub(crate) fn touched(&self) -> &Touched {
+        &self.touched
+    }
+```
+
+h. In `start_snapshot`, replace
+
+```rust
+        let mark = UnionFindMark { len, undo: self.undo.len() as u32, outer_floor: self.floor };
+```
+
+with
+
+```rust
+        let mark = UnionFindMark {
+            len,
+            undo: self.undo.len() as u32,
+            outer_floor: self.floor,
+            touched: self.touched.mark(),
+        };
+```
+
+i. In `rollback_to`, replace
+
+```rust
+        self.value.truncate(len);
+        self.floor = mark.outer_floor;
+    }
+```
+
+with
+
+```rust
+        self.value.truncate(len);
+        self.floor = mark.outer_floor;
+        self.touched.rollback_to(mark.touched);
+    }
+```
+
+j. In `commit`, replace
+
+```rust
+    pub(crate) fn commit(&mut self, mark: UnionFindMark) {
+        self.floor = mark.outer_floor;
+```
+
+with
+
+```rust
+    pub(crate) fn commit(&mut self, mark: UnionFindMark) {
+        self.floor = mark.outer_floor;
+        self.touched.commit();
+```
+
+k. At the end of `set`, replace
+
+```rust
+        self.value[at] = value;
+        self.changes += 1;
+    }
+```
+
+with
+
+```rust
+        self.value[at] = value;
+        self.changes += 1;
+        self.touched.push(index);
+    }
+```
+
+l. Replace `const _: () = assert!(size_of::<UnionFindMark>() == 12);` with
+`const _: () = assert!(size_of::<UnionFindMark>() == 16);`.
+
+3. `crates/hir-ty/src/next_solver/infer/type_variable.rs`: add `use super::touched::Touched;` to
+the imports, and after `pub(crate) fn changes(&self) -> u64 { .. }` in `TypeVariableStorage` add
+
+```rust
+    /// The rows written in the equality table; see `infer::touched`.
+    #[inline]
+    pub(crate) fn touched_eq(&self) -> &Touched {
+        self.eq_relations.touched()
+    }
+
+    /// The rows written in the sub-unification table.
+    #[inline]
+    pub(crate) fn touched_sub(&self) -> &Touched {
+        self.sub_unification_table.touched()
+    }
+```
+
+Status: open
+
+> forwarded to db-ty (`next_solver/infer/`; db-ty-next2, both windows); told by tmux (requests, pass 25).
+> applied by db-ty-next3 (2026-10-29 22:00), items 1-3 as written (the `type_variable.rs`
+> import as `use crate::next_solver::infer::touched::Touched;`, in that file's style). Reviewed:
+> sequence numbers never repeat within an epoch, so a reader whose rows were rolled back or
+> cleared rescans. Not built.
+
+## frontend-fast-infer: watch lists replace the round loop in `fulfill.rs` (2026-10-29)
+
+db-ty's `next_solver/fulfill.rs`. This is db-ty-sol-infer's "watch lists" (`v2/requests/solver-sync-inbox.md`,
+"From db-ty-sol-infer", step 2), built on the `state_changes` fixpoint already there. The new
+module `crates/hir-ty/src/next_solver/fulfill/watch.rs` (written, with `watch/tests.rs`, which
+holds the old loop for the differential test) has `FulfillmentCtxt::try_evaluate_obligations`:
+the same rounds, visiting only the obligations whose stalled-on rows were written, in row
+order, each still checked with `goal_remains_stalled` first. Needs the section above.
+
+1. Replace
+
+```rust
+use rustc_next_trait_solver::solve::{
+    GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt, StalledOnCoroutines,
+    fast_path::compute_goal_fast_path,
+};
+use rustc_type_ir::{
+    InferCtxtLike, Interner,
+    solve::{Certainty, NoSolution},
+};
+```
+
+with
+
+```rust
+use rustc_next_trait_solver::solve::{
+    GoalEvaluation, GoalStalledOn, StalledOnCoroutines, fast_path::compute_goal_fast_path,
+};
+use rustc_type_ir::{InferCtxtLike, solve::Certainty};
+```
+
+and after the `use crate::next_solver::{ .. };` block add
+
+```rust
+pub(crate) mod watch;
+```
+
+2. In `struct Pending`, replace
+
+```rust
+    stalled_on: Vec<StalledOn<'db>>,
+}
+
+const _: () = assert!(size_of::<Pending<'static>>() == 5 * size_of::<Vec<u8>>());
+```
+
+with
+
+```rust
+    stalled_on: Vec<StalledOn<'db>>,
+    watches: watch::Watches,
+}
+
+const _: () = assert!(
+    size_of::<Pending<'static>>() == 5 * size_of::<Vec<u8>>() + size_of::<watch::Watches>()
+);
+```
+
+3. In `held`, replace `            + self.stalled_on.capacity() * size_of::<StalledOn<'db>>()` with
+
+```rust
+            + self.stalled_on.capacity() * size_of::<StalledOn<'db>>()
+            + self.watches.held()
+```
+
+4. In `truncate`, replace
+
+```rust
+        self.stalled_on.truncate(len);
+    }
+```
+
+with
+
+```rust
+        self.stalled_on.truncate(len);
+        self.watches.forget();
+    }
+```
+
+5. Delete `try_evaluate_obligations` in `impl<'db> FulfillmentCtxt<'db>`: from its doc comment
+`/// rustc's loop: every pending obligation, until a round changes nothing. An obligation` through
+the `errors\n    }` that ends it, just before `pub(crate) fn evaluate_obligations_error_on_ambiguity`.
+`watch.rs` has it now, with the same signature and visibility.
+
+Status: open
+
+> forwarded to db-ty (`next_solver/fulfill.rs`; db-ty-next2, both windows); told by tmux (requests, pass 25).
+> applied by db-ty-next3 (2026-10-29 22:00), items 1-5 as written, plus one edit in
+> `fulfill/watch.rs`: its evaluation calls `global_goals::evaluate_root_goal(delegate, goal,
+> span, pending.stalled_on[at].take())` (and imports `global_goals`) in place of
+> `delegate.evaluate_root_goal(..)`. frontend-fast-trait's request (`v2/requests/db-ty.md`,
+> applied just before) moved the old loop's call to the global-goal table, and without this
+> the table would never answer. Checked: `Watches::forget` drops every cursor, so a `Pending`
+> recycled into another context (`recycle::give_pending`, which clears it) wakes all its rows.
+> Not built: please rerun `watch/tests.rs`'s differential test with the table on.
+> frontend-fast-infer (21:55): the `watch.rs` edit is right. The test's old loop
+> (`watch/tests.rs` `try_evaluate_obligations_old`) now makes the same
+> `global_goals::evaluate_root_goal` call, so new against old isolates the watch lists. The
+> differential test (`infer/coerce/fast/tests.rs`) also compares new (tables on) against old
+> with the tables off (`global_goals::switch::without`, through
+> `watch::tests::without_goal_tables`). I can't run it (this lane may not build). It needs
+> sections 3 and 4 in first, because `mod fast` comes from section 3.
+
+## frontend-fast-infer: coercion by head dispatch in `infer/coerce.rs` (2026-10-29)
+
+mem-db-infer's and mem-db-infer-expr's file (both DONE); lane db's `hir-ty`. Notes:
+`docs/v2/plan/lanes/frontend/fast-infer.md` section 1, with the proof of each case. The new
+module `crates/hir-ty/src/infer/coerce/fast.rs` (written, with `fast/tests.rs`: the
+differential test against the old order and the allocation budgets) holds the dispatch: rustc's
+unsizing rejections before any snapshot, unsizing skipped where no `CoerceUnsized` candidate
+can exist or where it already failed for the pair in this body, and the root snapshot only
+where a rule can fail after writing outside its own snapshots. Apply with the next section.
+
+1. Before `trait CoerceDelegate<'db> {`, add
+
+```rust
+mod fast;
+
+pub(super) use fast::UnsizeMemo;
+use fast::{UnsizeFailed, UnsizeResult};
+```
+
+and in `trait CoerceDelegate`, replace
+
+```rust
+    fn type_var_is_sized(&self, var: TyVid) -> bool;
+}
+```
+
+with
+
+```rust
+    fn type_var_is_sized(&self, var: TyVid) -> bool;
+
+    /// The body's record of failed unsizing coercions; none outside a body.
+    fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>>;
+}
+```
+
+2. In `unify_raw`, replace
+
+```rust
+        debug!("unify(a: {:?}, b: {:?}, use_lub: {})", a, b, self.use_lub);
+        self.infcx().commit_if_ok(|_| {
+```
+
+with
+
+```rust
+        debug!("unify(a: {:?}, b: {:?}, use_lub: {})", a, b, self.use_lub);
+        // Relating a type to itself returns it with no goal and no write.
+        if a == b && fast::shortcuts() {
+            return Ok(InferOk { value: b, obligations: PredicateObligations::new() });
+        }
+        self.infcx().commit_if_ok(|_| {
+```
+
+and replace
+
+```rust
+            match res {
+                Ok(InferOk { value, obligations }) => {
+```
+
+with
+
+```rust
+            match res {
+                Ok(ok) if ok.obligations.is_empty() && fast::shortcuts() => Ok(ok),
+                Ok(InferOk { value, obligations }) => {
+```
+
+3. Replace the body of `fn coerce` (from `// First, remove any resolved type variables` through
+the closing `}` of the last `match a.kind() { .. }`) so that it reads
+
+```rust
+    #[instrument(skip(self))]
+    fn coerce(&mut self, a: Ty<'db>, b: Ty<'db>) -> CoerceResult<'db, 'f> {
+        // First, remove any resolved type variables (at the top level, at least):
+        let a = self.infcx().shallow_resolve(a);
+        let b = self.infcx().shallow_resolve(b);
+        debug!("Coerce.tys({:?} => {:?})", a, b);
+        let head = self.head(a, b);
+        self.coerce_head(a, b, head)
+    }
+```
+
+(the `!` rule, the unsizing attempt and the terminal match are in `fast.rs`:
+`coerce_from_never`, `try_unsize`, `coerce_direct`).
+
+4. In `coerce_unsized`, replace from the signature through the lang-item `let`-`else`:
+
+```rust
+    fn coerce_unsized(&mut self, source: Ty<'db>, target: Ty<'db>) -> CoerceResult<'db, 'f> {
+        debug!(?source, ?target);
+        debug_assert!(self.infcx().shallow_resolve(source) == source);
+        debug_assert!(self.infcx().shallow_resolve(target) == target);
+
+        // We don't apply any coercions incase either the source or target
+        ..
+        {
+            return Err(TypeError::Mismatch);
+        }
+
+        let lang_items = self.interner().lang_items();
+        let traits = (lang_items.Unsize, lang_items.CoerceUnsized);
+        let (Some(unsize_did), Some(coerce_unsized_did)) = traits else {
+            debug!("missing Unsize or CoerceUnsized traits");
+            return Err(TypeError::Mismatch);
+        };
+```
+
+(the `..` is the variable-source and variable-target checks, the target-kind list and the
+`&str -> &str` check, all moved to `fast.rs`'s `unsize_rejected_up_front`) with
+
+```rust
+    /// Called once `unsize_rejected_up_front` let the pair through.
+    fn coerce_unsized(&mut self, source: Ty<'db>, target: Ty<'db>) -> UnsizeResult<'db, 'f> {
+        debug!(?source, ?target);
+        debug_assert!(self.infcx().shallow_resolve(source) == source);
+        debug_assert!(self.infcx().shallow_resolve(target) == target);
+
+        let lang_items = self.interner().lang_items();
+        let traits = (lang_items.Unsize, lang_items.CoerceUnsized);
+        let (Some(unsize_did), Some(coerce_unsized_did)) = traits else {
+            debug!("missing Unsize or CoerceUnsized traits");
+            return Err(TypeError::Mismatch.into());
+        };
+```
+
+and at its end replace
+
+```rust
+        if self
+            .delegate
+            .infcx()
+            .visit_proof_tree(
+                Goal::new(self.infcx().interner, self.param_env(), pred),
+                &mut CoerceVisitor {
+                    delegate: &self.delegate,
+                    errored: false,
+                    unsize_did,
+                    coerce_unsized_did,
+                    span: self.cause.span(),
+                },
+            )
+            .is_break()
+        {
+            return Err(TypeError::Mismatch);
+        }
+```
+
+with
+
+```rust
+        let mut visitor = CoerceVisitor {
+            delegate: &self.delegate,
+            errored: false,
+            read_table: false,
+            unsize_did,
+            coerce_unsized_did,
+            span: self.cause.span(),
+        };
+        if self
+            .delegate
+            .infcx()
+            .visit_proof_tree(Goal::new(self.infcx().interner, self.param_env(), pred), &mut visitor)
+            .is_break()
+        {
+            return Err(UnsizeFailed { read_table: visitor.read_table });
+        }
+```
+
+(the reborrow's `coerce_mutbls(..)?` and `self.unify_and(..)?` convert through
+`From<TypeError> for UnsizeFailed`).
+
+5. In `coerce_from_safe_fn`, replace `        self.commit_if_ok(|this| {` with
+`        self.rule_snapshot(|this| {`. Its callers always run inside the root snapshot,
+`may_coerce`'s, or `could_coerce`'s thrown-away context; the old order keeps it in the test.
+
+6. In `impl CoerceDelegate for InferenceCoercionDelegate`, after `type_var_is_sized`, add
+
+```rust
+
+    #[inline]
+    fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>> {
+        Some(&mut self.0.unsize_memo)
+    }
+```
+
+and in `impl CoerceDelegate for HirCoercionDelegate`, replace
+
+```rust
+    fn type_var_is_sized(&self, _var: TyVid) -> bool {
+        false
+    }
+}
+```
+
+with
+
+```rust
+    fn type_var_is_sized(&self, _var: TyVid) -> bool {
+        false
+    }
+    fn unsize_memo(&mut self) -> Option<&mut UnsizeMemo<'db>> {
+        None
+    }
+}
+```
+
+7. The three root coercions: in `InferenceContext::coerce` replace
+`        let ok = coerce.commit_if_ok(|coerce| coerce.coerce(source, target))?;` with
+`        let ok = coerce.coerce_at_root(source, target)?;`; in `try_find_coercion_lub` replace
+`            let result = coerce.commit_if_ok(|coerce| coerce.coerce(new_ty, prev_ty));` with
+`            let result = coerce.coerce_at_root(new_ty, prev_ty);` and
+`        match coerce.commit_if_ok(|coerce| coerce.coerce(prev_ty, new_ty)) {` with
+`        match coerce.coerce_at_root(prev_ty, new_ty) {`.
+
+8. `CoerceVisitor`: after the field `errored: bool,` add
+
+```rust
+    /// Whether the outcome read the table's sizedness of a variable, so it is not a function
+    /// of the two types alone.
+    read_table: bool,
+```
+
+and in `visit_goal`, replace
+
+```rust
+                    && self.delegate.type_var_is_sized(vid)
+```
+
+with
+
+```rust
+                    && {
+                        self.read_table = true;
+                        self.delegate.type_var_is_sized(vid)
+                    }
+```
+
+Status: open
+
+> forwarded to db-mem-infer-a (lane db's `hir-ty/src/infer/`, which it holds since mem-db-infer and mem-db-infer-expr are DONE); told by tmux (requests, pass 25).
+> applied by db-mem-infer-a (22:10): items 1 to 8 as written in `infer/coerce.rs` (`fn coerce` keeps its `#[instrument]` header; the old body up to the terminal `match` replaced by `head` + `coerce_head`).
+
+## frontend-fast-infer: the unsizing memo in `InferenceContext` (2026-10-29)
+
+`crates/hir-ty/src/infer.rs` (mem-db-infer-ctx's, DONE). With the section above.
+
+1. In `pub(crate) struct InferenceContext`, replace
+
+```rust
+    defined_anon_consts: RefCell<Vec<AnonConstId<'db>, &'f Frame>>,
+}
+```
+
+with
+
+```rust
+    defined_anon_consts: RefCell<Vec<AnonConstId<'db>, &'f Frame>>,
+    /// The unsizing coercions that failed in this body; see `coerce::fast`.
+    unsize_memo: coerce::UnsizeMemo<'db>,
+}
+```
+
+2. In `InferenceContext::new`, replace
+
+```rust
+            defined_anon_consts: RefCell::new(Vec::new_in(frame)),
+            lowering_mode,
+            frame,
+        }
+```
+
+with
+
+```rust
+            defined_anon_consts: RefCell::new(Vec::new_in(frame)),
+            lowering_mode,
+            frame,
+            unsize_memo: Default::default(),
+        }
+```
+
+Status: open
+
+> forwarded to db-mem-infer-a (`hir-ty/src/infer.rs`; with the coercion section above); told by tmux (requests, pass 25).
+> applied by db-mem-infer-a (22:10): both as written, with the coercion section.
+
+## frontend-tree: hir `src/semantics.rs`: `SemanticsScope::speculative_resolve_mod_path` (1) (2026-10-29)
+
+From frontend-tree-move-tools (frontend.md item 16, notes
+`docs/v2/plan/lanes/frontend/tree-move-tools.md`). blaze-lints' `Cx::resolve_name` resolves a
+name a format string captures as a one-segment path in an item's scope. It made a handle path
+with `ast::make::path_from_text(name)` for `speculative_resolve`; on views there is no path node
+to give, so it builds the `ModPath` (`one_segment_path` in `crates/blaze-lints/src/check.rs`,
+`speculative_resolve`'s rule for one segment) and needs the tail of `speculative_resolve` on
+its own. Additive; `speculative_resolve` calls it, so both mean the same. frontend-tree-move-hir
+told by tmux.
+
+File `crates/hir/src/semantics.rs`, in `impl<'db> SemanticsScope<'db>`, `fn speculative_resolve`.
+Old:
+
+```rust
+        resolve_hir_path(
+            self.db,
+            &self.resolver,
+            self.infer_body,
+            Path::BarePath(&ModPath::from_segments(kind, segments)),
+            HygieneId::ROOT,
+            None,
+        )
+    }
+```
+
+New:
+
+```rust
+        self.speculative_resolve_mod_path(&ModPath::from_segments(kind, segments))
+    }
+
+    /// [`Self::speculative_resolve`] of a path already made a [`ModPath`].
+    pub fn speculative_resolve_mod_path(&self, path: &ModPath) -> Option<PathResolution<'db>> {
+        resolve_hir_path(
+            self.db,
+            &self.resolver,
+            self.infer_body,
+            Path::BarePath(path),
+            HygieneId::ROOT,
+            None,
+        )
+    }
+```
+
+Status: open
+
+> forwarded to db (`crates/hir`; db-next3); told by tmux (requests, pass 25).
+> applied by db-apply-late (22:24): as written, in `impl<'db> SemanticsScope<'db>`; `speculative_resolve` now calls `speculative_resolve_mod_path`.
+
+## frontend-tree: hir-def expr_store/source_map.rs: onto views (1)
+
+> APPLIED by frontend-tree-move-def itself (21:45): the file is format's, every owner is DONE, so
+> it is free. Nothing for lane db to do. The applied hunks also move `MoveTo::Body`'s anchor
+> (dedyn's enum) onto `view::Node<'a>`, along with its test.
+
+From `frontend-tree-move-def` (frontend.md item 16, notes
+`docs/v2/plan/lanes/frontend/tree-move-def.md`), for lane db (`crates/hir-def/src/expr_store/` is
+format's; format is DONE and no live child holds this file). The source map's node-to-id lookups
+get view twins taking the view by value: `node_expr_view`, `node_macro_file_view`,
+`node_pat_view`, `node_type_view`, `node_label_view`, `macro_expansion_expr_view`,
+`expansion_view`, `implicit_format_args_view`, `asm_template_args_view`. Each looks up
+`AstPtr::of(view)`, the key its handle version makes with `AstPtr::new`, so both give the same
+id. `frontend-tree-move-hir` and the `nameres` part program against them. The handle versions stay
+until their callers move. The test is a new file of mine,
+`crates/hir-def/src/expr_store/source_map/view_tests.rs`, already written.
+
+needs: nothing (`AstPtr::of` is in `crates/syntax/src/view.rs`).
+
+> (requests, pass 27): the forward above is moot: frontend-tree-move-def applied it itself (its APPLIED line at the top).
+
+### Hunk 1: imports
+
+Old:
+
+```rust
+use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
+```
+
+New:
+
+```rust
+use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast, view};
+```
+
+### Hunk 2: the twins, and one body for the format and asm lookups
+
+Old:
+
+```rust
+    pub fn implicit_format_args(
+        &self,
+        node: InFile<&ast::FormatArgsExpr>,
+    ) -> Option<(HygieneId, &[(syntax::TextRange, Name)])> {
+        let expr_only = self.expr_only()?;
+        let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
+        let (hygiene, names) = expr_only
+            .template_map
+            .as_ref()?
+            .format_args_to_captures
+            .get(expr_only.expr_map.get(&src)?.as_expr()?)?;
+        Some((*hygiene, &**names))
+    }
+```
+
+New:
+
+```rust
+    pub fn implicit_format_args(
+        &self,
+        node: InFile<&ast::FormatArgsExpr>,
+    ) -> Option<(HygieneId, &[(syntax::TextRange, Name)])> {
+        self.implicit_format_args_at(node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>))
+    }
+
+    fn implicit_format_args_at(
+        &self,
+        src: InFile<AstPtr<ast::Expr>>,
+    ) -> Option<(HygieneId, &[(syntax::TextRange, Name)])> {
+        let expr_only = self.expr_only()?;
+        let (hygiene, names) = expr_only
+            .template_map
+            .as_ref()?
+            .format_args_to_captures
+            .get(expr_only.expr_map.get(&src)?.as_expr()?)?;
+        Some((*hygiene, &**names))
+    }
+```
+
+### Hunk 3
+
+Old:
+
+```rust
+    pub fn asm_template_args(
+        &self,
+        node: InFile<&ast::AsmExpr>,
+    ) -> Option<(ExprId, &[Vec<(syntax::TextRange, usize)>])> {
+        let expr_only = self.expr_only()?;
+        let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
+        let expr = expr_only.expr_map.get(&src)?.as_expr()?;
+        Some(expr).zip(
+            expr_only.template_map.as_ref()?.asm_to_captures.get(expr).map(std::ops::Deref::deref),
+        )
+    }
+
+    /// Get a reference to the source map's diagnostics.
+```
+
+New:
+
+```rust
+    pub fn asm_template_args(
+        &self,
+        node: InFile<&ast::AsmExpr>,
+    ) -> Option<(ExprId, &[Vec<(syntax::TextRange, usize)>])> {
+        self.asm_template_args_at(node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>))
+    }
+
+    fn asm_template_args_at(
+        &self,
+        src: InFile<AstPtr<ast::Expr>>,
+    ) -> Option<(ExprId, &[Vec<(syntax::TextRange, usize)>])> {
+        let expr_only = self.expr_only()?;
+        let expr = expr_only.expr_map.get(&src)?.as_expr()?;
+        Some(expr).zip(
+            expr_only.template_map.as_ref()?.asm_to_captures.get(expr).map(std::ops::Deref::deref),
+        )
+    }
+
+    /// [`Self::node_expr`] of a view.
+    pub fn node_expr_view(&self, node: InFile<view::Expr<'_>>) -> Option<ExprOrPatId> {
+        let src = node.map(AstPtr::<ast::Expr>::of);
+        self.expr_only()?.expr_map.get(&src).cloned().map(ExprOrPatIdPacked::unpack)
+    }
+
+    /// [`Self::node_macro_file`] of a view.
+    pub fn node_macro_file_view(&self, node: InFile<view::MacroCall<'_>>) -> Option<MacroCallId> {
+        let src = node.map(AstPtr::<ast::MacroCall>::of);
+        self.expr_only()?.expansions.get(&src).cloned()
+    }
+
+    /// [`Self::node_pat`] of a view.
+    pub fn node_pat_view(&self, node: InFile<view::Pat<'_>>) -> Option<ExprOrPatId> {
+        self.expr_only()?
+            .pat_map
+            .get(&node.map(AstPtr::<ast::Pat>::of))
+            .cloned()
+            .map(ExprOrPatIdPacked::unpack)
+    }
+
+    /// [`Self::node_type`] of a view.
+    pub fn node_type_view(&self, node: InFile<view::Type<'_>>) -> Option<TypeRefId> {
+        self.types_map.get(&node.map(AstPtr::<ast::Type>::of)).cloned()
+    }
+
+    /// [`Self::node_label`] of a view.
+    pub fn node_label_view(&self, node: InFile<view::Label<'_>>) -> Option<LabelId> {
+        let src = node.map(AstPtr::<ast::Label>::of).map(AstPtr::wrap_left);
+        self.expr_only()?.label_map.get(&src).cloned()
+    }
+
+    /// [`Self::macro_expansion_expr`] of a view.
+    pub fn macro_expansion_expr_view(
+        &self,
+        node: InFile<view::MacroExpr<'_>>,
+    ) -> Option<ExprOrPatId> {
+        let src = node.map(AstPtr::<ast::MacroExpr>::of).map(AstPtr::upcast);
+        self.expr_only()?.expr_map.get(&src).copied().map(ExprOrPatIdPacked::unpack)
+    }
+
+    /// [`Self::expansion`] of a view.
+    pub fn expansion_view(&self, node: InFile<view::MacroCall<'_>>) -> Option<MacroCallId> {
+        self.expr_only()?.expansions.get(&node.map(AstPtr::<ast::MacroCall>::of)).copied()
+    }
+
+    /// [`Self::implicit_format_args`] of a view.
+    pub fn implicit_format_args_view(
+        &self,
+        node: InFile<view::FormatArgsExpr<'_>>,
+    ) -> Option<(HygieneId, &[(syntax::TextRange, Name)])> {
+        let src = node.map(AstPtr::<ast::FormatArgsExpr>::of).map(AstPtr::upcast::<ast::Expr>);
+        self.implicit_format_args_at(src)
+    }
+
+    /// [`Self::asm_template_args`] of a view.
+    pub fn asm_template_args_view(
+        &self,
+        node: InFile<view::AsmExpr<'_>>,
+    ) -> Option<(ExprId, &[Vec<(syntax::TextRange, usize)>])> {
+        let src = node.map(AstPtr::<ast::AsmExpr>::of).map(AstPtr::upcast::<ast::Expr>);
+        self.asm_template_args_at(src)
+    }
+
+    /// Get a reference to the source map's diagnostics.
+```
+
+Why: the edge twins; the format and asm lookups keep one body, keyed by the pointer.
+
+### Hunk 4: the test module
+
+Old:
+
+```rust
+#[cfg(test)]
+pub(in crate::expr_store) mod tests {
+```
+
+New:
+
+```rust
+#[cfg(test)]
+mod view_tests;
+
+#[cfg(test)]
+pub(in crate::expr_store) mod tests {
+```
+
+Why: `view_tests.rs` compares every twin with its handle version on every node of a body.
+
+> forwarded to mem-format (it holds hir-def's `expr_store*`); told by tmux (requests, pass 25).
+
+> mem-format (2026-10-29 21:58): confirmed in the tree. `source_map.rs` has the `view` import, the
+> nine `*_view` twins, `implicit_format_args_at`/`asm_template_args_at` and `mod view_tests`, and
+> `source_map/view_tests.rs` exists. I hold the file, have no open edit in it, and keep the edit.
+> frontend-tree may move `source_map.rs`'s handle callers onto views too (tmux me).
+
+## mem-db-def: format, `ExpressionStoreBuilder::path_at` public, for hir's R10 (from db-mem-def, 2026-10-29 21:46)
+
+`v2/requests/mem-db-def-hir.md` R10, part 2: `SourceAnalyzer::resolve_path` and
+`resolve_hir_path_per_ns` (`crates/hir/src/source_analyzer.rs:1269`, `:1476`) lower a path with an
+`ExprCollector` only to resolve it, and `finish` the builder into a whole `ExpressionStore` every
+call. The store is needed only for a type anchor or a use tree's qualifier. Since paths became
+columns, the path itself is read through `store.path_at(..)` after `finish`, and hir can't read it
+before: `ExpressionStoreBuilder::path_at` is `pub(crate)`.
+
+In `crates/hir-def/src/expr_store/path.rs` (`impl ExpressionStoreBuilder`, ~:1304), make
+`path_at` `pub` (its doc as is). Then hir reads both paths from `collector.store`, computes
+`reads_store` (a type anchor on either path, or a use-tree parent) from them, and `finish`es only
+then; mem-format's `Drop for ExpressionStoreBuilder` already gives an unfinished builder's
+scratch back. The hir part is lane db's, applied once this lands.
+
+> forwarded to mem-format (`hir-def/src/expr_store/path.rs`); told by tmux (requests, pass 26).
+> applied (requests, pass 27; mem-format is DONE, so format's `expr_store` files are requests'): `ExpressionStoreBuilder::path_at` is `pub`, its doc as is. The hir half is lane db's (db-next3).
+
+## frontend-tree: base-db reparse.rs + tests.rs: onto views (1)
+
+From frontend-tree-move-expand (child of frontend-tree; notes
+`docs/v2/plan/lanes/frontend/tree-move-expand.md`). base-db has no public API that takes or
+returns a handle: `EditionedFileId::parse` returns the `Parse`, a kind tag that already gives
+views (`root()`, `view()`). These are its last syntax-handle reads. Each reads the same tree
+and makes the same check.
+
+1.1 File `crates/base-db/src/reparse.rs` (`assert_whole`). Old:
+
+```rust
+    let tree = |parse: &Parse<SourceFile>| parse.syntax_node().flat_tree().cloned();
+    assert!(tree(made) == tree(&whole), "a reparse whose tree is not the whole parse's");
+```
+
+New:
+
+```rust
+    assert!(
+        made.root().file() == whole.root().file(),
+        "a reparse whose tree is not the whole parse's"
+    );
+```
+
+Why: it compares the same `FlatTree`s (`PartialEq for FlatTree`). A parse's root is always flat,
+so the old `Option` was always `Some`. No handle is made and no `Arc` is counted.
+
+1.2 File `crates/base-db/src/tests.rs`. Old:
+
+```rust
+    let root = parse.syntax_node();
+    let tree = root.flat_tree().expect("a parsed file is a flat tree");
+    assert!(tree.source().ptr_eq(db.file_text(files[1]).text(&db)));
+```
+
+New:
+
+```rust
+    let tree = parse.root().file();
+    assert!(tree.source().ptr_eq(db.file_text(files[1]).text(&db)));
+```
+
+1.3 Old:
+
+```rust
+        let root = parse.syntax_node();
+        let function = root.children().next().expect("the `fn`");
+```
+
+New:
+
+```rust
+        let function = parse.root().children().next().expect("the `fn`");
+```
+
+Why: a view's `children`, `kind` and `is_lazy` ("lazy and not parsed yet; never parses") are
+the cursor's.
+
+1.4 Old:
+
+```rust
+            assert_eq!(parse.syntax_node().text().to_string(), text, "step {step}");
+```
+
+New:
+
+```rust
+            assert_eq!(parse.root().text(), text, "step {step}");
+```
+
+1.5 Old:
+
+```rust
+    assert_eq!(fresh_id.parse(&db).syntax_node().text().to_string(), "fn b() { 2 }");
+```
+
+New:
+
+```rust
+    assert_eq!(fresh_id.parse(&db).root().text(), "fn b() { 2 }");
+```
+
+Why: a view node's text is one slice of the source, so the check makes no `String`.
+
+> forwarded to db (`crates/base-db`; db-next3); told by tmux (requests, pass 26).
+> applied by db-apply-late (22:25): 1.1-1.5 as written (old texts matched).
+
+## frontend-tree: hir semantics.rs, source_analyzer.rs, lib.rs: onto views (1) (2026-10-29)
+
+From frontend-tree-move-hir (frontend.md item 16, notes
+`docs/v2/plan/lanes/frontend/tree-move-hir.md`). Declares the new view modules, all new files
+of mine (`crates/hir/src/semantics/view.rs`, `semantics/view/{has_source,source_to_def,analyze,tests}.rs`,
+`crates/hir/src/source_analyzer/view.rs`), and re-exports them where `blaze-diagnostics`,
+`blaze-engine`, `blaze-lints` and the tools already name them (`hir::view::Semantics`,
+`hir::view::HasSourceView`, `hir::ModuleSourceView`, `hir::FieldSourceView`). Additive: no
+handle API changes. Needs, for the new files to build: hir-expand's `files.rs` (1), `lib.rs` (2),
+`attrs.rs + cfg_process.rs` (3), `name.rs + mod_path.rs` (4) and hir-def's `src.rs` (1),
+`nameres.rs` (1) in `v2/requests/db-expand.md`; hir-def's `expr_store/source_map.rs` (1) above;
+`ExprCollector::lower_path_view` (frontend-tree-move-def-lower) and
+`attrs::parse_extra_crate_attrs_view` (frontend-tree-move-def-attrs).
+
+1.1 File `crates/hir/src/semantics.rs`. Old:
+
+```rust
+mod child_by_source;
+mod source_to_def;
+```
+
+New:
+
+```rust
+mod child_by_source;
+mod source_to_def;
+pub mod view;
+```
+
+Why: `view::Semantics` is a child of `semantics` so it shares `SemanticsImpl`'s caches
+(`s2d_cache`, the dyn maps, `infer_body_for_expr_or_pat`) without widening their visibility.
+
+1.2 File `crates/hir/src/source_analyzer.rs`. Old:
+
+```rust
+//! So, this modules should not be used during hir construction, it exists
+//! purely for "IDE needs".
+use std::{
+```
+
+New:
+
+```rust
+//! So, this modules should not be used during hir construction, it exists
+//! purely for "IDE needs".
+mod view;
+
+use std::{
+```
+
+Why: `SourceAnalyzer`'s view twins are a child module so they call the private resolve helpers
+(`resolve_hir_path_`, `resolve_hir_value_path`, `resolve_hir_path_qualifier`, `infer`, `owner`,
+`trait_environment`) instead of copying them.
+
+1.3 File `crates/hir/src/lib.rs`. Old:
+
+```rust
+    semantics::{
+        LintAttr, PathResolution, PathResolutionPerNs, Semantics, SemanticsImpl, SemanticsScope,
+        TypeInfo, VisibleTraits,
+    },
+};
+```
+
+New:
+
+```rust
+    semantics::{
+        LintAttr, PathResolution, PathResolutionPerNs, Semantics, SemanticsImpl, SemanticsScope,
+        TypeInfo, VisibleTraits,
+        view::{self, FieldSourceView, LocalSourceView, ModuleSourceView},
+    },
+};
+```
+
+Why: callers write `hir::view::Semantics`, `hir::view::HasSourceView` and
+`hir::{FieldSourceView, ModuleSourceView}`.
+
+Status: open
+
+> applied by db-apply-ty (21:57): 1.1, 1.2 and 1.3 as written, after db-mem-infer-b-lower (`source_analyzer.rs`) and db-mem-infer-a-ctx (`lib.rs`) were out. I checked that the re-exported names exist in `semantics/view.rs` (via `view/has_source.rs`).
+
+> applied by db-mem-infer-b (21:55), to "mem-db-infer-method, for lane items: additions": the `traits.rs` row's `frame` argument to `TyLoweringContext::new` in `where_predicate_must_hold` (lower R2 is in). The `confirm.rs:465` `substs_from_args_and_bindings(.., frame)` row stays frontend-fast-method's (it holds `confirm.rs`); told by tmux.
+
+## frontend-tree: hir-ty effects.rs, hir-ty-borrowck names.rs, check/tests.rs: onto views (3) (2026-10-29)
+
+From frontend-tree-move-hir (notes `docs/v2/plan/lanes/frontend/tree-move-hir.md`, "hir-ty and
+the checkers"). The last handle syntax in hir-ty and the four checkers: each reads one node
+under its file's root and needs no handle. `HirFileId::root` and `AstPtr::to_view` /
+`syntax::view::to_node` are in the tree. wfcheck, matchck and unsafeck have none.
+
+3.1 File `crates/hir-ty/src/effects.rs`. Old:
+
+```rust
+use syntax::ast;
+```
+
+New:
+
+```rust
+use syntax::view as ast;
+```
+
+3.2 File `crates/hir-ty/src/effects.rs`. Old:
+
+```rust
+    let Ok(source) = source_map.expr_syntax(expr) else { return false };
+    let root = source.file_id.parse_or_expand(db);
+    match source.value.to_node(&root) {
+        Either::Left(ast::Expr::ClosureExpr(closure)) => closure.const_token().is_some(),
+```
+
+New:
+
+```rust
+    let Ok(source) = source_map.expr_syntax(expr) else { return false };
+    match source.value.to_view(source.file_id.root(db)) {
+        Either::Left(ast::Expr::ClosureExpr(closure)) => closure.const_token().is_some(),
+```
+
+Why: a view of the closure under the root the database keeps, with no handle tree built.
+
+3.3 File `crates/hir-ty-borrowck/src/names.rs`. Old:
+
+```rust
+use syntax::{
+    AstNode,
+    ast::{self, HasName},
+};
+```
+
+New:
+
+```rust
+use syntax::view::{self as ast, AstNode as _, HasName as _};
+```
+
+3.4 File `crates/hir-ty-borrowck/src/names.rs`. Old:
+
+```rust
+        let node = source.value.to_node(&source.file_id.parse_or_expand(self.db));
+```
+
+New:
+
+```rust
+        let node = source.value.to_view(source.file_id.root(self.db));
+```
+
+Why: as 3.2. The rest of `from_external_macro` reads the same on views (`Either::right`,
+`ast::Pat::IdentPat`, `name()`, `syntax().text_range()`).
+
+3.5 File `crates/hir-ty-borrowck/src/check/tests.rs`. Old:
+
+```rust
+    let root = source.file_id.parse_or_expand(db);
+    let node = source.value.syntax_node_ptr().to_node(&root);
+    match span {
+        MirSpan::ExprEnd(_) => node.last_token().unwrap().text().to_owned(),
+        _ => node.text().to_string(),
+    }
+```
+
+New:
+
+```rust
+    let node = syntax::view::to_node(source.value.syntax_node_ptr(), source.file_id.root(db));
+    match span {
+        MirSpan::ExprEnd(_) => node.last_token().unwrap().text().to_owned(),
+        _ => node.text().to_owned(),
+    }
+```
+
+Why: as 3.2; a view node's text is one slice of the source.
+
+Status: open
+
+> applied by db-apply-ty (22:13): 3.1-3.5 as written. `effects.rs` went in after db-mem-infer-b-lower was done with it, and the borrowck files after db-mem-borrowck cleared them. `names.rs` had moved on (B7.14, `&str` names), but not in `from_external_macro` or the imports, so the old texts still matched.
+
+> forwarded to db (`crates/hir-ty`, `crates/hir-ty-borrowck`; db-next3); told by tmux (requests, pass 27).
+
+## mem-db-infer-method P4, for lane items: `crates/blaze-items/src/tests/narrow.rs:723` (from db-mem-infer-b, 22:05)
+
+`TraitValueItems` lost `Default` (P4, applied in hir-ty): it is `TraitValueItems<'db, 'f>` with
+`new_in(frame)`. The test's loop body, before `let mut index = TraitValueItems::default();` and the
+inner `for`, becomes the entry's "after" (`v2/requests/mem-db-infer-method.md` P4, line ~404):
+`blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| { let mut index = TraitValueItems::new_in(frame); for .. { .. } });`.
+Needs `blaze-mem` in blaze-items' dev-dependencies if not there (the brief says it has it).
+Until applied, blaze-items' tests don't compile.
+
+> applied (requests, pass 27; lane items is DONE): `tests/narrow.rs`'s loop body runs in `blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| ..)` with `TraitValueItems::new_in(frame)`. `blaze-mem` is already a normal dependency of blaze-items.
+
+## frontend-fast-bodies-cache-bodies: served dependency bodies, relocated ids and two hooks (2026-10-29)
+
+> moved: hir-ty is db-ty's; see `v2/requests/db-ty.md`, same heading. The edits below stay the
+> exact text.
+
+`crates/hir-ty/src/check_cache.rs` (and `check_cache/{ids,part,tests}.rs`, written) keeps each body
+of a dependency crate as its `InferenceRecord` plus its borrowck verdict, every id written as an
+index into a per-body table (`check_cache::relocating`) and read back in another database. The
+codecs below go through `crate::check_cache::{id_bits, id_of}`: outside a scope these are exactly
+today's `as_bits` / `from_bits`, so no record outside the cache changes by a byte (test
+`outside_a_scope_a_record_is_todays_bytes`). Notes: `docs/v2/plan/lanes/frontend/fast-bodies-cache-bodies.md`.
+
+### 1. `crates/hir-ty/src/lib.rs`: the module
+
+Old:
+
+```rust
+pub mod autoderef;
+pub mod consteval;
+```
+
+New:
+
+```rust
+pub mod autoderef;
+pub mod check_cache;
+pub mod consteval;
+```
+
+### 2. `crates/hir-ty/src/infer/persist.rs`: ids through the scope's table
+
+2a. Old (line 35): `use salsa::plumbing::{AsId, FromId};` New: delete the line.
+
+2b. Old:
+
+```rust
+fn salsa_id(bits: u64) -> Option<salsa::Id> {
+    (bits as u32 != 0).then(|| salsa::Id::from_bits(bits))
+}
+
+fn id_bits(id: impl AsId) -> u64 {
+    id.as_id().as_bits()
+}
+```
+
+New:
+
+```rust
+/// An id's word: its salsa bits, or inside `check_cache::relocating` its place in the table.
+fn id_bits<T: crate::check_cache::Relocate>(id: T) -> u64 {
+    crate::check_cache::id_bits(id)
+}
+
+/// [`id_bits`]' id back; `None` for index 0 or a place not in the table.
+fn id_of<T: crate::check_cache::Relocate>(bits: u64) -> Option<T> {
+    crate::check_cache::id_of(bits)
+}
+```
+
+2c. Old (`variant_of`):
+
+```rust
+    let id = salsa_id(bits)?;
+    Some(match tag {
+        0 => EnumVariantId::from_id(id).into(),
+        1 => StructId::from_id(id).into(),
+        2 => UnionId::from_id(id).into(),
+        _ => return None,
+    })
+```
+
+New:
+
+```rust
+    Some(match tag {
+        0 => id_of::<EnumVariantId>(bits)?.into(),
+        1 => id_of::<StructId>(bits)?.into(),
+        2 => id_of::<UnionId>(bits)?.into(),
+        _ => return None,
+    })
+```
+
+2d. Old (`candidate_of`):
+
+```rust
+    let id = salsa_id(bits)?;
+    Some(match tag {
+        0 => FunctionId::from_id(id).into(),
+        1 => ConstId::from_id(id).into(),
+        _ => return None,
+    })
+```
+
+New:
+
+```rust
+    Some(match tag {
+        0 => id_of::<FunctionId>(bits)?.into(),
+        1 => id_of::<ConstId>(bits)?.into(),
+        _ => return None,
+    })
+```
+
+2e. Old (`TableDecode::trait_ref`):
+
+```rust
+        let id = salsa_id(u64::from(low) | (u64::from(high) << 32))
+            .ok_or(FormatError::Invalid { at: self.at, what: "a trait of id 0" })?;
+        let args = self.table.args(args)?;
+        Ok(StoredTraitRef::new(TraitRef::new_from_args(
+            self.interner,
+            TraitId::from_id(id).into(),
+            args,
+        )))
+```
+
+New:
+
+```rust
+        let id = id_of::<TraitId>(u64::from(low) | (u64::from(high) << 32))
+            .ok_or(FormatError::Invalid { at: self.at, what: "a trait of id 0 or not in the table" })?;
+        let args = self.table.args(args)?;
+        Ok(StoredTraitRef::new(crate::check_cache::outside(|| {
+            TraitRef::new_from_args(self.interner, id.into(), args)
+        })))
+```
+
+(`outside`: `new_from_args` may ask the database, whose own reads must not see the scope.)
+
+2f. Old (`InferenceRecordRef::id`):
+
+```rust
+    fn id<T: FromId>(&self, bits: u64) -> Result<T, FormatError> {
+        salsa_id(bits).map(T::from_id).ok_or(self.invalid("a salsa id of index 0"))
+    }
+```
+
+New:
+
+```rust
+    fn id<T: crate::check_cache::Relocate>(&self, bits: u64) -> Result<T, FormatError> {
+        id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
+    }
+```
+
+2g. Old (the record's opaque map; a second database's opaque ids need not be in the first's order):
+
+```rust
+            let entries = exact(
+                ids.len(),
+                ids.iter()
+                    .zip(opaque_tys)
+                    .map(|(&bits, &ty)| Ok((self.id::<InternedOpaqueTyId<'db>>(bits)?, tys.ty(ty)?))),
+            )?;
+            SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
+```
+
+New:
+
+```rust
+            let mut entries = exact(
+                ids.len(),
+                ids.iter()
+                    .zip(opaque_tys)
+                    .map(|(&bits, &ty)| Ok((self.id::<InternedOpaqueTyId<'db>>(bits)?, tys.ty(ty)?))),
+            )?;
+            if crate::check_cache::in_scope() {
+                entries.sort_unstable_by_key(|&(id, _)| id);
+            }
+            SortedMap::from_sorted(entries).map_err(|what| self.invalid(what))?
+```
+
+2h. Old (`Sink::id`):
+
+```rust
+    fn id(&mut self, id: impl AsId) {
+        self.u64(id_bits(id));
+    }
+```
+
+New:
+
+```rust
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+        self.u64(id_bits(id));
+    }
+```
+
+2i. Old (`Source::salsa` and `Source::id`):
+
+```rust
+    fn salsa(&mut self) -> Result<salsa::Id, FormatError> {
+        let bits = self.u64()?;
+        salsa_id(bits).ok_or(self.invalid("a salsa id of index 0"))
+    }
+
+    fn id<T: FromId>(&mut self) -> Result<T, FormatError> {
+        self.salsa().map(T::from_id)
+    }
+```
+
+New:
+
+```rust
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
+        let bits = self.u64()?;
+        id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
+    }
+```
+
+2j. Old (`Source::generic_def`):
+
+```rust
+        let tag = self.word()?;
+        let id = self.salsa()?;
+        Ok(match tag {
+            0 => AdtId::StructId(StructId::from_id(id)).into(),
+            1 => AdtId::EnumId(EnumId::from_id(id)).into(),
+            2 => AdtId::UnionId(UnionId::from_id(id)).into(),
+            3 => ConstId::from_id(id).into(),
+            4 => FunctionId::from_id(id).into(),
+            5 => ImplId::from_id(id).into(),
+            6 => StaticId::from_id(id).into(),
+            7 => TraitId::from_id(id).into(),
+            8 => TypeAliasId::from_id(id).into(),
+            _ => return Err(self.invalid("a generic definition of no kind")),
+        })
+```
+
+New:
+
+```rust
+        Ok(match self.word()? {
+            0 => AdtId::StructId(self.id()?).into(),
+            1 => AdtId::EnumId(self.id()?).into(),
+            2 => AdtId::UnionId(self.id()?).into(),
+            3 => GenericDefId::ConstId(self.id()?),
+            4 => GenericDefId::FunctionId(self.id()?),
+            5 => GenericDefId::ImplId(self.id()?),
+            6 => GenericDefId::StaticId(self.id()?),
+            7 => GenericDefId::TraitId(self.id()?),
+            8 => GenericDefId::TypeAliasId(self.id()?),
+            _ => return Err(self.invalid("a generic definition of no kind")),
+        })
+```
+
+(The tag is read before the id as before; a tag of no kind now fails before reading the id
+rather than after, on the same bytes.)
+
+2k. Old (diagnostic 7, `PrivateAssocItem`):
+
+```rust
+                let kind = self.word()?;
+                let item_id = self.salsa()?;
+                let item = match kind {
+                    0 => AssocItemId::FunctionId(FunctionId::from_id(item_id)),
+                    1 => AssocItemId::ConstId(ConstId::from_id(item_id)),
+                    2 => AssocItemId::TypeAliasId(TypeAliasId::from_id(item_id)),
+                    _ => return Err(self.invalid("an associated item of no kind")),
+                };
+```
+
+New:
+
+```rust
+                let item = match self.word()? {
+                    0 => AssocItemId::FunctionId(self.id()?),
+                    1 => AssocItemId::ConstId(self.id()?),
+                    2 => AssocItemId::TypeAliasId(self.id()?),
+                    _ => return Err(self.invalid("an associated item of no kind")),
+                };
+```
+
+2l. The tests module: after `use la_arena::ArenaMap;` add `use salsa::plumbing::FromId;`.
+
+Every other `id_bits(it)` / `self.id(..)` / `self.id()?` caller is unchanged: each passes a
+hir-def id, `BuiltinDeriveImplId`, or one of the interned ids, all `Relocate`
+(`check_cache/ids.rs`). If a caller passes another salsa type the build names it; tell me.
+
+### 3. `crates/hir-ty/src/next_solver/persist.rs`: definitions through the table; `dyn` lists re-sorted
+
+Only the persisted pair (`Children`, `Reading`) relocates. The in-memory pair (`Words`, `Row`,
+which `tag` uses while interning, and interning happens inside a read scope) and every other
+sink keep raw salsa ids, through the trait's defaults.
+
+3a. In `trait Sink<'db>`, after `fn adt(&mut self, adt: AdtDef);` add:
+
+```rust
+    /// A salsa id as [`put_id`] writes it, unless the sink names ids otherwise.
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T)
+    where
+        Self: Sized,
+    {
+        put_id(self, id.as_id());
+    }
+```
+
+In `trait Source<'db>`, after `fn adt(&mut self) -> Result<AdtDef, Self::Error>;` add:
+
+```rust
+    /// A salsa id, as [`Sink::id`] wrote it.
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, Self::Error>
+    where
+        Self: Sized,
+    {
+        get_id(self).map(T::from_id)
+    }
+```
+
+In `impl<'db> Sink<'db> for Children<'_, 'db>`, after its `fn adt`, add:
+
+```rust
+    fn id<T: crate::check_cache::Relocate>(&mut self, id: T) {
+        let bits = crate::check_cache::id_bits(id);
+        self.word(bits as u32);
+        self.word((bits >> 32) as u32);
+    }
+```
+
+In `impl<'db, A: Fn(AdtId) -> AdtDef> Source<'db> for Reading<'_, A>`, after its `fn adt`, add:
+
+```rust
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
+        let index = self.word()?;
+        let generation = self.word()?;
+        crate::check_cache::id_of(u64::from(index) | (u64::from(generation) << 32))
+            .ok_or_else(|| self.invalid("a salsa id of index 0 or not in the table"))
+    }
+```
+
+(Outside a scope `id_bits`/`id_of` are `as_bits`/`from_bits` with the same index-0 refusal, so
+the persisted words are today's.)
+
+3b. `put_id` and `get_id` stay as they are (Old = New); listed so the defaults above are clear:
+
+```rust
+/// A salsa id: its index (never 0) and its generation.
+fn put_id<'db>(sink: &mut impl Sink<'db>, id: salsa::Id) {
+    let bits = id.as_bits();
+    sink.word(bits as u32);
+    sink.word((bits >> 32) as u32);
+}
+
+fn get_id<'db, S: Source<'db>>(source: &mut S) -> Result<salsa::Id, S::Error> {
+    let index = source.word()?;
+    let generation = source.word()?;
+    if index == 0 {
+        return Err(source.invalid("a salsa id of index 0"));
+    }
+    Ok(salsa::Id::from_bits(u64::from(index) | (u64::from(generation) << 32)))
+}
+```
+
+3c. Old (`put_def`): the whole `let (variant, id) = match def { ... }; sink.word(variant); put_id(sink, id);`
+New:
+
+```rust
+    match def {
+        SolverDefId::AdtId(AdtId::StructId(id)) => { sink.word(0); sink.id(id) }
+        SolverDefId::AdtId(AdtId::UnionId(id)) => { sink.word(1); sink.id(id) }
+        SolverDefId::AdtId(AdtId::EnumId(id)) => { sink.word(2); sink.id(id) }
+        SolverDefId::ConstId(id) => { sink.word(3); sink.id(id) }
+        SolverDefId::FunctionId(id) => { sink.word(4); sink.id(id) }
+        SolverDefId::ImplId(id) => { sink.word(5); sink.id(id) }
+        SolverDefId::BuiltinDeriveImplId(id) => { sink.word(6); sink.id(id) }
+        SolverDefId::StaticId(id) => { sink.word(7); sink.id(id) }
+        SolverDefId::AnonConstId(id) => { sink.word(8); sink.id(id) }
+        SolverDefId::TraitId(id) => { sink.word(9); sink.id(id) }
+        SolverDefId::TypeAliasId(id) => { sink.word(10); sink.id(id) }
+        SolverDefId::InternedClosureId(id) => { sink.word(11); sink.id(id) }
+        SolverDefId::InternedCoroutineId(id) => { sink.word(12); sink.id(id) }
+        SolverDefId::InternedCoroutineClosureId(id) => { sink.word(13); sink.id(id) }
+        SolverDefId::InternedOpaqueTyId(id) => { sink.word(14); sink.id(id) }
+        SolverDefId::EnumVariantId(id) => { sink.word(15); sink.id(id) }
+        SolverDefId::Ctor(Ctor::Struct(id)) => { sink.word(16); sink.id(id) }
+        SolverDefId::Ctor(Ctor::Enum(id)) => { sink.word(17); sink.id(id) }
+    }
+```
+
+(rustfmt will spread the arms; same words in the same order as today.)
+
+3d. Old (`get_def`): `let variant = source.word()?; let id = get_id(source)?; Ok(match variant { 0 => SolverDefId::AdtId(AdtId::StructId(FromId::from_id(id))), ... _ => return Err(source.invalid("a definition")), })`
+New: the same match with `source.id()?` in place of each `FromId::from_id(id)` and no `let id`:
+
+```rust
+    Ok(match source.word()? {
+        0 => SolverDefId::AdtId(AdtId::StructId(source.id()?)),
+        1 => SolverDefId::AdtId(AdtId::UnionId(source.id()?)),
+        2 => SolverDefId::AdtId(AdtId::EnumId(source.id()?)),
+        3 => SolverDefId::ConstId(source.id()?),
+        4 => SolverDefId::FunctionId(source.id()?),
+        5 => SolverDefId::ImplId(source.id()?),
+        6 => SolverDefId::BuiltinDeriveImplId(source.id()?),
+        7 => SolverDefId::StaticId(source.id()?),
+        8 => SolverDefId::AnonConstId(source.id()?),
+        9 => SolverDefId::TraitId(source.id()?),
+        10 => SolverDefId::TypeAliasId(source.id()?),
+        11 => SolverDefId::InternedClosureId(source.id()?),
+        12 => SolverDefId::InternedCoroutineId(source.id()?),
+        13 => SolverDefId::InternedCoroutineClosureId(source.id()?),
+        14 => SolverDefId::InternedOpaqueTyId(source.id()?),
+        15 => SolverDefId::EnumVariantId(source.id()?),
+        16 => SolverDefId::Ctor(Ctor::Struct(source.id()?)),
+        17 => SolverDefId::Ctor(Ctor::Enum(source.id()?)),
+        _ => return Err(source.invalid("a definition")),
+    })
+```
+
+(A variant of no kind now fails before its id words are read; the bytes refused are the same.)
+
+3e. `dyn` predicate lists are in id order (lower.rs: principal, projections by `def_id().0`,
+auto traits by `TraitId`), and a second database's ids are in another order. Old:
+
+```rust
+list_node!(
+    GenericArgs: GenericArg<'db>,
+    Tys: Ty<'db>,
+    Consts: Const<'db>,
+    BoundVarKinds: BoundVariableKind<'db>,
+    PatList: Pattern<'db>,
+    BoundExistentialPredicates: BoundExistentialPredicate<'db>,
+    Clauses: Clause<'db>,
+);
+```
+
+New:
+
+```rust
+list_node!(
+    GenericArgs: GenericArg<'db>,
+    Tys: Ty<'db>,
+    Consts: Const<'db>,
+    BoundVarKinds: BoundVariableKind<'db>,
+    PatList: Pattern<'db>,
+    Clauses: Clause<'db>,
+);
+
+impl<'db> Node<'db> for BoundExistentialPredicates<'db> {
+    const KIND: Kind = Kind::BoundExistentialPredicates;
+    #[inline]
+    fn row(self) -> NonZeroU32 {
+        BoundExistentialPredicates::row(self)
+    }
+    #[inline]
+    fn at(row: NonZeroU32) -> Self {
+        BoundExistentialPredicates::at(row)
+    }
+    fn put_node(self, sink: &mut impl Sink<'db>) {
+        sink.word(self.len() as u32);
+        self.iter().for_each(|item| item.put(sink));
+    }
+    fn get_node<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
+        let len = source.count()?;
+        let mut items = (0..len)
+            .map(|_| BoundExistentialPredicate::get(source))
+            .collect::<Result<SmallVec<[BoundExistentialPredicate<'db>; 8]>, _>>()?;
+        if crate::check_cache::in_scope() {
+            // In lowering's order, by this database's ids: the principal, projections, auto traits.
+            items.sort_by(|a, b| {
+                use ExistentialPredicate as P;
+                use std::cmp::Ordering::{Greater, Less};
+                match (a.skip_binder(), b.skip_binder()) {
+                    (P::Trait(_), P::Trait(_)) => std::cmp::Ordering::Equal,
+                    (P::Trait(_), _) => Less,
+                    (_, P::Trait(_)) => Greater,
+                    (P::Projection(a), P::Projection(b)) => a.def_id.0.cmp(&b.def_id.0),
+                    (P::Projection(_), _) => Less,
+                    (_, P::Projection(_)) => Greater,
+                    (P::AutoTrait(a), P::AutoTrait(b)) => a.0.cmp(&b.0),
+                }
+            });
+        }
+        Ok(BoundExistentialPredicates::new_from_slice(&items))
+    }
+}
+```
+
+(Same words written; outside a scope, the same list read.)
+
+3f. Old (`TyTableReader::open`): `Self::open_with(buffer, at, |id| AdtDef::new(id, interner))`
+New: `Self::open_with(buffer, at, |id| crate::check_cache::outside(|| AdtDef::new(id, interner)))`
+(`AdtDef::new` asks the database, whose own reads of persisted tables must not see the scope.)
+
+### 4. `crates/hir-ty/src/lower/persist.rs`: the diagnostics' ids (ColdBatch stays on raw ids)
+
+4a. After `fn id_bits(id: impl AsId) -> u64 { ... }` add:
+
+```rust
+/// A diagnostic's id: [`id_bits`], or inside `check_cache::relocating` its place in the table.
+fn def_bits<T: crate::check_cache::Relocate>(id: T) -> u64 {
+    crate::check_cache::id_bits(id)
+}
+```
+
+4b. In `put_generic_def`, each `id_bits(it)` becomes `def_bits(it)` (9 arms).
+
+4c. Old (`AmbiguousAssociatedItem` in `put_path_diagnostic`):
+
+```rust
+            put_u64(w, id_bits(variant));
+            put_u64(w, id_bits(item));
+            put_u64(w, id_bits(impl_));
+```
+
+New: the same with `def_bits`.
+
+4d. Old (`Words::id` and `Words::generic_def`):
+
+```rust
+    fn id(&mut self) -> Result<salsa::Id, FormatError> {
+        let bits = self.u64()?;
+        salsa_id(bits).ok_or(self.invalid("a salsa id of index 0"))
+    }
+
+    fn generic_def(&mut self) -> Result<GenericDefId, FormatError> {
+        let tag = self.u32()?;
+        let id = self.id()?;
+        Ok(match tag {
+            0 => AdtId::StructId(StructId::from_id(id)).into(),
+            1 => AdtId::EnumId(EnumId::from_id(id)).into(),
+            2 => AdtId::UnionId(UnionId::from_id(id)).into(),
+            3 => ConstId::from_id(id).into(),
+            4 => FunctionId::from_id(id).into(),
+            5 => ImplId::from_id(id).into(),
+            6 => StaticId::from_id(id).into(),
+            7 => TraitId::from_id(id).into(),
+            8 => TypeAliasId::from_id(id).into(),
+            _ => return Err(self.invalid("a generic definition of no kind")),
+        })
+    }
+```
+
+New:
+
+```rust
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
+        let bits = self.u64()?;
+        crate::check_cache::id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
+    }
+
+    fn generic_def(&mut self) -> Result<GenericDefId, FormatError> {
+        Ok(match self.u32()? {
+            0 => AdtId::StructId(self.id()?).into(),
+            1 => AdtId::EnumId(self.id()?).into(),
+            2 => AdtId::UnionId(self.id()?).into(),
+            3 => GenericDefId::ConstId(self.id()?),
+            4 => GenericDefId::FunctionId(self.id()?),
+            5 => GenericDefId::ImplId(self.id()?),
+            6 => GenericDefId::StaticId(self.id()?),
+            7 => GenericDefId::TraitId(self.id()?),
+            8 => GenericDefId::TypeAliasId(self.id()?),
+            _ => return Err(self.invalid("a generic definition of no kind")),
+        })
+    }
+```
+
+4e. Old:
+
+```rust
+                variant: EnumVariantId::from_id(self.id()?),
+                item: TypeAliasId::from_id(self.id()?),
+                impl_: ImplId::from_id(self.id()?),
+```
+
+New:
+
+```rust
+                variant: self.id()?,
+                item: self.id()?,
+                impl_: self.id()?,
+```
+
+### 5. `crates/hir-ty/src/infer.rs`: the query returns a served body's inference
+
+Old:
+
+```rust
+) -> InferenceResult<'db> {
+    infer_query(db, def)
+}
+```
+
+(the end of `infer_body_query`) New:
+
+```rust
+) -> InferenceResult<'db> {
+    if let Some(served) = crate::check_cache::served_inference(db, def) {
+        return served;
+    }
+    infer_query(db, def)
+}
+```
+
+`served_inference` is `None` with no part served (one `try_get` of a singleton input), and panics
+naming the crate and body when a served record does not read: never a quiet re-inference.
+
+### 6. `crates/hir-ty-borrowck/src/gate.rs`: a served verdict is the gate's answer (tell frontend-fast-borrowck)
+
+Old:
+
+```rust
+pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
+    verdict(def, borrowck(db, def))?;
+    Ok(Checked { owner: def, _revision: PhantomData })
+}
+```
+
+New:
+
+```rust
+pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
+    if !hir_ty::check_cache::served_passed(db, def) {
+        verdict(def, borrowck(db, def))?;
+    }
+    Ok(Checked { owner: def, _revision: PhantomData })
+}
+```
+
+A part records `passed` only for bodies the driver's borrow check passed (`encode`'s `passed`).
+
+### 7. `crates/hir-ty-borrowck`: the served tests (`src/served.rs`, written)
+
+7a. `src/lib.rs`, old:
+
+```rust
+#[cfg(test)]
+mod differential;
+```
+
+New:
+
+```rust
+#[cfg(test)]
+mod differential;
+#[cfg(test)]
+mod served;
+```
+
+7b. `Cargo.toml` `[dev-dependencies]`: add `blaze-format.workspace = true` (a part is an
+`Aligned`, the one `Held`).
+
+Status: open
+
+> forwarded to db (1 to 5, `crates/hir-ty`; db-next3) and frontend-fast-borrowck (6 and 7, `crates/hir-ty-borrowck`); told by tmux (requests, pass 27).
+> frontend-fast-borrowck (2026-10-29 22:04): no objection to 6 (a served pass is the verdict of a
+> body the driver's check passed; nothing of the analyses runs). Not applied yet, by order: `gate.rs`
+> calls and `served.rs` uses `hir_ty::check_cache`, which parts 1-5 make and which is not in the
+> tree, so applying 6 now breaks the crate's build and 7a its test build. `gate.rs` and the crate's
+> `Cargo.toml` are db-mem-borrowck's; I hand it 7a (the `mod served;` line in `lib.rs`, mine) too, so
+> 6, 7a and 7b land together right after parts 1-5 (told by tmux).
+> not applied by db-mem-borrowck (2026-10-29 22:10): waits on parts 1-5. `check_cache.rs` is written but `crates/hir-ty/src/lib.rs` has no `mod check_cache` (part 1), so `hir_ty::check_cache` does not resolve. 6 (`gate.rs`), 7a (`lib.rs` `#[cfg(test)] mod served;`) and 7b (`Cargo.toml` dev `blaze-format`) go in together once db marks 1-5 applied.
+
+## mem-db-def: frontend-tokens, `mbe::DeclarativeMacro::expand_making_in` (from db-mem-def, 2026-10-29 22:20)
+
+`v2/requests/mem-db-def-expand.md` E2 and E5 build a `macro_rules!` expansion in the run's frame
+(`parse_macro_expansion` opens it, `frame::task(Tag::Expand, ..)`). Since task 17,
+`DeclarativeMacroExpander::expand_making` (`crates/hir-expand/src/declarative.rs`) needs the
+expansion's `MadeIdents` too, and mbe offers them only for a global tree
+(`expand_making`, `crates/mbe/src/lib.rs:356`). `expand_in` (`:369`) returns no `MadeIdents`.
+
+In `crates/mbe/src/lib.rs`, next to `expand_in`:
+```rust
+    /// [`Self::expand_making`] with the output in `frame`, as [`Self::expand_in`].
+    pub fn expand_making_in<'f>(
+        &self,
+        frame: &'f Frame,
+        db: &Db,
+        tt: &tt::TopSubtree,
+        marker: impl Fn(&mut Span) + Copy,
+        call_style: MacroCallStyle,
+        call_site: Span,
+    ) -> ExpandResult<(tt::TopSubtree<&'f Frame>, MatchedArmIndex, MadeIdents)>
+```
+with `expand_in` becoming `expand_making_in(..).map(|(tree, arm, _)| (tree, arm))`, so the
+two can't drift. Then lane db makes `expand_making(db, frame, ..)` call it and `macro_expand`
+return the framed tree.
+
+> done by frontend-tokens (2026-10-29 22:10), not built:
+> - `DeclarativeMacro::expand_making_in` is in `crates/mbe/src/lib.rs`, with the signature above.
+>   The match runs in its own `frame::task(Tag::Expand, ..)` as before, and only the tree is
+>   built in `frame`.
+> - `expand_in` now calls `expand_making_in` and drops the third value.
+> - `MadeIdents` is a `SmallVec<[Span; 2]>` on the global allocator, not in the task's scratch,
+>   so it outlives the task. Beyond two spans it allocates globally, the same as
+>   `expand_making`.
+> - hot_lint is clean for this file.
+
+> forwarded to frontend-tokens (`crates/mbe`; frontend-tokens-next1); told by tmux (requests, pass 28).
+
+## dedup: the stability lint reads hir-def's stability, not its own parse (from dedup-sim-diag, 2026-10-29)
+
+From `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`). The
+`deprecated`/E0658 lint in `crates/blaze-diagnostics/src/lints/names/stability/` parses
+`#[deprecated]`/`#[stable]`/`#[unstable]` again (`attr.rs`) and walks rustc's inheritance again
+(`lookup.rs`), drifting from `hir_def::attrs::stability` (it rejects `#[unstable(.., soft)]`,
+uses `is_alphabetic` where rustc's `is_ident` is XID, hard-codes `CURRENT`, and has no
+`FORCE_UNSTABLE`). The diagnostics side is in `v2/requests/diagnostics.md` under the same
+heading; it needs these three small additions, which it applies after.
+
+### 1. `crates/hir-def/src/attrs/stability.rs`: a definition's own attributes, nothing inherited
+
+rustc's `SyntaxExtension::{stability, deprecation}` of a macro are its own attributes only.
+After `pub fn stability(..)` (line ~227), add:
+
+```rust
+/// What `def`'s own `#[deprecated]` says, nothing inherited: rustc's
+/// `SyntaxExtension::deprecation` of a macro.
+pub fn own_deprecation(db: &Db, def: StabilityDef) -> Option<&Deprecation> {
+    own(db, def)?.deprecation.as_ref()
+}
+
+/// What `def`'s own `#[stable]` or `#[unstable]` says in a crate with `staged_api`, nothing
+/// inherited: rustc's `SyntaxExtension::stability` of a macro.
+pub fn own_stability(db: &Db, def: StabilityDef) -> Option<&Stability> {
+    own(db, def)?.stability.as_ref()
+}
+```
+
+Test, in `crates/hir-def/src/attrs/tests.rs`'s `mod stability`: a `macro_rules!` without
+attributes in a `#[unstable(feature = "m", issue = "none")]` module of a staged crate has
+`stability(..)` the module's and `own_stability(..)` none; with its own `#[deprecated = "x"]`
+`own_deprecation(..)` has the note `x`.
+
+### 2. `crates/hir/src/from_id.rs`: `UseDecl` from its id
+
+In `from_id![..]`, after `(hir_def::ExternBlockId, crate::ExternBlock),`:
+
+```rust
+    (hir_def::UseId, crate::UseDecl),
+```
+
+### 3. `crates/hir/src/semantics.rs`: a `use` item's definition
+
+`SourceToDefCtx::use_to_def` exists; `ToDef` lacks the entry. In `to_def_impls![..]`, after
+`(crate::ExternBlock, ast::ExternBlock, extern_block_to_def),`:
+
+```rust
+    (crate::UseDecl, ast::Use, use_to_def),
+```
+
+> forwarded to db-expand-attrs (1, `hir-def/src/attrs/stability.rs`; db-expand-attrs-next1) and db (2 and 3, `crates/hir`; db-next3); told by tmux (requests, pass 28).
+
+## dedup: AdtId::variants (from dedup-sim-diag, 2026-10-29)
+
+From `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`). Four
+crates each wrote "an ADT's variants as `VariantId`s, in order": `hir-ty-borrowck/src/regions.rs`
+`adt_variants`, `hir-ty-wfcheck/src/outlives.rs` `variants`, `hir-ty-share/src/identity.rs`
+`variants` and `blaze-diagnostics/src/lints/names/items/externs.rs` `variants`. One belongs on
+the id, in hir-def.
+
+1. `crates/hir-def/src/lib.rs`, in `impl AdtId` after `hash_id`:
+
+```rust
+    /// The adt's variants, in order: its one of a struct or union, an enum's as declared.
+    pub fn variants(self, db: &Db) -> impl Iterator<Item = VariantId> + '_ {
+        let (one, all) = match self {
+            AdtId::StructId(it) => (Some(VariantId::StructId(it)), None),
+            AdtId::UnionId(it) => (Some(VariantId::UnionId(it)), None),
+            AdtId::EnumId(it) => (None, Some(it.enum_variants(db).variants.values())),
+        };
+        one.into_iter().chain(all.into_iter().flatten().map(|&(it, _)| VariantId::EnumVariantId(it)))
+    }
+```
+
+   Test (hir-def's tests): a struct gives itself, a union itself, `enum E { A, B(u8), C {} }`
+   gives `A`, `B`, `C` in order and an empty enum nothing.
+2. `crates/hir-ty-borrowck/src/regions.rs:7056`: delete `adt_variants`; its callers
+   (`regions.rs:2935`, `names.rs:150`, `check/parts.rs:273`) write `adt.variants(db)`.
+3. `crates/hir-ty-wfcheck/src/outlives.rs:797`: delete `variants`; its callers
+   (`outlives.rs:665`, `lib.rs:170`, `outlives/tests.rs:55`) write `adt.variants(db)`.
+
+`hir-ty-share`'s and blaze-diagnostics' callers are in `v2/requests/fastcompile.md` and
+`v2/requests/diagnostics.md` under their `## dedup` headings from dedup-sim-diag.
+
+> forwarded to db (`crates/hir-def`; db-next3); told by tmux (requests, pass 29).
+> applied by db-apply-late (22:27), parts 1 and 3: `AdtId::variants` in hir-def `lib.rs` as written; its test is `an_adts_variants_are_itself_or_its_enums_in_order` at the end of `nameres/tests.rs` (struct, union, `enum E { A, B(u8), C {} }` in order, empty enum). wfcheck's `outlives::variants` is deleted; `outlives.rs`, `lib.rs` and `outlives/tests.rs` call `adt.variants(db)`; `outlives.rs` drops its now unused `VariantId` import. Part 2 (borrowck) waits on db-mem-borrowck, which was asked by tmux.
+> applied by db-apply-late (22:40), part 2, cleared by db-mem-borrowck: `regions::adt_variants` deleted; `regions.rs`, `names.rs` (`def.def_id().variants(self.db).nth(..)`) and `check/parts.rs` call `AdtId::variants`, without the old `.into_iter()`.
+
+## dedup: hir-expand's written_range is syntax::view::written_range_of (from dedup-sim-diag, 2026-10-29)
+
+From `dedup-sim-diag`. After `v2/requests/frontend-tree.md` `## dedup:
+syntax::view::written_range and Expr::peel_parens` is in:
+`crates/hir-expand/src/builtin/fn_macro.rs:308` `written_range(&SyntaxNode)` is the rule that
+request puts in `syntax` (also copied in blaze-diagnostics, blaze-lints and hir-ty-mir). Its
+body becomes
+
+```rust
+    syntax::view::written_range_of(node.text_range(), node.children_with_tokens().map(|it| (it.kind(), it.text_range())))
+```
+
+or, once this file walks views, its callers call `syntax::view::written_range`.
+> applied by db-expand-attrs (2026-10-29, not built), part 1: `own_deprecation` and `own_stability` after `stability` in `attrs/stability.rs`, as given (staged-only stability holds: the reader drops `#[stable]`/`#[unstable]` outside `staged_api`). Test `a_macros_own_stability_and_deprecation_inherit_nothing` in `attrs/tests.rs`'s `mod stability` (helper `macro_in` reads the module's `legacy_macros`), as asked. Parts 2 and 3 are db's.
+
+## dedup: one Check/Verify comparison of frozen bytes (from dedup-sim-front, 2026-10-29)
+
+`crates/hir-def/src/nameres/frozen.rs` `check_lang_items` and
+`crates/hir-ty/src/method_resolution/frozen.rs` `check` (the impls) are the same 15 lines
+around a different encoder and kind name: skip `Mode::Serve`, name what the bytes are compared
+with by the mode, encode now, and `record_difference` when it differs or can't be written. The
+comparison goes in hir-def's `frozen.rs`, beside `record_difference`; the impls side is
+`v2/requests/items.md` under the same heading. `check` (the `DefMap`, Check mode only, with
+`agrees`) stays as it is.
+
+In `crates/hir-def/src/nameres/frozen.rs`, after `record_difference`, add:
+
+```rust
+/// Records a difference between `frozen`, the bytes of `krate`'s `kind`, and what `encode`
+/// writes now: the live ones in [`Mode::Check`], what was read of them in [`Mode::Verify`].
+pub fn check_frozen(
+    db: &Db,
+    krate: Crate,
+    kind: &'static str,
+    frozen: &Frozen,
+    encode: impl FnOnce() -> Result<Vec<u8>, String>,
+) {
+    let what = match frozen.mode {
+        Mode::Serve => return,
+        Mode::Check => "the live ones",
+        Mode::Verify => "what was read of them",
+    };
+    match encode() {
+        Ok(written) if *written == *frozen.bytes => {}
+        Ok(written) => record_difference(db, krate, kind, what, &written, &frozen.bytes),
+        Err(why) => {
+            // alloc: Check/Verify only, which record differences; never when serving
+            let what = format!("{what}, which cannot be written ({why})");
+            record_difference(db, krate, kind, &what, &[], &[])
+        }
+    }
+}
+```
+
+and `check_lang_items` becomes
+
+```rust
+pub fn check_lang_items(db: &Db, krate: Crate) {
+    let Some(frozen) = frozen_lang_items(db, krate) else { return };
+    check_frozen(db, krate, "lang items", &frozen, || encode_lang_items(db, krate));
+}
+```
+
+(its doc comment stays). What is recorded is the same text as before.
+
+> forwarded to db (db-next3); told by tmux. Its hir-ty half, items.md (same heading), is requests' and waits on this `check_frozen` (requests, pass 30).
+> applied by db-apply-late (22:33): `check_frozen` after `record_difference` and `check_lang_items` through it, as written. The hir-ty half (`method_resolution/frozen.rs`) is items.md's and can go in now.
+
+## dedup: delete base-db's unused `DbPanicContext` (from dedup-sim-front, 2026-10-29)
+
+`crates/base-db/src/lib.rs` `DbPanicContext` (`enter`, its panic hook, `with_ctx`) is a second
+copy of `stdx::panic_context` with its own stack, and nothing calls it
+(`rg DbPanicContext crates vendor` finds only its definition). Delete it: from `#[must_use]
+#[non_exhaustive] pub struct DbPanicContext;` through the end of `impl DbPanicContext { .. }`
+(the `with_ctx` with its `thread_local!`). Then the `use std::{...}` at the top becomes
+
+```rust
+use std::{str::FromStr as _, sync::atomic::AtomicUsize};
+```
+
+(`RefCell`, `panic` and `Once` were used only by it). A caller that wants context on a panic
+uses `stdx::panic_context::enter`, as the parser's tests do.
+
+> forwarded to db (db-next3); told by tmux (requests, pass 30).
+> applied by db-apply-late (22:33): `rg DbPanicContext crates vendor tools` found only its definition; deleted it and its impls, and the `use std` is as given.
+
+## dedup: `blaze_format::Placed`, a column written for a later `Slice` (from dedup-sim-front, 2026-10-29)
+
+After `v2/requests/format.md` (same heading) exports `blaze_format::Placed` (the new
+`crates/blaze-format/src/placed.rs`, the same fields, `push`, `push_each` and `slice` as below,
+plus `Placed::EMPTY`), delete hir-ty's three copies:
+
+1. `crates/hir-ty/src/consteval.rs`: delete `/// Where a column was written: nowhere when it is
+   empty.`, `struct Placed` and `impl Placed` (`push`, `push_each`, `slice`); `use
+   blaze_format::{FormatError, Record, Slice, Writer};` gains `Placed` (and drops `Record` or
+   `Slice` if `rg` finds no other use in the file). `Placed { at: 0, len: 0 }` at ~754 may stay
+   as written (the fields are `pub`) or become `Placed::EMPTY`.
+2. `crates/hir-ty/src/infer/persist.rs`: delete the same doc, `struct Placed` and its `impl`
+   (`push`, `slice`); `use blaze_format::{...}` gains `Placed`.
+3. `crates/hir-ty/src/lower/persist.rs`: the same.
+
+The bytes written are the same: `push` is the same code, `push_each` and `slice` too. Every
+caller calls `Placed::push`, `Placed::push_each`, `.slice(..)` and reads `.at`/`.len`, which the
+shared type has `pub`.
+
+> forwarded to db (db-next3: switch hir-ty's three `Placed` copies to `blaze_format::Placed`). The blaze-format module line is applied (format.md, same heading); told by tmux (requests, pass 30).
+> applied by db-apply-late (22:36), parts 1 and 3: `consteval.rs` and `lower/persist.rs` drop their `Placed` and import `blaze_format::Placed`. `consteval.rs` also drops `Record` from that import, since only its tests use it now and they import it themselves; the `Placed { at: 0, len: 0 }` literals stay. Part 2 (`infer/persist.rs`) waits on db-ty (window 72), which holds `infer/` and was asked by tmux.
+
+## db-unblock: cargo's request 2 (`Cx::file_at` / `Cx::dir_at`) is applied in blaze-query (2026-10-29 22:40)
+
+> APPLIED by db-unblock in `crates/blaze-query/src/lib.rs` (`kinds::FILE_AT`, `DIR_AT`, `CARGO`;
+> `Input::FileAt`/`DirAt` and their keys; `Cx::file_at`/`dir_at`; `read_input` reads the given
+> root), `src/image.rs` (inputs schema 3, root before path) and one test in `src/tests.rs`.
+> Details under request 2 in `v2/requests/cargo.md`. db-next3 and db-query2 told by tmux.
+
+> applied: nothing to apply: db-unblock's record of an applied request (requests, pass 30).
+
+## dedup: `ExpressionStoreOwnerId::generic_def`'s body arm is `DefWithBodyId::generic_def` (from dedup-sim-front, 2026-10-29)
+
+`crates/hir-def/src/lib.rs` `ExpressionStoreOwnerId::generic_def` writes out
+`DefWithBodyId::generic_def` arm for arm in its `Body` arm. Replace
+
+```rust
+            ExpressionStoreOwnerId::Body(def_with_body_id) => match def_with_body_id {
+                DefWithBodyId::FunctionId(id) => GenericDefId::FunctionId(id),
+                DefWithBodyId::StaticId(id) => GenericDefId::StaticId(id),
+                DefWithBodyId::ConstId(id) => GenericDefId::ConstId(id),
+                DefWithBodyId::VariantId(it) => it.lookup(db).parent.into(),
+            },
+```
+
+with
+
+```rust
+            ExpressionStoreOwnerId::Body(def_with_body_id) => def_with_body_id.generic_def(db),
+```
+
+Same answer for each of the four.
+
+> forwarded to db (db-next3); told by tmux (requests, pass 30).
+> applied by db-apply-late (22:35): as written (`DefWithBodyId::generic_def` has the same four arms).
+
+## dedup: one persisted code per binary operator, `BinaryOp::code` (from dedup-sim-front, 2026-10-29)
+
+After `v2/requests/format.md` (same heading) adds `syntax::ast::BinaryOp::{code, from_code}`
+and `ArithOp::code` (the table of this file's `binary_code`/`binary_of`, tested there against
+a copy of both), in `crates/hir-ty/src/infer/persist.rs`:
+
+- delete `fn arith_code`, `fn binary_code` and `fn binary_of` (with the doc comment above
+  `binary_code`);
+- `binary_code(*op)` (~1879) -> `op.code()`; `1 + arith_code(op)` (~1998) -> `1 + op.code()`;
+  `binary_of(code)` (~2767, ~3622) -> `BinaryOp::from_code(code)`;
+- the test `every_code_names_its_own_kind`: its `binary_code`/`binary_of` loop becomes
+  `for code in 0..29 { assert_eq!(BinaryOp::from_code(code).unwrap().code(), code); }
+  assert!(BinaryOp::from_code(29).is_none());` (or is dropped, since syntax's test holds it).
+
+`LogicOp`, `CmpOp` and `Ordering` leave the imports if nothing else uses them. The codes
+written are the same.
+
+> forwarded to db (hir-ty `infer/persist.rs`; db-next4). `BinaryOp::code` is in syntax (format.md, same heading); told by tmux (requests, pass 31).
+
+## items and codegen: `InferCtxt::resolve_vars_if_possible` is `deeply_resolve_ignoring_regions` (db-next4, 2026-10-29 22:50)
+
+The infer port (`v2/requests/db-ty.md`, section `db-ty-port-infer`, the table of old and new
+names) renamed `InferCtxt::resolve_vars_if_possible` to `deeply_resolve_ignoring_regions`
+(`crates/hir-ty/src/next_solver/infer/mod.rs:1349`), with no alias. These six calls on an
+`InferCtxt` don't compile until renamed. Only the method name changes. (`InferenceTable` and
+`InferenceContext` keep their own `resolve_vars_if_possible`; their callers are fine.)
+
+**Lane items** (DONE, so the requests lane applies it):
+- `crates/hir-ty/src/method_resolution.rs:546` `infcx.resolve_vars_if_possible(parent_args)`
+- `crates/hir-ty/src/method_resolution.rs:683` `infcx.resolve_vars_if_possible(impl_source)`
+- `crates/hir-ty/src/method_resolution/probe.rs:450` `self.infcx.resolve_vars_if_possible(ty.value)`
+- `crates/hir-ty/src/method_resolution/probe.rs:2086` `self.infcx().resolve_vars_if_possible(self_ty)`
+- `crates/hir-ty/src/method_resolution/pick_cache.rs:185` `infcx.resolve_vars_if_possible(self_ty)`
+
+In each, `resolve_vars_if_possible(` becomes `deeply_resolve_ignoring_regions(`.
+
+**Lane codegen** (codegen-next1):
+- `crates/hir-ty-mir/src/mir/monomorphization.rs:522`
+  `infcx.resolve_vars_if_possible(*vars.get(..)?)` becomes
+  `infcx.deeply_resolve_ignoring_regions(*vars.get(..)?)`.
+
+> applied (requests, pass 31): lane items' five renames. Codegen's `monomorphization.rs:522` was sent to codegen-next1.
+
+> applied, items' five (requests, pass 31; lane items is DONE): `method_resolution.rs` 546 and 683, `probe.rs` 450 and 2086, `pick_cache.rs` 185 call `deeply_resolve_ignoring_regions`. The `monomorphization.rs:522` one went to codegen (codegen-mir-next2, which holds `hir-ty-mir`, and codegen-next1); told by tmux.
+> applied by codegen-mir (2026-10-29 22:50): `monomorphization.rs:522` calls `infcx.deeply_resolve_ignoring_regions`; no other `resolve_vars_if_possible` in hir-ty-mir.
+
+> codegen-mir (2026-10-29): `mir/monomorphization.rs` is not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); it is codegen-mir-store's.
+
+## db-ty, forwarded from frontend-fast-trait: the fast path's depth (vendor, solver-sync series) (2026-10-29)
+
+**What.** Items 1-5 and 8 of `v2/requests/db-ty.md` "## frontend-fast-trait: the shape table charges search-graph depth as rustc does":
+- `vendor/rustc_type_ir/src/solve/mod.rs`: `FastPathDepth` and `ComputeGoalFastPathOutcome::HoldsWithin`.
+- `vendor/rustc_type_ir/src/search_graph/mod.rs`: `nested_available_depth` and `charge_answered_nested`.
+- `vendor/rustc_next_trait_solver/src/delegate.rs`: `compute_goal_fast_path` takes `depth`.
+- `solve/eval_ctxt/fast_path.rs`: it returns the required depth.
+- `solve/eval_ctxt/mod.rs`: `lower_available_depth`, and the three call sites (`add_goal`, the root's stalled rerun, `evaluate_goal`).
+- The two patches (`0007-fast-path-depth.patch`, `0005-fast-path-depth.patch`).
+
+The exact text is in db-ty.md.
+
+> applied by db-apply-late (22:38): items 1-5 as written in db-ty.md (solver-sync is DONE, so they fell to lane db). In 5a, the moved `match` is one indent level shallower; its arms and comments are unchanged. Item 8: `vendor/rustc_type_ir/patches/0007-fast-path-depth.patch` (search_graph and solve `mod.rs`) and `vendor/rustc_next_trait_solver/patches/0005-fast-path-depth.patch` (`delegate.rs`, `eval_ctxt/fast_path.rs`, `eval_ctxt/mod.rs`) are diffs of `src/` from just before these edits, with `a/`/`b/` prefixes, and each `PATCHES.md` gained its `###` heading. The callers in hir-ty (`solver.rs`, `fulfill.rs`) were already db-ty's items 6 and 7.
+
+**Where.** Lane db's solver-sync series (vendor files are not db-ty's).
+
+**Why.** The shape table answers goals that rustc proves through the search graph, without charging depth, so a goal near the recursion limit holds in blaze where rustc overflows (E0275). The case is `harness/v2/frontend/cases/trait/recursion_send_nested_past_twice_small_limit_rejects.rs`. db-ty has applied items 6 and 7 (`next_solver/solver.rs`, `next_solver/fulfill.rs`), and frontend-fast-trait has updated `global_goals/shape.rs`. hir-ty does not build until these vendor items land.
+
+## format (requests-next3, format is done): `sym::never_patterns` in `intern` (from db-audit-dbsub, for `v2/requests/db-matchck.md` §8, 2026-10-29 22:55)
+
+**What.** In `crates/intern/src/symbol/symbols.rs` (about line 691), one symbol beside `deref_patterns`:
+
+Old:
+```rust
+    deref_patterns,
+    mut_ref,
+```
+New:
+```rust
+    deref_patterns,
+    never_patterns,
+    mut_ref,
+```
+
+**Why.** `crates/hir-def/src/unstable_features.rs` now lists `never_patterns` (its macro matches
+`sym::never_patterns`), so hir-def does not build until this lands. Under
+`#![feature(never_patterns)]` rustc prints an uninhabited witness as `!`, not `_`
+(`print_witness_pat`), so E0004/E0005 text differs without it. Told requests-next3 by tmux.
+
+## coordinator: `tools/v2/hot_lint.py` treats a file declared by `#[cfg(test)] mod x;` as test code (from db-next6, 2026-10-29 22:35)
+
+What: in `tools/v2/hot_lint.py`, a module file is test code when the `mod` line that declares it
+(in the parent file) sits under `#[cfg(test)]` or inside a `#[cfg(test)]` item, and so is every
+file below it.
+
+Where: `in_test_module` and the file walk (`hot_lint.py:42-98`). Today only `tests/`, `*tests.rs`
+and inline `#[cfg(test)]` blocks are skipped.
+
+Why: 216 of the 815 findings over lane db's crates are in test-only files the lint can't see:
+`hir-expand/src/builtin/derive_macro/reference.rs` (`#[cfg(test)] mod reference;`, 50),
+`hir-ty-borrowck/src/differential.rs` and `differential/**` plus `budget.rs` (`#[cfg(test)] mod
+differential; mod budget;` in `lib.rs`, about 100), and `hir-def/src/macro_expansion_tests/**`
+(`#[cfg(test)] mod macro_expansion_tests;`, 63). Marking each test allocation `// alloc:` would
+be noise on code the rule never meant to cover.
+
+## core (requests-next3, no core window runs): admission tags blaze-query's kinds 4-6 (from db-next5, 2026-10-29 23:00)
+
+What: `crates/blaze-graph/src/admission.rs`, `tag_of` (line 79). blaze-query now has
+`kinds::TREE` (4, the database's own per-directory hash query), `FILE_AT` (5) and `DIR_AT` (6,
+inputs of a root other than the view's) (`crates/blaze-query/src/lib.rs:161-167`), and they fall
+to `Tag::Other`.
+
+Old:
+```rust
+        kinds::WALK => Tag::Query,
+        TaskKind(1..=3) => Tag::Vfs,
+```
+New:
+```rust
+        kinds::WALK | TaskKind(4) => Tag::Query,
+        TaskKind(1..=3) | TaskKind(5..=6) => Tag::Vfs,
+```
+And in `each_kind_belongs_to_its_subsystem` (line ~641), add `(4, Tag::Query), (5, Tag::Vfs),
+(6, Tag::Vfs),` after `(3, Tag::Vfs),`.
+
+Also (optional, no behavior today): line 87 `TaskKind(0x6000..0x7000) => Tag::Vfs` is wider than
+blaze-query's `kinds::CARGO` (`0x6000..0x6800`); `0x6800..0x7000` belongs to no lane.
+
+Why: admission budgets kinds by subsystem; a directory hash or a foreign-root read would be
+budgeted as `Other`.
+
+## usercode and cargo: two test query kinds share `0x7e01`, outside every range (from db-next5, 2026-10-29 23:00)
+
+What: `crates/blaze-usercode/src/inputs.rs:839` `QueryKind(0x7e01)` and
+`crates/blaze-cargo/src/serve/tests.rs:131` `QueryKind(0x7e01)` (both test-only). One number is
+one query (`crates/blaze-query/src/lib.rs:91-93`), and `0x7e01` is in no range of `kinds`.
+
+Fix: usercode's becomes `QueryKind(0x5ff0)` (inside `kinds::USER`), blaze-cargo's becomes
+`QueryKind(0x67f0)` (inside `kinds::CARGO`). Neither number is in use (`rg 'QueryKind\(0x5ff0|0x67f0'`).
+
+Why: they live in different test binaries, so nothing breaks today, but a shared test database
+or the admission estimates would mix them.
+
+> applied by usercode (2026-10-29), not built: `inputs.rs`'s test query `ViewTree` is
+> `QueryKind(0x5ff0)`. blaze-cargo's `serve/tests.rs:131` is lane cargo's, so it is left to
+> cargo.
+
+## items: hot_lint findings in items' files inside hir-ty (from db-next6, 2026-10-29 22:40)
+
+What: fix or justify (`// alloc:`/`// clone:` on the line) each `tools/v2/hot_lint.py` finding in
+lane items' hir-ty files: `crates/hir-ty/src/layout.rs` (4), `crates/hir-ty/src/layout/target.rs` (8), `crates/hir-ty/src/method_resolution.rs` (1), `crates/hir-ty/src/method_resolution/frozen.rs` (5), `crates/hir-ty/src/method_resolution/probe.rs` (14), `crates/hir-ty/src/traits.rs` (1). The list as of 22:35 is in `/tmp/db-next6-real.txt`.
+
+Why: common.md asks every hot crate to pass the lint; db's children (db-lint-*) clear every
+other hir-ty file and stay out of items'.
+
+## format (requests-next3, format is done): `lower_function` gives `FunctionSignature::splatted` (from db-audit-dbsub, for `v2/requests/db-ty.md` "db-ty-port-ty", 2026-10-29 23:15)
+
+**Why.** `crates/hir-ty/src/lower.rs:4124` passes `data.splatted` to `FnSigKind::new` (the nightly's
+`FnSigKind` carries rustc's `#[rustc_splat]` argument index, superset-of-rust), but
+`FunctionSignature` has no such field, so hir-ty does not build. Lane db adds the field, its codec
+words and the schema bump (`crates/hir-def/src/signatures.rs`, `deps/signatures/codes.rs`,
+`deps/signatures.rs`) and destructures an eighth element from `lower_function`. The index is
+rustc's `FnDecl::splatted` (`rustc_ast/src/ast.rs` at 16d1ffac, `lower_fn_decl`): the index into
+the parameters (the self parameter first, cfg-disabled ones skipped, the `...` one not counted) of
+the first with `#[rustc_splat]`, below `u8::MAX`, and `None` for a C-variadic function. Only
+`lower_function`'s walk knows which parameters cfg removes, so it computes it. The attribute is
+matched by name as `rustc_inherit_overflow_checks` is (`lower.rs` ~1988), so no new symbol.
+
+### 1. `crates/hir-def/src/expr_store/lower.rs`, `lower_function` (line ~456)
+
+Old:
+```rust
+    Option<TypeRefId>,
+    bool,
+    bool,
+) {
+    let mut expr_collector =
+        ExprCollector::with_maps(db, module, fn_.file_id, LoweringMode::Analysis, maps);
+```
+New:
+```rust
+    Option<TypeRefId>,
+    bool,
+    bool,
+    Option<u8>,
+) {
+    let mut expr_collector =
+        ExprCollector::with_maps(db, module, fn_.file_id, LoweringMode::Analysis, maps);
+```
+
+Old:
+```rust
+    let mut has_self_param = false;
+    let mut has_variadic = false;
+    collector.collect_impl_trait(&mut expr_collector, |collector, impl_trait_lower_fn| {
+```
+New:
+```rust
+    let mut has_self_param = false;
+    let mut has_variadic = false;
+    let is_splat = |attr: ast::Attr<'_>| attr.simple_name().is_some_and(|it| it == "rustc_splat");
+    let mut splat_at: Option<usize> = None;
+    collector.collect_impl_trait(&mut expr_collector, |collector, impl_trait_lower_fn| {
+```
+
+Old:
+```rust
+                    if enabled {
+                        has_self_param = true;
+                        let self_param_ty = match param.ty() {
+```
+New:
+```rust
+                    if enabled {
+                        has_self_param = true;
+                        if ast::HasAttrs::attrs(&param).any(is_splat) {
+                            splat_at = Some(0);
+                        }
+                        let self_param_ty = match param.ty() {
+```
+
+Old:
+```rust
+                        !is_variadic
+                    })
+                    .map(|param| param.ty())
+                    .collect::<SmallVec<[_; 8]>>();
+```
+New:
+```rust
+                        !is_variadic
+                    })
+                    .enumerate()
+                    .map(|(index, param)| {
+                        if splat_at.is_none() && ast::HasAttrs::attrs(&param).any(is_splat) {
+                            splat_at = Some(index + usize::from(has_self_param));
+                        }
+                        param.ty()
+                    })
+                    .collect::<SmallVec<[_; 8]>>();
+```
+
+Old:
+```rust
+        has_self_param,
+        has_variadic,
+    )
+}
+```
+New:
+```rust
+        has_self_param,
+        has_variadic,
+        if has_variadic {
+            None
+        } else {
+            splat_at.and_then(|index| u8::try_from(index).ok()).filter(|&index| index < u8::MAX)
+        },
+    )
+}
+```
+
+### 2. `crates/hir-def/src/expr_store/pretty.rs`, `print_function` (line ~290)
+
+Old:
+```rust
+        abi,
+        flags,
+    }: &FunctionSignature,
+```
+New:
+```rust
+        abi,
+        flags,
+        splatted: _,
+    }: &FunctionSignature,
+```
+
+rustc's AST validation errors for a splat index past 254 and for splat with `...` stay
+diagnostics' (`v2/requests/db-ty.md` "db-ty-port-ty").
+
+## format and items (requests-next3; both are done): db-ty-d-lower's items 1 and 2 (from db-audit-dbsub, for `v2/requests/db-ty.md` "db-ty-d-lower", 2026-10-29 23:25)
+
+**Why.** hir and hir-ty already use both, so the tree does not build without them: `crates/hir/src/diagnostics.rs:3580` calls `source_map.lifetime_syntax(..)`, and `GenericArgsLowerer::report_late_bound_lifetime_args` (`crates/hir-ty/src/lower/path.rs:1149`) has no default, so `confirm.rs`'s impl is missing a method. The section reached only lane db ("forwarded to db, pass 16").
+
+### 1. format: `crates/hir-def/src/expr_store/source_map.rs` (~line 978)
+
+Old:
+```rust
+    pub fn type_syntax(&self, id: TypeRefId) -> Result<TypeSource, SyntheticSyntax> {
+        self.types_map_back.get(id).ok_or(SyntheticSyntax)
+    }
+```
+New:
+```rust
+    pub fn type_syntax(&self, id: TypeRefId) -> Result<TypeSource, SyntheticSyntax> {
+        self.types_map_back.get(id).ok_or(SyntheticSyntax)
+    }
+
+    pub fn lifetime_syntax(&self, id: LifetimeRefId) -> Result<LifetimeSource, SyntheticSyntax> {
+        self.lifetime_map_back.get(id).ok_or(SyntheticSyntax)
+    }
+```
+(`LifetimeSource` is imported at line 33; `lifetime_map_back` is a `BackMap<LifetimeRef, ast::Lifetime>` like `types_map_back`.)
+
+### 2. items: `crates/hir-ty/src/method_resolution/confirm.rs`, `impl GenericArgsLowerer for LowererCtx` (~line 388)
+
+Old:
+```rust
+                self.ctx.push_diagnostic(InferenceDiagnostic::MethodCallIncorrectGenericsOrder {
+                    expr: self.expr,
+                    param_id,
+                    arg_idx,
+                    has_self_arg,
+                });
+            }
+
+            fn provided_kind(
+```
+New:
+```rust
+                self.ctx.push_diagnostic(InferenceDiagnostic::MethodCallIncorrectGenericsOrder {
+                    expr: self.expr,
+                    param_id,
+                    arg_idx,
+                    has_self_arg,
+                });
+            }
+
+            fn report_late_bound_lifetime_args(&mut self, def: GenericDefId, _hard_error: bool) {
+                self.ctx.push_diagnostic(InferenceDiagnostic::MethodCallLateBoundLifetimeArgs {
+                    expr: self.expr,
+                    def,
+                });
+            }
+
+            fn provided_kind(
+```
+(rustc's `prohibit_explicit_late_bound_lifetimes`: a method call is always the `late_bound_lifetime_arguments` lint, so `hard_error` is not read. `InferenceDiagnostic::MethodCallLateBoundLifetimeArgs { expr, def }` is `crates/hir-ty/src/infer.rs:668`.)
+
+## diagnostics (diagnostics-next2): db-ty-d-lower's items 3, 4 and 5 (from db-audit-dbsub, 2026-10-29 23:25)
+
+The exact text is in `v2/requests/db-ty.md` "## db-ty-d-lower", items 3-5; it reached only lane db. hir's side is in the tree: `AnyDiagnostic::{AmbiguousAssociatedItem, LateBoundLifetimeArgs, MissingLifetimes}` (`crates/hir/src/diagnostics.rs:138,173,226`), `UnresolvedAssocItem<'db>` (`:714`), and `BoundRegionKind::NamedForPrinting` (`hir-ty/src/lower.rs:2105`).
+- 3. `crates/blaze-diagnostics/src/print/printer.rs` ~242 (`match br.kind`): the `NamedForPrinting` arm, so `for<'x> fn(&'x u8)` prints `'x`.
+- 4. `crates/blaze-diagnostics/src/lower/mod.rs` `lower` and `crates/ide-diagnostics/src/lib.rs`: the three new `AnyDiagnostic` arms (neither crate builds without them: both match without a wildcard).
+- 5. `&hir::UnresolvedAssocItem` becomes `&hir::UnresolvedAssocItem<'_>` in `blaze-diagnostics/src/lower/unresolved_assoc_item.rs:33,129` and `ide-diagnostics/src/handlers/unresolved_assoc_item.rs:8`; the other changed shapes listed there.
+
+## coordinator (requests-next3, on its coordinator list): `.gitignore` hides `crates/hir-ty/src/target_feature/` (from db-audit-dbsub, 2026-10-29 23:25)
+
+`.gitignore:1` `target*/` matches `crates/hir-ty/src/target_feature/` (`git check-ignore -v crates/hir-ty/src/target_feature/tests.rs` names that line), so `tests.rs` is untracked while the tracked `target_feature.rs` declares `mod tests;`, and a clean checkout fails to build. Fix: anchor it, `/target*/`, or add `!crates/hir-ty/src/target_feature/` after it. From `v2/requests/db-ty.md` "db-ty-d-lower" item 6.
+
+## coordinator (requests-next3, on its coordinator list): `tracing` without its disabled spans in release (from db-audit-dbsub, for `v2/requests/db-ty.md` "db-ty-port-infer-errors", 2026-10-29 23:30)
+
+Root `Cargo.toml:278`: the workspace `tracing` has no compile-time level cap, so every disabled `#[instrument]` span and event still costs a callsite check (about 1 to 2 ns) in release builds, on the solver's and inference's hot paths. Old: `tracing = { version = "0.1.41", default-features = false, features = ["std"] }`. New: `tracing = { version = "0.1.41", default-features = false, features = ["std", "release_max_level_info"] }` (or `_off`; the decision is the coordinator's). It reached only lane db.

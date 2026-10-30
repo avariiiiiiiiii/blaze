@@ -10,7 +10,7 @@ Notes on [ci.md](../ci.md) as built, 2026-10-29. Requests of other lanes are in
 
 ## The agent API (`crates/blaze-api`)
 
-- **One schema** (`SCHEMA` 5: lane cargo's cargo-shaped targets, artifacts, units and
+- **One schema** (`SCHEMA` 5 when written, 14 since requests-api's change of 2026-10-29: lane cargo's cargo-shaped targets, artifacts, units and
   diagnostics, and lane proof's `Work`, `CodegenInputs`, `Trace` and `Tables`), deterministic CBOR from
   `blaze_protocol::cbor`, one frame layout for the Unix socket and for HTTP bodies. JSON is a
   rendering (`json`), never the wire.

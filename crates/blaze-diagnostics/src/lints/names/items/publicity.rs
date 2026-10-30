@@ -8,10 +8,7 @@
 //!
 //! Follows `compiler/rustc_lint/src/builtin.rs` (`UnreachablePub`) (MIT or Apache-2.0).
 
-use syntax::{
-    AstNode,
-    ast::{self, HasVisibility},
-};
+use syntax::view::{self as ast, AstNode, HasVisibility};
 
 use super::{
     def_span, visibility,
@@ -24,13 +21,13 @@ use crate::{
     model::{Applicability, Diag},
 };
 
-pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<Found> {
-    let node = &item.node.value;
-    let Some(vis) = public(node) else { return Vec::new() };
-    let exportable = match &item.container {
+pub(super) fn item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, effective: &Effective) -> Vec<Found> {
+    let node = item.node.value;
+    let Some(vis) = public(node) else { return Vec::new() }; // alloc: empty, no allocation
+    let exportable = match item.container {
         Container::Module | Container::Extern(_) => true,
         Container::Impl(imp) if imp.value.trait_().is_none() => false,
-        Container::Impl(_) | Container::Trait(_) => return Vec::new(),
+        Container::Impl(_) | Container::Trait(_) => return Vec::new(), // alloc: empty, no allocation
     };
     // Where its modules restrict it: a `use`'s reachability, else read only for a lint.
     let (reachable, restricted) = match node {
@@ -40,11 +37,11 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
         }
         _ => match visibility::def(cx, item) {
             Some(def) => (effective.is_reachable(def), None),
-            None => return Vec::new(),
+            None => return Vec::new(), // alloc: empty, no allocation
         },
     };
     if reachable {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, no allocation
     }
     let restricted = restricted.unwrap_or_else(|| visibility::restricted_to(cx, item));
     let grandparent = item.module.parent(cx.db);
@@ -57,15 +54,18 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
         true => Applicability::MaybeIncorrect,
         false => Applicability::MachineApplicable,
     };
-    let spans = match node {
-        ast::Item::Use(it) => it.use_tree().map(leaves).unwrap_or_default().iter().map(|it| it.syntax().text_range()).collect(),
-        _ => vec![def_span(node.syntax())],
-    };
+    // alloc: the spans of a lint that fires, one per `use` leaf
+    let mut spans = Vec::new();
+    match node {
+        ast::Item::Use(it) => it.use_tree().into_iter().for_each(|it| leaves(it, &mut spans)),
+        _ => spans.push(def_span(node.syntax())),
+    }
     let at = item.ptr();
     spans
         .into_iter()
         .map(|range| {
             let mut diag = Diag::lint("unreachable_pub", "unreachable `pub` item", cx.span(item.node.with_value(range)));
+            // clone: the span of a lint that fires, once per leaf
             diag.suggestion(vis_span.clone(), "consider restricting its visibility", new_vis, applicability);
             if exportable {
                 diag.help("or consider exporting it for use by other crates");
@@ -73,11 +73,11 @@ pub(super) fn item(cx: &Cx<'_, '_>, item: &Item, effective: &Effective) -> Vec<F
             crate::lints::code_fact(cx, &mut diag, at);
             Found::lint(diag, Phase::Late, at)
         })
-        .collect()
+        .collect() // alloc: the lints that fire, returned
 }
 
 /// The visibility of an item written plain `pub`.
-fn public(node: &ast::Item) -> Option<ast::Visibility> {
+fn public(node: ast::Item<'_>) -> Option<ast::Visibility<'_>> {
     let vis = match node {
         ast::Item::Const(it) => it.visibility(),
         ast::Item::Enum(it) => it.visibility(),
@@ -96,10 +96,10 @@ fn public(node: &ast::Item) -> Option<ast::Visibility> {
     (vis.pub_token().is_some() && vis.visibility_inner().is_none()).then_some(vis)
 }
 
-/// The leaves of a use tree, each one of HIR's `use` items.
-fn leaves(tree: ast::UseTree) -> Vec<ast::UseTree> {
+/// The ranges of the leaves of a use tree, each one of HIR's `use` items, appended to `out`.
+fn leaves(tree: ast::UseTree<'_>, out: &mut Vec<syntax::TextRange>) {
     match tree.use_tree_list() {
-        Some(list) => list.use_trees().flat_map(leaves).collect(),
-        None => vec![tree],
+        Some(list) => list.use_trees().for_each(|it| leaves(it, out)),
+        None => out.push(tree.syntax().text_range()),
     }
 }

@@ -27,7 +27,10 @@ use hir_def::{
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
 use rustc_hash::FxBuildHasher;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, WalkEvent, ast};
+use syntax::{
+    SyntaxKind, WalkEvent,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::cx::Cx;
 
@@ -231,38 +234,32 @@ fn block_owner(cx: &Cx<'_, '_>, module: ModuleId) -> Option<Parent> {
     let db = cx.db;
     let block = module.block(db)?;
     let ast_id = block.ast_id(db);
-    let root = cx.sema.parse_or_expand(ast_id.file_id);
-    let node = ast_id.file_id.ast_id_map(db).get(ast_id.value).to_node(&root);
-    // clone: a reference count, printing a block's path
-    body_parent(cx, node.syntax().clone())
+    let ptr = ast_id.file_id.ast_id_map(db).get(ast_id.value);
+    body_parent(cx, cx.node_view(ast_id.with_value(ptr)).value.syntax())
 }
 
-/// The path of a closure, an `async` block or a `gen` block `node`: its body's owner and the
-/// closures down to it, itself last.
-pub(crate) fn closure_path(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
+/// The path of a closure, an `async` block or a `gen` block `node` (of a tree `cx.vsema`
+/// gave out): its body's owner and the closures down to it, itself last.
+pub(crate) fn closure_path<'db>(cx: &Cx<'_, 'db>, node: ast::Node<'db>) -> Option<Parent> {
     body_parent(cx, node)
 }
 
 /// The body's owner `node` is written in and the closures around it, `node` included when it
 /// is one.
-fn body_parent(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
+fn body_parent<'db>(cx: &Cx<'_, 'db>, node: ast::Node<'db>) -> Option<Parent> {
     let db = cx.db;
     // alloc: printing a closure's path, the edge
     let mut closures = Vec::new();
-    for ancestor in cx.sema.ancestors_with_macros(node) {
-        if is_closure_like(&ancestor) {
+    for ancestor in cx.vsema.ancestors_with_macros(node) {
+        if is_closure_like(ancestor) {
             closures.push(ancestor);
             continue;
         }
-        // clone: a reference count per ancestor, printing a closure's path
-        let owner = if let Some(it) = ast::Fn::cast(ancestor.clone()) {
-            Def::Function(FunctionId::try_from(cx.sema.to_def(&it)?).ok()?)
-        } else if let Some(it) = ast::Const::cast(ancestor.clone()) {
-            Def::Const(cx.sema.to_def(&it)?.into())
-        } else if let Some(it) = ast::Static::cast(ancestor.clone()) {
-            Def::Static(cx.sema.to_def(&it)?.into())
-        } else {
-            continue;
+        let owner = match ancestor.kind() {
+            SyntaxKind::FN => Def::Function(FunctionId::try_from(cx.vsema.to_def(ast::Fn::cast(ancestor)?)?).ok()?),
+            SyntaxKind::CONST => Def::Const(cx.vsema.to_def(ast::Const::cast(ancestor)?)?.into()),
+            SyntaxKind::STATIC => Def::Static(cx.vsema.to_def(ast::Static::cast(ancestor)?)?.into()),
+            _ => continue,
         };
         // alloc: the closures of the path printed, returned in it
         let mut indices = Vec::with_capacity(closures.len() + 1);
@@ -274,7 +271,7 @@ fn body_parent(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
         }
         let mut parent = ancestor;
         for closure in closures.into_iter().rev() {
-            indices.push(closure_index(&parent, &closure));
+            indices.push(closure_index(parent, closure));
             parent = closure;
         }
         return Some(Parent::Body { owner, closures: indices });
@@ -283,11 +280,10 @@ fn body_parent(cx: &Cx<'_, '_>, node: SyntaxNode) -> Option<Parent> {
 }
 
 /// Whether rustc makes a closure definition of `node`: a closure, an `async` or `gen` block.
-pub(crate) fn is_closure_like(node: &SyntaxNode) -> bool {
+pub(crate) fn is_closure_like(node: ast::Node<'_>) -> bool {
     match node.kind() {
         SyntaxKind::CLOSURE_EXPR => true,
-        // clone: a reference count, of a block only
-        SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node.clone()).is_some_and(|it| {
+        SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node).is_some_and(|it| {
             it.async_token().is_some() || it.gen_token().is_some()
         }),
         _ => false,
@@ -295,7 +291,7 @@ pub(crate) fn is_closure_like(node: &SyntaxNode) -> bool {
 }
 
 /// Whether `node` is a definition closures are numbered under: an item, or a closure.
-fn is_closure_parent(node: &SyntaxNode) -> bool {
+fn is_closure_parent(node: ast::Node<'_>) -> bool {
     ast::Item::can_cast(node.kind()) || is_closure_like(node)
 }
 
@@ -303,17 +299,17 @@ fn is_closure_parent(node: &SyntaxNode) -> bool {
 /// numbered as they are reached, outer before inner, each under the nearest item or closure
 /// around it. One walk of `parent` up to `closure`, not entering another item or closure:
 /// what is inside one is numbered under it.
-pub(crate) fn closure_index(parent: &SyntaxNode, closure: &SyntaxNode) -> u32 {
+pub(crate) fn closure_index(parent: ast::Node<'_>, closure: ast::Node<'_>) -> u32 {
     let mut index = 0;
     let mut walk = parent.preorder();
     walk.next();
     while let Some(event) = walk.next() {
         let WalkEvent::Enter(node) = event else { continue };
-        if &node == closure {
+        if node == closure {
             break;
         }
-        if is_closure_parent(&node) {
-            index += u32::from(is_closure_like(&node));
+        if is_closure_parent(node) {
+            index += u32::from(is_closure_like(node));
             walk.skip_subtree();
         }
     }
@@ -770,9 +766,7 @@ impl<'f> Decls<'f> {
             let row = *at.entry(*name.symbol()).or_insert(next);
             pairs.push((row, Decl { def, local }));
         };
-        // alloc: hir's list of the crate's dependencies, once per check
-        let deps = cx.krate.dependencies(db);
-        for krate in std::iter::once(cx.krate).chain(deps.iter().map(|it| it.krate)) {
+        for krate in std::iter::once(cx.krate).chain(cx.krate.dependencies_iter(db).map(|it| it.krate)) {
             let local = krate == cx.krate;
             for (_, data) in crate_def_map(db, krate.into()).modules(db) {
                 for id in data.scope(db).declarations() {

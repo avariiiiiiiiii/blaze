@@ -86,6 +86,7 @@ pub(super) struct LexedFile {
 pub(super) fn nfc(ident: &str) -> Cow<'_, str> {
     match ident.is_ascii() {
         true => Cow::Borrowed(ident),
+        // alloc: a non-ASCII identifier only, normalized as rustc interns it
         false => Cow::Owned(ident.nfc().collect()),
     }
 }
@@ -114,9 +115,11 @@ impl<'a> Normalized<'a> {
             None => (0, text),
         };
         if memchr::memmem::find(rest.as_bytes(), b"\r\n").is_none() {
+            // alloc: empty, allocates nothing
             return Normalized { text: Cow::Borrowed(rest), bom, removed: Vec::new() };
         }
         let mut normalized = String::with_capacity(rest.len());
+        // alloc: once per file with a `\r\n`, as rustc's source map normalizes it
         let mut removed = Vec::new();
         let mut copied = 0;
         for (at, _) in rest.match_indices("\r\n") {
@@ -251,6 +254,7 @@ impl<'a> Lexer<'a, '_> {
                 let lo = at + i as u32;
                 (c, self.range(lo, lo + c.len_utf8() as u32))
             })
+            // alloc: only once `has_text_flow_control` found one, for the lint's diagnostic
             .collect()
     }
 

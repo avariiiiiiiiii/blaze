@@ -23,12 +23,15 @@
 mod cfg;
 mod table;
 
-pub(crate) use cfg::{cfg_entry, target_compact, try_gate};
+pub(crate) use cfg::{cfg_entry, target_compact, try_gate, try_gate_target};
 
 use blaze_items::Fact;
 use hir::{HirFileId, InFile};
 use rustc_hash::FxHashMap;
-use syntax::{AstNode, SyntaxNodePtr, TextRange, WalkEvent, ast};
+use syntax::{
+    SyntaxNodePtr, TextRange, WalkEvent,
+    view::{self as ast, AstNode as _},
+};
 
 use super::{Features, allows_unstable, feature_err};
 use crate::{
@@ -60,13 +63,13 @@ pub(crate) fn stability(path: &[&str]) -> Option<Option<Gate>> {
 /// feature is not enabled and the expansion it comes from is not allowed it, at its path.
 pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr) -> Option<Diag> {
     let path = attr.meta()?.path()?;
-    let mut names: [Option<ast::NameRef>; 2] = [None, None];
+    let mut names: [Option<ast::NameRef<'_>>; 2] = [None, None];
     let mut len = 0;
     for segment in path.segments() {
         *names.get_mut(len)? = Some(segment.name_ref()?);
         len += 1;
     }
-    let segments = [segment_text(&names[0]), segment_text(&names[1])];
+    let segments = [segment_text(names[0]), segment_text(names[1])];
     let gate = stability(&segments[..len])??;
     if features.enabled(gate.feature) || allows_unstable(cx, attr.file, attr.range(), gate.feature) {
         return None;
@@ -78,6 +81,7 @@ pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr) -> Option<
         diag.children.clear();
     }
     if gate.feature == "rustc_attrs" {
+        // alloc: the error's note
         diag.note(format!("the `{name}` attribute is an internal implementation detail that will never be stable"));
     }
     for note in gate.notes {
@@ -88,7 +92,7 @@ pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr) -> Option<
 }
 
 /// A segment's name as rustc's path has it: a raw identifier's without `r#`.
-fn segment_text(name: &Option<ast::NameRef>) -> &str {
+fn segment_text(name: Option<ast::NameRef<'_>>) -> &str {
     let Some(name) = name else { return "" };
     let text = name.text();
     text.strip_prefix("r#").unwrap_or(text)
@@ -120,8 +124,10 @@ fn explain(feature: &str, name: &str) -> String {
         "thread_local" => {
             "the `thread_local` attribute is an experimental feature, and does not currently handle destructors"
         }
+        // alloc: the error's message
         _ => return format!("the `{name}` attribute is an experimental feature"),
     };
+    // alloc: the error's message
     text.to_owned()
 }
 
@@ -132,17 +138,20 @@ fn explain(feature: &str, name: &str) -> String {
 /// [`gate`]s of a macro call's attributes.
 pub(super) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], features: &Features) -> Vec<Found> {
     let calls: FxHashMap<InFile<SyntaxNodePtr>, &Owner> =
+        // alloc: setup, the macro calls' owners, once per check
         owners.iter().filter(|it| it.target == Target::MacroCall).map(|it| (it.at(), it)).collect();
+    // alloc: empty, allocates only when a gate is hit
     let mut found = Vec::new();
+    // alloc: empty, reused for every node
     let mut diags = Vec::new();
     let trees = walk.files().chain(walk.trees.iter().filter(|it| !it.in_file()));
     for tree in trees {
         let mut events = tree.root.preorder();
         while let Some(event) = events.next() {
             let WalkEvent::Enter(node) = event else { continue };
-            let at = tree.ptr(&node);
-            if let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) {
-                let kept = configure(cx, walk, features, tree.file, &owner, &mut diags);
+            let at = tree.ptr(node);
+            if let Some(owner) = ast::AnyHasAttrs::cast(node) {
+                let kept = configure(cx, walk, features, tree.file, owner, &mut diags);
                 let replaced = ast::Item::can_cast(node.kind()) && tree.replaced.contains(&node);
                 if !kept || replaced {
                     events.skip_subtree();
@@ -153,8 +162,8 @@ pub(super) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], feat
                 {
                     diags.extend(call.attrs.iter().filter_map(|attr| gate(cx, features, attr)));
                 }
-            } else if let Some(predicate) = builtin_cfg(&node) {
-                cfg::predicate(cx, features, tree.file, &predicate, &mut diags);
+            } else if let Some(predicate) = builtin_cfg(node) {
+                cfg::predicate(cx, features, tree.file, predicate, &mut diags);
             }
             for mut diag in diags.drain(..) {
                 source_fact(cx, &mut diag, at);
@@ -166,11 +175,11 @@ pub(super) fn expansion(cx: &Cx<'_, '_>, walk: &Walk<'_>, owners: &[Owner], feat
 }
 
 /// The predicate of what `cfg!` expands to: `builtin # cfg(..)`, an expression or a pattern.
-fn builtin_cfg(node: &syntax::SyntaxNode) -> Option<ast::CfgPredicate> {
-    match ast::CfgPredExpr::cast(node.clone()) {
-        Some(it) => it.cfg_predicate(),
-        None => ast::CfgPredPat::cast(node.clone())?.cfg_predicate(),
+fn builtin_cfg(node: ast::Node<'_>) -> Option<ast::CfgPredicate<'_>> {
+    if let Some(expr) = ast::CfgPredExpr::cast(node) {
+        return expr.cfg_predicate();
     }
+    ast::CfgPredPat::cast(node)?.cfg_predicate()
 }
 
 /// rustc's `flat_map_node` of `owner`'s `#[cfg]`s and `#[cfg_attr]`s, in `file`: the gates of
@@ -180,10 +189,10 @@ fn configure(
     walk: &Walk<'_>,
     features: &Features,
     file: HirFileId,
-    owner: &ast::AnyHasAttrs,
+    owner: ast::AnyHasAttrs<'_>,
     diags: &mut Vec<Diag>,
 ) -> bool {
-    ast::attrs_including_inner(owner)
+    ast::attrs_including_inner(&owner)
         .filter_map(|it| it.meta())
         .all(|meta| configure_meta(cx, walk, features, file, meta, diags))
 }
@@ -195,22 +204,22 @@ fn configure_meta(
     walk: &Walk<'_>,
     features: &Features,
     file: HirFileId,
-    mut meta: ast::Meta,
+    mut meta: ast::Meta<'_>,
     diags: &mut Vec<Diag>,
 ) -> bool {
-    while let ast::Meta::UnsafeMeta(unsafe_meta) = &meta {
+    while let ast::Meta::UnsafeMeta(unsafe_meta) = meta {
         let Some(inner) = unsafe_meta.meta() else { return true };
         meta = inner;
     }
     match meta {
         ast::Meta::CfgMeta(cfg_meta) => {
             let Some(predicate) = cfg_meta.cfg_predicate() else { return true };
-            cfg::predicate(cx, features, file, &predicate, diags);
+            cfg::predicate(cx, features, file, predicate, diags);
             holds(walk, predicate)
         }
         ast::Meta::CfgAttrMeta(cfg_attr) => {
             let Some(predicate) = cfg_attr.cfg_predicate() else { return true };
-            cfg::predicate(cx, features, file, &predicate, diags);
+            cfg::predicate(cx, features, file, predicate, diags);
             !holds(walk, predicate) || cfg_attr.metas().all(|it| configure_meta(cx, walk, features, file, it, diags))
         }
         _ => true,
@@ -219,8 +228,8 @@ fn configure_meta(
 
 /// Whether the crate's cfg makes `predicate` hold, as [`Walk::on`] evaluates it: one it cannot
 /// evaluate holds.
-fn holds(walk: &Walk<'_>, predicate: ast::CfgPredicate) -> bool {
-    walk.cfg.check(&::cfg::CfgExpr::parse_from_ast(predicate)) != Some(false)
+fn holds(walk: &Walk<'_>, predicate: ast::CfgPredicate<'_>) -> bool {
+    walk.cfg.check(&::cfg::CfgExpr::parse_from_view(predicate)) != Some(false)
 }
 
 /// The E0658 of `feature` where the parser checks the feature itself, not the expansion's
@@ -256,6 +265,10 @@ pub(crate) fn link_modifier(
     modifier: &str,
     modifiers: InFile<TextRange>,
 ) -> Option<Diag> {
+    if features.enabled("native_link_modifiers_as_needed") {
+        return None;
+    }
+    // alloc: the error's message
     let explain = format!("linking modifier `{modifier}` is unstable");
     gated(cx, features, "native_link_modifiers_as_needed", modifiers, &explain)
 }
@@ -289,6 +302,10 @@ pub(crate) fn naked_target_feature(cx: &Cx<'_, '_>, features: &Features, attr: I
 /// `#[used(compiler)]` or `#[used(linker)]` (`which`) without `used_with_arg`, at the
 /// attribute (`attr_span`).
 pub(crate) fn used_with_arg(cx: &Cx<'_, '_>, features: &Features, which: &str, attr: InFile<TextRange>) -> Option<Diag> {
+    if features.enabled("used_with_arg") {
+        return None;
+    }
+    // alloc: the error's message
     let explain = format!("`#[used({which})]` is currently unstable");
     gated(cx, features, "used_with_arg", attr, &explain)
 }

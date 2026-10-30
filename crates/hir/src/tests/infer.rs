@@ -1,21 +1,22 @@
 //! What type inference records for the diagnostics that read it: the assignment an invalid
 //! left-hand side is of, scope errors of jumps and `yield`, where a body stops being reachable,
 //! an operator's unmet predicates and a call's arguments, the goals left ambiguous, the value
-//! each path resolved to, and what a `Self: Sized` method called on a trait object picked.
+//! each path resolved to, the first segment of a path that names nothing, and what a
+//! `Self: Sized` method called on a trait object picked.
 
 use hir_def::{
-    AdtId, ItemContainerId, Lookup,
+    AdtId, GenericDefId, GenericParamId, ItemContainerId, Lookup,
     expr_store::Body,
-    hir::{ArithOp, BinaryOp, Expr, ExprId, ExprOrPatId},
+    hir::{ArithOp, BinaryOp, Expr, ExprId, ExprOrPatId, generics::GenericParams},
     resolver::ValueNs,
-    signatures::{StructSignature, TraitSignature},
+    signatures::{FunctionSignature, StructSignature, TraitSignature},
 };
 use hir_ide::{
     CastError, EditionLint, InferBodyId, InferenceDiagnostic, InferenceResult, Unreachable,
     UnreachableAt,
     method_resolution::CandidateId,
-    next_solver::{TyKind, default_types},
-    solver_errors::{StoredGoal, TypeAnnotationNeeded},
+    next_solver::{TyKind, default_types, infer::traits::ObligationCauseCode},
+    solver_errors::{SolverDiagnostic, SolverDiagnosticKind, StoredGoal, TypeAnnotationNeeded},
 };
 use rustc_type_ir::{
     InferTy,
@@ -110,7 +111,38 @@ fn tainted() {
 fn decided() {
     need::<u8>();
 }
+fn any<U>() {}
+fn unconstrained() {
+    any();
+}
 "#;
+
+/// The function and name of the parameter each `TypeMustBeKnown` of a body names as the
+/// variable's origin.
+fn origins(db: &TestDB, name: &str) -> Vec<Option<(String, String)>> {
+    let (_, result) = infer(db, name);
+    result
+        .diagnostics()
+        .iter()
+        .filter_map(|it| match it {
+            InferenceDiagnostic::TypeMustBeKnown { origin, .. } => Some(origin.as_ref().map(|&(_, param)| {
+                let GenericParamId::TypeParamId(param) = param else {
+                    panic!("the origin is a type parameter, not {param:?}");
+                };
+                let GenericDefId::FunctionId(function) = param.parent() else {
+                    panic!("the parameter is a function's");
+                };
+                let params = GenericParams::of(db, param.parent());
+                let name = params[param.local_id()].name().map(|it| it.as_str().to_owned());
+                (
+                    FunctionSignature::of(db, function).name.as_str().to_owned(),
+                    name.expect("a named parameter"),
+                )
+            })),
+            _ => None,
+        })
+        .collect()
+}
 
 /// The `TypeMustBeKnown`s of a body: their codes, and the trait of each ambiguous goal.
 fn undecided(db: &TestDB, name: &str) -> Vec<(TypeAnnotationNeeded, Option<String>)> {
@@ -150,6 +182,17 @@ fn an_ambiguous_bound_is_e0283_with_its_goal() {
 }
 
 #[test]
+fn an_undecided_variable_names_the_parameter_it_was_made_for() {
+    let db = TestDB::with_files(AMBIGUOUS);
+    crate::attach_db(&db, || {
+        // rustc: "cannot infer type of the type parameter `T` declared on the function `need`",
+        // and the same of `any`'s `U`, which only its `Sized` bound constrains.
+        assert_eq!(origins(&db, "ambiguous"), [Some(("need".to_owned(), "T".to_owned()))]);
+        assert_eq!(origins(&db, "unconstrained"), [Some(("any".to_owned(), "U".to_owned()))]);
+    });
+}
+
+#[test]
 fn a_mismatch_keeps_an_undecided_literal_type() {
     let db = TestDB::with_files(
         r#"
@@ -184,6 +227,143 @@ fn decided() {
             [Some((types.types.bool.kind(), TyKind::Infer(InferTy::FreshIntTy(0))))]
         );
         assert_eq!(at_error("decided"), [None]);
+    });
+}
+
+#[test]
+fn a_mismatch_and_an_unmet_bound_say_why_they_were_required() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized, copy
+fn else_branch(c: bool) -> u8 {
+    if c { 1u8 } else { true }
+}
+fn first_arm(x: u8) -> u8 {
+    match x { _ => true }
+}
+fn later_arm(x: u8) -> u8 {
+    match x { 0 => 1u8, 1 => loop {}, _ => true }
+}
+fn returned() -> u8 {
+    return true;
+}
+fn block_tail() {
+    let _: u8 = { true };
+}
+fn needs<T: Copy>(_: T) {}
+struct S;
+fn bound() {
+    needs(S);
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let mismatches = |name| {
+            let (_, result) = infer(&db, name);
+            result
+                .diagnostics()
+                .iter()
+                .filter_map(|it| match it {
+                    InferenceDiagnostic::TypeMismatch { cause, .. } => Some(*cause),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(mismatches("else_branch"), [ObligationCauseCode::IfExpression]);
+        assert_eq!(mismatches("first_arm"), [ObligationCauseCode::BlockTailExpression]);
+        // The `!` arm is no prior arm: rustc points at `1u8` alone.
+        assert_eq!(mismatches("later_arm"), [ObligationCauseCode::MatchExpressionArm { prior_arms: 1 }]);
+        assert_eq!(mismatches("returned"), [ObligationCauseCode::ReturnValue]);
+        assert_eq!(mismatches("block_tail"), [ObligationCauseCode::BlockTailExpression]);
+
+        // rustc: "required by a bound in `needs`".
+        let (_, result) = infer(&db, "bound");
+        let causes: Vec<_> = result
+            .diagnostics()
+            .iter()
+            .filter_map(|it| match it {
+                InferenceDiagnostic::SolverDiagnostic(SolverDiagnostic {
+                    cause,
+                    kind: SolverDiagnosticKind::TraitUnimplemented { .. },
+                    ..
+                }) => Some(*cause),
+                _ => None,
+            })
+            .collect();
+        let needs = function(&db, "needs").generic_def(&db);
+        assert!(
+            matches!(
+                causes[..],
+                [ObligationCauseCode::WhereClauseInExpr { item, arg_index: None, .. }] if item == needs
+            ),
+            "{causes:?}"
+        );
+    });
+}
+
+/// The causes of the bounds inference left unmet in `name`, in the order it found them.
+fn unmet_causes(db: &TestDB, name: &str) -> Vec<ObligationCauseCode> {
+    let (_, result) = infer(db, name);
+    result
+        .diagnostics()
+        .iter()
+        .filter_map(|it| match it {
+            InferenceDiagnostic::SolverDiagnostic(SolverDiagnostic {
+                cause,
+                kind: SolverDiagnosticKind::TraitUnimplemented { .. },
+                ..
+            }) => Some(*cause),
+            _ => None,
+        })
+        .collect()
+}
+
+/// rustc's E0277 for an unsized parameter, return type and local (`check_fn`,
+/// `GatherLocalsVisitor`; `tests/ui/unsized-locals/issue-30276.rs`, `issue-50940.rs`).
+#[test]
+fn parameters_return_types_and_bindings_must_be_sized() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+fn sized_param(x: [u8]) {}
+fn sized_ret() -> str { loop {} }
+fn sized_binding(s: &str) { let t = *s; }
+fn sized_ok(x: &[u8]) {}
+fn sized_closure_param() { let _ = |x: [u8]| {}; }
+fn sized_two(x: [u8], s: &str) { let t = *s; }
+"#,
+    );
+    crate::attach_db(&db, || {
+        use ObligationCauseCode as C;
+        assert_eq!(unmet_causes(&db, "sized_param"), [C::SizedArgumentType]);
+        assert_eq!(unmet_causes(&db, "sized_ret"), [C::SizedReturnType]);
+        assert_eq!(unmet_causes(&db, "sized_binding"), [C::LetType]);
+        assert_eq!(unmet_causes(&db, "sized_ok"), []);
+        assert_eq!(unmet_causes(&db, "sized_closure_param"), [C::SizedArgumentType]);
+        // rustc's order: the parameter, then the local.
+        assert_eq!(unmet_causes(&db, "sized_two"), [C::SizedArgumentType, C::LetType]);
+    });
+}
+
+/// `unsized_fn_params` lifts a fn's parameters but not a closure's (rustc's
+/// `tests/ui/unsized-locals/issue-67981.rs`) nor a local's.
+#[test]
+fn unsized_fn_params_lifts_only_a_fns_parameters() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized
+//- /main.rs crate:main
+#![feature(unsized_fn_params)]
+fn unsized_param(x: [u8]) {}
+fn unsized_closure_param() { let _ = |x: [u8]| {}; }
+fn unsized_binding(s: &str) { let t = *s; }
+"#,
+    );
+    crate::attach_db(&db, || {
+        use ObligationCauseCode as C;
+        assert_eq!(unmet_causes(&db, "unsized_param"), []);
+        assert_eq!(unmet_causes(&db, "unsized_closure_param"), [C::SizedArgumentType]);
+        assert_eq!(unmet_causes(&db, "unsized_binding"), [C::LetType]);
     });
 }
 
@@ -878,6 +1058,9 @@ fn call(s: dep::S) {
 fn path(s: dep::S) {
     dep::S::gated(&s);
 }
+fn field(s: dep::S) {
+    let _ = s.gated;
+}
 //- /lib.rs crate:dep
 pub struct S;
 impl S {
@@ -906,6 +1089,31 @@ fn a_probe_records_the_unstable_items_it_passed_over() {
                 panic!("the passed-over `gated` is the inherent one");
             };
         }
+    });
+}
+
+/// rustc's `method_exists_for_diagnostic`: a field access that names no field probes for a
+/// method, and its pick's unstable candidates and the method are kept under the field
+/// expression, which `unstable_candidate_nodes` lists alone.
+#[test]
+fn a_field_naming_a_method_keeps_its_probe_s_unstable_items() {
+    let db = TestDB::with_files(UNSTABLE);
+    crate::attach_db(&db, || {
+        let (body, result) = infer(&db, "field");
+        let field = find_expr(&body, |it| matches!(it, Expr::Field { .. }));
+        let nodes: Vec<_> = result.unstable_candidate_nodes().collect();
+        let [(node, [(CandidateId::FunctionId(passed), feature)])] = &nodes[..] else {
+            panic!("only the field access passed over `S::gated`, not {nodes:?}");
+        };
+        assert_eq!(*node, ExprOrPatId::ExprId(field));
+        assert_eq!(feature.as_str(), "gated");
+        let ItemContainerId::ImplId(_) = passed.lookup(&db).container else {
+            panic!("the passed-over `gated` is the inherent one");
+        };
+        let (picked, _) = result.method_resolution(field).expect("the probe picked a method");
+        let ItemContainerId::TraitId(_) = picked.lookup(&db).container else {
+            panic!("the picked `gated` is `Ext`'s");
+        };
     });
 }
 
@@ -987,5 +1195,67 @@ fn a_2018_crate_records_the_calls_the_2021_prelude_makes_ambiguous() {
         };
 
         assert!(lints("new_call").is_empty(), "a 2021 crate has the new prelude already");
+    });
+}
+
+/// rustc's late resolver on paths of more than one segment (`typeck/path-to-method-sugg-unresolved-expr.rs`).
+const UNRESOLVED_PATHS: &str = r#"
+//- minicore: sized
+mod a {
+    pub fn f() {}
+    pub struct S { pub x: u8 }
+    pub struct T(pub u8);
+    pub struct B { pub x: u8 }
+}
+struct Ty;
+impl Ty {}
+fn prefix() { let _n = page_size::get(); }
+fn middle() { a::nothere::f(); }
+fn last() { a::nothere(); }
+fn found() { a::f(); }
+fn assoc() { Ty::nope(); }
+fn other_namespace() { let _b = a::B; }
+fn literal() { let _q = a::Q { x: 1 }; }
+fn literal_found() { let _s = a::S { x: 1 }; }
+fn single_literal() { let _n = Nope {}; }
+fn tuple_pattern(v: a::T) { let a::U(_) = v; }
+fn record_pattern(v: a::S) { let a::R { .. } = v; }
+fn ident() { nope; }
+"#;
+
+#[test]
+fn a_path_that_names_nothing_reports_its_first_failing_segment() {
+    let db = TestDB::with_files(UNRESOLVED_PATHS);
+    crate::attach_db(&db, || {
+        let segments = |name: &str| -> Vec<u32> {
+            let (_, result) = infer(&db, name);
+            result
+                .diagnostics()
+                .iter()
+                .filter_map(|it| match *it {
+                    InferenceDiagnostic::UnresolvedPath { segment, .. } => Some(segment),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(segments("prefix"), [0], "`page_size` is E0433");
+        assert_eq!(segments("middle"), [1], "`nothere` in `a` is E0433");
+        assert_eq!(segments("last"), [1], "the last segment is E0425");
+        assert_eq!(segments("found"), []);
+        assert_eq!(segments("assoc"), [], "an unknown associated item is E0599's");
+        assert_eq!(segments("other_namespace"), [], "a struct used as a value is E0423's");
+        assert_eq!(segments("literal"), [1]);
+        assert_eq!(segments("literal_found"), []);
+        assert_eq!(segments("single_literal"), [0]);
+        assert_eq!(segments("tuple_pattern"), [1]);
+        assert_eq!(segments("record_pattern"), [1]);
+        assert_eq!(segments("ident"), [], "one identifier stays `UnresolvedIdent`");
+        let (_, ident) = infer(&db, "ident");
+        assert!(
+            ident
+                .diagnostics()
+                .iter()
+                .any(|it| matches!(it, InferenceDiagnostic::UnresolvedIdent { .. }))
+        );
     });
 }

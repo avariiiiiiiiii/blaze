@@ -17,20 +17,21 @@ mod trace;
 use std::{fmt, fmt::Write as _, sync};
 
 use base_db::{Db, Crate, all_crates};
+use blaze_mem::Tag;
 use either::Either;
 use hir_expand::{
     AstId, ErasedAstId, InFile, MacroCallId,
     attrs::AttrId,
     name::Name,
     proc_macro::{
-        CustomProcMacroExpander, ProcMacro, ProcMacroExpander, ProcMacroExpansionError,
-        ProcMacroKind,
+        CustomProcMacroExpander, ProcMacro, ProcMacroCall, ProcMacroExpander,
+        ProcMacroExpansionError, ProcMacroKind,
     },
 };
 use intern::Symbol;
 use la_arena::Idx;
 use rustc_hash::{FxHashMap, FxHashSet};
-use span::{Edition, Span};
+use span::Edition;
 use syntax::ast;
 use test_fixture::ChangeFixture;
 use test_utils::MiniCore;
@@ -86,8 +87,10 @@ pub(super) fn old_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
 /// The crate's def map as the per-module resolver makes it, without `frozen`.
 #[salsa::tracked(returns(ref))]
 pub(super) fn new_crate_local_def_map(db: &Db, krate: Crate) -> DefMapPair<'_> {
-    let (def_map, local_def_map) = super::collect_crate(db, krate);
-    DefMapPair::new(db, def_map, local_def_map)
+    blaze_mem::frame::task(Tag::Nameres, |frame| {
+        let (def_map, local_def_map) = super::collect_crate(db, frame, krate);
+        DefMapPair::new(db, def_map, local_def_map)
+    })
 }
 
 /// The empty def map of `block` that `block_def_map` starts from, and the tree it collects.
@@ -133,10 +136,12 @@ pub(super) fn new_block_def_map<'db>(
     db: &'db Db,
     block_id: BlockIdLt<'db>,
 ) -> DefMap {
-    let (def_map, tree_id) = empty_block_def_map(db, block_id);
-    let krate = def_map.krate;
-    let local = crate_local_def_map(db, krate).local(db);
-    super::collect_block(db, def_map, tree_id, local)
+    blaze_mem::frame::task(Tag::Nameres, |frame| {
+        let (def_map, tree_id) = empty_block_def_map(db, block_id);
+        let krate = def_map.krate;
+        let local = crate_local_def_map(db, krate).local(db);
+        super::collect_block(db, frame, def_map, tree_id, local)
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -679,7 +684,7 @@ impl<'a> Projector<'a> {
                 impls
                     .iter()
                     .enumerate()
-                    .map(|(at, &it)| (self.impl_(it), trait_impl.get(at), reservation_impl.get(at)))
+                    .map(|(at, &it)| (self.impl_(it), trait_impl.contains(at), reservation_impl.contains(at)))
                     .collect(),
             ),
             builtin_derive_impls: sorted(
@@ -705,7 +710,7 @@ impl<'a> Projector<'a> {
                             CItem {
                                 def: (),
                                 vis: self.vis(vis),
-                                import: import.map(|it| self.import_id(it)),
+                                import: import.map(|it| self.import_or_extern_crate(it)),
                             },
                         )
                     })
@@ -872,14 +877,18 @@ pub(super) fn project<'a>(
         modules: _,
         prelude,
         macro_use_prelude,
-        derive_helpers_in_scope,
+        // Empty once handed over: read below from the records.
+        derive_helpers_in_scope: _,
         session_macros,
         // Compared without ids by `driver.rs`'s `name_records_equal_the_old_ones`.
         names: _,
-        diagnostics,
-        diagnostics_by_module,
+        diagnostics: _,
+        diagnostics_by_module: _,
+        records: _,
         data,
     } = def_map;
+    let super::super::Records { diagnostics, diagnostics_by_module, derive_helpers_in_scope, .. } =
+        def_map.records(db);
     let p = Projector::new(db, def_map);
 
     let mut by_module: FxHashMap<ModuleId, Vec<&DefDiagnosticKind>> = FxHashMap::default();
@@ -1126,13 +1135,7 @@ impl ProcMacroExpander for IdentityWhenValid {
     fn expand(
         &self,
         _: &Db,
-        subtree: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &base_db::Env,
-        _: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         let (parse, _) = syntax_bridge::token_tree_to_syntax_node(
             subtree,
@@ -1140,7 +1143,7 @@ impl ProcMacroExpander for IdentityWhenValid {
             &mut |_| Edition::CURRENT,
         );
         if parse.errors().is_empty() {
-            Ok(subtree.clone())
+            Ok(subtree.copy())
         } else {
             Err(ProcMacroExpansionError::Panic(format!(
                 "got invalid macro input: {:?}",
@@ -1149,6 +1152,7 @@ impl ProcMacroExpander for IdentityWhenValid {
         }
     }
 
+    // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
         other.type_id() == std::any::TypeId::of::<Self>()
     }

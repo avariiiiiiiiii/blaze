@@ -1,0 +1,95 @@
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use blaze_core::{
+    FileName, run_until_idle,
+    sim::{Faults, Sim},
+};
+
+use super::*;
+
+fn opened(sim: &mut Sim) -> blaze_cas::Store {
+    let config = blaze_cas::Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 40 };
+    let mut effects = Vec::new();
+    let mut store = blaze_cas::Store::open(config, &mut effects);
+    run_until_idle(sim, &mut effects, |completion, effects| {
+        if store.owns(completion.tag) {
+            store.complete(completion, effects);
+        }
+    });
+    assert!(store.ready(), "{:?}", store.broken());
+    store
+}
+
+fn key(n: u8) -> ContentId {
+    ContentId::of("blaze v2 serve deps test", &[n])
+}
+
+#[test]
+fn an_image_is_put_once_for_the_loop_and_other_bytes_under_its_key_are_an_error() {
+    let mut sim = Sim::new(1, Faults::default());
+    let mut store = opened(&mut sim);
+    let reader = store.reader();
+    let images = Images::new(reader.clone());
+    assert!(images.get(&key(1)).unwrap().is_none());
+    images.put(key(1), b"image one".to_vec()).unwrap();
+    images.put(key(1), b"image one".to_vec()).unwrap();
+    assert!(images.put(key(1), b"another".to_vec()).unwrap_err().contains("two images"));
+    images.put(key(2), b"image two".to_vec()).unwrap();
+    let puts = images.take_puts();
+    assert!(images.take_puts().is_empty(), "a take empties what was asked for");
+    let keys: Vec<Key> = puts.iter().map(|it| it.key).collect();
+    assert_eq!(keys, [Key(key(1)), Key(key(2))]);
+    assert!(puts.iter().all(|it| it.kind == Kind::Query));
+
+    // Once the loop has put them, they are read in place and not asked for again.
+    for put in puts {
+        store.put(put.key, put.kind, put.bytes).unwrap();
+    }
+    let images = Images::new(reader);
+    let found = images.get(&key(1)).unwrap().expect("put by the loop");
+    assert_eq!(found.bytes(), b"image one");
+    images.put(key(2), b"image two".to_vec()).unwrap();
+    assert!(images.put(key(2), b"changed".to_vec()).unwrap_err().contains("other bytes"));
+    assert!(images.puts.into_inner().unwrap().is_empty());
+}
+
+#[test]
+fn blaze_dep_images_is_check_verify_or_unset() {
+    let env = |value: &str| vec![("PATH".to_owned(), "/bin".to_owned()), (IMAGES.to_owned(), value.to_owned())];
+    assert_eq!(mode_in(&[]).unwrap(), Mode::Serve);
+    assert_eq!(mode_in(&env("check")).unwrap(), Mode::Check);
+    assert_eq!(mode_in(&env("verify")).unwrap(), Mode::Verify);
+    let error = mode_in(&env("off")).unwrap_err();
+    assert!(error.what.starts_with("BLAZE_DEP_IMAGES=off is not a value blaze takes"), "{}", error.what);
+}
+
+#[test]
+fn a_build_that_serves_is_never_failed_for_differences() {
+    let kept = Kept { served: Served::default(), mode: Mode::Serve };
+    assert!(differences(&kept).is_ok());
+}
+
+#[test]
+fn every_task_of_a_batch_runs_once_on_the_pool() {
+    let ran: Vec<AtomicU32> = (0..200).map(|_| AtomicU32::new(0)).collect();
+    on_pool(ran.len(), &|at| _ = ran[at].fetch_add(1, Ordering::Relaxed));
+    assert!(ran.iter().all(|it| it.load(Ordering::Relaxed) == 1));
+    on_pool(0, &|_| panic!("no task to run"));
+}
+
+#[test]
+fn a_task_that_would_wait_on_itself_runs_again_and_another_panic_goes_on() {
+    let ran: Vec<AtomicU32> = (0..8).map(|_| AtomicU32::new(0)).collect();
+    on_pool(ran.len(), &|at| {
+        if ran[at].fetch_add(1, Ordering::Relaxed) == 0 && at % 3 == 0 {
+            std::panic::panic_any(salsa::Cancelled::WouldWaitOnItself);
+        }
+    });
+    let runs: Vec<u32> = ran.iter().map(|it| it.load(Ordering::Relaxed)).collect();
+    assert_eq!(runs, [2, 1, 1, 2, 1, 1, 2, 1]);
+
+    let caught = std::panic::catch_unwind(|| on_pool(4, &|at| assert_ne!(at, 2, "crate two")));
+    let panic = caught.expect_err("the panic goes on");
+    let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or_default();
+    assert!(message.contains("crate two"), "{message}");
+}

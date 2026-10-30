@@ -73,6 +73,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 `mod db;` after `pub(crate) mod db;`, so the budget tests use the same test database.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: Cargo.toml and lib.rs as written; `blaze-alloc-count` goes after `test-fixture` (there is no `hir-ide` dev dependency). `scan.rs`/`scan/tests.rs` (`pub(crate) mod tests`, `pub(crate) mod db`) are not mine: not applied. lib.rs also declares `mod decode;`, `mod places;`, `mod rows;` and `#[cfg(test)] mod differential;` for frontend-fast-borrowck.
 
 ## B1. `crates/hir-ty-borrowck/src/mem.rs` (new)
 
@@ -158,10 +159,12 @@ a frame map of indices where it is looked up), which is rustc's own `FxIndexMap`
 only looked up changes nothing.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/mem.rs (every alias and helper, plus `ExactLen`).
 
 ## B2. The core containers
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:33): B2.1-B2.5 applied below, each with its own line.
 
 ### B2.1 `crates/hir-ty-borrowck/src/bitset.rs`
 
@@ -338,6 +341,7 @@ Tests (lines 207-281): each test body runs in `blaze_mem::frame::task(blaze_mem:
 (The first two allocations warm the frame's reservation, made once per thread and depth.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written.
 
 ### B2.2 `crates/hir-ty-borrowck/src/relation.rs`
 
@@ -595,6 +599,7 @@ Tests: in `frame::task(Tag::Mir, |frame| ..)`; `Facts::default()` -> `Facts::new
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: `relation.rs` had moved to `blaze_ids::radix::Csr`, whose `group_into` takes global `Vec`s and no allocator, so B2.2's own frame counting sort replaces it in `build`, `rebuild` and `freeze`; the `starts`/`rewind` helpers the text calls were gone and are written again (`starts` asserts each node is below the count). Extra test: `Csr::build` equals `blaze_radix::Csr::build` on random pairs.
 
 ### B2.3 `crates/hir-ty-borrowck/src/dataflow.rs`
 
@@ -729,6 +734,13 @@ GenKill<'f>`. The naive reference versions keep their global `Vec`s: they are th
 oracle, not the code under test.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+
+> applied by frontend-fast-borrowck, differently: `dataflow.rs` is rewritten as a difference
+> fixpoint over frame row stores (`rows.rs`: `Effects<'f>` replaces `GenKill`, `Rows<'f>`
+> replaces the `BitMatrix` result, `Edge` replaces the edge callback); `forward(frame, cfg,
+> &Effects, start, boundary: &[u64], edge: FnMut(from, to) -> Edge) -> Rows<'f>`,
+> `backward(frame, cfg, &Effects, edge) -> Rows<'f>`. All of it allocates from the frame. See
+> `docs/v2/plan/lanes/frontend/fast-borrowck.md` 3.1-3.2.
 
 ### B2.4 `crates/hir-ty-borrowck/src/cfg.rs`
 
@@ -912,6 +924,7 @@ collect, filled, set, FSet};`. Tests: `Dominators::of_graph(frame, count, ..)` i
 asked only while an error is explained.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written, kept lane db's `terminator.kind.all_successors()` in `Cfg::new` (its `successors` helper is gone).
 
 ### B2.5 `crates/hir-ty-borrowck/src/intervals.rs`
 
@@ -1121,6 +1134,8 @@ Add the budget test:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (2026-10-29 21:55): as written. The `smallvec` import goes; each
+> test runs in `frame::task(Tag::Mir, ..)`.
 
 ## B3. Lifetimes
 
@@ -1132,10 +1147,12 @@ result and the scan it holds already bound. Existing lifetimes named `'f` (`live
 `Effects<'f>`, line 50) are renamed `'e`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: for bitset.rs, relation.rs, cfg.rs, lib.rs, polonius.rs. `Ctx.scan` (and `Ctx::new`'s `scan`) is `&'a scan::Scan<'a, 'db>`, which B4.4 does not say; `Scan` is covariant in its frame lifetime, so the owner's scan passes.
 
 ## B4. The entry points: `crates/hir-ty-borrowck/src/lib.rs`
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:33): B4.1-B4.7 applied below by frontend-fast-borrowck-frame.
 
 ### B4.1 The queries take the run's frame
 
@@ -1190,6 +1207,7 @@ point a checker's entry may become `current`; it is not needed for the budget (T
 `use crate::mem::Frame;` with the other imports.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written, but `borrowck_anon_const`'s two early returns that allocate nothing (inline const, `Mode::Off`) stay outside the task.
 
 ### B4.2 `check_owner`: one task per body, what crosses bodies in the owner's frame
 
@@ -1405,6 +1423,7 @@ impl<I: Iterator> ExactSizeIterator for ExactLen<I> {}
 made once, when MIR lowering refuses a body.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written; `check::check` is called with B7's signature, `scan::Scan::new(frame, ..)` with B5.7's.
 
 ### B4.3 `coroutines`, `inline_consts`, `nested_bodies_written`
 
@@ -1498,6 +1517,7 @@ fn nested_bodies_written<'db>(
 (`stack` is the only allocation per call; one per body, in the owner's frame.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written.
 
 ### B4.4 `Ctx` (lines 617-726)
 
@@ -1556,6 +1576,7 @@ here: its tables do not come from the body's frame but are recycled per worker
 (`v2/requests/mem-db-solver.md` request 5), so nothing is threaded into it.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: `ArenaMap` has no `len()`, so `bindings.reserve(body.binding_locals.values().count())`. `Ctx` also gets `places: RefCell<places::Places<'a, 'db>>` (`Places::new(frame, body)`), and `place_ty` goes through `Ctx::place`, for frontend-fast-borrowck.
 
 ### B4.5 `normalized_env` (lines 889-912)
 
@@ -1576,6 +1597,7 @@ after (`env.clauses().iter()` is a copied slice iterator mapped, so it says its 
 It runs in the body's task (from `Ctx::new`), so `current` is the body's frame.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written.
 
 ### B4.6 `debugging` (lines 90-98)
 
@@ -1599,6 +1621,7 @@ pub(crate) fn debugging(db: &Db, owner: InferBodyId<'_>) -> bool {
 (the `match` after it compares `wanted` as a `&str` already: `wanted != "1"`, `== wanted`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written.
 
 ### B4.7 `drops_in_const` (lines 475-512)
 
@@ -1617,6 +1640,7 @@ and line 508 `!moved.contains(&place.local)` ->
 `!moved.contains(place.local.into_raw().into_u32() as usize)`; `use crate::bitset::BitSet;`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written.
 
 ## B5. The analyses
 
@@ -1643,6 +1667,7 @@ Signatures B6 (regions.rs) and B7 (check.rs) call, after this part:
 `'a` is `Ctx<'a, 'db>`'s: the body's task's frame.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:33): B5.1-B5.9 applied below, each with its own line.
 
 ### B5.1 `liveness.rs`
 
@@ -1948,6 +1973,18 @@ analyses over all locals, a value per region, the order of points and the drop c
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+> applied by frontend-fast-borrowck-facts: liveness.rs on the frame as above, with these
+> differences. `region_liveness(ctx, body, &cfg, &decoded, &moves, &regions, count)` takes the
+> decode (`decode.rs`); the uses and defs of each point are its columns, and the `Facts` here
+> hold only the callee reads and the drops of what may be initialized (`READ`, `DROP`), so
+> `Effects`/`effects_at`/`place_uses`/`operand_uses`/`assigned` are gone. `live_ranges` and
+> `maybe_initialized_at_drops` run on `rows::Effects` and `dataflow::backward`/`forward` (not
+> `GenKill`), their edges `rows::Edge`; `InitAtExit::restrict` is `InitAtExit::edge` (an
+> `Edge::Mask` of the exit or return row, `Edge::Nothing` from a block not reached), its
+> `returns_to` the decode's `returns: &'f [u32]`. `DropComponents` has a fourth lifetime for
+> `Regions<'r, 'db>`; `live_regions_of`'s `Visit` one for its output vector. Calls
+> `regions_of(ty, &mut FVec)` and `opaque_captures(frame, ..)` of R8.
+
 ### B5.2 `loans.rs`
 
 Per body: the loans, their projections, three relations; per loan, `out_of_scope`'s walk; per
@@ -2248,6 +2285,18 @@ point of a body with a two-phase borrow, a list of used locals.
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+> applied by frontend-fast-borrowck-facts: loans.rs on the frame as above, with these
+> differences. `Loans::gather(ctx, body, &cfg, &decoded, &regions, unique)` reads the decode's
+> borrows, constants, temporaries' definitions, writes, `StorageDead`s and two-phase reads
+> instead of the statements (same order: reverse postorder, statement order, operand order);
+> `static_locals(frame, &decoded)`, `extended_temporaries`, `const_promoted`, `certain_blocks`
+> and `promoted_borrows` take `&decoded` too (`promoted_borrows`' `defs` map is the decode's
+> `temp_of`). `Loans` keeps beside each loan's projection the `PlaceId` of each prefix
+> (`prefixes`), so `ignored` and `places_conflict` read the place-type column instead of
+> projecting again. `entry_sets` returns `rows::Rows<'a>` (`Dense` of no words when there is no
+> loan) from `dataflow::forward` over `rows::Effects`. `ScopeWalk`, `promotes`, `plain_value`
+> and `const_promotable` as above.
+
 ### B5.3 `moves.rs`
 
 Per body: the move-path tree's six columns, its map of steps, the moves and inits, the
@@ -2363,6 +2412,18 @@ preorder columns and the facts.
 
 > forwarded to db (from requests, pass 16; told by tmux).
 
+> applied by frontend-fast-borrowck-facts: moves.rs on the frame as above, with these
+> differences. `MoveData::gather(ctx, body, &cfg, &decoded)` reads the decode's moves, writes
+> and `StorageDead`s, a point's moves then its `StorageDead` then its writes (rustc's move
+> numbering); whether an operand moves (`is_copy`, `moves_out_of_guard`, the cast) is asked here
+> as before. The tree steps through `ctx.places` (parent, element, type per `PlaceId`) with a
+> memo of each place's `Lookup`, kept after `freeze` for `find`, which goes through
+> `ctx.place(local, projection)`. `MoveData` also keeps the decode's `dead`, `returns`,
+> `terminated`. `InitFlow<'f>`'s rows are `rows::Rows<'f>`, from `dataflow::forward` over
+> `rows::Effects`, a call's return an `Edge::Effect` of a row per call; `returns_to` is
+> replaced by a per-block row index (`call_of`). `freeze` takes `frame`, keeps `renumbered` a
+> frame vector and leaks it for `locals`.
+
 ### B5.4 `polonius.rs`
 
 Per body in `Polonius` mode: a direction per region, two CSRs over the constraints, and per
@@ -2445,6 +2506,7 @@ loan a walk with a visited set per region it reaches.
 - Imports: add `use crate::mem::{FVec, filled};`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by frontend-fast-borrowck-frame: as written; `for loan in loans.loans.iter()`; also the opaque captures' variances (`record_variances`) are collected into `ctx.frame` rather than a global `Vec`.
 
 ### B5.5 `inference.rs`
 
@@ -2530,6 +2592,7 @@ members CSR.
 - Imports: `use super::bitset::BitSet; use crate::mem::{FVec, Frame, filled};`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (21:36): as written, on -frame's `BitSet`/`BitMatrix`/`Csr` (`Csr::build(frame, ..)`, `Csr::with_capacity(frame, ..)`). Callers in regions.rs (B6) pass the frame.
 
 ### B5.6 `constraints.rs`
 
@@ -2631,6 +2694,7 @@ Iter<'a, 'f>; .. }`, `iter(&self) -> Iter<'_, 'f>`. Line 6 `use std::cell::OnceC
 `frame::task(Tag::Mir, |frame| ..)`, `Constraints::default()` -> `Constraints::new(frame)`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (21:36): as written; `of_sup` rebuilds the spare graph with -frame's `Csr::rebuild(&mut self, nodes, pairs)` and builds a new one with `Csr::build(*self.sup.allocator(), ..)`. The test's body moved into a helper `a_constraint_reads_back_in(frame)` that the `frame::task` calls.
 
 ### B5.7 `scan.rs`
 
@@ -2728,6 +2792,7 @@ Once per owner, in the owner's frame (B4.2).
   The vector comparisons (`scan.lets == want`) hold across allocators as they are.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (21:36): as written, with B0's `pub(crate) mod tests;` in scan.rs and `pub(crate) mod db;` in scan/tests.rs. `check`'s body is a helper `check_in(frame, db, def, seen)` that the `frame::task` calls.
 
 ### B5.8 `qualifs.rs`
 
@@ -2764,6 +2829,7 @@ Once per owner, in the owner's frame (B4.2).
   `FnOnce` serves.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (21:36): as written. The map's other maker, loans.rs line 164 `consts: &Default::default()`, has no `Default` for an `FMap`: it is B5.3's (frontend-fast-borrowck), told.
 
 ### B5.9 `timings.rs`
 
@@ -2771,6 +2837,7 @@ Nothing per run: its thread-local `RefCell<Option<Timings>>` is a measurement's,
 caller that asks for timings.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (21:36): nothing to change, as it says.
 
 ## W. `crates/hir-ty-wfcheck/`
 
@@ -2779,6 +2846,7 @@ Tag `Infer`. `wfcheck` and `inferred_outlives` are queries; each opens a `frame:
 code under them takes it through the `Check` and `Wfcx` that hold it.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:33): W0-W4 applied below by db-mem-borrowck.
 
 ### W0. Setup
 
@@ -2802,6 +2870,9 @@ code under them takes it through the `Check` and `Wfcx` that hold it.
   line 5 `mod db;` -> `pub(crate) mod db;` (the budget tests use its `TestDB`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (2026-10-29 21:40): as written; `hashbrown` first in
+> `[dependencies]`, `blaze-mem` after `blaze-format`. `mem.rs`'s test makes its 70-item frame
+> vector with `collect(frame, repeat_n(7, 70))`, as `filled` is left out, and runs under `Tag::Infer`.
 
 ### W1. `lib.rs`
 
@@ -3023,6 +3094,10 @@ predicate checked) is a `Symbol` clone, a reference count, not an allocation: un
 Imports: `use crate::mem::{self, FVec}; use blaze_mem::frame::Frame;`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (2026-10-29 21:40): every row, at lines about 10 below those
+> given. `errors` stays a global `Vec<Vec<Region>>` with the `// alloc:` line, since hir-ty's
+> `regions` still takes `&[Vec<Region>]`. The `function` per-input `found` is hoisted
+> once above the `for` and drained into `needs`. `bound_site`'s `Name` clone has a `// clone:` line.
 
 ### W2. `outlives.rs`
 
@@ -3217,6 +3292,8 @@ the calls on it). The long-term fix is a per-worker `Scratch<Component>` that `c
 fills and its callers read before calling it again; it is listed in the notes as open.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (2026-10-29 21:40): as written. The `Find`/`Walk` structs declare
+> their own `A: Allocator`, since an inner item can't name the function's.
 
 ### W3. `compare.rs`
 
@@ -3262,6 +3339,8 @@ fills and its callers read before calling it again; it is listed in the notes as
 - Line 20 `use smallvec::SmallVec;` goes if nothing else in the file uses it (it does not).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (2026-10-29 21:40): as written. The now-unused `Clause` import
+> goes as well.
 
 ### W4. `persist.rs`
 
@@ -3270,6 +3349,8 @@ The edge (the memo written to the store and read back): `to_result` (line 73) is
 persisted form, once per write` on each. Unchanged otherwise.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (2026-10-29 21:40): the two `// alloc:` lines on `write`'s
+> collects, plus one on `to_result`'s `to_owned` (the edge), which the hot lint flags.
 
 ## S. Per-call buffers, reused
 
@@ -3298,10 +3379,12 @@ and cleared per use:
 | wfcheck `variants`, compare `own`/`synthetic`/`hybrid` | call: a `SmallVec` | iterators (W2, W3) |
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:33): a table of the B2/B5/W rows, each applied with its section; e.g. `ScopeWalk` at crates/hir-ty-borrowck/src/loans.rs:772.
 
 ## T. Budget tests
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:33): T1 and T2 below.
 
 ### T1. `crates/hir-ty-borrowck/src/budget.rs` (new)
 
@@ -3490,6 +3573,7 @@ body reads the memo and makes the `Checked` view; a refused body's `Refused` clo
 errors, its error path.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-audit-mem (22:33): crates/hir-ty-borrowck/src/budget.rs had frontend-fast-borrowck's tests (clean, large, errors, asking again, the fixpoint) but not T1's last two: added `an_edit_to_another_file_allocates_nothing_to_answer_again` and `a_passing_gate_allocates_nothing`, on that file's `Db` and `functions -> (name, def)`, the gate test on its `TYPICAL` fixture in place of `CLEAN`.
 
 ### T2. `crates/hir-ty-wfcheck/src/budget.rs` (new)
 
@@ -3577,6 +3661,8 @@ and solver allocating nothing once warm (tables recycled per worker, mem-db-solv
 (mem-db-salsa).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-borrowck (2026-10-29 21:40): `crates/hir-ty-wfcheck/src/budget.rs` as
+> written. The test's own `Vec` gets an `// alloc:` line for the hot lint.
 
 ## Asks of others
 
@@ -3597,3 +3683,81 @@ and solver allocating nothing once warm (tables recycled per worker, mem-db-solv
   keeps B2.1's frame words, so T1's zero global allocations hold.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-mem (22:33): in the tree: `frame::current` (blaze-mem), salsa M1/M2 (`vendor/salsa/src/function/execute.rs` `frame::task(C::MEM_TAG, ..)`), `ElidedLifetimes::regions_into<E: AsRef<[Region]>>` at crates/hir-ty/src/lower.rs:4169, dedup bits applied (db.md); the rest are notes.
+
+## frontend-fast-bodies-cache-bodies, for db-mem-borrowck: a served verdict in the gate, and the served tests (2026-10-29)
+
+Items 6 and 7 of `v2/requests/db.md` / `db-ty.md` "frontend-fast-bodies-cache-bodies: served
+dependency bodies, relocated ids and two hooks"; db-ty says hir-ty-borrowck is yours. hir-ty's
+side (`pub mod check_cache`, the persist edits, the `infer_body_query` hook) is in the tree or
+being applied by db-apply-late.
+
+### 1. `crates/hir-ty-borrowck/src/gate.rs`
+
+Old:
+
+```rust
+pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
+    verdict(def, borrowck(db, def))?;
+    Ok(Checked { owner: def, _revision: PhantomData })
+}
+```
+
+New:
+
+```rust
+pub fn checked(db: &Db, def: DefWithBodyId) -> Result<Checked<'_>, Refused> {
+    if !hir_ty::check_cache::served_passed(db, def) {
+        verdict(def, borrowck(db, def))?;
+    }
+    Ok(Checked { owner: def, _revision: PhantomData })
+}
+```
+
+Why: a dependency's body served from its image carries the verdict the driver's borrow check
+gave when the part was written (`check_cache::encode`'s `passed`); `served_passed` is `false`
+with nothing served (one `try_get` of a singleton input) and for any body not recorded as passed.
+
+### 2. `crates/hir-ty-borrowck/src/lib.rs`
+
+Old:
+
+```rust
+#[cfg(test)]
+mod differential;
+```
+
+New:
+
+```rust
+#[cfg(test)]
+mod differential;
+#[cfg(test)]
+mod served;
+```
+
+`src/served.rs` is written (mine): a served body's MIR equals the MIR of its own inference, and
+`two_mut` (a borrow error) fails `checked` unserved, passes served as passed, fails served as not.
+
+### 3. `crates/hir-ty-borrowck/Cargo.toml`, `[dev-dependencies]`
+
+Old:
+
+```toml
+[dev-dependencies]
+test-fixture.workspace = true
+blaze-alloc-count.workspace = true
+```
+
+New:
+
+```toml
+[dev-dependencies]
+test-fixture.workspace = true
+blaze-alloc-count.workspace = true
+blaze-format.workspace = true
+```
+
+Why: the test hands a part over as an `Aligned`, the one `Held`.
+
+Status: open

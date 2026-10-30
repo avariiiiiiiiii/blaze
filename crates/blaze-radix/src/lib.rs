@@ -119,6 +119,9 @@ pub const fn pack_64(high: u64, low: u64) -> u128 {
 pub unsafe trait Workers: Sync {
     /// How many jobs run at once.
     fn threads(&self) -> usize;
+    // A pool hands each job to its threads type-erased, so a generic `job` would only be erased
+    // there, after a copy of the pool's `run` per closure.
+    // dyn: one call per job, a chunk of at least `MIN_CHUNK` items.
     fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync));
 }
 
@@ -132,6 +135,7 @@ unsafe impl Workers for Serial {
         1
     }
 
+    // dyn: the trait's signature, see `Workers::run`.
     fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
         (0..jobs).for_each(job);
     }
@@ -139,6 +143,7 @@ unsafe impl Workers for Serial {
 
 /// Gives `with` the workers of the pool the calling thread works for, and says whether there
 /// was one (it does not call `with` when not).
+// dyn: this crate is below the pool's and can't name it; asked once per sort from `PARALLEL` items.
 pub type Ambient = fn(with: &mut dyn FnMut(&dyn Workers)) -> bool;
 
 static HOOK: OnceLock<Ambient> = OnceLock::new();
@@ -152,6 +157,7 @@ pub fn set_ambient(hook: Ambient) {
 /// Sorts with the given workers, or the calling thread's ([`Radix::AMBIENT`]).
 #[derive(Clone, Copy)]
 pub struct Radix<'a> {
+    // dyn: as `Ambient`'s, which gives the same; used once per sort from `PARALLEL` items.
     workers: Option<&'a dyn Workers>,
 }
 
@@ -161,6 +167,7 @@ impl Radix<'static> {
 }
 
 /// Sorts on `workers` from [`PARALLEL`] elements.
+// dyn: see `Radix::workers`.
 pub fn on(workers: &dyn Workers) -> Radix<'_> {
     Radix { workers: Some(workers) }
 }
@@ -263,6 +270,7 @@ impl Radix<'_> {
         }
         if n >= PARALLEL {
             let mut done = false;
+            // dyn: see `Radix::workers`.
             let mut go = |workers: &dyn Workers| {
                 if workers.threads() > 1 {
                     parallel(items, key, workers, &mut *scratch);
@@ -568,6 +576,7 @@ fn changed() -> ! {
 fn parallel<E: Copy + Send + Sync, K: Key>(
     items: &mut [E],
     key: &(impl Fn(&E) -> K + Sync),
+    // dyn: see `Radix::workers`; `run` once per pass.
     workers: &dyn Workers,
     scratch: &mut Vec<E>,
 ) {

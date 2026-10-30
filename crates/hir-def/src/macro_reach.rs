@@ -12,8 +12,9 @@
 //! [`MacroReachable::update_from_macro`] is one pass's visit of it.
 
 use base_db::Db;
+use blaze_mem::frame::Frame;
 use hir_expand::MacroDefKind;
-use rustc_hash::FxHashSet;
+use rustc_hash::FxBuildHasher;
 use span::Transparency;
 
 use crate::{
@@ -69,14 +70,22 @@ pub enum Reached {
 }
 
 /// rustc's `macro_reachable`: the pairs of a module walked and the macro's module it was walked
-/// for, kept across the macros and the passes of one fixpoint.
-#[derive(Debug, Default)]
-pub struct MacroReachable {
-    walked: FxHashSet<(ModuleId, ModuleId)>,
-    stack: Vec<ModuleId>,
+/// for, kept across the macros and the passes of one fixpoint, in the frame of the run that
+/// holds the fixpoint.
+#[derive(Debug)]
+pub struct MacroReachable<'f> {
+    walked: hashbrown::HashSet<(ModuleId, ModuleId), FxBuildHasher, &'f Frame>,
+    stack: Vec<ModuleId, &'f Frame>,
 }
 
-impl MacroReachable {
+impl<'f> MacroReachable<'f> {
+    pub fn new_in(frame: &'f Frame) -> MacroReachable<'f> {
+        MacroReachable {
+            walked: hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame),
+            stack: Vec::new_in(frame),
+        }
+    }
+
     /// One pass's visit of a macro public at some level, made from `defining`, the module
     /// [`macro_reach_module`] gave: walks `defining` the first time, and the first ancestor not
     /// yet walked for it in each later pass, up to the crate root.

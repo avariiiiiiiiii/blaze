@@ -7,36 +7,34 @@
 //! const context. A build reaches the rest of a dependency's bodies only through codegen of the
 //! instances it compiles.
 //!
-//! The unit of work is a file module with the inline modules written in it ([`check_module`]).
-//! The modules of a check go to the database as one batch ([`Db::run_all`]), which
-//! runs them as plane tasks over the one database; each task's diagnostics go in its module's
-//! slot, and the result is read in the def maps' order, so it is the same whatever order the
-//! tasks ran in.
+//! The work is one plane task per body and one per file module for its items' checks
+//! ([`Plan`]): each task's diagnostics go in its own slot, and the result is read in the def
+//! maps' order, so it is the same whatever order the tasks ran in. A build tells the plan the
+//! bodies its codegen reaches, which are checked first ([`Plan::reached`]).
 //!
-//! The technique to match is rustc's parallel front end, `par_hir_for_each_module` on rayon's
-//! work stealing: one module per task. Here a run of small modules is one task, so no task
-//! costs less to schedule than it does to run, a slot is written once by a compare-and-swap
-//! (no lock), and unlike rustc's the diagnostics come out in one order whatever the threads.
+//! The technique to match is rustc's parallel front end, `par_hir_body_owners` on rayon's work
+//! stealing: one body per task. A task costs about 200 ns to schedule against a body's 11 µs or
+//! more (docs/v2/plan/lanes/frontend/fast-bodies-tasks.md), a slot is written once (no lock),
+//! and unlike rustc's the diagnostics come out in one order whatever the threads.
 
-use std::{ptr, sync::OnceLock};
+pub mod bodies;
 
 use base_db::Db;
-use blaze_mem::Tag;
 use hir_def::nameres::crate_def_map;
 
+use self::bodies::Plan;
 use crate::{
     AnyDiagnostic, Crate, DefWithBody, Module, diagnostics::DiagnosticsCollector,
 };
 
-/// Which bodies a check asks for: all of them when `None`.
-pub type Bodies<'a> = Option<&'a (dyn Fn(DefWithBody) -> bool + Sync)>;
-
-/// The items a task takes at least, but for the last: a run of smaller modules is one task.
-/// The tests' fixtures are a few items a module, which would otherwise be one task.
-const ITEMS_PER_TASK: usize = if cfg!(test) { 4 } else { 32 };
+/// The body filter of a check that asks for every body.
+pub fn every_body(_: DefWithBody) -> bool {
+    true
+}
 
 /// The crates `blaze check` checks: the workspace's members.
 pub fn workspace_crates(db: &Db) -> Vec<Crate> {
+    // alloc: once a check, its result, a word per crate
     Crate::all(db).into_iter().filter(|it| it.origin(db).is_local()).collect()
 }
 
@@ -47,49 +45,45 @@ pub fn file_modules(db: &Db, krate: Crate) -> Vec<Module> {
         .modules(db)
         .filter(|(_, data)| !data.origin.is_inline())
         .map(|(id, _)| Module { id })
+        // alloc: once a crate, its result, a word per file module
         .collect()
 }
 
 /// The diagnostics of `module`, of the inline modules written in it, and of every item and
 /// body declared in them, borrow checks included; with `bodies`, of the bodies it accepts only
-/// (a driver that knows which bodies an edit left as they were checked). The work of one plane
-/// task: it asks queries of the database and keeps nothing.
+/// (a driver that knows which bodies an edit left as they were checked). It asks queries of
+/// the database and keeps nothing.
 pub fn check_module<'db>(
     db: &'db Db,
     module: Module,
     style_lints: bool,
-    bodies: Bodies<'_>,
+    bodies: &(impl Fn(DefWithBody) -> bool + ?Sized),
 ) -> Vec<AnyDiagnostic<'db>> {
+    // alloc: the result; empty, so no allocation, unless a diagnostic is reported
     let mut acc = Vec::new();
-    let bodies = bodies.map(|it| it as &dyn Fn(DefWithBody) -> bool);
     DiagnosticsCollector::collect(db, module.id, &mut acc, style_lints, bodies);
     acc
 }
 
-/// [`check_module`] of each of [`file_modules`] of `krate`, in their order.
+/// [`check_module`] of each of [`file_modules`] of `krate`, in their order, as one [`Plan`].
 pub fn check_crate<'db>(
     db: &'db Db,
     krate: Crate,
     style_lints: bool,
-    bodies: Bodies<'_>,
+    bodies: &(impl Fn(DefWithBody) -> bool + Sync + ?Sized),
 ) -> Vec<AnyDiagnostic<'db>> {
-    check_modules(db, &file_modules(db, krate), style_lints, bodies).into_iter().flatten().collect()
+    Plan::new(db, &[krate], bodies).run(db, style_lints).pop().unwrap_or_default()
 }
 
-/// [`check_crate`] of each of `crates`, in their order, their modules all in one batch.
+/// [`check_crate`] of each of `crates`, in their order, all in one [`Plan`].
 pub fn check_crates<'db>(
     db: &'db Db,
     crates: &[Crate],
     style_lints: bool,
 ) -> Vec<(Crate, Vec<AnyDiagnostic<'db>>)> {
-    let per_crate: Vec<Vec<Module>> = crates.iter().map(|&it| file_modules(db, it)).collect();
-    let modules: Vec<Module> = per_crate.iter().flatten().copied().collect();
-    let mut found = check_modules(db, &modules, style_lints, None).into_iter();
-    crates
-        .iter()
-        .zip(&per_crate)
-        .map(|(&krate, of)| (krate, found.by_ref().take(of.len()).flatten().collect()))
-        .collect()
+    let found = Plan::new(db, crates, &every_body).run(db, style_lints);
+    // alloc: once a check, its result, a pair per crate
+    crates.iter().copied().zip(found).collect()
 }
 
 /// [`check_crates`] of [`workspace_crates`].
@@ -98,57 +92,4 @@ pub fn check_workspace(
     style_lints: bool,
 ) -> Vec<(Crate, Vec<AnyDiagnostic<'_>>)> {
     check_crates(db, &workspace_crates(db), style_lints)
-}
-
-/// [`check_module`] of each of `modules` as one batch of the database's tasks; the diagnostics
-/// of each, in the order of `modules`.
-fn check_modules<'db>(
-    db: &'db Db,
-    modules: &[Module],
-    style_lints: bool,
-    bodies: Bodies<'_>,
-) -> Vec<Vec<AnyDiagnostic<'db>>> {
-    let starts = tasks(db, modules);
-    if starts.len() < 2 {
-        return modules.iter().map(|&it| check_module(db, it, style_lints, bodies)).collect();
-    }
-    let slots: Vec<OnceLock<Vec<AnyDiagnostic<'db>>>> =
-        modules.iter().map(|_| OnceLock::new()).collect();
-    let home = ptr::from_ref(db).cast::<()>().addr();
-    db.run_all(Tag::Infer, starts.len(), |task_db, task| {
-        assert_eq!(
-            ptr::from_ref(task_db).cast::<()>().addr(),
-            home,
-            "a task of a check ran on another database than the one checked"
-        );
-        // SAFETY: `task_db` is the object `db` points at (checked above), which is borrowed for
-        // `'db` by this call, and `run_all` returns only once every task has run. `'db` brands
-        // the diagnostics as that database's, which this one is.
-        let task_db: &'db Db = unsafe { &*ptr::from_ref(task_db) };
-        let end = starts.get(task + 1).map_or(modules.len(), |&it| it as usize);
-        for at in starts[task] as usize..end {
-            let found = check_module(task_db, modules[at], style_lints, bodies);
-            assert!(slots[at].set(found).is_ok(), "a module of a check was checked twice");
-        }
-    });
-    slots
-        .into_iter()
-        .map(|it| it.into_inner().expect("`run_all` returned before a task of the check ran"))
-        .collect()
-}
-
-/// Where each task of `modules` starts: a run of modules, together of [`ITEMS_PER_TASK`]
-/// items or more but for the last, in order.
-pub(crate) fn tasks(db: &Db, modules: &[Module]) -> Vec<u32> {
-    let mut starts = Vec::with_capacity(modules.len());
-    let mut items = ITEMS_PER_TASK;
-    for (at, module) in modules.iter().enumerate() {
-        if items >= ITEMS_PER_TASK {
-            starts.push(at as u32);
-            items = 0;
-        }
-        let scope = module.id.def_map(db).module(db, module.id).scope(db);
-        items += 1 + scope.declarations().count() + scope.impls().len();
-    }
-    starts
 }

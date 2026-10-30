@@ -14,12 +14,12 @@
 use std::mem::offset_of;
 
 use blaze_format::{
-    ALIGN, FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema_of,
+    ALIGN, FormatError, Part, Persist, Placed, Record, SchemaHash, Slice, Writer, open_as,
+    schema_of,
 };
 use hir_def::{
-    AdtId, ConstId, ConstParamId, EnumId, EnumVariantId, FunctionId, GenericDefId,
-    GenericParamId, ImplId, LifetimeParamId, StaticId, StructId, TraitId, TypeAliasId,
-    TypeOrConstParamId, TypeParamId, UnionId, VariantId,
+    AdtId, ConstParamId, EnumVariantId, GenericDefId, GenericParamId, ImplId, LifetimeParamId,
+    StructId, TraitId, TypeOrConstParamId, TypeParamId, UnionId, VariantId,
 };
 use la_arena::{Idx, RawIdx};
 use salsa::plumbing::{AsId, FromId};
@@ -202,6 +202,11 @@ fn id_bits(id: impl AsId) -> u64 {
     id.as_id().as_bits()
 }
 
+/// A diagnostic's id: [`id_bits`], or inside `check_cache::relocating` its place in the table.
+fn def_bits<T: crate::check_cache::Relocate>(id: T) -> u64 {
+    crate::check_cache::id_bits(id)
+}
+
 fn variant_key(variant: VariantId) -> (u8, u64) {
     match variant {
         VariantId::EnumVariantId(it) => (0, id_bits(it)),
@@ -218,29 +223,6 @@ fn variant_of(tag: u8, bits: u64) -> Option<VariantId> {
         2 => UnionId::from_id(id).into(),
         _ => return None,
     })
-}
-
-/// Where a column was written: nowhere when it is empty.
-#[derive(Clone, Copy)]
-struct Placed {
-    at: u64,
-    len: usize,
-}
-
-impl Placed {
-    fn push<T: Record>(out: &mut Writer, values: &[T]) -> Placed {
-        match values.is_empty() {
-            true => Placed { at: 0, len: 0 },
-            false => Placed { at: out.push_slice(values), len: values.len() },
-        }
-    }
-
-    fn slice<T>(self, field_at: u64) -> Slice<T> {
-        match self.len {
-            0 => Slice::EMPTY,
-            len => Slice::between(field_at, self.at, len),
-        }
-    }
 }
 
 impl ColdBatch {
@@ -748,15 +730,15 @@ fn put_local<T>(w: &mut Vec<u32>, id: Idx<T>) {
 
 fn put_generic_def(w: &mut Vec<u32>, def: GenericDefId) {
     let (tag, bits) = match def {
-        GenericDefId::AdtId(AdtId::StructId(it)) => (0, id_bits(it)),
-        GenericDefId::AdtId(AdtId::EnumId(it)) => (1, id_bits(it)),
-        GenericDefId::AdtId(AdtId::UnionId(it)) => (2, id_bits(it)),
-        GenericDefId::ConstId(it) => (3, id_bits(it)),
-        GenericDefId::FunctionId(it) => (4, id_bits(it)),
-        GenericDefId::ImplId(it) => (5, id_bits(it)),
-        GenericDefId::StaticId(it) => (6, id_bits(it)),
-        GenericDefId::TraitId(it) => (7, id_bits(it)),
-        GenericDefId::TypeAliasId(it) => (8, id_bits(it)),
+        GenericDefId::AdtId(AdtId::StructId(it)) => (0, def_bits(it)),
+        GenericDefId::AdtId(AdtId::EnumId(it)) => (1, def_bits(it)),
+        GenericDefId::AdtId(AdtId::UnionId(it)) => (2, def_bits(it)),
+        GenericDefId::ConstId(it) => (3, def_bits(it)),
+        GenericDefId::FunctionId(it) => (4, def_bits(it)),
+        GenericDefId::ImplId(it) => (5, def_bits(it)),
+        GenericDefId::StaticId(it) => (6, def_bits(it)),
+        GenericDefId::TraitId(it) => (7, def_bits(it)),
+        GenericDefId::TypeAliasId(it) => (8, def_bits(it)),
     };
     w.push(tag);
     put_u64(w, bits);
@@ -909,9 +891,9 @@ pub(crate) fn put_path_diagnostic(w: &mut Vec<u32>, diagnostic: &PathLoweringDia
         }
         PathLoweringDiagnostic::AmbiguousAssociatedItem { segment, variant, item, impl_ } => {
             w.extend([9, segment]);
-            put_u64(w, id_bits(variant));
-            put_u64(w, id_bits(item));
-            put_u64(w, id_bits(impl_));
+            put_u64(w, def_bits(variant));
+            put_u64(w, def_bits(item));
+            put_u64(w, def_bits(impl_));
         }
     }
 }
@@ -963,24 +945,22 @@ impl Words<'_> {
         Ok(Idx::from_raw(RawIdx::from_u32(self.u32()?)))
     }
 
-    fn id(&mut self) -> Result<salsa::Id, FormatError> {
+    fn id<T: crate::check_cache::Relocate>(&mut self) -> Result<T, FormatError> {
         let bits = self.u64()?;
-        salsa_id(bits).ok_or(self.invalid("a salsa id of index 0"))
+        crate::check_cache::id_of(bits).ok_or(self.invalid("a salsa id of index 0 or not in the table"))
     }
 
     fn generic_def(&mut self) -> Result<GenericDefId, FormatError> {
-        let tag = self.u32()?;
-        let id = self.id()?;
-        Ok(match tag {
-            0 => AdtId::StructId(StructId::from_id(id)).into(),
-            1 => AdtId::EnumId(EnumId::from_id(id)).into(),
-            2 => AdtId::UnionId(UnionId::from_id(id)).into(),
-            3 => ConstId::from_id(id).into(),
-            4 => FunctionId::from_id(id).into(),
-            5 => ImplId::from_id(id).into(),
-            6 => StaticId::from_id(id).into(),
-            7 => TraitId::from_id(id).into(),
-            8 => TypeAliasId::from_id(id).into(),
+        Ok(match self.u32()? {
+            0 => AdtId::StructId(self.id()?).into(),
+            1 => AdtId::EnumId(self.id()?).into(),
+            2 => AdtId::UnionId(self.id()?).into(),
+            3 => GenericDefId::ConstId(self.id()?),
+            4 => GenericDefId::FunctionId(self.id()?),
+            5 => GenericDefId::ImplId(self.id()?),
+            6 => GenericDefId::StaticId(self.id()?),
+            7 => GenericDefId::TraitId(self.id()?),
+            8 => GenericDefId::TypeAliasId(self.id()?),
             _ => return Err(self.invalid("a generic definition of no kind")),
         })
     }
@@ -1137,9 +1117,9 @@ impl Words<'_> {
             },
             9 => PathLoweringDiagnostic::AmbiguousAssociatedItem {
                 segment: self.u32()?,
-                variant: EnumVariantId::from_id(self.id()?),
-                item: TypeAliasId::from_id(self.id()?),
-                impl_: ImplId::from_id(self.id()?),
+                variant: self.id()?,
+                item: self.id()?,
+                impl_: self.id()?,
             },
             _ => return Err(self.invalid("a path diagnostic of no kind")),
         })
@@ -1149,7 +1129,7 @@ impl Words<'_> {
 #[cfg(test)]
 mod tests {
     use blaze_format::{Aligned, to_bytes};
-    use hir_def::type_ref::TypeRefId;
+    use hir_def::{EnumId, TypeAliasId, type_ref::TypeRefId};
 
     use super::*;
 

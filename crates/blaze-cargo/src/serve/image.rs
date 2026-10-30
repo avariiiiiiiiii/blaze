@@ -25,7 +25,6 @@ use std::{
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::SchemaHash;
-use blaze_graph::admission::Predict;
 use blaze_history::{DecodeError, History};
 use blaze_image::{Builder, Image, SectionId, Stable};
 use blaze_query::Database;
@@ -60,7 +59,7 @@ pub fn history<S: Stable>(image: &Image<S>, config: blaze_history::Config) -> Re
 pub struct Parts<'a> {
     pub db: &'a Database,
     pub vfs: &'a mut Vfs,
-    pub predict: &'a dyn Predict,
+    pub predict: &'a History,
     pub effects: &'a mut Vec<Effect>,
 }
 
@@ -204,6 +203,7 @@ impl Images {
 
 /// [`blaze_image::Jobs`] on the process's worker pool: `job(0)` to `job(n - 1)`, back once all
 /// ran; a job's panic is resumed here.
+// dyn: the shape of `blaze_image::Jobs`; one call per section job of an image, each a whole section's work
 pub fn on_pool(n: usize, job: &(dyn Fn(usize) + Sync)) {
     let panicked = Mutex::new(None);
     blaze_graph::exec::shared().scope(|scope| {

@@ -4,6 +4,8 @@
 //! Copied from v1's `crates/blaze-registry/src/index.rs` and `query.rs`, reading the file as
 //! served (never cargo's cache encoding of it).
 
+use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
 use std::str::FromStr;
@@ -230,13 +232,66 @@ pub(crate) fn parse_line(line: &[u8]) -> anyhow::Result<IndexLine> {
     Ok(IndexLine { entry, status })
 }
 
-/// Every line of an index file whose name and version can be read, in the file's order. Lines
-/// are split at `\n` only, as cargo splits them.
-pub(crate) fn parse_file(raw: &[u8]) -> Vec<IndexLine> {
-    raw.split(|&it| it == b'\n')
-        .filter(|line| !line.is_empty())
-        .filter_map(|line| parse_line(line).ok())
-        .collect()
+#[derive(Deserialize)]
+struct IndexPackageVersion<'a> {
+    /// Read only to leave out a line without a name, as [`parse_line`] does.
+    #[serde(borrow, rename = "name")]
+    _name: Cow<'a, str>,
+    vers: Version,
+}
+
+/// An index file, each line's version read and the rest of it parsed only when a query
+/// matches that version, as cargo parses its cached index (`MaybeIndexSummary::Unparsed`).
+/// Lines are split at `\n` only, as cargo splits them; a line with no name and version is
+/// left out, as [`parse_line`] leaves it out.
+pub(crate) struct Lines {
+    raw: Vec<u8>,
+    versions: Vec<Version>,
+    spans: Vec<Range<usize>>,
+    parsed: Vec<OnceCell<Option<IndexLine>>>,
+}
+
+impl Lines {
+    pub(crate) fn new(raw: Vec<u8>) -> Lines {
+        let count = raw.iter().filter(|&&it| it == b'\n').count() + 1;
+        let mut versions = Vec::with_capacity(count);
+        let mut spans = Vec::with_capacity(count);
+        let mut start = 0;
+        for line in raw.split(|&it| it == b'\n') {
+            let span = start..start + line.len();
+            start = span.end + 1;
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(IndexPackageVersion { vers, .. }) = serde_json::from_slice(line) {
+                versions.push(vers);
+                spans.push(span);
+            }
+        }
+        let parsed = (0..versions.len()).map(|_| OnceCell::new()).collect();
+        Lines { raw, versions, spans, parsed }
+    }
+
+    pub(crate) fn empty() -> Lines {
+        Lines { raw: Vec::new(), versions: Vec::new(), spans: Vec::new(), parsed: Vec::new() }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parsed_count(&self) -> usize {
+        self.parsed.iter().filter(|it| it.get().is_some()).count()
+    }
+
+    /// The lines whose version `matches` accepts, in the file's order, each parsed once.
+    pub(crate) fn matching<'s>(
+        &'s self,
+        mut matches: impl FnMut(&Version) -> bool + 's,
+    ) -> impl Iterator<Item = &'s IndexLine> + 's {
+        self.versions.iter().enumerate().filter(move |(_, version)| matches(version)).filter_map(
+            move |(at, _)| {
+                self.parsed[at].get_or_init(|| parse_line(&self.raw[self.spans[at].clone()]).ok()).as_ref()
+            },
+        )
+    }
 }
 
 fn entry(package: IndexPackage) -> anyhow::Result<IndexEntry> {

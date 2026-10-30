@@ -6,7 +6,7 @@
 pub(crate) mod tests;
 
 use base_db::Db;
-use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup as _, VariantId};
+use hir_def::{AdtId, GenericDefId, ItemContainerId, Lookup as _};
 use std::alloc::Allocator;
 
 use crate::mem::{self, FMap, FVec};
@@ -662,7 +662,7 @@ fn inferred_outlives(db: &Db, adt: AdtId) -> InferredOutlives {
     blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
         let mut found = Vec::new_in(frame);
         let mut subtypes = Vec::new_in(frame);
-        for variant in variants(db, adt) {
+        for variant in adt.variants(db) {
             for (_, field) in db.field_types(variant).iter() {
                 let ty = field.ty().instantiate_identity().skip_norm_wip();
                 subtypes.clear();
@@ -792,15 +792,6 @@ fn walk_with<'db, A: Allocator>(ty: Ty<'db>, flags: TypeFlags, out: &mut Vec<Ty<
         }
     }
     ty.visit_with(&mut Walk(out, flags));
-}
-
-pub(crate) fn variants(db: &Db, adt: AdtId) -> impl Iterator<Item = VariantId> + '_ {
-    let (one, all): (Option<VariantId>, _) = match adt {
-        AdtId::StructId(it) => (Some(it.into()), None),
-        AdtId::UnionId(it) => (Some(it.into()), None),
-        AdtId::EnumId(it) => (None, Some(it.enum_variants(db).variants.values())),
-    };
-    one.into_iter().chain(all.into_iter().flatten().map(|&(it, _)| it.into()))
 }
 
 /// What an item knows of what outlives what: its where clauses, elaborated, and what the

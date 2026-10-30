@@ -48,7 +48,7 @@ pub(crate) struct Chunk {
 }
 
 pub(crate) struct Edges {
-    pages: Box<[OnceLock<Box<[AtomicU32]>>]>,
+    pages: Box<[OnceLock<super::Words<AtomicU32>>]>,
     /// The words reserved: every range starts below it.
     len: AtomicU32,
     /// Which array this is; a compaction makes the next, and a task's chunk of another is

@@ -10,8 +10,8 @@
 
 use hir::InFile;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, TextRange,
-    ast::{self, HasName as _},
+    SyntaxKind, TextRange,
+    view::{self as ast, AstNode as _, HasName as _},
 };
 
 use crate::{
@@ -22,8 +22,8 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MutRefInImmRefPat) -> Vec<Found> {
-    let node = cx.node(d.pat);
-    let range = match node.value.as_ref().right() {
+    let node = cx.node_view(d.pat);
+    let range = match node.value.right() {
         Some(ast::Pat::IdentPat(pat)) => match pat.name() {
             Some(name) => name.syntax().text_range(),
             None => pat.syntax().text_range(),
@@ -33,20 +33,21 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MutRefInImmRefPat) -> Vec<Found> {
     let span = cx.span(InFile::new(node.file_id, range));
     let mut diag =
         Diag::error(Some("E0596"), "cannot borrow as mutable inside an `&` pattern", span);
-    if let Some(and) = and_pat_prefix(cx, node.map(|it| it.syntax().clone())) {
+    if let Some(and) = and_pat_prefix(cx, node.map(|it| it.syntax())) {
         diag.suggestion(and, "replace this `&` with `&mut`", "&mut ", Applicability::MachineApplicable);
     }
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 
 /// The `&` (to where its pattern starts) of the innermost `&` pattern around `node`.
-fn and_pat_prefix(cx: &Cx<'_, '_>, node: InFile<SyntaxNode>) -> Option<Span> {
-    for ancestor in cx.sema.ancestors_with_macros_file(node).skip(1) {
-        let it = &ancestor.value;
+fn and_pat_prefix<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option<Span> {
+    for ancestor in cx.vsema.ancestors_with_macros_file(node).skip(1) {
+        let it = ancestor.value;
         match it.kind() {
             SyntaxKind::REF_PAT => {
-                let pat = ast::RefPat::cast(it.clone())?;
+                let pat = ast::RefPat::cast(it)?;
                 if pat.mut_token().is_some() {
                     continue;
                 }

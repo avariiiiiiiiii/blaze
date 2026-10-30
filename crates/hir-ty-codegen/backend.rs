@@ -10,7 +10,7 @@ use std::{
     fmt,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -435,7 +435,7 @@ struct Counts {
     /// Whether a thread holds these counts. The counts of [`Registry::late`] are held by
     /// none and shared by all: their words are added to with `fetch_add`.
     held: AtomicBool,
-    next: AtomicPtr<Counts>,
+    next: OnceLock<&'static Counts>,
 }
 
 #[repr(C, align(128))]
@@ -452,7 +452,7 @@ impl Counts {
             fallbacks: Mutex::new(BTreeMap::new()),
             passes: Mutex::new(None),
             held: AtomicBool::new(held),
-            next: AtomicPtr::new(std::ptr::null_mut()),
+            next: OnceLock::new(),
         }
     }
 
@@ -481,15 +481,16 @@ impl Counts {
 }
 
 /// Every thread's [`Counts`]: a list that only grows, of counts that are never freed, so a
-/// report reads them with no lock while threads count.
+/// report reads them with no lock while threads count. A link is set once: reading one is an
+/// acquire load, and a thread appends at the end (once, as it starts).
 struct Registry {
-    head: AtomicPtr<Counts>,
+    head: OnceLock<&'static Counts>,
     /// Where a thread counts once its own counts are gone, as it ends.
     late: Counts,
 }
 
 static REGISTRY: Registry =
-    Registry { head: AtomicPtr::new(std::ptr::null_mut()), late: Counts::new(false) };
+    Registry { head: OnceLock::new(), late: Counts::new(false) };
 
 impl Registry {
     /// Counts no thread holds, now held by the calling one: those a thread that ended left,
@@ -506,26 +507,21 @@ impl Registry {
             }
         }
         let counts: &'static Counts = Box::leak(Box::new(Counts::new(true)));
-        let mut head = self.head.load(Ordering::Relaxed);
+        let mut link = &self.head;
         loop {
-            counts.next.store(head, Ordering::Relaxed);
-            let new = std::ptr::from_ref(counts).cast_mut();
-            match self.head.compare_exchange_weak(head, new, Ordering::Release, Ordering::Relaxed)
-            {
-                Ok(_) => return counts,
-                Err(now) => head = now,
+            match link.set(counts) {
+                Ok(()) => return counts,
+                Err(_) => link = &link.get().expect("a link that refused a set is set").next,
             }
         }
     }
 
     /// The counts threads held, held now or not.
     fn listed(&'static self) -> impl Iterator<Item = &'static Counts> {
-        let mut at = self.head.load(Ordering::Acquire);
+        let mut link = &self.head;
         std::iter::from_fn(move || {
-            // SAFETY: every pointer in the list is of counts leaked by `claim`, which are
-            // never freed, and was published with a release store after its `next` was set.
-            let counts = unsafe { at.as_ref() }?;
-            at = counts.next.load(Ordering::Acquire);
+            let counts = *link.get()?;
+            link = &counts.next;
             Some(counts)
         })
     }
@@ -850,10 +846,7 @@ mod tests {
     use super::*;
 
     fn registry() -> &'static Registry {
-        Box::leak(Box::new(Registry {
-            head: AtomicPtr::new(std::ptr::null_mut()),
-            late: Counts::new(false),
-        }))
+        Box::leak(Box::new(Registry { head: OnceLock::new(), late: Counts::new(false) }))
     }
 
     #[test]

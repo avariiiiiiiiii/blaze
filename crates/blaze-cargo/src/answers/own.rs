@@ -478,6 +478,37 @@ fn unstable_allowed(
     })
 }
 
+/// The variables rustc is asked with.
+#[derive(Clone, Copy)]
+pub enum Vars<'a> {
+    /// This process's.
+    Process,
+    /// What the command sets or removes, else this process's.
+    Command(&'a std::process::Command),
+    /// What the list sets (`Some`) or removes (`None`), the last for a name winning, else this
+    /// process's.
+    Over(&'a [(OsString, Option<OsString>)]),
+    /// These, and no other.
+    Only(&'a [(&'a str, &'a str)]),
+}
+
+impl Vars<'_> {
+    pub fn get(self, name: &str) -> Option<OsString> {
+        match self {
+            Vars::Process => std::env::var_os(name),
+            Vars::Command(command) => match command.get_envs().find(|(it, _)| *it == name) {
+                Some((_, value)) => value.map(OsString::from),
+                None => std::env::var_os(name),
+            },
+            Vars::Over(set) => match set.iter().rev().find(|(it, _)| it.as_os_str() == name) {
+                Some((_, value)) => value.clone(),
+                None => std::env::var_os(name),
+            },
+            Vars::Only(set) => set.iter().find(|(it, _)| *it == name).map(|(_, value)| OsString::from(*value)),
+        }
+    }
+}
+
 /// What rustc prints, answering.
 #[derive(Debug, PartialEq)]
 pub struct Answer {
@@ -487,24 +518,16 @@ pub struct Answer {
 }
 
 /// What rustc of blaze's release prints to standard output for `args` with `stdin`, with
-/// the variables `var` reads; `None` for what this does not answer, and for an answer with
+/// the variables `vars`; `None` for what this does not answer, and for an answer with
 /// warnings, which only [`answered`] tells.
-pub fn answer(
-    args: &[OsString],
-    stdin: &[u8],
-    var: &dyn Fn(&str) -> Option<OsString>,
-) -> Option<Vec<u8>> {
-    answered(args, stdin, var).filter(|it| it.stderr.is_empty()).map(|it| it.stdout)
+pub fn answer(args: &[OsString], stdin: &[u8], vars: Vars<'_>) -> Option<Vec<u8>> {
+    answered(args, stdin, vars).filter(|it| it.stderr.is_empty()).map(|it| it.stdout)
 }
 
-/// What rustc of blaze's release prints for `args` with `stdin`, with the variables `var`
-/// reads; `None` for what this does not answer.
-pub fn answered(
-    args: &[OsString],
-    stdin: &[u8],
-    var: &dyn Fn(&str) -> Option<OsString>,
-) -> Option<Answer> {
-    if UNSET.iter().any(|it| var(it).is_some()) {
+/// What rustc of blaze's release prints for `args` with `stdin`, with the variables `vars`;
+/// `None` for what this does not answer.
+pub fn answered(args: &[OsString], stdin: &[u8], vars: Vars<'_>) -> Option<Answer> {
+    if UNSET.iter().any(|it| vars.get(it).is_some()) {
         return None;
     }
     let args = args.iter().map(|it| it.to_str()).collect::<Option<Vec<_>>>()?;
@@ -523,7 +546,7 @@ pub fn answered(
     }
     let given = Given::of(&args)?;
     let channel_nightly = release.version.contains("-nightly") || release.version.contains("-dev");
-    let nightly = unstable_allowed(var("RUSTC_BOOTSTRAP"), given.crate_name, channel_nightly)?;
+    let nightly = unstable_allowed(vars.get("RUSTC_BOOTSTRAP"), given.crate_name, channel_nightly)?;
     if given.prints.is_empty() || (given.from_stdin && !stdin.trim_ascii().is_empty()) {
         return None;
     }
@@ -739,7 +762,7 @@ mod tests {
 
     fn told(args: &str) -> Option<Answer> {
         let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
-        answered(&args, &[], &|_| None)
+        answered(&args, &[], Vars::Only(&[]))
     }
 
     /// uitest.py's RUSTFLAGS: a print of what is linked and kept files change nothing that is
@@ -778,7 +801,7 @@ mod tests {
              warning: 2 warnings emitted\n\n"
         );
         let args: Vec<OsString> = probe.split_whitespace().map(OsString::from).collect();
-        assert_eq!(answer(&args, &[], &|_| None), None);
+        assert_eq!(answer(&args, &[], Vars::Only(&[])), None);
         for hidden in ["-A warnings", "--cap-lints allow", "-Wwarnings -Awarnings"] {
             let said = told(&format!("{probe} {hidden}")).expect("an answer with no warnings");
             assert_eq!(said.stderr, b"");
@@ -804,16 +827,40 @@ mod tests {
             let args =
                 ["-Z", "unstable-options", "--print", "target-spec-json", "--target", target];
             let args: Vec<OsString> = args.iter().map(OsString::from).collect();
-            let var = |name: &str| {
-                (sdk && matches!(name, "SDKROOT" | "MACOSX_DEPLOYMENT_TARGET"))
-                    .then(|| OsString::from(if name == "SDKROOT" { "/sdk" } else { "14.0" }))
+            let vars: &[(&str, &str)] = match sdk {
+                true => &[("SDKROOT", "/sdk"), ("MACOSX_DEPLOYMENT_TARGET", "14.0")],
+                false => &[],
             };
-            answer(&args, &[], &var)
+            answer(&args, &[], Vars::Only(vars))
         };
         let wasm = spec("wasm32-wasip1", true).expect("wasm32-wasip1's spec under SDKROOT");
         assert!(String::from_utf8(wasm).unwrap().contains("\"arch\": \"wasm32\""));
         let apple = spec("aarch64-apple-darwin", true).expect("an Apple spec under SDKROOT");
         assert_eq!(Some(apple), spec("aarch64-apple-darwin", false));
+    }
+
+    #[test]
+    fn each_kind_of_vars_reads_its_own_then_the_process() {
+        let unset = format!("BLAZE_OWN_VARS_TEST_{}", std::process::id());
+        let path = std::env::var_os("PATH");
+        assert_eq!(Vars::Process.get("PATH"), path);
+        assert_eq!(Vars::Process.get(&unset), None);
+        let mut command = std::process::Command::new("rustc");
+        command.env(&unset, "set").env_remove("PATH");
+        assert_eq!(Vars::Command(&command).get(&unset), Some("set".into()));
+        assert_eq!(Vars::Command(&command).get("PATH"), None);
+        assert_eq!(Vars::Command(&std::process::Command::new("rustc")).get("PATH"), path);
+        let over = [
+            (OsString::from(&unset), Some(OsString::from("first"))),
+            (OsString::from(&unset), Some(OsString::from("last"))),
+            (OsString::from("PATH"), None),
+        ];
+        assert_eq!(Vars::Over(&over).get(&unset), Some("last".into()));
+        assert_eq!(Vars::Over(&over).get("PATH"), None);
+        assert_eq!(Vars::Over(&[]).get("PATH"), path);
+        let only = [("A", "1")];
+        assert_eq!(Vars::Only(&only).get("A"), Some("1".into()));
+        assert_eq!(Vars::Only(&only).get("PATH"), None);
     }
 
     /// servo's `[env]` has `RUSTC_BOOTSTRAP` a list of its crates, which every build script
@@ -822,7 +869,7 @@ mod tests {
     fn a_list_of_crates_bootstrapped_is_rustcs() {
         let told = |args: &str, bootstrap: &str| {
             let args: Vec<OsString> = args.split_whitespace().map(OsString::from).collect();
-            answered(&args, &[], &|name| (name == "RUSTC_BOOTSTRAP").then(|| bootstrap.into()))
+            answered(&args, &[], Vars::Only(&[("RUSTC_BOOTSTRAP", bootstrap)]))
         };
         let servo = "crown,script,mozjs_sys";
         for args in ["--version", "-vV"] {

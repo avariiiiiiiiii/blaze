@@ -29,6 +29,8 @@ mod arch;
 mod const_ast;
 mod const_macro;
 mod const_traits;
+mod deps;
+mod hir_eval;
 mod intrinsics;
 
 fn simplify(e: ConstEvalError<'_>) -> ConstEvalError<'_> {
@@ -162,6 +164,7 @@ fn eval_goal(db: &TestDB, file_id: EditionedFileId) -> Result<Allocation<'_>, Co
             _ => None,
         })
         .expect("No const named GOAL found in the test");
+    hir_eval::check_all(db, file_id);
     db.const_eval(const_id, GenericArgs::empty(), None)
 }
 

@@ -610,6 +610,7 @@ impl Sig for Function {
         w.put(&of.ret_type);
         w.put(&of.abi);
         put_flags(w, &of.flags);
+        w.put(&of.splatted);
     }
 
     fn get(
@@ -624,6 +625,7 @@ impl Sig for Function {
             ret_type: r.get()?,
             abi: r.get()?,
             flags: get_flags(r)?,
+            splatted: r.get()?,
             store: needs(store, r)?,
         };
         check_in_store(&signature.store, &signature.generic_params, &[], r)?;

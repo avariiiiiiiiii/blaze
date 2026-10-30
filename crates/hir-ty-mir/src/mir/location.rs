@@ -6,15 +6,21 @@
 use salsa::Database as _;
 use base_db::Db;
 use hir_def::{
-    DefWithBodyId, FunctionId, ItemContainerId, Lookup, attrs::AttrFlags, expr_store::Body,
-    hir::ExprId, signatures::FunctionSignature,
+    DefWithBodyId, FunctionId, ItemContainerId, Lookup,
+    attrs::AttrFlags,
+    expr_store::{Body, body::BodySourceMap},
+    hir::ExprId,
+    signatures::FunctionSignature,
 };
 use hir_expand::{
     FileRange, HirFileId, InFile, MacroDefKind,
     builtin::{BuiltinFnLikeExpander, EagerExpander},
 };
 use rustc_hash::FxHashMap;
-use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{
+    NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
+    view::{self as ast, AstNode, AstToken, Element, Node},
+};
 
 use crate::{
     InferenceResult,
@@ -24,7 +30,7 @@ use crate::{
 
 /// The range of an item or a macro call without the attributes and comments on top of it,
 /// which rustc's span of it leaves out.
-pub fn written_range(node: &SyntaxNode) -> TextRange {
+pub fn written_range(node: Node<'_>) -> TextRange {
     let start = node
         .children_with_tokens()
         .find(|it| {
@@ -102,7 +108,7 @@ pub fn located_concats<'db>(
             let loc = file_id.macro_file()?.loc(db);
             let concat =
                 matches!(loc.def.kind, MacroDefKind::BuiltInEager(_, EagerExpander::Concat));
-            (concat && names_location(&loc.to_node(db).value)).then_some((id, file_id))
+            (concat && names_location(loc.to_node_view(db).value)).then_some((id, file_id))
         })
         // alloc: the query's value, of a body that called a location macro
         .collect()
@@ -185,10 +191,10 @@ pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
     let path = |file| source_path(db, file);
     if let Some(file_id) = located_concats(db, owner).get(&expr) {
         use std::fmt::Write;
-        let call = file_id.macro_file()?.loc(db).to_node(db);
+        let call = file_id.macro_file()?.loc(db).to_node_view(db);
         // alloc: the value of the `concat!`, made only where one of a place is evaluated
         let mut text = String::new();
-        for part in concat_parts(&call.value)? {
+        for part in concat_parts(call.value)? {
             match part {
                 ConcatPart::Text(part) => text.push_str(&part),
                 ConcatPart::Location(expander, range) => {
@@ -205,7 +211,7 @@ pub fn placed(db: &Db, owner: DefWithBodyId, expr: ExprId) -> Option<Placed> {
     }
     let &(expander, file_id) = location_macros(db, owner).get(&expr)?;
     let site = written_call(db, file_id)?;
-    let range = InFile::new(site.file_id, written_range(&site.value));
+    let range = InFile::new(site.file_id, written_range(site.value));
     let FileRange { file_id, range } = range.original_node_file_range_rooted(db);
     let (file, line, col) = macro_location_of(db, file_id.into(), range)?;
     Some(match expander {
@@ -227,13 +233,12 @@ fn location_expander(name: &str) -> Option<BuiltinFnLikeExpander> {
 }
 
 /// Whether a macro call is passed a call of `line!`, `column!` or `file!`.
-fn names_location(call: &SyntaxNode) -> bool {
+fn names_location(call: Node<'_>) -> bool {
     call.descendants_with_tokens().filter_map(|it| it.into_token()).any(|token| {
         token.kind() == SyntaxKind::IDENT
             && location_expander(token.text()).is_some()
-            && token
-                .next_token()
-                .and_then(|next| syntax::algo::skip_trivia_token(next, syntax::Direction::Next))
+            && std::iter::successors(token.next_token(), |it| it.next_token())
+                .find(|next| !next.kind().is_trivia())
                 .is_some_and(|next| next.kind() == SyntaxKind::BANG)
     })
 }
@@ -247,60 +252,90 @@ pub enum ConcatPart {
 
 /// The arguments of a `concat!` call, when each is a literal or a call of `line!`, `column!`
 /// or `file!`.
-pub fn concat_parts(call: &SyntaxNode) -> Option<Vec<ConcatPart>> {
-    // clone: a syntax node handle (a refcount)
-    let tree = ast::MacroCall::cast(call.clone())?.token_tree()?;
-    let mut inside: Vec<SyntaxElement> =
-        // alloc: the call's arguments, read only where a `concat!` of a place is evaluated
-        tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
-    inside.pop()?;
-    let inside = inside.get(1..)?;
-    inside
-        .split(|it| it.kind() == SyntaxKind::COMMA)
-        .filter(|argument| !argument.is_empty())
-        .map(concat_part)
-        // alloc: the parts, made only where a `concat!` of a place is evaluated
-        .collect()
+pub fn concat_parts(call: Node<'_>) -> Option<Vec<ConcatPart>> {
+    let tree = ast::MacroCall::cast(call)?.token_tree()?;
+    let mut inside =
+        tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).peekable();
+    // The delimiters: one opens the arguments, the last one closes them.
+    inside.next()?;
+    inside.peek()?;
+    // alloc: the parts, made only where a `concat!` of a place is evaluated
+    let mut parts = Vec::new();
+    let mut argument = Argument::default();
+    while let Some(element) = inside.next() {
+        if inside.peek().is_none() {
+            break;
+        }
+        match element.kind() == SyntaxKind::COMMA {
+            true => {
+                if argument.len != 0 {
+                    parts.push(concat_part(std::mem::take(&mut argument))?);
+                }
+            }
+            false => argument.push(element),
+        }
+    }
+    if argument.len != 0 {
+        parts.push(concat_part(argument)?);
+    }
+    Some(parts)
 }
 
-fn concat_part(argument: &[SyntaxElement]) -> Option<ConcatPart> {
-    if let [SyntaxElement::Token(token)] = argument {
+/// What [`concat_part`] reads of an argument as its elements go by: the first, the last three
+/// and how many.
+#[derive(Clone, Copy, Default)]
+struct Argument<'t> {
+    first: Option<Element<'t>>,
+    last: [Option<Element<'t>>; 3],
+    len: usize,
+}
+
+impl<'t> Argument<'t> {
+    fn push(&mut self, element: Element<'t>) {
+        self.first.get_or_insert(element);
+        self.last = [self.last[1], self.last[2], Some(element)];
+        self.len += 1;
+    }
+}
+
+fn concat_part(argument: Argument<'_>) -> Option<ConcatPart> {
+    if let (1, Some(NodeOrToken::Token(token))) = (argument.len, argument.first) {
         let text = match token.kind() {
-            // clone: a token handle; alloc: the part's text
-            SyntaxKind::STRING => ast::String::cast(token.clone())?.value().ok()?.into_owned(),
-            SyntaxKind::INT_NUMBER => {
-                // clone: a token handle; alloc: the part's text
-                ast::IntNumber::cast(token.clone())?.value().ok()?.to_string()
-            }
-            // clone: a token handle; alloc: the part's text
-            SyntaxKind::CHAR => ast::Char::cast(token.clone())?.value().ok()?.to_string(),
+            // alloc: the part's text
+            SyntaxKind::STRING => ast::String::cast(token)?.value().ok()?.into_owned(),
+            // alloc: the part's text
+            SyntaxKind::INT_NUMBER => ast::IntNumber::cast(token)?.value().ok()?.to_string(),
+            // alloc: the part's text
+            SyntaxKind::CHAR => ast::Char::cast(token)?.value().ok()?.to_string(),
             // alloc: the part's text
             SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => token.text().to_owned(),
             _ => return None,
         };
         return Some(ConcatPart::Text(text));
     }
-    let [.., SyntaxElement::Token(name), bang, SyntaxElement::Node(arguments)] = argument else {
+    let [Some(NodeOrToken::Token(name)), Some(bang), Some(NodeOrToken::Node(arguments))] =
+        argument.last
+    else {
         return None;
     };
-    let expander = location_expander(name.text())?;
+    let (expander, first) = (location_expander(name.text())?, argument.first?);
     let empty = arguments.children_with_tokens().filter(|it| !it.kind().is_trivia()).count() == 2;
     (bang.kind() == SyntaxKind::BANG && empty).then(|| {
-        let range = argument[0].text_range().cover(arguments.text_range());
+        let range = first.text_range().cover(arguments.text_range());
         ConcatPart::Location(expander, range)
     })
 }
 
 /// The macro call an expansion comes from that is itself written out, in the source or in
 /// what a macro was passed, and not by another macro.
-pub fn written_call(db: &Db, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
-    let mut call = file_id.macro_file()?.loc(db).to_node(db);
+pub fn written_call<'db>(db: &'db Db, file_id: HirFileId) -> Option<InFile<Node<'db>>> {
+    let mut call = file_id.macro_file()?.loc(db).to_node_view(db);
     while let Some(outer) = call.file_id.macro_file() {
         let start = TextRange::empty(call.value.text_range().start());
         if call.file_id.span_map(db).span_for_range(start).ctx.is_root() {
             break;
         }
-        call = outer.loc(db).to_node(db);
+        call = outer.loc(db).to_node_view(db);
     }
     Some(call)
 }
@@ -335,7 +370,7 @@ fn reported_file_range(db: &Db, file_id: HirFileId, range: TextRange) -> FileRan
     let own_tokens = file_id.macro_file().is_some()
         && !file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root();
     match written_call(db, file_id) {
-        Some(call) if own_tokens => InFile::new(call.file_id, written_range(&call.value))
+        Some(call) if own_tokens => InFile::new(call.file_id, written_range(call.value))
             .original_node_file_range_rooted(db),
         _ => InFile::new(file_id, range).original_node_file_range_rooted(db),
     }
@@ -365,14 +400,24 @@ pub fn source_location_in_file<'db>(
     location_of(db, file_id, range)
 }
 
-/// The file a place in a body is written in, which may be what a macro expands to, and
-/// where in it rustc has the place begin.
-pub fn source_range<'db>(
-    db: &'db Db,
+/// Where a span of a body is written, as one of the body's source maps has it.
+pub enum SpanSource {
+    /// Its range: the closing brace of a block, which is where rustc has a scope left, or a
+    /// pattern's node.
+    Range(HirFileId, TextRange),
+    /// An expression, the range of which as rustc reports it [`reported_range`] reads from its
+    /// node.
+    Expr(InFile<SyntaxNodePtr>, ExprId),
+}
+
+/// Where `span` of `owner` is written by `source_map`: the map moved into the body's file
+/// ([`Body::with_source_map`]) or that of the tree of its anchor ([`Body::relative`]).
+pub fn span_source(
+    db: &Db,
     owner: DefWithBodyId,
+    source_map: &BodySourceMap,
     span: MirSpan,
-) -> Option<(HirFileId, TextRange)> {
-    let source_map = &Body::with_source_map(db, owner).1;
+) -> Option<SpanSource> {
     let source = match span {
         MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
         // The block an `async fn` is taken to wrap its body in is not written anywhere, and
@@ -387,23 +432,38 @@ pub fn source_range<'db>(
             }
         }
         MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
-        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown => return None,
-    };
-    if let MirSpan::ExprEnd(_) = span {
-        // The brace that closes a block, which is where rustc has a scope left.
-        let range = source.value.syntax_node_ptr().text_range();
-        let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
-        return Some((source.file_id, TextRange::new(last?, range.end())));
-    }
-    let range = match span {
-        MirSpan::ExprId(expr) => {
-            let root = source.file_id.parse_or_expand(db);
-            let node = source.value.syntax_node_ptr().to_node(&root);
-            reported_range(db, owner, expr, source.file_id, &node)?
+        // An inlined span indexes the optimized body's `Inlined`, not `owner`'s map: it is
+        // resolved through that body first.
+        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown | MirSpan::Inlined(_) => {
+            return None;
         }
-        _ => source.value.syntax_node_ptr().text_range(),
     };
-    Some((source.file_id, range))
+    let ptr = source.value.syntax_node_ptr();
+    Some(match span {
+        MirSpan::ExprEnd(_) => {
+            let range = ptr.text_range();
+            let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
+            SpanSource::Range(source.file_id, TextRange::new(last?, range.end()))
+        }
+        MirSpan::ExprId(expr) => SpanSource::Expr(InFile::new(source.file_id, ptr), expr),
+        _ => SpanSource::Range(source.file_id, ptr.text_range()),
+    })
+}
+
+/// The file a place in a body is written in, which may be what a macro expands to, and
+/// where in it rustc has the place begin.
+pub fn source_range<'db>(
+    db: &'db Db,
+    owner: DefWithBodyId,
+    span: MirSpan,
+) -> Option<(HirFileId, TextRange)> {
+    match span_source(db, owner, &Body::with_source_map(db, owner).1, span)? {
+        SpanSource::Range(file_id, range) => Some((file_id, range)),
+        SpanSource::Expr(source, expr) => {
+            let node = ast::to_node(source.value, source.file_id.root(db));
+            Some((source.file_id, reported_range(db, owner, expr, source.file_id, node)?))
+        }
+    }
 }
 
 /// The part of an expression that rustc's span of it covers where it panics: a method call
@@ -414,15 +474,13 @@ pub fn reported_range(
     owner: DefWithBodyId,
     expr: ExprId,
     file_id: HirFileId,
-    node: &SyntaxNode,
+    node: Node<'_>,
 ) -> Option<TextRange> {
     let end = node.text_range().end();
-    // clone: a syntax node handle (a refcount)
-    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
+    if let Some(call) = ast::MethodCallExpr::cast(node) {
         return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
     }
-    // clone: a syntax node handle (a refcount)
-    if let Some(written) = ast::IndexExpr::cast(node.clone())
+    if let Some(written) = ast::IndexExpr::cast(node)
         && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner).expr(expr)
         && !is_builtin_index(InferenceResult::of(db, owner), base, index)
     {
@@ -434,7 +492,7 @@ pub fn reported_range(
 /// The range of an expression with the parentheses around it. rustc's span of an expression
 /// includes them when both are written in one place, and not when a macro put the
 /// parentheses around what it was passed.
-fn parenthesized(db: &Db, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
+fn parenthesized(db: &Db, file_id: HirFileId, node: Node<'_>) -> TextRange {
     let passed_in = |range: TextRange| {
         file_id.macro_file().is_none()
             || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
@@ -463,4 +521,54 @@ pub fn track_caller(db: &Db, func: FunctionId) -> bool {
     };
     let name = &FunctionSignature::of(db, func).name;
     trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parts of the first macro call in `text`: a literal's text, or where a call of a
+    /// place is.
+    fn parts(text: &str) -> Option<Vec<Result<String, TextRange>>> {
+        let parse = syntax::SourceFile::parse(text, syntax::Edition::CURRENT);
+        let call = parse.root().descendants().find(|it| it.kind() == SyntaxKind::MACRO_CALL)?;
+        let parts = concat_parts(call)?.into_iter().map(|it| match it {
+            ConcatPart::Text(text) => Ok(text),
+            ConcatPart::Location(_, range) => Err(range),
+        });
+        Some(parts.collect())
+    }
+
+    fn range(text: &str, of: &str) -> TextRange {
+        let start = text.find(of).unwrap();
+        TextRange::new(TextSize::new(start as u32), TextSize::new((start + of.len()) as u32))
+    }
+
+    #[test]
+    fn concat_arguments_are_read_in_place() {
+        let text = r#"const C: &str = concat!("a\n", 12, 'c', true,);"#;
+        let read = ["a\n", "12", "c", "true"].map(|it| Ok(it.to_owned()));
+        assert_eq!(parts(text).unwrap(), read);
+        let text = r#"const C: &str = concat!("x", line!(), file! ( ));"#;
+        let read = vec![Ok("x".to_owned()), Err(range(text, "line!()")), Err(range(text, "file! ( )"))];
+        assert_eq!(parts(text), Some(read));
+        assert_eq!(parts("const C: &str = concat!();"), Some(Vec::new()));
+        assert_eq!(parts("const C: &str = concat!(,,);"), Some(Vec::new()));
+        // What is not a literal or a call of a place with nothing passed to it.
+        assert_eq!(parts("const C: &str = concat!(x);"), None);
+        assert_eq!(parts("const C: &str = concat!(\"a\" \"b\");"), None);
+        assert_eq!(parts("const C: &str = concat!(line!(1));"), None);
+        assert_eq!(parts("const C: &str = concat!(other!());"), None);
+    }
+
+    #[test]
+    fn a_call_of_a_place_is_found_past_blank_space() {
+        let call = |text: &str| {
+            let parse = syntax::SourceFile::parse(text, syntax::Edition::CURRENT);
+            let call = parse.root().descendants().find(|it| it.kind() == SyntaxKind::MACRO_CALL);
+            names_location(call.unwrap())
+        };
+        assert!(call("const C: &str = concat!(line /* here */ !());"));
+        assert!(!call("const C: &str = concat!(line, column);"));
+    }
 }

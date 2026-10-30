@@ -14,7 +14,7 @@ use blaze_ids::rng::SplitMix64;
 
 use super::{
     Outcome, hook, image,
-    switch::{Dwarf, HOST_ARCH, KEPT, Layout, Memory, POOL, Span, Switch, Writes},
+    switch::{Dwarf, HOST_ARCH, KEPT, Layout, Limits, Memory, POOL, Span, Switch, Writes},
 };
 use crate::patch::{
     Answer, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, FIRST_GENERATION, Message, Patch,
@@ -166,7 +166,22 @@ impl Program {
         self.switch_with(Fake { write_code, ..Fake::default() }, generation).expect("a switch")
     }
 
+    /// A switch of the program whose log and lasting ranges hold at most `limits`.
+    fn switch_limited(&self, write_code: bool, limits: &Limits) -> Switch<Fake> {
+        let fake = Fake { write_code, ..Fake::default() };
+        self.switch_with_limits(fake, FIRST_GENERATION, limits).expect("a switch")
+    }
+
     fn switch_with(&self, fake: Fake, generation: u64) -> Result<Switch<Fake>, String> {
+        self.switch_with_limits(fake, generation, &Limits::LONG)
+    }
+
+    fn switch_with_limits(
+        &self,
+        fake: Fake,
+        generation: u64,
+        limits: &Limits,
+    ) -> Result<Switch<Fake>, String> {
         let mut bytes = vec![0u8; Descriptor::SIZE];
         let at = bytes.as_ptr() as u64;
         let descriptor = Descriptor {
@@ -186,7 +201,7 @@ impl Program {
         let decoded = Descriptor::decode(&bytes).expect("a descriptor");
         let layout = Layout::new(&decoded, at).expect("a layout");
         assert_eq!(layout.slide, SLIDE);
-        Switch::new(fake, layout)
+        Switch::with_limits(fake, layout, limits)
     }
 
     /// Calls slot `slot` as code the linker made does: the cell, then the slot.
@@ -700,19 +715,29 @@ fn outcomes_say_what_became_of_a_patch() {
     assert_eq!(declined.to_string(), "generation 4 not applied: no");
 }
 
-/// A warm patch's table work allocates nothing: the log's columns and the lasting ranges
-/// start with room for a program's first thousand generations, the pool is full and the
-/// scratch buffers are at their high-water mark. Each patch sets one cell of a 16-slot table
-/// and is taken from encoded bytes, as `Live::poll` takes a message from its kept buffer.
+/// A warm patch's table work allocates nothing, however many patches came before it: the
+/// log's columns and the lasting ranges grow in place in address space reserved at start,
+/// the pool is full and the scratch buffers are at their high-water mark. 9,000 patches of 4
+/// cells each run past the 1,024 generations and 16,384 cells the columns had room for when
+/// they were `Vec`s, and across a commit step of every column of cells (32,768 rows of 8
+/// bytes). Each patch is taken from encoded bytes, as `Live::poll` takes a message from its
+/// kept buffer.
 #[test]
 fn a_warm_patch_allocates_nothing() {
     const SLOTS: u64 = 16;
+    const CELLS: u64 = 4;
+    const PATCHES: u64 = 9_000;
     let program = Program::with_slots(SLOTS as usize);
     let mut switch = program.switch(false);
     let message = |generation: u64, base: u64| {
-        let slot = (generation % SLOTS) as u32;
-        let target = if generation % 2 == 0 { address(one) } else { address(two) };
-        Message::Patch(patch(generation, base, vec![(slot, unslid(target))])).encode()
+        let cells = (0..CELLS)
+            .map(|it| {
+                let slot = ((generation * CELLS + it) % SLOTS) as u32;
+                let target = if (generation + it) % 2 == 0 { address(one) } else { address(two) };
+                (slot, unslid(target))
+            })
+            .collect();
+        Message::Patch(patch(generation, base, cells)).encode()
     };
     for _ in 0..POOL + KEPT + 8 {
         let base = switch.current();
@@ -720,7 +745,8 @@ fn a_warm_patch_allocates_nothing() {
         applied(&mut switch, patch(base + 1, base, vec![cell]));
     }
     let first = switch.current();
-    let messages: Vec<Vec<u8>> = (0..64).map(|it| message(first + it + 1, first + it)).collect();
+    let messages: Vec<Vec<u8>> =
+        (0..PATCHES).map(|it| message(first + it + 1, first + it)).collect();
     blaze_alloc_count::assert_at_most(0, "a warm patch's table work and its switch", || {
         for bytes in &messages {
             let view = Message::view(bytes).expect("an encoded message reads back");
@@ -729,7 +755,70 @@ fn a_warm_patch_allocates_nothing() {
             assert!(answer.is_some());
         }
     });
-    assert_eq!(switch.current(), first + 64);
+    assert_eq!(switch.current(), first + PATCHES);
+    let last = first + PATCHES;
+    let slots = program.slots();
+    for it in 0..CELLS {
+        let target = if (last + it) % 2 == 0 { address(one) } else { address(two) };
+        assert_eq!(slots[((last * CELLS + it) % SLOTS) as usize], target);
+    }
+}
+
+/// A patch that would take a column of the log or of the lasting ranges past its limit is
+/// refused whole, naming the column and its limit, and the program runs on as it was; a
+/// patch that fits in what is left still applies.
+#[test]
+fn a_full_column_refuses_the_patch() {
+    let refused = |outcome: &Outcome, says: &str| match outcome {
+        Outcome::Declined { why, .. } => assert!(why.contains(says), "{why:?} doesn't say {says:?}"),
+        other => panic!("{other}, where it should say {says:?}"),
+    };
+    let roomy = Limits { generations: 64, cells: 64, code: 64, lasting: 64 };
+
+    let program = Program::new();
+    let mut switch = program.switch_limited(false, &Limits { generations: 3, ..roomy });
+    applied(&mut switch, patch(1, 0, vec![(0, unslid(address(two)))]));
+    applied(&mut switch, patch(2, 1, vec![(1, unslid(address(one)))]));
+    let table = program.cell.load(Ordering::Relaxed);
+    let (outcome, answer) =
+        switch.handle(Message::Patch(patch(3, 2, vec![(0, unslid(address(one)))])));
+    refused(&outcome, "the log's generation numbers is full: it holds 3 rows at most");
+    assert!(matches!(answer, Some(Answer::Declined { generation: 3, .. })), "{answer:?}");
+    assert_eq!(program.cell.load(Ordering::Relaxed), table);
+    assert_eq!((switch.current(), program.calls()), (2, (2, 1)));
+    switch.roll_back(1).expect("generation 1 is kept");
+    assert_eq!(program.calls(), (2, 2));
+
+    let program = Program::new();
+    let mut switch = program.switch_limited(false, &Limits { cells: 3, ..roomy });
+    let both = |to: u64| vec![(0, unslid(to)), (1, unslid(to))];
+    applied(&mut switch, patch(1, 0, both(address(two))));
+    let (outcome, _) = switch.handle(Message::Patch(patch(2, 1, both(address(one)))));
+    refused(&outcome, "the log's slots is full: it holds 3 rows at most");
+    assert_eq!((switch.current(), program.calls()), (1, (2, 2)));
+    applied(&mut switch, patch(2, 1, vec![(0, unslid(address(one)))]));
+    assert_eq!(program.calls(), (1, 2));
+
+    let program = Program::new();
+    let mut switch = program.switch_limited(false, &Limits { code: 2, ..roomy });
+    let mut three = patch(1, 0, vec![(0, unslid(address(two)))]);
+    three.code = [0, 64, 128].map(|at| (unslid(program.code_at(at)), vec![0x90; 8])).to_vec();
+    let (outcome, _) = switch.handle(Message::Patch(three));
+    refused(&outcome, "the log's code starts is full: it holds 2 rows at most");
+    assert_eq!((switch.current(), program.calls()), (0, (1, 2)));
+
+    let program = Program::new();
+    let mut switch = program.switch_limited(false, &Limits { lasting: 2, ..roomy });
+    let mut two_spans = patch(1, 0, vec![(0, unslid(address(two)))]);
+    two_spans.code = [0, 64].map(|at| (unslid(program.code_at(at)), vec![0x90; 8])).to_vec();
+    applied(&mut switch, two_spans);
+    let mut more = patch(2, 1, vec![(1, unslid(address(one)))]);
+    more.code = vec![(unslid(program.code_at(128)), vec![0x90; 8])];
+    let (outcome, _) = switch.handle(Message::Patch(more));
+    refused(&outcome, "the lasting ranges' starts is full: it holds 2 rows at most");
+    assert_eq!((switch.current(), program.calls()), (1, (2, 2)));
+    applied(&mut switch, patch(2, 1, vec![(1, unslid(address(one)))]));
+    assert_eq!(program.calls(), (2, 1));
 }
 
 /// Rolling back to a kept generation whose table the pool still holds, and forward again, is

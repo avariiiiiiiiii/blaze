@@ -228,6 +228,7 @@ impl<'db> SourceToDefCtx<'db, '_> {
     pub(super) fn file_to_def(&mut self, file: FileId) -> &SmallVec<[ModuleId; 1]> {
         let _p = tracing::info_span!("SourceToDefCtx::file_to_def").entered();
         if !self.cache.file_to_def_cache.contains_key(&file) {
+            // clone: `Arc` bump so the set outlives `&mut self` below, once per file cache miss
             let within = self.cache.within.clone();
             let mut mods = self.modules_in(crates_of(self.db, within.as_deref(), file, true), file);
             if mods.is_empty() {
@@ -499,7 +500,10 @@ impl<'db> SourceToDefCtx<'db, '_> {
         &mut self,
         src: InFile<&Ast>,
         key: Key<Ast, ID>,
-    ) -> Option<ID> {
+    ) -> Option<ID>
+    where
+        keys::AstPtrPolicy<Ast, ID>: keys::Slot<Ast, ID>,
+    {
         self.dyn_map(src)?[key].get(&AstPtr::new(src.value)).copied()
     }
 
@@ -651,8 +655,10 @@ impl<'db> SourceToDefCtx<'db, '_> {
         let mut node = node.cloned();
         while let Some(parent) = parent(self, node.as_ref()) {
             if parent.file_id != node.file_id {
+                // clone: refcount bump of a node handle, no allocation
                 deepest_child_in_same_file = parent.clone();
             }
+            // clone: refcount bump, `cb` takes the parent by value and the walk keeps it
             if let Some(res) = cb(self, parent.clone(), &deepest_child_in_same_file.value) {
                 return Some(res);
             }
@@ -666,7 +672,9 @@ impl<'db> SourceToDefCtx<'db, '_> {
         container: InFile<SyntaxNode>,
         child: &SyntaxNode,
     ) -> Option<ChildContainer> {
-        let cont = if let Some(item) = ast::Item::cast(container.value.clone()) {
+        let cont = if ast::Item::can_cast(container.value.kind()) {
+            let item = ast::Item::cast(container.value)?;
+            let container = InFile::new(container.file_id, ());
             match &item {
                 ast::Item::Module(it) => self.module_to_def(container.with_value(it))?.into(),
                 ast::Item::Trait(it) => self.trait_to_def(container.with_value(it))?.into(),
@@ -748,7 +756,8 @@ impl<'db> SourceToDefCtx<'db, '_> {
                 }
                 _ => return None,
             }
-        } else if let Some(it) = ast::Variant::cast(container.value.clone()) {
+        } else if ast::Variant::can_cast(container.value.kind()) {
+            let it = ast::Variant::cast(container.value)?;
             let def = self.enum_variant_to_def(InFile::new(container.file_id, &it))?;
             let is_in_body =
                 it.eq_token().is_some_and(|it| it.text_range().end() < child.text_range().start());

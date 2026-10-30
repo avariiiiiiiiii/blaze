@@ -42,6 +42,7 @@ impl Parsed {
             .as_source_file_id(cx.db)
             .and_then(|it| walk.tree(HirFileId::from(it)))
             .map(|tree| tree.ptr(&tree.root));
+        // alloc: empty until a lint fires; holds only what fires
         Parsed { crate_at, hits: Vec::new() }
     }
 
@@ -95,6 +96,7 @@ fn varargs_without_pattern(
         return None;
     }
     let span = span(cx, tree, dots.text_range());
+    // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("varargs_without_pattern", "missing pattern for `...` argument", span.clone());
     diag.suggestion(
         span,
@@ -113,6 +115,7 @@ fn break_with_label_and_loop(
     node: &SyntaxNode,
     crate_at: InFile<SyntaxNodePtr>,
 ) -> Option<Emitted> {
+    // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
     let expr = ast::BreakExpr::cast(node.clone())?;
     let (Some(break_), Some(_), Some(value)) = (expr.break_token(), expr.lifetime(), expr.expr()) else { return None };
     let unlabeled = |node: &SyntaxNode| !node.children().any(|it| it.kind() == SyntaxKind::LABEL);
@@ -137,6 +140,7 @@ fn break_with_label_and_loop(
     );
     diag.multipart_suggestion(
         "wrap this expression in parentheses",
+        // alloc: the lint's text, for a lint found
         vec![(left, "(".to_owned()), (right, ")".to_owned())],
         Applicability::MachineApplicable,
     );

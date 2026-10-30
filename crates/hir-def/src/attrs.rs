@@ -22,14 +22,15 @@
 //! (`lang`, `repr`, `export_name`, ...) runs only for an item whose flag says it has the
 //! attribute.
 
-use std::{convert::Infallible, iter::Peekable, ops::ControlFlow};
+use std::{borrow::Cow, convert::Infallible, iter::Peekable, ops::ControlFlow};
 
-use base_db::{Db, Crate};
+use base_db::{Crate, Db, EditionedFileId};
+use blaze_mem::Frame;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
-    InFile, Lookup,
-    attrs::{AstKeyValueMetaExt, expand_cfg_attr},
+    AstId, HirFileId, InFile, Lookup,
+    attrs::expand_cfg_attr_view,
     mod_path::{ModPath, PathKind},
     name::Name,
 };
@@ -40,11 +41,11 @@ use rustc_abi::ReprOptions;
 use rustc_hash::FxHashSet;
 use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
+use span::AstIdNode;
 use syntax::{
-    AstNode, AstToken, NodeOrToken, SmolStr, SourceFile, SyntaxKind, T,
-    ast::{self, HasAttrs, TokenTreeChildren},
+    NodeOrToken, SmolStr, SourceFile, SyntaxKind, T,
+    view::{self as ast, AstNode, AstToken, HasAttrs, TokenTreeChildren, Typed},
 };
-use tt::TextSize;
 
 use crate::{
     AdtId, AstIdLoc, AttrDefId, BlockId, ExternBlockId, FieldId, FunctionId, GenericDefId,
@@ -53,7 +54,7 @@ use crate::{
     hir::generics::{GenericParams, LocalLifetimeParamId, LocalTypeOrConstParamId},
     nameres::ModuleOrigin,
     resolver::{HasResolver, Resolver},
-    src::{HasChildSource, HasSource},
+    src::HasChildSourceView,
 };
 
 pub mod docs;
@@ -61,22 +62,65 @@ pub mod stability;
 
 pub use self::docs::{Docs, IsInnerDoc};
 
+/// Which tree an item's attributes are read off.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Tree {
+    /// Its file's outline ([`crate::signatures::outline_item`]) when the item is in it: the
+    /// file's text less the bodies the outline leaves out, none of which holds an attribute of
+    /// its item, so the attributes read the same, and a body edit leaves the outline the same.
+    /// For what reads only the attributes' text: the flags and the value queries over
+    /// [`collect_attrs`]. An item the outline doesn't have (in a body it leaves out, or written
+    /// by a macro) is read off its file's parse.
+    Outline,
+    /// The file's parse: for what maps an attribute back to its place in the file (the docs'
+    /// source map, a macro call in a value, a field found by its range).
+    Live,
+}
+
 #[inline]
-fn attrs_from_ast_id_loc<N: AstNode + Into<ast::AnyHasAttrs>>(
-    db: &Db,
+fn attrs_from_ast_id_loc<'db, N: AstIdNode + Typed + Into<syntax::ast::AnyHasAttrs>>(
+    db: &'db Db,
     lookup: impl Lookup<Data = impl AstIdLoc<Ast = N> + HasModule>,
-) -> (InFile<ast::AnyHasAttrs>, Crate) {
+    tree: Tree,
+) -> (InFile<ast::AnyHasAttrs<'db>>, Crate) {
     let loc = lookup.lookup(db);
-    let source = loc.source(db);
     let krate = loc.krate(db);
-    (source.map(|it| it.into()), krate)
+    let id = loc.ast_id();
+    (InFile::new(id.file_id, any_has_attrs(item_node(db, id, tree).syntax())), krate)
+}
+
+/// The node at `id`, off the tree `tree` says.
+fn item_node<'db, N: AstIdNode + Typed>(db: &'db Db, id: AstId<N>, tree: Tree) -> N::Of<'db> {
+    if tree == Tree::Outline
+        && let Some(node) = crate::signatures::outline_item(db, id)
+    {
+        return node;
+    }
+    id.to_view(db)
+}
+
+/// The root of `file`, off the tree `tree` says.
+fn file_root(db: &Db, file: EditionedFileId, tree: Tree) -> ast::SourceFile<'_> {
+    match tree {
+        Tree::Outline => crate::signatures::outline_root(db, file),
+        Tree::Live => file.parse(db).view(),
+    }
+}
+
+/// `node` as the attribute owner it is: the node of an item whose handle type is
+/// `Into<AnyHasAttrs>`, so the cast holds by the caller's bound.
+#[inline]
+fn any_has_attrs(node: ast::Node<'_>) -> ast::AnyHasAttrs<'_> {
+    ast::AnyHasAttrs::cast(node).unwrap_or_else(|| {
+        panic!("a {:?} at {:?} holds no attributes", node.kind(), node.text_range())
+    })
 }
 
 /// The flags of a `#[doc(...)]`: the atoms [`DocAtom::parse`] reads, stepped through the same
 /// way, without building them.
 #[inline]
-fn extract_doc_tt_attr(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-    let mut iter = TokenTreeChildren::new(&tt).peekable();
+fn extract_doc_tt_attr(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
+    let mut iter = TokenTreeChildren::new(tt).peekable();
     while let Some(child) = iter.next() {
         let NodeOrToken::Token(name) = child else { continue };
         if !name.kind().is_any_identifier() {
@@ -111,8 +155,8 @@ fn extract_doc_tt_attr(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
     }
 }
 
-fn extract_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-    let tt = TokenTreeChildren::new(&tt);
+fn extract_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
+    let tt = TokenTreeChildren::new(tt);
     if let Ok(NodeOrToken::Token(option)) = Itertools::exactly_one(tt)
         && option.kind().is_any_identifier()
     {
@@ -131,8 +175,8 @@ fn extract_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
     }
 }
 
-fn extract_ra_macro_style(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-    let tt = TokenTreeChildren::new(&tt);
+fn extract_ra_macro_style(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
+    let tt = TokenTreeChildren::new(tt);
     if let Ok(NodeOrToken::Token(option)) = Itertools::exactly_one(tt)
         && option.kind().is_any_identifier()
     {
@@ -145,8 +189,8 @@ fn extract_ra_macro_style(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
     }
 }
 
-fn extract_rustc_skip_during_method_dispatch(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
-    let iter = TokenTreeChildren::new(&tt);
+fn extract_rustc_skip_during_method_dispatch(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
+    let iter = TokenTreeChildren::new(tt);
     for kind in iter {
         if let NodeOrToken::Token(kind) = kind
             && kind.kind().is_any_identifier()
@@ -165,14 +209,14 @@ fn extract_rustc_skip_during_method_dispatch(attr_flags: &mut AttrFlags, tt: ast
 }
 
 #[inline]
-fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<Infallible> {
+fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta<'_>) -> ControlFlow<Infallible> {
     match attr {
         ast::Meta::CfgMeta(_) => attr_flags.insert(AttrFlags::HAS_CFG),
         ast::Meta::KeyValueMeta(attr) => {
             let Some(key) = attr.path().and_then(|path| path.as_single_name_ref()) else {
                 return ControlFlow::Continue(());
             };
-            let flag = match word(name_text(&key)) {
+            let flag = match word(name_text(key)) {
                 Some(Word::deprecated) => AttrFlags::IS_DEPRECATED,
                 Some(Word::ignore) => AttrFlags::IS_IGNORE,
                 Some(Word::lang) => AttrFlags::LANG_ITEM,
@@ -181,7 +225,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                 Some(Word::unstable) => AttrFlags::IS_UNSTABLE,
                 Some(Word::rustc_reservation_impl) => AttrFlags::RUSTC_RESERVATION_IMPL,
                 Some(Word::export_name) => {
-                    if string_value_is(&attr, "main") {
+                    if string_value_is(attr, "main") {
                         attr_flags.insert(AttrFlags::IS_EXPORT_NAME_MAIN);
                     }
                     AttrFlags::HAS_EXPORT_NAME
@@ -196,22 +240,22 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
         }
         ast::Meta::TokenTreeMeta(attr) => {
             let (Some((first_segment, second_segment)), Some(tt)) =
-                (attr.path().as_ref().and_then(up_to_two_segments), attr.token_tree())
+                (attr.path().and_then(up_to_two_segments), attr.token_tree())
             else {
                 return ControlFlow::Continue(());
             };
-            let first = word(name_text(&first_segment));
+            let first = word(name_text(first_segment));
             match second_segment {
                 None => match first {
                     Some(Word::deprecated) => attr_flags.insert(AttrFlags::IS_DEPRECATED),
                     Some(Word::used) => attr_flags.insert(AttrFlags::USED),
                     Some(Word::inline) => {
-                        if !tt.syntax().text().contains_char('n') {
+                        if !tt.syntax().text().contains('n') {
                             attr_flags.insert(AttrFlags::IS_INLINE);
-                            if tt_has_token(&tt, "always") {
+                            if tt_has_token(tt, "always") {
                                 attr_flags.insert(AttrFlags::INLINE_ALWAYS)
                             }
-                        } else if tt_has_token(&tt, "never") {
+                        } else if tt_has_token(tt, "never") {
                             attr_flags.insert(AttrFlags::INLINE_NEVER)
                         }
                     }
@@ -220,6 +264,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                         attr_flags.insert(AttrFlags::HAS_REPR)
                     }
                     Some(Word::target_feature) => attr_flags.insert(AttrFlags::HAS_TARGET_FEATURE),
+                    Some(Word::link_ordinal) => attr_flags.insert(AttrFlags::HAS_LINK_ORDINAL),
                     Some(Word::proc_macro_derive | Word::rustc_builtin_macro) => {
                         attr_flags.insert(AttrFlags::IS_DERIVE_OR_BUILTIN_MACRO)
                     }
@@ -246,11 +291,22 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     {
                         attr_flags.insert(AttrFlags::HAS_SANITIZE)
                     }
+                    Some(Word::instruction_set)
+                        if attr.path().is_some_and(|path| path.qualifier().is_none()) =>
+                    {
+                        attr_flags.insert(AttrFlags::HAS_INSTRUCTION_SET)
+                    }
+                    Some(Word::optimize)
+                        if attr.path().is_some_and(|path| path.qualifier().is_none())
+                            && tt_has_token(tt, "none") =>
+                    {
+                        attr_flags.insert(AttrFlags::OPTIMIZE_NONE)
+                    }
                     _ => {}
                 },
                 Some(second_segment) => {
                     if first == Some(Word::rust_analyzer) {
-                        match word(name_text(&second_segment)) {
+                        match word(name_text(second_segment)) {
                             Some(Word::completions) => extract_ra_completions(attr_flags, tt),
                             Some(Word::macro_style) => extract_ra_macro_style(attr_flags, tt),
                             Some(Word::define_opaque) => {
@@ -286,7 +342,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                 // One segment, or three and more read by their last, as `as_up_to_two_segment`
                 // reads them; the flags `has_word` answers by are set for one segment only.
                 let single = qualifier.is_none();
-                let flag = match word(name_text(&this)) {
+                let flag = match word(name_text(this)) {
                     Some(Word::rustc_has_incoherent_inherent_impls) => {
                         AttrFlags::RUSTC_HAS_INCOHERENT_INHERENT_IMPLS
                     }
@@ -355,12 +411,24 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
                     Some(Word::rustc_canonical_symbol) if single => {
                         AttrFlags::RUSTC_CANONICAL_SYMBOL
                     }
+                    Some(Word::marker) if single => AttrFlags::MARKER,
+                    Some(Word::automatically_derived) if single => {
+                        AttrFlags::AUTOMATICALLY_DERIVED
+                    }
+                    Some(Word::rustc_main) if single => AttrFlags::RUSTC_MAIN,
+                    Some(Word::default) if single => AttrFlags::DEFAULT,
+                    Some(Word::naked) if single => AttrFlags::NAKED,
+                    Some(Word::rustc_deny_explicit_impl) if single => {
+                        AttrFlags::RUSTC_DENY_EXPLICIT_IMPL
+                    }
+                    Some(Word::rustc_no_mir_inline) if single => AttrFlags::RUSTC_NO_MIR_INLINE,
+                    Some(Word::cold) if single => AttrFlags::COLD,
                     _ => return ControlFlow::Continue(()),
                 };
                 attr_flags.insert(flag);
                 return ControlFlow::Continue(());
             };
-            let flag = match (word(name_text(&parent)), word(name_text(&this))) {
+            let flag = match (word(name_text(parent)), word(name_text(this))) {
                 (Some(Word::rust_analyzer), Some(Word::skip)) => AttrFlags::RUST_ANALYZER_SKIP,
                 (Some(Word::rust_analyzer), Some(Word::prefer_underscore_import)) => {
                     AttrFlags::PREFER_UNDERSCORE_IMPORT
@@ -379,7 +447,7 @@ fn match_attr_flags(attr_flags: &mut AttrFlags, attr: ast::Meta) -> ControlFlow<
 
 /// The text of a path segment, `r#` stripped, as `AstPathExt` reads it.
 #[inline]
-fn name_text(name: &ast::NameRef) -> &str {
+fn name_text<'t>(name: ast::NameRef<'t>) -> &'t str {
     let text = name.text();
     text.strip_prefix("r#").unwrap_or(text)
 }
@@ -387,7 +455,9 @@ fn name_text(name: &ast::NameRef) -> &str {
 /// The path's last segment and, when its qualifier is one segment, that qualifier first:
 /// `AstPathExt::as_up_to_two_segment` without building a string.
 #[inline]
-fn up_to_two_segments(path: &ast::Path) -> Option<(ast::NameRef, Option<ast::NameRef>)> {
+fn up_to_two_segments<'t>(
+    path: ast::Path<'t>,
+) -> Option<(ast::NameRef<'t>, Option<ast::NameRef<'t>>)> {
     let parent = path.qualifier().and_then(|it| it.as_single_name_ref());
     let this = path.segment()?.name_ref()?;
     Some(match parent {
@@ -398,30 +468,36 @@ fn up_to_two_segments(path: &ast::Path) -> Option<(ast::NameRef, Option<ast::Nam
 
 /// Whether the path is the one segment `name`: `AstPathExt::is1` without building a string.
 #[inline]
-fn path_is(path: Option<ast::Path>, name: &str) -> bool {
-    path.is_some_and(|it| is_one(&it, name))
+fn path_is(path: Option<ast::Path<'_>>, name: &str) -> bool {
+    path.is_some_and(|it| is_one(it, name))
 }
 
 /// [`path_is`] of a path at hand.
 #[inline]
-fn is_one(path: &ast::Path, name: &str) -> bool {
-    path.as_single_name_ref().is_some_and(|it| name_text(&it) == name)
+fn is_one(path: ast::Path<'_>, name: &str) -> bool {
+    path.as_single_name_ref().is_some_and(|it| name_text(it) == name)
 }
 
 /// Whether the token tree has a token `text` among its direct children.
-fn tt_has_token(tt: &ast::TokenTree, text: &str) -> bool {
+fn tt_has_token(tt: ast::TokenTree<'_>, text: &str) -> bool {
     TokenTreeChildren::new(tt).any(|it| matches!(it, NodeOrToken::Token(it) if it.text() == text))
 }
 
 /// Whether a key-value attribute's value is the string literal `text`: `value_string` without
 /// building a string.
-fn string_value_is(attr: &ast::KeyValueMeta, text: &str) -> bool {
+fn string_value_is(attr: ast::KeyValueMeta<'_>, text: &str) -> bool {
+    string_value(attr).is_some_and(|it| *it == *text)
+}
+
+/// The string literal a key-value attribute's value is, `AstKeyValueMetaExt::value_string`
+/// lent from the tree: a buffer is made only when unescaping changes the text.
+fn string_value(attr: ast::KeyValueMeta<'_>) -> Option<Cow<'_, str>> {
     if let Some(ast::Expr::Literal(value)) = attr.expr()
         && let ast::LiteralKind::String(value) = value.kind()
     {
-        value.value().is_ok_and(|it| *it == *text)
+        value.value().ok()
     } else {
-        false
+        None
     }
 }
 
@@ -497,7 +573,7 @@ name_set! {
 
 name_set! {
     /// A key of `#[link(..)]` that a native library reads.
-    enum LinkKey { cfg, kind, modifiers, name }
+    enum LinkKey { cfg, import_name_type, kind, modifiers, name }
 }
 
 name_set! {
@@ -507,7 +583,7 @@ name_set! {
 
 name_set! {
     /// A modifier of `#[link(modifiers = "..")]`, its sign split off.
-    enum LinkModifier { bundle, verbatim, whole_archive = "whole-archive" }
+    enum LinkModifier { as_needed = "as-needed", bundle, verbatim, whole_archive = "whole-archive" }
 }
 
 /// The [`Word`] a name is, if any.
@@ -519,8 +595,11 @@ fn word(name: &str) -> Option<Word> {
 name_set! {
     /// An attribute name the flags or the value queries read.
     enum Word {
+    automatically_derived,
     bench,
+    cold,
     completions,
+    default,
     define_opaque,
     deprecated,
     diagnostic,
@@ -530,17 +609,22 @@ name_set! {
     fundamental,
     ignore,
     inline,
+    instruction_set,
     lang,
     link_name,
+    link_ordinal,
     link_section,
     linkage,
     macro_export,
     macro_style,
+    marker,
     may_dangle,
     must_use,
+    naked,
     no_mangle,
     no_std,
     non_exhaustive,
+    optimize,
     panic_handler,
     path,
     pointee,
@@ -558,6 +642,7 @@ name_set! {
     rustc_comptime,
     rustc_const_panic_str,
     rustc_deallocator,
+    rustc_deny_explicit_impl,
     rustc_deprecated_safe_2024,
     rustc_diagnostic_item,
     rustc_force_inline,
@@ -569,9 +654,11 @@ name_set! {
     rustc_layout_scalar_valid_range_end,
     rustc_layout_scalar_valid_range_start,
     rustc_legacy_const_generics,
+    rustc_main,
     rustc_must_implement_one_of,
     rustc_never_returns_null_ptr,
     rustc_no_implicit_autorefs,
+    rustc_no_mir_inline,
     rustc_nounwind,
     rustc_paren_sugar,
     rustc_pass_indirectly_in_non_rustic_abis,
@@ -716,45 +803,48 @@ bitflags::bitflags! {
         const RUSTC_CANONICAL_SYMBOL = 1 << 77;
         /// `#[sanitize(..)]`, one segment: [`disabled_sanitizers`].
         const HAS_SANITIZE = 1 << 78;
+        /// `#[marker]`.
+        const MARKER = 1 << 79;
+        /// `#[automatically_derived]`.
+        const AUTOMATICALLY_DERIVED = 1 << 80;
+        /// `#[rustc_main]`.
+        const RUSTC_MAIN = 1 << 81;
+        /// `#[default]`, on an enum's variant.
+        const DEFAULT = 1 << 82;
+        /// `#[naked]` or `#[unsafe(naked)]` on a function.
+        const NAKED = 1 << 83;
+        /// `#[rustc_deny_explicit_impl]`, on a trait: no impl of it may be written.
+        const RUSTC_DENY_EXPLICIT_IMPL = 1 << 84;
+        /// `#[link_ordinal(..)]`, on an item of an `extern` block: imported by ordinal.
+        const HAS_LINK_ORDINAL = 1 << 85;
+        // One segment each; the inliner refuses on them as rustc's `is_inline_valid_on_fn`
+        // and `check_codegen_attributes` do.
+        /// `#[rustc_no_mir_inline]`.
+        const RUSTC_NO_MIR_INLINE = 1 << 86;
+        /// `#[cold]`.
+        const COLD = 1 << 87;
+        /// `#[optimize(none)]`: rustc's `OptimizeAttr::DoNotOptimize`.
+        const OPTIMIZE_NONE = 1 << 88;
+        /// `#[instruction_set(..)]`, any argument.
+        const HAS_INSTRUCTION_SET = 1 << 89;
     }
 }
 
 const _: () = assert!(size_of::<AttrFlags>() == 16);
 
-pub fn parse_extra_crate_attrs(db: &Db, krate: Crate) -> Option<SourceFile> {
-    let crate_data = krate.data(db);
-    let crate_attrs = &crate_data.crate_attrs;
-    if crate_attrs.is_empty() {
-        return None;
-    }
-    // All attributes are already enclosed in `#![]`.
-    let combined = crate_attrs.concat();
-    let p = SourceFile::parse(&combined, crate_data.edition);
-
-    let errs = p.errors();
-    if !errs.is_empty() {
-        let base_msg = "Failed to parse extra crate-level attribute";
-        let crate_name =
-            krate.extra_data(db).display_name.as_ref().map_or("{unknown}", |name| name.as_str());
-        let mut errs = errs.iter().peekable();
-        let mut offset = TextSize::from(0);
-        for raw_attr in crate_attrs {
-            let attr_end = offset + TextSize::of(&**raw_attr);
-            if errs.peeking_take_while(|e| e.range().start() < attr_end).count() > 0 {
-                tracing::error!("{base_msg} {raw_attr} for crate {crate_name}");
-            }
-            offset = attr_end
-        }
-        return None;
-    }
-
-    Some(p.tree())
+/// The attributes rustc appends to `krate`'s root's own inner attributes, each in its file: the
+/// crate attributes given on the command line that it applies
+/// ([`base_db::applied_crate_attr_files`]), in the order given.
+pub fn cli_crate_attrs(db: &Db, krate: Crate) -> impl Iterator<Item = InFile<ast::Attr<'_>>> {
+    base_db::applied_crate_attr_files(db, krate).iter().flat_map(move |&file| {
+        file.parse(db).view().attrs().map(move |attr| InFile::new(HirFileId::from(file), attr))
+    })
 }
 
 /// Whether the crate root declares `#![no_std]`, looking through `cfg_attr` gating.
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn crate_supports_no_std(db: &Db, krate: Crate) -> bool {
-    fn contains_no_std(meta: ast::Meta) -> bool {
+    fn contains_no_std(meta: ast::Meta<'_>) -> bool {
         match meta {
             ast::Meta::PathMeta(meta) => path_is(meta.path(), "no_std"),
             ast::Meta::CfgAttrMeta(meta) => meta.metas().any(contains_no_std),
@@ -765,67 +855,70 @@ pub(crate) fn crate_supports_no_std(db: &Db, krate: Crate) -> bool {
         }
     }
 
-    let root_file = krate.root_file_id(db).parse(db).tree();
-    parse_extra_crate_attrs(db, krate)
-        .into_iter()
-        .flat_map(|extra| extra.attrs())
-        .chain(root_file.attrs())
+    let root_file = krate.root_file_id(db).parse(db).view();
+    root_file
+        .attrs()
+        .chain(cli_crate_attrs(db, krate).map(|attr| attr.value))
         .filter_map(|attr| attr.meta())
         .any(contains_no_std)
 }
 
+/// The syntax `owner`'s attributes are read off, its outer `mod` declaration, the files of the
+/// crate attributes applied after its own for a crate root ([`cli_crate_attrs`]), and its
+/// crate: off the tree `tree` says.
 fn attrs_source(
     db: &Db,
     owner: AttrDefId,
-) -> (InFile<ast::AnyHasAttrs>, Option<InFile<ast::Module>>, Option<SourceFile>, Crate) {
+    tree: Tree,
+) -> (InFile<ast::AnyHasAttrs<'_>>, Option<InFile<ast::Module<'_>>>, &[EditionedFileId], Crate) {
     let (owner, krate) = match owner {
         AttrDefId::ModuleId(id) => {
             let def_map = id.def_map(db);
             let krate = def_map.krate();
-            let (definition, declaration, extra_crate_attrs) = match def_map.module(db, id).origin {
+            let (definition, declaration, crate_attrs) = match def_map.module(db, id).origin {
                 ModuleOrigin::CrateRoot { definition } => {
-                    let definition_source = definition.parse(db).tree();
+                    let definition_source = file_root(db, definition, tree);
                     let definition = InFile::new(definition.into(), definition_source.into());
-                    let extra_crate_attrs = parse_extra_crate_attrs(db, krate);
-                    (definition, None, extra_crate_attrs)
+                    (definition, None, base_db::applied_crate_attr_files(db, krate))
                 }
                 ModuleOrigin::File { declaration, declaration_tree_id, definition, .. } => {
-                    let definition_source = definition.parse(db).tree();
+                    let definition_source = file_root(db, definition, tree);
                     let definition = InFile::new(definition.into(), definition_source.into());
                     let declaration = InFile::new(declaration_tree_id.file_id(), declaration);
-                    let declaration = declaration.with_value(declaration.to_node(db));
-                    (definition, Some(declaration), None)
+                    let declaration = declaration.with_value(item_node(db, declaration, tree));
+                    (definition, Some(declaration), &[][..])
                 }
                 ModuleOrigin::Inline { definition_tree_id, definition } => {
                     let definition = InFile::new(definition_tree_id.file_id(), definition);
-                    let definition = definition.with_value(definition.to_node(db).into());
-                    (definition, None, None)
+                    let definition =
+                        definition.with_value(item_node(db, definition, tree).into());
+                    (definition, None, &[][..])
                 }
                 ModuleOrigin::BlockExpr { block, .. } => {
-                    let definition = block.to_node(db);
-                    (block.with_value(definition.into()), None, None)
+                    let definition = block.to_view(db);
+                    (block.with_value(definition.into()), None, &[][..])
                 }
             };
-            return (definition, declaration, extra_crate_attrs, krate);
+            return (definition, declaration, crate_attrs, krate);
         }
-        AttrDefId::AdtId(AdtId::StructId(it)) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::AdtId(AdtId::UnionId(it)) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::AdtId(AdtId::EnumId(it)) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::FunctionId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::EnumVariantId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::StaticId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::ConstId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::TraitId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::TypeAliasId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::MacroId(MacroId::MacroRulesId(it)) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::MacroId(MacroId::Macro2Id(it)) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::MacroId(MacroId::ProcMacroId(it)) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::ImplId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::ExternBlockId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::ExternCrateId(it) => attrs_from_ast_id_loc(db, it),
-        AttrDefId::UseId(it) => attrs_from_ast_id_loc(db, it),
+        AttrDefId::AdtId(AdtId::StructId(it)) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::AdtId(AdtId::UnionId(it)) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::AdtId(AdtId::EnumId(it)) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::FunctionId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::EnumVariantId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::StaticId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::ConstId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::TraitId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::TypeAliasId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::MacroId(MacroId::MacroRulesId(it)) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::MacroId(MacroId::Macro2Id(it)) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::MacroId(MacroId::ProcMacroId(it)) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::ImplId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::ExternBlockId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::ExternCrateId(it) => attrs_from_ast_id_loc(db, it, tree),
+        AttrDefId::UseId(it) => attrs_from_ast_id_loc(db, it, tree),
     };
-    (owner, None, None, krate)
+    (owner, None, &[], krate)
 }
 
 fn resolver_for_attr_def_id(db: &Db, owner: AttrDefId) -> Resolver<'_> {
@@ -850,51 +943,67 @@ fn resolver_for_attr_def_id(db: &Db, owner: AttrDefId) -> Resolver<'_> {
     }
 }
 
-fn collect_attrs<BreakValue>(
-    db: &Db,
+fn collect_attrs<'db, BreakValue>(
+    db: &'db Db,
     owner: AttrDefId,
-    callback: impl FnMut(ast::Meta) -> ControlFlow<BreakValue>,
+    mut callback: impl FnMut(ast::Meta<'db>) -> ControlFlow<BreakValue>,
 ) -> Option<BreakValue> {
-    let (source, outer_mod_decl, extra_crate_attrs, krate) = attrs_source(db, owner);
-    collect_attrs_in(db, &source, outer_mod_decl, extra_crate_attrs, krate, callback)
+    let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, owner, Tree::Outline);
+    collect_attrs_in(db, source, outer_mod_decl, crate_attrs, krate, |meta, _| callback(meta))
 }
 
-/// [`collect_attrs`] over a source [`attrs_source`] already found.
-fn collect_attrs_in<BreakValue>(
-    db: &Db,
-    source: &InFile<ast::AnyHasAttrs>,
-    outer_mod_decl: Option<InFile<ast::Module>>,
-    extra_crate_attrs: Option<SourceFile>,
+/// [`collect_attrs`] over a source [`attrs_source`] already found, each attribute with its file,
+/// in rustc's order: the outer `mod` declaration's, the owner's own, then the crate
+/// attributes' (`crate_attrs`, rustc appends them to the crate root's).
+fn collect_attrs_in<'db, BreakValue>(
+    db: &'db Db,
+    source: InFile<ast::AnyHasAttrs<'db>>,
+    outer_mod_decl: Option<InFile<ast::Module<'db>>>,
+    crate_attrs: &'db [EditionedFileId],
     krate: Crate,
-    mut callback: impl FnMut(ast::Meta) -> ControlFlow<BreakValue>,
+    mut callback: impl FnMut(ast::Meta<'db>, HirFileId) -> ControlFlow<BreakValue>,
 ) -> Option<BreakValue> {
-    let extra_attrs = extra_crate_attrs
-        .into_iter()
-        .flat_map(|src| src.attrs())
-        .chain(outer_mod_decl.into_iter().flat_map(|it| it.value.attrs()));
-
     let mut cfg_options = None;
-    expand_cfg_attr(
-        extra_attrs.chain(ast::attrs_including_inner(&source.value)),
-        || cfg_options.get_or_insert_with(|| krate.cfg_options(db)),
-        move |meta, _| callback(meta),
-    )
+    let mut cfg = || *cfg_options.get_or_insert_with(|| krate.cfg_options(db));
+    if let Some(decl) = outer_mod_decl {
+        let file = decl.file_id;
+        let found =
+            expand_cfg_attr_view(decl.value.attrs(), &mut cfg, |meta, _| callback(meta, file));
+        if found.is_some() {
+            return found;
+        }
+    }
+    let file = source.file_id;
+    let attrs = ast::attrs_including_inner(&source.value);
+    let found = expand_cfg_attr_view(attrs, &mut cfg, |meta, _| callback(meta, file));
+    if found.is_some() {
+        return found;
+    }
+    for &attr_file in crate_attrs {
+        let file = HirFileId::from(attr_file);
+        let attrs = attr_file.parse(db).view().attrs();
+        let found = expand_cfg_attr_view(attrs, &mut cfg, |meta, _| callback(meta, file));
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
 }
 
 /// The value of the `#[name = value]` attribute of `owner`, with the macros in it expanded:
 /// rustc expands the expression of a key-value attribute before it reads it
 /// (`rustc_expand::expand::InvocationCollector::visit_attribute` walks into `AttrArgs::Eq`).
 pub(crate) fn symbol_attr(db: &Db, owner: AttrDefId, name: &str) -> Option<Symbol> {
-    let (source, outer_mod_decl, extra_crate_attrs, krate) = attrs_source(db, owner);
+    let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
     let value =
-        collect_attrs_in(db, &source, outer_mod_decl, extra_crate_attrs, krate, |attr| match attr {
+        collect_attrs_in(db, source, outer_mod_decl, crate_attrs, krate, |attr, file| match attr {
             ast::Meta::KeyValueMeta(attr) if path_is(attr.path(), name) => match attr.expr() {
-                Some(value) => ControlFlow::Break(value),
+                Some(value) => ControlFlow::Break(InFile::new(file, value)),
                 None => ControlFlow::Continue(()),
             },
             _ => ControlFlow::Continue(()),
         })?;
-    attr_value(db, owner, krate, source.with_value(value))
+    attr_value(db, owner, krate, value)
 }
 
 /// The string a key-value attribute's value is, with the macros in it expanded by the
@@ -903,13 +1012,13 @@ fn attr_value(
     db: &Db,
     owner: AttrDefId,
     krate: Crate,
-    value: InFile<ast::Expr>,
+    value: InFile<ast::Expr<'_>>,
 ) -> Option<Symbol> {
     let InFile { file_id, value } = value;
     // A string literal, the usual value, reads as `expand_attr_value` reads it, with no
     // resolver or span map built for it.
-    let mut literal = value.clone();
-    while let ast::Expr::ParenExpr(paren) = &literal {
+    let mut literal = value;
+    while let ast::Expr::ParenExpr(paren) = literal {
         literal = paren.expr()?;
     }
     match literal {
@@ -926,38 +1035,57 @@ fn attr_value(
     }
 }
 
-fn collect_field_attrs<T>(
-    db: &Db,
+fn collect_field_attrs<'db, T>(
+    db: &'db Db,
     variant: VariantId,
-    mut field_attrs: impl FnMut(&CfgOptions, InFile<ast::AnyHasAttrs>) -> T,
+    tree: Tree,
+    frame: &Frame,
+    mut field_attrs: impl FnMut(&CfgOptions, InFile<ast::AnyHasAttrs<'db>>) -> T,
 ) -> ArenaMap<LocalFieldId, T> {
-    let mut result = ArenaMap::new();
-    for_each_field(db, variant, |idx, cfg_options, field| {
-        result.insert(
-            la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(idx)),
-            field_attrs(cfg_options, field),
-        );
+    let mut values = Vec::new_in(frame);
+    for_each_field(db, variant, tree, |_, cfg_options, field| {
+        values.push(field_attrs(cfg_options, field));
     });
-    result.shrink_to_fit();
+    // alloc: the memo's map, exact: one slot a field the cfg leaves in
+    let mut result = ArenaMap::with_capacity(values.len());
+    // `for_each_field` numbers the fields `0..` with no gap, so the index is the position.
+    for (idx, value) in values.drain(..).enumerate() {
+        result.insert(la_arena::Idx::from_raw(la_arena::RawIdx::from_u32(idx as u32)), value);
+    }
     result
 }
 
+/// An `ArenaMap` of `entries` (in index order), with room for exactly the last index.
+fn exact_arena_map<T, V: Copy>(
+    entries: &[(la_arena::Idx<T>, V)],
+) -> ArenaMap<la_arena::Idx<T>, V> {
+    let len = entries.last().map_or(0, |(idx, _)| u32::from(idx.into_raw()) as usize + 1);
+    // alloc: the memo's map, exact
+    let mut map = ArenaMap::with_capacity(len);
+    for &(idx, value) in entries {
+        map.insert(idx, value);
+    }
+    map
+}
+
 /// Calls `each` with the index, the crate's cfg options and the syntax of every field of
-/// `variant` its cfg leaves in, in order: the indices are `0..` with no gap.
-fn for_each_field(
-    db: &Db,
+/// `variant` its cfg leaves in, in order: the indices are `0..` with no gap. The fields are
+/// read off the tree `tree` says.
+fn for_each_field<'db>(
+    db: &'db Db,
     variant: VariantId,
-    mut each: impl FnMut(u32, &CfgOptions, InFile<ast::AnyHasAttrs>),
+    tree: Tree,
+    mut each: impl FnMut(u32, &CfgOptions, InFile<ast::AnyHasAttrs<'db>>),
 ) {
     let (variant_syntax, krate) = match variant {
-        VariantId::EnumVariantId(it) => attrs_from_ast_id_loc(db, it),
-        VariantId::StructId(it) => attrs_from_ast_id_loc(db, it),
-        VariantId::UnionId(it) => attrs_from_ast_id_loc(db, it),
+        VariantId::EnumVariantId(it) => attrs_from_ast_id_loc(db, it, tree),
+        VariantId::StructId(it) => attrs_from_ast_id_loc(db, it, tree),
+        VariantId::UnionId(it) => attrs_from_ast_id_loc(db, it, tree),
     };
     let cfg_options = krate.cfg_options(db);
-    let variant_syntax = variant_syntax
-        .with_value(ast::VariantDef::cast(variant_syntax.value.syntax().clone()).unwrap());
-    let fields = match &variant_syntax.value {
+    let variant_syntax =
+        variant_syntax.with_value(ast::VariantDef::cast(variant_syntax.value.syntax()).unwrap());
+    let fields = match variant_syntax.value {
         ast::VariantDef::Struct(it) => it.field_list(),
         ast::VariantDef::Union(it) => it.record_field_list().map(ast::FieldList::RecordFieldList),
         ast::VariantDef::Variant(it) => it.field_list(),
@@ -970,7 +1098,7 @@ fn for_each_field(
     match fields {
         ast::FieldList::RecordFieldList(fields) => {
             for field in fields.fields() {
-                if AttrFlags::is_cfg_enabled_for(&field, cfg_options).is_ok() {
+                if AttrFlags::is_cfg_enabled_for(field, cfg_options).is_ok() {
                     each(idx, cfg_options, variant_syntax.with_value(field.into()));
                     idx += 1;
                 }
@@ -978,7 +1106,7 @@ fn for_each_field(
         }
         ast::FieldList::TupleFieldList(fields) => {
             for field in fields.fields() {
-                if AttrFlags::is_cfg_enabled_for(&field, cfg_options).is_ok() {
+                if AttrFlags::is_cfg_enabled_for(field, cfg_options).is_ok() {
                     each(idx, cfg_options, variant_syntax.with_value(field.into()));
                     idx += 1;
                 }
@@ -999,7 +1127,10 @@ pub struct DeriveInfo {
     pub helpers: Box<[Symbol]>,
 }
 
-fn extract_doc_aliases(result: &mut Vec<Symbol>, attr: ast::Meta) -> ControlFlow<Infallible> {
+fn extract_doc_aliases(
+    result: &mut Vec<Symbol, &Frame>,
+    attr: ast::Meta<'_>,
+) -> ControlFlow<Infallible> {
     if let ast::Meta::TokenTreeMeta(attr) = attr
         && path_is(attr.path(), "doc")
         && let Some(tt) = attr.token_tree()
@@ -1031,6 +1162,10 @@ pub struct NativeLib {
     /// Not `-bundle`: a static library's objects go into the archive of a `staticlib` that
     /// links it, as rustc's default is.
     pub bundle: bool,
+    /// `+as-needed` or `-as-needed`, when written: `None` leaves the linker's default.
+    pub as_needed: Option<bool>,
+    /// `import_name_type = ".."`, as written.
+    pub import_name_type: Option<Symbol>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1041,17 +1176,21 @@ pub enum NativeLibKind {
     Static,
     Framework,
     RawDylib,
+    /// A `kind` other than these (`"link-arg"`, or one rustc refuses), as written.
+    Other(Symbol),
 }
 
 /// The library of a `link(...)`, and the `cfg(...)` it is linked under. `None` for one with no
 /// name (`wasm_import_module` alone).
-fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
+fn parse_link_tt(tt: ast::TokenTree<'_>) -> Option<(NativeLib, Option<CfgExpr>)> {
     let mut lib = NativeLib {
         name: Symbol::empty(),
         kind: NativeLibKind::Unspecified,
         verbatim: false,
         whole_archive: false,
         bundle: true,
+        as_needed: None,
+        import_name_type: None,
     };
     let mut cfg = None;
     let mut named = false;
@@ -1064,17 +1203,14 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
         let key = LinkKey::of(key.text());
         match children.peek() {
             Some(NodeOrToken::Node(group)) if key == Some(LinkKey::cfg) => {
-                cfg = link_cfg(group);
+                cfg = link_cfg(*group);
                 children.next();
             }
             Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
                 children.next();
                 let Some(NodeOrToken::Token(value)) = children.next() else { continue };
-                let Some(value) =
-                    ast::String::cast(value).and_then(|it| Some(it.value().ok()?.into_owned()))
-                else {
-                    continue;
-                };
+                let Some(value) = ast::String::cast(value) else { continue };
+                let Ok(value) = value.value() else { continue };
                 match key {
                     Some(LinkKey::name) => {
                         lib.name = Symbol::intern(&value);
@@ -1086,8 +1222,11 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
                             Some(LinkKind::dylib) => NativeLibKind::Dylib,
                             Some(LinkKind::framework) => NativeLibKind::Framework,
                             Some(LinkKind::raw_dylib) => NativeLibKind::RawDylib,
-                            None => NativeLibKind::Unspecified,
+                            None => NativeLibKind::Other(Symbol::intern(&value)),
                         }
+                    }
+                    Some(LinkKey::import_name_type) => {
+                        lib.import_name_type = Some(Symbol::intern(&value));
                     }
                     Some(LinkKey::modifiers) => {
                         for modifier in value.split(',') {
@@ -1097,6 +1236,7 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
                                 Some(LinkModifier::verbatim) => lib.verbatim = on,
                                 Some(LinkModifier::whole_archive) => lib.whole_archive = on,
                                 Some(LinkModifier::bundle) => lib.bundle = on,
+                                Some(LinkModifier::as_needed) => lib.as_needed = Some(on),
                                 None => (),
                             }
                         }
@@ -1110,8 +1250,8 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
     named.then_some((lib, cfg))
 }
 
-/// The string a `link(...)` gives `key`, as `key = "value"`.
-fn link_value(tt: &ast::TokenTree, key: &str) -> Option<String> {
+/// The string a `link(...)` gives `key`, as `key = "value"`, interned.
+fn link_symbol(tt: ast::TokenTree<'_>, key: &str) -> Option<Symbol> {
     let mut children = TokenTreeChildren::new(tt).peekable();
     while let Some(child) = children.next() {
         let NodeOrToken::Token(name) = child else { continue };
@@ -1123,35 +1263,44 @@ fn link_value(tt: &ast::TokenTree, key: &str) -> Option<String> {
             continue;
         }
         let Some(NodeOrToken::Token(value)) = children.next() else { continue };
-        return ast::String::cast(value).and_then(|it| Some(it.value().ok()?.into_owned()));
+        return ast::String::cast(value).and_then(|it| Some(Symbol::intern(&it.value().ok()?)));
     }
     None
 }
 
 /// The `cfg(...)` of a `link(...)`, the group after `cfg`: read as the predicate of a
-/// `#[cfg]` with that group.
-fn link_cfg(group: &ast::TokenTree) -> Option<CfgExpr> {
-    let text = format!("#[cfg{}] fn f() {{}}", group.syntax().text());
-    let file = SourceFile::parse(&text, span::Edition::CURRENT).tree();
-    let attr = file.syntax().descendants().find_map(ast::Attr::cast)?;
+/// `#[cfg]` with that group. Only a `#[link(.., cfg(..))]`, once per extern block, inside its
+/// memo.
+fn link_cfg(group: ast::TokenTree<'_>) -> Option<CfgExpr> {
+    let parse = blaze_mem::scratch::with_string(|text| {
+        use std::fmt::Write;
+        // A `String` takes every write.
+        let _ = write!(text, "#[cfg{}] fn f() {{}}", group.syntax().text());
+        SourceFile::parse(text, span::Edition::CURRENT)
+    });
+    let attr = parse.root().descendants().find_map(ast::Attr::cast)?;
     match attr.meta()? {
-        ast::Meta::CfgMeta(it) => Some(CfgExpr::parse_from_ast(it.cfg_predicate()?)),
+        ast::Meta::CfgMeta(it) => Some(CfgExpr::parse_from_view(it.cfg_predicate()?)),
         _ => None,
     }
 }
 
-fn extract_cfgs(result: &mut Vec<CfgExpr>, attr: ast::Meta) -> ControlFlow<Infallible> {
+fn extract_cfgs(
+    result: &mut Vec<CfgExpr, &Frame>,
+    attr: ast::Meta<'_>,
+) -> ControlFlow<Infallible> {
     if let ast::Meta::CfgMeta(attr) = attr
         && let Some(cfg_predicate) = attr.cfg_predicate()
     {
-        result.push(CfgExpr::parse_from_ast(cfg_predicate));
+        result.push(CfgExpr::parse_from_view(cfg_predicate));
     }
     ControlFlow::Continue(())
 }
 
+
 #[salsa::tracked]
 impl AttrFlags {
-    #[salsa::tracked(returns(copy))]
+    #[salsa::tracked(returns(copy), mem_tag = Nameres)]
     pub fn query(db: &Db, owner: AttrDefId) -> AttrFlags {
         let mut attr_flags = AttrFlags::empty();
         collect_attrs(db, owner, |attr| match_attr_flags(&mut attr_flags, attr));
@@ -1167,19 +1316,22 @@ impl AttrFlags {
 
         /// The flags of each field the cfg leaves in, indexed by `LocalFieldId`: 16 bytes a
         /// field, read by index.
-        #[salsa::tracked(returns(ref))]
+        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
         fn field_attr_flags(db: &Db, variant: VariantId) -> Box<[AttrFlags]> {
-            let mut result = SmallVec::<[AttrFlags; 8]>::new();
-            for_each_field(db, variant, |_, cfg_options, field| {
-                let mut attr_flags = AttrFlags::empty();
-                expand_cfg_attr(
-                    field.value.attrs(),
-                    || cfg_options,
-                    |attr, _| match_attr_flags(&mut attr_flags, attr),
-                );
-                result.push(attr_flags);
-            });
-            result.into_boxed_slice()
+            blaze_mem::frame::current(|frame| {
+                let mut result = Vec::new_in(frame);
+                for_each_field(db, variant, Tree::Outline, |_, cfg_options, field| {
+                    let mut attr_flags = AttrFlags::empty();
+                    expand_cfg_attr_view(
+                        field.value.attrs(),
+                        || cfg_options,
+                        |attr, _| match_attr_flags(&mut attr_flags, attr),
+                    );
+                    result.push(attr_flags);
+                });
+                // alloc: the memo's flags, exact
+                Box::from(&result[..])
+            })
         }
     }
 
@@ -1197,45 +1349,45 @@ impl AttrFlags {
         }
         return generic_params_attr_flags(db, def);
 
-        #[salsa::tracked(returns(ref))]
+        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
         fn generic_params_attr_flags(
             db: &Db,
             def: GenericDefId,
         ) -> (ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>)
         {
-            let mut lifetimes = ArenaMap::new();
-            let mut type_and_consts = ArenaMap::new();
+            blaze_mem::frame::current(|frame| {
+                let mut cfg_options = None;
+                let mut cfg_options =
+                    || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
 
-            let mut cfg_options = None;
-            let mut cfg_options =
-                || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
-
-            let lifetimes_source = HasChildSource::<LocalLifetimeParamId>::child_source(&def, db);
-            for (lifetime_id, lifetime) in lifetimes_source.value.iter() {
-                let mut attr_flags = AttrFlags::empty();
-                expand_cfg_attr(lifetime.attrs(), &mut cfg_options, |attr, _| {
-                    match_attr_flags(&mut attr_flags, attr)
-                });
-                if !attr_flags.is_empty() {
-                    lifetimes.insert(lifetime_id, attr_flags);
+                let mut lifetimes = Vec::new_in(frame);
+                let lifetimes_source =
+                    HasChildSourceView::<LocalLifetimeParamId>::child_source_view(&def, db);
+                for (lifetime_id, lifetime) in lifetimes_source.value.iter() {
+                    let mut attr_flags = AttrFlags::empty();
+                    expand_cfg_attr_view(lifetime.attrs(), &mut cfg_options, |attr, _| {
+                        match_attr_flags(&mut attr_flags, attr)
+                    });
+                    if !attr_flags.is_empty() {
+                        lifetimes.push((lifetime_id, attr_flags));
+                    }
                 }
-            }
 
-            let type_and_consts_source =
-                HasChildSource::<LocalTypeOrConstParamId>::child_source(&def, db);
-            for (type_or_const_id, type_or_const) in type_and_consts_source.value.iter() {
-                let mut attr_flags = AttrFlags::empty();
-                expand_cfg_attr(type_or_const.attrs(), &mut cfg_options, |attr, _| {
-                    match_attr_flags(&mut attr_flags, attr)
-                });
-                if !attr_flags.is_empty() {
-                    type_and_consts.insert(type_or_const_id, attr_flags);
+                let mut type_and_consts = Vec::new_in(frame);
+                let type_and_consts_source =
+                    HasChildSourceView::<LocalTypeOrConstParamId>::child_source_view(&def, db);
+                for (type_or_const_id, type_or_const) in type_and_consts_source.value.iter() {
+                    let mut attr_flags = AttrFlags::empty();
+                    expand_cfg_attr_view(type_or_const.attrs(), &mut cfg_options, |attr, _| {
+                        match_attr_flags(&mut attr_flags, attr)
+                    });
+                    if !attr_flags.is_empty() {
+                        type_and_consts.push((type_or_const_id, attr_flags));
+                    }
                 }
-            }
 
-            lifetimes.shrink_to_fit();
-            type_and_consts.shrink_to_fit();
-            (lifetimes, type_and_consts)
+                (exact_arena_map(&lifetimes), exact_arena_map(&type_and_consts))
+            })
         }
     }
 
@@ -1259,18 +1411,27 @@ impl AttrFlags {
             .unwrap_or_else(AttrFlags::empty)
     }
 
-    pub(crate) fn is_cfg_enabled_for(
-        owner: &dyn HasAttrs,
+    #[inline]
+    pub(crate) fn is_cfg_enabled_for<'t>(
+        owner: impl HasAttrs<'t>,
         cfg_options: &CfgOptions,
     ) -> Result<(), CfgExpr> {
-        let attrs = ast::attrs_including_inner(owner);
-        let result = expand_cfg_attr(
-            attrs,
+        Self::is_cfg_enabled_in(ast::AnyHasAttrs::new(owner), cfg_options)
+    }
+
+    /// [`AttrFlags::is_cfg_enabled_for`] of an owner as the view every attribute owner is:
+    /// one instance for every kind of owner.
+    pub(crate) fn is_cfg_enabled_in(
+        owner: ast::AnyHasAttrs<'_>,
+        cfg_options: &CfgOptions,
+    ) -> Result<(), CfgExpr> {
+        let result = expand_cfg_attr_view(
+            ast::attrs_including_inner(&owner),
             || cfg_options,
             |attr, _| {
                 if let ast::Meta::CfgMeta(attr) = attr
                     && let Some(cfg_predicate) = attr.cfg_predicate()
-                    && let cfg = CfgExpr::parse_from_ast(cfg_predicate)
+                    && let cfg = CfgExpr::parse_from_view(cfg_predicate)
                     && cfg_options.check(&cfg) == Some(false)
                 {
                     ControlFlow::Break(cfg)
@@ -1298,7 +1459,7 @@ impl AttrFlags {
         }
         return link_name(db, owner);
 
-        #[salsa::tracked(returns(clone))]
+        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
         fn link_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "link_name")
         }
@@ -1313,7 +1474,7 @@ impl AttrFlags {
         }
         return diagnostic_item(db, owner);
 
-        #[salsa::tracked(returns(clone))]
+        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
         fn diagnostic_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "rustc_diagnostic_item")
         }
@@ -1321,35 +1482,38 @@ impl AttrFlags {
 
     /// The native libraries the `#[link(...)]`s of an `extern` block link its crate against,
     /// those whose `cfg(...)` the crate does not have left out, in the order written.
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
     pub fn native_libs(db: &Db, owner: ExternBlockId) -> Box<[NativeLib]> {
         let krate = owner.lookup(db).container.krate(db);
-        let mut libs = Vec::new();
-        collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
-            if let ast::Meta::TokenTreeMeta(attr) = &attr
-                && path_is(attr.path(), "link")
-                && let Some(tt) = attr.token_tree()
-                && let Some((lib, cfg)) = parse_link_tt(&tt)
-                && cfg.is_none_or(|it| krate.cfg_options(db).check(&it) != Some(false))
-            {
-                libs.push(lib);
-            }
-            ControlFlow::Continue(())
-        });
-        libs.into_boxed_slice()
+        blaze_mem::frame::current(|frame| {
+            let mut libs = Vec::new_in(frame);
+            collect_attrs::<Infallible>(db, AttrDefId::ExternBlockId(owner), |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = &attr
+                    && path_is(attr.path(), "link")
+                    && let Some(tt) = attr.token_tree()
+                    && let Some((lib, cfg)) = parse_link_tt(tt)
+                    && cfg.is_none_or(|it| krate.cfg_options(db).check(&it) != Some(false))
+                {
+                    libs.push(lib);
+                }
+                ControlFlow::Continue(())
+            });
+            // alloc: the memo's libraries, exact; nothing for an extern block without `#[link]`
+            libs.drain(..).collect()
+        })
     }
 
     /// The module a wasm module imports the functions of an `extern` block from,
     /// `#[link(wasm_import_module = "...")]`: they are its imports, not a library's.
-    #[salsa::tracked(returns(clone))]
+    #[salsa::tracked(returns(clone), mem_tag = Nameres)]
     pub fn wasm_import_module(db: &Db, owner: ExternBlockId) -> Option<Symbol> {
         collect_attrs(db, AttrDefId::ExternBlockId(owner), |attr| {
             if let ast::Meta::TokenTreeMeta(attr) = &attr
                 && path_is(attr.path(), "link")
                 && let Some(tt) = attr.token_tree()
-                && let Some(module) = link_value(&tt, "wasm_import_module")
+                && let Some(module) = link_symbol(tt, "wasm_import_module")
             {
-                return ControlFlow::Break(Symbol::intern(&module));
+                return ControlFlow::Break(module);
             }
             ControlFlow::Continue(())
         })
@@ -1363,7 +1527,7 @@ impl AttrFlags {
         }
         return link_section(db, owner);
 
-        #[salsa::tracked(returns(clone))]
+        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
         fn link_section(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "link_section")
         }
@@ -1377,7 +1541,7 @@ impl AttrFlags {
         }
         return linkage(db, owner);
 
-        #[salsa::tracked(returns(clone))]
+        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
         fn linkage(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "linkage")
         }
@@ -1391,7 +1555,7 @@ impl AttrFlags {
         }
         return export_name(db, owner);
 
-        #[salsa::tracked(returns(clone))]
+        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
         fn export_name(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             symbol_attr(db, owner, "export_name")
         }
@@ -1404,6 +1568,15 @@ impl AttrFlags {
             Some(Word::rustc_nounwind) => AttrFlags::RUSTC_NOUNWIND,
             Some(Word::rustc_comptime) => AttrFlags::RUSTC_COMPTIME,
             Some(Word::panic_handler) => AttrFlags::PANIC_HANDLER,
+            Some(Word::rustc_canonical_symbol) => AttrFlags::RUSTC_CANONICAL_SYMBOL,
+            Some(Word::marker) => AttrFlags::MARKER,
+            Some(Word::automatically_derived) => AttrFlags::AUTOMATICALLY_DERIVED,
+            Some(Word::rustc_main) => AttrFlags::RUSTC_MAIN,
+            Some(Word::default) => AttrFlags::DEFAULT,
+            Some(Word::naked) => AttrFlags::NAKED,
+            Some(Word::rustc_deny_explicit_impl) => AttrFlags::RUSTC_DENY_EXPLICIT_IMPL,
+            Some(Word::rustc_no_mir_inline) => AttrFlags::RUSTC_NO_MIR_INLINE,
+            Some(Word::cold) => AttrFlags::COLD,
             _ => return Self::has_word_in_source(db, owner, name),
         };
         AttrFlags::query(db, owner).contains(flag)
@@ -1427,12 +1600,12 @@ impl AttrFlags {
 
         return lang_item(db, owner);
 
-        #[salsa::tracked(returns(clone))]
+        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
         fn lang_item(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::KeyValueMeta(attr) = attr
                     && path_is(attr.path(), "lang")
-                    && let Some(value) = attr.value_string()
+                    && let Some(value) = string_value(attr)
                 {
                     ControlFlow::Break(Symbol::intern(&value))
                 } else {
@@ -1456,7 +1629,7 @@ impl AttrFlags {
     ///
     /// Prefer [`AttrFlags::repr()`] in non-perf-sensitive places as it also has a check that
     /// that the ADT has repr.
-    #[salsa::tracked(returns(copy))]
+    #[salsa::tracked(returns(copy), mem_tag = Nameres)]
     pub fn repr_assume_has(db: &Db, owner: AdtId) -> Option<ReprOptions> {
         let mut result = None;
         collect_attrs::<Infallible>(db, owner.into(), |attr| {
@@ -1465,12 +1638,12 @@ impl AttrFlags {
                 && let Some(path) = attr.path()
                 && let Some(tt) = attr.token_tree()
             {
-                if is_one(&path, "repr")
-                    && let Some(repr) = parse_repr_tt(&tt)
+                if is_one(path, "repr")
+                    && let Some(repr) = parse_repr_tt(tt)
                 {
                     current = Some(repr);
-                } else if is_one(&path, "rustc_scalable_vector")
-                    && let mut tt = TokenTreeChildren::new(&tt)
+                } else if is_one(path, "rustc_scalable_vector")
+                    && let mut tt = TokenTreeChildren::new(tt)
                     && let Some(NodeOrToken::Token(scalable)) = tt.next()
                     && let Some(scalable) = ast::IntNumber::cast(scalable)
                     && let Ok(scalable) = scalable.value()
@@ -1502,36 +1675,37 @@ impl AttrFlags {
     }
 
     /// Call this only if there are legacy const generics, to save memory.
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
     pub(crate) fn legacy_const_generic_indices(
         db: &Db,
         owner: FunctionId,
     ) -> Option<Box<[u32]>> {
-        let result = collect_attrs(db, owner.into(), |attr| {
-            if let ast::Meta::TokenTreeMeta(attr) = attr
-                && path_is(attr.path(), "rustc_legacy_const_generics")
-                && let Some(tt) = attr.token_tree()
-            {
-                let result = parse_rustc_legacy_const_generics(tt);
-                ControlFlow::Break(result)
-            } else {
-                ControlFlow::Continue(())
-            }
-        });
-        result.filter(|it| !it.is_empty())
+        blaze_mem::frame::current(|frame| {
+            let result = collect_attrs(db, owner.into(), |attr| {
+                if let ast::Meta::TokenTreeMeta(attr) = attr
+                    && path_is(attr.path(), "rustc_legacy_const_generics")
+                    && let Some(tt) = attr.token_tree()
+                {
+                    let result = parse_rustc_legacy_const_generics(tt, frame);
+                    ControlFlow::Break(result)
+                } else {
+                    ControlFlow::Continue(())
+                }
+            });
+            result.filter(|it| !it.is_empty())
+        })
     }
 
     // There aren't typically many crates, so it's okay to always make this a query without a flag.
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
     pub fn doc_html_root_url(db: &Db, krate: Crate) -> Option<SmolStr> {
         let root_file_id = krate.root_file_id(db);
-        let syntax = root_file_id.parse(db).tree();
-        let extra_crate_attrs =
-            parse_extra_crate_attrs(db, krate).into_iter().flat_map(|src| src.attrs());
+        let syntax = root_file_id.parse(db).view();
+        let crate_attrs = cli_crate_attrs(db, krate).map(|attr| attr.value);
 
         let mut cfg_options = None;
-        expand_cfg_attr(
-            extra_crate_attrs.chain(syntax.attrs()),
+        expand_cfg_attr_view(
+            syntax.attrs().chain(crate_attrs),
             || cfg_options.get_or_insert(krate.cfg_options(db)),
             |attr, _| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -1541,7 +1715,7 @@ impl AttrFlags {
                         if let DocAtom::KeyValue { key, value } = atom
                             && key == "html_root_url"
                         {
-                            Some(value)
+                            Some(SmolStr::new(&*value))
                         } else {
                             None
                         }
@@ -1563,37 +1737,43 @@ impl AttrFlags {
 
         return target_features(db, owner);
 
-        #[salsa::tracked(returns(ref))]
+        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
         fn target_features(db: &Db, owner: FunctionId) -> FxHashSet<Symbol> {
-            let mut result = FxHashSet::default();
-            collect_attrs::<Infallible>(db, owner.into(), |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && path_is(attr.path(), "target_feature")
-                    && let Some(tt) = attr.token_tree()
-                {
-                    let mut tt = TokenTreeChildren::new(&tt);
-                    while let Some(NodeOrToken::Token(enable_ident)) = tt.next()
-                        && enable_ident.text() == "enable"
-                        && let Some(NodeOrToken::Token(eq_token)) = tt.next()
-                        && eq_token.kind() == T![=]
-                        && let Some(NodeOrToken::Token(features)) = tt.next()
-                        && let Some(features) = ast::String::cast(features)
-                        && let Ok(features) = features.value()
+            blaze_mem::frame::current(|frame| {
+                let mut found = Vec::new_in(frame);
+                collect_attrs::<Infallible>(db, owner.into(), |attr| {
+                    if let ast::Meta::TokenTreeMeta(attr) = attr
+                        && path_is(attr.path(), "target_feature")
+                        && let Some(tt) = attr.token_tree()
                     {
-                        result.extend(features.split(',').map(Symbol::intern));
-                        if tt
-                            .next()
-                            .and_then(NodeOrToken::into_token)
-                            .is_none_or(|it| it.kind() != T![,])
+                        let mut tt = TokenTreeChildren::new(tt);
+                        while let Some(NodeOrToken::Token(enable_ident)) = tt.next()
+                            && enable_ident.text() == "enable"
+                            && let Some(NodeOrToken::Token(eq_token)) = tt.next()
+                            && eq_token.kind() == T![=]
+                            && let Some(NodeOrToken::Token(features)) = tt.next()
+                            && let Some(features) = ast::String::cast(features)
+                            && let Ok(features) = features.value()
                         {
-                            break;
+                            found.extend(features.split(',').map(Symbol::intern));
+                            if tt
+                                .next()
+                                .and_then(NodeOrToken::into_token)
+                                .is_none_or(|it| it.kind() != T![,])
+                            {
+                                break;
+                            }
                         }
                     }
-                }
-                ControlFlow::Continue(())
-            });
-            result.shrink_to_fit();
-            result
+                    ControlFlow::Continue(())
+                });
+                // alloc: the memo's set, once: room for every feature named (a feature named
+                // twice is the one case with room to spare)
+                let mut set =
+                    FxHashSet::with_capacity_and_hasher(found.len(), Default::default());
+                set.extend(found.drain(..));
+                set
+            })
         }
     }
 
@@ -1602,15 +1782,17 @@ impl AttrFlags {
     /// it adds what each implies, which its MIR inliner compares in order.
     pub fn target_feature_list(db: &Db, owner: FunctionId) -> Vec<Symbol> {
         if !AttrFlags::query(db, owner.into()).contains(AttrFlags::HAS_TARGET_FEATURE) {
+            // alloc: an empty `Vec`, no allocation
             return Vec::new();
         }
+        // alloc: only a function with `#[target_feature]`; the caller owns the list
         let mut result = Vec::new();
         collect_attrs::<Infallible>(db, owner.into(), |attr| {
             if let ast::Meta::TokenTreeMeta(attr) = attr
                 && path_is(attr.path(), "target_feature")
                 && let Some(tt) = attr.token_tree()
             {
-                let mut tt = TokenTreeChildren::new(&tt);
+                let mut tt = TokenTreeChildren::new(tt);
                 while let Some(NodeOrToken::Token(enable_ident)) = tt.next()
                     && enable_ident.text() == "enable"
                     && let Some(NodeOrToken::Token(eq_token)) = tt.next()
@@ -1653,7 +1835,7 @@ impl AttrFlags {
 
         return rustc_layout_scalar_valid_range(db, owner);
 
-        #[salsa::tracked(returns(copy))]
+        #[salsa::tracked(returns(copy), mem_tag = Nameres)]
         fn rustc_layout_scalar_valid_range(
             db: &Db,
             owner: AdtId,
@@ -1662,15 +1844,15 @@ impl AttrFlags {
             collect_attrs::<Infallible>(db, owner.into(), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
                     && let Some(path) = attr.path()
-                    && (is_one(&path, "rustc_layout_scalar_valid_range_start")
-                        || is_one(&path, "rustc_layout_scalar_valid_range_end"))
+                    && (is_one(path, "rustc_layout_scalar_valid_range_start")
+                        || is_one(path, "rustc_layout_scalar_valid_range_end"))
                     && let Some(tt) = attr.token_tree()
-                    && let tt = TokenTreeChildren::new(&tt)
+                    && let tt = TokenTreeChildren::new(tt)
                     && let Ok(NodeOrToken::Token(value)) = Itertools::exactly_one(tt)
                     && let Some(value) = ast::IntNumber::cast(value)
                     && let Ok(value) = value.value()
                 {
-                    if is_one(&path, "rustc_layout_scalar_valid_range_start") {
+                    if is_one(path, "rustc_layout_scalar_valid_range_start") {
                         result.start = Some(value)
                     } else {
                         result.end = Some(value);
@@ -1699,26 +1881,34 @@ impl AttrFlags {
                 .unwrap_or_default(),
         };
 
-        #[salsa::tracked(returns(ref))]
+        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
         fn doc_aliases(db: &Db, owner: AttrDefId) -> Box<[Symbol]> {
-            let mut result = Vec::new();
-            collect_attrs::<Infallible>(db, owner, |attr| extract_doc_aliases(&mut result, attr));
-            result.into_boxed_slice()
+            blaze_mem::frame::current(|frame| {
+                let mut result = Vec::new_in(frame);
+                collect_attrs::<Infallible>(db, owner, |attr| {
+                    extract_doc_aliases(&mut result, attr)
+                });
+                // alloc: the memo's value, exact, only for an item whose flag says `#[doc(alias)]`
+                result.drain(..).collect()
+            })
         }
 
-        #[salsa::tracked(returns(ref))]
+        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
         fn fields_doc_aliases(
             db: &Db,
             variant: VariantId,
         ) -> ArenaMap<LocalFieldId, Box<[Symbol]>> {
-            collect_field_attrs(db, variant, |cfg_options, field| {
-                let mut result = Vec::new();
-                expand_cfg_attr(
-                    field.value.attrs(),
-                    || cfg_options,
-                    |attr, _| extract_doc_aliases(&mut result, attr),
-                );
-                result.into_boxed_slice()
+            blaze_mem::frame::current(|frame| {
+                collect_field_attrs(db, variant, Tree::Outline, frame, |cfg_options, field| {
+                    let mut result = Vec::new_in(frame);
+                    expand_cfg_attr_view(
+                        field.value.attrs(),
+                        || cfg_options,
+                        |attr, _| extract_doc_aliases(&mut result, attr),
+                    );
+                    // alloc: the field's aliases, exact; nothing for a field with none
+                    result.drain(..).collect::<Box<[Symbol]>>()
+                })
             })
         }
     }
@@ -1740,35 +1930,41 @@ impl AttrFlags {
         };
 
         // We LRU this query because it is only used by IDE.
-        #[salsa::tracked(returns(ref), lru = 250)]
+        #[salsa::tracked(returns(ref), lru = 250, mem_tag = Nameres)]
         fn cfgs(db: &Db, owner: AttrDefId) -> Option<CfgExpr> {
-            let mut result = Vec::new();
-            collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
-            match result.len() {
-                0 => None,
-                1 => result.into_iter().next(),
-                _ => Some(CfgExpr::All(result.into_boxed_slice())),
-            }
+            blaze_mem::frame::current(|frame| {
+                let mut result = Vec::new_in(frame);
+                collect_attrs::<Infallible>(db, owner, |attr| extract_cfgs(&mut result, attr));
+                match result.len() {
+                    0 => None,
+                    1 => result.into_iter().next(),
+                    // alloc: the memo's value, exact, only for an item whose flag says `#[cfg]`
+                    _ => Some(CfgExpr::All(result.drain(..).collect())),
+                }
+            })
         }
 
         // We LRU this query because it is only used by IDE.
-        #[salsa::tracked(returns(ref), lru = 50)]
+        #[salsa::tracked(returns(ref), lru = 50, mem_tag = Nameres)]
         fn fields_cfgs(
             db: &Db,
             variant: VariantId,
         ) -> ArenaMap<LocalFieldId, Option<CfgExpr>> {
-            collect_field_attrs(db, variant, |cfg_options, field| {
-                let mut result = Vec::new();
-                expand_cfg_attr(
-                    field.value.attrs(),
-                    || cfg_options,
-                    |attr, _| extract_cfgs(&mut result, attr),
-                );
-                match result.len() {
-                    0 => None,
-                    1 => result.into_iter().next(),
-                    _ => Some(CfgExpr::All(result.into_boxed_slice())),
-                }
+            blaze_mem::frame::current(|frame| {
+                collect_field_attrs(db, variant, Tree::Outline, frame, |cfg_options, field| {
+                    let mut result = Vec::new_in(frame);
+                    expand_cfg_attr_view(
+                        field.value.attrs(),
+                        || cfg_options,
+                        |attr, _| extract_cfgs(&mut result, attr),
+                    );
+                    match result.len() {
+                        0 => None,
+                        1 => result.into_iter().next(),
+                        // alloc: the field's cfgs, exact
+                        _ => Some(CfgExpr::All(result.drain(..).collect())),
+                    }
+                })
             })
         }
     }
@@ -1780,7 +1976,7 @@ impl AttrFlags {
         }
         return doc_keyword(db, owner);
 
-        #[salsa::tracked(returns(clone))]
+        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
         fn doc_keyword(db: &Db, owner: ModuleId) -> Option<Symbol> {
             collect_attrs(db, AttrDefId::ModuleId(owner), |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
@@ -1801,11 +1997,11 @@ impl AttrFlags {
     }
 
     // We LRU this query because it is only used by IDE.
-    #[salsa::tracked(returns(as_deref), lru = 250)]
+    #[salsa::tracked(returns(as_deref), lru = 250, mem_tag = Nameres)]
     pub fn docs(db: &Db, owner: AttrDefId) -> Option<Box<Docs>> {
-        let (source, outer_mod_decl, _extra_crate_attrs, krate) = attrs_source(db, owner);
-        let inner_attrs_node = docs::inner_docs_node(&source.value);
-        // Note: we don't have to pass down `_extra_crate_attrs` here, since `extract_docs`
+        let (source, outer_mod_decl, _crate_attrs, krate) = attrs_source(db, owner, Tree::Live);
+        let inner_attrs_node = docs::inner_docs_node(source.value);
+        // Note: we don't have to pass down `_crate_attrs` here, since `extract_docs`
         // does not handle crate-level attributes related to docs.
         // See: https://doc.rust-lang.org/rustdoc/write-documentation/the-doc-attribute.html#at-the-crate-level
         self::docs::extract_docs(
@@ -1825,22 +2021,24 @@ impl AttrFlags {
     }
 
     // We LRU this query because it is only used by IDE.
-    #[salsa::tracked(returns(ref), lru = 50)]
+    #[salsa::tracked(returns(ref), lru = 50, mem_tag = Nameres)]
     pub fn fields_docs(
         db: &Db,
         variant: VariantId,
     ) -> ArenaMap<LocalFieldId, Option<Box<Docs>>> {
         let krate = variant.module(db).krate(db);
-        collect_field_attrs(db, variant, |cfg_options, field| {
-            self::docs::extract_docs(
-                db,
-                krate,
-                &|| variant.resolver(db),
-                &|| cfg_options,
-                field,
-                None,
-                None,
-            )
+        blaze_mem::frame::current(|frame| {
+            collect_field_attrs(db, variant, Tree::Live, frame, |cfg_options, field| {
+                self::docs::extract_docs(
+                    db,
+                    krate,
+                    &|| variant.resolver(db),
+                    &|| cfg_options,
+                    field,
+                    None,
+                    None,
+                )
+            })
         })
     }
 
@@ -1852,40 +2050,46 @@ impl AttrFlags {
 
         return derive_info(db, owner).as_ref();
 
-        #[salsa::tracked(returns(ref))]
+        #[salsa::tracked(returns(ref), mem_tag = Nameres)]
         fn derive_info(db: &Db, owner: MacroId) -> Option<DeriveInfo> {
-            collect_attrs(db, owner.into(), |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && (path_is(attr.path(), "proc_macro_derive")
-                        || path_is(attr.path(), "rustc_builtin_macro"))
-                    && let Some(tt) = attr.token_tree()
-                    && let mut tt = TokenTreeChildren::new(&tt)
-                    && let Some(NodeOrToken::Token(trait_name)) = tt.next()
-                    && trait_name.kind().is_any_identifier()
-                {
-                    let trait_name = Symbol::intern(trait_name.text());
-
-                    let helpers = if let Some(NodeOrToken::Token(comma)) = tt.next()
-                        && comma.kind() == T![,]
-                        && let Some(NodeOrToken::Token(attributes)) = tt.next()
-                        && attributes.text() == "attributes"
-                        && let Some(NodeOrToken::Node(attributes)) = tt.next()
+            blaze_mem::frame::current(|frame| {
+                collect_attrs(db, owner.into(), |attr| {
+                    if let ast::Meta::TokenTreeMeta(attr) = attr
+                        && (path_is(attr.path(), "proc_macro_derive")
+                            || path_is(attr.path(), "rustc_builtin_macro"))
+                        && let Some(tt) = attr.token_tree()
+                        && let mut tt = TokenTreeChildren::new(tt)
+                        && let Some(NodeOrToken::Token(trait_name)) = tt.next()
+                        && trait_name.kind().is_any_identifier()
                     {
-                        attributes
-                            .syntax()
-                            .children_with_tokens()
-                            .filter_map(NodeOrToken::into_token)
-                            .filter(|it| it.kind().is_any_identifier())
-                            .map(|it| Symbol::intern(it.text()))
-                            .collect::<Box<[_]>>()
-                    } else {
-                        Box::new([])
-                    };
+                        let trait_name = Symbol::intern(trait_name.text());
 
-                    ControlFlow::Break(DeriveInfo { trait_name, helpers })
-                } else {
-                    ControlFlow::Continue(())
-                }
+                        let helpers = if let Some(NodeOrToken::Token(comma)) = tt.next()
+                            && comma.kind() == T![,]
+                            && let Some(NodeOrToken::Token(attributes)) = tt.next()
+                            && attributes.text() == "attributes"
+                            && let Some(NodeOrToken::Node(attributes)) = tt.next()
+                        {
+                            let mut helpers = Vec::new_in(frame);
+                            helpers.extend(
+                                attributes
+                                    .syntax()
+                                    .children_with_tokens()
+                                    .filter_map(NodeOrToken::into_token)
+                                    .filter(|it| it.kind().is_any_identifier())
+                                    .map(|it| Symbol::intern(it.text())),
+                            );
+                            // alloc: the memo's helpers, exact
+                            helpers.drain(..).collect::<Box<[_]>>()
+                        } else {
+                            Box::default()
+                        };
+
+                        ControlFlow::Break(DeriveInfo { trait_name, helpers })
+                    } else {
+                        ControlFlow::Continue(())
+                    }
+                })
             })
         }
     }
@@ -1897,14 +2101,14 @@ impl AttrFlags {
 
         return unstable_feature(db, owner);
 
-        #[salsa::tracked(returns(clone))]
+        #[salsa::tracked(returns(clone), mem_tag = Nameres)]
         fn unstable_feature(db: &Db, owner: AttrDefId) -> Option<Symbol> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::TokenTreeMeta(attr) = attr
                     && path_is(attr.path(), "unstable")
                     && let Some(tt) = attr.token_tree()
                 {
-                    let mut tt = TokenTreeChildren::new(&tt);
+                    let mut tt = TokenTreeChildren::new(tt);
                     // Technically the `feature = "..."` always comes first, but it's not a requirement.
                     while let Some(token) = tt.next() {
                         if let NodeOrToken::Token(token) = token
@@ -1932,12 +2136,12 @@ impl AttrFlags {
         }
         return Some(must_use_message(db, owner));
 
-        #[salsa::tracked(returns(as_deref))]
+        #[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
         fn must_use_message(db: &Db, owner: AttrDefId) -> Option<Box<str>> {
             collect_attrs(db, owner, |attr| {
                 if let ast::Meta::KeyValueMeta(attr) = attr
                     && path_is(attr.path(), "must_use")
-                    && let Some(message) = attr.value_string()
+                    && let Some(message) = string_value(attr)
                 {
                     return ControlFlow::Break(Box::from(&*message));
                 }
@@ -1954,45 +2158,51 @@ impl AttrFlags {
         }
         return define_opaque(db, owner);
 
-        #[salsa::tracked(returns(deref))]
+        #[salsa::tracked(returns(deref), mem_tag = Nameres)]
         fn define_opaque(db: &Db, owner: FunctionId) -> Box<[ModPath]> {
-            let mut result = Vec::new();
-            collect_attrs::<Infallible>(db, owner.into(), |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && attr.path().as_ref().and_then(up_to_two_segments).is_some_and(|(_, tool)| {
-                        tool.is_some_and(|it| name_text(&it) == "define_opaque")
-                    })
-                    && let Some(tt) = attr.token_tree()
-                {
-                    let tokens = TokenTreeChildren::new(&tt)
-                        .filter_map(NodeOrToken::into_token)
-                        .collect_vec();
-                    for path in tokens.split(|it| it.kind() == T![,]) {
-                        let mut kind = PathKind::Plain;
-                        let mut segments = Vec::new();
-                        for token in path {
-                            match token.kind() {
-                                T![crate] => kind = PathKind::Crate,
-                                T![self] => kind = PathKind::SELF,
-                                T![super] => {
-                                    kind = match kind {
-                                        PathKind::Super(n) => PathKind::Super(n + 1),
-                                        _ => PathKind::Super(1),
+            blaze_mem::frame::current(|frame| {
+                let mut result = Vec::new_in(frame);
+                let mut tokens = Vec::new_in(frame);
+                let mut segments = Vec::new_in(frame);
+                collect_attrs::<Infallible>(db, owner.into(), |attr| {
+                    if let ast::Meta::TokenTreeMeta(attr) = attr
+                        && attr.path().and_then(up_to_two_segments).is_some_and(|(_, tool)| {
+                            tool.is_some_and(|it| name_text(it) == "define_opaque")
+                        })
+                        && let Some(tt) = attr.token_tree()
+                    {
+                        tokens.clear();
+                        tokens.extend(
+                            TokenTreeChildren::new(tt).filter_map(NodeOrToken::into_token),
+                        );
+                        for path in tokens.split(|it| it.kind() == T![,]) {
+                            let mut kind = PathKind::Plain;
+                            segments.clear();
+                            for token in path {
+                                match token.kind() {
+                                    T![crate] => kind = PathKind::Crate,
+                                    T![self] => kind = PathKind::SELF,
+                                    T![super] => {
+                                        kind = match kind {
+                                            PathKind::Super(n) => PathKind::Super(n + 1),
+                                            _ => PathKind::Super(1),
+                                        }
                                     }
+                                    SyntaxKind::IDENT => segments
+                                        .push(Name::new_symbol_root(Symbol::intern(token.text()))),
+                                    _ => {}
                                 }
-                                SyntaxKind::IDENT => segments
-                                    .push(Name::new_symbol_root(Symbol::intern(token.text()))),
-                                _ => {}
+                            }
+                            if !segments.is_empty() {
+                                result.push(ModPath::from_segments(kind, segments.drain(..)));
                             }
                         }
-                        if !segments.is_empty() {
-                            result.push(ModPath::from_segments(kind, segments));
-                        }
                     }
-                }
-                ControlFlow::Continue(())
-            });
-            result.into_boxed_slice()
+                    ControlFlow::Continue(())
+                });
+                // alloc: the memo's value, exact, only for a function with `#[define_opaque]`
+                result.drain(..).collect()
+            })
         }
     }
 
@@ -2003,25 +2213,31 @@ impl AttrFlags {
         }
         return must_implement_one_of(db, owner);
 
-        #[salsa::tracked(returns(as_deref))]
+        #[salsa::tracked(returns(as_deref), mem_tag = Nameres)]
         pub fn must_implement_one_of(
             db: &Db,
             owner: TraitId,
         ) -> Option<Box<[Name]>> {
-            collect_attrs(db, owner.into(), |attr| {
-                if let ast::Meta::TokenTreeMeta(attr) = attr
-                    && path_is(attr.path(), "rustc_must_implement_one_of")
-                    && let Some(tt) = attr.token_tree()
-                    && let names = tt
-                        .token_trees_and_tokens()
-                        .filter_map(|it| ast::Ident::cast(it.into_token()?))
-                        .map(|name| Name::new_symbol_root(Symbol::intern(name.text())))
-                        .collect::<Box<[_]>>()
-                    && !names.is_empty()
-                {
-                    return ControlFlow::Break(names);
-                }
-                ControlFlow::Continue(())
+            blaze_mem::frame::current(|frame| {
+                let mut names = Vec::new_in(frame);
+                collect_attrs(db, owner.into(), |attr| {
+                    if let ast::Meta::TokenTreeMeta(attr) = attr
+                        && path_is(attr.path(), "rustc_must_implement_one_of")
+                        && let Some(tt) = attr.token_tree()
+                    {
+                        names.clear();
+                        names.extend(
+                            tt.token_trees_and_tokens()
+                                .filter_map(|it| ast::Ident::cast(it.into_token()?))
+                                .map(|name| Name::new_symbol_root(Symbol::intern(name.text()))),
+                        );
+                        if !names.is_empty() {
+                            // alloc: the memo's names, exact
+                            return ControlFlow::Break(names.drain(..).collect::<Box<[_]>>());
+                        }
+                    }
+                    ControlFlow::Continue(())
+                })
             })
         }
     }
@@ -2062,7 +2278,7 @@ pub fn disabled_sanitizers(db: &Db, def: FunctionId) -> u8 {
 }
 
 /// [`disabled_sanitizers`] of the items of `module`.
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Nameres)]
 fn module_disabled_sanitizers(db: &Db, module: ModuleId) -> u8 {
     let inherited = match module.containing_module_inside_def_map(db) {
         Some(parent) => module_disabled_sanitizers(db, ModuleId::from_id(parent.as_id())),
@@ -2078,7 +2294,7 @@ fn module_disabled_sanitizers(db: &Db, module: ModuleId) -> u8 {
 /// [`disabled_sanitizers`] of the items of `block`: the set of the module holding it, then the
 /// `#[sanitize]` of each item and closure between the two, outermost first, through the macro
 /// calls the block was expanded from.
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Nameres)]
 fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
     let outer = block.module(db);
     let krate = outer.krate(db);
@@ -2093,7 +2309,7 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
     };
     let ast_id = block.ast_id(db);
     let mut file_id = ast_id.file_id;
-    let mut node = ast_id.to_node(db).syntax().parent();
+    let mut node = ast_id.to_view(db).syntax().parent();
     let mut cfg_options = None;
     let mut sets = SmallVec::<[SanitizeSets; 4]>::new();
     'walk: loop {
@@ -2114,7 +2330,7 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
                 | SyntaxKind::CONST
                 | SyntaxKind::STATIC => {
                     if let Some(owner) = ast::AnyHasAttrs::cast(it) {
-                        sets.extend(expand_cfg_attr(
+                        sets.extend(expand_cfg_attr_view(
                             ast::attrs_including_inner(&owner),
                             || cfg_options.get_or_insert_with(|| krate.cfg_options(db)),
                             |meta, _| sanitize_sets(meta),
@@ -2124,7 +2340,7 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
                 _ => {}
             }
         }
-        let Some(call) = file_id.call_node(db) else { break };
+        let Some(call) = file_id.call_node_view(db) else { break };
         file_id = call.file_id;
         node = call.value.parent();
     }
@@ -2157,14 +2373,14 @@ impl SanitizeSets {
 
 /// The sets of `attr` if it is `#[sanitize(..)]`, which ends the walk: rustc reads an item's
 /// first (a second is an error). Its arguments are `key = "on" | "off"`, comma separated.
-fn sanitize_sets(attr: ast::Meta) -> ControlFlow<SanitizeSets> {
+fn sanitize_sets(attr: ast::Meta<'_>) -> ControlFlow<SanitizeSets> {
     let ast::Meta::TokenTreeMeta(attr) = attr else { return ControlFlow::Continue(()) };
     if !path_is(attr.path(), "sanitize") {
         return ControlFlow::Continue(());
     }
     let Some(tt) = attr.token_tree() else { return ControlFlow::Continue(()) };
     let mut sets = SanitizeSets::default();
-    let mut tt = TokenTreeChildren::new(&tt);
+    let mut tt = TokenTreeChildren::new(tt);
     while let Some(NodeOrToken::Token(key)) = tt.next()
         && let Some(NodeOrToken::Token(eq_token)) = tt.next()
         && eq_token.kind() == T![=]
@@ -2207,7 +2423,7 @@ fn merge_repr(this: &mut ReprOptions, other: ReprOptions) {
     }
 }
 
-fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
+fn parse_repr_tt(tt: ast::TokenTree<'_>) -> Option<ReprOptions> {
     use rustc_abi::{Align, Integer, IntegerType, ReprFlags, ReprOptions};
 
     let mut tts = TokenTreeChildren::new(tt).peekable();
@@ -2226,10 +2442,10 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
         }
         let repr = match ReprWord::of(ident.text().trim_start_matches("r#")) {
             Some(ReprWord::packed) => {
-                let pack = if let Some(NodeOrToken::Node(tt)) = tts.peek() {
-                    let tt = tt.clone();
-                    tts.next();
-                    let mut tt_iter = TokenTreeChildren::new(&tt);
+                let pack = if let Some(NodeOrToken::Node(tt)) =
+                    tts.next_if(|it| matches!(it, NodeOrToken::Node(_)))
+                {
+                    let mut tt_iter = TokenTreeChildren::new(tt);
                     if let Some(NodeOrToken::Token(lit)) = tt_iter.next()
                         && let Some(lit) = ast::IntNumber::cast(lit)
                         && let Ok(lit) = lit.value()
@@ -2247,10 +2463,10 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
             }
             Some(ReprWord::align) => {
                 let mut align = None;
-                if let Some(NodeOrToken::Node(tt)) = tts.peek() {
-                    let tt = tt.clone();
-                    tts.next();
-                    let mut tt_iter = TokenTreeChildren::new(&tt);
+                if let Some(NodeOrToken::Node(tt)) =
+                    tts.next_if(|it| matches!(it, NodeOrToken::Node(_)))
+                {
+                    let mut tt_iter = TokenTreeChildren::new(tt);
                     if let Some(NodeOrToken::Token(lit)) = tt_iter.next()
                         && let Some(lit) = ast::IntNumber::cast(lit)
                         && let Ok(lit) = lit.value()
@@ -2290,30 +2506,31 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
     Some(acc)
 }
 
-fn parse_rustc_legacy_const_generics(tt: ast::TokenTree) -> Box<[u32]> {
-    TokenTreeChildren::new(&tt)
-        .filter_map(|param| {
-            ast::IntNumber::cast(param.into_token()?)?.value().ok()?.try_into().ok()
-        })
-        .collect()
+fn parse_rustc_legacy_const_generics(tt: ast::TokenTree<'_>, frame: &Frame) -> Box<[u32]> {
+    let mut found = Vec::<u32, _>::new_in(frame);
+    found.extend(TokenTreeChildren::new(tt).filter_map(|param| {
+        ast::IntNumber::cast(param.into_token()?)?.value().ok()?.try_into().ok()
+    }));
+    // alloc: the memo's value, exact, only for a function with `#[rustc_legacy_const_generics]`
+    Box::from(&found[..])
 }
 
 #[derive(Debug)]
-enum DocAtom {
+enum DocAtom<'t> {
     /// eg. `#[doc(hidden)]`
-    Flag(SmolStr),
+    Flag(&'t str),
     /// eg. `#[doc(alias = "it")]`
     ///
     /// Note that a key can have multiple values that are all considered "active" at the same time.
     /// For example, `#[doc(alias = "x")]` and `#[doc(alias = "y")]`.
-    KeyValue { key: SmolStr, value: SmolStr },
+    KeyValue { key: &'t str, value: Cow<'t, str> },
     /// eg. `#[doc(alias("x", "y"))]`
-    Alias(Vec<SmolStr>),
+    Alias(SmallVec<[Cow<'t, str>; 2]>),
 }
 
-impl DocAtom {
-    fn parse(tt: ast::TokenTree) -> SmallVec<[DocAtom; 1]> {
-        let mut iter = TokenTreeChildren::new(&tt).peekable();
+impl<'t> DocAtom<'t> {
+    fn parse(tt: ast::TokenTree<'t>) -> SmallVec<[DocAtom<'t>; 1]> {
+        let mut iter = TokenTreeChildren::new(tt).peekable();
         let mut result = SmallVec::new();
         while iter.peek().is_some() {
             if let Some(expr) = next_doc_expr(&mut iter) {
@@ -2324,11 +2541,9 @@ impl DocAtom {
     }
 }
 
-fn next_doc_expr(it: &mut Peekable<TokenTreeChildren>) -> Option<DocAtom> {
+fn next_doc_expr<'t>(it: &mut Peekable<TokenTreeChildren<'t>>) -> Option<DocAtom<'t>> {
     let name = match it.next() {
-        Some(NodeOrToken::Token(token)) if token.kind().is_any_identifier() => {
-            SmolStr::new(token.text())
-        }
+        Some(NodeOrToken::Token(token)) if token.kind().is_any_identifier() => token.text(),
         _ => return None,
     };
 
@@ -2339,7 +2554,7 @@ fn next_doc_expr(it: &mut Peekable<TokenTreeChildren>) -> Option<DocAtom> {
                 && let Some(value) = ast::String::cast(value)
                 && let Ok(value) = value.value()
             {
-                DocAtom::KeyValue { key: name, value: SmolStr::new(&*value) }
+                DocAtom::KeyValue { key: name, value }
             } else {
                 return None;
             }
@@ -2348,10 +2563,9 @@ fn next_doc_expr(it: &mut Peekable<TokenTreeChildren>) -> Option<DocAtom> {
             if name != "alias" {
                 return None;
             }
-            let aliases = TokenTreeChildren::new(subtree)
-                .filter_map(|alias| {
-                    Some(SmolStr::new(&*ast::String::cast(alias.into_token()?)?.value().ok()?))
-                })
+            let aliases = TokenTreeChildren::new(*subtree)
+                .filter_map(|alias| ast::String::cast(alias.into_token()?)?.value().ok())
+                // alloc: a `doc(alias(..))` of 3+ names, read only by the doc-alias memo and docs
                 .collect();
             it.next();
             DocAtom::Alias(aliases)

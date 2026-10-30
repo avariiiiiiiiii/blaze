@@ -1,6 +1,7 @@
 //! [`Col`]: a column of a finished store, a slice that either owns its elements alone, as a
-//! `Box<[T]>` does, or shares one allocation with the store's other columns of `Copy` elements
-//! (a slab, written by [`SlabWriter`]).
+//! `Box<[T]>` does, shares one allocation with the store's other columns of `Copy` elements
+//! (a slab, written by [`SlabWriter`]), or reads its `Copy` elements where a dependency image
+//! holds them ([`Col::borrowed`]).
 //!
 //! A store's columns are written once, at `finish` or decode, and only read after. Giving each
 //! its own box costs an allocation per non-empty column (8 to 20 a body, more than the copy for
@@ -18,6 +19,8 @@ use std::{
     sync::Arc,
 };
 
+use crate::deps::{Held, ImageBuf};
+
 /// The unit a slab is allocated in. Its alignment bounds the alignment of every element type a
 /// slab holds ([`SlabWriter::take`] checks it at compile time).
 #[derive(Clone, Copy)]
@@ -28,25 +31,40 @@ const SLAB_ALIGN: usize = align_of::<Block>();
 
 type SlabBytes = Arc<[MaybeUninit<Block>]>;
 
+/// What keeps the elements of a column that does not own them alone.
+#[derive(Clone)]
+enum Owner {
+    /// The slab [`SlabWriter`] wrote them into.
+    Slab(SlabBytes),
+    /// The image buffer they lie in ([`Col::borrowed`]).
+    Image(ImageBuf),
+}
+
 /// A column of a finished store.
 ///
 /// Invariant, which every `unsafe` block here relies on: `ptr` is aligned and valid for reads
 /// of `len` initialized `T`s for as long as this `Col` lives, and nothing writes them. Either
-/// `owner` is `None` and they are the elements of a `Box<[T]>` this column owns, made by
-/// [`Col::boxed`] and freed by `drop`; or `owner` holds a count of the slab they are in, `T` is
-/// `Copy` (so there is nothing to drop), and [`SlabWriter::take`] wrote them before it made
-/// this column and writes no byte of them after.
+/// - `owner` is `None` and they are the elements of a `Box<[T]>` this column owns, made by
+///   [`Col::boxed`] and freed by `drop`;
+/// - or `owner` holds a count of the slab they are in, `T` is `Copy` (so there is nothing to
+///   drop), and [`SlabWriter::take`] wrote them before it made this column and writes no byte
+///   of them after;
+/// - or `owner` holds a count of the image they are in, `T` is `Copy`, and they lie inside its
+///   `bytes()`, which neither move nor change while a count lives ([`Held`]).
 pub(crate) struct Col<T> {
     ptr: NonNull<T>,
     len: usize,
-    owner: Option<SlabBytes>,
+    owner: Option<Owner>,
     of: PhantomData<T>,
 }
 
-const _: () = assert!(size_of::<Col<u32>>() == 32);
+// Both owners are counts of unsized values (a pointer and a length or a vtable), so the owner
+// takes a tag word besides: 32 bytes would need a slab that is itself a `dyn Held`, which is a
+// second allocation a store.
+const _: () = assert!(size_of::<Col<u32>>() == 40);
 
 // SAFETY: a `Col` is a `Box<[T]>` or shares `T`s with other `Col`s as an `Arc<[T]>` does; both
-// are `Send` and `Sync` when `T` is `Send + Sync`.
+// are `Send` and `Sync` when `T` is `Send + Sync`. An image owner is `Send + Sync` ([`Held`]).
 unsafe impl<T: Send + Sync> Send for Col<T> {}
 // SAFETY: as for `Send`.
 unsafe impl<T: Send + Sync> Sync for Col<T> {}
@@ -62,7 +80,35 @@ impl<T> Col<T> {
     /// Whether this column shares its allocation with others (for the allocation tests).
     #[cfg(test)]
     pub(crate) fn in_slab(&self) -> bool {
-        self.owner.is_some()
+        matches!(self.owner, Some(Owner::Slab(_)))
+    }
+}
+
+impl<T: Copy> Col<T> {
+    /// The column of `elements` where they are, inside `owner`'s bytes, holding a count of it;
+    /// `None` unless every byte of `elements` is inside `owner.bytes()`. An empty column holds
+    /// nothing.
+    pub(crate) fn borrowed(owner: &ImageBuf, elements: &[T]) -> Option<Col<T>> {
+        if elements.is_empty() {
+            return Some(Col::default());
+        }
+        let image = owner.bytes().as_ptr_range();
+        let column = elements.as_ptr_range();
+        let inside = image.start as usize <= column.start as usize
+            && column.end as usize <= image.end as usize;
+        inside.then(|| Col {
+            ptr: NonNull::from(elements).cast::<T>(),
+            len: elements.len(),
+            // clone: a count of the image, one a column
+            owner: Some(Owner::Image(owner.clone())),
+            of: PhantomData,
+        })
+    }
+
+    /// Whether this column reads its elements in an image (for the decode tests).
+    #[cfg(test)]
+    pub(crate) fn in_image(&self) -> bool {
+        matches!(self.owner, Some(Owner::Image(_)))
     }
 }
 
@@ -114,10 +160,11 @@ impl<T: Clone> Clone for Col<T> {
         match &self.owner {
             // alloc: a store's columns are copied only where a whole store is
             None => Col::boxed(Box::from(&**self)),
-            // A slab's elements are never written again, so another count shares them.
-            Some(slab) => {
+            // A slab's or an image's elements are never written again, so another count shares
+            // them.
+            Some(owner) => {
                 // clone: a count, not the elements
-                let owner = Some(slab.clone());
+                let owner = Some(owner.clone());
                 Col { ptr: self.ptr, len: self.len, owner, of: PhantomData }
             }
         }
@@ -245,7 +292,7 @@ impl SlabWriter {
             ptr: NonNull::new(dst).expect("inside an allocation"),
             len: elements.len(),
             // clone: a count of the slab, one a column
-            owner: Some(slab.clone()),
+            owner: Some(Owner::Slab(slab.clone())),
             of: PhantomData,
         }
     }
@@ -333,6 +380,30 @@ mod tests {
         layout.add::<u32>(4);
         let mut writer = SlabWriter::new(layout);
         writer.copy(&[0u32; 5]);
+    }
+
+    /// A column borrowed from an image reads its elements where they are, its clones too, after
+    /// every other count of the image is gone; one not wholly inside the image is refused.
+    #[test]
+    fn a_borrowed_column_reads_in_its_image() {
+        let words: Vec<u8> = (0..64u32).flat_map(|it| (it << 3).to_ne_bytes()).collect();
+        let image: ImageBuf = Arc::new(blaze_format::Aligned::copy_from(&words));
+        let (start, len) = (image.bytes().as_ptr(), image.bytes().len());
+        // SAFETY: the image's bytes start at a multiple of `blaze_format::ALIGN` ([`Held`]),
+        // which `u32` divides, and hold `len / 4` whole `u32`s, every bit pattern of which is one.
+        let all: &[u32] = unsafe { slice::from_raw_parts(start.cast::<u32>(), len / 4) };
+        let col = Col::borrowed(&image, &all[3..9]).expect("inside the image");
+        assert!(col.in_image() && !col.in_slab());
+        assert_eq!(col.as_ptr(), all[3..].as_ptr(), "read in place");
+        assert_eq!(&*col, &(3..9).map(|it| it << 3).collect::<Vec<u32>>()[..]);
+
+        let outside = [1u32, 2];
+        assert!(Col::borrowed(&image, &outside).is_none(), "a column outside its image");
+        assert!(!Col::borrowed(&image, &all[..0]).expect("empty").in_image(), "empty holds nothing");
+
+        let copy = col.clone();
+        drop((col, image));
+        assert_eq!(&*copy, &(3..9).map(|it| it << 3).collect::<Vec<u32>>()[..]);
     }
 
     /// Boxed columns of an element with a destructor: dropped once each, cloned deeply.

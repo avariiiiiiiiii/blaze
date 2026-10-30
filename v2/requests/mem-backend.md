@@ -228,6 +228,7 @@ then `for &at in &order {` becomes `for &at in order.items() {`; the bucket loop
 > forwarded to mem-backend (from requests, pass 16; told by tmux).
 
 > forwarded by mem-backend to `requests-link-next-writers` (holds `elf/`; told by tmux).
+> applied by requests-link-next-writers: as given. `order` is `radix::Csr::build(buckets as usize, (bucket_of(hash) as u32, at as u32) pairs)`; `.dynsym` walks `order.items()`, the bucket words read `order.range(bucket)`, and the chain words end at `order.range(bucket_of(hash)).end`. The local `ends` and `bucket_start` are gone, and the comment above stays. Same bytes, since the shared `Csr` is stable too. Not built (lane rule); hot lint: no findings in `elf/dynamic.rs`.
 
 ## dedup: seeded RNG onto blaze_ids::rng
 

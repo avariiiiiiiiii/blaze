@@ -867,8 +867,8 @@ fn match_meta_var<'t>(
         }
         MetaVarKind::Pat => (parser::PrefixEntryPoint::PatTop, TokensOrigin::Ast),
         MetaVarKind::PatParam => (parser::PrefixEntryPoint::Pat, TokensOrigin::Ast),
-        MetaVarKind::Stmt => (parser::PrefixEntryPoint::Stmt, TokensOrigin::Ast),
-        MetaVarKind::Block => (parser::PrefixEntryPoint::Block, TokensOrigin::Ast),
+        MetaVarKind::Stmt => (parser::PrefixEntryPoint::Stmt, TokensOrigin::Grouped),
+        MetaVarKind::Block => (parser::PrefixEntryPoint::Block, TokensOrigin::Grouped),
         MetaVarKind::Meta => (parser::PrefixEntryPoint::MetaItem, TokensOrigin::Ast),
         MetaVarKind::Item => (parser::PrefixEntryPoint::Item, TokensOrigin::Ast),
         MetaVarKind::Vis => (parser::PrefixEntryPoint::Vis, TokensOrigin::Ast),

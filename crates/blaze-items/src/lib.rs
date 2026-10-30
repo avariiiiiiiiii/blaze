@@ -24,7 +24,8 @@
 //! In this crate: [`key`] gives each item its [`ItemKey`] and resolves one back; `form` writes
 //! an item's normalized form; [`hash`] fills the forms' slots and gives the four hashes
 //! ([`hashes`]); [`facts`] gives each [`Fact`] its value; `index` holds the negative-fact
-//! indexes; [`table`] holds hashes and facts as columns ([`HashColumns`], [`FactSet`]). Each is computed by `#[salsa::tracked]` queries over the front end's database, so
+//! indexes; [`table`] holds hashes and facts as columns ([`HashColumns`], [`FactSet`]);
+//! [`goals`] gives the persistent goal cache its keys and facts. Each is computed by `#[salsa::tracked]` queries over the front end's database, so
 //! an edit recomputes only the forms it touched and stops where a hash comes out equal.
 //!
 //! Memory (docs/v2/plan/design/memory.md): a crate's tables (its key index, its hash columns)
@@ -40,6 +41,7 @@
 mod bound;
 mod facts;
 mod form;
+pub mod goals;
 pub mod hash;
 mod index;
 pub mod key;
@@ -263,6 +265,13 @@ pub enum Fact {
     DropCheck(ItemKey),
     Vtable { trait_: ItemKey, self_ty: SimplifiedType },
     Derive(ItemKey),
+    /// The target a crate (by its [`key::crate_key`]) is built for: its tuple, data layout and
+    /// spec, or why it could not be loaded.
+    Target(ContentId),
+    /// All of a crate (by its [`key::crate_key`]): the content of it and of every crate it
+    /// depends on, their inputs and the files of their source roots. A dependency's items are
+    /// lowered in batches of the whole crate, so a read of a batch stands for this.
+    Crate(ContentId),
 }
 
 /// The facts' query kinds, in [`blaze_query::kinds::FACTS`].
@@ -287,6 +296,8 @@ pub mod kinds {
     pub const DERIVE: QueryKind = QueryKind(0x100f);
     /// An item's [`crate::ItemHashes`].
     pub const HASHES: QueryKind = QueryKind(0x1010);
+    pub const TARGET: QueryKind = QueryKind(0x1011);
+    pub const CRATE: QueryKind = QueryKind(0x1012);
 }
 
 pub const FACT_DOMAIN: &str = "blaze v2 fact 1";
@@ -310,6 +321,8 @@ impl Fact {
             Fact::DropCheck(_) => kinds::DROP_CHECK,
             Fact::Vtable { .. } => kinds::VTABLE,
             Fact::Derive(_) => kinds::DERIVE,
+            Fact::Target(_) => kinds::TARGET,
+            Fact::Crate(_) => kinds::CRATE,
         }
     }
 
@@ -335,6 +348,7 @@ impl Fact {
                 hasher.id(&trait_.0).id(&self_ty.0)
             }
             Fact::Resolves { scope, name } => hasher.id(&scope.0).id(&name.0),
+            Fact::Target(krate) | Fact::Crate(krate) => hasher.id(&krate),
         };
         QueryKey { kind: self.kind(), input: hasher.finish() }
     }

@@ -13,10 +13,13 @@
 //! The process is made suspended and runs only once the driver follows it ([`follow`], then
 //! [`resume`]): its job's messages and its end come to the port with its spawn's handle, which
 //! names it only once it is in the driver's slab.
+//!
+//! A run handed to the warm launcher ([`super::warm`]) has its job and pipes made here as a
+//! started one's are, and no process of the driver's.
 
 use std::{
     cell::UnsafeCell,
-    ffi::{OsStr, OsString, c_void},
+    ffi::{OsString, c_void},
     io,
     marker::PhantomPinned,
     os::windows::io::{AsRawHandle as _, OwnedHandle},
@@ -37,8 +40,9 @@ use windows_sys::Win32::{
     },
     System::{
         JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+            JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_ASSOCIATE_COMPLETION_PORT, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
             JobObjectAssociateCompletionPortInformation, JobObjectExtendedLimitInformation,
             QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
@@ -48,14 +52,17 @@ use windows_sys::Win32::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
             DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
             InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, RegisterWaitForSingleObject,
+            PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION, RegisterWaitForSingleObject,
             ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
             UnregisterWaitEx, UpdateProcThreadAttribute, WT_EXECUTEONLYONCE,
         },
     },
 };
 
-use super::sys::{self, KEY_EXIT, KEY_JOB, Port};
+use super::{
+    rundirs::RunDirs,
+    sys::{self, KEY_JOB, Port, WideName},
+};
 use crate::{Command, Confine, Exit, Sandbox};
 
 /// What a pipe holds before its writer waits.
@@ -69,6 +76,11 @@ pub(super) const KILLED: u32 = 1;
 pub(super) const OUT_OF_MEMORY: u32 = STATUS_COMMITMENT_LIMIT as u32;
 
 static RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// The serial of a spawn, which its pipes' and run directory's names carry.
+pub(super) fn serial() -> u64 {
+    RUNS.fetch_add(1, Ordering::Relaxed)
+}
 
 /// A process made, suspended until [`resume`], its pipes the driver's.
 pub(super) struct Started {
@@ -87,15 +99,17 @@ pub(super) struct Started {
 pub(super) struct Finish {
     pub(super) command: Box<Command>,
     // dyn: the caller's sandbox maker, asked once per sandboxed process.
-    confine: Option<Arc<dyn Confine>>,
-    scratch: Option<PathBuf>,
+    pub(super) confine: Option<Arc<dyn Confine>>,
+    /// The run directory of a sandboxed process ([`RunDirs`]): the driver removes it once the
+    /// process has ended and its sandbox has been asked what it read.
+    pub(super) scratch: Option<PathBuf>,
 }
 
 /// `command` made in its sandbox, made by `confine`, unless the sandbox is off; in a job of its
 /// own, suspended until the driver follows it.
 // dyn: as above.
-pub(super) fn start(root: &Path, command: Box<Command>, confine: Option<&Arc<dyn Confine>>) -> io::Result<Started> {
-    let n = RUNS.fetch_add(1, Ordering::Relaxed);
+pub(super) fn start(dirs: &mut RunDirs, command: Box<Command>, confine: Option<&Arc<dyn Confine>>) -> io::Result<Started> {
+    let n = serial();
     let (confined, scratch, confine) = match &command.sandbox {
         Sandbox::Off => (None, None, None),
         Sandbox::On { .. } => {
@@ -110,15 +124,12 @@ pub(super) fn start(root: &Path, command: Box<Command>, confine: Option<&Arc<dyn
                     ),
                 ));
             };
-            // alloc: a sandboxed process's scratch directory, made once as it starts.
-            let scratch = root.join(".blaze-spawn").join(format!("{}-{n}", std::process::id()));
-            _ = std::fs::remove_dir_all(&scratch);
-            std::fs::create_dir_all(&scratch)?;
+            let scratch = dirs.make(n)?;
             match confine.confine(&command, &scratch) {
                 // clone: one reference count, the sandbox's to ask what the process read.
                 Ok(confined) => (Some(confined), Some(scratch), Some(confine.clone())),
                 Err(why) => {
-                    _ = std::fs::remove_dir_all(&scratch);
+                    dirs.remove(scratch);
                     // alloc: an error path.
                     return Err(io::Error::other(format!(
                         "{}: no sandbox can be made here: {why}",
@@ -138,29 +149,43 @@ pub(super) fn start(root: &Path, command: Box<Command>, confine: Option<&Arc<dyn
         None => Launch { program: &command.program, args: &command.args, env: &command.env, dir: &command.dir },
     };
     let made = run(&launch, &command, n);
-    let started = made.map_err(|error| {
-        if let Some(scratch) = &scratch {
-            _ = std::fs::remove_dir_all(scratch);
+    let started = match made {
+        Ok(started) => started,
+        Err(error) => {
+            if let Some(scratch) = scratch {
+                dirs.remove(scratch);
+            }
+            // alloc: an error path.
+            return Err(io::Error::new(error.kind(), format!("starting {}: {error}", launch.program.display())));
         }
-        // alloc: an error path.
-        io::Error::new(error.kind(), format!("starting {}: {error}", launch.program.display()))
-    })?;
+    };
     let (process, thread, job, stdin, stdout, stderr) = started;
     Ok(Started { process, thread, job, stdin, stdout, stderr, finish: Finish { command, confine, scratch } })
 }
 
-/// What a process is started as: its command's own, or what its sandbox made of it.
-struct Launch<'a> {
-    program: &'a Path,
-    args: &'a [OsString],
-    env: &'a [(OsString, OsString)],
-    dir: &'a Path,
+/// What a process is started as: its command's own, what its sandbox made of it, or the warm
+/// launcher.
+pub(super) struct Launch<'a> {
+    pub(super) program: &'a Path,
+    pub(super) args: &'a [OsString],
+    pub(super) env: &'a [(OsString, OsString)],
+    pub(super) dir: &'a Path,
 }
 
 type Handles = (OwnedHandle, OwnedHandle, OwnedHandle, Option<OwnedHandle>, OwnedHandle, OwnedHandle);
 
-fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
-    let job = job(command.memory)?;
+/// A run's standard handles, as a started process and a handed run have them: the driver's ends
+/// (overlapped, kept from children) and the child's (inheritable), its input's the null device
+/// where it is given none.
+pub(super) struct Standard {
+    pub(super) stdin: Option<OwnedHandle>,
+    pub(super) stdout: OwnedHandle,
+    pub(super) stderr: OwnedHandle,
+    /// The child's input, output and error.
+    pub(super) theirs: [OwnedHandle; 3],
+}
+
+pub(super) fn standard(command: &Command, n: u64) -> io::Result<Standard> {
     let (stdout, child_stdout) = pipe(true, n, "out")?;
     let (stderr, child_stderr) = pipe(true, n, "err")?;
     let (stdin, child_stdin) = match command.stdin.is_empty() {
@@ -170,26 +195,55 @@ fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
             (Some(ours), theirs)
         }
     };
-    let inherited = [child_stdin.as_raw_handle(), child_stdout.as_raw_handle(), child_stderr.as_raw_handle()];
+    Ok(Standard { stdin, stdout, stderr, theirs: [child_stdin, child_stdout, child_stderr] })
+}
+
+fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
+    let job = job(command.memory)?;
+    let Standard { stdin, stdout, stderr, theirs } = standard(command, n)?;
+    let inherited = theirs.each_ref().map(|it| it.as_raw_handle());
+    let flags = CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW;
+    let (process, thread) = create(launch, inherited, &inherited, flags)?;
+    // SAFETY: the job and the process just made, which has not run.
+    if let Err(error) = sys::check(unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) }) {
+        // SAFETY: the process just made.
+        unsafe { TerminateProcess(process.as_raw_handle(), KILLED) };
+        // alloc: an error path.
+        return Err(io::Error::new(error.kind(), format!("into its job: {error}")));
+    }
+    // Its ends are its own now: the pipes end when it and what it starts close them.
+    drop(theirs);
+    Ok((process, thread, job, stdin, stdout, stderr))
+}
+
+/// The process `launch` says, made with `flags`: its standard handles `standard` (null for
+/// none), inheriting `inherited` and nothing else (each inheritable, and open until the call
+/// returns). Its process and first thread.
+pub(super) fn create(
+    launch: &Launch<'_>,
+    standard: [HANDLE; 3],
+    inherited: &[HANDLE],
+    flags: PROCESS_CREATION_FLAGS,
+) -> io::Result<(OwnedHandle, OwnedHandle)> {
     // alloc: what the process is started with, made once as it starts.
     let program = sys::wide(launch.program.as_os_str())?;
     let mut line = crate::create_process::command_line(launch.program, launch.args)?;
     let env = crate::create_process::environment(launch.env)?;
     let dir = sys::wide(launch.dir.as_os_str())?;
-    let attributes = Attributes::new(&inherited)?;
+    let attributes = Attributes::new(inherited)?;
     // SAFETY: all zeros is a valid `STARTUPINFOEXW` before its fields are set.
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = inherited[0];
-    startup.StartupInfo.hStdOutput = inherited[1];
-    startup.StartupInfo.hStdError = inherited[2];
+    startup.StartupInfo.hStdInput = standard[0];
+    startup.StartupInfo.hStdOutput = standard[1];
+    startup.StartupInfo.hStdError = standard[2];
     startup.lpAttributeList = attributes.list();
     // SAFETY: all zeros is a valid `PROCESS_INFORMATION` for the call to fill.
     let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: NUL-terminated strings, a writable command line, a Unicode environment block
-    // ending in two NULs, and the attribute list and handles it names, all of which outlive
-    // the call.
+    // ending in two NULs, and the attribute list and the handles it names, all of which
+    // outlive the call (the handles are the caller's, open until it returns).
     sys::check(unsafe {
         CreateProcessW(
             program.as_ptr(),
@@ -197,7 +251,7 @@ fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
             std::ptr::null(),
             std::ptr::null(),
             1,
-            CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            flags,
             env.as_ptr().cast(),
             dir.as_ptr(),
             (&raw const startup).cast::<STARTUPINFOW>(),
@@ -207,16 +261,7 @@ fn run(launch: &Launch<'_>, command: &Command, n: u64) -> io::Result<Handles> {
     drop(attributes);
     let process = sys::owned(info.hProcess)?;
     let thread = sys::owned(info.hThread)?;
-    // SAFETY: the job and the process just made, which has not run.
-    if let Err(error) = sys::check(unsafe { AssignProcessToJobObject(job.as_raw_handle(), process.as_raw_handle()) }) {
-        // SAFETY: the process just made.
-        unsafe { TerminateProcess(process.as_raw_handle(), KILLED) };
-        // alloc: an error path.
-        return Err(io::Error::new(error.kind(), format!("into its job: {error}")));
-    }
-    // Its ends are its own now: the pipes end when it and what it starts close them.
-    drop((child_stdin, child_stdout, child_stderr));
-    Ok((process, thread, job, stdin, stdout, stderr))
+    Ok((process, thread))
 }
 
 /// The process of `thread`, made suspended in `job`, run; or, refused, its job ended.
@@ -251,7 +296,7 @@ pub(super) fn follow(job: &OwnedHandle, port: &Port, key: usize) -> io::Result<(
 
 /// A job that kills what is left in it when it closes and holds the memory of everything in
 /// it to `memory`.
-fn job(memory: Option<u64>) -> io::Result<OwnedHandle> {
+pub(super) fn job(memory: Option<u64>) -> io::Result<OwnedHandle> {
     // SAFETY: no security attributes or name.
     let job = sys::owned(unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) })?;
     // SAFETY: all zeros is a valid limit of nothing.
@@ -280,18 +325,57 @@ pub(super) fn terminate(job: &OwnedHandle, code: u32) {
     unsafe { TerminateJobObject(job.as_raw_handle(), code) };
 }
 
+/// No process may join `job` from here (`JOB_OBJECT_LIMIT_ACTIVE_PROCESS` of 0), its other
+/// limits and its memory kept: so a run handed to the warm launcher and killed before its
+/// program started can't start it after.
+pub(super) fn seal(job: &OwnedHandle) -> io::Result<()> {
+    // SAFETY: all zeros is a valid buffer for the call to fill.
+    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: an open job and a buffer of the class named, of its size.
+    sys::check(unsafe {
+        QueryInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&raw mut limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            std::ptr::null_mut(),
+        )
+    })?;
+    limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    limits.BasicLimitInformation.ActiveProcessLimit = 0;
+    // SAFETY: the job, and information of the class named, of its size.
+    sys::check(unsafe {
+        SetInformationJobObject(
+            job.as_raw_handle(),
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    })
+}
+
+/// The code `process`, which has ended, ended with.
+pub(super) fn code(process: &OwnedHandle) -> io::Result<i32> {
+    let mut code = 0u32;
+    // SAFETY: an open process and a code to write.
+    sys::check(unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) })?;
+    Ok(code as i32)
+}
+
 static PIPES: AtomicU64 = AtomicU64::new(0);
 
 /// A pipe: the driver's end (overlapped, kept from children) and the child's (inheritable).
-/// `inbound` is a pipe the child writes.
-fn pipe(inbound: bool, n: u64, which: &str) -> io::Result<(OwnedHandle, OwnedHandle)> {
-    // alloc: per process, made once as it starts (CreateProcessW costs a thousand times more).
-    let name = format!(
-        r"\\.\pipe\blaze-{}-{n}-{which}-{}",
-        std::process::id(),
-        PIPES.fetch_add(1, Ordering::Relaxed)
-    );
-    let wide = sys::wide(OsStr::new(&name))?;
+/// `inbound` is a pipe the child writes. Its name is made on the stack.
+pub(super) fn pipe(inbound: bool, n: u64, which: &str) -> io::Result<(OwnedHandle, OwnedHandle)> {
+    let mut wide = WideName::<128>::new();
+    wide.text(r"\\.\pipe\blaze-")
+        .number(u64::from(std::process::id()))
+        .text("-")
+        .number(n)
+        .text("-")
+        .text(which)
+        .text("-")
+        .number(PIPES.fetch_add(1, Ordering::Relaxed));
     let access = match inbound {
         true => PIPE_ACCESS_INBOUND,
         false => PIPE_ACCESS_OUTBOUND,
@@ -329,16 +413,16 @@ fn pipe(inbound: bool, n: u64, which: &str) -> io::Result<(OwnedHandle, OwnedHan
 
 /// The child's input where it is given none: the null device, as on Unix.
 fn nothing() -> io::Result<OwnedHandle> {
+    const NUL: [u16; 4] = [b'N' as u16, b'U' as u16, b'L' as u16, 0];
     let inherit = SECURITY_ATTRIBUTES {
         nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
         lpSecurityDescriptor: std::ptr::null_mut(),
         bInheritHandle: 1,
     };
-    let wide = sys::wide(OsStr::new("NUL"))?;
     // SAFETY: a NUL-terminated name and attributes that outlive the call.
     let handle = unsafe {
         CreateFileW(
-            wide.as_ptr(),
+            NUL.as_ptr(),
             GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             &inherit,
@@ -356,7 +440,7 @@ struct Attributes {
 }
 
 impl Attributes {
-    fn new(handles: &[HANDLE; 3]) -> io::Result<Attributes> {
+    fn new(handles: &[HANDLE]) -> io::Result<Attributes> {
         let mut size = 0;
         // SAFETY: a query of the size, writing nothing but `size`; it fails, as it must.
         unsafe { InitializeProcThreadAttributeList(std::ptr::null_mut(), 1, 0, &mut size) };
@@ -393,21 +477,29 @@ impl Drop for Attributes {
     }
 }
 
-/// What the thread pool's wait posts once the process has ended: [`KEY_EXIT`] with the bits
-/// of its spawn's handle, to the driver's port. Inline in the spawn's entry of the driver's
-/// slab, which never moves while it is there, and read by a thread of the pool's while the
-/// wait is registered (`UnsafeCell`; no `&mut` of the spawn may assume it alone reaches it:
-/// `PhantomPinned`). The driver drops the spawn's [`Waiting`], which waits out a call in
-/// progress, before the spawn leaves its entry.
+/// What the thread pool's wait posts once the process has ended: its key
+/// ([`super::sys::KEY_EXIT`] with the bits of its spawn's handle, or
+/// [`super::sys::KEY_WARM`] with the warm launcher's), to the driver's port. Inline in the
+/// entry of the driver's slab it is in, which never moves while it is there, and read by a
+/// thread of the pool's while the wait is registered (`UnsafeCell`; no `&mut` of the entry may
+/// assume it alone reaches it: `PhantomPinned`). The driver drops the entry's [`Waiting`],
+/// which waits out a call in progress, before the entry leaves the slab.
 pub(super) struct Waiter {
-    posted: UnsafeCell<(HANDLE, u64)>,
+    posted: UnsafeCell<Posted>,
     _pinned: PhantomPinned,
 }
 
+#[derive(Clone, Copy)]
+struct Posted {
+    port: HANDLE,
+    key: usize,
+    id: u64,
+}
+
 impl Waiter {
-    /// Posting to `port`, which outlives every wait of the driver's, with `id`.
-    pub(super) fn new(port: &Port, id: u64) -> Waiter {
-        Waiter { posted: UnsafeCell::new((port.raw(), id)), _pinned: PhantomPinned }
+    /// Posting to `port`, which outlives every wait of the driver's, `id` with `key`.
+    pub(super) fn new(port: &Port, key: usize, id: u64) -> Waiter {
+        Waiter { posted: UnsafeCell::new(Posted { port: port.raw(), key, id }), _pinned: PhantomPinned }
     }
 }
 
@@ -422,8 +514,8 @@ pub(super) struct Waiting {
 /// unregistered by `Waiting::drop`, which waits for a call in progress.
 unsafe extern "system" fn ended(context: *mut c_void, _timed_out: bool) {
     // SAFETY: as above; the waiter is written only as it is made, before its wait.
-    let (port, id) = unsafe { *context.cast::<(HANDLE, u64)>() };
-    _ = sys::post(port, KEY_EXIT, 0, id as usize);
+    let Posted { port, key, id } = unsafe { *context.cast::<Posted>() };
+    _ = sys::post(port, key, 0, id as usize);
 }
 
 impl Waiting {
@@ -465,21 +557,17 @@ impl Finish {
         &self.command.program
     }
 
-    /// How the process ended: its exit code, the most memory its job held, what its sandbox
-    /// says it read. Removes what was made for it.
+    /// How the run ended: `code` (its process's, or its warm launcher's answer), the most
+    /// memory its job held, what its sandbox says it read. The caller removes its run
+    /// directory after.
     pub(super) fn exited(
         &self,
-        process: &OwnedHandle,
+        code: io::Result<i32>,
         job: &OwnedHandle,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     ) -> io::Result<Exit> {
-        let ended = (|| {
-            let mut code = 0u32;
-            // SAFETY: an open process and a code to write.
-            sys::check(unsafe { GetExitCodeProcess(process.as_raw_handle(), &mut code) })?;
-            Ok::<_, io::Error>((code, peak(job)?))
-        })();
+        let ended = code.and_then(|code| Ok((code, peak(job)?)));
         let traced = match (&ended, &self.command.sandbox, &self.confine, &self.scratch) {
             (Ok(_), Sandbox::On { trace: true, .. }, Some(confine), Some(scratch)) => {
                 Some(confine.traced(&self.command, scratch).map_err(|why| {
@@ -492,12 +580,9 @@ impl Finish {
             }
             _ => None,
         };
-        if let Some(scratch) = &self.scratch {
-            _ = std::fs::remove_dir_all(scratch);
-        }
         let (code, peak_memory) = ended?;
         let traced = traced.transpose()?;
-        Ok(Exit { code: Some(code as i32), signal: None, stdout, stderr, traced, peak_memory })
+        Ok(Exit { code: Some(code), signal: None, stdout, stderr, traced, peak_memory })
     }
 }
 

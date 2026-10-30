@@ -78,8 +78,6 @@ impl Tree {
         &mut self.vfs
     }
 
-    /// The source files that are new since the last look. Each is in its source root once
-    /// this returns, with no text in it yet.
     /// Whether [`Tree::added`] has directories to list again.
     pub fn relisted(&self, db: &RootDatabase) -> bool {
         self.directories.iter().any(|(path, dir)| {
@@ -88,6 +86,8 @@ impl Tree {
         })
     }
 
+    /// The source files that are new since the last look. Each is in its source root once
+    /// this returns, with no text in it yet.
     pub fn added(&mut self, db: &mut RootDatabase) -> Moved {
         let mut stale: Vec<PathBuf> = self
             .directories

@@ -17,7 +17,7 @@ use std::{
     path::PathBuf,
 };
 
-use blaze_cas::{Corrupt, Guard, Key, Kind, Mismatch, Reader, Store, Ticket};
+use blaze_cas::{Corrupt, Guard, Key, Kind, Mismatch, Reader, Store, Ticket, Unit};
 use blaze_core::{Traced, Untraceable};
 use blaze_format::cursor::{self, Put};
 use blaze_ids::{ContentId, Hasher};
@@ -72,7 +72,7 @@ impl Shape {
         let mut traced = Traced::default();
         for path in &self.files {
             match trace::walked(path) {
-                Some((dir, package)) => match trace::walk(inputs, dir, package)? {
+                Some((dir, package)) => match inputs.tree(dir, package)? {
                     Some(hash) => traced.dirs.push((path.clone(), hash)), // clone: the Traced the caller keeps
                     None => traced.files.push((path.clone(), None)), // clone: the Traced the caller keeps
                 },
@@ -81,7 +81,7 @@ impl Shape {
         }
         for path in &self.dirs {
             let hash = match trace::walked(path) {
-                Some((dir, package)) => trace::walk(inputs, dir, package)?,
+                Some((dir, package)) => inputs.tree(dir, package)?,
                 None => inputs.dir(path)?,
             };
             match hash {
@@ -180,18 +180,20 @@ pub const VALUES: RunKey = RunKey { code: ContentId([0; 32]), given: ContentId([
 /// [`VALUES`]`.traced` hashes a run's: equal exactly when every name has the value it had.
 /// `None` when a directory of the shape is no longer one.
 pub fn values<I: Inputs>(bytes: &[u8], inputs: &mut I) -> Result<Option<ContentId>, FindError<I::Error>> {
-    keyed(bytes, &VALUES, inputs).map_err(|error| match error {
-        Keyed::NotAShape(why) => FindError::NotAShape { key: Key(ContentId([0; 32])), why },
-        Keyed::Inputs(error) => FindError::Inputs(error),
-    })
+    match keyed(bytes, &VALUES, false, inputs) {
+        Ok(keyed) => Ok(keyed.map(|(key, _)| key)),
+        Err(Keyed::NotAShape(why)) => Err(FindError::NotAShape { key: Key(ContentId([0; 32])), why }),
+        Err(Keyed::Inputs(error)) => Err(FindError::Inputs(error)),
+    }
 }
 
 /// What [`find`] found.
 #[derive(Debug)]
 pub enum Found<'s> {
     /// A result whose every input is as it is now: its key, the value kept and the shape it
-    /// was found by, in place.
-    Hit { key: Key, value: &'s [u8], shape: &'s [u8] },
+    /// was found by, in place; with [`find_reads`], also the [`values`] of that shape, hashed
+    /// in the same pass as the key.
+    Hit { key: Key, value: &'s [u8], shape: &'s [u8], values: Option<ContentId> },
     /// No result of a shape the run has had is for the inputs as they are now; `shapes` is
     /// how many it has had.
     Miss { shapes: u32 },
@@ -214,7 +216,19 @@ pub fn find<'s, I: Inputs>(
     run: &RunKey,
     inputs: &mut I,
 ) -> Result<Found<'s>, FindError<I::Error>> {
-    search(|key| Ok(store.get(guard, key)?.map(|entry| entry.bytes)), run, inputs)
+    search_in(|key| Ok(store.get(guard, key)?.map(|entry| entry.bytes)), run, false, inputs)
+}
+
+/// [`find`], with a hit's [`values`] hashed in the same pass as its key: what a caller that
+/// reports what the run read (`hir_def::deps`, through blaze-expand) asks, at no second read
+/// of any input.
+pub fn find_reads<'s, I: Inputs>(
+    store: &'s Reader,
+    guard: &'s Guard,
+    run: &RunKey,
+    inputs: &mut I,
+) -> Result<Found<'s>, FindError<I::Error>> {
+    search_in(|key| Ok(store.get(guard, key)?.map(|entry| entry.bytes)), run, true, inputs)
 }
 
 /// [`find`] for the store's own thread, which holds it.
@@ -223,12 +237,21 @@ pub(crate) fn find_held<'s, I: Inputs>(
     run: &RunKey,
     inputs: &mut I,
 ) -> Result<Found<'s>, FindError<I::Error>> {
-    search(|key| Ok(store.get(key)?.map(|entry| entry.bytes)), run, inputs)
+    search_in(|key| Ok(store.get(key)?.map(|entry| entry.bytes)), run, false, inputs)
 }
 
 pub(crate) fn search<'s, I: Inputs>(
     get: impl Fn(&Key) -> Result<Option<&'s [u8]>, Corrupt>,
     run: &RunKey,
+    inputs: &mut I,
+) -> Result<Found<'s>, FindError<I::Error>> {
+    search_in(get, run, false, inputs)
+}
+
+fn search_in<'s, I: Inputs>(
+    get: impl Fn(&Key) -> Result<Option<&'s [u8]>, Corrupt>,
+    run: &RunKey,
+    with_values: bool,
     inputs: &mut I,
 ) -> Result<Found<'s>, FindError<I::Error>> {
     let mut n = 0;
@@ -237,16 +260,57 @@ pub(crate) fn search<'s, I: Inputs>(
         let Some(bytes) = get(&at).map_err(FindError::Corrupt)? else {
             return Ok(Found::Miss { shapes: n });
         };
-        let keyed = keyed(bytes, run, inputs).map_err(|error| match error {
+        let keyed = keyed(bytes, run, with_values, inputs).map_err(|error| match error {
             Keyed::NotAShape(why) => FindError::NotAShape { key: at, why },
             Keyed::Inputs(error) => FindError::Inputs(error),
         })?;
-        if let Some(key) = keyed.map(Key)
-            && let Some(value) = get(&key).map_err(FindError::Corrupt)?
+        if let Some((key, values)) = keyed
+            && let Some(value) = get(&Key(key)).map_err(FindError::Corrupt)?
         {
-            return Ok(Found::Hit { key, value, shape: bytes });
+            return Ok(Found::Hit { key: Key(key), value, shape: bytes, values });
         }
         n += 1;
+    }
+}
+
+/// What a check hashes a shape's inputs into: the result key and, when asked, the
+/// [`VALUES`] hash of the same entries, each input read once for both.
+struct Keys {
+    run: trace::Keyer,
+    values: Option<trace::Keyer>,
+}
+
+impl Keys {
+    fn file(&mut self, path: &[u8], hash: Option<&[u8; 32]>) {
+        self.run.file(path, hash);
+        if let Some(values) = &mut self.values {
+            values.file(path, hash);
+        }
+    }
+
+    fn dir(&mut self, path: &[u8], hash: &[u8; 32]) {
+        self.run.dir(path, hash);
+        if let Some(values) = &mut self.values {
+            values.dir(path, hash);
+        }
+    }
+
+    fn env(&mut self, name: &[u8], value: Option<&[u8]>) {
+        self.run.env(name, value);
+        if let Some(values) = &mut self.values {
+            values.env(name, value);
+        }
+    }
+
+    fn untraceable(&mut self, name: &[u8]) {
+        self.run.untraceable(name);
+        if let Some(values) = &mut self.values {
+            values.untraceable(name);
+        }
+    }
+
+    fn finish(self) -> (ContentId, Option<ContentId>) {
+        (self.run.finish(), self.values.map(trace::Keyer::finish))
     }
 }
 
@@ -263,22 +327,29 @@ enum Keyed<E> {
 /// What it hashes is what [`RunKey::traced`] of [`Shape::values`] hashes: the shape is the
 /// normalized order, and the whole environment, sorted as [`Inputs::env_all`] lends it, is
 /// merged into the names the run asked for by the same order, the names' own (on Windows
-/// not their bytes').
-fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option<ContentId>, Keyed<I::Error>> {
+/// not their bytes'). With `with_values`, the [`VALUES`] hash of the same entries comes
+/// with the key.
+fn keyed<I: Inputs>(
+    bytes: &[u8],
+    run: &RunKey,
+    with_values: bool,
+    inputs: &mut I,
+) -> Result<Option<(ContentId, Option<ContentId>)>, Keyed<I::Error>> {
     let bad = Keyed::NotAShape;
     let short = |error: cursor::Error| Keyed::NotAShape(error.into());
     let all_name = trace::os_bytes(OsStr::new(ALL_ENV_NAME));
     // alloc: error path
     let rest = bytes.strip_prefix(SHAPE_MAGIC.as_slice()).ok_or_else(|| bad("not a shape".to_owned()))?;
     let mut at = cursor::Reader::new(rest);
-    let mut keyer = trace::Keyer::new(run);
+    let mut keyer =
+        Keys { run: trace::Keyer::new(run), values: with_values.then(|| trace::Keyer::new(&VALUES)) };
     for _ in 0..at.count_u64(1).map_err(short)? {
         let bytes = at.bytes_u64().map_err(short)?;
         let path = trace::path_in(bytes).map_err(bad)?;
         let hash = match trace::walked(&path) {
             // A walked directory that was not there: one there now is what the run did not
             // read.
-            Some((dir, package)) => match trace::walk(inputs, dir, package).map_err(Keyed::Inputs)? {
+            Some((dir, package)) => match inputs.tree(dir, package).map_err(Keyed::Inputs)? {
                 Some(_) => return Ok(None),
                 None => None,
             },
@@ -290,7 +361,7 @@ fn keyed<I: Inputs>(bytes: &[u8], run: &RunKey, inputs: &mut I) -> Result<Option
         let bytes = at.bytes_u64().map_err(short)?;
         let path = trace::path_in(bytes).map_err(bad)?;
         let hash = match trace::walked(&path) {
-            Some((dir, package)) => trace::walk(inputs, dir, package),
+            Some((dir, package)) => inputs.tree(dir, package),
             None => inputs.dir(&path),
         };
         match hash.map_err(Keyed::Inputs)? {
@@ -358,16 +429,30 @@ pub enum KeepError {
 }
 
 /// Keeps `value`, the result of `run`, which read `traced`: the result under its key and its
-/// shape in the chain if the chain has it not. The tickets of what was put.
+/// shape in the chain if the chain has it not. The tickets of what was put. [`keep_in`] of
+/// the store's shared unit.
 pub fn keep(
     store: &mut Store,
     run: &RunKey,
     traced: &Traced,
     value: Vec<u8>,
 ) -> Result<Vec<Ticket>, KeepError> {
+    keep_in(store, Unit::SHARED, run, traced, value)
+}
+
+/// [`keep`] into the packs of `unit`, the crate version the run is of ([`Store::unit`]): a
+/// build script's package, an expansion's calling crate, a test's crate. Its shapes go there
+/// too, since only runs of that crate version read them.
+pub fn keep_in(
+    store: &mut Store,
+    unit: Unit,
+    run: &RunKey,
+    traced: &Traced,
+    value: Vec<u8>,
+) -> Result<Vec<Ticket>, KeepError> {
     let mut tickets = Vec::with_capacity(2);
     let key = result_key(run, traced);
-    tickets.push(store.put(key, Kind::Run, value).map_err(KeepError::Mismatch)?);
+    tickets.push(store.put_in(unit, key, Kind::Run, value).map_err(KeepError::Mismatch)?);
     let shape = Shape::of(traced).encode();
     let mut n = 0;
     loop {
@@ -377,7 +462,7 @@ pub fn keep(
             Some(true) => return Ok(tickets),
             Some(false) => n += 1,
             // clone: the store owns what it keeps, and a slot another took first needs the shape again
-            None => match store.put(at, Kind::Run, shape.clone()) {
+            None => match store.put_in(unit, at, Kind::Run, shape.clone()) {
                 Ok(ticket) => {
                     tickets.push(ticket);
                     return Ok(tickets);
@@ -445,6 +530,9 @@ mod tests {
         struct Env(Vec<(OsString, OsString)>);
         impl Inputs for Env {
             type Error = ();
+            fn entry(&mut self, _: &Path) -> Result<crate::trace::Entry, ()> {
+                Ok(crate::trace::Entry::Missing)
+            }
             fn file(&mut self, _: &Path) -> Result<Option<[u8; 32]>, ()> {
                 Ok(None)
             }
@@ -487,6 +575,9 @@ mod tests {
         }
         impl Inputs for World {
             type Error = ();
+            fn entry(&mut self, _: &Path) -> Result<crate::trace::Entry, ()> {
+                Ok(crate::trace::Entry::Missing)
+            }
             fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ()> {
                 Ok(self.files.get(path).copied())
             }
@@ -530,17 +621,26 @@ mod tests {
                 &|it: &mut World| it.env.push(("UNSET".into(), "now".into())),
                 &|it: &mut World| it.env.push(("C".into(), "3".into())),
             ];
-            for change in changes {
+            let unchanged = VALUES.traced(&traced);
+            for (n, change) in changes.into_iter().enumerate() {
                 let mut now = world.clone();
                 change(&mut now);
                 let values = Shape::decode(&shape).unwrap().values(&mut now.clone()).unwrap();
-                let streamed = keyed(&shape, &run, &mut now).ok().unwrap();
-                assert_eq!(streamed, Some(run.traced(&values)), "whole {whole}");
+                let streamed = keyed(&shape, &run, false, &mut now.clone()).ok().unwrap();
+                assert_eq!(streamed, Some((run.traced(&values), None)), "whole {whole}");
+                let both = keyed(&shape, &run, true, &mut now.clone()).ok().unwrap();
+                assert_eq!(both, Some((run.traced(&values), Some(VALUES.traced(&values)))), "whole {whole}");
+                let alone = super::values(&shape, &mut now).ok().unwrap();
+                assert_eq!(alone, Some(VALUES.traced(&values)), "whole {whole}");
+                // A variable the run did not ask for is read only with the whole environment.
+                let same = n == 0 || (n == 4 && !whole);
+                assert_eq!(alone == Some(unchanged), same, "whole {whole}, change {n}");
             }
-            assert_eq!(keyed(&shape, &run, &mut world.clone()).ok().unwrap(), Some(run.traced(&traced)));
+            assert_eq!(keyed(&shape, &run, false, &mut world.clone()).ok().unwrap(), Some((run.traced(&traced), None)));
             let mut gone = world.clone();
             gone.dirs.clear();
-            assert_eq!(keyed(&shape, &run, &mut gone).ok().unwrap(), None);
+            assert_eq!(keyed(&shape, &run, true, &mut gone.clone()).ok().unwrap(), None);
+            assert_eq!(super::values(&shape, &mut gone).ok().unwrap(), None);
         }
     }
 
@@ -558,6 +658,9 @@ mod tests {
         }
         impl Inputs for World {
             type Error = ();
+            fn entry(&mut self, _: &Path) -> Result<crate::trace::Entry, ()> {
+                Ok(crate::trace::Entry::Missing)
+            }
             fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, ()> {
                 Ok(self.files.get(path).copied())
             }
@@ -588,9 +691,13 @@ mod tests {
             env: vec![("A".into(), "1".into())],
         };
         let key = blaze_alloc_count::assert_at_most(0, "a kept run's shape checked", || {
-            keyed(&shape, &run, &mut world).ok().unwrap()
+            keyed(&shape, &run, false, &mut world).ok().unwrap()
         });
-        assert_eq!(key, Some(run.traced(&traced)));
+        assert_eq!(key, Some((run.traced(&traced), None)));
+        let both = blaze_alloc_count::assert_at_most(0, "a kept run's shape checked with its values", || {
+            keyed(&shape, &run, true, &mut world).ok().unwrap()
+        });
+        assert_eq!(both, Some((run.traced(&traced), Some(VALUES.traced(&traced)))));
     }
 
     #[test]

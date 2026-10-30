@@ -7,13 +7,17 @@
 //! block's one [`super::unit::Unit`]. Each applies a mutation as the old `DefCollector` did to
 //! the state it holds; the first two also record it as a [`DeclOp`].
 
+use std::alloc::{Allocator, Global};
+
 use base_db::{Db, BuiltDependency};
+use blaze_mem::Frame;
 use cfg::CfgOptions;
+use hashbrown::HashMap;
 use hir_expand::{
     InFile, MacroCallId, attrs::AttrId, mod_path::ModPath, name::Name,
     proc_macro::CustomProcMacroExpander,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::FxBuildHasher;
 use smallvec::SmallVec;
 use syntax::ast;
 use triomphe::Arc;
@@ -27,7 +31,8 @@ use crate::{
 };
 
 use super::{
-    ops::{DeclOp, DeferredDerive, DeriveHelper},
+    FrameVec,
+    ops::{DeclOp, DeferredDerive, DeriveHelper, MacroOp},
     queries::DeclKey,
 };
 
@@ -125,12 +130,16 @@ pub(crate) struct CollectEnv {
 }
 
 /// The constants of one crate's (or block's) collection: what the old `DefCollector` read from
-/// its crate and never changed.
-pub(crate) struct CollectCx<'db> {
+/// its crate and never changed, and the frame of the query that collects, which its
+/// temporaries go to.
+pub(crate) struct CollectCx<'db, 'f> {
     pub(crate) db: &'db Db,
+    pub(crate) frame: &'f Frame,
     pub(crate) krate: base_db::Crate,
     pub(crate) data: Arc<DefMapCrateData>,
-    pub(crate) deps: FxIndexMap<Name, BuiltDependency>,
+    /// The dependencies by name, in order of first appearance; a later dependency of a name
+    /// replaces the earlier one in its place (the old `FxIndexMap::insert`).
+    pub(crate) deps: FrameVec<'f, (Name, &'db BuiltDependency)>,
     pub(crate) cfg_options: &'db CfgOptions,
     /// The crate's own procedural macros, from its built library (the old `proc_macros`).
     pub(crate) proc_macros: Box<[(Name, CustomProcMacroExpander, bool)]>,
@@ -141,22 +150,88 @@ pub(crate) struct CollectCx<'db> {
     pub(crate) in_block: bool,
 }
 
+impl<'db> CollectCx<'db, '_> {
+    /// The dependency named `name` (`deps.get`).
+    pub(crate) fn dep(&self, name: &Name) -> Option<&'db BuiltDependency> {
+        self.deps.iter().find(|(it, _)| it == name).map(|&(_, dep)| dep)
+    }
+}
+
 /// One module's tables that collection and the macro steps read and write per item (the old
 /// `DefCollector` held them crate-wide, keyed by item): carried from one step of the module to
-/// the next.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct SideTables {
+/// the next, owned (`SideTables`). A block's collection keeps them in its frame
+/// ([`SideTablesIn`]): nothing carries them past the block's query.
+#[derive(Clone, Debug)]
+pub(crate) struct SideTables<A: Allocator + Clone = Global> {
     /// The directory `mod` declarations of each module resolve in (`mod_dirs`).
-    pub(crate) mod_dirs: FxHashMap<ModuleId, ModDir>,
+    pub(crate) mod_dirs: HashMap<ModuleId, ModDir, FxBuildHasher, A>,
     /// `skip_attrs`.
-    pub(crate) skip_attrs: FxHashMap<InFile<ModItemId>, AttrId>,
+    pub(crate) skip_attrs: HashMap<InFile<ModItemId>, AttrId, FxBuildHasher, A>,
     /// `prev_active_attrs`.
-    pub(crate) prev_active_attrs: FxHashMap<AstId<ast::Item>, SmallVec<[AttrId; 1]>>,
+    pub(crate) prev_active_attrs:
+        HashMap<AstId<ast::Item>, SmallVec<[AttrId; 1]>, FxBuildHasher, A>,
     /// The module's part of `DefMap::derive_helpers_in_scope`.
-    pub(crate) derive_helpers: FxHashMap<AstId<ast::Item>, Vec<DeriveHelper>>,
+    pub(crate) derive_helpers: HashMap<AstId<ast::Item>, Vec<DeriveHelper, A>, FxBuildHasher, A>,
     /// `deferred_builtin_derives`.
-    pub(crate) deferred_derives: FxHashMap<AstId<ast::Item>, Vec<DeferredDerive>>,
+    pub(crate) deferred_derives:
+        HashMap<AstId<ast::Item>, Vec<DeferredDerive, A>, FxBuildHasher, A>,
 }
+
+/// A block's side tables, in the frame of its `block_def_map` query.
+pub(crate) type SideTablesIn<'f> = SideTables<&'f Frame>;
+
+impl<A: Allocator + Clone> SideTables<A> {
+    pub(crate) fn new_in(alloc: A) -> Self {
+        // clone: the allocator, a `&Frame` or `Global`: no allocation.
+        let a = || alloc.clone();
+        SideTables {
+            mod_dirs: HashMap::with_hasher_in(FxBuildHasher, a()),
+            skip_attrs: HashMap::with_hasher_in(FxBuildHasher, a()),
+            prev_active_attrs: HashMap::with_hasher_in(FxBuildHasher, a()),
+            derive_helpers: HashMap::with_hasher_in(FxBuildHasher, a()),
+            deferred_derives: HashMap::with_hasher_in(FxBuildHasher, a()),
+        }
+    }
+
+    /// The allocator the tables are in, which a new per-item list goes to as well.
+    pub(crate) fn alloc(&self) -> A {
+        // clone: as in `new_in`.
+        self.mod_dirs.allocator().clone()
+    }
+
+    /// The derive helpers of `item`, made empty if it has none yet.
+    pub(crate) fn derive_helpers_of(&mut self, item: AstId<ast::Item>) -> &mut Vec<DeriveHelper, A> {
+        let alloc = self.alloc();
+        self.derive_helpers.entry(item).or_insert_with(|| Vec::new_in(alloc))
+    }
+
+    /// The deferred builtin derives of `item`, made empty if it has none yet.
+    pub(crate) fn deferred_derives_of(
+        &mut self,
+        item: AstId<ast::Item>,
+    ) -> &mut Vec<DeferredDerive, A> {
+        let alloc = self.alloc();
+        self.deferred_derives.entry(item).or_insert_with(|| Vec::new_in(alloc))
+    }
+}
+
+impl Default for SideTables {
+    fn default() -> Self {
+        SideTables::new_in(Global)
+    }
+}
+
+impl<A: Allocator + Clone> PartialEq for SideTables<A> {
+    fn eq(&self, other: &Self) -> bool {
+        self.mod_dirs == other.mod_dirs
+            && self.skip_attrs == other.skip_attrs
+            && self.prev_active_attrs == other.prev_active_attrs
+            && self.derive_helpers == other.derive_helpers
+            && self.deferred_derives == other.deferred_derives
+    }
+}
+
+impl<A: Allocator + Clone> Eq for SideTables<A> {}
 
 /// Where one collection's mutations go, and the state it reads while it collects.
 ///
@@ -195,7 +270,7 @@ pub(crate) trait Sink<'db> {
     /// Moves the macro directives of the sink's own module(s) that `apply(DeclOp::Macro)`
     /// received since the last call to the end of `into`, in order (the old
     /// `unresolved_macros.push`). A round-0 sink keeps them in its log instead and moves none.
-    fn take_macros(&mut self, into: &mut Vec<super::ops::MacroOp>);
+    fn take_macros(&mut self, into: &mut FrameVec<'_, MacroOp>);
 
     /// The macro calls the sink's collections expanded at once (case 1) as `(module, call)`,
     /// for `expand_round`'s batch; a sink that does not batch ignores it.

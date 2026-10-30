@@ -18,10 +18,11 @@
 //! or hashed with BLAKE3 for it. Only a file the source roots gain or lose rebuilds its root's
 //! file set; its content ID is updated in place ([`RootContent::insert`]).
 
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, cell::RefCell, fmt};
 
 use blaze_ids::{ContentId, radix};
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_mem::{Frame, Tag, frame, scratch::Scratch};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use salsa::{Durability, Setter};
 use triomphe::Arc;
 use vfs::{
@@ -194,14 +195,35 @@ fn under(rel: &str, dir: &str) -> bool {
         || rel.strip_prefix(dir).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
+thread_local! {
+    static ROOT_SORT: RefCell<Scratch<SourceRootId>> = const { RefCell::new(Scratch::new()) };
+    static FILE_SORT: RefCell<Scratch<FileId>> = const { RefCell::new(Scratch::new()) };
+}
+
+fn sort_roots(roots: &mut [SourceRootId]) {
+    ROOT_SORT.with_borrow_mut(|scratch| radix::sort_copy_by_key_in(roots, |it| it.0, scratch.take()));
+}
+
+fn sort_files(files: &mut [FileId]) {
+    FILE_SORT.with_borrow_mut(|scratch| {
+        radix::sort_copy_by_key_in(files, |it| it.index(), scratch.take())
+    });
+}
+
+/// `list` as the vector a [`ViewChange`] hands its caller.
+fn owned<T: Copy>(list: &[T]) -> Vec<T> {
+    // alloc: the caller's list, at its size; none for an empty one.
+    list.to_vec()
+}
+
 /// What a view will write, worked out before anything is.
-struct Plan {
+struct Plan<'f> {
     /// Each file whose input may change, in the view's order.
-    writes: Vec<Write>,
+    writes: Vec<Write, &'f Frame>,
     /// The files put in a source root, with their paths, in the view's order.
-    added: Vec<(FileId, SourceRootId, VfsPath)>,
+    added: Vec<(FileId, SourceRootId, VfsPath), &'f Frame>,
     /// The files taken out of a source root, with it.
-    removed: Vec<(SourceRootId, FileId)>,
+    removed: Vec<(SourceRootId, FileId), &'f Frame>,
     /// [`Writer::next_file`] once the plan is written.
     next_file: u32,
 }
@@ -226,43 +248,51 @@ impl Files {
         db: &mut Db,
         view: ViewRoot<'_>,
     ) -> Result<ViewChange, ViewError> {
-        let mut writer = self.lock();
-        // The paths a source root names are normalized (`VfsPath::from`), so the base must be.
-        let normalized;
-        let base = match view.base.components().any(|it| matches!(it.as_str(), "." | "..")) {
-            true => {
-                // alloc: only for a base with a `.` or `..` part.
-                normalized = view.base.normalize();
-                &*normalized
+        frame::task(Tag::Parse, |frame| {
+            let mut writer = self.lock();
+            // The paths a source root names are normalized (`VfsPath::from`), so the base must be.
+            let normalized;
+            let base = match view.base.components().any(|it| matches!(it.as_str(), "." | "..")) {
+                true => {
+                    // alloc: only for a base with a `.` or `..` part.
+                    normalized = view.base.normalize();
+                    &*normalized
+                }
+                false => view.base,
+            };
+            let mut index = match writer.views.get_mut(base) {
+                Some(index) => std::mem::take(index),
+                None => ViewIndex::new(base, &writer.by_path),
+            };
+            let plan = self.plan_view(&writer, &mut index, &view, frame);
+            match writer.views.get_mut(base) {
+                Some(slot) => *slot = index,
+                None => {
+                    // alloc: the base's key, once per view base.
+                    writer.views.insert(base.to_path_buf(), index);
+                }
             }
-            false => view.base,
-        };
-        let mut index = match writer.views.get_mut(base) {
-            Some(index) => std::mem::take(index),
-            None => ViewIndex::new(base, &writer.by_path),
-        };
-        let plan = self.plan_view(&writer, &mut index, &view);
-        match writer.views.get_mut(base) {
-            Some(slot) => *slot = index,
-            None => {
-                // alloc: the base's key, once per view base.
-                writer.views.insert(base.to_path_buf(), index);
-            }
-        }
-        Ok(self.write_view(&mut writer, db, &view, plan?))
+            Ok(self.write_view(&mut writer, db, &view, plan?, frame))
+        })
     }
 
     /// What `view` changes, or why it is refused: reads only.
-    fn plan_view(
+    fn plan_view<'f>(
         &self,
         writer: &Writer,
         index: &mut ViewIndex,
         view: &ViewRoot<'_>,
-    ) -> Result<Plan, ViewError> {
+        frame: &'f Frame,
+    ) -> Result<Plan<'f>, ViewError> {
         let call = index.begin();
-        let mut fresh: FxHashSet<&str> = FxHashSet::default();
-        let mut plan =
-            Plan { writes: Vec::new(), added: Vec::new(), removed: Vec::new(), next_file: writer.next_file }; // alloc: none until a file changed.
+        let mut fresh: hashbrown::HashSet<&str, FxBuildHasher, &Frame> =
+            hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        let mut plan = Plan {
+            writes: Vec::new_in(frame),
+            added: Vec::new_in(frame),
+            removed: Vec::new_in(frame),
+            next_file: writer.next_file,
+        };
         for (at, file) in view.files.iter().enumerate() {
             check_path(file.path)?;
             let known = match index.find(file.path) {
@@ -313,10 +343,10 @@ impl Files {
             plan.writes.push(Write { at, id, root, added });
         }
 
-        // alloc: one list per call, of the changed files only (empty, no allocation, when none is).
-        let bytes: Vec<&[u8]> = plan.writes.iter().map(|it| &view.files[it.at].bytes[..]).collect();
-        let ids = ContentId::of_many(blaze_vfs::FILE_DOMAIN, &bytes);
-        for (write, &bytes) in plan.writes.iter().zip(&ids) {
+        let bytes =
+            frame.alloc_slice_from_iter(plan.writes.iter().map(|it| &view.files[it.at].bytes[..]));
+        let ids = content::hash_many(blaze_vfs::FILE_DOMAIN, bytes, frame);
+        for (write, &bytes) in plan.writes.iter().zip(ids) {
             let file = &view.files[write.at];
             if bytes != file.id {
                 return Err(ViewError::Mismatch {
@@ -328,14 +358,11 @@ impl Files {
             }
         }
 
-        let built: Vec<Cow<'_, str>> = view
-            .built
-            .iter()
-            .filter_map(|built| match view.base.starts_with(built) {
-                true => Some(Cow::Borrowed("")),
-                false => Some(rel_key(built.strip_prefix(view.base)?.as_str())),
-            })
-            .collect(); // alloc: one per call, an entry per `built` directory.
+        let mut built: Vec<Cow<'_, str>, &Frame> = Vec::with_capacity_in(view.built.len(), frame);
+        built.extend(view.built.iter().filter_map(|built| match view.base.starts_with(built) {
+            true => Some(Cow::Borrowed("")),
+            false => Some(rel_key(built.strip_prefix(view.base)?.as_str())),
+        }));
         for (rel, id) in index.unseen(call) {
             if built.iter().any(|built| under(rel, built)) {
                 continue;
@@ -351,18 +378,18 @@ impl Files {
         writer: &mut Writer,
         db: &mut Db,
         view: &ViewRoot<'_>,
-        plan: Plan,
+        plan: Plan<'_>,
+        frame: &Frame,
     ) -> ViewChange {
-        let mut change = ViewChange::default();
-        let texts: Vec<Option<syntax::Text>> = plan
-            .writes
-            .iter()
-            .map(|it| blaze_vfs::text_of(view.files[it.at].bytes.clone()).ok()) // clone: a count, the text holds the bytes
-            .collect(); // alloc: per call, of the changed files only.
-        // alloc: per call, of the changed files only.
-        let mut bytes = Vec::new();
-        // alloc: per call, of the changed files only.
-        let mut ranges = Vec::new();
+        let mut texts: Vec<Option<syntax::Text>, &Frame> =
+            Vec::with_capacity_in(plan.writes.len(), frame);
+        texts.extend(
+            plan.writes
+                .iter()
+                .map(|it| blaze_vfs::text_of(view.files[it.at].bytes.clone()).ok()), // clone: a count, the text holds the bytes
+        );
+        let mut bytes = blaze_mem::scratch::lend_bytes();
+        let mut ranges = Vec::new_in(frame);
         for (write, text) in plan.writes.iter().zip(&texts) {
             if text.is_none() {
                 continue;
@@ -372,19 +399,22 @@ impl Files {
             FileText::content_bytes(&view.files[write.at].id, appended, &mut bytes);
             ranges.push(start..bytes.len());
         }
-        let mut contents = content::hash_ranges(FileText::DOMAIN, &bytes, &ranges).into_iter();
+        let mut contents =
+            content::hash_ranges(FileText::DOMAIN, &bytes, &ranges, frame).iter().copied();
+        let (mut set, mut added, mut removed, mut no_text) =
+            (Vec::new_in(frame), Vec::new_in(frame), Vec::new_in(frame), Vec::new_in(frame));
 
         let mut changed_roots = Roots::new();
         for (write, text) in plan.writes.iter().zip(texts) {
             let content = match text {
                 Some(_) => contents.next().expect("a text ID for each file with text"),
                 None => {
-                    change.no_text.push(write.id);
+                    no_text.push(write.id);
                     FileText::no_text()
                 }
             };
             if write.added {
-                change.added.push(write.id);
+                added.push(write.id);
             }
             let unchanged = match (&text, self.text_input(write.id)) {
                 (Some(_), Some(input)) => input.content(&*db) == content,
@@ -410,39 +440,41 @@ impl Files {
             );
             index_file(writer, write.id, content, &mut changed_roots);
             if !write.added {
-                change.set.push(write.id);
+                set.push(write.id);
             }
         }
 
         for &(id, root, _) in &plan.added {
             self.set_file_source_root_in(writer, db, id, root, Durability::MEDIUM);
         }
-        let mut roots: Vec<SourceRootId> = plan
-            .added
-            .iter()
-            .map(|it| it.1)
-            .chain(plan.removed.iter().map(|it| it.0))
-            .collect(); // alloc: per call, the roots that gained or lost a file.
-        radix::sort_copy_by_key(&mut roots, |it| it.0);
+        let mut roots: Vec<SourceRootId, &Frame> =
+            Vec::with_capacity_in(plan.added.len() + plan.removed.len(), frame);
+        roots.extend(plan.added.iter().map(|it| it.1).chain(plan.removed.iter().map(|it| it.0)));
+        sort_roots(&mut roots);
         roots.dedup();
-        self.write_root_files(writer, db, &plan, &roots, &mut changed_roots);
-        self.write_root_contents(writer, db, &changed_roots);
-        writer.named.publish(db);
+        self.write_root_files(writer, db, &plan, &roots, &mut changed_roots, frame);
+        self.write_root_contents(writer, db, &changed_roots, frame);
+        writer.named.publish(db, frame);
 
         for &(_, id) in &plan.removed {
             writer.view_ids.remove(id);
-            change.removed.push(id);
+            removed.push(id);
         }
         for write in &plan.writes {
             writer.view_ids.insert(write.id, view.files[write.at].id);
         }
         writer.next_file = plan.next_file;
-        change.roots = roots;
-        for list in [&mut change.set, &mut change.added, &mut change.removed, &mut change.no_text] {
-            radix::sort_copy_by_key(list, |it| it.index());
+        for list in [&mut set, &mut added, &mut removed, &mut no_text] {
+            sort_files(list);
             list.dedup();
         }
-        change
+        ViewChange {
+            set: owned(&set),
+            added: owned(&added),
+            removed: owned(&removed),
+            no_text: owned(&no_text),
+            roots: owned(&roots),
+        }
     }
 
     /// Puts the plan's added files in their source roots and takes its removed ones out: each
@@ -453,27 +485,31 @@ impl Files {
         &self,
         writer: &mut Writer,
         db: &mut Db,
-        plan: &Plan,
+        plan: &Plan<'_>,
         roots: &[SourceRootId],
         changed: &mut Roots,
+        frame: &Frame,
     ) {
-        // alloc: per added file, hashed in one batch.
-        let keys: Vec<Vec<u8>> = plan.added.iter().map(|(_, _, path)| content::path_key(path)).collect();
-        // alloc: per added file, hashed in one batch.
-        let key_bytes: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-        let path_hashes = ContentId::of_many(SourceRoot::PATH_DOMAIN, &key_bytes);
-        let mut keys: Vec<Option<(Box<[u8]>, u8)>> = keys
-            .into_iter()
-            .zip(&path_hashes)
-            .map(|(key, hash)| Some((key.into_boxed_slice(), RootContent::bucket(hash))))
-            .collect(); // alloc: as above.
+        let mut keys = Vec::with_capacity_in(plan.added.len(), frame);
+        keys.extend(plan.added.iter().map(|(_, _, path)| content::path_key(path)));
+        let key_bytes = frame.alloc_slice_from_iter(keys.iter().map(|key| &**key));
+        let path_hashes = content::hash_many(SourceRoot::PATH_DOMAIN, key_bytes, frame);
+        let mut keys: Vec<Option<(Box<[u8]>, u8)>, &Frame> = {
+            let mut placed = Vec::with_capacity_in(keys.len(), frame);
+            placed.extend(
+                keys.into_iter()
+                    .zip(path_hashes)
+                    .map(|(key, hash)| Some((key, RootContent::bucket(hash)))),
+            );
+            placed
+        };
 
         for &root in roots {
             let input = self.source_root(root);
             let old = input.source_root(&*db);
-            let gone: FxHashSet<FileId> =
-                // alloc: per root that lost a file.
-                plan.removed.iter().filter(|it| it.0 == root).map(|it| it.1).collect();
+            let mut gone: hashbrown::HashSet<FileId, FxBuildHasher, &Frame> =
+                hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+            gone.extend(plan.removed.iter().filter(|it| it.0 == root).map(|it| it.1));
             let mut files = FileSet::default();
             for id in old.iter() {
                 if gone.contains(&id) {
@@ -525,18 +561,6 @@ impl Files {
                 changed.push(root);
             }
         }
-    }
-
-    /// The first file ID from `next` on that nothing has.
-    fn unused_file_id(&self, writer: &Writer, next: &mut u32) -> Option<FileId> {
-        while *next <= span::EditionedFileId::MAX_FILE_ID {
-            let id = FileId::from_raw(*next);
-            *next += 1;
-            if !self.is_used(writer, id) {
-                return Some(id);
-            }
-        }
-        None
     }
 }
 

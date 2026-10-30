@@ -16,6 +16,7 @@ use object::macho::{self, RelocationInfo};
 use object::read::macho::{MachHeader as _, Nlist as _, Section as _, Segment as _};
 
 use blaze_codegen::Arch;
+use blaze_format::cursor;
 use blaze_ids::radix;
 use smallvec::SmallVec;
 
@@ -23,6 +24,7 @@ use crate::model::{
     Apply, Binding, Data, Name, Names, NativeFixup, Object, Section, SectionKind, Symbol, SymbolDef,
     SymbolKind,
 };
+use crate::unwind::DW_EH_PE_OMIT;
 
 type Header = macho::MachHeader64<LE>;
 type Nlist = macho::Nlist64<LE>;
@@ -336,27 +338,25 @@ fn text<'a>(name: &str, bytes: &'a [u8]) -> Result<&'a str, String> {
 
 /// An `LC_LINKER_OPTION`: its words joined by a space (`-framework CoreFoundation`).
 fn linker_option(name: &str, command: &[u8]) -> Result<String, String> {
-    let Some(&[a, b, c, d]) = command.get(8..12) else {
+    let mut words = cursor::Reader::new(command);
+    let count = words
+        .skip(8)
+        .and_then(|()| words.u32())
         // alloc: error path
-        return Err(format!("{name}: a truncated LC_LINKER_OPTION"));
-    };
-    let count = u32::from_le_bytes([a, b, c, d]);
-    let mut rest = &command[12..];
-    let mut option = String::with_capacity(rest.len());
+        .map_err(|_| format!("{name}: a truncated LC_LINKER_OPTION"))?;
+    let mut option = String::with_capacity(words.left());
     for i in 0..count {
-        let end = rest
-            .iter()
-            .position(|&it| it == 0)
+        let word = words
+            .cstr()
             // alloc: error path
-            .ok_or_else(|| format!("{name}: an LC_LINKER_OPTION with fewer than {count} strings"))?;
-        let word = std::str::from_utf8(&rest[..end])
+            .map_err(|_| format!("{name}: an LC_LINKER_OPTION with fewer than {count} strings"))?;
+        let word = std::str::from_utf8(word)
             // alloc: error path
             .map_err(|_| format!("{name}: an LC_LINKER_OPTION that isn't UTF-8"))?;
         if i != 0 {
             option.push(' ');
         }
         option.push_str(word);
-        rest = &rest[end + 1..];
     }
     Ok(option)
 }
@@ -965,8 +965,9 @@ impl Reader<'_> {
         let mut by_addr: Option<Vec<u32>> = None;
         let mut at = 0;
         while at < bytes.len() {
-            let mut entry = Cursor { bytes, at };
-            let length = entry.u32().map_err(|it| self.frame_error(s, at, it))?;
+            let length = cursor::Reader::starting_at(bytes, at)
+                .and_then(|mut entry| entry.u32())
+                .map_err(|it| self.frame_error(s, at, it.as_str()))?;
             if length == 0 {
                 break;
             }
@@ -978,8 +979,9 @@ impl Reader<'_> {
                 .checked_add(length as usize)
                 .filter(|&it| it <= bytes.len())
                 .ok_or_else(|| self.frame_error(s, at, "a call frame entry longer than the section"))?;
-            let mut c = Cursor { bytes: &bytes[..end], at: start };
-            let id = c.u32().map_err(|it| self.frame_error(s, start, it))?;
+            let mut c = cursor::Reader::starting_at(&bytes[..end], start)
+                .map_err(|it| self.frame_error(s, start, it.as_str()))?;
+            let id = c.u32().map_err(|it| self.frame_error(s, start, it.as_str()))?;
             if id == 0 {
                 personalities.clear();
                 let cie = Cie::parse(&mut c, &mut personalities).map_err(|it| self.frame_error(s, start, &it))?;
@@ -994,13 +996,13 @@ impl Reader<'_> {
                     .and_then(|it| cies.binary_search_by_key(&it, |(cie, _)| *cie).ok())
                     .map(|found| cies[found].1)
                     .ok_or_else(|| self.frame_error(s, start, "an FDE whose CIE isn't before it"))?;
-                let pc_begin = c.at;
-                c.pointer(cie.fde).map_err(|it| self.frame_error(s, c.at, &it))?;
-                c.pointer(cie.fde & 0x0f).map_err(|it| self.frame_error(s, c.at, &it))?;
+                let pc_begin = c.at();
+                skip_pointer(&mut c, cie.fde).map_err(|it| self.frame_error(s, c.at(), &it))?;
+                skip_pointer(&mut c, cie.fde & 0x0f).map_err(|it| self.frame_error(s, c.at(), &it))?;
                 let mut lsda = None;
                 if cie.z {
-                    c.uleb().map_err(|it| self.frame_error(s, c.at, it))?;
-                    lsda = cie.lsda.map(|encoding| (c.at, encoding));
+                    c.skip_leb().map_err(|it| self.frame_error(s, c.at(), it.as_str()))?;
+                    lsda = cie.lsda.map(|encoding| (c.at(), encoding));
                 }
                 self.eh_pointer(s, pc_begin, cie.fde, &covered, &mut by_addr)?;
                 if let Some((field, encoding)) = lsda {
@@ -1092,8 +1094,6 @@ impl Reader<'_> {
     }
 }
 
-const DW_EH_PE_OMIT: u8 = 0xff;
-
 /// What an FDE needs of its CIE.
 #[derive(Clone, Copy)]
 struct Cie {
@@ -1108,32 +1108,32 @@ struct Cie {
 impl Cie {
     /// Reads a CIE after its id, noting where its personality pointer is, and its encoding, in
     /// `personalities`.
-    fn parse(c: &mut Cursor<'_>, personalities: &mut SmallVec<[(usize, u8); 2]>) -> Result<Cie, String> {
+    fn parse(c: &mut cursor::Reader<'_>, personalities: &mut SmallVec<[(usize, u8); 2]>) -> Result<Cie, String> {
         let version = c.u8()?;
         if version != 1 && version != 3 {
             // alloc: error path
             return Err(format!("a CIE of version {version}"));
         }
-        let augmentation = c.string()?;
-        c.uleb()?;
-        c.uleb()?;
+        let augmentation = c.cstr().map_err(|_| "an unterminated CIE augmentation")?;
+        c.skip_leb()?;
+        c.skip_leb()?;
         if version == 1 {
             c.u8()?;
         } else {
-            c.uleb()?;
+            c.skip_leb()?;
         }
         let mut cie = Cie { fde: 0, lsda: None, z: false };
         match augmentation {
             [] => {}
             [b'z', rest @ ..] => {
                 cie.z = true;
-                c.uleb()?;
+                c.skip_leb()?;
                 for &it in rest {
                     match it {
                         b'P' => {
                             let encoding = c.u8()?;
-                            personalities.push((c.at, encoding));
-                            c.pointer(encoding)?;
+                            personalities.push((c.at(), encoding));
+                            skip_pointer(c, encoding)?;
                         }
                         b'L' => cie.lsda = Some(c.u8()?),
                         b'R' => cie.fde = c.u8()?,
@@ -1163,55 +1163,20 @@ impl Cie {
     }
 }
 
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
-        let end = self.at.checked_add(n).filter(|&it| it <= self.bytes.len()).ok_or("a truncated call frame entry")?;
-        let taken = &self.bytes[self.at..end];
-        self.at = end;
-        Ok(taken)
+/// Moves past a pointer of `encoding`'s format.
+fn skip_pointer(c: &mut cursor::Reader<'_>, encoding: u8) -> Result<(), String> {
+    if encoding == DW_EH_PE_OMIT {
+        return Ok(());
     }
-
-    fn u8(&mut self) -> Result<u8, &'static str> {
-        Ok(self.take(1)?[0])
+    match encoding & 0x0f {
+        0x00 | 0x04 | 0x0c => c.skip(8)?,
+        0x02 | 0x0a => c.skip(2)?,
+        0x03 | 0x0b => c.skip(4)?,
+        0x01 | 0x09 => c.skip_leb()?,
+        // alloc: error path
+        other => return Err(format!("pointer format {other:#x}")),
     }
-
-    fn u32(&mut self) -> Result<u32, &'static str> {
-        let bytes = self.take(4)?;
-        Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-    }
-
-    /// An unsigned or signed LEB128, skipped.
-    fn uleb(&mut self) -> Result<(), &'static str> {
-        blaze_format::leb::skip(self.bytes, &mut self.at).map_err(|_| "a truncated call frame entry")
-    }
-
-    fn string(&mut self) -> Result<&'a [u8], &'static str> {
-        let rest = &self.bytes[self.at..];
-        let end = rest.iter().position(|&it| it == 0).ok_or("an unterminated CIE augmentation")?;
-        self.at += end + 1;
-        Ok(&rest[..end])
-    }
-
-    /// Skips a pointer of `encoding`'s format.
-    fn pointer(&mut self, encoding: u8) -> Result<(), String> {
-        if encoding == DW_EH_PE_OMIT {
-            return Ok(());
-        }
-        match encoding & 0x0f {
-            0x00 | 0x04 | 0x0c => self.take(8).map(drop)?,
-            0x02 | 0x0a => self.take(2).map(drop)?,
-            0x03 | 0x0b => self.take(4).map(drop)?,
-            0x01 | 0x09 => self.uleb()?,
-            // alloc: error path
-            other => return Err(format!("pointer format {other:#x}")),
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 fn arm64_name(kind: u8) -> &'static str {
@@ -1251,6 +1216,7 @@ fn x86_64_name(kind: u8) -> &'static str {
 #[cfg(test)]
 pub(super) mod tests {
     use blaze_codegen::Arch;
+    use blaze_format::cursor::Put;
     use blaze_ids::rng::SplitMix64;
     use object::macho;
 
@@ -1292,18 +1258,6 @@ pub(super) mod tests {
         sections: Vec<Sect>,
         symbols: Vec<Sym>,
         options: Vec<Vec<&'static str>>,
-    }
-
-    fn w16(out: &mut Vec<u8>, value: u16) {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn w32(out: &mut Vec<u8>, value: u32) {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn w64(out: &mut Vec<u8>, value: u64) {
-        out.extend_from_slice(&value.to_le_bytes());
     }
 
     fn name16(out: &mut Vec<u8>, name: &str) {
@@ -1392,9 +1346,9 @@ pub(super) mod tests {
                     }
                     let size = (12 + strings.len()).next_multiple_of(8);
                     let mut out = Vec::new();
-                    w32(&mut out, macho::LC_LINKER_OPTION);
-                    w32(&mut out, size as u32);
-                    w32(&mut out, words.len() as u32);
+                    out.put_u32(macho::LC_LINKER_OPTION);
+                    out.put_u32(size as u32);
+                    out.put_u32(words.len() as u32);
                     out.extend(strings);
                     out.resize(size, 0);
                     out
@@ -1426,50 +1380,50 @@ pub(super) mod tests {
             }
 
             let mut out = Vec::new();
-            w32(&mut out, macho::MH_MAGIC_64);
-            w32(&mut out, self.cpu);
-            w32(&mut out, 0);
-            w32(&mut out, macho::MH_OBJECT);
-            w32(&mut out, 2 + options.len() as u32);
-            w32(&mut out, commands as u32);
-            w32(&mut out, if self.subsections { macho::MH_SUBSECTIONS_VIA_SYMBOLS } else { 0 });
-            w32(&mut out, 0);
-            w32(&mut out, macho::LC_SEGMENT_64);
-            w32(&mut out, segment as u32);
+            out.put_u32(macho::MH_MAGIC_64);
+            out.put_u32(self.cpu);
+            out.put_u32(0);
+            out.put_u32(macho::MH_OBJECT);
+            out.put_u32(2 + options.len() as u32);
+            out.put_u32(commands as u32);
+            out.put_u32(if self.subsections { macho::MH_SUBSECTIONS_VIA_SYMBOLS } else { 0 });
+            out.put_u32(0);
+            out.put_u32(macho::LC_SEGMENT_64);
+            out.put_u32(segment as u32);
             name16(&mut out, "");
             let vmsize = self.sections.iter().map(|it| it.addr + it.size).max().unwrap_or(0);
-            w64(&mut out, 0);
-            w64(&mut out, vmsize);
-            w64(&mut out, (32 + commands) as u64);
-            w64(&mut out, (at - 32 - commands) as u64);
-            w32(&mut out, 7);
-            w32(&mut out, 7);
-            w32(&mut out, self.sections.len() as u32);
-            w32(&mut out, 0);
+            out.put_u64(0);
+            out.put_u64(vmsize);
+            out.put_u64((32 + commands) as u64);
+            out.put_u64((at - 32 - commands) as u64);
+            out.put_u32(7);
+            out.put_u32(7);
+            out.put_u32(self.sections.len() as u32);
+            out.put_u32(0);
             for (i, section) in self.sections.iter().enumerate() {
                 name16(&mut out, section.name);
                 name16(&mut out, section.segment);
-                w64(&mut out, section.addr);
-                w64(&mut out, section.size);
-                w32(&mut out, if section.zerofill { 0 } else { offsets[i] as u32 });
-                w32(&mut out, section.align);
+                out.put_u64(section.addr);
+                out.put_u64(section.size);
+                out.put_u32(if section.zerofill { 0 } else { offsets[i] as u32 });
+                out.put_u32(section.align);
                 let relocated = !section.relocations.is_empty();
-                w32(&mut out, if relocated { reloffs[i] as u32 } else { 0 });
-                w32(&mut out, section.relocations.len() as u32);
-                w32(&mut out, section.flags);
-                w32(&mut out, 0);
-                w32(&mut out, 0);
-                w32(&mut out, 0);
+                out.put_u32(if relocated { reloffs[i] as u32 } else { 0 });
+                out.put_u32(section.relocations.len() as u32);
+                out.put_u32(section.flags);
+                out.put_u32(0);
+                out.put_u32(0);
+                out.put_u32(0);
             }
             for option in &options {
                 out.extend_from_slice(option);
             }
-            w32(&mut out, macho::LC_SYMTAB);
-            w32(&mut out, 24);
-            w32(&mut out, symoff as u32);
-            w32(&mut out, self.symbols.len() as u32);
-            w32(&mut out, stroff as u32);
-            w32(&mut out, strings.len() as u32);
+            out.put_u32(macho::LC_SYMTAB);
+            out.put_u32(24);
+            out.put_u32(symoff as u32);
+            out.put_u32(self.symbols.len() as u32);
+            out.put_u32(stroff as u32);
+            out.put_u32(strings.len() as u32);
             assert_eq!(out.len(), 32 + commands);
             for (i, section) in self.sections.iter().enumerate() {
                 out.resize(offsets[i], 0);
@@ -1478,17 +1432,17 @@ pub(super) mod tests {
             for (i, section) in self.sections.iter().enumerate() {
                 out.resize(reloffs[i], 0);
                 for [word0, word1] in &section.relocations {
-                    w32(&mut out, *word0);
-                    w32(&mut out, *word1);
+                    out.put_u32(*word0);
+                    out.put_u32(*word1);
                 }
             }
             out.resize(symoff, 0);
             for (symbol, strx) in self.symbols.iter().zip(strx) {
-                w32(&mut out, strx);
+                out.put_u32(strx);
                 out.push(symbol.n_type);
                 out.push(symbol.n_sect);
-                w16(&mut out, symbol.n_desc);
-                w64(&mut out, symbol.n_value);
+                out.put_u16(symbol.n_desc);
+                out.put_u64(symbol.n_value);
             }
             out.extend_from_slice(&strings);
             out
@@ -1874,14 +1828,14 @@ pub(super) mod tests {
         obj.symbol("_g", SECT | EXT, text, 0, 16);
         // CIE: "zR", FDE pointers pc-relative 8-byte (0x10), as clang writes them for x86-64.
         let mut eh = Vec::new();
-        w32(&mut eh, 16);
-        w32(&mut eh, 0);
+        eh.put_u32(16);
+        eh.put_u32(0);
         eh.extend_from_slice(&[1, b'z', b'R', 0, 1, 0x78, 0x10, 1, 0x10, 0, 0, 0]);
         // FDE at 20, its CIE pointer at 24 and pc_begin at 28 (address 32 + 28): `_g`.
-        w32(&mut eh, 24);
-        w32(&mut eh, 24);
-        w64(&mut eh, (16i64 - 60) as u64);
-        w64(&mut eh, 16);
+        eh.put_u32(24);
+        eh.put_u32(24);
+        eh.put_u64((16i64 - 60) as u64);
+        eh.put_u64(16);
         eh.extend_from_slice(&[0, 0, 0, 0]);
         let frame = obj.section("__TEXT", "__eh_frame", 32, eh, 3, EH_FRAME);
         assert_eq!(frame, 2);
@@ -1903,17 +1857,17 @@ pub(super) mod tests {
         obj.symbol("_g", SECT | EXT, text, 0, 16);
         obj.symbol("_h", SECT | EXT, data, 0, 32);
         let cie = |eh: &mut Vec<u8>| {
-            w32(eh, 16);
-            w32(eh, 0);
+            eh.put_u32(16);
+            eh.put_u32(0);
             eh.extend_from_slice(&[1, b'z', b'R', 0, 1, 0x78, 0x10, 1, 0x10, 0, 0, 0]);
         };
         // An FDE whose CIE pointer (at `at + 4`) leads back to `cie`, `pc_begin` at `at + 8`.
         let fde = |eh: &mut Vec<u8>, cie: usize, target: i64| {
             let at = eh.len();
-            w32(eh, 24);
-            w32(eh, (at + 4 - cie) as u32);
-            w64(eh, (target - (48 + at as i64 + 8)) as u64);
-            w64(eh, 16);
+            eh.put_u32(24);
+            eh.put_u32((at + 4 - cie) as u32);
+            eh.put_u64((target - (48 + at as i64 + 8)) as u64);
+            eh.put_u64(16);
             eh.extend_from_slice(&[0, 0, 0, 0]);
         };
         let mut eh = Vec::new();
@@ -1955,15 +1909,15 @@ pub(super) mod tests {
         }
         let frame = text_len + data_len;
         let mut eh = Vec::new();
-        w32(&mut eh, 16);
-        w32(&mut eh, 0);
+        eh.put_u32(16);
+        eh.put_u32(0);
         eh.extend_from_slice(&[1, b'z', b'R', 0, 1, 0x78, 0x10, 1, 0x10, 0, 0, 0]);
         for i in 0..n {
             let at = eh.len();
-            w32(&mut eh, 24);
-            w32(&mut eh, (at + 4) as u32);
-            w64(&mut eh, (16 * i as i64 - (frame as i64 + at as i64 + 8)) as u64);
-            w64(&mut eh, 16);
+            eh.put_u32(24);
+            eh.put_u32((at + 4) as u32);
+            eh.put_u64((16 * i as i64 - (frame as i64 + at as i64 + 8)) as u64);
+            eh.put_u64(16);
             eh.extend_from_slice(&[0, 0, 0, 0]);
         }
         obj.section("__TEXT", "__eh_frame", frame, eh, 3, EH_FRAME);

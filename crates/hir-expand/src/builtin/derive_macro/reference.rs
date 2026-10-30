@@ -17,13 +17,18 @@ use crate::{
 };
 use syntax::ast::{self, AstNode, FieldList, HasAttrs, HasGenericParams, HasName, HasTypeBounds};
 
-/// Where the old derives read the item from, in the database's place.
-pub(super) trait ItemSource {
-    fn adt(&self) -> (&ast::Adt, &span::SpanMap);
+/// Where the old derives read the item from, in the database's place: the item and its span
+/// map.
+pub(super) struct ItemSource<'a>(pub(super) &'a ast::Adt, pub(super) &'a span::SpanMap);
+
+impl ItemSource<'_> {
+    fn adt(&self) -> (&ast::Adt, &span::SpanMap) {
+        (self.0, self.1)
+    }
 }
 
 fn parse_adt(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     _: &tt::TopSubtree,
     call_site: Span,
 ) -> Result<BasicAdtInfo, ExpandError> {
@@ -189,7 +194,6 @@ impl AdtShape {
     }
 }
 
-#[derive(Clone)]
 pub(super) struct BasicAdtInfo {
     name: tt::Ident,
     shape: AdtShape,
@@ -286,7 +290,6 @@ impl BasicAdtInfo {
     }
 }
 
-#[derive(Clone)]
 pub(super) struct AdtParam {
     name: tt::TopSubtree,
     /// `None` if this is a type parameter.
@@ -485,7 +488,7 @@ pub(super) fn name_to_token(
     Ok(name_token)
 }
 pub(super) fn expand_simple_derive(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     invoc_span: Span,
     tt: &tt::TopSubtree,
     trait_path: tt::TopSubtree,
@@ -546,15 +549,15 @@ pub(super) fn expand_simple_derive_with_parsed(
         .map(|param| {
             let ident = param.name;
             if let Some(b) = param.bounds {
-                let ident2 = ident.clone();
+                let ident2 = ident.copy();
                 where_block.push(quote! {invoc_span => #ident2 : #b , });
             }
             if let Some(ty) = param.const_ty {
-                let ident2 = ident.clone();
+                let ident2 = ident.copy();
                 (quote! {invoc_span => const #ident : #ty , }, quote! {invoc_span => #ident2 , })
             } else {
-                let bound = trait_path.clone();
-                let ident2 = ident.clone();
+                let bound = trait_path.copy();
+                let ident2 = ident.copy();
                 let param = if constrain_to_trait {
                     quote! {invoc_span => #ident : #bound , }
                 } else {
@@ -567,8 +570,8 @@ pub(super) fn expand_simple_derive_with_parsed(
 
     if constrain_to_trait {
         where_block.extend(info.associated_types.iter().map(|it| {
-            let it = it.clone();
-            let bound = trait_path.clone();
+            let it = it.copy();
+            let bound = trait_path.copy();
             quote! {invoc_span => #it : #bound , }
         }));
     }
@@ -585,7 +588,7 @@ pub(super) fn expand_simple_derive_with_parsed(
 }
 
 pub(super) fn copy_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -604,7 +607,7 @@ pub(super) fn copy_expand(
 /// `#[derive(ConstParamTy)]` (`adt_const_params`): the marker trait, named apart from the
 /// macro in `core::marker`.
 pub(super) fn const_param_ty_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -620,7 +623,7 @@ pub(super) fn const_param_ty_expand(
     )
 }
 pub(super) fn reborrow_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -634,7 +637,7 @@ pub(super) fn reborrow_expand(
     )
 }
 pub(super) fn expand_reborrow_marker_derive(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
     trait_path: tt::TopSubtree,
@@ -666,7 +669,7 @@ pub(super) fn expand_reborrow_marker_derive(
     ))
 }
 pub(super) fn clone_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -676,7 +679,7 @@ pub(super) fn clone_expand(
 /// `copy` is whether `Copy` is derived next to `Clone`, which makes cloning a copy for a type
 /// that has no type parameters.
 pub(super) fn clone_expand_with(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
     copy: bool,
@@ -743,7 +746,7 @@ pub(super) fn eq_eq(span: Span) -> tt::TopSubtree {
 }
 
 pub(super) fn default_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -808,7 +811,7 @@ pub(super) fn default_expand(
 }
 
 pub(super) fn debug_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -897,7 +900,7 @@ pub(super) fn last_by_ref(adt: &BasicAdtInfo, span: Span, last: bool) -> tt::Top
 }
 
 pub(super) fn hash_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -944,7 +947,7 @@ pub(super) fn hash_expand(
 }
 
 pub(super) fn eq_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -960,8 +963,31 @@ pub(super) fn eq_expand(
     )
 }
 
+/// rustc's `expand_deriving_partial_eq`: `StructuralPartialEq`, bounding no parameter and
+/// written for a union too, then `PartialEq`.
 pub(super) fn partial_eq_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
+    span: Span,
+    tt: &tt::TopSubtree,
+) -> ExpandResult<tt::TopSubtree> {
+    let partial_eq = partial_eq_impl_expand(db, span, tt);
+    let Ok(info) = parse_adt(db, tt, span) else { return partial_eq };
+    let krate = &dollar_crate(span);
+    let structural = expand_simple_derive_with_parsed(
+        span,
+        info,
+        quote! {span => #krate::marker::StructuralPartialEq },
+        |_| quote! {span =>},
+        false,
+        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+    );
+    let ExpandResult { value, err } = partial_eq;
+    let partial_eq = value.token_trees();
+    ExpandResult { value: quote! {span => #structural #partial_eq }, err }
+}
+
+fn partial_eq_impl_expand(
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1065,7 +1091,7 @@ pub(super) fn self_and_other_patterns(
 }
 
 pub(super) fn ord_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {
@@ -1120,7 +1146,7 @@ pub(super) fn ord_expand(
 }
 
 pub(super) fn partial_ord_expand(
-    db: &dyn ItemSource,
+    db: &ItemSource<'_>,
     span: Span,
     tt: &tt::TopSubtree,
 ) -> ExpandResult<tt::TopSubtree> {

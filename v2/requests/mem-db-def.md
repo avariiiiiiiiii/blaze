@@ -17,9 +17,12 @@ other parts are in the children's files, each written against H1 to H3:
 | hir-expand | `v2/requests/mem-db-def-expand.md` | `db-expand-macros-next1` |
 | hir | `v2/requests/mem-db-def-hir.md` | `db-next2` |
 
-Programmed against two requested signatures: `blaze_mem::frame::current<R>(f: impl FnOnce(&Frame)
--> R) -> R` (mem-db's request 1 of lane mem) and `ContentId::of_many_into(domain, inputs, out:
-&mut Vec<ContentId>)` (`v2/requests/mem-format.md`, "`crates/blaze-ids/src/many.rs`"). Line
+Programmed against `blaze_mem::frame::task` (`frame.rs:453`) and `ContentId::of_many_into(domain,
+inputs, out: &mut Vec<ContentId>)` (`crates/blaze-ids/src/lib.rs:80`), both in the tree. Every
+query body here and in the part requests opens its own `frame::task(<its tag>, ..)`, never
+`frame::current`: salsa's `execute` opens no frame today (mem-db-salsa's M1 is still a request),
+`current` stops outside a task, and a nested query's miss must not allocate into the outer
+query's frame. Tasks nest, so this stays right once M1 lands. Line
 numbers were reread against the tree on 2026-10-29 after base-db's `Roots`/`ByFile` rewrite; the
 function named is the anchor.
 
@@ -86,6 +89,8 @@ A test binary has one global allocator, and every budget test of a crate shares 
 
 > applied by db-expand-macros (hir-expand's part of H1 to H3): `crates/hir-expand/Cargo.toml` has `hashbrown` and `blaze-mem` in `[dependencies]` and `blaze-alloc-count` in `[dev-dependencies]`; `src/lib.rs` has `#![feature(allocator_api)]` after the `cfg_attr` line. H3 done differently: the allocator is at crate level, `#[cfg(test)] #[global_allocator] static ALLOC` after `mod prettify_macro_expansion_;`, not inside `mod tests`, because speed-hir-sol-expand's request (`v2/requests/db-expand-macros.md`, block 8) asked for it there and a binary has one. It is still one allocator for every budget test in the crate (`budget_tests.rs`, `builtin/derive_macro/tests.rs`). `v2/requests/mem-db-def-expand.md` doesn't exist yet; I'll apply it when it does.
 
+> applied by db-mem-def (21:28): H1 to H3 for base-db, hir-def and hir. Manifests gained `hashbrown` (all three) and `blaze-mem` (hir, hir-def; base-db had it), `blaze-alloc-count` in hir's dev-deps (the others had it); `#![feature(allocator_api)]` after the `cfg_attr` line in each lib.rs; hir's allocator after `mod tests;`. hir-def's H3 was already in (db-apply-def's alloc-count item).
+
 ---
 
 ## base-db (owner: `db-expand-inputs2-next1`)
@@ -109,6 +114,15 @@ The tag of every setter's task is `Tag::Parse` (contract 3: base-db's file input
 tables `Tag::Query` (contract 5).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+> db-expand (22:31): base-db's requests are db-expand's now (db-expand-inputs2-next1 has
+> closed). B1 to B8 and the budget tests are each marked below, and checked against the tree.
+> Two parts are left:
+> - B1's `lib.rs` change is not made, and that is intended: `content_bytes` stays
+>   `&mut Vec<u8>` because `blaze_format::cursor::Put` is implemented for `Vec<u8>` only, as
+>   B1's line says.
+> - B7's `parse_errors` half waits on `Parse::errors_exact` in `crates/syntax`. Tell db-expand
+>   when it lands.
 
 ### B1. Every setter is a task of its own (`files.rs`, `named.rs`, `content.rs`, `lib.rs`)
 
@@ -346,6 +360,8 @@ bucket inputs made once per database (`:166-173`) stay as they are (setup).
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
+> applied by db-mem-def (21:28): B1 in `content.rs`, `files.rs`, `named.rs`, adapted to the file as it is now: `content.rs` has no `frame()` helper and writes through `blaze_format::cursor::Put`, which is implemented only for `Vec<u8>`, so the byte buffers are the worker's (`scratch::lend_bytes`/`with_bytes`) instead of frame vecs, and `opt_bytes`/`content_bytes` stay `&mut Vec<u8>`. `path_key` returns `Box<[u8]>` via `scratch::with_bytes`; `path_key_into`, `hash_many` and `hash_ranges(.., frame) -> &'f [ContentId]` as written. Setters in `frame::task(Tag::Parse, ..)`; `RootContent::new`/`refresh`, `index_root`, `write_root_contents`, `Named::publish` take the frame.
+
 ### B2. `set_view_root` in its task (`view.rs`)
 
 The owner's rewrite already keeps the view index without making a key per call
@@ -488,14 +504,19 @@ fn sort_files(files: &mut [FileId]) {
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
+> applied by db-mem-def (21:28): B2 on `view.rs` as it is now (texts from `blaze_vfs::text_of`, `ViewFile::bytes`): `set_view_root` in `frame::task(Tag::Parse, ..)`, `Plan<'f>` of frame vecs, `fresh`/`gone` frame `hashbrown::HashSet`s, `built`, texts, ranges, roots and the key lists in the frame, `ViewChange`'s lists copied out with `to_vec()`, sorts through `ROOT_SORT`/`FILE_SORT` and `radix::sort_copy_by_key_in`. Differs: `write_view`'s byte buffer is `scratch::lend_bytes()` (as in B1), and `plan_view`'s ID check hashes through `content::hash_many`.
+
 ### B3. `ContentId::of_many_into` (owner: lane `format`; filed by `mem-format`)
 
-Already filed as `v2/requests/mem-format.md`, "`crates/blaze-ids/src/many.rs`: `of_many`'s per-call
-buffers", with `out: &mut Vec<ContentId>`, a warm call into a buffer with room allocating
+Landed (`crates/blaze-ids/src/lib.rs:80`, `of_many_into(domain, inputs, out: &mut Vec<ContentId>)`),
+from `v2/requests/mem-format.md`, "`crates/blaze-ids/src/many.rs`: `of_many`'s per-call
+buffers", a warm call into a buffer with room allocating
 nothing, and its test `a_warm_of_many_into_allocates_nothing`. B1 and B2 call it as filed
 (through `content::hash_many`); nothing more is asked here.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+> checked by db-mem-def (21:40): `ContentId::of_many_into` is in `crates/blaze-ids` (format's); `content::hash_many` and `hash_ranges` call it.
 
 ### B4. base-db's tables on reserved regions (`table.rs`)
 
@@ -628,6 +649,8 @@ for `Log` (four threads push 10 000 each; every index is read back to its value,
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
+> applied by db-mem-def (21:43), after db-expand-paths finished speed-hir's `Table` onto `intern::swiss::Index` and handed `table.rs` over: `Column` on `AppendVec<AtomicU64>` and `Log` on `blaze_mem::Column` as written; `Table::new(max)` passes `max` to its `Log`. The `Table` levels part is moot (a shard is now `{ lock, index: Index }`, whose growth is swiss's). `Files::default` sizes its six tables `1 << 22` and `views` `1 << 16`; `Named::default` `1 << 22`. Every `Column::set` caller holds the writer (`write_text`, `set_file_source_root_in` take `&mut Writer`; `set_source_root_with_durability` locks). Tests: `Table::new(1 << 16)` in both table tests, `Log::new(1 << 16)` in `a_log_and_a_column_give_back_what_was_put` (which already holds `Column` to a model), and a new `threads_pushing_to_a_log_each_get_their_own_index` (four threads, 10 000 each).
+
 ### B5. `run_all`: each task in a frame of its own, tagged by its caller (`db.rs`)
 
 A batch task's body runs outside salsa's executor: `hir/src/check.rs:117` checks modules in it,
@@ -736,6 +759,8 @@ Each caller imports `blaze_mem::Tag` (H1 gives the dependency; ide-db's manifest
 > applied by frontend-db-basereq (10-29): the `db/tests.rs` test
 > `a_batch_run_here_allocates_nothing_and_frames_each_task` from "Budget tests" below.
 
+> frontend-nameres (2026-10-29 21:21): seen and kept. `nameres/facts/collect.rs:218` passes `Tag::Nameres` (preludes) and `:295` `Tag::Expand` (expansions), with `use blaze_mem::Tag;` at `:11`; nothing left for `facts/`. hir-def's manifest now has `blaze-mem.workspace = true` (`crates/hir-def/Cargo.toml:52`), so the missing-dependency note above no longer holds for hir-def.
+
 ### B6. `transitive_deps` and `transitive_rev_deps` memoized (`input.rs:872-928`)
 
 Both rebuild everything per call (`vec![self]`, an `FxHashSet`, a `Vec`; for reverse deps an
@@ -765,7 +790,7 @@ impl Crate {
 
 #[salsa::tracked(returns(deref))]
 fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
-    blaze_mem::frame::current(|frame| {
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let mut worklist = Vec::new_in(frame);
         worklist.push(krate);
         let mut seen: hashbrown::HashSet<Crate, FxBuildHasher, &Frame> =
@@ -784,7 +809,7 @@ fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
 
 #[salsa::tracked(returns(deref))]
 fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
-    blaze_mem::frame::current(|frame| {
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
         let all = all_crates(db);
         // The reverse edges as CSR: for each crate (by its place in `all`), the crates that
         // depend on it.
@@ -857,6 +882,8 @@ a different function: unchanged.)
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
+> applied by db-mem-def (21:28; 21:40 moved to `frame::task(Tag::Query, ..)` as the revised text says): B6 as written in `input.rs` (`use blaze_mem::Frame;`), and hir's three callers (`lib.rs` `transitive_reverse_dependencies`, `notable_traits_in_deps`, the impls walk). The other crates' callers are filed in `v2/requests/db.md` under their owners.
+
 ### B7. `source_root_crates` at its exact size (`lib.rs:489-504`)
 
 ```rust
@@ -864,7 +891,7 @@ pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
     #[salsa::tracked(returns(deref))]
     pub fn source_root_crates(db: &Db, root: SourceRootInput) -> Box<[Crate]> {
         let crates = AllCrates::get(db).crates(db);
-        blaze_mem::frame::current(|frame| {
+        blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
             let mut found = Vec::new_in(frame);
             found.extend(crates.iter().copied().filter(|&krate| {
                 let root_file = krate.data(db).root_file_id;
@@ -876,12 +903,26 @@ pub fn source_root_crates(db: &Db, id: SourceRootId) -> &[Crate] {
     source_root_crates(db, db.source_root(id))
 }
 ```
-`EditionedFileId::parse_errors` (`editioned_file_id.rs:43-50`) turns `errors()`'s list into a
-box with `.into()`, which reallocates when the list has spare capacity; that list is
-`syntax::Parse::errors`' (lane format's), so the exact size is theirs to give: noted to
-`mem-format-tree`, nothing to change here.
+`EditionedFileId::parse_errors` and `parse_errors_with_bodies` (`editioned_file_id.rs:43-61`)
+turn `errors()`'s list into a box with `.into()`, which reallocates when the list has spare
+capacity. mem-format has requested `Parse::errors_exact()` and `errors_with_bodies_exact()`
+(`v2/requests/mem-format-tree.md`, end; each `Option<Box<[SyntaxError]>>`, `None` for no
+errors). Once they are in `crates/syntax`, and not before, the two bodies become:
+```rust
+    pub fn parse_errors(self, db: &Db) -> Option<Box<[SyntaxError]>> {
+        self.parse(db).errors_exact()
+    }
+
+    pub fn parse_errors_with_bodies(self, db: &Db) -> Option<Box<[SyntaxError]>> {
+        self.parse(db).errors_with_bodies_exact()
+    }
+```
+(attributes and doc comments as they are): one exact allocation per file with errors, none
+without.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+> applied by db-mem-def (21:28; 21:40 moved to `frame::task(Tag::Query, ..)` as the revised text says): `source_root_crates` as written. The `parse_errors` half waits on `Parse::errors_exact`/`errors_with_bodies_exact`, not in `crates/syntax` yet.
 
 ### B8. The executor path (no change; what was checked)
 
@@ -893,15 +934,20 @@ function (`lib.rs:491-492`) and, with B6, `transitive_deps` and `transitive_rev_
 (`fetch.rs:132`) → `self.execute` (`fetch.rs:197`; also `maybe_changed_after.rs:266`, a deep
 verify that has to recompute) → `execute.rs:39` `execute` → `execute_maybe_iterate` (`:122`,
 one call per fixpoint iteration) → `execute_query` (`:328`) → `C::execute(db, input)` (`:340`),
-the one place a query function's body runs, which `mem-db-salsa` wraps in
-`frame::task(C::TAG, ..)`. Nothing in base-db calls a query body any other way: no inner
+the one place a query function's body runs. `mem-db-salsa`'s M1 asks for it to be wrapped in
+`frame::task(C::MEM_TAG, ..)`, but today `vendor/salsa` opens no frame (it uses blaze-mem only
+for memo tables), and `frame::current` stops outside a task (`frame.rs:497`). So B6 and B7
+open their own `frame::task(Tag::Query, ..)`; tasks nest (`frame.rs:453`), so they stay right
+after M1 lands. Nothing in base-db calls a query body any other way: no inner
 function is called directly (`source_root_crates`' inner tracked function is reached only
 through the outer wrapper), and `Reparse::parse`/`reparse::whole` run only inside `parse`
 (and `assert_whole` in debug builds and tests, inside it). The one place base-db runs code
 outside the executor is `run_all`'s tasks, which B5 frames; the setters run outside any query
-and B1, B2 frame them. So `frame::current` in B6 and B7 always finds a frame.
+and B1, B2 frame them. No base-db query calls `frame::current`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+> checked by db-mem-def (21:40): no change asked, and it holds. B6 and B7 open `frame::task(Tag::Query, ..)`, and no base-db query calls `frame::current` (`db/tests.rs:62` calls it inside a `run_all` task, which B5 frames).
 
 ### Budget tests
 
@@ -1018,6 +1064,8 @@ The existing `a_memo_hit_allocates_nothing` (`db/tests.rs:79`) holds the parse-l
 > `a_changed_file_costs_a_constant` and the `built` case fail, by design, as the old
 > unchanged-view test did before block 2. The `crates/base-db/src/tests.rs` tests (keystroke,
 > view edit, crate deps) are not in my brief and stay for whoever applies B1, B2 and B6.
+
+> applied by db-mem-def (21:28): `lib_root`, `a_keystroke_allocates_only_its_text_and_slot` and `crate_deps_are_memo_hits` in `budget_tests.rs` (where the text puts them; nothing in `tests.rs`). The view edit is `a_changed_file_costs_a_constant`, as the text says. B4's `Log` test is in `tests.rs` (see B4).
 
 ## dedup: LEB128 and seeded RNGs onto `blaze_format::leb` and `blaze_ids::rng`
 

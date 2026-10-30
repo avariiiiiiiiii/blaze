@@ -6,7 +6,7 @@ use std::{
 
 use base_db::EditionedFileId;
 use blaze_ids::rng::SplitMix64;
-use syntax::{AstNode, ast::HasModuleItem};
+use syntax::view::HasModuleItem;
 use test_fixture::WithFixture;
 
 use crate::{
@@ -145,7 +145,7 @@ fn items_lowered_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize
     let krate = db.test_crate();
     let file_id = file.file_id(&*db);
     crate::file_item_tree(&*db, file.into(), krate);
-    let before = file.parse(&*db).tree().syntax().text().to_string();
+    let before = file.parse(&*db).root().text().to_string();
     db.set_file_text(file_id, &format!("{before}\n"));
     crate::file_item_tree(&*db, file.into(), krate);
     db.set_file_text(file_id, text);
@@ -222,22 +222,28 @@ fn a_big_item_keeps_its_tree_across_an_edit_elsewhere() {
     assert_eq!(items_lowered_by(&mut db, file, &renamed), 1);
 }
 
-/// How many top-level items' syntax making the file's tree hashes once it holds `text`, the
-/// file keyed at the text it holds before.
-fn items_hashed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize {
+/// How many top-level items' syntax making the file's tree hashes once it holds `text`, and how
+/// many items' ast ids and anchors it reads from the maps, the file keyed at the text it holds
+/// before.
+fn items_keyed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> (usize, usize) {
     let krate = db.test_crate();
     let file_id = file.file_id(&*db);
-    let before = file.parse(&*db).tree().syntax().text().to_string();
+    let before = file.parse(&*db).root().text().to_string();
     for warm in [format!("{before}\n"), before] {
         db.set_file_text(file_id, &warm);
         crate::file_item_tree(&*db, file.into(), krate);
     }
     db.set_file_text(file_id, text);
     super::HASHED.set(0);
+    super::READ.set(0);
     crate::file_item_tree(&*db, file.into(), krate);
-    let hashed = super::HASHED.get();
+    let counts = (super::HASHED.get(), super::READ.get());
     assert_assembled_is_whole(db, file, text);
-    hashed
+    counts
+}
+
+fn items_hashed_by(db: &mut TestDB, file: EditionedFileId, text: &str) -> usize {
+    items_keyed_by(db, file, text).0
 }
 
 #[test]
@@ -254,6 +260,38 @@ fn an_edit_hashes_only_the_items_it_touched() {
     // With the first item gone, the second begins where the text was the first's.
     let removed = appended.replacen("pub fn f0(a: u8) -> u8 { a + 0 }\n", "", 1);
     assert_eq!(items_hashed_by(&mut db, file, &removed), 1);
+}
+
+/// A body edit changes no entry of the ast id map or anchor of the span map outside the item
+/// it is in, so the ids and anchors read from the maps are those of the items whose text it
+/// touched (the ones hashed), and every other item's are its last keys'.
+#[test]
+fn an_edit_reads_ids_only_for_the_items_it_touched() {
+    let items: String =
+        (0..40).map(|i| format!("pub fn f{i}(a: u8) -> u8 {{ a + {i} }}\n")).collect();
+    let (mut db, file) = db_of(&items);
+    let edited = items.replace("{ a + 20 }", "{ a * 20 }");
+    assert_eq!(items_keyed_by(&mut db, file, &edited), (3, 3));
+    let longer = edited.replace("{ a + 30 }", "{ let b = a; b + 30 }");
+    assert_eq!(items_keyed_by(&mut db, file, &longer), (3, 3));
+    // An item added at the start moves every other, and their ids and anchors stay theirs.
+    let added = format!("struct S;\n{longer}");
+    assert_eq!(items_keyed_by(&mut db, file, &added), (1, 1));
+}
+
+/// A second `fn f` before another takes the first id of its name, so the later one's id, in
+/// the text the edit left unchanged, is renumbered: that item's ids are read from the maps
+/// (and it is lowered again) although its text is as it was, and only it of those kept.
+#[test]
+fn a_renumbered_id_reads_the_item_holding_it() {
+    let gs: String = (0..6).map(|i| format!("fn g{i}() {{}}\n")).collect();
+    let hs: String = (0..4).map(|i| format!("fn h{i}() {{}}\n")).collect();
+    let text = format!("{gs}fn f() {{}}\n{hs}");
+    let (mut db, file) = db_of(&text);
+    let edited = text.replacen("fn g4()", "fn f() {}\nfn g4()", 1);
+    let (hashed, read) = items_keyed_by(&mut db, file, &edited);
+    assert!(hashed < 12, "the items kept are not hashed");
+    assert_eq!(read, hashed + 1, "the renumbered `fn f` is read, and no other item kept");
 }
 
 #[test]
@@ -303,9 +341,9 @@ fn trees_asked_again_allocate_nothing() {
     assert_eq!(*kept, lower_whole(&db, file.into(), krate));
 }
 
-/// Assembling a file's tree allocates once a column, however many items the file has.
+/// Assembling a file's tree allocates once, its block, however many items the file has.
 #[test]
-fn assembly_allocates_once_a_column() {
+fn assembly_allocates_once_a_tree() {
     let allocations = |items: usize| {
         let text: String = (0..items)
             .map(|i| format!("pub struct S{i}(pub u8);\nfn f{i}() {{}}\nuse a::b{i};\n"))
@@ -313,8 +351,8 @@ fn assembly_allocates_once_a_column() {
         let (db, file) = db_of(&text);
         let krate = db.test_crate();
         let top = super::top_attrs(&db, file, krate);
-        let alone: Vec<ItemTree> = (file.parse(&db).tree().items())
-            .map(|item| super::item_alone(&db, file, krate, &item))
+        let alone: Vec<ItemTree> = (file.parse(&db).view().items())
+            .map(|item| super::item_alone(&db, file, krate, item))
             .collect();
         let marks: Vec<[super::Marks; 2]> =
             alone.iter().map(|it| [super::Marks::default(), super::Marks::ends(it)]).collect();
@@ -328,5 +366,5 @@ fn assembly_allocates_once_a_column() {
         assert_eq!(made.len(), items * 3 + 1, "a mark per item, then the end");
         used.allocations
     };
-    assert_eq!(allocations(4), allocations(64));
+    assert_eq!((allocations(4), allocations(64)), (1, 1));
 }

@@ -26,6 +26,7 @@ use std::{
 };
 
 use blaze_ids::bits::Bits;
+use blaze_mem::Frame;
 use hashbrown::HashTable;
 use hir::{AsAssocItem, HirFileId, InFile, ModuleDef, PathResolution};
 use hir_def::{
@@ -185,20 +186,24 @@ pub(super) struct ExternCrate {
 
 /// What the crate's name resolution goes through.
 ///
-/// Built once per crate. Each set and map is one FxHash probe per query; `by_module`, `globs`
-/// and `trees` point into `items` by `u32` index, so a module's imports or a binding's tree
-/// cost one probe and no scan. `lookups` memoizes scope lookups, hashed once over the
-/// borrowed key: a hit allocates nothing.
-pub(super) struct Uses {
+/// Built once per crate, its lists in the check's frame. Each set and map is one FxHash probe
+/// per query; `by_module`, `globs` and `trees` point into `items` by `u32` index, so a
+/// module's imports or a binding's tree cost one probe and no scan. `lookups` memoizes scope
+/// lookups, hashed once over the borrowed key: a hit allocates nothing. `traits` memoizes the
+/// traits in scope as CSR ranges of `trait_rows` and `trait_chains`: a hit copies two `u32`s.
+pub(super) struct Uses<'f> {
+    frame: &'f Frame,
     /// The `use` items, in the order rustc's walk comes to them.
-    pub(super) items: Vec<UseItem>,
+    pub(super) items: Vec<UseItem, &'f Frame>,
     /// The `extern crate` items, in that order.
-    pub(super) crates: Vec<ExternCrate>,
+    pub(super) crates: Vec<ExternCrate, &'f Frame>,
     /// The local bindings used, each as it was used most: rustc's `import_use_map`.
     pub(super) used: FxHashMap<Binding, Used>,
     /// The trait imports a method call, field or type-relative path could use, in the order
     /// they were first found: rustc's `maybe_unused_trait_imports` before `check_unused`.
-    pub(super) candidates: Vec<Binding>,
+    pub(super) candidates: Vec<Binding, &'f Frame>,
+    /// The bindings in `candidates`.
+    candidate_set: FxHashSet<Binding>,
     /// The trait imports type checking uses: rustc's `used_trait_imports`.
     pub(super) typeck: FxHashSet<Binding>,
     /// The bindings the crate re-exports: rustc's `effective_visibilities.is_exported`.
@@ -224,7 +229,11 @@ pub(super) struct Uses {
     /// Each module's glob trees, as (item, tree) indices, in `items`' order.
     pub(super) globs: FxHashMap<ModuleId, SmallVec<[(u32, u32); 2]>>,
     trees: FxHashMap<Binding, (u32, u32)>,
-    traits: FxHashMap<(ModuleId, Name), Vec<(TraitId, Vec<Binding>)>>,
+    /// The traits in scope at a module with a value item of a name: a range of `trait_rows`.
+    traits: FxHashMap<(ModuleId, Name), (u32, u32)>,
+    /// A trait in scope and the imports it is found through, a range of `trait_chains`.
+    trait_rows: Vec<(TraitId, u32, u32), &'f Frame>,
+    trait_chains: Vec<Binding, &'f Frame>,
     /// Each module's `use` items by file and start, filled once per module.
     use_ids: FxHashMap<(HirFileId, TextSize), UseId>,
     indexed: FxHashSet<ModuleId>,
@@ -232,8 +241,9 @@ pub(super) struct Uses {
     krate: base_db::Crate,
 }
 
-impl Uses {
-    pub(super) fn of(cx: &Cx<'_, '_>, walk: &Walk<'_>, places: &Places) -> Uses {
+impl<'f> Uses<'f> {
+    pub(super) fn of(cx: &Cx<'f, '_>, walk: &Walk<'_>, places: &Places) -> Uses<'f> {
+        let frame = cx.frame();
         let extern_prelude = cx
             .krate
             .base()
@@ -241,13 +251,15 @@ impl Uses {
             .dependencies
             .iter()
             .filter(|it| it.is_prelude())
-            .map(|it| Name::new_symbol_root(it.name.symbol().clone()))
-            .collect();
+            .map(|it| Name::new_symbol_root(*it.name.symbol()))
+            .collect(); // alloc: once per check, the names of the crate's prelude dependencies
         let mut uses = Uses {
-            items: Vec::new(),
-            crates: Vec::new(),
+            frame,
+            items: Vec::new_in(frame),
+            crates: Vec::new_in(frame),
             used: FxHashMap::default(),
-            candidates: Vec::new(),
+            candidates: Vec::new_in(frame),
+            candidate_set: FxHashSet::default(),
             typeck: FxHashSet::default(),
             exported: FxHashSet::default(),
             exported_names: FxHashSet::default(),
@@ -262,6 +274,8 @@ impl Uses {
             globs: FxHashMap::default(),
             trees: FxHashMap::default(),
             traits: FxHashMap::default(),
+            trait_rows: Vec::new_in(frame),
+            trait_chains: Vec::new_in(frame),
             use_ids: FxHashMap::default(),
             indexed: FxHashSet::default(),
             lookups: RefCell::new(HashTable::new()),
@@ -270,8 +284,10 @@ impl Uses {
         for tree in &walk.trees {
             for node in tree.of_kind(|it| matches!(it, SyntaxKind::USE | SyntaxKind::EXTERN_CRATE)) {
                 match node.kind() {
+                    // clone: a rowan cursor's refcount; the item keeps its node
                     SyntaxKind::USE => uses.use_item(cx, InFile::new(tree.file, ast::Use::cast(node.clone()).unwrap())),
                     SyntaxKind::EXTERN_CRATE => {
+                        // clone: a rowan cursor's refcount; the item keeps its node
                         uses.extern_crate(cx, walk, InFile::new(tree.file, ast::ExternCrate::cast(node.clone()).unwrap()))
                     }
                     _ => {}
@@ -313,6 +329,7 @@ impl Uses {
             }
         }
         for tree in &walk.trees {
+            // clone: a rowan cursor's refcount, one per item an attribute macro replaces
             for item in tree.replaced.iter().filter_map(|it| ast::Item::cast(it.clone())) {
                 uses.attr_macro(cx, InFile::new(tree.file, item));
             }
@@ -342,7 +359,7 @@ impl Uses {
         let per = resolve_in_items(cx, module, kind, names);
         self.lookups.borrow_mut().insert_unique(
             hash,
-            Lookup { module, kind, names: names.iter().cloned().collect(), per },
+            Lookup { module, kind, names: SmallVec::from_slice(names), per },
             |it| lookup_hash(it.module, it.kind, &it.names),
         );
         per
@@ -399,7 +416,7 @@ impl Uses {
             .value
             .visibility()
             .is_some_and(|it| matches!(it.kind(), ast::VisibilityKind::Pub));
-        let mut trees: Vec<Tree> = Vec::new();
+        let mut trees: Vec<Tree> = Vec::with_capacity(sources.value.values().count());
         // The trees enclosing the one being added, innermost last: pre-order makes the parent
         // the innermost that still contains it.
         let mut open: SmallVec<[(TextRange, u32); 4]> = SmallVec::new();
@@ -464,7 +481,9 @@ impl Uses {
                 None => return,
             },
         };
+        // alloc: only `#[macro_use]` imports, almost never there; empty, it allocates nothing
         let mut macro_use = Vec::new();
+        // clone: a rowan cursor's refcount; `AnyHasAttrs` takes the node and has no borrowed form
         let owner = ast::AnyHasAttrs::new(node.value.clone());
         for (meta, attr) in walk.attrs(&owner) {
             let path = match &meta {
@@ -518,7 +537,7 @@ impl Uses {
                 && ns == Ns::Macros
             {
                 self.macro_uses.insert((id, None));
-                self.macro_uses.insert((id, Some(name.clone())));
+                self.macro_uses.insert((id, Some(*name)));
                 return;
             }
             if let Binding::ExternCrate(id) = binding
@@ -583,7 +602,7 @@ impl Uses {
                 }
                 if !it.macro_use.is_empty() {
                     self.macro_uses.insert((it.id, None));
-                    self.macro_uses.insert((it.id, Some(name.clone())));
+                    self.macro_uses.insert((it.id, Some(*name)));
                 }
             }
         }
@@ -601,6 +620,7 @@ impl Uses {
         let mut prefixes: SmallVec<[Option<(PathKind, u32, u32)>; 4]> = SmallVec::with_capacity(count);
         let mut flat: SmallVec<[Name; 8]> = SmallVec::new();
         for j in 0..count {
+            // clone: a rowan cursor's refcount; the tree is read while `self` is written
             let tree = self.items[item].trees[j].node.clone();
             let base = match self.items[item].trees[j].parent {
                 Some(parent) => prefixes[parent as usize],
@@ -622,16 +642,16 @@ impl Uses {
                         kind = PathKind::Abs;
                     }
                     let start = flat.len() as u32;
-                    flat.extend(own.segments().iter().cloned());
+                    flat.extend_from_slice(own.segments());
                     Some((kind, start, flat.len() as u32))
                 }
                 (Some((kind, start, end)), Some(own)) if own.kind == PathKind::Plain => {
                     let new = flat.len() as u32;
                     for k in start as usize..end as usize {
-                        let name = flat[k].clone();
+                        let name = flat[k];
                         flat.push(name);
                     }
-                    flat.extend(own.segments().iter().cloned());
+                    flat.extend_from_slice(own.segments());
                     Some((kind, new, flat.len() as u32))
                 }
                 (Some(base), Some(own)) if own.kind == PathKind::Super(0) && own.segments().is_empty() => {
@@ -691,9 +711,9 @@ impl Uses {
         };
         let lexical = leaf && names.len() == 1 && kind == PathKind::Plain;
         let name = if self_import {
-            names.last().cloned()
+            names.last().copied()
         } else if leaf {
-            names.last().cloned()
+            names.last().copied()
         } else {
             None
         };
@@ -703,7 +723,7 @@ impl Uses {
             imported.values = None;
             imported.macros = None;
         } else if leaf {
-            let Some(name) = name.clone() else { return };
+            let Some(name) = name else { return };
             imported = self.lookup(cx, module, kind, names);
             for ns in Ns::ALL {
                 let Some(found) = entry(&imported, ns) else { continue };
@@ -730,6 +750,7 @@ impl Uses {
     fn node(&mut self, cx: &Cx<'_, '_>, walk: &Walk<'_>, file: HirFileId, node: &SyntaxNode) {
         let kind = node.kind();
         if kind == SyntaxKind::PATH {
+            // clone: a rowan cursor's refcount, one per path; `cast` takes the node
             let path = ast::Path::cast(node.clone()).unwrap();
             self.path(cx, file, &path);
             if path.parent_path().is_none()
@@ -739,15 +760,18 @@ impl Uses {
                 self.type_relative(cx, &path);
             }
         } else if kind == SyntaxKind::METHOD_CALL_EXPR {
+            // clone: a rowan cursor's refcount, one per method call; `cast` takes the node
             let call = ast::MethodCallExpr::cast(node.clone()).unwrap();
             let Some(name) = call.name_ref() else { return };
             let resolved = cx.sema.resolve_method_call(&call).map(|it| it.as_assoc_item(cx.db));
             self.lookup_trait_item(cx, call.syntax(), &name.as_name(), Some(resolved.flatten()));
         } else if kind == SyntaxKind::FIELD_EXPR {
+            // clone: a rowan cursor's refcount, one per field access; `cast` takes the node
             let field = ast::FieldExpr::cast(node.clone()).unwrap();
             let Some(name) = field.name_ref() else { return };
             self.lookup_trait_item(cx, field.syntax(), &name.as_name(), None);
         } else if kind == SyntaxKind::MACRO_CALL {
+            // clone: a rowan cursor's refcount, one per macro call; `cast` takes the node
             let call = ast::MacroCall::cast(node.clone()).unwrap();
             match cx.sema.resolve_macro_call(&call) {
                 Some(it) => {
@@ -769,6 +793,7 @@ impl Uses {
                 }
             }
         } else if ast::Adt::can_cast(kind)
+            // clone: a rowan cursor's refcount, one per ADT; `cast` takes the node
             && let Some(owner) = ast::AnyHasAttrs::cast(node.clone())
             && owner.attrs().next().is_some()
         {
@@ -787,25 +812,13 @@ impl Uses {
         let Some(scope) = cx.sema.scope(owner) else { return };
         let module = ModuleId::from(scope.module());
         let resolved = cx.sema.resolve_derive_macro(meta).unwrap_or_default();
-        for (k, (_, text)) in crate::cx::derive_paths(attr).into_iter().enumerate() {
-            let mut kind = PathKind::Plain;
-            let mut names = Vec::new();
-            for (i, segment) in text.split("::").enumerate() {
-                match segment {
-                    "" if i == 0 => kind = PathKind::Abs,
-                    "crate" if i == 0 => kind = PathKind::Crate,
-                    "self" if i == 0 => kind = PathKind::Super(0),
-                    "super" => {
-                        kind = match kind {
-                            PathKind::Super(n) => PathKind::Super(n + 1),
-                            _ => PathKind::Super(1),
-                        }
-                    }
-                    name => names.push(Name::new_root(name.trim_start_matches("r#"))),
-                }
-            }
+        let mut next = 0usize;
+        crate::cx::derive_path_tokens(attr, |_, tokens| {
+            let k = next;
+            next += 1;
+            let (kind, names) = Self::derive_path(tokens);
             if names.is_empty() {
-                continue;
+                return;
             }
             let expected = resolved.get(k).copied().flatten();
             if let Some(it) = expected {
@@ -833,7 +846,69 @@ impl Uses {
                     }
                 }
             }
+        });
+    }
+
+    /// The kind and names of a derive path from its tokens: its text split on `::` (colons
+    /// paired left to right, a `::` token as two), with a leading empty segment as `::`,
+    /// `crate`/`self` first or `super` anywhere as the path's kind, and `r#` trimmed off names.
+    fn derive_path(tokens: &[syntax::SyntaxToken]) -> (PathKind, SmallVec<[Name; 4]>) {
+        let mut kind = PathKind::Plain;
+        let mut names: SmallVec<[Name; 4]> = SmallVec::new();
+        let mut i = 0usize;
+        let mut parts: SmallVec<[&str; 2]> = SmallVec::new();
+        let mut colon = false;
+        let mut segment = |parts: &mut SmallVec<[&str; 2]>, i: &mut usize| {
+            let joined;
+            let text = match parts.as_slice() {
+                [] => "",
+                [it] => *it,
+                _ => {
+                    // alloc: a malformed path only (a lone `:` or two names with nothing between)
+                    joined = parts.concat();
+                    &joined
+                }
+            };
+            match text {
+                "" if *i == 0 => kind = PathKind::Abs,
+                "crate" if *i == 0 => kind = PathKind::Crate,
+                "self" if *i == 0 => kind = PathKind::Super(0),
+                "super" => {
+                    kind = match kind {
+                        PathKind::Super(n) => PathKind::Super(n + 1),
+                        _ => PathKind::Super(1),
+                    }
+                }
+                name => names.push(Name::new_root(name.trim_start_matches("r#"))),
+            }
+            parts.clear();
+            *i += 1;
+        };
+        for token in tokens {
+            let colons = match token.kind() {
+                SyntaxKind::COLON2 => 2,
+                SyntaxKind::COLON => 1,
+                _ => {
+                    if std::mem::take(&mut colon) {
+                        parts.push(":");
+                    }
+                    parts.push(token.text());
+                    continue;
+                }
+            };
+            for _ in 0..colons {
+                if std::mem::take(&mut colon) {
+                    segment(&mut parts, &mut i);
+                } else {
+                    colon = true;
+                }
+            }
         }
+        if colon {
+            parts.push(":");
+        }
+        segment(&mut parts, &mut i);
+        (kind, names)
     }
 
     /// Marks the attribute macro that replaces `item`, and what its attributes' paths go
@@ -862,13 +937,16 @@ impl Uses {
         let Some(scope) = cx.sema.scope(path.syntax()) else { return };
         let module = ModuleId::from(scope.module());
         let span_map = file.span_map(cx.db);
-        let mut chain = vec![path.clone()];
+        let mut chain: SmallVec<[ast::Path; 4]> = SmallVec::new();
+        // clone: a rowan cursor's refcount; the chain owns its paths to walk up their qualifiers
+        chain.push(path.clone());
         while let Some(qualifier) = chain.last().and_then(|it| it.qualifier()) {
             chain.push(qualifier);
         }
         chain.reverse();
         let mut done = 0;
         for (i, prefix) in chain.iter().enumerate() {
+            // clone: a rowan cursor's refcount; `from_src` takes the path, read again below
             let Some(mod_path) = ModPath::from_src(cx.db, prefix.clone(), &mut |range| span_map.span_for_range(range).ctx) else {
                 return;
             };
@@ -878,7 +956,7 @@ impl Uses {
             }
             done = names.len();
             let kind = mod_path.kind;
-            let name = names[names.len() - 1].clone();
+            let name = names[names.len() - 1];
             let lexical = kind == PathKind::Plain && names.len() == 1;
             let used = if lexical { Used::Scope } else { Used::Other };
             let per = self.lookup(cx, module, kind, names);
@@ -899,7 +977,7 @@ impl Uses {
                     Some(PathResolution::Def(def)) => {
                         module_prefix = matches!(def, ModuleDef::Module(_));
                         match ModuleDefId::try_from(def) {
-                            Ok(def) => Expected::Defs(vec![(Ns::Types, def)]),
+                            Ok(def) => Expected::one(Ns::Types, def),
                             Err(()) => Expected::Other,
                         }
                     }
@@ -974,11 +1052,12 @@ impl Uses {
     fn lookup_trait_item(&mut self, cx: &Cx<'_, '_>, at: &SyntaxNode, name: &Name, picked: Option<Option<hir::AssocItem>>) {
         let Some(scope) = cx.sema.scope(at) else { return };
         let module = ModuleId::from(scope.module());
-        let traits = self.traits_in_scope(cx, module, name);
-        for (_, chain) in &traits {
-            for binding in chain {
-                if !self.candidates.contains(binding) {
-                    self.candidates.push(*binding);
+        let (start, end) = self.traits_in_scope(cx, module, name);
+        let rows = start as usize..end as usize;
+        for &(_, from, to) in &self.trait_rows[start as usize..end as usize] {
+            for &binding in &self.trait_chains[from as usize..to as usize] {
+                if self.candidate_set.insert(binding) {
+                    self.candidates.push(binding);
                 }
             }
         }
@@ -987,13 +1066,13 @@ impl Uses {
             Some(Some(item)) => {
                 let Some(trait_) = item.container_or_implemented_trait(cx.db) else { return };
                 let trait_ = TraitId::from(trait_);
-                if let Some((_, chain)) = traits.iter().find(|(it, _)| *it == trait_) {
-                    self.typeck.extend(chain.iter().copied());
+                if let Some(&(_, from, to)) = self.trait_rows[rows].iter().find(|(it, _, _)| *it == trait_) {
+                    self.typeck.extend(self.trait_chains[from as usize..to as usize].iter().copied());
                 }
             }
             Some(None) => {
-                for (_, chain) in &traits {
-                    self.typeck.extend(chain.iter().copied());
+                for &(_, from, to) in &self.trait_rows[rows] {
+                    self.typeck.extend(self.trait_chains[from as usize..to as usize].iter().copied());
                 }
             }
         }
@@ -1001,45 +1080,46 @@ impl Uses {
 
     /// The traits in scope at `module` with an associated value named `name`, from the
     /// innermost block out to the nearest module, each with the imports it is found through
-    /// (rustc's `TraitCandidate`'s `import_ids`).
-    fn traits_in_scope(&mut self, cx: &Cx<'_, '_>, module: ModuleId, name: &Name) -> Vec<(TraitId, Vec<Binding>)> {
-        if let Some(it) = self.traits.get(&(module, name.clone())) {
-            return it.clone();
+    /// (rustc's `TraitCandidate`'s `import_ids`): a range of `trait_rows`, made once per module
+    /// and name.
+    fn traits_in_scope(&mut self, cx: &Cx<'_, '_>, module: ModuleId, name: &Name) -> (u32, u32) {
+        if let Some(&range) = self.traits.get(&(module, *name)) {
+            return range;
         }
         let db = cx.db;
-        let mut found = Vec::new();
+        let start = self.trait_rows.len() as u32;
         let mut at = Some(module);
         while let Some(id) = at {
             let def_map = id.def_map(db);
-            let mut seen = FxHashSet::default();
-            let traits: Vec<TraitId> = def_map.module(db, id).traits_in_scope(db).collect();
-            for trait_ in traits {
-                if !seen.insert(trait_) || !has_value_item(cx, trait_, name) {
+            // A trait already in this level's rows is seen; one seen without a value item has
+            // none on a second look either.
+            let level = self.trait_rows.len();
+            for trait_ in def_map.module(db, id).traits_in_scope(db) {
+                if self.trait_rows[level..].iter().any(|(it, _, _)| *it == trait_) || !has_value_item(cx, trait_, name) {
                     continue;
                 }
                 for binding in self.trait_bindings(cx, id, trait_) {
-                    found.push((trait_, self.trait_chain(cx, binding, trait_)));
+                    let from = self.trait_chains.len() as u32;
+                    self.trait_chain(cx, binding, trait_);
+                    self.trait_rows.push((trait_, from, self.trait_chains.len() as u32));
                 }
             }
             at = if id.is_block_module(db) { def_map.containing_module(db, id) } else { None };
         }
-        self.traits.insert((module, name.clone()), found.clone());
-        found
+        let range = (start, self.trait_rows.len() as u32);
+        self.traits.insert((module, *name), range);
+        range
     }
 
     /// What `trait_` is in scope through in `module`: each name it has there, each `_` import
     /// of it, else each glob import that brings it in unnamed; `None` when it is in scope
     /// through none of those.
-    fn trait_bindings(&self, cx: &Cx<'_, '_>, module: ModuleId, trait_: TraitId) -> Vec<Option<Binding>> {
+    fn trait_bindings(&self, cx: &Cx<'_, '_>, module: ModuleId, trait_: TraitId) -> SmallVec<[Option<Binding>; 2]> {
         let db = cx.db;
         let scope = module.def_map(db).module(db, module).scope(db);
-        let mut out: Vec<Option<Binding>> = scope
-            .types()
-            .filter(|(_, it)| it.def == ModuleDefId::TraitId(trait_))
-            .map(|(_, it)| it.import)
-            .collect();
-        let local = self.items.iter().filter(|it| it.module == module).flat_map(|it| it.trees.iter());
-        for tree in local.clone() {
+        let mut out: SmallVec<[Option<Binding>; 2]> = SmallVec::new();
+        out.extend(scope.types().filter(|(_, it)| it.def == ModuleDefId::TraitId(trait_)).map(|(_, it)| it.import));
+        for tree in self.items_of(module).flat_map(|it| it.trees.iter()) {
             if tree.underscore
                 && entry(&tree.imported, Ns::Types).is_some_and(|it| it.def == ModuleDefId::TraitId(trait_))
             {
@@ -1047,7 +1127,7 @@ impl Uses {
             }
         }
         if out.is_empty() {
-            for tree in local.filter(|it| it.kind == TreeKind::Glob) {
+            for tree in self.items_of(module).flat_map(|it| it.trees.iter()).filter(|it| it.kind == TreeKind::Glob) {
                 let Some(ModuleDefId::ModuleId(from)) = tree.source else { continue };
                 if from.def_map(db).module(db, from).traits_in_scope(db).any(|it| it == trait_) {
                     out.push(tree.binding);
@@ -1060,15 +1140,16 @@ impl Uses {
         out
     }
 
-    /// The local imports `binding` goes through to `trait_`: rustc's `find_transitive_imports`.
-    fn trait_chain(&self, cx: &Cx<'_, '_>, binding: Option<Binding>, trait_: TraitId) -> Vec<Binding> {
-        let mut chain = Vec::new();
+    /// The local imports `binding` goes through to `trait_`, onto `trait_chains`: rustc's
+    /// `find_transitive_imports`.
+    fn trait_chain(&mut self, cx: &Cx<'_, '_>, binding: Option<Binding>, trait_: TraitId) {
+        let start = self.trait_chains.len();
         let mut at = binding;
         while let Some(binding) = at {
-            if !self.is_local(cx, binding) || chain.contains(&binding) {
+            if !self.is_local(cx, binding) || self.trait_chains[start..].contains(&binding) {
                 break;
             }
-            chain.push(binding);
+            self.trait_chains.push(binding);
             at = match binding {
                 Binding::Import(_) => self
                     .tree(binding)
@@ -1083,21 +1164,20 @@ impl Uses {
                 Binding::ExternCrate(_) => None,
             };
         }
-        chain
     }
 
     /// The bindings re-exported: rustc's effective visibilities, from the crate root through
     /// every public name, into each public module and along each public import's chain.
     fn export(&mut self, cx: &Cx<'_, '_>) {
         let db = cx.db;
-        let mut stack: Vec<ModuleId> = vec![cx.krate.root_module(db).into()];
+        let mut stack: Vec<ModuleId, &Frame> = Vec::new_in(self.frame);
+        stack.push(cx.krate.root_module(db).into());
         while let Some(module) = stack.pop() {
             if !self.public_modules.insert(module) {
                 continue;
             }
             let scope = module.def_map(db).module(db, module).scope(db);
-            let entries: Vec<(Name, PerNs)> = scope.entries().map(|(name, per)| (name.clone(), per)).collect();
-            for (name, per) in entries {
+            for (name, per) in scope.entries() {
                 for ns in Ns::ALL {
                     let Some(found) = entry(&per, ns) else { continue };
                     if found.vis != Visibility::Public {
@@ -1110,12 +1190,12 @@ impl Uses {
                     }
                     let mut at = found.import;
                     while let Some(binding) = at {
-                        if !self.is_local(cx, binding) || !self.exported_names.insert((binding, name.clone(), ns)) {
+                        if !self.is_local(cx, binding) || !self.exported_names.insert((binding, *name, ns)) {
                             break;
                         }
                         self.exported.insert(binding);
                         at = self
-                            .next(cx, binding, &name, ns)
+                            .next(cx, binding, name, ns)
                             .filter(|it| it.vis == Visibility::Public)
                             .and_then(|it| it.import);
                     }
@@ -1127,51 +1207,59 @@ impl Uses {
 
 /// What a path resolves to, as hir has it.
 enum Expected {
-    /// These definitions, each in its namespace.
-    Defs(Vec<(Ns, ModuleDefId)>),
+    /// These definitions, each in its namespace: one per namespace at most.
+    Defs(SmallVec<[(Ns, ModuleDefId); 3]>),
     /// Something no import is found through: a local, a generic parameter, a builtin attribute.
     Other,
     /// It does not resolve.
     Unknown,
 }
 
-/// What hir resolves the whole of `path` to, in the namespaces it is used in.
-fn expected(cx: &Cx<'_, '_>, path: &ast::Path) -> Expected {
-    let defs = |defs: Vec<(Ns, Option<PathResolution<'_>>)>| {
-        let any = defs.iter().any(|(_, it)| it.is_some());
-        let defs: Vec<(Ns, ModuleDefId)> = defs
-            .into_iter()
-            .filter_map(|(ns, it)| match it {
-                Some(PathResolution::Def(def)) => ModuleDefId::try_from(def).ok().map(|it| (ns, it)),
-                _ => None,
-            })
-            .collect();
+impl Expected {
+    fn one(ns: Ns, def: ModuleDefId) -> Expected {
+        let mut defs = SmallVec::new();
+        defs.push((ns, def));
+        Expected::Defs(defs)
+    }
+
+    /// Of what hir resolves a path to in each of the namespaces of `per`.
+    fn of<const N: usize>(per: [(Ns, Option<PathResolution<'_>>); N]) -> Expected {
+        let any = per.iter().any(|(_, it)| it.is_some());
+        let mut defs: SmallVec<[(Ns, ModuleDefId); 3]> = SmallVec::new();
+        defs.extend(per.into_iter().filter_map(|(ns, it)| match it {
+            Some(PathResolution::Def(def)) => ModuleDefId::try_from(def).ok().map(|it| (ns, it)),
+            _ => None,
+        }));
         match (defs.is_empty(), any) {
             (false, _) => Expected::Defs(defs),
             (true, true) => Expected::Other,
             (true, false) => Expected::Unknown,
         }
-    };
-    let parent = path.syntax().parent();
-    if let Some(call) = parent.clone().and_then(ast::MacroCall::cast) {
-        return match cx.sema.resolve_macro_call(&call) {
-            Some(it) => Expected::Defs(vec![(Ns::Macros, ModuleDefId::MacroId(it.into()))]),
+    }
+}
+
+/// What hir resolves the whole of `path` to, in the namespaces it is used in.
+fn expected(cx: &Cx<'_, '_>, path: &ast::Path) -> Expected {
+    match path.syntax().parent() {
+        Some(parent) if ast::MacroCall::can_cast(parent.kind()) => {
+            let Some(call) = ast::MacroCall::cast(parent) else { return Expected::Unknown };
+            match cx.sema.resolve_macro_call(&call) {
+                Some(it) => Expected::one(Ns::Macros, ModuleDefId::MacroId(it.into())),
+                None => Expected::Unknown,
+            }
+        }
+        Some(parent) if ast::Meta::can_cast(parent.kind()) => Expected::of([(Ns::Macros, cx.sema.resolve_path(path))]),
+        _ => match cx.sema.resolve_path_per_ns(path) {
+            Some(it) => Expected::of([(Ns::Types, it.type_ns), (Ns::Values, it.value_ns), (Ns::Macros, it.macro_ns)]),
             None => Expected::Unknown,
-        };
-    }
-    if parent.is_some_and(|it| ast::Meta::can_cast(it.kind())) {
-        return defs(vec![(Ns::Macros, cx.sema.resolve_path(path))]);
-    }
-    match cx.sema.resolve_path_per_ns(path) {
-        Some(it) => defs(vec![(Ns::Types, it.type_ns), (Ns::Values, it.value_ns), (Ns::Macros, it.macro_ns)]),
-        None => Expected::Unknown,
+        },
     }
 }
 
 /// What `kind` and `names` resolve to from `module`, through which bindings: hir-def's
 /// `resolve_module_path_in_items`.
 fn resolve_in_items(cx: &Cx<'_, '_>, module: ModuleId, kind: PathKind, names: &[Name]) -> PerNs {
-    let path = ModPath::from_segments(kind, names.iter().cloned());
+    let path = ModPath::from_segments(kind, names.iter().copied());
     module.resolver(cx.db).resolve_module_path_in_items(cx.db, &path)
 }
 
@@ -1195,7 +1283,7 @@ fn lookup_hash(module: ModuleId, kind: PathKind, names: &[Name]) -> u64 {
 /// Whether `trait_` has an associated function or constant named `name`: rustc's
 /// `trait_may_have_item` in the value namespace.
 fn has_value_item(cx: &Cx<'_, '_>, trait_: TraitId, name: &Name) -> bool {
-    hir::Trait::from(trait_).items(cx.db).into_iter().any(|it| {
+    hir::Trait::from(trait_).items_iter(cx.db).any(|it| {
         matches!(it, hir::AssocItem::Function(_) | hir::AssocItem::Const(_)) && it.name(cx.db).as_ref() == Some(name)
     })
 }

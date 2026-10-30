@@ -34,3 +34,6 @@ rustc_type_ir_macros = { path = "../rustc_type_ir_macros", version = "0.0.0" }
 smallvec = { version = "1.8.1", default-features = false, features = ["const_generics"] }
 thin-vec = "0.2.21"
 tracing = "0.1"
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true

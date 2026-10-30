@@ -652,7 +652,7 @@ fn without_arguments(name: &str) -> String {
 /// decide, by its symbol, and of which [`Kind`]: `None` for what gives the same for the same
 /// input, as far as a test can tell. Locks are left out: a test that turns on how its threads
 /// are scheduled is flaky whether it runs again or not.
-fn outside(symbol: &str) -> Option<(Kind, &'static str)> {
+pub(crate) fn outside(symbol: &str) -> Option<(Kind, &'static str)> {
     let name = symbol.trim_start_matches('_');
     let name = name.split('$').next().unwrap_or(name);
     let name = name.strip_suffix("64").unwrap_or(name);

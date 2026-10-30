@@ -118,26 +118,12 @@ impl Verifier {
             signature.ok_or_else(|| WebhookError::new(400, "the delivery has no X-Hub-Signature-256"))?;
         let tag = signature
             .strip_prefix("sha256=")
-            .and_then(hex)
+            .and_then(blaze_format::hex::decode::<32>)
             .ok_or_else(|| WebhookError::new(401, "X-Hub-Signature-256 is not sha256=<64 hex digits>"))?;
         hmac::verify(key, body, &tag).map_err(|_| {
             WebhookError::new(401, "X-Hub-Signature-256 does not match the body under the webhook secret")
         })
     }
-}
-
-/// The 32 bytes of 64 hex digits, on the stack.
-fn hex(text: &str) -> Option<[u8; 32]> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    let digit = |byte: u8| char::from(byte).to_digit(16);
-    let mut tag = [0; 32];
-    for (out, pair) in tag.iter_mut().zip(bytes.chunks_exact(2)) {
-        *out = (digit(pair[0])? * 16 + digit(pair[1])?) as u8;
-    }
-    Some(tag)
 }
 
 /// The payload of event kind `kind` (`X-GitHub-Event`), delivery `id` (`X-GitHub-Delivery`).

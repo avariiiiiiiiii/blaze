@@ -713,7 +713,7 @@ pub(crate) fn add(linker: &mut Linker<State>) -> wasmtime::Result<()> {
                         return Err(EIO);
                     }
                 };
-                files.found(&rel, Some(*blake3::hash(&bytes).as_bytes()));
+                files.found(&rel, Some(blaze_ids::b3::hash(&bytes)));
                 Ok(files.insert(Open::File { bytes, at: 0 }))
             })();
             Ok(match opened {

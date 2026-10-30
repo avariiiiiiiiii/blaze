@@ -62,7 +62,7 @@ pub fn resolve_graph(
     resolve: &Resolve,
     members: &[PackageId],
     root: Option<PackageId>,
-    packages: &dyn MetadataPackages,
+    packages: &impl MetadataPackages,
     requested_kinds: &[CompileKind],
 ) -> CargoResult<MetadataResolve> {
     let mut node_map = FxHashMap::with_capacity_and_hasher(resolve.len(), FxBuildHasher);
@@ -77,11 +77,11 @@ pub fn resolve_graph(
     })
 }
 
-fn build_resolve_graph_r(
+fn build_resolve_graph_r<P: MetadataPackages>(
     node_map: &mut FxHashMap<PackageId, MetadataResolveNode>,
     pkg_id: PackageId,
     resolve: &Resolve,
-    packages: &dyn MetadataPackages,
+    packages: &P,
     requested_kinds: &[CompileKind],
 ) -> CargoResult<()> {
     if node_map.contains_key(&pkg_id) {

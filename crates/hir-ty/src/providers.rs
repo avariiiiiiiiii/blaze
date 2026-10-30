@@ -7,6 +7,10 @@
 //! registers its table with `inventory::submit!`, which the linker keeps in every binary that
 //! links that crate: nothing installs anything, and a binary with no table, or two, panics on
 //! the first miss, naming what to link.
+//!
+//! The MIR queries are one per [`MirOwner`] kind and [`MirStage`], each monomorphized or not:
+//! each keeps its own memo under its own key, and every one computes through `compute` or
+//! `compute_monomorphized`, which take the stage before from its memo ([`mir_at`]).
 
 use std::sync::OnceLock;
 
@@ -16,112 +20,35 @@ use hir_def::ModuleId;
 use crate::{
     InferBodyId,
     db::{InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
-    mir::{MirBody, MirEvalError, MirLowerError, MirOptions},
-    next_solver::{Allocation, GenericArgs, StoredGenericArgs, Ty},
+    mir::{InlinedBody, MirBody, MirEvalError, MirLowerError, MirOptions, MirOwner, MirStage},
+    next_solver::{Allocation, GenericArgs, StoredGenericArgs, StoredTy, Ty},
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
 
 type Built<'db> = Result<MirBody<'db>, MirLowerError<'db>>;
 
-/// hir-ty-mir's code for the MIR queries, one field per query, in its signatures.
+/// A body as its query keeps it.
+pub type Kept<'db> = Result<&'db MirBody<'db>, &'db MirLowerError<'db>>;
+
+/// hir-ty-mir's code for the MIR queries: lowering, and the step from one stage to the next.
 pub struct Mir {
-    pub mir_body: for<'db> fn(&'db Db, InferBodyId<'db>) -> Built<'db>,
-    pub mir_body_for_closure: for<'db> fn(&'db Db, InternedClosureId<'db>) -> Built<'db>,
-    pub mir_body_for_coroutine: for<'db> fn(&'db Db, InternedCoroutineId<'db>) -> Built<'db>,
-    pub mir_body_for_coroutine_by_move:
-        for<'db> fn(&'db Db, InternedCoroutineId<'db>) -> Built<'db>,
-
-    pub monomorphized_mir_body: for<'db> fn(
+    /// `owner`'s body built from its HIR.
+    pub build: for<'db> fn(&'db Db, MirOwner<'db>) -> Built<'db>,
+    /// A built body after the runtime passes.
+    pub run_passes: for<'db> fn(&'db Db, &MirBody<'db>) -> Built<'db>,
+    /// A runtime body optimized and checked as the options ask.
+    pub optimize:
+        for<'db> fn(&'db Db, &MirBody<'db>, MirOptions, Option<InlinedBody<'db>>) -> Built<'db>,
+    /// A body with the arguments in place of its generic parameters, in the environment.
+    pub monomorphize: for<'db> fn(
         &'db Db,
-        InferBodyId<'db>,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_mir_body_for_closure: for<'db> fn(
-        &'db Db,
-        InternedClosureId<'db>,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_mir_body_for_coroutine: for<'db> fn(
-        &'db Db,
-        InternedCoroutineId<'db>,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_mir_body_for_coroutine_by_move: for<'db> fn(
-        &'db Db,
-        InternedCoroutineId<'db>,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
+        &MirBody<'db>,
+        &StoredGenericArgs,
+        &StoredParamEnvAndCrate,
     ) -> Built<'db>,
 
-    pub runtime_mir_body: for<'db> fn(&'db Db, InferBodyId<'db>) -> Built<'db>,
-    pub runtime_mir_body_for_closure: for<'db> fn(&'db Db, InternedClosureId<'db>) -> Built<'db>,
-    pub runtime_mir_body_for_coroutine:
-        for<'db> fn(&'db Db, InternedCoroutineId<'db>) -> Built<'db>,
-    pub runtime_mir_body_for_coroutine_by_move:
-        for<'db> fn(&'db Db, InternedCoroutineId<'db>) -> Built<'db>,
-    pub monomorphized_runtime_mir_body: for<'db> fn(
-        &'db Db,
-        InferBodyId<'db>,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_runtime_mir_body_for_closure: for<'db> fn(
-        &'db Db,
-        InternedClosureId<'db>,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_runtime_mir_body_for_coroutine: for<'db> fn(
-        &'db Db,
-        InternedCoroutineId<'db>,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_runtime_mir_body_for_coroutine_by_move: for<'db> fn(
-        &'db Db,
-        InternedCoroutineId<'db>,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-
-    pub optimized_mir_body: for<'db> fn(&'db Db, InferBodyId<'db>, MirOptions) -> Built<'db>,
-    pub optimized_mir_body_for_closure:
-        for<'db> fn(&'db Db, InternedClosureId<'db>, MirOptions) -> Built<'db>,
-    pub optimized_mir_body_for_coroutine:
-        for<'db> fn(&'db Db, InternedCoroutineId<'db>, MirOptions) -> Built<'db>,
-    pub optimized_mir_body_for_coroutine_by_move:
-        for<'db> fn(&'db Db, InternedCoroutineId<'db>, MirOptions) -> Built<'db>,
-    pub monomorphized_optimized_mir_body: for<'db> fn(
-        &'db Db,
-        InferBodyId<'db>,
-        MirOptions,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_optimized_mir_body_for_closure: for<'db> fn(
-        &'db Db,
-        InternedClosureId<'db>,
-        MirOptions,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_optimized_mir_body_for_coroutine: for<'db> fn(
-        &'db Db,
-        InternedCoroutineId<'db>,
-        MirOptions,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
-    pub monomorphized_optimized_mir_body_for_coroutine_by_move: for<'db> fn(
-        &'db Db,
-        InternedCoroutineId<'db>,
-        MirOptions,
-        StoredGenericArgs,
-        StoredParamEnvAndCrate,
-    ) -> Built<'db>,
+    /// The types an `async` block holds across a yield (rustc's `mir_coroutine_witnesses`).
+    pub coroutine_witnesses: for<'db> fn(&'db Db, InternedCoroutineId<'db>) -> Box<[StoredTy]>,
 
     /// The value running `body` returns.
     pub interpret_mir: for<'db> fn(
@@ -192,6 +119,113 @@ pub fn set_runtime_mir_capacity(db: &mut Db, capacity: usize) {
     monomorphized_runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
 }
 
+/// `owner`'s body at `stage`, from the memo of the query that keeps it.
+pub fn mir_at<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Kept<'db> {
+    use MirOwner as O;
+    match (stage, owner) {
+        (MirStage::Built, O::Body(def)) => mir_body_query(db, def),
+        (MirStage::Built, O::Closure(it)) => mir_body_for_closure_query(db, it),
+        (MirStage::Built, O::Coroutine(it)) => mir_body_for_coroutine_query(db, it),
+        (MirStage::Built, O::CoroutineByMove(it)) => mir_body_for_coroutine_by_move_query(db, it),
+        (MirStage::Runtime, O::Body(def)) => runtime_mir_body_query(db, def),
+        (MirStage::Runtime, O::Closure(it)) => runtime_mir_body_for_closure_query(db, it),
+        (MirStage::Runtime, O::Coroutine(it)) => runtime_mir_body_for_coroutine_query(db, it),
+        (MirStage::Runtime, O::CoroutineByMove(it)) => {
+            runtime_mir_body_for_coroutine_by_move_query(db, it)
+        }
+        (MirStage::Optimized(options), O::Body(def)) => optimized_mir_body_query(db, def, options),
+        (MirStage::Optimized(options), O::Closure(it)) => {
+            optimized_mir_body_for_closure_query(db, it, options)
+        }
+        (MirStage::Optimized(options), O::Coroutine(it)) => {
+            optimized_mir_body_for_coroutine_query(db, it, options)
+        }
+        (MirStage::Optimized(options), O::CoroutineByMove(it)) => {
+            optimized_mir_body_for_coroutine_by_move_query(db, it, options)
+        }
+    }
+}
+
+/// `owner`'s body at `stage` with `subst` in place of its generic parameters, from the memo of
+/// the query that keeps it.
+pub fn monomorphized_mir_at<'db>(
+    db: &'db Db,
+    owner: MirOwner<'db>,
+    stage: MirStage,
+    subst: StoredGenericArgs,
+    env: StoredParamEnvAndCrate,
+) -> Kept<'db> {
+    use MirOwner as O;
+    match (stage, owner) {
+        (MirStage::Built, O::Body(def)) => monomorphized_mir_body_query(db, def, subst, env),
+        (MirStage::Built, O::Closure(it)) => {
+            monomorphized_mir_body_for_closure_query(db, it, subst, env)
+        }
+        (MirStage::Built, O::Coroutine(it)) => {
+            monomorphized_mir_body_for_coroutine_query(db, it, subst, env)
+        }
+        (MirStage::Built, O::CoroutineByMove(it)) => {
+            monomorphized_mir_body_for_coroutine_by_move_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::Body(def)) => {
+            monomorphized_runtime_mir_body_query(db, def, subst, env)
+        }
+        (MirStage::Runtime, O::Closure(it)) => {
+            monomorphized_runtime_mir_body_for_closure_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::Coroutine(it)) => {
+            monomorphized_runtime_mir_body_for_coroutine_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::CoroutineByMove(it)) => {
+            monomorphized_runtime_mir_body_for_coroutine_by_move_query(db, it, subst, env)
+        }
+        (MirStage::Optimized(options), O::Body(def)) => {
+            monomorphized_optimized_mir_body_query(db, def, options, subst, env)
+        }
+        (MirStage::Optimized(options), O::Closure(it)) => {
+            monomorphized_optimized_mir_body_for_closure_query(db, it, options, subst, env)
+        }
+        (MirStage::Optimized(options), O::Coroutine(it)) => {
+            monomorphized_optimized_mir_body_for_coroutine_query(db, it, options, subst, env)
+        }
+        (MirStage::Optimized(options), O::CoroutineByMove(it)) => {
+            monomorphized_optimized_mir_body_for_coroutine_by_move_query(
+                db, it, options, subst, env,
+            )
+        }
+    }
+}
+
+/// What the query of `owner` at `stage` computes: the body built, or the stage before from
+/// its memo taken one step on.
+fn compute<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Built<'db> {
+    let mir = mir();
+    match stage {
+        MirStage::Built => (mir.build)(db, owner),
+        MirStage::Runtime => {
+            let built = mir_at(db, owner, MirStage::Built).map_err(Clone::clone)?;
+            (mir.run_passes)(db, built)
+        }
+        MirStage::Optimized(options) => {
+            let runtime = mir_at(db, owner, MirStage::Runtime).map_err(Clone::clone)?;
+            (mir.optimize)(db, runtime, options, owner.caller())
+        }
+    }
+}
+
+/// What the monomorphized query of `owner` at `stage` computes: the generic body from its memo,
+/// instantiated.
+fn compute_monomorphized<'db>(
+    db: &'db Db,
+    owner: MirOwner<'db>,
+    stage: MirStage,
+    subst: StoredGenericArgs,
+    env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let generic = mir_at(db, owner, stage).map_err(Clone::clone)?;
+    (mir().monomorphize)(db, generic, &subst, &env)
+}
+
 // A body that needs itself to be built is an error, not a fixpoint: one per arity of the keys.
 
 fn mir_loop1<'db, A>(_: &'db Db, _: salsa::Id, _: A) -> Built<'db> {
@@ -214,12 +248,12 @@ fn mir_loop4<'db, A, B, C, D>(_: &'db Db, _: salsa::Id, _: A, _: B, _: C, _: D) 
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
 pub fn mir_body_query<'db>(db: &'db Db, def: InferBodyId<'db>) -> Built<'db> {
-    (mir().mir_body)(db, def)
+    compute(db, MirOwner::Body(def), MirStage::Built)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
 pub fn mir_body_for_closure_query<'db>(db: &'db Db, closure: InternedClosureId<'db>) -> Built<'db> {
-    (mir().mir_body_for_closure)(db, closure)
+    compute(db, MirOwner::Closure(closure), MirStage::Built)
 }
 
 /// The body of an `async` block, as the `Future::poll` of the block's type.
@@ -228,7 +262,7 @@ pub fn mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Built<'db> {
-    (mir().mir_body_for_coroutine)(db, coroutine)
+    compute(db, MirOwner::Coroutine(coroutine), MirStage::Built)
 }
 
 /// The body of the `async` block of an `async` closure that is called by value though it could
@@ -239,7 +273,7 @@ pub fn mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Built<'db> {
-    (mir().mir_body_for_coroutine_by_move)(db, coroutine)
+    compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Built)
 }
 
 // Built MIR, monomorphized.
@@ -251,7 +285,7 @@ pub fn monomorphized_mir_body_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_mir_body)(db, owner, subst, trait_env)
+    compute_monomorphized(db, MirOwner::Body(owner), MirStage::Built, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
@@ -261,7 +295,7 @@ pub fn monomorphized_mir_body_for_closure_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_mir_body_for_closure)(db, closure, subst, trait_env)
+    compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Built, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
@@ -271,7 +305,7 @@ pub fn monomorphized_mir_body_for_coroutine_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_mir_body_for_coroutine)(db, coroutine, subst, trait_env)
+    compute_monomorphized(db, MirOwner::Coroutine(coroutine), MirStage::Built, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
@@ -281,14 +315,15 @@ pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_mir_body_for_coroutine_by_move)(db, coroutine, subst, trait_env)
+    let owner = MirOwner::CoroutineByMove(coroutine);
+    compute_monomorphized(db, owner, MirStage::Built, subst, trait_env)
 }
 
 // Runtime MIR.
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
 pub fn runtime_mir_body_query<'db>(db: &'db Db, def: InferBodyId<'db>) -> Built<'db> {
-    (mir().runtime_mir_body)(db, def)
+    compute(db, MirOwner::Body(def), MirStage::Runtime)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
@@ -296,7 +331,7 @@ pub fn runtime_mir_body_for_closure_query<'db>(
     db: &'db Db,
     closure: InternedClosureId<'db>,
 ) -> Built<'db> {
-    (mir().runtime_mir_body_for_closure)(db, closure)
+    compute(db, MirOwner::Closure(closure), MirStage::Runtime)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
@@ -304,7 +339,7 @@ pub fn runtime_mir_body_for_coroutine_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Built<'db> {
-    (mir().runtime_mir_body_for_coroutine)(db, coroutine)
+    compute(db, MirOwner::Coroutine(coroutine), MirStage::Runtime)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
@@ -312,7 +347,7 @@ pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Built<'db> {
-    (mir().runtime_mir_body_for_coroutine_by_move)(db, coroutine)
+    compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Runtime)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
@@ -322,7 +357,7 @@ pub fn monomorphized_runtime_mir_body_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_runtime_mir_body)(db, def, subst, trait_env)
+    compute_monomorphized(db, MirOwner::Body(def), MirStage::Runtime, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
@@ -332,7 +367,7 @@ pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_runtime_mir_body_for_closure)(db, closure, subst, trait_env)
+    compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Runtime, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
@@ -342,7 +377,8 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_runtime_mir_body_for_coroutine)(db, coroutine, subst, trait_env)
+    let owner = MirOwner::Coroutine(coroutine);
+    compute_monomorphized(db, owner, MirStage::Runtime, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
@@ -352,7 +388,8 @@ pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_runtime_mir_body_for_coroutine_by_move)(db, coroutine, subst, trait_env)
+    let owner = MirOwner::CoroutineByMove(coroutine);
+    compute_monomorphized(db, owner, MirStage::Runtime, subst, trait_env)
 }
 
 // Optimized MIR.
@@ -363,7 +400,7 @@ pub fn optimized_mir_body_query<'db>(
     def: InferBodyId<'db>,
     options: MirOptions,
 ) -> Built<'db> {
-    (mir().optimized_mir_body)(db, def, options)
+    compute(db, MirOwner::Body(def), MirStage::Optimized(options))
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
@@ -372,7 +409,7 @@ pub fn optimized_mir_body_for_closure_query<'db>(
     closure: InternedClosureId<'db>,
     options: MirOptions,
 ) -> Built<'db> {
-    (mir().optimized_mir_body_for_closure)(db, closure, options)
+    compute(db, MirOwner::Closure(closure), MirStage::Optimized(options))
 }
 
 /// The body of an `async` block's `poll` with `options`: of the passes, only the UB checks run
@@ -383,7 +420,7 @@ pub fn optimized_mir_body_for_coroutine_query<'db>(
     coroutine: InternedCoroutineId<'db>,
     options: MirOptions,
 ) -> Built<'db> {
-    (mir().optimized_mir_body_for_coroutine)(db, coroutine, options)
+    compute(db, MirOwner::Coroutine(coroutine), MirStage::Optimized(options))
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
@@ -392,7 +429,7 @@ pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
     coroutine: InternedCoroutineId<'db>,
     options: MirOptions,
 ) -> Built<'db> {
-    (mir().optimized_mir_body_for_coroutine_by_move)(db, coroutine, options)
+    compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Optimized(options))
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
@@ -403,7 +440,8 @@ pub fn monomorphized_optimized_mir_body_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_optimized_mir_body)(db, def, options, subst, trait_env)
+    let stage = MirStage::Optimized(options);
+    compute_monomorphized(db, MirOwner::Body(def), stage, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
@@ -414,7 +452,8 @@ pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_optimized_mir_body_for_closure)(db, closure, options, subst, trait_env)
+    let stage = MirStage::Optimized(options);
+    compute_monomorphized(db, MirOwner::Closure(closure), stage, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
@@ -425,7 +464,8 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    (mir().monomorphized_optimized_mir_body_for_coroutine)(db, coroutine, options, subst, trait_env)
+    let stage = MirStage::Optimized(options);
+    compute_monomorphized(db, MirOwner::Coroutine(coroutine), stage, subst, trait_env)
 }
 
 #[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
@@ -436,8 +476,23 @@ pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
     subst: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
 ) -> Built<'db> {
-    let by_move = mir().monomorphized_optimized_mir_body_for_coroutine_by_move;
-    by_move(db, coroutine, options, subst, trait_env)
+    let stage = MirStage::Optimized(options);
+    compute_monomorphized(db, MirOwner::CoroutineByMove(coroutine), stage, subst, trait_env)
+}
+
+// What a coroutine holds across a yield.
+
+/// The types an `async` block holds across a yield, by which its future implements an auto
+/// trait: rustc's `mir_coroutine_witnesses` (`CoroutineLayout::field_tys` without what
+/// `ignore_for_traits` marks), generic in the parameters of the coroutine's parent, with regions
+/// erased. No cycle result: a goal on a coroutine of the body being inferred waits until that
+/// body is checked, as rustc's stalled coroutine goals, so a cycle here is a bug to stop on.
+#[salsa::tracked(returns(deref))]
+pub fn coroutine_witnesses_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+) -> Box<[StoredTy]> {
+    (mir().coroutine_witnesses)(db, coroutine)
 }
 
 #[cfg(test)]

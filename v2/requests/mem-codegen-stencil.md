@@ -1651,8 +1651,15 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 ### C3. `crates/blaze-intent/src/path.rs`
 
-Imports: add `use std::alloc::Allocator;`, `use blaze_mem::{Tag, frame};` and `SyntaxText` to the
-`syntax` import.
+Revised by mem-codegen (2026-10-29 21:19) for the coordinator's rule that new code walks syntax
+through `syntax::view`, never `SyntaxNode` (common.md, lane frontend-tree): the lookup (`find`,
+`matches`, `name_is`, `same_squeezed`, `describe`) is written on views, which are `Copy` and give
+a node's text as one `&'t str`. The handle functions that `edit.rs`, `rename.rs` and
+`tests/edits.rs` still call (`members`, `name_of`, `impl_of`, `of`, `is_top`, `top_of`,
+`scope_of`) are left as they are, for frontend-tree to move one at a time.
+
+Imports: add `use std::alloc::Allocator;`, `use blaze_mem::{Tag, frame};` and
+`use syntax::view::{self, AstNode as _};`.
 
 `Step::Impl` (line 95), before: `Impl { ty: String, of: Option<String>, nth: Option<usize> },`
 after (the doc's "read `ty` and `of` with whitespace removed" still holds: the comparison squeezes
@@ -1699,26 +1706,40 @@ fn split<'p>(path: &'p str, parts: &mut Vec<&'p str, impl Allocator>) -> Result<
 
 with the `let mut parts = ..` line deleted and the last line `Ok(())` (the pushes unchanged).
 
-`members` (199-224), before: `pub fn members(container: &SyntaxNode) -> Vec<SyntaxNode> {` /
-`let mut out = Vec::new();` / `let Some(list) = list else { return out };` / `out`. After:
+`members` (199-224) stays as it is (its callers in `edit.rs` and `tests/edits.rs` hold handles).
+After it, add its view form, which `find` walks; when the last handle caller has moved,
+`members` goes and `members_of` takes its name:
 
 ```rust
-pub fn members(container: &SyntaxNode) -> Vec<SyntaxNode> {
-    // alloc: the list the edits keep (`edit.rs`); a lookup uses `members_into`.
-    let mut out = Vec::new();
-    members_into(container, &mut out);
-    out
-}
-
-/// [`members`], pushed onto `out`.
-pub fn members_into(container: &SyntaxNode, out: &mut Vec<SyntaxNode, impl Allocator>) {
+/// [`members`] of a view: lent from the tree, nothing collected.
+fn members_of<'t>(container: view::Node<'t>) -> impl Iterator<Item = view::Node<'t>> {
     let list = match container.kind() {
-        // ... unchanged ...
+        SyntaxKind::SOURCE_FILE => Some(container),
+        SyntaxKind::MODULE => container.child_where(|it| it == SyntaxKind::ITEM_LIST),
+        SyntaxKind::IMPL | SyntaxKind::TRAIT => {
+            container.child_where(|it| it == SyntaxKind::ASSOC_ITEM_LIST)
+        }
+        SyntaxKind::STRUCT | SyntaxKind::UNION | SyntaxKind::VARIANT => container.child_where(|it| {
+            it == SyntaxKind::RECORD_FIELD_LIST || it == SyntaxKind::TUPLE_FIELD_LIST
+        }),
+        SyntaxKind::ENUM => container.child_where(|it| it == SyntaxKind::VARIANT_LIST),
+        _ => None,
     };
-    let Some(list) = list else { return };
-    // ... the loop, unchanged ...
+    list.into_iter()
+        .flat_map(view::Node::children)
+        .flat_map(|child| {
+            let extern_block = child.kind() == SyntaxKind::EXTERN_BLOCK;
+            let items = extern_block
+                .then(|| child.child_where(|it| it == SyntaxKind::EXTERN_ITEM_LIST))
+                .flatten();
+            (!extern_block).then_some(child).into_iter().chain(items.into_iter().flat_map(view::Node::children))
+        })
+        .filter(|it| Kind::of(it.kind()).is_some())
 }
 ```
+
+The same nodes in the same order as `members`: a list's children of a path's kinds, with an extern
+block's items in its place and the block itself left out.
 
 `matches` (248-258), before:
 
@@ -1737,10 +1758,10 @@ fn matches(member: &SyntaxNode, step: &Step<'_>) -> bool {
 }
 ```
 
-after:
+after (on views):
 
 ```rust
-fn matches(member: &SyntaxNode, step: &Step<'_>) -> bool {
+fn matches(member: view::Node<'_>, step: &Step<'_>) -> bool {
     match step {
         Step::Named { kind, name } => {
             kind.is_none_or(|kind| Kind::of(member.kind()) == Some(kind))
@@ -1748,12 +1769,12 @@ fn matches(member: &SyntaxNode, step: &Step<'_>) -> bool {
                 && name_is(member, name)
         }
         Step::Impl { ty, of, .. } => {
-            let Some(imp) = ast::Impl::cast(member.clone()) else { return false };
+            let Some(imp) = view::Impl::cast(member) else { return false };
             let Some(self_ty) = imp.self_ty() else { return false };
-            same_squeezed(&self_ty.syntax().text(), ty)
+            same_squeezed(self_ty.syntax().text(), ty)
                 && match (imp.trait_(), of) {
                     (None, None) => true,
-                    (Some(it), Some(of)) => same_squeezed(&it.syntax().text(), of),
+                    (Some(it), Some(of)) => same_squeezed(it.syntax().text(), of),
                     _ => false,
                 }
         }
@@ -1761,16 +1782,16 @@ fn matches(member: &SyntaxNode, step: &Step<'_>) -> bool {
 }
 
 /// Whether `member` goes by `name`: [`name_of`] compared without making its `String`.
-fn name_is(member: &SyntaxNode, name: &str) -> bool {
+fn name_is(member: view::Node<'_>, name: &str) -> bool {
     let name = strip_raw(name);
     if member.kind() == SyntaxKind::TUPLE_FIELD {
         let Some(list) = member.parent() else { return false };
-        let at = list.children().filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD).position(|it| it == *member);
+        let at = list.children().filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD).position(|it| it == member);
         return at.is_some_and(|at| is_decimal(name, at));
     }
     member
         .child_where(|it| it == SyntaxKind::NAME)
-        .and_then(ast::Name::cast)
+        .and_then(view::Name::cast)
         .is_some_and(|it| strip_raw(it.text()) == name)
 }
 
@@ -1784,15 +1805,9 @@ fn is_decimal(text: &str, n: usize) -> bool {
 
 /// Whether `text` with its whitespace removed reads as `want` with its whitespace removed
 /// ([`squeeze`] of both, compared without making either).
-pub(crate) fn same_squeezed(text: &SyntaxText, want: &str) -> bool {
-    let mut want = want.chars().filter(|it| !it.is_whitespace());
-    let same = text.try_for_each_chunk(|chunk| {
-        chunk
-            .chars()
-            .filter(|it| !it.is_whitespace())
-            .try_for_each(|c| if want.next() == Some(c) { Ok(()) } else { Err(()) })
-    });
-    same.is_ok() && want.next().is_none()
+pub(crate) fn same_squeezed(text: &str, want: &str) -> bool {
+    let squeezed = |text: &str| text.chars().filter(|it| !it.is_whitespace());
+    squeezed(text).eq(squeezed(want))
 }
 ```
 
@@ -1800,23 +1815,24 @@ These are the old comparisons exactly: `name_of` gives a tuple field's index as 
 sign, no leading zero) and a name's text, both then compared after `strip_raw`; `impl_of` gave the
 squeezed self type and trait, `None` without a self type.
 
+`describe` (261-264) takes the view, its body unchanged:
+`fn describe(node: view::Node<'_>) -> String {` (its one caller is `find`'s error arm, as
+`found.iter().copied().map(describe)`).
+
 `find` (266-306), before: as quoted in "Today" above. After:
 
 ```rust
-/// The one node `path` names in the file whose tree is `root`.
-pub fn find(root: &SyntaxNode, path: &str) -> Result<SyntaxNode, String> {
-    frame::task(Tag::Api, |temp| {
+/// The one node `path` names in the file whose tree's root is `root`.
+pub fn find<'t>(root: view::Node<'t>, path: &str) -> Result<view::Node<'t>, String> {
+    frame::task(Tag::Api, |temp| -> Result<view::Node<'t>, String> {
         let mut parts = Vec::with_capacity_in(4, temp);
         split(path, &mut parts)?;
-        let (mut frontier, mut found, mut members) = (Vec::new_in(temp), Vec::new_in(temp), Vec::new_in(temp));
-        frontier.push(root.clone());
+        let (mut frontier, mut found) = (Vec::new_in(temp), Vec::new_in(temp));
+        frontier.push(root);
         for (at, part) in parts.iter().enumerate() {
             let step = step(part, path)?;
             found.clear();
-            for container in &frontier {
-                members_into(container, &mut members);
-                found.extend(members.drain(..).filter(|member| matches(member, &step)));
-            }
+            found.extend(frontier.iter().flat_map(|it| members_of(*it)).filter(|it| matches(*it, &step)));
             if let Step::Impl { nth: Some(nth), .. } = step {
                 let count = found.len();
                 if nth >= count {
@@ -1831,16 +1847,31 @@ pub fn find(root: &SyntaxNode, path: &str) -> Result<SyntaxNode, String> {
             }
             std::mem::swap(&mut frontier, &mut found);
         }
-        Ok(frontier.into_iter().next().expect("a path's last step found one node"))
+        Ok(frontier[0])
     })
 }
 ```
 
 The error arms keep their `join`/`format!` (a failed lookup only): `parts[..at].join("::")` works on
 the frame `Vec`'s slice. `swap(0, nth)` then `truncate(1)` keeps the `nth` match alone, as
-`into_iter().nth(nth)` did.
+`into_iter().nth(nth)` did. No node is cloned or counted: a view is a borrow of the tree and an
+index, and the frame's vectors of them go with the task.
 
 `squeeze`, `impl_of` and `name_of` stay for `path::of`, `edit.rs` and `rename.rs`.
+
+`find`'s three callers hold handles today, so each takes the view's node back as one through a
+pointer, until frontend-tree moves it to views (when the `.map(..)` goes):
+
+- `rename.rs:66`: `path::find(&file.base, &target.item)` becomes
+  `path::find(file.parse.root(), &target.item).map(|it| view::ptr(it).to_node(&file.base))`
+  (`base` is `parse.syntax_node()`, the same tree).
+- `edit.rs:50`: `path::find(&root, item)` becomes
+  `path::find(file.parse.root(), item).map(|it| view::ptr(it).to_node(&root))`.
+- `edit.rs:223`: `path::find(&file.root(), into)` becomes
+  `path::find(file.parse.root(), into).map(|it| view::ptr(it).to_node(&file.root()))`.
+
+Each file adds `use syntax::view;`. `SyntaxNodePtr::to_node` makes the handle the caller made
+before; the zero budget below is `find`'s own.
 
 > forwarded to fastcompile (from requests, pass 16; told by tmux).
 
@@ -1860,13 +1891,15 @@ Lines 146-153, before:
             });
 ```
 
-after:
+after: this waits for frontend-tree to move `AddUse`'s scope walk (`items_of`) to views. On a
+handle the text is a `SyntaxText`, and comparing it without a `String` would be new handle code.
+On views it is:
 
 ```rust
-            let present = items_of(&scope).into_iter().any(|it| {
-                ast::Use::cast(it)
+            let present = items_of(scope).any(|it| {
+                view::Use::cast(it)
                     .and_then(|it| it.use_tree())
-                    .is_some_and(|tree| path::same_squeezed(&tree.syntax().text(), used))
+                    .is_some_and(|tree| path::same_squeezed(tree.syntax().text(), used))
             });
 ```
 
@@ -1889,10 +1922,10 @@ fn a_warm_find_allocates_nothing() {
         Edition::CURRENT,
         "mod m {\n    pub struct S(u8, u16);\n    impl Clone for S {\n        fn clone(&self) -> S { S(self.0, self.1) }\n    }\n}\nfn f() {}\n",
     );
-    let root = file.root();
+    let root = file.parse.root();
     for wanted in ["f", "m::S::1", "m::<S as Clone>::clone", "m::struct S", "m::< S as  Clone >::clone"] {
-        let first = path::find(&root, wanted).unwrap();
-        let (again, used) = blaze_alloc_count::measure(|| path::find(&root, wanted).unwrap());
+        let first = path::find(root, wanted).unwrap();
+        let (again, used) = blaze_alloc_count::measure(|| path::find(root, wanted).unwrap());
         assert_eq!(again, first);
         assert_eq!(used, blaze_alloc_count::Used::default(), "a warm find of `{wanted}`");
     }

@@ -12,6 +12,9 @@
 //! are on; macOS has no huge pages for anonymous memory on arm64, and Windows' large pages
 //! must be committed whole at reservation (`MEM_LARGE_PAGES`), which commit-on-growth cannot do,
 //! so there a reservation is made of base pages.
+//!
+//! A reservation can prefer a NUMA node for its pages ([`reserve_on`], [`bind`]): Linux's
+//! `mbind`, Windows' `VirtualAllocExNuma` at reservation; macOS has one memory node.
 
 use std::{io, ptr::NonNull, sync::atomic};
 
@@ -115,6 +118,132 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     NonNull::new(base).ok_or_else(|| {
         io::Error::new(io::ErrorKind::OutOfMemory, "the reservation is more than memory holds")
     })
+}
+
+/// As [`reserve`], with the pages the range is backed by preferred on NUMA node `node`.
+///
+/// Linux binds the fresh reservation (`mbind`, `MPOL_PREFERRED`) before any page of it exists,
+/// so every page is made on `node` while it has room. Windows takes the node when the range is
+/// reserved (`VirtualAllocExNuma`) and makes its pages there as they are first touched. macOS
+/// has no placement call and one memory node on every Mac blaze runs on (Apple silicon's unified
+/// memory, single-socket Intel), so node 0 is a plain reservation and any other is an error;
+/// likewise without virtual memory.
+#[cfg(target_os = "linux")]
+pub(crate) fn reserve_on(bytes: usize, huge: bool, node: u32) -> io::Result<NonNull<u8>> {
+    let base = reserve(bytes, huge)?;
+    // SAFETY: `[base, base + bytes)` is the reservation just made, which nothing else knows of.
+    if let Err(why) = unsafe { bind(base, bytes, node) } {
+        // SAFETY: the same reservation, released whole, unused.
+        unsafe { release(base, bytes) };
+        return Err(why);
+    }
+    Ok(base)
+}
+
+#[cfg(windows)]
+pub(crate) fn reserve_on(bytes: usize, _huge: bool, node: u32) -> io::Result<NonNull<u8>> {
+    use windows_sys::Win32::System::{
+        Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAllocExNuma},
+        Threading::GetCurrentProcess,
+    };
+    // SAFETY: a fresh reservation in this process at an address the kernel picks; the node is a
+    // number the kernel checks.
+    let base = unsafe {
+        VirtualAllocExNuma(GetCurrentProcess(), std::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS, node)
+    };
+    NonNull::new(base.cast::<u8>()).ok_or_else(|| {
+        let why = io::Error::last_os_error();
+        // alloc: the error of a reservation refused, once
+        io::Error::new(why.kind(), format!("reserving {bytes} bytes on NUMA node {node} (VirtualAllocExNuma): {why}"))
+    })
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(crate) fn reserve_on(bytes: usize, huge: bool, node: u32) -> io::Result<NonNull<u8>> {
+    one_node(node)?;
+    reserve(bytes, huge)
+}
+
+/// Prefers NUMA node `node` for the pages of `[ptr, ptr + bytes)` not yet made: Linux's `mbind`
+/// with `MPOL_PREFERRED`. A kernel built without NUMA (`ENOSYS`) has node 0 alone, where its
+/// memory already is; any other node is an error there.
+///
+/// # Safety
+///
+/// The range is inside one live reservation of [`reserve`]; changing its policy touches no data.
+#[cfg(target_os = "linux")]
+pub(crate) unsafe fn bind(ptr: NonNull<u8>, bytes: usize, node: u32) -> io::Result<()> {
+    /// `mempolicy.h`'s `MPOL_PREFERRED`.
+    const MPOL_PREFERRED: libc::c_long = 1;
+    /// The nodes a mask names: 1024.
+    const MASK_WORDS: usize = 16;
+    let bits = libc::c_ulong::BITS as usize;
+    let at = node as usize;
+    let mut mask = [0 as libc::c_ulong; MASK_WORDS];
+    let Some(word) = mask.get_mut(at / bits) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            // alloc: an error naming the node, once
+            format!("NUMA node {node} is past the {} nodes a mask names", MASK_WORDS * bits),
+        ));
+    };
+    *word |= 1 << (at % bits);
+    // The kernel reads one bit fewer than `maxnode` says.
+    let maxnode = (MASK_WORDS * bits + 1) as libc::c_ulong;
+    // SAFETY: `mbind` reads `MASK_WORDS` words of `mask`, a live array, and changes only the
+    // policy of the range, which the caller says is a reservation of ours.
+    let status = unsafe {
+        libc::syscall(libc::SYS_mbind, ptr.as_ptr(), bytes, MPOL_PREFERRED, mask.as_ptr(), maxnode, 0)
+    };
+    if status == 0 {
+        return Ok(());
+    }
+    let why = io::Error::last_os_error();
+    match why.raw_os_error() {
+        Some(libc::ENOSYS) if node == 0 => Ok(()),
+        // alloc: the error of a placement refused, once
+        _ => Err(io::Error::new(why.kind(), format!("binding {bytes} bytes to NUMA node {node} (mbind): {why}"))),
+    }
+}
+
+/// Windows places a range when it is reserved, never after (`VirtualAllocExNuma`'s preferred
+/// node is read only for a new reservation): an existing one is already where it is, which is
+/// node `node` only on a machine of that one node.
+#[cfg(windows)]
+pub(crate) unsafe fn bind(_ptr: NonNull<u8>, _bytes: usize, node: u32) -> io::Result<()> {
+    use windows_sys::Win32::System::Threading::GetNumaHighestNodeNumber;
+    let mut highest = 0u32;
+    // SAFETY: `highest` is a live `u32` to write.
+    let known = unsafe { GetNumaHighestNodeNumber(&mut highest) } != 0;
+    if known && highest == 0 && node == 0 {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        // alloc: an error naming the node, once
+        format!(
+            "Windows places memory on a NUMA node only when it is reserved: reserve this range on \
+             node {node} (Region::reserve_on) rather than binding it after"
+        ),
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
+pub(crate) unsafe fn bind(_ptr: NonNull<u8>, _bytes: usize, node: u32) -> io::Result<()> {
+    one_node(node)
+}
+
+/// Node 0, the one memory node there is where there is no placement call.
+#[cfg(not(any(target_os = "linux", windows)))]
+fn one_node(node: u32) -> io::Result<()> {
+    if node == 0 {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        // alloc: an error naming the node, once
+        format!("{} has one memory node and no NUMA node {node}", std::env::consts::OS),
+    ))
 }
 
 #[cfg(not(any(unix, windows)))]

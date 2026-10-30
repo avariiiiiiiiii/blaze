@@ -38,6 +38,7 @@ same as before, so nothing stored or compared changes.
 > `Blake3` adapter is gone (nothing else used it), `tree_hash`'s doc says the hash is carried.
 > Now untrue in `flat.rs` (syntax-tree's): the `SUBTREE` doc says hir-def hashes the same writes
 > itself and compares; it now reads this one.
+> mem-format-fwd: already in (`crates/hir-def/src/expr_store/body.rs` ~L491, `tree.subtree_hash(at)`; no `Blake3` left).
 
 ## for speed-hir-defs-sigs (`crates/hir-def/src/signatures.rs`): the same for signatures
 
@@ -52,6 +53,7 @@ Why: one pass, and a signature's tree that is rebuilt keeps its root's hash once
 > `SignatureSyntax`, and now `FileOutline`, compare the tree by content (`FlatTree: PartialEq`),
 > and nothing in `signatures.rs` hashes a tree. See `v2/requests/speed-hir.md`, "one BLAKE3
 > pass for a signature's tree hash", status line.
+> mem-format-fwd: overtaken by `FlatTree: PartialEq` (no `tree_hash` in `signatures.rs`); and not mem-format's file (`signatures.rs`). Nothing to apply.
 
 ## for the coordinator (`docs/v2/plan/lanes/format/speed-of-light.md`, "An edit")
 

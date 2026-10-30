@@ -31,7 +31,7 @@ use std::{
     time::Instant,
 };
 
-use blaze_api::{Cargo, Request, Response, TestResult, Ub, ViewRef};
+use blaze_api::{Cargo, Request, ResponseRef, TestResult, Ub, ViewRef};
 
 use self::{
     args::{Asked, Command, Invocation},
@@ -192,7 +192,8 @@ fn prepared_cargo(asked: &Invocation, color: bool) -> Result<(Place, Cargo), Str
     let place = place::find(&cwd, asked.flags.manifest_path.as_deref(), place::script(&asked.args))?;
     let home = crate::cargo::home::cargo_home();
     let files = place::config_files(&place, &asked.flags.config, home.as_deref())?;
-    let cargo = place::cargo(asked, &place, env, files, color)?;
+    let width = place::width(|name| std::env::var(name).ok(), io::stderr().is_terminal(), place::stderr_columns)?;
+    let cargo = place::cargo(asked, &place, env, files, color, width)?;
     Ok((place, cargo))
 }
 
@@ -203,6 +204,20 @@ fn cargo(asked: &Invocation) -> i32 {
         eprint!("{}", say::error(what, color));
         FAILED
     };
+    // cargo's `cli::main`, then `GlobalContext::configure`, before the shell has its color.
+    if let Some(directory) = &asked.directory {
+        if !asked.unstable_options {
+            let what = "the `-C` flag is unstable, pass `-Z unstable-options` on the nightly channel to enable it";
+            return refused(what, auto_color());
+        }
+        if let Err(error) = std::env::set_current_dir(directory) {
+            eprint!("{}", run::caused("could not change to requested directory", &[error.to_string()], auto_color()));
+            return FAILED;
+        }
+    }
+    if asked.flags.verbose > 0 && asked.flags.quiet {
+        return refused("cannot set both --verbose and --quiet", auto_color());
+    }
     let var = |name: &str| std::env::var(name).ok();
     let color = match place::color(asked.flags.color.as_deref(), var, io::stderr().is_terminal()) {
         Ok(color) => color,
@@ -261,22 +276,36 @@ pub fn drive<A: Api, O: Write, E: Write, P: Programs>(
     programs: &mut P,
 ) -> io::Result<Then> {
     let mut printer = Printer::new(shown, &place.root, out, err);
+    // alloc: once a request, for `--reached` and `--ub`; it grows by doubling, not by a result.
     let mut results: Vec<TestResult> = Vec::new();
     let mut unwritten = None;
-    let called = api.call(request, |response| match response {
-        Response::TestResult(result) => results.push(result),
-        response => {
-            if let Err(error) = printer.on(response) {
-                unwritten.get_or_insert(error);
+    let called = api.call(request, |response, more| {
+        let printed = match response {
+            ResponseRef::TestResult(result) => {
+                // alloc: a result held to the end, where libtest's format groups them by
+                // executable; only `--reached` and `--ub` have them.
+                results.push(result.into_owned());
+                Ok(())
             }
+            response => printer.on(response),
+        };
+        // Written once nothing more is held: what the daemon sent in one burst is one write, and
+        // a line never waits on the daemon's next.
+        let written = printed.and_then(|()| match more {
+            true => Ok(()),
+            false => printer.flush(),
+        });
+        if let Err(error) = written {
+            unwritten.get_or_insert(error);
         }
     });
     if let Some(error) = unwritten {
         return Err(error);
     }
     let ok = match called {
-        Ok(ok) => ok,
+        Ok(ok) => ok && !printer.refused(),
         Err(error) => {
+            printer.flush()?;
             printer.err().write_all(say::error(&error.to_string(), shown.color).as_bytes())?;
             return Ok(Then::Exit(FAILED));
         }

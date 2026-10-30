@@ -23,12 +23,14 @@ const INVARIANTS: &str = "enforces invariants that the compiler can't check. Rev
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplIncorrectSafety) -> Vec<Found> {
     let Some(at) = ImplAt::of_ptr(cx, d.file_id, d.impl_) else {
-        if validations(&cx.node(InFile::new(d.file_id, d.impl_)).value, d) {
+        if validations(cx.node_view(InFile::new(d.file_id, d.impl_)).value, d) {
+            // alloc: empty, allocates nothing
             return Vec::new();
         }
         return unresolved(cx, d.file_id, d.impl_, "an impl safety error");
     };
-    if validations(&at.node.value, d) {
+    if validations(at.node.value, d) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let db = cx.db;
@@ -40,6 +42,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplIncorrectSafety) -> Vec<F
     let span = at.span(cx);
     let mut diag = if d.should_be_safe {
         let mut diag =
+            // alloc: the error's text, for an error hir found
             Diag::error(Some("E0199"), format!("implementing the trait `{printed}` is not unsafe"), span.clone());
         diag.suggestion_verbose(
             span.with_hi(span.lo + "unsafe ".len() as u32),
@@ -51,9 +54,12 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplIncorrectSafety) -> Vec<F
     } else if trait_.is_unsafe(db) {
         let mut diag = Diag::error(
             Some("E0200"),
+            // alloc: the error's text, for an error hir found
             format!("the trait `{printed}` requires an `unsafe impl` declaration"),
+            // clone: on the error path, for an error hir found
             span.clone(),
         );
+        // alloc: the error's text, for an error hir found
         diag.note(format!("the trait `{printed}` {INVARIANTS}"));
         add_unsafe(&mut diag, &span);
         diag
@@ -61,14 +67,18 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TraitImplIncorrectSafety) -> Vec<F
         let mut diag = Diag::error(
             Some("E0569"),
             "requires an `unsafe impl` declaration due to `#[may_dangle]` attribute",
+            // clone: on the error path, for an error hir found
             span.clone(),
         );
+        // alloc: the error's text, for an error hir found
         diag.note(format!("the trait `{printed}` {INVARIANTS}"));
         add_unsafe(&mut diag, &span);
         diag
     };
     diag.fact(at.coherence(cx), "the header of the impl");
+    // alloc: the error's text, for an error hir found
     diag.fact(Fact::Signature(cx.key(ItemId::Trait(trait_.into()))), format!("whether `{printed}` is unsafe"));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Items)]
 }
 
@@ -84,6 +94,6 @@ fn add_unsafe(diag: &mut Diag, span: &crate::model::Span) {
 /// Whether `d` of the impl `node` is one of AST validation's errors: an inherent impl (E0197
 /// of an `unsafe` one; hir has no other safety error of it) or an `unsafe` negative impl
 /// (E0198).
-fn validations(node: &syntax::ast::Impl, d: &hir::TraitImplIncorrectSafety) -> bool {
+fn validations(node: syntax::view::Impl<'_>, d: &hir::TraitImplIncorrectSafety) -> bool {
     node.trait_().is_none() || d.should_be_safe && node.unsafe_token().is_some() && node.excl_token().is_some()
 }

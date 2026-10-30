@@ -2,7 +2,10 @@
 //! attribute of their own.
 
 use span::Edition;
-use syntax::{AstNode, SourceFile, ast};
+use syntax::{
+    SourceFile,
+    view::{self as ast, AstNode},
+};
 
 use crate::expr_store::lower::may_have_attrs;
 
@@ -46,9 +49,9 @@ fn g<#[cfg(q)] T, #[cfg(r)] 'a, #[cfg(s)] const N: usize, U>(#[cfg(t)] self_: u3
 
 #[test]
 fn a_node_with_an_attribute_is_never_skipped() {
-    let file = SourceFile::parse(CODE, Edition::CURRENT).tree();
+    let parse = SourceFile::parse(CODE, Edition::CURRENT);
     let (mut with, mut skipped) = (0, 0);
-    for node in file.syntax().descendants() {
+    for node in parse.root().descendants() {
         let Some(owner) = ast::AnyHasAttrs::cast(node) else { continue };
         let has = ast::attrs_including_inner(&owner).next().is_some();
         let may = may_have_attrs(&owner);

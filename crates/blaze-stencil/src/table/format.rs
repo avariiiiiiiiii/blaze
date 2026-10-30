@@ -1,7 +1,7 @@
 //! The stencil library's bytes: one little-endian blob per architecture variant, written by
 //! the generator ([`Writer`]) and read in place by the patcher ([`Reader`]). Shared with the
 //! generator (`build.rs` includes this file with `#[path]`); it uses nothing but `std`,
-//! [`crate::shape`] and [`crate::enc`].
+//! `blaze_ids::bits`, [`crate::shape`] and [`crate::enc`].
 //!
 //! ```text
 //! Header   84 bytes: MAGIC, FORMAT, shape::VERSION, variant, counts, seed, faults, then id
@@ -50,6 +50,8 @@
 //! at each trapping access. An exclusive-pair loop has two.
 
 use std::fmt;
+
+use blaze_ids::bits::BitSet;
 
 use crate::{enc::Form, shape::Shape};
 
@@ -538,7 +540,7 @@ impl<'a> Reader<'a> {
 
     fn check_index(&self) -> Result<(), FormatError> {
         // alloc: once per library, at its first use
-        let mut seen = vec![0u64; (self.counts.stencils as usize).div_ceil(64)];
+        let mut seen: BitSet<u32> = BitSet::new(self.counts.stencils as usize);
         let mut found = 0u32;
         for slot in 0..self.counts.slots {
             let at = self.layout.slots + slot as usize * SLOT;
@@ -553,12 +555,9 @@ impl<'a> Reader<'a> {
             if stencil >= self.counts.stencils {
                 return Err(FormatError::Bounds("a slot's stencil"));
             }
-            let word = &mut seen[stencil as usize / 64];
-            let bit = 1u64 << (stencil % 64);
-            if *word & bit != 0 {
+            if !seen.insert(stencil) {
                 return Err(FormatError::Bounds("a stencil indexed twice"));
             }
-            *word |= bit;
             found += 1;
             if !Shape::from_key(key).is_some_and(|shape| shape.exists_on(self.variant.isa())) {
                 return Err(FormatError::Shape(key));

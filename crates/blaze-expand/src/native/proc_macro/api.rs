@@ -885,8 +885,7 @@ impl Literal {
         Span::some(unsafe { sys::span_subspan(self.span.0, start, end) })
     }
 
-    // dyn: one writer per caller (`Display` and `to_string`), called once per piece of text.
-    fn parts(&self, f: &mut dyn FnMut(&str) -> fmt::Result) -> fmt::Result {
+    fn parts(&self, mut f: impl FnMut(&str) -> fmt::Result) -> fmt::Result {
         let hashes = |n: u8| "#".repeat(n as usize);
         let symbol = &*self.symbol;
         match self.kind {
@@ -946,7 +945,7 @@ impl FromStr for Literal {
 
 impl fmt::Display for Literal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.parts(&mut |part| f.write_str(part))
+        self.parts(|part| f.write_str(part))
     }
 }
 

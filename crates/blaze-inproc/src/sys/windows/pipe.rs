@@ -68,16 +68,6 @@ fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain([0]).collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(DIGITS[(byte >> 4) as usize] as char);
-        out.push(DIGITS[(byte & 15) as usize] as char);
-    }
-    out
-}
-
 fn hung_up(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error().map(|it| it as u32),
@@ -199,7 +189,7 @@ impl Listener {
         let _ = dir;
         let mut token = [0u8; 16];
         super::random(&mut token)?;
-        let address = format!("{PIPES}{PREFIX}{}-{}", std::process::id(), hex(&token));
+        let address = format!("{PIPES}{PREFIX}{}-{}", std::process::id(), crate::handshake::hex(&token));
         let name = wide(&address);
         let user = Sid::current_user()?;
         let security = Security::new(&user)?;
@@ -443,15 +433,5 @@ impl Security {
 
     fn descriptor(&self) -> *mut std::ffi::c_void {
         (&*self.descriptor as *const SECURITY_DESCRIPTOR).cast_mut().cast()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::hex;
-
-    #[test]
-    fn names_are_hex() {
-        assert_eq!(hex(&[0x00, 0xab, 0x7f]), "00ab7f");
     }
 }

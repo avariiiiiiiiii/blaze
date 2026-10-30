@@ -65,8 +65,10 @@ impl LatePass for InvalidReferenceCasting {
                     "casting `&T` to `&mut T` is undefined behavior, even if the reference is unused, consider instead using an `UnsafeCell`"
                 }
             };
+            // clone: a lint's span, for a lint found
             let mut diag = Diag::lint(LINT, message, expr_span.clone());
             if let Some(cast) = &orig_cast {
+                // clone: a lint's span, for a lint found
                 diag.span_label(cast.clone(), "casting happened here");
             }
             diag.note(NOTE);
@@ -83,6 +85,7 @@ impl LatePass for InvalidReferenceCasting {
                 diag.span_label(cast, "casting happened here");
             }
             diag.span_label(bigger.alloc, "backing allocation comes from here");
+            // alloc: the lint's text, for a lint found
             diag.note(format!(
                 "casting from `{}` ({} bytes) to `{}` ({} bytes)",
                 bigger.from_ty, bigger.from.size, bigger.to_ty, bigger.to.size

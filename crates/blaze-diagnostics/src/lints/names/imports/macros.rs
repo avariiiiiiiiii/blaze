@@ -15,6 +15,7 @@
 use hir::InFile;
 use hir_def::MacroId;
 use hir_expand::name::AsName;
+use smallvec::SmallVec;
 use syntax::{
     AstNode, NodeOrToken, SyntaxKind, SyntaxNode, T, TextRange,
     ast::{self, HasName, HasVisibility},
@@ -29,7 +30,8 @@ use crate::{
 };
 
 /// rustc's `unused_macros` and `unused_macro_rules`, each at the macro's item.
-pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found> {
+pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses<'_>) -> Vec<Found> {
+    // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
     let (macros, arms) =
         (cx.lint_may_fire(LintId::named("unused_macros")), cx.lint_may_fire(LintId::named("unused_macro_rules")));
@@ -38,6 +40,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
     }
     for tree in &walk.trees {
         for node in tree.of_kind(|it| matches!(it, SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF)) {
+            // clone: a rowan cursor's refcount, one per macro definition; `cast` takes the node
             let Some(def) = ast::Macro::cast(node.clone()) else { continue };
             let Some(name) = def.name() else { continue };
             let text = name.text();
@@ -52,7 +55,9 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
                     continue;
                 }
                 let span = cx.span(InFile::new(tree.file, name.syntax().text_range()));
+                // alloc: the message of a lint that fires
                 let mut diag = Diag::lint("unused_macros", format!("unused macro definition: `{text}`"), span);
+                // alloc: the fact of a lint that fires
                 diag.fact(cx.resolves_fact(it.module(cx.db), text), format!("what the calls of `{text}` resolve to"));
                 found.push(Found::lint(diag, Phase::Resolve, at));
                 continue;
@@ -62,18 +67,20 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
             }
             let matched = uses.arms.get(&id);
             let mut fact = None;
-            for (n, rule) in rules(&def).into_iter().enumerate() {
+            for (n, rule) in rules(&def).enumerate() {
                 if rule.compile_error || matched.is_some_and(|it| it.contains(n)) {
                     continue;
                 }
                 let mut spans = rule.spans.into_iter().map(|it| cx.span(InFile::new(tree.file, it)));
                 let Some(first) = spans.next() else { continue };
+                // alloc: the message of a lint that fires
                 let message = format!("rule #{} of macro `{text}` is never used", n + 1);
                 let mut diag = Diag::lint("unused_macro_rules", message, first);
                 for span in spans {
                     diag.primary(span);
                 }
                 let fact = fact.get_or_insert_with(|| cx.resolves_fact(it.module(cx.db), text));
+                // clone: alloc: the lint fires; each unused rule of the macro carries the one fact
                 diag.fact(fact.clone(), format!("which rules the calls of `{text}` match"));
                 found.push(Found::lint(diag, Phase::Resolve, at));
             }
@@ -86,6 +93,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
 /// `pub macro`.
 fn exported(walk: &Walk<'_>, def: &ast::Macro) -> bool {
     match def {
+        // clone: a rowan cursor's refcount; `AnyHasAttrs` takes the node and has no borrowed form
         ast::Macro::MacroRules(it) => walk.attrs(&ast::AnyHasAttrs::new(it.clone())).iter().any(|(meta, _)| {
             let path = match meta {
                 ast::Meta::PathMeta(it) => it.path(),
@@ -102,66 +110,55 @@ fn exported(walk: &Walk<'_>, def: &ast::Macro) -> bool {
 /// A rule of a macro: where rustc points at it (the matcher; an attribute rule's arguments
 /// and body), and whether its expansion calls `compile_error!`.
 struct Rule {
-    spans: Vec<TextRange>,
+    spans: SmallVec<[TextRange; 2]>,
     compile_error: bool,
 }
 
 /// The rules of `def`, in order: `matcher => expansion` separated by `;` in a `macro_rules!`,
 /// by `,` in a `macro`, whose `macro m(..) { .. }` form is one rule.
-fn rules(def: &ast::Macro) -> Vec<Rule> {
-    let body = match def {
-        ast::Macro::MacroRules(it) => it.token_tree(),
-        ast::Macro::MacroDef(it) => {
-            if let Some(args) = it.args() {
+///
+/// The body's delimiters are walked with the rest: neither is a `=`, `=>` or token tree, so
+/// neither changes a rule.
+fn rules(def: &ast::Macro) -> impl Iterator<Item = Rule> {
+    let (single, body) = match def {
+        ast::Macro::MacroRules(it) => (None, it.token_tree()),
+        ast::Macro::MacroDef(it) => match it.args() {
+            Some(args) => {
+                let mut spans = SmallVec::new();
+                spans.push(args.syntax().text_range());
                 let compile_error = it.body().is_some_and(|it| has_compile_error(it.syntax()));
-                return vec![Rule { spans: vec![args.syntax().text_range()], compile_error }];
+                (Some(Rule { spans, compile_error }), None)
             }
-            it.body()
-        }
+            None => (None, it.body()),
+        },
     };
-    let Some(body) = body else { return Vec::new() };
-    let elements: Vec<NodeOrToken<SyntaxNode, syntax::SyntaxToken>> = inner(body.syntax());
-    let mut rules = Vec::new();
-    let mut spans = Vec::new();
+    let mut elements = body
+        .into_iter()
+        .flat_map(|it| it.syntax().children_with_tokens())
+        .filter(|it| !it.kind().is_trivia())
+        .peekable();
+    let mut spans: SmallVec<[TextRange; 2]> = SmallVec::new();
     let mut after_arrow = false;
-    let mut i = 0;
-    while i < elements.len() {
-        match &elements[i] {
-            NodeOrToken::Token(token) if token.kind() == T![=] => {
-                if elements.get(i + 1).is_some_and(|it| it.kind() == T![>]) {
-                    i += 1;
+    single.into_iter().chain(std::iter::from_fn(move || {
+        while let Some(element) = elements.next() {
+            match &element {
+                NodeOrToken::Token(token) if token.kind() == T![=] => {
+                    elements.next_if(|it| it.kind() == T![>]);
+                    after_arrow = true;
                 }
-                after_arrow = true;
-            }
-            NodeOrToken::Token(token) if token.kind() == T![=>] => after_arrow = true,
-            NodeOrToken::Node(node) if node.kind() == SyntaxKind::TOKEN_TREE => {
-                if after_arrow {
-                    rules.push(Rule { spans: std::mem::take(&mut spans), compile_error: has_compile_error(node) });
-                    after_arrow = false;
-                } else {
+                NodeOrToken::Token(token) if token.kind() == T![=>] => after_arrow = true,
+                NodeOrToken::Node(node) if node.kind() == SyntaxKind::TOKEN_TREE => {
+                    if after_arrow {
+                        after_arrow = false;
+                        return Some(Rule { spans: std::mem::take(&mut spans), compile_error: has_compile_error(node) });
+                    }
                     spans.push(node.text_range());
                 }
+                _ => {}
             }
-            _ => {}
         }
-        i += 1;
-    }
-    rules
-}
-
-/// The elements of a token tree between its delimiters, without trivia.
-fn inner(tt: &SyntaxNode) -> Vec<NodeOrToken<SyntaxNode, syntax::SyntaxToken>> {
-    let mut elements: Vec<_> = tt.children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
-    let delimiter = |it: Option<&NodeOrToken<SyntaxNode, syntax::SyntaxToken>>| {
-        it.is_some_and(|it| matches!(it.kind(), T!['('] | T![')'] | T!['['] | T![']'] | T!['{'] | T!['}']))
-    };
-    if delimiter(elements.last()) {
-        elements.pop();
-    }
-    if delimiter(elements.first()) {
-        elements.remove(0);
-    }
-    elements
+        None
+    }))
 }
 
 /// Whether a token tree has `compile_error!` followed by a delimited group in it, at any

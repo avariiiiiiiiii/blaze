@@ -2036,17 +2036,10 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     /// a `TypeId` does not tell apart. Those of a binder in it are numbered in their order,
     /// for two spellings of one such type to have one id.
     fn type_id_ty(&self, ty: Ty<'db>) -> Result<'db, Ty<'db>> {
-        use rustc_type_ir::TypeFoldable;
         let ty = crate::mir::monomorphization::normalized_ty(self.db, ty, self.param_env)
             // alloc: error path
             .map_err(|e| MirEvalError::NotSupported(format!("a `TypeId` of {ty:?}: {e:?}")))?;
-        let interner = self.interner();
-        let erased = Region::new_erased(interner);
-        let ty = rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
-            rustc_type_ir::RegionKind::ReBound(..) => region,
-            _ => erased,
-        });
-        Ok(ty.fold_with(&mut Anonymized(interner)))
+        Ok(crate::mir::erase_and_anonymize_regions(self.interner(), ty))
     }
 
     /// Where `caller_location` asked at `span` of the body being run is: as rustc passes each
@@ -2295,26 +2288,6 @@ macro_rules! eval_float {
 
 eval_float!(f32);
 eval_float!(f64);
-
-/// Numbers the variables of every binder in what it folds in their order, with no names.
-struct Anonymized<'db>(crate::next_solver::DbInterner<'db>);
-
-impl<'db> rustc_type_ir::TypeFolder<crate::next_solver::DbInterner<'db>> for Anonymized<'db> {
-    fn cx(&self) -> crate::next_solver::DbInterner<'db> {
-        self.0
-    }
-
-    fn fold_binder<T>(
-        &mut self,
-        binder: rustc_type_ir::Binder<crate::next_solver::DbInterner<'db>, T>,
-    ) -> rustc_type_ir::Binder<crate::next_solver::DbInterner<'db>, T>
-    where
-        T: rustc_type_ir::TypeFoldable<crate::next_solver::DbInterner<'db>>,
-    {
-        use rustc_type_ir::{Interner, TypeSuperFoldable};
-        self.0.anonymize_bound_vars(binder.super_fold_with(self))
-    }
-}
 
 #[cfg(test)]
 mod tests {

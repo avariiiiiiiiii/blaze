@@ -225,7 +225,7 @@ pub fn compile_as(
     let sysroot = super::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
     let env = crate_env();
     let asked = Asked { args, cwd };
-    compile_in(&sysroot, &asked, source, env, made, dir, &|name| std::env::var(name).ok())
+    compile_in(&sysroot, &asked, source, env, made, dir)
 }
 
 /// [`compile_as`] of the crate rustc compiled as `record` says, over the standard library of
@@ -238,8 +238,7 @@ pub fn compile_record(
 ) -> Result<(), String> {
     let asked = Asked { args: &record.args, cwd: &record.cwd };
     let env = record.crate_env.clone();
-    let rustc_had = |name: &str| record.crate_env.get(name).cloned().or(std::env::var(name).ok());
-    compile_in(sysroot, &asked, &record.source, env, made, dir, &rustc_had)
+    compile_in(sysroot, &asked, &record.source, env, made, dir)
 }
 
 /// Builds the first crate of `described`, a `rust-project.json` over the standard library of
@@ -255,7 +254,7 @@ pub fn compile_described(
 }
 
 /// [`compile_as`] of the crate rustc was `asked` for, the variables its source reads by `env!`
-/// being `env` and the others what `rustc_had` says.
+/// being `env`.
 fn compile_in(
     sysroot: &Path,
     asked: &Asked<'_>,
@@ -263,7 +262,6 @@ fn compile_in(
     env: BTreeMap<String, String>,
     made: &Made<'_>,
     dir: &Path,
-    rustc_had: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
     if let Some(why) = crate::unstable::refusal(asked.args) {
         return Err(format!("it is built with {why}"));
@@ -289,23 +287,29 @@ fn compile_in(
     let deps =
         deps.iter().map(|(name, path)| Ok((name.clone(), add(&mut crates, &mut linked, path)?)));
     crates[0].deps = deps.collect::<Result<_, String>>()?;
-    build_described(sysroot, &crates, made, dir, rustc_had)
+    build_described(sysroot, &crates, made, dir)
 }
 
 /// Builds the first of `crates`, over the standard library of `sysroot`, as `made` says,
 /// describing them in `dir` ([`built`]). `Err` is why it was not built, or a variable its source
-/// read that `rustc_had` says otherwise.
+/// read that rustc had otherwise ([`rustc_had`]).
 pub fn build_described(
     sysroot: &Path,
     crates: &[Described],
     made: &Made<'_>,
     dir: &Path,
-    rustc_had: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), String> {
     let described = description(sysroot, crates);
     built(sysroot, &described, crates, made, dir)?;
     let read = std::fs::read_to_string(&made.dep_info).map_err(|it| it.to_string())?;
-    read_otherwise(&crate::dep_info::DepInfo::parse(&read), rustc_had)
+    let env = &crates[0].env;
+    read_otherwise(&crate::dep_info::DepInfo::parse(&read), |name| rustc_had(env, name))
+}
+
+/// What rustc had of the variable `name` for a crate cargo gave `env`: its value there, else
+/// the process's.
+fn rustc_had(env: &BTreeMap<String, String>, name: &str) -> Option<String> {
+    env.get(name).cloned().or_else(|| std::env::var(name).ok())
 }
 
 /// What the store keeps blaze's builds of build scripts and proc macros under in place of a
@@ -906,6 +910,16 @@ mod tests {
         assert_eq!(read_otherwise(&info, rustc_has(Some("1"))), Ok(()));
         assert!(read_otherwise(&info, rustc_has(Some("2"))).is_err());
         assert!(read_otherwise(&info, rustc_has(None)).is_err());
+    }
+
+    #[test]
+    fn rustc_had_what_cargo_gave_the_crate_else_the_process() {
+        let given = format!("BLAZE_OWN_SCRIPT_TEST_{}", std::process::id());
+        let env = BTreeMap::from([(given.clone(), "cargo".to_owned()), ("PATH".to_owned(), "given".to_owned())]);
+        assert_eq!(rustc_had(&env, &given).as_deref(), Some("cargo"));
+        assert_eq!(rustc_had(&env, "PATH").as_deref(), Some("given"));
+        assert_eq!(rustc_had(&BTreeMap::new(), "PATH"), std::env::var("PATH").ok());
+        assert_eq!(rustc_had(&BTreeMap::new(), &given), None);
     }
 
     #[test]

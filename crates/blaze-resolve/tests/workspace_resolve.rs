@@ -92,6 +92,7 @@ fn resolve(
         version_ordering: VersionOrdering::MaximumVersionsFirst,
         rust_versions: None,
         resolve_version: ResolveVersion::default(),
+        offline_flag: None,
     };
     let registry: MemRegistry = members.iter().copied().chain(packages).cloned().collect();
     let specs: Vec<PackageIdSpec> = members.iter().map(|m| m.package_id().to_spec()).collect();

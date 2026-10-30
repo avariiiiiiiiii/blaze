@@ -17,7 +17,10 @@
 use blaze_ids::radix;
 use hir::{HirFileId, InFile};
 use rustc_hash::FxHashSet;
-use syntax::{AstNode, Edition, LexedStr, SyntaxError, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{
+    Edition, LexedStr, SyntaxError, SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
     cx::Cx,
@@ -45,10 +48,12 @@ pub(crate) fn parsed(cx: &Cx<'_, '_>) -> Parsed {
         .modules(db)
         .all(|(_, data)| data.origin.file_id().is_none_or(|file| file_errors(db, file).is_empty()));
     if clean {
+        // alloc: empty, allocates nothing
         return Parsed { found: Vec::new(), fatal: false };
     }
     // alloc: a crate with a syntax error, the edge
     let mut found = Vec::new();
+    // alloc: the error's parts, for an error hir found
     let mut emptied: Vec<hir::Module> = Vec::new();
     for module in crate::checks::modules(cx) {
         if module.is_inline(db) || module.path_to_root(db).iter().any(|it| emptied.contains(it)) {
@@ -59,10 +64,9 @@ pub(crate) fn parsed(cx: &Cx<'_, '_>) -> Parsed {
         if errors.is_empty() {
             continue;
         }
-        let parse = file.parse(db);
         let (file_id, edition) = file.unpack(db);
         let text = cx.file_text(file_id);
-        let tree = parse.tree().syntax().clone();
+        let tree = cx.root(file.into());
         match lower_file(cx, file.into(), text, edition, tree, errors, &mut found) {
             Outcome::Parsed => {}
             Outcome::GaveUp if !module.is_crate_root(db) => emptied.push(module),
@@ -106,7 +110,7 @@ struct File<'a, 'c, 'db> {
     file: HirFileId,
     text: &'a str,
     edition: Edition,
-    tree: SyntaxNode,
+    tree: ast::Node<'a>,
     toks: Vec<Tok>,
 }
 
@@ -118,32 +122,35 @@ struct File<'a, 'c, 'db> {
 pub(crate) fn expansion_error(
     cx: &Cx<'_, '_>,
     file: HirFileId,
-    root: &SyntaxNode,
+    root: ast::Node<'_>,
     site: Span,
     msg: &str,
     pos: TextSize,
 ) -> Diag {
-    let text = root.to_string(); // alloc: error path, once per expansion that does not parse
     let toks = root
         .descendants_with_tokens()
         .filter_map(|it| it.into_token())
         .filter(|it| !is_trivia(it.kind()))
         .map(|it| Tok { kind: it.kind(), range: it.text_range() })
+        // alloc: the error's parts, for an error hir found
         .collect();
-    let f = File { cx, file, text: &text, edition: file.edition(cx.db), tree: root.clone(), toks };
+    let f = File { cx, file, text: root.text(), edition: file.edition(cx.db), tree: root, toks };
     let (mut diag, _) = f.parser_error(msg, pos);
     let (prev, token) = f.around(pos);
     if token.is_none()
         && let Some(expected) = diag.message.strip_suffix(", found `<eof>`").map(str::to_owned)
     {
+        // alloc: the error's text, for an error hir found
         diag.message = format!("macro expansion ends with an incomplete expression: {expected}");
         let at = prev.map_or(site, |it| f.at(it.range).shrink_to_hi());
         let old = std::mem::take(&mut diag.span.primary);
         for (span, _) in &mut diag.span.labels {
             if old.contains(span) {
+                // clone: on the error path, for an error hir found
                 *span = at.clone();
             }
         }
+        // alloc: the error's parts, for an error hir found
         diag.span.primary = vec![at];
     }
     diag
@@ -154,7 +161,7 @@ fn lower_file(
     file: HirFileId,
     text: &str,
     edition: Edition,
-    tree: SyntaxNode,
+    tree: ast::Node<'_>,
     errors: &[SyntaxError],
     found: &mut Vec<Found>,
 ) -> Outcome {
@@ -162,12 +169,14 @@ fn lower_file(
     let toks = tokens(&lexed, text);
     let f = File { cx, file, text, edition, tree, toks };
 
+    // alloc: the error's parts, for an error hir found
     let mut lexer_errors: Vec<(String, TextRange)> = Vec::new();
     let mut last_lifetime: Option<TextRange> = None;
     let mut errors_at = lexed.errors().peekable();
     for i in 0..lexed.len() {
         let range = token_range(&lexed, i);
         while let Some((_, msg)) = errors_at.next_if(|(at, _)| *at == i) {
+            // alloc: the error's text, for an error hir found
             lexer_errors.push((msg.to_owned(), range));
             let (diag, fatal) = f.lexer_error(lexed.kind(i), range, msg, last_lifetime);
             found.push(Found::new(diag, Phase::Parse));
@@ -187,16 +196,21 @@ fn lower_file(
     }
 
     let is_lexer_error = |error: &SyntaxError| {
+        // alloc: the error's text, for an error hir found
         let message = error.to_string();
         lexer_errors.iter().any(|(msg, range)| {
             *msg == message && (*range == error.range() || range.contains_range(error.range()))
         })
     };
+    // alloc: the error's parts, for an error hir found
     let mut parser_errors: Vec<&SyntaxError> = Vec::new();
+    // alloc: the error's parts, for an error hir found
     let mut literals: Vec<&SyntaxError> = Vec::new();
+    // alloc: the error's parts, for an error hir found
     let mut validation: Vec<&SyntaxError> = Vec::new();
     let mut seen: FxHashSet<(String, TextRange)> = FxHashSet::default();
     for error in errors {
+        // alloc: the error's text, for an error hir found
         if is_lexer_error(error) || !seen.insert((error.to_string(), error.range())) {
             continue;
         }
@@ -215,12 +229,14 @@ fn lower_file(
         }
     }
     for error in literals {
+        // alloc: the error's text, for an error hir found
         found.push(Found::new(Diag::error(None, error.to_string(), f.at(error.range())), Phase::Parse));
     }
     radix::sort_by_key(&mut parser_errors, |it| u32::from(it.range().start()));
     radix::sort_by_key(&mut validation, |it| u32::from(it.range().start()));
 
     for error in parser_errors {
+        // alloc: the error's text, for an error hir found
         let (diag, recovered) = f.parser_error(&error.to_string(), error.range().start());
         found.push(Found::new(diag, Phase::Parse));
         if !recovered {
@@ -237,6 +253,7 @@ impl File<'_, '_, '_> {
     /// an `impl` type with no trait), E0224 of a `dyn` type with no trait as
     /// `rustc_hir_analysis` gives it, the rest in the `syntax` crate's words.
     fn validation_error(&self, error: &SyntaxError) -> Option<Found> {
+        // alloc: the error's text, for an error hir found
         let message = error.to_string();
         let range = error.range();
         let at = self.at(range);
@@ -252,6 +269,7 @@ impl File<'_, '_, '_> {
                     _ => None,
                 }
             }
+            // alloc: the error's text, for an error hir found
             _ => Some(Found::new(Diag::error(None, error.to_string(), at), Phase::Resolve)),
         }
     }
@@ -278,6 +296,7 @@ const GLUED: &[&str] = &[
 ];
 
 fn tokens(lexed: &LexedStr<'_>, text: &str) -> Vec<Tok> {
+    // alloc: the error's parts, for an error hir found
     let mut toks: Vec<Tok> = Vec::new();
     for i in 0..lexed.len() {
         let kind = lexed.kind(i);
@@ -362,22 +381,28 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
 
     /// rustc's `token_descr`.
     fn describe(&self, tok: Option<Tok>) -> String {
+        // alloc: the error's text, for an error hir found
         let Some(tok) = tok else { return "`<eof>`".to_owned() };
         let s = self.src(tok);
         if matches!(tok.kind, SyntaxKind::OUTER_DOC_COMMENT | SyntaxKind::INNER_DOC_COMMENT) {
+            // alloc: the error's text, for an error hir found
             return format!("doc comment `{s}`");
         }
         if self.is_ident(tok) {
             if s == "_" {
+                // alloc: the error's text, for an error hir found
                 return format!("reserved identifier `{s}`");
             }
             if is_used_keyword(s, self.edition) {
+                // alloc: the error's text, for an error hir found
                 return format!("keyword `{s}`");
             }
             if is_unused_keyword(s, self.edition) {
+                // alloc: the error's text, for an error hir found
                 return format!("reserved keyword `{s}`");
             }
         }
+        // alloc: the error's text, for an error hir found
         format!("`{s}`")
     }
 
@@ -448,8 +473,11 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 if let Some(lifetime) = last_lifetime {
                     diag.multipart_suggestion(
                         "if you meant to write a string literal, use double quotes",
+                        // alloc: the error's parts, for an error hir found
                         vec![
+                            // alloc: the error's text, for an error hir found
                             (self.at(lifetime), "\"".to_owned()),
+                            // alloc: the error's text, for an error hir found
                             (self.at(TextRange::at(range.start(), one)), "\"".to_owned()),
                         ],
                         Applicability::MaybeIncorrect,
@@ -494,6 +522,7 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
         };
         let start = range.start();
         let mut diag = Diag::error(Some("E0758"), msg, self.at(TextRange::new(start, self.eof().end())));
+        // alloc: the error's parts, for an error hir found
         let mut opens = Vec::new();
         let mut last_nested = None;
         let mut chars = self.text[usize::from(start)..].char_indices().peekable();
@@ -527,12 +556,14 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
         let starter = after_hashes.chars().next();
         if starter != Some('"') {
             let bad = escaped_char(starter.unwrap_or('\0'));
+            // alloc: the error's text, for an error hir found
             let message = format!(
                 "found invalid character; only `#` is allowed in raw string delimitation: {bad}"
             );
             return Diag::error(None, message, self.at(range));
         }
         if hashes > 255 {
+            // alloc: the error's text, for an error hir found
             let message = format!(
                 "too many `#` symbols: raw strings may be delimited by up to 255 `#` symbols, but found {hashes}"
             );
@@ -554,9 +585,11 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
             }
         }
         let here = self.at(TextRange::empty(start));
+        // clone: on the error path, for an error hir found
         let mut diag = Diag::error(Some("E0748"), "unterminated raw string", here.clone());
         diag.span_label(here, "unterminated raw string");
         if hashes > 0 {
+            // alloc: the error's text, for an error hir found
             diag.note(format!("this raw string should be terminated with `\"{}`", "#".repeat(hashes)));
         }
         if let Some(offset) = possible {
@@ -585,6 +618,7 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 let delimiter = closer(found);
                 let mut diag = Diag::error(
                     None,
+                    // alloc: the error's text, for an error hir found
                     format!("mismatched closing delimiter: `{delimiter}`"),
                     self.at(unmatched.found_span),
                 );
@@ -600,6 +634,7 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 }
                 Some(diag)
             })
+            // alloc: the error's parts, for an error hir found
             .collect();
         if let Err(error) = result {
             errors.push(error);
@@ -636,21 +671,27 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
             }
             "expected expression" => {
                 let span = self.at(self.range_of(token));
+                // alloc: the error's text, for an error hir found
                 let message = format!("expected expression, found {}", self.describe(token));
+                // clone: on the error path, for an error hir found
                 let mut diag = Diag::error(None, message, span.clone());
                 diag.span_label(span, "expected expression");
                 (diag, false)
             }
             "expected a type" | "expected type" => {
                 let span = self.at(self.range_of(token));
+                // alloc: the error's text, for an error hir found
                 let message = format!("expected type, found {}", self.describe(token));
+                // clone: on the error path, for an error hir found
                 let mut diag = Diag::error(None, message, span.clone());
                 diag.span_label(span, "expected type");
                 (diag, false)
             }
             "expected pattern" => {
                 let span = self.at(self.range_of(token));
+                // alloc: the error's text, for an error hir found
                 let message = format!("expected pattern, found {}", self.describe(token));
+                // clone: on the error path, for an error hir found
                 let mut diag = Diag::error(None, message, span.clone());
                 diag.span_label(span, "expected pattern");
                 (diag, false)
@@ -677,13 +718,16 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 let at = self.toks.partition_point(|t| t.range.start() <= it.range.start());
                 self.toks.get(at).copied()
             });
+            // alloc: the error's text, for an error hir found
             let message = format!("expected `;`, found {found}");
             if matches!(src(token), Some("," | ":"))
                 && (src(next) == Some("}") || (self.can_begin_expr(next) && src(next) != Some(":")))
             {
                 let span = self.at(token_range);
+                // clone: on the error path, for an error hir found
                 let mut diag = Diag::error(None, message, span.clone());
                 diag.suggestion_with_style(
+                    // alloc: the error's text, for an error hir found
                     vec![(span, ";".to_owned())],
                     "change this to `;`",
                     Applicability::MachineApplicable,
@@ -698,9 +742,11 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 || (is_multiline(self.text, after_prev) && src(token) == Some("#"))
             {
                 let span = self.at(TextRange::empty(prev.range.end()));
+                // clone: on the error path, for an error hir found
                 let mut diag = Diag::error(None, message, span.clone());
                 diag.span_label(self.at(token_range), "unexpected token");
                 diag.suggestion_with_style(
+                    // alloc: the error's text, for an error hir found
                     vec![(span, ";".to_owned())],
                     "add `;` here",
                     Applicability::MachineApplicable,
@@ -710,14 +756,18 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
             }
         }
 
+        // alloc: the error's text, for an error hir found
         let message = format!("expected {expected}, found {found}");
+        // alloc: the error's text, for an error hir found
         let label = format!("expected {expected}");
         let mut diag = Diag::error(None, message, self.at(token_range));
         if let Some(prev) = prev {
             let symbol = self.src(prev);
             if self.is_ident(prev) && ["def", "fun", "func", "function"].contains(&symbol) {
                 diag.suggestion_with_style(
+                    // alloc: the error's text, for an error hir found
                     vec![(self.at(prev.range), "fn".to_owned())],
+                    // alloc: the error's text, for an error hir found
                     format!("write `fn` instead of `{symbol}` to declare a function"),
                     Applicability::MachineApplicable,
                     SuggestionStyle::HideCodeInline,
@@ -727,6 +777,7 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
                 && (self.can_begin_item(token) || src(token) == Some("("))
             {
                 diag.suggestion_with_style(
+                    // alloc: the error's text, for an error hir found
                     vec![(self.at(prev.range), "pub".to_owned())],
                     "write `pub` instead of `public` to make the item public",
                     Applicability::MachineApplicable,
@@ -763,14 +814,18 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
     fn expected_item(&self, prev: Option<Tok>, token: Option<Tok>) -> (Diag, bool) {
         let span = self.at(self.range_of(token));
         if token.is_some_and(|it| self.src(it) == ";") {
+            // clone: on the error path, for an error hir found
             let mut diag = Diag::error(None, "expected item, found `;`", span.clone());
             diag.suggestion_verbose(span, "remove this semicolon", "", Applicability::MachineApplicable);
             if let Some(name) = prev.and_then(|it| self.item_ending_at(it.range.end())) {
+                // alloc: the error's text, for an error hir found
                 diag.help(format!("{name} declarations are not followed by a semicolon"));
             }
             return (diag, true);
         }
+        // alloc: the error's text, for an error hir found
         let message = format!("expected item, found {}", self.describe(token));
+        // clone: on the error path, for an error hir found
         let mut diag = Diag::error(None, message, span.clone());
         let is_let = self.is_ident_named(token, "let");
         let next = token.and_then(|it| {
@@ -785,11 +840,13 @@ impl<'a, 'c, 'db> File<'a, 'c, 'db> {
             true => "`let` cannot be used for global variables",
             false => "expected item",
         };
+        // clone: on the error path, for an error hir found
         diag.span_label(span.clone(), label);
         if is_let_mut {
             diag.help("consider using `static` and a `Mutex` instead of `let mut`");
         } else if let_has_ident {
             diag.suggestion_with_style(
+                // alloc: the error's text, for an error hir found
                 vec![(span, "static".to_owned())],
                 "consider using `static` or `const` instead of `let`",
                 Applicability::MaybeIncorrect,
@@ -874,7 +931,9 @@ fn expected_token(kind: &str) -> Option<&'static str> {
 /// rustc's `escaped_char`.
 fn escaped_char(c: char) -> String {
     match c {
+        // alloc: the error's text, for an error hir found
         '\u{20}'..='\u{7e}' => c.to_string(),
+        // alloc: the error's text, for an error hir found
         _ => c.escape_default().to_string(),
     }
 }
@@ -1030,6 +1089,7 @@ impl Trees<'_, '_, '_, '_> {
             && self.info.open.len() >= SHOWN + 2
         {
             let more = self.info.open.len() - SHOWN;
+            // alloc: the error's text, for an error hir found
             diag.span_label(file.at(span), format!("another {more} unclosed delimiters begin from here"));
         }
         if let Some(&(delim, _)) = self.info.open.last() {
@@ -1040,6 +1100,7 @@ impl Trees<'_, '_, '_, '_> {
 
     fn close_delim_err(&mut self, tok: Tok) -> Diag {
         let file = self.file;
+        // alloc: the error's text, for an error hir found
         let message = format!("unexpected closing delimiter: `{}`", file.src(tok));
         let mut diag = Diag::error(None, message, file.at(tok.range));
         if !self.missing_open_delim(&mut diag) {
@@ -1064,6 +1125,7 @@ impl Trees<'_, '_, '_, '_> {
             }
             diag.span_label(
                 file.at(TextRange::empty(unmatched.found_span.start())),
+                // alloc: the error's text, for an error hir found
                 format!("missing open `{open}` for this delimiter"),
             );
             reported = true;
@@ -1082,6 +1144,7 @@ impl Trees<'_, '_, '_, '_> {
             .map(|&(open, close)| {
                 (TextRange::new(open.start(), close.start()), file.same_indentation(open, close))
             })
+            // alloc: the error's parts, for an error hir found
             .collect();
         radix::sort_copy_by_key(&mut matched, |(range, _)| u32::from(range.start()));
         for i in 0..matched.len() {

@@ -3,7 +3,6 @@
 //! as cargo's `unit_dependencies` derives it, and the strip and debuginfo adjustments of cargo's
 //! `rebuild_unit_graph_shared` are applied over the graph's dependencies.
 
-use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -11,8 +10,10 @@ use anyhow::{Context as _, anyhow, bail};
 use blaze_manifest::config::CompileKind;
 use blaze_manifest::diagnostic::report;
 use blaze_manifest::metadata::root_manifest;
-use blaze_manifest::profiles::{Profile, ProfilePackage, Profiles, UnitFor, requested_profile};
+use blaze_manifest::manifest::PackageId as Pkg;
+use blaze_manifest::profiles::{Profile, Profiles, UnitFor, requested_profile};
 use blaze_manifest::source::SourceId;
+use blaze_manifest::files::Disk;
 use blaze_manifest::{Config, Context, Workspace};
 use cargo_util_schemas::core::{PackageIdSpec, SourceKind};
 use cargo_util_schemas::lockfile::TomlLockfile;
@@ -126,7 +127,7 @@ pub(crate) fn main(
 }
 
 fn run(
-    ctx: &Context,
+    ctx: &Context<Disk>,
     host: &str,
     command: &Command,
     graph: &str,
@@ -152,35 +153,6 @@ fn run(
     Ok(serde_json::to_string_pretty(&profiles)? + "\n")
 }
 
-struct Pkg {
-    name: String,
-    version: semver::Version,
-    source_id: SourceId,
-}
-
-impl fmt::Display for Pkg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} v{}", self.name, self.version)?;
-        match &self.source_id.kind {
-            SourceKind::Path => write!(f, " ({})", self.source_id.url.path()),
-            _ if self.source_id.url.as_str() == blaze_manifest::source::CRATES_IO_INDEX => Ok(()),
-            _ => write!(f, " ({})", self.source_id.url),
-        }
-    }
-}
-
-impl ProfilePackage for Pkg {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn version(&self) -> &semver::Version {
-        &self.version
-    }
-    fn source_id(&self) -> &SourceId {
-        &self.source_id
-    }
-}
-
 fn package(pkg_id: &str) -> anyhow::Result<Pkg> {
     let spec = PackageIdSpec::parse(pkg_id).with_context(|| format!("package id `{pkg_id}`"))?;
     let version = spec.version().ok_or_else(|| anyhow!("package id `{pkg_id}` has no version"))?;
@@ -193,7 +165,7 @@ fn package(pkg_id: &str) -> anyhow::Result<Pkg> {
 /// The packages of the workspace's `Cargo.lock`, which cargo checks the package overrides
 /// against: every package of the resolve, built or not. A path package's directory is that of
 /// the unit or member of its name and version.
-fn lock_packages(ws: &Workspace<'_>, units: &[Unit]) -> anyhow::Result<Option<Vec<Pkg>>> {
+fn lock_packages(ws: &Workspace<'_, Disk>, units: &[Unit]) -> anyhow::Result<Option<Vec<Pkg>>> {
     let path = ws.root().join("Cargo.lock");
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(None) };
     let lock: TomlLockfile =
@@ -273,7 +245,7 @@ enum Edge {
 /// The profiles of `graph`'s units, in its order, and the warnings of the package overrides
 /// that match none of its packages.
 fn profiles_of(
-    ws: &Workspace<'_>,
+    ws: &Workspace<'_, Disk>,
     profiles: &Profiles,
     command: &Command,
     graph: &Value,
@@ -315,9 +287,9 @@ fn profiles_of(
         });
     }
     let locked = lock_packages(ws, &parsed)?;
-    let mut packages: Vec<&dyn ProfilePackage> = Vec::new();
+    let mut packages: Vec<&Pkg> = Vec::new();
     if let Some(locked) = &locked {
-        packages.extend(locked.iter().map(|p| p as &dyn ProfilePackage));
+        packages.extend(locked.iter());
     } else {
         let mut seen = rustc_hash::FxHashSet::default();
         for (unit, value) in parsed.iter().zip(units) {

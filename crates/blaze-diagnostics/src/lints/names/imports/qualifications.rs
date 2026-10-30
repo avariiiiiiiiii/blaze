@@ -35,11 +35,13 @@ use crate::{
 
 /// rustc's `potentially_unnecessary_qualifications`, less those whose name alone is found
 /// through an import found unused or redundant, in the order late resolution comes to them.
-pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses, unused: &Unused) -> Vec<Found> {
+pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses<'_>, unused: &Unused) -> Vec<Found> {
+    // alloc: holds only diagnostics that fire; empty, it allocates nothing
     let mut found = Vec::new();
     let mut scratch = Scratch::default();
     for tree in &walk.trees {
         for node in tree.of_kind(|it| it == SyntaxKind::PATH) {
+            // clone: a rowan cursor's refcount, one per path; `cast` takes the node
             let Some(path) = ast::Path::cast(node.clone()) else { continue };
             found.extend(qualification(cx, tree.file, &path, uses, unused, &mut scratch));
         }
@@ -52,6 +54,8 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses, unused: &Unus
 #[derive(Default)]
 struct Scratch<'db> {
     chain: Vec<ast::Path>,
+    /// The trait's chain of a `<T as Trait>::a`.
+    inner: Vec<ast::Path>,
     segments: Vec<(ast::Path, ast::PathSegment)>,
     resolved: Vec<Option<PathResolution<'db>>>,
     alone: FxHashMap<Name, ast::Path>,
@@ -61,7 +65,7 @@ fn qualification<'db>(
     cx: &Cx<'_, 'db>,
     file: HirFileId,
     path: &ast::Path,
-    uses: &Uses,
+    uses: &Uses<'_>,
     unused: &Unused,
     scratch: &mut Scratch<'db>,
 ) -> Option<Found> {
@@ -80,8 +84,8 @@ fn qualification<'db>(
     } else {
         return None;
     };
-    let Scratch { chain, segments, resolved, alone } = scratch;
-    segments_into(path, chain, segments)?;
+    let Scratch { chain, inner, segments, resolved, alone } = scratch;
+    segments_into(path, chain, inner, segments)?;
     if segments.len() < 2 || segments[0].1.coloncolon_token().is_some() {
         return None;
     }
@@ -98,7 +102,7 @@ fn qualification<'db>(
         let res = resolved[i]?;
         let name_ref = segments[i].1.name_ref()?;
         let name = name_ref.as_name();
-        let probe = alone.entry(name.clone()).or_insert_with(|| make::ext::ident_path(name_ref.text()));
+        let probe = alone.entry(name).or_insert_with(|| make::ext::ident_path(name_ref.text()));
         let lexical = scope.speculative_resolve(probe)?;
         (lexical == res).then_some((i, name_ref, name))
     })?;
@@ -118,15 +122,17 @@ fn qualification<'db>(
         Applicability::MachineApplicable,
     );
     let text = name_ref.text();
+    // alloc: the fact of a lint that fires
     diag.fact(cx.resolves_fact(module.into(), text), format!("what `{text}` alone finds"));
     Some(Found::lint(diag, Phase::Resolve, InFile::new(file, SyntaxNodePtr::new(&parent))))
 }
 
 /// rustc's segments of `path` into `segments`, each with the path it ends: those of the trait
-/// of `<T as Trait>::a` then the rest; of `<T>::a`, the rest.
+/// of `<T as Trait>::a` then the rest; of `<T>::a`, the rest. `chain` and `inner` are scratch.
 fn segments_into(
     path: &ast::Path,
     chain: &mut Vec<ast::Path>,
+    inner: &mut Vec<ast::Path>,
     segments: &mut Vec<(ast::Path, ast::PathSegment)>,
 ) -> Option<()> {
     segments.clear();
@@ -135,12 +141,11 @@ fn segments_into(
     let rest = match first.type_anchor() {
         Some(anchor) => {
             if anchor.as_token().is_some() {
-                let mut inner = Vec::new();
-                chain_into(&first.qualifying_trait()?.path()?, &mut inner);
+                chain_into(&first.qualifying_trait()?.path()?, inner);
                 if inner[0].segment()?.type_anchor().is_some() {
                     return None;
                 }
-                for path in inner {
+                for path in inner.drain(..) {
                     let segment = path.segment()?;
                     segments.push((path, segment));
                 }
@@ -159,6 +164,7 @@ fn segments_into(
 /// `path` and its qualifiers into `chain`, outermost qualifier first.
 fn chain_into(path: &ast::Path, chain: &mut Vec<ast::Path>) {
     chain.clear();
+    // clone: a rowan cursor's refcount; the chain owns its paths to walk up their qualifiers
     chain.push(path.clone());
     while let Some(qualifier) = chain.last().and_then(|it| it.qualifier()) {
         chain.push(qualifier);

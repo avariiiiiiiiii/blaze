@@ -2,6 +2,7 @@
 //! information and various assists.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 // It's useful to refer to code that is private in doc comments.
 #![allow(rustdoc::private_intra_doc_links)]
 
@@ -34,12 +35,14 @@ pub mod utils;
 mod variance;
 
 pub mod autoderef;
+pub mod check_cache;
 pub mod consteval;
 pub mod db;
 pub mod drop;
 pub mod dyn_compatibility;
 pub mod effects;
 pub mod evict;
+pub mod fn_cache;
 pub mod lang_items;
 pub mod layout;
 pub mod method_resolution;
@@ -48,10 +51,19 @@ pub mod primitive;
 pub mod providers;
 pub mod solver_errors;
 pub mod traits;
+pub mod used_imports;
+
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::{hash::Hash, ops::ControlFlow};
 
 use base_db::Db;
+use blaze_mem::Frame;
 use hir_def::{
     CallableDefId, ConstId, DefWithBodyId, EnumVariantId, ExpressionStoreOwnerId, FunctionId,
     GenericDefId, HasModule, LifetimeParamId, ModuleId, StaticId, TypeAliasId, TypeOrConstParamId,
@@ -65,7 +77,7 @@ use hir_expand::name::Name;
 use macros::GenericTypeVisitable;
 use mir::{MirEvalError, VTableMap};
 use rustc_abi::ExternAbi;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 use rustc_type_ir::{
     BoundVarIndexKind, TypeSuperVisitable, TypeVisitableExt,
     inherent::{IntoKind, Ty as _},
@@ -101,7 +113,7 @@ pub use infer::{
 pub use lower::{
     ElidedLifetimes, ElidedOutput, FieldType, FieldTypes, GenericDefaults, GenericDefaultsRef,
     GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, LoweringMode, Lowered,
-    SelfAndAssocBounds, TyDefId, TyLoweringContext, TyLoweringInferVarsCtx, TyLoweringResult,
+    SelfAndAssocBounds, TyDefId, TyLoweringContext, TyLoweringResult,
     ValueTyDefId,
     batch::{
         Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable,
@@ -123,15 +135,30 @@ pub use utils::{
     is_fn_unsafe_to_call, target_feature_is_safe_in_target,
 };
 pub use variance::{adt_unused_params, ctor_variances};
+pub use used_imports::used_imports_with_traits;
 
 pub mod closure_analysis {
     pub use crate::infer::{
-        CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, UpvarCapture,
+        CaptureInfo, CaptureSourceStack, CapturedPlace, ClosureData, MinCaptures, MinCapturesIter,
+        UpvarCapture,
         closure::analysis::{
             BorrowKind,
             expr_use_visitor::{FakeReadCause, Place, PlaceBase, Projection, ProjectionKind},
         },
     };
+}
+
+/// A map of a query run's temporaries, in its frame (docs/v2/plan/lanes/mem/db-infer.md, R3).
+pub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
+/// A set of a query run's temporaries, in its frame.
+pub(crate) type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame>;
+
+pub(crate) fn frame_map<K, V>(frame: &Frame) -> FrameMap<'_, K, V> {
+    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
+}
+
+pub(crate) fn frame_set<T>(frame: &Frame) -> FrameSet<'_, T> {
+    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)
 }
 
 /// A constant can have reference to other things. Memory map job is holding
@@ -448,7 +475,13 @@ impl<'db> MemoryMap<'db> {
                 map
             }),
             MemoryMap::Complex(cm) => {
-                cm.memory.iter().map(|(addr, val)| transform((addr, val))).collect()
+                let mut map =
+                    FxHashMap::with_capacity_and_hasher(cm.memory.len(), rustc_hash::FxBuildHasher);
+                for (addr, val) in cm.memory.iter() {
+                    let (addr, new) = transform((addr, val))?;
+                    map.insert(addr, new);
+                }
+                Ok(map)
             }
         }
     }
@@ -721,8 +754,11 @@ where
         }
     }
 
+    // alloc: the `hir` API's edge, and pushed only for error types, regions and consts
+    let vars = Vec::new();
     let mut error_replacer =
-        ErrorReplacer { vars: Vec::new(), binder: rustc_type_ir::DebruijnIndex::ZERO, interner };
+        ErrorReplacer { vars, binder: rustc_type_ir::DebruijnIndex::ZERO, interner };
+    // clone: the `hir` API's edge, folding takes `T` by value and callers pass interned types
     let value = match t.clone().try_fold_with(&mut error_replacer) {
         Ok(t) => t,
         Err(_) => panic!("Encountered unbound or inference vars in {t:?}"),

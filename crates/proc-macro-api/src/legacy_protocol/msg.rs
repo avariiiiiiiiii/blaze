@@ -164,20 +164,20 @@ impl ExpnGlobals {
 
 pub trait Message: serde::Serialize + DeserializeOwned {
     type Buf;
-    fn read(inp: &mut dyn BufRead, buf: &mut Self::Buf) -> io::Result<Option<Self>>;
-    fn write(&self, out: &mut dyn Write) -> io::Result<()>;
+    fn read<R: BufRead + ?Sized>(inp: &mut R, buf: &mut Self::Buf) -> io::Result<Option<Self>>;
+    fn write<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()>;
 }
 
 impl Message for Request {
     type Buf = String;
 
-    fn read(inp: &mut dyn BufRead, buf: &mut Self::Buf) -> io::Result<Option<Self>> {
+    fn read<R: BufRead + ?Sized>(inp: &mut R, buf: &mut Self::Buf) -> io::Result<Option<Self>> {
         Ok(match json::read(inp, buf)? {
             None => None,
             Some(buf) => Some(json::decode(buf)?),
         })
     }
-    fn write(&self, out: &mut dyn Write) -> io::Result<()> {
+    fn write<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         let value = json::encode(self)?;
         json::write(out, &value)
     }
@@ -186,13 +186,13 @@ impl Message for Request {
 impl Message for Response {
     type Buf = String;
 
-    fn read(inp: &mut dyn BufRead, buf: &mut Self::Buf) -> io::Result<Option<Self>> {
+    fn read<R: BufRead + ?Sized>(inp: &mut R, buf: &mut Self::Buf) -> io::Result<Option<Self>> {
         Ok(match json::read(inp, buf)? {
             None => None,
             Some(buf) => Some(json::decode(buf)?),
         })
     }
-    fn write(&self, out: &mut dyn Write) -> io::Result<()> {
+    fn write<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         let value = json::encode(self)?;
         json::write(out, &value)
     }

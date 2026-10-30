@@ -21,8 +21,8 @@ use std::mem;
 
 use hir::InFile;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, TextRange,
-    ast::{self, HasGenericArgs, HasGenericParams, HasModuleItem, HasName},
+    SyntaxKind, TextRange,
+    view::{self as ast, AstNode as _, HasGenericArgs as _, HasGenericParams as _, HasModuleItem as _, HasName as _},
 };
 
 use super::{Accepted, Finalize, GroupId};
@@ -165,6 +165,7 @@ fn not_crate_level(cx: &mut Accept<'_, '_, '_>, range: TextRange, name: &str) ->
     if cx.target() != Target::Crate {
         return true;
     }
+    // alloc: the error's message
     let diag = cx.err(None, format!("`#![doc({name} = \"...\")]` isn't allowed as a crate-level attribute"), range);
     cx.emit_err(diag);
     false
@@ -197,10 +198,13 @@ fn alias(doc: &mut Doc, cx: &mut Accept<'_, '_, '_>, path: TextRange, args: &Arg
 /// rustc's `add_alias`.
 fn add_alias(doc: &mut Doc, cx: &mut Accept<'_, '_, '_>, alias: String, range: TextRange) {
     let message = if alias.is_empty() {
+        // alloc: the error's message
         format!("{ALIAS} attribute cannot have empty value")
     } else if let Some(c) = bad_alias_char(&alias) {
+        // alloc: the error's message
         format!("{c:?} character isn't allowed in {ALIAS}")
     } else if alias.starts_with(' ') || alias.ends_with(' ') {
+        // alloc: the error's message
         format!("{ALIAS} cannot start or end with ' '")
     } else {
         if !not_crate_level(cx, range, "alias") {
@@ -232,20 +236,22 @@ fn keyword_or_attribute(
 ) {
     let Some(nv) = args.as_name_value() else { return };
     let Some(value) = nv.value_as_str() else { return };
-    let (valid, message, help) = if word == "keyword" {
-        (
-            is_keyword(value),
-            format!("nonexistent keyword `{value}` used in `#[doc(keyword = \"...\")]`"),
-            "only existing keywords are allowed in core/std",
-        )
-    } else {
-        (
-            table::is_builtin_attr_name(value),
-            format!("nonexistent builtin attribute `{value}` used in `#[doc(attribute = \"...\")]`"),
-            "only existing builtin attributes are allowed in core/std",
-        )
-    };
+    let keyword = word == "keyword";
+    let valid = if keyword { is_keyword(value) } else { table::is_builtin_attr_name(value) };
     if !valid {
+        let (message, help) = if keyword {
+            (
+                // alloc: the error's message
+                format!("nonexistent keyword `{value}` used in `#[doc(keyword = \"...\")]`"),
+                "only existing keywords are allowed in core/std",
+            )
+        } else {
+            (
+                // alloc: the error's message
+                format!("nonexistent builtin attribute `{value}` used in `#[doc(attribute = \"...\")]`"),
+                "only existing builtin attributes are allowed in core/std",
+            )
+        };
         let mut diag = cx.err(None, message, nv.value_range());
         diag.help(help);
         cx.emit_err(diag);
@@ -258,6 +264,7 @@ fn keyword_or_attribute(
     if !not_crate_level(cx, path, word) {
         return;
     }
+    // alloc: the value the parsed `#[doc]` keeps
     *slot = Some((value.to_owned(), cx.in_file(path)));
 }
 
@@ -343,18 +350,23 @@ fn cfg(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) {
     let Some(single) = list.as_single() else {
         let target = cx.target().name();
         if list.is_empty() {
+            // alloc: the error's suggestion
             cx.push_suggestion(format!("if the {target} should be disabled, use `#[cfg(false)]`"), list.range, "(false)");
         } else if let Some(args) = cx.cx.snippet(&cx.span(list.range)).map(str::to_owned) {
             cx.push_suggestion(
+                // alloc: the error's suggestion
                 format!("if the {target} should be enabled when all these predicates are, wrap them in `all`"),
                 list.range,
+                // alloc: the error's suggestion
                 format!("(all{args})"),
             );
             cx.push_suggestion(
+                // alloc: the error's suggestion
                 format!(
                     "alternately, if the {target} should be enabled when any of these predicates are, wrap them in `any`"
                 ),
                 list.range,
+                // alloc: the error's suggestion
                 format!("(any{args})"),
             );
         }
@@ -451,52 +463,55 @@ fn check_alias(fx: &mut Finalize<'_, '_, '_>, alias: &str, range: InFile<TextRan
         _ => None,
     };
     if let Some(location) = location {
+        // alloc: the error's message
         error(fx, range, format!("{ALIAS} isn't allowed on {location}"));
         return;
     }
-    if item_name(&fx.owner.node.value).is_some_and(|it| it == alias) {
+    if is_item_name(fx.owner.node.value, alias).unwrap_or(false) {
+        // alloc: the error's message
         error(fx, range, format!("`#[doc(alias = \"{alias}\"]` is the same as the item's name"));
     }
 }
 
 /// The trait or impl an associated item is in, through the macro call it is expanded from.
-fn container(cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>) -> Option<SyntaxNode> {
+fn container<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option<ast::Node<'db>> {
     let parent = node.value.parent();
     match parent {
         Some(parent) if parent.kind() == SyntaxKind::ASSOC_ITEM_LIST => parent.parent(),
         Some(parent) if parent.parent().is_some() => None,
         _ => {
-            let call = node.file_id.macro_file()?.loc(cx.db).to_node(cx.db);
-            container(cx, call.as_ref())
+            let call = node.file_id.macro_file()?.loc(cx.db).to_node_view(cx.db);
+            container(cx, call)
         }
     }
 }
 
 fn container_is(fx: &Finalize<'_, '_, '_>, kind: SyntaxKind) -> bool {
-    container(fx.cx, fx.owner.node.as_ref()).is_some_and(|it| it.kind() == kind)
+    container(fx.cx, fx.owner.node).is_some_and(|it| it.kind() == kind)
 }
 
 fn container_is_trait_impl(fx: &Finalize<'_, '_, '_>) -> bool {
-    container(fx.cx, fx.owner.node.as_ref()).and_then(ast::Impl::cast).is_some_and(|it| it.trait_().is_some())
+    container(fx.cx, fx.owner.node).and_then(ast::Impl::cast).is_some_and(|it| it.trait_().is_some())
 }
 
-/// The name rustc's `tcx.opt_item_name` gives the node, as `check_doc_alias_value` compares it.
-fn item_name(node: &SyntaxNode) -> Option<String> {
-    let unraw = |text: &str| text.strip_prefix("r#").unwrap_or(text).to_owned();
-    let rename = |rename: ast::Rename| match rename.name() {
+/// Whether `alias` is the name rustc's `tcx.opt_item_name` gives the node, as
+/// `check_doc_alias_value` compares it; `None` for a node without one.
+fn is_item_name(node: ast::Node<'_>, alias: &str) -> Option<bool> {
+    let unraw = |text: &str| text.strip_prefix("r#").unwrap_or(text) == alias;
+    let rename = |rename: ast::Rename<'_>| match rename.name() {
         Some(name) => Some(unraw(name.text())),
-        None => rename.underscore_token().map(|_| "_".to_owned()),
+        None => rename.underscore_token().map(|_| alias == "_"),
     };
     match node.kind() {
         SyntaxKind::EXTERN_CRATE => {
-            let krate = ast::ExternCrate::cast(node.clone())?;
+            let krate = ast::ExternCrate::cast(node)?;
             match krate.rename() {
                 Some(it) => rename(it),
                 None => Some(unraw(krate.name_ref()?.text())),
             }
         }
         SyntaxKind::USE => {
-            let tree = ast::Use::cast(node.clone())?.use_tree()?;
+            let tree = ast::Use::cast(node)?.use_tree()?;
             if tree.use_tree_list().is_some() || tree.star_token().is_some() {
                 return None;
             }
@@ -506,29 +521,28 @@ fn item_name(node: &SyntaxNode) -> Option<String> {
             }
         }
         SyntaxKind::TUPLE_FIELD => {
-            let index = node.parent()?.children().filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD).position(|it| it == *node)?;
-            Some(index.to_string())
+            let index = node.parent()?.children().filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD).position(|it| it == node)?;
+            // alloc: only for an alias of a tuple field
+            Some(index.to_string() == alias)
         }
-        SyntaxKind::RECORD_PAT_FIELD => Some(unraw(&ast::RecordPatField::cast(node.clone())?.field_name()?.to_string())),
-        SyntaxKind::RECORD_EXPR_FIELD => Some(unraw(ast::RecordExprField::cast(node.clone())?.field_name()?.text())),
-        SyntaxKind::LIFETIME_PARAM => Some(ast::LifetimeParam::cast(node.clone())?.lifetime()?.text().to_owned()),
-        _ => Some(unraw(ast::AnyHasName::cast(node.clone())?.name()?.text())),
+        SyntaxKind::RECORD_PAT_FIELD => Some(unraw(ast::RecordPatField::cast(node)?.field_name()?.syntax().text())),
+        SyntaxKind::RECORD_EXPR_FIELD => Some(unraw(ast::RecordExprField::cast(node)?.field_name()?.text())),
+        SyntaxKind::LIFETIME_PARAM => Some(ast::LifetimeParam::cast(node)?.lifetime()?.text() == alias),
+        _ => Some(unraw(ast::AnyHasName::cast(node)?.name()?.text())),
     }
 }
 
 /// `check_doc_keyword_and_attribute`'s: `#[doc(keyword)]` and `#[doc(attribute)]` are of empty
 /// modules.
 fn empty_module(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>, name: &str) {
-    let node = &fx.owner.node;
+    let node = fx.owner.node;
     let empty = match node.value.kind() {
-        SyntaxKind::MODULE => ast::Module::cast(node.value.clone()).map(|module| {
-            match fx.cx.sema.to_def2(InFile::new(node.file_id, &module)) {
-                Some(def) => module_is_empty(fx.cx, def),
-                None => module.item_list().is_none_or(|it| it.items().next().is_none()),
-            }
+        SyntaxKind::MODULE => ast::Module::cast(node.value).map(|module| match fx.cx.vsema.to_def(module) {
+            Some(def) => module_is_empty(fx.cx, def),
+            None => module.item_list().is_none_or(|it| it.items().next().is_none()),
         }),
         SyntaxKind::SOURCE_FILE if fx.target() == Target::Mod => {
-            fx.cx.sema.hir_file_to_module_def(node.file_id).map(|def| module_is_empty(fx.cx, def))
+            fx.cx.vsema.hir_file_to_module_def(node.file_id).map(|def| module_is_empty(fx.cx, def))
         }
         _ => None,
     };
@@ -537,6 +551,7 @@ fn empty_module(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>, name: &
         Some(false) => "should be used on empty modules",
         None => "should be used on modules",
     };
+    // alloc: the error's message
     error(fx, range, format!("`#[doc({name} = \"...\")]` {message}"));
 }
 
@@ -548,16 +563,16 @@ fn module_is_empty(cx: &Cx<'_, '_>, module: hir::Module) -> bool {
         && module.use_decls(db).is_empty()
         && module.extern_crate_decls(db).is_empty()
         && module.extern_blocks(db).is_empty()
-        && !module.legacy_macros(db).into_iter().any(|it| it.module(db) == module)
+        && !module.legacy_macros_iter(db).any(|it| it.module(db) == module)
 }
 
 /// `check_doc_fake_variadic`.
 fn fake_variadic(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>) {
-    let message = match ast::Impl::cast(fx.owner.node.value.clone()) {
+    let message = match ast::Impl::cast(fx.owner.node.value) {
         None => "`#[doc(keyword = \"...\")]` should be used on impl blocks",
         Some(imp) => {
             let self_ty = imp.self_ty().is_some_and(variadic_self_ty);
-            if self_ty || imp.trait_().and_then(|it| single_type_arg(&it)).is_some_and(is_one_tuple) {
+            if self_ty || imp.trait_().and_then(single_type_arg).is_some_and(is_one_tuple) {
                 return;
             }
             "`#[doc(fake_variadic)]` must be used on the first of a set of tuple or fn pointer trait impls with varying arity"
@@ -567,12 +582,12 @@ fn fake_variadic(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>) {
 }
 
 /// The one type argument of a path type's last segment; `Fn(A, B)`'s inputs as a tuple.
-enum OneArg {
-    Ty(ast::Type),
+enum OneArg<'t> {
+    Ty(ast::Type<'t>),
     Inputs(usize),
 }
 
-fn single_type_arg(ty: &ast::Type) -> Option<OneArg> {
+fn single_type_arg(ty: ast::Type<'_>) -> Option<OneArg<'_>> {
     let ast::Type::PathType(path) = ty else { return None };
     let segment = path.path()?.segment()?;
     if let Some(list) = segment.parenthesized_arg_list() {
@@ -583,7 +598,7 @@ fn single_type_arg(ty: &ast::Type) -> Option<OneArg> {
     arg.ty().map(OneArg::Ty)
 }
 
-fn is_one_tuple(arg: OneArg) -> bool {
+fn is_one_tuple(arg: OneArg<'_>) -> bool {
     match arg {
         OneArg::Inputs(inputs) => inputs == 1,
         OneArg::Ty(ty) => matches!(unparen(ty), ast::Type::TupleType(tuple) if tuple.fields().count() == 1),
@@ -591,8 +606,8 @@ fn is_one_tuple(arg: OneArg) -> bool {
 }
 
 /// `ty`, through its parentheses, as HIR has it.
-fn unparen(mut ty: ast::Type) -> ast::Type {
-    while let ast::Type::ParenType(paren) = &ty
+fn unparen(mut ty: ast::Type<'_>) -> ast::Type<'_> {
+    while let ast::Type::ParenType(paren) = ty
         && let Some(inner) = paren.ty()
     {
         ty = inner;
@@ -602,11 +617,11 @@ fn unparen(mut ty: ast::Type) -> ast::Type {
 
 /// rustc's `is_valid` of `check_doc_fake_variadic`: a 1-tuple, a 1-argument fn pointer, or a
 /// path of one type argument that is one.
-fn variadic_self_ty(ty: ast::Type) -> bool {
+fn variadic_self_ty(ty: ast::Type<'_>) -> bool {
     match unparen(ty) {
         ast::Type::TupleType(tuple) => tuple.fields().count() == 1,
         ast::Type::FnPtrType(fn_ptr) => fn_ptr.param_list().is_some_and(|it| it.params().count() == 1),
-        ty => match single_type_arg(&ty) {
+        ty => match single_type_arg(ty) {
             Some(OneArg::Ty(ty)) => variadic_self_ty(ty),
             Some(OneArg::Inputs(inputs)) => inputs == 1,
             None => false,
@@ -616,8 +631,8 @@ fn variadic_self_ty(ty: ast::Type) -> bool {
 
 /// `check_doc_search_unbox`.
 fn search_unbox(fx: &mut Finalize<'_, '_, '_>, range: InFile<TextRange>) {
-    let node = fx.owner.node.value.clone();
-    let generic = |list: Option<ast::GenericParamList>| list.is_some_and(|it| it.generic_params().next().is_some());
+    let node = fx.owner.node.value;
+    let generic = |list: Option<ast::GenericParamList<'_>>| list.is_some_and(|it| it.generic_params().next().is_some());
     let valid = match fx.target() {
         Target::Struct => ast::Struct::cast(node).is_some_and(|it| generic(it.generic_param_list())),
         Target::Enum => ast::Enum::cast(node).is_some_and(|it| generic(it.generic_param_list())),
@@ -641,7 +656,9 @@ fn inline(fx: &mut Finalize<'_, '_, '_>, inline: &[(DocInline, InFile<TextRange>
     let Some((_, other_range)) = rest.iter().find(|(it, _)| it != first) else { return };
     let first = fx.cx.span(*first_range);
     let other = fx.cx.span(*other_range);
+    // clone: the error's span
     let mut diag = Diag::error(None, "conflicting doc inlining attributes", first.clone());
+    // clone: the error's span
     diag.primary(other.clone());
     diag.span_label(first, "this attribute...");
     diag.span_label(other, "...conflicts with this attribute");

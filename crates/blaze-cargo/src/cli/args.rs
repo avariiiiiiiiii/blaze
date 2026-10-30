@@ -7,55 +7,25 @@ use std::ffi::OsString;
 
 use super::say;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Command {
-    Build,
-    Check,
-    Run,
-    Test,
-    Bench,
+pub use blaze_units::query::Command;
+
+/// What clap knows of a command: its usage line and its flags.
+trait Clap: Sized {
+    /// The command as clap's usage lines name it.
+    fn usage(self) -> &'static str;
+    fn has_positionals(self) -> bool;
+    fn flags(self) -> &'static [&'static [Flag]];
+    fn flag(self, found: impl Fn(&Flag) -> bool) -> Option<&'static Flag>;
 }
 
-impl Command {
-    /// The command a word names, with cargo's aliases.
-    pub fn named(word: &str) -> Option<Command> {
-        match word {
-            "build" | "b" => Some(Command::Build),
-            "check" | "c" => Some(Command::Check),
-            "run" | "r" => Some(Command::Run),
-            "test" | "t" => Some(Command::Test),
-            "bench" => Some(Command::Bench),
-            _ => None,
-        }
-    }
-
-    pub fn name(self) -> &'static str {
+impl Clap for Command {
+    fn usage(self) -> &'static str {
         match self {
-            Command::Build => "build",
-            Command::Check => "check",
-            Command::Run => "run",
-            Command::Test => "test",
-            Command::Bench => "bench",
-        }
-    }
-
-    /// The profile cargo builds with when none is named.
-    pub fn profile(self) -> &'static str {
-        match self {
-            Command::Build | Command::Check | Command::Run => "dev",
-            Command::Test => "test",
-            Command::Bench => "bench",
-        }
-    }
-
-    /// clap's usage line, after `Usage: `: the command, then its placeholders.
-    fn usage(self) -> (&'static str, &'static [&'static str]) {
-        match self {
-            Command::Build => ("cargo build", &["[OPTIONS]"]),
-            Command::Check => ("cargo check", &["[OPTIONS]"]),
-            Command::Run => ("cargo run", &["[OPTIONS]", "[ARGS]..."]),
-            Command::Test => ("cargo test", &["[OPTIONS]", "[TESTNAME]", "[-- [ARGS]...]"]),
-            Command::Bench => ("cargo bench", &["[OPTIONS]", "[BENCHNAME]", "[-- [ARGS]...]"]),
+            Command::Build => "cargo build",
+            Command::Check => "cargo check",
+            Command::Run => "cargo run",
+            Command::Test => "cargo test",
+            Command::Bench => "cargo bench",
         }
     }
 
@@ -66,23 +36,23 @@ impl Command {
     fn flags(self) -> &'static [&'static [Flag]] {
         match self {
             Command::Build => &[
-                GLOBAL, MESSAGE, PACKAGES, JOBS, KEEP_GOING, FUTURE, TARGETS, FEATURES, RELEASE,
-                PROFILE, TARGET, BUILD_ONLY, REPORTS, MANIFEST,
+                GLOBAL, FUTURE, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, RELEASE, DEBUG, PROFILE, JOBS,
+                KEEP_GOING, TARGET, ARTIFACT, REPORTS, COMPILE_TIME_DEPS, MANIFEST,
             ],
             Command::Check => &[
-                GLOBAL, MESSAGE, PACKAGES, JOBS, KEEP_GOING, FUTURE, TARGETS, FEATURES, RELEASE,
-                PROFILE, TARGET, REPORTS, MANIFEST,
+                GLOBAL, FUTURE, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, KEEP_GOING, RELEASE,
+                PROFILE, TARGET, REPORTS, COMPILE_TIME_DEPS, MANIFEST,
             ],
             Command::Run => &[
-                GLOBAL, MESSAGE, PACKAGE, JOBS, KEEP_GOING, RUN_TARGETS, FEATURES, RELEASE, PROFILE,
-                TARGET, REPORTS, MANIFEST,
+                GLOBAL, MESSAGE, SILENT, PACKAGE, RUN_TARGETS, FEATURES, JOBS, KEEP_GOING, RELEASE, PROFILE,
+                TARGET, MANIFEST, REPORTS,
             ],
             Command::Test => &[
-                GLOBAL, MESSAGE, TEST_ONLY, RUNNING, PACKAGES, JOBS, FUTURE, TARGETS, FEATURES,
+                GLOBAL, RUNNING, FUTURE, MESSAGE, PACKAGES, TARGETS, TEST_ONLY, FEATURES, JOBS, NO_KEEP_GOING,
                 RELEASE, PROFILE, TARGET, REPORTS, MANIFEST,
             ],
             Command::Bench => &[
-                GLOBAL, MESSAGE, RUNNING, PACKAGES, JOBS, FUTURE, TARGETS, FEATURES, PROFILE,
+                GLOBAL, RUNNING, MESSAGE, SILENT, PACKAGES, TARGETS, FEATURES, JOBS, NO_KEEP_GOING, PROFILE,
                 TARGET, REPORTS, MANIFEST,
             ],
         }
@@ -103,8 +73,14 @@ enum Takes {
     Value,
     /// The rest of its word, or the next word unless that is a flag (`num_args(0..=1)`).
     Optional,
-    /// `--timings=html` only (`require_equals`).
-    Equals,
+}
+
+/// Where a hidden flag that cargo refuses points: clap's error for it is an unknown argument with
+/// this tip (cargo's `UnknownArgumentValueParser::suggest_arg` and `suggest`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Points {
+    Arg(&'static str),
+    Says(&'static str),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -114,29 +90,59 @@ pub struct Flag {
     takes: Takes,
     value: &'static str,
     possible: &'static [&'static str],
+    /// Given more than once, its values add up (clap's `ArgAction::Append`); a flag that is not
+    /// is refused the second time.
+    many: bool,
+    /// Its value may start with `-` (`allow_hyphen_values`).
+    hyphen: bool,
+    /// Out of help and of clap's usage lines.
+    hidden: bool,
+    points: Option<Points>,
 }
 
 impl Flag {
     const fn new(long: &'static str, short: Option<char>, takes: Takes, value: &'static str) -> Flag {
-        Flag { long: Some(long), short, takes, value, possible: &[] }
+        Flag { long: Some(long), short, takes, value, possible: &[], many: false, hyphen: false, hidden: false, points: None }
     }
 
     const fn switch(long: &'static str) -> Flag {
         Flag::new(long, None, Takes::Switch, "")
     }
 
-    /// As clap shows it in an error: `--features <FEATURES>`, `--bin [<NAME>]`, `-Z <FLAG>`.
+    const fn many(self) -> Flag {
+        Flag { many: true, ..self }
+    }
+
+    const fn hidden(self) -> Flag {
+        Flag { hidden: true, ..self }
+    }
+
+    /// A hidden flag cargo has only to point to another.
+    const fn pointing(long: Option<&'static str>, short: Option<char>, points: Points) -> Flag {
+        Flag { long, short, points: Some(points), hidden: true, ..Flag::switch("") }
+    }
+
+    /// As clap shows it (`Arg`'s `Display`): `--features <FEATURES>`, `--bin [<NAME>]`,
+    /// `--verbose...`, `-Z <FLAG>`.
     fn shown(&self) -> String {
+        self.painted(false)
+    }
+
+    /// [`Flag::shown`] in clap's literal and placeholder styles (`Arg::stylized`) when `color`.
+    fn painted(&self, color: bool) -> String {
+        let paint = |style: &str, text: &str| say::paint(style, text, color);
         let name = match (self.long, self.short) {
             (Some(long), _) => format!("--{long}"),
             (None, Some(short)) => format!("-{short}"),
             (None, None) => String::new(),
         };
+        let name = paint(say::VALID, &name);
+        let value = || paint(say::PLACEHOLDER, &format!("<{}>", self.value));
         match self.takes {
-            Takes::Switch | Takes::Count => name,
-            Takes::Value => format!("{name} <{}>", self.value),
-            Takes::Optional => format!("{name} [<{}>]", self.value),
-            Takes::Equals => format!("{name}[=<{}>]", self.value),
+            Takes::Switch => name,
+            Takes::Count => format!("{name}{}", paint(say::PLACEHOLDER, "...")),
+            Takes::Value => format!("{name}{}{}", paint(say::PLACEHOLDER, " "), value()),
+            Takes::Optional => format!("{name}{}{}{}", paint(say::PLACEHOLDER, " ["), value(), paint(say::PLACEHOLDER, "]")),
         }
     }
 }
@@ -154,71 +160,82 @@ const FORMATS: &[&str] = &[
 const GLOBAL: &[Flag] = &[
     Flag::new("verbose", Some('v'), Takes::Count, ""),
     Flag::new("quiet", Some('q'), Takes::Switch, ""),
-    Flag { long: Some("color"), short: None, takes: Takes::Value, value: "WHEN", possible: COLORS },
-    Flag::new("config", None, Takes::Value, "KEY=VALUE|PATH"),
-    Flag { long: None, short: Some('Z'), takes: Takes::Value, value: "FLAG", possible: &[] },
+    Flag { possible: COLORS, ..Flag::new("color", None, Takes::Value, "WHEN") },
+    Flag::pointing(None, Some('c'), Points::Arg("--config")),
+    Flag::new("config", None, Takes::Value, "KEY=VALUE|PATH").many(),
+    Flag::pointing(None, Some('z'), Points::Arg("-Z")),
+    Flag { long: None, short: Some('Z'), ..Flag::new("", None, Takes::Value, "FLAG").many() },
     Flag::switch("frozen"),
     Flag::switch("locked"),
     Flag::switch("offline"),
     Flag::new("help", Some('h'), Takes::Switch, ""),
 ];
-const MESSAGE: &[Flag] = &[Flag {
-    long: Some("message-format"),
-    short: None,
-    takes: Takes::Value,
-    value: "FMT",
-    possible: FORMATS,
-}];
+/// cargo's `-C`, before the command only (it is no global of clap's).
+const DIRECTORY: Flag = Flag { long: None, short: Some('C'), ..Flag::new("", None, Takes::Value, "DIRECTORY") };
+const MESSAGE: &[Flag] = &[Flag { possible: FORMATS, ..Flag::new("message-format", None, Takes::Value, "FMT").many() }];
+const SILENT: &[Flag] = &[Flag::pointing(Some("silent"), Some('s'), Points::Arg("--quiet"))];
 const PACKAGES: &[Flag] = &[
-    Flag::new("package", Some('p'), Takes::Optional, "SPEC"),
+    Flag::new("package", Some('p'), Takes::Optional, "SPEC").many(),
     Flag::switch("workspace"),
+    Flag::new("exclude", None, Takes::Value, "SPEC").many(),
+    Flag::pointing(None, Some('x'), Points::Arg("--exclude")),
     Flag::switch("all"),
-    Flag::new("exclude", None, Takes::Value, "SPEC"),
 ];
+/// `run`'s `-p`, one package (`optional_opt`, not `optional_multi_opt`).
 const PACKAGE: &[Flag] = &[Flag::new("package", Some('p'), Takes::Optional, "SPEC")];
-const JOBS: &[Flag] = &[Flag::new("jobs", Some('j'), Takes::Value, "N")];
+const JOBS: &[Flag] = &[Flag { hyphen: true, ..Flag::new("jobs", Some('j'), Takes::Value, "N") }];
 const KEEP_GOING: &[Flag] = &[Flag::switch("keep-going")];
+/// `test` and `bench`: `arg_unsupported_keep_going`.
+const NO_KEEP_GOING: &[Flag] = &[Flag::pointing(
+    Some("keep-going"),
+    None,
+    Points::Says("use `--no-fail-fast` to run as many tests as possible regardless of failure"),
+)];
 const FUTURE: &[Flag] = &[Flag::switch("future-incompat-report")];
 const TARGETS: &[Flag] = &[
     Flag::switch("lib"),
     Flag::switch("bins"),
-    Flag::new("bin", None, Takes::Optional, "NAME"),
+    Flag::new("bin", None, Takes::Optional, "NAME").many(),
     Flag::switch("examples"),
-    Flag::new("example", None, Takes::Optional, "NAME"),
+    Flag::new("example", None, Takes::Optional, "NAME").many(),
     Flag::switch("tests"),
-    Flag::new("test", None, Takes::Optional, "NAME"),
+    Flag::new("test", None, Takes::Optional, "NAME").many(),
     Flag::switch("benches"),
-    Flag::new("bench", None, Takes::Optional, "NAME"),
+    Flag::new("bench", None, Takes::Optional, "NAME").many(),
     Flag::switch("all-targets"),
 ];
 const RUN_TARGETS: &[Flag] = &[
-    Flag::new("bin", None, Takes::Optional, "NAME"),
-    Flag::new("example", None, Takes::Optional, "NAME"),
+    Flag::new("bin", None, Takes::Optional, "NAME").many(),
+    Flag::new("example", None, Takes::Optional, "NAME").many(),
 ];
 const FEATURES: &[Flag] = &[
-    Flag::new("features", Some('F'), Takes::Value, "FEATURES"),
+    Flag::new("features", Some('F'), Takes::Value, "FEATURES").many(),
     Flag::switch("all-features"),
     Flag::switch("no-default-features"),
 ];
 const RELEASE: &[Flag] = &[Flag::new("release", Some('r'), Takes::Switch, "")];
+/// `build`'s `arg_redundant_default_mode`.
+const DEBUG: &[Flag] = &[Flag::pointing(
+    Some("debug"),
+    None,
+    Points::Says("`--debug` is the default for `cargo build`; instead `--release` is supported"),
+)];
 const PROFILE: &[Flag] = &[Flag::new("profile", None, Takes::Value, "PROFILE-NAME")];
 const TARGET: &[Flag] = &[
-    Flag::new("target", None, Takes::Optional, "TRIPLE"),
+    Flag::new("target", None, Takes::Optional, "TRIPLE").many(),
+    Flag::pointing(None, Some('t'), Points::Arg("--target")),
     Flag::new("target-dir", None, Takes::Value, "DIRECTORY"),
 ];
-const BUILD_ONLY: &[Flag] = &[
+const ARTIFACT: &[Flag] = &[
     Flag::new("artifact-dir", None, Takes::Value, "PATH"),
-    Flag::new("out-dir", None, Takes::Value, "PATH"),
-    Flag::switch("build-plan"),
+    Flag::pointing(None, Some('O'), Points::Arg("--artifact-dir")),
+    Flag::pointing(Some("out-dir"), None, Points::Arg("--artifact-dir")),
 ];
-const REPORTS: &[Flag] = &[
-    Flag::switch("unit-graph"),
-    Flag::new("timings", None, Takes::Equals, "FMTS"),
-    Flag::switch("ignore-rust-version"),
-];
+const REPORTS: &[Flag] = &[Flag::switch("unit-graph"), Flag::switch("timings"), Flag::switch("ignore-rust-version")];
+const COMPILE_TIME_DEPS: &[Flag] = &[Flag::switch("compile-time-deps").hidden()];
 const MANIFEST: &[Flag] = &[
-    Flag::new("manifest-path", None, Takes::Value, "PATH"),
-    Flag::new("lockfile-path", None, Takes::Value, "PATH"),
+    Flag::new("manifest-path", Some('m'), Takes::Value, "PATH"),
+    Flag::pointing(Some("path"), None, Points::Arg("--manifest-path")),
 ];
 /// `--reached` and `--ub*` are blaze's (extensions, opt-in): only the tests an edit reached run;
 /// the tests run in blaze's MIR evaluator, checked for undefined behavior (`hir-ty-ub`).
@@ -235,6 +252,11 @@ fn blaze_only(flag: &Flag) -> bool {
     matches!(flag.long, Some("reached" | "ub" | "ub-seed" | "ub-schedules"))
 }
 const RUNNING: &[Flag] = &[Flag::switch("no-run"), Flag::switch("no-fail-fast")];
+
+/// The flags clap's `conflicts_with` keeps apart (`arg_release`).
+fn conflicts(a: &Flag, b: &Flag) -> bool {
+    matches!((a.long, b.long), (Some("release"), Some("profile")) | (Some("profile"), Some("release")))
+}
 
 /// What blaze was asked.
 #[derive(Debug, PartialEq)]
@@ -266,7 +288,7 @@ pub enum DaemonVerb {
 pub struct Invocation {
     pub command: Option<Command>,
     /// The words before `--`, as typed, flags typed before the command first: cargo's to read.
-    /// None of `run`'s program arguments, nor blaze's own `--reached` and `--ub*`.
+    /// None of `run`'s program arguments, nor blaze's own `--reached` and `--ub*`, nor `-C`.
     pub args: Vec<String>,
     /// `test`'s and `bench`'s `TESTNAME`.
     pub filter: Option<String>,
@@ -275,6 +297,10 @@ pub struct Invocation {
     pub flags: Flags,
     /// `-h`/`--help` came before anything clap refuses: the command's help, and nothing else.
     pub help: bool,
+    /// `-C`'s directory, which the command changes to before anything else.
+    pub directory: Option<OsString>,
+    /// `-Z unstable-options` came before the command, where cargo looks for it to allow `-C`.
+    pub unstable_options: bool,
 }
 
 impl Invocation {
@@ -303,6 +329,27 @@ impl Invocation {
     }
 }
 
+/// What cargo's command refuses of a command line clap took, before it builds anything:
+/// `commands/test.rs`'s `--doc` with target selection or `--no-run`, and `run`'s glob
+/// patterns (`commands/run.rs` for packages, `ops::run` for targets, as `is_glob_pattern` sees
+/// one). cargo's code for each is 101.
+pub fn refused(asked: &Invocation) -> Option<String> {
+    let flags = &asked.flags;
+    let glob = |it: &str| it.contains(['*', '?', '[', ']']);
+    match asked.command() {
+        Command::Test if flags.doc && flags.targeted => Some("can't mix --doc with other target selecting options".to_owned()),
+        Command::Test if flags.doc && flags.no_run => Some("can't skip running doc tests with --no-run".to_owned()),
+        Command::Run => {
+            if let Some(pattern) = flags.packages.iter().find(|it| glob(it)) {
+                return Some(format!("`cargo run` does not support glob pattern `{pattern}` on package selection"));
+            }
+            let mut targets = flags.bins.iter().chain(&flags.examples).flatten();
+            targets.any(|it| glob(it)).then(|| "`cargo run` does not support glob patterns on target selection".to_owned())
+        }
+        _ => None,
+    }
+}
+
 /// The flags the client reads itself, or puts in `Targets`.
 #[derive(Debug, PartialEq, Default)]
 pub struct Flags {
@@ -320,6 +367,8 @@ pub struct Flags {
     /// Each `--bin`, with its name when it has one.
     pub bins: Vec<Option<String>>,
     pub examples: Vec<Option<String>>,
+    /// Any of the target selection flags (cargo's `CompileFilter::is_specific`).
+    pub targeted: bool,
     pub message_format: Vec<String>,
     pub color: Option<String>,
     pub config: Vec<String>,
@@ -352,8 +401,15 @@ impl Flags {
             "release" => self.release = true,
             "profile" => self.profile = owned(),
             "target" => self.targets.extend(owned()),
-            "bin" => self.bins.push(owned()),
-            "example" => self.examples.push(owned()),
+            "bin" => {
+                self.targeted = true;
+                self.bins.push(owned());
+            }
+            "example" => {
+                self.targeted = true;
+                self.examples.push(owned());
+            }
+            "lib" | "bins" | "examples" | "test" | "tests" | "bench" | "benches" | "all-targets" => self.targeted = true,
             "message-format" => self.message_format.extend(owned()),
             "color" => self.color = owned(),
             "config" => self.config.extend(owned()),
@@ -381,24 +437,46 @@ impl Flags {
 /// A command line clap refuses, with what it says.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Usage {
-    pub command: Command,
+    /// `None` for the words before any command (cargo's own `cli`).
+    pub command: Option<Command>,
     pub said: Said,
+    /// What clap's usage line of the error names, as it had them when it refused.
+    pub used: Vec<Used>,
+}
+
+/// An argument the command line had when clap refused it: what its "smart usage" lists.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum Used {
+    Flag(&'static Flag),
+    /// `TESTNAME` or `BENCHNAME`.
+    Filter,
+    /// The arguments of `run`'s program, or after `--`.
+    Program,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Said {
-    Unknown { arg: String, similar: Option<String> },
+    /// No flag of the command, with clap's did-you-mean, and whether it says to pass it after `--`.
+    Unknown { arg: String, similar: Option<String>, trailing: bool },
+    /// A hidden flag cargo has only to point elsewhere.
+    Points { flag: &'static Flag },
     NoValue { flag: &'static Flag },
     BadValue { value: String, flag: &'static Flag },
     ExtraValue { value: String, flag: &'static Flag },
     /// A number clap's `value_parser` refuses, with why (`invalid digit found in string`).
     NotNumber { value: String, flag: &'static Flag, why: String },
+    /// A flag that takes one value, or none, given again.
+    Twice { flag: &'static Flag },
+    /// `flag`, then `with`, which clap's `conflicts_with` keeps apart.
+    Conflict { flag: &'static Flag, with: &'static Flag },
     NotUtf8,
 }
 
 /// The arguments after `blaze` (or after the `blaze` cargo passes `cargo-blaze`), read.
 pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
     let mut globals = Vec::new();
+    let mut directory = None;
+    let mut unstable_options = false;
     let mut words = words.into_iter();
     while let Some(word) = words.next() {
         let text = word.to_str().map(str::to_owned);
@@ -418,6 +496,16 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
                     None => Asked::Unknown("daemon".to_owned()),
                 });
             }
+            Some(other) if other.starts_with("-C") => {
+                let value = match other[2..].strip_prefix('=').unwrap_or(&other[2..]) {
+                    "" => words.next().filter(|it| it.to_str().is_none_or(|it| !it.starts_with('-'))),
+                    attached => Some(OsString::from(attached)),
+                };
+                let Some(value) = value else {
+                    return Err(Usage { command: None, said: Said::NoValue { flag: &DIRECTORY }, used: Vec::new() });
+                };
+                directory = Some(value);
+            }
             Some(other) if other.starts_with('-') && other.len() > 1 => {
                 // A global flag before the command, and its value when that is the next word.
                 let attached = match other.strip_prefix("--") {
@@ -425,17 +513,21 @@ pub fn parse(words: Vec<OsString>) -> Result<Asked, Usage> {
                     None => other.len() > 2,
                 };
                 let takes_next = !attached && global(other).is_some_and(|it| it.takes == Takes::Value);
+                let z = other.strip_prefix("-Z").map(|it| it.strip_prefix('=').unwrap_or(it));
+                unstable_options |= z == Some("unstable-options");
                 globals.push(word);
                 if takes_next && let Some(value) = words.next() {
+                    unstable_options |= z == Some("") && value == "unstable-options";
                     globals.push(value);
                 }
             }
             Some(name) => match Command::named(name) {
                 Some(command) => {
+                    let before = globals.len();
                     globals.extend(words);
-                    return command_line(command, globals).map(|it| match it.help {
+                    return command_line_after(command, globals, before).map(|it| match it.help {
                         true => Asked::Help(Some(command)),
-                        false => Asked::Cargo(Box::new(it)),
+                        false => Asked::Cargo(Box::new(Invocation { directory, unstable_options, ..it })),
                     });
                 }
                 None => match super::inspect::Inspected::named(name) {
@@ -463,11 +555,21 @@ fn global(word: &str) -> Option<&'static Flag> {
 
 /// The words after a build command, as clap reads them for it.
 pub fn command_line(command: Command, words: Vec<OsString>) -> Result<Invocation, Usage> {
-    let refused = |said| Usage { command, said };
+    command_line_after(command, words, 0)
+}
+
+/// [`command_line`] of `words` whose first `before` came before the command: cargo's globals,
+/// which clap reads into the parent command, so that they neither repeat nor show in the
+/// command's usage lines.
+fn command_line_after(command: Command, words: Vec<OsString>, before: usize) -> Result<Invocation, Usage> {
     let mut asked = Invocation { command: Some(command), ..Invocation::default() };
-    let mut words = words.into_iter().peekable();
+    let mut used: Vec<Used> = Vec::new();
+    let mut seen: Vec<&'static Flag> = Vec::new();
+    let refused = |said, used: &[Used]| Usage { command: Some(command), said, used: used.to_vec() };
+    let mut words = words.into_iter().enumerate().peekable();
     let mut ended = false;
-    while let Some(word) = words.next() {
+    while let Some((at, word)) = words.next() {
+        let parents = at < before;
         if word == "--" {
             ended = true;
             break;
@@ -476,10 +578,10 @@ pub fn command_line(command: Command, words: Vec<OsString>) -> Result<Invocation
             match command {
                 Command::Run => {
                     asked.program.push(word);
-                    run_program(&mut asked, &mut words);
+                    run_program(&mut asked, words.by_ref().map(|(_, it)| it));
                     break;
                 }
-                _ => return Err(refused(Said::NotUtf8)),
+                _ => return Err(refused(Said::NotUtf8, &[])),
             }
         };
         let text = text.to_owned();
@@ -487,122 +589,169 @@ pub fn command_line(command: Command, words: Vec<OsString>) -> Result<Invocation
             match command {
                 Command::Run => {
                     asked.program.push(word);
-                    run_program(&mut asked, &mut words);
+                    run_program(&mut asked, words.by_ref().map(|(_, it)| it));
                     break;
                 }
                 Command::Test | Command::Bench if asked.filter.is_none() => {
+                    used.push(Used::Filter);
                     asked.args.push(text.clone());
                     asked.filter = Some(text);
                     continue;
                 }
-                _ => return Err(refused(Said::Unknown { arg: text, similar: None })),
+                _ => return Err(refused(Said::Unknown { arg: text, similar: None, trailing: false }, &[])),
             }
         }
         let mut typed = vec![text.clone()];
+        let mut flags: Vec<(&'static Flag, Option<String>)> = Vec::new();
         if let Some(long) = text.strip_prefix("--") {
             let (name, attached) = match long.split_once('=') {
                 Some((name, value)) => (name, Some(value.to_owned())),
                 None => (long, None),
             };
             let Some(flag) = command.flag(|it| it.long == Some(name)) else {
-                return Err(refused(Said::Unknown { arg: format!("--{name}"), similar: similar(command, name) }));
+                let similar = similar(command, name);
+                if let Some(flag) = similar.and_then(|it| command.flag(|flag| flag.long == Some(it)))
+                    && !flag.hidden
+                    && !used.contains(&Used::Flag(flag))
+                {
+                    used.push(Used::Flag(flag));
+                }
+                let said = Said::Unknown {
+                    arg: format!("--{name}"),
+                    similar: similar.map(|it| format!("--{it}")),
+                    trailing: command.has_positionals(),
+                };
+                return Err(refused(said, &used));
             };
+            if flag.points.is_some() {
+                return Err(refused(Said::Points { flag }, &[]));
+            }
             let value = match (flag.takes, attached) {
                 (Takes::Switch | Takes::Count, Some(value)) => {
-                    return Err(refused(Said::ExtraValue { value, flag }));
+                    return Err(refused(Said::ExtraValue { value, flag }, &[]));
                 }
                 (Takes::Switch | Takes::Count, None) => None,
-                (Takes::Value | Takes::Optional | Takes::Equals, Some(value)) => Some(value),
-                (Takes::Value, None) => match next_value(&mut words) {
+                (Takes::Value | Takes::Optional, Some(value)) => Some(value),
+                (Takes::Value, None) => match next_value(&mut words, flag.hyphen) {
                     Some(value) => {
                         typed.push(value.clone());
                         Some(value)
                     }
-                    None => return Err(refused(Said::NoValue { flag })),
+                    None => return Err(refused(Said::NoValue { flag }, &[])),
                 },
                 (Takes::Optional, None) => {
-                    let value = next_value(&mut words);
+                    let value = next_value(&mut words, false);
                     typed.extend(value.clone());
                     value
                 }
-                (Takes::Equals, None) => None,
             };
             if flag.long == Some("help") {
                 return Ok(Invocation { command: Some(command), help: true, ..Invocation::default() });
             }
-            check_value(flag, value.as_deref()).map_err(refused)?;
-            asked.flags.read(flag, value.as_deref());
-            if !blaze_only(flag) {
-                asked.args.extend(typed);
-            }
-            continue;
-        }
-        // A cluster of short flags: `-rq`, `-vv`, `-j8`, `-pfoo`, `-p=foo`.
-        let shorts: Vec<char> = text[1..].chars().collect();
-        let mut at = 0;
-        while at < shorts.len() {
-            let c = shorts[at];
-            let Some(flag) = command.flag(|it| it.short == Some(c)) else {
-                return Err(refused(Said::Unknown { arg: format!("-{c}"), similar: None }));
-            };
-            at += 1;
-            if flag.long == Some("help") {
-                return Ok(Invocation { command: Some(command), help: true, ..Invocation::default() });
-            }
-            let rest: String = shorts[at..].iter().collect();
-            let rest = rest.strip_prefix('=').unwrap_or(&rest).to_owned();
-            let value = match flag.takes {
-                Takes::Switch | Takes::Count => None,
-                Takes::Value | Takes::Optional | Takes::Equals if !rest.is_empty() => {
-                    at = shorts.len();
-                    Some(rest)
+            check_value(flag, value.as_deref()).map_err(|said| refused(said, &[]))?;
+            flags.push((flag, value));
+        } else {
+            // A cluster of short flags: `-rq`, `-vv`, `-j8`, `-pfoo`, `-p=foo`.
+            let shorts: Vec<char> = text[1..].chars().collect();
+            let mut at = 0;
+            while at < shorts.len() {
+                let c = shorts[at];
+                let Some(flag) = command.flag(|it| it.short == Some(c)) else {
+                    let said = Said::Unknown { arg: format!("-{c}"), similar: None, trailing: command.has_positionals() };
+                    return Err(refused(said, &[]));
+                };
+                if flag.points.is_some() {
+                    return Err(refused(Said::Points { flag }, &[]));
                 }
-                Takes::Value => match next_value(&mut words) {
-                    Some(value) => {
-                        typed.push(value.clone());
-                        Some(value)
+                at += 1;
+                if flag.long == Some("help") {
+                    return Ok(Invocation { command: Some(command), help: true, ..Invocation::default() });
+                }
+                let rest: String = shorts[at..].iter().collect();
+                let rest = rest.strip_prefix('=').unwrap_or(&rest).to_owned();
+                let value = match flag.takes {
+                    Takes::Switch | Takes::Count => None,
+                    Takes::Value | Takes::Optional if !rest.is_empty() => {
+                        at = shorts.len();
+                        Some(rest)
                     }
-                    None => return Err(refused(Said::NoValue { flag })),
-                },
-                Takes::Optional => {
-                    let value = next_value(&mut words);
-                    typed.extend(value.clone());
-                    value
+                    Takes::Value => match next_value(&mut words, flag.hyphen) {
+                        Some(value) => {
+                            typed.push(value.clone());
+                            Some(value)
+                        }
+                        None => return Err(refused(Said::NoValue { flag }, &[])),
+                    },
+                    Takes::Optional => {
+                        let value = next_value(&mut words, false);
+                        typed.extend(value.clone());
+                        value
+                    }
+                };
+                check_value(flag, value.as_deref()).map_err(|said| refused(said, &[]))?;
+                flags.push((flag, value));
+            }
+        }
+        for (flag, value) in flags {
+            if !parents {
+                let again = seen.iter().any(|it| std::ptr::eq(*it, flag));
+                if again && !flag.many && flag.takes != Takes::Count {
+                    return Err(refused(Said::Twice { flag }, &[]));
                 }
-                Takes::Equals => None,
-            };
-            check_value(flag, value.as_deref()).map_err(refused)?;
+                if !again {
+                    seen.push(flag);
+                    if !flag.hidden {
+                        used.push(Used::Flag(flag));
+                    }
+                }
+            }
             asked.flags.read(flag, value.as_deref());
+            if blaze_only(flag) {
+                typed.clear();
+            }
         }
         asked.args.extend(typed);
     }
     if ended {
-        let rest: Vec<OsString> = words.collect();
+        let rest: Vec<OsString> = words.map(|(_, it)| it).collect();
         match command {
             Command::Build | Command::Check => {
                 if let Some(first) = rest.first() {
                     let arg = first.to_string_lossy().into_owned();
-                    return Err(refused(Said::Unknown { arg, similar: None }));
+                    return Err(refused(Said::Unknown { arg, similar: None, trailing: false }, &[]));
                 }
             }
-            _ => asked.program.extend(rest),
+            _ => {
+                used.push(Used::Program);
+                asked.program.extend(rest);
+            }
+        }
+    }
+    if asked.command == Some(Command::Run) && !asked.program.is_empty() && !used.contains(&Used::Program) {
+        used.push(Used::Program);
+    }
+    // clap's validator, once every word is read: the first flag given of a pair it keeps apart.
+    for (at, &flag) in seen.iter().enumerate() {
+        if let Some(&with) = seen.iter().skip(at + 1).chain(&seen[..at]).find(|it| conflicts(flag, it)) {
+            let used: Vec<Used> = used.iter().copied().filter(|it| *it != Used::Flag(with)).collect();
+            return Err(refused(Said::Conflict { flag, with }, &used));
         }
     }
     Ok(asked)
 }
 
-/// The next word as a flag's value, unless it is a flag itself.
-fn next_value(words: &mut std::iter::Peekable<std::vec::IntoIter<OsString>>) -> Option<String> {
-    let next = words.peek()?.to_str()?;
-    if next.starts_with('-') && next != "-" {
+/// The next word as a flag's value, unless it is a flag itself and the flag takes no such value.
+fn next_value(words: &mut std::iter::Peekable<impl Iterator<Item = (usize, OsString)>>, hyphen: bool) -> Option<String> {
+    let next = words.peek()?.1.to_str()?;
+    if !hyphen && next.starts_with('-') && next != "-" {
         return None;
     }
-    words.next()?.into_string().ok()
+    words.next()?.1.into_string().ok()
 }
 
 /// `run`'s program has the rest: once its first argument comes, clap reads no more flags
 /// (`trailing_var_arg`), and the first `--` among them is dropped.
-fn run_program(asked: &mut Invocation, words: &mut impl Iterator<Item = OsString>) {
+fn run_program(asked: &mut Invocation, words: impl Iterator<Item = OsString>) {
     let mut dropped = false;
     for word in words {
         if word == "--" && !dropped {
@@ -632,16 +781,13 @@ fn check_value(flag: &'static Flag, value: Option<&str>) -> Result<(), Said> {
         return Ok(());
     }
     let parts: Vec<&str> = match flag.long {
-        // `value_delimiter(',')` and `ignore_case(true)`.
+        // `value_delimiter(',')`.
         Some("message-format") => value.split(',').collect(),
         _ => vec![value],
     };
+    // Both of cargo's flags with possible values are `ignore_case(true)`.
     for part in parts {
-        let known = match flag.long {
-            Some("message-format") => flag.possible.iter().any(|it| it.eq_ignore_ascii_case(part)),
-            _ => flag.possible.contains(&part),
-        };
-        if !known {
+        if !flag.possible.iter().any(|it| it.eq_ignore_ascii_case(part)) {
             return Err(Said::BadValue { value: part.to_owned(), flag });
         }
     }
@@ -649,10 +795,10 @@ fn check_value(flag: &'static Flag, value: Option<&str>) -> Result<(), Said> {
 }
 
 /// clap's did-you-mean of a long flag: the command's flag most like `typed`, of a Jaro
-/// similarity over 0.7 (`clap_builder::parser::features::suggestions`).
-fn similar(command: Command, typed: &str) -> Option<String> {
+/// similarity over 0.7, hidden ones too (`clap_builder::parser::features::suggestions`).
+fn similar(command: Command, typed: &str) -> Option<&'static str> {
     let longs = command.flags().iter().flat_map(|it| it.iter()).filter_map(|it| it.long);
-    best(typed, longs).map(|it| format!("--{it}"))
+    best(typed, longs)
 }
 
 fn best<'a>(typed: &str, among: impl Iterator<Item = &'a str>) -> Option<&'a str> {
@@ -706,93 +852,146 @@ pub fn jaro(a: &str, b: &str) -> f64 {
     (m / a.len() as f64 + m / b.len() as f64 + (m - transpositions as f64) / m) / 3.0
 }
 
+/// clap's usage line of an error, after `Usage: `: with nothing `used`, the command and its
+/// placeholders (`write_help_usage`); else the command, each flag used once in the order it came,
+/// and the positionals (`write_smart_usage`). cargo's own, before any command, is its
+/// `override_usage`. In cargo's styles when `color`.
+fn usage_line(command: Option<Command>, used: &[Used], color: bool) -> String {
+    let paint = |style: &str, text: &str| say::paint(style, text, color);
+    let mut line = format!("{} ", paint(say::GOOD, "Usage:"));
+    let Some(command) = command else {
+        line.push_str(&format!(
+            "{} {}\n       {} {} {} {}",
+            paint(say::VALID, "cargo"),
+            paint(say::PLACEHOLDER, "[OPTIONS] [COMMAND]"),
+            paint(say::VALID, "cargo"),
+            paint(say::PLACEHOLDER, "[OPTIONS]"),
+            paint(say::VALID, "-Zscript"),
+            paint(say::PLACEHOLDER, "<MANIFEST_RS> [ARGS]..."),
+        ));
+        return line;
+    };
+    let mut pieces = vec![paint(say::VALID, command.usage())];
+    match used.is_empty() {
+        true => pieces.push(paint(say::PLACEHOLDER, "[OPTIONS]")),
+        false => pieces.extend(used.iter().filter_map(|it| match it {
+            Used::Flag(flag) => Some(flag.painted(color)),
+            Used::Filter | Used::Program => None,
+        })),
+    }
+    let filter = used.contains(&Used::Filter);
+    let program = used.contains(&Used::Program);
+    match command {
+        Command::Build | Command::Check => {}
+        Command::Run => pieces.push(paint(say::PLACEHOLDER, "[ARGS]...")),
+        Command::Test | Command::Bench => {
+            let name = if command == Command::Test { "TESTNAME" } else { "BENCHNAME" };
+            match filter {
+                true => pieces.push(paint(say::PLACEHOLDER, &format!("<{name}>"))),
+                false => pieces.push(paint(say::PLACEHOLDER, &format!("[{name}]"))),
+            }
+            let args = paint(say::PLACEHOLDER, "[ARGS]...");
+            match program {
+                true => pieces.push(format!("{} {args}", paint(say::VALID, "--"))),
+                false => pieces.push(format!("{} {args}{}", paint(say::VALID, "[--"), paint(say::VALID, "]"))),
+            }
+        }
+    }
+    line.push_str(&pieces.join(" "));
+    line
+}
+
 /// clap's text for a refused command line, in cargo's styles when `color`; clap's exit code
-/// for it in cargo is 1.
+/// for it in cargo is 1. Its layout is clap's `format_error_message`: the error, a blank line
+/// and each tip, a blank line and the usage, and `For more information`.
 pub fn refusal(usage: &Usage, color: bool) -> String {
     let paint = |style: &str, text: &str| say::paint(style, text, color);
     let error = paint(say::ERROR, "error:");
-    let more = format!("For more information, try '{}'.\n", paint(say::VALID, "--help"));
-    let usage_line = || {
-        let (literal, placeholders) = usage.command.usage();
-        let mut line = format!("{} {}", paint(say::GOOD, "Usage:"), paint(say::VALID, literal));
-        for placeholder in placeholders {
-            line.push(' ');
-            line.push_str(&paint(say::PLACEHOLDER, placeholder));
-        }
-        line
-    };
+    let more = format!("\n\nFor more information, try '{}'.\n", paint(say::VALID, "--help"));
+    let usage_line = |used: &[Used]| format!("\n\n{}", usage_line(usage.command, used, color));
     let possible = |flag: &Flag| {
         let values: Vec<String> = flag.possible.iter().map(|it| paint(say::VALID, it)).collect();
-        format!("  [possible values: {}]\n", values.join(", "))
+        format!("\n  [possible values: {}]", values.join(", "))
     };
+    let tip = paint(say::VALID, "tip:");
+    let similar = |kind: &str, it: &str| format!("\n\n  {tip} a similar {kind} exists: '{}'", paint(say::VALID, it));
     match &usage.said {
-        Said::Unknown { arg, similar } => {
-            let mut said = format!("{error} unexpected argument '{}' found\n", paint(say::WARN, arg));
-            match similar {
-                Some(similar) => {
-                    let tip = paint(say::VALID, "tip:");
-                    said += &format!("\n  {tip} a similar argument exists: '{}'\n", paint(say::VALID, similar));
+        Said::Unknown { arg, similar: like, trailing } => {
+            let mut said = format!("{error} unexpected argument '{}' found", paint(say::WARN, arg));
+            if let Some(like) = like {
+                said += &similar("argument", like);
+            }
+            if *trailing {
+                if like.is_none() {
+                    said.push('\n');
                 }
-                None if usage.command.has_positionals() => {
-                    let tip = paint(say::VALID, "tip:");
-                    let trailing = paint(say::VALID, &format!("-- {arg}"));
-                    said += &format!("\n  {tip} to pass '{}' as a value, use '{trailing}'\n", paint(say::VALID, arg));
-                }
+                let trailing = paint(say::VALID, &format!("-- {arg}"));
+                said += &format!("\n  {tip} to pass '{}' as a value, use '{trailing}'", paint(say::WARN, arg));
+            }
+            format!("{said}{}{more}", usage_line(&usage.used))
+        }
+        Said::Points { flag } => {
+            let mut said = format!("{error} unexpected argument '{}' found", paint(say::WARN, &flag.shown()));
+            match flag.points {
+                Some(Points::Arg(to)) => said += &similar("argument", to),
+                Some(Points::Says(what)) => said += &format!("\n\n  {tip} {what}"),
                 None => {}
             }
-            format!("{said}\n{}\n\n{more}", usage_line())
+            format!("{said}{}{more}", usage_line(&[]))
         }
         Said::NoValue { flag } => {
             let mut said = format!(
-                "{error} a value is required for '{}' but none was supplied\n",
+                "{error} a value is required for '{}' but none was supplied",
                 paint(say::WARN, &flag.shown())
             );
             if !flag.possible.is_empty() {
                 said += &possible(flag);
             }
-            format!("{said}\n{more}")
+            format!("{said}{more}")
         }
         Said::BadValue { value, flag } => {
             let mut said = format!(
-                "{error} invalid value '{}' for '{}'\n",
+                "{error} invalid value '{}' for '{}'",
                 paint(say::WARN, value),
                 paint(say::VALID, &flag.shown())
             );
             said += &possible(flag);
-            if let Some(similar) = best(value, flag.possible.iter().copied()) {
-                let tip = paint(say::VALID, "tip:");
-                said += &format!("\n  {tip} a similar value exists: '{}'\n", paint(say::VALID, similar));
+            if let Some(like) = best(value, flag.possible.iter().copied()) {
+                said += &similar("value", like);
             }
-            format!("{said}\n{more}")
+            format!("{said}{more}")
         }
         Said::ExtraValue { value, flag } => format!(
-            "{error} unexpected value '{}' for '{}' found; no more were expected\n\n{}\n\n{more}",
+            "{error} unexpected value '{}' for '{}' found; no more were expected{}{more}",
             paint(say::WARN, value),
             paint(say::VALID, &flag.shown()),
-            usage_line()
+            usage_line(&[])
         ),
         Said::NotNumber { value, flag, why } => format!(
-            "{error} invalid value '{}' for '{}': {why}\n\n{more}",
+            "{error} invalid value '{}' for '{}': {why}{more}",
             paint(say::WARN, value),
             paint(say::VALID, &flag.shown())
         ),
-        Said::NotUtf8 => format!(
-            "{error} invalid UTF-8 was detected in one or more arguments\n\n{}\n\n{more}",
-            usage_line()
+        Said::Twice { flag } => format!(
+            "{error} the argument '{}' cannot be used multiple times{}{more}",
+            paint(say::WARN, &flag.shown()),
+            usage_line(&[])
         ),
+        Said::Conflict { flag, with } => format!(
+            "{error} the argument '{}' cannot be used with '{}'{}{more}",
+            paint(say::WARN, &flag.shown()),
+            paint(say::WARN, &with.shown()),
+            usage_line(&usage.used)
+        ),
+        Said::NotUtf8 => format!("{error} invalid UTF-8 was detected in one or more arguments{}{more}", usage_line(&[])),
     }
 }
 
 /// `blaze <command> --help`: the command's flags as this client reads them.
 pub fn help(command: Command) -> String {
-    let (literal, placeholders) = command.usage();
-    let mut said = format!(
-        "{}: cargo's `{}`, built by blaze's daemon\n\nUsage: {literal} {}\n\nOptions:\n",
-        command.name(),
-        command.name(),
-        placeholders.join(" ")
-    );
-    for flag in command.flags().iter().flat_map(|it| it.iter()) {
+    let usage = usage_line(Some(command), &[], false);
+    let mut said = format!("{}: cargo's `{}`, built by blaze's daemon\n\n{usage}\n\nOptions:\n", command.name(), command.name());
+    for flag in command.flags().iter().flat_map(|it| it.iter()).filter(|it| !it.hidden) {
         let line = match (flag.short, flag.long) {
             (Some(short), Some(_)) => format!("  -{short}, {}\n", flag.shown()),
             _ if flag.long.is_some() => format!("      {}\n", flag.shown()),

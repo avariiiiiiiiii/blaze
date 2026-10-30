@@ -67,6 +67,7 @@ derived `Eq`/`Hash` exactly: persist encodes them and `from_parts`/`from_words`/
 move onto the frame.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): C1 to C14 below, on top of dedup's `blaze_ids::bits` change (kept).
 
 ### C1. Imports (lines 11 to 29)
 
@@ -109,6 +110,7 @@ use rustc_hash::FxBuildHasher;
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): imports are `blaze_ids::bits::{BitSet, Bits, Ranked}` (dedup's, `radix` gone with C8), `blaze_mem::Frame` (no `scratch`: `VarSet` is gone, see C12), `la_arena::{Idx, RawIdx}`, no `rustc_hash` (the hasher is in `lib.rs`'s aliases), and `pub(crate) use crate::{FrameMap, FrameSet, frame_map, frame_set};`.
 
 ### C2. Frame maps, and `dense` (lines 112 to 132)
 
@@ -196,6 +198,7 @@ fn dense_in<K: DenseKey, V>(
 moves it without a realloc, and `ranks` is `with_capacity(words.len())`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): the aliases are the re-export of `lib.rs`'s (mem-db-infer.md section 5), not defined here; `set_bit` was already gone (dedup: `BitSet::insert_growing`), so `presence_of` writes its exact-length words through `BitSet::from_words(vec![0; n]).insert`; `Presence` is dedup's `Ranked` wrapper, whose `from_words` boxes the `Vec` without a realloc.
 
 ### C3. `DenseMap` (new, after `dense_in`)
 
@@ -275,6 +278,7 @@ impl<K: DenseKey + fmt::Debug, V: fmt::Debug> fmt::Debug for DenseMap<'_, K, V> 
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): as written, with C14's `Debug` body.
 
 ### C4. `TyColumn::from_entries` (lines 150 to 166)
 
@@ -336,6 +340,7 @@ impl<K: DenseKey> TyColumn<K> {
 `tys.drain(..)` is `TrustedLen`, so the `Box` is made at its length.)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): as written; `from_parts`' doc links name `from_dense` (the test-only `from_entries` would be a broken link).
 
 ### C5. `IndexColumn::from_entries` (lines 257 to 268)
 
@@ -378,6 +383,7 @@ impl<K: DenseKey, V> IndexColumn<K, V> {
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): applied to dedup's `BitSet::insert_growing` form of the old body; same result.
 
 ### C6. `ExprOrPatMap` (lines 353 to 393)
 
@@ -439,6 +445,7 @@ after:
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): as written (no `Default`, so persist's decoder takes P's `ExprOrPatMap::new_in(frame)`).
 
 ### C7. `FieldColumn::from_entries` (lines 410 to 439)
 
@@ -488,6 +495,7 @@ and after the function:
 so the tags never ended in `FIELD_NONE`; `used` keeps that.)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): as written.
 
 ### C8. `CsrBuilder` (lines 631 to 780)
 
@@ -633,6 +641,7 @@ items were the builder's `Vec` boxed (a shrink realloc when it had slack); now t
 once from the frame at their length.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): applied to dedup's form of `freeze` (its words a `BitSet`): the exact-length words are `BitSet::from_words(vec![0; n])` with `insert`; otherwise as written.
 
 ### C9. `IdxSet`, `ExprOrPatSet` and their frame forms (lines 782 to 897)
 
@@ -725,6 +734,7 @@ impl<'f> FrameExprOrPatSet<'f> {
 impl use them. Its `words: Vec<u64>` stays a `Vec`, as persist decodes it.)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): `IdxSet`'s words are dedup's `BitSet` now (still a `Vec<u64>` inside); `FrameIdxSet`'s are `Bits<Vec<u64, &'f Frame>>`, so `insert`/`contains`/`is_empty` are `blaze_ids::bits`' own, and `freeze` makes `BitSet::from_words(words[..used].to_vec())`. Names and signatures as written.
 
 ### C10. `ModeColumn::from_entries` (lines 940 to 944)
 
@@ -753,6 +763,7 @@ After (a slice iterator is `TrustedLen`, so the `Box` is made at its length):
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): as written.
 
 ### C11. `SortedMap::from_entries` (lines 997 to 1004)
 
@@ -791,6 +802,7 @@ After:
 allocates nothing.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): as written, with `// alloc:` on the owned copy.
 
 ### C12. `VarSet` (lines 1091 to 1117)
 
@@ -829,6 +841,7 @@ impl VarSet {
 `u64` buffers gets a new one, which goes on the shelf when dropped.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> not applied by db-mem-infer-a-columns (21:28): `VarSet` is gone from `columns.rs` (dedup bits: `unify.rs`' `diverging_type_vars` and `fallback.rs`' `diverging_roots` are `blaze_ids::bits::BitSet<u32>` now). Its rule (a lent `scratch` buffer, R2) would now land on those two `BitSet<u32>` sites in `unify.rs`/`fallback.rs`, not this file; handed to db-mem-infer-a.
 
 ### C13. Tests (`mod tests`, line 1120 on)
 
@@ -996,6 +1009,7 @@ reserves more keys than it writes, so a trailing run of empty slots, absent rang
 which inference's `reserve_nodes` leaves, is shown not to reach the columns.)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-a-columns (21:28): 1, 2, 4 applied (no `set_bit` to move: the `before` builders use `BitSet::insert_growing`, as dedup's old builders did; "made at its length" checks `frozen.words.into_words()`'s capacity, `IdxSet`'s words being a `BitSet`; `reserve_keys_for_test` is `self.words.grow(len)`); 3 not needed, `var_set_lists_what_it_holds` already tests dedup's `BitSet<u32>`.
 
 ### C14. `DenseMap`: the rest of `ArenaMap`'s API (after C3's `slots_mut`)
 
@@ -1050,6 +1064,8 @@ impl<'f, K: DenseKey, V: Clone> DenseMap<'f, K, V> {
 (the test then freezes `dense_rows`, whose `get_mut` changed key 7 as `rows`' did, against
 `before::index_column(rows)`, so move the three `from_dense` assertions after these lines.)
 
+> applied by db-mem-infer-a-columns (21:28): as written; the test also compares `contains_idx` with `ArenaMap`'s.
+
 ## A. `infer.rs`
 
 Lines as of 2026-10-29 20:50 (UTC-7); the file moves while others edit it, so each entry quotes
@@ -1091,6 +1107,8 @@ crates/hir-ty/src` on 2026-10-29), so one edit covers all files:
    `InferenceContextAutoderefCtx<'a, 'db, 'f>` (mem-db-infer-expr X3),
    `infer/closure/analysis/expr_use_visitor.rs:409, 422` `ExprUseVisitor`'s `cx`.
 5. The free fn `infer_finalize` (`infer.rs:254`): A2.
+
+> applied by db-mem-infer-a-ctx (21:36): `infer.rs`'s lines (the impl header, `infer_finalize`, the nested fn's `ctx`, `rvalue_hint`); the other files' lines are their holders' (`method_resolution.rs`, `confirm.rs`, `path.rs`, `mutability.rs`, `prelude_lints.rs` still had `InferenceContext<'db>` at 21:36).
 
 ### A1. Imports (lines 40 to 125)
 
@@ -1138,6 +1156,8 @@ use blaze_mem::Frame;
             SortedMap, TyColumn, frame_map, frame_set,
         },
 ```
+
+> applied by db-mem-infer-a-ctx (21:36): also `Hasher`, `FxIndexMap` and `SmallVec` left (closure X2 removed their last uses); `ThinVec` stays (`CaptureSourceStack`).
 
 ### A2. The query functions, their frame and tags (lines 132 to 285, 1557 to 1576)
 
@@ -1306,6 +1326,8 @@ pub(crate) fn infer_anon_const_body_query<'db>(
 The cycle results (`infer_cycle_result`, `infer_anon_const_cycle_result`) build
 `InferenceResult::new`, every column empty: no allocation, no frame.
 
+> applied by db-mem-infer-a-ctx (21:36): as written, with `mem_tag = Infer` (bare variant) in place of `crate::db::INFER_TAG`; `infer_body_in(db, def, inspect, lowering_mode, frame)` as written.
+
 ### A3. `InferenceTables<'db, 'f>` (lines 1060 to 1244)
 
 R5. Before: the struct as quoted at `pub(crate) struct InferenceTables<'db> {` (with
@@ -1469,6 +1491,8 @@ through its end. After:
 (The five `shrink_to_fit` calls are gone: the `FrameIdxSet`s' `freeze` copies their words once at
 their length, C9.)
 
+> applied by db-mem-infer-a-ctx (21:36): plus the new table `unstable_candidates` (`ExprOrPatMap<'f, Box<[(CandidateId, Symbol)]>>`, `ExprOrPatMap::new_in(frame)`, frozen as before), which the file gained after A3 was written.
+
 ### A4. `InferenceContext<'db, 'f>` and `BreakableContext<'db, 'f>` (lines 1838 to 1936)
 
 Before: the struct from `pub(crate) struct InferenceContext<'db> {` to
@@ -1561,6 +1585,8 @@ Its one caller outside this file, `infer/expr.rs:1736`
 `TupleId(self.tuple_field_accesses_rev.insert_full(substs).0 as u32)` (mem-db-infer-expr's file),
 becomes `TupleId(self.tuple_field_accesses_rev.insert(substs))`.
 
+> applied by db-mem-infer-a-ctx (21:36): as written (the old `block_traits` was a `RefCell<(Option<ModuleId>, bool, Rc<FxHashSet>)>` by then; replaced the same). The `traits_in_scope`/`block_traits` fields are subject to A10's outcome.
+
 ### A5. `InferenceContext::new` (lines 1938 to 1986)
 
 Before: the signature ending `lowering_mode: LoweringMode,\n    ) -> Self {` and the struct literal
@@ -1624,6 +1650,8 @@ impl<'db, 'f> InferenceContext<'db, 'f> {
 
 `traits_in_scope_into` taking any `Extend<TraitId>` is entry D1 (hir-def, below); it fills the
 set as `Resolver::traits_in_scope` filled its `FxHashSet` (same calls, same order).
+
+> applied by db-mem-infer-a-ctx (21:36): as written.
 
 ### A6. `merge` (lines 1988 to 2082)
 
@@ -1695,6 +1723,8 @@ key types `ExprId`, `PatId`, `BindingId`, `TypeRefId` themselves `DenseKey`s, wh
 `FrameExprOrPatSet::insert`, C9. `self.defined_anon_consts.borrow_mut().extend(..)` and
 `self.unreachable.extend(..)` are frame `Vec`s now and unchanged.)
 
+> applied by db-mem-infer-a-ctx (21:36): as written; the new `unstable_candidates` loop compiles as it is.
+
 ### A7. `merge_anon_consts` (lines 2113 to 2127)
 
 Before:
@@ -1709,6 +1739,8 @@ After (the rest unchanged; `append` moves between two frame `Vec`s):
         let mut defined_anon_consts =
             std::mem::replace(&mut *self.defined_anon_consts.borrow_mut(), Vec::new_in(self.frame));
 ```
+
+> applied by db-mem-infer-a-ctx (21:36): as written.
 
 ### A8. `resolve_all` (lines 2129 to 2266)
 
@@ -1828,6 +1860,8 @@ lists are built by pushing; when mem-db-infer-closure's entries build each at it
 entry deletes these lines (with `dummy_place`'s `projections: Vec::new()`, which allocates
 nothing). Told to mem-db-infer below.
 
+> applied by db-mem-infer-a-ctx (21:36): as written, then closure X3 over the closure-data loop (mem-db-infer.md section 6 item 2): the `shrink_to_fit` lines are gone, `dummy_place` has `projections: Box::default()`.
+
 ### A9. `with_ty_lowering` and `resolve_variant` (lines 2445 to 2465, 2750 to 2775)
 
 R2 and mem-db-infer-lower's table (its `infer/diagnostics.rs` rows): the lowering context takes
@@ -1869,6 +1903,8 @@ LifetimeLoweringMode::LateParam,\n        );` gains `self.frame,` after
 `LifetimeLoweringMode::LateParam,` the same way. (`TyLoweringContext` here is the
 `InferenceTyLoweringContext as TyLoweringContext` import; the closures callers pass infer the
 lifetimes.)
+
+> applied by db-mem-infer-a-ctx (21:36): as written (`resolve_variant` takes `path: Path<'_>` now, db-apply-ty's; the call's new last argument is the same).
 
 ### A10. `get_traits_in_scope` (lines 3107 to 3131)
 
@@ -1920,12 +1956,18 @@ reused `Rc` set's was, which already varied with what the previous block held; o
 an ambiguity's candidate sources depends on it.) Its caller, `method_resolution.rs:194`
 `with_method_resolution`, is entry M1.
 
+> superseded, applied otherwise by db-mem-infer-a-ctx (21:45): frontend-fast-method's `TraitsInScope` (`method_resolution/scope_sets.rs`, docs/v2/plan/lanes/frontend/fast-method.md section 7) replaces the body's set: `with_method_resolution` passes `TraitsInScope::of_resolver(self.db, &self.resolver)` (written by frontend-fast-method), so `infer.rs`'s `traits_in_scope`, `block_traits` and `get_traits_in_scope` are deleted (A4 and A5's lines for them with it, and `Cell`'s import). `sized_bound.rs`' all-traits probe moves to `TraitsInScope::Set(TraitSet::new(..))` (handed to db-mem-infer-a-small).
+
+> superseded, applied otherwise by db-mem-infer-a-ctx (21:45): frontend-fast-method's `TraitsInScope` (`method_resolution/scope_sets.rs`, docs/v2/plan/lanes/frontend/fast-method.md section 7) replaces the body's set: `with_method_resolution` passes `TraitsInScope::of_resolver(self.db, &self.resolver)` (written by frontend-fast-method), so `infer.rs`'s `traits_in_scope`, `block_traits` and `get_traits_in_scope` are deleted (A4 and A5's lines for them with it, and `Cell`'s import). `sized_bound.rs`' all-traits probe moves to `TraitsInScope::Set(TraitSet::new(..))` (handed to db-mem-infer-a-small).
+
 ### A11. The two context helpers of mem-db-infer-expr's X1 and X4
 
 Taken as written there: `write_expr_adj(&mut self, expr: ExprId, adjustments: &[Adjustment])`
 (X1), `record_deferred_call_resolution(&mut self, closure_def_id: ExprId, r:
 DeferredCallResolution<'db, 'f>)` and `remove_deferred_call_resolutions` returning
 `Vec<DeferredCallResolution<'db, 'f>, &'f Frame>` (X4).
+
+> applied by db-mem-infer-a-ctx (21:36): `write_expr_adj` (X1), `record_deferred_call_resolution` and `remove_deferred_call_resolutions` (X4) as written there.
 
 ### A12. Tests (`mod tests` at the end of `infer.rs`)
 
@@ -1957,6 +1999,8 @@ Add, after the existing tests:
 change here (tables, freeze, traits in scope, write-back) are held by hir-ty's inference tests
 (`crates/hir-ty/src/tests/`) and persist's round trips, which compare whole results; C13's test
 holds the columns byte for byte against the old builders.
+
+> applied by db-mem-infer-a-ctx (21:36): as written, with closure X2's `min_captures_split_their_block_by_root` in the same module (`use super::*;`), in place of the two `hash_unordered` tests.
 
 ### A13. Since A was written: `value_resolutions` and `infer/sized_bound.rs`
 
@@ -2068,6 +2112,11 @@ after (the `for &krate in all_crates(db)` loop unchanged):
 in the frame. `push_illegal_sized_bound`'s `candidates` `collect()` and `Box::from([it])` are the
 diagnostic's own list, on an error path: unchanged.)
 
+> applied by db-mem-infer-a-small (21:26): `infer/sized_bound.rs` items 1 to 3, with one difference: `TraitId` and `AssocItemId` stay imported (the file's new `has_value_item` closure uses them); `Either` and `FxHashSet` go. Compiles once A10 (`get_traits_in_scope` returning the frame set), M1 (`TraitsInScope`) and method P1 (`MethodResolutionContext::frame`) land.
+> superseded for item 3 (db-mem-infer-a-small, 21:50): frontend-fast-method's `TraitsInScope::Set(TraitSet::new(&mut traits))` (section at the end of this file) replaced the frame-set clone and `TraitsInScope::Inference`; `frame: self.frame` stays. The file no longer calls `get_traits_in_scope`.
+
+> applied by db-mem-infer-a-ctx (21:36): the `value_resolutions` part was already in A3's form (the file had it); `infer/sized_bound.rs` is db-mem-infer-a-small's.
+
 ## B. `infer/diagnostics.rs`
 
 Lines as of 2026-10-29 21:00 (UTC-7). R2 and mem-db-infer-lower's section 22 (its two
@@ -2077,6 +2126,7 @@ entry for `TyLoweringContext`'s fields). The two structs here hold the inference
 by `&mut`/`&RefCell`, both invariant, so they gain the `'f` of those tables.
 
 > forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+> applied by db-mem-infer-a-small (21:47): B1 to B4, on the tree as dedyn-ty left it (the `TyLoweringInferVarsCtx` impl gone, `with_inference_vars` concrete) and with `v2/requests/db-ty.md`'s dedyn outcome (db-ty-next3): `InferenceTyLoweringContext` also keeps `type_of_type_placeholder: &'a mut DenseMap<'f, TypeRefId, StoredTy>`, taken from the vars context in `new` (which calls `.with_inference_vars(&mut **table)`), and its `Drop` drains `ctx.type_placeholders` into it. `blaze_mem::Frame` imported after `base_db` (alphabetical). Needs from `lower.rs` (db-mem-infer-b-lower, told): `with_inference_vars(self, table: &'a mut InferenceTable<'db>)` and the `type_placeholders` frame list.
 
 ### B1. Imports (lines 17 to 31)
 
@@ -2291,6 +2341,7 @@ field of `InferenceContext` and is moved into `WriteBackCtxt`, and its only buff
 are an error-path list and the diverging set.
 
 > forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+> applied by db-mem-infer-a-small (21:26): U1, U4 to U7 as written. U2: `VarSet` is gone (dedup-bits-db's `db.md` columns section, part 2, which I applied with it), so `diverging_type_vars` was first `BitSet<u32>`; then (21:52, the parent's call) C12's goal against it: the field is a private `scratch::Lent<Vec<u64>>` (`scratch::lend_u64s()`), `set_diverging` grows it with `words_for` and inserts through `BitSliceMut::<u32>::from_words`, and `diverging_type_vars()` hands fallback a `BitSlice<'_, u32>` (a `Lent` is not `Words`, so views over its slice); the `// alloc:` on `trait_errors` as written. U3 and U8: no change. The `infer.rs` callers (`WriteBackCtxt::new(.., frame)`, `resolve_diagnostics` returning `Box<[_]>`) are A8's.
 
 ### U1. Imports (lines 12 and 13)
 
@@ -2697,6 +2748,7 @@ Per body with unsolved variables (every body with an integer literal of no other
 coercion, or `Default::default()`-like calls resolved late).
 
 > forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+> applied by db-mem-infer-a-small (21:26): E1 to E3, with one difference: `VarSet` had become `BitSet::<u32>::default()` (dedup-bits-db), so E1 drops `columns::VarSet` and keeps `blaze_ids::bits::Bits`, and E3's `diverging_roots` is frame words, `Bits::<_, u32>::from_words(Vec::<u64, _>::new_in(self.frame))` (its `insert_growing` and `contains` unchanged).
 
 ### E1. Imports (lines 3 to 13)
 
@@ -2804,6 +2856,7 @@ the whole change to this file; taken as written there. `autoderef` and `autodere
 build the solver-side `Autoderef` (mem-db-infer-method's `autoderef.rs`) and allocate nothing here.
 
 > forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+> applied by db-mem-infer-a-small (21:26): X2 as written. Callers told by tmux: `method_resolution/confirm.rs` (db-mem-infer-b), `infer/{expr,callee,place_op}.rs` (db-mem-infer-a-expr); `coerce.rs` already passes `self.frame`.
 
 ## G. The small files: `ambiguity.rs`, `at_error.rs`, `mutability.rs`, `opaques.rs`, `path.rs`
 
@@ -2814,16 +2867,22 @@ build the solver-side `Autoderef` (mem-db-infer-method's `autoderef.rs`) and all
 Line 5 header only (A0). `take_ambiguity_errors`' lists are U8's error path; `ambiguity_diagnostics`
 (`solver_errors.rs`, mem-db-infer-eval's) runs only when there is an ambiguity.
 
+> applied by db-mem-infer-a-small (21:26): the header.
+
 ### G2. `infer/at_error.rs`
 
 Line 15 header only (A0). Its `Box::new((expected.store(), found.store()))` is an error's own pair,
 already `// alloc:`; `type_at_error` (new) allocates nothing (a fold of interned types).
+
+> applied by db-mem-infer-a-small (21:26): the header.
 
 ### G3. `infer/mutability.rs`
 
 Line 16 header only (A0). The walk allocates nothing: `self.result.expr_adjustments.get_mut(&tgt_expr)`
 is C8's `CsrBuilder::get_mut` and `self.result.type_of_expr[tgt_expr]` C3's `Index`, as they were
 for `CsrBuilder` and `ArenaMap`.
+
+> applied by db-mem-infer-a-small (21:36): the header (db-apply-ty's report has its sections there done).
 
 ### G4. `infer/path.rs`
 
@@ -2864,12 +2923,16 @@ after (B4's third lifetime):
 the probe takes the name by value, and the second is an error's, already `// clone:`.
 `resolve_projections_within` is U4.
 
+> applied by db-mem-infer-a-small (21:36): as written (header, `self.frame` last to `InferenceTyLoweringContext::new`, `drop_ctx`'s third lifetime).
+
 ### G5. `infer/opaques.rs`
 
 Lines 15 and 66, headers only (A0). `handle_opaque_type_uses`' `clone_opaque_types()` is the
 solver's list (`next_solver/infer/mod.rs:958`, already `// alloc:`: once per body, none without an
 opaque type; S2 below), moved into `compute_definition_site_hidden_types`, which resolves it in
 place. `self.result.type_of_opaque.insert(..)` is A3's `FrameMap`.
+
+> applied by db-mem-infer-a-small (21:26): both headers.
 
 ## P. `infer/persist.rs`
 
@@ -2888,6 +2951,14 @@ opens `blaze_mem::frame::task(crate::db::INFER_TAG, ..)`; a call inside a query'
 deeper, and resets only its own memory.
 
 > forwarded to db (db-ty-next2) (requests, pass 20; told by tmux).
+
+> applied by db-mem-infer-a-persist (21:58): P1 to P7 as written, plus the same rule on code lane db
+> added since: `unstable_candidates`' map (`ExprOrPatMap::new_in(frame)`) and its candidate lists
+> (`exact`), `TraitUnimplemented::parent_impls` (`exact`), and db-ty-d-infer2's test
+> `every_cause_and_parent_impl_round_trips` (`Sink::new()`, its `Source` in a task). P1 also adds
+> `BindingId` (X4's `seen` set is typed by it). P7.1 differs in form only: `result()` is
+> `frame::task(INFER_TAG, result_in)` and the body moved unchanged into `fn result_in(frame: &Frame)`,
+> so no 110-line reindent.
 
 ### P1. Imports (lines 11 to 70)
 
@@ -3478,10 +3549,16 @@ TraitsInScope::Caller(&traits_in_scope),`; in `crates/hir/src/lib.rs` (line 100)
 Tests: `crates/hir-ide/src/tests/method_resolution.rs` (the inference path) and the
 `crates/hir/src/tests/` attribute and method-candidate tests (the caller path), unchanged.
 
+> superseded (db-mem-infer-a-ctx, 21:45): frontend-fast-method's `TraitsInScope` (`Scope { module, impl_trait }` / `Set(TraitSet)`) replaces this enum; no `TraitsInScope<'a>` was added. `method_resolution.rs`'s lines (with P1's `frame`) are frontend-fast-method's and in. `crates/hir`: `attrs.rs` passes `TraitsInScope::Set(TraitSet::collect(traits_in_scope.iter().copied()))` (applied); `lib.rs` `with_method_resolution` the same (see the report `/tmp/blaze-lanes/v2-db-mem-infer-a-ctx.md` for whether it is in).
+
+> superseded (db-mem-infer-a-ctx, 21:45): frontend-fast-method's `TraitsInScope` (`Scope { module, impl_trait }` / `Set(TraitSet)`) replaces this enum; no `TraitsInScope<'a>` was added. `method_resolution.rs`'s lines (with P1's `frame`) are frontend-fast-method's and in. `crates/hir`: `attrs.rs` passes `TraitsInScope::Set(TraitSet::collect(traits_in_scope.iter().copied()))` (applied); `lib.rs` `with_method_resolution` the same (see the report `/tmp/blaze-lanes/v2-db-mem-infer-a-ctx.md` for whether it is in).
+
 ### D1. mem-db-def-resolve (`Resolver::traits_in_scope_into`)
 
 Already filed as written there (`v2/requests/mem-db-def-resolve.md:358`): it takes any
 `Extend<TraitId>`. A5 fills the run's `FrameSet` with it; nothing more is needed.
+
+> applied by db-mem-infer-a-ctx (21:36): note only; A5 calls `traits_in_scope_into` (present in `resolver.rs:907`).
 
 ### S1, S2. mem-db-solver (notes, no change asked)
 
@@ -3490,6 +3567,8 @@ S1: `InferCtxt::unresolved_root_variables` (`next_solver/infer/mod.rs:664`) retu
 `clone_opaque_types` (line 958) is one global `Vec` per body with an opaque type. Both are the
 solver's recycled-storage decision; if it gives them an `impl Extend` form, E2 and G5 pass the
 frame list instead.
+
+> applied by db-mem-infer-a-ctx (21:36): notes only, nothing to apply.
 
 ### N1. mem-db-infer (notes)
 
@@ -3500,6 +3579,8 @@ frame list instead.
    to `lib.rs` and C2 re-exports them. Same types, so either is a path change only.
 2. A8 keeps `resolve_all`'s `shrink_to_fit` on the closure data until mem-db-infer-closure's X3
    builds each list at its length; whoever lands second deletes them.
+
+> applied by db-mem-infer-a-ctx (21:36): notes; item 2 done (closure X3 deleted the `shrink_to_fit` lines with A8).
 
 ## What allocates after this, in these files
 
@@ -3637,3 +3718,63 @@ their "before" code, so they still apply.
    each condition is unchanged.
 
 > forwarded to db (db-ty-next2) (requests, pass 21; told by tmux).
+> outcome (db-ty-next2, 21:20): item 1 goes to db-mem-infer-a with A0 (see A's line). Item 2
+> needs no edit. Item 3 is not applied: `crates/intern/src/symbol/symbols.rs` has neither
+> `from_iter` nor `FromIterator`, so the swap would not compile. The two symbols are requested
+> in `v2/requests/db-ty.md` `## db-ty-next2: two pre-interned symbols`, and db-ty applies the
+> `prelude_lints.rs` half once they land.
+> applied (db-ty-next2, 21:31): item 3 is in, now that the symbols have landed.
+> applied by db-mem-infer-a-small (21:50): item 1's `prelude_lints.rs` header (the file unchanged for 15 minutes, db-ty-d-infer2 in `persist.rs`; asked by tmux at 21:27). `sized_bound.rs`'s is A13's.
+
+## frontend-fast-method: yes to A10/M1's split; `sized_bound.rs` and `crates/hir` on `TraitsInScope` (2026-10-29)
+
+Yes to the plan in your report (21:38). Applied in my files: `method_resolution.rs` re-exports
+`scope_sets::{TraitSet, TraitsInScope}`; `MethodResolutionContext::traits_in_scope` is
+`TraitsInScope` (a `Copy` value, not a borrow); `with_method_resolution` builds it with
+`TraitsInScope::of_resolver(self.db, &self.resolver)` and `frame: self.frame` (P1); the impl
+header is `impl<'db, 'f> InferenceContext<'db, 'f>`; the X1 caller is
+`self.write_expr_adj(receiver, &result.adjustments);`. `confirm.rs` has C1 and C2. There is no
+`TraitsInScope::Inference`: the enum is `Scope { module, impl_trait }` / `Set(TraitSet)`.
+
+1. `crates/hir-ty/src/infer/sized_bound.rs` `probe_all_traits`. Before:
+
+```rust
+        let db = self.db;
+        // A clone keeps the set's table, so the probe walks the traits in scope as before.
+        // clone: the error path's set of every trait with an item of the name, in the frame.
+        let mut traits = self.get_traits_in_scope().clone();
+        for &krate in all_crates(db).iter() {
+```
+
+After:
+
+```rust
+        let db = self.db;
+        // alloc: the error path's set of every trait with an item of the name, interned once.
+        let mut traits: Vec<TraitId> =
+            TraitsInScope::of_resolver(db, &self.resolver).all(db).collect();
+        for &krate in all_crates(db).iter() {
+```
+
+and `traits_in_scope: TraitsInScope::Inference(&traits),` becomes
+`traits_in_scope: TraitsInScope::Set(TraitSet::new(&mut traits)),` (`TraitSet::new` sorts and
+dedups in place). Imports: `TraitSet` next to `TraitsInScope` in the `method_resolution::{..}`
+list, and `hir_def::TraitId` if not imported. Why: same set as `get_traits_in_scope` (module
+scopes with blocks, prelude, the impl's trait), with no body-held set.
+
+2. `crates/hir/src/attrs.rs` (~547-560): `let traits_in_scope = resolver.traits_in_scope(db);`
+stays; `traits_in_scope: &traits_in_scope,` becomes
+`traits_in_scope: TraitsInScope::Set(TraitSet::collect(traits_in_scope.iter().copied())),`,
+and the import line 25 gains `TraitSet, TraitsInScope`. (The resolver's own set, not
+`of_resolver`: a doc link has no impl's trait in scope, as today.)
+
+3. `crates/hir/src/lib.rs` `Type::with_method_resolution` (~5846): `traits_in_scope,` becomes
+`traits_in_scope: TraitsInScope::Set(TraitSet::collect(traits_in_scope.iter().copied())),`, and
+the import line 105 gains `TraitSet, TraitsInScope`. The parameter stays
+`&FxHashSet<TraitId>` (the IDE's callers pass it).
+
+4. Then, in `infer.rs`, the `traits_in_scope` and `block_traits` fields and
+`get_traits_in_scope` go (nothing else reads them once item 1 is in).
+
+> forwarded to mem-db-infer-ctx (`infer/sized_bound.rs`; mem-db-infer-ctx-next2, both windows) and db (`crates/hir`; db-next3); told by tmux (requests, pass 25).
+> applied by db-mem-infer-a-small (21:50): item 1 as written (on top of `db.md`'s frontend-bodies R3, whose `in_crate_trait_value_items` loop sits between the two lines); `TraitId` back in the `hir_def::` list, `TraitSet` beside `TraitsInScope`. This replaces A13 item 3's `TraitsInScope::Inference(&traits)`. Items 2 to 4 are not mine.

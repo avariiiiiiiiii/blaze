@@ -18,6 +18,16 @@ Where the "before" code here shows a `dyn` the file no longer has (I4.2's `extra
 `resolver: &dyn Fn() -> Resolver<'db>` and `get_cfg_options: &dyn Fn() -> &'a CfgOptions`),
 apply the change to the parameters as the file has them now. These requests add no `dyn`.
 
+Lane frontend-tree is moving `SyntaxNode` and `ast::` handle callers to `syntax::view`, one
+function at a time. These requests add no new handle use. Where they show a handle (`bodies` and
+`elided` as `Vec<SyntaxNode>` in I1.1 and I1.2, `inner_attrs_node: Option<SyntaxNode>` in I4.2,
+the `ast::` values in I2 and I6), that is the type the code had. Where frontend-tree has moved a
+function to views, keep its views and apply only the allocator change: the same buffer on the
+frame or scratch, holding the view type (or the `NodeId`/`AstPtr` it keeps). A view is `Copy`
+with no destructor, so a buffer of views may be `frame.alloc_slice_copy`/`alloc_slice_from_iter`
+instead of `Vec<_, &Frame>`. The flat tree's own calls (`clone_subtree_without`,
+`relative_without`) take whatever slice types frontend-tree gives them.
+
 ### Where those lines are at 21:00
 
 Rechecked at 2026-10-29 21:00: the code each section rewrites is unchanged, but `signatures.rs`
@@ -48,6 +58,7 @@ diagnostic_item, upvars, src and deps are where the sections say.
 | I2.7 `parse_link_tt` | (its `value` at 1062-1067) | fn at 1038; the `value` `let` inside it |
 
 > forwarded to db (db-expand-next2, owner of these hir-def files) (requests, pass 18; told by tmux).
+> read by db-expand (db-expand-paths, 2026-10-29) for I6 and I12.3: `import_map.rs` had moved (db-apply-def's `trait_assoc_items: BitSet`); applied against the code as it is.
 
 ### I6.2, two doc comments the FST's removal leaves stale
 
@@ -57,6 +68,7 @@ diagnostic_item, upvars, src and deps are where the sections say.
   "`importables` and the keys are built from those".
 
 > forwarded to db (db-expand-next2) (requests, pass 18; told by tmux).
+> applied by db-expand (db-expand-paths, 2026-10-29): both doc fixes as written.
 
 ## What this assumes
 
@@ -64,13 +76,14 @@ diagnostic_item, upvars, src and deps are where the sections say.
   (dev) `blaze-alloc-count` in hir-def's manifest, `#![feature(allocator_api)]` and the one
   `#[cfg(test)] #[global_allocator] static ALLOC: blaze_alloc_count::Counting` in
   `crates/hir-def/src/lib.rs`. Not refiled.
-- **`blaze_mem::frame::current`** (mem-db's request 1 to lane mem):
-  `pub fn current<R>(f: impl FnOnce(&Frame) -> R) -> R`, stopping (naming its caller) outside a
-  task. Every `frame::current` below sits at the top of a tracked function's body (rule 1).
+- **`blaze_mem::frame::task`** (`frame.rs:453`): every tracked function's body below opens
+  `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| ..)` at its top (rule 1), not
+  `frame::current`. Salsa's `execute` opens no frame, so `current` would stop outside a task,
+  and a nested query's miss would allocate into the outer query's frame. Revised 2026-10-29
+  21:30 after mem-db-def-collect found this.
 - **hashbrown's `nightly` feature** (mem-db's root request 3): `hashbrown::HashMap<K, V, S, &Frame>`
   and `HashSet<T, S, &Frame>` with `with_hasher_in`.
-- **Salsa runs each query function inside `frame::task(tag, ..)`** (mem-db-salsa) and stores a
-  memo with no heap allocation of its own (`vendor/salsa/src/table/memo.rs`: memos live in the
+- **Salsa stores a memo with no heap allocation of its own** (`vendor/salsa/src/table/memo.rs`: memos live in the
   slab; `zalsa_local.rs:1165`: edges inline). So a miss's budget is its value's allocations.
 - **Frame values with a destructor go in `Vec<T, &Frame>`** (whose drop runs the elements'
   drops), never `frame.alloc_slice_*` (which forgets them): `Name`, `Symbol`, `SyntaxNode`,
@@ -78,6 +91,8 @@ diagnostic_item, upvars, src and deps are where the sections say.
   `Copy` data (`u32`, `SyntaxNodePtr`, `TextRange`, `AttrFlags`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-expand (db-expand-items, 2026-10-29): H1 to H3 are in hir-def (`blaze-mem`, `hashbrown`, dev `blaze-alloc-count`, `#![feature(allocator_api)]`, one `#[cfg(test)] #[global_allocator]` at the end of `lib.rs`). `frame::current` and `frame::task` exist (`crates/blaze-mem/src/frame.rs`), the workspace's `hashbrown` takes `&Frame` (`with_hasher_in`, as hir-ty-mir and hir-ty-wfcheck use it), and `Frame: Allocator`. Not yet true: salsa running each query in `frame::task` (mem-db-salsa's M1, `v2/requests/mem-db-salsa.md`). `rg 'frame::task|MEM_TAG' vendor/salsa` finds nothing. Until M1 lands, every `frame::current` here stops with "frame::current outside any frame::task" when a query runs outside a task, tests included. Filed as `## db-expand-items: salsa runs each query in frame::task` in `v2/requests/db-expand.md`.
+> applied by db-expand (db-expand-attrs, 2026-10-29) for `attrs.rs` and `attrs/`: each query body opens `blaze_mem::frame::current`, not `frame::task`, with `mem_tag = Nameres` on its tracked attribute, as `signatures.rs`, `lang_item.rs` and hir-ty write it. Once M1 runs every query in `frame::task(C::MEM_TAG, ..)`, a nested query's miss gets its own frame (the 21:30 concern), and a `task` in each body would open a second frame per run. Builds with M2 and runs with M1 (`## db-expand-items: salsa runs each query in frame::task`).
 
 ## Tags (contract 3), for mem-db-salsa's tracked attribute
 
@@ -101,8 +116,20 @@ Every tracked function of this slice runs under `Tag::Nameres`:
 ---
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29), `signatures.rs` rows: every tracked fn there has `mem_tag = Nameres` (as `attrs.rs` and hir-ty already write it). Needs mem-db-salsa's M2 in `vendor/salsa-macros` (`rg mem_tag vendor` finds nothing yet).
+> not applied by db-expand (db-expand-items, 2026-10-29) for `lang_item.rs`, `diagnostic_item.rs`, `upvars.rs`, `unstable_features.rs`, `lib.rs`: salsa's tracked attribute has no tag option yet (mem-db-salsa's M2, `mem_tag = ..`; `rg mem_tag vendor` finds nothing), so there is nothing to write on these queries. Once M2 lands, each query this table lists in those files gets `mem_tag = Nameres`.
+> partly applied by db-mem-def (22:40; M2 in, `vendor/salsa-macros/src/options.rs:120`): `mem_tag = Nameres` on `lang_item.rs` 37/119/324, `diagnostic_item.rs` 79/105, `upvars.rs` 81/89/97, `import_map.rs` 82 and `deps/signatures/key.rs` 88, as `signatures.rs:152` writes it. `lib.rs` 976/1795 and `unstable_features.rs` 50 wait: both were edited minutes ago, and the holder has been asked. `lib.rs` 614/664 are tracked structs, which take no tag.
+> db-expand (22:36): M2 has landed (`vendor/salsa-macros/src/options.rs:120`), and so has M1
+> (`function/execute.rs` runs `frame::task(C::MEM_TAG, ..)`). The rows not applied above are
+> handed to db-mem-def, told by tmux: `lang_item.rs`, `diagnostic_item.rs`, `upvars.rs`,
+> `unstable_features.rs`, `lib.rs`, `import_map.rs` and `deps/signatures/key.rs`. db-expand
+> holds no files.
+> applied by db-expand (db-expand-attrs, 2026-10-29), `attrs.rs` and `attrs/stability.rs` rows: every tracked fn in both has `mem_tag = Nameres`, `extra_crate_attrs` included, and `deprecation_origin`, `stability_origin` and `block_owner` (the one at 673) added now. Needs M2.
 
-## I0. For mem-format-hir: one frame parameter on the lowering entry points
+## I0. For mem-format-hir: one frame parameter on the lowering entry points (withdrawn)
+
+Withdrawn at 21:19 on mem-format's answer below. The lowering's temporaries are on hir-def's
+pooled scratch, so this request and I1.6 are both dropped. Kept for the record:
 
 The signature queries lower through `expr_store/lower.rs` (format's). For their temporaries to be
 the run's frame, the entry points need the frame the query opened. Requested of
@@ -124,15 +151,16 @@ At 21:00, mem-format-hir has reported DONE without this change, so it was resent
 > mem-format-hir-apply (`v2/requests/mem-format-hir.md` 1-2, lane mem's ruling that hir-def's
 > scratch stays in its own thread-locals). A warm lowering is held to 0 allocations
 > (`a_warm_lowering_allocates_nothing`). So a `frame` handed to `with_maps` would be unused. It
-> also can't compile yet: hir-def has no `blaze-mem` dependency (H1) and `frame::current` is not
-> in blaze-mem. Signatures' own temporaries (I1.1-I1.4, I1.6's `relative`/`with_source_map`)
+> also can't compile yet: hir-def has no `blaze-mem` dependency (H1). Signatures' own temporaries (I1.1-I1.4, I1.6's `relative`/`with_source_map`)
 > open the frame in signatures.rs and keep it there; the `lower_*` calls stay as they are. If a
 > lowering temporary turns up that the pooled scratch can't hold, name it here and the parameter
 > goes in with the code that uses it.
+> applied by db-expand (db-expand-sigs, 2026-10-29): withdrawn, so nothing; the `lower_*` calls take no frame. (They will take a `BodyLowering` for db.md's item 6, `v2/requests/db-expand.md` "## db-expand-sigs: a signature lowered without its source map".)
 
 ## I1. `signatures.rs`
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29): I1.1 to I1.4 as below; I1.6 and I1.7 need no edit. `use blaze_mem::frame::Frame;` added. Every `frame::current` sits at the top of a tracked fn's body, or of `relative`/`with_source_map`'s call of `lower`; they need mem-db-salsa's M1 (queries in `frame::task`) to run.
 
 ### I1.1 `file_outline` (339-380): its three buffers onto the frame
 
@@ -168,7 +196,7 @@ After:
 
 ```rust
 pub fn file_outline(db: &Db, file_id: EditionedFileId) -> FileOutline {
-    blaze_mem::frame::current(|frame| {
+    blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
         let file = HirFileId::from(file_id);
         let root = file.parse_or_expand(db);
         let ast_id_map = file.ast_id_map(db);
@@ -217,6 +245,7 @@ Memo: `FileOutline` = the outline tree (`Arc<FlatTree>`, made by `clone_subtree_
 `AstIdMap` and `RealSpanMap` (span's, made exact there), `cuts: Box<[SyntaxNodePtr]>` exact.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29): as written.
 
 ### I1.2 `SignatureSyntax::new` (145-200) and `item_syntax` (386-402): `elided` and `ptrs`
 
@@ -236,16 +265,17 @@ anchored at an impl, trait or module around it (one entry per body under the anc
 - `item_syntax` (386) gains `frame: &Frame` last and passes it to both `SignatureSyntax::new`
   calls (396, 401).
 - `signature_syntax` (406): the body's `match def { .. }` goes inside
-  `blaze_mem::frame::current(|frame| match def { .. })`, each arm passing `frame` last to
+  `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| match def { .. })`, each arm passing `frame` last to
   `item_syntax`.
 - `variants_syntax` (427):
-  `blaze_mem::frame::current(|frame| item_syntax(db, def.lookup(db).id, |_| None, frame))`.
+  `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| item_syntax(db, def.lookup(db).id, |_| None, frame))`.
 - `use blaze_mem::frame::Frame;` at the top. `SmallVec` stays imported (`VariantBits`).
 
 Memo: `SignatureSyntax` = the item's own tree (`Arc<FlatTree>` from `clone_subtree_without`),
 its relative `AstIdMap` and `RealSpanMap` (`within`), two `SyntaxNodePtr`s.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29): as written. The test `items_anchored_at_a_fn_are_read_around_its_body` calls `item_syntax` inside `frame::task(Tag::Nameres, ..)`.
 
 ### I1.3 `lower_fields` (1771-1834): fields lowered into the frame, the arena made exact
 
@@ -256,10 +286,10 @@ Per `VariantFields` run: `Arena::with_capacity(count)` (1797) sized to every wri
   `frame: &Frame` last; `lower_field_list` passes it to both `lower_fields` calls (1746, 1756),
   `lower` to the three `lower_field_list` calls (1659, 1672, 1684).
 - `relative` (1632): `let syntax = variant_syntax(db, id)?;
-  Some(blaze_mem::frame::current(|frame| Self::lower(db, id, Some(syntax), frame)))`.
+  Some(blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| Self::lower(db, id, Some(syntax), frame)))`.
 - `with_source_map` (1615): its first line becomes
   `let Some((it, map)) = Self::relative(db, id) else {
-      return blaze_mem::frame::current(|frame| Self::lower(db, id, None, frame));
+      return blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| Self::lower(db, id, None, frame));
   };`
 - In `lower_fields`, 1797 `let mut arena = Arena::with_capacity(count);` becomes
   `let mut lowered = Vec::with_capacity_in(count, frame);`; 1816
@@ -289,6 +319,7 @@ Memo: `(Arc<VariantFields>, ExpressionStoreSourceMap)`: one `Arc`, the field are
 allocation, none for no field), the store and source map (format's).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29): as written, the copy into the arena a consuming `for` over the frame `Vec` rather than `drain(..)`. `moved_source_maps_are_the_files` calls `VariantFields::lower` inside `frame::task(Tag::Nameres, ..)`.
 
 ### I1.4 `EnumVariants::of` (1896-1954): variants and diagnostics into the frame, results exact
 
@@ -300,7 +331,7 @@ After (the body from 1901):
 
 ```rust
     ) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
-        blaze_mem::frame::current(|frame| {
+        blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
             let loc = e.lookup(db);
             // The relative tree's ast ids are the file's: what a variant is interned by.
             let (source, ast_id_map) = match variants_syntax(db, e) {
@@ -370,27 +401,24 @@ for an enum with no variant) and `VariantBits` (inline up to 64); the `ThinVec` 
 diagnostics (none unless a variant is cfg'd out).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29), adapted: the body is now `EnumVariants::lower` (frontend-deps split `of` into the image's value or `lower`), so the frame and the exact results went there. `VariantBits::with_len` does not exist; it is `VariantBits::new(kept_len)`, which the code already used. The bits are truncated and shrunk only when a name is written twice.
 
-### I1.6 The nine signatures' `relative` and `with_source_map`: one frame per run, to the lowering
+### I1.6 The nine signatures' `relative` and `with_source_map`: no change
 
-Once I0 lands. For each of `StructSignature` (596, 582), `UnionSignature` (698, 684),
-`EnumSignature` (806, 792), `ConstSignature` (911, 897), `StaticSignature` (1006, 992),
-`ImplSignature` (1100, 1086), `TraitSignature` (1218, 1204), `FunctionSignature` (1338, 1324),
-`TypeAliasSignature` (1529, 1515):
+Withdrawn at 21:19, after mem-format's answer to I0. `StructSignature`, `UnionSignature`,
+`EnumSignature`, `ConstSignature`, `StaticSignature`, `ImplSignature`, `TraitSignature`,
+`FunctionSignature` and `TypeAliasSignature` each have a `lower` with no temporary of its own
+(I1.7). All of their per-run work goes through `expr_store/lower.rs`'s `lower_*` entry points.
+`ExprCollector` keeps those temporaries on hir-def's pooled thread-local `Scratch`
+(`expr_store.rs` 518, 599), where a warm lowering allocates 0 (`a_warm_lowering_allocates_nothing`).
+So these `relative` and `with_source_map` functions open no frame: one would go unused. Their
+`lower` signatures and the `lower_*` calls stay as they are, and so does `lower_fields`'
+`ExprCollector::with_maps` (1768-1769).
 
-- `fn lower(db, id, source, maps)` gains `frame: &Frame` last and passes it last to its
-  `lower_generic_params_within` / `lower_impl` / `lower_trait` / `lower_function` /
-  `lower_type_alias` / `lower_type_ref` call.
-- `relative`: `Some(Self::lower(db, id, syntax.node(), Some(syntax.maps())))` becomes
-  `Some(blaze_mem::frame::current(|frame| {
-      Self::lower(db, id, syntax.node(), Some(syntax.maps()), frame)
-  }))`.
-- `with_source_map`: `None => Self::lower(db, id, id.lookup(db).source(db), None)` becomes
-  `None => blaze_mem::frame::current(|frame| {
-      Self::lower(db, id, id.lookup(db).source(db), None, frame)
-  })`.
-- `lower_fields` (1785): `ExprCollector::with_maps(db, module, fields.file_id,
-  crate::LoweringMode::Analysis, maps)` gains `frame` last.
+The only frames in signatures.rs are those I1.1 to I1.4 open for their own buffers:
+`file_outline`, `signature_syntax`, `variants_syntax`, `VariantFields::relative` and
+`with_source_map` (the lowered fields, I1.3), and `EnumVariants::of`. If a temporary of the
+nine turns up later, it is named here, and the frame goes in with the code that uses it.
 
 `of` lowers nothing (an `Arc` count of `relative`'s or `with_source_map`'s memo). Memo of each:
 `(Arc<XSignature>, ExpressionStoreSourceMap)`: one `Arc` (the signature's fixed fields:
@@ -399,6 +427,7 @@ mem-format), `FunctionSignature::params` / `TypeAliasSignature::bounds` (`Box<[_
 the store's list mark, format's), `Name`s (a symbol each).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29): withdrawn, so no frame here. (db.md's item 6 changes these functions for another reason: `of` lowering without the map.)
 
 ### I1.7 Nothing else in signatures.rs allocates per run
 
@@ -407,10 +436,12 @@ ABI string in place; `VariantBits` is inline up to 64 variants; `moved_to_file`/
 format's (`ExpressionStoreSourceMap::moved`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29): nothing to change; rechecked, still true.
 
 ## I2. `attrs.rs`
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): I2.1 to I2.8, each below.
 
 ### I2.1 `has_word` (1392-1409): every name a caller asks becomes a flag, no walk on a hit
 
@@ -520,6 +551,7 @@ attributes, I2.2). Bits 78 and up of `AttrFlags` are free.
   the block's flag reads the same either way.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29), adapted, one change with speed-hir-sol-defs §2 (`v2/requests/db-expand.md`) and diagnostics-speed-bodies §2: bit 78 was `HAS_SANITIZE` (db-apply-def), so `MARKER` 79, `AUTOMATICALLY_DERIVED` 80, `RUSTC_MAIN` 81, `DEFAULT` 82, with diagnostics' `NAKED` 83 and db-expand-sigs' `RUSTC_DENY_EXPLICIT_IMPL` 84; each `if single` in `match_attr_flags` and an arm of `has_word`. Test `has_word_flags_match_the_source` (`attrs/tests.rs`: the root module's items, impls and variants, `#[unsafe(naked)]` and `cfg_attr` included, with the count each word should find); `check_name_set!(Word)` takes the new words by itself. The corpus test's gating table now lists every one-segment word flag, which the old string match never set (it failed for `rustc_insignificant_dtor` and the four after it before this).
 
 ### I2.2 `parse_extra_crate_attrs` (714-742): memoized, the concat in scratch
 
@@ -578,6 +610,7 @@ parse (its flat tree and errors). `.tree()` is a node over the memo's tree (an `
 Add `extra_crate_attrs` to the tag table (`Nameres`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written.
 
 ### I2.3 `field_attr_flags` (1160-1173): flags in the frame, the memo exact
 
@@ -586,7 +619,7 @@ Add `extra_crate_attrs` to the tag table (`Nameres`).
 ```rust
         #[salsa::tracked(returns(ref))]
         fn field_attr_flags(db: &Db, variant: VariantId) -> Box<[AttrFlags]> {
-            blaze_mem::frame::current(|frame| {
+            blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
                 let mut result = Vec::new_in(frame);
                 for_each_field(db, variant, |_, cfg_options, field| {
                     let mut attr_flags = AttrFlags::empty();
@@ -606,6 +639,7 @@ Add `extra_crate_attrs` to the tag table (`Nameres`).
 Memo: `Box<[AttrFlags]>`, 16 bytes a field, one exact allocation (none for no field).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written, `frame::current` for `frame::task` (see "What this assumes"); the field walk reads the outline (`Tree::Outline`, speed-hir-sol-defs §12).
 
 ### I2.4 `generic_params_attr_flags` (1190-1229): the two maps exact
 
@@ -619,7 +653,7 @@ gathered in the frame, each map made once at the length its last index needs.
             def: GenericDefId,
         ) -> (ArenaMap<LocalLifetimeParamId, AttrFlags>, ArenaMap<LocalTypeOrConstParamId, AttrFlags>)
         {
-            blaze_mem::frame::current(|frame| {
+            blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
                 let mut cfg_options = None;
                 let mut cfg_options =
                     || *cfg_options.get_or_insert_with(|| def.krate(db).cfg_options(db));
@@ -675,6 +709,7 @@ fn exact_arena_map<T, V: Clone>(entries: &[(la_arena::Idx<T>, V)]) -> ArenaMap<l
 I9.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written, `frame::current` for `frame::task`; `exact_arena_map` takes `V: Copy`, so it copies and needs no `// clone:`.
 
 ### I2.5 `collect_field_attrs` (919-933) and its three users: per-field values in the frame
 
@@ -702,7 +737,7 @@ fn collect_field_attrs<T>(
 ```
 
 (`for_each_field` numbers the fields `0..` with no gap, so the index is the position.) Each user
-wraps its body in `blaze_mem::frame::current(|frame| ..)` and passes `frame` third.
+wraps its body in `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| ..)` and passes `frame` third.
 `fields_doc_aliases`' per-field `let mut result = Vec::new();` (1705) becomes
 `let mut result = Vec::new_in(frame);` and `result.into_boxed_slice()` (1711) becomes
 `result.drain(..).collect::<Box<[Symbol]>>()` (an exact-size drain: one exact allocation, none
@@ -713,11 +748,12 @@ for a field with no alias); `extract_doc_aliases` (992) takes
 (1740, 1760) become `_ => Some(CfgExpr::All(result.drain(..).collect()))`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written; `collect_field_attrs` also takes the `Tree` (§12): `fields_doc_aliases` and `fields_cfgs` read the outline, `fields_docs` the parse (its source map points into the file).
 
 ### I2.6 The value queries that build a list: frame, then exact
 
 - `native_libs` (1315-1330): `let mut libs = Vec::new();` becomes, inside
-  `blaze_mem::frame::current(|frame| { .. })`, `let mut libs = Vec::new_in(frame);`, and
+  `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| { .. })`, `let mut libs = Vec::new_in(frame);`, and
   `libs.into_boxed_slice()` becomes `libs.drain(..).collect()` (`// alloc: the memo's libraries,
   exact`).
 - `doc_aliases` (1693-1697): the same, over `extract_doc_aliases` (now taking the frame `Vec`).
@@ -735,25 +771,26 @@ for a field with no alias); `extract_doc_aliases` (992) takes
 
 - `define_opaque` (1948-1985): `let mut result = Vec::new();` and the per-attribute
   `tokens ... .collect_vec()` and per-path `let mut segments = Vec::new();` all become
-  `Vec::new_in(frame)` (one `frame::current` at the body's top);
+  `Vec::new_in(frame)` (one `frame::task(Tag::Nameres, ..)` at the body's top);
   `ModPath::from_segments(kind, segments)` becomes `ModPath::from_segments(kind, segments.drain(..))`
   (it takes `impl IntoIterator<Item = Name>`, `mod_path.rs:105`), and
   `result.into_boxed_slice()` becomes `result.drain(..).collect()`.
 - `derive_info` (1846-1880): the helpers'
   `.map(|it| Symbol::intern(it.text())).collect::<Box<[_]>>()` (a `filter` chain: not exact, so a
-  `Vec` grown then shrunk) becomes, with `frame` from a `frame::current` at the body's top,
+  `Vec` grown then shrunk) becomes, with `frame` from a `frame::task(Tag::Nameres, ..)` at the body's top,
   `{ let mut helpers = Vec::new_in(frame); helpers.extend(<the same chain>); helpers.drain(..).collect::<Box<[_]>>() }`.
 - `must_implement_one_of` (1996-2016): the same for `names`
   (`.filter_map(..).map(..).collect::<Box<[_]>>()`).
 - `parse_rustc_legacy_const_generics` (2119-2125): its `filter_map(..).collect()` into
   `Box<[u32]>` takes a frame: called from `legacy_const_generic_indices` (1495, tracked), which
-  opens `frame::current` and passes it;
+  opens `frame::task(Tag::Nameres, ..)` and passes it;
   `let mut found = Vec::new_in(frame); found.extend(<the chain>); Box::from(&found[..])`.
 
 Memo of each: the `Box<[_]>` / set at its exact length (none when empty: `Box<[T]>` of length 0
 allocates nothing).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written, each under `frame::current`.
 
 ### I2.7 `#[link]` parsing: no `String` per key, no `format!` per `cfg`
 
@@ -822,6 +859,7 @@ allocates nothing).
   ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written; `link_cfg` writes into `scratch::with_string`, so speed-hir-sol-defs §2's `format!` justification has nothing left to justify.
 
 ### I2.8 Hit paths of the attribute lookups: what is zero after I2.1 and I2.2
 
@@ -842,11 +880,12 @@ called inside query runs only (item and field lowering, `for_each_field`), where
 the run's work; it returns the failing `CfgExpr` as the diagnostic, so it stays owned.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): nothing to change; I12.1's test holds the hit paths at zero.
 
 ## I3. `attrs/stability.rs`
 
 - `own_of_fields` (354-374): `let mut fields = Vec::new();` becomes, inside
-  `blaze_mem::frame::current(|frame| { .. })`, `let mut fields = Vec::new_in(frame);`, and
+  `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| { .. })`, `let mut fields = Vec::new_in(frame);`, and
   `fields.into_boxed_slice()` becomes `fields.drain(..).collect()` (`// alloc: the memo's
   fields, exact`). Memo: `Box<[Own]>`, exact.
 - `items` (561-591): `SmallVec<[_; 16]>` of tokens and `Items = SmallVec<[_; 4]>`: inline for any
@@ -856,6 +895,7 @@ the run's work; it returns the failing `CfgExpr` as the diagnostic, so it stays 
   symbols).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): `own_of_fields` as written (`fields.drain(..).collect()`, with speed-hir-sol-defs §4's `// alloc:` line); `items` and `own_of_def` unchanged. Both read the parse (`Tree::Live`).
 
 ## I4. `attrs/docs.rs`: `docs` and `fields_docs` (IDE only, lru'd)
 
@@ -865,6 +905,7 @@ Per doc string with a newline: `lines: Vec<(&str, TextSize)>` (289) and two
 grown by `push` and shrunk (`shrink_to_fit`, 476-490 and 896).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): I4.1 and I4.2, below.
 
 ### I4.1 The trims over `doc.lines()`, nothing collected
 
@@ -1050,6 +1091,7 @@ would push), `reference_vertical_trim`, `reference_horizontal_trim`, and a test 
 (`ast::CommentShape` derives `Debug` and `Copy`; check, else print with `{:?}` of a `match`.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written. The old functions are `reference_vertical_trim`, `reference_horizontal_trim` and `reference_push_lines` in `docs.rs`'s tests; `trims_match_reference` compares the trims, and also the text and source map `push_doc_lines` builds against pushing the reference lines, over 20 000 seeded strings joined by `\n` and `\r\n` (no `Debug` of `CommentShape` needed). The iterator copies carry `// clone:`.
 
 ### I4.2 `extract_docs`' buffers from the worker, the memo copied out exact
 
@@ -1156,6 +1198,7 @@ and goes. Memo: `Option<Box<Docs>>`: the box, the text and source map each exact
 (947, 1124, 1193, 1228, 1312) are unchanged: `Indent` keeps `Default`.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written, the body in `extract_docs_into(buffers, ..)`, which `extract_docs` calls inside `scratch::with::<DocBuffers, _>`; the parameters are dedyn's `&impl Fn`. `Docs::shrink_to_fit` deleted (no other caller).
 
 ## I5. `lang_item.rs`
 
@@ -1163,7 +1206,7 @@ and goes. Memo: `Option<Box<Docs>>`: the box, the text and source map each exact
 
   ```rust
   pub fn crate_notable_traits(db: &Db, krate: Crate) -> Option<Box<[TraitId]>> {
-      blaze_mem::frame::current(|frame| {
+      blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
           let mut traits = Vec::new_in(frame);
           let crate_def_map = crate_def_map(db, krate);
           for (_, module_data) in crate_def_map.modules(db) {
@@ -1189,10 +1232,12 @@ and goes. Memo: `Option<Box<Docs>>`: the box, the text and source map each exact
   field load: zero (test I12.2).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-items, 2026-10-29): `crate_notable_traits` as written (frame `Vec`, `Box::from(&traits[..])`). `crate_lang_items` and `lang_items` were already as described, so nothing changed there apart from speed-hir-sol-defs §5's `// alloc:` on the box.
 
 ## I6. `import_map.rs`: the collection into the frame, the search over sorted keys
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-paths, 2026-10-29): I6.1, I6.2 and I6.3; see each below. The `fst` manifest move is asked in `v2/requests/db-expand.md` ("db-expand-paths: ...").
 
 ### I6.1 The collection (`Collector`, 197-394) and the build (98-166) onto the frame
 
@@ -1263,7 +1308,7 @@ unchanged.) `import_map_query_impl` (98) becomes:
 ```rust
     fn import_map_query_impl(db: &Db, krate: Crate) -> Self {
         let _p = tracing::info_span!("import_map_query").entered();
-        blaze_mem::frame::current(|frame| Self::build(db, krate, frame))
+        blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| Self::build(db, krate, frame))
     }
 
     fn build(db: &Db, krate: Crate, frame: &Frame) -> Self {
@@ -1350,6 +1395,7 @@ unchanged.) `import_map_query_impl` (98) becomes:
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-paths, 2026-10-29), adapted to the code as it is: `Collector<'f>` on the frame as written (rows map, rows, flags, infos, worklist, visited). In `build`, the counting sort is speed-hir's `Csr::build` (db-expand.md "speed-hir: four edits" item 1), over `(row, ImportInfo)` so it yields `info_start` and `infos` at their length (no `order` column); `trait_assoc_items` stays db-apply-def's `BitSet::new(rows)`. The three key columns are `Vec::with_capacity_in(.., frame)` (runs at most the infos, key bytes at most the names'), so they never regrow. Memo: nine exact allocations plus `Csr`'s cursors.
 
 ### I6.2 The FST goes: sorted keys, binary search, a scan for fuzzy
 
@@ -1525,6 +1571,7 @@ Manifest (owner's): `fst` moves from `[dependencies]` to `[dev-dependencies]` of
 `crates/hir-def/Cargo.toml` (line 24, the same spec), used only by the tests' reference model.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-paths, 2026-10-29): as written: the `fst` field and `use fst::..` gone, `keys`/`key_start`/`run_start`, `runs`, `key`, `run`, `lower_bound`, `search_runs`, `is_subsequence`, `search_dependencies` on `search_dependencies_into` on `search_dependencies_each` (R10b's), `search_maps` gone, `importables`' doc. Not done here: the manifest move (hir-def's `Cargo.toml` is not db-expand-paths'; asked in `v2/requests/db-expand.md`) and hir's `query_external_importables` onto `_each` (`crates/hir/`, mem-db-def-hir R10b).
 
 ### I6.3 The differential test (1563-1645): keys against the reference FST
 
@@ -1547,8 +1594,7 @@ become the keys and run bounds read off the old FST's stream:
                 }
 ```
 
-and 1598 (`ImportMap::import_map_query_impl(&db, krate)`, outside any query run, where
-`frame::current` stops) becomes
+and 1598 (`ImportMap::import_map_query_impl(&db, krate)`, outside any query run) becomes
 `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| ImportMap::build(&db, krate, frame))`.
 The `search_dependencies(&db, main, &query) == reference::search(..)` comparison (1636-1640)
 now checks the sorted-key search against the FST's union, every mode, both cases, every assoc
@@ -1560,6 +1606,7 @@ Memo: `ImportMap` = `items` (an `FxIndexSet`: entries and index table, exact), `
 one): nine exact allocations, built once.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-paths, 2026-10-29): the stream comparison and the `frame::task` rebuild as written. Added, for "the same order": the differential test also compares `search_dependencies_each`'s visits, in order, with a new `reference::search_each` (each dependency's own FST stream in key order, each key's importables in order), for every query and mode; and `is_subsequence_against_fst` checks `is_subsequence` against fst's `Subsequence` over random keys and every query of up to two chars.
 
 ## I7. `diagnostic_item.rs`
 
@@ -1581,7 +1628,7 @@ one): nine exact allocations, built once.
   ```rust
   pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
       let _p = tracing::info_span!("crate_diagnostic_items_query").entered();
-      blaze_mem::frame::current(|frame| {
+      blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
           let mut collect = Collect {
               db,
               by_name: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
@@ -1616,7 +1663,7 @@ one): nine exact allocations, built once.
   ```rust
   pub fn diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
       let _p = tracing::info_span!("diagnostic_items_query").entered();
-      blaze_mem::frame::current(|frame| {
+      blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
           let own = crate_diagnostic_items(db, krate);
           // `CrateData::dependencies` lists the sysroot crates even for `#![no_std]` and
           // `#![no_core]` crates, which rustc does not load; the extern prelude is what name
@@ -1670,6 +1717,7 @@ one): nine exact allocations, built once.
 - `DiagnosticItems::get` (38): a memo read and one probe: zero (test I12.1 covers it).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-items, 2026-10-29), with one change of form: the `entry` match is one free `fn insert(by_name, duplicates, name, owner)` shared by `Collect::item` and `diagnostic_items`' merge, and the memo is built once by `fn settle(by_name, duplicates)` (`FxHashMap::with_capacity_and_hasher` + `drain`, `duplicates.drain(..).collect()`). Both fns are used by both queries. The value is the same: the same entries, and duplicates in the order found. `Symbol` is `Copy`, so the merge copies (`(&name, &owner)`, `.copied()`) where the text cloned. `DiagnosticItems::insert` is gone; imports as asked (`hashbrown::hash_map::Entry`, `FxBuildHasher`, `Frame`).
 
 ## I8. `upvars.rs`
 
@@ -1698,7 +1746,7 @@ then `shrink_to_fit` (130) and boxed as the memo.
       if !store.exprs().any(|(_, expr)| matches!(expr, Expr::Closure { .. })) {
           return None;
       }
-      blaze_mem::frame::current(|frame| {
+      blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
           let mut binding_names = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
           binding_names.extend(store.bindings().map(|(_, binding)| *binding.name.symbol()));
           let mut visitor = UpvarsMentionedVisitor {
@@ -1726,7 +1774,7 @@ then `shrink_to_fit` (130) and boxed as the memo.
   ```
 
   `upvars_mentioned_impl` is `pub` but its only callers are the three tracked functions
-  (85, 93, 101); make it `fn` (no `pub`), so no caller outside a run can reach `current`.
+  (85, 93, 101); make it `fn` (no `pub`), so no caller outside a run reaches it.
 - `use blaze_mem::frame::Frame; use rustc_hash::{FxBuildHasher, FxHashMap};`.
 
 Memo: `Option<Box<FxHashMap<ExprId, Upvars>>>`: the box, the map (exact), each closure's
@@ -1734,6 +1782,7 @@ Memo: `Option<Box<FxHashMap<ExprId, Upvars>>>`: the box, the map (exact), each c
 with is mem-db-def-resolve's.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-items, 2026-10-29) as written: `UpvarsMentionedVisitor<'db, 'f>` with frame `binding_names`, `closures` and `mentioned`, `closures.push`, the memo exact, and `upvars_mentioned_impl` private. The early return uses `store.has_closures()` (speed-hir's item 3, `v2/requests/db-expand.md`) instead of the `exprs().any(..)` shown.
 
 ## I9. `src.rs` (IDE and attribute lowering; owned returns)
 
@@ -1748,6 +1797,7 @@ unused, never a regrow. `use_tree_source_map` (50) and `UseId::child_source` (66
 IDE's (source-to-def of a `use` tree), at the edge.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-items, 2026-10-29) as written: the map is made in each arm, `ArenaMap::with_capacity(fl.fields().count())` for `Tuple` and `Record` and `ArenaMap::new()` for `Unit`, and each arm returns `InFile::new(src.file_id, map)`.
 
 ## I10. `macro_reach.rs`: the walk's set and stack in the caller's frame
 
@@ -1780,6 +1830,7 @@ impl<'f> MacroReachable<'f> {
 MacroReachable::new_in(frame); .. })`. `symbol_attr` (38) is attrs.rs's (no buffer).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-items, 2026-10-29) as written: `MacroReachable<'f>` with `new_in`, `Default` gone, both tests inside `frame::task(Tag::Nameres, ..)`. It still has no caller outside its tests (`rg MacroReachable crates` outside `macro_reach*`: none).
 
 ## I11. `lib.rs`, `unstable_features.rs`, `deps/`, the rest
 
@@ -1788,7 +1839,7 @@ MacroReachable::new_in(frame); .. })`. `symbol_attr` (38) is attrs.rs's (no buff
 
   ```rust
   pub fn include_macro_invoc(db: &Db, krate: Crate) -> Box<[(MacroCallId, EditionedFileId)]> {
-      blaze_mem::frame::current(|frame| {
+      blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
           let mut found = Vec::new_in(frame);
           found.extend(
               crate_def_map(db, krate)
@@ -1855,6 +1906,8 @@ table, never a regrow. `query` (51) clones the def map's set: `FxHashSet::clone`
 table at the source's bucket count, so the memo is the same size as the def map's.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-items, 2026-10-29), I11: `include_macro_invoc` as written (frame `Vec`, `Box::from(&found[..])`). The rest of I11 needs no change. `UnstableFeatures::query`'s clone carries speed-hir-sol-defs §10's `// clone:`.
+> not applied (I11.1): mem-db-def-collect's A5 has not landed. `nameres.rs:352` (`DefMapCrateData::shrink_to_fit`) still calls `unstable_features.shrink_to_fit()`, and nothing calls `reserve` (`rg 'unstable_features\.reserve' crates/hir-def` finds nothing). Replacing `shrink_to_fit` now would stop `nameres.rs` building. Apply I11.1 when A5 makes that function `settle` and the collector's H4 reserves. Filed under `## db-expand-items: I11.1 waits on A5` in `v2/requests/db-expand.md`.
 
 ## I12. Budget tests (written in full)
 
@@ -1864,6 +1917,7 @@ assume salsa stores a memo with no heap allocation of its own and interns into r
 (mem-db-salsa's contract 5): what is left is the value's own allocations.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): I12.1, below (I12.2 to I12.4 are the siblings').
 
 ### I12.1 `attrs/tests.rs`: attribute lookups on a warm item are zero
 
@@ -1935,6 +1989,7 @@ to the test module: `either::Either`, `crate::{AdtId, VariantId}` are there; add
 if not.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): as written in `attrs/tests.rs`, the items found through a `root_owners` helper (also used by the I2.1 and §12 tests) and `"the_fn"` interned before the measure. Runs once M1 does (the queries' `frame::current`).
 
 ### I12.2 `lang_item.rs` tests: a lang-item lookup is zero; a notable-traits miss is its box
 
@@ -1987,6 +2042,7 @@ pub trait Other {}
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-items, 2026-10-29): both tests as written, at the end of `lang_item.rs`'s `mod tests`. Of I12's other parts, I12.1 (`attrs/tests.rs`) is db-expand-attrs', and I12.3 (`import_map.rs`) and I12.4 (`signatures.rs`) are other children's files. The upvars and lang-item read budgets are also in `alloc_budgets.rs` (now compiled).
 
 ### I12.3 `import_map.rs` tests: a search after its buffers have grown is zero; a build is its nine
 
@@ -2095,6 +2151,7 @@ pub mod m { pub fn f() {} pub use super::S as R; }
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-paths, 2026-10-29): the three tests at the end of `import_map.rs`'s `mod tests` (`TestDBExt` imported for `fetch_test_crate`). One change: `build_is_its_columns` allows 10, as `Csr::build` (speed-hir's item 1) allocates its cursors once per build. Not run.
 
 ### I12.4 `signatures.rs` tests: every signature query's warm re-request is zero; a miss is its value
 
@@ -2181,3 +2238,6 @@ interned per variant goes to salsa's intern tables, on regions. The test module 
 types from `super::*`.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29): both tests in the new `crates/hir-def/src/signatures/budgets.rs` (`#[cfg(test)] mod budgets;` in signatures.rs). The items are gathered with `test_items::{declarations, impls}` before measuring, in place of `module_for_file`/`def_map().module().scope()`. The miss budget of 2 also assumes mem-db-salsa's M5 (intern tables on regions), since the `EnumVariantLoc` interns are global allocations until then.
+
+> not applied by db-mem-def (21:39): db-expand-next2 holds these hir-def files and its children (db-expand-sigs, -items, -paths, -attrs) are applying them; it has not handed any over (asked by tmux 21:39). The `vendor/salsa` edit the tags need is M2 in `v2/requests/mem-db-salsa.md`, which speed-salsa-next3 has been given to apply after its S5.

@@ -4,7 +4,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use blaze_manifest::diagnostic::ManifestDiagnostic;
 use blaze_manifest::{Context, Workspace};
 use blaze_new::{NewOptions, Settings, VersionControl};
 
@@ -125,7 +124,7 @@ pub fn command(name: &str, args: Args<'_>) -> anyhow::Result<i32> {
                 }
                 None
             }
-            Err(err) => Some(rendered(&err, &cwd)),
+            Err(err) => Some(blaze_manifest::diagnostic::rendered(&err, &cwd)),
         };
         let settings = Settings {
             cwd: &cwd,
@@ -142,30 +141,6 @@ pub fn command(name: &str, args: Args<'_>) -> anyhow::Result<i32> {
         Ok(()) => Ok(0),
         Err(err) => Ok(failed(&err)),
     }
-}
-
-/// `err` as cargo prints an error after a warning: the message with no `error:`, then each
-/// cause.
-fn rendered(err: &anyhow::Error, cwd: &Path) -> String {
-    if let Some(diagnostic) = err.downcast_ref::<ManifestDiagnostic>() {
-        return diagnostic.render(cwd);
-    }
-    let mut out = String::new();
-    for (i, cause) in err.chain().enumerate() {
-        if i == 0 {
-            out.push_str(&cause.to_string());
-            continue;
-        }
-        out.push_str("\n\nCaused by:");
-        for line in cause.to_string().lines() {
-            out.push('\n');
-            if !line.is_empty() {
-                out.push_str("  ");
-                out.push_str(line);
-            }
-        }
-    }
-    out
 }
 
 /// The possible value clap's tip names for `value`: the last of the most similar by Jaro

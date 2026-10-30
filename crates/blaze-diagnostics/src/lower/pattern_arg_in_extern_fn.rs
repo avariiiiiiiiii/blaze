@@ -6,5 +6,6 @@
 use crate::{cx::Cx, lower::Found};
 
 pub(crate) fn lower(_cx: &Cx<'_, '_>, _d: &hir::PatternArgInExternFn) -> Vec<Found> {
+    // alloc: empty, allocates nothing
     Vec::new()
 }

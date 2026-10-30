@@ -13,10 +13,12 @@ use std::collections::VecDeque;
 
 use blaze_core::{Completion, Done, Effect, FileName, Tag};
 use blaze_ids::bits::BitSet;
+use blaze_inproc::{CodeMemory, CodeRange};
 use blaze_live::patch::message_file;
 
+use crate::file;
 use crate::state::State;
-use crate::{Image, LinkError, Output};
+use crate::{Image, LinkError, Output, Staged};
 
 /// A state the image can go back to: the state before a commit, and the ranges of its file
 /// the commit overwrote (read from `state` when rolling back).
@@ -112,6 +114,115 @@ fn message_name(output: &Output, generation: u64) -> Option<FileName> {
 }
 
 impl Image {
+    /// Whether `staged` may be committed now: no commit in flight, staged on the image's
+    /// generation.
+    pub(crate) fn can_commit(&self, staged: &Staged) -> Result<(), LinkError> {
+        if self.pending.is_some() {
+            return Err(LinkError { function: None, what: "a commit is in flight".into() });
+        }
+        if staged.base != self.state.generation {
+            return Err(LinkError {
+                function: None,
+                // alloc: error path
+                what: format!(
+                    "staged on generation {}, and the image is at {}: stage it again",
+                    staged.base, self.state.generation
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Makes `state` the image's, the state before it kept in the history with the ranges
+    /// of its file the commit overwrites: what a failed file commit puts back.
+    pub(crate) fn take(&mut self, state: State, full: bool, undo: Vec<(u64, u64)>) -> Revert {
+        self.generations = self.generations.max(state.generation);
+        let before = std::mem::replace(&mut self.state, state);
+        if before.laid_out {
+            let len = before.file_len;
+            self.remember(Undo { state: before, full, len, writes: undo });
+            Revert::Pop
+        } else {
+            Revert::Keep(before)
+        }
+    }
+
+    /// The writes that give back the file before the last commit, and the message saying so.
+    pub(crate) fn roll_back_writes(&self) -> Result<Writes, LinkError> {
+        if self.pending.is_some() {
+            return Err(LinkError { function: None, what: "a commit is in flight".into() });
+        }
+        let Some(undo) = self.history.back() else {
+            return Err(LinkError { function: None, what: "no commit to roll back".into() });
+        };
+        let from = self.state.generation;
+        let to = undo.state.generation;
+        let message = self.output.live.as_ref().map(|_| {
+            (from, blaze_live::patch::Message::RollBack { id: self.state.lineage, to }.encode())
+        });
+        Ok(Writes {
+            full: undo.full,
+            len: undo.len,
+            old_len: self.state.file_len,
+            writes: file::restore(&undo.state, undo.full, &undo.writes),
+            remove: message.is_some().then_some(to),
+            message,
+        })
+    }
+
+    /// Makes the history's last state the image's: what a failed file rollback puts back.
+    pub(crate) fn take_undo(&mut self) -> Revert {
+        let Undo { state, full, len, writes } = self.history.pop_back().expect("a rollback's writes were made of it");
+        let current = std::mem::replace(&mut self.state, state);
+        Revert::Push { state: current, full, len, writes }
+    }
+
+    /// Writes a commit's or rollback's file into `memory`'s image part, as the file's effects
+    /// leave it: a full write's file starts as zeros, so the gaps between its writes, and what
+    /// the last file had past it, are zeroed; a shorter file zeroes what it no longer has.
+    /// Each range written is published. Nothing is written when the file doesn't fit.
+    pub(crate) fn write_into(&self, writes: &Writes, memory: &mut CodeMemory) -> Result<(), LinkError> {
+        let image = memory.image_len();
+        let end = writes.writes.iter().map(|(at, bytes)| at + bytes.len() as u64).fold(writes.len, u64::max);
+        if end.max(writes.old_len) > image {
+            return Err(LinkError {
+                function: None,
+                // alloc: error path
+                what: format!(
+                    "{} is {:#x} bytes and its code memory's image part {image:#x}: make the code memory with \
+                     room for the file",
+                    self.to,
+                    end.max(writes.old_len),
+                ),
+            });
+        }
+        let to = &self.to;
+        // alloc: error path
+        let fail = |error: blaze_inproc::Error| LinkError { function: None, what: format!("writing {to} into its code memory: {error}") };
+        let zero = |memory: &mut CodeMemory, offset: u64, len: u64| -> Result<(), LinkError> {
+            if len == 0 {
+                return Ok(());
+            }
+            memory.fill(offset, len, 0).map_err(fail)?;
+            memory.publish(CodeRange { offset, len }).map_err(fail)
+        };
+        let mut at = 0;
+        for (offset, bytes) in &writes.writes {
+            if writes.full && *offset > at {
+                zero(memory, at, offset - at)?;
+            }
+            memory.write(*offset, bytes).map_err(fail)?;
+            let len = bytes.len() as u64;
+            memory.publish(CodeRange { offset: *offset, len }).map_err(fail)?;
+            at = at.max(offset + len);
+        }
+        if writes.full {
+            zero(memory, at, end.max(writes.old_len).saturating_sub(at))
+        } else {
+            zero(memory, writes.len, writes.old_len.saturating_sub(writes.len))
+        }
+    }
+
     pub(crate) fn steps(&mut self, writes: Writes) -> Result<Steps, LinkError> {
         let mut tags = Tags { high: self.output.tags, low: &mut self.tags };
         let (to, next) = (&self.to, &self.next);

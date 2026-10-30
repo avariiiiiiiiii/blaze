@@ -37,6 +37,7 @@ impl ResolveError {
 }
 
 impl std::error::Error for ResolveError {
+    // dyn: `std::error::Error::source`'s own signature, on the error path.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         self.cause.source()
     }

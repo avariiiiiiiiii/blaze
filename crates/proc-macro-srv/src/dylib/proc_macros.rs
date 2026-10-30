@@ -68,6 +68,7 @@ impl ProcMacros {
             }
         }
 
+        // alloc: error path, naming the macro.
         Err(bridge::PanicMessage::String(format!("proc-macro `{macro_name}` is missing")).into())
     }
 

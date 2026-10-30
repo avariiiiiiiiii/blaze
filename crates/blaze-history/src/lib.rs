@@ -26,6 +26,11 @@ pub mod table;
 #[cfg(test)]
 mod tests;
 
+/// Counts allocations so the predict and observe paths' tests hold them to a budget.
+#[cfg(all(test, not(blaze_check)))]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 use blaze_graph::{
     Key,
     admission::{Estimates, Predict, Prediction, TaskKind},

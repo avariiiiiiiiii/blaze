@@ -51,6 +51,7 @@ impl LatePass for InvalidFromUtf8 {
         let Some([arg]) = util::call_args(b, expr) else { return };
         let Some((def, _)) = util::called_fn(b, expr) else { return };
         let Some(item) = self.items.of(b.db(), def) else { return };
+        // alloc: empty, pushed to only for a const read by the argument of a `from_utf8` call
         let mut init = Init { linted: b, item: None, expr: *arg, read: Vec::new() };
         init.or_init();
         while let Expr::Ref { expr: inner, .. } = init.b().store().expr(init.expr) {
@@ -64,28 +65,35 @@ impl LatePass for InvalidFromUtf8 {
         };
         let method = item.strip_prefix("str_").unwrap_or(item);
         let method = match method.strip_prefix("inherent_") {
+            // alloc: the lint's diagnostic
             Some(method) => format!("str::{method}"),
+            // alloc: the lint's diagnostic
             None => format!("std::str::{method}"),
         };
         let mut diag = match item.contains("unchecked") {
             true => Diag::lint(
                 "invalid_from_utf8_unchecked",
+                // alloc: the lint's diagnostic
                 format!("calls to `{method}` with an invalid literal are undefined behavior"),
                 call,
             ),
             false => Diag::lint(
                 "invalid_from_utf8",
+                // alloc: the lint's diagnostic
                 format!("calls to `{method}` with an invalid literal always return an error"),
                 call,
             ),
         };
+        // alloc: the lint's diagnostic
         diag.span_label(literal, format!("the literal was valid UTF-8 up to the {} bytes", error.valid_up_to()));
         for def in init.read.iter().rev() {
             let (item, def) = *def;
             let name = b.cx.def_path(def.into());
+            // alloc: the lint's diagnostic
             diag.fact(Fact::Code(b.cx.key(item)), format!("the code of `{name}`"));
         }
         let called = b.cx.def_path(ModuleDefId::FunctionId(def).into());
+        // alloc: the lint's diagnostic
         diag.fact(Fact::Signature(b.cx.key(ItemId::Function(def))), format!("the signature of `{called}`"));
         out.push(b.lint(diag, Phase::Late, at));
     }

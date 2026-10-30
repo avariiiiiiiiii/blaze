@@ -105,7 +105,7 @@ impl Registry {
         name: &str,
         req: &OptVersionReq,
         source: SourceId,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         let summaries = self.summaries(name).await?;
         let lines: Vec<IndexLine> = summaries.select(|version| req.matches(version)).collect();
@@ -136,7 +136,7 @@ impl Registry {
         dep: &Dependency,
         kind: QueryKind,
         source: SourceId,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         let name = dep.package_name();
         let mut req = dep.version_req().clone();
@@ -240,7 +240,7 @@ impl<R: Resolver> Resolver for IndexRegistry<'_, R> {
         &self,
         dep: &Dependency,
         kind: QueryKind,
-        f: &mut dyn FnMut(IndexSummary),
+        f: &mut impl FnMut(IndexSummary),
     ) -> Result<()> {
         let id = dep.source_id();
         let Some(from) = self.registry_of(id)? else {

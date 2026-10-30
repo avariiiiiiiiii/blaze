@@ -50,6 +50,7 @@ mem-db-checks' B4 (`v2/requests/mem-db-checks.md`, line 1522) expected these tab
 the body's frame. They don't need to: they recycle without one.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied: nothing to apply (design note; requests 1 to 11 carry it out) (db-mem-infer-a, 21:58).
 
 ## What is made, how often, and where it goes (the inventory)
 
@@ -83,6 +84,7 @@ answered from the global cache.
 | external constraints | `eval_ctxt/mod.rs:1668, 1775` | the `Vec`s of `ExternalConstraintsData` | per response with region, opaque or normalization constraints | built in pooled `Vec`s and interned from a borrow (req 4) |
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied: nothing to apply (inventory; its rows point at requests 1 to 11) (db-mem-infer-a, 21:58).
 
 ### Caches that outlive a goal (not frame values)
 
@@ -107,6 +109,7 @@ answered from the global cache.
   param-env per revision. That is not per goal, and stays.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied: nothing to apply (these caches stay as they are) (db-mem-infer-a, 21:58).
 
 ## 1. solver-sync / lane db (`vendor/rustc_type_ir`, new patch 0006): cycle heads and candidate usages without heap nodes
 
@@ -288,6 +291,7 @@ The callers:
   give the same results. They run in the release train.
 
 > forwarded to solver-sync and lane db (windows `solver-sync`, `db-next2`; told by tmux 20:27). The blaze-alloc-count dev-dependency is told to mem-db.
+> applied by db-mem-infer-a-solver-vendor (21:39): as written, in `rustc_type_ir` patch 0006 (`0006-solver-storage-recycled`); the merge test uses two overlapping two-head sets so it stays inline; no test-fixture needed.
 
 ## 2. solver-sync / lane db (`vendor/rustc_type_ir`, patch 0006): the search graph's storage, recycled
 
@@ -445,6 +449,7 @@ The rest of the change:
     whose `held()` is unchanged, and a `new_in` over it starts empty.
 
 > forwarded to solver-sync and lane db (told by tmux 20:27).
+> applied by db-mem-infer-a-solver-vendor (21:39): in patch 0006; the proof-tree root (`evaluate_root_goal_for_proof_tree_raw`) still uses `SearchGraph::new` (no delegate reaches it); the cycle test checks `held()` unchanged, and the zero-allocation test is on an acyclic goal (a cycle's `NestedGoals` map allocates).
 
 ## 3. solver-sync / lane db (`vendor/rustc_next_trait_solver`, new patch 0004): the eval context's temporaries from the graph's scratch
 
@@ -638,6 +643,7 @@ under rustc_next_trait_solver's test module, against `SolverScratch` alone:
 - `assert_at_most(0, ..)` for a take, push within capacity, give.
 
 > forwarded to solver-sync and lane db (told by tmux 20:27). The blaze-alloc-count dev-dependency is told to mem-db.
+> applied by db-mem-infer-a-solver-vendor (21:39): in `rustc_next_trait_solver` patch 0004 (`0004-solver-temporaries-recycled`); also pooled the region-variable set of `filter_irrelevant_region_constraints`; the option list is passed as `&mut Vec` into `instantiate_and_apply_query_response`; the response canonicalizer takes no buffer (it discarded its variables); proof-tree paths keep fresh empty `Vec`s.
 
 ## 4. solver-sync / lane db (`vendor/rustc_next_trait_solver` patch 0004 and `vendor/rustc_type_ir`): external constraints interned from a borrow
 
@@ -672,6 +678,7 @@ under rustc_next_trait_solver's test module, against `SolverScratch` alone:
   constraints (a `T: 'a` bound).
 
 > forwarded to solver-sync and lane db (told by tmux 20:27).
+> applied by db-mem-infer-a-solver-vendor (21:39): the vendor half (`Interner::mk_external_constraints_ref`, buffers given back) in patches 0006 and 0004; added provided `SolverDelegate::make_deduplicated_region_constraints_into` and `InferCtxtLike::clone_opaque_types_added_since_into` (the request said `InferCtxtLike` doesn't change) so the pooled lists can be filled; hir-ty's overrides are db-mem-infer-a-solver's.
 
 ## 5. solver-sync-infer-core (`crates/hir-ty/src/next_solver/infer/mod.rs`, `at.rs`) and solver-sync-glue's files (`solver.rs`): the `InferCtxt`'s tables recycled per worker
 
@@ -917,6 +924,7 @@ keep taking and putting back the `InferCtxt`'s own state, which now comes warm f
   (`held() == 0` on the next take).
 
 > forwarded to solver-sync for solver-sync-infer-core (its window is gone) and to lane db for `recycle.rs` and `solver.rs` (told by tmux 20:27).
+> applied by db-mem-infer-a-solver (21:52): `recycle.rs` (shelves `INFER` 32, `PENDING` 32, `SEARCH` 8), `InferTables`, `build`/`Drop`/`fork` through the shelf, `solver.rs`'s two delegate methods, the four tests in `infer/mod.rs`. Differences: shelved bytes are counted by a `Kept<T>` wrapper (counted on give, uncounted on take or drop, so a full shelf or an ending thread keeps `Tag::Infer` right); `empty`/`held`/`clone_from` also cover `undo_log`, `const_var_params`, `region_obligations`, `region_assumptions`; nothing given back while panicking. Waits on `mod recycle;` in `next_solver.rs` (asked of db-mem-infer-a) and on `scratch::Shelf` public (section 11).
 
 ## 6. db-ty-port-solver / lane db (`crates/hir-ty/src/next_solver/fulfill.rs`): pending columns recycled
 
@@ -952,6 +960,7 @@ impl Drop for FulfillmentCtxt<'_> {
   50 that the fast path keeps.
 
 > forwarded to lane db (window `db-next2`, told by tmux 20:27).
+> applied by db-mem-infer-a-solver (21:52): `Pending` `pub(crate)` with `held` (and a test-only `reserve_for_tests`), `new` takes `recycle::pending()`, `Drop` gives back. Difference: the budget test is `a_warm_fulfillment_context_allocates_nothing` in `next_solver/budget_tests.rs`, not `fulfill.rs`, as its obligations need the fixture's items.
 
 ## 7. solver-sync-infer-relate (`crates/hir-ty/src/next_solver/infer/canonical/instantiate.rs`): the instantiation cache that doesn't allocate
 
@@ -997,6 +1006,7 @@ impl Drop for FulfillmentCtxt<'_> {
   variables, with two var values.
 
 > forwarded to solver-sync for solver-sync-infer-relate (its window is gone; told by tmux 20:27).
+> applied by db-mem-infer-a-solver (21:27): as written; `FxHashMap` import dropped. Test value is `([^0], *const ^1)` (builtin types on `Db::for_tests`, no fixture), not an ADT pair: same path (cache inserts below bound vars).
 
 ## 8. lane db (`crates/hir-ty/src/next_solver/`, a new test module; `crates/hir-ty/Cargo.toml` dev-dependencies): the three budget tests the contract asks for
 
@@ -1053,6 +1063,8 @@ fn body<'a, T: Clone + 'a>(x: &'a T) { let _ = x; }
   revalidation in a new view).
 
 > forwarded to lane db (window `db-next2`, told by tmux 20:27); the test-fixture dev-dependency is told to mem-db.
+> applied by db-mem-infer-a-solver (21:52): `next_solver/budget_tests.rs` with the fixture, the three tests, section 10's block-impl variant and section 6's fulfillment test. Waits on `#[cfg(test)] mod budget_tests;` in `next_solver.rs` (asked of db-mem-infer-a); the block-impl test passes only once section 10 lands.
+> applied by db-mem-infer-a (21:58): `mod recycle;` (section 5) and `#[cfg(test)] mod budget_tests;` in `next_solver.rs` (solver-sync's window is closed; lane db owns the file while db is not done).
 
 ## 9. solver-sync (`crates/hir-ty/src/next_solver/interner.rs`, `mod table`): interned storage on regions tagged `Intern`
 
@@ -1175,6 +1187,7 @@ fn body<'a, T: Clone + 'a>(x: &'a T) { let _ = x; }
     and `a_run_never_crosses_a_segment` go with the segments.
 
 > forwarded to solver-sync (told by tmux 20:27).
+> not applied by db-mem-infer-a-solver (21:52): `interner.rs` is solver-sync's; appended as written to `v2/requests/solver-sync-inbox.md` ("From db-mem-infer-a-solver"). solver-sync's window is closed (STATUS: DONE), so db-mem-infer-a was told instead.
 
 ## 10. solver-sync (`crates/hir-ty/src/next_solver/interner.rs`): the impl walks' `seen` lists inline
 
@@ -1204,6 +1217,7 @@ paths a goal hit or a warm re-solve doesn't take. They cover:
 They stay with their owners' annotations.
 
 > forwarded to solver-sync (told by tmux 20:27).
+> not applied by db-mem-infer-a-solver (21:52): `interner.rs` is solver-sync's; appended as written to `v2/requests/solver-sync-inbox.md` ("From db-mem-infer-a-solver"). Its budget test is in `next_solver/budget_tests.rs` (`resolving_goals_with_an_impl_in_a_block_warm_allocates_nothing`).
 
 ## 11. lane mem (`crates/blaze-mem/src/scratch.rs`, through mem-db): `Shelf<B, N>` public
 
@@ -1227,3 +1241,7 @@ They stay with their owners' annotations.
 
 > to mem-db by tmux: lane mem's, as are its other blaze-mem requests.
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-mem-infer-a-solver (21:52): filed with lane mem as `v2/requests/mem-db.md` section 12, forwarded to mem-next1; not landed yet (`Shelf` is still private in `scratch.rs`). `recycle.rs` uses `Shelf<B, N>` with `const fn new`, `take`, `give` as written here.
+
+> done by mem (2026-10-29): `scratch::Shelf<B, N>` is public, as mem-db.md section 12 says.
+

@@ -9,7 +9,10 @@
 
 use hir::{InFile, ModuleDef, PathResolution};
 use hir_def::{Lookup as _, attrs::AttrFlags};
-use syntax::{AstNode, SyntaxKind, SyntaxNodePtr, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
     cx::Cx,
@@ -21,17 +24,20 @@ use crate::{
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnusedMustUse<'db>) -> Vec<Found> {
     const LINT: LintId = LintId::named("unused_must_use");
     if !cx.lint_may_fire(LINT) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let at = d.expr.map(|it| it.syntax_node_ptr());
-    let node = cx.syntax(at);
-    let Some(expr) = ast::Expr::cast(node.value.clone()) else { return Vec::new() };
+    let node = cx.syntax_view(at);
+    // alloc: empty, allocates nothing
+    let Some(expr) = ast::Expr::cast(node.value) else { return Vec::new() };
     let span = cx.span_of(at);
     // Through the tails of blocks, as rustc's `check_stmt` goes: then the suggestion ends
     // the tail with `;`.
     let from_block = node.value.parent().is_some_and(|it| it.kind() == SyntaxKind::STMT_LIST);
+    // alloc: the lint's parts, for a value hir found unused
     let mut found = Vec::new();
-    if let Some(ty) = cx.sema.type_of_expr(&expr).map(|it| it.original)
+    if let Some(ty) = cx.vsema.type_of_expr(expr).map(|it| it.original)
         && let Some((adt, post)) = must_use_adt(cx, &ty, "")
     {
         let def = ModuleDef::Adt(adt);
@@ -39,7 +45,7 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::UnusedMustUse<'db>) -> Vec<F
         let diag = unused_def(cx, "", &post, def, reason, &span, post.is_empty().then_some(from_block));
         found.push(lint(cx, diag, at));
     }
-    if let Some(function) = callee(cx, &expr)
+    if let Some(function) = callee(cx, expr)
         && let Ok(id) = hir_def::FunctionId::try_from(function)
         && let Some(reason) = AttrFlags::must_use_message(cx.db, id.into())
     {
@@ -68,6 +74,7 @@ fn unused_def(
     suggest: Option<bool>,
 ) -> Diag {
     let path = cx.def_path(def);
+    // alloc: clone: the lint's parts, for a value hir found unused
     let mut diag = Diag::lint("unused_must_use", format!("unused {pre}`{path}`{post} that must be used"), span.clone());
     if let Some(reason) = reason {
         diag.note(reason);
@@ -77,6 +84,7 @@ fn unused_def(
         Some(true) => {
             diag.multipart_suggestion(
                 message,
+                // alloc: the lint's text, for a value hir found unused
                 vec![(span.shrink_to_lo(), "let _ = ".to_owned()), (span.shrink_to_hi(), ";".to_owned())],
                 Applicability::MaybeIncorrect,
             );
@@ -89,11 +97,13 @@ fn unused_def(
     match def {
         ModuleDef::Adt(adt) => {
             let key = cx.key(blaze_items::ItemId::Adt(adt.into()));
+            // alloc: the lint's text, for a value hir found unused
             diag.fact(blaze_items::Fact::Signature(key), format!("the attributes of `{path}`"));
         }
         ModuleDef::Function(function) => {
             if let Ok(id) = hir_def::FunctionId::try_from(function) {
                 let key = cx.key(blaze_items::ItemId::Function(id));
+                // alloc: the lint's text, for a value hir found unused
                 diag.fact(blaze_items::Fact::Signature(key), format!("the signature of `{path}`"));
             }
         }
@@ -125,30 +135,33 @@ fn must_use_adt<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, post: &str) -> Optio
         && let Some((ok, err)) = two(ty)
         && err.is_never()
     {
+        // alloc: the lint's text, for a value hir found unused
         return must_use_adt(cx, &ok, &format!(" in a `Result` with an uninhabited error{post}"));
     }
     if is(lang.ControlFlowContinue)
         && let Some((brk, cont)) = two(ty)
         && brk.is_never()
     {
+        // alloc: the lint's text, for a value hir found unused
         return must_use_adt(cx, &cont, &format!(" in a `ControlFlow` with an uninhabited break {post}"));
     }
     AttrFlags::must_use_message(cx.db, hir_def::AdtId::from(adt).into())?;
+    // alloc: the lint's text, for a value hir found unused
     Some((adt, post.to_owned()))
 }
 
 /// The function a call or a method call calls, when it names one: rustc's
 /// `check_fn_must_use` (a local holding a function names none).
-fn callee(cx: &Cx<'_, '_>, expr: &ast::Expr) -> Option<hir::Function> {
+fn callee(cx: &Cx<'_, '_>, expr: ast::Expr<'_>) -> Option<hir::Function> {
     match expr {
         ast::Expr::CallExpr(call) => {
             let ast::Expr::PathExpr(path) = call.expr()? else { return None };
-            match cx.sema.resolve_path(&path.path()?)? {
+            match cx.vsema.resolve_path(path.path()?)? {
                 PathResolution::Def(ModuleDef::Function(it)) => Some(it),
                 _ => None,
             }
         }
-        ast::Expr::MethodCallExpr(call) => cx.sema.resolve_method_call(call),
+        ast::Expr::MethodCallExpr(call) => cx.vsema.resolve_method_call(call),
         _ => None,
     }
 }

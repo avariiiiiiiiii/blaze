@@ -26,7 +26,7 @@ use rustc_hash::FxHashMap;
 use crate::arena::{FrameVec, collect_in};
 use crate::cow::{CowBytes, IdSet};
 use crate::model::{
-    Apply, Bind, Class, Delta, Export, Fixup, Formats, Function, GotEntry, Holds, Import, Placed, Region, Special,
+    Apply, Bind, Class, Delta, Export, Fixup, Formats, Function, GotEntry, Holds, Import, Pages, Placed, Region, Special,
     Splice, Sym, SymbolKind, Tls, WindowsUnwind, Writer,
 };
 use crate::place::Totals;
@@ -1462,6 +1462,7 @@ impl Parts {
         &'p self,
         stage: &'p Stage<'_>,
         contents: &'p [&'p [u8]],
+        paged: &'p [Option<Pages<'p>>],
         // dyn: `Placed::symbol`'s type (model.rs); a writer asks it a few fixed names per link
         symbol: &'p dyn Fn(&str) -> Option<u64>,
         delta: Option<&'p Delta<'p>>,
@@ -1474,6 +1475,7 @@ impl Parts {
             plan: stage.plan,
             regions: &self.regions,
             contents,
+            paged,
             libraries: &stage.new.resolved.libraries,
             imports: &stage.new.resolved.imports,
             got: &lists.got.items,

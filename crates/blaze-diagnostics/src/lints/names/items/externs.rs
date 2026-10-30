@@ -18,9 +18,12 @@
 //! (`ImproperCTypes`, `UsesPowerAlignment`, `BuiltinClashingExtern`) (MIT or Apache-2.0).
 
 use hir_ty::db::HirDatabase;
-use std::str::FromStr;
+use std::{cell::OnceCell, str::FromStr};
 
+use base_db::Db;
 use blaze_items::{Fact, ItemId};
+use blaze_mem::Frame;
+use either::Either;
 use hir::{InFile, ModuleDef};
 use intern::{Symbol, sym};
 use hir_def::{
@@ -43,8 +46,10 @@ use rustc_type_ir::{
     AliasTyKind, PatternKind,
     inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, Ty as _},
 };
+use smallvec::SmallVec;
 use syntax::{
-    AstNode, SyntaxNode, SyntaxNodePtr, TextRange, WalkEvent, ast,
+    SyntaxKind, SyntaxNodePtr, TextRange, WalkEvent,
+    view::{self as ast, AstNode},
 };
 
 use super::{
@@ -52,7 +57,7 @@ use super::{
     walk::{self, Container, Item, Orders},
 };
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -149,12 +154,13 @@ impl State {
 struct Types<'c, 'a, 'db> {
     cx: &'c Cx<'a, 'db>,
     interner: DbInterner<'db>,
-    infcx: InferCtxt<'db>,
+    /// Built when a type is first normalized or tested for `Sized`: most items never are.
+    infcx: OnceCell<InferCtxt<'db>>,
     env: ParamEnv<'db>,
     krate: base_db::Crate,
     limit: usize,
-    /// The ADTs whose representation was read, for the facts.
-    adts: Vec<AdtId>,
+    /// The ADTs whose representation was read since the last `emit`, for the facts.
+    adts: Vec<AdtId, &'a Frame>,
 }
 
 impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
@@ -162,10 +168,13 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
         let db = cx.db;
         let krate = cx.krate.base();
         let interner = DbInterner::new_with(db, krate);
-        let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
         let env = db.trait_environment(owner);
         let limit = crate_def_map(db, krate).recursion_limit() as usize;
-        Types { cx, interner, infcx, env, krate, limit, adts: Vec::new() }
+        Types { cx, interner, infcx: OnceCell::new(), env, krate, limit, adts: Vec::new_in(cx.frame()) }
+    }
+
+    fn infcx(&self) -> &InferCtxt<'db> {
+        self.infcx.get_or_init(|| self.interner.infer_ctxt().build(TypingMode::non_body_analysis()))
     }
 
     fn repr(&self, adt: AdtId) -> ReprOptions {
@@ -181,14 +190,14 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
     fn normalize(&self, ty: Ty<'db>) -> Ty<'db> {
         let ty = self.erased(ty);
         let cause = ObligationCause::dummy();
-        match self.infcx.at(&cause, self.env).deeply_normalize(ty) {
+        match self.infcx().at(&cause, self.env).deeply_normalize(ty) {
             Ok(it) => self.erased(it),
             Err(_) => ty,
         }
     }
 
     fn is_sized(&self, ty: Ty<'db>) -> bool {
-        self.infcx.type_is_sized_modulo_regions(self.env, ty)
+        self.infcx().type_is_sized_modulo_regions(self.env, ty)
     }
 
     fn is_1zst(&self, ty: Ty<'db>, env: ParamEnv<'db>) -> Option<bool> {
@@ -198,27 +207,6 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
 
     fn is_local(&self, adt: AdtId) -> bool {
         adt.krate(self.cx.db) == self.krate
-    }
-
-    fn variants(&self, adt: AdtId) -> Vec<VariantId> {
-        match adt {
-            AdtId::StructId(it) => vec![VariantId::StructId(it)],
-            AdtId::UnionId(it) => vec![VariantId::UnionId(it)],
-            AdtId::EnumId(it) => {
-                it.enum_variants(self.cx.db).variants.values().map(|&(it, _)| VariantId::EnumVariantId(it)).collect()
-            }
-        }
-    }
-
-    fn field_tys(&self, variant: VariantId, args: GenericArgs<'db>) -> Vec<Ty<'db>> {
-        let db = self.cx.db;
-        let types = db.field_types(variant);
-        variant
-            .fields(db)
-            .fields()
-            .iter()
-            .map(|(field, _)| types[field].ty().instantiate(self.interner, args).skip_norm_wip())
-            .collect()
     }
 
     /// rustc's `VariantDef::field_list_has_applicable_non_exhaustive`.
@@ -250,9 +238,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
     }
 
     fn nonnull_optimization_guaranteed(&self, adt: AdtId) -> bool {
-        let source = adt_source(self.cx, adt);
-        let Some(node) = ast::Adt::cast(source.value) else { return false };
-        walk::attr(self.cx, &node, "rustc_nonnull_optimization_guaranteed").is_some()
+        walk::attr(self.cx, &adt_source(self.cx, adt).value, "rustc_nonnull_optimization_guaranteed").is_some()
     }
 
     /// rustc's `ty_is_known_nonnull`.
@@ -270,8 +256,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
                 if lang.is_some_and(|it| it == sym::unsafe_cell || it == sym::unsafe_pinned) {
                     return false;
                 }
-                self.variants(adt)
-                    .into_iter()
+                variants(self.cx.db, adt)
                     .filter_map(|variant| self.transparent_field(adt, variant, args))
                     .any(|field| self.is_known_nonnull(field))
             }
@@ -299,8 +284,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
         match ty.kind() {
             TyKind::Adt(def, args) => {
                 let adt = def.def_id();
-                let inner =
-                    self.variants(adt).into_iter().filter_map(|variant| self.transparent_field(adt, variant, args)).last()?;
+                let inner = variants(self.cx.db, adt).filter_map(|variant| self.transparent_field(adt, variant, args)).last()?;
                 self.nullable(inner)
             }
             TyKind::Pat(base, _) => self.nullable(base),
@@ -318,7 +302,7 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
         match ty.kind() {
             TyKind::Adt(def, _) => match def.def_id() {
                 AdtId::StructId(it) => VariantId::StructId(it).fields(self.cx.db).fields().is_empty(),
-                AdtId::EnumId(it) => !self.variants_non_exhaustive(it) && self.variants(def.def_id()).is_empty(),
+                AdtId::EnumId(it) => !self.variants_non_exhaustive(it) && variants(self.cx.db, def.def_id()).next().is_none(),
                 AdtId::UnionId(_) => false,
             },
             TyKind::Tuple(tys) => tys.is_empty(),
@@ -331,15 +315,17 @@ impl<'c, 'a, 'db> Types<'c, 'a, 'db> {
     fn repr_nullable_ptr(&self, ty: Ty<'db>) -> Option<Ty<'db>> {
         match ty.kind() {
             TyKind::Adt(def, args) => {
-                let variants = self.variants(def.def_id());
-                let [one, two] = variants.as_slice() else { return None };
-                let field = match (self.field_tys(*one, args).as_slice(), self.field_tys(*two, args).as_slice()) {
-                    ([], [field]) | ([field], []) => *field,
-                    ([a], [b]) => {
-                        if self.is_niche_candidate(*a) {
-                            *b
-                        } else if self.is_niche_candidate(*b) {
-                            *a
+                let db = self.cx.db;
+                let mut all = variants(db, def.def_id());
+                let (Some(one), Some(two), None) = (all.next(), all.next(), all.next()) else { return None };
+                let (mut one, mut two) = (field_tys(db, self.interner, one, args), field_tys(db, self.interner, two, args));
+                let field = match ((one.next(), one.next()), (two.next(), two.next())) {
+                    ((None, _), (Some(field), None)) | ((Some(field), None), (None, _)) => field,
+                    ((Some(a), None), (Some(b), None)) => {
+                        if self.is_niche_candidate(a) {
+                            b
+                        } else if self.is_niche_candidate(b) {
+                            a
                         } else {
                             return None;
                         }
@@ -440,8 +426,8 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
         } else {
             false
         };
-        let fields = self.types.field_tys(variant, args);
-        let mut all_phantom = !fields.is_empty();
+        let mut fields = field_tys(self.types.cx.db, self.types.interner, variant, args).peekable();
+        let mut all_phantom = fields.peek().is_some();
         for field in fields {
             let field = self.types.normalize(field);
             all_phantom &= match self.visit_type(state.next(), field) {
@@ -501,8 +487,8 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
     fn visit_enum(&mut self, state: State, ty: Ty<'db>, adt: EnumId, args: GenericArgs<'db>) -> FfiResult<'db> {
         let id = AdtId::EnumId(adt);
         self.types.adts.push(id);
-        let variants = self.types.variants(id);
-        if variants.is_empty() {
+        let mut all = variants(self.types.cx.db, id).peekable();
+        if all.peek().is_none() {
             return FfiResult::Safe;
         }
         let repr = self.types.repr(id);
@@ -519,7 +505,7 @@ impl<'t, 'c, 'a, 'db> Visitor<'t, 'c, 'a, 'db> {
             };
         }
         let non_exhaustive = !self.types.is_local(id) && self.types.variants_non_exhaustive(adt);
-        for variant in variants {
+        for variant in all {
             let unit = matches!(variant.fields(self.types.cx.db).shape, FieldsShape::Unit);
             if non_exhaustive && !unit {
                 return FfiResult::Unsafe { ty, reason: "this enum is non-exhaustive", help: None };
@@ -648,17 +634,39 @@ fn is_mutable_ptr(ty: Ty<'_>) -> bool {
     )
 }
 
-fn adt_source(cx: &Cx<'_, '_>, adt: AdtId) -> InFile<SyntaxNode> {
+fn adt_source<'db>(cx: &Cx<'_, 'db>, adt: AdtId) -> InFile<ast::Adt<'db>> {
     let db = cx.db;
     match adt {
-        AdtId::StructId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
-        AdtId::UnionId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
-        AdtId::EnumId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+        AdtId::StructId(it) => it.lookup(db).source_view(db).map(ast::Adt::Struct),
+        AdtId::UnionId(it) => it.lookup(db).source_view(db).map(ast::Adt::Union),
+        AdtId::EnumId(it) => it.lookup(db).source_view(db).map(ast::Adt::Enum),
     }
 }
 
+/// The variants of an ADT, in order: a struct's or a union's one.
+fn variants(db: &Db, adt: AdtId) -> impl Iterator<Item = VariantId> + '_ {
+    match adt {
+        AdtId::StructId(it) => Either::Left(std::iter::once(VariantId::StructId(it))),
+        AdtId::UnionId(it) => Either::Left(std::iter::once(VariantId::UnionId(it))),
+        AdtId::EnumId(it) => {
+            Either::Right(it.enum_variants(db).variants.values().map(|&(it, _)| VariantId::EnumVariantId(it)))
+        }
+    }
+}
+
+/// The types of `variant`'s fields given `args`, in order.
+fn field_tys<'db>(
+    db: &'db Db,
+    interner: DbInterner<'db>,
+    variant: VariantId,
+    args: GenericArgs<'db>,
+) -> impl Iterator<Item = Ty<'db>> + 'db {
+    let types = db.field_types(variant);
+    variant.fields(db).fields().iter().map(move |(field, _)| types[field].ty().instantiate(interner, args).skip_norm_wip())
+}
+
 /// The ABI an `extern` block or a `fn` pointer type is written with, `None` if it is not one.
-pub(super) fn abi_of(abi: Option<ast::Abi>, default: ExternAbi) -> Option<ExternAbi> {
+pub(super) fn abi_of(abi: Option<ast::Abi<'_>>, default: ExternAbi) -> Option<ExternAbi> {
     let Some(abi) = abi else { return Some(default) };
     match abi.abi_string() {
         Some(it) => ExternAbi::from_str(&it.value().ok()?).ok(),
@@ -667,11 +675,12 @@ pub(super) fn abi_of(abi: Option<ast::Abi>, default: ExternAbi) -> Option<Extern
 }
 
 /// Where a lint of a type is emitted and what it is printed through.
-struct Site<'db> {
+struct Site<'i, 'db> {
     /// A type of the item's own, whose owner the lint's type is printed as of.
     owner: hir::Type<'db>,
     at: InFile<SyntaxNodePtr>,
-    fact: Option<(ItemId, String)>,
+    /// The item whose signature is the lint's fact, named only once a lint fires.
+    item: &'i Item<'db>,
 }
 
 struct Pass<'c, 'a, 'db> {
@@ -686,26 +695,33 @@ impl<'db> Pass<'_, '_, 'db> {
     fn fnptrs(
         &mut self,
         types: &mut Types<'_, '_, 'db>,
-        site: &Site<'db>,
+        site: &Site<'_, 'db>,
         state: State,
-        hir_ty: InFile<&ast::Type>,
+        hir_ty: InFile<ast::Type<'_>>,
         ty: Ty<'db>,
         mode: CItemKind,
     ) {
-        let tys = ty.walk().filter_map(|it| it.ty()).filter(|it| match it.kind() {
-            TyKind::FnPtr(_, hdr) => !hdr.abi().is_rustic_abi(),
-            _ => false,
-        });
-        let mut written = Vec::new();
+        let mut tys = ty
+            .walk()
+            .filter_map(|it| it.ty())
+            .filter(|it| match it.kind() {
+                TyKind::FnPtr(_, hdr) => !hdr.abi().is_rustic_abi(),
+                _ => false,
+            })
+            .peekable();
+        if tys.peek().is_none() {
+            return;
+        }
+        let mut written: SmallVec<[(usize, TextRange); 4]> = SmallVec::new();
         let mut depth = 0;
         for event in hir_ty.value.syntax().preorder() {
             match event {
                 WalkEvent::Enter(node) => {
-                    if !counted(&node) {
+                    if !counted(node) {
                         continue;
                     }
                     depth += 1;
-                    if let Some(ptr) = ast::FnPtrType::cast(node.clone())
+                    if let Some(ptr) = ast::FnPtrType::cast(node)
                         && abi_of(ptr.abi(), ExternAbi::Rust).is_some_and(|it| !it.is_rustic_abi())
                     {
                         let range = match node.parent().filter(|it| ast::ForType::can_cast(it.kind())) {
@@ -716,14 +732,13 @@ impl<'db> Pass<'_, '_, 'db> {
                     }
                 }
                 WalkEvent::Leave(node) => {
-                    if counted(&node) {
+                    if counted(node) {
                         depth -= 1;
                     }
                 }
             }
         }
-        let tys: Vec<Ty<'db>> = tys.collect();
-        for (fn_ptr, (depth, range)) in tys.into_iter().zip(written) {
+        for (fn_ptr, (depth, range)) in tys.zip(written) {
             let mut visitor = Visitor::new(&mut *types, fn_ptr, mode);
             let result = visitor.check_type(State { depth, ..state }, fn_ptr);
             self.emit(types, site, hir_ty.with_value(range), result, mode);
@@ -731,32 +746,24 @@ impl<'db> Pass<'_, '_, 'db> {
     }
 
     /// rustc's `check_foreign_fn` and `check_fn_for_external_abi_fnptr` of a function, by its ABI.
-    fn function(&mut self, item: &Item, f: &ast::Fn, mode: CItemKind) {
+    fn function(&mut self, item: &Item<'db>, f: ast::Fn<'db>, mode: CItemKind) {
         let cx = self.cx;
         let db = cx.db;
         let node = item.node.with_value(f);
-        let Some(def) = cx.sema.to_def2(node) else { return };
+        let Some(def) = cx.vsema.to_def2(node) else { return };
         let Ok(id) = FunctionId::try_from(def) else { return };
         let sig = db.callable_item_signature(CallableDefId::FunctionId(id)).skip_binder();
         let abi = sig.abi();
         let mut types = Types::new(cx, GenericDefId::FunctionId(id));
         let sig = types.interner.instantiate_bound_regions_with_erased(sig);
-        let site = Site { owner: def.ret_type(db), at: item.ptr(), fact: super::item_id(cx, item) };
-        let mut inputs: Vec<ast::Type> = Vec::new();
-        let mut spans: Vec<TextRange> = Vec::new();
-        if let Some(params) = f.param_list() {
-            if let Some(this) = params.self_param() {
-                spans.push(this.ty().map_or(this.syntax().text_range(), |it| it.syntax().text_range()));
-                inputs.extend(this.ty());
-            }
-            for param in params.params() {
-                let Some(ty) = param.ty() else { continue };
-                spans.push(ty.syntax().text_range());
-                inputs.push(ty);
-            }
-        }
+        let site = Site { owner: def.ret_type(db), at: item.ptr(), item };
+        let params = f.param_list();
+        let this = params.and_then(|it| it.self_param());
+        let written = || params.into_iter().flat_map(|it| it.params()).filter_map(|it| it.ty());
         let output = f.ret_type().and_then(|it| it.ty());
         if !abi.is_rustic_abi() {
+            let this_span = this.map(|this| this.ty().map_or(this.syntax().text_range(), |it| it.syntax().text_range()));
+            let spans = this_span.into_iter().chain(written().map(|ty| ty.syntax().text_range()));
             for (&input, range) in sig.inputs().iter().zip(spans) {
                 let mut visitor = Visitor::new(&mut types, input, mode);
                 let result = visitor.check_type(State::fn_entry(mode, FnPos::Arg), input);
@@ -769,13 +776,14 @@ impl<'db> Pass<'_, '_, 'db> {
                 self.emit(&mut types, &site, item.node.with_value(output.syntax().text_range()), result, mode);
             }
         } else {
-            let implicit_self = f.param_list().and_then(|it| it.self_param()).is_some_and(|it| it.ty().is_none());
+            let this_ty = this.and_then(|it| it.ty());
+            let implicit_self = this.is_some() && this_ty.is_none();
             let tys = sig.inputs().iter().copied().skip(usize::from(implicit_self));
-            for (input, hir_ty) in tys.zip(&inputs) {
+            for (input, hir_ty) in tys.zip(this_ty.into_iter().chain(written())) {
                 let state = State::fn_entry(mode, FnPos::Arg);
                 self.fnptrs(&mut types, &site, state, item.node.with_value(hir_ty), input, mode);
             }
-            if let Some(output) = &output {
+            if let Some(output) = output {
                 let state = State::fn_entry(mode, FnPos::Ret);
                 self.fnptrs(&mut types, &site, state, item.node.with_value(output), sig.output(), mode);
             }
@@ -783,14 +791,14 @@ impl<'db> Pass<'_, '_, 'db> {
     }
 
     /// rustc's `check_foreign_static`.
-    fn foreign_static(&mut self, item: &Item, s: &ast::Static) {
+    fn foreign_static(&mut self, item: &Item<'db>, s: ast::Static<'db>) {
         let cx = self.cx;
-        let Some(def) = cx.sema.to_def2(item.node.with_value(s)) else { return };
+        let Some(def) = cx.vsema.to_def2(item.node.with_value(s)) else { return };
         let Some(hir_ty) = s.ty() else { return };
         let id: hir_def::StaticId = def.into();
         let ty = cx.db.type_for_static(id).skip_binder();
         let mut types = Types::new(cx, GenericDefId::StaticId(id));
-        let site = Site { owner: def.ty(cx.db), at: item.ptr(), fact: super::item_id(cx, item) };
+        let site = Site { owner: def.ty(cx.db), at: item.ptr(), item };
         let mode = CItemKind::Declaration;
         let mut visitor = Visitor::new(&mut types, ty, mode);
         let result = visitor.check_type(State::static_entry(), ty);
@@ -798,72 +806,73 @@ impl<'db> Pass<'_, '_, 'db> {
     }
 
     /// rustc's `check_item` of a static, a const or a type alias.
-    fn typed(&mut self, item: &Item, owner: GenericDefId, printed: hir::Type<'db>, ty: Ty<'db>, hir_ty: Option<ast::Type>) {
+    fn typed(&mut self, item: &Item<'db>, owner: GenericDefId, printed: hir::Type<'db>, ty: Ty<'db>, hir_ty: Option<ast::Type<'db>>) {
         let Some(hir_ty) = hir_ty else { return };
         let mut types = Types::new(self.cx, owner);
-        let site = Site { owner: printed, at: item.ptr(), fact: super::item_id(self.cx, item) };
+        let site = Site { owner: printed, at: item.ptr(), item };
         let state = State::static_entry();
-        self.fnptrs(&mut types, &site, state, item.node.with_value(&hir_ty), ty, CItemKind::Definition);
+        self.fnptrs(&mut types, &site, state, item.node.with_value(hir_ty), ty, CItemKind::Definition);
     }
 
     /// rustc's `check_struct_for_power_alignment`, on AIX.
-    fn power_alignment(&mut self, item: &Item) {
+    fn power_alignment(&mut self, item: &Item<'db>) {
         let cx = self.cx;
-        let Some(adt) = ast::Adt::cast(item.node.value.syntax().clone()) else { return };
-        let Some(def) = cx.sema.to_def2(item.node.with_value(&adt)) else { return };
+        let Some(adt) = ast::Adt::cast(item.node.value.syntax()) else { return };
+        let Some(def) = cx.vsema.to_def2(item.node.with_value(adt)) else { return };
         let id = AdtId::from(def);
         let types = Types::new(cx, GenericDefId::AdtId(id));
         let repr = types.repr(id);
         if !repr.c() || repr.packed() || repr.align.is_some() {
             return;
         }
-        for field in walk::fields(item).iter().skip(1) {
+        for &field in walk::fields(item).iter().skip(1) {
             let Some(ty) = field_ty(cx, field) else { continue };
             if !power_aligned(&types, ty) {
                 continue;
             }
-            let span = cx.span(field.as_ref().map(def_span));
+            let span = cx.span(field.map(def_span));
             let mut diag = Diag::lint(
                 "uses_power_alignment",
                 "repr(C) does not follow the power alignment rule. This may affect platform C ABI compatibility for this type",
                 span,
             );
             if let Some((it, name)) = super::item_id(cx, item) {
-                diag.fact(Fact::Layout(cx.key(it)), format!("the layout of `{name}`"));
+                diag.fact(Fact::Layout(cx.key(it)), format!("the layout of `{name}`")); // alloc: the firing lint's fact
             }
-            self.found.push(Found::lint(diag, Phase::Late, field.as_ref().map(SyntaxNodePtr::new)));
+            self.found.push(Found::lint(diag, Phase::Late, field.map(ast::ptr)));
         }
     }
 
     /// rustc's `check_field_def` of each field of an ADT.
-    fn fields(&mut self, item: &Item) {
+    fn fields(&mut self, item: &Item<'db>) {
         let cx = self.cx;
         let db = cx.db;
-        let Some(adt) = ast::Adt::cast(item.node.value.syntax().clone()) else { return };
-        let Some(def) = cx.sema.to_def2(item.node.with_value(&adt)) else { return };
+        let Some(adt) = ast::Adt::cast(item.node.value.syntax()) else { return };
+        let Some(def) = cx.vsema.to_def2(item.node.with_value(adt)) else { return };
         let mut types = Types::new(cx, GenericDefId::AdtId(AdtId::from(def)));
-        for field in &walk::fields(item) {
+        for &field in &walk::fields(item) {
             let Some(ty) = field_ty(cx, field) else { continue };
             let Some(hir_ty) = field.value.children().find_map(ast::Type::cast) else { continue };
             let Some(owner) = field_def(cx, field) else { continue };
-            let site =
-                Site { owner: owner.ty(db), at: field.as_ref().map(SyntaxNodePtr::new), fact: super::item_id(cx, item) };
+            let site = Site { owner: owner.ty(db), at: field.map(ast::ptr), item };
             let state = State::static_entry();
-            self.fnptrs(&mut types, &site, state, field.with_value(&hir_ty), ty, CItemKind::Definition);
+            self.fnptrs(&mut types, &site, state, field.with_value(hir_ty), ty, CItemKind::Definition);
         }
     }
 
     fn emit(
         &mut self,
         types: &mut Types<'_, '_, 'db>,
-        site: &Site<'db>,
+        site: &Site<'_, 'db>,
         range: InFile<TextRange>,
         result: FfiResult<'db>,
         mode: CItemKind,
     ) {
-        let adts = std::mem::take(&mut types.adts);
         let (ty, note, help) = match result {
-            FfiResult::Safe => return,
+            FfiResult::Safe => {
+                types.adts.clear();
+                return;
+            }
             FfiResult::Phantom(ty) => (ty, "composed only of `PhantomData`", None),
             FfiResult::Unsafe { ty, reason, help } => (ty, reason, help),
         };
@@ -874,6 +883,7 @@ impl<'db> Pass<'_, '_, 'db> {
         };
         let printed = cx.ty(&site.owner.derived_from_next_solver(ty));
         let span = cx.span(range);
+        // alloc: the firing lint's message; clone: its span, labelled too
         let mut diag = Diag::lint(lint, format!("`extern` {desc} uses type `{printed}`, which is not FFI-safe"), span.clone());
         diag.span_label(span, "not FFI-safe");
         if let Some(help) = help {
@@ -884,18 +894,20 @@ impl<'db> Pass<'_, '_, 'db> {
             && types.is_local(def.def_id())
         {
             let source = adt_source(cx, def.def_id());
-            diag.span_note(cx.span(source.as_ref().map(def_span)), "the type is defined here");
+            diag.span_note(cx.span(source.map(|it| def_span(it.syntax()))), "the type is defined here");
         }
-        if let Some((id, name)) = &site.fact {
-            diag.fact(Fact::Signature(cx.key(*id)), format!("the signature of `{name}`"));
+        if let Some((id, name)) = super::item_id(cx, site.item) {
+            diag.fact(Fact::Signature(cx.key(id)), format!("the signature of `{name}`")); // alloc: the firing lint's fact
         }
         let mut seen = FxHashSet::default();
-        for adt in adts {
+        for &adt in &types.adts {
             if seen.insert(adt) {
                 let name = cx.def_path(ModuleDef::Adt(adt.into()));
+                // alloc: the firing lint's fact
                 diag.fact(Fact::Layout(cx.key(ItemId::Adt(adt))), format!("the representation of `{name}`"));
             }
         }
+        types.adts.clear();
         self.found.push(Found::lint(diag, Phase::Late, site.at));
     }
 }
@@ -923,32 +935,38 @@ fn power_aligned<'db>(types: &Types<'_, '_, 'db>, ty: Ty<'db>) -> bool {
     }
 }
 
-fn field_def(cx: &Cx<'_, '_>, field: &InFile<SyntaxNode>) -> Option<hir::Field> {
-    if let Some(it) = ast::RecordField::cast(field.value.clone()) {
-        return cx.sema.to_def2(field.with_value(&it));
+fn field_def<'db>(cx: &Cx<'_, 'db>, field: InFile<ast::Node<'db>>) -> Option<hir::Field> {
+    match field.value.kind() {
+        SyntaxKind::RECORD_FIELD => {
+            let it = ast::RecordField::cast(field.value)?;
+            cx.vsema.to_def2(field.with_value(it))
+        }
+        SyntaxKind::TUPLE_FIELD => {
+            let it = ast::TupleField::cast(field.value)?;
+            cx.vsema.to_def2(field.with_value(it))
+        }
+        _ => None,
     }
-    let it = ast::TupleField::cast(field.value.clone())?;
-    cx.sema.to_def2(field.with_value(&it))
 }
 
 /// A field's type as declared.
-fn field_ty<'db>(cx: &Cx<'_, 'db>, field: &InFile<SyntaxNode>) -> Option<Ty<'db>> {
+fn field_ty<'db>(cx: &Cx<'_, 'db>, field: InFile<ast::Node<'db>>) -> Option<Ty<'db>> {
     let id = hir_def::FieldId::from(field_def(cx, field)?);
     Some(cx.db.field_types(id.parent)[id.local_id].ty().skip_binder())
 }
 
 /// Whether a syntax node is a type rustc's HIR has one of: not the parentheses around one,
 /// nor the `for<..>` of a `fn` pointer type.
-fn counted(node: &SyntaxNode) -> bool {
+fn counted(node: ast::Node<'_>) -> bool {
     ast::Type::can_cast(node.kind()) && !ast::ParenType::can_cast(node.kind()) && !ast::ForType::can_cast(node.kind())
 }
 
 /// rustc's `ImproperCTypesLint` at an item itself: `check_foreign_item`, and `check_item` of a
 /// static, a const, a type alias or a `repr(C)` struct.
-pub(super) fn ctypes_item(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
-    let mut pass = Pass { cx, found: Vec::new() };
+pub(super) fn ctypes_item<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate) -> Vec<Found> {
+    let mut pass = Pass { cx, found: Vec::new() }; // alloc: empty until a lint fires; holds only what fires
     let db = cx.db;
-    match (&item.node.value, &item.container) {
+    match (item.node.value, item.container) {
         (ast::Item::Fn(f), Container::Extern(_)) => pass.function(item, f, CItemKind::Declaration),
         (ast::Item::Static(s), Container::Extern(block)) => {
             if abi_of(block.value.abi(), ExternAbi::C { unwind: false }).is_some_and(|it| !it.is_rustic_abi()) {
@@ -956,14 +974,14 @@ pub(super) fn ctypes_item(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Fo
             }
         }
         (ast::Item::Static(s), Container::Module) => {
-            if let Some(def) = cx.sema.to_def2(item.node.with_value(s)) {
+            if let Some(def) = cx.vsema.to_def2(item.node.with_value(s)) {
                 let id: hir_def::StaticId = def.into();
                 let ty = db.type_for_static(id).skip_binder();
                 pass.typed(item, GenericDefId::StaticId(id), def.ty(db), ty, s.ty());
             }
         }
         (ast::Item::Const(c), Container::Module) => {
-            if let Some(def) = cx.sema.to_def2(item.node.with_value(c)) {
+            if let Some(def) = cx.vsema.to_def2(item.node.with_value(c)) {
                 let id: hir_def::ConstId = def.into();
                 if let Some(ty) = db.value_ty(ValueTyDefId::ConstId(id)) {
                     pass.typed(item, GenericDefId::ConstId(id), def.ty(db), ty.skip_binder(), c.ty());
@@ -971,7 +989,7 @@ pub(super) fn ctypes_item(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Fo
             }
         }
         (ast::Item::TypeAlias(t), Container::Module) => {
-            if let Some(def) = cx.sema.to_def2(item.node.with_value(t)) {
+            if let Some(def) = cx.vsema.to_def2(item.node.with_value(t)) {
                 let id: hir_def::TypeAliasId = def.into();
                 let ty = db.ty(TyDefId::TypeAliasId(id)).skip_binder();
                 pass.typed(item, GenericDefId::TypeAliasId(id), def.ty(db), ty, t.ty());
@@ -985,9 +1003,9 @@ pub(super) fn ctypes_item(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Fo
 
 /// rustc's `ImproperCTypesLint` as the walk of an item reaches what is in it, after every pass's
 /// `check_item`: `check_field_def` of each field, `check_fn` of a function with a body.
-pub(super) fn ctypes_nested(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
-    let mut pass = Pass { cx, found: Vec::new() };
-    match (&item.node.value, &item.container) {
+pub(super) fn ctypes_nested<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>) -> Vec<Found> {
+    let mut pass = Pass { cx, found: Vec::new() }; // alloc: empty until a lint fires; holds only what fires
+    match (item.node.value, item.container) {
         (ast::Item::Fn(_), Container::Extern(_)) => {}
         (ast::Item::Fn(f), _) if f.body().is_some() => pass.function(item, f, CItemKind::Definition),
         (ast::Item::Struct(_) | ast::Item::Union(_) | ast::Item::Enum(_), _) => pass.fields(item),
@@ -1000,13 +1018,13 @@ pub(super) fn ctypes_nested(cx: &Cx<'_, '_>, item: &Item) -> Vec<Found> {
 fn symbol(cx: &Cx<'_, '_>, id: FunctionId) -> Symbol {
     match AttrFlags::link_name(cx.db, AttrDefId::FunctionId(id)) {
         Some(name) => name,
-        None => FunctionSignature::of(cx.db, id).name.symbol().clone(),
+        None => FunctionSignature::of(cx.db, id).name.symbol().clone(), // clone: an interned `Symbol`'s handle
     }
 }
 
 /// The span of the `#[link_name]` that names an `extern` function's symbol, if one does; read
 /// only for a lint that fires.
-fn link_name(cx: &Cx<'_, '_>, id: FunctionId, f: &ast::Fn) -> Option<TextRange> {
+fn link_name(cx: &Cx<'_, '_>, id: FunctionId, f: ast::Fn<'_>) -> Option<TextRange> {
     AttrFlags::link_name(cx.db, AttrDefId::FunctionId(id))?;
     walk::attr(cx, f, "link_name").map(|(_, range)| range)
 }
@@ -1024,7 +1042,7 @@ impl<'db> Same<'_, '_, '_, 'db> {
             if let TyKind::Adt(def, args) = ty.kind() {
                 let adt = def.def_id();
                 if self.types.repr(adt).transparent() && !self.types.nonnull_optimization_guaranteed(adt) {
-                    let first = self.types.variants(adt).into_iter().next();
+                    let first = variants(self.types.cx.db, adt).next();
                     if let Some(field) = first.and_then(|variant| self.types.transparent_field(adt, variant, args)) {
                         ty = field;
                         continue;
@@ -1079,12 +1097,11 @@ impl<'db> Same<'_, '_, '_, 'db> {
                 if (a_repr.pack, a_repr.align, a_repr.simd()) != (b_repr.pack, b_repr.align, b_repr.simd()) {
                     return false;
                 }
-                let fields = |def: AdtId, args| -> Vec<Ty<'db>> {
-                    self.types.variants(def).into_iter().flat_map(|variant| self.types.field_tys(variant, args)).collect()
-                };
-                let a_fields = fields(a_def.def_id(), a_args);
-                let b_fields = fields(b_def.def_id(), b_args);
-                a_fields.len() == b_fields.len() && a_fields.into_iter().zip(b_fields).all(|(a, b)| self.ty(a, b))
+                let (db, interner) = (self.types.cx.db, self.types.interner);
+                let fields = |def: AdtId, args| variants(db, def).flat_map(move |variant| field_tys(db, interner, variant, args));
+                let (a_def, b_def) = (a_def.def_id(), b_def.def_id());
+                fields(a_def, a_args).count() == fields(b_def, b_args).count()
+                    && fields(a_def, a_args).zip(fields(b_def, b_args)).all(|(a, b)| self.ty(a, b))
             }
             (TyKind::Array(a_ty, a_len), TyKind::Array(b_ty, b_len)) => a_len == b_len && self.ty(a_ty, b_ty),
             (TyKind::Slice(a_ty), TyKind::Slice(b_ty)) => self.ty(a_ty, b_ty),
@@ -1108,22 +1125,22 @@ impl<'db> Same<'_, '_, '_, 'db> {
 
 /// `clashing_extern_declarations`: each function of an `extern` block, in the order of rustc's
 /// `foreign_items`, against the first declared before it with the same symbol.
-pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
+pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, items: &[Item<'db>]) -> Vec<Found> {
     let db = cx.db;
-    let mut decls = Vec::new();
+    let mut decls = Vec::new_in(cx.frame());
     let mut orders = Orders::default();
     for item in items {
-        let (ast::Item::Fn(f), Container::Extern(_)) = (&item.node.value, &item.container) else { continue };
-        let Some(def) = cx.sema.to_def2(item.node.with_value(f)) else { continue };
+        let (ast::Item::Fn(f), Container::Extern(_)) = (item.node.value, item.container) else { continue };
+        let Some(def) = cx.vsema.to_def2(item.node.with_value(f)) else { continue };
         let Ok(id) = FunctionId::try_from(def) else { continue };
-        let lo = cx.span(item.node.as_ref().map(|it| item_range(it.syntax()))).lo;
+        let lo = cx.span(item.node.map(|it| item_range_view(it.syntax()))).lo;
         decls.push((orders.key(cx, item.module, lo), item, f, def, id));
     }
     if decls.len() < 2 {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
     decls.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut found = Vec::new();
+    let mut found = Vec::new(); // alloc: empty until a lint fires; holds only what fires
     let mut seen: FxHashMap<Symbol, usize> = FxHashMap::with_capacity_and_hasher(decls.len(), Default::default());
     for index in 0..decls.len() {
         let (_, item, f, def, id) = &decls[index];
@@ -1147,28 +1164,32 @@ pub(super) fn lints(cx: &Cx<'_, '_>, items: &[Item]) -> Vec<Found> {
         if same.sigs(erased.0, erased.1) {
             continue;
         }
+        // From here on the lint fires.
+        // alloc: the firing lint's message
         let this = FunctionSignature::of(db, *id).name.as_str().to_owned();
         let orig = symbol(cx, *first_id);
         let orig = orig.as_str();
-        let (orig_link, this_link) = (link_name(cx, *first_id, first_f), link_name(cx, *id, f));
-        let relevant = |item: &Item, link: Option<TextRange>| {
-            cx.span(item.node.as_ref().map(|it| link.unwrap_or_else(|| item_range(it.syntax()))))
+        let (orig_link, this_link) = (link_name(cx, *first_id, *first_f), link_name(cx, *id, *f));
+        let relevant = |item: &Item<'_>, link: Option<TextRange>| {
+            cx.span(item.node.map(|it| link.unwrap_or_else(|| item_range_view(it.syntax()))))
         };
         let previous = relevant(*first_item, orig_link);
         let mismatch = relevant(*item, this_link);
         let message = if orig == this {
-            format!("`{this}` redeclared with a different signature")
+            format!("`{this}` redeclared with a different signature") // alloc: the firing lint's message
         } else {
-            format!("`{this}` redeclares `{orig}` with a different signature")
+            format!("`{this}` redeclares `{orig}` with a different signature") // alloc: the firing lint's message
         };
+        // clone: the firing lint's span, labelled too
         let mut diag = Diag::lint("clashing_extern_declarations", message, mismatch.clone());
-        diag.span_label(previous, format!("`{orig}` previously declared here"));
+        diag.span_label(previous, format!("`{orig}` previously declared here")); // alloc: its label
         diag.span_label(mismatch, "this signature doesn't match the previous declaration");
         let print = |def: &hir::Function, sig| cx.ty(&def.ret_type(db).derived_from_next_solver(Ty::new_fn_ptr(interner, sig)));
-        diag.note(format!("expected `{}`\n   found `{}`", print(first_def, expected), print(def, this_sig)));
-        let first_name = FunctionSignature::of(db, *first_id).name.as_str().to_owned();
+        diag.note(format!("expected `{}`\n   found `{}`", print(first_def, expected), print(def, this_sig))); // alloc: its note
+        let first_name = FunctionSignature::of(db, *first_id).name.as_str().to_owned(); // alloc: its fact
+        // alloc: its facts
         diag.fact(Fact::Signature(cx.key(ItemId::Function(*first_id))), format!("the signature of `{first_name}`"));
-        diag.fact(Fact::Signature(cx.key(ItemId::Function(*id))), format!("the signature of `{this}`"));
+        diag.fact(Fact::Signature(cx.key(ItemId::Function(*id))), format!("the signature of `{this}`")); // alloc: as above
         found.push(Found::lint(diag, Phase::Late, item.ptr()));
     }
     found

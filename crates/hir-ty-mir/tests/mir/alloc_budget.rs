@@ -4,7 +4,7 @@
 //! reserved once per thread and reused.
 
 use blaze_alloc_count::{assert_at_most, measure};
-use hir_def::HasModule;
+use hir_def::{HasModule, expr_store::Body, hir::Expr};
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::HirDatabase,
@@ -220,11 +220,11 @@ fn optimize_allocates_the_kept_body_only() {
         let options = MirOptions::at(MirOptLevel::Release);
         let runtime = db.runtime_mir_body(def).expect("the runtime body").clone();
         // At its fixed point, no pass removes anything, so the copy is all that is kept.
-        let once = budget::optimize(&db, &runtime, options).expect("the optimizations");
-        let fixed = budget::optimize(&db, &once, options).expect("the optimizations, again");
+        let once = budget::optimize(&db, &runtime, options, None).expect("the optimizations");
+        let fixed = budget::optimize(&db, &once, options, None).expect("the optimizations, again");
         let (infcx, setup) = measure(|| budget::new_infer_ctxt(&db, def));
         drop(infcx);
-        let (ran, used) = measure(|| budget::optimize(&db, &fixed, options));
+        let (ran, used) = measure(|| budget::optimize(&db, &fixed, options, None));
         let ran = ran.expect("the optimizations at their fixed point");
         assert_eq!(ran, fixed, "the optimizations at their fixed point");
         assert_eq!(used.allocations, owned(&fixed) + setup.allocations);
@@ -304,6 +304,46 @@ pub fn many() -> u32 {
         // whose type fills to itself keeps its allocation's handle.
         assert_eq!(few, many, "no allocation per constant operand");
     });
+}
+
+/// A body of `n` statements at one scope depth, with the same types in each: what lowering
+/// allocates for itself must not grow with `n`.
+fn straight(n: usize) -> String {
+    let mut text = String::from(
+        "//- minicore: sized, copy, add\npub fn straight(a: u32) -> u32 {\n    let mut x = a;\n",
+    );
+    for _ in 0..n {
+        text.push_str("    x = x + 1;\n");
+    }
+    text.push_str("    x\n}\n");
+    text
+}
+
+/// What lowering `straight(n)` allocates beyond the body it keeps, and what its setup does.
+fn lowering_extra(n: usize) -> (u64, u64) {
+    let (db, _) = TestDB::with_single_file(&straight(n));
+    hir_ty::attach_db(&db, || {
+        let def = body_of(&db, "straight");
+        let warm = budget::lower(&db, def).expect("the body");
+        // The block's tail `x`: the path with the deepest scope chain of the body.
+        let body = Body::of(&db, function(&db, "straight").into());
+        let Expr::Block { tail: Some(tail), .. } = body.expr(body.root_expr()) else {
+            panic!("`straight` is a block with a tail")
+        };
+        let ((), setup) = measure(|| budget::lowering_setup(&db, def, tail));
+        let (ran, used) = measure(|| budget::lower(&db, def));
+        let ran = ran.expect("the body, again");
+        assert_eq!(ran, warm);
+        (used.allocations - owned(&ran), setup.allocations)
+    })
+}
+
+#[test]
+fn lowering_allocates_the_kept_body_and_its_setup_only() {
+    let (small, setup) = lowering_extra(8);
+    let (large, _) = lowering_extra(64);
+    assert_eq!(small, large, "lowering's own allocations grow with the body");
+    assert_eq!(small, setup, "lowering allocates beyond the body and its setup");
 }
 
 #[test]

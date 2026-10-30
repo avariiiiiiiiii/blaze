@@ -33,10 +33,7 @@ use hir_def::{
     visibility::Visibility,
 };
 use ide_db::RootDatabase;
-use syntax::{
-    AstNode,
-    ast::{self, HasName},
-};
+use syntax::view::{self as ast, AstNode, HasName};
 
 use crate::{
     model::{Code, Kind, Piece},
@@ -890,19 +887,19 @@ fn self_param(sig: &Sig<'_>, out: &mut Code, ty: TypeRefId, store: &ExpressionSt
 /// The parameter names as rustdoc shows them: a binding's name without `mut` or `ref`, another
 /// pattern as written.
 fn param_names(db: &RootDatabase, func: hir::Function) -> Vec<Option<String>> {
-    use hir::HasSource;
-    let Some(source) = func.source(db) else { return vec![] };
+    use hir::view::HasSourceView;
+    let Some(source) = func.source_view(db) else { return vec![] };
     let Some(list) = source.value.param_list() else { return vec![] };
     let mut out = vec![];
     if list.self_param().is_some() {
         out.push(None);
     }
     for param in list.params() {
-        let name = param.pat().map(|pat| match &pat {
+        let name = param.pat().map(|pat| match pat {
             ast::Pat::IdentPat(ident) if ident.pat().is_none() => {
                 ident.name().map_or_else(|| "_".to_owned(), |it| it.text().to_owned())
             }
-            other => squash(&other.syntax().text().to_string()),
+            other => squash(other.syntax().text()),
         });
         out.push(Some(name.unwrap_or_else(|| "_".to_owned())));
     }
@@ -1387,12 +1384,12 @@ pub(crate) fn constant(
 
 /// A constant's value as written when it is short and simple, as rustdoc shows it.
 fn short_initializer(db: &RootDatabase, it: hir::Const) -> Option<String> {
-    use hir::HasSource;
-    let source = it.source(db)?;
+    use hir::view::HasSourceView;
+    let source = it.source_view(db)?;
     let body = source.value.body()?;
     let simple = matches!(body, ast::Expr::Literal(_) | ast::Expr::PathExpr(_))
-        || matches!(&body, ast::Expr::PrefixExpr(prefix) if matches!(prefix.expr(), Some(ast::Expr::Literal(_))));
-    let text = squash(&body.syntax().text().to_string());
+        || matches!(body, ast::Expr::PrefixExpr(prefix) if matches!(prefix.expr(), Some(ast::Expr::Literal(_))));
+    let text = squash(body.syntax().text());
     (simple && text.len() <= 60).then_some(text)
 }
 
@@ -1446,11 +1443,11 @@ pub(crate) fn impl_header(db: &RootDatabase, places: Linking<'_>, it: hir::Impl)
 /// Whether `it` is the impl of a built-in derive (`#[derive(Clone)]`), which rustdoc shows as
 /// rustc's derive writes it, whatever rust-analyzer's expansion of it says.
 pub(crate) fn is_builtin_derive(db: &RootDatabase, it: hir::Impl) -> bool {
-    use hir::HasSource;
+    use hir::view::HasSourceView;
     if ImplId::try_from(it).is_err() {
         return true;
     }
-    let Some(source) = it.source(db) else { return false };
+    let Some(source) = it.source_view(db) else { return false };
     source
         .file_id
         .macro_file()

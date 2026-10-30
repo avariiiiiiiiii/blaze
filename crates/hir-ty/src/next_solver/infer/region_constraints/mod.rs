@@ -50,7 +50,7 @@ impl<'db> SolverRegionConstraintData<'db> {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct RegionConstraintStorage<'db> {
     /// For each `RegionVid`, the corresponding `RegionVariableOrigin`.
     pub(super) var_infos: IndexVec<RegionVid, RegionVariableInfo>,
@@ -93,6 +93,80 @@ pub struct RegionConstraintStorage<'db> {
     any_unifications: bool,
 }
 
+impl Clone for RegionConstraintStorage<'_> {
+    fn clone(&self) -> Self {
+        RegionConstraintStorage {
+            // clone: only `InferCtxt::fork` copies the region tables.
+            var_infos: self.var_infos.clone(),
+            // clone: only `InferCtxt::fork` copies the region tables.
+            legacy_data: self.legacy_data.clone(),
+            // clone: only `InferCtxt::fork` copies the region tables.
+            solver_data: self.solver_data.clone(),
+            // clone: only `InferCtxt::fork` copies the region tables.
+            solver_overwrites: self.solver_overwrites.clone(),
+            // clone: only `InferCtxt::fork` copies the region tables.
+            lubs: self.lubs.clone(),
+            // clone: only `InferCtxt::fork` copies the region tables.
+            glbs: self.glbs.clone(),
+            // clone: only `InferCtxt::fork` copies the region tables.
+            combinations: self.combinations.clone(),
+            // clone: only `InferCtxt::fork` copies the region tables.
+            unification_table: self.unification_table.clone(),
+            any_unifications: self.any_unifications,
+        }
+    }
+
+    /// Into `self`'s tables, keeping their capacity: a warm fork copies without allocating.
+    fn clone_from(&mut self, source: &Self) {
+        self.var_infos.raw.clone_from(&source.var_infos.raw);
+        self.legacy_data.clone_from(&source.legacy_data);
+        self.solver_data.clone_from(&source.solver_data);
+        self.solver_overwrites.clone_from(&source.solver_overwrites);
+        self.lubs.clone_from(&source.lubs);
+        self.glbs.clone_from(&source.glbs);
+        self.combinations.clone_from(&source.combinations);
+        self.unification_table.clone_from(&source.unification_table);
+        self.any_unifications = source.any_unifications;
+    }
+}
+
+impl RegionConstraintStorage<'_> {
+    /// Back to `default()`, its capacity kept.
+    pub(crate) fn empty(&mut self) {
+        let RegionConstraintStorage {
+            var_infos,
+            legacy_data,
+            solver_data,
+            solver_overwrites,
+            lubs,
+            glbs,
+            combinations,
+            unification_table,
+            any_unifications,
+        } = self;
+        var_infos.raw.clear();
+        legacy_data.empty();
+        *solver_data = SolverRegionConstraintData::default();
+        solver_overwrites.clear();
+        lubs.clear();
+        glbs.clear();
+        combinations.clear();
+        unification_table.empty();
+        *any_unifications = false;
+    }
+
+    /// Bytes its tables hold room for.
+    pub(crate) fn held(&self) -> usize {
+        self.var_infos.raw.capacity() * size_of::<RegionVariableInfo>()
+            + self.legacy_data.held()
+            + self.solver_overwrites.capacity() * size_of::<SolverRegionConstraint<'_>>()
+            + (self.lubs.capacity() + self.glbs.capacity())
+                * size_of::<(TwoRegions<'_>, RegionVid)>()
+            + self.combinations.capacity() * size_of::<(CombineMapType, TwoRegions<'_>)>()
+            + self.unification_table.held()
+    }
+}
+
 pub struct RegionConstraintCollector<'db, 'a> {
     storage: &'a mut RegionConstraintStorage<'db>,
     in_snapshot: bool,
@@ -104,7 +178,7 @@ pub type VarInfos = IndexVec<RegionVid, RegionVariableInfo>;
 /// Describes constraints between the region variables and other
 /// regions, as well as other conditions that must be verified, or
 /// assumptions that can be made.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct RegionConstraintData<'db> {
     /// Constraints of the form `A <= B`, where either `A` or `B` can
     /// be a region variable (or neither, as it happens).
@@ -122,6 +196,40 @@ pub struct RegionConstraintData<'db> {
     /// An example is a `A <= B` where neither `A` nor `B` are
     /// inference variables.
     pub verifys: Vec<Verify<'db>>,
+}
+
+impl Clone for RegionConstraintData<'_> {
+    fn clone(&self) -> Self {
+        RegionConstraintData {
+            // clone: only a fork or a caller taking the data copies it.
+            constraints: self.constraints.clone(),
+            // clone: only a fork or a caller taking the data copies it.
+            member_constraints: self.member_constraints.clone(),
+            // clone: only a fork or a caller taking the data copies it.
+            verifys: self.verifys.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.constraints.clone_from(&source.constraints);
+        self.member_constraints.clone_from(&source.member_constraints);
+        self.verifys.clone_from(&source.verifys);
+    }
+}
+
+impl RegionConstraintData<'_> {
+    /// Back to `default()`, its capacity kept.
+    fn empty(&mut self) {
+        self.constraints.truncate(0, 0);
+        self.member_constraints.clear();
+        self.verifys.clear();
+    }
+
+    fn held(&self) -> usize {
+        self.constraints.held()
+            + self.member_constraints.capacity() * size_of::<MemberConstraint<'_>>()
+            + self.verifys.capacity() * size_of::<Verify<'_>>()
+    }
 }
 
 /// Represents a constraint that influences the inference process.
@@ -168,12 +276,34 @@ impl<'db> Constraint<'db> {
 /// The constraints `sub <= sup` as columns. A row is a tag byte (the kind in the low two bits,
 /// whether the leak check sees it in the next two) and two `u32` operands: a variable's index,
 /// or for a concrete region its index in `regions`.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct RegionConstraints<'db> {
     tag: Vec<u8>,
     sub: Vec<u32>,
     sup: Vec<u32>,
     regions: Vec<Region<'db>>,
+}
+
+impl Clone for RegionConstraints<'_> {
+    fn clone(&self) -> Self {
+        RegionConstraints {
+            // clone: only a fork or a caller taking the data copies the columns.
+            tag: self.tag.clone(),
+            // clone: only a fork or a caller taking the data copies the columns.
+            sub: self.sub.clone(),
+            // clone: only a fork or a caller taking the data copies the columns.
+            sup: self.sup.clone(),
+            // clone: only a fork or a caller taking the data copies the columns.
+            regions: self.regions.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.tag.clone_from(&source.tag);
+        self.sub.clone_from(&source.sub);
+        self.sup.clone_from(&source.sup);
+        self.regions.clone_from(&source.regions);
+    }
 }
 
 const KIND_VAR_SUB_VAR: u8 = 0;
@@ -268,6 +398,12 @@ impl<'db> RegionConstraints<'db> {
         self.tag.push(kind | (visibility << VISIBILITY_SHIFT));
         self.sub.push(sub);
         self.sup.push(sup);
+    }
+
+    fn held(&self) -> usize {
+        self.tag.capacity() * size_of::<u8>()
+            + (self.sub.capacity() + self.sup.capacity()) * size_of::<u32>()
+            + self.regions.capacity() * size_of::<Region<'_>>()
     }
 
     fn truncate(&mut self, len: usize, regions: usize) {

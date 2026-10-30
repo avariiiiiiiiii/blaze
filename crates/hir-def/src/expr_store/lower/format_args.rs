@@ -8,14 +8,11 @@ use hir_expand::name::{AsName, Name};
 use intern::{Symbol, sym};
 use smallvec::SmallVec;
 use span::SyntaxContext;
-use syntax::{
-    AstPtr, AstToken as _,
-    ast::{self, HasName},
-};
+use syntax::view::{self as ast, AstToken as _, HasName};
 
 use crate::{
     builtin_type::{BuiltinInt, BuiltinUint},
-    expr_store::{HygieneId, lower::ExprCollector},
+    expr_store::{ExprPtr, HygieneId, lower::ExprCollector},
     hir::{
         Array, BindingAnnotation, Expr, ExprId, Literal, Pat, Statement, Statements, Unsafe,
         format_args::{
@@ -31,26 +28,25 @@ use crate::{
 impl<'db> ExprCollector<'db> {
     pub(super) fn collect_format_args(
         &mut self,
-        f: ast::FormatArgsExpr,
-        syntax_ptr: AstPtr<ast::Expr>,
+        f: ast::FormatArgsExpr<'_>,
+        syntax_ptr: ExprPtr,
     ) -> ExprId {
         let mut args = FormatArgumentsCollector::default();
         let mut written = SmallVec::<[bool; 16]>::new();
         f.args().for_each(|arg| {
             let expr = arg.expr();
-            // clone: a syntax node's count bump, once per argument.
-            written.push(expr.clone().is_some_and(is_written_literal));
+            written.push(expr.is_some_and(is_written_literal));
             args.add(FormatArgument {
                 kind: match arg.name() {
                     Some(name) => FormatArgumentKind::Named(name.as_name()),
                     None => FormatArgumentKind::Normal,
                 },
-                syntax: expr.as_ref().map(AstPtr::new),
+                syntax: expr.map(ExprPtr::of),
                 expr: self.collect_expr_opt(expr),
             });
         });
         let template = f.template();
-        let fmt_snippet = template.as_ref().and_then(|it| match it {
+        let fmt_snippet = template.and_then(|it| match it {
             ast::Expr::Literal(literal) => match literal.kind() {
                 // alloc: `format_args::parse` takes an owned snippet, once per call.
                 ast::LiteralKind::String(s) => Some(s.text().to_owned()),
@@ -61,16 +57,15 @@ impl<'db> ExprCollector<'db> {
         let record = self.store.record;
         // alloc: the source-map side table it stores, once per call.
         let mut mappings = vec![];
-        let (mut fmt, hygiene) = match template.and_then(|template| {
-            // clone: a syntax node's count bump, once per call.
-            self.expand_macros_to_string(template.clone()).map(|it| (it, template))
-        }) {
+        let (mut fmt, hygiene) = match template
+            .and_then(|template| self.expand_macros_to_string(template).map(|it| (it, template)))
+        {
             Some(((s, is_direct_literal), template)) => {
                 let call_ctx = SyntaxContext::root(self.def_map.edition());
                 let hygiene = self.hygiene_id_for(s.syntax().text_range());
-                let template_ptr = AstPtr::new(&template);
+                let template_ptr = ExprPtr::of(template);
                 let fmt = format_args::parse(
-                    &s,
+                    s,
                     template_ptr,
                     fmt_snippet,
                     args,
@@ -125,7 +120,7 @@ impl<'db> ExprCollector<'db> {
     // function but not its caller, and for some time support both versions.
     fn collect_format_args_impl(
         &mut self,
-        syntax_ptr: AstPtr<ast::Expr>,
+        syntax_ptr: ExprPtr,
         fmt: FormatArgs,
     ) -> ExprId {
         let lang_items = self.lang_items();
@@ -557,7 +552,7 @@ impl<'db> ExprCollector<'db> {
     /// ```
     fn make_argument(
         &mut self,
-        arg_ptr: Option<AstPtr<ast::Expr>>,
+        arg_ptr: Option<ExprPtr>,
         arg: ExprId,
         ty: ArgumentType,
     ) -> ExprId {
@@ -611,7 +606,7 @@ impl<'db> ExprCollector<'db> {
 }
 
 /// Whether `expr`, through parentheses and `&`, is a literal written as one, and not a byte.
-fn is_written_literal(mut expr: ast::Expr) -> bool {
+fn is_written_literal(mut expr: ast::Expr<'_>) -> bool {
     loop {
         expr = match expr {
             ast::Expr::ParenExpr(it) => match it.expr() {

@@ -19,11 +19,11 @@ use crate::next_solver::{
         traits::{ObligationCause, PredicateObligations},
     },
 };
-use rustc_hash::FxHashMap;
 use rustc_index::{Idx as _, IndexVec};
 use rustc_type_ir::{
     BoundVar, BoundVarIndexKind, GenericArgKind, IsRigid, PredicateProxy, TypeFlags, TypeFoldable,
     TypeFolder, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    data_structures::DelayedMap,
     inherent::{GenericArg as _, IntoKind},
     solve::VisibleForLeakCheck,
 };
@@ -137,7 +137,7 @@ struct CanonicalInstantiator<'db, 'a> {
 
     // Because we use `BoundVarIndexKind::Canonical`, we can cache
     // based only on the entire ty, not worrying about a `DebruijnIndex`
-    cache: FxHashMap<Ty<'db>, Ty<'db>>,
+    cache: DelayedMap<Ty<'db>, Ty<'db>>,
 }
 
 impl<'db, 'a> TypeFolder<DbInterner<'db>> for CanonicalInstantiator<'db, 'a> {
@@ -157,7 +157,7 @@ impl<'db, 'a> TypeFolder<DbInterner<'db>> for CanonicalInstantiator<'db, 'a> {
                     t
                 } else {
                     let res = t.super_fold_with(self);
-                    assert!(self.cache.insert(t, res).is_none());
+                    assert!(self.cache.insert(t, res));
                     res
                 }
             }
@@ -533,5 +533,41 @@ impl<'db> InferCtxt<'db> {
             }
         }
         Ok(InferOk { value: (), obligations })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use base_db::Db;
+    use rustc_type_ir::{BoundVar, Mutability, UintTy, inherent::Ty as _};
+
+    use super::instantiate_value;
+    use crate::next_solver::{CanonicalVarValues, DbInterner, GenericArg, GenericArgs, Ty};
+
+    /// Instantiating a response is the global cache's hit path: a value with a few bound
+    /// variables below types that aren't bound variables themselves (`[^0]`, `*const ^1`) is
+    /// folded without the instantiator's cache touching the heap.
+    #[test]
+    fn instantiating_a_small_canonical_value_allocates_nothing() {
+        let db = Db::for_tests();
+        let tcx = DbInterner::new_no_crate(&db);
+        let bound = |var: u32| Ty::new_canonical_bound(tcx, BoundVar::from_u32(var));
+        let value = Ty::new_tup(
+            tcx,
+            &[Ty::new_slice(tcx, bound(0)), Ty::new_ptr(tcx, bound(1), Mutability::Not)],
+        );
+        let var_values = CanonicalVarValues {
+            var_values: GenericArgs::new_from_slice(&[
+                GenericArg::from(Ty::new_uint(tcx, UintTy::U8)),
+                GenericArg::from(Ty::new_uint(tcx, UintTy::U32)),
+            ]),
+        };
+        // The first instantiation interns the result's types.
+        let expected = instantiate_value(tcx, &var_values, value);
+        blaze_alloc_count::assert_at_most(0, "instantiating a small canonical value", || {
+            for _ in 0..100 {
+                assert!(instantiate_value(tcx, &var_values, value) == expected);
+            }
+        });
     }
 }

@@ -88,7 +88,12 @@ impl std::error::Error for Refused {}
 
 /// What a borrow check result lets run: errors first, as they say the most.
 fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(), Refused> {
-    let errors: Vec<_> = result.diagnostics.iter().filter(|it| it.is_error()).cloned().collect();
+    let errors: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|it| it.is_error())
+        .cloned()
+        .collect(); // alloc: a refusal's own errors; empty, so no allocation, for a passing body
     if !errors.is_empty() {
         return Err(Refused::Errors { owner, errors });
     }
@@ -98,7 +103,8 @@ fn verdict(owner: DefWithBodyId, result: &BorrowckResult) -> Result<(), Refused>
         return Err(Refused::NotChecked { owner, why });
     }
     if let Some(what) = &result.skipped {
-        return Err(Refused::Unsupported { owner, what: what.clone() });
+        let what = what.clone(); // clone: a refusal owns its text, on the error path
+        return Err(Refused::Unsupported { owner, what });
     }
     Ok(())
 }
@@ -124,9 +130,13 @@ fn mir_of<'db>(
     def: DefWithBodyId,
     body: Result<&'db MirBody<'db>, MirLowerError<'db>>,
 ) -> Result<&'db MirBody<'db>, Refused> {
-    let body = body.map_err(|error| Refused::Lowering { owner: def, error: format!("{error:?}") })?;
+    let body = body.map_err(|error| {
+        let error = format!("{error:?}"); // alloc: a refusal's message, on the error path
+        Refused::Lowering { owner: def, error }
+    })?;
     if !belongs(db, body.owner, def) {
-        return Err(Refused::NotOf { owner: def, mir_owner: format!("{:?}", body.owner) });
+        let mir_owner = format!("{:?}", body.owner); // alloc: a refusal's message, error path
+        return Err(Refused::NotOf { owner: def, mir_owner });
     }
     Ok(body)
 }

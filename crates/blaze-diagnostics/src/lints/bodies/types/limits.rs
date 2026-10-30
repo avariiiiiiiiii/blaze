@@ -393,6 +393,7 @@ impl TypeLimits {
             return Some(b.lint(diag, Phase::Late, at));
         }
         let mut diag =
+            // clone: a span, for the invalid_nan_comparisons lint
             Diag::lint(LINT, "incorrect NaN comparison, NaN cannot be directly compared to itself", e_span.clone());
         let spans = util::span(b, l)
             .zip(util::span(b, r))
@@ -402,14 +403,19 @@ impl TypeLimits {
             return Some(b.lint(diag, Phase::Late, at));
         };
         let (operand, removed) = match nan {
+            // clone: a span, for the invalid_nan_comparisons lint
             Nan::EqLeft => (r_span.clone(), until(&l_span, &r_span)),
+            // clone: a span, for the invalid_nan_comparisons lint
             _ => (l_span.clone(), l_span.shrink_to_hi().to(&r_span)),
         };
         let mut parts = Vec::with_capacity(3);
         if op == Cmp::Ne {
+            // alloc: the invalid_nan_comparisons lint's text
             parts.push((operand.shrink_to_lo(), "!".to_owned()));
         }
+        // alloc: the invalid_nan_comparisons lint's text
         parts.push((operand.shrink_to_hi(), ".is_nan()".to_owned()));
+        // alloc: the invalid_nan_comparisons lint's text
         parts.push((removed, String::new()));
         diag.suggestion_with_style(parts, HELP, Applicability::MachineApplicable, SuggestionStyle::ShowAlways);
         Some(b.lint(diag, Phase::Late, at))
@@ -454,6 +460,7 @@ impl TypeLimits {
         let (r_refs, r_modifiers, r_dyn) = self.ptr_unsized(b, &mut solver, util::ty(b, r))?;
         let e_span = &util::span(b, e)?;
         let at = b.expr_node(e)?;
+        // clone: a span, for the ambiguous_wide_pointer_comparisons lint
         let mut diag = Diag::lint(LINT, MESSAGE, e_span.clone());
         let spans = util::span(b, l)
             .zip(util::span(b, r))
@@ -476,9 +483,13 @@ impl TypeLimits {
             diag.suggestion_with_style(parts, message, Applicability::MaybeIncorrect, SuggestionStyle::ShowAlways);
         };
         let eq_parts = |function: &str| {
+            // alloc: the ambiguous_wide_pointer_comparisons lint's text
             vec![
+                // alloc: the ambiguous_wide_pointer_comparisons lint's text; clone: a span, for the ambiguous_wide_pointer_comparisons lint
                 (left.clone(), format!("{ne}std::ptr::{function}({deref_left}")),
+                // alloc: the ambiguous_wide_pointer_comparisons lint's text; clone: a span, for the ambiguous_wide_pointer_comparisons lint
                 (middle.clone(), format!("{l_modifiers}, {deref_right}")),
+                // alloc: the ambiguous_wide_pointer_comparisons lint's text; clone: a span, for the ambiguous_wide_pointer_comparisons lint
                 (right.clone(), format!("{r_modifiers})")),
             ]
         };
@@ -494,25 +505,33 @@ impl TypeLimits {
         } else {
             let paren_left = if l_refs != 0 { ")" } else { "" };
             let paren_right = if r_refs != 0 { ")" } else { "" };
+            // alloc: the ambiguous_wide_pointer_comparisons lint's text
             let mut parts = Vec::new();
             if l_refs != 0 {
+                // alloc: the ambiguous_wide_pointer_comparisons lint's text
                 parts.push((l_span.shrink_to_lo(), format!("({deref_left}")));
             }
+            // alloc: the ambiguous_wide_pointer_comparisons lint's text
             parts.push((l_span.shrink_to_hi(), format!("{l_modifiers}{paren_left}.cast::<()>()")));
             if r_refs != 0 {
+                // alloc: the ambiguous_wide_pointer_comparisons lint's text
                 parts.push((r_span.shrink_to_lo(), format!("({deref_right}")));
             }
+            // alloc: the ambiguous_wide_pointer_comparisons lint's text
             parts.push((r_span.shrink_to_hi(), format!("{r_modifiers}{paren_right}.cast::<()>()")));
             verbose(&mut diag, "use untyped pointers to only compare their addresses", parts);
             let (open, close) = if via_method_call { ("", "") } else { ("(", ")") };
             verbose(
                 &mut diag,
                 "or expect the lint to compare the pointers metadata and addresses",
+                // alloc: the ambiguous_wide_pointer_comparisons lint's text
                 vec![
                     (
                         e_span.shrink_to_lo(),
+                        // alloc: the ambiguous_wide_pointer_comparisons lint's text
                         format!(r#"{{ #[expect(ambiguous_wide_pointer_comparisons, reason = "...")] {open}"#),
                     ),
+                    // alloc: the ambiguous_wide_pointer_comparisons lint's text
                     (e_span.shrink_to_hi(), format!("{close} }}")),
                 ],
             );
@@ -550,6 +569,7 @@ impl TypeLimits {
             let mut diag = Diag::lint(
                 LINT,
                 "function pointer comparisons do not produce meaningful results since their addresses are not guaranteed to be unique",
+                // clone: a span, for the unpredictable_function_pointer_comparisons lint
                 e_span.clone(),
             );
             diag.note("the address of the same function can vary between different codegen units");
@@ -574,16 +594,21 @@ impl TypeLimits {
         let middle = until(&l_span.shrink_to_hi(), &r_span.shrink_to_lo());
         let right = until(&r_span.shrink_to_hi(), &e_span.shrink_to_hi());
         let close = if matches!(r_ty.kind(), TyKind::FnPtr(..)) {
+            // alloc: the unpredictable_function_pointer_comparisons lint's text
             ")".to_owned()
         } else {
             let sig = r_ty.callable_sig(interner(b))?;
             let fn_ptr = Ty::new_fn_ptr(interner(b), sig);
+            // alloc: the unpredictable_function_pointer_comparisons lint's text
             format!(" as {})", util::print_ty(b, r, fn_ptr)?)
         };
         let mut diag = warn();
         diag.suggestion_with_style(
+            // alloc: the unpredictable_function_pointer_comparisons lint's text
             vec![
+                // alloc: the unpredictable_function_pointer_comparisons lint's text
                 (left, format!("{ne}std::ptr::fn_addr_eq({deref_left}")),
+                // alloc: the unpredictable_function_pointer_comparisons lint's text
                 (middle, format!(", {deref_right}")),
                 (right, close),
             ],

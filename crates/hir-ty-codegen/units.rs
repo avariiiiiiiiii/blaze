@@ -51,6 +51,7 @@ use std::{
 };
 
 use base_db::Db;
+use blaze_mem::Frame;
 use cranelift_codegen::ir;
 use hir_def::FunctionId;
 use hir_ty::{db::HirDatabase, traits::StoredParamEnvAndCrate};
@@ -62,6 +63,7 @@ use super::{
     backend::{self, Tally},
     cached, compiled_instance, compiled_root,
     fragment::{self, DataRequest, FuncRequest, FuncTarget, Recorder},
+    frame_map,
     home, imports, instance_rows, llvm, root_instance, root_rows, stable,
     tier::{self, Kind},
 };
@@ -187,14 +189,23 @@ fn shares(pending: &Pending) -> std::result::Result<(), &'static str> {
 /// the same of what it imports, and every function it takes the address of. What it imports
 /// and LLVM leaves a call of is kept by the unit ([`llvm::emit_unit`]); a root, which is
 /// called by its symbol, is called.
-fn calls_after_imports(db: &Db, pending: &Pending) -> Vec<FuncRequest> {
+fn calls_after_imports<'f>(
+    db: &Db,
+    pending: &Pending,
+    frame: &'f Frame,
+) -> Vec<FuncRequest, &'f Frame> {
     let (Ok(isa), Ok(target)) = (super::target(), super::selected_target()) else {
-        return pending.wants.requests.funcs.clone();
+        let all = &pending.wants.requests.funcs;
+        let mut calls = Vec::with_capacity_in(all.len(), frame);
+        calls.extend(all.iter().cloned());
+        return calls;
     };
+    // alloc: the import recorder's tables, per unit
     let mut recorder = Recorder::new(db, &**isa, target, false);
     let (funcs, datas) = recorder.moved_requests(&pending.wants.requests);
     let chosen = imports::chosen_for(&mut recorder, &FxHashSet::default(), imports::BUDGET);
-    let imported: FxHashMap<u32, &imports::Import> = chosen.iter().map(|it| (it.id, it)).collect();
+    let mut imported = frame_map::hash_map_with_capacity(chosen.len(), frame);
+    imported.extend(chosen.iter().map(|it| (it.id, it)));
     // What the IR refers to of its requests: some it asked for may be gone from it.
     let func = &pending.func;
     let named = |name: &ir::ExternalName| match name {
@@ -208,7 +219,8 @@ fn calls_after_imports(db: &Db, pending: &Pending) -> Vec<FuncRequest> {
         }
         _ => None,
     };
-    let (mut next, mut addressed, mut data) = (Vec::new(), FxHashSet::default(), Vec::new());
+    let (mut next, mut addressed, mut data) =
+        (Vec::new_in(frame), frame_map::hash_set(frame), Vec::new_in(frame));
     for block in func.layout.blocks() {
         for inst in func.layout.block_insts(block) {
             match func.dfg.insts[inst] {
@@ -246,7 +258,7 @@ fn calls_after_imports(db: &Db, pending: &Pending) -> Vec<FuncRequest> {
     // What is called, and what is taken the address of, with what that is built in calls
     // and refers to in turn.
     let (mut called, mut seen, mut reached) =
-        (FxHashSet::default(), FxHashSet::default(), FxHashSet::default());
+        (frame_map::hash_set(frame), frame_map::hash_set(frame), frame_map::hash_set(frame));
     next.extend(addressed.iter().copied());
     called.extend(addressed);
     loop {
@@ -283,9 +295,14 @@ fn calls_after_imports(db: &Db, pending: &Pending) -> Vec<FuncRequest> {
             break;
         }
     }
-    let mut called: Vec<u32> = called.into_iter().collect();
-    blaze_ids::radix::sort(&mut called);
-    called.into_iter().map(|at| requests.funcs[at as usize].clone()).collect()
+    let mut sorted: Vec<u32, &Frame> = Vec::with_capacity_in(called.len(), frame);
+    sorted.extend(called);
+    blaze_mem::scratch::with_u32s(|scratch| {
+        blaze_ids::radix::sort_copy_by_key_in(&mut sorted, |&it| it, scratch);
+    });
+    let mut calls = Vec::with_capacity_in(sorted.len(), frame);
+    calls.extend(sorted.iter().map(|&at| requests.funcs[at as usize].clone()));
+    calls
 }
 
 impl<'a, 'db> ObjectCodegen<'a, 'db> {
@@ -565,7 +582,10 @@ impl Context<'_> {
                 let kind = state.wave[at].clone();
                 (state.taken, state.building) = (at + 1, state.building + 1);
                 drop(state);
-                let built = self.built(db, symbols, &names, &mut homes, &kind);
+                // The unit's frame: what building its IR needs and drops (`calls_after_imports`).
+                let built = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+                    self.built(db, symbols, &names, &mut homes, &kind, frame)
+                });
                 state = lock();
                 (state.built[at], state.building) = (Some(built), state.building - 1);
                 if state.taken == state.wave.len() && state.building == 0 {
@@ -576,7 +596,10 @@ impl Context<'_> {
             }
             if let Some(Queued { place, job, .. }) = state.jobs.pop() {
                 drop(state);
-                let (outcomes, found) = self.compiled(db, symbols, &names, &mut homes, job);
+                // The unit's frame: each member's `build()` nests its own in it.
+                let (outcomes, found) = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |_| {
+                    self.compiled(db, symbols, &names, &mut homes, job)
+                });
                 state = lock();
                 state.done.push((place, outcomes, found));
                 continue;
@@ -601,6 +624,7 @@ impl Context<'_> {
         names: &stable::StableNames<'_, '_>,
         homes: &mut home::Homes,
         kind: &Kind,
+        frame: &Frame,
     ) -> (Option<Result<Produced>>, Found) {
         let produced = match kind {
             Kind::Root(root) if symbols.function(*root).is_none() => {
@@ -631,7 +655,7 @@ impl Context<'_> {
         match &produced {
             None => {}
             Some(Ok(Produced::Pending(pending))) if shares(pending).is_ok() => {
-                let calls = calls_after_imports(db, pending);
+                let calls = calls_after_imports(db, pending, frame);
                 self.finder.find(db, symbols, names, homes, &calls, &mut found);
             }
             Some(_) => {

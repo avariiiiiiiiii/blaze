@@ -3,13 +3,15 @@
 
 use std::{cell::RefCell, convert::Infallible, ops::ControlFlow};
 
-use base_db::{Db, FxIndexMap};
+use base_db::Db;
+use blaze_mem::Frame;
 use hir_def::{
     AssocItemId, AttrDefId, FunctionId, GenericParamId, HasModule, ImplId, ItemContainerId,
     TraitId,
     attrs::AttrFlags,
     hir::generics::GenericParams,
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
+    visibility::Visibility,
 };
 use hir_expand::name::Name;
 use intern::Symbol;
@@ -27,13 +29,17 @@ use tracing::{debug, instrument};
 use self::CandidateKind::*;
 pub(super) use self::PickKind::*;
 use crate::{
+    FrameSet,
     autoderef::Autoderef,
     db::HirDatabase,
+    frame_set,
     lower::GenericPredicates,
     method_resolution::{
         CandidateId, CandidateSource, InherentImpls, MethodError, MethodResolutionContext,
-        SelfTyKey, TraitValueItems, impl_value_item, simplified_type_module,
-        with_incoherent_inherent_impls,
+        SelfTyKey, TraitValueItems, impl_value_item,
+        pick_cache::{self, ProbeFacts},
+        scope_sets::{ScopeItem, ScopeItems},
+        simplified_type_module, with_incoherent_inherent_impls,
     },
     next_solver::{
         Binder, Canonical, ClauseKind, DbInterner, FnSig, GenericArg, GenericArgs, Goal, ParamEnv,
@@ -60,17 +66,21 @@ struct ProbeContext<'a, 'db, Choice> {
     orig_steps_var_values: &'a OriginalQueryValues<'db>,
     steps: &'a [CandidateStep<'db>],
 
-    inherent_candidates: Vec<Candidate<'db>>,
-    extension_candidates: Vec<Candidate<'db>>,
-    impl_dups: FxHashSet<ImplId>,
+    inherent_candidates: Vec<Candidate<'db>, &'a Frame>,
+    extension_candidates: Vec<Candidate<'db>, &'a Frame>,
+    impl_dups: FrameSet<'a, ImplId>,
 
     /// List of potential private candidates. Will be trimmed to ones that
     /// actually apply and then the result inserted into `private_candidate`
-    private_candidates: Vec<Candidate<'db>>,
+    private_candidates: Vec<Candidate<'db>, &'a Frame>,
 
     /// Collects near misses when the candidate functions are missing a `self` keyword and is only
     /// used for error reporting
-    static_candidates: Vec<CandidateSource>,
+    static_candidates: Vec<CandidateSource, &'a Frame>,
+
+    /// Whether a visibility `push_candidate` checked is `Visibility::Module`: then whether a
+    /// candidate is accessible depends on the module of the call (`ProbeFacts`).
+    module_dependent: bool,
 
     choice: Choice,
 }
@@ -249,7 +259,7 @@ pub struct CandidateStep<'db> {
 }
 
 #[derive(Clone, Debug)]
-struct MethodAutoderefStepsResult<'db> {
+pub(super) struct MethodAutoderefStepsResult<'db> {
     /// The valid autoderef steps that could be found by following a chain
     /// of `Receiver<Target=T>` or `Deref<Target=T>` trait implementations.
     pub steps: SmallVec<[CandidateStep<'db>; 3]>,
@@ -261,7 +271,7 @@ struct MethodAutoderefStepsResult<'db> {
 }
 
 #[derive(Debug, Clone)]
-struct MethodAutoderefBadTy<'db> {
+pub(super) struct MethodAutoderefBadTy<'db> {
     pub reached_raw_pointer: bool,
     pub ty: Canonical<'db, QueryResponse<'db, Ty<'db>>>,
 }
@@ -291,18 +301,20 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         self_ty: Ty<'db>,
         allow_unstable: bool,
     ) -> PickResult<'db> {
-        self.probe_op(
-            mode,
-            self_ty,
-            ProbeForNameChoice {
-                private_candidate: None,
-                item_name,
-                stable_only: false,
-                unstable_candidates: RefCell::default(),
-                allow_unstable,
-                trait_items: TraitValueItems::default(),
-            },
-        )
+        let scope_items =
+            self.traits_in_scope.named(self.infcx.interner.db, item_name, self.frame);
+        let choice = ProbeForNameChoice {
+            private_candidate: None,
+            item_name,
+            stable_only: false,
+            unstable_candidates: RefCell::default(),
+            allow_unstable,
+            trait_items: TraitValueItems::new_in(self.frame),
+            scope_items,
+        };
+        pick_cache::pick(self, mode, item_name, self_ty, allow_unstable, scope_items, |facts| {
+            self.probe_op(mode, self_ty, choice, facts)
+        })
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -311,7 +323,11 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         mode: Mode,
         self_ty: Ty<'db>,
     ) -> impl Iterator<Item = CandidateWithPrivate<'db>> {
-        self.probe_op(mode, self_ty, ProbeAllChoice::new()).candidates.into_inner().into_values()
+        self.probe_op(mode, self_ty, ProbeAllChoice::new(self.frame), &mut ProbeFacts::default())
+            .candidates
+            .into_inner()
+            .candidates
+            .into_iter()
     }
 
     fn probe_op<Choice: ProbeChoice<'db>>(
@@ -319,6 +335,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         mode: Mode,
         self_ty: Ty<'db>,
         choice: Choice,
+        facts: &mut ProbeFacts,
     ) -> Choice::FinalChoice {
         let mut orig_values = OriginalQueryValues::default();
         let predefined_opaques_in_body = PredefinedOpaques::new_from_iter(
@@ -331,42 +348,71 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         );
         let query_input =
             self.infcx.canonicalize_query((self_ty, predefined_opaques_in_body), &mut orig_values);
-        let steps = match mode {
-            Mode::MethodCall => self.method_autoderef_steps(&query_input),
-            Mode::Path => self.infcx.probe(|_| {
-                // Mode::Path - the deref steps is "trivial". This turns
-                // our CanonicalQuery into a "trivial" QueryResponse. This
-                // is a bit inefficient, but I don't think that writing
-                // special handling for this "trivial case" is a good idea.
+        match mode {
+            Mode::MethodCall => pick_cache::with_steps(
+                self,
+                &query_input,
+                || self.method_autoderef_steps(&query_input),
+                |steps| self.probe_steps(mode, self_ty, &orig_values, steps, choice, facts),
+            ),
+            Mode::Path => {
+                let steps = self.path_steps(&query_input);
+                self.probe_steps(mode, self_ty, &orig_values, &steps, choice, facts)
+            }
+        }
+    }
 
-                let infcx = self.infcx;
-                let ((self_ty, _), var_values) =
-                    infcx.instantiate_canonical(self.call_span, &query_input);
-                debug!(?self_ty, ?query_input, "probe_op: Mode::Path");
-                let prev_opaque_entries =
-                    self.infcx.inner.borrow_mut().opaque_types().num_entries();
-                MethodAutoderefStepsResult {
-                    steps: smallvec![CandidateStep {
-                        self_ty: self.infcx.make_query_response_ignoring_pending_obligations(
-                            var_values,
-                            self_ty,
-                            prev_opaque_entries
-                        ),
-                        self_ty_is_opaque: false,
-                        autoderefs: 0,
-                        from_unsafe_deref: false,
-                        unsize: false,
-                        reachable_via_deref: true,
-                    }],
-                    opt_bad_ty: None,
-                    reached_recursion_limit: false,
-                }
-            }),
-        };
+    /// The steps of a path probe: the receiver alone, as rustc writes them.
+    fn path_steps(
+        &self,
+        query_input: &Canonical<'db, (Ty<'db>, PredefinedOpaques<'db>)>,
+    ) -> MethodAutoderefStepsResult<'db> {
+        self.infcx.probe(|_| {
+            // Mode::Path - the deref steps is "trivial". This turns
+            // our CanonicalQuery into a "trivial" QueryResponse. This
+            // is a bit inefficient, but I don't think that writing
+            // special handling for this "trivial case" is a good idea.
 
+            let infcx = self.infcx;
+            let ((self_ty, _), var_values) =
+                infcx.instantiate_canonical(self.call_span, query_input);
+            debug!(?self_ty, ?query_input, "probe_op: Mode::Path");
+            let prev_opaque_entries = self.infcx.inner.borrow_mut().opaque_types().num_entries();
+            MethodAutoderefStepsResult {
+                // alloc: none: the one step is inline in the `SmallVec`.
+                steps: smallvec![CandidateStep {
+                    self_ty: self.infcx.make_query_response_ignoring_pending_obligations(
+                        var_values,
+                        self_ty,
+                        prev_opaque_entries
+                    ),
+                    self_ty_is_opaque: false,
+                    autoderefs: 0,
+                    from_unsafe_deref: false,
+                    unsize: false,
+                    reachable_via_deref: true,
+                }],
+                opt_bad_ty: None,
+                reached_recursion_limit: false,
+            }
+        })
+    }
+
+    /// The probe itself, over `steps`, the receiver's autoderef steps (`orig_values` their
+    /// canonical input's variables). Notes in `facts` whether its answer may be kept.
+    fn probe_steps<Choice: ProbeChoice<'db>>(
+        &self,
+        mode: Mode,
+        self_ty: Ty<'db>,
+        orig_values: &OriginalQueryValues<'db>,
+        steps: &MethodAutoderefStepsResult<'db>,
+        choice: Choice,
+        facts: &mut ProbeFacts,
+    ) -> Choice::FinalChoice {
         if steps.reached_recursion_limit {
             // FIXME: Report an error.
         }
+        facts.cacheable = !steps.reached_recursion_limit && steps.opt_bad_ty.is_none();
 
         // If we encountered an `_` type or an error type during autoderef, this is
         // ambiguous.
@@ -397,11 +443,11 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                     .instantiate_query_response_and_region_obligations(
                         &ObligationCause::new(self.receiver_span),
                         self.param_env,
-                        &orig_values,
+                        orig_values,
                         ty,
                     )
                     .unwrap_or_else(|_| panic!("instantiating {:?} failed?", ty));
-                let ty = self.infcx.resolve_vars_if_possible(ty.value);
+                let ty = self.infcx.deeply_resolve_ignoring_regions(ty.value);
                 match ty.kind() {
                     TyKind::Infer(InferTy::TyVar(_)) => {
                         // FIXME: Report "type annotations needed" error.
@@ -409,7 +455,7 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
                     TyKind::Error(_) => {}
                     _ => panic!("unexpected bad final type in method autoderef"),
                 };
-                return Choice::final_choice_from_err(MethodError::ErrorReported);
+                return Choice::final_choice_from_err(choice, MethodError::ErrorReported);
             }
         }
 
@@ -418,10 +464,12 @@ impl<'a, 'db> MethodResolutionContext<'a, 'db> {
         // this creates one big transaction so that all type variables etc
         // that we create during the probe process are removed later
         self.infcx.probe(|_| {
-            let mut probe_cx = ProbeContext::new(self, mode, &orig_values, &steps.steps, choice);
+            let mut probe_cx = ProbeContext::new(self, mode, orig_values, &steps.steps, choice);
 
             probe_cx.assemble_inherent_candidates();
             probe_cx.assemble_extension_candidates_for_traits_in_scope();
+            // Visibility is checked only while assembling.
+            facts.module_dependent = probe_cx.module_dependent;
             Choice::choose(probe_cx)
         })
     }
@@ -630,13 +678,16 @@ trait ProbeChoice<'db>: Sized {
         instantiate_self_ty_obligations: &[PredicateObligation<'db>],
     ) -> ControlFlow<Self::Choice>;
 
-    fn final_choice_from_err(err: MethodError<'db>) -> Self::FinalChoice;
+    fn final_choice_from_err(choice: Self, err: MethodError<'db>) -> Self::FinalChoice;
 
     fn choose(this: ProbeContext<'_, 'db, Self>) -> Self::FinalChoice;
+
+    /// Pushes the candidates of the traits in scope.
+    fn assemble_extension_candidates_for_traits_in_scope(this: &mut ProbeContext<'_, 'db, Self>);
 }
 
 #[derive(Debug)]
-struct ProbeForNameChoice<'db> {
+struct ProbeForNameChoice<'db, 'f> {
     item_name: Name,
 
     /// Some(candidate) if there is a private candidate
@@ -650,10 +701,13 @@ struct ProbeForNameChoice<'db> {
     /// Whether such items are as good as the others: the path was not written by the user.
     allow_unstable: bool,
     /// The items of `item_name` of the traits asked of so far.
-    trait_items: TraitValueItems<'db>,
+    trait_items: TraitValueItems<'db, 'f>,
+    /// The traits in scope with an item of `item_name`, and those items: the extension
+    /// candidates.
+    scope_items: ScopeItems,
 }
 
-impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
+impl<'db, 'f> ProbeChoice<'db> for ProbeForNameChoice<'db, 'f> {
     type Choice = PickResult<'db>;
     type FinalChoice = PickResult<'db>;
 
@@ -803,28 +857,59 @@ impl<'db> ProbeChoice<'db> for ProbeForNameChoice<'db> {
         ControlFlow::Continue(())
     }
 
-    fn final_choice_from_err(err: MethodError<'db>) -> Self::FinalChoice {
+    fn final_choice_from_err(_choice: Self, err: MethodError<'db>) -> Self::FinalChoice {
         Err(err)
     }
 
     fn choose(this: ProbeContext<'_, 'db, Self>) -> Self::FinalChoice {
-        this.pick()
+        // A pick's self type is the step's, with this probe's region variables; the pick is the
+        // same for any regions (the probe erases them), so every pick is given with them erased
+        // and one answer serves every body (`pick_cache`).
+        let interner = this.interner();
+        match this.pick() {
+            Ok(pick) => Ok(pick_cache::erase_regions_of_pick(interner, pick)),
+            Err(MethodError::PrivateMatch(pick)) => {
+                Err(MethodError::PrivateMatch(pick_cache::erase_regions_of_pick(interner, pick)))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn assemble_extension_candidates_for_traits_in_scope(this: &mut ProbeContext<'_, 'db, Self>) {
+        for &ScopeItem { trait_, item } in this.choice.scope_items.items() {
+            if this.mode == Mode::Path || matches!(item, CandidateId::FunctionId(_)) {
+                this.assemble_extension_candidate(trait_, item, &mut None);
+            }
+        }
     }
 }
 
 #[derive(Debug)]
-struct ProbeAllChoice<'db> {
-    candidates: RefCell<FxIndexMap<CandidateId, CandidateWithPrivate<'db>>>,
+struct ProbeAllChoice<'db, 'f> {
+    candidates: RefCell<AllCandidates<'db, 'f>>,
     considering_visible_candidates: bool,
 }
 
-impl ProbeAllChoice<'_> {
-    fn new() -> Self {
-        Self { candidates: RefCell::default(), considering_visible_candidates: true }
+/// Each candidate the first time its item is seen, in that order.
+#[derive(Debug)]
+struct AllCandidates<'db, 'f> {
+    seen: FrameSet<'f, CandidateId>,
+    candidates: Vec<CandidateWithPrivate<'db>, &'f Frame>,
+}
+
+impl<'f> ProbeAllChoice<'_, 'f> {
+    fn new(frame: &'f Frame) -> Self {
+        Self {
+            candidates: RefCell::new(AllCandidates {
+                seen: frame_set(frame),
+                candidates: Vec::new_in(frame),
+            }),
+            considering_visible_candidates: true,
+        }
     }
 }
 
-impl<'db> ProbeChoice<'db> for ProbeAllChoice<'db> {
+impl<'db, 'f> ProbeChoice<'db> for ProbeAllChoice<'db, 'f> {
     type Choice = Infallible;
     type FinalChoice = Self;
 
@@ -852,12 +937,14 @@ impl<'db> ProbeChoice<'db> for ProbeAllChoice<'db> {
     ) -> ControlFlow<Self::Choice> {
         let is_visible = this.choice.considering_visible_candidates;
         let mut all_candidates = this.choice.candidates.borrow_mut();
+        let AllCandidates { seen, candidates: all } = &mut *all_candidates;
         for candidate in candidates {
             // We should not override existing entries, because inherent methods of trait objects (from the principal)
             // are also visited as trait methods, and we want to consider them inherent.
-            all_candidates
-                .entry(candidate.item)
-                .or_insert(CandidateWithPrivate { candidate: candidate.clone(), is_visible });
+            if seen.insert(candidate.item) {
+                // clone: the IDE's completion list owns each candidate, once per item.
+                all.push(CandidateWithPrivate { candidate: candidate.clone(), is_visible });
+            }
         }
         ControlFlow::Continue(())
     }
@@ -904,13 +991,19 @@ impl<'db> ProbeChoice<'db> for ProbeAllChoice<'db> {
         ControlFlow::Continue(())
     }
 
-    fn final_choice_from_err(_err: MethodError<'db>) -> Self::FinalChoice {
-        Self::new()
+    fn final_choice_from_err(choice: Self, _err: MethodError<'db>) -> Self::FinalChoice {
+        choice
     }
 
     fn choose(mut this: ProbeContext<'_, 'db, Self>) -> Self::FinalChoice {
         let ControlFlow::Continue(()) = this.pick_all_method();
         this.choice
+    }
+
+    fn assemble_extension_candidates_for_traits_in_scope(this: &mut ProbeContext<'_, 'db, Self>) {
+        for trait_ in this.ctx.traits_in_scope.all(this.db()) {
+            this.assemble_extension_candidates_for_trait(trait_);
+        }
     }
 }
 
@@ -922,16 +1015,18 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
         steps: &'a [CandidateStep<'db>],
         choice: Choice,
     ) -> ProbeContext<'a, 'db, Choice> {
+        let frame = ctx.frame;
         ProbeContext {
             ctx,
             mode,
-            inherent_candidates: Vec::new(),
-            extension_candidates: Vec::new(),
-            impl_dups: FxHashSet::default(),
+            inherent_candidates: Vec::new_in(frame),
+            extension_candidates: Vec::new_in(frame),
+            impl_dups: frame_set(frame),
             orig_steps_var_values,
             steps,
-            private_candidates: Vec::new(),
-            static_candidates: Vec::new(),
+            private_candidates: Vec::new_in(frame),
+            static_candidates: Vec::new_in(frame),
+            module_dependent: false,
             choice,
         }
     }
@@ -976,6 +1071,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                 CandidateId::ConstId(id) => id.into(),
             };
             let visibility = candidate_id.assoc_visibility(self.db());
+            self.module_dependent |= matches!(visibility, Visibility::Module(..));
             self.ctx.resolver.is_visible(self.db(), visibility)
         } else {
             true
@@ -1217,9 +1313,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
 
     #[instrument(level = "debug", skip(self))]
     fn assemble_extension_candidates_for_traits_in_scope(&mut self) {
-        for &trait_did in self.ctx.traits_in_scope {
-            self.assemble_extension_candidates_for_trait(trait_did);
-        }
+        Choice::assemble_extension_candidates_for_traits_in_scope(self);
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1227,28 +1321,39 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
         // Made for the first item only: most traits in scope have none of the name.
         let mut trait_ref = None;
         self.with_trait_item(trait_def_id, |this, item| {
-            // Check whether `trait_def_id` defines a method with suitable name.
-            if !this.has_applicable_self(item) {
-                debug!("method has inapplicable self");
-                this.record_static_candidate(CandidateSource::Trait(trait_def_id));
-                return;
-            }
-            let trait_ref = *trait_ref.get_or_insert_with(|| {
-                let trait_args =
-                    this.infcx().fresh_args_for_item(this.ctx.call_span, trait_def_id.into());
-                TraitRef::new_from_args(this.interner(), trait_def_id.into(), trait_args)
-            });
-            this.push_candidate(
-                Candidate { item, kind: TraitCandidate(Binder::dummy(trait_ref)) },
-                false,
-            );
+            this.assemble_extension_candidate(trait_def_id, item, &mut trait_ref);
         });
+    }
+
+    /// Pushes `item` of `trait_def_id`, with `trait_ref` the trait's reference with fresh
+    /// arguments, made by the first item of the trait pushed.
+    fn assemble_extension_candidate(
+        &mut self,
+        trait_def_id: TraitId,
+        item: CandidateId,
+        trait_ref: &mut Option<TraitRef<'db>>,
+    ) {
+        // Check whether `trait_def_id` defines a method with suitable name.
+        if !self.has_applicable_self(item) {
+            debug!("method has inapplicable self");
+            self.record_static_candidate(CandidateSource::Trait(trait_def_id));
+            return;
+        }
+        let trait_ref = *trait_ref.get_or_insert_with(|| {
+            let trait_args =
+                self.infcx().fresh_args_for_item(self.ctx.call_span, trait_def_id.into());
+            TraitRef::new_from_args(self.interner(), trait_def_id.into(), trait_args)
+        });
+        self.push_candidate(
+            Candidate { item, kind: TraitCandidate(Binder::dummy(trait_ref)) },
+            false,
+        );
     }
 }
 
 ///////////////////////////////////////////////////////////////////////////
 // THE ACTUAL SEARCH
-impl<'a, 'db> ProbeContext<'a, 'db, ProbeForNameChoice<'db>> {
+impl<'a, 'db, 'f> ProbeContext<'a, 'db, ProbeForNameChoice<'db, 'f>> {
     #[instrument(level = "debug", skip(self))]
     fn pick(mut self) -> PickResult<'db> {
         if let Some(r) = self.pick_core() {
@@ -1978,7 +2083,7 @@ impl<'a, 'db, Choice: ProbeChoice<'db>> ProbeContext<'a, 'db, Choice> {
                         return false;
                     }
 
-                    !self.infcx().resolve_vars_if_possible(self_ty).is_ty_var()
+                    !self.infcx().deeply_resolve_ignoring_regions(self_ty).is_ty_var()
                 });
                 if constrained_opaque {
                     debug!("opaque type has been constrained");

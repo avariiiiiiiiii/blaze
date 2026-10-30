@@ -7,6 +7,7 @@ Filed in `v2/requests/db-ty.md` ("From speed-types-probe"): `TRAIT_VALUE_ITEMS =
 `method_resolution.rs`. Until applied, `kinds_are_distinct_and_hir_tys` fails.
 
 > forwarded to db: `crates/hir-ty/src/db.rs` (also in `db-ty.md`).
+> applied (checked by db-next2, 22:00): both kinds are in `crates/hir-ty/src/db.rs` `kinds!` (917, 918).
 
 ## format (hir-def): a name index on `TraitItems` and `ImplItems` (open, from items-hirty)
 

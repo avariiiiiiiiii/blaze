@@ -71,7 +71,9 @@ impl<'f, T: Copy> Csr<'f, T> {
     {
         let pairs = pairs.into_iter();
         let mut start = filled(frame, nodes + 1, 0u32);
+        // clone: the pairs' iterator, for the counting walk
         let total = starts(&mut start, pairs.clone().map(|(node, _)| node as usize));
+        // clone: the pairs' iterator, for its first item
         let Some((_, filler)) = pairs.clone().next() else {
             return Csr { start, items: Vec::new_in(frame) };
         };
@@ -94,8 +96,10 @@ impl<'f, T: Copy> Csr<'f, T> {
         let pairs = pairs.into_iter();
         self.start.clear();
         self.start.resize(nodes + 1, 0);
+        // clone: the pairs' iterator, for the counting walk
         let total = starts(&mut self.start, pairs.clone().map(|(node, _)| node as usize));
         self.items.clear();
+        // clone: the pairs' iterator, for its first item
         let Some((_, filler)) = pairs.clone().next() else { return };
         self.items.resize(total, filler);
         for (node, item) in pairs {

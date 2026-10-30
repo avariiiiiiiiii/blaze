@@ -431,6 +431,13 @@ mod tests {
 
     impl Inputs for Fixed {
         type Error = String;
+        fn entry(&mut self, path: &Path) -> Result<crate::trace::Entry, String> {
+            Ok(match (path == Path::new("/ws"), self.files.get(path)) {
+                (true, _) => crate::trace::Entry::Dir,
+                (false, Some(hash)) => crate::trace::Entry::File(ContentId(*hash), blaze_vfs::Mode::Regular),
+                (false, None) => crate::trace::Entry::Missing,
+            })
+        }
         fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
             Ok(match path == Path::new("/ws") {
                 true => Some(DIRECTORY),
@@ -476,7 +483,7 @@ mod tests {
                 env: vec![("CC".into(), "cc".into())],
                 dir: "/ws".into(),
                 stdin: Vec::new(),
-                sandbox: Sandbox::On { read: vec!["/ws".into()], write: Vec::new(), network: false, trace: false },
+                sandbox: Sandbox::On { read: vec!["/ws".into()], write: Vec::new(), network: false, trace: false, services: Vec::new() },
                 memory: None,
             },
             out_dir: None,

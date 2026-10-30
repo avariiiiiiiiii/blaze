@@ -27,7 +27,7 @@ use hir_expand::{MacroDefId, name::Name};
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use rustc_apfloat::ieee::{Double, Half, Quad, Single};
-use syntax::ast;
+use syntax::{ast, view};
 use type_ref::TypeRefId;
 
 use crate::{
@@ -257,9 +257,9 @@ impl Literal {
     }
 }
 
-impl From<ast::LiteralKind> for Literal {
-    fn from(ast_lit_kind: ast::LiteralKind) -> Self {
-        use ast::LiteralKind;
+impl From<view::LiteralKind<'_>> for Literal {
+    fn from(ast_lit_kind: view::LiteralKind<'_>) -> Self {
+        use view::LiteralKind;
         match ast_lit_kind {
             LiteralKind::IntNumber(lit) => {
                 if let builtin @ Some(_) = lit.suffix().and_then(BuiltinFloat::from_suffix) {

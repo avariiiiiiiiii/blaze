@@ -15,12 +15,12 @@
 use blaze_ids::radix;
 use hir::InFile;
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, T, TextRange,
-    TextSize, ast,
+    NodeOrToken, SyntaxKind, T, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
 };
 
 use super::Gated;
-use crate::{cx::item_range, lints::syntax::Walk};
+use crate::{cx::item_range_view as item_range, lints::syntax::Walk};
 
 /// A feature whose syntax rustc's parser gates, in the order `check_crate` reads them: its
 /// `gate_all!`s, then those it reads with its own rules, then the soft gates.
@@ -69,7 +69,9 @@ pub(super) type Spans = [Vec<Gated>; COUNT];
 /// What rustc's parser gates in the crate: the files' trees in the order rustc loads them,
 /// then the expansions' in the order the walk comes to them.
 pub(super) fn spans(walk: &Walk<'_>) -> Spans {
+    // alloc: empty, each allocates only when its feature is gated somewhere
     let mut spans: Spans = std::array::from_fn(|_| Vec::new());
+    // alloc: setup, once per check, reused for every tree
     let mut found: Vec<(u32, Pre, Gated)> = Vec::new();
     let files = walk.trees.iter().filter(|it| it.in_file());
     let expansions = walk.trees.iter().filter(|it| !it.in_file());
@@ -77,10 +79,10 @@ pub(super) fn spans(walk: &Walk<'_>) -> Spans {
         found.clear();
         for node in tree.root.descendants() {
             let mut push = |pre: Pre, at: TextRange, key: TextSize| {
-                let gated = Gated { at: InFile::new(tree.file, at), node: InFile::new(tree.file, SyntaxNodePtr::new(&node)) };
+                let gated = Gated { at: InFile::new(tree.file, at), node: InFile::new(tree.file, ast::ptr(node)) };
                 found.push((u32::from(key), pre, gated));
             };
-            gates_of(&node, &mut push);
+            gates_of(node, &mut push);
         }
         radix::sort_by_key(&mut found, |it| it.0);
         for &(_, pre, gated) in &found {
@@ -92,7 +94,7 @@ pub(super) fn spans(walk: &Walk<'_>) -> Spans {
 
 /// The spans the parser gates at `node`: each with its feature and the offset it is gated
 /// at.
-fn gates_of(node: &SyntaxNode, push: &mut impl FnMut(Pre, TextRange, TextSize)) {
+fn gates_of(node: ast::Node<'_>, push: &mut impl FnMut(Pre, TextRange, TextSize)) {
     let range = node.text_range();
     match node.kind() {
         SyntaxKind::SOURCE_FILE => {
@@ -138,7 +140,7 @@ fn gates_of(node: &SyntaxNode, push: &mut impl FnMut(Pre, TextRange, TextSize)) 
             }
             if let Some(modifier) = child(node, SyntaxKind::TRY_BLOCK_MODIFIER) {
                 let at = TextRange::new(modifier.text_range().start(), range.end());
-                let pre = match bikeshed(&modifier) {
+                let pre = match bikeshed(modifier) {
                     true => Pre::TryBlocksHeterogeneous,
                     false => Pre::TryBlocks,
                 };
@@ -283,7 +285,7 @@ fn gates_of(node: &SyntaxNode, push: &mut impl FnMut(Pre, TextRange, TextSize)) 
         }
         SyntaxKind::BOX_PAT => {
             let shorthand = node.parent().is_some_and(|it| {
-                it.kind() == SyntaxKind::RECORD_PAT_FIELD && child(&it, SyntaxKind::NAME_REF).is_none()
+                it.kind() == SyntaxKind::RECORD_PAT_FIELD && child(it, SyntaxKind::NAME_REF).is_none()
             });
             match token(node, T![box]) {
                 // `Foo { box x }`: the parser gates the `box` it eats before the binding.
@@ -296,17 +298,17 @@ fn gates_of(node: &SyntaxNode, push: &mut impl FnMut(Pre, TextRange, TextSize)) 
 }
 
 /// The first token of `kind` directly in `node`.
-pub(super) fn token(node: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxToken> {
+pub(super) fn token(node: ast::Node<'_>, kind: SyntaxKind) -> Option<ast::Token<'_>> {
     node.children_with_tokens().filter_map(NodeOrToken::into_token).find(|it| it.kind() == kind)
 }
 
 /// The first node of `kind` directly in `node`.
-pub(super) fn child(node: &SyntaxNode, kind: SyntaxKind) -> Option<SyntaxNode> {
+pub(super) fn child(node: ast::Node<'_>, kind: SyntaxKind) -> Option<ast::Node<'_>> {
     node.children().find(|it| it.kind() == kind)
 }
 
 /// The name after `builtin #`, where `node` is written as `builtin # name(..)`.
-fn builtin_ident(node: &SyntaxNode) -> Option<SyntaxToken> {
+fn builtin_ident(node: ast::Node<'_>) -> Option<ast::Token<'_>> {
     let mut tokens = node
         .children_with_tokens()
         .filter_map(NodeOrToken::into_token)
@@ -322,7 +324,7 @@ fn builtin_ident(node: &SyntaxNode) -> Option<SyntaxToken> {
 
 /// The span of `gen` or `async gen` in front of a block, a closure or a function: rustc's
 /// `CoroutineKind::Gen` or `AsyncGen`.
-fn gen_kind(node: &SyntaxNode) -> Option<TextRange> {
+fn gen_kind(node: ast::Node<'_>) -> Option<TextRange> {
     let gen_ = token(node, T![gen])?;
     let start = match token(node, T![async]) {
         Some(it) if it.text_range().start() < gen_.text_range().start() => it.text_range().start(),
@@ -332,7 +334,7 @@ fn gen_kind(node: &SyntaxNode) -> Option<TextRange> {
 }
 
 /// Whether the `try` of a block is `try bikeshed Ty`.
-fn bikeshed(modifier: &SyntaxNode) -> bool {
+fn bikeshed(modifier: ast::Node<'_>) -> bool {
     modifier
         .children_with_tokens()
         .filter_map(NodeOrToken::into_token)
@@ -340,46 +342,49 @@ fn bikeshed(modifier: &SyntaxNode) -> bool {
 }
 
 /// The span of a bound's constness: `~const`, `[const]` or `const`.
-fn bound_constness(bound: &SyntaxNode) -> Option<TextRange> {
-    let tokens: Vec<SyntaxToken> = bound
-        .children_with_tokens()
-        .filter_map(NodeOrToken::into_token)
-        .filter(|it| !it.kind().is_trivia())
-        .collect();
-    let konst = tokens.iter().position(|it| it.kind() == T![const])?;
-    let start = match konst.checked_sub(1).map(|it| tokens[it].kind()) {
-        Some(T![~]) | Some(T!['[']) => tokens[konst - 1].text_range().start(),
-        _ => tokens[konst].text_range().start(),
+fn bound_constness(bound: ast::Node<'_>) -> Option<TextRange> {
+    let mut tokens = bound.children_with_tokens().filter_map(NodeOrToken::into_token).filter(|it| !it.kind().is_trivia());
+    let mut before = None;
+    let konst = loop {
+        let it = tokens.next()?;
+        if it.kind() == T![const] {
+            break it;
+        }
+        before = Some(it);
     };
-    let end = match tokens.get(konst + 1) {
+    let start = match before {
+        Some(it) if matches!(it.kind(), T![~] | T!['[']) => it.text_range().start(),
+        _ => konst.text_range().start(),
+    };
+    let end = match tokens.next() {
         Some(it) if it.kind() == T![']'] => it.text_range().end(),
-        _ => tokens[konst].text_range().end(),
+        _ => konst.text_range().end(),
     };
     Some(TextRange::new(start, end))
 }
 
 /// The span of a const argument written as an unbraced `const { .. }` block.
-fn const_block(arg: &SyntaxNode) -> Option<TextRange> {
+fn const_block(arg: ast::Node<'_>) -> Option<TextRange> {
     if let Some(konst) = token(arg, T![const])
         && let Some(block) = child(arg, SyntaxKind::BLOCK_EXPR)
     {
         return Some(TextRange::new(konst.text_range().start(), block.text_range().end()));
     }
     let block = child(arg, SyntaxKind::BLOCK_EXPR)?;
-    token(&block, T![const])?;
-    Some(item_range(&block))
+    token(block, T![const])?;
+    Some(item_range(block))
 }
 
 /// The span of the path of a struct expression or pattern, when it is qualified
 /// (`<T as Trait>::Assoc { .. }`).
-fn qualified_path(node: &SyntaxNode) -> Option<TextRange> {
+fn qualified_path(node: ast::Node<'_>) -> Option<TextRange> {
     let path = child(node, SyntaxKind::PATH)?;
-    let mut first = path.clone();
-    while let Some(qualifier) = child(&first, SyntaxKind::PATH) {
+    let mut first = path;
+    while let Some(qualifier) = child(first, SyntaxKind::PATH) {
         first = qualifier;
     }
-    let segment = child(&first, SyntaxKind::PATH_SEGMENT)?;
-    child(&segment, SyntaxKind::TYPE_ANCHOR)?;
+    let segment = child(first, SyntaxKind::PATH_SEGMENT)?;
+    child(segment, SyntaxKind::TYPE_ANCHOR)?;
     Some(path.text_range())
 }
 
@@ -392,13 +397,34 @@ mod tests {
     /// The gates of `text`, parsed as a 2024 file, in the order [`spans`] keeps them within a
     /// tree: by the offset each is gated at.
     fn gates(text: &str) -> Vec<(Pre, &str)> {
-        let file = SourceFile::parse(text, Edition::Edition2024).tree();
+        let parse = SourceFile::parse(text, Edition::Edition2024);
         let mut found = Vec::new();
-        for node in file.syntax().descendants() {
-            gates_of(&node, &mut |pre, at, key| found.push((key, pre, at)));
+        for node in parse.root().descendants() {
+            gates_of(node, &mut |pre, at, key| found.push((key, pre, at)));
         }
         found.sort_by_key(|it| it.0);
         found.into_iter().map(|(_, pre, at)| (pre, &text[at])).collect()
+    }
+
+    /// Finding the gates of a tree reads its views and allocates nothing, gated syntax
+    /// included: zero at 4 items and at 400. The first walk parses what is parsed lazily.
+    #[test]
+    fn finding_the_gates_of_a_tree_allocates_nothing() {
+        for n in [4, 400] {
+            let text: String = (0..n)
+                .map(|i| format!("default impl<T> Tr for T {{}}\nfn f{i}() {{ let _ = try {{ yield 1 }}; }}\n"))
+                .collect();
+            let parse = SourceFile::parse(&text, Edition::Edition2024);
+            let mut gated = 0;
+            let mut walk = || {
+                for node in parse.root().descendants() {
+                    gates_of(node, &mut |_, _, _| gated += 1);
+                }
+            };
+            walk();
+            blaze_alloc_count::assert_at_most(0, "the gates of a tree", &mut walk);
+            assert_eq!(gated, 2 * 3 * n, "each item's `default impl`, `try` and `yield`, walked twice");
+        }
     }
 
     #[test]

@@ -5,9 +5,8 @@
 #[cfg(unix)]
 pub fn stderr_columns() -> Option<u16> {
     let mut size = libc::winsize { ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
-    // SAFETY: `TIOCGWINSZ` writes one `winsize` to the pointer it is given, which is `size`,
-    // live and writable for the call; a smaller buffer would be written past its end. A
-    // standard error that is no terminal is refused.
+    // SAFETY: `TIOCGWINSZ` writes one `winsize` through its third argument, which `&raw mut size`
+    // is for the call; on failure it writes nothing and `size` stays zeros.
     let got = unsafe { libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &raw mut size) };
     (got == 0 && size.ws_col > 0).then_some(size.ws_col)
 }

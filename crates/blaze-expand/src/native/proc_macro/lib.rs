@@ -286,45 +286,376 @@ pub mod __native {
         sync::Once,
     };
 
+    use rustc_hash::FxHashMap;
+    use span::{EditionedFileId, ErasedFileAstId, SpanAnchor, SyntaxContext, TextRange, TextSize};
+    use tt::WirePart;
+
     use super::*;
 
-    /// What the wasm host answers a module's imports with (`crates/blaze-macro-wasm/src/lib.rs`,
-    /// `add_host`), each function of the same name, and the words of a tree's spans. A span is
-    /// a word of the host's, `u64::MAX` none; text is `None` where the wasm host gives none
-    /// (-1).
-    pub trait Host {
-        fn def_site(&mut self) -> u64;
-        fn call_site(&mut self) -> u64;
-        fn mixed_site(&mut self) -> u64;
-        fn span_join(&mut self, a: u64, b: u64) -> u64;
-        fn span_resolved_at(&mut self, a: u64, at: u64) -> u64;
-        fn span_located_at(&mut self, a: u64, b: u64) -> u64;
-        fn span_parent(&mut self, a: u64) -> u64;
-        fn span_source(&mut self, a: u64) -> u64;
-        fn span_start(&mut self, a: u64) -> u64;
-        fn span_end(&mut self, a: u64) -> u64;
-        fn span_subspan(&mut self, a: u64, start: u64, end: u64) -> u64;
-        /// The word of `start..start + len` of the expansion's part `part`, `u64::MAX` for a
-        /// part it has not.
-        fn span_pack(&mut self, start: u32, len: u32, part: u32) -> u64;
-        /// `[start, len, part]` of a word, `[0, 0, u32::MAX]` for one it never gave out.
-        fn span_unpack(&mut self, a: u64) -> [u32; 3];
-        /// `[0, 0]` for a span it never gave out.
-        fn span_byte_range(&mut self, a: u64) -> [u32; 2];
-        fn span_line(&mut self, a: u64) -> u32;
-        fn span_column(&mut self, a: u64) -> u32;
-        fn span_debug(&mut self, a: u64) -> Option<String>;
-        fn span_file(&mut self, a: u64) -> Option<String>;
-        fn span_local_file(&mut self, a: u64) -> Option<String>;
-        fn span_source_text(&mut self, a: u64) -> Option<String>;
-        /// The stream of `text` as the columns [`wire::Reader`] reads, or why it is none.
-        fn ts_from_str(&mut self, text: &str) -> Result<Vec<u8>, String>;
+    /// The word of no span: a wide index never given out.
+    pub const NONE: u64 = u64::MAX;
+    /// A packed span's `len_part` that makes its `start` an index of the wide spans.
+    #[doc(hidden)]
+    pub const WIDE: u32 = u32::MAX;
+    /// What a packed span's length and part each stay under.
+    #[doc(hidden)]
+    pub const NARROW: u32 = 0xFFFF;
+    /// How many parts are found by a scan before a map is built.
+    const SCAN: usize = 8;
+
+    /// A span's anchor and context: what the spans of an expansion share.
+    pub type Part = (SpanAnchor, SyntaxContext);
+
+    /// The span parts of an expansion, in the order first given out (the def, call and mixed
+    /// sites, the input's, the attribute's, then what span operations make), and its spans too
+    /// wide to pack. A span is a word: `start | len_part << 32`, `len_part` being `len | part << 16`
+    /// when both are under [`NARROW`], else [`WIDE`] with `start` an index of the wide spans, as
+    /// tt packs a span. Both tables hold each entry once and a span packs whenever it can, so
+    /// equal spans have equal words.
+    #[derive(Default)]
+    pub struct Parts {
+        list: Vec<Part>,
+        /// Each part's index, once there are more than [`SCAN`].
+        map: FxHashMap<Part, u32>,
+        /// The part asked for last and its index: tokens near each other share one.
+        last: Option<(Part, u32)>,
+        wide: Vec<[u32; 3]>,
+        wides: FxHashMap<[u32; 3], u32>,
+    }
+
+    impl Parts {
+        /// Forgets every part and wide span, keeping the room, for the next expansion.
+        pub fn clear(&mut self) {
+            self.list.clear();
+            self.map.clear();
+            self.last = None;
+            self.wide.clear();
+            self.wides.clear();
+        }
+
+        pub fn len(&self) -> usize {
+            self.list.len()
+        }
+
+        pub fn all(&self) -> &[Part] {
+            &self.list
+        }
+
+        /// The index of the part `(anchor, ctx)`, the next one when it is new.
+        #[inline]
+        pub fn part(&mut self, anchor: SpanAnchor, ctx: SyntaxContext) -> u32 {
+            let part = (anchor, ctx);
+            if let Some((last, index)) = self.last
+                && last == part
+            {
+                return index;
+            }
+            let index = self.index(part);
+            self.last = Some((part, index));
+            index
+        }
+
+        fn index(&mut self, part: Part) -> u32 {
+            if self.list.len() <= SCAN {
+                if let Some(at) = self.list.iter().position(|it| *it == part) {
+                    return at as u32;
+                }
+                let at = self.list.len() as u32;
+                self.list.push(part);
+                if self.list.len() > SCAN {
+                    self.map.reserve(4 * SCAN);
+                    self.map.extend(self.list.iter().enumerate().map(|(at, &it)| (it, at as u32)));
+                }
+                return at;
+            }
+            let next = self.list.len() as u32;
+            let list = &mut self.list;
+            *self.map.entry(part).or_insert_with(|| {
+                list.push(part);
+                next
+            })
+        }
+
+        /// The word of `span`.
+        #[inline]
+        pub fn pack(&mut self, span: span::Span) -> u64 {
+            let part = self.part(span.anchor, span.ctx);
+            self.word(span.range.start().into(), span.range.len().into(), part)
+        }
+
+        /// The word of the span `start..start + len` of the part at `part`, which is one.
+        #[inline]
+        pub fn word(&mut self, start: u32, len: u32, part: u32) -> u64 {
+            if len < NARROW && part < NARROW {
+                return u64::from(start) | u64::from(len | part << 16) << 32;
+            }
+            self.wide_word([start, len, part])
+        }
+
+        #[cold]
+        fn wide_word(&mut self, span: [u32; 3]) -> u64 {
+            let next = self.wide.len() as u32;
+            let wide = &mut self.wide;
+            let at = *self.wides.entry(span).or_insert_with(|| {
+                wide.push(span);
+                next
+            });
+            u64::from(at) | u64::from(WIDE) << 32
+        }
+
+        /// The word the module asks for of `start`, `len` and `part` (`span_pack`): [`NONE`] for a
+        /// part it was never given or a span ending past 4 GiB.
+        pub fn pack_fields(&mut self, start: u32, len: u32, part: u32) -> u64 {
+            if part as usize >= self.list.len() || start.checked_add(len).is_none() {
+                return NONE;
+            }
+            self.word(start, len, part)
+        }
+
+        /// The span of `word`: `None` for a word no span of this expansion has, which a packed
+        /// span as long as only a wide one is, or of a part only a wide one has, is not either.
+        #[inline]
+        pub fn get(&self, word: u64) -> Option<span::Span> {
+            let [start, len, part] = self.fields_of(word)?;
+            let (anchor, ctx) = *self.list.get(part as usize)?;
+            let end = start.checked_add(len)?;
+            let range = TextRange::new(TextSize::new(start), TextSize::new(end));
+            Some(span::Span { range, anchor, ctx })
+        }
+
+        fn fields_of(&self, word: u64) -> Option<[u32; 3]> {
+            let (start, len_part) = (word as u32, (word >> 32) as u32);
+            if len_part == WIDE {
+                return self.wide.get(start as usize).copied();
+            }
+            let (len, part) = (len_part & NARROW, len_part >> 16);
+            (len != NARROW && part != NARROW).then_some([start, len, part])
+        }
+
+        /// `[start, len, part]` of `word` (`span_unpack`), `[0, 0, u32::MAX]` for a word no span of
+        /// this expansion has: its part is then refused wherever the module names it.
+        pub fn fields(&self, word: u64) -> [u32; 3] {
+            match self.get(word) {
+                Some(_) => self.fields_of(word).expect("a span's word has its fields"),
+                None => [0, 0, u32::MAX],
+            }
+        }
+
+        /// The part a tree the module wrote names: `{ file_id: index, ast_id: 0, ctx: 0 }` with an
+        /// index of this expansion's parts, and nothing else.
+        pub fn named(&self, part: WirePart) -> Result<Part, String> {
+            match part {
+                WirePart { file_id, ast_id: 0, ctx: 0 } if (file_id as usize) < self.list.len() => {
+                    Ok(self.list[file_id as usize])
+                }
+                // alloc: the message of a tree refused.
+                _ => Err(format!(
+                    "the expansion has {} span parts, each named by its index alone",
+                    self.list.len()
+                )),
+            }
+        }
+
+        /// The index of the part of the raw ids `write_wire` wrote of it.
+        #[doc(hidden)]
+        pub fn part_written(&mut self, file_id: u32, ast_id: u32, ctx: u32) -> u32 {
+            let anchor = SpanAnchor {
+                file_id: EditionedFileId::from_raw(file_id),
+                ast_id: ErasedFileAstId::from_raw(ast_id),
+            };
+            // SAFETY: `from_u32` asks for a value `into_u32` gave of this process's contexts:
+            // `ctx` is what `write_wire` wrote of a part of a tree of this process the moment before
+            // (`relative`). Memory safety doesn't rest on it: a wrong value panics in `from_u32` or
+            // in salsa's checked lookup, or names another context's hygiene.
+            let ctx = unsafe { SyntaxContext::from_u32(ctx) };
+            self.part(anchor, ctx)
+        }
+    }
+
+    /// What only blaze's database or lexer can answer of an expansion: asked when a macro
+    /// asks a span's place, file or text, joins, parents or cuts a span, or makes tokens of
+    /// text, never per token.
+    pub trait Ask {
+        /// The span covering both, `None` when they can't be joined.
+        fn join(&mut self, first: span::Span, second: span::Span) -> Option<span::Span>;
+        fn parent(&mut self, span: span::Span) -> Option<span::Span>;
+        fn source(&mut self, span: span::Span) -> Option<span::Span>;
+        /// The part of `span` between the module's encoded bounds, `None` when outside it.
+        fn subspan(&mut self, span: span::Span, start: u64, end: u64) -> Option<span::Span>;
+        fn byte_range(&mut self, span: span::Span) -> [u32; 2];
+        fn line_column(&mut self, span: span::Span) -> Option<(u32, u32)>;
+        fn file(&mut self, span: span::Span) -> Option<String>;
+        fn local_file(&mut self, span: span::Span) -> Option<String>;
+        fn source_text(&mut self, span: span::Span) -> Option<String>;
+        /// The stream of `text` at `call_site` as the columns [`wire::Reader`] reads, its
+        /// spans given words in `parts`, or why it is none.
+        fn ts_from_str(
+            &mut self,
+            parts: &mut Parts,
+            text: &str,
+            call_site: span::Span,
+        ) -> Result<Vec<u8>, String>;
         /// The literal of `text` as the columns of a stream of it alone.
-        fn literal_from_str(&mut self, text: &str) -> Option<Vec<u8>>;
+        fn literal_from_str(
+            &mut self,
+            parts: &mut Parts,
+            text: &str,
+            call_site: span::Span,
+        ) -> Option<Vec<u8>>;
+    }
+
+    /// The host of one expansion: its span parts and the words of its def, call and mixed
+    /// sites, answering every span function a macro calls per token itself, each as the wasm
+    /// host's function of the same name does (`crates/blaze-macro-wasm/src/lib.rs`,
+    /// `add_host`). A span is a word of [`Parts`], [`NONE`] none; text is `None` where the wasm
+    /// host gives none (-1).
+    pub struct Host<'a> {
+        pub parts: &'a mut Parts,
+        /// The words of the def, call and mixed sites.
+        pub sites: [u64; 3],
+        // What blaze-expand's database and lexer answer, which this crate can't name, as
+        // blaze-expand depends on it.
+        // dyn: the edge of that crate cycle, asked only off the per-token path (`Ask`).
+        pub ask: &'a mut dyn Ask,
+    }
+
+    impl Host<'_> {
+        fn span(&self, word: u64) -> Option<span::Span> {
+            self.parts.get(word)
+        }
+
+        fn call_site_span(&self) -> span::Span {
+            self.span(self.sites[1]).expect("the current call site is one of the expansion's")
+        }
+
+        pub fn def_site(&mut self) -> u64 {
+            self.sites[0]
+        }
+
+        pub fn call_site(&mut self) -> u64 {
+            self.sites[1]
+        }
+
+        pub fn mixed_site(&mut self) -> u64 {
+            self.sites[2]
+        }
+
+        pub fn span_join(&mut self, a: u64, b: u64) -> u64 {
+            let (Some(first), Some(second)) = (self.span(a), self.span(b)) else { return NONE };
+            self.ask.join(first, second).map_or(NONE, |it| self.parts.pack(it))
+        }
+
+        pub fn span_resolved_at(&mut self, a: u64, at: u64) -> u64 {
+            let (Some(span), Some(at)) = (self.span(a), self.span(at)) else { return a };
+            self.parts.pack(span::Span { ctx: at.ctx, ..span })
+        }
+
+        pub fn span_located_at(&mut self, a: u64, b: u64) -> u64 {
+            let (Some(span), Some(other)) = (self.span(a), self.span(b)) else { return b };
+            self.parts.pack(span::Span { ctx: span.ctx, ..other })
+        }
+
+        pub fn span_parent(&mut self, a: u64) -> u64 {
+            let Some(span) = self.span(a) else { return NONE };
+            self.ask.parent(span).map_or(NONE, |it| self.parts.pack(it))
+        }
+
+        pub fn span_source(&mut self, a: u64) -> u64 {
+            let Some(span) = self.span(a) else { return a };
+            self.ask.source(span).map_or(a, |it| self.parts.pack(it))
+        }
+
+        pub fn span_start(&mut self, a: u64) -> u64 {
+            let Some(span) = self.span(a) else { return a };
+            if span.anchor.ast_id == span::FIXUP_ERASED_FILE_AST_ID_MARKER {
+                return a;
+            }
+            self.parts.pack(span::Span { range: TextRange::empty(span.range.start()), ..span })
+        }
+
+        pub fn span_end(&mut self, a: u64) -> u64 {
+            let Some(span) = self.span(a) else { return a };
+            if span.anchor.ast_id == span::FIXUP_ERASED_FILE_AST_ID_MARKER {
+                return a;
+            }
+            self.parts.pack(span::Span { range: TextRange::empty(span.range.end()), ..span })
+        }
+
+        pub fn span_subspan(&mut self, a: u64, start: u64, end: u64) -> u64 {
+            let Some(span) = self.span(a) else { return NONE };
+            self.ask.subspan(span, start, end).map_or(NONE, |it| self.parts.pack(it))
+        }
+
+        /// The word of `start..start + len` of the expansion's part `part`, [`NONE`] for a
+        /// part it has not.
+        pub fn span_pack(&mut self, start: u32, len: u32, part: u32) -> u64 {
+            self.parts.pack_fields(start, len, part)
+        }
+
+        /// `[start, len, part]` of a word, `[0, 0, u32::MAX]` for one it never gave out.
+        pub fn span_unpack(&mut self, a: u64) -> [u32; 3] {
+            self.parts.fields(a)
+        }
+
+        /// `[0, 0]` for a span it never gave out.
+        pub fn span_byte_range(&mut self, a: u64) -> [u32; 2] {
+            let Some(span) = self.span(a) else { return [0, 0] };
+            self.ask.byte_range(span)
+        }
+
+        pub fn span_line(&mut self, a: u64) -> u32 {
+            let span = self.span(a);
+            span.and_then(|span| self.ask.line_column(span)).map_or(1, |(line, _)| line)
+        }
+
+        pub fn span_column(&mut self, a: u64) -> u32 {
+            let span = self.span(a);
+            span.and_then(|span| self.ask.line_column(span)).map_or(1, |(_, column)| column)
+        }
+
+        pub fn span_debug(&mut self, a: u64) -> Option<String> {
+            // alloc: the text the macro asked for.
+            self.span(a).map(|it| format!("{it:?}"))
+        }
+
+        pub fn span_file(&mut self, a: u64) -> Option<String> {
+            let span = self.span(a)?;
+            self.ask.file(span)
+        }
+
+        pub fn span_local_file(&mut self, a: u64) -> Option<String> {
+            let span = self.span(a)?;
+            self.ask.local_file(span)
+        }
+
+        pub fn span_source_text(&mut self, a: u64) -> Option<String> {
+            let span = self.span(a)?;
+            self.ask.source_text(span)
+        }
+
+        /// The stream of `text` as the columns [`wire::Reader`] reads, or why it is none.
+        pub fn ts_from_str(&mut self, text: &str) -> Result<Vec<u8>, String> {
+            let call_site = self.call_site_span();
+            self.ask.ts_from_str(self.parts, text, call_site)
+        }
+
+        /// The literal of `text` as the columns of a stream of it alone.
+        pub fn literal_from_str(&mut self, text: &str) -> Option<Vec<u8>> {
+            let call_site = self.call_site_span();
+            self.ask.literal_from_str(self.parts, text, call_site)
+        }
+
         /// The word of `span`, which makes it one of the expansion's.
-        fn pack(&mut self, span: span::Span) -> u64;
+        #[inline]
+        pub fn pack(&mut self, span: span::Span) -> u64 {
+            self.parts.pack(span)
+        }
+
         /// The span of `word`, `None` for a word the expansion has no span of.
-        fn get(&self, word: u64) -> Option<span::Span>;
+        #[inline]
+        pub fn get(&self, word: u64) -> Option<span::Span> {
+            self.parts.get(word)
+        }
     }
 
     /// Why an expansion gave no tree.
@@ -337,8 +668,7 @@ pub mod __native {
     }
 
     thread_local! {
-        // dyn: the host is blaze-expand's, which this crate can't name.
-        static HOST: Cell<Option<*mut (dyn Host + 'static)>> = const { Cell::new(None) };
+        static HOST: Cell<Option<*mut Host<'static>>> = const { Cell::new(None) };
         /// What a function that gives text or a stream back put there, for `sys::take`.
         // alloc: none, an empty buffer reused by every call.
         pub(crate) static BUFFER: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -348,34 +678,25 @@ pub mod __native {
     }
 
     /// Runs `f` with `host` answering every function of `sys` called on this thread.
-    // dyn: the host is blaze-expand's, which this crate can't name.
-    pub fn with_host<R>(host: &mut dyn Host, f: impl FnOnce() -> R) -> R {
-        // dyn: the host is blaze-expand's, which this crate can't name.
-        struct Restore(Option<*mut (dyn Host + 'static)>);
+    pub fn with_host<R>(host: &mut Host<'_>, f: impl FnOnce() -> R) -> R {
+        struct Restore(Option<*mut Host<'static>>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 HOST.with(|it| it.set(self.0));
             }
         }
-        // dyn: the host is blaze-expand's, which this crate can't name.
-        let host: *mut (dyn Host + '_) = host;
-        // SAFETY: only the lifetime changes. The pointer is read by `host` alone, on this
-        // thread, while `f` runs: `Restore` puts the one before it back when `f` returns or
-        // unwinds, before the borrow it came from ends.
-        let host = unsafe {
-            // dyn: the host is blaze-expand's, which this crate can't name.
-            std::mem::transmute::<*mut (dyn Host + '_), *mut (dyn Host + 'static)>(host)
-        };
+        // Only the lifetime changes. The pointer is read by `host` alone, on this thread,
+        // while `f` runs: `Restore` puts the one before it back when `f` returns or unwinds,
+        // before the borrow it came from ends.
+        let host = std::ptr::from_mut(host).cast::<Host<'static>>();
         let _restore = Restore(HOST.with(|it| it.replace(Some(host))));
         f()
     }
 
     /// Runs `f` with the host set on this thread, taken out of [`HOST`] while `f` runs: a
     /// host whose answer calls a function of `sys` itself is told so by the panic below.
-    // dyn: the host is blaze-expand's, which this crate can't name.
-    pub(crate) fn host<R>(f: impl FnOnce(&mut dyn Host) -> R) -> R {
-        // dyn: the host is blaze-expand's, which this crate can't name.
-        struct Restore(*mut (dyn Host + 'static));
+    pub(crate) fn host<R>(f: impl FnOnce(&mut Host<'_>) -> R) -> R {
+        struct Restore(*mut Host<'static>);
         impl Drop for Restore {
             fn drop(&mut self) {
                 HOST.with(|it| it.set(Some(self.0)));
@@ -385,13 +706,14 @@ pub mod __native {
             panic!("procedural macro API is used outside of a procedural macro");
         };
         let _restore = Restore(host);
-        // SAFETY: `host` is the pointer `with_host` set from a `&mut dyn Host` it holds the
+        // SAFETY: `host` is the pointer `with_host` set from a `&mut Host` it holds the
         // borrow of while it is set, on this thread. It is out of `HOST` until `_restore`
         // puts it back as `f` returns or unwinds, so no other call makes a second reference
         // to it meanwhile: one of `sys` inside `f` panics, and a nested `with_host` (a host's
         // answer expanding another macro) sets another host and gives back `None`. Two live
-        // `&mut` of one host would be undefined behavior.
-        f(unsafe { &mut *host })
+        // `&mut` of one host would be undefined behavior. `f` is given the host at a lifetime
+        // of its own, never `'static`.
+        f(unsafe { &mut *host.cast::<Host<'_>>() })
     }
 
     /// Gives every span of `tree` its word, in the order the wasm host gives a module's input
@@ -523,8 +845,7 @@ pub mod __native {
     }
 
     /// The span of `word`, or why the output can't have it.
-    // dyn: the host is blaze-expand's, which this crate can't name.
-    fn unpacked(host: &mut dyn Host, word: Span) -> Result<span::Span, Failed> {
+    fn unpacked(host: &mut Host<'_>, word: Span) -> Result<span::Span, Failed> {
         host.get(word.0).ok_or_else(|| {
             // alloc: the message of an output refused.
             Failed::Output(format!("it gave a span {:#x} that its expansion has not", word.0))
@@ -554,8 +875,7 @@ pub mod __native {
     }
 
     fn push(
-        // dyn: the host is blaze-expand's, which this crate can't name.
-        host: &mut dyn Host,
+        host: &mut Host<'_>,
         builder: &mut tt::TopSubtreeBuilder,
         stream: &TokenStream,
     ) -> Result<(), Failed> {

@@ -65,6 +65,7 @@ use super::{
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-regions (2026-10-29 21:40): both import edits as written; R3's `infer::region_constraints::Constraint` added to the `next_solver` group here too.
 
 ### R0.1 What other files call, after this part
 
@@ -87,6 +88,7 @@ The check.rs sibling (`mem-db-checks-check`, B7) and the parent's B5 call these;
 ---
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree: crates/hir-ty-borrowck/src/regions.rs:706 `build`, 220 `type_bounds_of -> impl Iterator`, 281 `opaque_captures(frame, ..)` (callers liveness.rs:780, polonius.rs:284, check.rs:2403 pass the frame), 693 `regions_of`, 7078 `outlives_components`, 7146 `alias_components`, 7214 `constraint_path`, 7056 `adt_variants`.
 
 ## R1. `Regions<'db>` becomes `Regions<'f, 'db>` (lines 169-243)
 
@@ -210,6 +212,8 @@ Every other file that names `Regions<'db>` / `&Regions<'_>` names `Regions<'_, '
 `&Regions<'_, '_>` (the parent's B5 already writes `liveness`, `loans`, `polonius`,
 `inference` so; check.rs is B7's).
 
+> applied by db-mem-borrowck-regions (2026-10-29 21:45): fields, `universal` and `type_bounds_of` as written. `outlives: Constraints<'f>` and `Constraints::new` are the parent's B5.6, not yet in `constraints.rs`.
+
 ---
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
@@ -220,6 +224,7 @@ Once per body: the regions' tables, every field of `Builder`, and two sets made 
 up front.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): R2.1-R2.4 applied below by db-mem-borrowck-regions; `build` at regions.rs:706 takes the frame maps.
 
 ### R2.1 `build` (lines 712-784)
 
@@ -348,6 +353,7 @@ and `FVec<'o, ..>` are covariant in `'o` (hashbrown's `RawTable<T, A>` and `Vec<
 by value), so `Builder` can hold it as `&'c FMap<'c, ..>`.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-regions (2026-10-29 21:46): as written (now at line 699).
 
 ### R2.2 `Builder` (lines 786-839)
 
@@ -411,6 +417,7 @@ The maps `early`/`late`/`parent_late`/`placeholders` are looked up and inserted 
 methods below can name `'a` for frame values they return.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-regions (2026-10-29 21:47): as written; the `scratch` field's doc says "cleared at each use" without the "(R3)". The one `impl Builder` (now line 881) is `impl<'a, 'db> Builder<'_, 'a, 'db>`.
 
 ### R2.3 `synthesized` and `aggregate_temps` (lines 841-876)
 
@@ -474,6 +481,7 @@ An expression of a nested body is in the owner's store (`ctx.store` is the owner
 bitset over `ctx.store`'s expressions covers every `ExprId` a body's MIR spans name.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-regions (2026-10-29 21:48): as written, both readers too (now lines 3060, 3965). `expr_ids` is `ExactSizeIterator` at `expr_store.rs` 1819.
 
 ### R2.4 `new_universal` (lines 920-926)
 
@@ -496,6 +504,8 @@ after:
         index[rv] = self.regions.universals.len() as u32;
         self.regions.universals.push((rv, kind));
 ```
+
+> applied by db-mem-borrowck-regions (2026-10-29 21:48): as written.
 
 ---
 
@@ -602,6 +612,7 @@ fn a_shelf_gives_back_what_it_took() {
 > db-ty-d-borrowck (2026-10-29 20:55): not applied, waits on R0-R2 and B0-B1 of
 > `mem-db-checks.md`: `Regions` is still `Regions<'db>`, there is no `crate::mem` (`mem.rs`), and
 > the crate has no `blaze-mem` dependency, so `Shelf`/`Scratch` have no frame to be in.
+> applied by db-mem-borrowck-regions (2026-10-29 21:50): `Shelf`, `Scratch` after `At` as written (`Constraint` imported in R0). The test is in a new `#[cfg(test)] mod tests` at the end of regions.rs, with one difference: `again` is given back before the counted block, so the counted `take` reuses the 100-long buffer.
 
 ## R4. Relating and outliving: per statement, per constraint
 
@@ -612,6 +623,7 @@ fn a_shelf_gives_back_what_it_took() {
 > forwarded to db (db-ty-d-borrowck) (requests, pass 18; told by tmux).
 > db-ty-d-borrowck (2026-10-29 20:55): not applied, waits on R3 (its `Scratch`) and so on
 > R0-R2 and B0-B1.
+> applied by db-mem-borrowck-regions (2026-10-29 21:58): R4.1-R4.6 as written (R4.3 at lines 3593 and 3637 now, R4.5 at 3067). R4.5's callers in `implied_bounds` are changed with R6.3; `closure_requirements`'s `parents` with R7.3.
 
 ### R4.1 `type_outlives_at` (lines 3672-3697): per type that must outlive a region
 
@@ -1569,6 +1581,7 @@ pairs);`, and line 7357 `pairs: pairs.into_iter().map(|(a, b)| (a.store(), b.sto
 .collect(),` -> `pairs: mem::owned(pairs.iter().map(|&(a, b)| (a.store(), b.store()))),`.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-regions (2026-10-29 22:10): R5.1-R5.10 as written, with every caller (`unsize` 5360, `signature_higher_ranked`, `statement`'s `opaque_bounds`). Differences: `prove_canonical`'s `#[allow(clippy::type_complexity)]` and `normalize_canonical`'s go (the types are simple now), and `normalize_canonical`'s local `use ..::Constraint` goes for R3's module import. `instantiate` in `clauses` was already generic (dedyn).
 
 ---
 
@@ -1582,6 +1595,7 @@ per-path or per-clause buffer, it takes one.
 > forwarded to db (db-ty-d-borrowck) (requests, pass 18; told by tmux).
 > db-ty-d-borrowck (2026-10-29 20:55): not applied, waits on R1-R2 (`Regions<'f, 'db>`,
 > `build`'s frame) and B0-B1.
+> applied by db-mem-borrowck-regions (2026-10-29 22:25): R6.1-R6.3 as written, found by old text (all moved ~50 lines down). `errors` (now line 1167) keeps `vec!` with the `// alloc:` note, as `ElidedLifetimes::regions` (lower.rs 4008) still takes `&[Vec<Region>]`. `positions.iter().flatten()` works on `spelled_positions`'s return before and after R7.5.
 
 ### R6.1 `universal_regions` (lines 1037-1666)
 
@@ -1977,6 +1991,7 @@ and `signature_higher_ranked` (R5.2) allocate nothing else.
 > forwarded to db (db-ty-d-borrowck) (requests, pass 18; told by tmux).
 > db-ty-d-borrowck (2026-10-29 20:55): not applied, waits on R2-R3 (`Builder`'s frame,
 > `Shelf`/`Scratch`) and B0-B1.
+> applied by db-mem-borrowck-regions (2026-10-29 21:50): R7.1-R7.6 as written, found by old text (all ~110 lines down). `elide`'s `errors` keeps `vec!` with the `// alloc:` note (ElidedLifetimes::regions still takes vectors).
 
 ### R7.1 `terminator`, `Call` (lines 5355-5497): per call
 
@@ -2503,6 +2518,7 @@ after:
 
 > forwarded to db (db-ty-d-borrowck) (requests, pass 19; told by tmux).
 > db-ty-d-borrowck (2026-10-29 20:59): not applied, waits on R0-R2 and B0-B1 as R3-R7 do.
+> applied by db-mem-borrowck-regions (2026-10-29 22:00): R8.1-R8.8 as written, found by old text. Differences: R6.1's two `opaque_captures` callers in `universal_regions` (now 1409, 1438) and R8.4's at 3306 were still `(self.ctx.db, ..)` and take the frame here; R8.8's `closure_annotations` was already in. polonius.rs 284 still calls `opaque_captures(ctx.db, ..)`: filed in `v2/requests/db-ty-d-borrowck.md` for frontend-fast-borrowck. names.rs and check/parts.rs already work with R8.5's iterator.
 
 ### R8.1 `opaque_captures` (lines 293-464): per opaque type visited
 
@@ -2842,6 +2858,8 @@ covers regions.rs too, and a second, warm run allocates nothing.
 
 
 ## dedyn: crates/hir-ty-borrowck/src/regions.rs: `InferVars` goes, lowering takes the `InferCtxt`
+> Being applied in the tree by dedyn-ty (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.
+
 
 Part of one change across hir-ty, written in full in `v2/requests/db-ty.md` under
 "## dedyn: crates/hir-ty/src/lower.rs" (section "hir-ty-borrowck/src/regions.rs"): delete
@@ -2852,6 +2870,8 @@ in place of the two `.with_infer_vars_behavior(..)`. Apply it with the hir-ty pa
 > forwarded to db (db-ty-d-borrowck) (requests, pass 19; told by tmux).
 > db-ty-d-borrowck (2026-10-29 20:59): not applied yet, `with_infer_ctxt_vars` is not in
 > `hir-ty/src/lower.rs`; applied with db-ty-next2's `lower.rs` part (see `v2/requests/db-ty.md`).
+> checked by db-mem-borrowck (2026-10-29 21:45): applied by dedyn-ty with hir-ty's `lower.rs`
+> (`with_infer_ctxt_vars` at `lower.rs` 448). regions.rs matches the section.
 
 > mem-db-checks-regions (2026-10-29 21:09): fits with R0-R9 in either order. It touches lines
 > 54-63 (`InferVars`), 4312/4323 and 4676/4687; R0 changes only the imports (20, 43-48), R7.5
@@ -2881,3 +2901,8 @@ constructors (`bits`, `matrix`, per `mem-db-checks-check` B7.13), regions.rs tak
 as written there; what it needs is the operations above.
 
 > forwarded to frontend-fast-borrowck (it holds those dataflow files now; told by tmux; requests, pass 22).
+> frontend-fast-borrowck (2026-10-29 22:00): kept, all of it. Checked in the tree: `bitset.rs`
+> `BitMatrix<'f>::new(frame, rows, columns)`, `contains`, `insert`, `union_rows`; `BitSet<'f>::new(frame,
+> size)`, `contains` (false past the end), `insert -> bool`; `cfg.rs` `Cfg<'f>.order: FVec<'f,
+> BasicBlockId>`, `Location { block, statement }` with public fields; `liveness::live_regions ->
+> FVec<'a, Rv>`, `normalize_erased` unchanged; `Ctx.frame`, `return_slot()`, `debugging(db, owner)`.

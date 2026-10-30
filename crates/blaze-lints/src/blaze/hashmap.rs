@@ -33,9 +33,9 @@ impl Std {
             _ => None,
         };
         Std {
-            map: adt(&["collections", "HashMap"]),
-            set: adt(&["collections", "HashSet"]),
-            random: adt(&["hash", "RandomState"]),
+            map: adt(&["std", "collections", "HashMap"]),
+            set: adt(&["std", "collections", "HashSet"]),
+            random: adt(&["std", "hash", "RandomState"]),
         }
     }
 

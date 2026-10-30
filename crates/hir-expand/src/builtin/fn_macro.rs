@@ -5,6 +5,7 @@ mod args;
 use std::{borrow::Cow, sync::OnceLock};
 
 use base_db::{AnchoredPath, Db};
+use blaze_mem::Frame;
 use cfg::CfgExpr;
 use either::Either;
 use intern::{Symbol, sym};
@@ -13,8 +14,6 @@ use mbe::{DelimiterKind, expect_fragment};
 use span::{Edition, FileId, Span};
 use stdx::edit_distance::edit_distance;
 use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
-use syntax_bridge::syntax_node_to_token_tree;
-
 use self::args::{Arg, Array, IntSuffix, Lit, lit_value};
 use crate::{
     BuiltinError, EditionedFileId, ExpandError, ExpandResult, FileRange, HirFileId, InFile,
@@ -36,7 +35,7 @@ macro_rules! register_builtin {
             /// Every variant, in declaration order.
             pub const ALL: &[Self] = &[$(Self::$kind),*];
 
-            fn expander(&self) -> fn (&Db, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree>  {
+            fn expander(&self) -> for<'f> fn (&Db, &'f Frame, MacroCallId, &tt::TopSubtree, Span) -> ExpandResult<tt::TopSubtree<&'f Frame>>  {
                 match *self {
                     $( Self::$kind => $expand, )*
                 }
@@ -67,15 +66,16 @@ macro_rules! register_builtin {
 }
 
 impl BuiltinFnLikeExpander {
-    pub fn expand(
+    pub fn expand<'f>(
         &self,
         db: &Db,
+        frame: &'f Frame,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
-    ) -> ExpandResult<tt::TopSubtree> {
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
         let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
-        self.expander()(db, id, tt, span)
+        self.expander()(db, frame, id, tt, span)
     }
 
     pub fn is_asm(&self) -> bool {
@@ -84,15 +84,16 @@ impl BuiltinFnLikeExpander {
 }
 
 impl EagerExpander {
-    pub fn expand(
+    pub fn expand<'f>(
         &self,
         db: &Db,
+        frame: &'f Frame,
         id: MacroCallId,
         tt: &tt::TopSubtree,
         span: Span,
-    ) -> ExpandResult<tt::TopSubtree> {
+    ) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
         let span = span_with_def_site_ctxt(db, span, id.into(), Edition::CURRENT);
-        self.expander()(db, id, tt, span)
+        self.expander()(db, frame, id, tt, span)
     }
 
     pub fn is_include(&self) -> bool {
@@ -183,15 +184,16 @@ fn parenthesized(tt: &tt::TopSubtree) -> WithDelimiter<'_> {
     }
 }
 
-fn module_path_expand(
+fn module_path_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     _tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     static PLACEHOLDER: OnceLock<Symbol> = OnceLock::new();
     let placeholder = constant_str_literal(&PLACEHOLDER, MODULE_PATH_PLACEHOLDER, span);
-    ExpandResult::ok(quote! {span =>
+    ExpandResult::ok(quote_in! {frame, span =>
          #placeholder
     })
 }
@@ -200,35 +202,38 @@ fn module_path_expand(
 /// literal with this in it puts the path of the module there.
 pub const MODULE_PATH_PLACEHOLDER: &str = "\u{0}module_path\u{0}";
 
-fn line_expand(
+fn line_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    place_expand(db, id, tt, span, "line!", |(line, _)| line)
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    place_expand(db, frame, id, tt, span, "line!", |(line, _)| line)
 }
 
-fn column_expand(
+fn column_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    place_expand(db, id, tt, span, "column!", |(_, column)| column)
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    place_expand(db, frame, id, tt, span, "column!", |(_, column)| column)
 }
 
 /// `line!()` or `column!()`: the `u32` that `pick` takes of [`written_place`], as rustc's
 /// `expand_line` and `expand_column` give it. Arguments are an error, after which the value is
 /// given all the same (rustc's `check_zero_tts`).
-fn place_expand(
+fn place_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
     name: &str,
     pick: fn((u32, u32)) -> u32,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let err = (!tt.token_trees().is_empty()).then(|| {
         // alloc: an error's message, on the error path
         BuiltinError::new(format!("{name} takes no arguments")).at(call_span(db, id, span))
@@ -239,7 +244,8 @@ fn place_expand(
             // alloc: an error's message, on the error path
             let message = format!("`{name}`: the call is not in its file's text");
             let err = ExpandError::other(span, message);
-            return ExpandResult::new(tt::TopSubtree::empty(DelimSpan::from_single(span)), err);
+            let empty = tt::TopSubtree::empty_in(DelimSpan::from_single(span), frame);
+            return ExpandResult::new(empty, err);
         }
     };
     let mut text = [0u8; 13];
@@ -255,7 +261,8 @@ fn place_expand(
         kind: tt::LitKind::Integer,
         suffix_len: 3,
     };
-    let expanded = tt::TopSubtree::invisible_from_leaves(span, [tt::Leaf::Literal(literal)]);
+    let expanded =
+        tt::TopSubtree::invisible_from_leaves_in(span, [tt::Leaf::Literal(literal)], frame);
     match err {
         Some(err) => ExpandResult::new(expanded, err),
         None => ExpandResult::ok(expanded),
@@ -325,22 +332,24 @@ pub fn line_and_column(db: &Db, range: FileRange) -> Option<(u32, u32)> {
     Some((place.line(), place.char_column(text.text(db))?))
 }
 
-fn log_syntax_expand(
+fn log_syntax_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     _tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    ExpandResult::ok(quote! {span =>})
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    ExpandResult::ok(quote_in! {frame, span =>})
 }
 
-fn trace_macros_expand(
+fn trace_macros_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     _tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    ExpandResult::ok(quote! {span =>})
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    ExpandResult::ok(quote_in! {frame, span =>})
 }
 
 /// Whether the source has another token right after the token `text` at `span`. `None` if the
@@ -372,19 +381,20 @@ fn through_proc_macro(db: &Db, id: MacroCallId) -> bool {
     false
 }
 
-fn stringify_expand(
+fn stringify_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let pretty = ::tt::stringify(
         tt.token_trees(),
         &|span, text| source_joined(db, span, text),
         through_proc_macro(db, id),
     );
 
-    let expanded = quote! {span =>
+    let expanded = quote_in! {frame, span =>
         #pretty
     };
 
@@ -421,12 +431,13 @@ fn write_assert_condition(out: &mut String, tokens: &str, edition: Edition) {
     }
 }
 
-fn assert_expand(
+fn assert_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
 
     let mut iter = tt.iter();
@@ -449,7 +460,7 @@ fn assert_expand(
             through_proc_macro(db, id),
         );
         const HEAD: &str = "assertion failed: ";
-        let mut message = String::with_capacity(HEAD.len() + tokens.len() + tokens.len() / 4);
+        let mut message = blaze_mem::scratch::lend_string();
         message.push_str(HEAD);
         write_assert_condition(&mut message, &tokens, span.ctx.edition(db));
         message
@@ -460,6 +471,7 @@ fn assert_expand(
         let panic_args = rest.iter();
         match &message {
             Some(message) => {
+                let message: &str = message;
                 quote_into!(b, call_site_span => #dollar_crate::panicking::panic(#message))
             }
             None if panic_2021 => {
@@ -469,7 +481,7 @@ fn assert_expand(
         }
     });
     let value = cond.value;
-    let expanded = quote! {call_site_span =>{
+    let expanded = quote_in! {frame, call_site_span =>{
         if !(#value) {
             #mac;
         }
@@ -481,52 +493,59 @@ fn assert_expand(
     }
 }
 
-fn file_expand(
+fn file_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     _tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     // FIXME: RA purposefully lacks knowledge of absolute file names
     // so just return "".
     static FILE: OnceLock<Symbol> = OnceLock::new();
     let file_name = constant_str_literal(&FILE, "file", span);
 
-    let expanded = quote! {span =>
+    let expanded = quote_in! {frame, span =>
         #file_name
     };
 
     ExpandResult::ok(expanded)
 }
 
-fn format_args_expand(
+fn format_args_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let pound = mk_pound(span);
     let args = parenthesized(tt);
-    ExpandResult::ok(quote! {span =>
+    ExpandResult::ok(quote_in! {frame, span =>
         builtin #pound format_args #args
     })
 }
 
-fn format_args_nl_expand(
+fn format_args_nl_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    match format_args_nl_of_literal(tt, span) {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    match format_args_nl_of_literal(frame, tt, span) {
         Some(expanded) => ExpandResult::ok(expanded),
-        None => format_args_nl_of_macro(db, tt, span),
+        None => format_args_nl_of_macro(db, frame, tt, span),
     }
 }
 
 /// `format_args_nl!` whose template is a string literal: `format_args!` of the literal with a
 /// newline appended. `None` if the first token is not a string literal.
-fn format_args_nl_of_literal(tt: &tt::TopSubtree, span: Span) -> Option<tt::TopSubtree> {
+fn format_args_nl_of_literal<'f>(
+    frame: &'f Frame,
+    tt: &tt::TopSubtree,
+    span: Span,
+) -> Option<tt::TopSubtree<&'f Frame>> {
     let mut args = tt.iter();
     let Some(tt::TtElement::Leaf(tt::Leaf::Literal(
         lit @ tt::Literal { kind: tt::LitKind::Str | tt::LitKind::StrRaw(_), .. },
@@ -537,7 +556,7 @@ fn format_args_nl_of_literal(tt: &tt::TopSubtree, span: Span) -> Option<tt::TopS
     // A raw string has no escapes: the newline goes in as it is.
     let newline = if lit.kind == tt::LitKind::Str { "\\n" } else { "\n" };
     let (text, suffix) = lit.text_and_suffix();
-    let mut joined = String::with_capacity(text.len() + newline.len() + suffix.len());
+    let mut joined = blaze_mem::scratch::lend_string();
     joined.push_str(text);
     joined.push_str(newline);
     joined.push_str(suffix);
@@ -553,7 +572,7 @@ fn format_args_nl_of_literal(tt: &tt::TopSubtree, span: Span) -> Option<tt::TopS
         b.close(delimiter.close);
     });
     let pound = mk_pound(span);
-    Some(quote! {span =>
+    Some(quote_in! {frame, span =>
         builtin #pound format_args #args
     })
 }
@@ -564,11 +583,12 @@ fn format_args_nl_of_literal(tt: &tt::TopSubtree, span: Span) -> Option<tt::TopS
 /// (`expand_format_args_impl` with `append_newline` in
 /// `compiler/rustc_builtin_macros/src/format.rs`). Here the template becomes
 /// `concat!(template, "\n")`, which expands to that same string.
-fn format_args_nl_of_macro(
+fn format_args_nl_of_macro<'f>(
     db: &Db,
+    frame: &'f Frame,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let pound = mk_pound(span);
     let mut iter = tt.iter();
     let template = expect_fragment(
@@ -581,7 +601,7 @@ fn format_args_nl_of_macro(
     let arguments = rest.iter();
     let dollar_crate = dollar_crate(span);
     let value = template.value;
-    let expanded = quote! {span =>
+    let expanded = quote_in! {frame, span =>
         builtin #pound format_args (#dollar_crate::concat!(#value, "\n") # #arguments)
     };
     match template.err {
@@ -590,54 +610,58 @@ fn format_args_nl_of_macro(
     }
 }
 
-fn asm_expand(
+fn asm_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let args = parenthesized(tt);
     let pound = mk_pound(span);
-    let expanded = quote! {span =>
+    let expanded = quote_in! {frame, span =>
         builtin #pound asm #args
     };
     ExpandResult::ok(expanded)
 }
 
-fn global_asm_expand(
+fn global_asm_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let args = parenthesized(tt);
     let pound = mk_pound(span);
-    let expanded = quote! {span =>
+    let expanded = quote_in! {frame, span =>
         builtin #pound global_asm #args
     };
     ExpandResult::ok(expanded)
 }
 
-fn naked_asm_expand(
+fn naked_asm_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let args = parenthesized(tt);
     let pound = mk_pound(span);
-    let expanded = quote! {span =>
+    let expanded = quote_in! {frame, span =>
         builtin #pound naked_asm #args
     };
     ExpandResult::ok(expanded)
 }
 
-fn cfg_select_expand(
+fn cfg_select_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let loc = id.loc(db);
     let cfg_options = loc.krate.cfg_options(db);
 
@@ -657,7 +681,7 @@ fn cfg_select_expand(
             _ => {
                 let err_span = iter.peek().map(|it| it.first_span()).unwrap_or(span);
                 return ExpandResult::new(
-                    tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+                    tt::TopSubtree::empty_in(tt::DelimSpan::from_single(span), frame),
                     ExpandError::other(err_span, "expected `=>` after cfg expression"),
                 );
             }
@@ -671,7 +695,7 @@ fn cfg_select_expand(
                 let err_span = iter.peek().map(|it| it.first_span()).unwrap_or(span);
                 iter.next();
                 return ExpandResult::new(
-                    tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+                    tt::TopSubtree::empty_in(tt::DelimSpan::from_single(span), frame),
                     ExpandError::other(err_span, "expected a token tree after `=>`"),
                 );
             }
@@ -684,7 +708,7 @@ fn cfg_select_expand(
                 );
                 if let Some(err) = expr.err {
                     return ExpandResult::new(
-                        tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+                        tt::TopSubtree::empty_in(tt::DelimSpan::from_single(span), frame),
                         err.into(),
                     );
                 }
@@ -709,37 +733,39 @@ fn cfg_select_expand(
                 close: span,
             });
             builder.extend_with_tt(expand_to);
-            ExpandResult::ok(builder.build())
+            ExpandResult::ok(builder.build_in(frame))
         }
         None => ExpandResult::new(
-            tt::TopSubtree::empty(tt::DelimSpan::from_single(span)),
+            tt::TopSubtree::empty_in(tt::DelimSpan::from_single(span), frame),
             BuiltinError::new("none of the predicates in this `cfg_select` evaluated to true")
                 .at(call_span(db, id, span)),
         ),
     }
 }
 
-fn cfg_expand(
+fn cfg_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let pound = mk_pound(span);
     // Support ide features, like completion and hover
     // This implementation should not be used for 'cfg_select' because 'cfg_select' expands any token.
-    let expanded = quote! {span =>
+    let expanded = quote_in! {frame, span =>
         builtin #pound cfg #tt
     };
     ExpandResult::ok(expanded)
 }
 
-fn panic_expand(
+fn panic_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
 
@@ -756,17 +782,18 @@ fn panic_expand(
     };
 
     // Expand to a macro call `$crate::panic::panic_{edition}`
-    let call = quote!(call_site_span =>#dollar_crate::panic::#mac! #subtree);
+    let call = quote_in!(frame, call_site_span =>#dollar_crate::panic::#mac! #subtree);
 
     ExpandResult::ok(call)
 }
 
-fn unreachable_expand(
+fn unreachable_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let dollar_crate = dollar_crate(span);
     let call_site_span = span_with_call_site_ctxt(db, span, id.into(), Edition::CURRENT);
 
@@ -783,7 +810,7 @@ fn unreachable_expand(
     };
 
     // Expand to a macro call `$crate::panic::panic_{edition}`
-    let call = quote!(call_site_span =>#dollar_crate::panic::#mac! #subtree);
+    let call = quote_in!(frame, call_site_span =>#dollar_crate::panic::#mac! #subtree);
 
     ExpandResult::ok(call)
 }
@@ -810,12 +837,13 @@ fn use_panic_2021(db: &Db, span: Span) -> bool {
     }
 }
 
-fn compile_error_expand(
+fn compile_error_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let err = match tt.iter().collect_array() {
         Some(
             [
@@ -827,17 +855,18 @@ fn compile_error_expand(
         _ => ExpandError::other(span, "`compile_error!` argument must be a string"),
     };
 
-    ExpandResult { value: quote! {span =>}, err: Some(err) }
+    ExpandResult { value: quote_in! {frame, span =>}, err: Some(err) }
 }
 
 /// rustc's `expand_concat`. The string is at the cover of the spans of the string, character
 /// and boolean literals it is made of, else at the call's open delimiter.
-fn concat_expand(
+fn concat_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     _arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     _call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let mut span: Option<Span> = None;
     let mut record_span = |s: Span| match &mut span {
         Some(span) if span.anchor == s.anchor => span.range = span.range.cover(s.range),
@@ -847,10 +876,9 @@ fn concat_expand(
     let open = tt.top_subtree().delimiter.open;
     let exprs = match args::exprs(db, tt) {
         Ok(it) => it,
-        Err(err) => return ExpandResult::new(quote!(open => ""), err),
+        Err(err) => return ExpandResult::new(quote_in!(frame, open => ""), err),
     };
-    // alloc: the text the call expands to
-    let mut text = String::new();
+    let mut text = blaze_mem::scratch::lend_string();
     let mut err = None;
     // alloc: the arguments that are no literal, on the error path
     let mut missing = Vec::new();
@@ -920,27 +948,30 @@ fn concat_expand(
         )
     });
     let span = span.unwrap_or(open);
-    ExpandResult { value: quote!(span =>#text), err }
+    let text: &str = &text;
+    ExpandResult { value: quote_in!(frame, span =>#text), err }
 }
 
 /// rustc's `expand_concat_bytes`. The literal has the call's span, as rustc's `expr_byte_str(sp,
 /// ..)` gives it.
-fn concat_bytes_expand(
+fn concat_bytes_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     _arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let byte_str = |bytes: &[u8]| {
-        let literal = tt::Literal::new_no_suffix(&escape_ascii(bytes), call_site, tt::LitKind::ByteStr);
-        tt::TopSubtree::invisible_from_leaves(call_site, [tt::Leaf::Literal(literal)])
+        let literal = blaze_mem::scratch::with_bytes(|out| {
+            tt::Literal::new_no_suffix(escape_ascii(bytes, out), call_site, tt::LitKind::ByteStr)
+        });
+        tt::TopSubtree::invisible_from_leaves_in(call_site, [tt::Leaf::Literal(literal)], frame)
     };
     let exprs = match args::exprs(db, tt) {
         Ok(it) => it,
         Err(err) => return ExpandResult::new(byte_str(&[]), err),
     };
-    // alloc: the bytes the call expands to
-    let mut bytes = Vec::new();
+    let mut bytes = blaze_mem::scratch::lend_bytes();
     let mut err = None;
     // alloc: the arguments that are no byte literal, on the error path
     let mut missing = Vec::new();
@@ -1112,14 +1143,15 @@ fn include_path(
     args::single_string(db, tt, name, call)
 }
 
-fn include_expand(
+fn include_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let ExpandResult { value: path, err } = include_path(db, arg_id, tt, "include!");
-    let empty = || tt::TopSubtree::empty(DelimSpan { open: span, close: span });
+    let empty = || tt::TopSubtree::empty_in(DelimSpan { open: span, close: span }, frame);
     let Some((path, path_span)) = path else {
         return ExpandResult { value: empty(), err };
     };
@@ -1128,11 +1160,12 @@ fn include_expand(
         Err(e) => return ExpandResult::new(empty(), err.unwrap_or(e)),
     };
     // FIXME: Parse errors
-    let expanded = syntax_node_to_token_tree(
-        &editioned_file_id.parse(db).syntax_node(),
+    let expanded = syntax_bridge::call_input_in(
+        editioned_file_id.parse(db).root(),
         crate::span_map::InOrder::new(crate::HirFileId::from(editioned_file_id).span_map(db)),
         span,
         syntax_bridge::DocCommentDesugarMode::ProcMacro,
+        frame,
     );
     ExpandResult { value: expanded, err }
 }
@@ -1150,42 +1183,39 @@ pub fn include_input_to_file_id(
     }
 }
 
-fn include_bytes_expand(
+fn include_bytes_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     // The length of what is not read is not known, so its type is `&[u8; _]`.
     let unread = || {
         let pound = mk_pound(span);
-        quote! {span => builtin #pound include_bytes }
+        quote_in! {frame, span => builtin #pound include_bytes }
     };
     let ExpandResult { value: path, err } = include_path(db, arg_id, tt, "include_bytes!");
     let Some((path, path_span)) = path else { return ExpandResult { value: unread(), err } };
-    match included_bytes(db, arg_id, path.as_str()) {
-        Some(bytes) => {
-            let text = escape_ascii(bytes);
-            let literal = tt::Literal::new_no_suffix(&text, span, tt::LitKind::ByteStr);
-            ExpandResult { value: quote!(span =>#literal), err }
-        }
-        None => {
-            let err = err.unwrap_or_else(|| {
-                // alloc: an error's message, on the error path
-                ExpandError::other(path_span, format!("failed to load file `{path}`"))
+    match included_bytes(db, arg_id, tt, path.as_str(), path_span) {
+        Ok(bytes) => {
+            let literal = blaze_mem::scratch::with_bytes(|out| {
+                tt::Literal::new_no_suffix(escape_ascii(bytes, out), span, tt::LitKind::ByteStr)
             });
-            ExpandResult::new(unread(), err)
+            ExpandResult { value: quote_in!(frame, span =>#literal), err }
         }
+        Err(error) => ExpandResult::new(unread(), err.unwrap_or(error)),
     }
 }
 
 /// `<[u8]>::escape_ascii` of `bytes` as one string, written in runs: the bytes it keeps (the
 /// printable ASCII other than quotes and backslashes) are copied whole, not formatted one by
-/// one, and the string is sized for them up front.
-fn escape_ascii(bytes: &[u8]) -> String {
+/// one, written into `out` (emptied first).
+fn escape_ascii<'o>(bytes: &[u8], out: &'o mut Vec<u8>) -> &'o str {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let kept = |b: u8| matches!(b, 0x20..=0x7e) && !matches!(b, b'"' | b'\'' | b'\\');
-    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 8);
+    out.clear();
+    out.reserve(bytes.len() + bytes.len() / 8);
     let mut run = 0;
     for (at, &b) in bytes.iter().enumerate() {
         if kept(b) {
@@ -1207,52 +1237,70 @@ fn escape_ascii(bytes: &[u8]) -> String {
         }
     }
     out.extend_from_slice(&bytes[run..]);
-    String::from_utf8(out).expect("escaped bytes are ASCII") // alloc: none: the escaped buffer becomes the `String`
+    std::str::from_utf8(out).expect("escaped bytes are ASCII")
 }
 
-/// The contents of the file an `include_bytes!` or `include_str!` at `call_id` names.
+/// The contents of the file an `include_bytes!` or `include_str!` at `call_id` (its argument
+/// `tt`) names, `path` at `path_span`; when the file can't be read, rustc's error at the call.
 fn included_bytes<'db>(
     db: &'db Db,
     call_id: MacroCallId,
+    tt: &tt::TopSubtree,
     path: &str,
-) -> Option<&'db [u8]> {
+    path_span: Span,
+) -> Result<&'db [u8], ExpandError> {
     let anchor = call_id.loc(db).kind.file_id().original_file_respecting_includes(db).file_id(db);
     let path = AnchoredPath { anchor, path };
     // A file of the VFS that is not UTF-8 is read from disk like one outside it.
     if let Some(file) = db.resolve_path(path)
         && db.has_file_text(file)
     {
-        return Some(db.file_text(file).text(db).as_bytes());
+        return Ok(db.file_text(file).text(db).as_bytes());
     }
-    db.included_file(call_id.loc(db).krate, path)?.bytes(db).as_deref()
+    let unloaded = || {
+        // alloc: an error's message, on the error path
+        ExpandError::other(path_span, format!("failed to load file `{}`", path.path))
+    };
+    let file = db.included_file(call_id.loc(db).krate, path).ok_or_else(unloaded)?;
+    match file.read(db) {
+        Ok(bytes) => Ok(&bytes[..]),
+        Err(error) => {
+            let shown = db.included_path(path).ok_or_else(unloaded)?;
+            let call = call_span(db, call_id, tt.top_subtree().delimiter.open);
+            // alloc: an error's message, on the error path
+            Err(ExpandError::other(call, format!("couldn't read `{shown}`: {error}")))
+        }
+    }
 }
 
-fn include_str_expand(
+fn include_str_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let ExpandResult { value: path, err } = include_path(db, arg_id, tt, "include_str!");
     let Some((path, path_span)) = path else {
-        let empty = tt::TopSubtree::empty(DelimSpan { open: call_site, close: call_site });
+        let empty =
+            tt::TopSubtree::empty_in(DelimSpan { open: call_site, close: call_site }, frame);
         return ExpandResult { value: empty, err };
     };
 
     // A UTF-8 file is escaped where it is read, not copied first.
-    let text = included_bytes(db, arg_id, path.as_str()).map(String::from_utf8_lossy); // alloc: none for a UTF-8 file, a borrowed `Cow`
+    let text = included_bytes(db, arg_id, tt, path.as_str(), path_span).and_then(|bytes| {
+        std::str::from_utf8(bytes).map_err(|_| {
+            let call = call_span(db, arg_id, tt.top_subtree().delimiter.open);
+            // alloc: an error's message, on the error path
+            ExpandError::other(call, format!("`{}` wasn't a utf-8 file", path.as_str()))
+        })
+    });
     match text {
-        Some(text) => {
-            let literal = str_literal(&text, call_site);
-            ExpandResult { value: quote!(call_site =>#literal), err }
+        Ok(text) => {
+            let literal = str_literal(text, call_site);
+            ExpandResult { value: quote_in!(frame, call_site =>#literal), err }
         }
-        None => ExpandResult::new(
-            quote!(call_site =>""),
-            err.unwrap_or_else(|| {
-                // alloc: an error's message, on the error path
-                ExpandError::other(path_span, format!("failed to load file `{path}`"))
-            }),
-        ),
+        Err(error) => ExpandResult::new(quote_in!(frame, call_site =>""), err.unwrap_or(error)),
     }
 }
 
@@ -1263,13 +1311,14 @@ fn get_env_inner(db: &Db, arg_id: MacroCallId, key: &Symbol) -> Option<String> {
     krate.env(db).get(key.as_str()).or_else(|| base_db::process_env_var(db, key.as_str()))
 }
 
-fn env_expand(
+fn env_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    let empty = || tt::TopSubtree::empty(DelimSpan { open: span, close: span });
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let empty = || tt::TopSubtree::empty_in(DelimSpan { open: span, close: span }, frame);
     let call = call_span(db, arg_id, span);
     let exprs = match args::exprs(db, tt) {
         Ok(it) => it,
@@ -1306,7 +1355,7 @@ fn env_expand(
         "UNRESOLVED_ENV_VAR".to_owned() // alloc: an error's message, on the error path
     });
     let span = var.span;
-    let expanded = quote! {span => #s };
+    let expanded = quote_in! {frame, span => #s };
 
     ExpandResult { value: expanded, err }
 }
@@ -1396,38 +1445,41 @@ fn similar_cargo_var(var: &str) -> Option<&'static str> {
     best
 }
 
-fn option_env_expand(
+fn option_env_expand<'f>(
     db: &Db,
+    frame: &'f Frame,
     arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let call = call_span(db, arg_id, call_site);
     let ExpandResult { value, err } = args::single_string(db, tt, "option_env!", call);
     let Some((key, span)) = value else {
-        let empty = tt::TopSubtree::empty(DelimSpan { open: call_site, close: call_site });
+        let empty =
+            tt::TopSubtree::empty_in(DelimSpan { open: call_site, close: call_site }, frame);
         return ExpandResult { value: empty, err };
     };
     let dollar_crate = dollar_crate(call_site);
     let expanded = match get_env_inner(db, arg_id, &key) {
-        None => quote! {call_site => #dollar_crate::option::Option::None::<&str> },
+        None => quote_in! {frame, call_site => #dollar_crate::option::Option::None::<&str> },
         Some(s) => {
             let value = group(span, |b| quote_into!(b, span => #s));
-            quote! {call_site => #dollar_crate::option::Option::Some(#value) }
+            quote_in! {frame, call_site => #dollar_crate::option::Option::Some(#value) }
         }
     };
 
     ExpandResult { value: expanded, err }
 }
 
-fn quote_expand(
+fn quote_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _arg_id: MacroCallId,
     _tt: &tt::TopSubtree,
     span: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     ExpandResult::new(
-        tt::TopSubtree::empty(tt::DelimSpan { open: span, close: span }),
+        tt::TopSubtree::empty_in(tt::DelimSpan { open: span, close: span }, frame),
         ExpandError::other(span, "quote! is not implemented"),
     )
 }
@@ -1456,29 +1508,31 @@ fn unescape_str_into(s: &str, out: &mut String) {
 }
 
 /// `gca!(expr)`, a generic const argument: the expression, which is what rustc evaluates it to.
-fn gca_expand(
+fn gca_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     _call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    let mut tt = tt.clone(); // clone: the expansion is the input, written once
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
+    let mut tt = tt::TopSubtree::from_subtree_in(tt.view(), frame);
     tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
     ExpandResult::ok(tt)
 }
 
-fn pattern_type_expand(
+fn pattern_type_expand<'f>(
     _db: &Db,
+    frame: &'f Frame,
     _arg_id: MacroCallId,
     tt: &tt::TopSubtree,
     call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
+) -> ExpandResult<tt::TopSubtree<&'f Frame>> {
     let ty = WithDelimiter {
         delimiter: tt::Delimiter { kind: tt::DelimiterKind::Invisible, ..tt.top_subtree().delimiter },
         token_trees: tt.token_trees(),
     };
     let pound = mk_pound(call_site);
-    ExpandResult::ok(quote! {call_site => builtin #pound pattern_type ( #ty ) })
+    ExpandResult::ok(quote_in! {frame, call_site => builtin #pound pattern_type ( #ty ) })
 }
 
 #[cfg(test)]
@@ -1533,7 +1587,10 @@ mod tests {
 
     const CALL: u32 = 100;
 
-    fn assert_same(old: &tt::TopSubtree, new: &tt::TopSubtree) {
+    fn assert_same<A: std::alloc::Allocator, B: std::alloc::Allocator>(
+        old: &tt::TopSubtree<A>,
+        new: &tt::TopSubtree<B>,
+    ) {
         assert_eq!(format!("{old:#?}"), format!("{new:#?}"));
         assert_eq!(old.to_string(), new.to_string());
         assert!(old == new);
@@ -1576,7 +1633,7 @@ mod tests {
             let tt = call_args(first);
             let pound = mk_pound(span);
             let old = {
-                let mut tt = tt.clone();
+                let mut tt = tt.copy();
                 tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
                 quote! {span => builtin #pound format_args #tt}
             };
@@ -1592,7 +1649,7 @@ mod tests {
         let span = at(CALL);
         let tt = call_args(None);
         let old = {
-            let mut tt = tt.clone();
+            let mut tt = tt.copy();
             tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
             tt.set_top_subtree_delimiter_span(tt::DelimSpan { open: span, close: span });
             quote! {span => m! #tt}
@@ -1604,7 +1661,7 @@ mod tests {
         assert_same(&old, &quote! {span => m! #new});
 
         let old = {
-            let mut tt = tt.clone();
+            let mut tt = tt.copy();
             tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Invisible);
             quote! {span => pattern_type ( #tt )}
         };
@@ -1625,7 +1682,7 @@ mod tests {
         else {
             return None;
         };
-        let mut tt = tt.clone();
+        let mut tt = tt.copy();
         tt.set_top_subtree_delimiter_kind(tt::DelimiterKind::Parenthesis);
         let newline = if lit.kind == tt::LitKind::Str { "\\n" } else { "\n" };
         let (text, suffix) = lit.text_and_suffix();
@@ -1636,11 +1693,12 @@ mod tests {
 
     #[test]
     fn format_args_nl_of_literal_is_set_token() {
+        let frame = &blaze_mem::Frame::new(blaze_mem::Tag::Expand).expect("a test's frame");
         let span = at(CALL);
         for first in templates() {
             let tt = call_args(first);
             let old = format_args_nl_by_set_token(&tt, span);
-            let new = format_args_nl_of_literal(&tt, span);
+            let new = format_args_nl_of_literal(frame, &tt, span);
             assert_eq!(old.is_some(), new.is_some());
             if let (Some(old), Some(new)) = (old, new) {
                 assert_same(&old, &new);
@@ -1653,16 +1711,17 @@ mod tests {
         );
         assert_same(
             &format_args_nl_by_set_token(&alone, span).unwrap(),
-            &format_args_nl_of_literal(&alone, span).unwrap(),
+            &format_args_nl_of_literal(frame, &alone, span).unwrap(),
         );
         let empty = tt::TopSubtree::empty(tt::DelimSpan::from_single(at(1)));
-        assert!(format_args_nl_of_literal(&empty, span).is_none());
+        assert!(format_args_nl_of_literal(frame, &empty, span).is_none());
     }
 
     #[test]
     fn escape_ascii_is_std() {
         let every: Vec<u8> = (0..=255).collect();
-        assert_eq!(escape_ascii(&every), every.escape_ascii().to_string());
+        let mut out = Vec::new();
+        assert_eq!(escape_ascii(&every, &mut out), every.escape_ascii().to_string());
         // Runs of kept bytes between escaped ones, from a fixed seed.
         let mut rng = blaze_ids::rng::SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         let mut bytes = Vec::with_capacity(4096);
@@ -1673,9 +1732,12 @@ mod tests {
         }
         for len in [0, 1, 2, 7, 64, 4096] {
             let it = &bytes[..len];
-            assert_eq!(escape_ascii(it), it.escape_ascii().to_string(), "{len}");
+            assert_eq!(escape_ascii(it, &mut out), it.escape_ascii().to_string(), "{len}");
         }
-        assert_eq!(escape_ascii(b"\t\r\n\\'\"\x00\x7f\xff ok"), "\\t\\r\\n\\\\\\'\\\"\\x00\\x7f\\xff ok");
+        assert_eq!(
+            escape_ascii(b"\t\r\n\\'\"\x00\x7f\xff ok", &mut out),
+            "\\t\\r\\n\\\\\\'\\\"\\x00\\x7f\\xff ok"
+        );
     }
 }
 

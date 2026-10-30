@@ -5,6 +5,8 @@
 //!
 //! So, this modules should not be used during hir construction, it exists
 //! purely for "IDE needs".
+mod view;
+
 use std::{
     cell::OnceCell,
     iter::{self, once},
@@ -18,7 +20,7 @@ use hir_def::{
     VariantId,
     expr_store::{
         Body, BodySourceMap, ExpressionStore, ExpressionStoreSourceMap, HygieneId,
-        lower::{ExprCollector, lower_generic_params},
+        lower::{ExprCollector, ImplTraitLowering, lower_generic_params},
         path::Path,
         scope::{ExprScopes, ScopeId},
     },
@@ -36,20 +38,19 @@ use hir_expand::{
 };
 use hir_ide::{
     Adjustment, InferBodyId, InferenceResult, LifetimeElisionKind, LifetimeLoweringMode,
-    ParamEnvAndCrate, TyLoweringContext, TyLoweringInferVarsCtx,
+    ParamEnvAndCrate, TyLoweringContext,
     diagnostics::{record_literal_missing_fields, record_pattern_missing_fields},
     lang_items::lang_items_for_bin_op,
     method_resolution::{self, CandidateId},
     next_solver::{
-        AliasTy, DbInterner, DefaultAny, EarlyBinder, ErrorGuaranteed, GenericArgs, ParamEnv,
-        Region, Ty, TyKind, TypingMode, infer::DbInternerInferExt,
+        AliasTy, DbInterner, EarlyBinder, ErrorGuaranteed, GenericArgs, ParamEnv, Ty, TyKind,
+        TypingMode, infer::DbInternerInferExt,
     },
     traits::{WherePredicateEvaluation, structurally_normalize_ty, where_predicate_must_hold},
 };
 use hir_ty_unsafeck::{InsideUnsafeBlock, unsafe_operations};
 use intern::{Symbol, sym};
 use itertools::Itertools;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind,
     inherent::{IntoKind, Ty as _},
@@ -416,9 +417,9 @@ impl<'db> SourceAnalyzer<'db> {
         PredicateEvaluationResult::holds("predicate holds")
     }
 
-    pub(crate) fn expr_id(&self, expr: ast::Expr) -> Option<ExprOrPatId> {
+    pub(crate) fn expr_id(&self, expr: &ast::Expr) -> Option<ExprOrPatId> {
         let src = InFile { file_id: self.file_id, value: expr };
-        self.store_sm()?.node_expr(src.as_ref())
+        self.store_sm()?.node_expr(src)
     }
 
     fn pat_id(&self, pat: &ast::Pat) -> Option<ExprOrPatId> {
@@ -432,6 +433,7 @@ impl<'db> SourceAnalyzer<'db> {
     }
 
     fn binding_id_of_pat(&self, pat: &ast::IdentPat) -> Option<BindingId> {
+        // clone: refcount bump to upcast the node to `ast::Pat`, no allocation
         let pat_id = self.pat_id(&pat.clone().into())?;
         if let Pat::Bind { id, .. } = self.store()?.pat(pat_id.as_pat()?) { Some(id) } else { None }
     }
@@ -439,7 +441,7 @@ impl<'db> SourceAnalyzer<'db> {
     pub(crate) fn expr_adjustments(&self, expr: &ast::Expr) -> Option<&[Adjustment]> {
         // It is safe to omit destructuring assignments here because they have no adjustments (neither
         // expressions nor patterns).
-        let expr_id = self.expr_id(expr.clone())?.as_expr()?;
+        let expr_id = self.expr_id(expr)?.as_expr()?;
         let infer = self.infer()?;
         infer.expr_adjustment(expr_id)
     }
@@ -449,53 +451,30 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         ty: &ast::Type,
     ) -> Option<Type<'db>> {
-        let interner = DbInterner::new_no_crate(db);
-
         let type_ref = self.type_id(ty)?;
 
         let generic_def = self.resolver.generic_def()?;
+        let store = self.store()?;
         let generics = OnceCell::new();
-        let mut vars_cts = VarsCtx { types: interner.default_types(), infer: self.infer() };
-        let ty = TyLoweringContext::new(
-            db,
-            &self.resolver,
-            self.store()?,
-            self.resolver.expression_store_owner().unwrap_or_else(|| generic_def.into()),
-            generic_def,
-            &generics,
-            // FIXME: Is this correct here? Anyway that should impact mostly diagnostics, which we don't emit here
-            // (this can impact the lifetimes generated, e.g. in `const` they won't be `'static`, but this seems like a
-            // small problem).
-            LifetimeElisionKind::Infer,
-            LifetimeLoweringMode::LateParam,
-        )
-        .with_interning_mode(LoweringMode::Ide)
-        .with_infer_vars_behavior(Some(&mut vars_cts))
-        .lower_ty(type_ref);
-
-        struct VarsCtx<'a, 'db> {
-            types: &'a DefaultAny<'db>,
-            infer: Option<&'a InferenceResult<'db>>,
-        }
-
-        impl<'db> TyLoweringInferVarsCtx<'db> for VarsCtx<'_, 'db> {
-            fn next_ty_var(&mut self, span: hir_ide::Span) -> Ty<'db> {
-                if let hir_ide::Span::TypeRefId(type_ref) = span
-                    && let Some(ty) =
-                        self.infer.and_then(|infer| infer.type_of_type_placeholder(type_ref))
-                {
-                    ty
-                } else {
-                    self.types.types.error
-                }
-            }
-            fn next_const_var(&mut self, _span: hir_ide::Span) -> hir_ide::next_solver::Const<'db> {
-                self.types.consts.error
-            }
-            fn next_region_var(&mut self, _span: hir_ide::Span) -> Region<'db> {
-                self.types.regions.error
-            }
-        }
+        let ty = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+            TyLoweringContext::new(
+                db,
+                &self.resolver,
+                store,
+                self.resolver.expression_store_owner().unwrap_or_else(|| generic_def.into()),
+                generic_def,
+                &generics,
+                // FIXME: Is this correct here? Anyway that should impact mostly diagnostics, which we don't emit here
+                // (this can impact the lifetimes generated, e.g. in `const` they won't be `'static`, but this seems like a
+                // small problem).
+                LifetimeElisionKind::Infer,
+                LifetimeLoweringMode::LateParam,
+                frame,
+            )
+            .with_interning_mode(LoweringMode::Ide)
+            .with_answered_infer_vars(self.infer())
+            .lower_ty(type_ref)
+        });
 
         Some(self.ty(db, ty))
     }
@@ -505,7 +484,7 @@ impl<'db> SourceAnalyzer<'db> {
         _db: &'db Db,
         expr: &ast::Expr,
     ) -> Option<bool> {
-        let expr_id = self.expr_id(expr.clone())?;
+        let expr_id = self.expr_id(expr)?;
         let store = self.store()?;
         let infer = self.infer()?;
         Some(self.expr_id_is_diverging(store, infer, expr_id))
@@ -534,7 +513,7 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         expr: &ast::Expr,
     ) -> Option<(Type<'db>, Option<Type<'db>>)> {
-        let expr_id = self.expr_id(expr.clone())?;
+        let expr_id = self.expr_id(expr)?;
         let infer = self.infer()?;
         let coerced = expr_id
             .as_expr()
@@ -598,6 +577,7 @@ impl<'db> SourceAnalyzer<'db> {
         _db: &'db Db,
         pat: &ast::IdentPat,
     ) -> Option<BindingMode> {
+        // clone: refcount bump to upcast the node to `ast::Pat`, no allocation
         let id = self.pat_id(&pat.clone().into())?;
         let infer = self.infer()?;
         Some(match infer.binding_mode(id.as_pat()?)? {
@@ -622,6 +602,7 @@ impl<'db> SourceAnalyzer<'db> {
                 .pat_adjustment(pat_id.as_pat()?)?
                 .iter()
                 .map(|adjust| self.ty(db, adjust.source.as_ref()))
+                // alloc: returned to the IDE caller, inline for the common single adjustment
                 .collect(),
         )
     }
@@ -631,7 +612,8 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         call: &ast::MethodCallExpr,
     ) -> Option<Callable<'db>> {
-        let expr_id = self.expr_id(call.clone().into())?.as_expr()?;
+        // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+        let expr_id = self.expr_id(&call.clone().into())?.as_expr()?;
         let (func, args) = self.infer()?.method_resolution(expr_id)?;
         let interner = DbInterner::new_no_crate(db);
         let ty = db.value_ty(func.into())?.instantiate(interner, args).skip_norm_wip();
@@ -646,7 +628,8 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         call: &ast::MethodCallExpr,
     ) -> Option<Function> {
-        let expr_id = self.expr_id(call.clone().into())?.as_expr()?;
+        // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+        let expr_id = self.expr_id(&call.clone().into())?.as_expr()?;
         let (f_in_trait, substs) = self.infer()?.method_resolution(expr_id)?;
 
         Some(self.resolve_impl_method_or_trait_def(db, f_in_trait, substs))
@@ -657,7 +640,7 @@ impl<'db> SourceAnalyzer<'db> {
         node: Either<ast::Expr, ast::Pat>,
     ) -> Option<&'db [(CandidateId, Symbol)]> {
         let id = match node {
-            Either::Left(expr) => self.expr_id(expr)?,
+            Either::Left(expr) => self.expr_id(&expr)?,
             Either::Right(pat) => self.pat_id(&pat)?,
         };
         Some(self.infer()?.unstable_candidates(id))
@@ -668,7 +651,8 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         call: &ast::MethodCallExpr,
     ) -> Option<(Either<Function, Field>, Option<GenericSubstitution<'db>>)> {
-        let expr_id = self.expr_id(call.clone().into())?.as_expr()?;
+        // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+        let expr_id = self.expr_id(&call.clone().into())?.as_expr()?;
         let inference_result = self.infer()?;
         match inference_result.method_resolution(expr_id) {
             Some((f_in_trait, substs)) => {
@@ -692,7 +676,7 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         call: &ast::Expr,
     ) -> Option<Callable<'db>> {
-        let (orig, adjusted) = self.type_of_expr(db, &call.clone())?;
+        let (orig, adjusted) = self.type_of_expr(db, call)?;
         adjusted.unwrap_or(orig).as_callable(db)
     }
 
@@ -701,7 +685,8 @@ impl<'db> SourceAnalyzer<'db> {
         field: &ast::FieldExpr,
     ) -> Option<Either<Field, TupleField<'db>>> {
         let def = self.infer_body?;
-        let expr_id = self.expr_id(field.clone().into())?.as_expr()?;
+        // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+        let expr_id = self.expr_id(&field.clone().into())?.as_expr()?;
         self.infer()?.field_resolution(expr_id).map(|it| {
             it.map_either(Into::into, |f| TupleField { owner: def, tuple: f.tuple, index: f.index })
         })
@@ -728,7 +713,8 @@ impl<'db> SourceAnalyzer<'db> {
     ) -> Option<(Either<Either<Field, TupleField<'db>>, Function>, Option<GenericSubstitution<'db>>)>
     {
         let def = self.infer_body?;
-        let expr_id = self.expr_id(field.clone().into())?.as_expr()?;
+        // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+        let expr_id = self.expr_id(&field.clone().into())?.as_expr()?;
         let inference_result = self.infer()?;
         match inference_result.field_resolution(expr_id) {
             Some(field) => match field {
@@ -874,7 +860,8 @@ impl<'db> SourceAnalyzer<'db> {
                 let (deref_trait, deref) = (lang_items.Deref?, lang_items.Deref_deref?);
                 self.infer()
                     .and_then(|infer| {
-                        let expr = self.expr_id(prefix_expr.clone().into())?.as_expr()?;
+                        // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+                        let expr = self.expr_id(&prefix_expr.clone().into())?.as_expr()?;
                         let (func, _) = infer.method_resolution(expr)?;
                         let (deref_mut_trait, deref_mut) =
                             (lang_items.DerefMut?, lang_items.DerefMut_deref_mut?);
@@ -908,7 +895,8 @@ impl<'db> SourceAnalyzer<'db> {
         let op_fn = self
             .infer()
             .and_then(|infer| {
-                let expr = self.expr_id(index_expr.clone().into())?.as_expr()?;
+                // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+                let expr = self.expr_id(&index_expr.clone().into())?.as_expr()?;
                 let (func, _) = infer.method_resolution(expr)?;
                 let (_index_mut_trait, index_mut_fn) =
                     (lang_items.IndexMut_index_mut?, lang_items.IndexMut_index_mut?);
@@ -970,7 +958,7 @@ impl<'db> SourceAnalyzer<'db> {
             None
         } else {
             // Shorthand syntax, resolve to the local
-            let mod_path = ModPath::from_segments(PathKind::Plain, once(local_name.clone()));
+            let mod_path = ModPath::from_segments(PathKind::Plain, once(local_name));
             let path = Path::from_known_path_with_no_generic(&mod_path);
             match self.resolver.resolve_path_in_value_ns_fully(
                 db,
@@ -1031,6 +1019,7 @@ impl<'db> SourceAnalyzer<'db> {
         tuple_struct_pat: &ast::TupleStructPat,
     ) -> Option<Vec<(Field, Type<'db>)>> {
         let interner = DbInterner::new_no_crate(db);
+        // clone: refcount bump to upcast the node to `ast::Pat`, no allocation
         let pat_id = self.pat_id(&tuple_struct_pat.clone().into())?;
         let variant_id = self.infer()?.variant_resolution_for_pat(pat_id.as_pat()?)?;
         let (_adt, substs) = self.infer()?.pat_ty(pat_id.as_pat()?).as_adt()?;
@@ -1043,6 +1032,7 @@ impl<'db> SourceAnalyzer<'db> {
                     let ty = field.ty().instantiate(interner, substs).skip_norm_wip();
                     (def, self.ty(db, ty))
                 })
+                // alloc: returned to the IDE caller, exact size
                 .collect(),
         )
     }
@@ -1052,6 +1042,7 @@ impl<'db> SourceAnalyzer<'db> {
         db: &'db Db,
         pat: &ast::IdentPat,
     ) -> Option<ModuleDef> {
+        // clone: refcount bump to upcast the node to `ast::Pat`, no allocation
         let expr_or_pat_id = self.pat_id(&pat.clone().into())?;
         let store = self.store()?;
 
@@ -1169,13 +1160,14 @@ impl<'db> SourceAnalyzer<'db> {
         path: &ast::Path,
     ) -> Option<(PathResolution<'db>, Option<GenericSubstitution<'db>>)> {
         let parent = path.syntax().parent();
+        // clone: refcount bump per cast attempt of the parent node, no allocation
         let parent = || parent.clone();
 
         let mut prefer_value_ns = parent().and_then(ast::PathExpr::cast).is_some();
         let resolved = (|| {
             let infer = self.infer()?;
             if let Some(path_expr) = parent().and_then(ast::PathExpr::cast) {
-                let expr_id = self.expr_id(path_expr.into())?;
+                let expr_id = self.expr_id(&path_expr.into())?;
                 if let Some((assoc, subs)) = infer.assoc_resolutions_for_expr_or_pat(expr_id) {
                     let (assoc, subst) = match assoc {
                         CandidateId::FunctionId(f_in_trait) => {
@@ -1261,7 +1253,7 @@ impl<'db> SourceAnalyzer<'db> {
                     ));
                 }
             } else if let Some(rec_lit) = parent().and_then(ast::RecordExpr::cast) {
-                let expr_id = self.expr_id(rec_lit.into())?;
+                let expr_id = self.expr_id(&rec_lit.into())?;
                 if let Some(VariantId::EnumVariantId(variant)) =
                     infer.variant_resolution_for_expr_or_pat(expr_id)
                 {
@@ -1294,11 +1286,11 @@ impl<'db> SourceAnalyzer<'db> {
         // FIXME: collectiong here shouldnt be necessary?
         let mut collector =
             ExprCollector::new(db, self.resolver.module(), self.file_id, LoweringMode::Ide);
-        let hir_path =
-            collector.lower_path(path.clone(), &mut ExprCollector::impl_trait_error_allocator)?;
+        // clone: refcount bump, `ExprCollector::lower_path` takes the handle by value
+        let hir_path = collector.lower_path(path.clone(), &mut ImplTraitLowering::Error)?;
         let parent_hir_path = path
             .parent_path()
-            .and_then(|p| collector.lower_path(p, &mut ExprCollector::impl_trait_error_allocator));
+            .and_then(|p| collector.lower_path(p, &mut ImplTraitLowering::Error));
         let (store, _) = collector.store.finish();
         let hir_path = store.path_at(hir_path);
         let parent_hir_path = parent_hir_path.map(|it| store.path_at(it));
@@ -1391,7 +1383,7 @@ impl<'db> SourceAnalyzer<'db> {
                         if let Some(helpers) = self
                             .resolver
                             .def_map()
-                            .derive_helpers_in_scope(InFile::new(self.file_id, ast_id))
+                            .derive_helpers_in_scope(db, InFile::new(self.file_id, ast_id))
                         {
                             // FIXME: Multiple derives can have the same helper
                             let name_ref = name_ref.as_name();
@@ -1445,8 +1437,9 @@ impl<'db> SourceAnalyzer<'db> {
             .any()?;
             let subst = (|| {
                 let parent = parent()?;
-                let ty = if let Some(expr) = ast::Expr::cast(parent.clone()) {
-                    let expr_id = self.expr_id(expr)?;
+                let ty = if ast::Expr::can_cast(parent.kind()) {
+                    let expr = ast::Expr::cast(parent)?;
+                    let expr_id = self.expr_id(&expr)?;
                     self.infer()?.type_of_expr_or_pat(expr_id)?
                 } else {
                     let pat = ast::Pat::cast(parent)?;
@@ -1502,8 +1495,8 @@ impl<'db> SourceAnalyzer<'db> {
     ) -> Option<PathResolutionPerNs<'db>> {
         let mut collector =
             ExprCollector::new(db, self.resolver.module(), self.file_id, LoweringMode::Ide);
-        let hir_path =
-            collector.lower_path(path.clone(), &mut ExprCollector::impl_trait_error_allocator)?;
+        // clone: refcount bump, `ExprCollector::lower_path` takes the handle by value
+        let hir_path = collector.lower_path(path.clone(), &mut ImplTraitLowering::Error)?;
         let (store, _) = collector.store.finish();
         let hir_path = store.path_at(hir_path);
         Some(resolve_hir_path_(
@@ -1526,7 +1519,8 @@ impl<'db> SourceAnalyzer<'db> {
         let body = self.store()?;
         let infer = self.infer()?;
 
-        let expr_id = self.expr_id(literal.clone().into())?.as_expr()?;
+        // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+        let expr_id = self.expr_id(&literal.clone().into())?.as_expr()?;
         let substs = infer.expr_ty(expr_id).as_adt()?.1;
         let (variant, missing_fields) =
             record_literal_missing_fields(db, infer, expr_id, body.expr(expr_id))?;
@@ -1542,7 +1536,8 @@ impl<'db> SourceAnalyzer<'db> {
         let body = self.store()?;
         let infer = self.infer()?;
 
-        let expr_id = self.expr_id(literal.clone().into())?.as_expr()?;
+        // clone: refcount bump to upcast the node to `ast::Expr`, no allocation
+        let expr_id = self.expr_id(&literal.clone().into())?.as_expr()?;
         let substs = infer.expr_ty(expr_id).as_adt()?.1;
         let (variant, matched_fields) =
             record_literal_matched_fields(db, infer, expr_id, body.expr(expr_id))?;
@@ -1559,6 +1554,7 @@ impl<'db> SourceAnalyzer<'db> {
         let body = self.store()?;
         let infer = self.infer()?;
 
+        // clone: refcount bump to upcast the node to `ast::Pat`, no allocation
         let pat_id = self.pat_id(&pattern.clone().into())?.as_pat()?;
         let substs = infer.pat_ty(pat_id).as_adt()?.1;
 
@@ -1576,6 +1572,7 @@ impl<'db> SourceAnalyzer<'db> {
         let body = self.store()?;
         let infer = self.infer()?;
 
+        // clone: refcount bump to upcast the node to `ast::Pat`, no allocation
         let pat_id = self.pat_id(&pattern.clone().into())?.as_pat()?;
         let substs = infer.pat_ty(pat_id).as_adt()?.1;
 
@@ -1602,12 +1599,13 @@ impl<'db> SourceAnalyzer<'db> {
                 let ty = field_types[local_id].ty().instantiate(interner, substs).skip_norm_wip();
                 (field.into(), self.ty(db, ty))
             })
+            // alloc: returned to the IDE caller, exact size
             .collect()
     }
 
     pub(crate) fn resolve_variant(&self, record_lit: ast::RecordExpr) -> Option<VariantId> {
         let infer = self.infer()?;
-        let expr_id = self.expr_id(record_lit.into())?;
+        let expr_id = self.expr_id(&record_lit.into())?;
         infer.variant_resolution_for_expr_or_pat(expr_id)
     }
 
@@ -1652,7 +1650,7 @@ impl<'db> SourceAnalyzer<'db> {
                     self.infer_body,
                     Path::from_known_path_with_no_generic(&ModPath::from_segments(
                         PathKind::Plain,
-                        Some(name.clone()),
+                        Some(*name),
                     )),
                     hygiene,
                 )
@@ -1693,7 +1691,7 @@ impl<'db> SourceAnalyzer<'db> {
                     self.infer_body,
                     Path::from_known_path_with_no_generic(&ModPath::from_segments(
                         PathKind::Plain,
-                        Some(name.clone()),
+                        Some(*name),
                     )),
                     hygiene,
                 )
@@ -1760,7 +1758,7 @@ impl<'db> SourceAnalyzer<'db> {
     }
 
     fn ty_of_expr(&self, expr: ast::Expr) -> Option<Ty<'db>> {
-        self.infer()?.type_of_expr_or_pat(self.expr_id(expr)?)
+        self.infer()?.type_of_expr_or_pat(self.expr_id(&expr)?)
     }
 }
 
@@ -1896,19 +1894,23 @@ fn resolve_hir_path_<'db>(
     let types = || {
         let (ty, unresolved, ty_is_visible) = match path.type_anchor() {
             Some(type_ref) => resolver.generic_def().and_then(|def| {
+                let store = store?;
                 let generics = OnceCell::new();
-                let (_, res) = TyLoweringContext::new(
-                    db,
-                    resolver,
-                    store?,
-                    resolver.expression_store_owner().unwrap_or_else(|| def.into()),
-                    def,
-                    &generics,
-                    LifetimeElisionKind::Infer,
-                    LifetimeLoweringMode::LateParam,
-                )
-                .with_interning_mode(LoweringMode::Ide)
-                .lower_ty_ext(type_ref);
+                let (_, res) = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+                    TyLoweringContext::new(
+                        db,
+                        resolver,
+                        store,
+                        resolver.expression_store_owner().unwrap_or_else(|| def.into()),
+                        def,
+                        &generics,
+                        LifetimeElisionKind::Infer,
+                        LifetimeLoweringMode::LateParam,
+                        frame,
+                    )
+                    .with_interning_mode(LoweringMode::Ide)
+                    .lower_ty_ext(type_ref)
+                });
                 res.map(|ty_ns| (ty_ns, path.segments().first(), Visibility::Public))
             }),
             None => {
@@ -2102,18 +2104,21 @@ fn resolve_hir_path_qualifier<'db>(
         let (ty, unresolved) = match path.type_anchor() {
             Some(type_ref) => resolver.generic_def().and_then(|def| {
                 let generics = OnceCell::new();
-                let (_, res) = TyLoweringContext::new(
-                    db,
-                    resolver,
-                    store,
-                    resolver.expression_store_owner().unwrap_or_else(|| def.into()),
-                    def,
-                    &generics,
-                    LifetimeElisionKind::Infer,
-                    LifetimeLoweringMode::LateParam,
-                )
-                .with_interning_mode(LoweringMode::Ide)
-                .lower_ty_ext(type_ref);
+                let (_, res) = blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+                    TyLoweringContext::new(
+                        db,
+                        resolver,
+                        store,
+                        resolver.expression_store_owner().unwrap_or_else(|| def.into()),
+                        def,
+                        &generics,
+                        LifetimeElisionKind::Infer,
+                        LifetimeLoweringMode::LateParam,
+                        frame,
+                    )
+                    .with_interning_mode(LoweringMode::Ide)
+                    .lower_ty_ext(type_ref)
+                });
                 res.map(|ty_ns| (ty_ns, path.segments().first()))
             }),
             None => {
@@ -2204,13 +2209,13 @@ fn record_literal_matched_fields(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
     // suggest fields if:
     // - not in code
     let matched_fields: Vec<LocalFieldId> = variant_data
         .fields()
         .iter()
-        .filter_map(|(f, d)| (!specified_fields.contains(&d.name)).then_some(f))
+        .filter_map(|(f, d)| (!fields.iter().any(|it| it.name == d.name)).then_some(f))
+        // alloc: returned to the IDE caller, exact size
         .collect();
     if matched_fields.is_empty() {
         return None;
@@ -2236,13 +2241,13 @@ fn record_pattern_matched_fields(
 
     let variant_data = variant_def.fields(db);
 
-    let specified_fields: FxHashSet<_> = fields.iter().map(|f| &f.name).collect();
     // suggest fields if:
     // - not in code
     let matched_fields: Vec<LocalFieldId> = variant_data
         .fields()
         .iter()
-        .filter_map(|(f, d)| if !specified_fields.contains(&d.name) { Some(f) } else { None })
+        .filter_map(|(f, d)| (!fields.iter().any(|it| it.name == d.name)).then_some(f))
+        // alloc: returned to the IDE caller, exact size
         .collect();
     if matched_fields.is_empty() {
         return None;

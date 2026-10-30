@@ -5,7 +5,11 @@
 //! candidate costs one 16-byte segment per name pushed and no allocation once the scratch has
 //! grown.
 
-use std::{cell::Cell, cmp::Ordering, iter};
+use std::{
+    cell::{Cell, RefCell},
+    cmp::Ordering,
+    iter,
+};
 
 use base_db::{Db, Crate, CrateOrigin, LangCrateOrigin};
 use hir_expand::{
@@ -14,7 +18,8 @@ use hir_expand::{
     name::{AsName, Name},
 };
 use intern::sym;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxBuildHasher, FxHashSet};
+use salsa::plumbing::{AsId, FromId};
 use smallvec::SmallVec;
 
 use crate::{
@@ -50,21 +55,19 @@ pub fn find_path(
     ignore_local_imports: bool,
     cfg: FindPathConfig,
 ) -> Option<ModPath> {
-    find_path_with(
-        &mut FindPathScratch::default(),
-        db,
-        item,
-        from,
-        prefix_kind,
-        ignore_local_imports,
-        cfg,
-    )
+    // Taken rather than borrowed: a query `find_path` reads may print a path itself, and gets
+    // an empty scratch instead of a borrow error.
+    let mut scratch = SCRATCH.take();
+    let found =
+        find_path_with(&mut scratch, db, item, from, prefix_kind, ignore_local_imports, cfg);
+    SCRATCH.set(scratch);
+    found
 }
 
 /// [`find_path`] with the caller's scratch, so that a run of calls (a diagnostic pass printing
 /// many paths) allocates only while the scratch grows.
 pub fn find_path_with<'db>(
-    scratch: &mut FindPathScratch<'db>,
+    scratch: &mut FindPathScratch,
     db: &'db Db,
     item: ItemInNs,
     from: ModuleIdLt<'db>,
@@ -109,21 +112,42 @@ pub fn find_path_with<'db>(
     Some(choice.into_path(scratch))
 }
 
-/// What one [`find_path`] call works in, kept by a caller that makes many: the visited set, the
-/// segment arena every candidate points into, and a worklist per depth of the local search.
-#[derive(Default)]
-pub struct FindPathScratch<'db> {
-    /// `(item, module)` pairs the local searches on the current stack have looked at. Empty
-    /// between top-level searches: each local search removes what it added.
-    visited: FxHashSet<(ItemInNs, ModuleIdLt<'db>)>,
+/// What one [`find_path`] call works in: the visited set, the segment arena every candidate
+/// points into, and a worklist per depth of the local search. Each thread keeps one, so a call
+/// allocates only while it grows.
+pub struct FindPathScratch {
+    /// `(item, module)` pairs the local searches on the current stack have looked at, the module
+    /// as its `salsa::Id`. Empty between top-level searches: each local search removes what it
+    /// added.
+    visited: FxHashSet<(ItemInNs, salsa::Id)>,
     /// The segments of every candidate of the call, each linked to the one before it, so a
     /// candidate extended by a name shares its prefix instead of copying it.
     segments: Vec<Segment>,
     /// Worklists of [`find_local_import_locations`], one per depth of its recursion.
-    worklists: Vec<Vec<(ModuleIdLt<'db>, bool)>>,
+    worklists: Vec<Vec<(salsa::Id, bool)>>,
 }
 
-impl<'db> FindPathScratch<'db> {
+impl Default for FindPathScratch {
+    fn default() -> Self {
+        FindPathScratch::new()
+    }
+}
+
+thread_local! {
+    static SCRATCH: RefCell<FindPathScratch> = const { RefCell::new(FindPathScratch::new()) };
+}
+
+impl FindPathScratch {
+    pub const fn new() -> FindPathScratch {
+        FindPathScratch {
+            visited: FxHashSet::with_hasher(FxBuildHasher),
+            // alloc: none until the thread's first call grows it, then kept
+            segments: Vec::new(),
+            // alloc: none until the thread's first call grows it, then kept
+            worklists: Vec::new(),
+        }
+    }
+
     fn reset(&mut self) {
         self.segments.clear();
         self.clear_visited();
@@ -204,7 +228,7 @@ struct FindPathCtx<'db> {
 /// Attempts to find a path to refer to the given `item` visible from the `from` ModuleIdLt<'_>
 fn find_path_inner<'db>(
     ctx: &FindPathCtx<'db>,
-    st: &mut FindPathScratch<'db>,
+    st: &mut FindPathScratch,
     item: ItemInNs,
     max_len: usize,
 ) -> Option<Choice> {
@@ -254,7 +278,7 @@ fn find_path_inner<'db>(
 
 fn find_path_for_module<'db>(
     ctx: &FindPathCtx<'db>,
-    st: &mut FindPathScratch<'db>,
+    st: &mut FindPathScratch,
     module_id: ModuleIdLt<'db>,
     maybe_extern: bool,
     max_len: usize,
@@ -295,7 +319,7 @@ fn find_path_for_module<'db>(
             } else {
                 PathKind::Plain
             };
-            return Some(Choice::new(st, kind, name.clone(), Stable));
+            return Some(Choice::new(st, kind, *name, Stable));
         }
     }
 
@@ -356,7 +380,7 @@ fn find_in_scope<'db>(
     // FIXME: We could have multiple applicable names here, but we currently only return the first
     def_map.with_ancestor_maps(db, from, &mut |def_map, local_id| {
         def_map.module(db, local_id).scope(db).names_of(item, |name, _, declared| {
-            (declared || !ignore_local_imports).then(|| name.clone())
+            (declared || !ignore_local_imports).then(|| *name)
         })
     })
 }
@@ -365,7 +389,7 @@ fn find_in_scope<'db>(
 /// name doesn't clash in current scope.
 fn find_in_prelude(
     db: &Db,
-    st: &mut FindPathScratch<'_>,
+    st: &mut FindPathScratch,
     local_def_map: &DefMap,
     item: ItemInNs,
     from: ModuleIdLt<'_>,
@@ -391,7 +415,7 @@ fn find_in_prelude(
         });
 
     if found_and_same_def.unwrap_or(true) {
-        Some(Choice::new(st, PathKind::Plain, name.clone(), Stable))
+        Some(Choice::new(st, PathKind::Plain, *name, Stable))
     } else {
         None
     }
@@ -423,7 +447,7 @@ fn is_kw_kind_relative_to_from(
 
 fn calculate_best_path<'db>(
     ctx: &FindPathCtx<'db>,
-    st: &mut FindPathScratch<'db>,
+    st: &mut FindPathScratch,
     item: ItemInNs,
     max_len: usize,
     best_choice: &mut Option<Choice>,
@@ -463,7 +487,7 @@ fn calculate_best_path<'db>(
 
 fn find_in_sysroot<'db>(
     ctx: &FindPathCtx<'db>,
-    st: &mut FindPathScratch<'db>,
+    st: &mut FindPathScratch,
     item: ItemInNs,
     max_len: usize,
     best_choice: &mut Option<Choice>,
@@ -517,7 +541,7 @@ fn find_in_sysroot<'db>(
 
 fn find_in_dep<'db>(
     ctx: &FindPathCtx<'db>,
-    st: &mut FindPathScratch<'db>,
+    st: &mut FindPathScratch,
     item: ItemInNs,
     max_len: usize,
     best_choice: &mut Option<Choice>,
@@ -554,7 +578,7 @@ fn find_in_dep<'db>(
 
 fn calculate_best_path_local<'db>(
     ctx: &FindPathCtx<'db>,
-    st: &mut FindPathScratch<'db>,
+    st: &mut FindPathScratch,
     item: ItemInNs,
     max_len: usize,
     best_choice: &mut Option<Choice>,
@@ -602,7 +626,7 @@ impl Choice {
         }
     }
 
-    fn new(st: &mut FindPathScratch<'_>, kind: PathKind, name: Name, stability: Stability) -> Self {
+    fn new(st: &mut FindPathScratch, kind: PathKind, name: Name, stability: Stability) -> Self {
         Self {
             kind,
             last: st.push_segment(NO_SEGMENT, name),
@@ -625,12 +649,12 @@ impl Choice {
             }
     }
 
-    fn push_segment(&mut self, st: &mut FindPathScratch<'_>, name: Name) {
+    fn push_segment(&mut self, st: &mut FindPathScratch, name: Name) {
         self.last = st.push_segment(self.last, name);
         self.segments += 1;
     }
 
-    fn push(mut self, st: &mut FindPathScratch<'_>, name: Name) -> Self {
+    fn push(mut self, st: &mut FindPathScratch, name: Name) -> Self {
         self.path_text_len += name_len(name);
         self.has_prelude_segment |= name == sym::prelude;
         self.push_segment(st, name);
@@ -638,7 +662,7 @@ impl Choice {
     }
 
     fn try_select(
-        st: &mut FindPathScratch<'_>,
+        st: &mut FindPathScratch,
         current: &mut Option<Choice>,
         mut other: Choice,
         prefer_prelude: bool,
@@ -680,7 +704,7 @@ impl Choice {
     }
 
     /// The one `ModPath` of the call: the segments read back from the arena and interned.
-    fn into_path(self, st: &FindPathScratch<'_>) -> ModPath {
+    fn into_path(self, st: &FindPathScratch) -> ModPath {
         let mut names = SmallVec::<[Name; 8]>::with_capacity(self.segments as usize);
         let mut at = self.last;
         while at != NO_SEGMENT {
@@ -712,9 +736,9 @@ fn path_kind_len(kind: PathKind) -> u32 {
 /// Finds locations in `from.krate` from which `item` can be imported by `from`.
 fn find_local_import_locations<'db>(
     ctx: &FindPathCtx<'db>,
-    st: &mut FindPathScratch<'db>,
+    st: &mut FindPathScratch,
     item: ItemInNs,
-    mut cb: impl FnMut(&mut FindPathScratch<'db>, Name, ModuleIdLt<'db>),
+    mut cb: impl FnMut(&mut FindPathScratch, Name, ModuleIdLt<'db>),
 ) {
     let db = ctx.db;
 
@@ -732,7 +756,7 @@ fn find_local_import_locations<'db>(
             .values()
             .copied()
             .chain(iter::successors(ctx.from.containing_module(db), |m| m.containing_module(db)))
-            .zip(iter::repeat(false)),
+            .map(|it| (it.as_id(), false)),
     );
 
     let def_map =
@@ -740,13 +764,16 @@ fn find_local_import_locations<'db>(
     let mut block_def_map;
     let mut cursor = 0;
 
-    while let Some(&mut (module, ref mut processed)) = worklist.get_mut(cursor) {
+    while let Some(&mut (id, ref mut processed)) = worklist.get_mut(cursor) {
         cursor += 1;
-        if !st.visited.insert((item, module)) {
+        if !st.visited.insert((item, id)) {
             // already processed this module
             continue;
         }
         *processed = true;
+        // Every id in the scratch was made from `db` during this call: the scratch is empty
+        // between calls (`reset`, and each local search removes what it added).
+        let module = ModuleIdLt::<'db>::from_id(id);
         let data = if module.block(db).is_some() {
             // Re-query the block's DefMap
             block_def_map = module.def_map(db);
@@ -789,18 +816,18 @@ fn find_local_import_locations<'db>(
                 // current crate
                 continue;
             }
-            if st.visited.contains(&(item, module)) {
+            if st.visited.contains(&(item, module.as_id())) {
                 continue;
             }
 
             if vis.is_visible_from(db, ctx.from) {
-                worklist.push((module, false));
+                worklist.push((module.as_id(), false));
             }
         }
     }
-    for &(module, processed) in &worklist {
+    for &(id, processed) in &worklist {
         if processed {
-            st.visited.remove(&(item, module));
+            st.visited.remove(&(item, id));
         }
     }
     worklist.clear();
@@ -811,6 +838,7 @@ fn find_local_import_locations<'db>(
 pub(crate) mod tests {
     use std::cell::LazyCell;
 
+    use blaze_alloc_count::assert_at_most;
     use blaze_ids::rng::SplitMix64;
     use expect_test::{Expect, expect};
     use itertools::Itertools;
@@ -3440,5 +3468,64 @@ pub mod future {
     fn choice_layout() {
         assert_eq!(size_of::<Segment>(), 16);
         assert!(size_of::<Choice>() <= 28);
+    }
+
+    /// Budget: `find_path` for an item reached through the local import search (a re-export two
+    /// modules away) and for one in another crate, each a second time on the same thread once the
+    /// thread's scratch has grown and the path is interned: 0 allocations.
+    #[test]
+    fn a_warm_find_path_allocates_nothing() {
+        let (db, pos) = TestDB::with_position(
+            r#"
+//- /main.rs crate:main deps:dep
+mod a {
+    pub mod b {
+        pub struct S;
+    }
+}
+mod c {
+    pub use crate::a::b::S as Again;
+}
+mod d {
+    $0
+}
+//- /dep.rs crate:dep
+pub mod x {
+    pub struct Y;
+}
+"#,
+        );
+        let module = db.module_at_position(pos);
+        let (def_map, local_def_map) = module.local_def_map(&db);
+        let item = |kind: PathKind, segments: &[&str]| {
+            let path = ModPath::from_segments(
+                kind,
+                segments.iter().map(|it| Name::new_symbol_root(intern::Symbol::intern(it))),
+            );
+            let res = def_map
+                .resolve_path(
+                    local_def_map,
+                    &db,
+                    module,
+                    &path,
+                    crate::item_scope::BuiltinShadowMode::Module,
+                    None,
+                )
+                .0;
+            ItemInNs::Types(res.take_types().expect("the fixture's item resolves"))
+        };
+        let items =
+            [item(PathKind::Crate, &["c", "Again"]), item(PathKind::Plain, &["dep", "x", "Y"])];
+        let cfg = FindPathConfig {
+            prefer_no_std: false,
+            prefer_prelude: false,
+            prefer_absolute: false,
+            allow_unstable: false,
+        };
+        let find = || items.map(|it| find_path(&db, it, module, PrefixKind::Plain, false, cfg));
+        let warm = find();
+        assert!(warm.iter().all(Option::is_some), "a fixture item has no path: {warm:?}");
+        let found = assert_at_most(0, "a warm `find_path`", find);
+        assert_eq!(found, warm);
     }
 }

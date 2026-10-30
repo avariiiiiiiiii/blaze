@@ -121,6 +121,26 @@ fn lint_non_uppercase_statics() {
     );
 }
 
+/// `variant_size_differences` at the variant more than three times the next largest, the tag
+/// subtracted; not of an enum with generic parameters, nor under `#[allow]`.
+#[test]
+fn enum_size_variance() {
+    ui_test(
+        "enum-size-variance.rs",
+        include_str!("items/enum-size-variance.rs"),
+        include_str!("items/enum-size-variance.stderr"),
+    );
+}
+
+#[test]
+fn variant_size_differences() {
+    ui_test(
+        "variant-size-differences.rs",
+        include_str!("items/variant-size-differences.rs"),
+        include_str!("items/variant-size-differences.stderr"),
+    );
+}
+
 #[test]
 fn zero_uses_in_fn() {
     ui_test(

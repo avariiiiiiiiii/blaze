@@ -54,7 +54,7 @@ use std::{collections::VecDeque, fmt, sync::Arc};
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::{SchemaHash, tiers::BufferColumns};
-use blaze_ids::{ContentId, Hasher, radix};
+use blaze_ids::{ContentId, Hasher, prehashed::ByHash, radix};
 use blaze_reclaim::{Grace, Limbo};
 pub use blaze_reclaim::{Guard, enter};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -120,8 +120,6 @@ const OWNED_MOST: u64 = 1 << 20;
 
 /// IO that fails this many times in a row breaks the store.
 const FAILURES_MOST: u32 = 8;
-
-const TAGS: u64 = 1 << 32;
 
 /// The packs of one store; a record's place in memory is its tier, pack and offset in 64 bits.
 const PACKS_MOST: usize = 1 << 16;
@@ -548,16 +546,13 @@ pub(crate) enum Use {
 
 /// The tags a store asks with, and what each asked for.
 struct Tags {
-    base: u64,
-    next: u64,
+    range: blaze_core::Tags,
     ops: FxHashMap<Tag, Op>,
 }
 
 impl Tags {
     fn fresh(&mut self) -> Tag {
-        let tag = Tag(self.base.wrapping_add(self.next));
-        self.next = (self.next + 1) % TAGS;
-        tag
+        self.range.next()
     }
 
     fn ask(&mut self, op: Op) -> Tag {
@@ -801,29 +796,6 @@ fn colder_columns(columns: &Columns, loc: Loc, hot: &[u8]) -> Result<Option<(For
     Ok(saves(&payload).then_some((Form::ColdColumns, payload)))
 }
 
-/// Keys and content IDs are BLAKE3 hashes already: their first eight bytes spread over a table
-/// as well as any hash of them would, so a lookup hashes nothing.
-#[derive(Default, Clone, Copy)]
-struct Prehashed(u64);
-
-impl std::hash::Hasher for Prehashed {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        if let Some(word) = bytes.first_chunk::<8>() {
-            self.0 ^= u64::from_le_bytes(*word);
-        }
-    }
-
-    fn write_usize(&mut self, _: usize) {}
-}
-
-/// A map on BLAKE3 hashes ([`Key`], [`ContentId`]), indexed by the hash itself.
-#[expect(clippy::disallowed_types, reason = "Uses a custom hasher")]
-type ByHash<K, V> = std::collections::HashMap<K, V, std::hash::BuildHasherDefault<Prehashed>>;
-
 /// A record's place in the store, as one number.
 fn location(tier: usize, pack: u32, offset: u64) -> u64 {
     ((tier as u64) << 56) | (u64::from(pack) << 40) | offset
@@ -850,7 +822,7 @@ impl Store {
         shared.add_segment(own.segment().clone());
         let drains = vec![Drain::new(own.segment().clone())];
         let mut store = Store {
-            tags: Tags { base: config.tags, next: 0, ops: FxHashMap::default() },
+            tags: Tags { range: blaze_core::Tags::new(config.tags), ops: FxHashMap::default() },
             config,
             tiers,
             broken: None,
@@ -1500,7 +1472,7 @@ impl Store {
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
-        tag.0.wrapping_sub(self.config.tags) < TAGS
+        self.tags.range.owns(tag)
     }
 
     /// Takes a completion of its own: a mapping, an append, a sync. Says which puts are now

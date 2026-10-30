@@ -4,23 +4,11 @@
 //! various caches, it's not really advanced at the moment.
 use std::panic::AssertUnwindSafe;
 
-use hir::{Symbol, import_map::ImportMap, sym};
+use hir::import_map::ImportMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use salsa::{Cancelled, Database};
 
-use crate::{FxIndexMap, RootDatabase, base_db::Crate, symbol_index::SymbolIndex};
-
-/// We're indexing many crates.
-#[derive(Debug)]
-pub struct ParallelPrimeCachesProgress {
-    /// the crates that we are currently priming.
-    pub crates_currently_indexing: Vec<Symbol>,
-    /// the total number of crates we want to prime.
-    pub crates_total: usize,
-    /// the total number of crates that have finished priming
-    pub crates_done: usize,
-    pub work_type: &'static str,
-}
+use crate::{RootDatabase, base_db::Crate, symbol_index::SymbolIndex};
 
 /// Warm caches for `scope`.
 ///
@@ -32,7 +20,6 @@ pub fn parallel_prime_caches(
     db: &RootDatabase,
     scope: &[Crate],
     num_worker_threads: usize,
-    cb: &(dyn Fn(ParallelPrimeCachesProgress) + Sync),
 ) {
     if scope.is_empty() {
         return;
@@ -40,7 +27,6 @@ pub fn parallel_prime_caches(
     let _p = tracing::info_span!("parallel_prime_caches", scope_size = scope.len()).entered();
 
     enum ParallelPrimeCacheWorkerProgress {
-        BeginCrateDefMap { crate_id: Crate, crate_name: Symbol },
         EndCrateDefMap { crate_id: Crate },
         EndCrateImportMap,
         EndSema,
@@ -106,12 +92,7 @@ pub fn parallel_prime_caches(
             let (sema_work_sender, sema_work_receiver) = crossbeam_channel::unbounded();
             let (symbols_work_sender, symbols_work_receiver) = crossbeam_channel::unbounded();
             let prime_caches_worker = move |db: &RootDatabase| {
-                let handle_def_map = |crate_id, crate_name| {
-                    progress_sender.send(ParallelPrimeCacheWorkerProgress::BeginCrateDefMap {
-                        crate_id,
-                        crate_name,
-                    })?;
-
+                let handle_def_map = |crate_id| {
                     let cancelled = Cancelled::catch(|| {
                         _ = hir::crate_def_map(db, crate_id);
                     });
@@ -177,8 +158,8 @@ pub fn parallel_prime_caches(
                     // Biased because we want to prefer def maps.
                     crossbeam_channel::select_biased! {
                         recv(def_map_work_receiver) -> work => {
-                            let Ok((crate_id, crate_name)) = work else { break };
-                            handle_def_map(crate_id, crate_name)?;
+                            let Ok(crate_id) = work else { break };
+                            handle_def_map(crate_id)?;
                         }
                         recv(sema_work_receiver) -> work => {
                             let Ok(crate_id) = work else { break };
@@ -221,18 +202,12 @@ pub fn parallel_prime_caches(
         let (mut module_symbols_total, mut module_symbols_done) = (0usize, 0usize);
         let (mut sema_total, mut sema_done) = (0usize, 0usize);
 
-        // an index map is used to preserve ordering so we can sort the progress report in order of
-        // "longest crate to index" first
-        let mut crates_currently_indexing =
-            FxIndexMap::with_capacity_and_hasher(num_worker_threads, Default::default());
-
         for (&krate, &to_be_done_deps) in &to_be_done_deps {
             if to_be_done_deps != 0 {
                 continue;
             }
 
-            let name = crate_name(db, krate);
-            def_map_work_sender.send((krate, name)).ok();
+            def_map_work_sender.send(krate).ok();
         }
 
         while crate_def_maps_done < crate_def_maps_total
@@ -242,36 +217,11 @@ pub fn parallel_prime_caches(
         {
             db.unwind_if_revision_cancelled();
 
-            let progress = ParallelPrimeCachesProgress {
-                crates_currently_indexing: crates_currently_indexing.values().cloned().collect(),
-                crates_done: crate_def_maps_done,
-                crates_total: crate_def_maps_total,
-                work_type: "Indexing",
-            };
-
-            cb(progress);
-
-            // Biased to prefer progress updates (and because it's faster).
-            let progress = match progress_receiver.recv() {
-                Ok(p) => p,
-                Err(crossbeam_channel::RecvError) => {
-                    // all our workers have exited, mark us as finished and exit
-                    cb(ParallelPrimeCachesProgress {
-                        crates_currently_indexing: vec![],
-                        crates_done: crate_def_maps_done,
-                        crates_total: crate_def_maps_done,
-                        work_type: "Done",
-                    });
-                    return;
-                }
-            };
+            // Every worker has exited.
+            let Ok(progress) = progress_receiver.recv() else { return };
 
             match progress {
-                ParallelPrimeCacheWorkerProgress::BeginCrateDefMap { crate_id, crate_name } => {
-                    crates_currently_indexing.insert(crate_id, crate_name);
-                }
                 ParallelPrimeCacheWorkerProgress::EndCrateDefMap { crate_id } => {
-                    crates_currently_indexing.swap_remove(&crate_id);
                     crate_def_maps_done += 1;
 
                     // Fire ready dependencies.
@@ -279,18 +229,8 @@ pub fn parallel_prime_caches(
                         let to_be_done = to_be_done_deps.get_mut(&dep).unwrap();
                         *to_be_done -= 1;
                         if *to_be_done == 0 {
-                            let dep_name = crate_name(db, dep);
-                            def_map_work_sender.send((dep, dep_name)).ok();
+                            def_map_work_sender.send(dep).ok();
                         }
-                    }
-
-                    if crate_def_maps_done == crate_def_maps_total {
-                        cb(ParallelPrimeCachesProgress {
-                            crates_currently_indexing: vec![],
-                            crates_done: crate_def_maps_done,
-                            crates_total: crate_def_maps_done,
-                            work_type: "Collecting Symbols",
-                        });
                     }
 
                     sema_work_sender.send(crate_id).ok();
@@ -328,11 +268,19 @@ pub fn parallel_prime_caches(
     });
 }
 
-fn crate_name(db: &RootDatabase, krate: Crate) -> Symbol {
-    krate
-        .extra_data(db)
-        .display_name
-        .as_deref()
-        .cloned()
-        .unwrap_or_else(|| sym::Integer::get(salsa::plumbing::AsId::as_id(&krate).index() as usize))
+#[cfg(test)]
+mod tests {
+    use test_fixture::WithFixture;
+
+    use crate::{RootDatabase, base_db::all_crates};
+
+    #[test]
+    fn primes_a_dependency_chain_and_returns() {
+        let db = RootDatabase::with_files(
+            "//- /a.rs crate:a\npub fn f() {}\n//- /b.rs crate:b deps:a\npub fn g() { a::f() }\n",
+        );
+        let all = all_crates(&db);
+        super::parallel_prime_caches(&db, &all, 2);
+        super::parallel_prime_caches(&db, &[], 2);
+    }
 }

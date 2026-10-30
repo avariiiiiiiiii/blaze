@@ -192,3 +192,110 @@ fn main() {
         ["deprecated: use of deprecated function `e`: use h", "deprecated: use of deprecated function `old::g`"]
     );
 }
+
+/// `stability-attribute-trait-impl`'s `ineffective_unstable_trait_impl`s and its "module has
+/// missing stability attribute" (the attribute checks'), each block as its `.stderr` has it.
+/// rustc gives the module's missing stability after the lints of `check_mod_unstable_api_usage`;
+/// this checks each block, not that order, which is the driver's.
+#[test]
+fn an_unstable_trait_impl_of_stable_types_and_traits_has_no_effect() {
+    let source = include_str!("stability/stability-attribute-trait-impl.rs");
+    let expected = include_str!("stability/stability-attribute-trait-impl.stderr");
+    let stderr = one("stability-attribute-trait-impl.rs", source, Mode::Other);
+    let (lints, rest) = expected.split_at(expected.find("error: module has missing").expect("the test's last error"));
+    let (missing, closing) = rest.split_at(rest.find("error: aborting").expect("the closing line"));
+    assert!(stderr.contains(lints), "{stderr}");
+    assert!(stderr.contains(missing), "{stderr}");
+    assert!(stderr.ends_with(closing), "{stderr}");
+}
+
+#[test]
+fn an_unstable_feature_bound_an_unresolved_trait_and_a_nested_unstable_type_keep_the_lint_off() {
+    let checked = checked(
+        r#"//- /main.rs crate:main edition:2021
+#![feature(staged_api)]
+#![stable(feature = "main", since = "1.0.0")]
+#[stable(feature = "a", since = "1.0.0")]
+pub struct S;
+#[stable(feature = "a", since = "1.0.0")]
+pub struct W<X>(X);
+#[unstable(feature = "b", issue = "none")]
+pub struct U;
+#[stable(feature = "c", since = "1.0.0")]
+pub trait T {}
+#[unstable_feature_bound(d)]
+#[unstable(feature = "d", issue = "none")]
+impl T for S {}
+#[unstable(feature = "e", issue = "none")]
+impl Unresolved for S {}
+#[unstable(feature = "f", issue = "none")]
+impl T for W<U> {}
+#[unstable(feature = "g", issue = "none")]
+impl T for W<S> {}
+fn main() {}
+"#,
+    );
+    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.contains("has no effect")).collect();
+    assert_eq!(messages, ["ineffective_unstable_trait_impl: an `#[unstable]` annotation here has no effect"]);
+}
+
+#[test]
+fn typeck_checks_a_receiver_before_its_method_and_an_initializer_before_its_pattern() {
+    let checked = checked(
+        r#"//- /main.rs crate:main edition:2021
+pub struct P(#[deprecated] pub u8);
+pub struct T;
+impl T {
+    #[deprecated]
+    pub fn a(&self) -> T { T }
+    #[deprecated]
+    pub fn b(&self) -> P { P(0) }
+}
+fn main() {
+    let P(_x) = T.a().b();
+}
+"#,
+    );
+    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
+    assert_eq!(
+        messages,
+        [
+            "deprecated: use of deprecated method `T::a`",
+            "deprecated: use of deprecated method `T::b`",
+            "deprecated: use of deprecated field `P::0`",
+        ]
+    );
+}
+
+#[test]
+fn what_a_macro_expands_to_is_checked_where_it_is_called() {
+    let checked = checked(
+        r#"//- /main.rs crate:main edition:2021
+#[deprecated]
+pub fn d1() {}
+#[deprecated]
+pub fn d2() {}
+#[deprecated]
+pub fn d3() {}
+macro_rules! call {
+    () => {
+        d2()
+    };
+}
+fn main() {
+    d1();
+    call!();
+    d3();
+}
+"#,
+    );
+    let messages: Vec<String> = checked.messages().into_iter().filter(|it| it.starts_with("deprecated")).collect();
+    assert_eq!(
+        messages,
+        [
+            "deprecated: use of deprecated function `d1`",
+            "deprecated: use of deprecated function `d2`",
+            "deprecated: use of deprecated function `d3`",
+        ]
+    );
+}

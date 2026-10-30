@@ -13,7 +13,7 @@ use crate::{
     lower::lower_mutability,
 };
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(crate) fn infer_mut_body(&mut self, body_expr: ExprId) {
         self.infer_mut_expr(body_expr, Mutability::Not);
     }

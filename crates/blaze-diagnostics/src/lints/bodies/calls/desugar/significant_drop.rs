@@ -65,6 +65,7 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
     pub(super) fn new(b: &BodyCx<'_, 'db>, solver: &'s Solver<'db>) -> SignificantDrops<'s, 'db> {
         let db = b.db();
         let limit = crate_def_map(db, b.cx.krate.into()).recursion_limit() as usize;
+        // alloc: empty, pushed to only on the overflow error
         SignificantDrops { db, solver, limit, dtors: FxHashMap::default(), overflowed: Vec::new() }
     }
 
@@ -105,11 +106,12 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
     /// an ADT through `adt_consider_insignificant_dtor`. A part is the type popped when one of
     /// its components always needs drop, or the component itself when it is an alias, an
     /// array of unknown length or a parameter that is all there is to it.
-    fn list(&mut self, query: Ty<'db>) -> Vec<Ty<'db>> {
-        let mut out = Vec::new();
+    fn list(&mut self, query: Ty<'db>) -> SmallVec<[Ty<'db>; 4]> {
+        let mut out = SmallVec::new();
         let mut seen = FxHashSet::default();
         seen.insert(query);
-        let mut unchecked: Vec<(Ty<'db>, usize)> = vec![(query, 0)];
+        let mut unchecked: SmallVec<[(Ty<'db>, usize); 8]> = SmallVec::new();
+        unchecked.push((query, 0));
         'next: while let Some((ty, level)) = unchecked.pop() {
             if level > self.limit {
                 self.overflowed.push(query);
@@ -203,6 +205,7 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
                 components => match try_const_usize(self.db, len) {
                     Some(0) => Some(SmallVec::new()),
                     Some(_) => components,
+                    // alloc: inline, a `SmallVec` of one allocates nothing
                     None => Some(smallvec![ty]),
                 },
             },
@@ -223,32 +226,38 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
             | TyKind::CoroutineClosure(..)
             | TyKind::Coroutine(..)
             | TyKind::CoroutineWitness(..)
+            // alloc: inline, a `SmallVec` of one allocates nothing
             | TyKind::UnsafeBinder(_) => Some(smallvec![ty]),
         }
     }
 
     /// `drop_tys_helper`'s `adt_components` when only significant destructors count: what a
     /// value of the ADT needs drop through, none when its own destructor is significant.
-    fn adt_components(&mut self, def: AdtDef, args: GenericArgs<'db>) -> Option<Vec<Ty<'db>>> {
+    fn adt_components(&mut self, def: AdtDef, args: GenericArgs<'db>) -> Option<SmallVec<[Ty<'db>; 8]>> {
         if def.is_manually_drop() {
-            return Some(Vec::new());
+            return Some(SmallVec::new());
         }
         let adt = def.def_id();
         match self.dtor(adt) {
             Dtor::Significant => return None,
-            Dtor::Insignificant => return Some(args.types().collect()),
+            Dtor::Insignificant => return Some(SmallVec::from_iter(args.types())),
             Dtor::None => {}
         }
+        let db = self.db;
         let interner = self.solver.interner();
-        let variants: SmallVec<[VariantId; 1]> = match adt {
-            AdtId::UnionId(_) => return Some(Vec::new()),
-            AdtId::StructId(it) => smallvec![VariantId::StructId(it)],
-            AdtId::EnumId(it) => enum_variant_ids(self.db, it).iter().map(|&it| VariantId::EnumVariantId(it)).collect(),
-        };
-        let mut fields = Vec::new();
-        for variant in variants {
-            for field in self.db.field_types(variant).values() {
+        let mut fields = SmallVec::new();
+        let mut of_variant = |variant: VariantId| {
+            for field in db.field_types(variant).values() {
                 fields.push(field.ty().instantiate(interner, args).skip_norm_wip());
+            }
+        };
+        match adt {
+            AdtId::UnionId(_) => return Some(SmallVec::new()),
+            AdtId::StructId(it) => of_variant(VariantId::StructId(it)),
+            AdtId::EnumId(it) => {
+                for &variant in enum_variant_ids(db, it).iter() {
+                    of_variant(VariantId::EnumVariantId(variant));
+                }
             }
         }
         Some(fields)
@@ -273,7 +282,6 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
     fn true_significant_drop_ty(&self, ty: Ty<'db>) -> Option<SmallVec<[Ty<'db>; 2]>> {
         let TyKind::Adt(def, args) = ty.kind() else { return None };
         let path = def_path(self.db, def.def_id())?;
-        let path: SmallVec<[&str; 6]> = path.iter().map(String::as_str).collect();
         let arg = |index: usize| args.iter().nth(index).and_then(|it| it.ty());
         match path[..] {
             ["syn" | "proc_macro2", ..]
@@ -281,7 +289,9 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
             | ["core" | "std", "task", "wake", "LocalWaker" | "Waker"]
             | ["tracing", "instrument", "Instrumented"]
             | ["bytes", "Bytes"] => Some(SmallVec::new()),
+            // alloc: inline, a `SmallVec` of one allocates nothing
             ["hashbrown", "raw", "RawTable" | "RawIntoIter"] => arg(0).map(|it| smallvec![it]),
+            // alloc: inline, a `SmallVec` of one allocates nothing
             ["hashbrown", "raw", "RawDrain"] => arg(1).map(|it| smallvec![it]),
             _ => None,
         }
@@ -297,14 +307,15 @@ impl<'s, 'db> SignificantDrops<'s, 'db> {
 /// The crate's name and the names of the modules down to the ADT and its own, when each is
 /// a name in the type namespace (rustc's `DefPathData::TypeNs`): none for an ADT in a block.
 /// Only those of the crates `true_significant_drop_ty` knows are read.
-fn def_path(db: &Db, adt: AdtId) -> Option<Vec<String>> {
+fn def_path(db: &Db, adt: AdtId) -> Option<SmallVec<[&'static str; 6]>> {
     let adt = hir::Adt::from(adt);
     let module = adt.module(db);
-    let krate = module.krate(db).display_name(db)?.crate_name().to_string();
-    if !matches!(&*krate, "syn" | "proc_macro2" | "core" | "std" | "tracing" | "bytes" | "hashbrown") {
+    let krate = module.krate(db).display_name(db)?.crate_name().as_str();
+    if !matches!(krate, "syn" | "proc_macro2" | "core" | "std" | "tracing" | "bytes" | "hashbrown") {
         return None;
     }
-    let mut path = vec![adt.name(db).as_str().to_owned()];
+    let mut path: SmallVec<[&'static str; 6]> = SmallVec::new();
+    path.push(adt.name(db).symbol().as_str());
     for module in module.path_to_root(db) {
         if module.is_crate_root(db) {
             break;
@@ -312,7 +323,7 @@ fn def_path(db: &Db, adt: AdtId) -> Option<Vec<String>> {
         if module.nearest_non_block_module(db) != module {
             return None;
         }
-        path.push(module.name(db)?.as_str().to_owned());
+        path.push(module.name(db)?.symbol().as_str());
     }
     path.push(krate);
     path.reverse();
@@ -321,13 +332,13 @@ fn def_path(db: &Db, adt: AdtId) -> Option<Vec<String>> {
 
 /// Whether the ADT is `#[rustc_insignificant_dtor]`, its `cfg_attr`s expanded.
 fn insignificant_dtor(db: &Db, adt: AdtId) -> bool {
-    let attrs: Vec<ast::Attr> = match adt {
-        AdtId::StructId(it) => it.lookup(db).source(db).value.attrs().collect(),
-        AdtId::EnumId(it) => it.lookup(db).source(db).value.attrs().collect(),
-        AdtId::UnionId(it) => it.lookup(db).source(db).value.attrs().collect(),
+    let attrs = match adt {
+        AdtId::StructId(it) => it.lookup(db).source(db).value.attrs(),
+        AdtId::EnumId(it) => it.lookup(db).source(db).value.attrs(),
+        AdtId::UnionId(it) => it.lookup(db).source(db).value.attrs(),
     };
     let cfg = adt.krate(db).cfg_options(db);
-    expand_cfg_attr(attrs.into_iter(), || cfg, |meta, _| match meta {
+    expand_cfg_attr(attrs, || cfg, |meta, _| match meta {
         ast::Meta::PathMeta(meta) if meta.path().is1("rustc_insignificant_dtor") => ControlFlow::Break(()),
         _ => ControlFlow::Continue(()),
     })
@@ -343,10 +354,14 @@ pub(super) fn dtor_span(b: &BodyCx<'_, '_>, ty: Ty<'_>) -> Option<Span> {
     let db = b.db();
     let adt = def.def_id();
     let node: InFile<SyntaxNode> = match hir_ty::drop::destructor(db, adt) {
+        // clone: a node handle, for the span of the lint's note
         Some(impl_) => impl_.lookup(db).source(db).map(|it| it.syntax().clone()),
         None => match adt {
+            // clone: a node handle, for the span of the lint's note
             AdtId::StructId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+            // clone: a node handle, for the span of the lint's note
             AdtId::EnumId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+            // clone: a node handle, for the span of the lint's note
             AdtId::UnionId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
         },
     };

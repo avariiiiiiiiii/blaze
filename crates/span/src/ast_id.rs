@@ -1441,6 +1441,13 @@ impl AstIdMap {
         })
     }
 
+    /// The map's entries outside fn bodies, `[start, end, kind, id]`: the root first, then in
+    /// the walk's order, breadth first (an item before what is in it), not sorted by start.
+    /// What an edit's unchanged text is compared by as one slice.
+    pub fn entries(&self) -> &[[u32; 4]] {
+        &self.entries
+    }
+
     /// The root node.
     pub fn root(&self) -> SyntaxNodePtr {
         entry_ptr(&self.entries[0])
@@ -1678,6 +1685,30 @@ fn bar() {
             macro_call_bar_id.raw.hash_value(),
             "hashes are equal"
         );
+    }
+
+    /// The entries lent are the root's, then each item's outside bodies in the walk's order,
+    /// with the ids lookups give.
+    #[test]
+    fn entries_are_lent_root_first_in_the_walks_order() {
+        let text: Arc<str> = "struct A;\nimpl T for A { fn b() { struct C; } }\nfn d() {}\n".into();
+        let file = full_of(&text);
+        let map = AstIdMap::from_source(&file);
+        let entries = map.entries();
+        assert_eq!(super::entry_ptr(&entries[0]), SyntaxNodePtr::new(&file));
+        let kinds: Vec<SyntaxKind> = entries.iter().map(|it| super::entry_ptr(it).kind()).collect();
+        let want = [
+            SyntaxKind::SOURCE_FILE,
+            SyntaxKind::STRUCT,
+            SyntaxKind::IMPL,
+            SyntaxKind::FN,
+            SyntaxKind::FN,
+        ];
+        assert_eq!(kinds, want, "`b` is under the impl, so after `d`; `C` is in a body");
+        for entry in entries {
+            let ptr = super::entry_ptr(entry);
+            assert_eq!(map.try_erased_ast_id(ptr), Some(super::entry_id(entry)));
+        }
     }
 
     #[test]
@@ -2279,6 +2310,193 @@ fn foo() {
             let kind = kinds[rng.index(kinds.len())];
             let data = rng.below(4);
             assert_eq!(packed.new_id(kind, data), pairs.new_id(kind, data));
+        }
+    }
+
+    /// A full parse and an outline of `text`, each with a cursor of its root.
+    fn parses(text: &Arc<str>) -> [(syntax::Parse<SourceFile>, SyntaxNode); 2] {
+        [
+            SourceFile::parse_shared(text.clone(), Edition::CURRENT),
+            SourceFile::parse_outline(text.clone(), Edition::CURRENT),
+        ]
+        .map(|parse| {
+            let node = parse.syntax_node();
+            (parse, node)
+        })
+    }
+
+    /// The id the handles name `node` by, made in `index_map` under `parent`: what
+    /// `ast_id_for` did before it read views, the reference the views are checked against.
+    fn handle_id(
+        node: &SyntaxNode,
+        index_map: &mut super::ErasedAstIdNextIndexMap,
+        parent: Option<ErasedFileAstId>,
+    ) -> ErasedFileAstId {
+        use super::{
+            BlockExprFileAstId, ErasedAssocItemFileAstId, ErasedFileAstIdKind as Kind,
+            ErasedHasNameFileAstId, ImplFileAstId,
+        };
+        let text = |it: Option<String>| it.unwrap_or_default();
+        let has_name = || {
+            let name = ast::AnyHasName::cast(node.clone()).and_then(|it| it.name());
+            text(name.map(|it| it.text().to_owned()))
+        };
+        let kind = match node.kind() {
+            SyntaxKind::BLOCK_EXPR => Kind::BlockExpr,
+            kind => ErasedFileAstId::should_alloc(kind).expect("a node with an id"),
+        };
+        match kind {
+            Kind::Enum
+            | Kind::Struct
+            | Kind::Union
+            | Kind::MacroDef
+            | Kind::MacroRules
+            | Kind::Module
+            | Kind::Static
+            | Kind::Trait => index_map.new_id(kind, ErasedHasNameFileAstId { name: &has_name() }),
+            Kind::ExternCrate => {
+                let name = ast::ExternCrate::cast(node.clone()).and_then(|it| it.name_ref());
+                let name = text(name.map(|it| it.text().to_owned()));
+                index_map.new_id(kind, ErasedHasNameFileAstId { name: &name })
+            }
+            Kind::Variant | Kind::Const | Kind::Fn | Kind::TypeAlias | Kind::MacroCall => {
+                let name = match kind {
+                    Kind::MacroCall => {
+                        let call = ast::MacroCall::cast(node.clone()).expect("a macro call");
+                        let name = call.path().and_then(|path| path.segment()?.name_ref());
+                        text(name.map(|it| it.text().to_owned()))
+                    }
+                    _ => has_name(),
+                };
+                let properties = ErasedHasNameFileAstId { name: &name };
+                index_map.new_id(kind, ErasedAssocItemFileAstId { parent, properties })
+            }
+            Kind::ExternBlock | Kind::Use | Kind::AsmExpr => index_map.new_id(kind, ()),
+            Kind::Impl => {
+                let item = ast::Impl::cast(node.clone()).expect("an impl");
+                let type_name = |ty: Option<ast::Type>| match ty? {
+                    ast::Type::PathType(it) => {
+                        Some(it.path()?.segment()?.name_ref()?.text().to_owned())
+                    }
+                    _ => None,
+                };
+                let (self_ty, trait_) = (type_name(item.self_ty()), type_name(item.trait_()));
+                let data = ImplFileAstId {
+                    self_ty_name: self_ty.as_deref(),
+                    trait_name: trait_.as_deref(),
+                };
+                index_map.new_id(kind, data)
+            }
+            Kind::BlockExpr => index_map.new_id(kind, BlockExprFileAstId { parent }),
+            Kind::Fixup | Kind::NoDownmap | Kind::Root => panic!("{kind:?} is no node's"),
+        }
+    }
+
+    /// The parent an entry's id is made under, as the walk tells it: the nearest item it is in
+    /// (a block is none), none at the top or under an extern block.
+    fn parent_in(map: &AstIdMap, node: &SyntaxNode) -> Option<ErasedFileAstId> {
+        let parent = node
+            .ancestors()
+            .skip(1)
+            .find(|it| ErasedFileAstId::should_alloc(it.kind()).is_some())?;
+        let id = map.erased_ast_id(SyntaxNodePtr::new(&parent));
+        (id.kind() != super::ErasedFileAstIdKind::ExternBlock as u32).then_some(id)
+    }
+
+    /// `from_view` makes the map `from_source` makes, every entry, id and body, in full parses
+    /// and outlines; and naming each item through a view gives the id its handle names it by,
+    /// replaying the entries in the order the walk made their ids.
+    #[test]
+    fn a_views_map_is_the_handles_map() {
+        for (path, text) in view_corpus() {
+            let path = path.display();
+            for (parse, node) in parses(&text) {
+                let want = AstIdMap::from_source(&node);
+                let got = AstIdMap::from_view(parse.root());
+                assert!(got == want, "{path}: from_view is not from_source");
+                assert_eq!(FxBuildHasher.hash_one(&got), FxBuildHasher.hash_one(&want), "{path}");
+                assert_eq!(got.entries, want.entries, "{path}: the entries");
+                assert_eq!(got.bodies.ats, want.bodies.ats, "{path}: the bodies");
+                assert_eq!(stored(&got), stored(&want), "{path}: the ids, the bodies' too");
+
+                let mut index_map = super::ErasedAstIdNextIndexMap::default();
+                for entry in &got.entries[1..] {
+                    let ptr = super::entry_ptr(entry);
+                    let item = ptr.to_node(&node);
+                    let id = handle_id(&item, &mut index_map, parent_in(&got, &item));
+                    assert_eq!(id, super::entry_id(entry), "{path}: {ptr:?} is named otherwise");
+                }
+            }
+        }
+    }
+
+    /// `relative_to_view` and `relative_without_view` make each item's map that the cursors'
+    /// `relative_to` and `relative_without` make: of the item as a tree of its own, and of it
+    /// with its fn bodies left out, in full parses and outlines.
+    #[test]
+    fn a_views_relative_maps_are_the_handles() {
+        for (path, text) in view_corpus() {
+            let path = path.display();
+            for (parse, node) in parses(&text) {
+                let map = AstIdMap::from_source(&node);
+                let root = parse.root();
+                // In the order they begin, none in another: what `relative_without` elides.
+                let bodies: Vec<SyntaxNodePtr> = (0..map.bodies.len())
+                    .map(|body| {
+                        let tree = map.bodies.tree.as_deref().expect("a map with bodies keeps them");
+                        let kind = super::kind_of(tree, map.bodies.ats[body]);
+                        SyntaxNodePtr::from_parts(kind, map.bodies.range(body))
+                    })
+                    .collect();
+                for entry in &map.entries[1..] {
+                    let ptr = super::entry_ptr(entry);
+                    if ptr.kind() == SyntaxKind::BLOCK_EXPR {
+                        continue;
+                    }
+                    let anchor = ptr.to_node(&node);
+                    let anchor_view = syntax::view::to_node(ptr, root);
+                    assert_eq!(syntax::view::ptr(anchor_view), ptr, "{path}");
+
+                    let relative = anchor.clone_subtree();
+                    let relative_view = syntax::view::Node::root(super::flat_of(&relative).0);
+                    let want = map.relative_to(&anchor, &relative);
+                    let got = map.relative_to_view(anchor_view, relative_view);
+                    assert!(got == want, "{path}: the map relative to {ptr:?}");
+                    assert_eq!(stored(&got), stored(&want), "{path}: relative to {ptr:?}");
+
+                    let range = ptr.text_range();
+                    let elided: Vec<SyntaxNodePtr> = bodies
+                        .iter()
+                        .copied()
+                        .filter(|it| range.contains_range(it.text_range()) && it.text_range() != range)
+                        .collect();
+                    if elided.is_empty() {
+                        continue;
+                    }
+                    let nodes: Vec<SyntaxNode> = elided.iter().map(|it| it.to_node(&node)).collect();
+                    let relative = without_all(&anchor, &nodes);
+                    let relative_view = syntax::view::Node::root(super::flat_of(&relative).0);
+                    let want = map.relative_without(&anchor, &relative, &elided);
+                    let got = map.relative_without_view(anchor_view, relative_view, &elided);
+                    assert!(got == want, "{path}: {ptr:?} without its bodies");
+                    assert_eq!(stored(&got), stored(&want), "{path}: {ptr:?} without its bodies");
+                }
+            }
+        }
+    }
+
+    /// A warm `from_view` allocates its result and nothing else, as a warm `from_source` does.
+    #[test]
+    fn a_warm_view_build_allocates_only_its_map() {
+        for (path, text) in view_corpus() {
+            for (parse, _) in parses(&text) {
+                let map = AstIdMap::from_view(parse.root());
+                let columns = if map.bodies.len() == 0 { 3 } else { 8 };
+                let what = format!("{}: a warm map build from a view", path.display());
+                blaze_alloc_count::assert_at_most(columns, &what, || {
+                    std::hint::black_box(AstIdMap::from_view(parse.root()));
+                });
+            }
         }
     }
 }

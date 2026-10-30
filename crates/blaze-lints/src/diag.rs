@@ -33,6 +33,7 @@ pub(crate) fn place_diag(
     diag: &mut Diag,
     offset: u32,
     name: &str,
+    // dyn: `check::NameOf`, asked once per diagnostic span that leaves its file.
     name_of: &dyn Fn(span::FileId) -> Option<String>,
 ) -> bool {
     let mut named = place_multi(&mut diag.span, offset, name, name_of);
@@ -51,6 +52,7 @@ fn place_multi(
     span: &mut MultiSpan,
     offset: u32,
     name: &str,
+    // dyn: `check::NameOf`, asked once per diagnostic span that leaves its file.
     name_of: &dyn Fn(span::FileId) -> Option<String>,
 ) -> bool {
     let mut named = true;
@@ -66,6 +68,7 @@ pub(crate) fn place(
     span: &mut Span,
     offset: u32,
     name: &str,
+    // dyn: `check::NameOf`, asked once per diagnostic span that leaves its file.
     name_of: &dyn Fn(span::FileId) -> Option<String>,
 ) -> bool {
     if span.file.is_empty() {
@@ -88,6 +91,7 @@ fn place_expansion(
     expansion: &mut Expansion,
     offset: u32,
     name: &str,
+    // dyn: `check::NameOf`, asked once per diagnostic span that leaves its file.
     name_of: &dyn Fn(span::FileId) -> Option<String>,
 ) -> bool {
     let def_site = expansion.def_site.as_mut().is_none_or(|it| place(it, offset, name, name_of));

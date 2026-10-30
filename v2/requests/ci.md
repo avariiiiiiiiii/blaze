@@ -155,6 +155,7 @@ blaze-v2-proof = { path = "crates/blaze-v2-proof" }
   for a view that is no longer open. The session answers `Why` today only for open views.
 
 > forwarded to db
+> not applied by db-audit-other (22:34): not in the tree: `Database::open` (`crates/blaze-query/src/lib.rs:1230`) still mints its own `ViewId`, and `Database::why` (`lib.rs:1284`) takes no root. Sent by db-audit-other to db-query2-next1, which holds `crates/blaze-query/` (told by tmux; same ask as `v2/requests/vfs.md` 7). `build::Opened.queries` goes on ci's side after.
 
 ## From safety-audit (2026-10-29, safety-audit-edge)
 

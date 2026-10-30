@@ -52,7 +52,9 @@ fn is_integral(ty: Ty<'_>) -> bool {
 fn ptr2int(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, out: &mut Vec<Found>) {
     let (Some(at), Some(span)) = (b.expr_node(expr), expr_span(b, expr)) else { return };
     let (Some(from_text), Some(to_text)) = (ty_text(b, from), ty_text(b, expr)) else { return };
+    // alloc: the lint's text, for a lint found
     let message = format!("cast from `{from_text}` to `{to_text}` implicitly exposes pointer provenance");
+    // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("implicit_provenance_casts", message, span.clone());
     diag.help("if conforming to strict provenance is not possible, use `.expose_provenance()`");
     diag.note(NOTE);
@@ -65,13 +67,16 @@ fn ptr2int(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, out: &
         let applicability = Applicability::MaybeIncorrect;
         match (!unambiguous(b, from), !to_ty.is_usize()) {
             (true, true) => {
+                // alloc: the lint's text, for a lint found
                 let parts = vec![(lo, "(".to_owned()), (cast_span, format!(").addr() as {to_text}"))];
                 diag.suggestion_with_style(parts, message, applicability, SuggestionStyle::ShowCode)
             }
             (true, false) => {
+                // alloc: the lint's text, for a lint found
                 let parts = vec![(lo, "(".to_owned()), (cast_span, ").addr()".to_owned())];
                 diag.suggestion_with_style(parts, message, applicability, SuggestionStyle::ShowCode)
             }
+            // alloc: the lint's text, for a lint found
             (false, true) => diag.suggestion(cast_span, message, format!(".addr() as {to_text}"), applicability),
             (false, false) => diag.suggestion(cast_span, message, ".addr()", applicability),
         };
@@ -83,15 +88,20 @@ fn ptr2int(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, to_ty: Ty<'_>, out: &
 fn int2ptr(b: &BodyCx<'_, '_>, expr: ExprId, from: ExprId, out: &mut Vec<Found>) {
     let (Some(at), Some(span)) = (b.expr_node(expr), expr_span(b, expr)) else { return };
     let (Some(from_text), Some(to_text)) = (ty_text(b, from), ty_text(b, expr)) else { return };
+    // alloc: the lint's text, for a lint found
     let message = format!("cast from `{from_text}` to `{to_text}` implicitly relies on exposed provenance");
+    // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("implicit_provenance_casts", message, span.clone());
     diag.help("if conforming to strict provenance is not possible, use `std::ptr::with_exposed_provenance()`");
     diag.note(NOTE);
     if can_be_used_for_suggestions(&span)
         && let (Some(from_span), Some(ty_span)) = (expr_span(b, from), cast_ty_span(b, expr))
     {
+        // alloc: the lint's text, for a lint found
         let parts = vec![
+            // alloc: the lint's text, for a lint found
             (from_span.shrink_to_lo(), "(...).with_addr(".to_owned()),
+            // alloc: the lint's text, for a lint found
             (from_span.shrink_to_hi().to(&ty_span), ")".to_owned()),
         ];
         diag.suggestion_with_style(

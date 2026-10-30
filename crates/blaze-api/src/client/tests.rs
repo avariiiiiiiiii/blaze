@@ -47,6 +47,56 @@ fn a_call_hands_over_its_responses_and_keeps_the_others() {
     assert_eq!(daemon.join().unwrap(), Envelope::new(1, Request::Status));
 }
 
+/// In place, a call hands over what [`Client::call`] does, says whether the next is already
+/// read, and keeps another request's responses owned.
+#[test]
+fn a_call_in_place_hands_over_its_responses_and_keeps_the_others() {
+    let error = ApiError::new("no such head", Some("main".to_owned()));
+    let fetched = Response::Fetched { verb: crate::FetchVerb::Updating, what: "crates.io index".to_owned() };
+    // Every answer is in the socket before the first read, so one read takes them all.
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    for answer in [
+        Envelope::new(99, Response::Error(error.clone())),
+        Envelope::new(1, Response::Status(status())),
+        Envelope::new(1, fetched.clone()),
+        Envelope::new(1, Response::Done { ok: true }),
+    ] {
+        theirs.write_all(&frames::encode(&answer).unwrap()).unwrap();
+    }
+    let mut client = Client::over(Link::Unix(ours));
+    let mut seen = Vec::new();
+    let ok = client.call_ref(Request::Status, |it, buffered| seen.push((it.into_owned(), buffered))).unwrap();
+    assert!(ok);
+    assert_eq!(seen, [
+        (Response::Status(status()), true),
+        (fetched, true),
+        (Response::Done { ok: true }, false),
+    ]);
+    assert!(client.buffered(), "the other request's response is kept");
+    assert_eq!(client.receive().unwrap(), Envelope::new(99, Response::Error(error)));
+    assert!(!client.buffered());
+    drop(theirs);
+}
+
+#[test]
+fn a_call_in_place_refuses_another_schema_by_name() {
+    let (mut client, _daemon) =
+        unix_daemon(vec![Envelope { schema: 99, id: 0, body: Response::Done { ok: true } }]);
+    let error = client.call_ref(Request::Status, |_, _| {}).unwrap_err();
+    assert!(matches!(error, ClientError::Schema { theirs: 99 }), "{error:?}");
+}
+
+#[test]
+fn over_http_a_call_in_place_reads_the_chunked_frames() {
+    let (at, daemon) = http_daemon(2, None);
+    let mut client = Client::http(at, "tok".to_owned()).unwrap();
+    let mut seen = Vec::new();
+    assert!(client.call_ref(Request::Status, |it, _| seen.push(it.into_owned())).unwrap());
+    assert_eq!(seen, [Response::Status(status()), Response::Done { ok: true }]);
+    assert!(client.call(Request::Status, |_| {}).unwrap(), "the connection is ready for the next");
+    assert_eq!(daemon.join().unwrap().len(), 2);
+}
+
 #[test]
 fn ids_are_chosen_by_the_client_and_increase() {
     let (ours, _theirs) = UnixStream::pair().unwrap();

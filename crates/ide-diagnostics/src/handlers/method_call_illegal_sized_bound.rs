@@ -1,3 +1,7 @@
+use hir::HirDisplay;
+use ide_db::Severity;
+use syntax::ast;
+
 use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
 
 // Diagnostic: method-call-illegal-sized-bound
@@ -9,13 +13,33 @@ pub(crate) fn method_call_illegal_sized_bound(
     ctx: &DiagnosticsContext<'_, '_>,
     d: &hir::MethodCallIllegalSizedBound,
 ) -> Diagnostic {
+    let name = d.method.name(ctx.sema.db);
+    let name = name.display(ctx.sema.db, ctx.edition);
+    let message = match d.needs_mut.then(|| receiver_ty(ctx, d)).flatten() {
+        Some(ty) => format!(
+            "the `{name}` method cannot be invoked on `{}`",
+            ty.display(ctx.sema.db, ctx.display_target)
+        ),
+        None => format!("the `{name}` method cannot be invoked on a trait object"),
+    };
     Diagnostic::new_with_syntax_node_ptr(
         ctx,
-        DiagnosticCode::RustcHardError("E0277"),
-        "the method cannot be invoked on a trait object because its `Self: Sized` bound is not satisfied",
+        DiagnosticCode::Ra("method-call-illegal-sized-bound", Severity::Error),
+        message,
         d.call_expr.map(|it| it.into()),
     )
     .stable()
+}
+
+fn receiver_ty<'db>(
+    ctx: &DiagnosticsContext<'_, 'db>,
+    d: &hir::MethodCallIllegalSizedBound,
+) -> Option<hir::Type<'db>> {
+    let root = d.call_expr.file_id.parse_or_expand(ctx.sema.db);
+    let ast::Expr::MethodCallExpr(call) = d.call_expr.value.to_node(&root).left()? else {
+        return None;
+    };
+    Some(ctx.sema.type_of_expr(&call.receiver()?)?.original)
 }
 
 #[cfg(test)]
@@ -33,7 +57,7 @@ trait Foo {
 
 fn f(x: &dyn Foo) {
     x.cant_call();
-  //^^^^^^^^^^^^^ error: the method cannot be invoked on a trait object because its `Self: Sized` bound is not satisfied
+  //^^^^^^^^^^^^^ error: the `cant_call` method cannot be invoked on a trait object
 }
 "#,
         );

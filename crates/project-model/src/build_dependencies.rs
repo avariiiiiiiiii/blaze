@@ -76,7 +76,6 @@ impl WorkspaceBuildScripts {
     pub(crate) fn run_for_workspace(
         config: &CargoConfig,
         workspace: &CargoWorkspace,
-        progress: &dyn Fn(String),
         sysroot: &Sysroot,
         toolchain: Option<&semver::Version>,
     ) -> io::Result<WorkspaceBuildScripts> {
@@ -92,7 +91,7 @@ impl WorkspaceBuildScripts {
             sysroot,
             toolchain,
         )?;
-        Self::run_per_ws(cmd, workspace, progress)
+        Self::run_per_ws(cmd, workspace)
     }
 
     /// Runs the build scripts by invoking the configured command *once*.
@@ -100,7 +99,6 @@ impl WorkspaceBuildScripts {
     pub(crate) fn run_once(
         config: &CargoConfig,
         workspaces: &[&CargoWorkspace],
-        progress: &dyn Fn(String),
         working_directory: &AbsPathBuf,
     ) -> io::Result<Vec<WorkspaceBuildScripts>> {
         assert_eq!(config.invocation_strategy, InvocationStrategy::Once);
@@ -141,14 +139,7 @@ impl WorkspaceBuildScripts {
 
         let errors = Self::run_command(
             cmd,
-            |package, cb| {
-                if let Some(&(package, workspace)) = by_id.get(package) {
-                    cb(&workspaces[workspace][package].name, &mut res[workspace].outputs[package]);
-                } else {
-                    tracing::error!("Received compiler message for unknown package: {}", package);
-                }
-            },
-            progress,
+            &mut Outputs { by_id: &by_id, res: &mut res, unknown: Unknown::Logged },
         )?;
         res.iter_mut().for_each(|it| it.error.clone_from(&errors));
         collisions.into_iter().for_each(|(id, workspace, package)| {
@@ -301,41 +292,26 @@ impl WorkspaceBuildScripts {
         bs
     }
 
-    fn run_per_ws(
-        cmd: Command,
-        workspace: &CargoWorkspace,
-        progress: &dyn Fn(String),
-    ) -> io::Result<WorkspaceBuildScripts> {
+    fn run_per_ws(cmd: Command, workspace: &CargoWorkspace) -> io::Result<WorkspaceBuildScripts> {
         let mut res = WorkspaceBuildScripts::default();
-        let outputs = &mut res.outputs;
         // NB: Cargo.toml could have been modified between `cargo metadata` and
         // `cargo check`. We shouldn't assume that package ids we see here are
         // exactly those from `config`.
-        let mut by_id: FxHashMap<Arc<PackageId>, Package> = FxHashMap::default();
-        for package in workspace.packages() {
-            outputs.insert(package, BuildScriptOutput::default());
-            by_id.insert(workspace[package].id.clone(), package);
-        }
+        let by_id = Self::by_id(workspace, &mut res);
 
-        res.error = Self::run_command(
+        let error = Self::run_command(
             cmd,
-            |package, cb| {
-                if let Some(&package) = by_id.get(package) {
-                    cb(&workspace[package].name, &mut outputs[package]);
-                } else {
-                    never!(
-                        "Received compiler message for unknown package: {}\n {}",
-                        package,
-                        by_id.keys().join(", ")
-                    );
-                }
+            &mut Outputs {
+                by_id: &by_id,
+                res: std::slice::from_mut(&mut res),
+                unknown: Unknown::Never,
             },
-            progress,
         )?;
+        res.error = error;
 
         if tracing::enabled!(tracing::Level::INFO) {
             for package in workspace.packages() {
-                let package_build_data = &outputs[package];
+                let package_build_data = &res.outputs[package];
                 if !package_build_data.is_empty() {
                     tracing::info!("{}: {package_build_data:?}", workspace[package].manifest,);
                 }
@@ -392,38 +368,36 @@ impl WorkspaceBuildScripts {
         lines: impl IntoIterator<Item = &'a str>,
     ) -> WorkspaceBuildScripts {
         let mut res = WorkspaceBuildScripts::default();
-        let outputs = &mut res.outputs;
-        let mut by_id: FxHashMap<Arc<PackageId>, Package> = FxHashMap::default();
-        for package in workspace.packages() {
-            outputs.insert(package, BuildScriptOutput::default());
-            by_id.insert(workspace[package].id.clone(), package);
-        }
+        let by_id = Self::by_id(workspace, &mut res);
         let errors = RefCell::new(String::new());
-        let push_err = |err: &str| {
-            let mut e = errors.borrow_mut();
-            e.push_str(err);
-            e.push('\n');
+        let mut outputs = Outputs {
+            by_id: &by_id,
+            res: std::slice::from_mut(&mut res),
+            unknown: Unknown::Ignored,
         };
-        let mut with_output_for =
-            |package: &PackageId, cb: &mut dyn FnMut(&str, &mut BuildScriptOutput)| {
-                if let Some(&package) = by_id.get(package) {
-                    cb(&workspace[package].name, &mut outputs[package]);
-                }
-            };
         for line in lines {
-            Self::said(line, &mut with_output_for, &|_| {}, &push_err);
+            Self::said(line, &mut outputs, &errors);
         }
         res.error = Some(errors.into_inner()).filter(|it| !it.is_empty());
         res
     }
 
+    /// Each package of `workspace` by its id, as the first workspace of a build, with an
+    /// empty output in `res`.
+    fn by_id(
+        workspace: &CargoWorkspace,
+        res: &mut WorkspaceBuildScripts,
+    ) -> FxHashMap<Arc<PackageId>, (Package, usize)> {
+        let mut by_id = FxHashMap::default();
+        for package in workspace.packages() {
+            res.outputs.insert(package, BuildScriptOutput::default());
+            by_id.insert(workspace[package].id.clone(), (package, 0));
+        }
+        by_id
+    }
+
     /// Takes in one line of what cargo printed.
-    fn said(
-        line: &str,
-        with_output_for: &mut dyn FnMut(&PackageId, &mut dyn FnMut(&str, &mut BuildScriptOutput)),
-        progress: &dyn Fn(String),
-        push_err: &dyn Fn(&str),
-    ) {
+    fn said(line: &str, outputs: &mut Outputs<'_>, errors: &RefCell<String>) {
         // Copy-pasted from existing cargo_metadata. It seems like we
         // should be using serde_stacker here?
         let mut deserializer = serde_json::Deserializer::from_str(line);
@@ -433,70 +407,65 @@ impl WorkspaceBuildScripts {
 
         match message {
             Message::BuildScriptExecuted(mut message) => {
-                with_output_for(&message.package_id, &mut |name, data| {
-                    // A package both the target and the host build (a dependency of a proc
-                    // macro) has its script run for each, which can say different things;
-                    // the code read is the target's. With `--target` cargo runs the host's in
-                    // `<dir>/<profile>` and the target's in `<dir>/<triple>/<profile>`.
-                    let depth = message.out_dir.components().count();
-                    if data.out_dir.as_ref().is_some_and(|was| {
-                        !message.out_dir.as_str().is_empty()
-                            && depth < Utf8Path::new(was.as_str()).components().count()
-                    }) {
-                        return;
+                let Some(data) = outputs.of(&message.package_id) else { return };
+                // A package both the target and the host build (a dependency of a proc
+                // macro) has its script run for each, which can say different things;
+                // the code read is the target's. With `--target` cargo runs the host's in
+                // `<dir>/<profile>` and the target's in `<dir>/<triple>/<profile>`.
+                let depth = message.out_dir.components().count();
+                if data.out_dir.as_ref().is_some_and(|was| {
+                    !message.out_dir.as_str().is_empty()
+                        && depth < Utf8Path::new(was.as_str()).components().count()
+                }) {
+                    return;
+                }
+                let cfgs = {
+                    let mut acc = Vec::new();
+                    for cfg in &message.cfgs {
+                        match crate::parse_cfg(cfg) {
+                            Ok(it) => acc.push(it),
+                            Err(err) => {
+                                let err = format!("invalid cfg from cargo-metadata: {err}");
+                                push_err(errors, &err);
+                                return;
+                            }
+                        };
                     }
-                    progress(format!("build script {name} run"));
-                    let cfgs = {
-                        let mut acc = Vec::new();
-                        for cfg in &message.cfgs {
-                            match crate::parse_cfg(cfg) {
-                                Ok(it) => acc.push(it),
-                                Err(err) => {
-                                    push_err(&format!("invalid cfg from cargo-metadata: {err}"));
-                                    return;
-                                }
-                            };
-                        }
-                        acc
-                    };
-                    data.envs.extend(message.env.drain(..));
-                    // cargo_metadata crate returns default (empty) path for
-                    // older cargos, which is not absolute, so work around that.
-                    let out_dir = mem::take(&mut message.out_dir);
-                    if !out_dir.as_str().is_empty() {
-                        let out_dir = AbsPathBuf::assert(out_dir);
-                        // inject_cargo_env(package, package_build_data);
-                        data.envs.insert("OUT_DIR", out_dir.as_str());
-                        data.out_dir = Some(out_dir);
-                        data.cfgs = cfgs;
-                    }
-                });
+                    acc
+                };
+                data.envs.extend(message.env.drain(..));
+                // cargo_metadata crate returns default (empty) path for
+                // older cargos, which is not absolute, so work around that.
+                let out_dir = mem::take(&mut message.out_dir);
+                if !out_dir.as_str().is_empty() {
+                    let out_dir = AbsPathBuf::assert(out_dir);
+                    // inject_cargo_env(package, package_build_data);
+                    data.envs.insert("OUT_DIR", out_dir.as_str());
+                    data.out_dir = Some(out_dir);
+                    data.cfgs = cfgs;
+                }
             }
             Message::CompilerArtifact(message) => {
-                with_output_for(&message.package_id, &mut |name, data| {
-                    if data.proc_macro_dylib_path == ProcMacroDylibPath::NotBuilt {
-                        data.proc_macro_dylib_path = ProcMacroDylibPath::NotProcMacro;
-                    }
-                    if !matches!(data.proc_macro_dylib_path, ProcMacroDylibPath::Path(_))
-                        && message.target.kind.contains(&cargo_metadata::TargetKind::ProcMacro)
-                    {
-                        progress(format!("proc-macro {name} built"));
-                        data.proc_macro_dylib_path =
-                            match message.filenames.iter().find(|file| is_dylib(file)) {
-                                Some(filename) => {
-                                    let filename = AbsPath::assert(filename);
-                                    ProcMacroDylibPath::Path(filename.to_owned())
-                                }
-                                None => ProcMacroDylibPath::DylibNotFound,
-                            };
-                    }
-                });
+                let Some(data) = outputs.of(&message.package_id) else { return };
+                if data.proc_macro_dylib_path == ProcMacroDylibPath::NotBuilt {
+                    data.proc_macro_dylib_path = ProcMacroDylibPath::NotProcMacro;
+                }
+                if !matches!(data.proc_macro_dylib_path, ProcMacroDylibPath::Path(_))
+                    && message.target.kind.contains(&cargo_metadata::TargetKind::ProcMacro)
+                {
+                    data.proc_macro_dylib_path =
+                        match message.filenames.iter().find(|file| is_dylib(file)) {
+                            Some(filename) => {
+                                let filename = AbsPath::assert(filename);
+                                ProcMacroDylibPath::Path(filename.to_owned())
+                            }
+                            None => ProcMacroDylibPath::DylibNotFound,
+                        };
+                }
             }
             Message::CompilerMessage(message) => {
-                progress(format!("received compiler message for: {}", message.target.name));
-
                 if let Some(diag) = message.message.rendered.as_deref() {
-                    push_err(diag);
+                    push_err(errors, diag);
                 }
             }
             Message::BuildFinished(_) => {}
@@ -505,28 +474,14 @@ impl WorkspaceBuildScripts {
         }
     }
 
-    fn run_command(
-        cmd: Command,
-        // ideally this would be something like:
-        // with_output_for: impl FnMut(&str, dyn FnOnce(&mut BuildScriptOutput)),
-        // but owned trait objects aren't a thing
-        mut with_output_for: impl FnMut(&PackageId, &mut dyn FnMut(&str, &mut BuildScriptOutput)),
-        progress: &dyn Fn(String),
-    ) -> io::Result<Option<String>> {
+    fn run_command(cmd: Command, outputs: &mut Outputs<'_>) -> io::Result<Option<String>> {
         let errors = RefCell::new(String::new());
-        let push_err = |err: &str| {
-            let mut e = errors.borrow_mut();
-            e.push_str(err);
-            e.push('\n');
-        };
 
         tracing::info!("Running build scripts: {:?}", cmd);
         let output = stdx::process::spawn_with_streaming_output(
             cmd,
-            &mut |line| Self::said(line, &mut with_output_for, progress, &push_err),
-            &mut |line| {
-                push_err(line);
-            },
+            &mut |line| Self::said(line, outputs, &errors),
+            &mut |line| push_err(&errors, line),
         )?;
 
         let errors = if !output.status.success() {
@@ -682,6 +637,51 @@ impl WorkspaceBuildScripts {
     }
 }
 
+/// Where what cargo says of a package goes: the output of the package with its id, in the
+/// workspace of the build it is in.
+struct Outputs<'a> {
+    by_id: &'a FxHashMap<Arc<PackageId>, (Package, usize)>,
+    res: &'a mut [WorkspaceBuildScripts],
+    unknown: Unknown,
+}
+
+/// What is made of cargo speaking of a package none of the workspaces has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unknown {
+    /// Nothing: the messages are of a build someone else ran.
+    Ignored,
+    /// An error is logged: one build of several workspaces, whose manifests may have changed.
+    Logged,
+    /// A bug: the build was of the one workspace that was read.
+    Never,
+}
+
+impl Outputs<'_> {
+    fn of(&mut self, id: &PackageId) -> Option<&mut BuildScriptOutput> {
+        let Some(&(package, workspace)) = self.by_id.get(id) else {
+            match self.unknown {
+                Unknown::Ignored => {}
+                Unknown::Logged => {
+                    tracing::error!("Received compiler message for unknown package: {}", id)
+                }
+                Unknown::Never => never!(
+                    "Received compiler message for unknown package: {}\n {}",
+                    id,
+                    self.by_id.keys().join(", ")
+                ),
+            }
+            return None;
+        };
+        Some(&mut self.res[workspace].outputs[package])
+    }
+}
+
+fn push_err(errors: &RefCell<String>, err: &str) {
+    let mut errors = errors.borrow_mut();
+    errors.push_str(err);
+    errors.push('\n');
+}
+
 // FIXME: Find a better way to know if it is a dylib.
 fn is_dylib(path: &Utf8Path) -> bool {
     match path.extension().map(|e| e.to_ascii_lowercase()) {
@@ -707,15 +707,69 @@ mod tests {
         .to_string()
     }
 
+    const DEP: Package = Package::from_raw(la_arena::RawIdx::from_u32(0));
+
+    /// What the one package `dep` of a workspace is read to have, and the errors, after
+    /// `lines`, with a package it does not have made `unknown` of.
+    fn read(lines: &[String], unknown: Unknown) -> (BuildScriptOutput, String) {
+        let mut res = WorkspaceBuildScripts::default();
+        res.outputs.insert(DEP, BuildScriptOutput::default());
+        let mut by_id = FxHashMap::default();
+        let dep = PackageId { repr: "path+file:///w/dep#0.1.0".to_owned() };
+        by_id.insert(Arc::new(dep), (DEP, 0));
+        let errors = RefCell::new(String::new());
+        let mut outputs = Outputs { by_id: &by_id, res: std::slice::from_mut(&mut res), unknown };
+        for line in lines {
+            WorkspaceBuildScripts::said(line, &mut outputs, &errors);
+        }
+        (res.outputs[DEP].clone(), errors.into_inner())
+    }
+
     /// The cfgs a package's script is read to have said after `lines`.
     fn cfgs_after(lines: &[String]) -> Vec<String> {
-        let mut data = BuildScriptOutput::default();
-        let mut with_output_for =
-            |_: &PackageId, cb: &mut dyn FnMut(&str, &mut BuildScriptOutput)| cb("dep", &mut data);
-        for line in lines {
-            WorkspaceBuildScripts::said(line, &mut with_output_for, &|_| {}, &|e| panic!("{e}"));
-        }
+        let (data, errors) = read(lines, Unknown::Never);
+        assert_eq!(errors, "");
         data.cfgs.iter().map(ToString::to_string).collect()
+    }
+
+    fn of_other(line: String) -> String {
+        line.replace("path+file:///w/dep#0.1.0", "path+file:///w/other#0.1.0")
+    }
+
+    #[test]
+    fn what_cargo_says_of_a_package_not_read_changes_nothing() {
+        let other = of_other(executed("/w/target/debug/build/other/1111/out", &["other"]));
+        for unknown in [Unknown::Ignored, Unknown::Logged] {
+            let got = read(std::slice::from_ref(&other), unknown);
+            assert_eq!(got, (BuildScriptOutput::default(), String::new()), "{unknown:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "unknown package")]
+    fn a_package_not_read_of_the_one_workspace_built_is_a_bug() {
+        let other = of_other(executed("/w/target/debug/build/other/1111/out", &["other"]));
+        read(&[other], Unknown::Never);
+    }
+
+    #[test]
+    fn a_cfg_that_does_not_parse_is_an_error_and_leaves_the_package_as_it_was() {
+        let bad = executed("/w/target/debug/build/dep/1111/out", &["feature=unquoted"]);
+        let (data, errors) = read(&[bad], Unknown::Never);
+        assert_eq!(data, BuildScriptOutput::default());
+        assert!(errors.starts_with("invalid cfg from cargo-metadata: "), "{errors}");
+        assert!(errors.ends_with('\n'), "{errors}");
+    }
+
+    #[test]
+    fn a_script_that_ran_is_told_its_out_dir() {
+        let out_dir = "/w/target/debug/build/dep/1111/out";
+        let (data, errors) = read(&[executed(out_dir, &["ran"])], Unknown::Never);
+        assert_eq!(errors, "");
+        assert_eq!(data.out_dir.as_ref().map(|it| it.as_str()), Some(out_dir));
+        assert_eq!(data.envs.get("OUT_DIR").as_deref(), Some(out_dir));
+        assert_eq!(data.cfgs.iter().map(ToString::to_string).collect::<Vec<_>>(), ["ran"]);
     }
 
     #[test]

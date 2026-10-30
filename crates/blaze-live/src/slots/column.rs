@@ -23,10 +23,15 @@ use super::{
 /// once per 32,768 rows. A multiple of [`os::GRAIN`].
 pub(super) const STEP: usize = 256 << 10;
 
-const _: () = assert!(STEP.is_multiple_of(os::GRAIN));
+/// The smallest page of the platforms: [`Column::ahead`] writes once per this many bytes.
+const FAULT: usize = 4096;
 
-/// At most `limit` rows of `T`, in address space reserved for all of them. 56 bytes; a row
-/// is `size_of::<T>()` bytes, and an index is one bounds check and one load.
+const _: () = assert!(STEP.is_multiple_of(os::GRAIN));
+const _: () = assert!(size_of::<Column<u64>>() == 32 + size_of::<os::Reserved>());
+
+/// At most `limit` rows of `T`, in address space reserved for all of them. 56 bytes (the
+/// reservation is 24); a row is `size_of::<T>()` bytes, and an index is a compare against
+/// the committed bytes, a bounds check and one load (a loop takes the slice once).
 pub(super) struct Column<T: Plain> {
     /// Which column, for the error when it is full.
     name: &'static str,
@@ -39,8 +44,8 @@ pub(super) struct Column<T: Plain> {
 impl<T: Plain> Column<T> {
     /// A column for at most `limit` rows, with none committed.
     pub(super) fn new(name: &'static str, limit: usize) -> Result<Column<T>, String> {
-        let bytes = limit.checked_mul(size_of::<T>()).and_then(|it| it.checked_next_multiple_of(STEP));
-        let Some(bytes) = bytes else {
+        let bytes = limit.checked_mul(size_of::<T>());
+        let Some(bytes) = bytes.and_then(|it| it.checked_next_multiple_of(STEP)) else {
             // alloc: error path, once at start
             return Err(format!("{name}: {limit} rows are more than the address space"));
         };
@@ -83,6 +88,25 @@ impl<T: Plain> Column<T> {
         Ok(())
     }
 
+    /// Commits the pages the next `more` rows go on (up to the limit) and writes each page
+    /// once, so the pushes that fill them neither call `mprotect` nor fault: for after a
+    /// patch's switch, off its latency path. What it can't commit is left to
+    /// [`Column::room`], which commits it when a row needs it, or refuses the patch saying why.
+    pub(super) fn ahead(&mut self, more: usize) {
+        let rows = self.len.saturating_add(more).min(self.limit);
+        if self.room(rows - self.len).is_err() {
+            return;
+        }
+        let per_page = (FAULT / size_of::<T>()).max(1);
+        let pages = image::rows_mut(&mut self.memory, rows);
+        let mut at = self.len;
+        while at < rows {
+            // Past the last row: a row's bytes stored back, which the compiler can't drop.
+            pages[at] = std::hint::black_box(pages[at]);
+            at = (at / per_page + 1) * per_page;
+        }
+    }
+
     /// Keeps the first `len` rows; what was committed stays committed.
     pub(super) fn truncate(&mut self, len: usize) {
         self.len = self.len.min(len);
@@ -103,7 +127,7 @@ impl<T: Plain> Column<T> {
             let rows = image::rows_mut(&mut self.memory, len);
             rows[start] = value;
             rows.copy_within(end..len, start + 1);
-            self.len = len - (end - start - 1);
+            self.truncate(len - (end - start - 1));
         }
         Ok(())
     }
@@ -152,7 +176,7 @@ mod tests {
         let mut model: Vec<T> = Vec::new();
         let mut rng = SplitMix64::new(seed);
         let mut full = 0;
-        for _ in 0..40_000 {
+        for step in 0..40_000 {
             let value = of(rng.next_u64());
             match rng.below(16) {
                 0 => {
@@ -167,12 +191,13 @@ mod tests {
                     }
                 }
                 1 if rng.one_in(64) => {
-                    let len = rng.index(model.len() + 1);
+                    let len = model.len() - rng.index(model.len().min(rows_per_step / 8) + 1);
                     column.truncate(len);
                     model.truncate(len);
                 }
                 2 => {
-                    let values: Vec<T> = (0..rng.index(300)).map(|_| of(rng.next_u64())).collect();
+                    let count = rng.index(rows_per_step / 64);
+                    let values: Vec<T> = (0..count).map(|_| of(rng.next_u64())).collect();
                     match column.extend_from_slice(&values) {
                         Ok(()) => model.extend_from_slice(&values),
                         Err(why) => {
@@ -191,11 +216,14 @@ mod tests {
                 },
             }
             assert_eq!(column.len(), model.len());
-            assert_eq!(&column[..], &model[..]);
+            if step % 97 == 0 {
+                assert_eq!(&column[..], &model[..], "at step {step}");
+            }
             let committed = column.committed();
             assert!(committed.is_multiple_of(STEP));
             assert!(committed >= model.len() * size_of::<T>());
         }
+        assert_eq!(&column[..], &model[..]);
         assert!(full > 0, "the column reached its limit");
         assert!(column.committed() >= 5 * STEP, "commits crossed several steps");
     }
@@ -222,6 +250,20 @@ mod tests {
         assert_eq!(column.committed(), 3 * STEP);
         let full = column.room(3 * STEP / 8).expect_err("past the limit");
         assert_eq!(full, format!("a column is full: it holds {} rows at most", 3 * STEP / 8));
+    }
+
+    /// Readying rows ahead commits them and changes no row; past the limit it readies up to it.
+    #[test]
+    fn rows_readied_ahead_are_committed_and_unchanged() {
+        let mut column = Column::<u64>::new("a column", STEP / 8 + 10).expect("reserved");
+        column.extend_from_slice(&[1, 2, 3]).expect("room");
+        column.truncate(1);
+        column.ahead(STEP / 8);
+        assert_eq!(column.committed(), 2 * STEP);
+        assert_eq!(&column[..], &[1]);
+        column.ahead(usize::MAX);
+        column.push(4).expect("room");
+        assert_eq!(&column[..], &[1, 4]);
     }
 
     /// Rows stay where they are as the column grows: growing never moves data.

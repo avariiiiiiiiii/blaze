@@ -54,7 +54,9 @@ use blaze_usercode::{
 };
 
 pub use puts::{Published, Put, publish, put, take_puts};
-use hir_expand::proc_macro::{ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind};
+use hir_expand::proc_macro::{
+    ExpansionReads, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, report_reads,
+};
 use paths::{AbsPath, AbsPathBuf};
 use proc_macro_api::{
     legacy_protocol::msg::{FlatTree, SpanDataIndexMap},
@@ -139,6 +141,9 @@ impl<'a> Seen<'a> {
 
 impl Inputs for Seen<'_> {
     type Error = inputs::Unreadable;
+    fn entry(&mut self, path: &std::path::Path) -> Result<blaze_usercode::trace::Entry, Self::Error> {
+        Now { files: Files::shared(), env: &self.none }.entry(path)
+    }
 
     fn file(&mut self, path: &std::path::Path) -> Result<Option<[u8; 32]>, Self::Error> {
         Now { files: Files::shared(), env: &self.none }.file(path)
@@ -172,12 +177,12 @@ pub fn checked(bytes: &[u8]) -> ContentId {
     ContentId::of("blaze v2 proc-macro checked expansion 1", bytes)
 }
 
-/// What the store has of a call.
+/// What the store has of a call, each with what its expansion read.
 enum Lookup {
     /// Its expansion, read back.
-    Read(tt::TopSubtree),
+    Read(tt::TopSubtree, ExpansionReads),
     /// The hash of its expansion's bytes, to compare a fresh one with ([`Mode::Check`]).
-    Hashed(ContentId),
+    Hashed(ContentId, ExpansionReads),
     Nothing,
 }
 
@@ -211,6 +216,26 @@ pub struct Keeping {
 /// Where expansions are kept: `None` before [`install`], as in a bench, which keeps nothing.
 pub fn keeping() -> Option<Keeping> {
     INSTALLED.get().map(|it| Keeping { expansions: &it.expansions, mode: it.mode })
+}
+
+/// The hash of the values the names of `shape` (an [`ExpansionReads::Traced`] shape) have
+/// now, for an expansion given the variables `env`: what `hir_def::deps` files a crate's
+/// image by. The same hash the expansion reported when its values were these.
+pub fn reads_now(env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+    reads_in(installed().expansions.environment.passed(), env, shape)
+}
+
+/// [`reads_now`] for a server passed `passed`.
+fn reads_in(passed: &[(String, String)], env: &Env, shape: &[u8]) -> Result<ContentId, String> {
+    let mut now = Seen { passed, call: env, made: None, none: inputs::Env::default() };
+    match index::values(shape, &mut now) {
+        Ok(Some(values)) => Ok(values),
+        // A directory that is no longer one: no value it had is this.
+        Ok(None) => Ok(ContentId::of("blaze v2 expansion reads gone", shape)),
+        Err(FindError::NotAShape { why, .. }) => Err(format!("a shape that does not read: {why}")), // alloc: error path
+        Err(FindError::Inputs(unreadable)) => Err(format!("{unreadable}")), // alloc: error path
+        Err(FindError::Corrupt(corrupt)) => Err(format!("{corrupt}")), // alloc: error path
+    }
 }
 
 fn wrap(
@@ -435,52 +460,49 @@ impl Kept {
         system(format!("{}: {why}", self.what())) // alloc: error path
     }
 
-    /// Expands by the macro's server or module, through the store.
-    #[allow(clippy::too_many_arguments)]
-    fn kept(
-        &self,
-        db: &Db,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
-    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    /// Expands by the macro's server or module, through the store, and reports what the
+    /// expansion read ([`report_reads`]) on every path that returns it.
+    fn kept(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         let installed = installed();
         let start = Instant::now();
-        let call = Call {
+        let keyed = Call {
             name: &self.name,
             kind: self.kind,
-            subtree,
-            attrs,
-            env,
-            def_site,
-            call_site,
-            mixed_site,
-            current_dir: &current_dir,
+            subtree: call.subtree,
+            attrs: call.attrs,
+            env: call.env,
+            def_site: call.def_site,
+            call_site: call.call_site,
+            mixed_site: call.mixed_site,
+            current_dir: call.current_dir,
         };
-        let (given, spans) = given(&installed.expansions.toolchain, &call);
+        let (given, spans) = given(&installed.expansions.toolchain, &keyed);
         let code = self.dylib.code().map_err(|why| self.error(why))?;
         let run = RunKey { code, given: given.finish() };
         // The files' table and this call's environment, made only if a shape read a variable:
         // no lock, and nothing here asks the database, so the store's guard is the one thing
-        // held across `find`.
+        // held across `find_reads`.
         let mut now = Seen {
             passed: installed.expansions.environment.passed(),
-            call: env,
+            call: call.env,
             made: None,
             none: inputs::Env::default(),
         };
         let found = {
             let guard = blaze_cas::enter();
-            match index::find(&installed.expansions.store, &guard, &run, &mut now) {
-                // Read in place, under the guard: a hit copies nothing out of the store.
-                Ok(Found::Hit { value, .. }) if installed.mode == Mode::Keep => {
-                    read(value, &spans).map(Lookup::Read).map_err(|why| self.error(why))
+            match index::find_reads(&installed.expansions.store, &guard, &run, &mut now) {
+                // Read in place, under the guard: a hit copies nothing out of the store but
+                // the shape it reports, which the calling crate's query owns.
+                Ok(Found::Hit { value, shape, values: Some(values), .. }) => {
+                    let reads = ExpansionReads::Traced { shape: shape.into(), values }; // alloc: what the query reporting it owns
+                    match installed.mode {
+                        Mode::Keep => read(value, &spans)
+                            .map(|output| Lookup::Read(output, reads))
+                            .map_err(|why| self.error(why)),
+                        Mode::Check => Ok(Lookup::Hashed(checked(value), reads)),
+                    }
                 }
-                Ok(Found::Hit { value, .. }) => Ok(Lookup::Hashed(checked(value))),
+                Ok(Found::Hit { values: None, .. }) => Err(self.error("the store's lookup found a hit without its values")),
                 Ok(Found::Miss { .. }) => Ok(Lookup::Nothing),
                 Err(FindError::Corrupt(corrupt)) => Err(self.error(corrupt)),
                 Err(FindError::NotAShape { key, why }) => {
@@ -491,17 +513,17 @@ impl Kept {
         }?;
         count(Counted::Keyed, start.elapsed());
         let found = match found {
-            Lookup::Read(output) => {
+            Lookup::Read(output, reads) => {
+                report_reads(reads);
                 count(Counted::Found, start.elapsed());
                 return Ok(output);
             }
-            Lookup::Hashed(hash) => Some(hash),
+            Lookup::Hashed(hash, reads) => Some((hash, reads)),
             Lookup::Nothing => None,
         };
         let asked = load_cargo::asked();
         let expand = Instant::now();
-        let expanded =
-            self.inner.expand(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir);
+        let expanded = self.inner.expand(db, call);
         let traced = warm::take_traced();
         count(Counted::Expanded, expand.elapsed());
         count(Counted::of(self.kind), expand.elapsed());
@@ -513,13 +535,14 @@ impl Kept {
             }
         };
         let bytes = written(&output, &spans);
-        if let Some(kept) = &found {
-            if bytes.as_deref().map(checked).as_ref() != Some(kept) {
+        if let Some((kept, reads)) = found {
+            if bytes.as_deref().map(checked) != Some(kept) {
                 return Err(self.error(format!( // alloc: error path
                     "{CACHE}=check: it expanded otherwise than the store kept it, under a key \
                      of every input it was traced to read"
                 )));
             }
+            report_reads(reads);
             count(Counted::Checked, Duration::ZERO);
             return Ok(output);
         }
@@ -528,6 +551,10 @@ impl Kept {
             Ok(None) => return Ok(output),
             Err(error) => return Err(error),
         };
+        report_reads(ExpansionReads::Traced {
+            shape: index::Shape::of(&traced).encode().into(), // alloc: once, as an expansion is kept
+            values: index::VALUES.traced(&traced),
+        });
         let Some(bytes) = bytes else {
             count(Counted::Unspanned, Duration::ZERO);
             return Ok(output);
@@ -543,27 +570,27 @@ impl Kept {
     }
 
     /// What the expansion read, when it can be kept by it: `None` when it can't be, counted
-    /// by why.
+    /// by why and reported as not known ([`ExpansionReads::Unknown`]).
     fn keepable(
         &self,
         traced: Option<Result<Traced, String>>,
         asked: u64,
     ) -> Result<Option<Traced>, ProcMacroExpansionError> {
+        let unknown = |counted: Counted, why: &'static str| {
+            count(counted, Duration::ZERO);
+            report_reads(ExpansionReads::Unknown(why));
+            Ok(None)
+        };
         let traced = match traced {
             Some(Ok(traced)) => traced,
             Some(Err(why)) => return Err(self.error(why)),
-            None => {
-                count(Counted::Untraced, Duration::ZERO);
-                return Ok(None);
-            }
+            None => return unknown(Counted::Untraced, "its server did not trace it"),
         };
         if load_cargo::asked() != asked {
-            count(Counted::Asked, Duration::ZERO);
-            return Ok(None);
+            return unknown(Counted::Asked, "it asked the database");
         }
         if index::untraceable(&traced) {
-            count(Counted::Untraceable, Duration::ZERO);
-            return Ok(None);
+            return unknown(Counted::Untraceable, "it read what can't be traced (the clock, a socket, a process)");
         }
         Ok(Some(traced))
     }
@@ -574,98 +601,37 @@ impl ProcMacroExpander for Kept {
         self.inner.requires_session()
     }
 
-    fn expand(
-        &self,
-        db: &Db,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
-    ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
+    /// An unreadable library gives `None`: its users get no image, and [`Kept::kept`] says
+    /// why.
+    fn code(&self) -> Option<ContentId> {
+        self.dylib.code().ok()
+    }
+
+    fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         if compare::comparing() {
-            let expanded = self.inner.expand(
-                db,
-                subtree,
-                attrs,
-                env,
-                def_site,
-                call_site,
-                mixed_site,
-                current_dir,
-            );
-            return self.failed(expanded);
+            return self.failed(self.inner.expand(db, call));
         }
         if compare::enabled() {
-            let expanded = self.inner.expand(
-                db,
-                subtree,
-                attrs,
-                env,
-                def_site,
-                call_site,
-                mixed_site,
-                current_dir.clone(), // clone: compare mode only, which expands the call twice
-            );
-            compare::again(
-                &self.dylib.path,
-                &self.name,
-                self.kind,
-                db,
-                subtree,
-                attrs,
-                env,
-                def_site,
-                call_site,
-                mixed_site,
-                &current_dir,
-                &expanded,
-            );
+            let expanded = self.inner.expand(db, call);
+            compare::again(&self.dylib.path, &self.name, self.kind, db, call, &expanded);
             return self.failed(expanded);
         }
-        self.kept(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir)
+        self.kept(db, call)
     }
 
     fn expand_in(
         &self,
         db: &Db,
         calling_crate: base_db::Crate,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
+        call: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         if !self.requires_session() {
-            return self.expand(
-                db,
-                subtree,
-                attrs,
-                env,
-                def_site,
-                call_site,
-                mixed_site,
-                current_dir,
-            );
+            return self.expand(db, call);
         }
         // A module that keeps state between calls keeps its sessions itself
         // (blaze-macro-wasm's `Verdict`): its output is a function of the calls before it.
         let start = Instant::now();
-        let expanded = self.inner.expand_in(
-            db,
-            calling_crate,
-            subtree,
-            attrs,
-            env,
-            def_site,
-            call_site,
-            mixed_site,
-            current_dir,
-        );
+        let expanded = self.inner.expand_in(db, calling_crate, call);
         count(Counted::Expanded, start.elapsed());
         count(Counted::of(self.kind), start.elapsed());
         if expanded.is_err() {
@@ -827,12 +793,63 @@ mod budget {
         let mut seen = Seen { passed: &passed, call: &call, made: None, none: inputs::Env::default() };
         let reader = store.reader();
         let guard = blaze_cas::enter();
+        let values = index::VALUES.traced(&traced);
         let mut find = || {
-            matches!(index::find(&reader, &guard, &run, &mut seen), Ok(Found::Hit { value: b"expansion", .. }))
+            matches!(
+                index::find_reads(&reader, &guard, &run, &mut seen),
+                Ok(Found::Hit { value: b"expansion", values: Some(found), .. }) if found == values
+            )
         };
         assert!(find());
         assert!(blaze_alloc_count::assert_at_most(0, "a kept expansion found through Seen", &mut find));
         drop(guard);
         _ = std::fs::remove_file(&lib);
+    }
+
+    /// What an expansion that read a file reports is what [`reads_in`] works out of its shape
+    /// while the file is as it was, found again on a hit, and not once the file has changed.
+    #[cfg(unix)]
+    #[test]
+    fn the_reads_an_expansion_reports_are_worked_out_again_until_a_file_changes() {
+        let mut sim = Sim::new(5, Faults::default());
+        let mut effects = Vec::new();
+        let config = Config { dir: FileName::new("store").unwrap(), layers: Vec::new(), tags: 1 << 48 };
+        let mut store = Store::open(config, &mut effects);
+        run_until_idle(&mut sim, &mut effects, |completion, effects| {
+            store.complete(completion, effects);
+        });
+        assert!(store.ready());
+        let read = std::env::temp_dir().join(format!("blaze-expand-reads-{}", std::process::id()));
+        std::fs::write(&read, b"included").unwrap();
+        let hash = inputs::hash_reader(b"included".as_slice()).unwrap();
+        let traced = Traced {
+            files: vec![(read.clone(), Some(hash))],
+            env: vec![("CARGO_PKG_NAME".into(), Some("a".into())), ("UNSET".into(), None)],
+            ..Traced::default()
+        };
+        let reported = index::VALUES.traced(&traced);
+        let shape = index::Shape::of(&traced).encode();
+        let call: Env = [("CARGO_PKG_NAME".to_owned(), "a".to_owned())].into_iter().collect();
+        assert_eq!(reads_in(&[], &call, &shape), Ok(reported));
+
+        let run = RunKey { code: ContentId::of("blaze v2 test 1", b"reads"), given: ContentId::default() };
+        index::keep(&mut store, &run, &traced, b"expansion".to_vec()).unwrap();
+        let reader = store.reader();
+        let guard = blaze_cas::enter();
+        let mut seen = Seen { passed: &[], call: &call, made: None, none: inputs::Env::default() };
+        match index::find_reads(&reader, &guard, &run, &mut seen) {
+            Ok(Found::Hit { shape: found, values, .. }) => {
+                assert_eq!(found, shape.as_slice());
+                assert_eq!(values, Some(reported));
+            }
+            other => panic!("{other:?}"),
+        }
+        drop(guard);
+
+        let other: Env = [("CARGO_PKG_NAME".to_owned(), "b".to_owned())].into_iter().collect();
+        assert_ne!(reads_in(&[], &other, &shape), Ok(reported));
+        std::fs::write(&read, b"included, and changed").unwrap();
+        assert_ne!(reads_in(&[], &call, &shape), Ok(reported));
+        _ = std::fs::remove_file(&read);
     }
 }

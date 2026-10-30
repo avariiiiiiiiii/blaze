@@ -51,7 +51,7 @@ use self::source_map::{
     PendingTemplate, SourceTable,
 };
 
-pub(crate) use self::source_map::Move;
+pub(crate) use self::source_map::{Move, MoveTo};
 
 pub use self::body::{Body, BodySourceMap};
 pub use self::lower::{
@@ -336,8 +336,7 @@ pub struct Lists {
     bounds: Vec<TypeBound>,
 }
 
-/// How high each list stack stood: [`ExpressionStoreBuilder::list_mark`]. Public because it is
-/// in the type of `ExprCollector::impl_trait_error_allocator`, which other crates pass.
+/// How high each list stack stood: [`ExpressionStoreBuilder::list_mark`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ListMark {
     exprs: u32,
@@ -794,6 +793,42 @@ impl ExpressionStoreBuilder {
         }
     }
 
+    /// The pooled tables, moved out and left empty: what `finish` reads and gives back, and what
+    /// a builder dropped unfinished gives back.
+    fn take_scratch(&mut self) -> Scratch {
+        Scratch {
+            columns: mem::take(&mut self.columns),
+            types: mem::take(&mut self.types),
+            lists: mem::take(&mut self.lists),
+            bindings: mem::take(&mut self.bindings),
+            labels: mem::take(&mut self.labels),
+            lifetimes: mem::take(&mut self.lifetimes),
+            binding_owners: mem::take(&mut self.binding_owners),
+            block_scopes: mem::take(&mut self.block_scopes),
+            ident_hygiene: mem::take(&mut self.ident_hygiene),
+            type_hygiene: mem::take(&mut self.type_hygiene),
+            block_editions: mem::take(&mut self.block_editions),
+            overflow_inheriting: mem::take(&mut self.overflow_inheriting),
+            expr_map: mem::take(&mut self.expr_map),
+            pat_map: mem::take(&mut self.pat_map),
+            label_map: mem::take(&mut self.label_map),
+            types_map: mem::take(&mut self.types_map),
+            lifetime_map: mem::take(&mut self.lifetime_map),
+            expansions: mem::take(&mut self.expansions),
+            macro_calls: mem::take(&mut self.macro_calls),
+            expr_map_back: mem::take(&mut self.expr_map_back),
+            pat_map_back: mem::take(&mut self.pat_map_back),
+            label_map_back: mem::take(&mut self.label_map_back),
+            types_map_back: mem::take(&mut self.types_map_back),
+            lifetime_map_back: mem::take(&mut self.lifetime_map_back),
+            binding_definitions: mem::take(&mut self.binding_definitions),
+            field_map_back: mem::take(&mut self.field_map_back),
+            pat_field_map_back: mem::take(&mut self.pat_field_map_back),
+            freeze: mem::take(&mut self.freeze),
+            packing: mem::take(&mut self.packing),
+        }
+    }
+
     /// Lowers without recording the source map (see `record`).
     pub(crate) fn skip_source_map(&mut self) {
         self.record = false;
@@ -1054,75 +1089,13 @@ impl ExpressionStoreBuilder {
     /// scratch at its exact length, the store's `Copy` columns into slabs, the scratch given
     /// back to this thread's pool. The gathering and sorting run in the pooled scratch too, so
     /// the copies are the only allocations.
-    pub fn finish(self) -> (ExpressionStore, ExpressionStoreSourceMap) {
-        let Self {
-            block_scopes,
-            columns,
-            types,
-            lists,
-            labels,
-            bindings,
-            binding_owners,
-            ident_hygiene,
-            type_hygiene,
-            block_editions,
-            overflow_inheriting,
-            inference_roots: mut expr_roots,
-            lifetimes,
-
-            expr_map,
-            expr_map_back,
-            pat_map,
-            pat_map_back,
-            label_map,
-            label_map_back,
-            types_map_back,
-            types_map,
-            lifetime_map_back,
-            lifetime_map,
-            binding_definitions,
-            field_map_back,
-            pat_field_map_back,
-            template_map,
-            expansions,
-            macro_calls,
-            diagnostics,
-            freeze,
-            packing,
-            record,
-        } = self;
-        debug_assert_eq!(lists.stacked(), None, "lowering left a list on this stack");
-        let mut scratch = Scratch {
-            columns,
-            types,
-            lists,
-            bindings,
-            labels,
-            lifetimes,
-            binding_owners,
-            block_scopes,
-            ident_hygiene,
-            type_hygiene,
-            block_editions,
-            overflow_inheriting,
-            expr_map,
-            pat_map,
-            label_map,
-            types_map,
-            lifetime_map,
-            expansions,
-            macro_calls,
-            expr_map_back,
-            pat_map_back,
-            label_map_back,
-            types_map_back,
-            lifetime_map_back,
-            binding_definitions,
-            field_map_back,
-            pat_field_map_back,
-            freeze,
-            packing,
-        };
+    pub fn finish(mut self) -> (ExpressionStore, ExpressionStoreSourceMap) {
+        debug_assert_eq!(self.lists.stacked(), None, "lowering left a list on this stack");
+        let mut expr_roots = self.inference_roots.take();
+        let template_map = self.template_map.take();
+        let diagnostics = mem::take(&mut self.diagnostics);
+        let record = self.record;
+        let mut scratch = self.take_scratch();
         let columns = scratch.columns.freeze_into();
         let types = scratch.types.freeze_into();
         let has_exprs =
@@ -1142,6 +1115,7 @@ impl ExpressionStoreBuilder {
                 let binding_definitions = BindingPats::from_pushed(
                     &mut scratch.binding_definitions,
                     scratch.bindings.len(),
+                    &mut freeze.cursors,
                 );
                 let sort = &mut freeze.sort;
                 let expr_map = SourceTable::from_pushed_in(&mut scratch.expr_map, &mut sort.exprs);
@@ -1275,6 +1249,18 @@ impl ExpressionStoreBuilder {
         let macro_calls = ThinVec::from_iter(scratch.macro_calls.iter().copied());
         scratch.give();
         (ExpressionStore { expr_only, types, lifetimes, type_hygiene, macro_calls }, source_map)
+    }
+}
+
+impl Drop for ExpressionStoreBuilder {
+    /// A builder dropped without [`ExpressionStoreBuilder::finish`] (a path lowered only to be
+    /// resolved) gives its scratch back too. After `finish` nothing is left, and an empty set is
+    /// not pooled, where it would shadow a grown one.
+    fn drop(&mut self) {
+        let scratch = self.take_scratch();
+        if scratch.capacity() != 0 {
+            scratch.give();
+        }
     }
 }
 
@@ -1435,6 +1421,12 @@ impl ExpressionStore {
             .unwrap_or_default()
             .iter()
             .map(move |&block| (block, block_def_map(db, block)))
+    }
+
+    /// The blocks this store's lowering made, in the order it made them: what lowering it again
+    /// for its source map is given ([`lower::BodyLowering::SourceMap`]).
+    pub(crate) fn block_scopes(&self) -> &[BlockId] {
+        self.expr_only.as_ref().map_or(&[][..], |it| &*it.block_scopes)
     }
 
     pub fn walk_bindings_in_pat(&self, pat_id: PatId, mut f: impl FnMut(BindingId)) {
@@ -2171,6 +2163,23 @@ mod scratch_tests {
         assert_eq!(store.kinds_present(), lowered.into_iter().map(bit).fold(0, |a, b| a | b));
         assert!(!store.has_closures());
         assert_eq!(ExpressionStore::empty().kinds_present(), 0, "no expressions, no kinds");
+    }
+
+    /// A builder dropped without `finish` (a path lowered only to be resolved) gives its
+    /// scratch back emptied, and a finished one gives nothing more when it is dropped.
+    #[test]
+    fn an_unfinished_builder_gives_its_scratch_back() {
+        empty_pool();
+        let mut builder = ExpressionStoreBuilder::new();
+        lower_every_table(&mut builder, 10);
+        let at = builder.columns.expr_kind.as_ptr();
+        drop(builder);
+        assert_eq!(pooled(), 1, "the dropped builder's scratch is pooled");
+        let next = ExpressionStoreBuilder::new();
+        assert_eq!(next.columns.expr_kind.as_ptr(), at, "and taken by the next builder");
+        assert!(next.columns.is_empty() && next.bindings.is_empty(), "given back emptied");
+        drop(next.finish());
+        assert_eq!(pooled(), 1, "a finished builder is pooled once");
     }
 
     #[test]

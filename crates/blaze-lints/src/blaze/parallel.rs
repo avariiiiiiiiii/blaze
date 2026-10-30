@@ -28,8 +28,11 @@ use hir_ty::{
     next_solver::{GenericArgs, Ty, TyKind},
     traits::implements_trait_unique,
 };
-use rustc_type_ir::inherent::IntoKind as _;
-use syntax::{NodeOrToken, TextRange, TextSize};
+use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
+use syntax::{
+    NodeOrToken, TextRange, TextSize,
+    view::{self as ast, AstNode as _, HasAttrs as _},
+};
 
 use self::{
     deps::{Dependence, Found, Mir, Reduced, Reduction, Verdict},
@@ -120,7 +123,7 @@ fn find(cx: &Cx<'_, '_>, on_parallel: bool, on_serial: bool) -> Vec<Finding> {
     let conf = cx.conf();
     let body = Body {
         cx,
-        m: Mir::new(db, env, mir, hir, &std),
+        m: Mir::new(db, env, mir, hir, &std, reassociate(cx)),
         analysis,
         threshold: conf.int("parallel-threshold", THRESHOLD).max(0) as u64,
         assumed: conf.int("parallel-assumed-trips", ASSUMED_TRIPS).max(1) as u64,
@@ -145,6 +148,15 @@ fn find(cx: &Cx<'_, '_>, on_parallel: bool, on_serial: bool) -> Vec<Finding> {
         }
     }
     found
+}
+
+/// Whether the item linted is `#[blaze::reassociate]`, blaze's own attribute that lets its
+/// float reductions be computed in any order (and so round differently).
+fn reassociate(cx: &Cx<'_, '_>) -> bool {
+    ast::AnyHasAttrs::cast(cx.root()).is_some_and(|item| {
+        item.attrs()
+            .any(|attr| attr.path().is_some_and(|path| path.syntax().text() == "blaze::reassociate"))
+    })
 }
 
 /// What a closure of a chain does, as the chain's iterations see it.
@@ -203,6 +215,17 @@ impl<'db> Body<'_, '_, 'db> {
         })
     }
 
+    /// Whether the items of the iterator `ty` may move to the thread that consumes them.
+    fn items_send(&self, ty: Ty<'db>) -> bool {
+        let (Some(iterator), Some(send)) = (self.m.std.iterator, self.m.std.send) else {
+            return false;
+        };
+        let Some(item) = self.cx.assoc_ty(&self.analysis.ty(ty), iterator.into(), "Item") else {
+            return false;
+        };
+        item.impls_trait(self.db(), send.into(), &[])
+    }
+
     /// Whether a `Map` closure's result points only into its item or into new memory.
     fn returns_item(&self, ty: Ty<'db>) -> bool {
         let (db, env) = (self.db(), self.m.env);
@@ -231,7 +254,7 @@ impl<'db> Body<'_, '_, 'db> {
                 Closure::Independent { cost, writes_item: false } => work += cost,
                 Closure::Independent { writes_item: true, .. } => return None,
                 Closure::Captures => {
-                    return Some(Err(Dependence::Carried { name: "a closure's capture".to_owned() }));
+                    return Some(Err(Dependence::Carried { name: "an adaptor's closure".to_owned() }));
                 }
             }
         }
@@ -255,7 +278,11 @@ impl<'db> Body<'_, '_, 'db> {
 
     /// The text of the chain starting at `head` with its source made parallel, and the range
     /// and new name of the source's method, when it has one.
-    fn parallel_head(&self, head_expr: hir_def::hir::ExprId, head: &Head) -> Option<(String, Option<(TextRange, &'static str)>)> {
+    fn parallel_head(
+        &self,
+        head_expr: hir_def::hir::ExprId,
+        head: &Head,
+    ) -> Option<(String, Option<(TextRange, &'static str)>)> {
         let head_range = self.range(head_expr)?;
         let text = self.cx.snippet(head_range);
         if let Some((call, name)) = head.call {
@@ -300,7 +327,7 @@ impl<'db> Body<'_, '_, 'db> {
     }
 
     /// The note that says how much work the loop does, and the trip count's source.
-    fn work_note(&self, work: u64, trips: Option<u128>) -> Option<(String, u64)> {
+    fn work_note(&self, work: u64, trips: Option<u128>) -> Option<String> {
         let (count, known) = match trips {
             Some(it) => (u64::try_from(it).unwrap_or(u64::MAX), true),
             None => (self.assumed, false),
@@ -313,13 +340,10 @@ impl<'db> Body<'_, '_, 'db> {
             true => format!("{count} iterations"),
             false => format!("{count} iterations (not known; `parallel-assumed-trips`)"),
         };
-        Some((
-            format!(
-                "each iteration runs about {work} MIR statements, over {trips}: {total}, past \
-                 `parallel-threshold` ({})",
-                self.threshold
-            ),
-            total,
+        Some(format!(
+            "each iteration runs about {work} MIR statements, over {trips}: {total}, past \
+             `parallel-threshold` ({})",
+            self.threshold
         ))
     }
 
@@ -333,6 +357,12 @@ impl<'db> Body<'_, '_, 'db> {
             if reduced.overflow {
                 note.push_str(
                     "; with overflow checks on, which iteration overflows, if one does, may differ",
+                );
+            }
+            if reduced.float {
+                note.push_str(
+                    "; it is of floats, which round differently in another order, and qualifies \
+                     only because the function is `#[blaze::reassociate]`",
                 );
             }
             notes.push(note);
@@ -349,7 +379,7 @@ impl<'db> Body<'_, '_, 'db> {
     }
 
     fn for_loop(&self, lp: &deps::Loop) -> Option<Finding> {
-        let iter_ty = self.m.mir.locals[lp_iter(lp, self.m.mir)?].ty.as_ref();
+        let iter_ty = self.m.mir.locals[lp.iter].ty.as_ref();
         let chain = Chain::of(self.m.std, iter_ty)?;
         let closures = self.closures(&chain)?;
         let head = Head::of(self.db(), self.analysis.body(), self.analysis.infer(), lp.head);
@@ -364,7 +394,7 @@ impl<'db> Body<'_, '_, 'db> {
         let (parallel_head, _) = self.parallel_head(lp.head, &head)?;
         match verdict {
             Verdict::Parallel(found) => {
-                let (work, _) = self.work_note(found.work, head.trips)?;
+                let work = self.work_note(found.work, head.trips)?;
                 let mut notes = vec![work];
                 self.found_notes(&found, &mut notes);
                 let mut helps = Vec::new();
@@ -374,9 +404,16 @@ impl<'db> Body<'_, '_, 'db> {
                     _ => ".fold(..).reduce(..) for the reductions".to_owned(),
                 };
                 helps.push(format!("run the iterations with rayon: `{parallel_head}{consumer}`"));
+                if let Some(first) = found.indexed.first() {
+                    helps.push(format!(
+                        "rayon's closures may not write what they capture: reach `{first}`'s \
+                         elements through `{first}.par_iter_mut().enumerate()` (or `.zip`) \
+                         instead of by index"
+                    ));
+                }
                 self.pool_help(&mut helps);
-                let suggestion = match found.reductions.is_empty() && !found.may_panic {
-                    true => self.for_each_rewrite(lp, &parallel_head),
+                let suggestion = match found.reductions.is_empty() && found.indexed.is_empty() {
+                    true => self.for_each_rewrite(lp, &parallel_head, found.may_panic),
                     false => None,
                 };
                 Some(Finding {
@@ -390,7 +427,7 @@ impl<'db> Body<'_, '_, 'db> {
                 })
             }
             Verdict::Serial(found, dependence) => {
-                let (work, _) = self.work_note(found.work, head.trips)?;
+                let work = self.work_note(found.work, head.trips)?;
                 Some(Finding {
                     lint: Lint::SerialDependence,
                     range,
@@ -426,13 +463,6 @@ impl<'db> Body<'_, '_, 'db> {
                     .to_owned(),
             );
         }
-        if self.m.reassociate
-            && found.reductions.iter().any(|it| it.reduction != Reduction::Insert && !it.overflow)
-        {
-            notes.push(
-                "`#[blaze::reassociate]` lets blaze reorder the float reductions".to_owned(),
-            );
-        }
     }
 
     /// `for pat in head { body }` as `head.par_iter().for_each(|pat| { body });`, when the
@@ -441,6 +471,7 @@ impl<'db> Body<'_, '_, 'db> {
         &self,
         lp: &deps::Loop,
         parallel_head: &str,
+        may_panic: bool,
     ) -> Option<(TextRange, String, String, Applicability)> {
         let range = self.range(lp.expr)?;
         let head = self.range(lp.head)?;
@@ -457,7 +488,7 @@ impl<'db> Body<'_, '_, 'db> {
         let before_head = usize::from(head.start().checked_sub(range.start())?);
         let pat = text.get(..before_head)?.strip_prefix("for")?.trim().strip_suffix("in")?.trim();
         let code = format!("{parallel_head}.for_each(|{pat}| {});", self.cx.snippet(body));
-        let applicability = match self.rayon {
+        let applicability = match self.rayon && !may_panic {
             true => Applicability::MachineApplicable,
             false => Applicability::MaybeIncorrect,
         };
@@ -484,12 +515,16 @@ impl<'db> Body<'_, '_, 'db> {
         if Some(trait_) != std.iterator {
             return None;
         }
-        let chain = Chain::of(std, infer.expr_ty(receiver))?;
+        let receiver_ty = infer.expr_ty(receiver);
+        let chain = Chain::of(std, receiver_ty)?;
+        if !self.items_send(receiver_ty) {
+            return None;
+        }
         let mut work = match self.closures(&chain)? {
             Ok(it) => it,
             Err(dependence) => return self.serial_chain(id, receiver, dependence, chain.overhead()),
         };
-        let item = infer.expr_ty(id);
+        let output = infer.expr_ty(id);
         let mut reduction = None;
         let mut writes_item = false;
         match method {
@@ -501,9 +536,7 @@ impl<'db> Body<'_, '_, 'db> {
                         writes_item = writes;
                     }
                     Closure::Captures => {
-                        let dependence = Dependence::Carried {
-                            name: format!("the closure `{method}` calls"),
-                        };
+                        let dependence = Dependence::Carried { name: format!(".{method}(..)") };
                         return self.serial_chain(id, receiver, dependence, work);
                     }
                 }
@@ -516,14 +549,12 @@ impl<'db> Body<'_, '_, 'db> {
                     _ => Reduction::Max,
                 };
                 let result = match method {
-                    "min" | "max" => item.as_adt().and_then(|(_, args)| {
-                        rustc_type_ir::inherent::GenericArgs::types(args).next()
-                    })?,
-                    _ => item,
+                    "min" | "max" => output.as_adt().and_then(|(_, args)| args.types().next())?,
+                    _ => output,
                 };
                 if matches!(result.kind(), TyKind::Float(_)) && !self.m.reassociate {
                     let dependence =
-                        Dependence::Float { name: format!("`.{method}()`'s result"), reduction: it };
+                        Dependence::Float { name: format!(".{method}()"), reduction: it };
                     return self.serial_chain(id, receiver, dependence, work);
                 }
                 if !matches!(result.kind(), TyKind::Int(_) | TyKind::Uint(_) | TyKind::Float(_)) {
@@ -532,10 +563,10 @@ impl<'db> Body<'_, '_, 'db> {
                 reduction = Some(it);
             }
             "collect" => {
-                let (adt, _) = item.as_adt()?;
+                let (adt, _) = output.as_adt()?;
                 let is = |it: Option<hir_def::AdtId>| it == Some(adt);
                 if is(std.hash_set) || is(std.hash_map) {
-                    let dependence = Dependence::HashOrder { name: "the collected set".to_owned() };
+                    let dependence = Dependence::HashOrder { name: ".collect()".to_owned() };
                     return self.serial_chain(id, receiver, dependence, work);
                 }
                 if !(is(std.vec) || is(std.string) || is(std.btree_set) || is(std.btree_map)) {
@@ -548,7 +579,7 @@ impl<'db> Body<'_, '_, 'db> {
             return None;
         }
         let head = Head::of(db, self.analysis.body(), infer, receiver);
-        let (work_note, _) = self.work_note(work, head.trips)?;
+        let work_note = self.work_note(work, head.trips)?;
         let range = self.range(id)?;
         let mut notes = vec![work_note];
         notes.push(
@@ -600,7 +631,7 @@ impl<'db> Body<'_, '_, 'db> {
         work: u64,
     ) -> Option<Finding> {
         let head = Head::of(self.db(), self.analysis.body(), self.analysis.infer(), receiver);
-        let (work_note, _) = self.work_note(work, head.trips)?;
+        let work_note = self.work_note(work, head.trips)?;
         Some(Finding {
             lint: Lint::SerialDependence,
             range: self.range(id)?,
@@ -613,9 +644,4 @@ impl<'db> Body<'_, '_, 'db> {
             suggestion: None,
         })
     }
-}
-
-/// The iterator local of `lp`.
-fn lp_iter(lp: &deps::Loop, _mir: &hir_ty::mir::MirBody<'_>) -> Option<hir_ty::mir::LocalId> {
-    Some(lp.iter())
 }

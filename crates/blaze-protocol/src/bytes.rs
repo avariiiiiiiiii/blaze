@@ -23,6 +23,27 @@ pub fn deserialize<'de, D: Deserializer<'de>>(from: D) -> Result<Vec<u8>, D::Err
     from.deserialize_byte_buf(Owned { array })
 }
 
+/// A `&[u8]` field read where it lies, from one byte string only, as [`deserialize`] reads it
+/// from a reader that is not human-readable (serde's own `&[u8]` takes text too):
+/// `#[serde(deserialize_with = "blaze_protocol::bytes::borrow")]`.
+pub fn borrow<'de, D: Deserializer<'de>>(from: D) -> Result<&'de [u8], D::Error> {
+    from.deserialize_bytes(Lent)
+}
+
+struct Lent;
+
+impl<'de> Visitor<'de> for Lent {
+    type Value = &'de [u8];
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a byte string, read where it lies")
+    }
+
+    fn visit_borrowed_bytes<E: de::Error>(self, bytes: &'de [u8]) -> Result<&'de [u8], E> {
+        Ok(bytes)
+    }
+}
+
 /// Bytes lent to a serializer as one byte string, for a place `with` can't name (a tuple's
 /// field, a list's item).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

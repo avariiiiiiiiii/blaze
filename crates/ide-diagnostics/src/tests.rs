@@ -306,6 +306,40 @@ fn test_disabled_diagnostics() {
 }
 
 #[test]
+fn of_bodies_asks_the_filter_of_each_body() {
+    let text = "fn asked() { let _x: u8 = \"\"; }\nfn skipped() { let _y: u8 = \"\"; }\n";
+    let (db, file_id) = RootDatabase::with_single_file(text);
+    let file_id = file_id.file_id(&db);
+    let seen = std::cell::RefCell::new(Vec::new());
+    let diagnostics = hir::attach_db(&db, || {
+        super::semantic_diagnostics_of_bodies(
+            &db,
+            &DiagnosticsConfig::test_sample(),
+            &AssistResolveStrategy::None,
+            file_id,
+            None,
+            &|body: hir::DefWithBody| {
+                let name = body.name(&db).map(|it| it.as_str().to_owned());
+                seen.borrow_mut().push(name.clone());
+                name.as_deref() == Some("asked")
+            },
+        )
+    });
+    let mut seen = seen.into_inner();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen, [Some("asked".to_owned()), Some("skipped".to_owned())]);
+    let skipped_at = text.find("fn skipped").unwrap();
+    let mismatches: Vec<_> = diagnostics
+        .iter()
+        .filter(|it| it.code.as_str() == "E0308")
+        .map(|it| it.range.range)
+        .collect();
+    assert_eq!(mismatches.len(), 1, "{diagnostics:?}");
+    assert!(usize::from(mismatches[0].start()) < skipped_at, "{mismatches:?}");
+}
+
+#[test]
 fn minicore_smoke_test() {
     if test_utils::skip_slow_tests() {
         return;

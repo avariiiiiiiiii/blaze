@@ -52,7 +52,7 @@ impl Inputs for Now {
         Ok(None)
     }
 
-    fn env(&mut self, _: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    fn env(&mut self, _: &std::ffi::OsStr) -> Option<&std::ffi::OsStr> {
         None
     }
 
@@ -60,8 +60,12 @@ impl Inputs for Now {
         &[]
     }
 
-    fn names(&mut self, _: &std::path::Path) -> Result<Option<Vec<(std::ffi::OsString, bool)>>, String> {
-        Ok(None)
+    fn names(&mut self, _: &std::path::Path, _: &mut blaze_usercode::trace::Names<'_>) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn entry(&mut self, _: &std::path::Path) -> Result<blaze_usercode::trace::Entry, String> {
+        Ok(blaze_usercode::trace::Entry::Missing)
     }
 }
 

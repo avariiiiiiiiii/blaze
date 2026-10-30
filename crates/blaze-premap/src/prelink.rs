@@ -223,7 +223,7 @@ pub fn output(dev: &Output, key_name: &str) -> Output {
 }
 
 /// The image of `request`, through `linker`, checked and encoded under `key`.
-pub fn build(linker: &dyn Prelink, request: &Request<'_>, key: ImageKey) -> Result<Vec<u8>, PremapError> {
+pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Result<Vec<u8>, PremapError> {
     if request.output.incremental || request.output.live.is_some() {
         return Err(PremapError::new("a dependency image is linked whole: its output is neither incremental nor live".to_owned()));
     }

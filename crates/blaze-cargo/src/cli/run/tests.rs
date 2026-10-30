@@ -1,6 +1,6 @@
 use std::{ffi::OsString, path::Path};
 
-use blaze_api::{Artifact, UnitProfile, UnitTarget};
+use blaze_api::{Artifact, ArtifactKind, CrateType, TargetKind, UnitProfile, UnitTarget};
 use blaze_ids::ContentId;
 
 use super::*;
@@ -19,8 +19,8 @@ pub(crate) fn artifact(package: &str, kind: &str, name: &str, test: bool, exe: O
         _ => format!("/w/{package}/src/lib.rs"),
     };
     let target = UnitTarget {
-        kind: vec![kind.to_owned()],
-        crate_types: vec![if kind == "lib" { "lib" } else { "bin" }.to_owned()],
+        kind: TargetKind::named(kind).unwrap(),
+        crate_types: vec![if kind == "lib" { CrateType::Lib } else { CrateType::Bin }],
         name: name.to_owned(),
         src_path,
         edition: "2024".to_owned(),
@@ -31,7 +31,7 @@ pub(crate) fn artifact(package: &str, kind: &str, name: &str, test: bool, exe: O
     let path = exe.map_or_else(|| format!("/w/target/debug/lib{name}.rlib"), |it| format!("/w/target/debug/{it}"));
     Artifact {
         package: format!("path+file:///w/{package}#0.1.0"),
-        kind: if test { "test".to_owned() } else { kind.to_owned() },
+        kind: if test { ArtifactKind::Test } else { ArtifactKind::named(kind).unwrap() },
         path: path.clone(),
         content: ContentId([0; 32]),
         manifest_path: format!("/w/{package}/Cargo.toml"),
@@ -89,7 +89,8 @@ fn two_bins_are_cargos_error() {
     );
     assert_eq!(
         pick(&built, &flags(&[Some("foo"), Some("bar")], &[])).unwrap_err(),
-        "`cargo run` can run at most one executable, but multiple were specified"
+        "`cargo run` can run at most one executable, but multiple were specified\nhelp: available targets:\n    \
+         bin `foo` in package `foo`\n    bin `bar` in package `foo`"
     );
 }
 
@@ -125,6 +126,23 @@ fn the_program_as_cargo_shows_and_runs_it() {
     let runner = Artifact { runner: vec!["qemu-aarch64".to_owned(), "-L".to_owned(), "/sysroot".to_owned()], ..foo };
     let exec = planned(&runner, &args, Path::new("/w")).unwrap();
     assert_eq!(exec.shown(), "`qemu-aarch64 -L /sysroot target/debug/foo a 'b c'`");
+}
+
+#[cfg(unix)]
+#[test]
+fn extra_verbose_shows_the_variables() {
+    let foo = artifact("foo", "bin", "foo", false, Some("foo"));
+    let exec = planned(&foo, &[OsString::from("a")], Path::new("/w")).unwrap();
+    assert_eq!(exec.shown_at(1), "`target/debug/foo a`");
+    assert_eq!(exec.shown_at(2), "`CARGO_PKG_NAME=foo target/debug/foo a`");
+}
+
+#[test]
+fn a_cause_of_lines_indented_as_cargos_indented_lines() {
+    assert_eq!(
+        caused("test failed", &["first\n\nlast".to_owned()], false),
+        "error: test failed\n\nCaused by:\n  first\n\n  last\n"
+    );
 }
 
 #[test]

@@ -91,7 +91,7 @@ use crate::{
 
 /// A rule's pattern, flattened once when the macro is defined. Every list is indexed by `u32`;
 /// the leaves a location compares with sit in side tables by kind.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Matcher {
     locs: Box<[Loc]>,
     reps: Box<[Rep]>,
@@ -1196,8 +1196,8 @@ fn match_meta_var<'t>(
         }
         MetaVarKind::Pat => (parser::PrefixEntryPoint::PatTop, TokensOrigin::Ast),
         MetaVarKind::PatParam => (parser::PrefixEntryPoint::Pat, TokensOrigin::Ast),
-        MetaVarKind::Stmt => (parser::PrefixEntryPoint::Stmt, TokensOrigin::Ast),
-        MetaVarKind::Block => (parser::PrefixEntryPoint::Block, TokensOrigin::Ast),
+        MetaVarKind::Stmt => (parser::PrefixEntryPoint::Stmt, TokensOrigin::Grouped),
+        MetaVarKind::Block => (parser::PrefixEntryPoint::Block, TokensOrigin::Grouped),
         MetaVarKind::Meta => (parser::PrefixEntryPoint::MetaItem, TokensOrigin::Ast),
         MetaVarKind::Item => (parser::PrefixEntryPoint::Item, TokensOrigin::Ast),
         MetaVarKind::Vis => (parser::PrefixEntryPoint::Vis, TokensOrigin::Ast),

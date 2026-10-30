@@ -21,6 +21,7 @@ visitor impls are gone from `crates/hir-ty/src/next_solver/interner.rs`. Nothing
 it is applied, `hir` does not compile.
 
 > forwarded to db: `crates/hir/` is lane db's.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree: `rg collect_ty_garbage crates` finds nothing.
 
 ## 2. Lane db: interner-free constructors in `vendor/rustc_type_ir`
 
@@ -114,6 +115,7 @@ lane db wants arguments tested in one read, the change is `type GenericArgs: .. 
 intern `GenericArgs` with `intern_with`, as `Clauses` is.
 
 > forwarded to db: `vendor/rustc_type_ir` is lane db's.
+> not applied by db-audit-dbsub-tysmall (22:33): optional, and it asks no change today (`type GenericArgs: GenericArgs<Self>` at `vendor/rustc_type_ir/src/interner.rs:115`, no `Flags`). `vendor/` is solver-sync's for the nightly-2026-10-27 rebase and lane db has stopped editing it; the ask is filed there (`v2/requests/solver-sync-inbox.md`, "Open, optional: `GenericArgs: Flags`"), unanswered, theirs to take into the series or leave.
 
 ## 4. Safety lane and db-ty-solver: remove `unsafe impl Send/Sync for DbInterner`
 

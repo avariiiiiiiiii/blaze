@@ -10,10 +10,12 @@
 
 #![forbid(unsafe_code)]
 
-use std::cell::RefCell;
+use std::{cell::RefCell, sync::Arc};
 
 use cranelift_codegen::{Context, ir};
 use cranelift_frontend::FunctionBuilderContext;
+
+use crate::{Layout, debuginfo::LineRow, fragment::Relocs};
 
 /// The most of each kind a thread keeps: deeper than this a nested build makes its own.
 const KEPT: usize = 4;
@@ -22,9 +24,24 @@ const KEPT: usize = 4;
 /// it grew to would be held by the thread for good.
 const LARGEST: usize = super::SINGLE_PASS;
 
+/// A kept list of relocations or line rows with room for more than this is let go rather than
+/// kept, as a context of more than [`LARGEST`] instructions is.
+const LARGEST_ROWS: usize = 1 << 16;
+
+/// The lists of layouts a build asked for and of variants' layouts it made (`KeptLayouts`).
+type LayoutLists = (Vec<Arc<Layout>>, Vec<Box<Layout>>);
+
 thread_local! {
     static CONTEXTS: RefCell<Vec<Context>> = const { RefCell::new(Vec::new()) };
     static BUILDERS: RefCell<Vec<FunctionBuilderContext>> = const { RefCell::new(Vec::new()) };
+    // alloc: none, an empty shelf
+    static RELOCS: RefCell<Vec<Relocs>> = const { RefCell::new(Vec::new()) };
+    // alloc: none, an empty shelf
+    static LINES: RefCell<Vec<Vec<LineRow>>> = const { RefCell::new(Vec::new()) };
+    // alloc: none, an empty shelf
+    static LAYOUT_LISTS: RefCell<Vec<LayoutLists>> = const { RefCell::new(Vec::new()) };
+    // alloc: none, an empty shelf
+    static COPIES: RefCell<Vec<Vec<(intern::Symbol, u64)>>> = const { RefCell::new(Vec::new()) };
 }
 
 /// A cleared context: one the thread kept, or a new one.
@@ -56,6 +73,80 @@ pub(super) fn keep_builder(builder: FunctionBuilderContext) {
     BUILDERS.with_borrow_mut(|kept| {
         if kept.len() < KEPT {
             kept.push(builder);
+        }
+    });
+}
+
+/// An empty list of relocations: one the thread kept, or a new one. v2's emit writes a
+/// function's into it ([`super::emit_lent`]) and its conversion gives it back.
+pub(super) fn relocs() -> Relocs {
+    RELOCS.with_borrow_mut(Vec::pop).unwrap_or_default()
+}
+
+/// Keeps `relocs` for the thread's next function, emptied.
+pub(super) fn keep_relocs(mut relocs: Relocs) {
+    if relocs.capacity() > LARGEST_ROWS {
+        return;
+    }
+    relocs.clear();
+    RELOCS.with_borrow_mut(|kept| {
+        if kept.len() < KEPT {
+            kept.push(relocs);
+        }
+    });
+}
+
+/// An empty list of line rows: one the thread kept, or a new one, as [`relocs`].
+pub(super) fn lines() -> Vec<LineRow> {
+    LINES.with_borrow_mut(Vec::pop).unwrap_or_default()
+}
+
+/// Keeps `lines` for the thread's next function, emptied.
+pub(super) fn keep_lines(mut lines: Vec<LineRow>) {
+    if lines.capacity() > LARGEST_ROWS {
+        return;
+    }
+    lines.clear();
+    LINES.with_borrow_mut(|kept| {
+        if kept.len() < KEPT {
+            kept.push(lines);
+        }
+    });
+}
+
+/// Lends `f` an empty list for [`SymbolResolver::copies`](super::SymbolResolver::copies): one
+/// the thread kept, or a new one, kept again after.
+pub(super) fn with_copies<R>(f: impl FnOnce(&mut Vec<(intern::Symbol, u64)>) -> R) -> R {
+    let mut copies = COPIES.with_borrow_mut(Vec::pop).unwrap_or_default();
+    copies.clear();
+    let result = f(&mut copies);
+    if copies.capacity() <= LARGEST_ROWS {
+        copies.clear();
+        COPIES.with_borrow_mut(|kept| {
+            if kept.len() < KEPT {
+                kept.push(copies);
+            }
+        });
+    }
+    result
+}
+
+/// Empty lists for a build's layouts (`KeptLayouts`): ones the thread kept, or new ones.
+pub(super) fn layout_lists() -> LayoutLists {
+    LAYOUT_LISTS.with_borrow_mut(Vec::pop).unwrap_or_default()
+}
+
+/// Keeps a build's lists of layouts for the thread's next build, emptied. Emptying them drops
+/// the layouts, so a kept list holds no `Arc` of salsa's past its build.
+pub(super) fn keep_layout_lists(mut asked: Vec<Arc<Layout>>, mut variants: Vec<Box<Layout>>) {
+    asked.clear();
+    variants.clear();
+    if asked.capacity().max(variants.capacity()) > LARGEST_ROWS {
+        return;
+    }
+    LAYOUT_LISTS.with_borrow_mut(|kept| {
+        if kept.len() < KEPT {
+            kept.push((asked, variants));
         }
     });
 }
@@ -133,6 +224,83 @@ mod tests {
         }
         assert_eq!(CONTEXTS.with_borrow(Vec::len), KEPT);
         assert_eq!(BUILDERS.with_borrow(Vec::len), KEPT);
+    }
+
+    /// A kept list comes back empty with its room, and filling it again to what it held takes
+    /// nothing of the global allocator.
+    #[test]
+    fn a_kept_list_of_rows_is_reused_whole() {
+        use crate::fragment::{Reloc, RelocName};
+        LINES.with_borrow_mut(Vec::clear);
+        RELOCS.with_borrow_mut(Vec::clear);
+        let row = |at: u32| Reloc {
+            offset: at,
+            kind: cranelift_codegen::binemit::Reloc::Abs8,
+            name: RelocName::Func(at),
+            addend: 0,
+            elf_type: None,
+        };
+        let fill = || {
+            let mut lines = lines();
+            let mut relocs = relocs();
+            assert!(lines.is_empty() && relocs.len() == 0);
+            lines.extend((0..100).map(|offset| LineRow { offset, span: offset }));
+            for at in 0..100 {
+                relocs.push(row(at)).expect("a row");
+            }
+            let made = (lines.len(), relocs.len());
+            keep_lines(lines);
+            keep_relocs(relocs);
+            made
+        };
+        let cold = fill();
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm unit's relocations and line rows", fill);
+        assert_eq!(cold, warm);
+        assert_eq!(warm, (100, 100));
+    }
+
+    /// A list of copies comes back with its room, and filling it again to what it held takes
+    /// nothing of the global allocator.
+    #[test]
+    fn a_kept_list_of_copies_is_reused() {
+        COPIES.with_borrow_mut(Vec::clear);
+        let symbol = intern::Symbol::intern("_RNvCs1234_5crate4copy");
+        let fill = |copies: &mut Vec<(intern::Symbol, u64)>| {
+            copies.extend((0..64).map(|at| (symbol, at)));
+            copies.len()
+        };
+        assert_eq!(with_copies(fill), 64);
+        let held = blaze_alloc_count::assert_at_most(0, "a warm list of copies", || {
+            with_copies(|copies| {
+                assert!(copies.is_empty(), "a lent list is empty");
+                fill(copies)
+            })
+        });
+        assert_eq!(held, 64);
+    }
+
+    /// A build's layout lists come back empty with their room, holding none of the layouts the
+    /// build before kept, and filling them again to what they held takes nothing of the global
+    /// allocator.
+    #[test]
+    fn kept_layout_lists_are_reused_whole() {
+        LAYOUT_LISTS.with_borrow_mut(Vec::clear);
+        let dl = rustc_abi::TargetDataLayout::default();
+        let scalar = crate::Scalar::Union { value: crate::Primitive::Int(rustc_abi::Integer::I32, true) };
+        let arcs: Vec<Arc<Layout>> = (0..64).map(|_| Arc::new(Layout::scalar(&dl, scalar))).collect();
+        let fill = || {
+            let (mut asked, variants) = layout_lists();
+            assert!(asked.is_empty() && variants.is_empty());
+            asked.extend(arcs.iter().cloned());
+            let made = asked.len();
+            keep_layout_lists(asked, variants);
+            made
+        };
+        let cold = fill();
+        assert!(arcs.iter().all(|it| Arc::strong_count(it) == 1));
+        let warm = blaze_alloc_count::assert_at_most(0, "a warm build's layout lists", fill);
+        assert_eq!((cold, warm), (64, 64));
+        assert!(arcs.iter().all(|it| Arc::strong_count(it) == 1));
     }
 
     #[test]

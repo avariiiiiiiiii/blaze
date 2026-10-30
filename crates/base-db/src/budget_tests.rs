@@ -11,8 +11,9 @@ use vfs::{
 };
 
 use crate::{
-    ContentId, CrateGraphBuilder, CrateOrigin, CrateWorkspaceData, Db, EditionedFileId, Env,
-    SourceRoot, SourceRootId, TargetKind, ViewChange, ViewFile, ViewRoot, relevant_crates,
+    ContentId, CrateBuilderId, CrateGraphBuilder, CrateName, CrateOrigin, CrateWorkspaceData, Db,
+    DependencyBuilder, EditionedFileId, Env, FileText, SourceRoot, SourceRootId, TargetKind,
+    ViewChange, ViewFile, ViewRoot, relevant_crates,
 };
 
 const FILES: u32 = 64;
@@ -30,8 +31,15 @@ fn loaded() -> (Db, Vec<FileId>) {
     let root = Arc::new(SourceRoot::new_local(set));
     db.set_source_root_with_durability(SourceRootId(0), root, Durability::MEDIUM);
     let mut graph = CrateGraphBuilder::default();
+    lib_root(&mut graph, files[0]);
+    graph.set_in_db(&mut db);
+    (db, files)
+}
+
+/// A library crate rooted at `root`, with no cfg, env or dependencies.
+fn lib_root(graph: &mut CrateGraphBuilder, root: FileId) -> CrateBuilderId {
     graph.add_crate_root(
-        files[0],
+        root,
         Edition::Edition2021,
         None,
         None,
@@ -47,9 +55,39 @@ fn loaded() -> (Db, Vec<FileId>) {
             toolchain: None,
             const_eval: Default::default(),
         }),
-    );
-    graph.set_in_db(&mut db);
-    (db, files)
+    )
+}
+
+#[test]
+fn a_keystroke_allocates_only_its_text_and_slot() {
+    let (mut db, files) = loaded();
+    for _ in 0..4 {
+        db.set_file_text(files[1], "fn f() { 2 }\n");
+        db.set_file_text(files[1], "fn f() { 1 }\n");
+    }
+    let content = db.source_root(SourceRootId(0)).content(&db);
+    let ((), used) = blaze_alloc_count::measure(|| db.set_file_text(files[1], "fn f() { 2 }\n"));
+    // The file's text and its reparse slot; the setter's batches are in its frame.
+    assert!(used.allocations <= 2, "a keystroke in a root of {FILES} files: {used:?}");
+    assert_ne!(db.source_root(SourceRootId(0)).content(&db), content);
+    assert_eq!(db.file_text(files[1]).content(&db), FileText::content_of("fn f() { 2 }\n", None));
+}
+
+#[test]
+fn crate_deps_are_memo_hits() {
+    let (mut db, files) = loaded();
+    let mut graph = CrateGraphBuilder::default();
+    let a = lib_root(&mut graph, files[0]);
+    let c = lib_root(&mut graph, files[2]);
+    graph.add_dep(a, DependencyBuilder::new(CrateName::new("c").unwrap(), c)).unwrap();
+    let ids = graph.set_in_db(&mut db);
+    let (a, c) = (ids[&a], ids[&c]);
+    assert_eq!(a.transitive_deps(&db), &[a, c]);
+    assert_eq!(c.transitive_rev_deps(&db), &[c, a]);
+    let (_, used) = blaze_alloc_count::measure(|| {
+        a.transitive_deps(&db).len() + c.transitive_rev_deps(&db).len()
+    });
+    assert_eq!(used.allocations, 0, "crate deps, warm: {used:?}");
 }
 
 /// Every read the brief names, of every file: its text, whether it has text, its source root

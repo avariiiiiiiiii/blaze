@@ -165,20 +165,26 @@ fn temporary(b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         return;
     }
     let Some(call) = util::syntax(b, expr) else { return };
+    // clone: a node handle, a reference count, once the call is of a `#[rustc_as_ptr]` method on a temporary
     let Some(name) = ast::MethodCallExpr::cast(call.value.clone()).and_then(|it| it.name_ref()) else { return };
     let ptr_span = b.cx.span(call.with_value(name.syntax().text_range()));
     let (Some(at), Some(temporary_span), Some(ty)) = (b.expr_node(expr), span(b, receiver), ty_text(b, receiver))
     else {
         return;
     };
+    // alloc: the lint's text, for a lint found
     let callee = name.text().to_string();
     let mut diag = Diag::lint(
         TEMPORARIES,
+        // alloc: the lint's text, for a lint found
         format!("this creates a dangling pointer because temporary `{ty}` is dropped at end of statement"),
+        // clone: a lint's span, for a lint found
         ptr_span.clone(),
     );
     diag.span_label(ptr_span, "pointer created here");
+    // alloc: the lint's text, for a lint found
     diag.span_label(temporary_span, format!("this `{ty}` is dropped at end of statement"));
+    // alloc: the lint's text, for a lint found
     diag.help(format!("bind the `{ty}` to a variable such that it outlives the pointer returned by `{callee}`"));
     diag.note(SAFE);
     diag.note("returning a pointer to a local variable will always result in a dangling pointer");
@@ -287,6 +293,7 @@ fn closure_return(b: &BodyCx<'_, '_>, closure: ExprId) -> Option<FnRet> {
     let output = interner.instantiate_bound_regions_with_erased(args.as_closure().sig()).output();
     pointee_not_1zst(b, output)?;
     let node = util::syntax(b, closure)?;
+    // clone: a node handle, a reference count, once the closure returns a raw pointer
     let ret_ty_node = ast::ClosureExpr::cast(node.value.clone())?.ret_type()?.ty()?;
     let ret_ty_span = b.cx.span(node.with_value(ret_ty_node.syntax().text_range()));
     Some(FnRet { ret_ty: b.cx.ty(&ret), ret_ty_span, fn_kind: "closure" })
@@ -359,16 +366,20 @@ impl Locals<'_, '_, '_> {
         let (Some(at), Some(expr_span), Some(local_var)) = (b.expr_node(expr), span(b, expr), b.binding_node(from)) else {
             return;
         };
+        // alloc: the lint's text, for a lint found
         let name = store[from].name.as_str().to_owned();
         let FnRet { ret_ty, ret_ty_span, fn_kind } = self.fn_ret;
         let mut diag = Diag::lint(
             LOCALS,
+            // alloc: the lint's text, for a lint found
             format!("{fn_kind} returns a dangling pointer to dropped local variable `{name}`"),
             expr_span,
         );
+        // alloc: the lint's text, for a lint found
         diag.span_label(ret_ty_span.clone(), format!("return type is `{ret_ty}`"));
         diag.span_label(
             b.cx.span_of(local_var),
+            // alloc: the lint's text, for a lint found
             format!("local variable `{name}` is dropped at the end of the {fn_kind}"),
         );
         if inner != expr

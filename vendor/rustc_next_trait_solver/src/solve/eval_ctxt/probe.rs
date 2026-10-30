@@ -1,4 +1,5 @@
 use std::marker::PhantomData;
+use std::mem;
 
 use rustc_type_ir::search_graph::CandidateHeadUsages;
 use rustc_type_ir::solve::{
@@ -53,7 +54,9 @@ where
         self,
         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, NoSolutionOrRerunNonErased>,
     ) -> Result<T, NoSolutionOrRerunNonErased> {
-        let nested_goals = self.ecx.nested_goals.clone();
+        let mut nested_goals = self.ecx.search_graph.scratch().take_nested_goals();
+        // clone: a probe starts from its parent's goals; `GoalStalledOn` clones its lists.
+        nested_goals.extend(self.ecx.nested_goals.iter().cloned());
         self.enter_inner(f, nested_goals)
     }
 
@@ -61,7 +64,8 @@ where
         self,
         f: impl FnOnce(&mut EvalCtxt<'_, D>) -> Result<T, NoSolutionOrRerunNonErased>,
     ) -> Result<T, NoSolutionOrRerunNonErased> {
-        self.enter_inner(f, Default::default())
+        let nested_goals = self.ecx.search_graph.scratch().take_nested_goals();
+        self.enter_inner(f, nested_goals)
     }
 
     pub(in crate::solve) fn enter_inner(
@@ -95,6 +99,7 @@ where
             nested.inspect.probe_final_state(delegate, max_input_universe);
             r
         });
+        nested.search_graph.scratch().give_nested_goals(mem::take(&mut nested.nested_goals));
 
         outer.opaque_accesses.update(nested.opaque_accesses)?;
 

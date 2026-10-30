@@ -3,13 +3,13 @@
 //! [`Envelope`] of [`SCHEMA`]: another schema is refused by name, and a body that does not
 //! decode is refused under its request's id.
 
-use std::io::{self, Read};
+use std::{
+    io::{self, Read},
+    ops::Range,
+};
 
 use blaze_protocol::cbor;
-use serde::{
-    Serialize,
-    de::{DeserializeOwned, IgnoredAny},
-};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 
 use crate::{ApiError, Envelope, LONGEST_REQUEST, SCHEMA};
 
@@ -65,6 +65,12 @@ impl Frames {
 
     /// [`Frames::next`] in place: the item stays in the buffer until the next push.
     pub fn next_ref(&mut self) -> Result<Option<&[u8]>, ApiError> {
+        Ok(self.next_range()?.map(|range| &self.bytes[range]))
+    }
+
+    /// Where [`Frames::next_ref`]'s item is, for [`Frames::item`]: so a caller can ask
+    /// [`Frames::ready`] while it holds the item.
+    pub(crate) fn next_range(&mut self) -> Result<Option<Range<usize>>, ApiError> {
         let Some(len) = self.declared()? else { return Ok(None) };
         let start = self.at + 4;
         let end = start + len;
@@ -72,7 +78,25 @@ impl Frames {
             return Ok(None);
         }
         self.at = end;
-        Ok(Some(&self.bytes[start..end]))
+        Ok(Some(start..end))
+    }
+
+    /// The item [`Frames::next_range`] said is at `range`, until the next push or fill.
+    pub(crate) fn item(&self, range: Range<usize>) -> &[u8] {
+        &self.bytes[range]
+    }
+
+    /// Whether [`Frames::next_ref`] answers without another byte: a whole item is held, or the
+    /// stream is refused.
+    pub fn ready(&self) -> bool {
+        if self.broken.is_some() {
+            return true;
+        }
+        match self.length() {
+            Some(len) if len > LONGEST_REQUEST => true,
+            Some(len) => self.held() >= 4 + len as usize,
+            None => false,
+        }
     }
 
     /// How many bytes are held that are not yet a whole item.
@@ -161,8 +185,8 @@ pub struct Refused {
 /// An item as an envelope of [`SCHEMA`]: another schema refused by name ("schema 2, this
 /// daemon speaks 4"), whether or not its body is one of this schema's; non-deterministic CBOR
 /// refused naming the offence. An item that decodes is read in one pass; only a refused one
-/// has its head read apart.
-pub fn decode<T: DeserializeOwned>(item: &[u8]) -> Result<Envelope<T>, Refused> {
+/// has its head read apart. A `T` that borrows (a [`crate::ResponseRef`]) borrows from `item`.
+pub fn decode<'a, T: Deserialize<'a>>(item: &'a [u8]) -> Result<Envelope<T>, Refused> {
     let error = match cbor::from_slice::<Envelope<T>>(item) {
         Ok(envelope) if envelope.schema == SCHEMA => return Ok(envelope),
         Ok(envelope) => return Err(wrong_schema(envelope.schema, envelope.id)),

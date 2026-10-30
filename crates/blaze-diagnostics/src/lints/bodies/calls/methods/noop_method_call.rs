@@ -72,6 +72,7 @@ fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
     };
     // Last of the tests: it reads the source.
     let node = util::syntax(b, expr)?;
+    // clone: a node handle, a reference count, once the call is of a noop method
     let call = ast::MethodCallExpr::cast(node.value.clone())?;
     let name = call.name_ref()?;
     let call_span = b.cx.span(node.with_value(TextRange::new(
@@ -102,9 +103,12 @@ fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
         let printed = b.ty(orig_ty);
         let mut diag = Diag::lint(
             "noop_method_call",
+            // alloc: the lint's diagnostic
             format!("call to `.{method_name}()` on a reference in this situation does nothing"),
+            // clone: a node handle or span, for the lint's diagnostic
             span.clone(),
         );
+        // alloc: the lint's diagnostic
         diag.note(format!(
             "the type `{printed}` does not implement `{trait_name}`, so calling `{method_name}` on `&{printed}` copies the reference, which does not do anything and can be removed"
         ));
@@ -112,6 +116,7 @@ fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
         if let TyKind::Adt(def, _) = orig_ty.kind() {
             diag.suggestion(
                 adt_def_span(b, def.def_id()).shrink_to_lo(),
+                // alloc: the lint's diagnostic
                 format!("if you meant to clone `{printed}`, implement `Clone` for it"),
                 "#[derive(Clone)]\n",
                 Applicability::MaybeIncorrect,
@@ -124,8 +129,10 @@ fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
         let message = match noop {
             Noop::Borrow => return None,
             Noop::Clone => {
+                // alloc: the lint's diagnostic
                 format!("using `.clone()` on a double reference, which returns `{ty}` instead of cloning the inner type")
             }
+            // alloc: the lint's diagnostic
             Noop::Deref => format!(
                 "using `.deref()` on a double reference, which returns `{ty}` instead of dereferencing the inner type"
             ),
@@ -146,8 +153,11 @@ fn erased<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
 fn adt_def_span(b: &BodyCx<'_, '_>, adt: AdtId) -> Span {
     let db: &Db = b.db();
     let node: InFile<SyntaxNode> = match adt {
+        // clone: a node handle or span, for the lint's diagnostic
         AdtId::StructId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+        // clone: a node handle or span, for the lint's diagnostic
         AdtId::EnumId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
+        // clone: a node handle or span, for the lint's diagnostic
         AdtId::UnionId(it) => it.lookup(db).source(db).map(|it| it.syntax().clone()),
     };
     b.cx.span(node.as_ref().map(def_range))
@@ -170,9 +180,11 @@ fn facts<'db>(
     let printed = b.cx.ty(&receiver_ty);
     diag.fact_opt(
         b.cx.method_fact(&receiver_ty, method_name),
+        // alloc: the lint's diagnostic
         format!("what `{method_name}` is on `{printed}`"),
     );
     let inner = receiver_ty.derived_from_next_solver(inner);
+    // alloc: the lint's diagnostic
     let what = format!("whether `{}` implements `{trait_name}`", b.cx.ty(&inner));
     diag.fact_opt(b.cx.implements_fact(hir::Trait::from(trait_id), &inner), what);
 }

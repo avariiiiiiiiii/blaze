@@ -16,7 +16,7 @@ use syntax::{TextRange, TextSize};
 use super::args::{ArgParser, Ident, Lit, MetaItem, MetaItemOrLit, MetaList, NameValue};
 use crate::{
     checks::features::Features,
-    cx::Cx,
+    cx::{Cx, item_range_view as item_range},
     lints::syntax::attrs::{
         Attr, Owner, Target,
         parse::{Krate, and_list, applied, crate_level},
@@ -59,11 +59,13 @@ pub(crate) enum BinaryFormat {
 impl TargetInfo {
     fn of(cx: &Cx<'_, '_>) -> TargetInfo {
         let cfg = cx.krate.cfg(cx.db);
+        // alloc: setup, once per check: the target's cfg values the parsers read
         let one = |key: &str| cfg.get_cfg_values(key).next().map(|it| it.to_string()).unwrap_or_default();
         TargetInfo {
             arch: one("target_arch"),
             os: one("target_os"),
             vendor: one("target_vendor"),
+            // alloc: setup, once per check: the target's families
             families: cfg.get_cfg_values("target_family").map(|it| it.to_string()).collect(),
             pointer_width: one("target_pointer_width").parse().ok(),
         }
@@ -104,10 +106,12 @@ const BUILTIN_TOOLS: [&str; 5] = ["clippy", "rustfmt", "diagnostic", "miri", "ru
 impl Session {
     /// Built once per check, by `checks::check`, from the crate's attributes and `features`
     /// (what `checks::features::configured` found).
-    pub(crate) fn of(cx: &Cx<'_, '_>, owners: &[Owner], features: Features) -> Session {
+    pub(crate) fn of<'db>(cx: &Cx<'_, 'db>, owners: &[Owner<'db>], features: Features) -> Session {
+        // alloc: setup, once per check: the tools the crate registers
         let mut tools = Vec::new();
         let crate_attrs = owners.iter().filter(|it| it.target == Target::Crate).flat_map(|it| &it.attrs);
         for attr in crate_attrs.filter(|it| super::is(it, "register_tool")) {
+            // alloc: setup, once per `#![register_tool]`: its parse errors, dropped here
             let mut quiet = Vec::new();
             let Some(ArgParser::List(list)) = super::args::parse(cx, attr, &["register_tool"], &mut quiet) else {
                 continue;
@@ -115,7 +119,7 @@ impl Session {
             for item in list.mixed() {
                 if let Some(ident) = item.meta_item_no_args().and_then(MetaItem::ident) {
                     // alloc: once per tool a crate registers, at setup.
-                    tools.push(ident.name.clone());
+                    tools.push(ident.name.to_string());
                 }
             }
         }
@@ -150,8 +154,8 @@ struct Custom {
 pub(crate) struct Accept<'a, 'c, 'db> {
     pub(crate) cx: &'a Cx<'c, 'db>,
     pub(crate) session: &'a Session,
-    pub(crate) owner: &'a Owner,
-    pub(crate) attr: &'a Attr,
+    pub(crate) owner: &'a Owner<'db>,
+    pub(crate) attr: &'a Attr<'db>,
     /// Its index in the owner's attributes.
     pub(crate) index: usize,
     pub(crate) builtin: &'static Builtin,
@@ -164,12 +168,13 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     pub(crate) fn new(
         cx: &'a Cx<'c, 'db>,
         session: &'a Session,
-        owner: &'a Owner,
+        owner: &'a Owner<'db>,
         index: usize,
         builtin: &'static Builtin,
         errors: &'a mut Vec<Diag>,
     ) -> Accept<'a, 'c, 'db> {
         let attr = &owner.attrs[index];
+        // alloc: empty, allocates nothing
         Accept { cx, session, owner, attr, index, builtin, errors, custom: Vec::new() }
     }
 
@@ -207,8 +212,8 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
 
     /// rustc's `target_span`: what the attribute is applied to, without its attributes.
     pub(crate) fn target_span(&self) -> Span {
-        let node = &self.owner.node;
-        self.cx.span(InFile::new(node.file_id, crate::cx::item_range(&node.value)))
+        let node = self.owner.node;
+        self.cx.span(InFile::new(node.file_id, item_range(node.value)))
     }
 
     pub(crate) fn target(&self) -> Target {
@@ -353,7 +358,13 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
 
     /// rustc's `expect_string_literal` of a `NameValueParser`.
     pub(crate) fn expect_string_literal(&mut self, nv: &NameValue) -> Option<String> {
-        let value = nv.value_as_str().map(str::to_owned);
+        // alloc: the value the parsed attribute keeps
+        self.expect_str(nv).map(str::to_owned)
+    }
+
+    /// [`Accept::expect_string_literal`], the value borrowed from the attribute.
+    pub(crate) fn expect_str<'p>(&mut self, nv: &'p NameValue) -> Option<&'p str> {
+        let value = nv.value_as_str();
         if value.is_none() {
             self.expected_string_literal(nv.value_range(), Some(nv.value_as_lit()));
         }
@@ -385,42 +396,51 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     }
 
     pub(crate) fn expected_integer_literal_in_range(&mut self, range: TextRange, lower: i64, upper: i64) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label(format!("expected an integer literal in the range of {lower}..={upper}")));
     }
 
     /// rustc's `expected_list`; `range` is used when `args` has none.
     pub(crate) fn expected_list(&mut self, range: TextRange, args: &ArgParser) {
         let range = args.range().unwrap_or(range);
+        // alloc: the error's label
         self.parse_error(range, Reason::Label("expected this to be a list".to_owned()));
     }
 
     pub(crate) fn expected_list_with_num_args_or_more(&mut self, args: usize, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label(format!("expected {args} or more items")));
     }
 
     pub(crate) fn expected_list_or_no_args(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label("expected a list or no arguments here".to_owned()));
     }
 
     pub(crate) fn expected_nv_or_no_args(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label("didn't expect a list here".to_owned()));
     }
 
     pub(crate) fn expected_non_empty_string_literal(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label("string is not allowed to be empty".to_owned()));
     }
 
     pub(crate) fn expected_no_args(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Coded("didn't expect any arguments here".to_owned(), "E0565"));
     }
 
     pub(crate) fn expected_identifier(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Coded("expected a valid identifier here".to_owned(), "E0565"));
     }
 
     /// rustc's `expected_name_value`: `name = "..."` was expected at `range`.
     pub(crate) fn expected_name_value(&mut self, range: TextRange, name: Option<&str>) {
         let reason = match name {
+            // alloc: the error's label
             Some(name) => Reason::Label(format!("expected this to be of the form `{name} = \"...\"`")),
             None => Reason::NameValue,
         };
@@ -428,14 +448,17 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     }
 
     pub(crate) fn missing_name_value(&mut self, range: TextRange, name: &str) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label(format!("missing argument `{name} = \"...\"`")));
     }
 
     pub(crate) fn duplicate_key(&mut self, range: TextRange, key: &str) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Coded(format!("found `{key}` used as a key more than once"), "E0538"));
     }
 
     pub(crate) fn expected_not_literal(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Coded("didn't expect a literal here".to_owned(), "E0565"));
     }
 
@@ -445,17 +468,21 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
             0 => "expected an argument here",
             _ => "expected a single argument here",
         };
+        // alloc: the error's label
         self.parse_error(range, Reason::Coded(label.to_owned(), "E0805"));
     }
 
     pub(crate) fn expected_at_least_one_argument(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label("expected at least 1 argument here".to_owned()));
     }
 
     /// "valid arguments are `a` or `b`".
     pub(crate) fn expected_specific_argument(&mut self, range: TextRange, possibilities: &[&str]) {
         let label = specific(possibilities, '`').map(|it| match possibilities.len() {
+            // alloc: the error's label
             1 => format!("the only valid argument here is {it}"),
+            // alloc: the error's label
             _ => format!("valid arguments are {it}"),
         });
         self.parse_error(range, Reason::Specific(label));
@@ -464,8 +491,11 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     /// "this attribute is only valid with `a` as an argument".
     pub(crate) fn expected_specific_argument_and_list(&mut self, range: TextRange, possibilities: &[&str]) {
         let label = specific(possibilities, '`').map(|it| match possibilities.len() {
+            // alloc: the error's label
             1 => format!("this attribute is only valid with {it} as an argument"),
+            // alloc: the error's label
             2 => format!("this attribute is only valid with either {it} as an argument"),
+            // alloc: the error's label
             _ => format!("this attribute is only valid with one of the following arguments: {it}"),
         });
         self.parse_error(range, Reason::Specific(label));
@@ -474,7 +504,9 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     /// "valid arguments are \"a\" or \"b\"".
     pub(crate) fn expected_specific_argument_strings(&mut self, range: TextRange, possibilities: &[&str]) {
         let label = specific(possibilities, '"').map(|it| match possibilities.len() {
+            // alloc: the error's label
             1 => format!("the only valid argument here is {it}"),
+            // alloc: the error's label
             _ => format!("valid arguments are {it}"),
         });
         self.parse_error(range, Reason::Specific(label));
@@ -484,16 +516,19 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     pub(crate) fn expected_string_literal(&mut self, range: TextRange, found: Option<&Lit>) {
         let reason = match found {
             Some(lit) if lit.is_bytestr() => Reason::ByteString(TextRange::at(lit.range.start(), TextSize::from(1))),
+            // alloc: the error's label
             _ => Reason::Label("expected a string literal here".to_owned()),
         };
         self.parse_error(range, reason);
     }
 
     pub(crate) fn expected_filename_literal(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label("expected a filename string literal here".to_owned()));
     }
 
     pub(crate) fn expected_integer_literal(&mut self, range: TextRange) {
+        // alloc: the error's label
         self.parse_error(range, Reason::Label("expected an integer literal here".to_owned()));
     }
 
@@ -504,6 +539,7 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
         let range = if range == self.attr_range() { inner } else { range };
         let span = self.span(range);
         let inner_span = self.span(inner);
+        // alloc: the error's message; clone: its span, used again for the suggestions
         let mut diag = Diag::error(Some("E0539"), format!("malformed `{}` attribute input", self.name()), inner_span.clone());
         let mut code = None;
         match reason {
@@ -532,16 +568,20 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
             }
         }
         if let Some(code) = code {
+            // alloc: the error's code
             diag.code = Some(crate::model::Code::Error(code.to_owned()));
         }
         if let Some(docs) = self.builtin.template.docs {
+            // alloc: the error's note
             diag.note(format!("for more information, visit <{docs}>"));
         }
         if custom.is_empty() {
             let suggestions = self.suggestions();
             if suggestions.len() < 4 {
                 let message = match suggestions.len() {
+                    // alloc: the error's suggestion message
                     1 => "must be of the form".to_owned(),
+                    // alloc: the error's suggestion message
                     _ => "try changing it to one of the following valid forms of the attribute".to_owned(),
                 };
                 diag.suggestions(inner_span, message, suggestions, Applicability::HasPlaceholders, SuggestionStyle::ShowCode);
@@ -562,6 +602,16 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
             self.errors.push(diag);
         }
     }
+
+    /// [`Accept::check_target`] of `#[name = "value"]`, its arguments written out only for
+    /// the error.
+    pub(crate) fn check_target_value(&mut self, value: &str, targets: Targets) {
+        if target_allowed(self.owner, targets) {
+            return;
+        }
+        // alloc: the error's arguments
+        self.check_target(&format!(" = \"{value}\""), targets);
+    }
 }
 
 /// What a parse error says at its span.
@@ -581,15 +631,27 @@ enum Reason {
 fn specific(possibilities: &[&str], quote: char) -> Option<String> {
     match possibilities {
         [] => None,
+        // alloc: an error's label
         [x] => Some(format!("{quote}{x}{quote}")),
         [first @ .., second_to_last, last] => {
+            // alloc: an error's label
             let mut out = String::new();
             for it in first {
+                // alloc: an error's label
                 out.push_str(&format!("{quote}{it}{quote}, "));
             }
+            // alloc: an error's label
             out.push_str(&format!("{quote}{second_to_last}{quote} or {quote}{last}{quote}"));
             Some(out)
         }
+    }
+}
+
+/// Whether `check_target` gives no error on `owner` of an attribute allowed on `targets`.
+fn target_allowed(owner: &Owner<'_>, targets: Targets) -> bool {
+    match targets.crate_level() {
+        Some(warn) => warn || owner.target == Target::Crate,
+        None => targets.is_allowed(owner.target) != Allowed::Error,
     }
 }
 
@@ -599,46 +661,51 @@ fn specific(possibilities: &[&str], quote: char) -> Option<String> {
 pub(crate) fn target_error(
     cx: &Cx<'_, '_>,
     krate: &Krate,
-    owner: &Owner,
-    attr: &Attr,
+    owner: &Owner<'_>,
+    attr: &Attr<'_>,
     targets: Targets,
     args: &str,
 ) -> Option<Diag> {
-    if let Some(warn) = targets.crate_level() {
-        if warn || owner.target == Target::Crate {
-            return None;
-        }
+    if target_allowed(owner, targets) {
+        return None;
+    }
+    if targets.crate_level().is_some() {
         let mut diag = crate_level(cx, krate, owner, attr);
         diag.level = crate::model::Level::Error;
         diag.code = None;
         return Some(diag);
     }
-    if targets.is_allowed(owner.target) != Allowed::Error {
-        return None;
-    }
     let path = attr.path();
     let name = attr.name();
     let range = if args.is_empty() { attr.path_range() } else { attr.inner_range() };
+    // alloc: the error's message
     let message = format!("the `{name}{args}` attribute cannot be used on {}", owner.target.plural_name());
     let mut diag = Diag::error(None, message, cx.span(attr.in_file(range)));
     diag.suggestion_with_style(
+        // alloc: the error's suggestion
         vec![(cx.span(attr.in_file(attr.range())), String::new())],
         "remove the attribute",
         Applicability::MachineApplicable,
         SuggestionStyle::CompletelyHidden,
     );
+    // alloc: the targets the error's help names
     let (applied, only) = applied(krate, targets.allowed().collect(), owner.target);
     let only = if only { "only " } else { "" };
+    // alloc: the error's help
     diag.help(format!("the `{name}{args}` attribute can {only}be applied to {}", and_list(&applied)));
     match (path.as_slice(), owner.target) {
         ([it], Target::Static) if it == "link_name" => {
             let inner = cx.span(attr.in_file(attr.inner_range()));
+            // alloc: the error's suggestion
             let mut parts = Vec::new();
             if !attr.is_unsafe() {
+                // alloc: the error's suggestion
                 parts.push((inner.shrink_to_lo(), "unsafe(".to_owned()));
             }
+            // alloc: the error's suggestion
             parts.push((cx.span(attr.in_file(attr.path_range())), "export_name".to_owned()));
             if !attr.is_unsafe() {
+                // alloc: the error's suggestion
                 parts.push((inner.shrink_to_hi(), ")".to_owned()));
             }
             diag.multipart_suggestion("did you mean to use `#[export_name]`?", parts, Applicability::MaybeIncorrect);

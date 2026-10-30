@@ -55,12 +55,12 @@ pub use base_db::{Db, ProcMacroLoadingError};
 pub use hir_expand::proc_macro::{ProcMacro, ProcMacroLoadResult};
 
 /// What [`lower`] lowers.
-pub struct Lower<'a> {
+pub struct Lower<'a, T> {
     pub units: &'a Units,
     pub config: &'a BuildConfig,
     /// The view's root and every mount's root, readable from any thread: the VFS's
     /// `blaze_vfs::Reader` (`&job.files`), or a `blaze_query::MemTree` in a test.
-    pub files: &'a dyn blaze_query::Tree,
+    pub files: &'a T,
     /// The view's root (what `Origin::View` mounts are of).
     pub root: ContentId,
     /// The machine's CPU, for a `-C target-cpu=native` in the rustflags; without it such a
@@ -197,7 +197,7 @@ fn build_db() -> Db {
 }
 
 /// The crate graph, source roots and files of `lower.units` in a new database.
-pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
+pub fn lower<T: blaze_query::Tree>(lower: Lower<'_, T>) -> Result<Lowered, LowerError> {
     let Lower { units, config, files, root, host_cpu } = lower;
     let unit_count = units.graph.units.len();
     if units.plans.len() != unit_count {
@@ -308,10 +308,9 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
             .filter(|it| *it != load && files::rest(it, load).is_some())
             .cloned()
             .collect();
-        let skip = |path: &str| skipped.iter().any(|it| it == path);
         loaded.clear();
         tree.read_view.set(false);
-        tree.walk(load, &skip, &mut loaded)?;
+        tree.walk(load, &skipped, &mut loaded)?;
         let built: Vec<AbsPathBuf> = skipped.iter().map(|it| abs(it)).collect::<Result<_, _>>()?;
         set_files(&mut db, load, &built, set, library.len(), &loaded)?;
         read.push(Load { dir: load.clone(), set, skipped, built, view: tree.read_view.get() });
@@ -542,7 +541,7 @@ impl Lowered {
     /// manifest sets, which every crate is made with: it is to be [`lower`]ed anew.
     ///
     /// A write, as [`Lowered::ran`] is.
-    pub fn refresh(&mut self, lower: Lower<'_>) -> Result<bool, LowerError> {
+    pub fn refresh<T: blaze_query::Tree>(&mut self, lower: Lower<'_, T>) -> Result<bool, LowerError> {
         let Lower { units, config, files, root, .. } = lower;
         if root == self.view {
             return Ok(true);
@@ -559,10 +558,9 @@ impl Lowered {
             if !load.view {
                 continue;
             }
-            let skip = |path: &str| load.skipped.iter().any(|it| it == path);
             loaded.clear();
             tree.read_view.set(false);
-            tree.walk(&load.dir, &skip, &mut loaded)?;
+            tree.walk(&load.dir, &load.skipped, &mut loaded)?;
             load.view = tree.read_view.get();
             let change = set_files(&mut self.db, &load.dir, &load.built, load.set, sets, &loaded)?;
             removed |= !change.removed.is_empty();
@@ -621,6 +619,45 @@ impl Lowered {
         by_crate.insert(krate, Arc::new(CrateProcMacros::new(macros)));
         all.set_by_crate(db).with_durability(Durability::HIGH).to(by_crate);
         Ok(())
+    }
+
+    /// The crates of `units` and their dependencies that are dependencies of the build
+    /// ([`hir_def::deps::eligible`]) read from the images `images` keeps, by `build`, the blaze
+    /// reading them ([`hir_def::deps::serve`]): under [`hir_def::deps::Mode::Serve`] an image
+    /// replaces resolving its crate. Only units every run of whose closure is applied may be
+    /// named, so nothing a later write changes reaches a crate served; one depending on a proc
+    /// macro not built yet is not eligible. An image that does not read is an error naming its
+    /// crate. A write, as [`Lowered::ran`] is.
+    pub fn serve_deps(
+        &mut self,
+        units: &[u32],
+        build: ContentId,
+        // dyn: the driver's store, one call per crate per front end
+        images: &dyn hir_def::deps::ImageStore,
+        mode: hir_def::deps::Mode,
+    ) -> Result<hir_def::deps::Served, LowerError> {
+        // alloc: setup, once per front end
+        let crates: Vec<Crate> = units.iter().filter_map(|&unit| self.crates.krate(unit as usize)).collect();
+        hir_def::deps::serve(&mut self.db, &crates, build, images, mode).map_err(LowerError::new)
+    }
+
+    /// The images of the crates `served` keyed and found none of, written to `images` from
+    /// what this front end resolves them to ([`hir_def::deps::store`]), with each crate refused
+    /// and why.
+    pub fn store_deps(
+        &self,
+        served: &hir_def::deps::Served,
+        // dyn: as in `serve_deps`
+        images: &dyn hir_def::deps::ImageStore,
+    ) -> Result<hir_def::deps::Stored, LowerError> {
+        hir_def::deps::store(&self.db, served, images).map_err(LowerError::new)
+    }
+
+    /// The database to give what else the store served for the crates [`Lowered::serve_deps`]
+    /// served (their checked bodies, their constants' values), right after it: a write, as
+    /// [`Lowered::ran`] is.
+    pub fn served_db(&mut self) -> &mut Db {
+        &mut self.db
     }
 }
 
@@ -750,8 +787,7 @@ fn set_files(
         let Some(path) = files::rest(&file.path, base).filter(|it| !it.is_empty()) else {
             return Err(LowerError::at(format!("`{}` is not under `{base}`", file.path), file.path.clone()));
         };
-        let file = blaze_vfs::File { id: file.id, mode: blaze_vfs::Mode::Regular, bytes: &file.bytes };
-        view.push(ViewFile { path, file });
+        view.push(ViewFile { path, id: file.id, bytes: &file.bytes });
     }
     let root = ViewRoot { base: &base_path, built, partition: &partition, other, files: &view };
     db.set_view_root(root).map_err(|error| {

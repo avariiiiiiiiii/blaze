@@ -10,16 +10,14 @@ use hir_def::{
     signatures::{FunctionSignature, TraitFlags, TraitSignature},
     unstable_features::UnstableFeatures,
 };
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, ClausePolarity, ClauseKind, TypeSuperVisitable as _, TypeVisitable as _,
     Upcast, elaborate, inherent::IntoKind,
 };
-use smallvec::SmallVec;
 
 use crate::{
     ImplTraitId,
-    db::{HirDatabase, InternedOpaqueTyId},
+    db::HirDatabase,
     lower::GenericPredicates,
     next_solver::{
         AliasTy, Binder, Clause, Clauses, DbInterner, EarlyBinder, GenericArgs, ParamEnv, ParamTy,
@@ -123,7 +121,7 @@ where
     ControlFlow::Continue(())
 }
 
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn dyn_compatibility_of_trait_query(
     db: &Db,
     trait_: TraitId,
@@ -137,7 +135,7 @@ pub fn dyn_compatibility_of_trait_query(
     res
 }
 
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn generics_require_sized_self(db: &Db, def_id: GenericDefId) -> bool {
     let krate = def_id.krate(db);
     let interner = DbInterner::new_with(db, krate);
@@ -228,7 +226,6 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
     struct IllegalSelfTypeVisitor<'db> {
         db: &'db Db,
         trait_: TraitId,
-        super_traits: Option<SmallVec<[TraitId; 4]>>,
         allow_self_projection: AllowSelfProjections,
     }
     impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for IllegalSelfTypeVisitor<'db> {
@@ -248,14 +245,7 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
                 ) => match self.allow_self_projection {
                     AllowSelfProjections::Yes => {
                         let trait_ = proj.trait_def_id(interner).0;
-                        if self.super_traits.is_none() {
-                            self.super_traits = Some(
-                                elaborate::supertrait_def_ids(interner, self.trait_.into())
-                                    .map(|super_trait| super_trait.0)
-                                    .collect(),
-                            )
-                        }
-                        if self.super_traits.as_ref().is_some_and(|s| s.contains(&trait_)) {
+                        if crate::utils::all_super_traits(self.db, self.trait_).contains(&trait_) {
                             ControlFlow::Continue(())
                         } else {
                             ty.super_visit_with(self)
@@ -268,8 +258,7 @@ fn contains_illegal_self_type_reference<'db, T: rustc_type_ir::TypeVisitable<DbI
         }
     }
 
-    let mut visitor =
-        IllegalSelfTypeVisitor { db, trait_, super_traits: None, allow_self_projection };
+    let mut visitor = IllegalSelfTypeVisitor { db, trait_, allow_self_projection };
     t.visit_with(&mut visitor).is_break()
 }
 
@@ -494,9 +483,9 @@ fn contains_illegal_impl_trait_in_trait<'db>(
     db: &'db Db,
     sig: &EarlyBinder<'db, Binder<'db, rustc_type_ir::FnSig<DbInterner<'db>>>>,
 ) -> Option<MethodViolationCode> {
-    struct OpaqueTypeCollector<'db>(FxHashSet<InternedOpaqueTyId<'db>>);
+    struct ReturnTypeImplTrait<'db>(&'db Db);
 
-    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for OpaqueTypeCollector<'db> {
+    impl<'db> rustc_type_ir::TypeVisitor<DbInterner<'db>> for ReturnTypeImplTrait<'db> {
         type Result = ControlFlow<()>;
 
         fn visit_ty(
@@ -507,25 +496,18 @@ fn contains_illegal_impl_trait_in_trait<'db>(
                 _,
                 AliasTy { kind: AliasTyKind::Opaque { def_id }, .. },
             ) = ty.kind()
+                && matches!(def_id.0.loc(self.0), ImplTraitId::ReturnTypeImplTrait(..))
             {
-                self.0.insert(def_id.0);
+                return ControlFlow::Break(());
             }
             ty.super_visit_with(self)
         }
     }
 
-    let ret = sig.skip_binder().output();
-    let mut visitor = OpaqueTypeCollector(FxHashSet::default());
-    _ = ret.visit_with(&mut visitor);
-
     // Since we haven't implemented RPITIT in proper way like rustc yet,
     // just check whether `ret` contains RPIT for now
-    for opaque_ty in visitor.0 {
-        let impl_trait_id = opaque_ty.loc(db);
-        if matches!(impl_trait_id, ImplTraitId::ReturnTypeImplTrait(..)) {
-            return Some(MethodViolationCode::ReferencesImplTraitInTrait);
-        }
-    }
-
-    None
+    let ret = sig.skip_binder().output();
+    ret.visit_with(&mut ReturnTypeImplTrait(db))
+        .is_break()
+        .then_some(MethodViolationCode::ReferencesImplTraitInTrait)
 }

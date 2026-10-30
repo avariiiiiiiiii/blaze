@@ -1666,6 +1666,15 @@ dissimilar, text-size and rustc-hash, so no caller makes a cycle.
 
 ## dedyn: crates/blaze-fmt: `&mut dyn Write` stays, with `// dyn:` (a CLI output writer, per file, not per token)
 
+> SUPERSEDED by dedyn-misc 2026-10-29: applied differently, no comments needed. `trait Emitter`
+> is deleted; `emitter.rs` has `pub(crate) enum Emitter` (one variant per emitter struct, built
+> by `Emitter::new(&Config)`, which replaces `lib.rs`'s `create_emitter`), its methods take
+> `&mut impl Write`, the session holds it by value and `write_file` takes `&mut Emitter`.
+> `print_docs` takes `&mut impl Write`. Test: `src/emitter/tests.rs`. Report:
+> `/tmp/blaze-lanes/v2-dedyn-misc.md`.
+> Being applied in the tree by dedyn-misc (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.
+
+
 Checked against the second sweep's item 4: the formatter does not write through these. It
 builds each file's text in a `String` (`rewrite` → `String`), and `source_file.rs::write_file`
 hands the whole text to the session's emitter once per file; the emitters write it with one
@@ -1689,3 +1698,1066 @@ directly above each of these (today's line numbers):
 the config; called once per formatted file.` above each.
 
 > forwarded to the coordinator: `crates/blaze-fmt` is the coordinator's own (crates.md "every other path"), not requests'; on requests' coordinator list (requests, pass 22).
+
+
+## db: `ProcMacroExpander` takes its call as one struct (from db-apply-def, 2026-10-29)
+
+db changed the trait in `crates/hir-expand/src/proc_macro.rs` (`v2/requests/db.md` '## dedup:
+`ProcMacroExpander` takes its call as one struct'):
+
+```rust
+fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError>;
+fn expand_in(&self, db: &Db, _calling_crate: Crate, call: ProcMacroCall<'_>) -> Result<..> { self.expand(db, call) }
+```
+
+`hir_expand::proc_macro::ProcMacroCall<'a>` is `Copy`, with `pub` fields `subtree: &'a
+tt::TopSubtree`, `attrs: Option<&'a tt::TopSubtree>`, `env: &'a Env`, `def_site`, `call_site`,
+`mixed_site: Span` and `current_dir: &'a str` (was `String`). The crates below don't build until
+these land. In each, import `ProcMacroCall` beside `ProcMacroExpander` (same `proc_macro::{..}`
+list), and drop `Env`/`Span` imports nothing else uses.
+
+The rule for every impl: the seven parameters after `db` (after `calling_crate` in
+`expand_in`), `subtree` .. `current_dir`, become one, `ProcMacroCall { <the names the body
+reads>, .. }: ProcMacroCall<'_>` (or `_: ProcMacroCall<'_>` when it reads none), and a
+forwarding `inner.expand(db, subtree, attrs, env, def_site, call_site, mixed_site,
+current_dir)` becomes `inner.expand(db, call)` with the parameter named `call`.
+
+- `crates/blaze-wasm/src/pack.rs`, `Replay::expand` (~134): `ProcMacroCall { subtree, attrs,
+  call_site, .. }: ProcMacroCall<'_>`.
+- `crates/blaze-wasm/src/pack/record.rs`, `Recorder` (~36): `expand` takes `call:
+  ProcMacroCall<'_>`, calls `self.inner.expand(db, call)` and `self.record(call.subtree,
+  call.attrs, &output)`; `expand_in` the same with `self.inner.expand_in(db, calling_crate,
+  call)`.
+- `crates/hir-ide/src/tests/derived_impls.rs`, `ImplDeserializableExpander` (~20):
+  `ProcMacroCall { call_site, .. }: ProcMacroCall<'_>`.
+- `crates/hir-ide/src/const_macro.rs`, `ConstMacroExpander` (~228): `ProcMacroCall { subtree,
+  attrs, def_site, call_site, mixed_site, .. }: ProcMacroCall<'_>`.
+- `crates/test-fixture/src/lib.rs`, the ten expanders at ~916-1247 (`Identity`, `Issue18089`,
+  `AttributeInputReplace`, `Issue18840`, `Mirror`, `Shorten`, `Issue17479`, `Issue18898`,
+  `DisallowCfg`, `GenerateSuffixedType`): each by the rule, naming the fields its body reads.
+
+hir-def's own test expanders (`macro_expansion_tests/mod.rs` done; `deps/tests.rs`,
+`nameres/tests/macros.rs`, `nameres/facts/tests.rs` as their holders free them) are db's.
+
+Status: open
+
+> applied (requests' paths): `crates/test-fixture/src/lib.rs`' ten expanders, `crates/hir-ide/src/tests/derived_impls.rs` and `crates/hir-ide/src/const_macro.rs` take `ProcMacroCall { .., .. }: ProcMacroCall<'_>` by the rule, `ProcMacroCall` imported, the unused `Env`/`Span` imports dropped. `crates/blaze-wasm/src/pack.rs` and `pack/record.rs` are the coordinator's own: on requests' coordinator list (requests, pass 23).
+
+## frontend-fast-borrowck-proof: `hot_lint.py` reads files of `#[cfg(test)] mod x;` as hot code
+
+`crates/hir-ty-borrowck/src/lib.rs` declares `#[cfg(test)] mod budget;` and
+`#[cfg(test)] mod differential;`, and `differential.rs` has `mod old;` (`differential/old.rs`,
+`differential/old/*.rs`): all test only, but `in_test_module` sees only `#[cfg(test)]` blocks
+inside a file and `main` skips only `tests/` and `*tests.rs`, so they are reported, all test
+code. The fix, in `tools/v2/hot_lint.py`: a file is test code when the module that declares it
+does so under `#[cfg(test)]`, or is itself test code.
+
+```python
+def parent_module(path: Path) -> Path | None:
+    """The file that declares `path`'s module: `lib.rs`/`main.rs`/`mod.rs` beside it, or
+    `<dir>.rs` for a file in `<dir>/`."""
+    if path.stem in ("lib", "main"):
+        return None
+    here = path.parent if path.stem != "mod" else path.parent.parent
+    names = ["lib.rs", "main.rs", "mod.rs"]
+    found = [here / it for it in names if (here / it).is_file() and here / it != path]
+    if path.stem == "mod" or not found:
+        found.append(here.with_suffix(".rs"))
+    return next((it for it in found if it.is_file()), None)
+
+
+def declared_for_tests(path: Path, depth: int = 0) -> bool:
+    """Whether `path`'s module is declared `#[cfg(test)] mod <name>;`, here or by an
+    ancestor module."""
+    parent = parent_module(path)
+    if parent is None or depth > 16:
+        return False
+    stem = path.parent.name if path.stem == "mod" else path.stem
+    decl = re.compile(rf"^\s*(pub(\([^)]*\))?\s+)?mod\s+{re.escape(stem)}\s*;")
+    lines = parent.read_text(errors="ignore").splitlines()
+    for i, line in enumerate(lines):
+        if decl.match(line):
+            j = i - 1
+            while j >= 0 and lines[j].strip().startswith("#["):
+                if re.match(r"#\[cfg\((all\()?test\b", lines[j].strip()):
+                    return True
+                j -= 1
+    return declared_for_tests(parent, depth + 1)
+```
+
+and in `main`, `... or name.endswith("tests.rs") or declared_for_tests(path):`. (A `mod`
+declared inside a `#[cfg(test)] mod tests { .. }` block is already caught by depth; this is the
+out-of-line case.)
+
+Status: open
+
+> forwarded to the coordinator (`tools/`): on requests' coordinator list (requests, pass 24).
+
+## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm
+
+From dedup-names (2026-10-29). `crates/blaze-wasm/src/names.rs` was the engine's `Resolver`
+copied ("FIXME: ... The two are to be one"), and had drifted from it (no paths for what a trait
+provides, statics in `const _` unnamed, the old closure count that guessed through macros). The
+shared part, spelling an item's path as `rustc-demangle` prints its v0 symbol and finding the
+static or closure a path names, is now the new crate `crates/rustc-symbols` (dedup-names', written),
+trait `rustc_symbols::Paths`. Both resolvers implement it with what only they know (how their
+table spells a crate, their `Semantics`, their `Places`). no-rustc step G
+([#87](https://github.com/indexable-inc/blaze/issues/87)) deletes the crate. The engine's half
+is in `v2/requests/codegen.md` under the same heading.
+
+Why a crate and not a module of `hir-ty-codegen`: both would build without a cycle (nothing
+under `hir` depends on `hir-ty-codegen`), but `hir-ty-codegen` has `hir` only as a
+dev-dependency today; as a normal one, the code generator could not start building until all of
+`hir` (and `hir-ide`, the checkers under it) had. The code needs nothing of `hir-ty-codegen`, and
+as a crate of its own the no-rustc deletion is one directory and two dependency lines.
+
+### 1. Root `Cargo.toml`, `[workspace.dependencies]`
+
+Before:
+
+```toml
+hir-ty-codegen = { path = "crates/hir-ty-codegen" }
+```
+
+After:
+
+```toml
+hir-ty-codegen = { path = "crates/hir-ty-codegen" }
+rustc-symbols = { path = "crates/rustc-symbols" }
+```
+
+(`members = ["crates/*", ...]` already takes the crate in.)
+
+### 2. `crates/blaze-wasm/Cargo.toml`, `[dependencies]`
+
+Before:
+
+```toml
+hir-ty-codegen = { path = "../hir-ty-codegen", features = ["wasm"] }
+```
+
+After:
+
+```toml
+hir-ty-codegen = { path = "../hir-ty-codegen", features = ["wasm"] }
+rustc-symbols = { path = "../rustc-symbols" }
+```
+
+### 3. `crates/blaze-wasm/src/lib.rs:384`
+
+Before:
+
+```rust
+                rustc = names::Resolver { db, table };
+```
+
+After:
+
+```rust
+                rustc = names::Resolver { db, table, places: Default::default() };
+```
+
+### 4. `crates/blaze-wasm/src/names.rs`, the whole file
+
+This also carries `v2/requests/mem-codegen-unit.md` 4.5 for this file (`function`, `static_` and
+`source_path` give `intern::Symbol`, `path` borrows from the table), since the trait is already
+that (`crates/hir-ty-codegen/mod.rs:344`). `Names` in `lib.rs` is untouched here.
+
+What the old file answered, it answers the same, but: a static in a `const _: () = { .. }` is now
+found (`<module>::_::NAME`), and a closure or static whose number the count can't tell through
+the macros around it is now no symbol, where the old count guessed. A function a trait declares
+is still never named here (`takes_types`), as before.
+
+Both sides are on views (`syntax::view`, `hir::view::Semantics`, frontend.md item 16):
+frontend-tree-move-tools moved this file onto them, and `rustc-symbols` is written on them the
+same way, so nothing here brings a `SyntaxNode` or a handle `Semantics` back. The file as it is
+now, copied fresh on 2026-10-29 after that move, is below; its `SymbolResolver` impl still gives
+`String`s, which the trait (`Option<intern::Symbol>`) no longer takes.
+
+Before (all 537 lines):
+
+```rust
+//! Names for what the module rustc built has: the symbols rustc gave its functions and
+//! statics, found from their paths.
+//!
+//! FIXME: this is `Resolver` of `blaze`, copied, without what a checkout on disk needs.
+//! The two are to be one.
+
+use std::path::PathBuf;
+
+use hir::{AsAssocItem, AssocItemContainer, Crate, Module, ModuleDef};
+use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
+use hir_ty_codegen::{SymbolResolver, exported_symbol, link_name};
+use ide_db::RootDatabase;
+use syntax::{
+    SyntaxKind, match_ast,
+    view::{self as ast, AstNode as _, HasName as _},
+};
+use vfs::FileId;
+
+use crate::symbols::SymbolTable;
+
+pub(crate) struct Resolver<'a> {
+    pub(crate) db: &'a RootDatabase,
+    pub(crate) table: &'a SymbolTable,
+}
+
+impl Resolver<'_> {
+    /// The function's path as `rustc-demangle` prints its v0 symbol.
+    fn path(&self, func: FunctionId) -> Option<String> {
+        let ModuleDef::Function(func) = ModuleDef::from(ModuleDefId::FunctionId(func)) else {
+            return None;
+        };
+        let name = func.name(self.db);
+        let Some(assoc) = func.as_assoc_item(self.db) else {
+            return self.item_path(func.module(self.db), name.as_str());
+        };
+        let AssocItemContainer::Impl(imp) = assoc.container(self.db) else { return None };
+        let self_ty = self.type_path(&imp.self_ty(self.db))?;
+        match imp.trait_(self.db) {
+            Some(trait_) => {
+                let mut path =
+                    self.item_path(trait_.module(self.db), trait_.name(self.db).as_str())?;
+                // `impl PartialEq<str> for String` and `impl PartialEq<&str> for String` are
+                // told apart by the trait's arguments alone.
+                let trait_ref = imp.trait_ref(self.db)?;
+                let params = hir::GenericDef::from(trait_).type_or_const_params(self.db);
+                let mut args = Vec::new();
+                for (idx, param) in params.iter().enumerate().skip(1) {
+                    let arg = trait_ref.get_type_argument(idx)?;
+                    let default = param.as_type_param(self.db).and_then(|it| it.default(self.db));
+                    // FIXME: a default that names a parameter is understood only as `= Self`.
+                    let is_default = default.as_ref().is_some_and(|default| {
+                        if default.as_type_param(self.db).is_some() {
+                            return hir::attach_db(self.db, || arg == trait_ref.self_ty());
+                        }
+                        let default = self.type_path(default);
+                        default.is_some() && default == self.type_path(&arg)
+                    });
+                    if idx + 1 == params.len() && is_default {
+                        break;
+                    }
+                    args.push(self.type_path(&arg)?);
+                }
+                if !args.is_empty() {
+                    path = format!("{path}<{}>", args.join(", "));
+                }
+                let trait_ = path;
+                Some(format!("<{self_ty} as {trait_}>::{}", name.as_str()))
+            }
+            None => Some(format!("<{self_ty}>::{}", name.as_str())),
+        }
+    }
+
+    fn in_generic_impl(&self, func: FunctionId) -> bool {
+        let ItemContainerId::ImplId(imp) = func.lookup(self.db).container else { return false };
+        let imp = hir::GenericDef::from(hir::Impl::from(imp));
+        !imp.type_or_const_params(self.db).is_empty()
+    }
+
+    /// rustc's `StableCrateId` of a crate it built something of.
+    fn rustc_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        let krate = Crate::from(krate);
+        let name = krate.display_name(self.db)?;
+        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+    }
+
+    /// The file the crate's source starts at.
+    fn crate_root(&self, krate: Crate) -> Option<PathBuf> {
+        crate_root_file(self.db, krate)
+    }
+
+    fn item_path(&self, module: Module, name: &str) -> Option<String> {
+        let mut path = self.scope_path(module)?;
+        path.push_str("::");
+        path.push_str(name);
+        Some(path)
+    }
+
+    /// The function written at `func`, which holds the block that `scope` is the module of.
+    ///
+    /// `Semantics::to_def` answers the same, but starts from every crate the file is part of,
+    /// which for a package with tests and examples analyses all its dev-dependencies.
+    fn function_at<'db>(
+        &self,
+        sema: &hir::view::Semantics<'db>,
+        scope: Module,
+        func: ast::Fn<'db>,
+    ) -> Option<hir::Function> {
+        use hir::view::HasSourceView as _;
+        let db = self.db;
+        let file = sema.hir_file_for(func.syntax());
+        let range = func.syntax().text_range();
+        let is_it = |it: &hir::Function| {
+            it.source_view(db).is_some_and(|source| {
+                source.file_id == file && source.value.syntax().text_range() == range
+            })
+        };
+        let among = |items: Vec<hir::AssocItem>| {
+            items.into_iter().filter_map(hir::AssocItem::as_function).find(is_it)
+        };
+        let mut module = Some(scope);
+        while let Some(it) = module {
+            let found = it
+                .declarations(db)
+                .into_iter()
+                .find_map(|def| match def {
+                    ModuleDef::Function(func) => Some(func).filter(is_it),
+                    ModuleDef::Trait(trait_) => among(trait_.items(db)),
+                    _ => None,
+                })
+                .or_else(|| it.impl_defs(db).into_iter().find_map(|imp| among(imp.items(db))));
+            if found.is_some() || it.nearest_non_block_module(db) == it {
+                return found;
+            }
+            module = it.parent(db);
+        }
+        None
+    }
+
+    /// The path of what holds a module's items: the module, or for the items of a block the
+    /// function, closure, constant or static the block is in, which only the syntax knows.
+    fn scope_path(&self, module: Module) -> Option<String> {
+        if module.nearest_non_block_module(self.db) == module {
+            let krate = module.krate(self.db);
+            let krate_name = krate.display_name(self.db)?;
+            let mut path = self
+                .table
+                .crate_path(krate_name.crate_name().as_str(), &self.crate_root(krate)?)?;
+            for segment in module.path_segments(self.db) {
+                path.push_str("::");
+                path.push_str(segment.as_str());
+            }
+            return Some(path);
+        }
+        let sema = hir::view::Semantics::new(self.db);
+        // A block module's definition is its block.
+        let source = module.definition_source_range(self.db);
+        let block = sema
+            .parse_or_expand(source.file_id)
+            .descendant_at_range(source.value, SyntaxKind::BLOCK_EXPR)?;
+        let mut inner = Vec::new();
+        let mut owner = None;
+        for node in sema.ancestors_with_macros(block) {
+            if is_closure(node) {
+                inner.push(format!("{{closure#{}}}", closure_number(&sema, node)?));
+                continue;
+            }
+            if let Some(func) = ast::Fn::cast(node) {
+                // The body of an `async fn` is a closure to rustc.
+                if func.async_token().is_some() {
+                    inner.push("{closure#0}".to_owned());
+                }
+                let func = self.function_at(&sema, module, func)?;
+                owner = Some(self.path(func.try_into().ok()?)?);
+                break;
+            }
+            match_ast! {
+                match node {
+                    ast::Const(it) => inner.push(it.name().map_or("_".to_owned(), |it| it.text().to_string())),
+                    ast::Static(it) => inner.push(it.name()?.text().to_string()),
+                    // Anonymous constants have numbers we don't know.
+                    ast::BlockExpr(it) => if it.const_token().is_some() { return None },
+                    ast::ConstArg(_) => return None,
+                    _ => {},
+                }
+            }
+        }
+        let mut path = match owner {
+            Some(owner) => owner,
+            None => {
+                let outer = inner.pop()?;
+                self.item_path(module.nearest_non_block_module(self.db), &outer)?
+            }
+        };
+        for segment in inner.iter().rev() {
+            path.push_str("::");
+            path.push_str(segment);
+        }
+        Some(path)
+    }
+
+    /// A type the way rustc writes it in a symbol.
+    fn type_path(&self, ty: &hir::Type<'_>) -> Option<String> {
+        if let Some((inner, mutability)) = ty.as_reference() {
+            let inner = self.type_path(&inner)?;
+            return Some(match mutability {
+                hir::Mutability::Shared => format!("&{inner}"),
+                hir::Mutability::Mut => format!("&mut {inner}"),
+            });
+        }
+        if let Some(elem) = ty.as_slice() {
+            return Some(format!("[{}]", self.type_path(&elem)?));
+        }
+        if let Some(builtin) = ty.as_builtin() {
+            return Some(builtin.name().as_str().to_owned());
+        }
+        if ty.is_tuple() {
+            let fields: Option<Vec<_>> =
+                ty.tuple_fields(self.db).iter().map(|it| self.type_path(it)).collect();
+            return Some(match &*fields? {
+                [only] => format!("({only},)"),
+                fields => format!("({})", fields.join(", ")),
+            });
+        }
+        // A parameter of the `impl` an item is in, where the item is not generic itself: a
+        // static, or what a closure or constant in a generic function holds.
+        if ty.as_type_param(self.db).is_some() {
+            return Some("_".to_owned());
+        }
+        let adt = ty.as_adt()?;
+        let path = self.item_path(adt.module(self.db), adt.name(self.db).as_str())?;
+        let generics = hir::GenericDef::from(adt);
+        let params = generics.type_or_const_params(self.db);
+        if params.is_empty() {
+            return Some(path);
+        }
+        // rustc leaves a defaulted const argument out of the name, so `Bump` may be `Bump<1>`.
+        // FIXME: name those too.
+        if !params.iter().all(|it| it.as_type_param(self.db).is_some()) {
+            return None;
+        }
+        // Lifetimes are erased, and rustc leaves erased ones out of the name.
+        let args: Option<Vec<_>> = ty.type_arguments().map(|arg| self.type_path(&arg)).collect();
+        Some(format!("{path}<{}>", args?.join(", ")))
+    }
+
+    /// What stands for a crate rustc built nothing of, the same after every edit: its name.
+    fn own_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        if !krate.data(self.db).origin.is_local() || self.rustc_crate_id(krate).is_some() {
+            return None;
+        }
+        let name = Crate::from(krate).display_name(self.db)?;
+        Some(name.crate_name().as_str().bytes().fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        }))
+    }
+}
+
+impl SymbolResolver for Resolver<'_> {
+    fn source_path(&self, file: FileId) -> Option<String> {
+        let root = self.db.file_source_root(file).source_root_id(self.db);
+        let root = self.db.source_root(root).source_root(self.db);
+        Some(root.path_for_file(&file)?.to_string())
+    }
+
+    fn function(&self, func: FunctionId) -> Option<String> {
+        if let Some(symbol) = exported_symbol(self.db, func) {
+            return Some(symbol);
+        }
+        // Not a function until the `impl<T>` it is in is given its types: there is nothing to
+        // name, the more so in a crate of such `impl`s alone, which rustc builds nothing of.
+        if self.in_generic_impl(func) {
+            return None;
+        }
+        let path = self.path(func)?;
+        if let Some(symbol) = self.table.get(&path) {
+            return Some(symbol.to_owned());
+        }
+        // rustc has built nothing of the crate: the function is ours to name, unless an
+        // `extern` block declares it, and it is defined elsewhere under the name it links to.
+        let krate = hir_def::HasModule::krate(&func, self.db);
+        let id = self.own_crate_id(krate)?;
+        if let Some(symbol) = link_name(self.db, func) {
+            return Some(symbol);
+        }
+        Some(format!("blaze.{id:x}.{path}"))
+    }
+
+    fn defines(&self, symbol: &str) -> bool {
+        self.table.defines(symbol)
+    }
+
+    fn stable_crate_id(&self, krate: ide_db::base_db::Crate) -> Option<u64> {
+        self.rustc_crate_id(krate).or_else(|| self.own_crate_id(krate))
+    }
+
+    fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
+        let adt = hir::Adt::from(adt);
+        let sema = hir::view::Semantics::new(self.db);
+        let source = sema.source(adt)?;
+        let mut around = sema.ancestors_with_macros(source.value.syntax()).skip(1);
+        let func = ast::Fn::cast(around.find(|it| is_definition(*it))?)?;
+        // The body of an `async fn` is a closure to rustc.
+        if func.async_token().is_some() {
+            return None;
+        }
+        let name = adt.name(self.db);
+        let named_so = func.syntax().descendants().filter_map(ast::Name::cast).filter(|it| {
+            it.text() == name.as_str()
+                && it.syntax().parent().is_some_and(|it| {
+                    ast::Adt::can_cast(it.kind())
+                        || ast::Trait::can_cast(it.kind())
+                        || ast::TypeAlias::can_cast(it.kind())
+                        || ast::Module::can_cast(it.kind())
+                })
+        });
+        if named_so.count() != 1 {
+            return None;
+        }
+        self.function_at(&sema, adt.module(self.db), func)?.try_into().ok()
+    }
+
+    fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
+        use hir::view::HasSourceView as _;
+        let db = self.db;
+        let it = hir::Impl::from(id);
+        let source = it.source_view(db)?;
+        // FIXME: where rustc puts the `impl`s a macro makes among the ones written out.
+        if source.file_id.is_macro() {
+            return None;
+        }
+        let start = |it: &hir::InFile<ast::Impl<'_>>| it.value.syntax().text_range().start();
+        let mut earlier = 0;
+        for other in it.module(db).impl_defs(db) {
+            let other = other.source_view(db)?;
+            // rustc numbers what a module has written out before what its macros and derives
+            // make, which it only has once they are expanded.
+            if other.file_id.is_macro() {
+                continue;
+            }
+            if other.file_id != source.file_id {
+                return None;
+            }
+            earlier += u32::from(start(&other) < start(&source));
+        }
+        Some(earlier)
+    }
+
+    fn static_(&self, id: StaticId) -> Option<String> {
+        let ModuleDef::Static(it) = ModuleDef::from(ModuleDefId::StaticId(id)) else {
+            return None;
+        };
+        let module = it.module(self.db);
+        let name = it.name(self.db);
+        if module.nearest_non_block_module(self.db) == module {
+            let path = self.item_path(module, name.as_str())?;
+            return self.table.get(&path).map(str::to_owned);
+        }
+        // A static in a body is named after the items around it, which only the syntax knows.
+        let sema = hir::view::Semantics::new(self.db);
+        let source = sema.source(it)?;
+        let mut names = vec![name.as_str().to_owned()];
+        let mut closures = Vec::new();
+        let mut around = Vec::new();
+        let mut owner = None;
+        for node in sema.ancestors_with_macros(source.value.syntax()).skip(1) {
+            if is_closure(node) {
+                closures.push(closure_number(&sema, node)?);
+                continue;
+            }
+            if let Some(func) = ast::Fn::cast(node) {
+                if func.async_token().is_some() {
+                    closures.push(0);
+                }
+                // A function written in a body is one more name on the way out.
+                let in_body = sema
+                    .ancestors_with_macros(node)
+                    .skip(1)
+                    .any(|it| ast::Fn::can_cast(it.kind()) || is_closure(it));
+                if in_body {
+                    names.extend(func.name().map(|it| it.text().to_string()));
+                    continue;
+                }
+                let func = self.function_at(&sema, module, func)?;
+                owner = Some(self.path(func.try_into().ok()?)?);
+                break;
+            }
+            let name = match_ast! {
+                match node {
+                    ast::Const(it) => it.name(),
+                    ast::Static(it) => it.name(),
+                    _ => None,
+                }
+            };
+            if let Some(name) = name {
+                let named = |other: ast::Node<'_>| {
+                    let other = match_ast! {
+                        match other {
+                            ast::Const(it) => it.name(),
+                            ast::Static(it) => it.name(),
+                            _ => None,
+                        }
+                    };
+                    other.is_some_and(|it| it.text() == name.text())
+                };
+                around.push(place_in_definition(&sema, node, &named)?.into());
+                names.push(name.text().to_string());
+            }
+        }
+        let owner = match owner {
+            Some(owner) => owner,
+            None => {
+                around.pop();
+                let outer = names.pop()?;
+                self.item_path(module.nearest_non_block_module(self.db), &outer)?
+            }
+        };
+        names.push(owner);
+        names.reverse();
+        closures.reverse();
+        around.reverse();
+        let path = names.join("::");
+        // Only a path through a closure or an anonymous constant has segments left out of it.
+        let named = |node: ast::Node<'_>| {
+            ast::Static::cast(node)
+                .is_some_and(|it| it.name().is_some_and(|it| it.text() == name.as_str()))
+        };
+        let place = place_in_definition(&sema, source.value.syntax(), &named)?.into();
+        let symbol = self
+            .table
+            .get_nested(&path, &closures, place, &around)
+            .or_else(|| self.table.get_at(&path, place, &around));
+        symbol.map(str::to_owned)
+    }
+
+    fn path(&self, path: &str) -> Option<String> {
+        self.table.get(path).map(str::to_owned)
+    }
+
+    fn item(&self, item: ModuleDefId) -> Option<String> {
+        let item = ModuleDef::from(item);
+        self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
+    }
+}
+
+/// Whether rustc numbers the node as a closure: a closure, or an `async` block.
+fn is_closure(node: ast::Node<'_>) -> bool {
+    ast::ClosureExpr::can_cast(node.kind())
+        || ast::BlockExpr::cast(node).is_some_and(|it| it.async_token().is_some())
+}
+
+fn is_definition(node: ast::Node<'_>) -> bool {
+    !ast::MacroCall::can_cast(node.kind())
+        && (ast::Item::can_cast(node.kind())
+            || ast::AssocItem::can_cast(node.kind())
+            || ast::ConstArg::can_cast(node.kind())
+            || is_closure(node)
+            || ast::BlockExpr::cast(node).is_some_and(|it| it.const_token().is_some()))
+}
+
+/// The place of a node among those of the definition it is written in that `counts` holds
+/// of, in the order rustc comes across them. This is how rustc tells apart the closures
+/// of a function, and the statics of one name that a macro used twice in it declares.
+fn place_in_definition<'db>(
+    sema: &hir::view::Semantics<'db>,
+    target: ast::Node<'db>,
+    counts: &impl Fn(ast::Node<'db>) -> bool,
+) -> Option<u32> {
+    let mut around = sema.ancestors_with_macros(target).skip(1);
+    let mut root = None;
+    let owner = around.find(|&node| {
+        root = Some(node);
+        is_definition(node)
+    });
+    let mut earlier = 0;
+    Place { sema, target, counts, earlier: &mut earlier }
+        .find_in(owner.or(root)?)
+        .then_some(earlier)
+}
+
+struct Place<'a, 'db, F: Fn(ast::Node<'db>) -> bool> {
+    sema: &'a hir::view::Semantics<'db>,
+    target: ast::Node<'db>,
+    counts: &'a F,
+    earlier: &'a mut u32,
+}
+
+impl<'db, F: Fn(ast::Node<'db>) -> bool> Place<'_, 'db, F> {
+    /// Counts the nodes before the target in the definition `node` is of. Whether the target
+    /// is there.
+    ///
+    /// rustc numbers what is written in the definition before what the macros used in it
+    /// expand to, and then goes through the macros in turn, each the same way.
+    fn find_in(&mut self, node: ast::Node<'db>) -> bool {
+        let mut calls = Vec::new();
+        if self.find_written_in(node, &mut calls) {
+            return true;
+        }
+        calls.iter().any(|&call| {
+            self.sema
+                .expand_macro_call(call)
+                .is_some_and(|expansion| self.find_in(expansion.value))
+        })
+    }
+
+    /// As `find_in`, of what is not in a macro: `calls` gets the macros come across.
+    fn find_written_in(&mut self, node: ast::Node<'db>, calls: &mut Vec<ast::MacroCall<'db>>) -> bool {
+        for child in node.children() {
+            if let Some(call) = ast::MacroCall::cast(child) {
+                calls.push(call);
+                continue;
+            }
+            if child == self.target {
+                return true;
+            }
+            if (self.counts)(child) {
+                *self.earlier += 1;
+            }
+            if !is_definition(child) && self.find_written_in(child, calls) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// The `n` of the `{closure#n}` rustc names a closure: its place among the closures of the
+/// definition it is written in, a closure's own closures being counted apart.
+fn closure_number<'db>(sema: &hir::view::Semantics<'db>, closure: ast::Node<'db>) -> Option<u32> {
+    place_in_definition(sema, closure, &is_closure)
+}
+
+fn crate_root_file(db: &RootDatabase, krate: Crate) -> Option<PathBuf> {
+    let file = krate.root_file(db);
+    let source_root = db.file_source_root(file).source_root_id(db);
+    let source_root = db.source_root(source_root).source_root(db);
+    Some(PathBuf::from(source_root.path_for_file(&file)?.to_string()))
+}
+```
+
+After:
+
+```rust
+//! Names for what the module rustc built has: the symbols rustc gave its functions and
+//! statics, found from their paths as `rustc_symbols` spells them.
+
+use std::{borrow::Cow, path::PathBuf};
+
+use base_db::Db;
+use hir::Crate;
+use hir_def::{FunctionId, ItemContainerId, Lookup, ModuleDefId, StaticId};
+use hir_ty_codegen::{SymbolResolver, exported_symbol, link_name};
+use rustc_symbols::{Paths, Places, StaticPath};
+use vfs::FileId;
+
+use crate::symbols::SymbolTable;
+
+pub(crate) struct Resolver<'a> {
+    pub(crate) db: &'a Db,
+    pub(crate) table: &'a SymbolTable,
+    pub(crate) places: Places,
+}
+
+impl<'a> Paths<'a> for Resolver<'a> {
+    fn db(&self) -> &'a Db {
+        self.db
+    }
+
+    fn crate_path(&self, krate: Crate) -> Option<Cow<'_, str>> {
+        let name = krate.display_name(self.db)?;
+        let path = self.table.crate_path(name.crate_name().as_str(), &self.crate_root(krate)?);
+        path.map(Cow::Owned)
+    }
+
+    fn sema(&self) -> hir::view::Semantics<'a> {
+        hir::view::Semantics::new(self.db)
+    }
+
+    fn places(&self) -> &Places {
+        &self.places
+    }
+}
+
+impl Resolver<'_> {
+    /// Whether the function takes types before it is one: it is in an `impl` that takes types
+    /// or constants, or a trait declares it, and it takes `Self`.
+    fn takes_types(&self, func: FunctionId) -> bool {
+        match func.lookup(self.db).container {
+            ItemContainerId::ImplId(imp) => {
+                let imp = hir::GenericDef::from(hir::Impl::from(imp));
+                !imp.type_or_const_params(self.db).is_empty()
+            }
+            ItemContainerId::TraitId(_) => true,
+            ItemContainerId::ModuleId(_) | ItemContainerId::ExternBlockId(_) => false,
+        }
+    }
+
+    /// rustc's `StableCrateId` of a crate it built something of.
+    fn rustc_crate_id(&self, krate: base_db::Crate) -> Option<u64> {
+        let krate = Crate::from(krate);
+        let name = krate.display_name(self.db)?;
+        self.table.stable_crate_id(name.crate_name().as_str(), &self.crate_root(krate)?)
+    }
+
+    /// The file the crate's source starts at.
+    fn crate_root(&self, krate: Crate) -> Option<PathBuf> {
+        let file = krate.root_file(self.db);
+        let source_root = self.db.file_source_root(file).source_root_id(self.db);
+        let source_root = self.db.source_root(source_root).source_root(self.db);
+        Some(PathBuf::from(source_root.path_for_file(&file)?.to_string()))
+    }
+
+    /// What stands for a crate rustc built nothing of, the same after every edit: its name.
+    fn own_crate_id(&self, krate: base_db::Crate) -> Option<u64> {
+        if !krate.data(self.db).origin.is_local() || self.rustc_crate_id(krate).is_some() {
+            return None;
+        }
+        let name = Crate::from(krate).display_name(self.db)?;
+        Some(name.crate_name().as_str().bytes().fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ byte as u64).wrapping_mul(0x100000001b3)
+        }))
+    }
+}
+
+impl SymbolResolver for Resolver<'_> {
+    fn source_path(&self, file: FileId) -> Option<intern::Symbol> {
+        let root = self.db.file_source_root(file).source_root_id(self.db);
+        let root = self.db.source_root(root).source_root(self.db);
+        // alloc: wasm, per name
+        Some(intern::Symbol::intern(&root.path_for_file(&file)?.to_string()))
+    }
+
+    fn function(&self, func: FunctionId) -> Option<intern::Symbol> {
+        if let Some(symbol) = exported_symbol(self.db, func) {
+            // alloc: wasm, per name
+            return Some(intern::Symbol::intern(&symbol));
+        }
+        // Not a function until it is given its types: there is nothing to name, the more so
+        // in a crate of such `impl`s alone, which rustc builds nothing of.
+        if self.takes_types(func) {
+            return None;
+        }
+        let path = self.function_path(func)?;
+        if let Some(symbol) = self.table.get(&path) {
+            // alloc: wasm, per name
+            return Some(intern::Symbol::intern(symbol));
+        }
+        // rustc has built nothing of the crate: the function is ours to name, unless an
+        // `extern` block declares it, and it is defined elsewhere under the name it links to.
+        let krate = hir_def::HasModule::krate(&func, self.db);
+        let id = self.own_crate_id(krate)?;
+        if let Some(symbol) = link_name(self.db, func) {
+            // alloc: wasm, per name
+            return Some(intern::Symbol::intern(&symbol));
+        }
+        // alloc: wasm, per name
+        Some(intern::Symbol::intern(&format!("blaze.{id:x}.{path}")))
+    }
+
+    fn defines(&self, symbol: &str) -> bool {
+        self.table.defines(symbol)
+    }
+
+    fn stable_crate_id(&self, krate: base_db::Crate) -> Option<u64> {
+        self.rustc_crate_id(krate).or_else(|| self.own_crate_id(krate))
+    }
+
+    fn declared_in(&self, adt: hir_def::AdtId) -> Option<FunctionId> {
+        self.declaring_function(adt)
+    }
+
+    fn impl_place(&self, id: hir_def::ImplId) -> Option<u32> {
+        rustc_symbols::impl_place(self.db, id)
+    }
+
+    fn static_(&self, id: StaticId) -> Option<intern::Symbol> {
+        let symbol = match self.static_path(id)? {
+            StaticPath::Item(path) => self.table.get(&path),
+            StaticPath::InBody { path, closures, place, around } => self
+                .table
+                .get_nested(&path, &closures, place, &around)
+                .or_else(|| self.table.get_at(&path, place, &around)),
+        };
+        // alloc: wasm, per name
+        symbol.map(intern::Symbol::intern)
+    }
+
+    fn path(&self, path: &str) -> Option<&str> {
+        self.table.get(path)
+    }
+
+    fn item(&self, item: ModuleDefId) -> Option<String> {
+        self.item_path_of(item)
+    }
+}
+```
+
+Read against each signature: `SymbolTable::{crate_path, stable_crate_id, get, get_at,
+get_nested, defines}` (`crates/blaze-engine/src/symbols.rs:657, 753, 764, 774, 795, 618`);
+`exported_symbol`/`link_name` (`hir-ty-codegen/mod.rs:4638`, `4674`, both `Option<String>`);
+`intern::Symbol::intern(&str)`; `rustc_symbols::Paths::sema` gives `hir::view::Semantics`
+(`crates/hir/src/semantics/view.rs:63`); `blaze-wasm` already depends on `base-db`, `hir`,
+`hir-def`, `intern` and `vfs`, and the file no longer needs `ide-db` or `syntax`.
+
+Something to know that is not this request's: `blaze-wasm/src/lib.rs:20` and `:24` read
+`#[path = "../../blaze/src/symbols.rs"]` and `"../../blaze/src/dep_info.rs"`. There is no
+`crates/blaze` any more (it is `crates/blaze-engine`, and `dep_info.rs` is blaze-cargo's), and
+the engine's `symbols.rs` now starts with `pub(crate) use blaze_cargo::symbols::rust_symbol_length;`,
+which blaze-wasm can't name. So blaze-wasm doesn't build today whatever this request does; the
+table it includes needs its own fix.
+
+Status: open
+
+> applied (1, requests, pass 25): `rustc-symbols = { path = "crates/rustc-symbols" }` after `hir-ty-codegen` in `[workspace.dependencies]`; new to `Cargo.lock` (in requests' lock additions). 2 to 4 are `crates/blaze-wasm`'s, the coordinator's, not requests': on requests' coordinator list.
+
+## From cargo (2026-10-29): `blaze-api` for tests run outside the sandbox (usercode-tests-off item 7)
+
+The daemon now runs a package's tests outside the sandbox unless its workspace opts in
+(`serve/unit/test.rs`; `v2/requests/usercode-tests-off.md`). docs/cargo.md asks for two more
+things: with `-v`, say which tests run outside and why, and have the command's summary name the
+tests that ran outside. Neither can be done with the API as it is:
+
+1. **The request's verbosity** (`Cargo::verbose: u8`, the count of `-v`, as cargo's
+   `Verbosity`). Nothing in a job tells the daemon `-v` was given. The CLI parses it, but the
+   daemon only renders. Without it, the "runs outside: `BLAZE_SANDBOX=off` / `tests = false` /
+   `unsandboxed-tests` / no opt-in" note would print on every run, which cargo never does.
+2. **`TestResult::outside: bool`**, true for a test whose `Finished::trace` is
+   `Trace::Unknown(test::OUTSIDE)`. The CLI's summary names those tests from it.
+
+Status: open
+
+> forwarded to requests-api (requests' child, editing `crates/blaze-api` for cargo-cli2 now; ci is DONE): with the same `SCHEMA` bump; told by tmux (requests, pass 28).
+
+> applied by requests-api (2026-10-29, `SCHEMA` 14, not built):
+> - 1 is `Cargo::verbose: u8`.
+> - 2 is `TestResult::outside: bool`, false for a cached result.
+>
+> The daemon fills both: `v2/requests/requests-api.md` section 1 items 7 and 10. The `crates.md` `SCHEMA` line is that file's section 5.
+
+## dedup: stdx::list, one English list (from dedup-sim-diag, 2026-10-29)
+
+From `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`). Thirteen
+copies of rustc's three English list forms: eleven in blaze-diagnostics (their callers are
+`v2/requests/diagnostics.md` `## dedup: one copy of each span, list and lookup helper`, part
+5), `blaze-doc/src/markdown.rs` `or_list`, and `misc.rs` `tokens_to_string`. A small text
+helper used across crates goes in `stdx` (dedup's ownership table).
+
+### 1. New `crates/stdx/src/list.rs`
+
+```rust
+//! Lists in English as rustc's diagnostics write them: "a", "a and b", then three forms of
+//! three or more.
+
+use std::fmt::{Display, Write};
+
+/// How a list of three or more joins its last item.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Join {
+    /// "a, b, and c": `DiagArgValue::StrListSepByAnd`, `DiagSymbolList`.
+    And,
+    /// "a, b, or c": the parser's `tokens_to_string`, rustdoc's lists of choices.
+    Or,
+    /// "a, b and c": `rustc_lint_defs::listify` and the type checker's `listify`.
+    AndNoSerialComma,
+}
+
+/// `items` joined as `join` says, each in backquotes when `quote`; "" when there are none.
+pub fn list<I>(items: I, join: Join, quote: bool) -> String
+where
+    I: IntoIterator,
+    I::IntoIter: ExactSizeIterator,
+    I::Item: Display,
+{
+    let (pair, last) = match join {
+        Join::And => (" and ", ", and "),
+        Join::Or => (" or ", ", or "),
+        Join::AndNoSerialComma => (" and ", " and "),
+    };
+    let quote = if quote { "`" } else { "" };
+    let items = items.into_iter();
+    let len = items.len();
+    let mut out = String::new(); // alloc: a diagnostic's text, on its error path
+    for (at, item) in items.enumerate() {
+        let sep = match (at, len) {
+            (0, _) => "",
+            (1, 2) => pair,
+            (at, _) if at + 1 == len => last,
+            _ => ", ",
+        };
+        let _ = write!(out, "{sep}{quote}{item}{quote}");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Join, list};
+
+    /// The copies' form, a slice match with `join`: the reference.
+    fn reference(items: &[String], join: Join) -> String {
+        let (pair, last) = match join {
+            Join::And => (" and ", ", and "),
+            Join::Or => (" or ", ", or "),
+            Join::AndNoSerialComma => (" and ", " and "),
+        };
+        match items {
+            [] => String::new(),
+            [one] => one.clone(),
+            [a, b] => format!("{a}{pair}{b}"),
+            [init @ .., end] => format!("{}{last}{end}", init.join(", ")),
+        }
+    }
+
+    #[test]
+    fn lists_are_joined_as_rustc_joins_them() {
+        assert_eq!(list(["avx"], Join::And, false), "avx");
+        assert_eq!(list(["avx", "bmi2"], Join::And, false), "avx and bmi2");
+        assert_eq!(list(["avx", "bmi2", "fma"], Join::And, false), "avx, bmi2, and fma");
+        assert_eq!(list(["a", "b", "c"], Join::Or, true), "`a`, `b`, or `c`");
+        assert_eq!(list(["a", "b", "c"], Join::AndNoSerialComma, true), "`a`, `b` and `c`");
+        assert_eq!(list(["a"], Join::AndNoSerialComma, true), "`a`");
+        assert_eq!(list(Vec::<&str>::new(), Join::Or, true), "");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn list_is_the_slice_matchs(items in proptest::collection::vec("[ab ,]{0,3}", 0..6), quote: bool) {
+            for join in [Join::And, Join::Or, Join::AndNoSerialComma] {
+                let quoted: Vec<String> =
+                    items.iter().map(|it| if quote { format!("`{it}`") } else { it.clone() }).collect();
+                proptest::prop_assert_eq!(list(&items, join, quote), reference(&quoted, join));
+            }
+        }
+    }
+}
+```
+
+`crates/stdx/src/lib.rs`: `pub mod list;` after `pub mod assert;` (after `pub mod
+edit_distance;` if that request is in). `crates/stdx/Cargo.toml`: `[dev-dependencies]
+proptest.workspace = true` (dev only).
+
+### 2. `crates/blaze-doc`
+
+`src/markdown.rs:389` `or_list(&[String])` is `stdx::list::list(items, Join::Or, false)`;
+delete it, its callers call that. `Cargo.toml` `[dependencies]` gains `stdx.workspace = true`.
+
+> forwarded to the coordinator: `crates/stdx` and `crates/blaze-doc` are its, not requests'; on requests' coordinator list (requests, pass 29).
+
+## dedup: blaze-lints' `item_range` and `peel_parens` copies (from dedup-sim-diag, 2026-10-29)
+
+From `dedup-sim-diag`. After `v2/requests/frontend-tree.md` `## dedup:
+syntax::view::written_range and Expr::peel_parens` is in:
+
+- `crates/blaze-lints/src/check.rs:1840` `item_range(node: ast::Node<'_>)` is
+  `syntax::view::written_range` (same rule; also copied in blaze-diagnostics, hir-expand,
+  hir-ty-mir). Replace the body with `syntax::view::written_range(node)`, or
+  `pub(crate) use syntax::view::written_range as item_range;`; drop `NodeOrToken` from the
+  imports if nothing else uses it.
+- Six copies of `ast::Expr::peel_parens` on views, each deleted with its calls written
+  `expr.peel_parens()`: `lints/needless_borrow.rs:188` `strip_parens`,
+  `lints/byte_char_slices.rs:90` `strip_parens`, `lints/useless_borrows_in_formatting.rs:108`
+  `strip_parens`, `lints/needless_borrows_for_generic_args.rs:170`,
+  `lints/collapsible_if.rs:84`, `lints/multiple_unsafe_ops_per_block.rs:180` `peel_parens`.
+
+Not taken: `blaze-fmt/src/ast/tokenstream.rs` `Spacing` repeats `tt::Spacing` (three variants
+and rustc's doc comment), but reusing it would add `tt` and its graph (`span`, `intern`,
+`blaze-mem`) to blaze-fmt for four lines; blaze-fmt's `peel_parens` is on its own
+rustc_ast port, not on syntax views.
+
+> forwarded to the coordinator: `crates/blaze-lints` is its (lane lints is DONE); on requests' coordinator list, after frontend-tree's `written_range` and `peel_parens` (requests, pass 29).
+
+## dedup: blaze-new's `normalize_path` onto blaze-manifest's (from dedup-sim-edge, 2026-10-29)
+
+The last `normalize_path` copy with no request (the others: `v2/requests/cargo.md` "one copy of
+each piece the load ported from v1's cargo crates" item 10 and "the rest of the cargo crates'
+copies" item 1, and this file's "the v1 cargo crates call blaze-units' copies" items 1 to 3).
+
+- `crates/blaze-new/Cargo.toml` `[dependencies]` += `blaze-manifest.workspace = true` (no cycle:
+  blaze-manifest does not depend on blaze-new).
+- `crates/blaze-new/src/lib.rs`: delete `fn normalize_path` (691-707, with its doc line); line 760
+  becomes `let manifest_path = blaze_manifest::paths::normalize_path(&path.join("Cargo.toml"));`.
+  `path` is `cwd.join(..)`, absolute, where the two rules agree (cargo-util's keeps a leading `..`
+  of a relative path, which this copy dropped).
+
+> forwarded to the coordinator: `blaze-new` is its; on requests' coordinator list (requests, pass 29).

@@ -17,7 +17,7 @@ use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId, name::Name};
 use la_arena::{Idx, RawIdx};
 use salsa::plumbing::AsId;
-use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
+use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast, view};
 
 use crate::{
     SyntheticSyntax,
@@ -393,7 +393,7 @@ impl<T, N: AstNode> BackMap<T, N> {
                     ends.push(0);
                     continue;
                 }
-                let to = (mv.to)(self.ptr(at, kind).syntax_node_ptr());
+                let to = mv.to.ptr(self.ptr(at, kind).syntax_node_ptr());
                 let ptr = AstPtr::<N>::try_from_raw(to).expect("moved to another kind");
                 let range = ptr.text_range();
                 kinds.push(u16::from(ptr.kind()));
@@ -428,6 +428,8 @@ pub(in crate::expr_store) struct FreezeScratch {
     run_files: Vec<HirFileId>,
     /// The buffers `finish` sorts the forward maps in.
     pub(in crate::expr_store) sort: SortScratch,
+    /// The cursors of [`BindingPats::from_pushed`]'s counting sort.
+    pub(in crate::expr_store) cursors: Vec<u32>,
 }
 
 const NO_PUSH: u32 = u32::MAX;
@@ -438,6 +440,7 @@ impl FreezeScratch {
         self.run_starts.clear();
         self.run_files.clear();
         self.sort.clear();
+        self.cursors.clear();
     }
 
     pub(in crate::expr_store) fn capacity(&self) -> usize {
@@ -445,6 +448,7 @@ impl FreezeScratch {
             + self.run_starts.capacity()
             + self.run_files.capacity()
             + self.sort.capacity()
+            + self.cursors.capacity()
     }
 }
 
@@ -547,7 +551,7 @@ impl<T, N: AstNode> BackPushes<T, N> {
             assert!(self.0.is_empty(), "syntax for an id of an empty arena");
             return BackMap::default();
         }
-        let FreezeScratch { pushes, run_starts, run_files, sort: _ } = scratch;
+        let FreezeScratch { pushes, run_starts, run_files, sort: _, cursors: _ } = scratch;
         pushes.clear();
         pushes.resize(len, NO_PUSH);
         for (at, &(id, _)) in self.0.iter().enumerate() {
@@ -599,35 +603,25 @@ pub(crate) struct BindingPats {
 impl BindingPats {
     /// The lists of `pushed` for a store of `bindings` bindings, by a counting sort (stable, so
     /// each binding's patterns stay in push order): one pass to count, one to sum, one to place.
-    /// Leaves `pushed` empty with its capacity.
+    /// Leaves `pushed` empty with its capacity; `cursors` is the sort's kept scratch.
     pub(in crate::expr_store) fn from_pushed(
         pushed: &mut Vec<(BindingId, PatId)>,
         bindings: usize,
+        cursors: &mut Vec<u32>,
     ) -> Self {
         if bindings == 0 {
             assert!(pushed.is_empty(), "a pattern for a binding of a store without bindings");
             return BindingPats::default();
         }
-        // alloc: the output offsets, one exact allocation
-        let mut starts = vec![0u32; bindings + 1];
-        for &(binding, _) in pushed.iter() {
-            starts[raw(binding) as usize + 1] += 1;
-        }
-        for at in 1..starts.len() {
-            starts[at] += starts[at - 1];
-        }
-        // alloc: the output patterns, one exact allocation
-        let mut pats = vec![idx::<Pat<'static>>(0); pushed.len()];
-        // Each binding's start is its cursor; once placed, it is where the next one starts.
-        for &(binding, pat) in pushed.iter() {
-            let cursor = &mut starts[raw(binding) as usize];
-            pats[*cursor as usize] = pat;
-            *cursor += 1;
-        }
-        for at in (1..starts.len()).rev() {
-            starts[at] = starts[at - 1];
-        }
-        starts[0] = 0;
+        // alloc: the output offsets and patterns, each one exact allocation
+        let (mut starts, mut pats) = (Vec::new(), Vec::new());
+        radix::csr::group_into(
+            bindings,
+            pushed.iter().map(|&(binding, pat)| (raw(binding), pat)),
+            &mut starts,
+            &mut pats,
+            cursors,
+        );
         pushed.clear();
         BindingPats { starts: starts.into_boxed_slice(), pats: pats.into_boxed_slice() }
     }
@@ -766,8 +760,53 @@ impl PartialEq for ExpressionStoreSourceMap {
 /// Moves the pointers into `file` of a source map: [`ExpressionStoreSourceMap::moved`].
 pub(crate) struct Move<'a> {
     pub(crate) file: HirFileId,
-    // dyn: one indirect call per pointer moved, beside the tree search each `to` makes
-    pub(crate) to: &'a dyn Fn(SyntaxNodePtr) -> SyntaxNodePtr,
+    pub(crate) to: MoveTo<'a>,
+}
+
+/// Where a pointer into [`Move::file`] goes, for each kind of tree lowered on its own.
+#[derive(Clone, Copy)]
+pub(crate) enum MoveTo<'a> {
+    /// A signature's tree, to its item's file: the tree's `item` is at `file` there, and the
+    /// tree is at `base`; what follows `elided`, the empty node standing for what the tree left
+    /// out, moves on by `removed`, and `elided` itself grows by it.
+    Signature {
+        item: SyntaxNodePtr,
+        elided: Option<SyntaxNodePtr>,
+        file: TextRange,
+        removed: TextSize,
+        base: TextSize,
+    },
+    /// A body's tree, to its file: the node of the same kind at its range moved on by `start`,
+    /// under `anchor`.
+    Body { anchor: view::Node<'a>, start: TextSize },
+}
+
+impl MoveTo<'_> {
+    #[inline]
+    fn ptr(self, ptr: SyntaxNodePtr) -> SyntaxNodePtr {
+        match self {
+            MoveTo::Signature { item, elided, file, removed, base } => {
+                let range = match elided {
+                    _ if ptr == item => return SyntaxNodePtr::from_parts(ptr.kind(), file),
+                    Some(elided) if ptr == elided => {
+                        TextRange::at(elided.text_range().start(), removed)
+                    }
+                    Some(elided) if ptr.text_range().start() >= elided.text_range().start() => {
+                        ptr.text_range() + removed
+                    }
+                    _ => ptr.text_range(),
+                };
+                SyntaxNodePtr::from_parts(ptr.kind(), range + base)
+            }
+            MoveTo::Body { anchor, start } => {
+                let range = ptr.text_range() + start;
+                anchor
+                    .descendant_at_range(range, ptr.kind())
+                    .map(view::ptr)
+                    .expect("no node where the body has one")
+            }
+        }
+    }
 }
 
 impl Move<'_> {
@@ -775,7 +814,7 @@ impl Move<'_> {
         if src.file_id != self.file {
             return src;
         }
-        let moved = (self.to)(src.value.syntax_node_ptr());
+        let moved = self.to.ptr(src.value.syntax_node_ptr());
         InFile::new(src.file_id, AstPtr::try_from_raw(moved).expect("moved to another kind"))
     }
 
@@ -791,7 +830,7 @@ impl Move<'_> {
 
     fn raw(&self, src: InFile<SyntaxNodePtr>) -> InFile<SyntaxNodePtr> {
         match src.file_id == self.file {
-            true => InFile::new(src.file_id, (self.to)(src.value)),
+            true => InFile::new(src.file_id, self.to.ptr(src.value)),
             false => src,
         }
     }
@@ -983,8 +1022,14 @@ impl ExpressionStoreSourceMap {
         &self,
         node: InFile<&ast::FormatArgsExpr>,
     ) -> Option<(HygieneId, &[(syntax::TextRange, Name)])> {
+        self.implicit_format_args_at(node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>))
+    }
+
+    fn implicit_format_args_at(
+        &self,
+        src: InFile<AstPtr<ast::Expr>>,
+    ) -> Option<(HygieneId, &[(syntax::TextRange, Name)])> {
         let expr_only = self.expr_only()?;
-        let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
         let (hygiene, names) = expr_only
             .template_map
             .as_ref()?
@@ -1009,12 +1054,82 @@ impl ExpressionStoreSourceMap {
         &self,
         node: InFile<&ast::AsmExpr>,
     ) -> Option<(ExprId, &[Vec<(syntax::TextRange, usize)>])> {
+        self.asm_template_args_at(node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>))
+    }
+
+    fn asm_template_args_at(
+        &self,
+        src: InFile<AstPtr<ast::Expr>>,
+    ) -> Option<(ExprId, &[Vec<(syntax::TextRange, usize)>])> {
         let expr_only = self.expr_only()?;
-        let src = node.map(AstPtr::new).map(AstPtr::upcast::<ast::Expr>);
         let expr = expr_only.expr_map.get(&src)?.as_expr()?;
         Some(expr).zip(
             expr_only.template_map.as_ref()?.asm_to_captures.get(expr).map(std::ops::Deref::deref),
         )
+    }
+
+    /// [`Self::node_expr`] of a view.
+    pub fn node_expr_view(&self, node: InFile<view::Expr<'_>>) -> Option<ExprOrPatId> {
+        let src = node.map(AstPtr::<ast::Expr>::of);
+        self.expr_only()?.expr_map.get(&src).cloned().map(ExprOrPatIdPacked::unpack)
+    }
+
+    /// [`Self::node_macro_file`] of a view.
+    pub fn node_macro_file_view(&self, node: InFile<view::MacroCall<'_>>) -> Option<MacroCallId> {
+        let src = node.map(AstPtr::<ast::MacroCall>::of);
+        self.expr_only()?.expansions.get(&src).cloned()
+    }
+
+    /// [`Self::node_pat`] of a view.
+    pub fn node_pat_view(&self, node: InFile<view::Pat<'_>>) -> Option<ExprOrPatId> {
+        self.expr_only()?
+            .pat_map
+            .get(&node.map(AstPtr::<ast::Pat>::of))
+            .cloned()
+            .map(ExprOrPatIdPacked::unpack)
+    }
+
+    /// [`Self::node_type`] of a view.
+    pub fn node_type_view(&self, node: InFile<view::Type<'_>>) -> Option<TypeRefId> {
+        self.types_map.get(&node.map(AstPtr::<ast::Type>::of)).cloned()
+    }
+
+    /// [`Self::node_label`] of a view.
+    pub fn node_label_view(&self, node: InFile<view::Label<'_>>) -> Option<LabelId> {
+        let src = node.map(AstPtr::<ast::Label>::of).map(AstPtr::wrap_left);
+        self.expr_only()?.label_map.get(&src).cloned()
+    }
+
+    /// [`Self::macro_expansion_expr`] of a view.
+    pub fn macro_expansion_expr_view(
+        &self,
+        node: InFile<view::MacroExpr<'_>>,
+    ) -> Option<ExprOrPatId> {
+        let src = node.map(AstPtr::<ast::MacroExpr>::of).map(AstPtr::upcast);
+        self.expr_only()?.expr_map.get(&src).copied().map(ExprOrPatIdPacked::unpack)
+    }
+
+    /// [`Self::expansion`] of a view.
+    pub fn expansion_view(&self, node: InFile<view::MacroCall<'_>>) -> Option<MacroCallId> {
+        self.expr_only()?.expansions.get(&node.map(AstPtr::<ast::MacroCall>::of)).copied()
+    }
+
+    /// [`Self::implicit_format_args`] of a view.
+    pub fn implicit_format_args_view(
+        &self,
+        node: InFile<view::FormatArgsExpr<'_>>,
+    ) -> Option<(HygieneId, &[(syntax::TextRange, Name)])> {
+        let src = node.map(AstPtr::<ast::FormatArgsExpr>::of).map(AstPtr::upcast::<ast::Expr>);
+        self.implicit_format_args_at(src)
+    }
+
+    /// [`Self::asm_template_args`] of a view.
+    pub fn asm_template_args_view(
+        &self,
+        node: InFile<view::AsmExpr<'_>>,
+    ) -> Option<(ExprId, &[Vec<(syntax::TextRange, usize)>])> {
+        let src = node.map(AstPtr::<ast::AsmExpr>::of).map(AstPtr::upcast::<ast::Expr>);
+        self.asm_template_args_at(src)
     }
 
     /// Get a reference to the source map's diagnostics.
@@ -1022,6 +1137,9 @@ impl ExpressionStoreSourceMap {
         self.expr_only().map(|it| &*it.diagnostics).unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+mod view_tests;
 
 #[cfg(test)]
 pub(in crate::expr_store) mod tests {
@@ -1251,8 +1369,13 @@ pub(in crate::expr_store) mod tests {
     #[test]
     fn moving_a_back_map_moves_its_files_pointers_only() {
         let mut scratch = FreezeScratch::default();
-        let to = |ptr: SyntaxNodePtr| {
-            SyntaxNodePtr::from_parts(ptr.kind(), ptr.text_range() + TextSize::from(100))
+        // An `item` no push points to and nothing elided: every pointer moves on by `base`.
+        let to = MoveTo::Signature {
+            item: SyntaxNodePtr::from_parts(SyntaxKind::SOURCE_FILE, TextRange::default()),
+            elided: None,
+            file: TextRange::default(),
+            removed: TextSize::from(0),
+            base: TextSize::from(100),
         };
         for seed in 0..32 {
             let mut rng = SplitMix64::new(seed);
@@ -1262,14 +1385,48 @@ pub(in crate::expr_store) mod tests {
             pushes.iter().for_each(|&(id, src)| pushed.insert(id, src));
             let map: ExprBackMap = pushed.freeze(len as usize, &mut scratch);
             let file = src::<ast::Expr>(1, false, SyntaxKind::PATH_EXPR, 0, 0).file_id;
-            let mv = Move { file, to: &to };
+            let mv = Move { file, to };
             let moved_pushes: Vec<_> = pushes.iter().map(|&(id, src)| (id, mv.ptr(src))).collect();
             assert_back_map_is(&map.moved(&mv), &moved_pushes, len);
         }
     }
 
     #[test]
+    fn each_kind_of_move_puts_a_pointer_where_its_tree_is() {
+        let ptr = |kind, start: u32, end: u32| {
+            SyntaxNodePtr::from_parts(kind, TextRange::new(start.into(), end.into()))
+        };
+        // A signature's tree: its item at 0..20, the empty node at 10 standing for 4 bytes left
+        // out; the item is at 100..124 in its file.
+        let signature = MoveTo::Signature {
+            item: ptr(SyntaxKind::FN, 0, 20),
+            elided: Some(ptr(SyntaxKind::BLOCK_EXPR, 10, 10)),
+            file: TextRange::new(100.into(), 124.into()),
+            removed: TextSize::from(4),
+            base: TextSize::from(100),
+        };
+        assert_eq!(signature.ptr(ptr(SyntaxKind::FN, 0, 20)), ptr(SyntaxKind::FN, 100, 124));
+        let elided = signature.ptr(ptr(SyntaxKind::BLOCK_EXPR, 10, 10));
+        assert_eq!(elided, ptr(SyntaxKind::BLOCK_EXPR, 110, 114), "the empty node grows");
+        assert_eq!(signature.ptr(ptr(SyntaxKind::NAME, 3, 4)), ptr(SyntaxKind::NAME, 103, 104));
+        let after = signature.ptr(ptr(SyntaxKind::WHERE_CLAUSE, 12, 15));
+        assert_eq!(after, ptr(SyntaxKind::WHERE_CLAUSE, 116, 119), "what follows moves on");
+
+        // A body's tree: the same node, found under the file's root 17 bytes on.
+        let edition = syntax::Edition::CURRENT;
+        let file = syntax::SourceFile::parse("const C: u8 = 0;\nfn f() { 1 + 2 }\n", edition);
+        let body = syntax::SourceFile::parse("fn f() { 1 + 2 }", edition);
+        fn bin(root: view::Node<'_>) -> view::Node<'_> {
+            root.descendants().find(|it| it.kind() == SyntaxKind::BIN_EXPR).unwrap()
+        }
+        let moved = MoveTo::Body { anchor: file.root(), start: TextSize::from(17) }
+            .ptr(view::ptr(bin(body.root())));
+        assert_eq!(moved, view::ptr(bin(file.root())));
+    }
+
+    #[test]
     fn binding_patterns_are_their_pushes_in_order() {
+        let mut cursors = Vec::new();
         for seed in 0..64 {
             let mut rng = SplitMix64::new(seed);
             let bindings = rng.below(50) as u32;
@@ -1283,7 +1440,7 @@ pub(in crate::expr_store) mod tests {
             }
             let model = pushed.clone();
             let room = pushed.capacity();
-            let lists = BindingPats::from_pushed(&mut pushed, bindings as usize);
+            let lists = BindingPats::from_pushed(&mut pushed, bindings as usize, &mut cursors);
             assert!(pushed.is_empty() && pushed.capacity() == room, "the scratch keeps its room");
             assert_eq!(lists.starts.len(), if bindings == 0 { 0 } else { bindings as usize + 1 });
             assert!(lists.starts.windows(2).all(|pair| pair[0] <= pair[1]), "sorted offsets");

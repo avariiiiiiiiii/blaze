@@ -85,6 +85,14 @@ impl<X: Cx> Stack<X> {
         self.entries.len()
     }
 
+    pub(super) fn capacity(&self) -> usize {
+        self.entries.raw.capacity()
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.entries.raw.clear()
+    }
+
     pub(super) fn last(&self) -> Option<&StackEntry<X>> {
         self.entries.raw.last()
     }

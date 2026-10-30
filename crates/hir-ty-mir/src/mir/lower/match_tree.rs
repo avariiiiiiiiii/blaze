@@ -19,7 +19,7 @@ use syntax::ast::RangeOp;
 use crate::{
     infer::PatAdjust,
     mir::{
-        framed::{self, Bits},
+        framed::{self, Bits, FrameMap},
         lower::{MirLowerCtx, Ty, TyKind},
     },
 };
@@ -71,8 +71,12 @@ struct Candidate<'t> {
     then: Option<usize>,
 }
 
+/// Candidates in the order they are matched, the first one last, so that taking the first is
+/// a pop and what a test leaves stays where it is.
+type Stack<'t> = Vec<Candidate<'t>, &'t Frame>;
+
 /// Where a test sends a candidate.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Branch {
     Variant(EnumVariantId),
     Int(u128),
@@ -96,15 +100,21 @@ impl<'t> Tree<'t, '_> {
     /// Matches the candidates in order, and says whether none of them matching can happen.
     /// Or-patterns are expanded before any test, as soon as any candidate starts with one,
     /// so that the alternatives are sorted by the tests of the arms before them.
-    fn run(&mut self, mut start: bool, mut candidates: Vec<Candidate<'t>, &'t Frame>) -> bool {
+    fn run(&mut self, mut start: bool, mut candidates: Stack<'t>) -> bool {
+        // The lowest place of a candidate that starts with an or-pattern. A candidate below the
+        // top is not changed while it waits, so one is left while this is below the length.
+        let ors = candidates.iter().position(starts_with_or);
         loop {
-            let Some(first) = candidates.first() else { return start };
+            let Some(first) = candidates.last() else { return start };
             match first.pairs.first() {
-                None => start = self.matched(start, candidates.remove(0)),
-                Some(_) if candidates.iter().any(starts_with_or) => {
-                    (start, candidates) = self.expand(start, candidates)
+                None => {
+                    let first = candidates.pop().expect("the first candidate");
+                    start = self.matched(start, first);
                 }
-                Some(_) => (start, candidates) = self.test(start, candidates),
+                Some(_) if ors.is_some_and(|it| it < candidates.len()) => {
+                    start = self.expand(start, &mut candidates)
+                }
+                Some(_) => start = self.test(start, &mut candidates),
             }
         }
     }
@@ -132,16 +142,12 @@ impl<'t> Tree<'t, '_> {
 
     /// Expands the or-patterns that candidates start with into a candidate for each
     /// alternative. The candidates after one that has more to test after its or-pattern are
-    /// left for after.
-    fn expand(
-        &mut self,
-        start: bool,
-        mut candidates: Vec<Candidate<'t>, &'t Frame>,
-    ) -> (bool, Vec<Candidate<'t>, &'t Frame>) {
-        let last = candidates.iter().position(|it| starts_with_or(it) && it.pairs.len() > 1);
-        let remaining = candidates.split_off(last.map_or(candidates.len(), |it| it + 1));
-        let mut expanded = Vec::with_capacity_in(candidates.len(), self.frame);
-        for mut candidate in candidates {
+    /// left in `candidates` for after.
+    fn expand(&mut self, start: bool, candidates: &mut Stack<'t>) -> bool {
+        let last = candidates.iter().rposition(|it| starts_with_or(it) && it.pairs.len() > 1);
+        let taken = candidates.split_off(last.unwrap_or(0));
+        let mut expanded = Vec::with_capacity_in(taken.len(), self.frame);
+        for mut candidate in taken.into_iter().rev() {
             if !starts_with_or(&candidate) {
                 expanded.push(candidate);
                 continue;
@@ -163,61 +169,140 @@ impl<'t> Tree<'t, '_> {
                 then,
             }));
         }
+        expanded.reverse();
         let outer = std::mem::take(&mut self.escaped);
         let fell = self.run(start, expanded);
         let escaped = std::mem::replace(&mut self.escaped, outer);
-        (fell || escaped, remaining)
+        fell || escaped
     }
 
     /// Makes the test the first candidate asks for first, sorts the candidates that the
     /// outcome says something about into its branches, and matches each branch. The
-    /// candidates from the first one it says nothing about are left for after.
-    fn test(
-        &mut self,
-        start: bool,
-        mut candidates: Vec<Candidate<'t>, &'t Frame>,
-    ) -> (bool, Vec<Candidate<'t>, &'t Frame>) {
+    /// candidates from the first one it says nothing about are left in `candidates` for after.
+    fn test(&mut self, start: bool, candidates: &mut Stack<'t>) -> bool {
+        let Some(first) = candidates.last() else { return start };
         // The first candidate is sorted by the pair the test is made of.
-        let Some(branch) = own_branch(&candidates[0].pairs[0].ask) else {
-            return (start, candidates);
-        };
-        let mut first = candidates.remove(0);
+        let Some(branch) = own_branch(&first.pairs[0].ask) else { return start };
+        let mut first = candidates.pop().expect("the first candidate");
         let Pair { place, ask, inside } = first.pairs.remove(0);
         first.pairs.extend(inside);
         radix::sort_by_key(&mut first.pairs, or_last);
-        let mut sorted = Vec::with_capacity_in(1, self.frame);
-        sorted.push(first);
-        let mut branches = Vec::new_in(self.frame);
-        branches.push((branch, sorted));
-        let mut remaining = Vec::new_in(self.frame);
-        let mut candidates = candidates.into_iter();
-        for mut candidate in candidates.by_ref() {
+        let mut branches = Branches::new_in(self.frame);
+        branches.add(branch, first, &place, &ask);
+        while let Some(mut candidate) = candidates.pop() {
             let Some(branch) = sort(&place, &ask, &mut candidate, &branches) else {
-                remaining.push(candidate);
+                candidates.push(candidate);
                 break;
             };
-            match branches.iter_mut().find(|(it, _)| *it == branch) {
-                Some((_, sorted)) => sorted.push(candidate),
-                None => {
-                    let mut sorted = Vec::with_capacity_in(1, self.frame);
-                    sorted.push(candidate);
-                    branches.push((branch, sorted));
+            branches.add(branch, candidate, &place, &ask);
+        }
+        // A switch always has a target for the values none of the candidates named, and
+        // the test of a `bool` has one for the value the first candidate did not ask for.
+        let mut fell = start
+            && match ask {
+                Ask::Bool(_) => !(branches.success && branches.failure),
+                _ => !branches.failure,
+            };
+        for (_, mut sorted) in branches.list {
+            sorted.reverse();
+            fell |= self.run(start, sorted);
+        }
+        fell
+    }
+}
+
+/// Up to how many branches of a test one is found by a scan rather than through the index.
+const LINEAR: usize = 8;
+
+/// The branches of one test, in the order a candidate was first sorted into each, which is
+/// the order they are matched in, and what `sort` asks of them.
+struct Branches<'t> {
+    /// Each branch's candidates in the order they were sorted in.
+    list: Vec<(Branch, Vec<Candidate<'t>, &'t Frame>), &'t Frame>,
+    /// By branch, where it is in `list`, once there are more than `LINEAR`.
+    index: FrameMap<'t, Branch, u32>,
+    /// The values of the `Int` branches, ascending.
+    ints: Vec<u128, &'t Frame>,
+    /// What the ranges at the tested place of the candidates in the `Failure` branch of an
+    /// `Int` test cover: disjoint ranges, ascending.
+    failed: Vec<(u128, u128), &'t Frame>,
+    success: bool,
+    failure: bool,
+}
+
+impl<'t> Branches<'t> {
+    fn new_in(frame: &'t Frame) -> Self {
+        Branches {
+            list: Vec::new_in(frame),
+            index: framed::map_in(frame),
+            ints: Vec::new_in(frame),
+            failed: Vec::new_in(frame),
+            success: false,
+            failure: false,
+        }
+    }
+
+    /// Puts `candidate` in `branch` of the test `ask` makes of `place`.
+    fn add(&mut self, branch: Branch, candidate: Candidate<'t>, place: &[Step], ask: &Ask<'t>) {
+        if branch == Branch::Failure && matches!(ask, Ask::Int(_)) {
+            for pair in &candidate.pairs {
+                if let Ask::Range(lo, hi) = pair.ask
+                    && pair.place == place
+                {
+                    self.fail_range(lo, hi);
                 }
             }
         }
-        remaining.extend(candidates);
-        // A switch always has a target for the values none of the candidates named, and
-        // the test of a `bool` has one for the value the first candidate did not ask for.
-        let has = |branch: Branch| branches.iter().any(|(it, _)| *it == branch);
-        let mut fell = start
-            && match ask {
-                Ask::Bool(_) => !(has(Branch::Success) && has(Branch::Failure)),
-                _ => !has(Branch::Failure),
-            };
-        for (_, sorted) in branches {
-            fell |= self.run(start, sorted);
+        let found = match self.list.len() <= LINEAR {
+            true => self.list.iter().position(|(it, _)| *it == branch),
+            false => self.index.get(&branch).map(|&it| it as usize),
+        };
+        if let Some(at) = found {
+            self.list[at].1.push(candidate);
+            return;
         }
-        (fell, remaining)
+        match branch {
+            Branch::Int(value) => {
+                let at = self.ints.partition_point(|&it| it < value);
+                self.ints.insert(at, value);
+            }
+            Branch::Success => self.success = true,
+            Branch::Failure => self.failure = true,
+            Branch::Variant(_) => (),
+        }
+        let mut sorted = Vec::with_capacity_in(1, *self.list.allocator());
+        sorted.push(candidate);
+        self.list.push((branch, sorted));
+        let len = self.list.len();
+        if len == LINEAR + 1 {
+            let list = &self.list;
+            self.index.extend(list.iter().enumerate().map(|(at, (it, _))| (*it, at as u32)));
+        } else if len > LINEAR + 1 {
+            self.index.insert(branch, (len - 1) as u32);
+        }
+    }
+
+    fn fail_range(&mut self, mut lo: u128, mut hi: u128) {
+        let from = self.failed.partition_point(|&(_, end)| end < lo);
+        let to = self.failed.partition_point(|&(start, _)| start <= hi);
+        if from < to {
+            lo = lo.min(self.failed[from].0);
+            hi = hi.max(self.failed[to - 1].1);
+        }
+        self.failed.drain(from..to);
+        self.failed.insert(from, (lo, hi));
+    }
+
+    /// Whether a range of a candidate in the `Failure` branch of an `Int` test has `value`.
+    fn failed_covers(&self, value: u128) -> bool {
+        let at = self.failed.partition_point(|&(_, end)| end < value);
+        self.failed.get(at).is_some_and(|&(start, _)| start <= value)
+    }
+
+    /// Whether the value of an `Int` branch is in `lo..=hi`.
+    fn names_int_in(&self, lo: u128, hi: u128) -> bool {
+        let at = self.ints.partition_point(|&it| it < lo);
+        self.ints.get(at).is_some_and(|&it| it <= hi)
     }
 }
 
@@ -256,25 +341,20 @@ fn sort<'t>(
     place: &[Step],
     ask: &Ask<'t>,
     candidate: &mut Candidate<'t>,
-    branches: &[(Branch, Vec<Candidate<'t>, &'t Frame>)],
+    branches: &Branches<'t>,
 ) -> Option<Branch> {
     let at = candidate.pairs.iter().position(|it| it.place == place)?;
     let (branch, answered) = match (ask, &candidate.pairs[at].ask) {
         (Ask::Variant(_), &Ask::Variant(variant)) => (Branch::Variant(variant), true),
         (Ask::Int(_), &Ask::Int(value)) => {
-            let covers = |it: &Pair| {
-                it.place == place
-                    && matches!(it.ask, Ask::Range(lo, hi) if lo <= value && value <= hi)
-            };
-            let failed = branches.iter().filter(|(it, _)| *it == Branch::Failure);
-            if failed.flat_map(|(_, sorted)| sorted).any(|it| it.pairs.iter().any(covers)) {
+            // A range of an earlier candidate that has the value would be tested first.
+            if branches.failed_covers(value) {
                 return None;
             }
             (Branch::Int(value), true)
         }
         (Ask::Int(_), &Ask::Range(lo, hi)) => {
-            let named = |it: &(Branch, Vec<Candidate<'t>, &'t Frame>)| matches!(it.0, Branch::Int(value) if lo <= value && value <= hi);
-            if branches.iter().any(named) {
+            if branches.names_int_in(lo, hi) {
                 return None;
             }
             (Branch::Failure, false)
@@ -337,6 +417,7 @@ impl<'a, 'f, 'db> MirLowerCtx<'a, 'f, 'db> {
             radix::sort_by_key(&mut pairs, or_last);
             candidates.push(Candidate { arm, pairs, guarded: it.guard.is_some(), then: None });
         }
+        candidates.reverse();
         let mut tree = Tree { frame, thens: Vec::new_in(frame), reached, escaped: false };
         tree.run(true, candidates);
         tree.reached
@@ -598,3 +679,6 @@ fn int_bounds(ty: Ty<'_>) -> Option<(u128, u128, bool)> {
     };
     Some((least, most, bounded))
 }
+
+#[cfg(test)]
+mod tests;

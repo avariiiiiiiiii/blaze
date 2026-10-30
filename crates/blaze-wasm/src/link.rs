@@ -227,13 +227,12 @@ impl<'a> Symbols<'a> {
     /// A hash for each symbol of everything it is: its bytes, and what they refer to, where
     /// a symbol without a name of its own is what it is made of in turn.
     fn contents(&self) -> Result<Vec<u64>, String> {
-        let hash = |it: &dyn Fn(&mut FxHasher)| {
-            let mut hasher = FxHasher::default();
-            it(&mut hasher);
-            hasher.finish()
-        };
         let mut contents: Vec<u64> = (self.defined.iter())
-            .map(|it| hash(&|hasher| (it.is_code, it.writable, &it.bytes).hash(hasher)))
+            .map(|it| {
+                let mut hasher = FxHasher::default();
+                (it.is_code, it.writable, &it.bytes).hash(&mut hasher);
+                hasher.finish()
+            })
             .collect();
         // Two symbols that differ only in what they reach after n steps are told apart in
         // round n, so there is nothing more to tell apart once a round finds nothing.

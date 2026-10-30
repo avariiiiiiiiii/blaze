@@ -29,5 +29,8 @@ serde_json.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
 [lints]
 workspace = true

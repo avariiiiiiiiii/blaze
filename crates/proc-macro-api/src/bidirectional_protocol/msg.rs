@@ -203,13 +203,13 @@ pub struct ExpnGlobals {
 impl Message for BidirectionalMessage {
     type Buf = Vec<u8>;
 
-    fn read(inp: &mut dyn BufRead, buf: &mut Self::Buf) -> io::Result<Option<Self>> {
+    fn read<R: BufRead + ?Sized>(inp: &mut R, buf: &mut Self::Buf) -> io::Result<Option<Self>> {
         Ok(match postcard::read(inp, buf)? {
             None => None,
             Some(buf) => Some(postcard::decode(buf)?),
         })
     }
-    fn write(&self, out: &mut dyn Write) -> io::Result<()> {
+    fn write<W: Write + ?Sized>(&self, out: &mut W) -> io::Result<()> {
         let value = postcard::encode(self)?;
         postcard::write(out, &value)
     }

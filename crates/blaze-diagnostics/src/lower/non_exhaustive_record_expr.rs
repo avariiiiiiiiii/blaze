@@ -16,17 +16,23 @@ use crate::{
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::NonExhaustiveRecordExpr) -> Vec<Found> {
     let span = cx.span_of_ptr(d.expr);
-    let Some(syntax::ast::Expr::RecordExpr(record)) = cx.node(d.expr).value.left() else { return vec![] };
-    let Some(variant) = cx.sema.resolve_variant(record) else { return vec![] };
+    // alloc: empty, allocates nothing
+    let Some(syntax::view::Expr::RecordExpr(record)) = cx.node_view(d.expr).value.left() else { return vec![] };
+    // alloc: empty, allocates nothing
+    let Some(variant) = cx.vsema.resolve_variant(record) else { return vec![] };
     let what = variant_descr(variant);
+    // alloc: the error's text, for an error hir found
     let message = format!("cannot create non-exhaustive {what} using struct expression");
     let mut diag = Diag::error(Some("E0639"), message, span);
     let adt = variant.adt(cx.db);
+    // alloc: the error's text, for an error hir found
     let name = variant.name(cx.db).display(cx.db, cx.edition).to_string();
     diag.fact(
         Fact::Signature(cx.key(ItemId::Adt(adt.into()))),
+        // alloc: the error's text, for an error hir found
         format!("whether `{name}` is `#[non_exhaustive]`"),
     );
     code_fact(cx, &mut diag, d.expr.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }

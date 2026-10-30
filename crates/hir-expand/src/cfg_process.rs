@@ -3,6 +3,7 @@ use std::{cell::OnceCell, ops::ControlFlow};
 
 use ::tt::TextRange;
 use base_db::{Db, Crate};
+use blaze_mem::Frame;
 use cfg::CfgExpr;
 use parser::T;
 use smallvec::SmallVec;
@@ -11,11 +12,11 @@ use syntax::{
     ast::{self, HasAttrs},
     view::{self, AstNode as _, HasAttrs as _},
 };
-use syntax_bridge::DocCommentDesugarMode;
+use syntax_bridge::{DocCommentDesugarMode, Inserted};
 
 use crate::{
     attrs::{
-        AttrId, expand_cfg_attr, expand_view_cfg_attr, is_item_tree_filtered_attr,
+        AttrId, expand_cfg_attr, expand_cfg_attr_view, is_item_tree_filtered_attr,
         with_one_segment, with_one_segment_view,
     },
     fixup::{self, SyntaxFixupUndoInfo},
@@ -26,10 +27,8 @@ use crate::{
 struct ItemIsCfgedOut;
 
 /// The callback's answers that insert no tokens, keeping or skipping the token.
-// alloc: none, an empty `Vec`
-const KEEP: (bool, Vec<tt::Leaf>) = (true, Vec::new());
-// alloc: none, an empty `Vec`
-const SKIP: (bool, Vec<tt::Leaf>) = (false, Vec::new());
+const KEEP: (bool, Inserted) = (true, Inserted::new_const());
+const SKIP: (bool, Inserted) = (false, Inserted::new_const());
 
 /// An attribute `cfg_attr` leaves: where its text is.
 #[derive(Debug)]
@@ -66,13 +65,14 @@ macro_rules! macro_input_callback_impl {
     ) => {
         #[allow(clippy::clone_on_copy, reason = "a view is `Copy`, a handle is not: one body for both")]
         fn $name(
+            frame: &Frame,
             db: &Db,
             is_derive: bool,
             censor_item_tree_attr_ids: &[AttrId],
             krate: Crate,
             default_span: Span,
             span_map: SpanMap<'_>,
-        ) -> impl FnMut(&mut $Preorder, &WalkEvent<$Element>) -> (bool, Vec<tt::Leaf>) {
+        ) -> impl FnMut(&mut $Preorder, &WalkEvent<$Element>) -> (bool, Inserted) {
             let cfg_options = OnceCell::new();
             let cfg_options = move || *cfg_options.get_or_init(|| krate.cfg_options(db));
 
@@ -93,8 +93,7 @@ macro_rules! macro_input_callback_impl {
                 }
             };
 
-            // alloc: one list per input, reused for every node with attributes
-            let mut attrs = Vec::new();
+            let mut attrs: Vec<AstAttrToProcess, &Frame> = Vec::new_in(frame);
             let mut attrs_idx = 0;
             let mut has_inner_attrs_owner = false;
             let mut in_attr = false;
@@ -258,7 +257,7 @@ macro_rules! macro_input_callback_impl {
                             NextExpandedAttrState::NotStarted => {
                                 if token_range.start() >= expanded_attr.range.start() {
                                     // We started the next attribute.
-                                    let mut insert_tokens = Vec::with_capacity(3);
+                                    let mut insert_tokens = Inserted::new();
                                     insert_tokens.push(tt::Leaf::Punct(tt::Punct {
                                         char: '#',
                                         spacing: tt::Spacing::Alone,
@@ -288,12 +287,12 @@ macro_rules! macro_input_callback_impl {
                             NextExpandedAttrState::InTheMiddle => {
                                 if token_range.start() >= expanded_attr.range.end() {
                                     // Finished the current attribute.
-                                    // alloc: the `]` after an expanded attribute: the bridge's callback takes a `Vec`
-                                    let insert_tokens = vec![tt::Leaf::Punct(tt::Punct {
+                                    let mut insert_tokens = Inserted::new();
+                                    insert_tokens.push(tt::Leaf::Punct(tt::Punct {
                                         char: ']',
                                         spacing: tt::Spacing::Alone,
                                         span: ast_attr.brackets_span.close,
-                                    })];
+                                    }));
 
                                     ast_attr.next_expanded_attr = NextExpandedAttrState::NotStarted;
                                     ast_attr.expanded_attrs_idx += 1;
@@ -323,7 +322,7 @@ macro_input_callback_impl!(
     view::Element<'_>,
     view::Token<'_>,
     view,
-    expand_view_cfg_attr,
+    expand_cfg_attr_view,
     CfgExpr::parse_from_view,
     with_one_segment_view
 );
@@ -350,23 +349,32 @@ pub(crate) fn attr_macro_input_to_token_tree(
     krate: Crate,
     fix_errors: bool,
 ) -> (tt::TopSubtree, SyntaxFixupUndoInfo) {
-    let fixups = if fix_errors {
-        fixup::fixup_syntax(span_map, node, span, DocCommentDesugarMode::ProcMacro)
-    } else {
-        fixup::SyntaxFixups::default()
-    };
-    (
-        syntax_bridge::call_input_modified(
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        let fixups = if fix_errors {
+            fixup::fixup_syntax(frame, span_map, node, span, DocCommentDesugarMode::ProcMacro)
+        } else {
+            fixup::SyntaxFixups::new_in(frame)
+        };
+        let callback = macro_input_callback(
+            frame,
+            db,
+            is_derive,
+            censor_item_tree_attr_ids,
+            krate,
+            span,
+            span_map,
+        );
+        let tt = syntax_bridge::call_input_modified(
             node,
             InOrder::new(span_map),
             fixups.append,
             fixups.remove,
             span,
             DocCommentDesugarMode::ProcMacro,
-            macro_input_callback(db, is_derive, censor_item_tree_attr_ids, krate, span, span_map),
-        ),
-        fixups.undo_info,
-    )
+            callback,
+        );
+        (tt, fixups.undo_info)
+    })
 }
 
 /// [`attr_macro_input_to_token_tree`] of an edited tree's handle (`expand_speculative`), which
@@ -381,28 +389,36 @@ pub(crate) fn attr_macro_input_to_token_tree_handle(
     krate: Crate,
     fix_errors: bool,
 ) -> (tt::TopSubtree, SyntaxFixupUndoInfo) {
-    let fixups = if fix_errors {
-        fixup::fixup_syntax_handle(span_map, node, span, DocCommentDesugarMode::ProcMacro)
-    } else {
-        fixup::SyntaxFixups::default()
-    };
-    (
-        syntax_bridge::syntax_node_to_token_tree_modified(
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        let fixups = if fix_errors {
+            fixup::fixup_syntax_handle(
+                frame,
+                span_map,
+                node,
+                span,
+                DocCommentDesugarMode::ProcMacro,
+            )
+        } else {
+            fixup::SyntaxFixups::new_in(frame)
+        };
+        let callback = macro_input_callback_handle(
+            frame,
+            db,
+            is_derive,
+            censor_item_tree_attr_ids,
+            krate,
+            span,
+            span_map,
+        );
+        let tt = syntax_bridge::syntax_node_to_token_tree_modified(
             node,
             InOrder::new(span_map),
             fixups.append,
             fixups.remove,
             span,
             DocCommentDesugarMode::ProcMacro,
-            macro_input_callback_handle(
-                db,
-                is_derive,
-                censor_item_tree_attr_ids,
-                krate,
-                span,
-                span_map,
-            ),
-        ),
-        fixups.undo_info,
-    )
+            callback,
+        );
+        (tt, fixups.undo_info)
+    })
 }

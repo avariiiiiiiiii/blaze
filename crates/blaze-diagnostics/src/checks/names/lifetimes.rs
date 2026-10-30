@@ -10,8 +10,8 @@
 
 use hir::InFile;
 use syntax::{
-    AstNode, SyntaxNode, TextRange,
-    ast::{self, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+    TextRange,
+    view::{self as ast, AstNode, HasGenericParams as _, HasName as _, HasTypeBounds as _},
 };
 
 use super::{Signature, outer};
@@ -54,41 +54,41 @@ impl Kind {
 
 /// A lifetime rib of rustc's: what it declares, and its span (`for<..>` or `<..>`, or empty
 /// where they would go).
-struct Binder {
+struct Binder<'t> {
     kind: Kind,
-    list: Option<ast::GenericParamList>,
+    list: Option<ast::GenericParamList<'t>>,
     span: TextRange,
-    node: SyntaxNode,
+    node: ast::Node<'t>,
 }
 
-impl Binder {
-    fn of(node: &SyntaxNode) -> Option<Binder> {
-        let binder = |kind, for_binder: Option<ast::ForBinder>, at: TextRange| {
-            let list = for_binder.as_ref().and_then(|it| it.generic_param_list());
+impl<'t> Binder<'t> {
+    fn of(node: ast::Node<'t>) -> Option<Binder<'t>> {
+        let binder = |kind, for_binder: Option<ast::ForBinder<'t>>, at: TextRange| {
+            let list = for_binder.and_then(|it| it.generic_param_list());
             let span = for_binder.map_or(TextRange::empty(at.start()), |it| it.syntax().text_range());
-            Some(Binder { kind, list, span, node: node.clone() })
+            Some(Binder { kind, list, span, node })
         };
-        if let Some(it) = ast::ForType::cast(node.clone()) {
+        if let Some(it) = cast::<ast::ForType>(node) {
             return binder(Kind::FnPtrType, it.for_binder(), it.syntax().text_range());
         }
-        if let Some(it) = ast::FnPtrType::cast(node.clone()) {
+        if let Some(it) = cast::<ast::FnPtrType>(node) {
             if node.parent().is_some_and(|it| ast::ForType::can_cast(it.kind())) {
                 return None;
             }
             return binder(Kind::FnPtrType, None, it.syntax().text_range());
         }
-        if let Some(it) = ast::TypeBound::cast(node.clone()) {
+        if let Some(it) = cast::<ast::TypeBound>(node) {
             let path = match it.ty()? {
                 ast::Type::PathType(ty) => ty.syntax().text_range(),
                 _ => return None,
             };
             return binder(Kind::PolyTrait, it.for_binder(), path);
         }
-        if let Some(it) = ast::WherePred::cast(node.clone()) {
+        if let Some(it) = cast::<ast::WherePred>(node) {
             it.ty()?;
             return binder(Kind::WhereBound, it.for_binder(), it.syntax().text_range());
         }
-        let kind = match ast::Item::cast(node.clone())? {
+        let kind = match cast::<ast::Item>(node)? {
             ast::Item::Fn(_) => Kind::Function,
             ast::Item::Struct(_)
             | ast::Item::Enum(_)
@@ -107,30 +107,35 @@ impl Binder {
             ast::Item::Impl(_) => Kind::ImplBlock,
             _ => return None,
         };
-        let list = ast::AnyHasGenericParams::cast(node.clone())?.generic_param_list();
+        let list = cast::<ast::AnyHasGenericParams>(node)?.generic_param_list();
         let span = match &list {
             Some(it) => it.syntax().text_range(),
             None => {
-                let after = match ast::AnyHasName::cast(node.clone()).and_then(|it| it.name()) {
+                let after = match cast::<ast::AnyHasName>(node).and_then(|it| it.name()) {
                     Some(name) => name.syntax().text_range().end(),
-                    None => ast::Impl::cast(node.clone())?.impl_token()?.text_range().end(),
+                    None => cast::<ast::Impl>(node)?.impl_token()?.text_range().end(),
                 };
                 TextRange::empty(after)
             }
         };
-        Some(Binder { kind, list, span, node: node.clone() })
+        Some(Binder { kind, list, span, node })
     }
 
-    fn declares(&self, name: &str) -> Option<ast::Lifetime> {
-        declared(self.list.as_ref()?, name)
+    fn declares(&self, name: &str) -> Option<ast::Lifetime<'t>> {
+        declared(self.list?, name)
     }
 }
 
-fn declared(list: &ast::GenericParamList, name: &str) -> Option<ast::Lifetime> {
+/// `node` as an `N`, if it is one.
+fn cast<'t, N: AstNode<'t>>(node: ast::Node<'t>) -> Option<N> {
+    N::cast(node)
+}
+
+fn declared<'t>(list: ast::GenericParamList<'t>, name: &str) -> Option<ast::Lifetime<'t>> {
     list.lifetime_params().filter_map(|it| it.lifetime()).find(|it| it.text() == name)
 }
 
-pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Lifetime) -> Option<Found> {
+pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature<'_>, lifetime: ast::Lifetime<'_>) -> Option<Found> {
     let name = lifetime.text();
     if name == "'static" || name == "'_" {
         return None;
@@ -138,10 +143,10 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Life
     if lifetime.syntax().parent().is_some_and(|it| ast::LifetimeParam::can_cast(it.kind())) {
         return None;
     }
-    let inner = outer::inner_item(&signature.node.value);
+    let inner = outer::inner_item(signature.node.value);
     // Almost every lifetime is declared by a binder around it: that is found first, with
     // nothing collected; the binders are gathered for the error alone.
-    let stop = &inner;
+    let stop = inner;
     let ribs = || {
         let mut ancestors = lifetime.syntax().ancestors();
         let mut done = false;
@@ -150,7 +155,7 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Life
                 return None;
             }
             let node = ancestors.next()?;
-            done = node == *stop;
+            done = node == stop;
             Some(node)
         })
     };
@@ -158,16 +163,17 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Life
         if ast::ConstParam::can_cast(node.kind()) {
             return None;
         }
-        if Binder::of(&node).is_some_and(|it| it.declares(name).is_some()) {
+        if Binder::of(node).is_some_and(|it| it.declares(name).is_some()) {
             return None;
         }
     }
-    let binders: Vec<Binder> = ribs().filter_map(|it| Binder::of(&it)).collect();
+    // alloc: on the error path, every binder having been passed
+    let binders: Vec<Binder<'_>> = ribs().filter_map(Binder::of).collect();
     let outer = inner
         .ancestors()
         .skip(1)
         .take_while(|it| !ast::Module::can_cast(it.kind()) && !ast::SourceFile::can_cast(it.kind()))
-        .filter_map(|it| Binder::of(&it))
+        .filter_map(Binder::of)
         .find_map(|it| it.declares(name));
 
     let file = signature.node.file_id;
@@ -175,13 +181,17 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Life
     let span = at(lifetime.syntax().text_range());
     let mut diag = match &outer {
         Some(outer) => {
+            // clone: the error's span
             let mut diag = Diag::error(Some("E0401"), "can't use generic parameters from outer item", span.clone());
+            // clone: the error's span
             diag.span_label(span.clone(), "use of generic parameter from outer item");
             diag.span_label(at(outer.syntax().text_range()), "lifetime parameter from outer item");
             diag
         }
         None => {
+            // alloc: the error's message and span
             let mut diag = Diag::error(Some("E0261"), format!("use of undeclared lifetime name `{name}`"), span.clone());
+            // clone: the error's span
             diag.span_label(span.clone(), "undeclared lifetime");
             diag
         }
@@ -198,11 +208,13 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Life
                 continue;
             }
             let higher_ranked = binder.kind.is_higher_ranked();
+            // alloc: the error's suggestion
             let mut removed: Vec<TextRange> = Vec::new();
             let (insert, sugg) = if binder.span.is_empty() {
+                // alloc: the error's suggestion
                 let mut names = vec![name.to_owned()];
                 if binder.kind == Kind::WhereBound
-                    && let Some(pred) = ast::WherePred::cast(binder.node.clone())
+                    && let Some(pred) = ast::WherePred::cast(binder.node)
                     && let Some(bounds) = pred.type_bound_list()
                 {
                     for bound in bounds.bounds() {
@@ -215,23 +227,29 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, lifetime: &ast::Life
                             if let Some(it) = param.lifetime()
                                 && !names.iter().any(|name| *name == it.text())
                             {
+                                // alloc: the error's suggestion
                                 names.push(it.text().to_string());
                             }
                         }
                     }
                 }
                 let names = names.join(", ");
+                // alloc: the error's suggestion
                 let sugg = if higher_ranked { format!("for<{names}> ") } else { format!("<{names}>") };
                 (binder.span, sugg)
             } else {
                 let Some(angle) = binder.list.as_ref().and_then(|it| it.l_angle_token()) else { continue };
+                // alloc: the error's suggestion
                 (TextRange::empty(angle.text_range().end()), format!("{name}, "))
             };
             let message = if higher_ranked {
+                // alloc: the error's suggestion
                 format!("consider making the {} lifetime-generic with a new `{name}` lifetime", binder.kind.descr())
             } else {
+                // alloc: the error's suggestion
                 format!("consider introducing lifetime `{name}` here")
             };
+            // alloc: the error's suggestion
             let parts = std::iter::once((at(insert), sugg)).chain(removed.into_iter().map(|it| (at(it), String::new()))).collect();
             diag.multipart_suggestion(message, parts, Applicability::MaybeIncorrect);
             if higher_ranked && !noted {

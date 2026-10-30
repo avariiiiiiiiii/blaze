@@ -112,6 +112,7 @@ pub(super) fn x86(walk: &Walk<'_>) -> bool {
 /// `naked_asm!` on x86 ([`x86`]).
 pub(super) fn lints(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, out: &mut Vec<Emitted>) {
     let asm = tree.nodes.iter().find(|it| it.kind() == SyntaxKind::ASM_EXPR);
+    // clone: a cursor's refcount (no allocation), once per `asm!` call on x86
     let Some(asm) = asm.and_then(|it| ast::AsmExpr::cast(it.clone())) else { return };
     asm_lints(cx, tree, call, &asm, out);
 }
@@ -139,7 +140,7 @@ fn asm_lints(
         if tree.skipped(expr.syntax().text_range()) {
             continue;
         }
-        let Some((value, style)) = string_of(cx, expr.clone()) else { return };
+        let Some((value, style)) = string_of(cx, &expr) else { return };
         for (needle, message) in [
             (".intel_syntax", "avoid using `.intel_syntax`, Intel syntax is the default"),
             (".att_syntax", "avoid using `.att_syntax`, prefer using `options(att_syntax)` instead"),
@@ -164,7 +165,7 @@ fn asm_lints(
 
 /// rustc's `expr_to_spanned_string` of a template once the macros it is a call of are expanded:
 /// its string and, when it is raw, its number of `#`s; `None` for what is not a string.
-fn string_of(cx: &Cx<'_, '_>, expr: ast::Expr) -> Option<(String, Option<usize>)> {
+fn string_of(cx: &Cx<'_, '_>, expr: &ast::Expr) -> Option<(String, Option<usize>)> {
     match expr {
         ast::Expr::Literal(literal) => match literal.kind() {
             ast::LiteralKind::String(it) => {
@@ -177,7 +178,7 @@ fn string_of(cx: &Cx<'_, '_>, expr: ast::Expr) -> Option<(String, Option<usize>)
         },
         ast::Expr::MacroExpr(it) => {
             let expanded = cx.sema.expand_macro_call(&it.macro_call()?)?;
-            string_of(cx, ast::Expr::cast(expanded.value)?)
+            string_of(cx, &ast::Expr::cast(expanded.value)?)
         }
         _ => None,
     }
@@ -207,6 +208,7 @@ fn inner(snippet: &str, needle: &str, end: fn(char) -> bool) -> Option<(usize, u
 fn within(span: &Span, inner: Option<(usize, usize)>) -> Span {
     match inner {
         Some((lo, hi)) => span.with_lo(span.lo + lo as u32).with_hi(span.lo + hi as u32),
+        // clone: a lint's span, for a lint found
         None => span.clone(),
     }
 }
@@ -234,10 +236,12 @@ fn has_lint_id(node: &SyntaxNode) -> bool {
     {
         return false;
     }
+    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
     if let Some(stmt) = ast::ExprStmt::cast(node.clone()) {
         return stmt.semicolon_token().is_some()
             && !matches!(stmt.expr(), Some(ast::Expr::MacroExpr(_)));
     }
+    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
     if let Some(block) = ast::BlockExpr::cast(node.clone()) {
         return is_expr(&block);
     }
@@ -268,12 +272,15 @@ fn is_expr(block: &ast::BlockExpr) -> bool {
     if ast::Fn::can_cast(kind) || ast::LetElse::can_cast(kind) || ast::AsmLabel::can_cast(kind) {
         return false;
     }
+    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
     if let Some(it) = ast::IfExpr::cast(parent.clone()) {
         return !is(it.then_branch());
     }
+    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
     if let Some(it) = ast::LoopExpr::cast(parent.clone()) {
         return !is(it.loop_body());
     }
+    // clone: a cursor's refcount (no allocation), only once a `bad_asm_style` lint fires
     if let Some(it) = ast::WhileExpr::cast(parent.clone()) {
         return !is(it.loop_body());
     }

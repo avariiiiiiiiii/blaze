@@ -192,18 +192,21 @@ unsafe fn use_toolchain(dir: &Path) {
     let exe = |name: &str| bin.join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     let path = std::env::var_os("PATH");
     let path = std::iter::once(bin.clone()).chain(path.iter().flat_map(std::env::split_paths));
-    // SAFETY: no other thread runs, by this function's contract.
+    // SAFETY: `set_var` races only with another thread using the environment; `use_toolchain` runs
+    // only from `settle`, which `cargo::command` calls on the main thread once its
+    // scoped threads are joined and before any other starts; were one running, its `getenv` could
+    // read freed memory.
     unsafe { std::env::set_var("CARGO", exe("cargo")) };
-    // SAFETY: as above.
+    // SAFETY: main thread, no other running, as for `CARGO` above.
     unsafe { std::env::set_var("RUSTC", exe("rustc")) };
-    // SAFETY: as above.
+    // SAFETY: main thread, no other running, as for `CARGO` above.
     unsafe { std::env::set_var("RUSTDOC", exe("rustdoc")) };
-    // SAFETY: as above.
+    // SAFETY: main thread, no other running, as for `CARGO` above.
     unsafe { std::env::set_var("RUSTUP_TOOLCHAIN", dir) };
-    // SAFETY: as above.
+    // SAFETY: main thread, no other running, as for `CARGO` above.
     unsafe { std::env::remove_var("RUSTUP_TOOLCHAIN_SOURCE") };
     if let Ok(path) = std::env::join_paths(path) {
-        // SAFETY: as above.
+        // SAFETY: main thread, no other running, as for `CARGO` above.
         unsafe { std::env::set_var("PATH", path) };
     }
 }

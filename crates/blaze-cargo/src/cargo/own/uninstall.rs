@@ -12,6 +12,7 @@ use blaze_manifest::config::{ConfigRelativePath, Definition};
 use blaze_manifest::manifest::{EitherManifest, read_manifest};
 use blaze_manifest::targets::TargetKind;
 use blaze_manifest::{Config, Context};
+use blaze_manifest::files::Disk;
 use blaze_resolve::{PackageId, PackageIdSpec, SourceId};
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +92,7 @@ fn one(root: &Path, spec: &str, bins: &[String], quiet: bool) -> anyhow::Result<
 
 /// The package of the manifest in the working directory, which `cargo uninstall` with no
 /// spec uninstalls.
-fn cwd_package(ctx: &Context) -> anyhow::Result<PackageId> {
+fn cwd_package(ctx: &Context<Disk>) -> anyhow::Result<PackageId> {
     let cwd = ctx.config.cwd().to_owned();
     let manifest = cwd.join("Cargo.toml");
     let source = blaze_manifest::source::SourceId::for_path(&cwd)?;
@@ -154,7 +155,7 @@ fn remove(
 
 /// Where `cargo install` put its programs: `--root`, `CARGO_INSTALL_ROOT`, `install.root`, or
 /// cargo's home.
-fn root(flag: Option<&str>, config: &Config) -> anyhow::Result<PathBuf> {
+fn root(flag: Option<&str>, config: &Config<Disk>) -> anyhow::Result<PathBuf> {
     let configured = config.get::<Option<ConfigRelativePath>>("install.root")?.map(|it| {
         let resolved = it.resolve_program(config.cwd());
         if resolved.is_relative()

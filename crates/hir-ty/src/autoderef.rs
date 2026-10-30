@@ -138,8 +138,8 @@ impl<'db> AutoderefCtx<'db> for DefaultAutoderefCtx<'_, 'db> {
     }
 }
 
-pub(crate) struct InferenceContextAutoderefCtx<'a, 'db>(&'a mut InferenceContext<'db>);
-impl<'db> AutoderefCtx<'db> for InferenceContextAutoderefCtx<'_, 'db> {
+pub(crate) struct InferenceContextAutoderefCtx<'a, 'db, 'f>(&'a mut InferenceContext<'db, 'f>);
+impl<'db> AutoderefCtx<'db> for InferenceContextAutoderefCtx<'_, 'db, '_> {
     #[inline]
     fn infcx(&self) -> &InferCtxt<'db> {
         &self.0.table.infer_ctxt
@@ -170,8 +170,8 @@ pub(crate) struct GeneralAutoderef<'db, Ctx, Steps = AutoderefSteps<'db>> {
 
 pub(crate) type Autoderef<'a, 'db, Steps = AutoderefSteps<'db>> =
     GeneralAutoderef<'db, DefaultAutoderefCtx<'a, 'db>, Steps>;
-pub(crate) type InferenceContextAutoderef<'a, 'db, Steps = AutoderefSteps<'db>> =
-    GeneralAutoderef<'db, InferenceContextAutoderefCtx<'a, 'db>, Steps>;
+pub(crate) type InferenceContextAutoderef<'a, 'db, 'f, Steps = AutoderefSteps<'db>> =
+    GeneralAutoderef<'db, InferenceContextAutoderefCtx<'a, 'db, 'f>, Steps>;
 
 impl<'db, Ctx, Steps> Iterator for GeneralAutoderef<'db, Ctx, Steps>
 where
@@ -248,10 +248,10 @@ impl<'a, 'db> Autoderef<'a, 'db> {
     }
 }
 
-impl<'a, 'db> InferenceContextAutoderef<'a, 'db> {
+impl<'a, 'db, 'f> InferenceContextAutoderef<'a, 'db, 'f> {
     #[inline]
     pub(crate) fn new_from_inference_context(
-        ctx: &'a mut InferenceContext<'db>,
+        ctx: &'a mut InferenceContext<'db, 'f>,
         base_ty: Ty<'db>,
         span: Span,
     ) -> Self {
@@ -259,7 +259,7 @@ impl<'a, 'db> InferenceContextAutoderef<'a, 'db> {
     }
 
     #[inline]
-    pub(crate) fn ctx(&mut self) -> &mut InferenceContext<'db> {
+    pub(crate) fn ctx(&mut self) -> &mut InferenceContext<'db, 'f> {
         self.ctx.0
     }
 }

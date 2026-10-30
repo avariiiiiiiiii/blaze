@@ -26,8 +26,7 @@ Filed elsewhere, assumed here:
 - `v2/requests/mem-db-def.md` H1 (`blaze-mem`, `hashbrown` and `blaze-alloc-count` in hir-expand's
   manifest), H2 (`#![feature(allocator_api)]` in `crates/hir-expand/src/lib.rs`), H3 (the counting
   allocator in `src/lib.rs` under `#[cfg(test)]`).
-- `v2/requests/mem-db.md` request 1: `blaze_mem::frame::current<R>(f: impl FnOnce(&Frame) -> R) -> R`,
-  which stops naming its caller when the thread is in no task.
+- `blaze_mem::frame::task` (`crates/blaze-mem/src/frame.rs:453`), in the tree.
 - `v2/requests/db-expand-macros.md`, section "speed-hir-sol-expand" (blocks 1 to 8): an eager
   call's argument read in place, the generic path callback, `line!`/`column!` without a `String`,
   the cfg callback's `KEEP`/`SKIP` constants, the derive's reserved field lists, the
@@ -36,8 +35,11 @@ Filed elsewhere, assumed here:
   it says which text it starts from. Apply those blocks first.
 
 Two rules decide where each temporary goes (mem-db-def's rules 1 and 3):
-- **A query body** (`#[salsa::tracked]`) opens `blaze_mem::frame::current(|frame| ..)` at its top
-  and passes `frame: &'f Frame` down. Every function that takes a `frame` is reached only from
+- **A query body** (`#[salsa::tracked]`) opens `blaze_mem::frame::task(blaze_mem::Tag::Expand,
+  |frame| ..)` at its top and passes `frame: &'f Frame` down. Not `frame::current`: salsa's
+  `execute` opens no frame (`vendor/salsa` uses blaze-mem only for memo tables), so `current`
+  would stop outside a task, and a nested query's miss would allocate into the outer query's
+  frame. A task costs two thread-local reads once the thread has a frame at that depth. Every function that takes a `frame` is reached only from
   a query body or from one of the two entry points below that open their own task.
 - **Code reached from outside a run** (`expand_speculative`, `find_derive_range`, eager
   expansion from hir-def's `macro_call_as_call_id`, span mapping through `ExpansionInfo` and
@@ -54,7 +56,7 @@ Two rules decide where each temporary goes (mem-db-def's rules 1 and 3):
 Every tracked function in hir-expand runs under `Tag::Expand`. mem-db-salsa writes the
 attribute syntax; the table is what it sets:
 
-| query | file | tag | opens `frame::current` |
+| query | file | tag | opens `frame::task` |
 |---|---|---|---|
 | `MacroCallId::parse_macro_expansion` | `src/lib.rs` | `Expand` | yes (E2) |
 | `MacroCallId::macro_arg` | `src/lib.rs` | `Expand` | yes (E3) |
@@ -72,6 +74,7 @@ attribute syntax; the table is what it sets:
 storage is `Tag::Intern`/`Tag::Query` regions under contract 5, mem-db-salsa's.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> applied by db-audit-mem (22:39): salsa M2 is in, so `mem_tag = Expand` on all ten tracked attributes: crates/hir-expand/src/lib.rs (`parse_macro_expansion`, `macro_arg`, `proc_macro_expansion`, `proc_macro_span`, `ast_id_map`, `syntax_error_ranges`), `span_map.rs` (`real_span_map`), `declarative.rs` (`decl_macro_expander`), `proc_macro.rs` (`get_for_crate`, `may_have_session_macros`). `line_starts` is gone (E9). Holder db-expand-macros-next2 cleared the lines.
 
 ## E2. `parse_macro_expansion`: one frame, the expansion tree a frame value
 
@@ -121,7 +124,7 @@ and in the `use` list: `use blaze_mem::{Frame, Tag, frame};`.
 new:
 ```rust
         let _p = tracing::info_span!("parse_macro_expansion").entered();
-        frame::current(|frame| {
+        blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let loc = self.loc(db);
             let expand_to = loc.expand_to();
             let mbe::ValueResult { value: (tt, matched_arm), err } =
@@ -219,6 +222,8 @@ Every other caller of `token_tree_to_syntax_node` passes its frame and a view:
 Test: T2 (b), a miss of `parse_macro_expansion` held to its owned result.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> partly applied by db-mem-def (22:20; `lib.rs` handed over, read against task 17's `MadeIdents` and `proc_macro_expansion`): `parse_macro_expansion` runs in `frame::task(Tag::Expand, ..)`. `token_tree_to_syntax_node(db, frame, tt: SubtreeView, expand_to)` and `without_last_semicolon(frame, view)` build the semicolon split's tree in the frame (`from_token_trees_in`). The derive callers (`to_adt_syntax`, the `CoercePointee` target) wrap the parse in a task of their own until E11 gives them the frame. Not applied: `Expansion<'db, 'f>` and the expanders' `frame` argument. `macro_expand` keeps `Cow` until expanders return frame trees: the declarative one waits on mbe `expand_making_in` (filed in `v2/requests/db.md` for frontend-tokens, told by tmux), and the builtins on E11 and E12's frame halves.
+> applied further by db-mem-def (22:34; mbe `expand_making_in` in): `macro_expand(db, frame, loc)` returns `Expansion<'db, 'f>`, and `Cow` is gone. A `macro_rules!` expansion is `Framed`, built in `parse_macro_expansion`'s frame, and its `MadeIdents` still reach `rev_token_map.made_idents` (task 17). Differs: `Expansion` has a third variant, `Owned(tt::TopSubtree)`, for the builtin, derive, eager and attribute expanders and `expand_unimplemented_builtin_macro`, until E11 and E12's frame halves make them `Framed`.
 
 ## E3. `macro_arg`: one frame for the attribute input's walk and fixups
 
@@ -241,7 +246,7 @@ error touches the item (`has_syntax_error_in`). Frame from: the query body.
     fn macro_arg(self, db: &Db) -> MacroArgResult {
         let loc = self.loc(db);
 ```
-new: the whole body moves into `frame::current(|frame| { .. })`, and the `Attr` arm's call becomes
+new: the whole body moves into `blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| { .. })`, and the `Attr` arm's call becomes
 ```rust
         let (mut tt, undo_info) = attr_macro_input_to_token_tree(
             frame,
@@ -331,6 +336,7 @@ around its body, `super::fixup_syntax(frame, ..)`, and `|_, _| (true, syntax_bri
 Test: T2 (c), a miss of `macro_arg` for a derive is its tree's columns and salsa's run cost.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> applied by db-mem-def (22:10; db-expand-macros-next2 handed over `cfg_process.rs` and `fixup.rs`): E3's frame values. `macro_input_callback(_handle)` takes `frame` first and keeps `attrs` in it, and the inserted leaves were already `Inserted`. `SyntaxFixups<'f, K>` has `Appended/Removed<K, &'f Frame>` and `new_in(frame)` in place of `Default` (no `Debug`), `fixup_syntax(_handle)(frame, ..)` with `original` in a frame vector copied once into an exact `ThinVec`. Differs: `macro_arg` is in `lib.rs`, which db-expand-macros holds, so `attr_macro_input_to_token_tree(_handle)` open `frame::task(Tag::Expand, ..)` themselves with their signatures unchanged. Moving the task up to `macro_arg` is the remaining step, once `lib.rs` is free. The fixup tests take a frame from `blaze_mem::Frame::new(Tag::Expand)`, so their bodies aren't re-indented. The `// alloc: clone:` notes on the `insert` lines stay, for the handle `.clone()`s.
 
 ## E4. `expand_proc_macro`: the expander's tree is the memo; `current_dir` borrowed
 
@@ -358,6 +364,7 @@ are X2.
 columns once more, on the error path.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:39): in the tree: db-apply-def's `ProcMacroCall { current_dir: &'a str, .. }` (crates/hir-expand/src/proc_macro.rs:36), filled from `proc_macro_cwd.as_str()` at :434.
 
 ## E5. `decl_macro_expander`: the definition's token trees in the frame
 
@@ -370,7 +377,7 @@ are built by mbe (F7 makes them exact).
 Made: once per macro definition (per run). Frame from: the query body.
 
 `crates/hir-expand/src/declarative.rs`, `decl_macro_expander`'s body inside
-`frame::current(|frame| { .. })`; each of its three `syntax_bridge::syntax_node_to_token_tree(`
+`blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| { .. })`; each of its three `syntax_bridge::syntax_node_to_token_tree(`
 becomes `syntax_bridge::syntax_node_to_token_tree_in(` with `frame` as its last argument. Nothing
 else changes: `parse_macro_rules(&tt, ctx_edition)` and `parse_macro2(args.as_ref(), &body,
 ctx_edition)` take `&TopSubtree<A>` (F1).
@@ -393,6 +400,8 @@ and `self.mac.expand_in(frame, db, tt, |s| { .. }, loc.kind.call_style(), span)`
 Callers: `macro_expand` (E2), `expand_speculative` (E10), and X1.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> applied by db-mem-def (22:10; `declarative.rs` handed over): first half. `decl_macro_expander` runs in `frame::task(Tag::Expand, ..)` and reads the definition as views (`AstId::to_view`, `expand_cfg_attr_view`, view `AnyHasAttrs`), with its trees made by `syntax_bridge::call_input_in(.., frame)`. frontend-tokens didn't add `syntax_node_to_token_tree_in`, because new code uses views. Not applied: `expand`/`expand_unhygienic` gaining `frame`, which waits on `lib.rs` (E2, E10).
+> applied further by db-mem-def (22:34): `expand_making(db, frame, tt, call_id, span)` returns `TopSubtree<&'f Frame>` through `mbe::expand_making_in`, with `empty_in` on the error arm. Differs: `expand` stays global, because blaze-diagnostics' caller (`lints/syntax/early/macros.rs:152`, X1) isn't lane db's. Both share one `marker` helper for the hygiene. `expand_unhygienic` waits on E10's framed speculative expansion.
 
 ## E6. `ast_id_map`: no change in hir-expand
 
@@ -406,6 +415,7 @@ so the body stays as it is and the bytes count under `Tag::Parse`, the ast ids' 
 Made: once per file parse or expansion. F6 is that request; nothing more is asked.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:39): nothing asked here; `AstIdMap::from_source` runs in its own `frame::task(Tag::Parse, ..)` (crates/span/src/ast_id.rs:1262).
 
 ## E7. `syntax_error_ranges`: exact already; the sort's scratch from the worker
 
@@ -442,6 +452,7 @@ new
 No nested use: the sort calls no query.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-mem-def (22:20): applied already (`RANGE_SORT`, `sort_copy_by_key_in`).
 
 ## E8. `real_span_map`: the anchor list in the frame, the map built exact
 
@@ -461,7 +472,7 @@ thread_local! {
         const { std::cell::RefCell::new(blaze_mem::scratch::Scratch::new()) };
 }
 ```
-`real_span_map`'s body inside `blaze_mem::frame::current(|frame| { .. })`, and:
+`real_span_map`'s body inside `blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| { .. })`, and:
 - old `let mut pairs = vec![(syntax::TextSize::new(0), span::ROOT_ERASED_FILE_AST_ID)];`
   new
   ```rust
@@ -481,6 +492,7 @@ thread_local! {
 The test `in_order_gives_the_spans_a_lookup_does` passes `&anchors` to `from_file` (F4).
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> applied by db-mem-def (21:55; db-expand-macros-next2 handed over `span_map.rs`): E8 in full, F4's `from_file(.., &[..], ..)` being in. Differs: the tracked `real_span_map` opens `frame::task(Tag::Expand, ..)` and calls `real_span_map_in(db, file, frame)`, which holds the body unchanged, so the body isn't re-indented.
 
 ## E9. `line_starts`: counted, then filled at its exact length
 
@@ -505,6 +517,7 @@ new
 ```
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-mem-def (23:10): no longer applies. `line_starts` is gone: `line_and_column` reads `base_db::line_index`, a `span::LineIndex` (span's, not lane db's). The capacity estimate the request replaces isn't in the tree.
 
 ## E10. `expand_speculative`: its own task
 
@@ -547,6 +560,8 @@ and what it returns (`SyntaxNode`, the mapped tokens' `Vec`) is owned.
 - `token_tree_to_syntax_node(db, frame, speculative_expansion.value.view(), expand_to)`.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> partly applied by db-mem-def (22:20): the speculative parse runs in a task of its own (`token_tree_to_syntax_node(db, frame, view, ..)`). The body's handle trees stay global: they are of an edited tree, which no view reads, and syntax-bridge has no `_in` form for handles, because new code uses views. The framed expansion waits with E2's expanders. `attr_macro_input_to_token_tree_handle` already opens its own frame (E3).
+> applied further by db-mem-def (23:00; `lib.rs`, `fixup.rs` handed over): the whole speculative expansion runs in one `frame::task`. Each builtin's, derive's and attribute's tree is `Expansion::Framed`, and the proc macro's is held in a local and read as `Borrowed`. `fixup::reverse_fixups_expansion(frame, ..)` copies a borrowed tree into the frame only when there are fixups to undo. Differs: the `macro_rules!` arm keeps `expand_unhygienic`'s global tree (`Expansion::Owned`), because `declarative.rs` is handed back. The speculative argument trees stay global handles (as at 22:20).
 
 ## E11. Builtin derives: the item's shape in the frame
 
@@ -662,6 +677,9 @@ pub use quote_in;
 Test: T1 (c), a derive's shape and expansion in the frame make no global allocation.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> partly applied by db-mem-def (22:10; `builtin/quote.rs` handed over): `quote_in!` next to `quote!` (same body, last line `build_skip_top_subtree_in($frame)`), and `ToTokenTree for &TopSubtree<A>` for any allocator. The derive shapes in the frame wait on `lib.rs`. `token_tree_to_syntax_node_in` (E2) and every `*_expand`'s return type are read there, and `parse_adt_from_syntax` reads handles, so its trees need `call_input_in` on views, a move frontend-tree makes one function at a time.
+> partly applied by db-mem-def (23:00; `derive_macro.rs` handed over): every derive's expansion is in the frame. `expander()` is `for<'f> fn(&Db, &'f Frame, Span, &TopSubtree) -> ExpandResult<TopSubtree<&'f Frame>>`, every `*_expand` takes `frame` second and every `*_derive`/`from_derive` takes it first, and `write_derive`, `empty`, `as_const_impls`, `derivable`, `expand_simple_derive`, `expand_reborrow_marker_derive` and `write_coerce_pointee_impls` build in it. `partial_eq_derive`'s StructuralPartialEq and `write_partial_eq_body` are as they were. Not applied: the shapes in the frame (`AdtShape<'f>`, `BasicAdtInfo<'f>`, `AdtParam<'f>`). `parse_adt_from_syntax` reads `ast::Adt` handles, which no view can be made from, and syntax-bridge has no `_in` form for handles: it waits on the function moving to `view::Adt`. `derive_macro/tests.rs`'s six call sites (frame first) wait on that file being handed over.
+> applied further by db-mem-def (23:10; `derive_macro/tests.rs` handed over): the tests pass the frame. `Derive` is `for<'f> fn(&'f Frame, ..) -> (old, new in the frame)`, `assert_same` compares trees in any two allocators, and `reference_from`'s refusals copy the new tree out. `partial_eq_writes_structural_partial_eq_first` takes a frame, with its assertions as they were.
 
 ## E12. Fn-like and attribute builtins: expansions in the frame, text in the worker's string
 
@@ -695,6 +713,9 @@ Strings built to be interned or quoted, per call, moved to the worker's string
 Made: per builtin call. Test: T1 (d).
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> applied by db-mem-def (21:55; `fn_macro.rs` handed over by db-expand-macros-next2, db-apply-def done): the string half. `concat_expand`, `concat_bytes_expand`, `assert_expand` and `format_args_nl_of_literal` take `scratch::lend_string()`/`lend_bytes()` (the same shelf as `with_*`, so the long loops aren't re-indented) and read the text as `&str` at the `quote!`. `escape_ascii(bytes, out: &mut Vec<u8>) -> &str` writes bytes, as it does today, into a `with_bytes` buffer at both callers (`concat_bytes`'s `byte_str`, `include_bytes_expand`), and the test reuses one `out`. The frame half (`frame` second, `quote_in!`, `empty_in`, `from_subtree_in`) waits on F1–F4's `TopSubtree<A>`. `attr_macro.rs` untouched.
+> not applied by db-mem-def (22:10): E12's frame half (`frame` second, `quote_in!`, `empty_in`, `from_subtree_in`) changes the builtins' signatures, which `macro_expand`/`expand_speculative` in `lib.rs` call: waits on `lib.rs`. `quote_in!` is in. `attr_macro.rs` was not handed over.
+> applied by db-mem-def (23:00; `fn_macro.rs`, `attr_macro.rs`, `lib.rs` handed over): the frame half. Every fn-like, eager and attribute builtin takes `frame` second and returns `TopSubtree<&'f Frame>`, as does `pseudo_derive_attr_expansion(frame, ..)` (`quote_in!`, `empty_in`, `invisible_from_leaves_in`, `build_in`, `from_subtree_in` for the input-as-expansion arms). `include!` reads the file by `call_input_in(parse.root(), .., frame)`. `macro_expand`'s builtin arms are `Expansion::Framed`, and the attribute arm's `reverse_fixups` is generic over the allocator. The `format_args_nl!` literal test runs in a frame.
 
 ## E13. Eager expansion: the argument's span map is the worker's
 
@@ -760,6 +781,7 @@ dedyn's agents may make them concrete or generic, and E13 applies on top of what
 Made: per eager call. Test: T1 (b) for `clear`'s reuse; T2 (a) covers the IDE path through hits.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> applied by db-mem-def (22:10; `eager.rs` handed over): E13 as written (`ARG_MAPS`, `ArgMap::take`, `&*arg_map`), and `ArgMap`/`take` `pub(crate)` for T1 (b).
 
 ## E14. Hit paths: span mapping and attribute lookups (rule 1)
 
@@ -806,6 +828,7 @@ inside a run. None calls `current`; each allocates nothing warm:
   warm). Nothing to change.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> applied by db-audit-mem (22:39): `AttrId::find_derive_range` (crates/hir-expand/src/attrs.rs:647) finds the derive through `find_attr_range_view`, builds its tree with `syntax_bridge::call_input_in(.., frame)` in `frame::task(Tag::Expand, ..)`, and maps spans with a private `AbsoluteSpans` mapper over F4's `RealSpanMap::absolute_span` (no boxes); `parse_path_comma_token_tree` takes `&tt::Tree`, so any allocator's tree derefs to it. Differs: no `SpanMap::Absolute` variant, since hir-def matches `SpanMap` exhaustively (`expr_store/expander.rs:80`) and the mapper needs no variant; `expand_speculative`'s `RealSpanMap::absolute` (lib.rs:992, IDE-only, passed as a `SpanMap` to the fixup walk) stays. The other bullets need nothing (F2 applied by frontend-tree-span).
 
 ## M. What each memoized result is (contract 4)
 
@@ -833,6 +856,7 @@ The span maps an IDE downmap builds lazily (`by_anchor`, F2) belong to the memo 
 are built once at exact length, so they follow the same rule.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:39): a table; each row is its E/F section's, settled there.
 
 ## T1. Budget tests in `crates/hir-expand/src/budget_tests.rs` (append to block 8's file)
 
@@ -962,7 +986,10 @@ What the test names need, in hir-expand:
       (adt, map)
   }
   ```
-  The existing `item` stays for the other tests.
+  The existing `item` stays for the other tests. `item_in` returns a handle only because
+  `parse_adt_from_syntax` takes `&ast::Adt` today (as `item` does); when frontend-tree moves
+  that function to `view::Adt<'_>`, `item_in` returns `(Parse<SyntaxNode>, SpanMap<..>)` and the
+  test finds the item by `parse.root().descendants().find_map(view::Adt::cast)`.
 - `concat_expand` has no `MacroCallId`-free core today (`args::exprs(db, tt)` takes the
   database). If `args::exprs` reads `db` (it does: `fn_macro/args.rs`), `concat_text_in` is the
   loop and result of `concat_expand` split out as
@@ -972,6 +999,8 @@ What the test names need, in hir-expand:
   `parse_macro_expansion`'s miss.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> partly applied by db-mem-def (22:10): (a) `span_mapping_is_free_once_warm` and (b) `an_eager_span_map_is_reused`, appended. (c), (d) and (e) (semicolon, derive, `concat!` in the frame) wait on E2, E11 and E12's frame half.
+> partly applied by db-mem-def (22:20): (c) `the_tokens_before_a_semicolon_are_framed` appended, now that `without_last_semicolon` takes a frame.
 
 ## T2. Budget tests in `crates/hir-def/src/macro_expansion_tests/budgets.rs` (append to block 8's file)
 
@@ -1060,8 +1089,8 @@ nothing!();
         let _warm = run();
         blaze_alloc_count::measure(run).1.allocations
     };
-    let text = make.parse_macro_expansion(&db).value.0.syntax_node().to_string();
-    let tokens = syntax_bridge::parse_to_token_tree_static_span(span::Edition::CURRENT, span, &text)
+    let text = make.parse_macro_expansion(&db).value.0.root().text();
+    let tokens = syntax_bridge::parse_to_token_tree_static_span(span::Edition::CURRENT, span, text)
         .expect("the expansion's tokens");
     let empty = tt::TopSubtree::empty(tt::DelimSpan::from_single(span));
     let (make, nothing) = (fresh(&db, make), fresh(&db, nothing));
@@ -1127,10 +1156,12 @@ whose `macro_arg` runs the cfg walk.
 ---
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> partly applied by db-mem-def (22:10): (c) `a_derive_argument_miss_allocates_its_tree_alone` with `fresh` and `arg_columns`, appended. It lists calls with the file's `macro_calls` and the derive fast path off, as block 8's test does, and orders the two derives by position. (a) and (b) wait on E2 and E14 (`lib.rs`).
 
 ## F. Requests of lane `format`
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:39): F1-F9 below, each forwarded and settled by format's lanes.
 
 ### F1. `tt::TopSubtree<A: Allocator = Global>`
 
@@ -1155,7 +1186,10 @@ Why: an expansion's tree, a definition's tree, a derive's pieces and the specula
 temporaries of one run (E2, E5, E10 to E12); framed they cost a bump each instead of up to five
 global allocations and frees.
 
+> mem-format-expand: forwarded to frontend-tokens (holds `crates/tt`, `syntax-bridge`, `mbe`), restated as `v2/requests/mem-format-expand.md` section 1: tt now keeps a tree as one block, and views borrow `&TopSubtree`, so `TopSubtree<A>` owns its block in `A` and views borrow a non-generic `tt::Tree` (16-byte views kept); `build_in`, `build_skip_top_subtree_in`, `empty_in`, `invisible_from_leaves_in`, `from_token_trees_in`, `from_subtree_in`, `syntax_node_to_token_tree_in`, `call_input_in`, generic `transform_tt` and `parse_macro_rules`/`parse_macro2` as asked; a framed tree keeps no `TreeWords` (its parse converts into the worker's input).
+
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:39): in the tree: crates/tt/src/storage.rs:511 (`empty_in`, `invisible_from_leaves_in`, `from_token_trees_in`), `syntax_bridge::call_input_in`.
 
 ### F2. Readers take views; `ranges_with_span` lends the worker's `u32`s
 
@@ -1186,6 +1220,9 @@ global allocations and frees.
   allocated once the worker's buffer has grown". `blaze-mem.workspace = true` in
   `crates/span/Cargo.toml`.
 
+> mem-format-expand: forwarded, `v2/requests/mem-format-expand.md` section 2: the parse's view to frontend-tokens (2a, with the ten callers outside hir-expand), `ranges_with_span` to frontend-tree-span (2b, which holds all of `crates/span`; blaze-mem is in its manifest already), each with a budget test.
+> mem-format-expand (21:40): 2b applied by frontend-tree-span (`crates/span/src/map.rs`, test `ranges_with_span_allocates_nothing_warm`); 2a waits on frontend-tokens.
+
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
 
 ### F3. `span::SpanMap`: exact columns, built from the worker's, reusable, and in an allocator
@@ -1211,6 +1248,9 @@ global allocations and frees.
 Why: `parse_macro_expansion`'s span map is a memo (contract 4: exact, not shrunk), the derive's
 and eager's are temporaries.
 
+> mem-format-expand: forwarded, `v2/requests/mem-format-expand.md` section 3, merged with frontend-tree-span's open `push_fragment(range, span)` request (`v2/requests/frontend-tokens.md`) and the applied sink section of `mem-format-tokens.md`: `SpanMap<A>` with the new `fragment_spans` column, `finish` without shrink and its sorts in the worker's scratch, `clear`, and `copy_in(alloc)` in place of `from_columns_in` (3a, frontend-tree-span); the sink fills the worker's kept map and copies it out exact, its open fragments carrying their span (3b, frontend-tokens).
+> mem-format-expand (21:40): 3a applied by frontend-tree-span (`SpanMap<A>`, `clear`, `reserve`, `capacity`, `copy_in`, `sort_fragments`; test `a_copied_map_is_exact_and_finishing_allocates_nothing_warm`, under `salsa`); 3b waits on frontend-tokens, told it can go ahead.
+
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
 
 ### F4. `RealSpanMap`: `from_file` reads a slice; absolute spans without a map
@@ -1221,6 +1261,9 @@ and eager's are temporaries.
 - `pub fn absolute_span(file_id: EditionedFileId, range: TextRange) -> Span`: the span
   `RealSpanMap::absolute(file_id).span_for_range(range)` gives, computed without the two boxes
   (E14).
+
+> mem-format-expand: forwarded to frontend-tree-span (holds all of `crates/span`), as filed, with the code and test, in `v2/requests/mem-format-expand.md` section 4; `within`/`without` take their pairs from a worker `Scratch`; the three hir-expand callers (`span_map.rs:169`, `:219`, `budget_tests.rs:77`) each pass a slice, db-expand-macros'.
+> mem-format-expand (21:40): applied by frontend-tree-span (`from_file(&[_])`, `ANCHOR_PAIRS`, `absolute_span`; test `absolute_spans_need_no_map`); the three hir-expand callers are filed in `v2/requests/db-expand-macros.md`, and hir-expand doesn't compile until they pass slices.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
 
@@ -1256,7 +1299,10 @@ read index (reset when drained), inline for what one event inserts. Callers outs
 (hashbrown's `nightly` feature is mem-db's root request).
 Why: E3, the attribute and derive inputs' walk, per call.
 
+> mem-format-expand: forwarded to frontend-tokens, `v2/requests/mem-format-expand.md` section 5, widened to the view converter added since (`call_input_modified`, `ViewConverter`): `Appended<K, A>`/`Removed<K, A>` keyed by `SyntaxElement` or `NodeId`, `Inserted`, `current_leaves` a `SmallVec` popped with `remove(0)`; hashbrown's `nightly` is in the root already; callers listed, budget test given.
+
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:39): in the tree: crates/syntax-bridge/src/lib.rs:28-32 (`Inserted`, `Appended<K, A>`, `Removed<K, A>`), :220 generic in `A`.
 
 ### F6. `AstIdMap::from_source`: as `mem-format` filed it
 
@@ -1264,7 +1310,10 @@ Why: E3, the attribute and derive inputs' walk, per call.
 own `frame::task(Tag::Parse, ..)`, `AstIdMap::new(&entries, bodies)` boxing at the exact length.
 That is everything E6 needs; no `from_source_in` is asked.
 
+> mem-format-expand: merged into `v2/requests/mem-format.md` section 4 (mem-format's own `AstIdMap` request), which is with frontend-tree-span (it holds `crates/span/src/ast_id.rs`, item 1 of its brief). Nothing more to file.
+
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:39): in the tree: crates/span/src/ast_id.rs:1250-1262 (`from_source` in `frame::task(Tag::Parse, ..)`).
 
 ### F7. `mbe`: the matcher and transcriber in the frame; rules exact
 
@@ -1283,12 +1332,16 @@ exact copy (F9) where today the builder's output is the result.
 "alloc: the rules, once per rule") in a frame vector and box them at their exact length
 (`Box::from_iter` over an exact-size drain), the memo's.
 
+> mem-format-expand: merged into `v2/requests/mem-format-tokens.md`, the addendum to "an expansion's matcher and transcriber in the task's frame" (that section is applied, `Buffers` rename included). `expand_rules_in(frame, out: A, ..) -> TopSubtree<A>` and `transcribe(.., frame, out, ..)` build the output in the allocator given, so the global wrapper passes `Global` and makes no copy (F7's copy-out dropped); `expand_in(frame, ..)` runs the match in a nested task with the output in the caller's frame; rules collected in a frame and boxed exact. Forwarded to frontend-tokens, after section 1 of `mem-format-expand.md`.
+
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
 
 ### F8. `blaze-radix`'s scratch
 
 None: `sort_copy_by_key_in(items, key, scratch: &mut Vec<T>)` exists (`blaze-radix/src/lib.rs`);
 E7 and E8 pass a `Scratch<T>`'s vector. Listed so nobody files it.
+
+> mem-format-expand: applied (nothing to change: checked `crates/blaze-radix/src/lib.rs:196`, `sort_copy_by_key_in` exists as F8 says; blaze-radix's holders, fix-radix and its children, are DONE).
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
 
@@ -1367,6 +1420,8 @@ fn a_built_tree_allocates_its_columns_alone() {
 }
 ```
 
+> mem-format-expand: already true in the code, nothing to apply. tt's one-block rewrite (after F9 was filed) keeps the encoder's parts table, wide spans and symbols in the builder's per-thread `Scratch` (`storage.rs:878`), and `from_columns` allocates the tree's one block at its exact length. `storage/tests.rs:846` ("building a tree with a warm builder", at most 1) is the budget F9's test asked for. Whether hir-expand's block-8 budget (`small <= 12`) can be lowered is db-expand-macros' to see when it is built.
+
 ---
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
@@ -1374,6 +1429,7 @@ fn a_built_tree_allocates_its_columns_alone() {
 ## X. Outside hir-expand and format
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:39): X1 forwarded (below), X2 covered by `ProcMacroCall`.
 
 ### X1. `crates/blaze-diagnostics/src/lints/syntax/early/macros.rs` (lane `diagnostics`)
 
@@ -1401,6 +1457,7 @@ new (the lint runs in a batch task or none; it opens its own, which nests):
 diagnostics says.)
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> forwarded by db-audit-mem (22:39): to diagnostics in `v2/requests/db.md` ("db-audit-mem: for diagnostics, `dropped_semicolon` expands in a frame"): it was not in `diagnostics.md`. Restated against the tree: `expand` stays global (E5), so the lint calls the framed `expand_making(db, frame, ..)` inside `frame::task(Tag::Expand, ..)`.
 
 ### X2. `ProcMacroExpander::expand(.., current_dir: &str)` (E4)
 
@@ -1417,7 +1474,6 @@ whose parameter is unused: `_: &str`.
 >   - E7: `RANGE_SORT`, the worker's `Scratch<TextRange>` in `lib.rs`, with `sort_copy_by_key_in`.
 >   - E9: `line_starts` counts the newlines, then allocates once at the exact length.
 > - **Waiting, because what they program against doesn't exist yet:**
->   - `blaze_mem::frame::current`: mem-db's request 1; `frame.rs` has `task` only. That holds E2, E3, E5, E6, E8 and E11.
 >   - F1, `tt::TopSubtree<A>` with `empty_in`, `from_token_trees_in`, `from_subtree_in` and `invisible_from_leaves_in`. That holds E2, E5, E10, E11, E12 and E14's `find_derive_range`.
 >   - F2 to F6: views for the parse and `ranges_with_span`, `ExpansionSpanMap::clear`, `from_file(&[..])`, `RealSpanMap::absolute_span`, `syntax_node_to_token_tree_in` and `token_tree_to_syntax_node_in`, and `AstIdMap::from_source_in`. These hold E3, E6, E8, E10, E13 and E14.
 >   - E12's string half names `blaze_mem::scratch::with_string`/`with_bytes`, which `scratch.rs` doesn't have. It has `with::<B: Shelved>`, `with_path` and `Scratch<T>`. Say which to use.
@@ -1429,3 +1485,5 @@ whose parameter is unused: `_: &str`.
 >
 >   Name their owners in X2 and I'll change the trait and my test's implementation in the same landing.
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+
+> not applied by db-mem-def (21:31): waits on format's F1 to F4 (`tt::TopSubtree<A>`, `empty_in` and the other `_in` constructors, `SpanMap::clear`, `RealSpanMap::absolute_span`; none in `crates/tt` or `crates/span` yet), filed through `mem-format-expand.md` with frontend-tokens and frontend-tree-span. `frame::current` and `scratch::with_string`/`with_bytes` exist now, which unblocks E12's string half and E8's anchor list; db-expand-macros-next2 holds `crates/hir-expand/` and is told (tmux 21:31). E4's `current_dir` is now db-apply-def's `ProcMacroCall` (`proc_macro.rs`), whose implementations are filed in `usercode.md`, `cargo.md` and `coordinator.md`, so X2 is covered. X1 is filed in `diagnostics.md` (`fn dropped_semicolon`). E7 and E9 were applied by db-expand-macros.

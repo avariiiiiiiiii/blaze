@@ -1,5 +1,5 @@
 //! Token trees as their columns ([`version::WIRE_TREES`]): a request carries the macro's input
-//! and attribute as [`tt::TopSubtree::write_wire`] writes them, and the answer its output the
+//! and attribute as [`tt::Tree::write_wire`] writes them, and the answer its output the
 //! same way, read back checked by [`tt::TopSubtree::read_wire`]. Nothing is converted per token
 //! but what a proc macro must not see (the parentheses of a fragment passed on, as
 //! [`FlatTree`](crate::legacy_protocol::msg::FlatTree) leaves them out).
@@ -11,8 +11,16 @@
 //!
 //! [`version::WIRE_TREES`]: crate::version::WIRE_TREES
 
+use std::fmt;
+
+use blaze_mem::{Frame, Tag, frame};
 use paths::Utf8PathBuf;
 use rustc_hash::FxHashMap;
+use serde::{
+    Deserializer, Serializer,
+    de::{MapAccess, SeqAccess, Visitor},
+    ser::{SerializeSeq, SerializeStruct},
+};
 use serde_derive::{Deserialize, Serialize};
 use span::{
     Edition, EditionedFileId, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange,
@@ -21,9 +29,13 @@ use span::{
 use tt::{TtElement, WirePart};
 
 use crate::{
-    bidirectional_protocol::msg::{ParentSpan, SpanJoin, SubResponse},
+    ProcMacroKind,
+    bidirectional_protocol::msg::{
+        ExpandMacroResponse, ParentSpan, Request, SpanJoin, SubRequest, SubResponse,
+    },
     legacy_protocol::msg::{
-        FlatTree, SpanDataIndexMap, deserialize_span_data_index_map, flat::fragment_contents,
+        FlatTree, PanicMessage, ServerConfig, SpanDataIndexMap, deserialize_span_data_index_map,
+        flat::fragment_contents,
     },
 };
 
@@ -85,6 +97,170 @@ pub struct ExpandMacroWire {
     pub mixed_site: WireSpan,
 }
 
+/// An [`ExpandMacroWire`] borrowed from its caller, written as the same bytes: a conversation
+/// encodes its request without copying a string, a variable or a tree. Its environment is
+/// `passed`, then `call`.
+pub struct WireAsk<'a> {
+    pub lib: &'a str,
+    pub passed: &'a [(String, String)],
+    pub call: &'a [(String, String)],
+    pub current_dir: &'a str,
+    pub macro_name: &'a str,
+    pub trees: &'a [u8],
+    pub has_attributes: bool,
+    pub sites: [WireSpan; 3],
+}
+
+/// The index of `Request` in `BidirectionalMessage`, and of `ExpandMacroWire` in `Request`, as
+/// their derives number them.
+const REQUEST: u32 = 0;
+const EXPAND_MACRO_WIRE: u32 = 4;
+
+impl WireAsk<'_> {
+    /// The request as the message `BidirectionalMessage::Request(Request::ExpandMacroWire(..))`
+    /// is written.
+    pub fn message(&self) -> impl serde::Serialize + '_ {
+        Variant { of: "BidirectionalMessage", index: REQUEST, name: "Request", value: Variant {
+            of: "Request",
+            index: EXPAND_MACRO_WIRE,
+            name: "ExpandMacroWire",
+            value: self,
+        } }
+    }
+}
+
+/// One variant of an enum, holding `value`, as a derive writes it.
+struct Variant<T> {
+    of: &'static str,
+    index: u32,
+    name: &'static str,
+    value: T,
+}
+
+impl<T: serde::Serialize> serde::Serialize for Variant<T> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_newtype_variant(self.of, self.index, self.name, &self.value)
+    }
+}
+
+impl serde::Serialize for WireAsk<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let [def_site, call_site, mixed_site] = &self.sites;
+        let mut it = s.serialize_struct("ExpandMacroWire", 9)?;
+        it.serialize_field("lib", self.lib)?;
+        it.serialize_field("env", &Env(self.passed, self.call))?;
+        it.serialize_field("current_dir", &Some(self.current_dir))?;
+        it.serialize_field("macro_name", self.macro_name)?;
+        it.serialize_field("trees", &Bytes(self.trees))?;
+        it.serialize_field("has_attributes", &self.has_attributes)?;
+        it.serialize_field("def_site", def_site)?;
+        it.serialize_field("call_site", call_site)?;
+        it.serialize_field("mixed_site", mixed_site)?;
+        it.end()
+    }
+}
+
+/// Two lists of variables written as one `Vec<(String, String)>`.
+struct Env<'a>(&'a [(String, String)], &'a [(String, String)]);
+
+impl serde::Serialize for Env<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        let mut seq = s.serialize_seq(Some(self.0.len() + self.1.len()))?;
+        for (name, value) in self.0.iter().chain(self.1) {
+            seq.serialize_element(&(name.as_str(), value.as_str()))?;
+        }
+        seq.end()
+    }
+}
+
+/// Bytes written as a `Vec<u8>` is, in one piece: postcard's length and bytes, JSON's array.
+struct Bytes<'a>(&'a [u8]);
+
+impl serde::Serialize for Bytes<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_bytes(self.0)
+    }
+}
+
+/// A server's message to a conversation of [`WireAsk`], read in place: an answer's tree is
+/// borrowed from the frame it came in, and what the client does not use of it is read past.
+#[derive(Debug, Deserialize)]
+#[serde(rename = "BidirectionalMessage")]
+pub(crate) enum Heard<'a> {
+    Request(Request),
+    #[serde(borrow)]
+    Response(HeardResponse<'a>),
+    SubRequest(SubRequest),
+    SubResponse(SubResponse),
+}
+
+/// [`Response`](crate::bidirectional_protocol::msg::Response), the answer to a wire request
+/// borrowed.
+#[derive(Debug, Deserialize)]
+#[serde(rename = "Response")]
+pub(crate) enum HeardResponse<'a> {
+    ListMacros(Result<Vec<(String, ProcMacroKind)>, String>),
+    ApiVersionCheck(u32),
+    SetConfig(ServerConfig),
+    ExpandMacro(Result<ExpandMacroResponse, PanicMessage>),
+    #[serde(borrow)]
+    ExpandMacroWire(Result<WireAnswer<'a>, PanicMessage>),
+}
+
+/// [`ExpandMacroWireResponse`](crate::bidirectional_protocol::msg::ExpandMacroWireResponse),
+/// its tree borrowed. What the macro tracked is not used: a warm server's sandbox traces what
+/// an expansion reads.
+#[derive(Debug, Deserialize)]
+pub(crate) struct WireAnswer<'a> {
+    #[serde(borrow)]
+    pub(crate) tree: &'a [u8],
+    #[serde(rename = "tracked_env_vars")]
+    _tracked_env_vars: UnusedVars,
+    #[serde(rename = "tracked_paths")]
+    _tracked_paths: UnusedNames,
+}
+
+/// A map of names to optional values, read past without keeping any.
+#[derive(Debug)]
+struct UnusedVars;
+
+/// A list of names, read past without keeping any.
+#[derive(Debug)]
+struct UnusedNames;
+
+impl<'de> serde::Deserialize<'de> for UnusedVars {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<UnusedVars, D::Error> {
+        d.deserialize_map(Past).map(|()| UnusedVars)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for UnusedNames {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<UnusedNames, D::Error> {
+        d.deserialize_seq(Past).map(|()| UnusedNames)
+    }
+}
+
+/// Reads names past, borrowed where they lie.
+struct Past;
+
+impl<'de> Visitor<'de> for Past {
+    type Value = ();
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a map or a list of names")
+    }
+
+    fn visit_map<M: MapAccess<'de>>(self, mut map: M) -> Result<(), M::Error> {
+        while map.next_entry::<&'de str, Option<&'de str>>()?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_seq<L: SeqAccess<'de>>(self, mut seq: L) -> Result<(), L::Error> {
+        while seq.next_element::<&'de str>()?.is_some() {}
+        Ok(())
+    }
+}
+
 /// How many anchors or contexts are looked for by a scan before they go in a map.
 const SCAN: usize = 8;
 
@@ -115,6 +291,12 @@ impl<K: Copy + Eq + std::hash::Hash, V: Copy> Ids<K, V> {
         }
     }
 
+    /// Empties it, keeping what it has room for.
+    fn clear(&mut self) {
+        self.list.clear();
+        self.map.clear();
+    }
+
     fn get(&self, key: K) -> Option<V> {
         match self.map.is_empty() {
             true => self.list.iter().find(|&&(it, _)| it == key).map(|&(_, value)| value),
@@ -139,6 +321,14 @@ impl Default for Sent {
 impl Sent {
     pub fn new() -> Sent {
         Sent { anchors: Ids::new(), contexts: Ids::new(), last: None }
+    }
+
+    /// Forgets what was sent, keeping the room it took: a connection notes each request's
+    /// parts in the one `Sent`.
+    pub fn clear(&mut self) {
+        self.anchors.clear();
+        self.contexts.clear();
+        self.last = None;
     }
 
     /// Notes the anchor and context of `span` as sent.
@@ -238,32 +428,35 @@ pub(crate) fn write_tree(subtree: tt::SubtreeView<'_>, sent: &mut Sent, out: &mu
     sent.span(&top.delimiter.close);
     let mut builder =
         tt::TopSubtreeBuilder::with_capacity(top.delimiter, subtree.token_trees().len());
-    // alloc: one stack per tree sent, as deep as its nesting.
-    let mut open: Vec<(tt::TtIter<'_>, Span)> = Vec::new();
-    let mut trees = fragment_contents(&top, subtree.iter()).unwrap_or_else(|| subtree.iter());
-    loop {
-        let Some(element) = trees.next() else {
-            let Some((outer, close)) = open.pop() else { break };
-            builder.close(close);
-            trees = outer;
-            continue;
-        };
-        match element {
-            TtElement::Leaf(leaf) => {
-                sent.span(leaf.span());
-                builder.push(leaf);
-            }
-            TtElement::Subtree(inner, contents) => {
-                sent.span(&inner.delimiter.open);
-                sent.span(&inner.delimiter.close);
-                builder.open(inner.delimiter.kind, inner.delimiter.open);
-                // clone: a slice iterator, no allocation.
-                let contents = fragment_contents(&inner, contents.clone()).unwrap_or(contents);
-                open.push((std::mem::replace(&mut trees, contents), inner.delimiter.close));
+    // The stack and the rebuilt tree are the request's temporaries, in its task's frame; the
+    // builder's own buffers are kept per thread.
+    frame::task(Tag::Expand, |frame| {
+        let mut open: Vec<(tt::TtIter<'_>, Span), &Frame> = Vec::new_in(frame);
+        let mut trees = fragment_contents(&top, subtree.iter()).unwrap_or_else(|| subtree.iter());
+        loop {
+            let Some(element) = trees.next() else {
+                let Some((outer, close)) = open.pop() else { break };
+                builder.close(close);
+                trees = outer;
+                continue;
+            };
+            match element {
+                TtElement::Leaf(leaf) => {
+                    sent.span(leaf.span());
+                    builder.push(leaf);
+                }
+                TtElement::Subtree(inner, contents) => {
+                    sent.span(&inner.delimiter.open);
+                    sent.span(&inner.delimiter.close);
+                    builder.open(inner.delimiter.kind, inner.delimiter.open);
+                    // clone: a slice iterator, no allocation.
+                    let contents = fragment_contents(&inner, contents.clone()).unwrap_or(contents);
+                    open.push((std::mem::replace(&mut trees, contents), inner.delimiter.close));
+                }
             }
         }
-    }
-    builder.build().write_wire(out);
+        builder.build_in(frame).write_wire(out);
+    });
 }
 
 /// The one tree of a server's answer `bytes`, each part one `sent` sent. `scratch` holds the
@@ -386,7 +579,7 @@ mod tests {
             let mut sent = Sent::new();
             let mut bytes = Vec::new();
             write_tree(tree.view(), &mut sent, &mut bytes);
-            assert_eq!(read_tree(&bytes, &sent, &mut Vec::new()), Ok(tree.clone()), "{files}");
+            assert_eq!(read_tree(&bytes, &sent, &mut Vec::new()), Ok(tree.copy()), "{files}");
         }
     }
 
@@ -500,6 +693,116 @@ mod tests {
         message(serde_json::from_str(&json).unwrap()).write(&mut frame).unwrap();
         let read = BidirectionalMessage::read(&mut &frame[..], &mut Vec::new()).unwrap();
         assert_eq!(read, Some(message(request)));
+    }
+
+    fn vars(names: &[&str]) -> Vec<(String, String)> {
+        names.iter().map(|name| (name.to_string(), format!("{name}="))).collect()
+    }
+
+    #[test]
+    fn a_borrowed_wire_request_is_written_as_the_owned_one_in_both_formats() {
+        let mut trees = Vec::new();
+        tree(2).write_wire(&mut trees);
+        let (passed, call) = (vars(&["PASSED"]), vars(&["CALL", "OTHER"]));
+        let sites = [span(1, 0, 1), span(1, 1, 1), span(1, 2, 1)].map(WireSpan::of);
+        let ask = WireAsk {
+            lib: "/lib.so",
+            passed: &passed,
+            call: &call,
+            current_dir: "/",
+            macro_name: "m",
+            trees: &trees,
+            has_attributes: true,
+            sites,
+        };
+        let [def_site, call_site, mixed_site] = sites;
+        let owned = BidirectionalMessage::Request(Request::ExpandMacroWire(Box::new(
+            ExpandMacroWire {
+                lib: Utf8PathBuf::from("/lib.so"),
+                env: [passed.clone(), call.clone()].concat(),
+                current_dir: Some("/".into()),
+                macro_name: "m".into(),
+                trees: trees.clone(),
+                has_attributes: true,
+                def_site,
+                call_site,
+                mixed_site,
+            },
+        )));
+        assert_eq!(
+            crate::transport::postcard::encode(&ask.message()).unwrap(),
+            crate::transport::postcard::encode(&owned).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string(&ask.message()).unwrap(),
+            serde_json::to_string(&owned).unwrap()
+        );
+    }
+
+    #[test]
+    fn an_answer_is_heard_where_it_lies_in_its_frame() {
+        use crate::bidirectional_protocol::msg::{ExpandMacroWireResponse, Response};
+        let mut tree_bytes = Vec::new();
+        tree(2).write_wire(&mut tree_bytes);
+        let answer = ExpandMacroWireResponse {
+            tree: tree_bytes.clone(),
+            tracked_env_vars: [("A".into(), Some("1".into())), ("B".into(), None)]
+                .into_iter()
+                .collect(),
+            tracked_paths: ["/p".into()].into_iter().collect(),
+        };
+        let message = BidirectionalMessage::Response(Response::ExpandMacroWire(Ok(answer)));
+        let mut frame = crate::transport::postcard::encode(&message).unwrap();
+        let len = crate::transport::postcard::unframe(&mut frame).unwrap();
+        let heard = crate::transport::postcard::parse::<Heard<'_>>(&frame[..len]).unwrap();
+        let Heard::Response(HeardResponse::ExpandMacroWire(Ok(heard))) = heard else {
+            panic!("an answer heard as another message");
+        };
+        assert_eq!(heard.tree, &tree_bytes[..]);
+        let range = frame.as_ptr_range();
+        assert!(range.contains(&heard.tree.as_ptr()), "the tree is read in place");
+    }
+
+    #[test]
+    fn a_wire_request_is_written_into_its_buffers_without_allocating() {
+        let (subtree, attr) = (tree(2), tree(1));
+        let (passed, call) = (vars(&["PASSED"]), vars(&["CALL"]));
+        let (mut sent, mut trees, mut frame) = (Sent::new(), Vec::new(), Vec::new());
+        let mut request = || {
+            sent.clear();
+            trees.clear();
+            write_tree(subtree.view(), &mut sent, &mut trees);
+            write_tree(attr.view(), &mut sent, &mut trees);
+            let ask = WireAsk {
+                lib: "/lib.so",
+                passed: &passed,
+                call: &call,
+                current_dir: "/",
+                macro_name: "m",
+                trees: &trees,
+                has_attributes: true,
+                sites: [span(1, 0, 1); 3].map(WireSpan::of),
+            };
+            crate::transport::postcard::encode_into(&ask.message(), &mut frame).unwrap();
+        };
+        // The first fills the buffers and the builder's scratch.
+        request();
+        blaze_alloc_count::assert_at_most(0, "a wire request into its buffers", request);
+    }
+
+    #[test]
+    fn a_wire_answer_read_allocates_only_its_tree() {
+        let tree = tree(2);
+        let mut sent = Sent::new();
+        let mut bytes = Vec::new();
+        write_tree(tree.view(), &mut sent, &mut bytes);
+        let mut aligned = Vec::new();
+        assert_eq!(read_tree(&bytes, &sent, &mut aligned).as_ref(), Ok(&tree));
+        // The tree's block: the first read kept `read_wire`'s check buffers for this thread.
+        let read = blaze_alloc_count::assert_at_most(1, "a wire answer's tree", || {
+            read_tree(&bytes, &sent, &mut aligned)
+        });
+        assert_eq!(read, Ok(tree));
     }
 
     #[test]

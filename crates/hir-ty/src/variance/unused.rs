@@ -5,17 +5,17 @@
 use std::ops::ControlFlow;
 
 use base_db::Db;
+use blaze_mem::Frame;
 use hir_def::{AdtId, GenericDefId, GenericParamId, VariantId};
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     AliasTyKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor, Variance,
     inherent::IntoKind,
 };
-use smallvec::SmallVec;
 
 use crate::{
-    GenericPredicates,
+    FrameSet, GenericPredicates,
     db::HirDatabase as _,
+    frame_set,
     generics::generics,
     next_solver::{ClauseKind, Const, ConstKind, DbInterner, Region, RegionKind, Ty, TyKind},
 };
@@ -24,48 +24,55 @@ use crate::{
 /// of its where clauses constrains, in declaration order (lifetimes first, as rustc's
 /// `own_params`). Empty when a field's type, or that of an ADT it names, has an error (rustc's
 /// `HasErrorDeep`): that error is reported instead.
+///
+/// Called outside queries (hir's E0392 check), so it runs in a task of its own (R1).
 pub fn adt_unused_params(db: &Db, adt: AdtId) -> Vec<GenericParamId> {
     let def = GenericDefId::AdtId(adt);
     let variances = super::variances_of(db, def);
-    let params: SmallVec<[GenericParamId; 8]> = generics(db, def).iter_id(false).collect();
-    let mut constrained: FxHashSet<GenericParamId> = params
-        .iter()
-        .zip(variances.as_slice())
-        .filter(|&(_, &variance)| variance != Variance::Bivariant)
-        .map(|(&param, _)| param)
-        .collect();
-    if constrained.len() == params.len() {
-        return Vec::new();
-    }
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        let mut params = Vec::new_in(frame);
+        params.extend(generics(db, def).iter_id(false));
+        let mut constrained = frame_set(frame);
+        constrained.extend(
+            params
+                .iter()
+                .zip(variances.as_slice())
+                .filter(|&(_, &variance)| variance != Variance::Bivariant)
+                .map(|(&param, _)| param),
+        );
+        if constrained.len() == params.len() {
+            return Vec::new(); // alloc: empty, allocates nothing
+        }
 
-    let projections: SmallVec<[_; 4]> = GenericPredicates::query_own_explicit(db, def)
-        .iter_identity()
-        .filter_map(|it| match it.skip_norm_wip().kind().skip_binder() {
-            ClauseKind::Projection(projection) => Some(projection),
-            _ => None,
-        })
-        .collect();
-    let mut inputs = FxHashSet::default();
-    loop {
-        let before = constrained.len();
-        for projection in &projections {
-            inputs.clear();
-            parameters_for(projection.projection_term, true, &mut inputs);
-            if inputs.is_subset(&constrained) {
-                parameters_for(projection.term, false, &mut constrained);
+        let mut projections = Vec::new_in(frame);
+        projections.extend(GenericPredicates::query_own_explicit(db, def).iter_identity().filter_map(
+            |it| match it.skip_norm_wip().kind().skip_binder() {
+                ClauseKind::Projection(projection) => Some(projection),
+                _ => None,
+            },
+        ));
+        let mut inputs = frame_set(frame);
+        loop {
+            let before = constrained.len();
+            for projection in &projections {
+                inputs.clear();
+                parameters_for(projection.projection_term, true, &mut inputs);
+                if inputs.is_subset(&constrained) {
+                    parameters_for(projection.term, false, &mut constrained);
+                }
+            }
+            if constrained.len() == before {
+                break;
             }
         }
-        if constrained.len() == before {
-            break;
-        }
-    }
 
-    let unused: Vec<GenericParamId> =
-        params.iter().copied().filter(|param| !constrained.contains(param)).collect();
-    if unused.is_empty() || has_error_deep(db, adt) {
-        return Vec::new();
-    }
-    unused
+        let mut unused = Vec::new_in(frame);
+        unused.extend(params.iter().copied().filter(|param| !constrained.contains(param)));
+        if unused.is_empty() || has_error_deep(db, adt, frame) {
+            return Vec::new(); // alloc: empty, allocates nothing
+        }
+        unused.to_vec() // alloc: the caller's list, exact size
+    })
 }
 
 /// The parameters in `value`, as rustc's `parameters_for`: those in a projection, an inherent
@@ -74,13 +81,13 @@ pub fn adt_unused_params(db: &Db, adt: AdtId) -> Vec<GenericParamId> {
 fn parameters_for<'db>(
     value: impl TypeVisitable<DbInterner<'db>>,
     include_nonconstraining: bool,
-    out: &mut FxHashSet<GenericParamId>,
+    out: &mut FrameSet<'_, GenericParamId>,
 ) {
-    struct Collect<'a> {
+    struct Collect<'a, 'f> {
         include_nonconstraining: bool,
-        out: &'a mut FxHashSet<GenericParamId>,
+        out: &'a mut FrameSet<'f, GenericParamId>,
     }
-    impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_> {
+    impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_, '_> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
             match ty.kind() {
@@ -123,12 +130,12 @@ fn parameters_for<'db>(
 
 /// rustc's `HasErrorDeep` over `type_of(adt)`: whether the type of a field of `adt`, or of an
 /// ADT a field names (each once), has an error.
-fn has_error_deep(db: &Db, adt: AdtId) -> bool {
-    struct HasErrorDeep<'db> {
+fn has_error_deep(db: &Db, adt: AdtId, frame: &Frame) -> bool {
+    struct HasErrorDeep<'db, 'f> {
         db: &'db Db,
-        seen: FxHashSet<AdtId>,
+        seen: FrameSet<'f, AdtId>,
     }
-    impl<'db> HasErrorDeep<'db> {
+    impl<'db> HasErrorDeep<'db, '_> {
         fn fields(&mut self, adt: AdtId) -> ControlFlow<()> {
             if !self.seen.insert(adt) {
                 return ControlFlow::Continue(());
@@ -152,7 +159,7 @@ fn has_error_deep(db: &Db, adt: AdtId) -> bool {
             }
         }
     }
-    impl<'db> TypeVisitor<DbInterner<'db>> for HasErrorDeep<'db> {
+    impl<'db> TypeVisitor<DbInterner<'db>> for HasErrorDeep<'db, '_> {
         type Result = ControlFlow<()>;
         fn visit_ty(&mut self, ty: Ty<'db>) -> ControlFlow<()> {
             match ty.kind() {
@@ -179,5 +186,5 @@ fn has_error_deep(db: &Db, adt: AdtId) -> bool {
             }
         }
     }
-    HasErrorDeep { db, seen: FxHashSet::default() }.fields(adt).is_break()
+    HasErrorDeep { db, seen: frame_set(frame) }.fields(adt).is_break()
 }

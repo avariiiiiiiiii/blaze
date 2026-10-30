@@ -10,7 +10,7 @@
 //!
 //! [`NextSolverError`]: crate::next_solver::fulfill::NextSolverError
 
-use hir_def::TraitId;
+use hir_def::{GenericParamId, TraitId, hir::generics::GenericParams};
 use intern::Symbol;
 use macros::{TypeFoldable, TypeVisitable};
 use rustc_type_ir::{
@@ -34,16 +34,41 @@ use crate::{
             errors::{FulfillmentError, FulfillmentErrorCode},
             resolve::ReplaceInferWithError,
             select::SelectionError,
-            traits::{ObligationCause, PredicateObligation},
+            traits::{ObligationCause, ObligationCauseCode, PredicateObligation},
         },
         obligation_ctxt::ObligationCtxt,
         util::clauses_as_obligations,
     },
 };
 
+// The derive belongs on the enum in `next_solver/infer/traits.rs` (requested of solver-sync,
+// `v2/requests/solver-sync-inbox.md`); diagnostics hash the code they carry.
+impl std::hash::Hash for ObligationCauseCode {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match *self {
+            ObligationCauseCode::WhereClauseInExpr { item, bound_index, arg_index } => {
+                (item, bound_index, arg_index).hash(state)
+            }
+            ObligationCauseCode::MatchExpressionArm { prior_arms } => prior_arms.hash(state),
+            ObligationCauseCode::Misc
+            | ObligationCauseCode::SizedArgumentType
+            | ObligationCauseCode::SizedReturnType
+            | ObligationCauseCode::BlockTailExpression
+            | ObligationCauseCode::ReturnValue
+            | ObligationCauseCode::IfExpression
+            | ObligationCauseCode::LetType => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, TypeVisitable, TypeFoldable)]
 pub struct SolverDiagnostic {
     pub span: Span,
+    /// Why the goal was required (rustc's obligation cause code): the bound of a callee for one
+    /// of its where clauses, a block's tail, and the rest.
+    #[type_visitable(ignore)]
+    pub cause: ObligationCauseCode,
     pub kind: SolverDiagnosticKind,
 }
 
@@ -52,6 +77,11 @@ pub enum SolverDiagnosticKind {
     TraitUnimplemented {
         trait_predicate: StoredTraitPredicate,
         parent_trait_predicates: Vec<StoredTraitPredicate>,
+        /// For each of `parent_trait_predicates`, the impl that would prove it, whose where
+        /// clause required the goal nearer the error (rustc's `ImplDerived`); `None` where that
+        /// goal came from no impl.
+        #[type_visitable(ignore)]
+        parent_impls: Vec<Option<AnyImplId>>,
     },
     /// A closure does not implement the `Fn*` or `AsyncFn*` trait asked of it because of its
     /// closure kind (E0525).
@@ -328,7 +358,7 @@ impl SolverDiagnostic {
             }
             FulfillmentErrorCode::Ambiguity { overflow: None } => return None,
         };
-        Some(SolverDiagnostic { span, kind })
+        Some(SolverDiagnostic { span, cause: error.obligation.cause.code(), kind })
     }
 }
 
@@ -403,21 +433,28 @@ fn handle_trait_unimplemented<'db>(
         polarity: trait_pred.polarity,
     };
 
-    let mut parent_trait_predicates = error
+    let (mut parent_trait_predicates, mut parent_impls): (Vec<_>, Vec<_>) = error
         .parent_trait_obligations
         .iter()
-        .filter_map(|predicate| predicate.as_trait_clause())
-        .map(|trait_predicate| {
+        .zip(&error.parent_impls)
+        .filter_map(|(predicate, &parent_impl)| Some((predicate.as_trait_clause()?, parent_impl)))
+        .map(|(trait_predicate, parent_impl)| {
             let trait_predicate = trait_predicate.skip_binder();
-            StoredTraitPredicate {
+            let predicate = StoredTraitPredicate {
                 trait_ref: StoredTraitRef::new(trait_predicate.trait_ref),
                 polarity: trait_predicate.polarity,
-            }
+            };
+            (predicate, parent_impl)
         })
-        .collect::<Vec<_>>();
+        .unzip(); // alloc: error path, the diagnostic's own lists
     parent_trait_predicates.reverse();
+    parent_impls.reverse();
 
-    Some(SolverDiagnosticKind::TraitUnimplemented { trait_predicate, parent_trait_predicates })
+    Some(SolverDiagnosticKind::TraitUnimplemented {
+        trait_predicate,
+        parent_trait_predicates,
+        parent_impls,
+    })
 }
 
 /// rustc's `ErrorSortKey`: sizedness and well-formedness goals last, so that the error names
@@ -459,6 +496,31 @@ fn sort_key<'db>(interner: DbInterner<'db>, error: &FulfillmentError<'db>) -> Er
 
 /// rustc's `ambiguity_term`: the term an ambiguity error blames, the first still holding an
 /// inference variable.
+/// The origin of the first variable in `term` made for a generic parameter (rustc's
+/// `TypeVariableOrigin`, which `extract_inference_diagnostics_data` names when `term` is that
+/// variable and `FindInferSourceVisitor` turns into the turbofish suggestion when it is inside):
+/// where it was made and the parameter, a type parameter other than a trait's `Self` or a const
+/// parameter.
+pub(crate) fn variable_origin<'db>(
+    infcx: &InferCtxt<'db>,
+    term: Term<'db>,
+) -> Option<(Span, GenericParamId)> {
+    GenericArg::from(term).walk().find_map(|arg| {
+        let (span, param) = match TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>(arg)? {
+            TyOrConstInferVar::Ty(vid) => infcx.type_var_origin(vid),
+            TyOrConstInferVar::Const(vid) => infcx.const_var_origin(vid)?,
+            TyOrConstInferVar::TyInt(_) | TyOrConstInferVar::TyFloat(_) => return None,
+        };
+        let param = param?;
+        if let GenericParamId::TypeParamId(it) = param
+            && GenericParams::of(infcx.interner.db, it.parent())[it.local_id()].is_trait_self()
+        {
+            return None;
+        }
+        Some((span, param))
+    })
+}
+
 fn ambiguity_term<'db>(predicate: Predicate<'db>) -> Option<Term<'db>> {
     match predicate.kind().skip_binder() {
         PredicateKind::Clause(ClauseKind::Trait(data)) => data
@@ -760,6 +822,7 @@ fn report_ambiguity<'db>(
     let predicate = infcx.deeply_resolve_ignoring_regions(obligation.predicate);
     let term = ambiguity_term(predicate);
     let diagnostic = |kind, top_term: Option<Term<'db>>, candidates, related| {
+        let origin = top_term.and_then(|term| variable_origin(infcx, term));
         let top_term = top_term.map(|term| {
             GenericArg::from(term).fold_with(&mut ReplaceInferWithError::new(interner)).store()
         });
@@ -772,6 +835,7 @@ fn report_ambiguity<'db>(
                 primary: AmbiguityNote { goal: StoredGoal::new(interner, predicate), candidates },
                 related,
             })),
+            origin,
         }
     };
     let (kind, top_term, candidates) = match predicate.kind().skip_binder() {

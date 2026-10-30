@@ -1639,7 +1639,7 @@ where
     pub(super) fn merge_trait_candidates(
         &mut self,
         trait_def_id: I::TraitId,
-        mut candidates: Vec<Candidate<I>>,
+        candidates: &mut Vec<Candidate<I>>,
         failed_candidate_info: FailedCandidateInfo,
     ) -> Result<(CanonicalResponse<I>, Option<TraitGoalProvenVia>), NoSolution> {
         if candidates.is_empty() {
@@ -1648,9 +1648,9 @@ where
 
         let candidate_preference_mode = CandidatePreferenceMode::compute(self.cx(), trait_def_id);
         if self.typing_mode().is_coherence() {
-            return Ok(match self.try_merge_impl_candidates(trait_def_id, &candidates) {
+            return Ok(match self.try_merge_impl_candidates(trait_def_id, candidates) {
                 Some(response) => (response, Some(TraitGoalProvenVia::Misc)),
-                None => (self.bail_with_ambiguity(&candidates), None),
+                None => (self.bail_with_ambiguity(candidates), None),
             });
         }
 
@@ -1675,13 +1675,16 @@ where
                 matches!(c.source, CandidateSource::AliasBound(AliasBoundKind::SelfBounds))
             })
         {
-            let alias_bounds: Vec<_> = candidates
-                .extract_if(.., |c| matches!(c.source, CandidateSource::AliasBound(..)))
-                .collect();
-            return Ok(self.merge_candidates_or_bail_with_ambiguity(
+            let mut alias_bounds = self.search_graph.scratch().take_candidates();
+            alias_bounds.extend(
+                candidates.extract_if(.., |c| matches!(c.source, CandidateSource::AliasBound(..))),
+            );
+            let merged = self.merge_candidates_or_bail_with_ambiguity(
                 &alias_bounds,
                 TraitGoalProvenVia::AliasBound,
-            ));
+            );
+            self.search_graph.scratch().give_candidates(alias_bounds);
+            return Ok(merged);
         }
 
         // If there are non-global where-bounds, prefer where-bounds
@@ -1690,11 +1693,14 @@ where
             .iter()
             .any(|c| matches!(c.source, CandidateSource::ParamEnv(ParamEnvSource::NonGlobal)));
         if has_non_global_where_bounds {
-            let where_bounds: Vec<_> = candidates
-                .extract_if(.., |c| matches!(c.source, CandidateSource::ParamEnv(_)))
-                .collect();
+            let mut where_bounds = self.search_graph.scratch().take_candidates();
+            where_bounds.extend(
+                candidates.extract_if(.., |c| matches!(c.source, CandidateSource::ParamEnv(_))),
+            );
             let Some((response, info)) = self.try_merge_candidates(&where_bounds) else {
-                return Ok((self.bail_with_ambiguity(&where_bounds), None));
+                let response = self.bail_with_ambiguity(&where_bounds);
+                self.search_graph.scratch().give_candidates(where_bounds);
+                return Ok((response, None));
             };
             match info {
                 // If there's an always applicable candidate, the result of all
@@ -1713,7 +1719,7 @@ where
                 // Supporting this makes the code more involved, so I am just going to
                 // ignore this for now.
                 MergeCandidateInfo::AlwaysApplicable(i) => {
-                    for (j, c) in where_bounds.into_iter().enumerate() {
+                    for (j, c) in where_bounds.drain(..).enumerate() {
                         if i != j {
                             self.ignore_candidate_head_usages(c.head_usages)
                         }
@@ -1725,22 +1731,26 @@ where
                 }
                 MergeCandidateInfo::EqualResponse => {}
             }
+            self.search_graph.scratch().give_candidates(where_bounds);
             return Ok((response, Some(TraitGoalProvenVia::ParamEnv)));
         }
 
         // Next, prefer any alias bound (nested or otherwise).
         if candidates.iter().any(|c| matches!(c.source, CandidateSource::AliasBound(_))) {
-            let alias_bounds: Vec<_> = candidates
-                .extract_if(.., |c| matches!(c.source, CandidateSource::AliasBound(_)))
-                .collect();
-            return Ok(self.merge_candidates_or_bail_with_ambiguity(
+            let mut alias_bounds = self.search_graph.scratch().take_candidates();
+            alias_bounds.extend(
+                candidates.extract_if(.., |c| matches!(c.source, CandidateSource::AliasBound(_))),
+            );
+            let merged = self.merge_candidates_or_bail_with_ambiguity(
                 &alias_bounds,
                 TraitGoalProvenVia::AliasBound,
-            ));
+            );
+            self.search_graph.scratch().give_candidates(alias_bounds);
+            return Ok(merged);
         }
 
-        self.filter_specialized_impls(AllowInferenceConstraints::No, &mut candidates);
-        self.unsound_prefer_builtin_dyn_impl(&mut candidates);
+        self.filter_specialized_impls(AllowInferenceConstraints::No, candidates);
+        self.unsound_prefer_builtin_dyn_impl(candidates);
 
         // If there are *only* global where bounds, then make sure to return that this
         // is still reported as being proven-via the param-env so that rigid projections
@@ -1751,11 +1761,11 @@ where
             .all(|c| matches!(c.source, CandidateSource::ParamEnv(ParamEnvSource::Global)));
         if only_global_where_bounds {
             Ok(self
-                .merge_candidates_or_bail_with_ambiguity(&candidates, TraitGoalProvenVia::ParamEnv))
+                .merge_candidates_or_bail_with_ambiguity(candidates, TraitGoalProvenVia::ParamEnv))
         } else {
             candidates
                 .retain(|c| !matches!(c.source, CandidateSource::ParamEnv(ParamEnvSource::Global)));
-            Ok(self.merge_impl_candidates_or_bail_with_ambiguity(trait_def_id, &candidates))
+            Ok(self.merge_impl_candidates_or_bail_with_ambiguity(trait_def_id, candidates))
         }
     }
 
@@ -1765,10 +1775,15 @@ where
         goal: Goal<I, TraitClause<I>>,
     ) -> Result<(CanonicalResponse<I>, Option<TraitGoalProvenVia>), NoSolutionOrRerunNonErased>
     {
-        let (candidates, failed_candidate_info) =
+        let (mut candidates, failed_candidate_info) =
             self.assemble_and_evaluate_candidates(goal, AssembleCandidatesFrom::All)?;
-        self.merge_trait_candidates(goal.predicate.def_id(), candidates, failed_candidate_info)
-            .map_err(Into::into)
+        let merged = self.merge_trait_candidates(
+            goal.predicate.def_id(),
+            &mut candidates,
+            failed_candidate_info,
+        );
+        self.search_graph.scratch().give_candidates(candidates);
+        merged.map_err(Into::into)
     }
 
     fn try_stall_coroutine(

@@ -98,21 +98,24 @@ fn ctor_variances_query(db: &Db, ctor: VariantId) -> StoredVariancesOf {
     if count == 0 {
         return VariancesOf::empty().store();
     }
-    let mut cx = Context { generics, variances: smallvec![Variance::Bivariant; count], db };
-    let callable = match ctor {
-        VariantId::StructId(s) => CallableDefId::StructId(s),
-        VariantId::EnumVariantId(v) => CallableDefId::EnumVariantId(v),
-        VariantId::UnionId(_) => unreachable!(),
-    };
-    let sig = db.callable_item_signature(callable).instantiate_identity().skip_binder();
-    cx.add_constraints_from_sig(sig.inputs_and_output.iter(), Variance::Covariant);
-    let mut variances = cx.variances;
-    for (idx, param) in cx.generics.iter_id(false).enumerate() {
-        if let GenericParamId::ConstParamId(_) = param {
-            variances[idx] = Variance::Invariant;
+    blaze_mem::frame::current(|frame| {
+        let variances = frame.alloc_slice_fill_with(count, |_| Variance::Bivariant);
+        let mut cx = Context { generics, variances, db };
+        let callable = match ctor {
+            VariantId::StructId(s) => CallableDefId::StructId(s),
+            VariantId::EnumVariantId(v) => CallableDefId::EnumVariantId(v),
+            VariantId::UnionId(_) => unreachable!(),
+        };
+        let sig = db.callable_item_signature(callable).instantiate_identity().skip_binder();
+        cx.add_constraints_from_sig(sig.inputs_and_output.iter(), Variance::Covariant);
+        let variances = cx.variances;
+        for (idx, param) in cx.generics.iter_id(false).enumerate() {
+            if let GenericParamId::ConstParamId(_) = param {
+                variances[idx] = Variance::Invariant;
+            }
         }
-    }
-    VariancesOf::new_from_slice(&variances).store()
+        VariancesOf::new_from_slice(variances).store()
+    })
 }
 
 pub(crate) fn variances_of_cycle_fn(
@@ -156,18 +159,15 @@ pub(crate) fn variances_of_cycle_initial(
     VariancesOf::new_from_iter(std::iter::repeat_n(Variance::Bivariant, count)).store()
 }
 
-/// An item's variances while they are worked out: one byte a parameter, on the stack for up
-/// to 16.
-type Variances = SmallVec<[Variance; 16]>;
-
-struct Context<'db> {
+struct Context<'db, 'f> {
     db: &'db Db,
     generics: Generics<'db>,
-    variances: Variances,
+    /// The variances while they are worked out, one byte a parameter, in the run's frame.
+    variances: &'f mut [Variance],
 }
 
-impl<'db> Context<'db> {
-    fn solve(mut self) -> Variances {
+impl<'db, 'f> Context<'db, 'f> {
+    fn solve(mut self) -> &'f mut [Variance] {
         tracing::debug!("solve(generics={:?})", self.generics);
         match self.generics.def() {
             GenericDefId::AdtId(adt) => {
@@ -197,7 +197,7 @@ impl<'db> Context<'db> {
             }
             _ => {}
         }
-        let mut variances = self.variances;
+        let variances = self.variances;
 
         // Const parameters are always invariant.
         // Make all const parameters invariant.

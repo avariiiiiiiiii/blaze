@@ -7,15 +7,17 @@
 //! spliced functions without changing any name's length, rewrites only their local symbols
 //! and names in it; the rest of the tail is small and written whole.
 
+use blaze_format::cursor::Put;
 use object::elf;
 use rayon::prelude::*;
 
-use super::dynamic::{CHUNK, Put, Strings, Sym, info, numbered, shndx, value};
+use super::dynamic::{CHUNK, Strings, Sym, info, numbered, shndx, value};
 use super::{
-    BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, EHDR, Elf, GNU_HASH, INTERP, PHDR, PHDRS, PREINIT_ARRAY,
-    RELA_DYN, Segment, VERNEED, VERSYM, error, in_file,
+    BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, EHDR, Elf, GNU_HASH, INTERP, PHDR, RELA_DYN, Segment, VERNEED,
+    VERSYM, error, in_file,
 };
-use crate::model::{Class, File, Function, Placed, Region, Splice, SymbolKind};
+use crate::cow::CowBytes;
+use crate::model::{Class, File, Function, Placed, Plan, Region, Reserve, Splice, SymbolKind};
 use crate::{LinkError, OutputKind};
 
 const SYM: usize = 24;
@@ -112,8 +114,12 @@ pub(crate) fn section_name(class: &Class) -> &str {
         Class::Data => ".data",
         Class::Table => ".blaze.table",
         Class::Got => ".got",
+        Class::PreinitArray => super::PREINIT_ARRAY,
         Class::InitArray => ".init_array",
         Class::FiniArray => ".fini_array",
+        Class::Reserve(Reserve::Arena) => ".blaze.reserve.arena",
+        Class::Reserve(Reserve::Cells) => ".blaze.reserve.cells",
+        Class::Reserve(Reserve::Fixed) => ".blaze.reserve.fixed",
         Class::PatchData => ".blaze.patch_data",
         Class::Named { name, .. } => name.as_str(),
         Class::Tdata => ".tdata",
@@ -182,7 +188,11 @@ pub(crate) struct KeptSymtab {
     layout: Layout,
     /// By function, in [`Placed::functions`] order.
     locals: Vec<Local>,
-    bytes: Vec<u8>,
+    /// What the last link's file holds too.
+    bytes: CowBytes,
+    /// The globals' symbols and the run from their names to the section headers, as a patch
+    /// writes them, reused.
+    scratch: Vec<u8>,
     /// How many builds were patches.
     #[cfg(test)]
     pub(crate) patched: u32,
@@ -225,8 +235,8 @@ impl KeptSymtab {
                 let (function, local) = (&functions[at], self.locals[at]);
                 let Some(name) = function.name.as_deref() else { continue };
                 let symbol = local_symbol(regions, function, local.name);
-                self.bytes[symtab + SYM * local.sym as usize..][..SYM].copy_from_slice(&symbol.bytes());
-                self.bytes[strtab + local.name as usize..][..name.len()].copy_from_slice(name.as_bytes());
+                self.bytes.update(symtab + SYM * local.sym as usize, &symbol.bytes());
+                self.bytes.update(strtab + local.name as usize, name.as_bytes());
             }
         }
     }
@@ -252,20 +262,27 @@ fn local_symbol(regions: &[Region], function: &Function, name: u32) -> Sym {
     }
 }
 
+/// Where the exports' and imports' symbols start in `.symtab`, and where their names start in
+/// `.strtab`, from `layout.len`.
+fn globals_at(layout: &Layout) -> (usize, usize) {
+    (layout.symtab() - layout.len + SYM * (1 + layout.named), layout.strtab() - layout.len + 1 + layout.function_names)
+}
+
 /// The cheap part of the tail, written whole on every link: the exports' and imports'
-/// symbols and names, `.shstrtab` and the section headers. `bytes` is the tail from
-/// `layout.len`, its other bytes as they are.
+/// symbols into `syms`, which runs from the first of them to `.strtab`, and into `rest`,
+/// which runs from their first name to the tail's end, their names, `.shstrtab` and the
+/// section headers. `rest`'s other bytes stay as they are, zeros.
 fn globals_and_headers(
     placed: &Placed<'_>,
     layout: &Layout,
-    bytes: &mut [u8],
+    syms: &mut [u8],
+    rest: &mut [u8],
     shstrtab: &[u8],
     shdrs: &[Shdr],
 ) -> Result<(), LinkError> {
-    let (base, regions) = (layout.len, placed.regions);
-    let (head, rest) = bytes.split_at_mut(layout.strtab() - base);
-    let syms = &mut head[layout.symtab() - base + SYM * (1 + layout.named)..];
-    let strs = &mut rest[1 + layout.function_names..layout.strtab_len()];
+    let regions = placed.regions;
+    let base = layout.strtab() + 1 + layout.function_names;
+    let strs = &mut rest[..layout.strtab_len() - 1 - layout.function_names];
     strs.fill(0);
     let mut strings = Names { bytes: strs, at: 0, offset: (1 + layout.function_names) as u32 };
     let mut out = syms.chunks_exact_mut(SYM);
@@ -284,9 +301,61 @@ fn globals_and_headers(
         let symbol = Sym { name: strings.add(&import.name), info: info(bind, import.kind), ..Sym::default() };
         out.next().expect("a symbol counted").copy_from_slice(&symbol.bytes());
     }
-    bytes[layout.shstrtab() - base..][..shstrtab.len()].copy_from_slice(shstrtab);
-    for (shdr, out) in shdrs.iter().zip(bytes[layout.shoff() - base..].chunks_exact_mut(SHDR)) {
+    rest[layout.shstrtab() - base..][..shstrtab.len()].copy_from_slice(shstrtab);
+    for (shdr, out) in shdrs.iter().zip(rest[layout.shoff() - base..].chunks_exact_mut(SHDR)) {
         out.copy_from_slice(&shdr.bytes());
+    }
+    Ok(())
+}
+
+/// What a dev run's start hook needs of the `PT_LOAD`s (`blaze_inproc::image` reads them, and
+/// a run overlays whole pages of code): each code segment starts on a page in the file and
+/// in memory, shares no page with another segment (the headers' included), is never writable
+/// and is all file bytes; each reservation is whole pages with no file bytes, after every
+/// other segment and in [`Reserve`] order. The layout makes all of it, so an error here
+/// names a layout bug; the image is never written otherwise.
+fn dev_run(loads: &[Load], plan: &Plan) -> Result<(), LinkError> {
+    let page = plan.page;
+    let mut last_reserve: Option<Reserve> = None;
+    for (at, load) in loads.iter().enumerate() {
+        let (start, end) = (load.vaddr, load.end);
+        let refuse = |why: &str| -> Result<(), LinkError> {
+            // alloc: error path
+            Err(error(format!("a dev run's {:?} segment at {start:#x}..{end:#x} {why}", load.segment)))
+        };
+        match load.segment {
+            Segment::Code => {
+                if !start.is_multiple_of(page) || !(start - plan.base).is_multiple_of(page) {
+                    return refuse(&format!("does not start on a {page:#x} page in the file and in memory")); // alloc: error path
+                }
+                if load.segment.flags() & elf::PF_W != 0 {
+                    return refuse("is writable");
+                }
+                if load.zeroed || load.file_end != end {
+                    return refuse("is not all file bytes");
+                }
+                let before = at.checked_sub(1).map(|it| &loads[it]).filter(|it| it.end.next_multiple_of(page) > start);
+                let after = loads.get(at + 1).filter(|it| it.vaddr < end.next_multiple_of(page));
+                if let Some(other) = before.or(after) {
+                    // alloc: error path
+                    return refuse(&format!("shares a {page:#x} page with the {:?} segment at {:#x}", other.segment, other.vaddr));
+                }
+            }
+            Segment::Reserve(reserve) => {
+                if last_reserve.is_some_and(|it| it >= reserve) {
+                    return refuse("is out of the arena, cells, fixed order");
+                }
+                last_reserve = Some(reserve);
+                if end == start || !start.is_multiple_of(page) || !(end - start).is_multiple_of(page) {
+                    return refuse(&format!("is not whole {page:#x} pages")); // alloc: error path
+                }
+                if load.file_end != start {
+                    return refuse("has file bytes");
+                }
+            }
+            _ if last_reserve.is_some() => return refuse("follows a reservation"),
+            Segment::Read | Segment::Relro | Segment::Write => {}
+        }
     }
     Ok(())
 }
@@ -302,7 +371,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     };
 
     // At most one per segment: a second run of one is an error below.
-    let mut loads: Vec<Load> = Vec::with_capacity(4);
+    let mut loads: Vec<Load> = Vec::with_capacity((4 + super::RESERVES) as usize);
     for region in regions {
         let segment = Segment::of(&region.class);
         let end = region.addr + region.capacity.max(region.size);
@@ -346,15 +415,24 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
     if loads.is_empty() {
         return Err(error("an image with no regions".into()));
     }
+    match writer.output.dev_run {
+        Some(_) => dev_run(&loads, plan)?,
+        None => {
+            if let Some(region) = regions.iter().find(|it| matches!(it.class, Class::Reserve(_))) {
+                // alloc: error path
+                return Err(error(format!("{:?} at {:#x} in an image that is not a dev run", region.class, region.addr)));
+            }
+        }
+    }
 
-    // Each synthetic region's address and the bytes `synthesize` gave it.
+    // Each synthetic region's address and how many bytes `synthesize` gave it.
     let synthetic = |name: &'static str| {
-        placed.region(&Class::Synthetic(name)).map(|(index, it)| (it.addr, placed.bytes(index)))
+        placed.region(&Class::Synthetic(name)).map(|(index, it)| (it.addr, placed.len(index) as u64))
     };
-    let mut phdrs = Vec::with_capacity(PHDRS as usize);
+    let room = writer.phdrs();
+    let mut phdrs = Vec::with_capacity(room as usize);
     phdrs.push(Phdr { p_type: elf::PT_PHDR, flags: 4, vaddr: plan.base + EHDR, filesz: 0, memsz: 0, align: 8 });
-    if let Some((addr, interp)) = synthetic(INTERP) {
-        let size = interp.len() as u64;
+    if let Some((addr, size)) = synthetic(INTERP) {
         phdrs.push(Phdr { p_type: elf::PT_INTERP, flags: 4, vaddr: addr, filesz: size, memsz: size, align: 1 });
     }
     for load in &loads {
@@ -367,8 +445,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
             align: plan.page,
         });
     }
-    if let Some((addr, dynamic)) = synthetic(DYNAMIC) {
-        let size = dynamic.len() as u64;
+    if let Some((addr, size)) = synthetic(DYNAMIC) {
         phdrs.push(Phdr { p_type: elf::PT_DYNAMIC, flags: 6, vaddr: addr, filesz: size, memsz: size, align: 8 });
     }
     if let Some(at) = loads.iter().position(|it| it.segment == Segment::Relro) {
@@ -379,8 +456,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         let size = end - load.vaddr;
         phdrs.push(Phdr { p_type: elf::PT_GNU_RELRO, flags: 4, vaddr: load.vaddr, filesz: size, memsz: size, align: 1 });
     }
-    if let (Some(_), Some((addr, hdr))) = (placed.region(&Class::EhFrame), synthetic(EH_FRAME_HDR)) {
-        let size = hdr.len() as u64;
+    if let (Some(_), Some((addr, size))) = (placed.region(&Class::EhFrame), synthetic(EH_FRAME_HDR)) {
         phdrs.push(Phdr { p_type: elf::PT_GNU_EH_FRAME, flags: 4, vaddr: addr, filesz: size, memsz: size, align: 4 });
     }
     phdrs.push(Phdr { p_type: elf::PT_GNU_STACK, flags: 6, vaddr: 0, filesz: 0, memsz: 0, align: 0 });
@@ -394,12 +470,11 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
             align: tls.align.max(1),
         });
     }
-    if let Some((addr, note)) = synthetic(BUILD_ID) {
-        let size = note.len() as u64;
+    if let Some((addr, size)) = synthetic(BUILD_ID) {
         phdrs.push(Phdr { p_type: elf::PT_NOTE, flags: 4, vaddr: addr, filesz: size, memsz: size, align: 4 });
     }
-    if phdrs.len() as u64 > PHDRS {
-        return Err(error(format!("{} program headers, more than the {PHDRS} the headers have room for", phdrs.len()))); // alloc: error path
+    if phdrs.len() as u64 > room {
+        return Err(error(format!("{} program headers, more than the {room} the headers have room for", phdrs.len()))); // alloc: error path
     }
     let phnum = phdrs.len() as u64;
     phdrs[0].filesz = phnum * PHDR;
@@ -443,18 +518,20 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         };
         match class {
             Class::Tbss | Class::Bss => shdr.sh_type = elf::SHT_NOBITS,
+            // No access, so not allocated: nothing of the image is there until the start hook
+            // maps it.
+            Class::Reserve(_) => {
+                (shdr.sh_type, shdr.flags, shdr.size) = (elf::SHT_NOBITS, 0, region.capacity.max(region.size))
+            }
+            Class::PreinitArray => (shdr.sh_type, shdr.entsize) = (elf::SHT_PREINIT_ARRAY, 8),
             Class::InitArray => (shdr.sh_type, shdr.entsize) = (elf::SHT_INIT_ARRAY, 8),
             Class::FiniArray => (shdr.sh_type, shdr.entsize) = (elf::SHT_FINI_ARRAY, 8),
-            Class::Named { name, .. } if name == PREINIT_ARRAY => {
-                (shdr.sh_type, shdr.entsize) = (elf::SHT_PREINIT_ARRAY, 8)
-            }
             Class::Got => shdr.entsize = 8,
             Class::EhFrame if writer.output.arch == blaze_codegen::Arch::X86_64 => {
                 shdr.sh_type = elf::SHT_X86_64_UNWIND
             }
             Class::Synthetic(name) => {
-                let bytes = placed.bytes(index);
-                shdr.size = bytes.len() as u64;
+                shdr.size = placed.len(index) as u64;
                 match *name {
                     BUILD_ID => shdr.sh_type = elf::SHT_NOTE,
                     DYNSYM => {
@@ -469,7 +546,7 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
                     }
                     VERNEED => {
                         shdr.sh_type = elf::SHT_GNU_VERNEED;
-                        (shdr.link, shdr.info) = (index_of(&Class::Synthetic(DYNSTR)), verneeds(bytes));
+                        (shdr.link, shdr.info) = (index_of(&Class::Synthetic(DYNSTR)), verneeds(placed.bytes(index)));
                     }
                     RELA_DYN => {
                         (shdr.sh_type, shdr.entsize) = (elf::SHT_RELA, 24);
@@ -599,16 +676,21 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
         Some(kept) if patch && kept.layout == layout && kept.bytes.len() == size => {
             let splices = placed.delta.map_or(&[][..], |it| it.functions);
             kept.patch_locals(regions, placed.functions, splices, symtab, strtab);
-            globals_and_headers(placed, &layout, &mut kept.bytes, &names.bytes, &shdrs)?;
-            // alloc: the output buffer, the file's tail past its debug info
-            let mut bytes = Vec::with_capacity(size);
-            bytes.extend_from_slice(&kept.bytes);
+            let (syms, names_at) = globals_at(&layout);
+            let scratch = &mut kept.scratch;
+            scratch.clear();
+            scratch.resize(strtab - syms + size - names_at, 0);
+            let (globals, rest) = scratch.split_at_mut(strtab - syms);
+            globals_and_headers(placed, &layout, globals, rest, &names.bytes, &shdrs)?;
+            kept.bytes.update(syms, &scratch[..strtab - syms]);
+            kept.bytes.update(names_at, &scratch[strtab - syms..]);
             kept.synthesis = placed.synthesis;
             #[cfg(test)]
             {
                 kept.patched += 1;
             }
-            bytes
+            // clone: two reference counts, the table shared with the state that holds it
+            kept.bytes.clone()
         }
         mut kept => {
             if patch {
@@ -659,10 +741,15 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
                     }
                 });
             }
-            globals_and_headers(placed, &layout, &mut bytes, &names.bytes, &shdrs)?;
+            {
+                let (syms, names_at) = globals_at(&layout);
+                let (head, rest) = bytes.split_at_mut(names_at);
+                globals_and_headers(placed, &layout, &mut head[syms..strtab], rest, &names.bytes, &shdrs)?;
+            }
+            let bytes = CowBytes::from_vec(bytes);
             if let Some(kept) = kept {
-                kept.bytes.clear();
-                kept.bytes.extend_from_slice(&bytes);
+                // clone: two reference counts, the table shared with the state that holds it
+                kept.bytes = bytes.clone();
                 kept.layout = layout;
                 kept.synthesis = placed.synthesis;
             }
@@ -673,39 +760,39 @@ pub(crate) fn file(writer: &Elf, placed: &Placed<'_>) -> Result<File, LinkError>
 
     let mut head = Vec::with_capacity((EHDR + PHDR * phnum) as usize);
     head.extend_from_slice(&elf::ELFMAG);
-    head.u8(elf::ELFCLASS64);
-    head.u8(elf::ELFDATA2LSB);
-    head.u8(elf::EV_CURRENT);
-    head.u8(elf::ELFOSABI_NONE);
+    head.put_u8(elf::ELFCLASS64);
+    head.put_u8(elf::ELFDATA2LSB);
+    head.put_u8(elf::EV_CURRENT);
+    head.put_u8(elf::ELFOSABI_NONE);
     head.resize(16, 0);
-    head.u16(elf::ET_DYN);
-    head.u16(writer.machine());
-    head.u32(u32::from(elf::EV_CURRENT));
-    head.u64(entry.unwrap_or(0));
-    head.u64(EHDR);
-    head.u64(shoff);
-    head.u32(0);
-    head.u16(EHDR as u16);
-    head.u16(PHDR as u16);
-    head.u16(phnum as u16);
-    head.u16(64);
-    head.u16(shdrs.len() as u16);
-    head.u16(shstrndx as u16);
+    head.put_u16(elf::ET_DYN);
+    head.put_u16(writer.machine());
+    head.put_u32(u32::from(elf::EV_CURRENT));
+    head.put_u64(entry.unwrap_or(0));
+    head.put_u64(EHDR);
+    head.put_u64(shoff);
+    head.put_u32(0);
+    head.put_u16(EHDR as u16);
+    head.put_u16(PHDR as u16);
+    head.put_u16(phnum as u16);
+    head.put_u16(64);
+    head.put_u16(shdrs.len() as u16);
+    head.put_u16(shstrndx as u16);
     for phdr in &phdrs {
-        head.u32(phdr.p_type);
-        head.u32(phdr.flags);
-        head.u64(phdr.vaddr.saturating_sub(plan.base));
-        head.u64(phdr.vaddr);
-        head.u64(phdr.vaddr);
-        head.u64(phdr.filesz);
-        head.u64(phdr.memsz);
-        head.u64(phdr.align);
+        head.put_u32(phdr.p_type);
+        head.put_u32(phdr.flags);
+        head.put_u64(phdr.vaddr.saturating_sub(plan.base));
+        head.put_u64(phdr.vaddr);
+        head.put_u64(phdr.vaddr);
+        head.put_u64(phdr.filesz);
+        head.put_u64(phdr.memsz);
+        head.put_u64(phdr.align);
     }
     debug_assert!(head.len() as u64 <= plan.headers);
 
-    // alloc: once per image, what `Writer::file` returns
+    // alloc: once per image, what `Writer::file` returns, and the headers' `Arc`
     let mut parts = Vec::with_capacity(2);
-    parts.push((0, head));
+    parts.push((0, CowBytes::from_vec(head)));
     // The debug sections are the core's: laid at their offsets, never copied here.
     // alloc: once per image, an entry per debug section
     let mut debug = Vec::with_capacity(placed.debug.len());

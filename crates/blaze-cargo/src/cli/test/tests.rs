@@ -1,6 +1,6 @@
 use std::{ffi::OsString, io, path::Path};
 
-use blaze_api::{Artifact, TestOutcome, TestResult};
+use blaze_api::{Artifact, ArtifactKind, TestOutcome, TestResult};
 
 use super::*;
 use crate::cli::{
@@ -30,7 +30,7 @@ pub(crate) fn built() -> Vec<Artifact> {
     vec![
         artifact("foo", "test", "x", true, Some("deps/x-4567")),
         artifact("foo", "lib", "foo", false, None),
-        Artifact { kind: "doctest".to_owned(), ..artifact("foo", "lib", "foo", true, Some("deps/foo-doctests")) },
+        Artifact { kind: ArtifactKind::Doctest, ..artifact("foo", "lib", "foo", true, Some("deps/foo-doctests")) },
         artifact("foo", "bin", "foo", true, Some("deps/foo-89ab")),
         artifact("foo", "lib", "foo", true, Some("deps/foo-0123abcd")),
         artifact("foo", "bin", "foo", false, Some("foo")),
@@ -138,7 +138,7 @@ fn no_fail_fast_with_one_failure_is_its_own_error() {
 
 #[test]
 fn doc_tests_by_the_targets_own_name_and_command_under_verbose() {
-    let doc = Artifact { kind: "doctest".to_owned(), ..artifact("foo", "lib", "my-lib", true, Some("deps/my_lib-doctests")) };
+    let doc = Artifact { kind: ArtifactKind::Doctest, ..artifact("foo", "lib", "my-lib", true, Some("deps/my_lib-doctests")) };
     let mut err = Vec::new();
     let code = run(&asked(Command::Test, &[]), &[doc.clone()], 1, speaking(), &mut err, &mut Fake::default()).unwrap();
     assert_eq!(code, 0);
@@ -233,9 +233,53 @@ fn quiet_and_bench() {
     assert_eq!(fake.ran[0].args, [OsString::from("--bench"), OsString::from("--quiet")]);
 }
 
+/// A result of `binary`, whose index is the daemon's: `foo`'s unit tests are executable 3 and
+/// `x` 1, so the order printed is the order they first came, not the indexes'.
 fn result(binary: &str, name: &str, outcome: TestOutcome, output: &str) -> TestResult {
     let millis = if outcome == TestOutcome::Ignored { 0 } else { 5 };
-    TestResult { binary: binary.to_owned(), name: name.to_owned(), outcome, output: output.as_bytes().to_vec(), millis, cached: None }
+    let executable = if binary.ends_with("x-4567") { 1 } else { 3 };
+    TestResult {
+        binary: binary.to_owned(),
+        name: name.to_owned(),
+        outcome,
+        output: output.as_bytes().to_vec(),
+        millis,
+        cached: None,
+        outside: false,
+        executable,
+    }
+}
+
+#[test]
+fn the_tests_that_ran_outside_named_in_one_note_as_cargos_shell_writes_it() {
+    let inside = result("/w/target/debug/deps/foo-0123abcd", "a", TestOutcome::Passed, "");
+    let outside = TestResult { name: "tests::writes_home".to_owned(), outside: true, ..inside.clone() };
+    let mut text = String::new();
+    super::outside(&mut text, std::slice::from_ref(&inside), false);
+    assert_eq!(text, "", "nothing when every test ran inside");
+    super::outside(&mut text, &[inside.clone(), outside.clone()], false);
+    assert_eq!(
+        text,
+        "note: 1 test ran outside the sandbox, so it runs every time and its pass is never kept: tests::writes_home\n"
+    );
+    text.clear();
+    let failed = TestResult { name: "tests::dials".to_owned(), outcome: TestOutcome::Failed, ..outside.clone() };
+    super::outside(&mut text, &[outside, inside, failed], true);
+    assert_eq!(
+        text,
+        "\x1b[1m\x1b[92mnote\x1b[0m: 2 tests ran outside the sandbox, so they run every time and their passes are \
+         never kept: tests::writes_home, tests::dials\n"
+    );
+}
+
+#[test]
+fn an_executable_index_past_any_request_is_refused_naming_it() {
+    let far = TestResult { executable: u32::MAX - 1, ..result("/w/target/debug/deps/foo-0123abcd", "a", TestOutcome::Passed, "") };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert!(!reached(&[far], speaking(), &mut out, &mut err).unwrap());
+    let err = String::from_utf8(err).unwrap();
+    assert!(err.starts_with("error: the daemon numbered the test executable /w/target/debug/deps/foo-0123abcd as 4294967294"), "{err}");
+    assert!(out.is_empty());
 }
 
 #[test]
@@ -260,4 +304,27 @@ fn reached_results_in_libtests_format() {
          filtered out; 1 unreached; finished in 0.01s\n\n\nrunning 1 test\ntest d ... ignored\n\ntest result: \
          ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n"
     );
+}
+
+#[test]
+fn reached_results_of_executables_interleaved_by_their_first_and_in_the_order_they_came() {
+    let results = [
+        result("/w/target/debug/deps/x-4567", "x1", TestOutcome::Passed, ""),
+        result("/w/target/debug/deps/foo-0123abcd", "f1", TestOutcome::Passed, ""),
+        result("/w/target/debug/deps/x-4567", "x2", TestOutcome::Passed, ""),
+        result("/w/target/debug/deps/foo-0123abcd", "f2", TestOutcome::Passed, ""),
+        result("/w/target/debug/deps/foo-0123abcd", "f3", TestOutcome::Passed, ""),
+    ];
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert!(reached(&results, speaking(), &mut out, &mut err).unwrap());
+    assert_eq!(
+        String::from_utf8(err).unwrap(),
+        "     Running target/debug/deps/x-4567\n     Running target/debug/deps/foo-0123abcd\n"
+    );
+    let out = String::from_utf8(out).unwrap();
+    let tests: Vec<&str> = out.lines().filter_map(|it| it.strip_prefix("test ")).filter(|it| it.ends_with("... ok")).collect();
+    assert_eq!(tests, ["x1 ... ok", "x2 ... ok", "f1 ... ok", "f2 ... ok", "f3 ... ok"]);
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    assert!(reached(&[], speaking(), &mut out, &mut err).unwrap());
+    assert!(out.is_empty() && err.is_empty());
 }

@@ -183,6 +183,9 @@ rustc's `panic_cannot_unwind`/`panic_in_cleanup` do. It reports that now as
 Then `unwind.rs`'s `abort` returns it.
 
 > forwarded to db (hir-ty is db's; db-ty-next2 told).
+> applied by db-ty (db-ty-next3, 21:35): `MirEvalError::Aborted(String)` after `Panic`; its
+> `Debug` prints "the program aborted: {0}". `unwind.rs`'s `abort` is codegen's to switch, and
+> hir-ide's `mir_pretty/errors.rs` needs the arm: both in `v2/requests/db-ty.md` "## db-ty-next3".
 
 ## 11. hir-def `src/lang_item.rs` (db-def): the `panic_const_*` lang items
 
@@ -209,6 +212,9 @@ inference already resolved it, and finds each expression's adjustments by a hash
 Then `lower.rs` reads both by index and its resolver calls for values go.
 
 > forwarded to db (`crates/hir-ty/src/infer.rs`) (from requests, pass 16; told by tmux).
+> applied (db-ty, checked by db-ty-next3): `InferenceResult::value_resolution(ExprOrPatId) ->
+> Option<ValueNs>` (db-ty-d-infer2's task 17, a column by node) and `expr_adjustments` as a CSR
+> by `ExprId` (db-ty-infer's columns). `lower.rs`'s switch to them is codegen's.
 
 ## dedyn: crates/hir-ty-mir/src/mir/eval: three `dyn` lines kept, justified (from dedyn-codegen, 2026-10-29)
 
@@ -248,3 +254,6 @@ each stays, with a `// dyn:` line inserted above it (indented as the line). No c
 Once codegen-inline's pass is registered, a Release body with `MirOptions::inline` has its
 callees' references in it. They are still reached from `Debug`, but only through the callee's
 own body, so the walk must visit each `body.inlined.callees[..]` body as it visits a call.
+
+> forwarded to codegen (`hir-ty-codegen/v2/refs.rs`; codegen-v2-next1 told by tmux; requests, pass 23).
+> applied by codegen-v2 (2026-10-29): already in the tree, no change. For an instance a unit inlines into, `refs::code_refs` walks its body a second time at `Build::WALK_INLINED` (`inlines: true`), so the callees' calls, constants, statics, drops and vtables in the inlined blocks are listed after the plain walk. `Walk::inlined_callees` then lists each `body.inlined.callees[..]` as built in. Held by `v2/tests.rs` `the_walk_lists_what_inlined_code_calls` (inlined `f`'s call of `g` is listed only by the inlined walk, and the inlined IR's requests place only against it) and `a_callee_inlined_twice_is_built_in_once`.

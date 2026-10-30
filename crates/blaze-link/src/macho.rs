@@ -5,7 +5,9 @@
 //! `__TEXT` (the headers, code, read-only data, `__unwind_info`, `__eh_frame`: read and
 //! run), `__DATA_CONST` (what the loader fixes up and then makes read-only: the GOT,
 //! initializers, constant data with pointers, the C objects' `__compact_unwind`), `__DATA`
-//! (the jump table's cells, data, thread-locals, zeroed data), `__DWARF` when the image carries debug
+//! (the jump table's cells, data, thread-locals, zeroed data), a dev run's reservations
+//! (`__BLAZE_ARENA`, `__BLAZE_CELLS`, `__BLAZE_FIXED`: no access and no file bytes, which its
+//! start hook maps into, [`crate::DevRun`]), `__DWARF` when the image carries debug
 //! info, and `__LINKEDIT` (what dyld reads: the rebase and bind opcodes, the export trie, the
 //! symbol table, the function starts and, last, the code signature, without which macOS on
 //! arm64 kills the program). Addresses the loader fixes up are told it by opcodes
@@ -40,14 +42,16 @@ use std::cmp::Ordering;
 use std::sync::Mutex;
 
 use blaze_codegen::Arch;
+use blaze_format::cursor::Put;
 use blaze_ids::radix;
 use blaze_sha256 as sha256;
 use object::macho;
 use rayon::prelude::*;
 
+use crate::cow::CowBytes;
 use crate::model::{
     Class, Counts, Data, Delta, File, Holds, Name, NativeFile, Names, Placed, Plan, Prot, Region,
-    SectionKind, SectionName, Special, Writer,
+    Reserve, SectionKind, SectionName, Special, Writer,
 };
 use smallvec::SmallVec;
 use crate::output::Platform;
@@ -63,6 +67,8 @@ const SEGMENT: usize = 72;
 const SECTION: usize = 80;
 const NLIST: usize = 16;
 const UNWIND_INFO: &str = "__unwind_info";
+/// The dev runtime's start hook, as the core names it (`_blaze_inproc_start` in Mach-O).
+const START: &str = "blaze_inproc_start";
 
 fn error(what: impl Into<String>) -> LinkError {
     LinkError { function: None, what: what.into() }
@@ -74,6 +80,20 @@ pub(crate) fn writer(output: &Output) -> Result<MachO, LinkError> {
         Arch::X86_64 => (macho::CPU_TYPE_X86_64, macho::CPU_SUBTYPE_X86_64_ALL, 0x1000),
         Arch::Wasm32 => return Err(error("a Mach-O image for wasm32, which has no Mach-O")),
     };
+    if output.dev_run.is_some() {
+        if output.arch != Arch::Aarch64 {
+            return Err(error(
+                "a dev run's Mach-O executable for x86-64: a run's start hook overlays the code of \
+                 arm64 executables only (`blaze_inproc::image`)",
+            ));
+        }
+        if !matches!(output.kind, OutputKind::Executable { .. }) {
+            return Err(error(
+                "a dev run of a dynamic library: only an executable has the start hook that \
+                 overlays its code",
+            ));
+        }
+    }
     let Some(platform) = output.platform else {
         return Err(error(
             "a Mach-O image without a platform (`Output::platform`): `LC_BUILD_VERSION` says \
@@ -229,9 +249,18 @@ enum Segment {
     Text,
     DataConst,
     Data,
+    /// A dev run's reservations ([`Reserve`]), after every segment with bytes and before
+    /// `__DWARF` and `__LINKEDIT`: no access, no file bytes and no sections, as `__PAGEZERO`.
+    Arena,
+    Cells,
+    Fixed,
 }
 
 impl Segment {
+    fn reserves(self) -> bool {
+        matches!(self, Segment::Arena | Segment::Cells | Segment::Fixed)
+    }
+
     fn of(name: &str) -> Option<Segment> {
         match name {
             "__TEXT" => Some(Segment::Text),
@@ -246,6 +275,9 @@ impl Segment {
             Segment::Text => "__TEXT",
             Segment::DataConst => "__DATA_CONST",
             Segment::Data => "__DATA",
+            Segment::Arena => "__BLAZE_ARENA",
+            Segment::Cells => "__BLAZE_CELLS",
+            Segment::Fixed => "__BLAZE_FIXED",
         }
     }
 
@@ -255,6 +287,18 @@ impl Segment {
             // Written only by the loader, before the program runs.
             Segment::DataConst => Prot::R,
             Segment::Data => Prot::RW,
+            Segment::Arena | Segment::Cells | Segment::Fixed => Prot::NONE,
+        }
+    }
+
+    /// `initprot` and `maxprot` of its load command.
+    fn vm_prot(self) -> u32 {
+        match self {
+            Segment::Text => macho::VM_PROT_READ | macho::VM_PROT_EXECUTE,
+            // `__DATA_CONST` is written by the loader, which makes it read-only after.
+            Segment::DataConst | Segment::Data => macho::VM_PROT_READ | macho::VM_PROT_WRITE,
+            // The start hook maps over them with `VM_FLAGS_OVERWRITE`, which no `maxprot` limits.
+            Segment::Arena | Segment::Cells | Segment::Fixed => 0,
         }
     }
 }
@@ -277,6 +321,8 @@ fn place(class: &Class) -> (Segment, u8) {
         Class::EhFrame => (Segment::Text, 8),
         Class::Got => (Segment::DataConst, 0),
         Class::InitArray => (Segment::DataConst, 1),
+        // Refused before the file is written ([`MachO::check_placed`]): Mach-O has none.
+        Class::PreinitArray => (Segment::DataConst, 1),
         Class::FiniArray => (Segment::DataConst, 2),
         Class::RelRo => (Segment::DataConst, 3),
         Class::Table => (Segment::Data, 0),
@@ -286,6 +332,9 @@ fn place(class: &Class) -> (Segment, u8) {
         Class::Tdata => (Segment::Data, 5),
         Class::Tbss => (Segment::Data, 6),
         Class::Bss => (Segment::Data, 7),
+        Class::Reserve(Reserve::Arena) => (Segment::Arena, 0),
+        Class::Reserve(Reserve::Cells) => (Segment::Cells, 0),
+        Class::Reserve(Reserve::Fixed) => (Segment::Fixed, 0),
     }
 }
 
@@ -293,8 +342,9 @@ fn split(name: &str) -> (&str, &str) {
     name.split_once(',').unwrap_or((name, ""))
 }
 
+/// Not in the file: zeroed data, and a dev run's reservations, which hold nothing.
 fn zeroed(class: &Class) -> bool {
-    matches!(class, Class::Tbss | Class::Bss)
+    matches!(class, Class::Tbss | Class::Bss | Class::Reserve(_))
 }
 
 /// The segment, name and flags of the section a region is in the file.
@@ -317,6 +367,7 @@ fn section_of(class: &Class) -> (Segment, &str, u32) {
                 | macho::S_ATTR_LIVE_SUPPORT,
         ),
         Class::InitArray => ("__mod_init_func", macho::S_MOD_INIT_FUNC_POINTERS),
+        Class::PreinitArray => ("__preinit_array", macho::S_REGULAR),
         Class::FiniArray => ("__mod_term_func", macho::S_MOD_TERM_FUNC_POINTERS),
         Class::Got => ("__got", macho::S_NON_LAZY_SYMBOL_POINTERS),
         Class::RelRo => ("__const", macho::S_REGULAR),
@@ -327,6 +378,8 @@ fn section_of(class: &Class) -> (Segment, &str, u32) {
         Class::Tdata => ("__thread_data", macho::S_THREAD_LOCAL_REGULAR),
         Class::Tbss => ("__thread_bss", macho::S_THREAD_LOCAL_ZEROFILL),
         Class::Bss => ("__bss", macho::S_ZEROFILL),
+        // A reservation's segment has no section ([`MachO::image`]): the name is for errors.
+        Class::Reserve(_) => ("__reserved", macho::S_ZEROFILL),
         Class::Named { name, .. } => {
             let (seg, sect) = split(name);
             let flags = match sect {
@@ -604,6 +657,12 @@ impl Writer for MachO {
         }
     }
 
+    fn start_hook(&self) -> Result<(Class, u32), String> {
+        // Below the `u32::MAX` that [`classify`] gives every input's and `#[link_section]`'s
+        // `__mod_init_func`, so the hook is the first pointer dyld calls of this image.
+        Ok((Class::InitArray, 0))
+    }
+
     fn special(&self, name: &str) -> Option<Special> {
         match name {
             "_mh_execute_header" if !self.shared() => return Some(Special::ImageBase),
@@ -700,16 +759,18 @@ impl Writer for MachO {
         ))
     }
 
-    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, CowBytes)>, LinkError> {
         let unwind = match &self.cache {
             Some(cache) => unwind::build_kept(placed, self.output.arch, &mut lock(cache).unwind)?,
-            None => unwind::build(placed, self.output.arch)?,
+            // alloc: once per link, the table's `Arc`: an image linked once keeps nothing
+            None => CowBytes::from_vec(unwind::build(placed, self.output.arch)?),
         };
         // alloc: `Writer::synthesize` returns a `Vec`: one entry, once per link
         Ok(vec![(Class::Synthetic(UNWIND_INFO), unwind)])
     }
 
     fn encode(&self, placed: &Placed<'_>) -> Result<Vec<(u64, u64)>, LinkError> {
+        self.check_placed(placed)?;
         if !chained::chained(&self.platform) {
             // alloc: none: an empty `Vec` holds no buffer
             return Ok(Vec::new());
@@ -771,23 +832,21 @@ struct SectionOut {
 struct Out(Vec<u8>);
 
 impl Out {
-    fn u8(&mut self, value: u8) {
-        self.0.push(value);
-    }
-    fn u16(&mut self, value: u16) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-    fn u32(&mut self, value: u32) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-    fn u64(&mut self, value: u64) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
     fn name16(&mut self, name: &str) {
         self.0.extend_from_slice(&field16(name));
     }
-    fn align(&mut self, to: usize) {
-        self.0.resize(self.0.len().next_multiple_of(to), 0);
+}
+
+impl std::ops::Deref for Out {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Out {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.0
     }
 }
 
@@ -858,8 +917,8 @@ impl MachO {
         let shared = self.shared();
 
         // The segments of the address space, and the sections of the regions in them.
-        // `__PAGEZERO`, the three of `Segment`, `__DWARF` and `__LINKEDIT`.
-        let mut segments: Vec<SegmentOut> = Vec::with_capacity(6);
+        // `__PAGEZERO`, the six of `Segment`, `__DWARF` and `__LINKEDIT`.
+        let mut segments: Vec<SegmentOut> = Vec::with_capacity(9);
         if !shared {
             segments.push(SegmentOut {
                 name: "__PAGEZERO",
@@ -873,7 +932,9 @@ impl MachO {
             });
         }
         let mut has_tlv = false;
-        for segment in [Segment::Text, Segment::DataConst, Segment::Data] {
+        for segment in
+            [Segment::Text, Segment::DataConst, Segment::Data, Segment::Arena, Segment::Cells, Segment::Fixed]
+        {
             let regions =
                 || (placed.regions.iter().enumerate()).filter(move |(_, it)| place(&it.class).0 == segment);
             let first = regions().next();
@@ -898,7 +959,7 @@ impl MachO {
             };
             let (mut vmend, mut filend) = (start, start);
             let mut zero_seen = None;
-            let mut sections = Vec::with_capacity(regions().count());
+            let mut sections = Vec::with_capacity(if segment.reserves() { 0 } else { regions().count() });
             for (index, region) in regions() {
                 let end = region.addr + region.capacity;
                 if region.addr < start {
@@ -920,7 +981,7 @@ impl MachO {
                     )));
                 }
                 if region.size > region.capacity
-                    || placed.bytes(index).len() as u64 > region.capacity
+                    || placed.len(index) as u64 > region.capacity
                 {
                     // alloc: error path
                     return Err(error(format!(
@@ -931,7 +992,7 @@ impl MachO {
                 vmend = vmend.max(end);
                 if zeroed(&region.class) {
                     zero_seen.get_or_insert(region.addr);
-                    if !placed.bytes(index).is_empty() {
+                    if placed.len(index) != 0 {
                         // alloc: error path
                         return Err(error(format!(
                             "the zeroed region of {:?} at {:#x} has bytes",
@@ -948,6 +1009,9 @@ impl MachO {
                         )));
                     }
                     filend = filend.max(end);
+                }
+                if segment.reserves() {
+                    continue;
                 }
                 let offset = match zeroed(&region.class) {
                     true => 0,
@@ -969,19 +1033,15 @@ impl MachO {
             }
             let vmend = page_up(vmend, page);
             let filesize = (page_up(filend, page) - vmaddr).min(vmend - vmaddr);
-            let prot = match segment.prot() {
-                Prot { write: true, .. } => macho::VM_PROT_READ | macho::VM_PROT_WRITE,
-                Prot { exec: true, .. } => macho::VM_PROT_READ | macho::VM_PROT_EXECUTE,
-                // `__DATA_CONST` is written by the loader, which makes it read-only after.
-                _ => macho::VM_PROT_READ | macho::VM_PROT_WRITE,
-            };
             segments.push(SegmentOut {
                 name: segment.name(),
                 vmaddr,
                 vmsize: vmend - vmaddr,
-                fileoff: vmaddr - base,
+                // A segment without file bytes at offset 0, as `__PAGEZERO`: its address less
+                // the base is past the file's end, which dyld refuses.
+                fileoff: if segment.reserves() { 0 } else { vmaddr - base },
                 filesize,
-                prot,
+                prot: segment.vm_prot(),
                 flags: if segment == Segment::DataConst { macho::SG_READ_ONLY } else { 0 },
                 sections,
             });
@@ -1113,8 +1173,8 @@ impl MachO {
         let (indirect, indirect_count) = indirect(placed, &mut sections, &symbols.index_of)?;
         let name_at = |(at, len): (u32, u32)| &symbols.strings[at as usize..(at + len) as usize];
         // Each segment before `__LINKEDIT`, (start, size): the chained fixups' page starts.
-        // alloc: none: at most six segments, inline
-        let laid: SmallVec<[(u64, u64); 6]> = segments.iter().map(|it| (it.vmaddr, it.vmsize)).collect();
+        // alloc: none: at most eight segments, inline
+        let laid: SmallVec<[(u64, u64); 8]> = segments.iter().map(|it| (it.vmaddr, it.vmsize)).collect();
 
         // alloc: none for a chained image, whose binds are its slots
         let mut binds = Vec::with_capacity(if chained { 0 } else { placed.binds.len() + placed.got.len() });
@@ -1158,31 +1218,41 @@ impl MachO {
         let linkedit_at = file_next;
         let fixups_len = match chained {
             true => {
-                let pages = laid.iter().map(|it| it.1.div_ceil(chained::PAGE) as usize).sum::<usize>();
+                // Only a segment dyld writes has slots, and so page starts: never a reservation's
+                // gigabytes of pages.
+                let pages = (segments.iter())
+                    .filter(|it| it.prot & macho::VM_PROT_WRITE != 0)
+                    .map(|it| it.vmsize.div_ceil(chained::PAGE) as usize)
+                    .sum::<usize>();
                 let names = placed.imports.iter().map(|it| it.name.len() + 2).sum::<usize>();
                 64 + 40 * laid.len() + 2 * pages + 8 * placed.imports.len() + names
             }
             false => 0,
         };
         let rebases = if chained { 0 } else { placed.rebase.len() };
-        let mut linkedit = Out(Vec::with_capacity(
+        // An incremental image builds it in its last link's buffer: see [`linkedit_part`].
+        let mut linkedit = Out(kept.as_deref_mut().map(|it| std::mem::take(&mut it.scratch)).unwrap_or_default());
+        linkedit.0.clear();
+        // alloc: once per link, `__LINKEDIT`'s bytes; none for a relink in place after the
+        // first, whose buffer is the last one's
+        linkedit.0.reserve(
             linkedit::capacity(rebases, &binds, &exports, placed.functions.len())
                 + fixups_len
                 + symbols.nlist.len()
                 + indirect.len()
                 + symbols.strings.len()
                 + 64,
-        ));
+        );
         let reuse = [
             delta.is_some_and(|it| it.rebase.is_empty()),
             delta.is_some_and(|it| it.same_names && it.binds.is_empty() && it.got.is_empty()),
             delta.is_some_and(|it| it.same_names),
             delta.is_some_and(|it| it.functions.is_empty()),
         ];
-        let kept_table = |nth: usize| -> Option<&[u8]> {
-            let kept = kept.as_deref().filter(|_| reuse[nth])?;
-            let at: usize = kept.lengths[..nth].iter().sum();
-            Some(&kept.tables[at..at + kept.lengths[nth]])
+        // A kept table's (start, length) in the kept `__LINKEDIT`.
+        let kept_table = |nth: usize| -> Option<(usize, usize)> {
+            let kept = kept.as_deref().filter(|it| reuse[nth] && it.linkedit.is_some())?;
+            Some(kept.tables[nth])
         };
         let at_of = |start: usize, len: usize| -> Result<(u32, u32), LinkError> {
             if len == 0 {
@@ -1190,8 +1260,10 @@ impl MachO {
             }
             Ok((u32_of(linkedit_at + start as u64, "`__LINKEDIT`'s offsets")?, len as u32))
         };
-        // Each kept table's (start, length) in `linkedit`: rebases, binds, trie, starts.
+        // Each kept table's (start, length) in `linkedit`: rebases, binds, trie, starts; and
+        // each reused one's in the kept `__LINKEDIT`, left zeros in `linkedit`.
         let mut tables = [(0usize, 0usize); 4];
+        let mut reused = [None; 4];
         let out = &mut linkedit.0;
         let mut fixups_at = (0, 0);
         if chained {
@@ -1201,27 +1273,31 @@ impl MachO {
             fixups_at = at_of(start, len)?;
         } else {
             let start = out.len();
-            let len = match kept_table(0) {
-                Some(bytes) => copy_into(out, bytes),
+            reused[0] = kept_table(0);
+            let len = match reused[0] {
+                Some((_, len)) => room(out, len),
                 None => linkedit::rebases(placed.rebase, &spans, out).map_err(error)?,
             };
             tables[0] = (start, len);
             let start = out.len();
-            let len = match kept_table(1) {
-                Some(bytes) => copy_into(out, bytes),
+            reused[1] = kept_table(1);
+            let len = match reused[1] {
+                Some((_, len)) => room(out, len),
                 None => linkedit::binds(&mut binds, &spans, out).map_err(error)?,
             };
             tables[1] = (start, len);
         }
         let start = out.len();
-        let len = match kept_table(2) {
-            Some(bytes) => copy_into(out, bytes),
+        reused[2] = kept_table(2);
+        let len = match reused[2] {
+            Some((_, len)) => room(out, len),
             None => linkedit::trie(&mut exports, out).map_err(error)?,
         };
         tables[2] = (start, len);
         let start = out.len();
-        let len = match kept_table(3) {
-            Some(bytes) => copy_into(out, bytes),
+        reused[3] = kept_table(3);
+        let len = match reused[3] {
+            Some((_, len)) => room(out, len),
             None => {
                 // alloc: one buffer per link, of exactly the functions
                 let starts: Vec<u64> = placed.functions.iter().map(|it| it.addr).collect();
@@ -1236,14 +1312,15 @@ impl MachO {
         let mut append = |bytes: &[u8]| -> Result<(u32, u32), LinkError> {
             let at = at_of(out.len(), bytes.len())?;
             out.extend_from_slice(bytes);
-            out.resize(out.len().next_multiple_of(8), 0);
+            out.pad_to(8);
             Ok(at)
         };
         let nlist_at = append(&symbols.nlist)?;
         let indirect_at = append(&indirect)?;
         let strings_at = append(&symbols.strings)?;
-        linkedit.align(16);
-        let code_limit = linkedit_at + linkedit.0.len() as u64;
+        linkedit.pad_to(16);
+        let linkedit = linkedit_part(kept.as_deref_mut(), linkedit.0, &tables, &reused);
+        let code_limit = linkedit_at + linkedit.len() as u64;
         let identifier = placed.name;
         if identifier.is_empty() || identifier.contains(['/', '\0']) {
             // alloc: error path
@@ -1252,7 +1329,7 @@ impl MachO {
             )));
         }
         let signature_len = sign::len(identifier, code_limit);
-        let linkedit_size = linkedit.0.len() as u64 + signature_len;
+        let linkedit_size = linkedit.len() as u64 + signature_len;
         segments.push(SegmentOut {
             name: "__LINKEDIT",
             vmaddr: vm_next,
@@ -1263,36 +1340,39 @@ impl MachO {
             flags: 0,
             sections: Vec::new(), // alloc: empty, which doesn't allocate
         });
+        if self.output.dev_run.is_some() {
+            code_alone(&segments, page)?;
+        }
 
         // The load commands.
         let mut commands = Out::default();
         let mut count = 0u32;
         for segment in &segments {
             count += 1;
-            commands.u32(macho::LC_SEGMENT_64);
-            commands.u32((SEGMENT + SECTION * segment.sections.len()) as u32);
+            commands.put_u32(macho::LC_SEGMENT_64);
+            commands.put_u32((SEGMENT + SECTION * segment.sections.len()) as u32);
             commands.name16(segment.name);
-            commands.u64(segment.vmaddr);
-            commands.u64(segment.vmsize);
-            commands.u64(segment.fileoff);
-            commands.u64(segment.filesize);
-            commands.u32(segment.prot);
-            commands.u32(segment.prot);
-            commands.u32(segment.sections.len() as u32);
-            commands.u32(segment.flags);
+            commands.put_u64(segment.vmaddr);
+            commands.put_u64(segment.vmsize);
+            commands.put_u64(segment.fileoff);
+            commands.put_u64(segment.filesize);
+            commands.put_u32(segment.prot);
+            commands.put_u32(segment.prot);
+            commands.put_u32(segment.sections.len() as u32);
+            commands.put_u32(segment.flags);
             for section in &segment.sections {
                 commands.name16(&section.name);
                 commands.name16(section.segment);
-                commands.u64(section.addr);
-                commands.u64(section.size);
-                commands.u32(section.offset);
-                commands.u32(section.align);
-                commands.u32(0);
-                commands.u32(0);
-                commands.u32(section.flags);
-                commands.u32(section.indirect);
-                commands.u32(0);
-                commands.u32(0);
+                commands.put_u64(section.addr);
+                commands.put_u64(section.size);
+                commands.put_u32(section.offset);
+                commands.put_u32(section.align);
+                commands.put_u32(0);
+                commands.put_u32(0);
+                commands.put_u32(section.flags);
+                commands.put_u32(section.indirect);
+                commands.put_u32(0);
+                commands.put_u32(0);
             }
         }
         if chained {
@@ -1300,30 +1380,30 @@ impl MachO {
                 [(macho::LC_DYLD_CHAINED_FIXUPS, fixups_at), (macho::LC_DYLD_EXPORTS_TRIE, trie_at)]
             {
                 count += 1;
-                commands.u32(command);
-                commands.u32(16);
-                commands.u32(at);
-                commands.u32(len);
+                commands.put_u32(command);
+                commands.put_u32(16);
+                commands.put_u32(at);
+                commands.put_u32(len);
             }
         } else {
             count += 1;
-            commands.u32(macho::LC_DYLD_INFO_ONLY);
-            commands.u32(48);
+            commands.put_u32(macho::LC_DYLD_INFO_ONLY);
+            commands.put_u32(48);
             for (at, len) in [rebase_at, bind_at, (0, 0), (0, 0), trie_at] {
-                commands.u32(at);
-                commands.u32(len);
+                commands.put_u32(at);
+                commands.put_u32(len);
             }
         }
         count += 1;
-        commands.u32(macho::LC_SYMTAB);
-        commands.u32(24);
-        commands.u32(nlist_at.0);
-        commands.u32(symbols.count);
-        commands.u32(strings_at.0);
-        commands.u32(strings_at.1);
+        commands.put_u32(macho::LC_SYMTAB);
+        commands.put_u32(24);
+        commands.put_u32(nlist_at.0);
+        commands.put_u32(symbols.count);
+        commands.put_u32(strings_at.0);
+        commands.put_u32(strings_at.1);
         count += 1;
-        commands.u32(macho::LC_DYSYMTAB);
-        commands.u32(80);
+        commands.put_u32(macho::LC_DYSYMTAB);
+        commands.put_u32(80);
         for field in [
             0,
             symbols.locals,
@@ -1344,7 +1424,7 @@ impl MachO {
             0,
             0,
         ] {
-            commands.u32(field);
+            commands.put_u32(field);
         }
         match &self.output.kind {
             OutputKind::Executable { .. } => {
@@ -1357,20 +1437,20 @@ impl MachO {
             }
         }
         count += 1;
-        commands.u32(macho::LC_UUID);
-        commands.u32(24);
+        commands.put_u32(macho::LC_UUID);
+        commands.put_u32(24);
         commands.0.extend_from_slice(&placed.id);
         count += 1;
-        commands.u32(macho::LC_BUILD_VERSION);
-        commands.u32(24);
-        commands.u32(self.platform.platform);
-        commands.u32(self.platform.minimum);
-        commands.u32(self.platform.sdk);
-        commands.u32(0);
+        commands.put_u32(macho::LC_BUILD_VERSION);
+        commands.put_u32(24);
+        commands.put_u32(self.platform.platform);
+        commands.put_u32(self.platform.minimum);
+        commands.put_u32(self.platform.sdk);
+        commands.put_u32(0);
         count += 1;
-        commands.u32(macho::LC_SOURCE_VERSION);
-        commands.u32(16);
-        commands.u64(0);
+        commands.put_u32(macho::LC_SOURCE_VERSION);
+        commands.put_u32(16);
+        commands.put_u64(0);
         if !shared {
             let entry = placed.entry.ok_or_else(|| error("an executable without an entry"))?;
             let text = &segments[1];
@@ -1379,10 +1459,10 @@ impl MachO {
                 return Err(error(format!("the entry {entry:#x} is not in `__TEXT`")));
             }
             count += 1;
-            commands.u32(macho::LC_MAIN);
-            commands.u32(24);
-            commands.u64(entry - base);
-            commands.u64(self.output.stack.unwrap_or(0));
+            commands.put_u32(macho::LC_MAIN);
+            commands.put_u32(24);
+            commands.put_u64(entry - base);
+            commands.put_u64(self.output.stack.unwrap_or(0));
         }
         for (library, weak) in &loaded {
             count += 1;
@@ -1394,16 +1474,16 @@ impl MachO {
             (macho::LC_DATA_IN_CODE, in_code_at),
         ] {
             count += 1;
-            commands.u32(command);
-            commands.u32(16);
-            commands.u32(at);
-            commands.u32(len);
+            commands.put_u32(command);
+            commands.put_u32(16);
+            commands.put_u32(at);
+            commands.put_u32(len);
         }
         count += 1;
-        commands.u32(macho::LC_CODE_SIGNATURE);
-        commands.u32(16);
-        commands.u32(u32_of(code_limit, "the code signature's offset")?);
-        commands.u32(u32_of(signature_len, "the code signature's length")?);
+        commands.put_u32(macho::LC_CODE_SIGNATURE);
+        commands.put_u32(16);
+        commands.put_u32(u32_of(code_limit, "the code signature's offset")?);
+        commands.put_u32(u32_of(signature_len, "the code signature's length")?);
 
         if (HEADER + commands.0.len()) as u64 > placed.plan.headers {
             // alloc: error path
@@ -1422,14 +1502,14 @@ impl MachO {
             flags |= macho::MH_HAS_TLV_DESCRIPTORS;
         }
         let mut headers = Out::default();
-        headers.u32(macho::MH_MAGIC_64);
-        headers.u32(self.cpu);
-        headers.u32(self.subtype);
-        headers.u32(if shared { macho::MH_DYLIB } else { macho::MH_EXECUTE });
-        headers.u32(count);
-        headers.u32(commands.0.len() as u32);
-        headers.u32(flags);
-        headers.u32(0);
+        headers.put_u32(macho::MH_MAGIC_64);
+        headers.put_u32(self.cpu);
+        headers.put_u32(self.subtype);
+        headers.put_u32(if shared { macho::MH_DYLIB } else { macho::MH_EXECUTE });
+        headers.put_u32(count);
+        headers.put_u32(commands.0.len() as u32);
+        headers.put_u32(flags);
+        headers.put_u32(0);
         headers.0.extend_from_slice(&commands.0);
 
         // The file as the loader reads it, hashed where its bytes are: the chained slots
@@ -1438,11 +1518,11 @@ impl MachO {
         pieces.push((0, &headers.0[..]));
         for (index, region) in placed.regions.iter().enumerate() {
             if let Some(at) = self.offset(placed, region) {
-                pieces.push((at, placed.bytes(index)));
+                placed.runs(index, |offset, bytes| pieces.push((at + offset as u64, bytes)));
             }
         }
         pieces.extend(debug_at.iter().map(|&(at, nth)| (at, &placed.debug[nth].1[..])));
-        pieces.push((linkedit_at, &linkedit.0[..]));
+        linkedit.runs(|offset, bytes| pieces.push((linkedit_at + offset as u64, bytes)));
         let file = sign::View::new(code_limit, pieces)
             .and_then(|it| it.with_slots(placed.encoded, base))
             .map_err(error)?;
@@ -1469,15 +1549,17 @@ impl MachO {
             )));
         }
         if let Some(kept) = kept.as_deref_mut() {
-            kept.keep(placed, &linkedit.0, tables, symbols, &debug_at);
+            // clone: two reference counts, `__LINKEDIT` shared with the state that holds it
+            kept.keep(placed, linkedit.clone(), tables, symbols, &debug_at);
         }
 
         // The signature is one part: an incremental link, which changes few of its hashes,
         // writes only the blocks of it that changed.
         let mut parts = Vec::with_capacity(3);
-        parts.push((0, headers.0));
-        parts.push((linkedit_at, linkedit.0));
-        parts.push((code_limit, signature));
+        // alloc: once per link, the headers' and the signature's `Arc`s
+        parts.push((0, CowBytes::from_vec(headers.0)));
+        parts.push((linkedit_at, linkedit));
+        parts.push((code_limit, CowBytes::from_vec(signature)));
         Ok(File { len: linkedit_at + linkedit_size, parts, debug: debug_at })
     }
 
@@ -1560,14 +1642,14 @@ impl MachO {
         let mut entry = |name: &str, kind: u8, sect: u8, desc: u16, value: u64| -> (u32, u32) {
             let at = strings.0.len() as u32;
             let (prefix, rest) = spelled(name);
-            nlist.u32(at);
+            nlist.put_u32(at);
             strings.0.extend_from_slice(prefix.as_bytes());
             strings.0.extend_from_slice(rest.as_bytes());
-            strings.u8(0);
-            nlist.u8(kind);
-            nlist.u8(sect);
-            nlist.u16(desc);
-            nlist.u64(value);
+            strings.put_u8(0);
+            nlist.put_u8(kind);
+            nlist.put_u8(sect);
+            nlist.put_u16(desc);
+            nlist.put_u64(value);
             (at, (prefix.len() + rest.len()) as u32)
         };
 
@@ -1599,7 +1681,7 @@ impl MachO {
                 strings.0.len()
             )));
         }
-        strings.align(8);
+        strings.pad_to(8);
 
         Ok(Symbols {
             count: count as u32,
@@ -1614,6 +1696,166 @@ impl MachO {
             locals_of,
         })
     }
+}
+
+impl MachO {
+    /// What the placed image may hold, checked before anything is encoded ([`Writer::encode`]
+    /// runs before [`Writer::file`]): no `.preinit_array`, a reservation exactly where the dev
+    /// run asks for one, a dev run's start hook first in `__mod_init_func`, and nothing dyld
+    /// writes in code.
+    fn check_placed(&self, placed: &Placed<'_>) -> Result<(), LinkError> {
+        if let Some(region) = placed.regions.iter().find(|it| it.class == Class::PreinitArray) {
+            // alloc: error path
+            return Err(error(format!(
+                "a `.preinit_array` region at {:#x} in a Mach-O image, which has no pre-initializers: \
+                 a dev run's start hook is the first entry of `__mod_init_func`",
+                region.addr
+            )));
+        }
+        let asked = self.output.dev_run.map_or([0; 3], |it| [it.arena, it.cells, it.fixed]);
+        for (reserve, asked) in [Reserve::Arena, Reserve::Cells, Reserve::Fixed].into_iter().zip(asked) {
+            let class = Class::Reserve(reserve);
+            let room = (placed.regions.iter())
+                .filter(|it| it.class == class)
+                .fold(0u64, |room, it| room.saturating_add(it.capacity));
+            if (asked == 0) != (room == 0) || room < asked {
+                let segment = place(&class).0.name();
+                return Err(error(match self.output.dev_run {
+                    // alloc: error path
+                    None => format!("`{segment}` reserves {room:#x} bytes in an image that is not a dev run"),
+                    // alloc: error path
+                    Some(_) => format!("`{segment}` reserves {room:#x} bytes where the dev run asks {asked:#x}"),
+                }));
+            }
+        }
+        if self.output.dev_run.is_some() {
+            start_hook_first(placed)?;
+        }
+        self.fixed_code(placed)
+    }
+
+    /// Nothing dyld writes is in `__TEXT`, so its bytes are the file's at every load address:
+    /// no pointer it slides, no bind, no GOT cell. Each is an error naming its symbol and
+    /// section.
+    fn fixed_code(&self, placed: &Placed<'_>) -> Result<(), LinkError> {
+        let base = placed.plan.base;
+        let text = (placed.regions.iter())
+            .filter(|it| place(&it.class).0 == Segment::Text)
+            .fold(base + placed.plan.headers, |end, it| end.max(it.addr + it.capacity));
+        let code = base..page_up(text, self.page);
+        let mut found = None;
+        if let Some(&at) = placed.rebase.iter().find(|it| code.contains(*it)) {
+            found = Some((at, "slides a pointer", None));
+        }
+        if let Some(bind) = placed.binds.iter().find(|it| code.contains(&it.addr)) {
+            found = found.filter(|it| it.0 < bind.addr).or(Some((bind.addr, "binds a pointer", Some(bind.import))));
+        }
+        if let Some(cell) = placed.got.iter().find(|it| code.contains(&it.addr)) {
+            let import = match cell.holds {
+                Holds::Import(import) => Some(import),
+                _ => None,
+            };
+            found = found.filter(|it| it.0 < cell.addr).or(Some((cell.addr, "fixes up a GOT cell", import)));
+        }
+        let Some((addr, what, import)) = found else { return Ok(()) };
+        let section = (placed.regions.iter())
+            .find(|it| (it.addr..it.addr + it.capacity.max(it.size)).contains(&addr))
+            // alloc: error path
+            .map_or_else(|| "the headers".to_owned(), |it| format!("`__TEXT,{}`", section_of(&it.class).1));
+        let symbol = match import.and_then(|it| placed.imports.get(it as usize)) {
+            Some(import) => {
+                let (prefix, rest) = spelled(&import.name);
+                // alloc: error path
+                format!("to `{prefix}{rest}`")
+            }
+            None => match function_at(placed, addr) {
+                Some(name) => {
+                    let (prefix, rest) = spelled(name);
+                    // alloc: error path
+                    format!("in `{prefix}{rest}`")
+                }
+                // alloc: error path
+                None => "in no function".to_owned(),
+            },
+        };
+        // alloc: error path
+        Err(error(format!(
+            "dyld {what} at {addr:#x} {symbol}, in {section}: code is written by no loader, so \
+             its bytes are the file's at every address it loads at (a pointer in code is a text \
+             relocation, which arm64 macOS refuses)"
+        )))
+    }
+}
+
+/// A dev run's first initializer is its start hook: the first pointer of `__mod_init_func`,
+/// as the region holds it before dyld slides it, is `_blaze_inproc_start`.
+fn start_hook_first(placed: &Placed<'_>) -> Result<(), LinkError> {
+    let start = (placed.symbol)(START).ok_or_else(|| {
+        error(
+            "a dev run whose image doesn't define `_blaze_inproc_start`: its dev runtime \
+             (`blaze_inproc::runtime`) is the start hook that overlays its code",
+        )
+    })?;
+    let first = (placed.region(&Class::InitArray)).and_then(|(index, _)| placed.view(index).u64(0));
+    match first {
+        Some(first) if first == start => Ok(()),
+        // alloc: error path
+        Some(first) => Err(error(format!(
+            "a dev run whose first initializer is {first:#x}, not `_blaze_inproc_start` at {start:#x}: \
+             the start hook overlays the code before any other initializer runs"
+        ))),
+        None => Err(error(
+            "a dev run with no `__mod_init_func`: its first entry is the start hook, \
+             `_blaze_inproc_start`",
+        )),
+    }
+}
+
+/// The name of the function `addr` is in, by [`Placed::functions`] (in address order).
+fn function_at<'p>(placed: &'p Placed<'_>, addr: u64) -> Option<&'p str> {
+    let at = placed.functions.partition_point(|it| it.addr <= addr).checked_sub(1)?;
+    let function = &placed.functions[at];
+    if addr >= function.addr + function.size.max(1) {
+        return None;
+    }
+    function.name.as_deref()
+}
+
+/// A dev run's code segments as its start hook overlays them (`blaze_inproc::image`): each
+/// starts on a page in the file and in memory, is all file bytes, is never writable, and
+/// shares no page of memory or of the file with another segment.
+fn code_alone(segments: &[SegmentOut], page: u64) -> Result<(), LinkError> {
+    for (nth, code) in segments.iter().enumerate().filter(|it| it.1.prot & macho::VM_PROT_EXECUTE != 0) {
+        let memory = code.vmaddr..page_up(code.vmaddr + code.vmsize, page);
+        let file = code.fileoff..page_up(code.fileoff + code.filesize, page);
+        let shared = (segments.iter().enumerate()).find(|&(other, it)| {
+            other != nth
+                && ((it.vmsize != 0 && it.vmaddr < memory.end && memory.start < it.vmaddr + it.vmsize)
+                    || (it.filesize != 0 && it.fileoff < file.end && file.start < it.fileoff + it.filesize))
+        });
+        let why = if code.prot & macho::VM_PROT_WRITE != 0 {
+            // alloc: error path
+            "is writable".to_owned()
+        } else if code.vmaddr % page != 0 || code.fileoff % page != 0 {
+            // alloc: error path
+            "does not start on a page".to_owned()
+        } else if code.filesize != code.vmsize {
+            // alloc: error path
+            "is not all file bytes".to_owned()
+        } else if let Some((_, other)) = shared {
+            // alloc: error path
+            format!("shares a page with `{}`", other.name)
+        } else {
+            continue;
+        };
+        // alloc: error path
+        return Err(error(format!(
+            "a dev run's code segment `{}` at {:#x} (file offset {:#x}) {why}: its start hook overlays \
+             whole pages of {page:#x} of code with the file's bytes",
+            code.name, code.vmaddr, code.fileoff
+        )));
+    }
+    Ok(())
 }
 
 /// The indirect symbol table of the `__got`s, and how many entries it has; each `__got`'s
@@ -1651,7 +1893,7 @@ fn indirect(
                 next += 1;
             }
             let cell = got.get(next).filter(|it| it.0 == addr).map(|it| it.1);
-            indirect.u32(match cell {
+            indirect.put_u32(match cell {
                 Some(&Holds::Import(import)) => index_of[import as usize],
                 Some(Holds::Local(_)) => macho::INDIRECT_SYMBOL_LOCAL,
                 _ => macho::INDIRECT_SYMBOL_ABS,
@@ -1757,10 +1999,53 @@ fn patch_locals(
     Ok(true)
 }
 
-/// A kept table's bytes appended to `out`; their length.
-fn copy_into(out: &mut Vec<u8>, bytes: &[u8]) -> usize {
-    out.extend_from_slice(bytes);
-    bytes.len()
+/// Room for a kept table of `len` bytes appended to `out`, as zeros; `len`.
+fn room(out: &mut Vec<u8>, len: usize) -> usize {
+    out.resize(out.len() + len, 0);
+    len
+}
+
+/// `__LINKEDIT` as the file's part, from `built`, laid out with each table at `tables` and the
+/// ones `reused` names (by their (start, length) in the kept `__LINKEDIT`) left zeros. Where
+/// each reused table is where it was in a kept `__LINKEDIT` of `built`'s length, that one with
+/// the rest written over it, which copies only the pages whose bytes changed, and `built` is
+/// kept to build the next in; otherwise `built` with the reused tables copied in.
+fn linkedit_part(
+    kept: Option<&mut Kept>,
+    mut built: Vec<u8>,
+    tables: &[(usize, usize); 4],
+    reused: &[Option<(usize, usize)>; 4],
+) -> CowBytes {
+    let Some(kept) = kept else {
+        // alloc: once per link, `__LINKEDIT`'s `Arc`: an image linked once keeps nothing
+        return CowBytes::from_vec(built);
+    };
+    let in_place = reused.iter().zip(tables).all(|(reused, table)| reused.is_none_or(|it| it == *table));
+    match kept.linkedit.as_ref() {
+        Some(last) if in_place && last.len() == built.len() => {
+            // clone: two reference counts; the writes below copy only the pages they change
+            let mut part = last.clone();
+            let mut at = 0;
+            for (reused, &(start, len)) in reused.iter().zip(tables) {
+                if reused.is_some() {
+                    part.update(at, &built[at..start]);
+                    at = start + len;
+                }
+            }
+            part.update(at, &built[at..]);
+            kept.scratch = built;
+            part
+        }
+        last => {
+            for (reused, &(start, len)) in reused.iter().zip(tables) {
+                if let Some((from, _)) = *reused {
+                    last.expect("a reused table is kept").copy_to(from, &mut built[start..start + len]);
+                }
+            }
+            // alloc: once per link whose `__LINKEDIT` moved, its `Arc`
+            CowBytes::from_vec(built)
+        }
+    }
 }
 
 /// What an incremental image keeps from its last link, behind [`MachO::cache`], for the next
@@ -1772,10 +2057,12 @@ struct Kept {
     unwind: unwind::Last,
     /// The synthesis the tables are of; 0 for none.
     synthesis: u64,
-    /// The rebase and bind opcodes, the export trie and the function starts, one after
-    /// another, and each one's length.
-    tables: Vec<u8>,
-    lengths: [usize; 4],
+    /// The last `__LINKEDIT`, as the last link's file holds it too, and in it the rebase and
+    /// bind opcodes, the export trie and the function starts: each one's (start, length).
+    linkedit: Option<CowBytes>,
+    tables: [(usize, usize); 4],
+    /// The buffer the next `__LINKEDIT` is built in, kept from the last.
+    scratch: Vec<u8>,
     symbols: Option<Symbols>,
     /// The chained slots, which a page is signed again for when one of them changed.
     slots: Vec<(u64, u64)>,
@@ -1789,16 +2076,13 @@ impl Kept {
     fn keep(
         &mut self,
         placed: &Placed<'_>,
-        linkedit: &[u8],
+        linkedit: CowBytes,
         tables: [(usize, usize); 4],
         symbols: Symbols,
         debug_at: &[(u64, usize)],
     ) {
-        self.tables.clear();
-        for (nth, &(start, len)) in tables.iter().enumerate() {
-            self.tables.extend_from_slice(&linkedit[start..start + len]);
-            self.lengths[nth] = len;
-        }
+        self.linkedit = Some(linkedit);
+        self.tables = tables;
         self.symbols = Some(symbols);
         self.slots.clear();
         self.slots.extend_from_slice(placed.encoded);
@@ -1883,11 +2167,11 @@ fn lock(cache: &Mutex<Kept>) -> std::sync::MutexGuard<'_, Kept> {
 /// A load command of a path at `at`, after `fields`: `LC_LOAD_DYLINKER`, `LC_*_DYLIB`.
 fn path_command(out: &mut Out, command: u32, at: u32, path: &str, fields: &[u32]) {
     let size = (at as usize + path.len() + 1).next_multiple_of(8);
-    out.u32(command);
-    out.u32(size as u32);
-    out.u32(at);
+    out.put_u32(command);
+    out.put_u32(size as u32);
+    out.put_u32(at);
     for field in fields {
-        out.u32(*field);
+        out.put_u32(*field);
     }
     let start = out.0.len();
     out.0.extend_from_slice(path.as_bytes());

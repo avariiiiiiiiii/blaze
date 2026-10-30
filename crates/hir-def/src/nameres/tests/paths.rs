@@ -528,7 +528,7 @@ fn gen_path(rng: &mut SplitMix64) -> ModPath {
 /// Resolves every path in `paths` from every module of the crate and of the block at `$0`,
 /// in every mode and shadow mode, with `resolve_path_fp_with_macro` and with the reference.
 /// Returns how many lookups resolved something.
-fn check_fixture(fixture: &str, paths: &mut dyn FnMut() -> Vec<ModPath>) -> usize {
+fn check_fixture(fixture: &str, paths: &mut impl FnMut() -> Vec<ModPath>) -> usize {
     let (db, position) = TestDB::with_position(fixture);
     let db = &db;
     let block_module = db.module_at_position(position);

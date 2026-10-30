@@ -10,14 +10,19 @@
 //! declared. The module's own new directives stay with the step (`pending`), the per-item tables
 //! too (`side`).
 
-use std::cell::{Cell, RefCell};
+use std::{
+    alloc::Allocator,
+    cell::{Cell, RefCell},
+};
 
 use base_db::{Crate, Db};
+use blaze_mem::Frame;
 use cfg::CfgAtom;
 use either::Either;
 use hir_expand::{
     AttrMacroAttrIds, HirFileId, InFile, MacroCallId, MacroCallKind, MacroDefId, MacroDefKind,
     attrs::{Attr, AttrId},
+    eager::EagerCall,
     mod_path::ModPath,
     name::Name,
 };
@@ -48,7 +53,7 @@ use crate::{
 };
 
 use super::{
-    collect,
+    FrameVec, collect,
     env::{ChildMode, ChildRequest, CollectCx, CrateEnv, SideTables, Sink},
     ops::{DeclOp, DeferredDerive, MacroOp, MacroOpKind, OpLog},
     queries::{
@@ -76,23 +81,24 @@ enum Resolved {
 /// One `resolve_macros` over `pending` through `sink`: resolves each directive (all three
 /// kinds, eager calls, the builtin-derive fast path and its deferral), retains the rest,
 /// expands the resolved ones in one `collect::expand_all` batch, collects each expansion.
-pub(crate) fn resolve_round<'db, S: Sink<'db>>(
-    cx: &CollectCx<'db>,
+pub(crate) fn resolve_round<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
+    cx: &CollectCx<'db, 'f>,
     sink: &mut S,
-    side: &mut SideTables,
-    pending: &mut Vec<MacroOp>,
+    side: &mut SideTables<A>,
+    pending: &mut FrameVec<'f, MacroOp>,
     eager_with_errors: bool,
 ) -> RoundResult {
+    let frame = cx.frame;
     // Directives the sink took before the round are the round's too.
     sink.take_macros(pending);
-    let macros = std::mem::take(pending);
-    // alloc: one per round of a module with directives; holds those it retains.
-    let mut kept = Vec::with_capacity(macros.len());
+    let macros = std::mem::replace(pending, Vec::new_in(frame));
+    let mut kept = Vec::with_capacity_in(macros.len(), frame);
     // The directives the round's own resolutions add (an attribute's item collected again, a
     // derive left unresolved), in the order they come: after the retained ones.
-    let mut added = Vec::new(); // alloc: empty until a resolution adds one
-    let mut resolved: Vec<ResolvedCall> = Vec::new(); // alloc: empty until a call resolves
-    let mut eager = Vec::new(); // alloc: empty unless an eager call expands
+    let mut added = Vec::new_in(frame);
+    let mut resolved: FrameVec<'f, ResolvedCall> = Vec::new_in(frame);
+    let mut eager = Vec::new_in(frame);
+    let mut eager_calls = Vec::new_in(frame);
     let mut progress = false;
     let mut deferred_eager = false;
     for directive in macros {
@@ -105,6 +111,7 @@ pub(crate) fn resolve_round<'db, S: Sink<'db>>(
             &mut Round {
                 resolved: &mut resolved,
                 eager: &mut eager,
+                eager_calls: &mut eager_calls,
                 added: &mut added,
                 deferred_eager: &mut deferred_eager,
             },
@@ -131,12 +138,14 @@ pub(crate) fn resolve_round<'db, S: Sink<'db>>(
 }
 
 /// The lists one round of [`resolve_round`] fills while it goes through its directives.
-struct Round<'a> {
-    resolved: &'a mut Vec<ResolvedCall>,
+struct Round<'a, 'f> {
+    resolved: &'a mut FrameVec<'f, ResolvedCall>,
     /// The calls eager expansion made of the arguments of a call it resolved, for
     /// `add_macro_invoc` once the round's directives are done.
-    eager: &'a mut Vec<(ModuleId, AstId<ast::MacroCall>, MacroCallId)>,
-    added: &'a mut Vec<MacroOp>,
+    eager: &'a mut FrameVec<'f, (ModuleId, AstId<ast::MacroCall>, MacroCallId)>,
+    /// What one call's eager expansion made, before it moves into `eager`.
+    eager_calls: &'a mut FrameVec<'f, EagerCall>,
+    added: &'a mut FrameVec<'f, MacroOp>,
     deferred_eager: &'a mut bool,
 }
 
@@ -185,18 +194,18 @@ fn resolve_macro_def<'db, S: Sink<'db>>(
 }
 
 /// The old `retain` closure of `resolve_macros` for one directive.
-fn resolve_one<'db, S: Sink<'db>>(
-    cx: &CollectCx<'db>,
+fn resolve_one<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
+    cx: &CollectCx<'db, 'f>,
     sink: &mut S,
-    side: &mut SideTables,
+    side: &mut SideTables<A>,
     directive: &MacroOp,
     eager_with_errors: bool,
-    round: &mut Round<'_>,
+    round: &mut Round<'_, 'f>,
 ) -> Resolved {
     let db = cx.db;
     let krate = cx.krate;
     let module = directive.module;
-    let push_resolved = |resolved: &mut Vec<ResolvedCall>, directive: &MacroOp, call_id| {
+    let push_resolved = |resolved: &mut FrameVec<'f, ResolvedCall>, directive: &MacroOp, call_id| {
         let attr_macro_item = match &directive.kind {
             MacroOpKind::Attr { ast_id, .. } => Some(ast_id.ast_id),
             MacroOpKind::FnLike { .. } | MacroOpKind::Derive { .. } => None,
@@ -208,10 +217,8 @@ fn resolve_one<'db, S: Sink<'db>>(
         MacroOpKind::FnLike { ast_id, expand_to, ctxt: call_site } => {
             let view: &S = sink;
             let unresolved = Cell::new(false);
-            // alloc: the paths an eager call's arguments name, kept once it resolves.
-            let named = RefCell::new(Vec::new());
+            let named = RefCell::new(Vec::new_in(cx.frame));
             let buffered = round.eager.len();
-            let eager = &mut *round.eager;
             let call_id = macro_call_as_call_id(
                 db,
                 ast_id.ast_id,
@@ -232,7 +239,13 @@ fn resolve_one<'db, S: Sink<'db>>(
                     }
                     def
                 },
-                &mut |ptr, call_id| eager.push((module, ptr.map(|(_, it)| it), call_id)),
+                round.eager_calls,
+            );
+            round.eager.extend(
+                round
+                    .eager_calls
+                    .drain(..)
+                    .map(|(ptr, call_id)| (module, ptr.map(|(_, it)| it), call_id)),
             );
             if call_id.is_ok() && unresolved.get() && !eager_with_errors {
                 // A macro its arguments name may be defined by one not expanded yet.
@@ -294,9 +307,7 @@ fn resolve_one<'db, S: Sink<'db>>(
                 if def_id.krate != krate
                     && let Some(helpers) = crate_def_map(db, def_id.krate).data.exported_derives.get(&macro_id)
                 {
-                    side.derive_helpers
-                        .entry(ast_id.ast_id.map(|it| it.upcast()))
-                        .or_default()
+                    side.derive_helpers_of(ast_id.ast_id.map(|it| it.upcast()))
                         .extend(helpers.iter().map(|&name| (name, macro_id, Either::Left(call_id))));
                 }
 
@@ -307,7 +318,7 @@ fn resolve_one<'db, S: Sink<'db>>(
         MacroOpKind::Attr { ast_id: file_ast_id, mod_item, attr_id, attr, tree } => {
             let &AstIdWithPath { ast_id, ref path } = file_ast_id;
             let file_id = ast_id.file_id;
-            let recollect_without = |sink: &mut S, side: &mut SideTables, added: &mut Vec<MacroOp>| {
+            let recollect_without = |sink: &mut S, side: &mut SideTables<A>, added: &mut FrameVec<'f, MacroOp>| {
                 recollect(cx, sink, side, added, directive, file_id, *mod_item, *attr_id, *tree);
                 Resolved::Yes
             };
@@ -470,10 +481,8 @@ fn resolve_one<'db, S: Sink<'db>>(
                                         .exported_derives
                                         .get(&macro_id)
                                 {
-                                    let derive_helpers = side
-                                        .derive_helpers
-                                        .entry(ast_id_without_path.map(|it| it.upcast()))
-                                        .or_default();
+                                    let derive_helpers =
+                                        side.derive_helpers_of(ast_id_without_path.map(|it| it.upcast()));
                                     helpers_start = derive_helpers.len();
                                     derive_helpers.extend(
                                         helpers.iter().map(|&name| (name, macro_id, Either::Left(call_id))),
@@ -485,9 +494,7 @@ fn resolve_one<'db, S: Sink<'db>>(
                                     && let MacroDefKind::BuiltInDerive(_, builtin_derive) = def_id.kind
                                     && crate::builtin_derive::has_builtin_derive_impl(builtin_derive)
                                 {
-                                    side.deferred_derives
-                                        .entry(ast_id_without_path.upcast())
-                                        .or_default()
+                                    side.deferred_derives_of(ast_id_without_path.upcast())
                                         .push(DeferredDerive {
                                             call_id,
                                             derive: builtin_derive,
@@ -573,9 +580,9 @@ fn resolve_one<'db, S: Sink<'db>>(
 
 /// The attribute macro call of `attr` on its item, every attribute expanded on the item
 /// before it censored (`prev_active_attrs`).
-fn attr_call(
-    cx: &CollectCx<'_>,
-    side: &mut SideTables,
+fn attr_call<A: Allocator + Clone>(
+    cx: &CollectCx<'_, '_>,
+    side: &mut SideTables<A>,
     item: &AstIdWithPath<ast::Item>,
     attr: &Attr,
     attr_id: AttrId,
@@ -598,11 +605,11 @@ fn attr_call(
 /// Collects the item of an attribute directive again, its attributes up to and including
 /// `attr_id` skipped (the old `recollect_without`).
 #[allow(clippy::too_many_arguments)]
-fn recollect<'db, S: Sink<'db>>(
-    cx: &CollectCx<'db>,
+fn recollect<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
+    cx: &CollectCx<'db, 'f>,
     sink: &mut S,
-    side: &mut SideTables,
-    added: &mut Vec<MacroOp>,
+    side: &mut SideTables<A>,
+    added: &mut FrameVec<'f, MacroOp>,
     directive: &MacroOp,
     file_id: HirFileId,
     mod_item: ModItemId,
@@ -632,7 +639,7 @@ fn recollect<'db, S: Sink<'db>>(
 ///
 /// A proc macro that keeps a session sees its calls in the order rustc makes them, so its
 /// calls are left to the collection, in order.
-fn expand_round(cx: &CollectCx<'_>, limit: u32, resolved: &[ResolvedCall]) {
+fn expand_round(cx: &CollectCx<'_, '_>, limit: u32, resolved: &[ResolvedCall]) {
     if resolved.len() < 2 {
         return;
     }
@@ -644,7 +651,7 @@ fn expand_round(cx: &CollectCx<'_>, limit: u32, resolved: &[ResolvedCall]) {
             MacroDefKind::ProcMacro(_, exp, _) if exp.requires_session(db, def.krate)
         )
     };
-    let mut calls = Vec::with_capacity(resolved.len()); // alloc: one per round that resolved calls
+    let mut calls = Vec::with_capacity_in(resolved.len(), cx.frame);
     calls.extend(
         resolved
             .iter()
@@ -666,11 +673,11 @@ pub(crate) fn first_attr<'p>(pending: impl IntoIterator<Item = &'p MacroOp>) -> 
 /// `reseed_with_unresolved_attribute` of `pending[index]`: reports the attribute unresolved,
 /// skips it and every attribute before it on the item, and collects the item as if they were
 /// not there.
-pub(crate) fn reseed_at<'db, S: Sink<'db>>(
-    cx: &CollectCx<'db>,
+pub(crate) fn reseed_at<'db, 'f, S: Sink<'db>, A: Allocator + Clone>(
+    cx: &CollectCx<'db, 'f>,
     sink: &mut S,
-    side: &mut SideTables,
-    pending: &mut Vec<MacroOp>,
+    side: &mut SideTables<A>,
+    pending: &mut FrameVec<'f, MacroOp>,
     index: u32,
 ) {
     sink.take_macros(pending);
@@ -701,7 +708,7 @@ pub(crate) fn reseed_at<'db, S: Sink<'db>>(
 /// `finish`'s unresolved-macro diagnostics for `pending`, as `Diagnostic` ops through `sink`.
 /// Attribute directives are diagnosed by their reseed.
 pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(
-    cx: &CollectCx<'db>,
+    cx: &CollectCx<'db, '_>,
     sink: &mut S,
     pending: impl IntoIterator<Item = &'p MacroOp>,
 ) {
@@ -723,7 +730,9 @@ pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(
                     directive.depth,
                     view.def_map().recursion_limit(),
                     |path| resolve_macro(view, module, path, MacroSubNs::Bang).map(|(_, it)| it),
-                    &mut |_, _| (),
+                    // Global until `macro_call_as_call_id` takes `Vec<EagerCall, A>`.
+                    // alloc: none unless an eager input holds macro calls; only the error is kept
+                    &mut Vec::new(),
                 );
                 if let Err(UnresolvedMacro { path }) = resolved {
                     sink.apply(DeclOp::Diagnostic(DefDiagnostic::unresolved_macro_call(
@@ -757,7 +766,7 @@ pub(crate) fn unresolved_macro_diagnostics<'db, 'p, S: Sink<'db>>(
 /// module it names; `Final` runs nothing. The driver asks it only of a module the round steps
 /// (`RoundModules::STEP`); asked of another, it carries the module's directives and tables on
 /// without building a view.
-pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
+pub(crate) fn macro_step(db: &Db, frame: &Frame, key: FactKey) -> MacroStep {
     let (module, krate, round) = (key.module(db), key.krate(db), key.round(db));
     let round_key = RoundKey::new(db, krate, round);
     let modules = queries::round_modules(db, round_key);
@@ -776,7 +785,7 @@ pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
     if reseed.is_none() && (!resolves || carried.is_empty()) {
         return MacroStep {
             ops: OpLog::default(),
-            pending: carried.pending().into_boxed_slice(),
+            pending: carried.pending_box(),
             side: carried.side(),
             new_modules: Box::default(),
             progress: false,
@@ -784,8 +793,8 @@ pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
         };
     }
 
-    let cx = collect::cx(db, krate, false);
-    let mut pending = carried.pending();
+    let cx = collect::cx(db, frame, krate, false);
+    let mut pending = carried.pending_in(frame);
     let mut side = carried.side();
     // clone: the step writes its module's tables, so it makes its own copy of them, once.
     let tables = Arc::make_mut(&mut side);
@@ -867,18 +876,27 @@ impl<'a> Carried<'a> {
         self.before.is_empty() && self.new_directives().next().is_none()
     }
 
-    /// The step's directives, owned: the last step's, then the new ones.
-    fn pending(&self) -> Vec<MacroOp> {
-        if self.is_empty() {
-            return Vec::new(); // alloc: empty, allocates nothing
-        }
-        // alloc: once per step of a module with directives, the list the step works on.
-        let mut pending = Vec::with_capacity(self.before.len() + self.new_directives().count());
+    fn len(&self) -> usize {
+        self.before.len() + self.new_directives().count()
+    }
+
+    /// The list a step works on, in its frame: the last step's directives, then the new ones.
+    fn pending_in<'f>(&self, frame: &'f Frame) -> FrameVec<'f, MacroOp> {
+        let mut pending = Vec::with_capacity_in(self.len(), frame);
         // clone: the directives are the values of earlier queries; the step owns its own list.
         pending.extend(self.before.iter().cloned());
         // clone: as above.
         pending.extend(self.new_directives().cloned());
         pending
+    }
+
+    /// The directives of a step that runs nothing, as its value, at exact size.
+    fn pending_box(&self) -> Box<[MacroOp]> {
+        // alloc: the step's value, exact; none when the module has no directive
+        let mut pending = Vec::with_capacity(self.len());
+        // clone: the step's value carries the directives on; the earlier values keep theirs.
+        pending.extend(self.directives().cloned());
+        pending.into_boxed_slice()
     }
 
     /// The step's tables: the carried ones, shared until the step writes them.
@@ -904,8 +922,9 @@ impl<'a> Carried<'a> {
 
 /// The sink of a macro step: a view of one module of a round, the modules its expansions
 /// declare, and the ops they make.
-struct StepSink<'db> {
+struct StepSink<'db, 'f> {
     db: &'db Db,
+    frame: &'f Frame,
     /// The step's module.
     module: ModuleId,
     round: u32,
@@ -917,24 +936,25 @@ struct StepSink<'db> {
     env: &'db CrateEnv,
     env_now: Option<CrateEnv>,
     /// The glob marks of the module's scope, read off it at the first `Update`.
-    marks: Option<PerNsGlobImports>,
-    /// Every op but the module's own directives.
-    log: OpLog,
+    marks: Option<PerNsGlobImports<&'f Frame>>,
+    /// Every op but the module's own directives; [`StepSink::into_step`] makes the [`OpLog`].
+    log: FrameVec<'f, DeclOp>,
     /// The module's own new directives, for `take_macros`.
-    macros: Vec<MacroOp>,
+    macros: FrameVec<'f, MacroOp>,
     /// The plain imports the step collected: module, the name it binds, its op in `log`.
-    imports: Vec<(ModuleId, Name, u32)>,
+    imports: FrameVec<'f, (ModuleId, Name, u32)>,
     /// The module's plain imports the round's fixed point left unresolved.
     unresolved: &'db [(Name, ModPath)],
-    new_modules: Vec<(ModuleId, ModuleRow)>,
+    new_modules: FrameVec<'f, (ModuleId, ModuleRow)>,
 }
 
-impl<'db> StepSink<'db> {
+impl<'db, 'f> StepSink<'db, 'f> {
     /// The step of the module at `at` of `round`. A module can step at a round that does not run
     /// its component (its calls wait on a module that does not change): it starts from its
     /// facts as they last changed, and the imports its component's last run left unresolved.
-    fn new(cx: &CollectCx<'db>, round: RoundKey, at: u32, row: &ModuleRow) -> StepSink<'db> {
+    fn new(cx: &CollectCx<'db, 'f>, round: RoundKey, at: u32, row: &ModuleRow) -> StepSink<'db, 'f> {
         let db = cx.db;
+        let frame = cx.frame;
         let krate = round.krate(db);
         let module = queries::round_modules(db, round).order[at as usize];
         let handle = queries::fact_handle(db, queries::fact_key(db, round, at));
@@ -966,12 +986,14 @@ impl<'db> StepSink<'db> {
             names: NameRecords::default(),
             diagnostics: Vec::new(), // alloc: empty, a view keeps no diagnostics
             diagnostics_by_module: DiagnosticsByModule::default(),
+            records: None,
             // clone: one count of the crate's shared data, once per step.
             data: cx.data.clone(),
         };
         env.install(&mut def_map);
         StepSink {
             db,
+            frame,
             module,
             round: round.round(db),
             def_map,
@@ -979,28 +1001,29 @@ impl<'db> StepSink<'db> {
             env,
             env_now: None,
             marks: None,
-            log: OpLog::default(),
-            macros: Vec::new(), // alloc: empty until the step collects a directive
-            imports: Vec::new(), // alloc: empty until the step collects an import
+            log: Vec::new_in(frame),
+            macros: Vec::new_in(frame),
+            imports: Vec::new_in(frame),
             unresolved: queries::unresolved_named(db, ran),
-            new_modules: Vec::new(), // alloc: empty until an expansion declares a module
+            new_modules: Vec::new_in(frame),
         }
     }
 
     fn into_step(
         self,
-        pending: Vec<MacroOp>,
+        pending: FrameVec<'_, MacroOp>,
         side: Arc<SideTables>,
         progress: bool,
         deferred_eager: bool,
     ) -> MacroStep {
-        let mut ops = self.log;
-        ops.shrink_to_fit();
         MacroStep {
-            ops,
-            pending: pending.into_boxed_slice(),
+            ops: OpLog::from_frame(self.log),
+            // A frame vector's `IntoIter` is `TrustedLen`: each box is one exact allocation.
+            // alloc: the step's value
+            pending: pending.into_iter().collect(),
+            // alloc: as above
+            new_modules: self.new_modules.into_iter().collect(),
             side,
-            new_modules: self.new_modules.into_boxed_slice(),
             progress,
             deferred_eager,
         }
@@ -1074,7 +1097,8 @@ impl<'db> StepSink<'db> {
         let db = self.db;
         if self.marks.is_none() {
             // Before the first write, so the scope is the one the round left.
-            self.marks = Some(PerNsGlobImports::of_scope(self.module, self.scope(self.module)));
+            let marks = PerNsGlobImports::of_scope_in(self.module, self.scope(self.module), self.frame);
+            self.marks = Some(marks);
         }
         for &(name, res) in resolutions {
             match name {
@@ -1098,8 +1122,8 @@ impl<'db> StepSink<'db> {
                     );
                 }
                 None => {
-                    let (tr, import) = match res.take_types_full() {
-                        Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import }) => (tr, import),
+                    let tr = match res.take_types_full() {
+                        Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import: _ }) => tr,
                         Some(other) => {
                             tracing::debug!("non-trait `_` import of {:?}", other);
                             continue;
@@ -1117,11 +1141,7 @@ impl<'db> StepSink<'db> {
                         }
                     };
                     if should_update {
-                        self.scope_mut(module).push_unnamed_trait(
-                            tr,
-                            vis,
-                            import.and_then(ImportOrExternCrate::import),
-                        );
+                        self.scope_mut(module).push_unnamed_trait_through(tr, vis, import);
                     }
                 }
             }
@@ -1203,7 +1223,7 @@ impl<'db> StepSink<'db> {
     }
 }
 
-impl<'db> Sink<'db> for StepSink<'db> {
+impl<'db> Sink<'db> for StepSink<'db, '_> {
     fn db(&self) -> &'db Db {
         self.db
     }
@@ -1229,7 +1249,7 @@ impl<'db> Sink<'db> for StepSink<'db> {
             && import.source.kind == ImportKind::Plain
             && let Some(name) = import.bound_name()
         {
-            let at = u32::try_from(self.log.ops.len()).expect("a step makes 2^32 ops");
+            let at = u32::try_from(self.log.len()).expect("a step makes 2^32 ops");
             self.imports.push((import.module, name, at));
         }
         self.log.push(op);
@@ -1254,7 +1274,7 @@ impl<'db> Sink<'db> for StepSink<'db> {
             if importer != module || bound != name {
                 continue;
             }
-            let DeclOp::Import(import) = &self.log.ops[at as usize] else {
+            let DeclOp::Import(import) = &self.log[at as usize] else {
                 unreachable!("`imports` points at the step's `Import` ops")
             };
             if let Some(it) = f(&import.path) {
@@ -1275,8 +1295,8 @@ impl<'db> Sink<'db> for StepSink<'db> {
         ChildMode::Inline
     }
 
-    fn take_macros(&mut self, into: &mut Vec<MacroOp>) {
-        into.append(&mut self.macros);
+    fn take_macros(&mut self, into: &mut FrameVec<'_, MacroOp>) {
+        into.extend(self.macros.drain(..));
     }
 }
 
@@ -1367,6 +1387,46 @@ concat!(not_yet!());
     }
 
     #[test]
+    fn an_eager_calls_nested_calls_are_recorded_after_it_in_order() {
+        let (db, _) = TestDB::with_many_files(
+            r#"
+//- /lib.rs
+#[rustc_builtin_macro]
+#[macro_export]
+macro_rules! concat { () => {} }
+mod a;
+mod b;
+//- /a.rs
+#[macro_export]
+macro_rules! one { () => { "1" } }
+#[macro_export]
+macro_rules! two { () => { "2" } }
+//- /b.rs
+crate::concat!(crate::one!(), crate::two!());
+"#,
+        );
+        let krate = db.fetch_test_crate();
+        let b = module_named(&db, krate, "b");
+        let first = step(&db, b, krate, 0);
+        assert!(!first.deferred_eager, "both nested macros resolve at round 0");
+        let invocs: Vec<MacroCallId> = first
+            .ops
+            .iter()
+            .filter_map(|op| match op {
+                DeclOp::AddMacroInvoc { module, id, .. } if *module == b => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(invocs.len(), 3, "the call, then its two nested calls: {:?}", first.ops);
+        assert!(invocs[0].is_eager(&db), "the outer call is recorded first");
+        let nested: Vec<String> = invocs[1..]
+            .iter()
+            .map(|id| id.parse_macro_expansion(&db).value.0.root().to_string())
+            .collect();
+        assert_eq!(nested, ["\"1\"", "\"2\""]);
+    }
+
+    #[test]
     fn an_unresolved_attribute_is_found_and_its_reseed_collects_the_item() {
         let (db, _) = TestDB::with_many_files(
             r#"
@@ -1382,17 +1442,20 @@ struct S;
         assert!(!first.progress);
         assert_eq!(first_attr(first.pending.iter()), Some(0), "{:?}", first.pending);
 
-        let cx = collect::cx(&db, krate, false);
-        let round = RoundKey::new(&db, krate, 0);
-        let modules = queries::round_modules(&db, round);
-        let at = modules.at(root).expect("the root is a module of round 0");
-        let mut sink = StepSink::new(&cx, round, at, &modules.rows[at as usize]);
-        let mut pending = first.pending.to_vec();
-        let mut side = Arc::clone(&first.side);
-        reseed_at(&cx, &mut sink, Arc::make_mut(&mut side), &mut pending, 0);
-        assert!(pending.is_empty(), "{pending:?}");
-        assert!(!side.skip_attrs.is_empty(), "the attribute is skipped from now on");
-        let step = sink.into_step(pending, side, true, false);
+        let step = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+            let cx = collect::cx(&db, frame, krate, false);
+            let round = RoundKey::new(&db, krate, 0);
+            let modules = queries::round_modules(&db, round);
+            let at = modules.at(root).expect("the root is a module of round 0");
+            let mut sink = StepSink::new(&cx, round, at, &modules.rows[at as usize]);
+            let mut pending = Vec::with_capacity_in(first.pending.len(), frame);
+            pending.extend(first.pending.iter().cloned());
+            let mut side = Arc::clone(&first.side);
+            reseed_at(&cx, &mut sink, Arc::make_mut(&mut side), &mut pending, 0);
+            assert!(pending.is_empty(), "{pending:?}");
+            assert!(!side.skip_attrs.is_empty(), "the attribute is skipped from now on");
+            sink.into_step(pending, side, true, false)
+        });
         assert!(
             step.ops.iter().any(|op| matches!(op, DeclOp::Diagnostic(it)
                 if matches!(it.kind, DefDiagnosticKind::UnresolvedMacroCall { .. }))),

@@ -1,21 +1,25 @@
 //! Fulfill loop for next-solver.
 
+use std::mem;
+
 use rustc_next_trait_solver::solve::{
-    GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt, StalledOnCoroutines,
-    fast_path::compute_goal_fast_path,
+    GoalEvaluation, GoalStalledOn, StalledOnCoroutines, fast_path::compute_goal_fast_path,
 };
 use rustc_type_ir::{
-    InferCtxtLike, Interner,
-    solve::{Certainty, NoSolution},
+    InferCtxtLike, Interner as _,
+    solve::{Certainty, FastPathDepth},
 };
 
 use crate::next_solver::{
-    DbInterner, ParamEnv, Predicate, SolverContext, TypingMode,
+    DbInterner, ParamEnv, Predicate, SolverContext, TypingMode, global_goals,
     infer::{
         InferCtxt,
         traits::{Obligation, ObligationCause, PredicateObligation, PredicateObligations},
     },
+    recycle,
 };
+
+pub(crate) mod watch;
 
 type StalledOn<'db> = Option<GoalStalledOn<DbInterner<'db>>>;
 
@@ -23,15 +27,18 @@ type StalledOn<'db> = Option<GoalStalledOn<DbInterner<'db>>>;
 /// what it is stalled on. The order is rustc's: it decides which errors are reported and which
 /// inference variables are constrained first.
 #[derive(Debug, Default)]
-struct Pending<'db> {
+pub(crate) struct Pending<'db> {
     cause: Vec<ObligationCause>,
     param_env: Vec<ParamEnv<'db>>,
     predicate: Vec<Predicate<'db>>,
     recursion_depth: Vec<u32>,
     stalled_on: Vec<StalledOn<'db>>,
+    watches: watch::Watches,
 }
 
-const _: () = assert!(size_of::<Pending<'static>>() == 5 * size_of::<Vec<u8>>());
+const _: () = assert!(
+    size_of::<Pending<'static>>() == 5 * size_of::<Vec<u8>>() + size_of::<watch::Watches>()
+);
 
 impl<'db> Pending<'db> {
     fn len(&self) -> usize {
@@ -64,8 +71,27 @@ impl<'db> Pending<'db> {
         (0..self.len()).map(|at| self.obligation(at))
     }
 
-    fn clear(&mut self) {
+    pub(crate) fn clear(&mut self) {
         self.truncate(0);
+    }
+
+    /// Bytes its columns hold room for.
+    pub(crate) fn held(&self) -> usize {
+        self.cause.capacity() * size_of::<ObligationCause>()
+            + self.param_env.capacity() * size_of::<ParamEnv<'db>>()
+            + self.predicate.capacity() * size_of::<Predicate<'db>>()
+            + self.recursion_depth.capacity() * size_of::<u32>()
+            + self.stalled_on.capacity() * size_of::<StalledOn<'db>>()
+            + self.watches.held()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_for_tests(&mut self, rows: usize) {
+        self.cause.reserve_exact(rows);
+        self.param_env.reserve_exact(rows);
+        self.predicate.reserve_exact(rows);
+        self.recursion_depth.reserve_exact(rows);
+        self.stalled_on.reserve_exact(rows);
     }
 
     fn truncate(&mut self, len: usize) {
@@ -74,6 +100,7 @@ impl<'db> Pending<'db> {
         self.predicate.truncate(len);
         self.recursion_depth.truncate(len);
         self.stalled_on.truncate(len);
+        self.watches.forget();
     }
 
     /// rustc's `retain_mut`: keeps, in order, the rows `keep` is true of, compacting every
@@ -132,9 +159,17 @@ pub struct FulfillmentCtxt<'db> {
 impl<'db> FulfillmentCtxt<'db> {
     pub fn new(infcx: &InferCtxt<'db>) -> FulfillmentCtxt<'db> {
         FulfillmentCtxt {
-            pending: Default::default(),
+            pending: recycle::pending(),
             usable_in_snapshot: infcx.num_open_snapshots(),
             fixpoint: None,
+        }
+    }
+}
+
+impl Drop for FulfillmentCtxt<'_> {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            recycle::give_pending(mem::take(&mut self.pending));
         }
     }
 }
@@ -151,11 +186,14 @@ impl<'db> FulfillmentCtxt<'db> {
         assert_eq!(self.usable_in_snapshot, infcx.num_open_snapshots());
         self.fixpoint = None;
         let delegate = <&SolverContext<'db>>::from(infcx);
-        match compute_goal_fast_path(delegate, obligation.as_goal(), obligation.cause.span()) {
-            Some(GoalEvaluation { certainty: Certainty::Yes, .. }) => {}
-            Some(GoalEvaluation { certainty: Certainty::Maybe(_), stalled_on, .. }) => {
+        let depth = FastPathDepth::Any(Some(infcx.interner.recursion_limit()));
+        let goal = obligation.as_goal();
+        match compute_goal_fast_path(delegate, goal, obligation.cause.span(), depth) {
+            Some((GoalEvaluation { certainty: Certainty::Yes, .. }, _)) => {}
+            Some((GoalEvaluation { certainty: Certainty::Maybe(_), stalled_on, .. }, _)) => {
                 self.pending.push(obligation, stalled_on)
             }
+            None if global_goals::holds_at_registration(delegate, obligation.as_goal()) => {}
             None => self.pending.push(obligation, None),
         }
     }
@@ -179,96 +217,6 @@ impl<'db> FulfillmentCtxt<'db> {
         }
         let errors = self.pending.obligations().map(NextSolverError::Ambiguity).collect(); // alloc: error path
         self.pending.clear();
-        errors
-    }
-
-    /// rustc's loop: every pending obligation, until a round changes nothing. An obligation
-    /// that made inference progress more often than the recursion limit is rustc's fatal
-    /// fulfillment overflow; here it ends the loop with an [`NextSolverError::Overflow`].
-    pub(crate) fn try_evaluate_obligations(
-        &mut self,
-        infcx: &InferCtxt<'db>,
-    ) -> Vec<NextSolverError<'db>> {
-        assert_eq!(self.usable_in_snapshot, infcx.num_open_snapshots());
-        if self.fixpoint == Some(infcx.state_changes()) {
-            return Vec::new(); // alloc: empty
-        }
-        self.fixpoint = None;
-        let delegate = <&SolverContext<'db>>::from(infcx);
-        let recursion_limit = infcx.interner.recursion_limit();
-        let mut errors = Vec::new(); // alloc: empty unless a goal fails
-        let mut overflowed = false;
-        loop {
-            let mut any_changed = false;
-            let round_start = infcx.state_changes();
-
-            self.pending.retain(|obligation, opt_stalled_on| {
-                if overflowed {
-                    return true;
-                }
-                // Common case: still stalled; keep the obligation. This path is extremely hot
-                // in some cases; there can be thousands of pending obligations.
-                if let Some(stalled_on) = opt_stalled_on
-                    && delegate.goal_remains_stalled(stalled_on)
-                {
-                    return true;
-                }
-
-                let goal = obligation.as_goal();
-                let span = obligation.cause.span();
-                let result = delegate.evaluate_root_goal(goal, span, opt_stalled_on.take());
-                infcx.inspect_evaluated_obligation(obligation, &result, || {
-                    Some(delegate.evaluate_root_goal_for_proof_tree(goal, span).1)
-                });
-                let GoalEvaluation { goal, certainty, has_changed, stalled_on } = match result {
-                    Ok(result) => result,
-                    Err(NoSolution) => {
-                        errors.push(NextSolverError::TrueError(obligation.clone())); // clone: error path, four `Copy` fields
-                        return false;
-                    }
-                };
-
-                // We've resolved the goal in `evaluate_root_goal`, avoid redoing this work
-                // in the next iteration. This does not resolve the inference variables
-                // constrained by evaluating the goal.
-                obligation.predicate = goal.predicate;
-                if has_changed == HasChanged::Yes {
-                    if obligation.recursion_depth as usize > recursion_limit {
-                        // We limit the total count of inference progress to avoid hangs, and
-                        // don't try to recover from this, as rustc doesn't.
-                        errors.push(NextSolverError::Overflow(obligation.clone())); // clone: error path, four `Copy` fields
-                        overflowed = true;
-                        return false;
-                    }
-                    // We increment the recursion depth here to track the number of times
-                    // this goal has resulted in inference progress. This doesn't precisely
-                    // model the way that we track recursion depth in the old solver due
-                    // to the fact that we only process root obligations, but it is a good
-                    // approximation and should only result in fulfillment overflow in
-                    // pathological cases.
-                    // A recursion limit of `u32::MAX` must not overflow the count.
-                    obligation.recursion_depth = obligation.recursion_depth.saturating_add(1);
-                    any_changed = true;
-                }
-
-                match certainty {
-                    Certainty::Yes => false,
-                    Certainty::Maybe(_) => {
-                        // What it is stalled on for the next round, as we run to a fixpoint.
-                        *opt_stalled_on = stalled_on;
-                        true
-                    }
-                }
-            });
-
-            if overflowed || !any_changed {
-                if !overflowed && infcx.state_changes() == round_start {
-                    self.fixpoint = Some(round_start);
-                }
-                break;
-            }
-        }
-
         errors
     }
 

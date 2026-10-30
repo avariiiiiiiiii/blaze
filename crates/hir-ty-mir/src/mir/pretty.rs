@@ -667,7 +667,7 @@ pub fn impl_written_at(
 ) -> (base_db::FileId, syntax::TextSize) {
     use hir_def::src::HasSource;
     use hir_expand::{InFile, MacroCallKind};
-    let source: InFile<_> = id.lookup(db).source(db);
+    let source: InFile<_> = id.lookup(db).ast_ptr(db);
     if let Some(call) = source.file_id.macro_file() {
         let loc = call.loc(db);
         if let MacroCallKind::Derive { .. } = loc.kind {
@@ -675,6 +675,7 @@ pub fn impl_written_at(
             return (range.file_id.file_id(db), range.range.start());
         }
     }
-    let range = source.syntax().original_file_range_rooted(db);
+    let range = InFile::new(source.file_id, source.value.syntax_node_ptr().text_range())
+        .original_node_file_range_rooted(db);
     (range.file_id.file_id(db), range.range.start())
 }

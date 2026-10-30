@@ -54,6 +54,7 @@ Callers outside db.rs that use only `.diagnostics()` and `.defined_anon_consts()
 `crates/hir-ide/src/tests.rs:162`.
 
 > forwarded to db: `crates/hir-ty/src/db.rs` is inside lane db (db-ty-db); `field_types` still returns `&ArenaMap`.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/db.rs:340-366` (the four signatures return `Lowered`/`&FieldTypes`) and `:1200` (`push` takes `Lowered`, callers at :1171-1193 pass `.as_lowered()` or the `Lowered` as is).
 
 ## 2. db-ty-db: `crates/hir-ty/src/lib.rs`, re-export the new public types
 
@@ -72,6 +73,7 @@ them cold) and their cold form (`ColdBatch::of_field_types(interner, batch)`,
 from other crates.
 
 > forwarded to db: `crates/hir-ty/src/lib.rs` is inside lane db; not re-exported yet.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/lib.rs:113-125` (`FieldTypes`, `Lowered`, the five `batch::` types and the four `persist::` types).
 
 ## 3. Coordinator (hir-ide): `crates/hir-ide/src/display.rs:1231`
 
@@ -121,6 +123,7 @@ form's columns and checks, the diagnostics' words, supertraits' order, the `para
 bitset); the type columns need interned types, which need a database, and hir-ty has none.
 
 > forwarded to db: `crates/hir/src/tests.rs` is inside lane db (db-ty-hir).
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:776` (`a_dependency_batch_is_what_the_per_item_lowering_gives`), `:817` (`a_cold_batch_round_trips_with_its_types`) and `:855` (`a_workspace_crate_has_no_batch`).
 
 ## 6. Items lane: `crates/blaze-items/src/facts.rs:203` hashes supertraits in their order
 

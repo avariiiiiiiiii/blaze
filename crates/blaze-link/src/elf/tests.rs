@@ -6,12 +6,13 @@ use super::image::section_name;
 use super::{Elf, Segment, in_file, section, writer};
 use std::sync::Mutex;
 
+use crate::cow::CowBytes;
 use crate::model::{
-    Bind, Class, Counts, Delta, Export, Function, GotEntry, Holds, Import, Library, Placed, Plan, Region, Special, Splice,
-    SymbolKind, Tls, Writer,
+    Bind, Class, Counts, Delta, Export, Function, GotEntry, Holds, Import, Library, Pages, Placed, Plan, Region, Reserve,
+    Special, Splice, SymbolKind, Tls, Writer,
 };
 use crate::output::Debug;
-use crate::{Format, Output, OutputKind};
+use crate::{DevRun, Format, Output, OutputKind};
 
 fn output(arch: blaze_codegen::Arch, kind: OutputKind, interpreter: Option<&str>) -> Output {
     Output {
@@ -26,6 +27,8 @@ fn output(arch: blaze_codegen::Arch, kind: OutputKind, interpreter: Option<&str>
         tags: 0,
         stack: None,
         windows_subsystem: false,
+        dev_run: None,
+        triple: match arch { blaze_codegen::Arch::Aarch64 => "aarch64-unknown-linux-gnu", _ => "x86_64-unknown-linux-gnu" }.into(),
     }
 }
 
@@ -127,13 +130,28 @@ impl Fixture {
         delta: Option<&Delta<'_>>,
         then: impl FnOnce(&Placed<'_>) -> R,
     ) -> R {
-        let contents: Vec<&[u8]> = contents.iter().map(Vec::as_slice).collect();
+        self.with_pages(contents, &[], synthesis, delta, then)
+    }
+
+    /// [`Fixture::with_in`], the regions `paged` holds in pages (and none in `contents`).
+    fn with_pages<R>(
+        &self,
+        contents: &[Vec<u8>],
+        paged: &[Option<Pages<'_>>],
+        synthesis: u64,
+        delta: Option<&Delta<'_>>,
+        then: impl FnOnce(&Placed<'_>) -> R,
+    ) -> R {
+        let contents: Vec<&[u8]> = (contents.iter().enumerate())
+            .map(|(at, it)| if paged.get(at).is_some_and(Option::is_some) { &[][..] } else { it.as_slice() })
+            .collect();
         then(&Placed {
             output: &self.writer.output,
             name: "image",
             plan: &self.plan,
             regions: &self.regions,
             contents: &contents,
+            paged,
             libraries: &self.libraries,
             imports: &self.imports,
             got: &self.got,
@@ -157,17 +175,40 @@ impl Fixture {
     /// Synthesizes with `writer`, then makes the file's parts with the synthetic regions'
     /// bytes where the core puts them, both of synthesis `synthesis` with `delta`.
     fn build(&self, writer: &Elf, synthesis: u64, delta: Option<&Delta<'_>>) -> (Vec<(Class, Vec<u8>)>, Vec<(u64, Vec<u8>)>) {
-        let tables = self.with_in(&self.contents, synthesis, delta, |placed| writer.synthesize(placed)).unwrap();
+        let (tables, parts) = self.shared(writer, synthesis, delta);
+        (flat(tables), flat(parts))
+    }
+
+    /// [`Fixture::build`]'s tables and parts as the writer hands them over.
+    fn shared(&self, writer: &Elf, synthesis: u64, delta: Option<&Delta<'_>>) -> (Vec<(Class, CowBytes)>, Vec<(u64, CowBytes)>) {
+        self.shared_in(writer, synthesis, delta, &[])
+    }
+
+    /// [`Fixture::shared`] with the regions of `held` given to the writer in those pages, as
+    /// the core gives a region it wrote since the full link.
+    fn shared_in(
+        &self,
+        writer: &Elf,
+        synthesis: u64,
+        delta: Option<&Delta<'_>>,
+        held: &[(Class, CowBytes)],
+    ) -> (Vec<(Class, CowBytes)>, Vec<(u64, CowBytes)>) {
+        let mut paged: Vec<Option<Pages<'_>>> = vec![None; self.regions.len()];
+        for (class, bytes) in held {
+            paged[self.index(class)] = Some(Pages::all(bytes));
+        }
+        let tables =
+            self.with_pages(&self.contents, &paged, synthesis, delta, |placed| writer.synthesize(placed)).unwrap();
         let mut contents = self.contents.clone();
         for (class, bytes) in &tables {
-            contents[self.index(class)] = bytes.clone();
+            contents[self.index(class)] = bytes.contiguous().into_owned();
         }
-        let file = self.with_in(&contents, synthesis, delta, |placed| writer.file(placed)).unwrap();
+        let file = self.with_pages(&contents, &paged, synthesis, delta, |placed| writer.file(placed)).unwrap();
         (tables, file.parts)
     }
 
     fn synthesize(&self) -> Result<Vec<(Class, Vec<u8>)>, crate::LinkError> {
-        self.with(|placed| self.writer.synthesize(placed))
+        self.with(|placed| self.writer.synthesize(placed)).map(flat)
     }
 
     /// Synthesizes, then writes the file as the core does: regions at their offsets, then the
@@ -187,6 +228,7 @@ impl Fixture {
         });
         let again = self.with(|placed| self.writer.file(placed).unwrap());
         assert_eq!((again.parts, again.debug), (file.parts.clone(), file.debug.clone()));
+        let parts = flat(file.parts);
         let mut bytes = vec![0; file.len as usize];
         for ((region, contents), offset) in self.regions.iter().zip(&self.contents).zip(offsets) {
             if let Some(offset) = offset {
@@ -194,7 +236,7 @@ impl Fixture {
                 bytes[offset as usize..][..contents.len()].copy_from_slice(contents);
             }
         }
-        for (offset, part) in &file.parts {
+        for (offset, part) in &parts {
             bytes[*offset as usize..][..part.len()].copy_from_slice(part);
         }
         for &(offset, nth) in &file.debug {
@@ -203,6 +245,11 @@ impl Fixture {
         }
         bytes
     }
+}
+
+/// Each of the writer's buffers as one vector, keyed as it was.
+fn flat<K>(parts: Vec<(K, CowBytes)>) -> Vec<(K, Vec<u8>)> {
+    parts.into_iter().map(|(key, bytes)| (key, bytes.contiguous().into_owned())).collect()
 }
 
 /// The debug sections are where the section headers say, with the bytes the core made, and
@@ -646,7 +693,8 @@ fn sections_are_placed_as_lld_places_them() {
         (".ctors", true, false, false, Class::InitArray, 65536),
         (".fini_array.5", true, false, false, Class::FiniArray, 5),
         (".dtors", true, false, false, Class::FiniArray, 65536),
-        (".preinit_array", true, false, false, named(".preinit_array", true, false), 0),
+        (".preinit_array", true, false, false, Class::PreinitArray, 0),
+        (".preinit_array.5", true, false, false, Class::PreinitArray, 0),
         ("linkme_ITEMS", true, false, false, named("linkme_ITEMS", true, false), 0),
         ("my_code", false, true, false, named("my_code", false, true), 0),
         (".init", false, true, false, named(".init", false, true), 0),
@@ -1187,7 +1235,8 @@ fn many_symbols(n: usize) -> Fixture {
 /// and lookup, the hashes, bucket ends and order, the other nine regions' bytes (`.interp`, the
 /// build ID, `.dynsym`, `.gnu.version`, `.gnu.version_r`, `.gnu.hash`, `.rela.dyn`, `.dynamic`,
 /// `.eh_frame_hdr`), the relocations and their per-chunk results,
-/// the `.preinit_array` class looked up, and the list `synthesize` returns.
+/// the `.preinit_array` class looked up, and the list `synthesize` returns; then 10 more, the
+/// `Arc` of each region's `CowBytes`, which the core no longer makes when it takes them.
 #[test]
 fn dynamic_tables_allocate_nothing_per_symbol() {
     let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
@@ -1208,7 +1257,7 @@ fn dynamic_tables_allocate_nothing_per_symbol() {
     };
     let (small, large) = (used(64), used(2000));
     assert_eq!(small.allocations, large.allocations, "the dynamic tables allocate per symbol");
-    assert!(large.allocations <= 22, "the dynamic tables: {} allocations, budget 22", large.allocations);
+    assert!(large.allocations <= 32, "the dynamic tables: {} allocations, budget 32", large.allocations);
 }
 
 /// The functions of [`relinked`].
@@ -1229,7 +1278,11 @@ fn relinked_name(at: usize, letter: char) -> String {
 /// and a slid pointer to each in every other 8 bytes of `.data`; a GOT cell holding the
 /// first, and a bind between the pointers.
 fn relinked() -> Fixture {
-    let n = RELINKED;
+    relinked_of(RELINKED)
+}
+
+/// [`relinked`] of `n` functions.
+fn relinked_of(n: usize) -> Fixture {
     let names: Vec<String> = (0..n).map(|at| relinked_name(at, 'f')).collect();
     let eh_frame_len = eh_frame(&vec![(0, 16); n]).len() as u64;
     let counts = Counts {
@@ -1412,4 +1465,370 @@ fn a_relink_from_another_synthesis_or_of_another_length_is_built() {
     let written = [(data + 16 * 6 + 8, 8)];
     relinks_as_built(&image, 3, &delta(2, &functions, &rebase, &[], &written));
     assert_eq!(patched(&image), [0, 0, 0], "a splice of another length is built");
+}
+
+/// How many of the 16 KiB pages of `new` a writer copied rather than shared with `old`.
+fn copied(new: &CowBytes, old: &CowBytes) -> usize {
+    let mut ranges = Vec::new();
+    new.changed_since(old, &mut ranges);
+    ranges.iter().map(|it| it.len().div_ceil(CowBytes::PAGE)).sum()
+}
+
+/// How many of the 16 KiB pages of `new` hold bytes other than `old`'s there.
+fn differing(new: &[u8], old: &[u8]) -> usize {
+    let page = CowBytes::PAGE;
+    (0..new.len().div_ceil(page))
+        .filter(|at| {
+            let range = at * page..((at + 1) * page).min(new.len());
+            old.get(range.clone()) != Some(&new[range])
+        })
+        .count()
+}
+
+/// A one-function relink of an image of 4,098 functions: of its kept tables (`.rela.dyn`,
+/// `.eh_frame_hdr` and the symbol table's tail), it copies only the pages whose bytes it
+/// changes (the function's pointer's `RELATIVE` entry, its `.eh_frame_hdr` cell and its local
+/// symbol) and shares every other with the last link's; the tables are a build's.
+#[test]
+fn a_one_function_relink_copies_only_the_pages_it_writes() {
+    const N: usize = 4098;
+    let mut image = relinked_of(N);
+    let (first, first_parts) = image.shared(&image.writer, 1, None);
+    let (text, data, eh) = (image.at(&Class::Text), image.at(&Class::Data), image.at(&Class::EhFrame));
+    // Function `k` starts 4 bytes on and is 4 shorter: its FDE and its pointer in `.data`
+    // move with it.
+    let k = 2000;
+    let moved = text + 16 * k as u64 + 4;
+    (image.functions[k].addr, image.functions[k].size) = (moved, 12);
+    image.put(&Class::Data, 16 * k, &moved.to_le_bytes());
+    let old = image.contents[image.index(&Class::EhFrame)].clone();
+    let fdes: Vec<(u64, u32)> = (0..N).map(|at| if at == k { (moved, 12) } else { (text + 16 * at as u64, 16) }).collect();
+    let new = eh_frame(&fdes);
+    image.put(&Class::EhFrame, 0, &new);
+    let mut written = vec![(data + 16 * k as u64, 8), changed(&old, &new, eh)];
+    written.sort_unstable();
+    let functions = [splice(k as u32..k as u32 + 1, k as u32..k as u32 + 1)];
+    let since = delta(1, &functions, &[], &[], &written);
+    let (tables, parts) = image.shared(&image.writer, 2, Some(&since));
+    assert_eq!(patched(&image), [1, 1, 1], "every table patched");
+    let fresh = Elf { output: image.writer.output.clone(), last: None };
+    assert_eq!((flat(tables.clone()), flat(parts.clone())), image.build(&fresh, 2, None), "a build's tables and parts");
+
+    let region = |tables: &[(Class, CowBytes)], name: &'static str| {
+        tables.iter().find(|it| it.0 == Class::Synthetic(name)).unwrap().1.clone()
+    };
+    let tail = |parts: &[(u64, CowBytes)]| parts.iter().find(|it| it.0 != 0).unwrap().1.clone();
+    let kept = [
+        (".rela.dyn", region(&tables, super::RELA_DYN), region(&first, super::RELA_DYN)),
+        (".eh_frame_hdr", region(&tables, super::EH_FRAME_HDR), region(&first, super::EH_FRAME_HDR)),
+        ("the symbol table's tail", tail(&parts), tail(&first_parts)),
+    ];
+    let (mut total, mut all_copied) = (0, 0);
+    for (what, new, old) in &kept {
+        let (copied, differing) = (copied(new, old), differing(&new.contiguous(), &old.contiguous()));
+        assert!(copied <= differing, "{what}: {copied} pages copied, {differing} changed");
+        assert!((1..=2).contains(&differing), "{what}: {differing} pages changed by one function");
+        total += new.len().div_ceil(CowBytes::PAGE);
+        all_copied += copied;
+    }
+    assert!(total >= 16, "{total} pages of kept tables: the image is not large");
+    eprintln!("a one-function relink among {N} functions copies {all_copied} of its kept tables' {total} pages");
+}
+
+/// The same relink with the code and data regions as the core holds them after it: the full
+/// link's buffers, with the function's code, its pointer and its FDE written into copies of the
+/// pages they land in. Only those pages are copied (no region is flattened for the writer),
+/// and the writer, reading `.data` and `.eh_frame` in their pages, makes the tables and parts a
+/// build from flat bytes makes.
+#[test]
+fn a_one_function_relink_reads_its_code_regions_in_pages() {
+    const N: usize = 4098;
+    let mut image = relinked_of(N);
+    let classes = [Class::Text, Class::Data, Class::EhFrame];
+    // clone: the full link's bytes of each region, which the test's own buffers are
+    let full: Vec<CowBytes> = classes.iter().map(|it| CowBytes::from_vec(image.contents[image.index(it)].clone())).collect();
+    image.shared(&image.writer, 1, None);
+    let (text, data, eh) = (image.at(&Class::Text), image.at(&Class::Data), image.at(&Class::EhFrame));
+    let k = 2000;
+    let moved = text + 16 * k as u64 + 4;
+    (image.functions[k].addr, image.functions[k].size) = (moved, 12);
+    image.put(&Class::Text, 16 * k + 4, &[0xcc; 12]);
+    image.put(&Class::Data, 16 * k, &moved.to_le_bytes());
+    let old = image.contents[image.index(&Class::EhFrame)].clone();
+    let fdes: Vec<(u64, u32)> = (0..N).map(|at| if at == k { (moved, 12) } else { (text + 16 * at as u64, 16) }).collect();
+    let new = eh_frame(&fdes);
+    image.put(&Class::EhFrame, 0, &new);
+    let mut written = vec![(moved, 12), (data + 16 * k as u64, 8), changed(&old, &new, eh)];
+    written.sort_unstable();
+
+    let mut held: Vec<(Class, CowBytes)> = classes.iter().cloned().zip(full.iter().cloned()).collect();
+    for (class, bytes) in &mut held {
+        let index = image.index(class);
+        let region = &image.regions[index];
+        for &(addr, len) in written.iter().filter(|it| it.0 >= region.addr && it.0 + it.1 <= region.addr + region.size) {
+            let at = (addr - region.addr) as usize;
+            bytes.write(at, &image.contents[index][at..at + len as usize]);
+        }
+    }
+    let (mut total, mut all_copied) = (0, 0);
+    for ((class, bytes), old) in held.iter().zip(&full) {
+        let flat = &image.contents[image.index(class)];
+        assert_eq!(&*bytes.contiguous(), &flat[..], "{class:?} holds the link's bytes");
+        assert!(bytes.slice(0, bytes.len()).is_none(), "{class:?} is in pages");
+        let (copied, differing) = (copied(bytes, old), differing(flat, &old.contiguous()));
+        assert!(copied <= differing, "{class:?}: {copied} pages copied, {differing} changed");
+        assert!((1..=2).contains(&copied), "{class:?}: {copied} pages copied by one function");
+        total += bytes.len().div_ceil(CowBytes::PAGE);
+        all_copied += copied;
+    }
+    assert!(total >= 8, "{total} pages of code and data: the image is not large");
+
+    let functions = [splice(k as u32..k as u32 + 1, k as u32..k as u32 + 1)];
+    let since = delta(1, &functions, &[], &[], &written);
+    let (tables, parts) = image.shared_in(&image.writer, 2, Some(&since), &held);
+    assert_eq!(patched(&image), [1, 1, 1], "every table patched");
+    let fresh = Elf { output: image.writer.output.clone(), last: None };
+    assert_eq!((flat(tables), flat(parts)), image.build(&fresh, 2, None), "a build's tables and parts");
+    let (tables, parts) = image.shared_in(&fresh, 3, None, &held);
+    assert_eq!((flat(tables), flat(parts)), image.build(&fresh, 3, None), "a build from pages is a build from flat bytes");
+    eprintln!("a one-function relink among {N} functions copies {all_copied} of its code and data's {total} pages");
+}
+
+/// The architecture `blaze_inproc::image` reads ELF images of: this machine's.
+fn host_arch() -> blaze_codegen::Arch {
+    if cfg!(target_arch = "aarch64") { blaze_codegen::Arch::Aarch64 } else { blaze_codegen::Arch::X86_64 }
+}
+
+/// A dev executable of this machine reserving `pages` pages (arena, cells, fixed), its page
+/// and the reservations' sizes.
+fn dev_executable(pages: [u64; 3]) -> (Output, u64, [u64; 3]) {
+    let arch = host_arch();
+    let page = match arch {
+        blaze_codegen::Arch::Aarch64 => 0x10000,
+        _ => 0x1000,
+    };
+    let sizes = pages.map(|it| it * page);
+    let mut output = output(arch, OutputKind::Executable { entry: "_start".into() }, Some("/lib/ld.so"));
+    output.dev_run = Some(DevRun { arena: sizes[0], cells: sizes[1], fixed: sizes[2] });
+    (output, page, sizes)
+}
+
+/// Each `PT_LOAD` as (flags, offset, vaddr, filesz, memsz), in order.
+fn loads(bytes: &[u8]) -> Vec<(u32, u64, u64, u64, u64)> {
+    let file = ElfFile64::<Endianness>::parse(bytes).unwrap();
+    let endian = file.endian();
+    (file.elf_program_headers().iter())
+        .filter(|it| it.p_type(endian) == elf::PT_LOAD)
+        .map(|it| (it.p_flags(endian), it.p_offset(endian), it.p_vaddr(endian), it.p_filesz(endian), it.p_memsz(endian)))
+        .collect()
+}
+
+/// Every `.dynamic` entry as (tag, value).
+fn dynamic_entries(bytes: &[u8]) -> Vec<(u64, u64)> {
+    let file = ElfFile64::<Endianness>::parse(bytes).unwrap();
+    let endian = file.endian();
+    let dynamic = file.elf_program_headers().iter().find_map(|it| it.dynamic(endian, bytes).unwrap()).unwrap();
+    dynamic.iter().map(|it| (it.d_tag(endian), it.d_val(endian))).collect()
+}
+
+/// The error `Writer::file` gives for the image, its synthetic regions made first.
+fn file_error(image: &mut Fixture) -> String {
+    for (class, bytes) in image.synthesize().unwrap() {
+        let index = image.index(&class);
+        image.contents[index] = bytes;
+    }
+    match image.with(|placed| image.writer.file(placed)) {
+        Ok(_) => panic!("the file was made"),
+        Err(error) => error.what,
+    }
+}
+
+/// A dev executable: the start hook's pointer first in `.preinit_array` (an input's entry after
+/// it), named by `DT_PREINIT_ARRAY`; its code on pages of its own, all in the file and never
+/// writable; its three reservations last, in order, of no access and no file bytes; bound at
+/// load. `blaze_inproc::image` reads the same code and reservations from the bytes.
+#[test]
+fn a_dev_executable_is_laid_out_for_its_start_hook() {
+    let (output, page, sizes) = dev_executable([4, 1, 2]);
+    let counts = Counts { absolute: 3, functions: 1, function_names: 4, ..Counts::default() };
+    let pieces = [
+        (Class::Text, 64, 16),
+        (Class::Stubs, 32, 16),
+        (Class::Rodata, 16, 8),
+        (Class::RelRo, 8, 8),
+        (Class::PreinitArray, 16, 8),
+        (Class::InitArray, 8, 8),
+        (Class::Data, 16, 8),
+        (Class::Bss, 32, 8),
+        (Class::Reserve(Reserve::Fixed), sizes[2], page),
+        (Class::Reserve(Reserve::Arena), sizes[0], page),
+        (Class::Reserve(Reserve::Cells), sizes[1], page),
+    ];
+    let mut image = Fixture::new(output, &pieces, &counts);
+    // As the core places a reservation: nothing placed, the range its capacity.
+    for region in image.regions.iter_mut().filter(|it| matches!(it.class, Class::Reserve(_))) {
+        region.size = 0;
+    }
+    assert_eq!(image.plan.headers, 64 + 56 * 15, "room for the reservations' program headers");
+    assert_eq!(image.writer.start_hook(), Ok((Class::PreinitArray, 0)));
+    let classes: Vec<&Class> = image.regions.iter().map(|it| &it.class).collect();
+    assert_eq!(
+        classes[classes.len() - 4..],
+        [&Class::Bss, &Class::Reserve(Reserve::Arena), &Class::Reserve(Reserve::Cells), &Class::Reserve(Reserve::Fixed)]
+    );
+    for class in [Class::Reserve(Reserve::Arena), Class::Reserve(Reserve::Cells), Class::Reserve(Reserve::Fixed)] {
+        assert_eq!(image.writer.prot(&class), crate::model::Prot::NONE);
+        assert!(!in_file(&class));
+    }
+    let (text, preinit, init) = (image.at(&Class::Text), image.at(&Class::PreinitArray), image.at(&Class::InitArray));
+    image.put(&Class::PreinitArray, 0, &text.to_le_bytes());
+    image.put(&Class::PreinitArray, 8, &(text + 16).to_le_bytes());
+    image.put(&Class::InitArray, 0, &(text + 32).to_le_bytes());
+    image.rebase = vec![preinit, preinit + 8, init];
+    image.functions = vec![Function { addr: text, size: 64, fde: None, windows: None, name: Some("main".into()) }];
+    image.entry = Some(text);
+    let bss_end = image.at(&Class::Bss) + 32;
+    let at = |name: &str| match image.writer.special(name) {
+        Some(Special::Placed(address)) => address(&image.regions),
+        other => panic!("`{name}` is {other:?}"),
+    };
+    assert_eq!((at("__preinit_array_start"), at("__preinit_array_end")), (preinit, preinit + 16));
+    assert_eq!(at("_end"), bss_end, "the reservations are not the image's memory");
+    let bytes = image.link();
+
+    // `.preinit_array`, the start hook's pointer first, and `.dynamic`.
+    let file = ElfFile64::<Endianness>::parse(&bytes[..]).unwrap();
+    let endian = file.endian();
+    let sections = file.elf_section_table();
+    let (_, shdr) = sections.section_by_name(endian, b".preinit_array").unwrap();
+    assert_eq!((shdr.sh_type(endian), shdr.sh_addr(endian), shdr.sh_size(endian)), (elf::SHT_PREINIT_ARRAY, preinit, 16));
+    assert_eq!(shdr.sh_entsize(endian), 8);
+    assert_eq!(bytes[preinit as usize..][..8], text.to_le_bytes(), "the start hook's pointer is first");
+    let entries = dynamic_entries(&bytes);
+    let tag = |tag: u32| entries.iter().find(|it| it.0 == u64::from(tag)).map(|it| it.1);
+    assert_eq!((tag(elf::DT_PREINIT_ARRAY), tag(elf::DT_PREINIT_ARRAYSZ)), (Some(preinit), Some(16)));
+    assert_eq!(tag(elf::DT_INIT_ARRAY), Some(init));
+    assert_ne!(tag(elf::DT_FLAGS).unwrap() & u64::from(elf::DF_BIND_NOW), 0);
+    assert_ne!(tag(elf::DT_FLAGS_1).unwrap() & u64::from(elf::DF_1_NOW), 0);
+    for lazy in [elf::DT_JMPREL, elf::DT_PLTREL, elf::DT_PLTRELSZ, elf::DT_TEXTREL] {
+        assert_eq!(tag(lazy), None, "nothing is bound lazily or written in code: tag {lazy}");
+    }
+    assert_eq!(tag(elf::DT_FLAGS).unwrap() & u64::from(elf::DF_TEXTREL), 0);
+
+    // The segments.
+    let loads = loads(&bytes);
+    assert_eq!(loads.iter().map(|it| it.0).collect::<Vec<_>>(), [4, 5, 6, 6, 0, 0, 0]);
+    let code: Vec<_> = loads.iter().filter(|it| it.0 & elf::PF_X != 0).collect();
+    assert_eq!(code.len(), 1);
+    for &&(flags, offset, vaddr, filesz, memsz) in &code {
+        assert_eq!(flags & elf::PF_W, 0, "code is never writable");
+        assert_eq!((offset % page, vaddr % page), (0, 0), "code starts on a page in the file and in memory");
+        assert_eq!(offset, vaddr);
+        assert_eq!(filesz, memsz, "code is all file bytes");
+        let end = (vaddr + memsz).next_multiple_of(page);
+        for other in loads.iter().filter(|it| it.2 != vaddr) {
+            let other_end = (other.2 + other.4).next_multiple_of(page);
+            assert!(other_end <= vaddr || other.2 >= end, "the code at {vaddr:#x} shares a page with {other:x?}");
+        }
+    }
+    let others_end = loads[..4].iter().map(|it| it.2 + it.4).max().unwrap();
+    let reserved: Vec<std::ops::Range<u64>> = loads[4..].iter().map(|it| it.2..it.2 + it.4).collect();
+    for (nth, (&(flags, _, vaddr, filesz, memsz), reserve)) in
+        loads[4..].iter().zip([Reserve::Arena, Reserve::Cells, Reserve::Fixed]).enumerate()
+    {
+        assert_eq!((flags, filesz, memsz), (0, 0, sizes[nth]), "{reserve:?}");
+        assert_eq!(vaddr, image.at(&Class::Reserve(reserve)));
+        assert_eq!(vaddr % page, 0);
+        assert!(vaddr >= others_end, "{reserve:?} is after every other segment");
+    }
+    assert!(reserved.is_sorted_by_key(|it| it.start));
+    for (name, size) in [&b".blaze.reserve.arena"[..], b".blaze.reserve.cells", b".blaze.reserve.fixed"].into_iter().zip(sizes) {
+        let (_, shdr) = sections.section_by_name(endian, name).unwrap();
+        assert_eq!((shdr.sh_type(endian), shdr.sh_flags(endian), shdr.sh_size(endian)), (elf::SHT_NOBITS, 0, size));
+    }
+
+    // What the start hook reads of the same bytes.
+    let layout = blaze_inproc::image::layout(blaze_inproc::Format::Elf, &bytes, page).unwrap();
+    let &(_, offset, vaddr, _, memsz) = code[0];
+    assert_eq!(layout.header, 0);
+    assert_eq!(layout.code, [blaze_inproc::Segment { offset, linked: vaddr, len: memsz.next_multiple_of(page) }]);
+    assert_eq!(layout.reserved, reserved);
+}
+
+/// An image that is not a dev run has the headers, segments and `.preinit_array` it had: an
+/// input's `.preinit_array` is relro between `.data.rel.ro` and `.init_array`, and a
+/// reservation in it is an error.
+#[test]
+fn an_image_without_a_dev_run_keeps_its_layout() {
+    let writer = Elf { output: executable(), last: None };
+    assert_eq!(writer.plan().headers, 64 + 56 * 12);
+    let counts = Counts { absolute: 1, ..Counts::default() };
+    let pieces = [(Class::Text, 16, 16), (Class::RelRo, 8, 8), (Class::PreinitArray, 8, 8), (Class::InitArray, 8, 8), (Class::Data, 8, 8)];
+    let mut image = Fixture::new(executable(), &pieces, &counts);
+    let (text, relro, preinit, init) =
+        (image.at(&Class::Text), image.at(&Class::RelRo), image.at(&Class::PreinitArray), image.at(&Class::InitArray));
+    assert!(relro < preinit && preinit < init);
+    assert_eq!(Segment::of(&Class::PreinitArray), Segment::Relro);
+    image.put(&Class::PreinitArray, 0, &text.to_le_bytes());
+    image.rebase = vec![preinit];
+    image.entry = Some(text);
+    let bytes = image.link();
+    assert_eq!(loads(&bytes).iter().map(|it| it.0).collect::<Vec<_>>(), [4, 5, 6, 6]);
+    let entries = dynamic_entries(&bytes);
+    let tag = |tag: u32| entries.iter().find(|it| it.0 == u64::from(tag)).map(|it| it.1);
+    assert_eq!((tag(elf::DT_PREINIT_ARRAY), tag(elf::DT_PREINIT_ARRAYSZ)), (Some(preinit), Some(8)));
+    let file = ElfFile64::<Endianness>::parse(&bytes[..]).unwrap();
+    let endian = file.endian();
+    let (_, shdr) = file.elf_section_table().section_by_name(endian, b".preinit_array").unwrap();
+    assert_eq!(shdr.sh_type(endian), elf::SHT_PREINIT_ARRAY);
+    assert_eq!(shdr.sh_flags(endian), u64::from(elf::SHF_ALLOC | elf::SHF_WRITE));
+
+    let pieces = [(Class::Text, 16, 16), (Class::Reserve(Reserve::Arena), 0x1000, 0x1000)];
+    let mut image = Fixture::new(executable(), &pieces, &Counts::default());
+    image.entry = Some(image.at(&Class::Text));
+    let error = file_error(&mut image);
+    assert!(error.contains("not a dev run"), "{error}");
+}
+
+/// A shared library has no start hook: the loader never calls its `.preinit_array`.
+#[test]
+fn a_shared_library_has_no_start_hook() {
+    let kind = OutputKind::Shared { name: "libx.so".into(), exports: Vec::new() };
+    let writer = Elf { output: output(blaze_codegen::Arch::X86_64, kind, None), last: None };
+    assert!(writer.start_hook().unwrap_err().contains("shared library"));
+}
+
+/// A reservation of part of a page is refused, never rounded.
+#[test]
+fn a_reservation_of_part_of_a_page_is_an_error() {
+    let (output, page, _) = dev_executable([1, 0, 0]);
+    let pieces = [(Class::Text, 16, 16), (Class::Reserve(Reserve::Arena), page / 2, page)];
+    let mut image = Fixture::new(output, &pieces, &Counts::default());
+    image.entry = Some(image.at(&Class::Text));
+    let error = file_error(&mut image);
+    assert!(error.contains("not whole") && error.contains("Arena"), "{error}");
+}
+
+/// A dynamic relocation in code is an error naming the symbol it is for and the section: the
+/// function holding a slid address, the import of a bind.
+#[test]
+fn a_text_relocation_names_its_symbol_and_section() {
+    let counts = Counts { absolute: 2, imports: 1, import_names: 6, libraries: 1, library_names: 9, ..Counts::default() };
+    let mut image = Fixture::new(executable(), &[(Class::Text, 64, 16), (Class::Data, 8, 8)], &counts);
+    let text = image.at(&Class::Text);
+    image.entry = Some(text);
+    image.functions = vec![
+        Function { addr: text, size: 32, fde: None, windows: None, name: Some("main".into()) },
+        Function { addr: text + 32, size: 32, fde: None, windows: None, name: Some("helper".into()) },
+    ];
+    image.rebase = vec![text + 40];
+    let error = image.synthesize().unwrap_err().what;
+    assert!(error.contains("`helper`") && error.contains("`.text`") && error.contains("text relocation"), "{error}");
+
+    image.rebase.clear();
+    image.libraries = vec![Library { name: "libc.so.6".into(), as_needed: false }];
+    image.imports = vec![import("malloc", Some(0), None, false)];
+    image.binds = vec![Bind { addr: text + 8, import: 0, addend: 0 }];
+    let error = image.synthesize().unwrap_err().what;
+    assert!(error.contains("`malloc`") && error.contains("`.text`") && error.contains("text relocation"), "{error}");
 }

@@ -18,10 +18,8 @@
 use std::fmt;
 
 mod intent;
-mod pool;
 
 pub use intent::ThreadIntent;
-pub use pool::Pool;
 
 /// # Panics
 ///

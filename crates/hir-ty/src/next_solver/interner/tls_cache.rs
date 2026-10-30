@@ -17,14 +17,15 @@
 
 use super::DbInterner;
 use base_db::{Db, Crate, Nonce};
-use blaze_reclaim::Limbo;
+use blaze_mem::{Cache, Pool, Pooled, Tag, pool::Limbo};
 use rustc_hash::FxBuildHasher;
 use rustc_type_ir::search_graph::GlobalCache;
 use salsa::Revision;
 use std::{
     cell::Cell,
     hash::BuildHasher,
-    mem, ptr,
+    mem,
+    ptr::{self, NonNull},
     sync::{
         LazyLock, Mutex,
         atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
@@ -41,6 +42,7 @@ type Erased = GlobalCache<DbInterner<'static>>;
 const _: fn() = || {
     fn send_sync<T: Send + Sync>() {}
     send_sync::<Erased>();
+    send_sync::<SharedCaches>();
 };
 
 /// `cache`, as the cache of an interner of `'db`.
@@ -66,7 +68,7 @@ struct Scope {
 
 /// The value of one key (for the solver, the goals of one scope or query) in one state
 /// (revision). Never changed once published but through the value's own `&self` methods and
-/// its use mark; freed only through `Shared::limbo`.
+/// its use mark; dropped, and its slot reused, only through its table's limbo.
 struct Generation<K, S, T> {
     key: K,
     state: S,
@@ -102,20 +104,50 @@ const EMPTY: u64 = 0;
 /// state. Two replaces of one slot racing may leave it a stale hint: lookups then miss it and
 /// the key is made again in another slot, until the slot is next replaced. That costs a
 /// solve, never an answer.
-struct Shared<K, S, T> {
+struct Shared<'p, K, S, T> {
     /// A hash of the key each slot holds, 0 for none, so a probe loads one word; the
     /// generation says which key it is.
     hints: Box<[AtomicU64]>,
     generations: Box<[AtomicPtr<Generation<K, S, T>>]>,
-    /// Generations replaced, until no task can still be reading them. Locked only to replace.
-    limbo: Mutex<Limbo>,
+    /// Where generations are made, each published from [`Pooled::into_raw`].
+    pool: &'p Pool<Generation<K, S, T>>,
+    /// Locked only to make or replace a generation.
+    slots: Mutex<Slots<'p, Generation<K, S, T>>>,
+}
+
+/// A table's way into its pool: the cache it makes generations from, and the limbo holding
+/// those replaced until no task can still be reading them, then giving their slots back.
+struct Slots<'p, G> {
+    cache: Cache<'p, G>,
+    limbo: Limbo<'p, G>,
+}
+
+/// How many generations a table's pool holds: its slots, and those replaced that wait for
+/// their grace (see `pool`).
+const POOLED: u32 = 1 << 20;
+
+/// The generations of a table, tagged `Infer`; reserved, none committed until made.
+fn pool<G>() -> Pool<G> {
+    Pool::new(POOLED, Tag::Infer)
+        .unwrap_or_else(|error| panic!("the trait solver's cache: {error}"))
 }
 
 /// A slot and the generation it was seen to hold.
 type Held<K, S, T> = (usize, *mut Generation<K, S, T>);
 
-static SHARED: LazyLock<Shared<Scope, Revision, Erased>> =
-    LazyLock::new(|| Shared::new(SHARED_BITS));
+/// A shared generation: the search graph's cache and the global-goal table, which answers
+/// root goals before they are canonicalized (`global_goals`).
+#[derive(Default)]
+struct SharedCaches {
+    search: Erased,
+    goals: crate::next_solver::global_goals::Goals,
+}
+
+static SHARED_GENERATIONS: LazyLock<Pool<Generation<Scope, Revision, SharedCaches>>> =
+    LazyLock::new(pool);
+
+static SHARED: LazyLock<Shared<'static, Scope, Revision, SharedCaches>> =
+    LazyLock::new(|| Shared::new(SHARED_BITS, LazyLock::force(&SHARED_GENERATIONS)));
 
 /// Runs `f` on the shared cache of `krate` (and `regions`) in `db`, as it is now.
 #[inline]
@@ -129,7 +161,20 @@ pub(super) fn shared<'db, R>(
     // Nested in the task the executor runs this in, so it writes nothing but a thread-local
     // count.
     let task = blaze_reclaim::enter();
-    f(unerase(SHARED.of(&task, Scope { nonce, krate, regions }, revision)))
+    f(unerase(&SHARED.of(&task, Scope { nonce, krate, regions }, revision).search))
+}
+
+/// Runs `f` on the global-goal table of `krate` (and `regions`) in `db`, as it is now.
+#[inline]
+pub(super) fn global_goals<R>(
+    db: &Db,
+    krate: Option<Crate>,
+    regions: bool,
+    f: impl FnOnce(&crate::next_solver::global_goals::Goals) -> R,
+) -> R {
+    let (nonce, revision) = db.nonce_and_revision();
+    let task = blaze_reclaim::enter();
+    f(&SHARED.of(&task, Scope { nonce, krate, regions }, revision).goals)
 }
 
 /// A key of a [`Shared`] table.
@@ -153,20 +198,25 @@ impl Key for Solved {
     }
 }
 
-impl<K, S, T> Shared<K, S, T>
+impl<'p, K, S, T> Shared<'p, K, S, T>
 where
     K: Key,
     S: Copy + Eq + Send + Sync + 'static,
     T: Default + Send + Sync + 'static,
 {
-    fn new(bits: u32) -> Shared<K, S, T> {
+    fn new(bits: u32, pool: &'p Pool<Generation<K, S, T>>) -> Shared<'p, K, S, T> {
         let len = 1usize << bits;
         Shared {
             // alloc: setup, once per table and process.
             hints: (0..len).map(|_| AtomicU64::new(EMPTY)).collect(),
             // alloc: setup, once per table and process.
             generations: (0..len).map(|_| AtomicPtr::new(ptr::null_mut())).collect(),
-            limbo: Mutex::new(Limbo::new()),
+            pool,
+            slots: Mutex::new(Slots {
+                cache: pool.cache(),
+                limbo: Limbo::new(pool)
+                    .unwrap_or_else(|error| panic!("the trait solver's cache: {error}")),
+            }),
         }
     }
 
@@ -213,8 +263,8 @@ where
     /// that guard is.
     #[inline]
     fn get(&self, held: *mut Generation<K, S, T>) -> Option<&Generation<K, S, T>> {
-        // SAFETY: a generation is freed only by the limbo, after a grace started once it was
-        // unlinked from its slot; the caller's guard was entered before `held` was loaded, so
+        // SAFETY: a generation is dropped and its slot reused only by the table's limbo, after
+        // a grace started once it was unlinked from its slot; the caller's guard was entered before `held` was loaded, so
         // that grace has not passed while the guard lives, and `of` ties what it returns to it.
         unsafe { held.as_ref() }
     }
@@ -271,69 +321,71 @@ where
         key: K,
         state: S,
     ) -> Result<&T, Option<&T>> {
-        // The box is what the limbo frees after a grace; an arena slot would need its own.
-        // alloc: a miss, once per key and state, and a solve follows it.
-        let made = Box::into_raw(Box::new(Generation {
-            key,
-            state,
-            referenced: AtomicBool::new(true),
-            value: T::default(),
-        }));
+        let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let made = slots
+            .cache
+            .alloc(Generation {
+                key,
+                state,
+                referenced: AtomicBool::new(true),
+                value: T::default(),
+            })
+            .into_raw();
         if let Err(won) = self.generations[at].compare_exchange(
             held,
-            made,
+            made.as_ptr(),
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            // SAFETY: `made` was never published, so this is its only owner.
-            drop(unsafe { Box::from_raw(made) });
+            // SAFETY: `made` came from `into_raw` of this pool just now and was never published.
+            slots.cache.recycle(unsafe { Pooled::from_raw(self.pool, made) });
+            drop(slots);
             return Err(self
                 .get(won)
                 .filter(|won| won.key == key && won.state == state)
                 .map(|won| &won.value));
         }
         self.hints[at].store(hint, Ordering::Release);
-        if !held.is_null() {
-            // SAFETY: every generation comes from `Box::into_raw` here, and the swap above
-            // unlinked `held`: one swap alone can, so this is the one place that takes it
-            // back, and the limbo frees it only after every task that may have loaded it has
-            // ended.
-            self.retire(unsafe { Box::from_raw(held) });
+        if let Some(held) = NonNull::new(held) {
+            // SAFETY: every generation in a slot was published from `into_raw` of this table's
+            // pool, and the swap above unlinked `held`: one swap alone can, so this is the one
+            // place that takes it back; the limbo drops it only after every task that may have
+            // loaded it has ended.
+            slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
+            // alloc: `Limbo::collect` gives slots back to the pool; it is not an iterator's.
+            slots.limbo.collect();
         }
-        // SAFETY: published above; freed only by the limbo, after the caller's guard is
+        drop(slots);
+        // SAFETY: published above; dropped only by the limbo, after the caller's guard is
         // dropped (see `of`).
-        Ok(unsafe { &(*made).value })
-    }
-
-    fn retire(&self, generation: Box<Generation<K, S, T>>) {
-        let mut limbo = self.limbo.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        limbo.retire(generation);
-        // alloc: `Limbo::collect` frees; it is not an iterator's.
-        limbo.collect();
+        Ok(unsafe { &(*made.as_ptr()).value })
     }
 
     /// Unlinks every generation.
     fn clear(&self) {
+        let mut slots = self.slots.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for (hint, slot) in self.hints.iter().zip(&self.generations) {
             hint.store(EMPTY, Ordering::Release);
-            let held = slot.swap(ptr::null_mut(), Ordering::AcqRel);
-            if !held.is_null() {
+            if let Some(held) = NonNull::new(slot.swap(ptr::null_mut(), Ordering::AcqRel)) {
                 // SAFETY: as in `replace`: the swap unlinked it, and only one swap can.
-                self.retire(unsafe { Box::from_raw(held) });
+                slots.limbo.retire(unsafe { Pooled::from_raw(self.pool, held) });
             }
         }
+        // alloc: `Limbo::collect` gives slots back to the pool; it is not an iterator's.
+        slots.limbo.collect();
     }
 }
 
-impl<K, S, T> Drop for Shared<K, S, T> {
+impl<K, S, T> Drop for Shared<'_, K, S, T> {
     fn drop(&mut self) {
         for slot in &mut self.generations {
-            let held = mem::replace(slot.get_mut(), ptr::null_mut());
-            if !held.is_null() {
-                // SAFETY: `&mut self`: no reader is left, and each generation is in one slot.
-                drop(unsafe { Box::from_raw(held) });
+            if let Some(held) = NonNull::new(mem::replace(slot.get_mut(), ptr::null_mut())) {
+                // SAFETY: `&mut self`: no reader is left; each generation is in one slot and was
+                // published from `into_raw` of this table's pool.
+                drop(unsafe { Pooled::from_raw(self.pool, held) });
             }
         }
+        // `slots` drops next: the limbo drops what it holds, its owner being gone.
     }
 }
 
@@ -390,11 +442,15 @@ struct OfQuery {
     cache: Erased,
 }
 
-static OF_QUERY: LazyLock<Shared<Solved, (), OfQuery>> = LazyLock::new(|| Shared::new(SLOT_BITS));
+static OF_QUERY_GENERATIONS: LazyLock<Pool<Generation<Solved, (), OfQuery>>> =
+    LazyLock::new(pool);
+
+static OF_QUERY: LazyLock<Shared<'static, Solved, (), OfQuery>> =
+    LazyLock::new(|| Shared::new(SLOT_BITS, LazyLock::force(&OF_QUERY_GENERATIONS)));
 
 // A generation's header is one line; the rest is the search graph's cache.
 const _: () = assert!(
-    size_of::<Generation<Scope, Revision, Erased>>() - size_of::<Erased>() <= 64
+    size_of::<Generation<Scope, Revision, SharedCaches>>() - size_of::<SharedCaches>() <= 64
         && size_of::<Generation<Solved, (), OfQuery>>() - size_of::<Erased>() <= 64
 );
 
@@ -440,7 +496,7 @@ mod tests {
         thread,
     };
 
-    use super::{EMPTY, Key, SOLVED_BLOCK, Shared, Solved};
+    use super::{EMPTY, Key, SOLVED_BLOCK, Shared, Solved, pool};
 
     type Goals = HashMap<u32, u32>;
 
@@ -455,9 +511,15 @@ mod tests {
         value as *const T as usize
     }
 
+    /// A table of a pool of its own, leaked so the table is `'static` as the process's are.
+    fn table<T: Default + Send + Sync + 'static>(bits: u32) -> Shared<'static, Solved, u32, T> {
+        // alloc: a test's pool, once a test.
+        Shared::new(bits, Box::leak(Box::new(pool())))
+    }
+
     /// How many slots hold a generation of `key`, read without the table's lookup (which
     /// would mark or make it).
-    fn holding(table: &Shared<Solved, u32, SharedGoals>, key: Solved) -> usize {
+    fn holding(table: &Shared<'_, Solved, u32, SharedGoals>, key: Solved) -> usize {
         let _task = blaze_reclaim::enter();
         table
             .generations
@@ -497,7 +559,7 @@ mod tests {
 
     #[test]
     fn a_hit_allocates_nothing() {
-        let table = Shared::<Solved, u32, SharedGoals>::new(4);
+        let table = table::<SharedGoals>(4);
         let task = blaze_reclaim::enter();
         let query = key();
         table.of(&task, query, 0);
@@ -509,18 +571,40 @@ mod tests {
     }
 
     #[test]
-    fn a_miss_into_an_empty_slot_allocates_its_generation_alone() {
-        let table = Shared::<Solved, u32, SharedGoals>::new(4);
+    fn a_miss_into_an_empty_slot_allocates_nothing() {
+        let table = table::<SharedGoals>(4);
         let task = blaze_reclaim::enter();
         let query = key();
-        blaze_alloc_count::assert_at_most(1, "a miss into an empty slot", || {
+        blaze_alloc_count::assert_at_most(0, "a miss into an empty slot", || {
             table.of(&task, query, 0);
         });
     }
 
+    /// A replace takes a slot of the pool and hands the old generation to the limbo, which
+    /// gives its slot back once its grace has passed: no allocation, warm or waiting.
+    #[test]
+    fn a_warm_replace_allocates_nothing() {
+        let table = table::<SharedGoals>(4);
+        let query = key();
+        let batch = blaze_mem::pool::BATCH as u32;
+        // The first batch is carved and the limbo's column committed; this thread's reclaim
+        // slot is claimed.
+        for state in 0..2 * batch {
+            let task = blaze_reclaim::enter();
+            table.of(&task, query, state);
+        }
+        blaze_alloc_count::assert_at_most(0, "a replace in a new state", || {
+            for state in 2 * batch..64 * batch {
+                let task = blaze_reclaim::enter();
+                table.of(&task, query, state);
+            }
+        });
+        assert_eq!(holding(&table, query), 1);
+    }
+
     #[test]
     fn a_goal_solved_in_one_query_is_not_reused_by_another() {
-        let table = Shared::<Solved, u32, SharedGoals>::new(4);
+        let table = table::<SharedGoals>(4);
         let task = blaze_reclaim::enter();
         let (one, other) = (key(), key());
         table.of(&task, one, 0).lock().unwrap().insert(7, 1);
@@ -530,7 +614,7 @@ mod tests {
 
     #[test]
     fn a_cache_filled_on_one_thread_serves_the_same_query_on_another() {
-        let table = Shared::<Solved, u32, SharedGoals>::new(4);
+        let table = table::<SharedGoals>(4);
         let query = key();
         thread::scope(|scope| {
             scope
@@ -550,7 +634,7 @@ mod tests {
 
     #[test]
     fn every_thread_gets_the_one_value_of_a_key_and_state() {
-        let table = Shared::<Solved, u32, SharedGoals>::new(4);
+        let table = table::<SharedGoals>(4);
         let (query, other) = (key(), key());
         let start = Barrier::new(8);
         let seen: Vec<usize> = thread::scope(|scope| {
@@ -574,7 +658,7 @@ mod tests {
 
     #[test]
     fn a_new_state_gets_a_new_value() {
-        let table = Shared::<Solved, u32, SharedGoals>::new(4);
+        let table = table::<SharedGoals>(4);
         let task = blaze_reclaim::enter();
         let query = key();
         table.of(&task, query, 0).lock().unwrap().insert(1, 1);
@@ -588,7 +672,7 @@ mod tests {
     #[test]
     fn a_full_window_gives_away_a_value_not_used_since_the_last_sweep() {
         // Every slot is in every window of a 16-slot table.
-        let table = Shared::<Solved, u32, SharedGoals>::new(4);
+        let table = table::<SharedGoals>(4);
         let task = blaze_reclaim::enter();
         let queries: Vec<Solved> = (0..16).map(|_| key()).collect();
         for &query in &queries {
@@ -613,7 +697,7 @@ mod tests {
 
     #[test]
     fn clear_unlinks_every_value() {
-        let table = Shared::<Solved, u32, SharedGoals>::new(4);
+        let table = table::<SharedGoals>(4);
         let task = blaze_reclaim::enter();
         let queries: Vec<Solved> = (0..8).map(|_| key()).collect();
         for &query in &queries {
@@ -642,7 +726,7 @@ mod tests {
 
     #[test]
     fn a_replaced_value_is_freed_only_after_its_readers_left_their_task() {
-        let table = Shared::<Solved, u32, Marked>::new(4);
+        let table = table::<Marked>(4);
         let (one, two, three) = (key(), key(), key());
         let (held, go) = (Barrier::new(2), Barrier::new(2));
         thread::scope(|scope| {
@@ -725,7 +809,7 @@ mod tests {
         // A small table, so values are given away while in use; states change under readers
         // (which the solver never does, as a revision needs `&mut` of the database), so
         // replacing and freeing race with lookups.
-        let table = Shared::<Solved, u32, SharedGoals>::new(5);
+        let table = table::<SharedGoals>(5);
         let queries: Vec<Solved> = (0..96).map(|_| key()).collect();
         let shared_hits = AtomicUsize::new(0);
         thread::scope(|scope| {
@@ -733,20 +817,14 @@ mod tests {
                 let (table, queries, shared_hits) = (&table, &queries, &shared_hits);
                 scope.spawn(move || {
                     let mut per_thread = PerThread { caches: Vec::new(), state: 0 };
-                    let mut seed = 0x2545_F491_4F6C_DD1Du64 ^ (worker + 1);
-                    let mut next = move || {
-                        seed ^= seed << 13;
-                        seed ^= seed >> 7;
-                        seed ^= seed << 17;
-                        seed
-                    };
+                    let mut rng = blaze_ids::rng::SplitMix64::new(0x2545_F491_4F6C_DD1D ^ (worker + 1));
                     for step in 0..20_000u32 {
                         let task = blaze_reclaim::enter();
                         // Each query is taken up by every thread, as a task moves; the state
                         // changes twice, as revisions do.
-                        let query = queries[next() as usize % queries.len()];
+                        let query = queries[rng.index(queries.len())];
                         let state = step / 8_000;
-                        let goal = (next() % 64) as u32;
+                        let goal = rng.below(64) as u32;
                         let truth = solve(query, state, goal);
                         let shared = {
                             let mut goals = table.of(&task, query, state).lock().unwrap();

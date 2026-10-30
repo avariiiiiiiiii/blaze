@@ -21,6 +21,7 @@ use hir_ty::{
     traits::StoredParamEnvAndCrate,
 };
 use hir_ty_mir::mir::MirSpan;
+use hir_ty_share::code::TABLES;
 
 use crate::{Instance, Pending, fragment};
 
@@ -33,19 +34,25 @@ pub(crate) mod convert;
 pub(crate) mod fold;
 pub(crate) mod frontend;
 pub(crate) mod hashes;
+pub(crate) mod linked;
 pub(crate) mod places;
 pub(crate) mod refs;
 pub(crate) mod release;
+mod roots;
 pub(crate) mod shape;
 pub(crate) mod side;
 pub(crate) mod statics;
 #[cfg(test)]
 mod tests;
+pub(crate) mod toolchain;
 pub(crate) mod unwind;
 
 pub use backend::Backends;
-pub use frontend::{Databases, HirFrontend};
+pub use frontend::{BodyChecks, Databases, HirFrontend};
 pub use hashes::ItemHashes;
+pub use linked::LinkInputs;
+pub use roots::{RootKind, RootTest, Roots};
+pub use toolchain::{select, toolchain};
 
 /// What the items lane says of the front end's items by content (docs/v2/plan/lanes/items.md): the
 /// keys the code generator puts in place of the database's dense ids, which differ from one
@@ -67,6 +74,9 @@ pub trait Hashes: Sync {
         owner: DefWithBodyId,
         span: MirSpan,
     ) -> Result<SpanRef, String>;
+    /// The anchors of `owner`'s span tables in [`hir_ty_share::code::table_of`]'s order: what
+    /// [`Hashes::span`] names a span of the body by, beside its index in the table.
+    fn anchors(&self, db: &Db, owner: DefWithBodyId) -> Result<[ContentId; TABLES], String>;
     /// Where a function is declared: what a call through a pointer to a `#[track_caller]`
     /// function passes as its caller's location.
     fn declaration(&self, db: &Db, func: FunctionId) -> Result<SpanRef, String>;
@@ -120,6 +130,14 @@ impl Hashes for HashSource {
             HashSource::Items(it) => it.span(db, owner, span),
             #[cfg(test)]
             HashSource::ById(it) => it.span(db, owner, span),
+        }
+    }
+
+    fn anchors(&self, db: &Db, owner: DefWithBodyId) -> Result<[ContentId; TABLES], String> {
+        match self {
+            HashSource::Items(it) => it.anchors(db, owner),
+            #[cfg(test)]
+            HashSource::ById(it) => it.anchors(db, owner),
         }
     }
 

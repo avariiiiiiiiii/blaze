@@ -22,31 +22,35 @@ use crate::{
     },
     process::Claimed,
     transport::postcard,
-    version,
-    wire::{ExpandMacroWire, Sent, flat_answer, read_tree},
+    wire::{Sent, flat_answer},
 };
 
 pub mod msg;
 
+/// What answers a server's sub-requests during a request: the database's answer
+/// (`load_cargo::answer`), or a refusal while none can be asked.
+// load-cargo's answer from the database, which this crate can't name (load-cargo depends on it).
+// dyn: called once per sub-request, each a round trip to the server.
 pub type SubCallback<'a> = &'a dyn Fn(SubRequest) -> Result<SubResponse, ServerError>;
 
-pub fn run_conversation(
-    writer: &mut dyn Write,
-    reader: &mut dyn BufRead,
+/// One request and its answer, the server's sub-requests answered by `callback` in between,
+/// every frame written and read in `buf`: a handshake's, or an older server's expansion. A
+/// server of [`crate::version::WIRE_TREES`] expands over its connection's buffers instead
+/// (`Claimed::expand_wire`).
+pub fn run_conversation<W: Write + ?Sized, R: BufRead + ?Sized>(
+    writer: &mut W,
+    reader: &mut R,
     buf: &mut Vec<u8>,
     msg: BidirectionalMessage,
     callback: SubCallback<'_>,
 ) -> Result<BidirectionalMessage, ServerError> {
-    let encoded = postcard::encode(&msg).map_err(wrap_encode)?;
-    postcard::write(writer, &encoded).map_err(wrap_io("failed to write initial request"))?;
+    postcard::encode_into(&msg, buf).map_err(wrap_encode)?;
+    postcard::write(writer, buf).map_err(wrap_io("failed to write initial request"))?;
 
     loop {
         let maybe_buf = postcard::read(reader, buf).map_err(wrap_io("failed to read message"))?;
         let Some(b) = maybe_buf else {
-            return Err(ServerError {
-                message: "proc-macro server closed the stream".into(),
-                io: Some(Arc::new(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))),
-            });
+            return Err(closed());
         };
 
         let msg: BidirectionalMessage = postcard::decode(b).map_err(wrap_decode)?;
@@ -56,41 +60,56 @@ pub fn run_conversation(
                 return Ok(BidirectionalMessage::Response(response));
             }
             BidirectionalMessage::SubRequest(sr) => {
-                // TODO: Avoid `AssertUnwindSafe` by making the callback `UnwindSafe` once `SourceDatabase`
-                // becomes unwind-safe (currently blocked by `parking_lot::RwLock` in the VFS).
-                let resp = match catch_unwind(AssertUnwindSafe(|| callback(sr))) {
-                    Ok(Ok(resp)) => BidirectionalMessage::SubResponse(resp),
-                    Ok(Err(err)) => BidirectionalMessage::SubResponse(SubResponse::Cancel {
-                        reason: err.to_string(),
-                    }),
-                    Err(_) => BidirectionalMessage::SubResponse(SubResponse::Cancel {
-                        reason: "callback panicked or was cancelled".into(),
-                    }),
-                };
-
-                let encoded = postcard::encode(&resp).map_err(wrap_encode)?;
-                postcard::write(writer, &encoded)
-                    .map_err(wrap_io("failed to write sub-response"))?;
+                let resp = BidirectionalMessage::SubResponse(answer(callback, sr));
+                postcard::encode_into(&resp, buf).map_err(wrap_encode)?;
+                postcard::write(writer, buf).map_err(wrap_io("failed to write sub-response"))?;
             }
-            _ => {
-                return Err(ServerError {
-                    message: format!("unexpected message {:?}", msg),
-                    io: None,
-                });
-            }
+            other => return Err(unexpected(&other)),
         }
     }
 }
 
-fn wrap_io(msg: &'static str) -> impl Fn(io::Error) -> ServerError {
+/// `callback`'s answer to the server's sub-request `request`, or a refusal saying why it gave
+/// none: it failed, panicked or was cancelled.
+pub(crate) fn answer(callback: SubCallback<'_>, request: SubRequest) -> SubResponse {
+    // TODO: Avoid `AssertUnwindSafe` by making the callback `UnwindSafe` once `SourceDatabase`
+    // becomes unwind-safe (currently blocked by `parking_lot::RwLock` in the VFS).
+    match catch_unwind(AssertUnwindSafe(|| callback(request))) {
+        Ok(Ok(response)) => response,
+        // alloc: error path, the refusal's reason.
+        Ok(Err(err)) => SubResponse::Cancel { reason: err.to_string() },
+        // alloc: error path, as above.
+        Err(_) => SubResponse::Cancel { reason: "callback panicked or was cancelled".into() },
+    }
+}
+
+/// The server closed the stream before it answered.
+pub(crate) fn closed() -> ServerError {
+    ServerError {
+        message: "proc-macro server closed the stream".into(),
+        // alloc: error path.
+        io: Some(Arc::new(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"))),
+    }
+}
+
+/// A message the server should not have sent then.
+pub(crate) fn unexpected(message: &impl std::fmt::Debug) -> ServerError {
+    // alloc: error path, naming the message.
+    ServerError { message: format!("unexpected message {message:?}"), io: None }
+}
+
+pub(crate) fn wrap_io(msg: &'static str) -> impl Fn(io::Error) -> ServerError {
+    // alloc: error path.
     move |err| ServerError { message: msg.into(), io: Some(Arc::new(err)) }
 }
 
-fn wrap_encode(err: io::Error) -> ServerError {
+pub(crate) fn wrap_encode(err: io::Error) -> ServerError {
+    // alloc: error path.
     ServerError { message: "failed to encode message".into(), io: Some(Arc::new(err)) }
 }
 
-fn wrap_decode(err: io::Error) -> ServerError {
+pub(crate) fn wrap_decode(err: io::Error) -> ServerError {
+    // alloc: error path.
     ServerError { message: "failed to decode message".into(), io: Some(Arc::new(err)) }
 }
 
@@ -104,9 +123,7 @@ pub(crate) fn version_check(
 
     match response_payload {
         BidirectionalMessage::Response(Response::ApiVersionCheck(version)) => Ok(version),
-        other => {
-            Err(ServerError { message: format!("unexpected response: {:?}", other), io: None })
-        }
+        other => Err(unexpected(&other)),
     }
 }
 
@@ -125,7 +142,7 @@ pub(crate) fn enable_rust_analyzer_spans(
         BidirectionalMessage::Response(Response::SetConfig(ServerConfig { span_mode })) => {
             Ok(span_mode)
         }
-        _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+        other => Err(unexpected(&other)),
     }
 }
 
@@ -136,6 +153,7 @@ pub(crate) fn find_proc_macros(
     callback: SubCallback<'_>,
 ) -> Result<Result<Vec<(String, ProcMacroKind)>, String>, ServerError> {
     let request = BidirectionalMessage::Request(Request::ListMacros(ListMacros {
+        // alloc: once per library.
         dylib_path: dylib_path.to_path_buf().into(),
     }));
 
@@ -143,10 +161,14 @@ pub(crate) fn find_proc_macros(
 
     match response_payload {
         BidirectionalMessage::Response(Response::ListMacros(it)) => Ok(it),
-        _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+        other => Err(unexpected(&other)),
     }
 }
 
+/// An expansion by a server older than [`crate::version::WIRE_TREES`], which takes and gives a
+/// [`FlatTree`]: the request owns what it sends (the edge, to an older server). A newer server
+/// expands over its connection's buffers (`Claimed::expand_wire`). The expansion saw the
+/// variables `seen`, what the shell passed and then the crate's, for its trace.
 pub(crate) fn expand(
     proc_macro: &ProcMacro,
     process: &Claimed<'_>,
@@ -158,54 +180,29 @@ pub(crate) fn expand(
     mixed_site: Span,
     current_dir: String,
     callback: SubCallback<'_>,
-    seen: Option<Vec<(std::ffi::OsString, std::ffi::OsString)>>,
+    seen: [&[(String, String)]; 2],
 ) -> Result<Result<tt::TopSubtree, String>, crate::ServerError> {
     let version = process.version();
     if let Some(err) = process.exited() {
         // clone: error path, the server's exit told to each caller.
         return Err(err.clone());
     }
-    if version >= version::WIRE_TREES {
-        let mut sent = Sent::new();
-        let task = ExpandMacroWire::of(
-            proc_macro,
-            subtree,
-            attr,
-            env,
-            [def_site, call_site, mixed_site],
-            current_dir,
-            &mut sent,
-        );
-        let sent = RefCell::new(sent);
-        // alloc: the request, sent to another process (the edge).
-        let task = BidirectionalMessage::Request(Request::ExpandMacroWire(Box::new(task)));
-        let answer = process.run_expansion(task, &noting(&sent, callback), seen)?;
-        return match answer {
-            BidirectionalMessage::Response(Response::ExpandMacroWire(Ok(resp))) => {
-                // alloc: none unless the answer's bytes are off a word.
-                let tree = read_tree(&resp.tree, &sent.borrow(), &mut Vec::new());
-                Ok(Ok(tree.map_err(answer_error)?))
-            }
-            BidirectionalMessage::Response(Response::ExpandMacroWire(Err(msg))) => Ok(Err(msg.0)),
-            // alloc: error path.
-            _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
-        };
-    }
     let mut span_data_table = SpanDataIndexMap::default();
     let def_site = span_data_table.insert_full(def_site).0;
     let call_site = span_data_table.insert_full(call_site).0;
     let mixed_site = span_data_table.insert_full(mixed_site).0;
+    // alloc: an older server's request, which owns what it sends (the edge).
     let task = BidirectionalMessage::Request(Request::ExpandMacro(Box::new(ExpandMacro {
         data: ExpandMacroData {
             macro_body: FlatTree::from_subtree(subtree, version, &mut span_data_table),
-            macro_name: proc_macro.name.to_string(),
+            macro_name: proc_macro.name.to_string(), // alloc: as above.
             attributes: attr
                 .map(|subtree| FlatTree::from_subtree(subtree, version, &mut span_data_table)),
             has_global_spans: ExpnGlobals { def_site, call_site, mixed_site },
             span_data_table: if process.rust_analyzer_spans() {
                 serialize_span_data_index_map(&span_data_table)
             } else {
-                Vec::new()
+                Vec::new() // alloc: none, empty.
             },
         },
         lib: proc_macro.dylib_path.to_path_buf().into(),
@@ -223,7 +220,7 @@ pub(crate) fn expand(
             Ok(Ok(tree.map_err(answer_error)?))
         }
         BidirectionalMessage::Response(Response::ExpandMacro(Err(msg))) => Ok(Err(msg.0)),
-        _ => Err(ServerError { message: "unexpected response".to_owned(), io: None }),
+        other => Err(unexpected(&other)),
     }
 }
 
@@ -250,11 +247,13 @@ fn run_request(
     callback: SubCallback<'_>,
 ) -> Result<BidirectionalMessage, ServerError> {
     if let Some(err) = srv.exited() {
+        // clone: error path, the server's exit told to each caller.
         return Err(err.clone());
     }
     srv.run_bidirectional(msg, callback)
 }
 
 pub fn reject_subrequests(req: SubRequest) -> Result<SubResponse, ServerError> {
+    // alloc: error path, naming the sub-request.
     Err(ServerError { message: format!("{req:?} sub-request not supported here"), io: None })
 }

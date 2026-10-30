@@ -27,6 +27,7 @@ mod reloc;
 use blaze_codegen::{Arch, RelocKind};
 
 use crate::LinkError;
+use crate::cow::CowBytes;
 use crate::model::{
     Apply, Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, SectionName, Special, Writer,
 };
@@ -155,6 +156,9 @@ fn place(class: &Class) -> u8 {
         Class::Synthetic(_) => 23,
         Class::InitArray => 30,
         Class::Named { write: false, .. } => 31,
+        // Never in a module: wasm has no `.preinit_array`, and a dev run of wasm is refused
+        // (`start_hook`).
+        Class::PreinitArray | Class::Reserve(_) => 32,
     }
 }
 
@@ -259,6 +263,11 @@ impl Writer for Wasm {
         Ok((custom(name), 0))
     }
 
+    fn start_hook(&self) -> Result<(Class, u32), String> {
+        // alloc: error path
+        Err("a wasm module has no code memory to start in: a dev run of wasm links with no `dev_run`".to_owned())
+    }
+
     fn special(&self, name: &str) -> Option<Special> {
         Some(match name {
             "__stack_pointer" => Special::Absolute(STACK_POINTER.into()),
@@ -309,11 +318,14 @@ impl Writer for Wasm {
 
     /// `__wasm_call_ctors` is written with the module ([`Writer::file`]), from the init array
     /// as it is then: its region holds one unit, which the code space counts it by.
-    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, Vec<u8>)>, LinkError> {
+    fn synthesize(&self, placed: &Placed<'_>) -> Result<Vec<(Class, CowBytes)>, LinkError> {
         // alloc: error path
         module::init_functions(placed).map_err(|e| error(format!("wasm: {e}")))?;
-        // alloc: once per link, the regions' bytes `Writer::synthesize` returns
-        Ok(vec![(Class::Synthetic(FUNCTIONS), vec![0]), (Class::Synthetic(HEAP), Vec::new())])
+        // wasm keeps no table across links: each region's bytes are wrapped once.
+        // alloc: once per link, the regions' bytes `Writer::synthesize` returns, and their `Arc`s
+        let (functions, heap) = (CowBytes::from_vec(vec![0]), CowBytes::from_vec(Vec::new()));
+        // alloc: once per link, the list `Writer::synthesize` returns
+        Ok(vec![(Class::Synthetic(FUNCTIONS), functions), (Class::Synthetic(HEAP), heap)])
     }
 
     fn offset(&self, _placed: &Placed<'_>, _region: &Region) -> Option<u64> {
@@ -323,9 +335,10 @@ impl Writer for Wasm {
     fn file(&self, placed: &Placed<'_>) -> Result<File, LinkError> {
         // alloc: error path
         let module = module::write(self, placed).map_err(|e| error(format!("wasm: {e}")))?;
-        // alloc: once per link, the one part of the `File` (the module, written whole)
+        // alloc: once per link, the one part of the `File` (the module, written whole, and its
+        // `Arc`: wasm keeps no table across links)
         // alloc: none for `debug`: an empty `Vec` holds no buffer
-        Ok(File { len: module.len() as u64, parts: vec![(0, module)], debug: Vec::new() })
+        Ok(File { len: module.len() as u64, parts: vec![(0, CowBytes::from_vec(module))], debug: Vec::new() })
     }
 }
 
@@ -347,6 +360,8 @@ mod tests {
             tags: 0,
             stack,
             windows_subsystem: false,
+            dev_run: None,
+            triple: "wasm32-unknown-unknown".into(),
         }
     }
 

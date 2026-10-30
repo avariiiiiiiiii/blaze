@@ -201,6 +201,7 @@ impl MirEvalError<'_> {
             MirEvalError::UndefinedBehavior(_)
             | MirEvalError::TargetDataLayoutNotAvailable(_)
             | MirEvalError::Panic(_)
+            | MirEvalError::Aborted(_)
             | MirEvalError::MirLowerErrorForClosure(_, _)
             | MirEvalError::TypeIsUnsized(_, _)
             | MirEvalError::NotSupported(_)
@@ -209,6 +210,7 @@ impl MirEvalError<'_> {
             | MirEvalError::HeapInValue { .. }
             | MirEvalError::CoerceUnsizedError(_)
             | MirEvalError::InternalError(_)
+            | MirEvalError::MachineStop
             | MirEvalError::InvalidVTableId(_) => writeln!(f, "{err:?}")?,
         }
         Ok(())
@@ -252,7 +254,8 @@ fn source_range(
             .find_map(|p| source_map.pat_syntax(*p).ok())?
             .map(|it| it.syntax_node_ptr()),
         MirSpan::SelfParam => self_param_syntax?.map(|it| it.syntax_node_ptr()),
-        MirSpan::Unknown => return None,
+        // The interpreter runs no optimized body, so no span of one reaches it.
+        MirSpan::Unknown | MirSpan::Inlined(_) => return None,
     };
     Some((span.file_id.original_file(db).file_id(db), span.value.text_range()))
 }

@@ -18,6 +18,11 @@ the root manifest) and one file per part, written by mem-db's children:
 | `mem-db-def` | `crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/` except format's files (`expr_store.rs`, `expr_store/`, `hir.rs`, `hir/`, `item_tree.rs`, `item_tree/`, which are `mem-format`'s) | `v2/requests/mem-db-def.md` |
 | `mem-db-checks` | `crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/` | `v2/requests/mem-db-checks.md` |
 
+Some parts split again, each with a request file of its own: `mem-db-infer-{ctx,expr,closure,lower,method,eval}.md`,
+`mem-db-def-{expand,hir,items,resolve,collect}.md` and `mem-db-checks-{regions,check}.md`, all
+under `v2/requests/`. The index by crate, and the budget test that holds each change, is the
+last section of `v2/requests/mem-db.md` ("Per crate").
+
 ## The contract
 
 Every change in every part programs against these, so the pieces fit.
@@ -55,8 +60,9 @@ Every change in every part programs against these, so the pieces fit.
    layout, const eval and trait solving `Infer`, its MIR queries `Mir`; borrowck `Mir`;
    wfcheck `Infer`; a query with none of these (blaze-query's own, salsa's tests) `Query`.
    blaze-query gives `Query` a `const TAG: Tag = Tag::Query` that a query overrides; salsa
-   gives `function::Configuration` the same constant, set by the tracked attribute
-   (`mem-db-salsa` writes the exact attribute).
+   gives `function::Configuration` a `const MEM_TAG: Tag = Tag::Query`, set by the tracked
+   attribute `mem_tag = <a Tag variant, or a path to a Tag constant>`
+   (`v2/requests/mem-db-salsa.md` M1 and M2).
 4. **A memoized result is not a frame value.** It outlives the run, so it is owned: lane mem's
    ruling in `v2/requests/mem.md` ("frontend-tokens", answer 2) is that a memo's value comes
    from the general-purpose allocator until memos persist into the image, since each memo has
@@ -85,3 +91,14 @@ freed in one store. `frame::task` is two thread-local accesses a run, against th
 (hundreds of nanoseconds for the smallest query). So the bound for a query run's temporaries is
 their bytes written once to warm memory, and the executor's wrapper costs under 1% of the
 cheapest run.
+
+The solver cache's replace (`v2/requests/mem-db.md` request 4) is bounded by the generation it
+writes: about 2.5 KB, some 40 cache lines, roughly 100 ns to warm L2. Taking the slot is an
+array pop from the table's cache (one compare-and-swap per 64), and retiring the old one is a
+push of 8 bytes into the limbo's reserved column. Together that is under 10 ns, against today's
+`Box::new` and the second box `blaze_reclaim::Limbo` makes (two allocations of 20 to 40 ns each,
+and a `Vec` that grows). So the replace stays within 10% of writing the generation.
+
+A revalidation in a reused view (request 6) is bounded by the loads `verify` already does: one
+result line per edge. Opening the view becomes a pop from the spare list plus the `reset` done
+earlier, off the path, in place of three `Map`s that cost two `mmap`s each and a shard array.

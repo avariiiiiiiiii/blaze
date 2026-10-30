@@ -43,6 +43,13 @@ pub trait ProcMacroExpander: fmt::Debug + Send + Sync + RefUnwindSafe + Any {
         false
     }
 
+    /// The content ID of the library the macro is code of: what the key of a crate that
+    /// uses it covers (`hir_def::deps`). `None` when it is not known, which keeps the crates
+    /// that use the macro out of dependency images.
+    fn code(&self) -> Option<base_db::ContentId> {
+        None
+    }
+
     /// Run the expander on one call.
     fn expand(
         &self,
@@ -77,6 +84,33 @@ pub enum ProcMacroExpansionError {
     Panic(String),
     /// The server itself errored out.
     System(String),
+}
+
+/// What an expansion read besides its call and the variables it was given, as its server
+/// traced it: what the image of the calling crate is filed by (`hir_def::deps`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpansionReads {
+    /// Nothing else.
+    Nothing,
+    /// The names it read, as the server encodes them, and the hash of the values they had.
+    Traced { shape: sync::Arc<[u8]>, values: base_db::ContentId },
+    /// Not known, and why: the calling crate gets no image.
+    Unknown(&'static str),
+}
+
+thread_local! {
+    static READS: std::cell::Cell<Option<ExpansionReads>> = const { std::cell::Cell::new(None) };
+}
+
+/// What the expansion running on this thread read: called by an expander before `expand`
+/// returns. An expander that does not call it has reads [`ExpansionReads::Unknown`].
+pub fn report_reads(reads: ExpansionReads) {
+    READS.set(Some(reads));
+}
+
+/// What the expander reported since the last call, cleared.
+pub(crate) fn take_reads() -> Option<ExpansionReads> {
+    READS.take()
 }
 
 pub type ProcMacroLoadResult = Result<Vec<ProcMacro>, ProcMacroLoadingError>;
@@ -155,7 +189,7 @@ impl ProcMacros {
 #[salsa::tracked]
 impl ProcMacros {
     /// Incrementality query to prevent queries from directly depending on [`Self::get`].
-    #[salsa::tracked(returns(as_ref))]
+    #[salsa::tracked(returns(as_ref), mem_tag = Expand)]
     pub fn get_for_crate(db: &Db, krate: Crate) -> Option<Arc<CrateProcMacros>> {
         Self::get(db).by_crate(db).get(&krate).cloned()
     }
@@ -220,7 +254,7 @@ impl CrateProcMacros {
 
 /// Whether this crate can call a macro whose state belongs to a compilation session,
 /// including macros reexported by a dependency.
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Expand)]
 pub fn may_have_session_macros(db: &Db, krate: Crate) -> bool {
     ProcMacros::get_for_crate(db, krate)
         .and_then(|it| {
@@ -408,7 +442,7 @@ impl CustomProcMacroExpander {
                             if proc_macro.kind == ProcMacroKind::Attr =>
                         {
                             ExpandResult {
-                                value: tt.clone(), // clone: error path: an attribute macro that failed keeps its item
+                                value: tt.copy(), // alloc: error path: an attribute macro that failed keeps its item
                                 err: Some(ExpandError::other(call_site, text)),
                             }
                         }

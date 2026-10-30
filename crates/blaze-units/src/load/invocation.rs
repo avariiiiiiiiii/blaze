@@ -63,13 +63,7 @@ impl Asked {
 
     /// The command as cargo names it, for `alias.<command>`.
     pub fn command_name(&self) -> &'static str {
-        match self.command() {
-            Command::Build => "build",
-            Command::Check => "check",
-            Command::Test => "test",
-            Command::Bench => "bench",
-            Command::Run => "run",
-        }
+        self.command().name()
     }
 
     pub fn env(&self, name: &str) -> Option<&str> {

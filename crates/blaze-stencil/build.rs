@@ -3,8 +3,8 @@
 //! llvm-sys and writes one library per variant to `OUT_DIR`.
 //!
 //! The shape set, the hole forms and the library format are the crate's own files, included
-//! here so the generator and the patcher read one definition. They use nothing but `std` and
-//! each other.
+//! here so the generator and the patcher read one definition. They use nothing but `std`,
+//! `blaze_ids::bits` and each other.
 
 // The generator uses part of what the shared files hold for the patcher.
 #[allow(dead_code)]

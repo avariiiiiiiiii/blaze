@@ -101,7 +101,7 @@ fn innermost(db: &TestDB, def: DefWithBodyId) -> ExprId {
 }
 
 fn the_trait(resolver: &crate::resolver::Resolver<'_>, db: &TestDB, text: &str) -> TraitId {
-    match resolver.resolve_path_in_type_ns_fully(db, &Path::BarePath(&path(&[text]))) {
+    match resolver.resolve_path_in_type_ns_fully(db, Path::BarePath(&path(&[text]))) {
         Some(TypeNs::TraitId(it)) => it,
         other => panic!("`{text}` is not a trait in scope: {other:?}"),
     }

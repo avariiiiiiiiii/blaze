@@ -3,9 +3,10 @@
 //! `Debug` and `Display`, the same errors.
 
 use span::{Edition, EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext};
+use blaze_mem::{Frame, Tag};
 use syntax::{AstNode, SourceFile, TextRange, TextSize, ast};
 
-use super::reference;
+use super::reference::{self, ItemSource};
 use crate::{ExpandResult, builtin::quote::dollar_crate, tt};
 
 fn span_at(range: TextRange, ctx: SyntaxContext) -> Span {
@@ -35,14 +36,6 @@ fn item(text: &str) -> (ast::Adt, span::SpanMap) {
     }
     map.finish();
     (adt, map)
-}
-
-struct Input<'a>(&'a ast::Adt, &'a span::SpanMap);
-
-impl reference::ItemSource for Input<'_> {
-    fn adt(&self) -> (&ast::Adt, &span::SpanMap) {
-        (self.0, self.1)
-    }
 }
 
 const ITEMS: &[&str] = &[
@@ -79,17 +72,23 @@ const ITEMS: &[&str] = &[
     "union GenericUnion<T: Copy> { a: T, b: u16 }",
 ];
 
-type Derive = fn(&Input<'_>, Span) -> [ExpandResult<tt::TopSubtree>; 2];
+/// A derive's old expansion and its new one, built in the frame.
+type Derive = for<'f> fn(
+    &'f Frame,
+    &ItemSource<'_>,
+    Span,
+) -> (ExpandResult<tt::TopSubtree>, ExpandResult<tt::TopSubtree<&'f Frame>>);
 
 fn derives() -> [(&'static str, Derive); 12] {
     macro_rules! pair {
         ($old:ident, $new:ident $(, $arg:expr)?) => {
-            |input: &Input<'_>, span: Span| {
+            |frame: &Frame, input: &ItemSource<'_>, span: Span| {
                 let dummy = tt::TopSubtree::empty(tt::DelimSpan::from_single(span));
-                [
+                let info = super::parse_adt_from_syntax(input.0, input.1, span);
+                (
                     reference::$old(input, span, &dummy $(, $arg)?),
-                    super::$new(span, super::parse_adt_from_syntax(input.0, input.1, span) $(, $arg)?),
-                ]
+                    super::$new(frame, span, info $(, $arg)?),
+                )
             }
         };
     }
@@ -109,7 +108,11 @@ fn derives() -> [(&'static str, Derive); 12] {
     ]
 }
 
-fn assert_same(what: &str, old: &ExpandResult<tt::TopSubtree>, new: &ExpandResult<tt::TopSubtree>) {
+fn assert_same<A: std::alloc::Allocator, B: std::alloc::Allocator>(
+    what: &str,
+    old: &ExpandResult<tt::TopSubtree<A>>,
+    new: &ExpandResult<tt::TopSubtree<B>>,
+) {
     assert_eq!(format!("{:#?}", old.value), format!("{:#?}", new.value), "{what}");
     assert_eq!(old.value.to_string(), new.value.to_string(), "{what}");
     assert!(old.value == new.value, "{what}: the encodings differ");
@@ -121,9 +124,10 @@ fn derives_match_nested_quotes() {
     let span = call_site();
     for text in ITEMS {
         let (adt, map) = item(text);
-        let input = Input(&adt, &map);
+        let input = ItemSource(&adt, &map);
         for (name, derive) in derives() {
-            let [old, new] = derive(&input, span);
+            let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+            let (old, new) = derive(frame, &input, span);
             assert_same(&format!("{name} of `{text}`"), &old, &new);
         }
     }
@@ -141,15 +145,60 @@ fn from_matches_nested_quotes() {
         "enum E { A(u8) }",
     ] {
         let (adt, map) = item(text);
-        let new = super::from_derive(span, &adt, &map);
-        let old = reference_from(span, &adt, &map);
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let new = super::from_derive(frame, span, &adt, &map);
+        let old = reference_from(frame, span, &adt, &map);
         assert_same(&format!("From of `{text}`"), &old, &new);
     }
 }
 
-/// rustc's `From` derive as the old code wrote it, for a struct with one field.
-fn reference_from(span: Span, adt: &ast::Adt, map: &span::SpanMap) -> ExpandResult<tt::TopSubtree> {
-    let ast::Adt::Struct(strukt) = adt else { return super::from_derive(span, adt, map) };
+/// rustc's `expand_deriving_partial_eq`: `StructuralPartialEq` first, bounding no parameter by
+/// itself or by `Copy` but keeping the item's own bounds, and written for a union too, beside
+/// `PartialEq`'s error.
+#[test]
+fn partial_eq_writes_structural_partial_eq_first() {
+    let span = call_site();
+    for (text, union) in [
+        ("#[repr(packed)] struct P<T: Clone>(T);", false),
+        ("union U<T: Clone> { a: T }", true),
+    ] {
+        let (adt, map) = item(text);
+        let info = super::parse_adt_from_syntax(&adt, &map, span);
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let ExpandResult { value, err } = super::partial_eq_derive(frame, span, info);
+        let written: String = value.to_string().split_whitespace().collect();
+        let partial_eq = written
+            .find("$crate::cmp::PartialEq")
+            .map_or(written.len(), |it| written[..it].rfind("impl").expect("an impl"));
+        let (structural, partial_eq) = written.split_at(partial_eq);
+        let name = if union { "U" } else { "P" };
+        let header = format!("impl<T,>$crate::marker::StructuralPartialEqfor{name}<T,>where");
+        assert!(structural.starts_with(&header), "{text}: {structural}");
+        assert!(structural.contains("T:Clone,"), "{text}: the item's own bound is kept");
+        assert!(
+            !structural.contains("PartialEq,") && !structural.contains("Copy"),
+            "{text}: {structural}"
+        );
+        assert_eq!(err.is_some(), union, "{text}");
+        assert_eq!(partial_eq.is_empty(), union, "{text}: {partial_eq}");
+        if !union {
+            assert!(partial_eq.contains("$crate::marker::Copy"), "a packed struct's fields are copied");
+        }
+    }
+}
+
+/// rustc's `From` derive as the old code wrote it, for a struct with one field. Another item is
+/// refused, as the new code refuses it.
+fn reference_from(
+    frame: &Frame,
+    span: Span,
+    adt: &ast::Adt,
+    map: &span::SpanMap,
+) -> ExpandResult<tt::TopSubtree> {
+    let refused = || {
+        super::from_derive(frame, span, adt, map).map(|it| tt::TopSubtree::from_subtree(it.view()))
+    };
+    let ast::Adt::Struct(strukt) = adt else { return refused() };
     let ty = match strukt.field_list() {
         Some(ast::FieldList::RecordFieldList(it)) if it.fields().count() == 1 => {
             it.fields().next().and_then(|it| it.ty())
@@ -157,7 +206,7 @@ fn reference_from(span: Span, adt: &ast::Adt, map: &span::SpanMap) -> ExpandResu
         Some(ast::FieldList::TupleFieldList(it)) if it.fields().count() == 1 => {
             it.fields().next().and_then(|it| it.ty())
         }
-        _ => return super::from_derive(span, adt, map),
+        _ => return refused(),
     };
     let field_ty = syntax_bridge::syntax_node_to_token_tree(
         ty.expect("a type").syntax(),
@@ -214,7 +263,9 @@ fn coerce_pointee_impls_match_nested_quotes() {
     let text = "#[repr(transparent)] struct Ptr<'a, T: ?Sized, const N: usize>(&'a T) where T: Tr;";
     let (adt, map) = item(text);
     let self_for_traits = quote! {span => Ptr<'a, __S, N> };
+    let frame = &Frame::new(Tag::Expand).expect("a test's frame");
     let new = super::write_coerce_pointee_impls(
+        frame,
         span,
         &super::parse_adt_from_syntax(&adt, &map, span).expect("an item"),
         &self_for_traits,
@@ -330,7 +381,10 @@ fn a_derive_allocates_nothing_per_field() {
         let text = wide_struct(fields);
         let (adt, map) = item(&text);
         let span = call_site();
-        let run = || super::clone_derive(span, super::parse_adt_from_syntax(&adt, &map, span), false);
+        let frame = &Frame::new(Tag::Expand).expect("a test's frame");
+        let run = || {
+            super::clone_derive(frame, span, super::parse_adt_from_syntax(&adt, &map, span), false)
+        };
         let warm = run();
         let (again, used) = blaze_alloc_count::measure(run);
         assert!(again.value == warm.value && again.err.is_none(), "{fields} fields");

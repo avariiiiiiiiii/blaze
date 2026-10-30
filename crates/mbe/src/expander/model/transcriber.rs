@@ -9,7 +9,7 @@ use tt::{Delimiter, TopSubtreeBuilder, iter::TtElement};
 use super::{Binding, Bindings};
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
-    expander::Fragment,
+    expander::{Fragment, TokensOrigin},
     parser::{ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
@@ -417,8 +417,14 @@ fn expand_var(
                 // rustc spacing is not like ours. Ours is like proc macros', it dictates how puncts will actually be joined.
                 // rustc uses them mostly for pretty printing. So we have to deviate a bit from what rustc does here.
                 // Basically, a metavariable can never be joined with whatever after it.
-                Fragment::Tokens { tree, origin } => {
-                    let _ = origin;
+                Fragment::Tokens { tree, origin: TokensOrigin::Grouped } => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    builder.extend_with_tt_alone(tree.strip_invisible());
+                    builder.close(span);
+                }
+                Fragment::Tokens { tree, origin: TokensOrigin::Raw | TokensOrigin::Ast } => {
                     builder.extend_with_tt_alone(tree);
                 }
                 Fragment::TokensOwned(tt) => {

@@ -6,6 +6,7 @@ use std::cmp::Reverse;
 
 use blaze_manifest::Config;
 use blaze_manifest::config::{CompileKind, Flags};
+use blaze_manifest::files::Files;
 use blaze_manifest::manifest::Manifest;
 use blaze_resolve::Cfg;
 use cargo_util_schemas::manifest::{TomlLintLevel, TomlManifest};
@@ -32,7 +33,7 @@ pub(super) struct KindInfo {
 /// cargo's `TargetInfo::new` for `kind` (`None` the host) in a build for `target`: the
 /// rustflags of `extra_args`, then once more with the cfg they give for `[target.'cfg(..)']`,
 /// up to the second turn as cargo stops.
-pub(super) fn kind_info(config: &Config, host: &str, target: Option<&str>, kind: Option<&str>) -> Result<KindInfo, LoadError> {
+pub(super) fn kind_info<F: Files>(config: &Config<F>, host: &str, target: Option<&str>, kind: Option<&str>) -> Result<KindInfo, LoadError> {
     let requested = [match target {
         Some(triple) => CompileKind::Target(triple.to_owned()),
         None => CompileKind::Host,

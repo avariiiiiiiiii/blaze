@@ -90,6 +90,10 @@ pub struct Spec {
     pub network: bool,
     /// Whether to record what it read; what was refused it is recorded either way.
     pub trace: bool,
+    /// Mach global names it may look up beyond the sandbox's own few (`Sandbox::On`'s
+    /// `services`); read on macOS only.
+    #[serde(default)]
+    pub services: Vec<String>,
     /// Where the live record goes, appended a line at a time before the call it notes goes
     /// on.
     pub live: PathBuf,
@@ -111,6 +115,7 @@ pub struct SpecOf<'a> {
     write: &'a [PathBuf],
     network: bool,
     trace: bool,
+    services: &'a [String],
     live: Cow<'a, Path>,
     report: PathBuf,
     not_inputs: &'a [PathBuf],
@@ -135,7 +140,7 @@ pub struct Launcher {
 impl Launcher {
     /// The spec of `command`, run with `scratch` as its scratch directory.
     pub fn spec<'a>(command: &'a Command, scratch: &Path) -> Result<SpecOf<'a>, String> {
-        let Sandbox::On { read, write, network, trace } = &command.sandbox else {
+        let Sandbox::On { read, write, network, trace, services } = &command.sandbox else {
             return Err(format!("{}: its sandbox is off", command.program.display())); // alloc: error path
         };
         let live = command.env.iter().rev().find(|(name, _)| name == LIVE);
@@ -148,6 +153,7 @@ impl Launcher {
             write,
             network: *network,
             trace: *trace,
+            services,
             live: live.map_or_else(|| Cow::Owned(scratch.join(LIVE_FILE)), |(_, value)| Cow::Borrowed(Path::new(value))),
             report: scratch.join(REPORT_FILE),
             not_inputs: std::slice::from_ref(&command.program),
@@ -295,7 +301,7 @@ mod tests {
             env: vec![("CC".into(), "cc".into()), (LIVE.into(), "/root/live/7".into())],
             dir: "/ws".into(),
             stdin: Vec::new(),
-            sandbox: Sandbox::On { read: vec!["/ws".into()], write: vec!["/out".into()], network: false, trace },
+            sandbox: Sandbox::On { read: vec!["/ws".into()], write: vec!["/out".into()], network: false, trace, services: Vec::new() },
             memory: None,
         }
     }

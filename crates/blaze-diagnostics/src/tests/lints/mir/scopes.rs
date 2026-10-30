@@ -3,19 +3,7 @@
 //! `unused_must_use`. A test given in part keeps its lines where they are, so the lines and
 //! columns of the expectation are the test's.
 
-use crate::{
-    Options,
-    emit::Style,
-    tests::{Mode, checked_with, compiletest, normalized, ui},
-};
-
-/// [`ui`] of a UI test that needs core's items: core is minicore with `flags`
-/// (`crates/test-utils/src/minicore.rs`).
-fn ui_core(name: &str, edition: &str, flags: &str, source: &str) -> String {
-    let fixture = format!("//- minicore: {flags}\n//- /{name} crate:main edition:{edition}\n{source}");
-    let options = compiletest(Mode::Other, &Options::default());
-    normalized(&checked_with(&fixture, "$DIR/", &options).stderr_with(Style { ui_testing: true, ..Style::default() }))
-}
+use crate::tests::{items::ui_core, ui};
 
 #[test]
 fn an_await_in_a_closure_points_at_the_closure() {

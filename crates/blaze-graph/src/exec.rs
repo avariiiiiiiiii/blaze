@@ -5,8 +5,10 @@
 //! on a second one (they wait, they don't compute). [`Scheduler`] is the daemon's one
 //! scheduler: it owns the [`Plane`] and steps it on a thread of its own, the owner thread, whose
 //! one wait is for the next input; it never waits for a worker. Its tasks run on the process's
-//! [`shared`] pool, near the group the plane names, inside [`arena::measure`], and what each
-//! held and how long it ran teach the [`Predict`] the next task's cost and memory come from.
+//! [`shared`] pool, near the group the plane names, each in a frame of its own
+//! ([`blaze_mem::frame::task`]) inside [`arena::measure`] and [`blaze_mem::frame::measure`],
+//! and what each held and how long it ran teach the [`Predict`] the next task's cost and
+//! memory come from.
 
 use std::{
     any::Any,
@@ -23,7 +25,7 @@ use std::{
     time::Instant,
 };
 
-use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag};
+use blaze_mem::{Cache, MemError, Pooled, Slab, Tag as MemTag, frame};
 use blaze_protocol::events::{Event, Record};
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use rustc_hash::FxHashMap;
@@ -87,11 +89,13 @@ pub fn shared() -> &'static Workers {
 /// The work nodes run on a pool of the machine's `work` workers and the IO nodes on one of its
 /// `io`, both lent to this build alone and kept for the next build of their size once it's
 /// over (not bound to CPUs: several builds may run at once). `work` may borrow what the caller
-/// has, and runs in its thread's task arena ([`arena::task`]), reset when the node is done.
+/// has, and runs in a frame of its own ([`blaze_mem::frame::task`]), freed when the node is
+/// done.
 ///
 /// A node whose work panics fails, and once the build is over the panic goes on on the calling
 /// thread, as from a thread of [`std::thread::scope`]: a panic that unwinds on purpose, as
-/// salsa's cancellation does, reaches whoever catches it.
+/// salsa's cancellation does, reaches whoever catches it. Work the frames' cap cancels
+/// ([`blaze_mem::frame::Cancelled`]) runs again on the same thread.
 pub fn drive<W, S>(
     machine: &mut Machine,
     nodes: Vec<Spec>,
@@ -125,7 +129,13 @@ where
                 let done = move |did: thread::Result<Did>| {
                     _ = done_tx.send((id, did.unwrap_or_else(failed), now()));
                 };
-                let run = move || arena::task(|| work(id));
+                let run = move || loop {
+                    match catch_unwind(AssertUnwindSafe(|| frame::task(MemTag::Other, |_| work(id)))) {
+                        Ok(did) => break did,
+                        Err(panic) if panic.is::<frame::Cancelled>() => {}
+                        Err(panic) => resume_unwind(panic),
+                    }
+                };
                 match at {
                     Pool::Io => waits.submit(None, run, done),
                     Pool::Work => jobs.submit(None, run, done),
@@ -678,9 +688,12 @@ impl<W> Handle<W> {
 /// to the owner. A run whose subsystem ([`admission::tag_of`]) is over its budget waits while
 /// another run of that subsystem is under way ([`Throttle`]).
 ///
-/// A task's work runs in its thread's task arena ([`arena::task`]: a pool worker's is on its
-/// NUMA node, in huge pages, and reset when the task ends) inside [`arena::measure`], and its
-/// `Done` gives the plane the peak it held and the group it ran on; after each `Done` the plane
+/// A task's work runs in a frame of its own ([`blaze_mem::frame::task`], tagged with its
+/// subsystem: a pool worker's chunks are on its NUMA node, and the frame is freed when the task
+/// ends) inside [`arena::measure`] and [`blaze_mem::frame::measure`], and its `Done` gives the
+/// plane the peak it held in both and the group it ran on. With a budget, the frames grow
+/// under its [`admission::share`] for [`MemTag::Frames`] ([`blaze_mem::frame::Cap`]); a task
+/// the cap cancels is posted again, as one that gives way. After each `Done` the plane
 /// hears what blaze holds ([`arena::own`]). The scheduler's [`Predict`] gives each task
 /// added or found its cost and memory before the plane sees it, and learns the peak and own run
 /// time of each run that ends with a result (a run that gave way and one that panicked teach it
@@ -740,6 +753,11 @@ impl<W: Send + 'static> Scheduler<W> {
         let io_threads = config.io;
         if let Some(budget) = &config.budget {
             admission::set_budgets(budget.bytes);
+            // The frames' share of the budget is their hard backstop. Nothing spills frame
+            // memory (a frame is freed when its task ends), so the spills go unheard.
+            let limit = budget.bytes / 64 * admission::share(MemTag::Frames);
+            let (cap, _spills) = frame::Cap::new(limit, limit);
+            frame::set_cap(Some(cap));
         }
         let plane = Plane::with_memo(config, memo)?;
         let (tx, rx) = bounded::<Msg<W>>(MAILBOX);
@@ -1121,16 +1139,20 @@ unsafe fn run_pooled<R: Runner>(header: NonNull<Header>) {
     match result {
         Ok((Ok(did), measure)) => run.done(did, Some(measure), group),
         Ok((Err(Cancelled), _)) => post(ctx, group, critical, run),
+        Err(panic) if panic.is::<frame::Cancelled>() => post(ctx, group, critical, run),
         Err(panic) => run.done(Did::failed(panicked(&*panic)), None, group),
     }
 }
 
-/// `live`'s work run by `runner` in this thread's task arena, reset when it ends, the peak it
-/// held and the time it took.
+/// `live`'s work run by `runner` in a frame of its own, freed when it ends, the peak it held
+/// (through the global allocator and in its frames) and the time it took. The frames' cap
+/// cancelling it unwinds from here with [`frame::Cancelled`].
 fn measured<R: Runner>(runner: &R, live: &Live<R::Work>) -> (Result<Did, Cancelled>, Measure) {
     let start = Instant::now();
-    let (did, peak) = arena::measure(|| arena::task(|| runner.run(&live.work)));
-    (did, Measure { peak, ran_ns: ns(start) })
+    let tag = admission::tag_of(live.kind);
+    let ((did, bytes), frames) =
+        frame::measure(|| arena::measure(|| frame::task(tag, |_| runner.run(&live.work))));
+    (did, Measure { peak: bytes + frames as u64, ran_ns: ns(start) })
 }
 
 /// Runs an IO task on this thread; posted again, behind what is queued for the IO threads,
@@ -1140,6 +1162,7 @@ fn run_io<R: Runner>(run: Ran<R>) {
     match catch_unwind(AssertUnwindSafe(|| measured(&ctx.runner, run.live()))) {
         Ok((Ok(did), measure)) => run.done(did, Some(measure), None),
         Ok((Err(Cancelled), _)) => _ = ctx.io.send(Some(run)),
+        Err(panic) if panic.is::<frame::Cancelled>() => _ = ctx.io.send(Some(run)),
         Err(panic) => run.done(Did::failed(panicked(&*panic)), None, None),
     }
 }
@@ -1162,7 +1185,7 @@ mod tests {
     use crossbeam_channel::bounded;
     use rustc_hash::FxHashMap;
 
-    use blaze_mem::Tag as MemTag;
+    use blaze_mem::{Tag as MemTag, frame};
 
     use super::{
         Ctx, Did, Heard, Live, Opened, RUNS, RequestId, Runner, SPARE, Scheduler, Table, Task,
@@ -1171,7 +1194,6 @@ mod tests {
     use crate::{
         Cancelled, Key,
         admission::{Estimates, Predict, Prediction, TaskKind},
-        arena,
         machine::{Config, Machine, NodeId, Outcome, Pool, Spec},
         plane::PlaneConfig,
         pool::group,
@@ -1353,19 +1375,19 @@ mod tests {
         assert_eq!(pool.critical_submitted(), 5);
     }
 
-    /// Every task's work runs in its thread's task arena, under `drive` and the scheduler both.
+    /// Every task's work runs in a frame of its own, under `drive` and the scheduler both.
     #[test]
-    fn work_runs_in_a_task_arena() {
-        let in_arena = || arena::with(|bump| *bump.alloc(7u64).unwrap()) == 7;
+    fn work_runs_in_a_task_frame() {
+        let in_frame = || frame::in_task() && frame::current(|frame| *frame.alloc(7u64)) == 7;
 
         let mut machine = Machine::new(Config { io: 1, work: 2, keep_going: false }).unwrap();
         let nodes = vec![spec(0, &[], Pool::Io, None), spec(1, &[0], Pool::Work, None)];
-        let work = |_: NodeId| if in_arena() { Did::built() } else { Did::failed("no arena") };
+        let work = |_: NodeId| if in_frame() { Did::built() } else { Did::failed("no frame") };
         assert!(drive(&mut machine, nodes, &work, &mut |_| {}, None).unwrap());
 
         let (scheduler, _) = scheduler(2);
         let work: Work =
-            Arc::new(move || Ok(if in_arena() { Did::built() } else { Did::failed("no arena") }));
+            Arc::new(move || Ok(if in_frame() { Did::built() } else { Did::failed("no frame") }));
         let opened = scheduler.open(1, false);
         let io = Task { spec: spec(71, &[], Pool::Io, None), kind: TaskKind(1), work: work.clone() };
         scheduler.add(opened.request, vec![io, task(72, &[71], None, work)]);

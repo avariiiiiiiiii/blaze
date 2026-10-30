@@ -30,7 +30,7 @@ use blaze_format::{
     FormatError, Part, Persist, Record, SchemaHash, Slice, Str, Writer, open_as, schema_of,
 };
 use hir_expand::{
-    MacroCallStyles, MacroDefId, MacroDefKind,
+    MacroCallId, MacroCallStyles, MacroDefId, MacroDefKind,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
     mod_path::ModPath,
     name::Name,
@@ -49,6 +49,7 @@ use crate::{
     LifetimeParamId, Macro2Id, MacroId, MacroRulesId, ProcMacroId, StaticId, StructId, TraitId,
     TypeAliasId, TypeOrConstParamId, TypeParamId, UnionId,
     builtin_type::{BuiltinFloat, BuiltinInt, BuiltinUint},
+    deps::ImageBuf,
     expr_store::{
         Body, ExprRoot, ExpressionOnlyStore, ExpressionStore, HygieneId, MissingBodyItemKind,
         NO_OWNER, kinds_of,
@@ -60,7 +61,7 @@ use crate::{
         ExprId, ExprOrPatId, ExprOrPatIdPacked, FloatTypeWrapper, InlineAsm, InlineAsmKind,
         InlineAsmRegOrRegClass, Label, Literal, MatchArm, OffsetOf, PatId, RecordFieldPat,
         RecordLitField,
-        col::{SlabLayout, SlabWriter},
+        col::{Col, SlabLayout, SlabWriter},
         columns::{self, Frozen, HirColumns},
         persist::{Code, Column, Node, Placed, Read, Words, WordsRec, syntax_context},
     },
@@ -150,6 +151,8 @@ blaze_format::record! {
         pub(crate) binding_owners: Slice<u32>,
         /// Each block's salsa id, as its bits.
         pub(crate) block_scopes: Slice<u64>,
+        /// Each macro call's salsa id, as its bits, in lowering order.
+        pub(crate) macro_calls: Slice<u64>,
         /// The packed id and the syntax context, by packed id in increasing order.
         pub(crate) ident_hygiene: Slice<IdPair>,
         /// The block and its edition, by block in increasing order.
@@ -781,6 +784,7 @@ struct StoreColumns {
     lifetimes: Column,
     binding_owners: Column,
     block_scopes: Column,
+    macro_calls: Column,
     ident_hygiene: Column,
     block_editions: Column,
     overflow_inheriting: Column,
@@ -801,7 +805,7 @@ impl StoreColumns {
         out: &mut Writer,
         scratch: &mut EncodeScratch,
     ) -> StoreColumns {
-        let ExpressionStore { expr_only, types, lifetimes, type_hygiene } = store;
+        let ExpressionStore { expr_only, types, lifetimes, type_hygiene, macro_calls } = store;
         let expr_only = expr_only.as_deref();
         let hir = expr_only.map(|it| &it.columns);
         let EncodeScratch { nodes, u32s, u64s, pairs, arms: arm_recs, roots, fields, names } =
@@ -869,6 +873,7 @@ impl StoreColumns {
         let binding_owners = Column::push(out, owners);
         let blocks = expr_only.map_or(&[][..], |it| &*it.block_scopes);
         let block_scopes = push_mapped(out, u64s, blocks, |&block| bits(block));
+        let macro_calls = push_mapped(out, u64s, &macro_calls[..], |&call| bits(call));
         let hygiene = expr_only.map_or(&[][..], |it| &*it.ident_hygiene);
         let ident_hygiene = push_mapped(out, pairs, hygiene, |&(id, hygiene)| IdPair {
             a: packed_bits(id),
@@ -926,6 +931,7 @@ impl StoreColumns {
             lifetimes,
             binding_owners,
             block_scopes,
+            macro_calls,
             ident_hygiene,
             block_editions,
             overflow_inheriting,
@@ -965,6 +971,7 @@ impl StoreColumns {
             lifetimes: self.lifetimes.slice(field(offset_of!(StoreRoot, lifetimes))),
             binding_owners: self.binding_owners.slice(field(offset_of!(StoreRoot, binding_owners))),
             block_scopes: self.block_scopes.slice(field(offset_of!(StoreRoot, block_scopes))),
+            macro_calls: self.macro_calls.slice(field(offset_of!(StoreRoot, macro_calls))),
             ident_hygiene: self.ident_hygiene.slice(field(offset_of!(StoreRoot, ident_hygiene))),
             block_editions: self.block_editions.slice(field(offset_of!(StoreRoot, block_editions))),
             overflow_inheriting: (self.overflow_inheriting)
@@ -1010,6 +1017,7 @@ pub struct ExpressionStoreRef<'a> {
     lifetimes: &'a [Node],
     binding_owners: &'a [u32],
     block_scopes: &'a [u64],
+    macro_calls: &'a [u64],
     ident_hygiene: &'a [IdPair],
     block_editions: &'a [IdPair],
     overflow_inheriting: &'a [u32],
@@ -1049,6 +1057,7 @@ impl<'a> ExpressionStoreRef<'a> {
             lifetimes: root.lifetimes.follow(buffer)?,
             binding_owners: root.binding_owners.follow(buffer)?,
             block_scopes: root.block_scopes.follow(buffer)?,
+            macro_calls: root.macro_calls.follow(buffer)?,
             ident_hygiene: root.ident_hygiene.follow(buffer)?,
             block_editions: root.block_editions.follow(buffer)?,
             overflow_inheriting: root.overflow_inheriting.follow(buffer)?,
@@ -1130,6 +1139,9 @@ impl<'a> ExpressionStoreRef<'a> {
         }
         for block in self.block_scopes {
             ensure(salsa_id(*block).is_some(), block, buffer, "a block id of index 0")?;
+        }
+        for call in self.macro_calls {
+            ensure(salsa_id(*call).is_some(), call, buffer, "a macro call id of index 0")?;
         }
         ascending(self.ident_hygiene, |it| it.a, buffer, "ident hygiene out of order")?;
         for pair in self.ident_hygiene {
@@ -1260,7 +1272,19 @@ impl<'a> ExpressionStoreRef<'a> {
 
     /// The store, back as the value that was written.
     pub fn decode(self) -> Result<ExpressionStore, FormatError> {
+        self.decode_with(None)
+    }
+
+    /// [`decode`](Self::decode) of a store whose buffer lies in `owner`'s bytes: each `Copy`
+    /// column the buffer holds as the store does is read where it is, holding a count of
+    /// `owner`, not copied. A column outside `owner` is an error, never a copy.
+    pub fn decode_in(self, owner: &ImageBuf) -> Result<ExpressionStore, FormatError> {
+        self.decode_with(Some(owner))
+    }
+
+    fn decode_with(self, image: Option<&ImageBuf>) -> Result<ExpressionStore, FormatError> {
         let buffer = self.buffer;
+        let as_is = AsIs { image, root: self.root, buffer };
         let words = Read::new(&self.root.words, buffer);
         let lifetimes = arena(self.lifetimes, &words, buffer, LifetimeRefKind::from_u32, get_lifetime)?;
         let bindings = arena(self.bindings, &words, buffer, only_kind, get_binding)?;
@@ -1296,9 +1320,9 @@ impl<'a> ExpressionStoreRef<'a> {
             use_args,
         };
         let types = TypeColumns::<Frozen> {
-            kind: self.ty_kind.into(),
-            data: self.ty_data.into(),
-            extra: self.ty_extra.into(),
+            kind: as_is.col(self.ty_kind, |it| Col::from(it))?,
+            data: as_is.col(self.ty_data, |it| Col::from(it))?,
+            extra: as_is.col(self.ty_extra, |it| Col::from(it))?,
             // alloc: the decode's one copy of the column.
             lists: self.ty_lists.iter().map(|&ty| idx(ty)).collect(),
             bounds: bounds.into(),
@@ -1347,37 +1371,38 @@ impl<'a> ExpressionStoreRef<'a> {
         let mut type_lists: Vec<Option<TypeRefId>> =
             decoded(self.type_lists, buffer, |&word| Ok(opt_idx(word)), |&ty| ids.ty_opt(ty))?;
         let SideTables { names, literals, offset_ofs, asms, mut macro_defs } = side;
-        // The `Copy` columns in one slab, in `HirColumns::freeze_into`'s order.
+        // The `Copy` columns in one slab, in `HirColumns::freeze_into`'s order; those the buffer
+        // holds as they are take no room when they are read in the image.
         let mut layout = SlabLayout::default();
         layout.add::<MacroDefId>(macro_defs.len());
         layout.add::<Option<TypeRefId>>(type_lists.len());
-        layout.add::<u32>(self.expr_data.len());
-        layout.add::<u32>(self.pat_data.len());
-        layout.add::<u32>(self.extra.len());
-        layout.add::<u32>(self.stmt_data.len());
+        layout.add::<u32>(as_is.slab_len(self.expr_data.len()));
+        layout.add::<u32>(as_is.slab_len(self.pat_data.len()));
+        layout.add::<u32>(as_is.slab_len(self.extra.len()));
+        layout.add::<u32>(as_is.slab_len(self.stmt_data.len()));
         layout.add::<ExprId>(expr_lists.len());
         layout.add::<PatId>(pat_lists.len());
-        layout.add::<u8>(self.expr_kind.len());
-        layout.add::<u8>(self.pat_kind.len());
-        layout.add::<u8>(self.stmt_kind.len());
+        layout.add::<u8>(as_is.slab_len(self.expr_kind.len()));
+        layout.add::<u8>(as_is.slab_len(self.pat_kind.len()));
+        layout.add::<u8>(as_is.slab_len(self.stmt_kind.len()));
         let mut slab = SlabWriter::new(layout);
         let macro_defs = slab.take(&mut macro_defs);
         let type_lists = slab.take(&mut type_lists);
-        let expr_data = slab.copy(self.expr_data);
-        let pat_data = slab.copy(self.pat_data);
-        let extra = slab.copy(self.extra);
-        let stmt_data = slab.copy(self.stmt_data);
+        let expr_data = as_is.col(self.expr_data, |it| slab.copy(it))?;
+        let pat_data = as_is.col(self.pat_data, |it| slab.copy(it))?;
+        let extra = as_is.col(self.extra, |it| slab.copy(it))?;
+        let stmt_data = as_is.col(self.stmt_data, |it| slab.copy(it))?;
         let expr_lists = slab.take(&mut expr_lists);
         let pat_lists = slab.take(&mut pat_lists);
         let columns = HirColumns::<Frozen> {
-            expr_kind: slab.copy(self.expr_kind),
+            expr_kind: as_is.col(self.expr_kind, |it| slab.copy(it))?,
             expr_data,
-            pat_kind: slab.copy(self.pat_kind),
+            pat_kind: as_is.col(self.pat_kind, |it| slab.copy(it))?,
             pat_data,
             extra,
             expr_lists,
             pat_lists,
-            stmt_kind: slab.copy(self.stmt_kind),
+            stmt_kind: as_is.col(self.stmt_kind, |it| slab.copy(it))?,
             stmt_data,
             arms: arms.into(),
             record_fields: record_fields.into(),
@@ -1400,7 +1425,7 @@ impl<'a> ExpressionStoreRef<'a> {
                 columns,
                 bindings,
                 labels,
-                binding_owners: self.binding_owners.into(),
+                binding_owners: as_is.col(self.binding_owners, |it| Col::from(it))?,
                 // alloc: the decode's one copy of the column.
                 block_scopes: self.block_scopes().collect(),
                 ident_hygiene: (self.ident_hygiene.iter())
@@ -1427,7 +1452,45 @@ impl<'a> ExpressionStoreRef<'a> {
             // alloc: the decode's one copy of the column.
             (self.type_hygiene.iter()).map(|pair| (idx(pair.a), hygiene_of(pair.b))).collect()
         });
-        Ok(ExpressionStore { expr_only, types, lifetimes, type_hygiene })
+        let macro_calls = (self.macro_calls.iter())
+            .map(|&call| {
+                <MacroCallId as FromId>::from_id(salsa_id(call).expect("checked when read"))
+            })
+            // alloc: the decode's one copy of the column.
+            .collect();
+        Ok(ExpressionStore { expr_only, types, lifetimes, type_hygiene, macro_calls })
+    }
+}
+
+/// Where a decode puts a `Copy` column its buffer holds as the store does.
+#[derive(Clone, Copy)]
+struct AsIs<'a> {
+    /// The image the buffer lies in, when it is read in place there.
+    image: Option<&'a ImageBuf>,
+    root: &'a StoreRoot,
+    buffer: &'a [u8],
+}
+
+impl AsIs<'_> {
+    /// The column of `elements`: read where it is in the image when there is one, else `copy`
+    /// of it.
+    fn col<T: Copy>(
+        self,
+        elements: &[T],
+        copy: impl FnOnce(&[T]) -> Col<T>,
+    ) -> Result<Col<T>, FormatError> {
+        match self.image {
+            None => Ok(copy(elements)),
+            Some(image) => Col::borrowed(image, elements).ok_or(FormatError::Invalid {
+                at: at_of(self.root, self.buffer),
+                what: "a column outside its image",
+            }),
+        }
+    }
+
+    /// `len` when the column is copied into the slab, 0 when it is read in the image.
+    fn slab_len(self, len: usize) -> usize {
+        if self.image.is_some() { 0 } else { len }
     }
 }
 
@@ -1442,7 +1505,7 @@ impl ExpressionStore {
 impl Persist for ExpressionStore {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStore"),
-        Part::U64(5),
+        Part::U64(6),
         Part::Schema(<StoreRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreRef<'a>;
@@ -1515,7 +1578,7 @@ impl Body {
 impl Persist for Body {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("Body"),
-        Part::U64(5),
+        Part::U64(6),
         Part::Schema(<BodyRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodyRef<'a>;
@@ -2877,6 +2940,47 @@ fn f() -> u32 {
         let past = with_word(&bytes, data_at, store.types.paths.mod_paths.len() as u32);
         let past = ExpressionStore::read(&past).expect("only a path's data word changed");
         assert!(past.decode().is_err(), "a bare path's mod path past its table");
+    }
+
+    /// `decode_in` of a store in an image is `decode`'s store, with the `Copy` columns the
+    /// buffer holds as they are read where they are; one outside the image is refused.
+    #[test]
+    fn decode_in_reads_in_its_image() {
+        use std::sync::Arc;
+
+        use crate::deps::Held;
+
+        let (db, defs) = bodies(EVERY_KIND);
+        let body = Body::of(&db, defs[0]);
+        let bytes = blaze_format::to_bytes(&body.store);
+        let image: ImageBuf = Arc::new(Aligned::copy_from(&bytes));
+        let read = ExpressionStore::read(image.bytes()).expect("a store just written");
+        let decoded = read.decode_in(&image).expect("a store in its image");
+        assert_eq!(decoded, read.decode().expect("a store just written"));
+        assert_eq!(decoded, body.store);
+
+        let only = decoded.expr_only.as_deref().expect("a body has expressions");
+        let columns = &only.columns;
+        for (name, in_image) in [
+            ("expr_kind", columns.expr_kind.in_image()),
+            ("expr_data", columns.expr_data.in_image()),
+            ("pat_kind", columns.pat_kind.in_image()),
+            ("pat_data", columns.pat_data.in_image()),
+            ("extra", columns.extra.in_image()),
+            ("stmt_kind", columns.stmt_kind.in_image()),
+            ("stmt_data", columns.stmt_data.in_image()),
+            ("binding_owners", only.binding_owners.in_image()),
+            ("ty_kind", decoded.types.kind.in_image()),
+            ("ty_data", decoded.types.data.in_image()),
+        ] {
+            assert!(in_image, "{name} is read in the image");
+        }
+        let image_bytes = image.bytes().as_ptr_range();
+        assert!(image_bytes.contains(&columns.expr_kind.as_ptr()), "expr_kind points into it");
+        assert!(columns.expr_lists.in_slab(), "a column decoded from ids is copied");
+
+        let other: ImageBuf = Arc::new(Aligned::copy_from(&bytes));
+        assert!(read.decode_in(&other).is_err(), "a buffer outside its image");
     }
 
     /// Names are in the buffer as their text, which every process reads the same, and not as

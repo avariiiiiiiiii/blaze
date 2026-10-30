@@ -6,7 +6,7 @@ use std::collections::HashMap;
 
 use hir::Semantics;
 use span::FileId;
-use syntax::{AstNode as _, ast};
+use syntax::view::{self as ast, AstNode as _};
 use test_fixture::WithFixture;
 
 use crate::{
@@ -29,13 +29,13 @@ fn each_let(fixture: &str, f: impl Fn(&Cx<'_, '_>, &hir::Type<'_>) -> String) ->
         let krate = hir::check::workspace_crates(&db)[0];
         let frame = crate::tests::frame();
         let cx = Cx::new(&sema, krate, Files::new(&names, ""), &frame);
-        let source = sema.parse(files[0]);
+        let source = cx.vsema.parse(files[0]);
         source
             .syntax()
             .descendants()
             .filter_map(ast::LetStmt::cast)
             .filter_map(|it| it.initializer())
-            .map(|init| f(&cx, &sema.type_of_expr(&init).expect("an initializer has a type").original))
+            .map(|init| f(&cx, &cx.vsema.type_of_expr(init).expect("an initializer has a type").original))
             .collect()
     })
 }

@@ -243,7 +243,7 @@ fn a_signature_of_the_right_length_with_a_non_hex_digit_is_401() {
     let bad = good.replace("e17", "e1g");
     let error = verify(b"It's a Secret to Everybody", b"Hello, World!", Some(&bad)).unwrap_err();
     assert_eq!(error.status, 401);
-    assert_eq!(hex(&good["sha256=".len()..]).map(|it| it[0]), Some(0x75));
+    assert_eq!(blaze_format::hex::decode::<32>(&good["sha256=".len()..]).map(|it| it[0]), Some(0x75));
 }
 
 /// The decoder before sonic-rs, kept to hold it to.

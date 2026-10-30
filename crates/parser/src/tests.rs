@@ -423,6 +423,7 @@ mod termination {
         fn new() -> Alphabet {
             let kinds: Vec<SyntaxKind> = (SyntaxKind::EOF as u16 + 1..=SyntaxKind::SHEBANG as u16)
                 .map(SyntaxKind::from)
+                .chain([SyntaxKind::UNWRAP_BINDER_KW, SyntaxKind::WRAP_BINDER_KW])
                 .filter(|&kind| !kind.is_trivia())
                 .collect();
             let mut contextual: Vec<SyntaxKind> = kinds

@@ -280,6 +280,7 @@ impl<T: 'static> LocalKey<T> {
             ),
             Some(Some(None)) => {
                 let value = Rc::new((self.init)());
+                // dyn: see `rt::Thread::locals`.
                 let shared: Rc<dyn Any> = Rc::clone(&value) as Rc<dyn Any>;
                 rt::with(|rt| {
                     let thread = rt.current();

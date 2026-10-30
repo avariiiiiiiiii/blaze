@@ -252,7 +252,9 @@ impl Tokens {
     pub(super) fn of(def: &ast::Macro, span: &impl Fn(TextSize) -> (Edition, bool)) -> Option<Tokens> {
         let node = def.syntax();
         let mut tokens =
+            // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
             Tokens { text: node.to_string(), base: node.text_range().start(), tts: Vec::new(), top: Ids::default() };
+        // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
         let mut scratch = Vec::new();
         match def {
             ast::Macro::MacroRules(it) => tokens.top = tokens.group(&it.token_tree()?, span, &mut scratch).tts,

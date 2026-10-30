@@ -26,26 +26,28 @@ use std::cell::RefCell;
 
 use base_db::{Db, Crate};
 use blaze_mem::{Frame, Tag, frame};
-use hir_def::HasModule;
+use hir_def::{DefWithBodyId, HasModule, attrs::AttrFlags, expr_store::Body};
+use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 
 use crate::{
-    InferBodyId,
-    db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+    InferBodyId, InferenceResult,
+    db::{HirDatabase, InternedCoroutineId},
     drop::{DropGlue, has_drop_glue},
     next_solver::{
-        DbInterner, ErrorGuaranteed, ParamEnv, StoredGenericArgs, Ty, TyKind, TypingMode,
+        DbInterner, ErrorGuaranteed, ParamEnv, Region, StoredTy, Ty, TyKind,
+        TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
         obligation_ctxt::ObligationCtxt,
     },
-    traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
+    traits::ParamEnvAndCrate,
 };
 
 use super::{
-    MirBody, MirLowerError, MirPhase, TerminatorKind,
+    BorrowKind, MirBody, MirLowerError, MirPhase, Operand, OperandKind, Rvalue, StatementKind,
+    TerminatorKind,
     budget::Pass,
     framed::{self, FrameMap},
-    monomorphization::monomorphized,
 };
 
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
@@ -91,6 +93,24 @@ impl<'f, 'db> Ctx<'f, 'db> {
             Ok(normalized) if matches!(normalized.kind(), TyKind::Infer(_)) => ty,
             Ok(normalized) => normalized,
             Err(_) => Ty::new_error(self.infcx.interner, ErrorGuaranteed),
+        }
+    }
+
+    /// The type of `operand` in `body`, not normalized: a static's is the `&'static T` the
+    /// operand is.
+    pub(super) fn operand_ty(&self, body: &MirBody<'db>, operand: &Operand) -> Ty<'db> {
+        match &operand.kind {
+            OperandKind::Copy(place) | OperandKind::Move(place) => {
+                place.as_ref().ty(body, &self.infcx, self.env).ty
+            }
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            &OperandKind::Static(static_) => {
+                let interner = self.infcx.interner;
+                let ty = InferenceResult::of(self.db, DefWithBodyId::from(static_))
+                    .expr_ty(Body::of(self.db, static_.into()).root_expr());
+                Ty::new_ref(interner, Region::new_static(interner), ty, Mutability::Not)
+            }
         }
     }
 
@@ -219,13 +239,6 @@ pub(super) fn run_one<'db>(
     Ok(())
 }
 
-pub(crate) fn compute_runtime_mir_body<'db>(
-    db: &'db Db,
-    def: InferBodyId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body(def)?)
-}
-
 /// The constant behind a promoted `&expr` of `def` after the passes: what the code generator
 /// evaluates for it with the interpreter.
 #[salsa::tracked(returns(as_ref))]
@@ -238,59 +251,46 @@ pub fn runtime_promoted_mir_body_query<'db>(
     run_passes(db, built)
 }
 
-pub(crate) fn compute_runtime_mir_body_for_closure<'db>(
-    db: &'db Db,
-    closure: InternedClosureId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body_for_closure(closure)?)
-}
-
-pub(crate) fn compute_runtime_mir_body_for_coroutine<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body_for_coroutine(coroutine)?)
-}
-
-pub(crate) fn compute_runtime_mir_body_for_coroutine_by_move<'db>(
+/// The types an `async` block holds across a yield: rustc's `mir_coroutine_witnesses`, the
+/// `CoroutineLayout::field_tys` its future implements auto traits by, in the order the body
+/// declares the locals. Not what `ignore_for_traits` marks: the temporary made for a place of a
+/// static that is not `#[thread_local]` (another access makes it again) and a fake borrow (only
+/// fake reads read it). Empty for a body MIR lowering refuses, as rustc's for a body with
+/// errors: that body is reported (`BorrowckSkipped`) and nothing is built from it.
+pub(crate) fn compute_coroutine_witnesses<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
-) -> Result<'db, MirBody<'db>> {
-    run_passes(db, db.mir_body_for_coroutine_by_move(coroutine)?)
-}
-
-pub(crate) fn compute_monomorphized_runtime_mir_body<'db>(
-    db: &'db Db,
-    def: InferBodyId<'db>,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.runtime_mir_body(def)?, &subst, &trait_env)
-}
-
-pub(crate) fn compute_monomorphized_runtime_mir_body_for_closure<'db>(
-    db: &'db Db,
-    closure: InternedClosureId<'db>,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.runtime_mir_body_for_closure(closure)?, &subst, &trait_env)
-}
-
-pub(crate) fn compute_monomorphized_runtime_mir_body_for_coroutine<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.runtime_mir_body_for_coroutine(coroutine)?, &subst, &trait_env)
-}
-
-pub(crate) fn compute_monomorphized_runtime_mir_body_for_coroutine_by_move<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<'db, MirBody<'db>> {
-    monomorphized(db, db.runtime_mir_body_for_coroutine_by_move(coroutine)?, &subst, &trait_env)
+) -> Box<[StoredTy]> {
+    let Ok(body) = db.runtime_mir_body_for_coroutine(coroutine) else {
+        return Box::default();
+    };
+    frame::task(Tag::Mir, |frame| {
+        let held = body.held_locals_in(frame);
+        let mut ignored: framed::Bits<'_> = framed::bits_in(body.locals.len(), frame);
+        for (_, block) in body.basic_blocks.iter() {
+            for statement in &block.statements {
+                let StatementKind::Assign(place, value) = &statement.kind else { continue };
+                if !place.projection.is_empty() {
+                    continue;
+                }
+                let ignore = match value {
+                    Rvalue::Use(Operand { kind: OperandKind::Static(id), .. }) => {
+                        !AttrFlags::query(db, (*id).into()).contains(AttrFlags::THREAD_LOCAL)
+                    }
+                    Rvalue::Ref(BorrowKind::Shallow, _) => true,
+                    _ => false,
+                };
+                if ignore {
+                    ignored.insert(framed::local_index(place.local));
+                }
+            }
+        }
+        held.locals
+            .iter()
+            .filter(|&&local| !ignored.contains(framed::local_index(local)))
+            // clone: a stored type's refcount, kept in the query's result
+            .map(|&local| body.locals[local].ty.clone())
+            // alloc: the witnesses the query keeps
+            .collect()
+    })
 }

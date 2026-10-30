@@ -342,6 +342,11 @@ pub enum SyntaxKind {
     WILDCARD_PAT,
     YEET_EXPR,
     YIELD_EXPR,
+    // Out of the generated order, after every other kind, so that each of those keeps its
+    // number: hir-def's persisted source map and span's AST id map store kinds as numbers.
+    UNWRAP_BINDER_KW,
+    WRAP_BINDER_KW,
+    UNSAFE_BINDER_CAST_EXPR,
     #[doc(hidden)]
     __LAST,
 }
@@ -458,6 +463,7 @@ impl SyntaxKind {
             | NEVER_TYPE
             | NOT_NULL
             | OFFSET_OF_EXPR
+            | UNSAFE_BINDER_CAST_EXPR
             | OR_PAT
             | PARAM
             | PARAM_LIST
@@ -680,6 +686,8 @@ impl SyntaxKind {
             SAFE_KW => "safe",
             SYM_KW => "sym",
             UNION_KW => "union",
+            UNWRAP_BINDER_KW => "unwrap_binder",
+            WRAP_BINDER_KW => "wrap_binder",
             YEET_KW => "yeet",
             ASYNC_KW => "async",
             AWAIT_KW => "await",
@@ -791,6 +799,8 @@ impl SyntaxKind {
             SAFE_KW => true,
             SYM_KW => true,
             UNION_KW => true,
+            UNWRAP_BINDER_KW => true,
+            WRAP_BINDER_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -890,6 +900,8 @@ impl SyntaxKind {
             SAFE_KW => true,
             SYM_KW => true,
             UNION_KW => true,
+            UNWRAP_BINDER_KW => true,
+            WRAP_BINDER_KW => true,
             YEET_KW => true,
             _ => false,
         }
@@ -1150,6 +1162,8 @@ macro_rules ! T_ {
     [safe] => { $ crate :: SyntaxKind :: SAFE_KW };
     [sym] => { $ crate :: SyntaxKind :: SYM_KW };
     [union] => { $ crate :: SyntaxKind :: UNION_KW };
+    [unwrap_binder] => { $ crate :: SyntaxKind :: UNWRAP_BINDER_KW };
+    [wrap_binder] => { $ crate :: SyntaxKind :: WRAP_BINDER_KW };
     [yeet] => { $ crate :: SyntaxKind :: YEET_KW };
     [async] => { $ crate :: SyntaxKind :: ASYNC_KW };
     [await] => { $ crate :: SyntaxKind :: AWAIT_KW };

@@ -54,7 +54,7 @@ pub(crate) fn parse_rule_style(src: &mut TtIter<'_>) -> Result<MacroCallStyle, P
 ///
 /// Stuff to the right is a [`MetaTemplate`] template which is used to produce
 /// output.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct MetaTemplate(pub(crate) Box<[Op]>);
 
 impl MetaTemplate {
@@ -99,7 +99,7 @@ pub(crate) type Binder = u32;
 /// A metavariable the pattern does not declare (or one not resolved yet).
 pub(crate) const NO_BINDER: Binder = u32::MAX;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Op {
     /// `spec` is a pattern's fragment specifier as written (`pat`, `pat_param`, `expr_2021`),
     /// and `decl` the span of `$name:spec` (a template's `$name`): rustc's `MetaVarDecl`.

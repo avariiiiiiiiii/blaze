@@ -19,6 +19,7 @@ The speed-of-light notes these come from: `docs/v2/plan/lanes/db/speed-of-light.
 "hir-expand: macro expansion (speed-hir-sol-expand)".
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub-macros (2026-10-29 22:37): in the tree: blocks 1 to 8, each checked below (8's `budget_tests.rs`, `lib.rs:32-36`, the dev-dep, `a_derive_allocates_nothing_per_field` and `macro_expansion_tests/budgets.rs` too).
 
 ### 1. `crates/hir-expand/src/lib.rs`: an eager call's argument read in place (fix)
 
@@ -140,6 +141,7 @@ undo_info)`, which takes `&SyntaxFixupUndoInfo`) and `HirFileId::syntax_context`
 compile unchanged.
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub-macros (2026-10-29 22:37): in the tree at `crates/hir-expand/src/lib.rs:94` (`MacroArg`), `:115` (`NO_FIXUPS`), `:680-692` and `:710`.
 
 ### 2. `crates/hir-expand/src/mod_path.rs`: the path callback is generic, not `dyn` (fix)
 
@@ -180,6 +182,7 @@ New:
 ```
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub-macros (2026-10-29 22:37): in the tree at `crates/hir-expand/src/mod_path.rs:97`, `:106`, `:128` (and `:328`, `:412`), with the comments at `:43` and `:116`.
 
 ### 3. `crates/hir-expand/src/builtin/fn_macro.rs`: `line!()`/`column!()` without a `String` (fix)
 
@@ -206,6 +209,7 @@ New:
 ```
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub-macros (2026-10-29 22:37): in the tree at `crates/hir-expand/src/builtin/fn_macro.rs:253-258`.
 
 ### 4. `crates/hir-expand/src/name.rs` and `proc_macro.rs`: `Symbol` is `Copy` (fix)
 
@@ -239,6 +243,7 @@ New:
 ```
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub-macros (2026-10-29 22:37): in the tree at `crates/hir-expand/src/name.rs:20`, `:342` and `proc_macro.rs:245`.
 
 ### 5. `crates/hir-expand/src/cfg_process.rs`: the callback's empty answers named once (fix)
 
@@ -276,6 +281,7 @@ Justify-comments in the same file (append to the line):
 - `let insert_tokens = vec![tt::Leaf::Punct(tt::Punct {` → `// alloc: the `]` after an expanded attribute: the bridge's callback takes a `Vec``
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub-macros (2026-10-29 22:37): in the tree at `crates/hir-expand/src/cfg_process.rs:30-31` (`KEEP`/`SKIP`, `Inserted` since frontend-tokens' syntax-bridge change).
 
 ### 6. `crates/hir-expand/src/builtin/derive_macro.rs`: one allocation per field list (fix)
 
@@ -325,6 +331,7 @@ Justify-comments in the same file (append to the line):
   → `// clone: `CoercePointee` only, rare: node handles and its edit's lists`
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub-macros (2026-10-29 22:37): in the tree at `crates/hir-expand/src/builtin/derive_macro.rs:537` and `:545`.
 
 ### 7. Justify-comments, the rest (append to the line, or put on the line above)
 
@@ -393,6 +400,7 @@ last `append.insert(node.into(), vec![`) → `// alloc: clone: error path: fixup
 - `self.clone().to_tokens(span, builder);` → `// clone: a leaf, a number or a `Copy` handle, as the doc above says`
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub-macros (2026-10-29 22:37): in the tree: hot_lint over `crates/hir-expand` finds 50 lines, all in the test-only `builtin/derive_macro/reference.rs`; `lib.rs:1750`, `:1754` take `SmallVec::from_buf`/`SmallVec::new()`.
 
 ### 8. Budgets: allocation-budget tests (new code, yours to add)
 
@@ -632,3 +640,72 @@ struct S { a: u8, b: u16 }
 > - `budgets.rs` needs hir-def's counting allocator (`v2/requests/db.md`, "speed-hir-store: one counting allocator for hir-def's tests", items 2 to 4, db-next2's).
 
 > forwarded to db (db-expand-macros-next1, which holds these paths) (from requests, pass 16; told by tmux).
+
+## frontend-tree-span: `RealSpanMap::from_file` takes `&[(TextSize, ErasedFileAstId)]`
+
+`v2/requests/mem-format-expand.md` section 4 is applied in `crates/span/src/map.rs`:
+`RealSpanMap::from_file(file_id, pairs: &[(TextSize, ErasedFileAstId)], end)` (it reads the
+pairs only; it used to take a `Box<[_]>`). hir-expand does not compile until these three
+one-token changes are made:
+
+- `crates/hir-expand/src/span_map.rs:169`: `&pairs` for `pairs.into_boxed_slice()`.
+- `crates/hir-expand/src/span_map.rs:219`: `&anchors` for `anchors.into_boxed_slice()`.
+- `crates/hir-expand/src/budget_tests.rs:77`: `&anchors` (and `anchors` can be a `Vec` or an
+  array, no `Box<[_]>` needed).
+
+Also new there, for E8 and E13: `RealSpanMap::absolute_span(file_id, range) -> Span` (the
+absolute map's span with no map made), and `SpanMap<A: Allocator + Clone = Global>` with
+`clear`, `reserve`, `capacity` and `copy_in(alloc)`; `finish` no longer shrinks.
+`ExpansionSpanMap = span::SpanMap` needs no change.
+
+> forwarded by db-expand-macros (2026-10-29 21:36) to db-mem-def, which holds `span_map.rs` (E8 rewrites this code) and `budget_tests.rs` (T1) now. Told by tmux, with the new `absolute_span` and `SpanMap<A>`.
+
+## frontend-tokens: syntax-bridge's new signatures (mem-format-expand 2a and 5), the callers outside it
+
+frontend-tokens applied `v2/requests/mem-format-expand.md` sections 2a and 5 in
+`crates/syntax-bridge/src/lib.rs` (2026-10-29, not built). The call sites below no longer compile
+until each makes the change given. The hir-expand ones are E2's and E3's in
+`v2/requests/mem-db-def-expand.md`, which already ask for the same.
+
+2a: `syntax_bridge::token_tree_to_syntax_node(tt: tt::SubtreeView<'_>, entry_point,
+span_to_edition)` takes a view, so each caller passes `.view()` of the tree it passes today.
+`reference::token_tree_to_syntax_node` keeps `&TopSubtree`. There's also
+`token_tree_to_syntax_node_in(view, entry_point, span_to_edition, alloc) -> (Parse, SpanMap<A>)`
+for E11.
+- `crates/hir-expand/src/lib.rs:1157`: `syntax_bridge::token_tree_to_syntax_node(tt.view(), ..)`.
+- `crates/hir-expand/src/fixup.rs:567`: the same.
+- Not hir-expand's (requests: please route): `crates/hir-def/src/nameres/facts/tests.rs:1142`,
+  `crates/hir-def/src/macro_expansion_tests/mod.rs:399` and `:443`,
+  `crates/hir-ide/src/const_macro.rs:188`: `&x` becomes `x.view()` (or `.view()` added to what
+  is passed).
+
+5: the modified conversions take hashbrown maps in any allocator, and the callback returns an
+inline `SmallVec`. All three types are new in syntax-bridge:
+`syntax_bridge::Inserted = SmallVec<[tt::Leaf; 3]>`,
+`syntax_bridge::Appended<K, A = Global> = hashbrown::HashMap<K, Inserted, FxBuildHasher, A>`,
+`syntax_bridge::Removed<K, A = Global> = hashbrown::HashSet<K, FxBuildHasher, A>`.
+`syntax_node_to_token_tree_modified<SpanMap, OnEvent, A: Allocator + Clone>(node, map, append:
+Appended<SyntaxElement, A>, remove: Removed<SyntaxElement, A>, ..)` and
+`call_input_modified<'t, SpanMap, OnEvent, A>(node, map, append: Appended<view::NodeId, A>,
+remove: Removed<view::NodeId, A>, ..)`. `OnEvent` returns `(bool, Inserted)`.
+- `crates/hir-expand/src/builtin/derive_macro.rs:1098`, `cfg_process.rs:359` and `:390`,
+  `fixup.rs:532` and `:550`. An `FxHashMap::default()` passed as `append` becomes
+  `Appended::<_, Global>::default()`, and an `FxHashSet::default()` passed as `remove` becomes
+  `Removed::<_, Global>::default()`. Give `A` explicitly: a function's type parameter takes no
+  default, so `Appended::default()` alone leaves `A` to infer. A map built and filled first is
+  declared as `Appended<_>`/`Removed<_>` (the alias's default is `Global`). A callback's
+  `Vec<tt::Leaf>` becomes `Inserted` (`smallvec![..]` for `vec![..]`, `Inserted::new()` for
+  `Vec::new()`).
+
+Also new and additive: `syntax_bridge::call_input_in(node: view::Node, map, call_site, mode,
+alloc) -> tt::TopSubtree<A>`, a task's temporary tree (once `tt::TopSubtree<A>` from section 1
+lands, which `frontend-tokens-alloc` is applying now). And
+`mbe::DeclarativeMacro::expand_making` (the `${concat}` spans, task 17; see `db-expand.md`).
+
+Status: applied (hir-expand); two outside callers to route
+
+> applied by db-expand-macros (2026-10-29, not built), the hir-expand call sites and my two in `macro_expansion_tests/mod.rs`:
+> - 2a: `.view()` is passed in `lib.rs` (`token_tree_to_syntax_node`), in `fixup.rs`'s test, and at `macro_expansion_tests/mod.rs` `IdentityWhenValidProcMacroExpander` and the `quote!` test.
+> - 5: `SyntaxFixups` holds `Appended<K>`/`Removed<K>`, filled with `smallvec![..]`. `cfg_process.rs`'s callbacks return `Inserted` (`KEEP`/`SKIP` use `Inserted::new_const()`). `derive_macro.rs` passes `Removed::<_>::from_iter`, `Appended::<_, Global>::default()` and `Inserted::new()`. `fixup.rs`'s test callbacks return `Inserted::new()`.
+> - These are also E2's and E3's syntax-bridge call sites in `mem-db-def-expand.md`; db-mem-def has been told.
+> - Not mine, left for requests to route: `hir-def/src/nameres/facts/tests.rs:1142` and `hir-ide/src/const_macro.rs:188`.

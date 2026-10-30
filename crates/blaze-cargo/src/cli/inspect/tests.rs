@@ -13,15 +13,8 @@ fn os(words: &[&str]) -> Vec<OsString> {
 struct Answering(Vec<Response>);
 
 impl Api for Answering {
-    fn call<F: FnMut(Response)>(&mut self, _: Request, mut on: F) -> Result<bool, ClientError> {
-        let mut ok = false;
-        for response in &self.0 {
-            if let Response::Done { ok: it } = response {
-                ok = *it;
-            }
-            on(response.clone());
-        }
-        Ok(ok)
+    fn call<F: FnMut(ResponseRef<'_>, bool)>(&mut self, _: Request, on: F) -> Result<bool, ClientError> {
+        Ok(crate::cli::daemon::tests::hand(&self.0, on))
     }
 }
 

@@ -46,7 +46,9 @@ its request file and to `mem-db-infer`, and does not invent another.
   `lower/batch.rs` runs each item of a crate's batch so (mem-db-infer-lower 15b), or a crate as
   large as std would grow the frame by about 2 MB of cold memory.
 - Lane dedyn's agents may change these files to replace a hot `dyn` with a concrete type, enum
-  or generic; their edits stay, and no part adds a hot `dyn`.
+  or generic; their edits stay, and no part adds a hot `dyn`. Likewise lane frontend-tree's
+  moves of `SyntaxNode` callers onto `syntax::view`: they stay, and new code reads syntax only
+  through `syntax::view`.
 
 ### R2. How `&'f Frame` enters the contexts
 

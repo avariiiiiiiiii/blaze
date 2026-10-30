@@ -102,12 +102,13 @@ use hir_ide::{
         InternedLayout, Layout as TyLayout, RustcEnumVariantIdx, RustcFieldIdx, TagEncoding,
         intern_layout,
     },
-    method_resolution::{self, InherentImpls, MethodResolutionContext},
+    method_resolution::{self, InherentImpls, MethodResolutionContext, TraitSet, TraitsInScope},
     mir::interpret_mir,
     mir_pretty::{MirBodyPretty as _, MirEvalErrorPretty as _},
     next_solver::{
         AliasTy, AnyImplId, ClauseKind, DbInterner, EarlyBinder, ErrorGuaranteed, FnSig,
-        GenericArg, GenericArgs, ParamEnv, PolyFnSig, Region, SolverDefId, Ty, TyKind, TypingMode,
+        GenericArg, GenericArgs, ParamEnv, PolyFnSig, Region, RegionExt as _, SolverDefId, Ty,
+        TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
     },
     traits::{self, structurally_normalize_ty},
@@ -172,6 +173,7 @@ pub use crate::{
     semantics::{
         LintAttr, PathResolution, PathResolutionPerNs, Semantics, SemanticsImpl, SemanticsScope,
         TypeInfo, VisibleTraits,
+        view::{self, FieldSourceView, LocalSourceView, ModuleSourceView},
     },
 };
 
@@ -229,7 +231,7 @@ pub use {
         CastError, EditionLint, PointerCast, ReceiverAdjustment, attach_db,
         attach_db_allow_change, const_macro,
         consteval::ConstEvalError,
-        display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError, HirWrite},
+        display::{ClosureStyle, DisplayTarget, HirDisplay, HirDisplayError},
         drop::DropGlue,
         dyn_compatibility::{DynCompatibilityViolation, MethodViolationCode},
         layout::LayoutError,
@@ -277,6 +279,7 @@ impl Crate {
     }
 
     pub fn origin(self, db: &Db) -> CrateOrigin {
+        // clone: editor edge; hot callers use `lang_origin`
         self.id.data(db).origin.clone()
     }
 
@@ -293,6 +296,7 @@ impl Crate {
     }
 
     pub fn dependencies(self, db: &Db) -> Vec<CrateDependency> {
+        // alloc: editor edge; hot callers use `dependencies_iter`
         self.dependencies_iter(db).collect()
     }
 
@@ -312,21 +316,21 @@ impl Crate {
             .copied()
             .filter(|&krate| krate.data(db).dependencies.iter().any(|it| it.crate_id == self.id))
             .map(|id| Crate { id })
-            .collect()
+            .collect() // alloc: editor edge, once per request
     }
 
     pub fn transitive_reverse_dependencies(
         self,
         db: &Db,
     ) -> impl Iterator<Item = Crate> {
-        self.id.transitive_rev_deps(db).into_iter().map(|id| Crate { id })
+        self.id.transitive_rev_deps(db).iter().map(|&id| Crate { id })
     }
 
     pub fn notable_traits_in_deps(self, db: &Db) -> impl Iterator<Item = &TraitId> {
         self.id
             .transitive_deps(db)
-            .into_iter()
-            .filter_map(|krate| hir_def::crate_notable_traits(db, krate))
+            .iter()
+            .filter_map(|&krate| hir_def::crate_notable_traits(db, krate))
             .flatten()
     }
 
@@ -335,6 +339,7 @@ impl Crate {
     }
 
     pub fn modules(self, db: &Db) -> Vec<Module> {
+        // alloc: editor edge; hot callers use `modules_iter`
         self.modules_iter(db).collect()
     }
 
@@ -358,10 +363,12 @@ impl Crate {
     }
 
     pub fn version(self, db: &Db) -> Option<String> {
+        // clone: editor edge, an owned string for display
         self.id.extra_data(db).version.clone()
     }
 
     pub fn display_name(self, db: &Db) -> Option<CrateDisplayName> {
+        // clone: editor edge, an owned name for display
         self.id.extra_data(db).display_name.clone()
     }
 
@@ -401,6 +408,7 @@ impl Crate {
     }
 
     pub fn all(db: &Db) -> Vec<Crate> {
+        // alloc: editor edge, once per request
         all_crates(db).iter().map(|&id| Crate { id }).collect()
     }
 
@@ -408,6 +416,7 @@ impl Crate {
     pub fn get_html_root_url(self, db: &Db) -> Option<String> {
         // Look for #![doc(html_root_url = "...")]
         let doc_url = AttrFlags::doc_html_root_url(db, self.id);
+        // alloc: editor edge, an owned URL for docs links
         doc_url.as_ref().map(|s| s.trim_matches('"').trim_end_matches('/').to_owned() + "/")
     }
 
@@ -497,6 +506,7 @@ impl ModuleDef {
     pub fn canonical_path(&self, db: &Db, edition: Edition) -> Option<String> {
         let name = self.name(db)?;
         let segments = self.module(db)?.path_segments(db).chain(Some(name));
+        // alloc: editor edge, a path rendered for display
         Some(segments.map(|it| it.display(db, edition).to_string()).join("::"))
     }
 
@@ -678,6 +688,7 @@ impl Module {
     }
 
     pub fn path_to_root(self, db: &Db) -> Vec<Module> {
+        // alloc: editor edge, a path as deep as the module nesting
         let mut res = vec![self];
         let mut curr = self;
         while let Some(next) = curr.parent(db) {
@@ -705,13 +716,13 @@ impl Module {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
 
-        let mut res = Vec::new();
+        let mut res = Vec::new(); // alloc: editor edge, the owned list callers take
 
         for (name, item) in scope.types() {
             if let ModuleDefId::ModuleId(m) = item.def
                 && (!pub_only || item.vis == Visibility::Public)
             {
-                res.push((name.clone(), Module { id: m }));
+                res.push((*name, Module { id: m }));
             }
         }
 
@@ -738,9 +749,9 @@ impl Module {
                 }
             })
             .flat_map(|(name, def)| {
-                ScopeDef::all_items(def).into_iter().map(move |item| (name.clone(), item))
+                ScopeDef::all_items(def).into_iter().map(move |item| (*name, item))
             })
-            .collect()
+            .collect() // alloc: editor edge, the owned scope listing callers take
     }
 
     pub fn resolve_mod_path(
@@ -762,7 +773,8 @@ impl Module {
         acc: &mut Vec<AnyDiagnostic<'db>>,
         style_lints: bool,
     ) {
-        crate::diagnostics::DiagnosticsCollector::collect(db, self.id, acc, style_lints, None);
+        let bodies = &crate::check::every_body;
+        crate::diagnostics::DiagnosticsCollector::collect(db, self.id, acc, style_lints, bodies);
     }
 
     /// Fills `acc` with the module's diagnostics, of the bodies only those `bodies` asks for:
@@ -772,13 +784,13 @@ impl Module {
         db: &'db Db,
         acc: &mut Vec<AnyDiagnostic<'db>>,
         style_lints: bool,
-        bodies: &dyn Fn(DefWithBody) -> bool,
+        bodies: &(impl Fn(DefWithBody) -> bool + ?Sized),
     ) {
-        let bodies = Some(bodies);
         crate::diagnostics::DiagnosticsCollector::collect(db, self.id, acc, style_lints, bodies);
     }
 
     pub fn declarations(self, db: &Db) -> Vec<ModuleDef> {
+        // alloc: editor edge; hot callers use `declarations_iter`
         self.declarations_iter(db).collect()
     }
 
@@ -792,6 +804,7 @@ impl Module {
     }
 
     pub fn legacy_macros(self, db: &Db) -> Vec<Macro> {
+        // alloc: editor edge; hot callers use `legacy_macros_iter`
         self.legacy_macros_iter(db).collect()
     }
 
@@ -804,24 +817,26 @@ impl Module {
     pub fn extern_blocks(self, db: &Db) -> Vec<ExternBlock> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
-        scope.extern_blocks().map(|id| ExternBlock { id }).collect()
+        scope.extern_blocks().map(|id| ExternBlock { id }).collect() // alloc: editor edge
     }
 
     /// The `use` items written in the module.
     pub fn use_decls(self, db: &Db) -> Vec<UseDecl> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
-        scope.use_decls().map(|id| UseDecl { id }).collect()
+        scope.use_decls().map(|id| UseDecl { id }).collect() // alloc: editor edge
     }
 
     /// The `extern crate` items written in the module.
     pub fn extern_crate_decls(self, db: &Db) -> Vec<ExternCrateDecl> {
         let def_map = self.id.def_map(db);
         let scope = def_map.module(db, self.id).scope(db);
+        // alloc: editor edge
         scope.extern_crate_decls().map(|id| ExternCrateDecl { id }).collect()
     }
 
     pub fn impl_defs(self, db: &Db) -> Vec<Impl> {
+        // alloc: editor edge; hot callers use `impl_defs_iter`
         self.impl_defs_iter(db).collect()
     }
 
@@ -955,7 +970,7 @@ impl AstNode for FieldSource {
 
 impl Field {
     pub fn name(&self, db: &Db) -> Name {
-        VariantId::from(self.parent).fields(db).fields()[self.id].name.clone()
+        VariantId::from(self.parent).fields(db).fields()[self.id].name
     }
 
     pub fn index(&self) -> usize {
@@ -1000,10 +1015,11 @@ impl Struct {
     }
 
     pub fn name(self, db: &Db) -> Name {
-        StructSignature::of(db, self.id).name.clone()
+        StructSignature::of(db, self.id).name
     }
 
     pub fn fields(self, db: &Db) -> Vec<Field> {
+        // alloc: editor edge; hot callers use `fields_iter`
         self.fields_iter(db).collect()
     }
 
@@ -1056,7 +1072,7 @@ pub struct Union {
 
 impl Union {
     pub fn name(self, db: &Db) -> Name {
-        UnionSignature::of(db, self.id).name.clone()
+        UnionSignature::of(db, self.id).name
     }
 
     pub fn module(self, db: &Db) -> Module {
@@ -1080,6 +1096,7 @@ impl Union {
     }
 
     pub fn fields(self, db: &Db) -> Vec<Field> {
+        // alloc: editor edge; hot callers use `fields_iter`
         self.fields_iter(db).collect()
     }
 
@@ -1111,10 +1128,11 @@ impl Enum {
     }
 
     pub fn name(self, db: &Db) -> Name {
-        EnumSignature::of(db, self.id).name.clone()
+        EnumSignature::of(db, self.id).name
     }
 
     pub fn variants(self, db: &Db) -> Vec<EnumVariant> {
+        // alloc: editor edge; hot callers use `variants_iter`
         self.variants_iter(db).collect()
     }
 
@@ -1213,10 +1231,11 @@ impl EnumVariant {
     }
 
     pub fn name(self, db: &Db) -> Name {
-        self.id.lookup(db).name.clone()
+        self.id.lookup(db).name
     }
 
     pub fn fields(self, db: &Db) -> Vec<Field> {
+        // alloc: editor edge; hot callers use `fields_iter`
         self.fields_iter(db).collect()
     }
 
@@ -1339,6 +1358,7 @@ impl Adt {
                     // but `Arena` requires to use an iterator
                     .nth(0)
             })
+            // clone: editor edge, one name and a tag
             .map(|arena| arena.1.clone())
     }
 
@@ -1354,6 +1374,7 @@ impl Adt {
     /// clauses constrains, in declaration order: each one rustc's E0392. Empty when a field's
     /// type has an error.
     pub fn unused_params(self, db: &Db) -> Vec<GenericParam> {
+        // alloc: error path, non-empty only when E0392 is reported
         hir_ide::adt_unused_params(db, self.into()).into_iter().map(GenericParam::from).collect()
     }
 }
@@ -1551,7 +1572,7 @@ impl DefWithBody {
     /// A textual representation of the HIR of this def's body for debugging purposes.
     pub fn debug_hir(self, db: &Db) -> String {
         let Some(id) = self.id() else {
-            return String::new();
+            return String::new(); // alloc: empty
         };
         let body = Body::of(db, id);
         body.pretty_print(db, id, Edition::CURRENT)
@@ -1560,12 +1581,12 @@ impl DefWithBody {
     /// A textual representation of the MIR of this def's body for debugging purposes.
     pub fn debug_mir(self, db: &Db) -> String {
         let Some(id) = self.id() else {
-            return String::new();
+            return String::new(); // alloc: empty
         };
         let body = db.mir_body(id.into());
         match body {
             Ok(body) => body.pretty_print(db, self.module(db).krate(db).to_display_target(db)),
-            Err(e) => format!("error:\n{e:?}"),
+            Err(e) => format!("error:\n{e:?}"), // alloc: debug output, error path
         }
     }
 
@@ -1655,7 +1676,7 @@ impl Function {
 
     pub fn name(self, db: &Db) -> Name {
         match self.id {
-            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).name.clone(),
+            AnyFunctionId::FunctionId(id) => FunctionSignature::of(db, id).name,
             AnyFunctionId::BuiltinDeriveImplMethod { method, .. } => {
                 Name::new_symbol_root(method.name())
             }
@@ -1840,11 +1861,11 @@ impl Function {
             .iter()
             .enumerate()
             .map(|(idx, &ty)| Param {
-                func: func.clone(),
+                func,
                 ty: Type { owner, ty: EarlyBinder::bind(interner, ty) },
                 idx,
             })
-            .collect()
+            .collect() // alloc: editor edge, the owned parameter list callers take
     }
 
     pub fn num_params(self, db: &Db) -> usize {
@@ -2045,6 +2066,7 @@ impl Function {
     ) -> Result<String, ConstEvalError<'_>> {
         let AnyFunctionId::FunctionId(id) = self.id else {
             return Err(ConstEvalError::MirEvalError(MirEvalError::NotSupported(
+                // alloc: error path
                 "evaluation of builtin derive impl methods is not supported".to_owned(),
             )));
         };
@@ -2059,9 +2081,9 @@ impl Function {
         )?;
         let (result, output) = interpret_mir(db, body, false, None)?;
         let mut text = match result {
-            Ok(_) => "pass".to_owned(),
+            Ok(_) => "pass".to_owned(), // alloc: editor edge, the owned report `eval` returns
             Err(e) => {
-                let mut r = String::new();
+                let mut r = String::new(); // alloc: error path, the rendered evaluation error
                 _ = e.pretty_print(
                     &mut r,
                     db,
@@ -2312,7 +2334,7 @@ impl Const {
     }
 
     pub fn name(self, db: &Db) -> Option<Name> {
-        ConstSignature::of(db, self.id).name.clone()
+        ConstSignature::of(db, self.id).name
     }
 
     pub fn value(self, db: &Db) -> Option<ast::Expr> {
@@ -2352,6 +2374,7 @@ pub struct EvaluatedConst<'db> {
 
 impl<'db> EvaluatedConst<'db> {
     pub fn render(&self, db: &Db, display_target: DisplayTarget) -> String {
+        // alloc: editor edge, rendered for display
         format!("{}", self.allocation.display(db, display_target))
     }
 
@@ -2362,7 +2385,7 @@ impl<'db> EvaluatedConst<'db> {
             let value = u128::from_le_bytes(mir::pad16(b, mir::IsSigned::No));
             let is_signed = matches!(ty, TyKind::Int(_)).into();
             let value_signed = i128::from_le_bytes(mir::pad16(b, is_signed));
-            let mut result =
+            let mut result = // alloc: editor edge, rendered for display
                 if let TyKind::Int(_) = ty { value_signed.to_string() } else { value.to_string() };
             if value >= 10 {
                 format_to!(result, " ({value:#X})");
@@ -2386,7 +2409,7 @@ impl Static {
     }
 
     pub fn name(self, db: &Db) -> Name {
-        StaticSignature::of(db, self.id).name.clone()
+        StaticSignature::of(db, self.id).name
     }
 
     pub fn is_mut(self, db: &Db) -> bool {
@@ -2446,17 +2469,17 @@ impl Trait {
     }
 
     pub fn name(self, db: &Db) -> Name {
-        TraitSignature::of(db, self.id).name.clone()
+        TraitSignature::of(db, self.id).name
     }
 
     pub fn direct_supertraits(self, db: &Db) -> Vec<Trait> {
         let traits = direct_super_traits(db, self.into());
-        traits.iter().map(|tr| Trait::from(*tr)).collect()
+        traits.iter().map(|tr| Trait::from(*tr)).collect() // alloc: editor edge
     }
 
     pub fn all_supertraits(self, db: &Db) -> Vec<Trait> {
         let traits = all_super_traits(db, self.into());
-        traits.iter().map(|tr| Trait::from(*tr)).collect()
+        traits.iter().map(|tr| Trait::from(*tr)).collect() // alloc: editor edge
     }
 
     pub fn function(self, db: &Db, name: impl PartialEq<Name>) -> Option<Function> {
@@ -2468,6 +2491,7 @@ impl Trait {
     }
 
     pub fn items(self, db: &Db) -> Vec<AssocItem> {
+        // alloc: editor edge; hot callers use `items_iter`
         self.items_iter(db).collect()
     }
 
@@ -2477,7 +2501,10 @@ impl Trait {
     }
 
     pub fn items_with_supertraits(self, db: &Db) -> Vec<AssocItem> {
-        self.all_supertraits(db).into_iter().flat_map(|tr| tr.items_iter(db)).collect()
+        all_super_traits(db, self.into())
+            .iter()
+            .flat_map(|&tr| Trait::from(tr).items_iter(db))
+            .collect() // alloc: editor edge, the owned item list callers take
     }
 
     pub fn is_auto(self, db: &Db) -> bool {
@@ -2508,7 +2535,7 @@ impl Trait {
         &self,
         db: &Db,
     ) -> Option<Vec<DynCompatibilityViolation>> {
-        let mut violations = vec![];
+        let mut violations = vec![]; // alloc: error path, filled only with violations
         _ = hir_ide::dyn_compatibility::dyn_compatibility_with_callback(
             db,
             self.id,
@@ -2570,7 +2597,7 @@ impl TypeAlias {
     }
 
     pub fn name(self, db: &Db) -> Name {
-        TypeAliasSignature::of(db, self.id).name.clone()
+        TypeAliasSignature::of(db, self.id).name
     }
 
     pub fn has_type(self, db: &Db) -> bool {
@@ -2728,7 +2755,7 @@ impl Macro {
                 match loc.kind {
                     ProcMacroKind::CustomDerive => AttrFlags::derive_info(db, self.id).map_or_else(
                         || as_name_opt(source.value.name()),
-                        |info| Name::new_symbol_root(info.trait_name.clone()),
+                        |info| Name::new_symbol_root(info.trait_name),
                     ),
                     ProcMacroKind::Bang | ProcMacroKind::Attr => as_name_opt(source.value.name()),
                 }
@@ -3280,7 +3307,7 @@ impl GenericDef {
     pub fn params(self, db: &Db) -> Vec<GenericParam> {
         let Ok(id) = self.try_into() else {
             // Let's pretend builtin derive impls don't have generic parameters.
-            return Vec::new();
+            return Vec::new(); // alloc: empty
         };
         let generics = GenericParams::of(db, id);
         let ty_params = generics.iter_type_or_consts().map(|(local_id, _)| {
@@ -3290,23 +3317,27 @@ impl GenericDef {
                 Either::Right(it) => GenericParam::TypeParam(it),
             }
         });
-        self.lifetime_params(db)
-            .into_iter()
-            .map(GenericParam::LifetimeParam)
+        generics
+            .iter_lt()
+            .map(|(local_id, _)| {
+                GenericParam::LifetimeParam(LifetimeParam {
+                    id: LifetimeParamId { parent: id, local_id },
+                })
+            })
             .chain(ty_params)
-            .collect()
+            .collect() // alloc: editor edge, the owned parameter list callers take
     }
 
     pub fn lifetime_params(self, db: &Db) -> Vec<LifetimeParam> {
         let Ok(id) = self.try_into() else {
             // Let's pretend builtin derive impls don't have generic parameters.
-            return Vec::new();
+            return Vec::new(); // alloc: empty
         };
         let generics = GenericParams::of(db, id);
         generics
             .iter_lt()
             .map(|(local_id, _)| LifetimeParam { id: LifetimeParamId { parent: id, local_id } })
-            .collect()
+            .collect() // alloc: editor edge
     }
 
     pub fn type_or_const_params(self, db: &Db) -> Vec<TypeOrConstParam> {
@@ -4142,7 +4173,7 @@ impl Impl {
                 Either::Right(impls) => all.extend(impls.iter().copied().map(Impl::from)),
             });
         };
-        for krate in module.krate(db).transitive_rev_deps(db) {
+        for krate in module.krate(db).transitive_rev_deps(db).iter().copied() {
             handle_impls(TraitImpls::for_crate(db, krate));
         }
         if let Some(block) = module.block(db)
@@ -4761,7 +4792,7 @@ impl TypeOwnerId {
 
 /// Note: A [`Type`] remembers its origin. Trying to do anything (except comparing)
 /// with types of different origins will cause errors or panics. Instead, use the `instantiate` methods.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Type<'db> {
     owner: TypeOwnerId,
     ty: EarlyBinder<'db, Ty<'db>>,
@@ -5151,6 +5182,18 @@ impl<'db> Type<'db> {
         )
     }
 
+    /// `&'erased self` (or `&'erased mut`) in this type's environment, as clippy's
+    /// `Ty::new_imm_ref(tcx, re_erased, ty)`; [`Type::add_reference`] gives an error region.
+    pub fn ref_to(&self, db: &'db Db, mutability: Mutability) -> Type<'db> {
+        let interner = DbInterner::new_no_crate(db);
+        let ty_mutability = match mutability {
+            Mutability::Shared => hir_ide::next_solver::Mutability::Not,
+            Mutability::Mut => hir_ide::next_solver::Mutability::Mut,
+        };
+        let region = Region::new_erased(interner);
+        self.derived_with(interner, Ty::new_ref(interner, region, self.ty.skip_binder(), ty_mutability))
+    }
+
     pub fn is_slice(&self) -> bool {
         matches!(self.ty.skip_binder().kind(), TyKind::Slice(..))
     }
@@ -5327,6 +5370,18 @@ impl<'db> Type<'db> {
         traits::implements_trait_unique_with_args(db, env, trait_.id, args)
     }
 
+    /// Whether the type implements `trait_` for some arguments after `Self`, each a fresh
+    /// inference variable: clippy's `implements_trait(cx, ty, trait_, &[])`, which leaves them to
+    /// inference. [`Type::impls_trait`] with no arguments makes them errors, which never hold.
+    pub fn impls_trait_fresh(&self, db: &'db Db, trait_: Trait) -> bool {
+        traits::implements_trait_unique(
+            self.ty.instantiate_identity().skip_norm_wip(),
+            db,
+            self.param_env(db),
+            trait_.id,
+        )
+    }
+
     /// Unlike [`Type::impls_trait()`], which checks whether the type always implements the trait,
     /// this check whether there are any generic args substitution for `args`` that will cause the
     /// trait to be implemented.
@@ -5419,6 +5474,67 @@ impl<'db> Type<'db> {
             return false;
         };
         self.impls_trait(db, copy_trait.into(), &[])
+    }
+
+    /// rustc's `Ty::is_sized` in the type's environment: an error type is sized, as
+    /// `is_trivially_sized` has it, and any other type is when `Sized` holds of it.
+    pub fn is_sized(&self, db: &'db Db) -> bool {
+        if self.is_unknown() {
+            return true;
+        }
+        let env = self.param_env(db);
+        let Some(sized_trait) = hir_def::lang_item::lang_items(db, env.krate).Sized else {
+            return false;
+        };
+        traits::implements_trait_unique(
+            self.ty.instantiate_identity().skip_norm_wip(),
+            db,
+            env,
+            sized_trait,
+        )
+    }
+
+    /// rustc's `type_allowed_to_implement_copy(..).is_ok()` with `Safety::Safe`, as clippy asks
+    /// it: a primitive core implements `Copy` for, or an ADT with no unsafe field and no `Drop`
+    /// impl whose every field, with this type's arguments, is `Copy` in its environment. A field
+    /// whose type is an error is skipped, as rustc skips it. Modulo regions, as
+    /// [`Type::is_copy`]: rustc also resolves each field's region constraints.
+    pub fn may_implement_copy(&self, db: &'db Db) -> bool {
+        let (adt_def, args) = match self.ty.skip_binder().kind() {
+            TyKind::Uint(_)
+            | TyKind::Int(_)
+            | TyKind::Bool
+            | TyKind::Float(_)
+            | TyKind::Char
+            | TyKind::RawPtr(..)
+            | TyKind::Never
+            | TyKind::Ref(_, _, hir_ide::next_solver::Mutability::Not)
+            | TyKind::Array(..) => return true,
+            TyKind::Adt(adt_def, args) => (adt_def, args),
+            _ => return false,
+        };
+        let adt = adt_def.def_id();
+        if hir_ide::drop::destructor(db, adt).is_some() {
+            return false;
+        }
+        let interner = DbInterner::new_no_crate(db);
+        let allowed = |variant: hir_def::VariantId| {
+            if variant.fields(db).fields().iter().any(|(_, field)| field.is_unsafe) {
+                return false;
+            }
+            db.field_types(variant).iter().all(|(_, field)| {
+                let ty = field.ty().instantiate(interner, args).skip_norm_wip();
+                let ty = self.derived_with(interner, ty);
+                ty.contains_unknown() || ty.is_copy(db)
+            })
+        };
+        match adt {
+            AdtId::StructId(id) => allowed(id.into()),
+            AdtId::UnionId(id) => allowed(id.into()),
+            AdtId::EnumId(id) => {
+                id.enum_variants(db).variants.values().all(|&(variant, _)| allowed(variant.into()))
+            }
+        }
     }
 
     pub fn as_callable(&self, db: &'db Db) -> Option<Callable<'db>> {
@@ -5648,17 +5764,17 @@ impl<'db> Type<'db> {
         mut callback: impl FnMut(AssocItem) -> Option<T>,
     ) -> Option<T> {
         let mut slot = None;
-        self.iterate_assoc_items_dyn(db, &mut |assoc_item_id| {
+        self.iterate_assoc_item_ids(db, &mut |assoc_item_id| {
             slot = callback(assoc_item_id.into());
             slot.is_some()
         });
         slot
     }
 
-    fn iterate_assoc_items_dyn(
+    fn iterate_assoc_item_ids(
         &self,
         db: &'db Db,
-        callback: &mut dyn FnMut(AssocItemId) -> bool,
+        callback: &mut impl FnMut(AssocItemId) -> bool,
     ) {
         let mut handle_impls = |impls: &[ImplId]| {
             for &impl_def in impls {
@@ -5843,17 +5959,22 @@ impl<'db> Type<'db> {
         let infcx = interner.infer_ctxt().build(typing_mode);
         let features = resolver.top_level_def_map().features();
         let environment = self.param_env(db);
-        let ctx = MethodResolutionContext {
-            infcx: &infcx,
-            resolver,
-            param_env: environment.param_env,
-            traits_in_scope,
-            edition: resolver.krate().data(db).edition,
-            features,
-            call_span: hir_ide::Span::Dummy,
-            receiver_span: hir_ide::Span::Dummy,
-        };
-        f(&ctx)
+        blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+            let ctx = MethodResolutionContext {
+                infcx: &infcx,
+                resolver,
+                param_env: environment.param_env,
+                traits_in_scope: TraitsInScope::Set(TraitSet::collect(
+                    traits_in_scope.iter().copied(),
+                )),
+                edition: resolver.krate().data(db).edition,
+                features,
+                call_span: hir_ide::Span::Dummy,
+                receiver_span: hir_ide::Span::Dummy,
+                frame,
+            };
+            f(&ctx)
+        })
     }
 
     /// Allows you to treat inherent and non-inherent methods differently.
@@ -6088,6 +6209,40 @@ impl<'db> Type<'db> {
             .map(Trait::from)
     }
 
+    /// The trait clauses of the type's environment, elaborated, that are not global, bind no
+    /// variables and are not `Sized` or `MetaSized`, whose self type is exactly this type (no
+    /// autoderef, unlike [`Type::env_traits`]), each with its type arguments after `Self`.
+    /// clippy's `elaborate(param_env.caller_bounds()).filter(|t| t.self_ty() == ty)`.
+    pub fn env_bounds(&self, db: &'db Db) -> Vec<(Trait, Vec<Type<'db>>)> {
+        let env = self.param_env(db);
+        let interner = DbInterner::new_with(db, env.krate);
+        let lang_items = hir_def::lang_item::lang_items(db, env.krate);
+        let ty = self.ty.skip_binder();
+        rustc_type_ir::elaborate::elaborate(interner, env.param_env.clauses().iter())
+            .filter(|clause| !clause.is_global())
+            .filter_map(|clause| match clause.kind().no_bound_vars()? {
+                ClauseKind::Trait(pred) => Some(pred),
+                _ => None,
+            })
+            .filter(|pred| {
+                let id = pred.def_id().0;
+                Some(id) != lang_items.Sized && Some(id) != lang_items.MetaSized
+            })
+            .filter(|pred| pred.self_ty() == ty)
+            .map(|pred| {
+                let args = pred
+                    .trait_ref
+                    .args
+                    .iter()
+                    .skip(1)
+                    .filter_map(|arg| arg.ty())
+                    .map(|arg| self.derived_with(interner, arg))
+                    .collect();
+                (Trait::from(pred.def_id().0), args)
+            })
+            .collect()
+    }
+
     pub fn as_impl_traits(&self, db: &'db Db) -> Option<impl Iterator<Item = Trait>> {
         self.ty.skip_binder().impl_trait_bounds(db).map(|it| {
             it.into_iter().filter_map(|pred| match pred.kind().skip_binder() {
@@ -6275,7 +6430,7 @@ pub struct Callable<'db> {
     is_bound_method: bool,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Callee<'db> {
     Def(CallableDefId),
     Closure(InternedClosureId<'db>, GenericArgs<'db>),
@@ -6336,6 +6491,11 @@ impl<'db> Callable<'db> {
         }
         let func = self.as_function()?;
         Some((func.self_param(db)?, self.ty.derived(self.erased.inputs()[0])))
+    }
+    /// The signature's safety: `Unsafe` for an `unsafe fn` item or pointer, `Safe` for a
+    /// closure or a call through an `Fn` trait.
+    pub fn safety(&self) -> Safety {
+        self.erased.safety()
     }
     pub fn n_params(&self) -> usize {
         self.sig.skip_binder().inputs_and_output.inputs().len()
@@ -6472,6 +6632,21 @@ impl<'db> Layout<'db> {
                 return None;
             };
         Some(tag_size)
+    }
+
+    /// For an enum whose tag holds its discriminant directly (`Variants::Multiple` with
+    /// `TagEncoding::Direct`): the tag's size and each variant's size, in bytes, in declaration
+    /// order (rustc's `variants[i].size`, tag included, as `variant_size_differences` reads
+    /// them). `None` for a niche-encoded enum or any layout with one variant.
+    pub fn direct_tag_variant_sizes(
+        &self,
+    ) -> Option<(u64, impl ExactSizeIterator<Item = u64>)> {
+        let layout::Variants::Multiple { tag, tag_encoding: TagEncoding::Direct, variants, .. } =
+            &self.0.variants
+        else {
+            return None;
+        };
+        Some((tag.size(self.1).bytes(), variants.iter().map(|variant| variant.size.bytes())))
     }
 }
 

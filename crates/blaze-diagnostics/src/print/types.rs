@@ -31,7 +31,7 @@ use rustc_type_ir::{
     },
 };
 use smallvec::SmallVec;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::view::AstNode as _;
 
 use super::{
     paths::{self, Def, Parent},
@@ -167,11 +167,14 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 let binder: Binder<'t, Ty<'t>> = *inner;
                 self.wrap_binder(&binder, BinderKind::Unsafe, |p, ty| p.print_type(*ty))
             }
+            // hir's types as inference had them at an error hold an undecided literal's as these.
+            TyKind::Infer(InferTy::FreshIntTy(_)) => self.write_str("{integer}"),
+            TyKind::Infer(InferTy::FreshFloatTy(_)) => self.write_str("{float}"),
             TyKind::Infer(it) => self.write_fmt(format_args!("{it}")),
             TyKind::Error(_) => self.write_str("_"),
             TyKind::Param(it) => self.print_param(it),
             TyKind::Bound(index, bound) => {
-                let mut out = String::new();
+                let mut out = String::new(); // alloc: a bound type printed, the edge
                 // Writing into a `String` does not fail.
                 let _ = rustc_type_ir::debug_bound_var(&mut out, index, bound.var);
                 match bound.kind {
@@ -296,14 +299,14 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 _ => Err(err),
             })
             .expect("a closure-like expression not desugared from a function has syntax");
-        let node = self.cx.node(src);
-        let syntax = node.value.syntax().clone();
+        let node = self.cx.node_view(src);
+        let syntax = node.value.syntax();
         let local = hir::Crate::from(hir_def::HasModule::krate(&owner, db)) == self.cx.krate;
         if !local {
             let path = paths::closure_path(self.cx, syntax).expect("a closure is written in a body");
             return Site::Path(path);
         }
-        Site::Span(self.cx.span(node.with_value(decl_range(&syntax))))
+        Site::Span(self.cx.span(node.with_value(crate::cx::closure_decl_range_view(syntax))))
     }
 
     /// `[for<'a> ]fn(..) -> T {path}`, with a function's late-bound lifetimes by their names.
@@ -407,8 +410,8 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     /// rustc's `pretty_print_opaque_impl_type`: `impl Fn(A) -> R + Trait<X = Y> + ?Sized + 'a`.
     fn print_impl_bounds(&mut self, clauses: impl Iterator<Item = Clause<'t>>) {
         let lang = self.interner.lang_items();
-        let mut traits: Traits<'t> = Vec::new();
-        let mut fn_traits: Vec<FnTrait<'t>> = Vec::new();
+        let mut traits: Traits<'t> = Vec::new(); // alloc: an `impl Trait` printed, the edge
+        let mut fn_traits: Vec<FnTrait<'t>> = Vec::new(); // alloc: an `impl Trait` printed, the edge
         let mut lifetimes: SmallVec<[Region<'t>; 1]> = SmallVec::new();
         let mut has_sized = false;
         let mut has_negative_sized = false;
@@ -656,7 +659,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 p.print_def_path(Def::Trait(it.0), &[]);
                 (p.finish(), it.0)
             })
-            .collect();
+            .collect(); // alloc: the auto traits' paths, sorted by them; printing a type, the edge
         auto.sort_by(|a, b| a.0.cmp(&b.0));
         for (_, trait_) in auto {
             if !std::mem::replace(&mut first, false) {
@@ -676,6 +679,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
 
         let principal = preds.principal().expect("printing the principal");
         let mut projections: SmallVec<[ExistentialProjection<'t>; 2]> =
+            // alloc: none up to 2, inline in the `SmallVec`; printing a type, the edge
             preds.projection_bounds().into_iter().map(|it| it.skip_binder()).collect();
 
         let is_fn = self.fn_trait_kind(trait_).is_some_and(|(_, is_async)| !is_async);
@@ -698,7 +702,7 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
                 .filter_only_self()
                 .filter_map(|it| it.as_projection_clause())
                 .map(|it| erase(self, ExistentialProjection::erase_self_ty(interner, it.skip_binder())))
-                .collect()
+                .collect() // alloc: none up to 4, inline in the `SmallVec`; printing a type, the edge
         };
         projections.retain(|it| !supers.contains(&erase(self, *it)));
         projections.sort_by_cached_key(|it| term_name(self.cx, it.def_id.0));
@@ -776,23 +780,6 @@ fn is_param(ty: Ty<'_>, param: ParamTy) -> bool {
     matches!(ty.kind(), TyKind::Param(it) if it.id == param.id)
 }
 
-/// The span rustc's `def_span` gives a closure-like node; see [`Printer::site`].
-fn decl_range(node: &SyntaxNode) -> TextRange {
-    let range = node.text_range();
-    let start = node
-        .children_with_tokens()
-        .find(|it| it.kind() != SyntaxKind::ATTR && !it.kind().is_trivia())
-        .map_or(range.start(), |it| it.text_range().start());
-    let end = ast::ClosureExpr::cast(node.clone())
-        .and_then(|it| {
-            it.ret_type()
-                .map(|it| it.syntax().text_range().end())
-                .or_else(|| it.param_list().map(|it| it.syntax().text_range().end()))
-        })
-        .unwrap_or(range.end());
-    TextRange::new(start, end.max(start))
-}
-
 /// rustc's 1-based line and 1-based column in chars of a byte offset.
 fn line_col(text: &str, offset: u32) -> (usize, usize) {
     let offset = (offset as usize).min(text.len());
@@ -823,9 +810,9 @@ fn coroutine_desc(kind: HirClosureKind, ticks: bool) -> String {
                 CoroutineSource::Closure => "closure body",
                 CoroutineSource::Fn => "fn body",
             };
-            format!("{}{source}", desugaring(kind, ticks))
+            format!("{}{source}", desugaring(kind, ticks)) // alloc: a coroutine's kind printed, the edge
         }
-        _ => "coroutine".to_owned(),
+        _ => "coroutine".to_owned(), // alloc: a coroutine's kind printed, the edge
     }
 }
 
@@ -864,35 +851,43 @@ pub(super) fn string_with_limit(cx: &Cx<'_, '_>, ty: Ty<'_>, limit: usize, mode:
 /// `max(diagnostic_width / 4, 40)` bytes long with rustc's default width.
 pub(super) fn sort_string(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {
     let db = cx.db;
-    match ty.kind() {
-        TyKind::Foreign(it) => format!("extern type `{}`", path_string(cx, Def::TypeAlias(it.0), mode)),
-        TyKind::FnDef(def, _) => fn_def_kind(def).to_owned(),
-        TyKind::FnPtr(..) => "fn pointer".to_owned(),
+    let s = match ty.kind() {
+        TyKind::Foreign(it) => {
+            // alloc: a type's sort printed, the edge
+            return format!("extern type `{}`", path_string(cx, Def::TypeAlias(it.0), mode));
+        }
+        TyKind::FnDef(def, _) => fn_def_kind(def),
+        TyKind::FnPtr(..) => "fn pointer",
         TyKind::Dynamic(preds, _) if let Some(principal) = preds.principal() => {
-            format!("`dyn {}`", path_string(cx, Def::Trait(principal.skip_binder().def_id.0), mode))
+            // alloc: a type's sort printed, the edge
+            return format!("`dyn {}`", path_string(cx, Def::Trait(principal.skip_binder().def_id.0), mode));
         }
-        TyKind::Dynamic(..) => "trait object".to_owned(),
-        TyKind::Closure(..) => "closure".to_owned(),
-        TyKind::Coroutine(id, _) => coroutine_desc(id.0.loc(db).kind, true),
-        TyKind::CoroutineWitness(..) => "coroutine witness".to_owned(),
-        TyKind::Infer(InferTy::TyVar(_)) => "inferred type".to_owned(),
-        TyKind::Infer(InferTy::IntVar(_)) => "integer".to_owned(),
-        TyKind::Infer(InferTy::FloatVar(_)) => "floating-point number".to_owned(),
-        TyKind::Placeholder(..) => "placeholder type".to_owned(),
-        TyKind::Bound(..) => "bound type".to_owned(),
-        TyKind::Infer(InferTy::FreshTy(_)) => "fresh type".to_owned(),
-        TyKind::Infer(InferTy::FreshIntTy(_)) => "fresh integral type".to_owned(),
-        TyKind::Infer(InferTy::FreshFloatTy(_)) => "fresh floating-point type".to_owned(),
+        TyKind::Dynamic(..) => "trait object",
+        TyKind::Closure(..) => "closure",
+        TyKind::Coroutine(id, _) => return coroutine_desc(id.0.loc(db).kind, true),
+        TyKind::CoroutineWitness(..) => "coroutine witness",
+        TyKind::Infer(InferTy::TyVar(_)) => "inferred type",
+        TyKind::Infer(InferTy::IntVar(_)) => "integer",
+        TyKind::Infer(InferTy::FloatVar(_)) => "floating-point number",
+        TyKind::Placeholder(..) => "placeholder type",
+        TyKind::Bound(..) => "bound type",
+        TyKind::Infer(InferTy::FreshTy(_)) => "fresh type",
+        // hir's types as inference had them at an error hold an undecided literal's as these.
+        TyKind::Infer(InferTy::FreshIntTy(_)) => "integer",
+        TyKind::Infer(InferTy::FreshFloatTy(_)) => "floating-point number",
         TyKind::Alias(alias) if matches!(alias.kind, AliasTyKind::Projection { .. } | AliasTyKind::Inherent { .. }) => {
-            "associated type".to_owned()
+            "associated type"
         }
-        TyKind::Param(_) => format!("type parameter `{}`", string(cx, ty, mode)),
+        // alloc: a type's sort printed, the edge
+        TyKind::Param(_) => return format!("type parameter `{}`", string(cx, ty, mode)),
         TyKind::Alias(alias) if let AliasTyKind::Opaque { def_id } = alias.kind => {
-            if is_future(cx, def_id.0) { "future".to_owned() } else { "opaque type".to_owned() }
+            if is_future(cx, def_id.0) { "future" } else { "opaque type" }
         }
-        TyKind::Error(_) => "type error".to_owned(),
-        _ => format!("`{}`", string_with_limit(cx, ty, 40, mode)),
-    }
+        TyKind::Error(_) => "type error",
+        // alloc: a type's sort printed, the edge
+        _ => return format!("`{}`", string_with_limit(cx, ty, 40, mode)),
+    };
+    s.to_owned() // alloc: a type's sort printed, the edge
 }
 
 fn fn_def_kind(def: CallableIdWrapper) -> &'static str {
@@ -946,7 +941,7 @@ pub(super) fn prefix_string(cx: &Cx<'_, '_>, ty: Ty<'_>) -> String {
         },
         TyKind::Param(_) => "type parameter",
     };
-    s.to_owned()
+    s.to_owned() // alloc: a type's kind printed, the edge
 }
 
 /// Whether an opaque type is bounded by `Future`: rustc's `is_impl_trait_future`.

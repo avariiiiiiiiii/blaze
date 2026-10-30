@@ -71,7 +71,8 @@ use blaze_usercode::{
     trace::{Inputs, Names},
 };
 use hir_expand::proc_macro::{
-    ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacroLoadResult,
+    ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+    ProcMacroLoadResult,
 };
 use intern::Symbol;
 use load_cargo::{SubRequest, SubResponse};
@@ -401,16 +402,16 @@ impl Value {
                 _ = write!(out, "{line}:{column}");
             }
             Some(SubResponse::SourceTextResult { text: Some(text) }) => {
-                keyed::hex(&keyed::digest_bytes(text.as_bytes()), out);
+                blaze_format::hex::encode_into(&keyed::digest_bytes(text.as_bytes()), out);
             }
             Some(SubResponse::ByteRangeResult { range }) => {
                 _ = write!(out, "{}..{}", range.start, range.end);
             }
             Some(SubResponse::FilePathResult { name }) => {
-                keyed::hex(&keyed::digest_bytes(name.as_bytes()), out);
+                blaze_format::hex::encode_into(&keyed::digest_bytes(name.as_bytes()), out);
             }
             Some(SubResponse::LocalFilePathResult { name: Some(name) }) => {
-                keyed::hex(&keyed::digest_bytes(name.as_bytes()), out);
+                blaze_format::hex::encode_into(&keyed::digest_bytes(name.as_bytes()), out);
             }
             _ => out.push('-'),
         }
@@ -1352,7 +1353,7 @@ fn listing(path: &Path) -> Option<(Known, String)> {
     let (head, list) = rest.split_once('\n').unwrap_or((rest, ""));
     let (identity, stamped) = head.strip_prefix("@ ")?.split_once(' ')?;
     (stamp(path)? == stamped).then_some(())?;
-    let known = Known { digest: unhex(digest)?, identity: Some(unhex(identity)?) };
+    let known = Known { digest: blaze_format::hex::decode::<32>(digest)?, identity: Some(blaze_format::hex::decode::<32>(identity)?) };
     // The list is the text's tail: the head is cut off, and the text is the list.
     let at = text.len() - list.len();
     text.drain(..at);
@@ -1368,25 +1369,14 @@ fn list_known(path: &Path, digest: &[u8; 32], identity: &[u8; 32], text: &str) {
     let Some(stamp) = stamp(path) else { return };
     // alloc: setup, once a module: the list file's text.
     let mut file = String::with_capacity(2 * 64 + stamp.len() + text.len() + 5);
-    keyed::hex(digest, &mut file);
+    blaze_format::hex::encode_into(digest, &mut file);
     file.push_str("\n@ ");
-    keyed::hex(identity, &mut file);
+    blaze_format::hex::encode_into(identity, &mut file);
     file.push(' ');
     file.push_str(&stamp);
     file.push('\n');
     file.push_str(text);
     write_whole(&list_file(path), file.as_bytes());
-}
-
-fn unhex(text: &str) -> Option<[u8; 32]> {
-    let mut out = [0; 32];
-    if text.len() != 64 {
-        return None;
-    }
-    for (at, byte) in out.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(text.get(at * 2..at * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
 }
 
 /// What the module of `bytes` at `path` was built of, as the file beside it says, when that
@@ -1399,7 +1389,7 @@ fn made_of(path: &Path, bytes: &[u8]) -> Option<[u8; 32]> {
     let (key, file) = text.trim_end().split_once(' ')?;
     let mut identity = keyed::Key::new("a proc-macro module built of");
     identity.field(key.as_bytes());
-    keyed::is_hex(file, &keyed::digest_bytes(bytes)).then(|| identity.done())
+    blaze_format::hex::is_encoding(file, &keyed::digest_bytes(bytes)).then(|| identity.done())
 }
 
 /// What a module is told of a crate's environment ([`guest_env`]), on the stack: cargo sets
@@ -1536,7 +1526,8 @@ impl Shapes {
     }
 
     /// The output kept as [`Shapes::written`] wrote it, its parts this input's, put in `parts`.
-    fn read(&self, value: &[u8], parts: &mut Parts) -> Result<tt::TopSubtree, String> {
+    /// A tree off a 4-byte boundary is copied into `room`.
+    fn read(&self, value: &[u8], parts: &mut Parts, room: &mut Vec<u8>) -> Result<tt::TopSubtree, String> {
         let count = value.get(..4).map(|it| u32::from_le_bytes(it.try_into().unwrap()) as usize);
         let table = count.and_then(|count| value.get(4..4 + count.checked_mul(8)?));
         let Some(table) = table else { return Err("its table of span parts is cut short".into()) };
@@ -1554,7 +1545,7 @@ impl Shapes {
                 return Err(format!("its span part {at} is an earlier one again"));
             }
         }
-        wire::read(&value[4 + table.len()..], parts)
+        wire::read_in(&value[4 + table.len()..], parts, room)
     }
 }
 
@@ -1652,6 +1643,12 @@ fn real(root: Option<&Path>, path: &Path, real: &mut PathBuf) -> Result<bool, Un
 
 impl Inputs for Now<'_> {
     type Error = Unreadable;
+    fn entry(&mut self, path: &Path) -> Result<blaze_usercode::trace::Entry, Unreadable> {
+        match real(self.root, path, self.real)? {
+            true => self.machine.entry(self.real.as_path()),
+            false => Ok(blaze_usercode::trace::Entry::Missing),
+        }
+    }
 
     fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, Unreadable> {
         match real(self.root, path, self.real)? {
@@ -1790,6 +1787,8 @@ struct Scratch {
     parts: Parts,
     shapes: Shapes,
     kept: Parts,
+    /// Where a kept output off a 4-byte boundary is copied to be read.
+    aligned: Vec<u8>,
     room: Room,
 }
 
@@ -1838,7 +1837,7 @@ fn expand<'a>(
     };
     let (env, root) = guest_env(call.env);
     let mut scratch = Scratched::take();
-    let Scratch { parts, shapes, kept, room } = &mut scratch.0;
+    let Scratch { parts, shapes, kept, aligned, room } = &mut scratch.0;
     let sites = [call.def_site, call.call_site, call.mixed_site].map(|span| parts.pack(span));
     let mut input = Reused::take();
     let mut attr = Reused::take();
@@ -1870,6 +1869,7 @@ fn expand<'a>(
         None => tree,
     };
     let kept = std::cell::Cell::from_mut(kept);
+    let aligned = std::cell::Cell::from_mut(aligned);
     let found = match keeping {
         Some(keeping) => {
             let found = find_answered(
@@ -1884,7 +1884,9 @@ fn expand<'a>(
                     // Read in place, under the guard: a hit copies nothing out of the store.
                     Found::Hit { value, .. } if keeping.mode == Mode::Keep => {
                         let mut parts = kept.take();
-                        let read = shapes.read(value, &mut parts);
+                        let mut copy = aligned.take();
+                        let read = shapes.read(value, &mut parts, &mut copy);
+                        aligned.set(copy);
                         kept.set(parts);
                         Err(read)
                     }
@@ -2359,13 +2361,7 @@ impl ProcMacroExpander for Expander {
     fn expand(
         &self,
         db: &Db,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        _current_dir: String,
+        ProcMacroCall { subtree, attrs, env, def_site, call_site, mixed_site, .. }: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         if self.wasm.stateful() {
             return Err(ProcMacroExpansionError::System(
@@ -2388,26 +2384,12 @@ impl ProcMacroExpander for Expander {
         &self,
         db: &Db,
         calling_crate: base_db::Crate,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        current_dir: String,
+        call: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         if !self.wasm.stateful() {
-            return self.expand(
-                db,
-                subtree,
-                attrs,
-                env,
-                def_site,
-                call_site,
-                mixed_site,
-                current_dir,
-            );
+            return self.expand(db, call);
         }
+        let ProcMacroCall { subtree, attrs, env, def_site, call_site, mixed_site, .. } = call;
         // A new revision must rerun unchanged registrations before changed uses.
         db.report_untracked_read();
         let (nonce, revision) = db.nonce_and_revision();
@@ -2569,6 +2551,114 @@ mod tests {
         assert!(decode(&raw, sites).unwrap_err().contains("span parts"));
     }
 
+    /// What the bridge's host is given to ask, which a span function it answers alone never
+    /// asks.
+    struct Unasked;
+
+    impl native_proc_macro::__native::Ask for Unasked {
+        fn join(&mut self, _: Span, _: Span) -> Option<Span> {
+            panic!("`join` was asked")
+        }
+        fn parent(&mut self, _: Span) -> Option<Span> {
+            panic!("`parent` was asked")
+        }
+        fn source(&mut self, _: Span) -> Option<Span> {
+            panic!("`source` was asked")
+        }
+        fn subspan(&mut self, _: Span, _: u64, _: u64) -> Option<Span> {
+            panic!("`subspan` was asked")
+        }
+        fn byte_range(&mut self, _: Span) -> [u32; 2] {
+            panic!("`byte_range` was asked")
+        }
+        fn line_column(&mut self, _: Span) -> Option<(u32, u32)> {
+            panic!("`line_column` was asked")
+        }
+        fn file(&mut self, _: Span) -> Option<String> {
+            panic!("`file` was asked")
+        }
+        fn local_file(&mut self, _: Span) -> Option<String> {
+            panic!("`local_file` was asked")
+        }
+        fn source_text(&mut self, _: Span) -> Option<String> {
+            panic!("`source_text` was asked")
+        }
+        fn ts_from_str(&mut self, _: &mut Parts, _: &str, _: Span) -> Result<Vec<u8>, String> {
+            panic!("`ts_from_str` was asked")
+        }
+        fn literal_from_str(&mut self, _: &mut Parts, _: &str, _: Span) -> Option<Vec<u8>> {
+            panic!("`literal_from_str` was asked")
+        }
+    }
+
+    /// `resolved_at`, `located_at`, `start` and `end`, which the bridge's `Host` answers of its
+    /// parts without asking, give the word this host's function of the same name gives, for
+    /// every pair of words of one expansion: narrow, wide, of a fixup, of another context or
+    /// anchor, and words it never gave out.
+    #[test]
+    fn a_span_function_the_bridge_answers_alone_gives_the_wasm_hosts_word() {
+        let mut linker = Linker::new(engine());
+        add_host(&mut linker).unwrap();
+        let mut store = Store::new(engine(), State::empty());
+        let func = |store: &mut Store<State>, name: &str| {
+            linker.get(&mut *store, HOST, name).unwrap().into_func().expect("a function")
+        };
+        let resolved_at =
+            func(&mut store, "span_resolved_at").typed::<(u64, u64), u64>(&store).unwrap();
+        let located_at =
+            func(&mut store, "span_located_at").typed::<(u64, u64), u64>(&store).unwrap();
+        let start = func(&mut store, "span_start").typed::<u64, u64>(&store).unwrap();
+        let end = func(&mut store, "span_end").typed::<u64, u64>(&store).unwrap();
+
+        let file_id = EditionedFileId::new(span::FileId::from_raw(7), span::Edition::CURRENT);
+        let other = SyntaxContext::root(span::Edition::Edition2015);
+        let anchored = |ast_id| SpanAnchor { file_id, ast_id };
+        let spans = [
+            span(0, 1),
+            span(1, 2),
+            span(2, 3),
+            span(10, 20),
+            Span { ctx: other, ..span(4, 9) },
+            Span { anchor: anchored(ErasedFileAstId::from_raw(3)), ..span(30, 31) },
+            Span { anchor: anchored(FIXUP_ERASED_FILE_AST_ID_MARKER), ..span(5, 8) },
+            span(0x100, 0x100 + 0x2_0000),
+        ];
+        let mut parts = Parts::default();
+        // alloc: a test's words.
+        let mut words = Vec::new();
+        for it in spans {
+            let word = parts.pack(it);
+            assert_eq!(store.data_mut().parts.pack(it), word);
+            words.push(word);
+        }
+        // No span at all, and a narrow word of a part the expansion has not.
+        words.extend([NONE, 5 | u64::from(3u32 | 40 << 16) << 32]);
+        let sites = [words[0], words[1], words[2]];
+        store.data_mut().sites = sites;
+
+        let mut ask = Unasked;
+        let mut host = native_proc_macro::__native::Host { parts: &mut parts, sites, ask: &mut ask };
+        for &a in &words {
+            assert_eq!(host.span_start(a), start.call(&mut store, a).unwrap(), "start of {a:#x}");
+            assert_eq!(host.span_end(a), end.call(&mut store, a).unwrap(), "end of {a:#x}");
+            for &b in &words {
+                let wasm = resolved_at.call(&mut store, (a, b)).unwrap();
+                assert_eq!(host.span_resolved_at(a, b), wasm, "{a:#x} resolved at {b:#x}");
+                let wasm = located_at.call(&mut store, (a, b)).unwrap();
+                assert_eq!(host.span_located_at(a, b), wasm, "{a:#x} located at {b:#x}");
+            }
+        }
+        assert!(host.parts.all() == store.data().parts.all(), "the two made the same parts");
+        let moved = host.span_resolved_at(words[0], words[4]);
+        let moved = host.get(moved).unwrap();
+        assert_eq!((moved.range, moved.ctx), (spans[0].range, other));
+        let fixup = words[6];
+        assert_eq!(host.span_start(fixup), fixup);
+        let ended = host.span_end(words[3]);
+        let ended = host.get(ended).unwrap();
+        assert_eq!(ended.range, TextRange::empty(spans[3].range.end()));
+    }
+
     #[test]
     fn a_module_that_is_not_one_is_refused_unrun() {
         assert!(check_module(b"\0asm\x01\0\0\0").is_ok());
@@ -2658,7 +2748,7 @@ mod tests {
         assert_eq!(said_of(Value::ByteRange, Some(&range)), "2..7");
         let file = SubResponse::FilePathResult { name: "src/lib.rs".to_owned() };
         let mut digest = String::new();
-        keyed::hex(&keyed::digest_bytes(b"src/lib.rs"), &mut digest);
+        blaze_format::hex::encode_into(&keyed::digest_bytes(b"src/lib.rs"), &mut digest);
         assert_eq!(said_of(Value::File, Some(&file)), digest);
     }
 
@@ -2739,7 +2829,7 @@ mod tests {
             traced.files,
             [
                 (path("missing"), None),
-                (path("schema.json"), Some(*blake3::hash(b"1").as_bytes())),
+                (path("schema.json"), Some(blaze_ids::b3::hash(b"1"))),
             ]
         );
         let listing = blaze_usercode::trace::listing([OsStr::new("lib.rs")]);
@@ -2821,6 +2911,227 @@ mod tests {
         let mut room = Room::default();
         let mut now = now(Some(Path::new("/p")), &mut room);
         assert!(now.file(Path::new("/etc/passwd")).is_err());
+    }
+
+    /// A module whose one macro asks the host for its call site, joins it with itself and
+    /// gives back its input as it was given: the host's span parts, its read and write of
+    /// trees and calls into the module and out of it, with nothing of the guest's `proc_macro`.
+    fn echo_module() -> Vec<u8> {
+        fn name(text: &str) -> Vec<u8> {
+            let mut out = vec![text.len() as u8];
+            out.extend_from_slice(text.as_bytes());
+            out
+        }
+        fn section(id: u8, body: Vec<u8>) -> Vec<u8> {
+            assert!(body.len() < 128, "a length of one LEB128 byte");
+            let mut out = vec![id, body.len() as u8];
+            out.extend(body);
+            out
+        }
+        let (i32, i64) = (0x7f, 0x7e);
+        let types: [&[u8]; 5] = [
+            // 0: `output(ptr, len)`.
+            &[0x60, 2, i32, i32, 0],
+            // 1: `call_site() -> span`.
+            &[0x60, 0, 1, i64],
+            // 2: `span_join(a, b) -> span`.
+            &[0x60, 2, i64, i64, 1, i64],
+            // 3: `alloc(len) -> ptr`.
+            &[0x60, 1, i32, 1, i32],
+            // 4: `expand(index, attr_ptr, attr_len, ptr, len)`.
+            &[0x60, 5, i32, i32, i32, i32, i32, 0],
+        ];
+        let mut typed = vec![types.len() as u8];
+        for it in types {
+            typed.extend_from_slice(it);
+        }
+        let mut module = b"\0asm\x01\0\0\0".to_vec();
+        module.extend(section(1, typed));
+        let mut imports = vec![3];
+        for (field, ty) in [("output", 0), ("call_site", 1), ("span_join", 2)] {
+            imports.extend(name(HOST));
+            imports.extend(name(field));
+            imports.extend([0, ty]);
+        }
+        module.extend(section(2, imports));
+        // Functions 3 and 4, after the three imported.
+        module.extend(section(3, vec![2, 3, 4]));
+        module.extend(section(5, vec![1, 0, 1]));
+        let mut exported = vec![3];
+        for (field, kind, index) in [("memory", 2, 0), (exports::ALLOC, 0, 3), (exports::EXPAND, 0, 4)] {
+            exported.extend(name(field));
+            exported.extend([kind, index]);
+        }
+        module.extend(section(7, exported));
+        // `alloc`: 1024, where the one input goes. `expand`: `span_join(call_site(),
+        // call_site())`, dropped, then `output(ptr, len)`.
+        let alloc = [0, 0x41, 0x80, 0x08, 0x0b];
+        let expand = [0, 0x10, 1, 0x10, 1, 0x10, 2, 0x1a, 0x20, 3, 0x20, 4, 0x10, 0, 0x0b];
+        let mut code = vec![2, alloc.len() as u8];
+        code.extend(alloc);
+        code.push(expand.len() as u8);
+        code.extend(expand);
+        module.extend(section(10, code));
+        module
+    }
+
+    /// The echo module ([`echo_module`]) compiled, its path in `dir`.
+    fn echo(dir: &Path) -> &'static Wasm {
+        let path = dir.join("echo.wasm");
+        std::fs::write(&path, echo_module()).unwrap();
+        Wasm::at(&path, None).unwrap()
+    }
+
+    fn echoed() -> Listed {
+        Listed { kind: ProcMacroKind::Bang, name: "echo".to_owned(), helpers: Vec::new() }
+    }
+
+    /// How many allocations reading `input` back as an expansion's output takes, its parts
+    /// those `call`'s sites and input give: what the output owns.
+    fn owned_by_output(input: &tt::TopSubtree, call: &Call<'_>) -> u64 {
+        let mut parts = Parts::default();
+        for site in [call.def_site, call.call_site, call.mixed_site] {
+            parts.pack(site);
+        }
+        let mut bytes = Vec::new();
+        wire::relative(input, &mut parts, &mut bytes);
+        let (read, used) = blaze_alloc_count::measure(|| wire::read(&bytes, &parts));
+        assert!(read.unwrap() == *input);
+        used.allocations
+    }
+
+    #[test]
+    fn a_compiled_module_is_found_by_its_digest_with_no_allocation() {
+        let dir = scratch("found");
+        let wasm = echo(&dir);
+        let path = dir.join("echo.wasm");
+        let known = Known { digest: wasm.digest, identity: None };
+        let again = blaze_alloc_count::assert_at_most(0, "a compiled module found by its digest", || {
+            Wasm::known(&path, known, None, None)
+        });
+        assert!(std::ptr::eq(again.unwrap(), wasm), "the module compiled once");
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_warm_expansion_in_a_kept_session_allocates_only_its_output() {
+        let dir = scratch("session");
+        let wasm = echo(&dir);
+        let env = Env::default();
+        let mut session = wasm.session(&env).unwrap();
+        let listed = echoed();
+        let input = tokens("a + (b, 1) \"s\"", span(4, 18)).unwrap();
+        let call = Call {
+            subtree: &input,
+            attrs: None,
+            env: &env,
+            def_site: span(0, 1),
+            call_site: span(1, 2),
+            mixed_site: span(2, 3),
+        };
+        // Warms the session's span parts, this thread's buffers and the module's memory.
+        for _ in 0..2 {
+            let out = session.expand(0, &listed, None, &call).output.unwrap();
+            assert!(out == input, "{out} came back of {input}");
+        }
+        let owned = owned_by_output(&input, &call);
+        let ran = blaze_alloc_count::assert_at_most(owned, "a warm expansion in a kept session", || {
+            session.expand(0, &listed, None, &call)
+        });
+        assert!(ran.output.unwrap() == input);
+        assert!(!ran.found && !ran.retained);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store in `sim`, open and ready, and what reads it for an expansion.
+    fn kept_in(sim: &mut blaze_core::sim::Sim) -> blaze_cas::Store {
+        let mut effects = Vec::new();
+        let config = blaze_cas::Config {
+            dir: blaze_core::FileName::new("store").unwrap(),
+            layers: Vec::new(),
+            tags: 1 << 48,
+        };
+        let mut store = blaze_cas::Store::open(config, &mut effects);
+        blaze_core::run_until_idle(sim, &mut effects, |completion, effects| {
+            store.complete(completion, effects);
+        });
+        assert!(store.ready());
+        store
+    }
+
+    fn keeping_in(store: &blaze_cas::Store) -> blaze_expand::Keeping {
+        let expansions = blaze_expand::Expansions {
+            store: store.reader(),
+            toolchain: ContentId::default(),
+            environment: Arc::new(proc_macro_api::warm::Environment::default()),
+        };
+        blaze_expand::Keeping { expansions: Box::leak(Box::new(expansions)), mode: Mode::Keep }
+    }
+
+    /// A kept expansion that read a file of its package, a variable and the line of a span is
+    /// found again with nothing allocated but its output, its span parts this call's, each
+    /// input looked up where it is and the span's question answered into reused room. When
+    /// the store has the output's bytes off a 4-byte boundary, the bridge copies them first.
+    #[cfg(unix)]
+    #[test]
+    fn a_kept_expansion_is_found_with_nothing_allocated_but_its_output() {
+        let dir = scratch("hit");
+        let wasm = echo(&dir);
+        let package = dir.join("package");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(package.join("schema.json"), "1").unwrap();
+        let mut env = Env::default();
+        env.set("CARGO_MANIFEST_DIR", package.to_str().unwrap());
+        env.set("CARGO_PKG_NAME", "pkg");
+        let listed = echoed();
+        let input = tokens("a + (b, 1) \"s\"", span(4, 18)).unwrap();
+        let call = Call {
+            subtree: &input,
+            attrs: None,
+            env: &env,
+            def_site: span(0, 1),
+            call_site: span(1, 2),
+            mixed_site: span(2, 3),
+        };
+        let code = code(&wasm.digest);
+        let module = || Ok::<_, String>(wasm);
+        let mut sim = blaze_core::sim::Sim::new(5, blaze_core::sim::Faults::default());
+        let mut store = kept_in(&mut sim);
+        // A miss runs the module and leaves what it made to keep.
+        let ran = expand(Some(keeping_in(&store)), &code, &module, 0, &listed, None, &call);
+        assert!(ran.output.unwrap() == input && !ran.found);
+        let put = blaze_expand::take_puts().into_iter().find(|it| it.run.code == code).unwrap();
+        // Kept as having read more than the echo does, so the hit looks each up.
+        let question = read_of(Value::LineColumn, [0, 1, 0, 0]);
+        let mut traced = Traced {
+            files: vec![(Path::new(wasi::PACKAGE).join("schema.json"), Some(blaze_ids::b3::hash(b"1")))],
+            env: vec![
+                ("CARGO_PKG_NAME".into(), Some("pkg".into())),
+                (question.into(), Some("-".into())),
+            ],
+            ..Traced::default()
+        };
+        blaze_usercode::trace::normalize(&mut traced);
+        index::keep(&mut store, &put.run, &traced, put.value).unwrap();
+        let keeping = Some(keeping_in(&store));
+        let hit = || expand(keeping, &code, &module, 0, &listed, None, &call);
+        // Warms this thread's scratch, buffers and file stamps.
+        let first = hit();
+        assert!(first.found, "the kept expansion is found");
+        assert!(first.output.unwrap() == input);
+        let owned = owned_by_output(&input, &call);
+        // A tree off a 4-byte boundary is copied into the scratch the first hit grew.
+        let ran = blaze_alloc_count::assert_at_most(owned, "a kept expansion found", hit);
+        assert!(ran.found && ran.output.unwrap() == input);
+        // What it read changed: then it is no hit.
+        std::fs::write(package.join("schema.json"), "22").unwrap();
+        let later = std::time::SystemTime::now() + Duration::from_secs(5);
+        let file = std::fs::File::options().write(true).open(package.join("schema.json")).unwrap();
+        file.set_modified(later).unwrap();
+        let ran = expand(keeping, &code, &module, 0, &listed, None, &call);
+        assert!(!ran.found && ran.output.unwrap() == input);
+        _ = blaze_expand::take_puts();
+        _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

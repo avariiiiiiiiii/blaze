@@ -78,10 +78,16 @@ incremental tests do (`log_executed`, counting `infer_body_query` and `borrowck`
 - adding an impl of a trait for a type no other body asks about re-infers no body;
 - adding a struct, an enum with `#[derive(Default)]`, or a function re-infers no body;
 - adding a `use` of a struct, in the bodies' own module or another, re-infers no body;
-- adding a `use` of a trait in another module re-infers no body of this one (in the same
-  module it re-infers that module's bodies until R4 lands; the test says so and is the one to
-  flip when it does);
-- dropping an item a body names re-infers that body (the cutoff is not a blind one).
+- adding an unresolved `use` re-infers no body (it is a def map diagnostic only);
+- adding a trait, or a `use` of one, re-infers no body of another module. In its own module it
+  re-infers at most that module's bodies: inference reads the module's traits in scope as one
+  set when it starts (`infer.rs`, `traits_in_scope: resolver.traits_in_scope(db)`), which R4
+  narrows to the traits with an item of each name probed;
+- editing a crate a body depends on, away from the items it names, re-infers no body of the
+  dependent crate;
+- changing the signature of a function a body calls re-infers that body, and dropping an impl a
+  body calls into re-infers it (the cutoff is not a blind one);
+- a warm check of every body (all memo hits) allocates nothing (`blaze_alloc_count`).
 
 ### Prior art
 
@@ -116,7 +122,7 @@ Child `frontend-fast-bodies-tasks` ([fast-bodies-tasks.md](fast-bodies-tasks.md)
   until then, and unreached bodies fill idle cores while codegen runs. The cost over
   "reached only" is total work, not latency: the unreached bodies' checks run off the critical
   path. The one body not checked is one whose outcome is read from the global cache (part 3),
-  which is the same outcome. Sent to `frontend-fast` as an objection (`v2/requests/frontend-fast-bodies.md`).
+  which is the same outcome. Sent to `frontend-fast` as an objection (`v2/requests/frontend-fast.md`).
 
 ## 3. Dependencies checked once for everyone
 
@@ -137,9 +143,15 @@ Child `frontend-fast-bodies-cache` ([fast-bodies-cache.md](fast-bodies-cache.md)
 ## Proof
 
 - `crates/hir/src/tests/bodies.rs`: the incremental tests above, one per kind of edit.
-- `harness/v2/frontend/cases/bodies/`: programs whose outcome depends on which bodies are
-  checked and when: errors in bodies nothing reaches (rustc rejects them, so blaze must),
-  errors in a body reached only through a function pointer, a trait object, a `const`, a
-  `static`, a generic instance or a closure, and accepted programs whose unreached bodies are
-  well-typed. `frontend-fast-diff`'s harness runs them through rustc and blaze.
+- `harness/v2/frontend/cases/bodies/` (58 cases): programs whose outcome depends on which
+  bodies are checked and when. Errors in bodies nothing reaches, which rustc rejects (type
+  errors, borrow errors, exhaustiveness, resolution, in free functions, methods, trait
+  defaults, `Drop` impls, generic functions never instantiated, closures, nested and `async`
+  functions, consts, statics, discriminants and associated consts); errors in bodies reached
+  only through a function pointer or a trait object; the one kind of error that does depend on
+  reachability, a post-monomorphization const panic, rejected when instantiated (040) and
+  accepted when not (041); and accepted programs: `cfg`'d-out bodies, macros never expanded,
+  unreached bodies that only warn, and bodies reached through a function pointer, a trait
+  object, a generic instance, a returned closure, const evaluation, a static, `Drop` and an
+  operator impl. `frontend-fast-diff`'s harness runs them through rustc and blaze.
 - The children's tests, named in their notes.

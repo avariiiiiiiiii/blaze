@@ -17,12 +17,16 @@
 
 use std::hash::{BuildHasher, Hash};
 
+use blaze_mem::Frame;
 use hashbrown::HashTable;
-use hir::{HirFileId, InFile, ModuleSource};
+use hir::{HirFileId, InFile, view::ModuleSourceView};
 use intern::{Symbol, sym};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use smallvec::SmallVec;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _, Node},
+};
 
 use super::{
     attr::{self, Deprecation, Stability},
@@ -68,14 +72,14 @@ impl Slots {
 /// A definition's node: its file and where in it.
 type Key = InFile<SyntaxNodePtr>;
 
-/// A hash-once memo table: 8 bytes of slots per key, one probe a lookup.
-struct Memo<K> {
-    table: HashTable<(K, Slots)>,
+/// A hash-once memo table in the check's frame: 8 bytes of slots per key, one probe a lookup.
+struct Memo<'f, K> {
+    table: HashTable<(K, Slots), &'f Frame>,
 }
 
-impl<K: Hash + Eq + Copy> Memo<K> {
-    fn new() -> Memo<K> {
-        Memo { table: HashTable::new() }
+impl<'f, K: Hash + Eq + Copy> Memo<'f, K> {
+    fn new(frame: &'f Frame) -> Memo<'f, K> {
+        Memo { table: HashTable::new_in(frame) }
     }
 
     fn hash(key: &K) -> u64 {
@@ -98,30 +102,33 @@ impl<K: Hash + Eq + Copy> Memo<K> {
     }
 }
 
+/// The index's tables live in the check's frame and go with it; nothing in them is part of a
+/// `Found`.
 pub(super) struct Index<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
-    pub(super) entries: Vec<Entry>,
-    pub(super) stabilities: Vec<Stability>,
-    nodes: Memo<Key>,
+    pub(super) entries: Vec<Entry, &'b Frame>,
+    pub(super) stabilities: Vec<Stability, &'b Frame>,
+    nodes: Memo<'b, Key>,
     /// Of a definition: its deprecation, and its stability when rustc checks it across
     /// crates (public, of another crate with `staged_api`).
-    defs: Memo<Def>,
-    macros: Memo<hir::Macro>,
+    defs: Memo<'b, Def>,
+    macros: Memo<'b, hir::Macro>,
     staged: FxHashMap<hir::Crate, bool>,
-    enabled: HashTable<(Symbol, bool)>,
+    enabled: HashTable<(Symbol, bool), &'b Frame>,
 }
 
 impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
     pub(super) fn new(cx: &'a Cx<'b, 'db>) -> Self {
+        let frame = cx.frame();
         Index {
             cx,
-            entries: Vec::new(),
-            stabilities: Vec::new(),
-            nodes: Memo::new(),
-            defs: Memo::new(),
-            macros: Memo::new(),
+            entries: Vec::new_in(frame),
+            stabilities: Vec::new_in(frame),
+            nodes: Memo::new(frame),
+            defs: Memo::new(frame),
+            macros: Memo::new(frame),
             staged: FxHashMap::default(),
-            enabled: HashTable::new(),
+            enabled: HashTable::new_in(frame),
         }
     }
 
@@ -153,13 +160,13 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
         if known != UNKNOWN {
             return decode(known);
         }
-        let node = self.cx.syntax(ptr);
+        let node = self.cx.syntax_view(ptr);
         self.deprecation_at(node, self.cx.krate)
     }
 
     /// `lookup_deprecation_entry` of the definition of `krate` at `node`: up its parents to
     /// the first known or with an attribute, then that answer kept for each node passed.
-    fn deprecation_at(&mut self, node: InFile<SyntaxNode>, krate: hir::Crate) -> Option<Id> {
+    fn deprecation_at(&mut self, node: InFile<Node<'db>>, krate: hir::Crate) -> Option<Id> {
         let cx = self.cx;
         let staged = self.staged(krate);
         let cfg = krate.cfg(cx.db);
@@ -167,18 +174,18 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
         let mut at = Some(node);
         let found = loop {
             let Some(node) = at else { break NONE };
-            let key = node.as_ref().map(SyntaxNodePtr::new);
+            let key = node.map(ast::ptr);
             let hash = Memo::hash(&key);
             let known = self.nodes.get(hash, &key).depr;
             if known != UNKNOWN {
                 break known;
             }
             passed.push((hash, key));
-            if let Some(depr) = own(cx, &node, |it| attr::deprecation(it, cfg, staged)) {
+            if let Some(depr) = own(cx, node, |it| attr::deprecation(it, cfg, staged)) {
                 self.entries.push(Entry { depr, local: krate == cx.krate });
                 break (self.entries.len() - 1) as u32;
             }
-            at = attr_parent(cx, node.clone()).or_else(|| crate_root(cx, &node, krate));
+            at = attr_parent(cx, node).or_else(|| crate_root(cx, node, krate));
         };
         for (hash, key) in passed {
             self.nodes.set(hash, key, |it| it.depr = found);
@@ -235,7 +242,7 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
         if let (Some(node), Some(krate)) = (def.source(cx), def.krate(cx.db)) {
             let staged = self.staged(krate);
             let cfg = krate.cfg(cx.db);
-            if let Some(depr) = attr::deprecation(&node.value, cfg, staged) {
+            if let Some(depr) = attr::deprecation(node.value, cfg, staged) {
                 self.entries.push(Entry { depr, local: false });
                 slot = (self.entries.len() - 1) as u32;
             }
@@ -257,7 +264,7 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
         let mut slot = NONE;
         if let (Some(node), Some(krate)) = (def.source(cx), def.krate(cx.db))
             && self.staged(krate)
-            && let Some(stability) = attr::stability(&node.value, krate.cfg(cx.db))
+            && let Some(stability) = attr::stability(node.value, krate.cfg(cx.db))
             && stability.is_unstable()
         {
             self.stabilities.push(stability);
@@ -308,33 +315,44 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
             .then_some(id)
     }
 
+    /// `lookup_stability` of `def`, of this crate or another, public or not: none unless its
+    /// crate is compiled with `staged_api`.
+    pub(super) fn stability(&mut self, def: Def) -> Option<Id> {
+        let cx = self.cx;
+        let krate = def.krate(cx.db)?;
+        if !self.staged(krate) {
+            return None;
+        }
+        self.stability_at(def.source(cx)?, krate)
+    }
+
     /// `lookup_stability` of a definition of this crate, staged, at `ptr`.
     pub(super) fn local_stability(&mut self, ptr: Key) -> Option<Id> {
         let known = self.nodes.get(Memo::hash(&ptr), &ptr).stab;
         if known != UNKNOWN {
             return decode(known);
         }
-        let node = self.cx.syntax(ptr);
+        let node = self.cx.syntax_view(ptr);
         self.stability_at(node, self.cx.krate)
     }
 
     /// `lookup_stability` of the definition of `krate`, staged, at `node`: up its parents to
     /// the first known or with an attribute, then down again with rustc's inheritance (an
     /// unstable parent's stability, or any of a field's or a variant's).
-    fn stability_at(&mut self, node: InFile<SyntaxNode>, krate: hir::Crate) -> Option<Id> {
+    fn stability_at(&mut self, node: InFile<Node<'db>>, krate: hir::Crate) -> Option<Id> {
         let cx = self.cx;
         let cfg = krate.cfg(cx.db);
         let mut passed: SmallVec<[(u64, Key, bool); 8]> = SmallVec::new();
         let mut at = Some(node);
         let mut value = loop {
             let Some(node) = at else { break NONE };
-            let key = node.as_ref().map(SyntaxNodePtr::new);
+            let key = node.map(ast::ptr);
             let hash = Memo::hash(&key);
             let known = self.nodes.get(hash, &key).stab;
             if known != UNKNOWN {
                 break known;
             }
-            if let Some(stability) = own(cx, &node, |it| attr::stability(it, cfg)) {
+            if let Some(stability) = own(cx, node, |it| attr::stability(it, cfg)) {
                 self.stabilities.push(stability);
                 let id = (self.stabilities.len() - 1) as u32;
                 self.nodes.set(hash, key, |it| it.stab = id);
@@ -342,7 +360,7 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
             }
             let inherits = matches!(node.value.kind(), SyntaxKind::RECORD_FIELD | SyntaxKind::TUPLE_FIELD | SyntaxKind::VARIANT);
             passed.push((hash, key, inherits));
-            at = attr_parent(cx, node.clone()).or_else(|| crate_root(cx, &node, krate));
+            at = attr_parent(cx, node).or_else(|| crate_root(cx, node, krate));
         };
         for (hash, key, inherits) in passed.into_iter().rev() {
             if value != NONE && !inherits && !self.stabilities[value as usize].is_unstable() {
@@ -356,12 +374,13 @@ impl<'a, 'b, 'db> Index<'a, 'b, 'db> {
 
 /// Whether this crate enables `feature`, kept in `enabled`. A hit clones no `Symbol` (no
 /// shared refcount written).
-fn enabled_in(cx: &Cx<'_, '_>, enabled: &mut HashTable<(Symbol, bool)>, feature: &Symbol) -> bool {
+fn enabled_in(cx: &Cx<'_, '_>, enabled: &mut HashTable<(Symbol, bool), &Frame>, feature: &Symbol) -> bool {
     let hash = FxBuildHasher.hash_one(feature);
     if let Some((_, it)) = enabled.find(hash, |(it, _)| it == feature) {
         return *it;
     }
     let it = cx.krate.is_unstable_feature_enabled(cx.db, feature);
+    // clone: the miss, once per distinct feature a use asks about; the table keeps its own `Symbol`
     enabled.insert_unique(hash, (feature.clone(), it), |(it, _)| FxBuildHasher.hash_one(it));
     it
 }
@@ -376,10 +395,10 @@ fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: 
     let ctxt = file.span_map(db).span_for_range(range).ctx;
     let Some(call) = ctxt.outer_expn(db) else { return false };
     let def = hir_expand::MacroCallId::from(call).loc(db).def;
-    let node: SyntaxNode = match def.kind {
+    let node: Node<'_> = match def.kind {
         MacroDefKind::Declarative(..) | MacroDefKind::ProcMacro(..) => match def.ast_id() {
-            either::Either::Left(id) => id.to_node(db).syntax().clone(),
-            either::Either::Right(id) => id.to_node(db).syntax().clone(),
+            either::Either::Left(id) => id.to_view(db).syntax(),
+            either::Either::Right(id) => id.to_view(db).syntax(),
         },
         MacroDefKind::BuiltIn(..)
         | MacroDefKind::BuiltInAttr(..)
@@ -387,31 +406,31 @@ fn allows_unstable(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange, feature: 
         | MacroDefKind::BuiltInEager(..)
         | MacroDefKind::UnimplementedBuiltIn(..) => return true,
     };
-    attr::allows_internal_unstable(&node, hir::Crate::from(def.krate).cfg(db), feature)
+    attr::allows_internal_unstable(node, hir::Crate::from(def.krate).cfg(db), feature)
 }
 
 /// What `read` finds in the attributes of the definition at `node`: a `mod foo;`'s, then
 /// those its file starts with.
-fn own<T>(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, read: impl Fn(&SyntaxNode) -> Option<T>) -> Option<T> {
-    if let Some(found) = read(&node.value) {
+fn own<'db, T>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>, read: impl Fn(Node<'db>) -> Option<T>) -> Option<T> {
+    if let Some(found) = read(node.value) {
         return Some(found);
     }
     if node.value.kind() != SyntaxKind::MODULE {
         return None;
     }
-    let module = ast::Module::cast(node.value.clone())?;
+    let module = ast::Module::cast(node.value)?;
     if module.item_list().is_some() {
         return None;
     }
-    let def = cx.sema.to_def2(node.with_value(&module))?;
-    match def.definition_source(cx.db).value {
-        ModuleSource::SourceFile(file) => read(file.syntax()),
+    let def = cx.vsema.to_def(module)?;
+    match def.definition_source_view(cx.db).value {
+        ModuleSourceView::SourceFile(file) => read(file.syntax()),
         _ => None,
     }
 }
 
 /// The crate root of `krate`, as the parent of `node` that has no other.
-fn crate_root(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, krate: hir::Crate) -> Option<InFile<SyntaxNode>> {
-    let root = krate.root_module(cx.db).definition_source(cx.db).map(|it| it.node());
-    (root != *node).then_some(root)
+fn crate_root<'db>(cx: &Cx<'_, 'db>, node: InFile<Node<'db>>, krate: hir::Crate) -> Option<InFile<Node<'db>>> {
+    let root = krate.root_module(cx.db).definition_source_view(cx.db).map(|it| it.node());
+    (root != node).then_some(root)
 }

@@ -14,8 +14,9 @@
 use std::collections::BTreeMap;
 
 use blaze_ids::radix;
+use blaze_mem::Frame;
 use hir::InFile;
-use rustc_hash::FxHashMap;
+use rustc_hash::FxBuildHasher;
 use span::Edition;
 use syntax::{SyntaxKind, SyntaxNodePtr};
 use unicode_security::{
@@ -40,11 +41,13 @@ pub(super) fn lints(cx: &Cx<'_, '_>, symbols: Vec<Symbol<'_>>, krate: InFile<Syn
             source_fact(cx, &mut diag, krate);
             Emitted::new(diag, Phase::Resolve, Pass::Early, krate)
         })
+        // alloc: one per lint found; empty allocates nothing
         .collect()
 }
 
 /// The diagnostics of [`lints`], in the order rustc emits them.
 fn diags(cx: &Cx<'_, '_>, symbols: &[Symbol<'_>]) -> Vec<Diag> {
+    // alloc: empty until a lint fires; holds only what fires
     let mut out = Vec::new();
     let mut has_non_ascii = false;
     for symbol in symbols {
@@ -54,11 +57,13 @@ fn diags(cx: &Cx<'_, '_>, symbols: &[Symbol<'_>]) -> Vec<Diag> {
         }
         has_non_ascii = true;
         let span = symbol.place.span(cx);
+        // clone: a lint's span, for a lint found
         out.push(Diag::lint("non_ascii_idents", "identifier contains non-ASCII characters", span.clone()));
         if name.chars().all(GeneralSecurityProfile::identifier_allowed) {
             continue;
         }
         for (codepoints, kind) in uncommon(name) {
+            // clone: a lint's span, for a lint found
             let mut diag = Diag::lint("uncommon_codepoints", uncommon_message(&codepoints, kind), span.clone());
             diag.note(uncommon_note(codepoints.len(), kind));
             out.push(diag);
@@ -67,29 +72,35 @@ fn diags(cx: &Cx<'_, '_>, symbols: &[Symbol<'_>]) -> Vec<Diag> {
     if !has_non_ascii {
         return out;
     }
-    for (existing, symbol) in confusables(symbols) {
+    for (existing, symbol) in confusables(cx.frame(), symbols) {
         let (existing, symbol) = (&symbols[existing], &symbols[symbol]);
         let existing_name = ident_string(&existing.name, cx.edition);
         let span = symbol.place.span(cx);
         let mut diag = Diag::lint(
             "confusable_idents",
+            // alloc: the lint's text, for a lint found
             format!(
                 "found both `{existing_name}` and `{}` as identifiers, which look alike",
                 ident_string(&symbol.name, cx.edition)
             ),
+            // clone: a lint's span, for a lint found
             span.clone(),
         );
         diag.span_label(existing.place.span(cx), "other identifier used here");
+        // alloc: the lint's text, for a lint found
         diag.span_label(span, format!("this identifier can be confused with `{existing_name}`"));
         out.push(diag);
     }
     for (symbol, set, chars) in mixed_script_confusables(symbols) {
+        // alloc: the lint's text, for a lint found
         let includes: Vec<String> = chars.iter().map(|&c| format!("'{c}' (U+{:04X})", c as u32)).collect();
         let mut diag = Diag::lint(
             "mixed_script_confusables",
+            // alloc: the lint's text, for a lint found
             format!("the usage of Script Group `{set}` in this crate consists solely of mixed script confusables"),
             symbols[symbol].place.span(cx),
         );
+        // alloc: the lint's text, for a lint found
         diag.note(format!("the usage includes {}", includes.join(", ")));
         diag.note("please recheck to make sure their usages are indeed what you want");
         out.push(diag);
@@ -125,7 +136,9 @@ impl Uncommon {
 /// the general security profile does not allow.
 fn uncommon(name: &str) -> Vec<(Vec<char>, Uncommon)> {
     let mut chars: Vec<(char, Option<IdentifierType>)> =
+        // alloc: only for an identifier `uncommon_codepoints` fires on
         name.chars().map(|c| (c, GeneralSecurityProfile::identifier_type(c))).collect();
+    // alloc: only for an identifier `uncommon_codepoints` fires on
     let mut groups = Vec::new();
     for (ty, kind) in [
         (IdentifierType::Exclusion, Uncommon::Exclusion),
@@ -147,6 +160,7 @@ fn uncommon(name: &str) -> Vec<(Vec<char>, Uncommon)> {
 
 /// Takes the characters of `chars` that `take` picks out, in order (`Vec::extract_if`).
 fn extract(chars: &mut Vec<(char, Option<IdentifierType>)>, take: impl Fn(&(char, Option<IdentifierType>)) -> bool) -> Vec<char> {
+    // alloc: only for an identifier `uncommon_codepoints` fires on
     let mut taken = Vec::new();
     chars.retain(|it| match take(it) {
         true => {
@@ -161,18 +175,30 @@ fn extract(chars: &mut Vec<(char, Option<IdentifierType>)>, take: impl Fn(&(char
 fn uncommon_message(codepoints: &[char], kind: Uncommon) -> String {
     let n = codepoints.len();
     let what = match (n, kind) {
+        // alloc: the lint's text, for a lint found
         (1, Uncommon::Exclusion) => "a character from an archaic script".to_owned(),
+        // alloc: the lint's text, for a lint found
         (1, Uncommon::Technical) => "a character that is for non-linguistic, specialized usage".to_owned(),
+        // alloc: the lint's text, for a lint found
         (1, Uncommon::LimitedUse) => "a character from a script in limited use".to_owned(),
+        // alloc: the lint's text, for a lint found
         (1, Uncommon::NotNfkc) => "a non normalized (NFKC) character".to_owned(),
+        // alloc: the lint's text, for a lint found
         (1, Uncommon::Restricted) => "an uncommon character".to_owned(),
+        // alloc: the lint's text, for a lint found
         (_, Uncommon::Exclusion) => format!("{n} characters from archaic scripts"),
+        // alloc: the lint's text, for a lint found
         (_, Uncommon::Technical) => format!("{n} characters that are for non-linguistic, specialized usage"),
+        // alloc: the lint's text, for a lint found
         (_, Uncommon::LimitedUse) => format!("{n} characters from scripts in limited use"),
+        // alloc: the lint's text, for a lint found
         (_, Uncommon::NotNfkc) => format!("{n} non normalized (NFKC) characters"),
+        // alloc: the lint's text, for a lint found
         (_, Uncommon::Restricted) => "uncommon characters".to_owned(),
     };
+    // alloc: the lint's text, for a lint found
     let listed: Vec<String> = codepoints.iter().map(|c| format!("{c:?}")).collect();
+    // alloc: the lint's text, for a lint found
     format!("identifier contains {what}: {}", and_list(&listed))
 }
 
@@ -182,7 +208,9 @@ fn uncommon_note(n: usize, kind: Uncommon) -> String {
         _ => "these characters are",
     };
     match kind {
+        // alloc: the lint's text, for a lint found
         Uncommon::Restricted => format!("{these} included in the Unicode general security profile"),
+        // alloc: the lint's text, for a lint found
         _ => format!("{these} included in the {} Unicode general security profile", kind.name()),
     }
 }
@@ -191,9 +219,13 @@ fn uncommon_note(n: usize, kind: Uncommon) -> String {
 /// "a, b, and c".
 fn and_list(items: &[String]) -> String {
     match items {
+        // alloc: the lint's text, for a lint found
         [] => String::new(),
+        // clone: the lint's text, for a lint found
         [one] => one.clone(),
+        // alloc: the lint's text, for a lint found
         [a, b] => format!("{a} and {b}"),
+        // alloc: the lint's text, for a lint found
         [init @ .., last] => format!("{}, and {last}", init.join(", ")),
     }
 }
@@ -204,7 +236,9 @@ fn ident_string(name: &str, edition: Edition) -> String {
     let raw = SyntaxKind::from_keyword(name, edition).is_some()
         && !matches!(name, "_" | "crate" | "self" | "Self" | "super");
     match raw {
+        // alloc: the lint's text, for a lint found
         true => format!("r#{name}"),
+        // alloc: the lint's text, for a lint found
         false => name.to_owned(),
     }
 }
@@ -212,10 +246,11 @@ fn ident_string(name: &str, edition: Edition) -> String {
 /// The pairs `confusable_idents` gives, by index in `symbols`: (the symbol it is confused
 /// with, the symbol it is given at). A symbol is confused with the first of the same skeleton
 /// unless both are ASCII; a non-ASCII symbol then takes an ASCII one's place.
-fn confusables(symbols: &[Symbol<'_>]) -> Vec<(usize, usize)> {
-    let mut by_skeleton: FxHashMap<String, (usize, bool)> = FxHashMap::default();
-    by_skeleton.reserve(symbols.len());
-    let mut pairs = Vec::new();
+fn confusables<'f>(frame: &'f Frame, symbols: &[Symbol<'_>]) -> Vec<(usize, usize), &'f Frame> {
+    let mut by_skeleton: hashbrown::HashMap<&'f str, (usize, bool), FxBuildHasher, &'f Frame> =
+        hashbrown::HashMap::with_capacity_and_hasher_in(symbols.len(), FxBuildHasher, frame);
+    let mut pairs = Vec::new_in(frame);
+    // alloc: one buffer for the crate, reused across its symbols
     let mut buf = String::new();
     for (index, symbol) in symbols.iter().enumerate() {
         let is_ascii = symbol.name.is_ascii();
@@ -232,7 +267,7 @@ fn confusables(symbols: &[Symbol<'_>]) -> Vec<(usize, usize)> {
                 }
             }
             None => {
-                by_skeleton.insert(buf.clone(), (index, is_ascii));
+                by_skeleton.insert(frame.alloc_str(&buf), (index, is_ascii));
             }
         }
     }
@@ -251,6 +286,7 @@ enum Usage {
 /// symbols' places.
 fn mixed_script_confusables(symbols: &[Symbol<'_>]) -> Vec<(usize, AugmentedScriptSet, Vec<char>)> {
     // In the order first seen, as rustc's `FxIndexMap`; Latin is always verified.
+    // alloc: setup, once per crate with a non-ASCII identifier; one entry per script set
     let mut states: Vec<(AugmentedScriptSet, Usage)> = vec![(AugmentedScriptSet::for_char('A'), Usage::Verified)];
     let mut has_suspicious = false;
     for (index, symbol) in symbols.iter().enumerate() {
@@ -274,6 +310,7 @@ fn mixed_script_confusables(symbols: &[Symbol<'_>]) -> Vec<(usize, AugmentedScri
                         false => Usage::Verified,
                         true => {
                             has_suspicious = true;
+                            // alloc: once per script set, a handful per crate
                             Usage::Suspicious(vec![ch], index)
                         }
                     };
@@ -283,11 +320,13 @@ fn mixed_script_confusables(symbols: &[Symbol<'_>]) -> Vec<(usize, AugmentedScri
         }
     }
     if !has_suspicious {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let verified: Vec<AugmentedScriptSet> = states
         .iter()
         .filter_map(|(set, state)| matches!(state, Usage::Verified).then_some(*set))
+        // alloc: once per crate with a suspicious script set; one entry per script set
         .collect();
     let mut reports: BTreeMap<(Order, Vec<char>), (usize, AugmentedScriptSet)> = BTreeMap::new();
     'sets: for (set, state) in states {
@@ -309,6 +348,7 @@ fn mixed_script_confusables(symbols: &[Symbol<'_>]) -> Vec<(usize, AugmentedScri
         chars.dedup();
         reports.insert((symbols[symbol].order, chars), (symbol, set));
     }
+    // alloc: one per lint found
     reports.into_iter().map(|((_, chars), (symbol, set))| (symbol, set, chars)).collect()
 }
 

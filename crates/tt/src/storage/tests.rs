@@ -376,6 +376,15 @@ fn check(tokens: &[TokenTree], rng: &mut SplitMix64) -> TopSubtree {
     assert!(all.try_into_subtree().is_some());
     assert_eq!(TopSubtree::from_subtree(tree.view()), tree);
     assert_eq!(TopSubtree::from_token_trees(tree.top_subtree().delimiter, inner), tree);
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        let framed = TopSubtree::from_serialized_in(tokens.to_vec(), frame);
+        assert_eq!(framed.block(), tree.block(), "built in a frame");
+        assert!(framed == tree && !framed.keeps_words());
+        assert_eq!(flat(&TopSubtree::from_subtree(framed.view())), tokens);
+        let delimiter = tree.top_subtree().delimiter;
+        assert_eq!(TopSubtree::from_token_trees_in(delimiter, inner, frame).block(), tree.block());
+        assert_eq!(TopSubtree::from_subtree_in(tree.view(), frame).block(), tree.block());
+    });
     // Damaging every byte costs a read a byte; a lexed file is checked whole only.
     check_wire(&tree, tokens.len() <= DAMAGED_TREES_UP_TO);
     tree
@@ -431,7 +440,7 @@ fn a_leaf_is_16_bytes_and_a_subtree_24() {
     assert_eq!(tree.spans().len(), tokens.len() + subtrees - 1);
     let rows = 2 * tree.nodes().len() + 2 * tree.spans().len();
     let tables = 3 * tree.wide().len() + 3 * tree.parts().len() + tree.symbol_ids().len();
-    assert_eq!(tree.block.len(), HEADER + rows + tables, "a block is its header and columns");
+    assert_eq!(tree.block().len(), HEADER + rows + tables, "a block is its header and columns");
 }
 
 #[test]
@@ -847,7 +856,7 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
             TopSubtree::from_token_trees(delimiter, view)
         });
         assert!(built == warm && built == *tree);
-        assert_eq!(built.block, tree.block);
+        assert_eq!(built.block(), tree.block());
 
         let mut bytes = Vec::new();
         tree.write_wire(&mut bytes);
@@ -866,14 +875,48 @@ fn walking_and_the_wire_allocate_the_same_for_any_size_of_tree() {
                 .map(|&(_, it)| it)
                 .ok_or_else(|| "a part the tree didn't have".to_owned())
         };
-        // The block, the nodes' check's stack of open subtrees, and the set of parts the
-        // canonical check makes when there are more than it scans.
-        let (read, _) = blaze_alloc_count::assert_at_most(3, "reading a tree", || {
+        // The first read grows the nodes' check's stack and the canonical check's set of parts,
+        // both kept per thread; a warm read allocates the block alone, and none in a frame.
+        drop(TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes"));
+        let (read, _) = blaze_alloc_count::assert_at_most(1, "reading a tree", || {
             TopSubtree::read_wire(&bytes, &mut resolve)
         })
         .expect("a tree's own bytes");
-        assert!(read == *tree);
+        assert!(read == *tree && read.keeps_words());
+        blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+            drop(TopSubtree::read_wire_in(&bytes, &mut resolve, frame).expect("a tree's own bytes"))
+        });
+        blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+            let (framed, _) = blaze_alloc_count::assert_at_most(0, "reading a tree in a frame", || {
+                TopSubtree::read_wire_in(&bytes, &mut resolve, frame)
+            })
+            .expect("a tree's own bytes");
+            assert_eq!(framed.block(), read.block());
+            assert!(framed == read && !framed.keeps_words());
+        });
     }
+}
+
+/// A tree built in a frame has the block of the same tree built globally, word for word, keeps
+/// no words, and costs the frame its block alone: no global allocation, warm.
+#[test]
+fn a_framed_tree_is_the_global_tree_in_the_frame() {
+    let tree = lex(0, "fn f(a: u32) -> u32 { (a + 1) * [2][0] }");
+    let delimiter = tree.top_subtree().delimiter;
+    let view = tree.token_trees();
+    // The thread's first task takes the frame's first chunk, and the first build grows the
+    // builder's buffers: both global, once.
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        drop(TopSubtree::from_token_trees_in(delimiter, view, frame))
+    });
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        let (framed, used) =
+            blaze_alloc_count::measure(|| TopSubtree::from_token_trees_in(delimiter, view, frame));
+        assert_eq!(used.allocations, 0, "{used:?}");
+        assert_eq!(framed.block(), tree.block());
+        assert!(framed == tree && !framed.keeps_words() && tree.keeps_words());
+        assert_eq!(framed.copy().block(), tree.block());
+    });
 }
 
 proptest::proptest! {
@@ -887,7 +930,7 @@ proptest::proptest! {
     ) {
         let mut trees = Gen::new(seed, parts);
         let tree = TopSubtree::from_serialized(trees.tree(budget));
-        proptest::prop_assert_eq!(Layout::of_header(&tree.block), Some(tree.layout));
+        proptest::prop_assert_eq!(Layout::of_header(tree.block()), Some(tree.layout));
         let mut bytes = Vec::new();
         tree.write_wire(&mut bytes);
         let parts = wire::parts_of(&tree);
@@ -901,7 +944,7 @@ proptest::proptest! {
         let (read, used) =
             TopSubtree::read_wire(&bytes, &mut resolve).expect("a tree's own bytes");
         proptest::prop_assert_eq!(used, bytes.len());
-        proptest::prop_assert_eq!(&read.block, &tree.block);
+        proptest::prop_assert_eq!(read.block(), tree.block());
         proptest::prop_assert_eq!(read.layout, tree.layout);
         proptest::prop_assert_eq!((read.top_open, read.top_close), (tree.top_open, tree.top_close));
     }

@@ -74,7 +74,7 @@ impl Rig {
 
     fn receiving(&self, conn: Conn) -> Option<Tag> {
         self.in_flight.iter().find_map(|it| match it {
-            Effect::Recv { conn: of, most, tag } if *of == conn => {
+            Effect::Recv { conn: of, most, tag, .. } if *of == conn => {
                 assert!((64 << 10..=LONGEST_REQUEST as usize).contains(most), "{most}");
                 Some(*tag)
             }
@@ -103,7 +103,7 @@ impl Rig {
             assert!(sends.len() <= 1, "more than one send in flight");
             let Some((tag, bytes)) = sends.into_iter().next() else { return out };
             out.extend(bytes);
-            self.complete(tag, Done::Sent);
+            self.complete(tag, Done::Sent(Vec::new()));
         }
     }
 
@@ -361,7 +361,7 @@ fn one_send_is_in_flight_and_later_replies_are_concatenated_behind_it() {
     let sends = rig.sends(conn);
     assert_eq!(sends.len(), 1);
     assert_eq!(responses(&sends[0].1), [Envelope::new(1, Response::Done { ok: true })]);
-    rig.complete(sends[0].0, Done::Sent);
+    rig.complete(sends[0].0, Done::Sent(Vec::new()));
     let sends = rig.sends(conn);
     assert_eq!(sends.len(), 1);
     assert_eq!(responses(&sends[0].1), [
@@ -754,11 +754,12 @@ fn any_split_of_an_http_stream_gives_the_same_arrivals_and_answers() {
 }
 
 /// A warm request on a Unix connection, read from the bytes received and handed over,
-/// allocates nothing; its reply is one allocation, the send buffer `Effect::Send` takes, and
-/// each send's end none. On an HTTP connection kept alive the request's read also writes the
-/// reply's head into a send buffer of its own: one allocation.
+/// allocates nothing, and nor does its reply: the send buffer comes back with the send's end
+/// and is the next reply's. On an HTTP connection kept alive the request's read also writes the
+/// reply's head into a send buffer, and the reply is written while that send is in flight:
+/// one allocation each.
 #[test]
-fn a_warm_request_allocates_nothing_and_its_reply_one_buffer() {
+fn a_warm_request_and_its_reply_reuse_their_buffers() {
     for unix in [true, false] {
         let mut rig = Rig::new(config(unix, !unix));
         let conn = rig.accept(unix, 1);
@@ -783,19 +784,22 @@ fn a_warm_request_allocates_nothing_and_its_reply_one_buffer() {
             let (_, replied) = blaze_alloc_count::measure(|| {
                 rig.server.reply(Reply { to, response: Response::Done { ok: true } }, &mut effects)
             });
-            assert!(!warm || replied.allocations <= 1, "{unix}: a warm reply: {replied:?}");
+            assert!(!warm || replied.allocations <= head, "{unix}: a warm reply: {replied:?}");
             rig.in_flight.extend(effects.drain(..));
-            let sending = |rig: &Rig| {
-                rig.in_flight.iter().find_map(|it| match it {
-                    Effect::Send { conn: of, tag, .. } if *of == conn => Some(*tag),
-                    _ => None,
-                })
+            let sending = |rig: &mut Rig| {
+                let at = rig.in_flight.iter().position(|it| matches!(it, Effect::Send { conn: of, .. } if *of == conn))?;
+                match rig.in_flight.remove(at) {
+                    Effect::Send { mut bytes, tag, .. } => {
+                        bytes.clear();
+                        Some((tag, bytes))
+                    }
+                    _ => unreachable!("found as a send"),
+                }
             };
             let mut sends = 0;
-            while let Some(sent) = sending(&rig) {
-                rig.in_flight.retain(|it| it.tag() != sent);
+            while let Some((sent, bytes)) = sending(&mut rig) {
                 let (_, done) = blaze_alloc_count::measure(|| {
-                    rig.server.complete(Completion { tag: sent, done: Done::Sent }, &mut effects, &mut arrived)
+                    rig.server.complete(Completion { tag: sent, done: Done::Sent(bytes) }, &mut effects, &mut arrived)
                 });
                 assert!(!warm || done.allocations == 0, "{unix}: a warm send's end: {done:?}");
                 rig.in_flight.extend(effects.drain(..));

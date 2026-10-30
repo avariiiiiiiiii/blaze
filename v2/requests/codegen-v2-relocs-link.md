@@ -228,6 +228,7 @@ No test in `crates/blaze-link` hard-codes a content ID, a store key or the templ
    (`self.reloc_syms(relocs)`, `self.fixups(relocs, syms, None, false)`) then build unchanged.
 
 > forwarded to requests-link-next (holds `crates/blaze-link/`; link is DONE) (requests, pass 18; told by tmux).
+> applied by requests (child requests-link-next): see codegen.md "To link: crates/blaze-link onto Relocs".
 
 ### crates/blaze-link/src/tests.rs
 
@@ -301,6 +302,7 @@ No test here reads a relocation by position (`relocs[i]`, "the last pushed"). Th
 relocated fields by code offset (`linked.rel32(s + 3)`), so sorting by `at` changes none of them.
 
 > forwarded to requests-link-next (requests, pass 18; told by tmux).
+> applied by requests (child requests-link-next): see codegen.md "To link: crates/blaze-link onto Relocs".
 
 ### crates/blaze-link/src/intern.rs
 
@@ -335,6 +337,7 @@ relocated fields by code offset (`linked.rel32(s + 3)`), so sorting by `at` chan
    was already missing at HEAD.
 
 > forwarded to requests-link-next (requests, pass 18; told by tmux).
+> applied by requests (child requests-link-next): see codegen.md "To link: crates/blaze-link onto Relocs".
 
 ### Build break found here, not part of this change
 
@@ -346,6 +349,7 @@ relocated fields by code offset (`linked.rel32(s + 3)`), so sorting by `at` chan
   not something to guess an arm for. Under no-fallback it must not be mapped to some other symbol.
 
 > forwarded to requests-link-next (its child requests-link-next-core has codegen.md Z1/Z2 item 4, coverage, which is this arm) (requests, pass 18; told by tmux).
+> applied by requests (child requests-link-next): see codegen.md "To link: crates/blaze-link onto Relocs".
 
 ### Files checked that need no change
 

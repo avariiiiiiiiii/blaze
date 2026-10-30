@@ -264,76 +264,76 @@ impl<'a> ItemTreeRef<'a> {
 /// its array and holds only what comes before its holder, and the attributes are in the order
 /// [`ItemTree::attrs`] searches them in: what indexing the tree relies on.
 fn check(tree: &ItemTree) -> Result<(), &'static str> {
-    let items = tree.kinds.len();
-    if tree.data.len() != items || tree.ast_ids.len() != items {
+    let items = tree.kinds().len();
+    if tree.data().len() != items || tree.ast_ids().len() != items {
         return Err("per-item columns of different lengths");
     }
-    let vis = |id: RawVisibilityId| id.is_builtin() || (id.raw as usize) < tree.vis.len();
-    let name = |id: NameId| (id.raw as usize) < tree.names.len();
-    let path = |id: PathId| (id.raw as usize) < tree.paths.len();
+    let vis = |id: RawVisibilityId| id.is_builtin() || (id.raw as usize) < tree.vis().len();
+    let name = |id: NameId| (id.raw as usize) < tree.names().len();
+    let path = |id: PathId| (id.raw as usize) < tree.paths().len();
     let path_or_none = |id: PathId| id == PathId::NONE || path(id);
     let alias =
         |id: AliasId| matches!(id, AliasId::NONE | AliasId::UNDERSCORE) || name(NameId { raw: id.raw });
     let named = |name_id: NameId, vis_id: RawVisibilityId| name(name_id) && vis(vis_id);
     // A list of items, each before the item `holder` that holds the list.
     let list = |range: IdRange, holder: usize| {
-        range.within(tree.children.len())
-            && tree.children[range.range()].iter().all(|child| (child.index as usize) < holder)
+        range.within(tree.children().len())
+            && tree.children()[range.range()].iter().all(|child| (child.index as usize) < holder)
     };
 
-    if !tree.top_level.iter().all(|id| (id.index as usize) < items) {
+    if !tree.top_level().iter().all(|id| (id.index as usize) < items) {
         return Err("a top-level item that is not in the tree");
     }
     for at in 0..items {
-        let (kind, data) = (tree.kinds[at], tree.data[at] as usize);
+        let (kind, data) = (tree.kinds()[at], tree.data()[at] as usize);
         if data >= tree.column_len(kind) {
             return Err("an item past the column of its kind");
         }
         let ok = match kind {
             ItemKind::Const => {
-                let it = &tree.consts[data];
+                let it = &tree.consts()[data];
                 (it.name == NameId::NONE || name(it.name)) && vis(it.visibility)
             }
-            ItemKind::Enum => named(tree.enums[data].name, tree.enums[data].visibility),
-            ItemKind::ExternBlock => list(tree.extern_blocks[data].children, at),
+            ItemKind::Enum => named(tree.enums()[data].name, tree.enums()[data].visibility),
+            ItemKind::ExternBlock => list(tree.extern_blocks()[data].children, at),
             ItemKind::ExternCrate => {
-                let it = &tree.extern_crates[data];
+                let it = &tree.extern_crates()[data];
                 named(it.name, it.visibility) && alias(it.alias)
             }
             ItemKind::Function => {
-                named(tree.functions[data].name, tree.functions[data].visibility)
+                named(tree.functions()[data].name, tree.functions()[data].visibility)
             }
             ItemKind::Impl => true,
-            ItemKind::Macro2 => named(tree.macro2s[data].name, tree.macro2s[data].visibility),
-            ItemKind::MacroCall => path(tree.macro_calls[data].path),
-            ItemKind::MacroRules => name(tree.macro_rules[data].name),
+            ItemKind::Macro2 => named(tree.macro2s()[data].name, tree.macro2s()[data].visibility),
+            ItemKind::MacroCall => path(tree.macro_calls()[data].path),
+            ItemKind::MacroRules => name(tree.macro_rules()[data].name),
             ItemKind::Mod => {
-                let it = &tree.mods[data];
+                let it = &tree.mods()[data];
                 named(it.name, it.visibility) && (it.items == IdRange::NONE || list(it.items, at))
             }
-            ItemKind::Static => named(tree.statics[data].name, tree.statics[data].visibility),
+            ItemKind::Static => named(tree.statics()[data].name, tree.statics()[data].visibility),
             ItemKind::Struct => {
-                let it = &tree.structs[data];
-                named(it.name, it.visibility) && it.value_ns_ctor.within(tree.ctor_vis.len())
+                let it = &tree.structs()[data];
+                named(it.name, it.visibility) && it.value_ns_ctor.within(tree.ctor_vis().len())
             }
-            ItemKind::Trait => named(tree.traits[data].name, tree.traits[data].visibility),
+            ItemKind::Trait => named(tree.traits()[data].name, tree.traits()[data].visibility),
             ItemKind::TypeAlias => {
-                named(tree.type_aliases[data].name, tree.type_aliases[data].visibility)
+                named(tree.type_aliases()[data].name, tree.type_aliases()[data].visibility)
             }
-            ItemKind::Union => named(tree.unions[data].name, tree.unions[data].visibility),
+            ItemKind::Union => named(tree.unions()[data].name, tree.unions()[data].visibility),
             ItemKind::Use => {
-                let it = &tree.uses[data];
-                vis(it.visibility) && (it.use_tree.raw as usize) < tree.use_trees.len()
+                let it = &tree.uses()[data];
+                vis(it.visibility) && (it.use_tree.raw as usize) < tree.use_trees().len()
             }
         };
         if !ok {
             return Err("an item naming something that is not in the tree");
         }
     }
-    if !tree.ctor_vis.iter().all(|&id| vis(id)) {
+    if !tree.ctor_vis().iter().all(|&id| vis(id)) {
         return Err("a constructor visibility that is not in the tree");
     }
-    for (at, it) in tree.use_trees.iter().enumerate() {
+    for (at, it) in tree.use_trees().iter().enumerate() {
         let ok = match it.kind {
             UseTree::SINGLE => path(it.path) && alias(it.alias) && it.list == IdRange::EMPTY,
             UseTree::GLOB => {
@@ -342,8 +342,8 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
             UseTree::PREFIXED => {
                 path_or_none(it.path)
                     && it.alias == AliasId::NONE
-                    && it.list.within(tree.use_tree_lists.len())
-                    && (tree.use_tree_lists[it.list.range()].iter())
+                    && it.list.within(tree.use_tree_lists().len())
+                    && (tree.use_tree_lists()[it.list.range()].iter())
                         .all(|child| (child.raw as usize) < at)
             }
             _ => false,
@@ -352,18 +352,18 @@ fn check(tree: &ItemTree) -> Result<(), &'static str> {
             return Err("a use tree that is not one, or not before the tree holding it");
         }
     }
-    for owner in &tree.attr_owners {
+    for owner in tree.attr_owners() {
         if owner.owner != ModItemId::TOP_OWNER && owner.owner.index as usize >= items {
             return Err("attributes of an item that is not in the tree");
         }
-        if !owner.attrs.within(tree.attrs.len()) {
+        if !owner.attrs.within(tree.attr_list().len()) {
             return Err("attributes past the tree's");
         }
-        if owner.cfg != AttrOwner::ENABLED && owner.cfg as usize >= tree.cfgs.len() {
+        if owner.cfg != AttrOwner::ENABLED && owner.cfg as usize >= tree.cfgs().len() {
             return Err("a `cfg` that is not in the tree");
         }
     }
-    if !tree.attr_owners.windows(2).all(|pair| pair[0].owner < pair[1].owner) {
+    if !tree.attr_owners().windows(2).all(|pair| pair[0].owner < pair[1].owner) {
         return Err("attributes not in the order of their items");
     }
     Ok(())
@@ -388,21 +388,21 @@ impl Persist for ItemTree {
     fn write(&self, out: &mut Writer) -> u64 {
         let mut w = Words::new();
         let names_at = w.at();
-        w.seq(self.names.iter());
+        w.seq(self.names().iter());
         let paths_at = w.at();
-        w.seq(self.paths.iter());
+        w.seq(self.paths().iter());
         let vis_at = w.at();
-        w.seq(self.vis.iter());
+        w.seq(self.vis().iter());
         let attrs_at = w.at();
-        w.seq(self.attrs.iter());
+        w.seq(self.attr_list().iter());
         let cfgs_at = w.at();
-        w.seq(self.cfgs.iter());
+        w.seq(self.cfgs().iter());
 
         // alloc: once a store write, the edge
-        let kinds: Vec<u8> = self.kinds.iter().map(|&kind| kind as u8).collect();
+        let kinds: Vec<u8> = self.kinds().iter().map(|&kind| kind as u8).collect();
         // alloc: once a store write, the edge
-        let ast_ids: Vec<u32> = self.ast_ids.iter().map(|id| id.erase().into_raw()).collect();
-        let macro_calls: Vec<MacroCallRec> = (self.macro_calls.iter())
+        let ast_ids: Vec<u32> = self.ast_ids().iter().map(|id| id.erase().into_raw()).collect();
+        let macro_calls: Vec<MacroCallRec> = (self.macro_calls().iter())
             .map(|call| MacroCallRec {
                 path: call.path,
                 ctxt: call.ctxt.into_u32(),
@@ -411,31 +411,31 @@ impl Persist for ItemTree {
             .collect(); // alloc: once a store write, the edge
 
         let placed = w.place(out);
-        let top_level = Column::push(out, &self.top_level);
+        let top_level = Column::push(out, self.top_level());
         let kinds = Column::push(out, &kinds);
-        let data = Column::push(out, &self.data);
+        let data = Column::push(out, self.data());
         let ast_ids = Column::push(out, &ast_ids);
-        let children = Column::push(out, &self.children);
-        let consts = Column::push(out, &self.consts);
-        let enums = Column::push(out, &self.enums);
-        let extern_blocks = Column::push(out, &self.extern_blocks);
-        let extern_crates = Column::push(out, &self.extern_crates);
-        let functions = Column::push(out, &self.functions);
-        let impls = Column::push(out, &self.impls);
-        let macro2s = Column::push(out, &self.macro2s);
+        let children = Column::push(out, self.children());
+        let consts = Column::push(out, self.consts());
+        let enums = Column::push(out, self.enums());
+        let extern_blocks = Column::push(out, self.extern_blocks());
+        let extern_crates = Column::push(out, self.extern_crates());
+        let functions = Column::push(out, self.functions());
+        let impls = Column::push(out, self.impls());
+        let macro2s = Column::push(out, self.macro2s());
         let macro_calls = Column::push(out, &macro_calls);
-        let macro_rules = Column::push(out, &self.macro_rules);
-        let mods = Column::push(out, &self.mods);
-        let statics = Column::push(out, &self.statics);
-        let structs = Column::push(out, &self.structs);
-        let traits = Column::push(out, &self.traits);
-        let type_aliases = Column::push(out, &self.type_aliases);
-        let unions = Column::push(out, &self.unions);
-        let uses = Column::push(out, &self.uses);
-        let use_trees = Column::push(out, &self.use_trees);
-        let use_tree_lists = Column::push(out, &self.use_tree_lists);
-        let ctor_vis = Column::push(out, &self.ctor_vis);
-        let attr_owners = Column::push(out, &self.attr_owners);
+        let macro_rules = Column::push(out, self.macro_rules());
+        let mods = Column::push(out, self.mods());
+        let statics = Column::push(out, self.statics());
+        let structs = Column::push(out, self.structs());
+        let traits = Column::push(out, self.traits());
+        let type_aliases = Column::push(out, self.type_aliases());
+        let unions = Column::push(out, self.unions());
+        let uses = Column::push(out, self.uses());
+        let use_trees = Column::push(out, self.use_trees());
+        let use_tree_lists = Column::push(out, self.use_tree_lists());
+        let ctor_vis = Column::push(out, self.ctor_vis());
+        let attr_owners = Column::push(out, self.attr_owners());
 
         let at = out.next::<Root>();
         let field = |offset: usize| at + offset as u64;
@@ -910,26 +910,26 @@ pub(crate) fn assert_round_trip(tree: &ItemTree) {
     let bytes = blaze_format::to_bytes(tree);
     let buffer = blaze_format::Aligned::copy_from(&bytes);
     let read = ItemTree::read(&buffer).expect("an item tree just written");
-    assert_eq!(read.top_level().collect::<Vec<_>>(), tree.top_level.to_vec());
-    assert_eq!(read.len(), tree.kinds.len());
-    for index in 0..tree.kinds.len() as u32 {
+    assert_eq!(read.top_level().collect::<Vec<_>>(), tree.top_level().to_vec());
+    assert_eq!(read.len(), tree.kinds().len());
+    for index in 0..tree.kinds().len() as u32 {
         let item = ModItemId { index };
-        assert_eq!(read.kind(item), Some(tree.kinds[index as usize]));
+        assert_eq!(read.kind(item), Some(tree.kinds()[index as usize]));
         assert_eq!(read.ast_id(item), Some(item.ast_id(tree).erase()));
     }
-    let past = ModItemId { index: tree.kinds.len() as u32 };
+    let past = ModItemId { index: tree.kinds().len() as u32 };
     assert_eq!((read.kind(past), read.ast_id(past)), (None, None));
-    for (&kind, &data) in tree.kinds.iter().zip(&tree.data) {
+    for (&kind, &data) in tree.kinds().iter().zip(tree.data()) {
         let list = match kind {
-            ItemKind::Mod if tree.mods[data as usize].items != IdRange::NONE => {
-                tree.mods[data as usize].items
+            ItemKind::Mod if tree.mods()[data as usize].items != IdRange::NONE => {
+                tree.mods()[data as usize].items
             }
-            ItemKind::ExternBlock => tree.extern_blocks[data as usize].children,
+            ItemKind::ExternBlock => tree.extern_blocks()[data as usize].children,
             _ => continue,
         };
         assert_eq!(read.children(list), Some(tree.items(list)));
     }
-    assert_eq!(read.children(IdRange { start: 0, len: tree.children.len() as u32 + 1 }), None);
+    assert_eq!(read.children(IdRange { start: 0, len: tree.children().len() as u32 + 1 }), None);
     let decoded = read.decode().expect("an item tree just written");
     assert_eq!(decoded, *tree);
     assert_eq!(blaze_format::to_bytes(&decoded), bytes, "an item tree written twice differs");
@@ -955,7 +955,7 @@ mod tests {
     #[test]
     fn every_item_kind_round_trips() {
         round_trip_fixture(
-            r#"
+            r##"
 //! crate docs
 #![no_std]
 #![feature(decl_macro)]
@@ -1026,7 +1026,7 @@ fn disabled() {}
 #[cfg(any(not(all()), target_os = "linux"))]
 #[after]
 struct DisabledLater;
-"#,
+"##,
         );
     }
 

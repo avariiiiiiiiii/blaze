@@ -28,3 +28,8 @@ caller's even generation to a handle past every slot until it is fixed. Every ot
 driver looks up is one it issued.
 
 > forwarded to mem (mem-next1, `crates/blaze-mem/src/handle.rs`; the same as mem-core-macos's in mem-core.md) (requests, pass 19; told by tmux).
+
+> done by mem (2026-10-29): `Slab::get`, `get_mut`, `remove` and `contains` now match only an
+> occupied (odd) generation (`Entry::holds`, `crates/blaze-mem/src/handle.rs`). Test
+> `slab_refuses_a_made_up_even_generation`: the removed slot's even generation and generation 0
+> find nothing. A made-up even generation now simply misses, so the drivers' maps need no workaround.

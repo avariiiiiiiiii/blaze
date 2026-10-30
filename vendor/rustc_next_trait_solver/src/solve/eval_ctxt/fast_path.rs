@@ -7,8 +7,8 @@
 
 use rustc_type_ir::inherent::*;
 use rustc_type_ir::solve::{
-    Certainty, ComputeGoalFastPathOutcome, Goal, GoalStalledOn, GoalStalledOnOpaques, MaybeInfo,
-    SucceededInErased,
+    Certainty, ComputeGoalFastPathOutcome, FastPathDepth, Goal, GoalStalledOn,
+    GoalStalledOnOpaques, MaybeInfo, SucceededInErased,
 };
 use rustc_type_ir::{InferCtxtLike, Interner};
 
@@ -134,21 +134,25 @@ pub(super) fn compute_goal_fast_path_cold<D, I>(
     delegate: &D,
     goal: Goal<I, I::Predicate>,
     origin_span: I::Span,
-) -> Option<GoalEvaluation<I>>
+    depth: FastPathDepth,
+) -> Option<(GoalEvaluation<I>, Option<usize>)>
 where
     D: SolverDelegate<Interner = I>,
     I: Interner,
 {
-    compute_goal_fast_path(delegate, goal, origin_span)
+    compute_goal_fast_path(delegate, goal, origin_span, depth)
 }
 
 /// This is a fast path optimization:
-/// See the docs on [`ComputeGoalFastPathOutcome`]
+/// See the docs on [`ComputeGoalFastPathOutcome`] and [`FastPathDepth`]. Beside the
+/// evaluation, the levels a `HoldsWithin` answer needs below the goal, which the caller
+/// charges to the parent goal.
 pub fn compute_goal_fast_path<D, I>(
     delegate: &D,
     goal: Goal<I, I::Predicate>,
     origin_span: I::Span,
-) -> Option<GoalEvaluation<I>>
+    depth: FastPathDepth,
+) -> Option<(GoalEvaluation<I>, Option<usize>)>
 where
     D: SolverDelegate<Interner = I>,
     I: Interner,
@@ -157,19 +161,36 @@ where
         return None;
     }
 
-    match delegate.compute_goal_fast_path(goal, origin_span) {
+    let holds = GoalEvaluation {
+        goal,
+        certainty: Certainty::Yes,
+        has_changed: HasChanged::No,
+        stalled_on: None,
+    };
+    match delegate.compute_goal_fast_path(goal, origin_span, depth) {
         ComputeGoalFastPathOutcome::NoFastPath => None,
-        ComputeGoalFastPathOutcome::TriviallyHolds => Some(GoalEvaluation {
-            goal,
-            certainty: Certainty::Yes,
-            has_changed: HasChanged::No,
-            stalled_on: None,
-        }),
-        ComputeGoalFastPathOutcome::TriviallyStalled { stalled_on } => Some(GoalEvaluation {
-            goal,
-            certainty: Certainty::AMBIGUOUS,
-            has_changed: HasChanged::No,
-            stalled_on: Some(stalled_on),
-        }),
+        ComputeGoalFastPathOutcome::TriviallyHolds => {
+            assert!(depth.depth_free(), "a depth-free answer at {depth:?}");
+            Some((holds, None))
+        }
+        ComputeGoalFastPathOutcome::HoldsWithin { required_depth } => {
+            assert!(
+                depth.available().is_some_and(|available| required_depth <= available),
+                "an answer needing {required_depth} levels at {depth:?}",
+            );
+            Some((holds, Some(required_depth)))
+        }
+        ComputeGoalFastPathOutcome::TriviallyStalled { stalled_on } => {
+            assert!(depth.depth_free(), "a depth-free answer at {depth:?}");
+            Some((
+                GoalEvaluation {
+                    goal,
+                    certainty: Certainty::AMBIGUOUS,
+                    has_changed: HasChanged::No,
+                    stalled_on: Some(stalled_on),
+                },
+                None,
+            ))
+        }
     }
 }

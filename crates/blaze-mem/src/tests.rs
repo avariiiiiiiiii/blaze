@@ -14,8 +14,8 @@ use std::{
 use blaze_alloc_count::measure;
 
 use crate::{
-    AppendVec, Arena, Built, Column, Frame, Handle, MemError, Pool, Region, RegionVec, Revisions,
-    Slab, Tag, chunks, frame, pool, revision::PublishError, scratch, tag,
+    AppendVec, Arena, Block, Built, Column, Frame, Handle, MemError, Pool, Region, RegionVec,
+    Revisions, Slab, Tag, chunks, frame, pool, revision::PublishError, scratch, tag,
 };
 
 /// xorshift64*: the tests' operations, the same on every run. Not `blaze_ids::rng`, since
@@ -241,6 +241,64 @@ fn column_takes_pushes_from_many_threads_and_reads_them_in_place() {
 }
 
 #[test]
+fn column_blocks_fill_in_order_and_leave_holes_unreadable() {
+    let column = Column::<u64>::new(1_000, Tag::Other).expect("reserve");
+    let mut a = column.claim(64).expect("room");
+    let mut b = column.claim(64).expect("room");
+    assert_eq!(column.fill(&mut b, 7).expect("room"), 64);
+    assert_eq!(column.fill(&mut a, 3).expect("room"), 0);
+    assert_eq!((column.get(64), column.get(0), column.get(1)), (Some(&7), Some(&3), None));
+    assert_eq!((a.remaining(), b.remaining()), (63, 63));
+    assert_eq!(column.len(), 128);
+    assert_eq!(column.push(9).expect("room"), 128);
+    assert!(column.claim(1_000).is_err());
+    assert!(column.claim(u32::MAX).is_err(), "a claim past any length is refused, not wrapped");
+    assert!(Block::EMPTY.is_spent());
+}
+
+#[test]
+#[should_panic(expected = "only the column that claimed it")]
+fn column_block_fills_only_its_column() {
+    let one = Column::<u64>::new(64, Tag::Other).expect("reserve");
+    let two = Column::<u64>::new(64, Tag::Other).expect("reserve");
+    let mut block = one.claim(4).expect("room");
+    let _ = two.fill(&mut block, 1);
+}
+
+#[test]
+fn column_threads_filling_their_own_blocks_publish_every_value_once() {
+    let column = Column::<u64>::new(1 << 16, Tag::Other).expect("reserve");
+    thread::scope(|scope| {
+        for worker in 0..8u64 {
+            let column = &column;
+            scope.spawn(move || {
+                let mut block = Block::EMPTY;
+                for n in 0..2_000u64 {
+                    if block.is_spent() {
+                        block = column.claim(64).expect("room");
+                    }
+                    let index = column.fill(&mut block, worker << 32 | n).expect("room");
+                    assert_eq!(column.get(index), Some(&(worker << 32 | n)));
+                }
+            });
+        }
+    });
+    let mut seen: Vec<u64> = column.iter().map(|(_, &value)| value).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 16_000);
+}
+
+#[test]
+fn column_get_mut_changes_a_published_value() {
+    let mut column = Column::<u64>::new(1 << 10, Tag::Query).expect("reserve");
+    let index = column.push(1).expect("room");
+    *column.get_mut(index).expect("published") = 9;
+    assert_eq!(column.get(index), Some(&9));
+    assert!(column.get_mut(index + 1).is_none());
+}
+
+#[test]
 fn column_reads_allocate_nothing() {
     let column = Column::<u64>::new(1 << 16, Tag::Intern).expect("reserve");
     for i in 0..10_000 {
@@ -445,7 +503,7 @@ fn frame_tasks_nest_with_frames_of_their_own() {
         assert!(inner_used >= 4096);
         assert_eq!(kept, &[9u8; 64], "an inner reset leaves the outer task's memory alone");
     });
-    assert!(frame::spare_frames() >= 2, "both frames are kept warm for the next tasks");
+    assert!(frame::spare_frames() >= 1, "the frames' chunk is kept warm for the next tasks");
     frame::task(Tag::Infer, |frame| assert_eq!(frame.used(), 0, "a task starts empty"));
 }
 
@@ -511,6 +569,350 @@ fn frame_task_allocates_nothing_once_warm() {
     work();
     let (_, used) = measure(work);
     assert_eq!(used.allocations, 0, "a warm task allocates only from its frame");
+}
+
+/// A task `depth` deep in tasks: it pushes 1 KB through [`frame::current`] and reads it back
+/// after the task inside it returns.
+fn nest(depth: usize) {
+    frame::task(Tag::Infer, |_| {
+        let pattern = |i: usize| (depth ^ i) as u8;
+        let kept = frame::current(|frame| std::ptr::from_mut(frame.alloc_slice_fill_with(1024, pattern)));
+        if depth > 1 {
+            nest(depth - 1);
+        }
+        frame::current(|frame| frame.alloc_slice_fill_with(64, |_| 0xAA));
+        // SAFETY: the bytes are in this task's frame, alive until the task ends, and nothing
+        // else refers to them.
+        let kept = unsafe { &*kept };
+        assert!(
+            kept.iter().enumerate().all(|(i, &byte)| byte == pattern(i)),
+            "task {depth} keeps its bytes past its inner task"
+        );
+    });
+}
+
+#[test]
+fn frame_300_nested_tasks_keep_their_bytes_and_cost_nothing_once_warm() {
+    let deep = thread::Builder::new().stack_size(64 << 20).spawn(|| {
+        // A place of its own, so the chunks other tests carve meanwhile are not counted.
+        chunks::set_thread_node(Some(0)).expect("node 0");
+        nest(300);
+        let warm = chunks::carved_on(Some(0));
+        blaze_alloc_count::assert_at_most(0, "300 nested warm tasks", || nest(300));
+        let second = chunks::carved_on(Some(0));
+        nest(300);
+        assert_eq!(second, warm, "a second pass carves no chunk");
+        assert_eq!(chunks::carved_on(Some(0)), second, "a third pass carves no chunk");
+        assert!(second <= 2 * chunks::CHUNK, "small nested tasks share their outer task's chunk");
+    });
+    deep.expect("spawn").join().expect("the nested tasks");
+}
+
+#[test]
+fn frame_inner_task_starts_in_the_rest_of_the_outer_chunk() {
+    frame::task(Tag::Infer, |outer| {
+        outer.alloc(1u64);
+        let held = outer.committed();
+        frame::task(Tag::Mir, |inner| {
+            let value = inner.alloc(2u64);
+            assert_eq!(inner.committed(), 0, "a small inner task takes no block of its own");
+            assert!(inner.contains(std::ptr::from_ref(value).cast()));
+            let pushed = outer.alloc(3u64);
+            assert!(outer.committed() > held, "the outer frame takes another block, not the lent bytes");
+            assert_eq!((*value, *pushed), (2, 3));
+        });
+    });
+}
+
+#[test]
+fn frame_outer_task_grows_while_an_inner_task_allocates() {
+    frame::task(Tag::Infer, |outer| {
+        let mut types: Vec<u64, &Frame> = Vec::with_capacity_in(16, outer);
+        types.extend(0..16);
+        frame::task(Tag::Mir, |inner| {
+            let mine = inner.alloc_slice_fill_with(4096, |i| i as u32);
+            for i in 16..100_000 {
+                types.push(i);
+            }
+            let more = frame::current(|frame| std::ptr::from_mut(frame.alloc_slice_fill_with(4096, |i| !(i as u32))));
+            assert!(mine.iter().enumerate().all(|(i, &v)| v == i as u32), "the outer frame's growth leaves the inner task's bytes alone");
+            // SAFETY: in the inner task's frame, alive until it ends; nothing else refers to it.
+            let more = unsafe { &*more };
+            assert!(more.iter().enumerate().all(|(i, &v)| v == !(i as u32)));
+        });
+        assert!(types.iter().copied().eq(0..100_000));
+        let after = outer.alloc_slice_fill_with(4096, |i| i as u16);
+        assert!(types.iter().copied().eq(0..100_000), "what the outer frame takes back is free");
+        assert!(after.iter().enumerate().all(|(i, &v)| v == i as u16));
+    });
+}
+
+#[test]
+fn frame_span_grows_in_place_and_comes_back_warm() {
+    let grow = || {
+        frame::task(Tag::Codegen, |frame| {
+            let mut bytes: Vec<u8, &Frame> = Vec::with_capacity_in(2 << 20, frame);
+            let first = bytes.as_ptr();
+            bytes.resize(24 << 20, 7);
+            assert_eq!(bytes.as_ptr(), first, "a span's top allocation grows in place");
+            assert!(frame.committed() >= 24 << 20);
+            bytes.len()
+        })
+    };
+    grow();
+    let spans = frame::spare_frames();
+    let ((), used) = measure(|| {
+        grow();
+    });
+    assert_eq!(used.allocations, 0, "a warm span is reused");
+    assert_eq!(frame::spare_frames(), spans);
+    frame::trim_spare(0);
+    assert_eq!(frame::spare_frames(), 0, "trimming to nothing gives every warm block back");
+}
+
+#[test]
+fn frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks() {
+    use std::{alloc::Allocator, ptr::NonNull, slice};
+
+    use crate::Marker;
+
+    struct Live {
+        ptr: NonNull<u8>,
+        layout: Layout,
+        /// What its bytes should be.
+        model: Vec<u8>,
+    }
+
+    /// Writes bytes `from..` of `live`, in the frame and the model alike.
+    fn write(live: &mut Live, from: usize, seed: u64) {
+        for i in from..live.layout.size() {
+            let byte = (seed as u8) ^ (i as u8).wrapping_mul(7);
+            // SAFETY: `ptr` is a live allocation of the frame of `layout.size()` bytes.
+            unsafe { live.ptr.as_ptr().add(i).write(byte) };
+            live.model.push(byte);
+        }
+    }
+
+    fn check(frame: &Frame, live: &Live) {
+        assert_eq!(live.ptr.as_ptr() as usize % live.layout.align(), 0, "aligned");
+        // SAFETY: as in `write`; only the test writes it.
+        let bytes = unsafe { slice::from_raw_parts(live.ptr.as_ptr(), live.layout.size()) };
+        assert!(bytes == live.model.as_slice(), "an allocation keeps its bytes");
+        if live.layout.size() > 0 {
+            assert!(frame.contains(live.ptr.as_ptr()));
+        }
+    }
+
+    let mut rng = Xorshift64Star::new(17);
+    let mut frame = Frame::with_reserve(1 << 30, Tag::Mir).expect("reserve");
+    let mut live: Vec<Live> = Vec::new();
+    // A marker and how many allocations were live when it was taken.
+    let mut marks: Vec<(Marker, usize)> = Vec::new();
+    for step in 0..20_000u64 {
+        let op = rng.below(32);
+        match op {
+            0..=13 => {
+                let size = match rng.below(512) {
+                    0 => (600 << 10) + rng.below(3 << 20) as usize,
+                    _ => rng.below(2048) as usize,
+                };
+                let layout = Layout::from_size_align(size, 1 << rng.below(8)).expect("layout");
+                let ptr = frame.allocate(layout).expect("within the reserve").cast::<u8>();
+                let mut it = Live { ptr, layout, model: Vec::new() };
+                write(&mut it, 0, step);
+                check(&frame, &it);
+                live.push(it);
+            }
+            14..=21 if !live.is_empty() => {
+                // A marker taken since the last allocation was made would cut its new bytes.
+                let n = live.len();
+                marks.retain(|&(_, count)| count < n);
+                let last = live.last_mut().expect("not empty");
+                let old = last.layout;
+                let size = match op {
+                    14..=18 => old.size() + rng.below(4096) as usize,
+                    _ => rng.below(old.size() as u64 + 1) as usize,
+                };
+                let new = Layout::from_size_align(size, old.align()).expect("layout");
+                let moved = match size >= old.size() {
+                    // SAFETY: `last` is a live allocation of the frame with layout `old`.
+                    true => unsafe { frame.grow(last.ptr, old, new) },
+                    // SAFETY: as above.
+                    false => unsafe { frame.shrink(last.ptr, old, new) },
+                };
+                last.ptr = moved.expect("within the reserve").cast();
+                last.layout = new;
+                last.model.truncate(size);
+                let kept = last.model.len();
+                write(last, kept, step);
+                check(&frame, last);
+            }
+            22..=23 if !live.is_empty() => {
+                let n = live.len();
+                marks.retain(|&(_, count)| count < n);
+                let last = live.pop().expect("not empty");
+                // SAFETY: a live allocation of the frame, given back once.
+                unsafe { frame.deallocate(last.ptr, last.layout) };
+            }
+            24..=26 => marks.push((frame.mark(), live.len())),
+            27..=29 if !marks.is_empty() => {
+                let at = rng.below(marks.len() as u64) as usize;
+                let (marker, count) = marks[at];
+                marks.truncate(at + 1);
+                frame.reset_to(marker);
+                live.truncate(count);
+                if let Some(last) = live.last() {
+                    check(&frame, last);
+                }
+            }
+            30 if rng.below(64) == 0 => {
+                frame.reset();
+                live.clear();
+                marks.clear();
+                assert_eq!(frame.used(), 0);
+            }
+            _ => {}
+        }
+        assert!(frame.used() <= frame.committed() && frame.used() <= frame.peak());
+        if step % 512 == 0 {
+            for it in &live {
+                check(&frame, it);
+            }
+        }
+    }
+    for it in &live {
+        check(&frame, it);
+    }
+}
+
+#[test]
+fn frame_measure_counts_inner_tasks_on_top_of_outer_and_allocates_nothing() {
+    let run = || {
+        frame::measure(|| {
+            frame::task(Tag::Infer, |outer| {
+                outer.alloc_slice_copy(&[0u8; 10_000]);
+                let ((), inner) = frame::measure(|| {
+                    frame::task(Tag::Mir, |inner| {
+                        inner.alloc_slice_copy(&[0u8; 50_000]);
+                    })
+                });
+                assert!((50_000..54_096).contains(&inner), "an inner measure counts its task: {inner}");
+            })
+        })
+    };
+    run();
+    let ((), bytes) = blaze_alloc_count::assert_at_most(0, "a warm measure of nested tasks", run);
+    assert!((60_000..68_192).contains(&bytes), "the inner task's bytes on top of the outer's: {bytes}");
+    let ((), none) = frame::measure(|| ());
+    assert_eq!(none, 0);
+}
+
+#[test]
+fn frame_cap_waits_past_its_limit_until_bytes_come_back() {
+    let (cap, _spills) = frame::Cap::new(100, 100);
+    let held = cap.reserve(80).expect("fits");
+    let waiter = thread::spawn(move || cap.reserve(40).map(|grant| grant.bytes()));
+    while cap.waiting() == 0 {
+        thread::yield_now();
+    }
+    assert_eq!(cap.held(), 80);
+    drop(held);
+    assert_eq!(waiter.join().expect("the waiter"), Ok(40));
+    assert_eq!(cap.held(), 0, "a grant gives its bytes back when it drops");
+}
+
+#[test]
+fn frame_cap_cancels_the_newest_wait_when_every_holder_waits() {
+    let (cap, _spills) = frame::Cap::new(100, 100);
+    let mine = cap.reserve(60).expect("fits");
+    let (go, ready) = std::sync::mpsc::channel();
+    let older = thread::spawn(move || {
+        let first = cap.reserve(30).expect("fits");
+        go.send(()).expect("the test waits for it");
+        let more = cap.reserve(30).map(|grant| grant.bytes());
+        (first.bytes(), more)
+    });
+    ready.recv().expect("the older thread holds its bytes");
+    while cap.waiting() == 0 {
+        thread::yield_now();
+    }
+    assert_eq!(
+        cap.reserve(50).map(|grant| grant.bytes()),
+        Err(frame::Cancelled),
+        "with every holder waiting, the newest wait is cancelled"
+    );
+    drop(mine);
+    assert_eq!(older.join().expect("the older waiter"), (30, Ok(30)), "the older wait goes on");
+}
+
+#[test]
+fn frame_cap_says_each_pass_of_spill_at() {
+    let (cap, spills) = frame::Cap::new(1000, 500);
+    let a = cap.reserve(600).expect("fits");
+    let b = cap.reserve(100).expect("fits");
+    assert_eq!(spills.ready().collect::<Vec<_>>(), [100], "one pass, with the bytes over it");
+    drop((a, b));
+    let c = cap.reserve(700).expect("fits");
+    assert_eq!(spills.ready().collect::<Vec<_>>(), [200], "passed again after falling under it");
+    drop(c);
+}
+
+#[test]
+#[should_panic(expected = "a reserve of 200 bytes, more than the cap of 100")]
+fn frame_cap_stops_on_a_reserve_past_its_whole_limit() {
+    let (cap, _spills) = frame::Cap::new(100, 100);
+    _ = cap.reserve(200);
+}
+
+#[test]
+fn frame_task_past_the_thread_shelf_reserves_from_the_cap() {
+    // Every test's task frames reserve from it while it is set, so it never makes one wait.
+    let (cap, _spills) = frame::Cap::new(1 << 50, 1 << 50);
+    let capped = thread::spawn(move || {
+        frame::set_cap(Some(cap));
+        frame::task(Tag::Codegen, |frame| {
+            let big = frame.alloc_slice_fill_with(8 << 20, |i| i as u8);
+            assert!(frame::capped() >= 8 << 20, "a span's pages are reserved from the cap");
+            assert!(cap.held() >= 8 << 20);
+            assert_eq!(big[12_345], 12_345usize as u8);
+        });
+        let left = frame::capped();
+        frame::set_cap(None);
+        left
+    });
+    assert_eq!(capped.join().expect("the capped task"), 0, "a span on the shelf holds none of the cap");
+}
+
+#[test]
+fn chunks_refuse_a_numa_node_past_the_last() {
+    assert!(matches!(chunks::set_thread_node(Some(chunks::MAX_NODES)), Err(MemError::TooLarge { .. })));
+    assert_eq!(chunks::thread_node(), None);
+    chunks::set_thread_node(Some(3)).expect("a node in range");
+    assert_eq!(chunks::thread_node(), Some(3));
+    chunks::set_thread_node(None).expect("unplaced");
+    assert_eq!(chunks::thread_node(), None);
+}
+
+#[test]
+fn region_on_node_zero_is_placed_there() {
+    let mut region = Region::reserve_on(4 << 20, 0, Tag::Other).expect("every machine has node 0");
+    assert_eq!(region.node(), Some(0));
+    region.ensure(1 << 20).expect("commit");
+    region.bind_node(0).expect("already on node 0");
+    #[cfg(not(windows))]
+    {
+        let mut unplaced = Region::reserve(4 << 20, Tag::Other).expect("reserve");
+        unplaced.bind_node(0).expect("node 0");
+        assert_eq!(unplaced.node(), Some(0));
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn region_on_a_second_node_is_an_error_on_one_node() {
+    let mut region = Region::reserve(4 << 20, Tag::Other).expect("reserve");
+    assert!(region.bind_node(1).is_err(), "macOS has one memory node");
+    assert_eq!(region.node(), None);
 }
 
 // Arena
@@ -864,6 +1266,29 @@ fn pool_caches_on_many_threads_share_slots_in_batches() {
 }
 
 #[test]
+fn pool_raw_round_trip_keeps_the_slot_and_drops_once() {
+    let drops = Rc::new(Cell::new(0));
+    let pool = Pool::<Counted>::new(64, Tag::Infer).expect("reserve");
+    let mut cache = pool.cache();
+    let made = cache.alloc(Counted { value: 5, drops: Rc::clone(&drops) });
+    let first = made.index();
+    let raw = made.into_raw();
+    assert_eq!(drops.get(), 0, "the raw value is kept");
+    // SAFETY: `raw` came from `into_raw` of a `Pooled` of `pool`, taken back once here.
+    let back = unsafe { pool::Pooled::from_raw(&pool, raw) };
+    assert_eq!((back.index(), back.value), (first, 5));
+    cache.recycle(back);
+    assert_eq!(drops.get(), 1);
+    let again = cache.alloc(Counted { value: 6, drops: Rc::clone(&drops) });
+    assert_eq!(again.index(), first, "the slot is the cache's next");
+    let (_, used) = measure(|| {
+        // SAFETY: as above, for `again`'s pointer.
+        unsafe { pool::Pooled::from_raw(&pool, again.into_raw()) }
+    });
+    assert_eq!(used.allocations, 0);
+}
+
+#[test]
 fn pool_full_is_an_error() {
     let pool = Pool::<u64>::new(10, Tag::Io).expect("reserve");
     let mut cache = pool.cache();
@@ -1086,6 +1511,21 @@ fn slab_reuses_slots_with_new_generations() {
 }
 
 #[test]
+fn slab_refuses_a_made_up_even_generation() {
+    let mut slab = Slab::<String>::new(16, Tag::Io).expect("reserve");
+    let old = slab.insert("moved out".to_owned());
+    assert_eq!(slab.remove(old).as_deref(), Some("moved out"));
+    let free = Handle::<String>::from_bits(old.to_bits() + (1 << 32));
+    assert_eq!(free.generation() & 1, 0, "the free slot's generation");
+    assert_eq!(slab.get(free), None);
+    assert!(!slab.contains(free));
+    assert_eq!(slab.get_mut(free), None);
+    assert_eq!(slab.remove(free), None);
+    let never = Handle::<String>::from_bits(u64::from(old.index()));
+    assert_eq!(slab.get(never), None, "generation 0, a retired slot's");
+}
+
+#[test]
 fn slab_handle_at_names_the_slot_s_current_value_only() {
     let mut slab = Slab::<u64>::new(16, Tag::Io).expect("reserve");
     let first = slab.insert(1);
@@ -1184,6 +1624,19 @@ fn scratch_lends_distinct_buffers_when_nested_and_keeps_their_capacity() {
         assert!(buffer.is_empty());
         assert!(buffer.capacity() >= 5, "the thread's buffer keeps what it grew to");
     });
+}
+
+#[test]
+fn scratch_a_shelf_keeps_its_n_largest() {
+    let mut shelf = scratch::Shelf::<Vec<u8>, 8>::new();
+    assert!(shelf.take().is_none(), "a new shelf is empty");
+    for size in 1..=10 {
+        shelf.give(Vec::with_capacity(size * 100));
+    }
+    let mut kept: Vec<usize> = std::iter::from_fn(|| shelf.take()).map(|b| b.capacity()).collect();
+    kept.sort_unstable();
+    assert_eq!(kept.len(), 8);
+    assert!(kept[0] >= 300, "the two smallest went: {kept:?}");
 }
 
 #[test]

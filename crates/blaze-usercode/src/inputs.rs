@@ -27,7 +27,7 @@ use blaze_query::{Cancelled, Cx};
 use blaze_vfs::outside::{Cover, Dirs};
 use rustc_hash::FxHasher;
 
-use crate::trace::{DIRECTORY, Inputs, Names, listing, os_bytes};
+use crate::trace::{DIRECTORY, Entry, Inputs, Names, listing, os_bytes};
 
 /// What a traced path that is neither a file nor a directory hashes as.
 pub const SPECIAL: [u8; 32] = *b"blaze v2 traced: not a file\0\0\0\0\0";
@@ -300,6 +300,66 @@ impl Files {
         }
         Ok((Some(hash), settled))
     }
+
+    /// What `path` is as a view holds it ([`Inputs::entry`]), a link not followed, as
+    /// blaze-cargo's fetch reads a tree into one: a link is its target, `/`-separated; a file
+    /// is executable when any of its execute bits is set. A file's content ID is kept under
+    /// what `stat` says of it, as its hash is.
+    fn entry(&self, path: &Path) -> Result<Entry, Unreadable> {
+        // alloc: error path
+        let refused = |error: &str| Unreadable { path: path.to_owned(), error: error.to_owned() };
+        // alloc: error path
+        let unreadable = |error: io::Error| Unreadable { path: path.to_owned(), error: error.to_string() };
+        if path.file_name().is_some_and(|it| it.to_str().is_none()) {
+            return Err(refused("its name is not UTF-8, which no view holds"));
+        }
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(error) if missing(&error) => return Ok(Entry::Missing),
+            Err(error) => return Err(unreadable(error)),
+        };
+        let kind = meta.file_type();
+        if kind.is_dir() {
+            return Ok(Entry::Dir);
+        }
+        if kind.is_symlink() {
+            let target = std::fs::read_link(path).map_err(unreadable)?;
+            #[cfg(unix)]
+            let id = ContentId::of(blaze_vfs::FILE_DOMAIN, std::os::unix::ffi::OsStrExt::as_bytes(target.as_os_str()));
+            #[cfg(not(unix))]
+            let id = {
+                let target = target.to_str().ok_or_else(|| refused("its link's target is not UTF-8"))?;
+                // alloc: a link off Unix, its target with `/` for each `\`, as a view has it.
+                ContentId::of(blaze_vfs::FILE_DOMAIN, target.replace('\\', "/").as_bytes())
+            };
+            return Ok(Entry::File(id, blaze_vfs::Mode::Symlink));
+        }
+        if !kind.is_file() {
+            return Err(refused("it is neither a file, a directory nor a link, which no view holds"));
+        }
+        #[cfg(unix)]
+        let executable = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o111 != 0;
+        #[cfg(not(unix))]
+        let executable = false;
+        let mode = if executable { blaze_vfs::Mode::Executable } else { blaze_vfs::Mode::Regular };
+        let stamp = Stamp::of(&meta);
+        let key = Hasher::new(crate::trace::os_domain!("blaze v2 disk view id stamp 1"))
+            .part(&os_bytes(path.as_os_str()))
+            .part(&stamp.bytes())
+            .finish();
+        if let Some(found) = self.stamped.find(&key) {
+            return Ok(Entry::File(ContentId(*self.stamped.get(found)), mode));
+        }
+        let file = std::fs::File::open(path).map_err(unreadable)?;
+        let mut hasher = Hasher::new(blaze_vfs::FILE_DOMAIN);
+        read_all(file, |bytes| _ = hasher.update(bytes)).map_err(unreadable)?;
+        let id = hasher.finish();
+        // A file changed while it was read is hashed again at its next check.
+        if std::fs::symlink_metadata(path).is_ok_and(|it| Stamp::of(&it) == stamp) {
+            self.stamped.intern(key, || id.0);
+        }
+        Ok(Entry::File(id, mode))
+    }
 }
 
 impl Default for Files {
@@ -369,13 +429,19 @@ const NOT_A_DIRECTORY: i32 = libc::ENOTDIR;
 const NOT_A_DIRECTORY: i32 = 267;
 
 /// The BLAKE3 hash of what `reader` reads.
-pub fn hash_reader(mut reader: impl io::Read) -> io::Result<[u8; 32]> {
-    let mut hasher = blake3::Hasher::new();
+pub fn hash_reader(reader: impl io::Read) -> io::Result<[u8; 32]> {
+    let mut hasher = blaze_ids::b3::Hasher::new();
+    read_all(reader, |bytes| _ = hasher.update(bytes))?;
+    Ok(hasher.finalize())
+}
+
+/// Everything `reader` reads, lent to `take` a buffer at a time.
+fn read_all(mut reader: impl io::Read, mut take: impl FnMut(&[u8])) -> io::Result<()> {
     let mut buffer = [0; 1 << 16];
     loop {
         match reader.read(&mut buffer) {
-            Ok(0) => return Ok(*hasher.finalize().as_bytes()),
-            Ok(n) => _ = hasher.update(&buffer[..n]),
+            Ok(0) => return Ok(()),
+            Ok(n) => take(&buffer[..n]),
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
         }
@@ -420,6 +486,10 @@ impl Inputs for Now<'_> {
         Ok(true)
     }
 
+    fn entry(&mut self, path: &Path) -> Result<Entry, Unreadable> {
+        self.files.entry(path)
+    }
+
     fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
         self.env.get(name)
     }
@@ -442,6 +512,10 @@ impl Inputs for Disk {
 
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Unreadable> {
         self.now().names(path, out)
+    }
+
+    fn entry(&mut self, path: &Path) -> Result<Entry, Unreadable> {
+        self.now().entry(path)
     }
 
     fn env(&mut self, name: &OsStr) -> Option<&OsStr> {
@@ -482,7 +556,7 @@ impl Hashes {
         if let Some(found) = self.0.find(&id) {
             return *self.0.get(found);
         }
-        let hash = *blake3::hash(bytes).as_bytes();
+        let hash = blaze_ids::b3::hash(bytes);
         self.0.intern(id, || hash);
         hash
     }
@@ -550,12 +624,36 @@ impl Inputs for ViewInputs<'_, '_> {
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, ViewError> {
         in_view(self.root, path, |name| {
             let Some(name) = name else { return Ok(self.now.names(path, out)?) };
+            // Sorted by name already, as `Names::sort` sorts.
             let Some(entries) = self.cx.dir(name)? else { return Ok(false) };
             for (name, dir) in entries {
                 out.push(OsStr::new(name), *dir);
             }
-            out.sort();
             Ok(true)
+        })
+    }
+
+    fn entry(&mut self, path: &Path) -> Result<Entry, ViewError> {
+        in_view(self.root, path, |name| {
+            let Some(name) = name else { return Ok(self.now.entry(path)?) };
+            if !name.is_empty()
+                && let Some(file) = self.cx.file(name)?
+            {
+                return Ok(Entry::File(file.id, file.mode));
+            }
+            Ok(match self.cx.dir(name)? {
+                Some(_) => Entry::Dir,
+                None => Entry::Missing,
+            })
+        })
+    }
+
+    /// The view's own hash below `dir`, kept per directory, so an edit hashes again only the
+    /// directories above it: the same as [`crate::trace::walk`]'s of the same tree.
+    fn tree(&mut self, dir: &Path, package: bool) -> Result<Option<[u8; 32]>, ViewError> {
+        in_view(self.root, dir, |name| match name {
+            None => Ok(self.now.tree(dir, package)?),
+            Some(name) => Ok(self.cx.tree(name, package)?),
         })
     }
 
@@ -579,7 +677,7 @@ mod tests {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("a"), b"one").unwrap();
         let mut disk = Disk::new(vec![("B".into(), "2".into()), ("A".into(), "1".into())]);
-        assert_eq!(disk.file(&dir.join("a")).unwrap(), Some(*blake3::hash(b"one").as_bytes()));
+        assert_eq!(disk.file(&dir.join("a")).unwrap(), Some(blaze_ids::b3::hash(b"one")));
         assert_eq!(disk.file(&dir.join("sub")).unwrap(), Some(DIRECTORY));
         assert_eq!(disk.file(&dir.join("none")).unwrap(), None);
         assert_eq!(disk.file(&dir.join("a/below")).unwrap(), None);
@@ -589,7 +687,7 @@ mod tests {
         );
         assert_eq!(disk.dir(&dir.join("none")).unwrap(), None);
         std::fs::write(dir.join("a"), b"two, longer").unwrap();
-        assert_eq!(disk.file(&dir.join("a")).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
+        assert_eq!(disk.file(&dir.join("a")).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         assert_eq!(disk.env(OsStr::new("A")), Some(OsStr::new("1")));
         assert_eq!(disk.env_all()[0].0, "A");
         #[cfg(unix)]
@@ -633,11 +731,11 @@ mod tests {
                 .collect();
             workers.into_iter().map(|it| it.join().unwrap()).collect()
         });
-        assert!(hashes.iter().all(|it| *it == Some(*blake3::hash(b"one").as_bytes())));
+        assert!(hashes.iter().all(|it| *it == Some(blaze_ids::b3::hash(b"one"))));
         assert_eq!(files.stamped.len(), 1);
         std::fs::write(&path, b"two, longer").unwrap();
         let mut now = Now { files: &files, env: &one };
-        assert_eq!(now.file(&path).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
+        assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         assert_eq!(files.stamped.len(), 2);
         assert_eq!(now.env(OsStr::new("X")), Some(OsStr::new("1")));
         _ = std::fs::remove_dir_all(&dir);
@@ -654,15 +752,15 @@ mod tests {
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let files = Files::watched_by(dirs);
         let mut now = Now { files: &files, env: &Env::default() };
-        assert_eq!(now.file(&path).unwrap(), Some(*blake3::hash(b"one").as_bytes()));
+        assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"one")));
         assert_eq!(dirs.len(), 1);
         assert_eq!(dirs.dir(0).path(), dir.as_path());
         std::fs::write(&path, b"two, longer").unwrap();
-        assert_eq!(now.file(&path).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
+        assert_eq!(now.file(&path).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         assert_eq!(now.file(&dir.join("gone")).unwrap(), None);
         assert_eq!(dirs.len(), 1);
         let roundabout = dir.join("sub").join("..").join("a");
-        assert_eq!(now.file(&roundabout).unwrap(), Some(*blake3::hash(b"two, longer").as_bytes()));
+        assert_eq!(now.file(&roundabout).unwrap(), Some(blaze_ids::b3::hash(b"two, longer")));
         let id = Files::path_id(&roundabout);
         assert!(files.vouched.get(files.vouched.find(&id).unwrap()).cover.is_none());
         assert_eq!(dirs.len(), 1);
@@ -681,7 +779,7 @@ mod tests {
         std::fs::write(&path, b"one").unwrap();
         let dirs: &'static Dirs = Box::leak(Box::new(Dirs::new()));
         let files = Files::watched_by(dirs);
-        let hash = Some(*blake3::hash(b"one").as_bytes());
+        let hash = Some(blaze_ids::b3::hash(b"one"));
         assert_eq!(files.file(&path).unwrap(), hash);
         let warm = blaze_alloc_count::assert_at_most(0, "a warm file", || files.file(&path).unwrap());
         assert_eq!(warm, hash);
@@ -711,5 +809,102 @@ mod tests {
         assert_eq!(vouched.read(), None);
         vouched.write(11, Some([1; 32]));
         assert_eq!(vouched.read(), None);
+    }
+    blaze_format::record! {
+        #[derive(Clone, Copy)]
+        struct BothRoot: 1 {
+            kept: ContentId,
+            walked: ContentId,
+        }
+    }
+
+    /// A view's tree hash both ways: its own ([`Cx::tree`]) and [`crate::trace::walk`]'s
+    /// through [`ViewInputs`], of the view placed at `/v`.
+    struct Both(ContentId, ContentId);
+
+    impl blaze_format::Persist for Both {
+        const SCHEMA: blaze_format::SchemaHash = <BothRoot as blaze_format::Record>::SCHEMA;
+        type Ref<'a> = ([u8; 32], [u8; 32]);
+        fn write(&self, out: &mut blaze_format::Writer) -> u64 {
+            out.push(&BothRoot { kept: self.0, walked: self.1 })
+        }
+        fn read(buffer: &[u8]) -> Result<([u8; 32], [u8; 32]), blaze_format::FormatError> {
+            blaze_format::open::<BothRoot>(buffer).map(|it| (it.kept.0, it.walked.0))
+        }
+    }
+
+    struct ViewTree;
+
+    impl blaze_query::Query for ViewTree {
+        const KIND: blaze_query::QueryKind = blaze_query::QueryKind(0x5ff0);
+        const NAME: &'static str = "view tree, both ways";
+        const PRODUCER: ContentId = ContentId([0x7e; 32]);
+        type Key = bool;
+        type Value = Both;
+        fn input(package: &bool) -> ContentId {
+            ContentId::of("blaze v2 usercode test view tree 1", &[u8::from(*package)])
+        }
+        fn execute(cx: &mut Cx<'_>, package: &bool) -> Result<Both, Cancelled> {
+            let kept = cx.tree("", *package)?.expect("the root is a directory");
+            let (env, hashes) = (Env::new(Vec::new()), Hashes::default());
+            let now = Now { files: Files::shared(), env: &env };
+            let mut inputs = ViewInputs { cx, root: Path::new("/v"), now, hashes: &hashes };
+            let walked = match crate::trace::walk(&mut inputs, Path::new("/v"), *package) {
+                Ok(it) => it.expect("the root is a directory"),
+                Err(ViewError::Cancelled) => return Err(Cancelled),
+                Err(ViewError::Unreadable(it)) => panic!("{it}"),
+            };
+            Ok(Both(ContentId(kept), ContentId(walked)))
+        }
+    }
+
+    /// A tree on the disk hashes as the same tree in a view does: names, kinds, contents, an
+    /// executable bit and a link's target, with a package's hidden names and `target` left out
+    /// alike.
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_on_the_disk_hashes_as_the_same_tree_in_a_view() {
+        use std::{os::unix::fs::PermissionsExt as _, sync::Arc};
+
+        use blaze_vfs::Mode;
+        let files: &[(&str, Mode, &[u8])] = &[
+            ("Cargo.toml", Mode::Regular, b"[package]"),
+            ("src/lib.rs", Mode::Regular, b"fn f() {}"),
+            ("src/deep/a.rs", Mode::Regular, b""),
+            ("run.sh", Mode::Executable, b"#!/bin/sh"),
+            ("link", Mode::Symlink, b"src/lib.rs"),
+            (".git/HEAD", Mode::Regular, b"ref"),
+            ("target/out", Mode::Regular, b"bin"),
+        ];
+        let tree = Arc::new(blaze_query::MemTree::default());
+        let config = blaze_query::Config { tree: Some(tree.clone()), dir: None, tags: 0 };
+        let mut db = blaze_query::Database::new(config);
+        db.register::<ViewTree>();
+        let view = db.open(blaze_vfs::View { root: tree.root_with_modes(files) });
+
+        let dir = std::env::temp_dir().join(format!("blaze-tree-test-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&dir);
+        for (path, mode, bytes) in files {
+            let at = dir.join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            match mode {
+                Mode::Symlink => std::os::unix::fs::symlink(std::str::from_utf8(bytes).unwrap(), &at).unwrap(),
+                _ => std::fs::write(&at, bytes).unwrap(),
+            }
+            if *mode == Mode::Executable {
+                std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        }
+        let mut disk = Disk::new(Vec::new());
+        for package in [false, true] {
+            let (kept, walked) = db.pin().get::<ViewTree>(view, &package).expect("not cancelled");
+            assert_eq!(walked, kept, "package {package}: the view walked and its own hash");
+            assert_eq!(disk.tree(&dir, package).unwrap(), Some(kept), "package {package}: the disk and the view");
+        }
+        let plain = disk.tree(&dir, false).unwrap();
+        std::fs::set_permissions(dir.join("run.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_ne!(disk.tree(&dir, false).unwrap(), plain, "the executable bit is in the hash");
+        assert_eq!(disk.tree(&dir.join("none"), false).unwrap(), None);
+        _ = std::fs::remove_dir_all(&dir);
     }
 }

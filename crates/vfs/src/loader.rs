@@ -230,8 +230,3 @@ impl fmt::Debug for Message {
         }
     }
 }
-
-#[test]
-fn handle_is_dyn_compatible() {
-    fn _assert(_: &dyn Handle) {}
-}

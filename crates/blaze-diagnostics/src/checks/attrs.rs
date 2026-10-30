@@ -36,7 +36,7 @@ use blaze_items::Fact;
 use blaze_mem::Frame;
 use hir::InFile;
 use smallvec::SmallVec;
-use syntax::{TextRange, TextSize, ast};
+use syntax::{TextRange, TextSize, view::AstNode as _};
 
 use self::{
     accept::Accept,
@@ -62,13 +62,14 @@ use crate::{
 /// a macro call's attributes, at expansion; with those of expansion's `check_attr`. Each
 /// owner's attributes are lowered once, here: what they are parsed to is returned for
 /// [`checked`] (nothing for a macro call's, which `check_mod_attrs` does not see).
-pub(crate) fn parsed<'f>(
-    cx: &Cx<'f, '_>,
+pub(crate) fn parsed<'f, 'db>(
+    cx: &Cx<'f, 'db>,
     session: &Session,
-    owners: &[Owner],
+    owners: &[Owner<'db>],
     found: &mut Vec<Found>,
 ) -> Lowered<'f> {
     let mut lowered = Lowered::with_capacity(cx.frame(), owners.len());
+    // alloc: setup, one buffer reused for every owner, once per check
     let mut errors = Vec::new();
     for owner in owners {
         for attr in &owner.attrs {
@@ -93,13 +94,14 @@ pub(crate) fn parsed<'f>(
 /// The errors `check_mod_attrs` gives of `owners`' attributes, parsed by [`parsed`] to
 /// `lowered`, then those of the stability pass, which reads what each definition inherits
 /// from its parents.
-pub(crate) fn checked(
-    cx: &Cx<'_, '_>,
+pub(crate) fn checked<'db>(
+    cx: &Cx<'_, 'db>,
     session: &Session,
-    owners: &[Owner],
+    owners: &[Owner<'db>],
     lowered: &Lowered<'_>,
     found: &mut Vec<Found>,
 ) {
+    // alloc: setup, one buffer reused for every owner, once per check
     let mut errors = Vec::new();
     for (at, owner) in owners.iter().enumerate() {
         let parsed = lowered.of(at);
@@ -109,9 +111,15 @@ pub(crate) fn checked(
         check::check(cx, session, owner, parsed, &mut errors);
         push(cx, owner, Phase::Items, &mut errors, found);
     }
-    for (at, diag) in parsers::stability::crate_checks(cx, session, owners, lowered) {
-        errors.push(diag);
-        push(cx, &owners[at], Phase::Items, &mut errors, found);
+    let stability = parsers::stability::crate_checks(cx, session, owners, lowered);
+    if stability.is_empty() {
+        return;
+    }
+    let root = cx.module_key(cx.krate.root_module(cx.db));
+    for (at, mut diag) in stability {
+        source_fact(cx, &mut diag, at);
+        diag.fact(Fact::Signature(root), "the `#![feature]`s of the crate root");
+        found.push(Found::new(diag, Phase::Items));
     }
 }
 
@@ -152,7 +160,7 @@ impl<'f> Lowered<'f> {
 
 /// Pushes `owner`'s errors, draining `errors`. Besides its source, each reads the
 /// `#![feature]`s of the crate root, which the gates, the parsers and their targets look at.
-fn push(cx: &Cx<'_, '_>, owner: &Owner, phase: Phase, errors: &mut Vec<Diag>, found: &mut Vec<Found>) {
+fn push(cx: &Cx<'_, '_>, owner: &Owner<'_>, phase: Phase, errors: &mut Vec<Diag>, found: &mut Vec<Found>) {
     if errors.is_empty() {
         return;
     }
@@ -187,10 +195,10 @@ enum GroupKind {
 
 /// rustc's `parse_attribute_list` of `owner`'s attributes: what they are, pushed to `parsed` in
 /// the order rustc keeps them, with the errors in `out`.
-fn lower(
-    cx: &Cx<'_, '_>,
+fn lower<'db>(
+    cx: &Cx<'_, 'db>,
     session: &Session,
-    owner: &Owner,
+    owner: &Owner<'db>,
     out: &mut Vec<Diag>,
     parsed: &mut Vec<ParsedAttr, &Frame>,
 ) {
@@ -310,17 +318,17 @@ fn lower(
 /// `attr`'s path as rustc's tables key it, given to `f` with nothing allocated: `["inline"]`,
 /// `["diagnostic", "on_unimplemented"]`, a doc comment's `["doc"]`. A segment that is not a
 /// name (`<T>`) is given as `"<>"`, which no table has.
-pub(in crate::checks) fn with_path<R>(attr: &Attr, f: impl FnOnce(&[&str]) -> R) -> R {
-    let AttrKind::Meta { meta, .. } = &attr.kind else { return f(&["doc"]) };
+pub(in crate::checks) fn with_path<R>(attr: &Attr<'_>, f: impl FnOnce(&[&str]) -> R) -> R {
+    let AttrKind::Meta { meta, .. } = attr.kind else { return f(&["doc"]) };
     let Some(path) = meta.path() else { return f(&[]) };
-    let names: SmallVec<[Option<ast::NameRef>; 4]> = path.segments().map(|it| it.name_ref()).collect();
-    let segments: SmallVec<[&str; 4]> = names.iter().map(|it| it.as_ref().map_or("<>", ast::NameRef::text)).collect();
+    // alloc: inline up to four segments
+    let segments: SmallVec<[&str; 4]> = path.segments().map(|it| it.name_ref().map_or("<>", |it| it.text())).collect();
     f(&segments)
 }
 
 /// Whether `attr`'s path is the one segment `name`, read with nothing allocated (what
 /// [`Attr::is`] answers by building the path).
-pub(in crate::checks) fn is(attr: &Attr, name: &str) -> bool {
+pub(in crate::checks) fn is(attr: &Attr<'_>, name: &str) -> bool {
     match &attr.kind {
         AttrKind::Doc(_) => name == "doc",
         AttrKind::Meta { meta, .. } => {
@@ -333,7 +341,7 @@ pub(in crate::checks) fn is(attr: &Attr, name: &str) -> bool {
 /// or `transparency.rs`'s own error (the lints are `lints::syntax::attrs`').
 fn duplicate(
     cx: &Cx<'_, '_>,
-    owner: &Owner,
+    owner: &Owner<'_>,
     path: &[&str],
     on_duplicate: OnDuplicate,
     used: usize,
@@ -351,6 +359,7 @@ fn duplicate(
     if on_duplicate != OnDuplicate::Error {
         return None;
     }
+    // alloc: clone: the error's message and span
     let mut diag = Diag::error(None, format!("multiple `{}` attributes", path.join("..")), unused_span.clone());
     diag.suggestion(unused_span, "remove this attribute", "", Applicability::MachineApplicable);
     diag.span_note(used_span, "attribute also specified here");
@@ -359,19 +368,21 @@ fn duplicate(
 
 /// The errors of rustc's `check_attribute_safety`: an unsafe attribute without `unsafe(..)`
 /// from the edition it must have one, `unsafe(..)` around one that is not unsafe.
-fn safety(cx: &Cx<'_, '_>, attr: &Attr, expected: Safety) -> Option<Diag> {
+fn safety(cx: &Cx<'_, '_>, attr: &Attr<'_>, expected: Safety) -> Option<Diag> {
     match expected {
         Safety::Unsafe { unsafe_since, .. } if !attr.is_unsafe() => {
             if unsafe_since.is_some_and(|since| attr.file.edition(cx.db) < since) {
                 return None;
             }
             let path = cx.span(attr.in_file(attr.path_range()));
+            // clone: the error's span
             let mut diag = Diag::error(None, "unsafe attribute used without unsafe", path.clone());
             diag.span_label(path, "usage of unsafe attribute");
             if !hides_wrapping(cx, attr) {
                 let inner = cx.span(attr.in_file(attr.inner_range()));
                 diag.multipart_suggestion(
                     "wrap the attribute in `unsafe(...)`",
+                    // alloc: the error's suggestion
                     vec![(inner.shrink_to_lo(), "unsafe(".to_owned()), (inner.shrink_to_hi(), ")".to_owned())],
                     Applicability::MachineApplicable,
                 );
@@ -384,15 +395,16 @@ fn safety(cx: &Cx<'_, '_>, attr: &Attr, expected: Safety) -> Option<Diag> {
 }
 
 /// `InvalidAttrUnsafe`: `unsafe(..)` around an attribute that is not unsafe.
-fn not_unsafe(cx: &Cx<'_, '_>, attr: &Attr) -> Diag {
-    let AttrKind::Meta { unsafety: Some(unsafety), .. } = &attr.kind else {
+fn not_unsafe(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> Diag {
+    let AttrKind::Meta { unsafety: Some(unsafety), .. } = attr.kind else {
         unreachable!("`{}` is written `unsafe(..)`", attr.name())
     };
     let keyword = unsafety
         .unsafe_token()
         .map(|it| it.text_range())
-        .unwrap_or_else(|| TextRange::at(syntax::AstNode::syntax(unsafety).text_range().start(), TextSize::from(6)));
+        .unwrap_or_else(|| TextRange::at(unsafety.syntax().text_range().start(), TextSize::from(6)));
     let span = cx.span(attr.in_file(keyword));
+    // alloc: clone: the error's message and span
     let mut diag = Diag::error(None, format!("`{}` is not an unsafe attribute", attr.name()), span.clone());
     diag.span_label(span, "this is not an unsafe attribute");
     diag.note("extraneous unsafe is not allowed in attributes");
@@ -401,24 +413,26 @@ fn not_unsafe(cx: &Cx<'_, '_>, attr: &Attr) -> Diag {
 
 /// Whether rustc leaves out the suggestion to wrap the attribute in `unsafe(..)`: it is from an
 /// expansion and its text is a macro call or a whole attribute (`not_from_proc_macro`).
-fn hides_wrapping(cx: &Cx<'_, '_>, attr: &Attr) -> bool {
-    let AttrKind::Meta { written, .. } = &attr.kind else { return false };
-    if !crate::lints::syntax::from_expansion(cx, InFile::new(attr.file, syntax::AstNode::syntax(written))) {
+fn hides_wrapping(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> bool {
+    let AttrKind::Meta { written, .. } = attr.kind else { return false };
+    if !crate::lints::syntax::from_expansion(cx, InFile::new(attr.file, written.syntax())) {
         return false;
     }
     let span = cx.span(attr.in_file(attr.inner_range()));
     let Some(snippet) = cx.snippet(&span) else { return false };
+    // alloc: on the error path (whether an unsafe attribute's error suggests `unsafe(..)`)
     let snippet: String = snippet.chars().filter(|it| !it.is_whitespace()).collect();
     snippet.contains("!(") || snippet.starts_with("#[") && snippet.ends_with(']')
 }
 
 /// `InvalidAttrAtCrateLevel`: `#![derive]`, `#![test]`, `#![test_case]`,
 /// `#![global_allocator]` or `#![bench]`, which name attribute macros that apply to items.
-fn at_crate_level(cx: &Cx<'_, '_>, attr: &Attr) -> Option<Diag> {
+fn at_crate_level(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> Option<Diag> {
     const NAMES: &[&str] = &["derive", "test", "test_case", "global_allocator", "bench"];
     let name = NAMES.iter().find(|it| is(attr, it))?;
     let range = attr.range();
     let span = cx.span(attr.in_file(range));
+    // alloc: clone: the error's message and span
     let mut diag = Diag::error(None, format!("`{name}` attribute cannot be used at crate level"), span.clone());
     let pound = TextRange::new(range.start(), attr.inner_range().start());
     diag.suggestion_verbose(cx.span(attr.in_file(pound)), "perhaps you meant to use an outer attribute", "#[", Applicability::MachineApplicable);
@@ -459,7 +473,7 @@ fn first_line_of_next_item(text: &str, end: TextSize) -> Option<TextRange> {
 }
 
 /// `UnsupportedAttributesInWhere`, at the attributes `indices` of a `where` predicate.
-fn in_where(cx: &Cx<'_, '_>, owner: &Owner, indices: &[usize]) -> Diag {
+fn in_where(cx: &Cx<'_, '_>, owner: &Owner<'_>, indices: &[usize]) -> Diag {
     let mut spans = indices.iter().map(|&it| {
         let attr = &owner.attrs[it];
         cx.span(attr.in_file(attr.range()))

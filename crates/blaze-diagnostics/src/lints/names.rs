@@ -20,7 +20,10 @@ mod imports;
 mod items;
 mod stability;
 
-pub(crate) use self::items::Walk as ItemWalk;
+pub(crate) use self::{
+    effective::{Def as EffectiveDef, Effective},
+    items::{Walk as ItemWalk, def_span},
+};
 use crate::{cx::Cx, lower::Found};
 
 /// What name resolution and the stability checks lint, given whatever else failed.
@@ -36,10 +39,10 @@ pub(crate) fn before_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// late lint passes, then the extern declarations that clash.
 pub(crate) fn after_abort(cx: &Cx<'_, '_>) -> Vec<Found> {
     let walk = cx.items();
-    let effective = effective::Effective::of(cx);
-    let mut found = items::private_in_public(cx, walk, &effective);
-    found.extend(dead::lints(cx, &effective));
-    found.extend(items::after_abort(cx, walk, &effective));
+    let effective = cx.effective();
+    let mut found = items::private_in_public(cx, walk, effective);
+    found.extend(dead::lints(cx, effective));
+    found.extend(items::after_abort(cx, walk, effective));
     found.extend(items::clashing_extern_declarations(cx, walk));
     found
 }

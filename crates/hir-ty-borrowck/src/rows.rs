@@ -12,7 +12,7 @@
 use std::ops::Range;
 
 use crate::{
-    bitset::{Transfer, masks},
+    bitset::{Transfer, range_masks},
     mem::{FVec, Frame},
 };
 
@@ -59,6 +59,7 @@ pub(super) trait Store<'f>: Sized {
     /// Row `row` as dense words.
     fn load(&self, row: usize, out: &mut [u64]);
 
+    #[cfg(test)]
     fn contains(&self, row: usize, bit: usize) -> bool;
 }
 
@@ -99,6 +100,7 @@ impl<'f> Store<'f> for Dense<'f> {
         out.copy_from_slice(&self.data[row * self.words..(row + 1) * self.words]);
     }
 
+    #[cfg(test)]
     fn contains(&self, row: usize, bit: usize) -> bool {
         bit / 64 < self.words && self.data[row * self.words + bit / 64] & (1 << (bit % 64)) != 0
     }
@@ -193,6 +195,7 @@ impl<'f> Store<'f> for Lined<'f> {
         }
     }
 
+    #[cfg(test)]
     fn contains(&self, row: usize, bit: usize) -> bool {
         let word = bit / 64;
         word < self.words
@@ -209,6 +212,7 @@ pub(super) enum Rows<'f> {
 }
 
 impl Rows<'_> {
+    #[cfg(test)]
     pub(super) fn words(&self) -> usize {
         match self {
             Rows::Dense(it) => it.words,
@@ -221,13 +225,6 @@ impl Rows<'_> {
         match self {
             Rows::Dense(it) => it.load(row, out),
             Rows::Lined(it) => it.load(row, out),
-        }
-    }
-
-    pub(super) fn contains(&self, row: usize, bit: usize) -> bool {
-        match self {
-            Rows::Dense(it) => it.contains(row, bit),
-            Rows::Lined(it) => it.contains(row, bit),
         }
     }
 }
@@ -273,8 +270,8 @@ impl<'f> Effects<'f> {
     /// Row `row`'s words and their `[gen, kill]`, by word.
     pub(super) fn of(&self, row: usize) -> (&[u32], &[[u64; 2]]) {
         let (start, end) = self.rows[row];
-        let range = start as usize..end as usize;
-        (&self.word[range.clone()], &self.bits[range])
+        let (start, end) = (start as usize, end as usize);
+        (&self.word[start..end], &self.bits[start..end])
     }
 
     /// The edge effect that is row `row`.
@@ -283,6 +280,7 @@ impl<'f> Effects<'f> {
         Edge::Effect { words, bits }
     }
 
+    #[cfg(test)]
     pub(super) fn apply(&self, row: usize, state: &mut [u64]) {
         let (words, bits) = self.of(row);
         for (&word, &[gen_, kill]) in words.iter().zip(bits) {
@@ -321,7 +319,7 @@ pub(super) struct Compose<'e, 'f> {
 impl Transfer for Compose<'_, '_> {
     #[inline]
     fn gen_range(&mut self, range: Range<usize>) {
-        masks(range, |word, mask| {
+        range_masks(range, |word, mask| {
             let [gen_, kill] = self.effects.touch(word);
             *gen_ |= mask;
             *kill &= !mask;
@@ -330,7 +328,7 @@ impl Transfer for Compose<'_, '_> {
 
     #[inline]
     fn kill_range(&mut self, range: Range<usize>) {
-        masks(range, |word, mask| {
+        range_masks(range, |word, mask| {
             let [gen_, kill] = self.effects.touch(word);
             *kill |= mask;
             *gen_ &= !mask;

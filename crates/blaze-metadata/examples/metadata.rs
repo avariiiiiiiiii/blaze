@@ -86,7 +86,6 @@ fn main() -> Result<()> {
         }),
         platform: triple.as_deref().map(|triple| TargetPlatform { triple, cfg: &cfg }),
         offline,
-        store: None,
         rustc_version: rustc_version.as_deref(),
     };
     if listed {

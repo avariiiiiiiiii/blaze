@@ -15,7 +15,10 @@ use hir_def::{
     nameres::demand::every_body,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use syntax::{AstNode, SyntaxNodePtr, TextSize, ast};
+use syntax::{
+    SyntaxNodePtr, TextSize, ast as tag,
+    view::{self as ast, AstNode as _, HasName as _},
+};
 
 use crate::{
     cx::Cx,
@@ -24,26 +27,41 @@ use crate::{
 };
 
 pub(super) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
+    // alloc: empty, allocates only when a name is bound twice
     let mut found = Vec::new();
+    let mut scratch = Scratch::default();
     for owner in every_body(cx.db, cx.krate.base()) {
-        check_body(cx, owner, &mut found);
+        check_body(cx, owner, &mut scratch, &mut found);
     }
     found
 }
 
+/// What [`check_body`] keeps of one body, cleared and reused for the next.
+#[derive(Default)]
+struct Scratch {
+    parent: FxHashMap<PatId, PatId>,
+    seen: FxHashSet<InFile<SyntaxNodePtr>>,
+    roots: Vec<Root>,
+    /// The product context of each parameter list, its parameters' names in it.
+    lists: FxHashMap<InFile<SyntaxNodePtr>, Ctx>,
+    ctxs: Vec<Ctx>,
+}
+
 /// The patterns of one body, each walked as rustc walks it: the parameters of a function or
 /// closure share one product context, every other pattern starts its own.
-fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, found: &mut Vec<Found>) {
+fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, scratch: &mut Scratch, found: &mut Vec<Found>) {
     let (body, map) = Body::with_source_map(cx.db, owner);
     let source = |pat: PatId| map.pat_syntax(pat).ok();
-    let mut parent: FxHashMap<PatId, PatId> = FxHashMap::default();
+    let Scratch { parent, seen, roots, lists, ctxs } = scratch;
+    parent.clear();
+    seen.clear();
+    roots.clear();
+    lists.clear();
     for (pat, _) in body.pats() {
         body.walk_pats_shallow(pat, |child| {
             parent.insert(child, pat);
         });
     }
-    let mut seen: FxHashSet<InFile<SyntaxNodePtr>> = FxHashSet::default();
-    let mut roots: Vec<Root> = Vec::new();
     for (pat, _) in body.pats() {
         // A pattern the lowering wrote (`Some(<pat>)` of a `for` loop) is no context of rustc's.
         if parent.get(&pat).is_some_and(|&up| source(up).is_some()) {
@@ -53,11 +71,11 @@ fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, found: &mut Vec<Found>) {
         if !seen.insert(src.map(|it| it.syntax_node_ptr())) {
             continue;
         }
-        let node = src.value.cast::<ast::Pat>().map(|ptr| cx.node(src.with_value(ptr)));
-        let list = node.as_ref().and_then(|node| {
+        let node = src.value.cast::<tag::Pat>().map(|ptr| cx.node_view(src.with_value(ptr)));
+        let list = node.and_then(|node| {
             let list = node.value.syntax().parent().filter(|it| ast::Param::can_cast(it.kind()))?;
             let list = list.parent().filter(|it| ast::ParamList::can_cast(it.kind()))?;
-            Some(node.with_value(SyntaxNodePtr::new(&list)))
+            Some(node.with_value(ast::ptr(list)))
         });
         let at = node.map(|node| (node.file_id, node.value.syntax().text_range().start()));
         roots.push(Root { pat, list, at });
@@ -71,22 +89,23 @@ fn check_body(cx: &Cx<'_, '_>, owner: DefWithBodyId, found: &mut Vec<Found>) {
         hir::DefWithBody::Const(it) => hir::ModuleDef::Const(it),
         hir::DefWithBody::EnumVariant(it) => hir::ModuleDef::EnumVariant(it),
     };
-    let mut walk = Walk { cx, body: &body.store, source: &source, item, owner, ctxs: Vec::new(), found };
-    let mut lists: FxHashMap<InFile<SyntaxNodePtr>, Vec<Ctx>> = FxHashMap::default();
-    for root in roots {
+    let mut walk = Walk { cx, body: &body.store, source: &source, item, owner, ctxs: std::mem::take(ctxs), found };
+    for root in roots.iter() {
+        walk.ctxs.clear();
         match root.list {
             Some(list) => {
-                let ctxs = lists.entry(list).or_insert_with(|| vec![Ctx::product()]);
-                walk.ctxs = std::mem::take(ctxs);
+                let ctx = lists.entry(list).or_insert_with(Ctx::product);
+                walk.ctxs.push(std::mem::replace(ctx, Ctx::product()));
                 walk.pat(root.pat, true);
-                *ctxs = std::mem::take(&mut walk.ctxs);
+                *ctx = walk.ctxs.pop().expect("a pattern's walk leaves the context it starts in");
             }
             None => {
-                walk.ctxs = vec![Ctx::product()];
+                walk.ctxs.push(Ctx::product());
                 walk.pat(root.pat, false);
             }
         }
     }
+    *ctxs = walk.ctxs;
 }
 
 /// A pattern rustc resolves on its own or as one parameter of a list.
@@ -139,19 +158,14 @@ impl<S: Fn(PatId) -> Option<ExprOrPatSource>> Walk<'_, '_, '_, S> {
             Pat::Bind { id, subpat } => {
                 if (self.source)(pat).is_some() {
                     let binding = &body[id];
+                    // clone: an interned name, kept in the context's set
                     self.bind(pat, (binding.name.clone(), binding.hygiene), param);
                 }
                 if let Some(subpat) = subpat {
                     self.pat(subpat, param);
                 }
             }
-            _ => {
-                let mut children = Vec::new();
-                body.walk_pats_shallow(pat, |child| children.push(child));
-                for child in children {
-                    self.pat(child, param);
-                }
-            }
+            _ => body.walk_pats_shallow(pat, |child| self.pat(child, param)),
         }
     }
 
@@ -171,27 +185,31 @@ impl<S: Fn(PatId) -> Option<ExprOrPatSource>> Walk<'_, '_, '_, S> {
 
     fn report(&mut self, pat: PatId, name: &Name, param: bool) {
         let Some(src) = (self.source)(pat) else { return };
-        let Some(ptr) = src.value.cast::<ast::Pat>() else { return };
-        let node = self.cx.node(src.with_value(ptr));
-        let ast::Pat::IdentPat(ident) = &node.value else { return };
+        let Some(ptr) = src.value.cast::<tag::Pat>() else { return };
+        let node = self.cx.node_view(src.with_value(ptr));
+        let ast::Pat::IdentPat(ident) = node.value else { return };
         let Some(ident) = ident.name() else { return };
         let span = self.cx.span(node.with_value(ident.syntax().text_range()));
         let name = name.as_str();
         let (code, message, label) = if param {
             (
                 "E0415",
+                // alloc: the error's message
                 format!("identifier `{name}` is bound more than once in this parameter list"),
                 "used as parameter more than once",
             )
         } else {
             (
                 "E0416",
+                // alloc: the error's message
                 format!("identifier `{name}` is bound more than once in the same pattern"),
                 "used in a pattern more than once",
             )
         };
+        // clone: the error's span
         let mut diag = Diag::error(Some(code), message, span.clone());
         diag.span_label(span, label);
+        // alloc: the error's fact
         let what = format!("the patterns of `{}`", self.cx.def_path(self.owner));
         diag.fact(Fact::Code(self.cx.key(self.item)), what);
         self.found.push(Found::new(diag, Phase::Resolve));

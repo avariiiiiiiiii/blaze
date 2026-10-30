@@ -59,12 +59,12 @@ impl Directive {
 }
 
 /// rustc's `parse_list`: the options of an attribute that has some, else its lint.
-pub(super) fn parse_list<'a>(
+pub(super) fn parse_list<'a, 't>(
     sink: &mut Sink<'_, '_, '_>,
-    args: &'a Args,
+    args: &'a Args<'t>,
     attr_range: TextRange,
     mode: Mode,
-) -> Option<&'a [Item]> {
+) -> Option<&'a [Item<'t>]> {
     match args {
         Args::List(list) if !list.items.is_empty() => return Some(&list.items),
         Args::List(list) => {
@@ -75,6 +75,7 @@ pub(super) fn parse_list<'a>(
             sink.parsed(diag);
         }
         Args::NoArgs => {
+            // alloc: the diagnostic's text
             let message = format!("missing options for `{}` attribute", mode.as_str());
             let mut diag = sink.lint(MALFORMED, message, attr_range);
             diag.help(mode.expected_options());
@@ -87,6 +88,7 @@ pub(super) fn parse_list<'a>(
 
 /// rustc's `MalFormedDiagnosticAttributeLint`.
 fn malformed(sink: &mut Sink<'_, '_, '_>, mode: Mode, range: TextRange) {
+    // alloc: the diagnostic's text
     let mut diag = sink.lint(MALFORMED, format!("malformed `{}` attribute", mode.as_str()), range);
     diag.span_label(sink.span(range), "invalid option found here");
     diag.help(mode.allowed_options());
@@ -96,20 +98,26 @@ fn malformed(sink: &mut Sink<'_, '_, '_>, mode: Mode, range: TextRange) {
 /// rustc's `IgnoredDiagnosticOption`.
 fn ignored(sink: &mut Sink<'_, '_, '_>, option: &str, first: InFile<TextRange>, later: InFile<TextRange>) {
     let later = sink.cx.span(later);
+    // alloc: the diagnostic's text and span, as is all of `ignored`'s
     let message = format!("`{option}` is ignored due to previous definition of `{option}`");
+    // clone: as above
     let mut diag = Diag::lint(MALFORMED, message, later.clone());
+    // alloc: as above
     diag.span_label(sink.cx.span(first), format!("`{option}` is first declared here"));
+    // alloc: as above
     diag.span_label(later, format!("`{option}` is later redundantly declared here"));
     sink.parsed(diag);
 }
 
 /// rustc's `parse_directive_items`: the directive `items` give, each lint as it comes to it.
-pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item], is_root: bool) -> Directive {
+pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item<'_>], is_root: bool) -> Directive {
     let mut directive = Directive {
         is_rustc_attr: mode == Mode::RustcOnUnimplemented,
+        // alloc: empty; a directive is of a diagnostic attribute, which `diagnostic::lints` alone reads
         filters: Vec::new(),
         message: None,
         label: None,
+        // alloc: as above
         notes: Vec::new(),
         parent_label: None,
     };
@@ -125,7 +133,7 @@ pub(super) fn parse_items(sink: &mut Sink<'_, '_, '_>, mode: Mode, items: &[Item
         };
         let value = match &meta.args {
             Args::NameValue { value, .. } => match &value.str {
-                Some(str) => Some((value, str.as_str())),
+                Some(str) => Some((value, &**str)),
                 None => {
                     malformed(sink, mode, span);
                     continue;
@@ -229,7 +237,7 @@ fn merge_option(
 }
 
 /// The format string `value` of the literal `lit`, its lints given.
-fn format_string(sink: &mut Sink<'_, '_, '_>, lit: &Lit, value: &str, mode: Mode) -> Format {
+fn format_string(sink: &mut Sink<'_, '_, '_>, lit: &Lit<'_>, value: &str, mode: Mode) -> Format {
     match format::parse(value, lit.text(), lit.range(), mode) {
         Ok(parsed) => {
             for warning in parsed.warnings {
@@ -260,6 +268,7 @@ fn format_string(sink: &mut Sink<'_, '_, '_>, lit: &Lit, value: &str, mode: Mode
                         diag
                     }
                     Warning::Disallowed(range) => {
+                        // alloc: the diagnostic's text
                         let message = format!("this format argument is not allowed in `#[{}]`", mode.as_str());
                         let mut diag = sink.lint(FORMAT_LITERALS, message, range);
                         diag.span_label(sink.span(range), "remove this format argument");
@@ -269,6 +278,7 @@ fn format_string(sink: &mut Sink<'_, '_, '_>, lit: &Lit, value: &str, mode: Mode
                 };
                 sink.parsed(diag);
             }
+            // alloc: the parameters of a diagnostic attribute's format string
             Format { params: parsed.params.into_iter().map(|(name, range)| (name, sink.at(range))).collect() }
         }
         Err(failed) => {
@@ -293,24 +303,29 @@ impl Invalid {
     fn emit(self, sink: &mut Sink<'_, '_, '_>) {
         let (range, message, label) = match self {
             Invalid::Literal(range) => {
+                // alloc: the diagnostic's text, as is each label below
                 (range, "literals inside `on`-clauses are not supported", "unexpected literal here".to_owned())
             }
             Invalid::ExpectedIdentifier(range, path) => (
                 range,
                 "expected an identifier inside this `on`-clause",
+                // alloc: as above
                 format!("expected an identifier here, not `{path}`"),
             ),
             Invalid::Predicate(range, name) => (
                 range,
                 "this predicate is invalid",
+                // alloc: as above
                 format!("expected one of `any`, `all` or `not` here, not `{name}`"),
             ),
             Invalid::NotOne(range) => {
+                // alloc: as above
                 (range, "expected a single predicate in `not(..)`", "unexpected quantity of predicates here".to_owned())
             }
             Invalid::Flag(range, name) => (
                 range,
                 "invalid flag in `on`-clause",
+                // alloc: as above
                 format!("expected one of the `crate_local`, `direct` or `from_desugaring` flags, not `{name}`"),
             ),
         };
@@ -321,14 +336,15 @@ impl Invalid {
 }
 
 /// rustc's `parse_filter`: the parameters the filter `item` names, in `visit_params`' order.
-fn filter(item: &Item) -> Result<Vec<String>, Invalid> {
+fn filter(item: &Item<'_>) -> Result<Vec<String>, Invalid> {
+    // alloc: the parameters of a diagnostic attribute's `on(..)` filter
     let mut params = Vec::new();
     predicate(item, &mut params)?;
     Ok(params)
 }
 
 /// rustc's `parse_predicate`.
-fn predicate(item: &Item, params: &mut Vec<String>) -> Result<(), Invalid> {
+fn predicate(item: &Item<'_>, params: &mut Vec<String>) -> Result<(), Invalid> {
     let Item::Meta(meta) = item else { return Err(Invalid::Literal(item.range())) };
     let Some(name) = meta.ident() else {
         return Err(Invalid::ExpectedIdentifier(meta.path_range, meta.path_text()));
@@ -340,11 +356,13 @@ fn predicate(item: &Item, params: &mut Vec<String>) -> Result<(), Invalid> {
                 [single] => predicate(single, params),
                 _ => Err(Invalid::NotOne(list.range)),
             },
+            // alloc: the diagnostic's text
             _ => Err(Invalid::Predicate(meta.path_range, name.to_owned())),
         },
         Args::NameValue { range, value } => {
             let Some(str) = &value.str else { return Err(Invalid::Literal(*range)) };
             if !matches!(name, "Self" | "from_desugaring" | "cause") {
+                // alloc: as `filter`'s parameters
                 params.push(name.to_owned());
             }
             format::filter_params(str, params);
@@ -352,6 +370,7 @@ fn predicate(item: &Item, params: &mut Vec<String>) -> Result<(), Invalid> {
         }
         Args::NoArgs => match name {
             "crate_local" | "direct" | "from_desugaring" => Ok(()),
+            // alloc: the diagnostic's text
             _ => Err(Invalid::Flag(meta.path_range, name.to_owned())),
         },
     }

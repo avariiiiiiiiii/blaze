@@ -12,7 +12,7 @@ fn collected_in(order: RunOrder, #[rust_analyzer::rust_fixture] ra_fixture: &str
     let krate = db.fetch_test_crate();
     let def_map = crate_def_map(&db, krate);
     let diagnostics: Vec<String> =
-        def_map.diagnostics().iter().map(|it| format!("{:?}", it.kind)).collect();
+        def_map.diagnostics(&db).iter().map(|it| format!("{:?}", it.kind)).collect();
     let records = super::uses::render_records(&db, def_map);
     let used = super::uses::render_used(&db, krate);
     let root_scope = def_map.module(&db, def_map.root).scope(&db);

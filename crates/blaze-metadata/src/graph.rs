@@ -5,10 +5,12 @@
 use anyhow::Result;
 use blaze_resolve::metadata::{Dep, DepKindInfo, MetadataResolve, MetadataResolveNode};
 use blaze_resolve::resolver::{FeaturesFor, ResolvedFeatures};
-use blaze_resolve::{DepKind, InternedString, PackageId, Platform, Resolve};
+use blaze_resolve::{DepKind, InternedString, PackageId, Resolve};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::summary::Read;
+use blaze_units::Read;
+
+use crate::Packages;
 
 /// Unordered while the walk fills it; [`of_build`] sorts each part once when it writes the node.
 #[derive(Default)]
@@ -38,14 +40,14 @@ fn builds_anything(
 /// From each of `roots`, the packages the build reaches, each with the features it is built
 /// with (both builds of one built for the target and for the host) and the dependencies it
 /// is built against. `dev_units` is whether the roots' tests, examples and benchmarks are
-/// built; `activated` whether a `[target.'cfg(..)']` platform holds.
+/// built; `packages` says whether a `[target.'cfg(..)']` platform holds.
 pub(crate) fn of_build(
     resolve: &Resolve,
     features: &ResolvedFeatures,
     roots: &[PackageId],
     dev_units: bool,
     reads: &FxHashMap<PackageId, Read>,
-    activated: &dyn Fn(&Platform) -> bool,
+    packages: &Packages<'_>,
     root: Option<PackageId>,
 ) -> Result<MetadataResolve> {
     let mut nodes: FxHashMap<PackageId, Node> = FxHashMap::default();
@@ -84,7 +86,7 @@ pub(crate) fn of_build(
                         || features.is_dep_activated(pkg, fk, name)
                         || (dep.kind() == DepKind::Build
                             && features.is_dep_activated(pkg, FeaturesFor::HostDep, name));
-                    kind_built && dep.platform().is_none_or(activated) && enabled
+                    kind_built && dep.platform().is_none_or(|it| packages.activates(it)) && enabled
                 })
                 .collect();
             if passing.is_empty() {

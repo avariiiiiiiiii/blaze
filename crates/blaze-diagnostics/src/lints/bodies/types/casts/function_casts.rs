@@ -38,6 +38,7 @@ impl LatePass for FunctionCastsAsInteger {
         let span = ty_span.with_lo(from_span.hi + 1);
         let mut diag = Diag::lint("function_casts_as_integer", "direct cast of function item into an integer", span);
         diag.suggestion_with_style(
+            // alloc: the lint's suggestion, for a lint found
             vec![(from_span.shrink_to_hi(), " as *const ()".to_owned())],
             "first cast to a pointer `as *const ()`",
             Applicability::MachineApplicable,

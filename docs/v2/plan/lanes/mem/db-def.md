@@ -20,9 +20,12 @@ request:
 
 ## Rules the parts share
 
-1. **`frame::current` only in a query function's body.** Salsa runs each body inside
-   `frame::task(tag, ..)` (`vendor/salsa/src/function/execute.rs:340`, wrapped by
-   mem-db-salsa), and base-db's `run_all` runs each batch task inside one too (request B5). Code
+1. **Each query body opens its own `frame::task(tag, ..)`.** Salsa's `execute` opens no frame
+   (`vendor/salsa` uses blaze-mem only for memo tables; mem-db-salsa's M1 asks for one), and
+   `frame::current` stops outside a task (`frame.rs:497`), and inside a nested query would hand
+   out the outer query's frame. A task costs two thread-local reads once the thread has a frame
+   at that depth, and tasks nest, so this stays right after M1. `frame::current` is only for
+   code inside base-db's `run_all` tasks, which B5 frames. Code
    also reached from outside a run (IDE requests through `hir::Semantics`, `Resolver` walks,
    path resolution on a warm map, attribute lookups) keeps its per-call buffers in the worker's
    scratch (`blaze_mem::scratch`, or a `thread_local!` `Scratch<T>`), since `current` stops in no

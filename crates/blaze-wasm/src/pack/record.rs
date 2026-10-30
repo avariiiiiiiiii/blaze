@@ -29,6 +29,7 @@ use super::{Call, Dep, Expansion, Expansions, File, Kind, Krate, Macro, Origin, 
 struct Recorder {
     krate: String,
     name: String,
+    // dyn: the proc macro it records, as `ProcMacro::expander` holds it: the edge to user code.
     inner: Arc<dyn ProcMacroExpander>,
     expansions: Arc<Mutex<Expansions>>,
 }
@@ -90,7 +91,9 @@ impl ProcMacroExpander for Recorder {
         output
     }
 
+    // dyn: hir-expand's `ProcMacroExpander::eq_dyn`, when a crate's macros are set.
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+        // dyn: as above, the one way to compare across expander types.
         (other as &dyn std::any::Any)
             .downcast_ref::<Self>()
             .is_some_and(|other| self.name == other.name && self.inner.eq_dyn(&*other.inner))
@@ -132,6 +135,7 @@ pub fn record(
     target: &str,
     main: &str,
     expand: impl FnOnce(&RootDatabase, &[Crate]),
+    // dyn: an error, once per pack recorded.
 ) -> Result<Pack, Box<dyn std::error::Error>> {
     // The program links against what cargo built, so its crates are configured as cargo's.
     project_model::SYSROOT_AS_BUILT.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -157,8 +161,8 @@ pub fn record(
         num_worker_threads: 1,
         proc_macro_processes: 1,
     };
-    let mut workspace = ProjectWorkspace::load(manifest, &cargo_config, &|_| {})?;
-    let scripts = workspace.run_build_scripts(&cargo_config, &|_| {})?;
+    let mut workspace = ProjectWorkspace::load(manifest, &cargo_config)?;
+    let scripts = workspace.run_build_scripts(&cargo_config)?;
     workspace.set_build_scripts(scripts);
     let (mut db, vfs, _server) = load_workspace(workspace, &cargo_config.extra_env, &load_config)?;
 

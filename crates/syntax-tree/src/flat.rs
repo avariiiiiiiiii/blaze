@@ -53,7 +53,10 @@ use std::{
     },
 };
 
-use blaze_ids::{radix, Domain};
+use blaze_ids::{
+    bits::{rank_in, BitSlice, BitSliceMut},
+    radix, Domain,
+};
 
 use self::block::{Block, Col};
 use crate::{SyntaxKind, Text, TextRange, TextSize};
@@ -166,12 +169,9 @@ impl Kept {
     /// The slot of the node of rank `rank`, when it is kept.
     #[inline]
     fn slot(&self, rank: usize) -> Option<&Slot> {
-        let (word, bit) = (rank / 64, rank % 64);
-        let bits = *self.bits.get(word)?;
-        ((bits >> bit) & 1 == 1).then(|| {
-            let before = (bits & ((1u64 << bit) - 1)).count_ones();
-            &self.hashes[self.ranks[word] as usize + before as usize]
-        })
+        BitSlice::<usize>::from_words(&self.bits[..])
+            .contains(rank)
+            .then(|| &self.hashes[rank_in(&self.bits, &self.ranks, rank)])
     }
 
     /// The kept nodes from `lo` to `hi`, each with its hash or 0.
@@ -180,14 +180,6 @@ impl Kept {
         let to = self.elements.partition_point(|&it| it < hi);
         self.elements[from..to].iter().zip(&self.hashes[from..to]).map(|(&it, slot)| (it, slot.value()))
     }
-}
-
-/// How many nodes come before element `at` of a tree whose [`FlatTree::nodes`] and
-/// [`FlatTree::ranks`] are `nodes` and `ranks`.
-#[inline]
-fn rank_in(nodes: &[u64], ranks: &[u32], at: u32) -> usize {
-    let (word, bit) = (at as usize / 64, at % 64);
-    ranks[word] as usize + (nodes[word] & ((1u64 << bit) - 1)).count_ones() as usize
 }
 
 /// What parses a lazy node: called with the node's kind, the tree's source, the node's range
@@ -589,24 +581,6 @@ fn node_bits(words: &[u32], nodes: &mut Vec<u64>) {
     }));
 }
 
-/// Appends bits `from..to` of `src` to `dst`, which holds `len` bits, up to 64 at a time.
-fn append_bits(dst: &mut Vec<u64>, len: &mut usize, src: &[u64], mut from: usize, to: usize) {
-    while from < to {
-        let n = (64 - from % 64).min(to - from);
-        let bits = (src[from / 64] >> (from % 64)) & (u64::MAX >> (64 - n));
-        let at = *len % 64;
-        if at == 0 {
-            dst.push(0);
-        }
-        let last = dst.len() - 1;
-        dst[last] |= bits << at;
-        if at + n > 64 {
-            dst.push(bits >> (64 - at));
-        }
-        (*len, from) = (*len + n, from + n);
-    }
-}
-
 /// The entries of a side table sorted by element of the elements from `lo` to `hi`.
 fn in_range<T>(table: &[(u32, T)], lo: u32, hi: u32) -> &[(u32, T)] {
     let from = table.partition_point(|it| it.0 < lo);
@@ -675,10 +649,10 @@ impl FlatTree {
         let marks = block.put(marks);
         for n in 0..kept {
             let at = kept_at(n).0;
-            let node = (nodes[at as usize / 64] >> (at % 64)) & 1 == 1;
+            let node = BitSlice::<usize>::from_words(&nodes[..]).contains(at as usize);
             debug_assert!(node, "element {at} is a node");
-            let rank = rank_in(&nodes, &ranks, at);
-            bits[rank / 64] |= 1 << (rank % 64);
+            let rank = rank_in(&nodes, &ranks, at as usize);
+            BitSliceMut::<usize>::from_words(&mut bits[..]).insert(rank);
         }
         let mut before = 0;
         let kept_ranks = block.fill(kept_words, |word| {
@@ -783,7 +757,7 @@ impl FlatTree {
     /// How many nodes come before element `at`, which is an element.
     #[inline]
     fn rank(&self, at: u32) -> usize {
-        rank_in(&self.nodes, &self.ranks, at)
+        rank_in(&self.nodes, &self.ranks, at as usize)
     }
 
     /// How many nodes come before element `at`, or are in the tree for `len()`.
@@ -1452,11 +1426,13 @@ impl FlatTree {
             it if it < lo || it == NO_PARENT => it,
             it => after(it),
         }));
-        spare.nodes.reserve((len as usize).div_ceil(64));
-        let mut bits = 0;
-        append_bits(&mut spare.nodes, &mut bits, &self.nodes, 0, lo as usize);
-        append_bits(&mut spare.nodes, &mut bits, &with.nodes, 0, added as usize);
-        append_bits(&mut spare.nodes, &mut bits, &self.nodes, hi as usize, self.len() as usize);
+        // `len` is `lo + added + (self.len() - hi)`: the three ranges fill the new bits exactly.
+        spare.nodes.resize((len as usize).div_ceil(64), 0);
+        let mut nodes = BitSliceMut::<usize>::from_words(&mut spare.nodes[..]);
+        let ours = BitSlice::from_words(&self.nodes[..]);
+        nodes.or_range_at(0, &ours, 0..lo as usize);
+        nodes.or_range_at(lo as usize, &BitSlice::from_words(&with.nodes[..]), 0..added as usize);
+        nodes.or_range_at((lo + added) as usize, &ours, hi as usize..self.len() as usize);
 
         // A start past `lo` is `with`'s, moved to `at`'s start, or that of the element it was
         // before the edit, moved by what the text grew: a mark and up to seven lengths.
@@ -3414,7 +3390,8 @@ mod tests {
         let clone = tree.clone();
         same_arrays(&clone, &tree, 5);
         assert_eq!(clone.kept.elements, tree.kept.elements);
-        let hashes = |tree: &FlatTree| tree.kept.hashes.iter().map(|it| it.value()).collect::<Vec<_>>();
+        let hashes =
+            |tree: &FlatTree| tree.kept.hashes.iter().map(|it| it.value()).collect::<Vec<_>>();
         assert_eq!(hashes(&clone), hashes(&tree));
         assert!(!std::ptr::eq(clone.words.as_ptr(), tree.words.as_ptr()));
     }

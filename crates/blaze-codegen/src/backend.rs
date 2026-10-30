@@ -62,6 +62,9 @@ pub struct Described<I, S> {
     /// Their keys, and those of what they build in, are in its store key; its
     /// [`CompiledFunction::inlined`] may name only their code hashes.
     pub built_in: Vec<u32>,
+    /// What a debugger and a backtrace call it: rustc's demangled name of the instance,
+    /// with its generic arguments (`core::ptr::drop_in_place<alloc::string::String>`).
+    pub name: String,
 }
 
 /// What the front end says of a static.
@@ -101,6 +104,14 @@ pub trait Frontend: Sync {
         &self,
         value: &Self::Static,
     ) -> Result<DescribedStatic<Self::Instance, Self::Static>, CodegenError>;
+
+    /// The instances and statics the walk reached next, before any of them is described:
+    /// what a front end checking bodies beside the build checks first. Once a level.
+    fn reached(&self, functions: &[(Self::Instance, Origin)], statics: &[Self::Static]);
+
+    /// Whether the build's outcome is decided without its code (a body it compiles failed
+    /// its check): the build stops at its next step and gives [`stopped`](crate::driver).
+    fn stopped(&self) -> bool;
 }
 
 /// What a prepared function compiles to, up to what fills its places: the content ID of its

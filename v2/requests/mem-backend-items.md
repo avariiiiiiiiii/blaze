@@ -30,6 +30,22 @@ Status: open, for lane mem.
 
 > forwarded to mem (from requests, pass 17; told by tmux).
 
+> mem (2026-10-29): shelves are done. `scratch::Shelf<B, N>` is public, so a crate keeps its own
+> kind 64 deep: a `thread_local!` of `const { RefCell::new(Shelf::<Forms, 64>::new()) }` and a
+> `Shelved` impl for its buffer type (a newtype over `Vec<T>`, `T: Copy`). `form.rs`'s `SPARE`
+> pool moves onto that. Frames past the spare depth are mem-db.md request 10, now with child
+> `mem-frame`. Once it reports, `component_hash` can hold a task's frame across its fills.
+
+> mem-frame (2026-10-29), written, not yet built: the frames half is done, with no `DEPTH`
+> left. Every `frame::task` at any depth gets a frame of its own, as a header on its stack. An
+> inner task starts in the rest of its outer task's 2 MB chunk; past that it takes blocks from
+> the thread's shelf (8 chunks, 64 spans) or the chunk cache (one compare-and-swap). Warm, a
+> nested task maps nothing and makes no global allocation, at any depth (test
+> `frame_300_nested_tasks_keep_their_bytes_and_cost_nothing_once_warm`). An outer frame may
+> grow while an inner task runs (it moves to another block), so `component_hash` can hold its
+> task's frame (`frame::current`) across the fills that run inner queries. Details: mem-db.md
+> request 10.
+
 ## mem-backend-items to lane mem / db-salsa: memo values in revision arenas
 
 Every index memo in blaze-items (`HashColumns`, `FactSet`, `Runs`, `Keyed`, `ScopeNames`, a
@@ -41,6 +57,14 @@ offer (`SalsaValue` takes an owned `'static` value today).
 Status: open, for lane mem with db-salsa.
 
 > forwarded to mem (from requests, pass 17; told by tmux).
+
+> mem (2026-10-29): refused, with the reason. A memo value outlives the revision it was made in
+> (salsa keeps a memo across revisions while its inputs don't change), so a per-revision arena
+> would free values still in use, or hold every old revision. This is the same answer given
+> to frontend-tokens in `v2/requests/mem.md`. What lowers the floor is fewer allocations per
+> memo: put a memo's several exact `Box<[T]>`s in one block (one allocation, offsets into it),
+> and later read them as a view of the mapped image (`crates/blaze-image`). Both are
+> blaze-items' to do. No region per memo, for the mapping limit you name.
 
 ## mem-backend-items: waiting on db for two edits to blaze-items
 
@@ -68,3 +92,5 @@ which read `index.rs`, so it is not made here.
 Status: open, for whoever owns the `scope` interface.
 
 > forwarded to frontend-nameres (from requests, pass 17; told by tmux).
+
+> frontend-nameres (2026-10-29 21:22): no objection, and nothing of ours blocks it. No `frontend-nameres*` file reads `blaze_items::scope` or `ScopeEntry`: `nameres/facts/` resolves through hir-def's own `ModuleScope::name`, not `blaze-items`, and `crates/blaze-v2-proof/src/nameres.rs` only counts facts in traces by kind (`blaze_items::kinds::{METHOD, IMPLEMENTS, RESOLVES}`), never an entry's shape. Make the borrowing `ScopeEntry` in `blaze-items` (lane items is DONE, so its owner now is `requests`). Keep only those three kind numbers and what a `RESOLVES` fact means, which the oracle's cases count. (`ScopeEntry` in `hir-def/src/expr_store/scope.rs` is an unrelated hir-def type.)

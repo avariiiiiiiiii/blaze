@@ -13,11 +13,12 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::{decode, encode, encode_into};
 use crate::{
-    ApiError, Artifact, Basis, BuildScriptRan, Cached, Cargo, Diagnostic, Edit, Edited,
-    EditedItem, Envelope, FactRead, FetchVerb, How, Level, LinkKind, Memory, Mismatch, Ranked,
-    Reach, ReachedItem, Request, Response, Span, Status, Table, TagMemory, Target, Targets,
-    TestOutcome, TestResult, Traced, Ub, UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb,
-    ViewRef, Worked,
+    ApiError, Applicability, Artifact, ArtifactKind, Basis, BuildScriptRan, Cached, Cargo,
+    CrateType, Diagnostic, Edit, Edited, EditedItem, Envelope, FactRead, FetchVerb, How, Level,
+    LinkKind, Memory, Mismatch, Ranked, Reach, ReachedItem, Request, Response, ResponseRef, Span,
+    ServedCrate, ServedPart, Status, Table, TagMemory, Target, TargetKind, Targets, TestOutcome,
+    TestResult, Traced, Ub,
+    UnitOf, UnitProfile, UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
 const REQUESTS: usize = 23;
@@ -214,7 +215,9 @@ impl Gen {
             root: self.text(),
             color: self.yes(),
             files: self.many(1, |g| (g.text(), g.bytes())),
+            width: self.maybe(Gen::u32),
             command: self.text(),
+            verbose: self.next() as u8,
         }
     }
 
@@ -339,25 +342,52 @@ impl Gen {
             byte_start: self.u32(),
             end_column: self.u32(),
             replacement: self.maybe(Gen::text),
-            applicability: self.maybe(Gen::text),
+            applicability: self.maybe(|g| {
+                const SURE: [Applicability; 4] = [
+                    Applicability::MachineApplicable,
+                    Applicability::MaybeIncorrect,
+                    Applicability::HasPlaceholders,
+                    Applicability::Unspecified,
+                ];
+                SURE[g.below(SURE.len() as u64) as usize]
+            }),
         }
     }
 
     fn unit_target(&mut self) -> UnitTarget {
+        const KINDS: [TargetKind; 6] = [
+            TargetKind::Lib,
+            TargetKind::Bin,
+            TargetKind::Test,
+            TargetKind::Bench,
+            TargetKind::Example,
+            TargetKind::CustomBuild,
+        ];
+        const TYPES: [CrateType; 8] = [
+            CrateType::Bin,
+            CrateType::Lib,
+            CrateType::Rlib,
+            CrateType::Dylib,
+            CrateType::Cdylib,
+            CrateType::Staticlib,
+            CrateType::ProcMacro,
+            CrateType::Sdylib,
+        ];
         UnitTarget {
             doc: self.yes(),
-            kind: self.texts(1),
+            kind: KINDS[self.below(KINDS.len() as u64) as usize],
             name: self.text(),
             test: self.yes(),
             doctest: self.yes(),
             edition: self.text(),
             src_path: self.text(),
-            crate_types: self.texts(1),
+            crate_types: self.many(1, |g| TYPES[g.below(TYPES.len() as u64) as usize]),
         }
     }
 
     fn unit_of(&mut self) -> UnitOf {
         UnitOf {
+            id: self.u32(),
             test: self.yes(),
             target: self.unit_target(),
             package_id: self.text(),
@@ -384,13 +414,24 @@ impl Gen {
                 false => Vec::new(),  // alloc: test and fuzz reference only
             },
             rendered: self.text(),
+            explanation: self.maybe(Gen::text),
         }
     }
 
     fn artifact(&mut self) -> Artifact {
+        const KINDS: [ArtifactKind; 8] = [
+            ArtifactKind::Bin,
+            ArtifactKind::Lib,
+            ArtifactKind::Test,
+            ArtifactKind::Example,
+            ArtifactKind::Bench,
+            ArtifactKind::ProcMacro,
+            ArtifactKind::CustomBuild,
+            ArtifactKind::Doctest,
+        ];
         Artifact {
             env: self.pairs(1),
-            kind: self.text(),
+            kind: KINDS[self.below(KINDS.len() as u64) as usize],
             path: self.text(),
             fresh: self.yes(),
             runner: self.texts(1),
@@ -431,6 +472,7 @@ impl Gen {
                     _ => Verb::Fresh,
                 },
                 source: self.maybe(Gen::text),
+                package: self.u32(),
                 version: self.text(),
                 package_id: self.text(),
             }),
@@ -458,6 +500,12 @@ impl Gen {
                 found: self.wide(),
                 green: self.wide(),
                 reran: self.wide(),
+                served: self.many(depth, |g| ServedCrate {
+                    why: g.maybe(Gen::text),
+                    bodies: ServedPart::ALL[(g.next() % 3) as usize],
+                    outcome: ServedPart::ALL[(g.next() % 3) as usize],
+                    package: g.text(),
+                }),
                 compiled: self.wide(),
                 critical_path_us: self.wide(),
             }),
@@ -475,6 +523,8 @@ impl Gen {
                 millis: self.wide(),
                 output: self.bytes(),
                 outcome: self.outcome(),
+                outside: self.yes(),
+                executable: self.u32(),
             }),
             9 => Response::Ran {
                 code: self.maybe(|g| g.next() as i32),
@@ -674,6 +724,32 @@ fn same_answer<T: DeserializeOwned + PartialEq + Debug>(bytes: &[u8]) {
     assert_eq!(new, old, "{bytes:02x?}");
 }
 
+/// The response `bytes` encode read where it lies, by both codecs and by [`decode`], is the
+/// one they read owned, or all of them refuse it.
+fn same_lent(bytes: &[u8]) {
+    fn lent(read: Result<Envelope<ResponseRef<'_>>, cbor::Error>) -> Result<Envelope<Response>, cbor::Error> {
+        read.map(|it| Envelope { schema: it.schema, id: it.id, body: it.body.into_owned() })
+    }
+    let owned = cbor::from_slice::<Envelope<Response>>(bytes);
+    let readings = [
+        lent(cbor::from_slice::<Envelope<ResponseRef<'_>>>(bytes)),
+        lent(reference::from_slice::<Envelope<ResponseRef<'_>>>(bytes)),
+    ];
+    for reading in readings {
+        match (&owned, reading) {
+            (Ok(owned), Ok(lent)) => assert_eq!(&lent, owned, "{bytes:02x?}"),
+            (Err(_), Err(_)) => {}
+            (owned, lent) => panic!("owned {owned:?}, in place {lent:?}: {bytes:02x?}"),
+        }
+    }
+    let owned = decode::<Response>(bytes).map_err(|it| it.id);
+    match (owned, decode::<ResponseRef<'_>>(bytes)) {
+        (Ok(owned), Ok(lent)) => assert_eq!(lent.body.into_owned(), owned.body, "{bytes:02x?}"),
+        (Err(owned), Err(lent)) => assert_eq!(lent.id, owned, "{bytes:02x?}"),
+        (owned, lent) => panic!("owned {owned:?}, in place {lent:?}: {bytes:02x?}"),
+    }
+}
+
 #[test]
 fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
     let mut g = Gen { rng: SplitMix64::new(0x2545_f491_4f6c_dd1d), plain: false };
@@ -691,6 +767,7 @@ fn every_request_and_response_is_the_bytes_the_old_codec_wrote() {
         );
         let envelope = Envelope::new(g.wide(), g.response(0));
         responses[response_index(&envelope.body)] = true;
+        same_lent(&cbor::to_vec(&envelope).unwrap());
         let in_order = same(&mut writer, &envelope);
         assert!(
             in_order || !g.plain,
@@ -712,5 +789,6 @@ fn changed_bytes_read_as_the_old_codec_read_them() {
         let mut response = reference::to_vec(&Envelope::new(g.wide(), g.response(0))).unwrap();
         g.mutate(&mut response);
         same_answer::<Response>(&response);
+        same_lent(&response);
     }
 }

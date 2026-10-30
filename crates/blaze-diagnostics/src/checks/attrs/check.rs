@@ -31,8 +31,11 @@
 use hir::{InFile, LangItem};
 use rustc_hash::FxHashMap;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, TextRange, WalkEvent,
-    ast::{self, HasGenericParams, HasName, HasTypeBounds, IsString},
+    SyntaxKind, TextRange, WalkEvent,
+    view::{
+        self as ast, AstNode, AstToken as _, HasAttrs as _, HasGenericArgs as _, HasGenericParams as _, HasName as _,
+        HasTypeBounds as _, IsString as _,
+    },
 };
 
 use super::{
@@ -41,7 +44,7 @@ use super::{
     parsers::{Finalize, doc},
 };
 use crate::{
-    cx::{Cx, def_range, signature_range},
+    cx::{Cx, def_range_view as def_range, item_range_view as item_range, signature_range_view as signature_range},
     lints::syntax::attrs::{
         Owner, Target,
         target::{GenericParamKind, MethodKind},
@@ -50,7 +53,13 @@ use crate::{
 };
 
 /// The errors `check_attributes` gives of `owner`'s attributes, parsed to `parsed`.
-pub(crate) fn check(cx: &Cx<'_, '_>, session: &Session, owner: &Owner, parsed: &[ParsedAttr], errors: &mut Vec<Diag>) {
+pub(crate) fn check<'db>(
+    cx: &Cx<'_, 'db>,
+    session: &Session,
+    owner: &Owner<'db>,
+    parsed: &[ParsedAttr],
+    errors: &mut Vec<Diag>,
+) {
     let mut fx = Finalize::new(cx, session, owner, errors);
     non_exported_macro(&mut fx, parsed);
     for attr in parsed {
@@ -93,8 +102,8 @@ fn one(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr], attr: &ParsedAttr) 
 }
 
 /// The node's syntax as `N`, when it is one.
-fn node<N: AstNode>(fx: &Finalize<'_, '_, '_>) -> Option<N> {
-    N::cast(fx.owner.node.value.clone())
+fn node<'db, N: AstNode<'db>>(fx: &Finalize<'_, '_, 'db>) -> Option<N> {
+    N::cast(fx.owner.node.value)
 }
 
 /// A range of the file the node is in.
@@ -103,7 +112,7 @@ fn node_span(fx: &Finalize<'_, '_, '_>, range: TextRange) -> crate::model::Span 
 }
 
 /// Whether `node` has the keyword `kind` among its own tokens (`const trait`, `impl const`).
-fn has_keyword(node: &SyntaxNode, kind: SyntaxKind) -> bool {
+fn has_keyword(node: ast::Node<'_>, kind: SyntaxKind) -> bool {
     node.children_with_tokens().any(|it| it.as_token().is_some_and(|it| it.kind() == kind))
 }
 
@@ -112,8 +121,8 @@ fn allow_const_fn_unstable(fx: &mut Finalize<'_, '_, '_>, attr: usize) {
     if !matches!(fx.target(), Target::Fn | Target::Method(_)) {
         return;
     }
-    let Some(function) = node::<ast::Fn>(fx) else { return };
-    if is_const_fn(&function) {
+    let Some(function) = node::<ast::Fn<'_>>(fx) else { return };
+    if is_const_fn(function) {
         return;
     }
     let mut diag = Diag::error(None, "attribute should be applied to `const fn`", fx.attr_span(attr));
@@ -122,13 +131,13 @@ fn allow_const_fn_unstable(fx: &mut Finalize<'_, '_, '_>, attr: usize) {
 }
 
 /// rustc's `is_const_fn`: written `const`, or a method of a `const trait` or of a const impl.
-fn is_const_fn(function: &ast::Fn) -> bool {
+fn is_const_fn(function: ast::Fn<'_>) -> bool {
     if function.const_token().is_some() {
         return true;
     }
     let Some(container) = function.syntax().parent().and_then(|it| it.parent()) else { return false };
     match container.kind() {
-        SyntaxKind::TRAIT | SyntaxKind::IMPL => has_keyword(&container, SyntaxKind::CONST_KW),
+        SyntaxKind::TRAIT | SyntaxKind::IMPL => has_keyword(container, SyntaxKind::CONST_KW),
         _ => false,
     }
 }
@@ -157,25 +166,27 @@ impl ObjectLifetimeDefault {
 /// parameters' object lifetime default, at the parameter (a trait's `Self` first, at the trait;
 /// a function's `impl Trait` arguments last).
 fn object_lifetime_defaults(fx: &mut Finalize<'_, '_, '_>) {
-    let item = fx.owner.node.value.clone();
-    let Some(generic) = ast::AnyHasGenericParams::cast(item.clone()) else { return };
-    let predicates: Vec<ast::WherePred> =
+    let item = fx.owner.node.value;
+    let Some(generic) = ast::AnyHasGenericParams::cast(item) else { return };
+    let predicates: Vec<ast::WherePred<'_>> =
+        // alloc: only for `#[rustc_dump_object_lifetime_defaults]`, always an error
         generic.where_clause().map(|it| it.predicates().collect()).unwrap_or_default();
+    // alloc: as above
     let mut found: Vec<(TextRange, ObjectLifetimeDefault)> = Vec::new();
-    if let Some(trait_) = ast::Trait::cast(item.clone()) {
+    if let Some(trait_) = ast::Trait::cast(item) {
         let mut set = LifetimeSet::Empty;
         set.add(trait_.type_bound_list());
-        for predicate in predicates.iter().filter(|it| bounds_param(it, "Self")) {
+        for &predicate in predicates.iter().filter(|it| bounds_param(**it, "Self")) {
             set.add(predicate.type_bound_list());
         }
-        found.push((def_range(&item), set.default()));
+        found.push((def_range(item), set.default()));
     }
     for param in generic.generic_param_list().into_iter().flat_map(|it| it.generic_params()) {
         let ast::GenericParam::TypeParam(param) = param else { continue };
         let Some(name) = param.name() else { continue };
         let mut set = LifetimeSet::Empty;
         set.add(param.type_bound_list());
-        for predicate in predicates.iter().filter(|it| bounds_param(it, name.text().as_str())) {
+        for &predicate in predicates.iter().filter(|it| bounds_param(**it, name.text())) {
             set.add(predicate.type_bound_list());
         }
         found.push((name.syntax().text_range(), set.default()));
@@ -195,7 +206,7 @@ fn object_lifetime_defaults(fx: &mut Finalize<'_, '_, '_>) {
 }
 
 /// Whether a `where` predicate bounds exactly the parameter `name`, without `for<..>`.
-fn bounds_param(predicate: &ast::WherePred, name: &str) -> bool {
+fn bounds_param(predicate: ast::WherePred<'_>, name: &str) -> bool {
     if predicate.for_binder().is_some() {
         return false;
     }
@@ -206,18 +217,18 @@ fn bounds_param(predicate: &ast::WherePred, name: &str) -> bool {
 }
 
 /// rustc's `Set1` of the lifetimes a type parameter outlives.
-enum LifetimeSet {
+enum LifetimeSet<'t> {
     Empty,
-    One(String),
+    One(&'t str),
     Many,
 }
 
-impl LifetimeSet {
-    fn add(&mut self, bounds: Option<ast::TypeBoundList>) {
+impl<'t> LifetimeSet<'t> {
+    fn add(&mut self, bounds: Option<ast::TypeBoundList<'t>>) {
         for bound in bounds.into_iter().flat_map(|it| it.bounds()) {
             let Some(lifetime) = bound.lifetime() else { continue };
-            let name = lifetime.syntax().text().to_string();
-            *self = match std::mem::replace(self, LifetimeSet::Many) {
+            let name = lifetime.syntax().text();
+            *self = match *self {
                 LifetimeSet::Empty => LifetimeSet::One(name),
                 LifetimeSet::One(it) if it == name => LifetimeSet::One(it),
                 _ => LifetimeSet::Many,
@@ -228,20 +239,12 @@ impl LifetimeSet {
     fn default(self) -> ObjectLifetimeDefault {
         match self {
             LifetimeSet::Empty => ObjectLifetimeDefault::Empty,
-            LifetimeSet::One(it) if it == "'static" => ObjectLifetimeDefault::Static,
-            LifetimeSet::One(it) if it == "'_" => ObjectLifetimeDefault::Ambiguous,
-            LifetimeSet::One(it) => ObjectLifetimeDefault::Param(it),
+            LifetimeSet::One("'static") => ObjectLifetimeDefault::Static,
+            LifetimeSet::One("'_") => ObjectLifetimeDefault::Ambiguous,
+            // alloc: only for `#[rustc_dump_object_lifetime_defaults]`, always an error
+            LifetimeSet::One(it) => ObjectLifetimeDefault::Param(it.to_owned()),
             LifetimeSet::Many => ObjectLifetimeDefault::Ambiguous,
         }
-    }
-}
-
-/// A function's ABI as rustc names it: `Rust` without `extern`, `C` for `extern` alone.
-fn abi(function: &ast::Fn) -> String {
-    let Some(abi) = function.abi() else { return "Rust".to_owned() };
-    match abi.string_token().and_then(ast::String::cast) {
-        Some(it) => it.value().map(|it| it.into_owned()).unwrap_or_else(|_| it.text_without_quotes().to_owned()),
-        None => "C".to_owned(),
     }
 }
 
@@ -253,12 +256,19 @@ fn naked(fx: &mut Finalize<'_, '_, '_>) {
     ) {
         return;
     }
-    let Some(function) = node::<ast::Fn>(fx) else { return };
-    let abi = abi(&function);
-    if !matches!(abi.as_str(), "Rust" | "rust-call" | "rust-cold" | "rust-preserve-none" | "tail") {
+    let Some(function) = node::<ast::Fn<'_>>(fx) else { return };
+    // The function's ABI as rustc names it: `Rust` without `extern`, `C` for `extern` alone.
+    let string = function.abi().map(|abi| abi.string_token().and_then(ast::String::cast));
+    let abi = match string {
+        None => std::borrow::Cow::Borrowed("Rust"),
+        Some(None) => std::borrow::Cow::Borrowed("C"),
+        Some(Some(it)) => it.value().unwrap_or_else(|_| std::borrow::Cow::Borrowed(it.text_without_quotes())),
+    };
+    if !matches!(&*abi, "Rust" | "rust-call" | "rust-cold" | "rust-preserve-none" | "tail") {
         return;
     }
-    let span = node_span(fx, signature_range(&function));
+    let span = node_span(fx, signature_range(function));
+    // alloc: only for a naked function of a Rust ABI
     fx.gate("naked_functions_rustic_abi", span, format!("`#[naked]` is currently unstable on `extern \"{abi}\"` functions"));
 }
 
@@ -271,7 +281,7 @@ fn track_caller(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr], attr: usiz
         return;
     }
     let Some(name) = parsed.iter().find_map(|it| match &it.parsed {
-        Parsed::Lang(name) => Some(name.as_str()),
+        Parsed::Lang(name) => Some(*name),
         _ => None,
     }) else {
         return;
@@ -279,14 +289,18 @@ fn track_caller(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr], attr: usiz
     if !WEAK_LANG_ITEMS.contains(&name) {
         return;
     }
-    let Some(function) = node::<ast::Fn>(fx) else { return };
+    let Some(function) = node::<ast::Fn<'_>>(fx) else { return };
     let what = match name {
+        // alloc: the error's message
         "panic_impl" => "`#[panic_handler]`".to_owned(),
+        // alloc: the error's message
         other => format!("`{other}` lang item"),
     };
+    // alloc: the error's message
     let message = format!("{what} function is not allowed to have `#[track_caller]`");
+    // clone: the error's message
     let mut diag = Diag::error(None, message.clone(), fx.attr_span(attr));
-    diag.span_label(node_span(fx, signature_range(&function)), message);
+    diag.span_label(node_span(fx, signature_range(function)), message);
     fx.emit_err(diag);
 }
 
@@ -295,7 +309,7 @@ fn non_exhaustive(fx: &mut Finalize<'_, '_, '_>, attr: usize) {
     if fx.target() != Target::Struct {
         return;
     }
-    let Some(ast::FieldList::RecordFieldList(fields)) = node::<ast::Struct>(fx).and_then(|it| it.field_list()) else {
+    let Some(ast::FieldList::RecordFieldList(fields)) = node::<ast::Struct<'_>>(fx).and_then(|it| it.field_list()) else {
         return;
     };
     if !fields.fields().any(|it| it.default_val().is_some()) {
@@ -318,7 +332,7 @@ fn may_dangle(fx: &mut Finalize<'_, '_, '_>, attr: usize) {
     let in_drop_impl = || {
         let list = fx.owner.node.value.parent().filter(|it| it.kind() == SyntaxKind::GENERIC_PARAM_LIST)?;
         let impl_ = list.parent().and_then(ast::Impl::cast)?;
-        let trait_ = fx.cx.sema.to_def(&impl_)?.trait_(fx.cx.db)?;
+        let trait_ = fx.cx.vsema.to_def(impl_)?.trait_(fx.cx.db)?;
         Some(hir::Trait::lang(fx.cx.db, fx.cx.krate, LangItem::Drop)? == trait_)
     };
     if in_drop_impl() == Some(true) {
@@ -337,27 +351,34 @@ fn legacy_const_generics(fx: &mut Finalize<'_, '_, '_>, attr: usize, indices: &[
     if fx.target() != Target::Fn {
         return;
     }
-    let Some(function) = node::<ast::Fn>(fx) else { return };
-    let mut params: Vec<(bool, TextRange)> = function
-        .generic_param_list()
-        .into_iter()
-        .flat_map(|it| it.generic_params())
-        .map(|it| (matches!(it, ast::GenericParam::ConstParam(_)), it.syntax().text_range()))
-        .collect();
-    let inputs: Vec<ast::Param> = function.param_list().into_iter().flat_map(|it| it.params()).collect();
-    for param in &inputs {
-        let Some(ty) = param.ty() else { continue };
-        params.extend(
-            ty.syntax().descendants().filter(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE).map(|it| (false, it.text_range())),
-        );
+    let Some(function) = node::<ast::Fn<'_>>(fx) else { return };
+    // The generic parameters, the `impl Trait` arguments last: how many, and the first that is
+    // not a const's.
+    let (mut params, mut non_const) = (0, None);
+    let mut param = |is_const: bool, range: TextRange| {
+        params += 1;
+        if !is_const && non_const.is_none() {
+            non_const = Some(range);
+        }
+    };
+    for it in function.generic_param_list().into_iter().flat_map(|it| it.generic_params()) {
+        param(matches!(it, ast::GenericParam::ConstParam(_)), it.syntax().text_range());
     }
-    if let Some(&(_, range)) = params.iter().find(|(is_const, _)| !is_const) {
+    let mut inputs = 0;
+    for input in function.param_list().into_iter().flat_map(|it| it.params()) {
+        inputs += 1;
+        let Some(ty) = input.ty() else { continue };
+        for it in ty.syntax().descendants().filter(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE) {
+            param(false, it.text_range());
+        }
+    }
+    if let Some(range) = non_const {
         let mut diag = Diag::error(None, "#[rustc_legacy_const_generics] functions must only have const generics", fx.attr_span(attr));
         diag.span_label(node_span(fx, range), "non-const generic parameter");
         fx.emit_err(diag);
         return;
     }
-    if indices.len() != params.len() {
+    if indices.len() != params {
         let generics = match function.generic_param_list() {
             Some(list) => list.syntax().text_range(),
             None => {
@@ -375,16 +396,19 @@ fn legacy_const_generics(fx: &mut Finalize<'_, '_, '_>, attr: usize, indices: &[
         return;
     }
     let self_param = function.param_list().and_then(|it| it.self_param()).is_some();
-    let arg_count = inputs.len() + usize::from(self_param) + params.len();
+    let arg_count = inputs + usize::from(self_param) + params;
     for &(index, range) in indices {
         if index < arg_count {
             continue;
         }
         let span = fx.span(attr, range);
         let label = match arg_count {
+            // alloc: the error's label
             1 => "there is only 1 argument".to_owned(),
+            // alloc: the error's label
             n => format!("there are only {n} arguments"),
         };
+        // clone: the error's span
         let mut diag = Diag::error(None, "index exceeds number of arguments", span.clone());
         diag.span_label(span, label);
         fx.emit_err(diag);
@@ -392,26 +416,27 @@ fn legacy_const_generics(fx: &mut Finalize<'_, '_, '_>, attr: usize, indices: &[
 }
 
 /// An associated item of a trait, as `check_rustc_must_implement_one_of` looks at it.
-struct AssocItem {
-    name: String,
+struct AssocItem<'t> {
+    name: &'t str,
     /// rustc's `def_span`.
     range: TextRange,
     /// A function, with whether it has a default body.
     function: Option<bool>,
 }
 
-fn assoc_items(trait_: &ast::Trait) -> Vec<AssocItem> {
+fn assoc_items(trait_: ast::Trait<'_>) -> Vec<AssocItem<'_>> {
+    // alloc: only for `#[rustc_must_implement_one_of]`
     let mut items = Vec::new();
     for item in trait_.assoc_item_list().into_iter().flat_map(|it| it.assoc_items()) {
-        let (name, range, function) = match &item {
+        let (name, range, function) = match item {
             ast::AssocItem::Fn(it) => (it.name(), signature_range(it), Some(it.body().is_some())),
             ast::AssocItem::Const(it) => {
-                let start = crate::cx::item_range(it.syntax()).start();
+                let start = item_range(it.syntax()).start();
                 let end = it.ty().map(|ty| ty.syntax().text_range().end()).or_else(|| it.name().map(|n| n.syntax().text_range().end()));
                 (it.name(), TextRange::new(start, end.unwrap_or(start)), None)
             }
             ast::AssocItem::TypeAlias(it) => {
-                let start = crate::cx::item_range(it.syntax()).start();
+                let start = item_range(it.syntax()).start();
                 let end = it
                     .generic_param_list()
                     .map(|g| g.syntax().text_range().end())
@@ -421,7 +446,7 @@ fn assoc_items(trait_: &ast::Trait) -> Vec<AssocItem> {
             ast::AssocItem::MacroCall(_) => continue,
         };
         let Some(name) = name else { continue };
-        items.push(AssocItem { name: name.text().to_string(), range, function });
+        items.push(AssocItem { name: name.text(), range, function });
     }
     items
 }
@@ -432,19 +457,21 @@ fn must_implement_one_of(fx: &mut Finalize<'_, '_, '_>, attr: usize, names: &[(S
     if fx.target() != Target::Trait {
         return;
     }
-    let Some(trait_) = node::<ast::Trait>(fx) else { return };
-    let items = assoc_items(&trait_);
+    let Some(trait_) = node::<ast::Trait<'_>>(fx) else { return };
+    let items = assoc_items(trait_);
     let attr_span = fx.attr_span(attr);
     for (name, range) in names {
-        match items.iter().find(|it| it.name == *name) {
+        match items.iter().find(|it| it.name == name.as_str()) {
             Some(AssocItem { function: Some(true), .. }) => {}
             Some(AssocItem { function: Some(false), range, .. }) => {
                 let mut diag = Diag::error(None, "function doesn't have a default implementation", node_span(fx, *range));
+                // clone: the error's span
                 diag.span_note(attr_span.clone(), "required by this annotation");
                 fx.emit_err(diag);
             }
             Some(AssocItem { function: None, range, .. }) => {
                 let mut diag = Diag::error(None, "not a function", node_span(fx, *range));
+                // clone: the error's span
                 diag.span_note(attr_span.clone(), "required by this annotation");
                 diag.note("all `#[rustc_must_implement_one_of]` arguments must be associated function names");
                 fx.emit_err(diag);
@@ -469,14 +496,14 @@ fn must_implement_one_of(fx: &mut Finalize<'_, '_, '_>, attr: usize, names: &[(S
 /// `check_linkage`: on an extern `static mut`, or a `const fn`.
 fn linkage(fx: &mut Finalize<'_, '_, '_>, attr: usize) {
     match fx.target() {
-        Target::ForeignStatic if node::<ast::Static>(fx).is_some_and(|it| it.mut_token().is_some()) => {
+        Target::ForeignStatic if node::<ast::Static<'_>>(fx).is_some_and(|it| it.mut_token().is_some()) => {
             let mut diag = Diag::error(None, "extern mutable statics are incompatible with the `linkage` attribute", fx.attr_span(attr));
             diag.note(
                 "the `linkage` attribute on extern statics generates a symbol that contains the address of another static. Making the extern static mutable would allow changing the address, rather than the static the address is pointing to",
             );
             fx.emit_err(diag);
         }
-        Target::Fn if node::<ast::Fn>(fx).is_some_and(|it| it.const_token().is_some()) => {
+        Target::Fn if node::<ast::Fn<'_>>(fx).is_some_and(|it| it.const_token().is_some()) => {
             let mut diag = Diag::error(None, "`const fn` are incompatible with the `linkage` attribute", fx.attr_span(attr));
             diag.note("`const fn` may be called at compile time, which happens before linking");
             fx.emit_err(diag);
@@ -510,21 +537,27 @@ fn repr(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
             Repr::Align(_) | Repr::Packed(_) => {}
         }
     }
-    let hints: Vec<crate::model::Span> = reprs.iter().map(|(_, range)| fx.span(first, *range)).collect();
+    let hints = |fx: &Finalize<'_, '_, '_>| -> Vec<crate::model::Span> {
+        // alloc: the error's spans
+        reprs.iter().map(|(_, range)| fx.span(first, *range)).collect()
+    };
     let target = fx.target().name();
     if transparent && reprs.len() > 1 {
-        let diag = multi(Some("E0692"), format!("transparent {target} cannot have other repr hints"), hints.clone());
+        // alloc: the error's message
+        let diag = multi(Some("E0692"), format!("transparent {target} cannot have other repr hints"), hints(fx));
         fx.emit_err(diag);
     }
     if transparent
         && let Some(((), pass)) = find(parsed, |it| matches!(it, Parsed::RustcPassIndirectlyInNonRusticAbis).then_some(()))
     {
+        // alloc: the error's spans
         let spans = vec![fx.target_span(), fx.attr_span(pass)];
+        // alloc: the error's message
         let diag = multi(Some("E0692"), format!("transparent {target} cannot have other repr hints"), spans);
         fx.emit_err(diag);
     }
     if rust && (ints > 0 || c || simd) {
-        let diag = multi(Some("E0566"), "conflicting representation hints", hints);
+        let diag = multi(Some("E0566"), "conflicting representation hints", hints(fx));
         fx.emit_err(diag);
     }
 }
@@ -545,34 +578,36 @@ fn multi(code: Option<&str>, message: impl Into<String>, spans: Vec<crate::model
 /// at the function.
 fn force_inline(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
     let Some(((), attr)) = find(parsed, |it| matches!(it, Parsed::Inline(Inline::Force)).then_some(())) else { return };
-    let Some(function) = node::<ast::Fn>(fx) else { return };
+    let Some(function) = node::<ast::Fn<'_>>(fx) else { return };
     let mut coroutines = usize::from(function.async_token().is_some() || function.gen_token().is_some());
     if let Some(body) = function.body() {
         let mut events = body.syntax().preorder();
         while let Some(event) = events.next() {
             let WalkEvent::Enter(node) = event else { continue };
-            if node != *body.syntax() && ast::Item::can_cast(node.kind()) {
+            if node != body.syntax() && ast::Item::can_cast(node.kind()) {
                 events.skip_subtree();
                 continue;
             }
-            if let Some(block) = ast::BlockExpr::cast(node.clone())
-                && (block.async_token().is_some() || block.gen_token().is_some())
-            {
-                coroutines += 1;
+            if ast::BlockExpr::can_cast(node.kind()) {
+                let block = ast::BlockExpr::cast(node).expect("a block");
+                if block.async_token().is_some() || block.gen_token().is_some() {
+                    coroutines += 1;
+                }
             } else if let Some(closure) = ast::ClosureExpr::cast(node)
                 && (closure.async_token().is_some() || closure.gen_token().is_some())
             {
-                if ast::HasAttrs::attrs(&closure).any(|it| it.simple_name().as_deref() == Some("rustc_force_inline")) {
+                if closure.attrs().any(|it| it.simple_name() == Some("rustc_force_inline")) {
                     continue;
                 }
                 coroutines += 1;
             }
         }
     }
-    let span = node_span(fx, signature_range(&function));
+    let span = node_span(fx, signature_range(function));
     for _ in 0..coroutines {
         let mut diag =
             Diag::error(None, "attribute cannot be applied to a `async`, `gen` or `async gen` function", fx.attr_span(attr));
+        // clone: the error's span
         diag.span_label(span.clone(), "`async`, `gen` or `async gen` function");
         fx.emit_err(diag);
     }
@@ -594,6 +629,7 @@ fn optimize_and_inline(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
         return;
     }
     let optimize_span = fx.attr_span(optimize);
+    // clone: the error's span
     let mut diag = Diag::error(None, "`#[optimize(none)]` cannot be used with `#[inline]` attributes", optimize_span.clone());
     diag.span_label(optimize_span, "`#[optimize(none)]` here");
     diag.span_label(fx.attr_span(at), "`#[inline]` here");
@@ -603,7 +639,7 @@ fn optimize_and_inline(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
 /// `check_non_exported_macro_for_invalid_attrs`: E0518, `#[inline]` on a `macro_rules` that is
 /// not `#[macro_export]`.
 fn non_exported_macro(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
-    if fx.target() != Target::MacroDef || node::<ast::MacroRules>(fx).is_none() {
+    if fx.target() != Target::MacroDef || node::<ast::MacroRules<'_>>(fx).is_none() {
         return;
     }
     if parsed.iter().any(|it| matches!(it.parsed, Parsed::MacroExport)) {
@@ -616,6 +652,7 @@ fn non_exported_macro(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
         return;
     };
     let span = fx.attr_span(attr);
+    // clone: the error's span
     let mut diag = Diag::error(Some("E0518"), "attribute should be applied to function or closure", span.clone());
     diag.span_label(span, "not a function or closure");
     fx.emit_err(diag);
@@ -623,41 +660,77 @@ fn non_exported_macro(fx: &mut Finalize<'_, '_, '_>, parsed: &[ParsedAttr]) {
 
 #[cfg(test)]
 mod tests {
-    use syntax::{AstNode, SourceFile, ast};
+    use syntax::{
+        Parse, SourceFile,
+        view::{self as ast, AstNode, HasTypeBounds as _},
+    };
 
     use super::{LifetimeSet, ObjectLifetimeDefault, bounds_param};
 
-    fn first<N: AstNode>(text: &str) -> N {
-        let parse = SourceFile::parse(text, span::Edition::Edition2021);
-        parse.tree().syntax().descendants().find_map(N::cast).unwrap()
+    fn parse(text: &str) -> Parse<SourceFile> {
+        SourceFile::parse(text, span::Edition::Edition2021)
+    }
+
+    fn first<'t, N: AstNode<'t>>(parse: &'t Parse<SourceFile>) -> N {
+        parse.root().descendants().find_map(N::cast).unwrap()
     }
 
     #[test]
     fn one_lifetime_twice_is_that_lifetime() {
-        let param: ast::TypeParam = first("struct S<'a, T: 'a + 'a>(&'a T);");
+        let parse = parse("struct S<'a, T: 'a + 'a>(&'a T);");
+        let param: ast::TypeParam<'_> = first(&parse);
         let mut set = LifetimeSet::Empty;
-        set.add(ast::HasTypeBounds::type_bound_list(&param));
+        set.add(param.type_bound_list());
         assert!(set.default() == ObjectLifetimeDefault::Param("'a".to_owned()));
     }
 
     #[test]
     fn two_lifetimes_are_ambiguous_and_static_is_static() {
-        let param: ast::TypeParam = first("struct S<'a, 'b, T: 'a + 'b>(&'a T);");
+        let two = parse("struct S<'a, 'b, T: 'a + 'b>(&'a T);");
+        let param: ast::TypeParam<'_> = first(&two);
         let mut set = LifetimeSet::Empty;
-        set.add(ast::HasTypeBounds::type_bound_list(&param));
+        set.add(param.type_bound_list());
         assert!(set.default() == ObjectLifetimeDefault::Ambiguous);
-        let param: ast::TypeParam = first("struct S<T: 'static>(T);");
+        let one = parse("struct S<T: 'static>(T);");
+        let param: ast::TypeParam<'_> = first(&one);
         let mut set = LifetimeSet::Empty;
-        set.add(ast::HasTypeBounds::type_bound_list(&param));
+        set.add(param.type_bound_list());
         assert!(set.default() == ObjectLifetimeDefault::Static);
     }
 
     #[test]
     fn a_where_predicate_bounds_only_its_own_parameter() {
-        let pred: ast::WherePred = first("struct S<T>(T) where T: 'static;");
-        assert!(bounds_param(&pred, "T"));
-        assert!(!bounds_param(&pred, "U"));
-        let pred: ast::WherePred = first("struct S<T>(T) where for<'a> T: 'a;");
-        assert!(!bounds_param(&pred, "T"));
+        let plain = parse("struct S<T>(T) where T: 'static;");
+        let pred: ast::WherePred<'_> = first(&plain);
+        assert!(bounds_param(pred, "T"));
+        assert!(!bounds_param(pred, "U"));
+        let binder = parse("struct S<T>(T) where for<'a> T: 'a;");
+        let pred: ast::WherePred<'_> = first(&binder);
+        assert!(!bounds_param(pred, "T"));
+    }
+
+    #[test]
+    fn a_traits_items_are_named_as_the_handles_name_them() {
+        use syntax::{AstNode as _, ast::HasName as _};
+
+        let parse = parse("trait T { fn a(); fn b() {} const C: u8; type D<X>; m!(); }");
+        let items = super::assoc_items(first(&parse));
+        let trait_: syntax::ast::Trait = parse.tree().syntax().descendants().find_map(syntax::ast::Trait::cast).unwrap();
+        let handles: Vec<_> = trait_
+            .assoc_item_list()
+            .into_iter()
+            .flat_map(|it| it.assoc_items())
+            .filter_map(|it| match it {
+                syntax::ast::AssocItem::Fn(it) => it.name(),
+                syntax::ast::AssocItem::Const(it) => it.name(),
+                syntax::ast::AssocItem::TypeAlias(it) => it.name(),
+                syntax::ast::AssocItem::MacroCall(_) => None,
+            })
+            .map(|it| it.text().to_string())
+            .collect();
+        let names: Vec<_> = items.iter().map(|it| it.name).collect();
+        assert_eq!(names, handles);
+        let functions: Vec<_> = items.iter().map(|it| it.function).collect();
+        assert_eq!(functions, [Some(false), Some(true), None, None]);
     }
 }

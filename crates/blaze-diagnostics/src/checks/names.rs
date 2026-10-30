@@ -9,17 +9,20 @@
 //! `resolve_lifetime`, `PathSource`), `late/diagnostics.rs` and `imports.rs` (MIT or
 //! Apache-2.0).
 
-mod failure;
+pub(crate) mod failure;
 mod lifetimes;
 mod outer;
-mod paths;
+pub(crate) mod paths;
 mod privacy;
 mod reexports;
 
 use blaze_items::{Fact, ItemId};
-use hir::{HasSource as _, InFile};
+use hir::InFile;
 use hir_def::ImplId;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, WalkEvent, ast};
+use syntax::{
+    SyntaxKind, WalkEvent,
+    view::{self as ast, AstNode as _},
+};
 
 use super::defs::item_id;
 use crate::{cx::Cx, lower::Found, model::Diag};
@@ -32,14 +35,14 @@ pub(crate) fn check(cx: &Cx<'_, '_>, scopes: &[hir::Module]) -> Vec<Found> {
     found
 }
 
-/// An item whose signature is walked: its syntax, rooted where Semantics resolves it, and the
-/// item whose signature its errors read.
-pub(super) struct Signature {
-    pub(super) node: InFile<SyntaxNode>,
+/// An item whose signature is walked: its syntax, in a tree `cx.vsema` gave out, and the item
+/// whose signature its errors read.
+pub(super) struct Signature<'db> {
+    pub(super) node: InFile<ast::Node<'db>>,
     pub(super) item: Option<ItemId>,
 }
 
-impl Signature {
+impl Signature<'_> {
     /// The fact of the item's signature an error of it reads (its key is asked for here, at
     /// the edge, not for every item walked).
     pub(super) fn fact(&self, cx: &Cx<'_, '_>, diag: &mut Diag) {
@@ -51,54 +54,54 @@ impl Signature {
 
 /// Each item of the crate's scopes given to `visit`, in rustc's order, those of traits and
 /// impls after them.
-fn signatures(cx: &Cx<'_, '_>, scopes: &[hir::Module], mut visit: impl FnMut(Signature)) {
+fn signatures<'db>(cx: &Cx<'_, 'db>, scopes: &[hir::Module], mut visit: impl FnMut(Signature<'db>)) {
     let db = cx.db;
-    let mut push = |node: Option<InFile<SyntaxNode>>, item: Option<ItemId>| {
+    let mut push = |node: Option<InFile<ast::Node<'db>>>, item: Option<ItemId>| {
         let Some(node) = node else { return };
         visit(Signature { node, item });
     };
     for &module in scopes {
-        for def in module.declarations(db) {
+        for def in module.declarations_iter(db) {
             let item = item_id(db, def);
             match def {
-                hir::ModuleDef::Function(it) => push(syntax_of(cx.sema.source(it)), item),
-                hir::ModuleDef::Adt(it) => push(syntax_of(cx.sema.source(it)), item),
-                hir::ModuleDef::TypeAlias(it) => push(syntax_of(cx.sema.source(it)), item),
-                hir::ModuleDef::Const(it) => push(syntax_of(cx.sema.source(it)), item),
-                hir::ModuleDef::Static(it) => push(syntax_of(cx.sema.source(it)), item),
+                hir::ModuleDef::Function(it) => push(syntax_of(cx.vsema.source(it)), item),
+                hir::ModuleDef::Adt(it) => push(syntax_of(cx.vsema.source(it)), item),
+                hir::ModuleDef::TypeAlias(it) => push(syntax_of(cx.vsema.source(it)), item),
+                hir::ModuleDef::Const(it) => push(syntax_of(cx.vsema.source(it)), item),
+                hir::ModuleDef::Static(it) => push(syntax_of(cx.vsema.source(it)), item),
                 hir::ModuleDef::Trait(it) => {
-                    push(syntax_of(cx.sema.source(it)), item);
-                    for assoc in it.items(db) {
+                    push(syntax_of(cx.vsema.source(it)), item);
+                    for assoc in it.items_iter(db) {
                         push(assoc_syntax(cx, assoc), item_id(db, assoc.into()));
                     }
                 }
                 _ => {}
             }
         }
-        for imp in module.impl_defs(db) {
-            push(syntax_of(cx.sema.source(imp)), ImplId::try_from(imp).ok().map(ItemId::Impl));
-            for assoc in imp.items(db) {
+        for imp in module.impl_defs_iter(db) {
+            push(syntax_of(cx.vsema.source(imp)), ImplId::try_from(imp).ok().map(ItemId::Impl));
+            for assoc in imp.items_iter(db) {
                 push(assoc_syntax(cx, assoc), item_id(db, assoc.into()));
             }
         }
     }
 }
 
-fn syntax_of<N: AstNode>(source: Option<InFile<N>>) -> Option<InFile<SyntaxNode>> {
-    source.map(|it| it.map(|it| it.syntax().clone()))
+fn syntax_of<'db, N: ast::AstNode<'db>>(source: Option<InFile<N>>) -> Option<InFile<ast::Node<'db>>> {
+    source.map(|it| it.map(|it| it.syntax()))
 }
 
-fn assoc_syntax(cx: &Cx<'_, '_>, assoc: hir::AssocItem) -> Option<InFile<SyntaxNode>> {
+fn assoc_syntax<'db>(cx: &Cx<'_, 'db>, assoc: hir::AssocItem) -> Option<InFile<ast::Node<'db>>> {
     match assoc {
-        hir::AssocItem::Function(it) => syntax_of(cx.sema.source(it)),
-        hir::AssocItem::Const(it) => syntax_of(cx.sema.source(it)),
-        hir::AssocItem::TypeAlias(it) => syntax_of(cx.sema.source(it)),
+        hir::AssocItem::Function(it) => syntax_of(cx.vsema.source(it)),
+        hir::AssocItem::Const(it) => syntax_of(cx.vsema.source(it)),
+        hir::AssocItem::TypeAlias(it) => syntax_of(cx.vsema.source(it)),
     }
 }
 
 /// Each path of a type or trait and each lifetime of the signature, the items, bodies,
 /// attributes and constants inside it left out.
-fn walk(cx: &Cx<'_, '_>, signature: &Signature, found: &mut Vec<Found>) {
+fn walk<'db>(cx: &Cx<'_, 'db>, signature: &Signature<'db>, found: &mut Vec<Found>) {
     let mut walk = signature.node.value.preorder();
     walk.next();
     while let Some(event) = walk.next() {
@@ -107,20 +110,20 @@ fn walk(cx: &Cx<'_, '_>, signature: &Signature, found: &mut Vec<Found>) {
             SyntaxKind::PATH_TYPE => {
                 let ty = ast::PathType::cast(node).expect("a PATH_TYPE node is a path type");
                 if let Some(path) = ty.path() {
-                    found.extend(paths::check(cx, signature, &ty, &path));
+                    found.extend(paths::check(cx, signature, ty, path));
                 }
             }
             SyntaxKind::LIFETIME => {
                 let lifetime = ast::Lifetime::cast(node).expect("a LIFETIME node is a lifetime");
-                found.extend(lifetimes::check(cx, signature, &lifetime));
+                found.extend(lifetimes::check(cx, signature, lifetime));
             }
-            _ if is_skipped(&node) => walk.skip_subtree(),
+            _ if is_skipped(node) => walk.skip_subtree(),
             _ => {}
         }
     }
 }
 
-fn is_skipped(node: &SyntaxNode) -> bool {
+fn is_skipped(node: ast::Node<'_>) -> bool {
     let kind = node.kind();
     ast::Item::can_cast(kind)
         || ast::AssocItemList::can_cast(kind)

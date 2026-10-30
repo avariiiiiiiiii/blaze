@@ -12,6 +12,7 @@ use std::fmt;
 
 use base_db::{Db, Crate};
 use blaze_ids::bits::{BitArray, BitIndex};
+use blaze_mem::Frame;
 use hir_def::attrs::AttrFlags;
 use hir_def::{FunctionId, HasModule};
 use intern::Symbol;
@@ -146,7 +147,7 @@ impl TargetArch {
 }
 
 /// The arch of `krate`'s target, from its `target_arch` cfg: once per crate.
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn crate_target_arch(db: &Db, krate: Crate) -> TargetArch {
     krate
         .cfg_options(db)
@@ -334,31 +335,35 @@ struct Declared {
 }
 
 impl Declared {
-    fn of<'a>(names: impl IntoIterator<Item = &'a Symbol>) -> Self {
+    fn of<'a>(frame: &Frame, names: impl IntoIterator<Item = &'a Symbol>) -> Self {
         let mut known = TargetFeatureSet::EMPTY;
-        let mut unknown = Vec::new();
+        let mut unknown = Vec::new_in(frame);
         for name in names {
             match TargetFeature::from_name(name.as_str()) {
                 Some(feature) => known.insert(feature),
-                None => unknown.push(name.clone()),
+                None => unknown.push(name),
             }
         }
         unknown.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         unknown.dedup();
-        Self { known, unknown: unknown.into_boxed_slice() }
+        // alloc: the memo's own list, at its size; none when every name is known
+        // clone: the memo keeps its own symbols
+        let unknown = unknown.iter().map(|&name| name.clone()).collect();
+        Self { known, unknown }
     }
 }
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Infer)]
 fn declared_target_features(db: &Db, owner: FunctionId) -> Declared {
-    Declared::of(AttrFlags::target_features(db, owner))
+    blaze_mem::frame::current(|frame| Declared::of(frame, AttrFlags::target_features(db, owner)))
 }
 
 /// The target features of rustc's tables that `krate`'s cfg has (`cfg(target_feature = "…")`),
 /// without what they imply: `CfgOptions::check_atom` of each, once per crate.
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub fn crate_target_features(db: &Db, krate: Crate) -> TargetFeatureSet {
     let values = krate.cfg_options(db).get_cfg_values("target_feature");
+    // alloc: none, the set is bits by value
     values.filter_map(|it| TargetFeature::from_name(it.as_str())).collect()
 }
 

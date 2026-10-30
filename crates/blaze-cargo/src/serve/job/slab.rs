@@ -1,12 +1,15 @@
-//! Generational slabs: a value's id is its slot and the slot's generation when it was put
+//! Generational indexes: a value's id is its slot and the slot's generation when it was put
 //! there, so a lookup is one index and one compare, and an id kept past its value's removal
 //! finds nothing (`slotmap`, `thunderdome`, a game engine's entity table).
 //!
-//! [`Slab`] hands out its own ids from a free list (last freed, first reused, so the slot is
-//! still in cache), each packable into the low bits of a [`blaze_core::Tag`]. [`Table`] holds
-//! values under ids handed out elsewhere (the session's `JobId`).
+//! [`Tagged`] keeps values in a [`blaze_mem::Slab`] (free slots reused newest first, so still
+//! in cache; a reserved region, so it grows without moving), each one's handle packed into the
+//! low bits of a [`blaze_core::Tag`]. [`Table`] holds values under ids handed out elsewhere
+//! (the session's `JobId`).
 
-/// A value's place in a [`Slab`] or [`Table`].
+use blaze_mem::{Handle, MemError, Slab, Tag as MemTag};
+
+/// A value's place in a [`Table`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Key {
     pub slot: u32,
@@ -14,6 +17,70 @@ pub struct Key {
 }
 
 const _: () = assert!(std::mem::size_of::<Key>() == 8);
+
+/// Values in a slab of at most `2^slot_bits`, each named in `slot_bits + generation_bits` bits:
+/// its slot, and its generation's low bits above. A slab's generation steps by two per reuse
+/// (odd while a slot holds a value), so a packed id is refused once its value is removed
+/// until its slot has been reused `2^(generation_bits - 1)` times.
+pub struct Tagged<T> {
+    slab: Slab<T>,
+    slot_bits: u32,
+    generation_mask: u32,
+}
+
+impl<T> Tagged<T> {
+    /// Reserves the room of `2^slot_bits` values, committing none.
+    pub fn new(slot_bits: u32, generation_bits: u32, tag: MemTag) -> Result<Tagged<T>, MemError> {
+        assert!(slot_bits < 32 && generation_bits <= 32 && slot_bits + generation_bits <= 64);
+        let generation_mask = if generation_bits == 32 { u32::MAX } else { (1 << generation_bits) - 1 };
+        Ok(Tagged { slab: Slab::new(1 << slot_bits, tag)?, slot_bits, generation_mask })
+    }
+
+    /// `value` in a free slot: its handle and the bits it packs into; an error once every slot
+    /// is taken.
+    pub fn insert(&mut self, value: T) -> Result<(Handle<T>, u64), MemError> {
+        // The region may hold more than asked (a page's worth); while fewer than `2^slot_bits`
+        // are live, every slot ever made is under `2^slot_bits`, so its index packs.
+        let wanted = self.slab.len() + 1;
+        if wanted > 1 << self.slot_bits {
+            return Err(MemError::TooLarge { tag: self.slab.tag(), what: "values of a tagged slab at once", wanted });
+        }
+        let handle = self.slab.try_insert(value)?;
+        Ok((handle, self.pack(handle)))
+    }
+
+    fn pack(&self, handle: Handle<T>) -> u64 {
+        u64::from(handle.index()) | u64::from(handle.generation() & self.generation_mask) << self.slot_bits
+    }
+
+    /// The value `packed` names: its slot holds one whose generation's low bits are `packed`'s.
+    /// Bits no handle of this slab packs into find nothing.
+    pub fn find(&self, packed: u64) -> Option<Handle<T>> {
+        let generation = packed >> self.slot_bits;
+        if generation > u64::from(self.generation_mask) {
+            return None;
+        }
+        let slot = (packed & ((1 << self.slot_bits) - 1)) as u32;
+        self.slab.handle_at(slot).filter(|it| u64::from(it.generation() & self.generation_mask) == generation)
+    }
+
+    pub fn get(&self, handle: Handle<T>) -> Option<&T> {
+        self.slab.get(handle)
+    }
+
+    pub fn get_mut(&mut self, handle: Handle<T>) -> Option<&mut T> {
+        self.slab.get_mut(handle)
+    }
+
+    pub fn remove(&mut self, handle: Handle<T>) -> Option<T> {
+        self.slab.remove(handle)
+    }
+
+    /// Every value, by slot.
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Handle<T>, &mut T)> {
+        self.slab.iter_mut()
+    }
+}
 
 struct Slot<T> {
     generation: u32,
@@ -30,95 +97,6 @@ impl<T> Slot<T> {
     }
 }
 
-/// Values under ids it hands out: at most `2^slot_bits` at once, each id packing into
-/// `slot_bits + generation_bits` bits. A generation wraps: an id is refused once its value is
-/// removed until its slot has been reused `2^generation_bits` times.
-pub struct Slab<T> {
-    slots: Vec<Slot<T>>,
-    free: Vec<u32>,
-    len: u32,
-    slot_bits: u32,
-    generation_mask: u32,
-}
-
-impl<T> Slab<T> {
-    pub fn new(slot_bits: u32, generation_bits: u32) -> Slab<T> {
-        assert!(slot_bits <= 32 && generation_bits <= 32 && slot_bits + generation_bits <= 64);
-        let generation_mask = if generation_bits == 32 { u32::MAX } else { (1 << generation_bits) - 1 };
-        Slab { slots: Vec::new(), free: Vec::new(), len: 0, slot_bits, generation_mask }
-    }
-
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    /// The id [`Slab::insert`] gives next; none once every slot is taken.
-    pub fn next(&self) -> Option<Key> {
-        if let Some(&slot) = self.free.last() {
-            return Some(Key { slot, generation: self.slots[slot as usize].generation });
-        }
-        let slot = u32::try_from(self.slots.len()).ok()?;
-        (u64::from(slot) < 1u64 << self.slot_bits).then_some(Key { slot, generation: 0 })
-    }
-
-    /// `value` in a free slot, its id; none, `value` given back, once every slot is taken.
-    pub fn insert(&mut self, value: T) -> Result<Key, T> {
-        let Some(key) = self.next() else { return Err(value) };
-        match self.free.pop() {
-            Some(slot) => self.slots[slot as usize].value = Some(value),
-            None => self.slots.push(Slot { generation: 0, value: Some(value) }),
-        }
-        self.len += 1;
-        Ok(key)
-    }
-
-    pub fn get(&self, key: Key) -> Option<&T> {
-        self.slots.get(key.slot as usize)?.get(key.generation)
-    }
-
-    pub fn get_mut(&mut self, key: Key) -> Option<&mut T> {
-        self.slots.get_mut(key.slot as usize)?.get_mut(key.generation)
-    }
-
-    /// The value of `key` taken out, its slot freed under the next generation.
-    pub fn remove(&mut self, key: Key) -> Option<T> {
-        let slot = self.slots.get_mut(key.slot as usize)?;
-        slot.get(key.generation)?;
-        let value = slot.value.take();
-        slot.generation = slot.generation.wrapping_add(1) & self.generation_mask;
-        self.free.push(key.slot);
-        self.len -= 1;
-        value
-    }
-
-    /// `key` as `slot | generation << slot_bits`.
-    pub fn pack(&self, key: Key) -> u64 {
-        u64::from(key.slot) | u64::from(key.generation) << self.slot_bits
-    }
-
-    /// The id [`Slab::pack`] made `packed` of; none for bits no id of this slab has.
-    pub fn unpack(&self, packed: u64) -> Option<Key> {
-        let slot_mask = (1u64 << self.slot_bits) - 1;
-        let generation = packed >> self.slot_bits;
-        if generation > u64::from(self.generation_mask) {
-            return None;
-        }
-        Some(Key { slot: (packed & slot_mask) as u32, generation: generation as u32 })
-    }
-
-    /// Every value, by slot.
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Key, &mut T)> {
-        (0u32..).zip(&mut self.slots).filter_map(|(slot, it)| {
-            let generation = it.generation;
-            it.value.as_mut().map(|value| (Key { slot, generation }, value))
-        })
-    }
-}
-
 /// Values under ids handed out elsewhere: a value's slot is its id's, and the one who hands
 /// them out puts a slot's next value in only once its last one is removed.
 pub struct Table<T> {
@@ -128,11 +106,8 @@ pub struct Table<T> {
 
 impl<T> Table<T> {
     pub fn new() -> Table<T> {
+        // alloc: none until the first put
         Table { slots: Vec::new(), len: 0 }
-    }
-
-    pub fn len(&self) -> u32 {
-        self.len
     }
 
     pub fn is_empty(&self) -> bool {
@@ -144,6 +119,7 @@ impl<T> Table<T> {
     pub fn put(&mut self, key: Key, value: T) -> Result<(), T> {
         let at = key.slot as usize;
         if at >= self.slots.len() {
+            // alloc: the table grows to the session's most slots once, then is reused
             self.slots.resize_with(at + 1, || Slot { generation: 0, value: None });
         }
         let slot = &mut self.slots[at];

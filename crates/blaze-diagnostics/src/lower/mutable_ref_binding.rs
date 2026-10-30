@@ -11,8 +11,8 @@
 
 use hir::InFile;
 use syntax::{
-    AstNode, TextRange,
-    ast::{self, HasName as _},
+    TextRange,
+    view::{self as ast, AstNode as _, HasName as _},
 };
 
 use crate::{
@@ -54,8 +54,8 @@ pub(crate) const UPGRADE_NOTE: &str = concat!(
 );
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MutableRefBinding) -> Vec<Found> {
-    let node = cx.node(d.pat);
-    let range = match node.value.as_ref().right() {
+    let node = cx.node_view(d.pat);
+    let range = match node.value.right() {
         Some(ast::Pat::IdentPat(pat)) => {
             let start = pat.syntax().text_range().start();
             let name = pat.name().map_or(start, |it| it.syntax().text_range().start());
@@ -70,5 +70,6 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MutableRefBinding) -> Vec<Found> {
     diag.help("add `#![feature(mut_ref)]` to the crate attributes to enable");
     diag.note(UPGRADE_NOTE);
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }

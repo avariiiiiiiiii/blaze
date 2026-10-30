@@ -147,7 +147,9 @@ fn emit(
 ) {
     let label = if mutable { "mutable " } else { "shared " };
     let mut diag =
+        // alloc: the lint's text, for a lint found
         Diag::lint("static_mut_refs", format!("creating a {label}reference to mutable static"), span.clone());
+    // alloc: the lint's text, for a lint found
     diag.span_label(span, format!("{label}reference to mutable static"));
     let suggest_addr_of = sugg.is_some();
     if let Some(sugg) = sugg {
@@ -156,6 +158,7 @@ fn emit(
             false => ("use `&raw const` instead to create a raw pointer", "&raw const "),
         };
         diag.suggestion_with_style(
+            // alloc: the lint's text, for a lint found
             vec![(sugg, code.to_owned())],
             message,
             Applicability::MaybeIncorrect,
@@ -169,6 +172,7 @@ fn emit(
     }
     if let Some(mut_span) = interior_sugg {
         diag.suggestion_with_style(
+            // alloc: the lint's text, for a lint found
             vec![(mut_span, String::new())],
             INTERIOR_MUTABILITY_SUGG,
             Applicability::MaybeIncorrect,
@@ -176,6 +180,7 @@ fn emit(
         );
     }
     let name = b.cx.def_path(ModuleDefId::StaticId(def).into());
+    // alloc: the lint's text, for a lint found
     diag.fact(Fact::Signature(b.cx.key(ItemId::Static(def))), format!("the signature of `{name}`"));
     out.push(b.lint(diag, Phase::Late, at));
 }

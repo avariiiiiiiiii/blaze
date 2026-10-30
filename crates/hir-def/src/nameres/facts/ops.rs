@@ -22,6 +22,7 @@ use smallvec::SmallVec;
 use span::SyntaxContext;
 use syntax::ast;
 
+use super::FrameVec;
 use crate::{
     AstId, AstIdWithPath, BuiltinDeriveImplId, ConstId, ExternBlockId, ExternCrateId, FunctionId,
     ImplId, ItemContainerId, MacroId, ModuleDefId, ModuleId, ProcMacroId, UseId,
@@ -372,10 +373,11 @@ impl DeclOp {
 }
 
 /// The ops of one collection, in the order they were made, with what a reader checks before it
-/// scans them ([`OpLog::has_children`], [`OpLog::writes_elsewhere`]), kept as they are pushed.
+/// scans them ([`OpLog::has_children`], [`OpLog::writes_elsewhere`]). A producer pushes into a
+/// vector of its frame and makes the log once, at its exact size ([`OpLog::from_frame`]).
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct OpLog {
-    pub(crate) ops: Vec<DeclOp>,
+    pub(crate) ops: Box<[DeclOp]>,
     /// The module of the log's first `Init`: in a round-0 log, the module that made it.
     owner: Option<ModuleId>,
     flags: u8,
@@ -383,28 +385,29 @@ pub(crate) struct OpLog {
 
 /// A `Splice`: the module has round-0 children, each collected by its own query.
 const SPLICE: u8 = 1;
-/// A scope op (`Declare`, `Update`) of a module other than the owner.
+/// A scope op (`Declare`, `Update`) of a module other than the owner as of that op.
 const ELSEWHERE: u8 = 2;
 
 impl OpLog {
-    pub(crate) fn push(&mut self, op: DeclOp) {
-        match &op {
-            &DeclOp::Init { module, .. } if self.owner.is_none() => self.owner = Some(module),
-            DeclOp::Splice { .. } => self.flags |= SPLICE,
-            &DeclOp::Declare { module, .. } | &DeclOp::Update { module, .. }
-                if self.owner != Some(module) =>
-            {
-                self.flags |= ELSEWHERE;
+    pub(crate) fn from_frame(ops: FrameVec<'_, DeclOp>) -> OpLog {
+        let mut owner = None;
+        let mut flags = 0;
+        for op in &ops {
+            match op {
+                &DeclOp::Init { module, .. } if owner.is_none() => owner = Some(module),
+                DeclOp::Splice { .. } => flags |= SPLICE,
+                &DeclOp::Declare { module, .. } | &DeclOp::Update { module, .. }
+                    if owner != Some(module) =>
+                {
+                    flags |= ELSEWHERE;
+                }
+                _ => {}
             }
-            _ => {}
         }
-        self.ops.push(op);
-    }
-
-    pub(crate) fn extend(&mut self, ops: impl IntoIterator<Item = DeclOp>) {
-        for op in ops {
-            self.push(op);
-        }
+        // A frame vector's `IntoIter` is `TrustedLen`: one allocation of exactly its length.
+        // alloc: the log is the query's value
+        let ops = ops.into_iter().collect();
+        OpLog { ops, owner, flags }
     }
 
     /// Whether the log declares a round-0 child (a `Splice`), whose subtree may make ops in the
@@ -426,10 +429,6 @@ impl OpLog {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.ops.is_empty()
-    }
-
-    pub(crate) fn shrink_to_fit(&mut self) {
-        self.ops.shrink_to_fit();
     }
 
     /// The `#[macro_export]` ops and proc-macro definitions it makes in `root`'s scope, in order:

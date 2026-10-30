@@ -45,6 +45,7 @@ struct InitError(Vec<(String, Option<Span>)>);
 
 impl InitError {
     fn new(message: impl Into<String>) -> InitError {
+        // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
         InitError(vec![(message.into(), None)])
     }
 
@@ -75,6 +76,7 @@ impl LatePass for InvalidValue {
             solver: &solver,
             near: expr,
             preds: Preds::new(&solver, b.cx.krate.base()),
+            // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
             layouts: Vec::new(),
         };
         let Some(err) = cx.ty_find_init_error(conjured, init) else { return };
@@ -83,10 +85,14 @@ impl LatePass for InvalidValue {
             return;
         };
         let message = match init {
+            // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
             Init::Zeroed => format!("the type `{ty}` does not permit zero-initialization"),
+            // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
             Init::Uninit => format!("the type `{ty}` does not permit being left uninitialized"),
         };
+        // clone: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
         let mut diag = Diag::lint("invalid_value", message, span.clone());
+        // clone: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
         diag.span_label(span.clone(), "this code causes undefined behavior when executed");
         if cx.preds.ty(conjured) == Pred::True {
             diag.span_label(
@@ -213,6 +219,7 @@ impl<'db> InitCx<'_, '_, 'db> {
         let db = self.b.db();
         let source = def.lookup(db).source(db);
         let span = self.b.cx.span(InFile::new(source.file_id, def_range(source.value.syntax())));
+        // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
         let mut potential = Vec::new();
         for &(variant, _) in def.enum_variants(db).variants.values() {
             let pred = self.preds.variant(VariantId::EnumVariantId(variant), true);
@@ -263,12 +270,15 @@ impl<'db> InitCx<'_, '_, 'db> {
             let Some(mut err) = self.ty_find_init_error(field_ty, init) else { continue };
             if local {
                 let sources = variant.child_source(db);
+                // clone: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
                 let node = sources.value[field].as_ref().either(|it| it.syntax().clone(), |it| it.syntax().clone());
                 let span = b.cx.span(InFile::new(sources.file_id, def_range(&node)));
                 if err.0[0].1.is_none() {
                     err.0[0].1 = Some(span);
+                    // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
                     err.0[0].0.push_str(&format!(" (in this {descr})"));
                 } else {
+                    // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
                     err = InitError::new(format!("in this {descr}")).spanned(span).nested(Some(err));
                 }
             }
@@ -285,6 +295,7 @@ impl<'db> InitCx<'_, '_, 'db> {
             _ => return field_err,
         };
         let Some(printed) = super::print_untrimmed(b, self.near, ty) else { return field_err };
+        // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
         self.layouts.push((adt, format!("the layout of `{printed}`")));
         let scalar = match &layout.backend_repr {
             BackendRepr::Scalar(scalar) | BackendRepr::ScalarPair { a: scalar, .. } => *scalar,
@@ -300,8 +311,10 @@ impl<'db> InitCx<'_, '_, 'db> {
         if let Some(field_err) = &mut field_err
             && field_err.0[0].0.contains(message)
         {
+            // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
             field_err.0[0].0 = format!("because {}", field_err.0[0].0);
         }
+        // alloc: only for a `mem::zeroed` or `mem::uninitialized` call found, to explain it
         Some(InitError::new(format!("`{printed}` {message}")).nested(field_err))
     }
 }

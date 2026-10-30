@@ -20,12 +20,12 @@ use blaze_items::{Fact, ItemId};
 use hir::{AsAssocItem as _, HasVisibility as _, InFile};
 use rustc_hash::FxHashSet;
 use syntax::{
-    AstNode, SyntaxKind, T, TextRange,
-    ast::{self, HasArgList as _, HasName as _},
+    SyntaxKind, T, TextRange,
+    view::{self as ast, AstNode as _, HasArgList as _, HasName as _, HasTypeBounds as _},
 };
 
 use crate::{
-    cx::{Cx, def_range},
+    cx::{Cx, def_range_view as def_range},
     lints::code_fact,
     lower::{
         Found, Phase,
@@ -38,24 +38,29 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedMethodCall<'_>) -> Vec<Found> {
-    let node = cx.node(d.expr);
-    let Some(ast::Expr::MethodCallExpr(call)) = node.value.clone().left() else { return vec![] };
+    let node = cx.node_view(d.expr);
+    // alloc: the error's parts, for an error hir found
+    let Some(ast::Expr::MethodCallExpr(call)) = node.value.left() else { return vec![] };
+    // alloc: empty, allocates nothing
     let Some(name_ref) = call.name_ref() else { return vec![] };
     let at = |range: TextRange| cx.span(InFile::new(node.file_id, range));
-    let args: Vec<ast::Expr> = call.arg_list().map(|it| it.args().collect()).unwrap_or_default();
+    // alloc: the error's parts, for an error hir found
+    let args: Vec<ast::Expr<'_>> = call.arg_list().map(|it| it.args().collect()).unwrap_or_default();
     let no_match = NoMatch {
+        // clone: on the error path, for an error hir found
         receiver: d.receiver.clone(),
+        // clone: on the error path, for an error hir found
         name: d.name.clone(),
         name_span: at(name_ref.syntax().text_range()),
         sugg_span: at(call.syntax().text_range()),
-        scope: cx.sema.scope(call.syntax()),
+        scope: cx.vsema.scope(call.syntax()),
         is_method: true,
         args: Some(args.len()),
     };
     let name = no_match.name();
     let item_kind = no_match.item_kind();
     let mut diag = no_match.error(cx, item_kind);
-    if call.syntax().text().contains_char('\n') {
+    if call.syntax().text().contains('\n') {
         let lo = no_match.name_span.lo;
         diag.span_label(no_match.sugg_span.with_hi(lo), "");
     }
@@ -65,15 +70,16 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedMethodCall<'_>) -> Vec<F
         diag.note(
             "found the following associated functions; to be used as methods, functions must have a `self` parameter",
         );
+        // clone: on the error path, for an error hir found
         diag.span_label(no_match.name_span.clone(), "this is an associated function, not a method");
     }
     if let [only] = statics.as_slice() {
-        associated_call_syntax(cx, &mut diag, &no_match, only, &call, &args, &at);
+        associated_call_syntax(cx, &mut diag, &no_match, only, call, &args, &at);
     }
     note_candidates(cx, &mut diag, &statics);
 
     let similar = similar_candidate(cx, &no_match);
-    let field_as_fn = call_field_as_fn(cx, &mut diag, &no_match, &call, &at);
+    let field_as_fn = call_field_as_fn(cx, &mut diag, &no_match, call, &at);
     if !field_as_fn && similar.is_none() && statics.is_empty() {
         not_found_label(cx, &mut diag, &no_match, item_kind);
     }
@@ -86,11 +92,14 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedMethodCall<'_>) -> Vec<F
     not_found_for_this(cx, &mut diag, &no_match, item_kind);
 
     let ty = cx.ty(&d.receiver);
+    // alloc: the error's text, for an error hir found
     diag.fact_opt(cx.method_fact(&d.receiver, &name), format!("what `{name}` is on `{ty}`"));
     if let Some(field) = &d.field_with_same_name {
+        // alloc: the error's text, for an error hir found
         diag.fact_opt(cx.method_fact(field, "call"), format!("whether the field `{name}` can be called"));
     }
     code_fact(cx, &mut diag, d.expr.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 
@@ -117,6 +126,7 @@ pub(crate) enum Static {
 
 impl<'db> NoMatch<'db> {
     pub(crate) fn name(&self) -> String {
+        // alloc: the error's text, for an error hir found
         self.name.as_str().to_owned()
     }
 
@@ -138,6 +148,7 @@ impl<'db> NoMatch<'db> {
         if let Some((adt, args)) = self.receiver.as_adt_with_args()
             && !args.is_empty()
         {
+            // alloc: the error's parts, for an error hir found
             let steps: Vec<hir::Type<'db>> = self.receiver.autoderef(cx.db).collect();
             let found = steps.iter().any(|ty| inherent_value(cx, ty, &self.name).is_some());
             if !found && steps.len() <= 1 {
@@ -146,7 +157,9 @@ impl<'db> NoMatch<'db> {
         }
         let prefix = crate::print::prefix_string(cx, &self.receiver);
         let name = self.name.display(cx.db, cx.edition);
+        // alloc: the error's text, for an error hir found
         let message = format!("no {item_kind} named `{name}` found for {prefix} `{ty}` in the current scope");
+        // clone: on the error path, for an error hir found
         Diag::error(Some("E0599"), message, self.name_span.clone())
     }
 
@@ -167,10 +180,11 @@ fn inherent_value<'db>(cx: &Cx<'_, 'db>, ty: &hir::Type<'db>, name: &hir::Name) 
 
 /// Every trait of every crate: rustc's `all_traits`.
 pub(crate) fn all_traits(cx: &Cx<'_, '_>) -> Vec<hir::Trait> {
+    // alloc: the error's parts, for an error hir found
     let mut traits = Vec::new();
     for krate in hir::Crate::all(cx.db) {
-        for module in krate.modules(cx.db) {
-            for def in module.declarations(cx.db) {
+        for module in krate.modules_iter(cx.db) {
+            for def in module.declarations_iter(cx.db) {
                 if let hir::ModuleDef::Trait(it) = def {
                     traits.push(it);
                 }
@@ -187,6 +201,7 @@ fn is_local_fn(cx: &Cx<'_, '_>, f: hir::Function) -> bool {
 /// The functions without `self` named as the method in the inherent impls of the types the
 /// receiver derefs to and in the traits in scope.
 fn static_candidates(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>, found: Option<hir::Function>) -> Vec<Static> {
+    // alloc: the error's parts, for an error hir found
     let mut statics = Vec::new();
     let mut push = |it: Static| {
         if !statics.contains(&it) {
@@ -208,7 +223,7 @@ fn static_candidates(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>, found: Option<hir:
     }
     if let Some(scope) = &no_match.scope {
         for t in all_traits(cx).into_iter().filter(|it| scope.can_use_trait_methods(*it)) {
-            for item in t.items(cx.db) {
+            for item in t.items_iter(cx.db) {
                 if let hir::AssocItem::Function(f) = item
                     && f.name(cx.db) == no_match.name
                     && !f.has_self_param(cx.db)
@@ -238,8 +253,8 @@ fn associated_call_syntax(
     diag: &mut Diag,
     no_match: &NoMatch<'_>,
     candidate: &Static,
-    call: &ast::MethodCallExpr,
-    args: &[ast::Expr],
+    call: ast::MethodCallExpr<'_>,
+    args: &[ast::Expr<'_>],
     at: &impl Fn(TextRange) -> Span,
 ) {
     let (ty_str, first_arg) = match *candidate {
@@ -252,6 +267,7 @@ fn associated_call_syntax(
                     (Some(a), Some(b)) => a == b,
                     _ => ty.could_unify_with(cx.db, &impl_ty),
                 })
+                // clone: on the error path, for an error hir found
                 .unwrap_or_else(|| impl_ty.clone())
                 .strip_references();
             let impl_ty_str = cx.ty(&impl_ty);
@@ -268,26 +284,27 @@ fn associated_call_syntax(
         Static::Trait(..) => (value_string(cx, &no_match.receiver.strip_references()), None),
     };
     let mut applicability = Applicability::MachineApplicable;
-    let receiver = call.receiver();
-    let explicit: Vec<&ast::Expr> = match (first_arg, &receiver) {
-        (Some(_), Some(receiver)) => std::iter::once(receiver).chain(args.iter()).collect(),
-        _ => args.iter().collect(),
-    };
+    let explicit = first_arg.and(call.receiver()).into_iter().chain(args.iter().copied());
     let snippets: Vec<String> = explicit
-        .iter()
         .map(|arg| match cx.snippet(&at(arg.syntax().text_range())) {
+            // alloc: the error's text, for an error hir found
             Some(text) => text.to_owned(),
             None => {
                 applicability = Applicability::HasPlaceholders;
+                // alloc: the error's text, for an error hir found
                 "_".to_owned()
             }
         })
+        // alloc: the error's parts, for an error hir found
         .collect();
+    // alloc: the error's text, for an error hir found
     let args = format!("({}{})", first_arg.unwrap_or(""), snippets.join(", "));
     let name = no_match.name.display(cx.db, cx.edition);
     diag.suggestion_verbose(
+        // clone: on the error path, for an error hir found
         no_match.sugg_span.clone(),
         "use associated function syntax instead",
+        // alloc: the error's text, for an error hir found
         format!("{ty_str}::{name}{args}"),
         applicability,
     );
@@ -297,6 +314,7 @@ fn associated_call_syntax(
 pub(crate) fn value_string(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> String {
     let printed = cx.ty(ty);
     match (ty.as_adt(), printed.find('<')) {
+        // alloc: the error's text, for an error hir found
         (Some(_), Some(at)) => format!("{}::{}", &printed[..at], &printed[at..]),
         _ => printed,
     }
@@ -310,6 +328,7 @@ fn note_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, sources: &[Static]) {
             Static::Trait(t, _) => (0, cx.def_path(hir::ModuleDef::Trait(t)), *it),
             Static::Impl(imp, _) => (1, cx.ty(&imp.self_ty(cx.db)), *it),
         })
+        // alloc: the error's parts, for an error hir found
         .collect();
     sources.sort_by(|a, b| (a.0, &a.1).cmp(&(b.0, &b.1)));
     sources.dedup_by(|a, b| a.2 == b.2);
@@ -321,18 +340,22 @@ fn note_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, sources: &[Static]) {
                 let note_span = match is_local_fn(cx, f) {
                     true => fn_def_span(cx, f),
                     false if imp.module(cx.db).krate(cx.db) == cx.krate => cx
-                        .sema
+                        .vsema
                         .source(imp)
                         .map(|it| cx.span(InFile::new(it.file_id, def_range(it.value.syntax())))),
                     false => None,
                 };
                 let impl_ty = cx.ty(&imp.self_ty(cx.db));
                 let insertion = match imp.trait_(cx.db) {
+                    // alloc: the error's text, for an error hir found
                     Some(t) => format!(" of the trait `{}`", cx.def_path(hir::ModuleDef::Trait(t))),
+                    // alloc: the error's text, for an error hir found
                     None => String::new(),
                 };
                 let note = match many {
+                    // alloc: the error's text, for an error hir found
                     true => format!("candidate #{} is defined in an impl{insertion} for the type `{impl_ty}`", idx + 1),
+                    // alloc: the error's text, for an error hir found
                     false => format!("the candidate is defined in an impl{insertion} for the type `{impl_ty}`"),
                 };
                 match note_span {
@@ -343,7 +366,9 @@ fn note_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, sources: &[Static]) {
             Static::Trait(t, f) => {
                 let path = cx.def_path(hir::ModuleDef::Trait(t));
                 let note = match many {
+                    // alloc: the error's text, for an error hir found
                     true => format!("candidate #{} is defined in the trait `{path}`", idx + 1),
+                    // alloc: the error's text, for an error hir found
                     false => format!("the candidate is defined in the trait `{path}`"),
                 };
                 match fn_def_span(cx, f) {
@@ -354,6 +379,7 @@ fn note_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, sources: &[Static]) {
         }
     }
     if sources.len() > limit {
+        // alloc: the error's text, for an error hir found
         diag.note(format!("and {} others", sources.len() - limit));
     }
 }
@@ -363,7 +389,7 @@ fn call_field_as_fn(
     cx: &Cx<'_, '_>,
     diag: &mut Diag,
     no_match: &NoMatch<'_>,
-    call: &ast::MethodCallExpr,
+    call: ast::MethodCallExpr<'_>,
     at: &impl Fn(TextRange) -> Span,
 ) -> bool {
     let found = no_match.receiver.autoderef(cx.db).find_map(|ty| {
@@ -382,7 +408,9 @@ fn call_field_as_fn(
             (Some(what), Some(receiver), Some(name_range)) => {
                 let expr = at(TextRange::new(receiver.syntax().text_range().start(), name_range.end()));
                 diag.multipart_suggestion(
+                    // alloc: the error's text, for an error hir found
                     format!("to call the {what} stored in `{name}`, surround the field access with parentheses"),
+                    // alloc: the error's text, for an error hir found
                     vec![(expr.shrink_to_lo(), "(".to_owned()), (expr.shrink_to_hi(), ")".to_owned())],
                     Applicability::MachineApplicable,
                 );
@@ -402,6 +430,7 @@ fn call_field_as_fn(
         }
     }
     let kind = if accessible { "field" } else { "private field" };
+    // alloc: the error's text, for an error hir found
     diag.span_label(no_match.name_span.clone(), format!("{kind}, not a method"));
     true
 }
@@ -432,6 +461,7 @@ fn callable_descr(cx: &Cx<'_, '_>, ty: &hir::Type<'_>) -> Option<&'static str> {
 /// is on instead.
 pub(crate) fn not_found_label(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMatch<'_>, item_kind: &str) {
     let ty = cx.ty(&no_match.receiver);
+    // alloc: the error's text, for an error hir found
     diag.span_label(no_match.name_span.clone(), format!("{item_kind} not found in `{ty}`"));
     let string_or_str = match no_match.receiver.as_reference() {
         Some((inner, _)) => inner.is_str() || is_string(cx, &inner),
@@ -439,6 +469,7 @@ pub(crate) fn not_found_label(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMat
     };
     if string_or_str && no_match.name.as_str() == "iter" {
         diag.suggestion_verbose(
+            // clone: on the error path, for an error hir found
             no_match.name_span.clone(),
             "because of the in-memory representation of `&str`, to obtain an `Iterator` over each of its codepoint use method `chars`",
             "chars",
@@ -449,6 +480,7 @@ pub(crate) fn not_found_label(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMat
         return;
     }
     let receiver_str = cx.ty(&no_match.receiver);
+    // alloc: the error's parts, for an error hir found
     let mut found: Vec<String> = Vec::new();
     no_match.receiver.iterate_assoc_items(cx.db, |item| {
         if item.name(cx.db).as_ref() != Some(&no_match.name) {
@@ -476,15 +508,20 @@ pub(crate) fn not_found_label(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMat
     match found.as_slice() {
         [] => {}
         [only] => {
+            // alloc: the error's text, for an error hir found
             diag.note(format!("the {item_kind} was found for `{only}`"));
         }
         candidates => {
             let limit = if candidates.len() == 5 { 5 } else { 4 };
+            // alloc: the error's text, for an error hir found
             let types: Vec<String> = candidates.iter().take(limit).map(|it| format!("- `{it}`")).collect();
             let more = match candidates.len() > limit {
+                // alloc: the error's text, for an error hir found
                 true => format!("\nand {} more types", candidates.len() - limit),
+                // alloc: the error's text, for an error hir found
                 false => String::new(),
             };
+            // alloc: the error's text, for an error hir found
             diag.note(format!("the {item_kind} was found for\n{}{more}", types.join("\n")));
         }
     }
@@ -504,7 +541,9 @@ pub(crate) fn similar_candidate(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>) -> Opti
     let scope = no_match.scope.as_ref()?;
     let lookup = no_match.name.as_str();
     let max_dist = std::cmp::max(lookup.len(), 3) / 3;
+    // alloc: the error's parts, for an error hir found
     let traits: FxHashSet<hir_def::TraitId> = all_traits(cx).into_iter().map(Into::into).collect();
+    // alloc: the error's parts, for an error hir found
     let mut found: Vec<hir::AssocItem> = Vec::new();
     let mut close = |item: hir::AssocItem| {
         if let Some(name) = item.name(cx.db)
@@ -530,6 +569,7 @@ pub(crate) fn similar_candidate(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>) -> Opti
         });
     }
     found.sort_by(|a, b| a.name(cx.db).cmp(&b.name(cx.db)));
+    // alloc: the error's text, for an error hir found
     let names: Vec<String> = found.iter().filter_map(|it| Some(it.name(cx.db)?.as_str().to_owned())).collect();
     let best = find_best_match_for_name_with_substrings(&names, lookup, None)?;
     found.into_iter().find(|it| it.name(cx.db).is_some_and(|name| name.as_str() == best))
@@ -539,6 +579,7 @@ pub(crate) fn similar_candidate(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>) -> Opti
 /// name".
 pub(crate) fn likely_intended(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMatch<'_>, similar: hir::AssocItem) {
     let Some(name) = similar.name(cx.db) else { return };
+    // alloc: the error's text, for an error hir found
     let name = name.display(cx.db, cx.edition).to_string();
     let (an, descr) = match similar {
         hir::AssocItem::Function(f) if f.has_self_param(cx.db) => ("a", "method"),
@@ -546,14 +587,15 @@ pub(crate) fn likely_intended(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMat
         hir::AssocItem::Const(_) => ("an", "associated constant"),
         hir::AssocItem::TypeAlias(_) => ("an", "associated type"),
     };
+    // alloc: the error's text, for an error hir found
     let message = format!("there is {an} {descr} `{name}` with a similar name");
     let def_span = |cx: &Cx<'_, '_>| match similar {
         hir::AssocItem::Function(f) => fn_def_span(cx, f),
         hir::AssocItem::Const(c) => {
-            cx.sema.source(c).map(|it| cx.span(InFile::new(it.file_id, def_range(it.value.syntax()))))
+            cx.vsema.source(c).map(|it| cx.span(InFile::new(it.file_id, def_range(it.value.syntax()))))
         }
         hir::AssocItem::TypeAlias(t) => {
-            cx.sema.source(t).map(|it| cx.span(InFile::new(it.file_id, def_range(it.value.syntax()))))
+            cx.vsema.source(t).map(|it| cx.span(InFile::new(it.file_id, def_range(it.value.syntax()))))
         }
     };
     let help = |diag: &mut Diag, message: String| match def_span(cx) {
@@ -571,13 +613,16 @@ pub(crate) fn likely_intended(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMat
             let inputs = if is_method { params } else { f.assoc_fn_params(cx.db).len() };
             match no_match.args {
                 Some(args) if inputs == args => {
+                    // clone: on the error path, for an error hir found
                     diag.suggestion_verbose(no_match.name_span.clone(), message, name, Applicability::MaybeIncorrect);
                 }
+                // alloc: the error's text, for an error hir found
                 Some(_) if is_method => help(diag, format!("{message}, but with different arguments")),
                 _ => help(diag, message),
             }
         }
         _ if !no_match.is_method && no_match.args.is_none_or(|it| it == 0) => {
+            // clone: on the error path, for an error hir found
             diag.suggestion_verbose(no_match.name_span.clone(), message, name, Applicability::MaybeIncorrect);
         }
         _ => help(diag, message),
@@ -593,13 +638,14 @@ pub(crate) fn not_found_for_this(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &No
     } else if let Some(adt) = no_match.receiver.as_adt()
         && adt.module(cx.db).krate(cx.db) == cx.krate
     {
-        cx.sema.source(adt).map(|it| cx.span(InFile::new(it.file_id, def_range(it.value.syntax()))))
+        cx.vsema.source(adt).map(|it| cx.span(InFile::new(it.file_id, def_range(it.value.syntax()))))
     } else {
         None
     };
     if let Some(span) = span {
         let prefix = crate::print::prefix_string(cx, &no_match.receiver);
         let name = no_match.name.display(cx.db, cx.edition);
+        // alloc: the error's text, for an error hir found
         diag.span_label(span, format!("{item_kind} `{name}` not found for this {prefix}"));
     }
 }
@@ -613,6 +659,7 @@ pub(crate) fn traits_to_import(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMa
         .iter()
         .copied()
         .filter(|t| !scope.can_use_trait_methods(*t) && trait_applies(cx, no_match, scope, *t))
+        // alloc: the error's parts, for an error hir found
         .collect();
     if valid_traits(cx, diag, no_match, out_of_scope, true) {
         return;
@@ -642,13 +689,14 @@ pub(crate) fn traits_to_import(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMa
             let local = t.module(cx.db).krate(cx.db) == cx.krate;
             (type_is_local || local)
                 && !t.is_auto(cx.db)
-                && t.items(cx.db).into_iter().any(|item| {
+                && t.items_iter(cx.db).any(|item| {
                     matches!(item, hir::AssocItem::Function(_) | hir::AssocItem::Const(_))
                         && item.name(cx.db).as_ref() == Some(&no_match.name)
                         && (local || matches!(t.visibility(cx.db), hir::Visibility::Public))
                 })
         })
         .map(|t| (t.module(cx.db).krate(cx.db) != cx.krate, cx.def_path(hir::ModuleDef::Trait(t)), t))
+        // alloc: the error's parts, for an error hir found
         .collect();
     if candidates.is_empty() {
         return;
@@ -663,9 +711,11 @@ pub(crate) fn traits_to_import(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMa
         Some(_) => "items from traits can only be used if the type parameter is bounded by the trait",
         None => "items from traits can only be used if the trait is implemented and in scope",
     });
+    // alloc: the error's text, for an error hir found
     let name = no_match.name.display(cx.db, cx.edition).to_string();
     let len = candidates.len();
     let message = |action: &str| {
+        // alloc: the error's text, for an error hir found
         format!(
             "the following {} an item `{name}`, perhaps you need to {action} {}:",
             if len == 1 { "trait defines" } else { "traits define" },
@@ -680,10 +730,12 @@ pub(crate) fn traits_to_import(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMa
     match candidates.as_slice() {
         [(false, path, t)] => {
             if impls(*t) {
+                // alloc: the error's parts, for an error hir found
                 valid_traits(cx, diag, no_match, vec![*t], false);
             } else {
+                // alloc: the error's text, for an error hir found
                 let note = format!("`{path}` defines an item `{name}`, perhaps you need to implement it");
-                match cx.sema.source(*t) {
+                match cx.vsema.source(*t) {
                     Some(it) => diag.span_note(cx.span(InFile::new(it.file_id, def_range(it.value.syntax()))), note),
                     None => diag.note(note),
                 };
@@ -693,8 +745,10 @@ pub(crate) fn traits_to_import(cx: &Cx<'_, '_>, diag: &mut Diag, no_match: &NoMa
             let mut note = message("implement");
             for (i, (_, path, t)) in candidates.iter().enumerate() {
                 if impls(*t) {
+                    // alloc: the error's parts, for an error hir found
                     valid_traits(cx, diag, no_match, vec![*t], false);
                 }
+                // alloc: the error's text, for an error hir found
                 note.push_str(&format!("\ncandidate #{}: `{path}`", i + 1));
             }
             diag.note(note);
@@ -717,12 +771,12 @@ fn restrict_param(
     if candidates.iter().any(|(_, _, t)| bounds.contains(t)) {
         return;
     }
-    let Some(source) = cx.sema.source(param.merge()) else { return };
-    let either::Either::Left(ast::TypeOrConstParam::Type(node)) = &source.value else { return };
+    let Some(source) = cx.vsema.source(param.merge()) else { return };
+    let either::Either::Left(ast::TypeOrConstParam::Type(node)) = source.value else { return };
     let Some(name) = node.name() else { return };
     let at = |range: TextRange| cx.span(InFile::new(source.file_id, range));
     let last_bound = node.type_bound_list().and_then(|it| it.bounds().last());
-    let (span, introducer) = match (&last_bound, node.colon_token()) {
+    let (span, introducer) = match (last_bound, node.colon_token()) {
         (Some(bound), _) => (at(bound.syntax().text_range()).shrink_to_hi(), " +"),
         (None, Some(colon)) => (at(colon.text_range()).shrink_to_hi(), ""),
         (None, None) => (at(name.syntax().text_range()).shrink_to_hi(), ":"),
@@ -738,20 +792,27 @@ fn restrict_param(
                     either::Either::Right(it) => !it.is_implicit(cx.db) && it.default(cx.db).is_none(),
                     either::Either::Left(it) => it.default(cx.db, cx.display_target).is_none(),
                 })
+                // alloc: the error's text, for an error hir found
                 .map(|it| it.name(cx.db).as_str().to_owned())
+                // alloc: the error's parts, for an error hir found
                 .collect();
             let candidate = match params.is_empty() {
+                // clone: on the error path, for an error hir found
                 true => path.clone(),
                 false => {
                     applicability = Applicability::HasPlaceholders;
+                    // alloc: the error's text, for an error hir found
                     format!("{path}</* {} */>", params.join(", "))
                 }
             };
+            // alloc: the error's text, for an error hir found
             vec![(span.clone(), format!("{introducer} {candidate}"))]
         })
+        // alloc: the error's parts, for an error hir found
         .collect();
-    let name = name.text().to_string();
+    let name = name.text();
     diag.suggestions.push(Suggestion {
+        // alloc: the error's text, for an error hir found
         message: message(&format!("restrict type parameter `{name}` with")),
         substitutions,
         applicability,
@@ -761,9 +822,10 @@ fn restrict_param(
 
 /// Whether the item looked for is found on the receiver through `t` alone.
 fn trait_applies(cx: &Cx<'_, '_>, no_match: &NoMatch<'_>, scope: &hir::SemanticsScope<'_>, t: hir::Trait) -> bool {
-    if !t.items(cx.db).iter().any(|it| it.name(cx.db).as_ref() == Some(&no_match.name)) {
+    if !t.items_iter(cx.db).any(|it| it.name(cx.db).as_ref() == Some(&no_match.name)) {
         return false;
     }
+    // alloc: the error's parts, for an error hir found
     let traits: FxHashSet<hir_def::TraitId> = std::iter::once(t.into()).collect();
     let of_trait = |item: hir::AssocItem| (item.container_or_implemented_trait(cx.db) == Some(t)).then_some(());
     match no_match.is_method {
@@ -793,24 +855,30 @@ pub(crate) fn valid_traits(
     }
     let Some(module) = no_match.module() else { return false };
     let mut candidates: Vec<(String, hir::Trait)> =
+        // alloc: the error's parts, for an error hir found
         traits.into_iter().map(|t| (cx.def_path(hir::ModuleDef::Trait(t)), t)).collect();
     candidates.sort_by(|a, b| a.0.cmp(&b.0));
     candidates.dedup_by(|a, b| a.1 == b.1);
+    // alloc: the error's text, for an error hir found
     let name = no_match.name.display(cx.db, cx.edition).to_string();
     let edition_fix = candidates.iter().map(|it| it.1).find(|t| is_try_into(cx, *t));
     if explain {
         diag.help("items from traits can only be used if the trait is in scope");
     }
     let this_trait_is = match candidates.as_slice() {
+        // alloc: the error's text, for an error hir found
         [(_, t)] => format!("trait `{}` which provides `{name}` is", t.name(cx.db).display(cx.db, cx.edition)),
+        // alloc: the error's text, for an error hir found
         _ => format!("the following traits which provide `{name}` are"),
     };
+    // alloc: the error's text, for an error hir found
     let message = format!("{this_trait_is} implemented but not in scope");
     let (accessible, inaccessible): (Vec<_>, Vec<_>) =
         candidates.iter().map(|it| it.1).partition(|t| t.is_visible_from(cx.db, module));
     let sugg = |traits: &[hir::Trait], visible: bool| {
         let (prefix, postfix) = if visible { ("use ", ";") } else { ("", "") };
         let mut suggs: Vec<String> =
+            // alloc: the error's text, for an error hir found
             traits.iter().map(|t| format!("{prefix}{}{postfix}\n", crate_path(cx, module, *t))).collect();
         suggs.sort();
         suggs
@@ -819,18 +887,24 @@ pub(crate) fn valid_traits(
     let inaccessible = sugg(&inaccessible, false);
     let Some(span) = inject_use_span(cx, module) else { return true };
     let for_access = |diag: &mut Diag, mut message: String, suggs: Vec<String>| {
+        // alloc: the error's text, for an error hir found
         message += &format!("; perhaps you want to import {}", if suggs.len() == 1 { "it" } else { "one of them" });
+        // clone: on the error path, for an error hir found
         diag.suggestions(span.clone(), message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowCode);
     };
     let for_privacy = |diag: &mut Diag, suggs: Vec<String>| {
         let this_trait_is = match suggs.as_slice() {
+            // alloc: the error's text, for an error hir found
             [only] => format!("trait `{}` which provides `{name}` is", only.trim()),
+            // alloc: the error's text, for an error hir found
             _ => format!("the following traits which provide `{name}` are"),
         };
+        // alloc: the error's text, for an error hir found
         let message = format!("{this_trait_is} implemented but not reachable");
         if suggs.len() == 1 {
             diag.help(message);
         } else {
+            // clone: on the error path, for an error hir found
             diag.suggestions(span.clone(), message, suggs, Applicability::MaybeIncorrect, SuggestionStyle::ShowCode);
         }
     };
@@ -843,6 +917,7 @@ pub(crate) fn valid_traits(
         for_privacy(diag, inaccessible);
     }
     if let Some(t) = edition_fix {
+        // alloc: the error's text, for an error hir found
         diag.note(format!("'{}' is included in the prelude starting in Edition 2021", crate_path(cx, module, t)));
     }
     true
@@ -865,13 +940,16 @@ pub(crate) fn crate_path(cx: &Cx<'_, '_>, module: hir::Module, t: hir::Trait) ->
     };
     let item = hir::ItemInNs::Types(hir::ModuleDef::Trait(t));
     if let Some(path) = module.find_use_path(cx.db, item, hir::PrefixKind::ByCrate, cfg) {
+        // alloc: the error's text, for an error hir found
         return path.display(cx.db, cx.edition).to_string();
     }
     let path = hir::ModuleDef::Trait(t).canonical_path(cx.db, cx.edition).unwrap_or_default();
     let krate = t.module(cx.db).krate(cx.db);
     match krate == cx.krate {
+        // alloc: the error's text, for an error hir found
         true => format!("crate::{path}"),
         false => match krate.display_name(cx.db) {
+            // alloc: the error's text, for an error hir found
             Some(name) => format!("{name}::{path}"),
             None => path,
         },
@@ -882,18 +960,18 @@ pub(crate) fn crate_path(cx: &Cx<'_, '_>, module: hir::Module, t: hir::Trait) ->
 /// first token after its inner attributes starts.
 pub(crate) fn inject_use_span(cx: &Cx<'_, '_>, module: hir::Module) -> Option<Span> {
     let module = module.nearest_non_block_module(cx.db);
-    let source = module.definition_source(cx.db);
-    let (body, end) = match &source.value {
-        hir::ModuleSource::SourceFile(it) => (it.syntax().clone(), it.syntax().text_range().end()),
-        hir::ModuleSource::Module(it) => {
+    let source = module.definition_source_view(cx.db);
+    let (body, end) = match source.value {
+        hir::ModuleSourceView::SourceFile(it) => (it.syntax(), it.syntax().text_range().end()),
+        hir::ModuleSourceView::Module(it) => {
             let list = it.item_list()?;
             let end = list.r_curly_token()?.text_range().start();
-            (list.syntax().clone(), end)
+            (list.syntax(), end)
         }
-        hir::ModuleSource::BlockExpr(_) => return None,
+        hir::ModuleSourceView::BlockExpr(_) => return None,
     };
     let mut tokens = body.descendants_with_tokens().filter_map(|it| it.into_token());
-    if matches!(source.value, hir::ModuleSource::Module(_)) {
+    if matches!(source.value, hir::ModuleSourceView::Module(_)) {
         tokens.next();
     }
     let start = tokens
@@ -910,6 +988,8 @@ pub(crate) fn inject_use_span(cx: &Cx<'_, '_>, module: hir::Module) -> Option<Sp
 
 /// The fact of the item looked for on an ADT's own impls.
 pub(crate) fn adt_fact(cx: &Cx<'_, '_>, diag: &mut Diag, adt: hir::Adt) {
+    // alloc: the error's text, for an error hir found
     let name = adt.name(cx.db).display(cx.db, cx.edition).to_string();
+    // alloc: the error's text, for an error hir found
     diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("the items of `{name}`"));
 }

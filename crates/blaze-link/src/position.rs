@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use blaze_format::cursor::{Put, Reader};
 use blaze_ids::ContentId;
 
 /// The span side table of one anchor, as [`crate::Change::spans`] carries it.
@@ -40,16 +41,15 @@ impl SpanTable {
     pub fn encode(&self) -> Vec<u8> {
         let names: usize = self.files.iter().map(|it| 4 + it.len()).sum();
         let mut out = Vec::with_capacity(8 + 4 + names + 4 + SPAN * self.spans.len());
-        out.extend_from_slice(&MAGIC);
-        out.extend_from_slice(&(self.files.len() as u32).to_le_bytes());
+        out.put_bytes(&MAGIC);
+        out.put_u32(self.files.len() as u32);
         for file in &self.files {
-            out.extend_from_slice(&(file.len() as u32).to_le_bytes());
-            out.extend_from_slice(file.as_bytes());
+            out.put_bytes_u32(file.as_bytes());
         }
-        out.extend_from_slice(&(self.spans.len() as u32).to_le_bytes());
+        out.put_u32(self.spans.len() as u32);
         for span in &self.spans {
             for word in [span.file, span.line, span.column] {
-                out.extend_from_slice(&word.to_le_bytes());
+                out.put_u32(word);
             }
         }
         out
@@ -86,41 +86,40 @@ pub(crate) struct Spans {
 impl Spans {
     /// Checks `bytes` as a span table and keeps one copy of it.
     pub fn new(bytes: &[u8]) -> Result<Spans, String> {
-        let mut read = Reader { bytes, at: 0 };
+        let mut read = Reader::new(bytes);
         if read.take(8)? != MAGIC {
             // alloc: error path
             return Err("not a span table: its magic is wrong".to_owned());
         }
-        let files = read.word()?;
-        let index = (files as usize).checked_mul(4).filter(|it| *it <= bytes.len()).ok_or("a span table cut short")?;
+        // Each file takes at least its length's 4 bytes, so the index is no longer than the table.
+        let files = read.count_u32(4)?;
+        let index = files * 4;
         // An exact-size iterator collects into the `Arc` itself.
         // alloc: the table's one buffer, once per table
         let mut buf: Arc<[u8]> = std::iter::repeat_n(0, index + bytes.len()).collect();
         let out = Arc::get_mut(&mut buf).expect("just made");
-        for file in 0..files as usize {
-            let len = read.word()? as usize;
-            let start = read.at;
-            std::str::from_utf8(read.take(len)?).map_err(|_| "a file name not UTF-8")?;
+        for file in 0..files {
+            let start = read.at() + 4;
+            read.str_u32()?;
             out[file * 4..file * 4 + 4].copy_from_slice(&((index + start) as u32).to_le_bytes());
         }
-        let spans = read.word()?;
-        let spans_at = read.at;
-        let body = (spans as usize).checked_mul(SPAN).ok_or("a span table cut short")?;
-        let rest = read.take(body)?;
-        if read.at != bytes.len() {
+        let spans = read.count_u32(SPAN)?;
+        let spans_at = read.at();
+        let rest = read.take(spans * SPAN)?;
+        if !read.is_done() {
             // alloc: error path
             return Err("bytes after a span table".to_owned());
         }
         for span in rest.chunks_exact(SPAN) {
             let file = u32::from_le_bytes(span[..4].try_into().expect("four bytes"));
-            if file >= files {
+            if file as usize >= files {
                 // alloc: error path
                 return Err(format!("a span in file {file} of {files}"));
             }
         }
         out[index..].copy_from_slice(bytes);
         let spans_at = u32::try_from(index + spans_at).map_err(|_| "a span table past 4 GiB")?;
-        Ok(Spans { buf, files, spans_at, spans })
+        Ok(Spans { buf, files: files as u32, spans_at, spans: spans as u32 })
     }
 
     /// The table's encoding, as the change carried it.
@@ -160,24 +159,6 @@ impl Spans {
 
     pub fn id(&self) -> ContentId {
         ContentId::of(SPAN_TABLE_DOMAIN, self.encoding())
-    }
-}
-
-struct Reader<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
-        let end = self.at.checked_add(n).ok_or("a span table cut short")?;
-        let part = self.bytes.get(self.at..end).ok_or("a span table cut short")?;
-        self.at = end;
-        Ok(part)
-    }
-
-    fn word(&mut self) -> Result<u32, String> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().expect("four bytes")))
     }
 }
 

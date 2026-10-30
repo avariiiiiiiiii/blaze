@@ -111,10 +111,10 @@ impl TargetKind {
         }
     }
 
-    pub fn rustc_crate_types(&self) -> Vec<CrateType> {
+    pub fn rustc_crate_types(&self) -> &[CrateType] {
         match self {
-            TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => kinds.clone(),
-            _ => vec![CrateType::Bin],
+            TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => kinds,
+            _ => &[CrateType::Bin],
         }
     }
 
@@ -365,7 +365,7 @@ pub(super) struct LtoUnit<'a> {
     pub kind: &'a TargetKind,
     pub mode: CompileMode,
     pub lto: &'a ProfileLto,
-    pub deps: &'a [usize],
+    pub deps: &'a [u32],
 }
 
 /// cargo's `lto::generate`: every unit reachable from `roots`, from the roots down. A unit
@@ -381,8 +381,8 @@ pub(super) fn generate(units: &[Option<LtoUnit<'_>>], roots: &[usize]) -> Vec<Op
                 let crate_types = unit.kind.rustc_crate_types();
                 if unit.kind.for_host() {
                     Lto::OnlyObject
-                } else if needs_object(&crate_types) {
-                    lto_when_needs_object(&crate_types)
+                } else if needs_object(crate_types) {
+                    lto_when_needs_object(crate_types)
                 } else {
                     Lto::OnlyBitcode
                 }
@@ -395,8 +395,8 @@ pub(super) fn generate(units: &[Option<LtoUnit<'_>>], roots: &[usize]) -> Vec<Op
 
 fn calculate(units: &[Option<LtoUnit<'_>>], map: &mut [Option<Lto>], at: usize, parent: &Lto) {
     let Some(unit) = &units[at] else { return };
-    let crate_types = match unit.mode {
-        CompileMode::Test | CompileMode::Doctest => vec![CrateType::Bin],
+    let crate_types: &[CrateType] = match unit.mode {
+        CompileMode::Test | CompileMode::Doctest => &[CrateType::Bin],
         _ => unit.kind.rustc_crate_types(),
     };
     let lto = if unit.kind.for_host() {
@@ -409,9 +409,9 @@ fn calculate(units: &[Option<LtoUnit<'_>>], map: &mut [Option<Lto>], at: usize, 
             ProfileLto::Bool(false) => Lto::OnlyObject,
         }
     } else {
-        match (parent, needs_object(&crate_types)) {
+        match (parent, needs_object(crate_types)) {
             (Lto::Run(_), false) => Lto::OnlyBitcode,
-            (Lto::Run(_), true) | (Lto::OnlyBitcode, true) => lto_when_needs_object(&crate_types),
+            (Lto::Run(_), true) | (Lto::OnlyBitcode, true) => lto_when_needs_object(crate_types),
             (Lto::Off, _) => Lto::Off,
             (_, false) | (Lto::OnlyObject, true) | (Lto::ObjectAndBitcode, true) => parent.clone(),
         }
@@ -435,7 +435,7 @@ fn calculate(units: &[Option<LtoUnit<'_>>], map: &mut [Option<Lto>], at: usize, 
     };
     map[at] = Some(merged.clone());
     for &dep in unit.deps {
-        calculate(units, map, dep, &merged);
+        calculate(units, map, dep as usize, &merged);
     }
 }
 

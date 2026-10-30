@@ -7,8 +7,10 @@
 //! its children's rows (each scope a fact of the child's own `module_decls`), and every other
 //! module read through [`decl_row`] (`nameres-core.md` §3, "Round 0 reads").
 
+use std::alloc::Allocator;
+
 use base_db::{BuiltDependency, Crate, CrateOrigin, Db, LangCrateOrigin};
-use blaze_mem::Tag;
+use blaze_mem::{Frame, Tag};
 use cfg::CfgExpr;
 use either::Either;
 use hir_expand::{
@@ -21,15 +23,14 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use rustc_hash::FxHashMap;
 use salsa::Database as _;
-use smallvec::SmallVec;
 use span::{Edition, FileAstId, ROOT_ERASED_FILE_AST_ID};
 use syntax::ast;
 use triomphe::Arc;
 
 use crate::{
     AdtId, AstId, AstIdWithPath, BuiltinDeriveImplId, BuiltinDeriveImplLoc, ConstLoc, EnumLoc,
-    ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc, FxIndexMap, ImplLoc,
-    Intern, ItemContainerId, Macro2Id, Macro2Loc, MacroExpander, MacroId, MacroRulesId,
+    ExternBlockLoc, ExternCrateId, ExternCrateLoc, FunctionId, FunctionLoc, ImplLoc,
+    Intern, ItemContainerId, Macro2Id, Macro2Loc, MacroExpander, MacroRulesId,
     MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId, ProcMacroId, ProcMacroLoc,
     StaticLoc, StructLoc, TraitLoc, TypeAliasLoc, UnionLoc, UseLoc, file_item_tree,
     item_scope::{ImportOrExternCrate, ItemScope, PerNsGlobImports},
@@ -54,6 +55,7 @@ use crate::{
 };
 
 use super::{
+    FrameMap, FrameVec, map_in,
     env::{Ancestor, ChildMode, ChildRequest, CollectCx, CollectEnv, SideTables, Sink},
     ops::{DeclOp, ImportOp, ImportSource, Inherited, MacroOp, MacroOpKind, OpLog},
     queries::{
@@ -65,28 +67,33 @@ use super::{
 
 /// The crate's dependencies by name, as the old `collect_defs` prologue made them: a later
 /// dependency of a name replaces an earlier one's value in its place.
-fn deps(
-    db: &Db,
+fn deps<'db, 'f>(
+    db: &'db Db,
+    frame: &'f Frame,
     krate: Crate,
-) -> FxIndexMap<Name, BuiltDependency> {
+) -> FrameVec<'f, (Name, &'db BuiltDependency)> {
     let data = krate.data(db);
-    let mut deps =
-        FxIndexMap::with_capacity_and_hasher(data.dependencies.len(), Default::default());
+    let mut deps = Vec::with_capacity_in(data.dependencies.len(), frame);
     for dep in &data.dependencies {
         tracing::debug!("crate dep {:?} -> {:?}", dep.name, dep.crate_id);
-        // clone: setup of one collection, a handful of dependencies
-        deps.insert(dep.as_name(), dep.clone());
+        let name = dep.as_name();
+        match deps.iter_mut().find(|(it, _)| *it == name) {
+            Some(it) => it.1 = dep,
+            None => deps.push((name, dep)),
+        }
     }
     deps
 }
 
 /// The constants of a collection of `krate` (`collect_defs`' prologue): deps, cfg, the crate's
-/// own proc macros (read with the root file's syntax context), the fast-path flag.
-pub(crate) fn cx<'db>(
+/// own proc macros (read with the root file's syntax context), the fast-path flag. Its
+/// temporaries go to `frame`, the calling query's.
+pub(crate) fn cx<'db, 'f>(
     db: &'db Db,
+    frame: &'f Frame,
     krate: Crate,
     in_block: bool,
-) -> CollectCx<'db> {
+) -> CollectCx<'db, 'f> {
     let krate_data = krate.data(db);
     // A block's map shares the crate map's data (`block_def_map`); a crate's own collection reads
     // the crate attributes only.
@@ -108,9 +115,10 @@ pub(crate) fn cx<'db>(
     let is_proc_macro = by_target || (!in_block && data.proc_macro);
     CollectCx {
         db,
+        frame,
         krate,
         data,
-        deps: deps(db, krate),
+        deps: deps(db, frame, krate),
         cfg_options: krate.cfg_options(db),
         proc_macros,
         is_proc_macro,
@@ -189,12 +197,13 @@ pub(crate) fn crate_data(
 /// `seed_with_top_level`'s second part).
 pub(crate) fn root_decl(
     db: &Db,
+    frame: &Frame,
     krate: Crate,
 ) -> DeclKey {
     let crate_data = queries::crate_data(db, krate);
-    let deps = deps(db, krate);
-    let mut prelude = Vec::with_capacity(deps.len());
-    for (name, dep) in &deps {
+    let deps = deps(db, frame, krate);
+    let mut prelude = Vec::with_capacity_in(deps.len(), frame);
+    for &(ref name, dep) in &deps {
         if dep.is_prelude() {
             // `no_core` and `no_std` remove the sysroot dependence on `core` and `std`; the
             // crate graph has them in place no matter what. Reading a dependency's crate data
@@ -214,6 +223,7 @@ pub(crate) fn root_decl(
     }
     // The def maps are collected as one batch of the database's tasks, then put in the extern
     // prelude in the order of the dependencies.
+    let prelude = &prelude[..];
     if prelude.len() > 1 {
         db.run_all(Tag::Nameres, prelude.len(), |db, at| {
             crate_def_map(db, prelude[at].1);
@@ -318,11 +328,12 @@ pub(super) fn held_scope(key: DeclKey) -> crate::nameres::BuildingScope {
 /// One module's round-0 declarations: its collection over a [`DeclSink`].
 pub(crate) fn module_decls(
     db: &Db,
+    frame: &Frame,
     key: DeclKey,
 ) -> ModuleDecls {
     let _p = tracing::info_span!("module_decls").entered();
     let decl = key.decl(db);
-    let cx = cx(db, decl.krate, false);
+    let cx = cx(db, frame, decl.krate, false);
     let mut sink = DeclSink::new(&cx, key, decl);
     let mut side = SideTables::default();
     sink.apply(DeclOp::Init {
@@ -416,8 +427,8 @@ fn inline_items(item_tree: &ItemTree, item: ModItemId, module: ModuleId) -> &[Mo
 /// ancestor, with the keys of the children before it) and this module's ancestors, and
 /// [`decl_row`] reaches that child's own subtree through its `module_decls`, which is finished.
 /// So no read of a collection ever reaches its own `module_decls`.
-struct DeclSink<'a, 'db> {
-    cx: &'a CollectCx<'db>,
+struct DeclSink<'a, 'db, 'f> {
+    cx: &'a CollectCx<'db, 'f>,
     #[cfg(test)]
     key: DeclKey,
     decl: &'db Decl,
@@ -427,16 +438,17 @@ struct DeclSink<'a, 'db> {
     /// The crate env as of now; changed only by the root's `extern crate`s and its prelude.
     crate_env: CrateEnvKey,
     local_def_map: &'db LocalDefMap,
-    log: OpLog,
-    children: Vec<DeclKey>,
-    child_keys: Vec<(ModuleId, DeclKey)>,
-    from_glob_import: PerNsGlobImports,
+    /// The log's ops so far; [`DeclSink::finish`] makes the [`OpLog`].
+    log: FrameVec<'f, DeclOp>,
+    children: FrameVec<'f, DeclKey>,
+    child_keys: FrameVec<'f, (ModuleId, DeclKey)>,
+    from_glob_import: PerNsGlobImports<&'f Frame>,
     /// The module's plain imports by the name each binds: indices into `log`, in order.
-    named: FxHashMap<Name, SmallVec<[u32; 1]>>,
+    named: FrameMap<'f, Name, FrameVec<'f, u32>>,
 }
 
-impl<'a, 'db> DeclSink<'a, 'db> {
-    fn new(cx: &'a CollectCx<'db>, key: DeclKey, decl: &'db Decl) -> Self {
+impl<'a, 'db, 'f> DeclSink<'a, 'db, 'f> {
+    fn new(cx: &'a CollectCx<'db, 'f>, key: DeclKey, decl: &'db Decl) -> Self {
         let db = cx.db;
         let env = decl.env.env(db);
         let rows = salsa::plumbing::AsId::as_id(&RowsKey::new(db, Rows::Decl(key)));
@@ -451,6 +463,7 @@ impl<'a, 'db> DeclSink<'a, 'db> {
             session_macros: false,
             diagnostics: Vec::new(), // alloc: empty, the view's diagnostics go to the log
             diagnostics_by_module: DiagnosticsByModule::default(),
+            records: None,
             names: Default::default(),
             data: Arc::clone(&cx.data),
         };
@@ -464,11 +477,11 @@ impl<'a, 'db> DeclSink<'a, 'db> {
             def_map,
             crate_env: env.krate,
             local_def_map: crate_env_local(db, env.krate),
-            log: OpLog::default(),
-            children: Vec::new(), // alloc: grows once per child module
-            child_keys: Vec::new(), // alloc: grows once per child module
-            from_glob_import: PerNsGlobImports::default(),
-            named: FxHashMap::default(),
+            log: Vec::new_in(cx.frame),
+            children: Vec::new_in(cx.frame),
+            child_keys: Vec::new_in(cx.frame),
+            from_glob_import: PerNsGlobImports::new_in(cx.frame),
+            named: map_in(cx.frame),
         }
     }
 
@@ -594,10 +607,8 @@ impl<'a, 'db> DeclSink<'a, 'db> {
                     );
                 }
                 None => {
-                    let (tr, import) = match res.take_types_full() {
-                        Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import }) => {
-                            (tr, import)
-                        }
+                    let tr = match res.take_types_full() {
+                        Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import: _ }) => tr,
                         Some(other) => {
                             tracing::debug!("non-trait `_` import of {:?}", other);
                             continue;
@@ -620,11 +631,7 @@ impl<'a, 'db> DeclSink<'a, 'db> {
                         }
                     };
                     if should_update {
-                        self.own_row().scope_mut().push_unnamed_trait(
-                            tr,
-                            vis,
-                            import.and_then(ImportOrExternCrate::import),
-                        );
+                        self.own_row().scope_mut().push_unnamed_trait_through(tr, vis, import);
                     }
                 }
             }
@@ -672,6 +679,9 @@ impl<'a, 'db> DeclSink<'a, 'db> {
     }
 
     fn finish(self, side: SideTables) -> ModuleDecls {
+        let ops = OpLog::from_frame(self.log);
+        // alloc: the module's round-0 children, part of the query's value, at exact size
+        let children = Box::from(&self.children[..]);
         let db = self.cx.db;
         let row = self.def_map.module(db, self.decl.module);
         let legacy = textual_scope(row.scope(db));
@@ -683,15 +693,12 @@ impl<'a, 'db> DeclSink<'a, 'db> {
             // clone: test capture of the held scope
             HELD.with(|it| it.borrow_mut().insert(self.key, (**held).clone()));
         }
-        let mut ops = self.log;
-        ops.shrink_to_fit();
-        let children = self.children.into_boxed_slice();
         // alloc: one per module, the tables its first macro step starts from
         ModuleDecls { ops, children, legacy, side: Arc::new(side) }
     }
 }
 
-impl<'a, 'db> Sink<'db> for DeclSink<'a, 'db> {
+impl<'a, 'db, 'f> Sink<'db> for DeclSink<'a, 'db, 'f> {
     fn db(&self) -> &'db Db {
         self.cx.db
     }
@@ -711,9 +718,9 @@ impl<'a, 'db> Sink<'db> for DeclSink<'a, 'db> {
             && it.source.kind == ImportKind::Plain
             && let Some(name) = it.bound_name()
         {
-            let at = u32::try_from(self.log.ops.len()).expect("a module log of 2^32 ops");
-            // alloc: the index of the module's plain imports, an entry per name they bind
-            self.named.entry(name).or_default().push(at);
+            let at = u32::try_from(self.log.len()).expect("a module log of 2^32 ops");
+            let frame = self.cx.frame;
+            self.named.entry(name).or_insert_with(|| Vec::new_in(frame)).push(at);
         }
         self.log.push(op);
     }
@@ -727,7 +734,7 @@ impl<'a, 'db> Sink<'db> for DeclSink<'a, 'db> {
         if module != self.decl.module {
             return None;
         }
-        self.named.get(&name)?.iter().find_map(|&at| match &self.log.ops[at as usize] {
+        self.named.get(&name)?.iter().find_map(|&at| match &self.log[at as usize] {
             DeclOp::Import(it) => f(&it.path),
             other => unreachable!("the import index names {other:?}"),
         })
@@ -791,7 +798,7 @@ impl<'a, 'db> Sink<'db> for DeclSink<'a, 'db> {
         ChildMode::Separate(key)
     }
 
-    fn take_macros(&mut self, _into: &mut Vec<MacroOp>) {}
+    fn take_macros(&mut self, _into: &mut FrameVec<'_, MacroOp>) {}
 }
 
 /// The row of `module` in the round-0 view of `key` (`Rows::Decl`): an ancestor as the key's
@@ -965,10 +972,10 @@ fn inject_std_extern_crate<'db, S: Sink<'db>>(sink: &mut S) {
 
 /// `ModCollector { .. }.collect(items, container)` through `sink`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn collect_items<'db, S: Sink<'db>>(
-    cx: &CollectCx<'db>,
+pub(crate) fn collect_items<'db, S: Sink<'db>, A: Allocator + Clone>(
+    cx: &CollectCx<'db, '_>,
     sink: &mut S,
-    side: &mut SideTables,
+    side: &mut SideTables<A>,
     module: ModuleId,
     tree: TreeId,
     macro_depth: u32,
@@ -993,10 +1000,10 @@ pub(crate) fn collect_items<'db, S: Sink<'db>>(
 
 /// `collect_macro_expansion`: the items of `call`'s expansion, collected in `module`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn collect_expansion<'db, S: Sink<'db>>(
-    cx: &CollectCx<'db>,
+pub(crate) fn collect_expansion<'db, S: Sink<'db>, A: Allocator + Clone>(
+    cx: &CollectCx<'db, '_>,
     sink: &mut S,
-    side: &mut SideTables,
+    side: &mut SideTables<A>,
     module: ModuleId,
     call: MacroCallId,
     depth: u32,
@@ -1028,13 +1035,11 @@ pub(crate) fn collect_expansion<'db, S: Sink<'db>>(
     if let Some(attr_macro_item) = attr_macro_item
         && let Some(derive_helpers) = side.derive_helpers.get(&attr_macro_item)
     {
-        // clone: the helpers of one attribute-macro item, once per such expansion
-        let derive_helpers = derive_helpers.clone();
+        let mut copied = Vec::with_capacity_in(derive_helpers.len(), cx.frame);
+        copied.extend_from_slice(derive_helpers);
         for item in item_tree.top_level_items() {
-            side.derive_helpers
-                .entry(InFile::new(file_id, item.ast_id(item_tree)))
-                .or_default()
-                .extend(derive_helpers.iter().copied());
+            side.derive_helpers_of(InFile::new(file_id, item.ast_id(item_tree)))
+                .extend(copied.iter().copied());
         }
     }
 
@@ -1054,10 +1059,10 @@ pub(crate) fn collect_expansion<'db, S: Sink<'db>>(
 }
 
 /// `seed_with_inner`: the items of a block, whose def map `sink` holds.
-pub(crate) fn seed_block<'db, S: Sink<'db>>(
-    cx: &CollectCx<'db>,
+pub(crate) fn seed_block<'db, S: Sink<'db>, A: Allocator + Clone>(
+    cx: &CollectCx<'db, '_>,
     sink: &mut S,
-    side: &mut SideTables,
+    side: &mut SideTables<A>,
     tree: TreeId,
 ) {
     let db = cx.db;
@@ -1087,10 +1092,10 @@ pub(crate) fn seed_block<'db, S: Sink<'db>>(
 }
 
 /// Walks a single module, populating defs, imports and macros.
-struct ModCollector<'a, 'db, S> {
-    cx: &'a CollectCx<'db>,
+struct ModCollector<'a, 'db, 'f, S, A: Allocator + Clone> {
+    cx: &'a CollectCx<'db, 'f>,
     sink: &'a mut S,
-    side: &'a mut SideTables,
+    side: &'a mut SideTables<A>,
     macro_depth: u32,
     module_id: ModuleId,
     tree_id: TreeId,
@@ -1099,7 +1104,7 @@ struct ModCollector<'a, 'db, S> {
     path_buf: &'a mut String,
 }
 
-impl<'db, S: Sink<'db>> ModCollector<'_, 'db, S> {
+impl<'db, 'f, S: Sink<'db>, A: Allocator + Clone> ModCollector<'_, 'db, 'f, S, A> {
     fn collect_in_top_module(&mut self, items: &[ModItemId]) {
         self.collect(items, self.module_id.into())
     }
@@ -1267,7 +1272,7 @@ impl<'db, S: Sink<'db>> ModCollector<'_, 'db, S> {
                     cov_mark::hit!(extern_crate_self_as);
                     Some(self.sink.def_map().crate_root(db))
                 } else {
-                    self.cx.deps.get(&name).map(|dep| crate_def_map(db, dep.crate_id).root_module_id())
+                    self.cx.dep(&name).map(|dep| crate_def_map(db, dep.crate_id).root_module_id())
                 };
 
                 let name = match &alias {
@@ -1467,7 +1472,7 @@ impl<'db, S: Sink<'db>> ModCollector<'_, 'db, S> {
         target_crate: Crate,
     ) {
         cov_mark::hit!(macro_rules_from_other_crates_are_visible_with_macro_use);
-        let mut single_imports = SmallVec::<[Name; 4]>::new();
+        let mut single_imports = Vec::new_in(self.cx.frame);
         for attr in macro_use_attrs {
             let Some(paths) = attr.parse_path_comma_token_tree(self.cx.db) else {
                 // `#[macro_use]` (without any paths) found, forget collected names and just import
@@ -1637,7 +1642,7 @@ impl<'db, S: Sink<'db>> ModCollector<'_, 'db, S> {
         tree: TreeId,
         item_tree: &'db ItemTree,
         mod_dir: ModDir,
-    ) -> ModCollector<'c, 'db, S> {
+    ) -> ModCollector<'c, 'db, 'f, S, A> {
         ModCollector {
             cx: self.cx,
             sink: &mut *self.sink,
@@ -2078,9 +2083,8 @@ impl<'db, S: Sink<'db>> ModCollector<'_, 'db, S> {
         // new legacy macros that create textual scopes. We need a way to resolve names in textual
         // scopes without eager expansion.
 
-        let mut eager_callback_buffer = SmallVec::<[_; 1]>::new();
-        // alloc: the paths an eager call's arguments name, kept once it resolves.
-        let named = std::cell::RefCell::new(SmallVec::<[(ModPath, MacroDefId); 1]>::new());
+        let mut eager_calls = Vec::new_in(self.cx.frame);
+        let named = std::cell::RefCell::new(Vec::new_in(self.cx.frame));
         // Case 1: try to resolve macro calls with single-segment name, or with a path to a macro
         // of another crate, and expand them, so that the `macro_rules!` they define are in the
         // textual scope of what follows, child modules included.
@@ -2104,10 +2108,10 @@ impl<'db, S: Sink<'db>> ModCollector<'_, 'db, S> {
                 }
                 def
             },
-            &mut |ptr, call_id| eager_callback_buffer.push((ptr, call_id)),
+            &mut eager_calls,
         );
         if let Ok(res) = res {
-            for (ptr, call_id) in eager_callback_buffer {
+            for (ptr, call_id) in eager_calls {
                 self.sink.apply(DeclOp::AddMacroInvoc {
                     module: module_id,
                     call: ptr.map(|(_, it)| it),
@@ -2260,15 +2264,15 @@ impl<'db, S: Sink<'db>> ModCollector<'_, 'db, S> {
                 }
             }
             ChildMode::Inline => {
-                let exports: SmallVec<[(Name, MacroId); 8]> = self
-                    .sink
-                    .def_map()
-                    .module(db, child)
-                    .scope(db)
-                    .legacy_macros()
-                    .filter_map(|(name, macs)| Some((*name, *macs.last()?)))
-                    // alloc: the child's macros, inline up to 8, once per `#[macro_use] mod`
-                    .collect();
+                let mut exports = Vec::new_in(self.cx.frame);
+                exports.extend(
+                    self.sink
+                        .def_map()
+                        .module(db, child)
+                        .scope(db)
+                        .legacy_macros()
+                        .filter_map(|(name, macs)| Some((*name, *macs.last()?))),
+                );
                 for (name, mac) in exports {
                     self.sink.apply(DeclOp::DefineLegacyMacro { module, name, mac });
                 }
@@ -2328,7 +2332,9 @@ mod tests {
         for key in keys(&db) {
             let decl = key.decl(&db);
             let decls = queries::module_decls(&db, key);
-            let replayed = unit::local_scope(&db, decl.module, &decl.inherited, &decls.ops);
+            let replayed = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+                unit::local_scope(&db, frame, decl.module, &decl.inherited, &decls.ops)
+            });
             assert_eq!(replayed, super::held_scope(key), "the round-0 scope of {:?}", decl.module);
         }
         db

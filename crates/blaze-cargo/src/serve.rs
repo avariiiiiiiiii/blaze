@@ -173,6 +173,7 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         socket,
         launcher: std::env::current_exe().context("the path of blaze itself, which launches the sandbox")?,
     };
+    // dyn: the sandbox's `Confine`, asked once per spawn
     let confine: Arc<dyn Confine> = Arc::new(blaze_usercode::confine::Launcher { program: paths.launcher.clone() });
     let threads = std::thread::available_parallelism().map_or(4, |it| it.get());
     let options = Options {
@@ -195,9 +196,9 @@ fn serve(args: impl IntoIterator<Item = OsString>) -> anyhow::Result<()> {
         activated,
     };
     signals::catch();
-    let steps: Arc<dyn work::Steps> = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
+    let steps = Arc::new(unit::Real::new(&paths).map_err(|why| anyhow::anyhow!(why))?);
     let scratch = paths.state.join("spawn");
-    let runner = Box::new(plane::Threads::new(options.io));
+    let runner = plane::Runner::Threads(plane::Threads::new(options.io));
     let driver = blaze_core::native(std::path::Path::new("/"), threads)
         .context("starting this machine's native driver (io_uring, kqueue or IOCP)")?;
     run(driver.confined(confine).scratch(scratch), options, steps, runner)
@@ -210,8 +211,8 @@ compile_error!("blaze serve runs on a native driver: io_uring (Linux), kqueue (m
 fn run(
     driver: blaze_core::Native,
     options: Options,
-    steps: Arc<dyn work::Steps>,
-    runner: Box<dyn plane::Runner<job::Value>>,
+    steps: Arc<unit::Real>,
+    runner: plane::Runner<job::Step<unit::Real>>,
 ) -> anyhow::Result<()> {
     let host = options.host.clone();
     let mut daemon = Daemon::start(driver, options, steps, runner).map_err(|why| anyhow::anyhow!(why))?;

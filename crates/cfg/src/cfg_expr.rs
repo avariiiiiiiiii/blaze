@@ -206,7 +206,7 @@ impl CfgExpr {
     }
 
     /// Fold the cfg by querying all basic `Atom` and `KeyValue` predicates.
-    pub fn fold(&self, query: &dyn Fn(&CfgAtom) -> bool) -> Option<bool> {
+    pub fn fold(&self, query: &impl Fn(&CfgAtom) -> bool) -> Option<bool> {
         match self {
             CfgExpr::Invalid => None,
             CfgExpr::Atom(atom) => Some(query(atom)),

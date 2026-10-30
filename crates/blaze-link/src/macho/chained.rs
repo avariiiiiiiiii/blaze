@@ -11,6 +11,7 @@
 
 use std::borrow::Cow;
 
+use blaze_format::cursor::Put;
 use blaze_ids::radix;
 use object::macho;
 use smallvec::SmallVec;
@@ -156,16 +157,10 @@ impl Imports {
 
 /// The 8 bytes at `addr` of the placed image.
 fn value_at(placed: &Placed<'_>, addr: u64) -> Result<u64, LinkError> {
-    let at = placed.regions.partition_point(|it| it.addr <= addr);
-    let bytes = at
-        .checked_sub(1)
-        .and_then(|at| {
-            let offset = usize::try_from(addr - placed.regions[at].addr).ok()?;
-            placed.bytes(at).get(offset..offset.checked_add(8)?)
-        })
+    placed
+        .u64_at(addr)
         // alloc: error path
-        .ok_or_else(|| error(format!("a pointer to slide at {addr:#x}, outside the bytes of its region")))?;
-    Ok(u64::from_le_bytes(bytes.try_into().expect("8 bytes")))
+        .ok_or_else(|| error(format!("a pointer to slide at {addr:#x}, outside the bytes of its region")))
 }
 
 /// The segment of `segments` holding `addr`, by its start; an error when none does.
@@ -268,13 +263,12 @@ pub(super) fn fixups<'n>(
     let binds = binds(placed)?;
     let imports = Imports::of(placed, &binds)?;
     let start = out.len();
-    let put32 = |out: &mut Vec<u8>, value: u32| out.extend_from_slice(&value.to_le_bytes());
     out.resize(start + HEADER.next_multiple_of(8), 0);
 
     // `dyld_chained_starts_in_image`, then each segment's `dyld_chained_starts_in_segment`.
     let starts = out.len();
     let count = segments.len() + 1;
-    put32(out, count as u32);
+    out.put_u32(count as u32);
     let offsets = out.len();
     out.resize(offsets + 4 * count, 0);
     let mut next = 0;
@@ -288,18 +282,18 @@ pub(super) fn fixups<'n>(
         let pad = (out.len() - start).next_multiple_of(8) - (out.len() - start);
         out.resize(out.len() + pad, 0);
         let at = (out.len() - starts) as u32;
-        out[offsets + 4 * nth..offsets + 4 * nth + 4].copy_from_slice(&at.to_le_bytes());
+        out.patch_u32(offsets + 4 * nth, at);
         let pages = vmsize.div_ceil(PAGE) as usize;
         if pages > usize::from(u16::MAX) {
             // alloc: error path
             return Err(error(format!("a segment at {vmaddr:#x} of {pages} chained pages, more than 65,535")));
         }
-        put32(out, (22 + 2 * pages) as u32);
-        out.extend_from_slice(&(PAGE as u16).to_le_bytes());
-        out.extend_from_slice(&POINTER_FORMAT.to_le_bytes());
-        out.extend_from_slice(&(vmaddr - base).to_le_bytes());
-        put32(out, 0);
-        out.extend_from_slice(&(pages as u16).to_le_bytes());
+        out.put_u32((22 + 2 * pages) as u32);
+        out.put_u16(PAGE as u16);
+        out.put_u16(POINTER_FORMAT);
+        out.put_u64(vmaddr - base);
+        out.put_u32(0);
+        out.put_u16(pages as u16);
         let page_starts = out.len();
         out.resize(page_starts + 2 * pages, 0);
         for page in out[page_starts..].chunks_exact_mut(2) {
@@ -350,16 +344,16 @@ pub(super) fn fixups<'n>(
         let weak = placed.imports[import as usize].weak;
         let word = u32::from(ordinal(import)? as u8) | u32::from(weak) << 8 | offset << 9;
         let at = table + nth * entry_len;
-        out[at..at + 4].copy_from_slice(&word.to_le_bytes());
+        out.patch_u32(at, word);
         if entry_len == 8 {
-            out[at + 4..at + 8].copy_from_slice(&addend.to_le_bytes());
+            out.patch_u32(at + 4, addend as u32);
         }
     }
 
     // `dyld_chained_fixups_header`.
     let header = [0, (starts - start) as u32, imports_at as u32, symbols_at as u32, entries as u32, imports.format, 0];
     for (nth, field) in header.into_iter().enumerate() {
-        out[start + 4 * nth..start + 4 * nth + 4].copy_from_slice(&field.to_le_bytes());
+        out.patch_u32(start + 4 * nth, field);
     }
     let len = (out.len() - start).next_multiple_of(8);
     out.resize(start + len, 0);

@@ -24,15 +24,13 @@ pub struct Compiled {
 /// For the sysroot and root of a workspace and libraries rustc compiled, what a caller has of
 /// each: a library that lists its macros or a WebAssembly module, `None` to expand with
 /// rustc's, or why it has none and the load is to fail.
-pub type Own = dyn Fn(Option<&AbsPath>, &AbsPath, &[Compiled]) -> Vec<Result<Option<AbsPathBuf>, String>>
-    + Send
-    + Sync;
+pub type Own = fn(Option<&AbsPath>, &AbsPath, &[Compiled]) -> Vec<Result<Option<AbsPathBuf>, String>>;
 
-static OWN: OnceLock<Box<Own>> = OnceLock::new();
+static OWN: OnceLock<Own> = OnceLock::new();
 
 /// Has each library a load names that does not list its macros expanded with what `own` has
 /// of it. The first call is the one kept.
-pub fn own_libraries_with(own: Box<Own>) {
+pub fn own_libraries_with(own: Own) {
     _ = OWN.set(own);
 }
 

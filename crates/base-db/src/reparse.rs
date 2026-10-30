@@ -191,8 +191,10 @@ pub(crate) fn whole(text: Text, edition: Edition, outline: bool) -> Parse<Source
 pub(crate) fn assert_whole(made: &Parse<SourceFile>, text: &Text, edition: Edition, outline: bool) {
     // clone: the check of debug builds and tests, not of a release parse.
     let whole = whole(text.clone(), edition, outline);
-    let tree = |parse: &Parse<SourceFile>| parse.syntax_node().flat_tree().cloned();
-    assert!(tree(made) == tree(&whole), "a reparse whose tree is not the whole parse's");
+    assert!(
+        made.root().file() == whole.root().file(),
+        "a reparse whose tree is not the whole parse's"
+    );
     let errors = |parse: &Parse<SourceFile>| {
         // alloc: as above, only to compare the two parses' errors.
         let mut errors: Vec<_> = parse

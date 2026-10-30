@@ -185,7 +185,7 @@ fn a_negative_fact_holds_before_the_name_appears() {
     let n = hir_expand::name::Name::new_symbol_root(intern::Symbol::intern("N"));
     assert!(b.scope(&db).get(&n).is_none(), "`a::N` does not exist yet");
     assert!(
-        map.diagnostics_of(b_id).any(|it| matches!(
+        map.diagnostics_of(&db, b_id).any(|it| matches!(
             it.kind,
             crate::nameres::diagnostics::DefDiagnosticKind::UnresolvedImport { .. }
         )),

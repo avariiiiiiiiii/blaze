@@ -19,6 +19,7 @@ use hir_def::{
     expr_store::ExpressionStoreDiagnostics,
     hir::{AsmOptions, Expr, ExprId, InlineAsmKind, generics::GenericParamDataRef},
 };
+use smallvec::SmallVec;
 use syntax::{AstNode, SyntaxNodePtr, TextRange, ast};
 
 use crate::{
@@ -86,6 +87,7 @@ impl LatePass for AsmLabels {
                 let found = template.snippet.and_then(|it| find_label_span(it, label));
                 let span = match found {
                     Some((lo, hi)) => template.span.with_lo(template.span.lo + lo).with_hi(template.span.lo + hi),
+                    // clone: a span, for the lint's diagnostic
                     None => template.span.clone(),
                 };
                 let mut diag = invalid_asm_label(kind, span, found.is_none());
@@ -109,24 +111,20 @@ struct Template<'db> {
 
 /// The template strings of the `asm!` written as `at`, those `cfg` removes left out; `None`
 /// when one is not a string, which rustc refuses before there is an `asm!` to lint.
-fn templates<'db>(b: &BodyCx<'_, 'db>, at: InFile<SyntaxNodePtr>) -> Option<Vec<Template<'db>>> {
+fn templates<'db>(b: &BodyCx<'_, 'db>, at: InFile<SyntaxNodePtr>) -> Option<SmallVec<[Template<'db>; 2]>> {
     let cx = b.cx;
     let node = cx.syntax(at);
+    // clone: a node handle, a reference count, once per `asm!`
     let asm = ast::AsmExpr::cast(node.value.clone())?;
-    let inactive: Vec<SyntaxNodePtr> = b
-        .source_map
-        .diagnostics()
-        .iter()
-        .filter_map(|it| match it {
-            ExpressionStoreDiagnostics::InactiveCode { node: inactive, .. } if inactive.file_id == at.file_id => {
-                Some(inactive.value)
-            }
-            _ => None,
+    let inactive = |ptr: SyntaxNodePtr| {
+        b.source_map.diagnostics().iter().any(|it| {
+            matches!(it, ExpressionStoreDiagnostics::InactiveCode { node: inactive, .. }
+                if inactive.file_id == at.file_id && inactive.value == ptr)
         })
-        .collect();
-    let mut templates = Vec::new();
+    };
+    let mut templates = SmallVec::new();
     for expr in asm.template() {
-        if inactive.contains(&SyntaxNodePtr::new(expr.syntax())) {
+        if inactive(SyntaxNodePtr::new(expr.syntax())) {
             continue;
         }
         let (value, range) = template_str(cx, expr)?;
@@ -179,6 +177,7 @@ fn requires_monomorphization(b: &BodyCx<'_, '_>) -> bool {
 /// That a lint of a `naked_asm!` read the generics of its function.
 fn generics_fact(b: &BodyCx<'_, '_>, diag: &mut Diag) {
     let DefWithBodyId::FunctionId(it) = b.owner else { return };
+    // alloc: the lint's diagnostic
     let what = format!("the signature of `{}`", b.cx.def_path(ModuleDefId::FunctionId(it).into()));
     diag.fact(Fact::Signature(b.cx.key(ItemId::Function(it))), what);
 }
@@ -219,6 +218,7 @@ fn invalid_asm_label(kind: Label, span: Span, missing_precise_span: bool) -> Dia
         }
         Label::Binary => {
             let message = "avoid using labels containing only the digits `0` and `1` in inline assembly";
+            // clone: a span, for the lint's diagnostic
             let mut diag = Diag::lint("binary_asm_labels", message, span.clone());
             diag.help("start numbering with `2` instead")
                 .note("an LLVM bug makes these labels ambiguous with a binary literal number on x86")
@@ -244,6 +244,7 @@ enum Label {
 /// a `//` comment cut off) read from its start, a label ending at each `:` until something is
 /// not one.
 fn labels(template: &str, raw: bool, hexagon: bool) -> Vec<(&str, Label)> {
+    // alloc: empty, pushed to only for a label in a template, which is then linted
     let mut labels = Vec::new();
     for statement in template.split(['\n', ';']) {
         let statement = statement.find("//").map_or(statement, |at| &statement[..at]);

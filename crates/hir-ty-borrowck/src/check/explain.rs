@@ -16,12 +16,13 @@ use hir_ty::{
     next_solver::TyKind,
 };
 
-use super::Checker;
+use super::{Checker, Draft, raw};
 use crate::{
-    BorrowckDiagnostic, PartSpan,
-    bitset::BitSet,
+    PartSpan,
+    bitset::bits,
     cfg::Location,
     liveness,
+    mem::{FDeque, FVec},
     regions::{self, Rv},
 };
 
@@ -77,7 +78,7 @@ enum UseSpans {
     Other(MirSpan),
 }
 
-impl<'db> Checker<'_, '_, 'db> {
+impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
     /// rustc's `explain_why_borrow_contains_point`: why loan `id` holds at `location`, where an
     /// access conflicts with it. `dropped` is the variable whose storage ending or drop the
     /// access is, when it is one.
@@ -133,7 +134,7 @@ impl<'db> Checker<'_, '_, 'db> {
     pub(super) fn add_explanation(
         &self,
         explanation: Explanation,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         desc: &str,
         borrow_span: Option<MirSpan>,
     ) {
@@ -142,7 +143,7 @@ impl<'db> Checker<'_, '_, 'db> {
         {
             diagnostic.label(
                 PartSpan::At(MirSpan::BindingId(binding)),
-                format!("binding `{name}` declared here"),
+                text!(self, "binding `{name}` declared here"),
             );
         }
         let overlaps = |at: PartSpan| borrow_span.is_some_and(|it| at == PartSpan::At(it));
@@ -157,7 +158,7 @@ impl<'db> Checker<'_, '_, 'db> {
                 if overlaps(at) || at == PartSpan::At(MirSpan::Unknown) {
                     return;
                 }
-                diagnostic.label(at, format!("{desc}borrow later {message}"));
+                diagnostic.label(at, text!(self, "{desc}borrow later {message}"));
                 if let Some(path) = path.filter(|&it| it != at) {
                     diagnostic.label(path, "used here by closure");
                 }
@@ -175,10 +176,10 @@ impl<'db> Checker<'_, '_, 'db> {
                     return;
                 }
                 match path.filter(|&it| it != at) {
-                    None => diagnostic.label(at, format!("{desc}{message}")),
+                    None => diagnostic.label(at, text!(self, "{desc}{message}")),
                     Some(_) if overlaps(at) => (),
                     Some(path) => {
-                        diagnostic.label(at, format!("{desc}borrow later {message}"));
+                        diagnostic.label(at, text!(self, "{desc}borrow later {message}"));
                         diagnostic.label(path, "used here by closure");
                     }
                 }
@@ -189,17 +190,18 @@ impl<'db> Checker<'_, '_, 'db> {
                     TyKind::Adt(def, _)
                         if !def.is_box() && self.ctx.has_destructor(def.def_id()) =>
                     {
-                        ("`Drop` code", format!("type `{def:?}`"))
+                        ("`Drop` code", text!(self, "type `{def:?}`"))
                     }
-                    TyKind::Closure(..) => ("destructor", "closure".to_owned()),
-                    TyKind::Coroutine(..) => ("destructor", "coroutine".to_owned()),
-                    _ => ("destructor", format!("type `{ty:?}`")),
+                    TyKind::Closure(..) => ("destructor", "closure"),
+                    TyKind::Coroutine(..) => ("destructor", "coroutine"),
+                    _ => ("destructor", text!(self, "type `{ty:?}`")),
                 };
                 match self.ctx.local_name(dropped) {
                     Some(name) => {
                         diagnostic.label(
                             PartSpan::At(at),
-                            format!(
+                            text!(
+                                self,
                                 "{desc}borrow might be used here, when `{name}` is dropped and runs the {dtor} for {what}"
                             ),
                         );
@@ -213,14 +215,16 @@ impl<'db> Checker<'_, '_, 'db> {
                         if let Some(made) = super::temporary_span(self.body, dropped) {
                             diagnostic.label(
                                 PartSpan::At(made),
-                                format!(
+                                text!(
+                                    self,
                                     "a temporary with access to the {desc}borrow is created here ..."
                                 ),
                             );
                         }
                         diagnostic.label(
                             PartSpan::At(at),
-                            format!(
+                            text!(
+                                self,
                                 "... and the {desc}borrow might be used here, when that temporary is dropped and runs the {dtor} for {what}"
                             ),
                         );
@@ -233,7 +237,7 @@ impl<'db> Checker<'_, '_, 'db> {
 
     /// The variable the borrow `expr` is of, through `&`, `*`, fields, method receivers and
     /// indexing, as rustc's `add_explanation_to_diagnostic` finds it: a path of one segment.
-    fn borrowed_variable(&self, mut expr: ExprId) -> Option<(hir_def::hir::BindingId, String)> {
+    fn borrowed_variable(&self, mut expr: ExprId) -> Option<(hir_def::hir::BindingId, &'f str)> {
         let store = self.ctx.store;
         loop {
             expr = match store.expr(expr) {
@@ -250,7 +254,7 @@ impl<'db> Checker<'_, '_, 'db> {
             return None;
         }
         let binding = regions::path_binding(self.ctx, self.body, expr)?;
-        Some((binding, store[binding].name.as_str().to_owned()))
+        Some((binding, store[binding].name.as_str()))
     }
 
     /// rustc's `find_sub_region_live_at`: the first region `region` outlives, itself first,
@@ -259,8 +263,10 @@ impl<'db> Checker<'_, '_, 'db> {
     fn sub_region_live_at(&self, region: Rv, location: Location) -> Option<Rv> {
         let point = self.cfg.point(location);
         let count = self.region_count;
-        let mut seen = BitSet::new(count);
-        let mut queue = VecDeque::from([region]);
+        let frame = self.ctx.frame;
+        let mut seen = bits(frame, count);
+        let mut queue: FDeque<'_, Rv> = VecDeque::with_capacity_in(count, frame);
+        queue.push_back(region);
         seen.insert(region);
         while let Some(rv) = queue.pop_front() {
             if self.regions.universal(rv).is_some()
@@ -282,6 +288,7 @@ impl<'db> Checker<'_, '_, 'db> {
     /// `FalseUnwind`: a loop starts at a block a back edge goes to, one from a block it
     /// dominates.
     fn loop_head(&self, region: Rv, from: Location) -> Option<Location> {
+        let (mut seen, mut stack) = self.reach_buffers();
         self.values.points_of(region).iter().take_while(|&it| it < self.cfg.points).find_map(
             |point| {
                 let location = self.cfg.location(point);
@@ -289,7 +296,7 @@ impl<'db> Checker<'_, '_, 'db> {
                     && self.cfg.predecessors(location.block).iter().any(|&pred| {
                         self.dominators.dominates(location.block, pred)
                     })
-                    && self.is_predecessor_of(from, location))
+                    && self.reaches(from, location, &mut seen, &mut stack))
                 .then_some(location)
             },
         )
@@ -298,9 +305,11 @@ impl<'db> Checker<'_, '_, 'db> {
     /// rustc's `find_use::find`: breadth first from `start` through the points `region` holds
     /// at, the first that mentions a local whose type has `region` and does not define it.
     fn find_use(&self, region: Rv, start: Location) -> Option<(LocalId, Location, DefUse)> {
-        let mut queue = VecDeque::from([start]);
-        let mut seen = BitSet::new(self.cfg.points);
-        let mut tys = Vec::new();
+        let frame = self.ctx.frame;
+        let mut queue: FDeque<'_, Location> = VecDeque::with_capacity_in(16, frame);
+        queue.push_back(start);
+        let mut seen = bits(frame, self.cfg.points);
+        let mut tys: FVec<'_, Rv> = Vec::new_in(frame);
         while let Some(location) = queue.pop_front() {
             let point = self.cfg.point(location);
             if !self.values.contains_point(region, point) || !seen.insert(point) {
@@ -558,8 +567,4 @@ fn operand(it: &Operand, place: &mut impl FnMut(LocalId, &[PlaceElem], DefUse)) 
     if let OperandKind::Copy(it) | OperandKind::Move(it) = &it.kind {
         place(it.local, it.projection.as_slice(), DefUse::Use);
     }
-}
-
-fn raw(local: LocalId) -> usize {
-    local.into_raw().into_u32() as usize
 }

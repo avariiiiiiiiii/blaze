@@ -239,7 +239,8 @@ struct Connecting {
 
 struct Connection {
     socket: net::Socket,
-    recvs: VecDeque<(Tag, usize)>,
+    /// Each receive, its most and the buffer it appends to.
+    recvs: VecDeque<(Tag, usize, Vec<u8>)>,
     /// Each send, and how much of it is sent.
     sends: VecDeque<(Tag, Vec<u8>, usize)>,
     read: u64,
@@ -272,7 +273,7 @@ pub struct Kqueue {
     workers: Vec<JoinHandle<()>>,
     // dyn: the platform's sandbox, given once at setup and asked once per spawn.
     confine: Option<Arc<dyn Confine>>,
-    /// Where a process's output and a connection's bytes are read into.
+    /// Where a process's output is read into.
     buffer: Vec<u8>,
     /// Made with the next wait.
     changes: Vec<Kevent>,
@@ -450,13 +451,19 @@ impl Kqueue {
             Effect::Spawn { command, tag } => self.spawn(command, tag),
             Effect::Listen { at, tag } => self.listen(&at, tag),
             Effect::Connect { at, tag } => self.connect(at, tag),
-            Effect::Recv { conn, most, tag } => {
-                self.connection(conn)?.recvs.push_back((tag, most));
+            Effect::Recv { conn, most, into, tag } => {
+                match self.connection(conn) {
+                    Ok(connection) => connection.recvs.push_back((tag, most, into)),
+                    Err(error) => self.ready.push(Completion { tag, done: Done::unread(into, error) }),
+                }
                 self.serve_recvs(conn_id(conn));
                 Ok(())
             }
             Effect::Send { conn, bytes, tag } => {
-                self.connection(conn)?.sends.push_back((tag, bytes, 0));
+                match self.connection(conn) {
+                    Ok(connection) => connection.sends.push_back((tag, bytes, 0)),
+                    Err(error) => self.ready.push(Completion { tag, done: Done::unsent(bytes, error) }),
+                }
                 self.serve_sends(conn_id(conn));
                 Ok(())
             }
@@ -491,9 +498,9 @@ impl Kqueue {
         };
         let id = self.watches.insert(watch);
         let watch = self.watches.get_mut(id).expect("inserted above");
+        let mut first = None;
         // SAFETY: the watch is in a slab entry, which never moves while it holds it, and it is
         // stopped (`retire`, or dropped in place with the slab) before it is taken out.
-        let mut first = None;
         let started = unsafe {
             match since {
                 None => watch.start(&self.root, dir, tag),
@@ -832,13 +839,11 @@ impl Kqueue {
 
     fn serve_recvs(&mut self, conn: ConnId) {
         let Some(connection) = self.conns.get_mut(conn) else { return };
-        while let Some(&(tag, most)) = connection.recvs.front() {
-            // At most a buffer's worth, which a receive may be: nothing is allocated for a
-            // receive that would wait.
-            let most = most.min(self.buffer.len());
-            let done = match connection.socket.read(&mut self.buffer[..most]) {
-                // alloc: the receive's payload.
-                Ok(n) => Done::Read(self.buffer[..n].to_vec()),
+        while let Some((tag, most, into)) = connection.recvs.front_mut() {
+            let tag = *tag;
+            // Straight into the asker's buffer, which keeps its room for the next receive.
+            let done = match connection.socket.read_into(into, *most) {
+                Ok(_) => Done::Read(std::mem::take(into)),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.changes.push(Kevent {
                         ident: connection.socket.fd() as usize,
@@ -850,8 +855,7 @@ impl Kqueue {
                     });
                     return;
                 }
-                // alloc: an error path.
-                Err(error) => Done::Failed(IoError(error.to_string())),
+                Err(error) => Done::unread(std::mem::take(into), error),
             };
             connection.recvs.pop_front();
             self.ready.push(Completion { tag, done });
@@ -863,10 +867,12 @@ impl Kqueue {
         while let Some((tag, bytes, put)) = connection.sends.front_mut() {
             let tag = *tag;
             let done = match *put == bytes.len() {
-                true => Done::Sent,
+                true => {
+                    bytes.clear();
+                    Done::Sent(std::mem::take(bytes))
+                }
                 false => match connection.socket.write(&bytes[*put..]) {
-                    // alloc: an error path.
-                    Ok(0) => Done::Failed(IoError("the connection took no more bytes".into())),
+                    Ok(0) => Done::unsent(std::mem::take(bytes), "the connection took no more bytes"),
                     Ok(n) => {
                         *put += n;
                         continue;
@@ -883,8 +889,7 @@ impl Kqueue {
                         });
                         return;
                     }
-                    // alloc: an error path.
-                    Err(error) => Done::Failed(IoError(error.to_string())),
+                    Err(error) => Done::unsent(std::mem::take(bytes), error),
                 },
             };
             connection.sends.pop_front();
@@ -897,13 +902,12 @@ impl Kqueue {
         self.disown(connection.read);
         self.disown(connection.write);
         let shut = connection.socket.shutdown();
-        for (recv, _) in connection.recvs {
-            // alloc: none, an empty vector.
-            self.ready.push(Completion { tag: recv, done: Done::Read(Vec::new()) });
+        for (recv, _, into) in connection.recvs {
+            self.ready.push(Completion { tag: recv, done: Done::Read(into) });
         }
-        for (send, ..) in connection.sends {
+        for (send, bytes, _) in connection.sends {
             // alloc: an error path.
-            let done = Done::Failed(IoError(format!("{conn:?} hung up before all of it was sent")));
+            let done = Done::unsent(bytes, format_args!("{conn:?} hung up before all of it was sent"));
             self.ready.push(Completion { tag: send, done });
         }
         shut?;
@@ -1006,8 +1010,6 @@ impl Kqueue {
 
     /// The kqueue refused a change of `id`'s.
     fn refused(&mut self, id: u64, owner: Owner, error: io::Error) {
-        // alloc: an error path.
-        let failed = |error: &io::Error| Done::Failed(IoError(error.to_string()));
         match owner {
             Owner::Exit(spawn) => {
                 self.disown(id);
@@ -1057,15 +1059,15 @@ impl Kqueue {
             }
             Owner::Read(conn) => {
                 let Some(connection) = self.conns.get_mut(conn) else { return };
-                if let Some((tag, _)) = connection.recvs.pop_front() {
-                    self.ready.push(Completion { tag, done: failed(&error) });
+                if let Some((tag, _, into)) = connection.recvs.pop_front() {
+                    self.ready.push(Completion { tag, done: Done::unread(into, &error) });
                 }
                 self.serve_recvs(conn);
             }
             Owner::Write(conn) => {
                 let Some(connection) = self.conns.get_mut(conn) else { return };
-                if let Some((tag, ..)) = connection.sends.pop_front() {
-                    self.ready.push(Completion { tag, done: failed(&error) });
+                if let Some((tag, bytes, _)) = connection.sends.pop_front() {
+                    self.ready.push(Completion { tag, done: Done::unsent(bytes, &error) });
                 }
                 self.serve_sends(conn);
             }
@@ -1363,7 +1365,7 @@ mod tests {
         let script = "cat; echo err >&2; exit 7";
         let limited = Box::new(Command { memory: Some(1 << 30), ..*command("/bin/echo", &["hi"], b"") });
         let mut on = command("/bin/echo", &["hi"], b"");
-        on.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false };
+        on.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() };
         let seen = run(&mut driver, vec![
             Effect::Spawn { command: command("/bin/sh", &["-c", script], b"hello"), tag: Tag(1) },
             Effect::Spawn { command: command("/bin/sh", &["-c", "kill -TERM $$"], b""), tag: Tag(2) },
@@ -1432,7 +1434,7 @@ mod tests {
         let root = dir("confine");
         let mut driver = Kqueue::new(&root, 1).unwrap().confined(Arc::new(Recording));
         let mut traced = command("/bin/echo", &["hi"], b"");
-        traced.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true };
+        traced.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true, services: Vec::new() };
         let seen = run(&mut driver, vec![Effect::Spawn { command: traced, tag: Tag(1) }]);
         let exit = exit(&seen[&1]);
         assert_eq!((exit.code, exit.stdout.as_slice()), (Some(0), &b"hi\n"[..]));
@@ -1458,7 +1460,7 @@ mod tests {
             match (done.tag.0, done.done) {
                 (1, Done::Accepted { conn }) => {
                     server = Some(conn);
-                    effects.push(Effect::Recv { conn, most: 64, tag: Tag(3) });
+                    effects.push(Effect::Recv { conn, most: 64, into: Vec::new(), tag: Tag(3) });
                 }
                 (2, Done::Connected { conn }) => {
                     client = Some(conn);
@@ -1468,21 +1470,20 @@ mod tests {
                     assert_eq!(bytes, b"ping");
                     let (server, client) = (server.unwrap(), client.unwrap());
                     effects.push(Effect::Send { conn: server, bytes: b"pong".to_vec(), tag: Tag(5) });
-                    effects.push(Effect::Recv { conn: client, most: 64, tag: Tag(6) });
+                    effects.push(Effect::Recv { conn: client, most: 64, into: Vec::new(), tag: Tag(6) });
                 }
                 (6, Done::Read(bytes)) => {
                     assert_eq!(bytes, b"pong");
                     effects.push(Effect::Hangup { conn: client.unwrap(), tag: Tag(7) });
-                    effects.push(Effect::Recv { conn: server.unwrap(), most: 64, tag: Tag(8) });
+                    effects.push(Effect::Recv { conn: server.unwrap(), most: 64, into: Vec::new(), tag: Tag(8) });
                 }
                 (8, Done::Read(bytes)) => {
                     assert!(bytes.is_empty(), "{bytes:?}");
                     effects.push(Effect::Hangup { conn: server.unwrap(), tag: Tag(9) });
                     effects.push(Effect::Unlisten { tag: Tag(1) });
                 }
-                (tag @ (4 | 5), Done::Sent)
-                | (tag @ (7 | 9), Done::HungUp)
-                | (tag @ 1, Done::Unlistened) => ends.push(tag),
+                (tag @ (4 | 5), Done::Sent(bytes)) if bytes.is_empty() => ends.push(tag),
+                (tag @ (7 | 9), Done::HungUp) | (tag @ 1, Done::Unlistened) => ends.push(tag),
                 (tag, other) => panic!("{tag}: {other:?}"),
             }
         });
@@ -1520,13 +1521,14 @@ mod tests {
         let seen = run(&mut driver, vec![
             Effect::Unwatch { tag: Tag(1) },
             Effect::Unlisten { tag: Tag(2) },
-            Effect::Recv { conn: Conn(77), most: 8, tag: Tag(3) },
+            Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
             Effect::Hangup { conn: Conn(77), tag: Tag(4) },
             Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
             Effect::Kill { tag: Tag(6) },
         ]);
         assert_eq!(seen.keys().copied().collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
-        assert!(seen.values().all(|it| matches!(it, Done::Failed(_))), "{seen:?}");
+        assert!(matches!(&seen[&3], Done::Broken { buffer, .. } if buffer == b"kept"), "{seen:?}");
+        assert!(seen.iter().all(|(tag, it)| *tag == 3 || matches!(it, Done::Failed(_))), "{seen:?}");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2075,6 +2077,41 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// A file's times set through the file threads, once the driver's buffers and the threads'
+    /// have grown: nothing allocated on the driver's thread, nor by the file thread's
+    /// `utimensat` and its hand-back.
+    #[test]
+    fn a_warm_times_set_allocates_nothing() {
+        const WARM: u64 = 8;
+        const ROUNDS: u64 = 200;
+        let root = dir("budget-times");
+        let mut driver = Kqueue::new(&root, 1).unwrap();
+        let file = name("f");
+        run(&mut driver, vec![Effect::Write { file: file.clone(), bytes: b"bytes".to_vec(), tag: Tag(1) }]);
+        let (mut effects, mut out) = (Vec::with_capacity(1), Vec::with_capacity(4));
+        for round in 0..WARM + ROUNDS {
+            if round == WARM {
+                driver.notify.file_allocations.store(0, Ordering::Relaxed);
+            }
+            // The caller's: made before the cycle.
+            let modified_ns = 1_700_000_000_000_000_000 + 1000 * round;
+            effects.push(Effect::Times { file: file.clone(), modified_ns, tag: Tag(round) });
+            let ((), used) = blaze_alloc_count::measure(|| {
+                driver.submit(&mut effects);
+                poll_for(&mut driver, &mut out, 1);
+            });
+            if round >= WARM {
+                assert_eq!(used.allocations, 0, "round {round}: a warm set of times, on the driver's thread");
+            }
+            assert_eq!(out.as_slice(), [Completion { tag: Tag(round), done: Done::Timed }]);
+            out.clear();
+        }
+        let threads = driver.notify.file_allocations.load(Ordering::Relaxed);
+        assert_eq!(threads, 0, "the file thread: {threads} allocations over {ROUNDS} warm sets of times");
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn a_warm_timer_arm_and_fire_allocates_nothing() {
         let mut driver = Kqueue::new(dir("budget-timers"), 1).unwrap();
@@ -2148,11 +2185,11 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A send on one end and a receive on the other, on a warm connection: only the received
-    /// bytes allocated. Then both ends hung up and their slots another connection's: the old
-    /// `Conn`s name nothing.
+    /// A send on one end and a receive on the other, on a warm connection, each buffer handed
+    /// back and given to the next: nothing allocated. Then both ends hung up and their slots
+    /// another connection's: the old `Conn`s name nothing, and their buffers come back.
     #[test]
-    fn a_warm_send_and_receive_allocates_only_the_bytes_received() {
+    fn a_warm_send_and_receive_allocates_nothing() {
         let root = dir("budget-conn");
         let mut driver = Kqueue::new(&root, 1).unwrap();
         let at = Address::Unix(name("s"));
@@ -2175,32 +2212,33 @@ mod tests {
             (server.unwrap(), client.unwrap())
         };
         let (server, client) = accept(&mut driver, &mut out, Tag(2));
+        let (mut sending, mut receiving) = (Vec::new(), Vec::new());
         for round in 0..200u64 {
-            // The caller's: made before the cycle.
-            effects.push(Effect::Send { conn: client, bytes: b"ping".to_vec(), tag: Tag(10) });
-            effects.push(Effect::Recv { conn: server, most: 64, tag: Tag(11) });
+            sending.extend_from_slice(b"ping");
+            receiving.clear();
             let ((), used) = blaze_alloc_count::measure(|| {
+                let (bytes, into) = (std::mem::take(&mut sending), std::mem::take(&mut receiving));
+                effects.push(Effect::Send { conn: client, bytes, tag: Tag(10) });
+                effects.push(Effect::Recv { conn: server, most: 64, into, tag: Tag(11) });
                 driver.submit(&mut effects);
                 poll_for(&mut driver, &mut out, 2);
             });
             if round >= 8 {
-                assert!(
-                    used.allocations <= 1,
-                    "round {round}: a warm send and receive made {} allocations; the received bytes' Vec<u8> only",
-                    used.allocations
-                );
+                assert_eq!(used.allocations, 0, "round {round}: a warm send and receive, their buffers reused");
             }
             out.sort_by_key(|it| it.tag);
-            assert!(
-                matches!(
-                    out.as_slice(),
-                    [Completion { done: Done::Sent, .. }, Completion { done: Done::Read(bytes), .. }]
-                        if bytes == b"ping"
-                ),
-                "{out:?}"
-            );
+            match &mut out[..] {
+                [
+                    Completion { done: Done::Sent(sent), .. },
+                    Completion { done: Done::Read(read), .. },
+                ] if sent.is_empty() && read == b"ping" => {
+                    (sending, receiving) = (std::mem::take(sent), std::mem::take(read));
+                }
+                other => panic!("{other:?}"),
+            }
             out.clear();
         }
+        assert!(sending.capacity() >= 4 && receiving.capacity() >= 64, "the buffers keep their room");
         effects.extend([Effect::Hangup { conn: client, tag: Tag(20) }, Effect::Hangup { conn: server, tag: Tag(21) }]);
         driver.submit(&mut effects);
         poll_for(&mut driver, &mut out, 2);
@@ -2208,10 +2246,13 @@ mod tests {
         out.clear();
         // A made-up `Conn` with the generation a freed slot has now.
         let free = Conn(client.0 + (1 << 32));
-        effects.push(Effect::Recv { conn: free, most: 8, tag: Tag(22) });
+        effects.push(Effect::Recv { conn: free, most: 8, into: receiving, tag: Tag(22) });
         driver.submit(&mut effects);
         poll_for(&mut driver, &mut out, 1);
-        assert!(matches!(out[..], [Completion { tag: Tag(22), done: Done::Failed(_) }]), "{out:?}");
+        assert!(
+            matches!(&out[..], [Completion { tag: Tag(22), done: Done::Broken { buffer, .. } }] if buffer.capacity() >= 64),
+            "{out:?}"
+        );
         out.clear();
         effects.push(Effect::Connect { at, tag: Tag(3) });
         driver.submit(&mut effects);
@@ -2223,12 +2264,15 @@ mod tests {
         new.sort();
         assert_eq!(old, new, "the hung-up connections' slots are the new ones'");
         effects.extend([
-            Effect::Recv { conn: client, most: 8, tag: Tag(30) },
+            Effect::Recv { conn: client, most: 8, into: Vec::new(), tag: Tag(30) },
             Effect::Send { conn: server, bytes: b"x".to_vec(), tag: Tag(31) },
         ]);
         driver.submit(&mut effects);
         poll_for(&mut driver, &mut out, 2);
-        assert!(out.iter().all(|it| matches!(it.done, Done::Failed(_))), "stale: {out:?}");
+        assert!(
+            out.iter().all(|it| matches!(&it.done, Done::Broken { buffer, .. } if buffer.is_empty())),
+            "stale: {out:?}"
+        );
         out.clear();
         effects.extend([
             Effect::Hangup { conn: again, tag: Tag(40) },

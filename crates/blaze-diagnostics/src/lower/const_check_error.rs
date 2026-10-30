@@ -10,11 +10,14 @@
 //! (`crates/hir-ty-mir/src/mir/const_check.rs`) writes it; the notes are rustc's for it.
 
 use blaze_items::{Fact, ItemId};
-use hir::{AsAssocItem, HasSource, InFile, ModuleDef, PathResolution};
-use syntax::{AstNode, SyntaxKind, SyntaxNodePtr, ast, ast::HasGenericParams};
+use hir::{AsAssocItem, InFile, ModuleDef, PathResolution};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr,
+    view::{self as ast, AstNode as _, HasGenericParams as _},
+};
 
 use crate::{
-    cx::{Cx, signature_range},
+    cx::{Cx, signature_range_view as signature_range},
     lints::code_fact,
     lower::{Found, Phase, break_outside_of_loop::up},
     model::Diag,
@@ -22,6 +25,7 @@ use crate::{
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ConstCheckError) -> Vec<Found> {
     let code = (!d.code.is_empty()).then_some(d.code);
+    // clone: the message hir owns, once per diagnostic (the edge).
     let mut diag = Diag::error(code, d.message.clone(), cx.span_of(d.node));
     let message = d.message.as_str();
     if message.starts_with("cannot call non-const ") {
@@ -35,6 +39,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ConstCheckError) -> Vec<Found> {
         diag.note("see issue #53020 <https://github.com/rust-lang/rust/issues/53020> for more information");
     }
     code_fact(cx, &mut diag, d.node);
+    // alloc: `lower`'s one `Vec` per diagnostic (lower/mod.rs's interface, the edge).
     vec![Found::new(diag, phase(cx, d.node))]
 }
 
@@ -43,14 +48,15 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::ConstCheckError) -> Vec<Found> {
 /// an enum's discriminant in its well-formedness check, and the rest (a `const fn`, an
 /// associated or generic `const`) in its borrow checking of each body.
 pub(crate) fn phase(cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Phase {
-    for node in up(cx, &cx.syntax(at)) {
+    for node in up(cx, cx.syntax_view(at)) {
         let node = node.value;
         if ast::Fn::can_cast(node.kind()) {
             return Phase::Mir;
         }
-        if let Some(it) = ast::Const::cast(node.clone()) {
+        if ast::Const::can_cast(node.kind()) {
             let associated = node.parent().is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST);
-            return match associated || it.generic_param_list().is_some() {
+            let generic = ast::Const::cast(node).is_some_and(|it| it.generic_param_list().is_some());
+            return match associated || generic {
                 true => Phase::Mir,
                 false => Phase::Bodies,
             };
@@ -72,21 +78,25 @@ fn non_const_call(cx: &Cx<'_, '_>, diag: &mut Diag, node: InFile<SyntaxNodePtr>,
     if message.starts_with("cannot call non-const intrinsic ") {
         return;
     }
-    let callee = ast::Expr::cast(cx.syntax(node).value).and_then(|expr| callee(cx, &expr));
+    let callee = ast::Expr::cast(cx.syntax_view(node).value).and_then(|expr| callee(cx, expr));
     if let Some(callee) = callee
         && let Ok(id) = hir_def::FunctionId::try_from(callee)
     {
+        // alloc: the callee's name for the notes, once per diagnostic (the edge).
         let name = callee.name(cx.db).display(cx.db, cx.edition).to_string();
         let key = cx.key(ItemId::Function(id));
+        // alloc: the fact's text, once per diagnostic (the edge).
         diag.fact(Fact::Signature(key), format!("the signature of `{name}`"));
         if callee.as_assoc_item(cx.db).is_none()
-            && let Some(source) = callee.source(cx.db)
+            && let Some(source) = cx.vsema.source(callee)
         {
-            let at = source.with_value(signature_range(&source.value));
+            let at = source.with_value(signature_range(source.value));
+            // alloc: the note's text, once per diagnostic (the edge).
             diag.span_note(cx.span(at), format!("function `{name}` is not const"));
         }
     }
     let Some((_, kind)) = message.rsplit_once(" in ") else { return };
+    // alloc: the note's text, once per diagnostic (the edge).
     diag.note(format!("calls in {kind} are limited to constant functions, tuple structs and tuple variants"));
     if kind == "statics" {
         diag.note("consider wrapping this expression in `std::sync::LazyLock::new(|| ...)`");
@@ -94,16 +104,16 @@ fn non_const_call(cx: &Cx<'_, '_>, diag: &mut Diag, node: InFile<SyntaxNodePtr>,
 }
 
 /// The function a call or a method call calls.
-fn callee(cx: &Cx<'_, '_>, expr: &ast::Expr) -> Option<hir::Function> {
+fn callee(cx: &Cx<'_, '_>, expr: ast::Expr<'_>) -> Option<hir::Function> {
     match expr {
         ast::Expr::CallExpr(call) => {
             let ast::Expr::PathExpr(path) = call.expr()? else { return None };
-            match cx.sema.resolve_path(&path.path()?)? {
+            match cx.vsema.resolve_path(path.path()?)? {
                 PathResolution::Def(ModuleDef::Function(it)) => Some(it),
                 _ => None,
             }
         }
-        ast::Expr::MethodCallExpr(call) => cx.sema.resolve_method_call(call),
+        ast::Expr::MethodCallExpr(call) => cx.vsema.resolve_method_call(call),
         _ => None,
     }
 }

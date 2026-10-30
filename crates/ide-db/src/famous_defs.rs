@@ -215,8 +215,7 @@ impl FamousDefs<'_, '_> {
         }
 
         let res = krate
-            .dependencies(db)
-            .into_iter()
+            .dependencies_iter(db)
             .find(|dep| dep.krate.origin(db) == CrateOrigin::Lang(origin))?
             .krate;
         Some(res)

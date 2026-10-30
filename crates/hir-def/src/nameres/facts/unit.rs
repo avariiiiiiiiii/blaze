@@ -15,14 +15,19 @@ mod imports;
 #[cfg(test)]
 mod tests;
 
-use std::mem;
+use std::{
+    alloc::{Allocator, Global},
+    mem,
+};
 
 use base_db::Db;
+use blaze_mem::Frame;
+use hashbrown::HashSet;
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::{FxBuildHasher, FxHashMap};
 use span::Edition;
 use triomphe::Arc;
 
@@ -36,6 +41,7 @@ use crate::{
     nameres::{
         BuildingScope, BuiltinShadowMode, DefMap, DiagnosticsByModule, LocalDefMap, ModuleData,
         ModuleOrigin, ModuleScope, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot,
+        diagnostics::DefDiagnostic,
         path_resolution::{PathRead, ReachedFixedPoint, ResolvePathResult},
         uses,
     },
@@ -44,10 +50,11 @@ use crate::{
 };
 
 use self::imports::{
-    ALL_NS, GlobEdges, ImportList, ImporterEdge, Imports, MACROS, NONE, PartialResolvedImport,
-    Phase, TYPES, WaitOn, written_ns,
+    ALL_NS, GlobEdges, ImportList, ImportQueues, ImporterEdge, ImporterLists, Imports, MACROS,
+    NONE, PartialResolvedImport, Phase, TYPES, WaitOn, written_ns,
 };
 use super::{
+    FrameSet, FrameVec, set_in,
     env::{ChildMode, ChildRequest, CollectCx, Sink},
     graph::Partition,
     ops::{DeclOp, ImportOp, MacroOp, OpLog},
@@ -59,26 +66,48 @@ use super::{
 
 const GLOB_RECURSION_LIMIT: usize = 100;
 
-/// What a component carries from one round to the next: its members' rows, its imports and the
-/// worklist over them, its glob edges, and what it read of other components.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct UnitState {
+/// What a component carries from one round to the next (`A = Global`): its members' rows, its
+/// imports and what each resolved to, its glob edges, and what it read of other components. The
+/// worklist over the imports is each run's own ([`ImportQueues`]). A block's state, never
+/// carried, is in its query's frame; its rows go into the block's map.
+#[derive(Clone, Debug)]
+pub(crate) struct UnitState<A: Allocator + Clone = Global> {
     /// The members' rows, in the order they were declared. Moved into the view while a unit
     /// runs, and back when it is done.
     rows: FxIndexMap<ModuleId, ModuleData>,
-    imports: Imports,
-    globs: GlobEdges,
-    from_glob_import: PerNsGlobImports,
+    imports: Imports<A>,
+    globs: GlobEdges<A>,
+    from_glob_import: PerNsGlobImports<A>,
     /// Every module of another component the state read (a path's slot, a glob's source).
-    upstream: FxHashSet<ModuleId>,
+    upstream: HashSet<ModuleId, FxBuildHasher, A>,
     /// The modules of other components the members glob-import, in the order first read:
     /// pulled again when the component carries on into a round.
-    upstream_globs: Vec<ModuleId>,
+    upstream_globs: Vec<ModuleId, A>,
     /// The `#[prelude_import]` a member resolved.
     prelude: Option<(ModuleId, Option<UseId>)>,
 }
 
-impl UnitState {
+impl Default for UnitState {
+    fn default() -> Self {
+        UnitState::new_in(Global)
+    }
+}
+
+impl<A: Allocator + Clone> UnitState<A> {
+    pub(crate) fn new_in(alloc: A) -> Self {
+        // clone: the allocator, a `&Frame` or `Global`: no allocation.
+        let a = || alloc.clone();
+        UnitState {
+            rows: FxIndexMap::default(),
+            imports: Imports::new_in(a()),
+            globs: ImporterLists::new_in(a()),
+            from_glob_import: PerNsGlobImports::new_in(a()),
+            upstream: HashSet::with_hasher_in(FxBuildHasher, a()),
+            upstream_globs: Vec::new_in(a()),
+            prelude: None,
+        }
+    }
+
     /// Every import of the members and what it resolved to, `None` for one still unresolved,
     /// in import order.
     pub(crate) fn import_outcomes(&self) -> impl Iterator<Item = (&ImportOp, Option<PerNs>)> + '_ {
@@ -119,10 +148,10 @@ impl ReadCheck<'_> {
 /// Whether `module`, a module of the unit's own map, is one the unit holds. A read of any other
 /// is checked against the partition and recorded as upstream; a read the partition does not put
 /// upstream stops, naming `path`, the import of `importer` that made it.
-fn held(
+fn held<A: Allocator + Clone>(
     db: &Db,
     check: &Option<ReadCheck<'_>>,
-    upstream: &mut FxHashSet<ModuleId>,
+    upstream: &mut HashSet<ModuleId, FxBuildHasher, A>,
     module: ModuleId,
     path: &ModPath,
     importer: ModuleId,
@@ -157,26 +186,31 @@ impl Local<'_> {
 }
 
 /// A unit at work: the view `DefMap` paths resolve in, the extern prelude, the state, and, for a
-/// crate's component, the partition its reads are checked against.
-pub(crate) struct Unit<'db> {
+/// crate's component, the partition its reads are checked against. What the run keeps besides
+/// the state is in the frame of the query that runs it.
+pub(crate) struct Unit<'db, 'f, A: Allocator + Clone = Global> {
     db: &'db Db,
+    frame: &'f Frame,
     def_map: DefMap,
     local: Local<'db>,
-    state: UnitState,
+    state: UnitState<A>,
+    queues: ImportQueues<'f>,
     check: Option<ReadCheck<'db>>,
     /// The macro directives a block's collection made (`Sink::apply(DeclOp::Macro)`), until
     /// `take_macros` moves them.
-    macros: Vec<MacroOp>,
+    macros: FrameVec<'f, MacroOp>,
     /// Scratch for `update`: the resolutions of each level of a glob propagation, one level's
     /// after its caller's.
-    held: Vec<(Option<Name>, PerNs)>,
+    held: FrameVec<'f, (Option<Name>, PerNs)>,
     /// The members whose row an op or a resolution wrote since the unit started.
-    touched: FxHashSet<ModuleId>,
+    touched: FrameSet<'f, ModuleId>,
     /// The names of `extern crate`s that did not resolve (`DeclOp::UnresolvedExternCrate`).
-    unresolved_extern_crates: FxHashSet<Name>,
+    unresolved_extern_crates: FrameSet<'f, Name>,
     /// The `NotIntroducing`, `ResolvedMacroPath` and `DeriveHelperUse` ops a block's collection
     /// made, in order, for its `NameRecords`.
-    records: Vec<DeclOp>,
+    records: FrameVec<'f, DeclOp>,
+    /// The diagnostics a block's collection made, in order, until the block's map takes them.
+    diagnostics: FrameVec<'f, DefDiagnostic>,
 }
 
 /// The rows of a unit's view.
@@ -190,7 +224,7 @@ fn own_rows(modules: &mut ModulesSlot) -> &mut ModulesMap {
 /// The row of `module`, a member, to write.
 fn row_of<'a>(
     modules: &'a mut ModulesSlot,
-    touched: &mut FxHashSet<ModuleId>,
+    touched: &mut FrameSet<'_, ModuleId>,
     module: ModuleId,
 ) -> &'a mut ModuleData {
     touched.insert(module);
@@ -200,48 +234,65 @@ fn row_of<'a>(
     }
 }
 
-impl<'db> Unit<'db> {
+impl<'db, 'f> Unit<'db, 'f, &'f Frame> {
     /// A block's unit: `def_map` is `block_def_map`'s empty map (`ModulesSlot::Building`),
-    /// every module it holds is a member, no partition check.
-    pub(crate) fn block(cx: &CollectCx<'db>, def_map: DefMap, local: &'db LocalDefMap) -> Unit<'db> {
-        Unit::new(cx.db, def_map, Local::Borrowed(local), UnitState::default(), None)
+    /// every module it holds is a member, no partition check. Its state is in the frame.
+    pub(crate) fn block(
+        cx: &CollectCx<'db, 'f>,
+        def_map: DefMap,
+        local: &'db LocalDefMap,
+    ) -> Unit<'db, 'f, &'f Frame> {
+        let state = UnitState::new_in(cx.frame);
+        Unit::new(cx.db, cx.frame, def_map, Local::Borrowed(local), state, None)
     }
 
+    /// The diagnostics the block's collection made, in order.
+    pub(crate) fn take_diagnostics(&mut self) -> FrameVec<'f, DefDiagnostic> {
+        mem::replace(&mut self.diagnostics, Vec::new_in(self.frame))
+    }
+}
+
+impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     fn new(
         db: &'db Db,
+        frame: &'f Frame,
         def_map: DefMap,
         local: Local<'db>,
-        state: UnitState,
+        state: UnitState<A>,
         check: Option<ReadCheck<'db>>,
-    ) -> Unit<'db> {
+    ) -> Unit<'db, 'f, A> {
+        let queues = ImportQueues::new_in(frame, state.imports.len());
         Unit {
             db,
+            frame,
             def_map,
             local,
             state,
+            queues,
             check,
-            // alloc: empty, allocates nothing until a block's collection makes a directive
-            macros: Vec::new(),
-            // alloc: empty, allocates nothing until a read is held
-            held: Vec::new(),
-            touched: FxHashSet::default(),
-            unresolved_extern_crates: FxHashSet::default(),
-            // alloc: empty, allocates nothing until a block's collection makes a record
-            records: Vec::new(),
+            macros: Vec::new_in(frame),
+            held: Vec::new_in(frame),
+            touched: set_in(frame),
+            unresolved_extern_crates: set_in(frame),
+            records: Vec::new_in(frame),
+            diagnostics: Vec::new_in(frame),
         }
     }
+}
 
+impl<'db, 'f> Unit<'db, 'f> {
     /// A crate's component at `round`: the members' rows of `state` (none for a fresh one), the
     /// round's view of every other module, the round's crate env, and `prelude`, the std
     /// prelude another component's `#[prelude_import]` resolved.
     pub(super) fn component(
         db: &'db Db,
+        frame: &'f Frame,
         round: RoundKey,
         env: CrateEnvKey,
         check: Option<ReadCheck<'db>>,
         mut state: UnitState,
         prelude: Option<(ModuleId, Option<UseId>)>,
-    ) -> Unit<'db> {
+    ) -> Unit<'db, 'f> {
         let krate = round.krate(db);
         let rows = RowsKey::new(db, Rows::Round(round));
         let own = ModulesMap { inner: mem::take(&mut state.rows) };
@@ -258,6 +309,7 @@ impl<'db> Unit<'db> {
             // alloc: empty, a component's view keeps no diagnostics
             diagnostics: Vec::new(),
             diagnostics_by_module: DiagnosticsByModule::default(),
+            records: None,
             // clone: one count of the crate's shared data.
             data: queries::crate_data(db, krate).clone(),
         };
@@ -266,9 +318,11 @@ impl<'db> Unit<'db> {
         if let Some(prelude) = state.prelude.or(prelude) {
             def_map.prelude = Some(prelude);
         }
-        Unit::new(db, def_map, Local::Owned(env.local_def_map()), state, check)
+        Unit::new(db, frame, def_map, Local::Owned(env.local_def_map()), state, check)
     }
+}
 
+impl<'db, 'f, A: Allocator + Clone> Unit<'db, 'f, A> {
     /// The import fixed point (`resolve_imports` until `ReachedFixedPoint::Yes`).
     pub(crate) fn resolve_imports(&mut self) {
         while self.resolve_imports_pass() == ReachedFixedPoint::No {}
@@ -290,7 +344,7 @@ impl<'db> Unit<'db> {
 
     /// The names of the `extern crate`s that did not resolve: an unresolved import whose path
     /// starts with one gets no diagnostic (`finish`).
-    pub(crate) fn unresolved_extern_crates(&self) -> &FxHashSet<Name> {
+    pub(crate) fn unresolved_extern_crates(&self) -> &FrameSet<'f, Name> {
         &self.unresolved_extern_crates
     }
 
@@ -315,7 +369,7 @@ impl<'db> Unit<'db> {
     }
 
     /// The state, the members' rows back in it.
-    fn into_state(mut self) -> UnitState {
+    fn into_state(mut self) -> UnitState<A> {
         self.state.rows = mem::take(&mut own_rows(&mut self.def_map.modules).inner);
         self.state
     }
@@ -374,7 +428,7 @@ impl<'db> Unit<'db> {
                     .insert(name, child);
                 if replaced.is_some() {
                     // A path can read whether a module is its parent's `__blaze_test_harness`.
-                    self.state.imports.wake_all();
+                    self.queues.wake_all(&self.state.imports);
                 }
             }
             // The collection keeps it in its `SideTables`.
@@ -405,7 +459,7 @@ impl<'db> Unit<'db> {
             }
             &DeclOp::DefineLegacyMacro { module, name, mac } => {
                 self.scope_mut(module).define_legacy_macro(name, mac);
-                self.state.imports.wake_env(name, MACROS);
+                self.queues.wake_env(&self.state.imports, name, MACROS);
             }
             &DeclOp::AddMacroInvoc { module, call, id } => {
                 self.scope_mut(module).add_macro_invoc(call, id);
@@ -422,12 +476,12 @@ impl<'db> Unit<'db> {
                 self.scope_mut(*module).init_derive_attribute(*adt, *attr, *attr_call, derive_calls);
             }
             // clone: the worklist owns its imports across rounds; once per import and component.
-            DeclOp::Import(it) => self.state.imports.push(it.clone()),
+            DeclOp::Import(it) => self.state.imports.push(&mut self.queues, it.clone()),
             // clone: a block's directive, once.
             DeclOp::Macro(it) => self.macros.push(it.clone()),
             &DeclOp::Prelude { module, import } => {
                 self.def_map.prelude = Some((module, import));
-                self.state.imports.wake_all();
+                self.queues.wake_all(&self.state.imports);
             }
             &DeclOp::UnresolvedExternCrate { name } => {
                 self.unresolved_extern_crates.insert(name);
@@ -485,34 +539,34 @@ impl<'db> Unit<'db> {
     /// nothing. So the pass records what that loop records, in its order.
     fn resolve_imports_pass(&mut self) -> ReachedFixedPoint {
         let mut res = ReachedFixedPoint::Yes;
-        self.state.imports.begin_pass();
-        while let Some(at) = self.state.imports.next_unresolved() {
+        self.queues.begin_pass(&self.state.imports);
+        while let Some(at) = self.queues.next_unresolved(&self.state.imports) {
             if self.retry_unresolved(at) {
                 res = ReachedFixedPoint::No;
             }
         }
         // Macro expansion can expose a new binding or change the visibility of an existing
         // one without adding a namespace. Revisit partial imports until their bindings settle.
-        self.state.imports.phase = Phase::Indeterminate(0);
-        while let Some(seq) = self.state.imports.next_indeterminate() {
+        self.queues.phase = Phase::Indeterminate(0);
+        while let Some(seq) = self.queues.next_indeterminate(&self.state.imports) {
             if self.retry_indeterminate(seq) {
                 res = ReachedFixedPoint::No;
             }
         }
-        self.state.imports.phase = Phase::Idle;
+        self.queues.phase = Phase::Idle;
         res
     }
 
     /// Retries unresolved import `at`; whether it recorded anything.
     fn retry_unresolved(&mut self, at: u32) -> bool {
         let i = at as usize;
-        self.state.imports.attempt(at);
+        self.queues.attempt(at);
         let status = self.resolve_import(at);
         let imports = &mut self.state.imports;
         imports.directives[i].status = status;
         match status {
             PartialResolvedImport::Unresolved => {
-                imports.wait(at);
+                self.queues.wait(at);
                 false
             }
             PartialResolvedImport::Indeterminate(resolved) => {
@@ -520,7 +574,7 @@ impl<'db> Unit<'db> {
                 imports.indeterminate.push((at, resolved));
                 imports.list[i] = ImportList::Indeterminate;
                 // Before recording: what it records may change what it resolves to.
-                imports.wait(at);
+                self.queues.wait(at);
                 self.record_resolved_import(at);
                 true
             }
@@ -536,14 +590,14 @@ impl<'db> Unit<'db> {
     fn retry_indeterminate(&mut self, seq: u32) -> bool {
         let (at, settled) = self.state.imports.indeterminate[seq as usize];
         let i = at as usize;
-        self.state.imports.attempt(at);
+        self.queues.attempt(at);
         let status = self.resolve_import(at);
         let imports = &mut self.state.imports;
         imports.directives[i].status = status;
         match status {
             PartialResolvedImport::Indeterminate(import) if import != settled => {
                 imports.indeterminate[seq as usize].1 = import;
-                imports.wait(at);
+                self.queues.wait(at);
                 self.record_resolved_import(at);
                 true
             }
@@ -553,24 +607,24 @@ impl<'db> Unit<'db> {
                 true
             }
             _ => {
-                imports.wait(at);
+                self.queues.wait(at);
                 false
             }
         }
     }
 
-    /// Resolves import `at`, leaving in `imports.keys` (and `imports.keys_any`) what the lookup
+    /// Resolves import `at`, leaving in `queues.keys` (and `queues.keys_any`) what the lookup
     /// read that this unit can still change, for `wait`. A read of a module of this crate the
     /// unit does not hold is checked against the partition and recorded as upstream; it waits on
     /// nothing, as that module's scope is final for the round.
     fn resolve_import(&mut self, at: u32) -> PartialResolvedImport {
         let db = self.db;
-        let Unit { def_map, local, state, check, .. } = self;
+        let Unit { def_map, local, state, queues, check, .. } = self;
         let UnitState { imports, upstream, .. } = state;
-        let Imports { directives, keys, keys_any, .. } = imports;
+        let (keys, keys_any) = (&mut queues.keys, &mut queues.keys_any);
         keys.clear();
         *keys_any = false;
-        let directive = &directives[at as usize];
+        let directive = &imports.directives[at as usize];
         let (path, importer) = (&directive.op.path, directive.op.module);
         let last = path.segments().last().copied();
         let in_crate = def_map.block.is_none();
@@ -762,7 +816,7 @@ impl<'db> Unit<'db> {
                             cov_mark::hit!(std_prelude);
                             self.def_map.prelude = Some((m, Some(source.id)));
                             self.state.prelude = Some((m, Some(source.id)));
-                            self.state.imports.wake_all();
+                            self.queues.wake_all(&self.state.imports);
                         } else if m.krate(self.db) != self.def_map.krate {
                             cov_mark::hit!(glob_across_crates);
                             // glob import from other crate => we can just import everything once
@@ -945,8 +999,8 @@ impl<'db> Unit<'db> {
                     changed |= self.push_res_and_update_glob_vis(module_id, &name, res, vis, import);
                 }
                 None => {
-                    let (tr, import) = match res.take_types_full() {
-                        Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import }) => (tr, import),
+                    let tr = match res.take_types_full() {
+                        Some(Item { def: ModuleDefId::TraitId(tr), vis: _, import: _ }) => tr,
                         Some(other) => {
                             tracing::debug!("non-trait `_` import of {:?}", other);
                             continue;
@@ -973,11 +1027,7 @@ impl<'db> Unit<'db> {
 
                     if should_update {
                         changed = true;
-                        self.scope_mut(module_id).push_unnamed_trait(
-                            tr,
-                            vis,
-                            import.and_then(ImportOrExternCrate::import),
-                        );
+                        self.scope_mut(module_id).push_unnamed_trait_through(tr, vis, import);
                     }
                 }
             }
@@ -1073,7 +1123,7 @@ impl<'db> Unit<'db> {
         }
         // Whatever the scope does with them: an import that read the slot is retried, and
         // finds the same answer if nothing it reads changed.
-        self.state.imports.wake_slot(module_id, *name, written_ns(&defs));
+        self.queues.wake_slot(&self.state.imports, module_id, *name, written_ns(&defs));
 
         let mut changed = false;
 
@@ -1179,7 +1229,7 @@ impl<'db> Unit<'db> {
     }
 }
 
-impl<'db> Sink<'db> for Unit<'db> {
+impl<'db, A: Allocator + Clone> Sink<'db> for Unit<'db, '_, A> {
     fn db(&self) -> &'db Db {
         self.db
     }
@@ -1194,9 +1244,9 @@ impl<'db> Sink<'db> for Unit<'db> {
 
     fn apply(&mut self, op: DeclOp) {
         match op {
-            DeclOp::Import(it) => self.state.imports.push(it),
+            DeclOp::Import(it) => self.state.imports.push(&mut self.queues, it),
             DeclOp::Macro(it) => self.macros.push(it),
-            DeclOp::Diagnostic(diagnostic) => self.def_map.diagnostics.push(diagnostic),
+            DeclOp::Diagnostic(diagnostic) => self.diagnostics.push(diagnostic),
             op @ (DeclOp::NotIntroducing(_)
             | DeclOp::ResolvedMacroPath { .. }
             | DeclOp::DeriveHelperUse(_)) => self.records.push(op),
@@ -1223,15 +1273,17 @@ impl<'db> Sink<'db> for Unit<'db> {
         ChildMode::Inline
     }
 
-    fn take_macros(&mut self, into: &mut Vec<MacroOp>) {
-        into.append(&mut self.macros);
+    fn take_macros(&mut self, into: &mut FrameVec<'_, MacroOp>) {
+        into.extend(self.macros.drain(..));
     }
 }
 
 /// The scope a module's round-0 log leaves, its imports unresolved: the replay of the ops that
-/// target it (and, for the crate root, its `Splice`s), from the textual scope it inherits.
+/// target it (and, for the crate root, its `Splice`s), from the textual scope it inherits. The
+/// unit it replays on is `frame`'s, the calling query's.
 pub(crate) fn local_scope(
     db: &Db,
+    frame: &Frame,
     module: ModuleId,
     inherited: &[(Name, Box<[MacroId]>)],
     ops: &OpLog,
@@ -1260,11 +1312,12 @@ pub(crate) fn local_scope(
         // alloc: empty, a scope's view keeps no diagnostics
         diagnostics: Vec::new(),
         diagnostics_by_module: DiagnosticsByModule::default(),
+        records: None,
         // clone: one count of the crate's shared data.
         data: queries::crate_data(db, krate).clone(),
     };
-    let mut unit =
-        Unit::new(db, def_map, Local::Borrowed(LocalDefMap::EMPTY), UnitState::default(), None);
+    let state = UnitState::new_in(frame);
+    let mut unit = Unit::new(db, frame, def_map, Local::Borrowed(LocalDefMap::EMPTY), state, None);
     for (name, macs) in inherited {
         for &mac in macs {
             unit.scope_mut(module).define_legacy_macro(*name, mac);
@@ -1405,7 +1458,7 @@ pub(crate) fn round_active(db: &Db, round: RoundKey) -> RoundActive {
 
 /// One component's resolution at one round (`nameres-core.md` §5). Only a component the round
 /// runs has one (`round_active`); its state carries on from the last round it ran at.
-pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
+pub(crate) fn scc_state(db: &Db, frame: &Frame, key: SccKey) -> SccState {
     let (anchor, krate, r) = (key.anchor(db), key.krate(db), key.round(db));
     let round = RoundKey::new(db, krate, r);
     let modules = queries::round_modules(db, round);
@@ -1470,8 +1523,8 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
         };
     }
 
-    // alloc: the value's member list, once per run that is not the quick path.
-    let members: Vec<ModuleId> = member_at.iter().map(|&at| modules.order[at as usize]).collect();
+    let mut members = Vec::with_capacity_in(member_at.len(), frame);
+    members.extend(member_at.iter().map(|&at| modules.order[at as usize]));
     let mut unit = match prev {
         Some((_, prev)) => {
             for &module in &prev.state.upstream {
@@ -1484,17 +1537,17 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
             // clone: once per round a component changes; the carried state stays the round
             // before's.
             let state = UnitState::clone(&prev.state);
-            let mut unit = Unit::component(db, round, env, Some(check), state, prelude);
+            let mut unit = Unit::component(db, frame, round, env, Some(check), state, prelude);
             for &module in &members {
                 unit.replay_round(module, r);
             }
             unit.repull_upstream_globs();
-            unit.state.imports.wake_all();
+            unit.queues.wake_all(&unit.state.imports);
             unit
         }
         None => {
-            let mut unit =
-                Unit::component(db, round, env, Some(check), UnitState::default(), prelude);
+            let state = UnitState::default();
+            let mut unit = Unit::component(db, frame, round, env, Some(check), state, prelude);
             unit.replay_fresh(&members, r);
             unit
         }
@@ -1525,7 +1578,7 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
     }
 
     // Each member's handle: the one it had the round before when its scope is the same.
-    let mut handles = Vec::with_capacity(members.len());
+    let mut handles = Vec::with_capacity_in(members.len(), frame);
     let mut all_carried = prev.is_some();
     for (at, &module) in members.iter().enumerate() {
         let before = match prev {
@@ -1563,9 +1616,8 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
 
     let state = unit.into_state();
     let handle_of = |module| queries::fact_handle(db, fact_key_of(db, round, module));
-    let upstream = state.upstream.iter().map(|&module| (module, handle_of(module)));
-    // alloc: the value's upstream list, once per run that is not the quick path.
-    let mut upstream: Vec<(ModuleId, salsa::Id)> = upstream.collect();
+    let mut upstream = Vec::with_capacity_in(state.upstream.len(), frame);
+    upstream.extend(state.upstream.iter().map(|&module| (module, handle_of(module))));
     upstream.sort_unstable_by_key(|&(module, _)| check.at(module));
     let prelude = if holds_prelude { state.prelude } else { None };
 
@@ -1574,10 +1626,13 @@ pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
             (Some((_, prev)), true) => prev.round,
             _ => r,
         },
-        members: members.into(),
-        handles: handles.into(),
+        // alloc: the value's lists, at exact size, once per run that is not the quick path
+        members: Box::from(&members[..]),
+        // alloc: as `members`
+        handles: Box::from(&handles[..]),
         prelude,
-        upstream: upstream.into(),
+        // alloc: as `members`
+        upstream: Box::from(&upstream[..]),
         imports,
         // alloc: the state the next round carries on from, once per run that is not the quick path.
         state: Arc::new(state),
@@ -1606,7 +1661,7 @@ fn installed_prelude(
     }
 }
 
-impl<'db> Unit<'db> {
+impl<A: Allocator + Clone> Unit<'_, '_, A> {
     /// A component that merged or is new at round `r`: rounds `0..=r` of each member, round by
     /// round, in module order.
     pub(super) fn replay_fresh(&mut self, members: &[ModuleId], r: u32) {
@@ -1656,17 +1711,21 @@ pub(crate) fn unresolved_named(db: &Db, key: FactKey) -> Box<[(Name, ModPath)]> 
     let module = key.module(db);
     let (state, _) = member_state(db, key);
     let imports = &state.state.imports;
-    imports
-        .directives
-        .iter()
-        .zip(&imports.list)
-        .filter(|(it, list)| {
-            **list == ImportList::Unresolved
-                && it.op.module == module
-                && it.op.source.kind == ImportKind::Plain
-        })
-        // clone: each path into the query's value, once per module and round.
-        .filter_map(|(it, _)| Some((it.op.bound_name()?, it.op.path.clone())))
-        // alloc: the query's value, once per module and round.
-        .collect()
+    let named = || {
+        imports
+            .directives
+            .iter()
+            .zip(&imports.list)
+            .filter(|(it, list)| {
+                **list == ImportList::Unresolved
+                    && it.op.module == module
+                    && it.op.source.kind == ImportKind::Plain
+            })
+            .filter_map(|(it, _)| Some((it.op.bound_name()?, &it.op.path)))
+    };
+    // alloc: the query's value, at exact size, once per module and round
+    let mut out = Vec::with_capacity(named().count());
+    // clone: each path into the query's value, once per module and round
+    out.extend(named().map(|(name, path)| (name, path.clone())));
+    out.into_boxed_slice()
 }

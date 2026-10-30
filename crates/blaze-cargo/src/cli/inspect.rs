@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blaze_api::{Request, Response, Table, ViewRef};
+use blaze_api::{Request, Response, ResponseRef, Table, ViewRef};
 
 use super::{
     FAILED, USAGE,
@@ -146,20 +146,26 @@ pub fn answer<A: Api>(
     what: Inspected,
     request: Request,
     to: Option<&Path>,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
+    out: &mut dyn Write, // dyn: the CLI's output writer, written once per answer.
+    err: &mut dyn Write, // dyn: the CLI's output writer, written once per error said.
     color: bool,
 ) -> io::Result<i32> {
     let mut answered = None;
     let mut said = Vec::new();
-    let called = api.call(request, |response| match response {
-        Response::CodegenInputs(_) | Response::Trace(_) | Response::Tables(_) => answered = Some(response),
-        Response::Error(error) => said.push(error.what),
+    // The answers are read owned in place too (`ResponseRef`'s once-a-request responses): each
+    // is moved out whole.
+    let called = api.call(request, |response, _| match response {
+        ResponseRef::CodegenInputs(it) => answered = Some(Response::CodegenInputs(it)),
+        ResponseRef::Trace(it) => answered = Some(Response::Trace(it)),
+        ResponseRef::Tables(it) => answered = Some(Response::Tables(it)),
+        // alloc: error path, the daemon's errors, said once it is done.
+        ResponseRef::Error(error) => said.push(error.what.to_owned()),
         _ => {}
     });
     for what in &said {
         err.write_all(say::error(what, color).as_bytes())?;
     }
+    // dyn: the CLI's output writer, written once per error said.
     let failed = |err: &mut dyn Write, what: &str| -> io::Result<i32> {
         err.write_all(say::error(what, color).as_bytes())?;
         Ok(FAILED)

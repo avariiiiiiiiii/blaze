@@ -56,3 +56,5 @@ would keep a stale identity. In `crates/blaze-cargo/src/serve/unit/test.rs`:
   `attrs()`, `outside()` and `identity()`.
 
 > forwarded to cargo (from requests, pass 17; told by tmux).
+
+> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/unit/test.rs:182` (`select::asked`, no probe), `test.rs:426` (`Test::of` by value) and the getters at `test.rs:367`, `:459`, `:546`, `:554`, `:557` and `:566`.

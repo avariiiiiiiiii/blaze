@@ -16,7 +16,8 @@ use intern::Live;
 
 use crate::{
     Cancelled, Changed, Config, Cx, Database, DbError, Edge, Input, MemTree, Query,
-    QueryKey, QueryKind, Stored, Tree,
+    QueryKey, QueryKind, Stored, Tree, kinds,
+    subtree::{Digest, Subtree, SubtreeKey},
     table::{Aligned, EdgeRecord},
 };
 
@@ -254,6 +255,7 @@ fn register(db: &mut Database) {
     db.register::<Conf>();
     db.register::<Names>();
     db.register::<ReadsFact>();
+    db.register::<TreeOf>();
 }
 
 fn setup() -> (Database, Arc<MemTree>) {
@@ -617,6 +619,60 @@ fn configuration_and_directories_are_inputs() {
     assert_eq!(db.pin().get::<Names>(added, &"nowhere".to_owned()), Ok(u64::MAX));
 }
 
+/// A file's length under another root, times 100, plus the names at that root's top;
+/// `u64::MAX` for no file.
+struct RootLen;
+
+impl Query for RootLen {
+    const KIND: QueryKind = QueryKind(0x2f20);
+    const NAME: &'static str = "root len";
+    const PRODUCER: ContentId = ContentId([0x20; 32]);
+    type Key = (ContentId, String);
+    type Value = Num;
+    fn input(key: &(ContentId, String)) -> ContentId {
+        Input::file_at_key(key.0, &key.1).input
+    }
+    fn execute(cx: &mut Cx<'_>, (root, path): &(ContentId, String)) -> Result<Num, Cancelled> {
+        ran("root len");
+        let Some(file) = cx.file_at(*root, path)? else { return Ok(Num(u64::MAX)) };
+        let names = cx.dir_at(*root, "")?.map_or(0, |names| names.len() as u64);
+        Ok(Num(file.bytes.len() as u64 * 100 + names))
+    }
+}
+
+#[test]
+fn another_roots_files_are_inputs_shared_by_every_view() {
+    let (mut db, tree) = setup();
+    db.register::<RootLen>();
+    let library = tree.root(&[("core/lib.rs", b"abcd".as_slice()), ("std/lib.rs", b"x")]);
+    let core = (library, "core/lib.rs".to_owned());
+    let one = view(&db, &tree, &[("a", "1")]);
+    assert_eq!(db.pin().get::<RootLen>(one, &core), Ok(402));
+    assert_eq!(db.pin().get::<RootLen>(one, &(library, "nope".to_owned())), Ok(u64::MAX));
+    assert_eq!(db.pin().get::<RootLen>(one, &(library, "core".to_owned())), Ok(u64::MAX), "a directory");
+    assert_eq!(runs("root len"), 3);
+
+    let two = view(&db, &tree, &[("a", "22")]);
+    assert_eq!(db.pin().get::<RootLen>(two, &core), Ok(402));
+    assert_eq!(runs("root len"), 3, "the view changed, the root did not: verified, not run");
+    assert_eq!(db.why(two, &QueryKey { kind: RootLen::KIND, input: RootLen::input(&core) }), None);
+
+    let newer = tree.root(&[("core/lib.rs", b"abcde".as_slice())]);
+    assert_eq!(db.pin().get::<RootLen>(two, &(newer, "core/lib.rs".to_owned())), Ok(501));
+    assert_ne!(Input::file_at_key(library, "core/lib.rs"), Input::file_at_key(newer, "core/lib.rs"));
+    assert_ne!(Input::file_at_key(library, "core/lib.rs"), Input::file_key("core/lib.rs"));
+
+    let (bytes, _) = image_of(&db, Builder::new());
+    let mut started = Database::open_image(config(&tree), opened(&bytes)).expect("an image");
+    register(&mut started);
+    started.register::<RootLen>();
+    reset();
+    let three = view(&started, &tree, &[("b", "3")]);
+    assert_eq!(started.pin().get::<RootLen>(three, &core), Ok(402));
+    assert_eq!(runs("root len"), 0, "the root's inputs came back from the image");
+    assert_eq!(started.take_corrupt(), vec![], "nothing read was corrupt");
+}
+
 #[test]
 fn a_fact_no_query_answers_is_never_reused_unverified() {
     let (db, tree) = setup();
@@ -954,6 +1010,110 @@ fn a_key_is_kept_once_and_runs_again_by_its_bytes() {
     assert_eq!(runs("len"), 2);
 }
 
+/// Its runs are tasks of `Tag::Parse`: it answers its frame's tag and [`Double`] of its key.
+struct Tagged;
+
+impl Query for Tagged {
+    const KIND: QueryKind = QueryKind(0x2f0d);
+    const NAME: &'static str = "tagged";
+    const PRODUCER: ContentId = ContentId([15; 32]);
+    const TAG: blaze_mem::Tag = blaze_mem::Tag::Parse;
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        // A miss: `double`, then `len`, run in tasks of their own and give the frame back.
+        let inner = cx.get::<Double>(key)?;
+        let tag = blaze_mem::frame::current(|frame| {
+            let mut bytes = Vec::new_in(frame);
+            bytes.extend_from_slice(key.as_bytes());
+            assert_eq!(bytes.len(), key.len());
+            frame.tag().index() as u64
+        });
+        Ok(Num(tag << 32 | inner))
+    }
+}
+
+#[test]
+fn a_run_is_a_frame_task_of_its_querys_tag() {
+    let (mut db, tree) = setup();
+    db.register::<Tagged>();
+    let one = view(&db, &tree, &[("a", "abc")]);
+    let parse = blaze_mem::Tag::Parse.index() as u64;
+    assert_eq!(db.pin().get::<Tagged>(one, &"a".to_owned()), Ok(parse << 32 | 6));
+}
+
+/// A view opened after one closed takes its state, emptied with its tables: revalidating a key
+/// whose inputs did not change there allocates nothing, and runs nothing.
+#[test]
+fn a_revalidation_that_changes_nothing_allocates_nothing() {
+    let (db, tree) = setup();
+    let first = view(&db, &tree, &[("a", "abc")]);
+    assert_eq!(double(&db, first, "a"), 6);
+    let root = tree.root(&[("a", b"abc".as_slice())]);
+    let name = "a".to_owned();
+    // Warm: the closed state's grace passes once other tests' tasks that began before it end.
+    let mut warm = 0;
+    while db.ready_views() == 0 {
+        let again = db.open(View { root });
+        assert_eq!(db.pin().get::<Double>(again, &name), Ok(6));
+        db.close(again);
+        warm += 1;
+        assert!(warm < 100_000, "a closed view was never ready again");
+        std::thread::yield_now();
+    }
+    let reused = db.open(View { root });
+    let pinned = db.pin();
+    let got = blaze_alloc_count::assert_at_most(0, "revalidating double(a) in a reused view", || {
+        pinned.get::<Double>(reused, &name)
+    });
+    assert_eq!(got, Ok(6));
+    assert_eq!((runs("double"), runs("len")), (1, 1), "verified, not run again");
+}
+
+/// Once warm, a collection that finds nothing new to drop allocates nothing.
+#[test]
+fn a_warm_collection_allocates_nothing() {
+    let (db, tree) = setup();
+    let one = view(&db, &tree, &[("a", "abc")]);
+    assert_eq!(double(&db, one, "a"), 6);
+    let mut effects = Vec::new();
+    for _ in 0..3 {
+        db.collect(&[], &mut effects);
+    }
+    blaze_alloc_count::assert_at_most(0, "a warm collection", || db.collect(&[], &mut effects));
+    assert!(effects.is_empty(), "an in-memory database writes nothing");
+    assert_eq!(double(&db, one, "a"), 6);
+}
+
+/// Once warm, a miss allocates no more than a segment the store opens for what it copies: the
+/// run's frame, its value buffer, its key bytes and its slot's list are all reused.
+#[test]
+fn a_warm_miss_allocates_at_most_a_segment() {
+    let (db, tree) = setup();
+    let name = "a".to_owned();
+    for n in 1..40usize {
+        let text = "x".repeat(n);
+        let root = tree.root(&[("a", text.as_bytes())]);
+        // A closed view's state is ready again once other tests' tasks that began before it end.
+        while n > 1 && db.ready_views() == 0 {
+            std::thread::yield_now();
+        }
+        let view = db.open(View { root });
+        let pinned = db.pin();
+        let budget = if n < 32 { u64::MAX } else { 1 };
+        let got = blaze_alloc_count::assert_at_most(budget, "a warm miss of double(a)", || {
+            pinned.get::<Double>(view, &name)
+        });
+        assert_eq!(got, Ok(2 * n as u64));
+        drop(pinned);
+        db.close(view);
+    }
+    assert_eq!(runs("len"), 39, "each new content a miss");
+}
+
 /// Collection's marks are a bit a memo: an ID past the end they were made for grows them, and
 /// they list what was marked in order.
 #[test]
@@ -1025,4 +1185,354 @@ fn a_file_that_fails_its_check_fails_the_request_and_is_read_again() {
     *tree.broken.lock().unwrap() = None;
     assert_eq!(double(&db, view, "a"), 8, "the failed read was not kept");
     assert_eq!(runs("len"), 3);
+}
+
+/// [`Cx::tree`] of a directory, with or without `package`.
+struct TreeOf;
+
+impl Query for TreeOf {
+    const KIND: QueryKind = QueryKind(0x2f0e);
+    const NAME: &'static str = "tree of";
+    const PRODUCER: ContentId = ContentId([15; 32]);
+    type Key = (String, bool);
+    type Value = Digest;
+    fn input(key: &(String, bool)) -> ContentId {
+        key_id(&format!("{}{}", u8::from(key.1), key.0))
+    }
+    fn execute(cx: &mut Cx<'_>, key: &(String, bool)) -> Result<Digest, Cancelled> {
+        ran("tree of");
+        Ok(Digest(cx.tree(&key.0, key.1)?))
+    }
+}
+
+fn tree_of(db: &Database, view: ViewId, dir: &str, package: bool) -> Option<[u8; 32]> {
+    db.pin().get::<TreeOf>(view, &(dir.to_owned(), package)).expect("tree of")
+}
+
+/// The key of the query for `dir` when the tree is asked of the root without `package`.
+fn subtree(dir: &str) -> QueryKey {
+    let key = SubtreeKey { dir: dir.to_owned(), package: false, top: dir.is_empty() };
+    QueryKey { kind: kinds::TREE, input: Subtree::input(&key) }
+}
+
+const NESTED: &[(&str, &str)] = &[("a/b/x", "1"), ("a/c/y", "2"), ("d/z", "3"), ("top", "4")];
+
+#[test]
+fn an_edit_reruns_only_the_directories_above_it() {
+    let (db, tree) = setup();
+    let one = view(&db, &tree, NESTED);
+    let first = tree_of(&db, one, "", false).expect("the root is a directory");
+
+    let edited = view(&db, &tree, &[("a/b/x", "9"), ("a/c/y", "2"), ("d/z", "3"), ("top", "4")]);
+    assert_ne!(tree_of(&db, edited, "", false), Some(first));
+    for dir in ["", "a", "a/b"] {
+        assert!(db.why(edited, &subtree(dir)).is_some(), "{dir:?} is above the edit: it reran");
+    }
+    for dir in ["a/c", "d"] {
+        assert_eq!(db.why(edited, &subtree(dir)), None, "{dir:?} is beside the edit: verified, not run");
+    }
+    assert_eq!(tree_of(&db, edited, "a/c", false), tree_of(&db, one, "a/c", false));
+
+    let again = view(&db, &tree, NESTED);
+    assert_eq!(tree_of(&db, again, "", false), Some(first), "equal trees hash equal");
+    assert_eq!(db.why(again, &subtree("")), None);
+}
+
+#[test]
+fn a_hash_sees_names_kinds_and_contents() {
+    let (db, tree) = setup();
+    let base = tree_of(&db, view(&db, &tree, &[("a/x", "1")]), "", false);
+    for files in [&[("a/y", "1")][..], &[("a/x", "2")], &[("b/x", "1")], &[("a/x/x", "1")], &[("a", "1")]] {
+        assert_ne!(tree_of(&db, view(&db, &tree, files), "", false), base, "{files:?}");
+    }
+    let one = view(&db, &tree, &[("a/x", "1")]);
+    assert_ne!(tree_of(&db, one, "", true), base, "package hashes apart from a plain tree");
+}
+
+#[test]
+fn a_package_leaves_out_hidden_names_and_the_top_target() {
+    let (db, tree) = setup();
+    let source = [("src/lib.rs", "fn f() {}"), ("src/target/t.rs", "1"), ("Cargo.toml", "[package]")];
+    let mut cluttered = source.to_vec();
+    cluttered.extend([(".git/HEAD", "ref"), (".env", "x"), ("target/debug/out", "bin"), ("src/.cache/c", "y")]);
+    let clean = view(&db, &tree, &source);
+    let noisy = view(&db, &tree, &cluttered);
+    assert_eq!(tree_of(&db, noisy, "", true), tree_of(&db, clean, "", true));
+    assert_ne!(tree_of(&db, noisy, "", false), tree_of(&db, clean, "", false), "a plain tree keeps them");
+
+    let mut nested = source;
+    nested[1].1 = "2";
+    let nested = view(&db, &tree, &nested);
+    assert_ne!(tree_of(&db, nested, "", true), tree_of(&db, clean, "", true), "only the top `target` is left out");
+}
+
+#[test]
+fn no_directory_has_no_tree() {
+    let (db, tree) = setup();
+    let one = view(&db, &tree, NESTED);
+    assert_eq!(tree_of(&db, one, "nowhere", false), None);
+    assert_eq!(tree_of(&db, one, "top", true), None, "a file is not a directory");
+    assert!(tree_of(&db, one, "a/", false).is_some());
+    assert_eq!(tree_of(&db, one, "a/", false), tree_of(&db, one, "a", false));
+}
+
+/// A [`MemTree`] that lists every directory backwards.
+struct Backwards(MemTree);
+
+impl Tree for Backwards {
+    fn file(&self, root: ContentId, path: &str) -> Result<Option<(ContentId, Mode, Bytes)>, Corrupt> {
+        self.0.file(root, path)
+    }
+    fn list(&self, root: ContentId, path: &str) -> Option<Vec<(String, bool)>> {
+        let mut names = self.0.list(root, path)?;
+        names.reverse();
+        Some(names)
+    }
+}
+
+/// The names of a directory, in the order [`Cx::dir`] gives them, joined by `,`.
+struct Listing;
+
+impl Query for Listing {
+    const KIND: QueryKind = QueryKind(0x2f0f);
+    const NAME: &'static str = "listing";
+    const PRODUCER: ContentId = ContentId([16; 32]);
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        let names = cx.dir(key)?.expect("a directory");
+        let joined: Vec<&str> = names.iter().map(|(name, _)| name.as_str()).collect();
+        LISTED.with(|listed| *listed.borrow_mut() = joined.join(","));
+        Ok(Num(names.len() as u64))
+    }
+}
+
+thread_local! {
+    static LISTED: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+#[test]
+fn a_listing_is_sorted_once_whatever_order_the_tree_gives() {
+    reset();
+    let files: &[(&str, &[u8])] = &[("b", b"1"), ("c/x", b"2"), ("a", b"3")];
+    let backwards = Arc::new(Backwards(MemTree::default()));
+    let root = backwards.0.root(files);
+    let mut db = Database::new(Config { tree: Some(backwards.clone()), dir: FileName::new("db"), tags: TAGS });
+    register(&mut db);
+    db.register::<Listing>();
+    let one = db.open(View { root });
+    assert_eq!(db.pin().get::<Listing>(one, &String::new()), Ok(3));
+    assert_eq!(LISTED.with(|listed| listed.borrow().clone()), "a,b,c");
+    let reversed = tree_of(&db, one, "", false);
+
+    let (sorted_db, sorted) = setup();
+    let other = sorted_db.open(View { root: sorted.root(files) });
+    assert_eq!(tree_of(&sorted_db, other, "", false), reversed, "the hash does not see the tree's order");
+}
+
+static SPREAD: Mutex<Option<HashMap<String, usize>>> = Mutex::new(None);
+
+fn spread_runs(name: &str) -> usize {
+    SPREAD.lock().unwrap().as_ref().and_then(|runs| runs.get(name).copied()).unwrap_or(0)
+}
+
+/// The length of a file, `u64::MAX` for none, its runs counted by name across threads: the
+/// key `no` is cancelled, and the key `gone` panics.
+struct Spread;
+
+impl Query for Spread {
+    const KIND: QueryKind = QueryKind(0x2f10);
+    const NAME: &'static str = "spread";
+    const PRODUCER: ContentId = ContentId([0x10; 32]);
+    type Key = String;
+    type Value = Num;
+    fn input(key: &String) -> ContentId {
+        key_id(key)
+    }
+    fn execute(cx: &mut Cx<'_>, key: &String) -> Result<Num, Cancelled> {
+        match key.as_str() {
+            "no" => return Err(Cancelled),
+            "gone" => panic!("spread was asked of {key}, which is gone"),
+            _ => {}
+        }
+        *SPREAD.lock().unwrap().get_or_insert_with(HashMap::new).entry(key.clone()).or_default() += 1;
+        Ok(Num(cx.file(key)?.map_or(u64::MAX, |file| file.bytes.len() as u64)))
+    }
+}
+
+fn fold(values: impl IntoIterator<Item = u64>) -> u64 {
+    values.into_iter().fold(0, |folded, value| folded.wrapping_mul(1_000_003).wrapping_add(value))
+}
+
+/// [`Spread`] of each name by one [`Cx::get_all`], folded in order.
+struct All;
+
+impl Query for All {
+    const KIND: QueryKind = QueryKind(0x2f11);
+    const NAME: &'static str = "all";
+    const PRODUCER: ContentId = ContentId([0x11; 32]);
+    type Key = Vec<String>;
+    type Value = Num;
+    fn input(key: &Vec<String>) -> ContentId {
+        key_id(&key.join("\0"))
+    }
+    fn execute(cx: &mut Cx<'_>, key: &Vec<String>) -> Result<Num, Cancelled> {
+        Ok(Num(fold(cx.get_all::<Spread>(key)?)))
+    }
+}
+
+/// [`All`] as a loop of [`Cx::get`].
+struct Each;
+
+impl Query for Each {
+    const KIND: QueryKind = QueryKind(0x2f12);
+    const NAME: &'static str = "each";
+    const PRODUCER: ContentId = ContentId([0x12; 32]);
+    type Key = Vec<String>;
+    type Value = Num;
+    fn input(key: &Vec<String>) -> ContentId {
+        key_id(&key.join("\0"))
+    }
+    fn execute(cx: &mut Cx<'_>, key: &Vec<String>) -> Result<Num, Cancelled> {
+        let mut values = Vec::new();
+        for name in key {
+            values.push(cx.get::<Spread>(name)?);
+        }
+        Ok(Num(fold(values)))
+    }
+}
+
+static WARM_ALL: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// [`Spread`] of each name by one [`Cx::get_all`], its allocations counted into [`WARM_ALL`];
+/// the round only makes another key.
+struct CountedAll;
+
+impl Query for CountedAll {
+    const KIND: QueryKind = QueryKind(0x2f13);
+    const NAME: &'static str = "counted all";
+    const PRODUCER: ContentId = ContentId([0x13; 32]);
+    type Key = (Vec<String>, u32);
+    type Value = Num;
+    fn input((names, round): &(Vec<String>, u32)) -> ContentId {
+        key_id(&format!("{}\0{round}", names.join("\0")))
+    }
+    fn execute(cx: &mut Cx<'_>, (names, _): &(Vec<String>, u32)) -> Result<Num, Cancelled> {
+        let (values, used) = blaze_alloc_count::measure(|| cx.get_all::<Spread>(names));
+        WARM_ALL.store(used.allocations, Ordering::SeqCst);
+        Ok(Num(fold(values?)))
+    }
+}
+
+fn spread_setup(files: &[(String, String)]) -> (Database, ViewId, Arc<MemTree>) {
+    let (mut db, tree) = setup();
+    db.register::<Spread>();
+    db.register::<All>();
+    db.register::<Each>();
+    db.register::<CountedAll>();
+    let files: Vec<(&str, &str)> = files.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
+    let one = view(&db, &tree, &files);
+    (db, one, tree)
+}
+
+fn names(names: &[&str]) -> Vec<String> {
+    names.iter().map(|&name| name.to_owned()).collect()
+}
+
+fn list_key<Q: Query<Key = Vec<String>>>(names: &[String]) -> QueryKey {
+    QueryKey { kind: Q::KIND, input: Q::input(&names.to_vec()) }
+}
+
+/// The values and edges of one `get_all` are a loop of `get`'s: in the order of the keys, a
+/// repeated key read again where it repeats, each key run once whichever task ran it. Another
+/// view verifies them as it verifies the loop's.
+#[test]
+fn get_all_gives_the_values_and_edges_a_loop_of_get_gives() {
+    let files: Vec<(String, String)> = (0..32).map(|i| (format!("all{i}"), "x".repeat(i))).collect();
+    let (db, one, tree) = spread_setup(&files);
+    let mut asked: Vec<String> = (0..32).map(|i| format!("all{i}")).collect();
+    asked.extend(names(&["all3", "all-missing", "all3", "all0"]));
+    let expected = fold(asked.iter().map(|name| match name.strip_prefix("all").and_then(|n| n.parse::<u64>().ok()) {
+        Some(n) => n,
+        None => u64::MAX,
+    }));
+
+    assert_eq!(db.pin().get::<All>(one, &asked), Ok(expected));
+    assert_eq!(db.pin().get::<Each>(one, &asked), Ok(expected));
+    let edges = |key: QueryKey| db.memo(&key).expect("it ran").edges;
+    let all = edges(list_key::<All>(&asked));
+    assert_eq!(all, edges(list_key::<Each>(&asked)), "the same edges in the same order");
+    let read: Vec<QueryKey> = all.iter().map(|edge| edge.read).collect();
+    assert_eq!(read, asked.iter().map(|name| key::<Spread>(name)).collect::<Vec<_>>());
+    for name in &asked {
+        assert_eq!(spread_runs(name), 1, "{name} ran once");
+    }
+
+    let mut edited = files.clone();
+    edited[5].1.push('y');
+    let edited: Vec<(&str, &str)> = edited.iter().map(|(path, bytes)| (path.as_str(), bytes.as_str())).collect();
+    let two = view(&db, &tree, &edited);
+    // all5 is one longer, and it is read once, at position 5.
+    let changed = expected.wrapping_add(1_000_003u64.wrapping_pow((asked.len() - 1 - 5) as u32));
+    assert_eq!(db.pin().get::<All>(two, &asked), Ok(changed));
+    assert_eq!(db.pin().get::<Each>(two, &asked), Ok(changed));
+    assert_eq!(spread_runs("all5"), 2, "only the edited file's key ran again");
+    assert_eq!(spread_runs("all6"), 1);
+    assert_eq!(db.why(two, &list_key::<All>(&asked)).map(|why| why.chain[0].key), Some(key::<Spread>("all5")));
+}
+
+/// A key whose run panics fails the call with its panic, raised once the jobs ahead have ended;
+/// what they resolved stays as memos.
+#[test]
+fn a_key_that_fails_fails_get_all_and_the_jobs_results_are_kept() {
+    let files: Vec<(String, String)> = (0..8).map(|i| (format!("fail{i}"), "x".repeat(i))).collect();
+    let (db, one, _) = spread_setup(&files);
+    let mut asked = names(&["fail0", "gone"]);
+    asked.extend((1..8).map(|i| format!("fail{i}")));
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| db.pin().get::<All>(one, &asked)));
+    let panic = failed.expect_err("the key that panics fails the call");
+    let message = panic.downcast_ref::<String>().map(String::as_str).unwrap_or("");
+    assert!(message.contains("gone"), "the key's own panic: {message}");
+    assert!(db.memo(&list_key::<All>(&asked)).is_none());
+    assert!(db.memo(&key::<Spread>("gone")).is_none());
+    for i in 1..8 {
+        assert!(db.memo(&key::<Spread>(&format!("fail{i}"))).is_some(), "fail{i} was resolved ahead and kept");
+    }
+    assert_eq!(db.pin().get::<Spread>(one, &"fail7".to_owned()), Ok(7));
+    assert_eq!(spread_runs("fail7"), 1, "kept, not run again");
+}
+
+/// The first key that is cancelled cancels the call; the jobs ahead's results stay as memos,
+/// and the request asked again without it reuses them.
+#[test]
+fn a_cancelled_key_cancels_get_all_and_the_jobs_results_are_kept() {
+    let files: Vec<(String, String)> = (0..8).map(|i| (format!("cancel{i}"), "x".repeat(i))).collect();
+    let (db, one, _) = spread_setup(&files);
+    let mut asked = names(&["cancel0", "no"]);
+    asked.extend((1..8).map(|i| format!("cancel{i}")));
+    assert_eq!(db.pin().get::<All>(one, &asked), Err(DbError::Cancelled));
+    assert!(db.memo(&list_key::<All>(&asked)).is_none());
+    assert!(db.memo(&key::<Spread>("no")).is_none());
+    for i in 1..8 {
+        assert!(db.memo(&key::<Spread>(&format!("cancel{i}"))).is_some(), "cancel{i} was resolved ahead and kept");
+    }
+    let rest: Vec<String> = (0..8).map(|i| format!("cancel{i}")).collect();
+    assert_eq!(db.pin().get::<All>(one, &rest), Ok(fold(0..8)));
+    for name in &rest {
+        assert_eq!(spread_runs(name), 1, "{name} ran once");
+    }
+}
+
+/// A `get_all` of keys the view resolved allocates its list of values and nothing else.
+#[test]
+fn a_warm_get_all_allocates_only_its_list() {
+    let files: Vec<(String, String)> = (0..16).map(|i| (format!("warm{i}"), "x".repeat(i))).collect();
+    let (db, one, _) = spread_setup(&files);
+    let asked: Vec<String> = (0..16).map(|i| format!("warm{i}")).collect();
+    assert_eq!(db.pin().get::<CountedAll>(one, &(asked.clone(), 0)), Ok(fold(0..16)));
+    assert_eq!(db.pin().get::<CountedAll>(one, &(asked, 1)), Ok(fold(0..16)));
+    assert_eq!(WARM_ALL.load(Ordering::SeqCst), 1, "a warm get_all allocated more than its list");
 }

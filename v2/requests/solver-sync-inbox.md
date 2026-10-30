@@ -236,6 +236,7 @@ tree; keep them through the port.
    - Test: an `async fn` holding an `Rc` across `.await` is not `Send`; without the hold it is.
 
 > forwarded to solver-sync (its inbox; told by tmux).
+> declared by db-ty-d-mir (21:19): `HirDatabase::coroutine_witnesses(&self, def: InternedCoroutineId<'db>) -> &'db [StoredTy]` (`hir-ty/src/db.rs`), a provider memo (`hir-ty/src/providers.rs`, `coroutine_witnesses_query`), not `impl_hir_database!` (gone). The read in `coroutine_hidden_types` is open: `db.coroutine_witnesses(def_id.0)`, each type's erased regions replaced by fresh anonymous bound regions of one outer `Binder`, no region assumptions, under the `EarlyBinder` the caller instantiates. Also rustc's stalled coroutine goals: a goal on a coroutine of the body being type-checked waits (`TypingMode::Analysis { defining_opaque_types_and_generators }`, `check_coroutine_obligations` after borrowck), or the witness query lowers MIR of the body being inferred, a cycle. Test written: `crates/hir/src/tests.rs`, `a_future_is_send_only_when_what_it_holds_across_an_await_is`. solver-sync's window is gone (its report says DONE); db told by tmux to name who does this.
 
 ## From db-ty-sol-infer (2026-10-29): make an empty fulfillment round free (`fulfill.rs`)
 
@@ -321,6 +322,21 @@ Both are diagnostic only; the solver's answers do not change.
 > and `infer/mod.rs` are db-ty-port-infer's (`v2/requests/db.md` section 10); told
 > db-ty-port-infer-next2 and db-next2 by tmux.
 
+3. (db-ty-d-infer2, follow-up to 1; for db-ty-port-infer) `next_solver/infer/traits.rs`:
+   - `ObligationCauseCode` gains `Hash` in its derive. `InferenceDiagnostic::TypeMismatch` and
+     `SolverDiagnostic` now carry the code and derive `Hash`. Until the derive lands,
+     `solver_errors.rs` holds a hand-written `impl Hash for ObligationCauseCode`, directly
+     after its imports. Delete it in the same change that adds the derive, or the two
+     impls conflict.
+   - Two more codes, which rustc's `CoerceMany` users set and blaze now has to call `Misc`:
+     - `IfExpressionWithNoElse`: an `if` with no `else` whose `then` is not `()`
+       (`check_then_else`). rustc's note: "`if` expressions without `else` evaluate to `()`".
+     - `ReturnNoExpression`: a bare `return;` in a function returning something else
+       (`check_expr_return`).
+     Both are fieldless. db-ty then sets them in `infer/expr.rs` (the `coerce_forced_unit`
+     calls of the `if` with no `else` and of `return`) and in `infer/persist.rs` (two more
+     cause tags, 8 and 9).
+
 ## From lane db (db.md section 12, 20:05): CacheScope; `SimplifiedType: PartialOrd + Ord`
 
 > applied by solver-sync (20:15): the `CacheScope` signature and items 2 and 3 of
@@ -328,3 +344,163 @@ Both are diagnostic only; the solver's answers do not change.
 > derives `PartialOrd + Ord` as new patch 0005 (`PATCHES.md` says what and why). The series
 > replays from the clean nightly to exactly the vendored tree. The items request is marked in
 > `v2/requests/items.md`.
+
+## From db-mem-infer-a-solver (2026-10-29 21:50): mem-db-solver.md sections 9 and 10 (`interner.rs`)
+
+Lane mem's requests for `crates/hir-ty/src/next_solver/interner.rs`, copied exactly from
+`v2/requests/mem-db-solver.md` sections 9 and 10 (not yet in the file as of 21:50: `Column<T>` still
+segments from `alloc_zeroed`, and both walks still `let mut seen = Vec::new();` at :1905 and :2053).
+The `blaze_mem::Region` API they use exists (`reserve_huge`, `base`, `committed`, `ensure` in
+`crates/blaze-mem/src/region.rs`). Section 10's budget test is already written by lane db in
+`next_solver/budget_tests.rs` (the block-impl variant); it passes once 10 lands.
+
+### 9. solver-sync (`crates/hir-ty/src/next_solver/interner.rs`, `mod table`): interned storage on regions tagged `Intern`
+
+**What is done:**
+- Every interned kind is already in an append-only, never-moved, lock-free-read table of
+  hir-ty's own (`interner.rs:2974-3905`): types, regions, consts, predicates, patterns,
+  canonical inputs, valtrees, allocations, external constraints, clause lists, and every
+  `interned_slice!` list.
+- The table kinds are `Rows<K>` (columns `tag`, `flags`, `binder`, `kinds` and an `Index`),
+  `Lists<T>` (columns `start`, `len`, `flags`, `binder` and a `Run` of items) and `Values<T>`
+  (columns `marks`, `values`).
+- A handle is a `u32` row, so the contract's shape (interned data in columns, a `u32` handle) is
+  already met.
+
+**What is left:**
+- Each `Column<T>` (`:3110`) is 23 segments from `std::alloc::alloc`/`alloc_zeroed` (`:3145`).
+  These are untagged, so the interner's bytes appear under no `Tag`, and a read is segment
+  arithmetic (`locate`, a `leading_zeros`, two loads).
+- `Run` must place a list within one segment (`fit`, `:3287`), so the end of a segment is
+  skipped.
+- Each `Index` shard's slot table grows by copying into a new `alloc_zeroed` table and leaking
+  the old one (`Slots::allocate`, `:3353`), also untagged.
+
+**Why not `blaze_mem::Column`:**
+- Its push claims an index with its own `fetch_add` and publishes with its own ready bit.
+- A `Rows` writes four columns at one row it claimed once, and publishes the row through the
+  index. A `Lists` claims runs of items.
+- So the tables need a reserved `Region` per column, not a `blaze_mem::Column`. The claiming and
+  publishing stay the tables' own.
+
+**What:**
+- `Column<T>` becomes a lazily reserved `blaze_mem::Region` tagged `Tag::Intern`:
+
+```rust
+    /// Values by position in one reserved region, committed as positions are written and never
+    /// moved or freed: a reference into it lives as long as the column (a `static`). Each
+    /// position is written once, by the thread that claimed it, before anything naming it is
+    /// published by a release store that the reader's acquire load pairs with.
+    struct Column<T> {
+        /// The region's base once reserved; null before the first write.
+        base: AtomicPtr<T>,
+        region: OnceLock<Region>,
+        /// Positions it can hold: the reservation, as `Region::reserve` is not `const`.
+        max: u64,
+        of: PhantomData<T>,
+    }
+
+    impl<T> Column<T> {
+        const fn new(max: u64) -> Column<T> {
+            Column { base: AtomicPtr::new(ptr::null_mut()), region: OnceLock::new(), max, of: PhantomData }
+        }
+
+        #[cold]
+        fn reserve(&self) -> *mut T {
+            let region = self.region.get_or_init(|| {
+                Region::reserve_huge(self.max as usize * size_of::<T>(), Tag::Intern)
+                    .unwrap_or_else(|error| panic!("reserving an interner column: {error}"))
+            });
+            let base = region.base().as_ptr().cast::<T>();
+            self.base.store(base, Ordering::Release);
+            base
+        }
+
+        /// The region, committed through `at`, and its base.
+        #[inline]
+        fn reach(&self, at: u64) -> *mut T {
+            let mut base = self.base.load(Ordering::Acquire);
+            if base.is_null() {
+                base = self.reserve();
+            }
+            let region = self.region.get().expect("reserved above");
+            region
+                .ensure((at as usize + 1) * size_of::<T>())
+                .unwrap_or_else(|error| panic!("growing an interner column: {error}"));
+            base
+        }
+    }
+```
+
+  - `write(at, value)`: `self.reach(at).wrapping_add(at as usize).write(value)`.
+  - `place(at)` (zeroed columns): `&*self.reach(at).wrapping_add(at as usize)`. The kernel zeroes
+    committed pages, so `Column::zeroed` and its `alloc_zeroed` go away.
+  - `peek(at)`: `None` unless `base` is set and
+    `(at + 1) * size_of::<T>() <= region.committed()`.
+  - `get` and `slice`: `base.load(Relaxed).wrapping_add(at)`. A written position's commit and
+    base store happen before the publication that the caller's acquire load pairs with.
+- Each `unsafe` keeps a `// SAFETY:` comment saying what is committed and who wrote it.
+- `Run::claim` drops `fit`: a run is contiguous in one region. The 2^32-position limit stays as
+  `max`.
+- `segment_start`, `segment_len`, `locate`, `SEGMENTS` and `FIRST_BITS` go away.
+- `max` per column comes from the table: `Rows::new(what, last)` gives `last + 1` rows to its
+  row columns; a `Lists` items run gives `1 << 32`; `Values` gives `LAST_ROW + 1`.
+- **Address space:** reserved lazily, per column actually written.
+  - The largest is `TYS`: `(2^30) × size_of::<TyKind>()`, about 32 GiB virtual.
+  - A list items column is `2^32 × 8` = 32 GiB virtual.
+  - With about 40 written columns, the total is under 1 TiB virtual, nothing committed until
+    written. That fits a 47-bit (128 TiB) user address space.
+  - Windows reserves address space without charging commit, and Linux `PROT_NONE` reservations
+    are not counted by overcommit (`blaze_mem::os::reserve`).
+- **The `Index` slot tables:**
+  - The tables a shard outgrows can't be freed: a reader may be probing them. So all of an
+    index's tables come from one region per `Index`, tagged `Intern`, bump-allocated under the
+    growing shard's `len` lock, which `Vacant::insert` already holds.
+  - Doubling means a shard's tables sum to under twice its last. With 64 shards at most half
+    full, reserving `4 × max_rows × 8` bytes covers them with room for imbalance between
+    shards.
+  - `Slots::allocate` takes `&Region` and an `AtomicUsize` cursor instead of calling
+    `alloc_zeroed`. Alignment is `SLOTS_ALIGN` (64) by rounding the cursor; committed memory is
+    zeroed.
+- **Budget and accounting tests** (`mod table` tests, beside
+  `each_table_gives_the_rows_and_values_of_its_safe_reference`):
+  - `interning_is_counted_under_intern`: `blaze_mem::tag::snapshot().get(Tag::Intern)` grows by
+    at least the bytes of 10,000 new rows. A hit (interning the same 10,000 again) grows nothing.
+  - `a_hit_allocates_nothing`: `blaze_alloc_count::assert_at_most(0, "interning a value already in", ..)`
+    over interning 10,000 existing rows, lists and values. That holds now and must keep holding.
+  - `a_miss_allocates_nothing`: the same over 10,000 new rows. Commits are system calls, not
+    allocator calls. Today a segment's first write and a shard's growth allocate.
+  - The existing safe-reference tests, the parallel test (8 threads) and the
+    `a_shard_that_grows_keeps_every_row` test stay. `positions_are_in_the_segment_that_holds_them`
+    and `a_run_never_crosses_a_segment` go with the segments.
+
+
+### 10. solver-sync (`crates/hir-ty/src/next_solver/interner.rs`): the impl walks' `seen` lists inline
+
+- **Why:**
+  - `for_each_relevant_impl` (`:1906`) and `for_each_blanket_impl` (`:2054`) run during candidate
+    assembly, once per trait goal computed.
+  - Each makes `let mut seen = Vec::new();` and pushes every impl of a block (`const _` and fn
+    bodies), so a trait or type defined in a block allocates per goal.
+  - A block holds few impls.
+- **Before:** `let mut seen = Vec::new();` (both). **After:**
+  `let mut seen: SmallVec<[ImplId; 8]> = SmallVec::new();`, or `[BlanketImplId; 8]` for
+  `for_each_blanket_impl`, whichever the pushed type is. hir-ty already depends on smallvec;
+  `contains` is unchanged.
+- **Budget test:** request 8's warm test with the fixture's `impl<T: Clone> Tr for Wrap<T>`
+  moved into a `const _: () = { .. };` block.
+
+The other 29 hot-lint findings in `next_solver/` (`opaques.rs`, `persist.rs`, `ty.rs`,
+`ir_print.rs`, `util.rs`, `predicate.rs`, `valtree.rs`, and the rest of `interner.rs`) are on
+paths a goal hit or a warm re-solve doesn't take. They cover:
+- `const_conditions`, `opaque_types_defined_by` and `explicit_implied_const_bounds`, which are
+  salsa-memoized per item;
+- persistence;
+- debug printing;
+- reflection;
+- `get_tracked`'s `.clone()` of a `Copy`-sized result.
+
+They stay with their owners' annotations.
+
+> forwarded to db-ty (`next_solver/interner.rs`; solver-sync is DONE; db-ty-next2, both windows); told by tmux (requests, pass 25).
+

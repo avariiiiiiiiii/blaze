@@ -9,7 +9,12 @@ const BORROWED: &str = "fn borrowed() -> u32 { let x = 5u32; let r = &x; *r }";
 
 #[test]
 fn kept_for_a_code_generator_that_emits_lifetime_markers() {
-    let options = MirOptions { level: MirOptLevel::Debug, ub_checks: false, lifetime_markers: true };
+    let options = MirOptions {
+        level: MirOptLevel::Debug,
+        ub_checks: false,
+        lifetime_markers: true,
+        inline: false,
+    };
     let mir = mir(BORROWED, "borrowed", options);
     assert!(mir.contains("StorageLive(") && mir.contains("StorageDead("), "{mir}");
 }

@@ -895,6 +895,9 @@ Status: open
 > `v2/requests/frontend-deps-items.md` take it to about 3 µs. Written up in
 > `docs/v2/plan/lanes/frontend/speed-of-light.md` (frontend-deps-reparse items 4 to 6, the
 > keystroke) and `reparse.md`.
+> frontend-deps-items (2026-10-29 22:05): the span slices are in. `items.rs` compares the ast
+> id entries and anchors in bulk, so only touched items read the maps. Item 4 is about 6 µs;
+> the rest is in the speed-of-light doc.
 
 ### speed-hir-sol-defs: `serve`'s read path is serial and copies each part (design)
 
@@ -923,6 +926,9 @@ Status: open
 > No change needed.
 
 ## dedyn: crates/hir-def/src/item_tree/lower.rs and attrs.rs: generic span callbacks and visibilities
+> Being applied in the tree by dedyn-def (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.
+> APPLIED by dedyn-def 2026-10-29 22:10: 1 and 2 verified as frontend-deps-items applied them. 3 superseded: the `&dyn ast::HasAttrs` parameters are gone, so are their `// dyn:` comments; `lower_attrs_into` takes syntax's `ast::AttrsIncludingInner` iterator (one instance) with `AttrsOrCfg::lower(&impl)` over it; in lower.rs (now on views) `lower_attrs_of` takes the concrete view node `ast::AnyHasAttrs<'_>`, with `lower_attrs` and `cfg_disabled` as `impl HasAttrs<'t>` shells.
+
 
 For `frontend-deps-items` (and `mem-format-tree-items`, who also holds `item_tree/`).
 
@@ -966,3 +972,362 @@ visibility.rs, signatures.rs twice).
 > is above `lower_attrs_of`, `lower_attrs` and `cfg_disabled` in lower.rs, and on the `owner`
 > lines of `AttrsOrCfg::lower` and `lower_attrs_into` in attrs.rs. `hot_lint`: no finding in
 > `item_tree*`.
+
+## frontend-fast-bodies-cache: `Stored` gives each written crate's filed key (2026-10-29)
+
+A dependency's check outcome (`blaze_diagnostics::cache`, notes
+`docs/v2/plan/lanes/frontend/fast-bodies-cache.md`, "The key") is filed under the key its image
+is filed under (`Image::key`: the crate key and, with reads, their values), plus the lint flags,
+`keep_duplicates` and the borrowck mode. For a served crate that key is
+`DepImages::try_get(db)?.images(db).get(&krate).map(Image::key)` (all `pub` already, nothing
+asked). For a crate resolved this session and imaged by `store`, the filed key is only known
+inside `serve.rs`'s `make`; asked: return it.
+
+In `crates/hir-def/src/deps/serve.rs`:
+
+1. `pub struct Stored`: after `pub refused: Vec<(Crate, Refused)>,` add
+   ```rust
+       /// The key each crate of `written` has its image filed under ([`Image::key`]): what a
+       /// value made from the crate as this database resolved it is filed by
+       /// (`blaze_diagnostics::cache`).
+       pub filed: FxHashMap<Crate, ContentId>,
+   ```
+2. `fn make(..) -> Result<Option<Refused>, String>` becomes
+   `-> Result<Result<ContentId, Refused>, String>`: each `return Ok(Some(why));` in it becomes
+   `return Ok(Err(why));`, each `Err(why) => return Ok(Some(why)),` becomes
+   `Err(why) => return Ok(Err(why)),`, and the last line `Ok(None)` becomes `Ok(Ok(filed))`.
+3. In `store`: `let made: Vec<OnceLock<Result<Option<Refused>, String>>> =` becomes
+   `let made: Vec<OnceLock<Result<Result<ContentId, Refused>, String>>> =`, and
+   ```rust
+           match made? {
+               None => stored.written.push(krate),
+               Some(why) => stored.refused.push((krate, why)),
+           }
+   ```
+   becomes
+   ```rust
+           match made? {
+               Ok(filed) => {
+                   stored.written.push(krate);
+                   stored.filed.insert(krate, filed);
+               }
+               Err(why) => stored.refused.push((krate, why)),
+           }
+   ```
+4. A test in `deps/tests.rs` beside `every_dependency_is_stored_and_served`: each crate of
+   `stored.written` has `stored.filed[&krate]` equal to the `Image::key` that `serve` then gives
+   it (`DepImages::get(&db).images(&db)[&krate].key()`).
+
+`Stored` derives `Default`, so the new field needs nothing else. No caller outside `deps/` reads
+`Stored` yet (`rg 'deps::store'` finds none in blaze-cargo).
+
+> applied by frontend-deps (2026-10-29): items 1 to 3 as given, in `crates/hir-def/src/deps/serve.rs`
+> (`Stored::filed`, `make -> Result<Result<ContentId, Refused>, String>`, `store` fills
+> `filed`). For item 4, `a_stored_image_is_served_under_the_key_store_filed_it_by` in
+> `deps/tests.rs` covers a crate without reads (`FIXTURE`) and one filed by its proc-macro
+> expansions' reads (`READING`). It compares by crate name across the two databases. Not
+> built.
+> On the key: `Image::key` plus the flags is right for what the image depends on. It does not
+> cover what bodies expand: `Reads::of` walks module-scope and signature macro calls only. A
+> check outcome made from bodies must also hash the reads of the body expansions it ran
+> (proc-macro `MacroCallId::expansion_reads` and the `Files::env_read` entries the bodies
+> added), or refuse a crate whose body expansions' reads are `Unknown`. Otherwise a changed
+> file read by a proc macro inside a fn body keeps a stale outcome.
+
+> forwarded to frontend-deps (frontend-deps-next2, holds `hir-def/src/deps/`; told by tmux; requests, pass 23).
+
+## frontend-fast-const-deps: an item's key for a constant, public (2026-10-29)
+
+`hir_ty::consteval::deps` (notes `docs/v2/plan/lanes/frontend/fast-const-deps.md`, "The key")
+keeps a dependency's evaluated `const` items in the store under a hash of the crate's
+check-result key, the item's stable key and its schema. The item's stable key is
+`signatures::key::of(db, Item::Const(id))`, which is `pub(super)` in a private module. Asked:
+one public function, no change to what the key is.
+
+1. `crates/hir-def/src/deps/signatures.rs`, after `fn format_error` (before `fn find`), add:
+   ```rust
+   /// The key of the record of `id`'s signature, the same in every process: what a value made
+   /// from the constant is filed by beside its crate's key (`hir_ty::consteval::deps`). `None`
+   /// for a constant in a block.
+   pub(crate) fn const_key(db: &Db, id: ConstId) -> Option<ContentId> {
+       key::of(db, Item::Const(id)).map(|(_, key)| key)
+   }
+   ```
+   (`ConstId`, `ContentId`, `Item`, `Db` are imported there already.)
+2. `crates/hir-def/src/deps.rs`, after `pub(crate) fn mode`, add:
+   ```rust
+   /// The stable key of `id`, a `const` item of a crate's modules ([`signatures`]): the same in
+   /// every process and checkout. `None` for a constant in a block.
+   pub fn const_key(db: &Db, id: crate::ConstId) -> Option<base_db::ContentId> {
+       signatures::const_key(db, id)
+   }
+   ```
+3. Please keep `KEY_DOMAIN` (signatures/key.rs) changing whenever what `key::of` writes changes:
+   the constant values' key takes the item key as is, so a new item encoding gives new keys.
+
+Also for you to know (no edit asked): `Reads::of` walks the macro calls of the crate's module
+scopes and of its signatures, not those inside bodies. The image does not depend on body
+expansions, so the image key is right as it is; but anything filed by `Image::key` that is made
+from bodies (check outcomes, inference, constant values) must add the reads of body
+expansions itself. Told frontend-fast-bodies-cache, whose check-result key our constants use.
+
+> applied by frontend-deps (2026-10-29): `signatures::const_key` in `deps/signatures.rs` and
+> `pub fn deps::const_key` in `deps.rs`, as given. Point 3 is now a written rule on
+> `KEY_DOMAIN` in `deps/signatures/key.rs`: its version goes up whenever what `key::of` hashes
+> changes. The note on body expansions is right and is now in the deps notes ("Reads"). Not
+> built.
+> forwarded to frontend-deps (frontend-deps-next2 told by tmux; requests, pass 23).
+
+## frontend-fast-bodies-cache-bodies: portable item ids and a body's key, public (2026-10-29)
+
+`hir_ty::check_cache` (written: `crates/hir-ty/src/check_cache{.rs,/ids.rs,/part.rs}`) files
+each body of a dependency by a key that is the same in every process and names the crate's
+items through one table written as frozen writes it. Both exist here, crate-private; this makes
+them public under narrow names. No behaviour of hir-def changes.
+
+### 1. New file `crates/hir-def/src/deps/signatures/ids.rs`
+
+```rust
+//! The signatures part's portable ids and keys, for other parts of an image that name a crate's
+//! items (`hir_ty::check_cache`): a table of items written as [`crate::nameres::frozen`] writes
+//! them, and the key of an item's body.
+
+use base_db::{Crate, Db};
+use blaze_ids::ContentId;
+use salsa::plumbing::{AsId, FromId};
+
+use super::{
+    key::{self, Item},
+    table,
+};
+use crate::{
+    ConstId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, ImplId, StaticId, StructId,
+    TraitId, TypeAliasId, UnionId, VariantId,
+    hir::persist::{Kind, Relocation},
+};
+
+/// [`key::KEY_DOMAIN`]: a part filed by [`body_key`]s puts it in its schema, so a new key
+/// encoding gives the part another key.
+pub const BODY_KEY_DOMAIN: &str = key::KEY_DOMAIN;
+
+/// Which item type a [`PortableId`] is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct IdKind(Kind);
+
+/// An item id a [`PortableIds`] table holds.
+pub trait PortableId: Copy + AsId + FromId {
+    const KIND: IdKind;
+}
+
+macro_rules! portable {
+    ($($ty:ty => $kind:ident),* $(,)?) => {$(
+        impl PortableId for $ty {
+            const KIND: IdKind = IdKind(Kind::$kind);
+        }
+    )*};
+}
+
+portable! {
+    FunctionId => Function,
+    StructId => Struct,
+    UnionId => Union,
+    EnumId => Enum,
+    ConstId => Const,
+    StaticId => Static,
+    TraitId => Trait,
+    TypeAliasId => TypeAlias,
+    ImplId => Impl,
+    EnumVariantId => EnumVariant,
+}
+
+/// Items of one crate, each at an index: written as the signatures part's table, read back in
+/// another database as that database's ids.
+#[derive(Default, Debug)]
+pub struct PortableIds(Relocation);
+
+impl PortableIds {
+    pub fn new() -> PortableIds {
+        PortableIds(Relocation::new())
+    }
+
+    /// The index of `id`, added when it is new.
+    pub fn index<T: PortableId>(&mut self, id: T) -> u32 {
+        self.0.index(T::KIND.0, id.as_id().as_bits())
+    }
+
+    /// The item at `index`, `None` when there is none or it is another type.
+    pub fn get<T: PortableId>(&self, index: u32) -> Option<T> {
+        self.0.get(T::KIND.0, index).map(|bits| T::from_id(salsa::Id::from_bits(bits)))
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The table's bytes; an error names an item frozen cannot write (one of another crate's
+    /// blocks, say).
+    pub fn encode(&self, db: &Db, krate: Crate) -> Result<Vec<u8>, String> {
+        table::encode(db, krate, &self.0)
+    }
+
+    /// [`Self::encode`]'s table, its items made again in `db`; an error for bytes that do not
+    /// decode, never a panic.
+    pub fn decode(db: &Db, krate: Crate, bytes: &[u8]) -> Result<PortableIds, String> {
+        table::decode(db, krate, bytes).map(PortableIds)
+    }
+}
+
+/// The key of `def`'s body, the same in every process: its item's key (a variant's, for a
+/// variant's discriminant); `None` for a body in a block.
+pub fn body_key(db: &Db, def: DefWithBodyId) -> Option<ContentId> {
+    let item = match def {
+        DefWithBodyId::FunctionId(it) => Item::Function(it),
+        DefWithBodyId::ConstId(it) => Item::Const(it),
+        DefWithBodyId::StaticId(it) => Item::Static(it),
+        DefWithBodyId::VariantId(it) => Item::Fields(VariantId::EnumVariantId(it)),
+    };
+    key::of(db, item).map(|(_, key)| key)
+}
+```
+
+(If `key::KEY_DOMAIN` is `pub(super)` it is visible here: `ids` is a child of `signatures`.
+A const of `DefWithBodyId` I have not listed: the match names every variant today; if there are
+more the build names them.)
+
+### 2. `crates/hir-def/src/deps/signatures.rs`
+
+Old:
+
+```rust
+mod codes;
+mod key;
+mod table;
+```
+
+New:
+
+```rust
+mod codes;
+mod ids;
+mod key;
+mod table;
+
+pub use self::ids::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableIds, body_key};
+```
+
+### 3. `crates/hir-def/src/deps.rs`
+
+Old:
+
+```rust
+pub use crate::nameres::frozen::Mode;
+```
+
+New:
+
+```rust
+pub use crate::deps::signatures::{BODY_KEY_DOMAIN, IdKind, PortableId, PortableIds, body_key};
+pub use crate::nameres::frozen::Mode;
+```
+
+### 4. A note for the key
+
+`hir_ty::check_cache::key(image, mode)` files the bodies part under the image's key. You noted
+that `Reads::of` does not cover a body's expansions (`env!` in a body): until it does, a body
+that read the environment is served against an image key that does not cover the read. I
+have told the parent lane (frontend-fast-bodies-cache).
+
+Status: applied (frontend-deps, 2026-10-29)
+
+> frontend-deps: applied as written. `deps/signatures/ids.rs` is new, re-exported from
+> `deps::signatures` and `deps`. I checked it against the tree: `Relocation` derives
+> `Default, Debug`; `Kind` has all ten variants; `table::{encode, decode}` and `key::of` are
+> `pub(super)`, so `ids` sees them; `DefWithBodyId` has the four variants you match. Not built.
+> On your point 4, the deps notes say the same ("Bodies are not covered"): until a body's
+> expansion reads are in its key, a body that read the environment is served against a key
+> that doesn't cover the read.
+
+> forwarded to frontend-deps (`hir-def/src/deps*`; frontend-deps-next2, both windows); told by tmux (requests, pass 28).
+
+## frontend-fast-bodies-cache: values made from bodies, filed by their reads (2026-10-29)
+
+Your note on `Stored::filed` was right: a check outcome made from bodies must also cover the
+reads of the expansions inside bodies (`env!` of a process variable, a proc macro in a fn body
+reading a file). `blaze_diagnostics::cache` and `hir_ty::check_cache` (its child) will file
+their values the way `deps::store` files an image: the read names in a slot under the base
+key, the value under `reads::image_key(base, record, values)`. Asked, public from
+`hir_def::deps` (in `deps/serve.rs` or a new `deps/filed.rs`, your call), reusing
+`Reads::of`, `keep_reads`, `reads::slot` and `reads::image_key` as they are:
+
+```rust
+/// The reads of `krate` as `db` checked it: [`Reads::of`] with, besides the calls its
+/// signatures name, every macro call of each of its bodies (`ExpressionStore::macro_calls`
+/// of `db.body(def)` for each `DefWithBodyId` of its modules, impls and traits, and of the
+/// items of the block scopes in them). Run after the check, so the `env!` log has the
+/// bodies' variables. An expansion with `ExpansionReads::Unknown` is a refusal, as for images.
+pub fn checked_reads(db: &Db, krate: Crate) -> Result<Reads, Refused>;
+
+/// Files `reads` (of `krate`, made in `db`) under `key`: the key itself when they are empty,
+/// else the first slot of `key` that holds them or is free (`keep_reads`), and the key a value
+/// made with them goes under (`reads::image_key(key, record, reads.values_then(db))`).
+/// `Ok(Err(..))` when every slot holds other reads.
+// dyn: the driver's store, one call per crate kept
+pub fn file_by_reads(
+    db: &Db,
+    krate: Crate,
+    key: ContentId,
+    reads: &Reads,
+    store: &dyn ImageStore,
+) -> Result<Result<ContentId, Refused>, String>;
+
+/// The first of `key`, then the filed key of each slot of `key` with its reads' values now
+/// (`Reads::decode`, `values_now`), for which `found` gives `Some`: as `fetch` looks for an
+/// image. `None` when none does. A slot that does not decode is an error naming the crate.
+// dyn: the driver's store, one call per crate per session
+pub fn find_by_reads<T>(
+    db: &Db,
+    krate: Crate,
+    key: ContentId,
+    store: &dyn ImageStore,
+    found: impl FnMut(ContentId) -> Result<Option<T>, String>,
+) -> Result<Option<T>, String>;
+```
+
+Tests, in `deps/tests.rs`: a crate whose body (not its signatures) calls `env!` of a process
+variable is filed in a slot; with the variable changed, `find_by_reads` gives `None`; with it
+as it was, the filed key. A body's proc-macro expansion with `Unknown` reads is refused by
+`checked_reads`. A crate with no body reads finds under `key` with no slot written.
+
+The callers are written against this (`crates/blaze-diagnostics/src/cache.rs`, `serve` and
+`store`); they do not build until it is there.
+
+Status: applied (frontend-deps, 2026-10-29)
+
+> frontend-deps: applied in a new `deps/filed.rs`, re-exported from `hir_def::deps` with your
+> signatures. Not built. One difference:
+> - **A crate read from an image** (`deps::mode` is `Some`): `checked_reads` leaves out the
+>   calls of its modules and signatures. `expansion_reads` runs the expansion, so asking for
+>   those would expand every item-level proc macro that serving skips. What they read is
+>   already in `Image::key`. So for such a crate, the `key` you give `file_by_reads` /
+>   `find_by_reads` must cover its image (`Image::key`, `Stored::filed`), as
+>   `check_cache::key(image, mode)` does. The blocks of its signatures are still walked:
+>   their items are not in the image.
+> - Otherwise it is as you wrote: every body (`demand::scope_body_owners`, `Body::of`), every
+>   signature's store (`signatures::store_of`), and the scopes of every block in them, then
+>   `Reads::of_calls`.
+> - `serve`'s `fetch` and `store`'s `make` now go through the same `filed::search` and
+>   `file_by_reads`, and `keep_reads` moved there.
+> - Tests in `deps/tests.rs`:
+>   - `a_body_s_process_variable_files_a_value_in_a_slot`;
+>   - `a_body_s_expansion_of_unknown_reads_is_refused` (a body's `mirror!`; `Reads::of` alone
+>     is empty);
+>   - `a_crate_with_no_body_reads_is_found_under_its_key`;
+>   - `an_imaged_crate_s_checked_reads_leave_out_what_its_image_covers`.
+> Constants (`deps::const_key`) are not covered yet: `hir_ty::consteval::deps` must add the
+> reads of the bodies it evaluated, by `checked_reads` or its own.
+
+> forwarded to frontend-deps (frontend-deps-next2, both windows); told by tmux (requests, pass 28).

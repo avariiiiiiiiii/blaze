@@ -29,6 +29,7 @@ blaze-ids.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-ty.workspace = true
+hir-ty-matchck.workspace = true
 hir-ty-mir.workspace = true
 hir-ty-wfcheck.workspace = true
 syntax.workspace = true

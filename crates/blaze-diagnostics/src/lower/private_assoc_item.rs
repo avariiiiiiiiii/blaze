@@ -7,20 +7,26 @@
 
 use blaze_items::{Fact, ItemId};
 use hir::InFile;
-use syntax::{AstNode, TextRange, ast};
+use syntax::{
+    TextRange,
+    view::{self as ast, AstNode as _, HasName as _},
+};
 
 use crate::{
-    cx::{Cx, def_range},
+    cx::{Cx, def_range_view as def_range},
     lints::code_fact,
     lower::{Found, Phase},
     model::Diag,
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateAssocItem) -> Vec<Found> {
-    let node = cx.node(d.expr_or_pat);
-    let Some(range) = name_range(&node.value) else { return vec![] };
+    let node = cx.node_view(d.expr_or_pat);
+    // alloc: empty, allocates nothing
+    let Some(range) = name_range(node.value) else { return vec![] };
     let name_span = cx.span(InFile::new(node.file_id, range));
+    // alloc: empty, allocates nothing
     let Some(name) = d.item.name(cx.db) else { return vec![] };
+    // alloc: the error's text, for an error hir found
     let name = name.display(cx.db, cx.edition).to_string();
     let kind = match d.item {
         hir::AssocItem::Function(f) if f.has_self_param(cx.db) => "method",
@@ -28,14 +34,17 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateAssocItem) -> Vec<Found> {
         hir::AssocItem::Const(_) => "associated constant",
         hir::AssocItem::TypeAlias(_) => "associated type",
     };
+    // alloc: the error's text, for an error hir found
     let mut diag = Diag::error(Some("E0624"), format!("{kind} `{name}` is private"), name_span.clone());
+    // alloc: the error's text, for an error hir found
     diag.span_label(name_span, format!("private {kind}"));
     let defined = match d.item {
-        hir::AssocItem::Function(f) => cx.sema.source(f).map(|it| it.map(|it| def_range(it.syntax()))),
-        hir::AssocItem::Const(c) => cx.sema.source(c).map(|it| it.map(|it| def_range(it.syntax()))),
-        hir::AssocItem::TypeAlias(t) => cx.sema.source(t).map(|it| it.map(|it| def_range(it.syntax()))),
+        hir::AssocItem::Function(f) => cx.vsema.source(f).map(|it| it.map(|it| def_range(it.syntax()))),
+        hir::AssocItem::Const(c) => cx.vsema.source(c).map(|it| it.map(|it| def_range(it.syntax()))),
+        hir::AssocItem::TypeAlias(t) => cx.vsema.source(t).map(|it| it.map(|it| def_range(it.syntax()))),
     };
     if let Some(defined) = defined {
+        // alloc: the error's text, for an error hir found
         diag.span_label(cx.span(defined), format!("private {kind} defined here"));
     }
 
@@ -45,20 +54,23 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::PrivateAssocItem) -> Vec<Found> {
         hir::AssocItem::TypeAlias(t) => Some(ItemId::Alias(t.into())),
     };
     if let Some(item) = item {
+        // alloc: the error's text, for an error hir found
         diag.fact(Fact::Signature(cx.key(item)), format!("the visibility of `{name}`"));
     }
-    if let either::Either::Left(ast::Expr::MethodCallExpr(call)) = &node.value
-        && let Some(receiver) = call.receiver().and_then(|it| cx.sema.type_of_expr(&it))
+    if let either::Either::Left(ast::Expr::MethodCallExpr(call)) = node.value
+        && let Some(receiver) = call.receiver().and_then(|it| cx.vsema.type_of_expr(it))
     {
         let receiver = receiver.original;
+        // alloc: the error's text, for an error hir found
         diag.fact_opt(cx.method_fact(&receiver, &name), format!("what `{name}` is on `{}`", cx.ty(&receiver)));
     }
     code_fact(cx, &mut diag, d.expr_or_pat.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 
 /// The range of the name a method call calls, or of the last segment of a path.
-fn name_range(node: &either::Either<ast::Expr, ast::Pat>) -> Option<TextRange> {
+fn name_range(node: either::Either<ast::Expr<'_>, ast::Pat<'_>>) -> Option<TextRange> {
     let path = match node {
         either::Either::Left(ast::Expr::MethodCallExpr(call)) => {
             return Some(call.name_ref()?.syntax().text_range());

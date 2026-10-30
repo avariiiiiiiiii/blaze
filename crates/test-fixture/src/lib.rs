@@ -21,14 +21,15 @@ use hir_expand::{
     change::ChangeWithProcMacros,
     files::FilePosition,
     proc_macro::{
-        ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind, ProcMacrosBuilder,
+        ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+        ProcMacrosBuilder,
     },
     quote,
     tt::{Leaf, TokenTree, TopSubtree, TopSubtreeBuilder, TtElement, TtIter},
 };
 use intern::{Symbol, sym};
 use paths::AbsPathBuf;
-use span::{Edition, FileId, Span};
+use span::{Edition, FileId};
 use stdx::itertools::Itertools;
 use test_utils::{
     CURSOR_MARKER, ESCAPED_CURSOR_MARKER, Fixture, FixtureWithProjectMeta, MiniCore, RangeOrOffset,
@@ -917,18 +918,12 @@ impl ProcMacroExpander for IdentityProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        subtree: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        _: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
-        Ok(subtree.clone())
+        Ok(subtree.copy())
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -940,13 +935,7 @@ impl ProcMacroExpander for Issue18089ProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        subtree: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        _: Span,
-        call_site: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree, call_site, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         let Some(tt::TtElement::Leaf(macro_name)) = subtree.iter().nth(1) else {
             return Err(ProcMacroExpansionError::Panic("incorrect input".to_owned()));
@@ -964,7 +953,7 @@ impl ProcMacroExpander for Issue18089ProcMacroExpander {
         })
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -976,20 +965,14 @@ impl ProcMacroExpander for AttributeInputReplaceProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        _: &TopSubtree,
-        attrs: Option<&TopSubtree>,
-        _: &Env,
-        _: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { attrs, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         attrs
             .cloned()
             .ok_or_else(|| ProcMacroExpansionError::Panic("Expected attribute input".into()))
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -1000,13 +983,7 @@ impl ProcMacroExpander for Issue18840ProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        fn_: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        def_site: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree: fn_, def_site, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         // Input:
         // ```
@@ -1026,7 +1003,7 @@ impl ProcMacroExpander for Issue18840ProcMacroExpander {
         Ok(result)
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -1037,13 +1014,7 @@ impl ProcMacroExpander for MirrorProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        input: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        _: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree: input, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         fn traverse(builder: &mut TopSubtreeBuilder, iter: TtIter<'_>) {
             for tt in iter.collect_vec().into_iter().rev() {
@@ -1062,7 +1033,7 @@ impl ProcMacroExpander for MirrorProcMacroExpander {
         Ok(builder.build())
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -1076,15 +1047,9 @@ impl ProcMacroExpander for ShortenProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        input: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        _: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree: input, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
-        let mut result = input.clone();
+        let mut result = input.copy();
         for (idx, it) in input.as_token_trees().iter_flat_tokens().enumerate() {
             if let TokenTree::Leaf(mut leaf) = it {
                 modify_leaf(&mut leaf);
@@ -1109,7 +1074,7 @@ impl ProcMacroExpander for ShortenProcMacroExpander {
         }
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -1121,13 +1086,7 @@ impl ProcMacroExpander for Issue17479ProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        subtree: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        _: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         let mut iter = subtree.iter();
         let Some(TtElement::Leaf(tt::Leaf::Literal(lit))) = iter.next() else {
@@ -1140,7 +1099,7 @@ impl ProcMacroExpander for Issue17479ProcMacroExpander {
         })
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -1152,13 +1111,7 @@ impl ProcMacroExpander for Issue18898ProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        subtree: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        def_site: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree, def_site, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         let span = subtree
             .token_trees()
@@ -1194,7 +1147,7 @@ impl ProcMacroExpander for Issue18898ProcMacroExpander {
         })
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -1206,13 +1159,7 @@ impl ProcMacroExpander for DisallowCfgProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        subtree: &TopSubtree,
-        _: Option<&TopSubtree>,
-        _: &Env,
-        _: Span,
-        _: Span,
-        _: Span,
-        _: String,
+        ProcMacroCall { subtree, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         for tt in subtree.token_trees().iter_flat_tokens() {
             if let tt::TokenTree::Leaf(tt::Leaf::Ident(ident)) = tt
@@ -1223,10 +1170,10 @@ impl ProcMacroExpander for DisallowCfgProcMacroExpander {
                 ));
             }
         }
-        Ok(subtree.clone())
+        Ok(subtree.copy())
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }
@@ -1238,13 +1185,7 @@ impl ProcMacroExpander for GenerateSuffixedTypeProcMacroExpander {
     fn expand(
         &self,
         _: &Db,
-        subtree: &TopSubtree,
-        _attrs: Option<&TopSubtree>,
-        _env: &Env,
-        _def_site: Span,
-        call_site: Span,
-        _mixed_site: Span,
-        _current_dir: String,
+        ProcMacroCall { subtree, call_site, .. }: ProcMacroCall<'_>,
     ) -> Result<TopSubtree, ProcMacroExpansionError> {
         let mut iter = subtree.iter();
         let Some(TtElement::Leaf(tt::Leaf::Ident(ident))) = iter.next() else {
@@ -1288,7 +1229,7 @@ impl ProcMacroExpander for GenerateSuffixedTypeProcMacroExpander {
         Ok(ret)
     }
 
-    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
+    fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool { // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
         other.type_id() == TypeId::of::<Self>()
     }
 }

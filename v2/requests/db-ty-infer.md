@@ -63,6 +63,7 @@ list of types in place of the table (it needs no database), so the table itself
 reference needs an interner) are covered only by a fixture test.
 
 > forwarded to db: `crates/hir/` is lane db's.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:963` (`an_inference_record_round_trips_through_its_type_table`: the fixture, `to_record`, `Persist::read`, `to_result` and `as_ref().to_result`).
 
 ## 3. db-ty-types: `next_solver::persist::{TyTableWriter, TyTableReader}`, as the contract says
 
@@ -75,6 +76,7 @@ Where: `crates/hir-ty/src/next_solver/persist.rs` (new), `pub mod persist;` in `
 Why: nothing else in the record depends on the interners' dense indices.
 
 > forwarded to db: between lane db's children.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/next_solver/persist.rs:1770` (`TyTableWriter::{new, ty, args, write}`) and `:1888` (`TyTableReader::{open, ty, args}`); `pub mod persist;` at `next_solver.rs:26`.
 
 ## 4. db-ty-lower: share the lowering diagnostics' words
 
@@ -103,6 +105,7 @@ Where: `crates/hir-ty/src/db.rs`, `evict.rs`.
 Why: db-ty-shared.md rule 4, values in the format.
 
 > forwarded to db: between lane db's children.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty/src/check_cache/part.rs:427`: the stored form is `InferenceRecord`, read with `to_result` and a failed read an error (`map_err(format_error)`), never a recomputation. `evict.rs`'s `drop_inference` drops the in-memory value only (salsa recomputes and backdates by fingerprint, the design of `docs/v2/plan/lanes/db.md` section 7), so nothing there needs the record.
 
 ## 6. Notes (no change asked)
 

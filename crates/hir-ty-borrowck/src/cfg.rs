@@ -101,8 +101,9 @@ impl<'f> Cfg<'f> {
             points += len;
         }
         let mut unique: FVec<'_, (u32, BasicBlockId)> = Vec::new_in(frame);
+        let mut seen = crate::mem::set(frame);
         for &(from, to) in edges {
-            if !unique.contains(&(from as u32, block(to))) {
+            if seen.insert((from, to)) {
                 unique.push((from as u32, block(to)));
             }
         }
@@ -146,27 +147,30 @@ impl<'f> Cfg<'f> {
         location: Location,
     ) -> SmallVec<[Location; 4]> {
         if location.statement > 0 {
+            // alloc: inline; asked only while an error is explained
             return smallvec::smallvec![Location { statement: location.statement - 1, ..location }];
         }
         self.predecessors(location.block)
             .iter()
             .filter(|it| self.is_reachable(**it))
             .map(|&block| Location { block, statement: body.basic_blocks[block].statements.len() })
-            .collect()
+            .collect() // alloc: four inline; asked only while an error is explained
     }
 }
 
 /// The blocks reachable from `start` in reverse postorder, and which are. rustc's `Postorder`
 /// takes each block's successors from the last, so its reverse postorder, the order errors are
 /// found in, has a loop's exit before its body.
-fn reverse_postorder(
-    successors: &Csr<BasicBlockId>,
+fn reverse_postorder<'f>(
+    frame: &'f Frame,
+    successors: &Csr<'_, BasicBlockId>,
     start: BasicBlockId,
-) -> (Vec<BasicBlockId>, Vec<bool>) {
+) -> (FVec<'f, BasicBlockId>, FVec<'f, bool>) {
     let count = successors.nodes();
-    let mut reachable = vec![false; count];
-    let mut postorder = Vec::with_capacity(count);
-    let mut stack = vec![(start, 0usize)];
+    let mut reachable = filled(frame, count, false);
+    let mut postorder = Vec::with_capacity_in(count, frame);
+    let mut stack: FVec<'_, (BasicBlockId, usize)> = Vec::with_capacity_in(count, frame);
+    stack.push((start, 0usize));
     reachable[index(start)] = true;
     while let Some((block, next)) = stack.last_mut() {
         let block = *block;
@@ -191,18 +195,19 @@ fn reverse_postorder(
 /// entry and exit in a walk of the tree, so that whether one dominates another is two
 /// comparisons. The iterative algorithm walked dominator chains for every predecessor, which a
 /// long body of calls, each unwinding to one cleanup, made quadratic.
-pub(super) struct Dominators {
+pub(super) struct Dominators<'f> {
     /// Each block's entry and exit in the walk of the tree; `usize::MAX` when unreachable.
-    enter: Vec<usize>,
-    exit: Vec<usize>,
+    enter: FVec<'f, usize>,
+    exit: FVec<'f, usize>,
 }
 
 const NONE: usize = usize::MAX;
 
-impl Dominators {
-    pub(super) fn new(cfg: &Cfg) -> Self {
+impl<'f> Dominators<'f> {
+    pub(super) fn new(frame: &'f Frame, cfg: &Cfg<'_>) -> Self {
         let start = cfg.order.first().map(|&it| index(it));
         Self::of_graph(
+            frame,
             cfg.reachable.len(),
             start,
             |it| cfg.successors.of(it),
@@ -211,19 +216,21 @@ impl Dominators {
     }
 
     fn of_graph<'g>(
+        frame: &'f Frame,
         count: usize,
         start: Option<usize>,
         successors: impl Fn(usize) -> &'g [BasicBlockId],
         predecessors: impl Fn(usize) -> &'g [BasicBlockId],
     ) -> Self {
-        let mut enter = vec![NONE; count];
-        let mut exit = vec![NONE; count];
+        let mut enter = filled(frame, count, NONE);
+        let mut exit = filled(frame, count, NONE);
         let Some(start) = start else { return Dominators { enter, exit } };
         // Depth-first preorder: `pre` of each block, `vertex` and `parent` by that number.
-        let mut pre = vec![NONE; count];
-        let mut vertex = Vec::new();
-        let mut parent = Vec::new();
-        let mut stack = vec![(start, NONE)];
+        let mut pre = filled(frame, count, NONE);
+        let mut vertex = Vec::with_capacity_in(count, frame);
+        let mut parent = Vec::with_capacity_in(count, frame);
+        let mut stack: FVec<'_, (usize, usize)> = Vec::with_capacity_in(count, frame);
+        stack.push((start, NONE));
         while let Some((block, from)) = stack.pop() {
             if pre[block] != NONE {
                 continue;
@@ -238,10 +245,10 @@ impl Dominators {
             }
         }
         let n = vertex.len();
-        let mut semi: Vec<usize> = (0..n).collect();
-        let mut label: Vec<usize> = (0..n).collect();
-        let mut ancestor = vec![NONE; n];
-        let mut path = Vec::new();
+        let mut semi = collect(frame, 0..n);
+        let mut label = collect(frame, 0..n);
+        let mut ancestor = filled(frame, n, NONE);
+        let mut path: FVec<'_, usize> = Vec::with_capacity_in(n, frame);
         for w in (1..n).rev() {
             for &pred in predecessors(vertex[w]) {
                 let v = pre[index(pred)];
@@ -278,9 +285,10 @@ impl Dominators {
             }
             idom[w] = x;
         }
-        let children = Csr::build(n, (1..n).map(|w| (idom[w] as u32, w as u32)));
+        let children = Csr::build(frame, n, (1..n).map(|w| (idom[w] as u32, w as u32)));
         let mut time = 0;
-        let mut stack = vec![(0, false)];
+        let mut stack: FVec<'_, (usize, bool)> = Vec::with_capacity_in(2 * n, frame);
+        stack.push((0, false));
         while let Some((w, done)) = stack.pop() {
             if done {
                 exit[vertex[w]] = time;
@@ -352,55 +360,58 @@ mod tests {
 
     #[test]
     fn match_the_dominator_sets() {
-        let mut rng = SplitMix64::new(0x2545f4914f6cdd1d);
-        for round in 0..500 {
-            let count = 1 + rng.index(24);
-            let edges = rng.index(count * 3 + 1);
-            let mut succs = vec![Vec::new(); count];
-            let mut preds = vec![Vec::new(); count];
-            // A chain from the start keeps most blocks reachable, as a body's are.
-            for b in 1..count {
-                if rng.index(4) != 0 {
-                    let from = rng.index(b);
-                    succs[from].push(block(b));
-                    preds[b].push(block(from));
+        blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
+            let mut rng = SplitMix64::new(0x2545f4914f6cdd1d);
+            for round in 0..500 {
+                let count = 1 + rng.index(24);
+                let edges = rng.index(count * 3 + 1);
+                let mut succs = vec![Vec::new(); count];
+                let mut preds = vec![Vec::new(); count];
+                // A chain from the start keeps most blocks reachable, as a body's are.
+                for b in 1..count {
+                    if rng.index(4) != 0 {
+                        let from = rng.index(b);
+                        succs[from].push(block(b));
+                        preds[b].push(block(from));
+                    }
                 }
-            }
-            for _ in 0..edges {
-                let (from, to) = (rng.index(count), rng.index(count));
-                if !succs[from].contains(&block(to)) {
-                    succs[from].push(block(to));
-                    preds[to].push(block(from));
+                for _ in 0..edges {
+                    let (from, to) = (rng.index(count), rng.index(count));
+                    if !succs[from].contains(&block(to)) {
+                        succs[from].push(block(to));
+                        preds[to].push(block(from));
+                    }
                 }
-            }
-            let mut reachable = vec![false; count];
-            let mut stack = vec![0];
-            reachable[0] = true;
-            while let Some(b) = stack.pop() {
-                for &s in &succs[b] {
-                    if !reachable[index(s)] {
-                        reachable[index(s)] = true;
-                        stack.push(index(s));
+                let mut reachable = vec![false; count];
+                let mut stack = vec![0];
+                reachable[0] = true;
+                while let Some(b) = stack.pop() {
+                    for &s in &succs[b] {
+                        if !reachable[index(s)] {
+                            reachable[index(s)] = true;
+                            stack.push(index(s));
+                        }
+                    }
+                }
+                let fast = Dominators::of_graph(
+                    frame,
+                    count,
+                    Some(0),
+                    |it| succs[it].as_slice(),
+                    |it| preds[it].as_slice(),
+                );
+                let want = naive(count, &preds, &reachable);
+                for a in 0..count {
+                    for b in 0..count {
+                        let want = reachable[b] && reachable[a] && want[b][a];
+                        assert_eq!(
+                            fast.dominates(block(a), block(b)),
+                            want,
+                            "round {round}: {a} dom {b}"
+                        );
                     }
                 }
             }
-            let fast = Dominators::of_graph(
-                count,
-                Some(0),
-                |it| succs[it].as_slice(),
-                |it| preds[it].as_slice(),
-            );
-            let want = naive(count, &preds, &reachable);
-            for a in 0..count {
-                for b in 0..count {
-                    let want = reachable[b] && reachable[a] && want[b][a];
-                    assert_eq!(
-                        fast.dominates(block(a), block(b)),
-                        want,
-                        "round {round}: {a} dom {b}"
-                    );
-                }
-            }
-        }
+        });
     }
 }

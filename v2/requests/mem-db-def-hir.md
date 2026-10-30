@@ -15,7 +15,7 @@ What the slice is, for the allocator:
   function (`rg 'salsa::tracked|salsa::interned' crates/hir/src` is empty). `db.rs` is
   re-exports; `check.rs` runs plane tasks through `Db::run_all`, which are not query runs;
   `evict.rs` and `match_lints.rs` are plain functions. So no file here opens
-  `blaze_mem::frame::current`, with one exception: `SymbolCollector` (`symbols.rs`) runs only
+  a frame, with one exception: `SymbolCollector` (`symbols.rs`) runs only
   inside ide-db's tracked `module_symbols`, `library_symbols` and `extern_prelude_symbols`, so it
   takes the frame they open (R9).
 - **Everything else is a hit path outside any query run**: an IDE request makes a `Semantics`,
@@ -36,6 +36,16 @@ Rules every change keeps:
 - No new `dyn`. R3's walk keeps the `&mut dyn FnMut` callback `descend_into_macros_impl` already
   takes. If dedyn's agents have made that generic by the time this is applied, the new
   `descend_into_macros_walk` takes the same generic `F` instead. Their edits stay.
+- No new syntax handles. Code that is new here finds syntax through `syntax::view`, never by
+  walking `SyntaxNode`/`SyntaxToken`. The R12 tests find their targets as views and keep them
+  as `TextRange`s and `SyntaxNodePtr`s; they make a handle only where `Semantics`' public API
+  still takes one. The shelves of R1 and the carried tables of R2 hold the types the existing
+  walk already passes around: `SyntaxToken`, and `SyntaxNode` as a map key. They change no
+  handle code into new handle code. When frontend-tree moves the walk to views, those element
+  types become `NodeId`s or token indices, since a borrowed view cannot sit on a `'static`
+  shelf. frontend-tree's agents may already have moved some functions named here to views. If
+  so, apply the change to the moved function, keep their edits, and keep the buffer change as
+  written.
 
 ## R1. New module `crates/hir/src/scratch.rs`, and `mod scratch;` in `src/lib.rs`
 
@@ -158,6 +168,9 @@ shelf is the one in `blaze_mem::scratch` (`with` unshelves, empties, runs, empti
 the nesting and the `DEPTH` bound are blaze-mem's.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+
+
+> applied by db-mem-def (21:40): R1, `crates/hir/src/scratch.rs` and `mod scratch;`. Differs: R10b's `Importables`, `IMPORTABLES_SEEN` and `LentCopied` are not in it yet (they wait with R10b); `recycle`, `with_clauses` and R5's `LentDrain` are.
 
 ## R2. `Semantics` caches carried from one request to the next on a thread
 
@@ -505,6 +518,9 @@ until the thread's next `Semantics` clears it; that is one request's worth.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
 
+
+> applied by db-mem-def (21:40): R2, both halves: `source_to_def.rs` (`expansion_at`/`expansions`, `crates_of`, `Carry`, `take`/`give`) and `semantics.rs` (`SemanticsImpl::new` takes the carry, `new_within` clears the file answers, `Drop` gives it back; the `Drop` impl sits just before `impl SemanticsImpl`).
+
 ## R3. `descend_into_macros_impl`'s stack on shelves (`semantics.rs:1232`)
 
 What allocates now, per call: `stack: Vec<(_, SmallVec<[_; 2]>)> = vec![]` grows on the first
@@ -734,6 +750,14 @@ three buffers from the shelf (R1), so the walk above is never aliased.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
 
+
+> db-expand-names (2026-10-29) adds `db` to `derive_helpers_in_scope` and `diagnostics_of`
+> (`v2/requests/db-expand.md`, "db-expand-names: frontend-bodies R1's callers outside hir-def").
+> Their call in this walk (the derive-helper branch, `semantics.rs` 1545 after R3) is in the part
+> R3 leaves unchanged. The two edits are independent: their argument goes on top of R3 as applied.
+
+> applied by db-mem-def (21:40): R3 as written: `descend_into_macros_impl` lends `DescendGroups` and two `DescendTokens`, the walk is `descend_into_macros_walk`, the derive branch collects into `DescendCalls`.
+
 ### R3b. The other descend helpers
 
 - `descend_token_into_include_expansion` (line 979): the `SmallVec<[_; 2]>` it builds only to
@@ -809,6 +833,9 @@ After (the second walk and its closure unchanged, inside the lend):
   visitor forms already; R11 asks the callers that only iterate to use them.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+
+
+> applied by db-mem-def (21:40): R3b as written (`Iterator::last`; `DescendFirsts` in `descend_node_into_attributes`).
 
 ## R4. `kmerge_by` of at most two iterators, without the heap (`semantics.rs`)
 
@@ -920,6 +947,9 @@ After:
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
 
+
+> applied by db-mem-def (21:40): R4 as written, with `kmerge2` and `KMerge2` `pub(crate)` for R12's test; `head` is a plain `let` (it captures nothing mutable). `Itertools` stays (`.join`).
+
 ## R5. The rest of `semantics.rs`' per-call buffers
 
 - `SemanticsScope::speculative_resolve` (line 2796): `let mut segments = vec![];` becomes
@@ -987,6 +1017,9 @@ impl<B: Shelved + DerefMut<Target = Vec<T>>, T: Default> DoubleEndedIterator for
 - `find_file`'s panic message (line 2373) formats only on the panic path.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+
+
+> applied by db-mem-def (21:40): R5: `speculative_resolve`'s `SmallVec<[Name; 8]>`, `lint_attrs` on the `LintAttrs` shelf returning `LentDrain`, `LintAttr: Default` (`#[default] Allow`).
 
 ## R6. `Module`, `Crate`, `Adt`, `Trait`, `Impl` accessors: iterator forms beside the `Vec` ones (`lib.rs`)
 
@@ -1162,6 +1195,9 @@ Callers in other crates: R11.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
 
+
+> applied by db-mem-def (21:40): R6, the iterator forms and hir's callers (`attrs.rs`, `term_search/tactics.rs`, `tests/api.rs`). `Module::children` returns its iterator without collecting.
+
 ## R7. `display.rs`
 
 Display runs per hover, at the edge, but per call it builds three vectors.
@@ -1263,6 +1299,9 @@ pub(crate) fn with_clauses<'db, R>(
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
 
+
+> applied by db-mem-def (21:40): R7 as written (`visible_fields` into a lent `Fields`, `Variants` for enums, `with_clauses` for the derive bounds and `TypeParam::hir_fmt`).
+
 ## R8. `attrs.rs`, `has_source.rs`, `from_id.rs`
 
 Read in full for per-call buffers: `has_source.rs` and `from_id.rs` make none (conversions and
@@ -1270,6 +1309,8 @@ Read in full for per-call buffers: `has_source.rs` and `from_id.rs` make none (c
 in R6. Nothing else to change.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+
+> applied by db-mem-def (21:40): nothing to change; `attrs.rs:589` is on `fields_iter` (R6).
 
 ## R9. `SymbolCollector` on the query's frame (`symbols.rs`), the one query-run code here
 
@@ -1426,6 +1467,9 @@ The callers pass the frame (R11, ide-db).
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
 
+
+> applied by db-mem-def (21:40): R9 as written (`SymbolCollector<'db, 'f>` on the frame; `new(db, frame, ..)`, `new_module(db, frame, ..)`). ide-db's callers already pass the frame.
+
 ## R10. `SourceAnalyzer::resolve_path` re-lowers the path into a whole store (`source_analyzer.rs:1285`, `:1492`)
 
 Per call, a path that inference did not resolve (every type path, `use` path and item path, and
@@ -1448,6 +1492,20 @@ held by speed-hir-store; asked there, see below), the second here:
    (a `Drop`, or `ExprCollector::discard(self)`), and `ExprCollector::new` plus `lower_path` of a
    path with no generic arguments must allocate nothing on warm scratch. Then a path lowered only
    to be resolved costs no allocation.
+
+> applied by mem-format (21:40), part 1: `impl Drop for ExpressionStoreBuilder` gives an unfinished
+> builder's scratch back to the pool. `finish` and `Drop` share `take_scratch`, and an empty set is
+> not pooled, where it would shadow a grown one. The collector's eight stacks (`path_segments`,
+> `path_generic_args`, `generic_args`, `assoc_bindings`, `fn_params`, `closure_params`,
+> `label_ribs`, `unowned_bindings`) are now one `Stacks` taken from a per-thread pool and given
+> back on drop. Before, they were fresh `Vec`s per collector, and a plain path's first segment
+> allocated. Tests: `an_unfinished_builder_gives_its_scratch_back` (expr_store.rs) and
+> `a_warm_plain_path_lookup_allocates_nothing` (lower/path/tests.rs: `ExprCollector::new` with
+> `LoweringMode::Ide`, `lower_path("a::b::C")`, dropped, budget 0). `SEGMENT_LOWERING_MAP`'s
+> test-only recording is opt-in (`RECORD_SEGMENTS`), so it doesn't count against the budget. If
+> the salsa reads in `with_maps` (`local_def_map`, `cfg_options`, `span_map`) allocate on a
+> memo hit, the test names them. Nothing built. Part 2 (`finish` only when the store is read)
+> is crates/hir's to apply.
 2. **Here**: `finish` only when the store is read. In `resolve_path` (lines 1285 to 1293).
    Before:
 
@@ -1518,6 +1576,9 @@ mem-db-def-resolve's slice; asked there:
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
 
+
+> not applied by db-mem-def (21:46): part 2 waits on format. Since paths became columns, `resolve_path` and `resolve_hir_path_per_ns` read `hir_path` through `store.path_at(..)` after `finish`, so the store is read on every call, and hir can't read a path from an unfinished builder (`ExpressionStoreBuilder::path_at` is `pub(crate)`, `crates/hir-def/src/expr_store/path.rs:1304`). Filed in `v2/requests/db.md` ("mem-db-def: format, `ExpressionStoreBuilder::path_at` public"). Once it is `pub`, read both paths from the builder, compute `reads_store` from them, and `finish` only when it is set. Part 1 is mem-format's, applied. The resolver half (`can_use_trait_methods`, `process_all_names`) is applied, see mem-db-def-resolve.md.
+
 ## R10b. `Crate::query_external_importables` without a set per search (`lib.rs:376`)
 
 Per completion request, `import_map::search_dependencies` builds a fresh
@@ -1535,7 +1596,10 @@ depend on the buffers' history. The set only dedups.
 
 - **Asked of mem-db-def-items** (window `mem-db-def-items-next1`): beside
   `search_dependencies_into`, the visitor it is built from, with the loop of I6.2 unchanged and
-  `found.insert(..)` becoming `f(..)`:
+  `found.insert(..)` becoming `f(..)`. **Taken** (2026-10-29): it is in
+  `v2/requests/mem-db-def-items.md` I6.2, with `search_dependencies_into` built on it. Its order
+  is the dependencies in order, then each one's runs in key order. Its test is
+  `each_is_free_and_in_a_fixed_order` (I12.3). The body below needs it to have landed first.
 
 ```rust
 /// Calls `f` on each importable name of `krate`'s dependencies that matches `query`, in the
@@ -1707,12 +1771,16 @@ hir-def's `search_runs`, which is mem-db-def-items' I6.2 budget.)
 
 > forwarded to db (db-next2, `crates/hir/`) (requests, pass 19; told by tmux).
 
+
+> not applied by db-mem-def (21:40): R10b waits on items' `search_dependencies_each` (`crates/hir-def/src/import_map.rs`), not in the tree.
+> handed to db-audit-mem (22:38): `path_at` (`expr_store/path.rs:1304`) and `search_dependencies_each` (`import_map.rs:681`) are in, and db-audit-mem is applying R10 part 2 and R10b in `source_analyzer.rs`, hir `lib.rs`, `scratch.rs` and `tests/budget.rs`. db-mem-def is in none of them.
+
 ## R11. Callers outside `crates/hir/` (owners from `docs/v2/plan/reference/crates.md`)
 
 - **ide-db** (coordinator; `crates/ide-db/` until it is removed at integration):
   `symbol_index.rs:374`, `:403`, `:422` make the collector inside `module_symbols`,
   `library_symbols`, `extern_prelude_symbols`. Each body opens the run's frame at its top and
-  passes it: `blaze_mem::frame::current(|frame| { ... SymbolCollector::new(db, frame, true) ... })`,
+  passes it: `blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| { ... SymbolCollector::new(db, frame, true) ... })`,
   and `SymbolCollector::new_module(db, frame, module, false)`. The tests at `:719` and `:746`
   run outside a query, so they open a task: `blaze_mem::frame::task(blaze_mem::Tag::Nameres,
   |frame| SymbolCollector::new_module(&db, frame, module_id, false))`. ide-db gains
@@ -1730,6 +1798,10 @@ hir-def's `search_runs`, which is mem-db-def-items' I6.2 budget.)
   references already). On 2026-10-29 that `rg` over the hir-dependent crates finds 126 lines.
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+> applied (the ide-db bullet; ide-db is requests'): `symbol_index.rs`' `library_symbols`, `module_symbols` and `extern_prelude_symbols` open the run's frame with `blaze_mem::frame::current` and pass it to `SymbolCollector::new`/`new_module`; the two tests open `frame::task(Tag::Nameres, ..)`; ide-db already depends on blaze-mem. Its iterate-only `declarations`/`impl_defs`/`variants` callers: none (the two `variants` calls match a slice). R9's `Tag::Nameres` on the three queries waits on salsa's `mem_tag` (mem-db-salsa M2; `vendor/salsa*` doesn't take it yet) (requests, pass 23).
+
+
+> filed by db-mem-def (21:40): ide-db's `SymbolCollector` callers are in already; the iterate-only callers' move to the `_iter` forms is filed in `v2/requests/db.md` ("mem-db-def: iterator forms of hir's accessors") under the coordinator, diagnostics, codegen and items.
 
 ## R12. Budget tests (`crates/hir/src/tests/budget.rs`, and `mod budget;` in `tests.rs`)
 
@@ -1744,8 +1816,9 @@ The whole file:
 //! Allocation budgets of `Semantics`' hit paths and the accessors' iterator forms: none once
 //! the thread's buffers have grown and the database is warm.
 
+use base_db::EditionedFileId;
 use blaze_alloc_count::assert_at_most;
-use syntax::{AstNode, SyntaxKind, ast};
+use syntax::{AstNode, SyntaxKind, SyntaxNodePtr, TextRange, ast, view};
 use test_fixture::WithFixture;
 
 use super::db::TestDB;
@@ -1768,22 +1841,84 @@ fn main() {
 }
 "#;
 
-/// Whether `path`'s last segment is the identifier `text` (compared as `&str`, so nothing is
-/// formatted inside a measured closure).
-fn ends_in(path: &ast::Path, text: &str) -> bool {
+/// What the tests ask `Semantics` about, found once through the file's views (outside every
+/// measured closure) and kept as ranges and pointers, which outlive the views.
+struct Targets {
+    origin: TextRange,
+    p_in_macro: TextRange,
+    dot_path: SyntaxNodePtr,
+    point_ty: SyntaxNodePtr,
+    strukt: SyntaxNodePtr,
+    field: SyntaxNodePtr,
+    module: SyntaxNodePtr,
+}
+
+/// Whether `path`'s last segment is the identifier `text`.
+fn ends_in(path: view::Path<'_>, text: &str) -> bool {
     path.segment()
         .and_then(|it| it.name_ref())
         .and_then(|it| it.ident_token())
         .is_some_and(|it| it.text() == text)
 }
 
-/// The token of `text` (the first) in `file`'s tree.
-fn token(file: &ast::SourceFile, text: &str) -> syntax::SyntaxToken {
-    file.syntax()
-        .descendants_with_tokens()
-        .filter_map(|it| it.into_token())
-        .find(|it| it.text() == text)
-        .unwrap_or_else(|| panic!("no token `{text}` in the fixture"))
+fn targets(db: &TestDB, file_id: EditionedFileId) -> Targets {
+    use view::AstNode as _;
+    let parse = file_id.parse(db);
+    let root = parse.root();
+    let ident = |at: view::Node<'_>, text: &str| {
+        at.descendants_with_tokens()
+            .filter_map(|it| it.into_token())
+            .find(|it| it.kind() == SyntaxKind::IDENT && it.text() == text)
+            .unwrap_or_else(|| panic!("no identifier `{text}` in the fixture"))
+            .text_range()
+    };
+    let first = |what: &str, found: Option<view::Node<'_>>| {
+        view::ptr(found.unwrap_or_else(|| panic!("no {what} in the fixture")))
+    };
+    let token_tree = root
+        .descendants()
+        .find_map(view::MacroCall::cast)
+        .and_then(|call| call.token_tree())
+        .expect("the call `id!`");
+    let strukt = root.descendants().find_map(view::Struct::cast).expect("`struct Point`");
+    Targets {
+        origin: ident(root, "origin"),
+        p_in_macro: ident(token_tree.syntax(), "p"),
+        dot_path: first(
+            "path `Shape::Dot`",
+            root.descendants()
+                .filter_map(view::Path::cast)
+                .find(|it| ends_in(*it, "Dot") && it.qualifier().is_some())
+                .map(|it| it.syntax()),
+        ),
+        point_ty: first(
+            "return type `Point`",
+            root.descendants()
+                .filter_map(view::PathType::cast)
+                .find_map(|it| it.path())
+                .map(|it| it.syntax()),
+        ),
+        strukt: view::ptr(strukt.syntax()),
+        field: first(
+            "field `x`",
+            strukt.syntax().descendants().find(|it| view::RecordField::can_cast(it.kind())),
+        ),
+        module: first(
+            "`mod inner`",
+            root.descendants().find(|it| view::Module::can_cast(it.kind())),
+        ),
+    }
+}
+
+// `Semantics`' API still takes handles, so each test turns a target into one at the call and
+// nowhere else: `token_at` and `node_at` go when frontend-tree moves `Semantics` to views.
+
+fn token_at(file: &ast::SourceFile, range: TextRange) -> syntax::SyntaxToken {
+    file.syntax().covering_element(range).into_token().expect("a token's range covers a token")
+}
+
+fn node_at<N: AstNode>(file: &ast::SourceFile, ptr: SyntaxNodePtr) -> N {
+    N::cast(ptr.to_node(file.syntax())).expect("a pointer's kind is the node's")
 }
 
 /// Runs `f` once to warm the database, the thread's shelves and the carried `Semantics`
@@ -1808,23 +1943,12 @@ fn warm_then_free<R>(db: &TestDB, what: &str, mut f: impl FnMut(&Semantics<'_>) 
 fn descend_into_macros_on_a_warm_file_allocates_nothing() {
     let (db, file_id) = TestDB::with_single_file(FIXTURE);
     crate::attach_db(&db, || {
+        let at = targets(&db, file_id);
         warm_then_free(&db, "descend_into_macros", |sema| {
             let file = sema.parse(file_id);
-            let p = token(&file, "origin");
-            let p = sema.descend_into_macros(p);
-            assert!(!p.is_empty());
-            let in_macro = file
-                .syntax()
-                .descendants()
-                .find_map(ast::MacroCall::cast)
-                .and_then(|call| call.token_tree())
-                .and_then(|tt| {
-                    tt.syntax()
-                        .children_with_tokens()
-                        .filter_map(|it| it.into_token())
-                        .find(|it| it.kind() == SyntaxKind::IDENT && it.text() == "p")
-                })
-                .expect("`p` in `id!`");
+            let origin = sema.descend_into_macros(token_at(&file, at.origin));
+            assert!(!origin.is_empty());
+            let in_macro = token_at(&file, at.p_in_macro);
             let mut found = 0u32;
             sema.descend_into_macros_cb(in_macro, |_, _| found += 1);
             assert_eq!(found, 1, "`p` maps to one token of the expansion");
@@ -1836,22 +1960,12 @@ fn descend_into_macros_on_a_warm_file_allocates_nothing() {
 fn resolve_path_through_semantics_on_a_warm_file_allocates_nothing() {
     let (db, file_id) = TestDB::with_single_file(FIXTURE);
     crate::attach_db(&db, || {
+        let at = targets(&db, file_id);
         warm_then_free(&db, "resolve_path", |sema| {
             let file = sema.parse(file_id);
-            let path = file
-                .syntax()
-                .descendants()
-                .filter_map(ast::Path::cast)
-                .find(|it| ends_in(it, "Dot") && it.qualifier().is_some())
-                .expect("the path `Shape::Dot`");
-            let resolved = sema.resolve_path(&path);
-            assert!(resolved.is_some(), "`Shape::Dot` resolves");
-            let ty_path = file
-                .syntax()
-                .descendants()
-                .filter_map(ast::PathType::cast)
-                .find_map(|it| it.path())
-                .expect("the return type `Point`");
+            let path: ast::Path = node_at(&file, at.dot_path);
+            assert!(sema.resolve_path(&path).is_some(), "`Shape::Dot` resolves");
+            let ty_path: ast::Path = node_at(&file, at.point_ty);
             assert!(sema.resolve_path(&ty_path).is_some(), "`Point` resolves");
         });
     });
@@ -1861,25 +1975,14 @@ fn resolve_path_through_semantics_on_a_warm_file_allocates_nothing() {
 fn to_def_on_a_cached_node_allocates_nothing() {
     let (db, file_id) = TestDB::with_single_file(FIXTURE);
     crate::attach_db(&db, || {
+        let at = targets(&db, file_id);
         warm_then_free(&db, "to_def", |sema| {
             let file = sema.parse(file_id);
-            let strukt = file
-                .syntax()
-                .descendants()
-                .find_map(ast::Struct::cast)
-                .expect("`struct Point`");
+            let strukt: ast::Struct = node_at(&file, at.strukt);
             let def = sema.to_struct_def(&strukt).expect("`Point` has a def");
-            let field = strukt
-                .syntax()
-                .descendants()
-                .find_map(ast::RecordField::cast)
-                .expect("the field `x`");
+            let field: ast::RecordField = node_at(&file, at.field);
             assert!(sema.to_def(&field).is_some(), "`x` has a def");
-            let module = file
-                .syntax()
-                .descendants()
-                .find_map(ast::Module::cast)
-                .expect("`mod inner`");
+            let module: ast::Module = node_at(&file, at.module);
             assert!(sema.to_module_def(&module).is_some(), "`inner` has a def");
             def
         });
@@ -2001,3 +2104,5 @@ first `Semantics` of a thread finds no carry (a `Semantics` made at another revi
 first on a thread, rebuilds them: that is a miss, not held to 0).
 
 > forwarded to db (`crates/hir/`) (from requests, pass 17; told by tmux).
+
+> applied by db-mem-def (21:40): R12, `crates/hir/src/tests/budget.rs` as written and `mod budget;` after `mod api;`. `resolve_path_through_semantics_on_a_warm_file_allocates_nothing` holds R10 too, which is not applied yet.

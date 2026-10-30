@@ -10,8 +10,9 @@ Owners (`docs/v2/plan/reference/crates.md`): every file is lane db's; `method_re
 items' as well. Neither is done, so every change below is a request; each entry names its owners.
 Lines are as of 2026-10-29 (UTC-7); other agents edit these files, so each entry quotes the
 "before" code to find it by. Lane dedyn may edit these files (replacing hot `dyn` with concrete
-types, enums or generics); where its edit changed a quoted line, apply the entry to the line as it
-is now and keep dedyn's change. `db` parameters (`&Db`, `&'db Db`) are left exactly as they are; the
+types, enums or generics), and lane frontend-tree may move `SyntaxNode` callers to `syntax::view`;
+where either changed a quoted line, apply the entry to the line as it is now and keep their
+change. No entry adds a `dyn` or a `SyntaxNode` use. `db` parameters (`&Db`, `&'db Db`) are left exactly as they are; the
 code holds unchanged if they go back to `&dyn HirDatabase`.
 
 Notes and the speed-of-light bound: `docs/v2/plan/lanes/mem/db-infer-method.md` (and "Speed" at
@@ -97,6 +98,7 @@ pub(crate) type FrameSet<'f, T> = hashbrown::HashSet<T, FxBuildHasher, &'f Frame
 `FxBuildHasher` is already imported in `method_resolution.rs` (`hash_self_ty` uses it).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b (22:05): as mem-db-infer.md section 5 says, `pub(crate) use crate::{FrameMap, FrameSet};` after the `pub use self::{..}` block (`blaze_mem::Frame` was already imported).
 
 ## Hot path: method calls and paths
 
@@ -169,6 +171,8 @@ After:
 `self.write_expr_adj(receiver, &result.adjustments);`
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+> applied by frontend-fast-method (holder of `method_resolution.rs`): the `frame` field, `frame: self.frame` in `with_method_resolution`, the `impl<'db, 'f> InferenceContext<'db, 'f>` header, and `write_expr_adj(receiver, &result.adjustments)`. H1/H2 can go in; they also need `TraitsInScope` (`v2/requests/mem-db-infer-ctx.md`, "frontend-fast-method: yes to A10/M1's split", items 2 and 3).
 
 ### P2. `ProbeContext`'s lists in the frame (probe.rs:62-72, 891-911, lane db + items)
 
@@ -250,6 +254,7 @@ both array elements have the same type, and `&Vec<_, A>` derefs to `&[_]`. The l
 and take frame space only when a candidate is pushed.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b (22:05): as written, with `frame_set(frame)` (lib.rs) for `FrameSet::with_hasher_in`; imports `crate::{FrameSet, frame_set}` and `blaze_mem::Frame`. `FxHashSet` stays (the collapse sets).
 
 ### P3. Probe's autoderef steps in the frame (probe.rs:246-256, 343, 497-498, 522, 546, lane db + items)
 
@@ -350,6 +355,8 @@ then unused: the import becomes `use smallvec::SmallVec;`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
+> superseded by frontend-fast-method: `probe_op` borrows the steps in place from the steps cache (`pick_cache::with_steps`) or from one `method_autoderef_steps` call, and `Mode::Path`'s one step is inline in the `SmallVec`; there is no copy of the steps to move into the frame. Notes: docs/v2/plan/lanes/frontend/fast-method.md, section 3.3.
+
 ### P4. `ProbeForNameChoice` and `TraitValueItems` carry the frame (probe.rs:632-646, 282-300; method_resolution.rs:593-624, lane db + items)
 
 Per probe. `TraitValueItems`, before:
@@ -411,6 +418,7 @@ After:
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b (22:05): as written in `method_resolution.rs` and `probe.rs`. Two users newer than the entry: frontend-fast-method's `scope_sets.rs` (`ScopeItems::of_traits` and `TraitsInScope::named` take the caller's `frame`, the probe passes `self.frame`; the query `module_items_named` opens `frame::current`; both of the file's tracked fns get `mem_tag = Infer`) and `pick_cache/tests.rs` (its `TraitValueItems` inside `frame::task`). `crates/blaze-items/src/tests/narrow.rs:723` is lane items' crate: filed in `v2/requests/db.md`.
 
 ### P5. `ProbeAllChoice` in the frame (probe.rs:789-799, 302-309, 822-837, 627, 780-782, 881-883, lane db + items)
 
@@ -521,6 +529,7 @@ inside `with_method_resolution`'s closure with `try_for_each`, so it never outli
 (H2). `FxIndexMap` leaves probe.rs's imports (`use base_db::Db;`).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b (22:05): as written (`frame_set(frame)` for the seen set; `final_choice_from_err(choice, ..)` in the trait, both impls and `probe_steps`, where `choice` is still unmoved). `FxIndexMap` left the imports. The kept `candidate.clone()` carries a `// clone:` mark.
 
 ### P6. Autoderef steps inline (autoderef.rs:31, 40-67, 82-89, 135-146, 152, 166-169, 246-260, lane db)
 
@@ -666,7 +675,7 @@ The `XXX` comment's "`Vec::contains()`" reads "`contains`". The return type `imp
 Ty<'db>> + use<'db>` holds: `arrayvec::IntoIter` owns its items.
 
 > forwarded to db (from requests, pass 17; told by tmux).
-> applied by db-mem-infer-b (21:25): the `AutoderefSteps` `ArrayVec`, the three `Steps` defaults and the pub `autoderef`'s `ArrayVec` of 21, as written. Not yet the R2 part (`'f` on `InferenceContextAutoderefCtx`/`InferenceContextAutoderef`): waits on mem-db-infer-ctx A0 (`InferenceContext<'db, 'f>`) and lands with expr X3's callers (db-mem-infer-a's).
+> applied by db-mem-infer-b (21:25): the `AutoderefSteps` `ArrayVec`, the three `Steps` defaults and the pub `autoderef`'s `ArrayVec` of 21, as written. The R2 part (`'f` on `InferenceContextAutoderefCtx`/`InferenceContextAutoderef`) applied at 21:35, as written, once ctx A0 and expr X3's callers (`callee.rs`, `place_op.rs`) were in.
 
 ## Confirm
 
@@ -722,6 +731,8 @@ After:
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+
+> applied by frontend-fast-method, as written.
 
 ### C2. The receiver's adjustments in the frame (confirm.rs:47-51, 173, 179-245, lane db + items)
 
@@ -791,6 +802,8 @@ the frame `Vec` at most once. `use blaze_mem::Frame;` in confirm.rs.
 
 > forwarded to db (from requests, pass 17; told by tmux).
 
+> applied by frontend-fast-method, as written (`autoderef.rs`'s X2 was already in).
+
 ## Impl tables: built once at exact size (method_resolution.rs:1220-1530, 1651-1711; frozen.rs:78-122; lane db + items)
 
 > **Hold (2026-10-29 21:17):** `requests-impls` is applying `v2/requests/items.md`
@@ -825,6 +838,7 @@ trait, which is what the stable radix sort of `into_sorted` kept), runs in found
 crate's tables equal the found ones exactly as before (`Mode::Check` compares them).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-impls (22:05): the hold is over (requests-impls DONE). The rule applied to the per-module code: every table (`for_crate`, `for_module`, `for_block`, `in_module_for_trait`, `for_crate_and_trait`, frozen reads) is built by a frame builder from flat records, and the crate/bucket merges (`merge_into`, `merge_trait_into`, `merge_at`) push each module table's runs into the same builders, so first-seen order and the result stay as before. `modules_by_self_ty`/`modules_by_trait` (`SelfTyModules`, `TraitModules`) moved to the same counting construction.
 
 ### I2. New code (replaces `Runs::new`, `SelfTys::new`, `SelfTyGroups`, `OneTraitImplsBuilder`, `InherentImpls::from_groups`, `TraitImpls::from_traits`)
 
@@ -1053,6 +1067,7 @@ trait has at least one impl, as before. `radix` stays imported for `pack_32`; `r
 `method_resolution.rs` if nothing else uses it (`macros_writing_impls` no longer does, M4).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-impls (22:05): `Runs::from_groups`, `ranks`, `SelfTys::in_order`, `group_of`, `order_by_hash` and `TraitImplsBuilder` as written. Differences: the inherent builder is generic, `SelfTyRunsBuilder<'db, 'f, V>` (`columns()` gives `(SelfTys, Runs<V>)`), with `type InherentImplsBuilder<'db, 'f> = SelfTyRunsBuilder<'db, 'f, ImplId>` and its `finish`, so `modules_by_self_ty` builds `SelfTyModules` with `V = ModuleId`; trait numbering and the trait sort are shared free fns `trait_number` and `order_by_trait_id` (used by `TraitImplsBuilder` and `TraitModules::from_found`, which replaces `TraitModules::new`); maps via `crate::frame_map`. `FxHashMap` left the imports.
 
 ### I3. Collecting (method_resolution.rs:1382-1418, 1652-1711)
 
@@ -1169,6 +1184,7 @@ and `impl_holders(db, def_map.krate(), ..)` / `collect(db, block_def_map, lang_i
 for inherent impls (`builder.frame`, `builder`).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-impls (22:05): on the per-module form: both `collect_def_map(db, frame, def_map)` loop `collect_module(db, module, .., &mut builder)` and `finish()`; `collect_module` takes `&mut {Inherent,Trait}ImplsBuilder<'db, '_>`, its bodies as written, and calls `impl_holders(db, builder.frame, module.krate(db), scope)` (M6's signature, by db-mem-infer-b-queries). `merge_into`/`merge_trait_into`/`merge_at` push into the builders; `from_groups`/`from_traits` deleted.
 
 ### I4. The queries open the frame (method_resolution.rs:1332-1342, 1355-1365, 1531-1553)
 
@@ -1246,6 +1262,7 @@ body, `frozen::trait_impls(db, frame, krate)`, `Self::collect_def_map(db, frame,
 `Box::new` of the result stay: they are the memo's one allocation for its handle.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-impls (22:05): `frame::current` around `for_crate` and `for_block` of both tables, and also around the new `for_module`, `modules_by_self_ty`, `modules_by_trait`, `in_module_for_trait` and `for_crate_and_trait`; frozen reads take the frame. Tags as `mem_tag = Infer`.
 
 ### I5. Frozen reads push into the builders (frozen.rs:80-122, lane db + items)
 
@@ -1364,6 +1381,8 @@ replaced by its second copy and is now merged with the first. The encoder writes
 is the caller's.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> held by requests-items-mem: the readers need I2's `TraitImplsBuilder`/`InherentImplsBuilder` (not in `method_resolution.rs` yet) and change I4's call sites, so they cannot land apart; handed to frontend-fast-method to apply with I2/I4 (`v2/requests/requests-items-mem.md`, told by tmux). `encode`'s half was already in.
+> applied by db-mem-infer-b-impls (22:05): both readers as written, with I2/I4; imports `InherentImplsBuilder`, `TraitImplsBuilder`, `blaze_mem::Frame`; `FxHashMap` stays for `FrozenImpls::maps`. dedup's cursor change (`part`, the writer) untouched (mem-db-infer.md 6 item 9).
 
 ### I6. Lookups over many crates collect exactly (method_resolution.rs:1562-1648)
 
@@ -1521,6 +1540,7 @@ fn crates_containing_incoherent_inherent_impls(db: &Db, krate: Crate) -> Box<[Cr
 (`transitive_deps` returns base-db's owned `Vec`; see "Left as is".)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-impls (22:05): on the per-module code. `in_crate_and_deps_for_trait_and_self_ty`, `blanket_in_crate_and_deps` (both now read each crate's `for_crate_and_trait`), `in_crate_for_trait` and `in_crate_and_deps_for_trait` collect in a frame `Vec`, result exact; so does `InherentImpls::in_crate_for_self_ty`'s several-modules path (was a global `Vec` with `// alloc:`). `crates_containing_incoherent_inherent_impls` in mem-db-infer.md 6 item 8's form (B6 is in: `transitive_deps(db).iter().copied()`). Every lookup tagged `Infer`.
 
 ## Other method_resolution.rs queries (lane db + items)
 
@@ -1589,6 +1609,7 @@ The key `(name, trait, position)` is unique, so the unstable sort gives exactly 
 sort's order.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): as written, with `mem_tag = Infer` for `crate::db::INFER_TAG` (settled); `// alloc:` on the result's `collect()`.
 
 ### M2. `in_crate_trait_value_items` (583-592)
 
@@ -1610,6 +1631,7 @@ After (tag added; no frame needed):
 ```
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): as written (`mem_tag = Infer`); `TraitValueItems` (P4) left to db-mem-infer-b.
 
 ### M3. `loaded_crates` (683-763)
 
@@ -1669,8 +1691,20 @@ After: the body is wrapped in `blaze_mem::frame::current(|frame| { .. })` (tag a
 
 ```rust
     let named_in = |unnamed: &mut Vec<&base_db::BuiltDependency, &Frame>,
-                    root: &syntax::SyntaxNode| {
+                    root: syntax::view::Node<'_>| {
+        let (tree, at) = root.flat();
 ```
+
+replacing the closure's first three lines (`let named_in = |unnamed: &mut
+Vec<&base_db::BuiltDependency>, root: &syntax::SyntaxNode| {`, `let root = root.to_flat();`,
+`let (tree, at) = root.flat().expect("a flat tree");`); the rest of its body is unchanged. New
+code walks views, not `SyntaxNode` handles (lane frontend-tree). The two are the same walk:
+`SyntaxNode::to_flat` is `self.clone()`, and its `flat()` and the view's `Node::flat()` both give
+the tree the node is in and its number there (`syntax-tree/src/cursor.rs:309-323`, `view.rs:194`),
+so the same identifiers are read, lazy parts included. The file loop's call, before:
+`named_in(&mut unnamed, &file.parse(db).syntax_node());` after:
+`named_in(&mut unnamed, file.parse(db).root());` (`Parse::root`, `syntax/src/view.rs:170`; the
+parse lives to the end of the statement).
 
 ```rust
     'modules: for (_, module) in def_map.modules(db) {
@@ -1688,7 +1722,7 @@ After: the body is wrapped in `blaze_mem::frame::current(|frame| { .. })` (tag a
             {
                 continue;
             }
-            named_in(&mut unnamed, &call.parse_macro_expansion(db).value.0.syntax_node());
+            named_in(&mut unnamed, call.parse_macro_expansion(db).value.0.root());
         }
     }
     let mut loaded = FrameSet::with_hasher_in(FxBuildHasher, frame);
@@ -1708,6 +1742,7 @@ method_resolution.rs if other code uses it (`with_incoherent_inherent_impls` cal
 check at apply time).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): the closure was already on `syntax::view::Node` (frontend-tree), so only its `&mut Vec<_, &Frame>` parameter changed; the set is `crate::frame_set(frame)`; `FxHashSet` had no other use in the file and was dropped from the `rustc_hash` import.
 
 ### M4. `macros_writing_impls` (992-1051) and `macro_definitions` (1057-1132)
 
@@ -1894,6 +1929,7 @@ map's macro names), which outlive the run. The only caller of `macro_definitions
 function (`rg -n "macro_definitions\(" crates`).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): as written, with `crate::frame_map`/`crate::frame_set(frame)` for `with_hasher_in`, a type on the sort closure's argument, `mem_tag = Infer`, and the body reindented inside `current`.
 
 ### M5. `impls_in_bodies` (887-982)
 
@@ -1940,6 +1976,7 @@ After (body in `blaze_mem::frame::current(|frame| { .. })`, tag added):
 regrown); the result is one exact allocation.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): as written (`tokens` typed `Vec<usize, &Frame>`), body reindented inside `current`, `mem_tag = Infer`.
 
 ### M6. `impl_holders` returns a frame `Vec` (775-807)
 
@@ -1967,6 +2004,7 @@ fn impl_holders<'f>(
 path of the finding queries takes the caller's frame.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): as written. Its two callers in `InherentImpls`/`TraitImpls::collect_module` are I3's (`builder.frame`), left to db-mem-infer-b-impls (told by tmux).
 
 ### M7. `impl_work` (1136-1145): entry point outside queries
 
@@ -2006,6 +2044,7 @@ pub fn impl_work(db: &Db, krate: Crate) -> Vec<ImplWork> {
 The returned `Vec<ImplWork>` (exact) is the caller's.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): as written, with `blaze_mem::Tag::Infer` for `crate::db::INFER_TAG`. The signature is unchanged, so its callers (`blaze-engine/src/lib.rs:3835`, `blaze-items/src/tests/narrow.rs:590`) need no edit and nothing was filed.
 
 ### M8. Tags only (method_resolution.rs)
 
@@ -2017,6 +2056,7 @@ crate::db::INFER_TAG)]`. No temporaries: `lookup_impl_method_stored` runs the so
 scan a memo slice.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): the three tags, as `mem_tag = Infer`.
 
 ## opaques.rs (lane db + items)
 
@@ -2057,6 +2097,7 @@ after: `blaze_mem::frame::current(|frame| type_aliases_of(frame, &impl_id.impl_i
 crate::db::INFER_TAG)]`. `use blaze_mem::Frame;`.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `type_aliases_of(frame, items)` collects in the frame, result exact; `impl_type_aliases`/`trait_type_aliases` open `frame::current`, tag `mem_tag = Infer`.
 
 ### O2. `rpit_hidden_types` (143-155)
 
@@ -2096,6 +2137,7 @@ inserted, so there are none. `return_position_impl_trait_types` is a filter over
 opaque table (`infer.rs:1700`), cheap to walk twice; no frame needed.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `ArenaMap::with_capacity(highest index + 1)`, no `shrink_to_fit`; tag `Infer`.
 
 ### O3. `defining_functions` (267-274), `define_opaque_functions` (296-302), `define_opaque_at` (380-385)
 
@@ -2176,6 +2218,7 @@ Each with `mem_tag = crate::db::INFER_TAG`. `tait_hidden_types` (157): tag only;
 sizes its map once (`ArenaMap::with_capacity(taits_count)`).
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `defining_functions`, `define_opaque_functions` (nested `collect`/`holder` take `&mut Vec<FunctionId, &Frame>`) and `define_opaque_at` collect in `frame::current`, results exact; all three and `tait_hidden_types` tagged `Infer`.
 
 ### O4. `opaque_types_defined_by` and helpers
 
@@ -2183,6 +2226,8 @@ Fill the caller's `&mut Vec` (`next_solver/interner.rs:2277, 2289`, mem-db-solve
 here. Whether that `Vec` moves to a frame is the solver's entry.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> seen by requests-items-mem: no change here, as the entry says (the `Vec` is mem-db-solver's).
+> applied: nothing to change (requests-items-mem's note: O4 needs nothing).
 
 ## specialization.rs (lane db + items)
 
@@ -2322,6 +2367,7 @@ Imports: `use blaze_mem::Frame;`, `use rustc_hash::FxBuildHasher;` (replacing `F
 crate::method_resolution::{FrameSet, SelfTyKey, TraitImpls};`. `specializes_query` (55): tag only.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `parameters_for`/`Collect<'a, 'f>` over `FrameSet`, `constrained_params(db, frame, impl_id)` with frame sets and a frame `Vec` of projections, `impl_has_unconstrained_params` in `frame::current`, `impl_unconstrained_params` in `frame::task(INFER_TAG, ..)`, `specializes_query` tagged. Departure: `crate::{FrameSet, frame_set}` from `lib.rs` (mem-db-infer section 5) in place of `method_resolution::FrameSet` and `with_hasher_in`; `SmallVec` stays for `specialized_ancestor`.
 
 ## drop.rs (lane db + items)
 
@@ -2381,6 +2427,7 @@ it is called. Imports: `use blaze_mem::Frame;`, `use rustc_hash::FxBuildHasher;`
 `destructor` (20): tag only. `is_freeze` has no temporaries.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `has_drop_glue` opens `frame::task(INFER_TAG, ..)` over the new `pub fn has_drop_glue_in(frame, ..)`, `has_drop_glue_impl` takes `&mut FrameSet<'_, Ty>` (`crate::frame_set`), `destructor` tagged `Infer`. Callers with a frame move to `has_drop_glue_in` in their own parts.
 
 ## inhabitedness.rs (lane db)
 
@@ -2611,7 +2658,7 @@ and `rest` assertions (both tests keep their assertions: bits 0, 5, 63, 64, 130 
 `use blaze_mem::Frame;`. `representability` (28): tag only.
 
 > forwarded to db (from requests, pass 17; told by tmux).
-> applied by db-mem-infer-b (21:25): as written, tags as `mem_tag = Infer` (salsa M2 takes a variant ident). The dedup request onto `blaze_ids::bits` (`v2/requests/db.md` "dedup: bits: hir-ty `ParamsInRepr`") is still pending; db-apply-ty told to apply it to the builder form.
+> applied by db-mem-infer-b (21:25): as written, tags as `mem_tag = Infer` (salsa M2 takes a variant ident). The dedup request onto `blaze_ids::bits` (`v2/requests/db.md` "dedup: bits: hir-ty `ParamsInRepr`") is still pending; db-apply-ty told to apply it to the builder form. Done by db-apply-ty (21:40): `ParamsInRepr = Bits<SmallVec<[u64; 1]>>`, the builder's words a frame `Bits<Vec<u64, &Frame>>`; tags and `frame::current` kept.
 
 ## traits.rs (lane db + items)
 
@@ -2667,6 +2714,8 @@ After: the whole body inside `blaze_mem::frame::task(crate::db::INFER_TAG, |fram
 the global one.)
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: the body runs in `frame::task(INFER_TAG, ..)` and the clauses are a frame `Vec`.
+> held by requests-items-mem: the `frame` argument to `TyLoweringContext::new` waits on mem-db-infer-lower's R2 (`lower.rs`'s `new` takes no frame yet); whoever lands R2 adds `frame,` after `LifetimeLoweringMode::Bound,` here.
 
 ### T2. Tags only
 
@@ -2676,6 +2725,7 @@ crate::db::INFER_TAG)]`. Both return `bool` and allocate nothing of their own (t
 an exact `Vec<bool>` the caller (`blaze-items/src/form.rs:753`) owns: no change.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-items-mem: `inherent_impl_coherent` and `orphan_rules_hold` take `mem_tag = Infer`.
 
 ## Callers outside hir-ty (lane db: `crates/hir`)
 
@@ -2722,7 +2772,7 @@ After:
 (`PickResult<'db>` borrows nothing of the frame.)
 
 > forwarded to db (from requests, pass 17; told by tmux).
-> not applied by db-mem-infer-b (21:25): waits on P1 (`MethodResolutionContext::frame`, lane items' `method_resolution.rs`; filed in `v2/requests/db.md` "mem-db-infer-method, for lane items") and on `blaze-mem` in `crates/hir/Cargo.toml`.
+> applied by db-mem-infer-b (21:55): as written, once P1's `frame` field was in; the literal keeps db-mem-infer-a-ctx's `TraitsInScope::Set(TraitSet::collect(..))` (frontend-fast-method's type, superseding ctx M1). `blaze-mem` was already in `crates/hir/Cargo.toml`.
 
 ### H2. `crates/hir/src/lib.rs:5782-5814` (`Type::with_method_resolution`)
 
@@ -2766,7 +2816,7 @@ After:
 iterator is consumed inside `f` at both call sites (5871, 5972).
 
 > forwarded to db (from requests, pass 17; told by tmux).
-> not applied by db-mem-infer-b (21:25): waits on P1, as H1.
+> applied by db-mem-infer-b (21:55): as written. `traits_in_scope,` left as it was for db-mem-infer-a-ctx's `TraitsInScope::Set(..)` edit.
 
 ## Tracked functions: tag and memo result
 
@@ -2817,6 +2867,8 @@ of one memoized value.
 own attribute (1330, 1529) takes no tag; its methods do.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-impls (22:05), the `InherentImpls`/`TraitImpls` rows and `crates_containing_incoherent_inherent_impls`: `mem_tag = Infer` on all of them and on requests-impls' new ones (`InherentImpls::{for_module, modules_by_self_ty, modules_of_self_ty, in_module_for_self_ty}`, `TraitImpls::{for_module, modules_by_trait, modules_of_trait, in_module_for_trait, for_crate_and_trait}`). The other rows are db-mem-infer-b-queries' (M1-M8) and requests-items-mem's.
+> applied by db-mem-infer-b-queries (21:59): the M1 to M8 rows (method_resolution.rs 428 to 1057), as `mem_tag = Infer`; the I, T, SP, O, D, R rows are other appliers'.
 
 ## Entry points outside queries (R1: `frame::task(INFER_TAG, ..)`)
 
@@ -2843,6 +2895,7 @@ FnMut(&TraitImpls<'db>) -> R`, passing `&mut *for_each` down) is lane dedyn's; n
 request touches those signatures or adds a `dyn`, so its edits and these apply in either order.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-queries (21:59): the `impl_work` row (M7), as `frame::task(blaze_mem::Tag::Infer, ..)`.
 
 ## R7 hit-path helpers (take the caller's frame)
 
@@ -2855,6 +2908,7 @@ request touches those signatures or adds a `dyn`, so its edits and these apply i
 its own.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by requests-method-mem (22:08): nothing left to write in lane items' files; checked that `impl_holders`, `TraitValueItems::new_in`, `ProbeAllChoice::new` and the builders (`SelfTyRunsBuilder::new`, `TraitImplsBuilder::new`, db-mem-infer-b-impls' I2) take the caller's frame and open no `current` of their own. frontend-fast-method's newer helpers follow the same rule: `ScopeItems::of_traits`/`TraitsInScope::named` take the probe's frame; only the query `module_items_named` opens `current`.
 
 ## Left as is, with why
 
@@ -3026,6 +3080,8 @@ costs no global allocation from my files (P2-P6, C2): the solver's responses (me
 what remains.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> applied by db-mem-infer-b-impls (22:05), `columns_tests`: as written, at the end of `method_resolution.rs`; `values` typed `[(u32, u32); 6]` and `by_group` given `-> Vec<u32>` so the array `map` infers. `macro_definitions_iterate_their_runs` is db-mem-infer-b-queries'.
+> applied by db-mem-infer-b-queries (21:59): `macro_definitions_iterate_their_runs` in `inert_attribute_tests`, as written; `columns_tests` is db-mem-infer-b-impls'.
 
 ## Rules that do not fit
 

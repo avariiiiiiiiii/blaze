@@ -91,6 +91,18 @@ impl LineRow {
     where
         I: IntoIterator<Item = (CodeOffset, ir::SourceLoc), IntoIter: Clone>,
     {
+        // alloc: none until the rows are counted, then exactly that many: the caller keeps them
+        let mut out = Vec::new();
+        Self::extend_ranges(&mut out, ranges);
+        out
+    }
+
+    /// [`Self::of_ranges`] onto the end of `out`, grown once to its exact length: what v2's
+    /// emit writes into the thread's kept rows ([`crate::spare::lines`]).
+    pub(super) fn extend_ranges<I>(out: &mut Vec<LineRow>, ranges: I)
+    where
+        I: IntoIterator<Item = (CodeOffset, ir::SourceLoc), IntoIter: Clone>,
+    {
         let ranges = ranges.into_iter();
         let rows = || {
             let mut last = None;
@@ -99,9 +111,8 @@ impl LineRow {
                 (last.replace(span) != Some(span)).then_some(LineRow { offset, span })
             })
         };
-        let mut out = Vec::with_capacity(rows().count());
+        out.reserve_exact(rows().count());
         out.extend(rows());
-        out
     }
 }
 

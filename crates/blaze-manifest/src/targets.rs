@@ -3,7 +3,6 @@
 //! cargo's `targets.rs` does it.
 
 use std::fmt::{self, Write as _};
-use std::fs::{self, DirEntry};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, bail};
@@ -15,6 +14,7 @@ use serde::Serialize;
 
 use crate::edit_distance::closest_msg;
 use crate::features::{Edition, Feature, Features};
+use crate::files::Files;
 use crate::manifest::deprecated_underscore;
 use crate::paths::normalize_path;
 
@@ -303,16 +303,16 @@ impl Target {
 /// A target as `cargo metadata` prints it, fields in cargo's order.
 #[derive(Serialize)]
 pub struct SerializedTarget<'a> {
-    kind: &'a TargetKind,
-    crate_types: Vec<CrateType>,
-    name: &'a str,
-    src_path: &'a PathBuf,
-    edition: String,
+    pub kind: &'a TargetKind,
+    pub crate_types: Vec<CrateType>,
+    pub name: &'a str,
+    pub src_path: &'a PathBuf,
+    pub edition: String,
     #[serde(rename = "required-features", skip_serializing_if = "Option::is_none")]
-    required_features: Option<&'a [String]>,
-    doc: bool,
-    doctest: bool,
-    test: bool,
+    pub required_features: Option<&'a [String]>,
+    pub doc: bool,
+    pub doctest: bool,
+    pub test: bool,
 }
 
 pub(crate) fn to_targets(
@@ -401,7 +401,8 @@ pub(crate) fn to_targets(
     Ok(targets)
 }
 
-pub(crate) fn normalize_lib(
+pub(crate) fn normalize_lib<F: Files>(
+    files: &F,
     original_lib: Option<&TomlTarget>,
     package_root: &Path,
     package_name: &str,
@@ -421,7 +422,7 @@ pub(crate) fn normalize_lib(
         }
         Ok(Some(lib))
     } else {
-        let inferred = inferred_lib(package_root);
+        let inferred = inferred_lib(files, package_root);
         let lib = original_lib.cloned().or_else(|| {
             inferred
                 .as_ref()
@@ -440,7 +441,7 @@ pub(crate) fn normalize_lib(
             } else {
                 let name = name_or_panic(&lib);
                 let legacy_path = Path::new("src").join(format!("{name}.rs"));
-                if edition == Edition::Edition2015 && package_root.join(&legacy_path).exists() {
+                if edition == Edition::Edition2015 && files.exists(&package_root.join(&legacy_path)) {
                     warnings.push(format!(
                         "path `{}` was erroneously implicitly accepted for library `{name}`,\n\
                          please rename the file to `src/lib.rs` or set lib.path in Cargo.toml",
@@ -506,7 +507,8 @@ fn to_lib_target(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn normalize_bins(
+pub(crate) fn normalize_bins<F: Files>(
+    files: &F,
     toml_bins: Option<&Vec<TomlTarget>>,
     package_root: &Path,
     package_name: &str,
@@ -528,7 +530,7 @@ pub(crate) fn normalize_bins(
         }
         Ok(toml_bins)
     } else {
-        let inferred = inferred_bins(package_root, package_name);
+        let inferred = inferred_bins(files, package_root, package_name);
         let mut bins = toml_targets_and_inferred(
             toml_bins,
             &inferred,
@@ -546,17 +548,16 @@ pub(crate) fn normalize_bins(
             validate_bin_crate_types(bin, edition, warnings, errors)?;
             validate_bin_proc_macro(bin, edition, warnings, errors)?;
 
-            let path =
-                target_path(bin, &inferred, TARGET_KIND_BIN, package_root, edition, &mut |_| {
-                    let legacy_path = legacy_bin_path(package_root, name_or_panic(bin), has_lib)?;
-                    warnings.push(format!(
-                        "path `{}` was erroneously implicitly accepted for binary `{}`,\n\
-                         please set bin.path in Cargo.toml",
-                        legacy_path.display(),
-                        name_or_panic(bin)
-                    ));
-                    Some(legacy_path)
-                });
+            let path = target_path(
+                files,
+                bin,
+                &inferred,
+                TARGET_KIND_BIN,
+                package_root,
+                edition,
+                Legacy::Bin { has_lib },
+                warnings,
+            );
             let path = match path {
                 Ok(path) => normalize_path(&path),
                 Err(e) => bail!("{e}"),
@@ -597,25 +598,31 @@ fn to_bin_targets(
     Ok(result)
 }
 
-fn legacy_bin_path(package_root: &Path, name: &str, has_lib: bool) -> Option<PathBuf> {
+fn legacy_bin_path<F: Files>(
+    files: &F,
+    package_root: &Path,
+    name: &str,
+    has_lib: bool,
+) -> Option<PathBuf> {
     if !has_lib {
         let rel_path = Path::new("src").join(format!("{name}.rs"));
-        if package_root.join(&rel_path).exists() {
+        if files.exists(&package_root.join(&rel_path)) {
             return Some(rel_path);
         }
     }
     let rel_path = Path::new("src").join("main.rs");
-    if package_root.join(&rel_path).exists() {
+    if files.exists(&package_root.join(&rel_path)) {
         return Some(rel_path);
     }
     let rel_path = Path::new("src").join("bin").join("main.rs");
-    if package_root.join(&rel_path).exists() {
+    if files.exists(&package_root.join(&rel_path)) {
         return Some(rel_path);
     }
     None
 }
 
-pub(crate) fn normalize_examples(
+pub(crate) fn normalize_examples<F: Files>(
+    files: &F,
     toml_examples: Option<&Vec<TomlTarget>>,
     package_root: &Path,
     edition: Edition,
@@ -623,18 +630,18 @@ pub(crate) fn normalize_examples(
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) -> anyhow::Result<Vec<TomlTarget>> {
-    let mut inferred = || infer_from_directory(package_root, Path::new(DEFAULT_EXAMPLE_DIR_NAME));
     normalize_targets(
+        files,
         TARGET_KIND_HUMAN_EXAMPLE,
         TARGET_KIND_EXAMPLE,
         toml_examples,
-        &mut inferred,
+        DEFAULT_EXAMPLE_DIR_NAME,
         package_root,
         edition,
         autodiscover,
         warnings,
         errors,
-        &mut |_| None,
+        Legacy::None,
         "autoexamples",
     )
 }
@@ -666,7 +673,8 @@ fn to_example_targets(
     Ok(result)
 }
 
-pub(crate) fn normalize_tests(
+pub(crate) fn normalize_tests<F: Files>(
+    files: &F,
     toml_tests: Option<&Vec<TomlTarget>>,
     package_root: &Path,
     edition: Edition,
@@ -674,18 +682,18 @@ pub(crate) fn normalize_tests(
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) -> anyhow::Result<Vec<TomlTarget>> {
-    let mut inferred = || infer_from_directory(package_root, Path::new(DEFAULT_TEST_DIR_NAME));
     normalize_targets(
+        files,
         TARGET_KIND_HUMAN_TEST,
         TARGET_KIND_TEST,
         toml_tests,
-        &mut inferred,
+        DEFAULT_TEST_DIR_NAME,
         package_root,
         edition,
         autodiscover,
         warnings,
         errors,
-        &mut |_| None,
+        Legacy::None,
         "autotests",
     )
 }
@@ -708,7 +716,8 @@ fn to_test_targets(
     Ok(result)
 }
 
-pub(crate) fn normalize_benches(
+pub(crate) fn normalize_benches<F: Files>(
+    files: &F,
     toml_benches: Option<&Vec<TomlTarget>>,
     package_root: &Path,
     edition: Edition,
@@ -716,36 +725,62 @@ pub(crate) fn normalize_benches(
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
 ) -> anyhow::Result<Vec<TomlTarget>> {
-    let mut legacy_warnings = vec![];
-    let mut legacy_bench_path = |bench: &TomlTarget| {
-        let legacy_path = Path::new("src").join("bench.rs");
-        if !(name_or_panic(bench) == "bench" && package_root.join(&legacy_path).exists()) {
-            return None;
-        }
-        legacy_warnings.push(format!(
-            "path `{}` was erroneously implicitly accepted for benchmark `{}`,\n\
-             please set bench.path in Cargo.toml",
-            legacy_path.display(),
-            name_or_panic(bench)
-        ));
-        Some(legacy_path)
-    };
-    let mut inferred = || infer_from_directory(package_root, Path::new(DEFAULT_BENCH_DIR_NAME));
-    let targets = normalize_targets(
+    normalize_targets(
+        files,
         TARGET_KIND_HUMAN_BENCH,
         TARGET_KIND_BENCH,
         toml_benches,
-        &mut inferred,
+        DEFAULT_BENCH_DIR_NAME,
         package_root,
         edition,
         autodiscover,
         warnings,
         errors,
-        &mut legacy_bench_path,
+        Legacy::Bench,
         "autobenches",
-    )?;
-    warnings.append(&mut legacy_warnings);
-    Ok(targets)
+    )
+}
+
+/// Where an edition 2015 target without a `path` that cargo once found elsewhere may still be.
+#[derive(Clone, Copy)]
+enum Legacy {
+    None,
+    /// `src/<name>.rs` (with no library), `src/main.rs` or `src/bin/main.rs`.
+    Bin { has_lib: bool },
+    /// `src/bench.rs`, for a benchmark named `bench`.
+    Bench,
+}
+
+impl Legacy {
+    /// The legacy path of `target` if it is there, with cargo's warning about it in `warnings`.
+    fn path<F: Files>(
+        self,
+        files: &F,
+        package_root: &Path,
+        target: &TomlTarget,
+        warnings: &mut Vec<String>,
+    ) -> Option<PathBuf> {
+        let name = name_or_panic(target);
+        let (legacy_path, kind, key) = match self {
+            Legacy::None => return None,
+            Legacy::Bin { has_lib } => {
+                (legacy_bin_path(files, package_root, name, has_lib)?, "binary", "bin")
+            }
+            Legacy::Bench => {
+                let legacy_path = Path::new("src").join("bench.rs");
+                if !(name == "bench" && files.exists(&package_root.join(&legacy_path))) {
+                    return None;
+                }
+                (legacy_path, "benchmark", "bench")
+            }
+        };
+        warnings.push(format!(
+            "path `{}` was erroneously implicitly accepted for {kind} `{name}`,\n\
+             please set {key}.path in Cargo.toml",
+            legacy_path.display(),
+        ));
+        Some(legacy_path)
+    }
 }
 
 fn to_bench_targets(
@@ -789,17 +824,19 @@ fn are_normalized_(toml_targets: Option<&[TomlTarget]>, autodiscover: Option<boo
 }
 
 #[allow(clippy::too_many_arguments)]
-fn normalize_targets(
+/// `inferred_dir`'s targets merged with the manifest's; a legacy path's warnings go after the rest.
+fn normalize_targets<F: Files>(
+    files: &F,
     target_kind_human: &str,
     target_kind: &str,
     toml_targets: Option<&Vec<TomlTarget>>,
-    inferred: &mut dyn FnMut() -> Vec<(String, PathBuf)>,
+    inferred_dir: &str,
     package_root: &Path,
     edition: Edition,
     autodiscover: Option<bool>,
     warnings: &mut Vec<String>,
     errors: &mut Vec<String>,
-    legacy_path: &mut dyn FnMut(&TomlTarget) -> Option<PathBuf>,
+    legacy: Legacy,
     autodiscover_flag_name: &str,
 ) -> anyhow::Result<Vec<TomlTarget>> {
     if are_normalized(toml_targets, autodiscover) {
@@ -814,7 +851,7 @@ fn normalize_targets(
         }
         Ok(toml_targets)
     } else {
-        let inferred = inferred();
+        let inferred = infer_from_directory(files, package_root, Path::new(inferred_dir));
         let toml_targets = toml_targets_and_inferred(
             toml_targets,
             &inferred,
@@ -832,9 +869,18 @@ fn normalize_targets(
             validate_crate_types(target, target_kind_human, edition, warnings)?;
         }
         let mut result = Vec::new();
+        let mut legacy_warnings = Vec::new();
         for mut target in toml_targets {
-            let path =
-                target_path(&target, &inferred, target_kind, package_root, edition, legacy_path);
+            let path = target_path(
+                files,
+                &target,
+                &inferred,
+                target_kind,
+                package_root,
+                edition,
+                legacy,
+                &mut legacy_warnings,
+            );
             let path = match path {
                 Ok(path) => path,
                 Err(e) => {
@@ -845,67 +891,82 @@ fn normalize_targets(
             target.path = Some(PathValue(normalize_path(&path)));
             result.push(target);
         }
+        warnings.append(&mut legacy_warnings);
         Ok(result)
     }
 }
 
-fn inferred_lib(package_root: &Path) -> Option<PathBuf> {
+fn inferred_lib<F: Files>(files: &F, package_root: &Path) -> Option<PathBuf> {
     let lib = Path::new("src").join("lib.rs");
-    package_root.join(&lib).exists().then_some(lib)
+    files.exists(&package_root.join(&lib)).then_some(lib)
 }
 
-fn inferred_bins(package_root: &Path, package_name: &str) -> Vec<(String, PathBuf)> {
+fn inferred_bins<F: Files>(
+    files: &F,
+    package_root: &Path,
+    package_name: &str,
+) -> Vec<(String, PathBuf)> {
     let main = "src/main.rs";
     let mut result = Vec::new();
-    if package_root.join(main).exists() {
+    if files.exists(&package_root.join(main)) {
         result.push((package_name.to_owned(), PathBuf::from(main)));
     }
-    result.extend(infer_from_directory(package_root, &Path::new("src").join("bin")));
+    result.extend(infer_from_directory(files, package_root, &Path::new("src").join("bin")));
     result
 }
 
-fn infer_from_directory(package_root: &Path, relpath: &Path) -> Vec<(String, PathBuf)> {
-    let Ok(entries) = fs::read_dir(package_root.join(relpath)) else {
+/// The targets in a directory by name order: each `*.rs` file, and each subdirectory with a
+/// `main.rs`, dotfiles left out.
+fn infer_from_directory<F: Files>(
+    files: &F,
+    package_root: &Path,
+    relpath: &Path,
+) -> Vec<(String, PathBuf)> {
+    let dir = package_root.join(relpath);
+    let Ok(entries) = files.list(&dir) else {
         return Vec::new();
     };
     entries
-        .filter_map(|e| e.ok())
-        .filter(is_not_dotfile)
-        .filter_map(|d| infer_any(package_root, &d))
+        .iter()
+        .filter(|(name, _)| !name.starts_with('.'))
+        .filter_map(|(name, is_dir)| infer_any(files, package_root, &dir.join(name), *is_dir))
         .collect()
 }
 
-fn infer_any(package_root: &Path, entry: &DirEntry) -> Option<(String, PathBuf)> {
-    if entry.file_type().is_ok_and(|t| t.is_dir()) {
-        infer_subdirectory(package_root, entry)
-    } else if entry.path().extension().and_then(|p| p.to_str()) == Some("rs") {
-        infer_file(package_root, entry)
+fn infer_any<F: Files>(
+    files: &F,
+    package_root: &Path,
+    path: &Path,
+    is_dir: bool,
+) -> Option<(String, PathBuf)> {
+    if is_dir {
+        infer_subdirectory(files, package_root, path)
+    } else if path.extension().and_then(|p| p.to_str()) == Some("rs") {
+        infer_file(package_root, path)
     } else {
         None
     }
 }
 
-fn infer_file(package_root: &Path, entry: &DirEntry) -> Option<(String, PathBuf)> {
-    let path = entry.path();
+fn infer_file(package_root: &Path, path: &Path) -> Option<(String, PathBuf)> {
     let stem = path.file_stem()?.to_str()?.to_owned();
-    let path = path.strip_prefix(package_root).map(|p| p.to_owned()).unwrap_or(path);
+    let path = path.strip_prefix(package_root).unwrap_or(path).to_owned();
     Some((stem, path))
 }
 
-fn infer_subdirectory(package_root: &Path, entry: &DirEntry) -> Option<(String, PathBuf)> {
-    let path = entry.path();
+fn infer_subdirectory<F: Files>(
+    files: &F,
+    package_root: &Path,
+    path: &Path,
+) -> Option<(String, PathBuf)> {
     let main = path.join("main.rs");
     let name = path.file_name()?.to_str()?.to_owned();
-    if main.exists() {
+    if files.exists(&main) {
         let main = main.strip_prefix(package_root).map(|p| p.to_owned()).unwrap_or(main);
         Some((name, main))
     } else {
         None
     }
-}
-
-fn is_not_dotfile(entry: &DirEntry) -> bool {
-    entry.file_name().to_str().map(|s| s.starts_with('.')) == Some(false)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1067,7 +1128,8 @@ fn configure(
     Ok(())
 }
 
-fn target_path_not_found_error_message(
+fn target_path_not_found_error_message<F: Files>(
+    files: &F,
     package_root: &Path,
     target: &TomlTarget,
     target_kind: &str,
@@ -1098,7 +1160,7 @@ fn target_path_not_found_error_message(
     if let Some((wrong_path, possible_path)) = commonly_wrong_paths
         .iter()
         .zip(possible_paths.iter())
-        .find(|(wp, _)| package_root.join(wp).exists())
+        .find(|(wp, _)| files.exists(&package_root.join(wp)))
     {
         let [wrong_path, possible_path] = [wrong_path, possible_path].map(|p| p.display());
         format!(
@@ -1115,13 +1177,16 @@ fn target_path_not_found_error_message(
     }
 }
 
-fn target_path(
+#[allow(clippy::too_many_arguments)]
+fn target_path<F: Files>(
+    files: &F,
     target: &TomlTarget,
     inferred: &[(String, PathBuf)],
     target_kind: &str,
     package_root: &Path,
     edition: Edition,
-    legacy_path: &mut dyn FnMut(&TomlTarget) -> Option<PathBuf>,
+    legacy: Legacy,
+    legacy_warnings: &mut Vec<String>,
 ) -> Result<PathBuf, String> {
     if let Some(ref path) = target.path {
         return Ok(path.0.clone());
@@ -1134,15 +1199,21 @@ fn target_path(
         (Some(path), None) => Ok(path),
         (None, None) => {
             if edition == Edition::Edition2015
-                && let Some(path) = legacy_path(target)
+                && let Some(path) = legacy.path(files, package_root, target, legacy_warnings)
             {
                 return Ok(path);
             }
-            Err(target_path_not_found_error_message(package_root, target, target_kind, inferred))
+            Err(target_path_not_found_error_message(
+                files,
+                package_root,
+                target,
+                target_kind,
+                inferred,
+            ))
         }
         (Some(p0), Some(p1)) => {
             if edition == Edition::Edition2015
-                && let Some(path) = legacy_path(target)
+                && let Some(path) = legacy.path(files, package_root, target, legacy_warnings)
             {
                 return Ok(path);
             }
@@ -1161,14 +1232,15 @@ Cargo doesn't know which to use because multiple target files found at `{}` and 
 }
 
 /// The build scripts of a package: `build.rs` next to the manifest unless `build` says otherwise.
-pub(crate) fn normalize_build(
+pub(crate) fn normalize_build<F: Files>(
+    files: &F,
     build: Option<&TomlPackageBuild>,
     package_root: &Path,
 ) -> anyhow::Result<Option<TomlPackageBuild>> {
     const BUILD_RS: &str = "build.rs";
     match build {
         None => {
-            if package_root.join(BUILD_RS).is_file() {
+            if files.is_file(&package_root.join(BUILD_RS)) {
                 Ok(Some(TomlPackageBuild::SingleScript(BUILD_RS.to_owned())))
             } else {
                 Ok(Some(TomlPackageBuild::Auto(false)))

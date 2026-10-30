@@ -214,3 +214,196 @@ now that `RootDatabase` is `base_db::Db`. And `ide_db::executions` (deleted with
 Status: open
 
 > applied: `enable_proc_attr_macros` deleted from `RootDatabaseExt` and from `impl RootDatabaseExt for Db` in `crates/ide-db/src/lib.rs`; `rg expand_proc_attr_macros crates` finds nothing (requests, pass 22).
+
+## frontend-fast-const: hir-ide's consteval fixtures check the HIR evaluator against MIR (2026-10-29)
+
+`crates/hir-ide` (coordinator's). The new test file `crates/hir-ide/src/tests/consteval/hir_eval.rs`
+(frontend-fast-const's, written) compares `hir_ty::consteval::hir_eval`'s HIR evaluation of every
+constant and discriminant of the closed shape with the MIR evaluator's (identical allocation or
+identical error), over generated programs and, through `eval_goal`, over every existing consteval
+fixture; and holds a memo hit to zero allocations. Needs the `pub mod hir_eval;` that
+`v2/requests/db.md` "frontend-fast-const: the evaluation queries go through
+`consteval::hir_eval::value`" adds to hir-ty.
+
+1. `crates/hir-ide/src/tests/consteval.rs`: after `mod intrinsics;` add the line `mod hir_eval;`.
+2. Same file, in `fn eval_goal`, replace
+
+```rust
+        .expect("No const named GOAL found in the test");
+    db.const_eval(const_id, GenericArgs::empty(), None)
+```
+
+with
+
+```rust
+        .expect("No const named GOAL found in the test");
+    hir_eval::check_all(db, file_id);
+    db.const_eval(const_id, GenericArgs::empty(), None)
+```
+
+3. `crates/hir-ide/Cargo.toml`, under `[dev-dependencies]` after `blaze-hashcons.workspace = true`:
+   `blaze-alloc-count.workspace = true`.
+4. `crates/hir-ide/src/lib.rs`, after `mod tests;` (which is `#[cfg(test)]`):
+
+```rust
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+```
+
+(as hir-ty's `lib.rs` has; without it `a_memo_hit_allocates_nothing` fails its control check
+rather than passing vacuously.)
+
+Status: open
+
+> applied (requests, pass 25): `mod hir_eval;` after `mod intrinsics;` (kept sorted, with `mod deps;`), `hir_eval::check_all(db, file_id);` in `eval_goal`, `blaze-alloc-count.workspace = true` in hir-ide's `[dev-dependencies]`, and the `#[cfg(test)] #[global_allocator]` `Counting` after `mod tests;` in `lib.rs`. Builds once db-mem-infer-b lands `pub mod hir_eval;` in `hir-ty/src/consteval.rs`.
+
+
+## frontend-tree: cfg `src/cfg_expr.rs`, `src/tests.rs`: delete `CfgExpr::parse_from_ast` (1) (2026-10-29)
+
+From frontend-tree-move-tools (frontend.md item 16, notes
+`docs/v2/plan/lanes/frontend/tree-move-tools.md`). `parse_from_view` is its view twin, already
+in the crate and compared with it on every cfg test (`cfgs` in `src/tests.rs`). Apply only after
+every caller has moved to `parse_from_view`.
+
+needs: the requests moving the callers: hir-expand `src/attrs.rs` (157, 254) and
+`src/cfg_process.rs` (337) (frontend-tree-move-expand, `v2/requests/db-expand.md`); hir-def
+`src/attrs.rs` (1138, 1147, 1273) and `src/expr_store/lower.rs` (3637) (frontend-tree-move-def,
+`v2/requests/db.md`); blaze-engine `src/test_harness.rs` (117) (frontend-tree-move-codegen,
+`v2/requests/codegen.md`); blaze-diagnostics `src/lints/syntax.rs` (321),
+`src/lints/syntax/check_cfg/unexpected.rs` (293, 301), `src/lints/names/items/walk.rs` (290),
+`src/lints/names/dead/defs.rs` (775) (frontend-tree-move-diag-lints), `src/checks/defs/conflicts.rs`
+(657), `src/checks/features/attributes.rs` (223) (frontend-tree-move-diag-lower), both in
+`v2/requests/diagnostics.md` or a diagnostics child's file; blaze-doc `src/lint.rs` (114)
+(frontend-tree-move-tools-doc, edited directly; done 2026-10-29: it calls `parse_from_view`). Check with
+`rg -n 'parse_from_ast' crates --type rust | rg -v '^crates/(ide[^/]*|rust-analyzer|hir-ide)/'`:
+only the lines below may remain.
+
+File `crates/cfg/src/cfg_expr.rs`. Old (delete it whole):
+
+```rust
+    #[cfg(feature = "syntax")]
+    pub fn parse_from_ast(ast: syntax::ast::CfgPredicate) -> CfgExpr {
+        use intern::sym;
+        use syntax::ast::{self, AstToken};
+
+        match ast {
+            ast::CfgPredicate::CfgAtom(atom) => {
+                let atom = match atom.key() {
+                    Some(ast::CfgAtomKey::True) => CfgAtom::Flag(sym::true_),
+                    Some(ast::CfgAtomKey::False) => CfgAtom::Flag(sym::false_),
+                    Some(ast::CfgAtomKey::Ident(key)) => {
+                        let key = Symbol::intern(key.text());
+                        match atom.string_token().and_then(ast::String::cast) {
+                            Some(value) => {
+                                if let Ok(value) = value.value() {
+                                    CfgAtom::KeyValue { key, value: Symbol::intern(&value) }
+                                } else {
+                                    return CfgExpr::Invalid;
+                                }
+                            }
+                            None => CfgAtom::Flag(key),
+                        }
+                    }
+                    None => return CfgExpr::Invalid,
+                };
+                CfgExpr::Atom(atom)
+            }
+            ast::CfgPredicate::CfgComposite(composite) => {
+                let Some(keyword) = composite.keyword() else {
+                    return CfgExpr::Invalid;
+                };
+                match keyword.text() {
+                    "all" => CfgExpr::All(
+                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),
+                    ),
+                    "any" => CfgExpr::Any(
+                        composite.cfg_predicates().map(CfgExpr::parse_from_ast).collect(),
+                    ),
+                    "not" => {
+                        let mut inner = composite.cfg_predicates();
+                        let (Some(inner), None) = (inner.next(), inner.next()) else {
+                            return CfgExpr::Invalid;
+                        };
+                        CfgExpr::Not(Box::new(CfgExpr::parse_from_ast(inner)))
+                    }
+                    _ => CfgExpr::Invalid,
+                }
+            }
+        }
+    }
+```
+
+New: nothing (the blank line after it goes too).
+
+Old:
+
+```rust
+    /// [`Self::parse_from_ast`] over a view of the predicate.
+```
+
+New:
+
+```rust
+    /// The `CfgExpr` of a `cfg` predicate, read from a view of it.
+```
+
+File `crates/cfg/src/tests.rs`. Old:
+
+```rust
+use syntax::{AstNode, Edition, SourceFile, ast, view, view::AstNode as _};
+```
+
+New:
+
+```rust
+use syntax::{Edition, SourceFile, view, view::AstNode as _};
+```
+
+Old:
+
+```rust
+/// The first predicate of `input`, read from its token tree and from its view. The handle's
+/// reading (`parse_from_ast`), the reference until the handles are deleted, must be the view's.
+/// `clean`: `input` must parse without errors.
+```
+
+New:
+
+```rust
+/// The first predicate of `input`, read from its token tree and from its view.
+/// `clean`: `input` must parse without errors.
+```
+
+Old:
+
+```rust
+    let from_view = CfgExpr::parse_from_view(pred);
+    let handle = parse.syntax_node().descendants().find_map(ast::CfgPredicate::cast).unwrap();
+    assert_eq!(CfgExpr::parse_from_ast(handle), from_view, "{input}");
+    (CfgExpr::parse(&tt), from_view)
+```
+
+New:
+
+```rust
+    let from_view = CfgExpr::parse_from_view(pred);
+    (CfgExpr::parse(&tt), from_view)
+```
+
+Status: open (waits on the callers above)
+
+> held (requests, pass 25): `crates/cfg` is the coordinator's, so requests applies it, but only once its `needs` are in: 15 `parse_from_ast` callers remain outside `crates/cfg`, `ide*` and `hir-ide` (`rg` as above).
+
+## frontend-fast-const-deps: hir-ide's tests of dependencies' constants (2026-10-29)
+
+`crates/hir-ide/src/tests/consteval/deps.rs` (frontend-fast-const-deps's, written) evaluates a
+library's constants, drains them into a store, and serves them in a second database through
+`const_eval`. It needs `hir_ty::consteval::deps` public (`pub mod deps;`, asked of db-ty-db in
+`v2/requests/db.md`, section "frontend-fast-const: dependencies' constants by content").
+
+1. `crates/hir-ide/src/tests/consteval.rs`: after `mod const_traits;` add the line `mod deps;`.
+
+Status: open
+
+> applied (requests, pass 25): `mod deps;` after `mod const_traits;` in `hir-ide/src/tests/consteval.rs`. Builds once db-mem-infer-b lands `pub mod deps;` in `hir-ty/src/consteval.rs`.

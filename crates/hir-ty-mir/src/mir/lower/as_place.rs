@@ -12,10 +12,14 @@ use crate::{
 impl<'db> MirLowerCtx<'_, '_, 'db> {
     /// A temporary is dropped before the ones that were made while computing its value.
     fn declare_last(&mut self, local: LocalId) {
-        let scope = self.drop_scopes.iter_mut().rev().find(|it| it.locals.contains(&local));
-        if let Some(scope) = scope {
-            scope.locals.retain(|&it| it != local);
-            scope.locals.push(local);
+        let scope = self.drop_scopes.iter_mut().rev().find(|it| it.locals.holds(local));
+        if let Some(scope) = scope
+            && let Some((&last, before)) = scope.locals.split_last()
+            && (last != local || before.contains(&local))
+        {
+            let locals = scope.locals.edit();
+            locals.retain(|&it| it != local);
+            locals.push(local);
         }
     }
 
@@ -26,9 +30,9 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
     ) -> Result<'db, Option<(Place<'db>, BasicBlockId)>> {
         let ty = self.expr_ty_without_adjust(expr_id);
         let place: Place<'db> = self.temp(ty, prev_block, expr_id.into())?.into();
-        self.unscheduled.insert(place.local);
+        self.unschedule(place.local);
         let lowered = self.lower_expr_to_place_without_adjust(expr_id, place, prev_block);
-        self.unscheduled.remove(&place.local);
+        self.reschedule(place.local);
         let Some(current) = lowered? else {
             return Ok(None);
         };
@@ -47,9 +51,9 @@ impl<'db> MirLowerCtx<'_, '_, 'db> {
             .map(|it| it.target.as_ref())
             .unwrap_or_else(|| self.expr_ty_without_adjust(expr_id));
         let place: Place<'db> = self.temp(ty, prev_block, expr_id.into())?.into();
-        self.unscheduled.insert(place.local);
+        self.unschedule(place.local);
         let lowered = self.lower_expr_to_place_with_adjust(expr_id, place, prev_block, adjustments);
-        self.unscheduled.remove(&place.local);
+        self.reschedule(place.local);
         let Some(current) = lowered? else {
             return Ok(None);
         };

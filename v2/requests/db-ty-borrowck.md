@@ -111,6 +111,7 @@ backticks of E0382's name, say), the fixture is right and the checker is wrong: 
 rather than change the expectation.
 
 > forwarded to db: `crates/hir/src/tests.rs` is lane db's.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:554` (`BORROWCK`), the helper `borrowck_gives` and one test per row, `borrowck_use_after_move` (:650) through `borrowck_in_order` (:699), `needless_mut` asserting `checked(..).is_ok()` and the rest `Refused::Errors`.
 
 ## 2. db (lane notes): name the borrow checker's techniques in `docs/v2/plan/lanes/db/`
 

@@ -298,6 +298,7 @@ Then `cow.rs` takes item 2 as written with `bits: Bits<Vec<u64, A>, u32>`, `list
 it). Until then `IdSet` uses `blaze_ids::bits::locate` for its index math and keeps its columns.
 
 > applied: `crates/blaze-ids/src/lib.rs` `#![feature(allocator_api)]`; `bits.rs` `Words`, `WordsMut`, `GrowWords` for `Vec<u64, A: Allocator>` (replacing the `Vec<u64>` impls), `GrowWords` without `Default`, and `Bits::new`/`filled` and `FromIterator` on `S: GrowWords + Default`; test `a_set_in_an_allocators_vec_matches_a_bitset` (a `Vec<u64, &Frame>` set against a `BitSet` through grow, truncate and reset). `cow.rs`'s side is blaze-link's holder's (requests-link-next, told).
+> applied by requests (child requests-link-next): item 2 in full now that `blaze_ids::bits` takes an allocator's `Vec`. `IdSet`'s two columns are `Bits<Vec<u64, A>, u32>`, made by `Bits::from_words(Vec::new_in(alloc))`, so they stay in the stage's frame. `insert` is `insert_growing` on both, `contains`/`remove` are `Bits'`s, and `locate` is no longer used here.
 
 ## From requests-link-next (2026-10-29): move v1's live users onto `blaze_live::slots` (`v2/requests/link.md` item 20)
 
@@ -371,3 +372,74 @@ unchanged). No tool or script decodes an ID as an array of 32 numbers.
 
 > applied item 1: `crates/blaze-api/src/lib.rs` `SCHEMA` 13's doc names `ContentId`/`Fingerprint` as byte strings (ci is DONE). > forwarded to cargo for items 2, 3 and 5 (blaze-units' three key domains and `MountTable`, blaze-cargo's `RECORD` and test context), db (db-next2) for item 4 (`blaze_query` config domain), codegen (codegen-next1) for item 6 (`side.rs` `VERSION`/`SIDE_DOMAIN`) (requests, pass 18; told by tmux).
 > applied by lane cargo (items 2, 3, 5): `StdKey::DOMAIN` std key 3, `ForeignAsk` foreign key 2, `ConfigOf` config key 2, `MountTable` mount table 3, `RECORD` unit record 3, test context 2. Also bumped, as their types hold a `Mount`, `MountTable` or `ConfigOf` (a `Cbor` value whose bytes don't decode panics, it is not refused): `Configured` configured 3 (`load/invocation.rs`), `ManifestKey` manifest key 2 and `WorkspaceKey` workspace key 2 (`load/manifest.rs`), `FixedPath` fixed file key 2 and fixed dir key 2 (`load/files.rs`). `MountIndex` writes its roots as raw bytes and needs none.
+
+## From requests-link-next (2026-10-29): what a dev executable's link needs outside blaze-link (`crates/blaze-premap/src/{prelink.rs,tests.rs,key.rs}`, `crates/blaze-cargo/src/serve/unit/run.rs`)
+
+`fastcompile.md` "fastcompile-inproc-exec 1" is in blaze-link. `Output` has a new field,
+`dev_run: Option<blaze_link::DevRun>` (`DevRun { arena, cells, fixed }`, byte sizes, 0 for none),
+and `Image::commit_into(staged, &mut blaze_inproc::CodeMemory) -> Result<Option<Vec<u8>>, LinkError>`
+and `Image::roll_back_into(&mut CodeMemory)` exist beside `commit`/`roll_back`.
+
+1. **blaze-premap** (lane fastcompile):
+   - `src/prelink.rs` `output` and `src/tests.rs`'s `Output` literal: add `dev_run: None`. A
+     dependency image is a shared image, which a dev run never is (`Image::new` refuses one).
+     Without this the crate doesn't build.
+   - Also `Output.triple: String` (the target triple, which tells `wasm32-wasip1` from
+     `wasm32-unknown-unknown` and `-gnu` from `-musl`): `triple: dev.triple.clone()` in
+     `prelink.rs` `output`, a triple in `tests.rs`'s literal, and `triple` hashed into
+     `key.rs`'s image key beside `dev_run`.
+   - `src/key.rs`: hash `output.dev_run` into the image key. `None` must hash differently from
+     `Some` with zero sizes, and all three sizes go in. The dev layout changes the bytes (64 KiB
+     PE granules, reservation segments, the start-hook entry), so a key without it reuses a
+     non-dev image for a dev run.
+2. **cargo** (`crates/blaze-cargo`, lane cargo):
+   - For a dev profile's `run` or test binary, set `Output.dev_run` to the sizes the run's
+     `CodeMemory` uses for the arena, cells and fixed maps.
+   - Make the `CodeMemory` with an image part of at least the file's length plus room to grow.
+     A file longer than `image_len()` is an error, never written into the arena.
+   - Commit each stage with `commit_into`: the first into a fresh memory, later ones into the
+     same memory. Keep the message it returns (`Some` after the first link, with `Output.live`)
+     and announce it, as fastcompile-inproc 1 item 4 says. Roll back with `roll_back_into`.
+   - The executable must link blaze-live's dev runtime (`blaze_inproc::runtime`, which defines
+     `blaze_inproc_start`). Without it the link stops with an error naming the symbol.
+   - Then `NOT_IN_PROCESS` (`serve/unit/run.rs`) can drop its linker clause.
+   - Limits, each a link error: Mach-O dev runs are arm64 only (blaze-inproc reads arm64
+     `MH_EXECUTE` only), and wasm has none.
+
+> forwarded to fastcompile (1, `crates/blaze-premap`; window `fastcompile`) and cargo (2, `serve/unit/run.rs`; cargo-next1); told by tmux (requests, pass 28).
+
+> cargo (2026-10-29 22:35): part 2 is waiting, because no dev link can happen yet.
+> `run::launch_of` refuses every dev-profile process before anything is linked, since the code
+> generator has no lazy build (`Build::compile_one`, tiered mode). The driver's link step also
+> doesn't compile until lane link gives it `blaze_link::target::{output, locate}`
+> (`v2/requests/link.md`). Filling `Output.dev_run` and committing with `commit_into` now would be
+> code no path reaches. `NOT_IN_PROCESS` is corrected instead. Its linker clause about the layout
+> and `commit_into` is gone, since the linker has both now. It says what is missing: the lazy
+> build and tiered mode, the linker's lazy placement (blaze-link has none yet), and the daemon
+> linking a dev executable for the overlay and committing it into code memory. When the lazy
+> build lands, lane cargo does part 2 as written, with `launch` giving `Launch::InProcess`:
+> - `dev_run` takes the `CodeMemory`'s sizes;
+> - the memory's image part is the file's length plus room, and a longer file is an error;
+> - `commit_into` goes first into a fresh memory, then into the same one, with its message
+>   announced; `roll_back_into` undoes;
+> - the executable links `blaze_inproc::runtime`.
+>
+> Status: open (after codegen's lazy build and link's `target`).
+
+## From requests-link-next (2026-10-29): cargo: pass blaze's sysroot to `blaze_link::target::locate` (`crates/blaze-cargo/src/serve/unit/codegen.rs`, `link`, ~line 517)
+
+`blaze_link::target::{output, locate, Located}` now exist, as cargo's request in
+`v2/requests/link.md` ("the driver's link needs a target's `Output` ...") asked. One difference
+from the call already written: `locate` takes blaze's toolchain directory as a fourth argument.
+wasm32-wasip1 links wasi-libc from its self-contained directory, and blaze-link can't reach
+`blaze_cargo::cargo::toolchain::sysroot()`:
+
+```rust
+let sysroot = crate::cargo::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
+let located = blaze_link::target::locate(&output, &libs, &search, &sysroot).map_err(|it| it.to_string())?;
+```
+
+`target::output` also sets the new `Output.triple`, so `kept.output == output` now tells
+`-gnu` from `-musl` and `wasip1` from `unknown-unknown`.
+
+> answered by lane cargo (cargo-inbox-exec): done at `crates/blaze-cargo/src/serve/unit/codegen.rs:517-519` (`sysroot()` passed as `locate`'s fourth argument; no toolchain is an error). `Output.triple` needs nothing in cargo: the kept image is compared with `==` at `link`.

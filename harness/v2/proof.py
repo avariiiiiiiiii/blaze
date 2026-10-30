@@ -9,7 +9,9 @@ The checks, each a script of this directory run with the same `engine` (v1 now, 
 
     oracle        oracle.py: the incremental build equals one from scratch after every edit
     corpus        corpus.py: real crates built, run and tested under blaze and rustc
-    rejections    rejections.py: rustc's compile-fail tests fail with the same error codes
+    rejections    rejections.py: rustc's compile-fail tests fail with the same error codes and spans
+    cases         frontend/cases.py: the front end's cases, each held to rustc then compared with it
+    fuzz          frontend/fuzz.py: generated programs compared with rustc, each mismatch shrunk to a case
     share         share.py: the instance-sharing programs print what Rust guarantees under rustc and blaze
     determinism   determinism.py: two builds on different core counts, byte for byte the same
     tightmemory   tightmemory.py: a build under a tight memory budget finishes, never OOMs
@@ -49,11 +51,14 @@ import report  # noqa: E402
 from typed_input import fail, parse  # noqa: E402
 
 SCRIPT = "proof.py"
-type Name = Literal["oracle", "corpus", "rejections", "share", "determinism", "tightmemory", "budgets"]
+type Name = Literal["oracle", "corpus", "rejections", "cases", "fuzz", "share", "determinism", "tightmemory",
+                    "budgets"]
 SCRIPTS: dict[str, tuple[str, ...]] = {
     "oracle": ("oracle.py", "run"),
     "corpus": ("corpus.py",),
     "rejections": ("rejections.py",),
+    "cases": ("frontend/cases.py",),
+    "fuzz": ("frontend/fuzz.py",),
     "share": ("share.py",),
     "determinism": ("determinism.py",),
     "tightmemory": ("tightmemory.py",),
@@ -193,6 +198,8 @@ def selftest() -> list[str]:
         wrong.append(f"argv_of: {argv}")
     if given != {"rounds": 2, "engine": asdict(spec), "out": "/o/oracle.json", "work": "/w/oracle"}:
         wrong.append(f"argv_of gives {given}")
+    if argv_of(Check("cases"), spec, Path("/o"), "")[1] != str(HERE / "frontend" / "cases.py"):
+        wrong.append("argv_of does not find a check's script in a subdirectory")
     for name in SCRIPTS:
         if name not in typing.get_args(Name.__value__):
             wrong.append(f"{name} is a script but not a Name")

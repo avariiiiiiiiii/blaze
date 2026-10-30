@@ -11,7 +11,8 @@ use base_db::Db;
 use rustc_next_trait_solver::placeholder::BoundVarReplacer;
 use rustc_type_ir::inherent::IntoKind;
 use rustc_type_ir::{
-    FallibleTypeFolder, TypeFlags, TypeFoldable, TypeSuperFoldable, TypeVisitableExt, UniverseIndex,
+    FallibleTypeFolder, Interner, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeVisitableExt, UniverseIndex,
 };
 
 use crate::{
@@ -23,7 +24,7 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 use crate::{
-    db::{HirDatabase, InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
+    db::{HirDatabase, InternedOpaqueTyId},
     next_solver::{
         AliasTyKind, Binder, DbInterner, GenericArgs, SolverDefId, Ty, TyKind, TypingMode,
         infer::{DbInternerInferExt, InferCtxt, traits::ObligationCause},
@@ -258,6 +259,9 @@ impl<'db> Filler<'db> {
     fn fill_body(&mut self, body: &mut MirBody<'db>) -> Result<(), MirLowerError<'db>> {
         for (_, l) in body.locals.iter_mut() {
             self.fill_ty(&mut l.ty)?;
+        }
+        for callee in &mut body.inlined.callees {
+            self.fill_args(&mut callee.args)?;
         }
         for (_, bb) in body.basic_blocks.iter_mut() {
             for statement in &mut bb.statements {
@@ -515,7 +519,7 @@ pub fn opaque_of_impl<'db>(
     if !ocx.evaluate_obligations_error_on_ambiguity().is_empty() {
         return None;
     }
-    let ty = infcx.resolve_vars_if_possible(*vars.get(idx.into_raw().into_u32() as usize)?);
+    let ty = infcx.deeply_resolve_ignoring_regions(*vars.get(idx.into_raw().into_u32() as usize)?);
     (!ty.has_infer() && !ty.has_escaping_bound_vars() && !references_non_lt_error(&ty))
         .then_some(ty)
 }
@@ -529,13 +533,39 @@ pub(crate) fn normalized_ty<'db>(
     ty.try_fold_with(&mut Filler::new(db, trait_env, GenericArgs::empty()))
 }
 
-pub(crate) fn compute_monomorphized_mir_body<'db>(
-    db: &'db Db,
-    owner: InferBodyId<'db>,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    monomorphized(db, db.mir_body(owner)?, &subst, &trait_env)
+/// `value` with every lifetime not bound in it erased and the variables of each binder in it
+/// numbered in their order, unnamed: rustc's `erase_and_anonymize_regions`, how a vtable and a
+/// `TypeId` have a type, so that two spellings of one type are one.
+pub fn erase_and_anonymize_regions<'db, T: TypeFoldable<DbInterner<'db>>>(
+    interner: DbInterner<'db>,
+    value: T,
+) -> T {
+    if !value.has_type_flags(TypeFlags::HAS_BINDER_VARS | TypeFlags::HAS_FREE_REGIONS) {
+        return value;
+    }
+    value.fold_with(&mut EraseAndAnonymize(interner))
+}
+
+struct EraseAndAnonymize<'db>(DbInterner<'db>);
+
+impl<'db> TypeFolder<DbInterner<'db>> for EraseAndAnonymize<'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.0
+    }
+
+    fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        binder: Binder<'db, T>,
+    ) -> Binder<'db, T> {
+        self.0.anonymize_bound_vars(binder).super_fold_with(self)
+    }
+
+    fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {
+        match region.kind() {
+            RegionKind::ReBound(..) => region,
+            _ => Region::new_erased(self.0),
+        }
+    }
 }
 
 /// The constant behind a promoted `&expr` of `owner`, as the instance with `subst` sees it.
@@ -549,31 +579,4 @@ pub fn monomorphized_promoted_mir_body_query<'db>(
 ) -> Result<MirBody<'db>, MirLowerError<'db>> {
     let body = super::runtime_promoted_mir_body_query(db, owner, expr).map_err(Clone::clone)?;
     monomorphized(db, body, &subst, &trait_env)
-}
-
-pub(crate) fn compute_monomorphized_mir_body_for_closure<'db>(
-    db: &'db Db,
-    closure: InternedClosureId<'db>,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    monomorphized(db, db.mir_body_for_closure(closure)?, &subst, &trait_env)
-}
-
-pub(crate) fn compute_monomorphized_mir_body_for_coroutine<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    monomorphized(db, db.mir_body_for_coroutine(coroutine)?, &subst, &trait_env)
-}
-
-pub(crate) fn compute_monomorphized_mir_body_for_coroutine_by_move<'db>(
-    db: &'db Db,
-    coroutine: InternedCoroutineId<'db>,
-    subst: StoredGenericArgs,
-    trait_env: StoredParamEnvAndCrate,
-) -> Result<MirBody<'db>, MirLowerError<'db>> {
-    monomorphized(db, db.mir_body_for_coroutine_by_move(coroutine)?, &subst, &trait_env)
 }

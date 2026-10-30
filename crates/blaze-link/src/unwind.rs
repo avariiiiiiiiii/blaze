@@ -8,6 +8,8 @@
 
 use std::ops::Range;
 
+use blaze_format::cursor::{self, Put, Reader};
+
 /// A record's bytes and the places in it the core relocates.
 #[cfg(test)]
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -136,7 +138,7 @@ pub(crate) fn fde_into(
     bytes.clear();
     bytes.reserve(16 + 1 + 4 + instructions.len() + 7);
     bytes.extend_from_slice(&[0; 12]);
-    bytes.extend_from_slice(&range.to_le_bytes());
+    bytes.put_u32(range);
     let mut fixups = Fields::NONE;
     fixups.push(4, Field::CiePointer);
     fixups.push(8, Field::Function);
@@ -162,7 +164,7 @@ fn finish(bytes: &mut Vec<u8>) -> Result<(), String> {
         // alloc: error path
         return Err("a frame record as long as the 64-bit length escape".to_owned());
     }
-    bytes[..4].copy_from_slice(&len.to_le_bytes());
+    bytes.patch_u32(0, len);
     Ok(())
 }
 
@@ -181,13 +183,10 @@ pub(crate) struct Native {
 pub(crate) fn split(section: &[u8]) -> Result<Vec<Native>, String> {
     // Compilers' records are mostly 24 to 64 bytes.
     let mut records: Vec<Native> = Vec::with_capacity(section.len() / 32);
-    let mut at = 0;
-    while at + 4 <= section.len() {
-        let word = |at: usize| -> Result<u32, String> {
-            let bytes = section.get(at..at + 4).ok_or("an .eh_frame record cut short")?;
-            Ok(u32::from_le_bytes(bytes.try_into().expect("four bytes")))
-        };
-        let len = word(at)? as usize;
+    let mut read = Reader::new(section);
+    while read.left() >= 4 {
+        let at = read.at();
+        let len = read.u32()? as usize;
         if len == 0 {
             break;
         }
@@ -195,12 +194,12 @@ pub(crate) fn split(section: &[u8]) -> Result<Vec<Native>, String> {
             // alloc: error path
             return Err("an .eh_frame record with a 64-bit length".to_owned());
         }
-        let end = at + 4 + len;
-        if end > section.len() || len < 4 {
+        let Some(body) = read.take(len).ok().filter(|_| len >= 4) else {
             // alloc: error path
             return Err(format!("an .eh_frame record at {at:#x} past the section's end"));
-        }
-        let id = word(at + 4)? as usize;
+        };
+        let end = read.at();
+        let id = Reader::new(body).u32()? as usize;
         let cie = match id {
             0 => None,
             back => Some(
@@ -216,9 +215,100 @@ pub(crate) fn split(section: &[u8]) -> Result<Vec<Native>, String> {
             }
         }
         records.push(Native { range: at..end, cie });
-        at = end;
     }
     Ok(records)
+}
+
+pub(crate) const DW_EH_PE_OMIT: u8 = 0xff;
+const DW_EH_PE_PCREL: u8 = 0x10;
+
+/// The FDE pointer encoding of the CIE `reader` is in (past its ID), what leads to it checked
+/// as gimli checks it. `reader`'s positions are from the start of the section at `section`.
+pub(crate) fn cie_encoding(reader: &mut Reader<'_>, section: u64) -> Result<u8, &'static str> {
+    const UNKNOWN: &str = "a CIE of an unknown augmentation";
+    let version = reader.u8().map_err(cursor::Error::as_str)?;
+    if !matches!(version, 1 | 3 | 4) {
+        return Err("a CIE of an unknown version");
+    }
+    let augmentation = reader.cstr().map_err(cursor::Error::as_str)?;
+    reader.uleb().map_err(cursor::Error::as_str)?;
+    reader.sleb().map_err(cursor::Error::as_str)?;
+    if version == 1 {
+        reader.u8().map_err(cursor::Error::as_str)?;
+    } else {
+        reader.uleb().map_err(cursor::Error::as_str)?;
+    }
+    let mut encoding = 0;
+    let mut data: Option<Reader<'_>> = None;
+    for (index, &ch) in augmentation.iter().enumerate() {
+        match ch {
+            b'z' if index == 0 => {
+                let len = reader.uleb().map_err(cursor::Error::as_str)?;
+                let start = reader.at();
+                usize::try_from(len)
+                    .ok()
+                    .and_then(|it| reader.skip(it).ok())
+                    .ok_or("augmentation data longer than its CIE")?;
+                let bytes = &reader.bytes()[..reader.at()];
+                data = Some(Reader::starting_at(bytes, start).map_err(cursor::Error::as_str)?);
+            }
+            b'L' => {
+                let data = data.as_mut().ok_or(UNKNOWN)?;
+                pointer_encoding(data.u8().map_err(cursor::Error::as_str)?)?;
+            }
+            b'P' => {
+                let data = data.as_mut().ok_or(UNKNOWN)?;
+                let personality = pointer_encoding(data.u8().map_err(cursor::Error::as_str)?)?;
+                eh_pointer(data, personality, section)?;
+            }
+            b'R' => {
+                let data = data.as_mut().ok_or(UNKNOWN)?;
+                encoding = pointer_encoding(data.u8().map_err(cursor::Error::as_str)?)?;
+            }
+            b'S' => {}
+            _ => return Err(UNKNOWN),
+        }
+    }
+    Ok(encoding)
+}
+
+/// `encoding` if it is a `DW_EH_PE_*` pointer encoding.
+fn pointer_encoding(encoding: u8) -> Result<u8, &'static str> {
+    let format = matches!(encoding & 0x0f, 0x00..=0x04 | 0x09..=0x0c);
+    if encoding == DW_EH_PE_OMIT || (format && encoding & 0x70 <= 0x50) {
+        Ok(encoding)
+    } else {
+        Err("an unknown pointer encoding")
+    }
+}
+
+/// A value in `encoding`'s format, signed ones sign-extended.
+pub(crate) fn eh_value(reader: &mut Reader<'_>, encoding: u8) -> Result<u64, &'static str> {
+    let value = match encoding & 0x0f {
+        0x00 | 0x04 | 0x0c => reader.u64(),
+        0x01 => reader.uleb(),
+        0x02 => reader.u16().map(u64::from),
+        0x03 => reader.u32().map(u64::from),
+        0x09 => reader.sleb().map(|it| it as u64),
+        0x0a => reader.i16().map(|it| it as u64),
+        0x0b => reader.i32().map(|it| it as u64),
+        _ => return Err("an unknown pointer encoding"),
+    };
+    value.map_err(cursor::Error::as_str)
+}
+
+/// A pointer in `encoding` with only the section's address (`section`) known: absolute or
+/// relative to where it is.
+pub(crate) fn eh_pointer(reader: &mut Reader<'_>, encoding: u8, section: u64) -> Result<u64, &'static str> {
+    if encoding == DW_EH_PE_OMIT {
+        return Err("a pointer whose encoding says it is omitted");
+    }
+    let base = match encoding & 0x70 {
+        0x00 => 0,
+        DW_EH_PE_PCREL => section.wrapping_add(reader.at() as u64),
+        _ => return Err("a pointer relative to a base other than where it is"),
+    };
+    Ok(base.wrapping_add(eh_value(reader, encoding)?))
 }
 
 /// The offsets in an image's `.eh_frame` (at `section`, `len` bytes) of every `every`th FDE

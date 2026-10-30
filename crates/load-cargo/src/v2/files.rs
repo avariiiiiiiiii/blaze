@@ -15,11 +15,11 @@ use super::LowerError;
 /// Symlinks followed in a row before a path is refused, as Linux's `MAXSYMLINKS`.
 const MAX_LINKS: u32 = 40;
 
-pub(crate) struct Mounts<'a> {
+pub(crate) struct Mounts<'a, T> {
     pub(crate) mounts: &'a [Mount],
     /// The root of `Origin::View` mounts.
     pub(crate) view: ContentId,
-    pub(crate) tree: &'a dyn Tree,
+    pub(crate) tree: &'a T,
     /// Set as a path is found in an `Origin::View` mount: what read it read the view.
     pub(crate) read_view: Cell<bool>,
 }
@@ -37,7 +37,7 @@ enum Node {
     None,
 }
 
-impl Mounts<'_> {
+impl<T: Tree> Mounts<'_, T> {
     /// The root and the path under it of `path`, absolute: by its longest mount.
     pub(crate) fn locate(&self, path: &str) -> Result<(ContentId, String), LowerError> {
         let mount = self
@@ -112,14 +112,9 @@ impl Mounts<'_> {
     }
 
     /// Every file under the directory `dir`, by its path under `dir` as cargo names it, but
-    /// those under a path `skip` says. A symlink is read as what it points to; one that points
+    /// those under a path of `skipped`. A symlink is read as what it points to; one that points
     /// to nothing is no file, as on the disk.
-    pub(crate) fn walk(
-        &self,
-        dir: &str,
-        skip: &dyn Fn(&str) -> bool,
-        out: &mut Vec<Loaded>,
-    ) -> Result<(), LowerError> {
+    pub(crate) fn walk(&self, dir: &str, skipped: &[String], out: &mut Vec<Loaded>) -> Result<(), LowerError> {
         // Each directory as named, where its entries are read from, and the symlinks followed
         // to reach it.
         let mut dirs: Vec<(String, String, u32)> = vec![(dir.to_owned(), dir.to_owned(), 0)];
@@ -130,7 +125,7 @@ impl Mounts<'_> {
             };
             for (name, is_dir) in entries.into_iter().rev() {
                 let child = format!("{named}/{name}");
-                if skip(&child) {
+                if skipped.iter().any(|it| *it == child) {
                     continue;
                 }
                 let child_real = format!("{real}/{name}");

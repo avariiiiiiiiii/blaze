@@ -348,7 +348,7 @@ pub(crate) fn shards<S>(make: fn() -> Result<S, MemError>) -> Result<Vec<S>, Mem
 mod tests {
     use std::collections::HashMap;
 
-    use blaze_codegen::{Arch, CompiledFunction, InstanceKey, Target};
+    use blaze_codegen::{Arch, CompiledFunction, InstanceKey, Relocs, Target};
     use blaze_core::{Completion, Done, Effect, FileName};
 
     use super::*;
@@ -479,6 +479,8 @@ mod tests {
             live: None,
             tags: 1 << 32,
             windows_subsystem: false,
+            dev_run: None,
+            triple: "x86_64-unknown-linux-gnu".into(),
             stack: None,
         }
     }
@@ -496,7 +498,7 @@ mod tests {
             arch: Arch::X86_64,
             align: 16,
             code: vec![0xb8, 1, 0, 0, 0, 0xc3],
-            relocs: Vec::new(),
+            relocs: Relocs::new(),
             data: Vec::new(),
             inlined: Vec::new(),
             side: None,

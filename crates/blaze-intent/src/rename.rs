@@ -14,17 +14,17 @@ use blaze_ids::radix;
 use blaze_vfs::Op;
 use either::Either;
 use hir::{
-    AsAssocItem, AssocItem, Crate, Field, HasVisibility, ModuleDef, PathResolution, Semantics, Trait,
-    Visibility, db::HirDatabase,
+    AsAssocItem, Crate, Field, HasVisibility, ModuleDef, PathResolution, Trait, Visibility,
+    db::HirDatabase, view::Semantics,
 };
 use rustc_hash::FxHashSet;
 use syntax::{
-    AstNode, LexedStr, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange,
-    ast::{self, HasAttrs as _},
+    LexedStr, NodeOrToken, SyntaxKind, TextRange,
+    view::{self as ast, AstNode as _, HasAttrs as _},
 };
 
 use crate::{
-    Edits,
+    Edits, Files,
     edit::{At, Touch},
     path,
 };
@@ -58,16 +58,13 @@ struct Hit {
 }
 
 /// Renames the item `target` names to `to`.
-pub(crate) fn rename(cx: &mut Edits<'_>, target: &Target, to: &str) -> Result<(), ApiError> {
+pub(crate) fn rename(cx: &mut Edits<'_, impl Files>, target: &Target, to: &str) -> Result<(), ApiError> {
     let fail = |what: String| ApiError::new(what, Some(target.file.clone()));
     let home = cx.open(&target.file).map_err(fail)?;
-    let (node, edition) = {
-        let file = &cx.working[home as usize];
-        let node = path::find(&file.base, &target.item)
-            .map_err(|error| fail(format!("{}: {error}", target.file)))?;
-        (node, file.edition)
-    };
-    let old = path::name_of(&node)
+    let node = path::find(cx.roots[home as usize], &target.item)
+        .map_err(|error| fail(format!("{}: {error}", target.file)))?;
+    let edition = cx.working[home as usize].edition;
+    let old = path::name_of(node)
         .filter(|_| node.child_where(|it| it == SyntaxKind::NAME).is_some())
         .ok_or_else(|| fail(format!("`{}` has no name to rename", target.item)))?;
     let bare = old.strip_prefix("r#").unwrap_or(&old).to_owned();
@@ -78,14 +75,14 @@ pub(crate) fn rename(cx: &mut Edits<'_>, target: &Target, to: &str) -> Result<()
         }
         _ => return Err(fail(format!("`{to}` is no identifier"))),
     }
-    let def = def_of(&cx.sema, &node).ok_or_else(|| {
+    let def = def_of(&cx.sema, node).ok_or_else(|| {
         fail(format!(
             "the front end has no item for `{}` in {}: cfg'd out under this view's configuration",
             target.item, target.file
         ))
     })?;
     if let Def::Item(item) = def
-        && let Some(of) = assoc(cx.db, item).and_then(|it| it.implemented_trait(cx.db))
+        && let Some(of) = item.as_assoc_item(cx.db).and_then(|it| it.implemented_trait(cx.db))
     {
         return Err(fail(format!(
             "`{}` implements an item of trait `{}`: rename it in the trait, and its impls follow",
@@ -107,14 +104,13 @@ pub(crate) fn rename(cx: &mut Edits<'_>, target: &Target, to: &str) -> Result<()
             continue;
         }
         let index = cx.open_id(file).map_err(fail)?;
-        let root = cx.working[index as usize].base.clone();
-        for element in root.descendants_with_tokens() {
-            let NodeOrToken::Token(token) = element else { continue };
-            if token.kind() != SyntaxKind::IDENT || token.text().strip_prefix("r#").unwrap_or(token.text()) != bare {
-                continue;
-            }
-            let class = classify(cx, &token, def, &node).map_err(|what| {
-                let text = &cx.working[index as usize].text;
+        let root = cx.roots[index as usize];
+        // Each match of the name goes straight to its token (a binary search a level), so the
+        // cost is the matches', not the file's nodes'.
+        for at in finder.find_iter(root.file().text().as_bytes()) {
+            let Some(token) = ident_at(root, at, bare.len()) else { continue };
+            let class = classify(cx, token, def, node).map_err(|what| {
+                let text = cx.working[index as usize].text();
                 let at = usize::from(token.text_range().start());
                 let line = memchr::memchr_iter(b'\n', &text.as_bytes()[..at]).count() + 1;
                 ApiError::new(format!("{path}:{line}: {what}"), Some(format!("{path}:{line}")))
@@ -126,12 +122,12 @@ pub(crate) fn rename(cx: &mut Edits<'_>, target: &Target, to: &str) -> Result<()
                 Class::Shorthand => (TextRange::empty(range.start()), format!("{to}: ")),
                 Class::ShorthandValue => (range, format!("{}: {to}", token.text())),
             };
-            cx.touches.push(touch_of(index, &token));
+            cx.touches.push(touch_of(index, token));
             hits.push(Hit { file: index, range, insert });
         }
     }
-    if let Some(top) = path::top_of(&node).filter(|top| *top == node) {
-        let at = match path::scope_of(&top) {
+    if let Some(top) = path::top_of(node).filter(|top| *top == node) {
+        let at = match path::scope_of(top) {
             Some(scope) => At::Item(scope.text_range().start()),
             None => At::File,
         };
@@ -150,52 +146,42 @@ pub(crate) fn rename(cx: &mut Edits<'_>, target: &Target, to: &str) -> Result<()
         file.splice(now, hit.insert).map_err(fail)?;
     }
     if let Def::Item(ModuleDef::Module(module)) = def {
-        moves(cx, module, &node, &bare, to).map_err(fail)?;
+        moves(cx, module, node, &bare, to).map_err(fail)?;
     }
     Ok(())
 }
 
 /// The front end's item for the node a path named.
-fn def_of(sema: &Semantics<'_>, node: &SyntaxNode) -> Option<Def> {
-    let node = node.clone();
+fn def_of<'db>(sema: &Semantics<'db>, node: ast::Node<'db>) -> Option<Def> {
     let item: ModuleDef = match node.kind() {
-        SyntaxKind::FN => sema.to_fn_def(&ast::Fn::cast(node)?)?.into(),
-        SyntaxKind::STRUCT => hir::Adt::from(sema.to_struct_def(&ast::Struct::cast(node)?)?).into(),
-        SyntaxKind::ENUM => hir::Adt::from(sema.to_enum_def(&ast::Enum::cast(node)?)?).into(),
-        SyntaxKind::UNION => hir::Adt::from(sema.to_def(&ast::Union::cast(node)?)?).into(),
-        SyntaxKind::TRAIT => sema.to_trait_def(&ast::Trait::cast(node)?)?.into(),
-        SyntaxKind::MODULE => sema.to_module_def(&ast::Module::cast(node)?)?.into(),
-        SyntaxKind::CONST => sema.to_const_def(&ast::Const::cast(node)?)?.into(),
-        SyntaxKind::STATIC => sema.to_static_def(&ast::Static::cast(node)?)?.into(),
-        SyntaxKind::TYPE_ALIAS => sema.to_def(&ast::TypeAlias::cast(node)?)?.into(),
+        SyntaxKind::FN => sema.to_fn_def(ast::Fn::cast(node)?)?.into(),
+        SyntaxKind::STRUCT => hir::Adt::from(sema.to_struct_def(ast::Struct::cast(node)?)?).into(),
+        SyntaxKind::ENUM => hir::Adt::from(sema.to_enum_def(ast::Enum::cast(node)?)?).into(),
+        SyntaxKind::UNION => hir::Adt::from(sema.to_def(ast::Union::cast(node)?)?).into(),
+        SyntaxKind::TRAIT => sema.to_trait_def(ast::Trait::cast(node)?)?.into(),
+        SyntaxKind::MODULE => sema.to_module_def(ast::Module::cast(node)?)?.into(),
+        SyntaxKind::CONST => sema.to_const_def(ast::Const::cast(node)?)?.into(),
+        SyntaxKind::STATIC => sema.to_static_def(ast::Static::cast(node)?)?.into(),
+        SyntaxKind::TYPE_ALIAS => sema.to_def(ast::TypeAlias::cast(node)?)?.into(),
         SyntaxKind::MACRO_RULES => {
-            sema.to_macro_def(&ast::Macro::MacroRules(ast::MacroRules::cast(node)?))?.into()
+            sema.to_macro_def(ast::Macro::MacroRules(ast::MacroRules::cast(node)?))?.into()
         }
-        SyntaxKind::MACRO_DEF => sema.to_macro_def(&ast::Macro::MacroDef(ast::MacroDef::cast(node)?))?.into(),
-        SyntaxKind::VARIANT => sema.to_enum_variant_def(&ast::Variant::cast(node)?)?.into(),
-        SyntaxKind::RECORD_FIELD => return Some(Def::Field(sema.to_def(&ast::RecordField::cast(node)?)?)),
+        SyntaxKind::MACRO_DEF => sema.to_macro_def(ast::Macro::MacroDef(ast::MacroDef::cast(node)?))?.into(),
+        SyntaxKind::VARIANT => sema.to_enum_variant_def(ast::Variant::cast(node)?)?.into(),
+        SyntaxKind::RECORD_FIELD => return Some(Def::Field(sema.to_def(ast::RecordField::cast(node)?)?)),
         _ => return None,
     };
     Some(Def::Item(item))
 }
 
-fn assoc(db: &Db, item: ModuleDef) -> Option<AssocItem> {
-    match item {
-        ModuleDef::Function(it) => it.as_assoc_item(db),
-        ModuleDef::Const(it) => it.as_assoc_item(db),
-        ModuleDef::TypeAlias(it) => it.as_assoc_item(db),
-        _ => None,
-    }
-}
-
 /// The trait `item` is an item of, when it is one.
 fn trait_of(db: &Db, item: ModuleDef) -> Option<Trait> {
-    assoc(db, item)?.container_trait(db)
+    item.as_assoc_item(db)?.container_trait(db)
 }
 
 /// Whether `found` is an impl's item implementing the trait item `item`.
 fn implements(db: &Db, found: ModuleDef, item: ModuleDef) -> bool {
-    trait_of(db, item).is_some_and(|of| assoc(db, found).and_then(|it| it.implemented_trait(db)) == Some(of))
+    trait_of(db, item).is_some_and(|of| found.as_assoc_item(db).and_then(|it| it.implemented_trait(db)) == Some(of))
 }
 
 /// Whether `found`, a reference resolved, is `item` or implements it.
@@ -242,12 +228,12 @@ fn files_of(db: &Db, def: Def) -> Vec<FileId> {
 }
 
 /// What `token`, the old name, is to `def`, across every macro expansion it is in.
-fn classify(cx: &Edits<'_>, token: &SyntaxToken, def: Def, node: &SyntaxNode) -> Result<Class, String> {
+fn classify<'db>(cx: &Edits<'db, impl Files>, token: ast::Token<'db>, def: Def, node: ast::Node<'db>) -> Result<Class, String> {
     let mut found = Class::No;
     let mut other = false;
-    for mapped in cx.sema.descend_into_macros_exact(token.clone()) {
-        let expanded = mapped != *token;
-        match classify_one(cx, &mapped, def, node)? {
+    for mapped in cx.sema.descend_into_macros_exact(token) {
+        let expanded = mapped != token;
+        match classify_one(cx, mapped, def, node)? {
             Class::No => other = true,
             Class::Shorthand | Class::ShorthandValue if expanded => {
                 return Err("a field shorthand in a macro's input: write it out (`x: x`) to rename it".to_owned());
@@ -267,29 +253,29 @@ fn unresolved() -> String {
         .to_owned()
 }
 
-fn classify_one(cx: &Edits<'_>, token: &SyntaxToken, def: Def, node: &SyntaxNode) -> Result<Class, String> {
+fn classify_one<'db>(cx: &Edits<'db, impl Files>, token: ast::Token<'db>, def: Def, node: ast::Node<'db>) -> Result<Class, String> {
     let sema = &cx.sema;
     let db = cx.db;
     let parent = token.parent().ok_or("a token outside any node")?;
     match parent.kind() {
         SyntaxKind::NAME => {
             let owner = parent.parent().ok_or("a name outside any node")?;
-            if owner == *node {
+            if owner == node {
                 return Ok(Class::Name);
             }
-            if let Some(pat) = ast::IdentPat::cast(owner.clone()) {
+            if let Some(pat) = ast::IdentPat::cast(owner) {
                 if let Some(field) = owner.parent().and_then(ast::RecordPatField::cast)
                     && field.name_ref().is_none()
                 {
                     let Def::Field(def) = def else { return Ok(Class::No) };
-                    return match sema.resolve_record_pat_field(&field) {
+                    return match sema.resolve_record_pat_field(field) {
                         Some((it, _)) if it == def => Ok(Class::Shorthand),
                         Some(_) => Ok(Class::No),
                         None => Err(unresolved()),
                     };
                 }
                 let Def::Item(item) = def else { return Ok(Class::No) };
-                return Ok(match sema.resolve_bind_pat_to_const(&pat) {
+                return Ok(match sema.resolve_bind_pat_to_const(pat) {
                     Some(it) if it == item => Class::Name,
                     _ => Class::No,
                 });
@@ -299,17 +285,17 @@ fn classify_one(cx: &Edits<'_>, token: &SyntaxToken, def: Def, node: &SyntaxNode
                 return Ok(Class::No);
             }
             let found: Option<ModuleDef> = match owner.kind() {
-                SyntaxKind::FN => ast::Fn::cast(owner).and_then(|it| sema.to_fn_def(&it)).map(Into::into),
-                SyntaxKind::CONST => ast::Const::cast(owner).and_then(|it| sema.to_const_def(&it)).map(Into::into),
-                SyntaxKind::TYPE_ALIAS => ast::TypeAlias::cast(owner).and_then(|it| sema.to_def(&it)).map(Into::into),
+                SyntaxKind::FN => ast::Fn::cast(owner).and_then(|it| sema.to_fn_def(it)).map(Into::into),
+                SyntaxKind::CONST => ast::Const::cast(owner).and_then(|it| sema.to_const_def(it)).map(Into::into),
+                SyntaxKind::TYPE_ALIAS => ast::TypeAlias::cast(owner).and_then(|it| sema.to_def(it)).map(Into::into),
                 _ => None,
             };
             Ok(if found.is_some_and(|it| implements(db, it, item)) { Class::Name } else { Class::No })
         }
         SyntaxKind::NAME_REF => {
-            let name_ref = ast::NameRef::cast(parent.clone()).expect("a name reference");
-            if let Some(field) = ast::RecordExprField::for_field_name(&name_ref) {
-                return record_expr_field(cx, &field, def);
+            let name_ref = ast::NameRef::cast(parent).expect("a name reference");
+            if let Some(field) = ast::RecordExprField::for_field_name(name_ref) {
+                return record_expr_field(cx, field, def);
             }
             let context = parent.parent().ok_or("a name reference outside any node")?;
             match context.kind() {
@@ -318,13 +304,13 @@ fn classify_one(cx: &Edits<'_>, token: &SyntaxToken, def: Def, node: &SyntaxNode
                     let path = context.parent().and_then(ast::Path::cast).ok_or("a path segment outside a path")?;
                     let in_use = path.syntax().ancestors().any(|it| it.kind() == SyntaxKind::USE_TREE);
                     let hit = if in_use {
-                        let per_ns = sema.resolve_path_per_ns(&path).ok_or_else(unresolved)?;
+                        let per_ns = sema.resolve_path_per_ns(path).ok_or_else(unresolved)?;
                         [per_ns.type_ns, per_ns.value_ns, per_ns.macro_ns]
                             .into_iter()
                             .flatten()
                             .any(|it| matches!(it, PathResolution::Def(found) if is(db, found, item)))
                     } else {
-                        match sema.resolve_path(&path) {
+                        match sema.resolve_path(path) {
                             Some(PathResolution::Def(found)) => is(db, found, item),
                             Some(_) => false,
                             None => return Err(unresolved()),
@@ -335,7 +321,7 @@ fn classify_one(cx: &Edits<'_>, token: &SyntaxToken, def: Def, node: &SyntaxNode
                 SyntaxKind::METHOD_CALL_EXPR => {
                     let Def::Item(item @ ModuleDef::Function(_)) = def else { return Ok(Class::No) };
                     let call = ast::MethodCallExpr::cast(context).expect("a method call");
-                    match sema.resolve_method_call(&call) {
+                    match sema.resolve_method_call(call) {
                         Some(found) => Ok(if is(db, found.into(), item) { Class::Name } else { Class::No }),
                         None => Err(unresolved()),
                     }
@@ -343,7 +329,7 @@ fn classify_one(cx: &Edits<'_>, token: &SyntaxToken, def: Def, node: &SyntaxNode
                 SyntaxKind::FIELD_EXPR => {
                     let Def::Field(def) = def else { return Ok(Class::No) };
                     let expr = ast::FieldExpr::cast(context).expect("a field expression");
-                    match sema.resolve_field(&expr) {
+                    match sema.resolve_field(expr) {
                         Some(Either::Left(it)) => Ok(if it == def { Class::Name } else { Class::No }),
                         Some(Either::Right(_)) => Ok(Class::No),
                         None => Err(unresolved()),
@@ -352,7 +338,7 @@ fn classify_one(cx: &Edits<'_>, token: &SyntaxToken, def: Def, node: &SyntaxNode
                 SyntaxKind::RECORD_PAT_FIELD => {
                     let Def::Field(def) = def else { return Ok(Class::No) };
                     let field = ast::RecordPatField::cast(context).expect("a record pattern field");
-                    match sema.resolve_record_pat_field(&field) {
+                    match sema.resolve_record_pat_field(field) {
                         Some((it, _)) => Ok(if it == def { Class::Name } else { Class::No }),
                         None => Err(unresolved()),
                     }
@@ -382,7 +368,7 @@ fn classify_one(cx: &Edits<'_>, token: &SyntaxToken, def: Def, node: &SyntaxNode
 
 /// What a record expression's field name is to `def`: the field, and in a shorthand
 /// (`S { x }`) the value too, a path of one segment.
-fn record_expr_field(cx: &Edits<'_>, field: &ast::RecordExprField, def: Def) -> Result<Class, String> {
+fn record_expr_field<'db>(cx: &Edits<'db, impl Files>, field: ast::RecordExprField<'db>, def: Def) -> Result<Class, String> {
     let shorthand = field.name_ref().is_none();
     let resolved = cx.sema.resolve_record_field(field);
     if let Some((it, _, _)) = &resolved
@@ -406,7 +392,7 @@ fn record_expr_field(cx: &Edits<'_>, field: &ast::RecordExprField, def: Def) -> 
         return Err("a field shorthand with no value path".to_owned());
     };
     let path = value.path().ok_or("a field shorthand with no value path")?;
-    match cx.sema.resolve_path(&path) {
+    match cx.sema.resolve_path(path) {
         Some(PathResolution::Def(found)) if is(cx.db, found, item) => Ok(Class::ShorthandValue),
         Some(_) => Ok(Class::No),
         None => Err(unresolved()),
@@ -416,9 +402,9 @@ fn record_expr_field(cx: &Edits<'_>, field: &ast::RecordExprField, def: Def) -> 
 /// The item a rewritten occurrence touches, and how: the renamed item's own name renames it; one
 /// in a body changes that body; in a use or a module's macro call, the scope; anywhere else, the
 /// item's signature, or its fields.
-fn touch_of(file: u32, token: &SyntaxToken) -> Touch {
+fn touch_of(file: u32, token: ast::Token<'_>) -> Touch {
     let parent = token.parent().expect("a token has a parent");
-    let Some(top) = path::top_of(&parent) else {
+    let Some(top) = path::top_of(parent) else {
         return Touch { file, at: At::File, how: How::Scope };
     };
     let at = At::Item(top.text_range().start());
@@ -426,7 +412,7 @@ fn touch_of(file: u32, token: &SyntaxToken) -> Touch {
     let own_name = parent.kind() == SyntaxKind::NAME && parent.parent().is_some_and(|it| it == top);
     let how = if own_name {
         How::Renamed
-    } else if body_of(&top).is_some_and(|body| body.contains_range(range)) {
+    } else if body_of(top).is_some_and(|body| body.contains_range(range)) {
         How::Body
     } else if top.kind() == SyntaxKind::MODULE {
         How::Scope
@@ -444,11 +430,11 @@ fn touch_of(file: u32, token: &SyntaxToken) -> Touch {
 }
 
 /// The range of a top item's body: a fn's block, a const's or static's value.
-fn body_of(top: &SyntaxNode) -> Option<TextRange> {
+fn body_of(top: ast::Node<'_>) -> Option<TextRange> {
     match top.kind() {
-        SyntaxKind::FN => Some(ast::Fn::cast(top.clone())?.body()?.syntax().text_range()),
-        SyntaxKind::CONST => Some(ast::Const::cast(top.clone())?.body()?.syntax().text_range()),
-        SyntaxKind::STATIC => Some(ast::Static::cast(top.clone())?.body()?.syntax().text_range()),
+        SyntaxKind::FN => Some(ast::Fn::cast(top)?.body()?.syntax().text_range()),
+        SyntaxKind::CONST => Some(ast::Const::cast(top)?.body()?.syntax().text_range()),
+        SyntaxKind::STATIC => Some(ast::Static::cast(top)?.body()?.syntax().text_range()),
         _ => None,
     }
 }
@@ -456,12 +442,12 @@ fn body_of(top: &SyntaxNode) -> Option<TextRange> {
 /// The moves of a renamed module's own file, and of its directory when its children are in it:
 /// `m.rs` to `n.rs` (and `m/` to `n/`), or `m/mod.rs`'s `m/` to `n/`. A module with a `#[path]`
 /// keeps its files.
-fn moves(cx: &mut Edits<'_>, module: hir::Module, node: &SyntaxNode, old: &str, to: &str) -> Result<(), String> {
-    let decl = ast::Module::cast(node.clone()).expect("a module's node");
+fn moves(cx: &mut Edits<'_, impl Files>, module: hir::Module, node: ast::Node<'_>, old: &str, to: &str) -> Result<(), String> {
+    let decl = ast::Module::cast(node).expect("a module's node");
     if decl.item_list().is_some() {
         return Ok(());
     }
-    if decl.attrs().any(|it| it.path().is_some_and(|path| path.syntax().text().to_string() == "path")) {
+    if decl.attrs().any(|it| it.path().is_some_and(|path| path.syntax().text() == "path")) {
         return Ok(());
     }
     let file = module

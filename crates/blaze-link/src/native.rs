@@ -531,7 +531,10 @@ impl Parsed {
             section.retain
                 || (!bound(object, at)
                     && (kept_by_name(object.name(section.name))
-                        || matches!(section.what, SectionKind::Alloc(Class::InitArray | Class::FiniArray, _))))
+                        || matches!(
+                            section.what,
+                            SectionKind::Alloc(Class::PreinitArray | Class::InitArray | Class::FiniArray, _)
+                        )))
         };
         let (mut root_count, mut unwind_count) = (0, 0);
         for (at, section) in object.sections.iter().enumerate() {
@@ -1792,7 +1795,9 @@ impl<'a> Stage<'a> {
                             let section = object.name(section.name);
                             // alloc: error path
                             error(None, match member_name {
+                                // alloc: error path
                                 Some(member) => format!("{}({member}): {section}: {what}", it.name),
+                                // alloc: error path
                                 None => format!("{}: {section}: {what}", it.name),
                             })
                         })?;
@@ -2093,6 +2098,16 @@ impl<'a> Stage<'a> {
     /// error naming it and who refers to it.
     fn decide(&self, graph: &Graph, sym: Sym, weak: bool) -> Result<Decision, LinkError> {
         let Some(name) = self.symbols.name_of(sym) else { return Ok(Decision::Skip) };
+        if self.output.dev_run.is_some() && name == crate::stage::START_HOOK {
+            return Err(error(
+                None,
+                // alloc: error path
+                format!(
+                    "undefined symbol `{name}`, which a dev run's first initializer calls: blaze-live's dev runtime \
+                     (`blaze_inproc::runtime`) must be linked into the executable itself"
+                ),
+            ));
+        }
         if let Some(special) = self.writer.special(name) {
             return Ok(Decision::Special(special));
         }

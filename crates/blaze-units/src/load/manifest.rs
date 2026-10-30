@@ -4,7 +4,6 @@
 //! ([`Snapshot`]), so a later query reads the same manifests again from exactly those.
 
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
@@ -15,7 +14,7 @@ use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
 use super::config::{ConfigChain, ConfigOf, ConfigRead};
-use super::files::{Fill, Reads, Snapshot, run_over};
+use super::files::{Fill, Reads, Snapshot, Used, run_over};
 use super::invocation::Asking;
 use super::{load_error, unmounted_error};
 use super::key_id;
@@ -57,13 +56,14 @@ impl Query for ManifestQuery {
     }
 
     fn execute(cx: &mut Cx<'_>, key: &ManifestKey) -> Result<Cbor<ManifestRead>, Cancelled> {
-        let config = match cx.get::<ConfigChain>(&key.config)?.get() {
+        let mut config = match cx.get::<ConfigChain>(&key.config)?.get() {
             Ok(config) => config,
             Err(error) => return Ok(Cbor(ManifestRead { snapshot: Snapshot::default(), read: Err(error) })),
         };
         let fill = Fill { config: &key.config, own: Some(&key.path), members: false };
         let path = PathBuf::from(&key.path);
-        let (read, used) = run_over(cx, config.snapshot.clone(), &fill, |_, files, _| {
+        let base = std::mem::take(&mut config.snapshot);
+        let (read, used) = run_over(cx, base, &fill, |_, files, _| {
             Ok(read_one(&config, files, &path, key.source.as_deref()))
         })?;
         let read = match used.unmounted() {
@@ -76,11 +76,11 @@ impl Query for ManifestQuery {
 
 fn read_one(
     config: &ConfigRead,
-    files: Rc<dyn Files>,
+    files: Snap,
     path: &Path,
     source: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
-    let ctx = Context::with_files(super::config::build(config, files.clone())?, files);
+    let ctx = Context::new(super::config::build(config, files)?);
     let source = match source {
         Some(source) => manifest_source(source, &ctx.config)?,
         None => blaze_manifest::source::SourceId::for_manifest_path(path)?,
@@ -130,7 +130,7 @@ pub(crate) struct WorkspaceQuery;
 impl Query for WorkspaceQuery {
     const KIND: QueryKind = QueryKind(0x6017);
     const NAME: &'static str = "cargo workspace";
-    const PRODUCER: ContentId = producer("blaze v2 cargo workspace 1");
+    const PRODUCER: ContentId = producer("blaze v2 cargo workspace 2");
     type Key = WorkspaceKey;
     type Value = Cbor<Result<WorkspaceRead, LoadError>>;
 
@@ -139,7 +139,7 @@ impl Query for WorkspaceQuery {
     }
 
     fn execute(cx: &mut Cx<'_>, key: &WorkspaceKey) -> Result<Cbor<Result<WorkspaceRead, LoadError>>, Cancelled> {
-        let config = match cx.get::<ConfigChain>(&key.config)?.get() {
+        let mut config = match cx.get::<ConfigChain>(&key.config)?.get() {
             Ok(config) => config,
             Err(error) => return Ok(Cbor(Err(error))),
         };
@@ -155,7 +155,8 @@ impl Query for WorkspaceQuery {
             (None, ConfigOf::Fixed { .. }) => None,
         };
         let fill = Fill { config: &key.config, own: None, members: true };
-        let (found, used) = run_over(cx, config.snapshot.clone(), &fill, |_, files, _| {
+        let base = std::mem::take(&mut config.snapshot);
+        let (found, used) = run_over(cx, base, &fill, |_, files, _| {
             Ok(read_workspace(&config, files, manifest_path.as_deref()))
         })?;
         if let Some(at) = used.unmounted() {
@@ -170,14 +171,13 @@ impl Query for WorkspaceQuery {
 
 fn read_workspace(
     config: &ConfigRead,
-    files: Rc<dyn Files>,
+    files: Snap,
     manifest_path: Option<&str>,
 ) -> Result<WorkspaceRead, LoadError> {
-    let ctx = Context::with_files(
+    let ctx = Context::new(
         super::config::build(config, files.clone()).map_err(|error| load_error(&error, None))?,
-        files.clone(),
     );
-    let current = root_manifest(manifest_path, &config.cwd, &*files)?;
+    let current = root_manifest(manifest_path, &config.cwd, &files)?;
     let ws = Workspace::new(Path::new(&current), &ctx).map_err(|error| load_error(&error, Some(current.clone())))?;
     let show = |path: &Path| path.display().to_string();
     let members: Vec<String> = ws.members().map(|(path, _)| show(path)).collect();
@@ -203,7 +203,7 @@ fn read_workspace(
 
 /// The manifest cargo reads: `--manifest-path`'s, or the nearest `Cargo.toml` from the cwd up,
 /// as cargo's `find_root_manifest_for_wd` and `root_manifest` say it.
-fn root_manifest(manifest_path: Option<&str>, cwd: &str, files: &dyn Files) -> Result<String, LoadError> {
+fn root_manifest(manifest_path: Option<&str>, cwd: &str, files: &Snap) -> Result<String, LoadError> {
     use blaze_manifest::files::FileKind;
     if let Some(path) = manifest_path {
         let path = super::files::normal(Path::new(path)).unwrap_or_else(|| path.to_owned());
@@ -244,24 +244,22 @@ fn root_manifest(manifest_path: Option<&str>, cwd: &str, files: &dyn Files) -> R
     Err(LoadError { what: format!("could not find `Cargo.toml` in `{cwd}` or any parent directory"), at: None })
 }
 
-/// The workspace `read` describes read again over its snapshot (and `extra`, files a later
-/// query read itself), handed to `then` with its context.
+/// The workspace `read` describes read again over `base`, its snapshot (moved out of it, so
+/// no file is copied), handed to `then` with its context.
 pub(crate) fn replay<'db, R>(
     cx: &mut Cx<'db>,
     read: &WorkspaceRead,
+    base: Snapshot,
     config_of: &ConfigOf,
-    extra: &Snapshot,
-    mut then: impl FnMut(&mut Cx<'db>, &Context, &Workspace<'_>, Rc<dyn Files>, &Reads<'_>) -> Result<R, Cancelled>,
-) -> Result<(Result<R, LoadError>, Snapshot), Cancelled> {
-    let mut base = read.snapshot.clone();
-    base.merge(extra.clone());
+    mut then: impl FnMut(&mut Cx<'db>, &Context<Snap>, &Workspace<'_, Snap>, Snap, &Reads<'_>) -> Result<R, Cancelled>,
+) -> Result<(Result<R, LoadError>, Used), Cancelled> {
     let fill = Fill { config: config_of, own: None, members: true };
     run_over(cx, base, &fill, |cx, files, reads| {
         let config = match super::config::build(&read.config, files.clone()) {
             Ok(config) => config,
             Err(error) => return Ok(Err(load_error(&error, None))),
         };
-        let ctx = Context::with_files(config, files.clone());
+        let ctx = Context::new(config);
         let ws = match Workspace::new(Path::new(&read.current), &ctx) {
             Ok(ws) => ws,
             Err(error) => return Ok(Err(load_error(&error, Some(read.current.clone())))),
@@ -274,7 +272,7 @@ pub(crate) fn replay<'db, R>(
 /// (blaze-metadata's `manifest_source`).
 pub(crate) fn manifest_source(
     source: &str,
-    config: &blaze_manifest::Config,
+    config: &blaze_manifest::Config<Snap>,
 ) -> anyhow::Result<blaze_manifest::source::SourceId> {
     use anyhow::Context as _;
     use blaze_manifest::source::{CRATES_IO_INDEX, SourceId};

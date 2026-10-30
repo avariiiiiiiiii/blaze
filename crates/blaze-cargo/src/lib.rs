@@ -3,6 +3,7 @@
 //! names (`check`, `doctest`, `link`, ...) take what is here of them and add the rest.
 
 #![allow(clippy::print_stderr, reason = "a command line program: stderr is where it speaks")]
+#![deny(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -27,11 +28,16 @@ pub mod live;
 pub mod memory;
 pub mod plan;
 pub mod process;
+#[allow(unsafe_code, reason = "the kernel calls std has no wrapper for, behind safe functions")]
+pub mod raw;
+#[allow(unsafe_code, reason = "the remote store's own")]
 pub mod remote;
 pub mod renamed;
+#[allow(unsafe_code, reason = "the sandbox's own system calls")]
 pub mod sandbox;
 /// blaze v2's daemon: the plane, the agent API's server and session, the VFS, the database and
 /// the store in one loop (docs/v2/plan/lanes/cargo/notes.md section 6).
+#[allow(unsafe_code, reason = "the daemon's own signal and process calls")]
 pub mod serve;
 pub mod socket;
 pub mod stub;

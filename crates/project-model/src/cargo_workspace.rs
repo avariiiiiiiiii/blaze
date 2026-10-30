@@ -171,7 +171,9 @@ pub struct CargoConfig {
 
 /// The root manifest of the workspace a manifest is in, and `cargo metadata` of it for the
 /// target with the triple and the `cfg` given, cargo run with the variables given.
+// dyn: blaze-cargo's reader, which depends on this crate; asked once per load.
 type Root = dyn Fn(&ManifestPath) -> anyhow::Result<ManifestPath> + Send + Sync;
+// dyn: blaze-cargo's resolver, which depends on this crate; asked once per load.
 type Metadata = dyn Fn(
         &ManifestPath,
         Option<&str>,
@@ -185,6 +187,7 @@ type Metadata = dyn Fn(
 /// `library/Cargo.toml`), as `Sysroot::load_workspace` asks cargo for it: with the features
 /// given, for the target with the triple given (none: every platform's), `--no-deps` or not,
 /// cargo run with the variables given.
+// dyn: blaze-cargo's reader of the library, which depends on this crate; once per sysroot load.
 type Library = dyn Fn(
         &ManifestPath,
         &CargoFeatures,
@@ -242,6 +245,7 @@ pub struct OwnBuildOutput {
     pub proc_macro_dylib: Option<AbsPathBuf>,
 }
 
+// dyn: blaze-cargo's build of the scripts, which depends on this crate; once per workspace load.
 type BuildScripts = dyn Fn(&CargoWorkspace, &OwnBuildAsked<'_>) -> anyhow::Result<Vec<(Package, OwnBuildOutput)>>
     + Send
     + Sync;
@@ -775,7 +779,7 @@ impl CargoWorkspace {
         &self,
         from: &AbsPath,
         to: &AbsPath,
-        moved: &dyn Fn(&AbsPath) -> bool,
+        moved: impl Fn(&AbsPath) -> bool,
     ) -> CargoWorkspace {
         let place = |path: &AbsPath| match path.strip_prefix(from) {
             Some(inside) => to.join(inside),
@@ -1021,7 +1025,7 @@ impl FetchMetadata {
         // Pre-fetch basic metadata using `--no-deps`, which:
         // - avoids fetching registries like crates.io,
         // - skips dependency resolution and does not modify lockfiles,
-        // - and thus doesn't require progress reporting or copying lockfiles.
+        // - and thus doesn't require copying lockfiles.
         //
         // Useful as a fast fallback to extract info like `target-dir`.
         let cargo_command;
@@ -1055,7 +1059,6 @@ impl FetchMetadata {
     pub(crate) fn exec(
         self,
         locked: bool,
-        progress: &dyn Fn(String),
     ) -> anyhow::Result<(cargo_metadata::Metadata, Option<anyhow::Error>)> {
         let Self {
             mut command,
@@ -1099,22 +1102,11 @@ impl FetchMetadata {
         }
         command.other_options(other_options);
 
-        progress("cargo metadata: started".to_owned());
-
-        let res = (|| -> anyhow::Result<(_, _)> {
-            let mut errored = false;
+        (|| -> anyhow::Result<(_, _)> {
             tracing::debug!("Running `{:?}`", command.cargo_command());
             let output =
-                spawn_with_streaming_output(command.cargo_command(), &mut |_| (), &mut |line| {
-                    errored = errored || line.starts_with("error") || line.starts_with("warning");
-                    if errored {
-                        progress("cargo metadata: ?".to_owned());
-                        return;
-                    }
-                    progress(format!("cargo metadata: {line}"));
-                })?;
+                spawn_with_streaming_output(command.cargo_command(), &mut |_| (), &mut |_| ())?;
             if !output.status.success() {
-                progress(format!("cargo metadata: failed {}", output.status));
                 let error = cargo_metadata::Error::CargoMetadata {
                     stderr: String::from_utf8(output.stderr)?,
                 }
@@ -1138,9 +1130,7 @@ impl FetchMetadata {
                 .ok_or(cargo_metadata::Error::NoJson)?;
             Ok((cargo_metadata::MetadataCommand::parse(stdout)?, None))
         })()
-        .with_context(|| format!("Failed to run `{:?}`", command.cargo_command()));
-        progress("cargo metadata: finished".to_owned());
-        res
+        .with_context(|| format!("Failed to run `{:?}`", command.cargo_command()))
     }
 }
 

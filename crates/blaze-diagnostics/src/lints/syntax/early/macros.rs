@@ -43,6 +43,7 @@ use crate::{
 /// expansions, each call's location read once and its lints picked by the kind of its macro.
 /// Macro definitions are linted in the early pass's one walk ([`definition`]).
 pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
+    // alloc: empty until a lint fires; holds only what fires
     let mut emitted = Vec::new();
     let x86 = asm::x86(walk);
     for tree in &walk.trees {
@@ -88,6 +89,7 @@ fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &Mac
     let MacroDefKind::Declarative(def, _) = loc.def.kind else { return None };
     let MacroCallKind::FnLike { expand_to, .. } = &loc.kind else { return None };
     let node = loc.to_node(db);
+    // clone: a cursor's refcount (no allocation), once per macro call
     let mac = ast::MacroCall::cast(node.value.clone())?;
     let is_trailing = is_trailing(&mac);
     let semicolon = match expand_to {
@@ -117,8 +119,10 @@ fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &Mac
     };
     let mut diag = Diag::lint(lint, "trailing semicolon in macro used in expression position", semicolon);
     if is_trailing {
+        // alloc: the lint's text, for a lint found
         let name = def.to_node(db).name().map(|it| it.text().to_string())?;
         diag.note("macro invocations at the end of a block are treated as expressions");
+        // alloc: the lint's text, for a lint found
         diag.note(format!(
             "to ignore the value produced by the macro, add a semicolon after the invocation of `{name}`"
         ));
@@ -173,6 +177,7 @@ fn span_of_token(cx: &Cx<'_, '_>, call: MacroCallId, token: span::Span) -> Span 
         return Span { expansion, ..written };
     }
     let at = match &expansion {
+        // clone: a lint's span, for a lint found
         Some(it) => Span { expansion: None, ..it.call_site.clone() },
         None => {
             let at = loc.kind.original_call_range(db, loc.krate);
@@ -193,10 +198,12 @@ fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &Mac
     let MacroCallKind::FnLike { expand_to, .. } = &loc.kind else { return None };
     let first = tree.root.children().next();
     let expr = match expand_to {
+        // clone: a cursor's refcount (no allocation), once per macro call
         ExpandTo::Expr if ast::Expr::can_cast(tree.root.kind()) => tree.root.clone(),
         ExpandTo::Expr => first.filter(|it| ast::Expr::can_cast(it.kind()))?,
         ExpandTo::Statements => match first? {
             it if ast::Expr::can_cast(it.kind()) => it,
+            // clone: a cursor's refcount (no allocation), once per macro call
             it => ast::ExprStmt::cast(it)?.expr()?.syntax().clone(),
         },
         _ => return None,
@@ -222,9 +229,10 @@ fn next_token(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
         if token.text_range().start() < offset {
             return false;
         }
-        match ast::Comment::cast(token.clone()) {
-            Some(comment) => comment.kind().doc.is_some(),
-            None => !token.kind().is_trivia(),
+        match token.kind() {
+            // clone: a cursor's refcount (no allocation) for the typed view, after the kind test
+            SyntaxKind::COMMENT => ast::Comment::cast(token.clone()).is_some_and(|it| it.kind().doc.is_some()),
+            kind => !kind.is_trivia(),
         }
     })
 }
@@ -248,6 +256,7 @@ fn duplicate_attribute(cx: &Cx<'_, '_>, walk: &Walk<'_>, loc: &MacroCallLoc) -> 
     if node.value.parent().is_some_and(|it| matches!(it.kind(), SyntaxKind::STMT_LIST | SyntaxKind::MACRO_STMTS)) {
         return None;
     }
+    // clone: a cursor's refcount (no allocation), once per macro call
     let owner = ast::AnyHasAttrs::cast(node.value.clone())?;
     let (_, invoked) = censored_attr_ids.invoc_attr().find_attr_range(db, loc.krate, *ast_id);
     let invoked = invoked.syntax().text_range();

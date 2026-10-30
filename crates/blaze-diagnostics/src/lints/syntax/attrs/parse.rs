@@ -26,14 +26,18 @@
 
 use hir::InFile;
 use rustc_hash::FxHashMap;
-use syntax::{AstNode, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, T, TextRange, ast};
+use smallvec::SmallVec;
+use syntax::{
+    NodeOrToken, SyntaxKind, T, TextRange,
+    view::{self as ast, AstNode},
+};
 
 use super::{
     Args, Attr, AttrKind, Owner, Target, lint_at, parsed,
     table::{self, Allowed, Builtin, Kind, OnDuplicate, Policy, Safety, Targets},
 };
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view},
     lints::{
         edit_distance::find_best_match_for_name_with_substrings,
         registry::LintId,
@@ -56,7 +60,7 @@ pub(crate) struct Krate {
 }
 
 impl Krate {
-    pub(crate) fn of(cx: &Cx<'_, '_>, owners: &[Owner]) -> Krate {
+    pub(crate) fn of(cx: &Cx<'_, '_>, owners: &[Owner<'_>]) -> Krate {
         let root = cx.krate.root_module(cx.db).as_source_file_id(cx.db);
         let root_name = root.map(|it| cx.file_name(it.file_id(cx.db))).unwrap_or_default();
         let mut krate = Krate {
@@ -71,8 +75,8 @@ impl Krate {
         let crate_attrs = owners.iter().filter(|it| it.target == Target::Crate).flat_map(|it| &it.attrs);
         for attr in crate_attrs {
             let (true, Args::List(tt)) = (attr.is("feature"), attr.args()) else { continue };
-            for item in items(&tt) {
-                match word(&item).as_deref() {
+            for item in items(tt) {
+                match word(&item) {
                     Some("fn_delegation") => krate.fn_delegation = true,
                     Some("stmt_expr_attributes") => krate.stmt_expr_attributes = true,
                     Some("extern_types") => krate.extern_types = true,
@@ -106,9 +110,11 @@ struct MacroUse {
 }
 
 /// The lints attribute parsing gives of `owners`' builtin attributes.
-pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<Emitted> {
+pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner<'_>]) -> Vec<Emitted> {
     let krate = Krate::of(cx, owners);
+    // alloc: empty, allocates nothing until a lint
     let mut emitted = Vec::new();
+    // alloc: as above; then one buffer for the crate
     let mut found = Vec::new();
     for owner in owners {
         let on_call = owner.target == Target::MacroCall;
@@ -119,8 +125,8 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<
             if on_call {
                 seen = Seen::default();
             }
-            let path = attr.path();
-            let segments: smallvec::SmallVec<[&str; 2]> = path.iter().map(String::as_str).collect();
+            // alloc: an inline `SmallVec`, nothing on the heap for a path of up to two segments
+            let segments: smallvec::SmallVec<[&str; 2]> = attr.segments().collect();
             match table::builtin(&segments) {
                 Some(builtin) => {
                     safety(cx, attr, builtin, &mut found);
@@ -160,20 +166,20 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, _walk: &Walk<'_>, owners: &[Owner]) -> Vec<
 /// not, it gives an error (`diagnostics-items`') and the attribute is not parsed further. A
 /// `= value` must be an unsuffixed literal; a list must be in parentheses and of meta items, but
 /// for `diagnostic::` attributes and `rustc_dummy`, whose lists are always taken.
-fn parses(attr: &Attr, builtin: &Builtin) -> bool {
+fn parses(attr: &Attr<'_>, builtin: &Builtin) -> bool {
     match attr.args() {
         Args::Word => true,
-        Args::NameValue(value) => is_unsuffixed_literal(value.as_ref()),
+        Args::NameValue(value) => is_unsuffixed_literal(value),
         Args::List(_) if matches!(builtin.path, ["diagnostic", ..] | ["rustc_dummy"]) => true,
         Args::List(tt) => {
             tt.left_delimiter_token().is_some_and(|it| it.kind() == T!['('])
-                && items(&tt).iter().all(|item| is_meta_item(item))
+                && items(tt).iter().all(|item| is_meta_item(item))
         }
     }
 }
 
 /// rustc's `expr_to_lit` accepting `value`: a literal without a suffix.
-fn is_unsuffixed_literal(value: Option<&ast::Expr>) -> bool {
+fn is_unsuffixed_literal(value: Option<ast::Expr<'_>>) -> bool {
     let Some(ast::Expr::Literal(literal)) = value else { return false };
     let token = literal.token();
     let text = token.text();
@@ -190,8 +196,8 @@ fn is_unsuffixed_literal(value: Option<&ast::Expr>) -> bool {
 
 /// Whether rustc's meta item list parser takes `item`: a literal, or a path with nothing after
 /// it, a parenthesized list or `= value`.
-fn is_meta_item(item: &[SyntaxElement]) -> bool {
-    let is_path_token = |it: &SyntaxElement| {
+fn is_meta_item(item: &[ast::Element<'_>]) -> bool {
+    let is_path_token = |it: &ast::Element<'_>| {
         matches!(it, NodeOrToken::Token(it) if matches!(it.kind(), SyntaxKind::IDENT | T![::] | T![self] | T![super] | T![crate] | T![Self]) || it.kind().is_keyword(span::Edition::CURRENT))
     };
     match item {
@@ -205,7 +211,8 @@ fn is_meta_item(item: &[SyntaxElement]) -> bool {
             match &item[path..] {
                 [] => true,
                 [NodeOrToken::Node(list)] => {
-                    ast::TokenTree::cast(list.clone()).and_then(|it| it.left_delimiter_token()).is_some_and(|it| it.kind() == T!['('])
+                    list.kind() == SyntaxKind::TOKEN_TREE
+                        && list.first_child_or_token().and_then(NodeOrToken::into_token).is_some_and(|it| it.kind() == T!['('])
                 }
                 [NodeOrToken::Token(eq), value @ ..] => eq.kind() == T![=] && !value.is_empty(),
                 _ => false,
@@ -215,13 +222,14 @@ fn is_meta_item(item: &[SyntaxElement]) -> bool {
 }
 
 /// rustc's `doc_str`: a doc comment or `#[doc = "..."]`.
-fn is_doc_str(attr: &Attr) -> bool {
-    attr.is_doc_comment() || attr.is("doc") && matches!(attr.args(), Args::NameValue(value) if string(value.as_ref()).is_some())
+fn is_doc_str(attr: &Attr<'_>) -> bool {
+    attr.is_doc_comment()
+        || attr.is("doc") && matches!(attr.args(), Args::NameValue(value) if with_string(value, |_| ()).is_some())
 }
 
 /// rustc's `check_attribute_safety`: an attribute that must be `unsafe(..)` and is not,
 /// before the edition it must be, and `unsafe_code` of every unsafe attribute.
-fn safety(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, found: &mut Vec<Diag>) {
+fn safety(cx: &Cx<'_, '_>, attr: &Attr<'_>, builtin: &Builtin, found: &mut Vec<Diag>) {
     let Safety::Unsafe { note, unsafe_since } = builtin.safety else { return };
     let outside = cx.lint_may_fire(LintId::named("unsafe_attr_outside_unsafe"));
     let code = cx.lint_may_fire(LintId::named("unsafe_code"));
@@ -234,11 +242,13 @@ fn safety(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, found: &mut Vec<Diag>
         let is_error = unsafe_since.is_none_or(|since| edition >= since);
         if !is_error {
             let path = cx.span(attr.in_file(attr.path_range()));
+            // clone: the diagnostic's span
             let mut diag = Diag::lint("unsafe_attr_outside_unsafe", "unsafe attribute used without unsafe", path.clone());
             diag.span_label(path, "usage of unsafe attribute");
             if !hides_wrapping(cx, attr) {
                 diag.multipart_suggestion(
                     "wrap the attribute in `unsafe(...)`",
+                    // alloc: the diagnostic's text
                     vec![(inner.shrink_to_lo(), "unsafe(".to_owned()), (inner.shrink_to_hi(), ")".to_owned())],
                     Applicability::MachineApplicable,
                 );
@@ -249,6 +259,7 @@ fn safety(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, found: &mut Vec<Diag>
     if !code {
         return;
     }
+    // alloc: the diagnostic's text
     let mut diag = Diag::lint("unsafe_code", format!("usage of the unsafe `{}` attribute", attr.name()), inner);
     diag.note(note);
     found.push(diag);
@@ -257,13 +268,14 @@ fn safety(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, found: &mut Vec<Diag>
 /// Whether rustc leaves out the suggestion to wrap the attribute in `unsafe(..)`: it is from an
 /// expansion and its text is a macro call or a whole attribute (`safety.rs`'s
 /// `not_from_proc_macro`).
-fn hides_wrapping(cx: &Cx<'_, '_>, attr: &Attr) -> bool {
-    let AttrKind::Meta { written, .. } = &attr.kind else { return false };
+fn hides_wrapping(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> bool {
+    let AttrKind::Meta { written, .. } = attr.kind else { return false };
     if !from_expansion(cx, InFile::new(attr.file, written.syntax())) {
         return false;
     }
     let span = cx.span(attr.in_file(attr.inner_range()));
     let Some(snippet) = cx.snippet(&span) else { return false };
+    // alloc: once per `unsafe_attr_outside_unsafe` emitted, its suggestion's test
     let snippet: String = snippet.chars().filter(|it| !it.is_whitespace()).collect();
     snippet.contains("!(") || snippet.starts_with("#[") && snippet.ends_with(']')
 }
@@ -272,8 +284,8 @@ fn hides_wrapping(cx: &Cx<'_, '_>, attr: &Attr) -> bool {
 fn accept(
     cx: &Cx<'_, '_>,
     krate: &Krate,
-    owner: &Owner,
-    attr: &Attr,
+    owner: &Owner<'_>,
+    attr: &Attr<'_>,
     builtin: &'static Builtin,
     seen: &mut Seen,
     found: &mut Vec<Diag>,
@@ -281,12 +293,12 @@ fn accept(
     let this = attr.in_file(attr.range());
     let args = attr.args();
     let path = builtin.path;
-    match (path, &args) {
+    match (path, args) {
         (["inline"], Args::NameValue(_)) => found.push(ill_formed(cx, attr, builtin, None)),
-        (["link"], Args::NameValue(value)) if string(value.as_ref()).as_deref() == Some("dl") => {
+        (["link"], Args::NameValue(value)) if with_string(value, |it| it == "dl") == Some(true) => {
             found.push(ill_formed(cx, attr, builtin, None))
         }
-        (["ignore"], Args::NameValue(value)) if string(value.as_ref()).is_none() => {
+        (["ignore"], Args::NameValue(value)) if with_string(value, |_| ()).is_none() => {
             found.push(ill_formed(cx, attr, builtin, None))
         }
         (["ignore"], Args::List(tt)) => {
@@ -314,7 +326,7 @@ fn accept(
             found.push(empty_list(cx, attr, builtin, this));
         }
         (["crate_type"], Args::NameValue(value)) if owner.target == Target::Crate => {
-            if let Some(diag) = unknown_crate_type(cx, attr, value.as_ref()) {
+            if let Some(diag) = unknown_crate_type(cx, attr, value) {
                 found.push(diag);
             }
         }
@@ -340,7 +352,7 @@ fn accept(
 /// Whether a single parser converts the attribute, so that a second one is unused: a parser
 /// of no arguments always does, the others when the input is of one of their forms, as
 /// their conversions check.
-fn takes(builtin: &Builtin, attr: &Attr, args: &Args) -> bool {
+fn takes(builtin: &Builtin, attr: &Attr<'_>, args: &Args<'_>) -> bool {
     let template = &builtin.template;
     let no_args = template.word && template.list.is_none() && template.one_of.is_empty() && template.name_value_str.is_none();
     if no_args {
@@ -349,19 +361,19 @@ fn takes(builtin: &Builtin, attr: &Attr, args: &Args) -> bool {
     match args {
         Args::Word => template.word,
         Args::List(tt) => {
-            let items = items(tt);
+            let items = items(*tt);
             template.list.is_some()
-                || matches!(items.as_slice(), [item] if word(item).is_some_and(|it| template.one_of.contains(&it.as_str())))
+                || matches!(items.as_slice(), [item] if word(item).is_some_and(|it| template.one_of.contains(&it)))
         }
         Args::NameValue(value) => {
-            template.name_value_str.is_some() && (string(value.as_ref()).is_some() || attr.is_doc_comment())
+            template.name_value_str.is_some() && (with_string(*value, |_| ()).is_some() || attr.is_doc_comment())
         }
     }
 }
 
 /// `MacroUseParser::ATTRIBUTES`: a second `#[macro_use]`, a `#[macro_use(..)]` with one without
 /// arguments, an empty list.
-fn macro_use(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, args: &Args, state: &mut MacroUse, found: &mut Vec<Diag>) {
+fn macro_use(cx: &Cx<'_, '_>, attr: &Attr<'_>, builtin: &Builtin, args: &Args<'_>, state: &mut MacroUse, found: &mut Vec<Diag>) {
     let span = attr.in_file(attr.range());
     let first = *state.first.get_or_insert(span);
     match args {
@@ -373,7 +385,7 @@ fn macro_use(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, args: &Args, state
                 found.push(unused_duplicate(cx, span, specific, false));
             }
         }
-        Args::List(tt) if items(tt).is_empty() => {
+        Args::List(tt) if items(*tt).is_empty() => {
             found.push(empty_list(cx, attr, builtin, attr.in_file(tt.syntax().text_range())));
         }
         Args::List(_) if state.all => found.push(unused_duplicate(cx, first, span, false)),
@@ -383,14 +395,14 @@ fn macro_use(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, args: &Args, state
 }
 
 /// `UsedParser::ATTRIBUTES`: one `#[used(compiler)]`, and one of `#[used(linker)]` and `#[used]`.
-fn used(cx: &Cx<'_, '_>, attr: &Attr, args: &Args, used: &mut [Option<InFile<TextRange>>; 3], found: &mut Vec<Diag>) {
+fn used(cx: &Cx<'_, '_>, attr: &Attr<'_>, args: &Args<'_>, used: &mut [Option<InFile<TextRange>>; 3], found: &mut Vec<Diag>) {
     const COMPILER: usize = 0;
     const LINKER: usize = 1;
     const DEFAULT: usize = 2;
     let by = match args {
         Args::Word => DEFAULT,
-        Args::List(tt) => match items(tt).as_slice() {
-            [item] => match word(item).as_deref() {
+        Args::List(tt) => match items(*tt).as_slice() {
+            [item] => match word(item) {
                 Some("compiler") => COMPILER,
                 Some("linker") => LINKER,
                 _ => return,
@@ -416,17 +428,19 @@ fn used(cx: &Cx<'_, '_>, attr: &Attr, args: &Args, used: &mut [Option<InFile<Tex
 }
 
 /// `invalid `crate_type` value`, with the stable crate type nearest it.
-fn unknown_crate_type(cx: &Cx<'_, '_>, attr: &Attr, value: Option<&ast::Expr>) -> Option<Diag> {
+fn unknown_crate_type(cx: &Cx<'_, '_>, attr: &Attr<'_>, value: Option<ast::Expr<'_>>) -> Option<Diag> {
     const KNOWN: &[&str] = &["bin", "dylib", "staticlib", "cdylib", "rlib", "lib", "proc-macro", "sdylib"];
     const STABLE: &[&str] = &["lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro", "bin"];
     let value_node = value?;
     let text = string(Some(value_node))?;
-    if KNOWN.contains(&text.as_str()) {
+    if KNOWN.contains(&&*text) {
         return None;
     }
     let span = cx.span(attr.in_file(value_node.syntax().text_range()));
+    // clone: the diagnostic's span
     let mut diag = Diag::lint("unknown_crate_types", "invalid `crate_type` value", span.clone());
     if let Some(candidate) = find_best_match_for_name_with_substrings(STABLE, &text, Some(5)) {
+        // alloc: the diagnostic's text
         diag.suggestion(span, "did you mean", format!("\"{candidate}\""), Applicability::MaybeIncorrect);
     }
     Some(diag)
@@ -434,19 +448,25 @@ fn unknown_crate_type(cx: &Cx<'_, '_>, attr: &Attr, value: Option<&ast::Expr>) -
 
 /// `ambiguous_derive_helpers`: a helper of `#[proc_macro_derive(Trait, attributes(..))]` named
 /// as a builtin attribute.
-fn ambiguous_helpers(cx: &Cx<'_, '_>, attr: &Attr, tt: &ast::TokenTree) -> Vec<Diag> {
+fn ambiguous_helpers(cx: &Cx<'_, '_>, attr: &Attr<'_>, tt: ast::TokenTree<'_>) -> Vec<Diag> {
     let items = items(tt);
+    // alloc: empty, allocates nothing, as each `Vec::new()` returned below
     let [trait_name, helpers] = items.as_slice() else { return Vec::new() };
     if word(trait_name).is_none() {
+        // alloc: as above
         return Vec::new();
     }
+    // alloc: as above
     let [NodeOrToken::Token(name), NodeOrToken::Node(list)] = helpers.as_slice() else { return Vec::new() };
-    let Some(list) = ast::TokenTree::cast(list.clone()) else { return Vec::new() };
+    // alloc: as above
+    let Some(list) = ast::TokenTree::cast(*list) else { return Vec::new() };
     if name.text() != "attributes" {
+        // alloc: as above
         return Vec::new();
     }
+    // alloc: as above, until a lint
     let mut found = Vec::new();
-    for helper in self::items(&list) {
+    for helper in self::items(list) {
         let [NodeOrToken::Token(ident)] = helper.as_slice() else { return found };
         if ident.kind() != SyntaxKind::IDENT {
             return found;
@@ -460,33 +480,44 @@ fn ambiguous_helpers(cx: &Cx<'_, '_>, attr: &Attr, tt: &ast::TokenTree) -> Vec<D
 }
 
 /// The lints of `repr`'s targets: each hint has its own (`parse_repr`'s `check_target`).
-fn repr_targets(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr, found: &mut Vec<Diag>) {
+fn repr_targets(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner<'_>, attr: &Attr<'_>, found: &mut Vec<Diag>) {
     use Policy::{Allow, Warn};
     const DATA: &[Policy] =
         &[Allow(Target::Struct), Allow(Target::Enum), Allow(Target::Union), Warn(Target::MacroCall)];
     const PACKED: &[Policy] = &[Allow(Target::Struct), Allow(Target::Union), Warn(Target::MacroCall)];
     const SIMD: &[Policy] = &[Allow(Target::Struct)];
     const INT: &[Policy] = &[Allow(Target::Enum), Warn(Target::MacroCall)];
-    const INTS: &[&str] = &["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize"];
     let Args::List(tt) = attr.args() else { return };
-    for item in items(&tt) {
+    for item in items(tt) {
         let Some(NodeOrToken::Token(hint)) = item.first() else { continue };
-        let hint = hint.text();
-        let (args, targets): (String, &[Policy]) = match hint {
-            "align" => ("(align(...))".to_owned(), DATA),
-            "packed" => ("(packed)".to_owned(), PACKED),
-            "Rust" | "C" | "transparent" => (format!("({hint})"), DATA),
-            "simd" => ("(simd)".to_owned(), SIMD),
-            _ if INTS.contains(&hint) => (format!("({hint})"), INT),
+        let (args, targets): (&str, &[Policy]) = match hint.text() {
+            "align" => ("(align(...))", DATA),
+            "packed" => ("(packed)", PACKED),
+            "Rust" => ("(Rust)", DATA),
+            "C" => ("(C)", DATA),
+            "transparent" => ("(transparent)", DATA),
+            "simd" => ("(simd)", SIMD),
+            "i8" => ("(i8)", INT),
+            "u8" => ("(u8)", INT),
+            "i16" => ("(i16)", INT),
+            "u16" => ("(u16)", INT),
+            "i32" => ("(i32)", INT),
+            "u32" => ("(u32)", INT),
+            "i64" => ("(i64)", INT),
+            "u64" => ("(u64)", INT),
+            "i128" => ("(i128)", INT),
+            "u128" => ("(u128)", INT),
+            "isize" => ("(isize)", INT),
+            "usize" => ("(usize)", INT),
             _ => continue,
         };
-        check_target(cx, krate, owner, attr, Targets::AllowList(targets), &args, found);
+        check_target(cx, krate, owner, attr, Targets::AllowList(targets), args, found);
     }
 }
 
 /// rustc's `check_target` of an attribute with arguments `args` (empty for most: those
 /// whose target does not depend on them).
-fn check_target(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr, targets: Targets, args: &str, found: &mut Vec<Diag>) {
+fn check_target(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner<'_>, attr: &Attr<'_>, targets: Targets, args: &str, found: &mut Vec<Diag>) {
     if let Some(warn) = targets.crate_level() {
         if warn && owner.target != Target::Crate {
             found.push(crate_level(cx, krate, owner, attr));
@@ -497,7 +528,7 @@ fn check_target(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr, targ
         return;
     }
     let path = attr.path();
-    let is_diagnostic = path.first().is_some_and(|it| it == "diagnostic");
+    let is_diagnostic = path.first().is_some_and(|it| it.as_str() == "diagnostic");
     let lint = if attr.is("deprecated")
         && !matches!(
             owner.target,
@@ -511,34 +542,42 @@ fn check_target(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr, targ
     };
     let name = attr.name();
     let range = if args.is_empty() { attr.path_range() } else { attr.inner_range() };
+    // alloc: the diagnostic's text, as is all below
     let message = format!("the `{name}{args}` attribute cannot be used on {}", owner.target.plural_name());
     let mut diag = Diag::lint(lint, message, cx.span(attr.in_file(range)));
     diag.suggestion_with_style(
+        // alloc: as above
         vec![(cx.span(attr.in_file(attr.range())), String::new())],
         "remove the attribute",
         Applicability::MachineApplicable,
         SuggestionStyle::CompletelyHidden,
     );
+    // alloc: as above
     let (applied, only) = applied(krate, targets.allowed().collect(), owner.target);
     let only = if only { "only " } else { "" };
+    // alloc: as above
     diag.help(format!("the `{name}{args}` attribute can {only}be applied to {}", and_list(&applied)));
     match (path.as_slice(), owner.target) {
-        ([it], Target::Static) if it == "link_name" => {
+        ([it], Target::Static) if it.as_str() == "link_name" => {
             let inner = cx.span(attr.in_file(attr.inner_range()));
+            // alloc: as above
             let mut parts = Vec::new();
             if !attr.is_unsafe() {
+                // alloc: as above
                 parts.push((inner.shrink_to_lo(), "unsafe(".to_owned()));
             }
+            // alloc: as above
             parts.push((cx.span(attr.in_file(attr.path_range())), "export_name".to_owned()));
             if !attr.is_unsafe() {
+                // alloc: as above
                 parts.push((inner.shrink_to_hi(), ")".to_owned()));
             }
             diag.multipart_suggestion("did you mean to use `#[export_name]`?", parts, Applicability::MaybeIncorrect);
         }
-        ([it], Target::Fn | Target::Method(_)) if it == "repr" && args == "(align(...))" && krate.fn_align => {
+        ([it], Target::Fn | Target::Method(_)) if it.as_str() == "repr" && args == "(align(...))" && krate.fn_align => {
             diag.help("use `#[rustc_align(...)]` instead");
         }
-        ([it], Target::Static) if it == "repr" && args == "(align(...))" && krate.static_align => {
+        ([it], Target::Static) if it.as_str() == "repr" && args == "(align(...))" && krate.static_align => {
             diag.help("use `#[rustc_align_static(...)]` instead");
         }
         _ => {}
@@ -555,21 +594,25 @@ fn check_target(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr, targ
 }
 
 /// rustc's `check_crate_level` where being elsewhere is a lint: `InvalidAttrStyle`.
-pub(crate) fn crate_level(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &Attr) -> Diag {
+pub(crate) fn crate_level(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner<'_>, attr: &Attr<'_>) -> Diag {
     let name = attr.name();
     let message = match attr.inner {
+        // alloc: the diagnostic's text, as is all of `crate_level`'s
         true => format!("the `#![{name}]` attribute can only be used at the crate root"),
+        // alloc: as above
         false => format!("crate-level attribute should be an inner attribute: add an exclamation mark: `#![{name}]`"),
     };
     let mut diag = Diag::lint("unused_attributes", message, cx.span(attr.in_file(attr.range())));
     if !attr.inner {
-        let target = cx.span(InFile::new(owner.node.file_id, target_range(&owner.node.value)));
+        let target = cx.span(InFile::new(owner.node.file_id, target_range(owner.node.value)));
         diag.span_note(
             target,
+            // alloc: as above
             format!("this attribute does not have an `!`, which means it is applied to this {}", owner.target.name()),
         );
     }
     if attr.inner && krate.root.is_some_and(|root| attr.file.original_file(cx.db) != root) {
+        // alloc: as above
         diag.help(format!("the crate root is at `{}`", krate.root_name));
     }
     diag
@@ -577,9 +620,9 @@ pub(crate) fn crate_level(cx: &Cx<'_, '_>, krate: &Krate, owner: &Owner, attr: &
 
 /// rustc's span of what an attribute is applied to: the node without its attributes; a
 /// macro call's ends at its arguments (`MacCall::span`), without a `;`.
-fn target_range(node: &SyntaxNode) -> TextRange {
-    let range = item_range(node);
-    match ast::MacroCall::cast(node.clone()).and_then(|it| it.token_tree()) {
+fn target_range(node: ast::Node<'_>) -> TextRange {
+    let range = item_range_view(node);
+    match ast::MacroCall::cast(node).and_then(|it| it.token_tree()) {
         Some(args) => TextRange::new(range.start(), args.syntax().text_range().end()),
         None => range,
     }
@@ -587,17 +630,21 @@ fn target_range(node: &SyntaxNode) -> TextRange {
 
 /// `UnusedBuiltinAttribute`: a builtin attribute no parser takes (a lint attribute) on a macro
 /// call (`rustc_expand`'s `check_attributes`).
-fn unused_builtin(cx: &Cx<'_, '_>, owner: &Owner, attr: &Attr, name: &str) -> Diag {
+fn unused_builtin(cx: &Cx<'_, '_>, owner: &Owner<'_>, attr: &Attr<'_>, name: &str) -> Diag {
     let at = cx.span(attr.in_file(attr.range()));
+    // alloc: the diagnostic's text and span, as is all of `unused_builtin`'s
     let mut diag = Diag::lint("unused_attributes", format!("unused attribute `{name}`"), at.clone());
-    if let Some(path) = ast::MacroCall::cast(owner.node.value.clone()).and_then(|it| it.path()) {
-        let text: String = path.syntax().text().to_string().chars().filter(|it| !it.is_whitespace()).collect();
+    if let Some(path) = ast::MacroCall::cast(owner.node.value).and_then(|it| it.path()) {
+        // alloc: as above
+        let text: String = path.syntax().text().chars().filter(|it| !it.is_whitespace()).collect();
         diag.span_note(
             cx.span(InFile::new(owner.node.file_id, path.syntax().text_range())),
+            // alloc: as above
             format!("the built-in attribute `{name}` will be ignored, since it's applied to the macro invocation `{text}`"),
         );
     }
     diag.suggestion_with_style(
+        // alloc: as above
         vec![(at, String::new())],
         "remove the attribute",
         Applicability::MachineApplicable,
@@ -644,6 +691,7 @@ pub(crate) fn applied(krate: &Krate, mut allowed: Vec<Target>, target: Target) -
     ];
     const IMPL_LIKE: &[Target] = &[Target::Impl { of_trait: false }, Target::Impl { of_trait: true }];
     const ADT_LIKE: &[Target] = &[Target::Struct, Target::Enum, Target::Union];
+    // alloc: a diagnostic's help, as is all of `applied`
     let mut groups = Vec::new();
     for (group, name) in [
         (FUNCTION_LIKE, "functions"),
@@ -658,6 +706,7 @@ pub(crate) fn applied(krate: &Krate, mut allowed: Vec<Target>, target: Target) -
         allowed.retain(|it| !group.contains(it));
         groups.push(name);
     }
+    // alloc: as above
     let mut names: Vec<&'static str> = groups.into_iter().chain(allowed.iter().map(|it| it.plural_name())).collect();
     names.sort_unstable();
     names.dedup();
@@ -668,6 +717,7 @@ pub(crate) fn applied(krate: &Krate, mut allowed: Vec<Target>, target: Target) -
 /// `UnusedDuplicate`: `unused` is a second attribute where `used` is used.
 fn unused_duplicate(cx: &Cx<'_, '_>, used: InFile<TextRange>, unused: InFile<TextRange>, warning: bool) -> Diag {
     let this = cx.span(unused);
+    // clone: the diagnostic's span
     let mut diag = Diag::lint("unused_attributes", "unused attribute", this.clone());
     diag.suggestion(this, "remove this attribute", "", Applicability::MachineApplicable);
     diag.span_note(cx.span(used), "attribute also specified here");
@@ -678,12 +728,15 @@ fn unused_duplicate(cx: &Cx<'_, '_>, used: InFile<TextRange>, unused: InFile<Tex
 }
 
 /// `EmptyAttributeList` at `span`: the attribute, or for one valid without a list, the list.
-fn empty_list(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, span: InFile<TextRange>) -> Diag {
+fn empty_list(cx: &Cx<'_, '_>, attr: &Attr<'_>, builtin: &Builtin, span: InFile<TextRange>) -> Diag {
     let span = cx.span(span);
     let name = attr.name();
+    // clone: the diagnostic's span
     let mut diag = Diag::lint("unused_attributes", "unused attribute", span.clone());
     let (note, remove) = match builtin.template.word {
+        // alloc: the diagnostic's text
         true => (format!("using `{name}` with an empty list is equivalent to not using a list at all"), "remove these parentheses"),
+        // alloc: the diagnostic's text
         false => (format!("using `{name}` with an empty list has no effect"), "remove this attribute"),
     };
     diag.note(note);
@@ -692,16 +745,20 @@ fn empty_list(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, span: InFile<Text
 }
 
 /// `IllFormedAttributeInput` of `ill_formed_attribute_input`, at what is between `#[` and `]`.
-fn ill_formed(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, help: Option<String>) -> Diag {
+fn ill_formed(cx: &Cx<'_, '_>, attr: &Attr<'_>, builtin: &Builtin, help: Option<String>) -> Diag {
     let suggestions: Vec<String> =
+        // alloc: the diagnostic's text, as is all of `ill_formed`'s
         builtin.template.suggestions(&attr.name(), attr.is_unsafe()).into_iter().map(|it| format!("`{it}`")).collect();
     let list = and_list(&suggestions);
     let message = match suggestions.len() {
+        // alloc: as above
         1 => format!("attribute must be of the form {list}"),
+        // alloc: as above
         _ => format!("valid forms for the attribute are {list}"),
     };
     let mut diag = Diag::lint("ill_formed_attribute_input", message, cx.span(attr.in_file(attr.inner_range())));
     if let Some(lint) = help {
+        // alloc: as above
         diag.help(format!("if you meant to silence a warning, consider using #![allow({lint})] or #![expect({lint})]"));
     }
     diag
@@ -710,10 +767,14 @@ fn ill_formed(cx: &Cx<'_, '_>, attr: &Attr, builtin: &Builtin, help: Option<Stri
 /// rustc's `StrListSepByAnd`: `a`, `a and b`, `a, b, and c`.
 pub(crate) fn and_list<S: AsRef<str>>(items: &[S]) -> String {
     match items {
+        // alloc: empty, allocates nothing
         [] => String::new(),
+        // alloc: a diagnostic's text, as is all of `and_list`'s
         [one] => one.as_ref().to_owned(),
+        // alloc: as above
         [a, b] => format!("{} and {}", a.as_ref(), b.as_ref()),
         [init @ .., last] => {
+            // alloc: as above
             let mut out = String::new();
             for it in init {
                 out.push_str(it.as_ref());
@@ -726,37 +787,50 @@ pub(crate) fn and_list<S: AsRef<str>>(items: &[S]) -> String {
     }
 }
 
+/// One item of an attribute's list: its elements, inline up to three.
+pub(crate) type Item<'t> = SmallVec<[ast::Element<'t>; 3]>;
+
+/// The items of an attribute's list, inline up to four.
+pub(crate) type Items<'t> = SmallVec<[Item<'t>; 4]>;
+
 /// The items of an attribute's list, between its commas, each without trivia.
-pub(crate) fn items(tt: &ast::TokenTree) -> Vec<Vec<SyntaxElement>> {
-    let children: Vec<SyntaxElement> = tt.syntax().children_with_tokens().collect();
-    let inside = match children.as_slice() {
-        [_, inside @ .., _] => inside,
-        _ => &[],
-    };
-    let mut items = vec![Vec::new()];
-    for child in inside {
-        match child {
-            NodeOrToken::Token(token) if token.kind() == T![,] => items.push(Vec::new()),
-            NodeOrToken::Token(token) if token.kind().is_trivia() => {}
-            it => items.last_mut().expect("one item at least").push(it.clone()),
+pub(crate) fn items<'t>(tt: ast::TokenTree<'t>) -> Items<'t> {
+    let mut items = Items::new();
+    let mut item = Item::new();
+    // Between the delimiters: the first child and the last are left out.
+    let mut children = tt.syntax().children_with_tokens().skip(1).peekable();
+    while let Some(child) = children.next() {
+        if children.peek().is_none() {
+            break;
+        }
+        let kind = child.kind();
+        if kind == T![,] {
+            if !item.is_empty() {
+                items.push(std::mem::take(&mut item));
+            }
+        } else if !kind.is_trivia() {
+            item.push(child);
         }
     }
-    items.retain(|it| !it.is_empty());
+    if !item.is_empty() {
+        items.push(item);
+    }
     items
 }
 
 /// The item when it is one word.
-pub(crate) fn word(item: &[SyntaxElement]) -> Option<String> {
+pub(crate) fn word<'t>(item: &[ast::Element<'t>]) -> Option<&'t str> {
     match item {
         [NodeOrToken::Token(token)] if token.kind() == SyntaxKind::IDENT || token.kind().is_keyword(span::Edition::CURRENT) => {
-            Some(token.text().to_owned())
+            Some(token.text())
         }
         _ => None,
     }
 }
 
 /// The item when it is a path with no arguments: `foo`, `clippy::bar`.
-fn path_of(item: &[SyntaxElement]) -> Option<String> {
+fn path_of(item: &[ast::Element<'_>]) -> Option<String> {
+    // alloc: the help of an ill-formed `#[ignore(..)]`
     let mut path = String::new();
     for element in item {
         let NodeOrToken::Token(token) = element else { return None };
@@ -769,10 +843,16 @@ fn path_of(item: &[SyntaxElement]) -> Option<String> {
 }
 
 /// The value of a string literal.
-pub(crate) fn string(value: Option<&ast::Expr>) -> Option<String> {
+pub(crate) fn string(value: Option<ast::Expr<'_>>) -> Option<String> {
+    // alloc: a `crate_type`'s value, once per crate
+    with_string(value, str::to_owned)
+}
+
+/// `f` of the value of a string literal, read in place.
+fn with_string<R>(value: Option<ast::Expr<'_>>, f: impl FnOnce(&str) -> R) -> Option<R> {
     let ast::Expr::Literal(literal) = value? else { return None };
     match literal.kind() {
-        ast::LiteralKind::String(it) => it.value().ok().map(|it| it.into_owned()),
+        ast::LiteralKind::String(it) => it.value().ok().map(|it| f(&it)),
         _ => None,
     }
 }
@@ -820,5 +900,53 @@ mod tests {
         assert!(!table::is_builtin_attr_name("serde"));
         let inline = table::builtin(&["inline"]).unwrap();
         assert_eq!(inline.template.suggestions("inline", false), ["inline", "inline(always)", "inline(never)"]);
+    }
+
+    /// A list's items are what is between its commas, without trivia, the empty ones left out.
+    #[test]
+    fn items_are_the_lists_items() {
+        let parse = syntax::SourceFile::parse("#[a(b, c = \"d\", e(f), , 1,)] fn g() {}", span::Edition::CURRENT);
+        let list = parse.root().descendants().find_map(ast::TokenTree::cast).unwrap();
+        let texts: Vec<String> = items(list)
+            .iter()
+            .map(|item| {
+                item.iter()
+                    .map(|it| match it {
+                        NodeOrToken::Node(it) => it.text(),
+                        NodeOrToken::Token(it) => it.text(),
+                    })
+                    .collect()
+            })
+            .collect();
+        assert_eq!(texts, ["b", "c=\"d\"", "e(f)", "1"]);
+        assert_eq!(word(&items(list)[0]), Some("b"));
+        let empty = syntax::SourceFile::parse("#[a()] fn g() {}", span::Edition::CURRENT);
+        let list = empty.root().descendants().find_map(ast::TokenTree::cast).unwrap();
+        assert!(blaze_alloc_count::assert_at_most(0, "an empty list's items", || items(list)).is_empty());
+    }
+
+    /// Reading the paths and string values of the crate's attributes allocates nothing.
+    #[test]
+    fn reading_an_attribute_allocates_nothing() {
+        let fixture = r#"
+//- /main.rs crate:main
+#[doc = "x"]
+#[diagnostic::on_unimplemented(message = "y")]
+trait T {}
+#[inline]
+#[must_use]
+fn f() {}
+"#;
+        crate::lints::with_cx(fixture, &[], |cx| {
+            let owners = super::super::owners(cx, cx.walk());
+            let attrs: Vec<&Attr<'_>> = owners.iter().flat_map(|it| &it.attrs).collect();
+            let read = blaze_alloc_count::assert_at_most(0, "the paths and values of the attributes", || {
+                let inline = attrs.iter().filter(|it| it.is("inline")).count();
+                let segments: usize = attrs.iter().map(|it| it.segments().count()).sum();
+                let docs = attrs.iter().filter(|it| is_doc_str(it)).count();
+                (inline, segments, docs)
+            });
+            assert_eq!(read, (1, 5, 1));
+        });
     }
 }

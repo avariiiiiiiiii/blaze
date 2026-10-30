@@ -67,7 +67,11 @@ pub use monomorphization::monomorphized;
 pub use monomorphization::{monomorphized_args, monomorphized_const, monomorphized_ty};
 pub use monomorphization::monomorphized_promoted_mir_body_query;
 pub use monomorphization::opaque_of_impl;
-pub use optimize::{passes_not_ported, set_interpreter_mir_opt_level};
+pub use monomorphization::erase_and_anonymize_regions;
+pub use optimize::{
+    CallerLocation, caller_location, owner_of, passes_not_ported, set_interpreter_mir_opt_level,
+    source_span, written_checked_at,
+};
 pub use pretty::{closure_path_suffix, impl_written_at, print_mir_body};
 pub use storage::{FrameStorage, StorageConflicts};
 pub use transform::{noop_landing_pads, runtime_promoted_mir_body_query};

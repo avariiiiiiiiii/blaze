@@ -2,13 +2,15 @@ use std::fmt::Debug;
 use std::ops::Deref;
 
 use rustc_type_ir::solve::{
-    ComputeGoalFastPathOutcome, FetchEligibleAssocItemResponse, Goal, NoSolution,
+    ComputeGoalFastPathOutcome, FastPathDepth, FetchEligibleAssocItemResponse, Goal, NoSolution,
     VisibleForLeakCheck,
 };
 use rustc_type_ir::transmute::Answer;
 use rustc_type_ir::{
     self as ty, CanonicalizerState, Const, InferCtxtLike, Interner, Region, TypeFoldable,
 };
+
+use crate::solve::SearchStorage;
 
 /// `SolverDelegate` is one of the two traits in the `rustc_type_ir` shared abstraction layer
 /// between rustc and rust-analyzer abstracting over the [InferCtxt][inferctxt-doc], which had to be
@@ -44,6 +46,7 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
         &self,
         goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
         span: <Self::Interner as Interner>::Span,
+        depth: FastPathDepth,
     ) -> ComputeGoalFastPathOutcome<Self::Interner>;
 
     fn fresh_var_for_kind(
@@ -78,6 +81,15 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     fn make_deduplicated_region_constraints(
         &self,
     ) -> Vec<(ty::RegionConstraint<Self::Interner>, VisibleForLeakCheck)>;
+
+    /// [`Self::make_deduplicated_region_constraints`], appended to `into`: an implementation
+    /// that writes them there directly allocates nothing once `into` has room.
+    fn make_deduplicated_region_constraints_into(
+        &self,
+        into: &mut Vec<(ty::RegionConstraint<Self::Interner>, VisibleForLeakCheck)>,
+    ) {
+        into.extend(self.make_deduplicated_region_constraints());
+    }
 
     fn instantiate_canonical<V>(
         &self,
@@ -127,6 +139,15 @@ pub trait SolverDelegate: Deref<Target = Self::Infcx> + Sized {
     /// Release canonicalizer state, either by deallocating it (the default) or by clearing it and
     /// stashing it for later reuse.
     fn release_canonicalizer_state(&self, _: CanonicalizerState<Self::Interner>) {}
+
+    /// The search graph's storage for a root goal. The delegate may keep it between root goals
+    /// (on its worker); the default makes a fresh one.
+    fn obtain_search_storage(&self) -> SearchStorage<Self::Interner> {
+        Default::default()
+    }
+
+    /// Takes back what [`Self::obtain_search_storage`] gave, emptied.
+    fn release_search_storage(&self, _storage: SearchStorage<Self::Interner>) {}
 
     fn emit_next_solver_overflow_fcw(
         &self,

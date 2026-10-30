@@ -90,7 +90,7 @@ pub(crate) fn write_scalar(out: &mut String, info: IntInfo, ty: Ty<'_>, bits: u1
     }
 }
 
-fn would_print_as_wildcard(p: &Witness<'_, '_>) -> bool {
+fn would_print_as_wildcard(p: &Witness<'_, '_>, never_patterns: bool) -> bool {
     match p.ctor() {
         Constructor::IntRange(IntRange {
             lo: MaybeInfiniteInt::NegInfinity,
@@ -99,9 +99,8 @@ fn would_print_as_wildcard(p: &Witness<'_, '_>) -> bool {
         | Constructor::Wildcard
         | Constructor::NonExhaustive
         | Constructor::Hidden
-        | Constructor::PrivateUninhabited
-        // No `never_patterns`: `!` is printed `_`.
-        | Constructor::Never => true,
+        | Constructor::PrivateUninhabited => true,
+        Constructor::Never => !never_patterns,
         _ => false,
     }
 }
@@ -233,12 +232,12 @@ impl<'a, 'db> Cx<'a, 'db> {
                 // `[x, _, .., _, y]` is `[x, .., y]`.
                 if has_dot_dot && slice.array_len().is_some() {
                     while let [rest @ .., last] = prefix
-                        && would_print_as_wildcard(last)
+                        && would_print_as_wildcard(last, self.never_patterns)
                     {
                         prefix = rest;
                     }
                     while let [first, rest @ ..] = suffix
-                        && would_print_as_wildcard(first)
+                        && would_print_as_wildcard(first, self.never_patterns)
                     {
                         suffix = rest;
                     }
@@ -264,6 +263,7 @@ impl<'a, 'db> Cx<'a, 'db> {
                 }
                 out.push(']');
             }
+            Constructor::Never if self.never_patterns => out.push('!'),
             Constructor::Never
             | Constructor::Wildcard
             | Constructor::NonExhaustive
@@ -335,7 +335,7 @@ impl<'a, 'db> Cx<'a, 'db> {
                 let mut printed = 0;
                 let names = fields.fields();
                 for (i, field) in pat.iter_fields().enumerate() {
-                    if would_print_as_wildcard(field) {
+                    if would_print_as_wildcard(field, self.never_patterns) {
                         continue;
                     }
                     let Some((_, data)) = names.iter().nth(i) else { continue };

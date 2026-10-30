@@ -55,6 +55,14 @@ paths.
 
 > forwarded to cargo: the daemon and `crates/blaze-cargo/` are lane cargo's (crates.md), not the coordinator's.
 
+> answered by lane cargo (cargo-inbox-user): done.
+> - The launcher is every driver's `Launcher { program: <blaze> }` at crates/blaze-cargo/src/serve.rs:147.
+> - The runs are in serve/unit/script.rs: `prepare` calls `script::prepare` with the code of the script the daemon compiled; `ScriptRun::start`/`complete` call `Run::begin`/`complete` over `inputs::Disk` of `Prepared::env`, with `cargo_rule` and `keyed`.
+> - An inert script is neither compiled nor run: compile.rs:201 `elided_unbuilt`, and `How::Inert` in script.rs.
+> - `BLAZE_ELIDE=verify` compiles and runs it anyway, and `finish` checks the run with `script::verify_elided`, failing the build on a difference (script.rs:53 `verifies`, :598). Any other value of `BLAZE_ELIDE` is an error. The record key carries the bit (compile.rs:195), so an unbuilt record is never reused under verify.
+> - cargo's files of the run are written as for any run (script.rs `Writing`).
+> - The v1 paths named here are not on v2's path.
+
 ## 5. coordinator: `blaze-cargo` depends on `blaze-usercode`
 
 What: `blaze-usercode.workspace = true` in `crates/blaze-cargo/Cargo.toml`.
@@ -709,6 +717,39 @@ while red-green revalidation of the same tree is O(1) when nothing changed. I'll
 `ViewInputs` for a `PACKAGE`/`TREE` path inside the view once it exists.
 
 > forwarded to db: `crates/blaze-query/` is its (told by tmux).
+
+> applied by db (db-next2, 2026-10-29), not compiled yet (no builds in this pass):
+> `Cx::tree(&mut self, dir, package) -> Result<Option<[u8; 32]>, Cancelled>`
+> (`crates/blaze-query/src/lib.rs`), `None` for no directory at `dir` (a trailing `/` is
+> trimmed). It reads through one query per directory (`subtree.rs`, kind `kinds::TREE` = 4), so
+> an edit reruns only the directories above it, and the others are verified, not run.
+> Differs from what you asked: the value is **not** `trace::walk`'s byte stream, because one
+> sequential stream can't be built bottom-up. It is a Merkle hash per directory: each kept
+> entry in name order, its name `part`, then `d` and the subdirectory's hash, or `f`, the file's
+> content ID and its git mode (so a mode change counts), or `-`. `package` leaves out names
+> starting with `.` at any depth and `target` at the top. Hash a tree off a view (disk, record)
+> with the public `blaze_query::TreeHash` (`new(package, top)`, `keeps`, `dir`, `file`,
+> `finish`), never with `walk`, so the two sides agree.
+> `Cx::dir` is sorted by name once per directory per view, when the view first reads it (an
+> already-sorted listing is only checked); `Tree::list` may give any order now, and the
+> directory's fingerprint doesn't depend on it. `ViewInputs::names`/`dir` can drop their sorts.
+> Tests in `crates/blaze-query/src/tests.rs`: `an_edit_reruns_only_the_directories_above_it`,
+> `a_hash_sees_names_kinds_and_contents`, `a_package_leaves_out_hidden_names_and_the_top_target`,
+> `no_directory_has_no_tree`, `a_listing_is_sorted_once_whatever_order_the_tree_gives`.
+
+> taken up by usercode (2026-10-29), not built: `ViewInputs::tree` is `Cx::tree` for a
+> `PACKAGE`/`TREE` path in the view, and `ViewInputs::names` no longer sorts. For both sides to
+> agree, `trace::walk` is now `TreeHash`'s walk, one directory at a time. `Inputs` has a new
+> required `entry(path) -> Entry` (`Dir`, `File(ContentId, Mode)`, `Missing`: what a view holds
+> there, a link not followed), and a provided `tree(dir, package)` that `ViewInputs` overrides.
+> On the disk, `Files::entry` gives a file's `FILE_DOMAIN` content ID (kept under its stamp, as
+> its hash is), a link's target as its bytes, and the executable bit from any `x` bit, as
+> blaze-cargo's fetch reads a tree into a view. A name that is not UTF-8 is an error, as no view
+> holds one. Test `a_tree_on_the_disk_hashes_as_the_same_tree_in_a_view` (`inputs.rs`) compares
+> a `MemTree` view's `Cx::tree`, a walk through `ViewInputs` and a `Disk` walk of the same files
+> (an executable and a link among them), with and without `package`. Package and tree keys kept
+> before this change miss once. The cargo test fixtures that implement `Inputs` need `entry`
+> (`v2/requests/cargo.md`, usercode: `Inputs::entry`).
 
 ## 11. vfs: what changed outside every view, for `inputs::Files`
 
@@ -2334,3 +2375,323 @@ Here, a test in `blaze-expand` beside `puts.rs`'s: an expansion that reads a fil
 does not.
 
 Status: open
+
+> applied (usercode, 2026-10-29), with one change to part 1 for speed:
+> - `index::values` and `VALUES` are as asked. A hit's values are not worked out by a second
+>   `values` pass, because that would read every input of the shape twice. `Found::Hit` gains
+>   `values: Option<ContentId>`, and the new `index::find_reads` fills it from the same pass as
+>   the key: `keyed` feeds a second `Keyer` under `VALUES`. Every existing match uses `..`.
+>   `find`, `find_held` and `search` don't hash values, so they cost what they did.
+> - `blaze-expand`: `Kept::code`; `kept` reports `Traced` on a hit (Keep, and Check after the
+>   check passes) and on a kept or unspanned miss, and `Unknown(why)` from `keepable` with the
+>   three texts; `reads_now`, through a testable `reads_in`.
+> - Tests: `index`'s change test checks `values` and the tee for five changes and a gone
+>   directory, and a budget test holds the tee to zero allocations. In `blaze-expand`,
+>   `the_reads_an_expansion_reports_are_worked_out_again_until_a_file_changes`, and the hit
+>   budget test is moved onto `find_reads`.
+> - Doesn't build until db-expand applies its half (`v2/requests/db-expand.md`, same heading):
+>   `ProcMacroExpander::code`, `ExpansionReads` and `report_reads`.
+> - At the same time, `Kept` (blaze-expand), `compare::again` and blaze-macro-wasm's `Expander`
+>   now take db's `ProcMacroCall<'_>`. db had already changed the trait, and these hadn't
+>   followed.
+> - wasm proc macros report nothing, so hir-expand makes their reads `Unknown` and a crate
+>   that uses one gets no image. That is on purpose. A wasm expansion is keyed by the
+>   database's answers to the span questions it asked, and by paths under the guest's root.
+>   `reads_now(env, shape)` can't work either out again without the database, so reporting
+>   `Traced` for them would need a wider `hir_def::deps` protocol. Native proc macros, the
+>   default, are covered.
+> forwarded to usercode (told by tmux; requests, pass 23).
+> frontend-deps (2026-10-29): agreed. `hir_def::deps` doesn't read `Found::Hit`. Its own
+> `Found` in `deps/serve.rs` is private, and its contract is `reads_now(env, shape)` and the
+> reported `Traced { shape, values }`, both as you wrote, so `find_reads`' `values` needs nothing
+> in `deps/`. `deps/tests.rs`' test expander now takes `ProcMacroCall<'_>`. The wasm limit is in
+> the deps notes ("What the key and reads do not cover is refused").
+
+
+## db: `ProcMacroExpander` takes its call as one struct (from db-apply-def, 2026-10-29)
+
+db applied `v2/requests/db.md` '## dedup: `ProcMacroExpander` takes its call as one struct' in
+`crates/hir-expand/src/proc_macro.rs`. The trait is now:
+
+```rust
+fn expand(&self, db: &Db, call: ProcMacroCall<'_>) -> Result<tt::TopSubtree, ProcMacroExpansionError>;
+fn expand_in(&self, db: &Db, _calling_crate: Crate, call: ProcMacroCall<'_>) -> Result<..> { self.expand(db, call) }
+```
+
+`hir_expand::proc_macro::ProcMacroCall<'a>` is `Copy`, with `pub` fields `subtree: &'a
+tt::TopSubtree`, `attrs: Option<&'a tt::TopSubtree>`, `env: &'a Env`, `def_site`, `call_site`,
+`mixed_site: Span` and `current_dir: &'a str` (was `String`). blaze-expand and blaze-macro-wasm
+don't build until these land.
+
+> forwarded to usercode (`blaze-expand`, `blaze-macro-wasm`; told by tmux; requests, pass 23).
+
+### `crates/blaze-expand/src/lib.rs`, `impl ProcMacroExpander for Kept` (~572)
+
+- `fn expand`: the parameters after `db: &Db,` (`subtree` .. `current_dir: String,`) become
+  `call: ProcMacroCall<'_>,`. Both `self.inner.expand(db, subtree, .., current_dir)` calls
+  (the `comparing()` one and the `enabled()` one, whose `current_dir.clone(), // clone: ..`
+  goes) become `self.inner.expand(db, call)`. `compare::again(.., db, subtree, attrs, env,
+  def_site, call_site, mixed_site, &current_dir, &expanded)` becomes `compare::again(..,
+  db, call, &expanded)`. The last line becomes `self.kept(db, call)`.
+- `fn expand_in`: the parameters after `calling_crate: base_db::Crate,` become `call:
+  ProcMacroCall<'_>,`; `return self.expand(db, call);` and `self.inner.expand_in(db,
+  calling_crate, call)`.
+- Import `ProcMacroCall` beside `ProcMacroExpander` from `hir_expand::proc_macro`; drop `Env`
+  and `Span` from the imports if nothing else uses them.
+
+> forwarded to usercode (requests, pass 23).
+
+### `crates/blaze-expand/src/lib.rs`, `fn kept` (~440)
+
+The parameters after `db: &Db,` become `call: ProcMacroCall<'_>,`, with `let ProcMacroCall {
+subtree, attrs, env, def_site, call_site, mixed_site, current_dir } = call;` first. Then the
+crate's own `Call { .. current_dir: &current_dir }` (~462) is `current_dir,` and the inner
+`self.inner.expand(db, subtree, attrs, env, def_site, call_site, mixed_site, current_dir)`
+(~504) is `self.inner.expand(db, call)`.
+
+> forwarded to usercode (requests, pass 23).
+
+### `crates/blaze-expand/src/compare.rs`, `fn again` (~111)
+
+The parameters `subtree` .. `current_dir: &str,` become `call: ProcMacroCall<'_>,` (the
+`#[allow(clippy::too_many_arguments)]` can go), and `mac.expander.expand(db, subtree, ..,
+current_dir.to_owned(), // alloc: ..)` becomes `mac.expander.expand(db, call)` (the `alloc:`
+line goes: the directory is borrowed now). Anything else in `again` that reads `subtree` etc.
+reads `call.subtree` etc.
+
+> forwarded to usercode (requests, pass 23).
+
+### `crates/blaze-macro-wasm/src/lib.rs`, `impl ProcMacroExpander for Expander` (~2354)
+
+- `fn expand`: the parameters after `db: &Db,` become `ProcMacroCall { subtree, attrs, env,
+  def_site, call_site, mixed_site, .. }: ProcMacroCall<'_>,` (the body is unchanged: its `Call {
+  subtree, attrs, env, def_site, call_site, mixed_site }` reads the same names).
+- `fn expand_in`: the parameters after `calling_crate: base_db::Crate,` become `call:
+  ProcMacroCall<'_>,`; `return self.expand(db, call);`; the rest of the body reads `call.subtree`
+  etc. where it read `subtree` etc. (or destructures `call` after the early return).
+
+Status: open
+
+> forwarded to usercode (requests, pass 23).
+
+> applied (usercode, 2026-10-29), all four parts: `Kept::expand`/`expand_in`/`kept` take
+> `call: ProcMacroCall<'_>` (`kept` builds its keyed `Call` from `call`'s fields and calls
+> `self.inner.expand(db, call)`), `compare::again(.., db, call, &expanded)` without the
+> `too_many_arguments` allow or the owned directory, and blaze-macro-wasm's `Expander` as
+> written above (`expand_in` destructures `call` after the early return). `Env` stays imported
+> in both files, where other code uses it. `compare.rs` drops `Env` and `Span`.
+
+## mem-core-exec: `Sandbox::On { services }`, the macOS rendezvous lookup, and the launcher's exec of a just-written program (from `fastcompile-inproc-exec 4`, 2026-10-29)
+
+`blaze_core::Sandbox::On` now has a fifth field, `services: Vec<String>`: Mach global names a
+sandboxed process may look up beyond the profile's own `MACH_SERVICES` (fastcompile's
+`host::Host::launch` will put `dev.blaze.inproc.<daemon pid>` there). They are ignored on Linux
+and Windows. blaze-core also has `pub mod busy`: the `ETXTBSY` retry schedule
+(`busy::next(tried, waited) -> Option<u64>` nanoseconds, waits doubling from 50 µs to 50 ms and
+adding up to `busy::MOST_NS` = 1 s). Design: `docs/v2/plan/lanes/mem/core.md`, "Exec of a
+just-written file". Nothing below is built.
+
+### 1. `crates/blaze-usercode/src/confine.rs`: the spec carries the names
+
+- `pub struct Spec`, after `pub trace: bool,`:
+  ```rust
+      /// Mach global names it may look up beyond the sandbox's own few (`Sandbox::On`'s
+      /// `services`); read on macOS only.
+      #[serde(default)]
+      pub services: Vec<String>,
+  ```
+- `pub struct SpecOf<'a>`, after `trace: bool,`: `services: &'a [String],`
+- `Launcher::spec`: `let Sandbox::On { read, write, network, trace } = &command.sandbox else {`
+  becomes `let Sandbox::On { read, write, network, trace, services } = &command.sandbox else {`,
+  and in `Ok(SpecOf { .. })`, after `trace: *trace,`, add `services,`.
+- the test command (~298): `sandbox: Sandbox::On { read: vec!["/ws".into()], write: vec!["/out".into()], network: false, trace },`
+  becomes `sandbox: Sandbox::On { read: vec!["/ws".into()], write: vec!["/out".into()], network: false, trace, services: Vec::new() },`
+
+### 2. `crates/blaze-usercode/src/pool.rs` (~52): the warm key hashes them
+
+A process allowed other lookups is another process, so the key must cover them. Change
+`Sandbox::On { read, write, network, trace } => {` to
+`Sandbox::On { read, write, network, trace, services } => {`, and after
+`hasher.update(&[u8::from(*network), u8::from(*trace)]);` add:
+```rust
+                hasher.update(&(services.len() as u64).to_le_bytes());
+                for service in services {
+                    hasher.part(service.as_bytes());
+                }
+```
+Test: two commands that differ only in `services` have different keys.
+
+### 3. Every other `Sandbox::On { .. }` literal: `services: Vec::new()`
+
+- `crates/blaze-usercode/src/script.rs:82`: after `trace: true,` add `services: Vec::new(),`.
+- `crates/blaze-usercode/src/pool.rs:362`, `crates/blaze-usercode/src/run.rs:479`: `trace: true }` /
+  `trace: false }` becomes `trace: true, services: Vec::new() }` / `trace: false, services: Vec::new() }`.
+- `crates/blaze-usercode/src/test/queue.rs:1047` and `:1799`: `trace: true }` becomes
+  `trace: true, services: Vec::new() }`.
+- `crates/blaze-usercode/src/test/queue/tests.rs:323`: `let Sandbox::On { read, write, network, trace } =`
+  becomes `let Sandbox::On { read, write, network, trace, .. } =`.
+- `crates/proc-macro-api/src/warm.rs:308`: after `trace: true,` add `services: Vec::new(),`.
+
+### 4. `crates/blaze-cargo/src/sandbox.rs` and `sandbox/v2.rs`: the names reach the backend
+
+- `sandbox.rs` `pub struct Also<'a>`, after `pub env: ..,`:
+  ```rust
+      /// Mach global names the program may look up beyond [`macos`]'s own few; read on macOS
+      /// only.
+      pub services: &'a [String],
+  ```
+  (`#[derive(Default, Clone, Copy)]` still holds: `&[String]` is both.)
+- `sandbox.rs:1046`: `Also { network: false, live: Some(&live), env: None }` becomes
+  `Also { network: false, live: Some(&live), env: None, services: &[] }`.
+- `sandbox/v2.rs:195`: `super::Also { network: spec.network, live: Some(live), env: Some(&spec.env) }`
+  becomes `super::Also { network: spec.network, live: Some(live), env: Some(&spec.env), services: &spec.services }`.
+- Each `blaze_usercode::confine::Spec { .. }` literal gets `services: Vec::new(),`:
+  `sandbox.rs:941`, `sandbox/v2.rs:334`, `sandbox/linux.rs:2843`,
+  `sandbox/macos.rs:930`, `sandbox/windows.rs:1487` and `:1713`.
+
+### 5. `crates/blaze-cargo/src/sandbox/macos.rs`: one lookup rule per name
+
+- `fn profile(writes: usize, lives: usize, sockets: usize, network: bool)` gains
+  `services: usize` before `network`. Between the `MACH_SERVICES`/`RESOLVER_SERVICE` loop and
+  `text.push_str(")\n");`:
+  ```rust
+      for at in 0..services {
+          _ = write!(text, "\n  (global-name (param \"SERVICE{at}\"))");
+      }
+  ```
+  The name is a parameter, as the paths are, so it needs no quoting.
+- In `run`, before the profile is made:
+  ```rust
+      for service in also.services {
+          if service.is_empty() || service.contains('\0') {
+              // alloc: the error, once, and no sandbox is made.
+              return Err(format!("the Mach service {service:?} can't be named in a profile"));
+          }
+      }
+  ```
+  Then `profile(writes.len(), lives.len(), sockets.len(), also.services.len(), also.network)`,
+  `params`' capacity `+ 2 * also.services.len()`, and after the `WRITE`/`LIVE`/`SOCKET` loop:
+  ```rust
+      for (at, it) in also.services.iter().enumerate() {
+          name.clear();
+          _ = write!(name, "SERVICE{at}");
+          params.extend([c(name.as_bytes()), c(it.as_bytes())]);
+      }
+  ```
+- Tests: `super::profile(2, 1, 1, false)` and `(1, 0, 0, true)` become `(2, 1, 1, 0, false)` and
+  `(1, 0, 0, 0, true)`. New test: `profile(0, 0, 0, 2, false)` contains
+  `(global-name (param "SERVICE0"))` and `(global-name (param "SERVICE1"))` inside the
+  `(allow mach-lookup` list, after `(deny mach-lookup)`. Also (macOS): a run with
+  `services: ["dev.blaze.test.<pid>"]` whose program `bootstrap_look_up`s a name the test registered
+  finds it, and one without the name is refused. The first macOS run also checks that Seatbelt takes
+  `(param ..)` inside `global-name`, as it does inside `subpath`.
+
+### 6. The launcher's exec of the program: the same `ETXTBSY` retry
+
+blaze-core makes a spawn again when its exec meets `ETXTBSY`. In a sandboxed run, though,
+blaze-core execs the launcher, and the launcher's child execs `Command.program`, which is the
+file just written. That exec needs the same loop on the same schedule. Here it may run in the
+child: each launcher process is one thread, and it forked its child after its own exec had closed
+every descriptor it started with, so the child holds no copy of a writer's descriptor. It may
+sleep and allocate.
+
+- `crates/blaze-cargo/src/sandbox/linux.rs` `fn exec`, the tail:
+  ```rust
+      raw::execve(made.argv, made.env);
+      // alloc: the error, once, and the program's process ends.
+      std::io::Error::last_os_error().to_string()
+  ```
+  becomes
+  ```rust
+      let (mut tried, mut waited) = (0, 0);
+      loop {
+          raw::execve(made.argv, made.env);
+          let error = std::io::Error::last_os_error();
+          if error.raw_os_error() != Some(libc::ETXTBSY) {
+              // alloc: the error, once, and the program's process ends.
+              return error.to_string();
+          }
+          let Some(wait) = blaze_core::busy::next(tried, waited) else {
+              // alloc: as above.
+              return format!(
+                  "still open for writing after {} ms of tries: {error}",
+                  blaze_core::busy::MOST_NS / 1_000_000
+              );
+          };
+          std::thread::sleep(std::time::Duration::from_nanos(wait));
+          tried += 1;
+          waited += wait;
+      }
+  ```
+  (`nanosleep`, which `thread::sleep` makes, is not one of the filter's refused calls.)
+- `crates/blaze-cargo/src/sandbox/macos.rs`, the forked child's
+  `unsafe { libc::execve(argv_ptrs[0], argv_ptrs.as_ptr(), env_ptrs.as_ptr()) };` and the
+  `let error = std::io::Error::last_os_error();` after it become the same loop:
+  `execve`, then on `ETXTBSY` `blaze_core::busy::next` and `std::thread::sleep`, then the
+  existing `eprintln!("blaze: could not run ..")` and `_exit(127)` with the error (or the
+  "still open for writing after 1000 ms of tries" one) once it is not `ETXTBSY` or the waits are spent.
+- Test (Linux): a sandboxed run of a copy of `/bin/sh` that another thread of the test holds open
+  for writing for 30 ms runs and exits as told. Held for 1.5 s, it fails naming the program and
+  `still open for writing`.
+
+### 7. Exec inside the sandbox: nothing to change, read on 2026-10-29
+
+The program under the target directory already execs in both sandboxes. On Linux no bind of a
+readable, writable or view directory is `MS_NOEXEC` (only `/dev` and `/proc` are), and Landlock's
+ruleset handles only write rights, not `EXECUTE`. macOS's profile is `(allow default)` and
+denies no `process-exec`. If either ever restricts exec, it must allow exactly `Command.program`
+(Landlock `EXECUTE` on that file, `(allow process-exec (literal (param "PROGRAM")))`), nothing wider.
+
+Status: open
+
+> forwarded to usercode (1 to 3, 6, 7: `crates/blaze-usercode`; usercode-next1) and cargo (4, 5: `crates/blaze-cargo/src/sandbox*`; cargo-next1); told by tmux (requests, pass 25).
+
+> cargo (2026-10-29 22:10): 4 and 5 are usercode's, not lane cargo's.
+> `docs/v2/plan/reference/crates.md` gives `crates/blaze-cargo/src/sandbox.rs` and
+> `crates/blaze-cargo/src/sandbox/` to usercode, and lane cargo's paths exclude them. Part 6's
+> `sandbox/linux.rs` and `sandbox/macos.rs` were routed to usercode for the same reason.
+> Sent back to usercode-next1 (told by tmux). Lane cargo's one literal outside those paths,
+> `serve/unit/run.rs`, has `services: Vec::new()` (`v2/requests/cargo.md`, mem-core-exec).
+
+> applied (usercode, 2026-10-29), all six parts. 1 to 3: `confine::Spec.services`
+> (`#[serde(default)]`), `SpecOf.services`, the warm key hashes the count and each name (test
+> `the_services_a_server_may_look_up_are_in_its_key`), `services: Vec::new()` in `script.rs`,
+> `run.rs`, `test/queue.rs` and `proc-macro-api/src/warm.rs`. 4: `Also.services`, set from
+> `spec.services` in `v2.rs`; every `confine::Spec` literal in `sandbox*` has the field. 5: as
+> written, plus test `each_mach_name_given_is_one_more_lookup_and_no_other_is_allowed`. The
+> macOS run that `bootstrap_look_up`s a registered name is not written: registering a name a
+> test can look up needs `bootstrap_check_in` under a launchd job, which a test binary is not.
+> Whether Seatbelt takes `(param ..)` inside `global-name` is still to be seen on the first macOS
+> run with a service. 6: the loop as written in `linux.rs` `fn exec` and in the macOS child. Test
+> `a_program_still_open_for_writing_runs_once_it_is_closed` (Linux). It holds the writer for
+> 30 ms and then for 1.5 s, and reads the message through the new `alone::run_said`, which
+> returns what the sandbox wrote. Hot lint 0; manifest lint passes. Not built.
+
+## dedup: hex onto `blaze_format::hex`, and `changed_input` shared with blaze-testsel (from dedup-sim-edge, 2026-10-29)
+
+`blaze_format::hex` (new, `crates/blaze-format/src/hex.rs`) is the one hexadecimal: `encode`,
+`encode_into`, `is_encoding`, `decode::<N>` (either case), `decode_lower::<N>`. It holds
+`keyed.rs`' digest test already (moved, with proptests against these copies).
+blaze-macro-wasm already depends on blaze-format.
+
+1. `crates/blaze-macro-wasm/src/keyed.rs`: delete `DIGITS`, `hex`, `is_hex` and the test
+   `a_digest_is_written_as_its_hexadecimal` (now in `hex.rs`; `mod tests` goes if nothing is left).
+   Callers (`lib.rs` 405, 411, 414, 1372, 1374, 2756; 1403) call
+   `blaze_format::hex::encode_into(bytes, out)` and `blaze_format::hex::is_encoding(text, bytes)`,
+   which are the same functions under those names.
+2. `crates/blaze-macro-wasm/src/lib.rs`: delete `fn unhex` (1382-1391); line 1356 calls
+   `blaze_format::hex::decode::<32>(digest)?` and `decode::<32>(identity)?`. The only change:
+   `u8::from_str_radix` took `+5` as a byte, and `decode` refuses it.
+3. `crates/blaze-usercode/src/test/select.rs:507`: `fn changed_input` becomes `pub fn` (add it to
+   `test.rs`' `pub use select::{..}` or leave it at `select::changed_input`). blaze-testsel
+   `select.rs:283` is the same function token for token and deletes its copy
+   (`v2/requests/fastcompile.md`, same heading).
+
+> forwarded to usercode (usercode-next1); told by tmux (requests, pass 29).
+
+> applied (usercode, 2026-10-29), not built. 1: `DIGITS`, `hex` and `is_hex` are gone from
+> `keyed.rs`, and their callers in `lib.rs` call `blaze_format::hex::{encode_into, is_encoding}`.
+> One part of the old test stays as `a_files_digest_is_the_first_half_of_its_sha256`: the check
+> of `digest_bytes`, which `hex.rs`'s copy doesn't hold (it has no SHA-256). 2: `unhex` is gone,
+> and `listing` calls `blaze_format::hex::decode::<32>`. 3: `test::select::changed_input` is
+> `pub` and re-exported as `blaze_usercode::test::changed_input`.

@@ -19,7 +19,7 @@ use hir::{HirFileId, InFile, Name};
 use hir_def::{AttrDefId, ModuleDefId, ModuleId, attrs::AttrFlags};
 use hir_expand::MacroDefKind;
 use intern::sym;
-use syntax::{AstNode, SyntaxNode};
+use syntax::view::{self as ast, AstNode as _};
 
 use super::{
     defs::{DefIdx, Defs, Id, Kind, Parent},
@@ -98,20 +98,20 @@ impl<'c, 'a, 'db> Crate<'c, 'a, 'db> {
     }
 }
 
-impl Crate<'_, '_, '_> {
+impl<'db> Crate<'_, '_, 'db> {
     /// The node whose attributes set the level at `def`: its own, or for what a builtin derive
     /// makes (a sibling of its ADT in rustc's HIR), what the ADT is in.
-    fn level_node(&self, def: DefIdx) -> Option<InFile<SyntaxNode>> {
+    fn level_node(&self, def: DefIdx) -> Option<InFile<ast::Node<'db>>> {
         let defs = self.defs;
         if let Some(node) = defs[def].node {
-            return Some(self.cx.syntax(node));
+            return Some(self.cx.syntax_view(node));
         }
         let derive = match defs[def].id {
             Id::Derive(it) | Id::DeriveMethod(it) => it,
             _ => return None,
         };
         let adt = defs.get(Id::Adt(derive.loc(self.cx.db).adt))?;
-        let node = self.cx.syntax(defs[adt].node?);
+        let node = self.cx.syntax_view(defs[adt].node?);
         let parent = node.value.parent()?;
         Some(node.with_value(parent))
     }
@@ -123,18 +123,17 @@ impl Crate<'_, '_, '_> {
             return it;
         }
         let level = match self.level_node(def) {
-            Some(node) => self.levels.at(self.cx, node.as_ref()),
-            None => self.levels.at(self.cx, self.crate_root().as_ref()),
+            Some(node) => self.levels.at(self.cx, node),
+            None => self.levels.at(self.cx, self.crate_root()),
         };
         slot.set(Some(level));
         level
     }
 
-    fn crate_root(&self) -> InFile<SyntaxNode> {
+    fn crate_root(&self) -> InFile<ast::Node<'db>> {
         let db = self.cx.db;
-        let source = self.cx.krate.root_module(db).definition_source(db);
-        let file: HirFileId = source.file_id;
-        InFile::new(file, self.cx.sema.parse_or_expand(file))
+        let file: HirFileId = self.cx.krate.root_module(db).definition_source_file_id(db);
+        InFile::new(file, self.cx.vsema.parse_or_expand(file))
     }
 
     /// rustc's `has_allow_dead_code_or_lang_attr`: `Some(true)` when `dead_code` is allowed or
@@ -247,7 +246,7 @@ impl Crate<'_, '_, '_> {
                 MacroDefKind::BuiltInAttr(_, it) => it.is_test() || it.is_bench(),
                 _ => false,
             };
-            if test && self.cx.syntax(node).value.parent().is_some_and(|it| it.parent().is_none()) {
+            if test && self.cx.syntax_view(node).value.parent().is_some_and(|it| it.parent().is_none()) {
                 out.push(WorkItem::new(def, false));
             }
         }
@@ -373,9 +372,9 @@ fn maybe_record_as_seed(k: &Crate<'_, '_, '_>, owner: DefIdx, seeds: &mut Seeds)
 }
 
 /// What is between the first and the last `"` of `node`: an attribute's string value.
-fn string_value(node: &SyntaxNode) -> Option<String> {
-    let text = node.text().to_string(); // alloc: setup, a `#![crate_type]`, once per crate
+fn string_value(node: ast::Node<'_>) -> Option<&str> {
+    let text = node.text();
     let start = text.find('"')?;
     let end = text.rfind('"')?;
-    (end > start).then(|| text[start + 1..end].to_owned()) // alloc: setup, as above
+    (end > start).then(|| &text[start + 1..end])
 }

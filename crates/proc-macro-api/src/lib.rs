@@ -10,10 +10,15 @@
     feature = "in-rust-tree",
     feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span, rustc_private)
 )]
+#![feature(allocator_api)]
 #![allow(internal_features, unused_features)]
 
 #[cfg(feature = "in-rust-tree")]
 extern crate rustc_driver as _;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub mod bidirectional_protocol;
 pub mod legacy_protocol;
@@ -165,50 +170,28 @@ impl ProcMacroClient {
         version: Option<&Version>,
         num_process: usize,
     ) -> io::Result<ProcMacroClient> {
+        // Each allocation here is once per client, which keeps what it opens connections with.
         let env: Vec<(OsString, Option<OsString>)> = env
             .into_iter()
             .map(|(name, value)| {
+                // alloc: once per client, as above.
                 (name.as_ref().to_owned(), value.as_ref().map(|it| it.as_ref().to_owned()))
             })
-            .collect();
-        let (path, version) = (process_path.to_owned(), version.cloned());
+            .collect(); // alloc: as above.
+        let (path, version) = (process_path.to_owned(), version.cloned()); // alloc: as above.
         let open = move || {
             let env = env.iter().map(|(name, value)| (name, value));
             ProcMacroServerProcess::spawn(&path, env, version.as_ref())
         };
-        ProcMacroClient::pooled(process_path, num_process, Box::new(open))
+        ProcMacroClient::pooled(process_path, num_process, Box::new(open)) // alloc: as above.
     }
 
     /// A client of `size` connections opened by `open` to start with, which opens more by it.
     fn pooled(path: &AbsPath, size: usize, open: Open) -> io::Result<ProcMacroClient> {
         let first = (0..size.max(1)).map(|_| open()).collect::<io::Result<Vec<_>>>()?;
+        // alloc: error path.
         let pool = ProcMacroServerPool::new(first, open).map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(ProcMacroClient { pool, path: path.to_owned() })
-    }
-
-    /// Invokes `spawn` and returns a client connected to the resulting read and write handles.
-    ///
-    /// The `process_path` is used for `Self::server_path`. This function is mainly used for testing.
-    pub fn with_io_channels(
-        process_path: &AbsPath,
-        spawn: impl Fn(
-            Option<ProtocolFormat>,
-        ) -> io::Result<(
-            Box<dyn process::ProcessExit>,
-            Box<dyn io::Write + Send + Sync>,
-            Box<dyn io::BufRead + Send + Sync>,
-        )> + Clone
-        + Send
-        + Sync
-        + 'static,
-        version: Option<&Version>,
-        num_process: usize,
-    ) -> io::Result<ProcMacroClient> {
-        let version = version.cloned();
-        let open = move || {
-            ProcMacroServerProcess::run(&spawn, version.as_ref(), || "<unknown>".to_owned())
-        };
-        ProcMacroClient::pooled(process_path, num_process, Box::new(open))
+        Ok(ProcMacroClient { pool, path: path.to_owned() }) // alloc: once per client.
     }
 
     /// A client of the warm servers `servers` ([`warm`]), each started by the daemon's pool as
@@ -218,20 +201,26 @@ impl ProcMacroClient {
     pub fn warm(
         program: &AbsPath,
         servers: Vec<warm::Warm>,
+        // The daemon's pool, which this crate can't name (the daemon depends on it).
+        // dyn: asked once per server connected, which starts or takes one.
         more: Arc<dyn warm::Servers>,
         environment: Arc<warm::Environment>,
     ) -> io::Result<ProcMacroClient> {
         if servers.is_empty() {
             return Err(io::Error::other("a proc-macro client of no warm server"));
         }
+        // Each allocation here is once per client, or once per connection it opens.
         let first = servers
             .into_iter()
-            .map(|server| ProcMacroServerProcess::warm(server, environment.clone()))
+            .map(|server| ProcMacroServerProcess::warm(server, Arc::clone(&environment)))
             .collect::<io::Result<Vec<_>>>()?;
-        let open: Open =
-            Box::new(move || ProcMacroServerProcess::warm(more.connect()?, environment.clone()));
+        // alloc: once per client, as above.
+        let open: Open = Box::new(move || {
+            ProcMacroServerProcess::warm(more.connect()?, Arc::clone(&environment))
+        });
+        // alloc: error path.
         let pool = ProcMacroServerPool::new(first, open).map_err(|e| io::Error::other(e.to_string()))?;
-        Ok(ProcMacroClient { pool, path: program.to_owned() })
+        Ok(ProcMacroClient { pool, path: program.to_owned() }) // alloc: once per client.
     }
 
     /// Returns the absolute path to the proc-macro server.

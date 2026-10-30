@@ -109,7 +109,7 @@ fn child<'a>(child: &'a Child, placed: &Placed<'a>) -> Diagnostic<'a> {
         code: None,
         level: child.level.name(),
         spans: spans(&child.span, placed),
-        children: Vec::new(),
+        children: Vec::new(), // alloc: empty, allocates nothing
         rendered: None,
     }
 }
@@ -122,18 +122,19 @@ fn suggestion<'a>(suggestion: &'a Suggestion, placed: &Placed<'a>) -> Diagnostic
         .iter()
         .flatten()
         .map(|(span, replacement)| {
+            // alloc: the JSON of a suggestion written, the edge
             let backtrace: Backtrace<'a> = span.macro_backtrace().collect();
             let suggested = Some((replacement.as_str(), suggestion.applicability));
             self::span(&span.file, span.lo, span.hi, true, None, suggested, &backtrace, placed)
         })
-        .collect();
+        .collect(); // alloc: the JSON of a suggestion written, the edge
     Diagnostic {
         message_type: None,
         message: &suggestion.message,
         code: None,
         level: "help",
         spans,
-        children: Vec::new(),
+        children: Vec::new(), // alloc: empty, allocates nothing
         rendered: None,
     }
 }
@@ -142,11 +143,12 @@ fn spans<'a>(span: &'a MultiSpan, placed: &Placed<'a>) -> Vec<DiagnosticSpan<'a>
     span.span_labels()
         .into_iter()
         .map(|it| {
+            // alloc: the JSON of a diagnostic written, the edge
             let backtrace: Backtrace<'a> = it.span.macro_backtrace().collect();
             let at = it.span;
             self::span(&at.file, at.lo, at.hi, it.is_primary, it.label, None, &backtrace, placed)
         })
-        .collect()
+        .collect() // alloc: the JSON of a diagnostic written, the edge
 }
 
 /// rustc's `DiagnosticSpan::from_span_full`: `lo..hi` of `name` placed, with the expansions it
@@ -181,6 +183,7 @@ fn span<'a>(
             self::span(&def.file, def.lo, head, false, None, None, &[], placed)
         });
         let call = &expansion.call_site;
+        // alloc: the JSON of a span in a macro, written, the edge; rustc's shape is recursive
         Box::new(DiagnosticSpanMacroExpansion {
             span: self::span(&call.file, call.lo, call.hi, false, None, None, outer, placed),
             macro_decl_name: expansion.decl_name(),
@@ -208,7 +211,7 @@ fn span<'a>(
 /// the columns of it on that line, 1-based in chars.
 fn lines(file: &File, lo: usize, hi: usize) -> Vec<DiagnosticSpanLine<'_>> {
     if lo > hi {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
     let ((lo_line, lo_column), (hi_line, hi_column)) = (file.position(lo), file.position(hi));
     let mut start = lo_column;

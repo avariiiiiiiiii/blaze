@@ -6,7 +6,10 @@ use base_db::{Crate, all_crates};
 use expect_test::{Expect, expect};
 use hir_expand::name::Name;
 use intern::sym;
-use syntax::{AstNode, ast};
+use syntax::{
+    ast,
+    view::{self, AstNode as _},
+};
 
 use super::*;
 use crate::{
@@ -18,7 +21,7 @@ use crate::{
     },
     per_ns::Namespace,
     resolver::{HasResolver, Resolver},
-    src::use_tree_to_ast,
+    src::use_tree_to_view,
     test_db::TestDBExt,
 };
 
@@ -34,10 +37,10 @@ fn import_text(db: &TestDB, import: ImportOrExternCrate) -> String {
     match import {
         ImportOrExternCrate::Import(ImportId { use_, idx })
         | ImportOrExternCrate::Glob(GlobId { use_, idx }) => {
-            use_tree_to_ast(db, use_.lookup(db).id, idx).syntax().text().to_string()
+            use_tree_to_view(db, use_.lookup(db).id, idx).syntax().text().to_owned()
         }
         ImportOrExternCrate::ExternCrate(it) => {
-            it.lookup(db).id.to_node(db).syntax().text().to_string()
+            it.lookup(db).id.to_view(db).syntax().text().to_owned()
         }
     }
 }
@@ -88,7 +91,7 @@ fn render(db: &TestDB, used: &UsedImports) -> String {
 /// The records of `def_map`, each in its order, naming everything by its source.
 pub(super) fn render_records(db: &TestDB, def_map: &DefMap) -> String {
     let NameRecords { uses, unresolved, glob_targets, macro_calls, derive_helpers, .. } =
-        def_map.name_records();
+        def_map.name_records(db);
     let mut out = String::new();
     for it in uses {
         let text = import_text(db, it.import);
@@ -124,9 +127,9 @@ fn via_text(db: &TestDB, via: MacroVia) -> String {
 }
 
 fn item_name(db: &TestDB, item: crate::AstId<ast::Item>) -> String {
-    let node = item.to_node(db);
-    let name = node.syntax().descendants().find_map(ast::Name::cast).unwrap();
-    name.text().to_string()
+    let node = item.to_view(db);
+    let name = node.syntax().descendants().find_map(view::Name::cast).unwrap();
+    name.text().to_owned()
 }
 
 fn check_used(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: Expect) {
@@ -322,7 +325,7 @@ macro_rules! made { () => {} }
     );
     let db = TestDB::with_files(fixture);
     let def_map = crate_def_map(&db, crate_named(&db, "main"));
-    let [call] = def_map.name_records().macro_calls() else { panic!() };
+    let [call] = def_map.name_records(&db).macro_calls() else { panic!() };
     assert_eq!(via_text(&db, call.via), "macro_use extern crate dep;");
 }
 
@@ -348,7 +351,7 @@ crate::there!();
     let db = TestDB::with_files(fixture);
     let def_map = crate_def_map(&db, db.fetch_test_crate());
     let mut vias: Vec<String> =
-        def_map.name_records().macro_calls().iter().map(|it| via_text(&db, it.via)).collect();
+        def_map.name_records(&db).macro_calls().iter().map(|it| via_text(&db, it.via)).collect();
     vias.sort();
     assert_eq!(vias, ["declaration", "import crate::there as again", "textual"]);
 }
@@ -376,14 +379,14 @@ fn derive() {}
 "#,
     );
     let def_map = crate_def_map(&db, crate_named(&db, "main"));
-    let mut helpers: Vec<(String, bool)> = (def_map.name_records().derive_helpers().iter())
+    let mut helpers: Vec<(String, bool)> = (def_map.name_records(&db).derive_helpers().iter())
         .map(|it| (item_name(&db, it.item), it.before_derive))
         .collect();
     helpers.sort();
     assert_eq!(helpers, [("After".to_owned(), false), ("Before".to_owned(), true)]);
     let dump = def_map.dump(&db);
     assert!(dump.contains("- After : type value") && dump.contains("- Before : type value"));
-    let unresolved = def_map.diagnostics().iter().map(|it| format!("{:?}", it.kind));
+    let unresolved = def_map.diagnostics(&db).iter().map(|it| format!("{:?}", it.kind));
     assert_eq!(unresolved.collect::<Vec<_>>(), Vec::<String>::new());
 }
 

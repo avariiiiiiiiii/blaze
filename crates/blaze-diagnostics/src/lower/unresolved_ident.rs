@@ -21,12 +21,13 @@ use either::Either;
 use hir::{HasAttrs as _, InFile, ModuleDef};
 use span::Edition;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
-    ast::{self, HasModuleItem as _, HasName as _},
+    SyntaxKind, TextRange,
+    view::{self as ast, AstNode as _, AstToken as _, HasModuleItem as _, HasName as _},
 };
 
 use crate::{
-    cx::{Cx, item_range},
+    checks::head_range_view as head_range,
+    cx::{Cx, item_range_view as item_range},
     lints::{code_fact, edit_distance::find_best_match_for_name},
     lower::{Found, Phase},
     model::{Applicability, Diag, MultiSpan, Span, SuggestionStyle},
@@ -35,62 +36,70 @@ use crate::{
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedIdent) -> Vec<Found> {
     let (ptr, in_node) = d.node.value;
     let ptr = InFile::new(d.node.file_id, ptr);
-    let node = cx.node(ptr);
+    let node = cx.node_view(ptr);
     let base = cx.span_of_ptr(ptr);
+    let syntax = node.value.syntax();
     let (span, name) = match in_node {
         Some(range) => {
-            let text = node.value.as_ref().either(|it| it.syntax().to_string(), |it| it.syntax().to_string());
-            let name = text.get(usize::from(range.start())..usize::from(range.end())).unwrap_or_default().to_owned();
-            let span = match cx.snippet(&base) == Some(text.as_str()) {
+            let text = syntax.text();
+            let name = text.get(usize::from(range.start())..usize::from(range.end())).unwrap_or_default();
+            let span = match cx.snippet(&base) == Some(text) {
                 true => base.with_lo(base.lo + u32::from(range.start())).with_hi(base.lo + u32::from(range.end())),
+                // clone: on the error path, for an error hir found
                 false => base.clone(),
             };
             (span, name)
         }
-        None => (base.clone(), written_name(&node.value)),
+        // clone: on the error path, for an error hir found
+        None => (base.clone(), written_name(node.value)),
     };
-    let source = PathSource::of(&node.value, in_node.is_some(), &name);
-    let syntax = node.value.as_ref().either(|it| it.syntax().clone(), |it| it.syntax().clone());
-    let scope = cx.sema.scope(&syntax);
+    let source = PathSource::of(node.value, in_node.is_some(), name);
+    let scope = cx.vsema.scope(syntax);
     let module = scope.as_ref().map(|it| it.module());
 
     let mut diag = if name == "self" {
-        self_value(cx, &syntax, d.node.file_id, source, span.clone())
+        // clone: on the error path, for an error hir found
+        self_value(cx, syntax, d.node.file_id, source, span.clone())
     } else {
+        // alloc: the error's text, for an error hir found
         let message = format!("cannot find {} `{name}` in this scope", source.expected());
+        // clone: on the error path, for an error hir found
         let mut diag = Diag::error(Some(source.code()), message, span.clone());
         let suggested =
-            scope.as_ref().is_some_and(|scope| typo(cx, &mut diag, Names::Scope(scope), source, &name, &span, &[]));
+            scope.as_ref().is_some_and(|scope| typo(cx, &mut diag, Names::Scope(scope), source, name, &span, &[]));
         if !suggested {
+            // clone: on the error path, for an error hir found
             diag.span_label(span.clone(), "not found in this scope");
         }
         if let Some(module) = module {
-            let found = imports(cx, module, source, &name, None);
+            let found = imports(cx, module, source, name, None);
             show_imports(cx, &mut diag, module, found, false);
         }
         diag
     };
     if let Some(module) = module {
-        diag.fact(cx.resolves_fact(module, &name), format!("what `{name}` names in its scope"));
+        // alloc: the error's text, for an error hir found
+        diag.fact(cx.resolves_fact(module, name), format!("what `{name}` names in its scope"));
     }
     code_fact(cx, &mut diag, InFile::new(d.node.file_id, d.node.value.0.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Resolve)]
 }
 
 /// The name a path expression or pattern is written with.
-fn written_name(node: &Either<ast::Expr, ast::Pat>) -> String {
+fn written_name<'t>(node: Either<ast::Expr<'t>, ast::Pat<'t>>) -> &'t str {
     let path = match node {
         Either::Left(ast::Expr::PathExpr(it)) => it.path(),
         Either::Right(ast::Pat::PathPat(it)) => it.path(),
         Either::Right(ast::Pat::TupleStructPat(it)) => it.path(),
-        Either::Right(ast::Pat::IdentPat(it)) => return it.name().map_or_else(String::new, |it| it.text().to_owned()),
-        Either::Left(it) => return it.syntax().to_string(),
-        Either::Right(it) => return it.syntax().to_string(),
+        Either::Right(ast::Pat::IdentPat(it)) => return it.name().map_or("", |it| it.text()),
+        Either::Left(it) => return it.syntax().text(),
+        Either::Right(it) => return it.syntax().text(),
     };
-    match path.as_ref().and_then(|it| it.segment()) {
-        Some(segment) if segment.self_token().is_some() => "self".to_owned(),
-        Some(segment) => segment.name_ref().map_or_else(String::new, |it| it.text().to_owned()),
-        None => String::new(),
+    match path.and_then(|it| it.segment()) {
+        Some(segment) if segment.self_token().is_some() => "self",
+        Some(segment) => segment.name_ref().map_or("", |it| it.text()),
+        None => "",
     }
 }
 
@@ -113,6 +122,8 @@ pub(crate) enum PathSource {
     Pat,
     /// The path of a tuple struct pattern.
     TupleStruct,
+    /// The path of a struct literal or a record pattern.
+    Struct,
     /// A type.
     Type,
     /// A trait: a bound, the trait of an impl, `<T as Trait>`.
@@ -120,9 +131,10 @@ pub(crate) enum PathSource {
 }
 
 impl PathSource {
-    fn of(node: &Either<ast::Expr, ast::Pat>, captured: bool, name: &str) -> PathSource {
+    pub(crate) fn of(node: Either<ast::Expr<'_>, ast::Pat<'_>>, captured: bool, name: &str) -> PathSource {
         match node {
             Either::Left(_) if captured => PathSource::Value,
+            Either::Left(ast::Expr::RecordExpr(_)) | Either::Right(ast::Pat::RecordPat(_)) => PathSource::Struct,
             Either::Left(expr) => {
                 let callee = expr
                     .syntax()
@@ -143,7 +155,7 @@ impl PathSource {
     pub(crate) fn ns(self) -> Ns {
         match self {
             PathSource::Value | PathSource::Callee(_) | PathSource::Pat | PathSource::TupleStruct => Ns::Value,
-            PathSource::Type | PathSource::Trait => Ns::Type,
+            PathSource::Struct | PathSource::Type | PathSource::Trait => Ns::Type,
         }
     }
 
@@ -155,15 +167,17 @@ impl PathSource {
             PathSource::Callee(true) => "function, tuple struct or tuple variant",
             PathSource::Pat => "unit struct, unit variant or constant",
             PathSource::TupleStruct => "tuple struct or tuple variant",
+            PathSource::Struct => "struct, variant or union type",
             PathSource::Type => "type",
             PathSource::Trait => "trait",
         }
     }
 
     /// `error_code` of a value path with no resolution in the namespace.
-    fn code(self) -> &'static str {
+    pub(crate) fn code(self) -> &'static str {
         match self {
             PathSource::Pat | PathSource::TupleStruct => "E0531",
+            PathSource::Struct => "E0422",
             _ => "E0425",
         }
     }
@@ -174,6 +188,7 @@ impl PathSource {
             PathSource::Value | PathSource::Callee(_) => true,
             PathSource::Pat => matches!(descr, "unit struct" | "unit variant" | "constant"),
             PathSource::TupleStruct => matches!(descr, "tuple struct" | "tuple variant"),
+            PathSource::Struct => matches!(descr, "struct" | "variant" | "union" | "type alias" | "self type"),
             PathSource::Type => matches!(
                 descr,
                 "struct" | "enum" | "union" | "trait" | "type alias" | "builtin type" | "type parameter" | "self type"
@@ -184,8 +199,10 @@ impl PathSource {
 }
 
 /// E0424 (`suggest_self_value`): `self` where no `self` parameter is.
-fn self_value(cx: &Cx<'_, '_>, syntax: &SyntaxNode, file: hir::HirFileId, source: PathSource, span: Span) -> Diag {
+fn self_value(cx: &Cx<'_, '_>, syntax: ast::Node<'_>, file: hir::HirFileId, source: PathSource, span: Span) -> Diag {
+    // alloc: the error's text, for an error hir found
     let message = format!("cannot find {} `self` in this scope", source.expected());
+    // clone: on the error path, for an error hir found
     let mut diag = Diag::error(Some("E0424"), message, span.clone());
     let at = |range: TextRange| cx.span(InFile::new(file, range));
     if matches!(source, PathSource::Pat | PathSource::TupleStruct) {
@@ -196,7 +213,7 @@ fn self_value(cx: &Cx<'_, '_>, syntax: &SyntaxNode, file: hir::HirFileId, source
     diag.span_label(span, "`self` value is a keyword only available in methods with a `self` parameter");
     if let Some(f) = syntax.ancestors().find_map(ast::Fn::cast) {
         let params = f.param_list();
-        if params.as_ref().is_some_and(|it| it.self_param().is_some()) {
+        if params.is_some_and(|it| it.self_param().is_some()) {
             diag.span_label(
                 at(item_range(f.syntax())),
                 "this function has a `self` parameter, but a macro invocation can only access identifiers it receives from parameters",
@@ -205,8 +222,8 @@ fn self_value(cx: &Cx<'_, '_>, syntax: &SyntaxNode, file: hir::HirFileId, source
             let is_assoc = f.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST);
             let doesnt = match is_assoc {
                 true => {
-                    let first = params.as_ref().and_then(|it| it.params().next());
-                    let sugg = match (&first, params.as_ref().and_then(|it| it.l_paren_token())) {
+                    let first = params.and_then(|it| it.params().next());
+                    let sugg = match (first, params.and_then(|it| it.l_paren_token())) {
                         (Some(first), _) => Some((at(first.syntax().text_range()).shrink_to_lo(), "&self, ")),
                         (None, Some(paren)) => Some((at(paren.text_range()).shrink_to_hi(), "&self")),
                         (None, None) => None,
@@ -224,6 +241,7 @@ fn self_value(cx: &Cx<'_, '_>, syntax: &SyntaxNode, file: hir::HirFileId, source
                 false => "can't",
             };
             if let Some(name) = f.name() {
+                // alloc: the error's text, for an error hir found
                 diag.span_label(at(name.syntax().text_range()), format!("this function {doesnt} have a `self` parameter"));
             }
         }
@@ -273,37 +291,26 @@ pub(crate) fn def_descr(cx: &Cx<'_, '_>, ns: Ns, def: ModuleDef) -> Option<&'sta
     })
 }
 
-/// rustc's `guess_head_span` of an item's `source_span`: up to its first `{`.
-fn head_range(node: &SyntaxNode) -> TextRange {
-    let range = item_range(node);
-    let text = node.to_string(); // alloc: the definition suggested, once per diagnostic
-    let base = node.text_range().start();
-    let from = usize::from(range.start() - base);
-    let item = &text[from..usize::from(range.end() - base)];
-    let head = item.find('{').map_or(item, |at| &item[..at]).trim_end();
-    TextRange::at(range.start(), TextSize::of(head))
-}
-
 /// The head span of an item's definition, of the kinds a path in `ns` may name.
 pub(crate) fn def_span(cx: &Cx<'_, '_>, ns: Ns, def: ModuleDef) -> Option<Span> {
-    let source: InFile<SyntaxNode> = match (ns, def) {
-        (Ns::Value, ModuleDef::Function(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        (Ns::Value, ModuleDef::Const(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        (Ns::Value, ModuleDef::Static(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        (Ns::Value, ModuleDef::EnumVariant(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        (Ns::Type, ModuleDef::Module(it)) => it.declaration_source(cx.db)?.map(|it| it.syntax().clone()),
-        (Ns::Type, ModuleDef::Trait(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        (Ns::Type, ModuleDef::TypeAlias(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
-        (_, ModuleDef::Adt(it)) => cx.sema.source(it)?.map(|it| it.syntax().clone()),
+    let source: InFile<ast::Node<'_>> = match (ns, def) {
+        (Ns::Value, ModuleDef::Function(it)) => cx.vsema.source(it)?.map(|it| it.syntax()),
+        (Ns::Value, ModuleDef::Const(it)) => cx.vsema.source(it)?.map(|it| it.syntax()),
+        (Ns::Value, ModuleDef::Static(it)) => cx.vsema.source(it)?.map(|it| it.syntax()),
+        (Ns::Value, ModuleDef::EnumVariant(it)) => cx.vsema.source(it)?.map(|it| it.syntax()),
+        (Ns::Type, ModuleDef::Module(it)) => it.declaration_source_view(cx.db)?.map(|it| it.syntax()),
+        (Ns::Type, ModuleDef::Trait(it)) => cx.vsema.source(it)?.map(|it| it.syntax()),
+        (Ns::Type, ModuleDef::TypeAlias(it)) => cx.vsema.source(it)?.map(|it| it.syntax()),
+        (_, ModuleDef::Adt(it)) => cx.vsema.source(it)?.map(|it| it.syntax()),
         _ => return None,
     };
-    Some(cx.span(source.map(|it| head_range(&it))))
+    Some(cx.span(source.map(head_range)))
 }
 
 /// Where a type parameter is declared: its name.
 fn param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<Span> {
-    let source = cx.sema.source(param.merge())?;
-    let range = match &source.value {
+    let source = cx.vsema.source(param.merge())?;
+    let range = match source.value {
         Either::Left(ast::TypeOrConstParam::Type(it)) => it.name()?.syntax().text_range(),
         _ => return None,
     };
@@ -324,10 +331,11 @@ fn scope_descr(cx: &Cx<'_, '_>, ns: Ns, def: &hir::ScopeDef<'_>) -> Option<&'sta
 
 /// Where a name in scope is defined, and whether it is a local's binding: an item's head, a
 /// local's name, a type parameter's name.
-fn scope_span(cx: &Cx<'_, '_>, ns: Ns, def: &hir::ScopeDef<'_>) -> (Option<Span>, bool) {
+fn scope_span<'db>(cx: &Cx<'_, 'db>, ns: Ns, def: &hir::ScopeDef<'db>) -> (Option<Span>, bool) {
     match def {
         hir::ScopeDef::Local(local) => {
-            let binding = local.primary_source(cx.db).name().map(|it| cx.span(it.map(|it| it.syntax().text_range())));
+            let binding =
+                local.primary_source_view(cx.db).name().map(|it| cx.span(it.map(|it| it.syntax().text_range())));
             (binding, true)
         }
         hir::ScopeDef::GenericParam(hir::GenericParam::TypeParam(it)) => (param_span(cx, *it), false),
@@ -392,6 +400,7 @@ pub(crate) fn typo<'db>(
     }
     let mut labelled = false;
     if !is_local && let Some(def) = &def {
+        // alloc: the error's text, for an error hir found
         diag.span_label(def.clone(), format!("similarly named {descr} `{found}` defined here"));
         labelled = true;
     }
@@ -399,10 +408,13 @@ pub(crate) fn typo<'db>(
     match (&def, found.strip_prefix('_')) {
         (Some(binding), Some(unused)) if snippet == Some(unused) && is_local => {
             if !labelled {
+                // alloc: the error's text, for an error hir found
                 diag.span_label(binding.clone(), format!("`{found}` defined here"));
             }
             diag.suggestion_verbose(
+                // clone: on the error path, for an error hir found
                 binding.clone(),
+                // alloc: the error's text, for an error hir found
                 format!("the leading underscore in `{found}` marks it as unused, consider renaming it to `{unused}`"),
                 unused,
                 Applicability::MaybeIncorrect,
@@ -410,7 +422,9 @@ pub(crate) fn typo<'db>(
         }
         _ => {
             diag.suggestion_verbose(
+                // clone: on the error path, for an error hir found
                 span.clone(),
+                // alloc: the error's text, for an error hir found
                 format!("a {descr} with a similar name exists"),
                 found,
                 Applicability::MaybeIncorrect,
@@ -461,6 +475,7 @@ pub(crate) fn imports(
         prefer_absolute: false,
         allow_unstable: true,
     };
+    // alloc: the error's parts, for an error hir found
     let mut found = Imports { ns, accessible: Vec::new(), inaccessible: Vec::new() };
     for decl in cx.paths().decls(cx).named(name) {
         let def = decl.def;
@@ -474,13 +489,16 @@ pub(crate) fn imports(
         };
         match module.find_use_path(cx.db, item, hir::PrefixKind::ByCrate, cfg) {
             Some(path) if decl.local || !is_doc_hidden(cx, def) => {
+                // alloc: the error's text, for an error hir found
                 let path = path.display(cx.db, cx.edition).to_string();
                 let of_crate = path.starts_with("crate::");
                 found.accessible.push(Import { path: in_edition(cx, path), of_crate, descr, def });
             }
             Some(_) => {}
             None if decl.local => {
+                // alloc: the error's text, for an error hir found
                 let path = def.canonical_path(cx.db, cx.edition).unwrap_or_else(|| name.to_owned());
+                // alloc: the error's text, for an error hir found
                 let path = in_edition(cx, format!("crate::{path}"));
                 found.inaccessible.push(Import { path, of_crate: true, descr, def });
             }
@@ -511,6 +529,7 @@ pub(crate) fn show_imports(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module
     }
     if !accessible.is_empty() {
         let msg = match accessible.as_slice() {
+            // alloc: the error's text, for an error hir found
             [only] => format!("consider importing this {}{instead}", only.descr),
             many => {
                 let kind = match many.iter().all(|it| it.descr == many[0].descr) {
@@ -518,6 +537,7 @@ pub(crate) fn show_imports(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module
                     false => "item",
                 };
                 let s = if kind.ends_with('s') { "es" } else { "s" };
+                // alloc: the error's text, for an error hir found
                 format!("consider importing one of these {kind}{s}{instead}")
             }
         };
@@ -527,13 +547,16 @@ pub(crate) fn show_imports(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module
                 diag.suggestions(
                     span,
                     msg,
+                    // alloc: the error's text, for an error hir found
                     accessible.iter().map(|it| format!("use {};\n{newline}", it.path)),
                     Applicability::MaybeIncorrect,
                     SuggestionStyle::ShowAlways,
                 );
             }
             None => {
+                // alloc: the error's text, for an error hir found
                 let paths: String = accessible.iter().map(|it| format!("\n{}", it.path)).collect();
+                // alloc: the error's text, for an error hir found
                 diag.help(format!("{msg}:{paths}"));
             }
         }
@@ -542,10 +565,13 @@ pub(crate) fn show_imports(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module
     match inaccessible.as_slice() {
         [] => {}
         [only] => {
+            // alloc: the error's text, for an error hir found
             let msg = format!("{} `{}` exists but is inaccessible", only.descr, only.path);
             match span_of(only) {
                 Some(span) => {
+                    // clone: on the error path, for an error hir found
                     let mut multi = MultiSpan::of(span.clone());
+                    // alloc: the error's text, for an error hir found
                     multi.labels.push((span, "not accessible".to_owned()));
                     diag.span_note(multi, msg);
                 }
@@ -559,14 +585,18 @@ pub(crate) fn show_imports(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module
                 true => many[0].descr,
                 false => "item",
             };
+            // alloc: the error's text, for an error hir found
             let plural = if descr.ends_with('s') { format!("{descr}es") } else { format!("{descr}s") };
+            // alloc: the error's text, for an error hir found
             let mut msg = format!("these {plural} exist but are inaccessible");
             let mut multi = MultiSpan::default();
             let mut colon = false;
             for it in many {
                 match span_of(it) {
                     Some(span) => {
+                        // clone: on the error path, for an error hir found
                         multi.primary.push(span.clone());
+                        // alloc: the error's text, for an error hir found
                         multi.labels.push((span, format!("`{}`: not accessible", it.path)));
                     }
                     None => {
@@ -603,6 +633,7 @@ fn is_doc_hidden(cx: &Cx<'_, '_>, def: ModuleDef) -> bool {
 /// in 2015.
 fn in_edition(cx: &Cx<'_, '_>, path: String) -> String {
     match (cx.edition, path.strip_prefix("crate::")) {
+        // alloc: the error's text, for an error hir found
         (Edition::Edition2015, Some(rest)) => rest.to_owned(),
         _ => path,
     }
@@ -612,25 +643,26 @@ fn in_edition(cx: &Cx<'_, '_>, path: String) -> String {
 /// in, the first `use` item there or else its first item, and whether it was a `use`.
 fn use_placement(cx: &Cx<'_, '_>, module: hir::Module) -> Option<(Span, bool)> {
     let module = module.nearest_non_block_module(cx.db);
-    let source = module.definition_source(cx.db);
-    fn first(mut items: impl Iterator<Item = ast::Item> + Clone) -> Option<(ast::Item, bool)> {
+    let source = module.definition_source_view(cx.db);
+    fn first<'t>(mut items: impl Iterator<Item = ast::Item<'t>> + Clone) -> Option<(ast::Item<'t>, bool)> {
+        // clone: an iterator of views, copies two indices
         match items.clone().find(|it| matches!(it, ast::Item::Use(_))) {
             Some(it) => Some((it, true)),
             None => items.next().map(|it| (it, false)),
         }
     }
-    let (item, found_use) = match &source.value {
-        hir::ModuleSource::SourceFile(it) => first(it.items())?,
-        hir::ModuleSource::Module(it) => first(it.item_list()?.items())?,
-        hir::ModuleSource::BlockExpr(_) => return None,
+    let (item, found_use) = match source.value {
+        hir::ModuleSourceView::SourceFile(it) => first(it.items())?,
+        hir::ModuleSourceView::Module(it) => first(it.item_list()?.items())?,
+        hir::ModuleSourceView::BlockExpr(_) => return None,
     };
     let start = item
         .syntax()
         .children_with_tokens()
-        .find(|it| match it {
+        .find(|it| match *it {
             syntax::NodeOrToken::Node(_) => true,
             syntax::NodeOrToken::Token(token) => {
-                !token.kind().is_trivia() || ast::Comment::cast(token.clone()).is_some_and(|it| it.kind().doc.is_some())
+                !token.kind().is_trivia() || ast::AnyComment::cast(token).is_some_and(|it| it.kind().doc.is_some())
             }
         })
         .map_or(item.syntax().text_range().start(), |it| it.text_range().start());

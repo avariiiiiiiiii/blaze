@@ -1057,6 +1057,40 @@ pub struct GoalStalledOn<I: Interner> {
     pub opaques: GoalStalledOnOpaques<I>,
 }
 
+/// What `SolverDelegate::compute_goal_fast_path` may answer where it is asked.
+///
+/// The search graph charges a goal it evaluates one level of the recursion limit, and charges
+/// its parent the levels below it. A fast-path answer that stands for such an evaluation must
+/// cost the same, so it needs the depth the goal is evaluated with, which only the place that
+/// evaluates the goal knows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FastPathDepth {
+    /// The goal is being added to its parent's nested goals and is evaluated later, at a
+    /// depth not known yet: only answers that cost no depth.
+    Added,
+    /// The goal is being evaluated after `Added` gave no answer: only `HoldsWithin`, within
+    /// the depth available to the goal, or none when `None` (evaluating it overflows, or a
+    /// proof tree is being built).
+    Evaluating(Option<usize>),
+    /// A root goal or a stalled goal rerun: every answer, `HoldsWithin` within this depth.
+    Any(Option<usize>),
+}
+
+impl FastPathDepth {
+    /// Whether answers that cost no depth may be given.
+    pub fn depth_free(self) -> bool {
+        !matches!(self, FastPathDepth::Evaluating(_))
+    }
+
+    /// The depth a `HoldsWithin` answer must fit in, when one may be given.
+    pub fn available(self) -> Option<usize> {
+        match self {
+            FastPathDepth::Added => None,
+            FastPathDepth::Evaluating(available) | FastPathDepth::Any(available) => available,
+        }
+    }
+}
+
 /// For some goals we can trivially answer some questions without going through
 /// canonicalization. There are three options:
 #[derive(Clone, Debug)]
@@ -1065,6 +1099,11 @@ pub enum ComputeGoalFastPathOutcome<I: Interner> {
     NoFastPath,
     /// The goal trivially holds, immediately produce a result with [`Certainty::Yes`]
     TriviallyHolds,
+    /// The goal holds with [`Certainty::Yes`] and no constraints, as its search-graph
+    /// evaluation finds with `required_depth` levels below it. Given only when the
+    /// [`FastPathDepth`] has an available depth of at least `required_depth`; the caller
+    /// charges the parent goal as a global cache hit of that required depth is charged.
+    HoldsWithin { required_depth: usize },
     /// The goal is trivially stalled: we know for sure that it makes no sense to compute it right
     /// now, but can return information about what its stalled on and when it can be computed for real.
     TriviallyStalled { stalled_on: GoalStalledOn<I> },

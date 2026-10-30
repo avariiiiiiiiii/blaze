@@ -278,7 +278,7 @@ fn search_index(krate: &CrateDoc) -> String {
     )
 }
 
-struct Writer<'a> {
+pub(crate) struct Writer<'a> {
     model: &'a Model,
     names: &'a FxHashSet<&'a str>,
     statics: &'a Statics,
@@ -338,7 +338,7 @@ impl<'a> Writer<'a> {
         &self.model.crates[self.k]
     }
 
-    fn url(&self, target: &Target) -> Option<String> {
+    pub(crate) fn url(&self, target: &Target) -> Option<String> {
         match target {
             Target::Url(url) => Some(url.clone()),
             Target::Item(item) => {
@@ -357,7 +357,7 @@ impl<'a> Writer<'a> {
         }
     }
 
-    fn title(target: &Target) -> String {
+    pub(crate) fn title(target: &Target) -> String {
         match target {
             Target::Url(url) => url.clone(),
             Target::Item(item) => {
@@ -388,14 +388,12 @@ impl<'a> Writer<'a> {
     }
 
     fn docs_html(&self, doc: &Doc, heading_offset: u32) -> String {
-        let url = |t: &Target| self.url(t);
-        let cx = Context { url: &url, title: &Self::title, heading_offset };
+        let cx = Context { writer: self, heading_offset };
         markdown::render(doc, &cx, &mut self.ids.borrow_mut())
     }
 
     fn summary_html(&self, doc: &Doc) -> String {
-        let url = |t: &Target| self.url(t);
-        let cx = Context { url: &url, title: &Self::title, heading_offset: 1 };
+        let cx = Context { writer: self, heading_offset: 1 };
         markdown::summary(doc, &cx)
     }
 
@@ -1095,28 +1093,20 @@ impl<'a> Writer<'a> {
 
     fn trait_body(&self, item: &Item) -> String {
         let mut out = String::new();
-        let groups: [(&str, &str, Box<dyn Fn(&Member) -> bool>); 5] = [
+        let groups: [(&str, &str, fn(&Member) -> bool); 5] = [
             (
                 "required-associated-types",
                 "Required Associated Types",
-                Box::new(|m: &Member| m.kind == Kind::AssocType && !m.provided),
+                |m: &Member| m.kind == Kind::AssocType && !m.provided,
             ),
             (
                 "provided-associated-types",
                 "Provided Associated Types",
-                Box::new(|m: &Member| m.kind == Kind::AssocType && m.provided),
+                |m: &Member| m.kind == Kind::AssocType && m.provided,
             ),
-            (
-                "associated-constants",
-                "Associated Constants",
-                Box::new(|m: &Member| m.kind == Kind::AssocConst),
-            ),
-            (
-                "required-methods",
-                "Required Methods",
-                Box::new(|m: &Member| m.kind == Kind::TyMethod),
-            ),
-            ("provided-methods", "Provided Methods", Box::new(|m: &Member| m.kind == Kind::Method)),
+            ("associated-constants", "Associated Constants", |m: &Member| m.kind == Kind::AssocConst),
+            ("required-methods", "Required Methods", |m: &Member| m.kind == Kind::TyMethod),
+            ("provided-methods", "Provided Methods", |m: &Member| m.kind == Kind::Method),
         ];
         for (id, title, wanted) in groups {
             let members: Vec<&Member> = item.trait_items.iter().filter(|m| wanted(m)).collect();

@@ -1,12 +1,24 @@
-use blaze_api::{Artifact, BuildScriptRan, Diagnostic, Level, Span, UnitOf, UnitProfile, UnitTarget};
+use blaze_api::{
+    Artifact, ArtifactKind, BuildScriptRan, Diagnostic, Level, Span, TargetKind, UnitOf, UnitProfile, UnitTarget,
+};
 use blaze_ids::ContentId;
 
 use super::*;
 
+/// `it` as the daemon sends it, for [`lent`] to read in place as the CLI does.
+fn sent<T: serde::Serialize>(it: &T) -> Vec<u8> {
+    blaze_protocol::cbor::to_vec(it).unwrap()
+}
+
+/// A `*Ref` read where it lies in [`sent`]'s bytes.
+fn lent<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> T {
+    blaze_protocol::cbor::from_slice(bytes).unwrap()
+}
+
 fn bin_target(dir: &str) -> UnitTarget {
     UnitTarget {
-        kind: vec!["bin".to_owned()],
-        crate_types: vec!["bin".to_owned()],
+        kind: TargetKind::Bin,
+        crate_types: vec![CrateType::Bin],
         name: "foo".to_owned(),
         src_path: format!("{dir}/src/main.rs"),
         edition: "2021".to_owned(),
@@ -28,7 +40,7 @@ fn build_finished() {
 fn compiler_artifact() {
     let artifact = Artifact {
         package: "path+file:///w/foo#0.1.0".to_owned(),
-        kind: "bin".to_owned(),
+        kind: ArtifactKind::Bin,
         path: "/w/foo/target/debug/foo".to_owned(),
         content: ContentId([0; 32]),
         manifest_path: "/w/foo/Cargo.toml".to_owned(),
@@ -66,8 +78,9 @@ fn build_script_executed() {
         env: vec![("Z_VERSION".to_owned(), "1.3".to_owned())],
         out_dir: "/w/foo/target/debug/build/foo-1/out".to_owned(),
     };
+    let bytes = sent(&ran);
     assert_eq!(
-        line(|out| build_script(out, &ran)),
+        line(|out| build_script(out, lent(&bytes))),
         r#"{"reason":"build-script-executed","package_id":"path+file:///w/foo#0.1.0","linked_libs":["static=z"],"linked_paths":["native=/w/foo/target/debug/build/foo-1/out"],"cfgs":["has_z"],"env":[["Z_VERSION","1.3"]],"out_dir":"/w/foo/target/debug/build/foo-1/out"}"#
     );
 }
@@ -102,13 +115,14 @@ fn unused(rendered: &str) -> Diagnostic {
         message: "if this is intentional, prefix it with an underscore".to_owned(),
         spans: vec![Span {
             replacement: Some("_x".to_owned()),
-            applicability: Some("MachineApplicable".to_owned()),
+            applicability: Some(Applicability::MachineApplicable),
             ..at.clone()
         }],
         children: Vec::new(),
         facts: Vec::new(),
         rendered: String::new(),
         unit: None,
+        explanation: None,
     };
     Diagnostic {
         level: Level::Warning,
@@ -119,6 +133,7 @@ fn unused(rendered: &str) -> Diagnostic {
         facts: Vec::new(),
         rendered: rendered.to_owned(),
         unit: None,
+        explanation: None,
     }
 }
 
@@ -131,10 +146,17 @@ fn checkout() -> (tempfile::TempDir, String) {
     (dir, root)
 }
 
+/// The `compiler-message` line of `diagnostic` in `unit`, both read in place as the CLI reads them.
+fn message(unit: &UnitOf, diagnostic: &Diagnostic, ansi: bool, sources: &mut Sources) -> String {
+    let (unit, diagnostic) = (sent(unit), sent(diagnostic));
+    line(|out| compiler_message(out, lent(&unit), lent(&diagnostic), ansi, sources))
+}
+
 #[test]
 fn a_compiler_message_as_cargo_writes_it_again() {
     let (_dir, root) = checkout();
     let unit = UnitOf {
+        id: 0,
         package_id: format!("path+file://{root}#0.1.0"),
         manifest_path: format!("{root}/Cargo.toml"),
         target: bin_target(&root),
@@ -142,7 +164,7 @@ fn a_compiler_message_as_cargo_writes_it_again() {
     };
     let rendered = "\u{1b}[1m\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
-    let said = line(|out| compiler_message(out, &unit, &unused(rendered), false, &mut sources));
+    let said = message(&unit, &unused(rendered), false, &mut sources);
     let target = format!(
         r#"{{"kind":["bin"],"crate_types":["bin"],"name":"foo","src_path":"{root}/src/main.rs","edition":"2021","doc":true,"doctest":false,"test":true}}"#
     );
@@ -162,12 +184,28 @@ fn a_compiler_message_as_cargo_writes_it_again() {
         text = text,
     );
     assert_eq!(said, expected);
+    // cargo's `FromCompiler` carries the target, not the unit's mode: the same unit compiled
+    // with `--test` writes the same message, its `"test"` the target's own.
+    let tested = UnitOf { test: true, ..unit.clone() };
+    assert_eq!(message(&tested, &unused(rendered), false, &mut sources), expected);
+    // A coded error carries rustc's markdown for its code as the code's `explanation`.
+    let coded = Diagnostic {
+        code: Some("E0384".to_owned()),
+        explanation: Some("A variable was assigned twice.\n\n```compile_fail,E0384\n```\n".to_owned()),
+        ..unused(rendered)
+    };
+    assert!(
+        message(&unit, &coded, false, &mut sources).ends_with(
+            r#""code":{"code":"E0384","explanation":"A variable was assigned twice.\n\n```compile_fail,E0384\n```\n"}}}"#
+        )
+    );
 }
 
 #[test]
 fn a_compiler_message_in_color_is_rustcs_as_it_wrote_it() {
     let (_dir, root) = checkout();
     let unit = UnitOf {
+        id: 0,
         package_id: format!("path+file://{root}#0.1.0"),
         manifest_path: format!("{root}/Cargo.toml"),
         target: bin_target(&root),
@@ -175,7 +213,7 @@ fn a_compiler_message_in_color_is_rustcs_as_it_wrote_it() {
     };
     let rendered = "\u{1b}[33mwarning\u{1b}[0m\n";
     let mut sources = Sources::new(std::path::Path::new(&root));
-    let said = line(|out| compiler_message(out, &unit, &unused(rendered), true, &mut sources));
+    let said = message(&unit, &unused(rendered), true, &mut sources);
     let message = said.split_once(r#""message":"#).unwrap().1;
     let text = r#"[{"text":"    let x = 1;","highlight_start":9,"highlight_end":10}]"#;
     let expected = format!(
@@ -198,13 +236,13 @@ fn a_span_over_lines_and_one_of_no_file() {
     let file = sources.file("src/main.rs", &root);
     assert!(file.is_some());
     assert_eq!(sources.file("src/main.rs", &root), file, "a name seen is not looked for again");
-    let over = span("src/main.rs", (1, 11), (3, 2), (10, 28));
+    let over = sent(&span("src/main.rs", (1, 11), (3, 2), (10, 28)));
     assert_eq!(
-        line(|out| span_text(out, &over, Order::Rustc, &sources, file)),
+        line(|out| span_text(out, lent(&over), Order::Rustc, &sources, file)),
         r#"[{"text":"fn main() {","highlight_start":11,"highlight_end":12},{"text":"    let x = 1;","highlight_start":1,"highlight_end":15},{"text":"}","highlight_start":1,"highlight_end":2}]"#
     );
-    let beyond = span("src/main.rs", (4, 1), (9, 1), (0, 0));
-    assert_eq!(line(|out| span_text(out, &beyond, Order::Rustc, &sources, file)), "[]");
+    let beyond = sent(&span("src/main.rs", (4, 1), (9, 1), (0, 0)));
+    assert_eq!(line(|out| span_text(out, lent(&beyond), Order::Rustc, &sources, file)), "[]");
     assert_eq!(sources.file("src/gone.rs", &root), None);
     let absolute = format!("{root}/src/main.rs");
     let same = sources.file(&absolute, "/elsewhere");
@@ -242,26 +280,50 @@ fn a_file_not_utf8_as_rustc_reads_it() {
 #[test]
 fn a_compiler_message_warm_allocates_nothing() {
     let (_dir, root) = checkout();
-    let unit = UnitOf {
+    let unit = sent(&UnitOf {
+        id: 0,
         package_id: format!("path+file://{root}#0.1.0"),
         manifest_path: format!("{root}/Cargo.toml"),
         target: bin_target(&root),
         test: false,
-    };
-    let diagnostic = unused("\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n");
+    });
+    let diagnostic = sent(&unused("\u{1b}[33mwarning\u{1b}[0m: unused variable: `x`\n"));
+    let (unit, diagnostic): (UnitOfRef<'_>, DiagnosticRef<'_>) = (lent(&unit), lent(&diagnostic));
     let mut sources = Sources::new(std::path::Path::new(&root));
     let mut out = String::with_capacity(16 * 1024);
     for ansi in [false, true] {
-        compiler_message(&mut out, &unit, &diagnostic, ansi, &mut sources);
+        compiler_message(&mut out, unit, diagnostic, ansi, &mut sources);
         out.clear();
         blaze_alloc_count::assert_at_most(0, "a warm compiler-message", || {
-            compiler_message(&mut out, &unit, &diagnostic, ansi, &mut sources);
+            compiler_message(&mut out, unit, diagnostic, ansi, &mut sources);
             out.clear();
         });
     }
 }
 
 /// The escape's stripping of colors against the reference: `say::strip_ansi`, then serde_json.
+/// The 8-byte scan finds every byte that is escaped, wherever in a word it falls, and none
+/// that isn't: each ASCII byte and a multi-byte character at every offset of 24 plain bytes.
+#[test]
+fn every_byte_escaped_as_serde_json_wherever_it_falls() {
+    let mut cases: Vec<String> = Vec::new();
+    for at in 0..24 {
+        for byte in 0u8..0x80 {
+            let mut text = "a".repeat(24);
+            text.replace_range(at..at + 1, &char::from(byte).to_string());
+            cases.push(text);
+        }
+        let mut text = "a".repeat(24);
+        text.insert(at, 'é');
+        cases.push(text);
+    }
+    for text in cases {
+        let mut quoted = String::new();
+        quote(&mut quoted, &text);
+        assert_eq!(quoted, serde_json::to_string(&text).unwrap(), "{text:?}");
+    }
+}
+
 #[test]
 fn colors_stripped_while_escaping() {
     for text in [

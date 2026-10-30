@@ -299,6 +299,7 @@ fn main() -> Result<()> {
         version_ordering: VersionOrdering::MaximumVersionsFirst,
         rust_versions: None,
         resolve_version: ResolveVersion::default(),
+        offline_flag: None,
     };
     let specs: Vec<PackageIdSpec> = members.iter().map(|m| m.package_id().to_spec()).collect();
     let mut registry = PackageRegistry::new(registry);

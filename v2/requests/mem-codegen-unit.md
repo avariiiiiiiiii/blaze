@@ -176,6 +176,8 @@ store's hit was copied into a `Vec` on every read; now it is read in place.
 
 ### 1.1 `Cargo.toml` and the crate root
 
+> applied by codegen-v1 (2026-10-29): the `blaze-mem` dependency, the `blaze-alloc-count` dev-dependency, `#![feature(allocator_api)]`, `mod frame_map;`, the `Frame`/`frame_map` uses and the test counting allocator, as written.
+
 `crates/hir-ty-codegen/Cargo.toml`, `[dependencies]`, beside the other `blaze-*` lines:
 
 ```toml
@@ -226,6 +228,8 @@ always spelled `blaze_alloc_count::Counting`.
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 ### 1.2 New file `crates/hir-ty-codegen/frame_map.rs`
+
+> applied by codegen-v1 (2026-10-29): `frame_map.rs` as written, with both tests.
 
 ```rust
 //! The maps and sets one function's build keeps while it runs, in its frame
@@ -388,6 +392,8 @@ mod tests {
 
 ### 1.3 `crates/hir-ty-codegen/lent.rs`: an allocator for the list
 
+> applied by codegen-v1 (2026-10-29): as written, plus `Lent::from_room`/`into_room` (an empty list in a buffer given back, and the buffer back emptied; used by 1.4's `KeptLayouts`) and the test `a_list_in_given_back_room_starts_empty`.
+
 `KeptLayouts` (1.4) keeps its two `Lent` lists of pointers in the build's frame. Each target stays
 in its own `Arc` or `Box` allocation: a `Frame::alloc` value's destructor never runs, and a
 `Layout` owns heap memory.
@@ -482,6 +488,8 @@ target in place, alive for the reference's lifetime.
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 ### 1.4 `crates/hir-ty-codegen/mod.rs`: each function's build on a frame
+
+> applied by codegen-v1 (2026-10-29): as written, except `KeptLayouts`: `&'cx KeptLayouts<'cx>` from the frame cannot borrow-check (it is invariant, and its frame `Vec` must be live at its own drop, so `kept` would still be borrowed when dropped), so `KeptLayouts` stays without a lifetime and takes its two lists from a per-thread shelf (`spare::layout_lists`/`keep_layout_lists`, `KeptLayouts::keep()` after the task), which allocates nothing warm; `Layouts::new(&kept, frame)` and the rest are as written, and the test at the end also checks `keep` drops every layout.
 
 `build()` (5061-5136) is where every function is built, v1's, v2's and the shims. It opens one
 `frame::task(Tag::Codegen, ..)`. `FunctionCx` and everything it keeps for the build live in that
@@ -1039,6 +1047,8 @@ The body from `let kept` to the end goes inside a task:
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 ### 1.5 Per-worker lists of relocations and line rows
+
+> applied by codegen-v1 (2026-10-29): as written, with `emit_lent(ctx, speed)` as codegen-v2 asked and `emit_at` gone; `emit` is `#[cfg(test)]` (only the tests call it), `Relocs::of_mach` is gone (no caller once `emit_with` uses `extend_mach`), and `spare.rs` also gained the layout-list shelf of 1.4 and its test.
 
 For each function v2 compiles, Cranelift's emit builds a `fragment::Relocs` and a
 `Vec<LineRow>`. `convert::function` reads them into the kept `CompiledFunction` and drops them.
@@ -2654,6 +2664,8 @@ After:
 
 ### 1.12 Cranelift's `Context`: already one reused per worker
 
+> applied by codegen-v1 (2026-10-29): nothing to add, as it says.
+
 Nothing to add. `spare.rs` keeps up to `KEPT = 4` `cranelift_codegen::Context`s and
 `FunctionBuilderContext`s per thread:
 
@@ -2670,6 +2682,8 @@ compiles in `crate::with_context` (`v2/backend.rs:703`), which ends in `keep_con
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 ### 1.13 Tests (`hir-ty-codegen`)
+
+> applied by codegen-v1 (2026-10-29): the `frame_map.rs`, `lent.rs` and `spare.rs` tests are in.
 
 > applied by codegen-v2 (2026-10-29), in part: the 1.6 test (in `v2/places.rs`) and the 1.7 test (bound 10, see 1.7) by codegen-v2-mem-v2a; the `v2/tests.rs`, `frame_map.rs`, `lent.rs`, `spare.rs` and `side.rs` tests are their owners' (codegen-v1, codegen-v2-mem-v2b).
 
@@ -2744,6 +2758,8 @@ unchanged.
 > forwarded to codegen (`hir-ty-codegen`, `blaze-codegen`) (from requests, pass 17; told by tmux).
 
 ### 1.14 What stays on the global heap in `hir-ty-codegen`, and why
+
+> applied by codegen-v1 (2026-10-29): `// alloc:` notes on `lazy`, `slots`, the variant `Box<Layout>` and the shelves; the `symbol_of` note in `v2/frontend.rs` is codegen-v2's.
 
 | what | where | why it stays |
 | --- | --- | --- |
@@ -4166,6 +4182,8 @@ Their state after the changes above:
 
 ## 3. Structs that gain a lifetime or an allocator parameter, and their callers
 
+> applied by codegen-v1 (2026-10-29): the `hir-ty-codegen` rows other than `v2/` (with `KeptLayouts` lifetime-free, see 1.4) and `emit_with(ctx, store, speed, relocs, lines)`.
+
 > applied by codegen-v2 (2026-10-29), in part: `Placer`, `Placed`, `convert::function(frame, ..)` and `convert::value(frame, ..)` and their callers in `v2/release.rs` and `v2/statics.rs` by codegen-v2-mem-v2a; the rest is the other owners'. Section 4 touches none of these files.
 
 > applied by codegen-v2 (2026-10-29), in part: `v2/shape.rs`'s `Out<'b>` and `Data<'f>`, `v2/side.rs`'s `Written*`, and the new parameters of `side::of`/`encode`, `shape::of`, `named`, `scoped` and `colocate`, with every caller in `v2/backend.rs`, by codegen-v2-mem-v2b; no signature declared in `v2.rs` changes. Section 4 touches none of codegen-v2-mem-v2b's files either.
@@ -4250,6 +4268,8 @@ Each such allocation keeps the note `// alloc: handed to the round, read by its 
 job`.
 
 #### 4.1.1 `units.rs` `Context::work`
+
+> applied by codegen-v1 (2026-10-29): as written (`units.rs` is v1's): both job loops in `Context::work` open a task, `built` takes the frame, and `calls_after_imports` is on it with `sort_copy_by_key_in`.
 
 Before (553-579):
 
@@ -4376,6 +4396,8 @@ per unit`. The `FuncRequest` clones allocate what their `Instance`s own, as `clo
 
 #### 4.1.2 `mod.rs` `compile_ahead`'s `run`
 
+> applied by codegen-v1 (2026-10-29): as written, except that the task's closure takes the lock again and returns the guard (`state = frame::task(..)`): `state` is moved by `drop(state)` before the job, so a closure can't capture it to assign it.
+
 This loop's frame holds the job's own temporaries, as below.
 
 Before (`mod.rs`, in `run`'s `loop`, after `drop(state);`):
@@ -4433,6 +4455,8 @@ If the job panics, `Working` and `Leaving` drop as they do today, and the frame 
 unwind.
 
 ### 4.2 `SymbolResolver` (`mod.rs:339`)
+
+> applied by codegen-v1 (2026-10-29): the trait as written; the engine's and blaze-wasm's implementors are requested in `mem-codegen-engine.md` and 4.5.
 
 `intern::Symbol` is `Copy` and four bytes, and `as_str()` gives a `&'static str`
 (`crates/intern/src/symbol.rs:54`, 190). `hir-ty-codegen` already depends on `intern`
@@ -4494,6 +4518,8 @@ The other methods keep their signatures, including `item`, which returns `String
 a unit's warm path. `ParallelWork` (`mod.rs`, after the trait) is unchanged.
 
 ### 4.3 Its callers in `hir-ty-codegen`
+
+> applied by codegen-v1 (2026-10-29): every listed site, plus the `root_named` caller in `found_callee` (`symbol.as_str()`).
 
 `rg -n '\b(symbols|resolver)\s*\.\s*(function|static_|source_path|path|closure|makers|copies)\('`
 lists them. `names.static_` at `mod.rs` 6385 and `later.rs` 559 is `StableNames`', not the
@@ -4675,6 +4701,8 @@ Its three callers (7530, 7809, 7857) pass a `&str` and use the result as one, as
 above.
 
 ### 4.4 `spare::with_copies` and its test
+
+> applied by codegen-v1 (2026-10-29): `spare::with_copies` and `a_kept_list_of_copies_is_reused`, as written.
 
 `copies` lends a `Vec<(intern::Symbol, u64)>`. `blaze_mem::scratch` has no shelf of that type,
 and its `Shelf` is private. So the buffer gets a shelf in `spare.rs`, beside `RELOCS` and

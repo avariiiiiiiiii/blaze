@@ -44,30 +44,40 @@ pub(super) const LINTS: super::LintSet = super::lint_set(["unconditional_recursi
 
 /// `CheckCallRecursion`: the calls of the function to itself, in `mir_promoted`.
 pub(super) fn calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
+    // alloc: empty, allocates nothing
     let Some(func) = function(b) else { return Vec::new() };
+    // alloc: empty, allocates nothing
     let Some(mir) = b.mir() else { return Vec::new() };
     let params = mir.param_locals.len();
     if !has_terminator(mir, |it| matches!(it, TerminatorKind::Call { args, .. } if args.len() == params)) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let types = Types::new(b, func);
     let trait_args = types.trait_args();
-    lint(b, search(mir, |terminator| types.calls_itself(mir, terminator, &trait_args)))
+    let trait_args = trait_args.as_ref().map_or(&[][..], |(args, count)| &args.as_slice()[..(*count).min(args.len())]);
+    lint(b, search(mir, |terminator| types.calls_itself(mir, terminator, trait_args)))
 }
 
 /// `CheckDropRecursion`: the drops of a value of the type a `Drop` impl's `drop` drops, after
 /// drop elaboration.
 pub(super) fn drops(b: &BodyCx<'_, '_>) -> Vec<Found> {
     if !b.elaborated {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
+    // alloc: empty, allocates nothing
     let Some(func) = function(b) else { return Vec::new() };
+    // alloc: empty, allocates nothing
     let ItemContainerId::ImplId(_) = func.lookup(b.db()).container else { return Vec::new() };
+    // alloc: empty, allocates nothing
     let Some(mir) = b.runtime_mir() else { return Vec::new() };
     if !has_terminator(mir, |it| matches!(it, TerminatorKind::Drop { .. })) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let types = Types::new(b, func);
+    // alloc: empty, allocates nothing
     let Some(drop_for) = types.drop_for() else { return Vec::new() };
     lint(b, search(mir, |terminator| types.drops(mir, terminator, drop_for)))
 }
@@ -90,19 +100,24 @@ fn function(b: &BodyCx<'_, '_>) -> Option<FunctionId> {
 /// `check_recursion`: when no way through the body returns, the lint at the function's
 /// signature with the recursive call sites, in order.
 fn lint(b: &BodyCx<'_, '_>, calls: Option<Vec<MirSpan>>) -> Vec<Found> {
+    // alloc: empty, allocates nothing
     let Some(calls) = calls.filter(|it| !it.is_empty()) else { return Vec::new() };
+    // alloc: the lint's spans, for a lint found
     let mut sites: Vec<Span> = calls.into_iter().filter_map(|it| b.mir_span(it)).collect();
     sites.sort_by(|a, b| (&a.file, a.lo, a.hi).cmp(&(&b.file, b.lo, b.hi)));
     let at = b.owner_node();
     let node = b.cx.syntax(at);
+    // alloc: empty, allocates nothing; clone: a node handle, a reference count, for a lint found
     let Some(function) = ast::Fn::cast(node.value.clone()) else { return Vec::new() };
     let span = b.cx.span(InFile::new(node.file_id, signature_range(&function)));
+    // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("unconditional_recursion", "function cannot return without recursing", span.clone());
     diag.span_label(span, "cannot return without recursing");
     for site in sites {
         diag.span_label(site, "recursive call site");
     }
     diag.help("a `loop` may express intention better if this is on purpose");
+    // alloc: the lint found
     vec![b.lint(diag, Phase::Mir, at)]
 }
 
@@ -119,6 +134,7 @@ fn search(mir: &MirBody<'_>, recursive: impl Fn(&Terminator) -> bool) -> Option<
         (BitSet::new(blocks), BitSet::new(blocks), BitSet::new(blocks));
     let mut stack: Vec<(BasicBlockId, bool)> = Vec::with_capacity(blocks);
     stack.push((mir.start_block, false));
+    // alloc: empty, pushed to only for a recursive call
     let mut calls = Vec::new();
     while let Some((block, settle)) = stack.pop() {
         let index = u32::from(block.into_raw()) as usize;
@@ -191,11 +207,12 @@ impl<'db> Types<'db> {
     }
 
     /// `CallRecursion::trait_args`: of a method of a trait, the trait's part of its identity
-    /// arguments, which a call must have to call the same method.
-    fn trait_args(&self) -> Vec<GenericArg<'db>> {
-        let ItemContainerId::TraitId(trait_) = self.func.lookup(self.db).container else { return Vec::new() };
+    /// arguments, which a call must have to call the same method: the identity arguments and
+    /// how many of them are the trait's.
+    fn trait_args(&self) -> Option<(GenericArgs<'db>, usize)> {
+        let ItemContainerId::TraitId(trait_) = self.func.lookup(self.db).container else { return None };
         let count = GenericParams::of(self.db, trait_.into()).len();
-        GenericArgs::identity_for_item(self.interner, self.func.into()).iter().take(count).collect()
+        Some((GenericArgs::identity_for_item(self.interner, self.func.into()), count))
     }
 
     fn place_ty(&self, mir: &MirBody<'db>, place: &StoredPlace) -> Ty<'db> {

@@ -187,7 +187,7 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
         let root_module = krate.root_module(self.db);
 
         self.push_symbol(FileSymbol {
-            name: crate_name.symbol().clone(),
+            name: *crate_name.symbol(),
             def: ModuleDef::Module(root_module),
             loc,
             container_name: None,
@@ -200,7 +200,7 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
 
         if canonical_name != crate_name.symbol() {
             self.push_symbol(FileSymbol {
-                name: canonical_name.clone(),
+                name: *canonical_name,
                 def: ModuleDef::Module(root_module),
                 loc,
                 container_name: None,
@@ -214,6 +214,7 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
     }
 
     pub fn finish(mut self) -> Box<[FileSymbol<'a>]> {
+        // alloc: the memo's stored value, exact size, once a module
         self.order.drain(..).collect()
     }
 
@@ -237,7 +238,7 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
                 ModuleDefId::ModuleId(id) => this.push_module(id, name),
                 ModuleDefId::FunctionId(id) => {
                     this.push_decl(id, name, false, None);
-                    this.collect_from_body(id, Some(name.clone()));
+                    this.collect_from_body(id, Some(*name));
                 }
                 ModuleDefId::AdtId(AdtId::StructId(id)) => {
                     this.push_decl(id, name, false, None);
@@ -257,11 +258,11 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
                 }
                 ModuleDefId::ConstId(id) => {
                     this.push_decl(id, name, false, None);
-                    this.collect_from_body(id, Some(name.clone()));
+                    this.collect_from_body(id, Some(*name));
                 }
                 ModuleDefId::StaticId(id) => {
                     this.push_decl(id, name, false, None);
-                    this.collect_from_body(id, Some(name.clone()));
+                    this.collect_from_body(id, Some(*name));
                 }
                 ModuleDefId::TraitId(id) => {
                     let trait_do_not_complete = this.push_decl(id, name, false, None);
@@ -323,9 +324,9 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
                 name_ptr: Some(AstPtr::new(&name_syntax)),
             };
             this.push_symbol(FileSymbol {
-                name: name.symbol().clone(),
+                name: *name.symbol(),
                 def: def.into(),
-                container_name: this.current_container_name.clone(),
+                container_name: this.current_container_name,
                 loc: dec_loc,
                 is_alias: false,
                 is_assoc: false,
@@ -364,9 +365,9 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
                     name_ptr: Some(AstPtr::new(&name_syntax)),
                 };
                 this.push_symbol(FileSymbol {
-                    name: name.symbol().clone(),
+                    name: *name.symbol(),
                     def: def.into(),
-                    container_name: this.current_container_name.clone(),
+                    container_name: this.current_container_name,
                     loc: dec_loc,
                     is_alias: false,
                     is_assoc: false,
@@ -456,7 +457,7 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
         // Descend into the blocks and enqueue collection of all modules within.
         for (_, def_map) in body.blocks(self.db) {
             for (id, _) in def_map.modules(self.db) {
-                self.work.push(SymbolCollectorWork { module_id: id, parent: name.clone() });
+                self.work.push(SymbolCollectorWork { module_id: id, parent: name });
             }
         }
     }
@@ -547,10 +548,10 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
 
             for alias in attrs.doc_aliases(self.db) {
                 self.push_symbol(FileSymbol {
-                    name: alias.clone(),
+                    name: *alias,
                     def,
                     loc,
-                    container_name: self.current_container_name.clone(),
+                    container_name: self.current_container_name,
                     is_alias: true,
                     is_assoc,
                     is_import: false,
@@ -561,9 +562,9 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
         }
 
         self.push_symbol(FileSymbol {
-            name: name.symbol().clone(),
+            name: *name.symbol(),
             def,
-            container_name: self.current_container_name.clone(),
+            container_name: self.current_container_name,
             loc,
             is_alias: false,
             is_assoc,
@@ -595,10 +596,10 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
 
             for alias in attrs.doc_aliases(self.db) {
                 self.push_symbol(FileSymbol {
-                    name: alias.clone(),
+                    name: *alias,
                     def,
                     loc,
-                    container_name: self.current_container_name.clone(),
+                    container_name: self.current_container_name,
                     is_alias: true,
                     is_assoc: false,
                     is_import: false,
@@ -609,9 +610,9 @@ impl<'a, 'f> SymbolCollector<'a, 'f> {
         }
 
         self.push_symbol(FileSymbol {
-            name: name.symbol().clone(),
+            name: *name.symbol(),
             def: ModuleDef::Module(module_id.into()),
-            container_name: self.current_container_name.clone(),
+            container_name: self.current_container_name,
             loc,
             is_alias: false,
             is_assoc: false,

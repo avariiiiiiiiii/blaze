@@ -21,6 +21,8 @@ pub struct Region {
     committed: AtomicUsize,
     granule: usize,
     huge: bool,
+    /// The NUMA node its pages are preferred on, once placed ([`Region::bind_node`]).
+    node: Option<u32>,
     tag: Tag,
 }
 
@@ -43,7 +45,22 @@ impl Region {
         Region::with(bytes, true, tag)
     }
 
+    /// As [`Region::reserve`], its pages preferred on NUMA node `node` from the first
+    /// (see [`Region::bind_node`] for what each system does).
+    pub fn reserve_on(bytes: usize, node: u32, tag: Tag) -> Result<Region, MemError> {
+        Region::placed(bytes, false, Some(node), tag)
+    }
+
+    /// As [`Region::reserve_huge`], its pages preferred on NUMA node `node` from the first.
+    pub fn reserve_huge_on(bytes: usize, node: u32, tag: Tag) -> Result<Region, MemError> {
+        Region::placed(bytes, true, Some(node), tag)
+    }
+
     fn with(bytes: usize, huge: bool, tag: Tag) -> Result<Region, MemError> {
+        Region::placed(bytes, huge, None, tag)
+    }
+
+    fn placed(bytes: usize, huge: bool, node: Option<u32>, tag: Tag) -> Result<Region, MemError> {
         let page = os::page_size();
         let granule = if huge { crate::HUGE_PAGE.max(page) } else { page.max(64 << 10) };
         let reserved = crate::align::checked_align_up(bytes.max(1), granule).ok_or(MemError::TooLarge {
@@ -51,12 +68,44 @@ impl Region {
             what: "a reservation",
             wanted: bytes,
         })?;
-        let base = os::reserve(reserved, huge).map_err(|os| MemError::Reserve {
-            tag,
-            bytes: reserved,
+        let base = match node {
+            Some(node) => os::reserve_on(reserved, huge, node),
+            None => os::reserve(reserved, huge),
+        }
+        .map_err(|os| MemError::Reserve { tag, bytes: reserved, os })?;
+        Ok(Region { base, reserved, committed: AtomicUsize::new(0), granule, huge, node, tag })
+    }
+
+    /// Prefers NUMA node `node` for the region's pages not yet made, so a worker's memory is
+    /// on its own node. Per system, with no other path when it cannot:
+    ///
+    /// - Linux: `mbind` with `MPOL_PREFERRED` over the whole reservation (pages go to `node`
+    ///   while it has room, elsewhere after); a kernel without NUMA has node 0 alone.
+    /// - Windows: a range's node is chosen when it is reserved ([`Region::reserve_on`]), so
+    ///   this is an error unless the region was reserved on `node` or the machine has that one
+    ///   node.
+    /// - macOS (and targets without virtual memory): one memory node; node 0 is where the
+    ///   memory is, any other an error.
+    ///
+    /// Pages already made stay where they are. A decommit keeps the placement.
+    pub fn bind_node(&mut self, node: u32) -> Result<(), MemError> {
+        if self.node == Some(node) {
+            return Ok(());
+        }
+        // SAFETY: the range is this region's whole reservation, alive while `self` is, and a
+        // policy change touches no data.
+        unsafe { os::bind(self.base, self.reserved, node) }.map_err(|os| MemError::Reserve {
+            tag: self.tag,
+            bytes: self.reserved,
             os,
         })?;
-        Ok(Region { base, reserved, committed: AtomicUsize::new(0), granule, huge, tag })
+        self.node = Some(node);
+        Ok(())
+    }
+
+    /// The NUMA node its pages are preferred on, if placed.
+    pub fn node(&self) -> Option<u32> {
+        self.node
     }
 
     pub fn base(&self) -> NonNull<u8> {
@@ -100,19 +149,29 @@ impl Region {
         self.grow(len)
     }
 
-    #[cold]
-    fn grow(&self, len: usize) -> Result<(), MemError> {
+    /// What [`Region::ensure`]`(len)` would leave committed, by the same geometric rule, as
+    /// the region stands now: for an owner that reserves the growth from a limit first.
+    pub fn committed_after(&self, len: usize) -> Result<usize, MemError> {
         if len > self.reserved {
             return Err(MemError::Exhausted { tag: self.tag, reserved: self.reserved, wanted: len });
         }
         let from = self.committed.load(Ordering::Acquire);
         if len <= from {
-            return Ok(());
+            return Ok(from);
         }
         let step = (from / 4).clamp(self.granule, MAX_STEP.max(self.granule));
-        let target = crate::align::checked_align_up(len.max(from + step), self.granule)
+        Ok(crate::align::checked_align_up(len.max(from + step), self.granule)
             .unwrap_or(self.reserved)
-            .min(self.reserved);
+            .min(self.reserved))
+    }
+
+    #[cold]
+    fn grow(&self, len: usize) -> Result<(), MemError> {
+        let from = self.committed.load(Ordering::Acquire);
+        let target = self.committed_after(len)?;
+        if target <= from {
+            return Ok(());
+        }
         let start = crate::align::align_down(from, self.granule);
         // SAFETY: `[start, target)` is granule-aligned (so page-aligned) and inside the
         // reservation (`target <= reserved`), which lives as long as `self`.
@@ -146,6 +205,12 @@ impl Region {
         *self.committed.get_mut() = keep;
         tag::sub(self.tag, committed - keep);
         tag::decommitted(committed - keep);
+        #[cfg(target_os = "linux")]
+        if let Some(node) = self.node {
+            // SAFETY: the range just mapped afresh, inside this live reservation and holding no
+            // page; the new mapping lost the placement, which this puts back.
+            unsafe { os::bind(self.at(keep), committed - keep, node) }?;
+        }
         Ok(())
     }
 
@@ -185,6 +250,7 @@ impl std::fmt::Debug for Region {
             .field("reserved", &self.reserved)
             .field("committed", &self.committed())
             .field("huge", &self.huge)
+            .field("node", &self.node)
             .finish()
     }
 }

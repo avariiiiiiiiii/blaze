@@ -339,13 +339,24 @@ impl<'db> rustc_type_ir::InferCtxtLike for InferCtxt<'db> {
         &self,
         prev_entries: OpaqueTypeStorageEntries,
     ) -> Vec<(OpaqueTypeKey<'db>, Ty<'db>)> {
-        self.inner
-            .borrow_mut()
-            .opaque_types()
-            .opaque_types_added_since(prev_entries)
-            .map(|(k, h)| (k, h.ty))
-            // alloc: `InferCtxtLike` returns an owned `Vec`; none without opaque types.
-            .collect()
+        // alloc: `InferCtxtLike` returns an owned `Vec`; none without opaque types.
+        let mut added = Vec::new();
+        self.clone_opaque_types_added_since_into(prev_entries, &mut added);
+        added
+    }
+
+    fn clone_opaque_types_added_since_into(
+        &self,
+        prev_entries: OpaqueTypeStorageEntries,
+        into: &mut Vec<(OpaqueTypeKey<'db>, Ty<'db>)>,
+    ) {
+        into.extend(
+            self.inner
+                .borrow_mut()
+                .opaque_types()
+                .opaque_types_added_since(prev_entries)
+                .map(|(k, h)| (k, h.ty)),
+        );
     }
 
     fn opaques_with_sub_unified_hidden_type(

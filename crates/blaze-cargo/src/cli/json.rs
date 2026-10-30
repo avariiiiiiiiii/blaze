@@ -2,14 +2,22 @@
 //! `compiler-message` carries (`rustc_errors/src/json.rs`), byte for byte: fields in the order
 //! cargo and rustc write them, `null` where they write `null`, strings escaped as serde_json
 //! escapes them. Each message is written straight into the caller's buffer, which it reuses:
-//! no tree, no copy of a field, no allocation per message once the buffer has grown.
+//! no tree, no copy of a field, no allocation per message once the buffer has grown. The
+//! messages a build streams are read where they lie in the daemon's frame
+//! ([`blaze_api::borrowed`]): each string is copied once, into the buffer, from the frame.
 
-use std::hash::BuildHasher as _;
+use std::collections::hash_map::Entry;
+use std::hash::{BuildHasher as _, BuildHasherDefault};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use blaze_api::{Artifact, BuildScriptRan, Diagnostic, Level, Span, UnitOf, UnitTarget};
-use rustc_hash::{FxBuildHasher, FxHashMap};
+use blaze_api::{
+    Applicability, Artifact, BuildScriptRanRef, CrateType, DiagnosticRef, Level, SpanRef, UnitOfRef, UnitTarget,
+    UnitTargetRef,
+};
+use rustc_hash::FxBuildHasher;
+
+use super::print::ByHash;
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
@@ -33,7 +41,20 @@ const ESCAPE: [u8; 256] = {
     table
 };
 
-/// `text` as serde_json writes a string: runs of bytes that need no escape are copied whole.
+/// Whether none of the 8 bytes of `word` is escaped ([`ESCAPE`]: below 0x20, `"` or `\`), by
+/// SWAR: each test is exact for whether any byte has it, which is all that is asked.
+fn plain(word: u64) -> bool {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let below = word.wrapping_sub(ONES * 0x20) & !word;
+    let quote = word ^ (ONES * u64::from(b'"'));
+    let backslash = word ^ (ONES * u64::from(b'\\'));
+    let zero = |it: u64| it.wrapping_sub(ONES) & !it;
+    (below | zero(quote) | zero(backslash)) & HIGH == 0
+}
+
+/// `text` as serde_json writes a string: runs of bytes that need no escape are copied whole,
+/// found 8 bytes at a time.
 pub fn quote(out: &mut String, text: &str) {
     quote_with(out, text, false);
 }
@@ -47,6 +68,13 @@ fn quote_with(out: &mut String, text: &str, strip: bool) {
     out.push('"');
     let (mut run, mut at) = (0, 0);
     while at < bytes.len() {
+        if let Some(chunk) = bytes.get(at..at + 8)
+            && let Ok(word) = <[u8; 8]>::try_from(chunk)
+            && plain(u64::from_le_bytes(word))
+        {
+            at += 8;
+            continue;
+        }
         let escape = ESCAPE[usize::from(bytes[at])];
         if escape == 0 {
             at += 1;
@@ -125,9 +153,9 @@ fn opt(out: &mut String, text: Option<&str>) {
     }
 }
 
-fn strs(out: &mut String, texts: &[String]) {
+fn strs<'s>(out: &mut String, texts: impl IntoIterator<Item = &'s str>) {
     out.push('[');
-    for (at, text) in texts.iter().enumerate() {
+    for (at, text) in texts.into_iter().enumerate() {
         if at > 0 {
             out.push(',');
         }
@@ -136,19 +164,61 @@ fn strs(out: &mut String, texts: &[String]) {
     out.push(']');
 }
 
+/// The fields of a target, owned or read in place, as [`target_with`] writes them.
+struct TargetFields<'s, K, C> {
+    kinds: K,
+    crate_types: C,
+    name: &'s str,
+    src_path: &'s str,
+    edition: &'s str,
+    doc: bool,
+    doctest: bool,
+    test: bool,
+}
+
 /// A target as cargo's `SerializedTarget` writes it. `required-features` is written only for a
 /// target that has some, which [`UnitTarget`] does not say.
 pub fn target(out: &mut String, target: &UnitTarget) {
+    target_with(out, TargetFields {
+        kinds: target.kinds(),
+        crate_types: target.crate_types.iter().copied(),
+        name: &target.name,
+        src_path: &target.src_path,
+        edition: &target.edition,
+        doc: target.doc,
+        doctest: target.doctest,
+        test: target.test,
+    });
+}
+
+/// [`target`] of one read in place.
+pub fn target_ref(out: &mut String, target: UnitTargetRef<'_>) {
+    target_with(out, TargetFields {
+        kinds: target.kinds(),
+        crate_types: target.crate_types.iter(),
+        name: target.name,
+        src_path: target.src_path,
+        edition: target.edition,
+        doc: target.doc,
+        doctest: target.doctest,
+        test: target.test,
+    });
+}
+
+fn target_with<'s>(
+    out: &mut String,
+    target: TargetFields<'s, impl Iterator<Item = &'static str>, impl Iterator<Item = CrateType>>,
+) {
     out.push_str(r#"{"kind":"#);
-    strs(out, &target.kind);
+    strs(out, target.kinds);
     out.push_str(r#","crate_types":"#);
-    strs(out, &target.crate_types);
+    strs(out, target.crate_types.map(CrateType::name));
     out.push_str(r#","name":"#);
-    quote(out, &target.name);
+    quote(out, target.name);
     out.push_str(r#","src_path":"#);
-    quote(out, &target.src_path);
+    quote(out, target.src_path);
     out.push_str(r#","edition":"#);
-    quote(out, &target.edition);
+    quote(out, target.edition);
     out.push_str(r#","doc":"#);
     boolean(out, target.doc);
     out.push_str(r#","doctest":"#);
@@ -178,9 +248,9 @@ pub fn artifact(out: &mut String, artifact: &Artifact) {
     out.push_str(r#","test":"#);
     boolean(out, profile.test);
     out.push_str(r#"},"features":"#);
-    strs(out, &artifact.features);
+    strs(out, artifact.features.iter().map(String::as_str));
     out.push_str(r#","filenames":"#);
-    strs(out, &artifact.filenames);
+    strs(out, artifact.filenames.iter().map(String::as_str));
     out.push_str(r#","executable":"#);
     opt(out, artifact.executable.as_deref());
     out.push_str(r#","fresh":"#);
@@ -189,15 +259,15 @@ pub fn artifact(out: &mut String, artifact: &Artifact) {
 }
 
 /// `build-script-executed`, without its newline.
-pub fn build_script(out: &mut String, ran: &BuildScriptRan) {
+pub fn build_script(out: &mut String, ran: BuildScriptRanRef<'_>) {
     out.push_str(r#"{"reason":"build-script-executed","package_id":"#);
-    quote(out, &ran.package_id);
+    quote(out, ran.package_id);
     out.push_str(r#","linked_libs":"#);
-    strs(out, &ran.linked_libs);
+    strs(out, ran.linked_libs);
     out.push_str(r#","linked_paths":"#);
-    strs(out, &ran.linked_paths);
+    strs(out, ran.linked_paths);
     out.push_str(r#","cfgs":"#);
-    strs(out, &ran.cfgs);
+    strs(out, ran.cfgs);
     out.push_str(r#","env":["#);
     for (at, (name, value)) in ran.env.iter().enumerate() {
         if at > 0 {
@@ -210,7 +280,7 @@ pub fn build_script(out: &mut String, ran: &BuildScriptRan) {
         out.push(']');
     }
     out.push_str(r#"],"out_dir":"#);
-    quote(out, &ran.out_dir);
+    quote(out, ran.out_dir);
     out.push('}');
 }
 
@@ -227,14 +297,14 @@ pub fn build_finished(out: &mut String, success: bool) {
 /// `CompilerMessage { rendered, #[serde(flatten)] other: BTreeMap, code: Option<DiagnosticCode> }`:
 /// `rendered` first, then every other field sorted by key (at every depth, as `serde_json::Value`
 /// maps are), then the outermost `code` last.
-pub fn compiler_message(out: &mut String, unit: &UnitOf, diagnostic: &Diagnostic, ansi: bool, sources: &mut Sources) {
+pub fn compiler_message(out: &mut String, unit: UnitOfRef<'_>, diagnostic: DiagnosticRef<'_>, ansi: bool, sources: &mut Sources) {
     let dir = unit.manifest_path.rsplit_once(['/', '\\']).map_or("", |(dir, _)| dir);
     out.push_str(r#"{"reason":"compiler-message","package_id":"#);
-    quote(out, &unit.package_id);
+    quote(out, unit.package_id);
     out.push_str(r#","manifest_path":"#);
-    quote(out, &unit.manifest_path);
+    quote(out, unit.manifest_path);
     out.push_str(r#","target":"#);
-    target(out, &unit.target);
+    target_ref(out, unit.target);
     out.push_str(r#","message":"#);
     let order = if ansi { Order::Rustc } else { Order::Sorted };
     diagnostic_json(out, diagnostic, true, order, sources, dir);
@@ -260,19 +330,23 @@ fn level(level: Level) -> &'static str {
     }
 }
 
-fn code(out: &mut String, code: Option<&str>) {
-    match code {
+/// rustc's `DiagnosticCode`: the code and its long explanation (`Diagnostic::explanation`, rustc's
+/// markdown), `null` without one.
+fn code(out: &mut String, diagnostic: DiagnosticRef<'_>) {
+    match diagnostic.code {
         Some(code) => {
             out.push_str(r#"{"code":"#);
             quote(out, code);
-            out.push_str(r#","explanation":null}"#);
+            out.push_str(r#","explanation":"#);
+            opt(out, diagnostic.explanation);
+            out.push('}');
         }
         None => out.push_str("null"),
     }
 }
 
 /// rustc's `Diagnostic`: `$message_type` on the outermost only, `rendered` `null` on children.
-fn diagnostic_json(out: &mut String, diagnostic: &Diagnostic, outermost: bool, order: Order, sources: &mut Sources, dir: &str) {
+fn diagnostic_json(out: &mut String, diagnostic: DiagnosticRef<'_>, outermost: bool, order: Order, sources: &mut Sources, dir: &str) {
     let spans = |out: &mut String, sources: &mut Sources| {
         out.push('[');
         for (at, span) in diagnostic.spans.iter().enumerate() {
@@ -300,9 +374,9 @@ fn diagnostic_json(out: &mut String, diagnostic: &Diagnostic, outermost: bool, o
                 out.push_str(r#""$message_type":"diagnostic","#);
             }
             out.push_str(r#""message":"#);
-            quote(out, &diagnostic.message);
+            quote(out, diagnostic.message);
             out.push_str(r#","code":"#);
-            code(out, diagnostic.code.as_deref());
+            code(out, diagnostic);
             out.push_str(r#","level":""#);
             out.push_str(level(diagnostic.level));
             out.push_str(r#"","spans":"#);
@@ -311,35 +385,35 @@ fn diagnostic_json(out: &mut String, diagnostic: &Diagnostic, outermost: bool, o
             children(out, sources);
             out.push_str(r#","rendered":"#);
             match outermost {
-                true => quote(out, &diagnostic.rendered),
+                true => quote(out, diagnostic.rendered),
                 false => out.push_str("null"),
             }
             out.push('}');
         }
         (Order::Sorted, true) => {
             out.push_str(r#"{"rendered":"#);
-            quote_with(out, &diagnostic.rendered, true);
+            quote_with(out, diagnostic.rendered, true);
             out.push_str(r#","$message_type":"diagnostic","children":"#);
             children(out, sources);
             out.push_str(r#","level":""#);
             out.push_str(level(diagnostic.level));
             out.push_str(r#"","message":"#);
-            quote(out, &diagnostic.message);
+            quote(out, diagnostic.message);
             out.push_str(r#","spans":"#);
             spans(out, sources);
             out.push_str(r#","code":"#);
-            code(out, diagnostic.code.as_deref());
+            code(out, diagnostic);
             out.push('}');
         }
         (Order::Sorted, false) => {
             out.push_str(r#"{"children":"#);
             children(out, sources);
             out.push_str(r#","code":"#);
-            code(out, diagnostic.code.as_deref());
+            code(out, diagnostic);
             out.push_str(r#","level":""#);
             out.push_str(level(diagnostic.level));
             out.push_str(r#"","message":"#);
-            quote(out, &diagnostic.message);
+            quote(out, diagnostic.message);
             out.push_str(r#","rendered":null,"spans":"#);
             spans(out, sources);
             out.push('}');
@@ -347,13 +421,14 @@ fn diagnostic_json(out: &mut String, diagnostic: &Diagnostic, outermost: bool, o
     }
 }
 
-/// rustc's `DiagnosticSpan`. `expansion` is `null`: [`Span`] carries no macro backtrace.
-fn span_json(out: &mut String, span: &Span, order: Order, sources: &mut Sources, dir: &str) {
-    let file = sources.file(&span.file, dir);
+/// rustc's `DiagnosticSpan`. `expansion` is `null`: [`blaze_api::Span`] carries no macro
+/// backtrace.
+fn span_json(out: &mut String, span: SpanRef<'_>, order: Order, sources: &mut Sources, dir: &str) {
+    let file = sources.file(span.file, dir);
     match order {
         Order::Rustc => {
             out.push_str(r#"{"file_name":"#);
-            quote(out, &span.file);
+            quote(out, span.file);
             out.push_str(r#","byte_start":"#);
             num(out, u64::from(span.byte_start));
             out.push_str(r#","byte_end":"#);
@@ -371,11 +446,11 @@ fn span_json(out: &mut String, span: &Span, order: Order, sources: &mut Sources,
             out.push_str(r#","text":"#);
             span_text(out, span, order, sources, file);
             out.push_str(r#","label":"#);
-            opt(out, span.label.as_deref());
+            opt(out, span.label);
             out.push_str(r#","suggested_replacement":"#);
-            opt(out, span.replacement.as_deref());
+            opt(out, span.replacement);
             out.push_str(r#","suggestion_applicability":"#);
-            opt(out, span.applicability.as_deref());
+            opt(out, span.applicability.map(Applicability::name));
             out.push_str(r#","expansion":null}"#);
         }
         Order::Sorted => {
@@ -388,19 +463,19 @@ fn span_json(out: &mut String, span: &Span, order: Order, sources: &mut Sources,
             out.push_str(r#","column_start":"#);
             num(out, u64::from(span.column));
             out.push_str(r#","expansion":null,"file_name":"#);
-            quote(out, &span.file);
+            quote(out, span.file);
             out.push_str(r#","is_primary":"#);
             boolean(out, span.primary);
             out.push_str(r#","label":"#);
-            opt(out, span.label.as_deref());
+            opt(out, span.label);
             out.push_str(r#","line_end":"#);
             num(out, u64::from(span.end_line));
             out.push_str(r#","line_start":"#);
             num(out, u64::from(span.line));
             out.push_str(r#","suggested_replacement":"#);
-            opt(out, span.replacement.as_deref());
+            opt(out, span.replacement);
             out.push_str(r#","suggestion_applicability":"#);
-            opt(out, span.applicability.as_deref());
+            opt(out, span.applicability.map(Applicability::name));
             out.push_str(r#","text":"#);
             span_text(out, span, order, sources, file);
             out.push('}');
@@ -411,7 +486,7 @@ fn span_json(out: &mut String, span: &Span, order: Order, sources: &mut Sources,
 /// rustc's `DiagnosticSpanLine`s of `span` (`SourceMap::span_to_lines`): each line it covers,
 /// highlighted from its start column on the first and to its end column on the last, in
 /// 1-based columns of characters. `[]` when the span is outside the file as it is on disk.
-fn span_text(out: &mut String, span: &Span, order: Order, sources: &Sources, file: Option<u32>) {
+fn span_text(out: &mut String, span: SpanRef<'_>, order: Order, sources: &Sources, file: Option<u32>) {
     let (first, last) = (span.line as usize, span.end_line as usize);
     let lines = file.map_or(0, |file| sources.line_count(file));
     out.push('[');
@@ -466,16 +541,21 @@ struct Source {
 }
 
 /// The source files spans point into, as on disk, each read once: rustc's JSON carries the
-/// text of the lines a span covers. A name is looked up by the Fx hash of the directory of its
-/// unit's manifest and the name as the span has it; every file's text goes into one buffer and
-/// every line start into another, 4 bytes a line, so that once the buffers have grown a lookup
-/// or a read allocates nothing.
+/// text of the lines a span covers. A name is found by the Fx hash of the directory of its
+/// unit's manifest and the name as the span has it, with one probe; every file's text goes into
+/// one buffer and every line start into another, 4 bytes a line, so that once the buffers have
+/// grown a lookup or a read allocates nothing.
 pub struct Sources {
-    root: PathBuf,
     /// Each (manifest directory, name)'s file, by hash; `None` for a name that is no file.
-    named: FxHashMap<u64, Option<u32>>,
+    named: ByHash<Option<u32>>,
+    texts: Texts,
+}
+
+/// The files read, their text and their line starts.
+struct Texts {
+    root: PathBuf,
     /// Each file read, by the hash of its path, so that two names of one file read it once.
-    at: FxHashMap<u64, u32>,
+    at: ByHash<u32>,
     files: Vec<Source>,
     text: String,
     starts: Vec<u32>,
@@ -491,15 +571,17 @@ impl Sources {
     /// `root` is the checkout's: a relative file name is looked for no higher.
     pub fn new(root: &Path) -> Sources {
         Sources {
-            // alloc: once a request.
-            root: root.to_owned(),
-            named: FxHashMap::with_capacity_and_hasher(FILES, FxBuildHasher),
-            at: FxHashMap::with_capacity_and_hasher(FILES, FxBuildHasher),
-            files: Vec::with_capacity(FILES),
-            text: String::with_capacity(TEXT),
-            starts: Vec::with_capacity(TEXT / 32),
-            path: PathBuf::with_capacity(1024),
-            bytes: Vec::with_capacity(TEXT / 4),
+            named: ByHash::with_capacity_and_hasher(FILES, BuildHasherDefault::default()),
+            texts: Texts {
+                // alloc: once a request.
+                root: root.to_owned(),
+                at: ByHash::with_capacity_and_hasher(FILES, BuildHasherDefault::default()),
+                files: Vec::with_capacity(FILES),
+                text: String::new(), // alloc: none until the first file is read.
+                starts: Vec::new(),  // alloc: none until the first file is read.
+                path: PathBuf::with_capacity(1024),
+                bytes: Vec::new(), // alloc: none until the first file is read.
+            },
         }
     }
 
@@ -507,53 +589,39 @@ impl Sources {
     /// in, which is the workspace root, an ancestor of the unit's manifest directory `dir`: the
     /// nearest one that has it.
     pub fn file(&mut self, name: &str, dir: &str) -> Option<u32> {
-        let key = FxBuildHasher.hash_one((dir, name));
-        if let Some(&found) = self.named.get(&key) {
-            return found;
+        match self.named.entry(FxBuildHasher.hash_one((dir, name))) {
+            Entry::Occupied(found) => *found.get(),
+            Entry::Vacant(slot) => *slot.insert(self.texts.file(Path::new(name), Path::new(dir))),
         }
-        let found = match self.find(Path::new(name), Path::new(dir)) {
-            true => self.read(),
-            false => None,
-        };
-        self.named.insert(key, found);
-        found
     }
 
-    /// The file at `path`, read the first time.
-    fn read(&mut self) -> Option<u32> {
-        let key = FxBuildHasher.hash_one(&self.path);
-        if let Some(&at) = self.at.get(&key) {
-            return Some(at);
-        }
-        self.bytes.clear();
-        std::fs::File::open(&self.path).and_then(|mut file| file.read_to_end(&mut self.bytes)).ok()?;
-        let begin = self.text.len();
-        match std::str::from_utf8(&self.bytes) {
-            Ok(text) => self.text.push_str(text),
-            // alloc: a file that is not UTF-8, as rustc reads it.
-            Err(_) => self.text.push_str(&String::from_utf8_lossy(&self.bytes)),
-        }
-        let first = self.starts.len();
-        let start = match self.text[begin..].starts_with('\u{feff}') {
-            true => begin + '\u{feff}'.len_utf8(),
-            false => begin,
-        };
-        self.starts.push(start as u32);
-        let text = &self.text[start..];
-        self.starts.extend(text.match_indices('\n').map(|(at, _)| (start + at + 1) as u32));
-        let at = self.files.len() as u32;
-        let lines = (self.starts.len() - first) as u32;
-        self.files.push(Source { first: first as u32, lines, end: self.text.len() as u32 });
-        self.at.insert(key, at);
-        Some(at)
+    pub fn line_count(&self, file: u32) -> usize {
+        self.texts.files[file as usize].lines as usize
     }
 
-    /// Puts where `file` is into `path`; false for nowhere.
-    fn find(&mut self, file: &Path, dir: &Path) -> bool {
+    /// Line `number` (1-based, at most [`Sources::line_count`]) of `file`.
+    pub fn line(&self, file: u32, number: usize) -> &str {
+        let texts = &self.texts;
+        let source = &texts.files[file as usize];
+        let at = source.first as usize + number - 1;
+        let start = texts.starts[at] as usize;
+        let end = match number < source.lines as usize {
+            true => texts.starts[at + 1] as usize - 1,
+            false => source.end as usize,
+        };
+        let line = &texts.text[start..end];
+        line.strip_suffix('\r').unwrap_or(line)
+    }
+}
+
+impl Texts {
+    /// The file `file` names from `dir` (as [`Sources::file`]), read the first time: each place
+    /// it may be is opened, with no `stat` before.
+    fn file(&mut self, file: &Path, dir: &Path) -> Option<u32> {
         self.path.clear();
         if file.is_absolute() {
             self.path.push(file);
-            return true;
+            return self.read();
         }
         for it in dir.ancestors() {
             if !it.starts_with(&self.root) {
@@ -562,28 +630,46 @@ impl Sources {
             self.path.clear();
             self.path.push(it);
             self.path.push(file);
-            if std::fs::metadata(&self.path).is_ok_and(|it| it.is_file()) {
-                return true;
+            if let Some(at) = self.read() {
+                return Some(at);
             }
         }
-        false
+        None
     }
 
-    pub fn line_count(&self, file: u32) -> usize {
-        self.files[file as usize].lines as usize
-    }
-
-    /// Line `number` (1-based, at most [`Sources::line_count`]) of `file`.
-    pub fn line(&self, file: u32, number: usize) -> &str {
-        let source = &self.files[file as usize];
-        let at = source.first as usize + number - 1;
-        let start = self.starts[at] as usize;
-        let end = match number < source.lines as usize {
-            true => self.starts[at + 1] as usize - 1,
-            false => source.end as usize,
+    /// The file at `path`, read the first time; `None` for no file there.
+    fn read(&mut self) -> Option<u32> {
+        let Texts { at, files, text, starts, path, bytes, .. } = self;
+        let slot = match at.entry(FxBuildHasher.hash_one(path.as_os_str().as_encoded_bytes())) {
+            Entry::Occupied(found) => return Some(*found.get()),
+            Entry::Vacant(slot) => slot,
         };
-        let line = &self.text[start..end];
-        line.strip_suffix('\r').unwrap_or(line)
+        // Grown at the first file, so that a build without a span into one maps no buffer.
+        if text.capacity() == 0 {
+            text.reserve(TEXT);
+            starts.reserve(TEXT / 32);
+            bytes.reserve(TEXT / 4);
+        }
+        bytes.clear();
+        // A directory opens and fails to read: no file there either.
+        std::fs::File::open(&*path).and_then(|mut file| file.read_to_end(bytes)).ok()?;
+        let begin = text.len();
+        match std::str::from_utf8(bytes) {
+            Ok(it) => text.push_str(it),
+            // alloc: a file that is not UTF-8, as rustc reads it.
+            Err(_) => text.push_str(&String::from_utf8_lossy(bytes)),
+        }
+        let first = starts.len();
+        let start = match text[begin..].starts_with('\u{feff}') {
+            true => begin + '\u{feff}'.len_utf8(),
+            false => begin,
+        };
+        starts.push(start as u32);
+        starts.extend(text[start..].match_indices('\n').map(|(at, _)| (start + at + 1) as u32));
+        let id = files.len() as u32;
+        let lines = (starts.len() - first) as u32;
+        files.push(Source { first: first as u32, lines, end: text.len() as u32 });
+        Some(*slot.insert(id))
     }
 }
 

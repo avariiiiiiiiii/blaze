@@ -1,17 +1,21 @@
-//! What match checking lints: `unreachable_patterns`, `irrefutable_let_patterns` and
-//! `bindings_with_variant_name` (E0170).
+//! What match checking lints: `unreachable_patterns`, `irrefutable_let_patterns`,
+//! `bindings_with_variant_name` (E0170), `overlapping_range_endpoints` and
+//! `non_contiguous_range_endpoints`.
 //!
 //! Follows `compiler/rustc_mir_build/src/thir/pattern/check_match.rs`
 //! (`report_unreachable_pattern`, `report_arm_reachability`, `report_irrefutable_let_patterns`,
-//! `check_let`, `check_for_bindings_named_same_as_variants`) and
+//! `check_let`, `check_for_bindings_named_same_as_variants`),
 //! `compiler/rustc_mir_build/src/diagnostics.rs` (`UnreachablePatternInner`, `WantedConstant`,
-//! `IrrefutableLetPatterns*`, `LetElseReplacementSuggestion`, `BindingsWithVariantName`) (MIT or
+//! `IrrefutableLetPatterns*`, `LetElseReplacementSuggestion`, `BindingsWithVariantName`),
+//! `compiler/rustc_pattern_analysis/src/rustc.rs` (`lint_overlapping_range_endpoints`,
+//! `lint_non_contiguous_range_endpoints`) and `compiler/rustc_pattern_analysis/src/diagnostics.rs`
+//! (`OverlappingRangeEndpoints`, `ExclusiveRangeMissingMax`, `ExclusiveRangeMissingGap`) (MIT or
 //! Apache-2.0). Which patterns are redundant and why is match checking's
 //! (`hir::DefWithBody::match_lints`); rustc checks no body that failed type checking.
 
 use hir::{DefWithBody, HasSource as _, InFile, IrrefutableLet, LetSource, MatchLint, PatternTypo};
 use syntax::{
-    AstNode, AstPtr, SyntaxNodePtr, TextRange,
+    AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange,
     ast::{self, HasName as _},
 };
 
@@ -26,11 +30,17 @@ use crate::{
 const COVERED_BY_MANY: usize = 4;
 
 /// The lints this module gives: it runs only when one may fire.
-pub(super) const LINTS: super::LintSet =
-    super::lint_set(["unreachable_patterns", "irrefutable_let_patterns", "bindings_with_variant_name"]);
+pub(super) const LINTS: super::LintSet = super::lint_set([
+    "unreachable_patterns",
+    "irrefutable_let_patterns",
+    "bindings_with_variant_name",
+    "overlapping_range_endpoints",
+    "non_contiguous_range_endpoints",
+]);
 
 pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
     if b.tainted() {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let lints = DefWithBody::from(b.owner).match_lints(b.db());
@@ -40,7 +50,10 @@ pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
             MatchLint::UnreachablePattern(it) => unreachable_pattern(b, it),
             MatchLint::IrrefutableLet(it) => irrefutable_let(b, it),
             MatchLint::BindingWithVariantName(it) => binding_with_variant_name(b, it),
+            MatchLint::OverlappingRangeEndpoints(it) => overlapping_range_endpoints(b, it),
+            MatchLint::NonContiguousRangeEndpoints(it) => non_contiguous_range_endpoints(b, it),
         })
+        // alloc: the lints found, empty until one is
         .collect()
 }
 
@@ -48,36 +61,49 @@ fn unreachable_pattern(b: &BodyCx<'_, '_>, d: &hir::UnreachablePattern<'_>) -> O
     let cx = b.cx;
     let at = pat_node(d.pat);
     let pat = cx.span_of(at);
+    // clone: a lint's span, for a lint found
     let mut diag = Diag::lint("unreachable_patterns", "unreachable pattern", pat.clone());
+    // alloc: the lint's text, for a lint found
     let covering: Vec<Span> = d.covered_by.iter().map(|it| cx.span_of_ptr(*it)).collect();
     match covering.as_slice() {
         [] => {
+            // alloc: the lint's text, for a lint found
             diag.span_label(pat.clone(), format!("matches no values because `{}` is uninhabited", cx.ty(&d.ty)));
             diag.note(
                 "to learn more about uninhabited types, see https://doc.rust-lang.org/nomicon/exotic-sizes.html#empty-types",
             );
         }
         [covering] if d.catchall => {
+            // clone: a lint's span, for a lint found
             diag.span_label(pat.clone(), "no value can reach this");
+            // clone: a lint's span, for a lint found
             diag.span_label(covering.clone(), "matches any value");
             if let Some(typo) = &d.typo {
                 pattern_typo(b, &mut diag, &pat, typo);
             }
         }
         [covering] => {
+            // clone: a lint's span, for a lint found
             diag.span_label(pat.clone(), "no value can reach this");
+            // clone: a lint's span, for a lint found
             diag.span_label(covering.clone(), "matches all the relevant values");
         }
         covering => {
+            // clone: a lint's span, for a lint found
             diag.span_label(pat.clone(), "no value can reach this");
+            // clone: a lint's span, for a lint found
             let mut spans = MultiSpan::of(pat.clone());
             for it in covering.iter().take(COVERED_BY_MANY) {
+                // alloc: the lint's text, for a lint found
                 spans.labels.push((it.clone(), "matches some of the same values".to_owned()));
             }
             let label = match covering.len().saturating_sub(COVERED_BY_MANY) {
+                // alloc: the lint's text, for a lint found
                 0 => "collectively making this unreachable".to_owned(),
+                // alloc: the lint's text, for a lint found
                 remain => format!("...and {remain} other patterns collectively make this unreachable"),
             };
+            // clone: a lint's span, for a lint found
             spans.labels.push((pat.clone(), label));
             diag.span_note(spans, "multiple earlier patterns match some of the same values");
         }
@@ -97,10 +123,13 @@ fn pattern_typo(b: &BodyCx<'_, '_>, diag: &mut Diag, pat: &Span, typo: &PatternT
         PatternTypo::WantedConstant { is_typo, const_name, const_path } => {
             let what = if *is_typo { "similarly named constant" } else { "constant" };
             diag.suggestion(
+                // clone: a lint's span, for a lint found
                 pat.clone(),
+                // alloc: the lint's text, for a lint found
                 format!(
                     "you might have meant to pattern match against the value of {what} `{const_name}` instead of introducing a new catch-all binding"
                 ),
+                // clone: a lint's span, for a lint found
                 const_path.clone(),
                 Applicability::MachineApplicable,
             );
@@ -113,6 +142,7 @@ fn pattern_typo(b: &BodyCx<'_, '_>, diag: &mut Diag, pat: &Span, typo: &PatternT
         }
         PatternTypo::InaccessibleConstant(konst) => {
             let Some(source) = konst.source(cx.db) else { return };
+            // clone: a lint's span, for a lint found
             let node = source.map(|it| it.syntax().clone());
             let range = def_range(&node.value);
             diag.span_note(
@@ -174,6 +204,7 @@ fn let_else(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
     let end = stmt.initializer()?.syntax().text_range().end();
     let span = cx.span(InFile::new(node.file_id, TextRange::new(start, end)));
     let mut diag = match span.expansion.is_some() {
+        // clone: a lint's span, for a lint found
         true => Diag::lint("irrefutable_let_patterns", "unreachable `else` clause", span.clone()),
         false => {
             let keyword = cx.span(InFile::new(node.file_id, stmt.let_else()?.else_token()?.text_range()));
@@ -181,6 +212,7 @@ fn let_else(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
             let len = text.find(char::is_whitespace).unwrap_or(text.len());
             let keyword = keyword.with_hi(keyword.lo + len as u32);
             let mut diag = Diag::lint("irrefutable_let_patterns", "unreachable `else` clause", keyword);
+            // clone: a lint's span, for a lint found
             diag.span_label(span.clone(), "assigning to binding pattern will always succeed");
             diag
         }
@@ -192,7 +224,9 @@ fn let_else(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
     {
         diag.suggestion(
             span,
+            // alloc: the lint's text, for a lint found
             format!("consider using `let Some({lhs}) = {rhs}` to match on a specific variant"),
+            // alloc: the lint's text, for a lint found
             format!("let Some({lhs}) = {rhs}"),
             Applicability::MachineApplicable,
         );
@@ -203,23 +237,90 @@ fn let_else(b: &BodyCx<'_, '_>, d: &IrrefutableLet) -> Option<Found> {
 fn binding_with_variant_name(b: &BodyCx<'_, '_>, d: &hir::BindingWithVariantName) -> Option<Found> {
     let cx = b.cx;
     let at = d.pat.map(|it| it.syntax_node_ptr());
+    // alloc: the lint's text, for a lint found
     let name = cx.node(d.pat).value.name()?.text().to_string();
     let span = cx.span_of(at);
     let ty_path = crate::print::def_path_untrimmed(cx, hir::ModuleDef::Adt(d.enum_.into()));
     let mut diag = Diag::lint(
         "bindings_with_variant_name",
+        // alloc: the lint's text, for a lint found
         format!("pattern binding `{name}` is named the same as one of the variants of the type `{ty_path}`"),
+        // clone: a lint's span, for a lint found
         span.clone(),
     );
     if d.suggest {
         diag.suggestion(
             span,
             "to match on the variant, qualify the path",
+            // alloc: the lint's text, for a lint found
             format!("{ty_path}::{name}"),
             Applicability::MachineApplicable,
         );
     }
     Some(b.lint(diag, Phase::Mir, at))
+}
+
+fn overlapping_range_endpoints(b: &BodyCx<'_, '_>, d: &hir::OverlappingRangeEndpoints) -> Option<Found> {
+    let cx = b.cx;
+    let range = cx.span_of_ptr(d.pat);
+    let message = "multiple patterns overlap on their endpoints";
+    let mut diag = Diag::lint("overlapping_range_endpoints", message, range.clone()); // clone: the lint's span, the edge
+    diag.span_label(range, "... with this range");
+    for it in &d.overlaps_with {
+        // alloc: a label of the lint, the edge
+        diag.span_label(cx.span_of_ptr(*it), format!("this range overlaps on `{}`...", d.overlap));
+    }
+    diag.note("you likely meant to write mutually exclusive ranges");
+    Some(b.lint(diag, Phase::Mir, match_level(b, d.pat)))
+}
+
+/// `ExclusiveRangeMissingMax` when no range starts at the gap (it is the type's maximum), else
+/// `ExclusiveRangeMissingGap`.
+fn non_contiguous_range_endpoints(b: &BodyCx<'_, '_>, d: &hir::NonContiguousRangeEndpoints) -> Option<Found> {
+    let cx = b.cx;
+    let first_range = cx.span_of_ptr(d.pat);
+    let gap = &d.gap;
+    let message = match d.gapped_with.is_empty() {
+        true => format!("exclusive range missing `{gap}`"), // alloc: the lint's message, the edge
+        false => "multiple ranges are one apart".to_owned(), // alloc: as above
+    };
+    // clone: the lint's span, the edge
+    let mut diag = Diag::lint("non_contiguous_range_endpoints", message, first_range.clone());
+    let label = format!("this range doesn't match `{gap}` because `..` is an exclusive range"); // alloc: a label, the edge
+    diag.span_label(first_range.clone(), label); // clone: as above
+    if !d.gapped_with.is_empty() {
+        // rustc's `PatRange` printed with its own end: `suggestion` is it with `..=`.
+        let printed = d.suggestion.replacen("..=", "..", 1);
+        for it in &d.gapped_with {
+            diag.span_label(
+                cx.span_of_ptr(*it),
+                // alloc: a label, the edge
+                format!("this could appear to continue range `{printed}`, but `{gap}` isn't matched by either of them"),
+            );
+        }
+    }
+    let suggestion = d.suggestion.as_str();
+    diag.suggestion(first_range, "use an inclusive range instead", suggestion, Applicability::MaybeIncorrect);
+    Some(b.lint(diag, Phase::Mir, match_level(b, d.pat)))
+}
+
+/// rustc's `match_lint_level`: the `match`, `let` or parameter the pattern is part of, whose
+/// level the range lints take (an arm's own attributes don't count).
+fn match_level(b: &BodyCx<'_, '_>, pat: InFile<AstPtr<ast::Pat>>) -> InFile<SyntaxNodePtr> {
+    let node = b.cx.syntax(pat_node(pat));
+    for ancestor in b.cx.sema.ancestors_with_macros_file(node).skip(1) {
+        match ancestor.value.kind() {
+            SyntaxKind::MATCH_ARM
+            | SyntaxKind::MATCH_ARM_LIST
+            | SyntaxKind::RECORD_PAT_FIELD
+            | SyntaxKind::RECORD_PAT_FIELD_LIST
+            | SyntaxKind::MACRO_CALL
+            | SyntaxKind::TOKEN_TREE => {}
+            kind if ast::Pat::can_cast(kind) => {}
+            _ => return ancestor.map(|it| SyntaxNodePtr::new(&it)),
+        }
+    }
+    pat_node(pat)
 }
 
 fn pat_node(pat: InFile<AstPtr<ast::Pat>>) -> InFile<SyntaxNodePtr> {

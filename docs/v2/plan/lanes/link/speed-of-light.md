@@ -431,6 +431,89 @@ redoing up, then the cell. Then the answer: the same 4 system calls, one file, w
 renamed into place. That is the bound and where the code is. Budget: 1.1 × (cells differing ×
 store + 1.3 µs).
 
+### The log of generations: reserved columns (speed-link-edge-mem-live)
+
+The switch keeps every generation the program ran (`switch.rs` `Log`) and every lasting range
+(`Lasting`) in columns. They were `Vec`s with room for 1,024 generations, 16,384 cells, 4,096
+writes of code and 4,096 lasting ranges. Past that, a column doubled: one allocation, plus a
+copy of the whole column, on the latency path of the patch that crossed the line. The
+allocation-budget test only held below those counts. blaze-mem's `RegionVec` can't be used
+(`v2/requests/mem-backend-live.md`, "refused by requests"): blaze-live is published and built
+alone into user programs, and blaze-mem reserved about 264 GB, which broke `Live::open` under
+`ulimit -v` and valgrind.
+
+Now each column is a `slots/column.rs` `Column<T>`:
+- At `Live::open` it reserves address space for its most rows (`mmap` with `PROT_NONE` and
+  `MAP_NORESERVE`, or `VirtualAlloc` with `MEM_RESERVE`).
+- It commits 256 KiB at a time as it grows (`mprotect` to read and write, or `MEM_COMMIT`), so
+  rows never move and growing never calls the allocator.
+- A full column refuses the patch before anything is written, with an error naming the column
+  and its limit. Nothing falls back to the heap.
+
+The `Range` columns became pairs of `u64` columns, and `kept` became one byte per generation.
+Rows are 25 B per generation, 20 B per cell, 16 B per write of code and 25 B per lasting range.
+The limits are `switch.rs` `Limits::LONG`; each column is rounded up to the 256 KiB step:
+
+| column | rows | bytes per row | reserved |
+|---|---|---|---|
+| generation numbers | 2^20 | 8 | 8 MiB |
+| parents, depths | 2^20 each | 4 | 4 MiB each |
+| kept marks | 2^20 | 1 | 1 MiB |
+| cell runs, code runs | 2^20 + 1 each | 4 | 4.25 MiB each |
+| slots | 2^24 | 4 | 64 MiB |
+| new targets, old targets | 2^24 each | 8 | 128 MiB each |
+| code starts, code ends | 2^22 each | 8 | 32 MiB each |
+| lasting starts, ends, generations | 2^20 each | 8 | 8 MiB each |
+| lasting kinds | 2^20 | 1 | 1 MiB |
+
+That is 25.5 MiB for the per-generation columns, 320 MiB for cells, 64 MiB for code and
+25 MiB for lasting ranges: **434.5 MiB of address space in 15 mappings**. None of it is
+memory until written. `Live::open` therefore needs `ulimit -v` (which counts reservations, in
+KiB) to leave 444,928 KiB above the program's own mappings: a 1 GiB limit fits a program
+whose own mappings are under about 590 MiB, and 4 GiB or unlimited always fits. Windows charges
+only committed pages against the commit limit, and macOS doesn't enforce `RLIMIT_AS`.
+
+How long the limits last:
+- A one-function edit takes 1 generation, 1 cell, 1 write of code and up to 3 lasting ranges
+  (the code, its FDE and the zero length after the FDE's run).
+- So the lasting ranges fill first, after about 350,000 edits: an edit every 10 seconds for
+  40 days.
+- A 1,000-function patch takes about 1,000 cells, 1,000 writes and 3,000 lasting ranges, so
+  about 350 of them fit.
+- A full log refuses the patch, naming the column, and the program needs a restart. No program
+  has come near this.
+
+Commits are rare:
+- A one-function edit writes 136 B across the 15 columns (25 B per generation, 20 for its cell,
+  16 for its code and 75 for 3 lasting ranges). Each column commits once per 256 KiB it
+  fills, so that is **one `mprotect` per 1,928 edits**.
+- A 1,000-function patch writes about 111 KB: 0.42 `mprotect` per patch. Each call adds
+  access to untouched pages, so no TLB shootdown, about 1 µs.
+
+The first write to a committed page faults (a minor fault, about 0.25 µs with zeroing). That
+is once per 30 one-function edits, but about 27 times for a 1,000-function patch: about 7 µs,
+15% of its 47 µs bound. So after each switch, off the latency path, `Column::ahead` commits
+and writes once each page that a next patch of the same size would push to. The next patch's
+pushes then find their pages committed and resident, and its log work costs only the stores:
+111 KB at about 50 GB/s is 2 µs, inside the bound's 10%. The commits move behind the switch
+too.
+
+Proof:
+- `a_warm_patch_allocates_nothing` takes 9,000 warm patches of 4 cells under a budget of 0
+  allocations. That is past the old 1,024 generations and 16,384 cells, and across a commit
+  step of every cell column.
+- `a_full_column_refuses_the_patch` sets small limits and checks that a full generation,
+  cell, code or lasting column refuses the patch whole and names itself.
+- `column.rs`'s model test checks `Column` against a `Vec` over seeded pushes, splices and
+  truncations, across commit steps and up to the limit.
+- `a_column_costs_memory_only_where_written` runs per platform: `mincore` on Linux and macOS,
+  `VirtualQuery` and `QueryWorkingSetEx` on Windows. It checks that a reserved or committed
+  column has no resident page until a row is written.
+
+State of the art: wasmtime and V8 reserve each linear memory or heap up front, with guard
+regions in GiB, and commit as it grows. This is the same technique sized for a program that
+links it: hundreds of MiB, not GiB.
+
 ### The sampler's counters: `sample.rs`
 
 The sampler reads no counter per sample. When it writes the profile (every 250 ms) it makes

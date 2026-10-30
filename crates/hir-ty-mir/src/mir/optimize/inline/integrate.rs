@@ -56,7 +56,12 @@ impl Temps {
 
     /// rustc's `create_temp_if_necessary`: a temporary the argument is moved out of is the
     /// parameter itself.
-    fn argument<'db>(&mut self, ctx: &Ctx<'_, 'db>, body: &mut MirBody<'db>, arg: Operand) -> LocalId {
+    fn argument<'db>(
+        &mut self,
+        ctx: &Ctx<'_, 'db>,
+        body: &mut MirBody<'db>,
+        arg: Operand,
+    ) -> LocalId {
         if let OperandKind::Move(place) = &arg.kind
             && place.projection.is_empty()
             && place.local != return_slot()

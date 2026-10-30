@@ -73,6 +73,11 @@ on the code of each body inlined into it.
   and the interpreter does not read `Inlined`.
 
 > forwarded to db (db-ty; window `db-next2`, told by tmux).
+> applied by db-ty (db-ty-next3, 21:40): the six types beside `MirBody` as written (plus
+> `Inlined::is_empty`, which reads `callees`), `MirBody::inlined` (hashed, shrunk),
+> `MirSpan::Inlined(u32)`, `MirOptions::inline` (`at` gives `false`). Test
+> `what_a_body_inlined_is_part_of_its_hash`. The struct literals and exhaustive matches this
+> breaks outside db-ty's paths are in `v2/requests/db-ty.md` "## db-ty-next3".
 
 ## 2. hir-def `src/attrs.rs` (db): the attributes the inliner reads
 
@@ -90,6 +95,20 @@ The inliner refuses a callee with either of the last two, or a caller with `HAS_
 where rustc compares the sets: blaze reads neither attribute's arguments yet.
 
 > forwarded to db (window `db-next2`, told by tmux).
+
+> APPLIED by db-unblock (2026-10-29 22:55) in `crates/hir-def/src/attrs.rs`. Bits 73 to 78 were
+> taken meanwhile, and `HAS_SANITIZE` already was (bit 78, `#[sanitize(..)]` of one segment), so
+> the four new ones are `RUSTC_NO_MIR_INLINE` (86), `COLD` (87), `OPTIMIZE_NONE` (88) and
+> `HAS_INSTRUCTION_SET` (89). All are one segment, as `HAS_SANITIZE` is: `#[rustc_no_mir_inline]` and
+> `#[cold]` as words (and in `AttrFlags::has_word`'s fast path), `#[optimize(..)]` with a
+> top-level `none` token, `#[instruction_set(..)]` with any token tree. The four names are in
+> attrs' own `Word` set (a perfect hash over text; `intern` needs no new symbols). Tests in
+> `crates/hir-def/src/attrs/tests.rs`: the reference walk's `gating_flags` and `GATING` know
+> them, the corpus has `optimize`'s shapes, `gating_flags_of_known_shapes` has each, and
+> `gated_queries_read_what_the_source_says` checks `#[cold]` (also through `cfg_attr`) and
+> `#[rustc_no_mir_inline]` against the source. Not changed: the existing `HAS_SANITIZE` reads
+> `#[sanitize(..)]` only, not `#[no_sanitize(..)]` as this item asked; whoever owns it next
+> should check whether the pinned nightly still accepts `no_sanitize`.
 
 ## 3. Exhaustive `MirSpan` matches (each crate's owner)
 

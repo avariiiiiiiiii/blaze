@@ -375,8 +375,6 @@ For more information about this error, try `rustc --explain E0029`.
 }
 
 #[test]
-#[ignore = "hir's InvalidRangePatType does not carry the ends' types as inference had them: \
-            `10` is `{integer}` there and `i32` once inference is done (v2/requests/diagnostics.md)"]
 fn a_range_with_one_bad_end_names_the_type_of_the_other() {
     // tests/ui/match/match-range-fail.rs
     let source = r#"fn main() {

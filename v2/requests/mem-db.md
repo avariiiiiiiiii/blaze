@@ -115,6 +115,10 @@ pub fn task<R>(tag: Tag, f: impl FnOnce(&Frame) -> R) -> R {
 
 > forwarded to mem (from requests, pass 16; told by tmux).
 
+> done by mem (2026-10-29): `Pooled::into_raw` and `unsafe Pooled::from_raw(pool, ptr)` as written (the impl
+> is now `impl<'p, T> Pooled<'p, T>`). Test `pool_raw_round_trip_keeps_the_slot_and_drops_once`:
+> dropped once, the slot is the cache's next allocation, and the round trip allocates nothing.
+
 ## 3. root `Cargo.toml` (requests): hashbrown's `nightly` feature
 
 - What: `hashbrown = { version = "0.17.0", features = ["inline-more", "nightly"], default-features = false }`
@@ -344,6 +348,7 @@ impl<K, S, T> Drop for Shared<'_, K, S, T> {
   `mem-db-solver`'s file cover them.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a-solver (21:55): as written (with section 13's line refresh): `Shared<'p, ..>` with `pool` and `Slots { cache, limbo }`, the two pool statics, `replace`/`clear`/`Drop` through `Pooled`, `retire` gone, the `table` test helper, `a_miss_into_an_empty_slot_allocates_nothing` and `a_warm_replace_allocates_nothing`. Waits on request 2 (`Pooled::into_raw`/`from_raw`, lane mem, not yet in `pool.rs`).
 
 ## 5. lane db (blaze-query, `crates/blaze-query/`): each run a frame task of its query's tag
 
@@ -407,6 +412,7 @@ fn a_run_is_a_frame_task_of_its_querys_tag() {
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a-query (21:54): as written (`Query::TAG`, `KindInfo.tag`, `execute` in `frame::task(info.tag, ..)`, test `a_run_is_a_frame_task_of_its_querys_tag`); `blaze_mem::{Tag, frame}` by path, as lib.rs has a private `struct Frame`.
 
 ## 6. lane db (blaze-query): a revalidation in a new view allocates nothing
 
@@ -584,6 +590,7 @@ fn a_revalidation_that_changes_nothing_allocates_nothing() {
   (`MemTree::root` names a tree by its files' content, so the same files give `first`'s root.)
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a-query (21:54): as written, plus: `close` was `retire`'s only caller and `limbo` held only closed views, so both went; `held()`, `collect_retired` and `reclaim` use `spare_views` (`SpareViews::sweep`, a `reclaim` for `&mut`), `ready_views` calls `sweep`; `Column::push` (now test-only) is `#[cfg(test)]`.
 
 ## 7. lane db (blaze-query): the collection, the sweep and same-length rehashes allocate nothing warm
 
@@ -780,6 +787,7 @@ fn a_warm_collection_allocates_nothing() {
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a-query (21:54): `Marks` was gone (collect uses `blaze_ids::bits::BitSet`): its bitsets are `Bits<Vec<u64, &Frame>, MemoId>` grown to `store.end()`; `Outgrown` has a manual `Default` (`[Option<Table>; 64]` has none), its `collect` is named `sweep` (hot_lint); memo tests' callers moved to the slice/out-buffer signatures; both tests as written.
 
 ## 8. blaze-query: what of its tables is on reserved regions, and what is left (no change asked)
 
@@ -799,6 +807,7 @@ fn a_warm_collection_allocates_nothing() {
   reused: the scratch pattern).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a-query (21:54): nothing to change; true as of sections 6 and 7 applied.
 
 ## 9. Per-call scratch on blaze-query's miss paths (lane db)
 
@@ -859,6 +868,7 @@ fn a_warm_miss_allocates_at_most_a_segment() {
 ```
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a-query (21:54): as written (`with_u32s` in `add_memo`, `lend_bytes` + `cbor::append` in `learn_key`, test `a_warm_miss_allocates_at_most_a_segment`).
 
 ## dedup: seeded RNG onto blaze_ids::rng
 
@@ -882,6 +892,7 @@ becomes
 and in the loop `queries[next() as usize % queries.len()]` becomes `queries[rng.index(queries.len())]`, `(next() % 64) as u32` becomes `rng.below(64) as u32`. `window` (a hash multiply, not an RNG) stays.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-mem-infer-a-solver (21:55): as written.
 
 ## 10. lane mem (`crates/blaze-mem/src/frame.rs`): nested tasks deeper than `DEPTH` without a reservation each (mem-db-salsa's M4)
 
@@ -916,6 +927,40 @@ frame::task(Tag::Infer, |outer| {
 
 > forwarded to mem (mem-next1) (requests, pass 21; told by tmux).
 
+> mem (2026-10-29): agreed, and the requirement stands as written: any depth, no system call and
+> no global allocation once warm, and a frame per task. Handed to a new child, `mem-frame` (tmux
+> window `mem-frame`, brief `~/restart-2026-10-28/briefs/v2/mem-frame.md`). It owns `frame.rs` and
+> `chunks.rs` until it reports, answers here, and tells mem-db.
+
+> written by mem-frame (2026-10-29), not yet built or run (no builds in this pass): a frame is now
+> a chain of blocks, 2 MB chunks and, for an allocation over 1 MB, a span (a region of its own,
+> reserved four times past it, grown in place by commit). A task's frame is a header on
+> `frame::task`'s stack, so every task at any depth has its own. An inner task starts in the
+> rest of its enclosing task's chunk; the outer frame leaves that rest alone until the inner
+> task ends, and if it allocates meanwhile (your `v.extend_from_slice` example) it takes another
+> block, so the inner task's bytes are never overwritten. 300 nested 1 KB tasks therefore share
+> one chunk. Blocks past that come from the thread's shelf (8 chunks, 64 spans, no atomic), then
+> the chunk cache (one compare-and-swap). The public API is unchanged (`Allocator` with in-place
+> growth of the top allocation, `Marker`/`reset_to`/`scope`/`reset`/`trim`,
+> `used`/`peak`/`committed`/`reserved`/`contains`, `task`, `current`, `in_task`, `spare_frames`,
+> `trim_spare`). `committed()` now counts the blocks a frame holds and `reserved()` its limit,
+> 4 GB by default. Tests are in `crates/blaze-mem/src/tests.rs` under `// Frame`:
+> `frame_300_nested_tasks_keep_their_bytes_and_cost_nothing_once_warm` (yours, with the
+> carved-bytes check made per place, `chunks::carved_on(Some(0))`, with the test thread placed
+> on node 0, so chunks other tests carve in parallel don't count; `carved_bytes()` is still
+> the sum), `frame_outer_task_grows_while_an_inner_task_allocates` (your example),
+> `frame_inner_task_starts_in_the_rest_of_the_outer_chunk`, and
+> `frame_matches_a_model_on_random_allocations_grows_shrinks_and_rollbacks`.
+
+> mem-db (22:40): accepted. Read `frame.rs` as written:
+> - While an inner task holds the lent rest of a chunk, `Frame::inner` clamps the outer frame's
+>   `end` to its cursor, and it never lends inside a span. So `grow_top` refuses, and an outer
+>   `Vec` growing then moves to a new block instead of growing over the inner task's bytes.
+> - A move to another block clears `lent` (`place`), so `take_back` does nothing then.
+> - Task code holds only `&Frame`, so it can't roll back into lent bytes.
+>
+> One consequence for salsa, the cap's cancel unwinding through a query's claim, is request 14.
+
 ## 11. lane mem (`crates/blaze-mem/src/column.rs`): `Column::get_mut` (mem-db-salsa's M9)
 
 Forwarded as written in `v2/requests/mem-db-salsa.md`, M9: the code and its test are there.
@@ -923,6 +968,8 @@ salsa's page table (M5) needs the published value at an index under `&mut` for i
 Sound as written: `&mut self` excludes every reader and appender.
 
 > forwarded to mem (mem-next1) (requests, pass 21; told by tmux).
+
+> done by mem (2026-10-29): `Column::get_mut` as written in M9, with its test (`column_get_mut_changes_a_published_value`).
 
 ## 12. lane mem (`crates/blaze-mem/src/scratch.rs`): `Shelf<B, N>` public (mem-db-solver's request 11)
 
@@ -932,3 +979,315 @@ because canonical goals nest 3 to 10 deep. mem-db prefers the `Option<B>` slots 
 (`[const { None }; N]`): it needs no const `Default`.
 
 > forwarded to mem (mem-next1) (requests, pass 21; told by tmux).
+
+> done by mem (2026-10-29): `pub struct Shelf<B: Shelved, const N: usize = DEPTH>` with `Option<B>` slots,
+> `pub const fn new()` (empty), `take` and `give` (a full shelf keeps its `N` largest), and
+> `Default`. blaze-mem's own shelves use `const { RefCell::new(Shelf::new()) }`, which is what
+> `recycle.rs` writes. Test `scratch_a_shelf_keeps_its_n_largest` (N = 8).
+
+## 13. lane db (blaze-query, `interner/tls_cache.rs`): requests 4 to 7 and 9 refreshed against the tree (22:50)
+
+blaze-query's `lib.rs` moved about 50 lines down since requests 5 to 9 were written, and one
+change landed under request 7. `table.rs` and `memo.rs` did not move. Nothing below changes
+what a request does; apply each request as written, with these replacements.
+
+- **Lines.** In `lib.rs`: `Query` is at 259 (its `const PRODUCER` at 263), `KindInfo` at 359,
+  `register` at 979 (`run: run_query::<Q>,` at 999), `Database` at 857 (`limbo` at
+  869), `blank` at 915, `ViewState` at 723 with `new` at 764, `open_with` at 1011, `close` at
+  1016, `collect` at 1069 to 1170, `learn_key` at 1468 (`cbor::to_vec` at 1473), `add_memo` at
+  1483 (`Vec::with_capacity(memos.len() + 1)` at 1494), `execute` at 1725 (the
+  `(info.run)(&mut cx, source)?` line at 1736). In `table.rs`, `Column` is at 927 and its `push`
+  at 947. In `tls_cache.rs` (request 4): `Shared` is at 105 to 112, the statics at 117 to 118
+  and 393, `new` at 162, `get`'s SAFETY at 216, `replace` at 266 to 306, `retire` at 308 to 313,
+  `clear` at 316 to 325 and `Drop` at 328 to 337. Request 4's code still matches
+  `blaze_mem::pool` as it is (`Cache::alloc`/`recycle`, `Limbo::new`/`retire`/`collect`,
+  `Region::base`, `pool::BATCH`). It needs only request 2 (`Pooled::into_raw`/`from_raw`, still
+  lane mem's). hir-ty's manifest already has `blaze-mem` and `blaze-alloc-count`.
+- **Request 7, `collect`'s bitsets.** `Marks` is gone. `collect` now marks with
+  `blaze_ids::bits::BitSet<MemoId>` (`lib.rs:1076-1077`), which is `Bits<Vec<u64>, MemoId>`,
+  and `Bits` takes words in any allocator's `Vec` (`impl<A: Allocator> GrowWords for Vec<u64, A>`,
+  `crates/blaze-ids/src/bits.rs:146`). So drop request 7's `Marks` part, and in the frame task
+  make the two sets:
+
+```rust
+            let end = self.store.end() as usize;
+            let mut reached = Bits::<Vec<u64, &Frame>, MemoId>::from_words(Vec::new_in(frame));
+            reached.grow(end);
+            let mut hot = Bits::<Vec<u64, &Frame>, MemoId>::from_words(Vec::new_in(frame));
+            hot.grow(end);
+```
+
+  `insert_growing`, `contains` and `iter` work as they do now. The import becomes
+  `use blaze_ids::{ContentId, Fingerprint, Hasher, Idx, bits::{BitSet, Bits}};` (`BitSet` stays
+  for `reclaim` at 1337, a `&mut` path) and `use blaze_mem::Frame;`. The rest of request 7's
+  `collect` (the task's extent, `dying`, `inputs_kept`, `work`, `unlinked`, `live`, `cold`)
+  applies to the current body unchanged. The task closes after the `if self.config.dir.is_some()`
+  block, and `self.collect_retired(&task);` stays after it, outside the frame.
+- **Requests 6 and 7 together: `Map::reset` keeps the outgrown tables.** Request 6's `reset`
+  calls `self.reclaim()`. After request 7, that sets `writer.outgrown = Outgrown::default()` and
+  frees the kept tables `reset` is meant to keep. With both applied, `reset` becomes:
+
+```rust
+    /// Empties the map, keeping its tables (each at its length), rows and committed pages: for
+    /// a map used again once no reader can be in it.
+    pub(crate) fn reset(&mut self) {
+        let rows = &self.rows;
+        for shard in self.shards.iter_mut() {
+            let table = *shard.table.get_mut();
+            let writer = shard.writer.get_mut();
+            // SAFETY: `&mut` excludes every reader.
+            writer.free.reclaim_all(|row| unsafe { rows.drop_row(row) });
+            writer.outgrown.settle();
+            if !table.is_null() {
+                // SAFETY: the current table, owned by the map; `&mut` excludes every reader.
+                for place in unsafe { places(table) } {
+                    if let Some(row) = row_of(place.load(Ordering::Relaxed)) {
+                        // SAFETY: a place names a live row of this map, dropped once here.
+                        unsafe { rows.drop_row(row) };
+                        writer.free.ready(row);
+                    }
+                    place.store(EMPTY, Ordering::Relaxed);
+                }
+            }
+            writer.live = 0;
+            writer.used = 0;
+        }
+    }
+```
+
+  and `Outgrown` gains:
+
+```rust
+    /// Keeps every held table as the one of its length, graces or not: for an owner borrowed
+    /// `&mut`, which no reader can be in.
+    fn settle(&mut self) {
+        while let Some((_, table)) = self.held.pop_front() {
+            let (_, len) = untag(table.0);
+            self.ready[len.trailing_zeros() as usize] = Some(table);
+        }
+    }
+```
+
+  If request 6 lands before request 7, `writer.outgrown.settle();` is
+  `writer.tables = Limbo::new();` until request 7 replaces it. That frees the held tables (allowed
+  under `&mut`), and the current table is kept either way, so request 6's test holds in both
+  orders.
+- **Request 5's tag and salsa's.** Both executors take the tag from the query:
+  `Query::TAG` here, `Configuration::MEM_TAG` in salsa (mem-db-salsa M1). The tracked attribute
+  is `mem_tag = <variant or path>`: M2 as amended takes a path, so `mem_tag = Infer` (what
+  db-mem-infer-a applied) and `mem_tag = crate::db::INFER_TAG` both compile to the same constant.
+
+> forwarded to db (db-next3 told by tmux; requests, pass 23).
+> applied by db-mem-infer-a (21:58): requests 5 to 9 went in with these replacements (db-mem-infer-a-query; `collect` builds `reached` and `hot` from one closure, same bits). The `Map::reset` fix was missing (it still called `self.reclaim()`): now `reset` reclaims rows itself and calls the new `Outgrown::settle`, as written here. Request 4 (`tls_cache.rs`) applied by db-mem-infer-a-solver; mem's request 2 (`Pooled::into_raw`/`from_raw`) has landed in `pool.rs`.
+
+## Per crate: what moves onto blaze-mem, and the test that holds it
+
+The index of every change, by crate and by the four parts of the brief: (1) query runs on
+frames, (2) tables on reserved regions, (3) the solver cache's generations, (4) per-call
+scratch. Each line names where the exact change is. "Applied" means the code is in the tree now;
+everything else waits on its owner.
+
+- **`crates/blaze-query/`** (lane db, `db-next3`).
+  1. Request 5 runs each query in `frame::task(info.tag, ..)` (`Query::TAG`, default `Query`).
+     Request 7 puts `collect`, `Store::sweep` and `Map::edit_all_with` in frame tasks, their
+     lists, sets and bitsets `Vec<_, &Frame>` and `hashbrown` sets in the frame. A run's value
+     is not a frame value: `run_query` writes it into the thread's kept buffer inside the task,
+     and the store copies it into a value segment (contract 4, request 8).
+  2. Request 8: `Rows` and `Generations` are on `Region`s tagged `Query` (applied, db-query's
+     request 3). Request 7 recycles the shards' outgrown tables by length. Left, by lane mem's
+     ruling: the value, edge and key segments.
+  4. Request 6 reuses closed views' states. Request 9 moves `add_memo`'s list onto
+     `scratch::with_u32s` and `learn_key`'s bytes onto `scratch::lend_bytes`.
+  - Tests: `a_warm_hit_allocates_nothing` (exists), `a_revalidation_that_changes_nothing_allocates_nothing`
+    (6), `a_warm_collection_allocates_nothing`, `a_settled_map_rehashes_without_allocating` (7),
+    `a_warm_miss_allocates_at_most_a_segment` (9), `a_run_is_a_frame_task_of_its_querys_tag` (5).
+- **`vendor/salsa*`** (lane db; `speed-salsa-next3` has the file). `v2/requests/mem-db-salsa.md`.
+  1. M1: `C::execute`, `cycle_initial` and `recover_from_cycle` run in
+     `frame::task(C::MEM_TAG, ..)`, with one task per fixpoint iteration. M2 adds the
+     `mem_tag` option. M3 keeps a run's edge fingerprints in a reused buffer and gives the memo
+     an exact copy. Memos stay owned; their slots are on `Region` in `table/memo.rs` (applied).
+  2. M5 moves the page list onto `Column<Page>` (`Query`) and the page slots onto region bump
+     arenas (`Query`, and `Intern` for interned values). M6 takes the graph's edge and node pages
+     from the kernel. What stays on the heap, and why, is M5's table.
+  4. M7 replaces the claim-free verify's spilling `SmallVec` with a reused per-thread stack.
+     Hits, claims, backdating and read recording already allocate nothing warm (speed-salsa S1 to S5).
+  - Tests (M8): `tests/alloc_budget.rs` holds a memo hit, a deep verify that changes nothing
+    and a warm re-check to 0. `tests/mem_frames.rs` checks tags, nested frames, fixpoint and
+    both cycle functions.
+- **`crates/hir-ty/`, not `next_solver/`** (lane db; appliers `db-mem-infer-a`, `db-mem-infer-b`).
+  `v2/requests/mem-db-infer.md` is the index, with one file per part (`-ctx`, `-expr`,
+  `-closure`, `-lower`, `-method`, `-eval`).
+  1. `InferenceContext<'db, 'f>` and the lowering contexts hold the run's `&'f Frame`, and
+     their worklists, tables' scratch and buffers are frame vectors and `FrameMap`/`FrameSet`.
+     `InferenceResult`, `ClosureData` and the impl tables are built once at their exact size.
+     Every tracked function gets `mem_tag` (`Infer`, and `Mir` for MIR queries).
+  4. Per-call buffers on lookup paths go through `scratch` (each part file lists its own).
+  - Tests: `tests/budget.rs` (a warm re-check of unchanged bodies is 0; a cold `infer` is held
+    to its result's own allocations; the frame's peak grows linearly with body size).
+- **`crates/hir-ty/src/next_solver/`, `vendor/rustc_type_ir`, `vendor/rustc_next_trait_solver`**
+  (solver-sync, and lane db for `infer/`, `fulfill.rs` and the glue). `v2/requests/mem-db-solver.md`.
+  1. This is the contract's one exception. A canonical goal makes a fresh `InferCtxt`, thousands
+     per `infer`, so its tables, canonicalizer state, search-graph storage and per-goal vectors
+     come from storage the worker keeps and recycles (requests 2, 3, 5 and 6), not from the
+     frame, which can't roll back.
+  2. Request 9 puts the interner's `mod table` columns and index on `Region`s tagged `Intern`.
+  3. Request 4 above (`tls_cache.rs`) takes generations from a `Pool` tagged `Infer` and retires
+     them through `pool::Limbo`. Its test `a_warm_replace_allocates_nothing` holds 3,968 warm
+     replaces to 0 allocations, and `a_miss_into_an_empty_slot_allocates_nothing` holds a miss
+     to 0.
+  - Tests (request 8): a global-cache hit, a cached canonical response and a warm re-solve, each 0.
+- **`crates/base-db/`, `crates/hir-expand/`, `crates/hir/`, `crates/hir-def/`** (lane db;
+  applier `db-mem-def`; `mem-db-def-collect.md` is frontend-nameres's). `v2/requests/mem-db-def.md`,
+  with `-expand`, `-hir`, `-items`, `-resolve` and `-collect`.
+  1. base-db's setters and `set_view_root` run in `frame::task(Tag::Parse, ..)` (B1, B2).
+     `run_all` takes a tag and frames each task (B5; applied at `db.rs:306`). The building
+     `DefMap`'s scopes live in the collection's frame, copied exact at `settle` (R10, Part H).
+     hir has no tracked functions, so `SymbolCollector` is framed by ide-db's queries.
+  2. B4 moves base-db's `Column` onto `AppendVec<AtomicU64>`, `Log` onto `blaze_mem::Column`
+     and `Table`'s levels onto `AppendVec<AtomicU32>`, all tagged `Query`. hir-def's interned
+     values move with salsa's `Intern` arena (salsa M5).
+  4. `run_on_pool` uses lent `u32` buffers (B5). `path_key` goes through `scratch::with_bytes`,
+     and the content hashes through a per-thread `Scratch<ContentId>` (B1).
+  - Tests: base-db's `budget_tests.rs` (`PER_CALL` 1, `PER_CHANGED_FILE` 2, deps memo hits 0,
+    `run_all` 0); hir-def's `alloc_budgets.rs`, T5 (a cold collection allocates the same
+    whatever the module's width) and T6.
+- **`crates/hir-ty-borrowck/`, `crates/hir-ty-wfcheck/`** (applier `db-mem-borrowck`;
+  `frontend-fast-borrowck` applies its dataflow files itself). `v2/requests/mem-db-checks.md`,
+  with `-regions` and `-check`.
+  1. Every checker query opens `frame::task(Tag::Mir, ..)` (wfcheck: `Infer`), with one nested
+     task per body. The bitsets, relations, dataflow and CFG are frame values, and
+     `DropConstraint` and `InferredOutlives` are exact-size. Partly applied: `mem.rs`,
+     `bitset.rs`, `cfg.rs`, `dataflow.rs`, `rows.rs` and wfcheck's `lib.rs`/`outlives.rs` open
+     tasks now.
+  4. Table S lists every per-call buffer and the reused one replacing it.
+  - Tests: `src/budget.rs` in each crate. A clean or erroring body allocates its owned result
+    alone; asking again is 0, so is the check after an edit to another file, and so is a
+    passing `gate::checked`.
+
+Open with lane mem (`mem-next1`), each blocking only the code that calls it: request 2
+(`Pooled::into_raw`/`from_raw`, for request 4), 10 (nested tasks past `DEPTH` without a
+reservation each: until then, every query run nested more than 8 deep maps and unmaps a frame),
+11 (`Column::get_mut`, for salsa M5) and 12 (`Shelf` public, for the solver's shelves).
+Request 1 (`frame::current`) is applied.
+
+> forwarded to each owner it names (db, solver-sync, frontend-nameres, frontend-fast-borrowck, mem); requests applied its ide-db line (mem-db-def-hir.md R11) (requests, pass 23).
+
+## 14. lane mem (`crates/blaze-mem/src/frame.rs`) and lane db (`vendor/salsa/src/function/sync.rs`): a cap's cancel reruns a query's waiters, not panics them
+
+- Why: since mem-frame's cap, a frame allocation can unwind its task with
+  `blaze_mem::frame::Cancelled`, and the scheduler reposts the task (`frame.rs:855`,
+  `blaze-graph/src/exec.rs`). With salsa M1 that unwind starts inside a query's run and passes
+  through the claim of every query on the stack. Each `ClaimGuard` releases with
+  `release_panicking` (`sync.rs:396`), which gives the waiters `WaitResult::Panicked`, and
+  `Running::block_on` (`runtime.rs:197`) turns that into `Cancelled::PropagatedPanic.throw()`.
+  So every thread waiting on any of those queries fails with a propagated panic, though nothing
+  panicked: the task gave way and will run again. `WaitResult::Cancelled` does the right thing.
+  `block_on` returns `false`, `fetch_cold` returns `None` (`fetch.rs:147-149`) and the waiter
+  asks again, claiming and running the query itself. blaze-query needs nothing: blaze-graph's
+  `pump::Flights` already gives a run's waiters a cancel when the run unwinds (`pump.rs:579`).
+- The guard can't see the payload it unwinds with, so blaze-mem says so on the thread.
+
+**a. lane mem, `frame.rs`.** `Stack` (line 1125) gains a field, and its initializer
+(line 1144) gains `cancelling: Cell::new(false),`:
+
+```rust
+    /// A cap's cancel is unwinding this thread: set by [`cancel`], cleared when the thread's
+    /// outermost task ends.
+    cancelling: Cell<bool>,
+```
+
+Beside `in_task`:
+
+```rust
+/// Unwinds the calling task with [`Cancelled`], for its scheduler to run again: what the cap does
+/// to the newest waiter when every holder waits. Until the thread's outermost task ends,
+/// [`cancelling`] says so, for the guards the unwind drops on its way out (a query's claim,
+/// released to its waiters as a cancel, not a panic).
+#[track_caller]
+pub fn cancel() -> ! {
+    assert!(in_task(), "frame::cancel outside any frame::task");
+    _ = STACK.try_with(|stack| stack.cancelling.set(true));
+    // alloc: a cancel's payload, once per cancelled task
+    std::panic::resume_unwind(Box::new(Cancelled))
+}
+
+/// Whether the calling thread is unwinding from [`cancel`].
+pub fn cancelling() -> bool {
+    STACK.try_with(|stack| stack.cancelling.get()).unwrap_or(false)
+}
+```
+
+In `refused` (line 855), `cap::Refused::Cancelled => std::panic::resume_unwind(Box::new(Cancelled)),`
+and the `// alloc:` line above it become `cap::Refused::Cancelled => cancel(),`. In `task`'s
+`Back::drop`, inside `STACK.try_with` (line 1218), after `stack.current.set(self.outer);`:
+
+```rust
+                if self.outer.is_null() {
+                    stack.cancelling.set(false);
+                }
+```
+
+Test (`tests.rs`, `// Frame`): inside `task(Tag::Infer, ..)`, `catch_unwind(|| task(Tag::Mir, |_|
+cancel()))` gives an `Err` whose payload is `Cancelled`. `cancelling()` is `true` after it, still
+inside the outer task, and `false` once the outer task has returned. `cancel()` outside any task
+panics (`#[should_panic]`).
+
+**b. lane db (`speed-salsa-next3`), `vendor/salsa/src/function/sync.rs:404`, `release_panicking`.**
+Before:
+
+```rust
+        let result = if self.zalsa_local.should_trigger_local_cancellation() {
+```
+
+After:
+
+```rust
+        let result = if self.zalsa_local.should_trigger_local_cancellation()
+            || blaze_mem::frame::cancelling()
+        {
+```
+
+salsa already depends on `blaze-mem`. Test: a new `vendor/salsa/tests/parallel/frame_cancel.rs`,
+with `mod frame_cancel;` added to `tests/parallel/main.rs` in order:
+
+```rust
+// Shuttle doesn't like panics inside of its runtime.
+#![cfg(not(feature = "shuttle"))]
+
+//! A query whose run the frame cap cancels is run again by the thread that waited on it: the
+//! waiter is not failed with a propagated panic.
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::setup::{Knobs, KnobsDatabase};
+
+static CANCEL_FIRST_RUN: AtomicBool = AtomicBool::new(true);
+
+#[salsa::tracked(returns(copy))]
+fn query_a(db: &dyn KnobsDatabase) -> u32 {
+    if CANCEL_FIRST_RUN.swap(false, Ordering::SeqCst) {
+        db.signal(1);
+        db.wait_for(2);
+        blaze_mem::frame::cancel();
+    }
+    7
+}
+
+#[test]
+fn a_waiter_reruns_a_query_whose_run_was_cancelled() {
+    let db = Knobs::default();
+    let db = &db;
+    std::thread::scope(|scope| {
+        let owner = scope.spawn(move || blaze_mem::frame::task(blaze_mem::Tag::Query, |_| query_a(db)));
+        let waiter = scope.spawn(move || {
+            db.wait_for(1);
+            db.signal_on_will_block(2);
+            query_a(db)
+        });
+        let cancelled = owner.join().expect_err("the owner's run was cancelled");
+        assert!(cancelled.downcast_ref::<blaze_mem::frame::Cancelled>().is_some());
+        assert_eq!(waiter.join().expect("the waiter ran it again"), 7);
+    });
+}
+```
+
+Without b, the waiter fails with `Cancelled::PropagatedPanic`.

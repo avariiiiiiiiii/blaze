@@ -5,6 +5,7 @@ mod coherence;
 mod db;
 mod facts;
 mod form;
+mod goals;
 mod hashes;
 mod mem;
 mod narrow;

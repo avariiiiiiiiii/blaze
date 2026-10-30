@@ -6,7 +6,11 @@ mod format_args;
 mod generics;
 mod path;
 
-use std::{cell::OnceCell, mem};
+use std::{
+    cell::{OnceCell, RefCell},
+    mem,
+    sync::Arc,
+};
 
 use base_db::{Db, FxIndexSet};
 use cfg::CfgOptions;
@@ -26,11 +30,11 @@ use smallvec::SmallVec;
 use span::{AstIdMap, RealSpanMap, SyntaxContext};
 use stdx::never;
 use syntax::{
-    AstNode, AstPtr, SyntaxNodePtr,
-    ast::{
-        self, ArrayExprKind, AstChildren, BlockExpr, ForBinder, HasArgList, HasGenericArgs,
-        HasGenericParams, HasLoopBody, HasName, HasTypeBounds, IsString, RangeItem,
-        SlicePatComponents,
+    AstPtr, FlatTree, SyntaxNodePtr, ast as tag,
+    view::{
+        self as ast, ArrayExprKind, AstChildren, AstNode, BlockExpr, ForBinder, HasArgList,
+        HasAttrs, HasGenericArgs, HasGenericParams, HasLoopBody, HasName, HasTypeBounds, IsString,
+        RangeItem, SlicePatComponents, Typed,
     },
 };
 use thin_vec::ThinVec;
@@ -44,10 +48,10 @@ use crate::{
     expr_store::{
         Body, BodySourceMap, ExprPtr, ExprRoot, ExpressionStore, ExpressionStoreBuilder,
         ExpressionStoreDiagnostics, ExpressionStoreSourceMap, HygieneId, LabelPtr, LifetimePtr,
-        ListMark, Lists, MissingBodyItemKind, PatPtr, SelfParamPtr, StoreVisitor, TypePtr,
+        ListMark, Lists, MacroCallPtr, MissingBodyItemKind, PatPtr, SelfParamPtr, StoreVisitor,
+        TypePtr,
         body::Param,
         expander::Expander,
-        lower::generics::ImplTraitLowerFn,
         path::{BindingRow, GenericArg, GenericArgs, GenericArgsParentheses, Path, PathIdx, slot},
     },
     hir::{
@@ -68,18 +72,24 @@ use crate::{
     unstable_features::UnstableFeatures,
 };
 
-pub use self::path::hir_segment_to_ast_segment;
+pub use self::generics::ImplTraitLowering;
+pub use self::path::{hir_segment_to_ast_segment, hir_segment_to_ast_segment_view};
 
-/// Which of a body's two lowerings [`lower_body`] is.
+/// Which of a store's two lowerings this is: a body's ([`lower_body`]) or a signature's (the
+/// `lower_*` entry points).
 #[derive(Clone, Copy)]
-pub(super) enum BodyLowering<'a> {
-    /// The body alone, as [`Body::of`] keeps it: no source map, and the body's blocks are made
-    /// here.
+pub(crate) enum BodyLowering<'a> {
+    /// The store alone, as [`Body::of`] and each `*Signature::of` keep it: no source map, and
+    /// its blocks are made here.
     Body,
-    /// The body again, with its source map. A `BlockId` is a tracked struct of the query that
+    /// The store again, with its source map. A `BlockId` is a tracked struct of the query that
     /// makes it, so the blocks are not made again but taken from the first lowering's
     /// `block_scopes`, in the order they are made: the two lowerings agree on every id.
     SourceMap { blocks: &'a [BlockId] },
+    /// The store with its source map, its blocks made here: one lowering for both, where
+    /// no first lowering kept blocks to give (a signature its crate's image serves, whose
+    /// `with_source_map` is the reference lowering from syntax; `lower_generic_params`).
+    Whole,
 }
 
 pub(super) fn lower_body(
@@ -88,8 +98,8 @@ pub(super) fn lower_body(
     syntax_node: SyntaxNodePtr,
     current_file_id: HirFileId,
     module: ModuleId,
-    parameters: Option<ast::ParamList>,
-    body: Option<ast::Expr>,
+    parameters: Option<ast::ParamList<'_>>,
+    body: Option<ast::Expr<'_>>,
     is_async_fn: bool,
     is_gen_fn: bool,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
@@ -107,10 +117,7 @@ pub(super) fn lower_body(
     let mut params = vec![];
     let mut collector =
         ExprCollector::with_maps(db, module, current_file_id, LoweringMode::Analysis, maps);
-    match lowering {
-        BodyLowering::Body => collector.store.skip_source_map(),
-        BodyLowering::SourceMap { blocks } => collector.given_blocks = Some(blocks.iter()),
-    }
+    collector.set_lowering(lowering);
 
     let skip_body = AttrFlags::query(
         db,
@@ -128,7 +135,7 @@ pub(super) fn lower_body(
         collector.with_expr_root(|collector| {
             if let Some(param_list) = parameters {
                 if let Some(self_param_syn) =
-                    param_list.self_param().filter(|self_param| collector.check_cfg(self_param))
+                    param_list.self_param().filter(|&self_param| collector.check_cfg(self_param))
                 {
                     let is_mutable = self_param_syn.mut_token().is_some()
                         && self_param_syn.amp_token().is_none();
@@ -143,9 +150,9 @@ pub(super) fn lower_body(
                     );
                     self_param = Some(Param::new(binding_id));
                     source_map_self_param =
-                        Some(collector.expander.in_file(AstPtr::new(&self_param_syn)));
+                        Some(collector.expander.in_file(SelfParamPtr::of(self_param_syn)));
                 }
-                let count = param_list.params().filter(|it| collector.check_cfg(it)).count();
+                let count = param_list.params().filter(|&it| collector.check_cfg(it)).count();
                 // alloc: the parameter list, once per skipped body.
                 params = (0..count).map(|_| Param::new(collector.missing_pat())).collect();
             };
@@ -154,13 +161,13 @@ pub(super) fn lower_body(
         });
         return collector.finish_body(params, self_param, source_map_self_param);
     }
-    validate_required_body(db, owner, current_file_id, syntax_node, body.as_ref(), &mut collector);
+    validate_required_body(db, owner, current_file_id, syntax_node, body.is_some(), &mut collector);
     collector.with_expr_root(|collector| {
         if let DefWithBodyId::FunctionId(func) = owner
             && let Some(param_list) = parameters
         {
             if let Some(self_param_syn) =
-                param_list.self_param().filter(|it| collector.check_cfg(it))
+                param_list.self_param().filter(|&it| collector.check_cfg(it))
             {
                 let is_mutable =
                     self_param_syn.mut_token().is_some() && self_param_syn.amp_token().is_none();
@@ -175,7 +182,7 @@ pub(super) fn lower_body(
                 );
                 self_param = Some(Param::new(binding_id));
                 source_map_self_param =
-                    Some(collector.expander.in_file(AstPtr::new(&self_param_syn)));
+                    Some(collector.expander.in_file(SelfParamPtr::of(self_param_syn)));
             }
 
             let params_are_bare_idents = match func.loc(db).container {
@@ -185,7 +192,7 @@ pub(super) fn lower_body(
             };
 
             for param in param_list.params() {
-                if collector.check_cfg(&param) {
+                if collector.check_cfg(param) {
                     let param_pat = match param.pat() {
                         Some(pat) => {
                             if params_are_bare_idents {
@@ -228,10 +235,10 @@ fn validate_required_body(
     owner: DefWithBodyId,
     current_file_id: HirFileId,
     syntax_node: SyntaxNodePtr,
-    body: Option<&ast::Expr>,
+    has_body: bool,
     collector: &mut ExprCollector<'_>,
 ) {
-    if body.is_some() {
+    if has_body {
         return;
     }
     let diagnostic_kind = match owner {
@@ -260,65 +267,101 @@ fn validate_required_body(
 pub(crate) fn lower_type_ref(
     db: &Db,
     module: ModuleId,
-    type_ref: InFile<Option<ast::Type>>,
+    type_ref: InFile<Option<ast::Type<'_>>>,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
+    lowering: BodyLowering<'_>,
 ) -> (ExpressionStore, ExpressionStoreSourceMap, TypeRefId) {
     let mut expr_collector =
         ExprCollector::with_maps(db, module, type_ref.file_id, LoweringMode::Analysis, maps);
+    expr_collector.set_lowering(lowering);
     let type_ref =
-        expr_collector.lower_type_ref_opt(type_ref.value, &mut ExprCollector::impl_trait_allocator);
-    let (store, source_map) = expr_collector.store.finish();
+        expr_collector.lower_type_ref_opt(type_ref.value, &mut ImplTraitLowering::Opaque);
+    let (store, source_map) = expr_collector.finish_store();
     (store, source_map, type_ref)
 }
 
+/// [`lower_generic_params_view`] of handles, for the callers outside the crate not yet on views:
+/// the nodes are found as views under their own tree, so both give the same store.
 pub fn lower_generic_params(
     db: &Db,
     module: ModuleId,
     def: GenericDefId,
     file_id: HirFileId,
-    param_list: Option<ast::GenericParamList>,
-    where_clause: Option<ast::WhereClause>,
+    param_list: Option<tag::GenericParamList>,
+    where_clause: Option<tag::WhereClause>,
     mode: LoweringMode,
 ) -> (ExpressionStore, GenericParams, ExpressionStoreSourceMap) {
-    lower_generic_params_within(db, module, def, file_id, param_list, where_clause, mode, None)
+    let top = param_list
+        .as_ref()
+        .map(top_of)
+        .or_else(|| where_clause.as_ref().map(top_of));
+    let param_list = param_list.zip(top.as_ref()).map(|(it, top)| view_of(&it, top));
+    let where_clause = where_clause.zip(top.as_ref()).map(|(it, top)| view_of(&it, top));
+    lower_generic_params_view(db, module, def, file_id, param_list, where_clause, mode)
 }
 
-/// [`lower_generic_params`] of a part of `file_id` lowered as a tree of its own, with `maps`
+pub fn lower_generic_params_view(
+    db: &Db,
+    module: ModuleId,
+    def: GenericDefId,
+    file_id: HirFileId,
+    param_list: Option<ast::GenericParamList<'_>>,
+    where_clause: Option<ast::WhereClause<'_>>,
+    mode: LoweringMode,
+) -> (ExpressionStore, GenericParams, ExpressionStoreSourceMap) {
+    lower_generic_params_within(
+        db,
+        module,
+        def,
+        file_id,
+        param_list,
+        where_clause,
+        mode,
+        None,
+        BodyLowering::Whole,
+    )
+}
+
+/// [`lower_generic_params_view`] of a part of `file_id` lowered as a tree of its own, with `maps`
 /// that part's maps ([`ExprCollector::with_maps`]).
 pub(crate) fn lower_generic_params_within(
     db: &Db,
     module: ModuleId,
     def: GenericDefId,
     file_id: HirFileId,
-    param_list: Option<ast::GenericParamList>,
-    where_clause: Option<ast::WhereClause>,
+    param_list: Option<ast::GenericParamList<'_>>,
+    where_clause: Option<ast::WhereClause<'_>>,
     mode: LoweringMode,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
+    lowering: BodyLowering<'_>,
 ) -> (ExpressionStore, GenericParams, ExpressionStoreSourceMap) {
     let mut expr_collector = ExprCollector::with_maps(db, module, file_id, mode, maps);
+    expr_collector.set_lowering(lowering);
     let mut collector = generics::GenericParamsCollector::new(def);
     collector.lower(&mut expr_collector, param_list, where_clause);
     let params = collector.finish();
-    let (store, source_map) = expr_collector.store.finish();
+    let (store, source_map) = expr_collector.finish_store();
     (store, params, source_map)
 }
 
 pub(crate) fn lower_impl(
     db: &Db,
     module: ModuleId,
-    impl_syntax: InFile<ast::Impl>,
+    impl_syntax: InFile<ast::Impl<'_>>,
     impl_id: ImplId,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
+    lowering: BodyLowering<'_>,
 ) -> (ExpressionStore, ExpressionStoreSourceMap, TypeRefId, Option<TraitRef>, GenericParams) {
     let mut expr_collector =
         ExprCollector::with_maps(db, module, impl_syntax.file_id, LoweringMode::Analysis, maps);
+    expr_collector.set_lowering(lowering);
     let self_ty =
         expr_collector.lower_type_ref_opt_disallow_impl_trait(impl_syntax.value.self_ty());
-    let trait_ = impl_syntax.value.trait_().and_then(|it| match &it {
+    let trait_ = impl_syntax.value.trait_().and_then(|it| match it {
         ast::Type::PathType(path_type) => {
             let path = expr_collector
-                .lower_path_type(path_type, &mut ExprCollector::impl_trait_allocator)?;
-            Some(TraitRef { path: expr_collector.alloc_path(path, AstPtr::new(&it)) })
+                .lower_path_type(path_type, &mut ImplTraitLowering::Opaque)?;
+            Some(TraitRef { path: expr_collector.alloc_path(path, TypePtr::of(it)) })
         }
         _ => None,
     });
@@ -329,19 +372,21 @@ pub(crate) fn lower_impl(
         impl_syntax.value.where_clause(),
     );
     let params = collector.finish();
-    let (store, source_map) = expr_collector.store.finish();
+    let (store, source_map) = expr_collector.finish_store();
     (store, source_map, self_ty, trait_, params)
 }
 
 pub(crate) fn lower_trait(
     db: &Db,
     module: ModuleId,
-    trait_syntax: InFile<ast::Trait>,
+    trait_syntax: InFile<ast::Trait<'_>>,
     trait_id: TraitId,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
+    lowering: BodyLowering<'_>,
 ) -> (ExpressionStore, ExpressionStoreSourceMap, GenericParams) {
     let mut expr_collector =
         ExprCollector::with_maps(db, module, trait_syntax.file_id, LoweringMode::Analysis, maps);
+    expr_collector.set_lowering(lowering);
     let mut collector = generics::GenericParamsCollector::with_self_param(
         &mut expr_collector,
         trait_id.into(),
@@ -353,16 +398,17 @@ pub(crate) fn lower_trait(
         trait_syntax.value.where_clause(),
     );
     let params = collector.finish();
-    let (store, source_map) = expr_collector.store.finish();
+    let (store, source_map) = expr_collector.finish_store();
     (store, source_map, params)
 }
 
 pub(crate) fn lower_type_alias(
     db: &Db,
     container: ItemContainerId,
-    alias: InFile<ast::TypeAlias>,
+    alias: InFile<ast::TypeAlias<'_>>,
     type_alias_id: TypeAliasId,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
+    lowering: BodyLowering<'_>,
 ) -> (ExpressionStore, ExpressionStoreSourceMap, GenericParams, Box<[TypeBound]>, Option<TypeRefId>)
 {
     let mut expr_collector = ExprCollector::with_maps(
@@ -372,8 +418,9 @@ pub(crate) fn lower_type_alias(
         LoweringMode::Analysis,
         maps,
     );
+    expr_collector.set_lowering(lowering);
     let bounds_mark = expr_collector
-        .type_bounds_from_ast(alias.value.type_bound_list(), &mut ExprCollector::impl_trait_allocator);
+        .type_bounds_from_ast(alias.value.type_bound_list(), &mut ImplTraitLowering::Opaque);
     // alloc: the alias's bounds, one exact allocation per type alias, kept by its signature.
     let bounds: Box<[TypeBound]> = expr_collector.store.drain_bounds(bounds_mark).collect();
     let mut collector = generics::GenericParamsCollector::new(type_alias_id.into());
@@ -386,7 +433,7 @@ pub(crate) fn lower_type_alias(
     let type_ref = alias
         .value
         .ty()
-        .map(|ty| expr_collector.lower_type_ref(ty, &mut ExprCollector::impl_trait_allocator));
+        .map(|ty| expr_collector.lower_type_ref(ty, &mut ImplTraitLowering::Opaque));
     if alias.value.ty().is_none() {
         let diagnostic_kind = match container {
             ItemContainerId::ModuleId(_) => Some(MissingBodyItemKind::TypeAlias),
@@ -395,23 +442,24 @@ pub(crate) fn lower_type_alias(
             ItemContainerId::TraitId(_) => None,
         };
         if let Some(kind) = diagnostic_kind {
-            let node = InFile::new(alias.file_id, SyntaxNodePtr::new(alias.value.syntax()));
+            let node = InFile::new(alias.file_id, ast::ptr(alias.value.syntax()));
             expr_collector
                 .store
                 .diagnostics
                 .push(ExpressionStoreDiagnostics::MissingBody { node, kind });
         }
     };
-    let (store, source_map) = expr_collector.store.finish();
+    let (store, source_map) = expr_collector.finish_store();
     (store, source_map, params, bounds, type_ref)
 }
 
 pub(crate) fn lower_function(
     db: &Db,
     module: ModuleId,
-    fn_: InFile<ast::Fn>,
+    fn_: InFile<ast::Fn<'_>>,
     function_id: FunctionId,
     maps: Option<(&RealSpanMap, &AstIdMap)>,
+    lowering: BodyLowering<'_>,
 ) -> (
     ExpressionStore,
     ExpressionStoreSourceMap,
@@ -423,20 +471,21 @@ pub(crate) fn lower_function(
 ) {
     let mut expr_collector =
         ExprCollector::with_maps(db, module, fn_.file_id, LoweringMode::Analysis, maps);
+    expr_collector.set_lowering(lowering);
     let mut collector = generics::GenericParamsCollector::new(function_id.into());
     collector.lower(&mut expr_collector, fn_.value.generic_param_list(), fn_.value.where_clause());
     let params_mark = expr_collector.store.list_mark();
     let mut has_self_param = false;
     let mut has_variadic = false;
-    collector.collect_impl_trait(&mut expr_collector, |collector, mut impl_trait_lower_fn| {
+    collector.collect_impl_trait(&mut expr_collector, |collector, impl_trait_lower_fn| {
         collector.with_lifetime_bound_scope(LifetimeBoundScope::Argument, |collector| {
             if let Some(param_list) = fn_.value.param_list() {
                 if let Some(param) = param_list.self_param() {
-                    let enabled = collector.check_cfg(&param);
+                    let enabled = collector.check_cfg(param);
                     if enabled {
                         has_self_param = true;
                         let self_param_ty = match param.ty() {
-                            Some(ty) => collector.lower_type_ref(ty, &mut impl_trait_lower_fn),
+                            Some(ty) => collector.lower_type_ref(ty, impl_trait_lower_fn),
                             None => {
                                 let self_type = collector
                                     .store
@@ -469,7 +518,7 @@ pub(crate) fn lower_function(
                 // Every parameter's cfg is checked before any type is lowered.
                 let p = param_list
                     .params()
-                    .filter(|param| collector.check_cfg(param))
+                    .filter(|&param| collector.check_cfg(param))
                     .filter(|param| {
                         let is_variadic = param.dotdotdot_token().is_some();
                         has_variadic |= is_variadic;
@@ -478,7 +527,7 @@ pub(crate) fn lower_function(
                     .map(|param| param.ty())
                     .collect::<SmallVec<[_; 8]>>();
                 for p in p {
-                    let ty = collector.lower_type_ref_opt(p, &mut impl_trait_lower_fn);
+                    let ty = collector.lower_type_ref_opt(p, impl_trait_lower_fn);
                     collector.store.push_list_type(ty);
                 }
             }
@@ -488,7 +537,7 @@ pub(crate) fn lower_function(
     expr_collector.store.truncate_to(params_mark);
     let return_type = fn_.value.ret_type().map(|ret_type| {
         expr_collector.with_lifetime_bound_scope(LifetimeBoundScope::Return, |this| {
-            this.lower_type_ref_opt(ret_type.ty(), &mut ExprCollector::impl_trait_allocator)
+            this.lower_type_ref_opt(ret_type.ty(), &mut ImplTraitLowering::Opaque)
         })
     });
     collector.update_to_late_bound_lifetimes(&expr_collector.named_lifetime_store);
@@ -518,7 +567,7 @@ pub(crate) fn lower_function(
     } else {
         return_type
     };
-    let (store, source_map) = expr_collector.store.finish();
+    let (store, source_map) = expr_collector.finish_store();
     (
         store,
         source_map,
@@ -556,25 +605,12 @@ pub struct ExprCollector<'db> {
 
     current_try_block: Option<TryBlock>,
 
-    label_ribs: Vec<LabelRib>,
-    unowned_bindings: Vec<BindingId>,
-
     awaitable_context: Option<Awaitable>,
     krate: base_db::Crate,
 
     name_generator_index: usize,
 
-    // Stacks for the lists of a path, its generic arguments and a `FnType` while they are
-    // built, like the builder's node lists: a nested one pushes and pops above, and the finished
-    // list is moved into the store's path columns (a `FnType`'s out in one exact allocation).
-    path_segments: Vec<Name>,
-    /// The slot word of each segment ([`slot`]).
-    path_generic_args: Vec<u32>,
-    generic_args: Vec<GenericArg>,
-    assoc_bindings: Vec<BindingRow>,
-    fn_params: Vec<(Option<Name>, TypeRefId)>,
-    /// A coroutine closure's parameters while its body is desugared.
-    closure_params: Vec<Param<PatId>>,
+    stacks: Stacks,
     /// The blocks of the body's first lowering not yet taken ([`BodyLowering::SourceMap`]).
     given_blocks: Option<std::slice::Iter<'db, BlockId>>,
 }
@@ -704,6 +740,95 @@ impl BindingList {
     }
 }
 
+/// A collector's stacks, kept per thread between collectors as the builder's scratch is, so a
+/// collector made to lower one path (an IDE lookup) allocates nothing once they are warm.
+#[derive(Default)]
+struct Stacks {
+    label_ribs: Vec<LabelRib>,
+    unowned_bindings: Vec<BindingId>,
+    // The lists of a path, its generic arguments and a `FnType` while they are built, like the
+    // builder's node lists: a nested one pushes and pops above, and the finished list is moved
+    // into the store's path columns (a `FnType`'s out in one exact allocation).
+    path_segments: Vec<Name>,
+    /// The slot word of each segment ([`slot`]).
+    path_generic_args: Vec<u32>,
+    generic_args: Vec<GenericArg>,
+    assoc_bindings: Vec<BindingRow>,
+    fn_params: Vec<(Option<Name>, TypeRefId)>,
+    /// A coroutine closure's parameters while its body is desugared.
+    closure_params: Vec<Param<PatId>>,
+}
+
+/// The stack sets a thread keeps, and the elements above which a set is dropped instead of
+/// kept, so that one huge body doesn't pin its memory.
+const STACK_SETS: usize = 4;
+const STACK_ELEMENTS: usize = 1 << 16;
+
+thread_local! {
+    /// This thread's spare stacks: a collector can run a query that lowers another store on
+    /// the same thread, which takes the next set (or a fresh one).
+    // alloc: const-empty, once per thread.
+    static STACKS: RefCell<Vec<Stacks>> = const { RefCell::new(Vec::new()) };
+}
+
+impl Stacks {
+    fn take() -> Stacks {
+        STACKS.try_with(|pool| pool.borrow_mut().pop()).ok().flatten().unwrap_or_default()
+    }
+
+    fn capacity(&self) -> usize {
+        self.label_ribs.capacity()
+            + self.unowned_bindings.capacity()
+            + self.path_segments.capacity()
+            + self.path_generic_args.capacity()
+            + self.generic_args.capacity()
+            + self.assoc_bindings.capacity()
+            + self.fn_params.capacity()
+            + self.closure_params.capacity()
+    }
+
+    fn clear(&mut self) {
+        let Stacks {
+            label_ribs,
+            unowned_bindings,
+            path_segments,
+            path_generic_args,
+            generic_args,
+            assoc_bindings,
+            fn_params,
+            closure_params,
+        } = self;
+        label_ribs.clear();
+        unowned_bindings.clear();
+        path_segments.clear();
+        path_generic_args.clear();
+        generic_args.clear();
+        assoc_bindings.clear();
+        fn_params.clear();
+        closure_params.clear();
+    }
+}
+
+impl Drop for Stacks {
+    /// Empties the set and keeps it for the next collector on this thread, unless it never grew,
+    /// is over [`STACK_ELEMENTS`], the pool is full or the thread is exiting. The set is moved
+    /// into the pool only from inside the borrow and nothing is dropped there, so this never
+    /// runs again under it.
+    fn drop(&mut self) {
+        let held = self.capacity();
+        if held == 0 || held > STACK_ELEMENTS {
+            return;
+        }
+        self.clear();
+        let _exiting = STACKS.try_with(|pool| {
+            let mut pool = pool.borrow_mut();
+            if pool.len() < STACK_SETS {
+                pool.push(mem::take(self));
+            }
+        });
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct NamedLifetimeStore {
     lifetime_bound_scope: Option<LifetimeBoundScope>,
@@ -785,10 +910,6 @@ impl<'db> ExprCollector<'db> {
             expander,
             current_try_block: None,
             is_lowering_coroutine: false,
-            // alloc: an empty stack, once per collector.
-            label_ribs: Vec::new(),
-            // alloc: an empty stack, once per collector.
-            unowned_bindings: Vec::new(),
             awaitable_context: None,
             current_block_legacy_macro_defs_count: FxHashMap::default(),
             outer_impl_trait: false,
@@ -796,22 +917,30 @@ impl<'db> ExprCollector<'db> {
             name_generator_index: 0,
             named_lifetime_store: NamedLifetimeStore::default(),
             for_type_binder: None,
-            // alloc: an empty stack, once per collector.
-            path_segments: Vec::new(),
-            // alloc: an empty stack, once per collector.
-            path_generic_args: Vec::new(),
-            // alloc: an empty stack, once per collector.
-            generic_args: Vec::new(),
-            // alloc: an empty stack, once per collector.
-            assoc_bindings: Vec::new(),
-            // alloc: an empty stack, once per collector.
-            fn_params: Vec::new(),
-            // alloc: an empty stack, once per collector.
-            closure_params: Vec::new(),
+            stacks: Stacks::take(),
             given_blocks: None,
         };
         result.store.inference_roots = Some(SmallVec::new());
         result
+    }
+
+    /// Lowers as `lowering` says: without the source map for [`BodyLowering::Body`], with it
+    /// and the first lowering's blocks for [`BodyLowering::SourceMap`], with it and blocks
+    /// made here for [`BodyLowering::Whole`] (what `with_maps` sets up).
+    pub(crate) fn set_lowering(&mut self, lowering: BodyLowering<'db>) {
+        match lowering {
+            BodyLowering::Body => self.store.skip_source_map(),
+            BodyLowering::SourceMap { blocks } => self.given_blocks = Some(blocks.iter()),
+            BodyLowering::Whole => {}
+        }
+    }
+
+    /// The store and its source map, checking that a lowering given blocks made all of them.
+    pub(crate) fn finish_store(self) -> (ExpressionStore, ExpressionStoreSourceMap) {
+        if let Some(rest) = &self.given_blocks {
+            assert_eq!(rest.len(), 0, "the store made fewer blocks than its first lowering");
+        }
+        self.store.finish()
     }
 
     /// The lowered body, and its source map when it was recorded.
@@ -850,7 +979,7 @@ impl<'db> ExprCollector<'db> {
 
     pub(in crate::expr_store) fn lower_lifetime_ref(
         &mut self,
-        lifetime: ast::Lifetime,
+        lifetime: ast::Lifetime<'_>,
     ) -> LifetimeRefId {
         // FIXME: Keyword check?
         let lifetime_ref = match lifetime.text() {
@@ -859,12 +988,12 @@ impl<'db> ExprCollector<'db> {
             "'_" => LifetimeRef::Placeholder,
             text => LifetimeRef::Named(Name::new_lifetime(text)),
         };
-        self.alloc_lifetime_ref(lifetime_ref, AstPtr::new(&lifetime))
+        self.alloc_lifetime_ref(lifetime_ref, LifetimePtr::of(lifetime))
     }
 
     pub(in crate::expr_store) fn lower_lifetime_ref_opt(
         &mut self,
-        lifetime: Option<ast::Lifetime>,
+        lifetime: Option<ast::Lifetime<'_>>,
     ) -> LifetimeRefId {
         match lifetime {
             Some(lifetime) => self.lower_lifetime_ref(lifetime),
@@ -875,11 +1004,11 @@ impl<'db> ExprCollector<'db> {
     /// Converts an `ast::TypeRef` to a `hir::TypeRef`.
     pub(in crate::expr_store) fn lower_type_ref(
         &mut self,
-        node: ast::Type,
-        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+        node: ast::Type<'_>,
+        impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> TypeRefId {
-        let ptr = AstPtr::new(&node);
-        match &node {
+        let ptr = TypePtr::of(node);
+        match node {
             ast::Type::ParenType(inner) => self.lower_type_ref_opt(inner.ty(), impl_trait_lower_fn),
             ast::Type::TupleType(inner) => {
                 let mark = self.store.list_mark();
@@ -894,7 +1023,7 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Type::NeverType(..) => self.alloc_type_ref(TypeRef::Never, ptr),
             ast::Type::PathType(inner) => {
-                match inner.path().and_then(|it| self.lower_path(it, impl_trait_lower_fn)) {
+                match inner.path().and_then(|it| self.lower_path_view(it, impl_trait_lower_fn)) {
                     Some(path) => self.alloc_type_ref_path(path, ptr),
                     None => self.alloc_type_ref(TypeRef::Error, ptr),
                 }
@@ -933,7 +1062,7 @@ impl<'db> ExprCollector<'db> {
                     .map(|it| self.lower_type_ref(it, impl_trait_lower_fn))
                     .unwrap_or_else(|| self.alloc_type_ref_desugared(TypeRef::UNIT));
                 let mut is_varargs = false;
-                let params_base = self.fn_params.len();
+                let params_base = self.stacks.fn_params.len();
                 if let Some(pl) = inner.param_list() {
                     if let Some(param) = pl.params().last() {
                         is_varargs = param.dotdotdot_token().is_some();
@@ -947,24 +1076,24 @@ impl<'db> ExprCollector<'db> {
                             ),
                             _ => None,
                         };
-                        self.fn_params.push((name, type_ref));
+                        self.stacks.fn_params.push((name, type_ref));
                     }
                 }
-                fn lower_abi(abi: ast::Abi) -> ExternAbi {
+                fn lower_abi(abi: ast::Abi<'_>) -> ExternAbi {
                     abi.abi_string()
                         .and_then(|abi| abi.text_without_quotes().parse().ok())
                         .unwrap_or(ExternAbi::FALLBACK)
                 }
 
                 let abi = inner.abi().map(lower_abi).unwrap_or(ExternAbi::Rust);
-                self.fn_params.push((None, ret_ty));
+                self.stacks.fn_params.push((None, ret_ty));
 
                 let fn_ = FnType {
                     is_varargs,
                     is_unsafe: inner.unsafe_token().is_some(),
                     abi,
                     // alloc: the fn type's own stored list, one exact allocation per `fn` type.
-                    params: self.fn_params.drain(params_base..).collect(),
+                    params: self.stacks.fn_params.drain(params_base..).collect(),
                     binder,
                 };
                 let id = self.store.alloc_fn_type(fn_);
@@ -994,7 +1123,7 @@ impl<'db> ExprCollector<'db> {
                                 )
                             },
                         );
-                        impl_trait_lower_fn(this, ptr, type_bounds)
+                        impl_trait_lower_fn.lower(this, ptr, type_bounds)
                     })
                 }
             }
@@ -1012,7 +1141,7 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Type::MacroType(mt) => match mt.macro_call() {
                 Some(mcall) => {
-                    let macro_ptr = AstPtr::new(&mcall);
+                    let macro_ptr = AstPtr::<tag::MacroCall>::of(mcall);
                     let src = self.expander.in_file(ptr);
                     let id = self.collect_macro_call(mcall, macro_ptr, true, |this, expansion| {
                         this.lower_type_ref_opt(expansion, impl_trait_lower_fn)
@@ -1027,14 +1156,14 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
-    pub(crate) fn lower_type_ref_disallow_impl_trait(&mut self, node: ast::Type) -> TypeRefId {
-        self.lower_type_ref(node, &mut Self::impl_trait_error_allocator)
+    pub(crate) fn lower_type_ref_disallow_impl_trait(&mut self, node: ast::Type<'_>) -> TypeRefId {
+        self.lower_type_ref(node, &mut ImplTraitLowering::Error)
     }
 
     pub(crate) fn lower_type_ref_opt(
         &mut self,
-        node: Option<ast::Type>,
-        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+        node: Option<ast::Type<'_>>,
+        impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> TypeRefId {
         match node {
             Some(node) => self.lower_type_ref(node, impl_trait_lower_fn),
@@ -1044,9 +1173,9 @@ impl<'db> ExprCollector<'db> {
 
     pub(crate) fn lower_type_ref_opt_disallow_impl_trait(
         &mut self,
-        node: Option<ast::Type>,
+        node: Option<ast::Type<'_>>,
     ) -> TypeRefId {
-        self.lower_type_ref_opt(node, &mut Self::impl_trait_error_allocator)
+        self.lower_type_ref_opt(node, &mut ImplTraitLowering::Error)
     }
 
     fn alloc_type_ref(&mut self, type_ref: TypeRef<'_>, node: TypePtr) -> TypeRefId {
@@ -1111,12 +1240,23 @@ impl<'db> ExprCollector<'db> {
         self.store.alloc_type_ref(TypeRef::Error)
     }
 
+    /// [`Self::lower_path_view`] of a handle, for the callers outside the crate not yet on views:
+    /// the path is found as a view under its own tree, so both give the same path.
     pub fn lower_path(
         &mut self,
-        ast: ast::Path,
-        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+        path: tag::Path,
+        impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> Option<PathIdx> {
-        super::lower::path::lower_path(self, ast, impl_trait_lower_fn)
+        let top = top_of(&path);
+        self.lower_path_view(view_of(&path, &top), impl_trait_lower_fn)
+    }
+
+    pub fn lower_path_view(
+        &mut self,
+        path: ast::Path<'_>,
+        impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
+    ) -> Option<PathIdx> {
+        super::lower::path::lower_path(self, path, impl_trait_lower_fn)
     }
 
     fn with_outer_impl_trait_scope<R>(
@@ -1128,22 +1268,6 @@ impl<'db> ExprCollector<'db> {
         let result = f(self);
         self.outer_impl_trait = old;
         result
-    }
-
-    pub fn impl_trait_error_allocator(
-        ec: &mut ExprCollector<'_>,
-        ptr: TypePtr,
-        bounds: ListMark,
-    ) -> TypeRefId {
-        ec.store.truncate_to(bounds);
-        ec.alloc_type_ref(TypeRef::Error, ptr)
-    }
-
-    fn impl_trait_allocator(ec: &mut ExprCollector<'_>, ptr: TypePtr, bounds: ListMark) -> TypeRefId {
-        let id = ec.with_lists(bounds, |ec, lists| {
-            ec.store.alloc_type_ref(TypeRef::ImplTrait(lists.bounds_since(bounds)))
-        });
-        ec.map_type_ref(id, ptr, false)
     }
 
     fn alloc_path(&mut self, path: PathIdx, node: TypePtr) -> PathId {
@@ -1325,7 +1449,7 @@ impl<'db> ExprCollector<'db> {
         &mut self,
         self_param: &mut Option<Param<BindingId>>,
         params: &mut [Param<PatId>],
-        expr: Option<ast::Expr>,
+        expr: Option<ast::Expr<'_>>,
         awaitable: Awaitable,
         is_async_fn: bool,
         is_gen_fn: bool,
@@ -1374,8 +1498,8 @@ impl<'db> ExprCollector<'db> {
 
     fn type_bounds_from_ast(
         &mut self,
-        type_bounds_opt: Option<ast::TypeBoundList>,
-        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+        type_bounds_opt: Option<ast::TypeBoundList<'_>>,
+        impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> ListMark {
         let mark = self.store.list_mark();
         for bound in type_bounds_opt.iter().flat_map(|it| it.bounds()) {
@@ -1387,18 +1511,18 @@ impl<'db> ExprCollector<'db> {
 
     fn lower_path_type(
         &mut self,
-        path_type: &ast::PathType,
-        impl_trait_lower_fn: ImplTraitLowerFn<'_>,
+        path_type: ast::PathType<'_>,
+        impl_trait_lower_fn: &mut ImplTraitLowering<'_>,
     ) -> Option<PathIdx> {
-        let path = self.lower_path(path_type.path()?, impl_trait_lower_fn)?;
+        let path = self.lower_path_view(path_type.path()?, impl_trait_lower_fn)?;
         Some(path)
     }
 
-    fn lower_for_binder_opt(&mut self, binder: Option<ForBinder>) -> ThinVec<Name> {
+    fn lower_for_binder_opt(&mut self, binder: Option<ForBinder<'_>>) -> ThinVec<Name> {
         binder.map(|b| self.lower_for_binder(b)).unwrap_or_default()
     }
 
-    fn lower_for_binder(&mut self, binder: ForBinder) -> ThinVec<Name> {
+    fn lower_for_binder(&mut self, binder: ForBinder<'_>) -> ThinVec<Name> {
         match binder.generic_param_list() {
             Some(gpl) => gpl
                 .lifetime_params()
@@ -1409,7 +1533,7 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
-    fn lower_const_arg_opt(&mut self, arg: Option<ast::ConstArg>) -> ConstRef {
+    fn lower_const_arg_opt(&mut self, arg: Option<ast::ConstArg<'_>>) -> ConstRef {
         ConstRef {
             expr: self.with_fresh_binding_expr_root(|this| {
                 this.collect_expr_opt(arg.and_then(|arg| arg.expr()))
@@ -1417,17 +1541,20 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
-    pub fn lower_const_arg(&mut self, arg: ast::ConstArg) -> ConstRef {
+    pub fn lower_const_arg(&mut self, arg: ast::ConstArg<'_>) -> ConstRef {
         ConstRef {
             expr: self.with_fresh_binding_expr_root(|this| this.collect_expr_opt(arg.expr())),
         }
     }
 
-    fn collect_expr(&mut self, expr: ast::Expr) -> ExprId {
+    fn collect_expr(&mut self, expr: ast::Expr<'_>) -> ExprId {
         self.maybe_collect_expr(expr).unwrap_or_else(|| self.missing_expr())
     }
 
-    pub(in crate::expr_store) fn collect_expr_opt(&mut self, expr: Option<ast::Expr>) -> ExprId {
+    pub(in crate::expr_store) fn collect_expr_opt(
+        &mut self,
+        expr: Option<ast::Expr<'_>>,
+    ) -> ExprId {
         match expr {
             Some(expr) => self.collect_expr(expr),
             None => self.missing_expr(),
@@ -1435,16 +1562,16 @@ impl<'db> ExprCollector<'db> {
     }
 
     /// Returns `None` if and only if the expression is `#[cfg]`d out.
-    fn maybe_collect_expr(&mut self, expr: ast::Expr) -> Option<ExprId> {
+    fn maybe_collect_expr(&mut self, expr: ast::Expr<'_>) -> Option<ExprId> {
         // An expression is lowered within the one it is in: rustc's 5,204-arm `else if`.
         stdx::ensure_sufficient_stack(|| self.maybe_collect_expr_here(expr))
     }
 
-    fn maybe_collect_expr_here(&mut self, expr: ast::Expr) -> Option<ExprId> {
-        if !self.check_cfg(&expr) {
+    fn maybe_collect_expr_here(&mut self, expr: ast::Expr<'_>) -> Option<ExprId> {
+        if !self.check_cfg(expr) {
             return None;
         }
-        let syntax_ptr = AstPtr::new(&expr);
+        let syntax_ptr = ExprPtr::of(expr);
 
         // FIXME: Move some of these arms out into separate methods for clarity
         Some(match expr {
@@ -1584,7 +1711,7 @@ impl<'db> ExprCollector<'db> {
                 let mark = self.collect_args(e.arg_list());
                 let method_name = e.name_ref().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
                 let generic_args = e.generic_arg_list().and_then(|it| {
-                    self.lower_generic_args(it, &mut Self::impl_trait_error_allocator)
+                    self.lower_generic_args(it, &mut ImplTraitLowering::Error)
                 });
                 let id = self.with_lists(mark, |this, lists| {
                     this.store.alloc_method_call(
@@ -1600,7 +1727,7 @@ impl<'db> ExprCollector<'db> {
                 let expr = self.collect_expr_opt(e.expr());
                 let mark = self.store.list_mark();
                 for arm in e.match_arm_list().iter().flat_map(|it| it.arms()) {
-                    if self.check_cfg(&arm) {
+                    if self.check_cfg(arm) {
                         let arm = MatchArm {
                             pat: self.collect_pat_top(arm.pat()),
                             expr: self.collect_expr_opt(arm.expr()),
@@ -1676,14 +1803,14 @@ impl<'db> ExprCollector<'db> {
             ast::Expr::RecordExpr(e) => {
                 let path = e
                     .path()
-                    .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
+                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let Some(path) = path else {
                     return Some(self.missing_expr());
                 };
                 let mark = self.store.list_mark();
                 let spread = if let Some(nfl) = e.record_expr_field_list() {
                     for field in nfl.fields() {
-                        if !self.check_cfg(&field) {
+                        if !self.check_cfg(field) {
                             continue;
                         }
 
@@ -1695,7 +1822,7 @@ impl<'db> ExprCollector<'db> {
                             None => self.missing_expr(),
                         };
                         if self.store.record {
-                            let src = self.expander.in_file(AstPtr::new(&field));
+                            let src = self.expander.in_file(AstPtr::<tag::RecordExprField>::of(field));
                             self.store.field_map_back.push((expr, src));
                         }
                         self.store.push_list_record_field(RecordLitField { name, expr });
@@ -1727,7 +1854,7 @@ impl<'db> ExprCollector<'db> {
                 let expr = self.collect_expr_opt(e.expr());
                 if let Awaitable::No(location) = self.is_lowering_awaitable_block() {
                     self.store.diagnostics.push(ExpressionStoreDiagnostics::AwaitOutsideOfAsync {
-                        node: self.expander.in_file(AstPtr::new(&e)),
+                        node: self.expander.in_file(AstPtr::<tag::AwaitExpr>::of(e)),
                         // alloc: a diagnostic, the error path.
                         location: location.to_string(),
                     });
@@ -1767,7 +1894,7 @@ impl<'db> ExprCollector<'db> {
                     // For coroutine closures, the body, aka. the coroutine is the bindings owner, and not the closure.
                     if let Some(pl) = e.param_list() {
                         for param in pl.params() {
-                            if !this.check_cfg(&param) {
+                            if !this.check_cfg(param) {
                                 continue;
                             }
 
@@ -1808,7 +1935,7 @@ impl<'db> ExprCollector<'db> {
                     let closure_kind = if let Some(kind) = kind {
                         // It's important that this expr is allocated immediately before the closure.
                         // We rely on it for `coroutine_for_closure()`.
-                        let mut params = mem::take(&mut this.closure_params);
+                        let mut params = mem::take(&mut this.stacks.closure_params);
                         let params_base = params.len();
                         params.extend(this.store.pats_since(mark).iter().copied().map(Param::new));
                         body = this.lower_coroutine_body_with_moved_arguments(
@@ -1826,7 +1953,7 @@ impl<'db> ExprCollector<'db> {
                             .set_from(params[params_base..].iter().map(|arg| arg.formal));
                         this.store.put_lists(lists, top);
                         params.truncate(params_base);
-                        this.closure_params = params;
+                        this.stacks.closure_params = params;
                         is_coroutine_closure = true;
 
                         ClosureKind::CoroutineClosure(kind)
@@ -1858,7 +1985,7 @@ impl<'db> ExprCollector<'db> {
                             syntax_ptr,
                         )
                     });
-                    let inherits = |attr: ast::Attr| {
+                    let inherits = |attr: ast::Attr<'_>| {
                         attr.simple_name().is_some_and(|it| it == "rustc_inherit_overflow_checks")
                     };
                     if ast::HasAttrs::attrs(&e).any(inherits) {
@@ -1945,7 +2072,7 @@ impl<'db> ExprCollector<'db> {
             }
 
             ast::Expr::Literal(e) => {
-                let literal = self.module_path_literal(&e).unwrap_or_else(|| e.kind().into());
+                let literal = self.module_path_literal(e).unwrap_or_else(|| e.kind().into());
                 let id = self.store.alloc_literal_expr(literal);
                 self.map_expr(id, syntax_ptr)
             }
@@ -1957,7 +2084,7 @@ impl<'db> ExprCollector<'db> {
             ast::Expr::RangeExpr(e) => self.collect_range_expr(e, syntax_ptr),
             ast::Expr::MacroExpr(e) => {
                 let e = e.macro_call()?;
-                let macro_ptr = AstPtr::new(&e);
+                let macro_ptr = AstPtr::<tag::MacroCall>::of(e);
                 let id = self.collect_macro_call(e, macro_ptr, true, |this, expansion| {
                     expansion.map(|it| this.maybe_collect_expr(it))
                 });
@@ -2010,7 +2137,7 @@ impl<'db> ExprCollector<'db> {
         })
     }
 
-    fn collect_range_expr(&mut self, e: ast::RangeExpr, syntax_ptr: AstPtr<ast::Expr>) -> ExprId {
+    fn collect_range_expr(&mut self, e: ast::RangeExpr<'_>, syntax_ptr: ExprPtr) -> ExprId {
         let lhs = e.start().map(|lhs| self.collect_expr(lhs));
         let rhs = e.end().map(|rhs| self.collect_expr(rhs));
         let kind = e.op_kind().unwrap_or(ast::RangeOp::Exclusive);
@@ -2088,7 +2215,7 @@ impl<'db> ExprCollector<'db> {
 
     fn collect_inclusive_range(
         &mut self,
-        syntax_ptr: AstPtr<ast::Expr>,
+        syntax_ptr: ExprPtr,
         lang_items: &LangItems,
         lhs: ExprId,
         rhs: ExprId,
@@ -2098,9 +2225,9 @@ impl<'db> ExprCollector<'db> {
         self.alloc_expr(Expr::Call { callee: fn_path, args: &[lhs, rhs] }, syntax_ptr)
     }
 
-    fn collect_expr_path(&mut self, e: ast::PathExpr) -> Option<(PathIdx, HygieneId)> {
+    fn collect_expr_path(&mut self, e: ast::PathExpr<'_>) -> Option<(PathIdx, HygieneId)> {
         e.path().and_then(|path| {
-            let path = self.lower_path(path, &mut Self::impl_trait_error_allocator)?;
+            let path = self.lower_path_view(path, &mut ImplTraitLowering::Error)?;
             let lowered = self.store.path_at(path);
             // Need to enable `mod_path.len() < 1` for `self`. A longer path takes its hygiene
             // too, whatever it starts with, for the items a `macro` names where it is defined.
@@ -2146,16 +2273,16 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
-    fn collect_expr_as_pat_opt(&mut self, expr: Option<ast::Expr>) -> PatId {
+    fn collect_expr_as_pat_opt(&mut self, expr: Option<ast::Expr<'_>>) -> PatId {
         match expr {
             Some(expr) => self.collect_expr_as_pat(expr),
             _ => self.missing_pat(),
         }
     }
 
-    fn collect_expr_as_pat(&mut self, expr: ast::Expr) -> PatId {
-        self.maybe_collect_expr_as_pat(&expr).unwrap_or_else(|| {
-            let src = self.expander.in_file(AstPtr::new(&expr).wrap_left());
+    fn collect_expr_as_pat(&mut self, expr: ast::Expr<'_>) -> PatId {
+        self.maybe_collect_expr_as_pat(expr).unwrap_or_else(|| {
+            let src = self.expander.in_file(ExprPtr::of(expr).wrap_left());
             let expr = self.collect_expr(expr);
             // Do not use `alloc_pat_from_expr()` here, it will override the entry in `expr_map`.
             let id = self.store.alloc_pat(Pat::Expr(expr));
@@ -2166,11 +2293,11 @@ impl<'db> ExprCollector<'db> {
         })
     }
 
-    fn maybe_collect_expr_as_pat(&mut self, expr: &ast::Expr) -> Option<PatId> {
+    fn maybe_collect_expr_as_pat(&mut self, expr: ast::Expr<'_>) -> Option<PatId> {
         if !self.check_cfg(expr) {
             return None;
         }
-        let syntax_ptr = AstPtr::new(expr);
+        let syntax_ptr = ExprPtr::of(expr);
 
         let result = match expr {
             ast::Expr::UnderscoreExpr(_) => self.alloc_pat_from_expr(Pat::Wild, syntax_ptr),
@@ -2184,7 +2311,7 @@ impl<'db> ExprCollector<'db> {
                         syntax_ptr,
                     ));
                 }
-                return e.expr().and_then(|expr| self.maybe_collect_expr_as_pat(&expr));
+                return e.expr().and_then(|expr| self.maybe_collect_expr_as_pat(expr));
             }
             ast::Expr::TupleExpr(e) => {
                 let (ellipsis, mark) = collect_tuple(self, e.fields());
@@ -2204,11 +2331,10 @@ impl<'db> ExprCollector<'db> {
                 let mut elements = e.exprs();
                 let mut rest_ptr = None;
                 for elem in elements.by_ref() {
-                    // clone: a syntax node's count bump; the rest's pointer is made from it after.
-                    match collect_possibly_rest(self, elem.clone()) {
+                    match collect_possibly_rest(self, elem) {
                         Either::Left(elem) => self.store.push_list_pat(elem),
                         Either::Right(()) => {
-                            rest_ptr = Some(AstPtr::new(&elem));
+                            rest_ptr = Some(ExprPtr::of(elem));
                             break;
                         }
                     }
@@ -2228,7 +2354,7 @@ impl<'db> ExprCollector<'db> {
                 let path = collect_path(self, e.expr()?)?;
                 let path = path
                     .path()
-                    .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
+                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let Some(path) = path else {
                     return Some(self.missing_pat());
                 };
@@ -2240,8 +2366,7 @@ impl<'db> ExprCollector<'db> {
                 self.map_pat_from_expr(id, syntax_ptr)
             }
             ast::Expr::PathExpr(e) => {
-                // clone: a syntax node's count bump, once per destructuring-assignment path.
-                let (path, hygiene) = self.collect_expr_path(e.clone())?;
+                let (path, hygiene) = self.collect_expr_path(e)?;
                 let mod_path =
                     self.store.path_at(path).mod_path().expect("should not lower to lang path");
                 if self.path_is_destructuring_assignment(mod_path) {
@@ -2257,8 +2382,8 @@ impl<'db> ExprCollector<'db> {
             }
             ast::Expr::MacroExpr(e) => {
                 let e = e.macro_call()?;
-                let macro_ptr = AstPtr::new(&e);
-                let src = self.expander.in_file(AstPtr::new(expr));
+                let macro_ptr = AstPtr::<tag::MacroCall>::of(e);
+                let src = self.expander.in_file(ExprPtr::of(expr));
                 let id = self.collect_macro_call(e, macro_ptr, true, |this, expansion| {
                     this.collect_expr_as_pat_opt(expansion)
                 });
@@ -2270,7 +2395,7 @@ impl<'db> ExprCollector<'db> {
             ast::Expr::RecordExpr(e) => {
                 let path = e
                     .path()
-                    .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
+                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let Some(path) = path else {
                     return Some(self.missing_pat());
                 };
@@ -2279,13 +2404,13 @@ impl<'db> ExprCollector<'db> {
                 if let Some(spread) = record_field_list.spread() {
                     self.store.diagnostics.push(
                         ExpressionStoreDiagnostics::FruInDestructuringAssignment {
-                            node: self.expander.in_file(AstPtr::new(&spread)),
+                            node: self.expander.in_file(ExprPtr::of(spread)),
                         },
                     );
                 }
                 let mark = self.store.list_mark();
                 for f in record_field_list.fields() {
-                    if !self.check_cfg(&f) {
+                    if !self.check_cfg(f) {
                         continue;
                     }
                     let Some(field_expr) = f.expr() else { continue };
@@ -2293,7 +2418,8 @@ impl<'db> ExprCollector<'db> {
                     let Some(name) = f.field_name() else { continue };
                     let name = name.as_name();
                     if self.store.record {
-                        let src = self.expander.in_file(AstPtr::new(&f).wrap_left());
+                        let src =
+                            self.expander.in_file(AstPtr::<tag::RecordExprField>::of(f).wrap_left());
                         self.store.pat_field_map_back.push((pat, src));
                     }
                     self.store.push_list_field_pat(RecordFieldPat { name, pat });
@@ -2307,13 +2433,17 @@ impl<'db> ExprCollector<'db> {
         };
         return Some(result);
 
-        fn collect_path(this: &mut ExprCollector<'_>, expr: ast::Expr) -> Option<ast::PathExpr> {
+        /// The path is of `expr`'s tree or of an expansion's, so it lives as long as both (`'v`).
+        fn collect_path<'db: 'v, 't: 'v, 'v>(
+            this: &mut ExprCollector<'db>,
+            expr: ast::Expr<'t>,
+        ) -> Option<ast::PathExpr<'v>> {
             match expr {
                 ast::Expr::PathExpr(e) => Some(e),
                 ast::Expr::MacroExpr(mac) => {
                     let call = mac.macro_call()?;
                     {
-                        let macro_ptr = AstPtr::new(&call);
+                        let macro_ptr = AstPtr::<tag::MacroCall>::of(call);
                         this.collect_macro_call(call, macro_ptr, true, |this, expanded_path| {
                             collect_path(this, expanded_path?)
                         })
@@ -2325,13 +2455,13 @@ impl<'db> ExprCollector<'db> {
 
         fn collect_possibly_rest(
             this: &mut ExprCollector<'_>,
-            expr: ast::Expr,
+            expr: ast::Expr<'_>,
         ) -> Either<PatId, ()> {
-            match &expr {
+            match expr {
                 ast::Expr::RangeExpr(e) if e.is_range_full() => Either::Right(()),
                 ast::Expr::MacroExpr(mac) => match mac.macro_call() {
                     Some(call) => {
-                        let macro_ptr = AstPtr::new(&call);
+                        let macro_ptr = AstPtr::<tag::MacroCall>::of(call);
                         let pat = this.collect_macro_call(
                             call,
                             macro_ptr,
@@ -2344,13 +2474,13 @@ impl<'db> ExprCollector<'db> {
                         if let Either::Left(pat) = pat
                             && this.store.record
                         {
-                            let src = this.expander.in_file(AstPtr::new(&expr).wrap_left());
+                            let src = this.expander.in_file(ExprPtr::of(expr).wrap_left());
                             this.store.pat_map_back.insert(pat, src);
                         }
                         pat
                     }
                     None => {
-                        let ptr = AstPtr::new(&expr);
+                        let ptr = ExprPtr::of(expr);
                         Either::Left(this.alloc_pat_from_expr(Pat::Missing, ptr))
                     }
                 },
@@ -2361,7 +2491,7 @@ impl<'db> ExprCollector<'db> {
         /// The tuple's `..` and the mark its other elements are pushed above on the pat stack.
         fn collect_tuple(
             this: &mut ExprCollector<'_>,
-            fields: ast::AstChildren<ast::Expr>,
+            fields: AstChildren<'_, ast::Expr<'_>>,
         ) -> (Option<u32>, ListMark) {
             let mark = this.store.list_mark();
             let mut ellipsis = None;
@@ -2385,7 +2515,7 @@ impl<'db> ExprCollector<'db> {
         &mut self,
         create_expr: impl FnOnce(&mut Self) -> (ExprId, ExprId),
     ) -> ExprId {
-        let prev_unowned_bindings_len = self.unowned_bindings.len();
+        let prev_unowned_bindings_len = self.stacks.unowned_bindings.len();
         let (bindings_owner, expr_to_return) = create_expr(self);
         self.associate_unowned_bindings_with(prev_unowned_bindings_len, bindings_owner);
         expr_to_return
@@ -2396,7 +2526,7 @@ impl<'db> ExprCollector<'db> {
         prev_unowned_bindings_len: usize,
         bindings_owner: ExprId,
     ) {
-        for binding in self.unowned_bindings.drain(prev_unowned_bindings_len..) {
+        for binding in self.stacks.unowned_bindings.drain(prev_unowned_bindings_len..) {
             self.store.binding_owners.insert(binding, bindings_owner);
         }
     }
@@ -2411,17 +2541,24 @@ impl<'db> ExprCollector<'db> {
     /// Desugar `try { <stmts>; <expr> }` into `'<new_label>: { <stmts>; ::std::ops::Try::from_output(<expr>) }`,
     /// `try { <stmts>; }` into `'<new_label>: { <stmts>; ::std::ops::Try::from_output(()) }`
     /// and save the `<new_label>` to use it as a break target for desugaring of the `?` operator.
-    fn desugar_try_block(&mut self, e: BlockExpr, result_type: Option<ast::Type>) -> ExprId {
+    fn desugar_try_block(
+        &mut self,
+        e: BlockExpr<'_>,
+        result_type: Option<ast::Type<'_>>,
+    ) -> ExprId {
         let try_from_output = self.lang_path(self.lang_items().TryTraitFromOutput);
         let label = self.generate_new_name();
-        let label = self.alloc_label_desugared(Label { name: label }, AstPtr::new(&e).wrap_right());
+        let label = self.alloc_label_desugared(
+            Label { name: label },
+            AstPtr::<tag::BlockExpr>::of(e).wrap_right(),
+        );
         let try_block_info = match result_type {
             Some(_) => TryBlock::Heterogeneous { label },
             None => TryBlock::Homogeneous { label },
         };
         let old_try_block = self.current_try_block.replace(try_block_info);
 
-        let ptr = AstPtr::new(&e).upcast();
+        let ptr: ExprPtr = AstPtr::<tag::BlockExpr>::of(e).upcast();
         let (btail, expr_id) = self.with_labeled_rib(label, HygieneId::ROOT, |this| {
             let mut btail = None;
             let block = this.collect_block_(e, |_, id, statements, tail| {
@@ -2499,7 +2636,7 @@ impl<'db> ExprCollector<'db> {
     /// We should probably do the same in future.
     ///
     /// [`DropTemps`]: https://doc.rust-lang.org/nightly/nightly-rustc/rustc_hir/hir/enum.ExprKind.html#variant.DropTemps
-    fn collect_while_loop(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::WhileExpr) -> ExprId {
+    fn collect_while_loop(&mut self, syntax_ptr: ExprPtr, e: ast::WhileExpr<'_>) -> ExprId {
         let label = e.label().map(|label| {
             (self.hygiene_id_for(label.syntax().text_range()), self.collect_label(label))
         });
@@ -2549,7 +2686,7 @@ impl<'db> ExprCollector<'db> {
     ///     }
     /// }
     /// ```
-    fn collect_for_loop(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::ForExpr) -> ExprId {
+    fn collect_for_loop(&mut self, syntax_ptr: ExprPtr, e: ast::ForExpr<'_>) -> ExprId {
         let lang_items = self.lang_items();
         let (Some(into_iter_fn), Some(iter_next_fn), Some(option_some), Some(option_none)) = (
             self.lang_path(lang_items.IntoIterIntoIter),
@@ -2560,8 +2697,8 @@ impl<'db> ExprCollector<'db> {
             return self.missing_expr();
         };
         let iterable = e.iterable();
-        let syntax_ptr_iterable = iterable.as_ref().map_or(syntax_ptr, AstPtr::new);
-        let loop_body = e.loop_body().map(|it| it.into());
+        let syntax_ptr_iterable = iterable.map_or(syntax_ptr, ExprPtr::of);
+        let loop_body = e.loop_body().map(ast::Expr::BlockExpr);
         let head = self.collect_expr_opt(iterable);
         let into_iter_fn_expr = self.store.alloc_path_expr(into_iter_fn);
         let into_iter_fn_expr = self.map_expr_desugared(into_iter_fn_expr, syntax_ptr_iterable);
@@ -2645,7 +2782,7 @@ impl<'db> ExprCollector<'db> {
     ///         return Try::from_residual(residual),
     /// }
     /// ```
-    fn collect_try_operator(&mut self, syntax_ptr: AstPtr<ast::Expr>, e: ast::TryExpr) -> ExprId {
+    fn collect_try_operator(&mut self, syntax_ptr: ExprPtr, e: ast::TryExpr<'_>) -> ExprId {
         let lang_items = self.lang_items();
         let (Some(try_branch), Some(cf_continue), Some(cf_break)) = (
             self.lang_path(lang_items.TryTraitBranch),
@@ -2715,7 +2852,7 @@ impl<'db> ExprCollector<'db> {
 
     /// The literal with the path of the module being lowered where `module_path!()` left its
     /// placeholder, when the literal has one: alone, or in what `concat!` made of it.
-    fn module_path_literal(&self, literal: &ast::Literal) -> Option<Literal> {
+    fn module_path_literal(&self, literal: ast::Literal<'_>) -> Option<Literal> {
         self.expander.current_file_id().macro_file()?;
         let ast::LiteralKind::String(text) = literal.kind() else { return None };
         let text = text.value().ok()?;
@@ -2746,15 +2883,17 @@ impl<'db> ExprCollector<'db> {
         Some(segments.join("::"))
     }
 
+    /// Expands `mcall` and hands `collector` the expansion's root as a `T`, a view of the
+    /// expansion's tree, which the database keeps (`'db`).
     fn collect_macro_call<T, U>(
         &mut self,
-        mcall: ast::MacroCall,
-        syntax_ptr: AstPtr<ast::MacroCall>,
+        mcall: ast::MacroCall<'_>,
+        syntax_ptr: MacroCallPtr,
         record_diagnostics: bool,
         collector: impl FnOnce(&mut Self, Option<T>) -> U,
     ) -> U
     where
-        T: ast::AstNode,
+        T: ast::AstNode<'db>,
     {
         let macro_call_ptr = self.expander.in_file(syntax_ptr);
 
@@ -2801,18 +2940,22 @@ impl<'db> ExprCollector<'db> {
                             Some(found.def)
                         })
                 };
-                self.expander.enter_expand(
+                // alloc: none unless the call is eager and its input holds macro calls
+                let mut eager_calls = Vec::new();
+                let res = self.expander.enter_expand(
                     self.db,
                     mcall,
                     self.krate,
                     resolver,
-                    &mut |ptr, call| {
-                        self.store.macro_calls.push(call);
-                        if self.store.record {
-                            self.store.expansions.push((ptr.map(|(it, _)| it), call));
-                        }
-                    },
-                )
+                    &mut eager_calls,
+                );
+                for (ptr, call) in eager_calls {
+                    self.store.macro_calls.push(call);
+                    if self.store.record {
+                        self.store.expansions.push((ptr.map(|(it, _)| it), call));
+                    }
+                }
+                res
             }
         };
 
@@ -2841,7 +2984,7 @@ impl<'db> ExprCollector<'db> {
                     }
                 }
 
-                let id = collector(self, expansion.map(|it| it.tree()));
+                let id = collector(self, expansion);
                 self.expander.exit(mark);
                 id
             }
@@ -2854,27 +2997,27 @@ impl<'db> ExprCollector<'db> {
     /// ([`hir_expand::ExpandTo::of_call_site`]) and expands to an expression.
     fn collect_macro_as_stmt(
         &mut self,
-        mac: ast::MacroExpr,
+        mac: ast::MacroExpr<'_>,
         in_expr_place: bool,
     ) -> Option<ExprId> {
         let mac_call = mac.macro_call()?;
-        if hir_expand::ExpandTo::of_call_site(&mac_call) == Ok(hir_expand::ExpandTo::Expr) {
+        if hir_expand::ExpandTo::of_call_site_view(mac_call) == Ok(hir_expand::ExpandTo::Expr) {
             return self.maybe_collect_expr(ast::Expr::MacroExpr(mac));
         }
-        // clone: a syntax node's count bump; `MacroExpr` alone has no `HasAttrs`.
-        if !self.check_cfg(&ast::Expr::MacroExpr(mac.clone())) {
+        // `MacroExpr` alone has no `HasAttrs`.
+        if !self.check_cfg(ast::Expr::MacroExpr(mac)) {
             return None;
         }
 
         let as_expr =
             in_expr_place && mac_call.token_tree().is_some_and(|it| it.l_curly_token().is_none());
-        let syntax_ptr = AstPtr::new(&ast::Expr::from(mac));
-        let macro_ptr = AstPtr::new(&mac_call);
+        let syntax_ptr = ExprPtr::of(ast::Expr::MacroExpr(mac));
+        let macro_ptr = MacroCallPtr::of(mac_call);
         let expansion = self.collect_macro_call(
             mac_call,
             macro_ptr,
             false,
-            |this, expansion: Option<ast::MacroStmts>| match expansion {
+            |this, expansion: Option<ast::MacroStmts<'_>>| match expansion {
                 Some(expansion) => {
                     // rustc parses the expansion of such a call as one expression, and takes
                     // one `;` after it (`ParserAnyMacro::make`, the lint
@@ -2912,10 +3055,10 @@ impl<'db> ExprCollector<'db> {
         })
     }
 
-    fn collect_stmt(&mut self, s: ast::Stmt) {
+    fn collect_stmt(&mut self, s: ast::Stmt<'_>) {
         match s {
             ast::Stmt::LetStmt(stmt) => {
-                if !self.check_cfg(&stmt) {
+                if !self.check_cfg(stmt) {
                     return;
                 }
                 let pat = self.collect_pat_top(stmt.pat());
@@ -2947,7 +3090,7 @@ impl<'db> ExprCollector<'db> {
                 }
             }
             ast::Stmt::Item(ast::Item::MacroDef(macro_)) => {
-                if !self.check_cfg(&macro_) {
+                if !self.check_cfg(macro_) {
                     return;
                 }
                 let Some(name) = macro_.name() else {
@@ -2963,7 +3106,7 @@ impl<'db> ExprCollector<'db> {
                 self.collect_macro_def(macro_id);
             }
             ast::Stmt::Item(ast::Item::MacroRules(macro_)) => {
-                if !self.check_cfg(&macro_) {
+                if !self.check_cfg(macro_) {
                     return;
                 }
                 let Some(name) = macro_.name() else {
@@ -2994,10 +3137,10 @@ impl<'db> ExprCollector<'db> {
         };
         let macro_id = macro_id.definition(self.db);
         self.store.push_list_statement(Statement::Item(Item::MacroDef(&macro_id)));
-        self.label_ribs.push(LabelRib::new(RibKind::MacroDef(macro_id)));
+        self.stacks.label_ribs.push(LabelRib::new(RibKind::MacroDef(macro_id)));
     }
 
-    fn collect_block(&mut self, block: ast::BlockExpr) -> ExprId {
+    fn collect_block(&mut self, block: ast::BlockExpr<'_>) -> ExprId {
         self.collect_block_(block, |_, id, statements, tail| Expr::Block {
             id,
             statements,
@@ -3009,7 +3152,7 @@ impl<'db> ExprCollector<'db> {
 
     fn collect_block_(
         &mut self,
-        block: ast::BlockExpr,
+        block: ast::BlockExpr<'_>,
         mk_block: impl for<'s> FnOnce(
             &mut Self,
             Option<BlockId>,
@@ -3019,7 +3162,7 @@ impl<'db> ExprCollector<'db> {
     ) -> ExprId {
         let block_id = (|| {
             let token = self.lowering_mode.allow_tracked_structs()?;
-            let file_local_id = self.expander.ast_id_map().ast_id_for_block(&block)?;
+            let file_local_id = self.expander.ast_id_map().ast_id_for_block_view(block)?;
             let ast_id = self.expander.in_file(file_local_id);
             if let Some(given) = &mut self.given_blocks {
                 let block =
@@ -3072,7 +3215,7 @@ impl<'db> ExprCollector<'db> {
             .and_then(|it| it.l_curly_token())
             .map(|it| self.expander.ctx_for_range(it.text_range()))
             .filter(|it| !it.is_root());
-        let syntax_node_ptr = AstPtr::new(&block.into());
+        let syntax_node_ptr = ExprPtr::of(ast::Expr::BlockExpr(block));
         let expr_id = self.with_lists(statements, |this, lists| {
             let expr = mk_block(this, block_id, lists.statements_since(statements), tail);
             this.alloc_expr(expr, syntax_node_ptr)
@@ -3087,7 +3230,7 @@ impl<'db> ExprCollector<'db> {
         expr_id
     }
 
-    fn collect_block_opt(&mut self, expr: Option<ast::BlockExpr>) -> ExprId {
+    fn collect_block_opt(&mut self, expr: Option<ast::BlockExpr<'_>>) -> ExprId {
         match expr {
             Some(block) => self.collect_block(block),
             None => self.missing_expr(),
@@ -3097,7 +3240,7 @@ impl<'db> ExprCollector<'db> {
     fn collect_labelled_block_opt(
         &mut self,
         label: Option<(HygieneId, LabelId)>,
-        expr: Option<ast::BlockExpr>,
+        expr: Option<ast::BlockExpr<'_>>,
     ) -> ExprId {
         match label {
             Some((hygiene, label)) => {
@@ -3107,13 +3250,13 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
-    fn collect_param_as_ident(&mut self, pat: ast::Pat) -> PatId {
+    fn collect_param_as_ident(&mut self, pat: ast::Pat<'_>) -> PatId {
         // parameters of functions in `extern` blocks and associated trait functions without a body
         // can only be simple identifiers and wildcards.
         // Furthermore, the identifiers in their parameters are always interpreted as bindings, even
         // if in a normal function they won't be, because they would refer to a path pattern.
 
-        match &pat {
+        match pat {
             ast::Pat::IdentPat(bp) if bp.is_simple_ident() => {
                 let name = bp.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
                 let hygiene = bp
@@ -3121,17 +3264,17 @@ impl<'db> ExprCollector<'db> {
                     .map(|name| self.hygiene_id_for(name.syntax().text_range()))
                     .unwrap_or(HygieneId::ROOT);
                 let binding = self.alloc_binding(name, BindingAnnotation::Unannotated, hygiene);
-                let pat =
-                    self.alloc_pat(Pat::Bind { id: binding, subpat: None }, AstPtr::new(&pat));
+                let pat = self.alloc_pat(Pat::Bind { id: binding, subpat: None }, PatPtr::of(pat));
                 self.add_definition_to_binding(binding, pat);
                 pat
             }
-            ast::Pat::WildcardPat(_) => self.alloc_pat(Pat::Wild, AstPtr::new(&pat)),
-            ast::Pat::MacroPat(mac) => self // clone: a syntax node's count bump.
-                .collect_macro_pat_with(mac.clone(), |this, pat| this.collect_param_as_ident(pat)),
+            ast::Pat::WildcardPat(_) => self.alloc_pat(Pat::Wild, PatPtr::of(pat)),
+            ast::Pat::MacroPat(mac) => {
+                self.collect_macro_pat_with(mac, |this, pat| this.collect_param_as_ident(pat))
+            }
             _ => {
                 self.store.diagnostics.push(ExpressionStoreDiagnostics::PatternArgInExternFn {
-                    node: self.expander.in_file(AstPtr::new(&pat)),
+                    node: self.expander.in_file(PatPtr::of(pat)),
                 });
                 self.missing_pat()
             }
@@ -3140,16 +3283,16 @@ impl<'db> ExprCollector<'db> {
 
     // region: patterns
 
-    fn collect_pat_top(&mut self, pat: Option<ast::Pat>) -> PatId {
+    fn collect_pat_top(&mut self, pat: Option<ast::Pat<'_>>) -> PatId {
         match pat {
             Some(pat) => self.collect_pat(pat, &mut BindingList::default()),
             None => self.missing_pat(),
         }
     }
 
-    fn collect_pat(&mut self, pat: ast::Pat, binding_list: &mut BindingList) -> PatId {
-        let ptr = AstPtr::new(&pat);
-        let pattern = match &pat {
+    fn collect_pat(&mut self, pat: ast::Pat<'_>, binding_list: &mut BindingList) -> PatId {
+        let ptr = PatPtr::of(pat);
+        let pattern = match pat {
             ast::Pat::IdentPat(bp) => {
                 let name = bp.name().map(|nr| nr.as_name()).unwrap_or_else(Name::missing);
                 let hygiene = bp
@@ -3200,7 +3343,7 @@ impl<'db> ExprCollector<'db> {
             ast::Pat::TupleStructPat(p) => {
                 let path = p
                     .path()
-                    .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
+                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let Some(path) = path else {
                     return self.missing_pat();
                 };
@@ -3222,7 +3365,7 @@ impl<'db> ExprCollector<'db> {
             ast::Pat::PathPat(p) => {
                 let path = p
                     .path()
-                    .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
+                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let id = match path {
                     Some(path) => self.store.alloc_path_pat(path),
                     None => self.store.alloc_pat(Pat::Missing),
@@ -3288,15 +3431,15 @@ impl<'db> ExprCollector<'db> {
             ast::Pat::RecordPat(p) => {
                 let path = p
                     .path()
-                    .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
+                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let Some(path) = path else {
                     return self.missing_pat();
                 };
                 let record_pat_field_list =
-                    &p.record_pat_field_list().expect("every struct should have a field list");
+                    p.record_pat_field_list().expect("every struct should have a field list");
                 let mark = self.store.list_mark();
                 for f in record_pat_field_list.fields() {
-                    if !self.check_cfg(&f) {
+                    if !self.check_cfg(f) {
                         continue;
                     }
                     let Some(ast_pat) = f.pat() else { continue };
@@ -3304,7 +3447,9 @@ impl<'db> ExprCollector<'db> {
                     let Some(name) = f.field_name() else { continue };
                     let name = name.as_name();
                     if self.store.record {
-                        let src = self.expander.in_file(AstPtr::new(&f).wrap_right());
+                        let src = self
+                            .expander
+                            .in_file(AstPtr::<tag::RecordPatField>::of(f).wrap_right());
                         self.store.pat_field_map_back.push((pat, src));
                     }
                     self.store.push_list_field_pat(RecordFieldPat { name, pat });
@@ -3340,7 +3485,7 @@ impl<'db> ExprCollector<'db> {
                 let Some((hir_lit, ast_lit)) = pat_literal_to_hir(lit) else {
                     break 'b Pat::Missing;
                 };
-                let expr_ptr = AstPtr::new(&ast::Expr::Literal(ast_lit));
+                let expr_ptr = ExprPtr::of(ast::Expr::Literal(ast_lit));
                 let expr_id = self.store.alloc_literal_expr(hir_lit);
                 Pat::Lit(self.map_expr(expr_id, expr_ptr))
             }
@@ -3361,16 +3506,15 @@ impl<'db> ExprCollector<'db> {
                 Pat::Lit(self.map_expr_from_pat(expr_id, ptr))
             }
             ast::Pat::MacroPat(mac) => {
-                // clone: a syntax node's count bump, once per macro call.
-                return self.collect_macro_pat_with(mac.clone(), |this, expanded_pat| {
+                return self.collect_macro_pat_with(mac, |this, expanded_pat| {
                     this.collect_pat(expanded_pat, binding_list)
                 });
             }
             ast::Pat::RangePat(p) => {
-                let mut range_part_lower = |p: Option<ast::Pat>| -> Option<ExprId> {
+                let mut range_part_lower = |p: Option<ast::Pat<'_>>| -> Option<ExprId> {
                     p.and_then(|it| {
-                        let ptr = PatPtr::new(&it);
-                        match &it {
+                        let ptr = PatPtr::of(it);
+                        match it {
                             ast::Pat::LiteralPat(it) => {
                                 let (literal, _) = pat_literal_to_hir(it)?;
                                 let id = self.store.alloc_literal_expr(literal);
@@ -3385,7 +3529,7 @@ impl<'db> ExprCollector<'db> {
                             ast::Pat::PathPat(p) => p
                                 .path()
                                 .and_then(|path| {
-                                    self.lower_path(path, &mut Self::impl_trait_error_allocator)
+                                    self.lower_path_view(path, &mut ImplTraitLowering::Error)
                                 })
                                 .map(|parsed| {
                                     let id = self.store.alloc_path_expr(parsed);
@@ -3410,13 +3554,13 @@ impl<'db> ExprCollector<'db> {
 
     fn collect_macro_pat_with(
         &mut self,
-        mac: ast::MacroPat,
-        callback: impl FnOnce(&mut Self, ast::Pat) -> PatId,
+        mac: ast::MacroPat<'_>,
+        callback: impl FnOnce(&mut Self, ast::Pat<'db>) -> PatId,
     ) -> PatId {
         match mac.macro_call() {
             Some(call) => {
-                let macro_ptr = AstPtr::new(&call);
-                let src = self.expander.in_file(AstPtr::new(&mac.into()));
+                let macro_ptr = MacroCallPtr::of(call);
+                let src = self.expander.in_file(PatPtr::of(ast::Pat::MacroPat(mac)));
                 let pat = self.collect_macro_call(call, macro_ptr, true, |this, expanded_pat| {
                     match expanded_pat {
                         Some(pat) => callback(this, pat),
@@ -3432,7 +3576,11 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
-    fn collect_pat_opt(&mut self, pat: Option<ast::Pat>, binding_list: &mut BindingList) -> PatId {
+    fn collect_pat_opt(
+        &mut self,
+        pat: Option<ast::Pat<'_>>,
+        binding_list: &mut BindingList,
+    ) -> PatId {
         match pat {
             Some(pat) => self.collect_pat(pat, binding_list),
             None => self.missing_pat(),
@@ -3441,7 +3589,7 @@ impl<'db> ExprCollector<'db> {
 
     fn collect_tuple_pat(
         &mut self,
-        args: AstChildren<ast::Pat>,
+        args: AstChildren<'_, ast::Pat<'_>>,
         has_leading_comma: bool,
         binding_list: &mut BindingList,
     ) -> (ListMark, Option<u32>) {
@@ -3478,15 +3626,15 @@ impl<'db> ExprCollector<'db> {
     // it is the macro expansion result of an arg sub-pattern in a slice or tuple pattern.
     fn collect_pat_possibly_rest(
         &mut self,
-        pat: ast::Pat,
+        pat: ast::Pat<'_>,
         binding_list: &mut BindingList,
     ) -> Either<PatId, ()> {
-        match &pat {
+        match pat {
             ast::Pat::RestPat(_) => Either::Right(()),
             ast::Pat::MacroPat(mac) => match mac.macro_call() {
                 Some(call) => {
-                    let macro_ptr = AstPtr::new(&call);
-                    let src = self.expander.in_file(AstPtr::new(&pat));
+                    let macro_ptr = MacroCallPtr::of(call);
+                    let src = self.expander.in_file(PatPtr::of(pat));
                     let pat =
                         self.collect_macro_call(call, macro_ptr, true, |this, expanded_pat| {
                             if let Some(expanded_pat) = expanded_pat {
@@ -3503,7 +3651,7 @@ impl<'db> ExprCollector<'db> {
                     pat
                 }
                 None => {
-                    let ptr = AstPtr::new(&pat);
+                    let ptr = PatPtr::of(pat);
                     Either::Left(self.alloc_pat(Pat::Missing, ptr))
                 }
             },
@@ -3511,15 +3659,15 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
-    fn collect_ty_pat_opt(&mut self, pat: Option<ast::Pat>) -> PatId {
+    fn collect_ty_pat_opt(&mut self, pat: Option<ast::Pat<'_>>) -> PatId {
         match pat {
             Some(pat) => self.collect_ty_pat(pat),
             None => self.missing_pat(),
         }
     }
 
-    fn collect_ty_pat(&mut self, pat: ast::Pat) -> PatId {
-        let ptr = AstPtr::new(&pat);
+    fn collect_ty_pat(&mut self, pat: ast::Pat<'_>) -> PatId {
+        let ptr = PatPtr::of(pat);
         match pat {
             ast::Pat::NotNull(_) => self.alloc_pat(Pat::NotNull, ptr),
             ast::Pat::OrPat(pat) => {
@@ -3566,9 +3714,9 @@ impl<'db> ExprCollector<'db> {
         }
     }
 
-    fn lower_ty_pat_range_side(&mut self, pat: ast::Pat) -> ExprId {
-        let ptr = AstPtr::new(&pat);
-        match &pat {
+    fn lower_ty_pat_range_side(&mut self, pat: ast::Pat<'_>) -> ExprId {
+        let ptr = PatPtr::of(pat);
+        match pat {
             ast::Pat::LiteralPat(it) => {
                 let Some((literal, _)) = pat_literal_to_hir(it) else { return self.missing_expr() };
                 let id = self.store.alloc_literal_expr(literal);
@@ -3577,7 +3725,7 @@ impl<'db> ExprCollector<'db> {
             ast::Pat::PathPat(it) => {
                 let path = it
                     .path()
-                    .and_then(|path| self.lower_path(path, &mut Self::impl_trait_error_allocator));
+                    .and_then(|path| self.lower_path_view(path, &mut ImplTraitLowering::Error));
                 let id = self.alloc_opt_path_expr(path);
                 self.map_expr_from_pat(id, ptr)
             }
@@ -3602,7 +3750,7 @@ impl<'db> ExprCollector<'db> {
 
     /// Lowers the range end of an exclusive range (`2..5`) to an inclusive range 2..=(5 - 1).
     /// This way the type system doesn't have to handle the distinction between inclusive/exclusive ranges.
-    fn lower_excluded_range_end(&mut self, pat: ast::Pat) -> ExprId {
+    fn lower_excluded_range_end(&mut self, pat: ast::Pat<'_>) -> ExprId {
         self.with_fresh_binding_expr_root(|this| {
             let excluded_end = this.lower_ty_pat_range_side(pat);
             let range_sub_path = this.lang_path(this.lang_items().RangeSub);
@@ -3615,16 +3763,23 @@ impl<'db> ExprCollector<'db> {
 
     /// Returns `false` (and emits diagnostics) when `owner` if `#[cfg]`d out, and `true` when
     /// not.
-    fn check_cfg(&mut self, owner: &dyn ast::HasAttrs) -> bool {
-        if !may_have_attrs(owner) {
+    #[inline]
+    fn check_cfg<'t>(&mut self, owner: impl ast::HasAttrs<'t>) -> bool {
+        if !may_have_attrs(&owner) {
             return true;
         }
+        self.check_cfg_of(ast::AnyHasAttrs::new(owner))
+    }
+
+    /// [`Self::check_cfg`] of an owner that may have attributes: one instance for every kind
+    /// of owner.
+    fn check_cfg_of(&mut self, owner: ast::AnyHasAttrs<'_>) -> bool {
         let enabled = self.expander.is_cfg_enabled(owner, self.cfg_options);
         match enabled {
             Ok(()) => true,
             Err(cfg) => {
                 self.store.diagnostics.push(ExpressionStoreDiagnostics::InactiveCode {
-                    node: self.expander.in_file(SyntaxNodePtr::new(owner.syntax())),
+                    node: self.expander.in_file(ast::ptr(owner.syntax())),
                     cfg,
                 });
                 false
@@ -3633,8 +3788,8 @@ impl<'db> ExprCollector<'db> {
     }
 
     /// Used for `cfg!()`, conducting imprecise checks
-    fn check_cfg_pred(&self, pred: Option<ast::CfgPredicate>) -> bool {
-        let expr = pred.map_or(cfg::CfgExpr::Invalid, cfg::CfgExpr::parse_from_ast);
+    fn check_cfg_pred(&self, pred: Option<ast::CfgPredicate<'_>>) -> bool {
+        let expr = pred.map_or(cfg::CfgExpr::Invalid, cfg::CfgExpr::parse_from_view);
         self.cfg_options.check(&expr) != Some(false)
     }
 
@@ -3646,19 +3801,18 @@ impl<'db> ExprCollector<'db> {
 
     // region: labels
 
-    fn collect_label(&mut self, ast_label: ast::Label) -> LabelId {
+    fn collect_label(&mut self, ast_label: ast::Label<'_>) -> LabelId {
         let label = Label {
             name: ast_label
                 .lifetime()
-                .as_ref()
                 .map_or_else(Name::missing, |lt| Name::new_lifetime(lt.text())),
         };
-        self.alloc_label(label, AstPtr::new(&ast_label))
+        self.alloc_label(label, AstPtr::<tag::Label>::of(ast_label))
     }
 
     fn resolve_label(
         &self,
-        lifetime: Option<ast::Lifetime>,
+        lifetime: Option<ast::Lifetime<'_>>,
     ) -> Result<Option<LabelId>, ExpressionStoreDiagnostics> {
         let Some(lifetime) = lifetime else { return Ok(None) };
         let mut hygiene_id =
@@ -3673,7 +3827,7 @@ impl<'db> ExprCollector<'db> {
         };
         let name = Name::new_lifetime(lifetime.text());
 
-        for (rib_idx, rib) in self.label_ribs.iter().enumerate().rev() {
+        for (rib_idx, rib) in self.stacks.label_ribs.iter().enumerate().rev() {
             match &rib.kind {
                 RibKind::Normal(label_name, id, label_hygiene)
                     if *label_name == name && *label_hygiene == hygiene_id =>
@@ -3683,7 +3837,7 @@ impl<'db> ExprCollector<'db> {
                     } else {
                         Err(ExpressionStoreDiagnostics::UnreachableLabel {
                             name,
-                            node: self.expander.in_file(AstPtr::new(&lifetime)),
+                            node: self.expander.in_file(LifetimePtr::of(lifetime)),
                         })
                     };
                 }
@@ -3708,23 +3862,23 @@ impl<'db> ExprCollector<'db> {
 
         Err(ExpressionStoreDiagnostics::UndeclaredLabel {
             name,
-            node: self.expander.in_file(AstPtr::new(&lifetime)),
+            node: self.expander.in_file(LifetimePtr::of(lifetime)),
         })
     }
 
     fn is_label_valid_from_rib(&self, rib_index: usize) -> bool {
-        !self.label_ribs[rib_index + 1..].iter().any(|rib| rib.kind.is_label_barrier())
+        !self.stacks.label_ribs[rib_index + 1..].iter().any(|rib| rib.kind.is_label_barrier())
     }
 
     fn pop_label_rib(&mut self) {
         // We need to pop all macro defs, plus one rib.
-        while let Some(LabelRib { kind: RibKind::MacroDef(_) }) = self.label_ribs.pop() {
+        while let Some(LabelRib { kind: RibKind::MacroDef(_) }) = self.stacks.label_ribs.pop() {
             // Do nothing.
         }
     }
 
     fn with_label_rib<T>(&mut self, kind: RibKind, f: impl FnOnce(&mut Self) -> T) -> T {
-        self.label_ribs.push(LabelRib::new(kind));
+        self.stacks.label_ribs.push(LabelRib::new(kind));
         let res = f(self);
         self.pop_label_rib();
         res
@@ -3736,7 +3890,7 @@ impl<'db> ExprCollector<'db> {
         hygiene: HygieneId,
         f: impl FnOnce(&mut Self) -> T,
     ) -> T {
-        self.label_ribs.push(LabelRib::new(RibKind::Normal(
+        self.stacks.label_ribs.push(LabelRib::new(RibKind::Normal(
             self.store.labels[label].name,
             label,
             hygiene,
@@ -3761,7 +3915,14 @@ impl<'db> ExprCollector<'db> {
     /// While `expr` is a macro call, repeatedly expand it. If the end result is a string literal,
     /// return that, along with a boolean for whether it was a direct string literal, i.e. no macro
     /// calls were involved. In all other cases, return `None`.
-    fn expand_macros_to_string(&mut self, expr: ast::Expr) -> Option<(ast::String, bool)> {
+    /// The string is of `expr`'s tree or of an expansion's, so it lives as long as both (`'v`).
+    fn expand_macros_to_string<'t: 'v, 'v>(
+        &mut self,
+        expr: ast::Expr<'t>,
+    ) -> Option<(ast::String<'v>, bool)>
+    where
+        'db: 'v,
+    {
         let m = match expr {
             ast::Expr::MacroExpr(m) => m,
             // An expression a macro was given is in parentheses where the macro puts it.
@@ -3778,10 +3939,11 @@ impl<'db> ExprCollector<'db> {
             _ => return None,
         };
         let e = m.macro_call()?;
-        let macro_ptr = AstPtr::new(&e);
-        let (exp, _) = self.collect_macro_call(e, macro_ptr, true, |this, expansion| {
-            expansion.and_then(|it| this.expand_macros_to_string(it))
-        })?;
+        let macro_ptr = MacroCallPtr::of(e);
+        let (exp, _) =
+            self.collect_macro_call(e, macro_ptr, true, |this, expansion: Option<ast::Expr<'db>>| {
+                expansion.and_then(|it| this.expand_macros_to_string(it))
+            })?;
         Some((exp, false))
     }
 
@@ -3798,7 +3960,7 @@ impl<'db> ExprCollector<'db> {
     }
 }
 
-fn pat_literal_to_hir(lit: &ast::LiteralPat) -> Option<(Literal, ast::Literal)> {
+fn pat_literal_to_hir(lit: ast::LiteralPat<'_>) -> Option<(Literal, ast::Literal<'_>)> {
     let ast_lit = lit.literal()?;
     let mut hir_lit: Literal = ast_lit.kind().into();
     if lit.minus_token().is_some() {
@@ -3849,7 +4011,7 @@ impl<'db> ExprCollector<'db> {
     }
 
     /// Lowers a call's arguments onto the expr stack, leaving out those `#[cfg]`d out.
-    fn collect_args(&mut self, arg_list: Option<ast::ArgList>) -> ListMark {
+    fn collect_args(&mut self, arg_list: Option<ast::ArgList<'_>>) -> ListMark {
         let mark = self.store.list_mark();
         for arg in arg_list.iter().flat_map(|it| it.args()) {
             if let Some(arg) = self.maybe_collect_expr(arg) {
@@ -3860,7 +4022,7 @@ impl<'db> ExprCollector<'db> {
     }
 
     /// Lowers `exprs` onto the expr stack, leaving out those `#[cfg]`d out.
-    fn collect_exprs(&mut self, exprs: impl Iterator<Item = ast::Expr>) -> ListMark {
+    fn collect_exprs<'t>(&mut self, exprs: impl Iterator<Item = ast::Expr<'t>>) -> ListMark {
         let mark = self.store.list_mark();
         for expr in exprs {
             if let Some(expr) = self.maybe_collect_expr(expr) {
@@ -3922,7 +4084,7 @@ impl<'db> ExprCollector<'db> {
         hygiene: HygieneId,
     ) -> BindingId {
         let binding = self.store.bindings.alloc(Binding { name, mode, problems: None, hygiene });
-        self.unowned_bindings.push(binding);
+        self.stacks.unowned_bindings.push(binding);
         binding
     }
 
@@ -3971,7 +4133,7 @@ impl<'db> ExprCollector<'db> {
         self.store.alloc_pat(Pat::Missing)
     }
 
-    fn alloc_label(&mut self, label: Label, ptr: AstPtr<ast::Label>) -> LabelId {
+    fn alloc_label(&mut self, label: Label, ptr: AstPtr<tag::Label>) -> LabelId {
         self.alloc_label_desugared(label, ptr.wrap_left())
     }
 
@@ -4124,23 +4286,44 @@ fn is_plain_path(path: Path<'_>) -> bool {
 /// node whose first child node is not an attribute has none, and so for the node holding its
 /// inner attributes. One child read in place of a walk over every child, for the nodes almost
 /// all of a body is.
-pub(in crate::expr_store) fn may_have_attrs(owner: &dyn ast::HasAttrs) -> bool {
-    let leads = |node: &syntax::SyntaxNode| {
-        node.first_child().is_some_and(|it| ast::AnyAttr::can_cast(it.kind()))
-    };
-    leads(owner.syntax()) || owner.inner_attributes_node().is_some_and(|node| leads(&node))
+#[inline]
+pub(in crate::expr_store) fn may_have_attrs<'t>(owner: &impl ast::HasAttrs<'t>) -> bool {
+    let leads =
+        |node: ast::Node<'t>| node.first_child().is_some_and(|it| ast::AnyAttr::can_cast(it.kind()));
+    leads(owner.syntax()) || owner.inner_attributes_node().is_some_and(leads)
 }
 
-fn comma_follows_token(t: Option<syntax::SyntaxToken>) -> bool {
-    (|| syntax::algo::skip_trivia_token(t?.next_token()?, syntax::Direction::Next))()
-        .is_some_and(|it| it.kind() == syntax::T![,])
+/// The tree of the root of a handle's tree, for [`view_of`]: what the handle callers outside the
+/// crate keep alive while their node is lowered as a view.
+fn top_of<N: syntax::AstNode>(node: &N) -> Arc<FlatTree> {
+    let root = node.syntax().ancestors().last().expect("a node is among its ancestors");
+    // clone: one count of the tree per handle call, on the cold edge of a caller not on views.
+    Arc::clone(root.flat().expect("every node is in a flat tree").0)
 }
 
-/// This function find the AST fragment that corresponds to an `AssociatedTypeBinding` in the HIR.
-pub fn hir_assoc_type_binding_to_ast(
-    segment_args: &ast::GenericArgList,
+/// The view of `node` under `top`, its root's tree ([`top_of`]): the same node, found by its
+/// pointer.
+fn view_of<'t, N: syntax::AstNode + Typed>(node: &N, top: &'t Arc<FlatTree>) -> N::Of<'t> {
+    AstPtr::new(node).to_view(ast::Node::root(top))
+}
+
+/// Whether the first token after `t` that is not trivia is a `,`.
+pub(in crate::expr_store) fn comma_follows_token(t: Option<ast::Token<'_>>) -> bool {
+    let mut next = t.and_then(|t| t.next_token());
+    while let Some(token) = next {
+        if !token.kind().is_trivia() {
+            return token.kind() == syntax::T![,];
+        }
+        next = token.next_token();
+    }
+    false
+}
+
+/// [`hir_assoc_type_binding_to_ast`] of a view.
+pub fn hir_assoc_type_binding_to_ast_view<'t>(
+    segment_args: ast::GenericArgList<'t>,
     binding_idx: u32,
-) -> Option<ast::AssocTypeArg> {
+) -> Option<ast::AssocTypeArg<'t>> {
     segment_args
         .generic_args()
         .filter_map(|arg| match arg {
@@ -4151,17 +4334,47 @@ pub fn hir_assoc_type_binding_to_ast(
         .nth(binding_idx as usize)
 }
 
-/// This function find the AST generic argument from the one in the HIR. Does not support the `Self` argument.
-pub fn hir_generic_arg_to_ast(
-    args: &ast::GenericArgList,
+/// [`hir_generic_arg_to_ast`] of a view.
+pub fn hir_generic_arg_to_ast_view<'t>(
+    args: ast::GenericArgList<'t>,
     arg_idx: u32,
     has_self_arg: bool,
-) -> Option<ast::GenericArg> {
+) -> Option<ast::GenericArg<'t>> {
     args.generic_args()
         .filter(|arg| match arg {
             ast::GenericArg::AssocTypeArg(_) => false,
             ast::GenericArg::LifetimeArg(arg) => arg.lifetime().is_some(),
             ast::GenericArg::ConstArg(_) | ast::GenericArg::TypeArg(_) => true,
+        })
+        .nth(arg_idx as usize - has_self_arg as usize)
+}
+
+/// This function find the AST fragment that corresponds to an `AssociatedTypeBinding` in the HIR.
+pub fn hir_assoc_type_binding_to_ast(
+    segment_args: &tag::GenericArgList,
+    binding_idx: u32,
+) -> Option<tag::AssocTypeArg> {
+    segment_args
+        .generic_args()
+        .filter_map(|arg| match arg {
+            tag::GenericArg::AssocTypeArg(it) => Some(it),
+            _ => None,
+        })
+        .filter(|binding| binding.param_list().is_none() && binding.name_ref().is_some())
+        .nth(binding_idx as usize)
+}
+
+/// This function find the AST generic argument from the one in the HIR. Does not support the `Self` argument.
+pub fn hir_generic_arg_to_ast(
+    args: &tag::GenericArgList,
+    arg_idx: u32,
+    has_self_arg: bool,
+) -> Option<tag::GenericArg> {
+    args.generic_args()
+        .filter(|arg| match arg {
+            tag::GenericArg::AssocTypeArg(_) => false,
+            tag::GenericArg::LifetimeArg(arg) => arg.lifetime().is_some(),
+            tag::GenericArg::ConstArg(_) | tag::GenericArg::TypeArg(_) => true,
         })
         .nth(arg_idx as usize - has_self_arg as usize)
 }

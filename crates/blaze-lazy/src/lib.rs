@@ -47,6 +47,11 @@ pub mod wire;
 #[cfg(all(test, feature = "daemon"))]
 mod tests;
 
+/// Counts allocations so the hot paths' tests hold them to a budget.
+#[cfg(all(test, feature = "daemon", not(blaze_check)))]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 #[cfg(feature = "daemon")]
 pub use mode::{Purpose, Refused, allow};
 #[cfg(feature = "daemon")]

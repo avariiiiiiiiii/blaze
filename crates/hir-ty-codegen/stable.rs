@@ -243,7 +243,8 @@ impl<'a, 'db> StableNames<'a, 'db> {
 
     /// The name of a file as every machine has it, as panic locations name it in an entry.
     pub(super) fn file_path(&self, file: base_db::FileId) -> Option<String> {
-        self.stored(self.symbols.source_path(file)?)
+        // alloc: stored gives an owned name
+        self.stored(self.symbols.source_path(file)?.as_str().to_owned())
     }
 
     /// Whether a name is of anything of a crate of the checkout, which is only what the
@@ -883,7 +884,11 @@ fn file_name(
         write!(out, "#{}", id.into_raw()).ok()
     };
     match file {
-        HirFileId::FileId(file) => out.push_str(&named(symbols.source_path(file.file_id(db)))?),
+        HirFileId::FileId(file) => {
+            // alloc: named gives an owned name
+            let path = symbols.source_path(file.file_id(db)).map(|it| it.as_str().to_owned());
+            out.push_str(&named(path)?);
+        }
         HirFileId::MacroFile(call) => match &call.loc(db).kind {
             MacroCallKind::FnLike { ast_id, .. } => {
                 written_at(out, ast_id.file_id, ast_id.value.erase())?;

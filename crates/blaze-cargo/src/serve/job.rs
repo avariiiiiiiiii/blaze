@@ -22,13 +22,23 @@
 //! reported as it starts, its outputs put into the store and placed where cargo places them
 //! (unless the file there is still as the same value was placed),
 //! then `Built`, the tests or the run, and `Work`; or the one answer a reach, a trace, a
-//! verify, the codegen inputs or the tables give. A cancel skips what has not started, kills
-//! what runs, and the job still finishes once, not ok.
+//! verify, an edit, the codegen inputs or the tables give. A job of declared intent
+//! ([`Builder::speculate`]) runs the same in the plane's idle class until it is promoted. A
+//! cancel skips what has not started, kills what runs, and the job still finishes once, not
+//! ok.
+//!
+//! Every table is indexed, never hashed, by an id the daemon hands out: a job by its
+//! [`JobId`]'s slot, a run of user code and an effect of the loop's own by the slot their tag
+//! carries ([`slab`]), a node by the batch its id falls in, and a path or a checkout by the
+//! `u32` it is interned to where it comes in.
 
 #![forbid(unsafe_code)]
 
+mod slab;
+#[cfg(test)]
+mod tests;
+
 use std::{
-    collections::{BTreeMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -37,8 +47,8 @@ use std::{
 };
 
 use blaze_api::{
-    ApiError, Artifact, Diagnostic, FetchVerb, Level, LinkKind, Mismatch, Response, Targets, TestOutcome,
-    TestResult, Traced, Ub, UnitStarted, Verb, Worked,
+    ApiError, Artifact, Diagnostic, Edit, FetchVerb, Level, LinkKind, Mismatch, Response, Targets, TestOutcome,
+    ServedCrate, TestResult, Traced, Ub, UnitStarted, Verb, Worked,
     build::{Builder, JobId, Opened, Work},
 };
 use blaze_cas::{Placed, Store};
@@ -56,58 +66,77 @@ use blaze_units::{
     query::{BuildConfig, Command, Fetch, FetchKind, Invocation, LockWrite, Mount, Origin, Planned, Units},
     schema::Mode as UnitMode,
 };
-use blaze_vfs::{Ticket, ViewId, Vfs};
+use blaze_history::History;
+use blaze_vfs::{Change, Ticket, ViewId, Vfs};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::cli::print::Format;
+use blaze_mem::{Handle, MemError, Tag as MemTag};
 
+use self::slab::{Table, Tagged};
 use super::{
     heads::Heads,
     image::{Images, Parts},
     mounts::Mounts,
-    plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds},
+    plane::{self, Did, Fresh, Happened, Plane, Posting, Task, kinds, loops},
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptFront, Library, Reader, Readers, Runs,
-        Selection, Source, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Readers, Runs, Selection, Source,
+        Steps, Writer,
     },
 };
+use crate::cli::print::Format;
+
+/// The daemon's plane: every batch of it a job's [`Step`].
+type Tasks<S> = Plane<Step<S>, History>;
 
 /// How many tags one run of user code uses ([`Runs`]).
 const RUN_TAGS: u64 = 1 << 32;
+/// A run's number is its slot in [`Jobs::runs`], its generation's low bits above, as many as
+/// the range of run tags leaves: at most `2^16` runs go at once.
+const RUN_SLOT_BITS: u32 = 16;
+/// A tag of the loop's own is `setup.tags + (slot | generation << 20)`, under the range's
+/// `2^32`: at most `2^20` such effects in flight at once, and a slot reused `2^11` times
+/// before a tag of its names a value again ([`Tagged`]).
+const OWN_SLOT_BITS: u32 = 20;
+const OWN_GENERATION_BITS: u32 = 12;
 
 /// What a thread task of a job hands the loop.
-pub enum Value {
+pub enum Value<S: Steps> {
     Library(Result<Library, ApiError>),
     /// The fetch at its place in its batch ([`Fetching::fetches`]).
     Fetched(Arc<[Fetch]>, u32, Result<Source, ApiError>),
     Planned(Result<Planned, ApiError>),
-    Lowered(Result<FrontEnd, ApiError>),
+    Lowered(Result<FrontEnd<S>, ApiError>),
     /// A unit's compile, and the images it relinked, given back to the loop.
-    Compiled(usize, Result<Compiled, ApiError>, Vec<Image>),
+    Compiled(usize, Result<Compiled, ApiError>, Vec<Image<S>>),
     Answer(Result<Response, ApiError>),
     /// `blaze test --ub`: the tests selected, and one's result.
     Selected(Result<Vec<String>, ApiError>),
     Evaluated(Result<TestResult, ApiError>),
+    /// [`Work::Ahead`]: the units to build ahead ([`Front::ahead`]).
+    Ahead(Result<Vec<u32>, ApiError>),
 }
 
 /// What jobs tell the session, in order.
 #[derive(Debug, PartialEq)]
 pub enum Said {
     Report(JobId, Response),
-    Finish(JobId, bool, Option<ApiError>),
+    /// The job over, ok or not, and the database view its build ran in, handed to the session
+    /// to keep or close ([`blaze_api::session::Session::finish_in`]); none when the job opened none.
+    Finish(JobId, bool, Option<ApiError>, Option<ViewId>),
 }
 
 /// What the jobs work with, lent by the loop for one call.
-pub struct World<'a> {
+pub struct World<'a, S: Steps> {
     pub now: Duration,
     pub vfs: &'a mut Vfs,
     pub db: &'a Arc<Database>,
     pub store: &'a mut Store,
-    pub plane: &'a mut Plane<Value>,
+    pub plane: &'a mut Tasks<S>,
     pub mounts: &'a mut Mounts,
     pub heads: &'a Heads,
+    /// The daemon's image, which a snapshot asks for and waits on.
     pub images: &'a mut Images,
-    pub steps: &'a Arc<dyn Steps>,
+    pub steps: &'a Arc<S>,
     pub effects: &'a mut Vec<Effect>,
     pub said: &'a mut Vec<Said>,
 }
@@ -123,7 +152,7 @@ pub struct Setup {
     /// Whether an agent's diagnostics are rendered in colour; a cargo command line's are as
     /// its client resolved `--color` against its terminal ([`blaze_api::Cargo::color`]).
     pub color: bool,
-    /// The lock writes and modes: `tags..tags + 2^32`.
+    /// The lock writes, modes and looks at files: `tags..tags + 2^32`.
     pub tags: u64,
     /// User code's runs take ranges of `2^32` from `runs` up to `runs_end`.
     pub runs: u64,
@@ -147,30 +176,121 @@ fn fetch_key(fetch: &Fetch) -> Key {
     Key(hasher.finish().0)
 }
 
-/// A step's work as a task: a give-way posts it again, unless the job is cancelled.
-/// The work of a batch of thread tasks: `step` of a task's `arg`, and the value it is told to
-/// the loop as.
-fn task<R: 'static>(
-    cancelled: &Arc<AtomicBool>,
-    step: impl Fn(u32, Readers) -> Result<R, Failed> + Send + Sync + 'static,
-    value: impl Fn(u32, Result<R, ApiError>) -> Value + Send + Sync + 'static,
-) -> plane::Work<Value> {
-    let cancelled = cancelled.clone();
-    Arc::new(move |arg, readers| match step(arg, readers) {
-        Ok(it) => Some(Did { outcome: Outcome::Built, value: value(arg, Ok(it)) }),
-        Err(Failed::Error(error)) => {
-            Some(Did { outcome: Outcome::Failed { why: error.what.clone() }, value: value(arg, Err(error)) })
+/// The thread tasks of one batch of a job's nodes: what they do and what they own, shared by
+/// the batch's tasks. Every batch of the daemon's plane is one, run by one `match`.
+pub struct Step<S: Steps> {
+    cancelled: Arc<AtomicBool>,
+    does: Does<S>,
+}
+
+/// What a batch's tasks do, each with what it owns.
+pub(super) enum Does<S: Steps> {
+    Library { steps: Arc<S>, kept: Vec<(String, String)> },
+    Plan { steps: Arc<S>, db: Arc<Database>, queries: ViewId },
+    /// Task `at` fetches `fetches[at]`.
+    Fetch { steps: Arc<S>, fetches: Arc<[Fetch]> },
+    /// The head's last front end, taken by the run that lowers into it.
+    Lower { steps: Arc<S>, input: JobInput, kept: Mutex<Option<S::KeptFront>> },
+    /// Task `at` compiles unit `at`.
+    Compile { front: Arc<S::Front> },
+    Select { front: Arc<S::Front>, filter: Vec<String>, args: Vec<String>, all: bool, ub: Ub },
+    /// Task `at` evaluates `tests[at]`.
+    Evaluate { front: Arc<S::Front>, tests: Arc<[String]>, ub: Ub },
+    Reach { to: Arc<S::Front>, from: Arc<S::Front>, changes: Vec<Change> },
+    CodegenInputs { front: Arc<S::Front> },
+    /// With the linker's tables of the images kept as it was posted.
+    Tables { front: Arc<S::Front>, images: Vec<(&'static str, u64, u64)> },
+    Trace { db: Arc<Database>, queries: ViewId, root: QueryKey },
+    Verify { steps: Arc<S>, input: JobInput, view: blaze_vfs::View },
+    Edit { front: Arc<S::Front>, edits: Vec<Edit> },
+    Ahead { front: Arc<S::Front>, filter: Vec<String> },
+}
+
+impl<S: Steps> Step<S> {
+    pub(super) fn of(cancelled: &Arc<AtomicBool>, does: Does<S>) -> Step<S> {
+        Step { cancelled: cancelled.clone(), does } // clone: a refcount, once per batch
+    }
+
+    /// How a task's result settles its node, and its value for the loop. A give-way posts it
+    /// again, unless the job is cancelled.
+    fn settle<R>(&self, result: Result<R, Failed>, value: impl FnOnce(Result<R, ApiError>) -> Value<S>) -> Option<Did<Value<S>>> {
+        match result {
+            Ok(it) => Some(Did { outcome: Outcome::Built, value: value(Ok(it)) }),
+            Err(Failed::Error(error)) => {
+                // clone: a failed task's error, for the plane and the loop
+                Some(Did { outcome: Outcome::Failed { why: error.what.clone() }, value: value(Err(error)) })
+            }
+            Err(Failed::Again) if self.cancelled.load(Ordering::Acquire) => Some(Did {
+                outcome: Outcome::Failed { why: "cancelled".to_owned() }, // alloc: a cancelled task, once
+                value: value(Err(ApiError::new("cancelled", None))),
+            }),
+            Err(Failed::Again) => None,
         }
-        Err(Failed::Again) if cancelled.load(Ordering::Acquire) => Some(Did {
-            outcome: Outcome::Failed { why: "cancelled".to_owned() },
-            value: value(arg, Err(ApiError::new("cancelled", None))),
-        }),
-        Err(Failed::Again) => None,
-    })
+    }
+}
+
+impl<S: Steps> plane::Work for Step<S> {
+    type Value = Value<S>;
+    type Readers = Readers<S>;
+
+    fn run(&self, arg: u32, readers: Readers<S>) -> Option<Did<Value<S>>> {
+        let at = arg as usize;
+        match &self.does {
+            Does::Library { steps, kept } => self.settle(steps.library(kept).map_err(Failed::Error), Value::Library),
+            Does::Plan { steps, db, queries } => self.settle(steps.plan(db, *queries), Value::Planned),
+            Does::Fetch { steps, fetches } => {
+                let fetched = steps.fetch(&fetches[at]).map_err(Failed::Error);
+                // clone: a refcount per fetch
+                self.settle(fetched, |it| Value::Fetched(fetches.clone(), arg, it))
+            }
+            Does::Lower { steps, input, kept } => {
+                let kept = kept.lock().unwrap_or_else(|it| it.into_inner()).take();
+                self.settle(steps.lower(input, kept), Value::Lowered)
+            }
+            Does::Compile { front } => {
+                let Readers { this, mut images, .. } = readers;
+                let compiled = front.compile(this.expect("a task that reads is posted with its reader"), at, &mut images);
+                let ok = matches!(&compiled, Ok(it) if it.ok);
+                let mut did = self.settle(compiled, |it| Value::Compiled(at, it, images))?;
+                if !ok && matches!(did.outcome, Outcome::Built) {
+                    did.outcome = Outcome::Failed { why: "it did not compile".to_owned() }; // alloc: a unit that failed, once
+                }
+                Some(did)
+            }
+            Does::Select { front, filter, args, all, ub } => {
+                let selection = Selection { filter, args, all: *all, ub: Some(*ub) };
+                self.settle(front.ub_tests(this(readers), selection), Value::Selected)
+            }
+            Does::Evaluate { front, tests, ub } => self.settle(front.evaluate(this(readers), &tests[at], *ub), Value::Evaluated),
+            Does::Reach { to, from, changes } => {
+                let from_reader = readers.from.expect("a reach is posted with a reader of the view it reaches from");
+                let reached = to.reach(this(Readers { from: None, ..readers }), from, from_reader, changes);
+                self.settle(reached, |it| Value::Answer(it.map(Response::Reached)))
+            }
+            Does::CodegenInputs { front } => {
+                self.settle(front.codegen_inputs(this(readers)), |it| Value::Answer(it.map(Response::CodegenInputs)))
+            }
+            Does::Tables { front, images } => {
+                let writer = readers.writer.expect("the tables' task is posted with its job's writer");
+                self.settle(front.tables(writer, images), |it| Value::Answer(it.map(Response::Tables)))
+            }
+            Does::Trace { db, queries, root } => {
+                self.settle(Ok(trace(db, *queries, *root)), |it| Value::Answer(it.map(Response::Trace)))
+            }
+            Does::Verify { steps, input, view } => {
+                let verified = verify(&**steps, input, *view);
+                self.settle(verified, |it| Value::Answer(it.map(|mismatches| Response::Verified { mismatches })))
+            }
+            Does::Edit { front, edits } => {
+                self.settle(front.edit(this(readers), edits), |it| Value::Answer(it.map(Response::Edited)))
+            }
+            Does::Ahead { front, filter } => self.settle(front.ahead(this(readers), filter), Value::Ahead),
+        }
+    }
 }
 
 /// The reader of a task's own front end, which a task of a batch that reads is posted with.
-fn this(readers: Readers) -> Reader {
+fn this<S: Steps>(readers: Readers<S>) -> S::Reader {
     readers.this.expect("a task that reads is posted with its reader")
 }
 
@@ -193,21 +313,30 @@ fn node<'a>(kind: NodeKind, name: &'a str, deps: &'a [NodeId], pool: Pool, key: 
 }
 
 /// A batch of one thread task of kind `task`, with no deps.
-fn lone(plane: &mut Plane<Value>, kind: NodeKind, name: &str, pool: Pool, key: Option<Key>, task: TaskKind) -> Fresh {
+fn lone<S: Steps>(plane: &mut Tasks<S>, kind: NodeKind, name: &str, pool: Pool, key: Option<Key>, task: TaskKind) -> Fresh {
     let mut fresh = plane.fresh(1, name.len(), 0);
     plane.push(&mut fresh, node(kind, name, &[], pool, key), one(task));
     fresh
+}
+
+/// A job's place in [`Jobs::jobs`].
+fn key_of(id: JobId) -> slab::Key {
+    slab::Key { slot: id.slot, generation: id.generation }
 }
 
 /// What a job's work asks of cargo: its command.
 fn command_of(work: &Work) -> Command {
     match work {
         Work::Build(_) | Work::CodegenInputs(_) => Command::Build,
-        Work::Test { .. } => Command::Test,
+        Work::Test { .. } | Work::Ahead { .. } => Command::Test,
         Work::Run { .. } => Command::Run,
-        Work::Check(_) | Work::Reach { .. } | Work::Verify(_) | Work::Trace(_) | Work::Tables | Work::Snapshot => {
-            Command::Check
-        }
+        Work::Check(_)
+        | Work::Reach { .. }
+        | Work::Verify(_)
+        | Work::Trace(_)
+        | Work::Tables
+        | Work::Snapshot
+        | Work::Edit(_) => Command::Check,
     }
 }
 
@@ -215,10 +344,12 @@ fn goal_of(work: &Work) -> Goal {
     match work {
         Work::Build(_) | Work::CodegenInputs(_) => Goal::Build,
         Work::Test { ub: Some(_), .. } => Goal::Check,
-        Work::Test { .. } => Goal::Test,
+        Work::Test { .. } | Work::Ahead { .. } => Goal::Test,
         Work::Run { .. } => Goal::Run,
         Work::Reach { .. } => Goal::Reach,
-        Work::Check(_) | Work::Verify(_) | Work::Trace(_) | Work::Tables | Work::Snapshot => Goal::Check,
+        Work::Check(_) | Work::Verify(_) | Work::Trace(_) | Work::Tables | Work::Snapshot | Work::Edit(_) => {
+            Goal::Check
+        }
     }
 }
 
@@ -231,73 +362,79 @@ fn targets_of(work: &Work) -> Option<&Targets> {
         | Work::Trace(targets)
         | Work::Test { targets, .. }
         | Work::Run { targets, .. }
-        | Work::Reach { targets, .. } => Some(targets),
-        Work::Tables | Work::Snapshot => None,
+        | Work::Reach { targets, .. }
+        | Work::Ahead { targets, .. } => Some(targets),
+        Work::Tables | Work::Snapshot | Work::Edit(_) => None,
     }
+}
+
+/// One word of cargo's command line: made once per job, at the edge.
+fn word(args: &mut Vec<String>, it: &str) {
+    args.push(it.to_owned()); // alloc: the invocation owns its words, once per job
 }
 
 /// cargo's command line for an agent's targets, run at `root` with only the daemon's `PATH`
 /// and `HOME`.
 pub fn invocation(work: &Work, targets: Option<&Targets>, root: &str, env: &[(String, String)]) -> Invocation {
     if let Some(cargo) = targets.and_then(|it| it.cargo.as_ref()) {
-        let command = match cargo.command.as_str() {
-            "build" | "b" => Command::Build,
-            "test" | "t" => Command::Test,
-            "bench" => Command::Bench,
-            "run" | "r" => Command::Run,
-            _ => Command::Check,
-        };
+        let command = Command::named(&cargo.command).unwrap_or(Command::Check);
+        // clone: cargo's own invocation, owned by the config, once per job
         return Invocation {
             command,
-            args: cargo.args.clone(),
-            root: cargo.root.clone(),
-            cwd: cargo.cwd.clone(),
-            env: cargo.env.clone(),
-            files: cargo.files.clone(),
+            args: cargo.args.clone(), // clone: once per job
+            root: cargo.root.clone(), // clone: once per job
+            cwd: cargo.cwd.clone(),   // clone: once per job
+            env: cargo.env.clone(),   // clone: once per job
+            files: cargo.files.clone(), // clone: once per job
         };
     }
-    let mut args = Vec::new();
+    let mut args = Vec::new(); // alloc: the invocation's words, once per job
     if let Some(targets) = targets {
         for package in &targets.packages {
-            args.extend(["-p".to_owned(), package.clone()]);
+            word(&mut args, "-p");
+            word(&mut args, package);
         }
         if !targets.profile.is_empty() {
-            args.extend(["--profile".to_owned(), targets.profile.clone()]);
+            word(&mut args, "--profile");
+            word(&mut args, &targets.profile);
         }
         if let Some(target) = &targets.target {
-            args.extend(["--target".to_owned(), target.clone()]);
+            word(&mut args, "--target");
+            word(&mut args, target);
         }
         if !targets.features.is_empty() {
-            args.extend(["-F".to_owned(), targets.features.join(",")]);
+            word(&mut args, "-F");
+            args.push(targets.features.join(","));
         }
         if targets.all_features {
-            args.push("--all-features".to_owned());
+            word(&mut args, "--all-features");
         }
         if targets.no_default_features {
-            args.push("--no-default-features".to_owned());
+            word(&mut args, "--no-default-features");
         }
     }
     if let Work::Run { bin: Some(bin), .. } = work {
-        args.extend(["--bin".to_owned(), bin.clone()]);
+        word(&mut args, "--bin");
+        word(&mut args, bin);
     }
     Invocation {
         command: command_of(work),
         args,
-        root: root.to_owned(),
-        cwd: root.to_owned(),
-        env: env.to_vec(),
-        files: Vec::new(),
+        root: root.to_owned(), // alloc: once per job
+        cwd: root.to_owned(),  // alloc: once per job
+        env: env.to_vec(),     // alloc: an agent's whole environment, once per job
+        files: Vec::new(),     // alloc: none, it stays empty
     }
 }
 
 /// Whether cargo's `args` ask for diagnostics a line each (`--message-format=short` or
 /// `json-diagnostic-short`), read as cargo reads each `--message-format`.
 fn short(args: &[String]) -> Result<bool, String> {
-    let mut values = Vec::new();
+    let mut values = Vec::new(); // alloc: none unless a `--message-format` is given
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         if let Some(value) = arg.strip_prefix("--message-format=") {
-            values.push(value.to_owned());
+            values.push(value.to_owned()); // alloc: once per `--message-format`, once per job
         } else if arg == "--message-format" {
             values.extend(args.next().cloned());
         }
@@ -305,12 +442,27 @@ fn short(args: &[String]) -> Result<bool, String> {
     Ok(matches!(crate::cli::print::format(&values)?, Format::Short | Format::Json { short: true, .. }))
 }
 
+/// Whether `root_dir` is one later builds are of again, whose last plan and front end are
+/// kept: a checkout's, not the directory of one agent's view (under `views`), which no other
+/// view shares.
+fn lasting(views: &str, root_dir: &str) -> bool {
+    root_dir.strip_prefix(views).is_none_or(|rest| !rest.starts_with('/'))
+}
+
+/// Whether `work` builds from the head's last plan when it is of the same view and config. A
+/// trace and a verify look at the plan's own run, so they ask it.
+fn reuses_plans(work: &Work) -> bool {
+    !matches!(work, Work::Trace(_) | Work::Verify(_))
+}
+
 /// A view being made ready: its config, its database view, and what its load asked.
 struct Prep {
     opened: Opened,
     root_dir: String,
+    /// The checkout `root_dir` is in [`Jobs::roots`]; none for an agent's view.
+    root: Option<u32>,
     config: Arc<BuildConfig>,
-    /// The view's root and its config as one: what [`Jobs::plans`] is matched by.
+    /// The view's root and its config as one: what [`LastPlan::key`] is matched by.
     key: ContentId,
     queries: ViewId,
     /// Every fetch's `at` this view's load asked for: asked again once mounted is a loop.
@@ -337,22 +489,167 @@ struct LastPlan {
     lock: Option<LockWrite>,
 }
 
-/// A view made ready: lowered, or planned only for the work that walks the plan.
-struct Ready {
-    input: JobInput,
-    front: Option<Arc<dyn Front>>,
-    writer: Option<Box<dyn Writer>>,
+/// Each unit's outputs as ids of [`Paths`]: unit `at`'s are `ids[starts[at]..starts[at + 1]]`.
+struct Outputs {
+    /// The units they are of: a later build of the same units reads these.
+    units: Arc<Units>,
+    starts: Vec<u32>,
+    ids: Vec<u32>,
 }
 
-enum Stage {
+impl Outputs {
+    fn of(&self, unit: usize) -> &[u32] {
+        match (self.starts.get(unit), self.starts.get(unit + 1)) {
+            (Some(&from), Some(&to)) => &self.ids[from as usize..to as usize],
+            _ => &[],
+        }
+    }
+}
+
+/// Every path an output is placed at or an image kept at, interned to a `u32` once, the first
+/// time it comes in, for the daemon's life; the rest indexed by it, a column each.
+struct Paths<S: Steps> {
+    ids: FxHashMap<Box<str>, u32>,
+    /// As it came in: `/`-rooted.
+    names: Vec<Box<str>>,
+    /// The driver's name of it; none for a path that names no file under the driver's root.
+    files: Vec<Option<FileName>>,
+    /// What was placed there and how the file was after: an output of the same value whose
+    /// file is still so is not placed again.
+    placed: Vec<Option<Placement>>,
+    /// The image kept linked there: moved into the compile that relinks it and back once it
+    /// ends ([`Image`]).
+    images: Vec<Option<Image<S>>>,
+    /// How many of `images` are some.
+    kept: u32,
+}
+
+impl<S: Steps> Paths<S> {
+    fn new() -> Paths<S> {
+        Paths {
+            ids: FxHashMap::default(),
+            names: Vec::new(),  // alloc: none until the first path
+            files: Vec::new(),  // alloc: none until the first path
+            placed: Vec::new(), // alloc: none until the first path
+            images: Vec::new(), // alloc: none until the first path
+            kept: 0,
+        }
+    }
+
+    fn intern(&mut self, path: &str) -> u32 {
+        if let Some(&id) = self.ids.get(path) {
+            return id;
+        }
+        let id = u32::try_from(self.names.len()).expect("under 2^32 paths");
+        let name: Box<str> = path.into();
+        self.ids.insert(name.clone(), id); // clone: a path's name, once for the daemon's life
+        self.names.push(name);
+        self.files.push(FileName::new(path.trim_start_matches('/')));
+        self.placed.push(None);
+        self.images.push(None);
+        id
+    }
+
+    /// The id of `path`, an output of the unit whose outputs are `ids`: a compare of the few
+    /// it has, interned only when it is none of them.
+    fn find(&mut self, ids: &[u32], path: &str) -> u32 {
+        ids.iter().copied().find(|&id| &*self.names[id as usize] == path).unwrap_or_else(|| self.intern(path))
+    }
+
+    /// Every unit's outputs interned.
+    fn outputs(&mut self, units: &Arc<Units>) -> Outputs {
+        let count = units.plans.iter().map(|plan| plan.outputs.len()).sum();
+        let mut starts = Vec::with_capacity(units.plans.len() + 1);
+        let mut ids = Vec::with_capacity(count);
+        starts.push(0);
+        for plan in &units.plans {
+            ids.extend(plan.outputs.iter().map(|path| self.intern(path)));
+            starts.push(u32::try_from(ids.len()).expect("under 2^32 outputs"));
+        }
+        Outputs { units: units.clone(), starts, ids } // clone: a refcount, once per new units
+    }
+
+    /// The images kept at `ids`, moved out for a compile.
+    fn take_images(&mut self, ids: &[u32]) -> Vec<Image<S>> {
+        let mut images = Vec::new(); // alloc: none unless an image is kept at an output
+        if self.kept == 0 {
+            return images;
+        }
+        for &id in ids {
+            if let Some(image) = self.images[id as usize].take() {
+                self.kept -= 1;
+                images.push(image);
+            }
+        }
+        images
+    }
+
+    /// Images a compile gave back, kept at their paths, `ids` the unit's outputs.
+    fn keep(&mut self, ids: &[u32], images: Vec<Image<S>>) {
+        for image in images {
+            let id = self.find(ids, &image.path) as usize;
+            if self.images[id].replace(image).is_none() {
+                self.kept += 1;
+            }
+        }
+    }
+}
+
+/// The checkouts later builds are of again ([`lasting`]), interned once by root directory.
+struct Roots<S: Steps> {
+    ids: FxHashMap<Box<str>, u32>,
+    /// The last plan of each.
+    plans: Vec<Option<LastPlan>>,
+    /// The front end of each one's last build, for its next job to lower into
+    /// ([`Steps::lower`]).
+    fronts: Vec<Option<S::KeptFront>>,
+    /// The outputs of its last units, as ids.
+    outputs: Vec<Option<Arc<Outputs>>>,
+}
+
+impl<S: Steps> Roots<S> {
+    fn new() -> Roots<S> {
+        Roots {
+            ids: FxHashMap::default(),
+            plans: Vec::new(),   // alloc: none until the first checkout
+            fronts: Vec::new(),  // alloc: none until the first checkout
+            outputs: Vec::new(), // alloc: none until the first checkout
+        }
+    }
+
+    fn intern(&mut self, root_dir: &str) -> u32 {
+        if let Some(&id) = self.ids.get(root_dir) {
+            return id;
+        }
+        let id = u32::try_from(self.plans.len()).expect("under 2^32 checkouts");
+        self.ids.insert(root_dir.into(), id);
+        self.plans.push(None);
+        self.fronts.push(None);
+        self.outputs.push(None);
+        id
+    }
+}
+
+/// A view made ready: lowered, or planned only for the work that walks the plan.
+struct Ready<S: Steps> {
+    input: JobInput,
+    root: Option<u32>,
+    front: Option<Arc<S::Front>>,
+    writer: Option<S::Writer>,
+}
+
+enum Stage<S: Steps> {
     Library(NodeId),
     Plan(NodeId, Prep),
     Fetch(Fetching),
-    Lower(NodeId, JobInput),
-    Units(Box<Build>),
+    /// The view's units being lowered, and the checkout it is of.
+    Lower(NodeId, JobInput, Option<u32>),
+    Units(Box<Build<S>>),
     Answer(NodeId),
-    /// The tests or the run, once every unit is built: its first tag, and it.
-    Runs(u64, Box<dyn Runs>),
+    /// [`Work::Ahead`]'s choice of units, the view lowered and ready.
+    Ahead(NodeId),
+    /// The tests or the run, once every unit is built: its run in [`Jobs::runs`].
+    Runs(Handle<Run<S>>),
     /// Waits for the VFS's commit of the heads and the store's last put before this.
     Snapshot { ticket: Option<Ticket>, heads: Vec<(String, ContentId)>, store: Option<blaze_cas::Ticket> },
     Over,
@@ -367,22 +664,26 @@ struct Fetching {
     prep: Prep,
 }
 
-struct Build {
+struct Build<S: Steps> {
     input: JobInput,
-    front: Arc<dyn Front>,
+    front: Arc<S::Front>,
     /// The front end, written only here, on the loop: each task that reads it is posted with
     /// a reader made from it then, and a write waits for those readers to end.
-    writer: Box<dyn Writer>,
+    writer: S::Writer,
     /// Reading tasks the plane asked to post while a write waited, posted once it is applied.
     held: Vec<(Posting, bool)>,
-    /// Unit `at` is node `first + at`.
+    /// The unit at node `first + at` is `picked[at]`, or `at` when all are built.
     first: NodeId,
+    count: u32,
+    picked: Option<Vec<u32>>,
     /// Each unit's package, by its place in the plan's packages; `u32::MAX` for none.
     package_of: Vec<u32>,
     /// The packages reported started, a bit each.
     reported: Vec<u64>,
-    /// The build scripts that run: their first tag, and the run.
-    scripts: FxHashMap<NodeId, (u64, Box<dyn Runs>)>,
+    /// Each unit's outputs, as ids of [`Jobs::paths`].
+    outputs: Arc<Outputs>,
+    /// The checkout it is of, whose front end is kept for its next build.
+    root: Option<u32>,
     artifacts: Vec<Artifact>,
     /// `blaze test --ub`'s tests, run in the evaluator once every unit is checked.
     evaluation: Option<Evaluation>,
@@ -396,32 +697,39 @@ struct Evaluation {
     failed: bool,
 }
 
-impl Build {
+impl<S: Steps> Build<S> {
     fn unit(&self, node: NodeId) -> Option<usize> {
-        let at = node.0.wrapping_sub(self.first.0) as usize;
-        (at < self.package_of.len()).then_some(at)
+        let at = node.0.wrapping_sub(self.first.0);
+        if at >= self.count {
+            return None;
+        }
+        Some(self.picked.as_ref().map_or(at, |it| it[at as usize]) as usize)
     }
 }
 
-struct Job {
+struct Job<S: Steps> {
     work: Work,
     views: Vec<Opened>,
-    ready: Vec<Ready>,
+    ready: Vec<Ready<S>>,
     request: Option<RequestId>,
+    /// Started by [`Builder::speculate`] and not promoted.
+    idle: bool,
     closed: bool,
     finished: bool,
     cancelled: Arc<AtomicBool>,
-    stage: Stage,
-    values: FxHashMap<NodeId, Value>,
+    stage: Stage<S>,
+    /// The value of the node its stage waits on, given before the node settles.
+    value: Option<(NodeId, Value<S>)>,
     /// Index files and git repositories reported as `Updating`, once each.
     updating: FxHashSet<String>,
-    /// Opened by the job and closed as it finishes.
+    /// Opened by the job and closed as it finishes, but `built`.
     queries: Vec<ViewId>,
-    /// Views of [`Jobs::plans`] it reads, which the jobs close once none reads them.
+    /// The one of `queries` its last view was made ready in: handed to the session as it
+    /// finishes ([`Said::Finish`]).
+    built: Option<ViewId>,
+    /// Views of [`Roots::plans`] it reads, which the jobs close once none reads them.
     borrowed: Vec<ViewId>,
     placing: usize,
-    /// The first ids of its batches of nodes ([`Jobs::nodes`]).
-    batches: Vec<NodeId>,
     /// Its runs of user code that have not ended.
     runs: u32,
     over: Option<(bool, Option<ApiError>)>,
@@ -429,130 +737,206 @@ struct Job {
     /// Units started that were fresh, and that were made again.
     fresh: u64,
     compiled: u64,
+    /// What its build's front end served of each dependency ([`Writer::served`]), taken by
+    /// its `Work` report.
+    served: Vec<ServedCrate>,
+}
+
+impl<S: Steps> Job<S> {
+    /// The value its stage waited on, if node `node` gave it.
+    fn take_value(&mut self, node: NodeId) -> Option<Value<S>> {
+        self.value.take_if(|(at, _)| *at == node).map(|(_, value)| value)
+    }
+}
+
+/// What the session asked, in the order it asked it.
+enum Asked {
+    Start { id: JobId, view: Option<Opened>, work: Work, idle: bool },
+    Cancel(JobId),
+    Promote(JobId),
+}
+
+/// An effect of the loop's own, by the slot its tag carries.
+enum Own {
+    /// A lock file written for the job.
+    Write { job: JobId, path: u32 },
+    /// An executable's mode set, then its placement recorded.
+    Mode { job: JobId, path: u32, key: blaze_cas::Key },
+    /// A placed output's file looked at: placed again unless it is as it was placed.
+    Look { job: JobId, path: u32, key: blaze_cas::Key, executable: bool },
+    /// A file placed, looked at for its [`Placement`].
+    Record { path: u32, key: blaze_cas::Key },
+}
+
+/// A placement the store was asked for.
+struct Placing {
+    job: JobId,
+    path: u32,
+    key: blaze_cas::Key,
+    executable: bool,
+}
+
+/// A run of user code: a build script's (its node), or the job's tests or run.
+struct Run<S: Steps> {
+    job: JobId,
+    node: Option<NodeId>,
+    /// Put in once started: boxed, so the table's slots stay small whatever the runs hold.
+    runs: Option<Box<S::Runs>>,
+    /// Asked to end early: a run is killed once.
+    killed: bool,
+}
+
+const _: () = assert!(std::mem::size_of::<JobId>() == 8);
+const _: () = assert!(std::mem::size_of::<Own>() <= 52);
+const _: () = assert!(std::mem::size_of::<Placing>() == 48);
+const _: () = assert!(std::mem::size_of::<Run<super::unit::Real>>() == 32);
+
+/// Whose each batch of nodes is, sorted by first id, a column each: the search reads `firsts`
+/// alone, O(log batches) with nothing kept per node.
+struct Batches {
+    firsts: Vec<u32>,
+    counts: Vec<u32>,
+    jobs: Vec<JobId>,
+}
+
+impl Batches {
+    fn new() -> Batches {
+        // alloc: none until the first batch
+        Batches { firsts: Vec::new(), counts: Vec::new(), jobs: Vec::new() }
+    }
+
+    /// Ids come in rising order until the plane's wrap past `2^32`, so this is a push but
+    /// once per wrap.
+    fn insert(&mut self, first: u32, count: u32, job: JobId) {
+        let at = self.firsts.partition_point(|it| *it < first);
+        self.firsts.insert(at, first);
+        self.counts.insert(at, count);
+        self.jobs.insert(at, job);
+    }
+
+    fn job_of(&self, node: NodeId) -> Option<JobId> {
+        let at = self.firsts.partition_point(|it| *it <= node.0).checked_sub(1)?;
+        (node.0 - self.firsts[at] < self.counts[at]).then(|| self.jobs[at])
+    }
+
+    /// Every batch of `job` let go.
+    fn remove(&mut self, job: JobId) {
+        let mut kept = 0;
+        for at in 0..self.jobs.len() {
+            if self.jobs[at] != job {
+                self.firsts[kept] = self.firsts[at];
+                self.counts[kept] = self.counts[at];
+                self.jobs[kept] = self.jobs[at];
+                kept += 1;
+            }
+        }
+        self.firsts.truncate(kept);
+        self.counts.truncate(kept);
+        self.jobs.truncate(kept);
+    }
 }
 
 /// The jobs of the session's [`Builder`], as the loop steps them.
-pub struct Jobs {
+pub struct Jobs<S: Steps> {
     setup: Setup,
-    started: Vec<(JobId, Option<Opened>, Work)>,
-    cancels: Vec<JobId>,
-    /// Walked in id order through [`Jobs::order`] wherever the walk says something.
-    jobs: FxHashMap<JobId, Job>,
-    /// The jobs' ids sorted, reused by each walk that must go in id order.
+    asked: Vec<Asked>,
+    /// By the slot of their [`JobId`], the session's.
+    jobs: Table<Job<S>>,
+    /// The jobs in the order they started: every walk that says something goes in it.
     order: Vec<JobId>,
-    /// Whose each batch of nodes is, by its first id: (how many, the job). A node's batch is
-    /// the last one starting at or below it, O(log batches) with nothing kept per node.
-    // BTreeMap: range queries by node id.
-    nodes: BTreeMap<u32, (u32, JobId)>,
-    by_request: FxHashMap<RequestId, JobId>,
+    batches: Batches,
     library: Option<String>,
     library_failed: Option<ApiError>,
+    /// The errors of fetches that failed, by where they mount: a fetch is one task for every
+    /// job asking it, so the jobs that joined it read its error here. Once per source.
     fetch_failed: FxHashMap<String, ApiError>,
-    /// The store's placements: the job, the value placed, and whether it is executable.
-    placing: FxHashMap<Tag, (JobId, blaze_cas::Key, bool)>,
-    /// What was placed at each path and how the file was after: an output of the same value
-    /// whose file is still so is not placed again.
-    placements: FxHashMap<FileName, Placement>,
-    /// Outputs whose file is looked at before they are placed: the job and the output.
-    looking: FxHashMap<Tag, (JobId, FileName, blaze_cas::Key, bool)>,
-    /// Files placed, looked at for their [`Placement`].
-    recording: FxHashMap<Tag, (FileName, blaze_cas::Key)>,
-    /// The modes of executables placed, by the tag in `own`.
-    moding: FxHashMap<Tag, (FileName, blaze_cas::Key)>,
-    /// The job of each lock write and mode of the loop's own.
-    own: FxHashMap<Tag, (JobId, String)>,
-    next_own: u64,
-    /// Whose each run of user code is (the job, and the script's node), by its number less
-    /// `runs_from`: run `n` has the tags `setup.runs + n * 2^32` on. Ended runs at the front
-    /// are let go, so a completion finds its run in O(1).
-    runs: VecDeque<Option<(JobId, Option<NodeId>)>>,
-    runs_from: u64,
+    /// The store's placements by the store's tag: its tags are its own, made among its other
+    /// effects, so there is no slot of ours in them to index by.
+    placing: FxHashMap<Tag, Placing>,
+    paths: Paths<S>,
+    /// The lock writes, modes and looks at files in flight, by the slot their tag carries.
+    own: Tagged<Own>,
+    /// Every run of user code going, by the number its tags carry: run `n` has the tags
+    /// `setup.runs + n * 2^32` on.
+    runs: Tagged<Run<S>>,
     /// The store's last put: its tickets are made in order, so all before it are durable once
     /// it is.
     put: Option<blaze_cas::Ticket>,
-    /// Every image kept linked, by the path cargo writes it at, for the daemon's life: each is
-    /// moved into the compile that relinks it and back once it ends ([`Image`]).
-    images: FxHashMap<String, Box<dyn Kept>>,
-    /// The last plan of each head, by its root directory.
-    plans: FxHashMap<String, LastPlan>,
-    /// Views of plans replaced in `plans`, closed once no job reads them.
+    roots: Roots<S>,
+    /// Views of plans replaced in `roots`, closed once no job reads them.
     retired: Vec<ViewId>,
-    /// The front end of each head's last build, by its root directory, for the next job of
-    /// the head to lower into ([`Steps::lower`]).
-    fronts: FxHashMap<String, KeptFront>,
+    /// What a run of user code says, a buffer reused by each of its calls.
+    out: Vec<Response>,
+    /// The tasks a write held, a buffer reused by each [`Jobs::apply_writes`].
+    posts: Vec<(Posting, bool)>,
+    /// The jobs that end, a buffer reused by each [`Jobs::wind_up`].
+    over: Vec<(JobId, bool, Option<ApiError>)>,
     /// A job ran a query or a unit since the image was written.
     pub cold: bool,
     /// A job finished since the last collection.
     pub ended: bool,
 }
 
-impl Builder for Jobs {
+impl<S: Steps> Builder for Jobs<S> {
     fn start(&mut self, job: JobId, view: Option<Opened>, work: Work) {
-        self.started.push((job, view, work));
+        self.asked.push(Asked::Start { id: job, view, work, idle: false });
     }
 
     fn cancel(&mut self, job: JobId) {
-        self.cancels.push(job);
+        self.asked.push(Asked::Cancel(job));
+    }
+
+    fn speculate(&mut self, job: JobId, view: Opened, work: Work) {
+        self.asked.push(Asked::Start { id: job, view: Some(view), work, idle: true });
+    }
+
+    fn promote(&mut self, job: JobId) {
+        self.asked.push(Asked::Promote(job));
     }
 }
 
-impl Jobs {
-    pub fn new(setup: Setup) -> Jobs {
-        Jobs {
+impl<S: Steps> Jobs<S> {
+    /// The jobs, their tables of effects and runs reserved, committing nothing.
+    pub fn new(setup: Setup) -> Result<Jobs<S>, MemError> {
+        let numbers = setup.runs_end.saturating_sub(setup.runs) / RUN_TAGS;
+        let bits = numbers.checked_ilog2().unwrap_or(0);
+        let run_slots = bits.min(RUN_SLOT_BITS);
+        let own = Tagged::new(OWN_SLOT_BITS, OWN_GENERATION_BITS, MemTag::Io)?;
+        let runs = Tagged::new(run_slots, bits - run_slots, MemTag::Usercode)?;
+        Ok(Jobs {
             setup,
-            started: Vec::new(),
-            cancels: Vec::new(),
-            jobs: FxHashMap::default(),
-            order: Vec::new(),
-            nodes: BTreeMap::new(),
-            by_request: FxHashMap::default(),
+            asked: Vec::new(), // alloc: none until the session asks
+            jobs: Table::new(),
+            order: Vec::new(), // alloc: none until a job starts
+            batches: Batches::new(),
             library: None,
             library_failed: None,
             fetch_failed: FxHashMap::default(),
             placing: FxHashMap::default(),
-            placements: FxHashMap::default(),
-            looking: FxHashMap::default(),
-            recording: FxHashMap::default(),
-            moding: FxHashMap::default(),
-            own: FxHashMap::default(),
-            next_own: 0,
-            runs: VecDeque::new(),
-            runs_from: 0,
+            paths: Paths::new(),
+            own,
+            runs,
             put: None,
-            images: FxHashMap::default(),
-            plans: FxHashMap::default(),
-            retired: Vec::new(),
-            fronts: FxHashMap::default(),
+            roots: Roots::new(),
+            retired: Vec::new(), // alloc: none until a plan is replaced
+            out: Vec::new(),     // alloc: none until user code says something, then reused
+            posts: Vec::new(),   // alloc: none until a write holds a task, then reused
+            over: Vec::new(),    // alloc: none until a job ends, then reused
             cold: false,
             ended: false,
-        }
+        })
     }
 
     /// Whether no job is under way.
     pub fn idle(&self) -> bool {
-        self.jobs.is_empty() && self.started.is_empty()
+        self.jobs.is_empty() && self.asked.is_empty()
     }
 
-    /// Whether `root_dir` is one later builds are of again, whose last plan and front end are
-    /// kept: a checkout's, not the directory of one agent's view, which no other view shares.
-    fn lasting(&self, root_dir: &str) -> bool {
-        root_dir.strip_prefix(self.setup.views.as_str()).is_none_or(|rest| !rest.starts_with('/'))
-    }
-
-    /// The roots the jobs' views read, kept by a collection.
+    /// The roots the jobs' views read, kept by a collection, in the order the jobs started.
     pub fn roots(&self) -> Vec<ContentId> {
-        let mut jobs: Vec<(&JobId, &Job)> = self.jobs.iter().collect();
-        blaze_ids::radix::sort_by_key(&mut jobs, |(id, _)| id.0);
-        jobs.into_iter().flat_map(|(_, it)| it.views.iter().map(|view| view.view.root)).collect()
-    }
-
-    /// The jobs' ids in order, in [`Jobs::order`]'s buffer: give it back once done.
-    fn sorted(&mut self) -> Vec<JobId> {
-        let mut order = std::mem::take(&mut self.order);
-        order.clear();
-        order.extend(self.jobs.keys().copied());
-        blaze_ids::radix::sort_copy_by_key(&mut order, |it| it.0);
-        order
+        let jobs = self.order.iter().filter_map(|id| self.jobs.get(key_of(*id)));
+        // alloc: once per collection
+        jobs.flat_map(|it| it.views.iter().map(|view| view.view.root)).collect()
     }
 
     pub fn owns(&self, tag: Tag) -> bool {
@@ -563,136 +947,169 @@ impl Jobs {
     }
 
     /// Takes what the session asked since the last call.
-    pub fn step(&mut self, w: &mut World<'_>) {
-        if !self.started.is_empty() {
-            let mut started = std::mem::take(&mut self.started);
-            for (id, view, work) in started.drain(..) {
-                self.begin(w, id, view, work);
+    pub fn step(&mut self, w: &mut World<'_, S>) {
+        if !self.asked.is_empty() {
+            let mut asked = std::mem::take(&mut self.asked);
+            for it in asked.drain(..) {
+                match it {
+                    Asked::Start { id, view, work, idle } => self.begin(w, id, view, work, idle),
+                    Asked::Cancel(id) => self.cancel_job(w, id),
+                    Asked::Promote(id) => self.promote_job(w, id),
+                }
             }
-            if self.started.is_empty() {
-                self.started = started;
-            }
-        }
-        if !self.cancels.is_empty() {
-            let mut cancels = std::mem::take(&mut self.cancels);
-            for id in cancels.drain(..) {
-                self.cancel_job(w, id);
-            }
-            if self.cancels.is_empty() {
-                self.cancels = cancels;
+            if self.asked.is_empty() {
+                self.asked = asked;
             }
         }
         self.wind_up(w);
     }
 
-    fn begin(&mut self, w: &mut World<'_>, id: JobId, view: Option<Opened>, work: Work) {
+    fn begin(&mut self, w: &mut World<'_, S>, id: JobId, view: Option<Opened>, work: Work, idle: bool) {
         let views = match (&work, view) {
-            (Work::Reach { from, .. }, Some(to)) => vec![*from, to],
-            (_, Some(view)) => vec![view],
-            (_, None) => Vec::new(),
+            (Work::Reach { from, .. }, Some(to)) => vec![*from, to], // alloc: once per job
+            (_, Some(view)) => vec![view],                           // alloc: once per job
+            (_, None) => Vec::new(),                                 // alloc: none
         };
         let keep_going = targets_of(&work)
             .and_then(|it| it.cargo.as_ref())
             .is_some_and(|cargo| cargo.args.iter().any(|arg| arg == "--keep-going"));
         let snapshot = matches!(work, Work::Snapshot);
-        let mut job = Job {
+        let job = Job {
             work,
             views,
-            ready: Vec::new(),
+            ready: Vec::new(), // alloc: once per job, a view or two
             request: None,
+            idle,
             closed: false,
             finished: snapshot,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)), // alloc: once per job, shared with its tasks
             stage: Stage::Over,
-            values: FxHashMap::default(),
+            value: None,
             updating: FxHashSet::default(),
-            queries: Vec::new(),
-            borrowed: Vec::new(),
+            queries: Vec::new(),  // alloc: once per job
+            built: None,
+            borrowed: Vec::new(), // alloc: once per job
             placing: 0,
-            batches: Vec::new(),
             runs: 0,
             over: None,
             stats: RequestStats::default(),
             fresh: 0,
             compiled: 0,
+            served: Vec::new(), // alloc: none; a build fills it once
         };
-        if snapshot {
-            job.stage = self.snapshot(w);
-            self.jobs.insert(id, job);
+        if self.jobs.put(key_of(id), job).is_err() {
+            // alloc: an error the session's free list can't give
+            let error = ApiError::new(format!("job slot {} is still another job's: it was handed out twice", id.slot), None);
+            w.said.push(Said::Finish(id, false, Some(error), None));
             return;
         }
-        let request = w.plane.open(w.now, keep_going);
-        job.request = Some(request);
-        self.by_request.insert(request, id);
-        self.jobs.insert(id, job);
+        self.order.push(id);
+        if snapshot {
+            let stage = self.snapshot(w);
+            if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                job.stage = stage;
+            }
+            return;
+        }
+        let request = w.plane.open(w.now, keep_going, idle);
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+            job.request = Some(request);
+        }
         self.prepare(w, id);
     }
 
+    /// A job of declared intent run from now on as one started: its plane request takes its
+    /// share. Once; a job gone, or not idle, is let be.
+    fn promote_job(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if !job.idle {
+            return;
+        }
+        job.idle = false;
+        if let (Some(request), false) = (job.request, job.finished) {
+            w.plane.promote(w.now, request);
+        }
+    }
+
     /// Makes the next view of the job ready, the standard library first.
-    fn prepare(&mut self, w: &mut World<'_>, id: JobId) {
+    fn prepare(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         if self.library.is_none() {
-            let job = self.jobs.get_mut(&id).expect("a job being prepared");
-            let steps = w.steps.clone();
+            let steps = w.steps.clone(); // clone: a refcount, once
             let kept = w.mounts.libraries(w.vfs);
-            let work = task(&job.cancelled, move |_, _| Ok(steps.library(&kept)?), |_, it| Value::Library(it));
+            let work = Step::of(&job.cancelled, Does::Library { steps, kept });
             let name = "the standard library's source";
             let fresh = lone(w.plane, NodeKind::Std, name, Pool::Io, Some(library_key()), kinds::LIBRARY);
             job.stage = Stage::Library(fresh.first());
             self.add(w, id, fresh, Some(work), false);
             return;
         }
-        let job = self.jobs.get(&id).expect("a job being prepared");
-        let opened = job.views[job.ready.len()];
-        let prep = self.open(w, id, opened, FxHashSet::default());
-        self.plan(w, id, prep);
+        let Some(&opened) = job.views.get(job.ready.len()) else {
+            self.end(w, id, false, Some(ApiError::new("the job has no view to build", None)));
+            return;
+        };
+        self.open(w, id, opened, FxHashSet::default());
     }
 
     /// The view opened in the database with its build configuration as the mounts are now, or
-    /// the head's last plan when it was of this view and configuration.
-    fn open(&mut self, w: &mut World<'_>, id: JobId, opened: Opened, asked: FxHashSet<String>) -> Prep {
-        let job = self.jobs.get_mut(&id).expect("a job opening a view");
+    /// the head's last plan when it was of this view and configuration; then its plan.
+    fn open(&mut self, w: &mut World<'_, S>, id: JobId, opened: Opened, asked: FxHashSet<String>) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        // clone: the config owns the library's place, once per view
+        let Some(library) = self.library.clone() else {
+            let error = ApiError::new("a view was opened before the standard library was mounted", None);
+            self.end(w, id, false, Some(error));
+            return;
+        };
         let targets = targets_of(&job.work);
         let root_dir = match targets.and_then(|it| it.cargo.as_ref()) {
-            Some(cargo) => cargo.root.clone(),
+            Some(cargo) => cargo.root.clone(), // clone: the view's root directory, once per view
             None => w
                 .heads
                 .path_of(w.vfs, opened.view.root)
+                // alloc: an agent's view's directory, once per view
                 .unwrap_or_else(|| format!("{}/{:x}", self.setup.views, opened.view.root)),
         };
-        let library = self.library.clone().expect("the library is mounted before a view is opened");
+        let root = lasting(&self.setup.views, &root_dir).then(|| self.roots.intern(&root_dir));
+        // clone: the config owns its mounts, once per view
         let mut mounts = vec![Mount { at: root_dir.clone(), origin: Origin::View, under: String::new() }];
         mounts.extend(w.mounts.all().cloned());
         mounts.sort_by(|a, b| a.at.cmp(&b.at));
         let config = BuildConfig {
             invocation: invocation(&job.work, targets, &root_dir, &self.setup.env),
             mounts,
-            host: self.setup.host.clone(),
+            host: self.setup.host.clone(), // clone: the config owns it, once per view
             library,
         };
         let encoded = config.encode();
         let key = Hasher::new("blaze v2 serve last plan").id(&opened.view.root).part(&encoded).finish();
+        let config = Arc::new(config); // alloc: once per view, shared with its tasks
         if reuses_plans(&job.work)
-            && let Some(last) = self.plans.get(&root_dir)
+            && let Some(root) = root
+            && let Some(Some(last)) = self.roots.plans.get(root as usize)
             && last.key == key
         {
             job.borrowed.push(last.queries);
-            let (queries, last) = (last.queries, Some((last.units.clone(), last.lock.clone())));
-            return Prep { opened, root_dir, config: Arc::new(config), key, queries, asked, last };
+            // clone: a refcount and the lock's text, once per view
+            let last_units = Some((last.units.clone(), last.lock.clone()));
+            let prep = Prep { opened, root_dir, root, config, key, queries: last.queries, asked, last: last_units };
+            self.plan(w, id, prep);
+            return;
         }
         let queries = w.db.open_with(opened.view, &encoded);
         job.queries.push(queries);
-        Prep { opened, root_dir, config: Arc::new(config), key, queries, asked, last: None }
+        self.plan(w, id, Prep { opened, root_dir, root, config, key, queries, asked, last: None });
     }
 
     /// The view's plan asked, or taken from the head's last one.
-    fn plan(&mut self, w: &mut World<'_>, id: JobId, mut prep: Prep) {
+    fn plan(&mut self, w: &mut World<'_, S>, id: JobId, mut prep: Prep) {
         if let Some((units, lock)) = prep.last.take() {
             self.ready(w, id, prep, units, lock);
             return;
         }
-        let job = self.jobs.get_mut(&id).expect("a job planning");
-        let (steps, db, queries) = (w.steps.clone(), w.db.clone(), prep.queries);
-        let work = task(&job.cancelled, move |_, _| steps.plan(&db, queries), |_, it| Value::Planned(it));
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let (steps, db, queries) = (w.steps.clone(), w.db.clone(), prep.queries); // clone: two refcounts, once per plan
+        let work = Step::of(&job.cancelled, Does::Plan { steps, db, queries });
         let name = named("the plan of ", &prep.root_dir);
         let fresh = lone(w.plane, NodeKind::Manifest, &name, Pool::Work, None, kinds::PLAN);
         job.stage = Stage::Plan(fresh.first(), prep);
@@ -700,15 +1117,18 @@ impl Jobs {
     }
 
     /// A batch of the job's nodes; with `reads`, its tasks read the job's front end.
-    fn add(&mut self, w: &mut World<'_>, id: JobId, fresh: Fresh, work: Option<plane::Work<Value>>, reads: bool) {
-        let job = self.jobs.get_mut(&id).expect("a job adding nodes");
-        let request = job.request.expect("a job that builds has a request");
+    fn add(&mut self, w: &mut World<'_, S>, id: JobId, fresh: Fresh, work: Option<Step<S>>, reads: bool) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let Some(request) = job.request else {
+            self.end(w, id, false, Some(ApiError::new("the job has no request of the plane to add its tasks to", None)));
+            return;
+        };
         let (first, count) = (fresh.first(), fresh.count());
         if count > 0 {
-            job.batches.push(first);
-            self.nodes.insert(first.0, (count, id));
+            self.batches.insert(first.0, count, id);
         }
         if let Err(error) = w.plane.add(w.now, request, fresh, work, reads) {
+            // alloc: an error, once
             self.end(w, id, false, Some(ApiError::new(format!("the plane refused the job's tasks: {error}"), None)));
         }
     }
@@ -717,9 +1137,8 @@ impl Jobs {
     /// now, after every write the loop applied before it. While a write of its job waits for
     /// the readers before it, the task is held and posted once the write is applied
     /// ([`Jobs::apply_writes`]). A compile is given the images kept at its outputs.
-    fn post(&mut self, w: &mut World<'_>, task: Posting, again: bool) {
-        let id = self.job_of(task.id);
-        let job = id.and_then(|id| self.jobs.get_mut(&id));
+    fn post(&mut self, w: &mut World<'_, S>, task: Posting, again: bool) {
+        let job = self.batches.job_of(task.id).and_then(|id| self.jobs.get_mut(key_of(id)));
         let readers = match job {
             Some(Job { stage: Stage::Units(build), .. }) => {
                 let Some(this) = build.writer.reader() else {
@@ -727,12 +1146,12 @@ impl Jobs {
                     return;
                 };
                 let images = match task.kind == kinds::COMPILE {
-                    true => take_images(&mut self.images, &build.input.units, task.arg as usize),
-                    false => Vec::new(),
+                    true => self.paths.take_images(build.outputs.of(task.arg as usize)),
+                    false => Vec::new(), // alloc: none
                 };
                 Some(Readers { this: Some(this), images, ..Readers::default() })
             }
-            Some(job) if matches!(job.stage, Stage::Answer(_)) => match job.work {
+            Some(job) if matches!(job.stage, Stage::Answer(_) | Stage::Ahead(_)) => match job.work {
                 Work::Tables => job.ready.last_mut().and_then(|it| it.writer.take()).map(|writer| Readers {
                     writer: Some(writer),
                     ..Readers::default()
@@ -750,6 +1169,7 @@ impl Jobs {
         };
         match readers {
             Some(readers) => w.plane.post(task, again, readers),
+            // alloc: a refused task, once
             None => w.plane.refuse(w.now, task, "its job has no front end to read now".to_owned()),
         }
     }
@@ -760,11 +1180,11 @@ impl Jobs {
     /// step: a reader is dropped as its task's work returns, before the plane hears the task
     /// ended, so the step that hears the last one applies the write. The daemon calls it
     /// once a turn as well, for a reader that outlives its task.
-    pub fn apply_writes(&mut self, w: &mut World<'_>) {
-        let order = self.sorted();
-        let mut posts = Vec::new();
-        for id in &order {
-            let job = self.jobs.get_mut(id).expect("a job in the order");
+    pub fn apply_writes(&mut self, w: &mut World<'_, S>) {
+        let order = std::mem::take(&mut self.order);
+        let mut posts = std::mem::take(&mut self.posts);
+        for &id in &order {
+            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             let Stage::Units(build) = &mut job.stage else { continue };
             if !build.writer.waiting() && build.held.is_empty() {
                 continue;
@@ -773,31 +1193,27 @@ impl Jobs {
                 Ok(true) => posts.append(&mut build.held),
                 Ok(false) => {}
                 Err(error) => {
-                    let held = std::mem::take(&mut build.held);
-                    for (task, _) in held {
-                        w.plane.refuse(w.now, task, format!("applying a build script's run or a proc macro: {}", error.what));
+                    for (task, _) in build.held.drain(..) {
+                        // alloc: a write that failed, once per task it held
+                        let why = format!("applying a build script's run or a proc macro: {}", error.what);
+                        w.plane.refuse(w.now, task, why);
                     }
                     if !job.cancelled.load(Ordering::Acquire) {
                         job.over.get_or_insert((false, Some(error)));
                     }
-                    self.end(w, *id, false, None);
+                    self.end(w, id, false, None);
                 }
             }
         }
         self.order = order;
-        for (task, again) in posts {
+        for (task, again) in posts.drain(..) {
             self.post(w, task, again);
         }
-    }
-
-    /// The job whose node `node` is.
-    fn job_of(&self, node: NodeId) -> Option<JobId> {
-        let (first, (count, id)) = self.nodes.range(..=node.0).next_back()?;
-        (node.0 - first < *count).then_some(*id)
+        self.posts = posts;
     }
 
     /// What the plane did.
-    pub fn happened(&mut self, w: &mut World<'_>, happened: &mut Vec<Happened<Value>>) {
+    pub fn happened(&mut self, w: &mut World<'_, S>, happened: &mut Vec<Happened<Value<S>>>) {
         for it in happened.drain(..) {
             match it {
                 Happened::Kept { id, puts } => self.kept(w, id, puts),
@@ -814,30 +1230,32 @@ impl Jobs {
 
     /// Keeps what a task's expansions put, from the store's one owner: a refused one fails the
     /// task's job, naming the expansion.
-    fn kept(&mut self, w: &mut World<'_>, node: NodeId, puts: Vec<blaze_expand::Put>) {
+    fn kept(&mut self, w: &mut World<'_, S>, node: NodeId, puts: Vec<blaze_expand::Put>) {
         let published = blaze_expand::publish(w.store, puts);
         if let Some(ticket) = published.tickets.last() {
             self.put = Some(*ticket);
         }
         let Some(refused) = published.refused.into_iter().next() else { return };
-        if let Some(job) = self.job_of(node).and_then(|id| self.jobs.get_mut(&id)) {
+        if let Some(job) = self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id))) {
             job.over.get_or_insert((false, Some(ApiError::new(refused, None))));
         }
     }
 
-    fn did(&mut self, w: &mut World<'_>, node: NodeId, value: Value) {
+    fn did(&mut self, w: &mut World<'_, S>, node: NodeId, value: Value<S>) {
         match value {
             Value::Library(Ok(Library { at, fingerprint, source })) => {
                 let mounted = match &source {
                     Some(source) => w.mounts.mount_library(w.vfs, &at, &fingerprint, source).map(drop),
                     None if w.mounts.has(&at) => Ok(()),
+                    // alloc: an error, once
                     None => Err(format!("its files were not read as it was mounted at {at}, and nothing is")),
                 };
                 match mounted {
                     Ok(()) => self.library = Some(at),
                     Err(why) => {
-                        self.library_failed =
-                            Some(ApiError::new(format!("the standard library's source: {why}"), Some(at)));
+                        // alloc: an error, once
+                        let what = format!("the standard library's source: {why}");
+                        self.library_failed = Some(ApiError::new(what, Some(at)));
                     }
                 }
             }
@@ -845,19 +1263,27 @@ impl Jobs {
             Value::Fetched(fetches, at, Ok(source)) => {
                 let fetch = &fetches[at as usize];
                 if let Err(why) = w.mounts.mount(w.vfs, &fetch.at, &source) {
+                    // clone: a failed fetch's names, once per source
                     self.fetch_failed.insert(fetch.at.clone(), ApiError::new(why, Some(fetch.what.clone())));
                 }
             }
             Value::Fetched(fetches, at, Err(error)) => {
+                // clone: a failed fetch's place, once per source
                 self.fetch_failed.insert(fetches[at as usize].at.clone(), error);
             }
             Value::Compiled(unit, result, images) => {
-                self.images.extend(images.into_iter().map(|Image { path, kept }| (path, kept)));
+                if !images.is_empty() {
+                    let build = self.batches.job_of(node).and_then(|id| match &self.jobs.get(key_of(id))?.stage {
+                        Stage::Units(build) => Some(build),
+                        _ => None,
+                    });
+                    self.paths.keep(build.map_or(&[][..], |it| it.outputs.of(unit)), images);
+                }
                 self.compiled(w, node, unit, result);
             }
             Value::Evaluated(result) => {
-                let Some(id) = self.job_of(node) else { return };
-                let Some(job) = self.jobs.get_mut(&id) else { return };
+                let Some(id) = self.batches.job_of(node) else { return };
+                let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
                 match result {
                     Ok(result) => {
                         if result.outcome == TestOutcome::Failed
@@ -876,18 +1302,18 @@ impl Jobs {
                 }
             }
             value => {
-                if let Some(job) = self.job_of(node).and_then(|id| self.jobs.get_mut(&id)) {
-                    job.values.insert(node, value);
+                if let Some(job) = self.batches.job_of(node).and_then(|id| self.jobs.get_mut(key_of(id))) {
+                    job.value = Some((node, value));
                 }
             }
         }
     }
 
-    fn settled(&mut self, w: &mut World<'_>, node: NodeId, ok: bool, why: Option<String>) {
-        let Some(id) = self.job_of(node) else { return };
-        let Some(job) = self.jobs.get_mut(&id) else { return };
+    fn settled(&mut self, w: &mut World<'_, S>, node: NodeId, ok: bool, why: Option<String>) {
+        let Some(id) = self.batches.job_of(node) else { return };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         if job.over.is_some() {
-            job.values.remove(&node);
+            job.take_value(node);
             return;
         }
         let why = why.unwrap_or_default();
@@ -896,21 +1322,21 @@ impl Jobs {
                 if self.library.is_some() {
                     self.prepare(w, id);
                 } else {
-                    let error = self
-                        .library_failed
-                        .clone()
-                        .unwrap_or_else(|| ApiError::new(format!("the standard library's source: {why}"), None));
+                    // alloc: an error, once
+                    let error = self.library_failed.clone().unwrap_or_else(|| {
+                        ApiError::new(format!("the standard library's source: {why}"), None) // alloc: an error, once
+                    });
                     self.end(w, id, false, Some(error));
                 }
             }
-            Stage::Plan(at, prep) if at == node => {
-                let value = job.values.remove(&node);
-                match value {
-                    Some(Value::Planned(Ok(planned))) => self.planned(w, id, prep, planned),
-                    Some(Value::Planned(Err(error))) => self.end(w, id, false, Some(error)),
-                    _ => self.end(w, id, false, Some(ApiError::new(format!("the plan of {}: {why}", prep.root_dir), None))),
+            Stage::Plan(at, prep) if at == node => match job.take_value(node) {
+                Some(Value::Planned(Ok(planned))) => self.planned(w, id, prep, planned),
+                Some(Value::Planned(Err(error))) => self.end(w, id, false, Some(error)),
+                _ => {
+                    let error = ApiError::new(format!("the plan of {}: {why}", prep.root_dir), None); // alloc: an error, once
+                    self.end(w, id, false, Some(error));
                 }
-            }
+            },
             Stage::Fetch(mut fetching) => {
                 let place = node.0.wrapping_sub(fetching.first.0) as usize;
                 if place >= fetching.fetches.len() {
@@ -919,11 +1345,10 @@ impl Jobs {
                 }
                 if !ok {
                     let at = &fetching.fetches[place].at;
-                    let error = self
-                        .fetch_failed
-                        .get(at)
-                        .cloned()
-                        .unwrap_or_else(|| ApiError::new(format!("fetching {at}: {why}"), Some(at.clone())));
+                    // clone: a failed fetch's error, for each job that asked it
+                    let error = self.fetch_failed.get(at).cloned().unwrap_or_else(|| {
+                        ApiError::new(format!("fetching {at}: {why}"), Some(at.clone())) // alloc: an error, once
+                    });
                     job.over.get_or_insert((false, Some(error)));
                 }
                 fetching.left -= 1;
@@ -938,18 +1363,29 @@ impl Jobs {
                 }
                 w.db.close(prep.queries);
                 job.queries.retain(|it| *it != prep.queries);
-                let again = self.open(w, id, prep.opened, prep.asked);
-                self.plan(w, id, again);
+                self.open(w, id, prep.opened, prep.asked);
             }
-            Stage::Lower(at, input) if at == node => match job.values.remove(&node) {
-                Some(Value::Lowered(Ok(FrontEnd { front, writer }))) => {
-                    job.ready.push(Ready { input, front: Some(front), writer: Some(writer) });
+            Stage::Lower(at, input, root) if at == node => match job.take_value(node) {
+                Some(Value::Lowered(Ok(FrontEnd { front, writer, puts }))) => {
+                    for put in puts {
+                        let key = put.key;
+                        match w.store.put(put.key, put.kind, put.bytes) {
+                            Ok(ticket) => self.put = Some(ticket),
+                            Err(mismatch) => {
+                                // alloc: an error, once
+                                let what = format!("the store holds other bytes under {key:?}: {mismatch:?}");
+                                self.end(w, id, false, Some(ApiError::new(what, None)));
+                                return;
+                            }
+                        }
+                    }
+                    job.ready.push(Ready { input, root, front: Some(front), writer: Some(writer) });
                     self.next(w, id);
                 }
                 Some(Value::Lowered(Err(error))) => self.end(w, id, false, Some(error)),
-                _ => self.end(w, id, false, Some(ApiError::new(format!("lowering the units: {why}"), None))),
+                _ => self.end(w, id, false, Some(ApiError::new(format!("lowering the units: {why}"), None))), // alloc: an error, once
             },
-            Stage::Answer(at) if at == node => match job.values.remove(&node) {
+            Stage::Answer(at) if at == node => match job.take_value(node) {
                 Some(Value::Answer(Ok(response))) => {
                     w.said.push(Said::Report(id, response));
                     self.end(w, id, true, None);
@@ -957,30 +1393,43 @@ impl Jobs {
                 Some(Value::Answer(Err(error))) => self.end(w, id, false, Some(error)),
                 _ => self.end(w, id, false, Some(ApiError::new(why, None))),
             },
+            Stage::Ahead(at) if at == node => match job.take_value(node) {
+                Some(Value::Ahead(Ok(units))) => self.build(w, id, Some(&units)),
+                Some(Value::Ahead(Err(error))) => self.end(w, id, false, Some(error)),
+                _ => {
+                    let error = ApiError::new(format!("choosing the units to build ahead: {why}"), None); // alloc: an error, once
+                    self.end(w, id, false, Some(error));
+                }
+            },
             Stage::Units(build) if build.evaluation.as_ref().is_some_and(|it| it.select == node) => {
-                let value = job.values.remove(&node);
+                let value = job.take_value(node);
                 job.stage = Stage::Units(build);
                 match value {
                     Some(Value::Selected(Ok(tests))) => self.evaluate(w, id, tests),
                     Some(Value::Selected(Err(error))) => self.end(w, id, false, Some(error)),
-                    _ => self.end(w, id, false, Some(ApiError::new(format!("selecting the tests: {why}"), None))),
+                    _ => {
+                        let error = ApiError::new(format!("selecting the tests: {why}"), None); // alloc: an error, once
+                        self.end(w, id, false, Some(error));
+                    }
                 }
             }
             stage => job.stage = stage,
         }
     }
 
-    fn planned(&mut self, w: &mut World<'_>, id: JobId, mut prep: Prep, planned: Planned) {
+    fn planned(&mut self, w: &mut World<'_, S>, id: JobId, mut prep: Prep, planned: Planned) {
         match planned {
             Planned::Failed(error) => self.end(w, id, false, Some(ApiError::new(error.what, error.at))),
             Planned::Needs(fetches) => {
-                let job = self.jobs.get_mut(&id).expect("a job planning");
+                let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
                 let mut wanted = Vec::with_capacity(fetches.len());
                 for fetch in fetches {
+                    // clone: each place asked, once per source
                     if !prep.asked.insert(fetch.at.clone()) {
                         let error = ApiError::new(
+                            // alloc: an error, once
                             format!("the load asked for {} again after it was fetched and mounted at {}", fetch.what, fetch.at),
-                            Some(fetch.at.clone()),
+                            Some(fetch.at.clone()), // clone: an error, once
                         );
                         self.end(w, id, false, Some(error));
                         return;
@@ -989,8 +1438,9 @@ impl Jobs {
                         continue;
                     }
                     let verb = match &fetch.kind {
-                        FetchKind::Crate { .. } => Some((FetchVerb::Downloaded, fetch.what.clone())),
+                        FetchKind::Crate { .. } => Some((FetchVerb::Downloaded, fetch.what.clone())), // clone: a report, once per source
                         FetchKind::IndexFile | FetchKind::Git { .. } => {
+                            // clone: a report, once per index or repository
                             job.updating.insert(fetch.what.clone()).then(|| (FetchVerb::Updating, fetch.what.clone()))
                         }
                     };
@@ -1002,8 +1452,7 @@ impl Jobs {
                 if wanted.is_empty() {
                     w.db.close(prep.queries);
                     job.queries.retain(|it| *it != prep.queries);
-                    let again = self.open(w, id, prep.opened, prep.asked);
-                    self.plan(w, id, again);
+                    self.open(w, id, prep.opened, prep.asked);
                     return;
                 }
                 let count = u32::try_from(wanted.len()).expect("under 2^32 fetches");
@@ -1011,7 +1460,7 @@ impl Jobs {
                 const FETCH: &str = "fetch ";
                 let names = fetches.iter().map(|it| FETCH.len() + it.what.len()).sum();
                 let mut fresh = w.plane.fresh(count, names, 0);
-                let mut name = String::new();
+                let mut name = String::new(); // alloc: one name buffer, reused by every fetch
                 for (at, fetch) in (0u32..).zip(fetches.iter()) {
                     name.clear();
                     name.push_str(FETCH);
@@ -1020,27 +1469,23 @@ impl Jobs {
                     w.plane.push(&mut fresh, node(NodeKind::Fetch, &name, &[], Pool::Io, Some(fetch_key(fetch))), task);
                 }
                 let first = fresh.first();
-                let work = {
-                    let (steps, asked, told) = (w.steps.clone(), fetches.clone(), fetches.clone());
-                    task(
-                        &job.cancelled,
-                        move |at, _| Ok(steps.fetch(&asked[at as usize])?),
-                        move |at, result| Value::Fetched(told.clone(), at, result),
-                    )
-                };
+                // clone: two refcounts, once per batch of fetches
+                let work = Step::of(&job.cancelled, Does::Fetch { steps: w.steps.clone(), fetches: fetches.clone() });
                 job.stage = Stage::Fetch(Fetching { first, fetches, left: count, prep });
                 self.add(w, id, fresh, Some(work), false);
             }
             Planned::Ready(mut units) => {
                 let lock = units.lock.take();
-                let units = Arc::new(units);
-                let lasting = self.lasting(&prep.root_dir);
-                let job = self.jobs.get_mut(&id).expect("a job planning");
-                if lasting && reuses_plans(&job.work) {
+                let units = Arc::new(units); // alloc: once per plan, shared by the job's tasks
+                let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+                if let Some(root) = prep.root
+                    && reuses_plans(&job.work)
+                {
                     job.queries.retain(|it| *it != prep.queries);
                     job.borrowed.push(prep.queries);
+                    // clone: a refcount and the lock's text, once per plan
                     let last = LastPlan { key: prep.key, queries: prep.queries, units: units.clone(), lock: lock.clone() };
-                    if let Some(old) = self.plans.insert(prep.root_dir.clone(), last)
+                    if let Some(old) = self.roots.plans[root as usize].replace(last)
                         && old.queries != prep.queries
                     {
                         self.retired.push(old.queries);
@@ -1053,23 +1498,30 @@ impl Jobs {
 
     /// The view's plan taken: its lock file written, its warnings reported, and its units
     /// lowered, or for the work that walks the plan, the view ready as it is.
-    fn ready(&mut self, w: &mut World<'_>, id: JobId, prep: Prep, units: Arc<Units>, lock: Option<LockWrite>) {
-        let job = self.jobs.get_mut(&id).expect("a job planning");
+    fn ready(&mut self, w: &mut World<'_, S>, id: JobId, prep: Prep, units: Arc<Units>, lock: Option<LockWrite>) {
+        if self.jobs.get(key_of(id)).is_none() {
+            return;
+        }
         if let Some(lock) = lock {
-            match FileName::new(lock.path.trim_start_matches('/')) {
-                Some(file) => {
-                    let tag = Tag(self.setup.tags + self.next_own % (1 << 32));
-                    self.next_own += 1;
-                    self.own.insert(tag, (id, lock.path));
-                    job.placing += 1;
-                    w.effects.push(Effect::Write { file, bytes: lock.text.into_bytes(), tag });
-                }
-                None => {
-                    let error = ApiError::new(format!("the lock file's path {} is no file", lock.path), Some(lock.path));
+            let path = self.paths.intern(&lock.path);
+            // clone: the driver's effect owns the file's name, once per lock write
+            let Some(file) = self.paths.files[path as usize].clone() else {
+                // alloc: an error, once
+                let error = ApiError::new(format!("the lock file's path {} is no file", lock.path), Some(lock.path));
+                self.end(w, id, false, Some(error));
+                return;
+            };
+            let tag = match self.own_tag(Own::Write { job: id, path }) {
+                Ok(tag) => tag,
+                Err(error) => {
                     self.end(w, id, false, Some(error));
                     return;
                 }
+            };
+            if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                job.placing += 1;
             }
+            w.effects.push(Effect::Write { file, bytes: lock.text.into_bytes(), tag });
         }
         for warning in &units.warnings {
             w.said.push(Said::Report(id, Response::Diagnostic(warned(warning))));
@@ -1077,12 +1529,14 @@ impl Jobs {
         let short = match short(&prep.config.invocation.args) {
             Ok(short) => short,
             Err(why) => {
-                self.end(w, id, false, Some(ApiError::new(why, Some("--message-format".to_owned()))));
+                self.end(w, id, false, Some(ApiError::new(why, Some("--message-format".to_owned())))); // alloc: an error, once
                 return;
             }
         };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        job.built = job.queries.contains(&prep.queries).then_some(prep.queries);
         let input = JobInput {
-            db: w.db.clone(),
+            db: w.db.clone(), // clone: a refcount, once per view
             queries: prep.queries,
             root: prep.opened.view.root,
             files: w.vfs.reader(),
@@ -1092,149 +1546,145 @@ impl Jobs {
             color: targets_of(&job.work).and_then(|it| it.cargo.as_ref()).map_or(self.setup.color, |it| it.color),
             short,
             goal: goal_of(&job.work),
-            cancelled: job.cancelled.clone(),
+            cancelled: job.cancelled.clone(), // clone: a refcount, once per view
         };
         if matches!(job.work, Work::Trace(_) | Work::Verify(_)) {
-            job.ready.push(Ready { input, front: None, writer: None });
+            job.ready.push(Ready { input, root: prep.root, front: None, writer: None });
             self.next(w, id);
             return;
         }
-        let kept = Mutex::new(self.fronts.remove(&prep.root_dir));
-        let (steps, lowering) = (w.steps.clone(), input.clone());
-        let work = task(
-            &job.cancelled,
-            move |_, _| steps.lower(&lowering, kept.lock().unwrap_or_else(|it| it.into_inner()).take()),
-            |_, it| Value::Lowered(it),
-        );
+        let kept = Mutex::new(prep.root.and_then(|root| self.roots.fronts[root as usize].take()));
+        let (steps, lowering) = (w.steps.clone(), input.clone()); // clone: refcounts, once per view
+        let work = Step::of(&job.cancelled, Does::Lower { steps, input: lowering, kept });
         let name = named("lowering ", &prep.root_dir);
         let fresh = lone(w.plane, NodeKind::Names, &name, Pool::Work, None, kinds::LOWER);
-        job.stage = Stage::Lower(fresh.first(), input);
+        job.stage = Stage::Lower(fresh.first(), input, prep.root);
         self.add(w, id, fresh, Some(work), false);
     }
 
     /// The next view to make ready, or the work once all are.
-    fn next(&mut self, w: &mut World<'_>, id: JobId) {
-        let job = self.jobs.get(&id).expect("a job going on");
+    fn next(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         if job.ready.len() < job.views.len() {
             self.prepare(w, id);
             return;
         }
-        let job = self.jobs.get_mut(&id).expect("a job going on");
-        let cancelled = job.cancelled.clone();
-        let ready = job.ready.last().expect("a job has a view");
-        let reads = ready.writer.is_some();
-        let answer: Option<plane::Work<Value>> = match &job.work {
-            Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } => None,
-            Work::Reach { changes, .. } => {
-                let from = job.ready[0].front.clone().expect("a reach lowers both views");
-                let to = ready.front.clone().expect("a reach lowers both views");
-                let changes = changes.clone();
-                let reach = move |_: u32, readers: Readers| {
-                    let from_reader = readers.from.expect("a reach is posted with a reader of the view it reaches from");
-                    to.reach(this(Readers { from: None, ..readers }), from.as_ref(), from_reader, &changes)
-                };
-                Some(task(&cancelled, reach, |_, it| Value::Answer(it.map(Response::Reached))))
-            }
-            Work::CodegenInputs(_) => {
-                let front = ready.front.clone().expect("lowered");
-                Some(task(&cancelled, move |_, readers| front.codegen_inputs(this(readers)), |_, it| Value::Answer(it.map(Response::CodegenInputs))))
-            }
-            Work::Tables => {
-                let front = ready.front.clone().expect("lowered");
-                let images: Vec<(&'static str, u64, u64)> = self.images.values().flat_map(|it| it.tables()).collect();
-                let tables = move |_: u32, readers: Readers| {
-                    let writer = readers.writer.expect("the tables' task is posted with its job's writer");
-                    front.tables(writer, &images)
-                };
-                Some(task(&cancelled, tables, |_, it| Value::Answer(it.map(Response::Tables))))
-            }
-            Work::Trace(_) => {
-                let (db, queries, root) = (ready.input.db.clone(), ready.input.queries, w.steps.plan_key());
-                Some(task(&cancelled, move |_, _| Ok(trace(&db, queries, root)), |_, it| Value::Answer(it.map(Response::Trace))))
-            }
-            Work::Verify(_) => {
-                let (steps, input) = (w.steps.clone(), ready.input.clone());
-                let view = job.views[0].view;
-                Some(task(
-                    &cancelled,
-                    move |_, _| verify(steps.as_ref(), &input, view),
-                    |_, it| Value::Answer(it.map(|mismatches| Response::Verified { mismatches })),
-                ))
-            }
-            Work::Snapshot => unreachable!("a snapshot has no view"),
-        };
-        if let Some(work) = answer {
-            let fresh = lone(w.plane, NodeKind::Bodies, "the job's answer", Pool::Work, None, kinds::WALK);
-            job.stage = Stage::Answer(fresh.first());
-            self.add(w, id, fresh, Some(work), reads);
-            self.close(w, id);
+        if matches!(job.work, Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. }) {
+            self.build(w, id, None);
             return;
         }
-        let ready = job.ready.pop().expect("a job has a view");
-        let front = ready.front.expect("a build lowers its view");
-        let writer = ready.writer.expect("a build lowers its view");
-        let input = ready.input;
-        let units = &input.units;
-        let count = u32::try_from(units.graph.units.len()).expect("under 2^32 units");
+        let reads = job.ready.last().is_some_and(|it| it.writer.is_some());
+        let work = match answer(job, &self.paths, w.steps) {
+            Ok(work) => work,
+            Err(error) => {
+                self.end(w, id, false, Some(error));
+                return;
+            }
+        };
+        let ahead = matches!(job.work, Work::Ahead { .. });
+        let name = if ahead { "the units to build ahead" } else { "the job's answer" };
+        let fresh = lone(w.plane, NodeKind::Bodies, name, Pool::Work, None, kinds::WALK);
+        job.stage = if ahead { Stage::Ahead(fresh.first()) } else { Stage::Answer(fresh.first()) };
+        self.add(w, id, fresh, Some(work), reads);
+        if !ahead {
+            self.close(w, id);
+        }
+    }
+
+    /// The job's units as nodes of the plane: every one, or the `picked` ones of a build ahead
+    /// and every unit they depend on.
+    fn build(&mut self, w: &mut World<'_, S>, id: JobId, picked: Option<&[u32]>) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        let ready = job.ready.pop();
+        let Some(Ready { input, root, front: Some(front), writer: Some(writer) }) = ready else {
+            self.end(w, id, false, Some(ApiError::new("a build's view is not lowered", None)));
+            return;
+        };
+        let cancelled = job.cancelled.clone(); // clone: a refcount, once per build
+        let all = &input.units.graph.units;
+        let picked = match picked {
+            None => None,
+            Some(picked) => {
+                if let Some(bad) = picked.iter().find(|it| **it as usize >= all.len()) {
+                    // alloc: an error, once
+                    let what = format!("the build ahead picked unit {bad} of a plan of {} units", all.len());
+                    self.end(w, id, false, Some(ApiError::new(what, None)));
+                    return;
+                }
+                let mut wanted = vec![false; all.len()]; // alloc: once per build ahead
+                let mut stack = picked.to_vec(); // alloc: once per build ahead
+                while let Some(at) = stack.pop() {
+                    if std::mem::replace(&mut wanted[at as usize], true) {
+                        continue;
+                    }
+                    stack.extend(all[at as usize].dependencies.iter().map(|dep| dep.index as u32));
+                }
+                // alloc: once per build ahead
+                Some((0u32..).zip(&wanted).filter_map(|(at, it)| it.then_some(at)).collect::<Vec<u32>>())
+            }
+        };
+        let count = u32::try_from(picked.as_ref().map_or(all.len(), Vec::len)).expect("under 2^32 units");
+        // The node of each unit, by its place after the batch's first; `u32::MAX` for one not built.
+        let node_of: Option<Vec<u32>> = picked.as_ref().map(|picked| {
+            let mut node_of = vec![u32::MAX; all.len()]; // alloc: once per build ahead
+            for (offset, &unit) in (0u32..).zip(picked) {
+                node_of[unit as usize] = offset;
+            }
+            node_of
+        });
+        let unit_at = |offset: u32| picked.as_ref().map_or(offset, |it| it[offset as usize]) as usize;
         let check = input.goal == Goal::Check;
         let kind = if check { NodeKind::Bodies } else { NodeKind::Codegen };
-        let (names, all_deps) = units.graph.units.iter().fold((0, 0), |(names, deps), unit| {
+        let (names, all_deps) = (0..count).map(|offset| &all[unit_at(offset)]).fold((0, 0), |(names, deps), unit| {
             (names + unit.pkg_id.len() + 1 + unit.target.name.len(), deps + unit.dependencies.len())
         });
         let mut nodes = w.plane.fresh(count, names, all_deps);
         let first = nodes.first();
+        // alloc: a name and a deps buffer, once per build, reused by every unit
         let (mut name, mut deps) = (String::new(), Vec::new());
-        for (at, unit) in (0u32..).zip(&units.graph.units) {
+        for offset in 0..count {
+            let at = unit_at(offset);
+            let unit = &all[at];
             deps.clear();
-            deps.extend(unit.dependencies.iter().map(|dep| NodeId(first.0 + dep.index as u32)));
+            deps.extend(unit.dependencies.iter().map(|dep| {
+                let index = dep.index as usize;
+                NodeId(first.0 + node_of.as_ref().map_or(index as u32, |it| it[index]))
+            }));
             name.clear();
             name.push_str(&unit.pkg_id);
             name.push(' ');
             name.push_str(&unit.target.name);
             let (kind, task) = match unit.mode {
-                UnitMode::RunCustomBuild => (NodeKind::ScriptRun, Task::Loop { kind: plane::loops::SCRIPT_RUN }),
-                _ => (kind, Task::Thread { kind: kinds::COMPILE, arg: at }),
+                UnitMode::RunCustomBuild => (NodeKind::ScriptRun, Task::Loop { kind: loops::SCRIPT_RUN }),
+                _ => (kind, Task::Thread { kind: kinds::COMPILE, arg: at as u32 }),
             };
             w.plane.push(&mut nodes, node(kind, &name, &deps, Pool::Work, None), task);
         }
-        let work: plane::Work<Value> = {
-            let (front, cancelled) = (front.clone(), cancelled.clone());
-            Arc::new(move |arg, readers: Readers| {
-                let at = arg as usize;
-                let Readers { this: reader, mut images, .. } = readers;
-                let reader = reader.expect("a task that reads is posted with its reader");
-                match front.compile(reader, at, &mut images) {
-                    Ok(compiled) => {
-                        let outcome = match compiled.ok {
-                            true => Outcome::Built,
-                            false => Outcome::Failed { why: "it did not compile".to_owned() },
-                        };
-                        Some(Did { outcome, value: Value::Compiled(at, Ok(compiled), images) })
-                    }
-                    Err(Failed::Error(error)) => Some(Did {
-                        outcome: Outcome::Failed { why: error.what.clone() },
-                        value: Value::Compiled(at, Err(error), images),
-                    }),
-                    Err(Failed::Again) if cancelled.load(Ordering::Acquire) => Some(Did {
-                        outcome: Outcome::Failed { why: "cancelled".to_owned() },
-                        value: Value::Compiled(at, Err(ApiError::new("cancelled", None)), images),
-                    }),
-                    Err(Failed::Again) => None,
-                }
-            })
-        };
+        let work = Step::of(&cancelled, Does::Compile { front: front.clone() }); // clone: a refcount, once per build
+        let units = &input.units;
         let package_of = {
             let packages: FxHashMap<&str, u32> =
+                // alloc: once per build
                 (0u32..).zip(&units.packages).map(|(at, package)| (package.id.as_str(), at)).collect();
+            // alloc: once per build
             units.graph.units.iter().map(|unit| packages.get(unit.pkg_id.as_str()).copied().unwrap_or(u32::MAX)).collect()
         };
-        let reported = vec![0; units.packages.len().div_ceil(64)];
+        let reported = vec![0; units.packages.len().div_ceil(64)]; // alloc: once per build
+        let outputs = match root.and_then(|root| self.roots.outputs[root as usize].as_ref()) {
+            Some(outputs) if Arc::ptr_eq(&outputs.units, units) => outputs.clone(), // clone: a refcount, once per build
+            _ => {
+                let made = Arc::new(self.paths.outputs(units)); // alloc: once per new units
+                if let Some(root) = root {
+                    self.roots.outputs[root as usize] = Some(made.clone()); // clone: a refcount
+                }
+                made
+            }
+        };
         let select = match &job.work {
             Work::Test { filter, args, all, ub: Some(ub), .. } => {
+                // clone: the selection, once per build
                 let (front, filter, args, all, ub) = (front.clone(), filter.clone(), args.clone(), *all, *ub);
-                let selection =
-                    move |_: u32, readers: Readers| front.ub_tests(this(readers), Selection { filter: &filter, args: &args, all, ub: Some(ub) });
-                let work = task(&cancelled, selection, |_, it| Value::Selected(it));
+                let work = Step::of(&cancelled, Does::Select { front, filter, args, all, ub });
                 deps.clear();
                 deps.extend((0..count).map(|at| NodeId(first.0 + at)));
                 let name = "the tests to evaluate";
@@ -1248,19 +1698,25 @@ impl Jobs {
             Some((evaluation, node, work)) => (Some(evaluation), Some((node, work))),
             None => (None, None),
         };
+        // alloc: once per build
         job.stage = Stage::Units(Box::new(Build {
             input,
             front,
             writer,
-            held: Vec::new(),
+            held: Vec::new(), // alloc: none until a write holds a task
             first,
+            count,
+            picked,
             package_of,
             reported,
-            scripts: FxHashMap::default(),
-            artifacts: Vec::new(),
+            outputs,
+            root,
+            artifacts: Vec::new(), // alloc: once per build
             evaluation,
         }));
-        self.add(w, id, nodes, Some(work), true);
+        if count > 0 {
+            self.add(w, id, nodes, Some(work), true);
+        }
         match select {
             Some((fresh, work)) => self.add(w, id, fresh, Some(work), true),
             None => self.close(w, id),
@@ -1269,15 +1725,15 @@ impl Jobs {
 
     /// `blaze test --ub`'s tests selected: each one evaluated on a worker, its result reported
     /// as it ends.
-    fn evaluate(&mut self, w: &mut World<'_>, id: JobId, tests: Vec<String>) {
-        let job = self.jobs.get_mut(&id).expect("a job evaluating");
+    fn evaluate(&mut self, w: &mut World<'_, S>, id: JobId, tests: Vec<String>) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let Stage::Units(build) = &job.stage else { return };
         let Some(evaluation) = &build.evaluation else { return };
         let count = u32::try_from(tests.len()).expect("under 2^32 tests");
         const TEST: &str = "test ";
         let names = tests.iter().map(|it| TEST.len() + it.len()).sum();
         let mut fresh = w.plane.fresh(count, names, 0);
-        let mut name = String::new();
+        let mut name = String::new(); // alloc: one name buffer, reused by every test
         for (at, test) in (0u32..).zip(&tests) {
             name.clear();
             name.push_str(TEST);
@@ -1285,25 +1741,25 @@ impl Jobs {
             let task = Task::Thread { kind: kinds::EVALUATE, arg: at };
             w.plane.push(&mut fresh, node(NodeKind::Bodies, &name, &[], Pool::Work, None), task);
         }
+        // clone: a refcount, once per evaluation
         let (front, tests, ub): (_, Arc<[String]>, _) = (build.front.clone(), tests.into(), evaluation.ub);
-        let evaluate = move |at: u32, readers: Readers| front.evaluate(this(readers), &tests[at as usize], ub);
-        let work = task(&job.cancelled, evaluate, |_, it| Value::Evaluated(it));
+        let work = Step::of(&job.cancelled, Does::Evaluate { front, tests, ub });
         self.add(w, id, fresh, Some(work), true);
         self.close(w, id);
     }
 
-    fn close(&mut self, w: &mut World<'_>, id: JobId) {
-        let Some(job) = self.jobs.get_mut(&id) else { return };
-        if !job.closed && !job.finished {
+    fn close(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        if let (Some(request), false, false) = (job.request, job.closed, job.finished) {
             job.closed = true;
-            w.plane.close(w.now, job.request.expect("a job that builds has a request"));
+            w.plane.close(w.now, request);
         }
     }
 
     /// A unit begins: reported once for its package, as cargo says `Compiling` once.
-    fn started_unit(&mut self, w: &mut World<'_>, node: NodeId) {
-        let Some(id) = self.job_of(node) else { return };
-        let Some(job) = self.jobs.get_mut(&id) else { return };
+    fn started_unit(&mut self, w: &mut World<'_, S>, node: NodeId) {
+        let Some(id) = self.batches.job_of(node) else { return };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let Stage::Units(build) = &mut job.stage else { return };
         let Some(at) = build.unit(node) else { return };
         let fresh = build.front.fresh(at);
@@ -1324,84 +1780,100 @@ impl Jobs {
             (false, ..) => Verb::Compiling,
         };
         let started = UnitStarted {
-            package_id: package.id.clone(),
-            name: package.name.clone(),
-            version: package.version.clone(),
-            source: package.source.clone(),
+            package_id: package.id.clone(), // clone: the report owns it, once per package
+            name: package.name.clone(),     // clone: the report owns it, once per package
+            version: package.version.clone(), // clone: the report owns it, once per package
+            source: package.source.clone(), // clone: the report owns it, once per package
             verb,
         };
         w.said.push(Said::Report(id, Response::Unit(started)));
     }
 
-    /// The first tag of a new run of the job's.
-    fn run_tags(&mut self, id: JobId, node: Option<NodeId>) -> u64 {
-        let tags = self.setup.runs + (self.runs_from + self.runs.len() as u64) * RUN_TAGS;
-        assert!(tags < self.setup.runs_end, "the daemon has run every run of user code its tags allow");
-        self.runs.push_back(Some((id, node)));
-        if let Some(job) = self.jobs.get_mut(&id) {
+    /// A new run of the job's user code, and its first tag.
+    fn run_tags(&mut self, id: JobId, node: Option<NodeId>) -> Result<(Handle<Run<S>>, u64), ApiError> {
+        let (run, packed) = match self.runs.insert(Run { job: id, node, runs: None, killed: false }) {
+            Ok(it) => it,
+            // alloc: an error, once
+            Err(error) => return Err(ApiError::new(format!("no room for another run of user code: {error}"), None)),
+        };
+        let tags = self.setup.runs + packed * RUN_TAGS;
+        if tags >= self.setup.runs_end {
+            self.runs.remove(run);
+            return Err(ApiError::new("the daemon has no tags left for a run of user code", None));
+        }
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
             job.runs += 1;
         }
-        tags
+        Ok((run, tags))
     }
 
-    /// The run a tag is of: its first tag, its job, and the script's node.
-    fn run_of(&self, tag: u64) -> Option<(u64, JobId, Option<NodeId>)> {
-        let number = tag.checked_sub(self.setup.runs)? / RUN_TAGS;
-        let (id, node) = (*self.runs.get(usize::try_from(number.checked_sub(self.runs_from)?).ok()?)?)?;
-        Some((self.setup.runs + number * RUN_TAGS, id, node))
+    /// The run a tag is of.
+    fn run_of(&self, tag: u64) -> Option<Handle<Run<S>>> {
+        self.runs.find(tag.checked_sub(self.setup.runs)? / RUN_TAGS)
     }
 
-    fn run_over(&mut self, tags: u64) {
-        let Some(at) = ((tags - self.setup.runs) / RUN_TAGS).checked_sub(self.runs_from) else { return };
-        if let Some((id, _)) = self.runs.get_mut(at as usize).and_then(Option::take)
-            && let Some(job) = self.jobs.get_mut(&id)
+    fn run_over(&mut self, run: Handle<Run<S>>) {
+        if let Some(Run { job: id, .. }) = self.runs.remove(run)
+            && let Some(job) = self.jobs.get_mut(key_of(id))
         {
             job.runs -= 1;
-        }
-        while self.runs.front().is_some_and(Option::is_none) {
-            self.runs.pop_front();
-            self.runs_from += 1;
         }
     }
 
     /// A build script's run begins, on the loop.
-    fn run_script(&mut self, w: &mut World<'_>, node: NodeId) {
-        let Some(id) = self.job_of(node) else { return };
+    fn run_script(&mut self, w: &mut World<'_, S>, node: NodeId) {
+        let Some(id) = self.batches.job_of(node) else { return };
         self.started_unit(w, node);
-        let Some(Stage::Units(build)) = self.jobs.get(&id).map(|it| &it.stage) else { return };
-        let Some(at) = build.unit(node) else { return };
-        let tags = self.run_tags(id, Some(node));
-        let job = self.jobs.get_mut(&id).expect("a job running a script");
-        let Stage::Units(build) = &mut job.stage else { unreachable!("checked above") };
-        let mut runs = match build.front.script(at, tags) {
-            Ok(runs) => runs,
+        let Some(Stage::Units(build)) = self.jobs.get(key_of(id)).map(|it| &it.stage) else { return };
+        let Some(unit) = build.unit(node) else { return };
+        let (run, tags) = match self.run_tags(id, Some(node)) {
+            Ok(it) => it,
             Err(error) => {
-                w.plane.ended(w.now, node, Outcome::Failed { why: error.what.clone() });
-                job.over.get_or_insert((false, Some(error)));
-                self.run_over(tags);
+                w.plane.ended(w.now, node, Outcome::Failed { why: error.what.clone() }); // clone: an error, once
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.over.get_or_insert((false, Some(error)));
+                }
                 return;
             }
         };
-        let mut out = Vec::new();
-        let ended = runs.start(w.store, Some(build.writer.as_mut()), w.effects, &mut out);
-        for response in out {
+        let Some(Job { stage: Stage::Units(build), over, .. }) = self.jobs.get_mut(key_of(id)) else {
+            self.run_over(run);
+            return;
+        };
+        let mut runs = match build.front.script(unit, tags) {
+            Ok(runs) => runs,
+            Err(error) => {
+                w.plane.ended(w.now, node, Outcome::Failed { why: error.what.clone() }); // clone: an error, once
+                over.get_or_insert((false, Some(error)));
+                self.run_over(run);
+                return;
+            }
+        };
+        let mut out = std::mem::take(&mut self.out);
+        let ended = runs.start(w.store, Some(&mut build.writer), w.effects, &mut out);
+        for response in out.drain(..) {
             w.said.push(Said::Report(id, response));
         }
+        self.out = out;
         match ended {
             Some(ok) => {
-                self.run_over(tags);
+                self.run_over(run);
                 script_ended(w, node, ok);
             }
-            None => _ = build.scripts.insert(node, (tags, runs)),
+            None => {
+                if let Some(it) = self.runs.get_mut(run) {
+                    it.runs = Some(Box::new(runs)); // alloc: once per run of user code that waits on its effects
+                }
+            }
         }
     }
 
     /// A unit's compile on the loop: its diagnostics said, its puts and outputs stored and
     /// placed, and a proc macro's load asked of the writer, so the units after it, posted only
     /// once it is applied, expand with it.
-    fn compiled(&mut self, w: &mut World<'_>, node: NodeId, unit: usize, result: Result<Compiled, ApiError>) {
-        let Some(id) = self.job_of(node) else { return };
-        let Some(job) = self.jobs.get_mut(&id) else { return };
+    fn compiled(&mut self, w: &mut World<'_, S>, node: NodeId, unit: usize, result: Result<Compiled, ApiError>) {
+        let Some(id) = self.batches.job_of(node) else { return };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         let mut compiled = match result {
             Ok(compiled) => compiled,
             Err(error) => {
@@ -1419,6 +1891,7 @@ impl Jobs {
         // Said once its last diagnostic is, so the client prints cargo's "generated N warnings"
         // or "could not compile" there and not at the build's end. A unit that said nothing has
         // no such line.
+        // clone: the report and its diagnostics each own the unit's name, once per unit
         let ended = compiled.diagnostics.iter().find_map(|it| it.unit.clone());
         for diagnostic in compiled.diagnostics {
             w.said.push(Said::Report(id, Response::Diagnostic(diagnostic)));
@@ -1431,89 +1904,134 @@ impl Jobs {
             match w.store.put(put.key, put.kind, put.bytes) {
                 Ok(ticket) => self.put = Some(ticket),
                 Err(mismatch) => {
+                    // alloc: an error, once
                     let error = ApiError::new(format!("the store holds other bytes under {key:?}: {mismatch:?}"), None);
                     job.over.get_or_insert((false, Some(error)));
                 }
             }
         }
-        if let (Some(artifact), Stage::Units(build)) = (compiled.artifact, &mut job.stage) {
-            build.artifacts.push(artifact);
-        }
+        let outputs = match (compiled.artifact, &mut job.stage) {
+            (artifact, Stage::Units(build)) => {
+                build.artifacts.extend(artifact);
+                Some(build.outputs.clone()) // clone: a refcount, once per unit
+            }
+            _ => None,
+        };
+        let ids = outputs.as_ref().map_or(&[][..], |it| it.of(unit));
         for output in compiled.outputs {
-            let Some(file) = FileName::new(output.path.trim_start_matches('/')) else {
+            let path = self.paths.find(ids, &output.path);
+            if self.paths.files[path as usize].is_none() {
+                // alloc: an error, once
                 let error = ApiError::new(format!("{} is no path an output can be placed at", output.path), Some(output.path));
-                if let Some(job) = self.jobs.get_mut(&id) {
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
                     job.over.get_or_insert((false, Some(error)));
                 }
                 continue;
-            };
-            let placed = self.placements.get(&file).is_some_and(|it| {
+            }
+            let placed = self.paths.placed[path as usize].as_ref().is_some_and(|it| {
                 it.key == output.key && it.executable == output.executable && it.meta.is_some()
             });
             if !placed {
-                self.place(w, id, file, output.key, output.executable);
+                self.place(w, id, path, output.key, output.executable);
                 continue;
             }
-            let tag = self.own_tag();
-            self.looking.insert(tag, (id, file.clone(), output.key, output.executable));
-            if let Some(job) = self.jobs.get_mut(&id) {
-                job.placing += 1;
+            let look = Own::Look { job: id, path, key: output.key, executable: output.executable };
+            let tag = self.own_tag(look);
+            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
+            match tag {
+                Ok(tag) => {
+                    job.placing += 1;
+                    // clone: the driver's effect owns the file's name, once per output
+                    let Some(file) = self.paths.files[path as usize].clone() else { continue };
+                    w.effects.push(Effect::Stat { file, tag });
+                }
+                Err(error) => _ = job.over.get_or_insert((false, Some(error))),
             }
-            w.effects.push(Effect::Stat { file, tag });
         }
     }
 
-    /// The store's value of `key` placed at `file` for job `id`.
-    fn place(&mut self, w: &mut World<'_>, id: JobId, file: FileName, key: blaze_cas::Key, executable: bool) {
-        self.placements.remove(&file);
-        let Some(job) = self.jobs.get_mut(&id) else { return };
-        let path = format!("/{file}");
+    /// The store's value of `key` placed at path `path` for job `id`.
+    fn place(&mut self, w: &mut World<'_, S>, id: JobId, path: u32, key: blaze_cas::Key, executable: bool) {
+        self.paths.placed[path as usize] = None;
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+        // clone: the store's effect owns the file's name, once per placement
+        let Some(file) = self.paths.files[path as usize].clone() else {
+            let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
+            // alloc: an error, once
+            job.over.get_or_insert((false, Some(ApiError::new(format!("{name} is no path an output can be placed at"), Some(name)))));
+            return;
+        };
         match w.store.place(&key, file, w.effects) {
             Some(tag) => {
-                self.placing.insert(tag, (id, key, executable));
+                self.placing.insert(tag, Placing { job: id, path, key, executable });
                 job.placing += 1;
             }
             None => {
-                let error = ApiError::new(format!("the store has nothing under {key:?} to place at {path}"), Some(path));
+                let name = self.paths.names[path as usize].to_string(); // alloc: an error, once
+                // alloc: an error, once
+                let error = ApiError::new(format!("the store has nothing under {key:?} to place at {name}"), Some(name));
                 job.over.get_or_insert((false, Some(error)));
             }
         }
     }
 
-    /// A tag of the loop's own, for a lock write, a mode or a look at a placed file.
-    fn own_tag(&mut self) -> Tag {
-        let tag = Tag(self.setup.tags + self.next_own % (1 << 32));
-        self.next_own += 1;
-        tag
+    /// A tag of the loop's own for `own`, carrying its slot in [`Jobs::own`].
+    fn own_tag(&mut self, own: Own) -> Result<Tag, ApiError> {
+        match self.own.insert(own) {
+            Ok((_, packed)) => Ok(Tag(self.setup.tags + packed)),
+            // alloc: an error, once
+            Err(_) => Err(ApiError::new(format!("the loop has 2^{OWN_SLOT_BITS} effects of its own in flight"), None)),
+        }
     }
 
-    /// `file` placed with the value of `key`: what is there now looked at for its record.
-    fn record(&mut self, w: &mut World<'_>, file: FileName, key: blaze_cas::Key, executable: bool) {
-        let tag = self.own_tag();
-        self.placements.insert(file.clone(), Placement { key, executable, meta: None });
-        self.recording.insert(tag, (file.clone(), key));
-        w.effects.push(Effect::Stat { file, tag });
+    /// Path `path` placed with the value of `key` for job `id`: what is there now looked at
+    /// for its record.
+    fn record(&mut self, w: &mut World<'_, S>, id: JobId, path: u32, key: blaze_cas::Key, executable: bool) {
+        // clone: the driver's effect owns the file's name, once per placement
+        let Some(file) = self.paths.files[path as usize].clone() else { return };
+        match self.own_tag(Own::Record { path, key }) {
+            Ok(tag) => {
+                self.paths.placed[path as usize] = Some(Placement { key, executable, meta: None });
+                w.effects.push(Effect::Stat { file, tag });
+            }
+            Err(error) => {
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.over.get_or_insert((false, Some(error)));
+                }
+            }
+        }
     }
 
     /// What the store placed.
-    pub fn placed(&mut self, w: &mut World<'_>, placed: Vec<Placed>) {
+    pub fn placed(&mut self, w: &mut World<'_, S>, placed: Vec<Placed>) {
         for Placed { tag, to, result } in placed {
-            let Some((id, key, executable)) = self.placing.remove(&tag) else { continue };
-            let Some(job) = self.jobs.get_mut(&id) else { continue };
+            let Some(Placing { job: id, path, key, executable }) = self.placing.remove(&tag) else { continue };
+            if self.jobs.get(key_of(id)).is_none() {
+                continue;
+            }
             match result {
-                Ok(()) if executable => {
-                    let tag = self.own_tag();
-                    self.own.insert(tag, (id, format!("/{to}")));
-                    self.moding.insert(tag, (to.clone(), key));
-                    w.effects.push(Effect::Mode { file: to, mode: 0o755, tag });
-                }
+                Ok(()) if executable => match self.own_tag(Own::Mode { job: id, path, key }) {
+                    Ok(tag) => w.effects.push(Effect::Mode { file: to, mode: 0o755, tag }),
+                    Err(error) => {
+                        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                            job.placing -= 1;
+                            job.over.get_or_insert((false, Some(error)));
+                        }
+                    }
+                },
                 Ok(()) => {
-                    job.placing -= 1;
-                    self.record(w, to, key, false);
+                    if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                        job.placing -= 1;
+                    }
+                    self.record(w, id, path, key, false);
                 }
                 Err(why) => {
-                    job.placing -= 1;
-                    job.over.get_or_insert((false, Some(ApiError::new(format!("placing /{to}: {why}"), Some(format!("/{to}"))))));
+                    if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                        job.placing -= 1;
+                        // alloc: an error, once
+                        let error = ApiError::new(format!("placing /{to}: {why}"), Some(format!("/{to}")));
+                        job.over.get_or_insert((false, Some(error)));
+                    }
                 }
             }
         }
@@ -1521,81 +2039,80 @@ impl Jobs {
     }
 
     /// A completion of the jobs' own: a lock write, a mode, a look at a placed file, or one of
-    /// user code's runs.
-    pub fn complete(&mut self, w: &mut World<'_>, completion: Completion) {
-        if completion.tag.0.wrapping_sub(self.setup.tags) < 1 << 32 {
-            let tag = completion.tag;
-            if let Some((file, key)) = self.recording.remove(&tag) {
-                match (completion.done, self.placements.get_mut(&file)) {
-                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key => placement.meta = Some(meta),
-                    _ => {
-                        self.placements.remove(&file);
-                    }
-                }
-            } else if let Some((id, file, key, executable)) = self.looking.remove(&tag) {
-                let unchanged = matches!(
-                    (&completion.done, self.placements.get(&file)),
-                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key && placement.meta == Some(*meta)
-                );
-                if let Some(job) = self.jobs.get_mut(&id) {
-                    job.placing -= 1;
-                }
-                if !unchanged {
-                    self.place(w, id, file, key, executable);
-                }
-            } else if let Some((id, path)) = self.own.remove(&tag) {
-                let moded = self.moding.remove(&tag);
-                if let Some(job) = self.jobs.get_mut(&id) {
-                    job.placing -= 1;
-                    match completion.done {
-                        Done::Failed(error) => {
-                            job.over.get_or_insert((false, Some(ApiError::new(format!("writing {path}: {error}"), Some(path)))));
-                        }
-                        _ => {
-                            if let Some((file, key)) = moded {
-                                self.record(w, file, key, true);
-                            }
-                        }
-                    }
-                }
+    /// user code's runs. One whose effect is gone (its slot freed, its job finished) is
+    /// dropped.
+    pub fn complete(&mut self, w: &mut World<'_, S>, completion: Completion) {
+        let own = completion.tag.0.wrapping_sub(self.setup.tags);
+        if own < 1 << 32 {
+            if let Some(it) = self.own.find(own).and_then(|handle| self.own.remove(handle)) {
+                self.completed(w, it, completion.done);
             }
             self.wind_up(w);
             return;
         }
-        let Some((tags, id, node)) = self.run_of(completion.tag.0) else { return };
-        let Some(job) = self.jobs.get_mut(&id) else {
-            self.run_over(tags);
+        let Some(run) = self.run_of(completion.tag.0) else { return };
+        let Some(Run { job: id, node, runs: Some(runs), .. }) = self.runs.get_mut(run) else { return };
+        let (id, node) = (*id, *node);
+        let Some(job) = self.jobs.get_mut(key_of(id)) else {
+            self.run_over(run);
             return;
         };
-        let mut out = Vec::new();
-        let ended = match (node, &mut job.stage) {
-            (Some(node), Stage::Units(build)) => match build.scripts.get_mut(&node) {
-                Some((_, runs)) => runs.complete(completion, w.store, Some(build.writer.as_mut()), w.effects, &mut out),
-                None => None,
-            },
-            (None, Stage::Runs(_, runs)) => runs.complete(completion, w.store, None, w.effects, &mut out),
+        let writer = match (&mut job.stage, node) {
+            (Stage::Units(build), Some(_)) => Some(&mut build.writer),
             _ => None,
         };
-        for response in out {
+        let mut out = std::mem::take(&mut self.out);
+        let ended = runs.complete(completion, w.store, writer, w.effects, &mut out);
+        for response in out.drain(..) {
             w.said.push(Said::Report(id, response));
         }
+        self.out = out;
         if let Some(ok) = ended {
-            self.run_over(tags);
+            self.run_over(run);
             self.run_ended(w, id, node, ok);
         }
         self.wind_up(w);
     }
 
-    fn run_ended(&mut self, w: &mut World<'_>, id: JobId, node: Option<NodeId>, ok: bool) {
-        let Some(job) = self.jobs.get_mut(&id) else { return };
-        match node {
-            Some(node) => {
-                if let Stage::Units(build) = &mut job.stage {
-                    build.scripts.remove(&node);
+    /// An effect of the loop's own done.
+    fn completed(&mut self, w: &mut World<'_, S>, own: Own, done: Done) {
+        match own {
+            Own::Record { path, key } => match (done, &mut self.paths.placed[path as usize]) {
+                (Done::Stat(Some(meta)), Some(placement)) if placement.key == key => placement.meta = Some(meta),
+                (_, placement) => *placement = None,
+            },
+            Own::Look { job: id, path, key, executable } => {
+                let unchanged = matches!(
+                    (&done, &self.paths.placed[path as usize]),
+                    (Done::Stat(Some(meta)), Some(placement)) if placement.key == key && placement.meta == Some(*meta)
+                );
+                if let Some(job) = self.jobs.get_mut(key_of(id)) {
+                    job.placing -= 1;
                 }
-                script_ended(w, node, ok);
+                if !unchanged {
+                    self.place(w, id, path, key, executable);
+                }
             }
+            Own::Write { job: id, path } | Own::Mode { job: id, path, .. } => {
+                let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
+                job.placing -= 1;
+                if let Done::Failed(error) = done {
+                    let name = &self.paths.names[path as usize];
+                    // alloc: an error, once
+                    let error = ApiError::new(format!("writing {name}: {error}"), Some(name.to_string()));
+                    job.over.get_or_insert((false, Some(error)));
+                } else if let Own::Mode { key, .. } = own {
+                    self.record(w, id, path, key, true);
+                }
+            }
+        }
+    }
+
+    fn run_ended(&mut self, w: &mut World<'_, S>, id: JobId, node: Option<NodeId>, ok: bool) {
+        match node {
+            Some(node) => script_ended(w, node, ok),
             None => {
+                let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
                 job.stage = Stage::Over;
                 self.worked(w, id);
                 self.end(w, id, ok, None);
@@ -1603,30 +2120,45 @@ impl Jobs {
         }
     }
 
-    fn plane_finished(&mut self, w: &mut World<'_>, request: RequestId, ok: bool, stats: RequestStats) {
-        let Some(id) = self.by_request.remove(&request) else { return };
-        let Some(job) = self.jobs.get_mut(&id) else { return };
+    fn plane_finished(&mut self, w: &mut World<'_, S>, request: RequestId, ok: bool, stats: RequestStats) {
+        let jobs = &self.jobs;
+        let Some(id) = self.order.iter().copied().find(|id| jobs.get(key_of(*id)).is_some_and(|it| it.request == Some(request)))
+        else {
+            return;
+        };
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.finished = true;
         job.stats = stats;
         if stats.ran > 0 {
             self.cold = true;
         }
-        if !matches!(job.stage, Stage::Units(_)) {
-            return;
-        }
-        if job.cancelled.load(Ordering::Acquire) {
+        if !matches!(job.stage, Stage::Units(_)) || job.cancelled.load(Ordering::Acquire) {
             return;
         }
         let ok = ok && job.over.is_none();
         let runs = ok && matches!(job.work, Work::Test { ub: None, .. } | Work::Run { .. });
-        let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { unreachable!("checked above") };
-        let Build { input, front, writer, artifacts, evaluation, .. } = *build;
-        if self.lasting(&input.config.invocation.root)
+        let Stage::Units(build) = std::mem::replace(&mut job.stage, Stage::Over) else { return };
+        let Build { input, front, mut writer, artifacts, evaluation, root, .. } = *build;
+        if let Err(error) = writer.finished() {
+            self.end(w, id, false, Some(error));
+            return;
+        }
+        let served = match writer.served() {
+            Ok(it) => it,
+            Err(error) => {
+                self.end(w, id, false, Some(error));
+                return;
+            }
+        };
+        if let Some(root) = root
             && let Some(kept) = writer.keep()
         {
-            self.fronts.insert(input.config.invocation.root.clone(), kept);
+            self.roots.fronts[root as usize] = Some(kept);
         }
-        let profile = input.units.finished.clone();
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+            job.served = served;
+        }
+        let profile = input.units.finished.clone(); // clone: the report owns it, once per build
         let members = input.units.packages.iter().filter(|it| it.is_member).count();
         let members = u32::try_from(members).unwrap_or(u32::MAX);
         if !runs {
@@ -1636,39 +2168,61 @@ impl Jobs {
             self.end(w, id, ok, None);
             return;
         }
-        let tags = self.run_tags(id, None);
-        let started = match &self.jobs[&id].work {
-            Work::Test { filter, all, args, ub, .. } => {
-                front.tests(&artifacts, Selection { filter, args, all: *all, ub: *ub }, tags)
-            }
-            Work::Run { bin, args, .. } => front.run(&artifacts, bin.as_deref(), args, tags),
-            _ => unreachable!("checked above"),
-        };
-        w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
-        let mut runs = match started {
-            Ok(runs) => runs,
+        let (run, tags) = match self.run_tags(id, None) {
+            Ok(it) => it,
             Err(error) => {
-                self.run_over(tags);
+                w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
                 self.worked(w, id);
                 self.end(w, id, false, Some(error));
                 return;
             }
         };
-        let mut out = Vec::new();
+        let Some(job) = self.jobs.get(key_of(id)) else {
+            self.run_over(run);
+            return;
+        };
+        let started = match &job.work {
+            Work::Test { filter, all, args, ub, .. } => {
+                front.tests(&artifacts, Selection { filter, args, all: *all, ub: *ub }, tags)
+            }
+            Work::Run { bin, args, .. } => front.run(&artifacts, bin.as_deref(), args, tags),
+            _ => Err(ApiError::new("only a test or a run runs once built", None)),
+        };
+        w.said.push(Said::Report(id, Response::Built { members, profile, artifacts }));
+        let mut runs = match started {
+            Ok(runs) => runs,
+            Err(error) => {
+                self.run_over(run);
+                self.worked(w, id);
+                self.end(w, id, false, Some(error));
+                return;
+            }
+        };
+        let mut out = std::mem::take(&mut self.out);
         let ended = runs.start(w.store, None, w.effects, &mut out);
-        for response in out {
+        for response in out.drain(..) {
             w.said.push(Said::Report(id, response));
         }
-        self.jobs.get_mut(&id).expect("a job whose plane finished").stage = Stage::Runs(tags, runs);
-        if let Some(ok) = ended {
-            self.run_over(tags);
-            self.run_ended(w, id, None, ok);
+        self.out = out;
+        if let Some(job) = self.jobs.get_mut(key_of(id)) {
+            job.stage = Stage::Runs(run);
+        }
+        match ended {
+            Some(ok) => {
+                self.run_over(run);
+                self.run_ended(w, id, None, ok);
+            }
+            None => {
+                if let Some(it) = self.runs.get_mut(run) {
+                    it.runs = Some(Box::new(runs)); // alloc: once per run of user code that waits on its effects
+                }
+            }
         }
     }
 
     /// `Work` of a build, test or run: what the plane and the units did.
-    fn worked(&mut self, w: &mut World<'_>, id: JobId) {
-        let job = &self.jobs[&id];
+    fn worked(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         if !matches!(job.work, Work::Build(_) | Work::Test { .. } | Work::Run { .. }) {
             return;
         }
@@ -1676,6 +2230,7 @@ impl Jobs {
         let worked = Worked {
             reran: stats.ran,
             green: stats.cached + stats.joined,
+            served: std::mem::take(&mut job.served),
             compiled,
             found: fresh,
             link: LinkKind::Placed,
@@ -1684,30 +2239,14 @@ impl Jobs {
         w.said.push(Said::Report(id, Response::Work(worked)));
     }
 
-    fn cancel_job(&mut self, w: &mut World<'_>, id: JobId) {
-        let Some(job) = self.jobs.get_mut(&id) else { return };
+    fn cancel_job(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         job.cancelled.store(true, Ordering::Release);
         job.over.get_or_insert((false, None));
         if matches!(job.stage, Stage::Snapshot { .. }) {
             job.stage = Stage::Over;
         }
         refuse_held(w, &mut job.stage);
-        let mut ended = Vec::new();
-        match &mut job.stage {
-            Stage::Units(build) => {
-                for (node, (tags, runs)) in &mut build.scripts {
-                    if let Some(ok) = runs.cancel(w.effects) {
-                        ended.push((*tags, Some(*node), ok));
-                    }
-                }
-            }
-            Stage::Runs(tags, runs) => {
-                if let Some(ok) = runs.cancel(w.effects) {
-                    ended.push((*tags, None, ok));
-                }
-            }
-            _ => {}
-        }
         if let (Some(request), false) = (job.request, job.finished) {
             w.plane.cancel(w.now, request);
             if !job.closed {
@@ -1715,17 +2254,30 @@ impl Jobs {
                 w.plane.close(w.now, request);
             }
         }
-        for (tags, node, ok) in ended {
-            self.run_over(tags);
+        self.kill_runs(w, id);
+    }
+
+    /// The job's runs of user code killed once each: a run that ends at once is let go, the
+    /// others end through their completions.
+    fn kill_runs(&mut self, w: &mut World<'_, S>, id: JobId) {
+        let mut ended = Vec::new(); // alloc: a cancel, once
+        for (run, it) in self.runs.iter_mut() {
+            if it.job != id || it.killed {
+                continue;
+            }
+            it.killed = true;
+            if let Some(runs) = &mut it.runs
+                && let Some(ok) = runs.cancel(w.effects)
+            {
+                ended.push((run, it.node, ok));
+            }
+        }
+        for (run, node, ok) in ended {
+            self.run_over(run);
             match node {
-                Some(node) => {
-                    if let Some(Stage::Units(build)) = self.jobs.get_mut(&id).map(|it| &mut it.stage) {
-                        build.scripts.remove(&node);
-                    }
-                    script_ended(w, node, ok);
-                }
+                Some(node) => script_ended(w, node, ok),
                 None => {
-                    if let Some(job) = self.jobs.get_mut(&id) {
+                    if let Some(job) = self.jobs.get_mut(key_of(id)) {
                         job.stage = Stage::Over;
                     }
                 }
@@ -1735,13 +2287,15 @@ impl Jobs {
 
     /// Ends the job, not ok with `error` when one is given: what of it runs is let go, and it
     /// finishes once nothing of it is left.
-    fn end(&mut self, w: &mut World<'_>, id: JobId, ok: bool, error: Option<ApiError>) {
-        let Some(job) = self.jobs.get_mut(&id) else { return };
+    fn end(&mut self, w: &mut World<'_, S>, id: JobId, ok: bool, error: Option<ApiError>) {
+        let Some(job) = self.jobs.get_mut(key_of(id)) else { return };
         match &mut job.over {
             Some((was, _)) => *was = *was && ok,
             None => job.over = Some((ok, error)),
         }
         refuse_held(w, &mut job.stage);
+        // A build's scripts that still run would apply their runs to a front end let go.
+        let scripts = matches!(job.stage, Stage::Units(_)) && job.runs > 0;
         if !matches!(job.stage, Stage::Runs(..)) {
             job.stage = Stage::Over;
         }
@@ -1754,16 +2308,18 @@ impl Jobs {
                 w.plane.close(w.now, request);
             }
         }
+        if scripts {
+            self.kill_runs(w, id);
+        }
     }
 
     /// Finishes every job that is over and has nothing left: its tasks, its placements and its
     /// runs; and a snapshot once all it waits for is durable.
-    fn wind_up(&mut self, w: &mut World<'_>) {
+    fn wind_up(&mut self, w: &mut World<'_, S>) {
         self.apply_writes(w);
-        let mut over = Vec::new();
-        let order = self.sorted();
-        for id in &order {
-            let job = self.jobs.get_mut(id).expect("a job in the order");
+        let mut over = std::mem::take(&mut self.over);
+        for &id in &self.order {
+            let Some(job) = self.jobs.get_mut(key_of(id)) else { continue };
             if let Stage::Snapshot { ticket: None, heads, store } = &mut job.stage
                 && w.images.done()
                 && store.is_none_or(|it| w.store.durable(it))
@@ -1772,7 +2328,7 @@ impl Jobs {
                 job.stage = Stage::Over;
                 match w.images.failed() {
                     None => {
-                        w.said.push(Said::Report(*id, Response::Snapshotted { heads }));
+                        w.said.push(Said::Report(id, Response::Snapshotted { heads }));
                         job.over = Some((true, None));
                     }
                     Some(why) => job.over = Some((false, Some(ApiError::new(why, None)))),
@@ -1780,21 +2336,22 @@ impl Jobs {
             }
             let Some((ok, error)) = &mut job.over else { continue };
             if job.finished && job.placing == 0 && job.runs == 0 && !matches!(job.stage, Stage::Runs(..)) {
-                over.push((*id, *ok, error.take()));
+                over.push((id, *ok, error.take()));
             }
         }
-        self.order = order;
-        for (id, ok, error) in over {
-            let job = self.jobs.remove(&id).expect("a job over");
+        for (id, ok, error) in over.drain(..) {
+            let Some(job) = self.jobs.remove(key_of(id)) else { continue };
             for queries in job.queries {
-                w.db.close(queries);
+                if job.built != Some(queries) {
+                    w.db.close(queries);
+                }
             }
-            for first in job.batches {
-                self.nodes.remove(&first.0);
-            }
+            self.batches.remove(id);
+            self.order.retain(|it| *it != id);
             self.ended = true;
-            w.said.push(Said::Finish(id, ok, error));
+            w.said.push(Said::Finish(id, ok, error, job.built));
         }
+        self.over = over;
         if !self.retired.is_empty() {
             let jobs = &self.jobs;
             self.retired.retain(|view| {
@@ -1808,7 +2365,7 @@ impl Jobs {
     }
 
     /// The VFS's tickets that are durable: a snapshot waits for its own.
-    pub fn durable(&mut self, w: &mut World<'_>, tickets: &[Ticket]) {
+    pub fn durable(&mut self, w: &mut World<'_, S>, tickets: &[Ticket]) {
         for job in self.jobs.values_mut() {
             if let Stage::Snapshot { ticket, .. } = &mut job.stage
                 && ticket.is_some_and(|it| tickets.contains(&it))
@@ -1821,9 +2378,10 @@ impl Jobs {
 
     /// A snapshot: the image written, the journal and the store flushed, and every head as it
     /// stands, reported once all of it is durable.
-    fn snapshot(&mut self, w: &mut World<'_>) -> Stage {
+    fn snapshot(&mut self, w: &mut World<'_, S>) -> Stage<S> {
         w.images.ask(Parts { db: w.db, vfs: &mut *w.vfs, predict: w.plane.predict(), effects: &mut *w.effects });
         w.store.flush(w.effects);
+        // alloc: once per snapshot
         let heads: Vec<(String, ContentId)> = w.vfs.heads().into_iter().map(|(head, root)| (head.to_owned(), root)).collect();
         let ticket = heads.first().and_then(|(head, root)| w.vfs.set_head(head, *root).ok());
         w.vfs.flush(w.effects);
@@ -1831,48 +2389,74 @@ impl Jobs {
     }
 }
 
-/// Whether `work` builds from the head's last plan when it is of the same view and config. A
-/// trace and a verify look at the plan's own run, so they ask it.
-fn reuses_plans(work: &Work) -> bool {
-    !matches!(work, Work::Trace(_) | Work::Verify(_))
+/// The task that answers a job's work on its ready views: a reach, the codegen inputs, the
+/// tables, a trace, a verify, an edit, or the units a build ahead picks.
+fn answer<S: Steps>(job: &Job<S>, paths: &Paths<S>, steps: &Arc<S>) -> Result<Step<S>, ApiError> {
+    let Some(ready) = job.ready.last() else { return Err(ApiError::new("the job has no view", None)) };
+    let not_lowered = || ApiError::new("the job's view is not lowered", None);
+    // clone: a refcount, once per job
+    let lowered = || ready.front.clone().ok_or_else(not_lowered);
+    let does = match &job.work {
+        Work::Reach { changes, .. } => {
+            // clone: a refcount, once per job
+            let from = job.ready.first().and_then(|it| it.front.clone()).ok_or_else(not_lowered)?;
+            let changes = changes.clone(); // clone: the task owns the changes, once per job
+            Does::Reach { to: lowered()?, from, changes }
+        }
+        Work::CodegenInputs(_) => Does::CodegenInputs { front: lowered()? },
+        Work::Tables => {
+            // alloc: once per tables job
+            let images: Vec<(&'static str, u64, u64)> = paths.images.iter().flatten().flat_map(|it| it.kept.tables()).collect();
+            Does::Tables { front: lowered()?, images }
+        }
+        Work::Trace(_) => {
+            // clone: a refcount, once per job
+            Does::Trace { db: ready.input.db.clone(), queries: ready.input.queries, root: steps.plan_key() }
+        }
+        Work::Verify(_) => {
+            let Some(view) = job.views.first().map(|it| it.view) else { return Err(ApiError::new("the job has no view", None)) };
+            // clone: refcounts, once per job
+            Does::Verify { steps: steps.clone(), input: ready.input.clone(), view }
+        }
+        // clone: the task owns the edits, once per job
+        Work::Edit(edits) => Does::Edit { front: lowered()?, edits: edits.clone() },
+        // clone: the task owns the filter, once per job
+        Work::Ahead { filter, .. } => Does::Ahead { front: lowered()?, filter: filter.clone() },
+        Work::Check(_) | Work::Build(_) | Work::Test { .. } | Work::Run { .. } | Work::Snapshot => {
+            return Err(ApiError::new("the job's work builds its units, answering nothing on its own", None));
+        }
+    };
+    Ok(Step::of(&job.cancelled, does))
 }
 
 /// The reading tasks a job held for a write ended unposted: the job is over or cancelled.
-fn refuse_held(w: &mut World<'_>, stage: &mut Stage) {
+fn refuse_held<S: Steps>(w: &mut World<'_, S>, stage: &mut Stage<S>) {
     if let Stage::Units(build) = stage {
         for (task, _) in build.held.drain(..) {
-            w.plane.refuse(w.now, task, "cancelled".to_owned());
+            w.plane.refuse(w.now, task, "cancelled".to_owned()); // alloc: a cancel, once per task held
         }
     }
 }
 
-/// The images kept at unit `unit`'s outputs, moved out of `images` for its compile.
-fn take_images(images: &mut FxHashMap<String, Box<dyn Kept>>, units: &Units, unit: usize) -> Vec<Image> {
-    if images.is_empty() {
-        return Vec::new();
-    }
-    let Some(plan) = units.plans.get(unit) else { return Vec::new() };
-    plan.outputs.iter().filter_map(|path| images.remove_entry(path.as_str())).map(|(path, kept)| Image { path, kept }).collect()
-}
-
-fn script_ended(w: &mut World<'_>, node: NodeId, ok: bool) {
+fn script_ended<S: Steps>(w: &mut World<'_, S>, node: NodeId, ok: bool) {
     let outcome = match ok {
         true => Outcome::Built,
-        false => Outcome::Failed { why: "the build script failed".to_owned() },
+        false => Outcome::Failed { why: "the build script failed".to_owned() }, // alloc: a failure, once
     };
     w.plane.ended(w.now, node, outcome);
 }
 
 /// A warning of the load, as cargo prints it.
 fn warned(warning: &str) -> Diagnostic {
+    // alloc: a warning of the load, once per plan
     Diagnostic {
         level: Level::Warning,
         code: None,
-        message: warning.to_owned(),
-        spans: Vec::new(),
-        children: Vec::new(),
-        facts: Vec::new(),
-        rendered: format!("warning: {warning}\n"),
+        message: warning.to_owned(), // alloc: the report owns it
+        spans: Vec::new(),           // alloc: none
+        children: Vec::new(),        // alloc: none
+        facts: Vec::new(),           // alloc: none
+        rendered: format!("warning: {warning}\n"), // alloc: the report owns it
         unit: None,
     }
 }
@@ -1880,8 +2464,8 @@ fn warned(warning: &str) -> Diagnostic {
 /// Every memo reachable from `from` in `db`, each once, in the order it is reached.
 fn walk(db: &Database, from: QueryKey) -> Vec<blaze_query::Memo> {
     let mut seen = FxHashSet::default();
-    let mut queue = vec![from];
-    let mut memos = Vec::new();
+    let mut queue = vec![from]; // alloc: a trace or a verify, once
+    let mut memos = Vec::new(); // alloc: a trace or a verify, once
     while let Some(key) = queue.pop() {
         if !seen.insert(key) {
             continue;
@@ -1903,18 +2487,19 @@ pub fn trace(db: &Database, view: ViewId, from: QueryKey) -> Vec<Traced> {
             fingerprint: memo.fingerprint,
             edges: memo.edges,
         })
-        .collect()
+        .collect() // alloc: a trace, once
 }
 
 /// The view's plan asked again in a database of its own from nothing, and every result
 /// compared with the daemon's.
-fn verify(steps: &dyn Steps, input: &JobInput, view: blaze_vfs::View) -> Result<Vec<Mismatch>, Failed> {
+fn verify<S: Steps>(steps: &S, input: &JobInput, view: blaze_vfs::View) -> Result<Vec<Mismatch>, Failed> {
+    // alloc: a verify's own tree, once
     let config = blaze_query::Config { tree: Some(Arc::new(input.files.clone())), dir: None, tags: 0 };
     let mut scratch = Database::new(config);
     steps.register(&mut scratch);
     let queries = scratch.open_with(view, &input.config.encode());
     steps.plan(&scratch, queries)?;
-    let mut mismatches = Vec::new();
+    let mut mismatches = Vec::new(); // alloc: a verify, once
     for memo in walk(&scratch, steps.plan_key()) {
         let Some(ours) = input.db.memo(&memo.key) else { continue };
         if ours.fingerprint != memo.fingerprint {
@@ -1922,144 +2507,4 @@ fn verify(steps: &dyn Steps, input: &JobInput, view: blaze_vfs::View) -> Result<
         }
     }
     Ok(mismatches)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn targets() -> Targets {
-        Targets {
-            packages: vec!["a".into(), "b".into()],
-            profile: "release".into(),
-            target: Some("wasm32-unknown-unknown".into()),
-            features: vec!["x".into(), "y".into()],
-            all_features: false,
-            no_default_features: true,
-            cargo: None,
-        }
-    }
-
-    #[test]
-    fn an_agents_targets_are_cargos_flags_at_the_root() {
-        let env = vec![("HOME".to_owned(), "/home/u".to_owned()), ("PATH".to_owned(), "/bin".to_owned())];
-        let work = Work::Build(targets());
-        let made = invocation(&work, targets_of(&work), "/w", &env);
-        assert_eq!(made.command, Command::Build);
-        let args: Vec<&str> = made.args.iter().map(String::as_str).collect();
-        assert_eq!(
-            args,
-            [
-                "-p", "a", "-p", "b", "--profile", "release", "--target", "wasm32-unknown-unknown", "-F", "x,y",
-                "--no-default-features"
-            ]
-        );
-        assert_eq!((made.root.as_str(), made.cwd.as_str()), ("/w", "/w"));
-        assert_eq!(made.env, env);
-        assert!(made.files.is_empty());
-    }
-
-    #[test]
-    fn cargos_own_invocation_is_kept_whole() {
-        let mut targets = targets();
-        targets.cargo = Some(blaze_api::Cargo {
-            command: "test".into(),
-            args: vec!["--workspace".into()],
-            root: "/w".into(),
-            cwd: "/w/a".into(),
-            env: vec![("RUSTFLAGS".into(), "-Dwarnings".into())],
-            files: Vec::new(),
-            color: false,
-        });
-        let work = Work::Test { targets: targets.clone(), filter: Vec::new(), all: false, args: Vec::new(), ub: None };
-        let made = invocation(&work, Some(&targets), "/elsewhere", &[]);
-        assert_eq!(made.command, Command::Test);
-        assert_eq!(made.args, vec!["--workspace".to_owned()]);
-        assert_eq!(made.cwd, "/w/a");
-        assert_eq!(made.env, vec![("RUSTFLAGS".to_owned(), "-Dwarnings".to_owned())]);
-    }
-
-    #[test]
-    fn diagnostics_are_short_as_cargos_message_format_says() {
-        let short = |args: &[&str]| short(&args.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>());
-        assert_eq!(short(&[]), Ok(false));
-        assert_eq!(short(&["--message-format=short"]), Ok(true));
-        assert_eq!(short(&["--message-format", "short", "-p", "a"]), Ok(true));
-        assert_eq!(short(&["--message-format=json,json-diagnostic-short"]), Ok(true));
-        assert_eq!(short(&["--message-format=json-diagnostic-rendered-ansi"]), Ok(false));
-        assert_eq!(short(&["--message-format=human"]), Ok(false));
-        assert!(short(&["--message-format=short", "--message-format=human"]).is_err());
-        assert!(short(&["--message-format=terse"]).is_err());
-    }
-
-    #[test]
-    fn tests_under_the_evaluator_check_the_units_and_build_none() {
-        let ub = Some(blaze_api::Ub { seed: Some(7), schedules: None });
-        let work = Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub };
-        assert_eq!(command_of(&work), Command::Test);
-        assert_eq!(goal_of(&work), Goal::Check);
-        let compiled = Work::Test { targets: targets(), filter: Vec::new(), all: true, args: Vec::new(), ub: None };
-        assert_eq!(goal_of(&compiled), Goal::Test);
-    }
-
-    #[test]
-    fn a_fetchs_key_is_its_source() {
-        let fetch = |at: &str, sha: &str| Fetch {
-            what: "serde v1.0.0".into(),
-            url: "https://static.crates.io/crates/serde/1.0.0/download".into(),
-            kind: FetchKind::Crate { sha256: sha.into() },
-            at: at.into(),
-        };
-        assert_eq!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/r/serde-1.0.0", "aa")));
-        assert_ne!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/r/serde-1.0.0", "bb")));
-        assert_ne!(fetch_key(&fetch("/r/serde-1.0.0", "aa")), fetch_key(&fetch("/s/serde-1.0.0", "aa")));
-    }
-
-    #[test]
-    fn jobs_are_walked_in_id_order_whatever_their_hashes() {
-        let setup = Setup { views: "/v".into(), host: "h".into(), env: Vec::new(), color: false, tags: 0, runs: 0, runs_end: 0 };
-        let mut jobs = Jobs::new(setup);
-        let ids = [9u64, 1, 300, 2, 1 << 40, 0, 77];
-        for id in ids {
-            let job = Job {
-                work: Work::Snapshot,
-                views: Vec::new(),
-                ready: Vec::new(),
-                request: None,
-                closed: false,
-                finished: true,
-                cancelled: Arc::new(AtomicBool::new(false)),
-                stage: Stage::Over,
-                values: FxHashMap::default(),
-                updating: FxHashSet::default(),
-                queries: Vec::new(),
-                borrowed: Vec::new(),
-                placing: 0,
-                batches: Vec::new(),
-                runs: 0,
-                over: None,
-                stats: RequestStats::default(),
-                fresh: 0,
-                compiled: 0,
-            };
-            jobs.jobs.insert(JobId(id), job);
-        }
-        let mut want: Vec<JobId> = ids.iter().map(|it| JobId(*it)).collect();
-        want.sort();
-        let order = jobs.sorted();
-        assert_eq!(order, want);
-        jobs.order = order;
-        jobs.jobs.remove(&JobId(300));
-        want.retain(|it| it.0 != 300);
-        assert_eq!(jobs.sorted(), want);
-    }
-
-    #[test]
-    fn only_a_checkouts_last_plan_and_front_end_are_kept() {
-        let setup = Setup { views: "/v".into(), host: "h".into(), env: Vec::new(), color: false, tags: 0, runs: 0, runs_end: 0 };
-        let jobs = Jobs::new(setup);
-        assert!(jobs.lasting("/home/u/w"));
-        assert!(jobs.lasting("/very/w"), "a directory beside the views' is a checkout's");
-        assert!(!jobs.lasting("/v/0123abcd"), "an agent's view is placed once");
-    }
 }

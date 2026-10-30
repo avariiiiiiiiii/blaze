@@ -1,6 +1,6 @@
 use hir::{CastError, ClosureStyle, HirDisplay};
 
-use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext};
+use crate::{Diagnostic, DiagnosticCode, DiagnosticsContext, Severity};
 
 macro_rules! format_ty {
     ($ctx:expr, $fmt:literal, $($arg:expr),* $(,)?) => {{
@@ -102,10 +102,32 @@ pub(crate) fn invalid_cast(
             DiagnosticCode::RustcHardError("E0804"),
             "cannot add auto trait to dyn bound via pointer cast".to_owned(),
         ),
-        // CastError::UnknownCastPtrKind | CastError::UnknownExprPtrKind => (
-        //     DiagnosticCode::RustcHardError("E0641"),
-        //     "cannot cast to a pointer of an unknown kind".to_owned(),
-        // ),
+        CastError::UnknownCastPtrKind => (
+            DiagnosticCode::RustcHardError("E0641"),
+            "cannot cast to a pointer of an unknown kind".to_owned(),
+        ),
+        CastError::UnknownExprPtrKind => (
+            DiagnosticCode::RustcHardError("E0641"),
+            "cannot cast from a pointer of an unknown kind".to_owned(),
+        ),
+        CastError::CastEnumDrop => (
+            DiagnosticCode::Ra("cast-enum-drop", Severity::Error),
+            format_ty!(
+                ctx,
+                "cannot cast enum `{}` into integer `{}` because it implements `Drop`",
+                d.expr_ty,
+                d.cast_ty
+            ),
+        ),
+        CastError::ForeignNonExhaustiveAdt => (
+            DiagnosticCode::RustcHardError("E0606"),
+            format_ty!(
+                ctx,
+                "casting `{}` as `{}` is invalid: cannot cast an enum with a non-exhaustive variant when it's defined in another crate",
+                d.expr_ty,
+                d.cast_ty
+            ),
+        ),
     };
     Diagnostic::new(code, message, display_range).stable()
 }
@@ -469,20 +491,42 @@ fn foo<T: ?Sized>() {
         );
     }
 
-    //     #[test]
-    //     fn order_dependent_cast_inference() {
-    //         check_diagnostics(
-    //             r#"
-    // //- minicore: sized
-    // fn main() {
-    //     let x = &"hello";
-    //     let mut y = 0 as *const _;
-    //               //^^^^^^^^^^^^^ error: cannot cast to a pointer of an unknown kind
-    //     y = x as *const _;
-    // }
-    // "#,
-    //         );
-    //     }
+    #[test]
+    fn order_dependent_cast_inference() {
+        check_diagnostics(
+            r#"
+//- minicore: sized
+fn main() {
+    let x = &"hello";
+    let mut y = 0 as *const _;
+              //^^^^^^^^^^^^^ error: cannot cast to a pointer of an unknown kind
+    y = x as *const _;
+}
+"#,
+        );
+    }
+
+    #[test]
+    fn enum_drop_cast_error() {
+        check_diagnostics(
+            r#"
+//- minicore: sized, drop
+enum E {
+    A = 0,
+}
+
+impl Drop for E {
+    fn drop(&mut self) {}
+}
+
+fn main() {
+    let e = E::A;
+    let _i = e as u32;
+           //^^^^^^^^ error: cannot cast enum `E` into integer `u32` because it implements `Drop`
+}
+"#,
+        );
+    }
 
     #[test]
     fn ptr_to_ptr_different_regions() {

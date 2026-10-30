@@ -14,12 +14,12 @@ use base_db::Db;
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use hir_expand::{
-    attrs::{Attr, AttrId, AttrInput, collect_item_tree_attrs},
+    attrs::{Attr, AttrId, AttrInput, collect_item_tree_attrs_view},
     mod_path::ModPath,
     name::Name,
 };
 use intern::{Symbol, sym};
-use syntax::{AstNode, ast};
+use syntax::view::{self as ast, AstNode};
 use syntax_bridge::DocCommentDesugarMode;
 use tt::token_to_literal;
 
@@ -42,9 +42,9 @@ impl Default for AttrsOrCfg {
 }
 
 impl AttrsOrCfg {
-    pub(crate) fn lower<'a, S>(
+    pub(crate) fn lower<'t, 'a, S>(
         db: &Db,
-        owner: &dyn ast::HasAttrs, // dyn: once per item, into hir-expand's collect_item_tree_attrs; a generic would copy the attribute lowering per node type
+        owner: impl ast::HasAttrs<'t>,
         cfg_options: &impl Fn() -> &'a CfgOptions,
         span_map: S,
     ) -> AttrsOrCfg
@@ -53,7 +53,13 @@ impl AttrsOrCfg {
     {
         // alloc: the owner's attributes, the value; none for an owner without any
         let mut attrs = Vec::new();
-        let cfg = lower_attrs_into(db, owner, cfg_options, span_map, &mut attrs);
+        let cfg = lower_attrs_into(
+            db,
+            ast::AnyHasAttrs::new(owner),
+            cfg_options,
+            span_map,
+            &mut attrs,
+        );
         let attrs = AttrsOwned(attrs.into_boxed_slice());
         match cfg {
             // alloc: once an owner `cfg`d out, which is lowered no further
@@ -65,10 +71,11 @@ impl AttrsOrCfg {
 
 /// Appends `owner`'s attributes to `attrs`, and returns the `cfg` that disables it, if one
 /// does: the attributes appended are then those before that `cfg` (what crate-level attributes
-/// need), so lowering a second owner after a disabled one is never needed.
-pub(super) fn lower_attrs_into<'a, S>(
+/// need), so lowering a second owner after a disabled one is never needed. One instance for
+/// every kind of owner.
+pub(super) fn lower_attrs_into<'t, 'a, S>(
     db: &Db,
-    owner: &dyn ast::HasAttrs, // dyn: once per item, into hir-expand's collect_item_tree_attrs; a generic would copy the attribute lowering per node type
+    owner: ast::AnyHasAttrs<'t>,
     cfg_options: &impl Fn() -> &'a CfgOptions,
     span_map: S,
     attrs: &mut Vec<Attr>,
@@ -76,15 +83,13 @@ pub(super) fn lower_attrs_into<'a, S>(
 where
     S: syntax_bridge::SpanMapper + Copy,
 {
-    let result = collect_item_tree_attrs::<Infallible>(owner, cfg_options, |meta, _| {
+    let result = collect_item_tree_attrs_view::<Infallible>(owner, cfg_options, |meta, _| {
         // NOTE: We cannot early return from this function, *every* attribute must be pushed, otherwise we'll mess the `AttrId`
         // tracking.
         let path = meta.path();
-        let path_range = path
-            .as_ref()
-            .map(|path| path.syntax().text_range())
-            .unwrap_or_else(|| meta.syntax().text_range());
-        let (span, input) = match &meta {
+        let path_range =
+            path.map_or_else(|| meta.syntax().text_range(), |path| path.syntax().text_range());
+        let (span, input) = match meta {
             ast::Meta::KeyValueMeta(meta) => {
                 let span = span_map.span_for(path_range);
                 let input = meta.expr().and_then(|value| {
@@ -105,8 +110,8 @@ where
             ast::Meta::TokenTreeMeta(meta) => {
                 let span = span_map.span_for(path_range);
                 let token_tree = meta.token_tree();
-                let tt = syntax_bridge::syntax_node_to_token_tree(
-                    token_tree.as_ref().map_or(meta.syntax(), |it| it.syntax()),
+                let tt = syntax_bridge::call_input(
+                    token_tree.map_or(meta.syntax(), |it| it.syntax()),
                     span_map,
                     span,
                     DocCommentDesugarMode::ProcMacro,
@@ -126,7 +131,7 @@ where
         };
 
         let path = path.and_then(|path| {
-            ModPath::from_src(db, path, &mut |range| span_map.span_for(range).ctx)
+            ModPath::from_src_view(db, path, &mut |range| span_map.span_for(range).ctx)
         });
         let path = path.unwrap_or_else(|| Name::missing().into());
 

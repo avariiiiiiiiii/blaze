@@ -493,6 +493,33 @@ fn a_store_outside_a_relocation_is_written_as_before() {
 }
 
 /// The function `f` of `lib` in `db`.
+/// Signatures whose stores keep macro calls: a type macro and macros in array lengths.
+const CALLS: &str = r#"
+//- /lib.rs crate:lib new_source_root:library
+macro_rules! m { () => { u8 } }
+macro_rules! n { () => { 4 } }
+pub fn f(_: [u8; n!()]) -> m!() { 0 }
+pub struct S([m!(); n!()]);
+"#;
+
+/// A store's macro calls are moved through the record's table: served in another database,
+/// they are that database's calls, the ones lowering it makes, not the writer's ids.
+#[test]
+fn a_store_s_macro_calls_read_back_as_this_database_s() {
+    let _turn = turn();
+    let memory = stored(CALLS);
+    let db = served_db(CALLS, &memory, Mode::Serve);
+    let krate = crate_named(&db, "lib");
+    let f = function_f(&db);
+    let served = served_function(&db, f).expect("an item of a crate with an image");
+    let lowered = &FunctionSignature::with_source_map(&db, f).0;
+    assert!(!lowered.store.macro_calls().is_empty(), "the fixture's calls are in the store");
+    assert_eq!(served.store.macro_calls(), lowered.store.macro_calls());
+    for item in declared(&db, krate) {
+        assert_served(&db, krate, item, true);
+    }
+}
+
 fn function_f(db: &TestDB) -> FunctionId {
     let f = Name::new_symbol_root(intern::Symbol::intern("f"));
     let krate = crate_named(db, "lib");

@@ -10,7 +10,7 @@ use hir_def::{
     signatures::FunctionSignature,
 };
 use hir_expand::name::Name;
-use intern::{Symbol, sym};
+use intern::sym;
 use rustc_ast_ir::Mutability;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind as _};
 use span::Edition;
@@ -67,7 +67,7 @@ fn is_stdlib_stable_crate(db: &Db, krate: Crate) -> bool {
     })
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// rustc's `lint_edition_dependent_dot_call`: the method call `call_expr` on `receiver` of
     /// type `self_ty`, picked as `pick`.
     pub(crate) fn lint_edition_dependent_dot_call(
@@ -152,7 +152,7 @@ impl<'db> InferenceContext<'db> {
         if self.edition.at_least_2021() {
             return;
         }
-        let from_iter = name.as_str() == "from_iter";
+        let from_iter = *name.symbol() == sym::from_iter;
         if !(*name.symbol() == sym::try_into || *name.symbol() == sym::try_from || from_iter) {
             return;
         }
@@ -166,7 +166,7 @@ impl<'db> InferenceContext<'db> {
         // Not for a type known not to implement `FromIterator`.
         if from_iter
             && let Some(AttrDefId::TraitId(from_iterator)) =
-                diagnostic_items(self.db, self.krate()).get(&Symbol::intern("FromIterator"))
+                diagnostic_items(self.db, self.krate()).get(&sym::FromIterator)
         {
             let any_type = self.table.next_ty_var(node.into());
             if !self

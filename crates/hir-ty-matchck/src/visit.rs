@@ -12,8 +12,6 @@ use std::cell::{Cell, RefCell};
 use base_db::Db;
 use hir_def::{
     AdtId, CallableDefId, DefWithBodyId, EnumId, EnumVariantId, FunctionId, HasModule,
-    VariantId,
-    attrs::AttrFlags,
     expr_store::Body,
     hir::{
         Array, BinaryOp, Expr, ExprId, ExprOrPatId, LogicOp, LoopSource, MatchArm,
@@ -32,11 +30,10 @@ use smallvec::SmallVec;
 
 use hir_ty::{
     Adjust, BindingMode, ByRef, InferenceResult,
-    consteval::try_const_usize,
     db::HirDatabase,
-    inhabitedness::is_enum_variant_uninhabited_from,
+    inhabitedness::{is_enum_variant_privately_uninhabited, is_enum_variant_uninhabited_from},
     next_solver::{
-        CallableIdWrapper, DbInterner, GenericArgs, Ty, TyKind, TypingMode,
+        CallableIdWrapper, DbInterner, Ty, TyKind, TypingMode,
         infer::DbInternerInferExt,
     },
 };
@@ -49,10 +46,6 @@ use crate::{
     lower::{LowerError, Lowerer},
     typo::find_fallback_pattern_typo,
 };
-
-/// How deep `uninhabited_ignoring_visibility` looks into a type: a type that holds itself
-/// does so behind a pointer, which ends the walk.
-const MAX_TYPE_DEPTH: u32 = 64;
 
 /// rustc's `LetSource`, with the sources it never lints.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +95,7 @@ pub(crate) fn check_body<'db>(
         pointer_bits: target.pointer_size().bits(),
         exhaustive_patterns: features.exhaustive_patterns,
         deref_patterns: features.deref_patterns,
+        never_patterns: features.never_patterns,
         has_deref_pat: Cell::new(false),
         range_lints: RefCell::new(Vec::new()), // alloc: none until a lint fires.
     };
@@ -824,7 +818,7 @@ impl<'c, 'a, 'db> Visitor<'c, 'a, 'db> {
         let AdtId::EnumId(enum_) = def.def_id() else { return false };
         let variant = idx.id(self.db, enum_);
         !is_enum_variant_uninhabited_from(cx.infcx, variant, args, cx.module, cx.env)
-            && variant_uninhabited_ignoring_visibility(cx, variant, args, 0)
+            && is_enum_variant_privately_uninhabited(cx.infcx, variant, args, cx.krate, cx.env)
     }
 
     /// `is_known_valid_scrutinee`: whether the place may hold invalid data, read through a
@@ -947,60 +941,5 @@ fn special_ty<'db>(cx: &Cx<'_, 'db>, ty: Ty<'db>) -> Option<SpecialTy> {
         _ if cx.is_foreign_non_exhaustive_enum(ty) => Some(SpecialTy::ForeignNonExhaustive),
         _ if cx.is_uninhabited(ty) => Some(SpecialTy::Uninhabited),
         _ => None,
-    }
-}
-
-/// `inhabited_predicate(..).apply_ignore_module` of a variant, negated: whether a field of
-/// it is uninhabited when every field is visible.
-fn variant_uninhabited_ignoring_visibility<'db>(
-    cx: &Cx<'_, 'db>,
-    variant: EnumVariantId,
-    args: GenericArgs<'db>,
-    depth: u32,
-) -> bool {
-    if variant.krate(cx.db) != cx.krate
-        && AttrFlags::query(cx.db, variant.into()).contains(AttrFlags::NON_EXHAUSTIVE)
-    {
-        return false;
-    }
-    cx.variant_fields(args, variant.into())
-        .any(|(_, ty)| uninhabited_ignoring_visibility(cx, ty, depth + 1))
-}
-
-/// `Ty::inhabited_predicate(..).apply_ignore_module`, negated.
-fn uninhabited_ignoring_visibility<'db>(cx: &Cx<'_, 'db>, ty: Ty<'db>, depth: u32) -> bool {
-    if depth > MAX_TYPE_DEPTH {
-        return false;
-    }
-    match ty.kind() {
-        TyKind::Never => true,
-        TyKind::Tuple(tys) => tys.iter().any(|ty| uninhabited_ignoring_visibility(cx, ty, depth + 1)),
-        TyKind::Array(elem, len) => {
-            try_const_usize(cx.db, len).is_some_and(|len| len > 0)
-                && uninhabited_ignoring_visibility(cx, elem, depth + 1)
-        }
-        TyKind::Adt(def, args) => match def.def_id() {
-            AdtId::UnionId(_) => false,
-            AdtId::StructId(id) => {
-                if id.krate(cx.db) != cx.krate
-                    && AttrFlags::query(cx.db, id.into()).contains(AttrFlags::NON_EXHAUSTIVE)
-                {
-                    return false;
-                }
-                cx.variant_fields(args, VariantId::StructId(id))
-                    .any(|(_, ty)| uninhabited_ignoring_visibility(cx, ty, depth + 1))
-            }
-            AdtId::EnumId(id) => {
-                if id.krate(cx.db) != cx.krate
-                    && AttrFlags::query(cx.db, id.into()).contains(AttrFlags::NON_EXHAUSTIVE)
-                {
-                    return false;
-                }
-                id.enum_variants(cx.db).variants.values().all(|&(variant, _)| {
-                    variant_uninhabited_ignoring_visibility(cx, variant, args, depth)
-                })
-            }
-        },
-        _ => false,
     }
 }

@@ -9,7 +9,8 @@ Part of [usercode](../usercode.md). Code: `crates/blaze-usercode/src/test.rs` an
 `crates/blaze-usercode/src/test/`. Requests: `v2/requests/usercode-fast-tests.md`.
 
 A request's tests go through one sans-IO queue (`test/queue.rs`) over every test binary.
-Each binary starts once, in its sandbox, as a fork server (`test/fork_server.rs`, text the
+Each binary starts once, in its sandbox or outside it ([below](#in-the-sandbox-or-outside)), as
+a fork server (`test/fork_server.rs`, text the
 harness compiles in); the server forks a child per test, and answers how it ended, what it
 wrote and what it executed (`test/wire.rs`). Before any of that, selection (`test/select.rs`)
 skips a test whose pass is kept for the code it reaches and the files it read. Nothing here is
@@ -150,6 +151,37 @@ Where we fall short: a server's tests can only start once it said hello, so the 
 a binary waits for its exec and sandbox; a pool of warm servers (#1443's warm pool) would
 hide that for the next request. Retries keep their place in the order but always go to the
 same server.
+
+## In the sandbox or outside
+
+Tests run outside any sandbox, as cargo runs them, unless the workspace opts into the
+`sandboxed-tests` experiment or the package says `tests = true` under
+`[package.metadata.blaze.sandbox]` (docs/cargo.md, "Sandboxed tests"). `test::Binary::sandboxed`
+says which, and cargo sets it (`v2/requests/usercode-tests-off.md`). It is `false` by default,
+and `false` for a package with `tests = false` and for every binary under `BLAZE_SANDBOX=off`.
+
+- **Outside**, the binary is spawned with `Sandbox::Off`: no record is made or read, and no
+  `confine::LIVE` is set. Its fork server and replicas run each test in a process of its own
+  as inside. A child's scope mark is an `access` of a path that isn't there, which nothing
+  sees. Each result's trace is `Trace::Unknown(OUTSIDE)`, so selection keeps no pass, and
+  cargo also marks the test `outside` so it runs every time. A binary run whole as libtest's
+  threads is the same.
+- **`unsandboxed-tests`** in an opted-in package makes a second `Binary` of the same program,
+  outside, whose jobs are the tests named. The sandboxed one gets the rest. This is libtest's
+  `--exact` split: each binary's jobs are exact names, a process each or, run whole, `NAME...
+  --exact`. Each binary has its own socket and record (`t{b}`, `r{b}`) by its place in the
+  queue.
+- **Outside after inside.** A binary outside starts only once every sandboxed test in the queue
+  has its result. An outside test writes the machine for real, and a sandboxed test's reads are
+  hashed as its result is drained, so running the two at once could key a pass to files the
+  test never saw. In a workspace that doesn't opt in, every binary is outside and nothing
+  waits. In one that does, the outside tests are the few a package named.
+- **No fallback.** Nothing goes outside except by this field. A sandboxed binary whose sandbox
+  can't be made loses its tests with why, as before.
+
+A test outside costs the queue less than one inside: no record read and no lines, only the
+reason string of its trace (inside the steady-state budget of 8 allocations a test,
+`the_steady_state_reuses_its_slabs`, run both ways).
 
 ## Which tests run at all (`test/select.rs`)
 

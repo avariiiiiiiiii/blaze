@@ -95,10 +95,12 @@ fn ensure_file_with_lock_free_access(path: Utf8PathBuf) -> NamedTempFile {
 
     (|| {
         let file_name = path.file_stem().ok_or_else(|| {
+            // alloc: error path, naming the path.
             io::Error::new(io::ErrorKind::InvalidInput, format!("File path is invalid: {path}"))
         })?;
 
         NamedTempFile::new_from_existing(
+            // alloc: the library's copy's name, once per library loaded.
             &format!("proc-macro-srv-{file_name}.dll"),
             path.as_std_path(),
         )

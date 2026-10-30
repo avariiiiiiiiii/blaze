@@ -23,7 +23,7 @@ use std::{
 
 use blaze_cas::{Key, Kind};
 use blaze_ids::{ContentId, Hasher};
-use blaze_items::ItemKey;
+use blaze_items::{CodeHash, ItemKey};
 use blaze_mem::{Tag, frame};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -105,6 +105,33 @@ pub struct Built {
     /// By key, each once.
     pub puts: Vec<Put>,
     pub stats: Stats,
+    /// Every instance the walk reached, compiled or found, with the code hash it was made
+    /// from, by key.
+    pub inputs: Vec<(InstanceKey, CodeHash)>,
+    /// The items of every instance and static, sorted, each once: the owners of the spans
+    /// the code names.
+    pub items: Vec<ItemKey>,
+    /// Every instance the walk reached by key, with the name a debugger calls it
+    /// ([`Described::name`]), those dedupe merged away included.
+    pub debug_names: Vec<(InstanceKey, String)>,
+    /// What each root reaches ([`Built::reached`]).
+    pub reach: Reach,
+}
+
+impl Built {
+    /// The code hashes, arguments and static values of everything `root` reaches, itself and
+    /// the callees its code builds in included, sorted and each once: what a test's result
+    /// depends on apart from its settings, the code outside blaze's (`extern` symbols, C
+    /// libraries) and the positions of the span tables its code names.
+    ///
+    /// # Panics
+    ///
+    /// When `root` is no function of the build: the caller asks of one of [`Built::roots`].
+    pub fn reached(&self, root: &InstanceKey) -> Vec<CodeHash> {
+        self.reach
+            .of(root)
+            .unwrap_or_else(|| panic!("{root:?} is no function of the build, so it reaches nothing"))
+    }
 }
 
 /// What [`Build::tier_up`] gives: each tiered function's key, with the code for its slot.
@@ -470,6 +497,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     fn walk(
         &self,
         roots: &[(FrontInstance<B>, Origin)],
+        static_roots: &[FrontStatic<B>],
         errors: &mut Vec<CodegenError>,
     ) -> (Sorted<InstanceKey, FnNode<B>>, Sorted<StaticId, StaticNode<B>>, Vec<InstanceKey>) {
         let mut nodes: FxHashMap<InstanceKey, FnNode<B>> = FxHashMap::default();
@@ -481,8 +509,9 @@ impl<'a, B: Prepare> Build<'a, B> {
         let mut level: Vec<(FrontInstance<B>, Origin)> =
             // clone: per build, the walk's handles of its roots
             roots.iter().filter(|it| queued.insert((*it).clone())).cloned().collect();
-        // alloc: per build, sized by its units
-        let mut static_level: Vec<FrontStatic<B>> = Vec::new();
+        let mut static_level: Vec<FrontStatic<B>> =
+            // clone: per build, the walk's handles of its static roots
+            static_roots.iter().filter(|it| static_queued.insert((*it).clone())).cloned().collect();
         let enqueue = |refs: &[FrontRef<FrontInstance<B>, FrontStatic<B>>],
                        requester: &Origin,
                        queued: &mut HashSet<(FrontInstance<B>, Origin)>,
@@ -511,6 +540,11 @@ impl<'a, B: Prepare> Build<'a, B> {
             }
         };
         while !level.is_empty() || !static_level.is_empty() {
+            if self.frontend.stopped() {
+                errors.push(stopped());
+                break;
+            }
+            self.frontend.reached(&level, &static_level);
             let described: Vec<_> = level
                 .par_iter()
                 .map(|(instance, requester)| {
@@ -664,8 +698,20 @@ impl<'a, B: Prepare> Build<'a, B> {
         roots: &[(FrontInstance<B>, Origin)],
         store: &impl Lookup,
     ) -> Result<Built, Vec<CodegenError>> {
+        self.run_with_statics(roots, &[], store)
+    }
+
+    /// [`Build::run`], with statics no code names that the program has all the same and
+    /// everything they reach: `#[used]` and exported statics, which a linker or the runtime
+    /// finds by name.
+    pub fn run_with_statics(
+        &mut self,
+        roots: &[(FrontInstance<B>, Origin)],
+        static_roots: &[FrontStatic<B>],
+        store: &impl Lookup,
+    ) -> Result<Built, Vec<CodegenError>> {
         let mut out = Out::default();
-        let (nodes, statics, root_keys) = self.walk(roots, &mut out.errors);
+        let (nodes, statics, root_keys) = self.walk(roots, static_roots, &mut out.errors);
         if !out.errors.is_empty() {
             return Err(out.finish().4);
         }
@@ -675,6 +721,10 @@ impl<'a, B: Prepare> Build<'a, B> {
         self.static_callees = statics.values().flat_map(|it| it.refs.iter().filter_map(callee)).collect();
 
         self.dev(&nodes, store, &mut out);
+        if self.frontend.stopped() {
+            // alloc: an error, once
+            return Err(vec![stopped()]);
+        }
         let release: Vec<Job<'_, B>> = nodes
             .iter()
             .filter(|(_, node)| !node.spec.backend.is_cranelift())
@@ -683,6 +733,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             // alloc: per build, sized by its units
             .collect();
         self.release(&nodes, &release, store, &mut out);
+        if self.frontend.stopped() {
+            // alloc: an error, once
+            return Err(vec![stopped()]);
+        }
         self.statics(&statics, store, &mut out);
 
         let mergeable = |key: &InstanceKey| match nodes.get(key) {
@@ -709,6 +763,32 @@ impl<'a, B: Prepare> Build<'a, B> {
         let patchable = nodes.iter().filter(|it| it.1.patchable).map(|it| *it.0).collect();
         // alloc: per build, what it gives the linker
         let tiered = nodes.iter().filter(|it| it.1.then.is_some()).map(|it| *it.0).collect();
+        // alloc: per build, what it gives the linker and the store's record
+        let inputs = nodes.iter().map(|(key, node)| (*key, node.unit.instance.code)).collect();
+        let mut items: Vec<ItemKey> = nodes
+            .values()
+            .map(|it| it.unit.item)
+            .chain(statics.iter().map(|(id, _)| id.0))
+            // alloc: per build, what it gives the linker
+            .collect();
+        items.sort_unstable();
+        items.dedup();
+        let debug_names = nodes
+            .iter()
+            // clone: per build, the names the build gives the linker
+            .map(|(key, node)| (*key, node.described.name.clone()))
+            // alloc: per build, what it gives the linker
+            .collect();
+        let reach = Reach::new(
+            nodes.iter().map(|(key, node)| {
+                let marks = [node.unit.instance.code.0, node.unit.instance.args];
+                (*key, reach::Node { marks, refs: &node.refs })
+            }),
+            statics.iter().map(|(id, node)| {
+                let marks = [node.described.value, node.described.instance];
+                (*id, reach::Node { marks, refs: &node.refs })
+            }),
+        );
         let (functions, compiled_statics, puts, stats, errors) = out.finish();
         self.nodes = nodes;
         if !errors.is_empty() {
@@ -725,6 +805,10 @@ impl<'a, B: Prepare> Build<'a, B> {
             deduped,
             puts,
             stats,
+            inputs,
+            items,
+            debug_names,
+            reach,
         })
     }
 
@@ -1341,6 +1425,17 @@ pub fn shared_memo() -> Arc<Memo> {
     // alloc: once a daemon
     Arc::new(Memo::new())
 }
+
+/// The error of a build stopped because its outcome was decided without its code
+/// ([`Frontend::stopped`]): of no instance, so its keys are empty. Its caller reports the
+/// check's errors, never this.
+fn stopped() -> CodegenError {
+    let none = (InstanceKey(ContentId::default()), ItemKey(ContentId::default()));
+    error(none.0, none.1, "stopped: a body the build compiles failed its check")
+}
+
+mod reach;
+pub use reach::Reach;
 
 #[cfg(test)]
 mod tests;

@@ -103,15 +103,32 @@ impl MacroKind {
             MacroKind::Derive => "derive macro",
         }
     }
+
+    /// rustc's `MacroKind::descr_expected`.
+    pub(crate) fn expected(self) -> &'static str {
+        match self {
+            MacroKind::Bang => "macro",
+            MacroKind::Attr => "attribute",
+            MacroKind::Derive => "derive macro",
+        }
+    }
+
+    /// rustc's `MacroKind::article`.
+    pub(crate) fn article(self) -> &'static str {
+        match self {
+            MacroKind::Attr => "an",
+            MacroKind::Bang | MacroKind::Derive => "a",
+        }
+    }
 }
 
 impl Expansion {
     /// As rustc's JSON names it: `name!`, `#[name]`, `#[derive(Name)]`.
     pub fn decl_name(&self) -> String {
         match self.kind {
-            MacroKind::Bang => format!("{}!", self.name),
-            MacroKind::Attr => format!("#[{}]", self.name),
-            MacroKind::Derive => format!("#[derive({})]", self.name),
+            MacroKind::Bang => format!("{}!", self.name), // alloc: the JSON of a diagnostic written
+            MacroKind::Attr => format!("#[{}]", self.name), // alloc: the JSON of a diagnostic written
+            MacroKind::Derive => format!("#[derive({})]", self.name), // alloc: the JSON of a diagnostic written
         }
     }
 }
@@ -119,6 +136,7 @@ impl Expansion {
 impl Span {
     pub fn new(file: &str, range: TextRange) -> Span {
         Span {
+            // alloc: a diagnostic's span; its callers make one for what they report
             file: file.to_owned(),
             lo: range.start().into(),
             hi: range.end().into(),
@@ -131,23 +149,24 @@ impl Span {
     }
 
     pub fn to(&self, other: &Span) -> Span {
+        // clone: a new span of a diagnostic being built, the edge
         Span { lo: self.lo.min(other.lo), hi: self.hi.max(other.hi), ..self.clone() }
     }
 
     pub fn with_lo(&self, lo: u32) -> Span {
-        Span { lo, ..self.clone() }
+        Span { lo, ..self.clone() } // clone: a new span of a diagnostic being built, the edge
     }
 
     pub fn with_hi(&self, hi: u32) -> Span {
-        Span { hi, ..self.clone() }
+        Span { hi, ..self.clone() } // clone: a new span of a diagnostic being built, the edge
     }
 
     pub fn shrink_to_lo(&self) -> Span {
-        Span { hi: self.lo, ..self.clone() }
+        Span { hi: self.lo, ..self.clone() } // clone: a new span of a diagnostic being built, the edge
     }
 
     pub fn shrink_to_hi(&self) -> Span {
-        Span { lo: self.hi, ..self.clone() }
+        Span { lo: self.hi, ..self.clone() } // clone: a new span of a diagnostic being built, the edge
     }
 
     pub fn is_empty(&self) -> bool {
@@ -201,7 +220,7 @@ impl From<Span> for MultiSpan {
 
 impl MultiSpan {
     pub fn of(span: Span) -> MultiSpan {
-        MultiSpan { primary: vec![span], labels: Vec::new() }
+        MultiSpan { primary: vec![span], labels: Vec::new() } // alloc: a diagnostic's span, the edge
     }
 
     pub fn is_empty(&self) -> bool {
@@ -223,7 +242,7 @@ impl MultiSpan {
                 is_primary: self.primary.contains(span),
                 label: Some(label),
             })
-            .collect();
+            .collect(); // alloc: a diagnostic's labels, written or rendered, the edge
         for span in &self.primary {
             if !labels.iter().any(|it| it.span == span) {
                 labels.push(SpanLabel { span, is_primary: true, label: None });
@@ -353,10 +372,10 @@ impl Diag {
             code,
             message: message.into(),
             span: MultiSpan::default(),
-            children: Vec::new(),
-            suggestions: Vec::new(),
+            children: Vec::new(),    // alloc: empty, allocates nothing
+            suggestions: Vec::new(), // alloc: empty, allocates nothing
             suggestions_disabled: false,
-            facts: Vec::new(),
+            facts: Vec::new(), // alloc: empty, allocates nothing
             fatal: false,
         }
     }
@@ -370,6 +389,7 @@ impl Diag {
 
     /// An error with rustc's code `code` (`"E0308"`), or none.
     pub fn error(code: Option<&str>, message: impl Into<String>, span: Span) -> Diag {
+        // alloc: the code of an error being built, the edge
         let mut diag = Diag::new(Level::Error, code.map(|it| Code::Error(it.to_owned())), message);
         diag.span = MultiSpan::of(span);
         diag
@@ -377,6 +397,7 @@ impl Diag {
 
     /// A diagnostic of the lint `lint`, at `warn` until [`crate::lints`] decides its level.
     pub fn lint(lint: &str, message: impl Into<String>, span: Span) -> Diag {
+        // alloc: the name of a lint being built, the edge
         let mut diag = Diag::new(Level::Warning, Some(Code::Lint(lint.to_owned())), message);
         diag.span = MultiSpan::of(span);
         diag
@@ -389,6 +410,7 @@ impl Diag {
     /// A lint of rustc's whose diagnostic has error code `code` (rustc's `.with_code` on a
     /// lint's diagnostic).
     pub fn lint_with_code(lint: &str, code: &str, message: impl Into<String>, span: Span) -> Diag {
+        // alloc: the name and code of a lint being built, the edge
         let code = Code::LintWithCode { lint: lint.to_owned(), code: code.to_owned() };
         let mut diag = Diag::new(Level::Warning, Some(code), message);
         diag.span = MultiSpan::of(span);
@@ -459,7 +481,7 @@ impl Diag {
         applicability: Applicability,
     ) -> &mut Diag {
         self.suggestion_with_style(
-            vec![(span, code.into())],
+            vec![(span, code.into())], // alloc: a suggestion being built, the edge
             message,
             applicability,
             SuggestionStyle::ShowCode,
@@ -475,7 +497,7 @@ impl Diag {
         applicability: Applicability,
     ) -> &mut Diag {
         self.suggestion_with_style(
-            vec![(span, code.into())],
+            vec![(span, code.into())], // alloc: a suggestion being built, the edge
             message,
             applicability,
             SuggestionStyle::ShowAlways,
@@ -491,6 +513,7 @@ impl Diag {
         applicability: Applicability,
         style: SuggestionStyle,
     ) -> &mut Diag {
+        // alloc: the substitutions of a suggestion being built, the edge
         let substitutions = codes.into_iter().map(|code| vec![(span.clone(), code)]).collect();
         self.suggestions.push(Suggestion {
             message: message.into(),
@@ -520,10 +543,11 @@ impl Diag {
         style: SuggestionStyle,
     ) -> &mut Diag {
         let mut seen = rustc_hash::FxHashSet::default();
+        // clone: the parts of a suggestion being built, the edge; `retain` keeps no borrow of them
         parts.retain(|(span, code)| seen.insert((span.lo, span.hi, code.clone())));
         self.suggestions.push(Suggestion {
             message: message.into(),
-            substitutions: vec![parts],
+            substitutions: vec![parts], // alloc: a suggestion being built, the edge
             applicability,
             style,
         });
@@ -564,9 +588,11 @@ impl Diag {
         let first = macros.next()?;
         let last = macros.last().unwrap_or(first);
         let and_then = match last.name != first.name {
+            // alloc: the note of a diagnostic in a macro, the edge
             true => format!(" which comes from the expansion of the {} `{}`", last.kind.descr(), last.name),
-            false => String::new(),
+            false => String::new(), // alloc: empty, allocates nothing
         };
+        // alloc: the note of a diagnostic in a macro, the edge
         Some(format!(
             "this {} originates in the {} `{}`{and_then} (in Nightly builds, run with -Z macro-backtrace for more info)",
             self.level.name(),

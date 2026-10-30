@@ -16,11 +16,12 @@ use hashbrown::HashTable;
 use hir::{HirFileId, InFile};
 use intern::Symbol;
 use rustc_hash::FxBuildHasher;
+use smallvec::SmallVec;
 use syntax::{SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, ast};
 
 use super::{
     ExpectId, Shared, Source, SourceId, Spec,
-    attrs::{self, ItemKind, Read},
+    attrs::{self, ItemKind, Read, Reads},
 };
 use crate::{
     lints::{
@@ -62,7 +63,7 @@ pub(super) struct Expectation {
     pub(super) id: ExpectId,
     /// Where the name is in the attribute.
     pub(super) key: Span,
-    pub(super) reason: Option<Box<str>>,
+    pub(super) reason: Option<Symbol>,
     /// `#[expect(unfulfilled_lint_expectations)]`, which nothing fulfills.
     pub(super) is_unfulfilled: bool,
     /// The node the attribute is on: where the level of `unfulfilled_lint_expectations` is.
@@ -132,16 +133,22 @@ impl Levels {
         Levels {
             early,
             walking,
+            // alloc: setup, once per builder (three per check)
             start: vec![0],
+            // alloc: as above
             parent: vec![NO_SET],
+            // alloc: as above
             has: vec![LintSet::EMPTY],
             ids: Vec::with_capacity(cmd),
             specs: Vec::with_capacity(cmd),
             anywhere: LintSet::EMPTY,
             cmd_at: [LintSet::EMPTY; LEVELS],
             at: HashTable::new(),
+            // alloc: empty, allocates nothing
             chain: Vec::new(),
+            // alloc: empty, allocates nothing
             emitted: Vec::new(),
+            // alloc: empty, allocates nothing
             expectations: Vec::new(),
         }
     }
@@ -157,59 +164,78 @@ impl Levels {
             None => (None, name),
         };
         if speaks {
-            let requested = format!("requested on the command line with `{} {name}`", level.to_cmd_flag());
+            // alloc: a diagnostic's note, made only for one
+            let requested = || format!("requested on the command line with `{} {name}`", level.to_cmd_flag());
             if only == "warnings" && level == Level::ForceWarn {
                 let mut diag = Diag::new(
                     crate::model::Level::Error,
+                    // alloc: an error's code
                     Some(Code::Error("E0602".to_owned())),
                     "`warnings` lint group is not supported with ´--force-warn´",
                 );
                 diag.span = MultiSpan::default();
+                // alloc: empty, allocates nothing
                 self.push(true, Vec::new(), diag);
             }
             let lint = |name: &str, message: String| {
+                // alloc: a diagnostic's code
                 Diag::new(crate::model::Level::Warning, Some(Code::Lint(name.to_owned())), message)
             };
             match sh.store.check(only, tool) {
                 Checked::Renamed(new) => {
+                    // alloc: a diagnostic's message
                     let mut diag = lint("renamed_and_removed_lints", format!("lint `{name}` has been renamed to `{new}`"));
+                    // alloc: as above
                     diag.help(format!("use the new name `{new}`"));
-                    diag.note(requested);
+                    diag.note(requested());
+                    // alloc: empty, allocates nothing
                     self.lint(sh, COMMAND_LINE, true, Vec::new(), diag, None);
                 }
                 Checked::Removed(reason) => {
+                    // alloc: a diagnostic's message
                     let mut diag = lint("renamed_and_removed_lints", format!("lint `{name}` has been removed: {reason}"));
-                    diag.note(requested);
+                    diag.note(requested());
+                    // alloc: empty, allocates nothing
                     self.lint(sh, COMMAND_LINE, true, Vec::new(), diag, None);
                 }
                 Checked::NoLint(suggestion) => {
+                    // alloc: a diagnostic's message
                     let mut diag = lint("unknown_lints", format!("unknown lint: `{name}`"));
                     if let Some((replace, from_rustc)) = suggestion {
                         diag.help(match from_rustc {
+                            // alloc: as above
                             true => format!("a lint with a similar name exists in `rustc` lints: `{replace}`"),
+                            // alloc: as above
                             false => format!("did you mean: `{replace}`"),
                         });
                     }
-                    diag.note(requested);
+                    diag.note(requested());
+                    // alloc: empty, allocates nothing
                     self.lint(sh, COMMAND_LINE, true, Vec::new(), diag, Some("E0602"));
                 }
                 Checked::Tool(_, Some(new)) => {
                     let mut diag = lint(
                         "renamed_and_removed_lints",
+                        // alloc: a diagnostic's message
                         format!("lint name `{name}` is deprecated and may not have an effect in the future"),
                     );
+                    // alloc: as above
                     diag.help(format!("change it to {new}"));
-                    diag.note(requested);
+                    diag.note(requested());
+                    // alloc: empty, allocates nothing
                     self.lint(sh, COMMAND_LINE, true, Vec::new(), diag, None);
                 }
                 Checked::NoTool => {
                     let tool = tool.unwrap_or_default();
                     let mut diag = Diag::new(
                         crate::model::Level::Error,
+                        // alloc: an error's code
                         Some(Code::Error("E0602".to_owned())),
+                        // alloc: an error's message
                         format!("unknown lint tool: `{tool}`"),
                     );
-                    diag.note(requested);
+                    diag.note(requested());
+                    // alloc: empty, allocates nothing
                     self.push(true, Vec::new(), diag);
                 }
                 Checked::Ok(_) | Checked::Tool(_, None) | Checked::MissingTool => {}
@@ -237,6 +263,7 @@ impl Levels {
         for tree in &walk.trees {
             for node in tree.with_attrs(|kind| attrs::may_be_owner(kind, early)) {
                 if attrs::owns(node, early) {
+                    // clone: a reference count on the tree, of a node with an attribute
                     self.set_at(sh, InFile::new(tree.file, node.clone()));
                 }
             }
@@ -312,13 +339,14 @@ impl Levels {
     }
 
     /// rustc's `add`: the attributes of one node.
-    fn add(&mut self, sh: &mut Shared<'_, '_, '_>, set: SetId, node: &InFile<SyntaxNode>, reads: Vec<Read>, is_crate: bool) {
+    fn add(&mut self, sh: &mut Shared<'_, '_, '_>, set: SetId, node: &InFile<SyntaxNode>, reads: Reads, is_crate: bool) {
         let says = self.early && self.walking;
         let in_root = node.file_id == sh.root;
         let cx = sh.cx;
         let file = node.file_id;
         let span = |range: TextRange| cx.span(InFile::new(file, range));
         let mut known: Option<Place> = None;
+        // clone: a diagnostic's place, made once and copied for each diagnostic of the node
         let mut place = || known.get_or_insert_with(|| attrs::place(cx.sema, node)).clone();
         for read in reads {
             let (level, mut items, pre) = match read {
@@ -334,17 +362,18 @@ impl Levels {
                 Some(it) => match &it.kind {
                     ItemKind::Word(_) | ItemKind::Lit => Tail::Lint,
                     ItemKind::NameValue { string, value, .. } if it.kind.is_reason() => {
+                        // clone: an interned symbol, a reference count
                         Tail::Reason(string.clone(), *value)
                     }
                     ItemKind::NameValue { .. } | ItemKind::List(_) => Tail::Bad(it.range),
                 },
             };
-            let mut reason: Option<Box<str>> = None;
+            let mut reason: Option<Symbol> = None;
             match tail {
                 Tail::Lint => {}
                 Tail::Reason(string, value) => {
                     match string {
-                        Some(string) => reason = Some(string.into_boxed_str()),
+                        Some(string) => reason = Some(string),
                         None if says => {
                             let diag = malformed(span(value), "reason must be a string literal");
                             self.push(pre, place(), diag);
@@ -377,24 +406,31 @@ impl Levels {
                     [tool, rest @ ..] if !rest.is_empty() => (Some(tool), attrs::path_string(rest)),
                     _ => (None, attrs::path_string(path)),
                 };
+                // The name as written, with its tool: for a diagnostic's message.
                 let full = || match tool {
+                    // alloc: a diagnostic's message
                     Some(tool) => format!("{}::{name}", tool.name()),
+                    // alloc: as above
                     None => name.clone().into_owned(),
                 };
                 let lint_diag = |lint: &str, message: String| Diag::lint(lint, message, at());
                 let (lints, named) = match sh.store.check(&name, tool.map(|it| it.name())) {
-                    Checked::Ok(lints) => (lints, path.last().map_or("", |it| it.name()).to_owned()),
-                    Checked::Tool(lints, None) => (lints, full()),
+                    Checked::Ok(lints) => (lints, Symbol::intern(path.last().map_or("", |it| it.name()))),
+                    Checked::Tool(lints, None) => {
+                        (lints, tool.map_or_else(|| Symbol::intern(&name), |tool| joined(tool.name(), &name)))
+                    }
                     Checked::Tool(lints, Some(new)) => {
                         if says {
                             let mut diag = lint_diag(
                                 "renamed_and_removed_lints",
+                                // alloc: a diagnostic's message
                                 format!("lint name `{name}` is deprecated and may not have an effect in the future"),
                             );
+                            // clone: the diagnostic's suggestion
                             diag.suggestion(at(), "change it to", new.clone(), Applicability::MachineApplicable);
                             self.lint(sh, set, false, place(), diag, None);
                         }
-                        (lints, new)
+                        (lints, Symbol::intern(&new))
                     }
                     Checked::MissingTool => continue,
                     Checked::NoTool => {
@@ -402,9 +438,11 @@ impl Levels {
                             let tool = tool.expect("a tool's lint");
                             let mut diag = Diag::error(
                                 Some("E0710"),
+                                // alloc: a diagnostic's message
                                 format!("unknown tool name `{0}` found in scoped lint: `{0}::{name}`", tool.name()),
                                 span(tool.range),
                             );
+                            // alloc: as above
                             diag.help(format!("add `#![register_tool({})]` to the crate root", tool.name()));
                             self.push(pre, place(), diag);
                         }
@@ -414,19 +452,21 @@ impl Levels {
                         if says {
                             let mut diag = lint_diag(
                                 "renamed_and_removed_lints",
+                                // alloc: a diagnostic's message
                                 format!("lint `{}` has been renamed to `{new}`", full()),
                             );
                             diag.suggestion(at(), "use the new name", new, Applicability::MachineApplicable);
                             self.lint(sh, set, false, place(), diag, None);
                         }
                         match sh.store.check(new, None) {
-                            Checked::Ok(lints) => (lints, new.to_owned()),
+                            Checked::Ok(lints) => (lints, Symbol::intern(new)),
                             other => panic!("`{name}` is renamed to `{new}`, which is {other:?}"),
                         }
                     }
                     Checked::Removed(why) => {
                         if says {
                             let diag =
+                                // alloc: a diagnostic's message
                                 lint_diag("renamed_and_removed_lints", format!("lint `{}` has been removed: {why}", full()));
                             self.lint(sh, set, false, place(), diag, None);
                         }
@@ -434,6 +474,7 @@ impl Levels {
                     }
                     Checked::NoLint(suggestion) => {
                         if says {
+                            // alloc: a diagnostic's message
                             let mut diag = lint_diag("unknown_lints", format!("unknown lint: `{}`", full()));
                             if let Some((replace, from_rustc)) = suggestion {
                                 let message = match from_rustc {
@@ -447,7 +488,8 @@ impl Levels {
                         continue;
                     }
                 };
-                let source = sh.source(Source::Node { name: named.into_boxed_str(), at: range, reason: reason.clone() });
+                // clone: an interned symbol, a reference count
+                let source = sh.source(Source::Node { name: named, at: range, reason: reason.clone() });
                 for &lint in lints {
                     if self.gated(sh, set, lint, Some(range), &mut place) {
                         self.insert_spec(sh, set, lint, Spec { level, expect, source }, &mut place);
@@ -458,20 +500,25 @@ impl Levels {
                     && self.walking
                 {
                     let is_unfulfilled = matches!(lints, [only] if only.id() == LintId::UNFULFILLED_LINT_EXPECTATIONS);
+                    // clone: an interned symbol; and the node, a reference count, once per `#[expect]` name
                     let reason = reason.clone();
+                    // clone: as above
                     self.expectations.push(Expectation { id, key: at(), reason, is_unfulfilled, node: node.clone() });
                 }
             }
         }
         if says && !is_crate {
             let range = self.range(set);
+            // clone: a `Range<u32>`-sized pair of indices, no allocation
             let ignored = self.ids[range.clone()].iter().zip(&self.specs[range]).find_map(|(id, spec)| {
                 match &sh.sources[spec.source.0 as usize] {
+                    // clone: an interned symbol, for a warning
                     Source::Node { name, at, .. } if id.lint().crate_level_only => Some((spec.level, name.clone(), *at)),
                     _ => None,
                 }
             });
             if let Some((level, name, at)) = ignored {
+                // alloc: a warning's message
                 let message = format!("{}({name}) is ignored unless specified at crate level", level.as_str());
                 self.lint(sh, set, false, place(), Diag::lint("unused_attributes", message, cx.span(at)), None);
             }
@@ -495,29 +542,35 @@ impl Levels {
         if self.early && spec.level != Level::Forbid && old.level == Level::Forbid {
             let groups = match &sh.sources[old.source.0 as usize] {
                 Source::Default => false,
-                Source::Node { name, .. } | Source::CommandLine { name, .. } => sh.store.is_lint_group(name),
+                Source::Node { name, .. } => sh.store.is_lint_group(name.as_str()),
+                Source::CommandLine { name, .. } => sh.store.is_lint_group(name),
             };
             if self.walking
                 && let Source::Node { name, at, .. } = &sh.sources[spec.source.0 as usize]
             {
                 let span = sh.cx.span(*at);
+                // alloc: an error's message
                 let message = format!("{}({name}) incompatible with previous forbid", spec.level.as_str());
                 let mut diag = match groups {
+                    // clone: the error's span, used twice
                     true => Diag::lint("forbidden_lint_groups", message, span.clone()),
+                    // clone: as above
                     false => Diag::error(Some("E0453"), message, span.clone()),
                 };
                 diag.span_label(span, "overruled by previous forbid");
                 match &sh.sources[old.source.0 as usize] {
                     Source::Default => {
+                        // alloc: an error's note
                         diag.note(format!("`forbid` lint level is the default for {}", lint.name));
                     }
                     Source::Node { at, reason, .. } => {
                         diag.span_label(sh.cx.span(*at), "`forbid` level set here");
                         if let Some(reason) = reason {
-                            diag.note(&**reason);
+                            diag.note(reason.as_str());
                         }
                     }
                     Source::CommandLine { name, .. } => {
+                        // alloc: an error's note
                         diag.note(format!("`forbid` lint level was set on command line (`-F {name}`)"));
                     }
                 }
@@ -558,20 +611,27 @@ impl Levels {
         if self.early && self.walking {
             let mut diag = Diag::new(
                 crate::model::Level::Warning,
+                // alloc: a warning's code
                 Some(Code::Lint("unknown_lints".to_owned())),
+                // alloc: a warning's message
                 format!("unknown lint: `{}`", lint.name),
             );
             if let Some(at) = at {
                 diag.span = MultiSpan::of(sh.cx.span(at));
             }
+            // alloc: a warning's note
             diag.note(format!("the `{}` lint is unstable", lint.name));
             if let Some(issue) = feature.issue {
+                // alloc: as above
                 diag.note(format!("see issue #{issue} <https://github.com/rust-lang/rust/issues/{issue}> for more information"));
             }
             diag.help(match at {
+                // alloc: a warning's help
                 None => format!("add `-Zcrate-attr=\"feature({})\"` to the command-line options to enable", feature.name),
+                // alloc: as above
                 Some(_) => format!("add `#![feature({})]` to the crate attributes to enable", feature.name),
             });
+            // alloc: a warning's note
             diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
             self.lint(sh, set, false, place(), diag, None);
         }
@@ -586,6 +646,7 @@ impl Levels {
         let spec = self.spec(sh, lint, set);
         if let Some(mut diag) = sh.finish(lint, spec, diag) {
             if let Some(code) = code {
+                // alloc: a diagnostic's code
                 diag.code = Some(Code::Error(code.to_owned()));
             }
             self.push(pre, place, diag);
@@ -601,6 +662,7 @@ impl Levels {
             return;
         }
         if pre {
+            // clone: a diagnostic both passes give, once per diagnostic
             self.emitted.push(Emitted { when: When::Pre, place: place.clone(), diag: diag.clone() });
         }
         self.emitted.push(Emitted { when: When::Early, place, diag });
@@ -689,16 +751,26 @@ impl Levels {
 }
 
 /// The last element of a lint attribute's list, which may be its `reason`.
+/// `tool::name`, interned: joined on the stack for a name of up to 64 bytes.
+fn joined(tool: &str, name: &str) -> Symbol {
+    let mut text: SmallVec<[u8; 64]> = SmallVec::new();
+    text.extend_from_slice(tool.as_bytes());
+    text.extend_from_slice(b"::");
+    text.extend_from_slice(name.as_bytes());
+    Symbol::intern(std::str::from_utf8(&text).expect("two names joined by `::`"))
+}
+
 enum Tail {
     Lint,
     /// `reason = ..`: the string, if it is one, and where the value is.
-    Reason(Option<String>, TextRange),
+    Reason(Option<Symbol>, TextRange),
     /// A `name = value` or `name(..)` that is not a reason.
     Bad(TextRange),
 }
 
 /// E0452 "malformed lint attribute input" with its label.
 fn malformed(at: Span, label: &str) -> Diag {
+    // clone: the error's span, used twice
     let mut diag = Diag::error(Some("E0452"), "malformed lint attribute input", at.clone());
     diag.span_label(at, label);
     diag
@@ -709,6 +781,7 @@ fn malformed(at: Span, label: &str) -> Diag {
 /// items, each in order; the owner is the item `node` is in.
 pub(super) fn owner_rank(sh: &Shared<'_, '_, '_>, node: &InFile<SyntaxNode>) -> (u8, Place) {
     let sema = sh.cx.sema;
+    // clone: a reference count on the tree, once per `#[expect]` name
     let mut at = node.clone();
     loop {
         let kind = at.value.kind();

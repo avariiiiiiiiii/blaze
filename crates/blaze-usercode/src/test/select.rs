@@ -504,7 +504,7 @@ fn explain<P: Passes + ?Sized, I: Inputs>(
 }
 
 /// The first input of `before` whose value `now` does not have.
-fn changed_input(before: &Traced, now: &Traced) -> Option<Input> {
+pub fn changed_input(before: &Traced, now: &Traced) -> Option<Input> {
     let files: FxHashMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect(); // alloc: the edge: an explanation for people, made only when asked
     let dirs: FxHashMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect(); // alloc: the edge: an explanation for people, made only when asked
     let env: FxHashMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect(); // alloc: the edge: an explanation for people, made only when asked

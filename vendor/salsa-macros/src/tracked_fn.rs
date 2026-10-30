@@ -62,6 +62,7 @@ impl AllowedOptions for TrackedFn {
     const HEAP_SIZE: bool = true;
 
     const SELF_TY: bool = true;
+    const MEM_TAG: bool = true;
 
     const PERSIST: AllowedPersistOptions = AllowedPersistOptions::AllowedIdent;
 }
@@ -102,6 +103,7 @@ impl Macro {
         let is_specifiable = self.args.specify.is_some();
         let requires_salsa_value = self.args.non_salsa_values.is_none();
         let heap_size_fn = self.args.heap_size_fn.iter();
+        let mem_tag = self.args.mem_tag.iter();
         let eq = if let Some(token) = &self.args.no_eq {
             if self.args.cycle_fn.is_some() {
                 return Err(syn::Error::new_spanned(
@@ -276,6 +278,7 @@ impl Macro {
                 needs_interner: #needs_interner,
                 revisions: #(#revisions)*,
                 heap_size_fn: #(#heap_size_fn)*,
+                mem_tag: #(#mem_tag)*,
                 eviction: #eviction_type,
                 lru: #lru,
                 return_mode: #return_mode,

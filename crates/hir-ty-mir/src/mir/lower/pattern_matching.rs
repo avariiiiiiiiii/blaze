@@ -1085,6 +1085,7 @@ impl<'f, 'db> MirLowerCtx<'_, 'f, 'db> {
         let (al, ar) = args.split_at(ellipsis.map_or(args.len(), |it| it as usize));
         let it = al
             .iter()
+            // clone: the iterator, walked from both ends
             .zip(fields.clone())
             .chain(ar.iter().rev().zip(fields.rev()))
             .map(|(x, y)| (y, *x));

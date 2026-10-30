@@ -14,18 +14,16 @@ use std::{
     ops::Index,
 };
 
-use blaze_ids::{
-    bits::{BitSet, Ranked},
-    radix,
-};
+use blaze_ids::bits::{BitSet, Bits, Ranked};
+use blaze_mem::Frame;
 use hir_def::{
     FieldId, TupleFieldId,
     hir::{ExprId, ExprOrPatIdPacked, PatId},
 };
-use la_arena::{ArenaMap, Idx, RawIdx};
+use la_arena::{Idx, RawIdx};
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashMap;
 
+pub(crate) use crate::{FrameMap, FrameSet, frame_map, frame_set};
 use crate::{
     infer::{BindingMode, ByRef},
     next_solver::StoredTy,
@@ -96,9 +94,31 @@ impl Presence {
     }
 }
 
-/// The values of `entries` by key, in key order.
-fn dense<K: DenseKey, V>(entries: impl IntoIterator<Item = (K, V)>) -> Vec<Option<V>> {
-    let mut dense: Vec<Option<V>> = Vec::new();
+/// How many of `slots` a column of them keeps: up to the last with a value.
+fn used<V>(slots: &[Option<V>]) -> usize {
+    slots.iter().rposition(Option::is_some).map_or(0, |last| last + 1)
+}
+
+/// Which of `slots` have a value, as a [`Presence`] made at its length.
+fn presence_of<V>(slots: &[Option<V>]) -> Presence {
+    let used = used(slots);
+    // alloc: the column's own words, at their length
+    let mut words = BitSet::<usize>::from_words(vec![0u64; used.div_ceil(64)]);
+    for (index, slot) in slots[..used].iter().enumerate() {
+        if slot.is_some() {
+            words.insert(index);
+        }
+    }
+    Presence::new(words.into_words()).expect("the last used slot has a value")
+}
+
+/// The values of `entries` by key, in key order, in `frame`.
+#[cfg(test)]
+fn dense_in<K: DenseKey, V>(
+    frame: &Frame,
+    entries: impl IntoIterator<Item = (K, V)>,
+) -> Vec<Option<V>, &Frame> {
+    let mut dense = Vec::new_in(frame);
     for (key, value) in entries {
         let index = key.to_index();
         if index >= dense.len() {
@@ -107,6 +127,96 @@ fn dense<K: DenseKey, V>(entries: impl IntoIterator<Item = (K, V)>) -> Vec<Optio
         dense[index] = Some(value);
     }
     dense
+}
+
+/// A value per arena index while inference writes it, in the frame: `ArenaMap`'s slots, a
+/// `None` per index without a value.
+pub(crate) struct DenseMap<'f, K, V> {
+    slots: Vec<Option<V>, &'f Frame>,
+    key: PhantomData<fn() -> K>,
+}
+
+impl<'f, K: DenseKey, V> DenseMap<'f, K, V> {
+    pub(crate) fn new_in(frame: &'f Frame) -> Self {
+        DenseMap { slots: Vec::new_in(frame), key: PhantomData }
+    }
+
+    /// Room for the keys below `len`, so that writing them moves nothing in the frame.
+    pub(crate) fn reserve_keys(&mut self, len: usize) {
+        if len > self.slots.len() {
+            self.slots.resize_with(len, || None);
+        }
+    }
+
+    pub(crate) fn insert(&mut self, key: K, value: V) -> Option<V> {
+        let index = key.to_index();
+        if index >= self.slots.len() {
+            self.slots.resize_with(index + 1, || None);
+        }
+        self.slots[index].replace(value)
+    }
+
+    #[inline]
+    pub(crate) fn get(&self, key: K) -> Option<&V> {
+        self.slots.get(key.to_index())?.as_ref()
+    }
+
+    pub(crate) fn contains_idx(&self, key: K) -> bool {
+        self.get(key).is_some()
+    }
+
+    pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.slots.iter_mut().flatten()
+    }
+
+    /// The slots, a `None` for each key without a value.
+    pub(crate) fn slots(&self) -> &[Option<V>] {
+        &self.slots
+    }
+
+    pub(crate) fn slots_mut(&mut self) -> &mut [Option<V>] {
+        &mut self.slots
+    }
+
+    #[allow(dead_code, reason = "ArenaMap's API, which DenseMap replaces for inference")]
+    pub(crate) fn get_mut(&mut self, key: K) -> Option<&mut V> {
+        self.slots.get_mut(key.to_index())?.as_mut()
+    }
+
+    /// The keys with a value and their values, in key order.
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (K, &V)> {
+        (self.slots.iter().enumerate())
+            .filter_map(|(index, slot)| Some((K::from_index(index), slot.as_ref()?)))
+    }
+
+    /// The keys with a value and their values, taken out in key order: `ArenaMap::into_iter`.
+    #[allow(dead_code, reason = "ArenaMap's API, which DenseMap replaces for inference")]
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (K, V)> {
+        (self.slots.drain(..).enumerate())
+            .filter_map(|(index, slot)| Some((K::from_index(index), slot?)))
+    }
+}
+
+impl<'f, K: DenseKey, V: Clone> DenseMap<'f, K, V> {
+    #[cfg(test)]
+    fn clone_for_test(&self) -> Self {
+        DenseMap { slots: self.slots.clone(), key: PhantomData }
+    }
+}
+
+impl<K: DenseKey, V> Index<K> for DenseMap<'_, K, V> {
+    type Output = V;
+
+    #[track_caller]
+    fn index(&self, key: K) -> &V {
+        self.get(key).expect("no value for this key")
+    }
+}
+
+impl<K: DenseKey + fmt::Debug, V: fmt::Debug> fmt::Debug for DenseMap<'_, K, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
 }
 
 /// A type per key, dictionary-encoded: `at[key]` is where the key's type is in `tys`
@@ -126,25 +236,35 @@ impl<K> Default for TyColumn<K> {
 }
 
 impl<K: DenseKey> TyColumn<K> {
-    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, StoredTy)>) -> Self {
-        let dense = dense(entries);
-        let mut by_ty: FxHashMap<StoredTy, u32> = FxHashMap::default();
-        let mut tys = Vec::new();
-        let at = dense
-            .into_iter()
-            .map(|ty| match ty {
+    /// The column of `slots`, which it takes the types out of.
+    pub(crate) fn from_dense(frame: &Frame, slots: &mut [Option<StoredTy>]) -> Self {
+        let used = used(slots);
+        let mut by_ty: FrameMap<'_, StoredTy, u32> = frame_map(frame);
+        let mut tys = Vec::new_in(frame);
+        // alloc: the column's own places, at their length
+        let mut at = Vec::with_capacity(used);
+        for slot in &mut slots[..used] {
+            at.push(match slot.take() {
                 None => NONE,
                 Some(ty) => *by_ty.entry(ty).or_insert_with_key(|ty| {
-                    tys.push(ty.clone());
+                    tys.push(*ty);
                     place(tys.len() - 1)
                 }),
-            })
-            .collect();
-        TyColumn { at, tys: tys.into_boxed_slice(), key: PhantomData }
+            });
+        }
+        // alloc: the column's own dictionary, copied out of the frame at its length
+        TyColumn { at: at.into_boxed_slice(), tys: tys.drain(..).collect(), key: PhantomData }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, StoredTy)>) -> Self {
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            Self::from_dense(frame, &mut dense_in(frame, entries))
+        })
     }
 
     /// The column of `at` and `tys` as [`Self::at`] and [`Self::tys`] give them, refused when
-    /// it is not one [`Self::from_entries`] makes.
+    /// it is not one [`Self::from_dense`] makes.
     pub(crate) fn from_parts(at: Box<[u32]>, tys: Box<[StoredTy]>) -> Result<Self, &'static str> {
         if at.last() == Some(&NONE) {
             return Err("a type column that ends in a key without a type");
@@ -233,20 +353,24 @@ impl<K, V> Default for IndexColumn<K, V> {
 }
 
 impl<K: DenseKey, V> IndexColumn<K, V> {
-    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
-        let (mut words, mut rows) = (BitSet::<usize>::default(), Vec::new());
-        for (index, row) in dense(entries).into_iter().enumerate() {
-            if let Some(row) = row {
-                words.insert_growing(index);
-                rows.push(row);
-            }
-        }
-        let present = Presence::new(words.into_words()).expect("a bit is set in every word that is made");
+    /// The column of `slots`, which it takes the rows out of.
+    pub(crate) fn from_dense(slots: &mut [Option<V>]) -> Self {
+        let present = presence_of(slots);
+        // alloc: the column's own rows, at their length
+        let mut rows = Vec::with_capacity(present.count());
+        rows.extend(slots.iter_mut().filter_map(Option::take));
         IndexColumn { present, rows: rows.into_boxed_slice(), key: PhantomData }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+            Self::from_dense(&mut dense_in(frame, entries))
+        })
+    }
+
     /// The column of `present` and `rows` as [`Self::present`] and [`Self::rows`] give them,
-    /// refused when it is not one [`Self::from_entries`] makes.
+    /// refused when it is not one [`Self::from_dense`] makes.
     pub(crate) fn from_parts(present: Vec<u64>, rows: Box<[V]>) -> Result<Self, &'static str> {
         let present = Presence::new(present)?;
         if present.count() != rows.len() {
@@ -328,20 +452,18 @@ impl<V: fmt::Debug> fmt::Debug for ExprOrPatColumn<V> {
     }
 }
 
-/// A map of expressions or patterns to values while inference writes it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ExprOrPatMap<V> {
-    exprs: ArenaMap<ExprId, V>,
-    pats: ArenaMap<PatId, V>,
+/// A map of expressions or patterns to values while inference writes it, in the frame.
+#[derive(Debug)]
+pub(crate) struct ExprOrPatMap<'f, V> {
+    exprs: DenseMap<'f, ExprId, V>,
+    pats: DenseMap<'f, PatId, V>,
 }
 
-impl<V> Default for ExprOrPatMap<V> {
-    fn default() -> Self {
-        ExprOrPatMap { exprs: ArenaMap::default(), pats: ArenaMap::default() }
+impl<'f, V> ExprOrPatMap<'f, V> {
+    pub(crate) fn new_in(frame: &'f Frame) -> Self {
+        ExprOrPatMap { exprs: DenseMap::new_in(frame), pats: DenseMap::new_in(frame) }
     }
-}
 
-impl<V> ExprOrPatMap<V> {
     pub(crate) fn insert(&mut self, node: ExprOrPatIdPacked, value: V) -> Option<V> {
         match (node.as_expr(), node.as_pat()) {
             (Some(expr), _) => self.exprs.insert(expr, value),
@@ -362,10 +484,10 @@ impl<V> ExprOrPatMap<V> {
         self.exprs.values_mut().chain(self.pats.values_mut())
     }
 
-    pub(crate) fn freeze(self) -> ExprOrPatColumn<V> {
+    pub(crate) fn freeze(mut self) -> ExprOrPatColumn<V> {
         ExprOrPatColumn {
-            exprs: IndexColumn::from_entries(self.exprs),
-            pats: IndexColumn::from_entries(self.pats),
+            exprs: IndexColumn::from_dense(self.exprs.slots_mut()),
+            pats: IndexColumn::from_dense(self.pats.slots_mut()),
         }
     }
 }
@@ -386,14 +508,16 @@ pub struct FieldColumn {
 }
 
 impl FieldColumn {
-    pub(crate) fn from_entries(
-        entries: impl IntoIterator<Item = (ExprId, either::Either<FieldId, TupleFieldId>)>,
-    ) -> Self {
-        let dense = dense(entries);
-        let (mut fields, mut tuple_fields) = (Vec::new(), Vec::new());
-        let mut tags = Vec::with_capacity(dense.len());
-        let mut data = Vec::with_capacity(dense.len());
-        for field in dense {
+    pub(crate) fn from_dense(slots: &[Option<either::Either<FieldId, TupleFieldId>>]) -> Self {
+        let slots = &slots[..used(slots)];
+        let tuple_count = slots.iter().filter(|it| matches!(it, Some(either::Either::Right(_)))).count();
+        let field_count = slots.iter().filter(|it| it.is_some()).count() - tuple_count;
+        // alloc: the column's own parts, each at its length
+        let (mut fields, mut tuple_fields) =
+            (Vec::with_capacity(field_count), Vec::with_capacity(tuple_count));
+        let mut tags = Vec::with_capacity(slots.len());
+        let mut data = Vec::with_capacity(slots.len());
+        for &field in slots {
             let (tag, word) = match field {
                 None => (FIELD_NONE, 0),
                 Some(either::Either::Left(field)) => {
@@ -416,8 +540,15 @@ impl FieldColumn {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_entries(
+        entries: impl IntoIterator<Item = (ExprId, either::Either<FieldId, TupleFieldId>)>,
+    ) -> Self {
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| Self::from_dense(&dense_in(frame, entries)))
+    }
+
     /// The column of the parts [`Self::tags`], [`Self::data`], [`Self::fields`] and
-    /// [`Self::tuple_fields`] give, refused when it is not one [`Self::from_entries`] makes.
+    /// [`Self::tuple_fields`] give, refused when it is not one [`Self::from_dense`] makes.
     pub(crate) fn from_parts(
         tags: Box<[u8]>,
         data: Box<[u32]>,
@@ -610,19 +741,26 @@ impl<K: DenseKey + fmt::Debug, T: fmt::Debug> fmt::Debug for Csr<K, T> {
 /// the flat array moves to its end, leaving its old items unused until [`Self::freeze`]
 /// compacts the lists into key order.
 #[derive(Clone, Debug)]
-pub(crate) struct CsrBuilder<K, T> {
-    ranges: Vec<Range>,
-    items: Vec<T>,
+pub(crate) struct CsrBuilder<'f, K, T> {
+    ranges: Vec<Range, &'f Frame>,
+    items: Vec<T, &'f Frame>,
     key: PhantomData<fn() -> K>,
 }
 
-impl<K, T> Default for CsrBuilder<K, T> {
-    fn default() -> Self {
-        CsrBuilder { ranges: Vec::new(), items: Vec::new(), key: PhantomData }
+impl<'f, K, T> CsrBuilder<'f, K, T> {
+    pub(crate) fn new_in(frame: &'f Frame) -> Self {
+        CsrBuilder { ranges: Vec::new_in(frame), items: Vec::new_in(frame), key: PhantomData }
     }
 }
 
-impl<K: DenseKey, T> CsrBuilder<K, T> {
+impl<'f, K: DenseKey, T> CsrBuilder<'f, K, T> {
+    /// Room for the keys below `len`, so that writing them moves nothing in the frame.
+    pub(crate) fn reserve_keys(&mut self, len: usize) {
+        if len > self.ranges.len() {
+            self.ranges.resize(len, Range::ABSENT);
+        }
+    }
+
     fn range(&self, key: &K) -> Range {
         self.ranges.get(key.to_index()).copied().unwrap_or(Range::ABSENT)
     }
@@ -704,10 +842,11 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
 
     pub(crate) fn values_mut(&mut self) -> impl Iterator<Item = &mut [T]> {
         let CsrBuilder { ranges, items, .. } = self;
-        // An empty list may start inside another one; lists with items never overlap.
-        let mut live: Vec<Range> =
-            ranges.iter().copied().filter(|it| !it.is_absent() && it.len != 0).collect();
-        radix::sort_copy_by_key(&mut live, |range| range.start);
+        let mut live = Vec::new_in(*ranges.allocator());
+        // An empty list may start inside another one; lists with items never overlap, so their
+        // starts are distinct and an unstable sort orders them as a stable one does.
+        live.extend(ranges.iter().copied().filter(|it| !it.is_absent() && it.len != 0));
+        live.sort_unstable_by_key(|range| range.start);
         let mut rest: &mut [T] = items;
         let mut consumed = 0usize;
         live.into_iter().map(move |range| {
@@ -727,31 +866,39 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
     }
 
     /// O(keys) when inference wrote the lists in key order without replacing one (the flat
-    /// array is kept as it is), else one move of every live item.
+    /// array is copied out of the frame as it is), else one move of every live item.
     pub(crate) fn freeze(self) -> Csr<K, T> {
-        let CsrBuilder { ranges, items, .. } = self;
-        let mut words = BitSet::<usize>::default();
-        let mut ends = Vec::new();
+        let CsrBuilder { ranges, mut items, .. } = self;
+        let frame = *items.allocator();
+        let used = ranges.iter().rposition(|range| !range.is_absent()).map_or(0, |last| last + 1);
+        let ranges = &ranges[..used];
+        let lists = ranges.iter().filter(|range| !range.is_absent()).count();
+        // alloc: the column's own words and ends, at their lengths
+        let mut words = BitSet::<usize>::from_words(vec![0u64; used.div_ceil(64)]);
+        let mut ends = Vec::with_capacity(lists);
         let mut next = 0usize;
         let mut in_order = true;
         for (index, range) in ranges.iter().enumerate() {
             if range.is_absent() {
                 continue;
             }
-            words.insert_growing(index);
+            words.insert(index);
             in_order &= range.start as usize == next;
             next += range.len as usize;
             ends.push(place(next));
         }
-        let present = Presence::new(words.into_words()).expect("a bit is set in every word that is made");
+        let present = Presence::new(words.into_words()).expect("the last used range is a list");
         let ends = ends.into_boxed_slice();
         if in_order && next == items.len() {
-            return Csr { present, ends, items: items.into_boxed_slice(), key: PhantomData };
+            // alloc: the column's own items, copied out of the frame at their length
+            return Csr { present, ends, items: items.drain(..).collect(), key: PhantomData };
         }
-        let mut items: Vec<Option<T>> = items.into_iter().map(Some).collect();
+        let mut slots = Vec::with_capacity_in(items.len(), frame);
+        slots.extend(items.drain(..).map(Some));
+        // alloc: the column's own items, at their length
         let mut flat = Vec::with_capacity(next);
         for range in ranges.iter().filter(|range| !range.is_absent()) {
-            flat.extend(items[range.slice()].iter_mut().map(|it| it.take().unwrap()));
+            flat.extend(slots[range.slice()].iter_mut().map(|it: &mut Option<T>| it.take().unwrap()));
         }
         Csr { present, ends, items: flat.into_boxed_slice(), key: PhantomData }
     }
@@ -804,10 +951,6 @@ impl<K: DenseKey> IdxSet<K> {
             _ => Ok(IdxSet { words: BitSet::from_words(words), key: PhantomData }),
         }
     }
-
-    pub(crate) fn shrink_to_fit(&mut self) {
-        self.words.shrink_to_fit();
-    }
 }
 
 impl<K: DenseKey> FromIterator<K> for IdxSet<K> {
@@ -838,6 +981,7 @@ pub struct ExprOrPatSet {
 }
 
 impl ExprOrPatSet {
+    #[cfg(test)]
     pub(crate) fn insert(&mut self, node: ExprOrPatIdPacked) -> bool {
         match (node.as_expr(), node.as_pat()) {
             (Some(expr), _) => self.exprs.insert(expr),
@@ -861,6 +1005,81 @@ impl ExprOrPatSet {
     pub fn iter(&self) -> impl Iterator<Item = ExprOrPatIdPacked> + '_ {
         let exprs = self.exprs.iter().map(ExprOrPatIdPacked::from);
         exprs.chain(self.pats.iter().map(ExprOrPatIdPacked::from))
+    }
+}
+
+/// An [`IdxSet`] while inference writes it, its words in the frame and made at the key count.
+#[derive(Debug)]
+pub(crate) struct FrameIdxSet<'f, K> {
+    words: Bits<Vec<u64, &'f Frame>>,
+    key: PhantomData<fn() -> K>,
+}
+
+impl<'f, K: DenseKey> FrameIdxSet<'f, K> {
+    pub(crate) fn new_in(frame: &'f Frame) -> Self {
+        FrameIdxSet { words: Bits::from_words(Vec::new_in(frame)), key: PhantomData }
+    }
+
+    /// Adds `key`, returning whether it was not in the set.
+    pub(crate) fn insert(&mut self, key: K) -> bool {
+        self.words.insert_growing(key.to_index())
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, key: &K) -> bool {
+        self.words.contains(key.to_index())
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.words.is_empty()
+    }
+
+    /// The set, its words copied once at their length, the last never zero.
+    pub(crate) fn freeze(&self) -> IdxSet<K> {
+        let words = self.words.words();
+        let used = words.iter().rposition(|&word| word != 0).map_or(0, |last| last + 1);
+        // alloc: the set's own words, at their length
+        IdxSet { words: BitSet::from_words(words[..used].to_vec()), key: PhantomData }
+    }
+
+    #[cfg(test)]
+    fn reserve_keys_for_test(&mut self, len: usize) {
+        self.words.grow(len);
+    }
+}
+
+impl<K: DenseKey> Extend<K> for FrameIdxSet<'_, K> {
+    fn extend<I: IntoIterator<Item = K>>(&mut self, iter: I) {
+        iter.into_iter().for_each(|key| _ = self.insert(key));
+    }
+}
+
+/// An [`ExprOrPatSet`] while inference writes it, in the frame.
+#[derive(Debug)]
+pub(crate) struct FrameExprOrPatSet<'f> {
+    exprs: FrameIdxSet<'f, ExprId>,
+    pats: FrameIdxSet<'f, PatId>,
+}
+
+impl<'f> FrameExprOrPatSet<'f> {
+    pub(crate) fn new_in(frame: &'f Frame) -> Self {
+        FrameExprOrPatSet { exprs: FrameIdxSet::new_in(frame), pats: FrameIdxSet::new_in(frame) }
+    }
+
+    pub(crate) fn insert(&mut self, node: ExprOrPatIdPacked) -> bool {
+        match (node.as_expr(), node.as_pat()) {
+            (Some(expr), _) => self.exprs.insert(expr),
+            (None, Some(pat)) => self.pats.insert(pat),
+            (None, None) => false,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.exprs.is_empty() && self.pats.is_empty()
+    }
+
+    pub(crate) fn freeze(&self) -> ExprOrPatSet {
+        ExprOrPatSet { exprs: self.exprs.freeze(), pats: self.pats.freeze() }
     }
 }
 
@@ -906,9 +1125,15 @@ impl<K> Default for ModeColumn<K> {
 }
 
 impl<K: DenseKey> ModeColumn<K> {
-    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, BindingMode)>) -> Self {
-        let codes = dense(entries).into_iter().map(|mode| mode.map_or(MODE_NONE, mode_code));
+    pub(crate) fn from_dense(slots: &[Option<BindingMode>]) -> Self {
+        let codes = slots[..used(slots)].iter().map(|mode| mode.map_or(MODE_NONE, mode_code));
+        // alloc: the column's own codes, at their length
         ModeColumn { codes: codes.collect(), key: PhantomData }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, BindingMode)>) -> Self {
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| Self::from_dense(&dense_in(frame, entries)))
     }
 
     pub(crate) fn from_codes(codes: Box<[u8]>) -> Result<Self, &'static str> {
@@ -963,12 +1188,20 @@ impl<K, V> Default for SortedMap<K, V> {
 }
 
 impl<K: Ord, V> SortedMap<K, V> {
-    /// The map of `entries`, of distinct keys.
+    /// The map of `entries`, of distinct keys, sorted in `frame`.
+    pub(crate) fn from_entries_in(frame: &Frame, entries: impl IntoIterator<Item = (K, V)>) -> Self {
+        let mut sorted = Vec::new_in(frame);
+        sorted.extend(entries);
+        // The keys are distinct, so an unstable sort orders them as a stable one does.
+        sorted.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+        debug_assert!(sorted.windows(2).all(|it| it[0].0 != it[1].0), "a key twice in a map");
+        // alloc: the map's own entries, at their length
+        SortedMap { entries: sorted.drain(..).collect() }
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_entries(entries: impl IntoIterator<Item = (K, V)>) -> Self {
-        let mut entries: Vec<(K, V)> = entries.into_iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-        debug_assert!(entries.windows(2).all(|it| it[0].0 != it[1].0), "a key twice in a map");
-        SortedMap { entries: entries.into_boxed_slice() }
+        blaze_mem::frame::task(crate::db::INFER_TAG, |frame| Self::from_entries_in(frame, entries))
     }
 
     pub(crate) fn from_sorted(entries: Vec<(K, V)>) -> Result<Self, &'static str> {
@@ -1061,7 +1294,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use blaze_ids::rng::SplitMix64;
-    use la_arena::{Idx, RawIdx};
+    use blaze_mem::frame;
+    use la_arena::{ArenaMap, Idx, RawIdx};
 
     use super::*;
 
@@ -1136,62 +1370,64 @@ mod tests {
 
     #[test]
     fn csr_builder_agrees_with_a_map_of_lists() {
-        for seed in 0..32 {
-            let mut model: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
-            let mut builder = CsrBuilder::<Key, u32>::default();
-            for (step, (k, v)) in writes(seed, 400, 40, 1000).into_iter().enumerate() {
-                match step % 5 {
-                    0 => {
-                        let items = vec![v, v + 1, v + 2];
-                        model.insert(k, items.clone());
-                        builder.insert(key(k), items);
-                    }
-                    1 => {
-                        let removed = builder.get(&key(k)).map(|it| it.to_vec());
-                        assert_eq!(removed, model.remove(&k));
-                        assert_eq!(builder.remove_in_place(&key(k)), removed.is_some());
-                    }
-                    2 => {
-                        model.entry(k).or_default();
-                        builder.ensure(key(k));
-                    }
-                    3 => {
-                        if let Some(items) = model.get_mut(&k) {
-                            items.iter_mut().for_each(|it| *it += 1);
+        frame::task(crate::db::INFER_TAG, |frame| {
+            for seed in 0..32 {
+                let mut model: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+                let mut builder = CsrBuilder::<Key, u32>::new_in(frame);
+                for (step, (k, v)) in writes(seed, 400, 40, 1000).into_iter().enumerate() {
+                    match step % 5 {
+                        0 => {
+                            let items = vec![v, v + 1, v + 2];
+                            model.insert(k, items.clone());
+                            builder.insert(key(k), items);
                         }
-                        if let Some(items) = builder.get_mut(&key(k)) {
-                            items.iter_mut().for_each(|it| *it += 1);
+                        1 => {
+                            let removed = builder.get(&key(k)).map(|it| it.to_vec());
+                            assert_eq!(removed, model.remove(&k));
+                            assert_eq!(builder.remove_in_place(&key(k)), removed.is_some());
+                        }
+                        2 => {
+                            model.entry(k).or_default();
+                            builder.ensure(key(k));
+                        }
+                        3 => {
+                            if let Some(items) = model.get_mut(&k) {
+                                items.iter_mut().for_each(|it| *it += 1);
+                            }
+                            if let Some(items) = builder.get_mut(&key(k)) {
+                                items.iter_mut().for_each(|it| *it += 1);
+                            }
+                        }
+                        _ => {
+                            model.entry(k).or_default().push(v);
+                            builder.push(key(k), v);
                         }
                     }
-                    _ => {
-                        model.entry(k).or_default().push(v);
-                        builder.push(key(k), v);
+                    for k in 0..40 {
+                        assert_eq!(builder.get(&key(k)).map(|it| it.to_vec()), model.get(&k).cloned());
+                        assert_eq!(builder.len_of(&key(k)), model.get(&k).map_or(0, Vec::len));
                     }
                 }
+                let mut doubled = builder.clone();
+                doubled.values_mut().flatten().for_each(|it| *it *= 2);
+                let frozen = builder.freeze();
+                let listed: Vec<(u32, Vec<u32>)> =
+                    frozen.iter().map(|(k, items)| (k.into_raw().into_u32(), items.to_vec())).collect();
+                assert_eq!(listed, model.clone().into_iter().collect::<Vec<_>>());
                 for k in 0..40 {
-                    assert_eq!(builder.get(&key(k)).map(|it| it.to_vec()), model.get(&k).cloned());
-                    assert_eq!(builder.len_of(&key(k)), model.get(&k).map_or(0, Vec::len));
+                    assert_eq!(frozen.contains_key(&key(k)), model.contains_key(&k));
+                    let twice = doubled.get(&key(k)).map(|it| it.to_vec());
+                    assert_eq!(twice, model.get(&k).map(|it| it.iter().map(|it| it * 2).collect()));
                 }
+                let again = Csr::<Key, u32>::from_parts(
+                    frozen.present().to_vec(),
+                    frozen.ends().into(),
+                    frozen.items().into(),
+                )
+                .unwrap();
+                assert!(again == frozen);
             }
-            let mut doubled = builder.clone();
-            doubled.values_mut().flatten().for_each(|it| *it *= 2);
-            let frozen = builder.freeze();
-            let listed: Vec<(u32, Vec<u32>)> =
-                frozen.iter().map(|(k, items)| (k.into_raw().into_u32(), items.to_vec())).collect();
-            assert_eq!(listed, model.clone().into_iter().collect::<Vec<_>>());
-            for k in 0..40 {
-                assert_eq!(frozen.contains_key(&key(k)), model.contains_key(&k));
-                let twice = doubled.get(&key(k)).map(|it| it.to_vec());
-                assert_eq!(twice, model.get(&k).map(|it| it.iter().map(|it| it * 2).collect()));
-            }
-            let again = Csr::<Key, u32>::from_parts(
-                frozen.present().to_vec(),
-                frozen.ends().into(),
-                frozen.items().into(),
-            )
-            .unwrap();
-            assert!(again == frozen);
-        }
+        })
     }
 
     #[test]
@@ -1218,36 +1454,40 @@ mod tests {
 
     #[test]
     fn a_csr_written_in_another_order_is_the_same_column() {
-        let mut forward = CsrBuilder::<Key, u32>::default();
-        forward.insert(key(1), [1, 2]);
-        forward.insert(key(5), [5]);
-        let mut backward = CsrBuilder::<Key, u32>::default();
-        backward.insert(key(5), [9]);
-        backward.push(key(1), 1);
-        backward.insert(key(5), [5]);
-        backward.push(key(1), 2);
-        assert!(forward.freeze() == backward.freeze());
+        frame::task(crate::db::INFER_TAG, |frame| {
+            let mut forward = CsrBuilder::<Key, u32>::new_in(frame);
+            forward.insert(key(1), [1, 2]);
+            forward.insert(key(5), [5]);
+            let mut backward = CsrBuilder::<Key, u32>::new_in(frame);
+            backward.insert(key(5), [9]);
+            backward.push(key(1), 1);
+            backward.insert(key(5), [5]);
+            backward.push(key(1), 2);
+            assert!(forward.freeze() == backward.freeze());
+        })
     }
 
     #[test]
     fn a_list_removed_at_the_end_leaves_the_same_column() {
-        let mut forward = CsrBuilder::<Key, u32>::default();
-        forward.insert(key(1), [1]);
-        let mut backward = CsrBuilder::<Key, u32>::default();
-        backward.insert(key(1), [1]);
-        backward.insert(key(7), [7, 8]);
-        assert!(backward.remove_in_place(&key(7)));
-        let (forward, backward) = (forward.freeze(), backward.freeze());
-        assert!(forward == backward);
-        assert_eq!(backward.present(), &[1 << 1]);
-        let trailing = Csr::<Key, u32>::from_parts(vec![1 << 1, 0], Box::new([1]), Box::new([1]));
-        assert!(trailing.is_err());
-        let uncovered = Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([1]), Box::new([1, 2]));
-        assert!(uncovered.is_err());
-        let backwards = Csr::<Key, u32>::from_parts(vec![0b110], Box::new([2, 1]), Box::new([1, 2]));
-        assert!(backwards.is_err());
-        let extra = Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([0, 1]), Box::new([1]));
-        assert!(extra.is_err());
+        frame::task(crate::db::INFER_TAG, |frame| {
+            let mut forward = CsrBuilder::<Key, u32>::new_in(frame);
+            forward.insert(key(1), [1]);
+            let mut backward = CsrBuilder::<Key, u32>::new_in(frame);
+            backward.insert(key(1), [1]);
+            backward.insert(key(7), [7, 8]);
+            assert!(backward.remove_in_place(&key(7)));
+            let (forward, backward) = (forward.freeze(), backward.freeze());
+            assert!(forward == backward);
+            assert_eq!(backward.present(), &[1 << 1]);
+            let trailing = Csr::<Key, u32>::from_parts(vec![1 << 1, 0], Box::new([1]), Box::new([1]));
+            assert!(trailing.is_err());
+            let uncovered = Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([1]), Box::new([1, 2]));
+            assert!(uncovered.is_err());
+            let backwards = Csr::<Key, u32>::from_parts(vec![0b110], Box::new([2, 1]), Box::new([1, 2]));
+            assert!(backwards.is_err());
+            let extra = Csr::<Key, u32>::from_parts(vec![1 << 1], Box::new([0, 1]), Box::new([1]));
+            assert!(extra.is_err());
+        })
     }
 
     #[test]
@@ -1310,13 +1550,15 @@ mod tests {
 
     #[test]
     fn an_empty_list_is_not_an_absent_one() {
-        let mut builder = CsrBuilder::<Key, u32>::default();
-        builder.ensure(key(3));
-        let frozen = builder.freeze();
-        assert!(frozen.contains_key(&key(3)));
-        assert_eq!(frozen.get(&key(3)).map(|it| it.len()), Some(0));
-        assert!(!frozen.contains_key(&key(2)));
-        assert!(frozen.get(&key(2)).is_none());
+        frame::task(crate::db::INFER_TAG, |frame| {
+            let mut builder = CsrBuilder::<Key, u32>::new_in(frame);
+            builder.ensure(key(3));
+            let frozen = builder.freeze();
+            assert!(frozen.contains_key(&key(3)));
+            assert_eq!(frozen.get(&key(3)).map(|it| it.len()), Some(0));
+            assert!(!frozen.contains_key(&key(2)));
+            assert!(frozen.get(&key(2)).is_none());
+        })
     }
 
     #[test]
@@ -1377,6 +1619,151 @@ mod tests {
         assert_eq!(set.iter().collect::<Vec<_>>(), vec![0, 3, 63, 64, 200]);
         for var in 0..300 {
             assert_eq!(set.contains(var), [0, 3, 63, 64, 200].contains(&var));
+        }
+    }
+
+    /// The builders as they were before they moved onto the frame, to hold the new ones to.
+    mod before {
+        use rustc_hash::FxHashMap;
+
+        use super::super::*;
+
+        fn dense<K: DenseKey, V>(entries: impl IntoIterator<Item = (K, V)>) -> Vec<Option<V>> {
+            let mut dense: Vec<Option<V>> = Vec::new();
+            for (key, value) in entries {
+                let index = key.to_index();
+                if index >= dense.len() {
+                    dense.resize_with(index + 1, || None);
+                }
+                dense[index] = Some(value);
+            }
+            dense
+        }
+
+        pub(super) fn ty_column<K: DenseKey>(entries: impl IntoIterator<Item = (K, StoredTy)>) -> TyColumn<K> {
+            let mut by_ty: FxHashMap<StoredTy, u32> = FxHashMap::default();
+            let mut tys = Vec::new();
+            let at = dense(entries)
+                .into_iter()
+                .map(|ty| match ty {
+                    None => NONE,
+                    Some(ty) => *by_ty.entry(ty).or_insert_with_key(|ty| {
+                        tys.push(*ty);
+                        place(tys.len() - 1)
+                    }),
+                })
+                .collect();
+            TyColumn { at, tys: tys.into_boxed_slice(), key: PhantomData }
+        }
+
+        pub(super) fn index_column<K: DenseKey, V>(entries: impl IntoIterator<Item = (K, V)>) -> IndexColumn<K, V> {
+            let (mut words, mut rows) = (BitSet::<usize>::default(), Vec::new());
+            for (index, row) in dense(entries).into_iter().enumerate() {
+                if let Some(row) = row {
+                    words.insert_growing(index);
+                    rows.push(row);
+                }
+            }
+            let present = Presence::new(words.into_words()).unwrap();
+            IndexColumn { present, rows: rows.into_boxed_slice(), key: PhantomData }
+        }
+
+        pub(super) fn mode_column<K: DenseKey>(entries: impl IntoIterator<Item = (K, BindingMode)>) -> ModeColumn<K> {
+            let codes = dense(entries).into_iter().map(|mode| mode.map_or(MODE_NONE, mode_code));
+            ModeColumn { codes: codes.collect(), key: PhantomData }
+        }
+
+        pub(super) fn csr<K: DenseKey, T: Clone>(ranges: &[Range], items: &[T]) -> Csr<K, T> {
+            let mut words = BitSet::<usize>::default();
+            let mut ends = Vec::new();
+            let mut next = 0usize;
+            for (index, range) in ranges.iter().enumerate() {
+                if range.is_absent() {
+                    continue;
+                }
+                words.insert_growing(index);
+                next += range.len as usize;
+                ends.push(place(next));
+            }
+            let mut flat = Vec::with_capacity(next);
+            for range in ranges.iter().filter(|range| !range.is_absent()) {
+                flat.extend(items[range.slice()].iter().cloned());
+            }
+            let present = Presence::new(words.into_words()).unwrap();
+            Csr { present, ends: ends.into_boxed_slice(), items: flat.into_boxed_slice(), key: PhantomData }
+        }
+
+        pub(super) fn sorted_map<K: Ord, V>(entries: impl IntoIterator<Item = (K, V)>) -> SortedMap<K, V> {
+            let mut entries: Vec<(K, V)> = entries.into_iter().collect();
+            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            SortedMap { entries: entries.into_boxed_slice() }
+        }
+    }
+
+    #[test]
+    fn frame_builders_make_the_columns_the_old_builders_made() {
+        let types = &crate::next_solver::default_types().types;
+        let palette = [types.i32, types.u8, types.bool, types.unit, types.never];
+        for seed in 0..32 {
+            frame::task(crate::db::INFER_TAG, |frame| {
+                let mut rows = ArenaMap::default();
+                let mut tys = ArenaMap::default();
+                let mut modes = ArenaMap::default();
+                let mut dense_rows = DenseMap::<Key, u32>::new_in(frame);
+                let mut dense_tys = DenseMap::<Key, StoredTy>::new_in(frame);
+                let mut dense_modes = DenseMap::<Key, BindingMode>::new_in(frame);
+                // Made at more keys than are written, as inference makes them at the node count.
+                dense_rows.reserve_keys(400);
+                dense_tys.reserve_keys(400);
+                dense_modes.reserve_keys(400);
+                for (k, v) in writes(seed, 200, 300, 1000) {
+                    let ty = palette[v as usize % palette.len()].store();
+                    let mode = BINDING_MODES[v as usize % BINDING_MODES.len()];
+                    assert_eq!(dense_rows.insert(key(k), v), rows.insert(key(k), v));
+                    dense_tys.insert(key(k), ty);
+                    tys.insert(key(k), ty);
+                    dense_modes.insert(key(k), mode);
+                    modes.insert(key(k), mode);
+                }
+                for k in 0..450 {
+                    assert_eq!(dense_rows.get(key(k)), rows.get(key(k)));
+                    assert_eq!(dense_rows.contains_idx(key(k)), rows.contains_idx(key(k)));
+                }
+                assert!(dense_rows.iter().map(|(k, &v)| (k, v)).eq(rows.iter().map(|(k, &v)| (k, v))));
+                *dense_rows.get_mut(key(7)).unwrap_or(&mut 0) += 1;
+                if let Some(row) = rows.get_mut(key(7)) {
+                    *row += 1;
+                }
+                let drained: Vec<(Key, u32)> = DenseMap::<Key, u32>::drain(&mut dense_rows.clone_for_test()).collect();
+                assert_eq!(drained, rows.iter().map(|(k, &v)| (k, v)).collect::<Vec<_>>());
+                assert!(IndexColumn::from_dense(dense_rows.slots_mut()) == before::index_column(rows));
+                assert!(TyColumn::from_dense(frame, dense_tys.slots_mut()) == before::ty_column(tys));
+                assert!(ModeColumn::from_dense(dense_modes.slots()) == before::mode_column(modes));
+
+                let mut builder = CsrBuilder::<Key, u32>::new_in(frame);
+                builder.reserve_keys(64);
+                let mut set = FrameIdxSet::<Key>::new_in(frame);
+                set.reserve_keys_for_test(700);
+                let mut model_set = std::collections::BTreeSet::new();
+                for (step, (k, v)) in writes(seed, 300, 40, 1000).into_iter().enumerate() {
+                    match step % 3 {
+                        0 => builder.insert(key(k), [v, v + 1]),
+                        1 => _ = builder.remove_in_place(&key(k)),
+                        _ => builder.push(key(k), v),
+                    }
+                    assert_eq!(set.insert(key(v % 700)), model_set.insert(v % 700));
+                }
+                let old = before::csr::<Key, u32>(&builder.ranges, &builder.items);
+                assert!(builder.freeze() == old);
+                let frozen = set.freeze();
+                assert!(frozen == model_set.iter().map(|&k| key(k)).collect::<IdxSet<Key>>());
+                let words = frozen.words.into_words();
+                assert_eq!(words.len(), words.capacity(), "made at its length");
+
+                let entries: Vec<(u32, u32)> =
+                    writes(seed, 100, 1000, 1000).into_iter().collect::<BTreeMap<_, _>>().into_iter().rev().collect();
+                assert!(SortedMap::from_entries_in(frame, entries.iter().copied()) == before::sorted_map(entries.clone()));
+            });
         }
     }
 }

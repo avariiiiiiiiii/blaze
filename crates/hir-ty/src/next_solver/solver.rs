@@ -7,14 +7,14 @@ use hir_def::{
     signatures::{ConstSignature, TypeAliasSignature},
 };
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustc_next_trait_solver::delegate::SolverDelegate;
+use rustc_next_trait_solver::{delegate::SolverDelegate, solve::SearchStorage};
 use rustc_type_ir::{
     AliasTyKind, CanonicalizerState, ClausePolarity, GenericArgKind, InferCtxtLike, InferTy,
     Interner, TypeFlags, TypeSuperVisitable, TypeVisitable, TypeVisitableExt, TypeVisitor,
     inherent::{GenericArg as _, GenericArgs as _, IntoKind, Term as _, Ty as _},
     lang_items::SolverTraitLangItem,
     solve::{
-        ComputeGoalFastPathOutcome, FetchEligibleAssocItemResponse, GoalStalledOn,
+        ComputeGoalFastPathOutcome, FastPathDepth, FetchEligibleAssocItemResponse, GoalStalledOn,
         GoalStalledOnOpaques, MaybeInfo, NoSolution, SucceededInErased, TyOrConstInferVar,
         VisibleForLeakCheck,
     },
@@ -34,12 +34,14 @@ use crate::{
         ClauseKind, CoercePredicate, ConstExt, ConstKind, ErrorGuaranteed, GenericArgs,
         ImplOrTraitAssocTermId, OpaqueTyIdWrapper, ParamEnv, Predicate, PredicateKind,
         RegionConstraint, SubtypePredicate, TermId, TraitAssocTermId, Ty, TyKind, TypingMode,
-        Unnormalized, fold::fold_tys, inspect::ProofTreeVisitor, util::sizedness_fast_path,
+        Unnormalized, fold::fold_tys, inspect::ProofTreeVisitor, recycle,
+        util::sizedness_fast_path,
     },
 };
 
 use super::{
     Const, DbInterner, GenericArg, Region,
+    global_goals::shape,
     infer::{DbInternerInferExt, InferCtxt, canonical::instantiate::CanonicalExt},
     inspect::{InspectConfig, InspectGoal},
 };
@@ -83,6 +85,152 @@ impl<'db> SolverContext<'db> {
         self.inner.borrow_mut().opaque_types().is_empty()
             // In erased mode, no opaques in the storage is not enough to answer here.
             && !self.typing_mode_raw().is_erased_not_coherence()
+    }
+
+    /// The fast-path answers that cost no search-graph depth.
+    fn depth_free_fast_path(
+        &self,
+        goal: Goal<'db, Predicate<'db>>,
+        span: Span,
+    ) -> ComputeGoalFastPathOutcome<DbInterner<'db>> {
+        use ComputeGoalFastPathOutcome as Outcome;
+        let interner = self.interner;
+
+        let pred = goal.predicate.kind();
+        match pred.skip_binder() {
+            PredicateKind::Clause(ClauseKind::Trait(trait_pred)) => {
+                let trait_pred = pred.rebind(trait_pred);
+                let self_ty = self.shallow_resolve(trait_pred.self_ty().skip_binder());
+                if let Some(vid) = self_ty.ty_vid()
+                    // We don't do this fast path when opaques are defined since we may
+                    // eventually use opaques to incompletely guide inference via ty var
+                    // self types.
+                    // FIXME: Properly consider opaques here.
+                    && self.known_no_opaque_types_in_storage()
+                {
+                    goal_stalled_on_args_or_nonempty_opaques(thin_vec![TyOrConstInferVar::Ty(vid)]) // alloc: `GoalStalledOn` owns a `ThinVec`
+                } else if trait_pred.polarity() == ClausePolarity::Positive {
+                    match interner.as_trait_lang_item(trait_pred.def_id()) {
+                        Some(SolverTraitLangItem::Sized | SolverTraitLangItem::MetaSized) => {
+                            let predicate = self.deeply_resolve_ignoring_regions(goal.predicate);
+                            if sizedness_fast_path(interner, predicate, goal.param_env) {
+                                Outcome::TriviallyHolds
+                            } else {
+                                Outcome::NoFastPath
+                            }
+                        }
+                        Some(SolverTraitLangItem::Copy | SolverTraitLangItem::Clone) => {
+                            let self_ty = self
+                                .deeply_resolve_ignoring_regions(trait_pred.self_ty().skip_binder());
+                            // Unlike `Sized` traits, which always prefer the built-in impl,
+                            // `Copy`/`Clone` may be shadowed by a param-env candidate which
+                            // could force a lifetime error or guide inference. While that's
+                            // not generally desirable, it is observable, so for now let's
+                            // ignore this fast path for types that have regions or infer.
+                            if !self_ty
+                                .has_type_flags(TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_INFER)
+                                && self_ty.is_trivially_pure_clone_copy()
+                            {
+                                Outcome::TriviallyHolds
+                            } else {
+                                Outcome::NoFastPath
+                            }
+                        }
+                        _ => Outcome::NoFastPath,
+                    }
+                } else {
+                    Outcome::NoFastPath
+                }
+            }
+            PredicateKind::DynCompatible(def_id) if interner.trait_is_dyn_compatible(def_id) => {
+                Outcome::TriviallyHolds
+            }
+            PredicateKind::Clause(ClauseKind::RegionOutlives(outlives)) => {
+                if outlives.has_escaping_bound_vars() {
+                    return Outcome::NoFastPath;
+                }
+                // Region constraints of nested goals are never visible to the leak check;
+                // this one skips the nested goal boundary, so it says so itself.
+                InferCtxtLike::sub_regions(
+                    &self.0,
+                    outlives.1,
+                    outlives.0,
+                    VisibleForLeakCheck::No,
+                    span,
+                );
+                Outcome::TriviallyHolds
+            }
+            PredicateKind::Clause(ClauseKind::TypeOutlives(outlives)) => {
+                if outlives.has_escaping_bound_vars() {
+                    return Outcome::NoFastPath;
+                }
+                let ty = self.deeply_resolve_ignoring_regions(outlives.0);
+                if ty.has_non_rigid_aliases() {
+                    return Outcome::NoFastPath;
+                }
+                if ty.has_non_region_infer() {
+                    let mut infers = CollectNonRegionInfer::default();
+                    ty.visit_with(&mut infers);
+                    return goal_stalled_on_args(
+                        infers
+                            .infers
+                            .into_iter()
+                            .map(|arg| {
+                                TyOrConstInferVar::maybe_from_generic_arg::<DbInterner<'db>>(arg)
+                                    .expect("collected an inference variable")
+                            })
+                            .collect(), // alloc: `GoalStalledOn` owns a `ThinVec`
+                    );
+                }
+                InferCtxtLike::register_ty_outlives(&self.0, outlives.0, outlives.1, span);
+                Outcome::TriviallyHolds
+            }
+            PredicateKind::Subtype(SubtypePredicate { a, b, .. })
+            | PredicateKind::Coerce(CoercePredicate { a, b }) => {
+                if a.has_escaping_bound_vars() || b.has_escaping_bound_vars() {
+                    return Outcome::NoFastPath;
+                }
+                match (self.shallow_resolve(a).kind(), self.shallow_resolve(b).kind()) {
+                    (
+                        TyKind::Infer(InferTy::TyVar(a_vid)),
+                        TyKind::Infer(InferTy::TyVar(b_vid)),
+                    ) => {
+                        self.sub_unify_ty_vids_raw(a_vid, b_vid);
+                        goal_stalled_on_args(thin_vec![ // alloc: `GoalStalledOn` owns a `ThinVec`
+                            TyOrConstInferVar::Ty(a_vid),
+                            TyOrConstInferVar::Ty(b_vid),
+                        ])
+                    }
+                    _ => Outcome::NoFastPath,
+                }
+            }
+            PredicateKind::Clause(ClauseKind::ConstArgHasType(ct, _)) => {
+                if ct.has_escaping_bound_vars() {
+                    return Outcome::NoFastPath;
+                }
+                match self.shallow_resolve_const(ct).ct_vid() {
+                    Some(vid) => goal_stalled_on_args(thin_vec![TyOrConstInferVar::Const(vid)]), // alloc: `GoalStalledOn` owns a `ThinVec`
+                    None => Outcome::NoFastPath,
+                }
+            }
+            PredicateKind::Clause(ClauseKind::WellFormed(arg)) => {
+                if arg.has_escaping_bound_vars() {
+                    return Outcome::NoFastPath;
+                }
+                let arg = self.shallow_resolve_term(arg);
+                if arg.is_trivially_wf(interner) {
+                    Outcome::TriviallyHolds
+                } else if arg.is_infer() {
+                    goal_stalled_on_args(thin_vec![ // alloc: `GoalStalledOn` owns a `ThinVec`
+                        TyOrConstInferVar::maybe_from_term::<DbInterner<'db>>(arg)
+                            .expect("an inference variable"),
+                    ])
+                } else {
+                    Outcome::NoFastPath
+                }
+            }
+            _ => Outcome::NoFastPath,
+        }
     }
 }
 
@@ -171,148 +319,21 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         &self,
         goal: Goal<'db, Predicate<'db>>,
         span: Span,
+        depth: FastPathDepth,
     ) -> ComputeGoalFastPathOutcome<Self::Interner> {
         use ComputeGoalFastPathOutcome as Outcome;
-        let interner = self.interner;
-
-        if interner.assumptions_on_binders() {
+        if self.interner.assumptions_on_binders() {
             return Outcome::NoFastPath;
         }
-
-        let pred = goal.predicate.kind();
-        match pred.skip_binder() {
-            PredicateKind::Clause(ClauseKind::Trait(trait_pred)) => {
-                let trait_pred = pred.rebind(trait_pred);
-                let self_ty = self.shallow_resolve(trait_pred.self_ty().skip_binder());
-                if let Some(vid) = self_ty.ty_vid()
-                    // We don't do this fast path when opaques are defined since we may
-                    // eventually use opaques to incompletely guide inference via ty var
-                    // self types.
-                    // FIXME: Properly consider opaques here.
-                    && self.known_no_opaque_types_in_storage()
-                {
-                    goal_stalled_on_args_or_nonempty_opaques(thin_vec![TyOrConstInferVar::Ty(vid)]) // alloc: `GoalStalledOn` owns a `ThinVec`
-                } else if trait_pred.polarity() == ClausePolarity::Positive {
-                    match interner.as_trait_lang_item(trait_pred.def_id()) {
-                        Some(SolverTraitLangItem::Sized | SolverTraitLangItem::MetaSized) => {
-                            let predicate = self.deeply_resolve_ignoring_regions(goal.predicate);
-                            if sizedness_fast_path(interner, predicate, goal.param_env) {
-                                Outcome::TriviallyHolds
-                            } else {
-                                Outcome::NoFastPath
-                            }
-                        }
-                        Some(SolverTraitLangItem::Copy | SolverTraitLangItem::Clone) => {
-                            let self_ty = self
-                                .deeply_resolve_ignoring_regions(trait_pred.self_ty().skip_binder());
-                            // Unlike `Sized` traits, which always prefer the built-in impl,
-                            // `Copy`/`Clone` may be shadowed by a param-env candidate which
-                            // could force a lifetime error or guide inference. While that's
-                            // not generally desirable, it is observable, so for now let's
-                            // ignore this fast path for types that have regions or infer.
-                            if !self_ty
-                                .has_type_flags(TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_INFER)
-                                && self_ty.is_trivially_pure_clone_copy()
-                            {
-                                Outcome::TriviallyHolds
-                            } else {
-                                Outcome::NoFastPath
-                            }
-                        }
-                        _ => Outcome::NoFastPath,
-                    }
-                } else {
-                    Outcome::NoFastPath
-                }
+        if depth.depth_free() {
+            match self.depth_free_fast_path(goal, span) {
+                Outcome::NoFastPath => {}
+                outcome => return outcome,
             }
-            PredicateKind::DynCompatible(def_id) if interner.trait_is_dyn_compatible(def_id) => {
-                Outcome::TriviallyHolds
-            }
-            PredicateKind::Clause(ClauseKind::RegionOutlives(outlives)) => {
-                if outlives.has_escaping_bound_vars() {
-                    return Outcome::NoFastPath;
-                }
-                // Region constraints of nested goals are never visible to the leak check;
-                // this one skips the nested goal boundary, so it says so itself.
-                InferCtxtLike::sub_regions(
-                    &self.0,
-                    outlives.1,
-                    outlives.0,
-                    VisibleForLeakCheck::No,
-                    span,
-                );
-                Outcome::TriviallyHolds
-            }
-            PredicateKind::Clause(ClauseKind::TypeOutlives(outlives)) => {
-                if outlives.has_escaping_bound_vars() {
-                    return Outcome::NoFastPath;
-                }
-                let ty = self.deeply_resolve_ignoring_regions(outlives.0);
-                if ty.has_non_rigid_aliases() {
-                    return Outcome::NoFastPath;
-                }
-                if ty.has_non_region_infer() {
-                    let mut infers = CollectNonRegionInfer::default();
-                    ty.visit_with(&mut infers);
-                    return goal_stalled_on_args(
-                        infers
-                            .infers
-                            .into_iter()
-                            .map(|arg| {
-                                TyOrConstInferVar::maybe_from_generic_arg::<Self::Interner>(arg)
-                                    .expect("collected an inference variable")
-                            })
-                            .collect(), // alloc: `GoalStalledOn` owns a `ThinVec`
-                    );
-                }
-                InferCtxtLike::register_ty_outlives(&self.0, outlives.0, outlives.1, span);
-                Outcome::TriviallyHolds
-            }
-            PredicateKind::Subtype(SubtypePredicate { a, b, .. })
-            | PredicateKind::Coerce(CoercePredicate { a, b }) => {
-                if a.has_escaping_bound_vars() || b.has_escaping_bound_vars() {
-                    return Outcome::NoFastPath;
-                }
-                match (self.shallow_resolve(a).kind(), self.shallow_resolve(b).kind()) {
-                    (
-                        TyKind::Infer(InferTy::TyVar(a_vid)),
-                        TyKind::Infer(InferTy::TyVar(b_vid)),
-                    ) => {
-                        self.sub_unify_ty_vids_raw(a_vid, b_vid);
-                        goal_stalled_on_args(thin_vec![ // alloc: `GoalStalledOn` owns a `ThinVec`
-                            TyOrConstInferVar::Ty(a_vid),
-                            TyOrConstInferVar::Ty(b_vid),
-                        ])
-                    }
-                    _ => Outcome::NoFastPath,
-                }
-            }
-            PredicateKind::Clause(ClauseKind::ConstArgHasType(ct, _)) => {
-                if ct.has_escaping_bound_vars() {
-                    return Outcome::NoFastPath;
-                }
-                match self.shallow_resolve_const(ct).ct_vid() {
-                    Some(vid) => goal_stalled_on_args(thin_vec![TyOrConstInferVar::Const(vid)]), // alloc: `GoalStalledOn` owns a `ThinVec`
-                    None => Outcome::NoFastPath,
-                }
-            }
-            PredicateKind::Clause(ClauseKind::WellFormed(arg)) => {
-                if arg.has_escaping_bound_vars() {
-                    return Outcome::NoFastPath;
-                }
-                let arg = self.shallow_resolve_term(arg);
-                if arg.is_trivially_wf(interner) {
-                    Outcome::TriviallyHolds
-                } else if arg.is_infer() {
-                    goal_stalled_on_args(thin_vec![ // alloc: `GoalStalledOn` owns a `ThinVec`
-                        TyOrConstInferVar::maybe_from_term::<Self::Interner>(arg)
-                            .expect("an inference variable"),
-                    ])
-                } else {
-                    Outcome::NoFastPath
-                }
-            }
-            _ => Outcome::NoFastPath,
+        }
+        match depth.available().and_then(|available| shape::holds_within(self, goal, available)) {
+            Some(required_depth) => Outcome::HoldsWithin { required_depth },
+            None => Outcome::NoFastPath,
         }
     }
 
@@ -442,27 +463,57 @@ impl<'db> SolverDelegate for SolverContext<'db> {
     fn make_deduplicated_region_constraints(
         &self,
     ) -> Vec<(RegionConstraint<'db>, VisibleForLeakCheck)> {
+        let mut constraints = Vec::new(); // alloc: the trait returns a `Vec`; none when empty
+        self.make_deduplicated_region_constraints_into(&mut constraints);
+        constraints
+    }
+
+    /// The same, appended to `into` (the solver's pooled list). Up to `SCANNED` distinct
+    /// constraints are deduplicated by a scan of those appended, so a response allocates
+    /// nothing once `into` has room; past that a map is built once.
+    fn make_deduplicated_region_constraints_into(
+        &self,
+        into: &mut Vec<(RegionConstraint<'db>, VisibleForLeakCheck)>,
+    ) {
         if !self.interner.regions() {
-            return Vec::new(); // alloc: empty
+            return;
         }
-        let mut seen = FxHashMap::default();
-        let mut constraints: Vec<(RegionConstraint<'db>, VisibleForLeakCheck)> = Vec::new(); // alloc: the trait returns a `Vec`
+        let base = into.len();
+        let mut seen: Option<FxHashMap<RegionConstraint<'db>, usize>> = None;
         for (constraint, visible) in self.0.query_region_constraints() {
             if says_nothing(constraint) {
                 continue;
             }
-            match seen.entry(constraint) {
-                Entry::Occupied(at) => {
-                    let previous = &mut constraints[*at.get()].1;
+            let found = match &mut seen {
+                Some(seen) => match seen.entry(constraint) {
+                    Entry::Occupied(at) => Some(*at.get()),
+                    Entry::Vacant(at) => {
+                        at.insert(into.len());
+                        None
+                    }
+                },
+                None => into[base..].iter().position(|it| it.0 == constraint).map(|at| base + at),
+            };
+            match found {
+                Some(at) => {
+                    let previous = &mut into[at].1;
                     *previous = previous.or(visible);
                 }
-                Entry::Vacant(at) => {
-                    at.insert(constraints.len());
-                    constraints.push((constraint, visible));
+                None => {
+                    into.push((constraint, visible));
+                    if seen.is_none() && into.len() - base > SCANNED {
+                        seen = Some(
+                            into[base..]
+                                .iter()
+                                .enumerate()
+                                .map(|(at, it)| (it.0, base + at))
+                                // alloc: once per response past `SCANNED` distinct constraints.
+                                .collect(),
+                        );
+                    }
                 }
             }
         }
-        constraints
     }
 
     fn instantiate_canonical<V>(
@@ -637,6 +688,14 @@ impl<'db> SolverDelegate for SolverContext<'db> {
         *self.canonicalizer_state.borrow_mut() = state;
     }
 
+    fn obtain_search_storage(&self) -> SearchStorage<Self::Interner> {
+        recycle::search_storage()
+    }
+
+    fn release_search_storage(&self, storage: SearchStorage<Self::Interner>) {
+        recycle::give_search_storage(storage);
+    }
+
     fn emit_next_solver_overflow_fcw(&self, goal: Goal<'db, Predicate<'db>>, span: Span) {
         let goal = self.deeply_resolve_ignoring_regions(goal);
         let mut chain = OverflowedGoalChain {
@@ -708,6 +767,10 @@ impl<'db> ProofTreeVisitor<'db> for OverflowedGoalChain<'db> {
 /// need would make every coinductive cycle through the type it is in (an auto trait over a
 /// recursive type) differ from its first provisional answer and run again, and the reruns of
 /// nested cycles multiply.
+/// Distinct region constraints a response deduplicates by scanning before it builds a map: a
+/// scan of 16 rows is cheaper than hashing, and most responses have fewer.
+const SCANNED: usize = 16;
+
 fn says_nothing(constraint: RegionConstraint<'_>) -> bool {
     let unknown = |error: Region<'_>, other: Region<'_>| error.is_error() && !other.is_placeholder();
     match constraint {

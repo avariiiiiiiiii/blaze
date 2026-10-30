@@ -22,7 +22,6 @@ cov-mark = "2.0.0"
 drop_bomb = "0.1.5"
 either.workspace = true
 hashbrown.workspace = true
-fst = { version = "0.4.7", default-features = false }
 indexmap.workspace = true
 itertools.workspace = true
 la-arena.workspace = true
@@ -60,6 +59,7 @@ unicode-ident.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 expect-test.workspace = true
+fst = { version = "0.4.7", default-features = false }
 proptest.workspace = true
 
 # local deps

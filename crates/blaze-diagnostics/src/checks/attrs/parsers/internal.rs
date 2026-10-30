@@ -91,7 +91,7 @@ pub(crate) fn accept(_state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &Arg
     let other = |name| Parsed::Other(name);
     match cx.builtin.path {
         ["lang"] => Accepted::Single(lang(cx, args)),
-        ["panic_handler"] => no_args(cx, args, Parsed::Lang("panic_impl".to_owned())),
+        ["panic_handler"] => no_args(cx, args, Parsed::Lang("panic_impl")),
         ["prelude_import"] => no_args(cx, args, other("PreludeImport")),
         ["rustc_canonical_symbol"] => no_args(cx, args, other("RustcCanonicalSymbol")),
         ["rustc_capture_analysis"] => no_args(cx, args, other("RustcCaptureAnalysis")),
@@ -175,20 +175,23 @@ pub(crate) fn check(_group: GroupId, _first: usize, _fx: &mut Finalize<'_, '_, '
 /// `LangParser::convert`.
 fn lang(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
     let nv = cx.expect_name_value(args, cx.attr_range(), None)?;
-    let name = cx.expect_string_literal(nv)?;
-    let Some(targets) = lang_item(&name) else {
+    let name = cx.expect_str(nv)?;
+    let Some((name, targets)) = lang_item(name) else {
+        // alloc: the error's message
         let mut diag = cx.err(Some("E0522"), format!("definition of an unknown lang item: `{name}`"), cx.attr_range());
+        // alloc: the error's label
         diag.span_label(cx.attr_span(), format!("definition of unknown lang item `{name}`"));
         cx.emit_err(diag);
         return None;
     };
     let foreign = matches!(cx.target(), Target::ForeignFn | Target::ForeignStatic | Target::ForeignTy | Target::ForeignMod);
-    if foreign && !is_weak(&name) {
+    if foreign && !is_weak(name) {
+        // alloc: the error's message
         let diag = cx.err(Some("E0264"), format!("unknown external lang item: `{name}`"), cx.attr_range());
         cx.emit_err(diag);
         return None;
     }
-    cx.check_target(&format!(" = \"{name}\""), Targets::AllowList(targets));
+    cx.check_target_value(name, Targets::AllowList(targets));
     Some(Parsed::Lang(name))
 }
 
@@ -199,8 +202,8 @@ fn is_weak(name: &str) -> bool {
 
 /// The one target the lang item `name` may be applied to, if rustc has a lang item of that
 /// name: rustc's `LangItem::from_name` and `LangItem::target`.
-fn lang_item(name: &str) -> Option<&'static [Policy]> {
-    LANG_ITEMS.binary_search_by(|(it, _)| (*it).cmp(name)).ok().map(|at| LANG_ITEMS[at].1)
+fn lang_item(name: &str) -> Option<(&'static str, &'static [Policy])> {
+    LANG_ITEMS.binary_search_by(|(it, _)| (*it).cmp(name)).ok().map(|at| LANG_ITEMS[at])
 }
 
 const TRAIT: &[Policy] = &[Policy::Allow(Target::Trait)];
@@ -554,6 +557,7 @@ fn cgu_fields(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, accepts_kind: bool)
 
 /// `CguFieldsMissing`, at the list; the `)` in it is rustc's.
 fn cgu_field_missing(cx: &mut Accept<'_, '_, '_>, list: TextRange, field: &str) {
+    // alloc: the error's message
     let diag = cx.err(None, format!("`#[{})]` is missing a `{field}` argument", cx.name()), list);
     cx.emit_err(diag);
 }
@@ -651,7 +655,8 @@ fn must_implement_one_of(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Optio
             errored = true;
             continue;
         };
-        names.push((ident.name.clone(), ident.range));
+        // alloc: the names the parsed `#[rustc_must_implement_one_of]` keeps
+        names.push((ident.name.to_string(), ident.range));
     }
     if errored {
         return None;
@@ -705,6 +710,7 @@ fn scalable_vector(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Pars
     let count = single_integer(cx, args)?;
     if u16::try_from(count).is_err() {
         let mut diag =
+            // alloc: the error's message
             cx.err(None, format!("element count in `rustc_scalable_vector` is too large: `{count}`"), cx.attr_range());
         diag.note("the value may not exceed `u16::MAX`");
         cx.emit_err(diag);
@@ -737,12 +743,12 @@ mod tests {
 
     #[test]
     fn a_lang_item_names_its_target() {
-        assert_eq!(lang_item("owned_box"), Some(&[Policy::Allow(Target::Struct)][..]));
-        assert_eq!(lang_item("fn"), Some(&[Policy::Allow(Target::Trait)][..]));
-        assert_eq!(lang_item("Some"), Some(&[Policy::Allow(Target::Variant)][..]));
-        assert_eq!(lang_item("panic_impl"), Some(&[Policy::Allow(Target::ForeignFn)][..]));
-        assert_eq!(lang_item("cookie"), None);
-        assert_eq!(lang_item("Fn"), None);
+        assert_eq!(lang_item("owned_box").map(|it| it.1), Some(&[Policy::Allow(Target::Struct)][..]));
+        assert_eq!(lang_item("fn").map(|it| it.1), Some(&[Policy::Allow(Target::Trait)][..]));
+        assert_eq!(lang_item("Some").map(|it| it.1), Some(&[Policy::Allow(Target::Variant)][..]));
+        assert_eq!(lang_item("panic_impl").map(|it| it.1), Some(&[Policy::Allow(Target::ForeignFn)][..]));
+        assert_eq!(lang_item("cookie").map(|it| it.1), None);
+        assert_eq!(lang_item("Fn").map(|it| it.1), None);
     }
 
     #[test]

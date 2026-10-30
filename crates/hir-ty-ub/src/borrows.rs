@@ -210,6 +210,20 @@ struct ThreadFrames {
     protected: Vec<(AllocId, BorTag)>,
 }
 
+/// The tags a [`Borrows::gc`] keeps, which its caller marks every tag still held in.
+pub struct LiveTags<'a>(&'a mut BitSet);
+
+impl LiveTags<'_> {
+    /// Keeps `tag`; a tag newer than the GC's start has nothing to drop.
+    #[inline]
+    pub fn mark(&mut self, tag: BorTag) {
+        let n = tag.get() as usize;
+        if n < self.0.capacity() {
+            self.0.insert(n);
+        }
+    }
+}
+
 impl Default for Borrows {
     fn default() -> Borrows {
         Borrows::new()
@@ -455,27 +469,22 @@ impl Borrows {
         self.retags_since_gc >= Borrows::GC_EVERY
     }
 
-    /// Drops every tag nothing holds. `live` is called once with a visitor the caller feeds
-    /// every tag still held, in memory and in the evaluator's values; protected tags, roots
+    /// Drops every tag nothing holds. `live` is called once with the set the caller marks
+    /// every tag still held in, in memory and in the evaluator's values; protected tags, roots
     /// and exposed tags are kept anyway. Miri: `run_provenance_gc`, `remove_unreachable_tags`.
-    pub fn gc(&mut self, mut live: impl FnMut(&mut dyn FnMut(AllocId, BorTag))) {
+    pub fn gc(&mut self, live: impl FnOnce(&mut LiveTags<'_>)) {
         self.retags_since_gc = 0;
         let Borrows { trees, threads, live: set, next_tag, .. } = self;
         set.reset(next_tag.get() as usize);
-        let mut mark = |tag: BorTag| {
-            let n = tag.get() as usize;
-            if n < set.capacity() {
-                set.insert(n);
-            }
-        };
-        live(&mut |_, tag| mark(tag));
+        let mut tags = LiveTags(set);
+        live(&mut tags);
         // Protected tags still have an access coming, and the tree compaction relies on them
         // being live (Miri: `FrameState::visit_provenance`).
         for &(_, tag) in threads.iter().flat_map(|t| &t.protected) {
-            mark(tag);
+            tags.mark(tag);
         }
         for tree in trees.iter().flatten() {
-            tree.visit_provenance(&mut mark);
+            tree.visit_provenance(&mut |tag| tags.mark(tag));
         }
         let set = &*set;
         let is_live = |tag: BorTag| set.contains(tag.get() as usize);

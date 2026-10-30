@@ -73,7 +73,7 @@ impl<'a> WfResultRef<'a> {
         let mut diagnostics = Vec::with_capacity(self.rows.len());
         for it in self.iter() {
             let WfDiagnosticRef { code, message, site } = it?;
-            diagnostics.push(WfDiagnostic { code, message: message.to_owned(), site });
+            diagnostics.push(WfDiagnostic { code, message: message.to_owned(), site }); // alloc: the edge, a memo read back from the store
         }
         Ok(WfResult { diagnostics })
     }
@@ -91,7 +91,7 @@ impl Persist for WfResult {
         let text: usize = self.diagnostics.iter().map(|it| it.message.len()).sum();
         out.bytes.reserve(text + (self.diagnostics.len() + 1) * size_of::<WfRow>());
         let messages: Vec<u64> =
-            self.diagnostics.iter().map(|it| out.push_str(&it.message)).collect();
+            self.diagnostics.iter().map(|it| out.push_str(&it.message)).collect(); // alloc: the memo's persisted form, once per write
         let rows_at = out.next::<WfRow>();
         let rows: Vec<WfRow> = self
             .diagnostics
@@ -112,7 +112,7 @@ impl Persist for WfResult {
                     index,
                 }
             })
-            .collect();
+            .collect(); // alloc: the memo's persisted form, once per write
         let written = out.push_slice(&rows);
         debug_assert!(rows.is_empty() || written == rows_at);
         let at = out.next::<WfRoot>();

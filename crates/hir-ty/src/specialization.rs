@@ -5,7 +5,7 @@ use hir_def::{
     HasModule, ImplId, LifetimeParamId, TypeOrConstParamId, hir::generics::GenericParams,
     signatures::ImplSignature, unstable_features::UnstableFeatures,
 };
-use rustc_hash::FxHashSet;
+use blaze_mem::Frame;
 use rustc_type_ir::{
     AliasTyKind, ConstKind, RegionKind, TypeSuperVisitable, TypeVisitable, TypeVisitableExt as _,
     TypeVisitor,
@@ -16,10 +16,11 @@ use smallvec::SmallVec;
 use tracing::debug;
 
 use crate::{
-    Span,
+    FrameSet, Span,
     db::HirDatabase,
+    frame_set,
     lower::GenericPredicates,
-    method_resolution::{SelfTyKey, TraitImpls},
+    method_resolution::{RelevantImplsKey, SelfTyKey, relevant_impls},
     next_solver::{
         AnyImplId, ClauseKind, Const, DbInterner, Region, Ty, TyKind, TypingMode, Unnormalized,
         infer::{DbInternerInferExt, traits::ObligationCause},
@@ -28,17 +29,27 @@ use crate::{
     },
 };
 
+/// The key of [`specializes_query`]: whether `specializing` specializes `parent`.
+#[salsa::interned(debug, revisions = usize::MAX)]
+pub struct ImplPair {
+    pub specializing: ImplId,
+    pub parent: ImplId,
+}
+
 // rustc does not have a cycle handling for the `specializes` query, meaning a cycle is a bug,
 // and indeed I was unable to cause cycles even with erroneous code. However, in r-a we can
 // create a cycle if there is an error in the impl's where clauses. I believe well formed code
 // cannot create a cycle, but a cycle handler is required nevertheless.
-fn specializes_query_cycle(
-    _db: &Db,
-    _: salsa::Id,
-    _specializing_impl_def_id: ImplId,
-    _parent_impl_def_id: ImplId,
-) -> bool {
+fn specializes_query_cycle(_db: &Db, _: salsa::Id, _pair: ImplPair) -> bool {
     false
+}
+
+/// Whether the crate of `impl_id` enables `specialization` or `min_specialization`: only
+/// then may it specialize another impl.
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
+pub(crate) fn may_specialize(db: &Db, impl_id: ImplId) -> bool {
+    let features = UnstableFeatures::query(db, impl_id.krate(db));
+    features.specialization || features.min_specialization
 }
 
 /// Is `specializing_impl_def_id` a specialization of `parent_impl_def_id`?
@@ -52,12 +63,9 @@ fn specializes_query_cycle(
 /// `parent_impl_def_id` is a const impl (conditionally based off of some `[const]`
 /// bounds), then `specializing_impl_def_id` must also be const for the same
 /// set of types.
-#[salsa::tracked(cycle_result = specializes_query_cycle, returns(copy))]
-fn specializes_query(
-    db: &Db,
-    specializing_impl_def_id: ImplId,
-    parent_impl_def_id: ImplId,
-) -> bool {
+#[salsa::tracked(cycle_result = specializes_query_cycle, returns(copy), mem_tag = Infer)]
+fn specializes_query(db: &Db, pair: ImplPair) -> bool {
+    let (specializing_impl_def_id, parent_impl_def_id) = (pair.specializing(db), pair.parent(db));
     let trait_env = db.trait_environment(specializing_impl_def_id.into());
     let interner = DbInterner::new_with(db, specializing_impl_def_id.krate(db));
 
@@ -152,8 +160,6 @@ pub(crate) fn specializes(
     specializing_impl_def_id: ImplId,
     parent_impl_def_id: ImplId,
 ) -> bool {
-    let module = specializing_impl_def_id.loc(db).container;
-
     // We check that the specializing impl comes from a crate that has specialization enabled.
     //
     // We don't really care if the specialized impl (the parent) is in a crate that has
@@ -163,12 +169,8 @@ pub(crate) fn specializes(
     // `#[allow_internal_unstable(specialization)]`, but `#[allow_internal_unstable]`
     // is an internal feature, std is not using it for specialization nor is likely to
     // ever use it, and we don't have the span information necessary to replicate that.
-    let features = UnstableFeatures::query(db, module.krate(db));
-    if !features.specialization && !features.min_specialization {
-        return false;
-    }
-
-    specializes_query(db, specializing_impl_def_id, parent_impl_def_id)
+    may_specialize(db, specializing_impl_def_id)
+        && specializes_query(db, ImplPair::new(db, specializing_impl_def_id, parent_impl_def_id))
 }
 
 /// The impl that `impl_id` takes an item it leaves out from: the closest of the impls it
@@ -178,8 +180,7 @@ pub(crate) fn specialized_ancestor(
     impl_id: ImplId,
     has_item: impl Fn(ImplId) -> bool,
 ) -> Option<ImplId> {
-    let features = UnstableFeatures::query(db, impl_id.krate(db));
-    if !features.specialization && !features.min_specialization {
+    if !may_specialize(db, impl_id) {
         return None;
     }
     let trait_ref = db.impl_trait(impl_id)?.instantiate_identity().skip_norm_wip();
@@ -196,34 +197,27 @@ pub(crate) fn specialized_ancestor(
     };
     // An impl `impl_id` specializes is at least as general: a blanket impl, or one for the
     // same simplified self type. The closest is the one that specializes every other, so the
-    // order these come in (blanket impls of every crate first) picks the same one.
+    // order these come in (blanket impls first) picks the same one.
     let (krate, trait_id) = (impl_id.krate(db), trait_ref.def_id.0);
-    let for_self_ty =
-        match simplify_type(interner, trait_ref.self_ty(), TreatParams::InstantiateWithInfer) {
-            Some(self_ty) => TraitImpls::in_crate_and_deps_for_trait_and_self_ty(
-                db,
-                krate,
-                trait_id,
-                SelfTyKey(self_ty),
-            ),
-            None => &[],
-        };
-    let for_self_ty = for_self_ty.iter().filter_map(|&it| match it {
-        AnyImplId::ImplId(it) => Some(it),
-        AnyImplId::BuiltinDeriveImplId(_) => None,
-    });
-    let ancestors: SmallVec<[ImplId; 4]> =
-        TraitImpls::blanket_in_crate_and_deps(db, krate, trait_id)
-            .iter()
-            .copied()
-            .chain(for_self_ty)
-            .filter(|&ancestor| {
-                ancestor != impl_id
-                    && has_item(ancestor)
-                    && headers_may_unify(ancestor)
-                    && specializes(db, impl_id, ancestor)
-            })
-            .collect();
+    let self_ty = simplify_type(interner, trait_ref.self_ty(), TreatParams::InstantiateWithInfer);
+    let key = RelevantImplsKey::new(db, krate, trait_id, self_ty.map(SelfTyKey));
+    let relevant = relevant_impls(db, key);
+    fn impls(impls: &[AnyImplId]) -> impl Iterator<Item = ImplId> + '_ {
+        impls.iter().filter_map(|&it| match it {
+            AnyImplId::ImplId(it) => Some(it),
+            AnyImplId::BuiltinDeriveImplId(_) => None,
+        })
+    }
+    let ancestors: SmallVec<[ImplId; 4]> = impls(relevant.blanket())
+        .chain(impls(relevant.for_self_ty()))
+        .filter(|&ancestor| {
+            ancestor != impl_id
+                && has_item(ancestor)
+                && headers_may_unify(ancestor)
+                && specializes(db, impl_id, ancestor)
+        })
+        // alloc: inline up to 4 ancestors; an impl specializes one or two.
+        .collect();
     ancestors.iter().copied().find(|&ancestor| {
         ancestors.iter().all(|&other| other == ancestor || specializes(db, ancestor, other))
     })
@@ -241,13 +235,13 @@ enum Parameter {
 fn parameters_for<'db>(
     value: impl TypeVisitable<DbInterner<'db>>,
     include_nonconstraining: bool,
-    out: &mut FxHashSet<Parameter>,
+    out: &mut FrameSet<'_, Parameter>,
 ) {
-    struct Collect<'a> {
+    struct Collect<'a, 'f> {
         include_nonconstraining: bool,
-        out: &'a mut FxHashSet<Parameter>,
+        out: &'a mut FrameSet<'f, Parameter>,
     }
-    impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_> {
+    impl<'db> TypeVisitor<DbInterner<'db>> for Collect<'_, '_> {
         type Result = ();
         fn visit_ty(&mut self, ty: Ty<'db>) {
             match ty.kind() {
@@ -291,21 +285,30 @@ fn parameters_for<'db>(
 /// `enforce_impl_non_lifetime_params_are_constrained`). rustc's `assoc_def` refuses to
 /// project an item such an impl defines, which would leave the parameter an inference
 /// variable nothing constrains, and gives an error instead.
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Infer)]
 pub(crate) fn impl_has_unconstrained_params(db: &Db, impl_id: ImplId) -> bool {
-    let Some(constrained) = constrained_params(db, impl_id) else { return false };
-    type_or_const_params(db, impl_id)
-        .any(|param| !constrained.contains(&Parameter::TypeOrConst(param)))
+    blaze_mem::frame::current(|frame| {
+        let Some(constrained) = constrained_params(db, frame, impl_id) else { return false };
+        type_or_const_params(db, impl_id)
+            .any(|param| !constrained.contains(&Parameter::TypeOrConst(param)))
+    })
 }
 
 /// The type and const parameters of `impl_id` that are constrained neither by its header nor
 /// by the associated types its where clauses equate with what is, in declaration order: each
 /// is one E0207. None when the header has an error type.
 pub fn impl_unconstrained_params(db: &Db, impl_id: ImplId) -> Vec<TypeOrConstParamId> {
-    let Some(constrained) = constrained_params(db, impl_id) else { return Vec::new() };
-    type_or_const_params(db, impl_id)
-        .filter(|&param| !constrained.contains(&Parameter::TypeOrConst(param)))
-        .collect()
+    blaze_mem::frame::task(crate::db::INFER_TAG, |frame| {
+        // alloc: an empty `Vec` holds no block
+        let Some(constrained) = constrained_params(db, frame, impl_id) else { return Vec::new() };
+        let mut unconstrained = Vec::new_in(frame);
+        unconstrained.extend(
+            type_or_const_params(db, impl_id)
+                .filter(|&param| !constrained.contains(&Parameter::TypeOrConst(param))),
+        );
+        // alloc: the caller's result, one block at its size
+        unconstrained.iter().copied().collect()
+    })
 }
 
 fn type_or_const_params(
@@ -319,32 +322,37 @@ fn type_or_const_params(
 
 /// The parameters of `impl_id` its header and its where clauses' projections constrain, or
 /// `None` when the header has an error type.
-fn constrained_params(db: &Db, impl_id: ImplId) -> Option<FxHashSet<Parameter>> {
+fn constrained_params<'f>(
+    db: &Db,
+    frame: &'f Frame,
+    impl_id: ImplId,
+) -> Option<FrameSet<'f, Parameter>> {
     let interner = DbInterner::new_no_crate(db);
     let self_ty = db.impl_self_ty(impl_id).instantiate_identity().skip_norm_wip();
     let trait_ref = db.impl_trait(impl_id).map(|it| it.instantiate_identity().skip_norm_wip());
     if self_ty.references_error() || trait_ref.is_some_and(|it| it.references_error()) {
         return None;
     }
-    let mut constrained = FxHashSet::default();
+    let mut constrained = frame_set(frame);
     match trait_ref {
         Some(trait_ref) => parameters_for(trait_ref, false, &mut constrained),
         None => parameters_for(self_ty, false, &mut constrained),
     }
     // rustc's `setup_constraining_predicates`: `<T as Trait>::Assoc == U` constrains `U` once
     // what the projection names is. A projection of the impl's own trait ref never does.
-    let projections: SmallVec<[_; 4]> = GenericPredicates::query_own_explicit(db, impl_id.into())
-        .iter_identity()
-        .filter_map(|it| match it.skip_norm_wip().kind().skip_binder() {
+    let mut projections = Vec::new_in(frame);
+    let predicates = GenericPredicates::query_own_explicit(db, impl_id.into());
+    projections.extend(predicates.iter_identity().filter_map(|it| {
+        match it.skip_norm_wip().kind().skip_binder() {
             ClauseKind::Projection(projection)
                 if Some(projection.projection_term.trait_ref(interner)) != trait_ref =>
             {
                 Some(projection)
             }
             _ => None,
-        })
-        .collect();
-    let mut inputs = FxHashSet::default();
+        }
+    }));
+    let mut inputs = frame_set(frame);
     loop {
         let before = constrained.len();
         for projection in &projections {

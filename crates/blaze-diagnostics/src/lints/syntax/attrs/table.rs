@@ -142,17 +142,22 @@ impl Template {
     /// around it when it was written so, sorted.
     pub(crate) fn suggestions(&self, name: &str, is_unsafe: bool) -> Vec<String> {
         let (open, close) = if is_unsafe { ("unsafe(", ")") } else { ("", "") };
+        // alloc: a diagnostic's text (`ill_formed`), as is each suggestion below
         let mut suggestions = Vec::new();
         if self.word {
+            // alloc: as above
             suggestions.push(format!("{open}{name}{close}"));
         }
         for descr in self.list.into_iter().flatten() {
+            // alloc: as above
             suggestions.push(format!("{open}{name}({descr}){close}"));
         }
         for word in self.one_of {
+            // alloc: as above
             suggestions.push(format!("{open}{name}({word}){close}"));
         }
         for descr in self.name_value_str.into_iter().flatten() {
+            // alloc: as above
             suggestions.push(format!("{open}{name} = \"{descr}\"{close}"));
         }
         suggestions.sort();

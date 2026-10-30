@@ -55,7 +55,7 @@ fn group_text(rng: &mut SplitMix64, depth: u32, out: &mut String) {
 /// Builds the elements of `text` (a group's inside, or a file's) onto `builder`, from `at`;
 /// a `[` opens a node of `group` (a lazy node of `LAZY` when `lazy` says so and the builder
 /// may make one). Gives where it stopped: past the `]` closing the group it is in.
-fn build(builder: &mut FlatTreeBuilder, source: &str, mut at: usize, lazy: &mut dyn FnMut() -> bool) -> usize {
+fn build(builder: &mut FlatTreeBuilder, source: &str, mut at: usize, lazy: &mut impl FnMut() -> bool) -> usize {
     let bytes = source.as_bytes();
     while at < bytes.len() {
         match bytes[at] {

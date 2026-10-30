@@ -750,12 +750,13 @@ mod tests {
             for (name, blocks) in paths() {
                 let mut words = Vec::new();
                 let classes = Classes::with(text, blocks, &mut words);
-                let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-                let space = |b: u8| matches!(b, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ');
+                let ident: fn(u8) -> bool = |b| b.is_ascii_alphanumeric() || b == b'_';
+                let space: fn(u8) -> bool =
+                    |b| matches!(b, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' ');
                 for at in 0..text.len() {
-                    let class: Option<&dyn Fn(u8) -> bool> = match text[at] {
-                        b if ident(b) => Some(&ident),
-                        b if space(b) => Some(&space),
+                    let class = match text[at] {
+                        b if ident(b) => Some(ident),
+                        b if space(b) => Some(space),
                         _ => None,
                     };
                     let expected = match class {

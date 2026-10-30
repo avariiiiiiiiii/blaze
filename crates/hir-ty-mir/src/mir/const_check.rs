@@ -223,12 +223,13 @@ pub fn const_check<'db>(db: &'db Db, def: DefWithBodyId) -> ConstCheck {
 /// check: core's `panic!` makes such a `const fn` in the body it is written in.
 fn not_const_checked(db: &Db, func: FunctionId) -> bool {
     use hir_def::src::HasSource;
-    use syntax::ast::HasAttrs;
-    let source = func.lookup(db).source(db);
+    use syntax::view::HasAttrs;
+    let source = func.lookup(db).ast_ptr(db);
     source
         .value
+        .to_view(source.file_id.root(db))
         .attrs()
-        .any(|attr| attr.simple_name().as_deref() == Some("rustc_do_not_const_check"))
+        .any(|attr| attr.simple_name() == Some("rustc_do_not_const_check"))
 }
 
 /// Whether a call of `func` in a const context is one rustc does not refuse as a call of a

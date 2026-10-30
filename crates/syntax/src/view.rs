@@ -164,6 +164,14 @@ pub trait Typed {
     type Of<'t>: AstNode<'t>;
 }
 
+impl<L: Typed, R: Typed> Typed for Either<L, R> {
+    type Of<'t> = Either<L::Of<'t>, R::Of<'t>>;
+}
+
+impl Typed for crate::ast::Macro {
+    type Of<'t> = Macro<'t>;
+}
+
 impl<T> Parse<T> {
     /// The root of the tree, borrowed.
     #[inline]

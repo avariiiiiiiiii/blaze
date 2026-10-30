@@ -34,16 +34,15 @@ mod types;
 
 use std::{cell::OnceCell, ops::ControlFlow};
 
-use base_db::Db;
 use hir::{HirFileId, InFile};
 use span::{Edition, SyntaxContext};
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize,
-    ast,
+    NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
+    view::{self as ast, AstNode as _},
 };
 
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view as item_range},
     lints::syntax::{Pass, Tree, Walk, source_fact},
     lower::{Found, Phase, mutable_ref_binding::BUILT_ON},
     model::{Diag, Span},
@@ -51,12 +50,12 @@ use crate::{
 
 /// One pass over the nodes [`Walk`] holds: each node costs a `kind` read and a `match` on it;
 /// only the kinds a check looks at are cast, and nothing is allocated unless an error fires.
-pub(crate) fn check(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Found> {
+pub(crate) fn check<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'db>) -> Vec<Found> {
     let features = OnceCell::new();
     let mut out = Out::default();
     for tree in &walk.trees {
         let v = V { cx, walk, tree, features: &features };
-        for node in &tree.nodes {
+        for &node in &tree.nodes {
             v.visit(node, &mut out);
         }
     }
@@ -73,25 +72,27 @@ struct Out {
 impl Out {
     fn finish(mut self, cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Found> {
         if self.found.is_empty() {
+            // alloc: empty, allocates nothing
             return Vec::new();
         }
         self.found.sort_by_cached_key(|(at, pass, _)| walk.place(cx, *at, *pass));
+        // alloc: the errors, only when there are some
         self.found.into_iter().map(|(_, _, found)| found).collect()
     }
 }
 
 /// The validator at one tree of the walk.
-struct V<'v, 'a, 'db, 'w> {
+struct V<'v, 'a, 'db> {
     cx: &'v Cx<'a, 'db>,
-    walk: &'v Walk<'w>,
-    tree: &'v Tree,
+    walk: &'v Walk<'db>,
+    tree: &'v Tree<'db>,
     /// The crate's `#![feature]`s, read the first time a check asks.
     features: &'v OnceCell<Vec<String>>,
 }
 
-impl V<'_, '_, '_, '_> {
+impl<'db> V<'_, '_, 'db> {
     /// The checks rustc's validator makes as it comes to `node`, in its order.
-    fn visit(&self, node: &SyntaxNode, out: &mut Out) {
+    fn visit(&self, node: ast::Node<'db>, out: &mut Out) {
         match node.kind() {
             SyntaxKind::FN => items::fn_(self, node, out),
             SyntaxKind::IMPL => items::impl_(self, node, out),
@@ -123,21 +124,21 @@ impl V<'_, '_, '_, '_> {
     }
 
     /// Gives `diag`, found at `node`, as the walk comes to it.
-    fn emit(&self, out: &mut Out, node: &SyntaxNode, diag: Diag) {
+    fn emit(&self, out: &mut Out, node: ast::Node<'_>, diag: Diag) {
         self.push(out, node, diag, Phase::Validate, Pass::Early);
     }
 
     /// Gives `diag`, found at `node`, as the walk leaves it.
-    fn emit_after(&self, out: &mut Out, node: &SyntaxNode, diag: Diag) {
+    fn emit_after(&self, out: &mut Out, node: ast::Node<'_>, diag: Diag) {
         self.push(out, node, diag, Phase::Validate, Pass::Post);
     }
 
     /// Gives `diag`, an error rustc's parser gives of `node`.
-    fn emit_parse(&self, out: &mut Out, node: &SyntaxNode, diag: Diag) {
+    fn emit_parse(&self, out: &mut Out, node: ast::Node<'_>, diag: Diag) {
         self.push(out, node, diag, Phase::Parse, Pass::Early);
     }
 
-    fn push(&self, out: &mut Out, node: &SyntaxNode, mut diag: Diag, phase: Phase, pass: Pass) {
+    fn push(&self, out: &mut Out, node: ast::Node<'_>, mut diag: Diag, phase: Phase, pass: Pass) {
         let at = self.tree.ptr(node);
         source_fact(self.cx, &mut diag, at);
         out.found.push((at, pass, Found::new(diag, phase)));
@@ -156,6 +157,7 @@ impl V<'_, '_, '_, '_> {
     /// The crate's language and library features, as its `#![feature(..)]`s enable them.
     fn feature(&self, name: &str) -> bool {
         let features = self.features.get_or_init(|| {
+            // alloc: setup, the crate's `#![feature]`s, once per check when a check asks
             let mut features = Vec::new();
             for meta in crate::checks::crate_attrs(self.cx) {
                 let ast::Meta::TokenTreeMeta(meta) = meta else { continue };
@@ -166,6 +168,7 @@ impl V<'_, '_, '_, '_> {
                 let Some(tt) = meta.token_tree().filter(|_| is_feature) else { continue };
                 for token in tt.syntax().children_with_tokens().filter_map(NodeOrToken::into_token) {
                     if token.kind() == SyntaxKind::IDENT {
+                        // alloc: as above
                         features.push(unraw(token.text()).to_owned());
                     }
                 }
@@ -181,50 +184,50 @@ impl V<'_, '_, '_, '_> {
     }
 
     /// Whether `cfg` keeps `node` (a variant or a field of an item the walk came to).
-    fn kept(&self, node: &SyntaxNode) -> bool {
+    fn kept(&self, node: ast::Node<'_>) -> bool {
         !self.tree.skipped(node.text_range())
     }
 
     /// Where rustc's span of `node`'s attribute `name` is (`#[name]`, or the attribute in a
     /// `cfg_attr` that gives it), once `cfg_attr` is expanded.
-    fn attr(&self, node: &SyntaxNode, name: &str) -> Option<TextRange> {
-        let owner = ast::AnyHasAttrs::cast(node.clone())?;
+    fn attr(&self, node: ast::Node<'_>, name: &str) -> Option<TextRange> {
+        let owner = ast::AnyHasAttrs::cast(node)?;
         let cfg = self.walk.cfg;
-        hir_expand::attrs::expand_cfg_attr(ast::attrs_including_inner(&owner), || cfg, |meta, attr| {
-            if is_named(&meta, name) { ControlFlow::Break(attr_range(&meta, &attr)) } else { ControlFlow::Continue(()) }
+        hir_expand::attrs::expand_cfg_attr_view(ast::attrs_including_inner(&owner), || cfg, |meta, attr| {
+            if is_named(meta, name) { ControlFlow::Break(attr_range(meta, attr)) } else { ControlFlow::Continue(()) }
         })
     }
 
     /// Each attribute of `node` once `cfg_attr` is expanded, with the `#[..]` it is written in.
-    fn each_attr(&self, node: &SyntaxNode, mut f: impl FnMut(&ast::Meta, &ast::Attr)) {
-        let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { return };
+    fn each_attr<'t>(&self, node: ast::Node<'t>, mut f: impl FnMut(ast::Meta<'t>, ast::Attr<'t>)) {
+        let Some(owner) = ast::AnyHasAttrs::cast(node) else { return };
         let cfg = self.walk.cfg;
         let _: Option<()> =
-            hir_expand::attrs::expand_cfg_attr(ast::attrs_including_inner(&owner), || cfg, |meta, attr| {
-                f(&meta, &attr);
+            hir_expand::attrs::expand_cfg_attr_view(ast::attrs_including_inner(&owner), || cfg, |meta, attr| {
+                f(meta, attr);
                 ControlFlow::Continue(())
             });
     }
 
-    fn has_attr(&self, node: &SyntaxNode, name: &str) -> bool {
+    fn has_attr(&self, node: ast::Node<'_>, name: &str) -> bool {
         self.attr(node, name).is_some()
     }
 
     /// Where rustc's validator is at `node`: the trait, impl or `extern` block whose item it
     /// is, else free. An item of an expansion is where the macro call is.
-    fn ctxt(&self, node: &SyntaxNode) -> Ctxt {
+    fn ctxt(&self, node: ast::Node<'db>) -> Ctxt<'db> {
         self.ctxt_in(self.tree.file, node)
     }
 
     /// [`V::ctxt`] of `node` of `file`, a tree this one is expanded from.
-    fn ctxt_in(&self, file: HirFileId, node: &SyntaxNode) -> Ctxt {
-        let ancestors = Ancestors { db: self.cx.db, file, next: node.parent() };
+    fn ctxt_in(&self, file: HirFileId, node: ast::Node<'db>) -> Ctxt<'db> {
+        let ancestors = Ancestors { vsema: &self.cx.vsema, file, next: node.parent() };
         for at in ancestors {
             match at.value.kind() {
                 SyntaxKind::ASSOC_ITEM_LIST => {
                     let Some(parent) = at.value.parent() else { return Ctxt::Free };
-                    if let Some(it) = ast::Trait::cast(parent.clone()) {
-                        return Ctxt::Trait(at.with_value(it));
+                    if ast::Trait::can_cast(parent.kind()) {
+                        return ast::Trait::cast(parent).map_or(Ctxt::Free, |it| Ctxt::Trait(at.with_value(it)));
                     }
                     if let Some(it) = ast::Impl::cast(parent) {
                         return match it.trait_() {
@@ -250,33 +253,39 @@ impl V<'_, '_, '_, '_> {
     /// The nodes `node` is in, innermost first, through the macro calls of the expansions it
     /// is in: a function-like call's node, then what it is in; an attribute macro's or a
     /// derive's, what the item it replaces or is on is in.
-    fn ancestors(&self, node: &SyntaxNode) -> Ancestors<'_> {
-        Ancestors { db: self.cx.db, file: self.tree.file, next: node.parent() }
+    fn ancestors(&self, node: ast::Node<'db>) -> Ancestors<'_, 'db> {
+        Ancestors { vsema: &self.cx.vsema, file: self.tree.file, next: node.parent() }
     }
 }
 
 /// The nodes a node is in (see [`V::ancestors`]).
-struct Ancestors<'db> {
-    db: &'db Db,
+struct Ancestors<'s, 'db> {
+    vsema: &'s hir::view::Semantics<'db>,
     file: HirFileId,
-    next: Option<SyntaxNode>,
+    next: Option<ast::Node<'db>>,
 }
 
-impl Iterator for Ancestors<'_> {
-    type Item = InFile<SyntaxNode>;
+impl<'db> Iterator for Ancestors<'_, 'db> {
+    type Item = InFile<ast::Node<'db>>;
 
-    fn next(&mut self) -> Option<InFile<SyntaxNode>> {
+    fn next(&mut self) -> Option<InFile<ast::Node<'db>>> {
         loop {
             if let Some(node) = self.next.take() {
                 self.next = node.parent();
                 return Some(InFile::new(self.file, node));
             }
-            let call = self.file.macro_file()?;
-            let at = call.loc(self.db).to_node(self.db);
+            self.file.macro_file()?;
+            // The call's tree is given out by `vsema`, so a check may ask it of the call.
+            let at = self.vsema.find_parent_file(self.file)?;
             self.file = at.file_id;
-            self.next = match at.value.kind() {
+            let kind = at.value.kind();
+            self.next = match kind {
                 SyntaxKind::MACRO_CALL => Some(at.value),
-                SyntaxKind::ATTR => at.value.parent().and_then(|it| it.parent()),
+                // A derive's call is its meta, in the `#[..]` on the item.
+                _ if kind == SyntaxKind::ATTR || ast::Meta::can_cast(kind) => (at.value.ancestors())
+                    .find(|it| it.kind() == SyntaxKind::ATTR)
+                    .and_then(|it| it.parent())
+                    .and_then(|it| it.parent()),
                 _ => at.value.parent(),
             };
         }
@@ -285,20 +294,21 @@ impl Iterator for Ancestors<'_> {
 
 /// What rustc's validator knows of the item it is at (`outer_trait_or_trait_impl`,
 /// `extern_mod_span`): the trait, impl or `extern` block it is in.
-enum Ctxt {
+#[derive(Clone, Copy)]
+enum Ctxt<'db> {
     Free,
-    Foreign(InFile<ast::ExternBlock>),
-    Trait(InFile<ast::Trait>),
-    TraitImpl(InFile<ast::Impl>),
-    Impl(InFile<ast::Impl>),
+    Foreign(InFile<ast::ExternBlock<'db>>),
+    Trait(InFile<ast::Trait<'db>>),
+    TraitImpl(InFile<ast::Impl<'db>>),
+    Impl(InFile<ast::Impl<'db>>),
 }
 
-impl Ctxt {
+impl<'db> Ctxt<'db> {
     /// `TraitOrImpl::constness`: the `const` of the trait or impl it is in.
-    fn constness(&self) -> Option<InFile<SyntaxToken>> {
-        match self {
-            Ctxt::Trait(it) => it.as_ref().map(|it| const_token(it.syntax())).transpose(),
-            Ctxt::TraitImpl(it) | Ctxt::Impl(it) => it.as_ref().map(|it| it.const_token()).transpose(),
+    fn constness(&self) -> Option<InFile<ast::Token<'db>>> {
+        match *self {
+            Ctxt::Trait(it) => it.map(|it| const_token(it.syntax())).transpose(),
+            Ctxt::TraitImpl(it) | Ctxt::Impl(it) => it.map(|it| it.const_token()).transpose(),
             Ctxt::Free | Ctxt::Foreign(_) => None,
         }
     }
@@ -309,7 +319,7 @@ impl Ctxt {
 }
 
 /// An item's `const` before its keyword (`const trait`, `const impl`).
-fn const_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+fn const_token(node: ast::Node<'_>) -> Option<ast::Token<'_>> {
     node.children_with_tokens()
         .filter_map(NodeOrToken::into_token)
         .take_while(|it| !matches!(it.kind(), SyntaxKind::TRAIT_KW | SyntaxKind::IMPL_KW))
@@ -317,18 +327,18 @@ fn const_token(node: &SyntaxNode) -> Option<SyntaxToken> {
 }
 
 /// Whether `meta`'s path is the one segment `name`.
-fn is_named(meta: &ast::Meta, name: &str) -> bool {
+fn is_named(meta: ast::Meta<'_>, name: &str) -> bool {
     !matches!(meta, ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_))
         && meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == name)
 }
 
 /// rustc's `attr_span` of `meta`, written in `attr`: the whole `#[..]`, or for one a
 /// `cfg_attr` gives, the attribute in it (with its `unsafe(..)`).
-fn attr_range(meta: &ast::Meta, attr: &ast::Attr) -> TextRange {
+fn attr_range(meta: ast::Meta<'_>, attr: ast::Attr<'_>) -> TextRange {
     let inner = meta.syntax().parent().filter(|it| it.kind() == SyntaxKind::UNSAFE_META);
-    let inner = inner.as_ref().unwrap_or(meta.syntax());
+    let inner = inner.unwrap_or(meta.syntax());
     match inner.parent() {
-        Some(parent) if &parent == attr.syntax() => attr.syntax().text_range(),
+        Some(parent) if parent == attr.syntax() => attr.syntax().text_range(),
         _ => inner.text_range(),
     }
 }
@@ -339,27 +349,14 @@ fn unraw(text: &str) -> &str {
 }
 
 /// The text of `range` of the tree `node` is in (`range` within `node`).
-fn text_of(node: &SyntaxNode, range: TextRange) -> String {
-    let text = node.to_string();
+fn text_of<'t>(node: ast::Node<'t>, range: TextRange) -> &'t str {
     let base = node.text_range().start();
-    text[usize::from(range.start() - base)..usize::from(range.end() - base)].to_owned()
-}
-
-/// rustc's `guess_head_span` of an item's span (`item_range`): up to its first `{`, the white
-/// space before it trimmed, when that is not empty and is on one line; else the whole span.
-fn head_range(node: &SyntaxNode) -> TextRange {
-    let range = item_range(node);
-    let text = text_of(node, range);
-    let head = text.split('{').next().unwrap_or("").trim_end();
-    if head.is_empty() || head.contains('\n') {
-        return range;
-    }
-    TextRange::at(range.start(), TextSize::of(head))
+    &node.text()[usize::from(range.start() - base)..usize::from(range.end() - base)]
 }
 
 /// rustc's `ending_semi_or_hi` of an item's span: its last character when that is `;`, else
 /// its end.
-fn ending_semi_or_hi(node: &SyntaxNode) -> TextRange {
+fn ending_semi_or_hi(node: ast::Node<'_>) -> TextRange {
     let range = item_range(node);
     let last = node.last_token().filter(|it| it.kind() == SyntaxKind::SEMICOLON);
     match last {
@@ -369,7 +366,7 @@ fn ending_semi_or_hi(node: &SyntaxNode) -> TextRange {
 }
 
 /// rustc's `span_extend_while_whitespace` of a token: it and the white space after it.
-fn extend_while_whitespace(token: &SyntaxToken) -> TextRange {
+fn extend_while_whitespace(token: ast::Token<'_>) -> TextRange {
     let range = token.text_range();
     match token.next_token() {
         Some(next) if next.kind() == SyntaxKind::WHITESPACE => range.cover(next.text_range()),
@@ -379,7 +376,7 @@ fn extend_while_whitespace(token: &SyntaxToken) -> TextRange {
 
 /// rustc's `span_until_non_whitespace` of the span from `token` to `end`: `token` and the
 /// white space after it.
-fn until_non_whitespace(token: &SyntaxToken, end: TextSize) -> TextRange {
+fn until_non_whitespace(token: ast::Token<'_>, end: TextSize) -> TextRange {
     let range = extend_while_whitespace(token);
     TextRange::new(range.start(), range.end().min(end.max(range.start())))
 }
@@ -389,9 +386,12 @@ fn until_non_whitespace(token: &SyntaxToken, end: TextSize) -> TextRange {
 fn feature_err(feature: &str, message: impl Into<String>, span: Span) -> Diag {
     let mut diag = Diag::error(Some("E0658"), message, span);
     if let Some(issue) = crate::lints::syntax::attrs::features::table::issue(feature) {
+        // alloc: the error's note
         diag.note(format!("see issue #{issue} <https://github.com/rust-lang/rust/issues/{issue}> for more information"));
     }
+    // alloc: the error's help
     diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));
+    // alloc: the error's note
     diag.note(format!("this compiler was built on {BUILT_ON}; consider upgrading it if it is out of date"));
     diag
 }

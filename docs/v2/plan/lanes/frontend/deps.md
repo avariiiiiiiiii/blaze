@@ -68,9 +68,27 @@ it once it runs.
   variables, `ImageStore::reads_now` for each shape with the crate's variables), then gets the
   image they name. A value that changed is a miss (`Served::stale`); the crate is resolved and
   imaged again under the same slot, never served from an older image.
+- **Bodies are filed by their own reads** (`deps/filed.rs`). `Reads::of` walks the macro
+  calls of module scopes and signatures, never those inside bodies, because the image holds no
+  body. A value made from bodies is filed as an image is, through three functions:
+  - `checked_reads(db, krate)` gives the reads of every body's macro calls, and of the
+    signatures and bodies of the items in their blocks, after the check. For a crate read from
+    an image it leaves out the module and signature calls: the image's key covers those, and
+    asking for them would expand what serving skips. So such a value's key must cover the image.
+  - `file_by_reads` keeps those reads in a slot of the value's key and gives the key the value
+    goes under.
+  - `find_by_reads` asks the key, then each slot with its reads' values now.
+
+  `serve` and `store` go through the same `search` and `file_by_reads`. The users are check
+  outcomes (`blaze_diagnostics::cache`, `hir_ty::check_cache`, by `Stored::filed` or
+  `Image::key`). Constant values (`hir_ty::consteval::deps`, by `deps::const_key`) still have
+  to add their bodies' reads.
 - **What the key and reads do not cover is refused** (`deps::store`, `Refused`):
   - an expansion whose reads are not known (`ExpansionReads::Unknown`: untraced, it asked the
-    database, it read the clock, or its macro keeps a session);
+    database, it read the clock, or its macro keeps a session). A wasm proc macro reports
+    nothing, so it is always unknown: its expansion is keyed by the database's answers to its
+    span questions, which `reads_now` can't work out again. Native proc macros, the default,
+    are covered;
   - two expansions that read the same names and found other values;
   - a def map that uses the session's macros;
   - a module file or `include!` outside the crate's source root;
@@ -85,27 +103,43 @@ it once it runs.
 - **Serve** (`deps/serve.rs`). `deps::serve(db, crates, build, store, mode)` keys the crates,
   reads each image the store has, checks the def map part names only files the crate has
   (`frozen::unreadable`), and gives the database the def maps and lang items
-  (`frozen::set`, `set_lang_items`) and the images (`DepImages`, which signatures read through
-  `deps::image` and `deps::mode`). An image that does not read under its own key is an error
-  naming the crate: never a crate resolved instead.
+  (`frozen::set`, `set_lang_items`) and the images (`DepImages`, read a crate at a time
+  through the tracked `deps::image_of`). An image that does not read under its own key is an
+  error naming the crate: never a crate resolved instead. `serve` adds to what earlier calls
+  served, so the daemon serves crates as their build scripts finish:
+  - a crate served before under the same key and mode is kept and not fetched again;
+  - one whose key changed is fetched again, and loses its image when none is found.
 - **Store.** `deps::store(db, served, store)` writes the image of each eligible crate not
   served, after the refusals; a store that keeps other bytes under the key is an error.
 - **In place.** `ImageStore::get` returns an `ImageBuf` (`Arc<dyn Held>`, where `Held` lends
   the bytes). The driver gives `blaze_cas::Reader::pinned`, a verified range of the store's
-  mapping at a 16-byte boundary, so an image is never copied; parts (`PartBytes::In`) and
-  signature stores borrow it.
+  mapping at a 16-byte boundary, so an image is never copied. Its parts (`PartBytes::In`)
+  borrow it: the frozen def maps and lang items (`Frozen.bytes`), and signature stores
+  (`ExpressionStoreRef::decode_in`, whose columns are `Col::borrowed`).
 - **Global cache.** `ReadThrough { local, global }` is an `ImageStore` that asks the local
   store, then the global one, and keeps what the global one gave locally. Puts and `reads_now`
   go to the local store. Portable keys are what make a global image usable.
 - **Modes.** `Mode::Serve` reads the image; `Mode::Check` resolves as well and records each
   difference; `Mode::Verify` re-encodes what was read and records a difference from the bytes.
 
+- **Portable ids for other parts.** `deps::{PortableIds, PortableId, IdKind, body_key,
+  BODY_KEY_DOMAIN}` (`deps/signatures/ids.rs`) let another part of an image
+  (`hir_ty::check_cache`) name a crate's items through the signatures part's table and file a
+  body under its item's key.
+
 ## Item 14: per-item reparse and lowering (lane `frontend-deps-reparse`)
 
-The parse query keeps the previous tree and the edit and reparses with `Reparser`; item trees
-are built per item and assembled byte-equal to a whole-file lowering, so an edit inside one
-item reruns only that item's lowering. Its notes and tests are in its report
-(`/tmp/blaze-lanes/v2-frontend-deps-reparse.md`); its hooks into `base-db` go to db.
+Item 14 has two parts:
+- **The parse** is db's D8: `base-db/src/reparse.rs` keeps each file's last parse and
+  reparses it with `syntax::Parse::reparse_onto`, checked against a whole parse in debug
+  builds.
+- **Lowering**: `hir-def/src/item_tree/items.rs` keeps each file's last tree and re-lowers
+  only the items an edit touched, assembled byte-equal to a whole-file lowering.
+
+frontend-deps-reparse's own parse cache, `syntax::SourceFile::parse_file` over a 128-slot
+table (`syntax/src/parsing/kept.rs`), had no caller once db applied D8 instead. It and its
+tests were deleted on 2026-10-29. `Parse::reparse_onto` and `Parse::reparse_to`, with their
+tests, stay in `crates/syntax`. Notes: [reparse.md](reparse.md).
 
 ## Tests and what each proves
 
@@ -149,18 +183,16 @@ In `crates/hir-def/src/deps/tests.rs`:
 
 ## Left, with who
 
-- db: the signature hooks `frontend-deps-sigs` sent (notes: [signatures.md](signatures.md)); and
-  `parse_file` in `EditionedFileId::parse` from `frontend-deps-reparse` (notes:
-  [reparse.md](reparse.md)).
+- db: the signature hooks `frontend-deps-sigs` sent (notes: [signatures.md](signatures.md)).
 - cargo-daemon: the `ImageStore` adapter over `blaze-cas`, `serve` once inputs are final,
   `store` after the build, a daily `Mode::Check` run (`v2/requests/cargo.md`).
 - db-expand (`v2/requests/db-expand.md`): `ProcMacroExpander::code`, `ExpansionReads`,
   `report_reads`, and `proc_macro_expansion` with `MacroCallId::expansion_reads`. `deps/key.rs`
   and `deps/reads.rs` compile once they land.
-- usercode (`v2/requests/usercode.md`): `Kept::code`, `report_reads` on every path of
-  `Kept::kept`, `index::values`, `Found::Hit`'s shape, and `blaze_expand::reads_now`.
-- db (`v2/requests/db.md`): `ExpressionStoreRef::decode_in` over an `ImageBuf`, which
-  `deps/signatures.rs` already calls (forwarded from speed-hir-store, which is done).
+- usercode (`v2/requests/usercode.md`): applied (`Kept::code`, `report_reads`,
+  `index::find_reads`, `blaze_expand::reads_now`). It builds once db-expand's half lands.
+  `ExpressionStoreRef::decode_in` (mem-format-hir-apply) and `Frozen.bytes: PartBytes`
+  (db-expand-names) have landed, and neither is built yet.
 - cargo (`v2/requests/cargo.md`, amended): the adapter over `Reader::pinned`, `reads_now`, and
   `ReadThrough` once the global adapter exists.
 - fastcompile (`v2/requests/fastcompile.md`): a public proof for dependency-image keys and an

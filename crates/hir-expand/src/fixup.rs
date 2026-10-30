@@ -1,8 +1,9 @@
 //! To make attribute macros work reliably when typing, we need to take care to
 //! fix up syntax errors in the code we're passing to them.
 
+use blaze_mem::Frame;
 use intern::sym;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxBuildHasher;
 use span::{
     ErasedFileAstId, FIXUP_ERASED_FILE_AST_ID_MARKER, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor,
     SyntaxContext,
@@ -16,7 +17,8 @@ use syntax::{
         self, AstNode as _, HasLoopBody as _, NodeId,
     },
 };
-use syntax_bridge::DocCommentDesugarMode;
+use smallvec::smallvec;
+use syntax_bridge::{Appended, DocCommentDesugarMode, Removed};
 use thin_vec::ThinVec;
 use tt::{Spacing, TransformTtAction, transform_tt};
 
@@ -31,19 +33,19 @@ use crate::{
 ///
 /// `K` names an element: a view's [`NodeId`] for a build's input, a handle for the
 /// speculative input of an edited tree ([`fixup_syntax_handle`]).
-#[derive(Debug)]
-pub(crate) struct SyntaxFixups<K = NodeId> {
-    pub(crate) append: FxHashMap<K, Vec<Leaf>>,
-    pub(crate) remove: FxHashSet<K>,
+pub(crate) struct SyntaxFixups<'f, K = NodeId> {
+    pub(crate) append: Appended<K, &'f Frame>,
+    pub(crate) remove: Removed<K, &'f Frame>,
     pub(crate) undo_info: SyntaxFixupUndoInfo,
 }
 
-impl<K> Default for SyntaxFixups<K> {
-    fn default() -> Self {
+impl<'f, K> SyntaxFixups<'f, K> {
+    /// No fixups, their maps in `frame`.
+    pub(crate) fn new_in(frame: &'f Frame) -> Self {
         SyntaxFixups {
-            append: FxHashMap::default(),
-            remove: FxHashSet::default(),
-            undo_info: SyntaxFixupUndoInfo::default(),
+            append: Appended::with_hasher_in(FxBuildHasher, frame),
+            remove: Removed::with_hasher_in(FxBuildHasher, frame),
+            undo_info: SyntaxFixupUndoInfo::NONE,
         }
     }
 }
@@ -71,12 +73,13 @@ const FIXUP_DUMMY_RANGE_END: TextSize = TextSize::new(!0);
 macro_rules! fixup_syntax_impl {
     ($name:ident, $Node:ty, $Owned:ty, $Key:ty, $ast:ident, $key:ident, $to_tt:path) => {
         #[allow(clippy::clone_on_copy, reason = "a view is `Copy`, a handle is not: one body for both")]
-        pub(crate) fn $name(
+        pub(crate) fn $name<'f>(
+            frame: &'f Frame,
             span_map: SpanMap<'_>,
             node: $Node,
             call_site: Span,
             mode: DocCommentDesugarMode,
-        ) -> SyntaxFixups<$Key> {
+        ) -> SyntaxFixups<'f, $Key> {
             fn has_error(node: &$Owned) -> bool {
                 node.children().any(|c| c.kind() == SyntaxKind::ERROR)
             }
@@ -89,10 +92,9 @@ macro_rules! fixup_syntax_impl {
                 has_error(node) || node.children().any(|c| !can_handle_error(&c) && has_error_to_handle(&c))
             }
 
-            let mut append = FxHashMap::<$Key, _>::default();
-            let mut remove = FxHashSet::<$Key>::default();
+            let SyntaxFixups { mut append, mut remove, .. } = SyntaxFixups::<$Key>::new_in(frame);
             let mut preorder = node.preorder();
-            let mut original = ThinVec::new();
+            let mut original: Vec<TopSubtree, &Frame> = Vec::new_in(frame);
             let dummy_range = FIXUP_DUMMY_RANGE;
             let fake_span = |range| {
                 let span = span_map.span_for_range(range);
@@ -125,7 +127,7 @@ macro_rules! fixup_syntax_impl {
                         is_raw: tt::IdentIsRaw::No,
                     });
                     // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                    append.insert($key!(node.clone()), vec![replacement]);
+                    append.insert($key!(node.clone()), smallvec![replacement]);
                     preorder.skip_subtree();
                     continue;
                 }
@@ -136,7 +138,7 @@ macro_rules! fixup_syntax_impl {
                             if it.name_ref().is_none() {
                                 // incomplete field access: some_expr.|
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node.clone()), vec![
+                                append.insert($key!(node.clone()), smallvec![
                                     Leaf::Ident(Ident {
                                         sym: sym::__ra_fixup,
                                         span: fake_span(node_range),
@@ -149,7 +151,7 @@ macro_rules! fixup_syntax_impl {
                             let needs_semi = it.semicolon_token().is_none() && it.expr().is_some_and(|e| e.syntax().kind() != SyntaxKind::BLOCK_EXPR);
                             if needs_semi {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node.clone()), vec![
+                                append.insert($key!(node.clone()), smallvec![
                                     Leaf::Punct(Punct {
                                         char: ';',
                                         spacing: Spacing::Alone,
@@ -161,7 +163,7 @@ macro_rules! fixup_syntax_impl {
                         $ast::LetStmt(it) => {
                             if it.semicolon_token().is_none() {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node.clone()), vec![
+                                append.insert($key!(node.clone()), smallvec![
                                     Leaf::Punct(Punct {
                                         char: ';',
                                         spacing: Spacing::Alone,
@@ -178,7 +180,7 @@ macro_rules! fixup_syntax_impl {
                                     None => continue,
                                 };
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(if_token), vec![
+                                append.insert($key!(if_token), smallvec![
                                     Leaf::Ident(Ident {
                                         sym: sym::__ra_fixup,
                                         span: fake_span(node_range),
@@ -188,7 +190,7 @@ macro_rules! fixup_syntax_impl {
                             }
                             if it.then_branch().is_none() {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node.clone()), vec![
+                                append.insert($key!(node.clone()), smallvec![
                                     Leaf::Punct(Punct {
                                         char: '{',
                                         spacing: Spacing::Alone,
@@ -210,7 +212,7 @@ macro_rules! fixup_syntax_impl {
                                     None => continue,
                                 };
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(while_token), vec![
+                                append.insert($key!(while_token), smallvec![
                                     Leaf::Ident(Ident {
                                         sym: sym::__ra_fixup,
                                         span: fake_span(node_range),
@@ -220,7 +222,7 @@ macro_rules! fixup_syntax_impl {
                             }
                             if it.loop_body().is_none() {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node.clone()), vec![
+                                append.insert($key!(node.clone()), smallvec![
                                     Leaf::Punct(Punct {
                                         char: '{',
                                         spacing: Spacing::Alone,
@@ -237,7 +239,7 @@ macro_rules! fixup_syntax_impl {
                         $ast::LoopExpr(it) => {
                             if it.loop_body().is_none() {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node.clone()), vec![
+                                append.insert($key!(node.clone()), smallvec![
                                     Leaf::Punct(Punct {
                                         char: '{',
                                         spacing: Spacing::Alone,
@@ -258,7 +260,7 @@ macro_rules! fixup_syntax_impl {
                                     None => continue
                                 };
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(match_token), vec![
+                                append.insert($key!(match_token), smallvec![
                                     Leaf::Ident(Ident {
                                         sym: sym::__ra_fixup,
                                         span: fake_span(node_range),
@@ -269,7 +271,7 @@ macro_rules! fixup_syntax_impl {
                             if it.match_arm_list().is_none() {
                                 // No match arms
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node.clone()), vec![
+                                append.insert($key!(node.clone()), smallvec![
                                     Leaf::Punct(Punct {
                                         char: '{',
                                         spacing: Spacing::Alone,
@@ -303,16 +305,16 @@ macro_rules! fixup_syntax_impl {
 
                             if it.pat().is_none() && it.in_token().is_none() && it.iterable().is_none() {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(for_token), vec![pat, in_token, iter]);
+                                append.insert($key!(for_token), smallvec![pat, in_token, iter]);
                             // does something funky -- see test case for_no_pat
                             } else if it.pat().is_none() {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(for_token), vec![pat]);
+                                append.insert($key!(for_token), smallvec![pat]);
                             }
 
                             if it.loop_body().is_none() {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node.clone()), vec![
+                                append.insert($key!(node.clone()), smallvec![
                                     Leaf::Punct(Punct {
                                         char: '{',
                                         spacing: Spacing::Alone,
@@ -330,7 +332,7 @@ macro_rules! fixup_syntax_impl {
                             if let Some(colon) = it.colon_token()
                                 && it.name_ref().is_some() && it.expr().is_none() {
                                     // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                    append.insert($key!(colon), vec![
+                                    append.insert($key!(colon), smallvec![
                                         Leaf::Ident(Ident {
                                             sym: sym::__ra_fixup,
                                             span: fake_span(node_range),
@@ -343,7 +345,7 @@ macro_rules! fixup_syntax_impl {
                             if let Some(colon) = it.coloncolon_token()
                                 && it.segment().is_none() {
                                     // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                    append.insert($key!(colon), vec![
+                                    append.insert($key!(colon), smallvec![
                                         Leaf::Ident(Ident {
                                             sym: sym::__ra_fixup,
                                             span: fake_span(node_range),
@@ -355,7 +357,7 @@ macro_rules! fixup_syntax_impl {
                         $ast::ClosureExpr(it) => {
                             if it.body().is_none() {
                                 // alloc: clone: error path: fixups run only where a syntax error touches the input (`has_syntax_error_in`)
-                                append.insert($key!(node), vec![
+                                append.insert($key!(node), smallvec![
                                     Leaf::Ident(Ident {
                                         sym: sym::__ra_fixup,
                                         span: fake_span(node_range),
@@ -368,13 +370,13 @@ macro_rules! fixup_syntax_impl {
                     }
                 }
             }
-            original.shrink_to_fit();
             let needs_fixups = !append.is_empty() || !original.is_empty();
-            SyntaxFixups {
-                append,
-                remove,
-                undo_info: SyntaxFixupUndoInfo { original: needs_fixups.then_some(original) },
-            }
+            let original = needs_fixups.then(|| {
+                let mut owned = ThinVec::with_capacity(original.len());
+                owned.extend(original.drain(..));
+                owned
+            });
+            SyntaxFixups { append, remove, undo_info: SyntaxFixupUndoInfo { original } }
         }
     };
 }
@@ -420,7 +422,10 @@ fixup_syntax_impl!(
     handle_tree
 );
 
-pub(crate) fn reverse_fixups(tt: &mut TopSubtree, undo_info: &SyntaxFixupUndoInfo) {
+pub(crate) fn reverse_fixups<A: core::alloc::Allocator + Clone>(
+    tt: &mut TopSubtree<A>,
+    undo_info: &SyntaxFixupUndoInfo,
+) {
     let Some(undo_info) = &undo_info.original else { return };
     let undo_info = &**undo_info;
     let top_subtree = tt.top_subtree();
@@ -443,7 +448,31 @@ pub(crate) fn reverse_fixups(tt: &mut TopSubtree, undo_info: &SyntaxFixupUndoInf
     reverse_fixups_(tt, undo_info);
 }
 
-fn reverse_fixups_(tt: &mut TopSubtree, undo_info: &[TopSubtree]) {
+/// [`reverse_fixups`] of an expansion: a borrowed tree is copied into `frame` first, only when
+/// there are fixups to undo.
+pub(crate) fn reverse_fixups_expansion<'f>(
+    frame: &'f Frame,
+    tt: &mut crate::Expansion<'_, 'f>,
+    undo_info: &SyntaxFixupUndoInfo,
+) {
+    if undo_info.original.is_none() {
+        return;
+    }
+    match tt {
+        crate::Expansion::Borrowed(it) => {
+            let mut copy = TopSubtree::from_subtree_in(it.view(), frame);
+            reverse_fixups(&mut copy, undo_info);
+            *tt = crate::Expansion::Framed(copy);
+        }
+        crate::Expansion::Owned(it) => reverse_fixups(it, undo_info),
+        crate::Expansion::Framed(it) => reverse_fixups(it, undo_info),
+    }
+}
+
+fn reverse_fixups_<A: core::alloc::Allocator + Clone>(
+    tt: &mut TopSubtree<A>,
+    undo_info: &[TopSubtree],
+) {
     transform_tt(tt, |tt| match tt {
         tt::TokenTree::Leaf(leaf) => {
             let span = leaf.span();
@@ -526,8 +555,14 @@ mod tests {
             Edition::CURRENT,
         )));
         let call_site = span_map.span_for_range(TextRange::empty(0.into()));
-        let fixups =
-            super::fixup_syntax(span_map, parsed.root(), call_site, DocCommentDesugarMode::Mbe);
+        let frame = &blaze_mem::Frame::new(blaze_mem::Tag::Expand).expect("a test's frame");
+        let fixups = super::fixup_syntax(
+            frame,
+            span_map,
+            parsed.root(),
+            call_site,
+            DocCommentDesugarMode::Mbe,
+        );
         let undo_info = fixups.undo_info;
         let mut tt = syntax_bridge::call_input_modified(
             parsed.root(),
@@ -536,11 +571,12 @@ mod tests {
             fixups.remove,
             call_site,
             DocCommentDesugarMode::Mbe,
-            |_, _| (true, Vec::new()),
+            |_, _| (true, syntax_bridge::Inserted::new()),
         );
 
         // The speculative input's handle version makes the same tree.
         let handle_fixups = super::fixup_syntax_handle(
+            frame,
             span_map,
             &parsed.syntax_node(),
             call_site,
@@ -554,7 +590,7 @@ mod tests {
             handle_fixups.remove,
             call_site,
             DocCommentDesugarMode::Mbe,
-            |_, _| (true, Vec::new()),
+            |_, _| (true, syntax_bridge::Inserted::new()),
         );
         assert_eq!(handle_tt, tt, "the view's and the handle's fixups differ");
 
@@ -565,7 +601,7 @@ mod tests {
 
         // the fixed-up tree should be syntactically valid
         let (parse, _) = syntax_bridge::token_tree_to_syntax_node(
-            &tt,
+            tt.view(),
             syntax_bridge::TopEntryPoint::MacroItems,
             &mut |_| parser::Edition::CURRENT,
         );
@@ -614,7 +650,9 @@ mod tests {
             Edition::CURRENT,
         )));
         let call_site = span_map.span_for_range(TextRange::empty(0.into()));
+        let frame = &blaze_mem::Frame::new(blaze_mem::Tag::Expand).expect("a test's frame");
         let fixups = super::fixup_syntax(
+            frame,
             span_map,
             parsed.root(),
             call_site,
@@ -622,6 +660,7 @@ mod tests {
         );
         assert!(!fixups.append.is_empty());
         let fixups = super::fixup_syntax_handle(
+            frame,
             span_map,
             &parsed.syntax_node(),
             call_site,

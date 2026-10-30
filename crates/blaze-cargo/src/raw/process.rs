@@ -131,16 +131,15 @@ pub fn withhold_inheritance() -> Withheld {
     let mut withheld = Vec::new();
     for handle in HANDLES.step_by(4).map(|it| it as HANDLE) {
         let mut flags = 0;
-        // SAFETY: a number that is no open handle is refused, so any number may be asked
-        // about, and `flags` is a live `u32`, all the call writes.
-        if unsafe { GetHandleInformation(handle, &raw mut flags) } == 0
-            || flags & HANDLE_FLAG_INHERIT == 0
-        {
-            continue;
-        }
-        // SAFETY: `handle` is open: it was just asked about. Its inheritance is no memory of
-        // this process's, so changing it can break nothing but what a child inherits.
-        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0 {
+        // SAFETY: `GetHandleInformation` checks `handle` and fails on a number that is no open
+        // handle, and `flags` is a `u32` it only writes; no Rust memory rests on the handle.
+        let held = unsafe { GetHandleInformation(handle, &mut flags) } != 0
+            && flags & HANDLE_FLAG_INHERIT != 0
+            // SAFETY: `handle` was just found open and inheritable; clearing the flag touches no
+            // memory, and `Withheld`'s drop sets it again. A number closed and reused meanwhile
+            // only has that handle's inheritance changed.
+            && unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } != 0;
+        if held {
             withheld.push(handle);
         }
     }

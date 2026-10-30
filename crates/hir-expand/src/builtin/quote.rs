@@ -132,6 +132,25 @@ macro_rules! quote {
 }
 pub use quote;
 
+/// [`quote!`], the tree built in `frame`: an expansion, which its query parses and drops.
+#[macro_export]
+macro_rules! quote_in {
+    ($frame:expr, $span:ident=> $($tt:tt)* ) => {
+        {
+            let mut builder = $crate::tt::TopSubtreeBuilder::new($crate::tt::Delimiter {
+                kind: $crate::tt::DelimiterKind::Invisible,
+                open: $span,
+                close: $span,
+            });
+            #[allow(unused)]
+            let builder_ref = &mut builder;
+            $crate::builtin::quote::__quote!($span builder_ref $($tt)*);
+            builder.build_skip_top_subtree_in($frame)
+        }
+    }
+}
+pub use quote_in;
+
 /// [`quote!`] written into a builder of the caller's (an expression of type
 /// `&mut TopSubtreeBuilder`), with no top subtree of its own: one buffer for a whole expansion.
 #[macro_export]
@@ -212,7 +231,7 @@ impl ToTokenTree for crate::tt::SubtreeView<'_> {
     }
 }
 
-impl ToTokenTree for &crate::tt::TopSubtree {
+impl<A: core::alloc::Allocator> ToTokenTree for &crate::tt::TopSubtree<A> {
     fn to_tokens(self, _: Span, builder: &mut TopSubtreeBuilder) {
         builder.extend_with_tt(self.as_token_trees());
     }

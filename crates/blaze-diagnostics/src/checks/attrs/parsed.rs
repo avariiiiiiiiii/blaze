@@ -28,7 +28,7 @@ pub(crate) enum Parsed {
     /// The hints of one `#[repr(..)]`, each with its range.
     Repr(Vec<(Repr, TextRange)>),
     /// `#[lang = "name"]`.
-    Lang(String),
+    Lang(&'static str),
     /// `#[linkage = ".."]`, a linkage rustc knows.
     Linkage(String),
     /// `#[export_name = ".."]`, a name rustc takes.
@@ -85,7 +85,7 @@ pub(crate) enum Optimize {
 /// rustc's `ReprAttr`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Repr {
-    Int(String),
+    Int(&'static str),
     Rust,
     C,
     Packed(u64),

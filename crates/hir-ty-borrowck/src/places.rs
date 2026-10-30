@@ -68,11 +68,6 @@ impl<'f, 'db> Places<'f, 'db> {
         at
     }
 
-    /// The place one element below `place`, if it has been made.
-    pub(crate) fn step(&self, place: PlaceId, elem: &PlaceElem) -> Option<PlaceId> {
-        self.steps.get(&(place, *elem)).copied()
-    }
-
     pub(crate) fn ty(&self, place: PlaceId) -> PlaceTy<'db> {
         self.ty[place as usize]
     }

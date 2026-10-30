@@ -142,14 +142,14 @@ exactly the counts the miss tests hold.
 
 **Signatures.** A signature's lowering is bounded by its syntax walk. The frame removes the
 per-node allocator calls (fields, variants, body cuts). The remaining cost is the
-`ExpressionStore` and `GenericParams`, which are format's (`ExprCollector`'s frame, request I0
-to mem-format-hir).
+`ExpressionStore` and `GenericParams`, which are format's. `ExprCollector` keeps its
+temporaries on hir-def's pooled thread-local scratch, at 0 allocations warm, so the nine
+signature queries open no frame of their own (I0 and I1.6 withdrawn).
 
 ## Left to others
 
-- **Request I0, to mem-format-hir.** The lowering entry points in `expr_store/lower.rs` take
-  the run's frame. Until that lands, I1.6 waits and I1.1 to I1.4 stand alone.
-- **To mem-db-def-hir.** The `hir` wrapper (`query_external_importables`) can keep a per-worker
-  set and call `search_dependencies_into`.
+- **To mem-db-def-hir.** The `hir` wrapper (`query_external_importables`) calls
+  `search_dependencies_each` and dedups with a per-worker seen-set, so the order is the order
+  found.
 - **To mem-db-def-resolve.** The `Resolver` that `upvars`' visitor walks with is
   mem-db-def-resolve's.

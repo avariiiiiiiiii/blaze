@@ -242,7 +242,7 @@ impl Target {
         }
     }
 
-    fn parse(triple: &str) -> Result<Target, String> {
+    pub(crate) fn parse(triple: &str) -> Result<Target, String> {
         let mut parts = triple.split('-');
         let arch = match parts.next() {
             Some("x86_64") => Arch::X86_64,

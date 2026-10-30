@@ -52,9 +52,11 @@ use rustc_type_ir::{
     AliasTy, AliasTyKind, ClosureKind as FnKind,
     inherent::{GenericArgs as _, IntoKind as _},
 };
+use smallvec::SmallVec;
+use std::rc::Rc;
 use syntax::SyntaxNodePtr;
 
-use self::flow::{Access, CaptureKind, Cfg, DeadCaptures, Flow, Index, Kind, Loc, PlaceSet, Places, Special};
+use self::flow::{Access, CaptureKind, Cfg, DeadCaptures, Flow, Index, Kind, Loc, PlaceSet, Places, Special, Tables};
 use self::source::{Decl, Source, Var};
 use super::BodyCx;
 use crate::{
@@ -65,22 +67,41 @@ use crate::{
 /// The lints this module gives: it runs only when one may fire.
 pub(super) const LINTS: super::LintSet = super::lint_set(["unused_variables", "unused_assignments"]);
 
-pub(super) fn lints(b: &BodyCx<'_, '_>) -> Vec<Found> {
+pub(super) fn lints<'db>(b: &BodyCx<'_, 'db>, pool: &mut Pool<'db>) -> Vec<Found> {
     if b.mir_tainted() || source::skipped(b) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
+    // alloc: empty, allocates nothing
     let Some(mir) = b.mir() else { return Vec::new() };
     if is_naked(mir) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
-    let mut liveness = Liveness::new(b);
+    let mut liveness = Liveness::new(b, std::mem::take(pool));
     liveness.body(mir, None);
-    for &expr in b.exprs() {
-        if let Expr::Closure { .. } = b.store().expr(expr) {
-            liveness.dead_captures(b.infer.expr_ty(expr));
+    if b.store().has_closures() {
+        for &expr in b.exprs() {
+            if let Expr::Closure { .. } = b.store().expr(expr) {
+                liveness.dead_captures(b.infer.expr_ty(expr));
+            }
         }
     }
+    *pool = liveness.pool;
     liveness.out
+}
+
+/// The tables of one body's analysis, kept from body to body: a body allocates only where it
+/// is larger than those before it. A closure's analysis, nested in its body's, takes another.
+#[derive(Default)]
+pub(super) struct Pool<'db>(Vec<Buffers<'db>>);
+
+#[derive(Default)]
+struct Buffers<'db> {
+    flow: Tables<'db>,
+    named: Vec<Named<'db>>,
+    bindings: Vec<(LocalId, BindingId)>,
+    lists: Vec<SmallVec<[Assignment<'db>; 2]>>,
 }
 
 /// rustc's check that skips a `#[naked]` function, whose body is its `naked_asm!` alone.
@@ -135,7 +156,7 @@ struct Assignment<'m> {
 enum Named<'db> {
     Var { binding: BindingId, local: LocalId, var: Var },
     Guard,
-    Capture { name: String, capture: &'db CapturedPlace },
+    Capture { capture: &'db CapturedPlace },
 }
 
 /// The analysis of a body and its closures, with the lints found in the order rustc emits
@@ -148,6 +169,7 @@ struct Liveness<'b, 'a, 'db> {
     analysed: FxHashMap<Nested<'db>, DeadCaptures>,
     constants: Option<Vec<(String, Ty<'db>, String)>>,
     out: Vec<Found>,
+    pool: Pool<'db>,
 }
 
 impl<'db> Liveness<'_, '_, 'db> {
@@ -155,6 +177,7 @@ impl<'db> Liveness<'_, '_, 'db> {
     fn dead_captures(&mut self, closure: Ty<'db>) -> DeadCaptures {
         let nested = self.nested(closure)?;
         if let Some(found) = self.analysed.get(&nested) {
+            // clone: an `Rc`, a reference count
             return found.clone();
         }
         self.analysed.insert(nested, None);
@@ -164,13 +187,14 @@ impl<'db> Liveness<'_, '_, 'db> {
             Nested::Coroutine(id) => (db.mir_body_for_coroutine(id), id.loc(db)),
         };
         let found = self.body(mir.ok()?, Some((loc.expr, closure)));
+        // clone: an `Rc`, a reference count
         self.analysed.insert(nested, found.clone());
         found
     }
 }
 
 impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
-    fn new(b: &'b BodyCx<'a, 'db>) -> Self {
+    fn new(b: &'b BodyCx<'a, 'db>, pool: Pool<'db>) -> Self {
         let db = b.db();
         Liveness {
             b,
@@ -179,7 +203,9 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             env: db.trait_environment(b.owner.generic_def(db)),
             analysed: FxHashMap::default(),
             constants: None,
+            // alloc: empty, pushed to only for a lint found
             out: Vec::new(),
+            pool,
         }
     }
 
@@ -205,20 +231,23 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         let b = self.b;
         let store = b.store();
         let (kind, in_place) = closure.map_or((CaptureKind::None, false), |(_, ty)| capture_kind(ty));
-        let captures: Vec<&'db CapturedPlace> = match closure {
+        let captures: SmallVec<[&'db CapturedPlace; 8]> = match closure {
             Some((expr, _)) => match b.infer.closures_data.get(&expr) {
-                Some(data) => data.min_captures.values().flatten().collect(),
+                Some(data) => SmallVec::from_iter(data.min_captures.values().flatten()),
                 None => return None,
             },
-            None => Vec::new(),
+            None => SmallVec::new(),
         };
 
-        let mut places = Places::new(mir.locals.len());
-        let mut named: Vec<Named<'db>> = Vec::new();
-        let mut bindings: Vec<(LocalId, BindingId)> =
-            mir.binding_locals.iter().map(|(binding, &local)| (local, binding)).collect();
+        let mut buffers = self.pool.0.pop().unwrap_or_default();
+        let mut places = Places::new(mir.locals.len(), &mut buffers.flow);
+        let mut named = std::mem::take(&mut buffers.named);
+        named.clear();
+        let mut bindings = std::mem::take(&mut buffers.bindings);
+        bindings.clear();
+        bindings.extend(mir.binding_locals.iter().map(|(binding, &local)| (local, binding)));
         radix::sort_copy_by_key(&mut bindings, |&(local, _)| flow::raw_local(local));
-        for (local, binding) in bindings {
+        for &(local, binding) in &bindings {
             let Some(var) = source::var(b, binding) else { continue };
             if ignored(&var.name) {
                 continue;
@@ -263,21 +292,25 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                 capture_locals.insert(local);
                 places.push(kind, ty, Some(local));
             }
-            named.push(Named::Capture { name: source::capture_name(b, capture), capture });
+            named.push(Named::Capture { capture });
         }
 
         let specials = self.specials(mir, &places, &capture_locals, closure_local);
-        let cfg = Cfg::new(mir, kind == CaptureKind::FnMut);
+        let cfg = Cfg::new(mir, kind == CaptureKind::FnMut, &mut buffers.flow);
         let mut flow = Flow::new(mir, &places, &specials, &cfg, kind);
         flow.solve(self);
-        let seen = flow.assignments(self);
+        let mut sightings = std::mem::take(&mut buffers.flow.sightings);
+        sightings.clear();
+        let mut seen = flow.assignments(self, sightings);
         let mut ever_live = seen.ever_live;
         let ever_dropped = seen.ever_dropped;
 
         let n = places.len();
-        let mut lists: Vec<Vec<Assignment<'db>>> = (0..n).map(|_| Vec::new()).collect();
+        let mut lists = std::mem::take(&mut buffers.lists);
+        lists.clear();
+        lists.resize_with(n, SmallVec::new);
         let mut slots: FxHashMap<(Index, Key), usize> = FxHashMap::default();
-        for sighting in seen.sightings {
+        for sighting in seen.sightings.drain(..) {
             let key = match sighting.kind {
                 Access::Assign => Key::At(sighting.span),
                 Access::Param | Access::Capture => Key::Start,
@@ -321,7 +354,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             }
         }
 
-        let mut dead = vec![false; captures.len()];
+        let mut dead: SmallVec<[bool; 8]> = SmallVec::from_elem(false, captures.len());
         for at in 0..n as Index {
             if let Kind::Capture { field, .. } = places.kinds[at as usize]
                 && !ever_live.contains(at)
@@ -372,17 +405,17 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             if list.is_empty() {
                 continue;
             }
-            let name = match named {
-                Named::Var { var, .. } => var.name.as_str(),
-                Named::Capture { name, .. } => name.as_str(),
+            let underscored = match named {
+                Named::Var { var, .. } => var.name.starts_with('_'),
+                Named::Capture { capture } => source::capture_underscored(b, capture),
                 Named::Guard => continue,
             };
-            if name.starts_with('_') {
+            if underscored {
                 continue;
             }
             let drop_guard = drop_guards.contains(at as Index);
-            let mut next_direct: Vec<(MirSpan, Option<&StoredPlace>, Loc)> = Vec::new();
-            let mut dead_assignments = Vec::with_capacity(list.len());
+            let mut next_direct: SmallVec<[(MirSpan, Option<&StoredPlace>, Loc); 4]> = SmallVec::new();
+            let mut dead_assignments: SmallVec<[_; 2]> = SmallVec::new();
             for assignment in list {
                 let direct_assignment = assignment.kind == Access::Assign && assignment.direct;
                 let should_report = !assignment.live && (assignment.direct || !drop_guard);
@@ -400,12 +433,32 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                     dead_assignments.push((assignment, overwrite));
                 }
             }
+            if dead_assignments.is_empty() {
+                continue;
+            }
+            let capture_name;
+            let name = match named {
+                Named::Var { var, .. } => var.name.as_str(),
+                Named::Capture { capture } => {
+                    capture_name = source::capture_name(b, capture);
+                    capture_name.as_str()
+                }
+                Named::Guard => continue,
+            };
             for (assignment, overwrite) in dead_assignments.into_iter().rev() {
                 self.dead_assignment(mir, named, name, assignment, overwrite, closure);
             }
         }
 
-        Some(dead.into())
+        drop(flow);
+        places.give_back(&mut buffers.flow);
+        cfg.give_back(&mut buffers.flow);
+        buffers.flow.sightings = seen.sightings;
+        buffers.named = named;
+        buffers.bindings = bindings;
+        buffers.lists = lists;
+        self.pool.0.push(buffers);
+        Some(Rc::from(&dead[..]))
     }
 
     /// The statements the transfer function reads differently: [`Special`].
@@ -418,7 +471,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
     ) -> FxHashMap<(u32, u32), Special> {
         let store = self.b.store();
         let mut specials = FxHashMap::default();
-        let mut stores: FxHashMap<MirSpan, Vec<(StoredPlace, (u32, u32))>> = FxHashMap::default();
+        let mut stores: FxHashMap<MirSpan, SmallVec<[(&StoredPlace, (u32, u32)); 1]>> = FxHashMap::default();
         for (block, data) in mir.basic_blocks.iter() {
             for (index, statement) in data.statements.iter().enumerate() {
                 let key = (raw(block), index as u32);
@@ -451,7 +504,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                         } else if let MirSpan::ExprId(value) = statement.span
                             && let Some(target) = self.source.assigned_by(value)
                         {
-                            stores.entry(target).or_default().push((lhs.clone(), key));
+                            stores.entry(target).or_default().push((lhs, key));
                         }
                     }
                     _ => {}
@@ -468,10 +521,10 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                 if places.is_indirect(place) {
                     continue;
                 }
-                for (lhs, op) in ops {
+                for &(lhs, op) in ops {
                     if lhs == place {
                         specials.insert((raw(block), index as u32), Special::SelfStore);
-                        specials.insert(*op, Special::SelfOp);
+                        specials.insert(op, Special::SelfOp);
                     }
                 }
             }
@@ -489,13 +542,12 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         binding: BindingId,
         local: LocalId,
         var: &Var,
-        list: &mut Vec<Assignment<'db>>,
+        list: &mut SmallVec<[Assignment<'db>; 2]>,
         drop_guard: bool,
     ) {
         let b = self.b;
         let is_arg = mir.param_locals.contains(&local);
         let decl = self.source.decl(binding);
-        let from_macro = var.def.expansion.is_some();
         let ty = mir.locals[local].ty.as_ref();
         let name = var.name.as_str();
 
@@ -505,11 +557,14 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             if used_after_uninitialized || !flow.mentions(local) {
                 return;
             }
-            let sugg = match from_macro {
+            let def = var.def(b);
+            let sugg = match def.expansion.is_some() {
                 true => Sugg::NoSugg,
-                false => Sugg::TryPrefix { spans: vec![var.def.clone()], typo: self.typo(is_arg, name, &var.def, ty) },
+                // clone: a lint's span, for an unused variable found
+                false => Sugg::TryPrefix { spans: vec![def.clone()], typo: self.typo(is_arg, name, &def, ty) },
             };
-            self.unused_variable(report, var, vec![var.def.clone()], sugg);
+            // alloc: a lint's span, for an unused variable found
+            self.unused_variable(report, var, &def, &[], vec![def.clone()], sugg);
             return;
         }
 
@@ -543,12 +598,15 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                     return;
                 }
             }
-            let typo = self.typo(is_arg, name, &var.def, ty);
+            let def = var.def(b);
+            let typo = self.typo(is_arg, name, &def, ty);
             let mut diag = Diag::lint(
                 "unused_variables",
+                // alloc: the lint's message, for an unused variable found
                 format!("variable `{name}` is assigned to, but never used"),
-                var.def.clone(),
+                def,
             );
+            // alloc: the lint's note, for an unused variable found
             diag.note(format!("consider using `_{name}` instead"));
             if let Some(typo) = typo {
                 typo.add(&mut diag);
@@ -557,31 +615,49 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             return;
         }
 
-        let spans: Vec<Span> = var.introductions.iter().map(|(span, _)| span.clone()).collect();
-        let sugg = if var.introductions.iter().any(|&(_, shorthand)| shorthand) {
+        let def = var.def(b);
+        let introductions = var.introductions(b);
+        // alloc: a lint's spans, for an unused variable found
+        let spans: Vec<Span> = introductions.iter().map(|(span, _)| span.clone()).collect();
+        let sugg = if introductions.iter().any(|&(_, shorthand)| shorthand) {
             Sugg::TryIgnore
-        } else if from_macro {
+        } else if def.expansion.is_some() {
             Sugg::NoSugg
         } else {
-            Sugg::TryPrefix { spans: spans.clone(), typo: self.typo(is_arg, name, &var.def, ty) }
+            // clone: a lint's spans, for an unused variable found
+            Sugg::TryPrefix { spans: spans.clone(), typo: self.typo(is_arg, name, &def, ty) }
         };
-        self.unused_variable(report, var, spans, sugg);
+        self.unused_variable(report, var, &def, &introductions, spans, sugg);
     }
 
     /// rustc's `UnusedVariable`.
-    fn unused_variable(&mut self, report: &mut Report, var: &Var, spans: Vec<Span>, sugg: Sugg) {
+    fn unused_variable(
+        &mut self,
+        report: &mut Report,
+        var: &Var,
+        def: &Span,
+        introductions: &[(Span, bool)],
+        spans: Vec<Span>,
+        sugg: Sugg,
+    ) {
         let b = self.b;
         let name = var.name.as_str();
+        // alloc: the lint's message, for an unused variable found
         let mut diag = Diag::lint("unused_variables", format!("unused variable: `{name}`"), spans[0].clone());
         for span in &spans[1..] {
+            // clone: a lint's span, for an unused variable found
             diag.primary(span.clone());
         }
+        // alloc: the lint's search text, for an unused variable found
         let brace_name = format!("{{{name}");
         for (lit, value) in report.strings(b) {
+            // alloc: the lint's search text, for an unused variable found
             let rendered = format!("{value:?}");
             if rendered.split(&brace_name).any(|it| matches!(it.chars().next(), Some('}' | ':'))) {
+                // clone: a lint's span, for an unused variable found
                 diag.span_label(lit.clone(), "you might have meant to use string interpolation in this string literal");
                 diag.suggestion_with_style(
+                    // alloc: the lint's suggestion, for an unused variable found
                     vec![(lit.shrink_to_lo(), "format!(".to_owned()), (lit.shrink_to_hi(), ")".to_owned())],
                     "string interpolation only works in `format!` invocations",
                     Applicability::MachineApplicable,
@@ -591,12 +667,13 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         }
         match sugg {
             Sugg::TryIgnore => {
-                let parts = var
-                    .introductions
+                let parts = introductions
                     .iter()
                     .map(|(span, shorthand)| {
+                        // alloc: the lint's suggestion, for an unused variable found
                         (span.clone(), if *shorthand { format!("{name}: _") } else { "_".to_owned() })
                     })
+                    // alloc: the lint's suggestion, for an unused variable found
                     .collect();
                 diag.suggestion_with_style(
                     parts,
@@ -610,6 +687,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                     typo.add(&mut diag);
                 }
                 diag.suggestion_with_style(
+                    // alloc: the lint's suggestion, for an unused variable found
                     spans.into_iter().map(|span| (span, format!("_{name}"))).collect(),
                     "if this is intentional, prefix it with an underscore",
                     Applicability::MachineApplicable,
@@ -618,7 +696,9 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
             }
             Sugg::NoSugg => {
                 diag.span_help(
-                    var.def.clone(),
+                    // clone: a lint's span, for an unused variable found
+                    def.clone(),
+                    // alloc: the lint's help, for an unused variable found
                     format!("`{name}` is captured in macro and introduced a unused variable"),
                 );
             }
@@ -634,6 +714,7 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
         let b = self.b;
         let constants = self.constants.get_or_insert_with(|| source::constants(b));
         let (kind, item, path) = source::pattern_typo(b, constants, name, ty)?;
+        // clone: a lint's span, for a typo found
         Some(Typo { span: def.clone(), kind, item, path })
     }
 
@@ -669,12 +750,15 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                 };
                 let mut diag = Diag::lint(
                     "unused_assignments",
+                    // alloc: the lint's message, for a dead assignment found
                     format!("value assigned to `{name}` is never read"),
+                    // clone: a lint's span, for a dead assignment found
                     assigned.clone(),
                 );
                 let help = suggestion.is_none() && overwrite.is_none();
                 if let Some((overwrite, _)) = overwrite {
                     diag.span_label(assigned, "this value is reassigned later and never used");
+                    // alloc: the lint's label, for a dead assignment found
                     diag.span_label(overwrite, format!("`{name}` is overwritten here before the previous value is read"));
                 }
                 if let Some(parts) = suggestion {
@@ -695,19 +779,21 @@ impl<'b, 'a, 'db> Liveness<'b, 'a, 'db> {
                 let Named::Var { var, .. } = named else { return };
                 let mut diag = Diag::lint(
                     "unused_assignments",
+                    // alloc: the lint's message, for a dead assignment found
                     format!("value passed to `{name}` is never read"),
-                    var.def.clone(),
+                    var.def(b),
                 );
                 diag.help("maybe it is overwritten before being read?");
                 (diag, var.node)
             }
             Access::Capture => {
-                let Named::Capture { capture, .. } = named else { return };
+                let Named::Capture { capture } = named else { return };
                 let Some((closure, _)) = closure else { return };
                 let (Some(span), Some(at)) = (source::capture_span(b, capture), b.expr_node(closure)) else {
                     return;
                 };
                 let mut diag =
+                    // alloc: the lint's message, for a dead assignment found
                     Diag::lint("unused_assignments", format!("value captured by `{name}` is never read"), span);
                 diag.help("did you mean to capture by reference instead?");
                 (diag, at)
@@ -779,7 +865,9 @@ struct Typo {
 impl Typo {
     fn add(self, diag: &mut Diag) {
         diag.suggestion_with_style(
+            // alloc: the lint's suggestion, for a typo found
             vec![(self.span, self.path)],
+            // alloc: the lint's suggestion, for a typo found
             format!("you might have meant to pattern match on the similarly named {} `{}`", self.kind, self.item),
             Applicability::MaybeIncorrect,
             SuggestionStyle::ShowAlways,
@@ -799,6 +887,7 @@ fn raw(block: BasicBlockId) -> u32 {
 /// The expressions of `root` and those in it.
 fn expr_tree(store: &hir_def::expr_store::ExpressionStore, root: ExprId) -> FxHashSet<ExprId> {
     let mut found = FxHashSet::default();
+    // alloc: only for a binding no point of the body reads, which is reported
     let mut stack = vec![root];
     while let Some(expr) = stack.pop() {
         if found.insert(expr) {
@@ -811,6 +900,7 @@ fn expr_tree(store: &hir_def::expr_store::ExpressionStore, root: ExprId) -> FxHa
 /// The patterns of `root` and those in it.
 fn pat_tree(store: &hir_def::expr_store::ExpressionStore, root: PatId) -> FxHashSet<PatId> {
     let mut found = FxHashSet::default();
+    // alloc: only for a binding no point of the body reads, which is reported
     let mut stack = vec![root];
     while let Some(pat) = stack.pop() {
         if found.insert(pat) {

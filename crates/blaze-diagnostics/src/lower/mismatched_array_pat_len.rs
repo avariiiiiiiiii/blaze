@@ -17,20 +17,26 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::MismatchedArrayPatLen) -> Vec<Foun
     let (min, size) = (d.found, d.expected);
     let mut diag = match d.has_rest {
         false => {
+            // alloc: the error's text, for an error hir found
             let message = format!("pattern requires {min} element{} but array has {size}", s(min));
+            // clone: on the error path, for an error hir found
             let mut diag = Diag::error(Some("E0527"), message, span.clone());
+            // alloc: the error's text, for an error hir found
             diag.span_label(span, format!("expected {size} element{}", s(size)));
             diag
         }
         true => {
-            let message =
-                format!("pattern requires at least {min} element{} but array has {size}", s(min));
+            // alloc: the error's text, for an error hir found
+            let message = format!("pattern requires at least {min} element{} but array has {size}", s(min));
+            // clone: on the error path, for an error hir found
             let mut diag = Diag::error(Some("E0528"), message, span.clone());
+            // alloc: the error's text, for an error hir found
             diag.span_label(span, format!("pattern cannot match array of {size} element{}", s(size)));
             diag
         }
     };
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 

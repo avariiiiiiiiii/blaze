@@ -7,7 +7,10 @@
 //! `walk_ty`, `with_impl_trait` and where `visit_generic_args` resets it,
 //! `check_fn_ptr_safety`) and `diagnostics.rs` (MIT or Apache-2.0).
 
-use syntax::{AstNode, SyntaxKind, SyntaxNode, ast};
+use syntax::{
+    SyntaxKind,
+    view::{self as ast, AstNode as _},
+};
 
 use super::{
     Out, V,
@@ -16,11 +19,11 @@ use super::{
 use crate::model::{Applicability, Diag};
 
 /// `visit_ty_common` of a function pointer type.
-pub(super) fn fn_ptr(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
-    let Some(ty) = ast::FnPtrType::cast(node.clone()) else { return };
+pub(super) fn fn_ptr<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Out) {
+    let Some(ty) = ast::FnPtrType::cast(node) else { return };
     if let Some(safe) = fns::safe_token(node) {
         let decl = fns::decl_range(node);
-        let remove = super::until_non_whitespace(&safe, decl.end());
+        let remove = super::until_non_whitespace(safe, decl.end());
         let mut diag = Diag::error(
             None,
             "function pointers cannot be declared with `safe` safety qualifier",
@@ -30,20 +33,20 @@ pub(super) fn fn_ptr(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
         v.emit(out, node, diag);
     }
     let abi = ty.abi();
-    let inputs = fns::inputs(v, ty.param_list().as_ref());
-    fns::check_decl(v, node, &inputs, false, Splat::of(abi.as_ref()), out);
+    let inputs = fns::inputs(v, ty.param_list());
+    fns::check_decl(v, node, &inputs, false, Splat::of(abi), out);
     fns::patterns(v, &inputs, false, |span, _| {
         let diag = Diag::error(Some("E0561"), "patterns aren't allowed in function pointer types", span);
         v.emit(out, node, diag);
     });
-    if let Some(name) = abi.as_ref().and_then(fns::abi_of) {
-        fns::signature(v, node, name, &fns::Sig::of_fn_ptr(&ty, &inputs), out);
+    if let Some(name) = abi.and_then(fns::abi_of) {
+        fns::signature(v, node, name, &fns::Sig::of_fn_ptr(ty, &inputs), out);
     }
 }
 
 /// `visit_ty_common` of a trait object: E0226 at its second lifetime bound.
-pub(super) fn dyn_trait(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
-    let Some(list) = ast::DynTraitType::cast(node.clone()).and_then(|it| it.type_bound_list()) else { return };
+pub(super) fn dyn_trait<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Out) {
+    let Some(list) = ast::DynTraitType::cast(node).and_then(|it| it.type_bound_list()) else { return };
     let mut lifetimes = list.bounds().filter_map(|it| it.lifetime());
     if lifetimes.next().is_none() {
         return;
@@ -56,11 +59,12 @@ pub(super) fn dyn_trait(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out)
 
 /// `visit_ty_common` and `walk_ty` of `impl Trait`: E0666 in an outer `impl Trait`, no trait
 /// in its bounds, and, once what is in it is walked, `use<..>` twice.
-pub(super) fn impl_trait(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
-    let Some(ty) = ast::ImplTraitType::cast(node.clone()) else { return };
+pub(super) fn impl_trait<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Out) {
+    let Some(ty) = ast::ImplTraitType::cast(node) else { return };
     let range = node.text_range();
     if let Some(outer) = outer_impl_trait(v, node) {
         let span = v.span(range);
+        // clone: the error's span
         let mut diag = Diag::error(Some("E0666"), "nested `impl Trait` is not allowed", span.clone());
         diag.span_label(v.cx.span(outer), "outer `impl Trait`");
         diag.span_label(span, "nested `impl Trait` here");
@@ -82,7 +86,7 @@ pub(super) fn impl_trait(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out
 /// `outer_impl_trait_span` at `node`: the `impl Trait` it is in, up to a constraint
 /// (`Item = impl Trait`) or the output of `Fn(..) -> ..`, where rustc resets it, or the item
 /// it is in.
-fn outer_impl_trait(v: &V<'_, '_, '_, '_>, node: &SyntaxNode) -> Option<hir::InFile<syntax::TextRange>> {
+fn outer_impl_trait<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>) -> Option<hir::InFile<syntax::TextRange>> {
     for at in v.ancestors(node) {
         match at.value.kind() {
             SyntaxKind::IMPL_TRAIT_TYPE => return Some(hir::InFile::new(at.file_id, at.value.text_range())),

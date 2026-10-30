@@ -28,7 +28,7 @@ mod order;
 pub mod load;
 #[cfg(feature = "query")]
 pub mod query;
-mod read;
+pub mod read;
 pub mod schema;
 #[cfg(feature = "query")]
 pub mod stdlib;

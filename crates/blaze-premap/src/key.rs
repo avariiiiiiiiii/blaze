@@ -16,7 +16,7 @@
 //! the caller found them in never changes a key.
 
 use blaze_codegen::settings::Toolchain;
-use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Reloc, RelocKind, Settings, Static, Target};
+use blaze_codegen::{Arch, CompiledFunction, Init, InstanceKey, Reloc, Settings, Static, Target};
 use blaze_ids::{ContentId, Hasher, radix};
 use blaze_items::{CodeHash, ItemKey};
 use blaze_link::{Debug, Format, NativeKind, Output, OutputKind, Platform};
@@ -326,7 +326,7 @@ fn output_into(hasher: &mut Hasher, output: &Output) {
 fn relocs_into(hasher: &mut Hasher, relocs: &[Reloc]) {
     count(hasher, relocs.len());
     for Reloc { at, kind, target, addend } in relocs {
-        hasher.update(&at.to_le_bytes()).update(&[reloc_tag(*kind)]).update(&addend.to_le_bytes());
+        hasher.update(&at.to_le_bytes()).update(&[blaze_codegen::content::kind_tag(*kind)]).update(&addend.to_le_bytes());
         target_into(hasher, target);
     }
 }
@@ -357,36 +357,5 @@ pub(crate) fn format_tag(format: Format) -> u8 {
         Format::MachO => 1,
         Format::Pe => 2,
         Format::Wasm => 3,
-    }
-}
-
-fn reloc_tag(kind: RelocKind) -> u8 {
-    match kind {
-        RelocKind::Abs64 => 0,
-        RelocKind::PcRel32 => 1,
-        RelocKind::GotPcRel32 => 2,
-        RelocKind::Call26 => 3,
-        RelocKind::AdrpPage21 => 4,
-        RelocKind::PageOffset12 => 5,
-        RelocKind::GotPage21 => 6,
-        RelocKind::GotPageOffset12 => 7,
-        RelocKind::TlsOffset => 8,
-        RelocKind::WasmFunction => 9,
-        RelocKind::WasmTable => 10,
-        RelocKind::WasmMemory => 11,
-        RelocKind::TlsGd32 => 12,
-        RelocKind::TlsGotTpOff32 => 13,
-        RelocKind::TlvRel32 => 14,
-        RelocKind::TlvPage21 => 15,
-        RelocKind::TlvPageOffset12 => 16,
-        RelocKind::TlsDescPage21 => 17,
-        RelocKind::TlsDescLd64Lo12 => 18,
-        RelocKind::TlsDescAddLo12 => 19,
-        RelocKind::TlsDescCall => 20,
-        RelocKind::TlsIePage21 => 21,
-        RelocKind::TlsIeLo12 => 22,
-        RelocKind::TpHi12 => 23,
-        RelocKind::TpLo12 => 24,
-        RelocKind::SectionRel32 => 25,
     }
 }

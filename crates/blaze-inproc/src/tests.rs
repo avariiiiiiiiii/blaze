@@ -7,7 +7,7 @@
 use blaze_ids::rng::SplitMix64;
 
 use crate::frame::{self, FrameError, Header, Kind, Reader, Writer, kinds};
-use crate::handshake::{Grant, Hello, Overlay, Place, VERSION, host_var, unhex};
+use crate::handshake::{Grant, Hello, Overlay, Place, VERSION, hex, host_var, unhex};
 use crate::image::tests::{R, RX, elf};
 use crate::sys::Rights;
 use crate::{Access, CodeMemory, CodeRange, Format, Layout, Segment};
@@ -294,6 +294,9 @@ fn a_grant_is_checked_against_the_image_relative_to_its_header() {
 
 #[test]
 fn tokens_are_32_hex_digits_after_the_address() {
+    let token: [u8; 16] = core::array::from_fn(|it| (it as u8) * 17);
+    assert_eq!(hex(&token), "00112233445566778899aabbccddeeff");
+    assert_eq!(unhex(hex(&token).as_bytes()), Some(token));
     assert_eq!(unhex(b"000102030405060708090a0b0c0d0e0f"), Some(core::array::from_fn(|it| it as u8)));
     assert_eq!(unhex(b"000102030405060708090a0b0c0d0e0"), None);
     assert_eq!(unhex(b"000102030405060708090a0b0c0d0eFF"), None);
@@ -956,7 +959,13 @@ mod linux {
                 env: vec![("X".into(), "1".into()), (HOST_VAR.into(), "stale".into())],
                 dir: dir.clone(),
                 stdin: Vec::new(),
-                sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false },
+                sandbox: Sandbox::On {
+                    read: Vec::new(),
+                    write: Vec::new(),
+                    network: false,
+                    trace: false,
+                    services: Vec::new(),
+                },
                 memory: None,
             };
             let (command, pending) = host.launch(&launch).unwrap();
@@ -964,8 +973,15 @@ mod linux {
             assert_eq!(command.args, ["a", "b"]);
             assert_eq!(command.env.iter().filter(|(name, _)| name == HOST_VAR).count(), 1);
             assert!(command.env.iter().any(|(name, value)| name == "X" && value == "1"));
-            let Sandbox::On { read, write, network, .. } = &command.sandbox else { panic!("the run left its sandbox") };
+            let Sandbox::On { read, write, network, services, .. } = &command.sandbox else {
+                panic!("the run left its sandbox")
+            };
             assert!(read.contains(&program));
+            if cfg!(target_os = "macos") {
+                assert_eq!(*services, [format!("dev.blaze.inproc.{}", std::process::id())]);
+            } else {
+                assert!(services.is_empty());
+            }
             assert_eq!(write.len(), 1);
             assert!(!network);
 

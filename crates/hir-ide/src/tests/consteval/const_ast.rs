@@ -64,7 +64,9 @@ fn check(text: &str) {
     let tree = const_ast::Tree::new(&kinds, &ends, &spans, &refs);
     let compiled = digest::digest(&tree);
     assert_ne!(compiled, 0, "the file has items");
-    let list = |it: &mut dyn Iterator<Item = String>| it.collect::<Vec<_>>().join(", ");
+    fn list(it: impl Iterator<Item = String>) -> String {
+        it.collect::<Vec<_>>().join(", ")
+    }
     let fixture = format!(
         "//- minicore: sized, copy, clone, derive, option, result, slice, index, coerce_unsized, str, iterator, panic
 //- /const_ast/lib.rs crate:const_ast
@@ -84,10 +86,10 @@ const TEXTS: &[&str] = &[{}];
 const TREE: const_ast::Tree<'static> = const_ast::Tree::new(KINDS, ENDS, SPANS, TEXTS);
 const GOAL: u64 = digest::digest(&TREE);
 ",
-        list(&mut kinds.iter().map(|it| it.to_string())),
-        list(&mut ends.iter().map(|it| it.to_string())),
-        list(&mut spans.iter().map(|it| it.to_string())),
-        list(&mut texts.iter().map(|it| format!("{it:?}"))),
+        list(kinds.iter().map(|it| it.to_string())),
+        list(ends.iter().map(|it| it.to_string())),
+        list(spans.iter().map(|it| it.to_string())),
+        list(texts.iter().map(|it| format!("{it:?}"))),
     );
     check_number(&fixture, compiled as i128);
 }

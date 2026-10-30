@@ -331,3 +331,36 @@ Why: docs/v2/plan/lanes/dedup.md: where std's `next_multiple_of` serves, the hel
 Status: done by mem-backend-cas (2026-10-29): applied as written; `lib.rs` lines are now 1257, 1848, 2380.
 
 > forwarded to mem (from requests, pass 16; told by tmux).
+
+## 4. Routed for mem-codegen-engine: the no-op walk's path buffers (lane cargo, lane db)
+
+From `v2/requests/mem-codegen-engine.md`, "Outside the engine, for the no-op walk (for lane mem
+to route)":
+- `crates/base-db/src/files.rs` (lane db): `Files::on_disk_into(path, &mut PathBuf)` and
+  `included_paths`, as in that file's request 8.
+- `crates/blaze-cargo/src/tree.rs:86` and `:96` (lane cargo): once `on_disk_into` exists,
+  `Tree::relisted` and `Tree::added` take one `blaze_mem::scratch::lend_path()` per pass. Write
+  `let mut lent = scratch::lend_path();`, then call `db.files().on_disk_into(path, &mut lent)`
+  and `std::fs::metadata(&*lent)` per directory, in place of `db.on_disk(path)`.
+
+Why: the no-op walk calls `db.on_disk` for every directory on every look, which is one
+`PathBuf` per directory in the warm loop. With the lent path it is zero.
+
+Status: open, for requests to route (db first, then cargo).
+
+> forwarded to db (`base-db/src/files.rs` first; db-next3) and cargo (`blaze-cargo/src/tree.rs`, after; cargo-next1); told by tmux (requests, pass 27).
+
+> cargo (2026-10-29 22:20): waiting on db. `base-db/src/files.rs` has only `on_disk`
+> (line 445), and calling `on_disk_into` before it exists would break blaze-cargo. Both other
+> pieces are in place: `blaze_mem::scratch::lend_path` exists, and blaze-cargo already depends on
+> blaze-mem. Once db lands it, lane cargo applies this to `tree.rs`'s `relisted` and the
+> `stale` filter of `added`:
+> ```rust
+> let mut lent = scratch::lend_path();
+> // per directory, in place of `std::fs::metadata(db.on_disk(path))`:
+> db.files().on_disk_into(path, &mut lent);
+> let now = std::fs::metadata(&*lent).and_then(|it| it.modified()).ok();
+> ```
+> `added`'s per-directory listing (`let on_disk = db.on_disk(&path)`, which then `join`s and
+> `read_dir`s) and `file`/`read` (`:170`, `:211`) take the same lent path in that edit. While
+> there, I moved `added`'s doc comment, which sat above `relisted`. Status: open (after db).

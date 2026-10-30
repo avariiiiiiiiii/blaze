@@ -23,7 +23,7 @@ fn collected_with(
         for &krate in base_db::all_crates(&db).iter() {
             let def_map = crate_def_map(&db, krate);
             out.push_str(&def_map.dump(&db));
-            for diagnostic in def_map.diagnostics() {
+            for diagnostic in def_map.diagnostics(&db) {
                 writeln!(out, "{diagnostic:?}").unwrap();
             }
         }

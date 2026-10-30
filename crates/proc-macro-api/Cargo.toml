@@ -36,6 +36,9 @@ intern.workspace = true
 postcard.workspace = true
 semver.workspace = true
 
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+
 [features]
 in-rust-tree = ["proc-macro-srv", "proc-macro-srv/in-rust-tree"]
 default = []

@@ -5,13 +5,18 @@
 
 mod alloc_budget;
 mod db;
+mod erase_regions;
+#[path = "../../src/mir/optimize/inline/fixtures.rs"]
+mod inline;
 mod machine;
 mod references;
 mod source_maps;
 mod source_names;
+mod stages;
 mod storage;
 mod threads;
 mod ub_checks;
+mod uninhabited;
 mod unwind;
 
 use hir_def::{ConstId, FunctionId};

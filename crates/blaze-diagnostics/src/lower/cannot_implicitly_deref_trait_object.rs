@@ -18,9 +18,9 @@ pub(crate) fn lower<'db>(
 ) -> Vec<Found> {
     let span = cx.span_of_ptr(d.pat);
     let ty = cx.ty(&d.found);
-    let mut diag =
-        Diag::error(Some("E0033"), format!("type `{ty}` cannot be dereferenced"), span.clone());
-    diag.span_label(span, format!("type `{ty}` cannot be dereferenced"));
+    let message = format!("type `{ty}` cannot be dereferenced"); // alloc: the error's message
+    let mut diag = Diag::error(Some("E0033"), message, span.clone()); // clone: the error's span
+    diag.span_label(span, format!("type `{ty}` cannot be dereferenced")); // alloc: its label
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
-    vec![Found::new(diag, Phase::Bodies)]
+    vec![Found::new(diag, Phase::Bodies)] // alloc: the error found
 }

@@ -1,6 +1,8 @@
 //! Transcriber takes a template, like `fn $ident() {}`, a set of bindings like
 //! `$ident => foo`, interpolates variables in the template, to get `fn foo() {}`
 
+use std::alloc::Allocator;
+
 use blaze_mem::frame::Frame;
 use intern::{Symbol, sym};
 use span::{Edition, Span};
@@ -8,8 +10,8 @@ use stdx::itertools::Itertools;
 use tt::{Delimiter, TopSubtreeBuilder, iter::TtElement};
 
 use crate::{
-    ExpandError, ExpandErrorKind, ExpandResult, MetaTemplate,
-    expander::{Binding, Bindings, Fragment},
+    ExpandError, ExpandErrorKind, ExpandResult, MadeIdents, MetaTemplate,
+    expander::{Binding, Bindings, Fragment, TokensOrigin},
     parser::{Binder, ConcatMetaVarExprElem, MetaVar, MetaVarKind, Op, RepeatKind, Separator},
 };
 
@@ -128,19 +130,25 @@ impl<'t> Bindings<'t> {
     }
 }
 
-pub(super) fn transcribe<'a>(
+/// The output is made in the worker's builder and written out once, by `build`: into the global
+/// allocator keeping its words (`TopSubtreeBuilder::build`), or into a caller's frame
+/// (`TopSubtreeBuilder::build_in`).
+pub(super) fn transcribe<'a, A: Allocator>(
     template: &MetaTemplate,
     bindings: &'a Bindings<'a>,
     frame: &'a Frame,
+    build: impl FnOnce(TopSubtreeBuilder) -> tt::TopSubtree<A>,
     marker: impl Fn(&mut Span) + Copy,
     call_site: Span,
-) -> ExpandResult<tt::TopSubtree> {
-    let mut ctx = ExpandCtx { bindings, nesting: Vec::new_in(frame), call_site };
+) -> ExpandResult<(tt::TopSubtree<A>, MadeIdents)> {
+    let mut ctx =
+        ExpandCtx { bindings, nesting: Vec::new_in(frame), call_site, made: MadeIdents::new() };
     let mut builder = tt::TopSubtreeBuilder::with_capacity(
         tt::Delimiter::invisible_spanned(ctx.call_site),
         template.0.len() + bindings.token_trees(),
     );
-    expand_subtree(&mut ctx, template, &mut builder, marker).map(|()| builder.build())
+    expand_subtree(&mut ctx, template, &mut builder, marker)
+        .map(|()| (build(builder), ctx.made))
 }
 
 #[derive(Debug)]
@@ -159,6 +167,8 @@ struct ExpandCtx<'a> {
     bindings: &'a Bindings<'a>,
     nesting: Vec<NestingState, &'a Frame>,
     call_site: Span,
+    /// The spans of the identifiers `${concat(..)}` made, kept with the expansion.
+    made: MadeIdents,
 }
 
 fn expand_subtree_with_delimiter(
@@ -384,6 +394,7 @@ fn expand_subtree(
                 let needs_raw =
                     parser::SyntaxKind::from_keyword(&concatenated, Edition::LATEST).is_some();
                 let is_raw = if needs_raw { tt::IdentIsRaw::Yes } else { tt::IdentIsRaw::No };
+                ctx.made.push(result_span);
                 builder.push(tt::Leaf::Ident(tt::Ident {
                     is_raw,
                     span: result_span,
@@ -435,8 +446,14 @@ fn expand_var(
                 // rustc spacing is not like ours. Ours is like proc macros', it dictates how puncts will actually be joined.
                 // rustc uses them mostly for pretty printing. So we have to deviate a bit from what rustc does here.
                 // Basically, a metavariable can never be joined with whatever after it.
-                Fragment::Tokens { tree, origin } => {
-                    let _ = origin;
+                Fragment::Tokens { tree, origin: TokensOrigin::Grouped } => {
+                    let mut span = id;
+                    marker(&mut span);
+                    builder.open(tt::DelimiterKind::Invisible, span);
+                    builder.extend_with_tt_alone(tree.strip_invisible());
+                    builder.close(span);
+                }
+                Fragment::Tokens { tree, origin: TokensOrigin::Raw | TokensOrigin::Ast } => {
                     builder.extend_with_tt_alone(tree);
                 }
                 Fragment::TokensOwned(tt) => {

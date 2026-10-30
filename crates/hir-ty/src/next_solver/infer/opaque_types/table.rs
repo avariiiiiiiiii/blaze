@@ -7,7 +7,7 @@ use tracing::instrument;
 use super::OpaqueHiddenType;
 use crate::next_solver::{FxIndexMap, OpaqueTypeKey, Ty};
 
-#[derive(Default, Debug, Clone)]
+#[derive(Default, Debug)]
 pub(crate) struct OpaqueTypeStorage<'db> {
     opaque_types: FxIndexMap<OpaqueTypeKey<'db>, OpaqueHiddenType<'db>>,
     duplicate_entries: Vec<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)>,
@@ -41,7 +41,48 @@ impl rustc_type_ir::inherent::OpaqueTypeStorageEntries for OpaqueTypeStorageEntr
     }
 }
 
+impl Clone for OpaqueTypeStorage<'_> {
+    fn clone(&self) -> Self {
+        OpaqueTypeStorage {
+            // clone: only `InferCtxt::fork` copies the opaque types.
+            opaque_types: self.opaque_types.clone(),
+            // clone: only `InferCtxt::fork` copies the opaque types.
+            duplicate_entries: self.duplicate_entries.clone(),
+            // clone: only `InferCtxt::fork` copies the opaque types.
+            undo: self.undo.clone(),
+            changes: self.changes,
+        }
+    }
+
+    /// Into `self`'s tables, keeping their capacity: a warm fork copies without allocating.
+    fn clone_from(&mut self, source: &Self) {
+        self.opaque_types.clone_from(&source.opaque_types);
+        self.duplicate_entries.clone_from(&source.duplicate_entries);
+        self.undo.clone_from(&source.undo);
+        self.changes = source.changes;
+    }
+}
+
 impl<'db> OpaqueTypeStorage<'db> {
+    /// Back to `default()`, its capacity kept.
+    pub(crate) fn empty(&mut self) {
+        self.opaque_types.clear();
+        self.duplicate_entries.clear();
+        self.undo.clear();
+        self.changes = 0;
+    }
+
+    /// Bytes its tables hold room for.
+    pub(crate) fn held(&self) -> usize {
+        // An index map keeps its entries in a `Vec` and their positions in a table of `usize`s.
+        self.opaque_types.capacity()
+            * (size_of::<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)>() + size_of::<usize>())
+            + self.duplicate_entries.capacity()
+                * size_of::<(OpaqueTypeKey<'db>, OpaqueHiddenType<'db>)>()
+            + self.undo.capacity()
+                * size_of::<(OpaqueTypeKey<'db>, Option<OpaqueHiddenType<'db>>)>()
+    }
+
     #[instrument(level = "debug")]
     pub(crate) fn remove(&mut self, key: OpaqueTypeKey<'db>, prev: Option<OpaqueHiddenType<'db>>) {
         if let Some(prev) = prev {

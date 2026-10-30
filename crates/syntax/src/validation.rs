@@ -35,7 +35,7 @@ pub(crate) fn validate(root: &SyntaxNode, errors: &mut Vec<SyntaxError>) {
 pub(crate) fn validate_outline(
     root: &SyntaxNode,
     lazies: &[(TextRange, u32)],
-    body: &mut dyn FnMut(u32, &mut Vec<SyntaxError>) -> bool,
+    mut body: impl FnMut(u32, &mut Vec<SyntaxError>) -> bool,
     errors: &mut Vec<SyntaxError>,
 ) {
     let _p = tracing::info_span!("parser::validate_outline").entered();

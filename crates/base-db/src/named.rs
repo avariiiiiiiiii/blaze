@@ -23,6 +23,7 @@ use std::{
 };
 
 use blaze_ids::{ContentId, Hasher};
+use blaze_mem::{Frame, scratch};
 use salsa::{Durability, Setter};
 use vfs::{FileId, VfsPath};
 
@@ -95,7 +96,7 @@ impl Default for Named {
     fn default() -> Named {
         Named {
             // alloc: once per database, when its `Files` is made.
-            table: Arc::new(Table::new()),
+            table: Arc::new(Table::new(1 << 22)),
             input: None,
             counts: [0; BUCKETS],
             sums: [[0; 4]; BUCKETS],
@@ -135,24 +136,22 @@ impl Named {
     /// Writes the content IDs of the buckets that gained paths or had one move, making the
     /// inputs the first time. Called by every setter that sets a source root's files, after
     /// it has.
-    pub(crate) fn publish(&mut self, db: &mut Db) {
+    pub(crate) fn publish(&mut self, db: &mut Db, frame: &Frame) {
         if self.input.is_some() && self.pending.is_empty() && self.moved == 0 {
             return;
         }
         let table = &self.table;
-        // alloc: a setter's batch of new paths, hashed in one call; a keystroke names none.
-        let keys: Vec<Vec<u8>> = self
-            .pending
-            .iter()
-            .map(|&(_, at)| content::path_key(&table.get(at).path))
-            .collect(); // alloc: as above.
-        let slices: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect(); // alloc: as above.
-        let ids = match slices.is_empty() {
-            true => Vec::new(), // alloc: empty, no allocation.
-            false => ContentId::of_many(SourceRoot::PATH_DOMAIN, &slices),
-        };
+        let mut bytes = scratch::lend_bytes();
+        let mut ranges: Vec<std::ops::Range<usize>, &Frame> =
+            Vec::with_capacity_in(self.pending.len(), frame);
+        for &(_, at) in &self.pending {
+            let start = bytes.len();
+            content::path_key_into(&table.get(at).path, &mut bytes);
+            ranges.push(start..bytes.len());
+        }
+        let ids = content::hash_ranges(SourceRoot::PATH_DOMAIN, &bytes, &ranges, frame);
         let mut dirty = std::mem::take(&mut self.moved);
-        for ((hash, _), id) in self.pending.iter().zip(&ids) {
+        for ((hash, _), id) in self.pending.iter().zip(ids) {
             let bucket = bucket_of(*hash);
             self.counts[bucket] += 1;
             for (lane, sum) in self.sums[bucket].iter_mut().enumerate() {

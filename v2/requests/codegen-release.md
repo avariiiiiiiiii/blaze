@@ -19,6 +19,9 @@ What release LLVM per function (`crates/hir-ty-codegen/v2/release.rs`, `llvm/rel
 
 > forwarded to codegen: inside lane codegen (codegen-adapter's `v2.rs`).
 
+> applied (codegen, checked 2026-10-29): `v2::Function::hint` (`v2.rs:230`) is filled by
+> `v2/backend.rs` `hint(db, instance)`, and release reads `function.hint` (`v2/release.rs`).
+
 ## codegen-devspeed (`fragment.rs`)
 
 1. **A keep-mask from `Wants::referenced`.** Return which requests were kept, or the old-to-new
@@ -27,6 +30,11 @@ What release LLVM per function (`crates/hir-ty-codegen/v2/release.rs`, `llvm/rel
    and stored.
 
 > forwarded to codegen: inside lane codegen (`fragment.rs`).
+
+> applied (codegen, checked 2026-10-29): `Wants::kept`/`referenced` (`fragment.rs`) give the
+> keep-mask, and v2's `convert::function` converts only the data the code's relocations reach
+> (`convert.rs` `requests`, "what nothing reaches is none of it"), so an imported body's data
+> LLVM left unused is neither converted nor stored.
 
 ## codegen (parent: the driver, `blaze-codegen`)
 
@@ -48,3 +56,8 @@ What release LLVM per function (`crates/hir-ty-codegen/v2/release.rs`, `llvm/rel
    function. Today it is kept as bitcode in a map by instance key.
 
 > forwarded to codegen: every item is inside lane codegen (codegen-adapter, codegen-devspeed, the parent).
+
+> applied (codegen, checked 2026-10-29): 1, the driver calls `imports::close` before deciding
+> (`driver.rs`); 2, `Emitted::extra` with `Template::externs` (backend-named symbols kept by
+> name, memo key unchanged); 3, `Prepare::summarize(.., &mut Prepared, ..)` keeps the
+> pre-linked module in the prepared function, with no bitcode round trip.

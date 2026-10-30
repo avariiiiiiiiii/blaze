@@ -11,13 +11,13 @@ use vfs::AbsPath;
 /// Whether the proc macros of the crate named (as rustc names it) in the workspace at the
 /// first path, whose library is at the second, run outside the sandbox. It is asked of each
 /// library before a server is started for it.
-pub type Unsandboxed = dyn Fn(&AbsPath, &str, &AbsPath) -> bool + Send + Sync;
+pub type Unsandboxed = fn(&AbsPath, &str, &AbsPath) -> bool;
 
-static UNSANDBOXED: OnceLock<Box<Unsandboxed>> = OnceLock::new();
+static UNSANDBOXED: OnceLock<Unsandboxed> = OnceLock::new();
 
 /// Has the proc macros `unsandboxed` names be expanded by servers started outside the
 /// sandbox. The first call is the one kept.
-pub fn unsandboxed_macros_with(unsandboxed: Box<Unsandboxed>) {
+pub fn unsandboxed_macros_with(unsandboxed: Unsandboxed) {
     _ = UNSANDBOXED.set(unsandboxed);
 }
 

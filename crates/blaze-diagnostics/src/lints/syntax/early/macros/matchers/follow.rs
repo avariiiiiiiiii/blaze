@@ -142,6 +142,7 @@ impl Follow<'_> {
                 }
                 Mtt::Sequence { tts, separator, kleene, .. } => {
                     let sub = self.build(tts);
+                    // clone: once per repetition of a matcher, only when `rust_2021_incompatible_or_patterns` may fire
                     self.first.insert(id, sub.clone());
                     if let Some(separator) = separator
                         && sub.maybe_empty

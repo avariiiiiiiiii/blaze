@@ -276,7 +276,7 @@ fn expander_of(root: span::FileId, name: &str) -> ConstMacroExpander {
 /// What the derives of `krate` expanded to, and why they did not, for a failure to say.
 fn derives(db: &TestDB, krate: base_db::Crate) -> String {
     let def_map = hir_def::nameres::crate_def_map(db, krate);
-    let mut out = format!("def map diagnostics: {:?}\n", def_map.diagnostics());
+    let mut out = format!("def map diagnostics: {:?}\n", def_map.diagnostics(db));
     for (_, module) in def_map.modules(db) {
         for (_, invocations) in module.scope(db).derive_macro_invocs() {
             for (_, _, calls) in invocations {

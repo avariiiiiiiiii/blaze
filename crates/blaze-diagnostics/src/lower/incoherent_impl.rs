@@ -11,7 +11,7 @@
 //! `compiler/rustc_hir_analysis/src/diagnostics.rs` (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId, ItemKey};
-use hir::{HasSource as _, HirFileId, InFile};
+use hir::{HirFileId, InFile};
 use hir_def::{
     AdtId, ImplId, TraitId,
     signatures::{
@@ -23,61 +23,64 @@ use hir_def::{
 };
 use intern::sym;
 use syntax::{
-    AstNode, AstPtr, TextRange,
-    ast::{self, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+    AstPtr, TextRange,
+    view::{self as ast, AstNode, HasGenericParams as _, HasName as _, HasTypeBounds as _},
 };
 
 use crate::{
-    cx::{Cx, def_range, item_range},
+    cx::{Cx, def_range_view as def_range, item_range_view as item_range, signature_range_view as signature_range},
     lower::{Found, Phase},
     model::{Diag, Span},
 };
 
-/// An impl a diagnostic is of: hir's item and its syntax, parsed as `cx.sema` parses it.
-pub(crate) struct ImplAt {
+/// An impl a diagnostic is of: hir's item and its syntax, a view of a tree `cx.vsema` gave out.
+pub(crate) struct ImplAt<'db> {
     pub(crate) impl_: hir::Impl,
     pub(crate) id: ImplId,
-    pub(crate) node: InFile<ast::Impl>,
+    pub(crate) node: InFile<ast::Impl<'db>>,
 }
 
-impl ImplAt {
+impl<'db> ImplAt<'db> {
     /// The impl `ptr` in `file_id` points to, as hir's diagnostics name an impl.
-    pub(crate) fn of_ptr(cx: &Cx<'_, '_>, file_id: HirFileId, ptr: AstPtr<ast::Impl>) -> Option<ImplAt> {
-        let node = cx.node(InFile::new(file_id, ptr));
-        let impl_ = cx.sema.to_def2(node.as_ref())?;
+    pub(crate) fn of_ptr(
+        cx: &Cx<'_, 'db>,
+        file_id: HirFileId,
+        ptr: AstPtr<syntax::ast::Impl>,
+    ) -> Option<ImplAt<'db>> {
+        let node = cx.node_view(InFile::new(file_id, ptr));
+        let impl_ = cx.vsema.to_def(node.value)?;
         let id = ImplId::try_from(impl_).ok()?;
         Some(ImplAt { impl_, id, node })
     }
 
     /// `impl_`, when it is written in source (a builtin derive's is not).
-    pub(crate) fn of(cx: &Cx<'_, '_>, impl_: hir::Impl) -> Option<ImplAt> {
+    pub(crate) fn of(cx: &Cx<'_, 'db>, impl_: hir::Impl) -> Option<ImplAt<'db>> {
         let id = ImplId::try_from(impl_).ok()?;
-        let source = impl_.source(cx.db)?;
-        let node = cx.node(source.as_ref().map(|it| AstPtr::new(it)));
+        let node = cx.vsema.source(impl_)?;
         Some(ImplAt { impl_, id, node })
     }
 
     /// rustc's `def_span` of the impl: from `impl` (or `unsafe`) to the end of its header,
     /// where clause included.
     pub(crate) fn span(&self, cx: &Cx<'_, '_>) -> Span {
-        cx.span(self.node.as_ref().map(|it| def_range(it.syntax())))
+        cx.span(self.node.map(|it| def_range(it.syntax())))
     }
 
     /// The span of a node of the impl.
-    pub(crate) fn span_of(&self, cx: &Cx<'_, '_>, node: &impl AstNode) -> Span {
+    pub(crate) fn span_of(&self, cx: &Cx<'_, '_>, node: impl AstNode<'db>) -> Span {
         cx.span(self.node.with_value(node.syntax().text_range()))
     }
 
     /// The type the impl is for, as written.
     pub(crate) fn self_ty_span(&self, cx: &Cx<'_, '_>) -> Span {
         match self.node.value.self_ty() {
-            Some(ty) => self.span_of(cx, &ty),
+            Some(ty) => self.span_of(cx, ty),
             None => self.span(cx),
         }
     }
 
     /// The path of the trait it implements, as written.
-    pub(crate) fn trait_path(&self) -> Option<ast::Path> {
+    pub(crate) fn trait_path(&self) -> Option<ast::Path<'db>> {
         match self.node.value.trait_()? {
             ast::Type::PathType(it) => it.path(),
             _ => None,
@@ -87,7 +90,7 @@ impl ImplAt {
     /// The span of the trait's path, its generic arguments included.
     pub(crate) fn trait_span(&self, cx: &Cx<'_, '_>) -> Span {
         match self.node.value.trait_() {
-            Some(trait_) => self.span_of(cx, &trait_),
+            Some(trait_) => self.span_of(cx, trait_),
             None => self.span(cx),
         }
     }
@@ -104,14 +107,16 @@ impl ImplAt {
 
 /// blaze's own error where it cannot find the impl hir gave an error of: the program is
 /// refused all the same (no-fallback).
-pub(crate) fn unresolved(cx: &Cx<'_, '_>, file_id: HirFileId, ptr: AstPtr<ast::Impl>, what: &str) -> Vec<Found> {
+pub(crate) fn unresolved(cx: &Cx<'_, '_>, file_id: HirFileId, ptr: AstPtr<syntax::ast::Impl>, what: &str) -> Vec<Found> {
     let span = cx.span(InFile::new(file_id, ptr.text_range()));
+    // alloc: the error's text, for an error hir found
     let diag = Diag::error(None, format!("blaze cannot find the impl {what} is of"), span);
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Items)]
 }
 
 /// rustc's `def_span` of a type alias: from its start to the end of its name and generics.
-pub(crate) fn alias_def_range(alias: &ast::TypeAlias) -> TextRange {
+pub(crate) fn alias_def_range(alias: ast::TypeAlias<'_>) -> TextRange {
     let range = item_range(alias.syntax());
     let end = match (alias.generic_param_list(), alias.name()) {
         (Some(generics), _) => generics.syntax().text_range().end(),
@@ -147,6 +152,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
     let mut diag = if is_primitive(&self_ty) {
         if rustc_attrs {
             // With every item allowed rustc takes the impl, as hir does not when it has none.
+            // alloc: empty, allocates nothing
             let Some(item) = first_unallowed() else { return Vec::new() };
             let mut diag = Diag::error(
                 Some("E0390"),
@@ -160,6 +166,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
             let mut diag = Diag::error(Some("E0390"), "cannot define inherent `impl` for primitive types", span);
             diag.help("consider using an extension trait instead");
             if let Some((inner, _)) = self_ty.as_reference() {
+                // alloc: the error's text, for an error hir found
                 diag.note(format!(
                     "you could also try moving the reference to uses of `{}` (such as `self`) within the implementation",
                     cx.ty(&inner)
@@ -173,6 +180,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
                 let mut diag = Diag::error(
                     Some("E0390"),
                     "cannot define inherent `impl` for a type outside of the crate where the type is defined",
+                    // clone: on the error path, for an error hir found
                     span.clone(),
                 );
                 diag.help("consider moving this inherent impl into the crate defining the type if possible");
@@ -182,6 +190,7 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
                 );
                 diag
             } else {
+                // alloc: empty, allocates nothing
                 let Some(item) = first_unallowed() else { return Vec::new() };
                 let mut diag = Diag::error(
                     Some("E0390"),
@@ -199,27 +208,33 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncoherentImpl) -> Vec<Found> {
         || self_ty.as_associated_type_parent_trait(cx.db).is_some()
         || self_ty.as_impl_traits(cx.db).is_some()
     {
+        // clone: on the error path, for an error hir found
         let mut diag = Diag::error(Some("E0118"), "no nominal type found for inherent implementation", span.clone());
         diag.span_label(span, "impl requires a nominal type");
         diag.note("either implement a trait on it or create a newtype to wrap it instead");
         diag
     } else {
+        // clone: on the error path, for an error hir found
         let mut diag = Diag::error(Some("E0785"), "cannot define inherent `impl` for a dyn auto trait", span.clone());
         diag.span_label(span, "impl requires at least one non-auto trait");
         diag.note("define and implement a new trait or type instead");
         diag
     };
     let ty = cx.ty(&self_ty);
+    // alloc: the error's text, for an error hir found
     diag.fact(at.coherence(cx), format!("the coherence of the inherent impl of `{ty}`"));
     match nominal(&self_ty) {
         Some(Nominal::Adt(adt)) => {
+            // alloc: the error's text, for an error hir found
             diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("where `{ty}` is defined"));
         }
         Some(Nominal::Trait(trait_)) => {
+            // alloc: the error's text, for an error hir found
             diag.fact(Fact::Signature(cx.key(ItemId::Trait(trait_.into()))), format!("where `{ty}` is defined"));
         }
         None => {}
     }
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Items)]
 }
 
@@ -238,34 +253,37 @@ fn nominal(ty: &hir::Type<'_>) -> Option<Nominal> {
 }
 
 /// `InherentTyOutsideNew`: E0116, with the note on an alias when the impl names one.
-fn outside_new(cx: &Cx<'_, '_>, at: &ImplAt, span: Span) -> Diag {
+fn outside_new<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>, span: Span) -> Diag {
     let mut diag = Diag::error(
         Some("E0116"),
         "cannot define inherent `impl` for a type outside of the crate where the type is defined",
+        // clone: on the error path, for an error hir found
         span.clone(),
     );
     diag.span_label(span, "impl for type defined outside of crate");
     diag.help("consider defining a trait and implementing it for the type or using a newtype wrapper like `struct MyType(ExternalType);` and implement it");
     diag.note("for more details about the orphan rules, see <https://doc.rust-lang.org/reference/items/implementations.html?highlight=orphan#orphan-rules>");
     if let Some(alias) = self_ty_alias(cx, at)
-        && let Some(source) = alias.source(cx.db)
+        && let Some(source) = cx.vsema.source(alias)
     {
-        let alias_span = cx.span(source.as_ref().map(alias_def_range));
+        let alias_span = cx.span(source.map(alias_def_range));
         let ty_name = cx.def_path(hir::ModuleDef::TypeAlias(alias));
         let alias_ty = cx.ty(&alias.ty(cx.db));
         diag.span_note(
             alias_span,
+            // alloc: the error's text, for an error hir found
             format!("`{ty_name}` does not define a new type, only an alias of `{alias_ty}` defined here"),
         );
+        // alloc: the error's text, for an error hir found
         diag.fact(Fact::Signature(cx.key(ItemId::Alias(alias.into()))), format!("what `{ty_name}` is an alias of"));
     }
     diag
 }
 
 /// The type alias the impl's self type is written as, when it is a path to one.
-fn self_ty_alias(cx: &Cx<'_, '_>, at: &ImplAt) -> Option<hir::TypeAlias> {
+fn self_ty_alias<'db>(cx: &Cx<'_, 'db>, at: &ImplAt<'db>) -> Option<hir::TypeAlias> {
     let ast::Type::PathType(ty) = at.node.value.self_ty()? else { return None };
-    match cx.sema.resolve_path(&ty.path()?)? {
+    match cx.vsema.resolve_path(ty.path()?)? {
         hir::PathResolution::Def(hir::ModuleDef::TypeAlias(alias)) => Some(alias),
         _ => None,
     }
@@ -318,20 +336,20 @@ fn first_item_without_allow(cx: &Cx<'_, '_>, id: ImplId) -> Option<Span> {
 pub(crate) fn assoc_def_span(cx: &Cx<'_, '_>, item: hir::AssocItem) -> Option<Span> {
     match item {
         hir::AssocItem::Function(it) => {
-            let source = it.source(cx.db)?;
-            Some(cx.span(source.as_ref().map(crate::cx::signature_range)))
+            let source = cx.vsema.source(it)?;
+            Some(cx.span(source.map(signature_range)))
         }
         hir::AssocItem::Const(it) => {
-            let source = it.source(cx.db)?;
-            Some(cx.span(source.as_ref().map(|it| {
+            let source = cx.vsema.source(it)?;
+            Some(cx.span(source.map(|it| {
                 let range = item_range(it.syntax());
                 let end = it.ty().map_or(range.end(), |ty| ty.syntax().text_range().end());
                 TextRange::new(range.start(), end)
             })))
         }
         hir::AssocItem::TypeAlias(it) => {
-            let source = it.source(cx.db)?;
-            Some(cx.span(source.as_ref().map(|it| {
+            let source = cx.vsema.source(it)?;
+            Some(cx.span(source.map(|it| {
                 let range = alias_def_range(it);
                 let end = it
                     .type_bound_list()
@@ -347,9 +365,9 @@ pub(crate) fn assoc_def_span(cx: &Cx<'_, '_>, item: hir::AssocItem) -> Option<Sp
 /// body included, from after its attributes.
 pub(crate) fn assoc_item_span(cx: &Cx<'_, '_>, item: hir::AssocItem) -> Option<Span> {
     let range = match item {
-        hir::AssocItem::Function(it) => it.source(cx.db)?.map(|it| item_range(it.syntax())),
-        hir::AssocItem::Const(it) => it.source(cx.db)?.map(|it| item_range(it.syntax())),
-        hir::AssocItem::TypeAlias(it) => it.source(cx.db)?.map(|it| item_range(it.syntax())),
+        hir::AssocItem::Function(it) => cx.vsema.source(it)?.map(|it| item_range(it.syntax())),
+        hir::AssocItem::Const(it) => cx.vsema.source(it)?.map(|it| item_range(it.syntax())),
+        hir::AssocItem::TypeAlias(it) => cx.vsema.source(it)?.map(|it| item_range(it.syntax())),
     };
     Some(cx.span(range))
 }
@@ -357,9 +375,9 @@ pub(crate) fn assoc_item_span(cx: &Cx<'_, '_>, item: hir::AssocItem) -> Option<S
 /// The identifier of an associated item, as written.
 pub(crate) fn assoc_name_span(cx: &Cx<'_, '_>, item: hir::AssocItem) -> Option<Span> {
     let name = match item {
-        hir::AssocItem::Function(it) => it.source(cx.db)?.map(|it| it.name()),
-        hir::AssocItem::Const(it) => it.source(cx.db)?.map(|it| it.name()),
-        hir::AssocItem::TypeAlias(it) => it.source(cx.db)?.map(|it| it.name()),
+        hir::AssocItem::Function(it) => cx.vsema.source(it)?.map(|it| it.name()),
+        hir::AssocItem::Const(it) => cx.vsema.source(it)?.map(|it| it.name()),
+        hir::AssocItem::TypeAlias(it) => cx.vsema.source(it)?.map(|it| it.name()),
     };
     let range = name.value?.syntax().text_range();
     Some(cx.span(InFile::new(name.file_id, range)))

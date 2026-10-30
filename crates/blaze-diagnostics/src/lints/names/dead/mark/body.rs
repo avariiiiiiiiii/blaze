@@ -32,7 +32,10 @@ use hir_def::{
 };
 use hir_ty::{Adjust, InferenceResult, next_solver::Ty};
 use smallvec::SmallVec;
-use syntax::{AstNode, SyntaxNodePtr, ast};
+use syntax::{
+    SyntaxNodePtr,
+    view::{self as ast, AstNode as _},
+};
 
 use super::{
     super::{
@@ -487,9 +490,9 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
     fn offset_of(&mut self, expr: ExprId) {
         let cx = self.m.k.cx;
         let Some(ptr) = self.node(expr) else { return };
-        let Some(it) = ast::OffsetOfExpr::cast(cx.syntax(ptr).value) else { return };
+        let Some(it) = ast::OffsetOfExpr::cast(cx.syntax_view(ptr).value) else { return };
         for name in it.fields() {
-            if let Some((Either::Right(field), _)) = cx.sema.resolve_offset_of_field(&name)
+            if let Some((Either::Right(field), _)) = cx.vsema.resolve_offset_of_field(name)
                 && let Some(field) = self.m.k.defs.get(Id::Field(FieldId::from(field)))
             {
                 self.m.insert_def_id(field);
@@ -520,7 +523,7 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         }
         let cx = self.m.k.cx;
         let Some(at) = self.node(assign) else { return };
-        if crate::lints::syntax::from_expansion(cx, cx.syntax(at).as_ref()) {
+        if crate::lints::syntax::from_expansion(cx, cx.syntax_view(at)) {
             return;
         }
         if !self.m.self_assigns.insert(at) {
@@ -584,7 +587,7 @@ impl<'w, 'k, 'c, 'a, 'db> Walk<'w, 'k, 'c, 'a, 'db> {
         if k.defs.in_anon
             && let Some(ptr) = self.node(expr)
         {
-            let own = closure && self.m.propagated && k.levels.at(k.cx, k.cx.syntax(ptr).as_ref()).is_allow_or_expect();
+            let own = closure && self.m.propagated && k.levels.at(k.cx, k.cx.syntax_view(ptr)).is_allow_or_expect();
             if !own {
                 self.m.live.anon.insert(ptr);
             }

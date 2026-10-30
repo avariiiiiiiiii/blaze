@@ -1,5 +1,4 @@
 use std::collections::hash_map::Entry;
-use std::mem;
 
 use rustc_type_ir::inherent::*;
 use rustc_type_ir::solve::{Goal, QueryInput};
@@ -8,7 +7,6 @@ use rustc_type_ir::{
     Const, Flags, InferCtxtLike, Interner, PlaceholderConst, PlaceholderType, PredicateProxy,
     Region, TypeFlags, TypeFoldable, TypeFolder, TypeSuperFoldable, TypeVisitableExt,
 };
-use thin_vec::ThinVec;
 
 use crate::delegate::SolverDelegate;
 
@@ -95,7 +93,7 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
         };
         debug_assert!(!value.has_infer(), "unexpected infer in {value:?}");
         debug_assert!(!value.has_placeholders(), "unexpected placeholders in {value:?}");
-        let (max_universe, _variables, var_kinds) = canonicalizer.finalize();
+        let (max_universe, var_kinds) = canonicalizer.finalize();
 
         Canonical { max_universe, var_kinds, value }
     }
@@ -201,10 +199,14 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
     ///
     /// We want to keep the option of canonicalizing `'static` to an existential
     /// variable in the future by changing the way we detect global where-bounds.
+    ///
+    /// The original values are appended to `orig_values`, so the canonicalizer state keeps
+    /// its own buffer for the next canonicalization.
     pub(super) fn canonicalize_input<P: TypeFoldable<I>>(
         delegate: &'a D,
         input: QueryInput<I, P>,
-    ) -> (ThinVec<I::GenericArg>, ty::Canonical<I, QueryInput<I, P>>) {
+        mut orig_values: Vec<I::GenericArg>,
+    ) -> (Vec<I::GenericArg>, ty::Canonical<I, QueryInput<I, P>>) {
         // First canonicalize the `param_env` while keeping `'static`. This produces a
         // canonicalizer that can canonicalize the rest of the input without keeping `'static`.
         let (param_env, mut rest_canonicalizer) =
@@ -226,8 +228,9 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
 
         debug_assert!(!value.has_infer(), "unexpected infer in {value:?}");
         debug_assert!(!value.has_placeholders(), "unexpected placeholders in {value:?}");
-        let (max_universe, variables, var_kinds) = rest_canonicalizer.finalize();
-        (variables, Canonical { max_universe, var_kinds, value })
+        orig_values.extend_from_slice(&rest_canonicalizer.state.variables);
+        let (max_universe, var_kinds) = rest_canonicalizer.finalize();
+        (orig_values, Canonical { max_universe, var_kinds, value })
     }
 
     fn get_or_insert_bound_var(
@@ -274,7 +277,8 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
         ty::BoundVar::from(idx)
     }
 
-    fn finalize(mut self) -> (ty::UniverseIndex, ThinVec<I::GenericArg>, I::CanonicalVarKinds) {
+    /// Ends the canonicalization: its state, `variables` included, goes back to the delegate.
+    fn finalize(mut self) -> (ty::UniverseIndex, I::CanonicalVarKinds) {
         // See the rustc-dev-guide section about how we deal with universes
         // during canonicalization in the new solver.
         let max_universe = match self.canonicalize_mode {
@@ -310,14 +314,13 @@ impl<'a, D: SolverDelegate<Interner = I>, I: Interner> Canonicalizer<'a, D, I> {
                     .unwrap_or(ty::UniverseIndex::ROOT)
             }
         };
-        let variables = mem::take(&mut self.state.variables);
         let var_kinds = self.delegate.cx().mk_canonical_var_kinds(&self.state.var_kinds);
 
         // We have finished with this canonicalizer and can return its state to the delegate for
         // later reuse.
         self.delegate.release_canonicalizer_state(self.state);
 
-        (max_universe, variables, var_kinds)
+        (max_universe, var_kinds)
     }
 
     fn inner_fold_ty(&mut self, t: I::Ty) -> I::Ty {

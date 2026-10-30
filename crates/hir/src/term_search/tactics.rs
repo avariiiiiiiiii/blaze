@@ -4,7 +4,7 @@
 //! * `ctx` - Context for the term search
 //! * `defs` - Set of items in scope at term search target location
 //! * `lookup` - Lookup table for types
-//! * `should_continue` - Function that indicates when to stop iterating
+//! * `fuel` - The units of work left, which stop the iteration when they run out
 //!
 //! And they return iterator that yields type trees that unify with the `goal` type.
 
@@ -19,7 +19,7 @@ use crate::{
     ModuleDef, ScopeDef, Type, TypeParam, term_search::Expr,
 };
 
-use super::{LookupTable, NewTypesKey, TermSearchCtx};
+use super::{Fuel, LookupTable, NewTypesKey, TermSearchCtx};
 
 /// # Trivial tactic
 ///
@@ -122,12 +122,12 @@ pub(super) fn assoc_const<'a, 'lt, 'db>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
-/// * `should_continue` - Function that indicates when to stop iterating
+/// * `fuel` - The units of work left, which stop the iteration when they run out
 pub(super) fn data_constructor<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
-    should_continue: &'a dyn std::ops::Fn() -> bool,
+    fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
@@ -137,7 +137,7 @@ pub(super) fn data_constructor<'a, 'lt, 'db>(
         .into_iter()
         .chain(iter::once(ctx.goal.clone()))
         .filter_map(|ty| ty.as_adt().map(|adt| (adt, ty)))
-        .filter(|_| should_continue())
+        .filter(|_| fuel.should_continue())
         .filter_map(move |(adt, ty)| match adt {
             Adt::Struct(strukt) => {
                 // Ignore unstable or not visible
@@ -265,12 +265,12 @@ pub(super) fn data_constructor<'a, 'lt, 'db>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
-/// * `should_continue` - Function that indicates when to stop iterating
+/// * `fuel` - The units of work left, which stop the iteration when they run out
 pub(super) fn free_function<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
-    should_continue: &'a dyn std::ops::Fn() -> bool,
+    fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
@@ -312,7 +312,7 @@ pub(super) fn free_function<'a, 'lt, 'db>(
                     .permutations(non_default_type_params_len);
 
                 let exprs: Vec<_> = generic_params
-                    .filter(|_| should_continue())
+                    .filter(|_| fuel.should_continue())
                     .filter_map(|generics| {
                         // Insert default type params
                         let mut g = generics.into_iter();
@@ -401,12 +401,12 @@ pub(super) fn free_function<'a, 'lt, 'db>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
-/// * `should_continue` - Function that indicates when to stop iterating
+/// * `fuel` - The units of work left, which stop the iteration when they run out
 pub(super) fn impl_method<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
-    should_continue: &'a dyn std::ops::Fn() -> bool,
+    fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
@@ -414,7 +414,7 @@ pub(super) fn impl_method<'a, 'lt, 'db>(
         .new_types(NewTypesKey::ImplMethod)
         .into_iter()
         .filter(|ty| !ty.type_arguments().any(|it| it.contains_unknown()))
-        .filter(|_| should_continue())
+        .filter(|_| fuel.should_continue())
         .flat_map(|ty| {
             Impl::all_for_type(db, ty.clone()).into_iter().map(move |imp| (ty.clone(), imp))
         })
@@ -423,7 +423,7 @@ pub(super) fn impl_method<'a, 'lt, 'db>(
             AssocItem::Function(f) => Some((imp, ty, f)),
             _ => None,
         })
-        .filter(|_| should_continue())
+        .filter(|_| fuel.should_continue())
         .filter_map(move |(imp, ty, it)| {
             let fn_generics = GenericDef::from(it);
             let imp_generics = GenericDef::from(imp);
@@ -522,12 +522,12 @@ pub(super) fn impl_method<'a, 'lt, 'db>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
-/// * `should_continue` - Function that indicates when to stop iterating
+/// * `fuel` - The units of work left, which stop the iteration when they run out
 pub(super) fn struct_projection<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
-    should_continue: &'a dyn std::ops::Fn() -> bool,
+    fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
@@ -535,7 +535,7 @@ pub(super) fn struct_projection<'a, 'lt, 'db>(
         .new_types(NewTypesKey::StructProjection)
         .into_iter()
         .map(|ty| (ty.clone(), lookup.find(db, &ty).expect("Expr not in lookup")))
-        .filter(|_| should_continue())
+        .filter(|_| fuel.should_continue())
         .flat_map(move |(ty, targets)| {
             ty.fields(db).into_iter().filter_map(move |(field, filed_ty)| {
                 if !field.is_visible_from(db, module) {
@@ -598,12 +598,12 @@ pub(super) fn famous_types<'a, 'lt, 'db>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
-/// * `should_continue` - Function that indicates when to stop iterating
+/// * `fuel` - The units of work left, which stop the iteration when they run out
 pub(super) fn impl_static_method<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
-    should_continue: &'a dyn std::ops::Fn() -> bool,
+    fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
     let module = ctx.scope.module();
@@ -613,7 +613,7 @@ pub(super) fn impl_static_method<'a, 'lt, 'db>(
         .into_iter()
         .chain(iter::once(ctx.goal.clone()))
         .filter(|ty| !ty.type_arguments().any(|it| it.contains_unknown()))
-        .filter(|_| should_continue())
+        .filter(|_| fuel.should_continue())
         .flat_map(|ty| {
             Impl::all_for_type(db, ty.clone()).into_iter().map(move |imp| (ty.clone(), imp))
         })
@@ -623,7 +623,7 @@ pub(super) fn impl_static_method<'a, 'lt, 'db>(
             AssocItem::Function(f) => Some((imp, ty, f)),
             _ => None,
         })
-        .filter(|_| should_continue())
+        .filter(|_| fuel.should_continue())
         .filter_map(move |(imp, ty, it)| {
             let fn_generics = GenericDef::from(it);
             let imp_generics = GenericDef::from(imp);
@@ -703,12 +703,12 @@ pub(super) fn impl_static_method<'a, 'lt, 'db>(
 /// * `ctx` - Context for the term search
 /// * `defs` - Set of items in scope at term search target location
 /// * `lookup` - Lookup table for types
-/// * `should_continue` - Function that indicates when to stop iterating
+/// * `fuel` - The units of work left, which stop the iteration when they run out
 pub(super) fn make_tuple<'a, 'lt, 'db>(
     ctx: &'a TermSearchCtx<'_, 'db>,
     _defs: &'a FxHashSet<ScopeDef<'db>>,
     lookup: &'lt mut LookupTable<'db>,
-    should_continue: &'a dyn std::ops::Fn() -> bool,
+    fuel: &'a Fuel,
 ) -> impl Iterator<Item = Expr<'db>> + use<'a, 'db, 'lt> {
     let db = ctx.sema.db;
 
@@ -716,7 +716,7 @@ pub(super) fn make_tuple<'a, 'lt, 'db>(
         .types_wishlist()
         .clone()
         .into_iter()
-        .filter(|_| should_continue())
+        .filter(|_| fuel.should_continue())
         .filter(|ty| ty.is_tuple())
         .filter_map(move |ty| {
             // Double check to not contain unknown
@@ -731,7 +731,7 @@ pub(super) fn make_tuple<'a, 'lt, 'db>(
             let exprs: Vec<Expr<'db>> = param_exprs
                 .into_iter()
                 .multi_cartesian_product()
-                .filter(|_| should_continue())
+                .filter(|_| fuel.should_continue())
                 .map(|params| {
                     let tys: Vec<Type<'_>> = params.iter().map(|it| it.ty(db)).collect();
                     let tuple_ty = Type::new_tuple(db, &tys);

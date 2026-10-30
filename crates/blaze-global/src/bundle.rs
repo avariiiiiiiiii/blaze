@@ -71,7 +71,7 @@ impl Locked {
             let checksum = field("checksum").ok_or_else(|| {
                 format!("{name} {version} of crates.io has no checksum in Cargo.lock: nothing says which bytes it is")
             })?;
-            let checksum = unhex(checksum)
+            let checksum = blaze_format::hex::decode::<32>(checksum)
                 .ok_or_else(|| format!("{name} {version}'s checksum {checksum:?} is not 64 hex digits"))?;
             let mut features = features;
             features.sort_unstable();
@@ -81,19 +81,6 @@ impl Locked {
         locked.sort_unstable();
         Ok(locked)
     }
-}
-
-fn unhex(text: &str) -> Option<[u8; 32]> {
-    let bytes = text.as_bytes();
-    if bytes.len() != 64 {
-        return None;
-    }
-    let digit = |it: u8| (it as char).to_digit(16).map(|it| it as u8);
-    let mut out = [0; 32];
-    for (at, pair) in bytes.chunks_exact(2).enumerate() {
-        out[at] = (digit(pair[0])? << 4) | digit(pair[1])?;
-    }
-    Some(out)
 }
 
 /// What a cold build of crates.io dependencies is a function of.

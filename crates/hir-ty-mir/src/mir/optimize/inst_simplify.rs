@@ -26,15 +26,10 @@ use crate::{
 use super::{Location, Mention, visit_body};
 
 fn operand_ty<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, operand: &Operand) -> Option<Ty<'db>> {
-    let ty = match &operand.kind {
-        OperandKind::Copy(place) | OperandKind::Move(place) => {
-            place.as_ref().ty(body, &ctx.infcx, ctx.env).ty
-        }
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        OperandKind::Static(_) => return None,
-    };
-    Some(ctx.normalize(ty))
+    if let OperandKind::Static(_) = operand.kind {
+        return None;
+    }
+    Some(ctx.normalize(ctx.operand_ty(body, operand)))
 }
 
 fn constant_bool(operand: &Operand) -> Option<bool> {

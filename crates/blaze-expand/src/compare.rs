@@ -15,12 +15,11 @@ use std::{
     },
 };
 
-use base_db::{Db, Env};
-use hir_expand::proc_macro::{ProcMacro, ProcMacroKind};
+use base_db::Db;
+use hir_expand::proc_macro::{ProcMacro, ProcMacroCall, ProcMacroKind};
 use paths::{AbsPath, AbsPathBuf};
 use proc_macro_api::ProcMacroClient;
 use rustc_hash::FxHashMap;
-use span::Span;
 
 thread_local! {
     /// Set while blaze's server expands a call again, whose expander is wrapped as every
@@ -107,19 +106,12 @@ impl Compare {
 
 /// Expands the call again with blaze's server and library when asked to, and counts whether
 /// it gave what the toolchain's did.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn again(
     dylib: &AbsPath,
     name: &str,
     kind: ProcMacroKind,
     db: &Db,
-    subtree: &tt::TopSubtree,
-    attrs: Option<&tt::TopSubtree>,
-    env: &Env,
-    def_site: Span,
-    call_site: Span,
-    mixed_site: Span,
-    current_dir: &str,
+    call: ProcMacroCall<'_>,
     toolchain: &Result<tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError>,
 ) {
     let Some(compare) = compare() else { return };
@@ -132,16 +124,7 @@ pub(crate) fn again(
         }
     };
     COMPARING.with(|it| it.set(true));
-    let ours = mac.expander.expand(
-        db,
-        subtree,
-        attrs,
-        env,
-        def_site,
-        call_site,
-        mixed_site,
-        current_dir.to_owned(), // alloc: the edge: the expander's interface takes its directory owned
-    );
+    let ours = mac.expander.expand(db, call);
     COMPARING.with(|it| it.set(false));
     COUNTS.compared[crate::kind_byte(kind) as usize].fetch_add(1, Ordering::Relaxed);
     let same = match (toolchain, &ours) {

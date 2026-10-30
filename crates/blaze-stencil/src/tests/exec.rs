@@ -31,6 +31,7 @@ use std::{
     ptr,
 };
 
+use blaze_inproc::exec::Executable;
 use cranelift_codegen::{
     binemit::Reloc as Kind,
     data_value::DataValue,
@@ -164,9 +165,9 @@ struct Slot([u8; 16]);
 
 /// Linked, executable code of one or more units.
 pub struct Exec {
-    code: Map,
-    data: Map,
-    /// Each unit's offset in `code`, the linked units then their trampolines.
+    /// The code, then the GOT, the counter cells and the data objects.
+    exec: Executable,
+    /// Each unit's offset in the code, the linked units then their trampolines.
     at: Vec<usize>,
     sigs: Vec<ir::Signature>,
     units: usize,
@@ -258,73 +259,82 @@ impl Exec {
         }
         let data_len = page(data_end.max(1));
 
-        let (code, data) = Map::pair(code_len, data_len);
-        let mut writer = Writer::new(&code, &data, veneers, calls, gots);
-        // SAFETY: `code` and `data` are fresh mappings of `code_len` and `data_len` bytes,
-        // writable on this thread between `Writer::new` and `Writer::finish`. Every unit's
-        // bytes end at or before `veneers` (laid out above), and every object at or before
-        // `data_end`, so no copy leaves its mapping.
-        unsafe {
+        let symbols = Symbols::new();
+        // The units are written at the addresses they run at, so the relocations resolve as
+        // the code is copied in; then `Executable` makes it executable.
+        let write = |code_bytes: &mut [u8], data_bytes: &mut [u8]| {
             for (view, at) in views.iter().zip(&at) {
-                ptr::copy_nonoverlapping(view.bytes.as_ptr(), code.at.add(*at), view.bytes.len());
+                code_bytes[*at..*at + view.bytes.len()].copy_from_slice(view.bytes);
             }
             for (blob, (at, len)) in link.data.iter().zip(&blobs) {
-                ptr::copy_nonoverlapping(blob.as_ptr(), data.at.add(*at), *len);
+                data_bytes[*at..*at + *len].copy_from_slice(blob);
             }
-        }
-        let symbols = Symbols::new();
-        for (i, view) in views.iter().enumerate() {
-            for reloc in view.relocs {
-                let target = match reloc.name {
-                    Name::User { namespace: FUNCS, index } => {
-                        let index = index as usize;
-                        assert!(index < units, "a call of unit {index} of {units}");
-                        code.at as usize + at[index]
-                    }
-                    Name::User { namespace: DATA, index } => {
-                        let (at, _) = blobs[index as usize];
-                        data.at as usize + at
-                    }
-                    Name::User { namespace: HOST, index } => link.host[index as usize],
-                    Name::User { namespace, index } => {
-                        panic!("unit {i}: a relocation against u{namespace}:{index}, which no test makes")
-                    }
-                    Name::LibCall(call) => symbols.libcall(call),
-                    Name::Known(symbol) => panic!("unit {i}: a relocation against {symbol:?}"),
-                    Name::Own(offset) => code.at as usize + at[i] + offset as usize,
-                    Name::Counter => data.at as usize + counters + i * 16,
-                };
-                let place = code.at as usize + at[i] + reloc.at as usize;
-                assert!(
-                    reloc.at as usize + reloc_len(reloc.kind) <= view.bytes.len(),
-                    "unit {i}: a {:?} at {} past its {} bytes",
-                    reloc.kind,
-                    reloc.at,
-                    view.bytes.len()
-                );
-                writer.relocate(i, place, reloc.kind, target, reloc.addend);
+            // The slices are not used again: the writer patches through these pointers.
+            let (code, data) = (code_bytes.as_mut_ptr(), data_bytes.as_mut_ptr());
+            let mut writer = Writer::new(code, data, veneers, calls, gots);
+            for (i, view) in views.iter().enumerate() {
+                for reloc in view.relocs {
+                    let target = match reloc.name {
+                        Name::User { namespace: FUNCS, index } => {
+                            let index = index as usize;
+                            assert!(index < units, "a call of unit {index} of {units}");
+                            code as usize + at[index]
+                        }
+                        Name::User { namespace: DATA, index } => {
+                            let (at, _) = blobs[index as usize];
+                            data as usize + at
+                        }
+                        Name::User { namespace: HOST, index } => link.host[index as usize],
+                        Name::User { namespace, index } => {
+                            panic!("unit {i}: a relocation against u{namespace}:{index}, which no test makes")
+                        }
+                        Name::LibCall(call) => symbols.libcall(call),
+                        Name::Known(symbol) => panic!("unit {i}: a relocation against {symbol:?}"),
+                        Name::Own(offset) => code as usize + at[i] + offset as usize,
+                        Name::Counter => data as usize + counters + i * 16,
+                    };
+                    let place = code as usize + at[i] + reloc.at as usize;
+                    assert!(
+                        reloc.at as usize + reloc_len(reloc.kind) <= view.bytes.len(),
+                        "unit {i}: a {:?} at {} past its {} bytes",
+                        reloc.kind,
+                        reloc.at,
+                        view.bytes.len()
+                    );
+                    writer.relocate(i, place, reloc.kind, target, reloc.addend);
+                }
             }
-        }
-        writer.finish(code_len);
+        };
+        let exec = Executable::written(code_len, data_len, write)
+            .unwrap_or_else(|it| panic!("executable memory for the units: {}", it.what));
+        let code_at = exec.code_address() as usize;
 
         let mut lsdas = Vec::with_capacity(views.len());
         for view in &views {
             lsdas.push(lsda(view.calls, view.handlers));
         }
-        let frames = Frames::register(link.isa, &views, &at, code.at as usize, &lsdas);
+        let frames = Frames::register(link.isa, &views, &at, code_at, &lsdas);
         let sigs = views.iter().map(|view| view.sig.clone()).collect();
-        Exec { code, data, at, sigs, units, tramps, counters, blobs, _lsdas: lsdas, frames }
+        Exec { exec, at, sigs, units, tramps, counters, blobs, _lsdas: lsdas, frames }
+    }
+
+    fn code_at(&self) -> usize {
+        self.exec.code_address() as usize
+    }
+
+    fn data_at(&self) -> usize {
+        self.exec.data_address() as usize
     }
 
     /// The address of unit `unit`'s code, for a `call_indirect` or a function pointer.
     pub fn addr(&self, unit: usize) -> usize {
         assert!(unit < self.units, "unit {unit} of {}", self.units);
-        self.code.at as usize + self.at[unit]
+        self.code_at() + self.at[unit]
     }
 
     /// The address of data object `index`.
     pub fn data_addr(&self, index: usize) -> usize {
-        self.data.at as usize + self.blobs[index].0
+        self.data_at() + self.blobs[index].0
     }
 
     /// The bytes of data object `index` as the code left them.
@@ -333,14 +343,14 @@ impl Exec {
         let mut out = vec![0; len];
         // SAFETY: the object is `len` bytes at `at` in the live data mapping, and no call is
         // running (calls borrow `self` and have returned), so nothing writes it meanwhile.
-        unsafe { ptr::copy_nonoverlapping(self.data.at.add(at), out.as_mut_ptr(), len) };
+        unsafe { ptr::copy_nonoverlapping((self.data_at() + at) as *const u8, out.as_mut_ptr(), len) };
         out
     }
 
     /// Unit `unit`'s tier counter cells: its calls and its back edges.
     pub fn counts(&self, unit: usize) -> [u64; 2] {
         assert!(unit < self.units, "unit {unit} of {}", self.units);
-        let cell = self.data.at as usize + self.counters + unit * 16;
+        let cell = self.data_at() + self.counters + unit * 16;
         // SAFETY: the cells are 16 bytes, 16-aligned, in the live data mapping; the code
         // writes them only during a call, and none is running.
         unsafe { [ptr::read_volatile(cell as *const u64), ptr::read_volatile((cell + 8) as *const u64)] }
@@ -423,7 +433,7 @@ impl Exec {
     fn prepare(&self, unit: usize, args: &[DataValue]) -> (usize, Vec<Slot>, Vec<Slot>) {
         assert!(unit < self.units, "unit {unit} of {}", self.units);
         let tramp = match &self.tramps[unit] {
-            Ok(tramp) => self.code.at as usize + self.at[*tramp],
+            Ok(tramp) => self.code_at() + self.at[*tramp],
             Err(e) => panic!("unit {unit}: no trampoline for {}: {e}", self.sigs[unit]),
         };
         let sig = &self.sigs[unit];
@@ -534,83 +544,8 @@ fn page(len: usize) -> usize {
     len.max(1).next_multiple_of(page)
 }
 
-/// One anonymous mapping.
-struct Map {
-    at: *mut u8,
-    len: usize,
-}
-
-impl Map {
-    /// The code mapping (writable until [`Writer::finish`]) and the data mapping beside it,
-    /// near enough for 32-bit PC-relative references both ways.
-    fn pair(code_len: usize, data_len: usize) -> (Map, Map) {
-        #[cfg(target_os = "macos")]
-        {
-            // SAFETY: anonymous mappings of fresh memory, checked below; `MAP_JIT` is what
-            // macOS allows to be executable without a signature.
-            let code = unsafe {
-                libc::mmap(
-                    ptr::null_mut(),
-                    code_len,
-                    libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC,
-                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_JIT,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(code, libc::MAP_FAILED, "mmap MAP_JIT: {}", std::io::Error::last_os_error());
-            let code = Map { at: code.cast(), len: code_len };
-            // The data right after the code if the kernel gives it there, which is checked:
-            // the code reaches it PC-relatively.
-            // SAFETY: as above; the hint is only a hint, and the result is checked.
-            let data = unsafe {
-                libc::mmap(
-                    code.at.add(code_len).cast(),
-                    data_len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANON,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(data, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
-            let data = Map { at: data.cast(), len: data_len };
-            let far = (data.at as usize).abs_diff(code.at as usize) + code_len.max(data_len);
-            assert!(far < 1 << 30, "the data mapping is {far:#x} bytes from the code, out of reach");
-            (code, data)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // SAFETY: an anonymous mapping of fresh memory, checked below.
-            let at = unsafe {
-                libc::mmap(
-                    ptr::null_mut(),
-                    code_len + data_len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            assert_ne!(at, libc::MAP_FAILED, "mmap: {}", std::io::Error::last_os_error());
-            let at: *mut u8 = at.cast();
-            // The one mapping is split in two: `Map::drop` of each unmaps its own pages.
-            // SAFETY: `code_len` is within the mapping.
-            let data = unsafe { at.add(code_len) };
-            (Map { at, len: code_len }, Map { at: data, len: data_len })
-        }
-    }
-}
-
-impl Drop for Map {
-    fn drop(&mut self) {
-        // SAFETY: `at..at + len` is a whole number of pages mapped by `Map::pair` and owned
-        // by this `Map` alone; nothing runs or reads it after the `Exec` is dropped.
-        unsafe { libc::munmap(self.at.cast(), self.len) };
-    }
-}
-
-/// Writes code and relocations while the code mapping is writable.
+/// Writes code and relocations while the code is writable: inside `Executable::written`'s
+/// `write`, at the addresses the code runs at.
 struct Writer {
     code: *mut u8,
     data: *mut u8,
@@ -622,16 +557,10 @@ struct Writer {
 }
 
 impl Writer {
-    fn new(code: &Map, data: &Map, veneers: usize, calls: usize, got_cap: usize) -> Writer {
-        #[cfg(target_os = "macos")]
-        // SAFETY: makes this thread's view of `MAP_JIT` pages writable (and not executable)
-        // until `finish`; no code of them runs on this thread meanwhile.
-        unsafe {
-            libc::pthread_jit_write_protect_np(0)
-        };
+    fn new(code: *mut u8, data: *mut u8, veneers: usize, calls: usize, got_cap: usize) -> Writer {
         Writer {
-            code: code.at,
-            data: data.at,
+            code,
+            data,
             veneers,
             calls,
             next_veneer: 0,
@@ -648,7 +577,7 @@ impl Writer {
                 assert!(self.gots.len() < self.got_cap, "more GOT entries than GOT relocations");
                 self.gots.push(target);
                 let entry = self.data as usize + (self.gots.len() - 1) * 8;
-                // SAFETY: the GOT is the first `got_cap * 8` bytes of the data mapping, and
+                // SAFETY: the GOT is the first `got_cap * 8` bytes of the data, and
                 // `entry` is 8-aligned within them.
                 unsafe { ptr::write(entry as *mut u64, target as u64) };
                 self.gots.len() - 1
@@ -680,7 +609,7 @@ impl Writer {
             veneer_bytes[8..].copy_from_slice(&(target as u64).to_le_bytes());
         }
         // SAFETY: the veneer area holds `calls` veneers of `VENEER` bytes after `veneers`,
-        // within the code mapping (`code_len` counted them), writable until `finish`.
+        // within the code (`code_len` counted them), writable while `write` runs.
         unsafe { ptr::copy_nonoverlapping(veneer_bytes.as_ptr(), veneer as *mut u8, VENEER) };
         veneer
     }
@@ -748,7 +677,7 @@ impl Writer {
 
     fn put32(&mut self, place: usize, value: u32) {
         // SAFETY: `place` is a relocation's field, checked to be within its unit's bytes in
-        // the code mapping, writable until `finish`.
+        // the code, writable while `write` runs.
         unsafe { ptr::write_unaligned(place as *mut u32, value) };
     }
 
@@ -762,72 +691,10 @@ impl Writer {
         let inst = unsafe { ptr::read_unaligned(place as *const u32) };
         self.put32(place, (inst & !mask) | bits);
     }
-
-    /// Makes the code executable and visible to instruction fetch.
-    fn finish(self, code_len: usize) {
-        #[cfg(target_os = "macos")]
-        // SAFETY: back to executable, not writable, on this thread; then the instruction
-        // cache is made to see the bytes written (`sys_icache_invalidate`, libSystem).
-        unsafe {
-            libc::pthread_jit_write_protect_np(1);
-            sys_icache_invalidate(self.code.cast(), code_len);
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            // SAFETY: the code mapping's own pages, made read and execute only.
-            let ok = unsafe {
-                libc::mprotect(self.code.cast(), code_len, libc::PROT_READ | libc::PROT_EXEC)
-            };
-            assert_eq!(ok, 0, "mprotect: {}", std::io::Error::last_os_error());
-            #[cfg(target_arch = "aarch64")]
-            // SAFETY: cache maintenance by address over the mapping's readable pages.
-            unsafe {
-                flush_icache(self.code, code_len)
-            };
-        }
-    }
 }
 
 fn rel32(unit: usize, kind: Kind, delta: i64) -> i32 {
     i32::try_from(delta).unwrap_or_else(|_| panic!("unit {unit}: {kind:?} of {delta:#x} out of range"))
-}
-
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn sys_icache_invalidate(start: *mut c_void, len: usize);
-}
-
-/// Cleans the data cache and invalidates the instruction cache over `len` bytes at `start`,
-/// by the line sizes `CTR_EL0` gives.
-///
-/// # Safety
-///
-/// `start..start + len` is mapped readable.
-#[cfg(all(not(target_os = "macos"), target_arch = "aarch64"))]
-unsafe fn flush_icache(start: *mut u8, len: usize) {
-    use std::arch::asm;
-    let ctr: u64;
-    // SAFETY: `CTR_EL0` is readable at EL0 on Linux.
-    unsafe { asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack)) };
-    let dline = 4usize << ((ctr >> 16) & 0xf);
-    let iline = 4usize << (ctr & 0xf);
-    let (start, end) = (start as usize, start as usize + len);
-    let mut at = start & !(dline - 1);
-    while at < end {
-        // SAFETY: a cache clean of a readable address (the caller's contract).
-        unsafe { asm!("dc cvau, {}", in(reg) at, options(nostack)) };
-        at += dline;
-    }
-    // SAFETY: barriers.
-    unsafe { asm!("dsb ish", options(nostack)) };
-    let mut at = start & !(iline - 1);
-    while at < end {
-        // SAFETY: an instruction cache invalidate of a readable address.
-        unsafe { asm!("ic ivau, {}", in(reg) at, options(nostack)) };
-        at += iline;
-    }
-    // SAFETY: barriers.
-    unsafe { asm!("dsb ish", "isb", options(nostack)) };
 }
 
 /// Runs `f` in a forked child with `len` bytes of memory shared with this process, and gives

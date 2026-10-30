@@ -6,7 +6,10 @@
 //! The steps after an impl look in every impl that matches it: a type's methods may be spread
 //! over several `impl S` blocks.
 
-use syntax::{AstNode, SyntaxKind, SyntaxNode, ast};
+use syntax::{
+    SyntaxKind,
+    view::{self as ast, AstNode as _, Node},
+};
 
 /// What one step of a path names.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -132,6 +135,11 @@ fn squeeze(text: &str) -> String {
     text.chars().filter(|it| !it.is_whitespace()).collect()
 }
 
+/// Whether `text` with its whitespace removed is `squeezed`.
+fn squeezes_to(text: &str, squeezed: &str) -> bool {
+    text.chars().filter(|it| !it.is_whitespace()).eq(squeezed.chars())
+}
+
 fn strip_raw(name: &str) -> &str {
     name.strip_prefix("r#").unwrap_or(name)
 }
@@ -196,10 +204,9 @@ fn top_level_as(body: &str) -> Option<usize> {
 /// The nodes a container holds that a path can name: a file's or module's items (and those of
 /// its extern blocks), an impl's or trait's, a struct's, union's or variant's fields, an enum's
 /// variants.
-pub fn members(container: &SyntaxNode) -> Vec<SyntaxNode> {
-    let mut out = Vec::new();
+pub fn members<'t>(container: Node<'t>) -> impl Iterator<Item = Node<'t>> {
     let list = match container.kind() {
-        SyntaxKind::SOURCE_FILE => Some(container.clone()),
+        SyntaxKind::SOURCE_FILE => Some(container),
         SyntaxKind::MODULE => container.child_where(|it| it == SyntaxKind::ITEM_LIST),
         SyntaxKind::IMPL | SyntaxKind::TRAIT => {
             container.child_where(|it| it == SyntaxKind::ASSOC_ITEM_LIST)
@@ -210,75 +217,92 @@ pub fn members(container: &SyntaxNode) -> Vec<SyntaxNode> {
         SyntaxKind::ENUM => container.child_where(|it| it == SyntaxKind::VARIANT_LIST),
         _ => None,
     };
-    let Some(list) = list else { return out };
-    for child in list.children() {
-        if child.kind() == SyntaxKind::EXTERN_BLOCK {
-            if let Some(items) = child.child_where(|it| it == SyntaxKind::EXTERN_ITEM_LIST) {
-                out.extend(items.children().filter(|it| Kind::of(it.kind()).is_some()));
-            }
-        } else if Kind::of(child.kind()).is_some() {
-            out.push(child);
-        }
-    }
-    out
+    list.into_iter().flat_map(Node::children).flat_map(|child| {
+        let externs = match child.kind() {
+            SyntaxKind::EXTERN_BLOCK => child.child_where(|it| it == SyntaxKind::EXTERN_ITEM_LIST),
+            _ => None,
+        };
+        let own = Kind::of(child.kind()).is_some().then_some(child);
+        own.into_iter()
+            .chain(externs.into_iter().flat_map(Node::children).filter(|it| Kind::of(it.kind()).is_some()))
+    })
 }
 
 /// The name a member goes by: its name, or a tuple field's index.
-pub fn name_of(member: &SyntaxNode) -> Option<String> {
+pub fn name_of(member: Node<'_>) -> Option<String> {
     if member.kind() == SyntaxKind::TUPLE_FIELD {
         let list = member.parent()?;
         let at = list
             .children()
             .filter(|it| it.kind() == SyntaxKind::TUPLE_FIELD)
-            .position(|it| it == *member)?;
+            .position(|it| it == member)?;
         return Some(at.to_string());
     }
+    Some(own_name(member)?.to_owned())
+}
+
+/// The text of a member's name, for one with a name.
+fn own_name(member: Node<'_>) -> Option<&str> {
     let name = member.child_where(|it| it == SyntaxKind::NAME)?;
-    Some(ast::Name::cast(name)?.text().to_owned())
+    Some(ast::Name::cast(name)?.text())
 }
 
 /// An impl's type and trait, whitespace removed.
-fn impl_of(member: &SyntaxNode) -> Option<(String, Option<String>)> {
-    let imp = ast::Impl::cast(member.clone())?;
-    let ty = squeeze(&imp.self_ty()?.syntax().text().to_string());
-    let of = imp.trait_().map(|it| squeeze(&it.syntax().text().to_string()));
+fn impl_of(member: Node<'_>) -> Option<(String, Option<String>)> {
+    let imp = ast::Impl::cast(member)?;
+    let ty = squeeze(imp.self_ty()?.syntax().text());
+    let of = imp.trait_().map(|it| squeeze(it.syntax().text()));
     Some((ty, of))
 }
 
-fn matches(member: &SyntaxNode, step: &Step<'_>) -> bool {
+/// Whether `member` is an impl whose type and trait, whitespace removed, are `ty` and `of`.
+fn impl_is(member: Node<'_>, ty: &str, of: Option<&str>) -> bool {
+    let Some(imp) = ast::Impl::cast(member) else { return false };
+    imp.self_ty().is_some_and(|it| squeezes_to(it.syntax().text(), ty))
+        && match (imp.trait_(), of) {
+            (None, None) => true,
+            (Some(its), Some(of)) => squeezes_to(its.syntax().text(), of),
+            _ => false,
+        }
+}
+
+fn matches(member: Node<'_>, step: &Step<'_>) -> bool {
     match step {
         Step::Named { kind, name } => {
             kind.is_none_or(|kind| Kind::of(member.kind()) == Some(kind))
                 && member.kind() != SyntaxKind::IMPL
-                && name_of(member).is_some_and(|it| strip_raw(&it) == strip_raw(name))
+                && match member.kind() {
+                    SyntaxKind::TUPLE_FIELD => name_of(member).is_some_and(|it| it == strip_raw(name)),
+                    _ => own_name(member).is_some_and(|it| strip_raw(it) == strip_raw(name)),
+                }
         }
-        Step::Impl { ty, of, .. } => {
-            impl_of(member).is_some_and(|(its_ty, its_of)| its_ty == *ty && its_of == *of)
-        }
+        Step::Impl { ty, of, .. } => impl_is(member, ty, of.as_deref()),
     }
 }
 
-fn describe(node: &SyntaxNode) -> String {
+fn describe(node: &Node<'_>) -> String {
     let kind = Kind::of(node.kind()).map_or("item", Kind::keyword);
     format!("{kind} at byte {}", u32::from(node.text_range().start()))
 }
 
 /// The one node `path` names in the file whose tree is `root`.
-pub fn find(root: &SyntaxNode, path: &str) -> Result<SyntaxNode, String> {
-    let mut frontier = vec![root.clone()];
+pub fn find<'t>(root: Node<'t>, path: &str) -> Result<Node<'t>, String> {
+    let mut frontier = vec![root];
     let parts = split(path)?;
     for (at, part) in parts.iter().enumerate() {
         let step = step(part, path)?;
-        let mut found: Vec<SyntaxNode> = frontier
+        let mut found: Vec<Node<'t>> = frontier
             .iter()
-            .flat_map(members)
-            .filter(|member| matches(member, &step))
+            .flat_map(|it| members(*it))
+            .filter(|member| matches(*member, &step))
             .collect();
         if let Step::Impl { nth: Some(nth), .. } = step {
             let count = found.len();
-            found = vec![found.into_iter().nth(nth).ok_or_else(|| {
+            let one = found.get(nth).copied().ok_or_else(|| {
                 format!("`{path}` asks for impl {nth} of `{part}`, and the file has {count}")
-            })?];
+            })?;
+            found.clear();
+            found.push(one);
         }
         let last = at + 1 == parts.len();
         match (found.len(), &step) {
@@ -306,14 +330,13 @@ pub fn find(root: &SyntaxNode, path: &str) -> Result<SyntaxNode, String> {
 }
 
 /// The path [`find`] takes back to `node`, a member of a chain of containers up to the file.
-pub fn of(node: &SyntaxNode) -> String {
+pub fn of(node: Node<'_>) -> String {
     let mut steps: Vec<String> = Vec::new();
-    let mut at = Some(node.clone());
+    let mut at = Some(node);
     while let Some(node) = at {
-        let parent = container_of(&node);
+        let parent = container_of(node);
         if Kind::of(node.kind()).is_some() {
-            let siblings = parent.as_ref().map(members).unwrap_or_default();
-            steps.push(step_of(&node, &siblings));
+            steps.push(step_of(node, parent));
         }
         at = parent;
     }
@@ -322,7 +345,7 @@ pub fn of(node: &SyntaxNode) -> String {
 }
 
 /// The node whose [`members`] `node` is one of.
-fn container_of(node: &SyntaxNode) -> Option<SyntaxNode> {
+fn container_of(node: Node<'_>) -> Option<Node<'_>> {
     node.ancestors().skip(1).find(|it| {
         matches!(
             it.kind(),
@@ -338,36 +361,40 @@ fn container_of(node: &SyntaxNode) -> Option<SyntaxNode> {
     })
 }
 
-fn step_of(node: &SyntaxNode, siblings: &[SyntaxNode]) -> String {
+/// `node`'s step among the members of `container`, its parent in the chain of containers.
+fn step_of<'t>(node: Node<'t>, container: Option<Node<'t>>) -> String {
+    let siblings = || container.into_iter().flat_map(members);
     if let Some((ty, of)) = impl_of(node) {
         let text = match &of {
             Some(of) => format!("<{ty} as {of}>"),
             None => format!("<{ty}>"),
         };
-        let alike: Vec<&SyntaxNode> = siblings
-            .iter()
-            .filter(|it| impl_of(it).is_some_and(|(t, o)| t == ty && o == of))
-            .collect();
-        if alike.len() > 1 {
-            let nth = alike.iter().position(|it| *it == node).expect("an impl is its own sibling");
+        let alike = || siblings().filter(|it| impl_is(*it, &ty, of.as_deref()));
+        if alike().count() > 1 {
+            let nth = alike().position(|it| it == node).expect("an impl is its own sibling");
             return format!("{text}@{nth}");
         }
         return text;
     }
     let name = name_of(node).unwrap_or_default();
-    let same = siblings
-        .iter()
-        .filter(|it| it.kind() != SyntaxKind::IMPL && name_of(it).as_deref() == Some(&*name))
-        .count();
+    let same = siblings().filter(|it| it.kind() != SyntaxKind::IMPL && named_exactly(*it, &name)).count();
     match Kind::of(node.kind()) {
         Some(kind) if same > 1 => format!("{} {name}", kind.keyword()),
         _ => name,
     }
 }
 
+/// Whether the name `member` goes by is `name`.
+fn named_exactly(member: Node<'_>, name: &str) -> bool {
+    match member.kind() {
+        SyntaxKind::TUPLE_FIELD => name_of(member).is_some_and(|it| it == name),
+        _ => own_name(member) == Some(name),
+    }
+}
+
 /// Whether `node` is a top item: one a path names directly under a file, module, impl or trait,
 /// not one inside a body.
-pub fn is_top(node: &SyntaxNode) -> bool {
+pub fn is_top(node: Node<'_>) -> bool {
     Kind::of(node.kind()).is_some()
         && node.parent().is_some_and(|parent| {
             matches!(
@@ -381,12 +408,12 @@ pub fn is_top(node: &SyntaxNode) -> bool {
 }
 
 /// The top item `node` is in: itself when it is one.
-pub fn top_of(node: &SyntaxNode) -> Option<SyntaxNode> {
-    node.ancestors().find(is_top)
+pub fn top_of(node: Node<'_>) -> Option<Node<'_>> {
+    node.ancestors().find(|it| is_top(*it))
 }
 
 /// The module, impl or trait a top item is in, `None` for one directly in the file.
-pub fn scope_of(item: &SyntaxNode) -> Option<SyntaxNode> {
+pub fn scope_of(item: Node<'_>) -> Option<Node<'_>> {
     item.ancestors().skip(1).find(|it| {
         matches!(it.kind(), SyntaxKind::MODULE | SyntaxKind::IMPL | SyntaxKind::TRAIT)
     })
@@ -394,7 +421,7 @@ pub fn scope_of(item: &SyntaxNode) -> Option<SyntaxNode> {
 
 #[cfg(test)]
 mod tests {
-    use syntax::{Edition, SourceFile};
+    use syntax::{Edition, Parse, SourceFile};
 
     use super::*;
 
@@ -413,15 +440,16 @@ impl<T> From<Vec<T>> for m::T { fn from(_: Vec<T>) -> m::T { make() } }
 extern \"C\" { fn ext(); }
 ";
 
-    fn root() -> SyntaxNode {
-        SourceFile::parse(FILE, Edition::CURRENT).syntax_node()
+    fn parse() -> Parse<SourceFile> {
+        SourceFile::parse(FILE, Edition::CURRENT)
     }
 
     #[track_caller]
     fn round_trip(path: &str, kind: Kind) {
-        let node = find(&root(), path).unwrap_or_else(|error| panic!("{path}: {error}"));
+        let parse = parse();
+        let node = find(parse.root(), path).unwrap_or_else(|error| panic!("{path}: {error}"));
         assert_eq!(Kind::of(node.kind()), Some(kind), "{path}");
-        assert_eq!(of(&node), path);
+        assert_eq!(of(node), path);
     }
 
     #[test]
@@ -442,34 +470,38 @@ extern \"C\" { fn ext(); }
 
     #[test]
     fn steps_after_an_impl_look_in_every_impl_alike() {
-        let node = find(&root(), "m::<S>::other").unwrap();
-        assert_eq!(of(&node), "m::<S>@1::other");
-        let spaced = find(&root(), "< m::T  as From< Vec<T> > >::from").unwrap();
-        assert_eq!(of(&spaced), "<m::T as From<Vec<T>>>::from");
+        let parse = parse();
+        let node = find(parse.root(), "m::<S>::other").unwrap();
+        assert_eq!(of(node), "m::<S>@1::other");
+        let spaced = find(parse.root(), "< m::T  as From< Vec<T> > >::from").unwrap();
+        assert_eq!(of(spaced), "<m::T as From<Vec<T>>>::from");
     }
 
     #[test]
     fn an_ambiguous_or_missing_step_is_an_error_naming_it() {
-        let error = find(&root(), "S").unwrap_err();
+        let parse = parse();
+        let root = parse.root();
+        let error = find(root, "S").unwrap_err();
         assert!(error.contains("`S` names 2 items"), "{error}");
-        let error = find(&root(), "m::<S>").unwrap_err();
+        let error = find(root, "m::<S>").unwrap_err();
         assert!(error.contains("names 2 items"), "{error}");
-        let error = find(&root(), "m::nope").unwrap_err();
+        let error = find(root, "m::nope").unwrap_err();
         assert_eq!(error, "no `nope` in `m`");
-        let error = find(&root(), "m::<S>@5::new").unwrap_err();
+        let error = find(root, "m::<S>@5::new").unwrap_err();
         assert!(error.contains("asks for impl 5"), "{error}");
-        assert!(find(&root(), "m::<S").is_err());
-        assert!(find(&root(), "m::").is_err());
-        assert!(find(&root(), "bogus S").is_err());
+        assert!(find(root, "m::<S").is_err());
+        assert!(find(root, "m::").is_err());
+        assert!(find(root, "bogus S").is_err());
     }
 
     #[test]
     fn top_items_and_their_scopes() {
-        let new = find(&root(), "m::<S>::new").unwrap();
-        assert!(is_top(&new));
-        assert_eq!(scope_of(&new).map(|it| it.kind()), Some(SyntaxKind::IMPL));
-        let field = find(&root(), "m::S::x").unwrap();
-        assert!(!is_top(&field));
-        assert_eq!(top_of(&field).map(|it| of(&it)).as_deref(), Some("m::S"));
+        let parse = parse();
+        let new = find(parse.root(), "m::<S>::new").unwrap();
+        assert!(is_top(new));
+        assert_eq!(scope_of(new).map(|it| it.kind()), Some(SyntaxKind::IMPL));
+        let field = find(parse.root(), "m::S::x").unwrap();
+        assert!(!is_top(field));
+        assert_eq!(top_of(field).map(of).as_deref(), Some("m::S"));
     }
 }

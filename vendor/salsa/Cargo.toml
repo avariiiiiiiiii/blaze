@@ -365,6 +365,10 @@ name = "memory-usage"
 path = "tests/memory-usage.rs"
 
 [[test]]
+name = "mem_frames"
+path = "tests/mem_frames.rs"
+
+[[test]]
 name = "mutate_in_place"
 path = "tests/mutate_in_place.rs"
 

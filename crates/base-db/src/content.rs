@@ -4,10 +4,14 @@
 //! it. Only content is hashed, never a `FileId`, `Crate`, `SourceRootId` or other dense index: a
 //! file is named by its path, another input by its own content ID.
 
-use std::{io::Write as _, ops::Range};
+use std::{cell::RefCell, io::Write as _, ops::Range};
 
 use blaze_format::cursor::Put;
 use blaze_ids::{ContentId, Hasher};
+use blaze_mem::{
+    Frame,
+    scratch::{self, Scratch},
+};
 use cfg::{CfgAtom, CfgOptions};
 use vfs::VfsPath;
 
@@ -56,12 +60,18 @@ pub fn cfg_options_content(cfg: &CfgOptions) -> ContentId {
     hasher.finish()
 }
 
-/// A path as content: whether it is on disk (0) or virtual (1), then its text.
-pub(crate) fn path_key(path: &VfsPath) -> Vec<u8> {
-    // alloc: one key per path a source root gains (per changed file), or per crate (setup).
-    let mut key = vec![if path.as_path().is_some() { 0 } else { 1 }];
-    write!(key, "{path}").expect("writing to a Vec does not fail");
-    key
+/// A path as content, at its exact size: whether it is on disk (0) or virtual (1), then its text.
+pub(crate) fn path_key(path: &VfsPath) -> Box<[u8]> {
+    scratch::with_bytes(|key| {
+        path_key_into(path, key);
+        Box::from(&key[..]) // alloc: the key a source root's content keeps
+    })
+}
+
+/// [`path_key`] appended to `out`, for keys that are only hashed.
+pub(crate) fn path_key_into(path: &VfsPath, out: &mut Vec<u8>) {
+    out.push(if path.as_path().is_some() { 0 } else { 1 });
+    write!(out, "{path}").expect("writing to a Vec does not fail");
 }
 
 pub(crate) fn len(hasher: &mut Hasher, len: usize) {
@@ -86,13 +96,31 @@ pub(crate) fn opt_bytes(out: &mut Vec<u8>, part: Option<&str>) {
     }
 }
 
-/// `ContentId::of(domain, &buf[range])` for each range, through [`ContentId::of_many`]: the
-/// domain's key derived once for all of them, and the inputs laid out in one buffer.
-pub(crate) fn hash_ranges(domain: &'static str, buf: &[u8], ranges: &[Range<usize>]) -> Vec<ContentId> {
-    if ranges.is_empty() {
-        return Vec::new(); // alloc: none, an empty `Vec`.
+thread_local! {
+    /// The IDs of the batch being hashed, kept across setter calls.
+    static IDS: RefCell<Scratch<ContentId>> = const { RefCell::new(Scratch::new()) };
+}
+
+/// `ContentId::of(domain, input)` for each input, in the frame: the domain's key derived once
+/// for all of them, the hasher's buffers and the result's the thread's.
+pub(crate) fn hash_many<'f>(domain: &'static str, inputs: &[&[u8]], frame: &'f Frame) -> &'f [ContentId] {
+    if inputs.is_empty() {
+        return &[];
     }
-    // alloc: one list per batch, beside the batch's IDs `of_many` returns.
-    let inputs: Vec<&[u8]> = ranges.iter().map(|range| &buf[range.start..range.end]).collect();
-    ContentId::of_many(domain, &inputs)
+    IDS.with_borrow_mut(|ids| {
+        let ids = ids.take();
+        ContentId::of_many_into(domain, inputs, ids);
+        &*frame.alloc_slice_copy(ids)
+    })
+}
+
+/// [`hash_many`] of `&buf[range]` for each range: the inputs laid out in one buffer.
+pub(crate) fn hash_ranges<'f>(
+    domain: &'static str,
+    buf: &[u8],
+    ranges: &[Range<usize>],
+    frame: &'f Frame,
+) -> &'f [ContentId] {
+    let inputs = frame.alloc_slice_from_iter(ranges.iter().map(|range| &buf[range.start..range.end]));
+    hash_many(domain, inputs, frame)
 }

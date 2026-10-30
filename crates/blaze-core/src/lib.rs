@@ -17,6 +17,7 @@
 //!
 //! On Windows [`iocp::Iocp`]. Each target's is its [`Native`] driver.
 
+pub mod busy;
 #[cfg(target_os = "linux")]
 mod cgroup;
 pub mod create_process;
@@ -38,6 +39,7 @@ mod net;
 mod process;
 pub mod signal;
 pub mod sim;
+mod tags;
 pub mod threads;
 #[cfg(target_os = "linux")]
 pub mod uring;
@@ -48,6 +50,7 @@ pub mod wheel;
 use std::{fmt, time::Duration};
 
 pub use crate::journal::{Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp};
+pub use crate::tags::Tags;
 
 /// Makes the sandbox of a process: given to a driver by whoever owns the platform's sandbox
 /// (`blaze-usercode`), so the driver starts what it says in place of the program. A driver
@@ -61,6 +64,77 @@ pub trait Confine: Send + Sync {
     /// What the sandbox recorded the process read, once it has exited: asked only of a
     /// sandbox that traces.
     fn traced(&self, command: &Command, scratch: &std::path::Path) -> Result<Traced, String>;
+    /// The warm launcher this sandbox hands its runs to, where it has one: the process a driver
+    /// starts once, and again only after it ended, outside any sandbox and in no job of the
+    /// driver's. Its standard input is a pipe the driver writes [`Confine::hand`]'s frames to,
+    /// its standard output a pipe the driver reads [`Answer`]s from, and its standard error the
+    /// driver's own. A driver given a confine that has one hands it every sandboxed spawn and
+    /// never asks [`Confine::confine`] for one; a driver that can't hand a run fails the spawn,
+    /// naming the launcher. Asked once, as the driver is given the confine.
+    fn warm(&self) -> Option<Confined> {
+        None
+    }
+    /// The frame of `command`'s run for the warm launcher, with `handed` naming what the driver
+    /// passed it for the run: written whole, frames in the order of their spawns. `scratch` is
+    /// as for [`Confine::confine`], and [`Confine::traced`] is asked as for a run it started.
+    /// An error says why the run can't be handed; nothing runs then.
+    fn hand(
+        &self,
+        command: &Command,
+        scratch: &std::path::Path,
+        handed: &Handed,
+    ) -> Result<Vec<u8>, String> {
+        _ = (command, scratch, handed);
+        // alloc: an error path.
+        Err("this sandbox has no warm launcher to hand a run to".to_owned())
+    }
+}
+
+/// What a driver passed a warm launcher for one run ([`Confine::hand`]). On Windows each is a
+/// handle the driver duplicated into the launcher's process, the launcher's from then on: the
+/// standard ones inheritable, the job not. On Unix (the warm launcher of cargo's request 14)
+/// each is the place, from 1, of its descriptor in the `SCM_RIGHTS` message the frame is sent
+/// with. 0 is none.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Handed {
+    /// The driver's name for the run, unique among its launcher's runs in flight, which the
+    /// run's [`Answer`] carries back.
+    pub run: u64,
+    pub stdin: u64,
+    pub stdout: u64,
+    pub stderr: u64,
+    /// The job its processes go in (Windows): made by the driver as for a spawn it starts
+    /// itself (killed on close, a crash ending a process, the command's memory limit), and
+    /// followed, killed and measured by the driver as that spawn's job is.
+    pub job: u64,
+}
+
+/// What a warm launcher writes on its standard output as each run ends: [`Answer::LEN`]
+/// bytes, the run and the code it ended with.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Answer {
+    pub run: u64,
+    pub code: i32,
+}
+
+impl Answer {
+    pub const LEN: usize = 12;
+
+    /// The run, then the code, little-endian.
+    pub fn to_bytes(self) -> [u8; Answer::LEN] {
+        let mut out = [0; Answer::LEN];
+        out[..8].copy_from_slice(&self.run.to_le_bytes());
+        out[8..].copy_from_slice(&self.code.to_le_bytes());
+        out
+    }
+
+    pub fn from_bytes(bytes: [u8; Answer::LEN]) -> Answer {
+        let (run, code) = bytes.split_at(8);
+        Answer {
+            run: u64::from_le_bytes(run.try_into().expect("8 bytes")),
+            code: i32::from_le_bytes(code.try_into().expect("4 bytes")),
+        }
+    }
 }
 
 /// The process a [`Confine`] starts for a command: its whole environment is this one.
@@ -110,6 +184,11 @@ impl fmt::Display for FileName {
         f.write_str(&self.0)
     }
 }
+
+/// The most bytes one [`Effect::Recv`] appends, whatever its `most`: a receive reserves its
+/// room before the bytes come, so an asker of a long frame grows its buffer by this much a
+/// receive, not by the frame's length at once.
+pub const RECV_MOST: usize = 64 << 10;
 
 /// IO a state machine asks for.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -219,12 +298,18 @@ pub enum Effect {
     Unlisten { tag: Tag },
     /// A connection made to `at`; completes with [`Done::Connected`].
     Connect { at: Address, tag: Tag },
-    /// The bytes the peer of `conn` sent since the last receive, at most `most`: empty once it
-    /// has hung up.
-    Recv { conn: Conn, most: usize, tag: Tag },
-    /// All of `bytes` sent on `conn`.
+    /// The bytes the peer of `conn` sent since the last receive, at most `most` and at most
+    /// [`RECV_MOST`], appended to `into` after what it holds: `into` may be empty or hold bytes
+    /// its asker keeps (the start of a frame), which stay as they are. Its capacity never
+    /// shrinks, and grows only to `into.len() + most.min(RECV_MOST)`, so an asker that hands
+    /// each [`Done::Read`]'s buffer to its next receive allocates nothing once it has grown.
+    /// Completes with [`Done::Read`] of `into`, nothing appended once the peer has hung up, or
+    /// with [`Done::Broken`] of it as given.
+    Recv { conn: Conn, most: usize, into: Vec<u8>, tag: Tag },
+    /// All of `bytes` sent on `conn`. Completes with [`Done::Sent`] of `bytes` cleared, its
+    /// capacity kept for the next send, or with [`Done::Broken`] of it cleared.
     Send { conn: Conn, bytes: Vec<u8>, tag: Tag },
-    /// `conn` closed; a receive in flight on it completes empty.
+    /// `conn` closed; a receive in flight on it completes with nothing appended.
     Hangup { conn: Conn, tag: Tag },
 }
 
@@ -283,6 +368,17 @@ pub enum Address {
     Tcp(std::net::SocketAddr),
 }
 
+/// `unix:<name>`, `unix:<name> (fd <fd>)` or `tcp:<addr>`, for errors and logs.
+impl fmt::Display for Address {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Address::Unix(name) => write!(f, "unix:{name}"),
+            Address::Inherited { fd, at } => write!(f, "unix:{at} (fd {fd})"),
+            Address::Tcp(addr) => write!(f, "tcp:{addr}"),
+        }
+    }
+}
+
 /// A connection a listen accepted or a connect made, named by the driver.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Conn(pub u64);
@@ -317,6 +413,11 @@ pub enum Sandbox {
         network: bool,
         /// Whether to record what it read ([`Traced`]).
         trace: bool,
+        /// Mach global names it may look up beyond the few every sandboxed process may (a
+        /// rendezvous the daemon serves, `dev.blaze.inproc.<pid>`): on macOS each is an
+        /// `(allow mach-lookup (global-name ..))` of its profile, and a name the profile can't
+        /// say fails the spawn. Ignored on Linux and Windows, which have no Mach names.
+        services: Vec<String>,
     },
 }
 
@@ -441,6 +542,8 @@ pub struct Meta {
 /// How an [`Effect`] went.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Done {
+    /// Of an [`Effect::ReadAll`] or [`Effect::Read`], the bytes read; of an [`Effect::Recv`],
+    /// its buffer with the bytes received appended.
     Read(Vec<u8>),
     Appended,
     Synced,
@@ -474,12 +577,33 @@ pub enum Done {
     Accepted { conn: Conn },
     Connected { conn: Conn },
     Unlistened,
-    Sent,
+    /// Of an [`Effect::Send`]: its bytes, cleared, their capacity kept.
+    Sent(Vec<u8>),
     HungUp,
+    /// An [`Effect::Send`] or [`Effect::Recv`] that failed, and its buffer back: a send's
+    /// cleared, a receive's as it was given. The one buffer not handed back is a send's that
+    /// io_uring's ring still held when the ring itself failed: the kernel may yet read it, so
+    /// it stays where it is, abandoned, and `buffer` is empty and new.
+    Broken { buffer: Vec<u8>, error: IoError },
     /// It did not happen. For an append, none of its bytes are durable unless a later sync
     /// says so; for a sync, nothing appended since the last successful one is known durable;
     /// for a write, the file is as it was.
     Failed(IoError),
+}
+
+impl Done {
+    /// [`Done::Broken`] of a send's `bytes`, cleared.
+    pub(crate) fn unsent(mut bytes: Vec<u8>, error: impl fmt::Display) -> Done {
+        bytes.clear();
+        // alloc: an error path.
+        Done::Broken { buffer: bytes, error: IoError(error.to_string()) }
+    }
+
+    /// [`Done::Broken`] of a receive's buffer `into`, as it was given.
+    pub(crate) fn unread(into: Vec<u8>, error: impl fmt::Display) -> Done {
+        // alloc: an error path.
+        Done::Broken { buffer: into, error: IoError(error.to_string()) }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -521,6 +645,8 @@ pub fn run_until_idle(
     effects: &mut Vec<Effect>,
     mut on: impl FnMut(Completion, &mut Vec<Effect>),
 ) {
+    // alloc: once per call, until idle; its callers are tests, examples and one-shot setup,
+    // never a hot loop.
     let mut done = Vec::new();
     loop {
         driver.submit(effects);

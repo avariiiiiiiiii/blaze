@@ -24,7 +24,7 @@ use crate::{
     Tags,
     bundle::{BundleId, ENTRIES_MOST, Manifest},
     client::{BUNDLE_PATH, BUNDLE_PUBLISH_PATH, FETCH_PATH, PUBLISH_PATH},
-    http, place,
+    http,
     sign::{RECORD_LEN, SIGNED_LEN, Signed, Trust},
     tls::{Channel, Channels, TlsServer},
     wire::{self, BATCH_MOST, BODY_MOST, Fields as _, RecvWindow, SendWindow},
@@ -153,7 +153,7 @@ impl<C: Channels> Server<C> {
                 Done::Unlistened => self.listen = None,
                 done => {
                     self.listen = None;
-                    self.problems.push(format!("listening at {} ended: {done:?}", place(&self.at)));
+                    self.problems.push(format!("listening at {} ended: {done:?}", self.at));
                 }
             }
             return;
@@ -169,8 +169,13 @@ impl<C: Channels> Server<C> {
         });
         match role {
             Some(Role::Send(at)) => match done {
-                Done::Sent => {
-                    self.peers[at].sending = None;
+                Done::Sent(spare) => {
+                    let peer = &mut self.peers[at];
+                    peer.sending = None;
+                    // The buffer sent is the next staged one, its room kept.
+                    if peer.staged.capacity() == 0 {
+                        peer.staged = spare;
+                    }
                     self.pump(at, store, effects);
                 }
                 done => self.drop_peer(at, &format!("sending failed: {done:?}"), effects),
@@ -225,7 +230,8 @@ impl<C: Channels> Server<C> {
             }
         };
         let tag = self.tags.next();
-        effects.push(Effect::Recv { conn, most: RECV_LEAST, tag });
+        // alloc: none here; the driver reserves the room the bytes come into.
+        effects.push(Effect::Recv { conn, most: RECV_LEAST, into: Vec::new(), tag });
         self.peers.push(Peer {
             conn,
             channel,
@@ -326,7 +332,9 @@ impl<C: Channels> Server<C> {
             };
             let tag = tags.next();
             peer.recv = Some(tag);
-            effects.push(Effect::Recv { conn: peer.conn, most: owed.clamp(RECV_LEAST, RECV_MOST), tag });
+            let most = owed.clamp(RECV_LEAST, RECV_MOST);
+            // alloc: none here; the driver reserves the room the bytes come into.
+            effects.push(Effect::Recv { conn: peer.conn, most, into: Vec::new(), tag });
         }
     }
 }

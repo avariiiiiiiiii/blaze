@@ -32,7 +32,7 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use super::{Outcome, hook};
+use super::{Outcome, column::Column, hook};
 use crate::patch::{
     ARCH_AARCH64, ARCH_X86_64, Answer, DESCRIPTOR, DESCRIPTOR_VERSION, Descriptor, MessageView,
     PatchView,
@@ -245,56 +245,113 @@ pub(crate) trait Memory {
     fn publish(&mut self, cell: u64, table: u64) -> Result<(), String>;
 }
 
-/// Every generation the program ran, by index (0 the one it started at), in columns: 29 bytes
-/// each, 20 per cell its patch set and 16 per write of code. Lookups by index are direct.
-struct Log {
-    number: Vec<u64>,
-    /// The generation it was applied on; its own index for the first.
-    parent: Vec<u32>,
-    depth: Vec<u32>,
-    /// Whether it is kept to roll back to.
-    kept: Vec<bool>,
-    /// Generation `g`'s cells are `cells[g]..cells[g + 1]` of `slot`, `new` and `old`.
-    cells: Vec<u32>,
-    slot: Vec<u32>,
-    /// A slot's target in memory in the generation, and in its parent.
-    new: Vec<u64>,
-    old: Vec<u64>,
-    /// Generation `g`'s code is `code_at[g]..code_at[g + 1]` of `code`, in memory.
-    code_at: Vec<u32>,
-    code: Vec<Range<u64>>,
+/// The most rows the log and [`Lasting`] hold: their columns reserve address space for these
+/// when the switch is made and commit it as they fill, so no patch moves a row or calls the
+/// allocator, and a patch past one is refused naming the column. The arithmetic, and the
+/// address space it takes, are in docs/v2/plan/lanes/link/speed-of-light.md ("The live
+/// runtime").
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Limits {
+    /// Generations, the first included.
+    pub(crate) generations: usize,
+    /// Cells set, over every generation.
+    pub(crate) cells: usize,
+    /// Writes of code, over every generation.
+    pub(crate) code: usize,
+    pub(crate) lasting: usize,
 }
 
-/// What the log and [`Lasting`] have room for from the start: a program's first
-/// `GENERATIONS` patches, `CELLS` cells, `CODE` writes of code and `LASTING` lasting ranges
-/// allocate nothing; past them a column doubles, one allocation per doubling. About 550 KB of
-/// address space, touched as it fills.
-const GENERATIONS: usize = 1 << 10;
-const CELLS: usize = 1 << 14;
-const CODE: usize = 1 << 12;
-const LASTING: usize = 1 << 12;
+impl Limits {
+    /// A long session's: about 1M generations, 16M cells, 4M writes of code and 1M lasting
+    /// ranges, in about 435 MiB of address space.
+    pub(crate) const LONG: Limits =
+        Limits { generations: 1 << 20, cells: 1 << 24, code: 1 << 22, lasting: 1 << 20 };
+}
+
+// Indexes into the log are `u32`s.
+const _: () = assert!(
+    Limits::LONG.generations < u32::MAX as usize
+        && Limits::LONG.cells <= u32::MAX as usize
+        && Limits::LONG.code <= u32::MAX as usize
+);
+
+/// Every generation the program ran, by index (0 the one it started at), in columns: 25 bytes
+/// each, 20 per cell its patch set and 16 per write of code. Lookups by index are direct.
+struct Log {
+    number: Column<u64>,
+    /// The generation it was applied on; its own index for the first.
+    parent: Column<u32>,
+    depth: Column<u32>,
+    /// Whether it is kept to roll back to: 1 if it is.
+    kept: Column<u8>,
+    /// Generation `g`'s cells are `cells[g]..cells[g + 1]` of `slot`, `new` and `old`.
+    cells: Column<u32>,
+    slot: Column<u32>,
+    /// A slot's target in memory in the generation, and in its parent.
+    new: Column<u64>,
+    old: Column<u64>,
+    /// Generation `g`'s code is `code_at[g]..code_at[g + 1]` of `code_start` and `code_end`,
+    /// in memory.
+    code_at: Column<u32>,
+    code_start: Column<u64>,
+    code_end: Column<u64>,
+}
 
 impl Log {
-    fn new(number: u64) -> Log {
+    fn new(number: u64, limits: &Limits) -> Result<Log, String> {
+        let (generations, cells, code) = (limits.generations, limits.cells, limits.code);
         let mut log = Log {
-            number: Vec::with_capacity(GENERATIONS),
-            parent: Vec::with_capacity(GENERATIONS),
-            depth: Vec::with_capacity(GENERATIONS),
-            kept: Vec::with_capacity(GENERATIONS),
-            cells: Vec::with_capacity(GENERATIONS + 1),
-            slot: Vec::with_capacity(CELLS),
-            new: Vec::with_capacity(CELLS),
-            old: Vec::with_capacity(CELLS),
-            code_at: Vec::with_capacity(GENERATIONS + 1),
-            code: Vec::with_capacity(CODE),
+            number: Column::new("the log's generation numbers", generations)?,
+            parent: Column::new("the log's parents", generations)?,
+            depth: Column::new("the log's depths", generations)?,
+            kept: Column::new("the log's kept marks", generations)?,
+            cells: Column::new("the log's cell runs", generations + 1)?,
+            slot: Column::new("the log's slots", cells)?,
+            new: Column::new("the log's new targets", cells)?,
+            old: Column::new("the log's old targets", cells)?,
+            code_at: Column::new("the log's code runs", generations + 1)?,
+            code_start: Column::new("the log's code starts", code)?,
+            code_end: Column::new("the log's code ends", code)?,
         };
-        log.number.push(number);
-        log.parent.push(0);
-        log.depth.push(0);
-        log.kept.push(true);
-        log.cells.extend([0, 0]);
-        log.code_at.extend([0, 0]);
-        log
+        log.number.push(number)?;
+        log.parent.push(0)?;
+        log.depth.push(0)?;
+        log.kept.push(1)?;
+        log.cells.extend_from_slice(&[0, 0])?;
+        log.code_at.extend_from_slice(&[0, 0])?;
+        Ok(log)
+    }
+
+    /// Makes room for one more generation with `cells` cells and `code` writes of code, or
+    /// says which column is full.
+    fn room(&mut self, cells: usize, code: usize) -> Result<(), String> {
+        self.number.room(1)?;
+        self.parent.room(1)?;
+        self.depth.room(1)?;
+        self.kept.room(1)?;
+        self.cells.room(1)?;
+        self.code_at.room(1)?;
+        self.slot.room(cells)?;
+        self.new.room(cells)?;
+        self.old.room(cells)?;
+        self.code_start.room(code)?;
+        self.code_end.room(code)
+    }
+
+    /// Readies the pages one more generation with `cells` cells and `code` writes of code
+    /// goes on ([`Column::ahead`]).
+    fn ahead(&mut self, cells: usize, code: usize) {
+        self.number.ahead(1);
+        self.parent.ahead(1);
+        self.depth.ahead(1);
+        self.kept.ahead(1);
+        self.cells.ahead(1);
+        self.code_at.ahead(1);
+        self.slot.ahead(cells);
+        self.new.ahead(cells);
+        self.old.ahead(cells);
+        self.code_start.ahead(code);
+        self.code_end.ahead(code);
     }
 
     fn cells(&self, generation: u32) -> Range<usize> {
@@ -302,73 +359,115 @@ impl Log {
         self.cells[g] as usize..self.cells[g + 1] as usize
     }
 
-    fn code(&self, generation: u32) -> &[Range<u64>] {
+    /// Whether generation `generation` wrote code at one of `pcs`.
+    fn has_code(&self, generation: u32, pcs: &[u64]) -> bool {
         let g = generation as usize;
-        &self.code[self.code_at[g] as usize..self.code_at[g + 1] as usize]
+        let writes = self.code_at[g] as usize..self.code_at[g + 1] as usize;
+        let (starts, ends) = (&self.code_start[writes.start..writes.end], &self.code_end[writes]);
+        starts.iter().zip(ends).any(|(start, end)| pcs.iter().any(|pc| start <= pc && pc < end))
     }
 
     /// Ends a generation whose cells and code were pushed after the last one's; its index.
-    fn finish(&mut self, number: u64, parent: u32) -> u32 {
+    fn finish(&mut self, number: u64, parent: u32) -> Result<u32, String> {
         let generation = self.number.len() as u32;
-        self.number.push(number);
-        self.parent.push(parent);
-        self.depth.push(self.depth[parent as usize] + 1);
-        self.kept.push(false);
-        self.cells.push(self.slot.len() as u32);
-        self.code_at.push(self.code.len() as u32);
-        generation
+        let depth = self.depth[parent as usize] + 1;
+        self.number.push(number)?;
+        self.parent.push(parent)?;
+        self.depth.push(depth)?;
+        self.kept.push(0)?;
+        self.cells.push(self.slot.len() as u32)?;
+        self.code_at.push(self.code_start.len() as u32)?;
+        Ok(generation)
     }
 }
 
 /// What a lasting range holds.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
 enum Holds {
-    Code,
-    Unwind,
+    Code = 0,
+    Unwind = 1,
+}
+
+impl Holds {
+    fn of(byte: u8) -> Holds {
+        if byte == Holds::Code as u8 { Holds::Code } else { Holds::Unwind }
+    }
 }
 
 /// Memory that never changes again, in memory, sorted and none overlapping: the code of
 /// every generation whose unwind entries were registered or that the cell may have pointed
 /// at (a thread can be in it however long ago the program left it), and every unwind entry
 /// registered (the unwinder reads it from then on, and not every platform can take one
-/// back). Each range is of one generation, by number.
+/// back). Each range is of one generation, by number. In columns, 25 bytes a range: a check
+/// reads only `end`, by binary search.
 struct Lasting {
-    ranges: Vec<(Range<u64>, u64, Holds)>,
+    start: Column<u64>,
+    end: Column<u64>,
+    number: Column<u64>,
+    holds: Column<u8>,
 }
 
 impl Lasting {
-    fn new() -> Lasting {
-        Lasting { ranges: Vec::with_capacity(LASTING) }
+    fn new(limit: usize) -> Result<Lasting, String> {
+        Ok(Lasting {
+            start: Column::new("the lasting ranges' starts", limit)?,
+            end: Column::new("the lasting ranges' ends", limit)?,
+            number: Column::new("the lasting ranges' generations", limit)?,
+            holds: Column::new("the lasting ranges' kinds", limit)?,
+        })
+    }
+
+    /// Makes room for `more` ranges, which is as many as `more` calls of [`Lasting::add`]
+    /// can need, or says which column is full.
+    fn room(&mut self, more: usize) -> Result<(), String> {
+        self.start.room(more)?;
+        self.end.room(more)?;
+        self.number.room(more)?;
+        self.holds.room(more)
+    }
+
+    /// Readies the pages `more` ranges go on ([`Column::ahead`]).
+    fn ahead(&mut self, more: usize) {
+        self.start.ahead(more);
+        self.end.ahead(more);
+        self.number.ahead(more);
+        self.holds.ahead(more);
     }
 
     /// The first lasting range `range` overlaps: a binary search.
-    fn hit(&self, range: &Range<u64>) -> Option<&(Range<u64>, u64, Holds)> {
-        let at = self.ranges.partition_point(|it| it.0.end <= range.start);
-        self.ranges.get(at).filter(|it| it.0.start < range.end)
+    fn hit(&self, range: &Range<u64>) -> Option<(Range<u64>, u64, Holds)> {
+        let at = self.end.partition_point(|end| *end <= range.start);
+        let start = *self.start.get(at).filter(|start| **start < range.end)?;
+        Some((start..self.end[at], self.number[at], Holds::of(self.holds[at])))
     }
 
     /// Adds `range` of generation `number`, merged with what it overlaps: only ranges of the
-    /// same generation can, since a patch over a lasting range is refused.
-    fn add(&mut self, range: Range<u64>, number: u64, holds: Holds) {
+    /// same generation can, since a patch over a lasting range is refused. In place, after
+    /// [`Lasting::room`].
+    fn add(&mut self, range: Range<u64>, number: u64, holds: Holds) -> Result<(), String> {
         if range.is_empty() {
-            return;
+            return Ok(());
         }
-        let at = self.ranges.partition_point(|it| it.0.end <= range.start);
+        let at = self.end.partition_point(|end| *end <= range.start);
         let (mut merged, mut holds, mut end) = (range, holds, at);
-        while let Some((next, _, other)) = self.ranges.get(end).filter(|it| it.0.start < merged.end)
-        {
-            merged = merged.start.min(next.start)..merged.end.max(next.end);
-            if *other == Holds::Code {
+        let (starts, ends, kinds) = (&self.start[..], &self.end[..], &self.holds[..]);
+        while end < starts.len() && starts[end] < merged.end {
+            merged = merged.start.min(starts[end])..merged.end.max(ends[end]);
+            if Holds::of(kinds[end]) == Holds::Code {
                 holds = Holds::Code;
             }
             end += 1;
         }
-        self.ranges.splice(at..end, [(merged, number, holds)]);
+        self.start.splice(at..end, merged.start)?;
+        self.end.splice(at..end, merged.end)?;
+        self.number.splice(at..end, number)?;
+        self.holds.splice(at..end, holds as u8)
     }
 }
 
 /// Why a write of `kind` over `hit` is refused, in linked addresses.
-fn over(kind: &str, hit: &(Range<u64>, u64, Holds), slide: u64) -> String {
+fn over(kind: &str, hit: (Range<u64>, u64, Holds), slide: u64) -> String {
     let (range, number, holds) = hit;
     let (start, end) = (range.start.wrapping_sub(slide), range.end.wrapping_sub(slide));
     match holds {
@@ -437,6 +536,15 @@ pub(crate) struct Switch<M: Memory> {
 
 impl<M: Memory> Switch<M> {
     pub(crate) fn new(memory: M, layout: Layout) -> Result<Switch<M>, String> {
+        Switch::with_limits(memory, layout, &Limits::LONG)
+    }
+
+    /// A switch whose log and lasting ranges hold at most `limits`.
+    pub(crate) fn with_limits(
+        memory: M,
+        layout: Layout,
+        limits: &Limits,
+    ) -> Result<Switch<M>, String> {
         let cell = layout.cell();
         memory.in_image(&(cell..cell + 8))?;
         let table = memory.cell(cell);
@@ -448,7 +556,8 @@ impl<M: Memory> Switch<M> {
         // alloc: error path, at start
         let end = end.ok_or_else(|| format!("a jump table at {table:#x} past the end of memory"))?;
         memory.in_image(&(table..end))?;
-        let log = Log::new(layout.generation);
+        let log = Log::new(layout.generation, limits)?;
+        let lasting = Lasting::new(limits.lasting)?;
         let mut kept = Vec::with_capacity(KEPT + 1);
         kept.push(0);
         let mut switch = Switch {
@@ -462,7 +571,7 @@ impl<M: Memory> Switch<M> {
             on: None,
             next: None,
             published: 0,
-            lasting: Lasting::new(),
+            lasting,
             scratch: Scratch::default(),
             #[cfg(test)]
             stored: 0,
@@ -547,7 +656,7 @@ impl<M: Memory> Switch<M> {
     fn lineage(&self) -> impl Iterator<Item = u32> + '_ {
         let mut at = Some(self.current);
         std::iter::from_fn(move || {
-            let generation = at.filter(|it| self.log.kept[*it as usize])?;
+            let generation = at.filter(|it| self.log.kept[*it as usize] != 0)?;
             let parent = self.log.parent[generation as usize];
             at = (parent != generation).then_some(parent);
             Some(generation)
@@ -683,13 +792,14 @@ impl<M: Memory> Switch<M> {
             s.functions.push((slid_begin, end.wrapping_add(slide), slid_unwind));
             s.unwinds.push(slid_unwind..slid_unwind + len);
         }
+        // Room in every column is made before anything is written (each added lasting range
+        // takes at most one row), so a full one refuses the patch whole and nothing after the
+        // writes can run out.
         let cells = patch.cells();
-        if u32::try_from(self.log.slot.len() + cells.len()).is_err()
-            || u32::try_from(self.log.code.len() + s.code.len()).is_err()
-            || u32::try_from(self.log.number.len()).is_err()
-        {
-            return Err("more generations, cells or code than this program counts".to_owned());
-        }
+        let set = cells.len();
+        let lasting = s.code.len() + s.fdes.len() + s.ends.len() + s.unwinds.len();
+        self.log.room(set, s.code.len())?;
+        self.lasting.room(lasting)?;
 
         let rebase = &s.rebase;
         self.memory.code(&Writes { message, spans: &s.code, rebase, slide })?;
@@ -698,31 +808,34 @@ impl<M: Memory> Switch<M> {
         // becomes of the rest.
         let number = patch.generation;
         for span in &s.code {
-            self.lasting.add(span.range(), number, Holds::Code);
+            self.lasting.add(span.range(), number, Holds::Code)?;
         }
         for &(at, len) in &s.fdes {
-            self.lasting.add(at..at + len, number, Holds::Unwind);
+            self.lasting.add(at..at + len, number, Holds::Unwind)?;
         }
         for &at in &s.ends {
-            self.lasting.add(at..at + 4, number, Holds::Unwind);
+            self.lasting.add(at..at + 4, number, Holds::Unwind)?;
         }
         for unwind in &s.unwinds {
-            self.lasting.add(unwind.clone(), number, Holds::Unwind);
+            self.lasting.add(unwind.start..unwind.end, number, Holds::Unwind)?;
         }
         self.memory.frames(&s.starts)?;
         self.memory.functions(&s.functions)?;
 
         for (slot, target) in cells {
             let old = self.value(slot);
-            self.log.slot.push(slot);
-            self.log.new.push(target.wrapping_add(slide));
-            self.log.old.push(old);
+            self.log.slot.push(slot)?;
+            self.log.new.push(target.wrapping_add(slide))?;
+            self.log.old.push(old)?;
         }
-        self.log.code.extend(s.code.iter().map(Span::range));
-        let generation = self.log.finish(patch.generation, self.current);
+        for span in &s.code {
+            self.log.code_start.push(span.at)?;
+            self.log.code_end.push(span.end())?;
+        }
+        let generation = self.log.finish(patch.generation, self.current)?;
         let at = self.standby(generation, &mut s.path);
         self.publish(Some(at))?;
-        self.log.kept[generation as usize] = true;
+        self.log.kept[generation as usize] = 1;
         self.kept.push(generation);
         self.current = generation;
         while self.kept.len() > KEPT {
@@ -730,9 +843,13 @@ impl<M: Memory> Switch<M> {
                 break;
             };
             let evicted = self.kept.remove(oldest);
-            self.log.kept[evicted as usize] = false;
+            self.log.kept[evicted as usize] = 0;
         }
         self.ready();
+        // After the switch, the pages a next patch of this size writes in the log, so its
+        // pushes find them committed and resident.
+        self.log.ahead(set, s.code.len());
+        self.lasting.ahead(lasting);
         Ok(())
     }
 
@@ -808,17 +925,19 @@ impl<M: Memory> Switch<M> {
     /// which the release store of the cell publishes. How many it stored.
     fn retarget(&mut self, at: usize, to: u32, path: &mut Vec<u32>) -> usize {
         let log = &self.log;
+        let (slot, old, new) = (&log.slot[..], &log.old[..], &log.new[..]);
+        let (depths, parents) = (&log.depth[..], &log.parent[..]);
         let table = &self.pool[at].table;
         let mut stored = 0;
         let mut undo = |generation: u32| {
             let cells = log.cells(generation);
             stored += cells.len();
             for cell in cells {
-                table[log.slot[cell] as usize].store(log.old[cell], Ordering::Relaxed);
+                table[slot[cell] as usize].store(old[cell], Ordering::Relaxed);
             }
         };
-        let depth = |generation: u32| log.depth[generation as usize];
-        let parent = |generation: u32| log.parent[generation as usize];
+        let depth = |generation: u32| depths[generation as usize];
+        let parent = |generation: u32| parents[generation as usize];
         let (mut from, mut onto) = (self.pool[at].holds, to);
         path.clear();
         while depth(from) > depth(onto) {
@@ -839,7 +958,7 @@ impl<M: Memory> Switch<M> {
             let cells = log.cells(generation);
             stored += cells.len();
             for cell in cells {
-                table[log.slot[cell] as usize].store(log.new[cell], Ordering::Relaxed);
+                table[slot[cell] as usize].store(new[cell], Ordering::Relaxed);
             }
         }
         self.pool[at].holds = to;
@@ -894,9 +1013,9 @@ impl<M: Memory> Switch<M> {
         self.lineage()
             .filter(|it| {
                 let parent = log.parent[*it as usize];
-                parent != *it && log.kept[parent as usize]
+                parent != *it && log.kept[parent as usize] != 0
             })
-            .filter(|it| log.code(*it).iter().any(|range| pcs.iter().any(|pc| range.contains(pc))))
+            .filter(|it| log.has_code(*it, pcs))
             .map(|it| (log.number[it as usize], log.number[log.parent[it as usize] as usize]))
             .max()
     }

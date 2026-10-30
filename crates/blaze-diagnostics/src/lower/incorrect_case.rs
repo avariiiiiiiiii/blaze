@@ -12,7 +12,10 @@
 use std::fmt::{self, Write as _};
 
 use hir::{HasVisibility as _, InFile, Visibility};
-use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
+use syntax::{
+    SyntaxKind,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
     cx::Cx,
@@ -74,34 +77,39 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
         Rule::Unknown => false,
     };
     if in_case {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let name_ptr = InFile::new(d.file, d.ident);
-    let name_node = cx.node(name_ptr);
+    let name_node = cx.node_view(name_ptr);
+    // alloc: empty, allocates nothing
     let Some(owner) = name_node.value.syntax().parent() else { return Vec::new() };
-    let at = |node: &SyntaxNode| InFile::new(d.file, SyntaxNodePtr::new(node));
+    let at = |node: ast::Node<'_>| InFile::new(d.file, ast::ptr(node));
     let found = match rule {
         Rule::Camel => {
             // rustc's early pass has no `check_foreign_item` for this lint.
             let foreign = owner.kind() == SyntaxKind::TYPE_ALIAS
                 && owner.parent().is_some_and(|it| it.kind() == SyntaxKind::EXTERN_ITEM_LIST);
             if foreign {
+                // alloc: empty, allocates nothing
                 return Vec::new();
             }
             let span = cx.span_of_ptr(name_ptr);
-            let (sort, lint_at) = camel_sort(&owner);
+            let (sort, lint_at) = camel_sort(owner);
             let mut diag =
+                // alloc: the error's text, for an error hir found
                 Diag::lint("non_camel_case_types", format!("{sort} `{name}` should have an upper camel case name"), span.clone());
             let cc = to_upper_camel_case(name);
             match cc != name {
                 true => diag.suggestion(span, "convert the identifier to upper camel case", cc, Applicability::MaybeIncorrect),
                 false => diag.span_label(span, "should have an UpperCamelCase name"),
             };
-            Found::lint(diag, Phase::Resolve, at(&lint_at))
+            Found::lint(diag, Phase::Resolve, at(lint_at))
         }
         Rule::Snake => {
             let span = cx.span_of_ptr(name_ptr);
-            let sort = snake_sort(&owner);
+            let sort = snake_sort(owner);
+            // alloc: the error's text, for an error hir found
             let mut diag = Diag::lint("non_snake_case", format!("{sort} `{name}` should have a snake case name"), span.clone());
             let sc = to_snake_case(name);
             if sc == name {
@@ -112,19 +120,22 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
                 diag.suggestion(
                     span,
                     "rename the identifier or convert it to a snake case raw identifier",
+                    // alloc: the error's text, for an error hir found
                     format!("r#{sc}"),
                     Applicability::MaybeIncorrect,
                 );
             } else {
+                // alloc: the error's text, for an error hir found
                 diag.note(format!("`{sc}` cannot be used as a raw identifier"));
                 diag.suggestion(span, "rename the identifier", "", Applicability::MaybeIncorrect);
             }
-            Found::lint(diag, Phase::Late, at(&owner))
+            Found::lint(diag, Phase::Late, at(owner))
         }
         Rule::Upper => {
             let span = cx.span_of_ptr(name_ptr);
-            let (sort, exported) = upper_sort(cx, &owner, d.file);
+            let (sort, exported) = upper_sort(cx, owner);
             let mut diag =
+                // alloc: the error's text, for an error hir found
                 Diag::lint("non_upper_case_globals", format!("{sort} `{name}` should have an upper case name"), span.clone());
             let uc = to_snake_case(name).to_uppercase();
             match uc != name {
@@ -137,22 +148,24 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::IncorrectCase) -> Vec<Found> {
                 }
                 false => diag.span_label(span, "should have an UPPER_CASE name"),
             };
-            Found::lint(diag, Phase::Late, at(&owner))
+            Found::lint(diag, Phase::Late, at(owner))
         }
         Rule::Unknown => {
             let diag = Diag::error(
                 None,
+                // alloc: the error's text, for an error hir found
                 format!("blaze does not know rustc's style lint of a name of kind `{}`: `{name}`", d.ident_type),
                 cx.span_of_ptr(name_ptr),
             );
             Found::new(diag, Phase::Late)
         }
     };
+    // alloc: the error's parts, for an error hir found
     vec![found]
 }
 
 /// The container of an associated item: the impl or trait its item list is in.
-fn assoc_container(item: &SyntaxNode) -> Option<SyntaxNode> {
+fn assoc_container(item: ast::Node<'_>) -> Option<ast::Node<'_>> {
     let list = item.parent().filter(|it| it.kind() == SyntaxKind::ASSOC_ITEM_LIST)?;
     list.parent()
 }
@@ -160,23 +173,23 @@ fn assoc_container(item: &SyntaxNode) -> Option<SyntaxNode> {
 /// rustc's sort of a type-like name, and the node its lint is emitted at: an associated type
 /// of an inherent impl is linted from the impl's `check_item`, so the impl's attributes
 /// decide its level.
-fn camel_sort(owner: &SyntaxNode) -> (&'static str, SyntaxNode) {
+fn camel_sort(owner: ast::Node<'_>) -> (&'static str, ast::Node<'_>) {
     match owner.kind() {
-        SyntaxKind::TRAIT => match ast::Trait::cast(owner.clone()).and_then(|it| it.eq_token()) {
-            Some(_) => ("trait alias", owner.clone()),
-            None => ("trait", owner.clone()),
+        SyntaxKind::TRAIT => match ast::Trait::cast(owner).and_then(|it| it.eq_token()) {
+            Some(_) => ("trait alias", owner),
+            None => ("trait", owner),
         },
-        SyntaxKind::VARIANT => ("variant", owner.clone()),
+        SyntaxKind::VARIANT => ("variant", owner),
         SyntaxKind::TYPE_ALIAS => match assoc_container(owner) {
             Some(container) if container.kind() == SyntaxKind::IMPL => ("associated type", container),
-            Some(_) => ("associated type", owner.clone()),
-            None => ("type", owner.clone()),
+            Some(_) => ("associated type", owner),
+            None => ("type", owner),
         },
-        _ => ("type", owner.clone()),
+        _ => ("type", owner),
     }
 }
 
-fn snake_sort(owner: &SyntaxNode) -> &'static str {
+fn snake_sort(owner: ast::Node<'_>) -> &'static str {
     match owner.kind() {
         SyntaxKind::FN => match assoc_container(owner).map(|it| it.kind()) {
             Some(SyntaxKind::IMPL) => "method",
@@ -191,16 +204,16 @@ fn snake_sort(owner: &SyntaxNode) -> &'static str {
 
 /// rustc's sort of a global, and whether the item is exported (rustc suggests renaming its uses
 /// only when it is not), when rustc asks: never for an associated constant.
-fn upper_sort(cx: &Cx<'_, '_>, owner: &SyntaxNode, file: hir::HirFileId) -> (&'static str, Option<bool>) {
+fn upper_sort<'db>(cx: &Cx<'_, 'db>, owner: ast::Node<'db>) -> (&'static str, Option<bool>) {
     if owner.kind() == SyntaxKind::CONST && assoc_container(owner).is_some() {
         return ("associated constant", None);
     }
-    if let Some(it) = ast::Const::cast(owner.clone()) {
-        let def = cx.sema.to_def2(InFile::new(file, &it));
+    if let Some(it) = ast::Const::cast(owner) {
+        let def = cx.vsema.to_def(it);
         return ("constant", def.map(|it| exported(cx, it.visibility(cx.db), it.module(cx.db))));
     }
-    if let Some(it) = ast::Static::cast(owner.clone()) {
-        let def = cx.sema.to_def2(InFile::new(file, &it));
+    if let Some(it) = ast::Static::cast(owner) {
+        let def = cx.vsema.to_def(it);
         return ("static variable", def.map(|it| exported(cx, it.visibility(cx.db), it.module(cx.db))));
     }
     ("constant", None)
@@ -341,6 +354,7 @@ pub(crate) fn to_upper_camel_case(s: &str) -> String {
         .split('_')
         .filter(|component| !component.is_empty())
         .map(|component| {
+            // alloc: the suggestion's text, built only for a name not in upper camel case
             let mut camel_cased_component = String::new();
             let mut new_word = true;
             let mut prev_is_lower_case = true;
@@ -364,6 +378,7 @@ pub(crate) fn to_upper_camel_case(s: &str) -> String {
             }
             camel_cased_component
         })
+        // alloc: the suggestion's text, built only for a name not in upper camel case
         .fold((String::new(), None), |(acc, prev): (String, Option<String>), next| {
             let join = match prev {
                 Some(prev) => {
@@ -391,9 +406,11 @@ fn is_snake_case(ident: &str) -> bool {
 }
 
 fn to_snake_case(mut name: &str) -> String {
+    // alloc: the suggestion's words, built only for a name hir flagged and rustc flags
     let mut words = vec![];
     name = name.trim_start_matches(|c: char| {
         if c == '_' {
+            // alloc: empty, allocates nothing
             words.push(String::new());
             true
         } else {
@@ -402,6 +419,7 @@ fn to_snake_case(mut name: &str) -> String {
     });
     for s in name.split('_') {
         let mut last_upper = false;
+        // alloc: the suggestion's words, built only for a name hir flagged and rustc flags
         let mut buf = String::new();
         if s.is_empty() {
             continue;
@@ -410,6 +428,7 @@ fn to_snake_case(mut name: &str) -> String {
             let upper = ch.is_uppercase() || is_titlecase(ch);
             if !buf.is_empty() && buf != "'" && upper && !last_upper {
                 words.push(buf.to_lowercase());
+                // alloc: empty, allocates nothing
                 buf = String::new();
             }
             last_upper = upper;

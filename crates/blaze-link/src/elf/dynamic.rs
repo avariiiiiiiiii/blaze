@@ -3,12 +3,14 @@
 //! `.dynamic` and `.eh_frame_hdr`. A pure function of [`Placed`]: an incremental link asks
 //! again and gets the same bytes for the same image, on any number of cores. An incremental
 //! output keeps its last `.rela.dyn` and `.eh_frame_hdr` and patches them where
-//! [`Placed::delta`] says what changed; a patched table is the one a build makes.
+//! [`Placed::delta`] says what changed; a patched table is the one a build makes. A kept table
+//! is a [`CowBytes`] the writer and the core's states share: a patch copies only the pages it
+//! changes, and the table handed to the core is a clone, never a copy.
 
 use std::collections::hash_map::Entry;
 
 use blaze_codegen::Arch;
-use blaze_format::leb::LebError;
+use blaze_format::cursor::{self, Put, Reader};
 use blaze_ids::radix;
 use object::elf;
 use rayon::prelude::*;
@@ -19,7 +21,9 @@ use super::{
     BUILD_ID, DYNAMIC, DYNSTR, DYNSYM, EH_FRAME_HDR, Elf, GNU_HASH, INTERP, RELA_DYN, Segment, VERNEED,
     VERSYM, error,
 };
-use crate::model::{Class, Counts, Delta, Holds, Placed, Region, SymbolKind, Tls};
+use crate::cow::CowBytes;
+use crate::model::{Class, Counts, Delta, Holds, Placed, Region, SymbolKind, Tls, View};
+use crate::unwind::{cie_encoding, eh_pointer, eh_value};
 use crate::{LinkError, Output, OutputKind};
 
 /// `.dynamic` entries besides `DT_NEEDED`: at most one of each tag [`Tables::of`] writes.
@@ -101,33 +105,6 @@ pub(crate) fn sizes(output: &Output, counts: &Counts) -> Vec<(Class, u64)> {
 }
 
 const NOTE_HEADER: u64 = 12 + 4;
-
-/// Little-endian writes.
-pub(crate) trait Put {
-    fn u8(&mut self, value: u8);
-    fn u16(&mut self, value: u16);
-    fn u32(&mut self, value: u32);
-    fn u64(&mut self, value: u64);
-    fn align(&mut self, to: usize);
-}
-
-impl Put for Vec<u8> {
-    fn u8(&mut self, value: u8) {
-        self.push(value);
-    }
-    fn u16(&mut self, value: u16) {
-        self.extend_from_slice(&value.to_le_bytes());
-    }
-    fn u32(&mut self, value: u32) {
-        self.extend_from_slice(&value.to_le_bytes());
-    }
-    fn u64(&mut self, value: u64) {
-        self.extend_from_slice(&value.to_le_bytes());
-    }
-    fn align(&mut self, to: usize) {
-        self.resize(self.len().next_multiple_of(to), 0);
-    }
-}
 
 /// A string table: `\0` first, each string once. Keys borrow the image's names: one FxHash
 /// probe (entry API) per string and no allocation per string.
@@ -293,9 +270,10 @@ pub(crate) struct Tables {
     pub(crate) gnu_hash: Vec<u8>,
     pub(crate) versym: Vec<u8>,
     pub(crate) verneed: Vec<u8>,
-    pub(crate) rela: Vec<u8>,
+    /// The kept tables, taken once each by [`Tables::regions`].
+    pub(crate) rela: Option<CowBytes>,
     pub(crate) dynamic: Vec<u8>,
-    pub(crate) eh_frame_hdr: Vec<u8>,
+    pub(crate) eh_frame_hdr: Option<CowBytes>,
 }
 
 impl Tables {
@@ -344,7 +322,7 @@ impl Tables {
         let symbols = 1 + imports.len() + exports.len();
         let symoffset = 1 + imports.len() as u32;
         let mut versym = Vec::with_capacity(symbols * 2);
-        versym.u16(elf::VER_NDX_LOCAL);
+        versym.put_u16(elf::VER_NDX_LOCAL);
         let versioned = imports.iter().filter(|it| it.library.is_some() && it.version.is_some()).count();
         let mut needs: Vec<(u32, &str, u16)> = Vec::with_capacity(versioned);
         let mut version_index: FxHashMap<(u32, &str), u16> =
@@ -369,7 +347,7 @@ impl Tables {
                 }
                 _ => elf::VER_NDX_GLOBAL,
             };
-            versym.u16(version);
+            versym.put_u16(version);
         }
         versym.resize(symbols * 2, 0);
         for pair in versym[2 * symoffset as usize..].chunks_exact_mut(2) {
@@ -388,24 +366,11 @@ impl Tables {
             hashes.extend(exports.iter().map(|it| gnu_hash(it.name.as_bytes())));
         }
         let bucket_of = |hash: u32| (hash % buckets as u32) as usize;
-        // `ends[b + 1]` counts bucket `b`; summed, `ends[b]` is its start, which placing its
-        // exports advances to its end.
-        // alloc: once per image, 4 bytes per bucket
-        let mut ends = vec![0u32; buckets as usize + 1];
-        for &hash in &hashes {
-            ends[bucket_of(hash) + 1] += 1;
-        }
-        for at in 1..ends.len() {
-            ends[at] += ends[at - 1];
-        }
-        // alloc: once per image, 4 bytes per export
-        let mut order = vec![0u32; exports.len()];
-        for (at, &hash) in hashes.iter().enumerate() {
-            let bucket = bucket_of(hash);
-            order[ends[bucket] as usize] = at as u32;
-            ends[bucket] += 1;
-        }
-        let bucket_start = |bucket: usize| if bucket == 0 { 0 } else { ends[bucket - 1] };
+        // alloc: once per image, 4 bytes per bucket and per export
+        let order = radix::Csr::build(
+            buckets as usize,
+            hashes.iter().enumerate().map(|(at, &hash)| (bucket_of(hash) as u32, at as u32)),
+        );
 
         // `.dynsym`: the null symbol, the imports, then the exports in bucket order.
         let mut dynsym = Vec::with_capacity(symbols * SYM as usize);
@@ -415,7 +380,7 @@ impl Tables {
             Sym { name: strings.add(&import.name), info: info(bind, import.kind), ..Sym::default() }.put(&mut dynsym);
         }
         numbered(placed.regions)?;
-        for &at in &order {
+        for &at in order.items() {
             let export = &exports[at as usize];
             Sym {
                 name: strings.add(&export.name),
@@ -431,25 +396,25 @@ impl Tables {
         let mut verneed = Vec::with_capacity(16 * (versioned_libraries + needs.len()));
         for (at, list) in needs.chunk_by(|a, b| a.0 == b.0).enumerate() {
             let last = at + 1 == versioned_libraries;
-            verneed.u16(1);
-            verneed.u16(list.len() as u16);
-            verneed.u32(needed_names[list[0].0 as usize]);
-            verneed.u32(16);
-            verneed.u32(if last { 0 } else { 16 + 16 * list.len() as u32 });
+            verneed.put_u16(1);
+            verneed.put_u16(list.len() as u16);
+            verneed.put_u32(needed_names[list[0].0 as usize]);
+            verneed.put_u32(16);
+            verneed.put_u32(if last { 0 } else { 16 + 16 * list.len() as u32 });
             for (at, &(_, name, index)) in list.iter().enumerate() {
-                verneed.u32(elf_hash(name.as_bytes()));
-                verneed.u16(0);
-                verneed.u16(index);
-                verneed.u32(strings.add(name));
-                verneed.u32(if at + 1 == list.len() { 0 } else { 16 });
+                verneed.put_u32(elf_hash(name.as_bytes()));
+                verneed.put_u16(0);
+                verneed.put_u16(index);
+                verneed.put_u32(strings.add(name));
+                verneed.put_u32(if at + 1 == list.len() { 0 } else { 16 });
             }
         }
 
         let mut gnu_hash = Vec::with_capacity(gnu_hash_len(exports.len() as u64) as usize);
-        gnu_hash.u32(buckets as u32);
-        gnu_hash.u32(symoffset);
-        gnu_hash.u32(mask_words as u32);
-        gnu_hash.u32(BLOOM_SHIFT);
+        gnu_hash.put_u32(buckets as u32);
+        gnu_hash.put_u32(symoffset);
+        gnu_hash.put_u32(mask_words as u32);
+        gnu_hash.put_u32(BLOOM_SHIFT);
         // The bloom filter, set in place.
         let bloom = gnu_hash.len();
         gnu_hash.resize(bloom + 8 * mask_words as usize, 0);
@@ -460,13 +425,13 @@ impl Tables {
             *cell = (u64::from_le_bytes(*cell) | bits).to_le_bytes();
         }
         for bucket in 0..buckets as usize {
-            let (start, end) = (bucket_start(bucket), ends[bucket]);
-            gnu_hash.u32(if start == end { 0 } else { symoffset + start });
+            let range = order.range(bucket);
+            gnu_hash.put_u32(if range.is_empty() { 0 } else { symoffset + range.start as u32 });
         }
-        for (at, &export) in order.iter().enumerate() {
+        for (at, &export) in order.items().iter().enumerate() {
             let hash = hashes[export as usize];
-            let last = at as u32 + 1 == ends[bucket_of(hash)];
-            gnu_hash.u32((hash & !1) | last as u32);
+            let last = at + 1 == order.range(bucket_of(hash)).end;
+            gnu_hash.put_u32((hash & !1) | last as u32);
         }
 
         let mut last = writer.last();
@@ -482,8 +447,8 @@ impl Tables {
         };
         let mut dynamic = Vec::with_capacity(16 * (needed_names.len() + DYNAMIC_FIXED as usize));
         let mut entry = |tag: u32, value: u64| {
-            dynamic.u64(u64::from(tag));
-            dynamic.u64(value);
+            dynamic.put_u64(u64::from(tag));
+            dynamic.put_u64(value);
         };
         for &name in &needed_names {
             entry(elf::DT_NEEDED, u64::from(name));
@@ -505,7 +470,7 @@ impl Tables {
             entry(elf::DT_FINI, fini);
         }
         for (class, tag, size) in [
-            (preinit(), elf::DT_PREINIT_ARRAY, elf::DT_PREINIT_ARRAYSZ),
+            (Class::PreinitArray, elf::DT_PREINIT_ARRAY, elf::DT_PREINIT_ARRAYSZ),
             (Class::InitArray, elf::DT_INIT_ARRAY, elf::DT_INIT_ARRAYSZ),
             (Class::FiniArray, elf::DT_FINI_ARRAY, elf::DT_FINI_ARRAYSZ),
         ] {
@@ -536,9 +501,9 @@ impl Tables {
         entry(elf::DT_NULL, 0);
 
         let mut note = Vec::with_capacity((NOTE_HEADER + 16) as usize);
-        note.u32(4);
-        note.u32(16);
-        note.u32(elf::NT_GNU_BUILD_ID);
+        note.put_u32(4);
+        note.put_u32(16);
+        note.put_u32(elf::NT_GNU_BUILD_ID);
         note.extend_from_slice(b"GNU\0");
         note.extend_from_slice(&placed.id);
 
@@ -550,37 +515,42 @@ impl Tables {
             gnu_hash,
             versym,
             verneed,
-            rela,
+            rela: Some(rela),
             dynamic,
-            eh_frame_hdr,
+            eh_frame_hdr: Some(eh_frame_hdr),
         })
     }
 
-    /// The bytes of the synthetic region `name`, moved out.
-    fn take(&mut self, name: &str) -> Vec<u8> {
-        std::mem::take(match name {
-            INTERP => return self.interp.take().unwrap_or_default(),
+    /// The bytes of the synthetic region `name`, moved out: a kept table as the writer keeps
+    /// it, any other once wrapped.
+    fn take(&mut self, name: &str) -> CowBytes {
+        let kept = match name {
+            RELA_DYN => self.rela.take(),
+            EH_FRAME_HDR => self.eh_frame_hdr.take(),
+            _ => None,
+        };
+        if let Some(bytes) = kept {
+            return bytes;
+        }
+        // alloc: once per region per link, the `Arc` of a table no link keeps
+        CowBytes::from_vec(std::mem::take(match name {
+            INTERP => return CowBytes::from_vec(self.interp.take().unwrap_or_default()),
             BUILD_ID => &mut self.note,
             DYNSYM => &mut self.dynsym,
             DYNSTR => &mut self.dynstr,
             GNU_HASH => &mut self.gnu_hash,
             VERSYM => &mut self.versym,
             VERNEED => &mut self.verneed,
-            RELA_DYN => &mut self.rela,
             DYNAMIC => &mut self.dynamic,
-            EH_FRAME_HDR => &mut self.eh_frame_hdr,
+            RELA_DYN | EH_FRAME_HDR => unreachable!("`names` lists the kept table {name} once"),
             _ => unreachable!("a synthetic region `names` doesn't list"),
-        })
+        }))
     }
 
-    pub(crate) fn regions(mut self, output: &Output) -> Vec<(Class, Vec<u8>)> {
+    pub(crate) fn regions(mut self, output: &Output) -> Vec<(Class, CowBytes)> {
         // alloc: once per image, what `Writer::synthesize` returns
         names(output).iter().map(|&name| (Class::Synthetic(name), self.take(name))).collect()
     }
-}
-
-fn preinit() -> Class {
-    Class::Named { name: super::PREINIT_ARRAY.into(), write: true, exec: false }
 }
 
 /// The region of `regions` (in address order) holding `addr`, by its placed size.
@@ -590,15 +560,34 @@ fn region_at(regions: &[Region], addr: u64) -> Option<usize> {
 }
 
 /// Whether the loader may write `at`: the region holding it, or an error naming a text
-/// relocation.
-fn writable(regions: &[Region], at: u64, what: &str) -> Result<usize, LinkError> {
+/// relocation. Code is never one: a dev run's code memory holds the file's bytes at every
+/// load address, and no image has the loader write its code.
+fn writable(placed: &Placed<'_>, at: u64, what: &str, symbol: Option<&str>) -> Result<usize, LinkError> {
+    let regions = placed.regions;
     let region = region_at(regions, at).ok_or_else(|| error(format!("{what} at {at:#x}, in no region of the image")))?; // alloc: error path
     let class = &regions[region].class;
     if !Segment::of(class).loader_writes() {
-        // alloc: error path
-        return Err(error(format!("{what} at {at:#x} is in {class:?}, which the loader can't write (a text relocation)")));
+        return Err(text_relocation(placed, at, what, symbol, class));
     }
     Ok(region)
+}
+
+/// The error of a dynamic relocation at `at` in `class`, which the loader can't write: the
+/// section, and the symbol it is for (`symbol`, else the function holding `at`).
+#[cold]
+fn text_relocation(placed: &Placed<'_>, at: u64, what: &str, symbol: Option<&str>, class: &Class) -> LinkError {
+    let section = super::image::section_name(class);
+    let functions = placed.functions;
+    let holding = functions
+        .partition_point(|it| it.addr <= at)
+        .checked_sub(1)
+        .map(|it| &functions[it])
+        .filter(|it| at < it.addr + it.size)
+        .and_then(|it| it.name.as_deref());
+    // alloc: error path
+    let of = symbol.or(holding).map_or_else(String::new, |it| format!(" for `{it}`"));
+    // alloc: error path
+    error(format!("{what}{of} at {at:#x} is in section `{section}`, which the loader can't write (a text relocation)"))
 }
 
 /// `.rela.dyn` as [`relocations`] makes it, a kept table that patches the next.
@@ -607,9 +596,11 @@ pub(crate) struct KeptRela {
     synthesis: u64,
     /// The table's bytes, its first `relative` entries the `RELATIVE` run in the order of
     /// [`Placed::rebase`] (kept only when the slid addresses came sorted, so entry `i` is
-    /// `rebase[i]`'s).
-    bytes: Vec<u8>,
+    /// `rebase[i]`'s): what the last link's state holds too.
+    bytes: CowBytes,
     relative: usize,
+    /// The binds' and GOT cells' entries a patch builds, reused.
+    scratch: Vec<u8>,
     /// How many builds were patches.
     #[cfg(test)]
     pub(crate) patched: u32,
@@ -619,12 +610,12 @@ pub(crate) struct KeptRela {
 /// `TPOFF64`. With `kept` (an incremental output's) of the synthesis `placed.delta` is from,
 /// and every splice of the slid addresses of equal length, the `RELATIVE` run is patched and
 /// the binds and GOT cells built; otherwise all of it is built.
-fn rela_dyn(writer: &Elf, placed: &Placed<'_>, shared: bool, kept: Option<&mut KeptRela>) -> Result<(Vec<u8>, usize, bool), LinkError> {
+fn rela_dyn(writer: &Elf, placed: &Placed<'_>, shared: bool, kept: Option<&mut KeptRela>) -> Result<(CowBytes, usize, bool), LinkError> {
     let tpoff64 = types(writer.output.arch).tpoff64;
     let Some(kept) = kept else {
         let (relocations, relative, _) = relocations(writer, placed, shared)?;
         let tpoff = relocations[relative..].iter().any(|it| it.r_type == tpoff64);
-        return Ok((rela_bytes(&relocations), relative, tpoff));
+        return Ok((CowBytes::from_vec(rela_bytes(&relocations)), relative, tpoff));
     };
     let last = std::mem::replace(&mut kept.synthesis, 0);
     let patches = placed.delta.filter(|delta| {
@@ -638,25 +629,26 @@ fn rela_dyn(writer: &Elf, placed: &Placed<'_>, shared: bool, kept: Option<&mut K
         push_others(writer, placed, shared, &mut others)?;
         sort_rela(&mut others);
         let head = RELA as usize * kept.relative;
-        kept.bytes.truncate(head);
-        kept.bytes.resize(head + RELA as usize * others.len(), 0);
-        put_relas(&others, &mut kept.bytes[head..]);
-        // alloc: the output buffer, `.rela.dyn`'s bytes
-        let mut bytes = Vec::with_capacity(kept.bytes.len());
-        bytes.extend_from_slice(&kept.bytes);
+        let scratch = &mut kept.scratch;
+        scratch.clear();
+        scratch.resize(RELA as usize * others.len(), 0);
+        put_relas(&others, scratch);
+        kept.bytes.resize(head + scratch.len());
+        kept.bytes.update(head, scratch);
         kept.synthesis = placed.synthesis;
         #[cfg(test)]
         {
             kept.patched += 1;
         }
-        return Ok((bytes, kept.relative, others.iter().any(|it| it.r_type == tpoff64)));
+        // clone: two reference counts, the table shared with the state that holds it
+        return Ok((kept.bytes.clone(), kept.relative, others.iter().any(|it| it.r_type == tpoff64)));
     }
     let (relocations, relative, in_order) = relocations(writer, placed, shared)?;
     let tpoff = relocations[relative..].iter().any(|it| it.r_type == tpoff64);
-    let bytes = rela_bytes(&relocations);
+    let bytes = CowBytes::from_vec(rela_bytes(&relocations));
     if in_order {
-        kept.bytes.clear();
-        kept.bytes.extend_from_slice(&bytes);
+        // clone: two reference counts, the table shared with the state that holds it
+        kept.bytes = bytes.clone();
         kept.relative = relative;
         kept.synthesis = placed.synthesis;
     }
@@ -685,7 +677,7 @@ fn patch_relative(writer: &Elf, placed: &Placed<'_>, delta: &Delta<'_>, kept: &m
     let bytes = &mut kept.bytes;
     let mut put = |at: usize| match slid(placed, rebase[at], relative) {
         Ok(rela) => {
-            bytes[RELA as usize * at..][..RELA as usize].copy_from_slice(&rela.bytes());
+            bytes.update(RELA as usize * at, &rela.bytes());
             true
         }
         Err(_) => false,
@@ -734,13 +726,12 @@ fn rela_bytes(relocations: &[Rela]) -> Vec<u8> {
 /// The `RELATIVE` relocation of the slid address `at`: its addend the 8 bytes placed there.
 fn slid(placed: &Placed<'_>, at: u64, r_type: u32) -> Result<Rela, LinkError> {
     let regions = placed.regions;
-    let region = writable(regions, at, "a slid address")?;
+    let region = writable(placed, at, "a slid address", None)?;
     let offset = (at - regions[region].addr) as usize;
     let value = placed
-        .bytes(region)
-        .get(offset..offset + 8)
+        .view(region)
+        .u64(offset)
         .ok_or_else(|| error(format!("a slid address at {at:#x}, outside the bytes of its region")))?; // alloc: error path
-    let value = u64::from_le_bytes(value.try_into().expect("8 bytes"));
     Ok(Rela { at, r_type, sym: 0, addend: value as i64 })
 }
 
@@ -782,15 +773,14 @@ fn push_others(writer: &Elf, placed: &Placed<'_>, shared: bool, other: &mut Vec<
         }
         Ok(1 + index)
     };
-    let regions = placed.regions;
-    let writable = |at: u64, what: &str| writable(regions, at, what);
     for bind in placed.binds {
-        writable(bind.addr, "a bound address")?;
+        let name = placed.imports.get(bind.import as usize).map(|it| it.name.as_str());
+        writable(placed, bind.addr, "a bound address", name)?;
         other.push(Rela { at: bind.addr, r_type: types.abs64, sym: import(bind.import)?, addend: bind.addend });
     }
     for cell in placed.got {
         let at = cell.addr;
-        writable(at, "a GOT cell")?;
+        writable(placed, at, "a GOT cell", None)?;
         match &cell.holds {
             Holds::Local(_) => {}
             // A shared library's TLS block is placed when it is loaded: the loader adds the
@@ -878,40 +868,40 @@ fn rel32(to: u64, from: u64, what: &str) -> Result<u32, LinkError> {
 }
 
 /// `.eh_frame_hdr`: the binary search table of every FDE in [`Class::EhFrame`] (the
-/// functions' and the native objects'), sorted by the address each covers. Encodings as
+/// functions' and the native objects') and of an ELF patch's in [`Class::Patch`] ([`outside`]),
+/// sorted by the address each covers. Encodings as
 /// lld writes them: `pcrel|sdata4` to `.eh_frame`, a `udata4` count, `datarel|sdata4` pairs.
 ///
 /// One pass over the records' headers ([`fdes`]), in parallel pieces split where the core
 /// placed the functions' FDEs. With `kept` (an incremental output's) of the synthesis
 /// `placed.delta` is from, the table is patched where that is exact ([`patch_hdr`]).
-fn eh_frame_hdr(placed: &Placed<'_>, kept: Option<&mut KeptHdr>) -> Result<Vec<u8>, LinkError> {
+fn eh_frame_hdr(placed: &Placed<'_>, kept: Option<&mut KeptHdr>) -> Result<CowBytes, LinkError> {
     let hdr = placed
         .region(&Class::Synthetic(EH_FRAME_HDR))
         .map(|(_, it)| it.addr)
         .ok_or_else(|| error(format!("the image has no `{EH_FRAME_HDR}` region")))?; // alloc: error path
     let Some(kept) = kept else {
-        return Ok(build_hdr(placed, hdr)?.0);
+        return Ok(CowBytes::from_vec(build_hdr(placed, hdr)?.0));
     };
     let last = std::mem::replace(&mut kept.synthesis, 0);
     let patches = placed.delta.filter(|delta| last != 0 && delta.patches(last, &[delta.functions]));
     if let Some(delta) = patches
         && patch_hdr(placed, delta, hdr, kept)
     {
-        // alloc: the output buffer, `.eh_frame_hdr`'s bytes
-        let mut bytes = Vec::with_capacity(kept.bytes.len());
-        bytes.extend_from_slice(&kept.bytes);
         kept.synthesis = placed.synthesis;
         #[cfg(test)]
         {
             kept.patched += 1;
         }
-        return Ok(bytes);
+        // clone: two reference counts, the table shared with the state that holds it
+        return Ok(kept.bytes.clone());
     }
     let (bytes, table, in_order) = build_hdr(placed, hdr)?;
+    let bytes = CowBytes::from_vec(bytes);
     if in_order && fdes_start_records(placed, &table) {
         kept.table = table;
-        kept.bytes.clear();
-        kept.bytes.extend_from_slice(&bytes);
+        // clone: two reference counts, the table shared with the state that holds it
+        kept.bytes = bytes.clone();
         kept.synthesis = placed.synthesis;
     }
     Ok(bytes)
@@ -924,7 +914,8 @@ pub(crate) struct KeptHdr {
     /// The table as (address covered, FDE), in section order, which was its address order
     /// (kept only then), so sorted both ways.
     table: Vec<(u64, u64)>,
-    bytes: Vec<u8>,
+    /// What the last link's state holds too.
+    bytes: CowBytes,
     /// The FDEs of the records walked again, reused.
     scratch: Vec<(u64, u64)>,
     /// How many builds were patches.
@@ -941,7 +932,7 @@ fn fdes_start_records(placed: &Placed<'_>, table: &[(u64, u64)]) -> bool {
         return true;
     }
     let Some((index, region)) = placed.region(&Class::EhFrame) else { return true };
-    let (section, end) = (region.addr, region.addr + placed.bytes(index).len() as u64);
+    let (section, end) = (region.addr, region.addr + placed.len(index) as u64);
     placed.functions.par_iter().with_min_len(CHUNK).all(|it| match it.fde {
         Some(fde) if fde > section && fde < end => table.binary_search_by_key(&fde, |it| it.1).is_ok(),
         _ => true,
@@ -958,8 +949,15 @@ fn fdes_start_records(placed: &Placed<'_>, table: &[(u64, u64)]) -> bool {
 /// table still sorted (so the build sorts nothing), every entry in reach, and each FDE a
 /// spliced function names one of the table.
 fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHdr) -> bool {
+    // An FDE outside `.eh_frame` (an ELF patch's) is listed only by a build.
+    let changed = |splice: &crate::model::Splice| {
+        placed.functions.get(splice.new.start as usize..splice.new.end as usize).unwrap_or_default()
+    };
+    if delta.functions.iter().any(|it| changed(it).iter().any(|f| f.fde.is_some_and(|fde| outside(placed, fde)))) {
+        return false;
+    }
     let Some((index, region)) = placed.region(&Class::EhFrame) else { return true };
-    let (bytes, section) = (placed.bytes(index), region.addr);
+    let (bytes, section) = (placed.view(index), region.addr);
     let end = section + bytes.len() as u64;
     let KeptHdr { table, bytes: out, scratch, .. } = kept;
     if out.len() != 12 + 8 * table.len() {
@@ -985,7 +983,7 @@ fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHd
             }
             match entry(bytes, at) {
                 Ok(Some((body, next))) => {
-                    let cie = bytes.get(body..body + 4).is_none_or(|id| id == [0; 4]);
+                    let cie = bytes.u32(body).is_none_or(|id| id == 0);
                     if at < e && next > s && cie {
                         return false;
                     }
@@ -1008,9 +1006,10 @@ fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHd
         }
         for (nth, &(pc, fde)) in table[k..j].iter().enumerate() {
             let (Ok(pc), Ok(fde)) = (rel32(pc, hdr, "a function"), rel32(fde, hdr, "an FDE")) else { return false };
-            let cell = &mut out[12 + 8 * (k + nth)..][..8];
+            let mut cell = [0u8; 8];
             cell[..4].copy_from_slice(&pc.to_le_bytes());
             cell[4..].copy_from_slice(&fde.to_le_bytes());
+            out.update(12 + 8 * (k + nth), &cell);
         }
     }
     delta.functions.iter().all(|splice| {
@@ -1022,13 +1021,14 @@ fn patch_hdr(placed: &Placed<'_>, delta: &Delta<'_>, hdr: u64, kept: &mut KeptHd
     })
 }
 
-/// `.eh_frame_hdr` built from `.eh_frame`: its bytes, its table, and whether the table came
-/// in address order.
+/// `.eh_frame_hdr` built from `.eh_frame` and the FDEs outside it ([`outside`]): its bytes,
+/// its table, and whether the table came in address order and holds only `.eh_frame`'s FDEs
+/// (what [`patch_hdr`] can patch).
 fn build_hdr(placed: &Placed<'_>, hdr: u64) -> Result<(Vec<u8>, Vec<(u64, u64)>, bool), LinkError> {
     let eh_frame = placed.region(&Class::EhFrame);
     let mut table = match eh_frame {
         Some((index, region)) => {
-            let bytes = placed.bytes(index);
+            let bytes = placed.view(index);
             let starts = crate::unwind::fde_splits(placed, region.addr, bytes.len(), CHUNK);
             // alloc: error path
             fdes(bytes, region.addr, &starts).map_err(|it| error(format!("the image's .eh_frame at {:#x}: {it}", region.addr)))?
@@ -1036,18 +1036,20 @@ fn build_hdr(placed: &Placed<'_>, hdr: u64) -> Result<(Vec<u8>, Vec<(u64, u64)>,
         // alloc: empty, which allocates nothing
         None => Vec::new(),
     };
+    let inside = table.len();
+    table.extend(placed.functions.iter().filter_map(|f| f.fde.filter(|&fde| outside(placed, fde)).map(|fde| (f.addr, fde))));
     let in_order = table.is_sorted();
     if !in_order {
         radix::sort_copy_by_key(&mut table, |&(pc, fde): &(u64, u64)| radix::pack_64(pc, fde));
     }
     let mut bytes = Vec::with_capacity(12 + 8 * table.len());
-    bytes.u8(1);
-    bytes.u8(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
-    bytes.u8(gimli::DW_EH_PE_udata4.0);
-    bytes.u8(gimli::DW_EH_PE_datarel.0 | gimli::DW_EH_PE_sdata4.0);
+    bytes.put_u8(1);
+    bytes.put_u8(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);
+    bytes.put_u8(gimli::DW_EH_PE_udata4.0);
+    bytes.put_u8(gimli::DW_EH_PE_datarel.0 | gimli::DW_EH_PE_sdata4.0);
     let eh_frame_addr = eh_frame.map_or(hdr + 4, |(_, it)| it.addr);
-    bytes.u32(rel32(eh_frame_addr, hdr + 4, ".eh_frame from .eh_frame_hdr")?);
-    bytes.u32(u32::try_from(table.len()).map_err(|_| error("more FDEs than .eh_frame_hdr counts".into()))?);
+    bytes.put_u32(rel32(eh_frame_addr, hdr + 4, ".eh_frame from .eh_frame_hdr")?);
+    bytes.put_u32(u32::try_from(table.len()).map_err(|_| error("more FDEs than .eh_frame_hdr counts".into()))?);
     bytes.resize(12 + 8 * table.len(), 0);
     let results: Vec<Result<(), LinkError>> = bytes[12..]
         .par_chunks_mut(8 * CHUNK)
@@ -1061,11 +1063,14 @@ fn build_hdr(placed: &Placed<'_>, hdr: u64) -> Result<(Vec<u8>, Vec<(u64, u64)>,
         })
         .collect(); // alloc: once per image, one result per chunk of FDEs
     first_error(results)?;
-    Ok((bytes, table, in_order))
+    Ok((bytes, table, in_order && table.len() == inside))
 }
 
-const DW_EH_PE_OMIT: u8 = 0xff;
-const DW_EH_PE_PCREL: u8 = 0x10;
+/// Whether `fde` is outside `.eh_frame`: an incremental ELF patch's, placed in
+/// [`Class::Patch`] after the patch's code.
+fn outside(placed: &Placed<'_>, fde: u64) -> bool {
+    placed.region(&Class::EhFrame).is_none_or(|(_, it)| !(it.addr..it.addr + it.size).contains(&fde))
+}
 
 /// How a walk over a piece of `.eh_frame` ended.
 enum Stop {
@@ -1086,7 +1091,7 @@ enum Stop {
 /// The section is walked in pieces from 0 and from each of `splits` (record starts, sorted),
 /// in parallel; each piece must end exactly where the next starts. The answer is the one
 /// walk from 0 gives, its first error included, on any number of cores.
-fn fdes(bytes: &[u8], section: u64, splits: &[usize]) -> Result<Vec<(u64, u64)>, String> {
+fn fdes(bytes: View<'_>, section: u64, splits: &[usize]) -> Result<Vec<(u64, u64)>, String> {
     if splits.is_empty() {
         // alloc: once per image, the table: compilers' FDEs take 32 bytes or so, so it grows
         // at most a few times
@@ -1132,8 +1137,9 @@ fn fdes(bytes: &[u8], section: u64, splits: &[usize]) -> Result<Vec<(u64, u64)>,
 }
 
 /// The FDEs of the records from `start` (a record's start) up to `end`, onto `table`: an
-/// error when a record runs past `end` where `end` is not the section's.
-fn walk(bytes: &[u8], section: u64, start: usize, end: usize, table: &mut Vec<(u64, u64)>) -> Result<Stop, String> {
+/// error when a record runs past `end` where `end` is not the section's. Each record is read
+/// in place, or put together in a reused buffer where it crosses a page of `bytes`.
+fn walk(bytes: View<'_>, section: u64, start: usize, end: usize, table: &mut Vec<(u64, u64)>) -> Result<Stop, String> {
     // The last CIE an FDE named, then those met in this piece (in order, so sorted), then
     // those of other pieces, found where they are.
     let mut last: Option<(usize, u8)> = None;
@@ -1141,6 +1147,8 @@ fn walk(bytes: &[u8], section: u64, start: usize, end: usize, table: &mut Vec<(u
     let mut met: SmallVec<[(usize, u8); 16]> = SmallVec::new();
     // alloc: only for a CIE another piece holds, once each
     let mut others: FxHashMap<usize, u8> = FxHashMap::default();
+    // alloc: only for a record across two pages, grown to the longest such record once per walk
+    let (mut across, mut cie_across) = (Vec::new(), Vec::new());
     // alloc: error path
     let bad = |at: usize, what: &str| format!("the entry at offset {at:#x}: {what}");
     let mut at = start;
@@ -1154,10 +1162,13 @@ fn walk(bytes: &[u8], section: u64, start: usize, end: usize, table: &mut Vec<(u
             return Err(format!("the record at offset {record:#x} runs past {end:#x}, where the core placed an FDE"));
         }
         at = next;
-        let mut reader = Cursor { bytes: &bytes[..next], at: body };
-        let id = reader.u32().map_err(|it| bad(record, it))?;
+        // Positions in `reader` are from the record's start, at `base` in the address space.
+        let base = section + record as u64;
+        let held = bytes.read(record, next - record, &mut across).ok_or_else(|| bad(record, EARLY))?;
+        let mut reader = Reader::starting_at(held, body - record).map_err(|it| bad(record, it.as_str()))?;
+        let id = reader.u32().map_err(|it| bad(record, it.as_str()))?;
         if id == 0 {
-            let encoding = cie_encoding(&mut reader, section).map_err(|it| bad(record, it))?;
+            let encoding = cie_encoding(&mut reader, base).map_err(|it| bad(record, it))?;
             met.push((record, encoding));
             continue;
         }
@@ -1172,7 +1183,7 @@ fn walk(bytes: &[u8], section: u64, start: usize, end: usize, table: &mut Vec<(u
                     Err(_) => match others.get(&cie) {
                         Some(&encoding) => encoding,
                         None => {
-                            let encoding = cie_at(bytes, cie, section).map_err(|it| bad(record, it))?;
+                            let encoding = cie_at(bytes, cie, section, &mut cie_across).map_err(|it| bad(record, it))?;
                             others.insert(cie, encoding);
                             encoding
                         }
@@ -1182,24 +1193,25 @@ fn walk(bytes: &[u8], section: u64, start: usize, end: usize, table: &mut Vec<(u
                 encoding
             }
         };
-        let pc = reader.pointer(encoding, section).map_err(|it| bad(record, it))?;
-        reader.value(encoding).map_err(|it| bad(record, it))?;
+        let pc = eh_pointer(&mut reader, encoding, base).map_err(|it| bad(record, it))?;
+        eh_value(&mut reader, encoding).map_err(|it| bad(record, it))?;
         table.push((pc, section + record as u64));
     }
     Ok(Stop::End)
 }
 
+/// What a read short of a record's fields says, as [`Reader`] says it.
+const EARLY: &str = "bytes that end early";
+
 /// The record at `at`: where its body (the CIE ID or pointer) starts and where it ends; none
 /// for a zero length, which ends the section.
-fn entry(bytes: &[u8], at: usize) -> Result<Option<(usize, usize)>, &'static str> {
-    let mut reader = Cursor { bytes, at };
-    let length = match reader.u32()? {
+fn entry(bytes: View<'_>, at: usize) -> Result<Option<(usize, usize)>, &'static str> {
+    let (length, body) = match bytes.u32(at).ok_or(EARLY)? {
         0 => return Ok(None),
         0xffff_fff0..=0xffff_fffe => return Err("a reserved initial length"),
-        0xffff_ffff => reader.u64()?,
-        length => u64::from(length),
+        0xffff_ffff => (bytes.u64(at + 4).ok_or(EARLY)?, at + 12),
+        length => (u64::from(length), at + 4),
     };
-    let body = reader.at;
     let end = usize::try_from(length)
         .ok()
         .and_then(|it| body.checked_add(it))
@@ -1208,144 +1220,16 @@ fn entry(bytes: &[u8], at: usize) -> Result<Option<(usize, usize)>, &'static str
     Ok(Some((body, end)))
 }
 
-/// The FDE pointer encoding of the CIE at `at`, which another piece holds.
-fn cie_at(bytes: &[u8], at: usize, section: u64) -> Result<u8, &'static str> {
+/// The FDE pointer encoding of the CIE at `at`, which another piece holds; `across` holds it
+/// where it crosses a page.
+fn cie_at(bytes: View<'_>, at: usize, section: u64, across: &mut Vec<u8>) -> Result<u8, &'static str> {
     let (body, end) = entry(bytes, at)?.ok_or("its CIE pointer names the section's end")?;
-    let mut reader = Cursor { bytes: &bytes[..end], at: body };
-    if reader.u32()? != 0 {
+    let held = bytes.read(at, end - at, across).ok_or(EARLY)?;
+    let mut reader = Reader::starting_at(held, body - at).map_err(cursor::Error::as_str)?;
+    if reader.u32().map_err(cursor::Error::as_str)? != 0 {
         return Err("its CIE pointer names an FDE");
     }
-    cie_encoding(&mut reader, section)
-}
-
-/// The FDE pointer encoding of the CIE `reader` is in (past its ID), what leads to it checked
-/// as gimli checks it.
-fn cie_encoding(reader: &mut Cursor<'_>, section: u64) -> Result<u8, &'static str> {
-    const UNKNOWN: &str = "a CIE of an unknown augmentation";
-    let version = reader.u8()?;
-    if !matches!(version, 1 | 3 | 4) {
-        return Err("a CIE of an unknown version");
-    }
-    let augmentation = reader.cstr()?;
-    reader.uleb()?;
-    reader.sleb()?;
-    if version == 1 {
-        reader.u8()?;
-    } else {
-        reader.uleb()?;
-    }
-    let mut encoding = 0;
-    let mut data: Option<Cursor<'_>> = None;
-    for (index, &ch) in augmentation.iter().enumerate() {
-        match ch {
-            b'z' if index == 0 => {
-                let len = reader.uleb()?;
-                let (bytes, start) = (reader.bytes, reader.at);
-                let end = usize::try_from(len)
-                    .ok()
-                    .and_then(|it| start.checked_add(it))
-                    .filter(|it| *it <= bytes.len())
-                    .ok_or("augmentation data longer than its CIE")?;
-                data = Some(Cursor { bytes: &bytes[..end], at: start });
-                reader.at = end;
-            }
-            b'L' => {
-                let data = data.as_mut().ok_or(UNKNOWN)?;
-                pointer_encoding(data.u8()?)?;
-            }
-            b'P' => {
-                let data = data.as_mut().ok_or(UNKNOWN)?;
-                let personality = pointer_encoding(data.u8()?)?;
-                data.pointer(personality, section)?;
-            }
-            b'R' => {
-                let data = data.as_mut().ok_or(UNKNOWN)?;
-                encoding = pointer_encoding(data.u8()?)?;
-            }
-            b'S' => {}
-            _ => return Err(UNKNOWN),
-        }
-    }
-    Ok(encoding)
-}
-
-/// `encoding` if it is a `DW_EH_PE_*` pointer encoding.
-fn pointer_encoding(encoding: u8) -> Result<u8, &'static str> {
-    let format = matches!(encoding & 0x0f, 0x00..=0x04 | 0x09..=0x0c);
-    if encoding == DW_EH_PE_OMIT || (format && encoding & 0x70 <= 0x50) {
-        Ok(encoding)
-    } else {
-        Err("an unknown pointer encoding")
-    }
-}
-
-/// A cursor over `.eh_frame`, little endian; `at` is from the section's start.
-struct Cursor<'a> {
-    bytes: &'a [u8],
-    at: usize,
-}
-
-impl<'a> Cursor<'a> {
-    fn take<const N: usize>(&mut self) -> Result<[u8; N], &'static str> {
-        let bytes = self.bytes.get(self.at..self.at + N).ok_or("cut short")?;
-        self.at += N;
-        Ok(bytes.try_into().expect("N bytes"))
-    }
-
-    fn u8(&mut self) -> Result<u8, &'static str> {
-        Ok(self.take::<1>()?[0])
-    }
-
-    fn u32(&mut self) -> Result<u32, &'static str> {
-        Ok(u32::from_le_bytes(self.take()?))
-    }
-
-    fn u64(&mut self) -> Result<u64, &'static str> {
-        Ok(u64::from_le_bytes(self.take()?))
-    }
-
-    fn uleb(&mut self) -> Result<u64, &'static str> {
-        blaze_format::leb::read_u64(self.bytes, &mut self.at).map_err(LebError::as_str)
-    }
-
-    fn sleb(&mut self) -> Result<i64, &'static str> {
-        blaze_format::leb::read_i64(self.bytes, &mut self.at).map_err(LebError::as_str)
-    }
-
-    fn cstr(&mut self) -> Result<&'a [u8], &'static str> {
-        let rest = &self.bytes[self.at..];
-        let len = rest.iter().position(|it| *it == 0).ok_or("a string without its end")?;
-        self.at += len + 1;
-        Ok(&rest[..len])
-    }
-
-    /// A value in `encoding`'s format, signed ones sign-extended.
-    fn value(&mut self, encoding: u8) -> Result<u64, &'static str> {
-        Ok(match encoding & 0x0f {
-            0x00 | 0x04 | 0x0c => self.u64()?,
-            0x01 => self.uleb()?,
-            0x02 => u64::from(u16::from_le_bytes(self.take()?)),
-            0x03 => u64::from(self.u32()?),
-            0x09 => self.sleb()? as u64,
-            0x0a => i16::from_le_bytes(self.take()?) as u64,
-            0x0b => i32::from_le_bytes(self.take()?) as u64,
-            _ => return Err("an unknown pointer encoding"),
-        })
-    }
-
-    /// A pointer in `encoding` with only `.eh_frame`'s address (`section`) known: absolute or
-    /// relative to where it is.
-    fn pointer(&mut self, encoding: u8, section: u64) -> Result<u64, &'static str> {
-        if encoding == DW_EH_PE_OMIT {
-            return Err("a pointer whose encoding says it is omitted");
-        }
-        let base = match encoding & 0x70 {
-            0x00 => 0,
-            DW_EH_PE_PCREL => section.wrapping_add(self.at as u64),
-            _ => return Err("a pointer relative to a base other than where it is"),
-        };
-        Ok(base.wrapping_add(self.value(encoding)?))
-    }
+    cie_encoding(&mut reader, section + at as u64)
 }
 
 #[cfg(test)]
@@ -1355,6 +1239,8 @@ mod tests {
     use rustc_hash::FxHashMap;
 
     use super::fdes;
+    use crate::cow::CowBytes;
+    use crate::model::{Pages, View};
 
     /// The walk `eh_frame_hdr` made before: gimli's parse of every record.
     fn reference(bytes: &[u8], section: u64) -> Result<Vec<(u64, u64)>, String> {
@@ -1520,8 +1406,38 @@ mod tests {
             assert_eq!(want.len(), n);
             for every in [0, 1, 7, 64, n] {
                 let splits = if every == 0 { Vec::new() } else { split_at(&starts, every) };
-                assert_eq!(fdes(&bytes, base, &splits).unwrap(), want, "round {round}, a split every {every}");
+                assert_eq!(fdes(View::Slice(&bytes), base, &splits).unwrap(), want, "round {round}, a split every {every}");
             }
+        }
+    }
+
+    /// The section held in pages, some written since its buffer (so records cross from the
+    /// buffer into a page and from page to page), reads as the one slice does.
+    #[test]
+    fn a_section_in_pages_reads_as_one_slice() {
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
+        for round in 0..8 {
+            let n = 1500 + (rng.next_u64() % 1500) as usize;
+            let base = 0x50_0000 + 0x1000 * round as u64;
+            let (bytes, starts) = section(&mut rng, n, base);
+            let mut paged = CowBytes::from_vec(bytes.clone());
+            for page in (0..bytes.len().div_ceil(CowBytes::PAGE)).filter(|it| (it + round) % 2 == 0) {
+                let at = page * CowBytes::PAGE;
+                paged.write(at, &bytes[at..at + 1]);
+            }
+            assert!(paged.slice(0, bytes.len()).is_none(), "round {round}: the section is in pages");
+            let view = View::Pages(Pages::all(&paged));
+            let want = fdes(View::Slice(&bytes), base, &[]).unwrap();
+            assert_eq!(want.len(), n);
+            for every in [0, 1, 7, 64] {
+                let splits = if every == 0 { Vec::new() } else { split_at(&starts, every) };
+                assert_eq!(fdes(view, base, &splits).unwrap(), want, "round {round}, a split every {every}");
+            }
+            let short = CowBytes::from_vec(bytes[..bytes.len() - 3].to_vec());
+            assert_eq!(
+                fdes(View::Pages(Pages::all(&short)), base, &[]).unwrap_err(),
+                fdes(View::Slice(&bytes[..bytes.len() - 3]), base, &[]).unwrap_err(),
+            );
         }
     }
 
@@ -1539,7 +1455,7 @@ mod tests {
         let want = reference(&bytes, base).unwrap();
         assert_eq!(want.len(), 150);
         for every in [1, 10, 149, 151] {
-            assert_eq!(fdes(&bytes, base, &split_at(&starts, every)).unwrap(), want, "every {every}");
+            assert_eq!(fdes(View::Slice(&bytes), base, &split_at(&starts, every)).unwrap(), want, "every {every}");
         }
     }
 
@@ -1554,16 +1470,16 @@ mod tests {
         let late = starts[180];
         bad[late..late + 4].copy_from_slice(&0xffff_fff3u32.to_le_bytes());
         assert!(reference(&bad, base).is_err());
-        let serial = fdes(&bad, base, &[]).unwrap_err();
+        let serial = fdes(View::Slice(&bad), base, &[]).unwrap_err();
         assert!(serial.contains("offset 0x0"), "{serial}");
         for every in [1, 13, 50] {
-            assert_eq!(fdes(&bad, base, &split_at(&starts, every)).unwrap_err(), serial, "every {every}");
+            assert_eq!(fdes(View::Slice(&bad), base, &split_at(&starts, every)).unwrap_err(), serial, "every {every}");
         }
         // A split the walk doesn't land on is an error naming where the core placed an FDE.
         let wrong = vec![starts[100] + 4];
-        assert!(fdes(&bytes, base, &wrong).unwrap_err().contains("where the core placed an FDE"));
+        assert!(fdes(View::Slice(&bytes), base, &wrong).unwrap_err().contains("where the core placed an FDE"));
         // A record cut short.
-        assert!(fdes(&bytes[..bytes.len() - 3], base, &[]).is_err());
+        assert!(fdes(View::Slice(&bytes[..bytes.len() - 3]), base, &[]).is_err());
         assert!(reference(&bytes[..bytes.len() - 3], base).is_err());
     }
 }

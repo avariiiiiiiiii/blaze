@@ -5,14 +5,18 @@
 //! Each is built from salsa queries in layers, so an edit reruns only the groupings it touches
 //! and every layer above backdates where its answer stayed the same:
 //!
-//! - impls: one crate's impls of one trait ([`trait_impls_in`], which reruns when the crate's
-//!   impls change and backdates for every other trait), then every crate's impls of the trait
-//!   ([`trait_impls`]), then the impls for one simplified self type ([`impls_of`]) and the
-//!   blanket ones ([`blanket_impls_of`]);
-//! - inherent impls: one crate's, by simplified self type ([`inherent_impls_in`]), then every
-//!   crate's for one self type ([`inherent_impls_of`]);
-//! - traits with an item of a name, for method candidates: one crate's ([`traits_in`]), then
-//!   every crate's for one name ([`traits_with`]);
+//! - impls: one crate's impls of one trait ([`trait_impls_in`], from hir-ty's per-module
+//!   bucket `TraitImpls::for_crate_and_trait`, which reruns only when a module's impls of that
+//!   trait change), then every crate's impls of the trait ([`trait_impls`]), then the impls for
+//!   one simplified self type ([`impls_of`]) and the blanket ones ([`blanket_impls_of`]);
+//! - inherent impls: one module's by simplified self type ([`inherent_impls_in_module`]), the
+//!   modules of a crate with impls for each type ([`inherent_impl_modules`],
+//!   [`inherent_modules_of`]) and one module's for one type ([`module_inherent_impls_of`]),
+//!   then every crate's for one self type ([`inherent_impls_of`]); a frozen crate's come from
+//!   its one frozen table ([`inherent_impls_in`]);
+//! - traits with an item of a name, for method candidates: one module's
+//!   ([`traits_in_module`]), one crate's ([`traits_in`]), then every crate's for one name
+//!   ([`traits_with`]);
 //! - names: one scope's, all of them ([`scope_names`]), from which [`scope`] picks one.
 //!
 //! Impls are found as hir-ty's `TraitImpls` and `InherentImpls` find them, in every crate:
@@ -46,7 +50,7 @@ use hir_def::{
 };
 use hir_ty::{
     db::HirDatabase,
-    method_resolution::{InherentImpls, TraitImpls},
+    method_resolution::{InherentImpls, TraitImpls, frozen},
     next_solver::{DbInterner, SimplifiedType as HirSimplifiedType},
 };
 use rustc_type_ir::fast_reject::{TreatParams, simplify_type};
@@ -493,7 +497,7 @@ fn trait_impls_in(
 ) -> Runs<SimplifiedType, AnyImpl> {
     frame::task(Tag::Other, |frame| {
         let mut found: Vec<_, &Frame> = Vec::new_in(frame);
-        TraitImpls::for_crate(db, krate).for_trait(trait_, |impls| match impls {
+        TraitImpls::for_crate_and_trait(db, krate, trait_).for_trait(trait_, |impls| match impls {
             Either::Left(impls) => found.extend(impls.iter().map(|&it| {
                 (impl_self_ty(db, it), key::item_key(db, ItemId::Impl(it)), AnyImpl::Impl(it))
             })),
@@ -525,8 +529,7 @@ pub(crate) fn trait_impls(db: &Db, trait_: TraitId) -> Runs<SimplifiedType, AnyI
 
 /// `krate` and the crates that depend on it, directly or not: the only ones that can hold an
 /// impl of one of its traits, which the impl names.
-#[salsa::tracked(returns(deref))]
-fn dependents(db: &Db, krate: Crate) -> Box<[Crate]> {
+fn dependents(db: &Db, krate: Crate) -> &[Crate] {
     krate.transitive_rev_deps(db)
 }
 
@@ -546,12 +549,25 @@ pub(crate) fn blanket_impls_of(db: &Db, trait_: TraitId) -> Keyed<AnyImpl> {
     Keyed::of(trait_impls(db, trait_).run(None).iter())
 }
 
-/// The inherent impls of `krate`, by the hash of their simplified self type, then key.
+/// The inherent impls of a frozen `krate`, from its one frozen table, by the hash of their
+/// simplified self type, then key.
 #[salsa::tracked(returns(ref))]
 fn inherent_impls_in(db: &Db, krate: Crate) -> Runs<SimplifiedType, ImplId> {
+    inherent_rows(db, InherentImpls::for_crate(db, krate))
+}
+
+/// The inherent impls of `module` and of the blocks in the bodies it holds, by the hash of
+/// their simplified self type, then key: equal unless one of them is added, removed or
+/// changes its self type.
+#[salsa::tracked(returns(ref))]
+fn inherent_impls_in_module(db: &Db, module: ModuleId) -> Runs<SimplifiedType, ImplId> {
+    inherent_rows(db, InherentImpls::for_module(db, module))
+}
+
+fn inherent_rows(db: &Db, impls: &InherentImpls<'_>) -> Runs<SimplifiedType, ImplId> {
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
-        for (self_ty, impls) in InherentImpls::for_crate(db, krate).iter() {
+        for (self_ty, impls) in impls.iter() {
             let self_ty = key::simplified(db, self_ty);
             rows.extend(
                 impls.iter().map(|&it| (Some(self_ty), key::item_key(db, ItemId::Impl(it)), it)),
@@ -561,7 +577,46 @@ fn inherent_impls_in(db: &Db, krate: Crate) -> Runs<SimplifiedType, ImplId> {
     })
 }
 
-/// The inherent impls of every crate for `self_ty`, sorted by key.
+/// The modules of `krate` with an inherent impl for each simplified self type, by its hash,
+/// then the module's key: equal unless a module gains its first impl for a type or loses its
+/// last.
+#[salsa::tracked(returns(ref))]
+fn inherent_impl_modules(db: &Db, krate: Crate) -> Runs<SimplifiedType, ModuleId> {
+    frame::task(Tag::Other, |frame| {
+        let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            let in_module = inherent_impls_in_module(db, module);
+            if in_module.searched.is_empty() {
+                continue;
+            }
+            let key = key::module_key(db, module);
+            rows.extend(in_module.searched.iter().map(|&self_ty| (Some(self_ty), key, module)));
+        }
+        Runs::new(&mut rows)
+    })
+}
+
+/// The modules of `krate` with an inherent impl for `self_ty`: equal unless that list changes,
+/// whatever other types gain.
+#[salsa::tracked(returns(deref))]
+fn inherent_modules_of(db: &Db, krate: Crate, self_ty: SimplifiedType) -> Box<[ModuleId]> {
+    let modules = inherent_impl_modules(db, krate).run(Some(self_ty));
+    column(modules.iter().map(|(_, module)| module))
+}
+
+/// The inherent impls of `module` for `self_ty`, sorted by key: equal unless one for that
+/// type is added there or removed.
+#[salsa::tracked(returns(ref))]
+fn module_inherent_impls_of(
+    db: &Db,
+    module: ModuleId,
+    self_ty: SimplifiedType,
+) -> Keyed<ImplId> {
+    Keyed::of(inherent_impls_in_module(db, module).run(Some(self_ty)).iter())
+}
+
+/// The inherent impls of every crate for `self_ty`, sorted by key. Reads, in each crate, only
+/// the modules with impls for that type.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn inherent_impls_of(
     db: &Db,
@@ -571,27 +626,31 @@ pub(crate) fn inherent_impls_of(
     frame::task(Tag::Other, |frame| {
         let mut rows: Vec<_, &Frame> = Vec::new_in(frame);
         for &krate in base_db::all_crates(db).iter() {
-            rows.extend(inherent_impls_in(db, krate).run(Some(self_ty)).iter());
+            if frozen::served(db, krate) {
+                rows.extend(inherent_impls_in(db, krate).run(Some(self_ty)).iter());
+                continue;
+            }
+            for &module in inherent_modules_of(db, krate, self_ty) {
+                rows.extend(module_inherent_impls_of(db, module, self_ty).iter());
+            }
         }
         Keyed::sorted(&mut rows)
     })
 }
 
-/// The traits declared in `krate`'s modules, by the hash of each name one of their items
-/// has, then key.
-#[salsa::tracked(returns(ref))]
-fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
+/// The traits declared in `module`, by the hash of each name one of their items has, then
+/// key, each pair once: equal unless such a trait or the names of its items change.
+#[salsa::tracked(returns(deref))]
+fn traits_in_module(db: &Db, module: ModuleId) -> Box<[(NameHash, ItemKey, TraitId)]> {
     frame::task(Tag::Other, |frame| {
         let mut names: Vec<&str, &Frame> = Vec::new_in(frame);
         let mut traits: Vec<_, &Frame> = Vec::new_in(frame);
-        for (_, module) in crate_def_map(db, krate).modules(db) {
-            for def in module.scope(db).declarations() {
-                let ModuleDefId::TraitId(trait_) = def else { continue };
-                let key = key::item_key(db, ItemId::Trait(trait_));
-                for (name, _) in trait_.trait_items(db).items.iter() {
-                    names.push(name.as_str());
-                    traits.push((key, trait_));
-                }
+        for def in module.def_map(db).module(db, module).scope(db).declarations() {
+            let ModuleDefId::TraitId(trait_) = def else { continue };
+            let key = key::item_key(db, ItemId::Trait(trait_));
+            for (name, _) in trait_.trait_items(db).items.iter() {
+                names.push(name.as_str());
+                traits.push((key, trait_));
             }
         }
         let mut found: Vec<_, &Frame> = Vec::with_capacity_in(traits.len(), frame);
@@ -599,10 +658,25 @@ fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
             name_hashes(names.iter().copied())
                 .into_iter()
                 .zip(traits.iter().copied())
-                .map(|(name, (key, trait_))| (Some(name), key, trait_)),
+                .map(|(name, (key, trait_))| (name, key, trait_)),
         );
         found.sort_unstable_by_key(|&(name, key, _)| (name, key));
         found.dedup_by_key(|&mut (name, key, _)| (name, key));
+        column(found.iter().copied())
+    })
+}
+
+/// The traits declared in `krate`'s modules, by the hash of each name one of their items
+/// has, then key: reruns only when some module's [`traits_in_module`] changes. A trait is
+/// declared in one module, so the modules' rows never repeat one another.
+#[salsa::tracked(returns(ref))]
+fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
+    frame::task(Tag::Other, |frame| {
+        let mut found: Vec<_, &Frame> = Vec::new_in(frame);
+        for (module, _) in crate_def_map(db, krate).modules(db) {
+            let rows = traits_in_module(db, module);
+            found.extend(rows.iter().map(|&(name, key, trait_)| (Some(name), key, trait_)));
+        }
         Runs::new(&mut found)
     })
 }

@@ -10,22 +10,28 @@
 //! by one compare-and-swap; a full probe window goes on to the next level, which has twice
 //! the slots and is made on first use. A read gives `&Template` for as long as the memo is
 //! borrowed: nothing is freed under `&self`, only by [`Memo::retain`], which takes `&mut self`.
+//!
+//! Unsafe for speed: the safe table, a `RwLock<HashMap>`, writes the lock's word on every
+//! read, so each worker's lookup of every function moves one cache line between all cores.
+//! Its tests check it against a map of first templates, and the model checker
+//! (`cfg(blaze_check)`) runs its races.
 
-use std::{
-    marker::PhantomData,
-    ptr,
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
-};
+#[cfg(not(blaze_check))]
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::{marker::PhantomData, ptr};
 
+#[cfg(blaze_check)]
+use blaze_check::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use blaze_ids::ContentId;
 
 use crate::template::Template;
 
-/// Slots of level 0; level `n` has `FIRST << n`.
-const FIRST: usize = 1 << 10;
+/// Slots of level 0; level `n` has `FIRST << n`. Under the model checker a level is a few
+/// slots, so a handful of puts spill and race to make the next level.
+const FIRST: usize = if cfg!(blaze_check) { 2 } else { 1 << 10 };
 const LEVELS: usize = 40;
 /// Slots tried in a level before the next.
-const PROBES: usize = 16;
+const PROBES: usize = if cfg!(blaze_check) { 2 } else { 16 };
 
 struct Entry {
     shape: ContentId,
@@ -281,6 +287,46 @@ mod tests {
         assert_eq!(memo.len(), crowded.len());
     }
 
+    /// The memo against a map that keeps the first template of a shape: the same answers for
+    /// a run of puts, gets and collections, crowded into few windows so most spill.
+    #[test]
+    fn the_memo_answers_as_a_map_of_first_templates() {
+        let mut memo = Memo::new();
+        let mut reference: std::collections::HashMap<ContentId, Template> = Default::default();
+        let mut rng = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let pick = |n: u64| {
+            let mut id = ContentId([0; 32]);
+            id.0[..8].copy_from_slice(&(n % 8).to_le_bytes());
+            id.0[31] = (n % 31) as u8;
+            id
+        };
+        for _ in 0..4000 {
+            let (op, n) = (next() % 16, next());
+            let shape = pick(n);
+            match op {
+                0 => {
+                    let kept = (next() % 4) as u8;
+                    memo.retain(&|it| it.0[31] % 4 != kept);
+                    reference.retain(|it, _| it.0[31] % 4 != kept);
+                }
+                1..8 => {
+                    let template = template(n as u8);
+                    let want = reference.entry(shape).or_insert(template.clone()).clone();
+                    assert_eq!(*memo.put(shape, template), want);
+                }
+                _ => assert_eq!(memo.get(&shape), reference.get(&shape)),
+            }
+            assert_eq!(memo.len(), reference.len());
+        }
+    }
+
+    #[cfg(not(blaze_check))]
     #[test]
     fn workers_putting_at_once_keep_one_template_per_shape() {
         let memo = Memo::new();
@@ -297,5 +343,101 @@ mod tests {
             }
         });
         assert_eq!(memo.len(), shapes.len());
+    }
+}
+
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-codegen
+/// --release model_`): puts racing on one shape keep one template, puts crowding one window
+/// race to make the next level, and a get racing a put sees nothing or what the put kept.
+#[cfg(all(test, blaze_check))]
+mod model {
+    use std::sync::Arc;
+
+    use blaze_check::thread;
+
+    use super::*;
+    use crate::Arch;
+
+    fn template(byte: u8) -> Template {
+        Template {
+            arch: Arch::Aarch64,
+            align: 4,
+            code: vec![byte; 4],
+            relocs: crate::Relocs::new(),
+            data: Vec::new(),
+            inlined: Vec::new(),
+            side: None,
+            unwind: None,
+            lines: Vec::new(),
+            refs: 0,
+            externs: Vec::new(),
+            coverage: None,
+        }
+    }
+
+    /// Shapes that start their probes at one slot, told apart by `n`.
+    fn crowded(n: u8) -> ContentId {
+        let mut id = ContentId([0; 32]);
+        id.0[31] = n;
+        id
+    }
+
+    fn kept_at(template: &Template) -> usize {
+        std::ptr::from_ref(template).addr()
+    }
+
+    #[test]
+    fn model_puts_of_one_shape_keep_one_template() {
+        blaze_check::model(|| {
+            let memo = Arc::new(Memo::new());
+            let other = {
+                let memo = memo.clone();
+                thread::spawn(move || kept_at(memo.put(crowded(0), template(1))))
+            };
+            let kept = memo.put(crowded(0), template(2));
+            assert_eq!(kept_at(kept), other.join().unwrap(), "one template kept");
+            assert!(*kept == template(1) || *kept == template(2));
+            assert_eq!(memo.get(&crowded(0)).map(kept_at), Some(kept_at(kept)));
+            assert_eq!(memo.len(), 1);
+        });
+    }
+
+    #[test]
+    fn model_crowded_puts_race_to_make_the_next_level() {
+        blaze_check::model(|| {
+            let memo = Arc::new(Memo::new());
+            let other = {
+                let memo = memo.clone();
+                thread::spawn(move || {
+                    for n in [0, 1] {
+                        assert_eq!(*memo.put(crowded(n), template(n)), template(n));
+                    }
+                })
+            };
+            assert_eq!(*memo.put(crowded(2), template(2)), template(2));
+            other.join().unwrap();
+            for n in 0..3 {
+                assert_eq!(*memo.get(&crowded(n)).unwrap(), template(n));
+            }
+            assert_eq!(memo.len(), 3);
+            assert!(memo.level(1).is_some(), "three shapes of one window spill");
+        });
+    }
+
+    #[test]
+    fn model_a_get_sees_nothing_or_what_a_put_kept() {
+        blaze_check::model(|| {
+            let memo = Arc::new(Memo::new());
+            memo.put(crowded(0), template(0));
+            memo.put(crowded(1), template(1));
+            let other = {
+                let memo = memo.clone();
+                thread::spawn(move || kept_at(memo.put(crowded(2), template(2))))
+            };
+            let seen = memo.get(&crowded(2)).map(kept_at);
+            let kept = other.join().unwrap();
+            assert!(seen.is_none_or(|it| it == kept), "a get reads a published entry");
+            assert_eq!(memo.get(&crowded(2)).map(kept_at), Some(kept));
+        });
     }
 }

@@ -20,7 +20,12 @@
 //! token trees alone: two trees are equal, and hash equal, exactly when their token trees are,
 //! whichever builder calls made them.
 
-use std::{cell::Cell, hash::Hash, sync::LazyLock};
+use std::{
+    alloc::{Allocator, Global},
+    cell::Cell,
+    hash::Hash,
+    sync::LazyLock,
+};
 
 use blaze_mem::scratch::Scratch as Stack;
 use intern::Symbol;
@@ -35,9 +40,12 @@ use crate::{
     Subtree, SubtreeView, TokenTree, TokenTreesView, TtIter,
 };
 
+mod owned;
 #[cfg(test)]
 mod tests;
 mod wire;
+
+pub use owned::{TopSubtree, Tree};
 
 pub use wire::{WireError, WirePart};
 mod columns;
@@ -356,32 +364,37 @@ impl Layout {
     }
 }
 
-#[derive(Clone)]
-pub struct TopSubtree {
-    /// [`HEADER`], then the columns at the offsets it gives.
-    block: Box<[u32]>,
-    layout: Layout,
-    top_open: Span,
-    top_close: Span,
-    words: words::WordsCache,
-}
-
 /// The block and the top spans: the layout follows from the block, and the words from both.
-impl PartialEq for TopSubtree {
-    fn eq(&self, other: &TopSubtree) -> bool {
-        self.block == other.block
+impl PartialEq for Tree {
+    fn eq(&self, other: &Tree) -> bool {
+        self.block() == other.block()
             && self.top_open == other.top_open
             && self.top_close == other.top_close
     }
 }
 
-impl Eq for TopSubtree {}
+impl Eq for Tree {}
 
-impl Hash for TopSubtree {
+impl Hash for Tree {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.block.hash(state);
+        self.block().hash(state);
         self.top_open.hash(state);
         self.top_close.hash(state);
+    }
+}
+
+/// As their trees: whichever allocators the two blocks are in.
+impl<A: Allocator, B: Allocator> PartialEq<TopSubtree<B>> for TopSubtree<A> {
+    fn eq(&self, other: &TopSubtree<B>) -> bool {
+        **self == **other
+    }
+}
+
+impl<A: Allocator> Eq for TopSubtree<A> {}
+
+impl<A: Allocator> Hash for TopSubtree<A> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        (**self).hash(state)
     }
 }
 
@@ -446,7 +459,7 @@ static EMPTY: LazyLock<TopSubtree> = LazyLock::new(|| {
 });
 
 #[inline]
-pub(crate) fn empty_tree() -> &'static TopSubtree {
+pub(crate) fn empty_tree() -> &'static Tree {
     &EMPTY
 }
 
@@ -470,13 +483,7 @@ impl TopSubtree {
 
     /// The tree of `tts`, the top subtree first and every token tree after it in preorder.
     pub fn from_serialized(tts: Vec<TokenTree>) -> Self {
-        let mut tts = tts.into_iter();
-        let Some(TokenTree::Subtree(top_subtree)) = tts.next() else {
-            panic!("must always have a top subtree");
-        };
-        let mut builder = TopSubtreeBuilder::with_capacity(top_subtree.delimiter, tts.len());
-        tts.for_each(|tt| builder.push_token_tree(tt));
-        builder.build()
+        serialized(tts).build()
     }
 
     pub fn from_subtree(subtree: SubtreeView<'_>) -> Self {
@@ -486,32 +493,80 @@ impl TopSubtree {
         builder.extend_with_tt(token_trees);
         builder.build()
     }
+}
 
-    pub fn view(&self) -> SubtreeView<'_> {
-        SubtreeView(TokenTreesView { tree: self, start: 0, end: self.node_count() as u32 })
+/// A builder holding `tts`, the top subtree first and every token tree after it in preorder.
+fn serialized(tts: Vec<TokenTree>) -> TopSubtreeBuilder {
+    let mut tts = tts.into_iter();
+    let Some(TokenTree::Subtree(top_subtree)) = tts.next() else {
+        panic!("must always have a top subtree");
+    };
+    let mut builder = TopSubtreeBuilder::with_capacity(top_subtree.delimiter, tts.len());
+    tts.for_each(|tt| builder.push_token_tree(tt));
+    builder
+}
+
+/// Trees in any allocator: a task's temporaries, which keep no parser words
+/// ([`Tree::keeps_words`]).
+impl<A: Allocator> TopSubtree<A> {
+    pub fn empty_in(span: DelimSpan, alloc: A) -> Self {
+        TopSubtreeBuilder::new(Delimiter::invisible_delim_spanned(span)).build_in(alloc)
     }
 
-    pub fn iter(&self) -> TtIter<'_> {
-        self.view().iter()
+    pub fn invisible_from_leaves_in<const N: usize>(
+        delim_span: Span,
+        leaves: [Leaf; N],
+        alloc: A,
+    ) -> Self {
+        let mut builder =
+            TopSubtreeBuilder::with_capacity(Delimiter::invisible_spanned(delim_span), N);
+        builder.extend(leaves);
+        builder.build_in(alloc)
     }
 
-    pub fn top_subtree(&self) -> Subtree {
-        self.subtree_at(0)
+    pub fn from_token_trees_in(
+        delimiter: Delimiter,
+        token_trees: TokenTreesView<'_>,
+        alloc: A,
+    ) -> Self {
+        let mut builder = TopSubtreeBuilder::with_capacity(delimiter, token_trees.len());
+        builder.extend_with_tt(token_trees);
+        builder.build_in(alloc)
+    }
+
+    /// [`TopSubtree::from_serialized`] in `alloc`.
+    pub fn from_serialized_in(tts: Vec<TokenTree>, alloc: A) -> Self {
+        serialized(tts).build_in(alloc)
+    }
+
+    pub fn from_subtree_in(subtree: SubtreeView<'_>, alloc: A) -> Self {
+        let token_trees = subtree.token_trees();
+        let mut builder =
+            TopSubtreeBuilder::with_capacity(subtree.top_subtree().delimiter, token_trees.len());
+        builder.extend_with_tt(token_trees);
+        builder.build_in(alloc)
     }
 
     pub fn set_top_subtree_delimiter_kind(&mut self, kind: DelimiterKind) {
         let top = Node::subtree(kind, 0, self.node(0).data);
-        self.block[HEADER..HEADER + 2].copy_from_slice(&top.row());
-        self.words = Default::default();
+        self.block_mut()[HEADER..HEADER + 2].copy_from_slice(&top.row());
+        self.forget_words();
     }
 
     /// The top delimiters' contexts are their words' editions, so the words kept are dropped.
     pub fn set_top_subtree_delimiter_span(&mut self, span: DelimSpan) {
-        self.top_open = span.open;
-        self.top_close = span.close;
-        self.words = Default::default();
+        self.set_top_spans(span.open, span.close);
     }
+}
 
+impl<A: Allocator + Clone> TopSubtree<A> {
+    /// [`TopSubtree::from_serialized`] like `like`: in its allocator, keeping words when it does.
+    pub(crate) fn from_serialized_like(tts: Vec<TokenTree>, like: &TopSubtree<A>) -> Self {
+        serialized(tts).build_like(like)
+    }
+}
+
+impl TopSubtree {
     /// Puts `leaf` in place of the leaf at `idx` (the top subtree being 0). Rebuilds the tree,
     /// in one pass with no buffer but its own: avoid it in a loop.
     pub fn set_token(&mut self, idx: usize, leaf: Leaf) {
@@ -528,57 +583,69 @@ impl TopSubtree {
         *self = builder.build();
     }
 
-    pub fn token_trees(&self) -> TokenTreesView<'_> {
-        self.view().token_trees()
-    }
-
-    pub fn as_token_trees(&self) -> TokenTreesView<'_> {
-        self.view().as_token_trees()
-    }
-
     /// Changes the AST id of every span in place, and rebuilds the tree only when that made two
     /// of its parts one.
     pub fn change_every_ast_id(&mut self, mut callback: impl FnMut(&mut span::ErasedFileAstId)) {
         let parts = self.layout.parts as usize..self.layout.symbols as usize;
-        for row in self.block[parts].as_chunks_mut::<3>().0 {
+        for row in self.block_mut()[parts].as_chunks_mut::<3>().0 {
             *row = CompressedSpanPart::from_row(*row).with_ast_id(&mut callback).row();
         }
-        callback(&mut self.top_open.anchor.ast_id);
-        callback(&mut self.top_close.anchor.ast_id);
+        let (open, close) = self.top_spans_mut();
+        callback(&mut open.anchor.ast_id);
+        callback(&mut close.anchor.ast_id);
         // Two parts made one would leave the table with a part twice, which a tree built from
         // the same token trees doesn't have.
         if has_duplicates(self.parts()) {
             *self = TopSubtree::from_token_trees(self.top_subtree().delimiter, self.token_trees());
         }
     }
+}
 
-    /// The tree of these columns and top spans: one allocation, each column one copy.
-    fn from_columns(
-        nodes: &[Node],
-        spans: &[PackedSpan],
-        wide: &[WideSpan],
-        parts: &[CompressedSpanPart],
-        symbols: &[u32],
-        top_open: Span,
-        top_close: Span,
-    ) -> TopSubtree {
-        let layout = Layout::new(nodes.len(), spans.len(), wide.len(), parts.len(), symbols.len());
-        // alloc: the tree, one block of its exact size.
-        let mut block = Vec::with_capacity(layout.end as usize);
-        block.extend_from_slice(&layout.header());
-        block.extend_from_slice(columns::words(nodes));
-        block.extend_from_slice(columns::words(spans));
-        block.extend_from_slice(columns::words(wide));
-        block.extend_from_slice(columns::words(parts));
-        block.extend_from_slice(symbols);
-        debug_assert_eq!(block.len(), layout.end as usize, "the columns are the layout's");
-        TopSubtree {
-            block: block.into_boxed_slice(),
-            layout,
-            top_open,
-            top_close,
-            words: Default::default(),
-        }
+/// The tree of these columns and top spans in `alloc`: one allocation, each column one copy.
+#[allow(clippy::too_many_arguments)]
+fn from_columns_in<A: Allocator>(
+    nodes: &[Node],
+    spans: &[PackedSpan],
+    wide: &[WideSpan],
+    parts: &[CompressedSpanPart],
+    symbols: &[u32],
+    top_open: Span,
+    top_close: Span,
+    keeps_words: bool,
+    alloc: A,
+) -> TopSubtree<A> {
+    let layout = Layout::new(nodes.len(), spans.len(), wide.len(), parts.len(), symbols.len());
+    // alloc: the tree, one block of its exact size, in `alloc`.
+    let mut block = Vec::with_capacity_in(layout.end as usize, alloc);
+    block.extend_from_slice(&layout.header());
+    block.extend_from_slice(columns::words(nodes));
+    block.extend_from_slice(columns::words(spans));
+    block.extend_from_slice(columns::words(wide));
+    block.extend_from_slice(columns::words(parts));
+    block.extend_from_slice(symbols);
+    debug_assert_eq!(block.len(), layout.end as usize, "the columns are the layout's");
+    TopSubtree::from_block(block.into_boxed_slice(), layout, top_open, top_close, keeps_words)
+}
+
+impl Tree {
+    pub fn view(&self) -> SubtreeView<'_> {
+        SubtreeView(TokenTreesView { tree: self, start: 0, end: self.node_count() as u32 })
+    }
+
+    pub fn iter(&self) -> TtIter<'_> {
+        self.view().iter()
+    }
+
+    pub fn top_subtree(&self) -> Subtree {
+        self.subtree_at(0)
+    }
+
+    pub fn token_trees(&self) -> TokenTreesView<'_> {
+        self.view().token_trees()
+    }
+
+    pub fn as_token_trees(&self) -> TokenTreesView<'_> {
+        self.view().as_token_trees()
     }
 
     /// The number of token trees, the top subtree's included.
@@ -595,27 +662,27 @@ impl TopSubtree {
 
     #[inline]
     fn nodes(&self) -> &[[u32; 2]] {
-        self.block[HEADER..self.layout.spans as usize].as_chunks::<2>().0
+        self.block()[HEADER..self.layout.spans as usize].as_chunks::<2>().0
     }
 
     #[inline]
     fn spans(&self) -> &[[u32; 2]] {
-        self.block[self.layout.spans as usize..self.layout.wide as usize].as_chunks::<2>().0
+        self.block()[self.layout.spans as usize..self.layout.wide as usize].as_chunks::<2>().0
     }
 
     #[inline]
     fn wide(&self) -> &[[u32; 3]] {
-        self.block[self.layout.wide as usize..self.layout.parts as usize].as_chunks::<3>().0
+        self.block()[self.layout.wide as usize..self.layout.parts as usize].as_chunks::<3>().0
     }
 
     #[inline]
     fn parts(&self) -> &[[u32; 3]] {
-        self.block[self.layout.parts as usize..self.layout.symbols as usize].as_chunks::<3>().0
+        self.block()[self.layout.parts as usize..self.layout.symbols as usize].as_chunks::<3>().0
     }
 
     #[inline]
     fn symbol_ids(&self) -> &[u32] {
-        &self.block[self.layout.symbols as usize..]
+        &self.block()[self.layout.symbols as usize..]
     }
 
     /// Every column, sliced once.
@@ -751,14 +818,14 @@ impl TopSubtree {
 }
 
 thread_local! {
-    /// The subtrees a [`TopSubtree::for_each_token`] walk is in, each as the index of the node
+    /// The subtrees a [`Tree::for_each_token`] walk is in, each as the index of the node
     /// after it and its own, kept for the next walk. `Scratch` has no `Default` for a `T`
     /// without one, so it is taken with `replace`, not `take`.
     // alloc: one buffer per thread, grown to the deepest nesting walked.
     static OPEN: Cell<Stack<(u32, u32)>> = const { Cell::new(Stack::new()) };
 }
 
-impl TopSubtree {
+impl Tree {
     /// Calls `f` with each token of the token trees `start..end` in order, a subtree being its
     /// opening delimiter, its token trees and its closing delimiter, with the context of each.
     /// Reads the columns: no span's range and no leaf is unpacked, and nothing is allocated
@@ -788,8 +855,8 @@ impl TopSubtree {
         }
     }
 
-    /// [`TopSubtree::for_each_token`] over the whole tree, with each token's slot: a leaf's or an
-    /// opening delimiter's node, or its subtree's [`TopSubtree::token_slots`] entry for a
+    /// [`Tree::for_each_token`] over the whole tree, with each token's slot: a leaf's or an
+    /// opening delimiter's node, or its subtree's [`Tree::token_slots`] entry for a
     /// closing one. What [`TreeWords`] are made from.
     pub fn for_each_slotted_token(&self, f: impl FnMut(u32, crate::FlatToken, SyntaxContext)) {
         self.walk_tokens(0, self.node_count() as u32, f)
@@ -862,14 +929,25 @@ impl TopSubtree {
     }
 }
 
-/// Whether a column holds a row twice.
-fn has_duplicates<T: Copy + Eq + Hash>(parts: &[T]) -> bool {
+thread_local! {
+    /// [`has_duplicates`]' set, kept for the next column of more than [`SCAN`] parts.
+    // alloc: one set per thread, grown to the most parts checked, up to `KEEP`.
+    static SEEN: Cell<Option<rustc_hash::FxHashSet<[u32; 3]>>> = const { Cell::new(None) };
+}
+
+/// Whether the parts column holds a row twice.
+fn has_duplicates(parts: &[[u32; 3]]) -> bool {
     if parts.len() <= SCAN {
         return parts.iter().enumerate().any(|(at, part)| parts[..at].contains(part));
     }
-    let mut seen = rustc_hash::FxHashSet::default();
+    let mut seen = SEEN.take().unwrap_or_default();
+    seen.clear();
     seen.reserve(parts.len());
-    !parts.iter().all(|part| seen.insert(*part))
+    let twice = !parts.iter().all(|part| seen.insert(*part));
+    if seen.capacity() <= KEEP {
+        SEEN.set(Some(seen));
+    }
+    twice
 }
 
 /// A builder's buffers and its encoder's, kept per thread between builds, so that building
@@ -1043,6 +1121,20 @@ impl TopSubtreeBuilder {
 
     /// Builds, and remove the top subtree if it has only one subtree child.
     pub fn build_skip_top_subtree(self) -> TopSubtree {
+        self.build_skip_top_subtree_keeping(true, Global)
+    }
+
+    /// [`Self::build_skip_top_subtree`] in `alloc`: a task's temporary, which keeps no parser
+    /// words.
+    pub fn build_skip_top_subtree_in<A: Allocator>(self, alloc: A) -> TopSubtree<A> {
+        self.build_skip_top_subtree_keeping(false, alloc)
+    }
+
+    fn build_skip_top_subtree_keeping<A: Allocator>(
+        self,
+        keeps_words: bool,
+        alloc: A,
+    ) -> TopSubtree<A> {
         assert!(
             self.unclosed_subtree_indices.is_empty(),
             "attempt to build an unbalanced `TopSubtreeBuilder`"
@@ -1057,13 +1149,28 @@ impl TopSubtreeBuilder {
                 close: self.closes[first.ordinal() as usize],
                 kind: first.delimiter_kind(),
             };
-            self.finish(2, top)
+            self.finish(2, top, keeps_words, alloc)
         } else {
-            self.build()
+            self.build_keeping(keeps_words, alloc)
         }
     }
 
     pub fn build(self) -> TopSubtree {
+        self.build_keeping(true, Global)
+    }
+
+    /// [`Self::build`] in `alloc`: a task's temporary, which keeps no parser words.
+    pub fn build_in<A: Allocator>(self, alloc: A) -> TopSubtree<A> {
+        self.build_keeping(false, alloc)
+    }
+
+    /// [`Self::build`] like `like`: in its allocator, keeping words when it does.
+    pub(crate) fn build_like<A: Allocator + Clone>(self, like: &TopSubtree<A>) -> TopSubtree<A> {
+        // clone: the allocator handle, `Global` or a `&Frame`, not the tree.
+        self.build_keeping(like.keeps_words(), like.allocator().clone())
+    }
+
+    fn build_keeping<A: Allocator>(self, keeps_words: bool, alloc: A) -> TopSubtree<A> {
         assert!(
             self.unclosed_subtree_indices.is_empty(),
             "attempt to build an unbalanced `TopSubtreeBuilder`"
@@ -1073,12 +1180,18 @@ impl TopSubtreeBuilder {
             close: self.closes[0],
             kind: self.nodes[0].delimiter_kind(),
         };
-        self.finish(1, top)
+        self.finish(1, top, keeps_words, alloc)
     }
 
     /// The tree of `top` holding the token trees from `first` on, encoded in one pass into the
-    /// encoder's columns, then copied into the tree's block, its one allocation.
-    fn finish(self, first: usize, top: Delimiter) -> TopSubtree {
+    /// encoder's columns, then copied into the tree's block in `alloc`, its one allocation.
+    fn finish<A: Allocator>(
+        self,
+        first: usize,
+        top: Delimiter,
+        keeps_words: bool,
+        alloc: A,
+    ) -> TopSubtree<A> {
         let TopSubtreeBuilder {
             nodes,
             spans,
@@ -1114,7 +1227,7 @@ impl TopSubtreeBuilder {
             };
             encoder.nodes.push(node);
         }
-        let tree = TopSubtree::from_columns(
+        let tree = from_columns_in(
             &encoder.nodes,
             &encoder.spans,
             &encoder.wide,
@@ -1122,6 +1235,8 @@ impl TopSubtreeBuilder {
             &encoder.symbols.list,
             top.open,
             top.close,
+            keeps_words,
+            alloc,
         );
         Scratch { nodes, spans, closes, symbols, unclosed: unclosed_subtree_indices, encoder }
             .give_back();

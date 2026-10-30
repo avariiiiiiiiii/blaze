@@ -694,7 +694,8 @@ pub fn opaque_key(db: &Db, owner: ItemId, index: u32) -> ItemKey {
     under(&parent, true, h.finish())
 }
 
-fn opaque_of<'db>(db: &'db Db, opaque: InternedOpaqueTyId<'db>) -> (ItemId, u32) {
+/// The item an opaque type is of and its index there.
+pub(crate) fn opaque_of<'db>(db: &'db Db, opaque: InternedOpaqueTyId<'db>) -> (ItemId, u32) {
     match opaque.loc(db) {
         ImplTraitId::ReturnTypeImplTrait(f, index) => {
             (ItemId::Function(f), index.into_raw().into_u32())
@@ -789,6 +790,12 @@ pub fn simplified<'db>(
         S::Error => h.update(&[22]),
     };
     SimplifiedType(h.finish())
+}
+
+/// The simplified self type of a type that simplifies to nothing (a parameter, an alias): only
+/// blanket impls unify with it, so `Implements` for it is a trait's blanket impls alone.
+pub fn unsimplified() -> SimplifiedType {
+    SimplifiedType(Hasher::new(SIMPLIFIED_DOMAIN).update(&[u8::MAX]).finish())
 }
 
 /// The path of an item as the program sees it (`type_name`, `module_path!`, a symbol's
@@ -921,6 +928,15 @@ pub fn resolve(db: &Db, key: ItemKey) -> Option<Resolved> {
     let index =
         if key.is_inner() { crate_inner_items(db, krate) } else { &crate_items(db, krate).index };
     index.get(&key)
+}
+
+/// The crate of the current database whose [`crate_key`] is `key`, if one has it.
+pub fn resolve_crate(db: &Db, key: &ContentId) -> Option<Crate> {
+    let krates = crates_by_prefix(db);
+    let prefix = u64::from_le_bytes(crate_prefix(key));
+    let at = krates.binary_search_by_key(&prefix, |&(it, _)| it).ok()?;
+    let krate = krates[at].1;
+    (crate_key(db, krate) == *key).then_some(krate)
 }
 
 /// The most keys one crate's index holds: address space only, committed as the index grows.

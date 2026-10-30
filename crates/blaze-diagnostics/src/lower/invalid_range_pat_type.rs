@@ -2,14 +2,12 @@
 //! on each end of what it is.
 //!
 //! Follows rustc's `compiler/rustc_hir_typeck/src/pat.rs` (`check_pat_range`,
-//! `emit_err_pat_range`, `endpoint_has_type`) (MIT or Apache-2.0). The `-Z teach` note is
-//! not written: blaze is not run with it.
+//! `emit_err_pat_range`, `endpoint_has_type`) (MIT or Apache-2.0). Each end's type and whether
+//! it fails are inference's, as it had them when it checked that end (an undecided literal's
+//! type is `{integer}`). The `-Z teach` note is not written: blaze is not run with it.
 
 use hir::InFile;
-use syntax::{
-    AstNode,
-    ast::{self, RangeItem},
-};
+use syntax::view::{self as ast, AstNode as _, RangeItem as _};
 
 use crate::{
     cx::Cx,
@@ -25,35 +23,28 @@ struct End<'db> {
     fail: bool,
 }
 
-pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidRangePatType) -> Vec<Found> {
-    let node = cx.node(d.pat);
-    let Some(ast::Pat::RangePat(range)) = node.value.as_ref().right() else { return Vec::new() };
+pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidRangePatType<'db>) -> Vec<Found> {
+    let node = cx.node_view(d.pat);
+    // alloc: empty, allocates nothing
+    let Some(ast::Pat::RangePat(range)) = node.value.right() else { return Vec::new() };
     let file = node.file_id;
-    let end = |pat: Option<ast::Pat>| {
-        let pat = pat?;
-        let ty = cx.sema.type_of_pat(&pat)?.original;
-        let fail = !(ty.is_int_or_uint() || ty.is_float() || ty.is_char() || ty.contains_unknown());
-        Some(End { span: cx.span(InFile::new(file, pat.syntax().text_range())), ty, fail })
+    let end = |pat: Option<ast::Pat<'_>>, at: &Option<(hir::Type<'db>, bool)>| {
+        let (pat, (ty, fail)) = (pat?, at.as_ref()?);
+        // clone: a type handle, on the error path, for an error hir found
+        Some(End { span: cx.span(InFile::new(file, pat.syntax().text_range())), ty: ty.clone(), fail: *fail })
     };
-    let mut lhs = end(range.start());
-    let mut rhs = end(range.end());
-    // The ends were each fine, but not once unified: rustc's check after `demand_eqtype`,
-    // which takes both to fail.
-    if !lhs.as_ref().is_some_and(|it| it.fail) && !rhs.as_ref().is_some_and(|it| it.fail) {
-        lhs.iter_mut().chain(rhs.iter_mut()).for_each(|it| it.fail = true);
-    }
-    if lhs.iter().chain(rhs.iter()).any(|it| it.ty.contains_unknown()) {
-        // rustc's `downgrade_to_delayed_bug`: an error of an end was given already.
-        return Vec::new();
-    }
+    let lhs = end(range.start(), &d.lhs);
+    let rhs = end(range.end(), &d.rhs);
     // rustc's order: the failing end first, then the other.
     let (first, second) = match (lhs, rhs) {
         (Some(l), r) if l.fail => (l, r),
         (l, Some(r)) if r.fail => (r, l),
+        // alloc: empty, allocates nothing
         _ => return Vec::new(),
     };
     let span = match &second {
         Some(it) if it.fail => cx.span_of_ptr(d.pat),
+        // clone: on the error path, for an error hir found
         _ => first.span.clone(),
     };
     let mut diag = Diag::error(
@@ -63,11 +54,14 @@ pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::InvalidRangePatType) -> Vec<
     );
     for end in std::iter::once(first).chain(second) {
         let label = match end.fail {
+            // alloc: the error's text, for an error hir found
             true => format!("this is of type `{}` but it should be `char` or numeric", cx.ty(&end.ty)),
+            // alloc: the error's text, for an error hir found
             false => format!("this is of type `{}`", cx.ty(&end.ty)),
         };
         diag.span_label(end.span, label);
     }
     code_fact(cx, &mut diag, d.pat.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }

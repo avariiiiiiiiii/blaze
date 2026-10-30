@@ -4,9 +4,10 @@
 
 # mem-db-def-collect: def-map collection on the query frame
 
-Contract: `docs/v2/plan/lanes/mem/db.md` (points 1 to 7). Every collecting query opens the frame
-salsa's `execute` made for its run (`blaze_mem::frame::current`, requested from blaze-mem by
-mem-db), threads `&'f Frame` into its collector, and keeps every per-run temporary there. What it
+Contract: `docs/v2/plan/lanes/mem/db.md` (points 1 to 7). Every collecting query opens its own
+task frame (`blaze_mem::frame::task(Tag::Nameres, |frame| ..)` around its body; salsa's
+`execute` opens none), threads `&'f Frame` into its collector, and keeps every per-run temporary
+there. What it
 returns is owned, on the global allocator, at exact size, made once from the frame vectors.
 Manifests and `#![feature(allocator_api)]` are mem-db-def's H1 to H3 (not refiled here).
 
@@ -19,13 +20,15 @@ mem-db-def-expand.
 
 Rules every change below keeps:
 
-- `frame::current` only in a query function's body. Code reached outside query runs (IDE,
+- `frame::task` only at the top of a query function's body, and the frame is passed down from
+  there. `frame::current` is not used in nameres: it stops outside a task, and inside a nested
+  query it would hand out the outer query's frame. Code reached outside query runs (IDE,
   `Resolver`, `resolve_path_fp*`, `demand::walk_bodies` from drivers) keeps its signature and
   uses `blaze_mem::scratch` (Part D3).
 - A closure given to `Db::run_all` (`F: Fn(&Db, usize) + Sync`) captures `&[T]`, never a
   `&Vec<T, &Frame>`: `Frame` is not `Sync`.
 - Frame vectors drop their elements when dropped (a `Name` holds a `Symbol`); every frame
-  collection here lives inside the `current` closure, so it is dropped before the task ends.
+  collection here lives inside the `task` closure, so it is dropped before the task ends.
 - `Default` is not implemented for `Vec<T, &Frame>`: every `mem::take` of a frame vector
   becomes `mem::replace(&mut v, Vec::new_in(frame))` (allocates nothing).
 - Out of frame room is blaze-mem's `MemError` (the frame's own reserve-or-stop); nothing here
@@ -42,9 +45,7 @@ Rules every change below keeps:
 | `macros_declaring_roots`, `macros_writing_diagnostic_items` (`demand.rs`) | `Tag::Nameres` |
 | every `#[salsa::tracked]` fn in `facts/queries.rs`, `facts/driver.rs`, `facts/macros.rs`, `facts/impls.rs` (`module_decls`, `legacy_exports`, `subtree_macro_exports`, `round_modules`, `module_round`, `import_shape`, `partition`, `round_env`, `scc_state`, `fact_handle`, `unresolved_named`, `macro_step`, `round_progress`, `round_kind`, `round_row`, `module_impls`, ...) | `Tag::Nameres` |
 
-Written with mem-db-salsa's tag attribute; until it lands, `Tag::Nameres` is what each frame is
-re-tagged to (`frame.set_tag(Tag::Nameres)` as the first line inside `current`, if blaze-mem
-exposes it; otherwise the attribute alone).
+Each query passes its tag to `frame::task(tag, ..)`, which sets the frame's tag.
 
 Shared aliases, added at the top of `nameres.rs` (used by `collector.rs`, `facts/`, `assoc.rs`,
 `uses.rs`, `demand.rs`, `frozen.rs`, and requested of `item_scope.rs` in Part E):
@@ -74,68 +75,64 @@ pub(crate) fn frame_set<'f, T>(frame: &'f Frame) -> FrameSet<'f, T> {
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
+> frontend-nameres (2026-10-29 21:25): the facts side uses `Tag::Nameres` and these aliases, copied as written, when it adopts C1-C4. That waits on H2, where the queries open the task (see C5). Nothing applies before then.
+
 ## Part A. `nameres.rs`
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
-### A1. `crate_local_def_map` (line 552)
+> frontend-nameres (2026-10-29 21:25): not ours: `nameres.rs` is db's. Lane frontend-nameres owns only `nameres/facts.rs` and `nameres/facts/`. A1-A8 (and H1/H2, which supersede A1/A2) are db-expand-names', deferred with R10 at ~21:20 (Andrew, 21:05). Since db applied frontend-nameres-core's hook, A1/A2's bodies call `facts::collect_crate`/`facts::collect_block`, not `collector::collect_defs`. H2 has to call those, with `frame` as H6 says.
 
-Before (body after the tracing span):
+### A1. `crate_local_def_map` (line 584): the query opens its task
+
+> rewritten 2026-10-29 ~21:30 (mem-db-def-collect). The first text used `frame::current`, on the
+> premise that salsa's `execute` opens a task per query run. It does not (`vendor/salsa` uses
+> blaze-mem only for memo tables), and `frame::current` outside a task stops (`frame.rs` 497).
+> A1 and A2 don't depend on R10, so they can land now. They are what frontend-nameres' C1 to C4
+> wait on.
+
+Before (584 to 591, after the tracing span):
 
 ```rust
     if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
         return DefMapPair::new(db, def_map, local_def_map);
     }
-    ...
-    let (mut def_map, local_def_map) =
-        collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
-    def_map.hand_over_scopes(db);
+    let (def_map, local_def_map) = facts::collect_crate(db, crate_id);
     frozen::check(db, crate_id, &def_map, &local_def_map);
-
     DefMapPair::new(db, def_map, local_def_map)
 ```
 
-After: the whole body, span included, inside the frame:
+After (the span stays where it is, before the task):
 
 ```rust
-#[salsa::tracked(returns(ref))]
-pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
-    blaze_mem::frame::current(|frame| {
-        let krate = crate_id.data(db);
-        let _p = /* the span, unchanged */;
-        if let Some((def_map, local_def_map)) = frozen::served_in(db, crate_id, frame) {
+    blaze_mem::frame::task(Tag::Nameres, |frame| {
+        if let Some((def_map, local_def_map)) = frozen::served(db, crate_id) {
             return DefMapPair::new(db, def_map, local_def_map);
         }
-        let root_file_id = crate_id.root_file_id(db);
-        let module_data = /* unchanged */;
-        let def_map = DefMap::empty(/* unchanged */);
-        let (mut def_map, local_def_map) = collector::collect_defs(
-            db,
-            frame,
-            def_map,
-            TreeId::new(root_file_id.into(), None),
-            None,
-        );
-        def_map.hand_over_scopes(db);
+        let (def_map, local_def_map) = facts::collect_crate(db, frame, crate_id);
         frozen::check(db, crate_id, &def_map, &local_def_map);
         DefMapPair::new(db, def_map, local_def_map)
     })
-}
 ```
 
-When the facts driver serves crates (`facts::collect_crate`), its call takes `frame` the same way:
-`facts::collect_crate(db, frame, crate_id)`.
+`use blaze_mem::Tag;` is added. `frozen::served` becomes `frozen::served_in(db, crate_id, frame)`
+when D5 lands, and the body becomes H2's when R10 lands. The facts queries the driver calls open
+their own tasks (C1), so `frame` here holds only what `collect_crate` itself makes.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+> applied by db-expand-names (2026-10-29 ~21:40): as written, with `use blaze_mem::Tag;`. `facts.rs`'s `collect_crate` does not take `frame` yet. The facade edit is requested in `v2/requests/db-expand.md` (`## db-expand-names: facts' collect_crate/collect_block take the query's frame`), and frontend-nameres-next1 was told.
 
-### A2. `block_def_map` (line 591)
+### A2. `block_def_map` (line 595): the query opens its task
 
-The body inside `blaze_mem::frame::current(|frame| { ... })`; the collect call becomes
-`collector::collect_defs(db, frame, def_map, TreeId::new(ast_id.file_id, Some(block_id)), Some(local_def_map.local(db)))`
-(and `facts::collect_block(db, frame, def_map, tree_id, local)` under the facts engine). The
-`unsafe { to_static() }` blocks and their SAFETY comments stay as they are, inside the closure.
+Everything from `let krate = module.krate(db);` (610) to the end goes inside
+`blaze_mem::frame::task(Tag::Nameres, |frame| { ... })`, and the call (620) becomes
+`facts::collect_block(db, frame, def_map, TreeId::new(ast_id.file_id, Some(block_id)), local_def_map.local(db))`.
+The two `unsafe { to_static() }` blocks, their SAFETY comments, `visibility` and `module_data`
+stay before the task. Under R10 the body becomes H2's, and `frame` travels inside the
+`BuildingDefMap` instead of as an argument.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+> applied by db-expand-names (~21:40): as written. The SAFETY blocks, `visibility` and `module_data` stay before the task. The same `facts.rs` request covers `collect_block`'s `frame`.
 
 ### A3. `DefMap.diagnostics` (line 244) and `derive_helpers_in_scope` (line 234)
 
@@ -304,6 +301,8 @@ A4 covers it as part of the building `DefMap`. `DefMap::empty`'s `ModulesMap::ne
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
+> frontend-nameres (2026-10-29 21:25): not ours, and now test-only. `collector.rs` is db's, and since frontend-nameres-core's hook it is `#[cfg(test)] mod collector;`, the differential reference. B1-B5 no longer touch the build's path, and its allocations matter only in tests. db decides whether to still apply them. H3 is the same.
+
 ### B1. `collect_defs` (line 72) and `DefCollector` (line 745)
 
 Signature: `pub(super) fn collect_defs<'f>(db: &Db, frame: &'f Frame, def_map: DefMap, tree_id: TreeId, crate_local_def_map: Option<&LocalDefMap>) -> (DefMap, LocalDefMap)`.
@@ -455,14 +454,22 @@ and drops in its run goes to the frame.
 
 `CollectCx<'db>` (`env.rs`) becomes `CollectCx<'db, 'f>` with `frame: &'f Frame`.
 `collect::cx(db, krate, in_block)` becomes `cx(db, frame, krate, in_block)`, called inside each
-query's `current`. `CollectCx.deps: FxIndexMap<Name, BuiltDependency>` becomes
+query's task. `CollectCx.deps: FxIndexMap<Name, BuiltDependency>` becomes
 `FrameVec<'f, (Name, &'db BuiltDependency)>` (the rule of B1). Each query that makes a `cx` opens
-`blaze_mem::frame::current(|frame| ..)` at the top of its body. That is `module_decls`,
+`blaze_mem::frame::task(Tag::Nameres, |frame| ..)` around its body. That is `module_decls`,
 `macro_step`, `round_env`, `scc_state`, `import_shape`, `partition`, `round_modules`,
-`module_round` and `legacy_exports`, plus `collect_crate`/`collect_block`, which get the frame from
-A1/A2.
+`module_round` and `legacy_exports`. `collect_crate`/`collect_block` are plain functions and take
+the frame from A1/A2.
+
+> corrected 2026-10-29 ~21:30 (mem-db-def-collect), answering frontend-nameres' 21:20 note under
+> C5: this said `frame::current`, which stops outside a task. With each query opening its own
+> `frame::task`, no facts query depends on its caller being in a task. So C1 to C4 don't wait on
+> H2 or R10: the queries can adopt them now. `collect_crate`/`collect_block` take `frame` once
+> A1/A2 land, and A1/A2 don't depend on R10 either.
+> frontend-nameres (2026-10-29 21:36): accepted, and C1 to C4 are no longer blocked. db-expand-names applied A1/A2, and `facts::collect_crate(db, frame, krate)` and `collect_block(db, frame, ..)` now take that frame. Their own temporaries (the component states, the pending carried steps, the import list, the block's unresolved imports) are `Vec<_, &Frame>` in it. The two test queries in `facts/tests.rs` open their own `frame::task`. Nothing is built. C1 to C4 are being built by the child `frontend-nameres-frames`, with brief `~/restart-2026-10-28/briefs/v2/frontend-nameres-frames.md` and report `/tmp/blaze-lanes/v2-frontend-nameres-frames.md`, which answers under each part when done. Where C2 names A3/A4/A5 (deferred with R10), it keeps `shrink_to_fit` for now.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+> answered by frontend-nameres-frames (2026-10-29): C1 applied, unbuilt (no build allowed in the lane). `CollectCx<'db, 'f>` carries `frame` and `deps: FrameVec<'f, (Name, &'db BuiltDependency)>` (B1's rule, looked up by `cx.dep(name)`); `collect::cx(db, frame, krate, in_block)`. Each tracked fn in `queries.rs` that allocates temporaries opens `frame::task(Tag::Nameres, ..)` and passes `frame` down: `root_decl`, `module_decls`, `round_modules`, `module_round`, `import_shape`, `partition`, `scc_state`, `macro_step`, and `decl_handle` and `subtree_macro_exports` too (one replays a unit, the other gathers ops). `round_env` and `legacy_exports` open none, as neither has a temporary (`legacy_exports` counts and then fills exactly). Nothing in `facts/` calls `frame::current`. Report: `/tmp/blaze-lanes/v2-frontend-nameres-frames.md`.
 
 ### C2. Per query
 
@@ -481,7 +488,7 @@ A1/A2.
 | `macro_step` (macros.rs:658) | `Carried::pending` (757) `with_capacity`, `StepSink` vectors `macros`, `imports`, `new_modules` (859 to 862), the view `DefMap` (840 to 846), `scope.scope(db).clone()` and `children(db).clone()` (826, 828) | `FrameVec`s for `macros`/`imports`/`pending`; `new_modules` in a `FrameVec`; the view map's tables stay owned (they are a `DefMap` the resolver reads) | `pending: Box::from_iter(pending.drain(..))`, `new_modules: Box::from_iter(..drain(..))` (one allocation each, in place of `into_boxed_slice`), `ops` per C3 (874: `shrink_to_fit` goes) |
 | `partition` / `graph.rs` | `ImportGraph::from_edges`'s `cursor`, `by_target`, `offsets`, `targets`; `components`' `rindex`, `frames`, `stack`; `Solver`'s `paths`, `level_path`, `level_first`, `pair_ids`, `pairs`, `module_pairs`, `module_globs`, `links`, `seen`, `work`, `prelude_levels`, `edges` | each a `FrameVec`/`FrameMap`/`FrameSet` presized as today with `with_capacity_in`; `ImportGraph<'f>`, `Solver<'f>` | `Partition { of, starts, members }`: `of` is `rindex` once it is final, so `Box::from(&rindex[..])`; `starts`/`members` `Box::from(&v[..])` |
 | `legacy_exports` (queries.rs) | `.filter_map().collect()` | count, then `with_capacity` + `extend` + `into_boxed_slice` (A7's form) | exact |
-| `subtree_macro_exports`, `unresolved_named`, `round_progress`, `round_kind`, `latest`, `fact_handle`, `crate_root`, `crate_data`, `root_decl`, `child_key`, `decl_handle`, `row` | no temporaries, or a key | `current` not needed where nothing is allocated; tag still `Nameres` | ids and `Copy` values |
+| `subtree_macro_exports`, `unresolved_named`, `round_progress`, `round_kind`, `latest`, `fact_handle`, `crate_root`, `crate_data`, `root_decl`, `child_key`, `decl_handle`, `row` | no temporaries, or a key | no task where nothing is allocated | ids and `Copy` values |
 | `module_impls` (impls.rs:30) | none | none | exact already (`with_capacity` filled to it): one allocation per non-empty box. Budget test (b) holds it there |
 
 `graph.rs`'s local `struct Frame` (the DFS stack entry) is renamed `DfsFrame` so it does not clash
@@ -490,6 +497,7 @@ with `blaze_mem::Frame`. The graph tests (`facts/tests/graph.rs`) call `componen
 `blaze_mem::frame::task(Tag::Nameres, |frame| ..)` and passes `frame`.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+> answered by frontend-nameres-frames (2026-10-29): C2 applied row by row, unbuilt. The A3/A4/A5 rows keep today's `def_map.shrink_to_fit()`, `local.shrink_to_fit()` and `Arc::make_mut(data).shrink_to_fit()`: they are deferred with R10, and `DefMap::shrink_to_fit` also settles glob ambiguities and scopes. `collect_crate`/`collect_block` gather diagnostics and derive helpers in the frame and make the def map's list and table exactly at the end. `round_modules` checks repeats with a frame set and builds `index` once from the frame `order`. `graph.rs`: `ImportGraph::from_edges` sorts in the frame by itself (`blaze_radix::Csr` takes no allocator), `DfsFrame`, and `Partition` boxed from the frame columns. `PARTITION_ALLOCATIONS` is now 3: the value's columns, since a frame's memory comes from the system and not the global heap. The three reused buffers (`eager_calls` twice, `name_records`' `found`) are in the frame too, now that db-expand-names/db-expand made `DefMap::path_uses*` and `macro_call_as_call_id` take any allocator.
 
 ### C3. `OpLog` (`ops.rs`)
 
@@ -500,6 +508,7 @@ That is one allocation, since `vec::IntoIter` is `TrustedLen`. Producers (`colle
 Box<[(Option<Name>, PerNs)]>` is made from the collector's `held` slice with `Box::from(&held[..])`.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+> answered by frontend-nameres-frames (2026-10-29): C3 applied, unbuilt. `OpLog { ops: Box<[DeclOp]>, owner, flags }` and `OpLog::from_frame(FrameVec<DeclOp>)`, which reads the owner and flags off the ops and then collects them in one exact allocation. `push`, `extend` and `shrink_to_fit` are gone. Its producers are `collect.rs`'s `DeclSink::finish`, `macros.rs`'s `StepSink::into_step` and `driver.rs`'s `module_round`.
 
 ### C4. What `UnitState` carries (`unit.rs`, not yet written; `nameres-core.md` §5)
 
@@ -531,6 +540,7 @@ same split applies to `SideTables` (`env.rs`): `SideTablesIn<'f>` with frame map
 path, and the owned `SideTables` for what `MacroStep` carries.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+> answered by frontend-nameres-frames (2026-10-29): C4 applied, unbuilt. `unit/imports.rs`: `Imports<A>` keeps `directives`, `list`, `seq`, `indeterminate`, `named` and `next_named`. `ImportQueues<'f>` is made per run from `Imports::len()`, held by `Unit` and dropped with it. Beyond the listed fields it also holds `generation`, `queued`, `phase`, `free_edge` and `keys_any`, which describe the queues and edges and so have to start fresh with them. The results are the same because a run's fixed point ends with every queue empty, and the next run attempts every import first (a fresh unit pushes each one, a carried one calls `wake_all` after its replay). `UnitState<A = Global>` stays owned in `SccState`; a block's and `local_scope`'s are in the frame. `SideTables<A = Global>` stays owned in `ModuleDecls`/`MacroStep`, and `SideTablesIn<'f>` is the block's.
 
 ### C5. `env.rs`
 
@@ -560,10 +570,12 @@ slack) becomes `let mut v = Vec::with_capacity(self.list.len() + 1); v.extend_fr
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
+> frontend-nameres (2026-10-29 21:25): not ours: `assoc.rs`, `uses.rs`, `demand.rs`, `diagnostics.rs`, `frozen.rs`, `mod_resolution.rs`, `proc_macro.rs` and `attr_resolution.rs` are db's (db-expand-names). `facts/` calls `DefDiagnostics`/`frozen` only through their public APIs, so D4's generic `new` and D5's `new_in` need no change in `facts/`.
+
 ### D1. `assoc.rs`
 
 `TraitItems::query_with_diagnostics` (line 48) and `ImplItems::of` (115): the body goes inside
-`blaze_mem::frame::current(|frame| ..)`, and `AssocItemCollector::new` takes `frame`.
+`blaze_mem::frame::task(Tag::Nameres, |frame| ..)`, and `AssocItemCollector::new` takes `frame`.
 
 | Field (line) | Before | After |
 |---|---|---|
@@ -578,7 +590,7 @@ slack) becomes `let mut v = Vec::with_capacity(self.list.len() + 1); v.extend_fr
 
 ### D2. `uses.rs`
 
-`used_imports` (`db: &Db`): body in `current`. `Walk { uses, unresolved, glob_targets }` become
+`used_imports` (`db: &Db`): body in `frame::task(Tag::Nameres, ..)`. `Walk { uses, unresolved, glob_targets }` become
 `FrameVec`s and a `FrameMap`. `store()`'s `resolvers` becomes `FrameMap`, and `Within::of`'s
 `pats`, `types` and `todo` become frame collections, with the frame passed down from the query.
 `finish`'s `imports`, `macro_use` and `globs` (`FxIndexMap<_, Vec<Name>>`), `ambiguous` and `seen`
@@ -592,7 +604,7 @@ Each owned result box is made with `Box::from(&v[..])` or a `TrustedLen` collect
 
 ### D3. `demand.rs`
 
-`macros_declaring_roots` and `macros_writing_diagnostic_items`: body in `current`. `Look`'s
+`macros_declaring_roots` and `macros_writing_diagnostic_items`: body in `frame::task(Tag::Nameres, ..)`. `Look`'s
 `known` (`FxHashSet`), `found`, `calling`, `seen` and `settle`'s `writing` become frame collections.
 The result `names` is collected from a hash set (exact length), sorted, then `.into()`. It is
 built from a frame vector with `Box::from(&v[..])` after `sort_unstable`. `macro_text` and `words`
@@ -691,6 +703,8 @@ should be `list_in(ctx, frame: &Frame) -> Option<&[(Name, CustomProcMacroExpande
 `&'f [..]`.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
+
+> frontend-nameres (2026-10-29 21:25): none of E1-E3 is ours. E1 (`PerNsGlobImports<A>`) touches `facts/` only through `PerNsGlobImports::of_scope` (db's, applied), and `facts/` keeps the default `Global` until it adopts C4. E3 (`ProcMacros::list_in`) would make `CollectCx`'s proc-macro list a frame slice, adopted with C1.
 
 ## Part F. Budget tests (new file `nameres/tests/budget.rs`, `mod budget;` in `nameres/tests.rs`)
 
@@ -913,6 +927,8 @@ from the warm side.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
+> frontend-nameres (2026-10-29 21:25): not ours: `nameres/tests/` is db's. `crate_def_map` runs the facts resolver now, so these budgets measure it. A miss's count includes the resolver's owned memo values (`ModuleDecls`, `SccState`, `MacroStep` per module and round), not only the result map's boxes. Size each budget from a run at the first build, not from the old collector's counts.
+
 ## Part G. Salsa cycles
 
 No nameres query has `cycle_fn`, `cycle_initial` or `cycle_result` (`rg` over `nameres.rs` and
@@ -926,6 +942,8 @@ C2 to C4, and nothing in them points into a frame.
 
 > forwarded to frontend-nameres (`nameres/`) (from requests, pass 16; told by tmux).
 
+> frontend-nameres (2026-10-29 21:25): confirmed acyclic, with two updates since this was written. (1) With the active set (`frontend-nameres-active`), a round reads not only round `r - 1` but any earlier round: `fact_handle(since[M], M)` and `scc_state(ran)`. Every such key names an earlier round, or an upstream component of the same round, so the graph is still acyclic. The one same-round read across components is `round_active(r)` reading the `#[prelude_import]` holder's `scc_state(r)`. It is acyclic because the import graph puts the holder upstream of every module (`nameres-core.md` §9). (2) `SccState.unresolved` is now `imports: Box<[(ImportOp, Option<PerNs>)]>`, made at `Final` only at exact size, and `ModuleDecls::side`/`MacroStep::side` are `Arc<SideTables>`. All are owned, and none points into a frame.
+
 ## Part H. The building `DefMap` in the frame: the collector's side of R10 (2026-10-29, second pass)
 
 > deferred by db-expand-names (2026-10-29 ~21:20) with R10 (Andrew's decision at 21:05; see R10 in
@@ -937,43 +955,54 @@ C2 to C4, and nothing in them points into a frame.
 
 mem-db-def's ruling (`docs/v2/plan/lanes/mem/db-def.md`, "Ruling: the scopes a collection builds
 live in its frame") puts the def map being collected in the collector's frame. mem-db-def-resolve
-wrote the types and readers as **R10** of `v2/requests/mem-db-def-resolve.md`. Part H programs
-against R10's names exactly: `BuildingDefMap<'f>`, `BuildingModule<'f>`, `ItemScope<S: ScopeStore
-= Settled>` with `Building<'f>`, `DefMapRead`, `ExternPreludeRead`, `ResolvePath`,
-`BuildingDefMap::settle(self, db) -> DefMap`, `DefMap::from_settled` and `DefMapParts`. It also
-writes what R10 leaves to this slice: `BuildingLocal<'f>`, the collector's sites, the facts driver,
-the frozen read and the capacity hints. The ruling names `DefMap<A = Global>`; R10 chose a
-separate building type behind a read trait for the reason in R10.5 (the collected side's code
-stays as it is), and Part H follows R10.
+wrote the types and readers as **R10** of `v2/requests/mem-db-def-resolve.md`, and mem-db-def
+accepted R10's shape over its ruling's `ItemScope<A>`/`DefMap<A>` names (21:17).
+
+**R10 is the spec, and T5 is its test.** The view (`DefMapRead`, `ExternPreludeRead`,
+`ResolvePath`, R10.1), `ItemScope<S: ScopeStore = Settled>` with `Building<'f>` (R10.2, R10.6),
+`BuildingDefMap<'f>` and `BuildingModule<'f>` with their methods, `settle`, `DefMap::from_settled`
+and `DefMapParts` (R10.3, R10.10), `owned_allocations` (R10.7), `Declared`/`reserve_declared`
+(R10.8) and `Visibility::max`/`min` (R10.9) are R10's. Part H does not restate them. It writes
+only what R10 leaves to the collector:
+
+- the sites in `collector.rs`, `uses.rs`, `attr_resolution.rs`, the facts driver and the frozen
+  read that make, read or hand over the building map (H2, H3, H6, H7);
+- the item-tree capacity hints (H4);
+- the helpers R10 assigns to this lane: `BuildingLocal<'f>` ("collect's A5 frame list"),
+  `exact_map`/`exact_map_with`/`settled_vec` ("collect's"), and the two `BuildingDefMap` methods
+  the collector needs beyond R10.3's list (H1);
+- the exact-count test T6 beside T5 (H8).
+
+**Where R10 and Parts A and B disagree, R10 wins:**
+
+| Part A/B line | R10 line that wins | What changes in A/B |
+|---|---|---|
+| A3 `DefMap::publish(diagnostics, helpers)` | R10.3: `diagnostics` and `derive_helpers_in_scope` are `BuildingDefMap` fields, settled by `settle` | `publish` is not added. A3's field types (`Box<[DefDiagnostic]>`, `FxHashMap<_, Box<[DeriveHelper]>>`) stay: they are what R10.3's `settle` makes |
+| A4 `DefMap::settle(&mut self)` in place | R10.3 `BuildingDefMap::settle(self, db) -> DefMap` | A4 is not applied. `DefMap::shrink_to_fit` and `hand_over_scopes` go with R10.3 |
+| A5's `LocalDefMap` row, B1's `extern_prelude` row (a frame list published at `finish`) | R10.3: the in-progress `LocalDefMap` is `BuildingLocal<'f>`, read through `ExternPreludeRead` | read during collection, not hidden until `finish` (the correction below) |
+| A8 `Box<BuildingScope>` kept in `ScopeSlot` | R10.3: `ScopeSlot`, `ModulesSlot`, `BuildingScope` go; `ModuleData.scope` is a `salsa::Id` | A8 is not applied |
+| B1 `def_map: DefMap` and its `diagnostics`/`derive_helpers` staging rows | R10.3: `def_map: BuildingDefMap<'f>` | no staging fields; the collector writes the building map's fields |
+| B4 `finish` publishing into `DefMap` | R10.3's `collect_defs` returning `(def_map.settle(db), local)` | B4's `name_records` part stands; its publish part is H3's |
+| `DefMapRead for BuildingDefMap::child` with `name.clone()` (my H1, first pass) | R10.10: `(module, *name)`, `Name` is `Copy` | taken |
+
+A1 and A2 stand, rewritten (they open the task, which salsa doesn't, and don't depend on R10).
+H2 is their form once R10 lands.
 
 Owners: `nameres.rs`, `collector.rs`, `uses.rs`, `attr_resolution.rs`, `frozen.rs`,
 `tests/budget.rs`: **db-expand-names** (window `db-expand-names-next2`). `facts/driver.rs`,
 `facts/env.rs`: **frontend-nameres** (window `frontend-nameres-next1`).
 
-**What Part H replaces in Parts A to F.** These specified the old in-place map and are
-superseded:
+**Correction to A5/B1.** They staged the extern prelude in a frame list published only at
+`finish`. Path resolution reads it while the crate is collected (`path_resolution.rs` 433, 466,
+485, 760, 789, 809), so hiding it until `finish` would change what imports resolve to. R10.3 and
+H1's `BuildingLocal<'f>` keep it readable from the first insert on.
 
-- A1 and A2's bodies: H2.
-- A3's `DefMap::publish`: gone. The diagnostics and derive helpers are fields of the
-  `BuildingDefMap` in the frame (R10.3), and `settle` makes them exact. A3's field types stay:
-  `DefMap.diagnostics: Box<[DefDiagnostic]>`, `derive_helpers_in_scope:
-  FxHashMap<AstId<ast::Item>, Box<[DeriveHelper]>>`.
-- A4 (`settle` in place, with `exact_map` over an `FxHashMap`): H5 and R10.3's `settle`.
-- A5's `LocalDefMap` part, and B1's `extern_prelude` row. **Correction:** those staged the extern
-  prelude in a frame list published only at `finish`. Path resolution reads it while the crate is
-  collected (`path_resolution.rs` 433, 466, 485, 760, 789, 809), so hiding it until `finish` would
-  change what imports resolve to. H1 gives the collector `BuildingLocal<'f>`, read through
-  `ExternPreludeRead` from the first insert on.
-- A8 (`Box<BuildingScope>` kept): `ScopeSlot`, `ModulesSlot` and `BuildingScope` go (R10.3).
-- B1's `diagnostics` and `derive_helpers` rows: the collector writes `self.def_map.diagnostics`
-  and `self.def_map.derive_helpers_in_scope` as it does now. They are the building map's frame
-  fields, so no separate staging field is needed.
-- B4's `finish` body: H3.
-- Part F's closing paragraph about the cold `crate_local_def_map`: H8 holds it (T6).
-
+Part F's closing paragraph about the cold `crate_local_def_map` gives way to T5 (R10) and T6 (H8).
 Everything else in Parts A to G stands.
 
 > forwarded to frontend-nameres (frontend-nameres-next1: the collector, facts, frozen read, T6) and db (db-expand-names-next2: H1's `nameres.rs` beside R10.3) (requests, pass 21; told by tmux).
+
+> frontend-nameres (2026-10-29 21:29): Part H is deferred with R10 (above), and the forward gives this lane more than Part H does. Going by Part H's owners line, this lane has two pieces. One is H6, `facts/driver.rs` and `facts/env.rs` (answered under H6 at 21:25). The other is H2's paragraph on the two differential helpers in `facts/tests.rs` (81, 125): each wraps its body in `frame::task(Tag::Nameres, ..)`, builds `BuildingDefMap::new_in(frame, ..)` and calls `collect_defs`. Both are accepted and land in one change with R10.3's `facts/` part, H6 and T5, once R10's types are in the tree. The rest belongs to db-expand-names, the owner this part names: `collector.rs` (H3, H4), `frozen.rs` (H7), `nameres/tests/budget.rs` (T6/H8) and `nameres.rs` (H1, H2's two queries). This lane does not take them. For H5, the facts `collect_block` calls `settle` once, last, as H6 has it. H9 needs nothing from this lane.
 
 ### H1. `nameres.rs`: what this slice adds next to R10.3
 
@@ -984,12 +1013,16 @@ Everything else in Parts A to G stands.
 > exist yet. It lands in the same change as R10 once hir-def's current tree has built
 > (Andrew's decision, 21:05).
 
+> trimmed 2026-10-29 ~21:30 (mem-db-def-collect, on mem-db-def's 21:17 instruction): the
+> `BuildingDefMap` bodies are gone from H1, since R10.3 specifies that type. What is left is what R10
+> assigns to this lane.
+
 Imports added at the top of `nameres.rs` (with Part A's aliases):
 
 ```rust
 use std::alloc::Allocator;
 
-use blaze_mem::Frame;
+use blaze_mem::{Frame, Tag};
 use rustc_hash::FxBuildHasher;
 
 use crate::item_scope::{Building, ScopeStore};
@@ -1011,114 +1044,28 @@ fn root_module_of(db: &Db, krate: Crate, block: Option<BlockId>) -> ModuleId {
 }
 ```
 
-**The bodies of R10.3's `BuildingDefMap` methods.** R10.3 names them; they are written here
-because they keep `ModulesMap`'s and the children maps' `FxIndexMap` behavior exactly. Each
-`insert` of a key already present keeps its position and takes the new value, and replacing a
-module drops its old children:
+**`BuildingDefMap` itself is R10.3's**: its fields, `new_in` (with R10.10's root
+`(ModuleOrigin, Visibility)`), `add_module`, `add_child`, `module`, `module_mut`, `modules`, its
+`DefMapRead` impl and `settle`. Part H does not restate them. It needs one property of them and
+three more methods.
+
+The property: the collector adds a module id that is already in the map when a module declares
+the same `mod` name twice (`ModuleIdLt` is interned by parent and name). Today's `FxIndexMap::insert`
+keeps the id's place, takes the new data and leaves the old children map behind. So
+`add_module` of an id already present keeps its place in `modules`, makes it empty again, and
+removes its old children from `child_at`. `add_child` of a name already present keeps the name's
+place in the parent's `children`, takes the new id, and returns the id it replaced
+(`Option<ModuleId>`, which `push_child_module` reads, H3).
+
+The two methods the collector calls that R10.3 doesn't list:
 
 ```rust
 impl<'f> BuildingDefMap<'f> {
-    /// An empty def map in `frame`: its root module only.
-    pub(crate) fn new_in(
-        frame: &'f Frame,
-        db: &Db,
-        krate: Crate,
-        data: Arc<DefMapCrateData>,
-        (origin, visibility): (ModuleOrigin, Visibility),
-        block: Option<BlockInfo>,
-    ) -> Self {
-        let root = root_module_of(db, krate, block.map(|it| it.block));
-        let mut map = BuildingDefMap {
-            frame,
-            krate,
-            block,
-            root,
-            prelude: None,
-            data,
-            modules: Vec::new_in(frame),
-            module_at: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
-            child_at: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
-            macro_use_prelude: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
-            derive_helpers_in_scope: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
-            diagnostics: Vec::new_in(frame),
-            names: uses::NameRecords::default(),
-            session_macros: false,
-        };
-        map.add_module(root, origin, visibility, None);
-        map
-    }
-
     /// Room for `additional` more modules: a capacity hint from the item tree (H4).
     pub(crate) fn reserve_modules(&mut self, additional: usize) {
         self.modules.reserve(additional);
         self.module_at.reserve(additional);
         self.child_at.reserve(additional);
-    }
-
-    /// Adds module `id`, empty. An id already there keeps its place and is made empty again, its
-    /// children forgotten, as `FxIndexMap::insert` of a new `ModuleData` did.
-    pub(crate) fn add_module(
-        &mut self,
-        id: ModuleId,
-        origin: ModuleOrigin,
-        visibility: Visibility,
-        parent: Option<ModuleId>,
-    ) -> &mut BuildingModule<'f> {
-        let frame = self.frame;
-        let module = BuildingModule {
-            origin,
-            visibility,
-            parent,
-            scope: ItemScope::new_in(frame),
-            children: Vec::new_in(frame),
-        };
-        let at = match self.module_at.entry(id) {
-            hashbrown::hash_map::Entry::Occupied(it) => {
-                let at = *it.get() as usize;
-                let old = std::mem::replace(&mut self.modules[at].1, module);
-                for (name, _) in old.children {
-                    self.child_at.remove(&(id, name));
-                }
-                at
-            }
-            hashbrown::hash_map::Entry::Vacant(it) => {
-                let at = self.modules.len();
-                it.insert(u32::try_from(at).expect("a def map of 2^32 modules"));
-                self.modules.push((id, module));
-                at
-            }
-        };
-        &mut self.modules[at].1
-    }
-
-    /// Names `child` `name` in `parent`: the child that had the name, if one did, which keeps
-    /// its place in the list.
-    pub(crate) fn add_child(&mut self, parent: ModuleId, name: Name, child: ModuleId) -> Option<ModuleId> {
-        // clone: a `Symbol`'s count, no allocation.
-        let replaced = self.child_at.insert((parent, name.clone()), child);
-        let children = &mut self.module_mut(parent).children;
-        match replaced {
-            Some(_) => {
-                let slot = children.iter_mut().find(|(it, _)| *it == name);
-                slot.expect("`child_at` and the module's children agree").1 = child;
-            }
-            None => children.push((name, child)),
-        }
-        replaced
-    }
-
-    pub(crate) fn module(&self, id: ModuleId) -> &BuildingModule<'f> {
-        match self.module_at.get(&id) {
-            Some(&at) => &self.modules[at as usize].1,
-            None => panic!("ModuleId not found in the def map being collected {:#?}: {id:#?}", self.root),
-        }
-    }
-
-    pub(crate) fn module_mut(&mut self, id: ModuleId) -> &mut BuildingModule<'f> {
-        match self.module_at.get(&id) {
-            Some(&at) => &mut self.modules[at as usize].1,
-            None => panic!("ModuleId not found in the def map being collected {:#?}: {id:#?}", self.root),
-        }
     }
 
     /// Two different modules at once, for a write to one from a read of the other; `None` when
@@ -1133,33 +1080,28 @@ impl<'f> BuildingDefMap<'f> {
         let [a, b] = self.modules.get_disjoint_mut([a, b]).ok()?;
         Some([&mut a.1, &mut b.1])
     }
-
-    /// The modules in the order they were added.
-    pub(crate) fn modules(&self) -> impl Iterator<Item = (ModuleId, &BuildingModule<'f>)> + '_ {
-        self.modules.iter().map(|(id, module)| (*id, module))
-    }
-
-    pub(crate) fn root_module_id(&self) -> ModuleId {
-        self.root
-    }
-
-    pub(crate) fn recursion_limit(&self) -> u32 {
-        self.data.recursion_limit()
-    }
 }
 ```
 
-R10.3's `DefMapRead for BuildingDefMap` `child` reads `self.child_at.get(&(module, *name))`;
-`Name` is not `Copy`, so it is `self.child_at.get(&(module, name.clone())).copied()` (a `Symbol`
-count, no allocation). `module_pair_mut` keeps `FxIndexMap::get_disjoint_mut`'s panic on equal
-keys.
+`module_pair_mut` keeps `FxIndexMap::get_disjoint_mut`'s panic on equal keys.
 
-**Crate data reads shared by both maps.** `DefMap::recursion_limit` (893) and
-`is_builtin_or_registered_attr` (`attr_resolution.rs` 81) read only `self.data`. Their bodies move
-to `DefMapCrateData` (`pub(super) fn recursion_limit(&self) -> u32 { self.recursion_limit.unwrap_or(128) }`,
-and `is_builtin_or_registered_attr` with `self.data.registered_tools` becoming
-`self.registered_tools`). `DefMap`'s two methods then call them on `self.data`, and the collector
-calls them on `self.def_map.data`. `resolve_attr_macro` (`attr_resolution.rs` 30, called by
+**What the collector reads of the building map besides `DefMapRead`.** `collector.rs` calls these
+on its `DefMap` today. On `BuildingDefMap` they become:
+
+| Call (count in `collector.rs`) | After |
+|---|---|
+| `def_map.root_module_id()` (3) | `def_map.root()` (`DefMapRead`) |
+| `def_map.block_id()` (3), `def_map.crate_root(db)` (1) | unchanged: `DefMapRead`'s provided methods |
+| `def_map.module(id)` (3) | R10.3's `module(id)`, the fields read directly (`.scope`, `.parent`) |
+| `def_map.recursion_limit()` (6), `features()` (1), `is_no_std()` (1), `is_no_core()` (1), `is_builtin_or_registered_attr(..)` (1) | `def_map.data.recursion_limit()`, `.features()`, `.is_no_std()`, `.is_no_core()`, `.is_builtin_or_registered_attr(..)` |
+| `resolve_path*`, `path_uses*`, `macro_via` | unchanged calls: `ResolvePath` (R10.1) and `RecordUses` (H3) |
+
+For the fifth row, those five bodies move to `DefMapCrateData`, each reading its own fields:
+`recursion_limit(&self) -> u32 { self.recursion_limit.unwrap_or(128) }`, `features` returns
+`&self.unstable_features`, `is_no_std` is `self.no_std || self.no_core`, `is_no_core` is
+`self.no_core`, and `is_builtin_or_registered_attr` (`attr_resolution.rs` 81) has
+`self.data.registered_tools` become `self.registered_tools`. `DefMap`'s five methods call them on
+`self.data`, so the readers outside nameres don't change. `resolve_attr_macro` (`attr_resolution.rs` 30, called by
 `assoc.rs` 209 on collected maps only) stays on `DefMap`, its first line becoming
 `self.data.is_builtin_or_registered_attr(&ast_id.path)`.
 
@@ -1189,8 +1131,7 @@ impl<'f> BuildingLocal<'f> {
             hashbrown::hash_map::Entry::Occupied(it) => self.entries[*it.get() as usize].1 = value,
             hashbrown::hash_map::Entry::Vacant(it) => {
                 let at = u32::try_from(self.entries.len()).expect("an extern prelude of 2^32 crates");
-                // clone: a `Symbol`'s count, no allocation.
-                self.entries.push((it.key().clone(), value));
+                self.entries.push((*it.key(), value));
                 it.insert(at);
             }
         }
@@ -1322,12 +1263,11 @@ and `from_settled`'s last statement is `DefMap::from_table(db, parts, table)`.
 from its list. `DefMapCrateData::shrink_to_fit` (327) goes: H4 makes every table of it at its
 size or reserved to its bound before the first insert.
 
-### H2. The two queries (replacing A1 and A2)
+### H2. The two queries: A1 and A2 once R10 lands
 
 ```rust
 #[salsa::tracked(returns(ref))]
 pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
-    let krate = crate_id.data(db);
     let _p = tracing::info_span!(
         "crate_def_map_query",
         name=?crate_id
@@ -1339,21 +1279,11 @@ pub(crate) fn crate_local_def_map(db: &Db, crate_id: Crate) -> DefMapPair<'_> {
     )
     .entered();
 
-    blaze_mem::frame::current(|frame| {
+    blaze_mem::frame::task(Tag::Nameres, |frame| {
         if let Some((def_map, local_def_map)) = frozen::served_in(db, crate_id, frame) {
             return DefMapPair::new(db, def_map, local_def_map);
         }
-        let root_file_id = crate_id.root_file_id(db);
-        let def_map = BuildingDefMap::new_in(
-            frame,
-            db,
-            crate_id,
-            Arc::new(DefMapCrateData::new(krate.edition)),
-            (ModuleOrigin::CrateRoot { definition: root_file_id }, Visibility::Public),
-            None,
-        );
-        let (def_map, local_def_map) =
-            collector::collect_defs(db, def_map, TreeId::new(root_file_id.into(), None), None);
+        let (def_map, local_def_map) = facts::collect_crate(db, frame, crate_id);
         frozen::check(db, crate_id, &def_map, &local_def_map);
         DefMapPair::new(db, def_map, local_def_map)
     })
@@ -1367,7 +1297,7 @@ pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
     let module = unsafe { block_id.module(db).to_static() };
     let visibility = Visibility::Module(module, VisibilityExplicitness::Implicit);
 
-    blaze_mem::frame::current(|frame| {
+    blaze_mem::frame::task(Tag::Nameres, |frame| {
         let krate = module.krate(db);
         let local_def_map = crate_local_def_map(db, krate);
         let def_map = BuildingDefMap::new_in(
@@ -1378,22 +1308,28 @@ pub fn block_def_map<'db>(db: &'db Db, block_id: BlockIdLt<'db>) -> DefMap {
             (ModuleOrigin::BlockExpr { block: ast_id, id: block_id }, visibility),
             Some(BlockInfo { block: block_id, parent: module }),
         );
-        let (def_map, _) = collector::collect_defs(
+        facts::collect_block(
             db,
             def_map,
             TreeId::new(ast_id.file_id, Some(block_id)),
-            Some(local_def_map.local(db)),
-        );
-        def_map
+            local_def_map.local(db),
+        )
     })
 }
 ```
 
-The `crate_local_def_map(db, krate)` inside the block's frame is a query of its own. On a miss it
-runs in a task one level deeper (contract 1), so the block's frame is not touched. Neither query
-calls `hand_over_scopes` (R10.3). Under the facts engine the two collect calls are
-`facts::collect_crate(db, frame, crate_id)` and `facts::collect_block(db, def_map, tree_id, local)`
-(H6), in the same places.
+Each query opens its own task because salsa's
+`execute` opens none (`vendor/salsa` uses blaze-mem only for memo tables). `frame::current`
+outside a task stops (`frame.rs` 497), and a nested query run inside an outer task must not
+allocate into the outer query's frame. A task costs two thread-local accesses once a thread has a
+frame at that depth. So `crate_local_def_map(db, krate)`, called inside the block's task, runs its
+own task one level deeper on a miss and leaves the block's frame alone. Neither query calls
+`hand_over_scopes` (R10.3).
+
+`collector::collect_defs` (H3) is the differential reference, called only by
+`facts/tests.rs` (81, 125) outside any query. Each of those two helpers wraps its body in
+`blaze_mem::frame::task(Tag::Nameres, |frame| ..)`, builds `BuildingDefMap::new_in(frame, ..)` with
+the root origin it builds today, and calls `collect_defs` as H3 gives it.
 
 ### H3. `collector.rs`: the collector builds `BuildingDefMap<'f>`
 
@@ -1530,10 +1466,10 @@ and the branch becomes:
             .expect("a module and the module it declares are both in the def map");
         for (name, macs) in parent.scope.legacy_macros() {
             for &mac in macs {
-                child.scope.define_legacy_macro(name.clone(), mac);
+                child.scope.define_legacy_macro(*name, mac);
             }
         }
-        let replaced = def_map.add_child(self.module_id, name.clone(), module);
+        let replaced = def_map.add_child(self.module_id, name, module);
         if replaced.is_some() {
             // A path can read whether a module is its parent's `__blaze_test_harness`.
             self.def_collector.imports.wake_all();
@@ -1625,7 +1561,8 @@ fn declared(item_tree: &ItemTree, items: &[ModItemId]) -> Declared {
 }
 ```
 
-`Declared` (with `mods`, which the scope ignores and the module table reads) is H9's ask 2.
+`Declared` (with `mods`, which the scope ignores and the module table reads) and
+`reserve_declared` are R10.8's.
 `ModCollector::collect` (2951) begins:
 
 ```rust
@@ -1668,40 +1605,27 @@ frame value.
 ```
 
   The order of `enable` is the attributes' order, as before. `registered_tools` reads the same
-  (the predefined tools, then the crate's in order). `UnstableFeatures::reserve` is H9's ask 4.
+  (the predefined tools, then the crate's in order). `UnstableFeatures::reserve` is mem-db-def-items' I11.1.
 - `export_proc_macro` (1234 to 1239) inserts at most one entry per proc macro of the crate into
   each map. `self.proc_macros` is the build system's list, so the reservation holds them unless a
   `#[proc_macro]` function is missing from it (`missing_expander`, an error state). Then the map
   grows past the hint, and the budget tests count it by capacity (H8).
 
-### H5. `settle`: what it copies, in what order, and that nothing outlives the run
+### H5. `settle` is R10.3's; what the collector owes it
 
-R10.3's `BuildingDefMap::settle(self, db) -> DefMap` is the one copy from the frame to the global
-heap. It replaces A4's in-place `settle`, `DefMap::shrink_to_fit` (672) and `hand_over_scopes`
-(703). `collect_defs` calls it (H3), and so does the facts `collect_block` (H6). What it makes,
-each once, at its length:
+The copy from the frame to the memo is R10.3's `BuildingDefMap::settle` and `DefMap::from_settled`,
+which replace A4. The collector's part:
 
-| Building (frame) | Settled (memo) | Order kept |
-|---|---|---|
-| `modules: Vec<(ModuleId, BuildingModule)>` | one `ModuleScope` per module, then `Modules { table: ModulesMap }` (`FxIndexMap::with_capacity_and_hasher(n)`) | the order modules were added: what `DefMap::modules(db)` iterates, and what the frozen encoding and `dump` walk |
-| each module's `children: Vec<(Name, ModuleId)>` | the `ModuleScope`'s `children: FxIndexMap` at its length | declaration order, with a replaced name in its first place (H1 `add_child`); what `children(db).iter()` sees |
-| each module's `ItemScope<Building<'f>>` | `ItemScope` by R10.2's `settle(self)` | every column in push order; the by-name and by-def tables made once (R1) |
-| `module_at`, `child_at` | nothing: indexes of the frame lists only | |
-| `macro_use_prelude` (frame hash map) | `exact_map` | a hash map: its iteration order is the table's and is deterministic. Readers that need an order sort (`resolver.rs` 834, `frozen.rs` 1893) |
-| `derive_helpers_in_scope` (frame map of frame lists) | `exact_map_with(.., settled_vec)`: the map and one box per non-empty list | each list in push order, which `helpers_range` indexes (2992) |
-| `diagnostics` | `settled_vec`, then `DiagnosticsByModule::of` (A6) | push order, which `diagnostics_of` keeps per module |
-| `names: NameRecords` | moved: already owned and exact (B4) | |
-| `prelude`, `data`, `session_macros`, `krate`, `block`, `root` | moved | |
-| the collector's `BuildingLocal` | `BuildingLocal::settle` (H1), called by `collect_defs` beside it | first-insert order, which `extern_prelude()` iterates and `LocalDefMap`'s `Hash` reads |
-
-The settled lists take their elements by move (`extend` from the frame vector's `IntoIter`), so a
-`Name` is moved, not cloned. Nothing in the frame outlives the run, for three reasons. First,
-`BuildingDefMap<'f>` and `BuildingLocal<'f>` borrow the frame for `'f`, which ends when the query's
-`current` closure returns. Second, `settle` consumes both and returns only owned values, so the
-borrow checker rejects a `DefMap` that keeps a frame reference. Third, `frame::task` resets the
-frame after the query function returns (contract 1). The frame lists' own drops run when the
-consumed `BuildingDefMap` is dropped inside `settle` (`module_at`, `child_at`) or as each
-`IntoIter` ends. They free nothing, since dropping a frame allocation is a no-op.
+- It calls `settle` once, last: `collect_defs` (H3) and the facts `collect_block` (H6). It settles
+  its `BuildingLocal` beside it (H1's `BuildingLocal::settle`, first-insert order kept).
+- The orders R10.3's `settle` keeps are the orders the collector writes in, so the collector
+  keeps today's write order. That means modules added as declared, a re-declared module or child
+  keeping its first place (H1's property), each scope column pushed as today, derive helpers and
+  diagnostics pushed as today. `macro_use_prelude` stays a hash map, and its readers sort
+  (`resolver.rs` 834, `frozen.rs` 1893).
+- Nothing the run makes outlives it. The building map and the `BuildingLocal` borrow the frame
+  for `'f`, which ends when H2's `frame::task` closure returns, and `settle` consumes them and
+  returns owned values. So a memo that keeps a frame reference does not compile.
 
 ### H6. The facts driver (`facts/driver.rs`, `facts/env.rs`; frontend-nameres)
 
@@ -1770,6 +1694,8 @@ The unresolved imports are read before `into_def_map`, as now. They go into a
 `extend`ed into the map. `side` is C4's frame `SideTablesIn<'f>` on the block path, so its helpers
 are frame vectors already. `name_records` (facts) takes `&impl DefMapRead`. The unit's own types
 (`unit.rs`) adapt to R10 as R10.3 says. That is frontend-nameres', and not restated here.
+
+> frontend-nameres (2026-10-29 21:25): accepted, and blocked with R10. H6 is ours, but it is written against `DefMap::from_table`, `DefMapParts`, `BuildingDefMap<'f>`, `DefMapRead`, `settle` and `set_diagnostics`. None of them exists in `nameres.rs` yet, and R10 was deferred until hir-def's current tree has built (Andrew, 21:05). `facts/driver.rs`/`env.rs` adopt H6 together with C1-C4 in the change that lands R10 and H2, against the R10 types as they land. Owner of the blocker: db (db-expand-names).
 
 ### H7. The frozen read (`frozen.rs`)
 
@@ -1953,7 +1879,7 @@ impl NameRecords {
 }
 ```
 
-`ItemScope::owned_allocations` and `UnstableFeatures::owned_allocations` are H9's asks 1 and 4.
+`ItemScope::owned_allocations` is R10.7's and `UnstableFeatures::owned_allocations` is I11.1's.
 
 The test, and the file's import block (Part F's, corrected: `module_for_file` and
 `fetch_test_crate` are `TestDBExt`'s):
@@ -2090,48 +2016,36 @@ scopes do not match.
 
 ### H9. Asks of the other slices (told by tmux)
 
-To **mem-db-def-resolve** (window `mem-db-def-resolve-next1`), for `item_scope.rs` and
-`visibility.rs`, on top of R10:
+All four are answered:
 
-1. `ItemScope::owned_allocations`, on the settled scope, `#[cfg(test)]`: one per non-empty heap
-   buffer the scope owns, as R10.2's `settle` makes them. That is each `ThinVec` (`settled`), each
-   `Keyed`'s entries and index, each `Bits`, the two `SettledTables` boxes, and each
-   `SmallVec<[_; 1]>` value that spilled (`len > 1`), with every field destructured as `settle`
-   does, so a new field cannot be missed.
-2. `ItemScope<Building<'f>>::reserve_declared(&mut self, d: &Declared)` and, in `item_scope.rs`:
+| Ask | Answered by |
+|---|---|
+| 1. `ItemScope::owned_allocations` | R10.7 |
+| 2. `Declared` and `ItemScope<Building<'f>>::reserve_declared` | R10.8, with `Declared` as given below |
+| 3. `Visibility::max`/`min` taking `&impl DefMapRead` | R10.9 |
+| 4. `UnstableFeatures::reserve`, its `shrink_to_fit` removed, `owned_allocations` | mem-db-def-items' I11.1 (`v2/requests/mem-db-def-items.md`) |
 
-   ```rust
-   /// How many of each kind of item a list declares into a scope (the collector's `declared`).
-   #[derive(Debug, Default, Clone, Copy)]
-   pub(crate) struct Declared {
-       /// Items with a name: each goes into `declarations` and one namespace column.
-       pub(crate) named: u32,
-       pub(crate) impls: u32,
-       pub(crate) uses: u32,
-       pub(crate) extern_crates: u32,
-       pub(crate) macro_calls: u32,
-       pub(crate) macro_rules: u32,
-       pub(crate) unnamed_consts: u32,
-       pub(crate) extern_blocks: u32,
-       /// Modules, counted in `named` too; the module table and children read this.
-       pub(crate) mods: u32,
-   }
-   ```
+I11.1 lands with or after the removal of `DefMapCrateData::shrink_to_fit` (A5, and H1's
+`DefMapCrateData` paragraph), since that function calls `UnstableFeatures::shrink_to_fit`
+(`nameres.rs` 349).
 
-   `reserve_declared` reserves `declarations` and the `types` and `values` columns by `named`,
-   `impls` and both `Bits` by `impls`, `use_decls` by `uses`, `extern_crate_decls` by
-   `extern_crates`, `macro_invocations` by `macro_calls`, `legacy_macros` by `macro_rules`,
-   `unnamed_consts` and `extern_blocks` by theirs. These are all frame `Vec::reserve` calls.
-3. `Visibility::max` and `Visibility::min` (`visibility.rs` 159, 222) take
-   `def_map: &impl DefMapRead`, as R10.4 does for `is_visible_from_def_map`. They read
-   `def_map.krate()` and `def_map.block_id()` only, and the collector calls `max` with the
-   building map (`collector.rs` 1716, 1857).
-Two notes on R10.3's text, written into H1: `new_in` takes the root's
-`(ModuleOrigin, Visibility)`, since there is no building `ModuleData` any more, and `child`
-clones the `Name` key.
+`Declared`, which R10.8 puts in `item_scope.rs`:
 
-To **mem-db-def-items** (window `mem-db-def-items-next1`), for `unstable_features.rs`:
+```rust
+/// How many of each kind of item a list declares into a scope (the collector's `declared`).
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Declared {
+    /// Items with a name: each goes into `declarations` and one namespace column.
+    pub(crate) named: u32,
+    pub(crate) impls: u32,
+    pub(crate) uses: u32,
+    pub(crate) extern_crates: u32,
+    pub(crate) macro_calls: u32,
+    pub(crate) macro_rules: u32,
+    pub(crate) unnamed_consts: u32,
+    pub(crate) extern_blocks: u32,
+    /// Modules, counted in `named` too; the module table and children read this.
+    pub(crate) mods: u32,
+}
+```
 
-4. `UnstableFeatures::reserve(&mut self, additional: usize) { self.all.reserve(additional) }`,
-   `UnstableFeatures::shrink_to_fit` (39) removed (H4 builds the set at its size), and
-   `#[cfg(test)] pub(crate) fn owned_allocations(&self) -> u64 { u64::from(self.all.capacity() > 0) }`.

@@ -119,6 +119,7 @@ fn scope_lookups_allocate_nothing() {
     let wide = map.module(&db, module(&db, krate, "wide"));
     let at_root: Vec<Name> = ["a", "b", "wide", "f", "missing"].map(name).into();
     let in_wide: Vec<Name> =
+        // alloc: test setup, outside the measure
         (0..12).map(|i| name(&format!("W{i}"))).chain([name("missing")]).collect();
     assert!(wide.scope(&db).entries().count() > 8, "`wide` does not reach the index");
     assert!(root.scope(&db).get(&name("b")).take_types().is_some(), "`b` is not re-exported");
@@ -178,6 +179,7 @@ fn resolver_scope_push_lookup_and_pop_allocate_nothing() {
     let mut resolver = def.resolver(&db);
     let guard = resolver.update_to_inner_scope(&db, def, innermost);
     let found: Vec<_> =
+        // alloc: test setup, outside the measure
         paths.iter().map(|it| resolver.resolve_path_in_value_ns(&db, it, HygieneId::ROOT)).collect();
     assert!(
         matches!(found[0], Some(ResolveValueResult::ValueNs(ValueNs::LocalBinding(_)))),
@@ -200,13 +202,12 @@ fn resolver_scope_push_lookup_and_pop_allocate_nothing() {
     });
 }
 
-/// Budget: a resolver for a function, once its def map, generics and scopes are warm. 1 today
-/// (the scope stack's `Vec`); 0 once `Resolver::scopes` holds its first scopes inline
-/// (`v2/requests/db-expand.md`, "speed-hir-sol-nameres").
+/// Budget: a resolver for a function, once its def map, generics and scopes are warm: 0
+/// (`Resolver::scopes` holds its first eight scopes inline).
 #[test]
-fn a_function_resolver_allocates_at_most_one() {
+fn a_function_resolver_allocates_nothing() {
     let (db, krate) = fixture();
     let def = the_function(&db, krate);
     black_box(def.resolver(&db));
-    assert_at_most(1, "a function's resolver", || black_box(def.resolver(&db)));
+    assert_at_most(0, "a function's resolver", || black_box(def.resolver(&db)));
 }

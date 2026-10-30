@@ -26,9 +26,14 @@ green identity) and the rustc shape for lowering (one query per item, keyed by w
 
 ## Parsing from the previous parse
 
-`SourceFile::parse_file(key, text, edition, outline)` (crates/syntax) keeps the last parse of each
-file in a small direct-mapped table (`parsing/kept.rs`, 128 slots by file id) and, when one is
-there of the same mode, makes the new parse with `Parse::reparse_to`: the edit is the
+Superseded on 2026-10-29: db's D8 (`base-db/src/reparse.rs`, over `Parse::reparse_onto`)
+keeps each file's last parse instead. `SourceFile::parse_file` and `parsing/kept.rs` had no
+caller, so they were deleted with their tests. `Parse::reparse_to` and `reparse_onto` stay.
+What follows is the design as it was.
+
+`SourceFile::parse_file(key, text, edition, outline)` (crates/syntax) kept the last parse of each
+file in a small direct-mapped table (`parsing/kept.rs`, 128 slots by file id) and, when one was
+there of the same mode, made the new parse with `Parse::reparse_to`: the edit is the
 difference between the kept tree's text and the new text (`edit_between`: common prefix and
 suffix, compared 64 bytes at a time, backed off to char boundaries), and
 `incremental_reparse_onto` reparses the smallest token, block, body or item holding it, the
@@ -75,7 +80,8 @@ whole-file lowering. A source file's tree is made from its last one instead
   function of its text, the lexer starts a token at an item's start the same way whatever came
   before, and the parser reads a top-level item from the item list's state, its own tokens and
   at most three tokens past its position, which the two items hold. Its ids and anchors are
-  still read and compared, as an edit elsewhere can renumber them.
+  copied from its old key unless the bulk compare of the maps (`Unchanged::touched`, below)
+  marked it, as an edit elsewhere can renumber them.
 - `Marks` are where an item's rows begin in each of the tree's 28 columns (`kinds` standing
   for `data` and `ast_ids` too), then where the last item's end. The whole-file lowering
   records them at each top-level item (`Ctx::lower_module_items_marked`), and assembly at each
@@ -91,8 +97,9 @@ whole-file lowering. A source file's tree is made from its last one instead
   lowered again every time. If every key and the top level are the same, the kept `Arc` itself
   is the result, which salsa compares by address and backdates.
 - `assemble(top, runs, marks)` builds the tree from the top level and runs of rows (a run of
-  kept items, or one item lowered alone) in one pass, each column allocated once at its summed
-  length, moving each id by where its run's rows go less where they were: items and attribute
+  kept items, or one item lowered alone) in one pass into the tree's one block (`block.rs`: a
+  header of column ends, then every column), allocated once at every column's summed length,
+  moving each id by where its run's rows go less where they were: items and attribute
   owners by the item base, payloads by their kind's column, `children`, `use_trees`,
   `use_tree_lists`, `ctor_vis`, names, paths, visibilities, attributes and `cfg`s by theirs,
   sentinels (`NameId::NONE`, `AliasId::NONE`/`UNDERSCORE`, `PathId::NONE`, the builtin
@@ -114,12 +121,19 @@ expansion is made anew and a block's tree is small.
 Known costs, all bounded (the bounds and the arithmetic are in
 [speed-of-light.md](speed-of-light.md), section frontend-deps-reparse):
 
-- Every edit reads every item's ast ids and anchors again, one hash probe and one binary search
-  for a typical item (about 13 µs for 500 items), until span lends the two maps' arrays
-  (requested in `v2/requests/frontend-deps-items.md`). Only the touched items and the two before
+- An edit reads ast ids and anchors from the maps, one hash probe and one binary search an
+  item, only for the items `Unchanged` doesn't keep and the kept ones the bulk compare marks.
+  The slot keeps the last `AstIdMap::entries` and `RealSpanMap::anchors`. `Unchanged::touched`
+  walks each array once, old and new together, over the text the edit left unchanged (the
+  suffix's moved back by the edit's length). It pairs entries by place and kind, a pair counts
+  only if its id is equal too, and every other entry marks the new item holding its start.
+  That is about 1 µs for 500 items, against 13 µs for reading every item. A renumbered id
+  (a second `fn f` before another) marks the one item holding it. A run out of step with the
+  other side marks more items, never a wrong reuse. Only the touched items and the two before
   them are hashed.
-- A slot holds 32 bytes of key, about 25 of ids and anchors and 112 of marks per item of its
-  file, and a count of the text the keys were made of, only for a file edited at least once.
+- A slot holds 32 bytes of key, about 25 of ids and anchors, about 30 of the maps' entries and
+  anchors and 112 of marks per item of its file, and a count of the text the keys were made
+  of, only for a file edited at least once.
 - An edit inside a `fn` of an inline module re-lowers the module: it moves the module's later
   items, whose starts are in its key.
 - Attributes are cloned on assembly, which allocates for those holding paths or inputs.
@@ -135,11 +149,9 @@ crates/syntax:
   sharing the new text.
 - `edit_between_cuts_the_common_ends`: the edit found leaves no common first or last char and
   rebuilds the new text, across multi-byte chars and long runs.
-- `a_kept_parse_makes_the_parse_of_the_new_text`: a sequence of texts through `parse_file`, full
-  and outline, each the parse of its text; another file in the same slot evicts the kept one.
-- `taking_and_keeping_allocate_nothing`, and `edit_between` in its test: a lookup of the kept
-  table, keeping a parse and finding the edit between two texts allocate nothing
-  (`blaze-alloc-count`).
+- `edit_between`'s allocation test: finding the edit between two texts allocates nothing
+  (`blaze-alloc-count`). `a_kept_parse_makes_the_parse_of_the_new_text` and
+  `taking_and_keeping_allocate_nothing` were deleted with `parsing/kept.rs` (2026-10-29).
 
 crates/hir-def/src/item_tree:
 
@@ -166,16 +178,28 @@ crates/hir-def/src/item_tree:
   each tree still whole; `common_ends_are_the_longest_that_do_not_overlap` holds the compare to
   a byte-by-byte one. The counting tests see their own slots: under `cfg(test)` the slots are
   per thread.
+- `an_edit_reads_ids_only_for_the_items_it_touched`: in a 40-item file, a body edit of the
+  same length, one that is longer, and an item added at the start read the maps' ids and
+  anchors (counted by `READ`) for only the items they hash, the ones `Unchanged` doesn't keep.
+  Each tree is still whole.
+- `a_renumbered_id_reads_the_item_holding_it`: a second `fn f` added before another renumbers
+  the later one's id in the unchanged suffix. Exactly one kept item more than those hashed is
+  read, and the tree is still whole.
 - `attributes_are_found_as_a_search_of_their_owners_finds_them`: the rank index `attrs` reads
   gives what a binary search of the owners gives, for every item of a tree of more than two
   blocks of 64.
 - `trees_asked_again_allocate_nothing`: a memo hit of `file_item_tree`, and a file whose items
   all kept their keys, allocate nothing.
-- `assembly_allocates_once_a_column`: assembling a file of 4 items and one of 64 allocates as
-  many times, and gives the whole-file tree.
+- `assembly_allocates_once_a_tree`: assembling a file of 4 items and one of 64 allocates once
+  each, the tree's block, and gives the whole-file tree.
 - `reading_a_tree_allocates_nothing`, `expanding_use_trees_whose_paths_are_interned_allocates_nothing`,
-  `a_warm_builder_lowers_a_file_in_one_allocation_a_column`, `decoding_a_tree_allocates_once_a_column`
-  and `a_builder_after_an_item_of_many_names_lowers_as_a_fresh_one` (speed-hir-sol-items).
+  `a_warm_builder_lowers_a_file_in_one_allocation` (the tree's block),
+  `decoding_a_tree_allocates_its_block_and_its_paths` (the block, and each decoded path's
+  segments) and `a_builder_after_an_item_of_many_names_lowers_as_a_fresh_one`
+  (speed-hir-sol-items).
+- `block.rs`'s tests: columns read back what was written, an empty tree allocates nothing, a
+  tree is one allocation, and a fill that panics, leaves a column short, writes past a column's
+  end or fails drops what it wrote.
 
 The budgets count only once hir-def's test binary installs `blaze_alloc_count::Counting`
 (requested from db).

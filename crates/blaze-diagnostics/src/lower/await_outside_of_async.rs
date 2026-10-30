@@ -5,10 +5,13 @@
 //! `LoweringContext::with_new_scopes` sets `current_item` (MIT or Apache-2.0).
 
 use hir::InFile;
-use syntax::{AstNode, SyntaxNode, TextRange, ast};
+use syntax::{
+    TextRange,
+    view::{self as ast, AstNode as _},
+};
 
 use crate::{
-    cx::{Cx, item_range, signature_range},
+    cx::{Cx, item_range_view as item_range, signature_range_view as signature_range},
     lints::code_fact,
     lower::{
         Found, Phase,
@@ -18,33 +21,35 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::AwaitOutsideOfAsync) -> Vec<Found> {
-    let node = cx.node(d.node);
+    let node = cx.node_view(d.node);
     let keyword = match node.value.await_token() {
         Some(it) => it.text_range(),
         None => node.value.syntax().text_range(),
     };
     let span = cx.span(node.with_value(keyword));
     let mut diag =
+        // clone: a handle, on the error path, for an error hir found
         Diag::error(Some("E0728"), "`await` is only allowed inside `async` functions and blocks", span.clone());
     diag.span_label(span, "only allowed inside `async` functions and blocks");
-    if let Some(scope) = scope(cx, &node.map(|it| it.syntax().clone())) {
+    if let Some(scope) = scope(cx, node.map(|it| it.syntax())) {
         diag.span_label(cx.span(scope), "this is not `async`");
     }
     code_fact(cx, &mut diag, d.node.map(|it| it.syntax_node_ptr()));
-    vec![Found::new(diag, Phase::Resolve)]
+    // alloc: the error's parts, for an error hir found
+    vec![Found::new(diag, Phase::Lower)]
 }
 
 /// The span of the scope rustc's AST lowering is in at `node` (`current_item`): a function's
 /// signature, a closure's head (`move |x| -> T`), a `gen` block, an anonymous const's
 /// expression; none in a `const` or `static` item's own body.
-fn scope(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<InFile<TextRange>> {
+fn scope<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> Option<InFile<TextRange>> {
     for (ancestor, child) in edges(cx, node) {
-        let child = &child.value;
-        let value = &ancestor.value;
-        if let Some(it) = ast::Fn::cast(value.clone()) {
-            return Some(ancestor.with_value(signature_range(&it)));
+        let child = child.value;
+        let value = ancestor.value;
+        if let Some(it) = ast::Fn::cast(value) {
+            return Some(ancestor.with_value(signature_range(it)));
         }
-        if let Some(it) = ast::ClosureExpr::cast(value.clone())
+        if let Some(it) = ast::ClosureExpr::cast(value)
             && it.body().is_some_and(|body| body.syntax() == child)
         {
             let end = match it.ret_type() {
@@ -53,7 +58,7 @@ fn scope(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<InFile<TextRange>
             };
             return Some(ancestor.with_value(TextRange::new(item_range(it.syntax()).start(), end)));
         }
-        if let Some(it) = ast::BlockExpr::cast(value.clone()) {
+        if let Some(it) = ast::BlockExpr::cast(value) {
             if it.const_token().is_some() {
                 return Some(ancestor.with_value(it.stmt_list()?.syntax().text_range()));
             }
@@ -61,7 +66,7 @@ fn scope(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Option<InFile<TextRange>
                 return Some(ancestor.with_value(item_range(it.syntax())));
             }
         }
-        if let Some(it) = ast::ArrayExpr::cast(value.clone())
+        if let Some(it) = ast::ArrayExpr::cast(value)
             && it.semicolon_token().is_some()
             && it.exprs().nth(1).is_some_and(|len| len.syntax() == child)
         {

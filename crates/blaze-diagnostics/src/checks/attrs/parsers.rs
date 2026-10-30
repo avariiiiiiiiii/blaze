@@ -38,7 +38,7 @@ use super::{
     parsed::{Parsed, ParsedAttr},
 };
 use crate::{
-    cx::Cx,
+    cx::{Cx, item_range_view as item_range},
     lints::syntax::attrs::{Attr, Owner, Target, table::index},
     model::{Diag, Span},
 };
@@ -157,7 +157,7 @@ pub(crate) fn check(module: Module, group: GroupId, first: usize, fx: &mut Final
 pub(crate) struct Finalize<'a, 'c, 'db> {
     pub(crate) cx: &'a Cx<'c, 'db>,
     pub(crate) session: &'a Session,
-    pub(crate) owner: &'a Owner,
+    pub(crate) owner: &'a Owner<'db>,
     errors: &'a mut Vec<Diag>,
 }
 
@@ -165,13 +165,13 @@ impl<'a, 'c, 'db> Finalize<'a, 'c, 'db> {
     pub(crate) fn new(
         cx: &'a Cx<'c, 'db>,
         session: &'a Session,
-        owner: &'a Owner,
+        owner: &'a Owner<'db>,
         errors: &'a mut Vec<Diag>,
     ) -> Finalize<'a, 'c, 'db> {
         Finalize { cx, session, owner, errors }
     }
 
-    pub(crate) fn attr(&self, index: usize) -> &'a Attr {
+    pub(crate) fn attr(&self, index: usize) -> &'a Attr<'db> {
         &self.owner.attrs[index]
     }
 
@@ -192,8 +192,8 @@ impl<'a, 'c, 'db> Finalize<'a, 'c, 'db> {
 
     /// rustc's `target_span`.
     pub(crate) fn target_span(&self) -> Span {
-        let node = &self.owner.node;
-        self.cx.span(InFile::new(node.file_id, crate::cx::item_range(&node.value)))
+        let node = self.owner.node;
+        self.cx.span(InFile::new(node.file_id, item_range(node.value)))
     }
 
     pub(crate) fn feature(&self, name: &str) -> bool {

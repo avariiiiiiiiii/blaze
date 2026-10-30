@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use blaze_codegen::Arch;
+use blaze_format::cursor::{self, Reader, Wanted};
 use blaze_format::leb::LebError;
 use blaze_ids::{bits::BitSet, radix};
 use object::Endianness;
@@ -196,23 +197,15 @@ fn set_trie(
     Ok(())
 }
 
-fn uleb(data: &[u8], at: &mut usize) -> Result<u64, String> {
-    let start = *at;
-    blaze_format::leb::read_u64(data, at).map_err(|error| match error {
-        LebError::Truncated => format!("a ULEB128 at {start:#x} runs past the end"), // alloc: error path
-        LebError::Overflow => format!("a ULEB128 at {start:#x} is too long"), // alloc: error path
-    })
-}
-
-fn cstring<'a>(data: &'a [u8], at: &mut usize) -> Result<&'a [u8], String> {
-    let rest = data.get(*at..).unwrap_or_default();
-    let len = rest
-        .iter()
-        .position(|&it| it == 0)
-        // alloc: error path
-        .ok_or_else(|| format!("a string at {:#x} runs past the end", *at))?;
-    *at += len + 1;
-    Ok(&rest[..len])
+/// A trie read's error in the words `malformed_tries` checks, the same from both walks.
+fn trie_error(error: cursor::Error) -> String {
+    let at = error.at;
+    match error.wanted {
+        Wanted::Leb(LebError::Truncated) => format!("a ULEB128 at {at:#x} runs past the end"), // alloc: error path
+        Wanted::Leb(LebError::Overflow) => format!("a ULEB128 at {at:#x} is too long"), // alloc: error path
+        Wanted::Nul { .. } => format!("a string at {at:#x} runs past the end"), // alloc: error path
+        _ => error.into(),
+    }
 }
 
 /// The sections by address, to classify an export's address in O(log n).
@@ -288,30 +281,26 @@ fn trie_exports(
             // alloc: error path
             return Err(format!("node {node:#x} is reached twice (a cycle)"));
         }
-        let mut at = node;
-        let terminal = uleb(data, &mut at)?;
+        let mut r = Reader::starting_at(data, node).map_err(trie_error)?;
+        let terminal = r.uleb().map_err(trie_error)?;
         if terminal != 0 {
-            let end = usize::try_from(terminal)
+            let info = usize::try_from(terminal)
                 .ok()
-                .and_then(|it| at.checked_add(it))
-                .filter(|&it| it <= data.len())
+                .and_then(|it| r.take(it).ok())
                 // alloc: error path
                 .ok_or_else(|| format!("node {node:#x}'s export info runs past the end"))?;
-            let info = &data[at..end];
             let (kind, weak) = export(info, &classify)
                 // alloc: error path
                 .map_err(|what| format!("node {node:#x}: {what}"))?;
             out.push(SharedSymbol { name: super::push_core_name(names, &name)?, version: None, kind, weak });
-            at = end;
         }
         // alloc: error path
-        let count = *data.get(at).ok_or_else(|| format!("node {node:#x} runs past the end"))?;
-        at += 1;
+        let count = r.u8().map_err(|_| format!("node {node:#x} runs past the end"))?;
         let first = stack.len();
         for _ in 0..count {
-            let label = at;
-            let len = cstring(data, &mut at)?.len();
-            let child = uleb(data, &mut at)?;
+            let label = r.at();
+            let len = r.cstr().map_err(trie_error)?.len();
+            let child = r.uleb().map_err(trie_error)?;
             let child = usize::try_from(child)
                 .ok()
                 .filter(|&it| it < data.len())
@@ -356,25 +345,21 @@ fn reference_trie_exports(data: &[u8], base: u64, sections: &[Section]) -> Resul
         if !visited.insert(node) {
             return Err(format!("node {node:#x} is reached twice (a cycle)"));
         }
-        let mut at = node;
-        let terminal = uleb(data, &mut at)?;
+        let mut r = Reader::starting_at(data, node).map_err(trie_error)?;
+        let terminal = r.uleb().map_err(trie_error)?;
         if terminal != 0 {
-            let end = usize::try_from(terminal)
+            let info = usize::try_from(terminal)
                 .ok()
-                .and_then(|it| at.checked_add(it))
-                .filter(|&it| it <= data.len())
+                .and_then(|it| r.take(it).ok())
                 .ok_or_else(|| format!("node {node:#x}'s export info runs past the end"))?;
-            let (kind, weak) =
-                export(&data[at..end], &classify).map_err(|what| format!("node {node:#x}: {what}"))?;
+            let (kind, weak) = export(info, &classify).map_err(|what| format!("node {node:#x}: {what}"))?;
             out.push(Owned { name: super::core_name(&prefix)?, kind, weak });
-            at = end;
         }
-        let count = *data.get(at).ok_or_else(|| format!("node {node:#x} runs past the end"))?;
-        at += 1;
+        let count = r.u8().map_err(|_| format!("node {node:#x} runs past the end"))?;
         let mut children = Vec::with_capacity(usize::from(count));
         for _ in 0..count {
-            let label = cstring(data, &mut at)?;
-            let child = uleb(data, &mut at)?;
+            let label = r.cstr().map_err(trie_error)?;
+            let child = r.uleb().map_err(trie_error)?;
             let child = usize::try_from(child)
                 .ok()
                 .filter(|&it| it < data.len())
@@ -430,8 +415,8 @@ fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolK
             | macho::EXPORT_SYMBOL_FLAGS_REEXPORT
             | macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER,
     ) | EXPORT_SYMBOL_FLAGS_STATIC_RESOLVER;
-    let mut at = 0;
-    let flags = uleb(info, &mut at)?;
+    let mut info = Reader::new(info);
+    let flags = info.uleb().map_err(trie_error)?;
     if flags & !known != 0 {
         // alloc: error path
         return Err(format!("unknown export flags {:#x}", flags & !known));
@@ -444,15 +429,15 @@ fn export(info: &[u8], classify: &impl Fn(u64) -> SymbolKind) -> Result<(SymbolK
         return Err(format!("unknown export kind {kind}"));
     }
     let kind = if flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_REEXPORT) != 0 {
-        uleb(info, &mut at)?;
-        cstring(info, &mut at)?;
+        info.uleb().map_err(trie_error)?;
+        info.cstr().map_err(trie_error)?;
         if tls { SymbolKind::Tls } else { SymbolKind::Other }
     } else if flags & u64::from(macho::EXPORT_SYMBOL_FLAGS_STUB_AND_RESOLVER) != 0 {
-        let stub = uleb(info, &mut at)?;
-        uleb(info, &mut at)?;
+        let stub = info.uleb().map_err(trie_error)?;
+        info.uleb().map_err(trie_error)?;
         classify(stub)
     } else {
-        let address = uleb(info, &mut at)?;
+        let address = info.uleb().map_err(trie_error)?;
         if tls {
             SymbolKind::Tls
         } else if kind == macho::EXPORT_SYMBOL_FLAGS_KIND_ABSOLUTE {
@@ -520,15 +505,9 @@ fn symtab_exports(
 
 #[cfg(test)]
 mod tests {
+    use blaze_format::cursor::Put;
+
     use super::*;
-
-    fn u32le(out: &mut Vec<u8>, value: u32) {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn u64le(out: &mut Vec<u8>, value: u64) {
-        out.extend_from_slice(&value.to_le_bytes());
-    }
 
     fn name16(out: &mut Vec<u8>, name: &str) {
         let mut field = [0u8; 16];
@@ -538,24 +517,24 @@ mod tests {
 
     fn segment(name: &str, vmaddr: u64, fileoff: u64, filesize: u64, sections: &[(&str, u64, u64, u32)]) -> Vec<u8> {
         let mut out = Vec::new();
-        u32le(&mut out, macho::LC_SEGMENT_64);
-        u32le(&mut out, 72 + 80 * sections.len() as u32);
+        out.put_u32(macho::LC_SEGMENT_64);
+        out.put_u32(72 + 80 * sections.len() as u32);
         name16(&mut out, name);
-        u64le(&mut out, vmaddr);
-        u64le(&mut out, 0x4000);
-        u64le(&mut out, fileoff);
-        u64le(&mut out, filesize);
-        u32le(&mut out, 7);
-        u32le(&mut out, 5);
-        u32le(&mut out, sections.len() as u32);
-        u32le(&mut out, 0);
+        out.put_u64(vmaddr);
+        out.put_u64(0x4000);
+        out.put_u64(fileoff);
+        out.put_u64(filesize);
+        out.put_u32(7);
+        out.put_u32(5);
+        out.put_u32(sections.len() as u32);
+        out.put_u32(0);
         for &(sect, addr, size, flags) in sections {
             name16(&mut out, sect);
             name16(&mut out, name);
-            u64le(&mut out, addr);
-            u64le(&mut out, size);
+            out.put_u64(addr);
+            out.put_u64(size);
             for value in [0, 4, 0, 0, flags, 0, 0, 0] {
-                u32le(&mut out, value);
+                out.put_u32(value);
             }
         }
         out
@@ -564,10 +543,10 @@ mod tests {
     fn dylib_command(cmd: u32, path: &str) -> Vec<u8> {
         let size = (24 + path.len() + 1).next_multiple_of(8);
         let mut out = Vec::new();
-        u32le(&mut out, cmd);
-        u32le(&mut out, size as u32);
+        out.put_u32(cmd);
+        out.put_u32(size as u32);
         for value in [24, 2, 0x10000, 0x10000] {
-            u32le(&mut out, value);
+            out.put_u32(value);
         }
         out.extend_from_slice(path.as_bytes());
         out.resize(size, 0);
@@ -576,20 +555,20 @@ mod tests {
 
     fn dyld_info(export_off: u32, export_size: u32) -> Vec<u8> {
         let mut out = Vec::new();
-        u32le(&mut out, macho::LC_DYLD_INFO_ONLY);
-        u32le(&mut out, 48);
+        out.put_u32(macho::LC_DYLD_INFO_ONLY);
+        out.put_u32(48);
         for _ in 0..8 {
-            u32le(&mut out, 0);
+            out.put_u32(0);
         }
-        u32le(&mut out, export_off);
-        u32le(&mut out, export_size);
+        out.put_u32(export_off);
+        out.put_u32(export_size);
         out
     }
 
     fn symtab_command(symoff: u32, nsyms: u32, stroff: u32, strsize: u32) -> Vec<u8> {
         let mut out = Vec::new();
         for value in [macho::LC_SYMTAB, 24, symoff, nsyms, stroff, strsize] {
-            u32le(&mut out, value);
+            out.put_u32(value);
         }
         out
     }
@@ -601,14 +580,14 @@ mod tests {
         let offset = (32 + sizeofcmds).next_multiple_of(8);
         let commands = commands(offset as u32);
         let mut out = Vec::new();
-        u32le(&mut out, macho::MH_MAGIC_64);
-        u32le(&mut out, cpu);
-        u32le(&mut out, 0);
-        u32le(&mut out, macho::MH_DYLIB);
-        u32le(&mut out, commands.len() as u32);
-        u32le(&mut out, sizeofcmds as u32);
-        u32le(&mut out, 0);
-        u32le(&mut out, 0);
+        out.put_u32(macho::MH_MAGIC_64);
+        out.put_u32(cpu);
+        out.put_u32(0);
+        out.put_u32(macho::MH_DYLIB);
+        out.put_u32(commands.len() as u32);
+        out.put_u32(sizeofcmds as u32);
+        out.put_u32(0);
+        out.put_u32(0);
         for command in commands {
             out.extend_from_slice(&command);
         }
@@ -810,7 +789,7 @@ mod tests {
                 commands.push(dylib_command(macho::LC_ID_DYLIB, "/usr/lib/libfoo.dylib"));
                 let mut trie = Vec::new();
                 for value in [macho::LC_DYLD_EXPORTS_TRIE, 16, tail, size] {
-                    u32le(&mut trie, value);
+                    trie.put_u32(value);
                 }
                 commands.push(trie);
                 commands
@@ -880,10 +859,10 @@ mod tests {
         let mut strings = vec![0u8];
         let mut table = Vec::new();
         for (name, n_type, n_sect, n_desc, value) in symbols {
-            u32le(&mut table, strings.len() as u32);
+            table.put_u32(strings.len() as u32);
             table.extend_from_slice(&[n_type, n_sect]);
             table.extend_from_slice(&n_desc.to_le_bytes());
-            u64le(&mut table, value);
+            table.put_u64(value);
             strings.extend_from_slice(name.as_bytes());
             strings.push(0);
         }
@@ -1003,17 +982,6 @@ mod tests {
         assert!(Sections::new(&overlapping).sorted.is_none());
         let high = [Section { addr: u64::MAX - 1, size: 4, flags: 0 }, Section { addr: 0, size: 4, flags: 0 }];
         assert!(Sections::new(&high).find(u64::MAX).is_some());
-    }
-
-    #[test]
-    fn uleb_limits() {
-        let mut max = Vec::new();
-        blaze_format::leb::write_u64(&mut max, u64::MAX);
-        let mut at = 0;
-        assert_eq!(uleb(&max, &mut at).unwrap(), u64::MAX);
-        assert_eq!(at, max.len());
-        let over = [0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
-        assert!(uleb(&over, &mut 0).unwrap_err().contains("too long"));
     }
 
     /// Reading a library allocates its install name, its one re-export and their list, the

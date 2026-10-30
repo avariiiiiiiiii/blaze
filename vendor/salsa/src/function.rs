@@ -63,6 +63,11 @@ pub unsafe trait Configuration: Any {
     const LOCATION: crate::ingredient::Location;
     const PERSIST: bool;
 
+    /// The subsystem a run of this function counts against: each run of its code (an
+    /// execution, a fixpoint iteration, its cycle functions) is a `blaze_mem::frame::task` of
+    /// this tag. Set with `#[salsa::tracked(mem_tag = Infer)]`.
+    const MEM_TAG: blaze_mem::Tag = blaze_mem::Tag::Query;
+
     /// The database that this function is associated with.
     type DbView: ?Sized + crate::Database;
 

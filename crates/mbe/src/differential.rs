@@ -53,20 +53,22 @@ fn assert_same(
     mac: &DeclarativeMacro,
     input: &tt::TopSubtree,
     marked: bool,
-    what: &dyn Fn() -> String,
+    what: &impl Fn() -> String,
 ) -> Vec<tt::TopSubtree> {
     let call_site = call_site();
     let mut expansions = Vec::new();
     assert_same_parses(db, input, &|| format!("{}\nthe input", what()));
     for style in STYLES {
-        let new = expander::expand_rules(db, &mac.rules, input, |_| (), style, call_site);
+        let new = expander::expand_rules(db, &mac.rules, input, |_| (), style, call_site)
+            .map(|(tree, arm, _)| (tree, arm));
         let old = expander::model::expand_rules(db, &mac.rules, input, |_| (), style, call_site);
         assert_eq!(new, old, "{}\nstyle: {style:?}", what());
         assert_same_parses(db, &new.value.0, &|| format!("{}\nstyle: {style:?}", what()));
         expansions.push(new.value.0);
         if marked {
             let marker = |span: &mut Span| span.range = TextRange::empty(TextSize::from(7));
-            let new = expander::expand_rules(db, &mac.rules, input, marker, style, call_site);
+            let new = expander::expand_rules(db, &mac.rules, input, marker, style, call_site)
+                .map(|(tree, arm, _)| (tree, arm));
             let old = expander::model::expand_rules(db, &mac.rules, input, marker, style, call_site);
             assert_eq!(new, old, "{}\nstyle: {style:?}, marked", what());
         }
@@ -94,7 +96,7 @@ fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
 /// columns and through the one the old cursor conversion made, and asserts the trees, their
 /// errors and their span maps are the same, and so are the inputs, as a parser's and as a
 /// matcher's.
-fn assert_same_parses(db: &Db, tt: &tt::TopSubtree, what: &dyn Fn() -> String) {
+fn assert_same_parses(db: &Db, tt: &tt::TopSubtree, what: &impl Fn() -> String) {
     use syntax_bridge::reference;
     let mut edition = |ctx: SyntaxContext| ctx.edition(db);
     for view in [tt.view().strip_invisible(), tt.token_trees(), tt.view().as_token_trees()] {
@@ -113,8 +115,9 @@ fn assert_same_parses(db: &Db, tt: &tt::TopSubtree, what: &dyn Fn() -> String) {
     }
     for idx in 0..TOP_ENTRY_POINTS {
         let new = caught(|| {
+            let view = tt.view();
             let (parse, map) =
-                syntax_bridge::token_tree_to_syntax_node(tt, top_entry_point(idx), &mut edition);
+                syntax_bridge::token_tree_to_syntax_node(view, top_entry_point(idx), &mut edition);
             (parse.debug_dump(), map)
         });
         let old = caught(|| {
@@ -149,7 +152,7 @@ fn entry_point(idx: usize) -> parser::PrefixEntryPoint {
 fn assert_same_fragments(
     db: &Db,
     input: &tt::TopSubtree,
-    what: &dyn Fn() -> String,
+    what: &impl Fn() -> String,
 ) {
     let delim_span = input.top_subtree().delimiter.delim_span();
     for idx in 0..ENTRY_POINTS {

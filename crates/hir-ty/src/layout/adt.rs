@@ -10,13 +10,13 @@ use rustc_abi::{
 };
 use rustc_index::IndexVec;
 use blaze_hashcons::Interned;
-use smallvec::SmallVec;
+use blaze_mem::Frame;
 
 use crate::{
     db::HirDatabase,
     layout::{
-        FIELDS_INLINE, InternedLayout, Layout, LayoutCx, LayoutError, RustcEnumVariantIdx,
-        RustcFieldIdx, enum_variant_ids, intern_layout, struct_flags, struct_tail_may_be_unsized,
+        InternedLayout, Layout, LayoutCx, LayoutError, RustcEnumVariantIdx, RustcFieldIdx,
+        enum_variant_ids, intern_layout, struct_flags, struct_tail_may_be_unsized,
         variant_field_ids,
     },
     next_solver::{DbInterner, GenericArgs, StoredGenericArgs},
@@ -24,12 +24,22 @@ use crate::{
     traits::StoredParamEnvAndCrate,
 };
 
-#[salsa::tracked(cycle_result = layout_of_adt_cycle_result, returns(clone))]
+#[salsa::tracked(cycle_result = layout_of_adt_cycle_result, returns(clone), mem_tag = Infer)]
 pub fn layout_of_adt_query(
     db: &Db,
     def: AdtId,
     args: StoredGenericArgs,
     trait_env: StoredParamEnvAndCrate,
+) -> Result<Interned<'static, InternedLayout>, LayoutError> {
+    blaze_mem::frame::current(|frame| layout_of_adt_in(db, def, args, trait_env, frame))
+}
+
+fn layout_of_adt_in(
+    db: &Db,
+    def: AdtId,
+    args: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+    frame: &Frame,
 ) -> Result<Interned<'static, InternedLayout>, LayoutError> {
     let krate = trait_env.krate;
     let Ok(target) = db.target_data_layout(krate) else {
@@ -41,9 +51,14 @@ pub fn layout_of_adt_query(
     let dl = target;
     let cx = LayoutCx::new(dl);
     let args = args.as_ref();
+    let variant_count = match def {
+        AdtId::StructId(_) | AdtId::UnionId(_) => 1,
+        AdtId::EnumId(e) => enum_variant_ids(db, e).len(),
+    };
     // Every variant's field layouts in one buffer, variant `i` at `fields[ends[i - 1]..ends[i]]`.
-    let mut fields = SmallVec::<[&Layout; FIELDS_INLINE]>::new();
-    let mut ends = SmallVec::<[u32; FIELDS_INLINE]>::new();
+    // `ends` is made at its size first, so that `fields`, the frame's last block, grows in place.
+    let mut ends = Vec::with_capacity_in(variant_count, frame);
+    let mut fields = Vec::new_in(frame);
     let mut push_variant = |variant: VariantId| -> Result<(), LayoutError> {
         variant_field_layouts(db, variant, args, &trait_env, &mut fields)?;
         ends.push(fields.len() as u32);
@@ -133,7 +148,7 @@ fn variant_field_layouts<'db>(
     variant: VariantId,
     args: GenericArgs<'db>,
     trait_env: &StoredParamEnvAndCrate,
-    out: &mut SmallVec<[&'static Layout; FIELDS_INLINE]>,
+    out: &mut Vec<&'static Layout, &Frame>,
 ) -> Result<(), LayoutError> {
     let interner = DbInterner::new_no_crate(db);
     let types = db.field_types(variant);
@@ -141,6 +156,7 @@ fn variant_field_layouts<'db>(
     out.reserve(ids.len());
     for &fd in ids {
         let ty = types[fd].ty().instantiate(interner, args).skip_norm_wip();
+        // clone: the env is two `u32` handles
         out.push(super::field_layout(db, ty.store(), trait_env.clone())?);
     }
     Ok(())
@@ -157,6 +173,7 @@ fn variants_of<'a, 'b>(
     let mut start = 0;
     for &end in ends {
         let end = end as usize;
+        // alloc: the calculator takes an owned `IndexVec` per variant (R-abi lifts this)
         variants.push(refs[start..end].iter().collect());
         start = end;
     }
@@ -231,10 +248,7 @@ mod tests {
         variants: &[Vec<&Layout>],
         layout: impl FnOnce(&Variants<'_, '_>) -> Result<Layout, LayoutError>,
     ) -> Result<Layout, LayoutError> {
-        let variants = variants
-            .iter()
-            .map(|it| it.to_vec())
-            .collect::<SmallVec<[_; 1]>>();
+        let variants = variants.iter().map(|it| it.to_vec()).collect::<Vec<_>>();
         let variants = variants.iter().map(|it| it.iter().collect()).collect::<IndexVec<_, _>>();
         layout(&variants)
     }
@@ -243,13 +257,15 @@ mod tests {
         variants: &[Vec<&Layout>],
         layout: impl FnOnce(&Variants<'_, '_>) -> Result<Layout, LayoutError>,
     ) -> Result<Layout, LayoutError> {
-        let mut fields = SmallVec::<[&Layout; FIELDS_INLINE]>::new();
-        let mut ends = SmallVec::<[u32; FIELDS_INLINE]>::new();
-        for variant in variants {
-            fields.extend(variant.iter().copied());
-            ends.push(fields.len() as u32);
-        }
-        layout(&variants_of(&fields, &ends))
+        blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
+            let mut ends = Vec::with_capacity_in(variants.len(), frame);
+            let mut fields = Vec::new_in(frame);
+            for variant in variants {
+                fields.extend(variant.iter().copied());
+                ends.push(fields.len() as u32);
+            }
+            layout(&variants_of(&fields, &ends))
+        })
     }
 
     #[test]

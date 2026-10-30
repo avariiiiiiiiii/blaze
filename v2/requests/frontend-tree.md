@@ -145,6 +145,10 @@ From `dedup-codec-rng` (report `/tmp/blaze-lanes/v2-dedup-codec-rng.md`). `blaze
 > frontend-tree (2026-10-29): `span` is now frontend-tree's. Child `frontend-tree-span` applies
 > this.
 
+> frontend-tree-span (2026-10-29): applied as written in `ast_id.rs`' tests: `next` gone,
+> `use blaze_ids::rng::SplitMix64;`, `SplitMix64::new(1)`/`new(2)`, `rng.below(len as u64 / 2 + 1)`,
+> `kinds[rng.index(kinds.len())]`, `rng.below(4)`. Same streams.
+
 ## dedup: seeded RNG onto blaze_ids::rng
 
 From `dedup-codec-rng-front` (report `/tmp/blaze-lanes/v2-dedup-codec-rng-front.md`). Every seeded test RNG in the front-end crates moves onto `blaze_ids::rng::SplitMix64` (`new`, `next_u64`, `next_u32`, `below(u64)` = `% n` and 0 for 0, `index(usize)`, `one_in`, `coin`, `pick`, `fill`); no test here pins a stream's values, only thresholds, so the local copy goes. The crate already depends on `blaze-ids`.
@@ -188,3 +192,243 @@ number per element, or a range set), tell me and I will move it.
 > `FxHashSet<NodeId>` and `FxHashMap<NodeId, ..>`. hir-expand's `cfg_process` produces those
 > sets from attributes it finds on views; that side is db-expand's.
 > forwarded to frontend-tree (from requests, pass 17; told by tmux).
+
+## frontend-tree-move-diag-lower: `Typed` for `Either` (crates/syntax `src/view.rs`)
+
+`hir`'s diagnostics keep `InFile<AstPtr<Either<ast::Expr, ast::Pat>>>` (and `Either<GenericArgList,
+NameRef>`, `Either<RecordExprField, RecordPatField>`, `Either<RecordExpr, RecordPat>`, ...) as ids;
+`AstPtr::to_view` needs `N: Typed`, which `Either` lacks. `AstNode<'t>` for `Either` is already there.
+
+File `crates/syntax/src/view.rs`, old:
+
+```rust
+pub trait Typed {
+    type Of<'t>: AstNode<'t>;
+}
+```
+
+new:
+
+```rust
+pub trait Typed {
+    type Of<'t>: AstNode<'t>;
+}
+
+impl<L: Typed, R: Typed> Typed for Either<L, R> {
+    type Of<'t> = Either<L::Of<'t>, R::Of<'t>>;
+}
+```
+
+Why: every `AstPtr<Either<..>>` a diagnostic carries is viewed with `to_view(root)`.
+
+> forwarded to frontend-tree (frontend-tree-next1 told by tmux; requests, pass 23).
+
+## frontend-tree-move-expand: `Typed` for `ast::Macro`, and `Arc` in `view.rs` (crates/syntax `src/view.rs`)
+
+Needs nothing first. (`Typed` for `Either` is diag-lower's heading above; hir-expand's twins
+need it too.)
+
+1. File `crates/syntax/src/view.rs`. Old:
+
+   ```rust
+   pub trait Typed {
+       type Of<'t>: AstNode<'t>;
+   }
+   ```
+
+   New:
+
+   ```rust
+   pub trait Typed {
+       type Of<'t>: AstNode<'t>;
+   }
+
+   impl Typed for crate::ast::Macro {
+       type Of<'t> = Macro<'t>;
+   }
+   ```
+
+   Why: `AstId<ast::Macro>` (every macro definition: `MacroDefKind`, `decl_macro_expander`) is
+   hand-written in `ast/node_ext.rs`, so the generator gave it no `Typed`, and
+   `AstId::<ast::Macro>::to_view(db)` needs one. `view::Macro<'t>` (`view/node_ext.rs`) is its
+   `AstNode<'t>` twin.
+
+2. File `crates/syntax/src/view.rs`. Old:
+
+   ```rust
+   use std::marker::PhantomData;
+   ```
+
+   New:
+
+   ```rust
+   use std::{marker::PhantomData, sync::Arc};
+   ```
+
+   Why: `pub fn root<'t, N: AstNode<'t>>(tree: &'t Arc<FlatTree>)` (L189) names `Arc`, which
+   nothing in the file imports.
+
+> forwarded to frontend-tree (`crates/syntax`; frontend-tree-next1); told by tmux (requests, pass 25).
+
+## frontend-tree-move-def-sigs: `Node::subtree_without` (crates/syntax-tree `src/view.rs`)
+
+Needs nothing first. hir-def's `signatures.rs` copies a file's outline and each item's signature
+tree with `SyntaxNode::clone_subtree_without(&[SyntaxNode])`; on views it needs the same copy, and
+`FlatTree::subtree_without` is `pub(crate)`.
+
+File `crates/syntax-tree/src/view.rs`. Old:
+
+```rust
+    /// An independent copy of this node's subtree: a tree of its own whose text starts at 0,
+    /// its lazy nodes lazy.
+    pub fn subtree(self) -> FlatTree {
+        self.tree.subtree(self.at)
+    }
+}
+```
+
+New:
+
+```rust
+    /// An independent copy of this node's subtree: a tree of its own whose text starts at 0,
+    /// its lazy nodes lazy.
+    pub fn subtree(self) -> FlatTree {
+        self.tree.subtree(self.at)
+    }
+
+    /// [`Self::subtree`] with the nodes `elided` under this one, ascending and disjoint, each
+    /// replaced by an empty node of its kind ([`FlatTree::subtree_without`]): the cursors'
+    /// `clone_subtree_without`. They must be in the tree this node's children are in (its
+    /// part's, for a lazy node).
+    pub fn subtree_without(self, elided: &[Node<'t, L>]) -> FlatTree {
+        if elided.is_empty() {
+            return self.subtree();
+        }
+        let (place, at) = self.inner();
+        let numbers = elided.iter().map(|node| {
+            assert!(
+                std::ptr::eq(node.tree, place.tree),
+                "the elided {:?} at {:?} is not in the flat tree of the {:?} it is cut from",
+                node.kind(),
+                node.text_range(),
+                self.kind(),
+            );
+            node.at
+        });
+        // alloc: the elided nodes' numbers, once per copy
+        let numbers: Vec<u32> = numbers.collect();
+        place.tree.subtree_without(at, &numbers)
+    }
+}
+```
+
+Why: the outline and signature trees are made from views (`tree-move-def-sigs.md`), with the
+same copy the cursors make: the same `inner` step into a lazy node's part, the same assertion,
+the same `FlatTree::subtree_without`. A test beside `a_cursor_clones_a_subtree_without_nodes`
+(same trees and lists) can check `Node::subtree_without` equals the cursor's
+`clone_subtree_without` tree for tree.
+
+> forwarded to frontend-tree (`crates/syntax-tree`; frontend-tree-next1); told by tmux (requests, pass 25).
+
+## frontend-tokens: `UnsafeBinderCastExpr` in the grammar and its view (db-expand.md, `builtin # wrap_binder`, item 1)
+
+The parser half of `v2/requests/db-expand.md` "`builtin # wrap_binder` / `builtin # unwrap_binder`"
+item 1 is in `crates/parser` (frontend-tokens, 2026-10-29, not built):
+- `SyntaxKind::UNSAFE_BINDER_CAST_EXPR` and the contextual keywords `WRAP_BINDER_KW`
+  (`wrap_binder`) and `UNWRAP_BINDER_KW` (`unwrap_binder`), with `T![wrap_binder]` and
+  `T![unwrap_binder]`. All three are added by hand at the end of the enum in
+  `syntax_kind/generated.rs`, just before `__LAST`, so no other kind changes its number.
+  hir-def's persisted source map and span's AST id map store kinds as numbers. If the grammar
+  codegen is ever rerun, it would put them in alphabetical order and renumber the kinds after
+  them, and those persisted formats would need their encodings bumped.
+- `builtin_expr` (`grammar/expressions/atom.rs`) parses `builtin # wrap_binder ( expr )`,
+  `builtin # wrap_binder ( expr , type )` and the same with `unwrap_binder`, as rustc's
+  `parse_expr_unsafe_binder_cast` does: no trailing comma. The node holds `BUILTIN_KW`, `#`, the
+  keyword, `(`, the expression, optionally `,` and the type, and `)`.
+- The inline test `unsafe_binder_cast` (its `.rs`, `.rast` and runner entry, written by hand).
+
+What's left is `crates/syntax`, which is yours:
+- `rust.ungram`: `| UnsafeBinderCastExpr` in `Expr`, and
+  `UnsafeBinderCastExpr = AnyAttr* 'builtin' '#' ('wrap_binder' | 'unwrap_binder') '(' Expr (',' Type)? ')'`.
+- `ast/generated/nodes.rs` and `view/generated/nodes.rs`: the node with `expr()`, `ty()`,
+  `wrap_binder_token()` and `unwrap_binder_token()`, its `Expr::UnsafeBinderCastExpr` variant,
+  and both `can_cast` lists. Plus the view accessor db-expand asks for: `is_wrap()`, which is
+  true when the keyword is `wrap_binder`. `tests/view/accessors.rs` gets its row if that file
+  is generated.
+- Every exhaustive match on `ast::Expr` or `view::Expr` then needs an arm. Lowering is
+  mem-format's item 2 (`Expr::UnsafeBinderCast`), which waits on this.
+
+Status: open
+
+> forwarded to frontend-tree (the `syntax::view` accessor; frontend-tree-next1) and mem-format (item 2, the hir-def store); told by tmux (requests, pass 26).
+
+## dedup: `syntax::view::written_range` and `Expr::peel_parens` (from dedup-sim-diag, 2026-10-29)
+
+From `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`). Two
+syntax-only helpers are written over and over above `syntax`; one copy of each belongs here.
+The callers' edits are in `v2/requests/{diagnostics,db,codegen,coordinator}.md` under
+`## dedup: callers of syntax::view::written_range and Expr::peel_parens`.
+
+### 1. `crates/syntax/src/view.rs`: where rustc's span of an item starts
+
+Four copies of "from the first child that is not an attribute, a doc comment or trivia":
+`blaze-diagnostics/src/cx.rs` `item_range`, `blaze-lints/src/check.rs` `item_range`,
+`hir-expand/src/builtin/fn_macro.rs` `written_range`, `hir-ty-mir/src/mir/location.rs`
+`written_range`; two walk handles, two views. (`DOC_COMMENT` is a node kind, so the copies
+that test it on nodes only and those that test it on every child agree.) The rule over the
+children's kinds and ranges serves both trees; the view form is the one new code calls.
+
+Add `TextRange` to `use crate::{..}` and, after `pub fn ptr`:
+
+```rust
+/// rustc's span of an item or a macro call, which leaves out the attributes, doc comments and
+/// comments on top of it: from the first of `children` (a node's children, in order, as their
+/// kinds and ranges) that is none of those, to the end of `range`, the node's own.
+pub fn written_range_of(range: TextRange, children: impl IntoIterator<Item = (SyntaxKind, TextRange)>) -> TextRange {
+    let start = children
+        .into_iter()
+        .find(|&(kind, _)| !matches!(kind, SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT) && !kind.is_trivia())
+        .map_or(range.start(), |(_, it)| it.start());
+    TextRange::new(start, range.end())
+}
+
+/// [`written_range_of`] of `node`.
+#[inline]
+pub fn written_range(node: Node<'_>) -> TextRange {
+    written_range_of(node.text_range(), node.children_with_tokens().map(|it| (it.kind(), it.text_range())))
+}
+```
+
+Tests (`view/tests.rs`): `/// d\n#[a]\n// c\npub fn f() {}` gives the range from `pub`; a node of
+attributes only gives its own range; and for every node of `ast/tests`'s sample files,
+`written_range(view)` equals `written_range_of` over the handle's `children_with_tokens()`.
+
+### 2. `crates/syntax/src/view/expr_ext.rs`: `peel_parens`
+
+Six copies in `blaze-lints` (`needless_borrow.rs` and `byte_char_slices.rs` and
+`useless_borrows_in_formatting.rs` `strip_parens`, `needless_borrows_for_generic_args.rs`,
+`collapsible_if.rs` and `multiple_unsafe_ops_per_block.rs` `peel_parens`), all on views, and two
+in `blaze-diagnostics` on handles (`lints/syntax/delims.rs` `peel_parens`,
+`lints/names/dead/mark.rs` `unparen`). In `impl<'t> ast::Expr<'t>`, after `is_block_like`:
+
+```rust
+    /// The expression inside every pair of parentheses around `self` (rustc's `peel_parens`:
+    /// HIR has no parentheses); `self` when it is not parenthesized, or a `()` holds nothing.
+    pub fn peel_parens(self) -> ast::Expr<'t> {
+        let mut expr = self;
+        while let ast::Expr::ParenExpr(paren) = expr
+            && let Some(inner) = paren.expr()
+        {
+            expr = inner;
+        }
+        expr
+    }
+```
+
+Test: `((a))` peels to `a`, `(a).b` stays a field expression, `()` stays a tuple.
+
+When frontend-tree's moves reach `blaze-diagnostics/src/lints/syntax/delims.rs` and
+`lints/names/dead/mark.rs` (frontend-tree-move-diag-lints-delims, -names), their handle copies
+go and the callers write `expr.peel_parens()`.
+
+> forwarded to frontend-tree (`crates/syntax`; frontend-tree-next1); told by tmux (requests, pass 29).

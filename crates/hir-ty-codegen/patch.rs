@@ -1608,7 +1608,8 @@ impl Base {
                 Ok(_) => {
                     let mark = Mark::of_root(db, root, self.debug);
                     self.marks.push(mark.expect("a root that compiles has a mark"));
-                    self.compiled.push((root, symbol));
+                    // alloc: the patch's base keeps it
+                    self.compiled.push((root, symbol.as_str().to_owned()));
                     self.crates.push(root.krate(db));
                     self.files.push(body_file(db, root.into()));
                 }
@@ -1628,7 +1629,8 @@ impl Base {
                 Mark::new(db, static_serial(db, id), &it.requests)
             });
             let known = BaseStatic {
-                symbol: symbols.static_(id).unwrap_or_default(),
+                // alloc: the patch's base keeps it
+                symbol: symbols.static_(id).map_or_else(String::new, |it| it.as_str().to_owned()),
                 writable: compiled.is_some_and(|it| it.writable),
                 mark,
                 krate: id.krate(db),
@@ -1818,7 +1820,8 @@ impl Base {
                 Some(symbol) => {
                     let known = BaseInstance {
                         env: env.clone(),
-                        symbol,
+                        // alloc: the patch's base keeps it
+                        symbol: symbol.as_str().to_owned(),
                         mark,
                         forwarded: false,
                         files: Some(Box::new([file])),

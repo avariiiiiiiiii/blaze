@@ -44,6 +44,33 @@ pub struct Output {
     /// PE: `#![windows_subsystem = "windows"]`, a GUI program with no console (rustc's
     /// `/SUBSYSTEM:WINDOWS`). Other formats have no subsystem.
     pub windows_subsystem: bool,
+    /// A dev executable whose start hook overlays its code with blaze's code memory
+    /// (`blaze_inproc`); `None` for every other image (`blaze build`, release, shared images).
+    pub dev_run: Option<DevRun>,
+    /// The target triple the image is for, as [`crate::target::output`] was given it: what
+    /// tells apart targets of one format and arch (`wasm32-wasip1` from
+    /// `wasm32-unknown-unknown`, `-gnu` from `-musl`), whose C runtimes differ.
+    pub triple: String,
+}
+
+/// A dev executable (`blaze run`, `blaze test`): its start hook, `blaze_inproc_start`, swaps its
+/// code segments for views of the daemon's code memory and maps the reservations, so:
+///
+/// - a pointer to `blaze_inproc_start` is the first initializer (ELF `.preinit_array`, Mach-O
+///   `__mod_init_func`, a PE TLS callback in `.CRT$XLAB`), rooted against section GC;
+/// - each code segment starts on a page in the file and in memory, shares no page, is never
+///   writable and is all in the file; PE's code sections are one run from a 64 KiB RVA, the
+///   next section on the next 64 KiB RVA;
+/// - no load-time write lands in code (no text relocations, no PE base relocation into code,
+///   ELF `DF_BIND_NOW`), so the code memory's bytes are the file's at every load address;
+/// - Mach-O is signed ad hoc without the hardened runtime; PE has no CFG.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DevRun {
+    /// The reserved address ranges, after the image's other segments in this order, each
+    /// page-aligned with no access and no file bytes; 0 is none.
+    pub arena: u64,
+    pub cells: u64,
+    pub fixed: u64,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

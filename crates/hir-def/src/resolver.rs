@@ -52,7 +52,7 @@ thread_local! {
 }
 
 /// A stack of [`Scope`]s over the scope of a module. A body walk keeps one: entering an
-/// expression pushes its scopes onto the same `Vec` and leaving truncates it
+/// expression pushes its scopes onto the same stack and leaving truncates it
 /// ([`Resolver::update_to_inner_scope`], [`Resolver::reset_to_guard`]), so a walk allocates
 /// only when the stack grows past its deepest point so far.
 #[derive(Debug, Clone)]
@@ -61,7 +61,7 @@ pub struct Resolver<'db> {
     ///
     /// When using, you generally want to process the scopes in reverse order,
     /// there's `scopes` *method* for that.
-    scopes: Vec<Scope<'db>>,
+    scopes: SmallVec<[Scope<'db>; 8]>,
     /// The expression scopes that [`Scope::ExprScope`] and [`Scope::MacroDefScope`] index: one
     /// per expression store the stack has held, so one in practice, kept inline.
     expr_stores: SmallVec<[ExprStore<'db>; 1]>,
@@ -217,7 +217,7 @@ impl<'db> Resolver<'db> {
     pub fn resolve_path_in_type_ns(
         &self,
         db: &Db,
-        path: &Path,
+        path: Path<'_>,
     ) -> Option<(TypeNs, Option<usize>, Option<ImportOrExternCrate>)> {
         self.resolve_path_in_type_ns_with_prefix_info(db, path).map(
             |(resolution, remaining_segments, import, _, _)| {
@@ -235,7 +235,7 @@ impl<'db> Resolver<'db> {
     pub fn resolve_path_in_type_ns_with_prefix_info(
         &self,
         db: &Db,
-        path: &Path,
+        path: Path<'_>,
     ) -> Option<(
         TypeNs,
         Option<usize>,
@@ -245,9 +245,9 @@ impl<'db> Resolver<'db> {
     )> {
         let path = match path {
             Path::BarePath(mod_path) => mod_path,
-            Path::Normal(it) => &it.mod_path,
+            Path::Normal(it) => it.mod_path,
             Path::LangItem(l, seg) => {
-                let type_ns = match *l {
+                let type_ns = match l {
                     LangItemTarget::UnionId(it) => TypeNs::AdtId(it.into()),
                     LangItemTarget::TypeAliasId(it) => TypeNs::TypeAliasId(it),
                     LangItemTarget::StructId(it) => TypeNs::AdtId(it.into()),
@@ -347,7 +347,7 @@ impl<'db> Resolver<'db> {
     pub fn resolve_path_in_type_ns_fully(
         &self,
         db: &Db,
-        path: &Path,
+        path: Path<'_>,
     ) -> Option<TypeNs> {
         let (res, unresolved, _) = self.resolve_path_in_type_ns(db, path)?;
         if unresolved.is_some() {
@@ -385,7 +385,7 @@ impl<'db> Resolver<'db> {
     pub fn resolve_path_in_value_ns(
         &self,
         db: &Db,
-        path: &Path,
+        path: Path<'_>,
         hygiene_id: HygieneId,
     ) -> Option<ResolveValueResult> {
         self.resolve_path_in_value_ns_with_prefix_info(db, path, hygiene_id).map(|(it, _, _)| it)
@@ -405,15 +405,15 @@ impl<'db> Resolver<'db> {
     pub fn resolve_path_in_value_ns_with_prefix_info(
         &self,
         db: &Db,
-        path: &Path,
+        path: Path<'_>,
         mut hygiene_id: HygieneId,
     ) -> Option<(ResolveValueResult, ResolvePathResultPrefixInfo, Visibility)> {
         let path = match path {
             Path::BarePath(mod_path) => mod_path,
-            Path::Normal(it) => &it.mod_path,
+            Path::Normal(it) => it.mod_path,
             Path::LangItem(l, None) => {
                 return Some((
-                    ResolveValueResult::ValueNs(match *l {
+                    ResolveValueResult::ValueNs(match l {
                         LangItemTarget::FunctionId(it) => ValueNs::FunctionId(it),
                         LangItemTarget::StaticId(it) => ValueNs::StaticId(it),
                         LangItemTarget::StructId(it) => ValueNs::StructId(it),
@@ -431,7 +431,7 @@ impl<'db> Resolver<'db> {
                 ));
             }
             Path::LangItem(l, Some(_)) => {
-                let type_ns = match *l {
+                let type_ns = match l {
                     LangItemTarget::UnionId(it) => TypeNs::AdtId(it.into()),
                     LangItemTarget::TypeAliasId(it) => TypeNs::TypeAliasId(it),
                     LangItemTarget::StructId(it) => TypeNs::AdtId(it.into()),
@@ -597,7 +597,7 @@ impl<'db> Resolver<'db> {
     pub fn resolve_path_in_value_ns_fully(
         &self,
         db: &Db,
-        path: &Path,
+        path: Path<'_>,
         hygiene: HygieneId,
     ) -> Option<ValueNs> {
         match self.resolve_path_in_value_ns(db, path, hygiene)? {
@@ -644,14 +644,14 @@ impl<'db> Resolver<'db> {
     pub fn record_path_uses(
         &self,
         db: &Db,
-        path: &Path,
+        path: Path<'_>,
         ns: Namespace,
         hygiene: HygieneId,
         out: &mut Vec<Use>,
     ) {
         let mod_path = match path {
             Path::BarePath(it) => it,
-            Path::Normal(it) => &it.mod_path,
+            Path::Normal(it) => it.mod_path,
             Path::LangItem(..) => return,
         };
         let in_items = match ns {
@@ -736,7 +736,7 @@ impl<'db> Resolver<'db> {
             Scope::GenericParams { def: GenericDefId::ImplId(impl_), .. } => {
                 let impl_data = ImplSignature::of(db, impl_);
                 impl_data.target_trait.is_some_and(|target| {
-                    self.resolve_path_in_type_ns_fully(db, &impl_data.store[target.path])
+                    self.resolve_path_in_type_ns_fully(db, impl_data.store.path(target.path))
                         == Some(TypeNs::TraitId(trait_))
                 })
             }
@@ -944,7 +944,7 @@ impl<'db> Resolver<'db> {
                     let impl_data = ImplSignature::of(db, impl_);
                     if let Some(target_trait) = impl_data.target_trait
                         && let Some(TypeNs::TraitId(trait_)) = self
-                            .resolve_path_in_type_ns_fully(db, &impl_data.store[target_trait.path])
+                            .resolve_path_in_type_ns_fully(db, impl_data.store.path(target_trait.path))
                     {
                         f(trait_)?;
                     }
@@ -1651,7 +1651,7 @@ impl HasResolver for ModuleId {
         let (mut def_map, local_def_map) = self.local_def_map(db);
         let mut module_id = self;
 
-        let mut scopes = Vec::new();
+        let mut scopes = SmallVec::new();
         if self.block(db).is_some() {
             // Innermost block first, then reversed: the stack holds outer blocks first.
             while let Some(parent) = def_map.parent() {

@@ -202,6 +202,8 @@ Seen while reading, not part of this change: `impl Builder for Jobs` (line 489) 
 `cancel` only, but `blaze_api::build::Builder` also has `speculate` and `promote` (declared
 intent, `v2/requests/ci.md`); it doesn't compile against the trait as it is today.
 
+> forwarded to cargo (cargo-jobs writes the daemon side; told by tmux; requests, pass 23).
+
 ## mem: `Slab::get` on a forged even generation reads an empty slot
 
 `crates/blaze-mem/src/handle.rs`: `Handle::from_bits` says "Any `u64` is a handle; one no slab
@@ -213,3 +215,5 @@ also require `handle.generation & 1 == 1` (or `entry.occupied()`), so the SAFETY
 are issued with odd generations only" holds for every handle, not just issued ones. Until then
 the session guards it itself (`session.rs` `handle` refuses an even generation; the test
 `a_report_or_finish_after_the_finish_is_dropped` sends one).
+
+> forwarded to mem (`crates/blaze-mem/`; mem-next1 told by tmux; requests, pass 23).

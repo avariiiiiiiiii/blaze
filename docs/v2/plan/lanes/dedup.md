@@ -51,4 +51,7 @@ only with each other.
 | `dedup-map` | file mapping |
 | `dedup-intern` | interners, hash-table probe copies |
 | `dedup-macros` | `blaze-expand` against `blaze-macro-wasm`: proc-macro library, lexer, wire, host |
+| `dedup-cursor` | the checked little-endian byte cursor and writer |
+| `dedup-names` | the rustc-symbol path resolver in `blaze-engine` and `blaze-wasm` |
+| `dedup-sim-front`, `dedup-sim-edge`, `dedup-sim-diag` | the semantic duplicate report's cross-crate groups (`tools/similar`), by area |
 | `dedup-scan` | every other copy-paste run (diagnostics against `blaze-lints`, cargo crates against `blaze-units`, edit distance, test databases, code-identity hashing, small helpers) |

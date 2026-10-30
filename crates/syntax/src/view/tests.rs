@@ -220,6 +220,26 @@ fn some<T>(pairs: Vec<T>) -> Vec<T> {
 // region: node_ext
 
 #[test]
+fn either_and_macro_pointers_view_their_nodes() {
+    let f = Fixture::source();
+    type Handle = either::Either<ast::Fn, ast::Struct>;
+    type View<'t> = either::Either<view::Fn<'t>, view::Struct<'t>>;
+    for (h, v) in some(f.nodes::<Handle, View<'_>>()) {
+        let found = crate::AstPtr::new(&h).to_view(f.view());
+        assert_eq!(vn(&found), vn(&v));
+        assert_eq!(found.is_left(), h.is_left());
+    }
+    for (h, v) in some(f.nodes::<ast::Macro, view::Macro<'_>>()) {
+        let found = crate::AstPtr::new(&h).to_view(f.view());
+        assert_eq!(vn(&found), vn(&v));
+        assert_eq!(
+            matches!(found, view::Macro::MacroRules(_)),
+            matches!(h, ast::Macro::MacroRules(_))
+        );
+    }
+}
+
+#[test]
 fn names_and_lifetimes() {
     let f = Fixture::source();
     for (h, v) in some(f.nodes::<ast::Name, view::Name<'_>>()) {

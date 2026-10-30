@@ -32,6 +32,9 @@ dependencies, cfgs, env, flags and outputs (`load.rs`, `load/`). It is a set of 
 blaze-query's database (`Invocation`, `Asking`, `Mounts`, `LoadFile`, `LoadDir`, `ConfigChain`,
 `ManifestQuery`, `WorkspaceQuery`, `Plan`), so its warm cost is the database's: a memo hit in the
 same view is one probe, and in a new view each memo is verified down to its inputs' fingerprints.
+A memo hit allocates nothing: every query's `input` hashes its key in `key_id`'s per-thread
+buffer, held to zero by `a_warm_load_allocates_nothing` (a file hit, a `Plan` hit, a `Plan`
+verified in a new view; the last waits on lane db's borrowed listings).
 
 ### Files and mounts (`load/files.rs`)
 
@@ -68,9 +71,12 @@ seen as no change (an early cutoff for everything downstream).
   should take 12.
 - What closes it: `ManifestQuery` keeps blaze-manifest's parsed `TomlManifest` (its own
   `Persist`) as the value with the canonical bytes as the fingerprint, and the workspace reads
-  that value instead of parsing again. That needs blaze-manifest's types to be persistable,
-  which is request 1 (the manifest crates are not lane cargo's). The config chain is a few
-  files up the directory tree, about 5 `stat`s and one parse each, at the bound already.
+  that value instead of parsing again. That needs blaze-manifest's types to be persistable;
+  the manifest crates are lane cargo's since request 1 (2026-10-29 21:08), and cargo-units
+  owns this change. The config chain is a few
+  files up the directory tree, about 5 `stat`s and one parse each, at the bound already. Its
+  snapshot is moved into the run, not cloned, and a run's snapshot is canonicalized only for
+  the files read raw in it (`files::Used::canonical`), not every file of the snapshot again.
 
 ### Resolve (`load/resolve.rs`)
 
@@ -93,12 +99,17 @@ its manifest; without one, cargo's resolver over the index.
   resolves in one run (test `a_locked_workspace_resolves_in_one_run`). A path dependency outside
   the workspace still costs one run per level of path dependencies, which is rare and bounded by
   their depth.
-- What removes the reruns entirely: blaze-manifest's `Files` taking a lifetime
-  (`Rc<dyn Files + 'a>`) so the step reads through the database on demand, and `Files::read`
-  returning a borrowed slice instead of a new `Vec` (each read copies the file today). Both
-  are requests to request 1's owner.
+- What removes the reruns entirely: blaze-manifest's `Files` is now a type parameter, never
+  `dyn` (dedyn-files), so blaze-units' `Snap` can borrow the step's `Cx` and read through the
+  database on demand, and `Files::read` can return borrowed bytes instead of a new `Vec` (each
+  read copies the file today). Both are cargo-units' now that the manifest crates are lane
+  cargo's.
 - The fastest known technique is cargo's with a lock: the lock is taken as the answer and only
   checked against the manifests. The design matches it.
+- Without a lock, index files are parsed lazily (`load/source/index.rs` `Lines`), as cargo's
+  cached index is (`MaybeIndexSummary::Unparsed`). Each line's version is read without
+  allocating, and the rest of a line is parsed once, only when a query's requirement matches
+  that version. Before, every version of every crate queried was parsed whole.
 
 ### The unit graph and plans (`graph.rs`, `load/units.rs`, `load/plan.rs`)
 
@@ -108,8 +119,11 @@ dependencies, then each unit's plan: env (about 25 variables), cfgs, flags, outp
 - Bound: O(U) with small constants: a unit's env and flags are about 40 short strings, about
   2 to 5 µs each with their allocations, so 0.5 to 1.3 ms at U = 250; the `Plan` value encoded
   once, about 3 KB per unit (750 KB at U = 250, about 1.5 ms at 500 MB/s).
-- As written: at the bound. `plan.rs` keeps the roots in an `FxHashSet` and walks the graph
-  once. The cost that matters is the reader's: the plan is a `Cbor<Planned>` decoded whole by
+- As written: at the bound. The graph's units are rows of `u32`-indexed columns
+  (`graph.rs`), with a unit's identity a small `Copy` key. `plan.rs` keeps the roots as a
+  `Vec<bool>` by unit, and its dependencies and LTO dependencies as CSR (`Csr`). It walks
+  the graph once, computes each package's env, lints and check-cfg once (not per unit), and
+  moves std's plans in rather than cloning them. The cost that matters is the reader's: the plan is a `Cbor<Planned>` decoded whole by
   each job that reads it (the daemon, below), about 2 to 3 ms at U = 250 with an allocation
   per string. The bound for a reader that changed nothing is no decode at all.
 
@@ -119,9 +133,23 @@ Work: cargo tree's graph over the resolve, and its text.
 
 - Bound: O(packages + edges + output bytes); a repeat is one memo hit, since the printed text is
   the query's value.
-- As written: a port of cargo's `tree` graph (node clones, `BTreeSet`s), O(P + E) with
-  allocation per node, well under 1 ms at P = 200. Within 10% of anything a user can notice. It
-  is not on a target path and was left as it is.
+- As written: at the bound.
+  - Packages are interned once to a dense `Pkg(u32)` in `PackageId` order. Nodes are a
+    `u32`-indexed column of 24-byte `Node`s (const-asserted).
+  - Edges are collected flat as 12-byte `Raw`s and laid out as CSR per (node, edge kind).
+    Two stable counting sorts and one pass sort them into cargo's node order and deduplicate
+    them, in O(E + N) with no comparison. cargo's node order is computed once, as a rank per node.
+  - `-p`, `--prune`, `-i` and the members are matched once into bitsets over packages. The
+    walk's "seen" and "on the stack" are bitsets over nodes.
+  - Output goes into one preallocated `String`, written in place, and each package's `{p}`
+    label is written once.
+  - The fastest known technique is DFS over CSR adjacency with bitset visited sets, CSR built
+    by counting sort (the GAP benchmark suite, Ligra, petgraph's `Csr`), and the printed text
+    memoized. blaze-tree matches it.
+  - Past the feature resolve, the graph and walk allocate a fixed number of buffers plus a few
+    per package (test `the_graph_and_walk_allocate_a_fixed_number_of_buffers`). A node's
+    features are written straight into the shared pool (`activated_features_iter`), with no
+    `Vec` per node. A repeat is a memo hit with no allocation.
 
 ## The standard library's graph and target table (`stdlib.rs`, `stdlib/`)
 
@@ -133,11 +161,14 @@ Work: std's own workspace (`library/`) loaded as a foreign workspace (`Foreign`)
   memo keyed by those, verified by the library root's content id. Warm, that is one probe.
   The target table is a lookup, about 1 µs per `target_cfg`.
 - As written: the target table is a 423 KB JSON parsed on first use in each process, about
-  1 ms once in the daemon's life (well inside its 1 s start). A table built into the binary
-  would make it zero and is not worth the build step until `proof` says start matters at the
-  ms level. `StdUnits` decodes `Foreign`'s CBOR and encodes its own: one extra copy of about
-  25 units, tens of µs, once per toolchain and target. Both are within the bound for their
-  paths.
+  1 ms once in the daemon's life (well inside its 1 s start). What closes it is rustc's own
+  design: the table compiled in, a lookup with no parse. `harness/answers.py --write` writes
+  the columns as a Rust file beside `rustc.json`, so no build script is needed (cargo-units'
+  side, with the coordinator's `harness/answers.py`). A lazy serde_json `RawValue` per target
+  was rejected, since it still parses JSON in every process. `StdUnits`' value is `CborBytes<StdPlanned>`: `Foreign`'s bytes passed on once
+  checked, never decoded and encoded again (cargo-units). A `StdUnits` hit and a std key's ID
+  allocate nothing (`a_kept_standard_library_is_read_without_allocating`). Both are within the
+  bound for their paths.
 
 ## The daemon: `blaze-cargo/src/serve*` and `load-cargo` (cargo-sync's; gaps for cargo-sync)
 
@@ -270,7 +301,12 @@ Work: cargo's arguments into the request; the workspace root found by walking up
 - Bound: parsing a few arguments is µs. Finding the root is about 6 to 8 `stat`s (under 10 µs),
   reading the environment and sorting it a few µs, encoding the request (a few KB of CBOR)
   µs, and one connect plus one round trip on a Unix socket (20 to 40 µs). About 50 µs.
-- As written: at the bound for the CLI's own work.
+- As written: at the bound for the CLI's own work. Each step's syscalls: one `stat` per directory
+  on the way up, files read with no `stat` before, and the environment copied once, with no
+  lossy copy of each name. Arguments are matched against cargo's flag tables by a linear scan
+  of `&'static str`, once a request, a few µs. A perfect hash would save under 1 µs.
+- Starting the daemon: a connect is retried every millisecond until it answers, as Bazel's
+  client and buck2's do. That is under 1 ms of a start that takes tens of ms to load the image.
 - What is not at the bound is the process: the CLI runs as the same `blaze` executable as the
   daemon. That executable links the whole front end, the codegen backends, and LLVM statically
   (`inkwell` with `llvm23-1-prefer-static`). Starting it costs the dynamic loader's relocations
@@ -288,11 +324,57 @@ Work: cargo's arguments into the request; the workspace root found by walking up
 Work: the answer's lines (cargo's `Compiling`, `Finished`, diagnostics, or JSON messages)
 written to stdout and stderr.
 
-- Bound: one write per stream per batch; for a no-op, about 2 lines and 1 to 2 writes, a few µs.
-- As written: each line is formatted into one reused `String` and written with one `write_all`
-  (stderr has no buffer, so one system call a line, about 1 µs). A no-op writes 1 or 2 lines; a
-  build writes one `Compiling` line per unit, each far cheaper than the unit's own work. At the
-  bound for every path that has a target.
+- Bound: one write per stream per batch of responses the socket read gave; for a no-op, about
+  2 lines and 1 to 2 writes, a few µs. Zero allocation per response once warm, the decode
+  included, and each unit, package and file found by a dense `u32` index.
+- As written (cargo-cli2, then cargo-cli3 on `blaze-api` `SCHEMA` 14, 2026-10-29):
+  - Writes: a response's lines are held in one buffer for one stream. A line for the other
+    stream writes it first, so stdout and stderr keep the order the lines were made in, and
+    more than 64 KiB is written whatever comes. `cli.rs`'s `drive` flushes only when
+    `Client::call_ref` says no other whole response is already held, so what the daemon sent
+    in one burst is one write per stream: at the bound.
+  - Lookups: a package is found by its dense index in the request (`UnitStarted::package`) in
+    a bitset, and a unit by its own (`UnitOf::id`) in a `u32` column of rows: one load each, no
+    hash and no compare. An index at or past 2^24 is the daemon's mistake, said as an error
+    and the build failed, before a table that long is made. A unit's hot count (`Counted`, 28
+    bytes) is in a column apart from its cold names (`Unit`, 20 bytes), both size asserted.
+    Target kinds, crate types, artifact kinds and applicability are `u8` enums, matched by tag,
+    never by string. rustc's summary lines are told by "no span and no code" before any text
+    is compared. At the bound.
+  - JSON: strings are escaped as serde_json does, with an 8-byte SWAR scan for the bytes to
+    escape (no `unsafe`). Plain runs are copied whole, and the output is byte for byte
+    serde_json's (`json/tests.rs`'s `every_byte_escaped_as_serde_json_wherever_it_falls`). The
+    state of the art is sonic-rs's and simdjson's 16- to 32-byte SIMD scan. SWAR is within 2x
+    of it on long plain strings, and a cargo message is under 1 KB, so the scan is a few
+    hundred ns a message, under the write it goes to. Matching it exactly needs
+    `std::arch` or `memchr` (`unsafe` or a new dependency), which this module avoids.
+  - Source lines: each file a span names is opened once, with no `stat` before. Its text goes
+    into one arena and its line starts into a `u32` column, found by `match_indices('\n')`
+    (core's word-at-a-time memchr). rustc's `analyze_source_file` uses SSE2. Here the read is
+    the bound, since each file is read once per request.
+  - Memory: the client allocates per request, not per response line. The printer's tables are
+    made once, for a few hundred units and a thousand diagnostics. Each unit is moved in from
+    its first response, never cloned. Every message is written into the one buffer through
+    `_into` writers. The source arena grows at the first file read, so a build whose spans name
+    no file maps no buffer. The allocations left are per request (the `--message-format`
+    parse, the `blaze-work` and `blaze-served` lines, the `--reached` results) or for an
+    error. `print/tests.rs`'s `printing_responses_warm_allocates_nothing` and
+    `json/tests.rs`'s `a_compiler_message_warm_allocates_nothing` hold the printer to zero
+    with `blaze-alloc-count`, once blaze-cargo's tests have one counting allocator (request to
+    cargo-inbox, item 1).
+  - The decode: each response is read where it lies in the client's frame buffer
+    (`blaze_api::borrowed::ResponseRef`, through `Client::call_ref`). A diagnostic's strings,
+    spans and unit are `&str`s and lists read in place, so the printer copies each string once,
+    into its line buffer, from the frame. At the bound. What comes at most once a request
+    (`Built`'s artifacts, `Work`) stays owned, and the `--reached` and `--ub` results are made
+    owned (`into_owned`), since libtest's format groups them at the end.
+- Running tests and `run` allocate per test executable (its command line, its shown form, the
+  failure text), which is one spawn's worth of work each: not a gap. `--reached` groups its
+  results by the daemon's dense executable index (`TestResult::executable`), with no hash,
+  using a stable counting sort (CSR: one index column and one start per executable). One text
+  buffer serves every executable: about 6 allocations a request, none per result or per
+  executable. The summary's note naming the tests that ran outside the sandbox
+  (`TestResult::outside`, docs/cargo.md) is one more scan of the results and one line.
 
 ### Running tests (`cli/test/`, `cli/run/`)
 

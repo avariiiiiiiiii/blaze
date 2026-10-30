@@ -12,3 +12,4 @@ mod reachable;
 mod recursion;
 mod types;
 mod unsafety;
+mod unstable_names;

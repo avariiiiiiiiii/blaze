@@ -114,25 +114,7 @@ pub enum Unwind {
     WindowsArm64 { len: u32, codes: Vec<u8> },
 }
 
-/// A DWARF call frame instruction, as `hir-ty-codegen/unwind.rs`'s `FrameRule`: registers
-/// by DWARF number, offsets in bytes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Rule {
-    Cfa(u16, i32),
-    CfaRegister(u16),
-    CfaOffset(i32),
-    Offset(u16, i32),
-    Restore(u16),
-    SameValue(u16),
-    Undefined(u16),
-    RememberState,
-    RestoreState,
-    ArgsSize(u32),
-    /// AArch64's return-address signing state from here (`true`: signed), DWARF's
-    /// `RA_SIGN_STATE` pseudo-register 34 as `ValExpression(34, [DW_OP_lit0 or DW_OP_lit1])`,
-    /// as Cranelift's `Aarch64SetPointerAuth` row writes it.
-    RaSignState(bool),
-}
+pub use blaze_codegen::unwind::FrameRule as Rule;
 
 /// Where stack slots are, for a debugger.
 #[derive(PartialEq, Eq, Debug, Default)]

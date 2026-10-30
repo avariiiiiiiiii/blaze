@@ -85,7 +85,7 @@ fn diff_assoc_items(
     // We keep one map because we want to keep the trait's order.
     let mut trait_items = FxIndexMap::default();
 
-    for i in target_trait.items(db) {
+    for i in target_trait.items_iter(db) {
         match i {
             hir::AssocItem::Function(f) => {
                 let is_required = !f.has_body(db);

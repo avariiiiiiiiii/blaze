@@ -461,7 +461,6 @@ ui!(
 // (`rustc_hir_typeck/src/method/prelude_edition_lints.rs`), for a call that resolves to
 // another trait's `into_iter`; `ShadowedIntoIter` sees `MyIntoIter::into_iter` and is silent.
 #[test]
-#[ignore = "needs typeck's prelude-collision lints (requested in v2/requests/diagnostics.md)"]
 fn array_into_iter_ambiguous() {
     let source = include_str!("desugar/ui/array-into-iter-ambiguous.rs");
     let expected = include_str!("desugar/ui/array-into-iter-ambiguous.stderr");

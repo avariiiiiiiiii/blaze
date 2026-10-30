@@ -3,6 +3,10 @@
 //! Every local lives in memory. Calls follow rustc's (unstable) Rust ABI so the
 //! output can be linked against rustc-compiled objects.
 
+#![feature(allocator_api)]
+// Unsafe code is in `llvm` (LLVM's C API) and `lent` alone (docs/v2/plan/design/unsafe.md).
+#![deny(unsafe_code)]
+
 extern crate ra_ap_rustc_ast_ir as rustc_ast_ir;
 extern crate ra_ap_rustc_index as rustc_index;
 extern crate rustc_abi;
@@ -11,6 +15,8 @@ extern crate rustc_type_ir;
 use std::{borrow::Cow, fmt, sync::LazyLock};
 
 use base_db::{Db, Crate};
+use blaze_mem::Frame;
+use frame_map::{FrameHashMap, FrameHashSet, FrameMap};
 use std::cell::Cell;
 
 use cranelift_codegen::{
@@ -45,7 +51,6 @@ use hir_def::{
     src::HasSource,
 };
 use hir_expand::{FileRange, HirFileId, InFile, MacroDefKind, builtin::BuiltinFnLikeExpander};
-use la_arena::ArenaMap;
 use rustc_abi::{ExternAbi, Integer, ReprFlags, Size};
 use rustc_ast_ir::Mutability;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -118,12 +123,14 @@ mod float_pair;
 mod fncache;
 pub use fncache::{Call, Found, Kind as ReachKind, Reach, tests_reach};
 mod fragment;
+mod frame_map;
 mod home;
 mod later;
 pub use home::body_file;
 #[cfg(feature = "llvm")]
 mod imports;
 #[cfg(feature = "llvm")]
+#[allow(unsafe_code)]
 mod llvm;
 
 /// The CPU of this host and its features as LLVM names them (`+avx2,-avx512f,...`), what
@@ -131,35 +138,12 @@ mod llvm;
 pub fn host_cpu() -> Option<(String, String)> {
     #[cfg(feature = "llvm")]
     {
-        use inkwell::llvm_sys::{core::LLVMDisposeMessage, target_machine as tm};
-        /// The text of `message`, which is then disposed of.
-        ///
-        /// # Safety
-        ///
-        /// `message` is a NUL-terminated string that LLVM allocated, that the caller owns and
-        /// that nothing reads after this.
-        unsafe fn owned(message: *mut std::ffi::c_char) -> String {
-            // SAFETY: the caller's: `message` is NUL-terminated and live until disposed of below.
-            let text = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy().into_owned();
-            // SAFETY: the caller's: LLVM allocated `message`, and nothing reads it after this.
-            unsafe { LLVMDisposeMessage(message) };
-            text
-        }
-        // SAFETY: it reads only the host's CPU and needs no LLVM state set up first.
-        let name = unsafe { tm::LLVMGetHostCPUName() };
-        // SAFETY: `name` is LLVM's string from just above, owned here and taken once.
-        let name = unsafe { owned(name) };
-        // SAFETY: LLVMGetHostCPUFeatures only reads the host CPU and needs no LLVM state set
-        // up first; it returns a string LLVM allocated, which this code now owns.
-        let features = unsafe { tm::LLVMGetHostCPUFeatures() };
-        // SAFETY: `features` is the NUL-terminated string LLVMGetHostCPUFeatures just
-        // allocated, owned here and given to `owned` once, which disposes of it; a second use
-        // would read freed memory.
-        let features = unsafe { owned(features) };
-        Some((name, features))
+        Some(llvm::host_cpu())
     }
     #[cfg(not(feature = "llvm"))]
-    None
+    {
+        None
+    }
 }
 mod neon;
 mod overlap;
@@ -170,6 +154,7 @@ mod units;
 use self::places::{row_location, source_location};
 mod promote;
 mod settled;
+#[allow(unsafe_code)]
 mod lent;
 use lent::Lent;
 mod spare;
@@ -338,8 +323,8 @@ pub enum RustcStaticCopy {
 }
 
 pub trait SymbolResolver {
-    fn function(&self, func: FunctionId) -> Option<String>;
-    fn static_(&self, id: StaticId) -> Option<String>;
+    fn function(&self, func: FunctionId) -> Option<intern::Symbol>;
+    fn static_(&self, id: StaticId) -> Option<intern::Symbol>;
     /// What rustc's copy under `symbol`, which [`Self::static_`] named, is to ours, when
     /// that is not simply the whole static.
     fn static_copy(&self, _symbol: &str) -> Option<RustcStaticCopy> {
@@ -350,7 +335,7 @@ pub trait SymbolResolver {
         false
     }
     /// A non-generic function by path, e.g. `core::panicking::panic_bounds_check`.
-    fn path(&self, path: &str) -> Option<String>;
+    fn path(&self, path: &str) -> Option<&str>;
     /// The path of an item, e.g. `core::any::TypeId`.
     fn item(&self, item: hir_def::ModuleDefId) -> Option<String>;
     /// The struct, enum or union [`Self::item`] spells `path`, when one of a module does.
@@ -358,7 +343,7 @@ pub trait SymbolResolver {
         None
     }
     /// The name rustc gives a source file in panic messages.
-    fn source_path(&self, file: base_db::FileId) -> Option<String>;
+    fn source_path(&self, file: base_db::FileId) -> Option<intern::Symbol>;
     /// The directory the names of [`Self::source_path`] are relative to, when the build is
     /// to tell a debugger where its code comes from.
     fn debug_directory(&self) -> Option<String> {
@@ -411,7 +396,7 @@ pub trait SymbolResolver {
         false
     }
     /// rustc's symbol of the closure at `expr` in the body of `owner`, which is not generic.
-    fn closure(&self, _owner: FunctionId, _expr: hir_def::hir::ExprId) -> Option<String> {
+    fn closure(&self, _owner: FunctionId, _expr: hir_def::hir::ExprId) -> Option<intern::Symbol> {
         None
     }
     /// The build is no patch of what rustc linked but one in full, which is linked: what
@@ -422,16 +407,13 @@ pub trait SymbolResolver {
     fn onto_rustcs(&self) -> bool {
         false
     }
-    /// The `StableCrateId` of each crate that compiled a copy of an instance of a function
-    /// named `function`.
-    fn makers(&self, _function: &str) -> Vec<u64> {
-        Vec::new()
-    }
-    /// The copies rustc made of the instance `symbol` is one of, each with the
-    /// `StableCrateId` of the crate that compiled it.
-    fn copies(&self, _symbol: &str) -> Vec<(String, u64)> {
-        Vec::new()
-    }
+    /// Adds to `out` the `StableCrateId` of each crate that compiled a copy of an instance of a
+    /// function named `function`. The caller lends `out` empty, from a buffer it keeps.
+    fn makers(&self, _function: &str, _out: &mut Vec<u64>) {}
+    /// Adds to `out` the copies rustc made of the instance `symbol` is one of, each with the
+    /// `StableCrateId` of the crate that compiled it, in the order the table has them. The
+    /// caller lends `out` empty, from a buffer it keeps.
+    fn copies(&self, _symbol: &str, _out: &mut Vec<(intern::Symbol, u64)>) {}
     /// Whether rustc compiled the crate, so that what is skipped of it is in the program.
     fn rustc_built(&self, _krate: Crate) -> bool {
         true
@@ -1221,7 +1203,7 @@ impl CodegenUnit {
             if failed.is_empty() && symbols.nothing_of_rustc() {
                 for (root, e) in &skipped {
                     if let Some(symbol) = symbols.function(*root) {
-                        cg.define_refused(&symbol, &e.to_string())?;
+                        cg.define_refused(symbol.as_str(), &e.to_string())?;
                     }
                 }
             }
@@ -5106,49 +5088,56 @@ fn build<'db>(
         Some(body) => ub_checks_of(cg.db, compiling, body.owner.module(cg.db).krate(cg.db)),
         None => compiling,
     };
-    let mut fx = FunctionCx {
-        cg,
-        body,
-        env,
-        infcx: interner.infer_ctxt().build(TypingMode::PostAnalysis),
-        interner,
-        builder: FunctionBuilder::new(&mut ctx.func, &mut builder_ctx),
-        locals: ArenaMap::with_capacity(body.map_or(0, |it| it.locals.len())),
-        blocks: ArenaMap::with_capacity(body.map_or(0, |it| it.basic_blocks.len())),
-        layouts: Layouts::new(&kept),
-        core_panics: Vec::new(),
-        glue: Default::default(),
-        inner_pad: None,
-        unwind_to: None,
-        pads: Vec::new(),
-        exception: None,
-        argument_slots: Vec::new(),
-        free_argument_slots: Vec::new(),
-        given_away: None,
-        block: None,
-        in_cleanup: false,
-        aborts,
-        debug_assertions: compiling,
-        ub_checks,
-        guarded: false,
-        ret_mode: PassMode::Ignore,
-        tracked,
-        variadic: false,
-        abi: ExternAbi::Rust,
-        location: None,
-        span: MirSpan::Unknown,
-        constant_locals: Vec::new(),
-        registers: FxHashMap::default(),
-        args: None,
-        suspended: None,
-        held_at: Vec::new(),
-    };
-    fill(&mut fx)?;
-    fx.note_variables();
-    fx.builder.seal_all_blocks();
-    let config = fx.cg.target_config();
-    let guarded = fx.guarded;
-    fx.builder.finalize(config);
+    // The build's tables (its locals, blocks, layouts, drop glue, registers and the rest of
+    // `FunctionCx`) are in a frame of the worker's, reset when the build returns.
+    let guarded = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| -> Result<bool> {
+        let mut fx = FunctionCx {
+            cg,
+            frame,
+            body,
+            env,
+            infcx: interner.infer_ctxt().build(TypingMode::PostAnalysis),
+            interner,
+            builder: FunctionBuilder::new(&mut ctx.func, &mut builder_ctx),
+            locals: FrameMap::with_capacity_in(body.map_or(0, |it| it.locals.len()), frame),
+            blocks: FrameMap::with_capacity_in(body.map_or(0, |it| it.basic_blocks.len()), frame),
+            layouts: Layouts::new(&kept, frame),
+            core_panics: Vec::new_in(frame),
+            glue: std::cell::RefCell::new(frame_map::hash_map(frame)),
+            inner_pad: None,
+            unwind_to: None,
+            pads: Vec::new_in(frame),
+            exception: None,
+            argument_slots: Vec::new_in(frame),
+            free_argument_slots: Vec::new_in(frame),
+            given_away: GivenAway::new_in(frame),
+            block: None,
+            in_cleanup: false,
+            aborts,
+            debug_assertions: compiling,
+            ub_checks,
+            guarded: false,
+            ret_mode: PassMode::Ignore,
+            tracked,
+            variadic: false,
+            abi: ExternAbi::Rust,
+            location: None,
+            span: MirSpan::Unknown,
+            constant_locals: Vec::new_in(frame),
+            registers: FrameMap::new_in(frame),
+            args: None,
+            suspended: None,
+            held_at: Vec::new_in(frame),
+        };
+        fill(&mut fx)?;
+        fx.note_variables();
+        fx.builder.seal_all_blocks();
+        let config = fx.cg.target_config();
+        let guarded = fx.guarded;
+        fx.builder.finalize(config);
+        Ok(guarded)
+    })?;
+    kept.keep();
     spare::keep_builder(builder_ctx);
     if guarded && let Some(entry) = ctx.func.layout.entry_block() {
         // The slot a guarded call looks for an exception in starts empty.
@@ -5364,35 +5353,45 @@ impl cranelift_codegen::incremental_cache::CacheKvStore for IncrementalCache {
     }
 }
 
-/// Runs Cranelift on a finished function: v2's compile (`v2/backend.rs`). v2 keeps what it
-/// compiles in the back-end memo by the function's shape, which is its printed IR with names
-/// by place, so Cranelift's incremental cache would be a second key over the same IR (a
-/// serialization and hash of the whole function, and a lookup in v1's store) that the memo
-/// already missed on. It compiles with none.
+/// [`emit_lent`] into lists of its own, at Cranelift's default optimization: what the tests
+/// compile a function with.
+#[cfg(test)]
 fn emit(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
-    emit_with(ctx, None, false)
+    // alloc: none until the code's rows are written, then exactly that many: the test keeps them
+    emit_with(ctx, None, false, Relocs::default(), Vec::new())
 }
 
-/// [`emit`] at Cranelift's `opt_level=speed` when `speed`: for code no edit reaches, the
-/// standard library's and dependencies', whose unit's key says so
-/// (`blaze_codegen::Backend::Cranelift { speed }`).
-fn emit_at(ctx: &mut cranelift_codegen::Context, speed: bool) -> Result<Code> {
-    emit_with(ctx, None, speed)
+/// Runs Cranelift on a finished function: v2's compile (`v2/backend.rs`), at
+/// `opt_level=speed` when `speed` (code no edit reaches, the standard library's and
+/// dependencies', whose unit's key says so: `blaze_codegen::Backend::Cranelift { speed }`).
+/// v2 keeps what it compiles in the back-end memo by the function's shape, which is its printed
+/// IR with names by place, so Cranelift's incremental cache would be a second key over the same
+/// IR (a serialization and hash of the whole function, and a lookup in v1's store) that the
+/// memo already missed on. It compiles with none. The relocations and line rows are written
+/// into the thread's kept lists ([`spare::relocs`], [`spare::lines`]), which v2's conversion
+/// gives back ([`spare::keep_relocs`], [`spare::keep_lines`]).
+fn emit_lent(ctx: &mut cranelift_codegen::Context, speed: bool) -> Result<Code> {
+    emit_with(ctx, None, speed, spare::relocs(), spare::lines())
 }
 
-/// [`emit`] for v1's build (`Backend::emit`), through Cranelift's incremental cache in v1's
+/// [`emit_lent`]'s compile for v1's build (`Backend::emit`), into lists of its own (v1 keeps
+/// them), at Cranelift's default optimization, through Cranelift's incremental cache in v1's
 /// store when there is one.
 fn emit_cached(ctx: &mut cranelift_codegen::Context) -> Result<Code> {
-    emit_with(ctx, store::Store::global(), false)
+    // alloc: none until the code's rows are written, then exactly that many: v1 keeps them
+    emit_with(ctx, store::Store::global(), false, Relocs::default(), Vec::new())
 }
 
-/// Runs Cranelift on a finished function, with `store` as its incremental cache. Cranelift
-/// panics on IR it has no lowering for (i128 corners, for one); that must cost us one function,
-/// not the process.
+/// Runs Cranelift on a finished function, with `store` as its incremental cache, writing its
+/// relocations and line rows into `relocs` and `lines`, which are empty. Cranelift panics on IR
+/// it has no lowering for (i128 corners, for one); that must cost us one function, not the
+/// process.
 fn emit_with(
     ctx: &mut cranelift_codegen::Context,
     store: Option<&'static store::Store>,
     speed: bool,
+    relocs: Relocs,
+    lines: Vec<LineRow>,
 ) -> Result<Code> {
     if Target::current().is_wasm() {
         return emit_wasm(&ctx.func, Target::current().calls());
@@ -5423,16 +5422,22 @@ fn emit_with(
         let Some(compiled) = ctx.compiled_code() else {
             return Err("no compiled code".to_owned());
         };
+        let mut relocs = relocs;
+        relocs.extend_mach(compiled.buffer.relocs(), &ctx.func).map_err(|e| e.to_string())?;
+        let mut lines = lines;
+        LineRow::extend_ranges(
+            &mut lines,
+            compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
+        );
         Ok(Code {
+            // clone: the kept code's signature, a few parameters
             signature: ctx.func.signature.clone(),
+            // alloc: the kept code, written once at its exact length
             bytes: compiled.buffer.data().to_vec(),
             align: compiled.buffer.alignment.into(),
-            relocs: Relocs::of_mach(compiled.buffer.relocs(), &ctx.func)
-                .map_err(|e| e.to_string())?,
+            relocs,
             unwind: FunctionUnwind::of(isa, ctx)?,
-            lines: LineRow::of_ranges(
-                compiled.buffer.get_srclocs_sorted().iter().map(|it| (it.start, it.loc)),
-            ),
+            lines,
             slots: SlotPlaces::default(),
         })
     }));
@@ -5836,8 +5841,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             && let Some(symbol) = self.symbols.function(func)
             && let Some(entry) = self.entries.as_ref().and_then(|it| it.get(&name))
         {
-            let id =
-                self.module.declare_function(&symbol, Linkage::Export, entry.code.signature())?;
+            let id = self.module.declare_function(
+                symbol.as_str(),
+                Linkage::Export,
+                entry.code.signature(),
+            )?;
             match self.stitch_entry(&name, id) {
                 Ok(ids) => self.placed(id, watch::Of::Root(func), &ids, watch::How::Stored),
                 Err(e) => {
@@ -5846,7 +5854,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     self.misfit = true;
                 }
             }
-            return Ok(symbol);
+            // alloc: the caller keeps it, once per root
+            return Ok(symbol.as_str().to_owned());
         }
         db.mir_body(func.into()).map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?;
         let Some(symbol) = self.symbols.function(func) else {
@@ -5855,6 +5864,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let private = self.on_demand_crates.is_empty() && self.symbols.private(func);
             return Err(if private { CodegenError::Private } else { CodegenError::NoSymbol });
         };
+        // alloc: kept by later::Of::Root and returned, once per root
+        let symbol = symbol.as_str().to_owned();
         let start = stdx::time::Instant::now();
         let tiers = self.tiers;
         let tiered = tiers.and_then(|it| it.code(db, &tier::Node(tier::Kind::Root(func))));
@@ -6057,12 +6068,17 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if self.symbols.nothing_of_rustc() || self.symbols.defines(ALLOCATOR_ENTRIES[0].1) {
             return Ok(());
         }
+        use std::fmt::Write as _;
+        let symbols = self.symbols;
         for &krate in crates {
             if !declares_global_allocator(db, krate) {
                 continue;
             }
             for (name, ours, params, returns) in ALLOCATOR_ENTRIES {
-                let Some(rustcs) = self.symbols.path(&format!("__rustc::{name}")) else {
+                let Some(rustcs) = blaze_mem::scratch::with_string(|key| {
+                    _ = write!(key, "__rustc::{name}");
+                    symbols.path(key)
+                }) else {
                     continue;
                 };
                 let Some(func) = global_allocator_export(db, krate, ours) else {
@@ -6073,7 +6089,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     );
                 };
                 self.wanted.push(func);
-                self.define_forwarding(&rustcs, Linkage::Hidden, Some(ours), params, returns)?;
+                self.define_forwarding(rustcs, Linkage::Hidden, Some(ours), params, returns)?;
             }
         }
         Ok(())
@@ -6364,108 +6380,113 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 };
                 state.working += 1;
                 drop(state);
-                let working = Working(&ahead, &waits);
-                let (mut found, mut called) = (Vec::new(), Vec::new());
-                let compiled = match &job {
-                    // One without a symbol is left to rustc, and so is what only it calls.
-                    either::Either::Left(root) if stored_root(*root) => None,
-                    either::Either::Left(root) => symbols.function(*root).and_then(|_| {
-                        if told.is_some() {
-                            root_rows(db, *root);
-                        }
-                        compiled_root(db, *root).as_ref().ok()
-                    }),
-                    either::Either::Right((instance, env)) => {
-                        let compiled = compiled_instance(db, instance.clone(), env.clone());
-                        let compiled = compiled.as_ref().ok();
-                        if let (Some(compiled), Some(told)) = (compiled, told) {
-                            told.ahead(db, compiled);
-                            instance_rows(db, instance.clone(), env.clone());
-                        }
-                        compiled
-                    }
-                };
-                // The thread that puts the function in the object asks for the value of each
-                // static it names and the place of each panic: it would find them one by one.
-                let mut statics = Vec::new();
-                for request in compiled.iter().flat_map(|it| &it.requests.datas) {
-                    match request {
-                        DataRequest::Static(id) => statics.push(*id),
-                        &DataRequest::Location(Some((owner, span))) => {
-                            _ = source_location(db, owner, span);
-                        }
-                        _ => {}
-                    }
-                }
-                let mut warmed = FxHashSet::default();
-                while let Some(id) = statics.pop() {
-                    if !warmed.insert(id) {
-                        continue;
-                    }
-                    if keeps {
-                        _ = names.static_(id);
-                    }
-                    if let Ok(value) = compiled_static(db, id) {
-                        let named = value.requests.datas.iter().filter_map(|it| match it {
-                            DataRequest::Static(id) => Some(*id),
-                            _ => None,
-                        });
-                        statics.extend(named);
-                    }
-                }
-                for request in compiled.iter().flat_map(|it| &it.requests.funcs) {
-                    let FuncTarget::Instance(callee, asked) = &request.target else {
-                        continue;
-                    };
-                    // A function without generic arguments is a root, called by its
-                    // symbol when rustc compiled it. The thread that puts the caller in
-                    // the object asks for the symbol, and finds it here.
-                    let root = match callee.def {
-                        InstanceDef::Fn(func)
-                            if callee.args.as_ref().iter().all(|it| it.region().is_some()) =>
-                        {
-                            // One compiled only when called is, by the thread that puts
-                            // its caller in the object: it is compiled for it here.
-                            if on_demand.contains(&func) {
-                                called.push(func);
+                // The job's frame: its lists of what it found, called and warmed. What leaves
+                // the job moves into the round's queues, on the global heap.
+                state = blaze_mem::frame::task(blaze_mem::Tag::Codegen, |frame| {
+                    let working = Working(&ahead, &waits);
+                    let (mut found, mut called) = (Vec::new_in(frame), Vec::new_in(frame));
+                    let compiled = match &job {
+                        // One without a symbol is left to rustc, and so is what only it calls.
+                        either::Either::Left(root) if stored_root(*root) => None,
+                        either::Either::Left(root) => symbols.function(*root).and_then(|_| {
+                            if told.is_some() {
+                                root_rows(db, *root);
                             }
-                            symbols.function(func).is_some()
+                            compiled_root(db, *root).as_ref().ok()
+                        }),
+                        either::Either::Right((instance, env)) => {
+                            let compiled = compiled_instance(db, instance.clone(), env.clone());
+                            let compiled = compiled.as_ref().ok();
+                            if let (Some(compiled), Some(told)) = (compiled, told) {
+                                told.ahead(db, compiled);
+                                instance_rows(db, instance.clone(), env.clone());
+                            }
+                            compiled
                         }
-                        _ => false,
                     };
-                    if !root && !rejected.contains_key(callee) && !in_store(callee) {
-                        found.push((callee.clone(), homes.home(db, callee, asked)));
+                    // The thread that puts the function in the object asks for the value of each
+                    // static it names and the place of each panic: it would find them one by one.
+                    let mut statics = Vec::new_in(frame);
+                    for request in compiled.iter().flat_map(|it| &it.requests.datas) {
+                        match request {
+                            DataRequest::Static(id) => statics.push(*id),
+                            &DataRequest::Location(Some((owner, span))) => {
+                                _ = source_location(db, owner, span);
+                            }
+                            _ => {}
+                        }
                     }
-                }
-                drop(working);
-                state = ahead.lock().unwrap_or_else(|e| e.into_inner());
-                state.working -= 1;
-                if let either::Either::Left(root) = job {
-                    state.rooted_done.insert(root);
-                }
-                if let either::Either::Right(it) = job {
-                    state.done.insert(it);
-                }
-                let mut added = 0;
-                for it in found {
-                    if state.seen.insert(it.clone()) {
-                        state.queue.push_back(it);
-                        added += 1;
+                    let mut warmed = frame_map::hash_set(frame);
+                    while let Some(id) = statics.pop() {
+                        if !warmed.insert(id) {
+                            continue;
+                        }
+                        if keeps {
+                            _ = names.static_(id);
+                        }
+                        if let Ok(value) = compiled_static(db, id) {
+                            let named = value.requests.datas.iter().filter_map(|it| match it {
+                                DataRequest::Static(id) => Some(*id),
+                                _ => None,
+                            });
+                            statics.extend(named);
+                        }
                     }
-                }
-                for root in called {
-                    if state.rooted.insert(root) {
-                        state.roots.push_back(root);
-                        added += 1;
+                    for request in compiled.iter().flat_map(|it| &it.requests.funcs) {
+                        let FuncTarget::Instance(callee, asked) = &request.target else {
+                            continue;
+                        };
+                        // A function without generic arguments is a root, called by its
+                        // symbol when rustc compiled it. The thread that puts the caller in
+                        // the object asks for the symbol, and finds it here.
+                        let root = match callee.def {
+                            InstanceDef::Fn(func)
+                                if callee.args.as_ref().iter().all(|it| it.region().is_some()) =>
+                            {
+                                // One compiled only when called is, by the thread that puts
+                                // its caller in the object: it is compiled for it here.
+                                if on_demand.contains(&func) {
+                                    called.push(func);
+                                }
+                                symbols.function(func).is_some()
+                            }
+                            _ => false,
+                        };
+                        if !root && !rejected.contains_key(callee) && !in_store(callee) {
+                            found.push((callee.clone(), homes.home(db, callee, asked)));
+                        }
                     }
-                }
-                // A thread for each new one, and every thread once there is nothing to do.
-                if state.working == 0 && state.queue.is_empty() && state.roots.is_empty() {
-                    work_to_do.notify_all();
-                } else {
-                    (0..added.min(threads)).for_each(|_| work_to_do.notify_one());
-                }
-                progress.notify_all();
+                    drop(working);
+                    let mut state = ahead.lock().unwrap_or_else(|e| e.into_inner());
+                    state.working -= 1;
+                    if let either::Either::Left(root) = job {
+                        state.rooted_done.insert(root);
+                    }
+                    if let either::Either::Right(it) = job {
+                        state.done.insert(it);
+                    }
+                    let mut added = 0;
+                    for it in found {
+                        if state.seen.insert(it.clone()) {
+                            state.queue.push_back(it);
+                            added += 1;
+                        }
+                    }
+                    for root in called {
+                        if state.rooted.insert(root) {
+                            state.roots.push_back(root);
+                            added += 1;
+                        }
+                    }
+                    // A thread for each new one, and every thread once there is nothing to do.
+                    if state.working == 0 && state.queue.is_empty() && state.roots.is_empty() {
+                        work_to_do.notify_all();
+                    } else {
+                        (0..added.min(threads)).for_each(|_| work_to_do.notify_one());
+                    }
+                    progress.notify_all();
+                    state
+                });
             }
         };
         // dyn: the build's one resolver, made by blaze-engine or blaze-wasm (which depend on this crate)
@@ -6735,8 +6756,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // written in one, can have.
             let makers = home::written_in(db, instance).map(|func| {
                 let name = FunctionSignature::of(db, func).name.as_str();
-                let makers = self.symbols.makers(name).into_iter();
-                makers.filter_map(|id| mixed.holder(db, id)).collect::<Vec<_>>()
+                blaze_mem::scratch::with_u64s(|makers| {
+                    self.symbols.makers(name, makers);
+                    // alloc: only a program whose crates check overflow differently gets here
+                    makers.iter().filter_map(|&id| mixed.holder(db, id)).collect::<Vec<_>>()
+                })
             });
             let mentions = home::mentioned_crates(db, instance);
             let reachable = mixed.reachable(asking, mentions.as_ref(), makers.as_deref());
@@ -6777,9 +6801,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let args = instance.args.as_ref();
         let checked = if !args.iter().all(|arg| arg.region().is_some()) {
             let Some(path) = self.instance_path(func, args) else { return nameless() };
-            let copies = self.symbols.path(&path).map(|it| self.symbols.copies(&it));
-            let holders: Vec<_> =
-                copies.iter().flatten().filter_map(|(_, id)| mixed.holder(db, *id)).collect();
+            let holders: Vec<_> = spare::with_copies(|copies| {
+                if let Some(it) = self.symbols.path(&path) {
+                    self.symbols.copies(it, copies);
+                }
+                // alloc: only a program whose crates check overflow differently gets here
+                copies.iter().filter_map(|&(_, id)| mixed.holder(db, id)).collect()
+            });
             let Some(checked) = mixed.reached(asking, &holders) else {
                 unsupported!(
                     "`{path}`, which rustc compiled with and without overflow checks: which \
@@ -6792,7 +6820,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         } else {
             // One copy under the function's symbol when rustc made one. Without, rustc found
             // the function small enough to compile in each crate that calls it.
-            let own = || self.symbols.function(func).is_some_and(|it| self.symbols.defines(&it));
+            let own = || self.symbols.function(func).is_some_and(|it| self.symbols.defines(it.as_str()));
             match crate_checks_overflow(db, func.krate(db)) {
                 Some(written_with) => written_with && (asking || own()),
                 None => asking,
@@ -6803,24 +6831,29 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     /// rustc's copy of the instance `symbol` is one of that is compiled as `checked` says, and
     /// that the executable has: the one its crate's symbol names may be one nothing called.
-    fn rustc_copy(&self, symbol: String, checked: bool) -> Option<String> {
+    fn rustc_copy<'s>(&self, symbol: &'s str, checked: bool) -> Option<&'s str> {
         let linked = |it: &str| self.symbols.linked(it);
         let Some(mixed) = &self.mixed else {
-            if linked(&symbol) {
+            if linked(symbol) {
                 return Some(symbol);
             }
-            return self.symbols.copies(&symbol).into_iter().map(|it| it.0).find(|it| linked(it));
+            return spare::with_copies(|copies| {
+                self.symbols.copies(symbol, copies);
+                copies.iter().map(|it| it.0.as_str()).find(|it| linked(it))
+            });
         };
-        let copies = self.symbols.copies(&symbol);
-        if copies.is_empty() {
-            return Some(symbol).filter(|it| linked(it));
-        }
-        let of = |id: u64| mixed.holder(self.db, id).is_some_and(|it| it.1 == checked);
-        copies.into_iter().find(|it| of(it.1) && linked(&it.0)).map(|it| it.0)
+        spare::with_copies(|copies| {
+            self.symbols.copies(symbol, copies);
+            if copies.is_empty() {
+                return Some(symbol).filter(|it| linked(it));
+            }
+            let of = |id: u64| mixed.holder(self.db, id).is_some_and(|it| it.1 == checked);
+            copies.iter().find(|it| of(it.1) && linked(it.0.as_str())).map(|it| it.0.as_str())
+        })
     }
 
     /// The function of the program that an instance without arguments is of, and its symbol.
-    fn root_named(&self, name: &str) -> Option<(FunctionId, String)> {
+    fn root_named(&self, name: &str) -> Option<(FunctionId, intern::Symbol)> {
         if let Some(&Some(func)) = self.root_names.get(name)
             && let Some(symbol) = self.symbols.function(func)
         {
@@ -6888,7 +6921,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                         unsupported!("an entry calls `{callee}`, which no crate declares");
                     };
                     self.want(of);
-                    self.import(&symbol, &func.sig)?
+                    self.import(symbol.as_str(), &func.sig)?
                 }
                 CachedTarget::Copy { name: callee, symbol } => {
                     let Some((of, _)) = self.root_named(callee) else {
@@ -7126,10 +7159,11 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 }
             }
             FuncTarget::Path(path) => {
-                let Some(symbol) = self.symbols.path(path) else {
+                let symbols = self.symbols;
+                let Some(symbol) = symbols.path(path) else {
                     unsupported!("call to `{path}`, which rustc has no symbol for");
                 };
-                self.import(&symbol, &request.sig)
+                self.import(symbol, &request.sig)
             }
             FuncTarget::Instance(instance, env) => self.callee(instance, env, &request.sig),
             FuncTarget::Asm(text) => self.assembly(text, &request.sig),
@@ -7221,7 +7255,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
 
     fn source_path(&mut self, file: base_db::FileId) -> Option<String> {
         let symbols = self.symbols;
-        let spelled = || symbols.source_path(file).map(|it| as_rustc_spells(&it));
+        let spelled = || symbols.source_path(file).map(|it| as_rustc_spells(it.as_str()));
         self.source_paths.entry(file).or_insert_with(spelled).clone()
     }
 
@@ -7274,7 +7308,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         // left to rustc, rustc's copy of an instance we could not compile, its allocator shim)
         // reads and writes rustc's, and a copy of ours would split the program's state in two
         // with nothing to tell (`docs/live.md#statics`). What refers to it is left to rustc.
-        if let Some(found) = symbol.as_deref()
+        if let Some(found) = symbol.map(|it| it.as_str())
             && let Some(copy) = self.symbols.static_copy(found)
         {
             let size = || compiled_static(db, id).as_ref().ok().map(|it| it.blob.bytes.len());
@@ -7299,7 +7333,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let in_base = self.base.and_then(|base| base.statics.get(&id));
         let stateful_linked = !self.symbols.nothing_of_rustc()
-            && symbol.as_ref().is_some_and(|it| self.symbols.linked(it))
+            && symbol.is_some_and(|it| self.symbols.linked(it.as_str()))
             && stateful();
         let shared = stateful_linked
             && in_base.map_or_else(|| self.rustc_values.kept(db, id), |it| it.shared);
@@ -7321,8 +7355,9 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         }
         let rustcs = symbol.filter(|_| !ours);
         // One the linker left out of what rustc linked is used by none of rustc's code there.
-        let unlinked = rustcs.as_ref().is_some_and(|it| !self.symbols.linked(it));
-        let theirs = || rustcs.filter(|_| !unlinked);
+        let unlinked = rustcs.is_some_and(|it| !self.symbols.linked(it.as_str()));
+        // alloc: once per static linked to rustc's copy; static_link_name gives a String
+        let theirs = || rustcs.filter(|_| !unlinked).map(|it| it.as_str().to_owned());
         let weak = AttrFlags::linkage(db, id.into()).is_some_and(|it| it.as_str() == "extern_weak");
         if weak && let Some(symbol) = static_link_name(db, id) {
             let data = self.weak_static(&symbol)?;
@@ -7430,7 +7465,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             let own = if cfg!(feature = "wasm") { self.symbols.static_(id) } else { None };
             let numbered = own.is_none();
             let name = match own {
-                Some(name) => name,
+                // alloc: wasm only, once per static
+                Some(name) => name.as_str().to_owned(),
                 None => self.own_data_name("blaze::static::"),
             };
             let linkage = if self.patching { Linkage::Hidden } else { Linkage::Local };
@@ -7550,7 +7586,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             && args.iter().all(|arg| arg.region().is_some())
             && let Some(symbol) = self.symbols.function(func)
             && self.as_its_crate_compiles(instance)
-            && let Some(symbol) = self.rustc_copy(symbol, instance.checked)
+            && let Some(symbol) = self.rustc_copy(symbol.as_str(), instance.checked)
             // rustc's copy of a function of another crate would hand out rustc's future.
             && (self.own_statics.crates.contains(&func.krate(self.db))
                 || !futures_kept_apart()
@@ -7562,7 +7598,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                 || !sve::passes_scalable(self.db, func, Some(args), env))
         {
             self.want(func);
-            return self.import(&symbol, sig);
+            return self.import(symbol, sig);
         }
         let signature = match def {
             InstanceDef::Fn(func) => Some(FunctionSignature::of(self.db, func)),
@@ -7600,7 +7636,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let InstanceDef::Fn(func) = def
             && let Some(symbol) = self.any_method(func, args)
         {
-            return self.import(&symbol, sig);
+            return self.import(symbol, sig);
         }
         // A `TypeId` is a hash only rustc can compute, and the two compilers have to agree on
         // it for `downcast` to work between their code. So take rustc's.
@@ -7618,20 +7654,27 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
                     "`TypeId` of `{of:?}`, neither hashed (at `{stuck}`) nor named by a rustc symbol"
                 );
             };
-            if let Some(symbol) = self.symbols.path(&format!("<core::any::TypeId>::of::<{ty}>")) {
-                return self.import(&symbol, sig);
+            use std::fmt::Write as _;
+            let symbols = self.symbols;
+            if let Some(symbol) = blaze_mem::scratch::with_string(|key| {
+                _ = write!(key, "<core::any::TypeId>::of::<{ty}>");
+                symbols.path(key)
+            }) {
+                return self.import(symbol, sig);
             }
             // rustc inlines `TypeId::of` into most of its callers. What is left then is the
             // `Any` method a `dyn Any` of the type calls, which makes no use of its `self`.
-            let Some(symbol) = self.symbols.path(&format!("<{ty} as core::any::Any>::type_id"))
-            else {
+            let Some(symbol) = blaze_mem::scratch::with_string(|key| {
+                _ = write!(key, "<{ty} as core::any::Any>::type_id");
+                symbols.path(key)
+            }) else {
                 unsupported!(
                     "`TypeId` of `{ty}`, not hashed (at `{stuck}`) and without a rustc symbol"
                 );
             };
             let mut method = sig.clone();
             method.params.push(AbiParam::new(ptr()));
-            let method = self.import(&symbol, &method)?;
+            let method = self.import(symbol, &method)?;
             let id = self
                 .module
                 .declare_function(
@@ -7664,8 +7707,13 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if signature.is_some_and(|it| !it.has_body()) {
             // The allocator entry points are declared in `alloc` and defined at link time,
             // under names in a crate of their own.
-            if let Some(symbol) = self.symbols.path(&format!("__rustc::{name}")) {
-                return self.import(&symbol, sig);
+            use std::fmt::Write as _;
+            let symbols = self.symbols;
+            if let Some(symbol) = blaze_mem::scratch::with_string(|key| {
+                _ = write!(key, "__rustc::{name}");
+                symbols.path(key)
+            }) {
+                return self.import(symbol, sig);
             }
             // FIXME: this passes arguments the way Rust functions take them, which is only
             // what a foreign function expects for scalars and pointers.
@@ -7826,6 +7874,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// callers then call.
     fn stands_in(&self, instance: &Instance) -> bool {
         self.forwarded.contains(instance)
+            // alloc: Spelling writes an owned path
             || matches!(instance.def, InstanceDef::Fn(func) if self
                 .instance_path(func, instance.args.as_ref())
                 .and_then(|path| self.symbols.path(&path))
@@ -7876,10 +7925,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// instance we cannot compile is still one we can call.
     fn forward_to_rustc(&mut self, instance: &Instance, id: FuncId) -> Option<()> {
         let InstanceDef::Fn(func) = instance.def else { return None };
-        let symbol = self.symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
+        let symbols = self.symbols;
+        // alloc: Spelling writes an owned path
+        let symbol = symbols.path(&self.instance_path(func, instance.args.as_ref())?)?;
         let symbol = self.rustc_copy(symbol, instance.checked)?;
         let sig = self.module.declarations().get_function_decl(id).signature.clone();
-        let target = self.import(&symbol, &sig).ok()?;
+        let target = self.import(symbol, &sig).ok()?;
         let mut ctx = self.module.make_context();
         ctx.func.signature = sig;
         let mut builder_ctx = std::mem::take(&mut self.builder_ctx);
@@ -7990,7 +8041,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
     /// rustc's own `<dyn Any>::is::<T>` or `downcast_ref::<T>`, when `func` is such a method
     /// and rustc compiled it for this `T`. It has the `TypeId` of `T` inlined in it, which may
     /// be the one place to get it.
-    fn any_method(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<String> {
+    fn any_method(&self, func: FunctionId, args: GenericArgs<'db>) -> Option<&'a str> {
+        use std::fmt::Write as _;
         let db = self.db;
         let name = FunctionSignature::of(db, func).name.as_str();
         let ItemContainerId::ImplId(impl_) = func.lookup(db).container else { return None };
@@ -8001,7 +8053,12 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return None;
         }
         let ty = self.symbol_type(args.as_slice().first()?.ty()?)?;
-        self.symbols.path(&format!("<{}>::{name}::<{ty}>", self.symbol_type(self_ty)?))
+        let of = self.symbol_type(self_ty)?;
+        let symbols = self.symbols;
+        blaze_mem::scratch::with_string(|key| {
+            _ = write!(key, "<{of}>::{name}::<{ty}>");
+            symbols.path(key)
+        })
     }
 
     /// The symbol a function declared in an `extern` block stands for.
@@ -8305,20 +8362,34 @@ impl DiscriminantWidth {
     }
 }
 
-/// The locals a call's operands move whole, whose memory the callee can be handed as it is.
-struct GivenAway {
-    /// The local the call's result is written to.
-    result: LocalId,
-    whole: FxHashSet<Value>,
+/// The locals a call's operands move whole, whose memory the callee can be handed as it is:
+/// one for the whole build, emptied at each call ([`GivenAway::start`]).
+struct GivenAway<'f> {
+    /// While a call is generated: the local its result is written to.
+    result: Option<LocalId>,
+    whole: FrameHashSet<'f, Value>,
     /// The address of every place the call's operands read.
-    read: Vec<Value>,
+    read: Vec<Value, &'f Frame>,
 }
 
-impl GivenAway {
-    /// Whether the memory at `addr` is a local moved whole that no other operand reads: a
-    /// field at the start of a local has the local's address.
+impl<'f> GivenAway<'f> {
+    fn new_in(frame: &'f Frame) -> Self {
+        GivenAway { result: None, whole: frame_map::hash_set(frame), read: Vec::new_in(frame) }
+    }
+
+    /// Starts the call whose result goes to `result`, forgetting the last call's.
+    fn start(&mut self, result: LocalId) {
+        self.result = Some(result);
+        self.whole.clear();
+        self.read.clear();
+    }
+
+    /// Whether, while a call is generated, the memory at `addr` is a local moved whole that no
+    /// other operand reads: a field at the start of a local has the local's address.
     fn gives(&self, addr: Value) -> bool {
-        self.whole.contains(&addr) && self.read.iter().filter(|&&it| it == addr).count() == 1
+        self.result.is_some()
+            && self.whole.contains(&addr)
+            && self.read.iter().filter(|&&it| it == addr).count() == 1
     }
 }
 
@@ -8339,21 +8410,23 @@ struct LocalSlot {
 
 struct FunctionCx<'cx, 'db> {
     cg: &'cx mut Recorder<'db>,
+    /// The build's frame: what the tables below are kept in, reset when the build returns.
+    frame: &'cx Frame,
     /// `None` while generating a shim that has no MIR.
     body: Option<&'db MirBody<'db>>,
     env: ParamEnvAndCrate<'db>,
     infcx: InferCtxt<'db>,
     interner: DbInterner<'db>,
     builder: FunctionBuilder<'cx>,
-    locals: ArenaMap<LocalId, LocalSlot>,
-    blocks: ArenaMap<BasicBlockId, ir::Block>,
+    locals: FrameMap<'cx, LocalId, LocalSlot>,
+    blocks: FrameMap<'cx, BasicBlockId, ir::Block>,
     /// The layouts asked for so far: a body asks for that of the same few types many times.
     layouts: Layouts<'cx, 'db>,
     /// The panic functions of core called so far, by name: resolving one walks core's modules
     /// by name, and every checked `+` of the body calls one.
-    core_panics: Vec<(&'static str, Option<FunctionId>)>,
+    core_panics: Vec<(&'static str, Option<FunctionId>), &'cx Frame>,
     /// Whether dropping each type asked about so far does anything.
-    glue: std::cell::RefCell<FxHashMap<Ty<'db>, DropGlue>>,
+    glue: std::cell::RefCell<FrameHashMap<'cx, Ty<'db>, DropGlue>>,
     /// A landing pad that takes over from the cleanup block of `unwind_to` for the calls
     /// made while it is set: drop glue unwinding from one field's drop to the rest.
     inner_pad: Option<ir::Block>,
@@ -8361,17 +8434,18 @@ struct FunctionCx<'cx, 'db> {
     /// `MirPhase::Runtime`: its drops are elaborated and it names its cleanup blocks.
     unwind_to: Option<BasicBlockId>,
     /// The landing pad of each cleanup block something unwinds to.
-    pads: Vec<(BasicBlockId, ir::Block)>,
+    pads: Vec<(BasicBlockId, ir::Block), &'cx Frame>,
     /// Where the exception is kept while the cleanup blocks run.
     exception: Option<ir::StackSlot>,
     /// The slots the arguments of the calls so far were copied to since the last were
     /// freed, each with its size and the power of two it is aligned to.
-    argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
+    argument_slots: Vec<(ir::StackSlot, (u32, u8)), &'cx Frame>,
     /// The ones whose call has returned.
-    free_argument_slots: Vec<(ir::StackSlot, (u32, u8))>,
-    /// While a call is generated: the local its result goes to, and where the locals moved
-    /// whole into it are. Nothing reads those again, so the callee can be handed them.
-    given_away: Option<GivenAway>,
+    free_argument_slots: Vec<(ir::StackSlot, (u32, u8)), &'cx Frame>,
+    /// While a call is generated (`result` is set): the local its result goes to, and where
+    /// the locals moved whole into it are. Nothing reads those again, so the callee can be
+    /// handed them.
+    given_away: GivenAway<'cx>,
     /// The block of the body being generated.
     block: Option<BasicBlockId>,
     in_cleanup: bool,
@@ -8397,16 +8471,16 @@ struct FunctionCx<'cx, 'db> {
     /// Where the statement being compiled comes from.
     span: MirSpan,
     /// Promoted locals that are read-only data instead of a slot the body writes to.
-    constant_locals: Vec<LocalId>,
+    constant_locals: Vec<LocalId, &'cx Frame>,
     /// The locals kept in a register in place of their slot: scalars nothing takes the
     /// address of. The slot is still there, written when something asks where the local is.
-    registers: FxHashMap<LocalId, Register>,
+    registers: FrameMap<'cx, LocalId, Register>,
     /// What the body's generic parameters stand for, when it is the body of an instance.
     args: Option<StoredGenericArgs>,
     /// While compiling an `async` body: where it says where it left off.
     suspended: Option<SuspendedState>,
     /// The locals an `async` body keeps in its future, and how far into it each is.
-    held_at: Vec<(LocalId, u32)>,
+    held_at: Vec<(LocalId, u32), &'cx Frame>,
 }
 
 /// The layouts a function's build asked for, each asked of the database once and then lent
@@ -8416,16 +8490,21 @@ struct FunctionCx<'cx, 'db> {
 /// interned `Ty` (a pointer) and no write outside the thread.
 struct Layouts<'cx, 'db> {
     kept: &'cx KeptLayouts,
-    of: std::cell::RefCell<FxHashMap<Ty<'db>, &'cx Layout>>,
+    of: std::cell::RefCell<FrameHashMap<'cx, Ty<'db>, &'cx Layout>>,
     /// The layout whose fields are a variant's, and the tag a value of it has (where, as what
     /// and its value), by the variant and the arguments of its type: `None` for a variant the
     /// type has no room for. Building one copies the variant's field offsets, which each
     /// aggregate of the variant would otherwise do again.
-    variants:
-        std::cell::RefCell<FxHashMap<(VariantId, GenericArgs<'db>), Option<VariantShape<'cx>>>>,
+    variants: std::cell::RefCell<
+        FrameHashMap<'cx, (VariantId, GenericArgs<'db>), Option<VariantShape<'cx>>>,
+    >,
 }
 
-/// What [`Layouts`] lends from, owned by `build` for the whole of it and freed after.
+/// What [`Layouts`] lends from, owned by `build` for the whole of it and freed after. Each
+/// layout stays salsa's (`Arc`) or the variant's own copy (`Box`), dropped at the end of the
+/// build; the two lists of pointers are the thread's ([`spare::layout_lists`]), given back
+/// emptied. They are not in the build's frame: lent from for `'cx` and dropped after it, a
+/// list whose allocator is `&'cx Frame` would still be borrowed when it drops.
 struct KeptLayouts {
     asked: Lent<Arc<Layout>>,
     variants: Lent<Box<Layout>>,
@@ -8433,7 +8512,13 @@ struct KeptLayouts {
 
 impl KeptLayouts {
     fn new() -> Self {
-        Self { asked: Lent::default(), variants: Lent::default() }
+        let (asked, variants) = spare::layout_lists();
+        Self { asked: Lent::from_room(asked), variants: Lent::from_room(variants) }
+    }
+
+    /// Drops what it kept and gives its lists back to the thread.
+    fn keep(self) {
+        spare::keep_layout_lists(self.asked.into_room(), self.variants.into_room());
     }
 }
 
@@ -8442,8 +8527,9 @@ type Tag = Option<(usize, types::Type, u128)>;
 type VariantShape<'cx> = (&'cx Layout, Tag);
 
 impl<'cx> Layouts<'cx, '_> {
-    fn new(kept: &'cx KeptLayouts) -> Self {
-        Self { kept, of: Default::default(), variants: Default::default() }
+    fn new(kept: &'cx KeptLayouts, frame: &'cx Frame) -> Self {
+        let of = std::cell::RefCell::new(frame_map::hash_map(frame));
+        Self { kept, of, variants: std::cell::RefCell::new(frame_map::hash_map(frame)) }
     }
 }
 
@@ -9790,7 +9876,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
             PassMode::Indirect => {
                 // The callee owns the memory it is handed.
-                if self.given_away.as_ref().is_some_and(|it| it.gives(addr)) {
+                if self.given_away.gives(addr) {
                     values.push(addr);
                     return;
                 }
@@ -10397,7 +10483,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             self.locals.insert(local, self.locals[returned_local(body)]);
         }
         // A local kept in a register gets a slot only when it needs memory: see `local_slot`.
-        let mut registers = Vec::new();
+        let mut registers = Vec::new_in(self.frame);
         if frame.is_none() {
             for local in register_locals(body, &forwarded) {
                 if !self.locals.contains_idx(local)
@@ -10413,17 +10499,17 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         }
         if frame.is_none() {
             for (temp, from) in moved_arguments(body, &forwarded) {
-                if !self.registers.contains_key(&temp) && !self.registers.contains_key(&from) {
+                if !self.registers.contains_idx(temp) && !self.registers.contains_idx(from) {
                     forwarded.insert(temp, from);
                 }
             }
         }
         let unmentioned = unmentioned_locals(body);
-        let mut shareable: Vec<(LocalId, ir::StackSlot)> = Vec::new();
+        let mut shareable: Vec<(LocalId, ir::StackSlot), &Frame> = Vec::new_in(self.frame);
         for (local, data) in body.locals.iter() {
             if self.locals.contains_idx(local)
                 || forwarded.contains_key(&local)
-                || self.registers.contains_key(&local)
+                || self.registers.contains_idx(local)
             {
                 continue;
             }
@@ -10804,7 +10890,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     fn local_addr(&mut self, local: LocalId) -> Value {
         let addr = self.local_slot(local).addr;
         let addr = self.slot_addr(addr);
-        if let Some(register) = self.registers.get(&local) {
+        if let Some(register) = self.registers.get(local) {
             let value = self.builder.use_var(register.var);
             self.builder.ins().store(MEM, value, addr, 0);
         }
@@ -10823,14 +10909,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         if self.registers.is_empty() || !place.projection.as_slice().is_empty() {
             return None;
         }
-        self.registers.get(&place.local).copied()
+        self.registers.get(place.local).copied()
     }
 
     fn place_ref(&mut self, place: &StoredPlace) -> Result<PlaceRef<'db>> {
         let borrowed = self.locals.get(place.local).is_some_and(|it| it.borrowed);
         // A pointer in a register is where it points with no load.
         let mut pointer = match place.projection.as_slice().first() {
-            Some(ProjectionElem::Deref) => self.registers.get(&place.local).copied(),
+            Some(ProjectionElem::Deref) => self.registers.get(place.local).copied(),
             _ => None,
         };
         let mut addr = match pointer {
@@ -10909,7 +10995,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
                 ProjectionElem::Downcast(_) => (),
                 ProjectionElem::Index(local) => {
-                    let index = match self.registers.get(local) {
+                    let index = match self.registers.get(*local) {
                         Some(register) => self.builder.use_var(register.var),
                         None => {
                             let index = self.slot_addr(self.locals[*local].addr);
@@ -11065,16 +11151,15 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         match &operand.kind {
             OperandKind::Copy(place) | OperandKind::Move(place) => {
                 let (addr, ty) = self.place(place)?;
-                if let Some(given) = &mut self.given_away {
-                    given.read.push(addr);
+                if self.given_away.result.is_some() {
+                    self.given_away.read.push(addr);
                 }
                 if let OperandKind::Move(_) = operand.kind
                     && place.projection.as_slice().is_empty()
                     && self.glue_of(ty.ty) != DropGlue::None
-                    && let Some(given) = &mut self.given_away
-                    && given.result != place.local
+                    && self.given_away.result.is_some_and(|it| it != place.local)
                 {
-                    given.whole.insert(addr);
+                    self.given_away.whole.insert(addr);
                 }
                 Ok((addr, ty.ty))
             }
@@ -12794,6 +12879,8 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
             }
         };
         let kept: &'cx KeptLayouts = self.layouts.kept;
+        // alloc: a `Layout` owns `Vec`s, so its copy can't be in the frame, whose values are
+        // never dropped; one per variant asked for, kept for the build
         let layout: &'cx Layout =
             kept.variants.alloc(Box::new(Layout::for_variant(layout, RustcEnumVariantIdx(index))));
         Ok(Some((layout, tag_value.map(|it| (offset, tag_ty, it)))))
@@ -13310,18 +13397,23 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         shareable: &[(LocalId, ir::StackSlot)],
         forwarded: &FxHashMap<LocalId, LocalId>,
     ) {
-        // A local kept in a register gets its slot later, if ever: see `local_slot`.
-        let mut registers: Vec<LocalId> = self.registers.keys().copied().collect();
-        blaze_ids::radix::sort_copy_by_key(&mut registers, |it| it.into_raw().into_u32());
+        let frame = self.frame;
+        // A local kept in a register gets its slot later, if ever: see `local_slot`. In index
+        // order: what sorting the keys of a hash map gave.
+        let mut registers: Vec<LocalId, &Frame> = Vec::with_capacity_in(self.registers.len(), frame);
+        registers.extend(self.registers.keys());
         let count = shareable.len() + registers.len();
         if count < 2 {
             return;
         }
-        let at: FxHashMap<LocalId, usize> =
-            shareable.iter().enumerate().map(|(at, &(local, _))| (local, at)).collect();
+        let mut at: FrameHashMap<'_, LocalId, usize> =
+            frame_map::hash_map_with_capacity(shareable.len(), frame);
+        at.extend(shareable.iter().enumerate().map(|(at, &(local, _))| (local, at)));
         // Each local with the slot it is kept in, by the slot's index.
-        let mut members: Vec<(LocalId, usize)> =
-            shareable.iter().enumerate().map(|(at, &(local, _))| (local, at)).collect();
+        let mut members: Vec<(LocalId, usize), &Frame> =
+            Vec::with_capacity_in(count + forwarded.len(), frame);
+        members.extend(shareable.iter().enumerate().map(|(at, &(local, _))| (local, at)));
+        // alloc: kept in the recorder's frame locals (`overlap::FrameLocals`) past the build
         let lazy: FxHashMap<LocalId, usize> = registers
             .iter()
             .enumerate()
@@ -13333,14 +13425,14 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 members.push((temp, slot));
             }
         }
-        let locals: Vec<LocalId> = members.iter().map(|it| it.0).collect();
+        let locals: &[LocalId] = frame.alloc_slice_from_iter(members.iter().map(|it| it.0));
         // A debugger reads a named local's slot all through its scope (`note_variables`), so it
         // keeps the slot to itself there, not only until its last read.
-        let named: FxHashSet<LocalId> = match Self::names_are_written(body) {
-            true => body.binding_locals.iter().map(|it| *it.1).collect(),
-            false => FxHashSet::default(),
-        };
-        let storage = body.frame_storage_conflicts(&locals, |local| named.contains(&local));
+        let mut named: FrameHashSet<'_, LocalId> = frame_map::hash_set(frame);
+        if Self::names_are_written(body) {
+            named.extend(body.binding_locals.iter().map(|it| *it.1));
+        }
+        let storage = body.frame_storage_conflicts(locals, |local| named.contains(&local));
         let mut conflicts = blaze_ids::bits::BitMatrix::new(count, count);
         for (a, &(_, slot_a)) in members.iter().enumerate() {
             for (b, &(_, slot_b)) in members.iter().enumerate().skip(a + 1) {
@@ -13350,6 +13442,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                 }
             }
         }
+        // alloc: kept in the recorder's frame locals past the build, as `lazy` is
         let mut slots: Vec<Option<ir::StackSlot>> = shareable.iter().map(|it| Some(it.1)).collect();
         slots.resize(count, None);
         self.cg.frame_locals = Some(overlap::FrameLocals { slots, conflicts, lazy });
@@ -13647,13 +13740,9 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         target: Option<BasicBlockId>,
         intrinsic: Option<Intrinsic>,
     ) -> Result<()> {
-        self.given_away = Some(GivenAway {
-            result: destination.local,
-            whole: FxHashSet::default(),
-            read: Vec::new(),
-        });
+        self.given_away.start(destination.local);
         let done = self.call_with(func, args, destination, target, intrinsic);
-        self.given_away = None;
+        self.given_away.result = None;
         done
     }
 
@@ -18734,7 +18823,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     /// Fills in the landing pads of a body in `MirPhase::Runtime`: each keeps the exception
     /// and goes on to its cleanup block, which ends in `UnwindResume`.
     fn emit_pads(&mut self) {
-        for (target, pad) in std::mem::take(&mut self.pads) {
+        for (target, pad) in std::mem::replace(&mut self.pads, Vec::new_in(self.frame)) {
             self.builder.switch_to_block(pad);
             let exception = self.builder.block_params(pad)[0];
             let slot = self.exception_slot();
@@ -19988,6 +20077,10 @@ fn operands_of(rvalue: &Rvalue) -> Vec<&Operand> {
 }
 
 #[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
+#[cfg(test)]
 mod tests {
     use cranelift_codegen::ir::{self, AbiParam, InstBuilder, types};
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -20031,10 +20124,12 @@ mod tests {
             let layout: &Layout = kept.asked.alloc(layout);
             lent.push(layout);
         }
-        for (layout, given) in lent.into_iter().zip(given) {
-            assert!(std::ptr::eq(layout, &*given));
-            assert_eq!(*layout, *given);
+        for (layout, given) in lent.into_iter().zip(given.iter()) {
+            assert!(std::ptr::eq(layout, &**given));
+            assert_eq!(*layout, **given);
         }
+        kept.keep();
+        assert!(given.iter().all(|it| Arc::strong_count(it) == 1), "a kept list holds a layout past its build");
     }
 
     /// The panic of each overflow check is named whole, as core declares it: `call_panic`

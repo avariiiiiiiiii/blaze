@@ -12,6 +12,7 @@ use vfs::AbsPath;
 /// Takes the expander of the macro `name` of the dylib at the path, of its kind, and gives
 /// back the one to expand with.
 pub type Wrap =
+    // dyn: hir-expand's expander, the edge to user code; wrapped once per macro loaded
     fn(Arc<dyn ProcMacroExpander>, &AbsPath, &str, ProcMacroKind) -> Arc<dyn ProcMacroExpander>;
 
 static WRAP: OnceLock<Wrap> = OnceLock::new();
@@ -36,11 +37,11 @@ pub(crate) fn ask() {
 }
 
 pub(crate) fn wrapped(
-    expander: Arc<dyn ProcMacroExpander>,
+    expander: Arc<dyn ProcMacroExpander>, // dyn: as `Wrap`, once per macro loaded
     dylib: &AbsPath,
     name: &str,
     kind: ProcMacroKind,
-) -> Arc<dyn ProcMacroExpander> {
+) -> Arc<dyn ProcMacroExpander> { // dyn: as `Wrap`
     match WRAP.get() {
         Some(wrap) => wrap(expander, dylib, name, kind),
         None => expander,

@@ -155,6 +155,7 @@ fn error(message: &str, file: &str) -> Response {
         }],
         rendered: String::new(),
         unit: None,
+        explanation: None,
     })
 }
 
@@ -166,6 +167,8 @@ fn test_result(name: &str, outcome: TestOutcome, output: &str) -> Response {
         outcome,
         output: output.as_bytes().to_vec(),
         millis: 12,
+        outside: false,
+        executable: 0,
     })
 }
 
@@ -212,6 +215,7 @@ fn a_push_end_to_end() {
             facts: Vec::new(),
             rendered: String::new(),
             unit: None,
+            explanation: None,
         }),
     });
     let out = sim.step(Input::Ended { job, run: check_run, ok: true });
@@ -980,6 +984,7 @@ fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
                     facts: Vec::new(),
                     rendered: String::new(),
                     unit: None,
+                    explanation: None,
                 }),
                 3 | 4 => {
                     let outcome = [TestOutcome::Passed, TestOutcome::Failed, TestOutcome::Ignored, TestOutcome::Unreached]
@@ -992,6 +997,8 @@ fn a_report_in_one_string_a_list_summarizes_as_one_string_an_item_did() {
                         outcome,
                         output: output.into_bytes(),
                         millis: at as u64,
+                        outside: false,
+                        executable: 0,
                     })
                 }
                 5 => Response::Error(ApiError::new(format!("lost {at}"), (at % 2 == 0).then(|| "a.sock".to_owned()))),
@@ -1046,6 +1053,7 @@ fn a_warm_service_step_allocates_only_what_it_posts() {
         facts: Vec::new(),
         rendered: String::new(),
         unit: None,
+        explanation: None,
     });
     let input = Input::Response { job, run: check_run, response: warning };
     blaze_alloc_count::assert_at_most(0, "a warning", || step(&mut sim.service, input, &mut out));

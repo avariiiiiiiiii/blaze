@@ -24,13 +24,21 @@
 //! connection's handle's bits, and a process's exit packet and its job's key carry its handle's.
 //! The buffers the kernel writes into are [`Buffers`], so a warm cycle allocates only what its
 //! completion carries.
+//!
+//! Given a confine with a warm launcher ([`Confine::warm`]), the driver hands it every
+//! sandboxed spawn ([`warm`]) and never asks [`Confine::confine`]: the run's job, pipes, input,
+//! output, memory, kill and trace are as for a process the driver starts, and its end is its
+//! answer. The launcher is started at the first such spawn and again only after it ended; a run
+//! it can't take fails, naming it, and is never started some other way.
 
 pub(crate) mod files;
 mod net;
 mod process;
+mod rundirs;
 mod stamp;
 mod sys;
 mod usn;
+mod warm;
 mod watch;
 
 pub(crate) use self::stamp::{entries, stamps};
@@ -67,9 +75,13 @@ use windows_sys::Win32::{
     },
 };
 
-use self::sys::{BUFFER, Buffer, Buffers, Head, KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, Port};
+use self::{
+    rundirs::RunDirs,
+    sys::{BUFFER, Buffer, Buffers, Head, KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, KEY_WARM, Port},
+};
 use crate::{
-    Address, Command, Completion, Confine, Conn, Cursor, Done, Driver, Effect, FileName, IoError, Tag,
+    Address, Command, Completion, Confine, Confined, Conn, Cursor, Done, Driver, Effect, FileName, IoError,
+    RECV_MOST, Sandbox, Tag,
     wheel::{self, Wheel},
 };
 
@@ -97,11 +109,17 @@ const WORK: usize = 1024;
 const TAGGED: usize = 1024;
 /// Completions made on the polling thread that wait for a poll without growing the list.
 const READY: usize = 4 * ENTRIES;
+/// Warm launchers the slab of them has room for: one runs at a time, and one that ended leaves
+/// its entry at once, so this is only the room a generation needs to tell them apart.
+const WARMS: u32 = 64;
+/// The tag of the warm launcher's own requests, which end in no completion of the caller's.
+const LAUNCHER: Tag = Tag(u64::MAX);
 
 type Id = blaze_mem::Handle<Request>;
 type FileId = blaze_mem::Handle<Cached>;
 type SpawnId = blaze_mem::Handle<Spawned>;
 type ConnId = blaze_mem::Handle<Connection>;
+type WarmId = blaze_mem::Handle<Warm>;
 
 /// What a request in flight is doing.
 enum Op {
@@ -117,12 +135,19 @@ enum Op {
     /// A process's output, `err` its standard error, read into `buffer`.
     Output { spawn: SpawnId, err: bool, pipe: OwnedHandle, buffer: Buffer },
     Input { spawn: SpawnId, pipe: OwnedHandle, bytes: Vec<u8>, put: usize },
+    /// The frames of the runs handed to the warm launcher `warm`, written to its control pipe
+    /// one at a time in the order of their spawns: `frame` from `put`. The pipe is the
+    /// request's while it is in flight and the launcher's between frames.
+    Frames { warm: WarmId, pipe: OwnedHandle, frame: Vec<u8>, put: usize },
+    /// The warm launcher's answers, read into `buffer`: one read always in flight while it runs.
+    Answers { warm: WarmId, pipe: OwnedHandle, buffer: Buffer },
     Accept(net::Accepting),
     Connect { connecting: net::Connecting, at: Address },
-    /// Into the spare room of `bytes` (as much as was asked for, up to [`BUFFER`]), which the
-    /// kernel writes and the completion carries as it is; `flags` are Winsock's to write as it
-    /// completes. On the socket of `conn`, which stays open while the request is on it.
-    Recv { conn: ConnId, socket: SOCKET, bytes: Vec<u8>, flags: UnsafeCell<u32> },
+    /// Into `most` bytes of the spare room of `bytes` after its length (reserved as it is
+    /// asked for), which the kernel writes and the completion appends; `flags` are Winsock's
+    /// to write as it completes. On the socket of `conn`, which stays open while the request
+    /// is on it.
+    Recv { conn: ConnId, socket: SOCKET, bytes: Vec<u8>, most: usize, flags: UnsafeCell<u32> },
     Send { conn: ConnId, socket: SOCKET, bytes: Vec<u8>, put: usize },
 }
 
@@ -133,7 +158,9 @@ impl Op {
             Op::Read { raw, .. } | Op::Write { raw, .. } => *raw,
             Op::Watch(watching) => watching.raw(),
             Op::Journal(journal) => journal.raw(),
-            Op::Output { pipe, .. } | Op::Input { pipe, .. } => pipe.as_raw_handle(),
+            Op::Output { pipe, .. } | Op::Input { pipe, .. } | Op::Frames { pipe, .. } | Op::Answers { pipe, .. } => {
+                pipe.as_raw_handle()
+            }
             Op::Accept(accepting) => net::raw(&accepting.listener.socket) as HANDLE,
             Op::Connect { connecting, .. } => connecting.raw() as HANDLE,
             Op::Recv { socket, .. } | Op::Send { socket, .. } => *socket as HANDLE,
@@ -176,14 +203,14 @@ impl Request {
             }
             Op::Watch(watching) => watching.read(head.reset(0)),
             Op::Journal(journal) => journal.read(head.reset(0)),
-            Op::Output { pipe, buffer, .. } => {
+            Op::Output { pipe, buffer, .. } | Op::Answers { pipe, buffer, .. } => {
                 let overlapped = head.reset(0);
                 // SAFETY: as for a read; the buffer is the request's until it ends (`let_go`).
                 sys::pending(unsafe {
                     ReadFile(pipe.as_raw_handle(), buffer.ptr(), BUFFER as u32, std::ptr::null_mut(), overlapped)
                 })
             }
-            Op::Input { pipe, bytes, put, .. } => {
+            Op::Input { pipe, bytes, put, .. } | Op::Frames { pipe, frame: bytes, put, .. } => {
                 let rest = &bytes[*put..];
                 let overlapped = head.reset(0);
                 // SAFETY: as for a write.
@@ -192,8 +219,9 @@ impl Request {
                 })
             }
             Op::Accept(accepting) => accepting.accept(head.reset(0)),
-            Op::Recv { socket, bytes, flags, .. } => {
-                net::recv(*socket, bytes.as_mut_ptr(), bytes.capacity(), flags.get(), head.reset(0))
+            Op::Recv { socket, bytes, most, flags, .. } => {
+                let into = bytes.spare_capacity_mut().as_mut_ptr().cast::<u8>();
+                net::recv(*socket, into, (*most).min(bytes.capacity() - bytes.len()), flags.get(), head.reset(0))
             }
             Op::Send { socket, bytes, put, .. } => net::send(*socket, &bytes[*put..], head.reset(0)),
             Op::Connect { .. } => unreachable!("a connect is asked for once, as it is made"),
@@ -218,6 +246,9 @@ fn len(bytes: usize) -> u32 {
 enum After {
     /// Its next step, asked for in place.
     Again,
+    /// The warm launcher `warm` answered `got` bytes into `buffer`: they are taken, then the
+    /// next read asked for in place (the kernel writes the buffer only once it is).
+    Answers { warm: WarmId, buffer: Buffer, got: usize },
     /// The request let go, then what follows of it.
     Over(Then),
 }
@@ -230,6 +261,10 @@ enum Then {
     Recv(ConnId),
     /// Its next send, or close.
     Send(ConnId),
+    /// The warm launcher's fault: it ends now.
+    Unwarm(WarmId, io::Error),
+    /// The warm launcher's answers ended: it ends once its process has.
+    Unanswered(WarmId, io::Error),
 }
 
 /// A handle the port's reads and writes are on: kept by its name (`readers`, `appenders`)
@@ -286,7 +321,9 @@ struct Journaling {
 
 struct Spawned {
     tag: Tag,
-    process: OwnedHandle,
+    /// Its process, of one the driver started; none of a run handed to the warm launcher, which
+    /// has ended once its answer comes.
+    process: Option<OwnedHandle>,
     job: OwnedHandle,
     /// What the thread pool's wait reads as the process ends: in this entry, which stays where
     /// it is until `waiting` is dropped (`end_wait`).
@@ -297,16 +334,42 @@ struct Spawned {
     /// Of its two outputs, how many have not ended.
     outputs: u8,
     exited: bool,
+    /// The code a handed run's answer said.
+    answered: Option<i32>,
+    /// The requests reading its output, as they were asked: what its warm launcher's end
+    /// cancels.
+    reads: [Option<Id>; 2],
     /// The request writing its input, while it is in flight.
     input: Option<Id>,
-    /// Why its output or input could not all be moved.
+    /// Why its output or input could not all be moved, or why it ended with no answer.
     failed: Option<io::Error>,
     finish: process::Finish,
 }
 
+/// The warm launcher, while it runs: what the driver hands runs to.
+struct Warm {
+    process: OwnedHandle,
+    pid: u32,
+    /// What the thread pool's wait reads as the launcher ends, posting [`KEY_WARM`]: in this
+    /// entry, which stays where it is until `waiting` is dropped (`Iocp::end_warm`, `Drop`).
+    waiter: process::Waiter,
+    waiting: Option<process::Waiting>,
+    /// Its control pipe between frames; the writing request's while one is in flight.
+    control: Option<OwnedHandle>,
+    writing: Option<Id>,
+    /// The read of its answers, in flight while they have not ended.
+    answers: Option<Id>,
+    cut: warm::Cut,
+    exited: bool,
+    /// Why its answers ended, once they have: it takes no more runs, and ends once its
+    /// process has.
+    unanswered: Option<io::Error>,
+}
+
 struct Connection {
     socket: OwnedSocket,
-    recvs: VecDeque<(Tag, usize)>,
+    /// Receives behind the one in flight, with their most and the buffer each appends to.
+    recvs: VecDeque<(Tag, usize, Vec<u8>)>,
     sends: VecDeque<(Tag, Vec<u8>)>,
     /// One receive and one send in flight at a time, so their bytes keep their order.
     receiving: bool,
@@ -331,6 +394,21 @@ pub struct Iocp {
     workers: Vec<JoinHandle<()>>,
     // dyn: the caller's sandbox maker, asked once per sandboxed process.
     confine: Option<Arc<dyn Confine>>,
+    /// The warm launcher the confine hands its runs to, where it has one: every sandboxed
+    /// spawn goes to it then.
+    warm: Option<Confined>,
+    warms: Slab<Warm>,
+    /// The launcher runs are handed to now.
+    warm_now: Option<WarmId>,
+    /// The runs in flight in it, by the run the frame names.
+    runs: FxHashMap<u64, SpawnId>,
+    /// The last run handed.
+    run: u64,
+    /// Frames not yet written to the launcher, in the order of their spawns.
+    frames: VecDeque<Vec<u8>>,
+    /// The runs a launcher's end fails, gathered as it ends.
+    failing: Vec<SpawnId>,
+    dirs: RunDirs,
     files: Slab<Cached>,
     readers: FxHashMap<FileName, FileId>,
     appenders: FxHashMap<FileName, FileId>,
@@ -389,6 +467,7 @@ impl Iocp {
             })
             .collect::<io::Result<Vec<_>>>()?;
         let mem = io::Error::other;
+        let dirs = RunDirs::new(&root)?;
         Ok(Iocp {
             start: Instant::now(),
             paths: sys::Paths::new(&root),
@@ -402,6 +481,16 @@ impl Iocp {
             at_threads: 0,
             workers,
             confine: None,
+            warm: None,
+            warms: Slab::new(WARMS, MemTag::Io).map_err(mem)?,
+            warm_now: None,
+            runs: reserved(),
+            run: 0,
+            // alloc: setup, room for as many frames waiting as runs the maps have room for.
+            frames: VecDeque::with_capacity(TAGGED),
+            // alloc: as above.
+            failing: Vec::with_capacity(TAGGED),
+            dirs,
             files: Slab::new(FILES, MemTag::Io).map_err(mem)?,
             // alloc: setup, room for every handle kept.
             readers: FxHashMap::with_capacity_and_hasher(CACHED, Default::default()),
@@ -426,9 +515,11 @@ impl Iocp {
         })
     }
 
-    /// The driver, starting each process whose sandbox is on as `confine` makes it.
+    /// The driver, starting each process whose sandbox is on as `confine` makes it, or, where
+    /// it has a warm launcher, handing each to it.
     // dyn: as the field.
     pub fn confined(mut self, confine: Arc<dyn Confine>) -> Iocp {
+        self.warm = confine.warm();
         self.confine = Some(confine);
         self
     }
@@ -652,19 +743,31 @@ impl Iocp {
             Effect::Spawn { command, tag } => self.spawn(command, tag),
             Effect::Listen { at, tag } => self.listen(at, tag),
             Effect::Connect { at, tag } => self.connect(at, tag),
-            Effect::Recv { conn, most, tag } => {
-                let (id, connection) = self.connection(conn)?;
+            Effect::Recv { conn, most, into, tag } => {
+                let (id, connection) = match self.connection(conn) {
+                    Ok(it) => it,
+                    Err(error) => {
+                        self.ready.push(Completion { tag, done: Done::unread(into, error) });
+                        return Ok(());
+                    }
+                };
                 if connection.receiving || !connection.recvs.is_empty() {
                     // alloc: a receive behind one in flight; the queue's room is kept for the
                     // connection's life.
-                    connection.recvs.push_back((tag, most));
+                    connection.recvs.push_back((tag, most, into));
                     return Ok(());
                 }
-                self.recv(id, tag, most);
+                self.recv(id, tag, most, into);
                 Ok(())
             }
             Effect::Send { conn, bytes, tag } => {
-                let (id, connection) = self.connection(conn)?;
+                let (id, connection) = match self.connection(conn) {
+                    Ok(it) => it,
+                    Err(error) => {
+                        self.ready.push(Completion { tag, done: Done::unsent(bytes, error) });
+                        return Ok(());
+                    }
+                };
                 if connection.sending || !connection.sends.is_empty() {
                     // alloc: as for a receive.
                     connection.sends.push_back((tag, bytes));
@@ -727,7 +830,12 @@ impl Iocp {
                 return Err(error);
             }
         };
-        let started = self.start_spawn(command, tag, [stdout_buffer, stderr_buffer]);
+        let buffers = [stdout_buffer, stderr_buffer];
+        // With a warm launcher every sandboxed spawn is handed to it, never confined here.
+        let started = match (&self.warm, &command.sandbox) {
+            (Some(_), Sandbox::On { .. }) => self.hand_spawn(command, tag, buffers),
+            _ => self.start_spawn(command, tag, buffers),
+        };
         if started.is_err() {
             self.buffers.give(stdout_buffer);
             self.buffers.give(stderr_buffer);
@@ -735,10 +843,32 @@ impl Iocp {
         started
     }
 
+    /// A spawn's entry: its process (none of a handed run) and job, its output not yet read.
+    fn spawned(&mut self, tag: Tag, process: Option<OwnedHandle>, job: OwnedHandle, finish: process::Finish) -> SpawnId {
+        let port = &self.port;
+        self.spawns.insert_with(|id| Spawned {
+            tag,
+            process,
+            job,
+            waiter: process::Waiter::new(port, KEY_EXIT, id.to_bits()),
+            waiting: None,
+            // alloc: none until output comes, `Exit`'s payload.
+            out: Vec::new(),
+            err: Vec::new(), // alloc: as above.
+            outputs: 2,
+            exited: false,
+            answered: None,
+            reads: [None, None],
+            input: None,
+            failed: None,
+            finish,
+        })
+    }
+
     /// The process of `command` started and followed, its standard output and error read into
     /// `buffers` (theirs from here, unless it fails).
     fn start_spawn(&mut self, command: Box<Command>, tag: Tag, buffers: [Buffer; 2]) -> io::Result<()> {
-        let started = process::start(&self.root, command, self.confine.as_ref())?;
+        let started = process::start(&mut self.dirs, command, self.confine.as_ref())?;
         let process::Started { process, thread, job, stdin, stdout, stderr, mut finish } = started;
         let port = &self.port;
         let associated = [Some(&stdout), Some(&stderr), stdin.as_ref()]
@@ -747,45 +877,48 @@ impl Iocp {
             .try_for_each(|pipe| port.associate(pipe.as_raw_handle()));
         if let Err(error) = associated {
             drop((stdin, stdout, stderr));
-            abandon(&process, &job, &finish);
+            abandon(Some(&process), &job, &mut finish, &mut self.dirs);
             return Err(error);
         }
         // The input the request writing it owns, as the kernel reads it until its completion.
         let input = std::mem::take(&mut finish.command.stdin);
-        let spawn = self.spawns.insert_with(|id| Spawned {
-            tag,
-            process,
-            job,
-            waiter: process::Waiter::new(port, id.to_bits()),
-            waiting: None,
-            // alloc: none until output comes, `Exit`'s payload.
-            out: Vec::new(),
-            err: Vec::new(), // alloc: as above.
-            outputs: 2,
-            exited: false,
-            input: None,
-            failed: None,
-            finish,
-        });
+        let spawn = self.spawned(tag, Some(process), job, finish);
         let spawned = self.spawns.get_mut(spawn).expect("just made");
         let followed = process::follow(&spawned.job, &self.port, spawn.to_bits() as usize).and_then(|()| {
+            let process = spawned.process.as_ref().expect("a started process");
             // SAFETY: the waiter is in the spawn's entry of the slab, which never moves while it
             // is there; `waiting` is dropped before the spawn leaves it (`end_wait`).
-            unsafe { process::Waiting::new(&spawned.process, &spawned.waiter) }
+            unsafe { process::Waiting::new(process, &spawned.waiter) }
         });
         let resumed = followed.and_then(|waiting| {
             spawned.waiting = Some(waiting);
             process::resume(thread, &spawned.job)
         });
         if let Err(error) = resumed {
-            let spawned = self.end_wait(spawn).expect("just made");
-            abandon(&spawned.process, &spawned.job, &spawned.finish);
+            let mut spawned = self.end_wait(spawn).expect("just made");
+            abandon(spawned.process.as_ref(), &spawned.job, &mut spawned.finish, &mut self.dirs);
             return Err(error);
         }
         self.spawning.insert(tag, spawn);
-        let [stdout_buffer, stderr_buffer] = buffers;
-        for (err, pipe, buffer) in [(false, stdout, stdout_buffer), (true, stderr, stderr_buffer)] {
-            let request = self.request(tag, Op::Output { spawn, err, pipe, buffer });
+        self.move_output(spawn, tag, [stdout, stderr], buffers, stdin, input);
+        Ok(())
+    }
+
+    /// The requests that read the output of `spawn` into `buffers` and write its input.
+    fn move_output(
+        &mut self,
+        spawn: SpawnId,
+        tag: Tag,
+        pipes: [OwnedHandle; 2],
+        buffers: [Buffer; 2],
+        stdin: Option<OwnedHandle>,
+        input: Vec<u8>,
+    ) {
+        for (at, (pipe, buffer)) in pipes.into_iter().zip(buffers).enumerate() {
+            let request = self.request(tag, Op::Output { spawn, err: at == 1, pipe, buffer });
+            if let Some(spawned) = self.spawns.get_mut(spawn) {
+                spawned.reads[at] = Some(request);
+            }
             self.put(request);
         }
         if let Some(pipe) = stdin {
@@ -795,7 +928,229 @@ impl Iocp {
             }
             self.put(request);
         }
+    }
+
+    /// The run of `command` handed to the warm launcher, started first if none runs: its job
+    /// and pipes made and followed as a started process's are, its handles given the launcher,
+    /// and its frame queued. Its end is its answer.
+    fn hand_spawn(&mut self, command: Box<Command>, tag: Tag, buffers: [Buffer; 2]) -> io::Result<()> {
+        let launcher = match self.launcher() {
+            Ok(launcher) => launcher,
+            Err(error) => {
+                let warm = self.warm.as_ref().expect("handed only with a warm launcher");
+                return Err(io::Error::new(
+                    error.kind(),
+                    // alloc: an error path.
+                    format!(
+                        "{}: starting the sandbox's warm launcher {}: {error}",
+                        command.program.display(),
+                        warm.program.display()
+                    ),
+                ));
+            }
+        };
+        let confine = self.confine.as_ref().expect("a warm launcher is a confine's");
+        let program = &self.warm.as_ref().expect("handed only with a warm launcher").program;
+        let process = &self.warms.get(launcher).expect("started above").process;
+        self.run += 1;
+        let handing = warm::hand(&mut self.dirs, command, confine, process, program, self.run)?;
+        let warm::Handing { job, stdin, stdout, stderr, frame, remote, mut finish } = handing;
+        let port = &self.port;
+        let associated = [Some(&stdout), Some(&stderr), stdin.as_ref()]
+            .into_iter()
+            .flatten()
+            .try_for_each(|pipe| port.associate(pipe.as_raw_handle()));
+        if let Err(error) = associated {
+            drop(remote);
+            abandon(None, &job, &mut finish, &mut self.dirs);
+            return Err(error);
+        }
+        let input = std::mem::take(&mut finish.command.stdin);
+        let spawn = self.spawned(tag, None, job, finish);
+        let spawned = self.spawns.get(spawn).expect("just made");
+        if let Err(error) = process::follow(&spawned.job, &self.port, spawn.to_bits() as usize) {
+            drop(remote);
+            let mut spawned = self.spawns.remove(spawn).expect("just made");
+            abandon(None, &spawned.job, &mut spawned.finish, &mut self.dirs);
+            return Err(error);
+        }
+        // Queued: the launcher may read the frame from here, so the handles it names are its own.
+        let run = remote.handed.run;
+        remote.keep();
+        // alloc: none until more frames wait than `TAGGED`; the queue keeps its room.
+        self.frames.push_back(frame);
+        self.runs.insert(run, spawn);
+        self.spawning.insert(tag, spawn);
+        self.move_output(spawn, tag, [stdout, stderr], buffers, stdin, input);
+        self.write_frames(launcher);
         Ok(())
+    }
+
+    /// The warm launcher runs are handed to: the one running, or, where it ended or is ending,
+    /// a new one, its answers read and its end waited on. An error starts nothing and keeps
+    /// nothing, and the next spawn tries again.
+    fn launcher(&mut self) -> io::Result<WarmId> {
+        if let Some(id) = self.warm_now {
+            let running = self.warms.get(id).map(|it| !it.exited && it.unanswered.is_none() && !warm::ended(&it.process));
+            match running {
+                Some(true) => return Ok(id),
+                Some(false) => self.end_warm(id, None),
+                None => self.warm_now = None,
+            }
+        }
+        let confined = self.warm.as_ref().expect("asked only with a warm launcher");
+        let warm::Launched { process, pid, control, answers } = warm::launch(confined, process::serial())?;
+        self.port.associate(control.as_raw_handle())?;
+        self.port.associate(answers.as_raw_handle())?;
+        let buffer = self.buffers.take()?;
+        let port = &self.port;
+        let id = self.warms.insert_with(|id| Warm {
+            process,
+            pid,
+            waiter: process::Waiter::new(port, KEY_WARM, id.to_bits()),
+            waiting: None,
+            control: Some(control),
+            writing: None,
+            answers: None,
+            cut: warm::Cut::default(),
+            exited: false,
+            unanswered: None,
+        });
+        let warm = self.warms.get_mut(id).expect("just made");
+        // SAFETY: the waiter is in the launcher's entry of the slab, which never moves while it
+        // is there; `waiting` is dropped before the entry leaves it (`end_warm`, `Drop`).
+        match unsafe { process::Waiting::new(&warm.process, &warm.waiter) } {
+            Ok(waiting) => warm.waiting = Some(waiting),
+            Err(error) => {
+                // Its input closes with it: it exits.
+                self.warms.remove(id);
+                self.buffers.give(buffer);
+                return Err(error);
+            }
+        }
+        let request = self.request(LAUNCHER, Op::Answers { warm: id, pipe: answers, buffer });
+        self.warms.get_mut(id).expect("just made").answers = Some(request);
+        self.warm_now = Some(id);
+        self.put(request);
+        match self.warms.get(id).and_then(|it| it.unanswered.as_ref()) {
+            None => Ok(id),
+            Some(error) => {
+                // alloc: an error path.
+                let error = io::Error::new(error.kind(), format!("reading its answers: {error}"));
+                self.end_warm(id, None);
+                Err(error)
+            }
+        }
+    }
+
+    /// The next frame queued written to the launcher `id`, where none is being written.
+    fn write_frames(&mut self, id: WarmId) {
+        let Some(warm) = self.warms.get_mut(id) else { return };
+        if warm.writing.is_some() || warm.unanswered.is_some() || self.frames.is_empty() {
+            return;
+        }
+        let Some(pipe) = warm.control.take() else { return };
+        let frame = self.frames.pop_front().expect("looked at above");
+        let request = self.request(LAUNCHER, Op::Frames { warm: id, pipe, frame, put: 0 });
+        self.warms.get_mut(id).expect("looked up above").writing = Some(request);
+        self.put(request);
+    }
+
+    /// What the launcher `id` answered, `bytes` of its answers pipe: each whole answer ends its
+    /// run. An answer for a run not in flight is the launcher's fault, which the error says.
+    fn answered(&mut self, id: WarmId, mut bytes: &[u8]) -> io::Result<()> {
+        loop {
+            let Some(warm) = self.warms.get_mut(id) else { return Ok(()) };
+            let Some(answer) = warm.cut.next(&mut bytes) else { return Ok(()) };
+            let Some(spawn) = self.runs.remove(&answer.run) else {
+                // alloc: an error path.
+                return Err(io::Error::other(format!("it answered run {}, which is not in flight in it", answer.run)));
+            };
+            if let Some(spawned) = self.spawns.get_mut(spawn) {
+                spawned.exited = true;
+                spawned.answered = Some(answer.code);
+            }
+            self.finish_spawn(spawn);
+        }
+    }
+
+    /// The answers of the launcher `id` ended, as `why` says: it takes no more runs, its input
+    /// is closed (so one still running stops), and it ends once its process has.
+    fn unanswered(&mut self, id: WarmId, why: io::Error) {
+        let Some(warm) = self.warms.get_mut(id) else { return };
+        warm.answers = None;
+        warm.unanswered = Some(why);
+        drop(warm.control.take());
+        if let Some(request) = warm.writing.and_then(|request| self.requests.get(request)) {
+            request.cancel();
+        }
+        if warm.exited {
+            self.end_warm(id, None);
+        }
+    }
+
+    /// The launcher `id` let go: its wait unregistered, its pipes and process closed (what of
+    /// its pipes a request is on closes as the request ends), frames not yet written dropped.
+    /// Every run in flight in it fails, naming it and how it ended (`fault`, or its exit code),
+    /// its job ended and its run directory removed. The next sandboxed spawn starts another.
+    fn end_warm(&mut self, id: WarmId, fault: Option<io::Error>) {
+        let Some(warm) = self.warms.get_mut(id) else { return };
+        drop(warm.waiting.take());
+        let warm = self.warms.remove(id).expect("looked up above");
+        if self.warm_now == Some(id) {
+            self.warm_now = None;
+        }
+        self.frames.clear();
+        for request in [warm.writing, warm.answers].into_iter().flatten() {
+            if let Some(request) = self.requests.get(request) {
+                request.cancel();
+            }
+        }
+        if self.runs.is_empty() {
+            return;
+        }
+        let how = match (&fault, warm::ended(&warm.process)) {
+            // alloc: an error path, once per launcher that ends.
+            (Some(fault), _) => format!("({fault})"),
+            (None, true) => match process::code(&warm.process) {
+                // alloc: as above.
+                Ok(code) => format!("with code {code}"),
+                Err(error) => format!("({error})"), // alloc: as above.
+            },
+            (None, false) => match &warm.unanswered {
+                // alloc: as above.
+                Some(why) => format!("({why})"),
+                None => "(it was let go)".to_owned(), // alloc: as above.
+            },
+        };
+        let program = &self.warm.as_ref().expect("a launcher is the warm launcher's").program;
+        // alloc: as above.
+        let why = format!(
+            "the sandbox's warm launcher {} (process {}) ended {how} before the run did",
+            program.display(),
+            warm.pid
+        );
+        drop(warm);
+        let mut failing = std::mem::take(&mut self.failing);
+        failing.extend(self.runs.drain().map(|(_, spawn)| spawn));
+        for &spawn in &failing {
+            let Some(spawned) = self.spawns.get_mut(spawn) else { continue };
+            // The launcher may hold the job open: what of it runs is ended, not left to the close.
+            process::terminate(&spawned.job, process::KILLED);
+            spawned.exited = true;
+            // clone: an error path, the message of each run the launcher took with it.
+            spawned.failed.get_or_insert_with(|| io::Error::other(why.clone()));
+            for read in spawned.reads.into_iter().flatten() {
+                if let Some(request) = self.requests.get(read) {
+                    request.cancel();
+                }
+            }
+        }
+        for &spawn in &failing {
+            self.finish_spawn(spawn);
+        }
+        failing.clear();
+        self.failing = failing;
     }
 
     /// The spawn `id` taken out of the slab, its wait unregistered first, so the thread pool
@@ -816,15 +1171,24 @@ impl Iocp {
         if let Some(request) = spawned.input.and_then(|request| self.requests.get(request)) {
             request.cancel();
         }
-        let Spawned { tag, process, job, out, err, failed, finish, .. } = spawned;
+        let Spawned { tag, process, job, out, err, answered, failed, mut finish, .. } = spawned;
         self.spawning.remove(&tag);
-        let ended = finish.exited(&process, &job, out, err);
+        let code = match (&process, answered) {
+            (Some(process), _) => process::code(process),
+            (None, Some(code)) => Ok(code),
+            // A handed run with no answer ended with its launcher, which `failed` says.
+            (None, None) => Err(io::ErrorKind::BrokenPipe.into()),
+        };
+        let ended = finish.exited(code, &job, out, err);
+        if let Some(dir) = finish.scratch.take() {
+            self.dirs.remove(dir);
+        }
         // Closing the job kills whatever of it is left (`KILL_ON_JOB_CLOSE`).
         drop(job);
-        let done = match (ended, failed) {
+        let done = match (failed, ended) {
             // alloc: `Done::Exited`'s payload.
-            (Ok(exit), None) => Done::Exited(Box::new(exit)),
-            (Ok(_), Some(error)) | (Err(error), _) => {
+            (None, Ok(exit)) => Done::Exited(Box::new(exit)),
+            (Some(error), _) | (None, Err(error)) => {
                 // alloc: an error path.
                 Done::Failed(IoError(format!("{}: {error}", finish.program().display())))
             }
@@ -888,14 +1252,16 @@ impl Iocp {
         }
     }
 
-    /// A receive of up to `most` bytes on `id`, which has none in flight.
-    fn recv(&mut self, id: ConnId, tag: Tag, most: usize) {
+    /// A receive of up to `most` bytes (at most [`RECV_MOST`]) on `id`, which has none in
+    /// flight, appended to `into`.
+    fn recv(&mut self, id: ConnId, tag: Tag, most: usize, mut into: Vec<u8>) {
         let connection = self.conns.get_mut(id).expect("the caller's connection");
         connection.receiving = true;
         let socket = net::raw(&connection.socket);
-        // alloc: the bytes received, `Done::Read`'s payload, which the kernel writes in place.
-        let bytes = Vec::with_capacity(most.min(BUFFER));
-        let op = Op::Recv { conn: id, socket, bytes, flags: UnsafeCell::new(0) };
+        let most = most.min(RECV_MOST);
+        // alloc: none once `into` has room for `most` more, as a buffer handed back has.
+        into.reserve(most);
+        let op = Op::Recv { conn: id, socket, bytes: into, most, flags: UnsafeCell::new(0) };
         let request = self.request(tag, op);
         self.put(request);
     }
@@ -903,7 +1269,7 @@ impl Iocp {
     /// A send of `bytes` on `id`, which has none in flight; a send of none is sent at once.
     fn send(&mut self, id: ConnId, tag: Tag, bytes: Vec<u8>) {
         if bytes.is_empty() {
-            self.ready.push(Completion { tag, done: Done::Sent });
+            self.ready.push(Completion { tag, done: Done::Sent(bytes) });
             return;
         }
         let connection = self.conns.get_mut(id).expect("the caller's connection");
@@ -923,8 +1289,8 @@ impl Iocp {
             if connection.receiving {
                 return;
             }
-            let Some((tag, most)) = connection.recvs.pop_front() else { return };
-            self.recv(id, tag, most);
+            let Some((tag, most, into)) = connection.recvs.pop_front() else { return };
+            self.recv(id, tag, most, into);
         }
     }
 
@@ -960,11 +1326,12 @@ impl Iocp {
         // What is in flight on it ends now: a receive as empty, a send as failed (`ended`).
         // SAFETY: an open socket; no `OVERLAPPED` names every request on it.
         unsafe { CancelIoEx(net::raw(&connection.socket) as HANDLE, std::ptr::null()) };
-        for (recv, _) in connection.recvs.drain(..) {
-            self.ready.push(Completion { tag: recv, done: Done::Read(Vec::new()) }); // alloc: none, an empty `Vec`.
+        for (recv, _, into) in connection.recvs.drain(..) {
+            self.ready.push(Completion { tag: recv, done: Done::Read(into) });
         }
-        for (send, _) in connection.sends.drain(..) {
-            self.ready.push(failed(send, format_args!("{conn:?} hung up before all of it was sent")));
+        for (send, bytes) in connection.sends.drain(..) {
+            let done = Done::unsent(bytes, format_args!("{conn:?} hung up before all of it was sent"));
+            self.ready.push(Completion { tag: send, done });
         }
         self.close_if_idle(id);
         shut?;
@@ -1108,6 +1475,49 @@ impl Iocp {
                     spawned.input = None;
                     After::Over(Then::Nothing)
                 }
+                Op::Frames { warm, frame, put, .. } => {
+                    let warm = *warm;
+                    // Of a launcher let go, or ending (the write cancelled as its answers ended):
+                    // its pipe closes with the request.
+                    if !self.warms.get(warm).is_some_and(|it| it.unanswered.is_none()) {
+                        break 'step After::Over(Then::Nothing);
+                    }
+                    match result {
+                        Ok(got) if got > 0 => {
+                            *put += got as usize;
+                            if *put < frame.len() {
+                                break 'step After::Again;
+                            }
+                            match self.frames.pop_front() {
+                                Some(next) => {
+                                    *frame = next;
+                                    *put = 0;
+                                    After::Again
+                                }
+                                // The pipe given back to the launcher until the next frame.
+                                None => After::Over(Then::Nothing),
+                            }
+                        }
+                        // alloc: an error path.
+                        Ok(_) => After::Over(Then::Unwarm(warm, io::Error::other("its input took no more of a frame"))),
+                        Err(error) => {
+                            // alloc: an error path.
+                            let error = io::Error::new(error.kind(), format!("writing a frame to its input: {error}"));
+                            After::Over(Then::Unwarm(warm, error))
+                        }
+                    }
+                }
+                Op::Answers { warm, buffer, .. } => {
+                    let warm = *warm;
+                    if !self.warms.contains(warm) {
+                        break 'step After::Over(Then::Nothing);
+                    }
+                    match result {
+                        Ok(got) => After::Answers { warm, buffer: *buffer, got: (got as usize).min(BUFFER) },
+                        // End of file (`ERROR_BROKEN_PIPE`) or an error: no more answers come.
+                        Err(error) => After::Over(Then::Unanswered(warm, error)),
+                    }
+                }
                 Op::Accept(accepting) => {
                     if accepting.stopping {
                         // A connection accepted as it was asked to stop closes with it.
@@ -1147,13 +1557,14 @@ impl Iocp {
                     After::Again
                 }
                 Op::Connect { .. } | Op::Journal(_) => unreachable!("ended above"),
-                Op::Recv { conn, bytes, .. } => {
+                Op::Recv { conn, bytes, most, .. } => {
                     let done = match result {
                         Ok(got) => {
                             // SAFETY: the receive's completion was taken: the kernel wrote `got`
-                            // bytes from the start of the room it was given, which is the
-                            // `Vec`'s capacity, and writes them no more.
-                            unsafe { bytes.set_len((got as usize).min(bytes.capacity())) };
+                            // bytes, at most `most`, from the start of the room it was given,
+                            // `most` bytes of the spare room after the `Vec`'s length (reserved
+                            // by `Iocp::recv`), and writes them no more.
+                            unsafe { bytes.set_len(bytes.len() + (got as usize).min(*most)) };
                             Done::Read(std::mem::take(bytes))
                         }
                         // Hung up, here or by the peer: no more bytes.
@@ -1163,10 +1574,9 @@ impl Iocp {
                                 Some(ERROR_OPERATION_ABORTED | ERROR_NETNAME_DELETED | ERROR_CONNECTION_ABORTED)
                             ) || code == Some(WSAECONNRESET as u32) =>
                         {
-                            Done::Read(Vec::new()) // alloc: none, an empty `Vec`.
+                            Done::Read(std::mem::take(bytes))
                         }
-                        // alloc: an error path.
-                        Err(error) => Done::Failed(IoError(error.to_string())),
+                        Err(error) => Done::unread(std::mem::take(bytes), error),
                     };
                     self.ready.push(Completion { tag, done });
                     if let Some(connection) = self.conns.get_mut(*conn) {
@@ -1185,17 +1595,17 @@ impl Iocp {
                                 break 'step After::Again;
                             }
                             match *put == bytes.len() {
-                                true => Done::Sent,
-                                // alloc: an error path.
-                                false => Done::Failed(IoError(format!("{shown:?} took no more bytes"))),
+                                true => {
+                                    bytes.clear();
+                                    Done::Sent(std::mem::take(bytes))
+                                }
+                                false => Done::unsent(std::mem::take(bytes), format_args!("{shown:?} took no more bytes")),
                             }
                         }
                         Err(_) if code == Some(ERROR_OPERATION_ABORTED) => {
-                            // alloc: an error path.
-                            Done::Failed(IoError(format!("{shown:?} hung up before all of it was sent")))
+                            Done::unsent(std::mem::take(bytes), format_args!("{shown:?} hung up before all of it was sent"))
                         }
-                        // alloc: an error path.
-                        Err(error) => Done::Failed(IoError(error.to_string())),
+                        Err(error) => Done::unsent(std::mem::take(bytes), error),
                     };
                     self.ready.push(Completion { tag, done });
                     if let Some(connection) = self.conns.get_mut(conn) {
@@ -1207,6 +1617,16 @@ impl Iocp {
         };
         let then = match after {
             After::Again => return self.put(id),
+            After::Answers { warm, buffer, got } => {
+                // SAFETY: the read's completion was taken, so the kernel writes the buffer no
+                // more until the read is asked for again, after the bytes are taken; it wrote
+                // `got` of them. The buffer is the request's, which stays in the slab.
+                let read = unsafe { std::slice::from_raw_parts(buffer.ptr(), got) };
+                match self.answered(warm, read) {
+                    Ok(()) => return self.put(id),
+                    Err(fault) => Then::Unwarm(warm, fault),
+                }
+            }
             After::Over(then) => then,
         };
         if let Some(request) = self.requests.remove(id) {
@@ -1217,15 +1637,32 @@ impl Iocp {
             Then::Spawn(spawn) => self.finish_spawn(spawn),
             Then::Recv(conn) => self.serve_recvs(conn),
             Then::Send(conn) => self.serve_sends(conn),
+            Then::Unwarm(warm, fault) => self.end_warm(warm, Some(fault)),
+            Then::Unanswered(warm, why) => self.unanswered(warm, why),
         }
     }
 
     /// What an ended request held of the driver's given back.
     fn let_go(&mut self, request: Request) {
-        match &request.op {
-            Op::Read { file, .. } | Op::Write { file, .. } => release(&mut self.files, *file),
+        match request.op {
+            Op::Read { file, .. } | Op::Write { file, .. } => release(&mut self.files, file),
             Op::Watch(watching) => self.buffers.give(watching.buffer),
-            Op::Output { buffer, .. } => self.buffers.give(*buffer),
+            Op::Output { buffer, .. } => self.buffers.give(buffer),
+            Op::Answers { warm, buffer, .. } => {
+                self.buffers.give(buffer);
+                if let Some(warm) = self.warms.get_mut(warm) {
+                    warm.answers = None;
+                }
+            }
+            // Its pipe is the launcher's again between frames, unless it is ending.
+            Op::Frames { warm, pipe, .. } => {
+                if let Some(warm) = self.warms.get_mut(warm) {
+                    warm.writing = None;
+                    if warm.unanswered.is_none() {
+                        warm.control = Some(pipe);
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -1261,6 +1698,16 @@ impl Iocp {
                     let Some(spawned) = self.spawns.get_mut(id) else { continue };
                     spawned.exited = true;
                     self.finish_spawn(id);
+                }
+                // The warm launcher's process ended; one let go since is a stale handle. What it
+                // answered before is read to the end of its answers, which ends it then.
+                KEY_WARM => {
+                    let id = WarmId::from_bits(entry.lpOverlapped as usize as u64);
+                    let Some(warm) = self.warms.get_mut(id) else { continue };
+                    warm.exited = true;
+                    if warm.unanswered.is_some() {
+                        self.end_warm(id, None);
+                    }
                 }
                 key if key >= KEY_JOB => {
                     let Some(spawned) = self.spawns.get(SpawnId::from_bits(key as u64)) else { continue };
@@ -1348,6 +1795,14 @@ impl Iocp {
 
 impl Drop for Iocp {
     fn drop(&mut self) {
+        // The warm launcher's input ends first: it ends its runs' jobs, takes their grants back
+        // and exits. A frame being written is cancelled, and the pipe closes as it comes back.
+        if let Some(warm) = self.warm_now.and_then(|id| self.warms.get_mut(id)) {
+            drop(warm.control.take());
+            if let Some(request) = warm.writing.and_then(|id| self.requests.get(id)) {
+                request.cancel();
+            }
+        }
         for (_, spawned) in self.spawns.iter() {
             process::terminate(&spawned.job, process::KILLED);
         }
@@ -1381,9 +1836,19 @@ impl Drop for Iocp {
                 ManuallyDrop::drop(&mut self.buffers);
             }
         }
-        for (_, spawned) in self.spawns.iter_mut() {
+        for (_, spawned) in self.spawns.iter_mut().filter(|(_, it)| it.process.is_some()) {
             drop(spawned.waiting.take());
-            abandon(&spawned.process, &spawned.job, &spawned.finish);
+            abandon(spawned.process.as_ref(), &spawned.job, &mut spawned.finish, &mut self.dirs);
+        }
+        // Handed runs are abandoned as started ones are, their run directories removed once
+        // the launcher, which writes in them, has exited.
+        for (_, warm) in self.warms.iter_mut() {
+            // SAFETY: an open process; it exits once its input has ended, which it has.
+            unsafe { WaitForSingleObject(warm.process.as_raw_handle(), GIVE_BACK.as_millis() as u32) };
+            drop(warm.waiting.take());
+        }
+        for (_, spawned) in self.spawns.iter_mut().filter(|(_, it)| it.process.is_none()) {
+            abandon(None, &spawned.job, &mut spawned.finish, &mut self.dirs);
         }
         self.work = None;
         for worker in self.workers.drain(..) {
@@ -1398,7 +1863,14 @@ impl Driver for Iocp {
             let tag = effect.tag();
             match effect {
                 Effect::Kill { tag } => {
-                    if let Some(spawned) = self.spawning.get(&tag).and_then(|id| self.spawns.get(*id)) {
+                    if let Some(spawned) = self.spawning.get(&tag).and_then(|id| self.spawns.get_mut(*id)) {
+                        // A handed run's program may not have started: its job takes no process
+                        // from here, so it never can. Either way its answer ends it.
+                        if spawned.process.is_none()
+                            && let Err(error) = process::seal(&spawned.job)
+                        {
+                            spawned.failed.get_or_insert(error);
+                        }
                         process::terminate(&spawned.job, process::KILLED);
                     }
                 }
@@ -1575,13 +2047,17 @@ fn file(root: &Path, effect: Effect, at: &mut PathBuf, to: &mut PathBuf) -> io::
     }
 }
 
-/// A process the driver no longer follows: killed, waited for, and what was made for it
-/// removed.
-fn abandon(process: &OwnedHandle, job: &OwnedHandle, finish: &process::Finish) {
+/// A run the driver no longer follows: killed, its process (of one it started) waited for, and
+/// its run directory removed.
+fn abandon(process: Option<&OwnedHandle>, job: &OwnedHandle, finish: &mut process::Finish, dirs: &mut RunDirs) {
     process::terminate(job, process::KILLED);
-    // SAFETY: an open process handle; a kill of its job ends it promptly.
-    unsafe { WaitForSingleObject(process.as_raw_handle(), GIVE_BACK.as_millis() as u32) };
-    _ = finish.exited(process, job, Vec::new(), Vec::new()); // alloc: none, an empty `Vec`.
+    if let Some(process) = process {
+        // SAFETY: an open process handle; a kill of its job ends it promptly.
+        unsafe { WaitForSingleObject(process.as_raw_handle(), GIVE_BACK.as_millis() as u32) };
+    }
+    if let Some(dir) = finish.scratch.take() {
+        dirs.remove(dir);
+    }
 }
 
 fn no_connection(conn: Conn) -> io::Error {
@@ -1591,10 +2067,20 @@ fn no_connection(conn: Conn) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeMap, ffi::OsString};
+    use std::{
+        collections::BTreeMap,
+        ffi::OsString,
+        io::{Read as _, Write as _},
+        os::windows::io::{AsRawHandle as _, FromRawHandle as _, RawHandle},
+        process::Stdio,
+    };
+
+    use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
 
     use super::*;
-    use crate::{Confined, Exit, Journaled, Lost, Names, Sandbox, Stamp, Traced, run_until_idle, threads::Threads};
+    use crate::{
+        Answer, Confined, Exit, Handed, Journaled, Lost, Names, Sandbox, Stamp, Traced, run_until_idle, threads::Threads,
+    };
 
     fn name(it: &str) -> FileName {
         FileName::new(it).unwrap()
@@ -1656,7 +2142,7 @@ mod tests {
             )
         });
         let mut on = command("cmd.exe", &["/d", "/c", "echo hi"], b"");
-        on.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false };
+        on.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() };
         let seen = run(&mut driver, vec![
             Effect::Spawn { command: command("findstr.exe", &["/r", "^"], b"hello\r\n"), tag: Tag(1) },
             Effect::Spawn { command: command("cmd.exe", &["/d", "/c", "echo err>&2& exit /b 7"], b""), tag: Tag(2) },
@@ -1722,7 +2208,7 @@ mod tests {
         let root = dir("confine");
         let mut driver = Iocp::new(&root, 1).unwrap().confined(Arc::new(Recording));
         let mut traced = command("cmd.exe", &["/d", "/c", "echo hi"], b"");
-        traced.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true };
+        traced.sandbox = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true, services: Vec::new() };
         let seen = run(&mut driver, vec![Effect::Spawn { command: traced, tag: Tag(1) }]);
         let exit = exit(&seen[&1]);
         assert_eq!((exit.code, exit.stdout.as_slice()), (Some(0), &b"hi\r\n"[..]));
@@ -1730,6 +2216,275 @@ mod tests {
         assert_eq!(exit.traced, Some(wanted));
         let left = std::fs::read_dir(root.join(".blaze-spawn")).unwrap().count();
         assert_eq!(left, 0);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The variable that makes this test binary [`Tiny`]'s warm launcher.
+    const TINY: &str = "BLAZE_IOCP_TEST_TINY_LAUNCHER";
+    /// A frame of [`Tiny::hand`]: its length, the run, its four handles, the code to answer and
+    /// the milliseconds to wait before.
+    const TINY_FRAME: usize = 4 + 5 * 8 + 4 + 4;
+    /// A run's code that has the launcher run `PING` in the run's job and answer its code: a
+    /// run to kill.
+    const HOLD: i32 = -100;
+    /// A run's code that has the launcher exit with code 3 before it answers.
+    const LEAVE: i32 = -101;
+    /// A run's code that has the launcher answer a run not in flight.
+    const ASTRAY: i32 = -102;
+
+    /// A confine whose warm launcher is this test binary ([`tiny_launcher`]). A run's first
+    /// argument is the code it is answered with (or [`HOLD`], [`LEAVE`], [`ASTRAY`]), its second
+    /// how many milliseconds the launcher waits first.
+    struct Tiny;
+
+    impl Confine for Tiny {
+        fn confine(&self, command: &Command, _: &Path) -> Result<Confined, String> {
+            Err(format!("{}: confine asked of a sandbox with a warm launcher", command.program.display()))
+        }
+
+        fn traced(&self, _: &Command, _: &Path) -> Result<Traced, String> {
+            Ok(Traced::default())
+        }
+
+        fn warm(&self) -> Option<Confined> {
+            Some(Confined {
+                program: std::env::current_exe().unwrap(),
+                args: Vec::new(),
+                env: vec![(TINY.into(), "1".into()), ("SystemRoot".into(), std::env::var_os("SystemRoot").unwrap())],
+                dir: std::env::temp_dir(),
+            })
+        }
+
+        fn hand(&self, command: &Command, _: &Path, handed: &Handed) -> Result<Vec<u8>, String> {
+            let arg = |at: usize| {
+                command.args.get(at).and_then(|it| it.to_str()).and_then(|it| it.parse::<i64>().ok()).unwrap_or(0)
+            };
+            let mut frame = Vec::with_capacity(TINY_FRAME);
+            frame.extend_from_slice(&((TINY_FRAME - 4) as u32).to_le_bytes());
+            for field in [handed.run, handed.stdin, handed.stdout, handed.stderr, handed.job] {
+                frame.extend_from_slice(&field.to_le_bytes());
+            }
+            frame.extend_from_slice(&(arg(0) as i32).to_le_bytes());
+            frame.extend_from_slice(&(arg(1) as u32).to_le_bytes());
+            Ok(frame)
+        }
+    }
+
+    /// [`Tiny`]'s launcher, where this test binary is started as one: each frame on standard
+    /// input is a run on a thread of its own, which waits as asked, writes the run's number to
+    /// the run's standard output, closes the run's handles and answers on standard output.
+    /// Before `main`, so the test harness writes nothing on the answers.
+    extern "C" fn tiny_launcher() {
+        if std::env::var_os(TINY).is_none() {
+            return;
+        }
+        let mut input = std::io::stdin().lock();
+        loop {
+            let mut frame = [0u8; TINY_FRAME];
+            if input.read_exact(&mut frame).is_err() {
+                std::process::exit(0);
+            }
+            let word = |at: usize| u64::from_le_bytes(frame[at..at + 8].try_into().unwrap());
+            let (run, handles) = (word(4), [word(12), word(20), word(28), word(36)]);
+            let code = i32::from_le_bytes(frame[44..48].try_into().unwrap());
+            let wait = u32::from_le_bytes(frame[48..52].try_into().unwrap());
+            if code == LEAVE {
+                std::process::exit(3);
+            }
+            // SAFETY: the driver duplicated each into this process for this run alone, and named
+            // it in this frame only, so each is adopted once.
+            let [stdin, stdout, stderr, job] =
+                handles.map(|it| (it != 0).then(|| unsafe { OwnedHandle::from_raw_handle(it as usize as RawHandle) }));
+            std::thread::spawn(move || {
+                drop((stdin, stderr));
+                std::thread::sleep(Duration::from_millis(wait.into()));
+                let answered = if code == ASTRAY { run + 1_000_000 } else { run };
+                let code = match code {
+                    HOLD => {
+                        drop(stdout);
+                        hold(job.as_ref().expect("a run's job"))
+                    }
+                    code => {
+                        if let Some(out) = stdout {
+                            _ = std::fs::File::from(out).write_all(&run.to_le_bytes());
+                        }
+                        code
+                    }
+                };
+                drop(job);
+                let mut answers = std::io::stdout().lock();
+                let written = answers.write_all(&Answer { run: answered, code }.to_bytes()).and_then(|()| answers.flush());
+                if written.is_err() {
+                    std::process::exit(2);
+                }
+            });
+        }
+    }
+
+    /// `PING` run in `job` until it ends: its code, or 125 where it could not join the job.
+    fn hold(job: &OwnedHandle) -> i32 {
+        let ping = std::process::Command::new(system().join("PING.EXE"))
+            .args(["-n", "60", "127.0.0.1"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut ping) = ping else { return 125 };
+        // SAFETY: an open job and the process just made.
+        if unsafe { AssignProcessToJobObject(job.as_raw_handle(), ping.as_raw_handle()) } == 0 {
+            _ = ping.kill();
+            _ = ping.wait();
+            return 125;
+        }
+        ping.wait().map_or(125, |status| status.code().unwrap_or(125))
+    }
+
+    // SAFETY: the C runtime calls each entry of this section as a function before `main`, on
+    // the one thread the process has then. The entry is `tiny_launcher`, an `extern "C" fn()`,
+    // which is what an entry is (`_PVFV`); anything but a function pointer there would be called
+    // as code.
+    #[used]
+    #[unsafe(link_section = ".CRT$XCU")]
+    static TINY_LAUNCHER: extern "C" fn() = tiny_launcher;
+
+    /// A sandboxed run for [`Tiny`]: answered `code` after `wait_ms`.
+    fn tiny(code: i32, wait_ms: u32, stdin: &[u8]) -> Box<Command> {
+        Box::new(Command {
+            program: PathBuf::from("tiny-run"),
+            args: vec![code.to_string().into(), wait_ms.to_string().into()],
+            env: Vec::new(),
+            dir: std::env::temp_dir(),
+            stdin: stdin.to_vec(),
+            sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() },
+            memory: None,
+        })
+    }
+
+    /// The run's number, which [`tiny_launcher`] writes to its standard output.
+    fn ran(exit: &Exit) -> u64 {
+        u64::from_le_bytes(exit.stdout.as_slice().try_into().expect("the run's number, 8 bytes"))
+    }
+
+    #[test]
+    fn runs_handed_to_the_warm_launcher_end_with_their_own_codes_and_outputs() {
+        let root = dir("warm");
+        let mut driver = Iocp::new(&root, 1).unwrap().confined(Arc::new(Tiny));
+        let mut effects = vec![
+            Effect::Spawn { command: tiny(7, 400, b""), tag: Tag(1) },
+            Effect::Spawn { command: tiny(9, 0, b"some input"), tag: Tag(2) },
+            Effect::Spawn { command: command("cmd.exe", &["/d", "/c", "echo plain"], b""), tag: Tag(3) },
+        ];
+        let (mut order, mut seen) = (Vec::new(), BTreeMap::new());
+        run_until_idle(&mut driver, &mut effects, |done, _| {
+            order.push(done.tag.0);
+            seen.insert(done.tag.0, done.done);
+        });
+        let (one, two) = (exit(&seen[&1]), exit(&seen[&2]));
+        assert_eq!((one.code, two.code), (Some(7), Some(9)), "{seen:?}");
+        assert_ne!(ran(one), ran(two));
+        assert!(one.stderr.is_empty() && two.stderr.is_empty(), "{seen:?}");
+        // Answered out of order: the second first.
+        let at = |tag: u64| order.iter().position(|it| *it == tag).unwrap();
+        assert!(at(2) < at(1), "{order:?}");
+        // A spawn with its sandbox off is started as ever.
+        let three = exit(&seen[&3]);
+        assert_eq!((three.code, three.stdout.as_slice()), (Some(0), &b"plain\r\n"[..]));
+        // One launcher took both, and nothing of theirs is left.
+        assert_eq!(driver.warms.len(), 1);
+        assert!(driver.runs.is_empty() && driver.frames.is_empty());
+        assert_eq!(std::fs::read_dir(root.join(".blaze-spawn")).unwrap().count(), 0);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_killed_handed_run_ends_and_the_launcher_takes_the_next() {
+        let root = dir("warm-kill");
+        let mut driver = Iocp::new(&root, 1).unwrap().confined(Arc::new(Tiny));
+        let mut out = Vec::new();
+        driver.submit(&mut vec![Effect::Spawn { command: tiny(HOLD, 0, b""), tag: Tag(1) }]);
+        // Long enough, mostly, for the launcher to start its program in the run's job.
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_millis(500) {
+            driver.poll(&mut out, Duration::from_millis(50));
+        }
+        assert!(out.is_empty(), "{out:?}");
+        let seen = run(&mut driver, vec![Effect::Kill { tag: Tag(1) }]);
+        let killed = exit(&seen[&1]);
+        // Ended as it ran (the kill's code), or refused its start (the launcher's could-not).
+        assert!(matches!(killed.code, Some(1 | 125)), "{killed:?}");
+        let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(4, 0, b""), tag: Tag(2) }]);
+        assert_eq!(exit(&seen[&2]).code, Some(4));
+        assert_eq!(driver.warms.len(), 1);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_launcher_that_ends_fails_its_runs_naming_it_and_the_next_run_starts_another() {
+        let root = dir("warm-end");
+        let mut driver = Iocp::new(&root, 1).unwrap().confined(Arc::new(Tiny));
+        let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(0, 0, b""), tag: Tag(1) }]);
+        assert_eq!(exit(&seen[&1]).code, Some(0));
+        let first = driver.warm_now.expect("a launcher runs");
+        let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(LEAVE, 0, b""), tag: Tag(2) }]);
+        let program = std::env::current_exe().unwrap().display().to_string();
+        match &seen[&2] {
+            Done::Failed(why) => {
+                assert!(why.0.starts_with("tiny-run: the sandbox's warm launcher "), "{why:?}");
+                assert!(why.0.contains(&program), "{why:?}");
+                assert!(why.0.ends_with("ended with code 3 before the run did"), "{why:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(driver.warm_now.is_none() && !driver.warms.contains(first));
+        // The end of the launcher let go, posted late: a stale handle, dropped.
+        driver.port.post(KEY_WARM, 0, first.to_bits() as usize).unwrap();
+        let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(5, 0, b""), tag: Tag(3) }]);
+        assert_eq!(exit(&seen[&3]).code, Some(5));
+        let second = driver.warm_now.expect("another launcher");
+        assert_ne!(second, first);
+        // An answer for a run not in flight is the launcher's fault: it ends, failing the run.
+        let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(ASTRAY, 0, b""), tag: Tag(4) }]);
+        assert!(matches!(&seen[&4], Done::Failed(why) if why.0.contains("which is not in flight in it")), "{seen:?}");
+        assert!(!driver.warms.contains(second));
+        let seen = run(&mut driver, vec![Effect::Spawn { command: tiny(6, 0, b""), tag: Tag(5) }]);
+        assert_eq!(exit(&seen[&5]).code, Some(6));
+        assert!(driver.runs.is_empty());
+        assert_eq!(std::fs::read_dir(root.join(".blaze-spawn")).unwrap().count(), 0);
+        drop(driver);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A warm handed run: on the polling thread it allocates the frame `Tiny::hand` returns,
+    /// the `Exit` its completion boxes and its output's bytes, and nothing of the driver's.
+    #[test]
+    fn a_warm_handed_run_allocates_only_its_frame_exit_and_output() {
+        let root = dir("budget-warm");
+        let mut driver = Iocp::new(&root, 1).unwrap().confined(Arc::new(Tiny));
+        let mut effects = Vec::with_capacity(4);
+        let mut out = Vec::with_capacity(16);
+        for round in 0..6 {
+            let command = tiny(0, 0, b"");
+            out.clear();
+            let ((), used) = blaze_alloc_count::measure(|| {
+                effects.push(Effect::Spawn { command, tag: Tag(round) });
+                driver.submit(&mut effects);
+                until(&mut driver, &mut out, 1);
+            });
+            let exit = exit(&out[0].done);
+            assert_eq!(exit.code, Some(0), "{out:?}");
+            // The first starts the launcher and grows the slabs, buffers and kept paths.
+            if round > 1 {
+                let payload = 2 + u64::from(exit.stdout.capacity() > 0);
+                assert!(
+                    used.allocations <= payload,
+                    "a warm handed run made {} allocations; its frame, its exit and its output are {payload}",
+                    used.allocations
+                );
+            }
+        }
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1743,7 +2498,7 @@ mod tests {
         run_until_idle(&mut driver, &mut effects, |done, effects| match (done.tag.0, done.done) {
             (1, Done::Accepted { conn }) => {
                 server = Some(conn);
-                effects.push(Effect::Recv { conn, most: 64, tag: Tag(3) });
+                effects.push(Effect::Recv { conn, most: 64, into: Vec::new(), tag: Tag(3) });
             }
             (2, Done::Connected { conn }) => {
                 client = Some(conn);
@@ -1753,21 +2508,20 @@ mod tests {
                 assert_eq!(bytes, b"ping");
                 let (server, client) = (server.unwrap(), client.unwrap());
                 effects.push(Effect::Send { conn: server, bytes: b"pong".to_vec(), tag: Tag(5) });
-                effects.push(Effect::Recv { conn: client, most: 64, tag: Tag(6) });
+                effects.push(Effect::Recv { conn: client, most: 64, into: Vec::new(), tag: Tag(6) });
             }
             (6, Done::Read(bytes)) => {
                 assert_eq!(bytes, b"pong");
                 effects.push(Effect::Hangup { conn: client.unwrap(), tag: Tag(7) });
-                effects.push(Effect::Recv { conn: server.unwrap(), most: 64, tag: Tag(8) });
+                effects.push(Effect::Recv { conn: server.unwrap(), most: 64, into: b"kept".to_vec(), tag: Tag(8) });
             }
             (8, Done::Read(bytes)) => {
-                assert!(bytes.is_empty(), "{bytes:?}");
+                assert_eq!(bytes, b"kept", "nothing appended once the peer hung up");
                 effects.push(Effect::Hangup { conn: server.unwrap(), tag: Tag(9) });
                 effects.push(Effect::Unlisten { tag: Tag(1) });
             }
-            (tag @ (4 | 5), Done::Sent) | (tag @ (7 | 9), Done::HungUp) | (tag @ 1, Done::Unlistened) => {
-                ends.push(tag)
-            }
+            (tag @ (4 | 5), Done::Sent(bytes)) if bytes.is_empty() => ends.push(tag),
+            (tag @ (7 | 9), Done::HungUp) | (tag @ 1, Done::Unlistened) => ends.push(tag),
             (tag, other) => panic!("{tag}: {other:?}"),
         });
         ends.sort();
@@ -1819,13 +2573,14 @@ mod tests {
         let seen = run(&mut driver, vec![
             Effect::Unwatch { tag: Tag(1) },
             Effect::Unlisten { tag: Tag(2) },
-            Effect::Recv { conn: Conn(77), most: 8, tag: Tag(3) },
+            Effect::Recv { conn: Conn(77), most: 8, into: b"kept".to_vec(), tag: Tag(3) },
             Effect::Hangup { conn: Conn(77), tag: Tag(4) },
             Effect::Connect { at: Address::Unix(name("nobody")), tag: Tag(5) },
             Effect::Kill { tag: Tag(6) },
         ]);
         assert_eq!(seen.keys().copied().collect::<Vec<_>>(), [1, 2, 3, 4, 5]);
-        assert!(seen.values().all(|it| matches!(it, Done::Failed(_))), "{seen:?}");
+        assert!(matches!(&seen[&3], Done::Broken { buffer, .. } if buffer == b"kept"), "{seen:?}");
+        assert!(seen.iter().all(|(tag, it)| *tag == 3 || matches!(it, Done::Failed(_))), "{seen:?}");
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -2379,9 +3134,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A warm send and receive on a connection: the bytes received are the one allocation.
+    /// A warm send and receive on a connection, each handed the buffer the last gave back,
+    /// allocate nothing.
     #[test]
-    fn a_warm_connection_sends_and_receives_only_its_bytes() {
+    fn a_warm_connection_sends_and_receives_into_buffers_handed_back() {
         let root = dir("budget-conn");
         let mut driver = Iocp::new(&root, 1).unwrap();
         let mut out = Vec::with_capacity(16);
@@ -2399,27 +3155,33 @@ mod tests {
         }
         let (server, client) = (server.unwrap(), client.unwrap());
         let mut effects = Vec::with_capacity(4);
+        let (mut sending, mut receiving) = (Vec::new(), Vec::new());
         for round in 0..4 {
-            let send = Effect::Send { conn: client, bytes: b"ping".to_vec(), tag: Tag(3) };
-            let recv = Effect::Recv { conn: server, most: 64, tag: Tag(4) };
+            sending.extend_from_slice(b"ping");
+            receiving.clear();
             out.clear();
             let ((), used) = blaze_alloc_count::measure(|| {
-                effects.push(send);
-                effects.push(recv);
+                let (bytes, into) = (std::mem::take(&mut sending), std::mem::take(&mut receiving));
+                effects.push(Effect::Send { conn: client, bytes, tag: Tag(3) });
+                effects.push(Effect::Recv { conn: server, most: 64, into, tag: Tag(4) });
                 driver.submit(&mut effects);
                 until(&mut driver, &mut out, 2);
             });
-            let mut ends: Vec<_> = out.iter().map(|it| (it.tag.0, it.done.clone())).collect();
-            ends.sort_by_key(|it| it.0);
-            assert_eq!(ends, [(3, Done::Sent), (4, Done::Read(b"ping".to_vec()))]);
             if round > 0 {
-                assert!(
-                    used.allocations <= 1,
-                    "a warm send and receive made {} allocations; the bytes received are one",
-                    used.allocations
-                );
+                assert_eq!(used.allocations, 0, "round {round}: a warm send and receive, their buffers reused");
+            }
+            out.sort_by_key(|it| it.tag);
+            match &mut out[..] {
+                [
+                    Completion { tag: Tag(3), done: Done::Sent(sent) },
+                    Completion { tag: Tag(4), done: Done::Read(read) },
+                ] if sent.is_empty() && read == b"ping" => {
+                    (sending, receiving) = (std::mem::take(sent), std::mem::take(read));
+                }
+                other => panic!("{other:?}"),
             }
         }
+        assert!(sending.capacity() >= 4 && receiving.capacity() >= 64, "the buffers keep their room");
         let seen = run(&mut driver, vec![
             Effect::Hangup { conn: client, tag: Tag(5) },
             Effect::Hangup { conn: server, tag: Tag(6) },

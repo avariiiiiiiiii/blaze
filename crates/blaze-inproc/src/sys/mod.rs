@@ -27,6 +27,15 @@
 //!   callers check), and `fn publish(&self, range: Range<usize>)`, the instruction-cache
 //!   maintenance for code written there (`dc cvau`, `dsb ish`, `ic ivau`, `dsb ish`, `isb`
 //!   on AArch64 as `CTR_EL0` asks; nothing on x86-64).
+//! - `struct Exec` (`Send + Sync`): private memory of this process, code then data, zero when
+//!   made, freed when dropped (`crate::exec`). `fn new(code: usize, data: usize, write: impl
+//!   FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error>`: `write` gets the code's `code`
+//!   bytes and the data's `data`, writable, at the addresses they run at, on the calling
+//!   thread; then the code is made read and execute (Linux `mprotect`, macOS `MAP_JIT` with
+//!   `pthread_jit_write_protect_np`, Windows `VirtualProtectEx`) with the instruction cache
+//!   maintenance `View::publish` does. The data is within 1 GiB of every code byte.
+//!   `fn code_address(&self) -> u64`, `fn data_address(&self) -> u64`,
+//!   `fn data(&mut self) -> &mut [u8]`.
 //! - `struct Stream` (`Send`): a connected byte stream of the channel.
 //!   `fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error>` (0 when the peer hung up),
 //!   `fn write_all(&mut self, bytes: &[u8]) -> Result<(), Error>`,
@@ -68,6 +77,8 @@
 //!   IDs of the live threads of process `pid` as `thread_id` names them; none for a process
 //!   that is gone.
 //! - `fn thread_id() -> u64`: the calling thread's, as the OS names it system-wide.
+//! - `fn service() -> Option<String>` (daemon): the Mach global name a sandboxed run looks up
+//!   to reach this daemon (macOS's rendezvous, `dev.blaze.inproc.<pid>`); none elsewhere.
 //! - `fn serialize()`: a context synchronization of the calling thread (`isb`; `cpuid` on
 //!   x86-64).
 //! - `fn backtrace(out: &mut [u64]) -> Option<usize>`: the return addresses of the calling

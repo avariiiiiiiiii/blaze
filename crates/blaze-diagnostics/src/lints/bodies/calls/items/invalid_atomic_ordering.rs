@@ -123,6 +123,7 @@ fn check_compare_exchange(b: &BodyCx<'_, '_>, expr: ExprId, method: &str, args: 
     if !matches!(ordering(b, arg), Some(Ordering::Release | Ordering::AcqRel)) {
         return;
     }
+    // alloc: the lint's diagnostic
     let message = format!(
         "`{method}`'s failure ordering may not be `Release` or `AcqRel`, since a failed `{method}` does not result in a write"
     );
@@ -177,6 +178,7 @@ fn diag(b: &BodyCx<'_, '_>, arg: ExprId, message: impl Into<String>) -> Option<D
 fn emit(b: &BodyCx<'_, '_>, expr: ExprId, def: FunctionId, mut diag: Diag, out: &mut Vec<Found>) {
     let Some(at) = b.expr_node(expr) else { return };
     let called = b.cx.def_path(ModuleDefId::FunctionId(def).into());
+    // alloc: the lint's diagnostic
     diag.fact(Fact::Signature(b.cx.key(ItemId::Function(def))), format!("the signature of `{called}`"));
     out.push(b.lint(diag, Phase::Late, at));
 }

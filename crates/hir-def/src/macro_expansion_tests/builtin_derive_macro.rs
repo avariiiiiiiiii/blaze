@@ -260,6 +260,7 @@ enum Command {
     Jump,
 }
 
+impl <> $crate::marker::StructuralPartialEq for Command< > where {}
 impl <> $crate::cmp::PartialEq for Command< > where {
     fn eq(&self , other: &Self ) -> bool {
         let __self_discr = $crate::intrinsics::discriminant_value(self );
@@ -299,6 +300,7 @@ enum Token {
     Star,
 }
 
+impl <> $crate::marker::StructuralPartialEq for Token< > where {}
 impl <> $crate::cmp::PartialEq for Token< > where {
     fn eq(&self , other: &Self ) -> bool {
         let __self_discr = $crate::intrinsics::discriminant_value(self );
@@ -329,6 +331,7 @@ enum Command {
     Jump,
 }
 
+impl <> $crate::marker::StructuralPartialEq for Command< > where {}
 const impl <> $crate::cmp::PartialEq for Command< > where {
     fn eq(&self , other: &Self ) -> bool {
         let __self_discr = $crate::intrinsics::discriminant_value(self );

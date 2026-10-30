@@ -92,9 +92,24 @@ pub(super) fn run_as(
     alone(Job::Run { spec: spec.clone(), program, unshared: Some(unshared) })
 }
 
+/// [`run`], and also what it and the sandbox wrote, which is not written to this test's stderr.
+#[cfg(target_os = "linux")]
+pub(super) fn run_said(spec: &super::Spec, program: Option<&[OsString]>) -> (Result<i32, String>, String) {
+    let program = program.map(<[OsString]>::to_vec);
+    // clone: once per sandbox a test makes, the job it is sent as.
+    said(Job::Run { spec: spec.clone(), program, unshared: None })
+}
+
 /// Runs this test binary again to do `job`, and what it answered. What it and the sandbox
 /// wrote is written to this test's stderr.
 fn alone(job: Job) -> Result<i32, String> {
+    let (answered, said) = said(job);
+    eprint!("{said}");
+    answered
+}
+
+/// [`alone`], and what it and the sandbox wrote.
+fn said(job: Job) -> (Result<i32, String>, String) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     // Once per sandbox a test makes: where its answer goes, and the job, for the process that
     // makes it.
@@ -113,12 +128,12 @@ fn alone(job: Job) -> Result<i32, String> {
         .output()
         .unwrap();
     // alloc: once per sandbox a test makes, what it wrote, read as text.
-    eprint!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+    let said = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
     let answered = std::fs::read(&answer);
     _ = std::fs::remove_file(&answer);
     match answered.ok().and_then(|it| serde_json::from_slice(&it).ok()) {
-        Some(answered) => answered,
-        None => panic!("the test binary run again answered nothing ({})", out.status),
+        Some(answered) => (answered, said),
+        None => panic!("the test binary run again answered nothing ({}): {said}", out.status),
     }
 }
 

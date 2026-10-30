@@ -6,7 +6,7 @@ use base_db::Db;
 use intern::{Symbol, sym};
 use span::{Edition, SyntaxContext};
 use syntax::utils::is_raw_identifier;
-use syntax::{ast, format_smolstr};
+use syntax::{ast, format_smolstr, view};
 
 /// `Name` is a wrapper around string, which is used in hir for both references
 /// and declarations. In theory, names should also carry hygiene info, but we are
@@ -291,6 +291,45 @@ impl AsName for ast::FieldKind {
         match self {
             ast::FieldKind::Name(nr) => nr.as_name(),
             ast::FieldKind::Index(idx) => {
+                let idx = idx.text().parse::<usize>().unwrap_or(0);
+                Name::new_tuple_field(idx)
+            }
+        }
+    }
+}
+
+impl AsName for view::NameRef<'_> {
+    fn as_name(&self) -> Name {
+        let text = self.text();
+        if text.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            && let Ok(idx) = text.parse::<usize>()
+        {
+            return Name::new_tuple_field(idx);
+        }
+        Name::new_root(text)
+    }
+}
+
+impl AsName for view::Name<'_> {
+    fn as_name(&self) -> Name {
+        Name::new_root(self.text())
+    }
+}
+
+impl AsName for view::NameOrNameRef<'_> {
+    fn as_name(&self) -> Name {
+        match self {
+            view::NameOrNameRef::Name(it) => it.as_name(),
+            view::NameOrNameRef::NameRef(it) => it.as_name(),
+        }
+    }
+}
+
+impl AsName for view::FieldKind<'_> {
+    fn as_name(&self) -> Name {
+        match self {
+            view::FieldKind::Name(nr) => nr.as_name(),
+            view::FieldKind::Index(idx) => {
                 let idx = idx.text().parse::<usize>().unwrap_or(0);
                 Name::new_tuple_field(idx)
             }

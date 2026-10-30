@@ -60,9 +60,11 @@ infers the body first.
 
 ### 3.1 The shape, classified once
 
-`consteval/hir_eval.rs`, `classify`: one walk of the body's expression tree that either
+`consteval/hir_eval.rs`, `Program::of`: one walk of the body's expression tree that either
 compiles it to a flat postorder program of at most 256 ops (on the stack, `ArrayVec`) or says
-the constant is outside the shape. A constant is in the shape when all of these hold, and is
+the constant is outside the shape. The four evaluation queries call `hir_eval::value`, which is
+`by_hir` for a constant of the shape and `by_mir` (the queries' MIR code, moved) for any other;
+`both` runs the two for the differential tests. A constant is in the shape when all of these hold, and is
 evaluated by MIR otherwise; that is the one path for it, so this is a split by shape, never a
 fallback (a constant in the shape never reaches MIR evaluation, and one outside never reaches
 this evaluator):
@@ -73,8 +75,12 @@ this evaluator):
 - **The body.** Inference of it has no type mismatch, no diagnostic and no error; its store has
   no macro call (MIR lowering refuses a body with a failed expansion, `check_expansions`, and
   the store cannot tell a failed one from a good one without the source map); its tree has at
-  most 256 nodes; the owner crate's const-eval budget has at least 4096 steps and 1 MiB (a
-  tree of 256 nodes runs at most 3 blocks a node, so MIR evaluation of it can never run out).
+  most 256 nodes; the const-eval budget and target of the constant's own crate (the ones
+  `Evaluator::with_machine` reads, not the environment's) have at least 4096 steps and 1 MiB
+  (a tree of 256 nodes runs at most 3 blocks a node, so MIR evaluation of it can never run out)
+  and a data layout. A constant of the shape uses no generic parameter, so its value is the
+  same for every `subst`; layouts are asked in the evaluation's environment, as the
+  evaluator's `layout` asks them.
 - **Every node** has no adjustment, and a type of kind `Int`, `Uint`, `Bool` or `Char`, and is
   one of:
   - a literal: `Int`, `Uint` (truncated to the type's width, as `lower_literal_to_operand`),
@@ -91,7 +97,8 @@ this evaluator):
   - a call with no arguments of `core::intrinsics::size_of`/`align_of` (by `intrinsic_of`), or
     of `core::mem::size_of`/`align_of` (their diagnostic items, in a crate of the toolchain),
     whose one type argument has no parameter, inference variable or error, and whose layout
-    is `Ok` and sized; the value is `layout.size` or `layout.align.abi`, as the shim's;
+    is `Ok` and sized, and whose type is `usize`; the value is `layout.size` or `layout.align`,
+    as the shim's;
   - a block with no statement and no label whose tail is in the shape.
 
 ### 3.2 Evaluation, with rustc's checks and MIR's exact errors
@@ -157,23 +164,33 @@ that does not read back under its key is an error naming the constant, never a r
 ## 4. What proves it
 
 - `crates/hir-ty/src/consteval/hir_eval/tests.rs` (no database):
-  - `ops_match_the_mir_evaluator`: the MIR evaluator's integer semantics (its `IntValue` ops,
-    the asserts pass's checks and its messages), copied into the test module, against
-    `ops.rs` on every operation, every integer type, at the edges (0, 1, -1, MIN, MAX, widths)
-    and on 200,000 random operands: identical bytes or identical message.
+  - `ops_match_the_reference`: a reference written as the MIR evaluator computes (each value
+    its native integer type read from its little-endian bytes, `checked_*` for the asserts
+    pass's checks, the shift amount as the unsigned type of its own width, `as` for casts)
+    against `ops.rs` on every operation, every integer type, `bool` and `char`, at the edges
+    (0, 1, -1, MIN, MAX, MIN+1, the width and its neighbours) and on random operands (2,000
+    rounds of every kind and operator): identical bits or identical panic.
+  - `every_check_fails_where_rustc_s_does`: each row of the table above at its boundary, for
+    every integer type.
   - `generated_trees_match`: random expression trees (literals of every integer type, every
     operator, casts, nested constants that fail) run by a reference tree-walker that follows
     MIR's statement order against the compiled program: identical bytes or error.
-  - `programs_are_postorder` and size assertions on `Op` and `Value`.
+  - `programs_allocate_nothing` (a literal's program and a failing one, with a control that
+    the counting allocator is installed) and `sizes` (`Op` at most 32 bytes, `Kind` and `Panic`
+    one).
 - `crates/hir-ide/src/tests/consteval/hir_eval.rs` (with a database, both evaluators; hir-ide is
   where the consteval fixtures are): every fixture `GOAL` of `tests/consteval.rs` and its
-  submodules is run by both paths when it is in the shape (`eval_goal` asks
-  `hir_eval::differential`), and generated programs (random literals and operators of every
+  submodules, and every other constant and explicit discriminant of its crate, is run by both
+  paths when it is in the shape (`eval_goal` calls `check_all`; a coordinator request),
+  hand fixtures pin the shape's edges (`the_shape`, `the_checks`, `layout_facts`,
+  `outside_the_shape`, each with the count of constants it must classify in the shape), and
+  generated programs (30 files of 40 constants, each also required to be in the shape) (random literals and operators of every
   integer type, overflow, division by zero, shifts out of range, failing named constants) are
   written as fixtures and evaluated by both: identical `Allocation` or identical
-  `ConstEvalError`. Allocation budget (`blaze-alloc-count`): a literal constant evaluates with
-  exactly the result's interning (one allocation, its bytes) and a second `const_eval` of it
-  allocates nothing.
+  `ConstEvalError`. Allocation budget (`blaze-alloc-count`): a second `const_eval` of a
+  constant (a memo hit) allocates nothing (`a_memo_hit_allocates_nothing`); evaluating a
+  program allocates nothing (hir-ty's `programs_allocate_nothing`), so a literal constant's one
+  allocation is its bytes for the interning.
 - `harness/v2/frontend/cases/const/` (child `frontend-fast-const-cases`): at least 40 programs
   run through rustc and blaze by `frontend-fast-diff`'s harness, covering each shape above and
   each edge where a constant leaves it (a method call, a float, a static, a generic, a macro),

@@ -514,11 +514,11 @@ fn infer_with_mismatches(content: &str, include_mismatches: bool) -> String {
     })
 }
 
-pub(crate) fn visit_module(
+pub(crate) fn visit_module<F: FnMut(ModuleDefId)>(
     db: &TestDB,
     crate_def_map: &DefMap,
     module_id: ModuleId,
-    cb: &mut dyn FnMut(ModuleDefId),
+    cb: &mut F,
 ) {
     visit_scope(db, crate_def_map, crate_def_map.module(db, module_id).scope(db), cb);
     for impl_id in crate_def_map.module(db, module_id).scope(db).impls() {
@@ -542,11 +542,11 @@ pub(crate) fn visit_module(
         }
     }
 
-    fn visit_scope(
+    fn visit_scope<F: FnMut(ModuleDefId)>(
         db: &TestDB,
         crate_def_map: &DefMap,
         scope: &ItemScope,
-        cb: &mut dyn FnMut(ModuleDefId),
+        cb: &mut F,
     ) {
         for decl in scope.declarations() {
             cb(decl);
@@ -586,7 +586,7 @@ pub(crate) fn visit_module(
         }
     }
 
-    fn visit_body(db: &TestDB, body: &Body, cb: &mut dyn FnMut(ModuleDefId)) {
+    fn visit_body<F: FnMut(ModuleDefId)>(db: &TestDB, body: &Body, cb: &mut F) {
         for (_, def_map) in body.blocks(db) {
             for (mod_id, _) in def_map.modules(db) {
                 visit_module(db, def_map, mod_id, cb);

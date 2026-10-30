@@ -331,8 +331,7 @@ impl<'db> rustc_type_ir::inherent::ValueConst<DbInterner<'db>> for ValueConst<'d
     }
 
     fn try_to_target_usize(self, interner: DbInterner<'db>) -> Option<u64> {
-        let data_layout = interner.db.target_data_layout_or_default(interner.expect_crate());
-        ValueConst::try_to_target_usize(self, data_layout)
+        ValueConst::try_to_target_usize(self, rustc_abi::HasDataLayout::data_layout(&interner))
     }
 }
 

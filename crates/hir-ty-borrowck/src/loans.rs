@@ -2,32 +2,36 @@
 //! `places_conflict.rs`: each borrow is a loan of a place, in scope from where it is made to
 //! where its region stops holding, or the reference to it is overwritten, or the place it
 //! borrows goes away.
+//!
+//! The borrows, the writes and the reads that activate a two-phase borrow are the decode's
+//! ([`Decoded`]), in reverse postorder and statement order, the order the loans are numbered
+//! in.
 
 use hir_def::{
     DefWithBodyId,
     hir::{Array, Expr},
 };
-use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind;
-use smallvec::SmallVec;
 
 use hir_ty::{
     InferBodyId,
-    mir::{
-        BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, OperandKind, PlaceElem,
-        ProjectionElem, Rvalue, StatementKind, TerminatorKind,
-    },
+    mir::{BasicBlockId, BorrowKind, LocalId, MirBody, MirSpan, MutBorrowKind, PlaceElem, ProjectionElem},
     next_solver::TyKind,
 };
 
 use super::{
     Ctx,
-    bitset::{BitMatrix, BitSet, Transfer},
-    cfg::{Cfg, Location, index},
-    dataflow::{GenKill, forward},
+    bitset::{BitSet, Transfer, bits},
+    cfg::{Cfg, Location, block, index},
+    dataflow::forward,
+    decode::{Decoded, NONE, WriteKind, local, raw},
+    inference::RegionValues,
     intervals::IntervalSet,
-    regions::{RegionValues, Regions, Rv},
+    mem::{self, FMap, FSet, FVec, Frame},
+    places::PlaceId,
+    regions::{Regions, Rv},
     relation::{Facts, Relation},
+    rows::{Dense, Edge, Effects, Rows, Store},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -39,7 +43,8 @@ pub(super) enum Activation {
 
 pub(super) struct Loan {
     pub(super) local: LocalId,
-    /// The range of [`Loans::projections`] the projection of the place borrowed is.
+    /// The range of [`Loans::projections`] the projection of the place borrowed is, and of
+    /// [`Loans::prefixes`] the places its prefixes are.
     projection: (u32, u32),
     pub(super) kind: BorrowKind,
     pub(super) region: Rv,
@@ -66,18 +71,21 @@ const ENDS_AT: u8 = 0;
 /// ends, by overwriting what holds them or ending the storage of what they borrow.
 const KILLED_AT: u8 = 0;
 
-pub(super) struct Loans {
-    pub(super) loans: Vec<Loan>,
+pub(super) struct Loans<'f> {
+    pub(super) loans: FVec<'f, Loan>,
     /// The projections of every loan's place, one after another.
-    projections: Vec<PlaceElem>,
+    projections: FVec<'f, PlaceElem>,
+    /// Beside each element of [`Self::projections`], the place it projects: the loan's place
+    /// up to that element, whose type the conflicts read.
+    prefixes: FVec<'f, PlaceId>,
     /// Each list in the order the loans were made, or for activations, found.
-    index: Relation,
-    scopes: Relation,
+    index: Relation<'f>,
+    scopes: Relation<'f>,
     /// What each point kills, found once with [`places_conflict`] for the entry sets and the
     /// walk, which replay it.
-    kills: Relation,
+    kills: Relation<'f>,
     /// The borrows of a promoted copy, which make no loan and read nothing.
-    pub(super) promoted: FxHashSet<Location>,
+    pub(super) promoted: FSet<'f, Location>,
 }
 
 /// How much of a place an access touches, as rustc's `AccessDepth`.
@@ -99,14 +107,15 @@ pub(super) enum Bias {
     NoOverlap,
 }
 
-/// Whether a borrow of `place` is not a loan rustc tracks: one through a shared reference or
-/// a raw pointer, which nothing the body does can invalidate.
-fn ignored<'db>(
-    ctx: &Ctx<'_, 'db>,
-    body: &MirBody<'db>,
+/// Whether a borrow of `local.projection`, whose prefixes are the places `prefixes` (root
+/// first), is not a loan rustc tracks: one through a shared reference or a raw pointer, which
+/// nothing the body does can invalidate.
+fn ignored(
+    ctx: &Ctx<'_, '_>,
     local: LocalId,
     projection: &[PlaceElem],
-    statics: &FxHashSet<LocalId>,
+    prefixes: &[PlaceId],
+    statics: &FSet<'_, LocalId>,
 ) -> bool {
     if statics.contains(&local) {
         return true;
@@ -114,13 +123,10 @@ fn ignored<'db>(
     let Some(last) = projection.iter().rposition(|it| *it == ProjectionElem::Deref) else {
         return false;
     };
-    let mut base = ctx.place_ty(body, local, &[]);
+    let places = ctx.places.borrow();
     for (index, elem) in projection[..=last].iter().enumerate() {
-        if index > 0 {
-            base = ctx.project(base, &projection[index - 1]);
-        }
         if *elem == ProjectionElem::Deref {
-            match base.ty.kind() {
+            match places.ty(prefixes[index]).ty.kind() {
                 TyKind::Ref(_, _, rustc_ast_ir::Mutability::Not) | TyKind::RawPtr(..) => {
                     return true;
                 }
@@ -161,23 +167,16 @@ fn plain_value<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, expr: hir_def::hir:
         owner: body.owner,
         store: ctx.store,
         infer: ctx.infer,
-        consts: &Default::default(),
+        consts: &std::cell::RefCell::new(mem::map(ctx.frame)),
     };
     cx.value(expr, 0).is_empty()
 }
 
 /// The locals a `static` is read through.
-pub(super) fn static_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
-    let mut found = FxHashSet::default();
-    for (_, block) in body.basic_blocks.iter() {
-        for statement in &block.statements {
-            if let StatementKind::Assign(place, Rvalue::Use(operand)) = &statement.kind
-                && let OperandKind::Static(_) = operand.kind
-                && place.projection.is_empty()
-            {
-                found.insert(place.local);
-            }
-        }
+pub(super) fn static_locals<'f>(frame: &'f Frame, decoded: &Decoded<'_>) -> FSet<'f, LocalId> {
+    let mut found = mem::set(frame);
+    for constant in decoded.constants.iter().filter(|it| it.is_static) {
+        found.insert(constant.local);
     }
     found
 }
@@ -186,13 +185,17 @@ pub(super) fn static_locals(body: &MirBody<'_>) -> FxHashSet<LocalId> {
 /// lifetime, into the value itself: the operand of a `&` the value is, or that is an element,
 /// a field, a tuple struct's or variant's constructor argument, a block's value or a cast
 /// operand of such. Likewise a `const { .. }` block's value.
-fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
-    let mut refs = FxHashSet::default();
+fn extended_temporaries<'a>(
+    ctx: &Ctx<'a, '_>,
+    body: &MirBody<'_>,
+    decoded: &Decoded<'_>,
+) -> FSet<'a, LocalId> {
+    let mut refs = mem::set(ctx.frame);
     let root = match body.owner {
         InferBodyId::AnonConstId(konst) if ctx.inline_const => Some(konst.loc(ctx.db).expr),
         _ => ctx.store.expr_roots().next_back(),
     };
-    let mut stack: Vec<_> = root.into_iter().collect();
+    let mut stack = mem::collect(ctx.frame, root);
     while let Some(expr) = stack.pop() {
         match ctx.store.expr(expr) {
             Expr::Const(inner) => stack.push(inner),
@@ -219,17 +222,14 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
             _ => (),
         }
     }
-    let mut found = FxHashSet::default();
-    for (_, block) in body.basic_blocks.iter() {
-        for statement in &block.statements {
-            if let StatementKind::Assign(_, Rvalue::Ref(_, place)) = &statement.kind
-                && let MirSpan::ExprId(expr) = statement.span
-                && refs.contains(&expr)
-                && place.projection.is_empty()
-                && !ctx.bindings.contains_key(&place.local)
-            {
-                found.insert(place.local);
-            }
+    let mut found = mem::set(ctx.frame);
+    for borrow in decoded.borrows() {
+        if let MirSpan::ExprId(expr) = borrow.span
+            && refs.contains(&expr)
+            && borrow.whole
+            && !ctx.bindings.contains_key(&borrow.local)
+        {
+            found.insert(borrow.local);
         }
     }
     found
@@ -241,10 +241,15 @@ fn extended_temporaries(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Loca
 /// mutability (`Ms::new(&[M::new("a")])`). A borrow is promoted only if it is shared, or of
 /// an empty array, and a call only where the item's value certainly runs it, not in a branch
 /// that may be dead code.
-fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
-    let certain = certain_blocks(body);
+fn const_promoted<'a>(
+    ctx: &Ctx<'a, '_>,
+    body: &MirBody<'_>,
+    decoded: &Decoded<'_>,
+) -> FSet<'a, LocalId> {
+    let certain = certain_blocks(ctx.frame, body, decoded);
     let calls = |expr: hir_def::hir::ExprId| {
-        let mut stack = vec![expr];
+        let mut stack = Vec::new_in(ctx.frame);
+        stack.push(expr);
         while let Some(expr) = stack.pop() {
             if is_call(ctx, expr) {
                 return true;
@@ -253,24 +258,21 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
         }
         false
     };
-    let mut found = FxHashSet::default();
-    for (id, block) in body.basic_blocks.iter() {
-        for statement in &block.statements {
-            if let StatementKind::Assign(_, Rvalue::Ref(_, place)) = &statement.kind
-                && let MirSpan::ExprId(expr) = statement.span
-                && let Expr::Ref { expr: inner, mutability, .. } = ctx.store.expr(expr)
-                && (mutability.is_shared()
-                    || matches!(ctx.store.expr(inner), Expr::Array(Array::ElementList { elements }) if elements.is_empty()))
-                && place.projection.is_empty()
-                && const_promotable(ctx, body, inner, 0)
-                && (certain.contains(&id) || !calls(inner))
+    let mut found = mem::set(ctx.frame);
+    for borrow in decoded.borrows() {
+        if let MirSpan::ExprId(expr) = borrow.span
+            && let Expr::Ref { expr: inner, mutability, .. } = ctx.store.expr(expr)
+            && (mutability.is_shared()
+                || matches!(ctx.store.expr(inner), Expr::Array(Array::ElementList { elements }) if elements.is_empty()))
+            && borrow.whole
+            && const_promotable(ctx, body, inner, 0)
+            && (certain.contains(&borrow.location.block) || !calls(inner))
+        {
+            let ty = body.locals[borrow.local].ty.as_ref();
+            if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
+                && ctx.drop_glue(ty) == hir_ty::drop::DropGlue::None
             {
-                let ty = body.locals[place.local].ty.as_ref();
-                if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
-                    && ctx.drop_glue(ty) == hir_ty::drop::DropGlue::None
-                {
-                    found.insert(place.local);
-                }
+                found.insert(borrow.local);
             }
         }
     }
@@ -279,19 +281,18 @@ fn const_promoted(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<LocalId> {
 
 /// The blocks a body certainly runs if it returns, rustc's `promotion_safe_blocks`: from the
 /// start on through gotos, calls, drops and asserts.
-fn certain_blocks(body: &MirBody<'_>) -> FxHashSet<hir_ty_mir::mir::BasicBlockId> {
-    let mut found = FxHashSet::default();
-    let mut block = body.start_block;
-    while found.insert(block) {
-        block = match body.basic_blocks[block].terminator.as_ref().map(|it| &it.kind) {
-            Some(
-                TerminatorKind::Goto { target }
-                | TerminatorKind::Call { target: Some(target), .. }
-                | TerminatorKind::Drop { target, .. }
-                | TerminatorKind::Assert { target, .. },
-            ) => *target,
-            _ => break,
-        };
+fn certain_blocks<'f>(
+    frame: &'f Frame,
+    body: &MirBody<'_>,
+    decoded: &Decoded<'_>,
+) -> FSet<'f, BasicBlockId> {
+    let mut found = mem::set(frame);
+    let mut at = body.start_block;
+    while found.insert(at) {
+        match decoded.certain[index(at)] {
+            NONE => break,
+            next => at = block(next as usize),
+        }
     }
     found
 }
@@ -301,82 +302,39 @@ fn certain_blocks(body: &MirBody<'_>) -> FxHashSet<hir_ty_mir::mir::BasicBlockId
 /// aggregates of them, of a type with no drop glue or interior mutability. The borrow
 /// neither reads the temporary nor holds it, so the `ref a` of `let ref a @ b = U;` does
 /// not borrow what `b` moves out.
-fn promoted_borrows(ctx: &Ctx<'_, '_>, body: &MirBody<'_>) -> FxHashSet<Location> {
-    fn define<'b>(
-        defs: &mut FxHashMap<LocalId, Option<&'b Rvalue>>,
-        local: LocalId,
-        rvalue: Option<&'b Rvalue>,
-    ) {
-        defs.entry(local).and_modify(|it| *it = None).or_insert(rvalue);
-    }
-    let mut defs = FxHashMap::default();
-    for (_, block) in body.basic_blocks.iter() {
-        for statement in &block.statements {
-            match &statement.kind {
-                StatementKind::Assign(place, rvalue) => {
-                    define(&mut defs, place.local, place.projection.is_empty().then_some(rvalue));
-                    // A mutable borrow of a part of the temporary is a use rustc's
-                    // `TempState` takes for a mutation, `&mut t.0` of `let ref a @ (ref mut
-                    // b, _) = (1, 2)`, so `a` borrows the temporary itself.
-                    if let Rvalue::Ref(BorrowKind::Mut { .. }, borrowed) = rvalue
-                        && !borrowed.projection.as_slice().is_empty()
-                    {
-                        define(&mut defs, borrowed.local, None);
-                    }
-                }
-                StatementKind::Deinit(place) => define(&mut defs, place.local, None),
-                _ => (),
-            }
-        }
-        if let Some(terminator) = &block.terminator
-            && let TerminatorKind::Call { destination, .. } = &terminator.kind
-        {
-            define(&mut defs, destination.local, None);
-        }
-    }
+fn promoted_borrows<'a>(
+    ctx: &Ctx<'a, '_>,
+    body: &MirBody<'_>,
+    decoded: &Decoded<'_>,
+) -> FSet<'a, Location> {
     let temp = |local: LocalId| {
         local != super::return_slot()
             && !body.param_locals.contains(&local)
             && !ctx.bindings.contains_key(&local)
     };
     fn promotable(
-        defs: &FxHashMap<LocalId, Option<&Rvalue>>,
+        decoded: &Decoded<'_>,
         temp: &impl Fn(LocalId) -> bool,
         local: LocalId,
         depth: usize,
     ) -> bool {
-        let operand = |operand: &hir_ty_mir::mir::Operand| match &operand.kind {
-            OperandKind::Constant { .. } | OperandKind::Allocation { .. } => true,
-            OperandKind::Copy(place) | OperandKind::Move(place) => {
-                place.projection.is_empty() && promotable(defs, temp, place.local, depth + 1)
-            }
-            OperandKind::Static(_) => false,
-        };
         depth < 16
             && temp(local)
-            && match defs.get(&local) {
-                Some(Some(Rvalue::Use(it))) => operand(it),
-                // A closure that captures nothing too, `unwrap_or(&|_| true)`.
-                Some(Some(Rvalue::Aggregate(kind, operands))) => {
-                    !matches!(kind, hir_ty_mir::mir::AggregateKind::Union(..))
-                        && operands.iter().all(operand)
-                }
-                _ => false,
-            }
+            && decoded.temp_of(local).is_some_and(|locals| {
+                locals.iter().all(|&it| promotable(decoded, temp, it, depth + 1))
+            })
     }
-    let mut found = FxHashSet::default();
-    for (block, data) in body.basic_blocks.iter() {
-        for (statement, it) in data.statements.iter().enumerate() {
-            if let StatementKind::Assign(_, Rvalue::Ref(BorrowKind::Shared, place)) = &it.kind
-                && !place.projection.as_slice().contains(&ProjectionElem::Deref)
-                && promotable(&defs, &temp, place.local, 0)
+    let mut found = mem::set(ctx.frame);
+    for borrow in decoded.borrows() {
+        if borrow.kind == BorrowKind::Shared
+            && !borrow.through_deref
+            && promotable(decoded, &temp, borrow.local, 0)
+        {
+            let ty = body.locals[borrow.local].ty.as_ref();
+            if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
+                && ctx.drop_glue(ty) == hir_ty::drop::DropGlue::None
             {
-                let ty = body.locals[place.local].ty.as_ref();
-                if hir_ty::drop::is_freeze(&ctx.infcx, ty, ctx.env)
-                    && ctx.drop_glue(ty) == hir_ty::drop::DropGlue::None
-                {
-                    found.insert(Location { block, statement });
-                }
+                found.insert(borrow.location);
             }
         }
     }
@@ -393,9 +351,7 @@ fn const_promotable(
     if depth > 16 {
         return false;
     }
-    let all = |exprs: Vec<hir_def::hir::ExprId>| {
-        exprs.into_iter().all(|it| const_promotable(ctx, body, it, depth + 1))
-    };
+    let promotable = |it: hir_def::hir::ExprId| const_promotable(ctx, body, it, depth + 1);
     match ctx.store.expr(expr) {
         Expr::Literal(_) => true,
         Expr::Path(path) => {
@@ -419,13 +375,13 @@ fn const_promotable(
                 Some(_) => true,
             }
         }
-        Expr::Array(Array::ElementList { elements }) => all(elements.to_vec()),
+        Expr::Array(Array::ElementList { elements }) => elements.iter().copied().all(promotable),
         Expr::Array(Array::Repeat { initializer, .. }) => {
             const_promotable(ctx, body, initializer, depth + 1)
         }
-        Expr::Tuple { exprs } => all(exprs.to_vec()),
+        Expr::Tuple { exprs } => exprs.iter().copied().all(promotable),
         Expr::RecordLit { fields, spread: hir_def::hir::RecordSpread::None, .. } => {
-            all(fields.iter().map(|it| it.expr).collect())
+            fields.iter().map(|it| it.expr).all(promotable)
         }
         Expr::Ref { expr, .. } | Expr::Cast { expr, .. } => {
             const_promotable(ctx, body, expr, depth + 1)
@@ -445,7 +401,7 @@ fn const_promotable(
             let dropped = args
                 .iter()
                 .any(|&it| ctx.drop_glue(ctx.infer.expr_ty(it)) != hir_ty::drop::DropGlue::None);
-            callable && !dropped && all(args.to_vec())
+            callable && !dropped && args.iter().copied().all(promotable)
         }
         // `NAME.as_str()` of a `const NAME`, as tracing's `fieldset!` names its fields.
         Expr::MethodCall { receiver, args, .. } => {
@@ -455,7 +411,9 @@ fn const_promotable(
             let dropped = std::iter::once(&receiver)
                 .chain(args.iter())
                 .any(|&it| ctx.drop_glue(ctx.infer.expr_ty(it)) != hir_ty::drop::DropGlue::None);
-            callable && !dropped && all(std::iter::once(receiver).chain(args.to_vec()).collect())
+            callable
+                && !dropped
+                && std::iter::once(receiver).chain(args.iter().copied()).all(promotable)
         }
         // A block of items and a tail is its tail in MIR, where rustc promotes.
         Expr::Block { statements, tail: Some(tail), .. }
@@ -467,33 +425,44 @@ fn const_promotable(
     }
 }
 
-impl Loans {
+impl<'a> Loans<'a> {
     pub(super) fn gather<'db>(
-        ctx: &Ctx<'_, 'db>,
+        ctx: &Ctx<'a, 'db>,
         body: &MirBody<'db>,
-        cfg: &Cfg,
-        regions: &Regions<'_>,
+        cfg: &Cfg<'_>,
+        decoded: &Decoded<'_>,
+        regions: &Regions<'_, '_>,
         unique: impl Fn(LocalId, LocalId, &[PlaceElem]) -> bool,
     ) -> Self {
-        let mut statics = static_locals(body);
+        let frame = ctx.frame;
+        let mut statics = static_locals(frame, decoded);
         // A promoted constant is `'static`, as a `static` is; so is what a `const` or `static`
         // item's value borrows, which becomes part of that value whatever it calls.
         let item = matches!(
             body.owner,
             InferBodyId::DefWithBodyId(DefWithBodyId::ConstId(_) | DefWithBodyId::StaticId(_))
         );
-        let (promoted, rejected): (Vec<_>, Vec<_>) =
-            body.promoted_locals.iter().partition(|&&(local, expr)| {
-                // rustc promotes no call, not even of a `const fn` in a `const` block.
-                item || (!is_call(ctx, expr)
-                    && (ctx.is_plain(body.locals[local].ty.as_ref())
-                        || plain_value(ctx, body, expr)))
-            });
+        // rustc promotes no call, not even of a `const fn` in a `const` block.
+        let promotes = |&(local, expr): &(LocalId, hir_def::hir::ExprId)| {
+            item || (!is_call(ctx, expr)
+                && (ctx.is_plain(body.locals[local].ty.as_ref())
+                    || plain_value(ctx, body, expr)))
+        };
+        let mut promoted: FVec<'_, &(LocalId, hir_def::hir::ExprId)> = Vec::new_in(frame);
+        let mut rejected = mem::set(frame);
+        for it in body.promoted_locals.iter() {
+            match promotes(it) {
+                true => promoted.push(it),
+                false => {
+                    rejected.insert(it.1);
+                }
+            }
+        }
         // Nor what borrows one it does not promote, `&&TEST_DROP`.
-        let rejected: FxHashSet<hir_def::hir::ExprId> =
-            rejected.into_iter().map(|&(_, expr)| expr).collect();
-        let borrows_rejected = |expr: hir_def::hir::ExprId| {
-            let mut stack = vec![expr];
+        let mut stack: FVec<'_, hir_def::hir::ExprId> = Vec::new_in(frame);
+        let mut borrows_rejected = |expr: hir_def::hir::ExprId| {
+            stack.clear();
+            stack.push(expr);
             while let Some(expr) = stack.pop() {
                 if rejected.contains(&expr) {
                     return true;
@@ -504,152 +473,122 @@ impl Loans {
         };
         statics.extend(
             promoted
-                .into_iter()
-                .filter(|&&(_, expr)| rejected.is_empty() || !borrows_rejected(expr))
-                .map(|&(local, _)| local),
+                .iter()
+                .filter(|&&&(_, expr)| rejected.is_empty() || !borrows_rejected(expr))
+                .map(|&&(local, _)| local),
         );
         if item {
-            statics.extend(extended_temporaries(ctx, body));
-            statics.extend(const_promoted(ctx, body));
+            statics.extend(extended_temporaries(ctx, body, decoded));
+            statics.extend(const_promoted(ctx, body, decoded));
         } else if ctx.inline_const {
-            statics.extend(extended_temporaries(ctx, body));
+            statics.extend(extended_temporaries(ctx, body, decoded));
         }
         // A function item is a constant of a type with no data, promoted where it is borrowed:
         // `&Trait::method`, which inference may leave without a type when it cannot tell `Self`.
-        for (_, block) in body.basic_blocks.iter() {
-            for statement in &block.statements {
-                if let StatementKind::Assign(place, Rvalue::Use(operand)) = &statement.kind
-                    && !matches!(operand.kind, OperandKind::Copy(_) | OperandKind::Move(_))
-                    && place.projection.is_empty()
-                    && matches!(
-                        body.locals[place.local].ty.as_ref().kind(),
-                        TyKind::FnDef(..) | TyKind::Error(_)
-                    )
-                {
-                    statics.insert(place.local);
-                }
+        for constant in decoded.constants.iter() {
+            if matches!(
+                body.locals[constant.local].ty.as_ref().kind(),
+                TyKind::FnDef(..) | TyKind::Error(_)
+            ) {
+                statics.insert(constant.local);
             }
         }
+        let borrows = decoded.reachable_borrows();
         let mut loans = Loans {
-            loans: Vec::new(),
-            projections: Vec::new(),
+            loans: Vec::with_capacity_in(borrows.len(), frame),
+            projections: Vec::new_in(frame),
+            prefixes: Vec::new_in(frame),
             index: Relation::default(),
             scopes: Relation::default(),
             kills: Relation::default(),
-            promoted: promoted_borrows(ctx, body),
+            promoted: promoted_borrows(ctx, body, decoded),
         };
-        let mut facts = Facts::default();
-        let mut two_phase: FxHashMap<LocalId, usize> = FxHashMap::default();
-        for &block in &cfg.order {
-            for (statement, it) in body.basic_blocks[block].statements.iter().enumerate() {
-                let StatementKind::Assign(place, Rvalue::Ref(kind, borrowed)) = &it.kind else {
-                    continue;
-                };
-                let location = Location { block, statement };
-                let projection = borrowed.projection.as_slice();
-                if ignored(ctx, body, borrowed.local, projection, &statics)
-                    || loans.promoted.contains(&location)
-                {
-                    continue;
-                }
-                let Some(&region) = regions.loan_regions.get(&location) else { continue };
-                let mut kind = *kind;
-                // rustc makes the mutable borrow a closure captures of a variable without
-                // `mut` a unique one.
-                if let BorrowKind::Mut { kind: MutBorrowKind::Default } = kind
-                    && unique(place.local, borrowed.local, projection)
-                {
-                    kind = BorrowKind::Mut { kind: MutBorrowKind::ClosureCapture };
-                }
-                let two = matches!(kind, BorrowKind::Mut { kind: MutBorrowKind::TwoPhasedBorrow })
-                    && place.projection.is_empty();
-                let id = loans.loans.len();
-                if two {
-                    two_phase.insert(place.local, id);
-                }
-                let start = loans.projections.len() as u32;
-                loans.projections.extend_from_slice(projection);
-                loans.loans.push(Loan {
-                    local: borrowed.local,
-                    projection: (start, loans.projections.len() as u32),
-                    kind,
-                    region,
-                    location,
-                    span: it.span,
-                    assigned: place.local,
-                    activation: if two {
-                        Activation::NotActivated
-                    } else {
-                        Activation::NotTwoPhase
-                    },
-                });
-                facts.push(MADE_AT, cfg.point(location), id);
-                facts.push(OF_LOCAL, borrowed.local.into_raw().into_u32() as usize, id);
+        let mut facts = Facts::with_capacity(frame, borrows.len() * 2);
+        let mut two_phase: FMap<'_, LocalId, usize> = mem::map(frame);
+        let mut chain: FVec<'_, PlaceId> = Vec::new_in(frame);
+        for borrow in borrows {
+            let location = borrow.location;
+            let projection = decoded.projection(borrow.place);
+            ctx.places.borrow().chain(borrow.place, &mut chain);
+            let prefixes = &chain[..projection.len()];
+            if ignored(ctx, borrow.local, projection, prefixes, &statics)
+                || loans.promoted.contains(&location)
+            {
+                continue;
             }
+            let Some(&region) = regions.loan_regions.get(&location) else { continue };
+            let mut kind = borrow.kind;
+            // rustc makes the mutable borrow a closure captures of a variable without
+            // `mut` a unique one.
+            if let BorrowKind::Mut { kind: MutBorrowKind::Default } = kind
+                && unique(borrow.assigned, borrow.local, projection)
+            {
+                kind = BorrowKind::Mut { kind: MutBorrowKind::ClosureCapture };
+            }
+            let two = matches!(kind, BorrowKind::Mut { kind: MutBorrowKind::TwoPhasedBorrow })
+                && borrow.assigned_whole;
+            let id = loans.loans.len();
+            if two {
+                two_phase.insert(borrow.assigned, id);
+            }
+            let start = loans.projections.len() as u32;
+            loans.projections.extend_from_slice(projection);
+            loans.prefixes.extend_from_slice(prefixes);
+            loans.loans.push(Loan {
+                local: borrow.local,
+                projection: (start, loans.projections.len() as u32),
+                kind,
+                region,
+                location,
+                span: borrow.span,
+                assigned: borrow.assigned,
+                activation: if two {
+                    Activation::NotActivated
+                } else {
+                    Activation::NotTwoPhase
+                },
+            });
+            facts.push(MADE_AT, cfg.point(location), id);
+            facts.push(OF_LOCAL, raw(borrow.local), id);
         }
         if !two_phase.is_empty() {
             // A two-phase borrow is activated by the first use of the reference.
-            for &block in &cfg.order {
-                let data = &body.basic_blocks[block];
-                for statement in 0..=data.statements.len() {
-                    let location = Location { block, statement };
-                    let mut used = Vec::new();
-                    if let Some(it) = data.statements.get(statement) {
-                        match &it.kind {
-                            StatementKind::Assign(place, rvalue) => {
-                                rvalue.for_each_operand(&mut |op| {
-                                    if let OperandKind::Copy(p) | OperandKind::Move(p) = &op.kind {
-                                        used.push(p.local);
-                                    }
-                                });
-                                if let Rvalue::Ref(_, p)
-                                | Rvalue::CopyForDeref(p)
-                                | Rvalue::Len(p)
-                                | Rvalue::Discriminant(p) = rvalue
-                                {
-                                    used.push(p.local);
-                                }
-                                if !place.projection.is_empty() {
-                                    used.push(place.local);
-                                }
-                            }
-                            _ => continue,
-                        }
-                    } else if let Some(terminator) = &data.terminator {
-                        terminator.kind.for_each_operand(&mut |op| {
-                            if let OperandKind::Copy(p) | OperandKind::Move(p) = &op.kind {
-                                used.push(p.local);
-                            }
-                        });
-                    }
-                    for local in used {
-                        if let Some(&id) = two_phase.get(&local)
+            for &block in cfg.order.iter() {
+                let start = cfg.block_start(block);
+                for point in start..=cfg.block_end(body, block) {
+                    let location = Location { block, statement: point - start };
+                    for &used in decoded.two_phase.of(point) {
+                        if let Some(&id) = two_phase.get(&local(used))
                             && loans.loans[id].activation == Activation::NotActivated
                             && loans.loans[id].location != location
                         {
                             loans.loans[id].activation = Activation::At(location);
-                            facts.push(ACTIVATED_AT, cfg.point(location), id);
+                            facts.push(ACTIVATED_AT, point, id);
                         }
                     }
                 }
             }
         }
         loans.index = facts.freeze(&[cfg.points, body.locals.len(), cfg.points]);
-        loans.kills = loans.find_kills(ctx, body, cfg);
+        loans.kills = loans.find_kills(ctx, body, cfg, decoded);
         loans
     }
 
     /// The loans each reachable point kills, in the order it kills them.
-    fn find_kills<'db>(&self, ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, cfg: &Cfg) -> Relation {
-        let mut facts = Facts::default();
+    fn find_kills<'db>(
+        &self,
+        ctx: &Ctx<'a, 'db>,
+        body: &MirBody<'db>,
+        cfg: &Cfg<'_>,
+        decoded: &Decoded<'_>,
+    ) -> Relation<'a> {
+        let mut facts = Facts::new(ctx.frame);
         if self.loans.is_empty() {
             return facts.freeze(&[cfg.points]);
         }
-        for &block in &cfg.order {
-            let data = &body.basic_blocks[block];
-            for statement in 0..=data.statements.len() {
-                let point = cfg.point(Location { block, statement });
-                self.killed_by(ctx, body, block, statement, &mut |id| {
+        for &block in cfg.order.iter() {
+            for point in cfg.block_start(block)..=cfg.block_end(body, block) {
+                self.killed_by(ctx, body, decoded, point, &mut |id| {
                     facts.push(KILLED_AT, point, id)
                 });
             }
@@ -657,51 +596,28 @@ impl Loans {
         facts.freeze(&[cfg.points])
     }
 
-    /// Calls `kill` with each loan the statement or terminator at `statement` of `block`
-    /// ends.
+    /// Calls `kill` with each loan the statement or terminator at `point` ends: a write
+    /// (an assignment, an `asm!` output, a call's destination, a `DropAndReplace`) or the end
+    /// of a local's storage.
     fn killed_by<'db>(
         &self,
-        ctx: &Ctx<'_, 'db>,
+        ctx: &Ctx<'a, 'db>,
         body: &MirBody<'db>,
-        block: BasicBlockId,
-        statement: usize,
+        decoded: &Decoded<'_>,
+        point: usize,
         kill: &mut impl FnMut(usize),
     ) {
-        let data = &body.basic_blocks[block];
-        if let Some(statement) = data.statements.get(statement) {
-            match &statement.kind {
-                StatementKind::Assign(place, _) => {
-                    self.kill_on_place(ctx, body, place.local, place.projection.as_slice(), kill)
-                }
-                StatementKind::StorageDead(local) => {
-                    for &id in self.of_local(*local) {
-                        kill(id as usize);
-                    }
-                }
-                StatementKind::InlineAsm(asm) => {
-                    for operand in &asm.operands {
-                        if let hir_ty_mir::mir::AsmOperand::Reg { output: Some(output), .. } =
-                            operand
-                        {
-                            self.kill_on_place(
-                                ctx,
-                                body,
-                                output.local,
-                                output.projection.as_slice(),
-                                kill,
-                            );
-                        }
-                    }
-                }
-                _ => (),
+        for written in decoded.writes.of(point) {
+            if written.kind != WriteKind::Yield {
+                let place = written.place;
+                let projection = decoded.projection(place);
+                self.kill_on_place(ctx, body, decoded.local(place), projection, kill);
             }
-        } else if let Some(terminator) = &data.terminator {
-            match &terminator.kind {
-                TerminatorKind::Call { destination: place, .. }
-                | TerminatorKind::DropAndReplace { place, .. } => {
-                    self.kill_on_place(ctx, body, place.local, place.projection.as_slice(), kill)
-                }
-                _ => (),
+        }
+        let dead = decoded.dead[point];
+        if dead != NONE {
+            for &id in self.of_local(local(dead)) {
+                kill(id as usize);
             }
         }
     }
@@ -718,27 +634,35 @@ impl Loans {
     }
 
     /// The loans of a place of `local`, in the order they were made.
-    pub(super) fn of_local(&self, local: LocalId) -> &[u32] {
-        self.index.get(OF_LOCAL, local.into_raw().into_u32() as usize)
+    pub(super) fn of_local(&self, local: LocalId) -> &'a [u32] {
+        self.index.get(OF_LOCAL, raw(local))
     }
 
     /// The two-phase loans first used at `point`.
-    pub(super) fn activated_at(&self, point: usize) -> &[u32] {
+    pub(super) fn activated_at(&self, point: usize) -> &'a [u32] {
         self.index.get(ACTIVATED_AT, point)
     }
 
     /// Where each loan goes out of scope: the first points past it its region does not hold
     /// at, as rustc's `OutOfScopePrecomputer`.
-    pub(super) fn compute_scopes(&mut self, body: &MirBody<'_>, cfg: &Cfg, values: &RegionValues) {
-        let mut facts = Facts::default();
+    pub(super) fn compute_scopes(
+        &mut self,
+        ctx: &Ctx<'a, '_>,
+        body: &MirBody<'_>,
+        cfg: &Cfg<'_>,
+        values: &RegionValues<'_>,
+    ) {
+        let mut facts = Facts::new(ctx.frame);
+        let mut walk = ScopeWalk::new(ctx.frame, body.basic_blocks.len());
         for id in 0..self.loans.len() {
             let points = values.points_of(self.loans[id].region);
-            let ends = out_of_scope(body, cfg, self.loans[id].location, |start, end| {
-                points.first_absent_in(start, end)
-            });
-            for point in ends {
-                facts.push(ENDS_AT, point, id);
-            }
+            walk.out_of_scope(
+                body,
+                cfg,
+                self.loans[id].location,
+                |start, end| points.first_absent_in(start, end),
+                |point| facts.push(ENDS_AT, point, id),
+            );
         }
         self.scopes = facts.freeze(&[cfg.points]);
     }
@@ -747,51 +671,56 @@ impl Loans {
     /// that it is not live at, as rustc's `PoloniusOutOfScopePrecomputer`.
     pub(super) fn compute_polonius_scopes(
         &mut self,
+        ctx: &Ctx<'a, '_>,
         body: &MirBody<'_>,
-        cfg: &Cfg,
-        live: &[IntervalSet],
+        cfg: &Cfg<'_>,
+        live: &[IntervalSet<'_>],
     ) {
-        let mut facts = Facts::default();
+        let mut facts = Facts::new(ctx.frame);
+        let mut walk = ScopeWalk::new(ctx.frame, body.basic_blocks.len());
         for id in 0..self.loans.len() {
             let issued = cfg.point(self.loans[id].location);
             // The loan is in scope where it is made, live there or not.
-            let ends = out_of_scope(body, cfg, self.loans[id].location, |start, end| {
-                match live[id].first_absent_in(start, end) {
+            walk.out_of_scope(
+                body,
+                cfg,
+                self.loans[id].location,
+                |start, end| match live[id].first_absent_in(start, end) {
                     Some(point) if point == issued => {
                         (point < end).then(|| live[id].first_absent_in(point + 1, end)).flatten()
                     }
                     other => other,
-                }
-            });
-            for point in ends {
-                facts.push(ENDS_AT, point, id);
-            }
+                },
+                |point| facts.push(ENDS_AT, point, id),
+            );
         }
         self.scopes = facts.freeze(&[cfg.points]);
     }
 
     /// The loans in scope at the start of each block, a row per block: rustc's `Borrows`.
-    pub(super) fn entry_sets(&self, body: &MirBody<'_>, cfg: &Cfg) -> BitMatrix {
+    pub(super) fn entry_sets(&self, ctx: &Ctx<'a, '_>, body: &MirBody<'_>, cfg: &Cfg<'_>) -> Rows<'a> {
+        let frame = ctx.frame;
         let blocks = body.basic_blocks.len();
         let count = self.loans.len();
         if count == 0 {
-            return BitMatrix::new(blocks, 0);
+            return Rows::Dense(Dense::new(frame, blocks, 0));
         }
-        let mut transfer = GenKill::new(blocks, count);
-        for &block in &cfg.order {
-            let data = &body.basic_blocks[block];
+        let mut transfer = Effects::new(frame, blocks, count);
+        for &block in cfg.order.iter() {
+            let start = cfg.block_start(block);
             let mut row = transfer.row(index(block));
-            for statement in 0..=data.statements.len() {
-                let location = Location { block, statement };
+            for point in start..=cfg.block_end(body, block) {
+                let location = Location { block, statement: point - start };
                 self.before(cfg, location, &mut row);
                 self.after(cfg, location, &mut row);
             }
         }
-        forward(cfg, &transfer, body.start_block, &BitSet::new(count), |_, _, _| ())
+        let boundary = bits(frame, count);
+        forward(frame, cfg, &transfer, body.start_block, boundary.words(), |_, _| Edge::Same)
     }
 
     /// The loans that go out of scope as `location` starts.
-    pub(super) fn before(&self, cfg: &Cfg, location: Location, state: &mut impl Transfer) {
+    pub(super) fn before(&self, cfg: &Cfg<'_>, location: Location, state: &mut impl Transfer) {
         for &id in self.scopes.get(ENDS_AT, cfg.point(location)) {
             state.kill(id as usize);
         }
@@ -799,7 +728,7 @@ impl Loans {
 
     /// What the statement or terminator at `location` does to the loans in scope: the kills
     /// [`Self::find_kills`] found, then the loan it makes.
-    pub(super) fn after(&self, cfg: &Cfg, location: Location, state: &mut impl Transfer) {
+    pub(super) fn after(&self, cfg: &Cfg<'_>, location: Location, state: &mut impl Transfer) {
         let point = cfg.point(location);
         for &id in self.kills.get(KILLED_AT, point) {
             state.kill(id as usize);
@@ -812,7 +741,7 @@ impl Loans {
     /// rustc's `kill_borrows_on_place`: overwriting a local ends every loan of what it holds.
     fn kill_on_place<'db>(
         &self,
-        ctx: &Ctx<'_, 'db>,
+        ctx: &Ctx<'a, 'db>,
         body: &MirBody<'db>,
         local: LocalId,
         projection: &[PlaceElem],
@@ -838,47 +767,71 @@ impl Loans {
     }
 }
 
-/// The first points reachable from just past `issued` that are not in scope, given
-/// `first_absent(start, end)`, the first point of `start..=end` not in scope. It walks whole
-/// blocks: a block's points are consecutive, so one lookup finds where a loan ends in it.
-fn out_of_scope(
-    body: &MirBody<'_>,
-    cfg: &Cfg,
-    issued: Location,
-    mut first_absent: impl FnMut(usize, usize) -> Option<usize>,
-) -> SmallVec<[usize; 2]> {
-    let mut out = SmallVec::new();
-    let last = |block: BasicBlockId| {
-        cfg.point(Location { block, statement: body.basic_blocks[block].statements.len() })
-    };
-    let mut entered = BitSet::new(body.basic_blocks.len());
-    let mut work: Vec<BasicBlockId> = Vec::new();
-    // The rest of the issuing block, if the loan is not made by its terminator.
-    let issued_point = cfg.point(issued);
-    let rest = issued.statement < body.basic_blocks[issued.block].statements.len();
-    if rest {
-        match first_absent(issued_point + 1, last(issued.block)) {
-            Some(point) => out.push(point),
-            None => work.extend(cfg.successors(issued.block).iter().copied()),
-        }
-    } else {
-        work.extend(cfg.successors(issued.block).iter().copied());
-    }
-    while let Some(block) = work.pop() {
-        if !entered.insert(index(block)) {
-            continue;
-        }
-        let start = cfg.point(Location { block, statement: 0 });
-        // Coming back around to the issuing block, the points past the loan were seen.
-        let (end, through) =
-            if rest && block == issued.block { (issued_point, false) } else { (last(block), true) };
-        match first_absent(start, end) {
-            Some(point) => out.push(point),
-            None if through => work.extend(cfg.successors(block).iter().copied()),
-            None => (),
+/// What [`ScopeWalk::out_of_scope`] keeps from one loan to the next: the blocks a walk
+/// entered, as a set and as a list to clear it by.
+struct ScopeWalk<'f> {
+    entered: BitSet<'f>,
+    entered_list: FVec<'f, BasicBlockId>,
+    work: FVec<'f, BasicBlockId>,
+}
+
+impl<'f> ScopeWalk<'f> {
+    fn new(frame: &'f Frame, blocks: usize) -> Self {
+        ScopeWalk {
+            entered: bits(frame, blocks),
+            entered_list: Vec::new_in(frame),
+            work: Vec::new_in(frame),
         }
     }
-    out
+
+    /// Gives `end_at` the first points reachable from just past `issued` that are not in
+    /// scope, given `first_absent(start, end)`, the first point of `start..=end` not in
+    /// scope. It walks whole blocks: a block's points are consecutive, so one lookup finds
+    /// where a loan ends in it.
+    fn out_of_scope(
+        &mut self,
+        body: &MirBody<'_>,
+        cfg: &Cfg<'_>,
+        issued: Location,
+        mut first_absent: impl FnMut(usize, usize) -> Option<usize>,
+        mut end_at: impl FnMut(usize),
+    ) {
+        for block in self.entered_list.drain(..) {
+            self.entered.remove(index(block));
+        }
+        self.work.clear();
+        let work = &mut self.work;
+        let last = |block: BasicBlockId| cfg.block_end(body, block);
+        // The rest of the issuing block, if the loan is not made by its terminator.
+        let issued_point = cfg.point(issued);
+        let rest = issued.statement < body.basic_blocks[issued.block].statements.len();
+        if rest {
+            match first_absent(issued_point + 1, last(issued.block)) {
+                Some(point) => end_at(point),
+                None => work.extend(cfg.successors(issued.block).iter().copied()),
+            }
+        } else {
+            work.extend(cfg.successors(issued.block).iter().copied());
+        }
+        while let Some(block) = work.pop() {
+            if !self.entered.insert(index(block)) {
+                continue;
+            }
+            self.entered_list.push(block);
+            let start = cfg.block_start(block);
+            // Coming back around to the issuing block, the points past the loan were seen.
+            let (end, through) = if rest && block == issued.block {
+                (issued_point, false)
+            } else {
+                (last(block), true)
+            };
+            match first_absent(start, end) {
+                Some(point) => end_at(point),
+                None if through => work.extend(cfg.successors(block).iter().copied()),
+                None => (),
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -892,8 +845,8 @@ enum Overlap {
 /// borrows, as rustc's `borrow_conflicts_with_place`.
 pub(super) fn places_conflict<'db>(
     ctx: &Ctx<'_, 'db>,
-    body: &MirBody<'db>,
-    loans: &Loans,
+    _body: &MirBody<'db>,
+    loans: &Loans<'_>,
     id: usize,
     local: LocalId,
     projection: &[PlaceElem],
@@ -905,12 +858,10 @@ pub(super) fn places_conflict<'db>(
         return false;
     }
     let borrow = loans.projection(id);
-    // Each prefix's type from the one before, as `multi_projection_ty` folds them.
-    let mut base_ty = ctx.place_ty(body, local, &[]);
+    let prefixes = &loans.prefixes[loan.projection.0 as usize..loan.projection.1 as usize];
     for (index, &elem) in borrow.iter().enumerate() {
-        if index > 0 {
-            base_ty = ctx.project(base_ty, &borrow[index - 1]);
-        }
+        // Each prefix's type, as `multi_projection_ty` folds them.
+        let base_ty = ctx.places.borrow().ty(prefixes[index]);
         if let Some(&access) = projection.get(index) {
             match projection_conflict(ctx, base_ty, elem, access, bias) {
                 Overlap::Arbitrary => return true,

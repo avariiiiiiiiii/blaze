@@ -17,7 +17,7 @@ use hir_def::{
 use hir_ty::{
     InferBodyId, ParamEnvAndCrate,
     db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
-    next_solver::{DbInterner, GenericArgs, ParamEnv, TyKind},
+    next_solver::{DbInterner, GenericArgs, ParamEnv, Region, TyKind},
 };
 use hir_ty_mir::mir::overflow::crate_checks_overflow;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -47,6 +47,16 @@ impl<'db> Databases<'db> {
     }
 }
 
+/// The check of the bodies a build compiles, run beside it: told what the walk reaches, and
+/// whether the build's outcome is already its failure.
+pub trait BodyChecks: Sync {
+    /// Check these first: bodies the build reached. Any the check does not hold is passed over.
+    fn reached(&self, bodies: &[DefWithBodyId]);
+
+    /// Whether a check failed: what the build makes is then not used.
+    fn stopped(&self) -> bool;
+}
+
 /// The front end of a v2 build.
 pub struct HirFrontend<'db> {
     pub(crate) databases: Databases<'db>,
@@ -54,6 +64,8 @@ pub struct HirFrontend<'db> {
     pub(crate) build_time: BuildTime,
     /// Which origins' units MIR-inline: what a function's references are walked for.
     inlining: Option<Inlining>,
+    // dyn: called once a level of the walk, never per instance
+    checks: Option<&'db dyn BodyChecks>,
 }
 
 /// Whether some unit of each origin of the build's [`Policy`] MIR-inlines
@@ -118,7 +130,14 @@ impl Inlining {
 
 impl<'db> HirFrontend<'db> {
     pub fn new(databases: Databases<'db>, hashes: HashSource, build_time: BuildTime) -> Self {
-        HirFrontend { databases, hashes, build_time, inlining: None }
+        HirFrontend { databases, hashes, build_time, inlining: None, checks: None }
+    }
+
+    /// The front end of a build whose unit's bodies `checks` checks beside it.
+    // dyn: called once a level of the walk, never per instance
+    pub fn with_checks(mut self, checks: &'db dyn BodyChecks) -> Self {
+        self.checks = Some(checks);
+        self
     }
 
     /// The front end of a build compiled as `policy` says: what describing and preparing a
@@ -165,17 +184,7 @@ impl<'db> HirFrontend<'db> {
     /// A function that is not generic, as a root of the build: `main`, a test, an exported
     /// function.
     pub fn root(&self, func: FunctionId) -> HirInstance {
-        self.databases.with(|db, homes| {
-            let krate = func.krate(db);
-            let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate }.store();
-            let instance = Instance {
-                def: InstanceDef::Fn(func),
-                args: GenericArgs::new_from_slice(&[]).store(),
-                checked: false,
-            };
-            let env = homes.home(db, &instance, &env);
-            HirInstance(Kind::Code(instance, env))
-        })
+        self.databases.with(|db, homes| root_in(db, homes, func))
     }
 
     /// The C `main` of a program whose `fn main` is `main`.
@@ -229,6 +238,7 @@ impl<'db> HirFrontend<'db> {
             overflow_checks,
             address: if symbol.is_some() { Address::Significant } else { Address::Free },
             symbol,
+            name: super::linked::debug_name(db, &instance.0),
             refs,
             built_in,
         })
@@ -299,6 +309,60 @@ impl Frontend for HirFrontend<'_> {
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
         self.with(|db, homes| self.described_static(db, homes, value))
     }
+
+    fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
+        let Some(checks) = self.checks else { return };
+        let bodies: Vec<DefWithBodyId> = self.with(|db, _| {
+            (functions.iter().filter_map(|(instance, _)| body_of(db, instance)))
+                .chain(statics.iter().map(|it| DefWithBodyId::StaticId(it.0)))
+                // alloc: once a level of the walk, sized by it
+                .collect()
+        });
+        checks.reached(&bodies);
+    }
+
+    fn stopped(&self) -> bool {
+        self.checks.is_some_and(|it| it.stopped())
+    }
+}
+
+/// The body whose check an instance's code waits on: a function's, or that of the item a
+/// closure or coroutine is written in. `None` for a shim, `asm!`, the allocator's and a closure
+/// in an anonymous constant, which their module's item checks cover.
+fn body_of(db: &Db, instance: &HirInstance) -> Option<DefWithBodyId> {
+    match &instance.0 {
+        Kind::Code(instance, _) => match instance.def {
+            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.into()),
+            def @ (InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_)) => match closure_loc(db, def)?.owner {
+                InferBodyId::DefWithBodyId(owner) => Some(owner),
+                InferBodyId::AnonConstId(_) => None,
+            },
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
+        },
+        Kind::Start(main) => Some((*main).into()),
+        Kind::Asm(_) | Kind::Allocator(_) => None,
+    }
+}
+
+/// [`HirFrontend::root`] in a task's `homes`. Each lifetime parameter is erased, as in the
+/// instance a call names, so the root and the call are one instance.
+pub(crate) fn root_in(db: &Db, homes: &mut Homes, func: FunctionId) -> HirInstance {
+    let krate = func.krate(db);
+    let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate }.store();
+    let interner = DbInterner::new_no_crate(db);
+    let erased = Region::new_erased(interner);
+    let instance = Instance {
+        def: InstanceDef::Fn(func),
+        args: GenericArgs::for_item(interner, func.into(), |_, _, _, _| erased.into()).store(),
+        checked: false,
+    };
+    let env = homes.home(db, &instance, &env);
+    HirInstance(Kind::Code(instance, env))
 }
 
 /// The code hashes of the instances whose bodies the IR of `instance` builds in, at any depth,

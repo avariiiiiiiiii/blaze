@@ -73,6 +73,7 @@ impl<'a> Parser<'a> {
         let (is_source_literal, end_of_snippet, pre_input_vec) = match snippet {
             Some(snippet) if snippet.starts_with('"') && snippet.len() >= 2 => {
                 let without_quotes = &snippet[1..snippet.len() - 1];
+                // alloc: once per format string of a diagnostic attribute, as is all of `new`
                 let (mut ok, mut vec) = (true, Vec::new());
                 let mut chars = input.chars();
                 syntax::unescape::unescape_str(without_quotes, |range, res| match res {
@@ -86,10 +87,13 @@ impl<'a> Parser<'a> {
                 if ok && chars.as_str().is_empty() {
                     (true, 1 + end, vec)
                 } else {
+                    // alloc: empty, allocates nothing
                     (false, snippet.len(), Vec::new())
                 }
             }
+            // alloc: as above
             Some(snippet) => (false, snippet.len(), Vec::new()),
+            // alloc: as above
             None => (false, input.len(), Vec::new()),
         };
         let input_vec = if pre_input_vec.is_empty() {
@@ -99,14 +103,17 @@ impl<'a> Parser<'a> {
                     let i = idx + quote_offset;
                     (i..i + c.len_utf8(), idx, c)
                 })
+                // alloc: the format string's chars, once per format string
                 .collect()
         } else {
             input
                 .char_indices()
                 .zip(pre_input_vec)
                 .map(|((i, c), (r, _))| (r.start + quote_offset..r.end + quote_offset, i, c))
+                // alloc: as above
                 .collect()
         };
+        // alloc: empty until an error
         Parser { input, input_vec, index: 0, errors: Vec::new(), is_source_literal, end_of_snippet }
     }
 
@@ -136,7 +143,9 @@ impl<'a> Parser<'a> {
                     Some(Piece::Lit)
                 } else {
                     self.errors.push(ParseError {
+                        // alloc: an error's text, as is each `ParseError`'s below
                         description: "unmatched `}` found".to_owned(),
+                        // alloc: as above
                         label: "unmatched `}`".to_owned(),
                         span: start..end,
                     });
@@ -174,9 +183,12 @@ impl<'a> Parser<'a> {
 
     fn missing_closing_brace(&mut self, arg: &Argument<'_>) {
         let (range, description) = match self.peek() {
+            // alloc: as above
             Some((r, _, c)) => (r.start..r.start, format!("expected `}}`, found `{}`", c.escape_debug())),
+            // alloc: as above
             None => (self.end_of_snippet..self.end_of_snippet, "expected `}` but string was terminated".to_owned()),
         };
+        // alloc: as above
         self.errors.push(ParseError { description, label: "expected `}`".to_owned(), span: range.start..range.start });
         if let (Some((_, _, c)), Some((_, _, nc))) = (self.peek(), self.peek_ahead()) {
             match (c, nc) {
@@ -234,7 +246,9 @@ impl<'a> Parser<'a> {
                     let word = self.word();
                     let full_span = start..self.index2range(self.index).start;
                     self.errors.insert(0, ParseError {
+                        // alloc: as above
                         description: "raw identifiers are not supported".to_owned(),
+                        // alloc: as above
                         label: "raw identifier used here".to_owned(),
                         span: full_span,
                     });
@@ -255,6 +269,7 @@ impl<'a> Parser<'a> {
 
     fn index2range(&self, index: usize) -> Range<usize> {
         match self.input_vec.get(index) {
+            // clone: a range, two integers copied
             Some((r, _, _)) => r.clone(),
             None => self.end_of_snippet..self.end_of_snippet,
         }
@@ -289,7 +304,9 @@ impl<'a> Parser<'a> {
         let word = &self.input[self.index2pos(index)..end];
         if word == "_" {
             self.errors.push(ParseError {
+                // alloc: as above
                 description: "invalid argument name `_`".to_owned(),
+                // alloc: as above
                 label: "invalid argument name".to_owned(),
                 span: self.index2range(index).start..err_end,
             });
@@ -314,10 +331,12 @@ impl<'a> Parser<'a> {
         if overflow {
             let overflowed = &self.input[self.index2pos(start_index)..self.index2pos(self.index)];
             self.errors.push(ParseError {
+                // alloc: as above
                 description: format!(
                     "integer `{overflowed}` does not fit into the type `u16` whose range is `0..={}`",
                     u16::MAX
                 ),
+                // alloc: as above
                 label: "integer out of range for `u16`".to_owned(),
                 span: self.index2range(start_index).start..self.index2range(self.index).end,
             });
@@ -331,7 +350,9 @@ impl<'a> Parser<'a> {
         if let (Some((range, _)), Some(_)) = (question, colon) {
             self.word();
             self.errors.insert(0, ParseError {
+                // alloc: as above
                 description: "expected format parameter to occur after `:`".to_owned(),
+                // alloc: as above
                 label: "expected `?` to occur after `:`".to_owned(),
                 span: range,
             });
@@ -341,7 +362,9 @@ impl<'a> Parser<'a> {
     fn missing_colon_before_debug_formatter(&mut self) {
         if let Some((range, _)) = self.consume_pos('?') {
             self.errors.insert(0, ParseError {
+                // alloc: as above
                 description: "expected `}`, found `?`".to_owned(),
+                // alloc: as above
                 label: "expected `:` before `?` to format with `Debug`".to_owned(),
                 span: range,
             });
@@ -352,7 +375,9 @@ impl<'a> Parser<'a> {
         if let Some((range, _)) = self.consume_pos('=') {
             self.errors.insert(0, ParseError {
                 description: "python's f-string debug `=` is not supported in rust, use `dbg(x)` instead"
+                    // alloc: as above
                     .to_owned(),
+                // alloc: as above
                 label: "expected `}`".to_owned(),
                 span: range,
             });
@@ -363,7 +388,9 @@ impl<'a> Parser<'a> {
         if let Some((range, _)) = self.consume_pos(alignment) {
             self.errors.insert(0, ParseError {
                 description: "expected alignment specifier after `:` in format string; example: `{:>?}`"
+                    // alloc: as above
                     .to_owned(),
+                // alloc: as above
                 label: format!("expected `{alignment}` to occur after `:`"),
                 span: range,
             });
@@ -373,7 +400,9 @@ impl<'a> Parser<'a> {
     fn suggest_unsupported_python_numeric_grouping(&mut self) {
         if let Some((range, _)) = self.consume_pos(',') {
             self.errors.insert(0, ParseError {
+                // alloc: as above
                 description: "python's numeric grouping `,` is not supported in rust format strings".to_owned(),
+                // alloc: as above
                 label: "expected `}`".to_owned(),
                 span: range,
             });
@@ -383,7 +412,9 @@ impl<'a> Parser<'a> {
     fn suggest_format_missing_colon_for_sign(&mut self) {
         if let Some((range, _)) = self.consume_pos('+') {
             self.errors.insert(0, ParseError {
+                // alloc: as above
                 description: "the `+` sign flag must appear after `:` in a format string".to_owned(),
+                // alloc: as above
                 label: "expected `:` before `+` sign flag".to_owned(),
                 span: range,
             });
@@ -407,7 +438,9 @@ impl<'a> Parser<'a> {
             Position::Implicit => return,
         };
         self.errors.insert(0, ParseError {
+            // alloc: as above
             description: description.to_owned(),
+            // alloc: as above
             label: "not supported".to_owned(),
             span: arg.position_span.start..field.position_span.end,
         });
@@ -459,6 +492,7 @@ pub(super) struct Failed {
 /// written at `literal`, as an option of an attribute of `mode`.
 pub(super) fn parse(input: &str, snippet: &str, literal: TextRange, mode: Mode) -> Result<Parsed, Failed> {
     let mut parser = Parser::new(input, Some(snippet));
+    // alloc: once per format string of a diagnostic attribute, its arguments
     let mut args = Vec::new();
     while let Some(piece) = parser.next_piece() {
         if let Piece::Arg(arg) = piece {
@@ -488,6 +522,7 @@ pub(super) fn filter_params(input: &str, params: &mut Vec<String>) {
         if let Piece::Arg(Argument { position: Position::Named(name), .. }) = piece
             && !matches!(name, "integer" | "integral" | "float" | "union" | "enum" | "struct")
         {
+            // alloc: a parameter an `on(..)` filter names (`directive::filter`)
             params.push(name.to_owned());
         }
     }
@@ -495,6 +530,7 @@ pub(super) fn filter_params(input: &str, params: &mut Vec<String>) {
 
 /// rustc's `parse_arg`: what `arg` is under `mode`, the warnings it gives.
 fn parse_arg(arg: &Argument<'_>, mode: Mode, parsed: &mut Parsed, literal: TextRange, is_source_literal: bool) {
+    // clone: a range, two integers copied
     let span = slice(literal, arg.position_span.clone(), is_source_literal);
     let mut check_format = true;
     match arg.position {
@@ -528,6 +564,7 @@ fn parse_arg(arg: &Argument<'_>, mode: Mode, parsed: &mut Parsed, literal: TextR
                 | Mode::DiagnosticOnConst
                 | Mode::DiagnosticOnTypeError,
                 param,
+                // alloc: a generic parameter a diagnostic attribute's format string names
             ) => parsed.params.push((param.to_owned(), span)),
             (Mode::DiagnosticOnUnknown | Mode::DiagnosticOnUnmatchedArgs, _) => {
                 parsed.warnings.push(Warning::Disallowed(span));
@@ -537,6 +574,7 @@ fn parse_arg(arg: &Argument<'_>, mode: Mode, parsed: &mut Parsed, literal: TextR
         Position::Implicit => parsed.warnings.push(Warning::Positional(span)),
     }
     if check_format && let Some(ty_span) = &arg.ty_span {
+        // clone: a range, two integers copied
         parsed.warnings.push(Warning::Specifier(slice(literal, ty_span.clone(), is_source_literal)));
     }
 }

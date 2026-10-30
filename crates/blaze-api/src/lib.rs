@@ -16,6 +16,7 @@
 //! fields in this one.
 //!
 //! - [`frames`]: frames in and out of a byte stream, and the schema check.
+//! - [`borrowed`]: a response read where it lies in the frame ([`ResponseRef`]), for the CLI.
 //! - [`http`]: HTTP/1.1, sans-IO, for the API's HTTP side and the webhook.
 //! - [`server`]: the daemon's listener, as a state machine over [`blaze_core`]'s sockets: what
 //!   [`Arrived`] and where each [`Reply`] goes.
@@ -28,6 +29,7 @@
 #![deny(unsafe_code)]
 
 pub mod activation;
+pub mod borrowed;
 pub mod build;
 pub mod client;
 pub mod frames;
@@ -42,6 +44,10 @@ pub mod units;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
+pub use borrowed::{
+    ApiErrorRef, BasisRef, BuildScriptRanRef, CachedRef, DiagnosticRef, FactReadRef, ResponseRef,
+    SpanRef, TestResultRef, UnitOfRef, UnitStartedRef, UnitTargetRef,
+};
 pub use intent::{Edit, Edited, EditedItem, How, Target};
 
 use blaze_core::Conn;
@@ -53,8 +59,12 @@ use serde::{Deserialize, Serialize};
 /// The version of every body's schema. A change to any type here is a new number. 11: every
 /// `Vec<u8>` (a run's output, a test's, cargo's files) is one byte string, not an array. 12:
 /// [`Request::Memory`] and [`Response::Memory`]. 13: [`Op`]'s bytes are one byte string too, and so is each [`ContentId`] and
-/// [`Fingerprint`].
-pub const SCHEMA: u32 = 13;
+/// [`Fingerprint`]. 14: [`Cargo::width`], [`Cargo::verbose`], [`Diagnostic::explanation`] and
+/// [`TestResult::outside`]; [`Worked::served`]; dense ids
+/// ([`UnitOf::id`], [`UnitStarted::package`], [`TestResult::executable`]); the fixed name sets
+/// as enums ([`TargetKind`], [`CrateType`], [`ArtifactKind`], [`Applicability`]), written by
+/// name as before. [`ResponseRef`] reads the same bytes.
+pub const SCHEMA: u32 = 14;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -124,8 +134,15 @@ pub struct Cargo {
     /// it. Never credentials.
     #[serde(with = "files")]
     pub files: Vec<(String, Vec<u8>)>,
+    /// The columns diagnostics are rendered in: what cargo passes rustc as
+    /// `--diagnostic-width` (`Shell::err_width().diagnostic_terminal_width()`, the terminal's
+    /// when stderr is one); `None` for rustc's own default.
+    pub width: Option<u32>,
     /// `build`, `check`, `test`, `bench` or `run`.
     pub command: String,
+    /// How many `-v` were given (cargo's `Verbosity`: 1 is `Verbose`, 2 or more `-vv`); 0 with
+    /// none or with `-q`, which `args` says.
+    pub verbose: u8,
 }
 
 /// [`Cargo::files`], each file's bytes one byte string.
@@ -157,6 +174,8 @@ impl std::fmt::Debug for Cargo {
             .field("env", &Names(&self.env))
             .field("files", &Names(&self.files))
             .field("color", &self.color)
+            .field("width", &self.width)
+            .field("verbose", &self.verbose)
             .finish()
     }
 }
@@ -327,12 +346,19 @@ pub struct Diagnostic {
     pub message: String,
     pub children: Vec<Diagnostic>,
     /// rustc's text for it, as rustc prints it (in color when the request's
-    /// [`Cargo::color`]).
+    /// [`Cargo::color`], in [`Cargo::width`] columns).
     pub rendered: String,
+    /// rustc's long explanation of `code` (`rustc --explain`'s markdown), the `explanation`
+    /// of its JSON's `code`, in every format. `None` for a lint, a code with none, and a
+    /// child.
+    pub explanation: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct UnitOf {
+    /// The daemon's index of the unit in the request's unit graph: dense from 0 and the same
+    /// in every response of the request, so a client finds a unit's row by it.
+    pub id: u32,
     /// The unit is compiled with `--test` (cargo's `CompileMode::Test`): cargo names it
     /// `` `foo` (lib test) `` in "generated N warnings" and "could not compile".
     pub test: bool,
@@ -348,6 +374,9 @@ pub struct UnitStarted {
     /// What cargo prints after the version: `(/abs/path)` for a path package,
     /// `(https://github.com/o/r#0123abcd)` for a git one, none for a registry's.
     pub source: Option<String>,
+    /// The daemon's index of the package (`package_id`) in the request's load: dense from 0
+    /// and the same in every response of the request.
+    pub package: u32,
     pub version: String,
     pub package_id: String,
 }
@@ -379,13 +408,116 @@ pub struct BuildScriptRan {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct UnitTarget {
     pub doc: bool,
-    pub kind: Vec<String>,
+    pub kind: TargetKind,
     pub name: String,
     pub test: bool,
     pub doctest: bool,
     pub edition: String,
     pub src_path: String,
-    pub crate_types: Vec<String>,
+    /// As cargo's `rustc_crate_types`: a library's (and an example library's) own, in the
+    /// manifest's order; `bin` for every other kind.
+    pub crate_types: Vec<CrateType>,
+}
+
+impl UnitTarget {
+    /// cargo's JSON `kind` of it (`TargetKind`'s serialization): a library's crate types, else
+    /// its kind's one word.
+    pub fn kinds(&self) -> impl Iterator<Item = &'static str> + '_ {
+        let (word, types) = match self.kind {
+            TargetKind::Lib => (None, &self.crate_types[..]),
+            kind => (Some(kind.name()), &[][..]),
+        };
+        word.into_iter().chain(types.iter().map(|it| it.name()))
+    }
+}
+
+/// A target's kind, as cargo's `TargetKind` has it; an example library is an
+/// [`TargetKind::Example`] whose crate types are not `bin`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum TargetKind {
+    Lib,
+    Bin,
+    Test,
+    Bench,
+    Example,
+    CustomBuild,
+}
+
+impl TargetKind {
+    pub const ALL: [TargetKind; 6] = [
+        TargetKind::Lib,
+        TargetKind::Bin,
+        TargetKind::Test,
+        TargetKind::Bench,
+        TargetKind::Example,
+        TargetKind::CustomBuild,
+    ];
+
+    /// The kind [`TargetKind::name`] names `name`.
+    pub fn named(name: &str) -> Option<TargetKind> {
+        TargetKind::ALL.into_iter().find(|it| it.name() == name)
+    }
+
+    /// cargo's word for it, what its JSON `kind` says of every kind but a library.
+    pub const fn name(self) -> &'static str {
+        match self {
+            TargetKind::Lib => "lib",
+            TargetKind::Bin => "bin",
+            TargetKind::Test => "test",
+            TargetKind::Bench => "bench",
+            TargetKind::Example => "example",
+            TargetKind::CustomBuild => "custom-build",
+        }
+    }
+}
+
+/// A crate type, as rustc's `--crate-type` names it. cargo passes rustc any other word, which
+/// rustc refuses; the daemon refuses it first, naming it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum CrateType {
+    Bin,
+    Lib,
+    Rlib,
+    Dylib,
+    Cdylib,
+    Staticlib,
+    ProcMacro,
+    Sdylib,
+}
+
+impl CrateType {
+    pub const ALL: [CrateType; 8] = [
+        CrateType::Bin,
+        CrateType::Lib,
+        CrateType::Rlib,
+        CrateType::Dylib,
+        CrateType::Cdylib,
+        CrateType::Staticlib,
+        CrateType::ProcMacro,
+        CrateType::Sdylib,
+    ];
+
+    /// The crate type [`CrateType::name`] names `name`.
+    pub fn named(name: &str) -> Option<CrateType> {
+        CrateType::ALL.into_iter().find(|it| it.name() == name)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            CrateType::Bin => "bin",
+            CrateType::Lib => "lib",
+            CrateType::Rlib => "rlib",
+            CrateType::Dylib => "dylib",
+            CrateType::Cdylib => "cdylib",
+            CrateType::Staticlib => "staticlib",
+            CrateType::ProcMacro => "proc-macro",
+            CrateType::Sdylib => "sdylib",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -398,7 +530,7 @@ pub struct UnitProfile {
 }
 
 /// What a build did: the counts the oracle's over-invalidation and the budgets read.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Worked {
     pub link: LinkKind,
     /// Functions found in the store.
@@ -407,10 +539,56 @@ pub struct Worked {
     pub green: u64,
     /// Queries executed.
     pub reran: u64,
+    /// Each crate of the build that is not a workspace member, sorted by cargo package name:
+    /// whether its check outcome and its bodies were served.
+    pub served: Vec<ServedCrate>,
     /// Functions whose code was generated.
     pub compiled: u64,
     /// The plane's critical path of the request.
     pub critical_path_us: u64,
+}
+
+/// A dependency crate of [`Worked::served`].
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct ServedCrate {
+    /// The `Display` of `blaze_diagnostics::cache::Refused` or `hir_def::deps::serve::Refused`
+    /// when either part is [`ServedPart::Refused`], else `None`.
+    pub why: Option<String>,
+    pub bodies: ServedPart,
+    pub outcome: ServedPart,
+    /// cargo's package name, not the crate name: the one that is unique in a build.
+    pub package: String,
+}
+
+/// What became of a part of a dependency crate's check.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[serde(rename_all = "lowercase")]
+#[repr(u8)]
+pub enum ServedPart {
+    /// Read from the store and used.
+    Served,
+    /// Not in the store: checked this session and offered to the store.
+    Checked,
+    /// Neither served nor stored.
+    Refused,
+}
+
+impl ServedPart {
+    pub const ALL: [ServedPart; 3] = [ServedPart::Served, ServedPart::Checked, ServedPart::Refused];
+
+    /// The part [`ServedPart::name`] names `name`.
+    pub fn named(name: &str) -> Option<ServedPart> {
+        ServedPart::ALL.into_iter().find(|it| it.name() == name)
+    }
+
+    /// The word of the `blaze-served` line.
+    pub const fn name(self) -> &'static str {
+        match self {
+            ServedPart::Served => "served",
+            ServedPart::Checked => "checked",
+            ServedPart::Refused => "refused",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -466,8 +644,40 @@ pub struct Span {
     pub byte_start: u32,
     pub end_column: u32,
     pub replacement: Option<String>,
-    /// `MachineApplicable`, `MaybeIncorrect`, `HasPlaceholders`, `Unspecified`.
-    pub applicability: Option<String>,
+    pub applicability: Option<Applicability>,
+}
+
+/// How sure a suggestion is, as rustc's JSON `suggestion_applicability` names it.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(u8)]
+pub enum Applicability {
+    MachineApplicable,
+    MaybeIncorrect,
+    HasPlaceholders,
+    Unspecified,
+}
+
+impl Applicability {
+    pub const ALL: [Applicability; 4] = [
+        Applicability::MachineApplicable,
+        Applicability::MaybeIncorrect,
+        Applicability::HasPlaceholders,
+        Applicability::Unspecified,
+    ];
+
+    /// The applicability [`Applicability::name`] names `name`.
+    pub fn named(name: &str) -> Option<Applicability> {
+        Applicability::ALL.into_iter().find(|it| it.name() == name)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Applicability::MachineApplicable => "MachineApplicable",
+            Applicability::MaybeIncorrect => "MaybeIncorrect",
+            Applicability::HasPlaceholders => "HasPlaceholders",
+            Applicability::Unspecified => "Unspecified",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
@@ -478,8 +688,7 @@ pub struct Artifact {
     /// (`DYLD_FALLBACK_LIBRARY_PATH`/`LD_LIBRARY_PATH`/`PATH`) with cargo's directories first.
     /// None of the user's environment. Empty for an artifact that does not run.
     pub env: Vec<(String, String)>,
-    /// `bin`, `lib`, `test`, `example`, `bench`, `proc-macro`, `custom-build`, `doctest`.
-    pub kind: String,
+    pub kind: ArtifactKind,
     /// The main file placed (the executable for one that runs), and its content.
     pub path: String,
     pub fresh: bool,
@@ -501,9 +710,56 @@ pub struct Artifact {
     pub manifest_path: String,
 }
 
+/// What an [`Artifact`] is.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub enum ArtifactKind {
+    Bin,
+    Lib,
+    Test,
+    Example,
+    Bench,
+    ProcMacro,
+    CustomBuild,
+    Doctest,
+}
+
+impl ArtifactKind {
+    pub const ALL: [ArtifactKind; 8] = [
+        ArtifactKind::Bin,
+        ArtifactKind::Lib,
+        ArtifactKind::Test,
+        ArtifactKind::Example,
+        ArtifactKind::Bench,
+        ArtifactKind::ProcMacro,
+        ArtifactKind::CustomBuild,
+        ArtifactKind::Doctest,
+    ];
+
+    /// The kind [`ArtifactKind::name`] names `name`.
+    pub fn named(name: &str) -> Option<ArtifactKind> {
+        ArtifactKind::ALL.into_iter().find(|it| it.name() == name)
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            ArtifactKind::Bin => "bin",
+            ArtifactKind::Lib => "lib",
+            ArtifactKind::Test => "test",
+            ArtifactKind::Example => "example",
+            ArtifactKind::Bench => "bench",
+            ArtifactKind::ProcMacro => "proc-macro",
+            ArtifactKind::CustomBuild => "custom-build",
+            ArtifactKind::Doctest => "doctest",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct TestResult {
     pub name: String,
+    /// The test executable, as cargo's `Running` line names it.
     pub binary: String,
     /// Not run: the result that stands, and what it was kept by. A cached result is
     /// `Unreached` with `millis` 0.
@@ -512,6 +768,12 @@ pub struct TestResult {
     #[serde(with = "blaze_protocol::bytes")]
     pub output: Vec<u8>,
     pub outcome: TestOutcome,
+    /// It ran outside the sandbox (docs/cargo.md), so the command's summary names it. False for
+    /// a cached result, whose run is not this one.
+    pub outside: bool,
+    /// The daemon's index of `binary` among the request's test executables: dense from 0, the
+    /// same for every result of one executable, so a client groups results by it.
+    pub executable: u32,
 }
 
 /// The run that stands for a test not run.
@@ -706,6 +968,8 @@ mod tests {
             millis: 1,
             output: vec![9; 30],
             outcome: TestOutcome::Passed,
+            outside: true,
+            executable: 0,
         };
         let bytes = blaze_protocol::cbor::to_vec(&result).unwrap();
         let mut output = vec![0x66, b'o', b'u', b't', b'p', b'u', b't', 0x58, 30];
@@ -720,13 +984,89 @@ mod tests {
             root: "/w".to_owned(),
             color: false,
             files: vec![("/c".to_owned(), vec![1, 2])],
+            width: Some(100),
             command: "build".to_owned(),
+            verbose: 2,
         };
         let bytes = blaze_protocol::cbor::to_vec(&cargo).unwrap();
         let files = [0x65, b'f', b'i', b'l', b'e', b's', 0x81, 0x82, 0x62, b'/', b'c', 0x42, 1, 2];
         assert!(bytes.windows(files.len()).any(|it| it == files), "{bytes:02x?}");
+        let width = [0x65, b'w', b'i', b'd', b't', b'h', 0x18, 100];
+        assert!(bytes.windows(width.len()).any(|it| it == width), "{bytes:02x?}");
         assert_eq!(blaze_protocol::cbor::from_slice::<Cargo>(&bytes).unwrap(), cargo);
         let json = serde_json::to_value(&cargo).unwrap();
         assert_eq!(json["files"], serde_json::json!([["/c", [1, 2]]]));
+    }
+
+    /// A fixed name set goes out by name, as the strings it was went; a name outside it is
+    /// refused, naming it.
+    #[test]
+    fn a_fixed_name_is_written_by_name_and_an_unknown_one_refused() {
+        let names = [
+            (blaze_protocol::cbor::to_vec(&TargetKind::CustomBuild).unwrap(), "custom-build"),
+            (blaze_protocol::cbor::to_vec(&CrateType::ProcMacro).unwrap(), "proc-macro"),
+            (blaze_protocol::cbor::to_vec(&ArtifactKind::Doctest).unwrap(), "doctest"),
+            (blaze_protocol::cbor::to_vec(&Applicability::MachineApplicable).unwrap(), "MachineApplicable"),
+            (blaze_protocol::cbor::to_vec(&TargetKind::Lib).unwrap(), TargetKind::Lib.name()),
+        ];
+        for (bytes, name) in names {
+            assert_eq!(bytes, blaze_protocol::cbor::to_vec(name).unwrap(), "{name}");
+        }
+        fn each<T: Serialize + serde::de::DeserializeOwned + Copy + PartialEq + std::fmt::Debug>(
+            all: &[T],
+            name: fn(T) -> &'static str,
+            named: fn(&str) -> Option<T>,
+        ) {
+            for &it in all {
+                let bytes = blaze_protocol::cbor::to_vec(name(it)).unwrap();
+                assert_eq!(blaze_protocol::cbor::to_vec(&it).unwrap(), bytes, "{it:?}");
+                assert_eq!(blaze_protocol::cbor::from_slice::<T>(&bytes), Ok(it));
+                assert_eq!(named(name(it)), Some(it));
+            }
+            assert_eq!(named("staticlibs"), None);
+        }
+        each(&TargetKind::ALL, TargetKind::name, TargetKind::named);
+        each(&CrateType::ALL, CrateType::name, CrateType::named);
+        each(&ArtifactKind::ALL, ArtifactKind::name, ArtifactKind::named);
+        each(&Applicability::ALL, Applicability::name, Applicability::named);
+        each(&ServedPart::ALL, ServedPart::name, ServedPart::named);
+        let bytes = blaze_protocol::cbor::to_vec("staticlibs").unwrap();
+        let refused = blaze_protocol::cbor::from_slice::<CrateType>(&bytes).unwrap_err();
+        assert!(refused.to_string().contains("`staticlibs`"), "{refused}");
+        let item = blaze_protocol::cbor::to_vec(&Envelope::new(3, Response::Fetched {
+            verb: FetchVerb::Updating,
+            what: String::new(),
+        }))
+        .unwrap();
+        let updating = [0x68, b'U', b'p', b'd', b'a', b't', b'i', b'n', b'g'];
+        let at = item.windows(updating.len()).position(|it| it == updating).unwrap();
+        let mut unknown = item.clone();
+        unknown[at + 1] = b'X';
+        let refused = frames::decode::<Response>(&unknown).unwrap_err();
+        assert_eq!(refused.id, Some(3));
+        assert!(refused.error.what.contains("`Xpdating`"), "{refused:?}");
+        let refused = frames::decode::<ResponseRef<'_>>(&unknown).unwrap_err();
+        assert!(refused.error.what.contains("`Xpdating`"), "{refused:?}");
+    }
+
+    /// cargo's JSON `kind`: a library's crate types, any other target's one word.
+    #[test]
+    fn a_targets_kinds_are_cargos() {
+        let target = |kind, crate_types| UnitTarget {
+            doc: false,
+            kind,
+            name: "a".to_owned(),
+            test: false,
+            doctest: false,
+            edition: "2024".to_owned(),
+            src_path: "/w/src/lib.rs".to_owned(),
+            crate_types,
+        };
+        let lib = target(TargetKind::Lib, vec![CrateType::Rlib, CrateType::Cdylib]);
+        assert_eq!(lib.kinds().collect::<Vec<_>>(), ["rlib", "cdylib"]);
+        let example = target(TargetKind::Example, vec![CrateType::Cdylib]);
+        assert_eq!(example.kinds().collect::<Vec<_>>(), ["example"]);
+        let script = target(TargetKind::CustomBuild, vec![CrateType::Bin]);
+        assert_eq!(script.kinds().collect::<Vec<_>>(), ["custom-build"]);
     }
 }

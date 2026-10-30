@@ -83,7 +83,7 @@ impl RaFixtureAnalysis {
         literal: ast::String,
         expanded: &ast::String,
         config: &RaFixtureConfig<'_>,
-        on_cursor: &mut dyn FnMut(TextRange),
+        on_cursor: &mut impl FnMut(TextRange),
     ) -> Option<RaFixtureAnalysis> {
         if config.disable_ra_fixture {
             return None;

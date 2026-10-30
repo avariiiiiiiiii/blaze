@@ -109,6 +109,8 @@ const CONTEXTUAL: &[(&str, SyntaxKind, Option<Edition>)] = &[
     ("safe", SAFE_KW, None),
     ("sym", SYM_KW, None),
     ("union", UNION_KW, None),
+    ("unwrap_binder", UNWRAP_BINDER_KW, None),
+    ("wrap_binder", WRAP_BINDER_KW, None),
     ("yeet", YEET_KW, None),
 ];
 
@@ -395,6 +397,8 @@ mod tests {
             "safe" => SAFE_KW,
             "sym" => SYM_KW,
             "union" => UNION_KW,
+            "unwrap_binder" => UNWRAP_BINDER_KW,
+            "wrap_binder" => WRAP_BINDER_KW,
             "yeet" => YEET_KW,
             _ => return None,
         };

@@ -1564,6 +1564,8 @@ impl Remote {
 
 #[cfg(test)]
 pub mod tests {
+    use blaze_ids::rng::SplitMix64;
+
     use super::*;
 
     pub fn scratch(name: &str) -> PathBuf {
@@ -1597,25 +1599,19 @@ pub mod tests {
     /// `seed` and `runs` changes of it, the same ones in every run: bytes cut, flipped,
     /// put in and taken out.
     pub fn changed(seed: &[u8], runs: usize) -> impl Iterator<Item = Vec<u8>> {
-        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-        let mut next = move |bound: usize| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            (state % bound.max(1) as u64) as usize
-        };
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         let seed = seed.to_vec();
         std::iter::once(seed.clone()).chain((0..runs).map(move |_| {
             let mut bytes = seed.clone();
-            for _ in 0..=next(4) {
-                let at = next(bytes.len());
-                match next(5) {
+            for _ in 0..=rng.index(4) {
+                let at = rng.index(bytes.len());
+                match rng.index(5) {
                     0 => bytes.truncate(at),
-                    1 if !bytes.is_empty() => bytes[at] ^= 1 << next(8),
-                    2 => bytes.insert(at, b"\n /.\\\0\xff"[next(7)]),
+                    1 if !bytes.is_empty() => bytes[at] ^= 1 << rng.index(8),
+                    2 => bytes.insert(at, b"\n /.\\\0\xff"[rng.index(7)]),
                     3 if !bytes.is_empty() => _ = bytes.remove(at),
                     _ => {
-                        let from = next(bytes.len());
+                        let from = rng.index(bytes.len());
                         let again = bytes[from..].to_vec();
                         bytes.splice(at..at, again);
                     }
@@ -1756,12 +1752,9 @@ pub mod tests {
     fn a_packed_pack_is_all_written_before_it_is_unpacked() {
         // Bytes zstd makes nothing smaller of, so what is sent ends in a chunk of its own.
         let mut pack = [&b"blazepk"[..], &[STORE_FORMAT as u8]].concat();
-        let mut seed = 0x9e3779b97f4a7c15u64;
+        let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
         while pack.len() < (64 << 10) + 9 {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            pack.extend_from_slice(&seed.to_le_bytes());
+            pack.extend_from_slice(&rng.next_u64().to_le_bytes());
         }
         let sent = zstd::encode_all(&pack[..], 3).unwrap();
         let (named, keys) = (Digest::of(&pack), Digest::of(&[1; 32]));

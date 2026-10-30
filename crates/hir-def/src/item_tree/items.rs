@@ -5,9 +5,11 @@
 //! top-level item: all that lowering the item reads ([`item_keys`]: a fingerprint of its
 //! syntax but for its bodies, its ast ids and its span anchors) and where its rows are in the
 //! tree ([`Marks`]). An edit keys the new parse's items, hashing only those whose text it
-//! touched ([`Unchanged`]), keeps the rows of the unchanged items before and after the changed
-//! ones (copied, their ids moved), lowers the changed ones alone and assembles the file's tree
-//! from them ([`assemble`]). An edit inside a top-level `fn`'s body, or an
+//! touched ([`Unchanged`]) and reading ids and anchors from the maps only for those in which
+//! an entry of the maps changed ([`Unchanged::touched`]), keeps the rows of the unchanged items
+//! before and after the changed ones (copied, their ids moved), lowers the changed ones alone
+//! and assembles the file's tree from them ([`assemble`]). An edit inside a top-level `fn`'s
+//! body, or an
 //! `impl`'s or `trait`'s, changes no key and returns the last tree itself. A file's first
 //! lowering is [`super::lower_whole`] and makes no keys, so a file never edited never pays for
 //! them; its first edit lowers it whole again, keying it. The tree is the one `lower_whole`
@@ -19,6 +21,7 @@
 
 use std::{
     cell::Cell,
+    cmp::Ordering,
     hash::{Hash, Hasher},
     mem,
     sync::{Arc, Mutex, PoisonError},
@@ -30,17 +33,16 @@ use cfg::CfgOptions;
 use hir_expand::{HirFileId, span_map::SpanMap};
 use span::{AstIdMap, ErasedFileAstId, RealSpanMap};
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, Text, TextRange, TextSize,
-    ast::{self, HasModuleItem},
+    NodeOrToken, SyntaxKind, Text, TextRange, TextSize,
+    ast as tag,
+    view::{self as ast, AstNode, HasModuleItem},
 };
 
-use crate::{
-    attrs::parse_extra_crate_attrs,
-    item_tree::{
-        AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, Function, IdRange, ItemKind,
-        ItemTree, Macro2, MacroCall, MacroRules, Mod, ModItemId, NameId, PathId, RawVisibilityId,
-        Static, Struct, Trait, TypeAlias, Union, Use, UseTree, UseTreeId, lower,
-    },
+use crate::item_tree::{
+    AliasId, AttrOwner, Const, Enum, ExternBlock, ExternCrate, Function, IdRange, ItemKind,
+    ItemTree, ItemTreeLens, ItemTreeSinks, Macro2, MacroCall, MacroRules, Mod, ModItemId, NameId,
+    PathId, RawVisibilityId, Static, Struct, Trait, TypeAlias, Union, Use, UseTree, UseTreeId,
+    lower,
 };
 
 #[cfg(test)]
@@ -57,7 +59,7 @@ pub(super) fn file_item_tree(db: &Db, file: EditionedFileId, krate: Crate) -> Ar
     let cfg = krate.cfg_options(db);
     let (tree, keyed) = match kept {
         None => {
-            count_lowered(|| file.parse(db).tree().items().count());
+            count_lowered(|| file.parse(db).view().items().count());
             // alloc: the tree's handle, once a lowering
             (Arc::new(super::lower_whole(db, file.into(), krate)), None)
         }
@@ -128,6 +130,12 @@ struct Keyed {
     /// Per top-level item, where its rows begin in each of `tree`'s columns; then where the
     /// last item's end. One more than `keys.items`.
     marks: Vec<Marks>,
+    /// The file's ast id map's entries ([`AstIdMap::entries`]) and span map's anchors as
+    /// `[start, id]`, as `keys` was made: the next edit compares the new maps' with these in the
+    /// text it left unchanged, so an item no entry or anchor of which changed copies its ids and
+    /// anchors from `keys` ([`Unchanged::touched`]).
+    entries: Vec<[u32; 4]>,
+    anchors: Vec<[u32; 2]>,
 }
 
 /// What lowering reads of each top-level item of a file ([`item_keys`]): its syntax, as a
@@ -177,18 +185,20 @@ impl Keys {
 }
 
 /// The text of `source_file`'s tree: the file's, shared.
-fn text_of(source_file: &ast::SourceFile) -> &Text {
-    source_file.syntax().flat().expect("a source file's flat tree").0.source()
+fn text_of<'t>(source_file: ast::SourceFile<'t>) -> &'t Text {
+    source_file.syntax().file().source()
 }
 
 /// The tree of an edited file from its kept one: the rows of the items whose keys are the
 /// same before and after the edit's, kept, and the items between lowered again.
 fn reuse(db: &Db, file: EditionedFileId, krate: Crate, mut keyed: Keyed) -> Keyed {
-    let source_file = file.parse(db).tree();
+    let source_file = file.parse(db).view();
     let mut scratch = SCRATCH.take();
     scratch.keys.clear();
-    item_keys(db, file, &source_file, &mut scratch, Some(&keyed));
-    keyed.text = text_of(&source_file).clone(); // clone: one count of the file's text
+    item_keys(db, file, source_file, &mut scratch, Some(&keyed));
+    keyed.text = text_of(source_file).clone(); // clone: one count of the file's text
+    mem::swap(&mut keyed.entries, &mut scratch.entries);
+    mem::swap(&mut keyed.anchors, &mut scratch.anchors);
     let (old, new) = (&keyed.keys, &scratch.keys);
     let (old_items, new_items) = (old.items.len(), new.items.len());
     let before = (0..old_items.min(new_items)).take_while(|&it| old.same(it, new, it)).count();
@@ -209,7 +219,7 @@ fn reuse(db: &Db, file: EditionedFileId, krate: Crate, mut keyed: Keyed) -> Keye
     let changed = new_items - before - after;
     count_lowered(|| changed);
     let fresh: Vec<ItemTree> = (source_file.items().skip(before).take(changed))
-        .map(|item| lower::Ctx::new(db, file.into(), krate).lower_item(&item))
+        .map(|item| lower::Ctx::new(db, file.into(), krate).lower_item(item))
         .collect(); // alloc: once an edit, the list of the items it changed
     let fresh_marks: Vec<[Marks; 2]> =
         fresh.iter().map(|it| [Marks::default(), Marks::ends(it)]).collect(); // alloc: as `fresh`
@@ -239,13 +249,13 @@ fn reuse(db: &Db, file: EditionedFileId, krate: Crate, mut keyed: Keyed) -> Keye
 /// top level's owner.
 fn same_top(old: &ItemTree, first: &Marks, top: &ItemTree) -> bool {
     let top_owner = |tree: &ItemTree| {
-        tree.attr_owners.last().copied().filter(|it| it.owner == ModItemId::TOP_OWNER)
+        tree.attr_owners().last().copied().filter(|it| it.owner == ModItemId::TOP_OWNER)
     };
-    let (attrs, cfgs) = (top.attrs.len(), top.cfgs.len());
-    first.attrs as usize == attrs
+    let (attrs, cfgs) = (top.attr_list().len(), top.cfgs().len());
+    first.attr_list as usize == attrs
         && first.cfgs as usize == cfgs
-        && old.attrs[..attrs] == top.attrs[..]
-        && old.cfgs[..cfgs] == top.cfgs[..]
+        && old.attr_list()[..attrs] == top.attr_list()[..]
+        && old.cfgs()[..cfgs] == top.cfgs()[..]
         && top_owner(old) == top_owner(top)
 }
 
@@ -258,30 +268,28 @@ fn lower_keyed(
     cfg: &CfgOptions,
     last: Option<Keyed>,
 ) -> Keyed {
-    let source_file = file.parse(db).tree();
+    let source_file = file.parse(db).view();
     let mut scratch = SCRATCH.take();
     if let Some(last) = last {
         (scratch.keys, scratch.marks) = (last.keys, last.marks);
+        (scratch.entries, scratch.anchors) = (last.entries, last.anchors);
     }
     scratch.keys.clear();
     scratch.marks.clear();
-    item_keys(db, file, &source_file, &mut scratch, None);
+    item_keys(db, file, source_file, &mut scratch, None);
     count_lowered(|| scratch.keys.items.len());
 
-    let root_file_id = krate.root_file_id(db);
-    let extra = (file == root_file_id)
-        .then(|| parse_extra_crate_attrs(db, krate))
-        .flatten()
-        .map(|crate_attrs| (crate_attrs, root_file_id.span_file_id(db)));
     let mut ctx = lower::Ctx::new(db, file.into(), krate);
-    ctx.lower_top_attrs(&source_file, extra);
-    let tree = ctx.lower_module_items_marked(&source_file, &mut scratch.marks);
+    ctx.lower_top_attrs(source_file, crate_attrs_of(db, file, krate));
+    let tree = ctx.lower_module_items_marked(source_file, &mut scratch.marks);
     let keyed = Keyed {
         cfg: cfg.clone(), // clone: once a file's first edit or a new `cfg` set
         tree: Arc::new(tree), // alloc: the tree's handle, once a lowering
-        text: text_of(&source_file).clone(), // clone: one count of the file's text
+        text: text_of(source_file).clone(), // clone: one count of the file's text
         keys: mem::take(&mut scratch.keys),
         marks: mem::take(&mut scratch.marks),
+        entries: mem::take(&mut scratch.entries),
+        anchors: mem::take(&mut scratch.anchors),
     };
     release(scratch);
     keyed
@@ -290,13 +298,18 @@ fn lower_keyed(
 /// The tree of `file`'s top level's attributes alone: its inner attributes and, for a crate's
 /// root, the crate attributes given on the command line.
 pub(super) fn top_attrs(db: &Db, file: EditionedFileId, krate: Crate) -> ItemTree {
-    let source_file = file.parse(db).tree();
-    let root_file_id = krate.root_file_id(db);
-    let extra = (file == root_file_id)
-        .then(|| parse_extra_crate_attrs(db, krate))
-        .flatten()
-        .map(|crate_attrs| (crate_attrs, root_file_id.span_file_id(db)));
-    lower::Ctx::new(db, HirFileId::from(file), krate).lower_top(&source_file, extra)
+    let source_file = file.parse(db).view();
+    lower::Ctx::new(db, HirFileId::from(file), krate)
+        .lower_top(source_file, crate_attrs_of(db, file, krate))
+}
+
+/// The files of the crate attributes rustc appends to `file`'s inner attributes: `krate`'s
+/// applied ones when `file` is its root, else none.
+fn crate_attrs_of(db: &Db, file: EditionedFileId, krate: Crate) -> &[EditionedFileId] {
+    match file == krate.root_file_id(db) {
+        true => base_db::applied_crate_attr_files(db, krate),
+        false => &[],
+    }
 }
 
 /// The tree of one top-level item of `file` alone, as an edit lowers a changed item.
@@ -305,7 +318,7 @@ pub(super) fn item_alone(
     db: &Db,
     file: EditionedFileId,
     krate: Crate,
-    item: &ast::Item,
+    item: ast::Item<'_>,
 ) -> ItemTree {
     lower::Ctx::new(db, file.into(), krate).lower_item(item)
 }
@@ -317,6 +330,9 @@ thread_local! {
     pub(super) static LOWERED: Cell<usize> = const { Cell::new(0) };
     /// How many top-level items' syntax this thread hashed ([`item_keys`]).
     pub(super) static HASHED: Cell<usize> = const { Cell::new(0) };
+    /// How many top-level items' ast ids and anchors this thread read from the maps
+    /// ([`item_keys`]), not copied from the last keys.
+    pub(super) static READ: Cell<usize> = const { Cell::new(0) };
 }
 
 fn count_lowered(items: impl FnOnce() -> usize) {
@@ -329,6 +345,11 @@ fn count_lowered(items: impl FnOnce() -> usize) {
 fn count_hashed() {
     #[cfg(test)]
     HASHED.set(HASHED.get() + 1);
+}
+
+fn count_read() {
+    #[cfg(test)]
+    READ.set(READ.get() + 1);
 }
 
 /// The domain of an item's key.
@@ -363,20 +384,31 @@ struct Scratch {
     bytes: Vec<u8>,
     keys: Keys,
     marks: Vec<Marks>,
+    /// The maps' entries and anchors keyed from, as [`Keyed`]'s.
+    entries: Vec<[u32; 4]>,
+    anchors: Vec<[u32; 2]>,
+    /// One bit per new top-level item: whether an entry or anchor in it changed.
+    touched: Vec<u64>,
 }
 
 thread_local! {
     static SCRATCH: Cell<Scratch> = Cell::new(Scratch::default());
 }
 
-/// About 200 KiB of a [`Scratch`]'s arrays.
+/// About 200 KiB of each of a [`Scratch`]'s arrays.
 const SCRATCH_IDS: usize = 1 << 14;
 
 fn release(mut scratch: Scratch) {
     scratch.keys.clear();
     scratch.marks.clear();
+    scratch.entries.clear();
+    scratch.anchors.clear();
     let keys = &scratch.keys;
-    if keys.ids.capacity() <= SCRATCH_IDS && keys.items.capacity() <= SCRATCH_IDS {
+    if keys.ids.capacity() <= SCRATCH_IDS
+        && keys.items.capacity() <= SCRATCH_IDS
+        && scratch.entries.capacity() <= SCRATCH_IDS
+        && scratch.anchors.capacity() <= SCRATCH_IDS
+    {
         SCRATCH.set(scratch);
     }
 }
@@ -386,12 +418,15 @@ fn release(mut scratch: Scratch) {
 /// ([`hash_item`]), the ast ids of the items it is made of and the span anchors within it, all
 /// from where it starts, so an item keeps its key wherever it moves in the file. An item whose
 /// text `last`'s also had, unchanged ([`Unchanged`]), takes the fingerprint it had there, so an
-/// edit hashes only the items it touched. Two walks of the items, which allocate nothing once
-/// the scratch is grown.
+/// edit hashes only the items it touched; and, when no entry of the ast id map and no anchor of
+/// the span map in it changed ([`Unchanged::touched`]), its ids and anchors, so an edit reads
+/// the maps per item only for the items it touched. Two walks of the items and one of each
+/// map's arrays, which allocate nothing once the scratch is grown. Leaves the maps' arrays in
+/// `scratch.entries` and `scratch.anchors`, for the next edit.
 fn item_keys(
     db: &Db,
     file: EditionedFileId,
-    source_file: &ast::SourceFile,
+    source_file: ast::SourceFile<'_>,
     scratch: &mut Scratch,
     last: Option<&Keyed>,
 ) {
@@ -400,30 +435,52 @@ fn item_keys(
     let SpanMap::RealSpanMap(span_map) = hir_file.span_map(db) else {
         unreachable!("a source file's span map is a real file's")
     };
-    let Scratch { bytes, keys, .. } = scratch;
+    let (pairs, starts) = span_map.anchors();
+    let Scratch { bytes, keys, entries, anchors, touched, .. } = scratch;
     for item in source_file.items() {
         let range = item.syntax().text_range();
         keys.items.push(ItemKey { range, syntax: 0, ids_end: 0, anchors_end: 0 });
     }
     let unchanged = last.map(|last| Unchanged::new(last, text_of(source_file), &keys.items));
+    touched.clear();
+    touched.resize(keys.items.len().div_ceil(64), 0);
+    if let Some((last, unchanged)) = last.zip(unchanged.as_ref()) {
+        unchanged.touched(last, ast_id_map.entries(), pairs, starts, &keys.items, touched);
+    }
     for (at, item) in source_file.items().enumerate() {
         let range = keys.items[at].range;
-        let ids_from = keys.ids.len();
-        item_ids(&item, ast_id_map, range.start(), &mut keys.ids);
-        item_anchors(span_map, range, &keys.ids[ids_from..], &mut keys.anchors);
-        let kept = last.zip(unchanged.as_ref()).and_then(|(last, unchanged)| {
-            unchanged.kept(&last.keys.items, &keys.items, at).map(|it| it.syntax)
+        let was = last.zip(unchanged.as_ref()).and_then(|(last, unchanged)| {
+            unchanged.kept(&last.keys.items, &keys.items, at).map(|was| (last, was))
         });
-        let syntax = kept.unwrap_or_else(|| {
-            count_hashed();
-            bytes.clear();
-            let mut feed = Feed(&mut *bytes);
-            hash_item(item.syntax(), &mut feed);
-            feed.fingerprint()
-        });
+        match was.filter(|_| touched[at / 64] & (1 << (at % 64)) == 0) {
+            Some((last, was)) => {
+                keys.ids.extend_from_slice(last.keys.ids(was));
+                keys.anchors.extend_from_slice(last.keys.anchors(was));
+            }
+            None => {
+                count_read();
+                let ids_from = keys.ids.len();
+                item_ids(item, ast_id_map, range.start(), &mut keys.ids);
+                item_anchors(span_map, range, &keys.ids[ids_from..], &mut keys.anchors);
+            }
+        }
+        let syntax = match was {
+            Some((last, was)) => last.keys.items[was].syntax,
+            None => {
+                count_hashed();
+                bytes.clear();
+                let mut feed = Feed(&mut *bytes);
+                hash_item(item.syntax(), &mut feed);
+                feed.fingerprint()
+            }
+        };
         keys.items[at] =
             ItemKey { range, syntax, ids_end: id(keys.ids.len()), anchors_end: id(keys.anchors.len()) };
     }
+    entries.clear();
+    entries.extend_from_slice(ast_id_map.entries());
+    anchors.clear();
+    anchors.extend(starts.iter().zip(pairs).map(|(&start, &[ast_id, _])| [start, ast_id]));
 }
 
 fn id(len: usize) -> u32 {
@@ -440,6 +497,8 @@ fn id(len: usize) -> u32 {
 struct Unchanged {
     /// The new parse's leading items that are in the prefix with two items after them.
     prefix_items: usize,
+    /// The length of the prefix.
+    prefix: u32,
     /// Where the suffix begins in the new text.
     suffix_from: TextSize,
     /// The old text's length less the new's: where an item of the suffix was, from where it is.
@@ -453,25 +512,127 @@ impl Unchanged {
         let in_prefix = items.iter().take_while(|it| usize::from(it.range.end()) <= prefix).count();
         Unchanged {
             prefix_items: in_prefix.saturating_sub(2),
+            prefix: id(prefix),
             suffix_from: TextSize::new(id(new.len() - suffix)),
             shift: old.len() as i64 - new.len() as i64,
         }
     }
 
-    /// The key `old` had for item `at` of `new`, if the item is one this edit left unchanged.
-    fn kept<'a>(&self, old: &'a [ItemKey], new: &[ItemKey], at: usize) -> Option<&'a ItemKey> {
+    /// The index in `old` of item `at` of `new`, if the item is one this edit left unchanged.
+    fn kept(&self, old: &[ItemKey], new: &[ItemKey], at: usize) -> Option<usize> {
         let range = new[at].range;
         let (was, start) = if at < self.prefix_items {
-            (old.get(at)?, i64::from(u32::from(range.start())))
+            (at, i64::from(u32::from(range.start())))
         } else if range.start() >= self.suffix_from {
             let from_end = new.len() - at;
-            let was = old.get(old.len().checked_sub(from_end)?)?;
-            (was, i64::from(u32::from(range.start())) + self.shift)
+            (old.len().checked_sub(from_end)?, i64::from(u32::from(range.start())) + self.shift)
         } else {
             return None;
         };
-        let same = i64::from(u32::from(was.range.start())) == start && was.range.len() == range.len();
+        let it = old.get(was)?;
+        let same = i64::from(u32::from(it.range.start())) == start && it.range.len() == range.len();
         same.then_some(was)
+    }
+
+    /// Whether what spans `start..end` of the new text is in the text this edit left unchanged.
+    fn keeps(&self, start: u32, end: u32) -> bool {
+        end <= self.prefix || start >= u32::from(self.suffix_from)
+    }
+
+    /// Where what spanned `start..end` of the last text is in the new, if it is in the text
+    /// this edit left unchanged.
+    fn moved(&self, start: u32, end: u32) -> Option<[u32; 2]> {
+        if end <= self.prefix {
+            return Some([start, end]);
+        }
+        let now = |it: u32| u32::try_from(i64::from(it) - self.shift).ok();
+        let start = now(start).filter(|&it| it >= u32::from(self.suffix_from))?;
+        Some([start, now(end)?])
+    }
+
+    /// Sets the bit in `touched` of each item of `items` (the new parse's) holding an entry of
+    /// the ast id map or an anchor of the span map, in the text this edit left unchanged, that
+    /// is not as it was in `last`'s maps; `entries`, `pairs` and `starts` are the new maps'
+    /// ([`AstIdMap::entries`], [`RealSpanMap::anchors`]). An item no bit is set for has the
+    /// ast ids and anchors it had, if [`Self::kept`] keeps it: its entries are all in that text,
+    /// and an id is looked up by its node's kind and range, which no two entries share, so equal
+    /// entries give equal lookups. Each map's arrays are walked once, old and new together.
+    fn touched(
+        &self,
+        last: &Keyed,
+        entries: &[[u32; 4]],
+        pairs: &[[u32; 2]],
+        starts: &[u32],
+        items: &[ItemKey],
+        touched: &mut [u64],
+    ) {
+        let mut mark = |offset: u32| {
+            let at = items.partition_point(|it| u32::from(it.range.end()) <= offset);
+            if items.get(at).is_some_and(|it| u32::from(it.range.start()) <= offset) {
+                touched[at / 64] |= 1 << (at % 64);
+            }
+        };
+        // Each map's first is the root's, which is no item's: its entry's range is the whole
+        // text and its anchor begins at 0, before the first item's.
+        let old = (last.entries.get(1..).unwrap_or_default().iter())
+            .filter_map(|&[s, e, kind, id]| self.moved(s, e).map(|[s, e]| [s, e, kind, id]));
+        let new = entries.get(1..).unwrap_or_default().iter().copied();
+        compare(old, new.filter(|&[s, e, ..]| self.keeps(s, e)), &mut mark);
+        let old = (last.anchors.get(1..).unwrap_or_default().iter())
+            .filter_map(|&[s, id]| Some([self.moved(s, s + 1)?[0], id]));
+        let new = starts.iter().zip(pairs).skip(1).map(|(&s, &[id, _])| [s, id]);
+        compare(old, new.filter(|&[s, _]| self.keeps(s, s + 1)), &mut mark);
+    }
+}
+
+/// Walks `old` and `new` together, each `[start, .., id]` of what is in the unchanged text
+/// (`old`'s moved to where it is now), in their maps' order: a node's place and kind before
+/// its id. Two of the same place and kind are a pair, which counts when their ids are equal
+/// too; `mark` is called with the start of each that has no equal partner. The order is by
+/// start within each run of rising starts (a level of the ast id map's breadth-first walk, or
+/// the whole of the anchors), and a run is walked with the other side's matching run: when one
+/// side's next starts a run and the other's does not, the other's is walked to its run's end.
+/// A run out of step with the other side's only marks more; a pair never counts unless its
+/// entries are equal.
+fn compare<const N: usize>(
+    old: impl Iterator<Item = [u32; N]>,
+    new: impl Iterator<Item = [u32; N]>,
+    mark: &mut impl FnMut(u32),
+) {
+    let (mut old, mut new) = (old.peekable(), new.peekable());
+    let (mut old_at, mut new_at) = (0, 0);
+    loop {
+        let step = match (old.peek(), new.peek()) {
+            (None, None) => return,
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (Some(a), Some(b)) => match (a[0] < old_at, b[0] < new_at) {
+                (true, false) => Ordering::Greater,
+                (false, true) => Ordering::Less,
+                _ => a[..N - 1].cmp(&b[..N - 1]),
+            },
+        };
+        match step {
+            Ordering::Equal => {
+                let (Some(a), Some(b)) = (old.next(), new.next()) else {
+                    unreachable!("both sides peeked")
+                };
+                if a[N - 1] != b[N - 1] {
+                    mark(b[0]);
+                }
+                (old_at, new_at) = (a[0], b[0]);
+            }
+            Ordering::Less => {
+                let Some(a) = old.next() else { unreachable!("an old entry peeked") };
+                mark(a[0]);
+                old_at = a[0];
+            }
+            Ordering::Greater => {
+                let Some(b) = new.next() else { unreachable!("a new entry peeked") };
+                mark(b[0]);
+                new_at = b[0];
+            }
+        }
     }
 }
 
@@ -512,8 +673,8 @@ macro_rules! marks {
             /// level's attribute owner, which is no item's.
             fn ends(tree: &ItemTree) -> Marks {
                 let top =
-                    tree.attr_owners.last().is_some_and(|it| it.owner == ModItemId::TOP_OWNER);
-                let mut ends = Marks { $($column: base(tree.$column.len()),)* };
+                    tree.attr_owners().last().is_some_and(|it| it.owner == ModItemId::TOP_OWNER);
+                let mut ends = Marks { $($column: base(tree.$column().len()),)* };
                 ends.attr_owners -= top as u32;
                 ends
             }
@@ -524,9 +685,9 @@ macro_rules! marks {
             }
         }
 
-        /// The marks of the columns being assembled, named as the tree's.
+        /// The marks of the columns `sinks` are filling, named as the tree's.
         macro_rules! marks_of {
-            () => { Marks { $($column: base($column.len()),)* } };
+            ($sinks:ident) => { Marks { $($column: base($sinks.$column.len()),)* } };
         }
     };
 }
@@ -558,7 +719,7 @@ marks!(
     paths,
     vis,
     attr_owners,
-    attrs,
+    attr_list,
     cfgs,
 );
 
@@ -580,248 +741,219 @@ impl Rows<'_> {
 }
 
 /// A file's tree from its parts: `top`, its top level's attributes ([`top_attrs`]), and runs
-/// of its items' rows in order, each run's ids moved by where its rows go. One pass over every
-/// part, each column allocated once at its length. Pushes onto `marks` where each item's rows
-/// begin in the tree made, then where the last one's end. The attributes are cloned, which
-/// allocates for those whose paths or inputs do.
+/// of its items' rows in order, each run's ids moved by where its rows go. Every column's
+/// length is summed first, then one pass over every part writes the tree's one block. Pushes
+/// onto `marks` where each item's rows begin in the tree made, then where the last one's end.
+/// The attributes are cloned, which allocates for those whose paths or inputs do.
 pub(super) fn assemble(top: &ItemTree, parts: &[Rows<'_>], marks: &mut Vec<Marks>) -> ItemTree {
-    macro_rules! column {
-        ($field:ident) => {
-            column!($field, $field)
+    macro_rules! len {
+        ($column:ident) => {
+            len!($column, $column)
         };
-        ($field:ident, $by:ident) => {
-            // alloc: the tree's column, once a tree at its length
-            Vec::with_capacity(
-                top.$field.len()
-                    + parts.iter().map(|it| (it.to().$by - it.from().$by) as usize).sum::<usize>(),
-            )
+        ($column:ident, $by:ident) => {
+            top.$column().len()
+                + parts.iter().map(|it| (it.to().$by - it.from().$by) as usize).sum::<usize>()
         };
     }
-    let mut top_level = column!(top_level);
-    let mut kinds = column!(kinds);
-    let mut data = column!(data, kinds);
-    let mut ast_ids = column!(ast_ids, kinds);
-    let mut children = column!(children);
-    let mut consts = column!(consts);
-    let mut enums = column!(enums);
-    let mut extern_blocks = column!(extern_blocks);
-    let mut extern_crates = column!(extern_crates);
-    let mut functions = column!(functions);
-    let mut impls = column!(impls);
-    let mut macro2s = column!(macro2s);
-    let mut macro_calls = column!(macro_calls);
-    let mut macro_rules = column!(macro_rules);
-    let mut mods = column!(mods);
-    let mut statics = column!(statics);
-    let mut structs = column!(structs);
-    let mut traits = column!(traits);
-    let mut type_aliases = column!(type_aliases);
-    let mut unions = column!(unions);
-    let mut uses = column!(uses);
-    let mut use_trees = column!(use_trees);
-    let mut use_tree_lists = column!(use_tree_lists);
-    let mut ctor_vis = column!(ctor_vis);
-    let mut names = column!(names);
-    let mut paths = column!(paths);
-    let mut vis = column!(vis);
-    let mut attr_owners = column!(attr_owners);
-    let mut attrs = column!(attrs);
-    let mut cfgs = column!(cfgs);
+    let items = len!(kinds);
+    let lens = ItemTreeLens {
+        top_level: len!(top_level),
+        kinds: items,
+        data: len!(data, kinds),
+        ast_ids: len!(ast_ids, kinds),
+        children: len!(children),
+        consts: len!(consts),
+        enums: len!(enums),
+        extern_blocks: len!(extern_blocks),
+        extern_crates: len!(extern_crates),
+        functions: len!(functions),
+        impls: len!(impls),
+        macro2s: len!(macro2s),
+        macro_calls: len!(macro_calls),
+        macro_rules: len!(macro_rules),
+        mods: len!(mods),
+        statics: len!(statics),
+        structs: len!(structs),
+        traits: len!(traits),
+        type_aliases: len!(type_aliases),
+        unions: len!(unions),
+        uses: len!(uses),
+        use_trees: len!(use_trees),
+        use_tree_lists: len!(use_tree_lists),
+        ctor_vis: len!(ctor_vis),
+        names: len!(names),
+        paths: len!(paths),
+        vis: len!(vis),
+        attr_owners: len!(attr_owners),
+        attr_index: items.div_ceil(64),
+        attr_list: len!(attr_list),
+        cfgs: len!(cfgs),
+    };
 
-    attrs.extend(top.attrs.iter().cloned());
-    cfgs.extend(top.cfgs.iter().cloned());
-    for part in parts {
-        let (tree, from, to) = (part.tree, part.from(), part.to());
-        macro_rules! rows {
-            ($field:ident) => {
-                rows!($field, $field)
-            };
-            ($field:ident, $by:ident) => {
-                &tree.$field[from.$by as usize..to.$by as usize]
-            };
+    // alloc: the tree's block, once a tree at its length
+    ItemTree::build(lens, |s| {
+        s.attr_list.extend(top.attr_list().iter().cloned());
+        s.cfgs.extend(top.cfgs().iter().cloned());
+        for part in parts {
+            assemble_part(s, part, marks);
         }
-        let now = marks_of!();
-        marks.extend(part.marks[..part.marks.len() - 1].iter().map(|it| it.moved(from, &now)));
-        // An id `i` of the part's is `i - from` in its run, so `i - from + now` in the tree.
-        let by = |now: u32, from: u32| now.wrapping_sub(from);
-        let base = Bases {
-            item: by(now.kinds, from.kinds),
-            children: by(now.children, from.children),
-            use_trees: by(now.use_trees, from.use_trees),
-            use_tree_lists: by(now.use_tree_lists, from.use_tree_lists),
-            ctor_vis: by(now.ctor_vis, from.ctor_vis),
-            names: by(now.names, from.names),
-            paths: by(now.paths, from.paths),
-            vis: by(now.vis, from.vis),
-            attrs: by(now.attrs, from.attrs),
-            cfgs: by(now.cfgs, from.cfgs),
+        marks.push(marks_of!(s));
+        s.attr_owners.extend_from_slice(top.attr_owners());
+        s.attr_index.extend(super::attr_blocks(s.attr_owners.written(), items));
+    })
+}
+
+/// Writes `part`'s rows into the tree being assembled, after the rows written so far, each id
+/// moved by where its run goes; pushes onto `marks` where each of its items' rows begin.
+fn assemble_part(s: &mut ItemTreeSinks<'_>, part: &Rows<'_>, marks: &mut Vec<Marks>) {
+    let (tree, from, to) = (part.tree, part.from(), part.to());
+    macro_rules! rows {
+        ($column:ident) => {
+            rows!($column, $column)
         };
-        for (&kind, &at) in rows!(kinds).iter().zip(rows!(data, kinds)) {
-            let (column, origin) = match kind {
-                ItemKind::Const => (now.consts, from.consts),
-                ItemKind::Enum => (now.enums, from.enums),
-                ItemKind::ExternBlock => (now.extern_blocks, from.extern_blocks),
-                ItemKind::ExternCrate => (now.extern_crates, from.extern_crates),
-                ItemKind::Function => (now.functions, from.functions),
-                ItemKind::Impl => (now.impls, from.impls),
-                ItemKind::Macro2 => (now.macro2s, from.macro2s),
-                ItemKind::MacroCall => (now.macro_calls, from.macro_calls),
-                ItemKind::MacroRules => (now.macro_rules, from.macro_rules),
-                ItemKind::Mod => (now.mods, from.mods),
-                ItemKind::Static => (now.statics, from.statics),
-                ItemKind::Struct => (now.structs, from.structs),
-                ItemKind::Trait => (now.traits, from.traits),
-                ItemKind::TypeAlias => (now.type_aliases, from.type_aliases),
-                ItemKind::Union => (now.unions, from.unions),
-                ItemKind::Use => (now.uses, from.uses),
-            };
-            kinds.push(kind);
-            data.push(by(column, origin).wrapping_add(at));
-        }
-        ast_ids.extend_from_slice(rows!(ast_ids, kinds));
-        top_level.extend(rows!(top_level).iter().map(|&it| base.item(it)));
-        children.extend(rows!(children).iter().map(|&it| base.item(it)));
-
-        consts.extend(
-            rows!(consts)
-                .iter()
-                .map(|it| Const { name: base.name(it.name), visibility: base.vis(it.visibility) }),
-        );
-        enums.extend(
-            rows!(enums)
-                .iter()
-                .map(|it| Enum { name: base.name(it.name), visibility: base.vis(it.visibility) }),
-        );
-        extern_blocks.extend(
-            rows!(extern_blocks)
-                .iter()
-                .map(|it| ExternBlock { children: base.children(it.children) }),
-        );
-        extern_crates.extend(rows!(extern_crates).iter().map(|it| ExternCrate {
-            name: base.name(it.name),
-            alias: base.alias(it.alias),
-            visibility: base.vis(it.visibility),
-        }));
-        functions.extend(
-            rows!(functions).iter().map(|it| Function {
-                name: base.name(it.name),
-                visibility: base.vis(it.visibility),
-            }),
-        );
-        impls.extend_from_slice(rows!(impls));
-        macro2s.extend(
-            rows!(macro2s)
-                .iter()
-                .map(|it| Macro2 { name: base.name(it.name), visibility: base.vis(it.visibility) }),
-        );
-        macro_calls.extend(
-            rows!(macro_calls).iter().map(|it| MacroCall { path: base.path(it.path), ..*it }),
-        );
-        macro_rules
-            .extend(rows!(macro_rules).iter().map(|it| MacroRules { name: base.name(it.name) }));
-        mods.extend(rows!(mods).iter().map(|it| Mod {
-            name: base.name(it.name),
-            visibility: base.vis(it.visibility),
-            items: match it.items {
-                IdRange::NONE => IdRange::NONE,
-                items => base.children(items),
-            },
-        }));
-        statics.extend(
-            rows!(statics)
-                .iter()
-                .map(|it| Static { name: base.name(it.name), visibility: base.vis(it.visibility) }),
-        );
-        structs.extend(rows!(structs).iter().map(|it| Struct {
-            name: base.name(it.name),
-            visibility: base.vis(it.visibility),
-            value_ns_ctor: match it.value_ns_ctor.len {
-                0 => it.value_ns_ctor,
-                _ => shift(it.value_ns_ctor, base.ctor_vis),
-            },
-        }));
-        traits.extend(
-            rows!(traits)
-                .iter()
-                .map(|it| Trait { name: base.name(it.name), visibility: base.vis(it.visibility) }),
-        );
-        type_aliases.extend(
-            rows!(type_aliases).iter().map(|it| TypeAlias {
-                name: base.name(it.name),
-                visibility: base.vis(it.visibility),
-            }),
-        );
-        unions.extend(
-            rows!(unions)
-                .iter()
-                .map(|it| Union { name: base.name(it.name), visibility: base.vis(it.visibility) }),
-        );
-        uses.extend(rows!(uses).iter().map(|it| Use {
-            visibility: base.vis(it.visibility),
-            use_tree: base.use_tree(it.use_tree),
-        }));
-        use_trees.extend(rows!(use_trees).iter().map(|it| UseTree {
-            kind: it.kind,
-            path: base.path(it.path),
-            alias: base.alias(it.alias),
-            list: match it.kind {
-                UseTree::PREFIXED => shift(it.list, base.use_tree_lists),
-                _ => it.list,
-            },
-        }));
-        use_tree_lists.extend(rows!(use_tree_lists).iter().map(|&it| base.use_tree(it)));
-        ctor_vis.extend(rows!(ctor_vis).iter().map(|&it| base.vis(it)));
-        names.extend(rows!(names).iter().cloned());
-        paths.extend(rows!(paths).iter().cloned());
-        vis.extend(rows!(vis).iter().cloned());
-        attr_owners.extend(rows!(attr_owners).iter().map(|it| AttrOwner {
-            owner: base.item(it.owner),
-            attrs: shift(it.attrs, base.attrs),
-            cfg: match it.cfg {
-                AttrOwner::ENABLED => AttrOwner::ENABLED,
-                cfg => cfg.wrapping_add(base.cfgs),
-            },
-        }));
-        attrs.extend(rows!(attrs).iter().cloned());
-        cfgs.extend(rows!(cfgs).iter().cloned());
+        ($column:ident, $by:ident) => {
+            &tree.$column()[from.$by as usize..to.$by as usize]
+        };
     }
-    marks.push(marks_of!());
-    attr_owners.extend_from_slice(&top.attr_owners);
-    let attr_index = super::attr_index(&attr_owners, kinds.len());
-
-    ItemTree {
-        top_level: top_level.into(),
-        kinds: kinds.into(),
-        data: data.into(),
-        ast_ids: ast_ids.into(),
-        children: children.into(),
-        consts: consts.into(),
-        enums: enums.into(),
-        extern_blocks: extern_blocks.into(),
-        extern_crates: extern_crates.into(),
-        functions: functions.into(),
-        impls: impls.into(),
-        macro2s: macro2s.into(),
-        macro_calls: macro_calls.into(),
-        macro_rules: macro_rules.into(),
-        mods: mods.into(),
-        statics: statics.into(),
-        structs: structs.into(),
-        traits: traits.into(),
-        type_aliases: type_aliases.into(),
-        unions: unions.into(),
-        uses: uses.into(),
-        use_trees: use_trees.into(),
-        use_tree_lists: use_tree_lists.into(),
-        ctor_vis: ctor_vis.into(),
-        names: names.into(),
-        paths: paths.into(),
-        vis: vis.into(),
-        attr_owners: attr_owners.into(),
-        attr_index,
-        attrs: attrs.into(),
-        cfgs: cfgs.into(),
+    let now = marks_of!(s);
+    marks.extend(part.marks[..part.marks.len() - 1].iter().map(|it| it.moved(from, &now)));
+    // An id `i` of the part's is `i - from` in its run, so `i - from + now` in the tree.
+    let by = |now: u32, from: u32| now.wrapping_sub(from);
+    let base = Bases {
+        item: by(now.kinds, from.kinds),
+        children: by(now.children, from.children),
+        use_trees: by(now.use_trees, from.use_trees),
+        use_tree_lists: by(now.use_tree_lists, from.use_tree_lists),
+        ctor_vis: by(now.ctor_vis, from.ctor_vis),
+        names: by(now.names, from.names),
+        paths: by(now.paths, from.paths),
+        vis: by(now.vis, from.vis),
+        attrs: by(now.attr_list, from.attr_list),
+        cfgs: by(now.cfgs, from.cfgs),
+    };
+    for (&kind, &at) in rows!(kinds).iter().zip(rows!(data, kinds)) {
+        let (column, origin) = match kind {
+            ItemKind::Const => (now.consts, from.consts),
+            ItemKind::Enum => (now.enums, from.enums),
+            ItemKind::ExternBlock => (now.extern_blocks, from.extern_blocks),
+            ItemKind::ExternCrate => (now.extern_crates, from.extern_crates),
+            ItemKind::Function => (now.functions, from.functions),
+            ItemKind::Impl => (now.impls, from.impls),
+            ItemKind::Macro2 => (now.macro2s, from.macro2s),
+            ItemKind::MacroCall => (now.macro_calls, from.macro_calls),
+            ItemKind::MacroRules => (now.macro_rules, from.macro_rules),
+            ItemKind::Mod => (now.mods, from.mods),
+            ItemKind::Static => (now.statics, from.statics),
+            ItemKind::Struct => (now.structs, from.structs),
+            ItemKind::Trait => (now.traits, from.traits),
+            ItemKind::TypeAlias => (now.type_aliases, from.type_aliases),
+            ItemKind::Union => (now.unions, from.unions),
+            ItemKind::Use => (now.uses, from.uses),
+        };
+        s.kinds.push(kind);
+        s.data.push(by(column, origin).wrapping_add(at));
     }
+    s.ast_ids.extend_from_slice(rows!(ast_ids, kinds));
+    s.top_level.extend(rows!(top_level).iter().map(|&it| base.item(it)));
+    s.children.extend(rows!(children).iter().map(|&it| base.item(it)));
+
+    s.consts.extend(
+        rows!(consts)
+            .iter()
+            .map(|it| Const { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+    );
+    s.enums.extend(
+        rows!(enums)
+            .iter()
+            .map(|it| Enum { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+    );
+    s.extern_blocks.extend(
+        rows!(extern_blocks).iter().map(|it| ExternBlock { children: base.children(it.children) }),
+    );
+    s.extern_crates.extend(rows!(extern_crates).iter().map(|it| ExternCrate {
+        name: base.name(it.name),
+        alias: base.alias(it.alias),
+        visibility: base.vis(it.visibility),
+    }));
+    s.functions.extend(
+        rows!(functions)
+            .iter()
+            .map(|it| Function { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+    );
+    s.impls.extend_from_slice(rows!(impls));
+    s.macro2s.extend(
+        rows!(macro2s)
+            .iter()
+            .map(|it| Macro2 { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+    );
+    s.macro_calls
+        .extend(rows!(macro_calls).iter().map(|it| MacroCall { path: base.path(it.path), ..*it }));
+    s.macro_rules
+        .extend(rows!(macro_rules).iter().map(|it| MacroRules { name: base.name(it.name) }));
+    s.mods.extend(rows!(mods).iter().map(|it| Mod {
+        name: base.name(it.name),
+        visibility: base.vis(it.visibility),
+        items: match it.items {
+            IdRange::NONE => IdRange::NONE,
+            items => base.children(items),
+        },
+    }));
+    s.statics.extend(
+        rows!(statics)
+            .iter()
+            .map(|it| Static { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+    );
+    s.structs.extend(rows!(structs).iter().map(|it| Struct {
+        name: base.name(it.name),
+        visibility: base.vis(it.visibility),
+        value_ns_ctor: match it.value_ns_ctor.len {
+            0 => it.value_ns_ctor,
+            _ => shift(it.value_ns_ctor, base.ctor_vis),
+        },
+    }));
+    s.traits.extend(
+        rows!(traits)
+            .iter()
+            .map(|it| Trait { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+    );
+    s.type_aliases.extend(
+        rows!(type_aliases)
+            .iter()
+            .map(|it| TypeAlias { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+    );
+    s.unions.extend(
+        rows!(unions)
+            .iter()
+            .map(|it| Union { name: base.name(it.name), visibility: base.vis(it.visibility) }),
+    );
+    s.uses.extend(rows!(uses).iter().map(|it| Use {
+        visibility: base.vis(it.visibility),
+        use_tree: base.use_tree(it.use_tree),
+    }));
+    s.use_trees.extend(rows!(use_trees).iter().map(|it| UseTree {
+        kind: it.kind,
+        path: base.path(it.path),
+        alias: base.alias(it.alias),
+        list: match it.kind {
+            UseTree::PREFIXED => shift(it.list, base.use_tree_lists),
+            _ => it.list,
+        },
+    }));
+    s.use_tree_lists.extend(rows!(use_tree_lists).iter().map(|&it| base.use_tree(it)));
+    s.ctor_vis.extend(rows!(ctor_vis).iter().map(|&it| base.vis(it)));
+    s.names.extend(rows!(names).iter().cloned());
+    s.paths.extend(rows!(paths).iter().cloned());
+    s.vis.extend(rows!(vis).iter().cloned());
+    s.attr_owners.extend(rows!(attr_owners).iter().map(|it| AttrOwner {
+        owner: base.item(it.owner),
+        attrs: shift(it.attrs, base.attrs),
+        cfg: match it.cfg {
+            AttrOwner::ENABLED => AttrOwner::ENABLED,
+            cfg => cfg.wrapping_add(base.cfgs),
+        },
+    }));
+    s.attr_list.extend(rows!(attr_list).iter().cloned());
+    s.cfgs.extend(rows!(cfgs).iter().cloned());
 }
 
 /// How one part's ids move into the tree assembled: added, wrapping, to each id of the part
@@ -894,25 +1026,26 @@ impl Bases {
 
 /// The ids of `item` and the items it is made of, the nodes [`lower::Ctx`] asks the ids of, in
 /// preorder (by start).
-fn item_ids(item: &ast::Item, map: &AstIdMap, start: TextSize, out: &mut Vec<[u32; 3]>) {
-    push_id(out, item.syntax(), start, map.ast_id(item).erase());
+fn item_ids(item: ast::Item<'_>, map: &AstIdMap, start: TextSize, out: &mut Vec<[u32; 3]>) {
+    push_id(out, item.syntax(), start, map.ast_id_of_view::<tag::Item>(item).erase());
     match item {
         ast::Item::Module(module) => {
             for child in module.item_list().into_iter().flat_map(|list| list.items()) {
-                item_ids(&child, map, start, out);
+                item_ids(child, map, start, out);
             }
         }
         ast::Item::ExternBlock(block) => {
             for child in block.extern_item_list().into_iter().flat_map(|list| list.extern_items()) {
                 let child = ast::Item::from(child);
-                push_id(out, child.syntax(), start, map.ast_id(&child).erase());
+                let id = map.ast_id_of_view::<tag::Item>(child).erase();
+                push_id(out, child.syntax(), start, id);
             }
         }
         _ => {}
     }
 }
 
-fn push_id(out: &mut Vec<[u32; 3]>, node: &SyntaxNode, start: TextSize, id: ErasedFileAstId) {
+fn push_id(out: &mut Vec<[u32; 3]>, node: ast::Node<'_>, start: TextSize, id: ErasedFileAstId) {
     let at = u32::from(node.text_range().start() - start);
     out.push([at, node.kind() as u32, id.into_raw()]);
 }
@@ -946,10 +1079,9 @@ fn item_anchors(map: &RealSpanMap, item: TextRange, ids: &[[u32; 3]], out: &mut 
 /// lowering reads comes after what is left out within the node holding it, so leaving it out
 /// moves nothing that is hashed; what it moves in the item ([`item_ids`], [`item_anchors`]) is
 /// hashed with the key.
-fn hash_item(item: &SyntaxNode, state: &mut Feed<'_>) {
-    // clone: a cursor, which allocates nothing; `cast` takes it by value
-    let Some(ast) = ast::Item::cast(item.clone()) else { return hash_full(item, state) };
-    let (inner, skipped, items) = match &ast {
+fn hash_item(item: ast::Node<'_>, state: &mut Feed<'_>) {
+    let Some(ast) = ast::Item::cast(item) else { return hash_full(item, state) };
+    let (inner, skipped, items) = match ast {
         ast::Item::Fn(it) => (element(it.body()), None, None),
         ast::Item::Impl(it) => (element(it.assoc_item_list()), None, None),
         ast::Item::Trait(it) => (element(it.assoc_item_list()), None, None),
@@ -963,25 +1095,21 @@ fn hash_item(item: &SyntaxNode, state: &mut Feed<'_>) {
     }
     (NODE, item.kind() as u16).hash(state);
     for child in item.children_with_tokens() {
-        let at = match &child {
-            NodeOrToken::Node(node) => node.flat().map(|(_, at)| at),
-            NodeOrToken::Token(_) => None,
-        };
         match child {
-            NodeOrToken::Token(token) => hash_token(&token, state),
-            NodeOrToken::Node(node) if at == inner => hash_inner_attrs(&node, state),
-            NodeOrToken::Node(_) if at == skipped => SKIPPED.hash(state),
-            NodeOrToken::Node(node) if at == items => {
+            NodeOrToken::Token(token) => hash_token(token, state),
+            NodeOrToken::Node(node) if Some(node) == inner => hash_inner_attrs(node, state),
+            NodeOrToken::Node(node) if Some(node) == skipped => SKIPPED.hash(state),
+            NodeOrToken::Node(node) if Some(node) == items => {
                 (NODE, node.kind() as u16).hash(state);
                 for child in node.children_with_tokens() {
                     match child {
-                        NodeOrToken::Token(token) => hash_token(&token, state),
-                        NodeOrToken::Node(node) => hash_item(&node, state),
+                        NodeOrToken::Token(token) => hash_token(token, state),
+                        NodeOrToken::Node(node) => hash_item(node, state),
                     }
                     END.hash(state);
                 }
             }
-            NodeOrToken::Node(node) => hash_full(&node, state),
+            NodeOrToken::Node(node) => hash_full(node, state),
         }
         END.hash(state);
     }
@@ -991,7 +1119,7 @@ fn hash_item(item: &SyntaxNode, state: &mut Feed<'_>) {
 /// attribute lowering reads of it ([`ast::HasAttrs::inner_attributes_node`]): the tokens,
 /// attributes and doc comments before its first statement or item, and after that any inner
 /// attribute or doc comment with its offset. A lazy body is hashed whole.
-fn hash_inner_attrs(node: &SyntaxNode, state: &mut Feed<'_>) {
+fn hash_inner_attrs(node: ast::Node<'_>, state: &mut Feed<'_>) {
     if node.is_lazy() {
         return hash_full(node, state);
     }
@@ -1001,11 +1129,10 @@ fn hash_inner_attrs(node: &SyntaxNode, state: &mut Feed<'_>) {
     for child in node.children_with_tokens() {
         match child {
             NodeOrToken::Node(node) if node.kind() == SyntaxKind::STMT_LIST => {
-                hash_inner_attrs(&node, state)
+                hash_inner_attrs(node, state)
             }
             NodeOrToken::Node(node) if ast::AnyAttr::can_cast(node.kind()) => {
                 let attr = ast::AnyAttr::cast(node).expect("an attribute");
-                let node = attr.syntax();
                 if !leading {
                     if !attr.kind().is_inner() {
                         continue;
@@ -1015,16 +1142,16 @@ fn hash_inner_attrs(node: &SyntaxNode, state: &mut Feed<'_>) {
                 hash_full(node, state);
             }
             NodeOrToken::Node(_) => leading = false,
-            NodeOrToken::Token(token) if leading => hash_token(&token, state),
+            NodeOrToken::Token(token) if leading => hash_token(token, state),
             NodeOrToken::Token(_) => {}
         }
     }
     END.hash(state);
 }
 
-/// Where `node` is in its file's flat tree.
-fn element(node: Option<impl AstNode>) -> Option<u32> {
-    node?.syntax().flat().map(|(_, at)| at)
+/// The node a view is, to find among its parent's children.
+fn element<'t>(node: Option<impl AstNode<'t>>) -> Option<ast::Node<'t>> {
+    Some(node?.syntax())
 }
 
 const NODE: u8 = 0;
@@ -1037,8 +1164,8 @@ const KEPT_HASH: u8 = 4;
 /// across edits that don't touch them.
 const KEPT_TEXT: u32 = 4096;
 
-fn hash_full(node: &SyntaxNode, state: &mut Feed<'_>) {
-    let (tree, at) = node.flat().expect("a node of a flat tree");
+fn hash_full(node: ast::Node<'_>, state: &mut Feed<'_>) {
+    let (tree, at) = node.flat();
     if u32::from(node.text_range().len()) >= KEPT_TEXT {
         return (KEPT_HASH, tree.subtree_hash(at)).hash(state);
     }
@@ -1046,6 +1173,6 @@ fn hash_full(node: &SyntaxNode, state: &mut Feed<'_>) {
     tree.hash_subtree(at, state);
 }
 
-fn hash_token(token: &SyntaxToken, state: &mut Feed<'_>) {
+fn hash_token(token: ast::Token<'_>, state: &mut Feed<'_>) {
     (TOKEN, token.kind() as u16, token.text()).hash(state);
 }

@@ -181,7 +181,12 @@ impl Disk {
 
     /// A `utimensat` of `name`: its inode's mtime is `modified_ns` and its change time moves, as
     /// on a real disk. `false`, and nothing done, where `name` is neither a file nor a directory.
-    pub(super) fn times(&mut self, name: &FileName, modified_ns: u64, files: &FxHashMap<FileName, SimFile>) -> bool {
+    pub(super) fn times(
+        &mut self,
+        name: &FileName,
+        modified_ns: u64,
+        files: &FxHashMap<FileName, SimFile>,
+    ) -> bool {
         if self.stamp(name, files) == Stamp::GONE {
             return false;
         }

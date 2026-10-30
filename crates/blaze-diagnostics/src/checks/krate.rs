@@ -13,22 +13,23 @@
 use std::ops::ControlFlow;
 
 use base_db::{FileId, TargetKind};
-use hir::{HasSource, InFile, ModuleDef, Name};
+use hir::{HirFileId, InFile, ModuleDef, Name};
 use hir_def::{Lookup, ModuleDefId, expr_store::Body, item_scope::ImportOrGlob};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
-    AstNode, AstToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange, TextSize,
-    ast::{self, HasName},
+    SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _, HasName as _, NodeId},
 };
 
 use crate::{
     checks::{PASSES, has_crate_attr, modules},
-    cx::{Cx, def_range, item_range},
+    cx::{Cx, def_range_view as def_range, item_range_view as item_range},
     lower::Found,
     model::{Code, Diag, Level},
 };
 
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
+    // alloc: empty, allocates nothing, unless there is an error
     entry(cx).into_iter().map(|diag| Found::new(diag, PASSES)).collect()
 }
 
@@ -41,11 +42,14 @@ fn is_executable(kind: TargetKind) -> bool {
 /// rustc's `entry_fn`: the errors of looking for the crate's `main`.
 fn entry(cx: &Cx<'_, '_>) -> Vec<Diag> {
     if !is_executable(cx.krate.target_kind(cx.db)) || has_crate_attr(cx, "no_main") {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
+    // alloc: empty unless there is an error
     let mut diags = Vec::new();
     let items = free_items(cx);
-    let mut rustc_main: Option<&FreeItem> = None;
+    let mut rustc_main: Option<&FreeItem<'_>> = None;
+    // alloc: empty unless a `main` is below the crate root
     let mut non_main_fns = Vec::new();
     for item in &items {
         if item.rustc_main {
@@ -56,6 +60,7 @@ fn entry(cx: &Cx<'_, '_>) -> Vec<Diag> {
                     let mut diag = Diag::error(
                         Some("E0137"),
                         "multiple functions with a `#[rustc_main]` attribute",
+                        // clone: the error's span
                         span.clone(),
                     );
                     diag.span_label(cx.span(first.def_range()), "first `#[rustc_main]` function");
@@ -63,7 +68,7 @@ fn entry(cx: &Cx<'_, '_>) -> Vec<Diag> {
                     diags.push(diag);
                 }
             }
-        } else if item.name.as_deref() == Some("main") && !item.at_root {
+        } else if item.main && !item.at_root {
             non_main_fns.push(item);
         }
     }
@@ -76,9 +81,9 @@ fn entry(cx: &Cx<'_, '_>) -> Vec<Diag> {
         let local = function.module(cx.db).krate(cx.db) == cx.krate;
         if local
             && function.extern_block(cx.db).is_some()
-            && let Some(node) = function.source(cx.db)
+            && let Some(node) = cx.vsema.source(*function)
         {
-            let span = cx.span(node.as_ref().map(|it| def_range(it.syntax())));
+            let span = cx.span(node.map(|it| def_range(it.syntax())));
             let mut diag = Diag::error(None, "the `main` function cannot be declared in an `extern` block", span);
             diag.fact(cx.resolves_fact(root, "main"), "what `main` is in the crate root");
             diags.push(diag);
@@ -109,30 +114,35 @@ fn main_def(cx: &Cx<'_, '_>, root: hir::Module) -> Option<MainDef> {
     }
     let use_tree = |use_: hir_def::UseId, idx| {
         let ast_id = use_.lookup(cx.db).id;
-        let tree = hir_def::src::use_tree_to_ast(cx.db, ast_id, idx);
+        let tree = hir_def::src::use_tree_to_view(cx.db, ast_id, idx);
         InFile::new(ast_id.file_id, tree.syntax().text_range())
     };
     let binding = match item.import {
         Some(ImportOrGlob::Import(import)) => Some(use_tree(import.use_, import.idx)),
         Some(ImportOrGlob::Glob(glob)) => Some(use_tree(glob.use_, glob.idx)),
-        None => source(cx, ModuleDef::from(item.def)).map(|node| node.as_ref().map(item_range)),
+        None => source(cx, ModuleDef::from(item.def)).map(|node| node.map(item_range)),
     };
     binding.map(MainDef::Other)
 }
 
 /// rustc's `no_main_err`.
-fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem], main: Option<MainDef>) -> Diag {
+fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem<'_>], main: Option<MainDef>) -> Diag {
+    // alloc: the error's message
     let message = format!("`main` function not found in crate `{}`", crate_name(cx, root));
     let file = root.as_source_file_id(cx.db).map(|it| it.file_id(cx.db));
     let filename = file.map(|it| cx.file_name(it));
     let at = file.and_then(|file| Some(cx.span_in_file(file, TextRange::empty(crate_end(cx, file)?))));
     let mut diag = match &at {
+        // clone: the error's span
         Some(at) => Diag::error(Some("E0601"), message, at.clone()),
+        // alloc: the error's code
         None => Diag::new(Level::Error, Some(Code::Error("E0601".to_owned())), message),
     };
     let note = if non_main_fns.is_empty() {
         match &filename {
+            // alloc: the error's label
             Some(filename) => format!("consider adding a `main` function to `{filename}`"),
+            // alloc: the error's label
             None => "consider adding a `main` function at the crate level".to_owned(),
         }
     } else {
@@ -142,7 +152,9 @@ fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem], main:
         diag.note("you have one or more functions named `main` not defined at the crate level");
         diag.help("consider moving the `main` function definitions");
         match &filename {
+            // alloc: the error's label
             Some(filename) => format!("the main function must be defined at the crate level (in `{filename}`)"),
+            // alloc: the error's label
             None => "the main function must be defined at the crate level".to_owned(),
         }
     };
@@ -167,6 +179,7 @@ fn no_main(cx: &Cx<'_, '_>, root: hir::Module, non_main_fns: &[&FreeItem], main:
 /// The crate's name: `--crate-name`, else rustc's from the root file's name.
 fn crate_name(cx: &Cx<'_, '_>, root: hir::Module) -> String {
     if let Some(name) = cx.krate.display_name(cx.db) {
+        // alloc: the error's message
         return name.crate_name().to_string();
     }
     let file = root.as_source_file_id(cx.db).map(|it| cx.file_name(it.file_id(cx.db))).unwrap_or_default();
@@ -182,10 +195,10 @@ fn crate_end(cx: &Cx<'_, '_>, file: FileId) -> Option<TextSize> {
         return None;
     }
     let root = cx.krate.root_module(cx.db).as_source_file_id(cx.db)?;
-    let tree = root.parse(cx.db).tree();
+    let tree = cx.vsema.parse(root);
     let mut token = tree.syntax().last_token();
     while let Some(it) = token {
-        if !is_rustc_trivia(&it) {
+        if !is_rustc_trivia(it) {
             return Some(it.text_range().end());
         }
         token = it.prev_token();
@@ -193,48 +206,50 @@ fn crate_end(cx: &Cx<'_, '_>, file: FileId) -> Option<TextSize> {
     Some(TextSize::of(text))
 }
 
-/// What rustc's lexer gives no token for: whitespace, comments that are not doc comments,
-/// the shebang and the frontmatter.
-fn is_rustc_trivia(token: &SyntaxToken) -> bool {
-    match token.kind() {
-        SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER => true,
-        SyntaxKind::COMMENT => ast::Comment::cast(token.clone()).is_none_or(|it| it.kind().doc.is_none()),
-        _ => false,
-    }
+/// What rustc's lexer gives no token for: whitespace, comments that are not doc comments
+/// (a doc comment is an `INNER_DOC_COMMENT` or `OUTER_DOC_COMMENT` token), the shebang and the
+/// frontmatter.
+fn is_rustc_trivia(token: ast::Token<'_>) -> bool {
+    matches!(
+        token.kind(),
+        SyntaxKind::WHITESPACE | SyntaxKind::COMMENT | SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER
+    )
 }
 
 /// An item rustc's `hir_free_items` gives: a module's, a block's, not an associated or a
-/// foreign item.
-struct FreeItem {
-    name: Option<String>,
+/// foreign item. Only those `entry` looks at are kept: a `#[rustc_main]` function, an item
+/// named `main` below the crate root.
+struct FreeItem<'db> {
+    /// Named `main`.
+    main: bool,
     /// Directly in the crate root.
     at_root: bool,
     /// The module it is declared in (a block's for an item in a body).
     module: hir::Module,
-    node: InFile<SyntaxNode>,
+    node: InFile<ast::Node<'db>>,
     rustc_main: bool,
     /// Where it is in the crate's source: rustc's order of items.
     place: Vec<u32>,
 }
 
-impl FreeItem {
+impl FreeItem<'_> {
     /// rustc's `def_span`.
     fn def_range(&self) -> InFile<TextRange> {
-        self.node.as_ref().map(free_item_def_range)
+        self.node.map(free_item_def_range)
     }
 }
 
 /// rustc's `def_span` of a free item: a const's or a static's ends with its type, a macro's
 /// with its name, the rest as [`def_range`].
-fn free_item_def_range(node: &SyntaxNode) -> TextRange {
+fn free_item_def_range(node: ast::Node<'_>) -> TextRange {
     let start = item_range(node).start();
-    let end = if let Some(it) = ast::Const::cast(node.clone()) {
+    let end = if let Some(it) = ast::Const::cast(node) {
         it.ty().map(|ty| ty.syntax().text_range().end())
-    } else if let Some(it) = ast::Static::cast(node.clone()) {
+    } else if let Some(it) = ast::Static::cast(node) {
         it.ty().map(|ty| ty.syntax().text_range().end())
-    } else if let Some(it) = ast::MacroRules::cast(node.clone()) {
+    } else if let Some(it) = ast::MacroRules::cast(node) {
         it.name().map(|name| name.syntax().text_range().end())
-    } else if let Some(it) = ast::MacroDef::cast(node.clone()) {
+    } else if let Some(it) = ast::MacroDef::cast(node) {
         it.name().map(|name| name.syntax().text_range().end())
     } else {
         None
@@ -246,9 +261,10 @@ fn free_item_def_range(node: &SyntaxNode) -> TextRange {
 }
 
 /// The crate's free items, in rustc's order.
-fn free_items(cx: &Cx<'_, '_>) -> Vec<FreeItem> {
+fn free_items<'db>(cx: &Cx<'_, 'db>) -> Vec<FreeItem<'db>> {
     let root = cx.krate.root_module(cx.db);
-    let mut walk = Walk { cx, places: Places::new(cx), root, seen: FxHashSet::default(), items: Vec::new() };
+    // alloc: setup, once per crate; `items` is empty unless there is a `#[rustc_main]` or a `main` below the root
+    let mut walk = Walk { cx, places: None, root, seen: FxHashSet::default(), items: Vec::new() };
     walk.module(root);
     let mut items = walk.items;
     items.sort_by(|a, b| a.place.cmp(&b.place));
@@ -257,16 +273,17 @@ fn free_items(cx: &Cx<'_, '_>) -> Vec<FreeItem> {
 
 struct Walk<'a, 'b, 'db> {
     cx: &'a Cx<'b, 'db>,
-    places: Places,
+    /// Made for the first item kept.
+    places: Option<Places>,
     root: hir::Module,
-    seen: FxHashSet<InFile<SyntaxNodePtr>>,
-    items: Vec<FreeItem>,
+    seen: FxHashSet<(HirFileId, NodeId)>,
+    items: Vec<FreeItem<'db>>,
 }
 
-impl Walk<'_, '_, '_> {
+impl<'db> Walk<'_, '_, 'db> {
     fn module(&mut self, module: hir::Module) {
         let db = self.cx.db;
-        for def in module.declarations(db) {
+        for def in module.declarations_iter(db) {
             let foreign = match def {
                 ModuleDef::Function(it) => it.extern_block(db).is_some(),
                 ModuleDef::Static(it) => it.extern_block(db).is_some(),
@@ -278,16 +295,14 @@ impl Walk<'_, '_, '_> {
             if let Some(node) = source(self.cx, def) {
                 self.push(module, def.name(db), node);
             }
-            for body in bodies(self.cx, def) {
-                self.blocks(body);
-            }
+            bodies(self.cx, def, |body| self.blocks(body));
         }
-        for macro_ in module.legacy_macros(db) {
+        for macro_ in module.legacy_macros_iter(db) {
             if macro_.module(db) != module {
                 continue;
             }
-            if let Some(node) = macro_.source(db) {
-                let node = node.map(|it| it.either(|it| it.syntax().clone(), |it| it.syntax().clone()));
+            if let Some(node) = self.cx.vsema.source(macro_) {
+                let node = node.map(|it| it.either(|it| it.syntax(), |it| it.syntax()));
                 self.push(module, Some(macro_.name(db)), node);
             }
         }
@@ -295,12 +310,12 @@ impl Walk<'_, '_, '_> {
         let scope = module_id.def_map(db).module(db, module_id).scope(db);
         for id in scope.extern_crate_decls() {
             let decl = hir::ExternCrateDecl::from(id);
-            if let Some(node) = decl.source(db) {
-                self.push(module, decl.alias_or_name(db), node.map(|it| it.syntax().clone()));
+            if let Some(node) = self.cx.vsema.source(decl) {
+                self.push(module, decl.alias_or_name(db), node.map(|it| it.syntax()));
             }
         }
-        for impl_ in module.impl_defs(db) {
-            for item in impl_.items(db) {
+        for impl_ in module.impl_defs_iter(db) {
+            for item in impl_.items_iter(db) {
                 if let Some(body) = assoc_body(item) {
                     self.blocks(body);
                 }
@@ -311,39 +326,37 @@ impl Walk<'_, '_, '_> {
         }
     }
 
-    fn push(&mut self, module: hir::Module, name: Option<Name>, node: InFile<SyntaxNode>) {
-        if !self.seen.insert(node.as_ref().map(SyntaxNodePtr::new)) {
+    fn push(&mut self, module: hir::Module, name: Option<Name>, node: InFile<ast::Node<'db>>) {
+        if !self.seen.insert((node.file_id, node.value.id())) {
             return;
         }
-        self.items.push(FreeItem {
-            name: name.map(|it| it.as_str().to_owned()),
-            at_root: module == self.root,
-            module,
-            rustc_main: has_attr(self.cx, &node, "rustc_main"),
-            place: self.places.of(self.cx, &node),
-            node,
-        });
+        let at_root = module == self.root;
+        let main = name.is_some_and(|it| it.as_str() == "main");
+        let rustc_main = has_attr(self.cx, node, "rustc_main");
+        if !rustc_main && (!main || at_root) {
+            return;
+        }
+        let cx = self.cx;
+        let place = self.places.get_or_insert_with(|| Places::new(cx)).of(cx, node);
+        self.items.push(FreeItem { main, at_root, module, rustc_main, place, node });
     }
 
     /// The items of the blocks of `body`.
     fn blocks(&mut self, body: hir::DefWithBody) {
         let Ok(id) = hir_def::DefWithBodyId::try_from(body) else { return };
-        let blocks: Vec<hir::Module> = Body::of(self.cx.db, id)
-            .blocks(self.cx.db)
-            .map(|(_, def_map)| hir::Module::from(def_map.root_module_id()))
-            .collect();
-        for block in blocks {
-            self.module(block);
+        let db = self.cx.db;
+        for (_, def_map) in Body::of(db, id).blocks(db) {
+            self.module(hir::Module::from(def_map.root_module_id()));
         }
     }
 }
 
-/// The bodies of `def`: its own, its variants' discriminants, a trait's default bodies.
-fn bodies(cx: &Cx<'_, '_>, def: ModuleDef) -> Vec<hir::DefWithBody> {
+/// Each body of `def`: its own, its variants' discriminants, a trait's default bodies.
+fn bodies(cx: &Cx<'_, '_>, def: ModuleDef, f: impl FnMut(hir::DefWithBody)) {
     match def {
-        ModuleDef::Adt(hir::Adt::Enum(it)) => it.variants(cx.db).into_iter().map(hir::DefWithBody::from).collect(),
-        ModuleDef::Trait(it) => it.items(cx.db).into_iter().filter_map(assoc_body).collect(),
-        _ => def.as_def_with_body().into_iter().collect(),
+        ModuleDef::Adt(hir::Adt::Enum(it)) => it.variants_iter(cx.db).map(hir::DefWithBody::from).for_each(f),
+        ModuleDef::Trait(it) => it.items_iter(cx.db).filter_map(assoc_body).for_each(f),
+        _ => def.as_def_with_body().into_iter().for_each(f),
     }
 }
 
@@ -356,30 +369,30 @@ fn assoc_body(item: hir::AssocItem) -> Option<hir::DefWithBody> {
 }
 
 /// The node of a module item as written: the item, a module's declaration.
-fn source(cx: &Cx<'_, '_>, def: ModuleDef) -> Option<InFile<SyntaxNode>> {
-    fn syntax<N: AstNode>(it: InFile<N>) -> InFile<SyntaxNode> {
-        it.map(|it| it.syntax().clone())
+fn source<'db>(cx: &Cx<'_, 'db>, def: ModuleDef) -> Option<InFile<ast::Node<'db>>> {
+    fn syntax<'db, N: ast::AstNode<'db>>(it: InFile<N>) -> InFile<ast::Node<'db>> {
+        it.map(|it| it.syntax())
     }
     match def {
-        ModuleDef::Module(it) => it.declaration_source(cx.db).map(syntax),
-        ModuleDef::Function(it) => it.source(cx.db).map(syntax),
-        ModuleDef::Adt(it) => it.source(cx.db).map(syntax),
-        ModuleDef::Const(it) => it.source(cx.db).map(syntax),
-        ModuleDef::Static(it) => it.source(cx.db).map(syntax),
-        ModuleDef::Trait(it) => it.source(cx.db).map(syntax),
-        ModuleDef::TypeAlias(it) => it.source(cx.db).map(syntax),
+        ModuleDef::Module(it) => it.declaration_source_view(cx.db).map(syntax),
+        ModuleDef::Function(it) => cx.vsema.source(it).map(syntax),
+        ModuleDef::Adt(it) => cx.vsema.source(it).map(syntax),
+        ModuleDef::Const(it) => cx.vsema.source(it).map(syntax),
+        ModuleDef::Static(it) => cx.vsema.source(it).map(syntax),
+        ModuleDef::Trait(it) => cx.vsema.source(it).map(syntax),
+        ModuleDef::TypeAlias(it) => cx.vsema.source(it).map(syntax),
         ModuleDef::Macro(it) => {
-            it.source(cx.db).map(|it| it.map(|it| it.either(|it| it.syntax().clone(), |it| it.syntax().clone())))
+            cx.vsema.source(it).map(|it| it.map(|it| it.either(|it| it.syntax(), |it| it.syntax())))
         }
         ModuleDef::EnumVariant(_) | ModuleDef::BuiltinType(_) => None,
     }
 }
 
 /// Whether `node` has the attribute `#[name]`, `cfg_attr` expanded.
-fn has_attr(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, name: &str) -> bool {
-    let Some(owner) = ast::AnyHasAttrs::cast(node.value.clone()) else { return false };
+fn has_attr(cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>, name: &str) -> bool {
+    let Some(owner) = ast::AnyHasAttrs::cast(node.value) else { return false };
     let attrs = ast::attrs_including_inner(&owner);
-    hir_expand::attrs::expand_cfg_attr(attrs, || cx.krate.cfg(cx.db), |meta, _| {
+    hir_expand::attrs::expand_cfg_attr_view(attrs, || cx.krate.cfg(cx.db), |meta, _| {
         let named = meta.path().and_then(|it| it.as_single_name_ref()).is_some_and(|it| it.text() == name);
         if named { ControlFlow::Break(()) } else { ControlFlow::Continue(()) }
     })
@@ -398,8 +411,9 @@ impl Places {
         for module in modules(cx) {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             let file = file.file_id(cx.db);
-            let place = match module.declaration_source(cx.db) {
-                Some(declaration) => places.of(cx, &declaration.map(|it| it.syntax().clone())),
+            let place = match module.declaration_source_view(cx.db) {
+                Some(declaration) => places.of(cx, declaration.map(|it| it.syntax())),
+                // alloc: empty, allocates nothing
                 None => Vec::new(),
             };
             places.files.insert(file, place);
@@ -409,10 +423,64 @@ impl Places {
 
     /// Where `node` is: its file's place, then where in the file it is written (for a macro's
     /// output, where the macro is called).
-    fn of(&self, cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>) -> Vec<u32> {
-        let range = node.as_ref().original_file_range_rooted(cx.db).into_file_id(cx.db);
+    fn of(&self, cx: &Cx<'_, '_>, node: InFile<ast::Node<'_>>) -> Vec<u32> {
+        let range = node.original_file_range_rooted_view(cx.db).into_file_id(cx.db);
         let mut place = self.files.get(&range.file_id).cloned().unwrap_or_default();
         place.push(range.range.start().into());
         place
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use syntax::{AstNode as _, AstToken as _, Edition, SourceFile, SyntaxToken, ast as handle};
+
+    use super::*;
+
+    /// The rule on handles: a comment is trivia unless it is a doc comment.
+    fn is_rustc_trivia_handle(token: &SyntaxToken) -> bool {
+        match token.kind() {
+            SyntaxKind::WHITESPACE | SyntaxKind::SHEBANG | SyntaxKind::FRONTMATTER => true,
+            kind if handle::AnyComment::can_cast(kind) => {
+                handle::AnyComment::cast(token.clone()).is_some_and(|it| it.doc_kind().is_none())
+            }
+            _ => false,
+        }
+    }
+
+    /// Walking back from the last token, the view gives the handles' tokens and
+    /// [`is_rustc_trivia`] the handle rule at each, doc comments of every kind included.
+    #[test]
+    fn trivia_on_views_is_the_handle_rule() {
+        let mut docs = 0;
+        for text in [
+            "#!/usr/bin/env rust\n// c\nfn main() {}\n/* b */\n",
+            "//! inner\n/// outer\nfn f() {}\n/** block outer */\nstruct S;\n// trailing\n",
+            "/*! inner block */\nfn g() {}\n/// last\n",
+            "// only a comment\n",
+        ] {
+            let parse = SourceFile::parse(text, Edition::CURRENT);
+            let handles = parse.tree();
+            let mut handle = handles.syntax().last_token();
+            let mut view = parse.root().last_token();
+            loop {
+                match (handle, view) {
+                    (Some(h), Some(v)) => {
+                        assert_eq!((h.kind(), h.text_range()), (v.kind(), v.text_range()));
+                        assert_eq!(is_rustc_trivia_handle(&h), is_rustc_trivia(v), "{:?} in {text:?}", v.kind());
+                        if matches!(v.kind(), SyntaxKind::INNER_DOC_COMMENT | SyntaxKind::OUTER_DOC_COMMENT) {
+                            docs += 1;
+                        }
+                        handle = h.prev_token();
+                        view = v.prev_token();
+                    }
+                    (h, v) => {
+                        assert!(h.is_none() && v.is_none(), "the walks end together in {text:?}");
+                        break;
+                    }
+                }
+            }
+        }
+        assert_eq!(docs, 5, "each doc comment is a token of its own kind");
     }
 }

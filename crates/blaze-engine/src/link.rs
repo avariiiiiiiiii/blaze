@@ -446,6 +446,7 @@ fn leading_bytes(path: &Path) -> anyhow::Result<[u8; 8]> {
 /// the program can reach, as the link leaves out every one it can't. They are the lines of the
 /// section that holds them alone ([`hir_ty_codegen::stand_in_section`]), so what else the
 /// program has in its data (blaze has the words of the message) is never taken for one.
+#[allow(unsafe_code)]
 pub(crate) fn stand_ins(exe: &Path) -> anyhow::Result<Vec<String>> {
     use object::{Object, ObjectSection};
     let file = std::fs::File::open(exe).with_context(|| format!("opening {}", exe.display()))?;

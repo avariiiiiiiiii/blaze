@@ -1899,13 +1899,7 @@ impl hir_expand::proc_macro::ProcMacroExpander for HugeExpander {
     fn expand(
         &self,
         _: &Db,
-        _: &crate::tt::TopSubtree,
-        _: Option<&crate::tt::TopSubtree>,
-        _: &base_db::Env,
-        _: span::Span,
-        call_site: span::Span,
-        _: span::Span,
-        _: String,
+        hir_expand::proc_macro::ProcMacroCall { call_site, .. }: hir_expand::proc_macro::ProcMacroCall<'_>,
     ) -> Result<crate::tt::TopSubtree, hir_expand::proc_macro::ProcMacroExpansionError> {
         let text = format!(
             "macro_rules! ignore {{ ($($t:tt)*) => {{}}; }} ignore! {{ {} }} pub struct Big;",
@@ -1915,6 +1909,7 @@ impl hir_expand::proc_macro::ProcMacroExpander for HugeExpander {
             .unwrap())
     }
 
+    // dyn: `ProcMacroExpander::eq_dyn`'s signature, compared when a crate's macros are set
     fn eq_dyn(&self, other: &dyn hir_expand::proc_macro::ProcMacroExpander) -> bool {
         other.type_id() == std::any::TypeId::of::<Self>()
     }

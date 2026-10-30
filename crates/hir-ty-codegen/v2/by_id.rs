@@ -7,6 +7,7 @@ use blaze_items::{CodeHash, ItemId, ItemKey};
 use hir_def::{DefWithBodyId, FunctionId};
 use hir_ty::next_solver::{Const, Ty};
 use hir_ty_mir::mir::MirSpan;
+use hir_ty_share::code::{self, TABLES};
 
 use super::{Body, Hashes};
 
@@ -36,7 +37,14 @@ impl Hashes for ById {
     }
 
     fn span(&self, _: &Db, owner: DefWithBodyId, span: MirSpan) -> Result<SpanRef, String> {
-        Ok(SpanRef { anchor: by_id("test span", (owner, span)), index: 0 })
+        let (table, index) = code::table_of(span)
+            // alloc: an error
+            .map_err(|at| format!("{span:?} of {owner:?}: inlined span {at}, which is of another body"))?;
+        Ok(SpanRef { anchor: by_id("test span", (owner, table)), index })
+    }
+
+    fn anchors(&self, _: &Db, owner: DefWithBodyId) -> Result<[ContentId; TABLES], String> {
+        Ok(std::array::from_fn(|table| by_id("test span", (owner, table))))
     }
 
     fn declaration(&self, _: &Db, func: FunctionId) -> Result<SpanRef, String> {

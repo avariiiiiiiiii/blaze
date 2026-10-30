@@ -25,8 +25,9 @@ const PACKAGE_SOURCE_LOCK: &str = ".cargo-ok";
 /// The answers of a sparse index that say it has no such file (cargo's `http_remote`).
 const NOT_IN_INDEX: [u16; 3] = [404, 410, 451];
 
-pub struct Fetcher {
-    http: Arc<dyn Http>,
+/// Fetches over `H`: blaze-registry's [`HyperHttp`] in the daemon, a fake in the tests.
+pub struct Fetcher<H: Http> {
+    http: Arc<H>,
     retry: Retry,
     /// The daemon's own directory for git's work: each fetch clones into a directory of its
     /// own under it, removed once the tree is read. Never the user's `$CARGO_HOME`, so no
@@ -34,22 +35,24 @@ pub struct Fetcher {
     scratch: PathBuf,
 }
 
-impl Fetcher {
+impl Fetcher<HyperHttp> {
     /// A fetcher over blaze-registry's HTTP client (`HyperHttp`), with cargo's retries, doing
     /// git's work under `scratch`.
-    pub fn new(scratch: PathBuf) -> Result<Fetcher, String> {
+    pub fn new(scratch: PathBuf) -> Result<Fetcher<HyperHttp>, String> {
         let http = HyperHttp::shared().map_err(|e| redact(&format!("{e:#}")))?;
         Ok(Fetcher::with_http(http, scratch))
     }
+}
 
+impl<H: Http + 'static> Fetcher<H> {
     /// The same over any `Http` (tests use a fake).
-    pub fn with_http(http: Arc<dyn Http>, scratch: PathBuf) -> Fetcher {
+    pub fn with_http(http: Arc<H>, scratch: PathBuf) -> Fetcher<H> {
         Fetcher { http, retry: Retry { quiet: true, ..Retry::default() }, scratch }
     }
 
     /// The same, tried again as `retry` says (cargo's `net.retry`); never said on stderr, which
     /// is the daemon's log.
-    pub fn retrying(self, retry: Retry) -> Fetcher {
+    pub fn retrying(self, retry: Retry) -> Fetcher<H> {
         Fetcher { retry: Retry { quiet: true, ..retry }, ..self }
     }
 

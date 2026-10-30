@@ -222,6 +222,7 @@ fn execute(threads: &mut Vec<Coroutine>, main: coro::Job, stack: usize) -> Optio
     }
 }
 
+// dyn: a panic's payload, as `catch_unwind` gives it.
 fn message(panic: &(dyn Any + Send)) -> &str {
     match panic.downcast_ref::<&'static str>() {
         Some(message) => message,

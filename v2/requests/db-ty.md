@@ -14,6 +14,7 @@ queries are in `hir-ty-mir` and evicted from `hir`. If the names or signatures d
 files are the only callers to change.
 
 > forwarded to db: db-salsa made `evict_values(db) -> usize` and `evict_values_of(db, keys)`, both only on functions with `lru` (`HasCapacity`); no `evict_value` and nothing for functions without `lru`. Lane db decides between widening it and `evict.rs` calling those names.
+> checked by db-audit-dbsub (2026-10-29 23:35): settled the second way, in the tree: salsa generates `evict_values` and `evict_values_of` on every tracked fn whose output is `Hash` (`vendor/salsa-macro-rules/src/setup_tracked_fn.rs:547,558`), and `crates/hir/src/evict.rs:35-66` and `crates/hir-ty/src/evict.rs:24` call those names.
 
 ## 2. Coordinator: `crates/hir-ide/src/tests/incremental.rs`
 
@@ -91,6 +92,7 @@ compile until both are added.
 > taken by db-ty-d-mir: the declaration, codegen's computation and the macro's method, with exact code, are in "db-ty-d-mir", 2, below; the declaration lands when db says go.
 > forwarded to codegen: `crates/hir-ty-mir` has no computation of the types live across a yield (rustc's `mir_coroutine_witnesses`); it is codegen's to write.
 > pending (requests): once both exist, `impl_hir_database!` in `crates/hir-ide/src/impl_db_macro.rs` implements the method from hir-ty-mir's function. The `impl_holders` finding is for items, forwarded there.
+> forwarded by db-audit-dbsub (2026-10-29 23:35) to db-solver (holds `next_solver/`; exact old/new in `/tmp/blaze-lanes/dbsub-to-db-solver.md` 1, told by tmux): the declaration (`hir-ty/src/db.rs:138`), the provider (`hir-ty-mir/src/mir/providers.rs:23`) and the test (`crates/hir/src/tests.rs` `a_future_is_send_only_when_what_it_holds_across_an_await_is`) are in, but `coroutine_hidden_types` (`next_solver/interner.rs` ~2423) still returns no types. Also open, told db-next4: `infer/unify.rs:486` drops the goals stalled on the body's own coroutines (`_ = drain_stalled_obligations_for_coroutines`), where rustc keeps them and checks them after borrowck (`check_coroutine_obligations`).
 
 ## 8. db-salsa (through lane db): hash a value when it is evicted, not when it is stored
 
@@ -106,6 +108,7 @@ Hashing at eviction costs one walk per evicted value, and only for values that a
 `Hash` impls in `crates/hir-ty` (`infer.rs`, `mir.rs`) are the same either way.
 
 > forwarded to db
+> checked by db-audit-dbsub (2026-10-29 23:35): in the tree at `vendor/salsa/src/function/memo.rs:93-108` (the fingerprint is taken when the value is dropped) and `vendor/salsa/src/function.rs:396,465`.
 
 ## 9. Codegen: `lru = 0` on the 11 MIR queries that lack it
 
@@ -143,6 +146,7 @@ Why: "types and the trait solver are u32-indexed tables" (`docs/v2/plan/lanes/db
 those crates: the `Interner` trait's associated types and the search graph's `GlobalCache`.
 
 > forwarded to db: both vendor crates are lane db's own; db-ty is its child.
+> checked by db-audit-dbsub (2026-10-29 23:35): a permission, no edit of its own: lane db applies both children's vendor requests; each is settled under its own section in `v2/requests/db-ty-types.md` and `db-ty-solver.md` (audited by db-audit-dbsub-tysmall).
 
 ## 13. Whoever writes `salsa::capture_reads` (through lane db): two more rules for the shared solver cache
 
@@ -191,6 +195,7 @@ traits (`tls_cache.rs` asserts it). hir-ty does not build against the tree as it
 back to the old signature.
 
 > forwarded to db: it asks through lane db (for solver-sync).
+> checked by db-audit-dbsub (2026-10-29 23:35): in the tree: `vendor/rustc_type_ir/src/interner.rs:273-280` (`with_global_cache(self, scope: CacheScope, ..)`, `cache_scope`) and hir-ty's `next_solver/interner.rs:1264-1282`.
 
 ## 15. Diagnostics (through the coordinator): stop on `#![feature(generic_const_exprs)]`
 
@@ -225,6 +230,7 @@ value for the whole process, and fingerprints are not persisted (salsa recompute
 `InferenceResult` and `MirBody` rely on this. Say so if there is a case I miss.
 
 > forwarded to db
+> checked by db-audit-dbsub (2026-10-29 23:35): holds in the tree, more strongly: a `Symbol` is now a `u32` ID in the symbol table, stable across processes that restore one image, and never freed while the process runs (`crates/intern/src/symbol.rs:1-9`); interned values never move or are freed (`crates/intern/src/lib.rs:2`, `arena.rs:3`). The image's GC keeps each surviving symbol at its own ID. No case missed.
 
 ## speed-types: `VTableMap::tys` replaces probing for the first vtable id (`crates/hir-ty/src/lib.rs`, `consteval.rs`)
 
@@ -320,6 +326,7 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   else uses it.
 
 > forwarded to db (db-ty; window `db-next2`, told by tmux).
+> forwarded by db-audit-dbsub (2026-10-29 23:35) to db-solver (holds `next_solver/`; `/tmp/blaze-lanes/dbsub-to-db-solver.md` 2, told by tmux): both are still there (`generic_arg.rs:750`, `util.rs:307`) and nothing in `crates/` uses either.
 
 ## db-ty-port-infer-errors
 
@@ -382,6 +389,8 @@ from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay un
   `Copy` when `T` is (`PredicateObligation` is 20 bytes of `Copy` fields). Every
   `obligation.clone()` becomes a plain copy (`*obligation` / `obligation`), which also clears
   those hot-lint findings and clippy's `clone_on_copy`.
+
+> checked by db-audit-dbsub (2026-10-29 23:35): in: the two db-ty-port-solver bullets and db-ty-port-ty's (as marked); `blaze-alloc-count` under hir-ty's `[dev-dependencies]` (`crates/hir-ty/Cargo.toml:65`); the `#[global_allocator]` (`crates/hir-ty/src/lib.rs:60`); `hot_lint.py`'s `crates: tuple[str, ...]` (`tools/v2/hot_lint.py:39`); `Obligation` is `Copy` (`next_solver/infer/traits.rs:97`). Forwarded by db-audit-dbsub: the `wf.rs` port to db-solver (`/tmp/blaze-lanes/dbsub-to-db-solver.md` 3, told by tmux; `next_solver/wf.rs` does not exist, `errors.rs` ~384 keeps the FIXME); the `tracing` `release_max_level_*` feature to the coordinator (`v2/requests/db.md`, "## coordinator (requests-next3 ...): `tracing` without its disabled spans in release"). Still blocked, as written: the whole-generalization budget test waits on a hir-ty test database.
 
 ## db-ty-port-solver
 
@@ -460,25 +469,27 @@ type", writes them. hir-ty-mir does not compile until its one `MirBody { .. }` l
   call gives `"definition"`, a call returning `!` gives none.
 
 > forwarded to db for codegen.
+> checked by db-audit-dbsub (2026-10-29 23:35): in the tree: `crates/hir-ty-mir/src/mir/lower.rs:429` (the literal's field), `:5323` (filled), and `mir/lower/uninhabited.rs` (rustc's `LintAndRemoveUninhabited`).
 
-### 2. Codegen (`crates/hir-ty-mir`) and coordinator (`crates/hir-ide/src/impl_db_macro.rs`): `coroutine_witnesses`
+### 2. Codegen (`crates/hir-ty-mir`): `coroutine_witnesses`, the provider
 
 `db-ty` item 7 above and `v2/requests/diagnostics.md`, "coroutine witness types for significant
-drops". Three edits that land together (the macro stops compiling if the trait method comes
-first); db (window `db-next2`) says go, then I add the declaration to `hir-ty/src/db.rs`, beside
-the coroutine MIR queries:
+drops". Done in hir-ty on db's go (window `db-next3`), the way the other MIR queries are:
+`hir-ty/src/providers.rs` has the table field `Mir::coroutine_witnesses: for<'db> fn(&'db Db,
+InternedCoroutineId<'db>) -> Box<[StoredTy]>` and the memo `coroutine_witnesses_query`
+(`returns(deref)`, calling `(mir().coroutine_witnesses)(db, coroutine)`, no cycle result);
+`hir-ty/src/db.rs` has `HirDatabase::coroutine_witnesses(&self, def) -> &[StoredTy]`, its
+`impl for Db`, and the kind `COROUTINE_WITNESSES = 0x24a8`.
+
+**hir-ty-mir does not compile until** its `inventory::submit!(Mir { .. })`
+(`crates/hir-ty-mir/src/mir/providers.rs`) has the field. After `opaque_of_impl: ..,`:
 
 ```rust
-    /// The types an `async` block holds across a yield, by which its future implements an
-    /// auto trait: rustc's `mir_coroutine_witnesses` (`CoroutineLayout::field_tys` without
-    /// what `ignore_for_traits` marks). Generic in the parameters of the coroutine's parent,
-    /// with regions erased.
-    fn coroutine_witnesses<'db>(&'db self, def: InternedCoroutineId<'db>) -> &'db [StoredTy];
+        coroutine_witnesses: transform::compute_coroutine_witnesses,
 ```
 
 **a. Codegen, `crates/hir-ty-mir/src/mir/transform.rs`**, after
-`runtime_mir_body_for_coroutine_by_move_query` (and `coroutine_witnesses_query` added to the
-`pub use transform::{..}` list in `crates/hir-ty-mir/src/mir.rs`). The locals are the ones the
+`compute_runtime_mir_body_for_coroutine_by_move`: the function the field names. The locals are the
 runtime body keeps in the future (`MirBody::locals_held_across_yields`, which already drops the
 receiver, the captures used in place and the promoted constants), so a future's auto traits and
 its layout (`hir-ty/src/layout.rs:579`) see the same fields. Of the by-move body nothing is
@@ -491,8 +502,7 @@ asked: rustc's witnesses are of the coroutine's own body.
 /// static that is not `#[thread_local]` (another access makes it again) and a fake borrow (only
 /// fake reads read it). Empty for a body MIR lowering refuses, as rustc's for a body with
 /// errors: that body is reported (`BorrowckSkipped`) and nothing is built from it.
-#[salsa::tracked(returns(deref))]
-pub fn coroutine_witnesses_query<'db>(
+pub(crate) fn compute_coroutine_witnesses<'db>(
     db: &'db Db,
     coroutine: InternedCoroutineId<'db>,
 ) -> Box<[StoredTy]> {
@@ -527,32 +537,14 @@ pub fn coroutine_witnesses_query<'db>(
 }
 ```
 
-over the concrete database (common.md, "The database is concrete"; `db.runtime_mir_body_for_coroutine`
-resolves statically to `impl HirDatabase for Db`), with `use base_db::Db;`,
-`use hir_def::attrs::AttrFlags;`, `use smallvec::SmallVec;` and, from `super`,
-`BorrowKind, LocalId, Operand, OperandKind, Rvalue, StatementKind` (all `hir_ty::mir::*`), and
-`StoredTy` from `crate::next_solver` (or `hir_ty::next_solver`). No `lru`: the result is a few
-types per coroutine, read by every auto-trait goal of its future, and not dropped by
-`hir/src/evict.rs`. hir-ty's kind test does not see it (hir-ty-mir's query).
+`transform.rs` already has `base_db::Db` and `hir_def::HasModule`; it adds
+`use hir_def::attrs::AttrFlags;`, `use smallvec::SmallVec;`, `StoredTy` in its
+`next_solver::{..}` import, and from `super` `BorrowKind, LocalId, Operand, OperandKind, Rvalue,
+StatementKind` (all `hir_ty::mir::*`). The memo is hir-ty's, so the query has no `lru` (a few
+types per coroutine, read by every auto-trait goal of its future, not dropped by
+`hir/src/evict.rs`).
 
-When frontend-db's providers land (`docs/v2/plan/lanes/frontend/db.md`, "Providers, for the
-queries hir-ty reads but can't compute"), this query moves with its MIR siblings: declared in
-hir-ty as a tracked function over `&Db` whose body calls `hir_ty::providers()`, its code the
-`fn` above registered by `hir_ty_mir::provide()`, and b's method goes. Until then it is a
-trait method like the other MIR queries.
-
-**b. Coordinator, `crates/hir-ide/src/impl_db_macro.rs`**: `StoredTy` joins the
-`next_solver::{..}` import at the top of the macro (`next_solver::{Allocation, GenericArgs,
-StoredGenericArgs, StoredTy, Ty}`), and after `runtime_mir_body_for_coroutine_by_move`:
-
-```rust
-                fn coroutine_witnesses<'db>(
-                    &'db self,
-                    def: InternedCoroutineId<'db>,
-                ) -> &'db [StoredTy] {
-                    mir::coroutine_witnesses_query(self, def)
-                }
-```
+The `impl_hir_database!` method once asked of the coordinator is not needed: the macro is gone.
 
 **c. Then solver-sync** (`next_solver/interner.rs`, `coroutine_hidden_types`, in its inbox):
 read `db.coroutine_witnesses(def_id.0)`, each type with its erased regions replaced by fresh
@@ -566,7 +558,9 @@ Test (written, `crates/hir/src/tests.rs`,
 `a_future_is_send_only_when_what_it_holds_across_an_await_is`): an `async` block holding a
 `NotSend(*const u8)` across `.await` is not `Send`; one that moves it out before is.
 
-> waiting for db's go (asked by tmux, window `db-next2`).
+> applied by db-ty-d-mir (hir-ty half, on db's go): the table field, `coroutine_witnesses_query` in `hir-ty/src/providers.rs`, the `HirDatabase` method and its `impl for Db`, and kind `0x24a8` in `hir-ty/src/db.rs`. Codegen told for a (the `submit!` field and `compute_coroutine_witnesses`), solver-sync for c, both by tmux.
+
+> applied by codegen-mir-store (2026-10-29), uncompiled: a. The `coroutine_witnesses: transform::compute_coroutine_witnesses,` field in `hir-ty-mir/src/mir/providers.rs`, and the function in `transform.rs` as written, except that it runs in one `frame::task`: it calls `held_locals_in(frame)`, and `ignored` is a frame `Bits` over the locals instead of a `SmallVec` scanned per local. The imports are as listed.
 
 ## db-ty-port-infer
 
@@ -610,6 +604,9 @@ Sites (2026-10-29):
 > names. Still open, in other owners' files: items' `method_resolution.rs` 530 and 656,
 > `method_resolution/probe.rs` 398 and 1951, and `opaques.rs` 221; solver-sync's
 > `next_solver/util.rs` 650; codegen's `hir-ty-mir/src/mir/monomorphization.rs`.
+> applied by db-solver (22:33): `next_solver/util.rs` 651 calls `shallow_resolve_region_var`; no
+> other old name in the table is used under `next_solver/` (the `probe_value` hits are on
+> unification tables, not `RegionConstraintCollector`).
 
 ## frontend-nameres-impls: kinds for the per-module impl tables (2026-10-29)
 
@@ -649,6 +646,10 @@ unused and claims none of the numbers kept for speed-types-probe's children (`0x
 Status: open
 
 > forwarded to db (db-ty; told by tmux). requests applies the items half once this and db's re-export land.
+> applied (checked by db-ty-next2, 21:25): `db.rs` `kinds!` has all nine under "Per-module impl
+> tables". They are at `0x24b0..=0x24b8`, not `0x2490..=0x2498`, because the MIR queries took
+> `0x2490..=0x24a8`. No number is reused. The nine tracked fns are in `method_resolution.rs`
+> (items' half), so `every_query_has_a_kind` sees both sides.
 > applied by db-ty (db-ty-next3, 21:25) at **`0x24b0..0x24b8`**, same order and names:
 > `0x2490..0x24a7` is MIR's (`MIR_BODY` .. `MONOMORPHIZED_OPTIMIZED_MIR_BODY_FOR_COROUTINE_BY_MOVE`).
 > Until the items half lands, `every_query_has_a_kind` fails on these nine.
@@ -656,6 +657,24 @@ Status: open
 ## db-ty-d-infer2
 
 > forwarded to diagnostics (blaze-diagnostics and ide-diagnostics; told by tmux).
+
+> diagnostics-lints (2026-10-29): the lane parent is alive as window `diagnostics-next2`; items 1-5, 7 and 8 (`lower/**`, `lower/mod.rs`) forwarded there, item 6 (`lints/bodies/types/util.rs`) to `diagnostics-speed-bodies`, its owner (told by tmux).
+>
+> diagnostics (window 67, 2026-10-29): accepted, given to three children, each marking its
+> items when they are in:
+> - `diagnostics-infer2-solver`: items 1 and 9;
+> - `diagnostics-infer2-casts`: items 4, 2, 5 and 6 (6 only if `diagnostics-speed-bodies`
+>   didn't apply it before it finished);
+> - `diagnostics-infer2-methods`: items 8, 7 and 3.
+>
+> The arms that unbreak the build (items 1, 4 and 8) come first in each.
+>
+> Not diagnostics' paths: the `..` in `crates/hir-ide/src/tests.rs`'s two
+> `InferenceDiagnostic::TypeMismatch { node, expected, found }` patterns (lines 281 and 416,
+> items 2 and 9), and item 2's `{integer}`/`{float}` print in `hir-ide/src/display.rs`. Both are
+> for the coordinator, which owns `crates/hir-ide`; they are on its list.
+
+> diagnostics-lints (21:58): item 9 forwarded to the parent too. The `crates/hir-ide/src/tests.rs` part is outside blaze-diagnostics, for hir-ide's owner.
 
 ### 1. Diagnostics (blaze-diagnostics) and ide-diagnostics: ambiguity errors and the other trait solver errors (task 22 part 3)
 
@@ -730,6 +749,8 @@ literal's type as `InferTy::FreshIntTy(0)` / `FreshFloatTy(0)`. hir's `TypeMisma
   `match_arms_of_incompatible_types_skip_the_diverging_one` can be un-ignored.
   `InvalidRangePatType` gets its types with task 37.
 
+> applied by diagnostics-infer2-casts (2026-10-29): `lower/type_mismatch.rs` labels the mismatch with `d.at_error` (new `print::sorts_at_error`: a wholly `{integer}`/`{float}` side is "integer"/"floating-point number", one holding it is the type in backticks), and the match arms' "this is found to be of type" and the expected/found note print it too; `match_arms_of_incompatible_types_skip_the_diverging_one` un-ignored. Gap: hir-ide's `{integer}`/`{float}` print is not in `display.rs`; requested in `v2/requests/diagnostics.md` ("diagnostics-infer2-casts: hir-ide prints `{integer}` and `{float}`"), and the test fails until it is. The `hir-ide/src/tests.rs` `..` is hir-ide's owner's.
+
 ### 3. Diagnostics (blaze-diagnostics): E0525 from the closure and its kind origin (task 22 parts 5 and 6)
 
 hir now gives `ClosureKindMismatch.closure: Option<InFile<AstPtr<ast::ClosureExpr>>>` (the
@@ -745,6 +766,8 @@ the capture it belongs to, for `move` closures too.
   `capture.display_place_source_code(cx.db, cx.edition)`) instead of the first moving or
   mutating capture of a non-`move` closure; drop `closure_of`, `origin` and the module doc's
   "The front end gives neither ..." paragraph.
+
+> applied by diagnostics-infer2-methods (2026-10-29): `lower/closure_kind_mismatch.rs` takes the closure from `d.closure` and the origin label from `Closure::kind_origin` (on the node, place `display_place_source_code`; only for a found `FnOnce`/`FnMut` kind, as rustc); `closure_of`, `origin` and the doc paragraph are gone, and with them `unimplemented_trait.rs`'s unread `Cause::node` (and `Cause`'s lifetime). Test: rustc's `closures/2229_closure_analysis/diagnostics/closure-origin-tuple-diagnostics.rs` in `tests/bodies/types.rs`. Gap: rustc prints the origin's own place, hir gives the capture's (truncated) place: requested in `v2/requests/diagnostics.md` `## diagnostics-infer2-methods`, part 3. `diagnostics-infer2-solver` has the file for item 9.
 
 ### 4. Diagnostics (blaze-diagnostics) and ide-diagnostics: E0641 and the other cast errors rustc gives (task 23)
 
@@ -772,6 +795,8 @@ arms for the new variants:
 - `crates/ide-diagnostics/src/handlers/invalid_cast.rs`: the arms (the E0641 one is there,
   commented out), and the commented-out test `order_dependent_cast_inference` can come back
   (rustc's `tests/ui/cast/order-dependent-cast-inference.rs`).
+
+> applied by diagnostics-infer2-casts (2026-10-29): `lower/invalid_cast.rs` gives E0641 (both directions), `CastEnumDrop` (rustc's wording: "cannot cast enum `E` into integer `u32` because it implements `Drop`", no code) and E0606 of `ForeignNonExhaustiveAdt` with its note; `DifferingKinds`' notes, `IntToWideCast`'s metadata and parameter note and E0804's traits read `expr_pointer`/`cast_pointer`/`added_auto_traits` (the type-walking helpers are gone). ide-diagnostics: the four arms, `order_dependent_cast_inference` back, plus `enum_drop_cast_error`. Tests in `tests/bodies/calls.rs`: rustc's `inference/order-dependent-cast-inference`, `enum/enum-drop-cast-error`, `rfc-2008-non-exhaustive/enum-as-cast`.
 
 ### 5. Diagnostics (blaze-diagnostics): pattern checking as rustc gives it (task 37), and `sym::Vec`
 
@@ -801,6 +826,8 @@ Wanted:
 
 > forwarded to diagnostics (blaze-diagnostics and ide-diagnostics; told by tmux).
 
+> applied by diagnostics-infer2-casts (2026-10-29): `lower/mismatched_tuple_struct_pat_arg_count.rs` takes `d.variant` (no path resolution) and suggests parentheses only when `!d.had_err`; `lower/invalid_range_pat_type.rs` takes each end's type and failure from `d.lhs`/`d.rhs` (blaze's printer prints `FreshIntTy`/`FreshFloatTy` as `{integer}`/`{float}`, so this needs no hir-ide change); `a_range_with_one_bad_end_names_the_type_of_the_other` un-ignored; `lower/expected_array_or_slice_pat.rs` uses `Crate::lang_origin`. Gap: `sym::Vec` requested of intern's owner in `v2/requests/diagnostics.md`; until then the `"Vec"` string compare stays.
+
 ### 6. Diagnostics (blaze-diagnostics): the value a path resolved to, from inference (task 17)
 
 `InferenceResult::value_resolution(ExprOrPatId) -> Option<ValueNs>` is what inference resolved
@@ -813,6 +840,8 @@ Wanted: `crates/blaze-diagnostics/src/lints/bodies/types/util.rs` `path_value`, 
 `b.infer.value_resolution(expr.into())` in place of the `ExprScopes`/`FnDef`/
 `resolver_for_scope` steps (drop their imports). A path that does not resolve gives `None`, as
 now.
+
+> applied by diagnostics-infer2-casts (2026-10-29; `diagnostics-speed-bodies` had not): `path_value` is `assoc_resolutions_for_expr`, then `b.infer.value_resolution(expr.into())`; the `ExprScopes`/`FnDef`/`resolver_for_scope` steps and their imports are gone, and so is `BodyCx`'s per-body memo of it (`BodyCx::path_value`, `Scratch::values`), which only paid for the scope walk.
 
 ### 7. Diagnostics (blaze-diagnostics): `MethodCallIllegalSizedBound` carries the pick (task 29)
 
@@ -838,6 +867,8 @@ Wanted, in `crates/blaze-diagnostics/src/lower/method_call_illegal_sized_bound.r
   `mut ` suggestion before the parameter's type when the receiver is a `&`-typed parameter,
   else a help.
 
+> applied by diagnostics-infer2-methods (2026-10-29): `lower/method_call_illegal_sized_bound.rs` as rustc's `IllegalSizedBound` arm: "cannot be invoked on `{rcvr_ty}`" when `needs_mut`, the `Sized` label only when not, on a direct `Sized` bound on `Self` (keyword, resolved to the lang item) in `d.bound`'s where clause or a trait's supertraits; `suggest_use_candidates`' help and `use` suggestions of `d.candidates` (accessible and not); "you need `&mut T` instead of `&T`" as `mut ` before a `&`-typed parameter's type (or `&self`'s `self`) else a help. ide handler: rustc's message, `Ra("method-call-illegal-sized-bound")` (rustc gives no code; it was E0277). Tests: rustc's `illegal-sized-bound/mutability-mismatch.rs` and `suggestions/trait-object-import-suggestion-on-method.rs` (unimported) in `tests/bodies/calls.rs`. Gaps: rustc's glob-import candidates of `_` re-exports and "due to this macro variable"; `imm-ref-trait-object.rs` and `mutability-mismatch-arg.rs` wait on minicore's `Iterator::min` (requested, part 4).
+
 ### 8. Diagnostics (blaze-diagnostics) and ide-diagnostics: unstable name collisions and the prelude-collision lints (task 36)
 
 hir now gives (`compiler/rustc_hir_typeck/src/method/probe.rs` and
@@ -857,13 +888,15 @@ Wanted, so the workspace builds again:
 
 - `crates/blaze-diagnostics/src/lower/mod.rs` and `crates/ide-diagnostics/src/lib.rs`: arms for
   the two new `AnyDiagnostic` variants.
-- blaze-diagnostics: rustc's `unstable_name_collisions` from `unstable_candidates`
-  (`Pick::maybe_emit_unstable_name_collision_hint`: "a method with this name may be added to the
-  standard library in the future" / "an associated item ...", the "call it with fully qualified
-  syntax" help naming the pick's trait, and one "add `#![feature({feature})]`" help per
-  candidate; only when the pick is a trait's, as rustc's `if let Some(..) = pick.item.trait_container`);
-  for every method call (an `ast::MethodCallExpr`), a field access with no field, and a
-  type-relative path.
+- blaze-diagnostics: rustc's `unstable_name_collisions` wherever `unstable_candidates` is not
+  empty (`Pick::maybe_emit_unstable_name_collision_hint`): "{a} {method|associated constant}
+  with this name may be added to the standard library in the future" on the method name or path,
+  the picked item (the call's `resolve_method_call`, the path's resolution) giving "call with
+  fully qualified syntax `{path}(...)` to keep using the current method" for a function, or for
+  a trait's const the suggestion `<{self_ty} as {Trait}>::{name}`, and the
+  `disabled_nightly_features` help per candidate (`` `{candidate path}` `` and its feature).
+  For a method call, a field access with no field (rustc's `method_exists_for_diagnostic`), and
+  a type-relative path.
 - blaze-diagnostics: the two prelude lints' messages and suggestions
   (`AmbiguousTraitMethodCall`, `AmbiguousTraitMethod`, `AmbiguousTraitAssocFunc` there): "trait
   method `{name}` will become ambiguous in Rust {edition}" with "disambiguate the method call"
@@ -876,6 +909,69 @@ Wanted, so the workspace builds again:
 - `crates/intern/src/symbol/symbols.rs` (not db-ty's): `from_iter` and `FromIterator`, so
   `hir-ty/src/infer/prelude_lints.rs` compares symbols instead of `name.as_str() ==
   "from_iter"` and `Symbol::intern("FromIterator")`.
+
+> applied by diagnostics-infer2-methods (2026-10-29): `lower/edition_dependent_method_call.rs` and `lower/fully_qualified_call_from_2018.rs` (arms in `lower/mod.rs`) emit the four lints through the registry at rustc's levels with `AmbiguousTraitMethodCall`/`AmbiguousTraitMethod`/`AmbiguousTraitAssocFunc`'s messages and suggestions, the trait named by rustc's `trait_path_or_bare_name` (`ItemScope::trait_binding`, blocks outward, `_` imports by their use path); ide-diagnostics handlers and arms for both. `lints/bodies/unstable_names.rs` emits `unstable_name_collisions` per body from `InferenceResult::unstable_candidates` of method calls and type-relative path expressions and patterns, with the fully-qualified help or the `<T as Trait>::C` suggestion and `disabled_nightly_features`' `#![feature(..)]` suggestion per candidate. Tests: `tests/lints/bodies/calls/desugar.rs`'s `array_into_iter_ambiguous` un-ignored; rustc's `inference/inference_unstable.rs` with its two auxiliary crates in `tests/lints/bodies/unstable_names.rs`. The `from_iter`/`FromIterator` symbols were already in. Gaps: the field access with no field (hir-ty records no candidates there) and a per-hit iterator, requested in `v2/requests/diagnostics.md` `## diagnostics-infer2-methods`, parts 1 and 2; an anonymous const's body is not scanned; a `_` import past a local re-export is not followed.
+
+### 9. Diagnostics (blaze-diagnostics), ide-diagnostics and hir-ide: why a type or bound was required, and the parameter an undecided variable is for (task 22 parts 1 and 4)
+
+hir now gives (rustc's `ObligationCauseCode` and `TypeVariableOrigin` at 16d1ffac):
+
+- `hir::ObligationCauseCode`:
+  - variants: `Misc`, `WhereClauseInExpr { item: GenericDef, bound_index, arg_index }`,
+    `SizedArgumentType`, `BlockTailExpression`, `ReturnValue`, `IfExpression`,
+    `MatchExpressionArm { prior_arms }` and `LetType`;
+  - carried as `cause` on `TypeMismatch`, `UnimplementedTrait`, `ClosureKindMismatch` and
+    `TraitSolverError`.
+- Where inference sets each code:
+  - a callee's bounds: `WhereClauseInExpr`, with `bound_index` the bound's place in the item's
+    predicates, its parents' first, as `GenericPredicates` lists them; `arg_index` is always
+    `None` so far;
+  - an `if`'s `else`: `IfExpression`;
+  - a `match` arm with no prior arm of a type other than `!`: `BlockTailExpression`;
+  - later arms: `MatchExpressionArm { prior_arms }`, where `prior_arms` counts the earlier arms
+    whose type is not `!` (rustc keeps the last five of their spans);
+  - a block's tail: `BlockTailExpression`;
+  - a `return` value: `ReturnValue`;
+  - anything else: `Misc`.
+- A goal derived from another keeps the cause of the root goal.
+- `UnimplementedTrait::parent_impls: Vec<Option<Impl>>`, one per `parent_trait_predicates`
+  entry: the impl whose where clause required the predicate nearer the error (rustc's
+  `ImplDerived`).
+- `TypeMustBeKnown::origin: Option<(SpanSyntax, GenericParam)>`:
+  - the first undecided variable in the term, with the type or const parameter it was made for
+    and where;
+  - `None` for a trait's `Self`, for a variable made for no parameter, and for a type
+    parameter whose span is inside a macro expansion (as rustc's
+    `extract_inference_diagnostics_data`).
+
+Wanted:
+
+- `crates/hir-ide/src/tests.rs` (both `InferenceDiagnostic::TypeMismatch { node, expected, found }`
+  patterns, about lines 281 and 416): add `..`. They have not built since HEAD added `at_error`;
+  `cause` is another field.
+- blaze-diagnostics, from the cause (rustc's `note_obligation_cause_code` and
+  `note_type_err`):
+  - `WhereClauseInExpr`: the note "required by a bound in `{item}`", with the label "required by
+    this bound in `{item}`" on the bound. The bound's span comes from `bound_index` through the
+    item's predicates in source order. If no source map gives that, ask db-ty for one.
+  - `IfExpression`: "`if` and `else` have incompatible types", with "expected because of this" on
+    the `then` tail.
+  - `MatchExpressionArm`: "`match` arms have incompatible types", with "this is found to be of
+    type `{ty}`" on up to five prior arms whose type is not `!`.
+  - `ReturnValue`: "expected `{ty}` because of return type" on the return type.
+  - `BlockTailExpression`: the semicolon suggestions.
+  - `parent_impls`: for each `Some`, the note "required for `{self}` to implement `{trait}`",
+    with "unsatisfied trait bound introduced here" on the impl's where clause.
+- blaze-diagnostics, from `origin`:
+  - E0282/E0283 say ", where the type for type parameter `{name}` is specified" (or "the value
+    of const parameter" for a const);
+  - the turbofish suggestion `::<{params}>` on the path that made the variable
+    (`need_type_info.rs`, `InferSourceKind::GenericArg`).
+- Not yet set:
+  - `SizedArgumentType` and `LetType`: blaze's inference does not require parameters or
+    locals to be `Sized` (rustc's `check_fn` and `GatherLocalsVisitor`). That gap is db-ty's.
+  - rustc's `IfExpressionWithNoElse` and `ReturnNoExpression`: asked of db-ty-port-infer in
+    `solver-sync-inbox.md` (from db-ty-d-infer2, item 3). Until then, both are `Misc`.
 
 ## db-ty-d-hir
 
@@ -1027,10 +1123,12 @@ hir and hir-ty use what they add.
    after `target*/`, or anchor the pattern (`/target*/`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> forwarded by db-audit-dbsub (2026-10-29 23:35): none of 1-6 is in, and each had reached only lane db, though hir's side is in (so 1, 2 and 4 break the build). Filed in `v2/requests/db.md`: 1 (format, `source_map.rs`) and 2 (items, `confirm.rs`) with exact old/new under "## format and items (requests-next3; both are done): db-ty-d-lower's items 1 and 2"; 3-5 under "## diagnostics (diagnostics-next2): db-ty-d-lower's items 3, 4 and 5"; 6's `.gitignore` under "## coordinator ...: `.gitignore` hides `crates/hir-ty/src/target_feature/`" (`git check-ignore` confirms; `tests.rs` is still untracked). 6's test lines in `target_feature/tests.rs` are kept. Told requests-next3 and diagnostics-next2 by tmux.
 
 ## db-ty-d-borrowck
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-dbsub (2026-10-29 23:35): its one item (below) is in.
 
 ### 1. Diagnostics (blaze-diagnostics): lower the parts of a borrow check error
 
@@ -1063,8 +1161,13 @@ and notes ... are not given yet") becomes untrue with this. `unused_mut` keeps i
 the borrow checker gives it no parts.
 
 > forwarded to db (from requests, pass 17; told by tmux).
+> checked by db-audit-dbsub (2026-10-29 23:35): in the tree at `crates/blaze-diagnostics/src/lower/borrowck_error.rs:55-73` (labels, children, suggestions), applied by diagnostics.
 
 ## dedyn: crates/hir-ty/src/lower.rs: the lowering's inference variables are an enum, not `&mut dyn TyLoweringInferVarsCtx`
+
+> APPLIED by dedyn-ty 2026-10-29 21:40 (all six files; tests in `crates/hir-ty/src/tests/infer_vars.rs`)
+> Being applied in the tree by dedyn-ty (dedyn, 2026-10-29 21:22, new edit rule): don't apply it again.
+
 
 `TyLoweringInferVarsCtx` has three implementations and no others can appear: type inference
 (`infer/diagnostics.rs` `InferenceTyLoweringVarsCtx`), the borrow checker
@@ -1080,6 +1183,23 @@ private field; outside hir-ty each variant has its own `pub` builder taking publ
 > db-ty-d-borrowck (2026-10-29 20:59): `regions.rs` part not applied yet: `with_infer_ctxt_vars`
 > is not in `hir-ty/src/lower.rs` (db-ty-next2's part), and the section says to apply them
 > together. Applied as soon as db-ty-next2's `lower.rs` part lands.
+> outcome (db-ty-next3, 21:58): handed to `db-mem-infer-b-lower` (lane db), which holds
+> `lower.rs` for `mem-db-infer-lower.md` 1 to 14, to land with its 2 (the context takes
+> `frame: &'a Frame`) and `mem-db-infer-ctx.md` B3/B4 (`type_of_type_placeholder` becomes a
+> `DenseMap<'f, ..>`). One change to the section so the two fit: under `&'a mut` a
+> `DenseMap<'f, ..>` is invariant in `'f`, which would put `'f` on `TyLoweringContext`. So
+> `InferVars::Inference` holds only `table: &'a mut InferenceTable<'db>`; its `next_ty_var`
+> pushes `(type_ref, ty)` for a `Span::TypeRefId` onto a new
+> `pub(crate) type_placeholders: Vec<(TypeRefId, Ty<'db>), &'a Frame>` of `TyLoweringContext`
+> (empty, so unallocated, in nearly every lowering); `InferenceTyLoweringContext` keeps
+> `type_of_type_placeholder: &'a mut DenseMap<'f, TypeRefId, StoredTy>` from its vars context
+> and its `Drop` drains `ctx.type_placeholders` into it (`insert(type_ref, ty.store())`), beside
+> the diagnostics and anon consts it already moves. Every inference lowering goes through
+> `InferenceTyLoweringContext` (`infer.rs` `with_ty_lowering`/`resolve_variant`,
+> `infer/path.rs`), so each placeholder still lands before write-back reads it.
+> `consteval.rs`' part and `lib.rs`' line go with it. db-ty-d-borrowck's `regions.rs` and
+> `source_analyzer.rs` follow once `with_infer_ctxt_vars`/`with_answered_infer_vars` exist.
+> applied by db-mem-infer-a-small (21:47): the `infer/diagnostics.rs` half of this outcome, with mem-db-infer-ctx B3/B4 (`type_of_type_placeholder` kept by `InferenceTyLoweringContext`, its `Drop` drains `ctx.type_placeholders`; `new` calls `.with_inference_vars(&mut **table)`). The `lower.rs` half is db-mem-infer-b-lower's (told).
 
 ### lower.rs
 
@@ -1245,6 +1365,10 @@ In `pub use lower::{ .. }` drop `TyLoweringInferVarsCtx,`.
   before `        .with_infer_vars_behavior(vars.then_some(&mut infer_vars as _));`
   after  `        .with_infer_ctxt_vars(vars.then_some(&self.ctx.infcx));`
 
+> checked by db-mem-borrowck (2026-10-29 21:45): applied in the tree (by dedyn-ty, with the
+> `lower.rs` part): `InferVars` and its impl are gone, and both sites call `with_infer_ctxt_vars`
+> as written. `TyLoweringInferVarsCtx` is no longer in hir-ty.
+
 ### hir/src/source_analyzer.rs (the `type_of_type` lowering)
 
 - Delete `let interner = DbInterner::new_no_crate(db);` and
@@ -1256,3 +1380,1631 @@ In `pub use lower::{ .. }` drop `TyLoweringInferVarsCtx,`.
 - Imports: drop `TyLoweringInferVarsCtx` from `use hir_ide::{ .. }`, and `DefaultAny` and
   `Region` from its `next_solver::{ .. }` (their only uses were in `VarsCtx`; `DbInterner`
   stays if `rg -w DbInterner` still finds a use).
+
+## db-ty-next2: two pre-interned symbols (`crates/intern/src/symbol/symbols.rs`)
+
+What: add `from_iter` and `FromIterator` to the pre-interned list, in its alphabetical places
+(beside `into_iter` and `IntoIterator`, near line 382).
+
+Why: `mem-db-infer-ctx.md` G6 item 3. `infer/prelude_lints.rs` compares
+`name.as_str() == "from_iter"` and calls `Symbol::intern("FromIterator")`, a global interner
+lookup, on every `try_from`/`try_into`/`from_iter` type-relative path in a pre-2021 crate. With
+the two symbols in, db-ty changes the two lines to `*name.symbol() == sym::from_iter` and
+`&sym::FromIterator`, and the import to `use intern::sym;`. The same interned symbols are
+compared, so neither lint's condition changes. Until the symbols land, that edit would not
+compile, so it waits.
+Status: applied
+
+> applied by db-ty (db-ty-next2, 21:31): `prelude_lints.rs` compares `*name.symbol() == sym::from_iter`
+> and looks up `&sym::FromIterator`; the import is `use intern::sym;`.
+
+> applied: `from_iter` and `FromIterator` are in `crates/intern/src/symbol/symbols.rs` after `from_str` (the `from_*` run); db-ty-next2 told it may change `prelude_lints.rs` (requests, pass 23).
+
+## db-ty-next3
+
+Requests from db-ty-next3 (2026-10-29 21:30 to 22:10), for changes it made in db-ty's paths.
+
+> applied in part, forwarded the rest (requests, pass 24); see each part.
+
+### 1. hir-ide (`crates/hir-ide/src/mir_pretty/errors.rs`) and codegen (`crates/hir-ty-mir/src/mir/eval/unwind.rs`): `MirEvalError::Aborted`
+
+codegen-mir's request 10 is in `crates/hir-ty/src/mir.rs`: `MirEvalError::Aborted(String)`, after
+`Panic`, whose `Debug` prints `the program aborted: {0}`.
+- `mir_pretty/errors.rs` (~L201), the arm that prints `{err:?}`: add `| MirEvalError::Aborted(_)`
+  (with `| MirEvalError::MachineStop`, still missing there from lane safety's request).
+- `unwind.rs` `abort`: `MirEvalError::Aborted(reason.to_owned())` in place of
+  `MirEvalError::NotSupported(format!("the program aborted: {reason}"))` (keep the `// alloc:`).
+- Note for `hir-ty-ub` (`src/check.rs` ~L718): an abort now reaches the `other =>` arm, an
+  `Outcome::Error` with that text, where it was `Outcome::Unsupported`. rustc's test harness
+  reports an aborting test as failed, so `MirEvalError::Aborted(message) => Outcome::Failed {
+  message: message.clone(), seed }` is the closer arm; ub's call.
+
+> applied (requests' paths): `hir-ide/src/mir_pretty/errors.rs` prints `MirEvalError::Aborted(_)` and `MachineStop` with `{err:?}`; `hir-ty-ub/src/check.rs` (safety is DONE) maps `Aborted(message)` to `Outcome::Failed`, as rustc's harness fails an aborting test. `hir-ty-mir/src/mir/eval/unwind.rs` `abort` forwarded to codegen (codegen-mir-next2, told by tmux) (requests, pass 24).
+
+> applied by codegen-mir (2026-10-29): `unwind.rs` `abort` returns `MirEvalError::Aborted(reason.to_owned())` (it was already in the tree).
+
+> applied by codegen-mir (2026-10-29): `unwind.rs` `abort` returns `MirEvalError::Aborted(reason.to_owned())`, `// alloc:` kept.
+
+### 2. codegen and others: what codegen-inline's types change outside db-ty's paths
+
+codegen-inline's request 1 is in `mir.rs` (`InlinedBody`, `InlinedCallee`, `InlinedScope`,
+`InlinedSpan`, `InlinedBinding`, `InlinedPromoted`, `Inlined`, `MirBody::inlined`,
+`MirSpan::Inlined(u32)`, `MirOptions::inline`). It needs, or the tree does not build:
+- `crates/hir-ty-mir/src/mir/lower.rs` ~L434, the one `MirBody { .. }` literal: add
+  `inlined: Default::default(),` after `unreachable_after_calls`.
+- `MirOptions` literals without `inline` (add `inline: false` unless the test means inlining):
+  `hir-ty-mir/tests/mir/ub_checks.rs` 37 and 41, `hir-ty-mir/tests/mir/storage.rs` 12,
+  `hir-ty-share/src/lib.rs` 139, `hir-ty-share/src/tests/mod.rs` 33, 270 and 275.
+
+> checked by codegen-mir-store (2026-10-29): the hir-ty-mir part is in the tree (someone applied it at the same time): `inlined: Default::default(),` in `lower.rs`'s `MirBody` literal, and `inline: false` in `tests/mir/ub_checks.rs` (`checked`, `unchecked`) and `tests/mir/storage.rs`. `hir-ty-share` is not mine.
+  `hir-ty-codegen/mod.rs` `mir_options_of` (~L3518): check it sets `inline` (its doc says so).
+- Exhaustive `match`es on `MirSpan` that need an `Inlined` arm: `blaze-items/src/form.rs` ~347
+  (a new tag, e.g. `MirSpan::Inlined(it) => (6, it)`), `hir-ty-ub/src/check.rs` ~103 (the same),
+  `hir-ty-ub/src/check/report.rs` ~160 and `hir-ide/src/mir_pretty/errors.rs` ~254
+  (`MirSpan::Inlined(_) => return None`: the interpreter runs no optimized body),
+  `blaze-diagnostics/src/lints/bodies.rs` ~416 (`MirSpan::Inlined(_) => None`: lints read
+  built MIR). `hir-ty-share/src/code.rs` and `hir-ty-codegen/fragment.rs` handle it already.
+
+> applied (requests' paths): `MirSpan::Inlined` arms in `blaze-items/src/form.rs` (tag 6), `hir-ty-ub/src/check.rs` (kind 6; the per-body span columns go from 6 to 7), `hir-ty-ub/src/check/report.rs` and `hir-ide/src/mir_pretty/errors.rs` (`return None`). This also settles the held codegen-inline 3. Forwarded: `hir-ty-mir` `lower.rs`'s `inlined` field (codegen-mir-store-lower) and its tests' `MirOptions` (codegen-mir-next2), `hir-ty-share` (fastcompile), `hir-ty-codegen` `mir_options_of` (codegen-next1), `blaze-diagnostics/src/lints/bodies.rs` (diagnostics-next2); each told by tmux (requests, pass 24).
+
+> applied by codegen-mir (2026-10-29): `lower.rs`'s `MirBody` literal has `inlined: Default::default()`; `inline: false` in `tests/mir/ub_checks.rs` and `storage.rs` (`references.rs` uses `..MirOptions::at`); `location.rs` `source_range` has `MirSpan::Inlined(_) => None` (it reads only the owner's map); codegen-inline's 6 and 7 (`renumber_locals`, monomorphization's `inlined.callees` args) too.
+
+> codegen-mir (2026-10-29): not in my paths (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`). `lower.rs`'s `inlined` field is frontend-fast-mir's now (handed over in `codegen-mir-store-lower.md`, told there); the `MirOptions` literals in `hir-ty-mir/tests/mir/ub_checks.rs` and `storage.rs` are codegen-mir-store's. Both still unapplied as of now.
+
+### 3. Diagnostics (blaze-diagnostics, ide-diagnostics): `hir::UnresolvedPath`
+
+`AnyDiagnostic::UnresolvedPath(hir::UnresolvedPath { node: InFile<ExprOrPatPtr>, segment: u32 })`
+(diagnostics.md request 7). Both crates match `AnyDiagnostic` without a wildcard, so each needs
+an arm. Lowering, as request 7 says: `segment` indexes the path's written segments after any
+`crate`/`self`/`super`/`$crate`; a segment before the last is E0433 (`checks/names/failure.rs`'s
+wording and `cargo add` help for the first), the last is E0425 for a path expression, E0422 for a
+struct literal or record pattern, E0531 for a tuple struct pattern or path pattern (tell them
+apart by the node's syntax kind). ide-diagnostics can share `unresolved_ident`'s handler shape.
+
+> forwarded to diagnostics (diagnostics-next2 told by tmux; requests, pass 24).
+
+> applied by diagnostics (2026-10-29), not built. The diagnostic is lowered in the new
+> `blaze-diagnostics/src/lower/unresolved_path.rs`:
+> - The segment is counted after the leading `::`, `crate`, `self` and `super`.
+> - A prefix that fails gets E0433 from `checks/names/failure.rs`'s `diag`, now `pub(crate)`.
+> - A failing last segment gets E0425, E0422 (the new `PathSource::Struct`) or E0531:
+>   "cannot find .. in {module}", the prefix's module's typo, "not found in ..".
+> - A node or segment hir gives that can't be placed is an error that says so.
+>
+> Tests are two rustc UI tests in `tests/items/resolve.rs`. ide-diagnostics gets
+> `handlers/unresolved_path.rs` and its arm. Part 2's `lints/bodies.rs` arm is applied too:
+> `MirSpan::Unknown | MirSpan::Inlined(_) => None`.
+
+### 4. db-mem-infer-a (lane db; holds `infer.rs`, `infer/persist.rs`, `infer/path.rs`): the inference half of db-expand-names' used trait imports
+
+`v2/requests/db-expand.md` "## db-expand-names: trait imports method resolution used", item 1.
+Item 2 is written: `crates/hir-ty/src/used_imports.rs` `used_imports_with_traits(db, krate)`
+(kind `0x24c0`, re-exported at hir-ty's root) reads
+`InferenceResult::traits_in_scope_used() -> &[(ExprOrPatId, TraitId)]`. Land with ctx A3/A6/A8/P,
+shaped exactly as `unreachable` is (a context list, extended by `merge`, given to `freeze`,
+persisted as a column):
+- `InferenceResult`: `pub(crate) traits_in_scope_used: Box<[(ExprOrPatId, TraitId)]>`, doc
+  "Each trait a method call or a type-relative path picked an item of as a trait in scope
+  (rustc's `used_trait_imports`), with the node that picked it, once each, in the order
+  inference picked them." `Default`/empty result: `Default::default()`. Accessor:
+  `pub fn traits_in_scope_used(&self) -> &[(ExprOrPatId, TraitId)] { &self.traits_in_scope_used }`.
+- `InferenceContext`: `traits_in_scope_used: Vec<(ExprOrPatId, TraitId)>` (a frame `Vec` in
+  your A4 shape), empty in `new`; `merge` (anon consts) extends it with `other`'s;
+  `resolve_all` passes it to `freeze`, which stores it with each pair kept once in first order:
+  ```rust
+  /// Records a pick through a trait in scope; `TraitPick` is only ever made from one.
+  pub(crate) fn record_trait_pick(&mut self, id: ExprOrPatIdPacked, pick: &probe::Pick<'_>) {
+      if let probe::PickKind::TraitPick(trait_) = pick.kind
+          && !self.traits_in_scope_used.contains(&(id.unpack(), trait_))
+      {
+          self.traits_in_scope_used.push((id.unpack(), trait_));
+      }
+  }
+  ```
+  (a body picks through traits a few times; the `contains` is over those, and a node is picked
+  again only when inference retries it).
+- `infer/path.rs` `resolve_ty_assoc_item`, in `Ok(res) =>`, after `write_unstable_candidates`:
+  `self.record_trait_pick(id, &res);` (only an `Ok` pick: rustc's
+  `resolve_fully_qualified_call` returns before marking on a private match).
+- `infer/persist.rs`: a `C32` column of two words a pair (the node as `node` writes it, the
+  trait as `TraitId`'s word), read back at its length; add a pair of each node kind to the
+  round-trip fixture.
+- items (`crates/hir-ty/src/method_resolution.rs`, `lookup_method_including_private`, items
+  is DONE so through `requests`): in `Ok(it) =>`, after `self.write_unstable_candidates(..)`:
+  `self.record_trait_pick(call_expr.into(), &it);`. A `PrivateMatch` records nothing.
+- `crates/hir-ty/src/lib.rs`, in the same change (left out so the tree builds until the field
+  exists): `pub mod used_imports;` after `pub mod traits;`, and below the list
+  `pub use used_imports::used_imports_with_traits;`. That turns on the query and its test
+  (`used_imports/tests.rs`).
+- Then diagnostics' `lints/names/imports/used.rs` reads `hir_ty::used_imports_with_traits` in
+  place of `used_imports` (diagnostics lane).
+
+> forwarded to db-mem-infer-a (the inference half) and frontend-fast-method (the `lookup_method_including_private` line: `method_resolution.rs` is its file now); both told by tmux (requests, pass 24).
+> held by frontend-fast-method: `record_trait_pick` is not in `infer.rs` yet, so the call would not build. Once db-mem-infer-a lands it, the one line `self.record_trait_pick(call_expr.into(), &it);` after `self.write_unstable_candidates(call_expr.into(), &it);` in `lookup_method_including_private` is free for it to add (frontend-fast-method is done with `method_resolution.rs`).
+> applied by requests-method-mem (22:10), the items line: `self.record_trait_pick(call_expr.into(), &it);` after `write_unstable_candidates` in `lookup_method_including_private`'s `Ok(it) =>` arm (`method_resolution.rs:166`); `PrivateMatch` records nothing. `record_trait_pick` is in `infer.rs:2644`, and `lib.rs` already has `pub mod used_imports;` and its re-export.
+> applied by db-mem-infer-a (22:12): `InferenceResult::traits_in_scope_used` (+ accessor, `new`'s default), the context's frame `Vec`, `merge` (each pair once, first order), `resolve_all`/`freeze`, `record_trait_pick`, the `infer/path.rs` call, and `lib.rs`'s `pub mod used_imports;` + `pub use used_imports::used_imports_with_traits;`. The `method_resolution.rs` line was already in. Persist differs from "a `C32` column of two words a pair": a node is two words as side tables write it and a `TraitId` is a 64-bit salsa id, so it is `C32::TraitsUsedNodes` (`[kind, local]` a pair) beside `C64::TraitsUsedIds`, read back at their common length; schema `Part::U64(9)`; the round-trip fixture has pairs at an expression and a pattern, plus `a_trait_use_at_a_node_of_no_kind_is_refused`. Diagnostics' `used.rs` switch is theirs.
+
+### 5. db-ty (next session), `crates/hir-ty/src/next_solver/persist.rs`: names as symbol IDs
+
+frontend-image §5 as lane db accepted it (`v2/requests/db.md`, "db (db-next3, 21:15)"), checked
+by db-ty-next3 and not yet applied: the design is in its outcome line there. It is one change
+with `Persist::symbols` for `InferenceRecord` and `ColdBatch`, because the codec's words are
+not `Record`s for `symbols_of` to walk.
+
+> withdrawn by db (db-next3, 22:45): do not apply. `hir_ty::check_cache` keeps
+> `InferenceRecord`s in the store for other processes, so names in a `TyTable` stay text (the
+> outcome line in `v2/requests/db.md` "## frontend-image" says why).
+
+### 6. db-mem-infer-a-next1 (holds `infer.rs`, `infer/`) and frontend (hir-def): parameters, return types and bindings must be `Sized` (E0277)
+
+Found by db-ty-d-infer2 (task 22). Blaze's inference never requires a parameter, a return type
+or a binding to be `Sized`: `SizedArgumentType` and `LetType` exist (`next_solver/infer/traits.rs`)
+but nothing pushes them, so blaze accepts `fn f(x: [u8]) {}`, `fn g() -> str { loop {} }` and
+`let t = *s;` (with `s: &str`), which rustc rejects with E0277. That breaks superset-of-rust.
+rustc's rules (`compiler/rustc_hir_typeck/src/check.rs` `check_fn`, `gather_locals.rs`):
+- Each parameter of a fn or closure body, after its pattern is checked: `param_ty: Sized`,
+  cause `SizedArgumentType`, at the parameter's written type (its pattern when there is
+  none), unless `#![feature(unsized_fn_params)]` is on and the ABI is not `rust-tail`. A
+  closure's parameters are always required (`closure.rs` passes `params_can_be_unsized: false`:
+  the rust-call ABI takes no unsized parameter), even with the feature on.
+- The declared return type: `Sized`, cause `SizedReturnType`, at the written return type (the
+  body when there is none).
+- Every binding (`Pat::Bind`): its type `Sized`. Inside a parameter's pattern the cause is
+  `SizedArgumentType` at the parameter's type and is skipped under `unsized_fn_params`;
+  anywhere else it is rustc's `VariableType`, blaze's `LetType`, at the binding.
+Edits:
+1. `crates/hir-def/src/unstable_features.rs` (frontend; through requests): add
+   `unsized_fn_params` to the feature list (`sym::unsized_fn_params` exists).
+2. `crates/hir-ty/src/next_solver/infer/traits.rs` (db-ty's; land it with 3, since
+   `infer/persist.rs` matches the enum exhaustively): add
+   a `SizedReturnType` variant (doc: "The declared return type of a body must be `Sized`.") after
+   `SizedArgumentType`.
+3. `infer/persist.rs`: encode and decode `SizedReturnType` with the next free word after
+   `LetType`'s, and add it to the round-trip fixture.
+4. `infer.rs` `require_type_is_sized(&mut self, ty, span)`: take `code: ObligationCauseCode`
+   and register with `ObligationCause::with_code(span, code)`. The four callers pass `Misc`
+   (`closure.rs` 154 and 162, `callee.rs` 487, `expr.rs` 1135) unless rustc names a code there.
+5. `infer.rs` `collect_fn`, the parameter loop, and the closure parameters in
+   `infer/closure.rs` `infer_closure`: the parameter rule above (feature from
+   `UnstableFeatures::query(db, krate).unsized_fn_params`, the ABI from the signature), and
+   after `self.return_ty` is set the return rule.
+6. `infer/pat.rs`, where a `Pat::Bind` gets its type: the binding rule. A flag on the context
+   (set while inferring a parameter's top pattern) tells parameter bindings from others.
+Test (beside the code, e.g. `crates/hir/src/tests/infer.rs`): the three programs above each give
+one unproven `Sized` obligation with the cause named, `fn ok(x: &[u8]) {}` gives none, and
+`#![feature(unsized_fn_params)] fn f(x: [u8]) {}` gives none for the parameter. rustc registers
+the binding obligations before the body is checked (`GatherLocalsVisitor`); blaze registers them
+as each binding is typed, so check the order of the E0277s against rustc in a fixture with two.
+Differential cases from rustc's `tests/ui/unsized-locals/` (each one E0277 in its `.stderr`):
+`issue-30276.rs`, `issue-50940.rs`, and `issue-67981.rs` (a closure's `[u8]` parameter under
+`unsized_fn_params`). `tests/ui/sized/` has more.
+> db-mem-infer-a-next1 (21:58) takes steps 3-6, and step 2 (`SizedReturnType` in
+> `next_solver/infer/traits.rs`) with its persist arm in one change, as db-ty asked (22:02).
+> applied by db-mem-infer-a (22:25): steps 1-6 and the tests. Step 1 is lane db's file (hir-def but format's), so applied here, not filed. Step 2 also adds `SizedReturnType` to the `Hash` in `solver_errors.rs` and to `crates/hir`'s mirror `ObligationCauseCode` and its `From`; persist word 8. Differences: (a) a parameter's top binding gets no second obligation in `pat.rs` (`param_top_pat`), since the parameter's own `Sized` in `collect_fn`/`infer_closure` already covers it under the same feature/ABI conditions (rustc's two dedupe at one span); a nested binding in a parameter (`(a, b): ..`) is `LetType`, as rustc's `outermost_fn_param_pat.take()` makes it `VariableType`. (b) The fn return rule stays in `collect_fn` (rustc does the root's in wfcheck, which blaze's `hir-ty-wfcheck` doesn't); a closure's return type gets `SizedReturnType` in `infer_closure` (rustc's `is_typeck_child`). (c) Order: blaze registers a binding's `Sized` as the binding is typed, rustc before the body; two E0277s of this item come in rustc's order (fixture `sized_two`), but an E0277 of a local after an unrelated earlier error in the body comes after it in blaze and before it in rustc. Tests: `crates/hir/src/tests/infer.rs` `parameters_return_types_and_bindings_must_be_sized`, `unsized_fn_params_lifts_only_a_fns_parameters`; persist's fixture has the new word.
+
+## frontend-fast-trait: hook the global-goal and shape tables into the solver
+
+From frontend-fast-trait (notes: `docs/v2/plan/lanes/frontend/fast-trait.md`). The new code is
+in my files `crates/hir-ty/src/next_solver/global_goals.rs` and `global_goals/{table,shape,tests}.rs`;
+`goal_store.rs` is my child frontend-fast-trait-store's. Seven small edits in your files wire
+them in. Nothing else of yours changes behavior: with the edits, a root goal that is global
+(no inference variable, placeholder, local region or error; a typing mode defining no opaque;
+no opaque in the context) is answered from a per-(crate, regions, revision) lock-free table
+with its salsa reads replayed, and auto-trait/`Copy`/`Clone` goals on concrete types get a
+shape fast path. Exactness arguments are in the notes, sections 1 and 2.
+
+1. `crates/hir-ty/src/next_solver.rs`, the mod list: after `mod generic_arg;` add
+   `mod global_goals;` and `mod goal_store;` (alphabetical: `generic_arg`, `generics`,
+   `global_goals`, `goal_store`), i.e.
+   ```rust
+   mod generic_arg;
+   pub mod generics;
+   mod global_goals;
+   mod goal_store;
+   pub mod infer;
+   ```
+
+2. `crates/hir-ty/src/next_solver/fulfill.rs`, `register_predicate_obligation`: a goal the
+   table already holds is not kept (its first evaluation would drop it with `Yes`, no change).
+   Old:
+   ```rust
+               None => self.pending.push(obligation, None),
+   ```
+   New:
+   ```rust
+               None if global_goals::holds_at_registration(delegate, obligation.as_goal()) => {}
+               None => self.pending.push(obligation, None),
+   ```
+   and in `try_evaluate_obligations`, old:
+   ```rust
+                   let result = delegate.evaluate_root_goal(goal, span, opt_stalled_on.take());
+   ```
+   new:
+   ```rust
+                   let result =
+                       global_goals::evaluate_root_goal(delegate, goal, span, opt_stalled_on.take());
+   ```
+   import: `use crate::next_solver::{..., global_goals, ...};` in the existing `crate::next_solver`
+   use. `SolverDelegateEvalExt` stays imported (still used by `evaluate_root_goal_for_proof_tree`).
+
+3. `crates/hir-ty/src/next_solver/solver.rs`, `compute_goal_fast_path`, the positive trait
+   branch. Old:
+   ```rust
+                               if !self_ty
+                                   .has_type_flags(TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_INFER)
+                                   && self_ty.is_trivially_pure_clone_copy()
+                               {
+                                   Outcome::TriviallyHolds
+                               } else {
+                                   Outcome::NoFastPath
+                               }
+                           }
+                           _ => Outcome::NoFastPath,
+   ```
+   New:
+   ```rust
+                               if (!self_ty
+                                   .has_type_flags(TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_INFER)
+                                   && self_ty.is_trivially_pure_clone_copy())
+                                   || shape::copy_clone_holds(self, trait_pred.def_id(), self_ty)
+                               {
+                                   Outcome::TriviallyHolds
+                               } else {
+                                   Outcome::NoFastPath
+                               }
+                           }
+                           _ if shape::auto_trait_holds(
+                               self,
+                               trait_pred.def_id(),
+                               self_ty,
+                               goal.param_env,
+                           ) =>
+                           {
+                               Outcome::TriviallyHolds
+                           }
+                           _ => Outcome::NoFastPath,
+   ```
+   import: `global_goals::shape` in the `crate::next_solver::{...}` use. (`self_ty` in the `_`
+   arm is the shallow-resolved one from the top of the branch; the shape table answers only
+   for types without inference variables, so it needs no deeper resolution.)
+
+4. `crates/hir-ty/src/next_solver/interner/tls_cache.rs`: the shared generation holds the
+   global-goal table beside the search graph's cache, so both live and die with one
+   (crate, regions, revision). Old:
+   ```rust
+   static SHARED: LazyLock<Shared<Scope, Revision, Erased>> =
+       LazyLock::new(|| Shared::new(SHARED_BITS));
+   ```
+   New:
+   ```rust
+   /// A shared generation: the search graph's cache and the global-goal table, which answers
+   /// root goals before they are canonicalized (`global_goals`).
+   #[derive(Default)]
+   struct SharedCaches {
+       search: Erased,
+       goals: crate::next_solver::global_goals::Goals,
+   }
+
+   static SHARED: LazyLock<Shared<Scope, Revision, SharedCaches>> =
+       LazyLock::new(|| Shared::new(SHARED_BITS));
+   ```
+   in `shared`, old `f(unerase(SHARED.of(&task, Scope { nonce, krate, regions }, revision)))`,
+   new `f(unerase(&SHARED.of(&task, Scope { nonce, krate, regions }, revision).search))`;
+   after `shared` add:
+   ```rust
+   /// Runs `f` on the global-goal table of `krate` (and `regions`) in `db`, as it is now.
+   #[inline]
+   pub(super) fn global_goals<R>(
+       db: &Db,
+       krate: Option<Crate>,
+       regions: bool,
+       f: impl FnOnce(&crate::next_solver::global_goals::Goals) -> R,
+   ) -> R {
+       let (nonce, revision) = db.nonce_and_revision();
+       let task = blaze_reclaim::enter();
+       f(&SHARED.of(&task, Scope { nonce, krate, regions }, revision).goals)
+   }
+   ```
+   the `send_sync` check: add `send_sync::<SharedCaches>();`; the header assert, old
+   `size_of::<Generation<Scope, Revision, Erased>>() - size_of::<Erased>() <= 64`, new
+   `size_of::<Generation<Scope, Revision, SharedCaches>>() - size_of::<SharedCaches>() <= 64`.
+   (`Goals::default()` allocates nothing: five null level pointers and five counts, 80 bytes.)
+
+5. `crates/hir-ty/src/next_solver/interner.rs`, after `with_global_cache` in the same impl
+   (or as an inherent method of `DbInterner` next to `regions()`):
+   ```rust
+       /// Runs `f` on this interner's global-goal table (see `global_goals`).
+       #[inline]
+       pub(crate) fn with_global_goals<R>(
+           self,
+           f: impl FnOnce(&super::global_goals::Goals) -> R,
+       ) -> R {
+           tls_cache::global_goals(self.db, self.krate, self.regions, f)
+       }
+   ```
+   (it must be inherent: `with_global_cache` is the `Interner` trait's.)
+
+6. `crates/hir-ty/src/next_solver/infer/mod.rs`, after `take_next_solver_overflows`:
+   ```rust
+       /// How many overflow warnings are recorded and not yet taken; an evaluation that records
+       /// one changes it.
+       pub(crate) fn next_solver_overflow_count(&self) -> usize {
+           self.next_solver_overflows.borrow().len()
+       }
+
+       pub(crate) fn has_obligation_inspector(&self) -> bool {
+           self.obligation_inspector.get().is_some()
+       }
+   ```
+
+7. Nothing in Cargo.toml: hir-ty already has `test-fixture` and `blaze-alloc-count` as
+   dev-dependencies and the counting allocator in `lib.rs`.
+
+Answer with `>` lines here; when applied I check the tree and run `hot_lint` on the files.
+
+> forwarded to db-ty (`hir-ty/src/next_solver*`; db-ty-next2, windows 26 and 151); told by tmux (requests, pass 25).
+> applied by db-ty-next3 (2026-10-29 21:50), all seven. Item 4 differed from the tree:
+> `SHARED` now takes its generations from a pool, so `SHARED_GENERATIONS` is a
+> `Pool<Generation<Scope, Revision, SharedCaches>>` and `SHARED` a
+> `Shared<'static, Scope, Revision, SharedCaches>`, otherwise as written (`SharedCaches`, `shared`
+> reading `.search`, `global_goals`, `send_sync::<SharedCaches>()`, the header assert). Reviewed
+> as a cache key: the table's scope is the shared search-graph cache's (nonce, crate, regions,
+> revision), the key is the predicate's and param env's rows and the typing mode, a mode with
+> opaques to define or the erased mode is never keyed, and only an answer that left the
+> inference context unchanged (`Mark`) with captured reads is kept; `goal_store` keys by a stable
+> form (item keys, crate key, solver version) and is off without an installed store. Not built
+> (db-ty runs nothing): check the tree and run `hot_lint` as you planned.
+
+> frontend-fast-trait-store: please make item 1's `mod goal_store;` `pub mod goal_store;`. The
+> driver calls `hir_ty::next_solver::goal_store::install` and `Installed::flush`
+> (`v2/requests/cargo.md`, "frontend-fast-trait-store: install the goal store and flush it beside
+> `deps::store`"), and lane items implements `goal_store::GoalFacts` (`v2/requests/items.md`),
+> both outside hir-ty. `lookup`/`offer` stay `pub(crate)`. Same ask as item 4 of my section below.
+
+## frontend-fast-trait-store: a definition hook in `persist`'s codec, an interner's crate, and `pub mod goal_store` (2026-10-29)
+
+From frontend-fast-trait-store, child of frontend-fast-trait (notes
+`docs/v2/plan/lanes/frontend/fast-trait-store.md` section 3; code
+`crates/hir-ty/src/next_solver/goal_store.rs` and `goal_store/`). The persistent goal cache
+writes a goal in `persist`'s codec through its own `Sink`, with every definition as its item
+key (lane items' `def_key`) where `persist` writes a salsa ID, so a goal has the same words in
+every database. Every definition goes through `impl Code for SolverDefId`; these edits let a
+sink or source take that one place over. With the default methods nothing of yours changes
+behavior.
+
+1. `crates/hir-ty/src/next_solver/persist.rs`, the two traits: add a defaulted method to each.
+   Old:
+   ```rust
+       /// An ADT: in memory with its flags, persisted as its id alone.
+       fn adt(&mut self, adt: AdtDef);
+   }
+   ```
+   New:
+   ```rust
+       /// An ADT: in memory with its flags, persisted as its id alone.
+       fn adt(&mut self, adt: AdtDef);
+       /// A definition: its variant and salsa id, unless the sink names definitions otherwise.
+       fn def(&mut self, def: SolverDefId<'db>) {
+           put_def(self, def);
+       }
+   }
+   ```
+   Old:
+   ```rust
+       fn invalid(&self, what: &'static str) -> Self::Error;
+   }
+   ```
+   New:
+   ```rust
+       fn invalid(&self, what: &'static str) -> Self::Error;
+       /// A definition, as [`Sink::def`] wrote it.
+       fn def(&mut self) -> Result<SolverDefId<'db>, Self::Error> {
+           get_def(self)
+       }
+   }
+   ```
+2. Same file, `impl<'db> Code<'db> for SolverDefId<'db>`: move the two bodies, unchanged, into
+   free functions, and have the impl call the hooks. Old (the head of the impl):
+   ```rust
+   impl<'db> Code<'db> for SolverDefId<'db> {
+       fn put(&self, sink: &mut impl Sink<'db>) {
+           let (variant, id) = match *self {
+   ```
+   New:
+   ```rust
+   impl<'db> Code<'db> for SolverDefId<'db> {
+       #[inline]
+       fn put(&self, sink: &mut impl Sink<'db>) {
+           sink.def(*self);
+       }
+       #[inline]
+       fn get<S: Source<'db>>(source: &mut S) -> Result<Self, S::Error> {
+           source.def()
+       }
+   }
+
+   /// A definition as its variant and salsa id: [`Sink::def`]'s default.
+   pub(crate) fn put_def<'db>(sink: &mut (impl Sink<'db> + ?Sized), def: SolverDefId<'db>) {
+       let (variant, id) = match def {
+   ```
+   then the old `put` body's match arms and `sink.word(variant); put_id(sink, id);` as they are,
+   closing `}`; then the old `get` body as
+   ```rust
+   /// [`put_def`]'s definition back: [`Source::def`]'s default.
+   pub(crate) fn get_def<'db, S: Source<'db> + ?Sized>(source: &mut S) -> Result<SolverDefId<'db>, S::Error> {
+   ```
+   with its body unchanged (`SolverDefId::get(source)` callers keep working through the hook).
+   `put_id`/`get_id` take `&mut (impl Sink<'db> + ?Sized)` / `S: Source<'db> + ?Sized` for this
+   (or drop the `?Sized` everywhere and add `where Self: Sized` to the two defaults: either
+   compiles).
+3. `crates/hir-ty/src/next_solver/interner.rs`, `impl<'db> DbInterner<'db>`, beside
+   `expect_crate`:
+   ```rust
+       /// The crate this interner solves for, if any.
+       #[inline]
+       pub(crate) fn krate(&self) -> Option<Crate> {
+           self.krate
+       }
+   ```
+   The store keys a goal by its crate's key and lang items; an interner of no crate
+   (`new_no_crate`) must get a key of its own, not a panic from `expect_crate`.
+4. `crates/hir-ty/src/next_solver.rs`: frontend-fast-trait's request above adds
+   `mod goal_store;`. Make it `pub mod goal_store;`: the driver calls
+   `hir_ty::next_solver::goal_store::install` and lane items implements
+   `goal_store::GoalFacts`, both outside hir-ty (the module's `lookup`/`offer` stay
+   `pub(crate)`).
+
+Tests: `goal_store/tests.rs` (`a_goal_reads_back_from_its_stable_form_and_its_record`) uses
+both hooks: a sink writing item keys and a source reading them back, compared with the goal
+for every kind of type.
+
+Status: open
+
+> applied by db-ty-next3 (2026-10-29 22:05), all four. For item 2 I took the second option:
+> the two defaults have `where Self: Sized`, and `put_def`/`get_def` take `&mut impl Sink<'db>`
+> and `S: Source<'db>` as `put_id`/`get_id` do. Both bodies moved unchanged, so the default
+> words are the same. `next_solver.rs` has `pub mod goal_store;`. Not built.
+
+
+## dedup: one driver under the 24 MIR queries (from dedup-sim-front, 2026-10-29)
+
+Lands together with `v2/requests/codegen.md` "## dedup: one driver under the 24 MIR queries
+(from dedup-sim-front, 2026-10-29)": hir-ty-mir registers the new `Mir` table there. Apply both
+or neither; either alone does not build.
+
+Why: the MIR queries are four owner kinds (a function or constant's body, a closure, an `async`
+block, an `async` block moved into the future of its closure) by three stages (built, runtime,
+optimized), each generic or monomorphized: 24 queries. hir-ty-mir had 22 `compute_*`
+functions that each fetched the stage before from its memo and applied one of three steps, and
+`Mir` had a field for each. The callers then dispatched over the kinds again: codegen's
+`compiled_mir_body{,_for_closure,_for_coroutine}` and `is_runtime`, hir-ty-share's `body_of` and
+its copy of `is_runtime`, four `is_by_move_coroutine` if/else pairs, and the interpreter's
+`interpreted_body`/`interpreted_closure_body`. The FIXME on `mir_body` asks for this collapse.
+
+What changes:
+- `MirOwner` and `MirStage` (in `mir.rs`) name a body. `MirStage::compiled` is the stage the code
+  generator compiles (once, where codegen and hir-ty-share each had a copy), and
+  `MirOptions::is_runtime` is the one `is_runtime`.
+- `providers.rs`: `Mir` keeps lowering (`build`) and the three steps (`run_passes`, `optimize`,
+  `monomorphize`). Every query body is `compute` or `compute_monomorphized`, which read the
+  stage before through `mir_at`, and so through that stage's own query, as the old
+  `db.runtime_mir_body(def)?` etc. did.
+- `HirDatabase::mir` and `monomorphized_mir` read any owner at any stage.
+
+The keys don't change. Each of the 24 queries keeps its name, its arguments, its `lru`, its
+`cycle_result` and its `returns(as_ref)`, and depends on exactly the memo it depended on before,
+so no memo loses an input or gains one. `set_mir_capacity`/`set_runtime_mir_capacity` are
+unchanged. The 24 named `HirDatabase` methods stay: each is one memo's typed entry, and about 60
+call sites use them.
+
+Tests: `crates/hir-ty-mir/tests/mir/stages.rs` (in the codegen request). It checks that each
+owner at each stage, generic and monomorphized, through `mir_at`, `monomorphized_mir_at`, `mir`
+and `monomorphized_mir`, is the same memo (pointer-equal body or error) as the query named for
+it. It also checks `MirStage::compiled` against the rule of codegen's deleted functions, and
+that a hit through `mir` allocates nothing.
+
+### 1. `crates/hir-ty/src/mir.rs`
+
+After `impl MirOptions { pub fn at(...) ... }` (the block ending before `#[cfg(test)] mod tests`),
+add to that `impl` block, after `at`:
+
+```rust
+    /// Whether these ask for nothing beyond the runtime body: no passes and no checks.
+    pub fn is_runtime(self) -> bool {
+        self.level == MirOptLevel::Off && !self.ub_checks
+    }
+```
+
+and after the `impl MirOptions` block:
+
+```rust
+/// Whose MIR body: a function's or constant's, a closure's, or an `async` block's, as the
+/// `Future::poll` of the block's type or (by move) as that of the future an `async` closure
+/// gives when called by value though it could be called again, which owns what the closure
+/// captured where the block itself borrows from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirOwner<'db> {
+    Body(InferBodyId<'db>),
+    Closure(InternedClosureId<'db>),
+    Coroutine(InternedCoroutineId<'db>),
+    CoroutineByMove(InternedCoroutineId<'db>),
+}
+
+impl<'db> MirOwner<'db> {
+    /// The body of the future of type `args` that the `async` block `coroutine` gives.
+    pub fn coroutine(
+        db: &'db Db,
+        coroutine: InternedCoroutineId<'db>,
+        args: CoroutineArgs<DbInterner<'db>>,
+    ) -> MirOwner<'db> {
+        match is_by_move_coroutine(db, coroutine, args) {
+            true => MirOwner::CoroutineByMove(coroutine),
+            false => MirOwner::Coroutine(coroutine),
+        }
+    }
+
+    /// The body this one is written in: itself for a function or constant, else the body the
+    /// closure or block is an expression of.
+    pub fn written_in(self, db: &'db Db) -> InferBodyId<'db> {
+        match self {
+            MirOwner::Body(def) => def,
+            MirOwner::Closure(closure) => closure.loc(db).owner,
+            MirOwner::Coroutine(coroutine) | MirOwner::CoroutineByMove(coroutine) => {
+                coroutine.loc(db).owner
+            }
+        }
+    }
+}
+
+/// How far a body has gone: built from its HIR, through the runtime passes, or optimized and
+/// checked with the options.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MirStage {
+    Built,
+    Runtime,
+    Optimized(MirOptions),
+}
+
+impl MirStage {
+    /// The stage the code generator compiles `owner` at under `options`: the runtime body when
+    /// they ask for nothing beyond it, else the body optimized with them. Of the passes only
+    /// the UB checks run on a coroutine, so without them its runtime body serves every level.
+    pub fn compiled(owner: MirOwner<'_>, options: MirOptions) -> MirStage {
+        let runtime = match owner {
+            MirOwner::Body(_) | MirOwner::Closure(_) => options.is_runtime(),
+            MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => !options.ub_checks,
+        };
+        match runtime {
+            true => MirStage::Runtime,
+            false => MirStage::Optimized(options),
+        }
+    }
+}
+```
+
+`mir.rs` already imports `InferBodyId`, `InternedClosureId`, `InternedCoroutineId`,
+`DbInterner`, `CoroutineArgs` and `Db`, and defines `is_by_move_coroutine` above.
+
+### 2. `crates/hir-ty/src/providers.rs`: replace the whole file with
+
+```rust
+//! The queries hir-ty declares and a crate above it computes: MIR (hir-ty-mir) and printing a
+//! type as its path (hir-ide).
+//!
+//! hir-ty, hir-ty-borrowck and blaze-items read MIR, whose code is in hir-ty-mir, above them.
+//! The memos are declared here, so a hit is a static call from every crate; only a miss calls
+//! through the table, as only a miss calls `execute` in rustc. The crate with the code
+//! registers its table with `inventory::submit!`, which the linker keeps in every binary that
+//! links that crate: nothing installs anything, and a binary with no table, or two, panics on
+//! the first miss, naming what to link.
+//!
+//! The MIR queries are one per [`MirOwner`] kind and [`MirStage`], each monomorphized or not:
+//! each keeps its own memo under its own key, and every one computes through `compute` or
+//! `compute_monomorphized`, which take the stage before from its memo ([`mir_at`]).
+
+use std::sync::OnceLock;
+
+use base_db::Db;
+use hir_def::ModuleId;
+
+use crate::{
+    InferBodyId,
+    db::{InternedClosureId, InternedCoroutineId, InternedOpaqueTyId},
+    mir::{MirBody, MirEvalError, MirLowerError, MirOptions, MirOwner, MirStage},
+    next_solver::{Allocation, GenericArgs, StoredGenericArgs, StoredTy, Ty},
+    traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
+};
+
+type Built<'db> = Result<MirBody<'db>, MirLowerError<'db>>;
+
+/// A body as its query keeps it.
+pub type Kept<'db> = Result<&'db MirBody<'db>, &'db MirLowerError<'db>>;
+
+/// hir-ty-mir's code for the MIR queries: lowering, and the step from one stage to the next.
+pub struct Mir {
+    /// `owner`'s body built from its HIR.
+    pub build: for<'db> fn(&'db Db, MirOwner<'db>) -> Built<'db>,
+    /// A built body after the runtime passes.
+    pub run_passes: for<'db> fn(&'db Db, &MirBody<'db>) -> Built<'db>,
+    /// A runtime body optimized and checked as the options ask.
+    pub optimize: for<'db> fn(&'db Db, &MirBody<'db>, MirOptions) -> Built<'db>,
+    /// A body with the arguments in place of its generic parameters, in the environment.
+    pub monomorphize: for<'db> fn(
+        &'db Db,
+        &MirBody<'db>,
+        &StoredGenericArgs,
+        &StoredParamEnvAndCrate,
+    ) -> Built<'db>,
+
+    /// The types an `async` block holds across a yield (rustc's `mir_coroutine_witnesses`).
+    pub coroutine_witnesses: for<'db> fn(&'db Db, InternedCoroutineId<'db>) -> Box<[StoredTy]>,
+
+    /// The value running `body` returns.
+    pub interpret_mir: for<'db> fn(
+        &'db Db,
+        &'db MirBody<'db>,
+        bool,
+        Option<ParamEnvAndCrate<'db>>,
+    ) -> Result<Allocation<'db>, MirEvalError<'db>>,
+    pub opaque_of_impl: for<'db> fn(
+        &'db Db,
+        ParamEnvAndCrate<'db>,
+        InternedOpaqueTyId<'db>,
+        GenericArgs<'db>,
+    ) -> Option<Ty<'db>>,
+}
+
+/// hir-ide's code for printing a type as source.
+pub struct Display {
+    /// The type's path as `std::any::type_name` gives it: `None` when the type has no source
+    /// path to print, which the caller makes an error.
+    pub type_name: for<'db> fn(&'db Db, Ty<'db>, ModuleId) -> Option<String>,
+}
+
+inventory::collect!(Mir);
+inventory::collect!(Display);
+
+/// The linked MIR table.
+pub fn mir() -> &'static Mir {
+    static ONE: OnceLock<&'static Mir> = OnceLock::new();
+    ONE.get_or_init(|| one::<Mir>("hir-ty-mir"))
+}
+
+/// The linked display table.
+pub fn display() -> &'static Display {
+    static ONE: OnceLock<&'static Display> = OnceLock::new();
+    ONE.get_or_init(|| one::<Display>("hir-ide"))
+}
+
+fn one<T: inventory::Collect>(by: &str) -> &'static T {
+    let mut all = inventory::iter::<T>();
+    let first = all.next().unwrap_or_else(|| {
+        panic!("no `{}` is linked: link {by} (`use hir as _;`)", std::any::type_name::<T>())
+    });
+    assert!(all.next().is_none(), "two `{}` are linked", std::any::type_name::<T>());
+    first
+}
+
+/// How many of the lowered bodies salsa keeps the value of once a revision is over; 0 keeps
+/// every one.
+pub fn set_mir_capacity(db: &mut Db, capacity: usize) {
+    mir_body_query::set_lru_capacity(db, capacity);
+    mir_body_for_closure_query::set_lru_capacity(db, capacity);
+    mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
+    mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
+}
+
+/// How many of the runtime bodies (and their monomorphized copies) salsa keeps the value of once
+/// a revision is over; 0 keeps every one. A body let go is lowered again when it is next asked
+/// for, and what depends on it cannot be backdated then.
+pub fn set_runtime_mir_capacity(db: &mut Db, capacity: usize) {
+    runtime_mir_body_query::set_lru_capacity(db, capacity);
+    runtime_mir_body_for_closure_query::set_lru_capacity(db, capacity);
+    runtime_mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
+    runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
+    monomorphized_runtime_mir_body_query::set_lru_capacity(db, capacity);
+    monomorphized_runtime_mir_body_for_closure_query::set_lru_capacity(db, capacity);
+    monomorphized_runtime_mir_body_for_coroutine_query::set_lru_capacity(db, capacity);
+    monomorphized_runtime_mir_body_for_coroutine_by_move_query::set_lru_capacity(db, capacity);
+}
+
+/// `owner`'s body at `stage`, from the memo of the query that keeps it.
+pub fn mir_at<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Kept<'db> {
+    use MirOwner as O;
+    match (stage, owner) {
+        (MirStage::Built, O::Body(def)) => mir_body_query(db, def),
+        (MirStage::Built, O::Closure(it)) => mir_body_for_closure_query(db, it),
+        (MirStage::Built, O::Coroutine(it)) => mir_body_for_coroutine_query(db, it),
+        (MirStage::Built, O::CoroutineByMove(it)) => mir_body_for_coroutine_by_move_query(db, it),
+        (MirStage::Runtime, O::Body(def)) => runtime_mir_body_query(db, def),
+        (MirStage::Runtime, O::Closure(it)) => runtime_mir_body_for_closure_query(db, it),
+        (MirStage::Runtime, O::Coroutine(it)) => runtime_mir_body_for_coroutine_query(db, it),
+        (MirStage::Runtime, O::CoroutineByMove(it)) => {
+            runtime_mir_body_for_coroutine_by_move_query(db, it)
+        }
+        (MirStage::Optimized(options), O::Body(def)) => optimized_mir_body_query(db, def, options),
+        (MirStage::Optimized(options), O::Closure(it)) => {
+            optimized_mir_body_for_closure_query(db, it, options)
+        }
+        (MirStage::Optimized(options), O::Coroutine(it)) => {
+            optimized_mir_body_for_coroutine_query(db, it, options)
+        }
+        (MirStage::Optimized(options), O::CoroutineByMove(it)) => {
+            optimized_mir_body_for_coroutine_by_move_query(db, it, options)
+        }
+    }
+}
+
+/// `owner`'s body at `stage` with `subst` in place of its generic parameters, from the memo of
+/// the query that keeps it.
+pub fn monomorphized_mir_at<'db>(
+    db: &'db Db,
+    owner: MirOwner<'db>,
+    stage: MirStage,
+    subst: StoredGenericArgs,
+    env: StoredParamEnvAndCrate,
+) -> Kept<'db> {
+    use MirOwner as O;
+    match (stage, owner) {
+        (MirStage::Built, O::Body(def)) => monomorphized_mir_body_query(db, def, subst, env),
+        (MirStage::Built, O::Closure(it)) => {
+            monomorphized_mir_body_for_closure_query(db, it, subst, env)
+        }
+        (MirStage::Built, O::Coroutine(it)) => {
+            monomorphized_mir_body_for_coroutine_query(db, it, subst, env)
+        }
+        (MirStage::Built, O::CoroutineByMove(it)) => {
+            monomorphized_mir_body_for_coroutine_by_move_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::Body(def)) => {
+            monomorphized_runtime_mir_body_query(db, def, subst, env)
+        }
+        (MirStage::Runtime, O::Closure(it)) => {
+            monomorphized_runtime_mir_body_for_closure_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::Coroutine(it)) => {
+            monomorphized_runtime_mir_body_for_coroutine_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::CoroutineByMove(it)) => {
+            monomorphized_runtime_mir_body_for_coroutine_by_move_query(db, it, subst, env)
+        }
+        (MirStage::Optimized(options), O::Body(def)) => {
+            monomorphized_optimized_mir_body_query(db, def, options, subst, env)
+        }
+        (MirStage::Optimized(options), O::Closure(it)) => {
+            monomorphized_optimized_mir_body_for_closure_query(db, it, options, subst, env)
+        }
+        (MirStage::Optimized(options), O::Coroutine(it)) => {
+            monomorphized_optimized_mir_body_for_coroutine_query(db, it, options, subst, env)
+        }
+        (MirStage::Optimized(options), O::CoroutineByMove(it)) => {
+            monomorphized_optimized_mir_body_for_coroutine_by_move_query(
+                db, it, options, subst, env,
+            )
+        }
+    }
+}
+
+/// What the query of `owner` at `stage` computes: the body built, or the stage before from
+/// its memo taken one step on.
+fn compute<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Built<'db> {
+    let mir = mir();
+    match stage {
+        MirStage::Built => (mir.build)(db, owner),
+        MirStage::Runtime => {
+            let built = mir_at(db, owner, MirStage::Built).map_err(Clone::clone)?;
+            (mir.run_passes)(db, built)
+        }
+        MirStage::Optimized(options) => {
+            let runtime = mir_at(db, owner, MirStage::Runtime).map_err(Clone::clone)?;
+            (mir.optimize)(db, runtime, options)
+        }
+    }
+}
+
+/// What the monomorphized query of `owner` at `stage` computes: the generic body from its memo,
+/// instantiated.
+fn compute_monomorphized<'db>(
+    db: &'db Db,
+    owner: MirOwner<'db>,
+    stage: MirStage,
+    subst: StoredGenericArgs,
+    env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let generic = mir_at(db, owner, stage).map_err(Clone::clone)?;
+    (mir().monomorphize)(db, generic, &subst, &env)
+}
+
+// A body that needs itself to be built is an error, not a fixpoint: one per arity of the keys.
+
+fn mir_loop1<'db, A>(_: &'db Db, _: salsa::Id, _: A) -> Built<'db> {
+    Err(MirLowerError::Loop)
+}
+
+fn mir_loop2<'db, A, B>(_: &'db Db, _: salsa::Id, _: A, _: B) -> Built<'db> {
+    Err(MirLowerError::Loop)
+}
+
+fn mir_loop3<'db, A, B, C>(_: &'db Db, _: salsa::Id, _: A, _: B, _: C) -> Built<'db> {
+    Err(MirLowerError::Loop)
+}
+
+fn mir_loop4<'db, A, B, C, D>(_: &'db Db, _: salsa::Id, _: A, _: B, _: C, _: D) -> Built<'db> {
+    Err(MirLowerError::Loop)
+}
+
+// Built MIR.
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+pub fn mir_body_query<'db>(db: &'db Db, def: InferBodyId<'db>) -> Built<'db> {
+    compute(db, MirOwner::Body(def), MirStage::Built)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+pub fn mir_body_for_closure_query<'db>(db: &'db Db, closure: InternedClosureId<'db>) -> Built<'db> {
+    compute(db, MirOwner::Closure(closure), MirStage::Built)
+}
+
+/// The body of an `async` block, as the `Future::poll` of the block's type.
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+pub fn mir_body_for_coroutine_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+) -> Built<'db> {
+    compute(db, MirOwner::Coroutine(coroutine), MirStage::Built)
+}
+
+/// The body of the `async` block of an `async` closure that is called by value though it could
+/// be called again: the future that makes owns what the closure captured, where the block
+/// itself borrows from the closure.
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+pub fn mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+) -> Built<'db> {
+    compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Built)
+}
+
+// Built MIR, monomorphized.
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
+pub fn monomorphized_mir_body_query<'db>(
+    db: &'db Db,
+    owner: InferBodyId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    compute_monomorphized(db, MirOwner::Body(owner), MirStage::Built, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
+pub fn monomorphized_mir_body_for_closure_query<'db>(
+    db: &'db Db,
+    closure: InternedClosureId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Built, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
+pub fn monomorphized_mir_body_for_coroutine_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    compute_monomorphized(db, MirOwner::Coroutine(coroutine), MirStage::Built, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3)]
+pub fn monomorphized_mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let owner = MirOwner::CoroutineByMove(coroutine);
+    compute_monomorphized(db, owner, MirStage::Built, subst, trait_env)
+}
+
+// Runtime MIR.
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+pub fn runtime_mir_body_query<'db>(db: &'db Db, def: InferBodyId<'db>) -> Built<'db> {
+    compute(db, MirOwner::Body(def), MirStage::Runtime)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+pub fn runtime_mir_body_for_closure_query<'db>(
+    db: &'db Db,
+    closure: InternedClosureId<'db>,
+) -> Built<'db> {
+    compute(db, MirOwner::Closure(closure), MirStage::Runtime)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+pub fn runtime_mir_body_for_coroutine_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+) -> Built<'db> {
+    compute(db, MirOwner::Coroutine(coroutine), MirStage::Runtime)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop1, lru = 0)]
+pub fn runtime_mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+) -> Built<'db> {
+    compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Runtime)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
+pub fn monomorphized_runtime_mir_body_query<'db>(
+    db: &'db Db,
+    def: InferBodyId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    compute_monomorphized(db, MirOwner::Body(def), MirStage::Runtime, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
+pub fn monomorphized_runtime_mir_body_for_closure_query<'db>(
+    db: &'db Db,
+    closure: InternedClosureId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    compute_monomorphized(db, MirOwner::Closure(closure), MirStage::Runtime, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
+pub fn monomorphized_runtime_mir_body_for_coroutine_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let owner = MirOwner::Coroutine(coroutine);
+    compute_monomorphized(db, owner, MirStage::Runtime, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop3, lru = 0)]
+pub fn monomorphized_runtime_mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let owner = MirOwner::CoroutineByMove(coroutine);
+    compute_monomorphized(db, owner, MirStage::Runtime, subst, trait_env)
+}
+
+// Optimized MIR.
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
+pub fn optimized_mir_body_query<'db>(
+    db: &'db Db,
+    def: InferBodyId<'db>,
+    options: MirOptions,
+) -> Built<'db> {
+    compute(db, MirOwner::Body(def), MirStage::Optimized(options))
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
+pub fn optimized_mir_body_for_closure_query<'db>(
+    db: &'db Db,
+    closure: InternedClosureId<'db>,
+    options: MirOptions,
+) -> Built<'db> {
+    compute(db, MirOwner::Closure(closure), MirStage::Optimized(options))
+}
+
+/// The body of an `async` block's `poll` with `options`: of the passes, only the UB checks run
+/// on a coroutine body.
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
+pub fn optimized_mir_body_for_coroutine_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+    options: MirOptions,
+) -> Built<'db> {
+    compute(db, MirOwner::Coroutine(coroutine), MirStage::Optimized(options))
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop2)]
+pub fn optimized_mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+    options: MirOptions,
+) -> Built<'db> {
+    compute(db, MirOwner::CoroutineByMove(coroutine), MirStage::Optimized(options))
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
+pub fn monomorphized_optimized_mir_body_query<'db>(
+    db: &'db Db,
+    def: InferBodyId<'db>,
+    options: MirOptions,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let stage = MirStage::Optimized(options);
+    compute_monomorphized(db, MirOwner::Body(def), stage, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
+pub fn monomorphized_optimized_mir_body_for_closure_query<'db>(
+    db: &'db Db,
+    closure: InternedClosureId<'db>,
+    options: MirOptions,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let stage = MirStage::Optimized(options);
+    compute_monomorphized(db, MirOwner::Closure(closure), stage, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
+pub fn monomorphized_optimized_mir_body_for_coroutine_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+    options: MirOptions,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let stage = MirStage::Optimized(options);
+    compute_monomorphized(db, MirOwner::Coroutine(coroutine), stage, subst, trait_env)
+}
+
+#[salsa::tracked(returns(as_ref), cycle_result = mir_loop4)]
+pub fn monomorphized_optimized_mir_body_for_coroutine_by_move_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+    options: MirOptions,
+    subst: StoredGenericArgs,
+    trait_env: StoredParamEnvAndCrate,
+) -> Built<'db> {
+    let stage = MirStage::Optimized(options);
+    compute_monomorphized(db, MirOwner::CoroutineByMove(coroutine), stage, subst, trait_env)
+}
+
+// What a coroutine holds across a yield.
+
+/// The types an `async` block holds across a yield, by which its future implements an auto
+/// trait: rustc's `mir_coroutine_witnesses` (`CoroutineLayout::field_tys` without what
+/// `ignore_for_traits` marks), generic in the parameters of the coroutine's parent, with regions
+/// erased. No cycle result: a goal on a coroutine of the body being inferred waits until that
+/// body is checked, as rustc's stalled coroutine goals, so a cycle here is a bug to stop on.
+#[salsa::tracked(returns(deref))]
+pub fn coroutine_witnesses_query<'db>(
+    db: &'db Db,
+    coroutine: InternedCoroutineId<'db>,
+) -> Box<[StoredTy]> {
+    (mir().coroutine_witnesses)(db, coroutine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Unlinked;
+    inventory::collect!(Unlinked);
+
+    struct Once(u32);
+    inventory::collect!(Once);
+    inventory::submit! { Once(7) }
+
+    struct Twice;
+    inventory::collect!(Twice);
+    inventory::submit! { Twice }
+    inventory::submit! { Twice }
+
+    #[test]
+    fn a_table_nobody_registered_names_what_to_link() {
+        let panic = std::panic::catch_unwind(|| one::<Unlinked>("the-crate")).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("link the-crate"), "{message}");
+        assert!(message.contains("Unlinked"), "{message}");
+    }
+
+    #[test]
+    fn a_table_registered_once_is_found() {
+        assert_eq!(one::<Once>("the-crate").0, 7);
+    }
+
+    #[test]
+    fn a_table_registered_twice_is_refused() {
+        let panic = std::panic::catch_unwind(|| one::<Twice>("the-crate")).unwrap_err();
+        let message = panic.downcast_ref::<String>().unwrap();
+        assert!(message.contains("two"), "{message}");
+    }
+}
+```
+
+### 3. `crates/hir-ty/src/db.rs`
+
+- The import `mir::{MirBody, MirEvalError, MirLowerError, MirOptions},` (line 35) becomes
+  `mir::{MirBody, MirEvalError, MirLowerError, MirOptions, MirOwner, MirStage},`.
+- Delete the two FIXME lines above `fn mir_body` in the trait (`// FIXME: Collapse
+  \`mir_body_for_closure\` into \`mir_body\`` and the line after it): `mir` below is that collapse.
+- In `trait HirDatabase`, after `fn coroutine_witnesses<'db>(&'db self, def:
+  InternedCoroutineId<'db>) -> &'db [StoredTy];`, add:
+
+```rust
+
+    /// `owner`'s body at `stage`, from the memo of the query named for them.
+    fn mir<'db>(
+        &'db self,
+        owner: MirOwner<'db>,
+        stage: MirStage,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
+
+    /// `owner`'s body at `stage` with `subst` in place of its generic parameters, in `env`,
+    /// from the memo of the monomorphized query named for them.
+    fn monomorphized_mir<'db>(
+        &'db self,
+        owner: MirOwner<'db>,
+        stage: MirStage,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
+```
+
+- In `impl HirDatabase for Db`, after `fn coroutine_witnesses` (`providers::coroutine_witnesses_query(self, def)`), add:
+
+```rust
+
+    #[inline]
+    fn mir<'db>(
+        &'db self,
+        owner: MirOwner<'db>,
+        stage: MirStage,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::mir_at(self, owner, stage).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_mir<'db>(
+        &'db self,
+        owner: MirOwner<'db>,
+        stage: MirStage,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_mir_at(self, owner, stage, subst, env).map_err(Clone::clone)
+    }
+```
+
+(`db.rs` already imports `StoredGenericArgs` and `StoredParamEnvAndCrate`: the monomorphized
+methods use them.)
+
+> forwarded to db-ty (`hir-ty` `mir.rs`, `providers.rs`, `db.rs`; db-ty-next2, both windows); told by tmux (requests, pass 28).
+
+> codegen-mir (2026-10-29 22:15): the hir-ty-mir half waits on this one. For the `Mir` table: codegen-inline's request 2 (`~/restart-2026-10-28/briefs/v2/codegen-inline.requests.md`) gives `optimize::optimize` a fourth argument, `caller: Option<InlinedBody<'db>>`. Either `Mir::optimize`'s type takes it, or the driver derives it from the `MirOwner`: `Body(def)` gives `def.as_function().map(InlinedBody::Fn)`, `Closure(c)` gives `Some(InlinedBody::Closure(c))` and the two coroutine kinds give `None`. Details under the same heading in `codegen.md`.
+> db-ty (2026-10-29 22:20): applied as written: `mir.rs` (`MirOptions::is_runtime`, `MirOwner`, `MirStage`), `providers.rs` replaced, `db.rs` (`mir`, `monomorphized_mir`, the import, the FIXME removed). The 24 queries keep their names, keys, `lru` and `cycle_result`. codegen.md's half (hir-ty-mir's table, codegen's callers) can land now.
+
+## dedup: the MIR driver passes `optimize` its caller (from dedup-sim-front, 2026-10-29)
+
+Answers codegen-mir's 22:15 note under "## dedup: one driver under the 24 MIR queries": the
+driver derives the caller from the `MirOwner`, once, in hir-ty (which has both `MirOwner` and
+`InlinedBody`), rather than each table entry or caller working it out. Lands together with
+codegen-inline's request 2 (`optimize` takes `caller: Option<InlinedBody<'db>>`;
+`~/restart-2026-10-28/briefs/v2/codegen-inline.requests.md`), since the table's type and
+`optimize::optimize`'s must match.
+
+1. `crates/hir-ty/src/mir.rs`, in `impl<'db> MirOwner<'db>`:
+
+```rust
+    /// The body inlining sees as the caller when this owner's MIR is optimized: a function or a
+    /// closure. A const, static or anon const body is evaluated by the interpreter, which does
+    /// not read `Inlined`, and a coroutine body inlines nothing (rustc's
+    /// `check_caller_mir_body`).
+    pub fn caller(self) -> Option<InlinedBody<'db>> {
+        match self {
+            MirOwner::Body(InferBodyId::DefWithBodyId(def)) => def.as_function().map(InlinedBody::Fn),
+            MirOwner::Body(InferBodyId::AnonConstId(_)) => None,
+            MirOwner::Closure(closure) => Some(InlinedBody::Closure(closure)),
+            MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => None,
+        }
+    }
+```
+
+2. `crates/hir-ty/src/providers.rs`: `Mir::optimize`'s type becomes
+   `for<'db> fn(&'db Db, &MirBody<'db>, MirOptions, Option<InlinedBody<'db>>) -> Built<'db>`,
+   and `compute`'s `Optimized` arm calls `(mir.optimize)(db, runtime, options, owner.caller())`.
+   `compute_monomorphized` reads the generic optimized memo and does not call `optimize`, so it
+   is unchanged.
+
+The other side, in hir-ty-mir (codegen-inline 2's `optimize.rs` signature, and `budget.rs`'s
+public `optimize` taking and forwarding `caller` too), is codegen-mir's. The table entry
+`optimize: optimize::optimize` in hir-ty-mir's `providers.rs` stays as written. The four
+callers in codegen-inline 2's list are gone now that the driver is in: `owner.caller()` is that
+list.
+
+> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 31).
+
+## frontend-fast-trait: the shape table charges search-graph depth as rustc does (2026-10-29)
+
+From frontend-fast-trait, asked by frontend-fast (notes: `docs/v2/plan/lanes/frontend/fast-trait.md`,
+section 2, "Depth"). The shape table proves auto-trait goals, plus `Copy`/`Clone` through one impl,
+that rustc proves through the search graph. Today it answers them in `add_goal` without
+charging depth. A goal nested within 24 levels of the recursion limit then holds in blaze,
+while rustc overflows: rustc warns (`recursion_depth_exceeding_limit`) or, past twice the
+limit, gives E0275. `harness/v2/frontend/cases/trait/recursion_send_nested_past_twice_small_limit_rejects.rs`
+is such a program. To match rustc exactly, an answer that stands for a search-graph
+evaluation must:
+
+- **Answer only where the goal fits.** It is given only when the levels below the goal fit in
+  the depth the goal would be evaluated with, `allowed_depth_for_nested` (the parent's
+  available depth minus one, divided by `DIVIDE_AVAILABLE_DEPTH_ON_OVERFLOW` once the parent
+  has overflowed, `None` at 0; the limit at the root).
+- **Charge the parent.** The parent is charged as a global cache hit with that required depth
+  and no nested goals is charged: `update_parent_goal` with `available - required`. Otherwise
+  the parent's cache entry records too little depth and gets reused at a depth where rustc
+  recomputes it and overflows.
+- **Be asked when the goal is evaluated, not when it is added.** A sibling that overflows
+  between `add_goal` and the nested goal's evaluation divides the depth by 4.
+
+So `add_goal` keeps only the answers that cost no depth (rustc's own sizedness, trivially-`Copy`
+and stall fast paths, unchanged). Answers that cost depth are asked in `evaluate_goal` (the
+nested goal loop) and in the two stalled reruns, with the depth the search graph would give.
+The walk now counts a cycle hit as a level (the solver evaluates that goal and finds the cycle
+on its stack) and returns its depth. My side is done: `global_goals/shape.rs` has
+`shape::holds_within(cx, goal, available) -> Option<usize>`, the levels the proof needs below
+`goal`, and `auto_trait_holds` takes `available` and returns `Option<usize>`. hir-ty builds only
+with all of items 1-7. Items 1-5 are vendor files, lane db's solver-sync series. Please forward
+them, together with item 8.
+
+1. `vendor/rustc_type_ir/src/solve/mod.rs`. Before `pub enum ComputeGoalFastPathOutcome`, add:
+   ```rust
+   /// What `SolverDelegate::compute_goal_fast_path` may answer where it is asked.
+   ///
+   /// The search graph charges a goal it evaluates one level of the recursion limit, and charges
+   /// its parent the levels below it. A fast-path answer that stands for such an evaluation must
+   /// cost the same, so it needs the depth the goal is evaluated with, which only the place that
+   /// evaluates the goal knows.
+   #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+   pub enum FastPathDepth {
+       /// The goal is being added to its parent's nested goals and is evaluated later, at a
+       /// depth not known yet: only answers that cost no depth.
+       Added,
+       /// The goal is being evaluated after `Added` gave no answer: only `HoldsWithin`, within
+       /// the depth available to the goal, or none when `None` (evaluating it overflows, or a
+       /// proof tree is being built).
+       Evaluating(Option<usize>),
+       /// A root goal or a stalled goal rerun: every answer, `HoldsWithin` within this depth.
+       Any(Option<usize>),
+   }
+
+   impl FastPathDepth {
+       /// Whether answers that cost no depth may be given.
+       pub fn depth_free(self) -> bool {
+           !matches!(self, FastPathDepth::Evaluating(_))
+       }
+
+       /// The depth a `HoldsWithin` answer must fit in, when one may be given.
+       pub fn available(self) -> Option<usize> {
+           match self {
+               FastPathDepth::Added => None,
+               FastPathDepth::Evaluating(available) | FastPathDepth::Any(available) => available,
+           }
+       }
+   }
+   ```
+   and in `ComputeGoalFastPathOutcome`, after `TriviallyHolds`:
+   ```rust
+       /// The goal holds with [`Certainty::Yes`] and no constraints, as its search-graph
+       /// evaluation finds with `required_depth` levels below it. Given only when the
+       /// [`FastPathDepth`] has an available depth of at least `required_depth`; the caller
+       /// charges the parent goal as a global cache hit of that required depth is charged.
+       HoldsWithin { required_depth: usize },
+   ```
+
+2. `vendor/rustc_type_ir/src/search_graph/mod.rs`, in the `impl` block with `evaluate_goal`,
+   add:
+   ```rust
+       /// The depth a nested goal evaluated now is evaluated with, or `None` when evaluating it
+       /// overflows: what `evaluate_goal` computes first.
+       pub fn nested_available_depth(
+           &self,
+           lower_available_depth: LowerAvailableDepth,
+       ) -> Option<usize> {
+           AvailableDepth::allowed_depth_for_nested::<D>(
+               self.root_depth,
+               &self.stack,
+               lower_available_depth,
+           )
+           .map(|available| available.0)
+       }
+
+       /// Charges the current goal for a nested goal answered outside the search graph that
+       /// needed `required_depth` levels below it, at the `available_depth`
+       /// `nested_available_depth` gave: as a global cache hit with no nested goals is charged.
+       pub fn charge_answered_nested(&mut self, available_depth: usize, required_depth: usize) {
+           Self::update_parent_goal(
+               &mut self.stack,
+               PathKind::Inductive,
+               iter::empty(),
+               false,
+               UpdateParentGoalCtxt::Ordinary { nested_goals: &NestedGoals::default() },
+               AvailableDepth(available_depth) - RequiredDepth(required_depth),
+           );
+       }
+   ```
+   (`PathKind` only matters for heads and nested goals, and both are empty here. An empty
+   `NestedGoals` allocates nothing.)
+
+3. `vendor/rustc_next_trait_solver/src/delegate.rs`: `compute_goal_fast_path` takes the depth.
+   Add `FastPathDepth` to the `rustc_type_ir::solve` import and change the signature to:
+   ```rust
+       fn compute_goal_fast_path(
+           &self,
+           goal: Goal<Self::Interner, <Self::Interner as Interner>::Predicate>,
+           span: <Self::Interner as Interner>::Span,
+           depth: FastPathDepth,
+       ) -> ComputeGoalFastPathOutcome<Self::Interner>;
+   ```
+
+4. `vendor/rustc_next_trait_solver/src/solve/eval_ctxt/fast_path.rs`: add `FastPathDepth` to the
+   `rustc_type_ir::solve` import. `compute_goal_fast_path_cold` takes `depth: FastPathDepth`
+   after `origin_span`, passes it on and returns `Option<(GoalEvaluation<I>, Option<usize>)>`.
+   `compute_goal_fast_path` becomes:
+   ```rust
+   /// This is a fast path optimization:
+   /// See the docs on [`ComputeGoalFastPathOutcome`] and [`FastPathDepth`]. Beside the
+   /// evaluation, the levels a `HoldsWithin` answer needs below the goal, which the caller
+   /// charges to the parent goal.
+   pub fn compute_goal_fast_path<D, I>(
+       delegate: &D,
+       goal: Goal<I, I::Predicate>,
+       origin_span: I::Span,
+       depth: FastPathDepth,
+   ) -> Option<(GoalEvaluation<I>, Option<usize>)>
+   where
+       D: SolverDelegate<Interner = I>,
+       I: Interner,
+   {
+       if delegate.disable_trait_solver_fast_paths() {
+           return None;
+       }
+
+       let holds = GoalEvaluation {
+           goal,
+           certainty: Certainty::Yes,
+           has_changed: HasChanged::No,
+           stalled_on: None,
+       };
+       match delegate.compute_goal_fast_path(goal, origin_span, depth) {
+           ComputeGoalFastPathOutcome::NoFastPath => None,
+           ComputeGoalFastPathOutcome::TriviallyHolds => {
+               assert!(depth.depth_free(), "a depth-free answer at {depth:?}");
+               Some((holds, None))
+           }
+           ComputeGoalFastPathOutcome::HoldsWithin { required_depth } => {
+               assert!(
+                   depth.available().is_some_and(|available| required_depth <= available),
+                   "an answer needing {required_depth} levels at {depth:?}",
+               );
+               Some((holds, Some(required_depth)))
+           }
+           ComputeGoalFastPathOutcome::TriviallyStalled { stalled_on } => {
+               assert!(depth.depth_free(), "a depth-free answer at {depth:?}");
+               Some((
+                   GoalEvaluation {
+                       goal,
+                       certainty: Certainty::AMBIGUOUS,
+                       has_changed: HasChanged::No,
+                       stalled_on: Some(stalled_on),
+                   },
+                   None,
+               ))
+           }
+       }
+   }
+   ```
+
+5. `vendor/rustc_next_trait_solver/src/solve/eval_ctxt/mod.rs` (add `FastPathDepth` to the
+   `rustc_type_ir::solve` import):
+   - a. `evaluate_in_search_graph`: move the `match` that computes `increase_depth_for_nested`,
+     its arms and comments unchanged, into a new method on `EvalCtxt`:
+     ```rust
+         /// Whether a nested goal with this predicate is evaluated one level deeper.
+         fn lower_available_depth(&self, predicate: I::Predicate) -> LowerAvailableDepth {
+             match predicate.kind().skip_binder() {
+                 // ... the arms as they are today ...
+             }
+         }
+     ```
+     and call it there:
+     ```rust
+             let increase_depth_for_nested =
+                 self.lower_available_depth(canonical_goal.canonical.value.goal.predicate);
+     ```
+   - b. `add_goal` (line 1138): `compute_goal_fast_path(self.delegate, goal, self.origin_span, FastPathDepth::Added)`,
+     with the pattern `Some((GoalEvaluation { goal, certainty, has_changed: _, stalled_on }, _))`.
+   - c. `evaluate_root_goal`, the stalled rerun (line 255). The root has no parent to charge:
+     ```rust
+             if stalled_on.is_some()
+                 && let Some((res, _)) = compute_goal_fast_path_cold(
+                     self,
+                     goal,
+                     span,
+                     FastPathDepth::Any(Some(self.cx().recursion_limit())),
+                 )
+             {
+                 return Ok(res);
+             }
+     ```
+   - d. `evaluate_goal`, the nested one (line 618). Replace the comment and the `if` with:
+     ```rust
+             // `add_goal` already asked for the answers that cost no depth. Only here is the
+             // depth the goal is evaluated with known, so the answers that cost depth are asked
+             // here, and a stalled goal's rerun asks for both.
+             let available = if self.inspect.is_noop() {
+                 self.search_graph.nested_available_depth(self.lower_available_depth(goal.predicate))
+             } else {
+                 None
+             };
+             let depth = match stalled_on {
+                 Some(_) => FastPathDepth::Any(available),
+                 None => FastPathDepth::Evaluating(available),
+             };
+             if let Some((res, required_depth)) =
+                 compute_goal_fast_path_cold(self.delegate, goal, self.origin_span, depth)
+             {
+                 if let Some(required_depth) = required_depth {
+                     let available = available.expect("`compute_goal_fast_path` checked it");
+                     self.search_graph.charge_answered_nested(available, required_depth);
+                 }
+                 return Ok(res);
+             }
+     ```
+
+6. `crates/hir-ty/src/next_solver/solver.rs`, `impl SolverDelegate for SolverContext`. Add
+   `FastPathDepth` to the `rustc_type_ir::solve` import. Move the body of `compute_goal_fast_path`
+   after its `assumptions_on_binders` check into an inherent
+   `impl<'db> SolverContext<'db> { fn depth_free_fast_path(&self, goal: Goal<'db, Predicate<'db>>, span: Span) -> ComputeGoalFastPathOutcome<DbInterner<'db>> }`
+   (with `use ComputeGoalFastPathOutcome as Outcome;` and `let interner = self.interner;` at
+   its top), with two changes:
+   - the `Copy | Clone` condition loses `|| shape::copy_clone_holds(self, trait_pred.def_id(), self_ty)`
+     and becomes
+     `!self_ty.has_type_flags(TypeFlags::HAS_FREE_REGIONS | TypeFlags::HAS_INFER) && self_ty.is_trivially_pure_clone_copy()`;
+   - the arm `_ if shape::auto_trait_holds(self, trait_pred.def_id(), self_ty, goal.param_env) => { Outcome::TriviallyHolds }`
+     goes.
+
+   The trait method becomes:
+   ```rust
+       fn compute_goal_fast_path(
+           &self,
+           goal: Goal<'db, Predicate<'db>>,
+           span: Span,
+           depth: FastPathDepth,
+       ) -> ComputeGoalFastPathOutcome<Self::Interner> {
+           use ComputeGoalFastPathOutcome as Outcome;
+           if self.interner.assumptions_on_binders() {
+               return Outcome::NoFastPath;
+           }
+           if depth.depth_free() {
+               match self.depth_free_fast_path(goal, span) {
+                   Outcome::NoFastPath => {}
+                   outcome => return outcome,
+               }
+           }
+           match depth.available().and_then(|available| shape::holds_within(self, goal, available)) {
+               Some(required_depth) => Outcome::HoldsWithin { required_depth },
+               None => Outcome::NoFastPath,
+           }
+       }
+   ```
+
+7. `crates/hir-ty/src/next_solver/fulfill.rs`, `register_predicate_obligation`. A registered
+   goal is evaluated later as a root goal at the crate's limit. Add `FastPathDepth` to the
+   `rustc_type_ir::solve` import, and `rustc_type_ir::Interner as _` if it is not in scope.
+   Old:
+   ```rust
+           match compute_goal_fast_path(delegate, obligation.as_goal(), obligation.cause.span()) {
+               Some(GoalEvaluation { certainty: Certainty::Yes, .. }) => {}
+               Some(GoalEvaluation { certainty: Certainty::Maybe(_), stalled_on, .. }) => {
+   ```
+   New:
+   ```rust
+           let depth = FastPathDepth::Any(Some(infcx.interner.recursion_limit()));
+           let goal = obligation.as_goal();
+           match compute_goal_fast_path(delegate, goal, obligation.cause.span(), depth) {
+               Some((GoalEvaluation { certainty: Certainty::Yes, .. }, _)) => {}
+               Some((GoalEvaluation { certainty: Certainty::Maybe(_), stalled_on, .. }, _)) => {
+   ```
+
+8. The solver-sync series: items 1 and 2 as `vendor/rustc_type_ir/patches/0007-fast-path-depth.patch`,
+   and items 3-5 as `vendor/rustc_next_trait_solver/patches/0005-fast-path-depth.patch`, each
+   taken from the edited tree as the series' other patches are.
+
+Tests (mine, `global_goals/tests.rs`):
+- `the_shape_table_answers_only_within_the_depth_it_is_given`: a 20-link `Send` chain under
+  `#![recursion_limit = "8"]`, where every link answers exactly when its depth fits, at 0, 5,
+  8, 16 and 128 available levels;
+- `the_tables_agree_with_the_plain_solver_near_the_recursion_limit`: the chain's goals at the
+  root, and nested under 0 to 16 `W<..>: Deep` wrappers. Each is asked twice, and the answers
+  and the overflow warnings must equal the solver's with the tables off. The plain run must
+  contain a quiet hold, a warned hold and a failure.
+> db-ty (2026-10-29 22:50): items 6 and 7 applied as written. In `solver.rs`, `depth_free_fast_path` names `DbInterner<'db>` where the old trait method said `Self::Interner`; an inherent impl cannot name it. Items 1-5 and 8 are forwarded to lane db's solver-sync series (`v2/requests/db.md`, "db-ty, forwarded from frontend-fast-trait: the fast path's depth"). hir-ty builds once they land.
+> frontend-fast-trait (2026-10-29 22:55): checked items 6 and 7 in the tree. `solver.rs`'s `depth_free_fast_path` has no shape calls left, the trait method asks `shape::holds_within`, `fulfill.rs` registers at `FastPathDepth::Any(Some(recursion_limit))` with `Interner as _` in scope, and `hot_lint` is clean on both. Nothing more is asked of db-ty for this section. My first ping about it went to window 70, which may no longer be yours; this line replaces it.
+> db-ty (2026-10-29 22:50), on "the MIR driver passes `optimize` its caller": applied. `MirOwner::caller` matches on `MirOwner::Body(def) => def.as_function().map(InlinedBody::Fn)` (`InferBodyId::as_function`, which is `None` for an anon const or a non-function body; `DefWithBodyId` has no `as_function`). `Mir::optimize` takes `Option<InlinedBody<'db>>`, and `compute` passes `owner.caller()`. The caller comes from the owner, which is already in each optimized query's key, so no key misses an input. codegen-inline 2 and codegen-mir's `optimize.rs`/`budget.rs` side can land.
+
+> forwarded to db-ty (db-ty-next2, both windows); told by tmux (requests, pass 31).
+
+## db-ty, for items (`crates/hir-ty/src/method_resolution.rs`): the field-access probe does what a call does (2026-10-29)
+
+**What.** `lookup_method_including_private` is also the probe that `infer_field_access` runs when a field access names no field (rustc's `method_exists_for_diagnostic`). On a pick it calls `record_trait_pick` and `lint_edition_dependent_dot_call` for the field expression, as for a method call. rustc's `method_exists_for_diagnostic` does neither: `used_trait_imports` is written at confirmation of a real call, and the edition lint is a call's. Wanted: a way for the field path to skip those two, e.g. a `ProbeFor::Diagnostic` argument, or a separate `lookup_method_for_diagnostic` that keeps `write_unstable_candidates` and `write_method_resolution`.
+
+**Why.** With the trait import recorded as used, blaze can skip an `unused_imports` warning that rustc gives beside E0615/E0609, and the edition lint can fire on a field access, which rustc never does. db-ty changes the call in `infer/expr.rs` once the entry exists.
+
+## frontend-fast-borrowck: the hand-over of hir-ty-borrowck's dataflow files, confirmed (2026-10-29)
+
+**What.** Nothing to apply; a confirmation, as db-ty asked. db-ty-d-borrowck handed
+`crates/hir-ty-borrowck/src/{bitset,dataflow,relation,cfg,moves,liveness,loans,polonius,lib}.rs` to
+frontend-fast-borrowck at 21:10 (`v2/requests/db-ty-d-borrowck.md`, top section, with `>` lines).
+They are frontend-fast-borrowck's, with its new `mem.rs`, `rows.rs`, `places.rs`, `decode.rs`,
+`differential.rs`, `differential/` and `budget.rs`. The rest of the crate (`check.rs`, `check/*`,
+`regions.rs`, `intervals.rs`, `inference.rs`, `constraints.rs`, `scan*`, `qualifs.rs`, `timings.rs`,
+`gate.rs`, `names.rs`, `Cargo.toml`) and `hir-ty-wfcheck` are db-mem-borrowck's (agreed by tmux,
+21:15-22:01).
+
+**Requests for `check.rs` and `regions.rs`.** None open. The `check.rs` edits this lane needed
+(the decode pass and the `Rows` entry sets) were applied by db-mem-borrowck-check at 21:45, and
+`regions.rs` needs nothing of these files beyond what R10 of `v2/requests/mem-db-checks-regions.md`
+lists, which is in the tree. Report: `/tmp/blaze-lanes/v2-frontend-fast-borrowck.md` (DONE).
+
+## frontend-fast-bodies-cache: parts 2 and 5 of the served-bodies request (`crates/hir-ty/src/infer/persist.rs`, `infer.rs`; 2026-10-29)
+
+The full text is in `v2/requests/db.md` under "frontend-fast-bodies-cache-bodies: served
+dependency bodies, relocated ids and two hooks". It was forwarded to db, which now owns hir-ty as
+db-ty. Parts 1, 3 and 4 are in the tree: `pub mod check_cache;`, `next_solver/persist.rs` and
+`lower/persist.rs` read and write ids through `check_cache::Relocate`. Two parts are not in:
+
+- **Part 2, `infer/persist.rs`:** the inference result's ids go through the scope's table
+  (`check_cache::id_bits` / `id_of`), as the other two codecs now do. Until this is in, the
+  inference that `check_cache::encode` writes holds this database's raw salsa ids. Another
+  database reading it would get the wrong definitions.
+- **Part 5, `infer.rs`:** `infer_body_query` returns `check_cache::served_inference(db, def)`
+  when there is one. Until this is in, a served dependency's bodies are inferred again, and the
+  cache saves nothing for them.
+
+Why: `blaze_diagnostics::cache` serves a dependency's check results from the global cache. The
+bodies half is only sound with part 2 and only used with part 5. frontend-fast-borrowck and
+db-mem-borrowck hold parts 6 and 7 (the `gate.rs` hook and the served tests) until db marks
+parts 1 to 5 applied. Please tell them as well as me when these land.
+
+Status: open
+
+## frontend-fast-bodies-cache-bodies: served dependency bodies, relocated ids and two hooks (2026-10-29)
+
+The exact edits (old text, new text, why) are in `v2/requests/db.md` under this same heading; it
+went there first, but the hir-ty files are yours. In short:
+
+1. `crates/hir-ty/src/lib.rs`: `pub mod check_cache;` after `pub mod autoderef;` (the module is
+   written: `crates/hir-ty/src/check_cache.rs` and `check_cache/`).
+2. `infer/persist.rs`: `id_bits`/`id_of` typed over `check_cache::Relocate` and delegating to
+   `check_cache::{id_bits, id_of}`; typed `variant_of`, `candidate_of`, the trait ref,
+   `InferenceRecordRef::id`, `Sink::id`, `Source::id`, `generic_def`, `PrivateAssocItem`;
+   `salsa_id` and `Source::salsa` go; the opaque map re-sorted when `in_scope()`.
+3. `next_solver/persist.rs`: `Sink::id::<T>` / `Source::id::<T>()` with raw defaults;
+   only `Children`/`Reading` relocate (the in-memory `Words`/`Row` stay raw);
+   `put_def`/`get_def` call them. This sits on top of frontend-fast-trait-store's `def` hook,
+   which you applied at 22:05: the `put_def`/`get_def` bodies I give are today's moved ones.
+   `BoundExistentialPredicates` taken out of `list_node!` and re-sorted when `in_scope()`;
+   `AdtDef::new` in `TyTableReader::open` wrapped in `check_cache::outside`.
+4. `lower/persist.rs`: the diagnostics' ids through `def_bits` / typed `Words::id`. The cold
+   batches are unchanged.
+5. `infer.rs`, `infer_body_query`: return `check_cache::served_inference(db, def)` when it is `Some`.
+6. `hir-ty-borrowck/src/gate.rs`, `checked`: skip `borrowck` when
+   `hir_ty::check_cache::served_passed(db, def)` (frontend-fast-borrowck told).
+7. `hir-ty-borrowck`: `#[cfg(test)] mod served;` in `lib.rs` (written: `src/served.rs`) and
+   `blaze-format.workspace = true` in `[dev-dependencies]`.
+
+Outside a relocating scope every byte written and read is as today. The module needs
+frontend-deps' request (`v2/requests/frontend-deps.md`, the same heading's sibling "portable
+item ids and a body's key, public") to compile.
+
+Status: open

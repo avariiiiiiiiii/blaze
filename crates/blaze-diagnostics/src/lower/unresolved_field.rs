@@ -17,8 +17,8 @@ use std::{cmp, mem};
 use blaze_items::{Fact, ItemId};
 use hir::{HasVisibility as _, InFile};
 use syntax::{
-    AstNode, TextRange,
-    ast::{self, FieldKind},
+    TextRange,
+    view::{self as ast, AstNode as _, FieldKind, HasName as _},
 };
 
 use crate::{
@@ -29,23 +29,30 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedField<'_>) -> Vec<Found> {
-    let node = cx.node(d.expr);
-    let Some(ast::Expr::FieldExpr(field_expr)) = node.value.clone().left() else { return vec![] };
-    let Some(field_range) = field_range(&field_expr) else { return vec![] };
+    let node = cx.node_view(d.expr);
+    // alloc: the error's parts, for an error hir found
+    let Some(ast::Expr::FieldExpr(field_expr)) = node.value.left() else { return vec![] };
+    // alloc: empty, allocates nothing
+    let Some(field_range) = field_range(field_expr) else { return vec![] };
+    // alloc: empty, allocates nothing
     let Some(base) = field_expr.expr() else { return vec![] };
     let at = |range: TextRange| cx.span(InFile::new(node.file_id, range));
     let field_span = at(field_range);
+    // alloc: the error's text, for an error hir found
     let field = d.name.display(cx.db, cx.edition).to_string();
     let receiver = &d.receiver;
     let ty = cx.ty(receiver);
-    let module = cx.sema.scope(field_expr.syntax()).map(|it| it.module());
+    let module = cx.vsema.scope(field_expr.syntax()).map(|it| it.module());
 
     let mut diag = if d.method_with_same_name_exists {
-        take_value_of_method(cx, &field_expr, &field, &ty, field_span.clone(), &at)
+        // clone: on the error path, for an error hir found
+        take_value_of_method(cx, field_expr, &field, &ty, field_span.clone(), &at)
     } else if !is_primitive(receiver) {
-        let mut diag = no_such_field(cx, d, &field_expr, &base, &field, &ty, field_span.clone(), module, &at);
+        // clone: on the error path, for an error hir found
+        let mut diag = no_such_field(cx, d, field_expr, base, &field, &ty, field_span.clone(), module, &at);
         let peeled = receiver.strip_references();
         if let Some((_, len)) = peeled.as_array(cx.db) {
+            // clone: on the error path, for an error hir found
             diag.span_label(field_span.clone(), "unknown field");
             if let Ok(index) = field.parse::<u64>() {
                 let applicability = match (len as u64) < index {
@@ -55,39 +62,51 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedField<'_>) -> Vec<Found>
                 let between = at(TextRange::new(base.syntax().text_range().end(), field_range.start()));
                 diag.multipart_suggestion(
                     "instead of using tuple indexing, use array indexing",
+                    // alloc: the error's text, for an error hir found
                     vec![(between, "[".to_owned()), (field_span.shrink_to_hi(), "]".to_owned())],
                     applicability,
                 );
             }
         } else if peeled.is_raw_ptr() {
+            // clone: on the error path, for an error hir found
             diag.span_label(field_span.clone(), "unknown field");
             let base_span = at(base.syntax().text_range());
             if base_span.expansion.is_none() && field_span.expansion.is_none() {
                 let val = match cx.snippet(&base_span) {
+                    // alloc: the error's text, for an error hir found
                     Some(text) if text.len() < 20 => format!("`{text}`"),
+                    // alloc: the error's text, for an error hir found
                     _ => "the value".to_owned(),
                 };
                 let between = at(TextRange::new(base.syntax().text_range().end(), field_range.start()));
                 diag.multipart_suggestion(
+                    // alloc: the error's text, for an error hir found
                     format!("{val} is a raw pointer; try dereferencing it"),
+                    // alloc: the error's text, for an error hir found
                     vec![(base_span.shrink_to_lo(), "(*".to_owned()), (between, ").".to_owned())],
                     Applicability::MaybeIncorrect,
                 );
             }
         } else if let Some(param) = peeled.as_type_param(cx.db) {
+            // clone: on the error path, for an error hir found
             diag.span_label(field_span.clone(), "unknown field");
             if let Some(span) = type_param_span(cx, param) {
+                // alloc: the error's text, for an error hir found
                 let name = param.name(cx.db).display(cx.db, cx.edition).to_string();
+                // alloc: the error's text, for an error hir found
                 diag.span_label(span, format!("type parameter '{name}' declared here"));
             }
         } else {
+            // clone: on the error path, for an error hir found
             diag.span_label(field_span.clone(), "unknown field");
         }
         diag
     } else {
+        // alloc: the error's text, for an error hir found
         let message = format!("`{ty}` is a primitive type and therefore doesn't have fields");
+        // clone: on the error path, for an error hir found
         let mut diag = Diag::error(Some("E0610"), message, field_span.clone());
-        let unsuffixed_int = match &base {
+        let unsuffixed_int = match base {
             ast::Expr::Literal(lit) => match lit.kind() {
                 ast::LiteralKind::IntNumber(int) => int.suffix().is_none(),
                 _ => false,
@@ -104,10 +123,13 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedField<'_>) -> Vec<Found>
                 );
             } else if let Some(suffix) = partial_float_suffix(&field) {
                 diag.suggestion_verbose(
+                    // clone: on the error path, for an error hir found
                     field_span.clone(),
+                    // alloc: the error's text, for an error hir found
                     format!(
                         "if intended to be a floating point literal, consider adding a `0` after the period and a `{suffix}` suffix"
                     ),
+                    // alloc: the error's text, for an error hir found
                     format!("0{suffix}"),
                     Applicability::MaybeIncorrect,
                 );
@@ -116,16 +138,20 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedField<'_>) -> Vec<Found>
         diag
     };
     if let Some(adt) = receiver.strip_references().as_adt() {
+        // alloc: the error's text, for an error hir found
         let name = adt.name(cx.db).display(cx.db, cx.edition).to_string();
+        // alloc: the error's text, for an error hir found
         diag.fact(Fact::Signature(cx.key(ItemId::Adt(adt.into()))), format!("the fields of `{name}`"));
     }
+    // alloc: the error's text, for an error hir found
     diag.fact_opt(cx.method_fact(receiver, d.name.as_str()), format!("what `{field}` is on `{ty}`"));
     code_fact(cx, &mut diag, d.expr.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Bodies)]
 }
 
 /// The range of the name or index after the `.` of `x.f`.
-pub(crate) fn field_range(field_expr: &ast::FieldExpr) -> Option<TextRange> {
+pub(crate) fn field_range(field_expr: ast::FieldExpr<'_>) -> Option<TextRange> {
     Some(match field_expr.field_access()? {
         FieldKind::Name(name) => name.syntax().text_range(),
         FieldKind::Index(token) => token.text_range(),
@@ -140,17 +166,19 @@ fn is_primitive(ty: &hir::Type<'_>) -> bool {
 /// E0615 (`ban_take_value_of_method`).
 fn take_value_of_method(
     cx: &Cx<'_, '_>,
-    field_expr: &ast::FieldExpr,
+    field_expr: ast::FieldExpr<'_>,
     field: &str,
     ty: &str,
     field_span: Span,
     at: &impl Fn(TextRange) -> Span,
 ) -> Diag {
+    // alloc: the error's text, for an error hir found
     let message = format!("attempted to take value of method `{field}` on type `{ty}`");
+    // clone: on the error path, for an error hir found
     let mut diag = Diag::error(Some("E0615"), message, field_span.clone());
     diag.span_label(field_span, "method, not a field");
     // rustc's expression of `(x.f)` is `x.f` with the span of the parentheses.
-    let mut outer = ast::Expr::FieldExpr(field_expr.clone());
+    let mut outer = ast::Expr::FieldExpr(field_expr);
     while let Some(paren) = outer.syntax().parent().and_then(ast::ParenExpr::cast) {
         outer = ast::Expr::ParenExpr(paren);
     }
@@ -166,13 +194,16 @@ fn take_value_of_method(
     if is_call && is_wrapped {
         diag.multipart_suggestion(
             "remove wrapping parentheses to call the method",
+            // alloc: the error's parts, for an error hir found
             vec![
+                // alloc: the error's text, for an error hir found
                 (at(TextRange::new(range.start(), range.start() + one)), String::new()),
+                // alloc: the error's text, for an error hir found
                 (at(TextRange::new(range.end() - one, range.end())), String::new()),
             ],
             Applicability::MachineApplicable,
         );
-    } else if !in_place(&outer) {
+    } else if !in_place(outer) {
         let span = match is_wrapped {
             true => at(TextRange::new(range.start() + one, range.end() - one)),
             false => at(range),
@@ -180,7 +211,7 @@ fn take_value_of_method(
         let params = method_params(cx, field_expr, field).unwrap_or(0);
         suggest_method_call(&mut diag, "use parentheses to call the method", params, span);
     } else if let Some(base) = field_expr.expr()
-        && let Some(receiver) = cx.sema.type_of_expr(&base).map(|it| it.original)
+        && let Some(receiver) = cx.vsema.type_of_expr(base).map(|it| it.original)
         && let Some((pointee, _)) = receiver.as_raw_ptr()
         && pointee.as_adt().is_some_and(|adt| !matches!(adt, hir::Adt::Enum(_)))
         && pointee.fields(cx.db).iter().any(|(it, _)| it.name(cx.db).as_str() == field)
@@ -188,6 +219,7 @@ fn take_value_of_method(
         let base = at(base.syntax().text_range());
         diag.multipart_suggestion(
             "to access the field, dereference first",
+            // alloc: the error's text, for an error hir found
             vec![(base.shrink_to_lo(), "(*".to_owned()), (base.shrink_to_hi(), ")".to_owned())],
             Applicability::MaybeIncorrect,
         );
@@ -199,16 +231,17 @@ fn take_value_of_method(
 
 /// How many arguments besides `self` the method `name` the receiver of `x.name` would call
 /// takes.
-fn method_params(cx: &Cx<'_, '_>, field_expr: &ast::FieldExpr, name: &str) -> Option<usize> {
+fn method_params(cx: &Cx<'_, '_>, field_expr: ast::FieldExpr<'_>, name: &str) -> Option<usize> {
     let base = field_expr.expr()?;
-    let receiver = cx.sema.type_of_expr(&base)?.original;
-    let scope = cx.sema.scope(field_expr.syntax())?;
+    let receiver = cx.vsema.type_of_expr(base)?.original;
+    let scope = cx.vsema.scope(field_expr.syntax())?;
     let name = hir::Name::new_symbol_root(hir::Symbol::intern(name));
     receiver.iterate_method_candidates(cx.db, &scope, Some(&name), |f| Some(f.params_without_self(cx.db).len()))
 }
 
 /// rustc's `suggest_method_call`: `()` after `span`, with a `_` for each argument.
 pub(crate) fn suggest_method_call(diag: &mut Diag, message: &str, params: usize, span: Span) {
+    // alloc: the error's text, for an error hir found
     let code = format!("({})", vec!["_"; params].join(", "));
     let applicability = match params > 0 {
         true => Applicability::HasPlaceholders,
@@ -218,16 +251,16 @@ pub(crate) fn suggest_method_call(diag: &mut Diag, message: &str, params: usize,
 }
 
 /// rustc's `expr_in_place`: whether `expr` is in the left side of an assignment.
-pub(crate) fn in_place(expr: &ast::Expr) -> bool {
-    let mut node = expr.syntax().clone();
+pub(crate) fn in_place(expr: ast::Expr<'_>) -> bool {
+    let mut node = expr.syntax();
     while let Some(parent) = node.parent().and_then(ast::Expr::cast) {
-        if let ast::Expr::BinExpr(bin) = &parent
+        if let ast::Expr::BinExpr(bin) = parent
             && matches!(bin.op_kind(), Some(ast::BinaryOp::Assignment { .. }))
-            && bin.lhs().is_some_and(|lhs| lhs.syntax() == &node)
+            && bin.lhs().is_some_and(|lhs| lhs.syntax() == node)
         {
             return true;
         }
-        node = parent.syntax().clone();
+        node = parent.syntax();
     }
     false
 }
@@ -237,15 +270,17 @@ pub(crate) fn in_place(expr: &ast::Expr) -> bool {
 fn no_such_field(
     cx: &Cx<'_, '_>,
     d: &hir::UnresolvedField<'_>,
-    field_expr: &ast::FieldExpr,
-    base: &ast::Expr,
+    field_expr: ast::FieldExpr<'_>,
+    base: ast::Expr<'_>,
     field: &str,
     ty: &str,
     field_span: Span,
     module: Option<hir::Module>,
     at: &impl Fn(TextRange) -> Span,
 ) -> Diag {
+    // alloc: the error's text, for an error hir found
     let message = format!("no field `{field}` on type `{ty}`");
+    // clone: on the error path, for an error hir found
     let mut diag = Diag::error(Some("E0609"), message, field_span.clone());
     let peeled = d.receiver.strip_references();
     let base_range = base.syntax().text_range();
@@ -261,6 +296,7 @@ fn no_such_field(
             _ => None,
         });
         if let Some(f) = found {
+            // clone: on the error path, for an error hir found
             diag.span_label(field_span.clone(), "this is an associated function, not a method");
             diag.note(
                 "found the following associated function; to be used as method, it must have a `self` parameter",
@@ -269,12 +305,15 @@ fn no_such_field(
                 && let Some(impl_ty) = hir::AssocItem::Function(f).implementing_ty(cx.db)
             {
                 let impl_ty = cx.ty(&impl_ty);
+                // alloc: the error's text, for an error hir found
                 diag.span_note(span, format!("the candidate is defined in an impl for the type `{impl_ty}`"));
             }
             diag.multipart_suggestion(
                 "use associated function syntax instead",
+                // alloc: the error's parts, for an error hir found
                 vec![
                     (at(base_range), cx.ty(&peeled)),
+                    // alloc: the error's text, for an error hir found
                     (at(TextRange::new(base_range.end(), field_expr_field_start(field_expr))), "::".to_owned()),
                 ],
                 Applicability::MaybeIncorrect,
@@ -285,18 +324,23 @@ fn no_such_field(
 
     let (ty, unwrap) = match option_or_result_arg(cx, &d.receiver) {
         Some(arg) => (arg, "unwrap()."),
+        // clone: on the error path, for an error hir found
         None => (d.receiver.clone(), ""),
     };
     let same_context = at(field_expr.syntax().text_range()).expansion == field_span.expansion;
     for found in field_candidates(cx, &ty, module) {
+        // alloc: the error's parts, for an error hir found
         let names: Vec<String> = found.iter().map(|(name, _)| name.clone()).collect();
         let mut paths: Vec<String> = found
             .into_iter()
+            // alloc: the error's parts, for an error hir found
             .filter_map(|candidate| nested_field(cx, field, candidate, Vec::new(), module))
             .map(|mut path| {
                 path.pop();
+                // alloc: the error's text, for an error hir found
                 path.iter().map(|it| format!("{it}.")).collect::<String>()
             })
+            // alloc: the error's parts, for an error hir found
             .collect();
         paths.sort();
         let similar = find_best_match_for_name(&names, field, None);
@@ -307,7 +351,9 @@ fn no_such_field(
             };
             diag.suggestions(
                 field_span.shrink_to_lo(),
+                // alloc: the error's text, for an error hir found
                 format!("{some} of the expressions' fields {have} a field of the same name"),
+                // alloc: the error's text, for an error hir found
                 paths.iter().map(|path| format!("{unwrap}{path}")),
                 Applicability::MaybeIncorrect,
                 SuggestionStyle::ShowCode,
@@ -316,20 +362,23 @@ fn no_such_field(
             && !(field.parse::<usize>().is_ok() && similar.parse::<usize>().is_ok())
         {
             diag.suggestion_verbose(
+                // clone: on the error path, for an error hir found
                 field_span.clone(),
                 "a field with a similar name exists",
+                // alloc: the error's text, for an error hir found
                 format!("{unwrap}{similar}"),
                 Applicability::MaybeIncorrect,
             );
         } else if !names.is_empty() {
             let is = if names.len() == 1 { " is" } else { "s are" };
+            // alloc: the error's text, for an error hir found
             diag.note(format!("available field{is}: {}", name_series_display(&names)));
         }
     }
     diag
 }
 
-fn field_expr_field_start(field_expr: &ast::FieldExpr) -> syntax::TextSize {
+fn field_expr_field_start(field_expr: ast::FieldExpr<'_>) -> syntax::TextSize {
     field_range(field_expr).map_or(field_expr.syntax().text_range().end(), |it| it.start())
 }
 
@@ -360,6 +409,7 @@ fn field_candidates<'db>(
         .filter_map(|ty| {
             if ty.is_tuple() {
                 let fields = ty.tuple_fields(cx.db).into_iter().take(100);
+                // alloc: the error's text, for an error hir found
                 return Some(fields.enumerate().map(|(i, ty)| (i.to_string(), ty)).collect());
             }
             if !matches!(ty.as_adt()?, hir::Adt::Struct(_) | hir::Adt::Union(_)) {
@@ -370,8 +420,10 @@ fn field_candidates<'db>(
                 return None;
             }
             let fields = fields.into_iter().filter(|(field, _)| visible(field)).take(100);
+            // alloc: the error's text, for an error hir found
             Some(fields.map(|(field, ty)| (field.name(cx.db).as_str().to_owned(), ty)).collect())
         })
+        // alloc: the error's parts, for an error hir found
         .collect()
 }
 
@@ -394,6 +446,7 @@ fn nested_field<'db>(
     }
     for nested in field_candidates(cx, &ty, module) {
         for candidate in nested {
+            // clone: on the error path, for an error hir found
             if let Some(path) = nested_field(cx, field, candidate, path.clone(), module) {
                 return Some(path);
             }
@@ -408,8 +461,8 @@ pub(crate) fn type_param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<
     if param.is_implicit(cx.db) {
         return None;
     }
-    let source = cx.sema.source(param.merge())?;
-    let name = match &source.value {
+    let source = cx.vsema.source(param.merge())?;
+    let name = match source.value {
         either::Either::Left(ast::TypeOrConstParam::Type(it)) => it.name()?,
         _ => return None,
     };
@@ -418,8 +471,8 @@ pub(crate) fn type_param_span(cx: &Cx<'_, '_>, param: hir::TypeParam) -> Option<
 
 /// rustc's `def_span` of a function: its signature.
 pub(crate) fn fn_def_span(cx: &Cx<'_, '_>, f: hir::Function) -> Option<Span> {
-    let source = cx.sema.source(f)?;
-    Some(cx.span(InFile::new(source.file_id, crate::cx::def_range(source.value.syntax()))))
+    let source = cx.vsema.source(f)?;
+    Some(cx.span(InFile::new(source.file_id, crate::cx::def_range_view(source.value.syntax()))))
 }
 
 fn is_valid_float_suffix(field: &str) -> bool {
@@ -464,8 +517,10 @@ fn partial_float_suffix(field: &str) -> Option<&'static str> {
 pub(crate) fn name_series_display(names: &[String]) -> String {
     let limit = if names.len() == 6 { 6 } else { 5 };
     let mut display =
+        // alloc: the error's text, for an error hir found
         names.iter().take(limit).map(|it| format!("`{it}`")).collect::<Vec<_>>().join(", ");
     if names.len() > limit {
+        // alloc: the error's text, for an error hir found
         display = format!("{} ... and {} others", display, names.len() - limit);
     }
     display
@@ -500,11 +555,13 @@ fn find_best_match_for_name_impl(
 ) -> Option<String> {
     let lookup_uppercase = lookup.to_uppercase();
     if let Some(c) = candidates.iter().find(|c| c.to_uppercase() == lookup_uppercase) {
+        // clone: on the error path, for an error hir found
         return Some(c.clone());
     }
     let lookup_len = lookup.chars().count();
     let mut dist = dist.unwrap_or_else(|| cmp::max(lookup_len, 3) / 3);
     let mut best = None;
+    // alloc: the error's parts, for an error hir found
     let mut next_candidates = vec![];
     for c in candidates {
         let found = match use_substring_score {
@@ -512,6 +569,7 @@ fn find_best_match_for_name_impl(
             false => edit_distance(lookup, c, dist),
         };
         match found {
+            // clone: on the error path, for an error hir found
             Some(0) => return Some(c.clone()),
             Some(d) => {
                 if use_substring_score {
@@ -519,10 +577,12 @@ fn find_best_match_for_name_impl(
                         dist = d;
                         next_candidates.clear();
                     }
+                    // clone: on the error path, for an error hir found
                     next_candidates.push(c.clone());
                 } else {
                     dist = d - 1;
                 }
+                // clone: on the error path, for an error hir found
                 best = Some(c.clone());
             }
             None => {}
@@ -536,12 +596,14 @@ fn find_best_match_for_name_impl(
     }
     let lookup_words = sort_by_words(lookup);
     candidates.iter().fold(None, |result, candidate| match sort_by_words(candidate) == lookup_words {
+        // clone: on the error path, for an error hir found
         true => Some(candidate.clone()),
         false => result,
     })
 }
 
 fn sort_by_words(name: &str) -> Vec<&str> {
+    // alloc: the error's parts, for an error hir found
     let mut words: Vec<&str> = name.split('_').collect();
     words.sort_unstable();
     words
@@ -550,7 +612,9 @@ fn sort_by_words(name: &str) -> Vec<&str> {
 /// rustc's restricted Damerau-Levenshtein distance of `a` and `b`, or `None` if it is over
 /// `limit`.
 pub(crate) fn edit_distance(a: &str, b: &str, limit: usize) -> Option<usize> {
+    // alloc: the error's parts, for an error hir found
     let a = a.chars().collect::<Vec<_>>();
+    // alloc: the error's parts, for an error hir found
     let b = b.chars().collect::<Vec<_>>();
     let mut a = &a[..];
     let mut b = &b[..];
@@ -576,8 +640,11 @@ pub(crate) fn edit_distance(a: &str, b: &str, limit: usize) -> Option<usize> {
     if b.is_empty() {
         return Some(min_dist);
     }
+    // alloc: the error's parts, for an error hir found
     let mut prev_prev = vec![usize::MAX; b.len() + 1];
+    // alloc: the error's parts, for an error hir found
     let mut prev = (0..=b.len()).collect::<Vec<_>>();
+    // alloc: the error's parts, for an error hir found
     let mut current = vec![0; b.len() + 1];
     for i in 1..=a.len() {
         current[0] = i;

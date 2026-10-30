@@ -39,6 +39,7 @@ use rustc_type_ir::{
     elaborate::elaborate,
     inherent::{BoundExistentialPredicates as _, GenericArgs as _, IntoKind as _},
 };
+use smallvec::SmallVec;
 use syntax::{AstNode as _, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
 
 use crate::{
@@ -136,10 +137,12 @@ impl LatePass for PathStatements {
         let span = stmt_span(b, &stmt);
         let solver = Solver::of(b);
         let diag = if needs_drop(&solver, b.infer.expr_ty(expr)) {
+            // clone: a span, for the lint's diagnostic
             let mut diag = Diag::lint("path_statements", "path statement drops value", span.clone());
             let message = "use `drop` to clarify the intent";
             match b.expr_span(expr).and_then(|it| b.cx.snippet(&it)) {
                 Some(snippet) => {
+                    // alloc: the lint's diagnostic
                     diag.suggestion(span, message, format!("drop({snippet});"), Applicability::MachineApplicable);
                 }
                 None => {
@@ -227,7 +230,7 @@ impl LatePass for LetUnderscore {
 /// wherever it is, a value with a destructor only at the top.
 fn let_underscore(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
     let store = b.store();
-    let mut wild = Vec::new();
+    let mut wild: SmallVec<[(usize, PatId); 2]> = SmallVec::new();
     let mut index = 0;
     store.walk_pats(local.pat, &mut |it| {
         if matches!(store.pat(it), Pat::Wild) {
@@ -262,7 +265,9 @@ fn let_underscore(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
         let assign = local.assign.is_some();
         if is_sync_lock {
             let mut diag =
+                // clone: a span, for the lint's diagnostic
                 Diag::lint("let_underscore_lock", "non-binding let on a synchronization lock", pat_span.clone());
+            // clone: a span, for the lint's diagnostic
             diag.span_label(pat_span.clone(), "this lock is not assigned to a binding and is immediately dropped");
             non_binding_let_sub(&mut diag, pat_span, drop_fn, assign);
             out.push(b.lint(diag, Phase::Late, local_at.at));
@@ -270,6 +275,7 @@ fn let_underscore(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
             let mut diag = Diag::lint(
                 "let_underscore_drop",
                 "non-binding let on a type that has a destructor",
+                // clone: a span, for the lint's diagnostic
                 local_at.span.clone(),
             );
             non_binding_let_sub(&mut diag, pat_span, drop_fn, assign);
@@ -283,6 +289,7 @@ fn non_binding_let_sub(diag: &mut Diag, pat: Span, drop_fn: Option<(Span, Span)>
     let binding = "consider binding to an unused variable to avoid immediately dropping the value";
     if drop_fn.is_some() || !assign {
         let prefix = if assign { "let " } else { "" };
+        // alloc: the lint's diagnostic
         diag.suggestion_verbose(pat, binding, format!("{prefix}_unused"), Applicability::MachineApplicable);
     } else {
         diag.span_help(pat, binding);
@@ -291,6 +298,7 @@ fn non_binding_let_sub(diag: &mut Diag, pat: Span, drop_fn: Option<(Span, Span)>
         Some((start, end)) => {
             diag.multipart_suggestion(
                 "consider immediately dropping the value",
+                // alloc: the lint's diagnostic
                 vec![(start, "drop(".to_owned()), (end, ")".to_owned())],
                 Applicability::MachineApplicable,
             );
@@ -356,6 +364,7 @@ impl LatePass for UnusedResults {
         let Some(written) = ast::Expr::cast(b.cx.syntax(node).value) else { return };
         let Some(ty) = b.cx.sema.type_of_expr(&written) else { return };
         let ty = b.cx.ty(&ty.original);
+        // alloc: the lint's diagnostic
         let diag = Diag::lint("unused_results", format!("unused result of type `{ty}`"), stmt_span(b, &stmt));
         out.push(b.lint(diag, Phase::Late, at));
     }
@@ -550,15 +559,19 @@ impl LatePass for NonShorthandFieldPatterns {
                 BindingAnnotation::Ref => "ref ",
                 BindingAnnotation::RefMut => "ref mut ",
             };
+            // alloc: the lint's diagnostic
             let name = binding.name.display_no_db(b.cx.edition).to_string();
             let mut diag = Diag::lint(
                 "non_shorthand_field_patterns",
+                // alloc: the lint's diagnostic
                 format!("the `{name}:` in this pattern is redundant"),
+                // clone: a span, for the lint's diagnostic
                 span.clone(),
             );
             diag.suggestion(
                 span,
                 "use shorthand field pattern",
+                // alloc: the lint's diagnostic
                 format!("{prefix}{name}"),
                 Applicability::MachineApplicable,
             );

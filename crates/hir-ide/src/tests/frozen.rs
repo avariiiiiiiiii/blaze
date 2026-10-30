@@ -75,6 +75,15 @@ fn name(db: &TestDB, krate: Crate) -> String {
     krate.extra_data(db).display_name.as_ref().map(|it| it.to_string()).unwrap_or_default()
 }
 
+/// What `encode` makes of each of `all`, by crate name.
+fn each(
+    db: &TestDB,
+    all: &[Crate],
+    encode: impl Fn(Crate) -> Result<Vec<u8>, String>,
+) -> Vec<(String, Vec<u8>)> {
+    all.iter().map(|&it| (name(db, it), encode(it).unwrap())).collect()
+}
+
 /// The frozen def maps, lang items and impls of each crate of a fresh database, by name.
 struct Bytes {
     def_maps: Vec<(String, Vec<u8>)>,
@@ -86,13 +95,10 @@ fn frozen() -> Bytes {
     let db = TestDB::with_files(FIXTURE);
     crate::attach_db(&db, || {
         let all = crates(&db);
-        let each = |encode: &dyn Fn(Crate) -> Result<Vec<u8>, String>| {
-            all.iter().map(|&it| (name(&db, it), encode(it).unwrap())).collect()
-        };
         Bytes {
-            def_maps: each(&|it| frozen_def::encode(&db, it)),
-            lang_items: each(&|it| frozen_def::encode_lang_items(&db, it)),
-            impls: each(&|it| frozen_impls::encode(&db, it)),
+            def_maps: each(&db, &all, |it| frozen_def::encode(&db, it)),
+            lang_items: each(&db, &all, |it| frozen_def::encode_lang_items(&db, it)),
+            impls: each(&db, &all, |it| frozen_impls::encode(&db, it)),
         }
     })
 }

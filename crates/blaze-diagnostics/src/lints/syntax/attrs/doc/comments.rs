@@ -12,14 +12,14 @@
 use hir::{HirFileId, InFile};
 use rustc_hash::FxHashMap;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange,
-    ast::{self, CommentShape, HasLoopBody as _, HasName as _},
+    SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode, CommentShape, HasLoopBody as _, HasName as _},
 };
 
 use super::super::super::{Emitted, Pass, source_fact};
 use super::super::{Attr, AttrKind, Owner, Target};
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view},
     lower::Phase,
     model::Diag,
 };
@@ -28,37 +28,41 @@ const LINT: &str = "unused_doc_comments";
 
 /// rustc's `UnusedDocComment`: the lints of `owner`'s doc comments, when it is what the early
 /// lint pass checks them on.
-pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner, emitted: &mut Vec<Emitted>) {
-    let node = &owner.node.value;
+pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner<'_>, emitted: &mut Vec<Emitted>) {
+    // Each doc string of an owner below is linted: one without any is left at once.
+    if !owner.attrs.iter().any(|it| it.is_doc_comment() || super::is_doc(it)) {
+        return;
+    }
+    let node = owner.node.value;
     let (kind, label, at) = match owner.target {
-        Target::Statement => ("statements", item_range(node), owner.at()),
+        Target::Statement => ("statements", item_range_view(node), owner.at()),
         Target::Arm => {
-            let Some(arm) = ast::MatchArm::cast(node.clone()) else { return };
+            let Some(arm) = ast::MatchArm::cast(node) else { return };
             let (Some(pat), Some(body)) = (arm.pat(), arm.expr()) else { return };
             let range = TextRange::new(pat.syntax().text_range().start(), body.syntax().text_range().end());
             ("match arms", range, owner.at())
         }
         Target::PatField => {
             let Some(at) = grandparent(owner, SyntaxKind::RECORD_PAT) else { return };
-            ("pattern fields", item_range(node), at)
+            ("pattern fields", item_range_view(node), at)
         }
         Target::ExprField => {
             let Some(at) = grandparent(owner, SyntaxKind::RECORD_EXPR) else { return };
-            ("expression fields", item_range(node), at)
+            ("expression fields", item_range_view(node), at)
         }
         Target::GenericParam { .. } => {
             let name = match node.kind() {
                 SyntaxKind::LIFETIME_PARAM => {
-                    ast::LifetimeParam::cast(node.clone()).and_then(|it| it.lifetime()).map(|it| it.syntax().text_range())
+                    ast::LifetimeParam::cast(node).and_then(|it| it.lifetime()).map(|it| it.syntax().text_range())
                 }
-                SyntaxKind::TYPE_PARAM => ast::TypeParam::cast(node.clone()).and_then(|it| it.name()).map(|it| it.syntax().text_range()),
-                _ => ast::ConstParam::cast(node.clone()).and_then(|it| it.name()).map(|it| it.syntax().text_range()),
+                SyntaxKind::TYPE_PARAM => ast::TypeParam::cast(node).and_then(|it| it.name()).map(|it| it.syntax().text_range()),
+                _ => ast::ConstParam::cast(node).and_then(|it| it.name()).map(|it| it.syntax().text_range()),
             };
             let Some(name) = name else { return };
             ("generic parameters", name, owner.at())
         }
-        Target::ForeignMod => ("extern blocks", item_range(node), owner.at()),
-        _ if ast::Expr::can_cast(node.kind()) && !is_block(node) => ("expressions", item_range(node), owner.at()),
+        Target::ForeignMod => ("extern blocks", item_range_view(node), owner.at()),
+        _ if ast::Expr::can_cast(node.kind()) && !is_block(node) => ("expressions", item_range_view(node), owner.at()),
         _ => return,
     };
     let label = cx.span(InFile::new(owner.node.file_id, label));
@@ -86,9 +90,12 @@ pub(super) fn unused(cx: &Cx<'_, '_>, owner: &Owner, emitted: &mut Vec<Emitted>)
             _ => "use `//` for a plain comment",
         };
         let mut diag = Diag::lint(LINT, "unused doc comment", cx.span(span));
+        // alloc: the diagnostic's text and span
         diag.span_label(label.clone(), format!("rustdoc does not generate documentation for {kind}"));
         diag.help(help);
+        // clone: a pointer, copied for a lint emitted
         source_fact(cx, &mut diag, at.clone());
+        // clone: as above
         emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Early, at.clone()));
     }
 }
@@ -104,19 +111,19 @@ pub(super) fn macro_call(cx: &Cx<'_, '_>, span: InFile<TextRange>, attr: InFile<
 
 /// The node of `owner` two levels up, when it is of `kind`: a field's struct pattern or
 /// expression, which the early lint pass checks the field's doc comments on.
-fn grandparent(owner: &Owner, kind: SyntaxKind) -> Option<InFile<SyntaxNodePtr>> {
+fn grandparent(owner: &Owner<'_>, kind: SyntaxKind) -> Option<InFile<SyntaxNodePtr>> {
     let node = owner.node.value.parent()?.parent().filter(|it| it.kind() == kind)?;
-    Some(InFile::new(owner.node.file_id, SyntaxNodePtr::new(&node)))
+    Some(InFile::new(owner.node.file_id, ast::ptr(node)))
 }
 
 /// Whether `node` is a block rustc's AST has as a `Block`, not an expression: a function's
 /// body, the `then` of an `if`, a loop's body, a `let .. else`'s block.
-fn is_block(node: &SyntaxNode) -> bool {
+fn is_block(node: ast::Node<'_>) -> bool {
     if node.kind() != SyntaxKind::BLOCK_EXPR {
         return false;
     }
     let Some(parent) = node.parent() else { return false };
-    let is = |block: Option<ast::BlockExpr>| block.is_some_and(|it| it.syntax() == node);
+    let is = |block: Option<ast::BlockExpr<'_>>| block.is_some_and(|it| it.syntax() == node);
     match parent.kind() {
         SyntaxKind::FN | SyntaxKind::LET_ELSE => true,
         SyntaxKind::IF_EXPR => is(ast::IfExpr::cast(parent).and_then(|it| it.then_branch())),
@@ -137,9 +144,9 @@ impl Modules {
             let mut declared = FxHashMap::default();
             for module in crate::checks::modules(cx) {
                 if let Some(file) = module.as_source_file_id(cx.db)
-                    && let Some(declaration) = module.declaration_source(cx.db)
+                    && let Some(declaration) = module.declaration_source_view(cx.db)
                 {
-                    declared.insert(HirFileId::from(file), declaration.as_ref().map(|it| SyntaxNodePtr::new(it.syntax())));
+                    declared.insert(HirFileId::from(file), declaration.map(|it| ast::ptr(it.syntax())));
                 }
             }
             declared
@@ -152,26 +159,26 @@ impl Modules {
 /// (`current_expansion.lint_node_id`): the innermost node around the call that the invocation
 /// collector gives an id of its own, through the expansions the call is in. A module file's
 /// root is its `mod` item.
-pub(in crate::lints::syntax::attrs) fn lint_node(cx: &Cx<'_, '_>, call: &InFile<SyntaxNode>, modules: &mut Modules) -> InFile<SyntaxNodePtr> {
-    let mut at = call.clone();
+pub(in crate::lints::syntax::attrs) fn lint_node(cx: &Cx<'_, '_>, call: InFile<ast::Node<'_>>, modules: &mut Modules) -> InFile<SyntaxNodePtr> {
+    let mut at = call;
     loop {
         // `at` itself is a macro call (or what an attribute macro or derive is on): no node
         // of rustc's AST, it is expanded away.
-        let mut root = at.value.clone();
+        let mut root = at.value;
         for node in at.value.ancestors().skip(1) {
-            if has_id(&node) {
+            if has_id(node) {
                 if node.kind() == SyntaxKind::SOURCE_FILE
                     && let Some(declaration) = modules.declaration(cx, at.file_id)
                 {
                     return declaration;
                 }
-                return InFile::new(at.file_id, SyntaxNodePtr::new(&node));
+                return InFile::new(at.file_id, ast::ptr(node));
             }
             root = node;
         }
         match at.file_id.macro_file() {
-            Some(expansion) => at = expansion.loc(cx.db).to_node(cx.db),
-            None => return InFile::new(at.file_id, SyntaxNodePtr::new(&root)),
+            Some(expansion) => at = expansion.loc(cx.db).to_node_view(cx.db),
+            None => return InFile::new(at.file_id, ast::ptr(root)),
         }
     }
 }
@@ -180,7 +187,7 @@ pub(in crate::lints::syntax::attrs) fn lint_node(cx: &Cx<'_, '_>, call: &InFile<
 /// items, statements but those of a trailing expression or a macro call, expressions,
 /// patterns, types, arms, fields, parameters, generic parameters, variants, where predicates
 /// and the crate.
-fn has_id(node: &SyntaxNode) -> bool {
+fn has_id(node: ast::Node<'_>) -> bool {
     match node.kind() {
         SyntaxKind::MACRO_CALL | SyntaxKind::MACRO_EXPR | SyntaxKind::MACRO_PAT | SyntaxKind::MACRO_TYPE => false,
         SyntaxKind::SOURCE_FILE
@@ -197,7 +204,7 @@ fn has_id(node: &SyntaxNode) -> bool {
         | SyntaxKind::CONST_PARAM
         | SyntaxKind::MATCH_ARM
         | SyntaxKind::WHERE_PRED => true,
-        SyntaxKind::EXPR_STMT => ast::ExprStmt::cast(node.clone()).is_some_and(|it| {
+        SyntaxKind::EXPR_STMT => ast::ExprStmt::cast(node).is_some_and(|it| {
             it.semicolon_token().is_some() && !matches!(it.expr(), Some(ast::Expr::MacroExpr(_)))
         }),
         SyntaxKind::BLOCK_EXPR => !is_block(node),

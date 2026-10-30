@@ -16,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 
 use super::closure::{self, StorePath};
 use super::home::cargo_home_of;
+use crate::content::hex;
 use crate::sandbox::{Bind, View};
 
 /// The table of system libraries by crate, shipped with blaze.
@@ -403,14 +404,14 @@ pub fn dep_out_dirs(env: &[(String, String)]) -> Vec<PathBuf> {
 
 /// Adds to `key` what a run in `closure` is made of besides its script, its arguments and its
 /// environment: its package's source ([`package_identity`]), each store path of the closure by
-/// its NarHash, and what each `OUT_DIR` of `deps` holds, by its path as `unplace` names it.
+/// its NarHash, and what each `OUT_DIR` of `deps` holds, by its path as `places` unplaces it.
 pub fn key_of(
     key: &mut super::keyed::Key,
     package: &Path,
     hidden: &[PathBuf],
     closure: &Closure,
     deps: &[PathBuf],
-    unplace: &dyn Fn(&[u8]) -> Vec<u8>,
+    places: &super::script::Places,
 ) -> anyhow::Result<()> {
     key.field(package_identity(package, cargo_home_of(package).as_deref(), hidden)?.as_bytes());
     for (path, _) in &closure.paths {
@@ -420,7 +421,7 @@ pub fn key_of(
     for dir in deps {
         let mut digest = Sha256::new();
         tree_digest(dir, dir, &[], &mut digest)?;
-        key.field(&unplace(dir.as_os_str().as_encoded_bytes()));
+        key.field(&places.unplace(dir.as_os_str().as_encoded_bytes()));
         key.field(&digest.finalize());
     }
     Ok(())
@@ -618,10 +619,6 @@ fn tree_digest(
     Ok(())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|it| format!("{it:02x}")).collect()
-}
-
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -680,6 +677,34 @@ mod tests {
             libs: vec!["openssl.dev".into()],
             paths: names.iter().map(|it| (path(it), root.join(it))).collect(),
         }
+    }
+
+    #[test]
+    fn a_dependency_out_dir_is_keyed_by_its_unplaced_path() {
+        let root = std::env::temp_dir().join(format!("blaze-hermetic-key-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        let closure = Closure { roots: Vec::new(), libs: Vec::new(), paths: Vec::new() };
+        let key_in = |checkout: &str, made: &[u8]| {
+            let package = root.join(checkout).join("pkg");
+            let target = root.join(checkout).join("target");
+            let out = target.join("debug/build/x-1/out");
+            let dep = target.join("debug/build/dep-1/out");
+            std::fs::create_dir_all(&package).unwrap();
+            std::fs::create_dir_all(&dep).unwrap();
+            std::fs::write(package.join("build.rs"), b"fn main() {}").unwrap();
+            std::fs::write(dep.join("made"), made).unwrap();
+            let env = [
+                ("OUT_DIR".to_owned(), out.to_str().unwrap().to_owned()),
+                ("CARGO_MANIFEST_DIR".to_owned(), package.to_str().unwrap().to_owned()),
+            ];
+            let places = super::super::script::Places::of(&env);
+            let mut key = super::super::keyed::Key::new("test");
+            key_of(&mut key, &package, &[], &closure, &[dep], &places).unwrap();
+            key.done()
+        };
+        assert_eq!(key_in("one", b"a"), key_in("two", b"a"));
+        assert_ne!(key_in("one", b"a"), key_in("three", b"b"));
+        _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

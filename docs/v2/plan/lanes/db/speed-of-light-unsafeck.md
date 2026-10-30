@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: speed of light for hir-ty-unsafeck, rustc's unsafety check over a body's store and inference, with the arithmetic, what the code does to reach it, and the one gap it still has.
+summary: speed of light for hir-ty-unsafeck, rustc's unsafety check over a body's store and inference, with the arithmetic and what the code does to reach it.
 date: 2026-10-29
 ---
 # Speed of light: unsafety checking (`crates/hir-ty-unsafeck/`)
@@ -36,18 +36,14 @@ about 5 µs at 3.5 GHz. The callee lookups dominate.
   features are `hir-ty`'s `u16` bitsets, so checking a `#[target_feature]` call is a subset test.
 - One-entry caches cover the last variant's fields, the last ADT's layout attribute and the
   `Drop` trait, because field accesses and patterns run on one type at a time.
-- The resolver, and the inference context for `Freeze`, are made lazily: the first at the first
-  path that may name a static, the second at the first shared borrow of a layout-constrained
-  place, which almost no body has.
+- The inference context for `Freeze` is made lazily, at the first shared borrow of a
+  layout-constrained place, which almost no body has.
 - There is no `dyn` in the walk. `Sink` is a generic, so the query and the editor's callback
   each get their own copy of the walker.
 
-## The gap
+## Static paths
 
-`check_static` resolves, through the resolver, every path that is not a variant, an associated
-item or a function: every use of a local too. That is a scope walk of about 20 to 50 cycles per
-use, well above the floor's 5 for a body that reads many locals. Inference already resolves
-every value path. Recording the paths that resolved to a static, as one bitset over `ExprId` in
-`InferenceResult`, turns the check into one bit test plus a `StaticSignature` read for the few
-that did. This is requested in `v2/requests/db-unsafeck.md`, and until it lands the check
-stays the resolver walk.
+`check_static` does not resolve anything: inference already records what each value path
+resolved to (`InferenceResult::value_resolution`), so the check is one column read per path
+plus a `StaticSignature` read for the few that named a static. A scope walk through the
+resolver would cost about 20 to 50 cycles per use of a local, well above the floor's 5.

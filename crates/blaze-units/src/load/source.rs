@@ -21,6 +21,7 @@ mod tree;
 
 use anyhow::{anyhow, bail};
 use blaze_manifest::Config;
+use blaze_manifest::files::Files;
 use blaze_query::{Cancelled, Cx};
 use blaze_resolve::{CRATES_IO_REGISTRY, GitReference, PackageId, SourceId, SourceKind};
 use cargo_util_schemas::core as manifest_core;
@@ -77,7 +78,7 @@ impl Sources {
     /// `[registries]`, `registry.index`, `registries.crates-io.protocol` (sparse by default),
     /// `$CARGO_HOME` (`config.home()`). `offline` is `Some("--offline")` or `Some("--frozen")`
     /// when the command line or `net.offline` makes the build offline.
-    pub(crate) fn new(config: &Config, offline: Option<&'static str>) -> anyhow::Result<Sources> {
+    pub(crate) fn new<F: Files>(config: &Config<F>, offline: Option<&'static str>) -> anyhow::Result<Sources> {
         let home = normal(config.home())
             .ok_or_else(|| anyhow!("`$CARGO_HOME` (`{}`) is not an absolute path", config.home().display()))?;
         Ok(Sources { map: SourceMap::new(config)?, home, offline })
@@ -155,14 +156,14 @@ impl Sources {
                 let no_hash = || anyhow!("no hash listed for {id}");
                 match self.index_file(cx, from, name)? {
                     IndexFile::Here(bytes) => {
-                        let lines = index::parse_file(&bytes);
-                        let line = lines.into_iter().find(|it| &it.entry.version == id.version());
-                        match line {
+                        let lines = index::Lines::new(bytes);
+                        match lines.matching(|it| it == id.version()).next() {
                             Some(line)
                                 if line.status != index::Status::Invalid
                                     && !line.entry.checksum.is_empty() =>
                             {
-                                line.entry.checksum
+                                // clone: the one checksum the download needs, out of the file's lines.
+                                line.entry.checksum.clone()
                             }
                             _ => return Ok(Err(no_hash())),
                         }
@@ -447,7 +448,7 @@ struct SourceMap {
 }
 
 impl SourceMap {
-    fn new(config: &Config) -> anyhow::Result<SourceMap> {
+    fn new<F: Files>(config: &Config<F>) -> anyhow::Result<SourceMap> {
         let crates_io = match config.crates_io_maybe_sparse_http()?.kind {
             manifest_core::SourceKind::SparseRegistry => SourceId::crates_io_sparse(),
             _ => SourceId::crates_io(),

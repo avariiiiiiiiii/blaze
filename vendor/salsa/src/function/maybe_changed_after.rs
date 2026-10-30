@@ -14,7 +14,8 @@ use crate::zalsa::{MemoIngredientIndex, Zalsa, ZalsaDatabase};
 use crate::zalsa_local::{
     QueryEdgeIter, QueryEdgeKind, QueryEdges, QueryOriginRef, QueryRevisions, ZalsaLocal,
 };
-use smallvec::SmallVec;
+use std::cell::Cell;
+use std::mem::ManuallyDrop;
 use crate::{Id, Revision};
 
 /// Result of memo validation.
@@ -343,6 +344,102 @@ impl<'db> UnclaimedFrame<'db> {
     }
 }
 
+thread_local! {
+    /// The claim-free walk's stack, empty between walks, so a deep chain grows it once per
+    /// thread.
+    // alloc: `Vec::new` allocates nothing; the thread's walks reuse the one buffer
+    static UNCLAIMED_STACK: Cell<Vec<UnclaimedFrame<'static>>> = const { Cell::new(Vec::new()) };
+}
+
+/// The thread's walk stack, empty, for frames that borrow for `'db`. A walk inside a walk gets
+/// an empty `Vec`, which allocates only if that walk grows it.
+fn take_stack<'db>() -> Vec<UnclaimedFrame<'db>> {
+    let stack = UNCLAIMED_STACK.take();
+    debug_assert!(stack.is_empty());
+    let mut stack = ManuallyDrop::new(stack);
+    // SAFETY: the vector holds no frame (`give_stack` clears it, `Vec::new` starts empty), so no
+    // borrow of another lifetime is carried over; `UnclaimedFrame<'static>` and
+    // `UnclaimedFrame<'db>` differ only in a lifetime, so they have one layout, and the
+    // allocation is the global allocator's, as it was.
+    unsafe { Vec::from_raw_parts(stack.as_mut_ptr().cast(), 0, stack.capacity()) }
+}
+
+/// Gives the stack's allocation back to the thread, emptied.
+fn give_stack(mut stack: Vec<UnclaimedFrame<'_>>) {
+    stack.clear();
+    let mut stack = ManuallyDrop::new(stack);
+    // SAFETY: as in `take_stack`: empty, the same layout, the same allocation.
+    let stack = unsafe { Vec::from_raw_parts(stack.as_mut_ptr().cast(), 0, stack.capacity()) };
+    UNCLAIMED_STACK.set(stack);
+}
+
+/// Walks `stack` (its bottom the memo checked) until that memo is verified (true) or only a
+/// claimed check can decide (false).
+fn walk_unclaimed<'db>(
+    zalsa: &'db Zalsa,
+    db: RawDatabase<'_>,
+    stack: &mut Vec<UnclaimedFrame<'db>>,
+) -> bool {
+    while let Some(frame) = stack.last_mut() {
+        let Some(edge) = frame.edges.next() else {
+            let done = stack.pop().expect("salsa: the walk's stack holds the memo it checks");
+            done.finish(zalsa);
+            let Some(parent) = stack.last_mut() else {
+                return true;
+            };
+            let result = done.header.verify_result_after(parent.verified_at);
+            if !parent.take(zalsa, parent.position - 1, done.key, result) {
+                return false;
+            }
+            continue;
+        };
+        let position = frame.position;
+        frame.position += 1;
+        if edge.kind() == QueryEdgeKind::Output {
+            return false;
+        }
+        let dependency = edge.key();
+        let ingredient = zalsa.lookup_ingredient(dependency.ingredient_index());
+        let result = match ingredient.as_function() {
+            Some(function) => {
+                let Some(memo) = function.memo(zalsa, dependency.key_index()) else {
+                    return false;
+                };
+                let header = memo.header();
+                match header.maybe_changed_after_hot(
+                    zalsa,
+                    dependency,
+                    frame.verified_at,
+                    #[cfg(feature = "detailed-trace")]
+                    memo.has_value(),
+                ) {
+                    Some(result) => result,
+                    None => {
+                        let Some(edges) = header.unclaimed_edges(zalsa) else {
+                            return false;
+                        };
+                        stack.push(UnclaimedFrame::new(header, dependency, edges));
+                        continue;
+                    }
+                }
+            }
+            // SAFETY: `db` is the database every ingredient of `zalsa` was created with.
+            None => unsafe {
+                ingredient.maybe_changed_after(
+                    zalsa,
+                    db,
+                    dependency.key_index(),
+                    frame.verified_at,
+                )
+            },
+        };
+        if !frame.take(zalsa, position, dependency, result) {
+            return false;
+        }
+    }
+    unreachable!("salsa: the claim-free walk returns when it pops its first memo")
+}
+
 impl MemoHeader {
     /// What a reader verified at `revision` learns from this memo, now verified.
     #[inline]
@@ -378,8 +475,9 @@ impl MemoHeader {
     /// flag), so tasks walking the same memos agree, and one running a memo under its claim
     /// sees the same inputs.
     ///
-    /// The walk keeps its own stack (eight memos inline), so a chain of any depth is walked
-    /// once, in the order the claimed check walks it.
+    /// The walk keeps an explicit stack the thread reuses, so a chain of any depth is walked
+    /// once, in the order the claimed check walks it, and allocates nothing once the thread has
+    /// walked one as deep.
     pub(super) fn deep_verify_unclaimed<'db>(
         &'db self,
         zalsa: &'db Zalsa,
@@ -389,67 +487,11 @@ impl MemoHeader {
         let Some(edges) = self.unclaimed_edges(zalsa) else {
             return false;
         };
-        let mut stack: SmallVec<[UnclaimedFrame<'db>; 8]> = SmallVec::new();
+        let mut stack = take_stack();
         stack.push(UnclaimedFrame::new(self, database_key_index, edges));
-
-        while let Some(frame) = stack.last_mut() {
-            let Some(edge) = frame.edges.next() else {
-                let done = stack.pop().expect("salsa: the walk's stack holds the memo it checks");
-                done.finish(zalsa);
-                let Some(parent) = stack.last_mut() else {
-                    return true;
-                };
-                let result = done.header.verify_result_after(parent.verified_at);
-                if !parent.take(zalsa, parent.position - 1, done.key, result) {
-                    return false;
-                }
-                continue;
-            };
-            let position = frame.position;
-            frame.position += 1;
-            if edge.kind() == QueryEdgeKind::Output {
-                return false;
-            }
-            let dependency = edge.key();
-            let ingredient = zalsa.lookup_ingredient(dependency.ingredient_index());
-            let result = match ingredient.as_function() {
-                Some(function) => {
-                    let Some(memo) = function.memo(zalsa, dependency.key_index()) else {
-                        return false;
-                    };
-                    let header = memo.header();
-                    match header.maybe_changed_after_hot(
-                        zalsa,
-                        dependency,
-                        frame.verified_at,
-                        #[cfg(feature = "detailed-trace")]
-                        memo.has_value(),
-                    ) {
-                        Some(result) => result,
-                        None => {
-                            let Some(edges) = header.unclaimed_edges(zalsa) else {
-                                return false;
-                            };
-                            stack.push(UnclaimedFrame::new(header, dependency, edges));
-                            continue;
-                        }
-                    }
-                }
-                // SAFETY: `db` is the database every ingredient of `zalsa` was created with.
-                None => unsafe {
-                    ingredient.maybe_changed_after(
-                        zalsa,
-                        db,
-                        dependency.key_index(),
-                        frame.verified_at,
-                    )
-                },
-            };
-            if !frame.take(zalsa, position, dependency, result) {
-                return false;
-            }
-        }
-        unreachable!("salsa: the claim-free walk returns when it pops its first memo")
+        let verified = walk_unclaimed(zalsa, db, &mut stack);
+        give_stack(stack);
+        verified
     }
 
     fn maybe_changed_after_hot(

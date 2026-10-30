@@ -15,6 +15,7 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+blaze-format.workspace = true
 blaze-resolve = { path = "../blaze-resolve" }
 blaze-source.workspace = true
 rustc-hash.workspace = true

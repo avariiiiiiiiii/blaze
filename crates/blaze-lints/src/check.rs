@@ -26,7 +26,7 @@ use hir_expand::{AstId, MacroCallId, MacroCallKind, MacroDefKind};
 use rustc_hash::{FxHashMap, FxHashSet};
 use span::{AstIdMap, Edition};
 use syntax::{
-    AstPtr, FlatTree, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange, TextSize,
+    AstPtr, FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     WalkEvent,
     view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _, HasName as _, HasVisibility as _},
 };
@@ -60,6 +60,8 @@ pub struct Found {
 
 /// Names files as rustc names them in diagnostics: from the root of the workspace when they
 /// are below it, else by their whole path.
+// A generic would copy the whole driver per caller.
+// dyn: asked once per file of the crate and once per diagnostic span that leaves its file.
 pub type NameOf<'a> = &'a dyn Fn(base_db::FileId) -> Option<String>;
 
 /// The diagnostics of the lints of `krate`, in the order rustc would emit them.
@@ -519,8 +521,8 @@ pub(crate) fn lint_body(db: &Db, def: DefWithBodyId, on: On, conf: &Conf) -> Lin
     match body_syntax(db, def) {
         Some(syntax) => {
             let Some(file) = syntax.file_id.file_id() else { return Lints::default() };
-            let handle = syntax.root(db);
-            let anchor = view_of(&handle);
+            let tree = syntax.tree(db);
+            let anchor = ast::Node::root(&tree);
             let Some(owner) = ast::try_to_node(syntax.item, anchor) else {
                 return Lints::default();
             };
@@ -598,15 +600,6 @@ fn body_root(def: DefWithBodyId, owner: ast::Node<'_>) -> Option<ast::Node<'_>> 
     }
 }
 
-/// The view of the node `handle` is.
-fn view_of(handle: &SyntaxNode) -> ast::Node<'_> {
-    let (tree, at) = handle.flat().expect("a syntax node is in a flat tree");
-    match ast::Node::at(tree, ast::NodeId { part: ast::NodeId::FILE, at }) {
-        NodeOrToken::Node(it) => it,
-        NodeOrToken::Token(_) => unreachable!("a syntax node handle is of a node"),
-    }
-}
-
 /// The tree a query's findings are of: a body's anchor, or the file.
 struct Base<'q, 't> {
     file: EditionedFileId,
@@ -664,7 +657,7 @@ pub(crate) struct Cx<'q, 't> {
     root: ast::Node<'t>,
     def: Option<DefWithBodyId>,
     analysis: OnceCell<Option<hir::BodyAnalysis<'q>>>,
-    sema: OnceCell<hir::Semantics<'q>>,
+    sema: OnceCell<hir::view::Semantics<'q>>,
     items: OnceCell<Items>,
     /// The expansions read, with the call of each.
     trees: RefCell<Vec<(&'q FlatTree, MacroCallId)>>,
@@ -913,8 +906,8 @@ impl<'q, 't> Cx<'q, 't> {
         if self.def.is_some() {
             return self.analysis()?.resolve_path(self.ptr::<syntax::ast::Path>(path));
         }
-        let handle = syntax::ast::Path::cast(self.handle(path.syntax())?)?;
-        self.sema().resolve_path(&handle)
+        let path = ast::Path::cast(self.in_sema(path.syntax())?)?;
+        self.sema().resolve_path(path)
     }
 
     pub(crate) fn pat_ty(&self, pat: ast::Pat<'t>) -> Option<hir::Type<'q>> {
@@ -930,8 +923,8 @@ impl<'q, 't> Cx<'q, 't> {
         if self.def.is_some() {
             return self.analysis()?.resolve_type(self.ptr::<syntax::ast::Type>(ty));
         }
-        let handle = syntax::ast::Type::cast(self.handle(ty.syntax())?)?;
-        self.sema().resolve_type(&handle)
+        let ty = ast::Type::cast(self.in_sema(ty.syntax())?)?;
+        self.sema().resolve_type(ty)
     }
 
     /// The macro `call` calls.
@@ -939,9 +932,8 @@ impl<'q, 't> Cx<'q, 't> {
         if self.def.is_some() {
             return self.analysis()?.resolve_macro_call(self.ptr::<syntax::ast::MacroCall>(call));
         }
-        let file = self.file_of(call.syntax());
-        let handle = syntax::ast::MacroCall::cast(self.handle(call.syntax())?)?;
-        self.sema().resolve_macro_call2(InFile::new(file, &handle))
+        let call = ast::MacroCall::cast(self.in_sema(call.syntax())?)?;
+        self.sema().resolve_macro_call(call)
     }
 
     /// The `macro_rules!` or `macro` item defining `mac`; `None` for a proc macro.
@@ -960,10 +952,8 @@ impl<'q, 't> Cx<'q, 't> {
             let at = InFile::new(self.file_of(at), ast::ptr(at));
             return self.analysis()?.resolve_name(at, &name);
         }
-        let handle = self.handle(at)?;
-        // alloc: a path of one name to resolve, made only for a name a macro captured
-        let path = syntax::ast::make::path_from_text(name);
-        self.sema().scope(&handle)?.speculative_resolve(&path)
+        let at = self.in_sema(at)?;
+        self.sema().scope(at)?.speculative_resolve_mod_path(&one_segment_path(name))
     }
 
     pub(crate) fn famous(&self) -> Famous<'q> {
@@ -1549,25 +1539,21 @@ impl<'q, 't> Cx<'q, 't> {
         self.analysis()?.expansion(InFile::new(file, AstPtr::<syntax::ast::MacroCall>::of(call)))
     }
 
-    /// The node of the file's whole tree, or of the expansion it is in, that `node` is, for
-    /// what `hir` answers only of those: in [`query::item_lints`], which reads the whole file.
-    fn handle(&self, node: ast::Node<'_>) -> Option<SyntaxNode> {
+    /// The node of the file's whole tree, or of the expansion it is in, that `node` is, in the
+    /// tree the view `Semantics` hands out, for what `hir` answers only of those: in
+    /// [`query::item_lints`], which reads the whole file.
+    fn in_sema(&self, node: ast::Node<'_>) -> Option<ast::Node<'q>> {
         debug_assert!(!self.base.relative, "a body's query reads its own tree, not the file's");
-        let file = self.file_of(node);
-        let root = self.sema().parse_or_expand(file);
+        let root = self.sema().parse_or_expand(self.file_of(node));
         let range = node.text_range();
         if !root.text_range().contains_range(range) {
             return None;
         }
-        let start = match root.covering_element(range) {
-            NodeOrToken::Node(it) => it,
-            NodeOrToken::Token(it) => it.parent()?,
-        };
-        start.ancestors().find(|it| it.text_range() == range && it.kind() == node.kind())
+        root.descendant_at_range(range, node.kind())
     }
 
-    fn sema(&self) -> &hir::Semantics<'q> {
-        self.sema.get_or_init(|| hir::Semantics::new(self.db))
+    fn sema(&self) -> &hir::view::Semantics<'q> {
+        self.sema.get_or_init(|| hir::view::Semantics::new(self.db))
     }
 
     /// What the items the query walks are: of the file's modules for the items of a file, of
@@ -1862,6 +1848,20 @@ pub(crate) fn item_range(node: ast::Node<'_>) -> TextRange {
         })
         .map_or(node.text_range().start(), |it| it.text_range().start());
     TextRange::new(start, node.text_range().end())
+}
+
+/// The path `name` is when written alone, as `SemanticsScope::speculative_resolve` reads a
+/// path of one segment.
+fn one_segment_path(name: &str) -> hir::ModPath {
+    use hir::PathKind;
+    let (kind, segment) = match name {
+        "self" => (PathKind::Super(0), None),
+        "super" => (PathKind::Super(1), None),
+        "crate" => (PathKind::Crate, None),
+        "Self" => (PathKind::Plain, Some(hir::Name::new_symbol_root(intern::sym::Self_))),
+        _ => (PathKind::Plain, Some(hir::Name::new_root(name))),
+    };
+    hir::ModPath::from_segments(kind, segment)
 }
 
 /// The span rustc gives a function's definition: its signature, without its body.

@@ -13,8 +13,8 @@ use blaze_resolve::{Cfg, PackageId, PackageIdSpec, Resolve, Summary};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
-use super::files::{Mounts, Snapshot};
-use super::summary::Read;
+use super::files::{Mounts, Snap};
+use crate::read::Read;
 use super::invocation::Asking;
 use super::manifest::{WorkspaceQuery, replay};
 use super::{Select, Staged, unmounted_error, view_spec};
@@ -36,8 +36,8 @@ pub struct ResolveAsk {
 
 /// The view's workspace resolved, as cargo's `resolve_ws_with_opts` leaves it.
 pub struct ViewResolved<'a> {
-    pub ws: &'a Workspace<'a>,
-    pub config: &'a Config,
+    pub ws: &'a Workspace<'a, Snap>,
+    pub config: &'a Config<Snap>,
     /// The resolve of the packages selected, guided by the lock file.
     pub resolve: &'a Resolve,
     pub members: Members<'a>,
@@ -100,11 +100,12 @@ pub fn resolve_view<R>(
         true => crate::Filter::all_targets(),
         false => crate::Filter::Default { required_features_filterable: true },
     };
-    let read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
+    let mut read = match cx.get::<WorkspaceQuery>(&spec.workspace)?.get() {
         Ok(read) => read,
         Err(error) => return Ok(Resolving::Failed(error)),
     };
-    let (outcome, used) = replay(cx, &read, &spec.workspace.config, &Snapshot::default(), |cx, ctx, ws, files, reads| {
+    let base = std::mem::take(&mut read.snapshot);
+    let (outcome, used) = replay(cx, &read, base, &spec.workspace.config, |cx, ctx, ws, files, reads| {
         super::resolve::resolved(cx, ctx, ws, &files, reads, &spec, |_, resolved| {
             let member_summaries: Vec<&Summary> =
                 resolved.member_ids.iter().map(|id| &resolved.reads[id].summary).collect();
@@ -147,7 +148,7 @@ pub fn resolve_view<R>(
 /// `triple`'s cfg as cargo reads `[target.'cfg(..)']` for a build on `host` (with `target`
 /// the build's `--target`): its probe with the configuration's rustflags for it and
 /// `--crate-type proc-macro`.
-pub fn platform_cfg(config: &Config, triple: &str, host: &str, target: Option<&str>) -> Result<Vec<Cfg>, LoadError> {
+pub fn platform_cfg(config: &Config<Snap>, triple: &str, host: &str, target: Option<&str>) -> Result<Vec<Cfg>, LoadError> {
     let error = |what: String| LoadError { what, at: None };
     let rustflags = super::plan::platform_rustflags(config, triple, host, target)?;
     let args = CfgArgs::from_flags(&rustflags).map_err(error)?;

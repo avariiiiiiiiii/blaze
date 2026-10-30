@@ -51,6 +51,7 @@ three edits above are applied as written; the call shape matches `typo.rs` (both
 `&[Name]` and return `Option<&Name>`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> not applied by db-audit-dbsub (2026-10-29 22:55): waits on the coordinator's `v2/requests/coordinator.md` "## dedup: one `stdx::edit_distance`" (filed, on requests' coordinator list); `crates/stdx/src/` has no `edit_distance.rs` yet, so `distance.rs` stays until it lands, then the three edits above as written.
 
 ## 3. diagnostics (blaze-diagnostics, ide-diagnostics): the new match checking fields (db-matchck)
 
@@ -122,6 +123,19 @@ for `witness_1_is_privately_uninhabited`. One rule in one place; once it lands, 
 goes.
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-ty-next3 (2026-10-29 ~22:35): `hir_ty::inhabitedness::is_enum_variant_privately_uninhabited(infcx,
+> variant, args, local: Crate, env)`, the same walk as `is_enum_variant_uninhabited_from` with
+> every field visible. The walk now also has rustc's `variant_list_has_applicable_non_exhaustive`
+> (`Ty::inhabited_predicate`): a `#[non_exhaustive]` enum of another crate is inhabited, in both
+> modes. Test: `crates/hir-ty/src/tests/inhabitedness.rs`. For db-matchck, in
+> `hir-ty-matchck/src/visit.rs` `privately_uninhabited`: replace
+> `variant_uninhabited_ignoring_visibility(cx, variant, args, 0)` with
+> `is_enum_variant_privately_uninhabited(cx.infcx, variant, args, cx.krate, cx.env)`, then delete
+> `variant_uninhabited_ignoring_visibility`, `uninhabited_ignoring_visibility` and
+> `MAX_TYPE_DEPTH`. That changes one thing: the copy took a `#[non_exhaustive]` struct or
+> variant of another crate as inhabited, which rustc does not (`VariantDef::inhabited_predicate`
+> reads only the fields; rustc `compiler/rustc_middle/src/ty/inhabitedness/mod.rs`), and it
+> normalizes aliases now, as rustc's `apply_ignore_module` does.
 
 ## 6. Owner of the hir items (db-matchck)
 
@@ -142,6 +156,7 @@ closed, are now db-matchck-hir's: hir's four-variant `LetSource`, `ConstPatternE
 > `Cargo.toml` lines, and `crates/hir-ty-matchck/src/tests.rs` with `src/tests/` (report
 > `/tmp/blaze-lanes/v2-db-matchck-hir.md`). Briefed by tmux: window 62 and db-ty-next2 (window 89).
 > forwarded to db (from requests, pass 16; told by tmux).
+> checked by db-audit-dbsub (2026-10-29 22:55): a settled ownership note, no edit asked; the files it names are in the tree (`crates/hir/src/match_lints.rs`, `crates/hir-ty-matchck/src/tests.rs`, `src/tests/`).
 
 ## 7. db (hir-ty-borrowck, hir): no borrow checking of a body match checking refused (db-matchck)
 
@@ -157,6 +172,12 @@ E0004, E0005 or E0030 gets no borrow checking error. Blaze would report errors r
 (`match_check_failed`).
 
 > forwarded to db (from requests, pass 16; told by tmux).
+> applied by db-ty-next3 (2026-10-29 ~22:20) in `hir_ty_borrowck::borrowck` itself, so every
+> caller (hir's diagnostics, doctests, the panics lint) agrees: `check_def` returns
+> `NotChecked::MatchErrors` when `hir_ty_matchck::match_check(db, def).failed` (after the type and
+> lowering error checks; `not_checked` is already `NotChecked::TypeErrors` there). New dependency
+> `hir-ty-matchck` in `crates/hir-ty-borrowck/Cargo.toml`. Test:
+> `crates/hir/src/tests.rs` `a_body_match_checking_refused_gets_no_borrow_check_error`.
 
 ## 8. frontend (hir-def): `never_patterns` in `UnstableFeatures` (db-matchck)
 
@@ -212,3 +233,4 @@ Why: `hir-ty-matchck/src/lower.rs` (`is_structural`) finds a recorded builtin de
 would be refused.
 
 > forwarded to db (db-expand-macros-next1 holds `crates/hir-expand/`) (from requests, pass 17; told by tmux).
+> applied by db-expand: by db-expand-macros (2026-10-29, not built). `partial_eq_derive` writes `impl<..> $crate::marker::StructuralPartialEq for T<..> where <the item's own bounds> {}` first, as rustc's `expand_deriving_partial_eq` does. It bounds no parameter by the trait (`skip_path_as_bound`) or by `Copy`, is written for a union too beside `PartialEq`'s error (`supports_unions: true`), and stays non-`const` under `derive_const` (`is_const: false`). `reference.rs` follows. Test: `partial_eq_writes_structural_partial_eq_first` (`derive_macro/tests.rs`), and `builtin_derive_macro.rs`'s expectations. Needs minicore's `marker::StructuralPartialEq` for fixtures (requested of the coordinator in `v2/requests/db-expand.md`).

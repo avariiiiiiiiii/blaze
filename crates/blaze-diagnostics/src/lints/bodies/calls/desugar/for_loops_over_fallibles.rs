@@ -40,12 +40,6 @@ impl LatePass for ForLoopsOverFallibles {
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
         let Some(found) = for_loop(b, expr) else { return };
         let (pat, arg) = (found.pat, found.head);
-        let Some(pat_span) = b.pat_span(pat) else { return };
-        if util::from_expansion(&pat_span) {
-            return;
-        }
-        let Some(arg_span) = util::span(b, arg) else { return };
-        let arg_span = source_callsite(&arg_span);
         let ty = util::ty(b, arg);
         let (adt, args, ref_mutability) = match ty.kind() {
             TyKind::Adt(adt, args) => (adt.def_id(), args, None),
@@ -66,6 +60,12 @@ impl LatePass for ForLoopsOverFallibles {
         } else {
             return;
         };
+        let Some(pat_span) = b.pat_span(pat) else { return };
+        if util::from_expansion(&pat_span) {
+            return;
+        }
+        let Some(arg_span) = util::span(b, arg) else { return };
+        let arg_span = source_callsite(&arg_span);
         let (article, name, var) = match fallible {
             Fallible::Option if ref_mutability.is_some() => ("a", "Option", "Some"),
             Fallible::Option => ("an", "Option", "Some"),
@@ -79,20 +79,25 @@ impl LatePass for ForLoopsOverFallibles {
         let Some(at) = b.expr_node(expr) else { return };
         let Some(expr_span) = util::span(b, expr) else { return };
 
+        // alloc: the lint's diagnostic
         let message = format!(
             "for loop over {article} `{ref_prefix}{name}`. This is more readably written as an `if let` statement"
         );
+        // clone: a span, for the lint's diagnostic
         let mut diag = Diag::lint("for_loops_over_fallibles", message, arg_span.clone());
         let start_span = expr_span.with_hi(pat_span.lo);
         let end_span = between(&pat_span, &arg_span);
         match next_receiver(b, &solver, arg, &arg_span) {
             Some((recv_span, recv_snip)) => diag.suggestion_with_style(
+                // alloc: the lint's diagnostic
                 vec![(between(&recv_span, &arg_span.shrink_to_hi()), ".by_ref()".to_owned())],
+                // alloc: the lint's diagnostic
                 format!("to iterate over `{recv_snip}` remove the call to `next`"),
                 Applicability::MaybeIncorrect,
                 SuggestionStyle::ShowCode,
             ),
             None => diag.suggestion_with_style(
+                // alloc: the lint's diagnostic
                 vec![(start_span.clone(), format!("while let {var}(")), (end_span.clone(), ") = ".to_owned())],
                 "to check pattern in a loop use `while let`",
                 Applicability::MaybeIncorrect,
@@ -101,6 +106,7 @@ impl LatePass for ForLoopsOverFallibles {
         };
         if fallible == Fallible::Result && suggest_question_mark(b, &solver, args) {
             diag.suggestion_with_style(
+                // alloc: the lint's diagnostic
                 vec![(arg_span.shrink_to_hi(), "?".to_owned())],
                 "consider unwrapping the `Result` with `?` to iterate over its contents",
                 Applicability::MaybeIncorrect,
@@ -108,12 +114,14 @@ impl LatePass for ForLoopsOverFallibles {
             );
         }
         diag.suggestion_with_style(
+            // alloc: the lint's diagnostic
             vec![(start_span, format!("if let {var}(")), (end_span, ") = ".to_owned())],
             "consider using `if let` to clear intent",
             Applicability::MaybeIncorrect,
             SuggestionStyle::ShowCode,
         );
         let def = ModuleDefId::AdtId(AdtId::EnumId(adt));
+        // alloc: the lint's diagnostic
         let what = format!("the definition of `{}`", b.cx.def_path(def.into()));
         diag.fact(Fact::Signature(b.cx.key(ItemId::Adt(AdtId::EnumId(adt)))), what);
         out.push(b.lint(diag, Phase::Late, at));
@@ -140,6 +148,7 @@ fn next_receiver(
     {
         return None;
     }
+    // alloc: the lint's diagnostic
     let recv_snip = b.cx.snippet(&recv_span)?.to_owned();
     Some((recv_span, recv_snip))
 }

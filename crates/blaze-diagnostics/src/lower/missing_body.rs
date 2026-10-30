@@ -7,5 +7,5 @@
 use crate::{cx::Cx, lower::Found};
 
 pub(crate) fn lower(_cx: &Cx<'_, '_>, _d: &hir::MissingBody) -> Vec<Found> {
-    Vec::new()
+    Vec::new() // alloc: empty, allocates nothing
 }

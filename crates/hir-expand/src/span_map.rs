@@ -106,13 +106,31 @@ impl HirFileId {
 
 /// This is an implementation detail of [`HirFileId::span_map`]. Outside this crate, use
 /// `HirFileId::from(file_id).span_map(db)` instead of `real_span_map(db, file_id)`.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Expand)]
 pub(crate) fn real_span_map(
     db: &Db,
     editioned_file_id: base_db::EditionedFileId,
 ) -> RealSpanMap {
+    blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
+        real_span_map_in(db, editioned_file_id, frame)
+    })
+}
+
+thread_local! {
+    /// The scratch of the anchor sort, kept by the worker.
+    static ANCHOR_SORT: std::cell::RefCell<blaze_mem::scratch::Scratch<(syntax::TextSize, span::ErasedFileAstId)>> =
+        const { std::cell::RefCell::new(blaze_mem::scratch::Scratch::new()) };
+}
+
+/// [`real_span_map`], its anchor list in `frame`.
+fn real_span_map_in(
+    db: &Db,
+    editioned_file_id: base_db::EditionedFileId,
+    frame: &blaze_mem::Frame,
+) -> RealSpanMap {
     use syntax::ast::HasModuleItem;
-    let mut pairs = vec![(syntax::TextSize::new(0), span::ROOT_ERASED_FILE_AST_ID)]; // alloc: the file's span map, once per parse of the file
+    let mut pairs = Vec::new_in(frame);
+    pairs.push((syntax::TextSize::new(0), span::ROOT_ERASED_FILE_AST_ID));
     let ast_id_map = HirFileId::from(editioned_file_id).ast_id_map(db);
 
     let tree = editioned_file_id.parse(db).tree();
@@ -164,11 +182,13 @@ pub(crate) fn real_span_map(
     });
     // The lookup is a binary search, and the nested items were added after the items that
     // hold them.
-    radix::sort_copy_by_key(&mut pairs, |&(offset, _)| u32::from(offset));
+    ANCHOR_SORT.with_borrow_mut(|scratch| {
+        radix::sort_copy_by_key_in(&mut pairs, |&(offset, _)| u32::from(offset), scratch.take())
+    });
 
     RealSpanMap::from_file(
         editioned_file_id.span_file_id(db),
-        pairs.into_boxed_slice(),
+        &pairs,
         tree.syntax().text_range().end(),
     )
 }
@@ -216,7 +236,7 @@ mod tests {
                     anchors.push((at.into(), ErasedFileAstId::from_raw(anchors.len() as u32)));
                 }
             }
-            let real = RealSpanMap::from_file(file_id, anchors.into_boxed_slice(), len.into());
+            let real = RealSpanMap::from_file(file_id, &anchors, len.into());
 
             let mut expansion = ExpansionSpanMap::empty();
             for (i, range) in tokens(&mut rng, len).into_iter().enumerate() {

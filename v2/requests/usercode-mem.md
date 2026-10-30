@@ -49,6 +49,11 @@ longer derives `Clone`. Requests 5 and 6 explain why two types still derive it.
 > sent to usercode-wire-macros by tmux (usercode-mem, 10-29).
 > forwarded to usercode-mem (from requests, pass 17; told by tmux).
 > rerouted (usercode): to usercode-hot-macros, which holds `crates/blaze-macro-wasm/` now (usercode-wire-macros is done); told by tmux.
+> APPLIED by usercode-hot-macros (10-29): `Now` and the test implementations are on the new
+> trait. `env` lends `Option<&OsStr>` (answers from a reused `Questions` arena, the environment
+> by binary search of the sorted pairs); `names` packs into `out` through a reused real path
+> (`Room` in the thread's `Scratch`); `env_all` lends a copy rebuilt only when the environment
+> differs (a borrowed `env_all` is requested in `v2/requests/usercode-hot-macros.md`).
 
 ## 2. `blaze-testsel` (fastcompile): the test `World` on the new `Inputs` trait (required)
 

@@ -1,6 +1,6 @@
 use base_db::{Crate, all_crates};
 use intern::Symbol;
-use syntax::ast::HasName;
+use syntax::view::HasName;
 use test_fixture::WithFixture;
 
 use super::{crate_diagnostic_items, diagnostic_items};
@@ -78,7 +78,7 @@ fn crate_named(db: &TestDB, name: &str) -> Crate {
 fn function_name(db: &TestDB, owner: DefWithBodyId) -> String {
     match owner {
         DefWithBodyId::FunctionId(it) => {
-            it.lookup(db).source(db).value.name().unwrap().text().to_string()
+            it.lookup(db).source_view(db).value.name().unwrap().text().to_owned()
         }
         other => panic!("not a function: {other:?}"),
     }

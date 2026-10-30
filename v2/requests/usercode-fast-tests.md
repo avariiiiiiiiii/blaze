@@ -91,7 +91,7 @@ speed.
 
 > forwarded to cargo (told by tmux).
 
-> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test/traced.rs:34` (`Common::traced`, called from `serve/unit/test.rs:507`). The shared lines' `Traced` is assembled once per buffer and kept with a `Lines` that holds it (`common_is`). Each result assembles only its own lines and splices them in place (`Splice::put`, `:82`), then takes them out after `select::record`. A warm splice allocates nothing. Tests in `serve/unit/test/tests.rs:114` check it against one assembly over 2000 seeded splits.
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test/traced.rs:34` (`Common::traced`, called from `serve/unit/test.rs:510`). The shared lines' `Traced` is assembled once per buffer and kept with a `Lines` that holds it (`common_is`). Each result assembles only its own lines and splices them in place (`Splice::put`, `:82`), then takes them out after `select::record`. A warm splice allocates nothing. Tests in `serve/unit/test/tests.rs:101` check it against one assembly over 2000 seeded splits.
 
 ## usercode-fast-tests 6: parent (selection's callers): compute a test's identity once
 
@@ -164,7 +164,7 @@ From the allocation pass. Nothing in cargo breaks, as of today's tree:
 
 > forwarded to cargo (told by tmux).
 
-> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test.rs:607` (`self.finished(queue.drain(), ..)`; `finished` takes the drain as an iterator, `:477`) and `:427` (`Test::of(reached, ..)` by value). Cargo clones none of the types that are no longer `Clone`.
+> answered by lane cargo (cargo-inbox-tests): done at `crates/blaze-cargo/src/serve/unit/test.rs:610` (`self.finished(queue.drain(), ..)`; `finished` takes the drain as an iterator, `:480`) and `:427` (`Test::of(reached, ..)` by value). Cargo clones none of the types that are no longer `Clone`.
 
 ## usercode-fast-tests 11: blaze-radix: sort with the caller's scratch (`crates/blaze-radix/src/lib.rs`)
 

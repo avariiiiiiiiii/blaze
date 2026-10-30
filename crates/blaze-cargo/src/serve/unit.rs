@@ -26,10 +26,13 @@
 #![forbid(unsafe_code)]
 
 mod artifact;
+mod checks;
 mod codegen;
 mod compile;
+mod deps;
 mod files;
 mod graph;
+mod intent;
 mod reach;
 mod run;
 mod say;
@@ -40,7 +43,6 @@ mod test;
 mod tests;
 
 use std::{
-    any::Any,
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex, OnceLock, atomic::Ordering},
@@ -48,7 +50,9 @@ use std::{
 };
 
 use base_db::FileId;
-use blaze_api::{ApiError, Artifact, Reach, Table, TestResult, Ub, UnitOf, UnitTarget};
+use blaze_api::{ApiError, Artifact, CrateType, Reach, Response, Table, TargetKind, TestResult, Ub, UnitOf, UnitTarget};
+use blaze_cas::Store;
+use blaze_core::{Completion, Effect, Tag};
 use blaze_ids::ContentId;
 use blaze_units::{
     query::{BuildConfig, Fetch, Units},
@@ -60,14 +64,14 @@ use crate::serve::{
     Paths,
     fetch::Fetcher,
     work::{
-        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, KeptFront, Library, Reader, Runs, Selection,
-        Source, SourceFile, Steps, Writer,
+        Compiled, Failed, Front, FrontEnd, Goal, Image, JobInput, Kept, Library, Put, Runs, Selection, Source,
+        SourceFile, Steps, Writer,
     },
 };
 
 /// The build `blaze serve` runs: one for the daemon's life, shared by every job.
 pub struct Real {
-    fetcher: Fetcher,
+    fetcher: Fetcher<blaze_registry::http::HyperHttp>,
     shared: Arc<Shared>,
 }
 
@@ -127,6 +131,13 @@ fn stand_ins(dir: &std::path::Path, launcher: &std::path::Path) -> Result<(), St
 }
 
 impl Steps for Real {
+    type Front = JobFront;
+    type Writer = UnitWriter;
+    type Reader = UnitReader;
+    type KeptFront = KeptLowered;
+    type Linked = codegen::Linked;
+    type Runs = UnitRuns;
+
     fn fetch(&self, fetch: &Fetch) -> Result<Source, ApiError> {
         self.fetcher.fetch(fetch)
     }
@@ -149,14 +160,20 @@ impl Steps for Real {
         Ok(Library { at: named, fingerprint, source: Some(Source { files, under: String::new() }) })
     }
 
-    fn lower(&self, input: &JobInput, kept: Option<KeptFront>) -> Result<FrontEnd, Failed> {
+    fn lower(&self, input: &JobInput, kept: Option<KeptLowered>) -> Result<FrontEnd<Real>, Failed> {
         if input.cancelled.load(Ordering::Relaxed) {
             return Err(Failed::Again);
         }
-        let kept = kept.and_then(KeptFront::take::<KeptLowered>).filter(|it| {
-            (Arc::ptr_eq(&it.units, &input.units) || it.units == input.units) && it.config == input.config
-        });
-        let writer = cancellable(move || -> Result<UnitWriter, Failed> {
+        let writer = cancellable(move || -> Result<(UnitWriter, Vec<Put>), Failed> {
+            let mut kept = kept;
+            let mut puts = Vec::new();
+            if let Some(it) = &mut kept {
+                let later = std::mem::take(&mut it.later);
+                puts = deps::store(&it.lowered, it.deps.take(), &mut it.session, &later, &it.root)?;
+            }
+            let kept = kept.filter(|it| {
+                (Arc::ptr_eq(&it.units, &input.units) || it.units == input.units) && it.config == input.config
+            });
             let lower = || Lower {
                 units: &input.units,
                 config: &input.config,
@@ -165,12 +182,22 @@ impl Steps for Real {
                 host_cpu: self.shared.host_cpu.as_ref(),
             };
             let failed = |error| Failed::Error(lower_error(error));
-            let mut lowered = match kept {
-                Some(KeptLowered { mut lowered, .. }) => match lowered.refresh(lower()).map_err(failed)? {
-                    true => lowered,
-                    false => load_cargo::v2::lower(lower()).map_err(failed)?,
+            // A front end kept and moved to the view keeps what it was served: only crates of
+            // the build's dependencies were, and moving reads again only the view's files.
+            let (mut lowered, session) = match kept {
+                Some(KeptLowered { session, mut lowered, .. }) => match lowered.refresh(lower()).map_err(failed)? {
+                    true => (lowered, Some(session)),
+                    false => {
+                        drop((session, lowered));
+                        (load_cargo::v2::lower(lower()).map_err(failed)?, None)
+                    }
                 },
-                None => load_cargo::v2::lower(lower()).map_err(failed)?,
+                None => (load_cargo::v2::lower(lower()).map_err(failed)?, None),
+            };
+            let fresh = session.is_none();
+            let mut session = match session {
+                Some(session) => session,
+                None => deps::session(&lowered, &input.store)?,
             };
             let job = Arc::new(Job::new(input.clone(), lowered.crates().clone(), self.shared.clone()));
             let waits = graph::Waits::new(&job.graph);
@@ -182,10 +209,25 @@ impl Steps for Real {
                     identify(&mut lowered, &job, unit);
                 }
             }
-            Ok(UnitWriter { front: Arc::new(lowered), job, waits, ready: Vec::new(), runs: Vec::new(), macros: Vec::new() })
+            let mut deps = None;
+            if fresh {
+                deps::serve(&mut lowered, &job, &deps::ready(&job, &waits), &mut session, &mut deps)?;
+            }
+            let writer = UnitWriter {
+                session,
+                front: Arc::new(lowered),
+                job,
+                waits,
+                ready: Vec::new(),
+                runs: Vec::new(),
+                macros: Vec::new(),
+                deps,
+            };
+            Ok((writer, puts))
         })??;
-        let front: Arc<dyn Front> = Arc::new(JobFront(writer.job.clone()));
-        Ok(FrontEnd { front, writer: Box::new(writer) })
+        let (writer, puts) = writer;
+        let front = Arc::new(JobFront(writer.job.clone()));
+        Ok(FrontEnd { front, writer, puts })
     }
 }
 
@@ -195,22 +237,39 @@ fn lower_error(error: load_cargo::v2::LowerError) -> ApiError {
 
 /// A job's front end as the loop keeps it ([`Writer::keep`]), with what it was lowered from:
 /// the next build of the head lowers into it only when it lowers the same.
-struct KeptLowered {
+pub(crate) struct KeptLowered {
+    /// What its database keeps of the store ([`deps::session`]), its goals flushed when the
+    /// next build lowers into it. Declared first: its goal store is uninstalled before the
+    /// database it is keyed to drops.
+    session: deps::Session,
     lowered: Lowered,
     units: Arc<Units>,
     config: Arc<BuildConfig>,
+    /// What it was served with, until the next build lowering into it stores the images.
+    deps: Option<deps::Kept>,
+    /// The dependency crates its build checked, and the workspace root their outcomes'
+    /// paths are named from, until the next build lowering into it stores them.
+    later: Vec<deps::Later>,
+    root: String,
 }
 
-/// What a task reads the front end through ([`Reader`]): a shared reference to the job's
+/// What a task reads the front end through ([`Steps::Reader`]): a shared reference to the job's
 /// lowered front end, as it stood when the loop posted the task. Its database is read by
 /// reference, never cloned.
 pub(crate) struct UnitReader {
     front: Arc<Lowered>,
+    /// The dependencies' check outcomes its database was served ([`deps::serve`]): written
+    /// with the front end, only while no reader holds it.
+    checks: Arc<blaze_diagnostics::cache::Served>,
 }
 
 impl UnitReader {
     pub(crate) fn db(&self) -> &Db {
         self.front.db()
+    }
+
+    pub(crate) fn checks(&self) -> &blaze_diagnostics::cache::Served {
+        &self.checks
     }
 
     /// The job's files by path.
@@ -223,20 +282,25 @@ impl UnitReader {
 /// the writes asked for and not yet applied, and as each build script's run is applied, the
 /// identities of the units it was the last run in the closure of.
 pub(crate) struct UnitWriter {
+    /// What the front end's database keeps of the store ([`deps::session`]), declared first
+    /// as in [`KeptLowered`].
+    session: deps::Session,
     front: Arc<Lowered>,
     job: Arc<Job>,
     waits: graph::Waits,
-    /// The units a run made ready, reused from run to run.
+    /// The units the runs of one apply made ready, reused from apply to apply.
     ready: Vec<u32>,
     /// Build scripts' runs asked for, checked, in the order asked.
     runs: Vec<(usize, Ran)>,
     /// Proc macros' loads asked for, checked, in the order asked.
     macros: Vec<(usize, ProcMacroLoadResult)>,
+    /// What a front end freshly lowered was served with ([`deps::serve`]).
+    deps: Option<deps::Kept>,
 }
 
-impl Writer for UnitWriter {
-    fn reader(&self) -> Option<Reader> {
-        (!self.waiting()).then(|| Reader::new(UnitReader { front: Arc::clone(&self.front) }))
+impl Writer<Real> for UnitWriter {
+    fn reader(&self) -> Option<UnitReader> {
+        (!self.waiting()).then(|| UnitReader { front: Arc::clone(&self.front), checks: self.session.checks() })
     }
 
     fn ran(&mut self, run: usize, ran: Ran) -> Result<(), ApiError> {
@@ -263,13 +327,18 @@ impl Writer for UnitWriter {
         for (unit, macros) in self.macros.drain(..) {
             lowered.macros(unit, macros).map_err(lower_error)?;
         }
+        self.ready.clear();
         for (run, ran) in self.runs.drain(..) {
             lowered.ran(run, &ran).map_err(lower_error)?;
-            self.ready.clear();
+            let from = self.ready.len();
             self.waits.applied(run as u32, &mut self.ready);
-            for &unit in &self.ready {
+            for &unit in &self.ready[from..] {
                 identify(lowered, &self.job, unit);
             }
+        }
+        // A front end freshly lowered was served; the units these runs made ready are served too.
+        if self.deps.is_some() && !self.ready.is_empty() {
+            deps::serve(lowered, &self.job, &self.ready, &mut self.session, &mut self.deps)?;
         }
         Ok(true)
     }
@@ -282,13 +351,30 @@ impl Writer for UnitWriter {
         cancellable(|| lowered.tables())
     }
 
-    fn keep(mut self: Box<Self>) -> Option<KeptFront> {
+    fn finished(&mut self) -> Result<(), ApiError> {
+        self.deps.as_ref().map_or(Ok(()), deps::differences)
+    }
+
+    fn served(&self) -> Result<Vec<blaze_api::ServedCrate>, ApiError> {
+        deps::served(self.front.db(), &self.job, &self.session)
+    }
+
+    fn keep(mut self) -> Option<KeptLowered> {
         if !matches!(self.apply(), Ok(true)) {
             return None;
         }
-        let UnitWriter { front, job, .. } = *self;
+        let UnitWriter { session, front, job, deps, .. } = self;
         let lowered = Arc::into_inner(front)?;
-        Some(KeptFront::new(KeptLowered { lowered, units: job.input.units.clone(), config: job.input.config.clone() }))
+        let later = std::mem::take(&mut *job.later.lock().unwrap_or_else(|it| it.into_inner()));
+        Some(KeptLowered {
+            session,
+            lowered,
+            units: job.input.units.clone(),
+            config: job.input.config.clone(),
+            deps,
+            later,
+            root: job.mounted.root().to_owned(), // alloc: once per front end kept
+        })
     }
 }
 
@@ -409,6 +495,9 @@ pub(crate) struct Job {
     pub(crate) ub: OnceLock<test::UbTests>,
     /// When the job's front was made: the clock the test queue is given.
     pub(crate) began: Instant,
+    /// The dependency crates checked this build, kept with the front end until the head's next
+    /// build stores their outcomes ([`deps::store`]); one write per such crate.
+    later: Mutex<Vec<deps::Later>>,
 }
 
 impl Job {
@@ -433,7 +522,22 @@ impl Job {
             build_time: OnceLock::new(),
             ub: OnceLock::new(),
             began: Instant::now(),
+            later: Mutex::new(Vec::new()), // alloc: setup, once per job; grows once per dependency crate checked
         }
+    }
+
+    /// Dependency crate `krate`, checked this build with the lint flags `flags`, whose outcome
+    /// `diags` is stored once the front end's images are ([`deps::store`]); `refused` is why
+    /// the outcome can't be stored ([`blaze_diagnostics::cache::encode`]), for the build's
+    /// report ([`deps::served`]).
+    pub(crate) fn check_later(
+        &self,
+        krate: base_db::Crate,
+        flags: Vec<String>,
+        diags: Vec<blaze_diagnostics::Diag>,
+        refused: Option<String>,
+    ) {
+        self.later.lock().unwrap_or_else(|it| it.into_inner()).push(deps::Later { krate, flags, diags, refused });
     }
 
     pub(crate) fn units(&self) -> &Units {
@@ -459,13 +563,19 @@ impl Job {
         package_of(self.units(), unit)
     }
 
-    /// The unit a diagnostic of `unit` is of, as cargo's JSON names it.
-    pub(crate) fn unit_of(&self, unit: &Unit) -> Result<UnitOf, ApiError> {
+    /// The unit a diagnostic of unit `at` is of, as cargo's JSON names it, with its index in
+    /// the request's units.
+    pub(crate) fn unit_of(&self, at: usize) -> Result<UnitOf, ApiError> {
+        let unit = self.unit(at)?;
         let package = self.package(unit)?;
+        let id = u32::try_from(at)
+            .map_err(|_| ApiError::new(format!("unit {at} is past the 2^32 units a request can name"), None))?;
         Ok(UnitOf {
+            id,
+            test: matches!(unit.mode, Mode::Test) || (matches!(unit.mode, Mode::Check) && unit.checked_as_test),
             package_id: unit.pkg_id.clone(),
             manifest_path: package.manifest_path.clone(),
-            target: unit_target(unit),
+            target: unit_target(unit)?,
         })
     }
 
@@ -496,19 +606,35 @@ pub(crate) fn package_of<'a>(
         .ok_or_else(|| ApiError::new(format!("the build has no package `{}`", unit.pkg_id), None))
 }
 
-/// A unit's target, as cargo's JSON messages give it.
-pub(crate) fn unit_target(unit: &Unit) -> UnitTarget {
+/// A unit's target, as cargo's JSON messages give it. Its kind is cargo's first word for it
+/// (any word but `bin`, `test`, `bench`, `example` and `custom-build` is a library's crate
+/// type); a crate type blaze doesn't know is an error naming it, as rustc refuses it.
+pub(crate) fn unit_target(unit: &Unit) -> Result<UnitTarget, ApiError> {
     let target = &unit.target;
-    UnitTarget {
-        kind: target.kind.clone(),
-        crate_types: target.crate_types.clone(),
+    let Some(first) = target.kind.first() else {
+        return Err(ApiError::new(format!("target `{}` has no kind in cargo's unit graph", target.name), None));
+    };
+    let kind = TargetKind::named(first).unwrap_or(TargetKind::Lib);
+    let crate_types = target
+        .crate_types
+        .iter()
+        .map(|word| {
+            CrateType::named(word).ok_or_else(|| {
+                // alloc: error path
+                ApiError::new(format!("target `{}` has the crate type `{word}`, which rustc doesn't know", target.name), None)
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(UnitTarget {
+        kind,
+        crate_types,
         name: target.name.clone(),
         src_path: target.src_path.to_string_lossy().into_owned(),
         edition: target.edition.clone(),
         doc: target.doc,
         doctest: target.doctest,
         test: target.test,
-    }
+    })
 }
 
 /// Whether the job stops `unit` after the front end: a check, or every unit of `cargo check`.
@@ -519,11 +645,7 @@ pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
 /// A job's front as the loop holds it.
 pub(crate) struct JobFront(pub(crate) Arc<Job>);
 
-impl Front for JobFront {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
+impl Front<Real> for JobFront {
     fn fresh(&self, unit: usize) -> bool {
         match self.0.unit(unit).map(|it| it.mode) {
             Ok(Mode::RunCustomBuild) => script::fresh(&self.0, unit),
@@ -532,29 +654,26 @@ impl Front for JobFront {
         }
     }
 
-    fn compile(&self, reader: Reader, unit: usize, images: &mut Vec<Image>) -> Result<Compiled, Failed> {
-        let reader: UnitReader = reader.take();
+    fn compile(&self, reader: UnitReader, unit: usize, images: &mut Vec<Image<Real>>) -> Result<Compiled, Failed> {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
         cancellable(|| compile::compile(&self.0, &reader, unit, images))?
     }
 
-    fn script(&self, unit: usize, tags: u64) -> Result<Box<dyn Runs>, ApiError> {
-        script::start(&self.0, unit, tags)
+    fn script(&self, unit: usize, tags: u64) -> Result<UnitRuns, ApiError> {
+        script::start(&self.0, unit, tags).map(UnitRuns::Script)
     }
 
-    fn tests(&self, built: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<Box<dyn Runs>, ApiError> {
-        test::start(&self.0, built, selection, tags)
+    fn tests(&self, built: &[Artifact], selection: Selection<'_>, tags: u64) -> Result<UnitRuns, ApiError> {
+        test::start(&self.0, built, selection, tags).map(UnitRuns::Tests)
     }
 
-    fn ub_tests(&self, reader: Reader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
-        let reader: UnitReader = reader.take();
+    fn ub_tests(&self, reader: UnitReader, selection: Selection<'_>) -> Result<Vec<String>, Failed> {
         cancellable(|| test::ub_tests(&self.0, &reader, selection))?
     }
 
-    fn evaluate(&self, reader: Reader, test: &str, ub: Ub) -> Result<TestResult, Failed> {
-        let reader: UnitReader = reader.take();
+    fn evaluate(&self, reader: UnitReader, test: &str, ub: Ub) -> Result<TestResult, Failed> {
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
@@ -567,38 +686,44 @@ impl Front for JobFront {
         bin: Option<&str>,
         args: &[String],
         tags: u64,
-    ) -> Result<Box<dyn Runs>, ApiError> {
-        run::start(&self.0, built, bin, args, tags)
+    ) -> Result<UnitRuns, ApiError> {
+        run::start(&self.0, built, bin, args, tags).map(UnitRuns::Program)
     }
 
     fn reach(
         &self,
-        reader: Reader,
-        from: &dyn Front,
-        from_reader: Reader,
+        after: UnitReader,
+        from: &JobFront,
+        before: UnitReader,
         changes: &[blaze_vfs::Change],
     ) -> Result<Reach, Failed> {
-        let Some(from) = from.as_any().downcast_ref::<JobFront>() else {
-            return Err(Failed::Error(ApiError::new(
-                "the view to reach from was not lowered by this daemon's build",
-                None,
-            )));
-        };
-        let after: UnitReader = reader.take();
-        let before: UnitReader = from_reader.take();
         if self.0.cancelled() {
             return Err(Failed::Again);
         }
         cancellable(|| reach::reach(&from.0, before.db(), &self.0, after.db(), changes))?
     }
 
-    fn codegen_inputs(&self, reader: Reader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
+    fn edit(&self, reader: UnitReader, edits: &[blaze_api::Edit]) -> Result<blaze_api::Edited, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        cancellable(|| intent::edit(&self.0, &reader, edits))?
+    }
+
+    fn ahead(&self, reader: UnitReader, filter: &[String]) -> Result<Vec<u32>, Failed> {
+        if self.0.cancelled() {
+            return Err(Failed::Again);
+        }
+        cancellable(|| intent::ahead(&self.0, &reader, filter))?
+    }
+
+    fn codegen_inputs(&self, reader: UnitReader) -> Result<Vec<(ContentId, ContentId)>, Failed> {
         // Read from the units' records in the store: the front end is not asked.
-        drop(reader.take::<UnitReader>());
+        drop(reader);
         cancellable(|| compile::codegen_inputs(&self.0))?
     }
 
-    fn tables(&self, mut writer: Box<dyn Writer>, images: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
+    fn tables(&self, mut writer: UnitWriter, images: &[(&'static str, u64, u64)]) -> Result<Vec<Table>, Failed> {
         let mut counted = writer.tables()?;
         counted.extend_from_slice(images);
         Ok(summed(counted))
@@ -609,9 +734,60 @@ impl Kept for codegen::Linked {
     fn tables(&self) -> Vec<(&'static str, u64, u64)> {
         codegen::Linked::tables(self)
     }
+}
 
-    fn into_any(self: Box<Self>) -> Box<dyn Any + Send> {
-        self
+/// User code of a job, run on the loop: a build script's run, the build's tests, or its
+/// program.
+pub(crate) enum UnitRuns {
+    Script(script::ScriptRun),
+    Tests(test::TestRun),
+    Program(run::Program),
+}
+
+impl Runs<Real> for UnitRuns {
+    fn start(
+        &mut self,
+        store: &Store,
+        writer: Option<&mut UnitWriter>,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
+        match self {
+            UnitRuns::Script(it) => it.start(store, writer, effects, out),
+            UnitRuns::Tests(it) => it.start(store, writer, effects, out),
+            UnitRuns::Program(it) => it.start(store, writer, effects, out),
+        }
+    }
+
+    fn owns(&self, tag: Tag) -> bool {
+        match self {
+            UnitRuns::Script(it) => it.owns(tag),
+            UnitRuns::Tests(it) => it.owns(tag),
+            UnitRuns::Program(it) => it.owns(tag),
+        }
+    }
+
+    fn complete(
+        &mut self,
+        completion: Completion,
+        store: &mut Store,
+        writer: Option<&mut UnitWriter>,
+        effects: &mut Vec<Effect>,
+        out: &mut Vec<Response>,
+    ) -> Option<bool> {
+        match self {
+            UnitRuns::Script(it) => it.complete(completion, store, writer, effects, out),
+            UnitRuns::Tests(it) => it.complete(completion, store, writer, effects, out),
+            UnitRuns::Program(it) => it.complete(completion, store, writer, effects, out),
+        }
+    }
+
+    fn cancel(&mut self, effects: &mut Vec<Effect>) -> Option<bool> {
+        match self {
+            UnitRuns::Script(it) => it.cancel(effects),
+            UnitRuns::Tests(it) => it.cancel(effects),
+            UnitRuns::Program(it) => it.cancel(effects),
+        }
     }
 }
 

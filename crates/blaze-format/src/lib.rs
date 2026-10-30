@@ -20,7 +20,9 @@
 //! record names one by [`SpanRef`].
 
 pub mod cursor;
+pub mod hex;
 pub mod leb;
+mod placed;
 mod raw;
 mod schema;
 pub mod tiers;
@@ -36,6 +38,7 @@ use blaze_ids::{ContentId, Fingerprint};
 use serde::{Deserialize, Serialize};
 
 pub use crate::schema::{Part, SCHEMA_DOMAIN, schema, schema_of};
+pub use crate::placed::Placed;
 
 #[cfg(target_endian = "big")]
 compile_error!("blaze's format is little-endian, as every target blaze runs on is");

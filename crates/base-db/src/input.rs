@@ -13,6 +13,7 @@ use std::sync::{Mutex, PoisonError};
 use std::{fmt, mem, ops};
 
 use blaze_ids::{ContentId, Hasher, radix};
+use blaze_mem::Frame;
 use cfg::{CfgOptions, HashableCfgOptions};
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
@@ -501,7 +502,8 @@ pub struct CrateData<Id> {
     /// declared in source via `extern crate test`.
     pub dependencies: Vec<Dependency<Id>>,
     pub origin: CrateOrigin,
-    /// Extra crate-level attributes, including the surrounding `#![]`.
+    /// The crate attributes given on the command line (rustc's `-Z crate-attr`), each with
+    /// `#![` and `]` around it: each is a file of its own, see [`crate::crate_attrs`].
     pub crate_attrs: Box<[Box<str>]>,
     pub target_kind: TargetKind,
     /// The crate types it is built as (rustc's `--crate-type`s): cargo's target's
@@ -657,6 +659,13 @@ pub struct Crate {
     #[get(content_field)]
     #[set(set_content_field)]
     content: InputId,
+    /// The files of its crate attributes ([`crate::crate_attrs`]), kept with its data: not in
+    /// its content ID, which has the attributes' text.
+    #[default]
+    #[returns(ref)]
+    #[get(attr_files_field)]
+    #[set(set_attr_files_field)]
+    attr_files: Box<[FileId]>,
 }
 
 impl Crate {
@@ -707,13 +716,16 @@ impl Crate {
         durability: Durability,
     ) -> Crate {
         let content = Crate::content_of(&*db, &data, &extra, &workspace, &cfg, &env);
-        Crate::builder(data, extra, workspace, cfg, env, InputId(content))
+        let krate = Crate::builder(data, extra, workspace, cfg, env, InputId(content))
             .durability(durability)
-            .new(&*db)
+            .new(&*db);
+        db.set_crate_attr_files(krate, false, Some(durability));
+        krate
     }
 
     pub fn set_data(self, db: &mut Db, data: BuiltCrateData) {
         self.set_data_field(db).to(data);
+        db.set_crate_attr_files(self, false, None);
         refresh_contents(db, self);
     }
 
@@ -870,61 +882,87 @@ fn refresh_content(db: &mut Db, krate: Crate) -> bool {
 }
 
 impl Crate {
-    /// Returns an iterator over all transitive dependencies of the given crate,
-    /// including the crate itself.
+    /// The crate and every crate it depends on, directly or not, in the order a walk from it
+    /// first reaches them.
     ///
     /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
-    pub fn transitive_deps(self, db: &Db) -> Vec<Crate> {
-        // There is a bit of duplication here and in `CrateGraphBuilder` in the same method, but it's not terrible
-        // and removing that is a bit difficult.
-        // alloc: a walk of the crate graph (setup; the method says not to call it from hir).
-        let mut worklist = vec![self];
-        let mut deps_seen = FxHashSet::default();
-        // alloc: as above.
-        let mut deps = Vec::new();
+    pub fn transitive_deps(self, db: &Db) -> &[Crate] {
+        transitive_deps(db, self)
+    }
 
+    /// The crate and every crate that depends on it, directly or not, in the order a walk from
+    /// it first reaches them.
+    ///
+    /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
+    pub fn transitive_rev_deps(self, db: &Db) -> &[Crate] {
+        transitive_rev_deps(db, self)
+    }
+}
+
+#[salsa::tracked(returns(deref))]
+fn transitive_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+        let mut worklist = Vec::new_in(frame);
+        worklist.push(krate);
+        let mut seen: hashbrown::HashSet<Crate, FxBuildHasher, &Frame> =
+            hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
+        let mut deps = Vec::new_in(frame);
         while let Some(krate) = worklist.pop() {
-            if !deps_seen.insert(krate) {
+            if !seen.insert(krate) {
                 continue;
             }
             deps.push(krate);
-
             worklist.extend(krate.data(db).dependencies.iter().map(|dep| dep.crate_id));
         }
-        deps
-    }
+        Box::from(&deps[..]) // alloc: the memo's value at its size.
+    })
+}
 
-    /// Returns all transitive reverse dependencies of the given crate,
-    /// including the crate itself.
-    ///
-    /// **Warning**: do not use this query in `hir-*` crates! It kills incrementality across crate metadata modifications.
-    pub fn transitive_rev_deps(self, db: &Db) -> Box<[Crate]> {
-        // alloc: a walk of the crate graph (setup; the method says not to call it from hir).
-        let mut worklist = vec![self];
-        let mut rev_deps = FxHashSet::default();
-        rev_deps.insert(self);
-
-        let mut inverted_graph = FxHashMap::<_, Vec<_>>::default();
-        all_crates(db).iter().for_each(|&krate| {
-            krate
-                .data(db)
-                .dependencies
-                .iter()
-                .for_each(|dep| inverted_graph.entry(dep.crate_id).or_default().push(krate))
-        });
-
-        while let Some(krate) = worklist.pop() {
-            if let Some(crate_rev_deps) = inverted_graph.get(&krate) {
-                crate_rev_deps
-                    .iter()
-                    .copied()
-                    .filter(|&rev_dep| rev_deps.insert(rev_dep))
-                    .for_each(|rev_dep| worklist.push(rev_dep));
+#[salsa::tracked(returns(deref))]
+fn transitive_rev_deps(db: &Db, krate: Crate) -> Box<[Crate]> {
+    blaze_mem::frame::task(blaze_mem::Tag::Query, |frame| {
+        let all = all_crates(db);
+        // The reverse edges as CSR: for each crate (by its place in `all`), the crates that
+        // depend on it.
+        let mut place: hashbrown::HashMap<Crate, u32, FxBuildHasher, &Frame> =
+            hashbrown::HashMap::with_capacity_and_hasher_in(all.len(), FxBuildHasher, frame);
+        place.extend(all.iter().enumerate().map(|(at, &krate)| (krate, at as u32)));
+        let starts = frame.alloc_slice_fill_with(all.len() + 1, |_| 0u32);
+        for &from in all.iter() {
+            for dep in &from.data(db).dependencies {
+                starts[place[&dep.crate_id] as usize + 1] += 1;
             }
         }
-
-        rev_deps.into_iter().collect::<Box<_>>()
-    }
+        for at in 1..starts.len() {
+            starts[at] += starts[at - 1];
+        }
+        let next = frame.alloc_slice_copy(&starts[..all.len()]);
+        let edges = frame.alloc_slice_fill_with(starts[all.len()] as usize, |_| krate);
+        for &from in all.iter() {
+            for dep in &from.data(db).dependencies {
+                let to = place[&dep.crate_id] as usize;
+                edges[next[to] as usize] = from;
+                next[to] += 1;
+            }
+        }
+        let seen = frame.alloc_slice_fill_with(all.len(), |_| false);
+        let mut order = Vec::new_in(frame);
+        let mut worklist = Vec::new_in(frame);
+        worklist.push(krate);
+        seen[place[&krate] as usize] = true;
+        while let Some(krate) = worklist.pop() {
+            order.push(krate);
+            let at = place[&krate] as usize;
+            for &rev_dep in &edges[starts[at] as usize..starts[at + 1] as usize] {
+                let slot = &mut seen[place[&rev_dep] as usize];
+                if !*slot {
+                    *slot = true;
+                    worklist.push(rev_dep);
+                }
+            }
+        }
+        Box::from(&order[..]) // alloc: the memo's value at its size.
+    })
 }
 
 /// The mapping from [`UniqueCrateData`] to their [`Crate`] input. Read and written only by
@@ -1025,6 +1063,11 @@ impl CrateGraphBuilder {
             );
         }
 
+        for &krate in old_all_crates.iter() {
+            if !all_crates.contains(&krate) {
+                db.set_crate_attr_files(krate, true, Some(Durability::MEDIUM));
+            }
+        }
         if old_all_crates.len() != all_crates.len()
             || old_all_crates.iter().any(|&krate| !all_crates.contains(&krate))
         {
@@ -1165,6 +1208,7 @@ impl CrateGraphBuilder {
                     input
                 }
             };
+            db.set_crate_attr_files(crate_input, false, Some(Durability::MEDIUM));
             all_crates.insert(crate_input);
             visited.insert(source, crate_input);
             crate_input

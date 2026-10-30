@@ -14,7 +14,7 @@ use hir_def::{
 };
 use std::cell::RefCell;
 
-use rustc_hash::FxHashMap;
+use crate::mem::FMap;
 use rustc_type_ir::inherent::IntoKind;
 
 use hir_ty::{
@@ -60,7 +60,7 @@ pub(crate) struct ValueCx<'a, 'db> {
     pub(crate) store: &'a ExpressionStore,
     pub(crate) infer: &'a InferenceResult<'db>,
     /// What each `const` item's value has, asked once as rustc's `mir_const_qualif` query.
-    pub(crate) consts: &'a RefCell<FxHashMap<ConstId, Qualifs>>,
+    pub(crate) consts: &'a RefCell<FMap<'a, ConstId, Qualifs>>,
 }
 
 /// rustc stops at no depth; this does where a value nests deeper than any real one.
@@ -108,7 +108,7 @@ impl<'db> ValueCx<'_, 'db> {
                 if self.infer.variant_resolution_for_expr(expr).is_some()
                     && !matches!(ty.kind(), TyKind::FnDef(..))
                 {
-                    return self.aggregate(ty, &[], depth);
+                    return self.aggregate(ty, std::iter::empty(), depth);
                 }
                 let of_ty = self.of_ty(ty);
                 match self.const_item(expr) {
@@ -121,14 +121,13 @@ impl<'db> ValueCx<'_, 'db> {
             }
             Expr::Array(Array::Repeat { initializer, .. }) => self.value(initializer, depth + 1),
             Expr::RecordLit { fields, spread: RecordSpread::None, .. } => {
-                let parts: Vec<_> = fields.iter().map(|it| it.expr).collect();
-                self.aggregate(ty, &parts, depth)
+                self.aggregate(ty, fields.iter().map(|it| it.expr), depth)
             }
             Expr::Call { callee, args }
                 if matches!(self.infer.expr_ty(callee).kind(), TyKind::FnDef(def, _)
                     if !matches!(def.0, hir_def::CallableDefId::FunctionId(_))) =>
             {
-                self.aggregate(ty, args, depth)
+                self.aggregate(ty, args.iter().copied(), depth)
             }
             Expr::Ref { expr: inner, .. } => self.borrowed(inner, depth + 1),
             Expr::Cast { expr: inner, .. }
@@ -156,9 +155,14 @@ impl<'db> ValueCx<'_, 'db> {
     /// rustc's `Rvalue::Aggregate`: a struct or variant is made of its fields unless it is
     /// a union, or its type has a `Drop` impl (for `NeedsDrop`) or is `UnsafeCell` (for
     /// `HasMutInterior`), which have what any value of the type has.
-    fn aggregate(&self, ty: Ty<'db>, parts: &[ExprId], depth: usize) -> Qualifs {
+    fn aggregate(
+        &self,
+        ty: Ty<'db>,
+        parts: impl Iterator<Item = ExprId>,
+        depth: usize,
+    ) -> Qualifs {
         let parts =
-            || parts.iter().fold(Qualifs::default(), |acc, &it| acc.or(self.value(it, depth + 1)));
+            || parts.fold(Qualifs::default(), |acc, it| acc.or(self.value(it, depth + 1)));
         let TyKind::Adt(def, _) = ty.kind() else { return parts() };
         let id = def.def_id();
         if matches!(id, AdtId::UnionId(_)) {

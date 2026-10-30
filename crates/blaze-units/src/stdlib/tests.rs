@@ -131,6 +131,44 @@ fn the_profile_decides_its_cfgs() {
     assert!(target_cfg(triple, &builtin).is_err());
 }
 
+// rustc sets `cfg(sanitize = "..")` itself for each sanitizer `-Z sanitizer` turns on, lists
+// adding up; no `cfg(sanitizer_cfi_*)` without `cfi`, which blaze refuses.
+#[test]
+fn a_sanitizer_is_a_cfg() {
+    let triple = "x86_64-unknown-linux-gnu";
+    let flags = |words: &[&str]| CfgArgs::from_flags(&words.iter().map(|it| (*it).to_owned()).collect::<Vec<_>>());
+    let sanitized = |words: &[&str]| -> Vec<String> {
+        let cfgs = target_cfg(triple, &flags(words).unwrap()).unwrap();
+        cfgs.into_iter().filter(|it| it.starts_with("sanitize")).collect()
+    };
+    assert_eq!(sanitized(&[]), Vec::<String>::new());
+    assert_eq!(sanitized(&["-Zsanitizer=address"]), ["sanitize=\"address\""]);
+    assert_eq!(sanitized(&["-Z", "sanitizer=thread", "-Zsanitizer=thread"]), ["sanitize=\"thread\""]);
+    assert_eq!(
+        sanitized(&["-Zsanitizer=memory", "-Zsanitizer-memory-track-origins", "-Z", "sanitizer_recover=memory"]),
+        ["sanitize=\"memory\""]
+    );
+    assert_eq!(sanitized(&["-Zsanitizer-recover=address"]), Vec::<String>::new());
+    assert_eq!(
+        flags(&["-Zsanitizer=address", "-Zsanitizer=thread"]).unwrap_err(),
+        "`-Zsanitizer=address` is incompatible with `-Zsanitizer=thread`"
+    );
+    assert_eq!(
+        flags(&["-Zsanitizer=thread,memory"]).unwrap_err(),
+        "`-Zsanitizer=memory` is incompatible with `-Zsanitizer=thread`"
+    );
+    assert!(flags(&["-Zsanitizer=cfi"]).unwrap_err().contains("the `cfi` sanitizer"));
+    assert!(flags(&["-Zsanitizer=nope"]).unwrap_err().contains("no sanitizer `nope`"));
+    assert!(flags(&["-Zsanitizer"]).unwrap_err().contains("comma-separated list"));
+    // cargo-fuzz's flags beside the sanitizer decide no cfg.
+    assert_eq!(
+        sanitized(&["-Zsanitizer=address", "-Cpasses=sancov-module", "-Cllvm-args=-sanitizer-coverage-level=4"]),
+        ["sanitize=\"address\""]
+    );
+    // A `--cfg` of it is rustc's to set, not the user's.
+    assert!(target_cfg(triple, &flags(&["--cfg", "sanitize=\"address\""]).unwrap()).is_err());
+}
+
 #[test]
 fn a_proc_macro_of_a_static_target_has_no_crt_static() {
     let triple = "x86_64-unknown-linux-musl";

@@ -81,7 +81,7 @@ pub fn answer(
     db: &Db,
     crates: &[Crate],
     root: &Path,
-    path_of: &dyn Fn(FileId) -> Option<PathBuf>,
+    path_of: &impl Fn(FileId) -> Option<PathBuf>,
     ask: &Ask,
 ) -> Answer {
     let name_of = |file: FileId| -> Option<String> {
@@ -156,7 +156,7 @@ fn setup(package: &Package) -> Result<Setup, String> {
 fn written<'a>(
     found: impl Iterator<Item = &'a Found>,
     sources: &mut Sources,
-    read: &dyn Fn(&str) -> Option<String>,
+    read: impl Fn(&str) -> Option<String>,
     style: Style,
 ) -> Vec<Message> {
     let found: Vec<&Found> = found.collect();

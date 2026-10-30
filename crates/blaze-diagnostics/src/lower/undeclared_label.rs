@@ -10,7 +10,10 @@
 
 use hir::{HirFileId, InFile};
 use span::SyntaxContext;
-use syntax::{AstNode, SyntaxNode, TextRange, ast, ast::HasLoopBody};
+use syntax::{
+    TextRange,
+    view::{self as ast, AstNode as _, HasLoopBody as _},
+};
 
 use crate::{
     cx::Cx,
@@ -20,23 +23,26 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UndeclaredLabel) -> Vec<Found> {
-    let node = cx.node(d.node);
-    let name = node.value.text().to_owned();
+    let node = cx.node_view(d.node);
+    let name = node.value.text();
     let span = cx.span_of_ptr(d.node);
-    let mut diag = match resolve(cx, &node.map(|it| it.syntax().clone()), &name) {
+    let mut diag = match resolve(cx, node.map(|it| it.syntax()), name) {
         Resolution::Unreachable { defined, similar } => {
-            unreachable_label::unreachable(cx, span, &name, Some(defined), similar)
+            unreachable_label::unreachable(cx, span, name, Some(defined), similar)
         }
-        Resolution::Undeclared { similar } => undeclared(cx, span, &name, similar),
-        Resolution::Found => undeclared(cx, span, &name, None),
+        Resolution::Undeclared { similar } => undeclared(cx, span, name, similar),
+        Resolution::Found => undeclared(cx, span, name, None),
     };
     code_fact(cx, &mut diag, d.node.map(|it| it.syntax_node_ptr()));
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Resolve)]
 }
 
 /// rustc's `UndeclaredLabel`.
 fn undeclared(cx: &Cx<'_, '_>, span: crate::model::Span, name: &str, similar: Option<Similar>) -> Diag {
+    // alloc: clone: the error's parts, for an error hir found
     let mut diag = Diag::error(Some("E0426"), format!("use of undeclared label `{name}`"), span.clone());
+    // alloc: clone: the error's parts, for an error hir found
     diag.span_label(span.clone(), format!("undeclared label `{name}`"));
     match similar {
         Some(similar) if similar.reachable => {
@@ -67,8 +73,8 @@ pub(crate) enum Resolution {
 
 /// A rib of rustc's label ribs: a label, or a barrier labels are not reachable through
 /// (a function, a closure, an `async` or `gen` block, a constant).
-enum Rib {
-    Label(ast::Lifetime),
+enum Rib<'t> {
+    Label(ast::Lifetime<'t>),
     Barrier,
 }
 
@@ -77,13 +83,13 @@ enum Rib {
 /// one is similar only in the same syntax context (`eq_ctxt`). The ribs are read as the walk
 /// goes up, innermost first, and it stops at the label used; a label's syntax context is
 /// looked up only when its name is the one used or like it.
-pub(crate) fn resolve(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, name: &str) -> Resolution {
+pub(crate) fn resolve<'db>(cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>, name: &str) -> Resolution {
     let used = ctxt(cx, node.file_id, node.value.text_range());
     let used_hygiene = used.opaque_and_semiopaque(cx.db);
     let mut similar: Option<Similar> = None;
     let mut reachable = true;
     for (it, child) in edges(cx, node) {
-        let lifetime = match rib(&it.value, &child.value) {
+        let lifetime = match rib(it.value, child.value) {
             None => continue,
             Some(Rib::Barrier) => {
                 reachable = false;
@@ -107,6 +113,7 @@ pub(crate) fn resolve(cx: &Cx<'_, '_>, node: &InFile<SyntaxNode>, name: &str) ->
             };
         }
         if close && ctxt == used {
+            // alloc: the error's text, for an error hir found
             similar = Some(Similar { name: label.to_owned(), at, reachable });
         }
     }
@@ -119,9 +126,9 @@ fn ctxt(cx: &Cx<'_, '_>, file: HirFileId, range: TextRange) -> SyntaxContext {
 }
 
 /// The label rib `it` makes for what is in its `child`, if any.
-fn rib(it: &SyntaxNode, child: &SyntaxNode) -> Option<Rib> {
-    let label = |label: Option<ast::Label>| Some(Rib::Label(label?.lifetime()?));
-    match ast::Expr::cast(it.clone()) {
+fn rib<'t>(it: ast::Node<'t>, child: ast::Node<'_>) -> Option<Rib<'t>> {
+    let label = |label: Option<ast::Label<'t>>| Some(Rib::Label(label?.lifetime()?));
+    match ast::Expr::cast(it) {
         Some(ast::Expr::LoopExpr(loop_)) => label(loop_.label()),
         Some(ast::Expr::WhileExpr(loop_)) => label(loop_.label()),
         Some(ast::Expr::ForExpr(loop_)) => {
@@ -144,7 +151,7 @@ fn rib(it: &SyntaxNode, child: &SyntaxNode) -> Option<Rib> {
                 || ast::Const::can_cast(it.kind())
                 || ast::Static::can_cast(it.kind())
                 || ast::ConstArg::can_cast(it.kind())
-                || ast::ArrayExpr::cast(it.clone()).is_some_and(|array| {
+                || ast::ArrayExpr::cast(it).is_some_and(|array| {
                     array.semicolon_token().is_some() && array.exprs().nth(1).is_some_and(|len| len.syntax() == child)
                 });
             barrier.then_some(Rib::Barrier)

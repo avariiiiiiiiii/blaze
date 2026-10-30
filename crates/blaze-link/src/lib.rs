@@ -32,6 +32,7 @@ mod stage;
 mod state;
 mod symbols;
 mod table;
+pub mod target;
 mod unwind;
 mod wasm;
 mod write;
@@ -53,10 +54,10 @@ use blaze_items::ItemKey;
 use blaze_mem::Frame;
 use rustc_hash::FxHashMap;
 
-pub use output::{Debug, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
+pub use output::{Debug, DevRun, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
 pub use position::{COLUMN, LINE, Position, SpanTable};
 
-use commit::{Pending, Revert, Undo, Writes};
+use commit::{Pending, Undo, Writes};
 use model::{Formats, NativeFile, Plan, Writer};
 use stage::{Contents, Stage};
 use state::{State, has_table};
@@ -165,6 +166,9 @@ impl Image {
             // alloc: error path
             return Err(fail(format!("live patching of {:?} images", output.format)));
         }
+        if let Some(dev_run) = &output.dev_run {
+            dev_run_fits(&output, dev_run, &plan, &writer).map_err(fail)?;
+        }
         // alloc: once per image, the name its next file is written at
         let next = FileName::new(&format!("{}.blaze-next", to.as_str()))
             // alloc: error path
@@ -243,6 +247,7 @@ impl Image {
         stage.inputs(&change)?;
         stage.apply(&change)?;
         stage.descriptor();
+        stage.start_hook()?;
         stage.resolve()?;
         stage.referrers();
         stage.needs()?;
@@ -283,32 +288,32 @@ impl Image {
     /// Makes `staged` the image, all at once, through effects: the new file renamed over the
     /// old, then the message to running programs. Completions go to [`Image::complete`].
     pub fn commit(&mut self, staged: Staged, effects: &mut Vec<Effect>) -> Result<(), LinkError> {
-        if self.pending.is_some() {
-            return Err(LinkError { function: None, what: "a commit is in flight".into() });
-        }
-        if staged.base != self.state.generation {
-            return Err(LinkError {
-                function: None,
-                // alloc: error path
-                what: format!(
-                    "staged on generation {}, and the image is at {}: stage it again",
-                    staged.base, self.state.generation
-                ),
-            });
-        }
+        self.can_commit(&staged)?;
         let full = staged.writes.full;
         let steps = self.steps(staged.writes)?;
-        self.generations = self.generations.max(staged.state.generation);
-        let before = std::mem::replace(&mut self.state, staged.state);
-        let revert = if before.laid_out {
-            let len = before.file_len;
-            self.remember(Undo { state: before, full, len, writes: staged.undo });
-            Revert::Pop
-        } else {
-            Revert::Keep(before)
-        };
+        let revert = self.take(staged.state, full, staged.undo);
         self.begin(steps, revert, effects);
         Ok(())
+    }
+
+    /// Makes `staged` the image at once, its file's bytes written into `memory`'s image part at
+    /// their file offsets as [`Image::commit`] would write the file, each range published: a
+    /// dev run's executable, written once from the memory and overlaid by it
+    /// ([`blaze_inproc::CodeMemory`]). The image's first commit is into a new memory; each
+    /// later one into the memory that holds its last, which keeps zeros past the file's end.
+    /// The history is [`Image::commit`]'s, so [`Image::roll_back_into`] undoes it. Gives the
+    /// encoded message for running programs that the file commit writes (`None` for the
+    /// image's first commit, which no program runs yet, and without [`Output::live`]).
+    pub fn commit_into(
+        &mut self,
+        staged: Staged,
+        memory: &mut blaze_inproc::CodeMemory,
+    ) -> Result<Option<Vec<u8>>, LinkError> {
+        self.can_commit(&staged)?;
+        self.write_into(&staged.writes, memory)?;
+        let message = staged.writes.message.map(|(_, bytes)| bytes);
+        self.take(staged.state, staged.writes.full, staged.undo);
+        Ok(message)
     }
 
     /// Back to the image before the last commit: a patch that panicked, or one whose borrow
@@ -317,30 +322,22 @@ impl Image {
     /// them back too; their changes are then staged again without the refused body. A commit
     /// in flight must complete first.
     pub fn roll_back(&mut self, effects: &mut Vec<Effect>) -> Result<(), LinkError> {
-        if self.pending.is_some() {
-            return Err(LinkError { function: None, what: "a commit is in flight".into() });
-        }
-        let Some(undo) = self.history.back() else {
-            return Err(LinkError { function: None, what: "no commit to roll back".into() });
-        };
-        let from = self.state.generation;
-        let to = undo.state.generation;
-        let message = self.output.live.as_ref().map(|_| {
-            (from, blaze_live::patch::Message::RollBack { id: self.state.lineage, to }.encode())
-        });
-        let writes = Writes {
-            full: undo.full,
-            len: undo.len,
-            old_len: self.state.file_len,
-            writes: file::restore(&undo.state, undo.full, &undo.writes),
-            remove: message.is_some().then_some(to),
-            message,
-        };
+        let writes = self.roll_back_writes()?;
         let steps = self.steps(writes)?;
-        let Undo { state, full, len, writes } = self.history.pop_back().expect("looked at above");
-        let current = std::mem::replace(&mut self.state, state);
-        self.begin(steps, Revert::Push { state: current, full, len, writes }, effects);
+        let revert = self.take_undo();
+        self.begin(steps, revert, effects);
         Ok(())
+    }
+
+    /// [`Image::roll_back`] into the code memory the image is committed into
+    /// ([`Image::commit_into`]): the undo's bytes written and published there, the image back
+    /// at once. Gives the encoded message for running programs that the file rollback writes
+    /// (`None` without [`Output::live`]).
+    pub fn roll_back_into(&mut self, memory: &mut blaze_inproc::CodeMemory) -> Result<Option<Vec<u8>>, LinkError> {
+        let writes = self.roll_back_writes()?;
+        self.write_into(&writes, memory)?;
+        self.take_undo();
+        Ok(writes.message.map(|(_, bytes)| bytes))
     }
 
     pub fn slot(&self, function: &InstanceKey) -> Option<Slot> {
@@ -386,6 +383,7 @@ pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, by
     let output = Output {
         format,
         arch,
+        // alloc: a fuzz target's setup, once per input
         kind: OutputKind::Executable { entry: "_start".to_owned() },
         interpreter: None,
         platform: (format == Format::MachO).then_some(Platform { platform: 1, minimum: 0x000b_0000, sdk: 0x000b_0000 }),
@@ -395,6 +393,8 @@ pub fn fuzz_read(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, by
         tags: 0,
         stack: None,
         windows_subsystem: false,
+        dev_run: None,
+        triple: match (format, arch) { (Format::Elf, blaze_codegen::Arch::Aarch64) => "aarch64-unknown-linux-gnu", (Format::Elf, _) => "x86_64-unknown-linux-gnu", (Format::MachO, blaze_codegen::Arch::X86_64) => "x86_64-apple-darwin", (Format::MachO, _) => "aarch64-apple-darwin", (Format::Pe, _) => "x86_64-pc-windows-msvc", (Format::Wasm, _) => "wasm32-unknown-unknown" }.into(),
     };
     model::writer(&output).is_ok_and(|writer| writer.read("fuzz", bytes, &kind).is_ok())
 }
@@ -455,6 +455,34 @@ pub fn default_libraries(output: &Output, natives: &[Native<'_>]) -> Result<Vec<
     }
     out.retain(|it| !left_out.iter().any(|gone| gone.eq_ignore_ascii_case(it)));
     Ok(out)
+}
+
+/// The address space a dev run's reservations may take in all: what a process has below
+/// its 48-bit (x86-64, AArch64) top half.
+const ADDRESS_SPACE: u64 = 1 << 47;
+
+/// Why `output` can't be the dev run `dev_run` asks for: a shared image (only an executable
+/// has a start hook), a format with none, or reservations past a process's address space.
+fn dev_run_fits(output: &Output, dev_run: &DevRun, plan: &Plan, writer: &Formats) -> Result<(), String> {
+    if let OutputKind::Shared { name, .. } = &output.kind {
+        // alloc: error path
+        return Err(format!("a dev run of the shared image {name}: only an executable starts in the dev runtime"));
+    }
+    writer.start_hook()?;
+    let mut total: u64 = 0;
+    for (what, size) in [("arena", dev_run.arena), ("cells", dev_run.cells), ("fixed maps", dev_run.fixed)] {
+        match blaze_mem::align::checked_align_up_u64(size, plan.page).and_then(|it| total.checked_add(it)) {
+            Some(sum) if sum <= ADDRESS_SPACE => total = sum,
+            _ => {
+                // alloc: error path
+                return Err(format!(
+                    "the dev run's reservations, with {size:#x} bytes for the {what}, take more than a process's \
+                     {ADDRESS_SPACE:#x} bytes of address space"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What an image is across its generations: its first full link's pieces and inputs. Once

@@ -6,6 +6,7 @@ use std::mem::{self, MaybeUninit};
 use std::ptr::{self, NonNull};
 use std::slice;
 
+use blaze_mem::{Column, Region, Tag};
 use memo::MemoTable;
 use rustc_hash::FxHashMap;
 
@@ -26,9 +27,80 @@ const MAX_PAGES: usize = Id::MAX_USIZE / PAGE_LEN;
 pub(crate) struct PageView<'p, T: Slot>(&'p Page, PhantomData<&'p T>);
 
 pub struct Table {
-    pages: boxcar::Vec<Page>,
+    /// Declared before the arenas, so dropped first: a page's drop drops its slots in place,
+    /// in an arena.
+    pages: Column<Page>,
     /// Map from ingredient to non-full pages that are up for grabs
     non_full_pages: Mutex<FxHashMap<IngredientIndex, Vec<PageIndex>>>,
+    /// The slots of pages of a type tagged `Query`: inputs and tracked structs.
+    query_slots: PageArena,
+    /// The slots of pages of a type tagged `Intern`: interned values.
+    intern_slots: PageArena,
+}
+
+/// The most address space one arena of slot pages reserves: 64 GB, committed only as pages are
+/// made.
+const SLOT_BYTES: usize = 1 << 36;
+
+/// The slot pages of one tag, in one reserved region: bumped by one compare-and-swap per page
+/// (per 128 slots), never moved, and freed with the table.
+struct PageArena {
+    region: Region,
+    used: AtomicUsize,
+}
+
+impl PageArena {
+    fn new(tag: Tag) -> PageArena {
+        PageArena {
+            region: Region::reserve(SLOT_BYTES, tag).unwrap_or_else(|err| {
+                panic!("salsa: reserving the table's `{tag}` slot pages: {err}")
+            }),
+            used: AtomicUsize::new(0),
+        }
+    }
+
+    /// Committed, uninitialized room for one page of `layout`, the caller's until the arena
+    /// drops.
+    fn alloc(&self, layout: Layout) -> NonNull<()> {
+        assert!(
+            layout.align() <= blaze_mem::page_size(),
+            "salsa: a slot type is aligned past a page"
+        );
+        let mut used = self.used.load(Ordering::Relaxed);
+        let end = loop {
+            let start = used.next_multiple_of(layout.align());
+            let end = start + layout.size();
+            match self
+                .used
+                .compare_exchange_weak(used, end, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => break end,
+                Err(now) => used = now,
+            }
+        };
+        self.region.ensure(end).unwrap_or_else(|err| {
+            panic!(
+                "salsa: committing a page of `{}` slots: {err}",
+                self.region.tag()
+            )
+        });
+        self.region.at(end - layout.size()).cast::<()>()
+    }
+}
+
+/// The arena for pages of `T`, by its tag.
+fn arena_of<'a, T: Slot>(query: &'a PageArena, intern: &'a PageArena) -> &'a PageArena {
+    match T::MEM_TAG {
+        Tag::Query => query,
+        Tag::Intern => intern,
+        other => panic!("salsa: table slots are tagged `Query` or `Intern`, not `{other}`"),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn page_missing(page: usize) -> ! {
+    panic!("salsa: page `{page}` is not allocated")
 }
 
 /// # Safety
@@ -53,6 +125,10 @@ pub unsafe trait Slot: Any + Send + Sync {
 
     /// Mutably access the [`MemoTable`] for this slot.
     fn memos_mut(&mut self) -> &mut MemoTable;
+
+    /// The subsystem the table's pages of these slots count against: `Query`, or `Intern` for
+    /// interned values.
+    const MEM_TAG: Tag = Tag::Query;
 }
 
 /// [Slot::memos]
@@ -71,9 +147,10 @@ struct SlotVTable {
     memos_mut: SlotMemosMutFnErased,
     /// The type name of what is stored as entries in data.
     type_name: fn() -> &'static str,
-    /// A drop impl to call when the own page drops
-    /// SAFETY: The caller is required to supply a valid pointer to a `Box<PageDataEntry<T>>`, and
-    /// the correct initialized length, memo types and the page's first memo row.
+    /// Drops the page's slots in place; their memory is the arena's, freed with the table.
+    /// SAFETY: The caller is required to supply the page's data pointer (a `PageData<T>` in a
+    /// [`PageArena`]), and the correct initialized length, memo types and the page's first memo
+    /// row, once.
     drop_impl:
         unsafe fn(data: *mut (), initialized: usize, memo_types: &MemoTableTypes, first_row: u32),
 }
@@ -83,13 +160,13 @@ impl SlotVTable {
         const {
             &Self {
                 drop_impl: |data, initialized, memo_types, first_row| {
-                    // SAFETY: The caller is required to provide a valid data pointer.
-                    let data = unsafe { Box::from_raw(data.cast::<PageData<T>>()) };
+                    let data = data.cast::<PageDataEntry<T>>();
                     for i in 0..initialized {
-                        let item = data[i].get().cast::<T>();
-                        // SAFETY: The caller is required to provide a valid initialized length,
-                        // and the page's first row, so slot `i`'s row is `first_row + i`.
+                        // SAFETY: The caller provides the page's data, its initialized length and
+                        // its first row, so entry `i` is in the page and holds an initialized `T`
+                        // that nothing else drops, and its row is `first_row + i`.
                         unsafe {
+                            let item = (*data.add(i)).get().cast::<T>();
                             memo_types
                                 .attach_memos_mut(first_row + i as u32, (*item).memos_mut())
                                 .drop();
@@ -120,8 +197,8 @@ struct Page {
     /// Number of elements of `data` that are initialized.
     allocated: AtomicUsize,
 
-    /// The potentially uninitialized data of this page. As we initialize new entries, we increment `allocated`.
-    /// This is a box allocated `PageData<SlotType>`
+    /// The potentially uninitialized data of this page, a `PageData<SlotType>` in its tag's
+    /// [`PageArena`]. As we initialize new entries, we increment `allocated`.
     data: NonNull<()>,
 
     /// A vtable for the slot type stored in this page.
@@ -176,19 +253,40 @@ impl SlotIndex {
 impl Default for Table {
     fn default() -> Self {
         Self {
-            // alloc: setup, once per database
-            pages: boxcar::Vec::new(),
+            pages: Column::new(MAX_PAGES, Tag::Query)
+                .unwrap_or_else(|err| panic!("salsa: reserving the table's page list: {err}")),
             non_full_pages: Default::default(),
+            query_slots: PageArena::new(Tag::Query),
+            intern_slots: PageArena::new(Tag::Intern),
         }
     }
 }
 
 impl Table {
+    #[inline]
+    fn page_at(&self, page: usize) -> &Page {
+        match self.pages.get(page as u32) {
+            Some(page) => page,
+            None => page_missing(page),
+        }
+    }
+
+    fn arena<T: Slot>(&self) -> &PageArena {
+        arena_of::<T>(&self.query_slots, &self.intern_slots)
+    }
+
+    fn push(&self, page: Page) -> usize {
+        match self.pages.push(page) {
+            Ok(index) => index as usize,
+            Err(err) => panic!("salsa: adding a page to the table: {err}"),
+        }
+    }
+
     /// Returns the [`IngredientIndex`] for an [`Id`].
     #[inline]
     pub fn ingredient_index(&self, id: Id) -> IngredientIndex {
         let (page_idx, _) = split_id(id);
-        self.pages[page_idx.0].ingredient
+        self.page_at(page_idx.0).ingredient
     }
 
     /// Get a reference to the data for `id`, which must have been allocated from this table with type `T`.
@@ -219,7 +317,7 @@ impl Table {
 
     /// Returns the number of pages that have been allocated.
     pub fn page_count(&self) -> usize {
-        self.pages.count()
+        self.pages.len()
     }
 
     #[cfg(feature = "salsa_unstable")]
@@ -255,7 +353,7 @@ impl Table {
     /// If `page` is out of bounds or the type `T` is incorrect.
     #[inline]
     pub(crate) fn page<T: Slot>(&self, page: PageIndex) -> PageView<'_, T> {
-        self.pages[page.0].assert_type::<T>()
+        self.page_at(page.0).assert_type::<T>()
     }
 
     /// Force initialize the page at the given index.
@@ -276,14 +374,15 @@ impl Table {
         ingredient: IngredientIndex,
         memo_types: &Arc<MemoTableTypes>,
     ) {
-        let page = self.pages.get_mut(page_idx.0);
+        let page = self.pages.get_mut(page_idx.0 as u32);
 
         match page {
             Some(page) => {
                 // Initialize the page if was created using `push_uninit_page`.
                 if page.slot_type_id == TypeId::of::<DummySlot>() {
-                    // alloc: one page and one `Arc` count per 128 slots, when a page fills
-                    *page = Page::new::<T>(ingredient, memo_types.clone());
+                    let arena = arena_of::<T>(&self.query_slots, &self.intern_slots);
+                    // alloc: one `Arc` count per page; the page's slots are in its tag's arena
+                    *page = Page::new::<T>(ingredient, memo_types.clone(), arena);
                 }
 
                 // Ensure the page has the correct type.
@@ -315,7 +414,7 @@ impl Table {
         ingredient: IngredientIndex,
         memo_types: Arc<MemoTableTypes>,
     ) -> PageIndex {
-        PageIndex::new(self.pages.push(Page::new::<T>(ingredient, memo_types)))
+        PageIndex::new(self.push(Page::new::<T>(ingredient, memo_types, self.arena::<T>())))
     }
 
     /// Allocate an uninitialized page.
@@ -324,10 +423,11 @@ impl Table {
     pub(crate) fn push_uninit_page(&self) -> PageIndex {
         // Note that `DummySlot` is a ZST, so the memory wasted by any pages of ingredients
         // that were not serialized should be negligible.
-        PageIndex::new(self.pages.push(Page::new::<DummySlot>(
+        PageIndex::new(self.push(Page::new::<DummySlot>(
             IngredientIndex::new(0),
-            // alloc: one page and one `Arc` count per 128 slots, when a page fills
+            // alloc: one `Arc` per placeholder page, when persistence restores a database
             Arc::new(MemoTableTypes::default()),
+            self.arena::<DummySlot>(),
         )))
     }
 
@@ -347,7 +447,7 @@ impl Table {
         current_revision: Revision,
     ) -> MemoTableWithTypes<'_> {
         let (page, slot) = split_id(id);
-        let page = self.pages[page.0].assert_type::<T>();
+        let page = self.page_at(page.0).assert_type::<T>();
         let slot_data = &page.data()[slot.0];
 
         // Validates the slot (a tracked struct's read lock); the row doesn't wait for it.
@@ -369,7 +469,7 @@ impl Table {
     /// owning this table.
     pub unsafe fn dyn_memos(&self, id: Id, current_revision: Revision) -> MemoTableWithTypes<'_> {
         let (page, slot) = split_id(id);
-        let page = &self.pages[page.0];
+        let page = self.page_at(page.0);
         // SAFETY: We supply a proper slot pointer and the caller is required to pass the `current_revision`.
         let _ = unsafe { (page.slot_vtable.memos)(page.get(slot), current_revision) };
         // SAFETY: `slot` is an allocated slot of this page (`Page::get` checked it).
@@ -384,7 +484,7 @@ impl Table {
     /// entire lifetime of the returned table and any references obtained from it.
     pub(crate) unsafe fn dyn_memos_unchecked(&self, id: Id) -> MemoTableWithTypes<'_> {
         let (page, slot) = split_id(id);
-        let page = &self.pages[page.0];
+        let page = self.page_at(page.0);
         page.assert_allocated(slot);
         // SAFETY: `slot` is an allocated slot of this page, checked above; the caller prevents
         // its reuse and destruction.
@@ -398,7 +498,7 @@ impl Table {
     /// If `id` is not an allocated slot.
     pub(crate) fn memo_row(&self, id: Id) -> u32 {
         let (page, slot) = split_id(id);
-        let page = &self.pages[page.0];
+        let page = self.page_at(page.0);
         page.assert_allocated(slot);
         page.memo_row(slot)
     }
@@ -409,7 +509,7 @@ impl Table {
         let page_index = page.0;
         let page = self
             .pages
-            .get_mut(page_index)
+            .get_mut(page_index as u32)
             .unwrap_or_else(|| panic!("index `{page_index}` is uninitialized"));
         let row = page.memo_row(slot);
         // SAFETY: We supply a proper slot pointer and the caller is required to pass the `current_revision`.
@@ -425,8 +525,8 @@ impl Table {
         memo_index: impl Fn(IngredientIndex) -> Option<MemoIngredientIndex>,
         mut f: impl FnMut(MemoTableWithTypesMut<'_>, MemoIngredientIndex),
     ) {
-        for page_index in 0..self.pages.count() {
-            let Some(page) = self.pages.get_mut(page_index) else {
+        for page_index in 0..self.pages.len() {
+            let Some(page) = self.pages.get_mut(page_index as u32) else {
                 continue;
             };
             let Some(memo_ingredient_index) = memo_index(page.ingredient) else {
@@ -493,13 +593,13 @@ impl Table {
     }
 }
 
-struct ErasedSlots<'db> {
-    pages: boxcar::vec::Iter<'db, Page>,
+struct ErasedSlots<'db, P> {
+    pages: P,
     current_page: Option<(PageIndex, &'db Page, std::ops::Range<usize>)>,
     slot_type_id: TypeId,
 }
 
-impl Iterator for ErasedSlots<'_> {
+impl<'db, P: Iterator<Item = (u32, &'db Page)>> Iterator for ErasedSlots<'db, P> {
     type Item = (Id, *mut ());
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -524,7 +624,7 @@ impl Iterator for ErasedSlots<'_> {
             self.current_page = self.pages.find_map(|(page_index, page)| {
                 (page.slot_type_id == self.slot_type_id).then(|| {
                     (
-                        PageIndex::new(page_index),
+                        PageIndex::new(page_index as usize),
                         page,
                         0..page.allocated.load(Ordering::Acquire),
                     )
@@ -618,25 +718,11 @@ impl Page {
     }
 
     #[inline]
-    fn new<T: Slot>(ingredient: IngredientIndex, memo_types: Arc<MemoTableTypes>) -> Self {
-        #[cfg(not(feature = "shuttle"))]
-        let data: Box<PageData<T>> =
-            // alloc: one page and one `Arc` count per 128 slots, when a page fills
-            Box::new([const { UnsafeCell::new(MaybeUninit::uninit()) }; PAGE_LEN]);
-
-        #[cfg(feature = "shuttle")]
-        let data = {
-            // Avoid stack overflows when using larger shuttle types.
-            let data = (0..PAGE_LEN)
-                .map(|_| UnsafeCell::new(MaybeUninit::uninit()))
-                .collect::<Box<[PageDataEntry<T>]>>();
-
-            let data: *mut [PageDataEntry<T>] = Box::into_raw(data);
-
-            // SAFETY: `*mut PageDataEntry<T>` and `*mut [PageDataEntry<T>; N]` have the same layout.
-            unsafe { Box::from_raw(data.cast::<PageDataEntry<T>>().cast::<PageData<T>>()) }
-        };
-
+    fn new<T: Slot>(
+        ingredient: IngredientIndex,
+        memo_types: Arc<MemoTableTypes>,
+        arena: &PageArena,
+    ) -> Self {
         Self {
             ingredient,
             memo_columns: memo_types.columns(),
@@ -645,7 +731,7 @@ impl Page {
             slot_vtable: SlotVTable::of::<T>(),
             slot_type_id: TypeId::of::<T>(),
             allocated: AtomicUsize::new(0),
-            data: NonNull::from(Box::leak(data)).cast::<()>(),
+            data: arena.alloc(Layout::new::<PageData<T>>()),
         }
     }
 
@@ -737,4 +823,25 @@ pub fn split_id(id: Id) -> (PageIndex, SlotIndex) {
     let slot = index & PAGE_LEN_MASK;
     let page = index >> PAGE_LEN_BITS;
     (PageIndex::new(page), SlotIndex::new(slot))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pages_keep_their_order_and_their_arena() {
+        let table = Table::default();
+        let types = Arc::new(MemoTableTypes::default());
+        let first = table.push_page::<DummySlot>(IngredientIndex::new(3), types.clone());
+        let second = table.push_page::<DummySlot>(IngredientIndex::new(4), types);
+        assert_eq!((first.as_usize(), second.as_usize()), (0, 1));
+        assert_eq!(table.page_count(), 2);
+        assert_eq!(
+            table.ingredient_index(make_id(second, SlotIndex::new(0))),
+            IngredientIndex::new(4)
+        );
+        assert_eq!(table.query_slots.region.tag(), Tag::Query);
+        assert_eq!(table.intern_slots.region.tag(), Tag::Intern);
+    }
 }

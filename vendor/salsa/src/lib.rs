@@ -429,6 +429,7 @@ pub mod plumbing {
         transmute_data_ptr, views,
     };
     pub use crate::zalsa_local::ZalsaLocal;
+    pub use blaze_mem::Tag as MemTag;
 
     #[cfg(feature = "persistence")]
     pub use serde;

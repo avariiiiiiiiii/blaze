@@ -28,6 +28,7 @@ Why: hir-ide's checker is deleted at integration, and the editor's highlighting 
 from the same walk as the diagnostics. Told in tmux window `db-ty-next1`.
 
 > forwarded to db (window `db-next2`, told by tmux).
+> checked by db-audit-dbsub (2026-10-29 22:45): in the tree at `crates/hir/src/semantics.rs:42` and `crates/hir/src/source_analyzer.rs:51` (`use hir_ty_unsafeck::..`); `crates/hir/src/lib.rs` no longer re-exports `diagnostics::UnsafetyReason`, and `crates/hir/src/diagnostics.rs:743` re-exports `hir_ty_unsafeck::{UnsafeLint, UnsafetyReason}`.
 
 ## 3. diagnostics: `MissingUnsafe` and the new reasons
 
@@ -77,6 +78,7 @@ rustc requires `unsafe` for both (`ExprKind::{Place,Value}UnwrapUnsafeBinder`,
 unresolved macro, so blaze accepts nothing rustc rejects.
 
 > forwarded to db (window `db-next2`, told by tmux).
+> applied by db-expand: the hir-expand half, by db-expand-macros (2026-10-29): nothing to add. In core (read from the local nightly-2026-05-27 source; no rust-src of the pinned nightly-2026-10-27 is on this machine), core's `wrap_binder!`/`unwrap_binder!` are declarative `pub macro`s (`library/core/src/unsafe_binder.rs`) that expand to `builtin # wrap_binder(expr[, ty])` / `builtin # unwrap_binder(..)`, and hir-expand expands them already. The parse of that syntax (format: `parser` `builtin_expr`, `syntax`) and the store's `Expr::UnsafeBinderCast` (mem-format) are requested in `v2/requests/db-expand.md`, "`builtin # wrap_binder` / `builtin # unwrap_binder`".
 
 ## 5. db-ty (hir-ty inference): which paths resolved to a static
 
@@ -89,6 +91,16 @@ associated item or a function, through the resolver: every use of a local. With 
 is one bit test (`docs/v2/plan/lanes/db/speed-of-light-unsafeck.md`, "The gap").
 
 > forwarded to db (window `db-next2`, told by tmux).
+> db-ty-next3 (2026-10-29 ~22:20): **not needed in hir-ty.** Inference already records what
+> every value path resolved to, statics included: `InferenceResult::value_resolution(id:
+> ExprOrPatId) -> Option<ValueNs>` (`infer.rs`, written by `resolve_value_path` in
+> `infer/path.rs` for each path expression and pattern). So the change is in
+> `hir-ty-unsafeck/src/lib.rs` `check_static` alone (db-unsafeck's): after the early returns,
+> `let Some(ValueNs::StaticId(id)) = self.infer.value_resolution(current.into()) else { return };`
+> in place of the resolver, its scope guard and the hygiene lookup (and the `resolver` field
+> if nothing else reads it). A path inference could not resolve records nothing, so nothing is
+> reported for it, as rustc reports no unsafety for an unresolved path.
+> applied by db-audit-dbsub (2026-10-29 22:45): as db-ty-next3 wrote, in `crates/hir-ty-unsafeck/src/lib.rs` `check_static`: `self.infer.value_resolution(current.into())` in place of the resolver walk; the `resolver` field and the `HasResolver`/`ResolveValueResult`/`Resolver` imports go. `docs/v2/plan/lanes/db/speed-of-light-unsafeck.md` "The gap" becomes "Static paths". Not built.
 
 ## 6. Tools: `tools/v2/hot_lint.py` cannot read its `crates` field
 

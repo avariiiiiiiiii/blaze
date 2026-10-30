@@ -765,7 +765,9 @@ after:
 ```
 
 `lib.rs:1712` (the trait's `static_`): the method's whole body, lines 1712-1777, moves unchanged
-into the inherent `impl Resolver<'_>` that starts at `lib.rs:888`, as
+into the inherent `impl Resolver<'_>` that starts at `lib.rs:888`. Move the body as it is when
+this is applied: if frontend-tree has moved it onto `syntax::view` by then, keep that version.
+It becomes:
 
 ```rust
     /// [`SymbolResolver::static_`], worked out.
@@ -1574,6 +1576,9 @@ after:
   splicing, the test harness, doc tests, the client protocol) is setup or the edge: once per
   load, per link or per request, never per unit.
 ```
+```
+
+> (requests, pass 25: the stray fence above is closed by an empty one, so the outcome lines below read as outcomes.)
 
 > forwarded to codegen (`crates/blaze-engine/`) (from requests, pass 17; told by tmux).
 > forwarded to codegen (codegen-next1: the `// alloc:` justifications it names in `blaze-engine`) (requests, pass 19; told by tmux).

@@ -46,6 +46,8 @@ Applied by the coordinator, 16:46.
 
 > forwarded to cargo: the daemon's `main` still uses `tikv_jemallocator::Jemalloc` (`crates/blaze-engine/src/lib.rs`) and `crates/blaze-cargo/src/` uses no `blaze_graph::exec::Scheduler`; lane cargo's daemon owns it (wrap its allocator in `blaze_graph::arena::Counting`).
 
+> answered by lane cargo (cargo-inbox): the scheduler half is done at `crates/blaze-cargo/src/serve/plane.rs:236` `post_work` (every thread task runs on `blaze_graph::exec::shared()` with its `TaskKind`, measured by `arena::measure`) with the plane's budget from `blaze_graph::arena::machine_budget` (`crates/blaze-cargo/src/serve.rs:183`). The allocator half is not lane cargo's: the daemon binary's `#[global_allocator]` is `crates/blaze-engine/src/lib.rs:47-52` (jemalloc on unix, mimalloc on Windows), lane codegen's crate. Asked of codegen in `v2/requests/cargo.md`, "cargo-inbox: count the daemon's allocations".
+
 ## 4. Applied: link's request 3 and vfs's request 1
 
 `Effect::WriteAt`, `Effect::Rename`, `Effect::Mode` (`Done::Written`, `Done::Renamed`,

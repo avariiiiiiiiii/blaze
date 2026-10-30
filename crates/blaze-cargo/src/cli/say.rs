@@ -6,7 +6,33 @@
 
 use std::{fmt::Write as _, path::Path, time::Duration};
 
-use blaze_api::UnitTarget;
+use blaze_api::{TargetKind, UnitTarget, UnitTargetRef};
+
+/// What cargo's lines name a target by: its kind and its name. An owned target and one read in
+/// place ([`UnitTargetRef`]) both give it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Named<'a> {
+    pub kind: TargetKind,
+    pub name: &'a str,
+}
+
+impl<'a> From<&'a UnitTarget> for Named<'a> {
+    fn from(target: &'a UnitTarget) -> Named<'a> {
+        Named { kind: target.kind, name: &target.name }
+    }
+}
+
+impl<'a> From<UnitTargetRef<'a>> for Named<'a> {
+    fn from(target: UnitTargetRef<'a>) -> Named<'a> {
+        Named { kind: target.kind, name: target.name }
+    }
+}
+
+impl<'a> From<&UnitTargetRef<'a>> for Named<'a> {
+    fn from(target: &UnitTargetRef<'a>) -> Named<'a> {
+        Named { kind: target.kind, name: target.name }
+    }
+}
 
 /// cargo's `HEADER` and `GOOD` (`util/style.rs`): bright green, bold.
 pub const GOOD: &str = "\x1b[1m\x1b[92m";
@@ -18,7 +44,6 @@ pub const WARN: &str = "\x1b[1m\x1b[93m";
 pub const VALID: &str = "\x1b[1m\x1b[96m";
 /// cargo's `PLACEHOLDER`: cyan.
 pub const PLACEHOLDER: &str = "\x1b[36m";
-pub const BOLD: &str = "\x1b[1m";
 pub const RESET: &str = "\x1b[0m";
 
 /// `text` in `style` when `color`.
@@ -143,41 +168,45 @@ pub fn package(name: &str, version: &str, source: Option<&str>) -> String {
 
 /// A target as cargo's `Target::description_named` names it: `lib`, `bin "foo"`,
 /// `build script`.
-pub fn target_named(target: &UnitTarget) -> String {
+pub fn target_named<'a>(target: impl Into<Named<'a>>) -> String {
+    let target = target.into();
     let mut out = String::with_capacity(target.name.len() + 12);
     target_named_into(&mut out, target);
     out
 }
 
 /// [`target_named`] into `out`.
-pub fn target_named_into(out: &mut String, target: &UnitTarget) {
-    let kind = match target.kind.first().map(String::as_str) {
-        Some("custom-build") => return out.push_str("build script"),
-        Some(kind @ ("bin" | "test" | "bench" | "example")) => kind,
-        _ => return out.push_str("lib"),
+pub fn target_named_into<'a>(out: &mut String, target: impl Into<Named<'a>>) {
+    let target = target.into();
+    let kind = match target.kind {
+        TargetKind::CustomBuild => return out.push_str("build script"),
+        TargetKind::Lib => return out.push_str("lib"),
+        kind @ (TargetKind::Bin | TargetKind::Test | TargetKind::Bench | TargetKind::Example) => kind.name(),
     };
     out.push_str(kind);
     out.push_str(" \"");
-    out.push_str(&target.name);
+    out.push_str(target.name);
     out.push('"');
 }
 
 /// Whether a unit compiled with `--test` is named a test of its target: it is no test or bench
 /// target (cargo's `mode.is_rustc_test() && !(target.is_test() || target.is_bench())`).
-fn test_of(target: &UnitTarget, test: bool) -> bool {
-    test && !matches!(target.kind.first().map(String::as_str), Some("test" | "bench"))
+fn test_of(target: Named<'_>, test: bool) -> bool {
+    test && !matches!(target.kind, TargetKind::Test | TargetKind::Bench)
 }
 
 /// A unit as cargo's `descriptive_pkg_name` names it: `` `foo` (lib) ``, `` `foo` (lib test) ``
 /// for one compiled with `--test` that is no test or bench target.
-pub fn unit_named(package: &str, target: &UnitTarget, test: bool) -> String {
+pub fn unit_named<'a>(package: &str, target: impl Into<Named<'a>>, test: bool) -> String {
+    let target = target.into();
     let mut out = String::with_capacity(package.len() + target.name.len() + 20);
     unit_named_into(&mut out, package, target, test);
     out
 }
 
 /// [`unit_named`] into `out`.
-pub fn unit_named_into(out: &mut String, package: &str, target: &UnitTarget, test: bool) {
+pub fn unit_named_into<'a>(out: &mut String, package: &str, target: impl Into<Named<'a>>, test: bool) {
+    let target = target.into();
     out.push('`');
     out.push_str(package);
     out.push_str("` (");
@@ -219,16 +248,25 @@ pub struct Warned {
 /// suggestion) ``: what follows `warning:` for a unit with warnings, `None` for one without
 /// (`JobQueue::report_warning_count`). The hint is for a local unit that is no build script,
 /// and always names the package (cargo since "fix(check): ... always using -p").
-pub fn generated(package: &str, target: &UnitTarget, test: bool, local: bool, warned: Warned) -> Option<String> {
+pub fn generated<'a>(package: &str, target: impl Into<Named<'a>>, test: bool, local: bool, warned: Warned) -> Option<String> {
+    let target = target.into();
     let mut out = String::with_capacity(package.len() * 2 + target.name.len() + 96);
     generated_into(&mut out, package, target, test, local, warned).then_some(out)
 }
 
 /// [`generated`] into `out`; false, with nothing written, for a unit without warnings.
-pub fn generated_into(out: &mut String, package: &str, target: &UnitTarget, test: bool, local: bool, warned: Warned) -> bool {
+pub fn generated_into<'a>(
+    out: &mut String,
+    package: &str,
+    target: impl Into<Named<'a>>,
+    test: bool,
+    local: bool,
+    warned: Warned,
+) -> bool {
     if warned.total == 0 {
         return false;
     }
+    let target = target.into();
     unit_named_into(out, package, target, test);
     // Writing to a String cannot fail.
     let _ = match warned.total {
@@ -240,10 +278,9 @@ pub fn generated_into(out: &mut String, package: &str, target: &UnitTarget, test
         1 => write!(out, " (1 duplicate)"),
         n => write!(out, " ({n} duplicates)"),
     };
-    let custom_build = target.kind.first().is_some_and(|it| it == "custom-build");
     if let Some(fixable @ 1..) = warned.fixable
         && local
-        && !custom_build
+        && target.kind != TargetKind::CustomBuild
     {
         out.push_str(" (run `cargo fix --");
         target_named_into(out, target);
@@ -262,14 +299,22 @@ pub fn generated_into(out: &mut String, package: &str, target: &UnitTarget, test
 
 /// `` could not compile `foo` (lib) due to 1 previous error; 1 warning emitted ``: what follows
 /// `error:` for a unit that failed (`core/compiler/mod.rs`, `rustc`).
-pub fn could_not_compile(package: &str, target: &UnitTarget, test: bool, errors: u32, warnings: u32) -> String {
+pub fn could_not_compile<'a>(package: &str, target: impl Into<Named<'a>>, test: bool, errors: u32, warnings: u32) -> String {
+    let target = target.into();
     let mut out = String::with_capacity(package.len() + target.name.len() + 80);
     could_not_compile_into(&mut out, package, target, test, errors, warnings);
     out
 }
 
 /// [`could_not_compile`] into `out`.
-pub fn could_not_compile_into(out: &mut String, package: &str, target: &UnitTarget, test: bool, errors: u32, warnings: u32) {
+pub fn could_not_compile_into<'a>(
+    out: &mut String,
+    package: &str,
+    target: impl Into<Named<'a>>,
+    test: bool,
+    errors: u32,
+    warnings: u32,
+) {
     out.push_str("could not compile ");
     unit_named_into(out, package, target, test);
     // Writing to a String cannot fail.

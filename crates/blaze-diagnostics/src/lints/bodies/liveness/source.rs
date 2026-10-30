@@ -29,7 +29,7 @@ use hir_ty::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use rustc_type_ir::inherent::IntoKind as _;
 use syntax::{
-    AstNode as _, SyntaxNodePtr, TextRange,
+    AstNode as _, SmolStr, SyntaxNodePtr, TextRange, ToSmolStr as _,
     ast::{self, HasAttrs as _},
 };
 
@@ -139,14 +139,27 @@ impl Source {
     }
 }
 
-/// Where a binding is introduced: rustc's `BindingForm::Var` of its local.
+/// Where a binding is introduced: rustc's `BindingForm::Var` of its local. Its spans are
+/// made only for a lint ([`Var::def`], [`Var::introductions`]).
 pub(super) struct Var {
-    pub(super) name: String,
-    /// rustc's `def_span`: where the first pattern binding it is.
-    pub(super) def: Span,
+    pub(super) name: SmolStr,
+    /// The first pattern binding it.
     pub(super) node: InFile<SyntaxNodePtr>,
+    binding: BindingId,
+}
+
+impl Var {
+    /// rustc's `def_span`: where the first pattern binding it is.
+    pub(super) fn def(&self, b: &BodyCx<'_, '_>) -> Span {
+        introduction(b, self.node).0
+    }
+
     /// Each pattern binding it, and whether it is a field's shorthand (`S { x }`).
-    pub(super) introductions: Vec<(Span, bool)>,
+    pub(super) fn introductions(&self, b: &BodyCx<'_, '_>) -> Vec<(Span, bool)> {
+        let patterns = b.source_map.patterns_for_binding(self.binding);
+        // alloc: a lint's spans, made only once the binding is reported
+        patterns.iter().filter_map(|&pat| b.pat_node(pat)).map(|node| introduction(b, node)).collect()
+    }
 }
 
 /// The binding as rustc's MIR building introduces it, unless it was made by lowering
@@ -156,27 +169,15 @@ pub(super) fn var(b: &BodyCx<'_, '_>, binding: BindingId) -> Option<Var> {
     if data.name.is_missing() || data.name.is_generated() {
         return None;
     }
-    let mut introductions = Vec::new();
-    let mut first = None;
-    for &pat in b.source_map.patterns_for_binding(binding) {
-        let Some(node) = b.pat_node(pat) else { continue };
-        let (span, shorthand) = introduction(b, node);
-        first.get_or_insert(node);
-        introductions.push((span, shorthand));
-    }
-    let node = first?;
-    Some(Var {
-        name: data.name.display(b.db(), b.cx.edition).to_string(),
-        def: introductions[0].0.clone(),
-        node,
-        introductions,
-    })
+    let node = b.source_map.patterns_for_binding(binding).iter().find_map(|&pat| b.pat_node(pat))?;
+    Some(Var { name: data.name.display(b.db(), b.cx.edition).to_smolstr(), node, binding })
 }
 
 /// The span of a binding's pattern as rustc's THIR has it: from its start to the end of its
 /// name (`ref mut x` of `ref mut x @ Some(_)`), and whether it is a field's shorthand.
 fn introduction(b: &BodyCx<'_, '_>, node: InFile<SyntaxNodePtr>) -> (Span, bool) {
     let syntax = b.cx.syntax(node);
+    // clone: a node handle, a reference count, for a lint's span
     let Some(pat) = ast::IdentPat::cast(syntax.value.clone()) else { return (b.cx.span_of(node), false) };
     let range = syntax.value.text_range();
     let end = pat.name().map_or(range.end(), |it| it.syntax().text_range().end());
@@ -218,13 +219,22 @@ pub(super) fn assignment_span(
     Some((span, node))
 }
 
+/// Whether [`capture_name`] starts with `_`, without making it: a deref puts a `*` first,
+/// a field goes after the variable's name.
+pub(super) fn capture_underscored(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> bool {
+    !capture.place.projections.iter().any(|it| matches!(it.kind, ProjectionKind::Deref))
+        && b.store()[capture.captured_local()].name.display(b.db(), b.cx.edition).to_smolstr().starts_with('_')
+}
+
 /// rustc's `CapturedPlace::to_string`: the captured variable with what the capture
 /// projects out of it (`*x`, `x.field`, `x.0`).
 pub(super) fn capture_name(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> String {
     let db = b.db();
+    // alloc: for a lint's suggestion, once a lint is found
     let mut name = b.store()[capture.captured_local()].name.display(db, b.cx.edition).to_string();
     for (i, projection) in capture.place.projections.iter().enumerate() {
         match projection.kind {
+            // alloc: for a lint's suggestion, once a lint is found
             ProjectionKind::Deref => name = format!("*{name}"),
             ProjectionKind::Field { field_idx, variant_idx } => {
                 match capture.place.ty_before_projection(i).kind() {
@@ -239,9 +249,11 @@ pub(super) fn capture_name(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> Strin
                                 .unwrap_or_default(),
                         };
                         if let Some(field) = fields.get(field_idx as usize) {
+                            // alloc: for a lint's suggestion, once a lint is found
                             name = format!("{name}.{}", field.name(db).display(db, b.cx.edition));
                         }
                     }
+                    // alloc: for a lint's suggestion, once a lint is found
                     _ => name = format!("{name}.{field_idx}"),
                 }
             }
@@ -263,6 +275,7 @@ pub(super) fn capture_span(b: &BodyCx<'_, '_>, capture: &CapturedPlace) -> Optio
 /// nor the inline consts in it, which have MIR of their own.
 fn own_exprs(b: &BodyCx<'_, '_>, root: ExprId, mut f: impl FnMut(ExprId, Expr<'_>)) {
     let store = b.store();
+    // alloc: at most once per body, only once a binding no point reads is found
     let mut stack = vec![root];
     while let Some(expr) = stack.pop() {
         let it = store.expr(expr);
@@ -277,11 +290,13 @@ fn own_exprs(b: &BodyCx<'_, '_>, root: ExprId, mut f: impl FnMut(ExprId, Expr<'_
 /// The string literals of the body built from `root`, in source order, with their values:
 /// rustc's string constants of the MIR (`LiteralFinder`).
 pub(super) fn string_literals(b: &BodyCx<'_, '_>, root: ExprId) -> Vec<(Span, String)> {
+    // alloc: at most once per body, for an unused variable found
     let mut found = Vec::new();
     own_exprs(b, root, |expr, it| {
         if let Expr::Literal(Literal::String(value)) = it
             && let Some(span) = util::span(b, expr)
         {
+            // alloc: at most once per body, for an unused variable found
             found.push((span, value.as_str().to_owned()));
         }
     });
@@ -318,32 +333,41 @@ pub(super) fn pattern_typo<'db>(
     if let TyKind::Adt(def, _) = peeled.kind() {
         let units: Vec<(String, &'static str, hir::ModuleDef)> = match def.def_id() {
             AdtId::EnumId(it) => hir::Enum::from(it)
-                .variants(db)
-                .into_iter()
+                .variants_iter(db)
                 .filter(|it| it.kind(db) == hir::StructKind::Unit)
+                // alloc: for a lint's suggestion, once a lint is found
                 .map(|it| (it.name(db).as_str().to_owned(), "variant", hir::ModuleDef::EnumVariant(it)))
+                // alloc: for a lint's suggestion, once a lint is found
                 .collect(),
             AdtId::StructId(it) => {
                 let it = hir::Struct::from(it);
                 match it.kind(db) == hir::StructKind::Unit {
+                    // alloc: for a lint's suggestion, once a lint is found
                     true => vec![(it.name(db).as_str().to_owned(), "struct", hir::ModuleDef::Adt(hir::Adt::Struct(it)))],
+                    // alloc: for a lint's suggestion, once a lint is found
                     false => Vec::new(),
                 }
             }
+            // alloc: for a lint's suggestion, once a lint is found
             AdtId::UnionId(_) => Vec::new(),
         };
+        // alloc: for a lint's suggestion, once a lint is found
         let names: Vec<&str> = units.iter().map(|(name, ..)| name.as_str()).collect();
         if let Some(found) = crate::lints::edit_distance::find_best_match_for_name(&names, name, None)
             && let Some((item, kind, def)) = units.iter().find(|(it, ..)| it == found)
             && let Some(path) = untrimmed_path(b, *def)
         {
+            // clone: for a lint's suggestion, once a lint is found
             return Some((kind, item.clone(), path));
         }
     }
+    // alloc: for a lint's suggestion, once a lint is found
     let same: Vec<&(String, Ty<'db>, String)> = consts.iter().filter(|(_, it, _)| *it == ty).collect();
+    // alloc: for a lint's suggestion, once a lint is found
     let names: Vec<&str> = same.iter().map(|(name, ..)| name.as_str()).collect();
     let found = crate::lints::edit_distance::find_best_match_for_name(&names, name, None)?;
     let (item, _, path) = same.iter().find(|(it, ..)| it == found)?;
+    // clone: for a lint's suggestion, once a lint is found
     Some(("constant", item.clone(), path.clone()))
 }
 
@@ -352,9 +376,10 @@ pub(super) fn pattern_typo<'db>(
 pub(super) fn constants<'db>(b: &BodyCx<'_, 'db>) -> Vec<(String, Ty<'db>, String)> {
     let db = b.db();
     let here = hir::Module::from(b.owner.module(db));
+    // alloc: for a lint's suggestion, once a lint is found
     let mut found = Vec::new();
-    for module in b.cx.krate.modules(db) {
-        for def in module.declarations(db) {
+    for module in b.cx.krate.modules_iter(db) {
+        for def in module.declarations_iter(db) {
             let hir::ModuleDef::Const(it) = def else { continue };
             let Some(name) = it.name(db) else { continue };
             if !it.is_visible_from(db, here) {
@@ -362,6 +387,7 @@ pub(super) fn constants<'db>(b: &BodyCx<'_, 'db>) -> Vec<(String, Ty<'db>, Strin
             }
             let Some(ty) = db.value_ty(ValueTyDefId::ConstId(it.into())) else { continue };
             let Some(path) = untrimmed_path(b, def) else { continue };
+            // alloc: for a lint's suggestion, once a lint is found
             found.push((name.as_str().to_owned(), ty.skip_binder(), path));
         }
     }
@@ -379,6 +405,7 @@ fn untrimmed_path(b: &BodyCx<'_, '_>, def: hir::ModuleDef) -> Option<String> {
         allow_unstable: true,
     };
     let path = b.cx.krate.root_module(db).find_path(db, ItemInNs::Values(def), config)?;
+    // alloc: for a lint's suggestion, once a lint is found
     Some(path.display(db, b.cx.edition).to_string())
 }
 
@@ -400,18 +427,23 @@ pub(super) fn mut_reference_param(
     let Expr::Ref { expr: inner, rawness: hir_def::hir::Rawness::Ref, .. } = store.expr(value) else { return None };
     let node = b.pat_node(param)?;
     let at = |range: TextRange| b.cx.span(InFile::new(node.file_id, range));
+    // alloc: for a lint's suggestion, once a lint is found
     let mut parts = Vec::new();
     if ty.mut_token().is_none() {
         let pre = if ty.lifetime().is_some() { " " } else { "" };
         let inner_ty = ty.ty()?.syntax().text_range();
+        // alloc: for a lint's suggestion, once a lint is found
         parts.push((at(TextRange::empty(inner_ty.start())), format!("{pre}mut ")));
     }
     let name = pat.name()?.syntax().text_range();
+    // alloc: for a lint's suggestion, once a lint is found
     parts.push((at(TextRange::new(pat.syntax().text_range().start(), name.start())), String::new()));
     let lhs = b.pat_span(target)?;
+    // alloc: for a lint's suggestion, once a lint is found
     parts.push((lhs.shrink_to_lo(), "*".to_owned()));
     let rhs = util::span(b, value)?;
     let inner = util::span(b, inner)?;
+    // alloc: for a lint's suggestion, once a lint is found
     parts.push((rhs.with_hi(inner.lo), String::new()));
     Some(parts)
 }

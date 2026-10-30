@@ -13,6 +13,7 @@ use std::collections::hash_map::Entry;
 use std::path::Path;
 
 use blaze_manifest::Config;
+use blaze_manifest::files::Files;
 use blaze_manifest::config::CompileKind;
 use blaze_manifest::manifest::Manifest;
 use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
@@ -33,7 +34,7 @@ fn error(what: String) -> LoadError {
     LoadError { what, at: None }
 }
 
-pub(crate) struct PlanInput<'a> {
+pub(crate) struct PlanInput<'a, F: Files> {
     pub units: &'a [Unit],
     /// The standard library's units' plans, made by its own load; `None` for every other unit.
     pub std_plans: &'a [Option<UnitPlan>],
@@ -43,7 +44,7 @@ pub(crate) struct PlanInput<'a> {
     pub manifests: &'a FxHashMap<PackageId, (&'a Path, &'a Manifest)>,
     /// The graph's roots, as indexes of `units`.
     pub roots: &'a [usize],
-    pub config: &'a Config,
+    pub config: &'a Config<F>,
     pub intent: Intent,
     /// Whether the standard library is built (`-Zbuild-std`): only then do its units' hashes
     /// go into their dependents'.
@@ -68,14 +69,15 @@ pub(crate) struct PlanInput<'a> {
 }
 
 pub(crate) struct PlanOutput {
-    /// Of each unit, in the units' order.
-    pub plans: Vec<UnitPlan>,
+    /// Of each unit, in the units' order; `None` for one planned elsewhere, whose plan is its
+    /// `std_plans`' (moved in by the caller, which owns them).
+    pub plans: Vec<Option<UnitPlan>>,
     /// What cargo prints after `Finished`: "`dev` profile [unoptimized + debuginfo]".
     pub finished: String,
 }
 
 /// The rustflags of every unit for `triple` in a build for `target`.
-pub(crate) fn platform_rustflags(config: &Config, triple: &str, host: &str, target: Option<&str>) -> Result<Vec<String>, LoadError> {
+pub(crate) fn platform_rustflags<F: Files>(config: &Config<F>, triple: &str, host: &str, target: Option<&str>) -> Result<Vec<String>, LoadError> {
     let kind = match target {
         Some(target) if target == triple => Some(triple),
         _ if triple == host => None,
@@ -91,7 +93,7 @@ fn finished(requested: &str, opt_level: &str, debuginfo: bool) -> String {
     format!("`{requested}` profile [{opt}{debug}]")
 }
 
-pub(crate) fn plan(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
+pub(crate) fn plan<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadError> {
     plan_units(input).map_err(|mut error| {
         if error.at.is_none() {
             error.at = Some(input.ws_manifest.display().to_string());
@@ -118,6 +120,30 @@ struct Facts<'a> {
     profile: HashedProfile<'a>,
 }
 
+/// Each unit's dependencies in one column: unit `at`'s are
+/// `edges[starts[at] as usize..starts[at + 1] as usize]`, 4 bytes an edge and 4 a unit.
+struct Csr {
+    starts: Vec<u32>,
+    edges: Vec<u32>,
+}
+
+impl Csr {
+    fn with_capacity(units: usize, edges: usize) -> Csr {
+        let mut starts = Vec::with_capacity(units + 1);
+        starts.push(0);
+        Csr { starts, edges: Vec::with_capacity(edges) }
+    }
+
+    /// Ends the unit whose edges were pushed since the last.
+    fn close(&mut self) {
+        self.starts.push(self.edges.len() as u32);
+    }
+
+    fn of(&self, at: usize) -> &[u32] {
+        &self.edges[self.starts[at] as usize..self.starts[at + 1] as usize]
+    }
+}
+
 /// What every unit of a package planned here shares, made once per package.
 struct PackageFlags {
     env: Vec<(String, String)>,
@@ -128,8 +154,8 @@ struct PackageFlags {
 }
 
 /// What is the same for every unit.
-struct Shared<'a> {
-    input: &'a PlanInput<'a>,
+struct Shared<'a, F: Files> {
+    input: &'a PlanInput<'a, F>,
     kinds: Vec<KindInfo>,
     kind_hashes: Vec<u64>,
     rustc: RustcVersion,
@@ -138,7 +164,7 @@ struct Shared<'a> {
 }
 
 /// cargo's `should_use_metadata` (`use_extra_filename`) and `use_pkg_dir`, of a unit.
-fn use_metadata(shared: &Shared<'_>, facts: &Facts<'_>) -> (bool, bool) {
+fn use_metadata<F: Files>(shared: &Shared<'_, F>, facts: &Facts<'_>) -> (bool, bool) {
     let mode = facts.mode;
     if mode.is_any_test() || mode.is_check() {
         return (true, true);
@@ -180,7 +206,7 @@ fn manifest_target<'a>(manifest: &'a Manifest, kind: &TargetKind, name: &str) ->
         .ok_or_else(|| error(format!("`{}` has no {kind:?} target `{name}`", manifest.package_id.name)))
 }
 
-fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
+fn plan_units<F: Files>(input: &PlanInput<'_, F>) -> Result<PlanOutput, LoadError> {
     let units = input.units;
     if input.std_plans.len() != units.len() {
         return Err(error(format!("{} standard library plans for {} units", input.std_plans.len(), units.len())));
@@ -238,19 +264,21 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
     let stop_rlib_uplift = shared.rustc.is_nightly() && config.env("__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT") != Some("1");
 
     // What each unit planned here is, and the dependencies its hashes take.
+    if u32::try_from(units.len()).is_err() {
+        return Err(error(format!("{} units are more than a unit's index holds", units.len())));
+    }
     let mut facts: Vec<Option<Facts<'_>>> = Vec::with_capacity(units.len());
-    let mut deps: Vec<Vec<usize>> = Vec::with_capacity(units.len());
+    let mut deps = Csr::with_capacity(units.len(), units.iter().map(|it| it.dependencies.len()).sum());
     for (at, unit) in units.iter().enumerate() {
-        let mut edges = Vec::with_capacity(unit.dependencies.len());
         for dep in &unit.dependencies {
             let to = units
                 .get(dep.index)
                 .ok_or_else(|| error(format!("unit {at} depends on unit {}, which there is not", dep.index)))?;
             if !to.is_std || unit.is_std || input.build_std {
-                edges.push(dep.index);
+                deps.edges.push(dep.index as u32);
             }
         }
-        deps.push(edges);
+        deps.close();
         if input.std_plans[at].is_some() {
             facts.push(None);
             continue;
@@ -288,17 +316,20 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
     }
 
     // `lto::generate`, over the units planned here.
-    let lto_deps: Vec<Vec<usize>> = deps
-        .iter()
-        .map(|edges| edges.iter().copied().filter(|&to| facts[to].is_some()).collect())
-        .collect();
-    let lto_units: Vec<Option<LtoUnit<'_>>> = facts
-        .iter()
-        .zip(&lto_deps)
-        .map(|(it, edges)| {
-            it.as_ref().map(|it| LtoUnit { kind: &it.target_kind, mode: it.mode, lto: &it.profile.lto, deps: edges })
-        })
-        .collect();
+    let mut lto_deps = Csr::with_capacity(units.len(), deps.edges.len());
+    for at in 0..units.len() {
+        lto_deps.edges.extend(deps.of(at).iter().copied().filter(|&to| facts[to as usize].is_some()));
+        lto_deps.close();
+    }
+    let mut lto_units: Vec<Option<LtoUnit<'_>>> = Vec::with_capacity(units.len());
+    for (at, it) in facts.iter().enumerate() {
+        lto_units.push(it.as_ref().map(|it| LtoUnit {
+            kind: &it.target_kind,
+            mode: it.mode,
+            lto: &it.profile.lto,
+            deps: lto_deps.of(at),
+        }));
+    }
     let ltos = hash::generate(&lto_units, input.roots);
 
     // `compute_metadata`, each unit after its dependencies.
@@ -346,7 +377,7 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
     let mut plans = Vec::with_capacity(units.len());
     for (at, it) in facts.iter().enumerate() {
         let Some(it) = it else {
-            plans.push(input.std_plans[at].clone().expect("a unit planned elsewhere has its plan"));
+            plans.push(None);
             continue;
         };
         let unit = it.unit;
@@ -397,7 +428,7 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
                 },
                 &config_env,
             );
-            plans.push(UnitPlan {
+            plans.push(Some(UnitPlan {
                 checked_as_test: unit.checked_as_test,
                 metadata: meta.metadata(),
                 extra_filename: meta.extra_filename(),
@@ -412,7 +443,7 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
                 unsandboxed,
                 runner: Vec::new(),
                 harness: target.harness,
-            });
+            }));
             continue;
         }
 
@@ -473,7 +504,7 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
         let mut rustflags = Vec::with_capacity(unit.profile.rustflags.len() + info.rustflags.len());
         rustflags.extend(unit.profile.rustflags.iter().cloned());
         rustflags.extend(info.rustflags.iter().cloned());
-        plans.push(UnitPlan {
+        plans.push(Some(UnitPlan {
             checked_as_test: unit.checked_as_test,
             metadata: meta.metadata(),
             extra_filename: meta.extra_filename(),
@@ -492,7 +523,7 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
                 _ => Vec::new(),
             },
             harness: target.harness,
-        });
+        }));
     }
 
     let base = input.base_profile;
@@ -500,10 +531,10 @@ fn plan_units(input: &PlanInput<'_>) -> Result<PlanOutput, LoadError> {
 }
 
 /// The unit's `Metadata`, its dependencies' first.
-fn meta_of(
-    shared: &Shared<'_>,
+fn meta_of<F: Files>(
+    shared: &Shared<'_, F>,
     facts: &[Option<Facts<'_>>],
-    deps: &[Vec<usize>],
+    deps: &Csr,
     ltos: &[Option<hash::Lto>],
     metas: &mut [Option<Meta>],
     at: usize,
@@ -524,9 +555,9 @@ fn meta_of(
             Meta::read(&plan.metadata, &plan.extra_filename, &what)?
         }
         Some(it) => {
-            let mut dep_metas = Vec::with_capacity(deps[at].len());
-            for &dep in &deps[at] {
-                dep_metas.push(meta_of(shared, facts, deps, ltos, metas, dep, depth + 1)?);
+            let mut dep_metas = Vec::with_capacity(deps.of(at).len());
+            for &dep in deps.of(at) {
+                dep_metas.push(meta_of(shared, facts, deps, ltos, metas, dep as usize, depth + 1)?);
             }
             let lto = ltos[at].as_ref().ok_or_else(|| {
                 error(format!("`{}`'s `{}` is reached from no root of the unit graph", unit.pkg_id, unit.target.name))

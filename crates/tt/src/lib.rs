@@ -4,6 +4,7 @@
 //! The `TokenTree` is semantically a tree, but for performance reasons it is stored as a flat structure.
 
 #![cfg_attr(feature = "in-rust-tree", feature(rustc_private))]
+#![feature(allocator_api)]
 #![deny(unsafe_code)]
 
 #[cfg(feature = "in-rust-tree")]
@@ -35,8 +36,8 @@ pub use text_size::{TextRange, TextSize};
 
 pub use self::iter::{TtElement, TtIter};
 pub use self::storage::{
-    SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder, TreeWords, ViewWords, WireError,
-    WirePart,
+    SubtreeBuilderRestorePoint, TopSubtree, TopSubtreeBuilder, Tree, TreeWords, ViewWords,
+    WireError, WirePart,
 };
 
 pub const MAX_GLUED_PUNCT_LEN: usize = 3;
@@ -181,7 +182,7 @@ impl Subtree {
 /// The token trees `start..end` of `tree`, whole subtrees: 16 bytes, copied freely.
 #[derive(Clone, Copy)]
 pub struct TokenTreesView<'a> {
-    tree: &'a TopSubtree,
+    tree: &'a Tree,
     start: u32,
     end: u32,
 }
@@ -694,15 +695,27 @@ fn print_debug_token(f: &mut fmt::Formatter<'_>, level: usize, tt: TtElement<'_>
     Ok(())
 }
 
-impl fmt::Debug for TopSubtree {
+impl fmt::Debug for Tree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Debug::fmt(&self.view(), f)
     }
 }
 
-impl fmt::Display for TopSubtree {
+impl fmt::Display for Tree {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.view(), f)
+    }
+}
+
+impl<A: std::alloc::Allocator> fmt::Debug for TopSubtree<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<A: std::alloc::Allocator> fmt::Display for TopSubtree<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&**self, f)
     }
 }
 
@@ -1100,9 +1113,10 @@ impl TransformTtAction<'_> {
 
 /// Calls `callback` with each token tree of `tt` in preorder, the top subtree first, and does
 /// what it says: keeps the token tree (visiting a subtree's own after it) or puts a (possibly
-/// empty) view in its place, which is not visited. One pass into a builder.
-pub fn transform_tt<'b>(
-    tt: &mut TopSubtree,
+/// empty) view in its place, which is not visited. One pass into a builder; the tree made is
+/// like `tt` (in its allocator, keeping words when it does).
+pub fn transform_tt<'b, A: std::alloc::Allocator + Clone>(
+    tt: &mut TopSubtree<A>,
     mut callback: impl FnMut(&TokenTree) -> TransformTtAction<'b>,
 ) {
     let top = tt.top_subtree();
@@ -1112,12 +1126,12 @@ pub fn transform_tt<'b>(
     };
     if let Some(replacement) = replacement {
         // alloc: the whole tree replaced, which no caller asks for but the contract allows.
-        *tt = TopSubtree::from_serialized(replacement.iter_flat_tokens().collect());
+        *tt = TopSubtree::from_serialized_like(replacement.iter_flat_tokens().collect(), tt);
         return;
     }
     let mut builder = TopSubtreeBuilder::with_capacity(top.delimiter, tt.token_trees().len());
     walk(tt.iter(), &mut builder, &mut callback);
-    *tt = builder.build();
+    *tt = builder.build_like(tt);
 
     fn walk<'b>(
         trees: TtIter<'_>,

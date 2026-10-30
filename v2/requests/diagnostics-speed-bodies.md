@@ -37,6 +37,15 @@ same order, and `ExprKinds` is a `u64` of them.
 > checked). It is not encoded, so the format's bytes are unchanged. A `const` assert keeps the
 > kinds under 64. `has_closures` is now a bit test on it. Test:
 > `a_store_knows_its_expression_kinds`. Status: applied.
+>
+> used by diagnostics-speed-bodies (2026-10-29): `liveness::lints` skips its closure loop (and
+> with it the body's preorder list) when `!store.has_closures()`. The other two uses named
+> above don't hold:
+> - `unsafety`'s scan looks for `unsafe` blocks, and every block is the one kind `Block`.
+> - Skipping `Late`'s walk needs no running pass to have a statement, arm or pattern hook, but
+>   `UnusedResults`, `PathStatements` and `UnitBindings` all run at default levels.
+>
+> Nothing more is asked of hir-def.
 
 ## 2. hir-def: `AttrFlags::NAKED` and `AttrFlags::AUTOMATICALLY_DERIVED`
 
@@ -59,6 +68,7 @@ With the bits, both are one flag test. The diagnostics side changes then stay in
 `lints/bodies/liveness*`, which are this lane's paths.
 
 > forwarded to db (db-expand-next2, `hir-def/src/attrs.rs`) (requests, pass 20; told by tmux).
+> applied by db-expand (db-expand-attrs, 2026-10-29): `NAKED = 1 << 83` (`#[naked]`; `#[unsafe(naked)]` reaches it as `expand_cfg_attr` unwraps `unsafe(..)`) and `AUTOMATICALLY_DERIVED = 1 << 80` (with mem-db-def-items I2.1, one change for both), set in `match_attr_flags`'s one-segment arm; `has_word(.., "naked")` and `has_word(.., "automatically_derived")` are bit tests. Tests: `has_word_flags_match_the_source`, `gating_flags_of_known_shapes`.
 
 ## 3. Parent (`diagnostics`): compute `body_owners` once per check
 

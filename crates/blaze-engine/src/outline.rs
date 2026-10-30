@@ -16,8 +16,8 @@ use ide_db::{
 };
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 use syntax::{
-    AstNode, Edition, SyntaxKind, SyntaxNode, TextRange, WalkEvent,
-    ast::{self, HasAttrs, HasGenericParams, HasName},
+    Edition, SyntaxKind, TextRange, WalkEvent,
+    view::{self as ast, AstNode, HasAttrs, HasGenericParams, HasName, Node},
 };
 use vfs::FileId;
 
@@ -244,17 +244,16 @@ struct Copied {
 fn copied(db: &RootDatabase, file: FileId) -> Copied {
     let edition =
         relevant_crates(db, file).first().map_or(Edition::CURRENT, |it| it.data(db).edition);
-    let tree = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
-    copied_in(&tree)
+    copied_in(EditionedFileId::new(db, file, edition).parse(db).root())
 }
 
-fn copied_in(tree: &SyntaxNode) -> Copied {
-    let generic = |params: Option<ast::GenericParamList>| {
+fn copied_in<'t>(tree: Node<'t>) -> Copied {
+    let generic = |params: Option<ast::GenericParamList<'t>>| {
         params.is_some_and(|it| {
             it.generic_params().any(|it| !matches!(it, ast::GenericParam::LifetimeParam(_)))
         })
     };
-    let is_copied = |func: &ast::Fn| {
+    let is_copied = |func: &ast::Fn<'t>| {
         // A trait's method declared without a body has no code to copy.
         if func.body().is_none() {
             return false;
@@ -263,21 +262,20 @@ fn copied_in(tree: &SyntaxNode) -> Copied {
             it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
         });
         let inline = func.attrs().any(|attr| {
-            let text = attr.syntax().text().to_string();
+            let text = attr.syntax().text();
             text.contains("inline") && !text.contains("never")
         });
         let around = func.syntax().ancestors().skip(1).any(|it| {
-            ast::Trait::cast(it.clone()).is_some()
+            ast::Trait::cast(it).is_some()
                 || ast::Impl::cast(it).is_some_and(|it| generic(it.generic_param_list()))
         });
         generic(func.generic_param_list()) || impl_trait_parameter || inline || around
     };
-    let inline = |func: &ast::Fn| {
-        func.attrs().any(|attr| attr.syntax().text().to_string().contains("inline"))
-    };
+    let inline =
+        |func: &ast::Fn<'t>| func.attrs().any(|attr| attr.syntax().text().contains("inline"));
     // Of the file's modules or an `impl` of them that is not generic, where the function's
     // path names it alone.
-    let of_modules = |func: &ast::Fn| {
+    let of_modules = |func: &ast::Fn<'t>| {
         let in_modules = func.syntax().ancestors().skip(1).all(|it| match it.kind() {
             SyntaxKind::SOURCE_FILE
             | SyntaxKind::MODULE
@@ -292,16 +290,16 @@ fn copied_in(tree: &SyntaxNode) -> Copied {
     };
     // Not generic, and not `#[inline(always)]`, which LLVM puts into each caller at every
     // level.
-    let inline_alone = |func: &ast::Fn| {
+    let inline_alone = |func: &ast::Fn<'t>| {
         let generic = generic(func.generic_param_list())
             || func.syntax().ancestors().skip(1).any(|it| {
-                ast::Trait::cast(it.clone()).is_some()
+                ast::Trait::cast(it).is_some()
                     || ast::Impl::cast(it).is_some_and(|it| generic(it.generic_param_list()))
             })
             || func.param_list().is_some_and(|it| {
                 it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
             });
-        let always = func.attrs().any(|attr| attr.syntax().text().to_string().contains("always"));
+        let always = func.attrs().any(|attr| attr.syntax().text().contains("always"));
         let of_items = func.syntax().ancestors().skip(1).all(|it| {
             matches!(
                 it.kind(),
@@ -314,14 +312,14 @@ fn copied_in(tree: &SyntaxNode) -> Copied {
         });
         inline(func) && !generic && !always && of_items
     };
-    let text = tree.text().to_string();
+    let text = tree.text();
     let line_starts: Vec<usize> =
         std::iter::once(0).chain(text.match_indices('\n').map(|(at, _)| at + 1)).collect();
-    let mut generics: FxHashMap<String, FxHasher> = FxHashMap::default();
-    let mut inlined: FxHashMap<String, FxHasher> = FxHashMap::default();
+    let mut generics: FxHashMap<&'t str, FxHasher> = FxHashMap::default();
+    let mut inlined: FxHashMap<&'t str, FxHasher> = FxHashMap::default();
     let mut others = FxHasher::default();
     for func in tree.descendants().filter_map(ast::Fn::cast).filter(is_copied) {
-        let name = func.name().map(|it| it.text().to_string());
+        let name = func.name().map(|it| it.text());
         let hasher = match name {
             Some(name) if of_modules(&func) => generics.entry(name).or_default(),
             Some(name) if inline_alone(&func) => inlined.entry(name).or_default(),
@@ -330,10 +328,12 @@ fn copied_in(tree: &SyntaxNode) -> Copied {
         let start = usize::from(func.syntax().text_range().start());
         let line = line_starts.partition_point(|&it| it <= start) - 1;
         (line, text[line_starts[line]..start].chars().count()).hash(hasher);
-        func.syntax().text().to_string().hash(hasher);
+        func.syntax().text().hash(hasher);
     }
-    let generics = generics.into_iter().map(|(name, it)| (name, it.finish())).collect();
-    let inline = inlined.into_iter().map(|(name, it)| (name, it.finish())).collect();
+    // alloc: the names kept with the hashes, once per function rustc copies
+    let generics = generics.into_iter().map(|(name, it)| (name.to_owned(), it.finish())).collect();
+    // alloc: as above
+    let inline = inlined.into_iter().map(|(name, it)| (name.to_owned(), it.finish())).collect();
     Copied { generics, inline, others: others.finish() }
 }
 
@@ -424,7 +424,7 @@ fn types(db: &RootDatabase, file: FileId) -> FxHashMap<String, u64> {
     let edition =
         relevant_crates(db, file).first().map_or(Edition::CURRENT, |it| it.data(db).edition);
     let file = EditionedFileId::new(db, file, edition);
-    let tree = file.parse(db).syntax_node();
+    let tree = file.parse(db).root();
     let mut found = FxHashMap::<String, u64>::default();
     // Every item has an id, also one in a body: the types are found without walking the file.
     let kinds = [
@@ -436,16 +436,16 @@ fn types(db: &RootDatabase, file: FileId) -> FxHashMap<String, u64> {
     ];
     let items =
         hir::HirFileId::from(file).ast_id_map(db).ptrs().filter(|it| kinds.contains(&it.kind()));
-    for node in items.map(|it| it.to_node(&tree)) {
-        let (kind, name) = if let Some(it) = ast::Struct::cast(node.clone()) {
+    for node in items.map(|it| ast::to_node(it, tree)) {
+        let (kind, name) = if let Some(it) = ast::Struct::cast(node) {
             ("struct", it.name())
-        } else if let Some(it) = ast::Enum::cast(node.clone()) {
+        } else if let Some(it) = ast::Enum::cast(node) {
             ("enum", it.name())
-        } else if let Some(it) = ast::Union::cast(node.clone()) {
+        } else if let Some(it) = ast::Union::cast(node) {
             ("union", it.name())
-        } else if let Some(it) = ast::TypeAlias::cast(node.clone()) {
+        } else if let Some(it) = ast::TypeAlias::cast(node) {
             ("type", it.name())
-        } else if let Some(it) = ast::Trait::cast(node.clone()) {
+        } else if let Some(it) = ast::Trait::cast(node) {
             ("trait", it.name())
         } else {
             continue;
@@ -489,8 +489,8 @@ fn outline(db: &RootDatabase, file: FileId, functions: &[FunctionId]) -> Option<
     // As the crate reads it, so that the file is parsed once for both.
     let edition =
         relevant_crates(db, file).first().map_or(Edition::CURRENT, |it| it.data(db).edition);
-    let tree = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
-    let (hash, found) = hash_outside_bodies(&tree, &seen.declaring, &FxHashSet::default());
+    let tree = EditionedFileId::new(db, file, edition).parse(db).root();
+    let (hash, found) = hash_outside_bodies(tree, &seen.declaring, &FxHashSet::default());
     // Each of them has to be one of the bodies that were kept in.
     (found == seen.declaring.len()).then_some(hash)
 }
@@ -510,28 +510,29 @@ fn outline_without(
     }
     let edition =
         relevant_crates(db, file).first().map_or(Edition::CURRENT, |it| it.data(db).edition);
-    let tree = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
-    let (hash, found) = hash_outside_bodies(&tree, &seen.declaring, added);
+    let tree = EditionedFileId::new(db, file, edition).parse(db).root();
+    let (hash, found) = hash_outside_bodies(tree, &seen.declaring, added);
     (found == seen.declaring.len()).then_some(hash)
 }
 
 /// What [`Outlines::adding`] finds of an edit that gives `file` the text `text`.
 fn adding(db: &RootDatabase, listed: &Listed, file: FileId, text: &str) -> Option<Adding> {
     let edition = relevant_crates(db, file).first()?.data(db).edition;
-    let was = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
-    let now = ast::SourceFile::parse(text, edition).tree().syntax().clone();
+    let was = EditionedFileId::new(db, file, edition).parse(db).root();
+    let now = syntax::SourceFile::parse(text, edition);
+    let now = now.root();
     // Functions taken away are those the text before has that the edit added to it, and what
     // names them is looked for in the file as the edit leaves it.
-    let (added, away) = match added_functions(&was, &now) {
+    let (added, away) = match added_functions(was, now) {
         Some(added) => (added, false),
-        None => (added_functions(&now, &was)?, true),
+        None => (added_functions(now, was)?, true),
     };
     let crates = listed.crates_of(db, file);
     if crates.is_empty() || crates.iter().any(|it| it.transitive_rev_deps(db).len() != 1) {
         return None;
     }
-    let names: FxHashSet<String> =
-        added.iter().filter_map(|it| it.name()).map(|it| it.text().to_string()).collect();
+    let names: FxHashSet<&str> =
+        added.iter().filter_map(|it| it.name()).map(|it| it.text()).collect();
     let mut files: Vec<(FileId, Edition)> = hir::attach_db(db, || {
         let modules = crates.iter().flat_map(|&krate| {
             let edition = krate.data(db).edition;
@@ -547,8 +548,8 @@ fn adding(db: &RootDatabase, listed: &Listed, file: FileId, text: &str) -> Optio
     files.dedup();
     for &(other, edition) in &files {
         let tree = match other == file && away {
-            true => now.clone(),
-            false => EditionedFileId::new(db, other, edition).parse(db).syntax_node(),
+            true => now,
+            false => EditionedFileId::new(db, other, edition).parse(db).root(),
         };
         // A file another one includes is written as part of it, and the names of macros are
         // matched by name.
@@ -574,16 +575,18 @@ fn adding(db: &RootDatabase, listed: &Listed, file: FileId, text: &str) -> Optio
 /// The functions written in `now` that `was` has none of, when nothing else changed but bodies
 /// that nothing else sees into: functions of the file's modules, each of a name no function of
 /// its module had, that rustc compiles once under a symbol of their own.
-fn added_functions(was: &SyntaxNode, now: &SyntaxNode) -> Option<Vec<ast::Fn>> {
-    let (was_written, now_written) = (functions_of_modules(was)?, functions_of_modules(now)?);
+fn added_functions<'t>(was: Node<'t>, now: Node<'t>) -> Option<Vec<ast::Fn<'t>>> {
+    let mut modules = Modules::default();
+    let was_written = functions_of_modules(was, &mut modules)?;
+    let now_written = functions_of_modules(now, &mut modules)?;
     if was_written.keys().any(|it| !now_written.contains_key(it)) {
         return None;
     }
-    let added: Vec<ast::Fn> = (now_written.into_iter())
+    let added: Vec<ast::Fn<'t>> = (now_written.into_iter())
         .filter(|(key, _)| !was_written.contains_key(key))
         .map(|it| it.1)
         .collect();
-    if added.is_empty() || !added.iter().all(added_alone) {
+    if added.is_empty() || !added.iter().all(|&it| added_alone(it)) {
         return None;
     }
     let skipped: FxHashSet<TextRange> = added.iter().map(|it| it.syntax().text_range()).collect();
@@ -593,28 +596,48 @@ fn added_functions(was: &SyntaxNode, now: &SyntaxNode) -> Option<Vec<ast::Fn>> {
     same.then_some(added)
 }
 
-/// The functions of a file's modules by the names of the modules and their own, or `None` when
-/// two have one name: a `#[cfg]` tells which is compiled.
-fn functions_of_modules(tree: &SyntaxNode) -> Option<FxHashMap<(Vec<String>, String), ast::Fn>> {
+/// The modules of the trees an edit compares, each numbered by the one it is in (0 for the
+/// file) and its name: a module is the same number in both trees when its path is the same.
+type Modules<'t> = FxHashMap<(u32, &'t str), u32>;
+
+/// The functions of a file's modules by the number of their module in `modules` and their
+/// name, or `None` when two have one: a `#[cfg]` tells which is compiled.
+fn functions_of_modules<'t>(
+    tree: Node<'t>,
+    modules: &mut Modules<'t>,
+) -> Option<FxHashMap<(u32, &'t str), ast::Fn<'t>>> {
     let mut found = FxHashMap::default();
-    for func in tree.descendants().filter_map(ast::Fn::cast) {
-        let Some(name) = func.name() else { continue };
-        let mut modules = Vec::new();
-        let of_modules = func.syntax().ancestors().skip(1).all(|it| match it.kind() {
-            SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST => true,
-            SyntaxKind::MODULE => {
-                let name = ast::Module::cast(it).and_then(|it| it.name());
-                modules.push(name.map(|it| it.text().to_string()).unwrap_or_default());
-                true
+    // alloc: once per tree, the modules the walk is in
+    let mut within: Vec<u32> = vec![0];
+    let mut walk = tree.preorder();
+    while let Some(event) = walk.next() {
+        let node = match event {
+            WalkEvent::Enter(node) => node,
+            WalkEvent::Leave(node) => {
+                if node.kind() == SyntaxKind::MODULE {
+                    within.pop();
+                }
+                continue;
             }
-            _ => false,
-        });
-        if !of_modules {
-            continue;
-        }
-        modules.reverse();
-        if found.insert((modules, name.text().to_string()), func).is_some() {
-            return None;
+        };
+        match node.kind() {
+            SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST => {}
+            SyntaxKind::MODULE => {
+                let name = ast::Module::cast(node).and_then(|it| it.name()).map_or("", |it| it.text());
+                let next = modules.len() as u32 + 1;
+                let module = *modules.entry((*within.last()?, name)).or_insert(next);
+                within.push(module);
+            }
+            // A function in a function is of its body, not of a module.
+            SyntaxKind::FN => {
+                walk.skip_subtree();
+                let Some(func) = ast::Fn::cast(node) else { continue };
+                let Some(name) = func.name() else { continue };
+                if found.insert((*within.last()?, name.text()), func).is_some() {
+                    return None;
+                }
+            }
+            _ => walk.skip_subtree(),
         }
     }
     Some(found)
@@ -623,12 +646,12 @@ fn functions_of_modules(tree: &SyntaxNode) -> Option<FxHashMap<(Vec<String>, Str
 /// Whether a function added to a file is compiled once, under its own symbol, and seen by
 /// nothing but what calls it: not generic, not `#[inline]`, and with a body that nothing else
 /// sees into and that declares no items.
-fn added_alone(func: &ast::Fn) -> bool {
+fn added_alone(func: ast::Fn<'_>) -> bool {
     let impl_trait_parameter = func.param_list().is_some_and(|it| {
         it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
     });
     let inline = func.attrs().any(|attr| {
-        let text = attr.syntax().text().to_string();
+        let text = attr.syntax().text();
         text.contains("inline") && !text.contains("never")
     });
     let Some(body) = func.body() else { return false };
@@ -701,11 +724,11 @@ fn declares_items(db: &RootDatabase, func: FunctionId) -> bool {
 pub(crate) fn skeleton(db: &RootDatabase, file: FileId) -> Option<u64> {
     let edition =
         relevant_crates(db, file).first().map_or(Edition::CURRENT, |it| it.data(db).edition);
-    skeleton_of(&EditionedFileId::new(db, file, edition).parse(db).syntax_node())
+    skeleton_of(EditionedFileId::new(db, file, edition).parse(db).root())
 }
 
-fn skeleton_of(tree: &SyntaxNode) -> Option<u64> {
-    let written_by_macro = |node: &SyntaxNode| {
+fn skeleton_of<'t>(tree: Node<'t>) -> Option<u64> {
+    let written_by_macro = |node: Node<'t>| {
         node.kind() == SyntaxKind::MACRO_CALL
             && node.parent().is_some_and(|it| {
                 !matches!(
@@ -718,7 +741,7 @@ fn skeleton_of(tree: &SyntaxNode) -> Option<u64> {
             })
     };
     // An import's id is of a kind of its own, which no function's is found by.
-    let has_items = |body: &SyntaxNode| {
+    let has_items = |body: Node<'t>| {
         body.descendants().skip(1).any(|it| {
             ast::Item::can_cast(it.kind())
                 && !matches!(
@@ -728,7 +751,7 @@ fn skeleton_of(tree: &SyntaxNode) -> Option<u64> {
         })
     };
     for node in tree.descendants() {
-        if written_by_macro(&node) || is_unseen_body(&node) && has_items(&node) {
+        if written_by_macro(node) || is_unseen_body(node) && has_items(node) {
             return None;
         }
     }
@@ -738,7 +761,7 @@ fn skeleton_of(tree: &SyntaxNode) -> Option<u64> {
 /// The hash, and how many of the `declaring` functions were come by. The functions at
 /// `skipped` are left out whole.
 fn hash_outside_bodies(
-    file: &SyntaxNode,
+    file: Node<'_>,
     declaring: &FxHashSet<TextRange>,
     skipped: &FxHashSet<TextRange>,
 ) -> (u64, usize) {
@@ -756,7 +779,7 @@ fn hash_outside_bodies(
                 node.kind().hash(&mut hasher);
                 if node.kind() == SyntaxKind::FN && declaring.contains(&node.text_range()) {
                     found += 1;
-                } else if is_unseen_body(&node)
+                } else if is_unseen_body(node)
                     && node.parent().is_none_or(|it| !declaring.contains(&it.text_range()))
                 {
                     walk.skip_subtree();
@@ -780,7 +803,7 @@ fn hash_outside_bodies(
 
 /// Whether the node is the body of a function that nothing else sees into, going by how the
 /// function is written. What its body declares takes name resolution to tell.
-fn is_unseen_body(node: &SyntaxNode) -> bool {
+fn is_unseen_body(node: Node<'_>) -> bool {
     if node.kind() != SyntaxKind::BLOCK_EXPR {
         return false;
     }
@@ -797,7 +820,7 @@ fn is_unseen_body(node: &SyntaxNode) -> bool {
     // rustc copies the body into the callers, also the ones it compiled for us.
     let always_inlined = func.attrs().any(|attr| {
         attr.simple_name().is_some_and(|name| name == "inline")
-            && attr.syntax().text().to_string().contains("always")
+            && attr.syntax().text().contains("always")
     });
     if always_inlined {
         return false;
@@ -805,7 +828,7 @@ fn is_unseen_body(node: &SyntaxNode) -> bool {
     // An attribute written inside the body is the function's, and a macro declared in it can
     // be exported from the crate.
     let reaches_out = node.descendants().any(|it| match it.kind() {
-        SyntaxKind::ATTR => it.ancestors().nth(2).is_some_and(|block| block == *node),
+        SyntaxKind::ATTR => it.ancestors().nth(2).is_some_and(|block| block == node),
         SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => true,
         _ => false,
     });
@@ -816,15 +839,15 @@ fn is_unseen_body(node: &SyntaxNode) -> bool {
     // input is the macro's.
     func.syntax().ancestors().skip(1).all(|it| match it.kind() {
         SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST | SyntaxKind::ASSOC_ITEM_LIST => true,
-        SyntaxKind::MODULE | SyntaxKind::IMPL | SyntaxKind::TRAIT => is_inert(&it),
+        SyntaxKind::MODULE | SyntaxKind::IMPL | SyntaxKind::TRAIT => is_inert(it),
         _ => false,
     })
 }
 
 /// Whether no attribute on the item can be a macro that rewrites it.
-fn is_inert(item: &SyntaxNode) -> bool {
-    let Some(item) = ast::AnyHasAttrs::cast(item.clone()) else { return false };
-    item.attrs().all(|attr| attr.simple_name().is_some_and(|name| INERT.contains(&name.as_str())))
+fn is_inert(item: Node<'_>) -> bool {
+    let Some(item) = ast::AnyHasAttrs::cast(item) else { return false };
+    item.attrs().all(|attr| attr.simple_name().is_some_and(|name| INERT.contains(&name)))
 }
 
 /// The crate the file is a module of, when that is one of `used`, which the crates in `built`
@@ -858,7 +881,7 @@ impl Listed {
         // Copied out: a query that is cancelled unwinds, and would poison the lock.
         let built = crate::lock(&self.built).clone();
         let read: FxHashSet<_> = (built.iter())
-            .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db))
+            .flat_map(|&it| ide_db::base_db::Crate::from(it).transitive_deps(db).iter().copied())
             .collect();
         (!read.is_empty()).then(|| std::sync::Arc::new(read))
     }
@@ -948,7 +971,7 @@ impl Listed {
                         }
                         None => {
                             let used = used.get_or_insert_with(|| {
-                                let used = listed.iter().flat_map(|it| it.transitive_deps(db));
+                                let used = listed.iter().flat_map(|it| it.transitive_deps(db).iter().copied());
                                 used.collect::<FxHashSet<Crate>>()
                             });
                             if used.contains(&krate) {
@@ -969,8 +992,8 @@ mod tests {
     use syntax::SourceFile;
 
     fn hash(text: &str) -> u64 {
-        let tree = SourceFile::parse(text, Edition::CURRENT).syntax_node();
-        hash_outside_bodies(&tree, &FxHashSet::default(), &FxHashSet::default()).0
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        hash_outside_bodies(parse.root(), &FxHashSet::default(), &FxHashSet::default()).0
     }
 
     #[track_caller]
@@ -984,7 +1007,7 @@ mod tests {
     }
 
     fn copies(text: &str) -> Copied {
-        copied_in(&SourceFile::parse(text, Edition::CURRENT).syntax_node())
+        copied_in(SourceFile::parse(text, Edition::CURRENT).root())
     }
 
     #[test]
@@ -1137,7 +1160,7 @@ mod tests {
     }
 
     fn skeleton(text: &str) -> Option<u64> {
-        skeleton_of(&SourceFile::parse(text, Edition::CURRENT).syntax_node())
+        skeleton_of(SourceFile::parse(text, Edition::CURRENT).root())
     }
 
     #[test]
@@ -1171,10 +1194,11 @@ mod tests {
     fn a_body_that_declares_items_is_kept() {
         let text = |n: u8| format!("fn f() {{ fn g() -> u8 {{ {n} }} }}");
         let hash = |text: &str| {
-            let tree = SourceFile::parse(text, Edition::CURRENT).syntax_node();
+            let parse = SourceFile::parse(text, Edition::CURRENT);
+            let tree = parse.root();
             let declaring = tree.descendants().find(|it| it.kind() == SyntaxKind::FN).unwrap();
             let declaring = FxHashSet::from_iter([declaring.text_range()]);
-            hash_outside_bodies(&tree, &declaring, &FxHashSet::default())
+            hash_outside_bodies(tree, &declaring, &FxHashSet::default())
         };
         let (one, found) = hash(&text(1));
         assert_eq!(found, 1);
@@ -1182,9 +1206,21 @@ mod tests {
     }
 
     fn added(before: &str, after: &str) -> Option<Vec<String>> {
-        let parse = |text: &str| SourceFile::parse(text, Edition::CURRENT).syntax_node();
-        let added = added_functions(&parse(before), &parse(after))?;
-        Some(added.iter().map(|it| it.name().unwrap().text().to_string()).collect())
+        let before = SourceFile::parse(before, Edition::CURRENT);
+        let after = SourceFile::parse(after, Edition::CURRENT);
+        let added = added_functions(before.root(), after.root())?;
+        Some(added.iter().map(|it| it.name().unwrap().text().to_owned()).collect())
+    }
+
+    #[test]
+    fn functions_are_told_apart_by_the_path_of_their_module() {
+        let before = "mod a {\n    fn f() {}\n    mod b {}\n}\nmod b {}\n";
+        // `a::b::f` and `b::f` are two functions, and neither is `a::f`.
+        let after = "mod a {\n    fn f() {}\n    mod b {\n        fn f() {}\n    }\n}\nmod b {\n    fn f() {}\n}\n";
+        assert_eq!(added(before, after).unwrap(), ["f", "f"]);
+        // `a::f` taken to `a::b::f` is one taken away and another added.
+        let after = "mod a {\n    mod b {\n        fn f() {}\n    }\n}\nmod b {}\n";
+        assert_eq!(added(before, after), None);
     }
 
     #[test]

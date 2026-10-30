@@ -100,6 +100,7 @@ Why: `blaze_query::Cx` has no way to reach those today. The kinds are reserved i
 `query::keys`.
 
 > forwarded to db
+> not applied by db-audit-other (22:34): not in the tree. `blaze_query::Cx` (`crates/blaze-query/src/lib.rs:592`) still holds only the database, task, view and run, so no query can reach a `Frontend`, `Backends`, `Policy` or the daemon's `Memo`. Sent by db-audit-other to db-query2-next1, which holds `crates/blaze-query/` (told by tmux).
 
 ## 4. coordinator: index entry
 
@@ -478,6 +479,26 @@ trade-off), `enable_alias_analysis` (only the `speed` egraph pass reads it). Two
 
 `v2/requests/cargo.md:829-845` ("To lane codegen") and `v2/requests/codegen-adapter.md` ("To codegen (parent): cargo's API asks of `v2*` have no owner"): none of `hir_ty_codegen::v2::toolchain`, `RootKind`, `Roots`/`RootTest`, `HirFrontend::roots`/`linked`/`link_inputs`, `LinkInputs`, `Built::reached` or `blaze_codegen::{NativeLib, NativeLibKind}` exists in the tree, and `blaze-cargo/src/serve/unit/codegen.rs` calls `v2::toolchain` and imports `NativeLib`/`NativeLibKind`. They are in codegen-v2's paths but were in no brief of its; each of test roots (libtest's start, the fork server), native libraries and link inputs is a lane's worth. Say who takes them; codegen-v2 can take `toolchain`, `NativeLib` and `Built::reached` given the source of `Toolchain::id` (blaze's code identity: `blaze_store`'s `Identity`?) and the Cranelift and LLVM version strings.
 
+> applied by codegen-api-link (2026-10-29): `hir_ty_codegen::v2::toolchain(target, rustflags)` (`v2/toolchain.rs`; `id` from `blaze_store::build_name`, Cranelift's version as `Cargo.lock` pins it, LLVM's from `llvm.json`; a code-changing `-C` it does not read is an error naming it) and `v2::select(&Toolchain)`, which selects the process's target, features and frame pointers; `check_spec` checks the ISA's settings against the features.
+> applied by codegen-api-link (2026-10-29): `blaze_codegen::{NativeLib, NativeLibKind}` (`lib.rs`), and `HirFrontend::linked(krate)` (`v2/linked.rs`) from each `extern` block's `#[link]`s; `raw-dylib` and `wasm_import_module` are errors naming them.
+> applied by codegen-api-link (2026-10-29): `HirFrontend::link_inputs(&Built) -> LinkInputs { spans, debug_names }` (`v2/linked.rs`): every span table the code names, encoded as `blaze_link::position::SpanTable`, from a memoized per-body query; an anchor of no table is an error. Debug names are `Described::name` (`Built::debug_names`), which `v2/frontend.rs` must fill (asked of codegen-api-roots).
+> applied by codegen-api-link (2026-10-29): `Built::reached(&root)` (`driver/reach.rs`), `Built::inputs` (cargo.md section 18), `Built::items` and `Build::run_with_statics` (static roots). `mod roots` and its `pub use` are in `v2.rs`. What is left for cargo is in "To cargo: what codegen-api-link's API asks of its calls" below.
+
+> applied by codegen-api-roots (2026-10-29): `RootKind`, `Roots`, `RootTest` and `HirFrontend::roots` are in `crates/hir-ty-codegen/v2/roots.rs` (with `v2/roots/`), fitted to cargo's calls (`codegen.rs:277`, `:312`, `compile.rs:496`, `test.rs:180`). Test roots are libtest's start through the harness's `main`, which calls usercode's fork server; the harness is source text `HirFrontend::harness` writes for cargo to append to the root file (see "To cargo: roots" below). `RootTest` also has `function: FunctionId` (`test.rs:180` reads it) and `Roots` has `statics`. Until codegen-api-link adds `mod roots; pub use roots::{RootKind, RootTest, Roots};` to `v2.rs` (asked) they are not reachable.
+
+### To cargo: roots (from codegen-api-roots, 2026-10-29)
+
+`HirFrontend::roots` (`crates/hir-ty-codegen/v2/roots.rs`) needs four things of `blaze-cargo/src/serve/unit/`:
+
+1. **The test harness in the root file.** For a unit with `RootKind::Test` whose crate has `cfg(test)`, `roots` refuses unless the crate's root file ends with the module `HirFrontend::harness(krate, panic, blaze_usercode::test::fork_server(record))` returns (`Ok(None)` for a crate without `cfg(test)`: a `harness = false` test is an executable). Append it to the root file's text before the unit's roots are asked, and write it again when the tests change: its second line is a digest of the listing, and `roots` refuses a harness written for other tests rather than run stale ones. `HirFrontend::on_disk(text)` is the text without it. `panic = "abort"` is refused, as rustc refuses it without `-Zpanic-abort-tests`.
+2. **The proc-macro list in the root file.** For `RootKind::ProcMacro`, append `HirFrontend::proc_macro_list(krate)` (v1's `__blaze_proc_macros` module with the `#[no_mangle]` static `BLAZE_PROC_MACROS`, which `load-cargo`'s `listed` loader reads); `roots` refuses a proc-macro crate without it.
+3. **Static roots.** `Roots::statics` are `#[used]` and exported statics no code names (rustc's `linked_symbols`: `ctor`, `inventory`, `linkme`). Pass them to the build once `Build::run` takes them (asked of codegen-api-link); until then, refuse a unit whose `roots.statics` is not empty rather than link a program without them.
+4. **A policy on the frontend.** `frontend()` in `codegen.rs` never calls `HirFrontend::with_policy`, so every `describe` fails with "the front end was made with no policy". `roots` itself needs none.
+
+### To db: test attributes by resolution (from codegen-api-roots, 2026-10-29)
+
+`AttrFlags::IS_TEST` (`crates/hir-def/src/attrs.rs:311`) is a textual match on `test`, `{core,std}::prelude::*::test`; `IS_BENCH` on `bench`. A `#[test]` reached through another path (`use core::prelude::v1::test as check; #[check]`) is not listed, and so not run, where rustc runs it. Set both from the resolved built-in attribute macro (the `FIXME` at `attrs.rs:693`), or give codegen a query `is_test(db, FunctionId) -> Option<TestKind>` it can list by. `v2/roots/harness.rs` reads `ignore` and `should_panic` from the syntax (as v1's harness does, `cfg_attr` expanded by the crate's cfg) and would take a hir-def reader of them in their place: `AttrFlags::ignore_message(db, AttrDefId) -> Option<Option<Symbol>>`, `AttrFlags::should_panic(db, AttrDefId) -> Option<Option<Symbol>>`.
+
 ## From safety (lane safety, 2026-10-29; design `docs/v2/plan/lanes/safety/notes.md`)
 
 > forwarded to codegen: S1 (`hir-ty-mir`'s evaluator) and S2 (the LLVM back end) are lane codegen's.
@@ -664,6 +685,8 @@ Exact before/after for each site: `v2/requests/codegen-v2-relocs-link.md`. In sh
 - `src/stage.rs:183-205` `function_keys`/`key_count`, `:229-236` `reloc_syms`, `:568-587` `fixups`, `:592-603` `add_function`, `:785-787` `add_static`: intern each of `relocs.targets()` once and index the symbols by `row.target`; slices of `syms` are measured by `targets().len()`. Same fixups (now in offset order, which `write::split` already wants).
 - `src/tests.rs:7,57,63,73-74,569` and `src/intern.rs:351,499` (tests): `blaze_codegen::Relocation` by path (clashes with `object::write::Relocation`), `relocs: relocs.into()` / `Relocs::new()`.
 - Already broken at HEAD, not by this change: the test literals of `CompiledFunction` lack `coverage: None` (`tests.rs:58`, `intern.rs:494`), and `stage.rs`'s `wide` lacks the `Target::Coverage` arm asked in "From codegen (lead): what Z1, Z2 ..." below.
+
+> applied by requests (child requests-link-next): every edit of `v2/requests/codegen-v2-relocs-link.md`, against the current lines. `stage.rs`: `Relocs` import, `NO_RELOCS`, and `function_keys`/`key_count`/`reloc_syms` over `targets()` (`reloc_syms` keeps its `Result`; `wide` takes the third `of` argument and already has the `Target::Coverage` arm). `fixups` indexes symbols by `row.target`, `add_function` slices by `targets().len()`, and `add_static` uses `&NO_RELOCS`. `tests.rs`/`intern.rs`: `blaze_codegen::Relocation` by path, `relocs.into()`, `Relocs::new()` (`coverage: None` was already in). No other `.relocs` reader of codegen types is in the crate. Not built (no builds in this pass).
 
 ### To fastcompile: `crates/blaze-premap` and `crates/blaze-lazy` onto `Relocs` (from codegen-v2, 2026-10-29)
 
@@ -2738,6 +2761,8 @@ hir-ty-mir already (not compiled).
 Status: open
 
 > forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).
+> applied by mem-format-fwd: `ExpressionStore::macro_calls() -> &[MacroCallId]`; builder and `Scratch` keep `macro_calls: Vec<MacroCallId>` (cleared, counted); both pushes in `expr_store/lower.rs` record it outside `record`. Adapted: the column is a field of `ExpressionStore` (`ThinVec`, 8 bytes, no allocation when empty), not of `ExpressionOnlyStore`, so a signature with only type macros needs no made-up `expr_only`. It is persisted too: `StoreRoot::macro_calls` (salsa id bits, like `block_scopes`; `StoreRoot` 6, store and body schemas 6), checked nonzero and decoded, since a dependency's signature store is decoded and an anon const in it reaches `failed_expansion`. Test: `tests/body.rs` `round_trip` (every fixture) checks the store's set equals the map's, and `Body::of`'s equals `with_source_map`'s.
+> mem-format-fwd: not mem-format's (`deps/signatures/table.rs`, relocating the new column through the image's table as `Kind::MacroCall`); forwarded to the coordinator as `v2/requests/mem-format-fwd.md` F1 (frontend-deps-sigs, its holder, is DONE).
 
 ## dedup: byte cursor onto blaze_format::cursor
 
@@ -4140,3 +4165,5916 @@ Insert above each (indented as it):
 
 No test calls what dedyn 1-3 and 8-9 change. dedyn 5's test `the_facts_of_a_function_alone`
 passes `&instances` as before. Nothing new to dispatch: each is a concrete type or a generic.
+
+## frontend-tree: blaze-engine outline.rs: onto views (1)
+From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. `outline.rs` reads the file's parse and its `AstIdMap` only, so it moves whole onto `EditionedFileId::parse(db).root()` (`returns(ref)`, a `Node<'db>`) and `syntax::view::to_node`; needs no other heading first. Same nodes, ranges, texts and hashes as the handles (`str` hashes as `String`). `functions_of_modules` keys a function by its module's number (a `(parent, &str) -> u32` map shared by the two trees an edit compares) and the `&str` of its name, instead of a `(Vec<String>, String)` per function. Apply the hunks in order; each old text is unique in the file. New test: `functions_are_told_apart_by_the_path_of_their_module`.
+
+> forwarded to codegen (`crates/blaze-engine/`; codegen-engine and codegen-next1 told by tmux; requests, pass 24).
+
+> applied by codegen-engine (2026-10-29): hunks 1-15 in order, each old text found once, with
+> the new test `functions_are_told_apart_by_the_path_of_their_module`. `outline.rs` no longer
+> uses `SyntaxNode`.
+
+### 1. `crates/blaze-engine/src/outline.rs` (lines 18-21 now)
+
+Why: the views instead of the handles.
+
+Old:
+
+```rust
+use syntax::{
+    AstNode, Edition, SyntaxKind, SyntaxNode, TextRange, WalkEvent,
+    ast::{self, HasAttrs, HasGenericParams, HasName},
+};
+```
+
+New:
+
+```rust
+use syntax::{
+    Edition, SyntaxKind, TextRange, WalkEvent,
+    view::{self as ast, AstNode, HasAttrs, HasGenericParams, HasName, Node},
+};
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 2. `crates/blaze-engine/src/outline.rs` (lines 244-338 now)
+
+Why: `copied_in` on views: text lent (`&'t str`), names kept as `String` only in the result.
+
+Old:
+
+```rust
+fn copied(db: &RootDatabase, file: FileId) -> Copied {
+    let edition =
+        relevant_crates(db, file).first().map_or(Edition::CURRENT, |it| it.data(db).edition);
+    let tree = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
+    copied_in(&tree)
+}
+
+fn copied_in(tree: &SyntaxNode) -> Copied {
+    let generic = |params: Option<ast::GenericParamList>| {
+        params.is_some_and(|it| {
+            it.generic_params().any(|it| !matches!(it, ast::GenericParam::LifetimeParam(_)))
+        })
+    };
+    let is_copied = |func: &ast::Fn| {
+        // A trait's method declared without a body has no code to copy.
+        if func.body().is_none() {
+            return false;
+        }
+        let impl_trait_parameter = func.param_list().is_some_and(|it| {
+            it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+        });
+        let inline = func.attrs().any(|attr| {
+            let text = attr.syntax().text().to_string();
+            text.contains("inline") && !text.contains("never")
+        });
+        let around = func.syntax().ancestors().skip(1).any(|it| {
+            ast::Trait::cast(it.clone()).is_some()
+                || ast::Impl::cast(it).is_some_and(|it| generic(it.generic_param_list()))
+        });
+        generic(func.generic_param_list()) || impl_trait_parameter || inline || around
+    };
+    let inline = |func: &ast::Fn| {
+        func.attrs().any(|attr| attr.syntax().text().to_string().contains("inline"))
+    };
+    // Of the file's modules or an `impl` of them that is not generic, where the function's
+    // path names it alone.
+    let of_modules = |func: &ast::Fn| {
+        let in_modules = func.syntax().ancestors().skip(1).all(|it| match it.kind() {
+            SyntaxKind::SOURCE_FILE
+            | SyntaxKind::MODULE
+            | SyntaxKind::ITEM_LIST
+            | SyntaxKind::ASSOC_ITEM_LIST => true,
+            SyntaxKind::IMPL => {
+                !generic(ast::Impl::cast(it).and_then(|it| it.generic_param_list()))
+            }
+            _ => false,
+        });
+        in_modules && !inline(func)
+    };
+    // Not generic, and not `#[inline(always)]`, which LLVM puts into each caller at every
+    // level.
+    let inline_alone = |func: &ast::Fn| {
+        let generic = generic(func.generic_param_list())
+            || func.syntax().ancestors().skip(1).any(|it| {
+                ast::Trait::cast(it.clone()).is_some()
+                    || ast::Impl::cast(it).is_some_and(|it| generic(it.generic_param_list()))
+            })
+            || func.param_list().is_some_and(|it| {
+                it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+            });
+        let always = func.attrs().any(|attr| attr.syntax().text().to_string().contains("always"));
+        let of_items = func.syntax().ancestors().skip(1).all(|it| {
+            matches!(
+                it.kind(),
+                SyntaxKind::SOURCE_FILE
+                    | SyntaxKind::MODULE
+                    | SyntaxKind::ITEM_LIST
+                    | SyntaxKind::IMPL
+                    | SyntaxKind::ASSOC_ITEM_LIST
+            )
+        });
+        inline(func) && !generic && !always && of_items
+    };
+    let text = tree.text().to_string();
+    let line_starts: Vec<usize> =
+        std::iter::once(0).chain(text.match_indices('\n').map(|(at, _)| at + 1)).collect();
+    let mut generics: FxHashMap<String, FxHasher> = FxHashMap::default();
+    let mut inlined: FxHashMap<String, FxHasher> = FxHashMap::default();
+    let mut others = FxHasher::default();
+    for func in tree.descendants().filter_map(ast::Fn::cast).filter(is_copied) {
+        let name = func.name().map(|it| it.text().to_string());
+        let hasher = match name {
+            Some(name) if of_modules(&func) => generics.entry(name).or_default(),
+            Some(name) if inline_alone(&func) => inlined.entry(name).or_default(),
+            _ => &mut others,
+        };
+        let start = usize::from(func.syntax().text_range().start());
+        let line = line_starts.partition_point(|&it| it <= start) - 1;
+        (line, text[line_starts[line]..start].chars().count()).hash(hasher);
+        func.syntax().text().to_string().hash(hasher);
+    }
+    let generics = generics.into_iter().map(|(name, it)| (name, it.finish())).collect();
+    let inline = inlined.into_iter().map(|(name, it)| (name, it.finish())).collect();
+    Copied { generics, inline, others: others.finish() }
+}
+```
+
+New:
+
+```rust
+fn copied(db: &RootDatabase, file: FileId) -> Copied {
+    let edition =
+        relevant_crates(db, file).first().map_or(Edition::CURRENT, |it| it.data(db).edition);
+    copied_in(EditionedFileId::new(db, file, edition).parse(db).root())
+}
+
+fn copied_in<'t>(tree: Node<'t>) -> Copied {
+    let generic = |params: Option<ast::GenericParamList<'t>>| {
+        params.is_some_and(|it| {
+            it.generic_params().any(|it| !matches!(it, ast::GenericParam::LifetimeParam(_)))
+        })
+    };
+    let is_copied = |func: &ast::Fn<'t>| {
+        // A trait's method declared without a body has no code to copy.
+        if func.body().is_none() {
+            return false;
+        }
+        let impl_trait_parameter = func.param_list().is_some_and(|it| {
+            it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+        });
+        let inline = func.attrs().any(|attr| {
+            let text = attr.syntax().text();
+            text.contains("inline") && !text.contains("never")
+        });
+        let around = func.syntax().ancestors().skip(1).any(|it| {
+            ast::Trait::cast(it).is_some()
+                || ast::Impl::cast(it).is_some_and(|it| generic(it.generic_param_list()))
+        });
+        generic(func.generic_param_list()) || impl_trait_parameter || inline || around
+    };
+    let inline =
+        |func: &ast::Fn<'t>| func.attrs().any(|attr| attr.syntax().text().contains("inline"));
+    // Of the file's modules or an `impl` of them that is not generic, where the function's
+    // path names it alone.
+    let of_modules = |func: &ast::Fn<'t>| {
+        let in_modules = func.syntax().ancestors().skip(1).all(|it| match it.kind() {
+            SyntaxKind::SOURCE_FILE
+            | SyntaxKind::MODULE
+            | SyntaxKind::ITEM_LIST
+            | SyntaxKind::ASSOC_ITEM_LIST => true,
+            SyntaxKind::IMPL => {
+                !generic(ast::Impl::cast(it).and_then(|it| it.generic_param_list()))
+            }
+            _ => false,
+        });
+        in_modules && !inline(func)
+    };
+    // Not generic, and not `#[inline(always)]`, which LLVM puts into each caller at every
+    // level.
+    let inline_alone = |func: &ast::Fn<'t>| {
+        let generic = generic(func.generic_param_list())
+            || func.syntax().ancestors().skip(1).any(|it| {
+                ast::Trait::cast(it).is_some()
+                    || ast::Impl::cast(it).is_some_and(|it| generic(it.generic_param_list()))
+            })
+            || func.param_list().is_some_and(|it| {
+                it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+            });
+        let always = func.attrs().any(|attr| attr.syntax().text().contains("always"));
+        let of_items = func.syntax().ancestors().skip(1).all(|it| {
+            matches!(
+                it.kind(),
+                SyntaxKind::SOURCE_FILE
+                    | SyntaxKind::MODULE
+                    | SyntaxKind::ITEM_LIST
+                    | SyntaxKind::IMPL
+                    | SyntaxKind::ASSOC_ITEM_LIST
+            )
+        });
+        inline(func) && !generic && !always && of_items
+    };
+    let text = tree.text();
+    let line_starts: Vec<usize> =
+        std::iter::once(0).chain(text.match_indices('\n').map(|(at, _)| at + 1)).collect();
+    let mut generics: FxHashMap<&'t str, FxHasher> = FxHashMap::default();
+    let mut inlined: FxHashMap<&'t str, FxHasher> = FxHashMap::default();
+    let mut others = FxHasher::default();
+    for func in tree.descendants().filter_map(ast::Fn::cast).filter(is_copied) {
+        let name = func.name().map(|it| it.text());
+        let hasher = match name {
+            Some(name) if of_modules(&func) => generics.entry(name).or_default(),
+            Some(name) if inline_alone(&func) => inlined.entry(name).or_default(),
+            _ => &mut others,
+        };
+        let start = usize::from(func.syntax().text_range().start());
+        let line = line_starts.partition_point(|&it| it <= start) - 1;
+        (line, text[line_starts[line]..start].chars().count()).hash(hasher);
+        func.syntax().text().hash(hasher);
+    }
+    // alloc: the names kept with the hashes, once per function rustc copies
+    let generics = generics.into_iter().map(|(name, it)| (name.to_owned(), it.finish())).collect();
+    // alloc: as above
+    let inline = inlined.into_iter().map(|(name, it)| (name.to_owned(), it.finish())).collect();
+    Copied { generics, inline, others: others.finish() }
+}
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 3. `crates/blaze-engine/src/outline.rs` (lines 427-427 now)
+
+Why: `types` walks the view of the parse.
+
+Old:
+
+```rust
+    let tree = file.parse(db).syntax_node();
+```
+
+New:
+
+```rust
+    let tree = file.parse(db).root();
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 4. `crates/blaze-engine/src/outline.rs` (lines 439-449 now)
+
+Why: the `AstIdMap`'s pointers found as views (`syntax::view::to_node`); casts take the `Copy` view.
+
+Old:
+
+```rust
+    for node in items.map(|it| it.to_node(&tree)) {
+        let (kind, name) = if let Some(it) = ast::Struct::cast(node.clone()) {
+            ("struct", it.name())
+        } else if let Some(it) = ast::Enum::cast(node.clone()) {
+            ("enum", it.name())
+        } else if let Some(it) = ast::Union::cast(node.clone()) {
+            ("union", it.name())
+        } else if let Some(it) = ast::TypeAlias::cast(node.clone()) {
+            ("type", it.name())
+        } else if let Some(it) = ast::Trait::cast(node.clone()) {
+            ("trait", it.name())
+```
+
+New:
+
+```rust
+    for node in items.map(|it| ast::to_node(it, tree)) {
+        let (kind, name) = if let Some(it) = ast::Struct::cast(node) {
+            ("struct", it.name())
+        } else if let Some(it) = ast::Enum::cast(node) {
+            ("enum", it.name())
+        } else if let Some(it) = ast::Union::cast(node) {
+            ("union", it.name())
+        } else if let Some(it) = ast::TypeAlias::cast(node) {
+            ("type", it.name())
+        } else if let Some(it) = ast::Trait::cast(node) {
+            ("trait", it.name())
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 5. `crates/blaze-engine/src/outline.rs` (lines 492-493 now)
+
+Why: `outline` hashes the view.
+
+Old:
+
+```rust
+    let tree = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
+    let (hash, found) = hash_outside_bodies(&tree, &seen.declaring, &FxHashSet::default());
+```
+
+New:
+
+```rust
+    let tree = EditionedFileId::new(db, file, edition).parse(db).root();
+    let (hash, found) = hash_outside_bodies(tree, &seen.declaring, &FxHashSet::default());
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 6. `crates/blaze-engine/src/outline.rs` (lines 513-514 now)
+
+Why: `outline_without` hashes the view.
+
+Old:
+
+```rust
+    let tree = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
+    let (hash, found) = hash_outside_bodies(&tree, &seen.declaring, added);
+```
+
+New:
+
+```rust
+    let tree = EditionedFileId::new(db, file, edition).parse(db).root();
+    let (hash, found) = hash_outside_bodies(tree, &seen.declaring, added);
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 7. `crates/blaze-engine/src/outline.rs` (lines 521-552 now)
+
+Why: `adding` compares views; the new text's parse is kept in a local that the views borrow; names are `&str`.
+
+Old:
+
+```rust
+    let was = EditionedFileId::new(db, file, edition).parse(db).syntax_node();
+    let now = ast::SourceFile::parse(text, edition).tree().syntax().clone();
+    // Functions taken away are those the text before has that the edit added to it, and what
+    // names them is looked for in the file as the edit leaves it.
+    let (added, away) = match added_functions(&was, &now) {
+        Some(added) => (added, false),
+        None => (added_functions(&now, &was)?, true),
+    };
+    let crates = listed.crates_of(db, file);
+    if crates.is_empty() || crates.iter().any(|it| it.transitive_rev_deps(db).len() != 1) {
+        return None;
+    }
+    let names: FxHashSet<String> =
+        added.iter().filter_map(|it| it.name()).map(|it| it.text().to_string()).collect();
+    let mut files: Vec<(FileId, Edition)> = hir::attach_db(db, || {
+        let modules = crates.iter().flat_map(|&krate| {
+            let edition = krate.data(db).edition;
+            hir::Crate::from(krate).modules(db).into_iter().map(move |it| (it, edition))
+        });
+        modules
+            .map(|(module, edition)| {
+                (module.definition_source_file_id(db).original_file(db).file_id(db), edition)
+            })
+            .collect()
+    });
+    blaze_ids::radix::sort_copy_by_key(&mut files, |it| blaze_ids::radix::pack_32(it.0.index(), it.1 as u32));
+    files.dedup();
+    for &(other, edition) in &files {
+        let tree = match other == file && away {
+            true => now.clone(),
+            false => EditionedFileId::new(db, other, edition).parse(db).syntax_node(),
+        };
+```
+
+New:
+
+```rust
+    let was = EditionedFileId::new(db, file, edition).parse(db).root();
+    let now = syntax::SourceFile::parse(text, edition);
+    let now = now.root();
+    // Functions taken away are those the text before has that the edit added to it, and what
+    // names them is looked for in the file as the edit leaves it.
+    let (added, away) = match added_functions(was, now) {
+        Some(added) => (added, false),
+        None => (added_functions(now, was)?, true),
+    };
+    let crates = listed.crates_of(db, file);
+    if crates.is_empty() || crates.iter().any(|it| it.transitive_rev_deps(db).len() != 1) {
+        return None;
+    }
+    let names: FxHashSet<&str> =
+        added.iter().filter_map(|it| it.name()).map(|it| it.text()).collect();
+    let mut files: Vec<(FileId, Edition)> = hir::attach_db(db, || {
+        let modules = crates.iter().flat_map(|&krate| {
+            let edition = krate.data(db).edition;
+            hir::Crate::from(krate).modules(db).into_iter().map(move |it| (it, edition))
+        });
+        modules
+            .map(|(module, edition)| {
+                (module.definition_source_file_id(db).original_file(db).file_id(db), edition)
+            })
+            .collect()
+    });
+    blaze_ids::radix::sort_copy_by_key(&mut files, |it| blaze_ids::radix::pack_32(it.0.index(), it.1 as u32));
+    files.dedup();
+    for &(other, edition) in &files {
+        let tree = match other == file && away {
+            true => now,
+            false => EditionedFileId::new(db, other, edition).parse(db).root(),
+        };
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 8. `crates/blaze-engine/src/outline.rs` (lines 574-647 now)
+
+Why: `added_functions`/`functions_of_modules`/`added_alone` on views, keys interned (no `String` or `Vec` per function): one preorder walk that skips all but modules, item lists and the file, as the old ancestor test admitted.
+
+Old:
+
+```rust
+/// The functions written in `now` that `was` has none of, when nothing else changed but bodies
+/// that nothing else sees into: functions of the file's modules, each of a name no function of
+/// its module had, that rustc compiles once under a symbol of their own.
+fn added_functions(was: &SyntaxNode, now: &SyntaxNode) -> Option<Vec<ast::Fn>> {
+    let (was_written, now_written) = (functions_of_modules(was)?, functions_of_modules(now)?);
+    if was_written.keys().any(|it| !now_written.contains_key(it)) {
+        return None;
+    }
+    let added: Vec<ast::Fn> = (now_written.into_iter())
+        .filter(|(key, _)| !was_written.contains_key(key))
+        .map(|it| it.1)
+        .collect();
+    if added.is_empty() || !added.iter().all(added_alone) {
+        return None;
+    }
+    let skipped: FxHashSet<TextRange> = added.iter().map(|it| it.syntax().text_range()).collect();
+    let none = FxHashSet::default();
+    let same =
+        hash_outside_bodies(was, &none, &none).0 == hash_outside_bodies(now, &none, &skipped).0;
+    same.then_some(added)
+}
+
+/// The functions of a file's modules by the names of the modules and their own, or `None` when
+/// two have one name: a `#[cfg]` tells which is compiled.
+fn functions_of_modules(tree: &SyntaxNode) -> Option<FxHashMap<(Vec<String>, String), ast::Fn>> {
+    let mut found = FxHashMap::default();
+    for func in tree.descendants().filter_map(ast::Fn::cast) {
+        let Some(name) = func.name() else { continue };
+        let mut modules = Vec::new();
+        let of_modules = func.syntax().ancestors().skip(1).all(|it| match it.kind() {
+            SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST => true,
+            SyntaxKind::MODULE => {
+                let name = ast::Module::cast(it).and_then(|it| it.name());
+                modules.push(name.map(|it| it.text().to_string()).unwrap_or_default());
+                true
+            }
+            _ => false,
+        });
+        if !of_modules {
+            continue;
+        }
+        modules.reverse();
+        if found.insert((modules, name.text().to_string()), func).is_some() {
+            return None;
+        }
+    }
+    Some(found)
+}
+
+/// Whether a function added to a file is compiled once, under its own symbol, and seen by
+/// nothing but what calls it: not generic, not `#[inline]`, and with a body that nothing else
+/// sees into and that declares no items.
+fn added_alone(func: &ast::Fn) -> bool {
+    let impl_trait_parameter = func.param_list().is_some_and(|it| {
+        it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+    });
+    let inline = func.attrs().any(|attr| {
+        let text = attr.syntax().text().to_string();
+        text.contains("inline") && !text.contains("never")
+    });
+    let Some(body) = func.body() else { return false };
+    let declares = body.syntax().descendants().skip(1).any(|it| {
+        ast::Item::can_cast(it.kind())
+            && !matches!(
+                it.kind(),
+                SyntaxKind::MACRO_CALL | SyntaxKind::USE | SyntaxKind::EXTERN_CRATE
+            )
+    });
+    func.generic_param_list().is_none()
+        && !impl_trait_parameter
+        && !inline
+        && !declares
+        && is_unseen_body(body.syntax())
+}
+```
+
+New:
+
+```rust
+/// The functions written in `now` that `was` has none of, when nothing else changed but bodies
+/// that nothing else sees into: functions of the file's modules, each of a name no function of
+/// its module had, that rustc compiles once under a symbol of their own.
+fn added_functions<'t>(was: Node<'t>, now: Node<'t>) -> Option<Vec<ast::Fn<'t>>> {
+    let mut modules = Modules::default();
+    let was_written = functions_of_modules(was, &mut modules)?;
+    let now_written = functions_of_modules(now, &mut modules)?;
+    if was_written.keys().any(|it| !now_written.contains_key(it)) {
+        return None;
+    }
+    let added: Vec<ast::Fn<'t>> = (now_written.into_iter())
+        .filter(|(key, _)| !was_written.contains_key(key))
+        .map(|it| it.1)
+        .collect();
+    if added.is_empty() || !added.iter().all(|&it| added_alone(it)) {
+        return None;
+    }
+    let skipped: FxHashSet<TextRange> = added.iter().map(|it| it.syntax().text_range()).collect();
+    let none = FxHashSet::default();
+    let same =
+        hash_outside_bodies(was, &none, &none).0 == hash_outside_bodies(now, &none, &skipped).0;
+    same.then_some(added)
+}
+
+/// The modules of the trees an edit compares, each numbered by the one it is in (0 for the
+/// file) and its name: a module is the same number in both trees when its path is the same.
+type Modules<'t> = FxHashMap<(u32, &'t str), u32>;
+
+/// The functions of a file's modules by the number of their module in `modules` and their
+/// name, or `None` when two have one: a `#[cfg]` tells which is compiled.
+fn functions_of_modules<'t>(
+    tree: Node<'t>,
+    modules: &mut Modules<'t>,
+) -> Option<FxHashMap<(u32, &'t str), ast::Fn<'t>>> {
+    let mut found = FxHashMap::default();
+    // alloc: once per tree, the modules the walk is in
+    let mut within: Vec<u32> = vec![0];
+    let mut walk = tree.preorder();
+    while let Some(event) = walk.next() {
+        let node = match event {
+            WalkEvent::Enter(node) => node,
+            WalkEvent::Leave(node) => {
+                if node.kind() == SyntaxKind::MODULE {
+                    within.pop();
+                }
+                continue;
+            }
+        };
+        match node.kind() {
+            SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST => {}
+            SyntaxKind::MODULE => {
+                let name = ast::Module::cast(node).and_then(|it| it.name()).map_or("", |it| it.text());
+                let next = modules.len() as u32 + 1;
+                let module = *modules.entry((*within.last()?, name)).or_insert(next);
+                within.push(module);
+            }
+            // A function in a function is of its body, not of a module.
+            SyntaxKind::FN => {
+                walk.skip_subtree();
+                let Some(func) = ast::Fn::cast(node) else { continue };
+                let Some(name) = func.name() else { continue };
+                if found.insert((*within.last()?, name.text()), func).is_some() {
+                    return None;
+                }
+            }
+            _ => walk.skip_subtree(),
+        }
+    }
+    Some(found)
+}
+
+/// Whether a function added to a file is compiled once, under its own symbol, and seen by
+/// nothing but what calls it: not generic, not `#[inline]`, and with a body that nothing else
+/// sees into and that declares no items.
+fn added_alone(func: ast::Fn<'_>) -> bool {
+    let impl_trait_parameter = func.param_list().is_some_and(|it| {
+        it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+    });
+    let inline = func.attrs().any(|attr| {
+        let text = attr.syntax().text();
+        text.contains("inline") && !text.contains("never")
+    });
+    let Some(body) = func.body() else { return false };
+    let declares = body.syntax().descendants().skip(1).any(|it| {
+        ast::Item::can_cast(it.kind())
+            && !matches!(
+                it.kind(),
+                SyntaxKind::MACRO_CALL | SyntaxKind::USE | SyntaxKind::EXTERN_CRATE
+            )
+    });
+    func.generic_param_list().is_none()
+        && !impl_trait_parameter
+        && !inline
+        && !declares
+        && is_unseen_body(body.syntax())
+}
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 9. `crates/blaze-engine/src/outline.rs` (lines 704-704 now)
+
+Why: `skeleton` on the view.
+
+Old:
+
+```rust
+    skeleton_of(&EditionedFileId::new(db, file, edition).parse(db).syntax_node())
+```
+
+New:
+
+```rust
+    skeleton_of(EditionedFileId::new(db, file, edition).parse(db).root())
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 10. `crates/blaze-engine/src/outline.rs` (lines 707-828 now)
+
+Why: `skeleton_of`, `hash_outside_bodies`, `is_unseen_body`, `is_inert` on `Copy` views; attribute text read in place.
+
+Old:
+
+```rust
+fn skeleton_of(tree: &SyntaxNode) -> Option<u64> {
+    let written_by_macro = |node: &SyntaxNode| {
+        node.kind() == SyntaxKind::MACRO_CALL
+            && node.parent().is_some_and(|it| {
+                !matches!(
+                    it.kind(),
+                    SyntaxKind::SOURCE_FILE
+                        | SyntaxKind::MACRO_EXPR
+                        | SyntaxKind::MACRO_PAT
+                        | SyntaxKind::MACRO_TYPE
+                )
+            })
+    };
+    // An import's id is of a kind of its own, which no function's is found by.
+    let has_items = |body: &SyntaxNode| {
+        body.descendants().skip(1).any(|it| {
+            ast::Item::can_cast(it.kind())
+                && !matches!(
+                    it.kind(),
+                    SyntaxKind::MACRO_CALL | SyntaxKind::USE | SyntaxKind::EXTERN_CRATE
+                )
+        })
+    };
+    for node in tree.descendants() {
+        if written_by_macro(&node) || is_unseen_body(&node) && has_items(&node) {
+            return None;
+        }
+    }
+    Some(hash_outside_bodies(tree, &FxHashSet::default(), &FxHashSet::default()).0)
+}
+
+/// The hash, and how many of the `declaring` functions were come by. The functions at
+/// `skipped` are left out whole.
+fn hash_outside_bodies(
+    file: &SyntaxNode,
+    declaring: &FxHashSet<TextRange>,
+    skipped: &FxHashSet<TextRange>,
+) -> (u64, usize) {
+    let mut hasher = FxHasher::default();
+    let mut found = 0;
+    let mut walk = file.preorder_with_tokens();
+    while let Some(event) = walk.next() {
+        match event {
+            WalkEvent::Enter(syntax::NodeOrToken::Node(node))
+                if node.kind() == SyntaxKind::FN && skipped.contains(&node.text_range()) =>
+            {
+                walk.skip_subtree();
+            }
+            WalkEvent::Enter(syntax::NodeOrToken::Node(node)) => {
+                node.kind().hash(&mut hasher);
+                if node.kind() == SyntaxKind::FN && declaring.contains(&node.text_range()) {
+                    found += 1;
+                } else if is_unseen_body(&node)
+                    && node.parent().is_none_or(|it| !declaring.contains(&it.text_range()))
+                {
+                    walk.skip_subtree();
+                }
+            }
+            WalkEvent::Enter(syntax::NodeOrToken::Token(token)) => {
+                // Blank space and comments say nothing, except to a macro that is handed them.
+                // A doc comment is a token of another kind.
+                let blank = matches!(token.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)
+                    && token.parent().is_none_or(|it| it.kind() != SyntaxKind::TOKEN_TREE);
+                if !blank {
+                    token.kind().hash(&mut hasher);
+                    token.text().hash(&mut hasher);
+                }
+            }
+            WalkEvent::Leave(_) => {}
+        }
+    }
+    (hasher.finish(), found)
+}
+
+/// Whether the node is the body of a function that nothing else sees into, going by how the
+/// function is written. What its body declares takes name resolution to tell.
+fn is_unseen_body(node: &SyntaxNode) -> bool {
+    if node.kind() != SyntaxKind::BLOCK_EXPR {
+        return false;
+    }
+    let Some(func) = node.parent().and_then(ast::Fn::cast) else { return false };
+    if func.const_token().is_some() || func.async_token().is_some() || func.gen_token().is_some() {
+        return false;
+    }
+    let names_its_type = func.ret_type().is_some_and(|it| {
+        it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+    });
+    if names_its_type || !is_inert(func.syntax()) {
+        return false;
+    }
+    // rustc copies the body into the callers, also the ones it compiled for us.
+    let always_inlined = func.attrs().any(|attr| {
+        attr.simple_name().is_some_and(|name| name == "inline")
+            && attr.syntax().text().to_string().contains("always")
+    });
+    if always_inlined {
+        return false;
+    }
+    // An attribute written inside the body is the function's, and a macro declared in it can
+    // be exported from the crate.
+    let reaches_out = node.descendants().any(|it| match it.kind() {
+        SyntaxKind::ATTR => it.ancestors().nth(2).is_some_and(|block| block == *node),
+        SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => true,
+        _ => false,
+    });
+    if reaches_out {
+        return false;
+    }
+    // Only items, all the way up: a function in a body is that body's, and one in a macro's
+    // input is the macro's.
+    func.syntax().ancestors().skip(1).all(|it| match it.kind() {
+        SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST | SyntaxKind::ASSOC_ITEM_LIST => true,
+        SyntaxKind::MODULE | SyntaxKind::IMPL | SyntaxKind::TRAIT => is_inert(&it),
+        _ => false,
+    })
+}
+
+/// Whether no attribute on the item can be a macro that rewrites it.
+fn is_inert(item: &SyntaxNode) -> bool {
+    let Some(item) = ast::AnyHasAttrs::cast(item.clone()) else { return false };
+    item.attrs().all(|attr| attr.simple_name().is_some_and(|name| INERT.contains(&name.as_str())))
+}
+```
+
+New:
+
+```rust
+fn skeleton_of<'t>(tree: Node<'t>) -> Option<u64> {
+    let written_by_macro = |node: Node<'t>| {
+        node.kind() == SyntaxKind::MACRO_CALL
+            && node.parent().is_some_and(|it| {
+                !matches!(
+                    it.kind(),
+                    SyntaxKind::SOURCE_FILE
+                        | SyntaxKind::MACRO_EXPR
+                        | SyntaxKind::MACRO_PAT
+                        | SyntaxKind::MACRO_TYPE
+                )
+            })
+    };
+    // An import's id is of a kind of its own, which no function's is found by.
+    let has_items = |body: Node<'t>| {
+        body.descendants().skip(1).any(|it| {
+            ast::Item::can_cast(it.kind())
+                && !matches!(
+                    it.kind(),
+                    SyntaxKind::MACRO_CALL | SyntaxKind::USE | SyntaxKind::EXTERN_CRATE
+                )
+        })
+    };
+    for node in tree.descendants() {
+        if written_by_macro(node) || is_unseen_body(node) && has_items(node) {
+            return None;
+        }
+    }
+    Some(hash_outside_bodies(tree, &FxHashSet::default(), &FxHashSet::default()).0)
+}
+
+/// The hash, and how many of the `declaring` functions were come by. The functions at
+/// `skipped` are left out whole.
+fn hash_outside_bodies(
+    file: Node<'_>,
+    declaring: &FxHashSet<TextRange>,
+    skipped: &FxHashSet<TextRange>,
+) -> (u64, usize) {
+    let mut hasher = FxHasher::default();
+    let mut found = 0;
+    let mut walk = file.preorder_with_tokens();
+    while let Some(event) = walk.next() {
+        match event {
+            WalkEvent::Enter(syntax::NodeOrToken::Node(node))
+                if node.kind() == SyntaxKind::FN && skipped.contains(&node.text_range()) =>
+            {
+                walk.skip_subtree();
+            }
+            WalkEvent::Enter(syntax::NodeOrToken::Node(node)) => {
+                node.kind().hash(&mut hasher);
+                if node.kind() == SyntaxKind::FN && declaring.contains(&node.text_range()) {
+                    found += 1;
+                } else if is_unseen_body(node)
+                    && node.parent().is_none_or(|it| !declaring.contains(&it.text_range()))
+                {
+                    walk.skip_subtree();
+                }
+            }
+            WalkEvent::Enter(syntax::NodeOrToken::Token(token)) => {
+                // Blank space and comments say nothing, except to a macro that is handed them.
+                // A doc comment is a token of another kind.
+                let blank = matches!(token.kind(), SyntaxKind::WHITESPACE | SyntaxKind::COMMENT)
+                    && token.parent().is_none_or(|it| it.kind() != SyntaxKind::TOKEN_TREE);
+                if !blank {
+                    token.kind().hash(&mut hasher);
+                    token.text().hash(&mut hasher);
+                }
+            }
+            WalkEvent::Leave(_) => {}
+        }
+    }
+    (hasher.finish(), found)
+}
+
+/// Whether the node is the body of a function that nothing else sees into, going by how the
+/// function is written. What its body declares takes name resolution to tell.
+fn is_unseen_body(node: Node<'_>) -> bool {
+    if node.kind() != SyntaxKind::BLOCK_EXPR {
+        return false;
+    }
+    let Some(func) = node.parent().and_then(ast::Fn::cast) else { return false };
+    if func.const_token().is_some() || func.async_token().is_some() || func.gen_token().is_some() {
+        return false;
+    }
+    let names_its_type = func.ret_type().is_some_and(|it| {
+        it.syntax().descendants().any(|it| it.kind() == SyntaxKind::IMPL_TRAIT_TYPE)
+    });
+    if names_its_type || !is_inert(func.syntax()) {
+        return false;
+    }
+    // rustc copies the body into the callers, also the ones it compiled for us.
+    let always_inlined = func.attrs().any(|attr| {
+        attr.simple_name().is_some_and(|name| name == "inline")
+            && attr.syntax().text().contains("always")
+    });
+    if always_inlined {
+        return false;
+    }
+    // An attribute written inside the body is the function's, and a macro declared in it can
+    // be exported from the crate.
+    let reaches_out = node.descendants().any(|it| match it.kind() {
+        SyntaxKind::ATTR => it.ancestors().nth(2).is_some_and(|block| block == node),
+        SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF => true,
+        _ => false,
+    });
+    if reaches_out {
+        return false;
+    }
+    // Only items, all the way up: a function in a body is that body's, and one in a macro's
+    // input is the macro's.
+    func.syntax().ancestors().skip(1).all(|it| match it.kind() {
+        SyntaxKind::SOURCE_FILE | SyntaxKind::ITEM_LIST | SyntaxKind::ASSOC_ITEM_LIST => true,
+        SyntaxKind::MODULE | SyntaxKind::IMPL | SyntaxKind::TRAIT => is_inert(it),
+        _ => false,
+    })
+}
+
+/// Whether no attribute on the item can be a macro that rewrites it.
+fn is_inert(item: Node<'_>) -> bool {
+    let Some(item) = ast::AnyHasAttrs::cast(item) else { return false };
+    item.attrs().all(|attr| attr.simple_name().is_some_and(|name| INERT.contains(&name)))
+}
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 11. `crates/blaze-engine/src/outline.rs` (lines 971-974 now)
+
+Why: tests: the parse kept while its view is walked.
+
+Old:
+
+```rust
+    fn hash(text: &str) -> u64 {
+        let tree = SourceFile::parse(text, Edition::CURRENT).syntax_node();
+        hash_outside_bodies(&tree, &FxHashSet::default(), &FxHashSet::default()).0
+    }
+```
+
+New:
+
+```rust
+    fn hash(text: &str) -> u64 {
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        hash_outside_bodies(parse.root(), &FxHashSet::default(), &FxHashSet::default()).0
+    }
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 12. `crates/blaze-engine/src/outline.rs` (lines 986-988 now)
+
+Why: tests on views.
+
+Old:
+
+```rust
+    fn copies(text: &str) -> Copied {
+        copied_in(&SourceFile::parse(text, Edition::CURRENT).syntax_node())
+    }
+```
+
+New:
+
+```rust
+    fn copies(text: &str) -> Copied {
+        copied_in(SourceFile::parse(text, Edition::CURRENT).root())
+    }
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 13. `crates/blaze-engine/src/outline.rs` (lines 1139-1141 now)
+
+Why: tests on views.
+
+Old:
+
+```rust
+    fn skeleton(text: &str) -> Option<u64> {
+        skeleton_of(&SourceFile::parse(text, Edition::CURRENT).syntax_node())
+    }
+```
+
+New:
+
+```rust
+    fn skeleton(text: &str) -> Option<u64> {
+        skeleton_of(SourceFile::parse(text, Edition::CURRENT).root())
+    }
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 14. `crates/blaze-engine/src/outline.rs` (lines 1173-1178 now)
+
+Why: tests on views.
+
+Old:
+
+```rust
+        let hash = |text: &str| {
+            let tree = SourceFile::parse(text, Edition::CURRENT).syntax_node();
+            let declaring = tree.descendants().find(|it| it.kind() == SyntaxKind::FN).unwrap();
+            let declaring = FxHashSet::from_iter([declaring.text_range()]);
+            hash_outside_bodies(&tree, &declaring, &FxHashSet::default())
+        };
+```
+
+New:
+
+```rust
+        let hash = |text: &str| {
+            let parse = SourceFile::parse(text, Edition::CURRENT);
+            let tree = parse.root();
+            let declaring = tree.descendants().find(|it| it.kind() == SyntaxKind::FN).unwrap();
+            let declaring = FxHashSet::from_iter([declaring.text_range()]);
+            hash_outside_bodies(tree, &declaring, &FxHashSet::default())
+        };
+```
+
+> forwarded to codegen (requests, pass 24).
+
+### 15. `crates/blaze-engine/src/outline.rs` (lines 1184-1188 now)
+
+Why: tests on views, and one for the interned module paths: same path in both trees is one module, a nested `b` is not the top-level `b`.
+
+Old:
+
+```rust
+    fn added(before: &str, after: &str) -> Option<Vec<String>> {
+        let parse = |text: &str| SourceFile::parse(text, Edition::CURRENT).syntax_node();
+        let added = added_functions(&parse(before), &parse(after))?;
+        Some(added.iter().map(|it| it.name().unwrap().text().to_string()).collect())
+    }
+```
+
+New:
+
+```rust
+    fn added(before: &str, after: &str) -> Option<Vec<String>> {
+        let before = SourceFile::parse(before, Edition::CURRENT);
+        let after = SourceFile::parse(after, Edition::CURRENT);
+        let added = added_functions(before.root(), after.root())?;
+        Some(added.iter().map(|it| it.name().unwrap().text().to_owned()).collect())
+    }
+
+    #[test]
+    fn functions_are_told_apart_by_the_path_of_their_module() {
+        let before = "mod a {\n    fn f() {}\n    mod b {}\n}\nmod b {}\n";
+        // `a::b::f` and `b::f` are two functions, and neither is `a::f`.
+        let after = "mod a {\n    fn f() {}\n    mod b {\n        fn f() {}\n    }\n}\nmod b {\n    fn f() {}\n}\n";
+        assert_eq!(added(before, after).unwrap(), ["f", "f"]);
+        // `a::f` taken to `a::b::f` is one taken away and another added.
+        let after = "mod a {\n    mod b {\n        fn f() {}\n    }\n}\nmod b {}\n";
+        assert_eq!(added(before, after), None);
+    }
+```
+
+> forwarded to codegen (requests, pass 24).
+
+## frontend-fast-bodies-tasks: the front end hears what the walk reaches, and a failed check stops the build (2026-10-29)
+
+From `frontend-fast-bodies-tasks` (notes `docs/v2/plan/lanes/frontend/fast-bodies-tasks.md`).
+A unit's check now runs as one plane task per body beside its codegen
+(`crates/hir/src/check/bodies.rs`, `Plan::reached`); bodies the build reaches are checked
+first. The front end needs the walk's levels as it finds them, before describing them, and
+the driver needs to stop when a check already failed (the build's outcome is then its check's
+errors and nothing codegen makes is used). The check never depends on reachability for
+*whether* a body is checked: every body is, reached ones first. Only `driver.rs`'s walk calls
+`describe`, so this covers fastcompile's builds too. Status: open
+
+### 1. `crates/blaze-codegen/src/backend.rs`: two required `Frontend` methods
+
+Why: the walk tells the front end each level before describing it; the driver asks whether to
+stop between its phases.
+
+Old:
+
+```rust
+    fn describe_static(
+        &self,
+        value: &Self::Static,
+    ) -> Result<DescribedStatic<Self::Instance, Self::Static>, CodegenError>;
+}
+
+/// What a prepared function compiles to, up to what fills its places: the content ID of its
+```
+
+New:
+
+```rust
+    fn describe_static(
+        &self,
+        value: &Self::Static,
+    ) -> Result<DescribedStatic<Self::Instance, Self::Static>, CodegenError>;
+
+    /// The instances and statics the walk reached next, before any of them is described:
+    /// what a front end checking bodies beside the build checks first. Once a level.
+    fn reached(&self, functions: &[(Self::Instance, Origin)], statics: &[Self::Static]);
+
+    /// Whether the build's outcome is decided without its code (a body it compiles failed
+    /// its check): the build stops at its next step and gives [`stopped`](crate::driver).
+    fn stopped(&self) -> bool;
+}
+
+/// What a prepared function compiles to, up to what fills its places: the content ID of its
+```
+
+### 2. `crates/blaze-codegen/src/driver.rs`: the walk tells each level and stops
+
+Why: the hook at the one place levels are known; a stop between levels and phases keeps a
+failing check from waiting on the rest of codegen.
+
+Old (`Build::walk`, line 513):
+
+```rust
+        while !level.is_empty() || !static_level.is_empty() {
+            let described: Vec<_> = level
+```
+
+New:
+
+```rust
+        while !level.is_empty() || !static_level.is_empty() {
+            if self.frontend.stopped() {
+                errors.push(stopped());
+                break;
+            }
+            self.frontend.reached(&level, &static_level);
+            let described: Vec<_> = level
+```
+
+Old (`Build::run`, lines 677 and 685-686):
+
+```rust
+        self.dev(&nodes, store, &mut out);
+        let release: Vec<Job<'_, B>> = nodes
+```
+
+New:
+
+```rust
+        self.dev(&nodes, store, &mut out);
+        if self.frontend.stopped() {
+            return Err(vec![stopped()]);
+        }
+        let release: Vec<Job<'_, B>> = nodes
+```
+
+Old:
+
+```rust
+        self.release(&nodes, &release, store, &mut out);
+        self.statics(&statics, store, &mut out);
+```
+
+New:
+
+```rust
+        self.release(&nodes, &release, store, &mut out);
+        if self.frontend.stopped() {
+            return Err(vec![stopped()]);
+        }
+        self.statics(&statics, store, &mut out);
+```
+
+And a free function at the end of `driver.rs` (before `#[cfg(test)] mod tests;` if it is at
+the end, else anywhere at module level):
+
+```rust
+/// The error of a build stopped because its outcome was decided without its code
+/// ([`Frontend::stopped`]): of no instance, so its keys are empty. Its caller reports the
+/// check's errors, never this.
+fn stopped() -> CodegenError {
+    let none = (InstanceKey(ContentId::default()), ItemKey(ContentId::default()));
+    error(none.0, none.1, "stopped: a body the build compiles failed its check")
+}
+```
+
+(`ContentId`, `InstanceKey`, `ItemKey`, `Frontend` and `error` are in `driver.rs` already.)
+
+### 3. `crates/blaze-codegen/src/driver/tests.rs`: `Program` hears levels and can stop; a test
+
+Why: the other `Frontend` impl; the test pins that each level is told before it is described,
+in walk order, and that a stop ends the build with no output.
+
+Old:
+
+```rust
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+```
+
+New:
+
+```rust
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+```
+
+Old:
+
+```rust
+#[derive(Default)]
+struct Program {
+    functions: HashMap<u32, Function>,
+    /// Each static's value byte and section.
+    statics: HashMap<u32, (u8, Option<String>)>,
+}
+```
+
+New:
+
+```rust
+#[derive(Default)]
+struct Program {
+    functions: HashMap<u32, Function>,
+    /// Each static's value byte and section.
+    statics: HashMap<u32, (u8, Option<String>)>,
+    /// The functions of each level the walk reached, in the order it told them.
+    reached: Mutex<Vec<Vec<u32>>>,
+    stop: AtomicBool,
+}
+```
+
+Old (end of `impl Frontend for Program`):
+
+```rust
+            origin: Origin::Member("app".to_owned()),
+            symbol: None,
+            refs: Vec::new(),
+        })
+    }
+}
+```
+
+New:
+
+```rust
+            origin: Origin::Member("app".to_owned()),
+            symbol: None,
+            refs: Vec::new(),
+        })
+    }
+
+    fn reached(&self, functions: &[(u32, Origin)], _: &[u32]) {
+        self.reached.lock().unwrap().push(functions.iter().map(|it| it.0).collect());
+    }
+
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+}
+```
+
+New test, after `a_cold_build_compiles_once_per_shape_and_a_warm_one_compiles_nothing`:
+
+```rust
+#[test]
+fn the_front_end_hears_each_level_before_it_and_a_stop_ends_the_build() {
+    let (program, policy) = (program(), policy(OptLevel::O0, Mode::Output));
+    let (machine, memo, store) = (Machine::default(), Memo::new(), Store::default());
+    build(&program, &machine, &policy, &memo, &store).unwrap();
+    assert_eq!(*program.reached.lock().unwrap(), [vec![1], vec![2, 3], vec![4, 5]]);
+
+    program.stop.store(true, Ordering::Relaxed);
+    let stopped = Machine::default();
+    let errors = build(&program, &stopped, &policy, &Memo::new(), &store).unwrap_err();
+    assert!(errors.iter().all(|it| it.what.starts_with("stopped")), "{errors:?}");
+    assert_eq!(stopped.prepared.load(Ordering::Relaxed), 0);
+}
+```
+
+### 4. `crates/hir-ty-codegen/v2/frontend.rs`: `BodyChecks`, `with_checks`, the impl
+
+Why: hir-ty-codegen does not depend on `hir` (where the plan is), so the hook is a trait here
+that blaze-cargo implements over the plan (`crates/blaze-cargo/src/serve/unit/checks.rs`).
+
+Old:
+
+```rust
+/// The front end of a v2 build.
+pub struct HirFrontend<'db> {
+    pub(crate) databases: Databases<'db>,
+    pub(crate) hashes: HashSource,
+    pub(crate) build_time: BuildTime,
+    /// Which origins' units MIR-inline: what a function's references are walked for.
+    inlining: Option<Inlining>,
+}
+```
+
+New:
+
+```rust
+/// The check of the bodies a build compiles, run beside it: told what the walk reaches, and
+/// whether the build's outcome is already its failure.
+pub trait BodyChecks: Sync {
+    /// Check these first: bodies the build reached. Any the check does not hold is passed over.
+    fn reached(&self, bodies: &[DefWithBodyId]);
+
+    /// Whether a check failed: what the build makes is then not used.
+    fn stopped(&self) -> bool;
+}
+
+/// The front end of a v2 build.
+pub struct HirFrontend<'db> {
+    pub(crate) databases: Databases<'db>,
+    pub(crate) hashes: HashSource,
+    pub(crate) build_time: BuildTime,
+    /// Which origins' units MIR-inline: what a function's references are walked for.
+    inlining: Option<Inlining>,
+    // dyn: called once a level of the walk, never per instance
+    checks: Option<&'db dyn BodyChecks>,
+}
+```
+
+Old:
+
+```rust
+        HirFrontend { databases, hashes, build_time, inlining: None }
+    }
+```
+
+New:
+
+```rust
+        HirFrontend { databases, hashes, build_time, inlining: None, checks: None }
+    }
+
+    /// The front end of a build whose unit's bodies `checks` checks beside it.
+    pub fn with_checks(mut self, checks: &'db dyn BodyChecks) -> Self {
+        self.checks = Some(checks);
+        self
+    }
+```
+
+Old (end of `impl Frontend for HirFrontend<'_>`):
+
+```rust
+        self.with(|db, homes| self.described_static(db, homes, value))
+    }
+}
+```
+
+New:
+
+```rust
+        self.with(|db, homes| self.described_static(db, homes, value))
+    }
+
+    fn reached(&self, functions: &[(HirInstance, Origin)], statics: &[HirStatic]) {
+        let Some(checks) = self.checks else { return };
+        let bodies: Vec<DefWithBodyId> = self.with(|db, _| {
+            // alloc: once a level of the walk, sized by it
+            (functions.iter().filter_map(|(instance, _)| body_of(db, instance)))
+                .chain(statics.iter().map(|it| DefWithBodyId::StaticId(it.0)))
+                .collect()
+        });
+        checks.reached(&bodies);
+    }
+
+    fn stopped(&self) -> bool {
+        self.checks.is_some_and(|it| it.stopped())
+    }
+}
+
+/// The body whose check an instance's code waits on: a function's, or that of the item a
+/// closure or coroutine is written in. `None` for a shim, `asm!`, the allocator's and a closure
+/// in an anonymous constant, which their module's item checks cover.
+fn body_of(db: &Db, instance: &HirInstance) -> Option<DefWithBodyId> {
+    match &instance.0 {
+        Kind::Code(instance, _) => match instance.def {
+            InstanceDef::Fn(func) | InstanceDef::VtableShim(func) => Some(func.into()),
+            def @ (InstanceDef::Closure(_)
+            | InstanceDef::Coroutine(_)
+            | InstanceDef::CoroutineByMove(_)) => match closure_loc(db, def)?.owner {
+                InferBodyId::DefWithBodyId(owner) => Some(owner),
+                InferBodyId::AnonConstId(_) => None,
+            },
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
+        },
+        Kind::Start(main) => Some((*main).into()),
+        Kind::Asm(_) | Kind::Allocator(_) => None,
+    }
+}
+```
+
+(`DefWithBodyId`, `InferBodyId`, `InstanceDef`, `Kind`, `closure_loc`, `Origin` are in scope in
+`frontend.rs` already; `self.with` is what `describe` uses.)
+
+### 5. `crates/hir-ty-codegen/v2.rs`: export the trait
+
+Old:
+
+```rust
+pub use frontend::{Databases, HirFrontend};
+```
+
+New:
+
+```rust
+pub use frontend::{BodyChecks, Databases, HirFrontend};
+```
+
+> applied by codegen-v2 (2026-10-29): sections 1-5 as written (`Frontend::reached`/`stopped` in `backend.rs`, the walk's and `run`'s stops and `stopped()` in `driver.rs`, `Program`'s impl and the test in `driver/tests.rs`, `BodyChecks`/`with_checks`/`body_of` in `v2/frontend.rs`, the export in `v2.rs`); `Program` and `HirFrontend` are the only `Frontend` impls; the two `vec![stopped()]` carry `// alloc:` for the hot lint. blaze-cargo's `BodyChecks` impl is the requester's.
+
+## frontend-tree: hir-ty-mir location.rs, hir-ty-codegen mod.rs places.rs stable.rs: onto views (2)
+
+Renamed (2026-10-29 21:56, frontend-tree): the twin of `MacroCallLoc::to_node` is `MacroCallLoc::to_node_view`; the hunks below say so.
+From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. `hir_ty_mir::mir::location`'s syntax functions take and give views (`written_range(Node)`, `concat_parts(Node)`, `reported_range(.., Node)`, `written_call -> Option<InFile<Node<'db>>>`), and their only callers (`hir-ty-codegen` `mod.rs`, `places.rs`) move with them in this heading, so it lands as one. `stable.rs` rides along (the same `MacroCallLoc` read).
+
+needs: frontend-tree-move-expand's `MacroCallLoc::to_node_view<'db>(&self, db: &'db Db) -> InFile<syntax::view::Node<'db>>` (its request 2, `hir-expand lib.rs`, in `v2/requests/db-expand.md`), and frontend-tree-move-def's `BodySyntax::tree(&self, db: &Db) -> Arc<FlatTree>` (`hir-def expr_store/body.rs`, in `v2/requests/db.md`).
+
+Same meaning as the handles: `HasSource::source(db)` is `ast_ptr(db)` found under `parse_or_expand`, so `syntax::view::to_node(ptr, file_id.root(db))` is the same node; `concat_parts` reads the arguments as the call's token tree is walked once (no `Vec` of elements); a call in the body's anchor keeps its written range (`CallNode::Anchored(TextRange)`), the only thing read of it. The stable names and `lasting_static_name` hash `&str` where they hashed `String`: `Hash` writes the same bytes, so names across edits are unchanged. New tests in `location.rs`: `concat_arguments_are_read_in_place`, `a_call_of_a_place_is_found_past_blank_space`.
+
+### 1. `crates/hir-ty-mir/src/mir/location.rs` (lines 17-17 now)
+
+Why: views instead of handles.
+
+Old:
+
+```rust
+use syntax::{AstNode, AstToken, SyntaxElement, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+```
+
+New:
+
+```rust
+use syntax::{
+    NodeOrToken, SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode, AstToken, Element, Node},
+};
+```
+
+### 2. `crates/hir-ty-mir/src/mir/location.rs` (lines 25-36 now)
+
+Why: `written_range` takes a view.
+
+Old:
+
+```rust
+/// The range of an item or a macro call without the attributes and comments on top of it,
+/// which rustc's span of it leaves out.
+pub fn written_range(node: &SyntaxNode) -> TextRange {
+    let start = node
+        .children_with_tokens()
+        .find(|it| {
+            !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
+                && !it.kind().is_trivia()
+        })
+        .map_or(node.text_range().start(), |it| it.text_range().start());
+    TextRange::new(start, node.text_range().end())
+}
+```
+
+New:
+
+```rust
+/// The range of an item or a macro call without the attributes and comments on top of it,
+/// which rustc's span of it leaves out.
+pub fn written_range(node: Node<'_>) -> TextRange {
+    let start = node
+        .children_with_tokens()
+        .find(|it| {
+            !matches!(it.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT)
+                && !it.kind().is_trivia()
+        })
+        .map_or(node.text_range().start(), |it| it.text_range().start());
+    TextRange::new(start, node.text_range().end())
+}
+```
+
+### 3. `crates/hir-ty-mir/src/mir/location.rs` (lines 105-105 now)
+
+Why: the call as a view.
+
+Old:
+
+```rust
+            (concat && names_location(&loc.to_node(db).value)).then_some((id, file_id))
+```
+
+New:
+
+```rust
+            (concat && names_location(loc.to_view(db).value)).then_some((id, file_id))
+```
+
+### 4. `crates/hir-ty-mir/src/mir/location.rs` (lines 188-191 now)
+
+Why: the call as a view.
+
+Old:
+
+```rust
+        let call = file_id.macro_file()?.loc(db).to_node(db);
+        // alloc: the value of the `concat!`, made only where one of a place is evaluated
+        let mut text = String::new();
+        for part in concat_parts(&call.value)? {
+```
+
+New:
+
+```rust
+        let call = file_id.macro_file()?.loc(db).to_view(db);
+        // alloc: the value of the `concat!`, made only where one of a place is evaluated
+        let mut text = String::new();
+        for part in concat_parts(call.value)? {
+```
+
+### 5. `crates/hir-ty-mir/src/mir/location.rs` (lines 207-208 now)
+
+Why: the site is a `Copy` view.
+
+Old:
+
+```rust
+    let site = written_call(db, file_id)?;
+    let range = InFile::new(site.file_id, written_range(&site.value));
+```
+
+New:
+
+```rust
+    let site = written_call(db, file_id)?;
+    let range = InFile::new(site.file_id, written_range(site.value));
+```
+
+### 6. `crates/hir-ty-mir/src/mir/location.rs` (lines 229-306 now)
+
+Why: `names_location`, `concat_parts` (streamed: first and last three elements of each argument, no `Vec` of elements; same `None`s), `concat_part`, `written_call` on views; `ConcatPart` unchanged.
+
+Old:
+
+```rust
+/// Whether a macro call is passed a call of `line!`, `column!` or `file!`.
+fn names_location(call: &SyntaxNode) -> bool {
+    call.descendants_with_tokens().filter_map(|it| it.into_token()).any(|token| {
+        token.kind() == SyntaxKind::IDENT
+            && location_expander(token.text()).is_some()
+            && token
+                .next_token()
+                .and_then(|next| syntax::algo::skip_trivia_token(next, syntax::Direction::Next))
+                .is_some_and(|next| next.kind() == SyntaxKind::BANG)
+    })
+}
+
+/// An argument of a `concat!`.
+pub enum ConcatPart {
+    Text(String),
+    /// A call of `line!`, `column!` or `file!`, and where it is.
+    Location(BuiltinFnLikeExpander, TextRange),
+}
+
+/// The arguments of a `concat!` call, when each is a literal or a call of `line!`, `column!`
+/// or `file!`.
+pub fn concat_parts(call: &SyntaxNode) -> Option<Vec<ConcatPart>> {
+    // clone: a syntax node handle (a refcount)
+    let tree = ast::MacroCall::cast(call.clone())?.token_tree()?;
+    let mut inside: Vec<SyntaxElement> =
+        // alloc: the call's arguments, read only where a `concat!` of a place is evaluated
+        tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).collect();
+    inside.pop()?;
+    let inside = inside.get(1..)?;
+    inside
+        .split(|it| it.kind() == SyntaxKind::COMMA)
+        .filter(|argument| !argument.is_empty())
+        .map(concat_part)
+        // alloc: the parts, made only where a `concat!` of a place is evaluated
+        .collect()
+}
+
+fn concat_part(argument: &[SyntaxElement]) -> Option<ConcatPart> {
+    if let [SyntaxElement::Token(token)] = argument {
+        let text = match token.kind() {
+            // clone: a token handle; alloc: the part's text
+            SyntaxKind::STRING => ast::String::cast(token.clone())?.value().ok()?.into_owned(),
+            SyntaxKind::INT_NUMBER => {
+                // clone: a token handle; alloc: the part's text
+                ast::IntNumber::cast(token.clone())?.value().ok()?.to_string()
+            }
+            // clone: a token handle; alloc: the part's text
+            SyntaxKind::CHAR => ast::Char::cast(token.clone())?.value().ok()?.to_string(),
+            // alloc: the part's text
+            SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => token.text().to_owned(),
+            _ => return None,
+        };
+        return Some(ConcatPart::Text(text));
+    }
+    let [.., SyntaxElement::Token(name), bang, SyntaxElement::Node(arguments)] = argument else {
+        return None;
+    };
+    let expander = location_expander(name.text())?;
+    let empty = arguments.children_with_tokens().filter(|it| !it.kind().is_trivia()).count() == 2;
+    (bang.kind() == SyntaxKind::BANG && empty).then(|| {
+        let range = argument[0].text_range().cover(arguments.text_range());
+        ConcatPart::Location(expander, range)
+    })
+}
+
+/// The macro call an expansion comes from that is itself written out, in the source or in
+/// what a macro was passed, and not by another macro.
+pub fn written_call(db: &Db, file_id: HirFileId) -> Option<InFile<SyntaxNode>> {
+    let mut call = file_id.macro_file()?.loc(db).to_node(db);
+    while let Some(outer) = call.file_id.macro_file() {
+        let start = TextRange::empty(call.value.text_range().start());
+        if call.file_id.span_map(db).span_for_range(start).ctx.is_root() {
+            break;
+        }
+        call = outer.loc(db).to_node(db);
+    }
+    Some(call)
+}
+```
+
+New:
+
+```rust
+/// Whether a macro call is passed a call of `line!`, `column!` or `file!`.
+fn names_location(call: Node<'_>) -> bool {
+    call.descendants_with_tokens().filter_map(|it| it.into_token()).any(|token| {
+        token.kind() == SyntaxKind::IDENT
+            && location_expander(token.text()).is_some()
+            && std::iter::successors(token.next_token(), |it| it.next_token())
+                .find(|next| !next.kind().is_trivia())
+                .is_some_and(|next| next.kind() == SyntaxKind::BANG)
+    })
+}
+
+/// An argument of a `concat!`.
+pub enum ConcatPart {
+    Text(String),
+    /// A call of `line!`, `column!` or `file!`, and where it is.
+    Location(BuiltinFnLikeExpander, TextRange),
+}
+
+/// The arguments of a `concat!` call, when each is a literal or a call of `line!`, `column!`
+/// or `file!`.
+pub fn concat_parts(call: Node<'_>) -> Option<Vec<ConcatPart>> {
+    let tree = ast::MacroCall::cast(call)?.token_tree()?;
+    let mut inside =
+        tree.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).peekable();
+    // The delimiters: one opens the arguments, the last one closes them.
+    inside.next()?;
+    inside.peek()?;
+    // alloc: the parts, made only where a `concat!` of a place is evaluated
+    let mut parts = Vec::new();
+    let mut argument = Argument::default();
+    while let Some(element) = inside.next() {
+        if inside.peek().is_none() {
+            break;
+        }
+        match element.kind() == SyntaxKind::COMMA {
+            true => {
+                if argument.len != 0 {
+                    parts.push(concat_part(std::mem::take(&mut argument))?);
+                }
+            }
+            false => argument.push(element),
+        }
+    }
+    if argument.len != 0 {
+        parts.push(concat_part(argument)?);
+    }
+    Some(parts)
+}
+
+/// What [`concat_part`] reads of an argument as its elements go by: the first, the last three
+/// and how many.
+#[derive(Clone, Copy, Default)]
+struct Argument<'t> {
+    first: Option<Element<'t>>,
+    last: [Option<Element<'t>>; 3],
+    len: usize,
+}
+
+impl<'t> Argument<'t> {
+    fn push(&mut self, element: Element<'t>) {
+        self.first.get_or_insert(element);
+        self.last = [self.last[1], self.last[2], Some(element)];
+        self.len += 1;
+    }
+}
+
+fn concat_part(argument: Argument<'_>) -> Option<ConcatPart> {
+    if let (1, Some(NodeOrToken::Token(token))) = (argument.len, argument.first) {
+        let text = match token.kind() {
+            // alloc: the part's text
+            SyntaxKind::STRING => ast::String::cast(token)?.value().ok()?.into_owned(),
+            // alloc: the part's text
+            SyntaxKind::INT_NUMBER => ast::IntNumber::cast(token)?.value().ok()?.to_string(),
+            // alloc: the part's text
+            SyntaxKind::CHAR => ast::Char::cast(token)?.value().ok()?.to_string(),
+            // alloc: the part's text
+            SyntaxKind::TRUE_KW | SyntaxKind::FALSE_KW => token.text().to_owned(),
+            _ => return None,
+        };
+        return Some(ConcatPart::Text(text));
+    }
+    let [Some(NodeOrToken::Token(name)), Some(bang), Some(NodeOrToken::Node(arguments))] =
+        argument.last
+    else {
+        return None;
+    };
+    let (expander, first) = (location_expander(name.text())?, argument.first?);
+    let empty = arguments.children_with_tokens().filter(|it| !it.kind().is_trivia()).count() == 2;
+    (bang.kind() == SyntaxKind::BANG && empty).then(|| {
+        let range = first.text_range().cover(arguments.text_range());
+        ConcatPart::Location(expander, range)
+    })
+}
+
+/// The macro call an expansion comes from that is itself written out, in the source or in
+/// what a macro was passed, and not by another macro.
+pub fn written_call<'db>(db: &'db Db, file_id: HirFileId) -> Option<InFile<Node<'db>>> {
+    let mut call = file_id.macro_file()?.loc(db).to_view(db);
+    while let Some(outer) = call.file_id.macro_file() {
+        let start = TextRange::empty(call.value.text_range().start());
+        if call.file_id.span_map(db).span_for_range(start).ctx.is_root() {
+            break;
+        }
+        call = outer.loc(db).to_view(db);
+    }
+    Some(call)
+}
+```
+
+### 7. `crates/hir-ty-mir/src/mir/location.rs` (lines 338-338 now)
+
+Why: the call is a `Copy` view.
+
+Old:
+
+```rust
+        Some(call) if own_tokens => InFile::new(call.file_id, written_range(&call.value))
+```
+
+New:
+
+```rust
+        Some(call) if own_tokens => InFile::new(call.file_id, written_range(call.value))
+```
+
+### 8. `crates/hir-ty-mir/src/mir/location.rs` (lines 399-403 now)
+
+Why: the expression found as a view under `HirFileId::root`.
+
+Old:
+
+```rust
+        MirSpan::ExprId(expr) => {
+            let root = source.file_id.parse_or_expand(db);
+            let node = source.value.syntax_node_ptr().to_node(&root);
+            reported_range(db, owner, expr, source.file_id, &node)?
+        }
+```
+
+New:
+
+```rust
+        MirSpan::ExprId(expr) => {
+            let node = ast::to_node(source.value.syntax_node_ptr(), source.file_id.root(db));
+            reported_range(db, owner, expr, source.file_id, node)?
+        }
+```
+
+### 9. `crates/hir-ty-mir/src/mir/location.rs` (lines 412-448 now)
+
+Why: `reported_range` and `parenthesized` take a view (no clone to cast).
+
+Old:
+
+```rust
+pub fn reported_range(
+    db: &Db,
+    owner: DefWithBodyId,
+    expr: ExprId,
+    file_id: HirFileId,
+    node: &SyntaxNode,
+) -> Option<TextRange> {
+    let end = node.text_range().end();
+    // clone: a syntax node handle (a refcount)
+    if let Some(call) = ast::MethodCallExpr::cast(node.clone()) {
+        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
+    }
+    // clone: a syntax node handle (a refcount)
+    if let Some(written) = ast::IndexExpr::cast(node.clone())
+        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner).expr(expr)
+        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
+    {
+        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
+    }
+    Some(parenthesized(db, file_id, node))
+}
+
+/// The range of an expression with the parentheses around it. rustc's span of an expression
+/// includes them when both are written in one place, and not when a macro put the
+/// parentheses around what it was passed.
+fn parenthesized(db: &Db, file_id: HirFileId, node: &SyntaxNode) -> TextRange {
+    let passed_in = |range: TextRange| {
+        file_id.macro_file().is_none()
+            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
+    };
+    let inner = passed_in(node.text_range());
+    node.ancestors()
+        .skip(1)
+        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
+        .last()
+        .map_or(node.text_range(), |it| it.text_range())
+}
+```
+
+New:
+
+```rust
+pub fn reported_range(
+    db: &Db,
+    owner: DefWithBodyId,
+    expr: ExprId,
+    file_id: HirFileId,
+    node: Node<'_>,
+) -> Option<TextRange> {
+    let end = node.text_range().end();
+    if let Some(call) = ast::MethodCallExpr::cast(node) {
+        return Some(TextRange::new(call.name_ref()?.syntax().text_range().start(), end));
+    }
+    if let Some(written) = ast::IndexExpr::cast(node)
+        && let hir_def::hir::Expr::Index { base, index } = Body::of(db, owner).expr(expr)
+        && !is_builtin_index(InferenceResult::of(db, owner), base, index)
+    {
+        return Some(TextRange::new(written.l_brack_token()?.text_range().start(), end));
+    }
+    Some(parenthesized(db, file_id, node))
+}
+
+/// The range of an expression with the parentheses around it. rustc's span of an expression
+/// includes them when both are written in one place, and not when a macro put the
+/// parentheses around what it was passed.
+fn parenthesized(db: &Db, file_id: HirFileId, node: Node<'_>) -> TextRange {
+    let passed_in = |range: TextRange| {
+        file_id.macro_file().is_none()
+            || file_id.span_map(db).span_for_range(TextRange::empty(range.start())).ctx.is_root()
+    };
+    let inner = passed_in(node.text_range());
+    node.ancestors()
+        .skip(1)
+        .take_while(|it| it.kind() == SyntaxKind::PAREN_EXPR && passed_in(it.text_range()) == inner)
+        .last()
+        .map_or(node.text_range(), |it| it.text_range())
+}
+```
+
+### 10. `crates/hir-ty-mir/src/mir/location.rs` (lines 464-466 now)
+
+Why: tests of `concat_parts` (literals, trailing and empty commas, calls of places with their ranges, refusals) and `names_location` past trivia.
+
+Old:
+
+```rust
+    let name = &FunctionSignature::of(db, func).name;
+    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
+}
+```
+
+New:
+
+```rust
+    let name = &FunctionSignature::of(db, func).name;
+    trait_ref.skip_binder().def_id.0.trait_items(db).method_by_name(name).is_some_and(has)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The parts of the first macro call in `text`: a literal's text, or where a call of a
+    /// place is.
+    fn parts(text: &str) -> Option<Vec<Result<String, TextRange>>> {
+        let parse = syntax::SourceFile::parse(text, syntax::Edition::CURRENT);
+        let call = parse.root().descendants().find(|it| it.kind() == SyntaxKind::MACRO_CALL)?;
+        let parts = concat_parts(call)?.into_iter().map(|it| match it {
+            ConcatPart::Text(text) => Ok(text),
+            ConcatPart::Location(_, range) => Err(range),
+        });
+        Some(parts.collect())
+    }
+
+    fn range(text: &str, of: &str) -> TextRange {
+        let start = text.find(of).unwrap();
+        TextRange::new(TextSize::new(start as u32), TextSize::new((start + of.len()) as u32))
+    }
+
+    #[test]
+    fn concat_arguments_are_read_in_place() {
+        let text = r#"const C: &str = concat!("a\n", 12, 'c', true,);"#;
+        let read = ["a\n", "12", "c", "true"].map(|it| Ok(it.to_owned()));
+        assert_eq!(parts(text).unwrap(), read);
+        let text = r#"const C: &str = concat!("x", line!(), file! ( ));"#;
+        let read = vec![Ok("x".to_owned()), Err(range(text, "line!()")), Err(range(text, "file! ( )"))];
+        assert_eq!(parts(text), Some(read));
+        assert_eq!(parts("const C: &str = concat!();"), Some(Vec::new()));
+        assert_eq!(parts("const C: &str = concat!(,,);"), Some(Vec::new()));
+        // What is not a literal or a call of a place with nothing passed to it.
+        assert_eq!(parts("const C: &str = concat!(x);"), None);
+        assert_eq!(parts("const C: &str = concat!(\"a\" \"b\");"), None);
+        assert_eq!(parts("const C: &str = concat!(line!(1));"), None);
+        assert_eq!(parts("const C: &str = concat!(other!());"), None);
+    }
+
+    #[test]
+    fn a_call_of_a_place_is_found_past_blank_space() {
+        let call = |text: &str| {
+            let parse = syntax::SourceFile::parse(text, syntax::Edition::CURRENT);
+            let call = parse.root().descendants().find(|it| it.kind() == SyntaxKind::MACRO_CALL);
+            names_location(call.unwrap())
+        };
+        assert!(call("const C: &str = concat!(line /* here */ !());"));
+        assert!(!call("const C: &str = concat!(line, column);"));
+    }
+}
+```
+
+### 11. `crates/hir-ty-codegen/mod.rs` (lines 61-61 now)
+
+Why: no handle left in the crate after this heading (`places.rs` included).
+
+Old:
+
+```rust
+use syntax::{AstNode, SyntaxNode, TextRange, TextSize};
+```
+
+New:
+
+```rust
+use syntax::{TextRange, TextSize};
+```
+
+### 12. `crates/hir-ty-codegen/mod.rs` (lines 2658-2664 now)
+
+Why: `written_print` hashes the view's text (the same bytes); the file is asked before any node is found.
+
+Old:
+
+```rust
+    let source = func.lookup(db).source(db);
+    if source.file_id.macro_file().is_some() {
+        return None;
+    }
+    let mut hasher = rustc_hash::FxHasher::default();
+    (*declaration_location(db, func))?.hash(&mut hasher);
+    source.value.syntax().text().to_string().hash(&mut hasher);
+```
+
+New:
+
+```rust
+    let source = func.lookup(db).ast_ptr(db);
+    if source.file_id.macro_file().is_some() {
+        return None;
+    }
+    let mut hasher = rustc_hash::FxHasher::default();
+    (*declaration_location(db, func))?.hash(&mut hasher);
+    let written = syntax::view::to_node(source.value.syntax_node_ptr(), source.file_id.root(db));
+    written.text().hash(&mut hasher);
+```
+
+### 13. `crates/hir-ty-codegen/mod.rs` (lines 4562-4563 now)
+
+Why: the call as a view.
+
+Old:
+
+```rust
+        let written = call.to_node(db);
+        let range = TextRange::empty(written_range(&written.value).start());
+```
+
+New:
+
+```rust
+        let written = call.to_node_view(db);
+        let range = TextRange::empty(written_range(written.value).start());
+```
+
+### 14. `crates/hir-ty-codegen/mod.rs` (lines 4580-4581 now)
+
+Why: the function as a view.
+
+Old:
+
+```rust
+    let source = func.lookup(db).source(db);
+    location_of(db, source.file_id, written_range(source.value.syntax()))
+```
+
+New:
+
+```rust
+    let source = written_node(db, &func.lookup(db));
+    location_of(db, source.file_id, written_range(source.value))
+```
+
+### 15. `crates/hir-ty-codegen/mod.rs` (lines 4596-4600 now)
+
+Why: the function as a view, found only for a macro file.
+
+Old:
+
+```rust
+    let source = func.lookup(db).source(db);
+    if source.file_id.macro_file().is_none() {
+        return *declaration_location(db, func);
+    }
+    written_place(db, source.file_id, written_range(source.value.syntax()), None)
+```
+
+New:
+
+```rust
+    let source = func.lookup(db).ast_ptr(db);
+    if source.file_id.macro_file().is_none() {
+        return *declaration_location(db, func);
+    }
+    let written = syntax::view::to_node(source.value.syntax_node_ptr(), source.file_id.root(db));
+    written_place(db, source.file_id, written_range(written), None)
+```
+
+### 16. `crates/hir-ty-codegen/mod.rs` (lines 4609-4621 now)
+
+Why: the struct or variant as a view; `written_node` is `HasSource::source` with no handle.
+
+Old:
+
+```rust
+    let (file, node) = match def {
+        CallableDefId::FunctionId(_) => return None,
+        CallableDefId::StructId(it) => {
+            let source = it.lookup(db).source(db);
+            (source.file_id, source.value.syntax().clone())
+        }
+        CallableDefId::EnumVariantId(it) => {
+            let source = it.lookup(db).source(db);
+            (source.file_id, source.value.syntax().clone())
+        }
+    };
+    location_of(db, file, written_range(&node))
+}
+```
+
+New:
+
+```rust
+    let source = match def {
+        CallableDefId::FunctionId(_) => return None,
+        CallableDefId::StructId(it) => written_node(db, &it.lookup(db)),
+        CallableDefId::EnumVariantId(it) => written_node(db, &it.lookup(db)),
+    };
+    location_of(db, source.file_id, written_range(source.value))
+}
+
+/// The node `loc` is written as, viewed in the tree the database keeps for its file: what
+/// `source(db)` is, with no handle made.
+fn written_node<'db>(db: &'db Db, loc: &impl HasSource) -> InFile<syntax::view::Node<'db>> {
+    let InFile { file_id, value } = loc.ast_ptr(db);
+    InFile::new(file_id, syntax::view::to_node(value.syntax_node_ptr(), file_id.root(db)))
+}
+```
+
+### 17. `crates/hir-ty-codegen/mod.rs` (lines 7300-7300 now)
+
+Why: the static's text lent; `&str` hashes as the `String` did, so the lasting name is the same.
+
+Old:
+
+```rust
+        let declared = id.lookup(self.db).source(self.db).value.syntax().text().to_string();
+```
+
+New:
+
+```rust
+        let declared = written_node(self.db, &id.lookup(self.db)).value.text();
+```
+
+### 18. `crates/hir-ty-codegen/mod.rs` (lines 13340-13344 now)
+
+Why: the `concat!` call as a view.
+
+Old:
+
+```rust
+            .map(|it| it.loc(db).to_node(db))
+        else {
+            return Ok(None);
+        };
+        let Some(parts) = concat_parts(&call.value) else {
+```
+
+New:
+
+```rust
+            .map(|it| it.loc(db).to_node_view(db))
+        else {
+            return Ok(None);
+        };
+        let Some(parts) = concat_parts(call.value) else {
+```
+
+### 19. `crates/hir-ty-codegen/mod.rs` (lines 13385-13385 now)
+
+Why: the site is a `Copy` view.
+
+Old:
+
+```rust
+        let range = InFile::new(site.file_id, written_range(&site.value));
+```
+
+New:
+
+```rust
+        let range = InFile::new(site.file_id, written_range(site.value));
+```
+
+### 20. `crates/hir-ty-codegen/places.rs` (lines 17-17 now)
+
+Why: `view` named explicitly (the parameter `syntax: &BodySyntax` reads better beside `view::`).
+
+Old:
+
+```rust
+use span::Span;
+```
+
+New:
+
+```rust
+use span::Span;
+use syntax::view;
+```
+
+### 21. `crates/hir-ty-codegen/places.rs` (lines 131-146 now)
+
+Why: a call in the anchor keeps its written range (all that is read of it), viewed in `BodySyntax::tree`; another file's call is a view of the database's tree.
+
+Old:
+
+```rust
+/// The node of a macro call: in the anchor of the body, or in another file.
+enum CallNode {
+    Anchored(SyntaxNode),
+    Other(InFile<SyntaxNode>),
+}
+
+fn call_node(db: &Db, syntax: &BodySyntax, call: MacroCallId) -> CallNode {
+    let loc = call.loc(db);
+    if let MacroCallKind::FnLike { ast_id, .. } = loc.kind
+        && ast_id.file_id == syntax.file_id
+        && let Some(ptr) = syntax.ast_id_map.try_get_erased(ast_id.value.erase())
+    {
+        return CallNode::Anchored(ptr.to_node(&syntax.root(db)));
+    }
+    CallNode::Other(loc.to_node(db))
+}
+```
+
+New:
+
+```rust
+/// The node of a macro call: in the anchor of the body, of which the range it is written at is
+/// kept (the anchor's tree is a count this thread holds, which no view outlives), or in
+/// another file.
+enum CallNode<'db> {
+    Anchored(TextRange),
+    Other(InFile<view::Node<'db>>),
+}
+
+fn call_node<'db>(db: &'db Db, syntax: &BodySyntax, call: MacroCallId) -> CallNode<'db> {
+    let loc = call.loc(db);
+    if let MacroCallKind::FnLike { ast_id, .. } = loc.kind
+        && ast_id.file_id == syntax.file_id
+        && let Some(ptr) = syntax.ast_id_map.try_get_erased(ast_id.value.erase())
+    {
+        let tree = syntax.tree(db);
+        return CallNode::Anchored(written_range(view::to_node(ptr, view::Node::root(&tree))));
+    }
+    CallNode::Other(loc.to_node_view(db))
+}
+```
+
+### 22. `crates/hir-ty-codegen/places.rs` (lines 184-191 now)
+
+Why: the expression viewed in the anchor's tree or the file's root.
+
+Old:
+
+```rust
+        MirSpan::ExprId(expr) => {
+            let root = match source.file_id == syntax.file_id {
+                true => syntax.root(db),
+                false => source.file_id.parse_or_expand(db),
+            };
+            let node = source.value.syntax_node_ptr().to_node(&root);
+            reported_range(db, owner, expr, source.file_id, &node)?
+        }
+```
+
+New:
+
+```rust
+        MirSpan::ExprId(expr) => {
+            let ptr = source.value.syntax_node_ptr();
+            match source.file_id == syntax.file_id {
+                true => {
+                    let tree = syntax.tree(db);
+                    let node = view::to_node(ptr, view::Node::root(&tree));
+                    reported_range(db, owner, expr, source.file_id, node)?
+                }
+                false => {
+                    let node = view::to_node(ptr, source.file_id.root(db));
+                    reported_range(db, owner, expr, source.file_id, node)?
+                }
+            }
+        }
+```
+
+### 23. `crates/hir-ty-codegen/places.rs` (lines 258-264 now)
+
+Why: the anchored range read directly.
+
+Old:
+
+```rust
+            CallNode::Anchored(node) => {
+                syntax.span_map.span_for_range(TextRange::empty(written_range(&node).start()))
+            }
+            CallNode::Other(node) => {
+                let range = TextRange::empty(written_range(&node.value).start());
+                node.file_id.span_map(db).span_for_range(range)
+            }
+```
+
+New:
+
+```rust
+            CallNode::Anchored(range) => {
+                syntax.span_map.span_for_range(TextRange::empty(range.start()))
+            }
+            CallNode::Other(node) => {
+                let range = TextRange::empty(written_range(node.value).start());
+                node.file_id.span_map(db).span_for_range(range)
+            }
+```
+
+### 24. `crates/hir-ty-codegen/places.rs` (lines 276-276 now)
+
+Why: `CallNode` borrows the database.
+
+Old:
+
+```rust
+fn written_call(db: &Db, syntax: &BodySyntax, file_id: HirFileId) -> Option<CallNode> {
+```
+
+New:
+
+```rust
+fn written_call<'db>(
+    db: &'db Db,
+    syntax: &BodySyntax,
+    file_id: HirFileId,
+) -> Option<CallNode<'db>> {
+```
+
+### 25. `crates/hir-ty-codegen/places.rs` (lines 305-308 now)
+
+Why: the anchored range read directly.
+
+Old:
+
+```rust
+            CallNode::Anchored(node) => anchored(db, owner, written_range(&node).start()),
+            CallNode::Other(node) => {
+                place_up(db, owner, syntax, node.file_id, written_range(&node.value))
+            }
+```
+
+New:
+
+```rust
+            CallNode::Anchored(range) => anchored(db, owner, range.start()),
+            CallNode::Other(node) => {
+                place_up(db, owner, syntax, node.file_id, written_range(node.value))
+            }
+```
+
+### 26. `crates/hir-ty-codegen/stable.rs` (lines 631-632 now)
+
+Why: the closure's text lent from the view (same bytes digested).
+
+Old:
+
+```rust
+            let root = source.file_id.parse_or_expand(self.db);
+            let text = source.value.syntax_node_ptr().to_node(&root).text().to_string();
+```
+
+New:
+
+```rust
+            let root = source.file_id.root(self.db);
+            let text = syntax::view::to_node(source.value.syntax_node_ptr(), root).text();
+```
+
+### 27. `crates/hir-ty-codegen/stable.rs` (lines 921-921 now)
+
+Why: the call's text lent; `print_of(&&str)` hashes as `print_of(&String)`, so the stable name is the same.
+
+Old:
+
+```rust
+                    let text = loc.to_node(db).value.text().to_string();
+```
+
+New:
+
+```rust
+                    let text = loc.to_node_view(db).value.text();
+```
+
+> forwarded to codegen (`hir-ty-codegen`: codegen-next1; `hir-ty-mir/src/mir/location.rs`: codegen-mir-next2, windows 18 and 162); told by tmux (requests, pass 25).
+> codegen-mir (2026-10-29): `mir/location.rs` is not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); it is codegen-mir-store's.
+> applied by codegen-mir-store (2026-10-29), uncompiled: items 1-10 (`location.rs`) as written, each old text matched once; builds once `MacroCallLoc::to_view` (db-expand request 2) and `BodySyntax::tree` land. Items 11-27 (`hir-ty-codegen`) are codegen-next1's, told by tmux.
+> db-ty-next3 (2026-10-29 22:10): not db-ty's: `crates/hir-ty-mir/src/mir/location.rs` is codegen's (`hir-ty-mir`, likely codegen-mir-store with the other `mir/` files outside `eval*` and `optimize*`). Back to requests to route.
+
+## To the coordinator: blaze-wasm's `SymbolResolver` implementors (mem-codegen-unit 4.5)
+
+From codegen-v1 (2026-10-29). `crates/hir-ty-codegen/mod.rs` `SymbolResolver` changed as
+`v2/requests/mem-codegen-unit.md` 4.2 gives it. `crates/blaze-wasm/src/lib.rs`
+`impl SymbolResolver for Names<'_>` (508) and `crates/blaze-wasm/src/names.rs`
+`impl SymbolResolver for Resolver<'_>` (258) don't build until they change as 4.5 says:
+`function`/`static_`/`source_path` intern what they build (`// alloc: wasm, per name`), `path`
+borrows from its table, and `makers`/`copies`, if implemented, add to the lent list.
+
+> forwarded to the coordinator: `crates/blaze-wasm` is its, not requests'; on requests' coordinator list, with dedup's `names.rs` rewrite (`coordinator.md`, "dedup: one rustc-symbol resolver"), which carries this 4.5 for `names.rs` (requests, pass 25).
+
+## frontend-tree: hir-ty-mir const_check.rs pretty.rs: onto views (3)
+From frontend-tree-move-codegen (2026-10-29), tree.md item 16. Needs nothing first. `HasSource::source(db)` is `ast_ptr(db)` found under `parse_or_expand`: the same node is `ptr.to_view(file_id.root(db))`, and a node's `original_file_range_rooted` is `InFile<TextRange>::original_node_file_range_rooted` of its range (what the handle method calls), so `pretty.rs` needs no node at all.
+
+### 1. `crates/hir-ty-mir/src/mir/const_check.rs` (lines 226-231 now)
+
+Why: the function's attributes read from its view; `simple_name` lends its `&str`.
+
+Old:
+
+```rust
+    use syntax::ast::HasAttrs;
+    let source = func.lookup(db).source(db);
+    source
+        .value
+        .attrs()
+        .any(|attr| attr.simple_name().as_deref() == Some("rustc_do_not_const_check"))
+```
+
+New:
+
+```rust
+    use syntax::view::HasAttrs;
+    let source = func.lookup(db).ast_ptr(db);
+    source
+        .value
+        .to_view(source.file_id.root(db))
+        .attrs()
+        .any(|attr| attr.simple_name() == Some("rustc_do_not_const_check"))
+```
+
+### 2. `crates/hir-ty-mir/src/mir/pretty.rs` (lines 670-670 now)
+
+Why: the pointer is all that is read.
+
+Old:
+
+```rust
+    let source: InFile<_> = id.lookup(db).source(db);
+```
+
+New:
+
+```rust
+    let source: InFile<_> = id.lookup(db).ast_ptr(db);
+```
+
+### 3. `crates/hir-ty-mir/src/mir/pretty.rs` (lines 678-678 now)
+
+Why: the range mapped up as the handle method maps it.
+
+Old:
+
+```rust
+    let range = source.syntax().original_file_range_rooted(db);
+```
+
+New:
+
+```rust
+    let range = InFile::new(source.file_id, source.value.syntax_node_ptr().text_range())
+        .original_node_file_range_rooted(db);
+```
+
+> forwarded to codegen (`crates/hir-ty-mir`; codegen-mir-next2, both windows); told by tmux (requests, pass 25).
+> codegen-mir (2026-10-29): `const_check.rs` and `pretty.rs` are not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); they are codegen-mir-store's.
+> applied by codegen-mir-store (2026-10-29), uncompiled: items 1-3 as written (`const_check.rs` reads the attributes from the view, `pretty.rs` maps the pointer's range up).
+> db-ty-next3 (2026-10-29 22:10): not db-ty's. db-ty holds `hir-ty`, `hir`, `hir-ty-borrowck` and `hir-ty-wfcheck`, not `crates/hir-ty-mir`; codegen-mir names the holder above (codegen-mir-store for `const_check.rs`, `pretty.rs`, `purity.rs`; frontend-fast-mir for `lower.rs`).
+
+## frontend-tree: hir-ty-mir lower.rs macro-call reads: onto views (4)
+
+> frontend-tree-move-codegen (2026-10-29 22:02): `lower.rs` is frontend-fast-mir's now (codegen-mir-store-lower handed it over), so this request is theirs; pointer in `v2/requests/frontend-fast-mir.md`. Items 1-2 (`failed_expansion`) are in the tree as written; items 3-7 (`is_expression_call`) are open, each old text matching once.
+
+Renamed (2026-10-29 21:56, frontend-tree): the twin of `MacroCallLoc::to_node` is `MacroCallLoc::to_node_view`; the hunks below say so.
+From frontend-tree-move-codegen (2026-10-29), tree.md item 16. `failed_expansion` and `is_expression_call` read the call site and the expansion's statements through views.
+
+needs: frontend-tree-move-expand's `MacroCallLoc::to_node_view<'db>(&self, db: &'db Db) -> InFile<syntax::view::Node<'db>>` (its request 2, `hir-expand lib.rs`, in `v2/requests/db-expand.md`).
+
+### 1. `crates/hir-ty-mir/src/mir/lower.rs` (lines 4685-4685 now)
+
+Why: the view trait.
+
+Old:
+
+```rust
+    use syntax::AstNode;
+```
+
+New:
+
+```rust
+    use syntax::view::AstNode;
+```
+
+### 2. `crates/hir-ty-mir/src/mir/lower.rs` (lines 4691-4692 now)
+
+Why: the site as a view of the database's tree.
+
+Old:
+
+```rust
+        let site = call.loc(db).to_node(db);
+        Some((syntax::ast::MacroCall::cast(site.value)?, site.file_id))
+```
+
+New:
+
+```rust
+        let site = call.loc(db).to_node_view(db);
+        Some((syntax::view::MacroCall::cast(site.value)?, site.file_id))
+```
+
+### 3. `crates/hir-ty-mir/src/mir/lower.rs` (lines 4721-4721 now)
+
+Why: views are passed by value.
+
+Old:
+
+```rust
+        if !is_expression_call(&call_site, file, &enclosing) {
+```
+
+New:
+
+```rust
+        if !is_expression_call(call_site, file, &enclosing) {
+```
+
+### 4. `crates/hir-ty-mir/src/mir/lower.rs` (lines 4724-4724 now)
+
+Why: the expansion's root as a view (`Parse::root`).
+
+Old:
+
+```rust
+        let statements = syntax::ast::MacroStmts::cast(expansion.value.0.syntax_node())?;
+```
+
+New:
+
+```rust
+        let statements = syntax::view::MacroStmts::cast(expansion.value.0.root())?;
+```
+
+### 5. `crates/hir-ty-mir/src/mir/lower.rs` (lines 4734-4734 now)
+
+Why: the view's statement type.
+
+Old:
+
+```rust
+            Some(syntax::ast::Stmt::ExprStmt(only)) if count == 1 => {
+```
+
+New:
+
+```rust
+            Some(syntax::view::Stmt::ExprStmt(only)) if count == 1 => {
+```
+
+### 6. `crates/hir-ty-mir/src/mir/lower.rs` (lines 4770-4778 now)
+
+Why: takes and finds views; the body is unchanged.
+
+Old:
+
+```rust
+fn is_expression_call<F>(
+    call: &syntax::ast::MacroCall,
+    file: hir_expand::HirFileId,
+    enclosing: &F,
+) -> bool
+where
+    F: Fn(hir_expand::MacroCallId) -> Option<(syntax::ast::MacroCall, hir_expand::HirFileId)>,
+{
+    use syntax::{AstNode, SyntaxKind::*, ast};
+```
+
+New:
+
+```rust
+fn is_expression_call<'t, F>(
+    call: syntax::view::MacroCall<'t>,
+    file: hir_expand::HirFileId,
+    enclosing: &F,
+) -> bool
+where
+    F: Fn(hir_expand::MacroCallId) -> Option<(syntax::view::MacroCall<'t>, hir_expand::HirFileId)>,
+{
+    use syntax::{
+        SyntaxKind::*,
+        view::{self as ast, AstNode},
+    };
+```
+
+### 7. `crates/hir-ty-mir/src/mir/lower.rs` (lines 4792-4792 now)
+
+Why: views are passed by value.
+
+Old:
+
+```rust
+            Some((outer, file)) => is_expression_call(&outer, file, enclosing),
+```
+
+New:
+
+```rust
+            Some((outer, file)) => is_expression_call(outer, file, enclosing),
+```
+
+> forwarded to codegen (`crates/hir-ty-mir`; codegen-mir-next2, both windows); told by tmux (requests, pass 25).
+> codegen-mir (2026-10-29): `lower.rs` is not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); frontend-fast-mir holds `lower.rs` and `lower/` now (`v2/requests/codegen-mir-store-lower.md`).
+> db-ty-next3 (2026-10-29 22:10): not db-ty's. db-ty holds `hir-ty`, `hir`, `hir-ty-borrowck` and `hir-ty-wfcheck`, not `crates/hir-ty-mir`; codegen-mir names the holder above (codegen-mir-store for `const_check.rs`, `pretty.rs`, `purity.rs`; frontend-fast-mir for `lower.rs`).
+> applied by frontend-fast-mir (2026-10-29 22:05), uncompiled: all 7 hunks in `crates/hir-ty-mir/src/mir/lower.rs` as written (`to_node_view`, `view::MacroCall`/`MacroStmts`/`Stmt`, `Parse::root`, `is_expression_call<'t, F>` by value). Checked against the tree: `MacroCallLoc::to_node_view` is in `hir-expand/src/lib.rs`, the view types are `Copy` and have every method the body calls, `Node::parent`/`kind` exist; `written_call`/`concat_parts` in `mir/location.rs` already take views and are not touched here.
+> frontend-fast-mir (22:07): correction noted: (4) depends only on the call-site view; `lower.rs` calls `MacroCallLoc::to_node_view`, the name in `hir-expand/src/lib.rs` now (there is no `to_view`). Nothing else to do.
+
+## frontend-tree: hir-ty-codegen type_id.rs: onto views (5)
+From frontend-tree-move-codegen (2026-10-29), tree.md item 16. The enum's visibility read from its view.
+
+needs: `## frontend-tree: hir-def visibility.rs: onto views (4)` in `v2/requests/db-expand.md` (frontend-tree-move-def's `hir_def::visibility::visibility_from_ast_view(db, has_resolver, ast_vis: InFile<Option<view::Visibility<'_>>>) -> Visibility`, accepted by db-expand-paths). `hir_def::src::HasSource::source_view` is in the tree.
+
+Revised (2026-10-29 22:10): item 3 reads the enum by `source_view` (the same node as `ast_ptr` under `root`, as `source` is under `parse_or_expand`).
+
+### 1. `crates/hir-ty-codegen/type_id.rs` (lines 22-22 now)
+
+Why: the view twin.
+
+Old:
+
+```rust
+    visibility::{Visibility, visibility_from_ast},
+```
+
+New:
+
+```rust
+    visibility::{Visibility, visibility_from_ast_view},
+```
+
+### 2. `crates/hir-ty-codegen/type_id.rs` (lines 32-32 now)
+
+Why: the view trait.
+
+Old:
+
+```rust
+use syntax::ast::HasVisibility;
+```
+
+New:
+
+```rust
+use syntax::view::HasVisibility;
+```
+
+### 3. `crates/hir-ty-codegen/type_id.rs` (lines 1033-1034 now)
+
+Why: the enum as a view of the database's tree (`source_view`: the node `source` finds).
+
+Old:
+
+```rust
+                let source = parent.lookup(db).source(db);
+                Some(visibility_from_ast(db, parent, source.map(|it| it.visibility())))
+```
+
+New:
+
+```rust
+                let source = parent.lookup(db).source_view(db);
+                Some(visibility_from_ast_view(db, parent, source.map(|it| it.visibility())))
+```
+
+> forwarded to codegen (`crates/hir-ty-codegen`; codegen-next1); told by tmux (requests, pass 25).
+
+## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm
+
+From dedup-names (2026-10-29). `blaze-wasm/src/names.rs` was the engine's `Resolver` copied
+("FIXME: ... The two are to be one"). The part both need, spelling an item's path as
+`rustc-demangle` prints its v0 symbol, and the static or closure a path names, is now the crate
+`crates/rustc-symbols` (written; dedup-names'), trait `rustc_symbols::Paths`: `function_path`,
+`item_path`, `item_path_of`, `scope_path`, `type_path`, `function_at`, `closure_path`,
+`static_path`, `declaring_function`, and `rustc_symbols::impl_place`, with the closure and static
+counter (`Count`, `LateImports`, `Places`, ...) moved verbatim from `lib.rs`. The engine's
+`Resolver` keeps everything only it has (the checkout, the prebuilt std, `ResolverParts`, its
+crate ids, its own names) and implements `Paths` with its `crate_path`, `sema` and `places`.
+The blaze-wasm half and the root `Cargo.toml` line are in `v2/requests/coordinator.md` under the
+same heading. no-rustc step G ([#87](https://github.com/indexable-inc/blaze/issues/87)) deletes
+the crate, as its doc says; the engine's own `blaze.<crate>.<path>` names, which use
+`function_path` too, take a spelling of their own in that change.
+
+The moved code is the engine's, as it is now (the newer of the two copies): nothing the engine
+answers changes. Line numbers are as of 2026-10-29 21:50; every edit is anchored by its text.
+
+`rustc-symbols` is written on views (`syntax::view`, `hir::view::Semantics`, frontend.md item
+16), as frontend-tree-move-tools asked: `Paths::sema` gives a `hir::view::Semantics`, and
+`function_at` matches the function by `AstIdMap::ast_id_of_view`, as the engine's handle code
+does by `ast_id`. So for frontend-tree-move-codegen, who is moving `lib.rs` onto views: what
+this request deletes (`path`, `item_path`, `function_at`, `scope_path`, `type_path`, the
+syntax of `closure`, `static_named` and `declared_in`, `place_in_definition` through
+`closure_number`, lines 896-1340 and 1874-2389 in part) is already on views in the crate and
+need not be moved twice. Every `self.sema()` of `lib.rs` (1229, 1552, 1652, 1728) is in it,
+so the handle `sema` goes with no caller left.
+
+**Order with `v2/requests/mem-codegen-engine.md` 3-5** (forwarded, not applied yet), which touch
+the same methods: those can go first or after. Where both edit one method, the text below says
+what the method is with both in. In short: request 4's inherent `crate_path` (`-> Option<&str>`)
+becomes the `Paths` impl's (item 3); its edit to `scope_path` (`lib.rs:1222`) is void, as
+`scope_path` moves; its edit to `adt_at` is not made (`.as_deref()` stays, the trait gives a
+`Cow`). Request 5's `private` and `closure` take `function_path`/`closure_path` (items 6, 7); its
+`static_named` gets the body of item 8.
+
+### 1. `crates/blaze-engine/Cargo.toml`
+
+Before:
+
+```toml
+hir-ty-borrowck.workspace = true
+```
+
+After:
+
+```toml
+hir-ty-borrowck.workspace = true
+rustc-symbols.workspace = true
+```
+
+### 2. `lib.rs` imports
+
+`lib.rs:55`, before:
+
+```rust
+use std::{
+    collections::BTreeSet,
+```
+
+after:
+
+```rust
+use std::{
+    borrow::Cow,
+    collections::BTreeSet,
+```
+
+`lib.rs:84-88`, before:
+
+```rust
+use syntax::{
+    AstNode, SyntaxNode,
+    ast::{self, HasName},
+    match_ast,
+};
+```
+
+after:
+
+```rust
+use rustc_symbols::{Paths, Places, StaticPath};
+use syntax::{
+    AstNode,
+    ast::{self, HasName},
+};
+```
+
+(`SyntaxNode` and `match_ast!` are used only by what moves. `AsAssocItem`, `AssocItemContainer`,
+`Body`, `HasName` stay used: `lib.rs:4240`, `4507`, `4339`, `6414`.)
+
+### 3. `lib.rs:869-875` and `1134-1146`: `sema` and `crate_path` become the `Paths` impl
+
+Delete the inherent `sema` (`lib.rs:869-875`):
+
+```rust
+    /// What reads the syntax, with each file a module of the crates of the programs.
+    fn sema(&self) -> hir::Semantics<'a> {
+        match &self.programs {
+            Some(crates) => hir::Semantics::new_within(self.db, crates.clone()),
+            None => hir::Semantics::new(self.db),
+        }
+    }
+
+```
+
+and the inherent `crate_path` (`lib.rs:1134-1146`):
+
+```rust
+    /// How the paths of symbols spell a crate. One of the checkout that rustc built nothing
+    /// of is spelled with its own id, so that no symbol of another crate of its name (the
+    /// standard library's memchr) is taken for one of its items.
+    fn crate_path(&self, krate: Crate) -> Option<String> {
+        let name = krate.display_name(self.db)?;
+        if self.table.is_empty() && krate.origin(self.db).is_lang() {
+            return Some(name.crate_name().to_string());
+        }
+        match self.own_crate_id(krate.into()) {
+            Some(own) => Some(format!("{}[{own:x}]", name.crate_name())),
+            None => self.table.crate_path(name.crate_name().as_str(), &self.crate_root(krate)?),
+        }
+    }
+
+```
+
+and add, after the `impl<'a> Resolver<'a> { .. }` that ends with `in_prebuilt` (`lib.rs:886`,
+before `impl Resolver<'_> {` at 888):
+
+```rust
+impl<'a> Paths<'a> for Resolver<'a> {
+    fn db(&self) -> &'a Db {
+        self.db
+    }
+
+    /// How the paths of symbols spell a crate. One of the checkout that rustc built nothing
+    /// of is spelled with its own id, so that no symbol of another crate of its name (the
+    /// standard library's memchr) is taken for one of its items.
+    fn crate_path(&self, krate: Crate) -> Option<Cow<'_, str>> {
+        let name = krate.display_name(self.db)?;
+        if self.table.is_empty() && krate.origin(self.db).is_lang() {
+            return Some(Cow::Owned(name.crate_name().to_string()));
+        }
+        match self.own_crate_id(krate.into()) {
+            Some(own) => Some(Cow::Owned(format!("{}[{own:x}]", name.crate_name()))),
+            None => self
+                .table
+                .crate_path(name.crate_name().as_str(), &self.crate_root(krate)?)
+                .map(Cow::Owned),
+        }
+    }
+
+    /// What reads the syntax, with each file a module of the crates of the programs.
+    fn sema(&self) -> hir::view::Semantics<'a> {
+        match &self.programs {
+            Some(crates) => hir::view::Semantics::new_within(self.db, crates.clone()),
+            None => hir::view::Semantics::new(self.db),
+        }
+    }
+
+    fn places(&self) -> &Places {
+        &self.places
+    }
+}
+```
+
+With `mem-codegen-engine` 4 in, `crate_path` here is instead the memo's, and request 4's inherent
+`fn crate_path(&self, krate: Crate) -> Option<&str>` is not added (this is it; its
+`crate_path_of` stays as request 4 writes it):
+
+```rust
+    /// How the paths of symbols spell a crate ([`Resolver::crate_path_of`]).
+    fn crate_path(&self, krate: Crate) -> Option<Cow<'_, str>> {
+        self.crate_facts(krate.into()).path.as_deref().map(Cow::Borrowed)
+    }
+```
+
+The fields `places: Places` (`lib.rs:423`, `454`) and `places: Places::default()` (`lib.rs:859`)
+stay as written: `Places` is now `rustc_symbols::Places`, the same type moved.
+
+### 4. `lib.rs:895-946`: delete the inherent `path`
+
+From `    /// The function's path as \`rustc-demangle\` prints its v0 symbol.` (895) through the `}`
+that closes `fn path` (946), up to and not including `    /// The symbol of \`func\`, when it has
+one.` (948). It is `Paths::function_path`, word for word but `self.db` read through `db()`.
+
+### 5. `lib.rs:1173-1322`: delete `item_path`, `function_at`, `scope_path`, `type_path`
+
+From `    fn item_path(&self, module: Module, name: &str) -> Option<String> {` (1173) through the
+end of `fn type_path` (`        Some(format!("{path}<{}>", args?.join(", ")))` and its `    }`,
+1321-1322), keeping the `}` that closes `impl Resolver<'_>` (1323). `fn crate_root` (1168-1171)
+stays: `rustc_crate_id`, `own_crate_id`, `rustc_built` and `content_id` use it.
+
+### 6. `self.path(func)` becomes `self.function_path(func)`
+
+Every `self.path(func)` left in `lib.rs` after 4 and 5 (`lib.rs:955`, `985`, `1027`, `1076`,
+`1112`, `1526`), and `resolver.path(func)` at `lib.rs:5379` and `5430`, become
+`self.function_path(func)` / `resolver.function_path(func)`. With the inherent `path` gone,
+`resolver.path(func)` would reach `SymbolResolver::path(&str)` and not build. With
+`mem-codegen-engine` 5 in, its `private` is:
+
+```rust
+    fn private(&self, func: FunctionId) -> bool {
+        // alloc: a miss: the path is spelled once a build.
+        let private = || {
+            !self.is_generic(func)
+                && self.function_path(func).is_some_and(|path| self.table.private(&path))
+        };
+        *self.memos.privates.get_or_insert_with(func, private)
+    }
+```
+
+### 7. `lib.rs:1549-1574`: `SymbolResolver::closure`
+
+Before: the whole method, from
+`    fn closure(&self, owner: FunctionId, expr: hir_def::hir::ExprId) -> Option<String> {`
+through `        self.table.get(&path).map(str::to_owned)` and its `    }`.
+
+After (as `mem-codegen-engine` 5 types it; the trait already is, `hir-ty-codegen/mod.rs:418`):
+
+```rust
+    fn closure(&self, owner: FunctionId, expr: hir_def::hir::ExprId) -> Option<intern::Symbol> {
+        // alloc: a closure's path, once per unit that names it.
+        self.table.get(&self.closure_path(owner, expr)?).map(intern::Symbol::intern)
+    }
+```
+
+### 8. `lib.rs:1714-1775`: `SymbolResolver::static_`
+
+Before: the whole method, from `    fn static_(&self, id: StaticId) -> Option<String> {` through
+`        symbol.map(str::to_owned)` and its `    }`.
+
+After, as the body `mem-codegen-engine` 5 moves into the inherent `static_named` (its trait
+`static_` over the memo stays as request 5 writes it):
+
+```rust
+    /// [`SymbolResolver::static_`], worked out.
+    fn static_named(&self, id: StaticId) -> Option<String> {
+        if self.prebuilt(hir_def::HasModule::krate(&id, self.db)) {
+            return self.in_prebuilt(self.own_static_name(id)?);
+        }
+        let symbol = match self.static_path(id)? {
+            StaticPath::Item(path) => self.table.get(&path),
+            StaticPath::InBody { path, closures, place, around } => self
+                .table
+                .get_nested(&path, &closures, place, &around)
+                .or_else(|| self.table.get_at(&path, place, &around)),
+        };
+        symbol.map(str::to_owned)
+    }
+```
+
+Without request 5, the same body stays the trait's `static_` (`-> Option<String>`).
+
+### 9. `lib.rs:1650-1700`: `declared_in`, `impl_place`; `lib.rs:1781-1785`: `item`
+
+`declared_in`'s body (from `        let adt = hir::Adt::from(adt);` through
+`        self.function_at(&sema, adt.module(self.db), &func)?.try_into().ok()`) becomes:
+
+```rust
+        self.declaring_function(adt)
+```
+
+`impl_place`'s body (from `        use hir::HasSource;` through `        Some(earlier)`) becomes:
+
+```rust
+        rustc_symbols::impl_place(self.db, id)
+```
+
+`item`'s body, before:
+
+```rust
+        let item = ModuleDef::from(item);
+        self.item_path(item.module(self.db)?, item.name(self.db)?.as_str())
+```
+
+after:
+
+```rust
+        // alloc: an item's path, which the caller extends into the symbol it spells.
+        self.item_path_of(item)
+```
+
+`adt_at` is unchanged: `self.crate_path(it).as_deref() == Some(krate)` reads the `Cow` the
+trait gives, and `self.item(..)` is still the trait's.
+
+### 10. `lib.rs:1811-1825` and `1855-2391`: delete the free functions that moved
+
+- `/// The segment a constant or static that items are written in adds to their path, ...` and
+  `fn name_in_path` (1811-1825). `is_in_body`, `crate_place` and `short_hash` (1827-1853) stay.
+- From `/// Whether rustc numbers the node as a closure: a closure, or an \`async\` block.`
+  (1855) through the end of `fn closure_number` (`    place_counted(sema, places,
+  Counted::Closures, closure, Counts::Closures)` and its `}`), up to and not including
+  `/// The crates called \`krate\` that a build of the checkout at \`checkout\` compiles` (2393):
+  `is_closure`, `is_definition`, `place_in_definition`, `owner_of`, `place_counted`,
+  `all_places`, `spot_in`, `struct Places`, `PlacesOf`, `Counted`, `Counts`, `Spot`,
+  `LateImports`, `has_attribute_macro`, `module_is_expanded`, `Turn`, `Count` and its impl,
+  `closure_number`. Nothing else in `blaze-engine` names them (`rg` over `src/`: `symbols.rs:277`
+  says `is_definition` in a comment, about `object`'s).
+
+### 11. `lib.rs:11654-11676`: the test that moved
+
+Delete `a_count_counts_the_nodes_of_its_kind` with its doc comment (from `    /// Each kind of
+node a count counts holds of its nodes alone: ...` through its closing `    }`, before
+`    /// What cargo says is taken in line by line, ...`). It is in
+`crates/rustc-symbols/src/tests.rs`, word for word.
+
+### Tests
+
+`crates/rustc-symbols/src/tests.rs`: the moved count test; a corpus with the path of every kind
+of function (module, inherent, trait impl with and without defaulted arguments, provided, in a
+body, in closures, in `const`, `const _`, `static`, `async fn`) and of `impl` self types
+(references, slices, tuples of one and two, generics), each checked against the text and against
+the old blaze-wasm copy's `path`/`type_path` (kept in the test as the reference); statics in
+bodies; and a proptest that writes random nestings of modules, functions, constants, methods and
+closures and checks every function's path and every `impl`'s type against the reference.
+
+Status: open
+
+> forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux. The root `rustc-symbols` line it needs is in (requests, pass 25).
+
+## frontend-tree: blaze-engine as_rustc.rs consteval.rs mirdump.rs check.rs borrowck.rs: onto views (6)
+From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. The small readers of syntax in blaze-engine onto views: a crate root's attributes read off `Parse::view()` (`as_rustc`), an item's line from its source view's range mapped up by `InFile<TextRange>::original_node_file_range_rooted` (what the handle `original_file_range_rooted` calls), the paths of a file walked as views (`check`). Same nodes, ranges and texts; `as_rustc` reads each attribute's `&str` instead of a `String`.
+
+needs: frontend-tree-move-hir's `hir::view` (`crates/hir/src/semantics/view.rs`, re-exported as `hir::view`): `Semantics` (`new`, `new_within`, `parse_guess_edition`, `parse_or_expand`, `source`, `hir_file_for`, `to_def`, `ancestors_with_macros`, `expand_macro_call`, `resolve_path`, `resolve_method_call`, `resolve_macro_call`, `resolve_attr_macro_call`, `scope`, `module_definition_node`, `file_to_module_def(s)`), `HasSourceView`, `ModuleSourceView`, `Module::{definition,declaration}_source_view`, `UseDecl::source_view` (requests in `v2/requests/db.md`).
+
+### 1. `crates/blaze-engine/src/as_rustc.rs` (lines 304-313 now)
+
+Why: the root's attributes as views of the parse, each read as the `&str` of its text.
+
+Old:
+
+```rust
+    use syntax::{AstNode as _, ast::HasAttrs as _};
+    let edition = edition.parse().unwrap_or(syntax::Edition::CURRENT);
+    let file = syntax::SourceFile::parse(text, edition).tree();
+    let mut named = Vec::new();
+    for attr in file.attrs() {
+        let attr = attr.syntax().text().to_string();
+        if !attr.starts_with("#!") {
+            continue;
+        }
+        let mut rest = attr.as_str();
+```
+
+New:
+
+```rust
+    use syntax::view::{AstNode as _, HasAttrs as _};
+    let edition = edition.parse().unwrap_or(syntax::Edition::CURRENT);
+    let parse = syntax::SourceFile::parse(text, edition);
+    let file = parse.view();
+    let mut named = Vec::new();
+    for attr in file.attrs() {
+        let attr = attr.syntax().text();
+        if !attr.starts_with("#!") {
+            continue;
+        }
+        let mut rest = attr;
+```
+
+### 2. `crates/blaze-engine/src/consteval.rs` (lines 21-21 now)
+
+Why: the view twin of `HasSource`.
+
+Old:
+
+```rust
+use hir::{AssocItem, HasSource as _, ModuleDef};
+```
+
+New:
+
+```rust
+use hir::{AssocItem, ModuleDef, view::HasSourceView as _};
+```
+
+### 3. `crates/blaze-engine/src/consteval.rs` (lines 25-25 now)
+
+Why: the views' `AstNode`.
+
+Old:
+
+```rust
+use syntax::AstNode as _;
+```
+
+New:
+
+```rust
+use syntax::view::AstNode as _;
+```
+
+### 4. `crates/blaze-engine/src/consteval.rs` (lines 122-123 now)
+
+Why: a range in its file, mapped up as the handle method maps the node's range.
+
+Old:
+
+```rust
+        let line_of = |node: hir::InFile<&syntax::SyntaxNode>| {
+            let range = node.original_file_range_rooted(db);
+```
+
+New:
+
+```rust
+        let line_of = |node: hir::InFile<syntax::TextRange>| {
+            let range = node.original_node_file_range_rooted(db);
+```
+
+### 5. `crates/blaze-engine/src/consteval.rs` (lines 144-145 now)
+
+Why: the constant's source view.
+
+Old:
+
+```rust
+                        let name = it.name(db).map_or("_".to_owned(), |it| it.as_str().to_owned());
+                        let line = it.source(db).and_then(|it| line_of(it.syntax()));
+```
+
+New:
+
+```rust
+                        let name = it.name(db).map_or("_".to_owned(), |it| it.as_str().to_owned());
+                        let line = it
+                            .source_view(db)
+                            .and_then(|it| line_of(it.map(|it| it.syntax().text_range())));
+```
+
+### 6. `crates/blaze-engine/src/consteval.rs` (lines 148-149 now)
+
+Why: the static's source view.
+
+Old:
+
+```rust
+                    ModuleDef::Static(it) if it.extern_block(db).is_none() => {
+                        let line = it.source(db).and_then(|it| line_of(it.syntax()));
+```
+
+New:
+
+```rust
+                    ModuleDef::Static(it) if it.extern_block(db).is_none() => {
+                        let line = it
+                            .source_view(db)
+                            .and_then(|it| line_of(it.map(|it| it.syntax().text_range())));
+```
+
+### 7. `crates/blaze-engine/src/consteval.rs` (lines 165-166 now)
+
+Why: the associated constant's source view.
+
+Old:
+
+```rust
+                    let name = named(&format!("{}::{}", adt.name(db).as_str(), name.as_str()));
+                    let line = it.source(db).and_then(|it| line_of(it.syntax()));
+```
+
+New:
+
+```rust
+                    let name = named(&format!("{}::{}", adt.name(db).as_str(), name.as_str()));
+                    let line = it
+                        .source_view(db)
+                        .and_then(|it| line_of(it.map(|it| it.syntax().text_range())));
+```
+
+### 8. `crates/blaze-engine/src/mirdump.rs` (lines 107-110 now)
+
+Why: the function's source view and its range mapped up.
+
+Old:
+
+```rust
+        let Some(source) = hir::HasSource::source(hir::Function::from(func), self.db) else {
+            return (String::new(), 0);
+        };
+        let range = source.syntax().original_file_range_rooted(self.db);
+```
+
+New:
+
+```rust
+        let Some(source) = hir::view::HasSourceView::source_view(hir::Function::from(func), self.db)
+        else {
+            return (String::new(), 0);
+        };
+        let range = source
+            .map(|it| syntax::view::AstNode::syntax(&it).text_range())
+            .original_node_file_range_rooted(self.db);
+```
+
+### 9. `crates/blaze-engine/src/check.rs` (lines 129-137 now)
+
+Why: the file's paths walked as views, resolved by the view `Semantics`.
+
+Old:
+
+```rust
+fn unresolved(db: &RootDatabase, file: vfs::FileId) -> Option<String> {
+    use syntax::{AstNode as _, ast};
+    let sema = hir::Semantics::new(db);
+    let tree = sema.parse_guess_edition(file);
+    tree.syntax().descendants().filter_map(ast::Path::cast).find_map(|path| {
+        let in_attr = path.syntax().ancestors().any(|it| ast::Attr::can_cast(it.kind()));
+        (!in_attr && sema.resolve_path(&path).is_none()).then(|| path.to_string())
+    })
+}
+```
+
+New:
+
+```rust
+fn unresolved(db: &RootDatabase, file: vfs::FileId) -> Option<String> {
+    use syntax::view::{self as ast, AstNode as _};
+    let sema = hir::view::Semantics::new(db);
+    let tree = sema.parse_guess_edition(file);
+    tree.syntax().descendants().filter_map(ast::Path::cast).find_map(|path| {
+        let in_attr = path.syntax().ancestors().any(|it| ast::Attr::can_cast(it.kind()));
+        (!in_attr && sema.resolve_path(path).is_none()).then(|| path.to_string())
+    })
+}
+```
+
+### 10. `crates/blaze-engine/src/borrowck.rs` (lines 530-530 now)
+
+Why: the view `Semantics` (only `file_to_module_def`, which takes ids).
+
+Old:
+
+```rust
+        let sema = hir::Semantics::new(db);
+```
+
+New:
+
+```rust
+        let sema = hir::view::Semantics::new(db);
+```
+
+> forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).
+
+## frontend-tree: blaze-engine doctest.rs doctest/program.rs doctest/extract.rs: onto views (7)
+From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. The doctest collector onto views: an example's statements and a crate's `#![doc(test(..))]` read off `Parse::root()`, an item's documentation placed by tokens of `HirFileId::root(db)` and the token twin of `original_file_range`, a `use`'s name and an impl's type read from the source views, and the functions and paths of an example's file walked through the view `Semantics`. Same nodes, ranges, texts and order. `is_main` checks `fn main` over the tokens as it walks them instead of gathering a `Vec<String>`; `OfTheCrate::read` compares the `&str` before a token tree instead of a `String`.
+
+needs: frontend-tree-move-hir's `hir::view` (`crates/hir/src/semantics/view.rs`, re-exported as `hir::view`): `Semantics` (`new`, `new_within`, `parse_guess_edition`, `parse_or_expand`, `source`, `hir_file_for`, `to_def`, `ancestors_with_macros`, `expand_macro_call`, `resolve_path`, `resolve_method_call`, `resolve_macro_call`, `resolve_attr_macro_call`, `scope`, `module_definition_node`, `file_to_module_def(s)`), `HasSourceView`, `ModuleSourceView`, `Module::{definition,declaration}_source_view`, `UseDecl::source_view` (requests in `v2/requests/db.md`). And frontend-tree-move-expand's `InFile<view::Token<'_>>::original_file_range(self, db) -> FileRange` (`hir-expand/src/files.rs`, the twin of `InFile<SyntaxToken>::original_file_range`; extract.rs hunks 4 and 9).
+
+### 1. `crates/blaze-engine/src/doctest/program.rs` (lines 5-8 now)
+
+Why: the views.
+
+Old:
+
+```rust
+use syntax::{
+    AstNode, Edition, SyntaxKind, TextSize,
+    ast::{self, HasName},
+};
+```
+
+New:
+
+```rust
+use syntax::{
+    Edition, SyntaxKind, TextSize,
+    view::{self as ast, AstNode as _, HasName as _},
+};
+```
+
+### 2. `crates/blaze-engine/src/doctest/program.rs` (lines 41-44 now)
+
+Why: the wrapped example's root as a view.
+
+Old:
+
+```rust
+        let file = ast::SourceFile::parse(&wrapped, edition).tree();
+        let whole = TextSize::of(&*wrapped);
+        let body = file
+            .syntax()
+```
+
+New:
+
+```rust
+        let parse = syntax::SourceFile::parse(&wrapped, edition);
+        let whole = TextSize::of(&*wrapped);
+        let body = parse
+            .root()
+```
+
+### 3. `crates/blaze-engine/src/doctest/program.rs` (lines 58-59 now)
+
+Why: views are `Copy`.
+
+Old:
+
+```rust
+            let is_inner_attr =
+                ast::Attr::cast(node.clone()).is_some_and(|it| it.excl_token().is_some());
+```
+
+New:
+
+```rust
+            let is_inner_attr = ast::Attr::cast(node).is_some_and(|it| it.excl_token().is_some());
+```
+
+### 4. `crates/blaze-engine/src/doctest/program.rs` (lines 71-71 now)
+
+Why: views are `Copy`.
+
+Old:
+
+```rust
+            } else if let Some(it) = ast::ExternCrate::cast(node.clone()) {
+```
+
+New:
+
+```rust
+            } else if let Some(it) = ast::ExternCrate::cast(node) {
+```
+
+### 5. `crates/blaze-engine/src/doctest/program.rs` (lines 77-77 now)
+
+Why: by value.
+
+Old:
+
+```rust
+                parts.has_main |= is_main(&node);
+```
+
+New:
+
+```rust
+                parts.has_main |= is_main(node);
+```
+
+### 6. `crates/blaze-engine/src/doctest/program.rs` (lines 87-106 now)
+
+Why: a view; `fn` then `main` found as the tokens are walked, with no `Vec<String>`.
+
+Old:
+
+```rust
+fn is_main(node: &syntax::SyntaxNode) -> bool {
+    if let Some(function) = ast::Fn::cast(node.clone()) {
+        return function.name().is_some_and(|it| it.text() == "main");
+    }
+    let call = node.descendants().find(|it| it.kind() == SyntaxKind::MACRO_CALL);
+    let is_call = matches!(
+        node.kind(),
+        SyntaxKind::MACRO_CALL | SyntaxKind::EXPR_STMT | SyntaxKind::MACRO_EXPR
+    );
+    is_call
+        && call.is_some_and(|it| {
+            let words: Vec<String> = it
+                .descendants_with_tokens()
+                .filter_map(|it| it.into_token())
+                .filter(|it| !it.kind().is_trivia())
+                .map(|it| it.text().to_owned())
+                .collect();
+            words.windows(2).any(|it| it[0] == "fn" && it[1] == "main")
+        })
+}
+```
+
+New:
+
+```rust
+fn is_main(node: ast::Node<'_>) -> bool {
+    if let Some(function) = ast::Fn::cast(node) {
+        return function.name().is_some_and(|it| it.text() == "main");
+    }
+    let call = node.descendants().find(|it| it.kind() == SyntaxKind::MACRO_CALL);
+    let is_call = matches!(
+        node.kind(),
+        SyntaxKind::MACRO_CALL | SyntaxKind::EXPR_STMT | SyntaxKind::MACRO_EXPR
+    );
+    is_call
+        && call.is_some_and(|it| {
+            let mut before = None;
+            it.descendants_with_tokens()
+                .filter_map(|it| it.into_token())
+                .filter(|it| !it.kind().is_trivia())
+                .any(|it| {
+                    let word = it.text();
+                    std::mem::replace(&mut before, Some(word)) == Some("fn") && word == "main"
+                })
+        })
+}
+```
+
+### 7. `crates/blaze-engine/src/doctest/extract.rs` (lines 6-9 now)
+
+Why: the views and `HasSourceView` (`hir::HasAttrs` is hir's own, kept).
+
+Old:
+
+```rust
+use hir::{Adt, AssocItem, HasAttrs, HasSource, Module, ModuleDef};
+use ide_db::{RootDatabase, rust_doc::is_rust_fence};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use syntax::{AstNode, SyntaxKind, TextRange, TextSize, ast::HasName};
+```
+
+New:
+
+```rust
+use hir::{Adt, AssocItem, HasAttrs, Module, ModuleDef, view::HasSourceView as _};
+use ide_db::{RootDatabase, rust_doc::is_rust_fence};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+use syntax::{
+    SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _, AstToken as _, HasName as _},
+};
+```
+
+### 8. `crates/blaze-engine/src/doctest/extract.rs` (lines 144-144 now)
+
+Why: the `use`'s source view (`UseDecl::source_view`).
+
+Old:
+
+```rust
+            let name = it.source(db).value.use_tree().and_then(|tree| use_name(&tree));
+```
+
+New:
+
+```rust
+            let name = it.source_view(db).value.use_tree().and_then(use_name);
+```
+
+### 9. `crates/blaze-engine/src/doctest/extract.rs` (lines 152-154 now)
+
+Why: the impl's source view.
+
+Old:
+
+```rust
+            let Some(source) = it.source(db) else { continue };
+            let Some(ty) = source.value.self_ty() else { continue };
+            let path = join(path, shown_type(&ty));
+```
+
+New:
+
+```rust
+            let Some(source) = it.source_view(db) else { continue };
+            let Some(ty) = source.value.self_ty() else { continue };
+            let path = join(path, shown_type(ty));
+```
+
+### 10. `crates/blaze-engine/src/doctest/extract.rs` (lines 234-235 now)
+
+Why: the file's tree as a view; the token below is a view and takes the token twin of `original_file_range`.
+
+Old:
+
+```rust
+        let db = self.db;
+        let tree = range.file_id.parse_or_expand(db);
+```
+
+New:
+
+```rust
+        let db = self.db;
+        let tree = range.file_id.root(db);
+```
+
+### 11. `crates/blaze-engine/src/doctest/extract.rs` (lines 258-263 now)
+
+Why: the call as a view of its file (`AstId::to_view`), the expansion's tokens as views.
+
+Old:
+
+```rust
+        if calls.next().is_some() || included(&call.to_in_file_node(self.db).value).is_none() {
+            return None;
+        }
+        let expansion = hir::HirFileId::from(id).parse_or_expand(self.db);
+        let mut tokens = expansion.descendants_with_tokens().filter_map(|it| it.into_token());
+        let file = tokens.find_map(<syntax::ast::String as syntax::AstToken>::cast)?;
+```
+
+New:
+
+```rust
+        if calls.next().is_some() || included(call.to_view(self.db)).is_none() {
+            return None;
+        }
+        let expansion = hir::HirFileId::from(id).root(self.db);
+        let mut tokens = expansion.descendants_with_tokens().filter_map(|it| it.into_token());
+        let file = tokens.find_map(ast::String::cast)?;
+```
+
+### 12. `crates/blaze-engine/src/doctest/extract.rs` (lines 278-278 now)
+
+Why: the file's tree as a view.
+
+Old:
+
+```rust
+            let tree = range.file_id.parse_or_expand(self.db);
+```
+
+New:
+
+```rust
+            let tree = range.file_id.root(self.db);
+```
+
+### 13. `crates/blaze-engine/src/doctest/extract.rs` (lines 301-303 now)
+
+Why: the call as a view; its range mapped up as the handle method maps it.
+
+Old:
+
+```rust
+        let call = call.to_in_file_node(self.db);
+        let included = self.whole_files.then(|| included(&call.value)).flatten();
+        let call = call.syntax().original_file_range_rooted(self.db);
+```
+
+New:
+
+```rust
+        let call = hir::InFile::new(call.file_id, call.to_view(self.db));
+        let included = self.whole_files.then(|| included(call.value)).flatten();
+        let call = call.map(|it| it.syntax().text_range());
+        let call = call.original_node_file_range_rooted(self.db);
+```
+
+### 14. `crates/blaze-engine/src/doctest/extract.rs` (lines 316-317 now)
+
+Why: the file's root as a view.
+
+Old:
+
+```rust
+        let tree = call.file_id.parse(self.db).syntax_node();
+        let attr = tree.covering_element(call.range).ancestors();
+```
+
+New:
+
+```rust
+        let parse = call.file_id.parse(self.db);
+        let attr = parse.root().covering_element(call.range).ancestors();
+```
+
+### 15. `crates/blaze-engine/src/doctest/extract.rs` (lines 328-331 now)
+
+Why: the file's tree as a view; the token is `Copy`.
+
+Old:
+
+```rust
+        let tree = range.file_id.parse_or_expand(db);
+        let token = tree.token_at_offset(range.value.start()).right_biased()?;
+        // What a macro wrote of its own is where the macro is used, as rustdoc has it.
+        let written = hir::InFile::new(range.file_id, token.clone()).original_file_range(db);
+```
+
+New:
+
+```rust
+        let tree = range.file_id.root(db);
+        let token = tree.token_at_offset(range.value.start()).right_biased()?;
+        // What a macro wrote of its own is where the macro is used, as rustdoc has it.
+        let written = hir::InFile::new(range.file_id, token).original_file_range(db);
+```
+
+### 16. `crates/blaze-engine/src/doctest/extract.rs` (lines 361-406 now)
+
+Why: `included`, `use_name`, `is_macro_rules`, `is_written_in` and `shown_type` over views (`Module::definition_source_view`, `ModuleSourceView`); a range mapped up as the handle method maps the node's.
+
+Old:
+
+```rust
+fn included(call: &syntax::ast::MacroCall) -> Option<String> {
+    let includes = call.path()?.segment()?.name_ref().is_some_and(|it| it.text() == "include_str");
+    let mut tokens = call.token_tree()?.syntax().descendants_with_tokens();
+    let file =
+        tokens.find_map(|it| <syntax::ast::String as syntax::AstToken>::cast(it.into_token()?))?;
+    includes.then(|| file.value().ok().map(|it| it.into_owned())).flatten()
+}
+
+/// The name a `use` is tested under: the one it brings its path in as, and none for a list
+/// or a glob.
+fn use_name(tree: &syntax::ast::UseTree) -> Option<String> {
+    if tree.use_tree_list().is_some() || tree.star_token().is_some() {
+        return None;
+    }
+    if let Some(rename) = tree.rename() {
+        return Some(rename.name().map_or("_".to_owned(), |it| it.text().to_owned()));
+    }
+    tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_string())
+}
+
+fn is_macro_rules(db: &RootDatabase, it: hir::Macro) -> bool {
+    let source = it.source(db).and_then(|it| it.value.left());
+    matches!(source, Some(syntax::ast::Macro::MacroRules(_)))
+}
+
+/// Whether the macro is one of the items of the module as they are written: its own, or of a
+/// macro that is used there.
+fn is_written_in(db: &RootDatabase, it: hir::Macro, module: Module) -> bool {
+    let Some(source) = it.source(db) else { return false };
+    let written = source.syntax().original_file_range_rooted(db);
+    let tree = written.file_id.parse(db).syntax_node();
+    let around = tree.covering_element(written.range).ancestors();
+    let inline = around.into_iter().find_map(syntax::ast::Module::cast);
+    let inline = inline.map(|it| it.syntax().text_range());
+    let module = module.definition_source(db);
+    module.file_id == hir::HirFileId::from(written.file_id)
+        && match &module.value {
+            hir::ModuleSource::SourceFile(_) => inline.is_none(),
+            hir::ModuleSource::Module(it) => inline == Some(it.syntax().text_range()),
+            hir::ModuleSource::BlockExpr(_) => false,
+        }
+}
+
+/// The type an `impl` is of as rustdoc names it: as the compiler writes it out, where a
+/// reference has its lifetime even when none is written, and with no spaces.
+fn shown_type(ty: &syntax::ast::Type) -> String {
+```
+
+New:
+
+```rust
+fn included(call: ast::MacroCall<'_>) -> Option<String> {
+    let includes = call.path()?.segment()?.name_ref().is_some_and(|it| it.text() == "include_str");
+    let mut tokens = call.token_tree()?.syntax().descendants_with_tokens();
+    let file = tokens.find_map(|it| ast::String::cast(it.into_token()?))?;
+    includes.then(|| file.value().ok().map(|it| it.into_owned())).flatten()
+}
+
+/// The name a `use` is tested under: the one it brings its path in as, and none for a list
+/// or a glob.
+fn use_name(tree: ast::UseTree<'_>) -> Option<String> {
+    if tree.use_tree_list().is_some() || tree.star_token().is_some() {
+        return None;
+    }
+    if let Some(rename) = tree.rename() {
+        return Some(rename.name().map_or("_".to_owned(), |it| it.text().to_owned()));
+    }
+    tree.path().and_then(|it| it.segment()).map(|it| it.syntax().text().to_owned())
+}
+
+fn is_macro_rules(db: &RootDatabase, it: hir::Macro) -> bool {
+    let source = it.source_view(db).and_then(|it| it.value.left());
+    matches!(source, Some(ast::Macro::MacroRules(_)))
+}
+
+/// Whether the macro is one of the items of the module as they are written: its own, or of a
+/// macro that is used there.
+fn is_written_in(db: &RootDatabase, it: hir::Macro, module: Module) -> bool {
+    use hir::view::ModuleSourceView;
+    let Some(source) = it.source_view(db) else { return false };
+    let written = source.map(|it| it.syntax().text_range()).original_node_file_range_rooted(db);
+    let parse = written.file_id.parse(db);
+    let around = parse.root().covering_element(written.range).ancestors();
+    let inline = around.into_iter().find_map(ast::Module::cast);
+    let inline = inline.map(|it| it.syntax().text_range());
+    let module = module.definition_source_view(db);
+    module.file_id == hir::HirFileId::from(written.file_id)
+        && match module.value {
+            ModuleSourceView::SourceFile(_) => inline.is_none(),
+            ModuleSourceView::Module(it) => inline == Some(it.syntax().text_range()),
+            ModuleSourceView::BlockExpr(_) => false,
+        }
+}
+
+/// The type an `impl` is of as rustdoc names it: as the compiler writes it out, where a
+/// reference has its lifetime even when none is written, and with no spaces.
+fn shown_type(ty: ast::Type<'_>) -> String {
+```
+
+### 17. `crates/blaze-engine/src/doctest/extract.rs` (lines 413-413 now)
+
+Why: the view.
+
+Old:
+
+```rust
+        let reference = token.parent().and_then(syntax::ast::RefType::cast);
+```
+
+New:
+
+```rust
+        let reference = token.parent().and_then(ast::RefType::cast);
+```
+
+### 18. `crates/blaze-engine/src/doctest/extract.rs` (lines 508-510 now)
+
+Why: the test on views.
+
+Old:
+
+```rust
+            let file = syntax::ast::SourceFile::parse(&file, syntax::Edition::CURRENT).tree();
+            let found = file.syntax().descendants().find_map(syntax::ast::Impl::cast);
+            shown_type(&found.and_then(|it| it.self_ty()).unwrap())
+```
+
+New:
+
+```rust
+            let parse = syntax::SourceFile::parse(&file, syntax::Edition::CURRENT);
+            let found = parse.root().descendants().find_map(ast::Impl::cast);
+            shown_type(found.and_then(|it| it.self_ty()).unwrap())
+```
+
+### 19. `crates/blaze-engine/src/doctest.rs` (lines 459-484 now)
+
+Why: the root's token trees as views; what is before one compared as its `&str`.
+
+Old:
+
+```rust
+    fn read(db: &RootDatabase, krate: hir::Crate) -> OfTheCrate {
+        use syntax::{AstNode, SyntaxKind, ast};
+        let root = krate.root_file(db);
+        let file = ast::SourceFile::parse(db.file_text(root).text(db), Edition::CURRENT).tree();
+        let mut of_the_crate = OfTheCrate::default();
+        let trees = file.syntax().descendants().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
+        // `test(..)` directly inside `doc(..)` of an attribute of the file itself.
+        for tree in trees {
+            let before = |node: &syntax::SyntaxNode| {
+                let mut prev = node.prev_sibling_or_token();
+                while prev.as_ref().is_some_and(|it| it.kind().is_trivia()) {
+                    prev = prev.and_then(|it| it.prev_sibling_or_token());
+                }
+                prev.map(|it| it.to_string())
+            };
+            let outer = tree.parent().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
+            let in_doc = outer.as_ref().is_some_and(|it| before(it).as_deref() == Some("doc"));
+            if before(&tree).as_deref() != Some("test") || !in_doc {
+                continue;
+            }
+            for inner in tree.children().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE) {
+                if before(&inner).as_deref() == Some("attr") {
+                    let text = inner.text().to_string();
+                    of_the_crate.attrs.extend(split_attrs(&text[1..text.len() - 1]));
+                }
+            }
+```
+
+New:
+
+```rust
+    fn read(db: &RootDatabase, krate: hir::Crate) -> OfTheCrate {
+        use syntax::{NodeOrToken, SyntaxKind, view as ast};
+        fn before(node: ast::Node<'_>) -> Option<&str> {
+            let mut prev = node.prev_sibling_or_token();
+            while prev.is_some_and(|it| it.kind().is_trivia()) {
+                prev = prev.and_then(|it| it.prev_sibling_or_token());
+            }
+            prev.map(|it| match it {
+                NodeOrToken::Node(it) => it.text(),
+                NodeOrToken::Token(it) => it.text(),
+            })
+        }
+        let root = krate.root_file(db);
+        let parse = syntax::SourceFile::parse(db.file_text(root).text(db), Edition::CURRENT);
+        let mut of_the_crate = OfTheCrate::default();
+        let trees = parse.root().descendants().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
+        // `test(..)` directly inside `doc(..)` of an attribute of the file itself.
+        for tree in trees {
+            let outer = tree.parent().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE);
+            let in_doc = outer.is_some_and(|it| before(it) == Some("doc"));
+            if before(tree) != Some("test") || !in_doc {
+                continue;
+            }
+            for inner in tree.children().filter(|it| it.kind() == SyntaxKind::TOKEN_TREE) {
+                if before(inner) == Some("attr") {
+                    let text = inner.text();
+                    of_the_crate.attrs.extend(split_attrs(&text[1..text.len() - 1]));
+                }
+            }
+```
+
+### 20. `crates/blaze-engine/src/doctest.rs` (lines 950-955 now)
+
+Why: the file's functions as views, `to_def` of the view `Semantics`.
+
+Old:
+
+```rust
+    use syntax::{AstNode as _, ast};
+    let sema = hir::Semantics::new(db);
+    let functions = sema.parse_guess_edition(file).syntax().descendants().filter_map(ast::Fn::cast);
+    let mut why = Vec::new();
+    for function in functions {
+        let Some(function) = sema.to_def(&function) else { continue };
+```
+
+New:
+
+```rust
+    use syntax::view::{self as ast, AstNode as _};
+    let sema = hir::view::Semantics::new(db);
+    let functions = sema.parse_guess_edition(file).syntax().descendants().filter_map(ast::Fn::cast);
+    let mut why = Vec::new();
+    for function in functions {
+        let Some(function) = sema.to_def(function) else { continue };
+```
+
+### 21. `crates/blaze-engine/src/doctest.rs` (lines 980-995 now)
+
+Why: the file and its expansions walked as views, resolved by the view `Semantics`.
+
+Old:
+
+```rust
+    use syntax::{AstNode as _, ast};
+    let sema = hir::Semantics::new(db);
+    let mut trees = vec![sema.parse_guess_edition(file).syntax().clone()];
+    while let Some(tree) = trees.pop() {
+        for node in tree.descendants() {
+            let used = if let Some(call) = ast::MacroCall::cast(node.clone()) {
+                trees.extend(sema.expand_macro_call(&call).map(|it| it.value));
+                None
+            } else if let Some(path) = ast::Path::cast(node.clone()) {
+                match sema.resolve_path(&path) {
+                    Some(hir::PathResolution::Def(def)) => Some(def),
+                    _ => None,
+                }
+            } else {
+                ast::MethodCallExpr::cast(node)
+                    .and_then(|call| sema.resolve_method_call(&call))
+```
+
+New:
+
+```rust
+    use syntax::view::{self as ast, AstNode as _};
+    let sema = hir::view::Semantics::new(db);
+    let mut trees = vec![sema.parse_guess_edition(file).syntax()];
+    while let Some(tree) = trees.pop() {
+        for node in tree.descendants() {
+            let used = if let Some(call) = ast::MacroCall::cast(node) {
+                trees.extend(sema.expand_macro_call(call).map(|it| it.value));
+                None
+            } else if let Some(path) = ast::Path::cast(node) {
+                match sema.resolve_path(path) {
+                    Some(hir::PathResolution::Def(def)) => Some(def),
+                    _ => None,
+                }
+            } else {
+                ast::MethodCallExpr::cast(node)
+                    .and_then(|call| sema.resolve_method_call(call))
+```
+
+> forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).
+
+## frontend-tree: blaze-engine test_harness.rs: onto views (8)
+From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. A test's attributes read off its source view (`cfg_attr` through `CfgExpr::parse_from_view`), its name's range mapped up as the handle method maps it. Same metas, order and ranges. A path's name is its `&str` (no `String` per attribute); `expected` matches the five tokens as they are walked instead of gathering a `Vec`.
+
+needs: frontend-tree-move-hir's `hir::view` (`crates/hir/src/semantics/view.rs`, re-exported as `hir::view`): `Semantics` (`new`, `new_within`, `parse_guess_edition`, `parse_or_expand`, `source`, `hir_file_for`, `to_def`, `ancestors_with_macros`, `expand_macro_call`, `resolve_path`, `resolve_method_call`, `resolve_macro_call`, `resolve_attr_macro_call`, `scope`, `module_definition_node`, `file_to_module_def(s)`), `HasSourceView`, `ModuleSourceView`, `Module::{definition,declaration}_source_view`, `UseDecl::source_view` (requests in `v2/requests/db.md`).
+
+### 1. `crates/blaze-engine/src/test_harness.rs` (lines 10-13 now)
+
+Why: the views.
+
+Old:
+
+```rust
+use syntax::{
+    AstNode as _, AstToken as _,
+    ast::{self, HasAttrs as _, HasName as _},
+};
+```
+
+New:
+
+```rust
+use syntax::view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _, HasName as _};
+```
+
+### 2. `crates/blaze-engine/src/test_harness.rs` (lines 88-88 now)
+
+Why: the view twin.
+
+Old:
+
+```rust
+    use hir::HasSource as _;
+```
+
+New:
+
+```rust
+    use hir::view::HasSourceView as _;
+```
+
+### 3. `crates/blaze-engine/src/test_harness.rs` (lines 97-97 now)
+
+Why: the function's source view.
+
+Old:
+
+```rust
+        let source = function.source(db)?;
+```
+
+New:
+
+```rust
+        let source = function.source_view(db)?;
+```
+
+### 4. `crates/blaze-engine/src/test_harness.rs` (lines 109-109 now)
+
+Why: views carry the tree's lifetime.
+
+Old:
+
+```rust
+        let mut metas: Vec<ast::Meta> = source.value.attrs().filter_map(|it| it.meta()).collect();
+```
+
+New:
+
+```rust
+        let mut metas: Vec<ast::Meta<'_>> =
+            source.value.attrs().filter_map(|it| it.meta()).collect();
+```
+
+### 5. `crates/blaze-engine/src/test_harness.rs` (lines 117-119 now)
+
+Why: `CfgExpr::parse_from_view`, the twin of `parse_from_ast`.
+
+Old:
+
+```rust
+            let predicate = cfg::CfgExpr::parse_from_ast(cfg_attr.cfg_predicate()?);
+            if krate.cfg(db).check(&predicate) != Some(false) {
+                let inner: Vec<ast::Meta> = cfg_attr.metas().collect();
+```
+
+New:
+
+```rust
+            let predicate = cfg::CfgExpr::parse_from_view(cfg_attr.cfg_predicate()?);
+            if krate.cfg(db).check(&predicate) != Some(false) {
+                let inner: Vec<ast::Meta<'_>> = cfg_attr.metas().collect();
+```
+
+### 6. `crates/blaze-engine/src/test_harness.rs` (lines 123-126 now)
+
+Why: `named` is a function giving the path's `&str` (below).
+
+Old:
+
+```rust
+        for meta in attrs {
+            let named = |path: Option<ast::Path>| path.map(|it| it.syntax().text().to_string());
+            match meta {
+                ast::Meta::PathMeta(meta) => match named(meta.path()).as_deref() {
+```
+
+New:
+
+```rust
+        for meta in attrs {
+            match meta {
+                ast::Meta::PathMeta(meta) => match named(meta.path()) {
+```
+
+### 7. `crates/blaze-engine/src/test_harness.rs` (lines 132-133 now)
+
+Why: by value.
+
+Old:
+
+```rust
+                    let value = meta.expr().and_then(|it| string_of(&it));
+                    match named(meta.path()).as_deref() {
+```
+
+New:
+
+```rust
+                    let value = meta.expr().and_then(string_of);
+                    match named(meta.path()) {
+```
+
+### 8. `crates/blaze-engine/src/test_harness.rs` (lines 143-147 now)
+
+Why: by value.
+
+Old:
+
+```rust
+                ast::Meta::TokenTreeMeta(meta) => match named(meta.path()).as_deref() {
+                    Some("ignore") => test.ignore = true,
+                    Some("should_panic") => {
+                        test.should_panic =
+                            ShouldPanic::WithMessage(expected(&meta.token_tree()?)?);
+```
+
+New:
+
+```rust
+                ast::Meta::TokenTreeMeta(meta) => match named(meta.path()) {
+                    Some("ignore") => test.ignore = true,
+                    Some("should_panic") => {
+                        test.should_panic =
+                            ShouldPanic::WithMessage(expected(meta.token_tree()?)?);
+```
+
+### 9. `crates/blaze-engine/src/test_harness.rs` (lines 155-155 now)
+
+Why: the name's range mapped up as the handle method maps the node's.
+
+Old:
+
+```rust
+        let range = source.with_value(name.syntax()).original_file_range_rooted(db);
+```
+
+New:
+
+```rust
+        let range = source.with_value(name.syntax().text_range());
+        let range = range.original_node_file_range_rooted(db);
+```
+
+### 10. `crates/blaze-engine/src/test_harness.rs` (lines 323-350 now)
+
+Why: `named`, `string_of` and `expected` over views; `expected` takes the tokens as they come.
+
+Old:
+
+```rust
+/// The value of a string literal.
+fn string_of(expr: &ast::Expr) -> Option<String> {
+    let ast::Expr::Literal(literal) = expr else { return None };
+    let ast::LiteralKind::String(string) = literal.kind() else { return None };
+    Some(string.value().ok()?.into_owned())
+}
+
+/// The message of `should_panic(expected = "...")`. `None` for any other argument: rustc
+/// takes no other.
+fn expected(tree: &ast::TokenTree) -> Option<String> {
+    let tokens: Vec<_> = tree
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|it| !it.kind().is_trivia())
+        .collect();
+    match tokens.as_slice() {
+        [open, name, eq, value, close]
+            if open.text() == "("
+                && name.text() == "expected"
+                && eq.text() == "="
+                && close.text() == ")" =>
+        {
+            Some(ast::String::cast(value.clone())?.value().ok()?.into_owned())
+        }
+        _ => None,
+    }
+}
+```
+
+New:
+
+```rust
+/// The text of a path as it is written.
+fn named(path: Option<ast::Path<'_>>) -> Option<&str> {
+    path.map(|it| it.syntax().text())
+}
+
+/// The value of a string literal.
+fn string_of(expr: ast::Expr<'_>) -> Option<String> {
+    let ast::Expr::Literal(literal) = expr else { return None };
+    let ast::LiteralKind::String(string) = literal.kind() else { return None };
+    Some(string.value().ok()?.into_owned())
+}
+
+/// The message of `should_panic(expected = "...")`. `None` for any other argument: rustc
+/// takes no other.
+fn expected(tree: ast::TokenTree<'_>) -> Option<String> {
+    let mut tokens = tree
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|it| !it.kind().is_trivia());
+    let [Some(open), Some(name), Some(eq), Some(value), Some(close), None] =
+        [(); 6].map(|()| tokens.next())
+    else {
+        return None;
+    };
+    if [open, name, eq, close].map(|it| it.text()) != ["(", "expected", "=", ")"] {
+        return None;
+    }
+    Some(ast::String::cast(value)?.value().ok()?.into_owned())
+}
+```
+
+### 11. `crates/blaze-engine/src/test_harness.rs` (lines 373-373 now)
+
+Why: the view `Semantics`.
+
+Old:
+
+```rust
+            let sema = hir::Semantics::new(&db);
+```
+
+New:
+
+```rust
+            let sema = hir::view::Semantics::new(&db);
+```
+
+> forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).
+
+## frontend-tree: blaze-engine lib.rs: onto views (9)
+
+Revised (2026-10-29 22:00): apply after `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm`. That request moves `path`, `item_path`, `function_at`, `scope_path`, `type_path`, the syntax of `closure`, `static_named` and `declared_in`, and `name_in_path` through `closure_number` into `crates/rustc-symbols`, written on views, with every `self.sema()`; so items 2-19 and 28 (the moved count test) are withdrawn, and item 1 is rewritten over that request's imports. Items 20-27 and 29-31 stand, their old texts untouched by it.
+From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. How blaze-engine names what rustc built (closures, statics in bodies, items of blocks, `impl` places), the count of closures and statics in a definition, and the late imports: all onto `hir::view::Semantics` and `Node<'db>`. A view's `==` is identity (same tree, same index), what the handle `==` was, and the view `Semantics` hands out the database's own trees, so the comparisons along `ancestors_with_macros` and an expansion's root mean what they did. `function_at` keys the function by `AstIdMap::ast_id_of_view`; `name_in_path` gives the name's `&str`, so `Counts::holds` makes no `String` per node it tests; a test's attributes and a function's text are hashed from `&str` (`str` hashes as `String`, `join` gives the same bytes). Every test kept, on views.
+
+Stays on handles: `callers_of_generic` (hunk 20), which takes its callers from `ide_db::defs::Definition::usages`, the IDE's reference search, which gives handle nodes and takes the handle `Semantics`. It names its handle types in full, since `ast` and `AstNode` are the views' in this file now. A build-path reverse call index would replace it (not frontend-tree's).
+
+needs: frontend-tree-move-hir's `hir::view` (`crates/hir/src/semantics/view.rs`, re-exported as `hir::view`): `Semantics` (`new`, `new_within`, `parse_guess_edition`, `parse_or_expand`, `source`, `hir_file_for`, `to_def`, `ancestors_with_macros`, `expand_macro_call`, `resolve_path`, `resolve_method_call`, `resolve_macro_call`, `resolve_attr_macro_call`, `scope`, `module_definition_node`, `file_to_module_def(s)`), `HasSourceView`, `ModuleSourceView`, `Module::{definition,declaration}_source_view`, `UseDecl::source_view` (requests in `v2/requests/db.md`).
+
+### 1. `crates/blaze-engine/src/lib.rs` (the imports, as `## dedup: one rustc-symbol resolver ...` item 2 leaves them)
+
+Why: the views. After the dedup request, the only syntax `lib.rs` reads by name is method calls on views (`.name()`, `.syntax()`): `match_ast!`, `SyntaxNode` and the `ast` module have no user left (`callers_of_generic`, item 20, names its handles in full).
+
+Old:
+
+```rust
+use rustc_symbols::{Paths, Places, StaticPath};
+use syntax::{
+    AstNode,
+    ast::{self, HasName},
+};
+```
+
+New:
+
+```rust
+use rustc_symbols::{Paths, Places, StaticPath};
+use syntax::view::{AstNode, HasName};
+```
+
+### 2. `crates/blaze-engine/src/lib.rs` (lines 870-875 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 3. `crates/blaze-engine/src/lib.rs` (lines 1184-1192 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 4. `crates/blaze-engine/src/lib.rs` (lines 1229-1250 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 5. `crates/blaze-engine/src/lib.rs` (lines 1724-1733 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 6. `crates/blaze-engine/src/lib.rs` (lines 1652-1655 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 7. `crates/blaze-engine/src/lib.rs` (lines 1673-1688 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 8. `crates/blaze-engine/src/lib.rs` (lines 1734-1750 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 9. `crates/blaze-engine/src/lib.rs` (lines 1815-1826 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 10. `crates/blaze-engine/src/lib.rs` (lines 1856-1868 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 11. `crates/blaze-engine/src/lib.rs` (lines 1874-1896 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 12. `crates/blaze-engine/src/lib.rs` (lines 1903-1914 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 13. `crates/blaze-engine/src/lib.rs` (lines 1921-1921 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 14. `crates/blaze-engine/src/lib.rs` (lines 1934-1938 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 15. `crates/blaze-engine/src/lib.rs` (lines 1954-1960 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 16. `crates/blaze-engine/src/lib.rs` (lines 2007-2014 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 17. `crates/blaze-engine/src/lib.rs` (lines 2033-2076 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 18. `crates/blaze-engine/src/lib.rs` (lines 2089-2103 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 19. `crates/blaze-engine/src/lib.rs` (lines 2119-2389 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 20. `crates/blaze-engine/src/lib.rs` (lines 4533-4535 now)
+
+Why: stays on handles (ide_db's reference search), named in full now that `ast`/`AstNode` are the views'.
+
+Old:
+
+```rust
+            let ide_db::search::FileReferenceNode::NameRef(name) = reference.name else { continue };
+            let caller = sema.ancestors_with_macros(name.syntax().clone()).find_map(ast::Fn::cast);
+            let caller = caller.and_then(|it| sema.to_def(&it));
+```
+
+New:
+
+```rust
+            let ide_db::search::FileReferenceNode::NameRef(name) = reference.name else { continue };
+            let name = syntax::AstNode::syntax(&name);
+            let caller = sema.ancestors_with_macros(name.clone()).find_map(syntax::ast::Fn::cast);
+            let caller = caller.and_then(|it| sema.to_def(&it));
+```
+
+### 21. `crates/blaze-engine/src/lib.rs` (lines 3973-3975 now)
+
+Why: the view twins.
+
+Old:
+
+```rust
+    use hir::HasSource as _;
+    use sha2::Digest as _;
+    use syntax::ast::HasAttrs as _;
+```
+
+New:
+
+```rust
+    use hir::view::HasSourceView as _;
+    use sha2::Digest as _;
+    use syntax::view::HasAttrs as _;
+```
+
+### 22. `crates/blaze-engine/src/lib.rs` (lines 3994-3995 now)
+
+Why: the attributes' `&str`s joined: the same bytes, no `String` per attribute.
+
+Old:
+
+```rust
+        let attrs = function.source(db).map(|it| {
+            let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
+```
+
+New:
+
+```rust
+        let attrs = function.source_view(db).map(|it| {
+            let attrs = it.value.attrs().map(|it| it.syntax().text());
+```
+
+### 23. `crates/blaze-engine/src/lib.rs` (lines 4157-4157 now)
+
+Why: the root's attributes as views.
+
+Old:
+
+```rust
+    let attrs = syntax::ast::HasAttrs::attrs(&root.parse(db).tree());
+```
+
+New:
+
+```rust
+    let parse = root.parse(db);
+    let attrs = syntax::view::HasAttrs::attrs(&parse.view());
+```
+
+### 24. `crates/blaze-engine/src/lib.rs` (lines 6412-6417 now)
+
+Why: the function's source view; the name's range mapped up as the handle method maps it.
+
+Old:
+
+```rust
+    let at = func.and_then(|func| hir::HasSource::source(hir::Function::from(func), db)).and_then(
+        |source| {
+            let name = source.value.name()?;
+            Some(source.with_value(name.syntax()).original_file_range_rooted(db))
+        },
+    );
+```
+
+New:
+
+```rust
+    let at = func
+        .and_then(|func| hir::view::HasSourceView::source_view(hir::Function::from(func), db))
+        .and_then(|source| {
+            let name = source.value.name()?;
+            let range = source.with_value(name.syntax().text_range());
+            Some(range.original_node_file_range_rooted(db))
+        });
+```
+
+### 25. `crates/blaze-engine/src/lib.rs` (lines 6645-6646 now)
+
+Why: the function's text hashed as `&str`: `str` and `String` hash the same.
+
+Old:
+
+```rust
+        let written = hir::HasSource::source(func, db)
+            .map(|it| rustc_hash::FxBuildHasher.hash_one(it.value.syntax().text().to_string()));
+```
+
+New:
+
+```rust
+        let written = hir::view::HasSourceView::source_view(func, db)
+            .map(|it| rustc_hash::FxBuildHasher.hash_one(it.value.syntax().text()));
+```
+
+### 26. `crates/blaze-engine/src/lib.rs` (lines 7304-7305 now)
+
+Why: the view twins.
+
+Old:
+
+```rust
+        use hir::HasSource as _;
+        use syntax::ast::HasAttrs as _;
+```
+
+New:
+
+```rust
+        use hir::view::HasSourceView as _;
+        use syntax::view::HasAttrs as _;
+```
+
+### 27. `crates/blaze-engine/src/lib.rs` (lines 7329-7330 now)
+
+Why: the attributes' `&str`s joined: the same bytes.
+
+Old:
+
+```rust
+                let attrs = function.source(db).map(|it| {
+                    let attrs = it.value.attrs().map(|it| it.syntax().text().to_string());
+```
+
+New:
+
+```rust
+                let attrs = function.source_view(db).map(|it| {
+                    let attrs = it.value.attrs().map(|it| it.syntax().text());
+```
+
+### 28. `crates/blaze-engine/src/lib.rs` (lines 11666-11670 now)
+
+Withdrawn (2026-10-29 22:00): this code moves to `crates/rustc-symbols`, already on views, under `## dedup: one rustc-symbol resolver for blaze-engine and blaze-wasm` above; do not apply.
+
+### 29. `crates/blaze-engine/src/lib.rs` (lines 11867-11876 now)
+
+Why: the test of `new_within` on the view `Semantics` that `sema()` makes.
+
+Old:
+
+```rust
+            let crates_of = |sema: &hir::Semantics<'_>, file| {
+                let modules = sema.file_to_module_defs(file);
+                modules.map(|it| ide_db::base_db::Crate::from(it.krate(&db))).collect::<Vec<_>>()
+            };
+            let all = hir::Semantics::new(&db);
+            let (app, example) = (crates_of(&all, main)[0], crates_of(&all, other)[0]);
+            assert_eq!(crates_of(&all, shared), [app, example]);
+            let within = |crates: &[_]| {
+                hir::Semantics::new_within(&db, Arc::new(crates.iter().copied().collect()))
+            };
+```
+
+New:
+
+```rust
+            let crates_of = |sema: &hir::view::Semantics<'_>, file| {
+                let modules = sema.file_to_module_defs(file);
+                modules.map(|it| ide_db::base_db::Crate::from(it.krate(&db))).collect::<Vec<_>>()
+            };
+            let all = hir::view::Semantics::new(&db);
+            let (app, example) = (crates_of(&all, main)[0], crates_of(&all, other)[0]);
+            assert_eq!(crates_of(&all, shared), [app, example]);
+            let within = |crates: &[_]| {
+                hir::view::Semantics::new_within(&db, Arc::new(crates.iter().copied().collect()))
+            };
+```
+
+### 30. `crates/blaze-engine/src/lib.rs` (lines 11905-11906 now)
+
+Why: the view `Semantics`.
+
+Old:
+
+```rust
+            let sema = hir::Semantics::new(&db);
+            let module = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
+```
+
+New:
+
+```rust
+            let sema = hir::view::Semantics::new(&db);
+            let module = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
+```
+
+### 31. `crates/blaze-engine/src/lib.rs` (lines 12047-12048 now)
+
+Why: the view `Semantics`.
+
+Old:
+
+```rust
+            let sema = hir::Semantics::new(&db);
+            let root = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
+```
+
+New:
+
+```rust
+            let sema = hir::view::Semantics::new(&db);
+            let root = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
+```
+
+> forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).
+
+## frontend-tree: hir-ty-codegen v2/roots/harness.rs: onto views (10)
+From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16. For codegen-api-roots, whose new file this is (new code walks views, common.md). The test function's node found from its pointer under the database's tree (`HasSource::ast_ptr`, `HirFileId::root`, `AstPtr::to_view`: the node `source` finds, with no handle or reparse), its attributes read as views (`cfg_attr` through `CfgExpr::parse_from_view`). Same metas, order and ranges. `expected` matches the five tokens as they are walked: no `Vec` and no token clone. Needs nothing first: every API is in the tree.
+
+### 1. `crates/hir-ty-codegen/v2/roots/harness.rs` (lines 24-27 now)
+
+Why: the views.
+
+Old:
+
+```rust
+use syntax::{
+    AstNode as _, AstToken as _, TextRange,
+    ast::{self, HasAttrs as _, HasName as _},
+};
+```
+
+New:
+
+```rust
+use syntax::{
+    TextRange,
+    view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _, HasName as _},
+};
+```
+
+### 2. `crates/hir-ty-codegen/v2/roots/harness.rs` (lines 129-129 now)
+
+Why: the function as a view of the database's tree.
+
+Old:
+
+```rust
+    let source = function.lookup(db).source(db);
+```
+
+New:
+
+```rust
+    let ptr = function.lookup(db).ast_ptr(db);
+    let root = ptr.file_id.root(db);
+    let source = ptr.map(|it| it.to_view(root));
+```
+
+### 3. `crates/hir-ty-codegen/v2/roots/harness.rs` (lines 144-146 now)
+
+Why: views carry the tree's lifetime.
+
+Old:
+
+```rust
+    let mut metas: Vec<ast::Meta> = source.value.attrs().filter_map(|it| it.meta()).collect();
+    metas.reverse();
+    let named = |path: Option<ast::Path>| {
+```
+
+New:
+
+```rust
+    let mut metas: Vec<ast::Meta<'_>> = source.value.attrs().filter_map(|it| it.meta()).collect();
+    metas.reverse();
+    let named = |path: Option<ast::Path<'_>>| {
+```
+
+### 4. `crates/hir-ty-codegen/v2/roots/harness.rs` (lines 154-154 now)
+
+Why: the view twin of `parse_from_ast`.
+
+Old:
+
+```rust
+                let predicate = CfgExpr::parse_from_ast(predicate);
+```
+
+New:
+
+```rust
+                let predicate = CfgExpr::parse_from_view(predicate);
+```
+
+### 5. `crates/hir-ty-codegen/v2/roots/harness.rs` (lines 167-167 now)
+
+Why: by value.
+
+Old:
+
+```rust
+                let value = meta.expr().map(|it| string_of(&it)).transpose();
+```
+
+New:
+
+```rust
+                let value = meta.expr().map(string_of).transpose();
+```
+
+### 6. `crates/hir-ty-codegen/v2/roots/harness.rs` (lines 182-182 now)
+
+Why: by value.
+
+Old:
+
+```rust
+                    test.should_panic = Some(meta.token_tree().and_then(|it| expected(&it)));
+```
+
+New:
+
+```rust
+                    test.should_panic = Some(meta.token_tree().and_then(expected));
+```
+
+### 7. `crates/hir-ty-codegen/v2/roots/harness.rs` (lines 208-208 now)
+
+Why: a view by value.
+
+Old:
+
+```rust
+fn string_of(expr: &ast::Expr) -> Result<Option<String>, String> {
+```
+
+New:
+
+```rust
+fn string_of(expr: ast::Expr<'_>) -> Result<Option<String>, String> {
+```
+
+### 8. `crates/hir-ty-codegen/v2/roots/harness.rs` (lines 220-240 now)
+
+Why: the tokens matched as they come: no `Vec`, no clone.
+
+Old:
+
+```rust
+fn expected(tree: &ast::TokenTree) -> Option<String> {
+    let tokens: Vec<_> = tree
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|it| !it.kind().is_trivia())
+        // alloc: once a `should_panic` with a list, of its few tokens
+        .collect();
+    match tokens.as_slice() {
+        [open, name, eq, value, close]
+            if open.text() == "("
+                && name.text() == "expected"
+                && eq.text() == "="
+                && close.text() == ")" =>
+        {
+            // clone: a token is a reference count; alloc: the message libtest is given
+            Some(ast::String::cast(value.clone())?.value().ok()?.into_owned())
+        }
+        _ => None,
+    }
+}
+```
+
+New:
+
+```rust
+fn expected(tree: ast::TokenTree<'_>) -> Option<String> {
+    let mut tokens = tree
+        .syntax()
+        .children_with_tokens()
+        .filter_map(|it| it.into_token())
+        .filter(|it| !it.kind().is_trivia());
+    let [Some(open), Some(name), Some(eq), Some(value), Some(close), None] =
+        [(); 6].map(|()| tokens.next())
+    else {
+        return None;
+    };
+    if [open, name, eq, close].map(|it| it.text()) != ["(", "expected", "=", ")"] {
+        return None;
+    }
+    // alloc: the message libtest is given
+    Some(ast::String::cast(value)?.value().ok()?.into_owned())
+}
+```
+
+> applied by codegen-api-roots (2026-10-29): all 8 hunks, as written, in `crates/hir-ty-codegen/v2/roots/harness.rs`; `hot_lint` finds nothing in `v2/roots*`. Not built (codegen-api-roots runs no build).
+
+## frontend-tree: blaze-engine outline.rs: an allocation budget (11)
+From frontend-tree-move-codegen (2026-10-29), tree.md / frontend.md item 16 ("hot paths get a `blaze-alloc-count` budget test"). After (1): `hash_outside_bodies` and `skeleton_of` of a parsed file allocate nothing, held by `blaze_alloc_count::assert_at_most(0, ..)` as `memo.rs` holds a memo hit (`blaze-alloc-count` is already a dev-dependency, and the crate's test allocator counts). Needs nothing first.
+
+### 1. `crates/blaze-engine/src/outline.rs` (lines 1009-1011 now)
+
+Why: the budget test, beside the outline's other tests.
+
+Old:
+
+```rust
+    fn copies(text: &str) -> Copied {
+        copied_in(SourceFile::parse(text, Edition::CURRENT).root())
+    }
+```
+
+New:
+
+```rust
+    fn copies(text: &str) -> Copied {
+        copied_in(SourceFile::parse(text, Edition::CURRENT).root())
+    }
+
+    /// An outline's hash and a file's skeleton walk the tree's arrays and allocate nothing.
+    #[test]
+    fn an_outline_is_hashed_with_no_allocation() {
+        let text = "mod m { fn f<T>(x: T) { let _ = || 1; } }\n#[derive(Debug)]\nstruct S;\n\
+                    impl S { fn g(&self) -> u8 { 2 } }\nmacro_rules! m { () => {} }\n";
+        let parse = SourceFile::parse(text, Edition::CURRENT);
+        let none = FxHashSet::<TextRange>::default();
+        let (hash, skeleton) = blaze_alloc_count::assert_at_most(0, "an outline's hash", || {
+            (hash_outside_bodies(parse.root(), &none, &none), skeleton_of(parse.root()))
+        });
+        assert_eq!(hash.1, 0);
+        assert_eq!(skeleton, Some(hash.0));
+    }
+```
+
+> forwarded to codegen (`crates/blaze-engine`; codegen-engine and codegen-next1); told by tmux (requests, pass 26).
+
+## frontend-tree: hir-ty-mir location.rs: MacroCallLoc::to_node_view (12)
+From frontend-tree-move-codegen (2026-10-29). frontend-tree fixed the name of `MacroCallLoc::to_node`'s view twin as `MacroCallLoc::to_node_view(&self, db: &'db Db) -> InFile<view::Node<'db>>` (beside `to_node_item_view`), not `to_view` as request (2) wrote it. This renames the four calls (2) put in `location.rs`. For codegen-mir-store, which applied (2). Same function, same meaning; needs frontend-tree-move-expand's twin under that name.
+
+### 1. `crates/hir-ty-mir/src/mir/location.rs` (lines 108-108 now)
+
+Why: the twin's name.
+
+Old:
+
+```rust
+            (concat && names_location(loc.to_view(db).value)).then_some((id, file_id))
+```
+
+New:
+
+```rust
+            (concat && names_location(loc.to_node_view(db).value)).then_some((id, file_id))
+```
+
+### 2. `crates/hir-ty-mir/src/mir/location.rs` (lines 191-191 now)
+
+Why: the twin's name.
+
+Old:
+
+```rust
+        let call = file_id.macro_file()?.loc(db).to_view(db);
+```
+
+New:
+
+```rust
+        let call = file_id.macro_file()?.loc(db).to_node_view(db);
+```
+
+### 3. `crates/hir-ty-mir/src/mir/location.rs` (lines 329-329 now)
+
+Why: the twin's name.
+
+Old:
+
+```rust
+    let mut call = file_id.macro_file()?.loc(db).to_view(db);
+```
+
+New:
+
+```rust
+    let mut call = file_id.macro_file()?.loc(db).to_node_view(db);
+```
+
+### 4. `crates/hir-ty-mir/src/mir/location.rs` (lines 335-335 now)
+
+Why: the twin's name.
+
+Old:
+
+```rust
+        call = outer.loc(db).to_view(db);
+```
+
+New:
+
+```rust
+        call = outer.loc(db).to_node_view(db);
+```
+
+> applied by codegen-mir-store (2026-10-29), uncompiled: the four `.loc(db).to_view(db)` calls in `location.rs` (108, 191, 329, 335) are `.to_node_view(db)`.
+
+
+## frontend-fast-mir: `mod uninhabited;` in `crates/hir-ty-mir/tests/mir/main.rs`
+
+What: in `crates/hir-ty-mir/tests/mir/main.rs`, after `mod ub_checks;`, add `mod uninhabited;`
+(the list stays sorted: `ub_checks`, `uninhabited`, `unwind`).
+Why: `tests/mir/uninhabited.rs` (new, frontend-fast-mir's) holds the fixtures for
+`MirBody::unreachable_after_calls`, which lowering now fills (`lower/uninhabited.rs`, db-ty-d-mir's
+request 1, rustc's `LintAndRemoveUninhabited`). Without the line the file is not compiled.
+
+> applied by codegen-mir-store (2026-10-29): `mod uninhabited;` after `mod ub_checks;` in `tests/mir/main.rs`.
+
+## To cargo: what codegen-api-link's API asks of its calls (2026-10-29)
+
+Where: `crates/blaze-cargo/src/serve/unit/codegen.rs` and `compile.rs`.
+
+1. Call `hir_ty_codegen::v2::select(&toolchain)` once, before the first `Build::new`, with the
+   `Toolchain` `v2::toolchain` made, and fail the unit with its error. It selects the target,
+   `-C target-feature`s and frame pointers of the process's code generator; `check_spec` refuses
+   every unit of a toolchain the process was not set up for. A daemon whose process already
+   compiles for another toolchain gets that error: one toolchain per process, as
+   `Target::select` has it.
+2. Pass the roots' statics: `Build::run_with_statics(&asked, &roots.statics, &store)` in place
+   of `run(&asked, &store)` (`codegen.rs:332`), so `#[used]` and exported statics are in the
+   program (codegen-api-roots' request 2).
+3. A test's selection (`TestOf.reached`): `Built::reached` has every code hash, argument and
+   static value the root reaches, sorted and each once (not "in the walk's order", as the doc
+   comment of `TestOf.reached` says). It does not have the positions: a reformat that moves a
+   `panic!` changes its message and no code hash. Fold in the content of each span table of
+   `LinkInputs::spans` (all of them, or those the reached functions name) when a test's output
+   can print a position.
+4. Out of sync with the tree, not codegen's: `blaze_link::target::locate` does not exist;
+   `Change` has a `slots` field the call leaves out; the driver's `Lookup` has `read`, not
+   `get`; `HirFrontend::new` is used without `with_policy`, which `describe` needs to know which
+   origins MIR-inline.
+
+> forwarded to cargo (cargo-next1); told by tmux (requests, pass 28).
+
+> cargo (2026-10-29 22:35): 1–3 and three of 4's four done, in `serve/unit/codegen.rs` and `compile.rs`.
+> 1. `generate` calls `hir_ty_codegen::v2::select(&toolchain)` before `Build::new`, and its
+>    error fails the unit. It runs per unit, but `Target::select` and `select_features` hold the
+>    first toolchain and compare later ones against it, so it acts once per process and refuses
+>    another toolchain.
+> 2. `run_with_statics(&asked, &roots.statics, &store)`.
+> 3. `TestOf.reached` is `Built::reached` plus one hash per span table of the binary (its anchor
+>    and its bytes, domain `blaze v2 cargo test spans 1`), sorted and deduplicated. The doc
+>    comment says so. It uses all the span tables, not only those the reached functions name: a
+>    reformat anywhere in the binary reruns its tests, which is exact but coarse. Narrowing it to
+>    the tables a test's functions name needs `Built` to give the span anchors per root. The tables
+>    are read once per unit through `Generated::side` (a `OnceCell` of `link_inputs`), shared with
+>    the link, and never for a library.
+> 4. Done: `Reading` implements `Lookup::read`, borrowing the store's bytes in place (the `Vec`
+>    per read is gone); `HirFrontend::new(..).with_policy(&policy)` in `generate`; and
+>    `Change { slots: Vec::new() }`. A whole build tiers nothing up, and `Built` names no edited
+>    function's slot. Codegen, if a relink of a kept image must put an edited function in the slot
+>    its callers call, say where `Built` gives that pair.
+>    Not done: `blaze_link::target::{output, locate}` exist nowhere in the workspace, so that half
+>    is asked of lane link in `v2/requests/link.md` ("the driver's link needs a target's `Output`
+>    and its native libraries located"). Until it lands, `link` doesn't compile.
+>
+> Status: done (cargo's part), the link half open with lane link.
+
+## To store: blaze's code identity in full (from codegen-api-link, 2026-10-29)
+
+Where: `crates/blaze-store/src/lib.rs`.
+
+What: `pub fn identity() -> Option<[u8; KEY]>`, `Identity::current().ok().map(|it| it.0)`: what
+the store keys this process's values by apart from its format, in full.
+
+Why: `Toolchain::id` (`hir_ty_codegen::v2::toolchain`) is blaze's code identity with its
+pinned toolchain. Today it is the hash of `build_name()`, 64 bits of it; with `identity()` it
+is all 256.
+
+> applied (requests, pass 28; lane store is DONE): `pub fn identity() -> Option<[u8; KEY]>` after `build_name` in `crates/blaze-store/src/lib.rs`, `Identity::current().ok().map(|it| it.0)`, documented as the hash `build_name` shows sixteen hex digits of.
+
+## To the front end (`crates/hir-def/src/attrs.rs`): what `#[link]` says that `native_libs` drops (from codegen-api-link, 2026-10-29)
+
+What: `AttrFlags::native_libs` reads a `kind` it does not know as `NativeLibKind::Unspecified`,
+skips a modifier it does not know (`as-needed`) and says nothing of `import_name_type`, and
+nothing says whether an item of an `extern` block has `#[link_ordinal]`. Keep what is written:
+a `kind` other than the four as its text, the `+`/`-` of `as-needed`, and `import_name_type`.
+
+Why: `HirFrontend::linked` (`v2/linked.rs`) is to refuse, naming it, every `#[link]` blaze can't
+link (`kind = "link-arg"`, `+as-needed`, `import_name_type`, `link_ordinal`); today it can
+refuse only `raw-dylib` and `wasm_import_module`, and the others are read as a plain `dylib`.
+
+> forwarded to db-expand-attrs (`hir-def/src/attrs.rs`; db-expand-attrs-next1); told by tmux (requests, pass 28).
+> applied by db-expand-attrs (2026-10-29, not built): `NativeLibKind::Other(Symbol)` keeps a `kind` other than the four as its text; `NativeLib::as_needed: Option<bool>` keeps `+`/`-as-needed`; `NativeLib::import_name_type: Option<Symbol>` keeps `import_name_type`; `AttrFlags::HAS_LINK_ORDINAL` (`1 << 85`) says an item has `#[link_ordinal(..)]`. Tests: `link_keeps_what_blaze_cannot_link`, `#[link_ordinal]` known-shape rows, the string-match references and corpus extended. The readers' side (`linked.rs` refusals, `blaze-engine/src/link.rs` literals and refusals, `blaze-items/src/form.rs` hashing the new fields) is under `## db-expand-attrs: NativeLib keeps what #[link] says` in `v2/requests/db-expand.md`.
+
+
+## dedup: one driver under the 24 MIR queries (from dedup-sim-front, 2026-10-29)
+
+Lands together with `v2/requests/db-ty.md`, heading "## dedup: one driver under the 24 MIR
+queries (from dedup-sim-front, 2026-10-29)". That request changes hir-ty's `Mir` table, which
+`hir-ty-mir/src/mir/providers.rs` fills, and adds `MirOwner`, `MirStage`,
+`MirOptions::is_runtime`, `HirDatabase::mir` and `monomorphized_mir`. Apply both or neither. The
+why and the key argument are there. In short: each of the 24 queries keeps its key, memo, `lru`
+and cycle result, the 22 one-line `compute_*` functions go, and so do the callers' own dispatches
+over the owner kinds.
+
+### hir-ty-mir
+
+1. `src/mir/providers.rs`: the `inventory::submit!` block becomes
+
+```rust
+inventory::submit! {
+    Mir {
+        build: lower::build_mir_body,
+        run_passes: transform::run_passes,
+        optimize: optimize::optimize,
+        monomorphize: monomorphization::monomorphized,
+
+        interpret_mir,
+        opaque_of_impl: monomorphization::opaque_of_impl,
+        coroutine_witnesses: transform::compute_coroutine_witnesses,
+    }
+}
+```
+
+   (the rest of the file stays: `transform::run_passes` and `optimize::optimize` are
+   `pub(super)`, which `mir::providers` sees).
+
+2. `src/mir/lower.rs`:
+   - `use super::{MirLowerError, OperandKind, Place, ...}` (line 68) gains `MirOwner`.
+   - Replace the three functions `compute_mir_body_for_closure`, `compute_mir_body_for_coroutine`
+     and `compute_mir_body_for_coroutine_by_move` (with their doc comments, around line 4659)
+     with:
+
+```rust
+/// `owner`'s body built from its HIR. An `async` block's is the `Future::poll` of the block's
+/// type; by move, the future owns what its `async` closure captured, where the block itself
+/// borrows from the closure.
+pub(crate) fn build_mir_body<'db>(db: &'db Db, owner: MirOwner<'db>) -> Result<'db, MirBody<'db>> {
+    match owner {
+        MirOwner::Body(def) => compute_mir_body(db, def),
+        MirOwner::Closure(closure) => {
+            lower_closure_body(db, closure.loc(db), CoroutineCaptures::Own)
+        }
+        MirOwner::Coroutine(coroutine) => {
+            lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::Own)
+        }
+        MirOwner::CoroutineByMove(coroutine) => {
+            lower_closure_body(db, coroutine.loc(db), CoroutineCaptures::OfClosure)
+        }
+    }
+}
+```
+
+3. `src/mir/transform.rs`: delete `compute_runtime_mir_body`, `compute_runtime_mir_body_for_closure`,
+   `compute_runtime_mir_body_for_coroutine`, `compute_runtime_mir_body_for_coroutine_by_move` and
+   the four `compute_monomorphized_runtime_mir_body*` (the end of the file). Keep
+   `runtime_promoted_mir_body_query` and `compute_coroutine_witnesses`. Imports then unused:
+   `InternedClosureId` (`db::{HirDatabase, InternedClosureId, InternedCoroutineId}` becomes
+   `db::{HirDatabase, InternedCoroutineId}`), `StoredGenericArgs` from the `next_solver` list,
+   `StoredParamEnvAndCrate` (`traits::{ParamEnvAndCrate, StoredParamEnvAndCrate}` becomes
+   `traits::ParamEnvAndCrate`), and `monomorphization::monomorphized` from `use super::{...}`.
+
+4. `src/mir/monomorphization.rs`: delete `compute_monomorphized_mir_body` and the three
+   `compute_monomorphized_mir_body_for_{closure,coroutine,coroutine_by_move}`. Keep
+   `monomorphized_promoted_mir_body_query`. `db::{HirDatabase, InternedClosureId,
+   InternedCoroutineId, InternedOpaqueTyId}` becomes `db::{HirDatabase, InternedOpaqueTyId}`.
+
+5. `src/mir/optimize.rs`:
+   - Delete the eight `compute_optimized_mir_body*` and `compute_monomorphized_optimized_mir_body*`
+     (lines 217-297).
+   - Replace `interpreted_body` and `interpreted_closure_body` with:
+
+```rust
+/// The body the interpreter runs of `owner`: the runtime body, or that body optimized at the
+/// level [`set_interpreter_mir_opt_level`] set.
+pub(super) fn interpreted_body<'db>(
+    db: &'db Db,
+    owner: MirOwner<'db>,
+    subst: StoredGenericArgs,
+    env: StoredParamEnvAndCrate,
+) -> Result<'db, &'db MirBody<'db>> {
+    let stage = match interpreter_level() {
+        MirOptLevel::Off => MirStage::Runtime,
+        level => MirStage::Optimized(MirOptions::at(level)),
+    };
+    db.monomorphized_mir(owner, stage, subst, env)
+}
+```
+
+   - Imports: `use crate::{InferBodyId, db::{HirDatabase, InternedClosureId, InternedCoroutineId},
+     traits::StoredParamEnvAndCrate};` becomes
+     `use crate::{db::HirDatabase, traits::StoredParamEnvAndCrate};`. The `use super::{...}` list
+     drops `monomorphization::monomorphized` and gains `MirOwner, MirStage`.
+
+6. `src/mir/eval.rs`, the four `super::optimize::interpreted_*` calls:
+   - line ~3201: `konst.into(),` becomes `super::MirOwner::Body(konst.into()),`;
+   - line ~4603: `super::optimize::interpreted_closure_body(self.db, closure, ...` becomes
+     `super::optimize::interpreted_body(self.db, super::MirOwner::Closure(closure), ...`;
+   - line ~4740: `imp.into(),` becomes `super::MirOwner::Body(imp.into()),`;
+   - line ~5330: `drop_impl.into(),` becomes `super::MirOwner::Body(drop_impl.into()),`.
+
+7. Tests: add `mod stages;` to `tests/mir/main.rs` (after `mod source_names;`) and create
+   `tests/mir/stages.rs`:
+
+```rust
+//! The MIR queries through their one driver: each owner at each stage, generic or
+//! monomorphized, read through `mir_at`, `monomorphized_mir_at` and the database's `mir` and
+//! `monomorphized_mir`, is the memo of the query named for that owner and stage.
+
+use blaze_alloc_count::assert_at_most;
+use hir_def::HasModule;
+use hir_ty::{
+    InferBodyId, ParamEnvAndCrate,
+    db::{HirDatabase, InternedCoroutineId},
+    mir::{MirOptLevel, MirOptions, MirOwner, MirStage},
+    next_solver::{GenericArgs, StoredGenericArgs, TyKind},
+    providers::{self, Kept},
+    traits::StoredParamEnvAndCrate,
+};
+use rustc_type_ir::inherent::IntoKind;
+use test_fixture::WithFixture;
+
+use crate::{db::TestDB, function};
+
+const BODIES: &str = r#"
+//- minicore: sized, copy, add, fn, future
+pub fn closes(a: u32) -> u32 {
+    let add = |b: u32| a + b;
+    add(1)
+}
+pub fn later() {
+    let _block = async { 7u32 };
+}
+"#;
+
+/// Whether two reads are of one memo: the same body, or the same error.
+fn same(a: Kept<'_>, b: Kept<'_>) -> bool {
+    match (a, b) {
+        (Ok(a), Ok(b)) => std::ptr::eq(a, b),
+        (Err(a), Err(b)) => std::ptr::eq(a, b),
+        _ => false,
+    }
+}
+
+/// The `async` block `def` binds to a local.
+fn the_async_block<'db>(db: &'db TestDB, def: InferBodyId<'db>) -> InternedCoroutineId<'db> {
+    let body = db.mir_body(def).expect("the MIR of `later`");
+    body.locals
+        .iter()
+        .find_map(|(_, local)| match local.ty.as_ref().kind() {
+            TyKind::Coroutine(id, _) => Some(id.0),
+            _ => None,
+        })
+        .expect("a local of the `async` block's type")
+}
+
+/// The query named for `owner` at `stage`, called by name: what the driver's dispatch is
+/// checked against.
+fn named<'db>(db: &'db TestDB, owner: MirOwner<'db>, stage: MirStage) -> Kept<'db> {
+    use MirOwner as O;
+    match (stage, owner) {
+        (MirStage::Built, O::Body(it)) => providers::mir_body_query(db, it),
+        (MirStage::Built, O::Closure(it)) => providers::mir_body_for_closure_query(db, it),
+        (MirStage::Built, O::Coroutine(it)) => providers::mir_body_for_coroutine_query(db, it),
+        (MirStage::Built, O::CoroutineByMove(it)) => {
+            providers::mir_body_for_coroutine_by_move_query(db, it)
+        }
+        (MirStage::Runtime, O::Body(it)) => providers::runtime_mir_body_query(db, it),
+        (MirStage::Runtime, O::Closure(it)) => {
+            providers::runtime_mir_body_for_closure_query(db, it)
+        }
+        (MirStage::Runtime, O::Coroutine(it)) => {
+            providers::runtime_mir_body_for_coroutine_query(db, it)
+        }
+        (MirStage::Runtime, O::CoroutineByMove(it)) => {
+            providers::runtime_mir_body_for_coroutine_by_move_query(db, it)
+        }
+        (MirStage::Optimized(at), O::Body(it)) => providers::optimized_mir_body_query(db, it, at),
+        (MirStage::Optimized(at), O::Closure(it)) => {
+            providers::optimized_mir_body_for_closure_query(db, it, at)
+        }
+        (MirStage::Optimized(at), O::Coroutine(it)) => {
+            providers::optimized_mir_body_for_coroutine_query(db, it, at)
+        }
+        (MirStage::Optimized(at), O::CoroutineByMove(it)) => {
+            providers::optimized_mir_body_for_coroutine_by_move_query(db, it, at)
+        }
+    }
+}
+
+/// The same of the monomorphized queries.
+fn named_monomorphized<'db>(
+    db: &'db TestDB,
+    owner: MirOwner<'db>,
+    stage: MirStage,
+    subst: StoredGenericArgs,
+    env: StoredParamEnvAndCrate,
+) -> Kept<'db> {
+    use MirOwner as O;
+    match (stage, owner) {
+        (MirStage::Built, O::Body(it)) => providers::monomorphized_mir_body_query(db, it, subst, env),
+        (MirStage::Built, O::Closure(it)) => {
+            providers::monomorphized_mir_body_for_closure_query(db, it, subst, env)
+        }
+        (MirStage::Built, O::Coroutine(it)) => {
+            providers::monomorphized_mir_body_for_coroutine_query(db, it, subst, env)
+        }
+        (MirStage::Built, O::CoroutineByMove(it)) => {
+            providers::monomorphized_mir_body_for_coroutine_by_move_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::Body(it)) => {
+            providers::monomorphized_runtime_mir_body_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::Closure(it)) => {
+            providers::monomorphized_runtime_mir_body_for_closure_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::Coroutine(it)) => {
+            providers::monomorphized_runtime_mir_body_for_coroutine_query(db, it, subst, env)
+        }
+        (MirStage::Runtime, O::CoroutineByMove(it)) => {
+            providers::monomorphized_runtime_mir_body_for_coroutine_by_move_query(
+                db, it, subst, env,
+            )
+        }
+        (MirStage::Optimized(at), O::Body(it)) => {
+            providers::monomorphized_optimized_mir_body_query(db, it, at, subst, env)
+        }
+        (MirStage::Optimized(at), O::Closure(it)) => {
+            providers::monomorphized_optimized_mir_body_for_closure_query(db, it, at, subst, env)
+        }
+        (MirStage::Optimized(at), O::Coroutine(it)) => {
+            providers::monomorphized_optimized_mir_body_for_coroutine_query(db, it, at, subst, env)
+        }
+        (MirStage::Optimized(at), O::CoroutineByMove(it)) => {
+            providers::monomorphized_optimized_mir_body_for_coroutine_by_move_query(
+                db, it, at, subst, env,
+            )
+        }
+    }
+}
+
+/// The fixture's owners, with the environment of the function each is in. Not a by-move
+/// coroutine: only an `async` closure called by value has one.
+fn owners(db: &TestDB) -> Vec<(MirOwner<'_>, StoredParamEnvAndCrate)> {
+    let env = |name: &str| {
+        let func = function(db, name);
+        let def: InferBodyId<'_> = func.into();
+        ParamEnvAndCrate {
+            param_env: db.trait_environment(def.generic_def(db)),
+            krate: func.module(db).krate(db),
+        }
+        .store()
+    };
+    let closes: InferBodyId<'_> = function(db, "closes").into();
+    let closure = db.mir_body(closes).expect("the MIR of `closes`").closures[0];
+    let later: InferBodyId<'_> = function(db, "later").into();
+    let block = the_async_block(db, later);
+    vec![
+        (MirOwner::Body(closes), env("closes")),
+        (MirOwner::Closure(closure), env("closes")),
+        (MirOwner::Body(later), env("later")),
+        (MirOwner::Coroutine(block), env("later")),
+    ]
+}
+
+fn stages() -> [MirStage; 4] {
+    [
+        MirStage::Built,
+        MirStage::Runtime,
+        MirStage::Optimized(MirOptions::at(MirOptLevel::Debug)),
+        MirStage::Optimized(MirOptions { ub_checks: true, ..MirOptions::at(MirOptLevel::Release) }),
+    ]
+}
+
+#[test]
+fn every_owner_at_every_stage_is_the_memo_of_its_query() {
+    let (db, _) = TestDB::with_single_file(BODIES);
+    hir_ty::attach_db(&db, || {
+        for (owner, _) in owners(&db) {
+            for stage in stages() {
+                let driven = providers::mir_at(&db, owner, stage);
+                assert!(same(driven, named(&db, owner, stage)), "{owner:?} at {stage:?}");
+                if let Ok(kept) = driven {
+                    let asked = db.mir(owner, stage).expect("the body `mir_at` read");
+                    assert!(std::ptr::eq(asked, kept), "`mir` of {owner:?} at {stage:?}");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn every_owner_at_every_stage_monomorphized_is_the_memo_of_its_query() {
+    let (db, _) = TestDB::with_single_file(BODIES);
+    hir_ty::attach_db(&db, || {
+        let subst = || GenericArgs::empty().store();
+        for (owner, env) in owners(&db) {
+            for stage in stages() {
+                let driven =
+                    providers::monomorphized_mir_at(&db, owner, stage, subst(), env.clone());
+                let by_name = named_monomorphized(&db, owner, stage, subst(), env.clone());
+                assert!(same(driven, by_name), "{owner:?} at {stage:?}, monomorphized");
+                if let Ok(kept) = driven {
+                    let asked = db
+                        .monomorphized_mir(owner, stage, subst(), env.clone())
+                        .expect("the body `monomorphized_mir_at` read");
+                    assert!(std::ptr::eq(asked, kept), "`monomorphized_mir` of {owner:?}");
+                }
+            }
+        }
+    });
+}
+
+#[test]
+fn a_body_read_again_through_mir_allocates_nothing() {
+    let (db, _) = TestDB::with_single_file(BODIES);
+    hir_ty::attach_db(&db, || {
+        let closes: InferBodyId<'_> = function(&db, "closes").into();
+        let owner = MirOwner::Body(closes);
+        let optimized = MirStage::Optimized(MirOptions::at(MirOptLevel::Release));
+        db.mir(owner, optimized).expect("the optimized body of `closes`");
+        let runtime = db.mir(owner, MirStage::Runtime).expect("the runtime body");
+        let again = assert_at_most(0, "a memoized runtime body through `mir`", || {
+            db.mir(owner, MirStage::Runtime).expect("the runtime body, again")
+        });
+        assert!(std::ptr::eq(runtime, again));
+    });
+}
+
+/// The stage the code generator compiles, as its `compiled_mir_body`, `_for_closure` and
+/// `_for_coroutine` picked it: the runtime body when the options ask for no pass and no check
+/// (a coroutine's when they ask for no check, as only the checks run on one), else the body
+/// optimized with them.
+#[test]
+fn the_compiled_stage_is_the_runtime_body_unless_more_is_asked() {
+    let (db, _) = TestDB::with_single_file(BODIES);
+    hir_ty::attach_db(&db, || {
+        let off = MirOptions::at(MirOptLevel::Off);
+        let checked = MirOptions { ub_checks: true, ..off };
+        let release = MirOptions::at(MirOptLevel::Release);
+        let checked_release = MirOptions { ub_checks: true, ..release };
+        for (owner, _) in owners(&db) {
+            let coroutine = matches!(owner, MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_));
+            assert_eq!(MirStage::compiled(owner, off), MirStage::Runtime, "{owner:?}");
+            assert_eq!(MirStage::compiled(owner, checked), MirStage::Optimized(checked));
+            let at_release = match coroutine {
+                true => MirStage::Runtime,
+                false => MirStage::Optimized(release),
+            };
+            assert_eq!(MirStage::compiled(owner, release), at_release, "{owner:?}");
+            assert_eq!(
+                MirStage::compiled(owner, checked_release),
+                MirStage::Optimized(checked_release)
+            );
+        }
+    });
+}
+```
+
+### hir-ty-codegen
+
+8. `mod.rs`:
+   - The `use hir_ty_mir::mir::{...}` list (line ~92) gains `MirOwner, MirStage`.
+   - After `enum InstanceDef { ... }` add:
+
+```rust
+impl InstanceDef {
+    /// Whose MIR the instance runs: `None` for a shim, which has none.
+    fn mir_owner<'db>(self) -> Option<MirOwner<'db>> {
+        match self {
+            InstanceDef::Fn(func) => Some(MirOwner::Body(func.into())),
+            InstanceDef::Closure(id) => Some(MirOwner::Closure(InternedClosureId::from_id(id))),
+            InstanceDef::Coroutine(id) => {
+                Some(MirOwner::Coroutine(InternedCoroutineId::from_id(id)))
+            }
+            InstanceDef::CoroutineByMove(id) => {
+                Some(MirOwner::CoroutineByMove(InternedCoroutineId::from_id(id)))
+            }
+            InstanceDef::DropGlue
+            | InstanceDef::CallOnceShim
+            | InstanceDef::VtableShim(_)
+            | InstanceDef::FnPointerShim
+            | InstanceDef::ReifyShim { .. } => None,
+        }
+    }
+}
+```
+
+   - Delete `is_runtime` (line ~3536, its doc comment with it), `compiled_mir_body`,
+     `compiled_mir_body_for_closure` and `compiled_mir_body_for_coroutine` (to line ~3594):
+     `MirOptions::is_runtime` and `MirStage::compiled` are those.
+   - In `instance_body`, replace everything from the comment `// The database keeps a
+     monomorphized body of the runtime body only, which only` through the end of the
+     `let body = match instance.def { ... };` (the shim arm `=> unsupported!("the body of a
+     shim"),` and its `};`) with:
+
+```rust
+    // The database keeps a monomorphized body of the runtime body only, which only
+    // `BLAZE_MIR_OPT=0` compiles; of a coroutine, only `BLAZE_LEAN=0`, whatever the level.
+    let Some(owner) = instance.def.mir_owner() else { unsupported!("the body of a shim") };
+    let lean = match owner {
+        MirOwner::Body(_) | MirOwner::Closure(_) => {
+            *LEAN || mir_opt_level() != Some(MirOptLevel::Off)
+        }
+        MirOwner::Coroutine(_) | MirOwner::CoroutineByMove(_) => *LEAN,
+    };
+    let written = owner.written_in(db).module(db).krate(db);
+    let options = body_options(db, build, written, env.krate);
+    // A unit's body, or one with rustc's UB checks, is never the kept runtime one.
+    let body = if lean || build.is_some() || !options.is_runtime() {
+        tally
+            .step(Step::Mir, || db.mir(owner, MirStage::compiled(owner, options)))
+            .and_then(|it| filled(it, &args, &env))
+    } else {
+        db.monomorphized_mir(owner, MirStage::Runtime, args, env).map(Cow::Borrowed)
+    };
+```
+
+     This is the old match arm for arm: the same guard per kind (`lean` for functions and
+     closures, `*LEAN` for coroutines, then `build.is_some() || !is_runtime(options)`), the same
+     body, and the same kept runtime body otherwise. The one difference is that a closure's and
+     a coroutine's MIR read is now counted under `Step::Mir`, as a function's already was.
+   - In the function at line ~5500 (`let owner: InferBodyId<'db> = func.into();`), replace
+     `let body = tally.step(Step::Mir, || compiled_mir_body(db, owner, options));` with
+
+```rust
+    let stage = MirStage::compiled(MirOwner::Body(owner), options);
+    let body = tally.step(Step::Mir, || db.mir(MirOwner::Body(owner), stage));
+```
+
+     and the `.step(Step::Monomorphize, || match options { options if is_runtime(options) => {
+     db.monomorphized_runtime_mir_body(owner, args, env.store()) } options =>
+     db.monomorphized_optimized_mir_body(owner, options, args, env.store()), })` with
+     `.step(Step::Monomorphize, || db.monomorphized_mir(MirOwner::Body(owner), stage, args, env.store()))`.
+   - At line ~3929, in the `TyKind::Coroutine(id, args)` arm, replace
+     `match is_by_move_coroutine(db, id.0, args) { true => db.monomorphized_mir_body_for_coroutine_by_move(id.0, parent, env.store()), false => db.monomorphized_mir_body_for_coroutine(id.0, parent, env.store()), }`
+     with
+     `db.monomorphized_mir(MirOwner::coroutine(db, id.0, args), MirStage::Built, parent, env.store())`.
+     `is_by_move_coroutine` stays imported: `coroutine_instance` and line ~14096 use it.
+
+9. `debuginfo/types.rs`, line ~605: replace
+   `let body = match is_by_move_coroutine(self.db, id.0, args) { true => self.db.monomorphized_runtime_mir_body_for_coroutine_by_move(id.0, parent_args.store(), self.env.store()), false => self.db.monomorphized_runtime_mir_body_for_coroutine(id.0, parent_args.store(), self.env.store()), }.ok()?;`
+   with
+
+```rust
+        let owner = MirOwner::coroutine(self.db, id.0, args);
+        let body = self
+            .db
+            .monomorphized_mir(owner, MirStage::Runtime, parent_args.store(), self.env.store())
+            .ok()?;
+```
+
+   and in the `use hir_ty::{...}` list, `mir::is_by_move_coroutine,` becomes
+   `mir::{MirOwner, MirStage},` (its only use was this one).
+
+Callers left on purpose: `optimize/inline.rs`'s `optimized` (two arms over its own
+`InlinedBody`), blaze-engine's `mirdump.rs` and `borrowck.rs`, and the built-body reads in
+`fncache/dispatch.rs`. Each picks one fixed stage, so a `MirOwner` there would save no line.
+
+> forwarded to codegen (hir-ty-mir: codegen-mir-next2, both windows; hir-ty-codegen: codegen-next1); told by tmux. It lands after db-ty.md's half (`MirOwner`, `MirStage`, `monomorphized_mir`) (requests, pass 28).
+
+> codegen-mir (2026-10-29 22:15): hir-ty-mir half (1–7) not applied yet: db-ty's half isn't in
+> (`hir-ty` has no `MirOwner`/`MirStage`/`HirDatabase::mir`/`providers::mir_at`/`Kept`, and `Mir`
+> still has the 24 fields), and this says both or neither. Checked that every name 1–7 relies on
+> exists (`lower_closure_body`, `CoroutineCaptures::{Own, OfClosure}`, `compute_mir_body`,
+> `transform::run_passes`, `compute_coroutine_witnesses`, `interpreter_level`, the four
+> `interpreted_*` calls in `eval.rs`), so it applies as written once db-ty lands. One clash for
+> db-ty: `Mir::optimize` stores `optimize::optimize`, whose signature is
+> `(&Db, &MirBody, MirOptions)` today, but codegen-inline's request 2 (its requests brief) adds
+> `caller: Option<InlinedBody<'db>>`. The table's `optimize` type should take the caller, or the
+> driver pass it from `MirOwner` (`Body(def)` gives `def.as_function().map(InlinedBody::Fn)`,
+> `Closure(c)` gives `Some(InlinedBody::Closure(c))`, coroutines give `None`).
+> codegen-mir (2026-10-29 22:15): items 5 (`optimize.rs`) and 6 (`eval.rs`) are in, as written, now that db-ty's half has landed (applied while I was confirming it; I checked each hunk: the eight `compute_*optimized*` are gone, `interpreted_body` takes a `MirOwner`, `interpreted_closure_body` is gone, the four `eval.rs` calls pass `MirOwner::Body`/`Closure`, and the imports are trimmed). Items 1-4 and 7 (`providers.rs`, `lower.rs`, `transform.rs`, `monomorphization.rs`, tests) are not mine: `lower.rs` is frontend-fast-mir's, the rest codegen-mir-store's.
+> applied by codegen-mir-store (2026-10-29), uncompiled: items 1 (`providers.rs`'s table), 3 (`transform.rs`'s eight `compute_*` and the four imports), 4 (`monomorphization.rs`'s four and the import) and 7 (`tests/mir/stages.rs` word for word, `mod stages;` in `main.rs`), against db-ty's half now in hir-ty (names checked: `Mir`'s fields, `mir_at`, `monomorphized_mir_at`, the 24 `*_query`, `MirStage::compiled`, `HirDatabase::mir`/`monomorphized_mir`). Open: item 2 (`lower.rs` `build_mir_body`, frontend-fast-mir's; `providers.rs` names it) and items 5-6 (codegen-mir's), both told by tmux.
+> applied by codegen-mir (2026-10-29 22:15), uncompiled: 5 (`optimize.rs`: the eight `compute_*optimized*` gone, one `interpreted_body` over `MirOwner`/`MirStage`, imports as written) and 6 (`eval.rs`'s four calls through `MirOwner`). No caller of a removed function is left in the tree. `optimize::optimize` matches `Mir::optimize` today; codegen-inline's `caller` argument (see 22:15 above) is still open with db-ty. Left: item 2 (frontend-fast-mir's `lower.rs` `build_mir_body`).
+> dedup-sim-front (2026-10-29 22:30): on codegen-mir's 22:15 question about `optimize`'s
+> `caller`: the driver passes it. hir-ty gets `MirOwner::caller()` (your rule, with an anon
+> const body giving `None`), and `Mir::optimize`'s type takes `Option<InlinedBody<'db>>`. Filed
+> as `v2/requests/db-ty.md` "## dedup: the MIR driver passes `optimize` its caller". On your
+> side: codegen-inline 2's `optimize.rs` signature as written, `budget.rs`'s `optimize` taking
+> and forwarding `caller`, and the table entry unchanged. Its four callers are now `owner.caller()`.
+> applied by frontend-fast-mir (2026-10-29 22:40), uncompiled: item 2. `lower.rs`'s `use super::{..}` gains `MirOwner`; the three `compute_mir_body_for_{closure,coroutine,coroutine_by_move}` are replaced by `build_mir_body` as written (its type matches `Mir::build`, `fn(&Db, MirOwner) -> Built`). Also dropped `InternedCoroutineId` from `lower.rs`'s `db::{..}` import, which only those functions used. No caller of the removed functions is left in the tree. With this, items 1-7 are all in.
+
+## dedup: one span-to-source step for codegen's and hir-ty-mir's `source_range` (from dedup-sim-front, 2026-10-29)
+
+`hir-ty-codegen/places.rs` `source_range` and `hir-ty-mir/src/mir/location.rs` `source_range`
+share their first 27 lines: which node a `MirSpan` names in a source map, the closing brace of an
+`async fn`'s block for `ExprEnd`, `None` for the spans with no syntax. They differ only in the
+map and tree they read. Codegen reads `Body::relative` and the anchor's own tree
+(`BodySyntax::root`), so a place does not move when an edit elsewhere in the file moves the body.
+hir-ty-mir reads `Body::with_source_map` and the file's tree. So the step goes in one place and
+both keep their own tree read.
+
+1. `crates/hir-ty-mir/src/mir/location.rs`:
+   - Imports: `hir_def::{...}` gains `expr_store::body::BodySourceMap` (next to
+     `expr_store::Body`); `syntax::{...}` gains `SyntaxNodePtr`.
+   - Replace `pub fn source_range` with:
+
+```rust
+/// Where a span of a body is written, as one of the body's source maps has it.
+pub enum SpanSource {
+    /// Its range: the closing brace of a block, which is where rustc has a scope left, or a
+    /// pattern's node.
+    Range(HirFileId, TextRange),
+    /// An expression, the range of which as rustc reports it [`reported_range`] reads from its
+    /// node.
+    Expr(InFile<SyntaxNodePtr>, ExprId),
+}
+
+/// Where `span` of `owner` is written by `source_map`: the map moved into the body's file
+/// ([`Body::with_source_map`]) or that of the tree of its anchor ([`Body::relative`]).
+pub fn span_source(
+    db: &Db,
+    owner: DefWithBodyId,
+    source_map: &BodySourceMap,
+    span: MirSpan,
+) -> Option<SpanSource> {
+    let source = match span {
+        MirSpan::ExprId(expr) => source_map.expr_syntax(expr).ok()?,
+        // The block an `async fn` is taken to wrap its body in is not written anywhere, and
+        // ends where the body does.
+        MirSpan::ExprEnd(expr) => {
+            match (source_map.expr_syntax(expr), Body::of(db, owner).expr(expr)) {
+                (Ok(written), _) => written,
+                (Err(_), hir_def::hir::Expr::Block { tail: Some(tail), .. }) => {
+                    source_map.expr_syntax(tail).ok()?
+                }
+                (Err(_), _) => return None,
+            }
+        }
+        MirSpan::PatId(pat) => source_map.pat_syntax(pat).ok()?,
+        // An inlined span indexes the optimized body's `Inlined`, not `owner`'s map: it is
+        // resolved through that body first.
+        MirSpan::BindingId(_) | MirSpan::SelfParam | MirSpan::Unknown | MirSpan::Inlined(_) => {
+            return None;
+        }
+    };
+    let ptr = source.value.syntax_node_ptr();
+    Some(match span {
+        MirSpan::ExprEnd(_) => {
+            let range = ptr.text_range();
+            let last = range.end().checked_sub(TextSize::new(1)).filter(|it| *it >= range.start());
+            SpanSource::Range(source.file_id, TextRange::new(last?, range.end()))
+        }
+        MirSpan::ExprId(expr) => SpanSource::Expr(InFile::new(source.file_id, ptr), expr),
+        _ => SpanSource::Range(source.file_id, ptr.text_range()),
+    })
+}
+
+/// The file a place in a body is written in, which may be what a macro expands to, and
+/// where in it rustc has the place begin.
+pub fn source_range<'db>(
+    db: &'db Db,
+    owner: DefWithBodyId,
+    span: MirSpan,
+) -> Option<(HirFileId, TextRange)> {
+    match span_source(db, owner, &Body::with_source_map(db, owner).1, span)? {
+        SpanSource::Range(file_id, range) => Some((file_id, range)),
+        SpanSource::Expr(source, expr) => {
+            let node = ast::to_node(source.value, source.file_id.root(db));
+            Some((source.file_id, reported_range(db, owner, expr, source.file_id, node)?))
+        }
+    }
+}
+```
+
+2. `crates/hir-ty-codegen/mod.rs`: the `location::{...}` list in `use hir_ty_mir::mir::{...}` gains
+   `SpanSource, span_source`.
+
+3. `crates/hir-ty-codegen/places.rs`, `source_range`: everything from
+   `let source_map = &Body::relative(db, owner).as_ref()?.1;` to the end becomes
+
+```rust
+    let source_map = &Body::relative(db, owner).as_ref()?.1;
+    match span_source(db, owner, source_map, span)? {
+        SpanSource::Range(file_id, range) => Some((file_id, range)),
+        SpanSource::Expr(source, expr) => {
+            let root = match source.file_id == syntax.file_id {
+                true => syntax.root(db),
+                false => source.file_id.parse_or_expand(db),
+            };
+            let node = source.value.to_node(&root);
+            Some((source.file_id, reported_range(db, owner, expr, source.file_id, &node)?))
+        }
+    }
+```
+
+   (the tree read is codegen's as before. Its `&node` handle against `reported_range`'s
+   `Node<'_>` is frontend-tree's open move of this file to views, unchanged here.)
+
+The output is unchanged: the same map, span cases, brace rule and tree as each copy had.
+
+> forwarded to codegen (codegen-next1 for hir-ty-codegen, codegen-mir-next2 for hir-ty-mir); told by tmux (requests, pass 29).
+> codegen-mir (2026-10-29): item 1 is `mir/location.rs`, not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); it is codegen-mir-store's.
+
+> applied by codegen-mir (2026-10-29 22:30), uncompiled: 1 (`transform.rs`: `Ctx::operand_ty` and its imports), 2 (`transform/asserts.rs`), 3 (`optimize/inst_simplify.rs`). 4 (`optimize/inline.rs`) is codegen-inline's file and its window is open: told by tmux and in `~/restart-2026-10-28/briefs/v2/codegen-inline.requests.md`; until it lands, inline.rs keeps its own copy, which still builds.
+## dedup: hir-ty-mir's written_range is syntax::view::written_range (from dedup-sim-diag, 2026-10-29)
+
+From `dedup-sim-diag` (lane dedup; report `/tmp/blaze-lanes/v2-dedup-sim-diag.md`). After
+`v2/requests/frontend-tree.md` `## dedup: syntax::view::written_range and Expr::peel_parens`
+is in: `crates/hir-ty-mir/src/mir/location.rs:30` `pub fn written_range(node: Node<'_>)` is
+the function that request puts in `syntax::view` (the same rule; also copied in
+blaze-diagnostics, blaze-lints and hir-expand). Replace it with
+`pub use syntax::view::written_range;`, so hir-ty-codegen's path to it is unchanged.
+
+> forwarded to codegen (`crates/hir-ty-mir`; codegen-mir-next2, both windows), after frontend-tree's `syntax::view::written_range`; told by tmux (requests, pass 29).
+> codegen-mir (2026-10-29 22:30): waiting. `syntax::view::written_range` isn't in `crates/syntax` yet; `location.rs:30` keeps its own until it is.
+> codegen-mir (2026-10-29): `mir/location.rs` is not mine (mine are `mir/eval*`, `mir/optimize.rs`, `optimize/inline*`); it is codegen-mir-store's.
+
+## dedup: one spelling of the scalar types for `type_name`, `stable` and `Spelling` (from dedup-sim-front, 2026-10-29)
+
+`hir-ty-codegen/stable.rs` `spell_ty`, `hir-ty-mir/src/mir/type_name.rs` `write_ty` and
+`hir-ty-codegen/mod.rs` `Spelling::symbol_type` are three spellings of a type, kept apart on
+purpose: `spell_ty` names items by file and stable item id so a name holds across daemon runs
+(bound regions by depth, closures by a hash of their source, `dyn` parts sorted by their
+spelling), `write_ty` is rustc's `type_name`, demangled-symbol and debug-info text, and
+`Spelling::symbol_type` writes crates as the resolver's `name[hash]` paths, the key `read_type`
+and `SymbolResolver::adt_at` read back to find rustc's symbol. What all three write the same is
+the seven scalar arms (`bool`, `char`, `str`, `!`, the integers and floats). Those go in one
+place; nothing any of them writes changes.
+
+1. `crates/hir-ty-mir/src/mir/type_name.rs`: after `rustc_debug_function`, add
+
+```rust
+/// How a type with no parts is written, the same in every spelling of a type: `type_name`,
+/// symbols, debug info and the names [`crate`]'s users keep across runs. `None` for any
+/// other type.
+pub fn scalar_name(ty: Ty<'_>) -> Option<&'static str> {
+    Some(match ty.kind() {
+        TyKind::Bool => "bool",
+        TyKind::Char => "char",
+        TyKind::Str => "str",
+        TyKind::Never => "!",
+        TyKind::Int(it) => it.name_str(),
+        TyKind::Uint(it) => it.name_str(),
+        TyKind::Float(it) => it.name_str(),
+        _ => return None,
+    })
+}
+```
+
+   and in `write_ty`, replace
+
+```rust
+fn write_ty<'db>(db: &'db Db, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
+    match ty.kind() {
+        TyKind::Bool => out.push_str("bool"),
+        TyKind::Char => out.push_str("char"),
+        TyKind::Str => out.push_str("str"),
+        TyKind::Never => out.push('!'),
+        TyKind::Int(it) => out.push_str(it.name_str()),
+        TyKind::Uint(it) => out.push_str(it.name_str()),
+        TyKind::Float(it) => out.push_str(it.name_str()),
+        TyKind::Ref(region, pointee, mutability) => {
+```
+
+   with
+
+```rust
+fn write_ty<'db>(db: &'db Db, out: &mut Spelled, ty: Ty<'db>) -> Option<()> {
+    if let Some(name) = scalar_name(ty) {
+        out.push_str(name);
+        return Some(());
+    }
+    match ty.kind() {
+        TyKind::Ref(region, pointee, mutability) => {
+```
+
+   (the match keeps its `_ => return None`).
+
+2. `crates/hir-ty-codegen/stable.rs` `spell_ty`: replace
+
+```rust
+        let db = self.db;
+        match ty.kind() {
+            TyKind::Bool => out.push_str("bool"),
+            TyKind::Char => out.push_str("char"),
+            TyKind::Str => out.push_str("str"),
+            TyKind::Never => out.push('!'),
+            TyKind::Int(it) => out.push_str(it.name_str()),
+            TyKind::Uint(it) => out.push_str(it.name_str()),
+            TyKind::Float(it) => out.push_str(it.name_str()),
+            TyKind::Ref(region, pointee, mutability) => {
+```
+
+   with
+
+```rust
+        let db = self.db;
+        if let Some(name) = hir_ty_mir::mir::type_name::scalar_name(ty) {
+            out.push_str(name);
+            return Some(());
+        }
+        match ty.kind() {
+            TyKind::Ref(region, pointee, mutability) => {
+```
+
+   (the match keeps its `_ => return self.miss("other type")`).
+
+3. `crates/hir-ty-codegen/mod.rs` `Spelling::symbol_type`: replace
+
+```rust
+        let db = self.db;
+        Some(match ty.kind() {
+            TyKind::Bool => "bool".to_owned(),
+            TyKind::Char => "char".to_owned(),
+            TyKind::Str => "str".to_owned(),
+            TyKind::Never => "!".to_owned(),
+            TyKind::Int(it) => it.name_str().to_owned(),
+            TyKind::Uint(it) => it.name_str().to_owned(),
+            TyKind::Float(it) => it.name_str().to_owned(),
+            TyKind::Ref(_, pointee, Mutability::Not) => format!("&{}", self.symbol_type(pointee)?),
+```
+
+   with
+
+```rust
+        let db = self.db;
+        if let Some(name) = hir_ty_mir::mir::type_name::scalar_name(ty) {
+            return Some(name.to_owned());
+        }
+        Some(match ty.kind() {
+            TyKind::Ref(_, pointee, Mutability::Not) => format!("&{}", self.symbol_type(pointee)?),
+```
+
+   (the match keeps its `_ => return None`). Also its doc comment: "How rustc's demangled
+   symbols spell the types" on `struct Spelling` becomes "How rustc's symbols spell the types
+   and instances of the program, with each crate as the resolver's path for it (`name[hash]`),
+   the key [`SymbolResolver::path`] finds rustc's symbol by. Not
+   `hir_ty_mir::mir::type_name::rustc_symbol_type`, which writes what a backtrace shows."
+
+4. Test, new `crates/hir-ty-mir/tests/mir/scalar_names.rs`, and `mod scalar_names;` in
+   `tests/mir/main.rs` (after `mod references;`): the shared function against the arms it
+   replaced, and through `rustc_type_name` and `rustc_symbol_type` end to end.
+
+```rust
+//! `type_name::scalar_name` against the arms each spelling of a type had for the scalars.
+
+use hir_ty::{
+    next_solver::{DbInterner, Ty, TyKind},
+    primitive::{FloatTy, IntTy, UintTy},
+};
+use hir_ty_mir::mir::type_name::{rustc_symbol_type, rustc_type_name, scalar_name};
+use test_fixture::WithFixture;
+
+use crate::db::TestDB;
+
+/// The arms `write_ty`, `spell_ty` and `Spelling::symbol_type` each had.
+fn reference(kind: TyKind<'_>) -> Option<&'static str> {
+    Some(match kind {
+        TyKind::Bool => "bool",
+        TyKind::Char => "char",
+        TyKind::Str => "str",
+        TyKind::Never => "!",
+        TyKind::Int(it) => it.name_str(),
+        TyKind::Uint(it) => it.name_str(),
+        TyKind::Float(it) => it.name_str(),
+        _ => return None,
+    })
+}
+
+#[test]
+fn scalar_names_are_the_arms_they_replace() {
+    let (db, _) = TestDB::with_single_file("fn main() {}");
+    hir_ty::attach_db(&db, || {
+        let interner = DbInterner::new_no_crate(&db);
+        let ints = [IntTy::Isize, IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::I128];
+        let uints =
+            [UintTy::Usize, UintTy::U8, UintTy::U16, UintTy::U32, UintTy::U64, UintTy::U128];
+        let floats = [FloatTy::F16, FloatTy::F32, FloatTy::F64, FloatTy::F128];
+        let scalars = [TyKind::Bool, TyKind::Char, TyKind::Str, TyKind::Never]
+            .into_iter()
+            .chain(ints.map(TyKind::Int))
+            .chain(uints.map(TyKind::Uint))
+            .chain(floats.map(TyKind::Float));
+        for kind in scalars {
+            let ty = Ty::new(interner, kind);
+            let name = scalar_name(ty).expect("a scalar has a name");
+            assert_eq!(Some(name), reference(ty.kind()));
+            assert_eq!(rustc_type_name(&db, ty).as_deref(), Some(name));
+            assert_eq!(rustc_symbol_type(&db, ty).as_deref(), Some(name));
+        }
+        let unit = Ty::new_tup(interner, &[]);
+        let slice = Ty::new_slice(interner, Ty::new(interner, TyKind::Bool));
+        for ty in [unit, slice] {
+            assert_eq!(scalar_name(ty), None);
+            assert_eq!(reference(ty.kind()), None);
+        }
+    });
+}
+```
+
+Kept, not merged: `blaze-diagnostics/src/print/types.rs` `pretty_print_type` and
+`hir-ide/src/display.rs` keep their own scalar arms: both are exhaustive matches ported arm for
+arm from rustc's printer, where a shared early return would hide a new `TyKind`.
+
+> forwarded to codegen (codegen-next1); told by tmux (requests, pass 29).
+
+## dedup: one `Ctx::operand_ty` for the MIR passes (from dedup-sim-front, 2026-10-29)
+
+`hir-ty-mir/src/mir/transform/asserts.rs`, `optimize/inst_simplify.rs` and `optimize/inline.rs`
+each have an `operand_ty` over `transform::Ctx` with the same place, constant and allocation
+arms. They differ in the static arm (asserts: `bool`, a stand-in for "not an integer"; inst_simplify:
+`None`; inline: the `&'static T` the operand is) and in the normalizing (asserts and inst_simplify
+`Ctx::normalize`, an alias at the top; inline `normalize_ty`, every alias, regions erased). The
+type goes on `Ctx` once, with the static's real type; each pass keeps its normalizing.
+
+1. `crates/hir-ty-mir/src/mir/transform.rs`:
+   - Imports: `hir_def::{HasModule, attrs::AttrFlags}` becomes
+     `hir_def::{DefWithBodyId, HasModule, attrs::AttrFlags, expr_store::Body}`; add
+     `use rustc_ast_ir::Mutability;`; `crate::{...}` gains `InferenceResult`, and its
+     `next_solver::{...}` gains `Region`.
+   - In `impl<'f, 'db> Ctx<'f, 'db>`, after `normalize`, add:
+
+```rust
+    /// The type of `operand` in `body`, not normalized: a static's is the `&'static T` the
+    /// operand is.
+    pub(super) fn operand_ty(&self, body: &MirBody<'db>, operand: &Operand) -> Ty<'db> {
+        match &operand.kind {
+            OperandKind::Copy(place) | OperandKind::Move(place) => {
+                place.as_ref().ty(body, &self.infcx, self.env).ty
+            }
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            &OperandKind::Static(static_) => {
+                let interner = self.infcx.interner;
+                let ty = InferenceResult::of(self.db, DefWithBodyId::from(static_))
+                    .expr_ty(Body::of(self.db, static_.into()).root_expr());
+                Ty::new_ref(interner, Region::new_static(interner), ty, Mutability::Not)
+            }
+        }
+    }
+```
+
+2. `crates/hir-ty-mir/src/mir/transform/asserts.rs`: the body of `fn operand_ty` becomes
+   `ctx.normalize(ctx.operand_ty(body, operand))`. Its three callers test the type for
+   `Int`/`Uint` only (`UnaryOp(Neg)`, `binary_op`'s `a`, the shift amount `b`, whose other arm
+   keeps it as is): a static operand is a reference, not an integer, as `bool` was, so no check
+   changes.
+
+3. `crates/hir-ty-mir/src/mir/optimize/inst_simplify.rs`: the body of `fn operand_ty` becomes
+
+```rust
+    if let OperandKind::Static(_) = operand.kind {
+        return None;
+    }
+    Some(ctx.normalize(ctx.operand_ty(body, operand)))
+```
+
+4. `crates/hir-ty-mir/src/mir/optimize/inline.rs`: the body of `pub(super) fn operand_ty`
+   becomes `normalize_ty(ctx, ctx.operand_ty(body, operand))` (its doc stays). Its imports lose
+   what only the static arm used: `rustc_ast_ir::Mutability`, `InferenceResult` from
+   `crate::{...}`, and `DefWithBodyId` and `expr_store::Body` from `hir_def::{...}`.
+
+Nothing any pass computes changes: the same arms, the same normalizing per pass.
+
+Not merged, and why: `eval.rs`'s `Evaluator::operand_ty` (its own locals and monomorphized
+places), `hir-ty-borrowck/src/regions.rs` (regions renumbered; a `static mut` is `*mut T`, as
+rustc's), `hir-ty-codegen/mod.rs` and `v2/refs.rs` (`static_ty`, the codegen's address type),
+`const_check.rs` (locals only, the kind), and blaze-diagnostics' `recursion.rs`/`panics.rs` (the
+lints' own place types). One thing to look at, not changed here: `Ctx::operand_ty`, as inline's
+and eval's arm before it, types a `static mut` operand `&'static T` where borrowck has rustc's
+`*mut T`.
+
+> forwarded to codegen (`crates/hir-ty-mir`; codegen-mir-next2, both windows); told by tmux (requests, pass 29).
+> codegen-mir (2026-10-29): item 4 (`optimize/inline.rs`) is mine, held until item 1's `Ctx::operand_ty` is in `transform.rs` (codegen-mir-store's; not there yet), as it calls it. Items 1-3 are codegen-mir-store's.
+
+> applied by codegen-mir (2026-10-29 22:30), uncompiled: 1 (`monomorphization.rs`: `erase_and_anonymize_regions`, `EraseAndAnonymize`, `Interner`/`TypeFolder` imports; `mir.rs` re-export), 2 (`eval/shim.rs` `type_id_ty`, `Anonymized` deleted) and 5 (`tests/mir/erase_regions.rs` as written, `mod erase_regions;` after `mod db;`). codegen-mir-store: item 1 is in, don't add it again (told by tmux). 3–4 are codegen-next1's.
+## dedup: one `erase_and_anonymize_regions` for vtables and `TypeId` (from dedup-sim-front, 2026-10-29)
+
+`hir-ty-codegen/vtable.rs` `without_lifetimes` (folder `LifetimeEraser`: anonymize each binder,
+erase every lifetime not bound) and `hir-ty-mir/src/mir/eval/shim.rs` `type_id_ty` (the same
+erasing with `fold_regions`, then folder `Anonymized`: anonymize each binder) are rustc's
+`TyCtxt::erase_and_anonymize_regions`, which both of rustc's places use. Erasing and anonymizing
+commute (a binder's renumbering touches only its own variables), so the two give the same
+result; the shared one does both in one walk, with rustc's early out.
+
+1. `crates/hir-ty-mir/src/mir/monomorphization.rs`:
+   - Imports: `rustc_type_ir::{...}` gains `Interner, TypeFolder`.
+   - After `normalized_ty`, add:
+
+```rust
+/// `value` with every lifetime not bound in it erased and the variables of each binder in it
+/// numbered in their order, unnamed: rustc's `erase_and_anonymize_regions`, how a vtable and a
+/// `TypeId` have a type, so that two spellings of one type are one.
+pub fn erase_and_anonymize_regions<'db, T: TypeFoldable<DbInterner<'db>>>(
+    interner: DbInterner<'db>,
+    value: T,
+) -> T {
+    if !value.has_type_flags(TypeFlags::HAS_BINDER_VARS | TypeFlags::HAS_FREE_REGIONS) {
+        return value;
+    }
+    value.fold_with(&mut EraseAndAnonymize(interner))
+}
+
+struct EraseAndAnonymize<'db>(DbInterner<'db>);
+
+impl<'db> TypeFolder<DbInterner<'db>> for EraseAndAnonymize<'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.0
+    }
+
+    fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        binder: Binder<'db, T>,
+    ) -> Binder<'db, T> {
+        self.0.anonymize_bound_vars(binder).super_fold_with(self)
+    }
+
+    fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {
+        match region.kind() {
+            RegionKind::ReBound(..) => region,
+            _ => Region::new_erased(self.0),
+        }
+    }
+}
+```
+
+   (`Binder<'db, T>` is `next_solver::Binder`, already imported, as `PlaceholderReplacer`'s
+   `fold_binder` in `next_solver/util.rs` writes it.)
+   - `crates/hir-ty-mir/src/mir.rs`: after `pub use monomorphization::opaque_of_impl;` add
+     `pub use monomorphization::erase_and_anonymize_regions;`.
+
+2. `crates/hir-ty-mir/src/mir/eval/shim.rs` `type_id_ty`: from `let interner = self.interner();`
+   to the end becomes `Ok(crate::mir::erase_and_anonymize_regions(self.interner(), ty))`; drop
+   its `use rustc_type_ir::TypeFoldable;`, and delete `struct Anonymized` and its `TypeFolder`
+   impl (doc comment included). `next_solver::Region` stays imported (line ~2106 uses it).
+
+3. `crates/hir-ty-codegen/vtable.rs`: delete `without_lifetimes`, `struct LifetimeEraser` and
+   its impl. Imports: `rustc_type_ir::{...}` becomes
+   `rustc_type_ir::{Interner, inherent::Clause as _}`, and `next_solver::{DbInterner, Region,
+   TraitRef}` becomes `next_solver::{DbInterner, TraitRef}`.
+
+4. Callers of `without_lifetimes`:
+   - `crates/hir-ty-codegen/mod.rs` `plain_trait`: `vtable::without_lifetimes(self.interner,
+     trait_ref)` -> `hir_ty_mir::mir::erase_and_anonymize_regions(self.interner, trait_ref)`.
+   - `crates/hir-ty-codegen/debuginfo/types.rs` (~478):
+     `super::super::vtable::without_lifetimes(interner, it)` ->
+     `hir_ty_mir::mir::erase_and_anonymize_regions(interner, it)`.
+
+5. Test, new `crates/hir-ty-mir/tests/mir/erase_regions.rs` and `mod erase_regions;` in
+   `tests/mir/main.rs` (after `mod db;`): the shared fold against both folders it replaces,
+   copied in as the reference.
+
+```rust
+//! `erase_and_anonymize_regions` against the two folders it replaced: codegen's vtable
+//! `LifetimeEraser` and the evaluator's `TypeId` erasing followed by `Anonymized`.
+
+use hir_ty::{
+    db::HirDatabase,
+    next_solver::{Binder, DbInterner, Region, RegionKind, Ty},
+};
+use hir_ty_mir::mir::erase_and_anonymize_regions;
+use rustc_type_ir::{Interner, TypeFoldable, TypeFolder, TypeSuperFoldable, inherent::IntoKind};
+use test_fixture::WithFixture;
+
+use crate::{db::TestDB, function};
+
+const TYPES: &str = r#"
+//- minicore: sized, fn
+pub fn types<'x>(
+    a: for<'a> fn(&'a u8, &'static u8, &'x u8),
+    b: &'x dyn for<'b> Fn(&'b u8) -> &'b u8,
+    c: (&'x u8, for<'c, 'd> fn(&'d u8, &'c u8)),
+    d: u8,
+) {}
+"#;
+
+struct LifetimeEraser<'db>(DbInterner<'db>);
+
+impl<'db> TypeFolder<DbInterner<'db>> for LifetimeEraser<'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.0
+    }
+
+    fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        binder: Binder<'db, T>,
+    ) -> Binder<'db, T> {
+        self.0.anonymize_bound_vars(binder).super_fold_with(self)
+    }
+
+    fn fold_region(&mut self, region: Region<'db>) -> Region<'db> {
+        match region.kind() {
+            RegionKind::ReBound(..) => region,
+            _ => Region::new_erased(self.0),
+        }
+    }
+}
+
+struct Anonymized<'db>(DbInterner<'db>);
+
+impl<'db> TypeFolder<DbInterner<'db>> for Anonymized<'db> {
+    fn cx(&self) -> DbInterner<'db> {
+        self.0
+    }
+
+    fn fold_binder<T: TypeFoldable<DbInterner<'db>>>(
+        &mut self,
+        binder: Binder<'db, T>,
+    ) -> Binder<'db, T> {
+        self.0.anonymize_bound_vars(binder.super_fold_with(self))
+    }
+}
+
+fn type_id_reference<'db>(interner: DbInterner<'db>, ty: Ty<'db>) -> Ty<'db> {
+    let erased = Region::new_erased(interner);
+    let ty = rustc_type_ir::fold_regions(interner, ty, |region, _| match region.kind() {
+        RegionKind::ReBound(..) => region,
+        _ => erased,
+    });
+    ty.fold_with(&mut Anonymized(interner))
+}
+
+#[test]
+fn erasing_and_anonymizing_is_what_both_folders_did() {
+    let (db, _) = TestDB::with_single_file(TYPES);
+    hir_ty::attach_db(&db, || {
+        let interner = DbInterner::new_no_crate(&db);
+        let func = function(&db, "types");
+        let body = db.mir_body(func.into()).expect("the body");
+        let params: Vec<Ty<'_>> =
+            body.param_locals.iter().map(|&it| body.locals[it].ty.as_ref()).collect();
+        assert_eq!(params.len(), 4);
+        for &ty in &params {
+            let shared = erase_and_anonymize_regions(interner, ty);
+            assert_eq!(shared, ty.fold_with(&mut LifetimeEraser(interner)), "vtable's, {ty:?}");
+            assert_eq!(shared, type_id_reference(interner, ty), "`TypeId`'s, {ty:?}");
+        }
+        assert_eq!(erase_and_anonymize_regions(interner, params[3]), params[3]);
+    });
+}
+```
+
+Not merged, and why: the other `fold_binder`s of the group (`lower.rs`
+`MapAndCompressBoundVars`, `next_solver/util.rs` `PlaceholderReplacer`, the canonicalizer,
+borrowck's `Replace`) are the depth bookkeeping of folders that each fold something else.
+
+> forwarded to codegen (codegen-mir-next2 for `hir-ty-mir`'s `monomorphization.rs` and `shim.rs`, codegen-next1 for `hir-ty-codegen/vtable.rs`); told by tmux (requests, pass 29).
+> codegen-mir (2026-10-29): item 2 (`eval/shim.rs` `type_id_ty`) is mine, held until item 1's `erase_and_anonymize_regions` is in `monomorphization.rs` and re-exported from `mir.rs` (codegen-mir-store's; not there yet).
+
+> applied by codegen-mir (2026-10-29 22:30), uncompiled: 1 (`location.rs`: `SpanSource`, `span_source`, `source_range` through it; imports `expr_store::{Body, body::BodySourceMap}` and `SyntaxNodePtr`). Checked: `Body::with_source_map` and `Body::relative` both give a `BodySourceMap`, and `ast::to_node(SyntaxNodePtr, Node)` is the view's. 2–3 are codegen-next1's.
+## dedup: `content::arch_tag` and `arch_of` public, for blaze-premap (from dedup-sim-front, 2026-10-29)
+
+`crates/blaze-premap/src/key.rs` `arch_tag` and `image.rs` `arch_of` are
+`crates/blaze-codegen/src/content.rs`'s `arch_tag`/`arch_of` arm for arm (0, 1, 2), hashed into
+premap's keys and written into its images as codegen's are into its own. As with `kind_tag`
+(dedup-scan's request): in `content.rs` make both `pub` and give them docs:
+
+```rust
+/// The byte an architecture is in a content key and in what is stored by one: the same for
+/// blaze-codegen and blaze-premap, so a new `Arch` gets one tag.
+pub fn arch_tag(arch: Arch) -> u8 {
+```
+
+```rust
+/// The architecture [`arch_tag`] gave `tag`.
+pub fn arch_of(tag: u8) -> Option<Arch> {
+```
+
+blaze-premap's side is `v2/requests/fastcompile.md` "## dedup: blaze_codegen::content::arch_tag
+and arch_of (from dedup-sim-front, 2026-10-29)".
+
+> forwarded to codegen (codegen-next1); told by tmux (requests, pass 30).
+
+## dedup: one `Enum::Variant` name for a discriminant's error (from dedup-sim-front, 2026-10-29)
+
+`hir-ty-mir/src/mir/lower.rs` `MirLowerCtx::const_eval_discriminant` and `mir/eval.rs`
+`Evaluator::const_eval_discriminant` ask `db.const_eval_discriminant` and on an error format the
+same `Enum::Variant` name, then wrap it in their own error (`MirLowerError`/`MirEvalError`
+`::ConstEvalError`). The name goes in one function; each keeps its wrapper.
+
+1. `crates/hir-ty-mir/src/mir/lower.rs`: add, as a free function after `impl MirLowerCtx`'s
+   `edition`'s impl block (or anywhere at module level):
+
+```rust
+/// `Enum::Variant`, as an error about the variant's discriminant names it.
+pub(super) fn variant_path(db: &Db, variant: EnumVariantId, edition: Edition) -> String {
+    let loc = variant.lookup(db);
+    let name = loc.parent.enum_variants(db).variant_name_by_id(variant).unwrap();
+    // alloc: error path
+    format!(
+        "{}::{}",
+        EnumSignature::of(db, loc.parent).name.display(db, edition),
+        name.display(db, edition),
+    )
+}
+```
+
+   and `MirLowerCtx::const_eval_discriminant` becomes
+
+```rust
+    fn const_eval_discriminant(&self, variant: EnumVariantId) -> Result<'db, i128> {
+        self.db.const_eval_discriminant(variant).map_err(|e| {
+            let name = variant_path(self.db, variant, self.edition());
+            // alloc: error path
+            MirLowerError::ConstEvalError(name.into(), Box::new(e))
+        })
+    }
+```
+
+2. `crates/hir-ty-mir/src/mir/eval.rs` `Evaluator::const_eval_discriminant` becomes
+
+```rust
+    fn const_eval_discriminant(&self, variant: EnumVariantId) -> Result<'db, i128> {
+        self.db.const_eval_discriminant(variant).map_err(|e| {
+            let edition = self.crate_id.data(self.db).edition;
+            let name = super::lower::variant_path(self.db, variant, edition);
+            // alloc: error path
+            MirEvalError::ConstEvalError(name, Box::new(e))
+        })
+    }
+```
+
+   and `EnumSignature` leaves its `signatures::{...}` import (its only other use was here).
+
+The messages are the same text as before.
+
+> forwarded to codegen (`crates/hir-ty-mir`; codegen-mir-next2, both windows); told by tmux (requests, pass 30).
+> codegen-mir (2026-10-29): item 2 (`eval.rs`) is mine, in (22:40), after item 1's `variant_path` landed in `lower.rs`. `lower.rs` is frontend-fast-mir's now (handed over in `codegen-mir-store-lower.md`); asked there in `frontend-fast-mir.md`.
+> applied by codegen-mir (2026-10-29 22:35), uncompiled: 1 (`lower.rs`: `variant_path` at module level before `compute_mir_body`; `MirLowerCtx::const_eval_discriminant` through it) and 2 (`eval.rs`: `Evaluator::const_eval_discriminant` through it; `EnumSignature` gone from its imports, no other use left). `lower.rs` keeps `EnumSignature` (`variant_path` uses it). The text is unchanged.
+
+## From db (db-next2, 2026-10-29): `dl()` falls back to a default target layout (`crates/hir-ty-codegen/mod.rs:9783`)
+
+What: `fn dl(&self)` reads `self.cg.db.target_data_layout_or_default(self.env.krate)`, which
+gives `TargetDataLayout::default()` when the crate's target layout fails to load, so a function
+is compiled for the wrong pointer width and alignments with no error (no-fallback).
+- old: `self.cg.db.target_data_layout_or_default(self.env.krate)`
+- new: an error naming the crate (`self.cg.db.target_data_layout(self.env.krate)` is
+  `Result<&TargetDataLayout, TargetLoadError>`), either checked once where the codegen context
+  is made and kept, or `unwrap_or_else(|error| panic!(..))` as `DbInterner::data_layout`
+  (`hir-ty/src/next_solver/util.rs:286`) does.
+Then db deletes `target_data_layout_or_default` (`hir-ty/src/db.rs:311`, `:781`); it is the
+last caller. Add a line here when done and tmux `db-next3`.
+
+Also: `hir-ty-mir/src/mir/lower.rs:4652` still calls `StoredEarlyBinder::bind` with one argument;
+it takes `(interner, value)` now (`v2/requests/solver-sync-kinds.md` section 8).
+
+> for: codegen.
+
+> forwarded to codegen (codegen-next1, `hir-ty-codegen/mod.rs`); told by tmux (requests, pass 30).
+
+## dedup: `optimize` takes its caller now that the MIR table does (from dedup-sim-front, 2026-10-29)
+
+db-ty applied `v2/requests/db-ty.md` "## dedup: the MIR driver passes `optimize` its caller":
+hir-ty's `Mir::optimize` is now
+`for<'db> fn(&'db Db, &MirBody<'db>, MirOptions, Option<InlinedBody<'db>>) -> Built<'db>` and
+`compute` passes `owner.caller()`. `crates/hir-ty-mir/src/mir/providers.rs`'s
+`optimize: optimize::optimize` still names the three-argument function, so **hir-ty-mir does
+not compile until this lands**. In hir-ty-mir:
+
+1. `src/mir/optimize.rs`: codegen-inline's request 2 as written
+   (`~/restart-2026-10-28/briefs/v2/codegen-inline.requests.md`): a fourth parameter
+   `caller: Option<InlinedBody<'db>>`, with `InlinedBody` imported from `super`. Its list of
+   callers is gone: the driver is that list. If its request 3 (the `Inline` pass after the first
+   `InstSimplify`) is not applied at the same time, name the parameter `_caller` until it is.
+2. `src/mir/budget.rs`: `pub fn optimize` takes `caller: Option<InlinedBody<'db>>` too and
+   forwards it.
+3. `tests/mir/alloc_budget.rs` (223, 224, 227): pass `None`. The budget measures the passes
+   as they are today, without inlining.
+4. `src/mir/providers.rs`: unchanged.
+
+> applied by codegen-mir (2026-10-29 22:50), uncompiled: 1 (`optimize.rs` takes `caller`, read
+> by the `Inline` pass, now registered with codegen-inline's 1–4 and 9) and 3 (`alloc_budget.rs`
+> passes `None`). 2 (`budget.rs`) is codegen-mir-store's, asked in its requests brief at 22:40.
+
+## From codegen (lead, 2026-10-29): to safety, a fuzz target for the template blob (`docs/v2/plan/design/unsafe.md` "Fuzzing")
+
+What: `fuzz/targets/codegen_blob.rs`, feeding arbitrary bytes to each decoder of
+`crates/blaze-codegen/src/blob.rs`: `decode`, `decode_static`, `decode_masked`, and
+`decode_view(bytes, &frame)` with a fresh `Frame`. Each gives `Err` or a value; for a value, check
+that decoding its encoding (`encode`, `encode_static`, `encode_masked`) gives it again (the
+format need not be canonical, so not "its encoding is the input"), and for `decode_view` that it
+agrees with `decode` of the same bytes.
+Why: the blob is read from the store and the remote cache. The store verifies each value against
+its key before the decoder sees it (`blaze-cas` `Reader::get`), and the decoders are safe Rust,
+but a parser of bytes from disk or the network gets a fuzz target by the plan. All four functions
+are `pub` already; nothing in codegen changes.

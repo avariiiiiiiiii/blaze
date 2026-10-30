@@ -3,6 +3,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
+use blaze_ids::rng::SplitMix64 as Rng;
 use cfg::{CfgAtom, CfgOptions};
 use intern::Symbol;
 use salsa::Durability;
@@ -63,6 +64,17 @@ fn key_value(key: &str, value: &str) -> CfgAtom {
 }
 
 fn add(graph: &mut CrateGraphBuilder, root: FileId, cfg: CfgOptions, env: Env) -> CrateBuilderId {
+    add_with_attrs(graph, root, cfg, env, &[])
+}
+
+/// [`add`], with `attrs` its crate attributes given on the command line.
+fn add_with_attrs(
+    graph: &mut CrateGraphBuilder,
+    root: FileId,
+    cfg: CfgOptions,
+    env: Env,
+    attrs: &[&str],
+) -> CrateBuilderId {
     graph.add_crate_root(
         root,
         Edition::Edition2021,
@@ -72,7 +84,7 @@ fn add(graph: &mut CrateGraphBuilder, root: FileId, cfg: CfgOptions, env: Env) -
         None,
         env,
         CrateOrigin::Local { repo: None, name: None },
-        Vec::new(),
+        attrs.iter().map(|it| it.to_string()).collect(),
         TargetKind::Lib { is_proc_macro: false },
         Arc::new(AbsPathBuf::assert_utf8(std::env::temp_dir())),
         Arc::new(CrateWorkspaceData {
@@ -145,8 +157,7 @@ fn a_files_parse_shares_its_text() {
     let mut db = Db::for_tests();
     let files = load(&mut db, 0, FILES);
     let parse = EditionedFileId::new(&db, files[1], Edition::Edition2021).parse(&db);
-    let root = parse.syntax_node();
-    let tree = root.flat_tree().expect("a parsed file is a flat tree");
+    let tree = parse.root().file();
     assert!(tree.source().ptr_eq(db.file_text(files[1]).text(&db)));
 }
 
@@ -157,8 +168,7 @@ fn a_library_files_parse_leaves_bodies_unparsed() {
     let files = load(&mut db, 0, &[("/a/lib.rs", "fn f() { let x = 1 + 1; }")]);
     let body_is_lazy = |db: &Db| {
         let parse = EditionedFileId::new(db, files[0], Edition::Edition2021).parse(db);
-        let root = parse.syntax_node();
-        let function = root.children().next().expect("the `fn`");
+        let function = parse.root().children().next().expect("the `fn`");
         let body = function.children().find(|it| it.kind() == syntax::SyntaxKind::BLOCK_EXPR);
         body.expect("its body").is_lazy()
     };
@@ -260,6 +270,128 @@ fn a_dependency_added_outside_the_prelude_says_so() {
     assert!(dependency.is_sysroot());
     assert_ne!(outside, in_prelude);
     assert_eq!(depend_on(&mut db, BuiltDependency::with_prelude(name, b, true, false)), in_prelude);
+}
+
+/// The texts of `krate`'s crate attributes' files, in order.
+fn attr_texts(db: &Db, krate: Crate) -> Vec<String> {
+    let text = |file: &FileId| -> String { (**db.file_text(*file).text(db)).to_owned() };
+    krate.crate_attr_files(db).iter().map(text).collect()
+}
+
+/// A graph with crate `a` on `FILES`' first file, its crate attributes `attrs`.
+fn set_attrs(db: &mut Db, files: &[FileId], attrs: &[&str]) -> Crate {
+    let mut graph = CrateGraphBuilder::default();
+    let a = add_with_attrs(&mut graph, files[0], CfgOptions::default(), Env::default(), attrs);
+    graph.set_in_db(db)[&a]
+}
+
+#[test]
+fn each_crate_attr_is_a_file_of_its_own_in_the_roots_source_root() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    assert_eq!(attr_texts(&db, a), ["#![no_std]", "#![feature(x)]"]);
+    let root = db.source_root(SourceRootId(0)).source_root(&db);
+    for &file in a.crate_attr_files(&db) {
+        assert!(!files.contains(&file), "{file:?} is a file of the VFS");
+        assert_eq!(db.file_source_root(file).source_root_id(&db), SourceRootId(0));
+        assert_eq!(root.path_for_file(&file), None, "no `mod` reaches {file:?}");
+        assert_eq!(crate::crate_attr_owner(&db, file), Some(a));
+    }
+    let editioned = crate::crate_attr_files(&db, a);
+    assert!(editioned.iter().all(|file| file.edition(&db) == Edition::Edition2021));
+    assert_eq!(crate::applied_crate_attr_files(&db, a), editioned);
+}
+
+#[test]
+fn an_equal_graph_keeps_the_crate_attr_files_and_writes_nothing() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    let before = a.crate_attr_files(&db).to_vec();
+    let revision = revision(&db);
+    assert_eq!(set_attrs(&mut db, &files, &["no_std", "feature(x)"]), a);
+    assert_eq!(a.crate_attr_files(&db), before);
+    assert_eq!(revision(&db), revision);
+}
+
+#[test]
+fn a_changed_crate_attr_reuses_a_file_and_a_gone_one_is_taken_out() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let a = set_attrs(&mut db, &files, &["no_std", "feature(x)"]);
+    let first = a.crate_attr_files(&db).to_vec();
+
+    // `feature(x)` keeps its file; `feature(y)` gets the one `no_std` left.
+    assert_eq!(set_attrs(&mut db, &files, &["feature(x)", "feature(y)"]), a);
+    assert_eq!(a.crate_attr_files(&db), [first[1], first[0]]);
+    assert_eq!(attr_texts(&db, a), ["#![feature(x)]", "#![feature(y)]"]);
+
+    assert_eq!(set_attrs(&mut db, &files, &["feature(y)"]), a);
+    assert_eq!(a.crate_attr_files(&db), [first[0]]);
+    assert!(!db.has_file_text(first[1]), "the file of a gone attribute is taken out");
+
+    // The ID taken out is the next attribute's.
+    assert_eq!(set_attrs(&mut db, &files, &["feature(y)", "no_core"]), a);
+    assert_eq!(a.crate_attr_files(&db), [first[0], first[1]]);
+    assert_eq!(attr_texts(&db, a), ["#![feature(y)]", "#![no_core]"]);
+}
+
+#[test]
+fn a_crate_that_goes_takes_its_crate_attr_files_out() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let a = set_attrs(&mut db, &files, &["no_std"]);
+    let attr = a.crate_attr_files(&db)[0];
+    let mut graph = CrateGraphBuilder::default();
+    add(&mut graph, files[2], CfgOptions::default(), Env::default());
+    graph.set_in_db(&mut db);
+    assert!(a.crate_attr_files(&db).is_empty());
+    assert!(!db.has_file_text(attr));
+}
+
+#[test]
+#[should_panic(expected = "is the file of a crate attribute")]
+fn the_vfs_setters_refuse_a_crate_attr_file() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let a = set_attrs(&mut db, &files, &["no_std"]);
+    let attr = a.crate_attr_files(&db)[0];
+    db.set_file_text(attr, "fn f() {}");
+}
+
+/// rustc's rule for one crate attribute (`rustc_builtin_macros/src/cmdline_attrs.rs`): exactly
+/// one attribute item, its tokens balanced, nothing after it.
+#[test]
+fn a_crate_attr_is_one_attribute_or_rustcs_error() {
+    use crate::CrateAttrError;
+    let range = |start: u32, end: u32| TextRange::new(start.into(), end.into());
+    let cases: &[(&str, Option<CrateAttrError>)] = &[
+        ("no_std", None),
+        ("feature(a, b)", None),
+        ("doc = \"x\"", None),
+        ("cfg_attr(unix, no_std)", None),
+        ("a b", Some(CrateAttrError::Trailing { range: range(3, 6) })),
+        ("a, b", Some(CrateAttrError::Trailing { range: range(3, 5) })),
+        ("a] #![b", Some(CrateAttrError::UnexpectedClose { close: range(4, 5) })),
+        ("a(", Some(CrateAttrError::Unclosed { open: range(4, 5) })),
+        ("a(]", Some(CrateAttrError::MismatchedClose { open: range(4, 5), close: range(5, 6) })),
+        ("a = ", Some(CrateAttrError::Syntax)),
+        ("\"a", Some(CrateAttrError::Syntax)),
+    ];
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let attrs: Vec<&str> = cases.iter().map(|(attr, _)| *attr).collect();
+    let a = set_attrs(&mut db, &files, &attrs);
+    let attr_files = crate::crate_attr_files(&db, a);
+    let mut applied = Vec::new();
+    for (&(attr, want), &file) in cases.iter().zip(attr_files) {
+        assert_eq!(crate::crate_attr_error(&db, file), want, "{attr:?}");
+        if want.is_none() {
+            applied.push(file);
+        }
+    }
+    assert_eq!(crate::applied_crate_attr_files(&db, a), applied);
 }
 
 /// Source roots 0 (the checkout) and 1 (everything else), both empty.
@@ -414,32 +546,15 @@ fn a_content_id_that_is_not_its_bytes_is_refused() {
     assert_eq!(file_at(&db, &base, "src/lib.rs"), None);
 }
 
-/// splitmix64: the seeded inputs of the model tests.
-struct Rng(u64);
-
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-        z ^ (z >> 31)
-    }
-
-    fn below(&mut self, n: u64) -> u64 {
-        self.next() % n
-    }
-}
-
 #[test]
 fn a_table_finds_what_a_hash_map_does() {
     use crate::table::{Table, hash_of};
     use rustc_hash::FxHashMap;
 
-    let table: Table<Box<str>> = Table::new();
+    let table: Table<Box<str>> = Table::new(1 << 16);
     let mut model: FxHashMap<String, u32> = FxHashMap::default();
     let mut order = Vec::new();
-    let mut rng = Rng(7);
+    let mut rng = Rng::new(7);
     for _ in 0..20_000 {
         let key = format!("key {}", rng.below(5_000));
         let hash = hash_of(key.as_str());
@@ -466,13 +581,13 @@ fn a_table_finds_what_a_hash_map_does() {
 fn threads_inserting_one_key_get_one_value() {
     use crate::table::{Table, hash_of};
 
-    let table: Table<u64> = Table::new();
+    let table: Table<u64> = Table::new(1 << 16);
     let found: Vec<Vec<u32>> = std::thread::scope(|scope| {
         let threads: Vec<_> = (0..8)
             .map(|thread| {
                 let table = &table;
                 scope.spawn(move || {
-                    let mut rng = Rng(thread);
+                    let mut rng = Rng::new(thread);
                     let mut at = vec![u32::MAX; 2_000];
                     for _ in 0..10_000 {
                         let key = rng.below(2_000);
@@ -502,11 +617,42 @@ fn threads_inserting_one_key_get_one_value() {
 }
 
 #[test]
+fn threads_pushing_to_a_log_each_get_their_own_index() {
+    use crate::table::Log;
+
+    let log: Log<u32> = Log::new(1 << 16);
+    let pushed: Vec<Vec<(u32, u32)>> = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..4u32)
+            .map(|thread| {
+                let log = &log;
+                scope.spawn(move || {
+                    (0..10_000u32)
+                        .map(|at| {
+                            let value = thread * 10_000 + at;
+                            (log.push(value), value)
+                        })
+                        .collect()
+                })
+            })
+            .collect();
+        threads.into_iter().map(|it| it.join().unwrap()).collect()
+    });
+    let mut by_index = vec![u32::MAX; 40_000];
+    for (index, value) in pushed.into_iter().flatten() {
+        assert_eq!(log.get(index), Some(&value));
+        assert_eq!(by_index[index as usize], u32::MAX, "index {index} handed out twice");
+        by_index[index as usize] = value;
+    }
+    assert!(log.iter().copied().eq(by_index.iter().copied()), "`iter` is in index order");
+    assert_eq!(log.get(40_000), None);
+}
+
+#[test]
 fn a_log_and_a_column_give_back_what_was_put() {
     use crate::table::{Column, Log};
     use salsa::plumbing::Id;
 
-    let log: Log<u32> = Log::new();
+    let log: Log<u32> = Log::new(1 << 16);
     for value in 0..5_000u32 {
         assert_eq!(log.push(value * 3), value);
     }
@@ -518,7 +664,7 @@ fn a_log_and_a_column_give_back_what_was_put() {
 
     let column: Column<Id> = Column::new();
     let mut model = std::collections::BTreeMap::new();
-    let mut rng = Rng(11);
+    let mut rng = Rng::new(11);
     for _ in 0..10_000 {
         let raw = rng.below(1 << 16) as u32;
         if rng.below(4) == 0 {
@@ -570,6 +716,31 @@ fn what_queries_note_is_kept_once_and_sorted() {
     assert_eq!(db.files.sources_included_by(), named);
 }
 
+/// A file `include_bytes!` names that can't be read keeps why, in `std::io::Error`'s words
+/// (rustc's "couldn't read" message prints them), and a different error is a different input.
+#[test]
+fn an_unreadable_included_file_keeps_its_error() {
+    let mut db = Db::for_tests();
+    let files = load(&mut db, 0, FILES);
+    let mut graph = CrateGraphBuilder::default();
+    let a = add(&mut graph, files[0], CfgOptions::default(), Env::default());
+    let a = graph.set_in_db(&mut db)[&a];
+    let dir = AbsPathBuf::assert_utf8(std::env::temp_dir());
+    let missing = dir.join("blaze-base-db-unreadable-include.rs");
+    let _ = std::fs::remove_file(&missing);
+    let read = |path: &AbsPathBuf| {
+        let file = db.files().included_file(&db, a, path, Durability::LOW);
+        (file.read(&db).clone(), file.content(&db))
+    };
+    let expected = |path: &AbsPathBuf| std::fs::read(path).unwrap_err().to_string();
+    let (missing_read, missing_content) = read(&missing);
+    let (dir_read, dir_content) = read(&dir);
+    assert_eq!(missing_read.unwrap_err().to_string(), expected(&missing));
+    assert_eq!(dir_read.unwrap_err().to_string(), expected(&dir));
+    assert_ne!(missing_content, dir_content, "a different error is a different input");
+    assert!(db.files().included_is_read(&db, &missing), "the same error is what was read");
+}
+
 /// The view a seed makes at a step: some of a fixed set of paths, each with one of a few
 /// contents, some of which are not UTF-8.
 fn seeded_view(rng: &mut Rng) -> Vec<(String, Vec<u8>)> {
@@ -611,7 +782,7 @@ fn view_state(
 
 #[test]
 fn a_view_set_over_others_is_the_view_set_alone() {
-    let mut rng = Rng(3);
+    let mut rng = Rng::new(3);
     let mut db = Db::for_tests();
     let (base, partition) = checkout(&mut db);
     let built = [base.join("target")];
@@ -902,7 +1073,7 @@ fn a_path_no_source_root_names_is_found_once_one_does() {
 
 #[test]
 fn the_simd_prefix_and_suffix_equal_their_scalar_reference() {
-    let mut rng = Rng(19);
+    let mut rng = Rng::new(19);
     for _ in 0..4_000 {
         let common = rng.below(160) as usize;
         let mut a: Vec<u8> = (0..common).map(|_| rng.below(4) as u8).collect();
@@ -941,7 +1112,7 @@ fn random_edit(rng: &mut Rng, text: &str) -> String {
 
 #[test]
 fn the_edit_between_two_texts_makes_one_the_other() {
-    let mut rng = Rng(23);
+    let mut rng = Rng::new(23);
     let mut old = include_str!("target.rs").to_owned();
     for _ in 0..500 {
         let new = random_edit(&mut rng, &old);
@@ -980,14 +1151,14 @@ fn a_parse_after_random_edits_is_the_whole_parse() {
         }
         let id = EditionedFileId::new(&db, file, Edition::Edition2021);
         assert_eq!(id.parse(&db).is_outline(), library);
-        let mut rng = Rng(seed);
+        let mut rng = Rng::new(seed);
         let mut text = source.to_owned();
         let start = reparsed();
         for step in 0..80 {
             text = random_edit(&mut rng, &text);
             db.set_file_text(file, &text);
             let parse = id.parse(&db);
-            assert_eq!(parse.syntax_node().text().to_string(), text, "step {step}");
+            assert_eq!(parse.root().text(), text, "step {step}");
             assert_whole(parse, db.file_text(file).text(&db), Edition::Edition2021, library);
         }
         assert_eq!(reparsed() - start, 80, "seed {seed}: every edit after a kept parse reparses");
@@ -1021,7 +1192,7 @@ fn a_reparse_is_made_from_the_last_text_that_was_parsed() {
     assert_eq!(db.file_text(fresh).reparse_field(&db).edit(), None);
     let start = reparsed();
     let fresh_id = EditionedFileId::new(&db, fresh, Edition::Edition2021);
-    assert_eq!(fresh_id.parse(&db).syntax_node().text().to_string(), "fn b() { 2 }");
+    assert_eq!(fresh_id.parse(&db).root().text(), "fn b() { 2 }");
     assert_eq!(reparsed(), start);
 
     // Another edition's parse is not made from this one's.

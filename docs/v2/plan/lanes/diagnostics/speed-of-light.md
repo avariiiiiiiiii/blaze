@@ -288,10 +288,10 @@ The bounds below are that design with nothing extra.
 | Component | Work | Bound | Now |
 | --- | --- | --- | --- |
 | skip of allowed lints | one AND of a `LintSet` per pass | under 1 µs | at the bound: every pass gates on `cx.any_may_fire` / `lint_may_fire`; `stability` runs anyway for E0658 |
-| syntax walk | one pass over the crate's nodes, shared | about 0.5 ms | `imports` reads `cx.walk()`; `stability` walks again (about 10 ms) |
+| syntax walk | one pass over the crate's nodes, shared | about 0.5 ms | `imports` and `stability` read `cx.walk()`; `stability` scans its `kinds` column (about 0.5 ms) and reads only the nodes of the kinds it checks (about 2 ms) |
 | item walk | one pass over the items, shared | about 0.3 ms | at the bound: `cx.items()`, made once for both sides of the abort |
 | `imports` | one bit per import, then one visit per `use` tree | about 0.1 ms | about 150 ms: every path is resolved again |
-| `stability` | one table probe per resolved use | about 2.6 ms | about 160 ms: every path is resolved again, in a walk of its own |
+| `stability` | one table probe per resolved use | about 2.6 ms | about 150 ms: every path is resolved again |
 | `items`, after the abort | 17 checks at each of 10,000 items | about 2.4 ms | near the bound, plus on-demand path resolutions in five passes |
 | `effective` | one walk of each public interface per rise | the `dead` section's `reach` row | computed once, shared |
 
@@ -307,14 +307,18 @@ are skipped one by one (`deprecated` and `deprecated_in_future` before any text 
 and the `#[macro_escape]` warning are not lints either.
 
 **The syntax walk.** One read of a node's kind from the walk's pre-order columns is about 2
-cycles; 800,000 nodes is 1.6 million cycles, about 0.5 ms. `imports` reads `cx.walk()`, the
-early lint pass's walk, which `lints::syntax` builds once. `stability/walk.rs` still walks the
-expanded syntax with rowan cursors: at about 45 cycles a node (a cursor allocated and freed,
-and a `SyntaxKind` dispatch) that is 36 million cycles, about 10 ms, 20 times the bound.
-What removes it: walk `cx.walk()`'s trees instead. The visit order is the same pre-order, and
-`stability` already sorts what it reports by its own key. It is a rewrite of the walk's
-traversal that I did not make blind, without a build, because its typeck order inside a body
-(a receiver before its method, a `let`'s initializer before its pattern) is easy to break.
+cycles; 800,000 nodes is 1.6 million cycles, about 0.5 ms. `imports` and `stability` read
+`cx.walk()`, the early lint pass's walk, which `lints::syntax` builds once. `stability/walk.rs`
+scans each tree's `kinds` column, about 0.5 ms of its own, and touches a node only when its
+kind is one it checks (items, attributes, `let`s, paths, `use` trees, method calls, fields,
+parameters, generic parameters and arguments): a few hundred thousand nodes, at about 30
+cycles each for the node's range and cast, about 2 ms. An expansion's or a module file's tree
+is walked where it is reached, so the owners and modules are numbered as rustc's walk numbers
+them. Inside a body it keeps typeck's order (a receiver before its method; a `let`'s type,
+initializer, pattern, then the rest, found in one pass over the `let`'s children). Whether a
+path is in a body is found only where a check needs it (type-relative paths and associated
+type constraints), by walking up to the nearest item or expression. These are estimates, not
+measured: the port was made without a build.
 
 **`imports`.** rustc's bound: resolve already recorded the uses, so the lint is one bit test
 per binding plus one visit of each `use` tree to group what is unused. 2,000 trees at about
@@ -332,7 +336,7 @@ both, the pass is a read of two tables.
 index, which `stability/lookup.rs` already is: a `HashTable` hashed once, its 8-byte slots in
 `u32`-numbered arenas, at about 50 cycles a probe. 180,000 uses cost 9 million cycles, about
 2.6 ms. Now each use's resolution is a `sema.resolve_path`, or a `resolve_method_call` for
-method calls and fields, at about 3,000 cycles: about 150 ms, plus the 10 ms walk above. The
+method calls and fields, at about 3,000 cycles: about 150 ms, plus the 2.5 ms walk above. The
 same resolution table removes it. A name pre-filter (skip a path whose last segment names no
 deprecated or unstable definition) is not sound: `use old as new` renames, and std has
 deprecated items in every crate's scope.
@@ -352,15 +356,15 @@ removes their cost.
 ### The whole pass
 
 Bound: about 6 ms for the 100,000-line crate on one core: the shared walks about 0.8 ms,
-`imports` 0.1 ms, `stability` 2.6 ms, `items` 2.4 ms. Now: about 320 ms, nearly all of it
+`imports` 0.1 ms, `stability` 2.6 ms, `items` 2.4 ms. Now: about 310 ms, nearly all of it
 paths resolved again through `Semantics`, once by `imports` and once by `stability`.
 
 What stands in the way of the 90% mark is in the front end, not in these passes: hir-def
 recording which imports each resolution went through (imports' request 1), and one table of
 path resolutions recorded as lowering and inference make them (filed by
 `diagnostics-lints-names`). With both, `imports` and `stability` drop to their bounds without
-changing their rules. The one change in these passes still to make is `stability`'s walk onto
-`cx.walk()`, after the first build (about 10 ms to 0.5 ms).
+changing their rules. `stability`'s walk now reads `cx.walk()` (about 10 ms to about 2.5 ms,
+estimated); what is left of it is its own scan of the `kinds` column and the nodes it checks.
 
 None of these passes does I/O or a syscall, and none is parallel. Modules are independent for
 `items` and `stability`, so the passes could split across cores by module. At a 6 ms bound
@@ -647,6 +651,7 @@ operations in the code, using the costs of the `dead_code` section.
 | Item scopes | one list per check | about 1 ms, once | once | four times |
 | Impls by trait | one hash probe per impl | under 0.1 ms | at the bound | a linear search and a `Vec` per trait |
 | Staged dependencies' features | one walk per dependency, only when needed | 0 for a crate with no library feature | 0 | every dependency, every check |
+| Missing stability (`staged_api` only) | one visit and two probes per definition | 0 outside `staged_api`; about 1 ms for std | 0 outside `staged_api`; about 30 to 60 ms for std | not checked |
 
 **The walk.** `Walk::of` visits 800,000 nodes at about 15 cycles each (cursor arithmetic on the
 flat tree and a kind test), about 12 million cycles, about 3.5 ms. `checks::check` built its
@@ -673,6 +678,19 @@ building `Vec<String>`s. The builtin tools are a `const` array, so a crate that 
 tool has an empty list. At about 300 cycles per attribute (a table lookup, an argument parse,
 a parser's accept), 20,000 attributes cost about 6 million cycles, about 2 ms, which is the
 bound.
+
+**Missing stability.** rustc's `MissingStabilityAnnotations` visits each definition once. Per
+definition it does one lookup of its stability and one of its effective visibility, about 50
+cycles each. That is about 1 ms for std's roughly 60,000 definitions, and nothing for a crate
+without `#![feature(staged_api)]`: `crate_checks` returns before it walks. Here the pass scans
+the walk's `kinds` column, which is at the bound. For each definition it then:
+
+- walks the definition's ancestors twice, for `order_key` and `parent`, at depth 3 to 6;
+- maps the node to its `hir` definition through `Semantics::to_def2`, about 0.5 to 1 µs, to
+  probe `Effective`.
+
+That is about 30 to 60 ms for std. Reaching the bound needs the walk to carry each definition
+node's ID and its parent's index as columns, so that both of those become array reads.
 
 **Signature paths.** The work is to resolve each path that can fail. rustc resolves each path
 once, and a type parameter is found in the item's rib. Here, each `PathType` paid for:
@@ -783,6 +801,7 @@ about 5,000 attributes, about 400 of them lint levels.
 | The early pass and the syntax passes | one kind read per node, a cast where a lint wants the kind | about 0.7 ms | about 2.5 ms: one scan of the columns per pass, about ten |
 | `check_cfg` | the `cfg`s of each node with an attribute | about 0.3 ms | at the bound: only nodes `Tree::attrs` marks are read |
 | The lexer's lints | one lex of each source that can fire | about 2 cycles a byte where it must | a SIMD ASCII scan, and no lex, where nothing can fire |
+| Suggestions (`edit_distance`) | one distance per candidate name, only for a lint that fires | about 1 cycle a byte of candidate | at the bound: Hyyrö's bit-parallel OSA distance |
 
 The arithmetic behind each row follows.
 
@@ -817,8 +836,9 @@ at about 100 cycles: 40 million cycles, about 11 ms, twice.
 
 **The walk.** `Walk::add` visits the expanded crate once in pre-order and keeps four columns
 indexed alike: `nodes`, `kinds` (2 bytes), `attrs` (1 byte) and the trees' `off` and
-`replaced` lists. Every syntax pass of this part and `names::imports` reads it through
-`cx.walk()`; nothing walks a tree again. The bound is a flat syntax store's pre-order at
+`replaced` lists. Every syntax pass of this part, `names::imports` and `names::stability`
+read it through `cx.walk()`; nothing walks a tree again. The bound is a flat syntax store's
+pre-order at
 about 2 cycles a node, 0.5 ms. Now each node costs a rowan cursor, made and freed, at about
 45 cycles: 36 million cycles, about 10 ms. What removes it is in the front end: the flat
 syntax view (`syntax::view`), once the walk can be made over it without `SyntaxNode`s.
@@ -847,6 +867,16 @@ a source that is all ASCII is not lexed: the check is the standard library's SIM
 Budget test: `an_ascii_crate_is_not_lexed` (the same allocations at 4 and 400 functions, at
 most 4).
 
+**Suggestions.** "a lint with a similar name exists" and its kin run only on the edge, once a
+diagnostic is certain, but over every candidate: the 270 lint names, or every name in scope.
+`edit_distance` (by `diagnostics-lints`) is Hyyrö's 2003 bit-parallel optimal string
+alignment distance, as rapidfuzz's `osa_hyrroe2003` has it. For a pattern of up to 64 bytes it
+keeps one machine word per row state, so a comparison is about one cycle per byte of the
+candidate instead of rustc's rows of `pattern × text` cells. It works on bytes for ASCII with
+no allocation, compares upper case without making `String`s, and reuses one buffer for the
+sorted-words step. Over 64 characters it takes rustc's rows. Its results are rustc's, checked
+by a 20,000-pair test against rustc's algorithm. That beats rustc's own suggestion path.
+
 ### The whole part
 
 Bound: about 3 ms for the reference crate on one core (the walk 0.5 ms, the fused scans
@@ -872,3 +902,183 @@ must). Now: about 13 ms, of which 10 ms is rowan's walk and about 2 ms the unfus
   Those on the no-diagnostic path that were found have been fixed or gated on
   `lint_may_fire`. The script can't run at the moment: `tools/typed_input.py`, which it
   imports, is gone from the tree.
+
+## MIR lowering: matches, unsafety, scopes (diagnostics-lints-mir-speed)
+
+`crates/blaze-diagnostics/src/lower/` gives E0004 (`missing_match_arms.rs`), E0005
+(`non_exhaustive_let.rs`), E0133 with `unsafe_op_in_unsafe_fn` and `deprecated_safe_2024`
+(`missing_unsafe.rs`), and the scope errors: `break`/`continue` outside a loop, `return`,
+`await` and `yield` outside their bodies, undeclared and unreachable labels, and
+`unused_must_use`. Each lowering runs once per hir diagnostic, so a clean crate costs nothing
+here beyond hir's own checks (match checking, the unsafety walk, body lowering), which are
+db's. The work that counts is per diagnostic. What should stay small there is walking the
+tree, not printing the message.
+
+This builds on `diagnostics-speed-lower` ("Lowering and printing" above), which already put the
+`lint_may_fire` bit test in front of `unused_must_use` and `missing_unsafe`'s two lints and
+stopped `must_use_adt` collecting the type's arguments. Those stay as they are. What this
+section adds is the shape of the lowerings past that gate:
+- lazy walks up the tree in place of collected ancestor chains;
+- one walk of a block for E0571, in place of a walk per `break`;
+- label resolution that stops at the label it finds;
+- E0133's block head read in place;
+- `deprecated_safe_2024`'s attribute read before the gate decides;
+- `Result` and `ControlFlow` found by lang item in place of a name compare;
+- E0004 and E0005 printed from hir's analysis, in place of being parsed back from its text.
+
+| Component | Work per diagnostic | Bound | Now |
+| --- | --- | --- | --- |
+| Scope errors (`break`, `continue`, `return`, `await`, `yield`) | one walk up to the body owner | depth `d`, about 10 cycles a step | at the bound, with no allocation |
+| `break` with a value in a plain block | one walk down the block | `n` nodes of the block, once | at the bound |
+| Undeclared label | a walk up to the label, then rustc's typo search | `d` steps, plus one edit distance per label in scope | at the bound |
+| E0004, E0005 | print what hir found | the text of three witnesses, plus one source lookup per variant pointed at (five at most) | at the bound |
+| E0133, the block's head | read the head of an `unsafe` block in place | the head's tokens | at the bound |
+| `unsafe_op_in_unsafe_fn`, the first operation | which linted operation comes first in its function | one flag read | `k·n` for `k` linted operations in a body of `n` expressions (request 1) |
+| `unused_must_use` | is the type `Result` or `ControlFlow` | two lang-item field reads | at the bound, with one bit test when the lint is allowed everywhere |
+
+**Scope errors.** rustc's `rustc_passes::loops` (`CheckLoopVisitor`) keeps a stack of contexts
+on its way down: a loop, a closure, a coroutine, a labeled or unlabeled block. It resets the
+stack at each body owner. rustc_ast_lowering's `lower_loop_destination` and
+`rustc_resolve`'s label ribs resolve `break 'a`. blaze finds the same thing by walking up from
+the error, and that walk is now lazy. `up` and `edges` step through `parent()`, a reference
+count and an index in the flat tree, and expand a macro call only when they reach its root.
+Each stops at the first body owner or target. On the reference crate a body is about 30 nodes
+deep, so a walk is about 30 steps, about 300 cycles. Before, `ancestors` collected the whole
+chain into a `Vec` up to the file root, expanding every macro above the error. `contexts`
+then replayed it; that is still the case, but only up to the body owner.
+
+**`break` with a value in a plain block.** rustc gives E0571 only for the first `break` that
+targets the block. Before, blaze rebuilt the context chain of every `break` in the block for
+every one of them: `B²·d` steps, plus a `Vec` per `break`. A block of 2,000 nodes with 20
+`break`s cost 20·20·30 = 12,000 steps and 400 `Vec`s. Now it is one pre-order walk of the
+block. Each frame records whether the block is still the target. A subtree where it is not
+gets skipped, and the walk stops at the first `break` that qualifies: at most 2,000 visits,
+with no allocation per node. A test compares it against the old rule on a fixture with every
+kind of nesting.
+
+**Labels.** `undeclared_label` walks up to the label used, keeping a flag for whether a closure
+or a body edge sits in between (unreachable, E0767). It reads hygiene only for a label with the
+same name, or one close enough for rustc's `find_best_match_for_name`. Before, it collected
+every rib of the body. `yield_outside_coroutine` finds the first `yield` of a body in one
+walk, which before took a walk per `yield`.
+
+**E0004 and E0005.** rustc's `check_match` analyses a match with `rustc_pattern_analysis`:
+Maranget's usefulness algorithm ("Warnings for pattern matching", 2007), extended with
+constructor splitting, `PlaceValidity` and witness construction. It then prints the first
+three witnesses. `hir-ty-matchck` runs that same crate. hir now gives every witness printed
+(`print_witness_pat`), the variants `maybe_point_at_variant` names, the types of
+`collect_special_tys`, and the flags for guards, references, private uninhabitedness and
+constants. So the lowering only prints. Before, it re-inferred the scrutinee's type, split
+hir's joined text, and parsed each witness back against the type (a field-type
+instantiation per field). For E0005 the work left is rustc's `each_binding`: one
+`resolve_bind_pat_to_const` per identifier in the pattern, and that only when rustc
+suggests `let...else` or `if let`.
+
+**E0133.** `head_range` reads the `unsafe` block's text through `SyntaxText` slices in place.
+Before, it made a `String` of the whole block per error. `missing_unsafe` reads
+`lint_may_fire` before it builds anything.
+
+**Budget tests.** `a_walk_up_allocates_nothing` checks that `up` and `edges` allocate nothing
+and yield one item per step. `a_blocks_breaks_are_those_of_the_plain_rule` checks that one
+walk finds the `break`s the old rule found. `the_first_yield_is_that_of_the_plain_rule`,
+`the_head_read_in_place_is_the_texts` and `the_witnesses_are_joined_as_rustc_joins_them`
+check the rest.
+
+**What stands in the way.**
+- The first `unsafe_op_in_unsafe_fn` of a function: hir doesn't say which it is, so the
+  lowering re-runs `get_unsafe_ops`, which is not a query, per diagnostic. Its cost is `k·n`,
+  about 100,000 node visits for an FFI wrapper with 50 linted operations, where it should be one
+  flag read (`v2/requests/diagnostics.md`, `diagnostics-lints-mir-speed` 1). rustc's
+  `UnsafetyVisitor` sets `suggest_unsafe_block` during its one walk.
+- `rustc_pattern_analysis` is crates.io's 0.166 snapshot, not the pinned nightly's (request 2).
+  This doesn't affect speed, but it lets which matches compile drift from rustc's.
+
+## Borrow check and const check lowerings (`diagnostics-lints`)
+
+`lower/borrowck_error.rs`, `lower/borrowck_skipped.rs`, `lower/const_check_error.rs` and
+`lower/const_impure.rs` turn hir's borrow-check, const-check and purity results into rustc's
+diagnostics, or blaze's. Each runs once per diagnostic hir gives and never on a clean crate,
+so its work is per diagnostic. Cycles are at 3.5 GHz, with the costs of the `dead_code`
+section.
+
+**The work of one diagnostic.** These are the steps nothing can skip:
+
+- the node from its pointer, one root-to-node descent of about 15 levels at about 20 cycles
+  (300 cycles);
+- its span, a binary search of the file's line index (about 200 cycles);
+- the `Diag` with its message copied (one allocation, about 100 cycles);
+- the item it is in, for the fact the agent API records (`Fact::Code`): one ancestor walk of
+  about 10 nodes, a `to_def2` hit in Semantics' per-file cache, and the item's key (about
+  800 cycles).
+
+That is about 1,400 cycles, 0.4 µs, per diagnostic. Rendering it (`emit`, annotate-snippets)
+costs 10 to 50 times more, so these lowerings are not where a failing check spends its time.
+
+| Component | Bound per diagnostic | Now | Was |
+| --- | --- | --- | --- |
+| `borrowck_error` (an error) | about 1,400 cycles, plus one span per label, note and suggestion part hir gives | that, plus `phase`'s second walk (about 100) | the same |
+| `borrowck_error` (`unused_mut`) | one bit test when allowed, else about 1,600 with the suggestion | at the bound | at the bound |
+| `borrowck_skipped` | about 1,400 cycles, plus the item's path when printed | at the bound | twice the item lookup, about 2,200 |
+| `const_check_error` | about 1,400, plus one call resolution for E0015 | about 1,500 | the same |
+| `const_impure`, lint allowed | one perfect-hash lookup and one bit test, about 40 cycles | at the bound | a scan of every dependency's name, about 1,500 |
+| `const_impure`, crate not opted in | 0 (hir should not look) | about 1,500: a scan of the direct dependencies' names | the same |
+
+**What changed.** `borrowck_skipped` finds its item once, for both the message's path and
+the fact; before, `code_fact` walked and called `to_def2` a second time. `const_impure` tests
+`cx.lint_may_fire` first, so where the lint is allowed (`--cap-lints allow`, which is every
+dependency cargo builds) it costs a bit test.
+
+**Budget test.** `lower::borrowck_error::tests::an_allowed_lint_allocates_nothing`: with
+`-A unused_mut -A blaze::const_impure`, lowering both allocates nothing.
+
+**Within 10%.** `phase` (the stage rustc gives the error in) walks the ancestors a second time,
+about 100 cycles, which is 7% of the bound. One walk could give both the item and the phase,
+but that means changing `lints::body_item`, which is `diagnostics-speed-lints`'.
+
+**What stands in the way.**
+- hir runs `const_purity` on every `const fn` of every crate, and this lowering drops the
+  result unless the crate depends on `blaze`. The work's bound in a crate that has not opted
+  in is zero: the purity analysis should not run there at all. The fix belongs to db: gate
+  `ConstImpure` in `hir/src/diagnostics.rs` on fn-cache's `uses_cache`, which is then
+  computed once per crate (`v2/requests/diagnostics.md`, "diagnostics-lints: purity only
+  where fn-cache is used"). With it, the dependency scan here goes too.
+- The const checker's messages are matched as strings (`starts_with("cannot call non-const
+  ")`), about 20 cycles per diagnostic. That is inside the bound, but it is a string dispatch on
+  a fixed set, which the `ConstCheckKind` request removes.
+
+## The hot lint over the whole crate (`diagnostics`, session 4)
+
+`tools/v2/hot_lint.py` counted about 5,340 findings in the crate when it was added to `HOT`.
+Session 3's children brought `lints/names/**`, `emit`, `print`, the top-level files and part of
+`lower/` to 0. Eight `diagnostics-hot2-*` children took the 2,316 that were left, in
+`checks/**`, `lints/syntax/**`, `lints/bodies/**` and `lower/**`. The crate is now at 0. The only
+exception is a lowering another agent is still writing, which it checks before it reports.
+
+The rule was the same everywhere. A check that finds nothing is the hot path, and it is fixed.
+Building a diagnostic is the edge, and it is justified on its line. Nothing a check gives
+changed: no diagnostic, order, span or fact, and no test expectation. What this pass took off
+the hot path:
+- **Attribute parsing** (`checks/attrs/**`). An identifier, suffix, number, char, short string
+  (23 bytes or less), list of up to 8 elements or meta token stream of up to 16 tokens is held
+  inline (`SmolStr`, `SmallVec`). A long string literal is copied once, not twice. A lint
+  attribute no longer makes a `String` per lint name.
+- **Name conflicts** (`checks/defs/conflicts.rs`). Per scope: one push per binding into a
+  reused buffer, one Fx hash and one probe of a reused `HashTable`, and a radix sort into reused
+  scratch. Once the buffers have grown to the largest scope, nothing is allocated unless there
+  is a conflict.
+- **The early lints** (`lints/syntax/early/**`). `while_true` and `ambiguous_negative_literal`
+  clone nothing. The confusables table is in the check's frame, with one copy per distinct
+  skeleton. The lexer's per-file flags are in the frame. A node is cast only after its kind
+  test.
+- **Macro definitions and derive lists** (`lower/macro_*`, `lower/malformed_derive.rs`). A
+  `macro_rules!` that rustc accepts costs one walk of its tokens with no allocation, and a
+  derive list one walk of its children.
+- **Allowed lints.** `lower/elided_lifetimes_in_path.rs` costs one bit test
+  (`Cx::lint_may_fire`) where the lint is allowed everywhere.
+
+What is left on the hot path is hir's own: the `Vec`s that `items_iter`, `use_decls` and
+`extern_crate_decls` return, and the rowan handles that `qualifier()` returns. Both go when the
+front end gives views and iterators (lanes frontend-tree and db). Two costs in error-free code
+are inside the bound but worth a profile: `checks/impls/compare.rs` matches impl items to trait
+items by linear search (O(n·m) `name` calls per impl), and `lints/bodies/types/literal.rs`
+builds a `Span` for each literal that reaches `lint_literal`, which is already the gated path.

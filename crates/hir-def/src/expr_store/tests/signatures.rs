@@ -125,6 +125,18 @@ fn ret_impl_trait() -> impl Trait {}
 }
 
 #[test]
+fn an_impl_trait_where_none_is_allowed_is_an_error() {
+    lower_and_print(
+        r"
+fn f<T = impl Trait>() {}
+",
+        expect![[r#"
+            fn f<T = {error}>() {...}
+        "#]],
+    );
+}
+
+#[test]
 fn argument_position_impl_trait_functions() {
     lower_and_print(
         r"

@@ -20,14 +20,14 @@ use crate::{
     lower::{GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode},
     method_resolution::{self, CandidateId, MethodError},
     next_solver::{
-        GenericArg, GenericArgs, TraitRef, Ty, Unnormalized, infer::traits::ObligationCause,
-        util::clauses_as_obligations,
+        GenericArg, GenericArgs, TraitRef, Ty, Unnormalized,
+        infer::traits::{Obligation, ObligationCause, ObligationCauseCode},
     },
 };
 
 use super::InferenceContext;
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     pub(super) fn infer_path(
         &mut self,
         path: Path<'_>,
@@ -169,6 +169,7 @@ impl<'db> InferenceContext<'db> {
             &mut vars_ctx,
             &self.defined_anon_consts,
             LifetimeLoweringMode::LateParam,
+            self.frame,
         );
         let mut path_ctx = if no_diagnostics {
             ctx.at_path_forget_diagnostics(path)
@@ -268,7 +269,7 @@ impl<'db> InferenceContext<'db> {
         return Some((value, self_subst));
 
         #[inline]
-        fn drop_ctx(mut ctx: TyLoweringContext<'_, '_>, no_diagnostics: bool) {
+        fn drop_ctx(mut ctx: TyLoweringContext<'_, '_, '_>, no_diagnostics: bool) {
             if no_diagnostics {
                 ctx.forget_diagnostics();
             }
@@ -284,13 +285,27 @@ impl<'db> InferenceContext<'db> {
         let interner = self.interner();
         let predicates = GenericPredicates::query_all(self.db, def);
         let param_env = self.table.param_env;
-        self.table.register_predicates(clauses_as_obligations(
+        // rustc's `add_required_obligations_with_code`: each bound's cause names it by its place
+        // in the item's predicates, its parents' first.
+        self.table.register_predicates(
             predicates
                 .iter_instantiated(interner, subst.as_slice())
-                .map(Unnormalized::skip_norm_wip),
-            ObligationCause::new(node),
-            param_env,
-        ));
+                .map(Unnormalized::skip_norm_wip)
+                .enumerate()
+                .map(|(bound_index, clause)| {
+                    let code = ObligationCauseCode::WhereClauseInExpr {
+                        item: def,
+                        bound_index: u32::try_from(bound_index).expect("2^32 bounds"),
+                        arg_index: None,
+                    };
+                    Obligation {
+                        cause: ObligationCause::with_code(node, code),
+                        param_env,
+                        predicate: clause.as_predicate(),
+                        recursion_depth: 0,
+                    }
+                }),
+        );
     }
 
     fn resolve_trait_assoc_item(
@@ -347,6 +362,7 @@ impl<'db> InferenceContext<'db> {
         }
 
         let res = self.with_method_resolution(Span::Dummy, Span::Dummy, |ctx| {
+            // clone: an interned name (a refcount); the probe takes it by value
             let (mode, name) = (method_resolution::Mode::Path, name.clone());
             if desugared {
                 ctx.probe_for_desugared_name(mode, name, ty)
@@ -357,6 +373,7 @@ impl<'db> InferenceContext<'db> {
         let (item, visible) = match res {
             Ok(res) => {
                 self.write_unstable_candidates(id, &res);
+                self.record_trait_pick(id, &res);
                 self.lint_fully_qualified_call_from_2018(id, name, ty, &res);
                 (res.item, true)
             }

@@ -666,3 +666,307 @@ error: aborting due to 1 previous error
 "##;
     assert_eq!(ui("feature-gate-deprecated_suggestion.rs", "2015", source), stderr);
 }
+
+#[test]
+fn a_reachable_item_needs_a_stability_unless_it_inherits_an_unstable_one() {
+    // tests/ui/missing/missing-stability.rs
+    let source = r##"// Checks that exported items without stability attributes cause an error
+
+#![crate_type="lib"]
+#![feature(staged_api)]
+
+#![stable(feature = "stable_test_feature", since = "1.0.0")]
+
+pub fn unmarked() {
+    //~^ ERROR function has missing stability attribute
+    ()
+}
+
+#[unstable(feature = "unstable_test_feature", issue = "none")]
+pub mod foo {
+    // #[unstable] is inherited
+    pub fn unmarked() {}
+}
+
+#[stable(feature = "stable_test_feature", since="1.0.0")]
+pub mod bar {
+    // #[stable] is not inherited
+    pub fn unmarked() {}
+    //~^ ERROR function has missing stability attribute
+}
+"##;
+    let stderr = r##"error: function has missing stability attribute
+  --> $DIR/missing-stability.rs:8:1
+   |
+LL | pub fn unmarked() {
+   | ^^^^^^^^^^^^^^^^^
+
+error: function has missing stability attribute
+  --> $DIR/missing-stability.rs:22:5
+   |
+LL |     pub fn unmarked() {}
+   |     ^^^^^^^^^^^^^^^^^
+
+error: aborting due to 2 previous errors
+
+"##;
+    assert_eq!(ui("missing-stability.rs", "2015", source), stderr);
+}
+
+#[test]
+fn an_exported_macro_needs_a_stability() {
+    // tests/ui/stability-attribute/stability-attribute-sanity-3.rs
+    let source = r##"// More checks that stability attributes are used correctly
+
+#![feature(staged_api)]
+
+#![stable(feature = "stable_test_feature", since = "1.0.0")]
+
+#[macro_export]
+macro_rules! mac { //~ ERROR macro has missing stability attribute
+    () => ()
+}
+
+fn main() { }
+"##;
+    let stderr = r##"error: macro has missing stability attribute
+  --> $DIR/stability-attribute-sanity-3.rs:8:1
+   |
+LL | macro_rules! mac {
+   | ^^^^^^^^^^^^^^^^
+
+error: aborting due to 1 previous error
+
+"##;
+    assert_eq!(ui("stability-attribute-sanity-3.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_reachable_const_fn_or_const_trait_needs_a_const_stability() {
+    // tests/ui/stability-attribute/missing-const-stability.rs
+    let source = r##"//@ compile-flags: -Znext-solver
+#![feature(staged_api)]
+#![feature(const_trait_impl, rustc_attrs, intrinsics)]
+#![stable(feature = "stable", since = "1.0.0")]
+
+#[stable(feature = "stable", since = "1.0.0")]
+pub const fn foo() {} //~ ERROR function has missing const stability attribute
+
+#[unstable(feature = "unstable", issue = "none")]
+pub const fn bar() {} // ok because function is unstable
+
+#[stable(feature = "stable", since = "1.0.0")]
+pub struct Foo;
+impl Foo {
+    #[stable(feature = "stable", since = "1.0.0")]
+    pub const fn foo() {} //~ ERROR associated function has missing const stability attribute
+
+    #[unstable(feature = "unstable", issue = "none")]
+    pub const fn bar() {} // ok because function is unstable
+}
+
+#[stable(feature = "stable", since = "1.0.0")]
+pub const trait Bar {
+//~^ ERROR trait has missing const stability attribute
+    #[stable(feature = "stable", since = "1.0.0")]
+    fn fun();
+}
+#[stable(feature = "stable", since = "1.0.0")]
+const impl Bar for Foo {
+    // ok because all users must enable `const_trait_impl`
+    fn fun() {}
+}
+
+#[stable(feature = "stable", since = "1.0.0")]
+#[rustc_intrinsic]
+pub const unsafe fn size_of_val<T>(x: *const T) -> usize { 42 }
+//~^ ERROR function has missing const stability attribute
+
+fn main() {}
+"##;
+    let stderr = r##"error: function has missing const stability attribute
+  --> $DIR/missing-const-stability.rs:7:1
+   |
+LL | pub const fn foo() {}
+   | ^^^^^^^^^^^^^^^^^^
+
+error: trait has missing const stability attribute
+  --> $DIR/missing-const-stability.rs:23:1
+   |
+LL | pub const trait Bar {
+   | ^^^^^^^^^^^^^^^^^^^
+
+error: function has missing const stability attribute
+  --> $DIR/missing-const-stability.rs:36:1
+   |
+LL | pub const unsafe fn size_of_val<T>(x: *const T) -> usize { 42 }
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error: associated function has missing const stability attribute
+  --> $DIR/missing-const-stability.rs:16:5
+   |
+LL |     pub const fn foo() {}
+   |     ^^^^^^^^^^^^^^^^^^
+
+error: aborting due to 4 previous errors
+
+"##;
+    assert_eq!(ui("missing-const-stability.rs", "2015", source), stderr);
+}
+
+#[test]
+fn the_crate_root_needs_a_stability() {
+    // tests/ui/stability-attribute/missing-stability-attr-at-top-level.rs
+    let source = r##"#![feature(staged_api)]
+//~^ ERROR module has missing stability attribute
+
+fn main() {}
+"##;
+    let stderr = r##"error: module has missing stability attribute
+  --> $DIR/missing-stability-attr-at-top-level.rs:1:1
+   |
+LL | / #![feature(staged_api)]
+...  |
+LL | | fn main() {}
+   | |____________^
+
+error: aborting due to 1 previous error
+
+"##;
+    assert_eq!(ui("missing-stability-attr-at-top-level.rs", "2015", source), stderr);
+}
+
+#[test]
+fn a_trait_its_items_and_a_trait_impl_need_a_stability_in_rustcs_order() {
+    // tests/ui/privacy/issue-113860.rs
+    let source = r##"#![feature(staged_api)]
+//~^ ERROR module has missing stability attribute
+
+pub trait Trait {
+    //~^ ERROR trait has missing stability attribute
+    const X: u32;
+    //~^ ERROR associated constant has missing stability attribute
+}
+
+impl Trait for u8 {
+    //~^ ERROR implementation has missing stability attribute
+    pub(self) const X: u32 = 3;
+    //~^ ERROR visibility qualifiers are not permitted here [E0449]
+}
+
+fn main() {}
+"##;
+    let stderr = r##"error[E0449]: visibility qualifiers are not permitted here
+  --> $DIR/issue-113860.rs:12:5
+   |
+LL |     pub(self) const X: u32 = 3;
+   |     ^^^^^^^^^ help: remove the qualifier
+   |
+   = note: trait items always share the visibility of their trait
+
+error: module has missing stability attribute
+  --> $DIR/issue-113860.rs:1:1
+   |
+LL | / #![feature(staged_api)]
+LL | |
+LL | |
+LL | | pub trait Trait {
+...  |
+LL | | fn main() {}
+   | |____________^
+
+error: trait has missing stability attribute
+  --> $DIR/issue-113860.rs:4:1
+   |
+LL | pub trait Trait {
+   | ^^^^^^^^^^^^^^^
+
+error: implementation has missing stability attribute
+  --> $DIR/issue-113860.rs:10:1
+   |
+LL | impl Trait for u8 {
+   | ^^^^^^^^^^^^^^^^^
+
+error: associated constant has missing stability attribute
+  --> $DIR/issue-113860.rs:6:5
+   |
+LL |     const X: u32;
+   |     ^^^^^^^^^^^^
+
+error: aborting due to 5 previous errors
+
+For more information about this error, try `rustc --explain E0449`.
+"##;
+    assert_eq!(ui("issue-113860.rs", "2015", source), stderr);
+}
+
+/// Not a rustc UI test: what `check_missing_stability` gives, as rustc's source has it
+/// (`visit_variant`, `lookup_stability`'s `inherit_stability`, `def_span`), of an enum with
+/// none: the enum, each variant, then a tuple or unit variant's constructor ("tuple variant",
+/// "unit variant", spanned as the variant), then its fields.
+#[test]
+fn a_variant_and_its_constructor_each_need_a_stability() {
+    let source = r##"#![feature(staged_api)]
+#![stable(feature = "a", since = "1.0.0")]
+
+pub enum E {
+    T(u8),
+    U,
+    R { x: u8 },
+}
+
+fn main() {}
+"##;
+    let stderr = r##"error: enum has missing stability attribute
+  --> $DIR/variants.rs:4:1
+   |
+LL | pub enum E {
+   | ^^^^^^^^^^
+
+error: variant has missing stability attribute
+  --> $DIR/variants.rs:5:5
+   |
+LL |     T(u8),
+   |     ^
+
+error: tuple variant has missing stability attribute
+  --> $DIR/variants.rs:5:5
+   |
+LL |     T(u8),
+   |     ^
+
+error: field has missing stability attribute
+  --> $DIR/variants.rs:5:7
+   |
+LL |     T(u8),
+   |       ^^
+
+error: variant has missing stability attribute
+  --> $DIR/variants.rs:6:5
+   |
+LL |     U,
+   |     ^
+
+error: unit variant has missing stability attribute
+  --> $DIR/variants.rs:6:5
+   |
+LL |     U,
+   |     ^
+
+error: variant has missing stability attribute
+  --> $DIR/variants.rs:7:5
+   |
+LL |     R { x: u8 },
+   |     ^
+
+error: field has missing stability attribute
+  --> $DIR/variants.rs:7:9
+   |
+LL |     R { x: u8 },
+   |         ^^^^^
+
+error: aborting due to 8 previous errors
+
+"##;
+    assert_eq!(ui("variants.rs", "2015", source), stderr);
+}

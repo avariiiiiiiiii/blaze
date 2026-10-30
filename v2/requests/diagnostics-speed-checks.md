@@ -40,6 +40,7 @@ Why: `checks/impls.rs`' `denies_explicit_impls` asks for each implemented trait'
 only to look for this one attribute. With the flag, the check is a bit test per trait.
 
 > forwarded to db (db-expand-next2, `hir-def/src/signatures.rs`) (requests, pass 20; told by tmux).
+> applied by db-expand (db-expand-sigs, 2026-10-29), the signatures.rs part, adapted in name: `TraitFlags::DENY_EXPLICIT_IMPL = 1 << 11`, set by `TraitFlags::from_attrs` from db-expand-attrs' `AttrFlags::RUSTC_DENY_EXPLICIT_IMPL` (one segment, no arguments, `cfg_attr` expanded). Tests: the reference `if` in `flags_from_attrs_as_one_if_per_flag`, and `deny_explicit_impl_is_a_trait_flag` (`signatures/alone_tests.rs`). `hir::Trait::is_deny_explicit_impl` is lane hir's (`v2/requests/db-expand.md`, "## db-expand-sigs: `AttrFlags::RUSTC_DENY_EXPLICIT_IMPL`", part B), and `denies_explicit_impls` reading it is diagnostics'.
 
 ## 4. `Cx::modules()`, made once per check (parent: `crates/blaze-diagnostics/src/cx.rs`)
 

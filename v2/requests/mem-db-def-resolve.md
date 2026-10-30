@@ -548,6 +548,7 @@ hottest call of `find_path` (two per module visited) and of method resolution's 
 filter. Delete the line. Nothing else in the file changes. Held by T4, which runs it many times.
 
 > forwarded to db (db-expand-next2) (requests, pass 18; told by tmux).
+> applied by db-expand (db-expand-paths, 2026-10-29): the `#[tracing::instrument(skip_all)]` line on `is_visible_from` deleted; nothing else changed.
 
 ## R8. `find_path`: a per-worker scratch (`find_path.rs` 45 to 143, 713 to 808; db-expand)
 
@@ -665,6 +666,7 @@ model in `mod tests` (2438 on) keeps its own fresh set: it is the reference.
 Held by T4.
 
 > forwarded to db (db-expand-next2) (requests, pass 18; told by tmux).
+> applied by db-expand (db-expand-paths, 2026-10-29): as written. `FindPathScratch` has no lifetime (`visited` and the worklists hold `salsa::Id`), `const fn new`, `Default` by hand, the `SCRATCH` thread-local taken and set back by `find_path`; all 14 `FindPathScratch<'db>`/`<'_>` uses and `impl<'db>` lose the lifetime; `find_local_import_locations` turns ids back with `ModuleIdLt::<'db>::from_id`; the three `name.clone()` are `*name`. The `mod tests` model keeps its own set. The `info_span!` in `find_path_with` is §7's (db-expand.md).
 
 ## R9. `DynMap`: a struct of typed maps (`dyn_map.rs`, db-expand; hir change in R9h)
 
@@ -877,6 +879,7 @@ The callers pass concrete keys and are unchanged. Add `dyn_map::Policy` to the i
 `child_by_source.rs` is unchanged (`DynMap::default()`, `map[keys::X].insert/get/is_empty`).
 
 > forwarded to db (db-expand-next2; R9h's hir part to db-next2) (requests, pass 18; told by tmux).
+> applied by dedyn-ide (2026-10-29): `dyn_map.rs` as typed fields from a `keys!` macro, `stdx/src/anymap.rs` deleted; R9h's generic hir bound differs, see `v2/requests/dedyn-ide.md` §2. Test `dyn_map::tests::each_key_has_its_own_map`. Not run.
 
 ## Requests to callers outside the slice
 
@@ -926,6 +929,8 @@ collector's side changes beyond your A4 and B tables.
 
 > forwarded to db (db-next2 for `crates/hir/`, db-ty-next2 for `hir-ty/src/infer.rs`) (requests, pass 18; told by tmux).
 
+> applied by db-mem-def (21:39): hir's part. `can_use_trait_methods` calls `has_trait_in_scope`; `process_all_names` takes the thread's `NAMES_IN_SCOPE` (its `thread_local!` inside the function, since an `impl` block can't hold one) and fills it through `names_in_scope_into`. The tree's signature, `f: &mut impl FnMut`, is kept (the text had `&mut dyn`). `visible_traits` and `attrs.rs:547` stay as the text says. The `infer.rs` part is db-ty-next2's. The rest of this file is applied by db-expand-names and db-expand, or deferred with R10 and T5 by Andrew's decision; R9 (and its hir part R9h) is db-expand-next2's and not applied yet.
+
 ## Budget tests
 
 Each needs H3's counting allocator. Each asserts with `blaze_alloc_count::assert_at_most(0, ..)`
@@ -933,6 +938,7 @@ and builds everything it reads (paths, the resolver, the kept buffers) outside t
 
 > forwarded to db (T1 to T3 db-expand-names-next2, T4 db-expand-next2) (requests, pass 18; told by tmux).
 > applied by db-expand-names: T1 (`nameres/tests/paths.rs`), T2 (`resolver/tests.rs`), T3 (`item_scope/tests/budgets.rs`) as written. Not run (no builds in this lane); they need H3's counting allocator in `lib.rs`.
+> applied by db-expand (db-expand-paths, 2026-10-29): T4 as written, `a_warm_find_path_allocates_nothing` at the end of `find_path.rs`'s `mod tests`, with `use blaze_alloc_count::assert_at_most;` (`Name`, `PathKind` come through `super::*`). Not run.
 
 ### T1. Every shape of path on a warm def map (`nameres/tests/paths.rs`, db-expand-names)
 
@@ -1491,6 +1497,7 @@ table builders (`sorted_table`, `by_def_table`, `by_name`, `sorted_small`) are r
 > (2) hir-def does not build yet: H1-H3, R1-R5, T1-T3 and the facts switch-over are all unbuilt.
 > R10 rewrites `item_scope.rs` and `path_resolution.rs` over them. It waits until that tree has
 > built and run once in an ix VM.
+> R10.4 (and R10.9) not applied by db-expand (db-expand-paths, 2026-10-29): `DefMapRead` (R10.1) is not in the tree (deferred above), so `&impl DefMapRead` has no trait to name. `is_visible_from_def_map`, `max` and `min` keep `&DefMap`; they move with R10.1 when it lands.
 
 ### R10.1 The view (`nameres/path_resolution.rs`)
 
@@ -1978,6 +1985,8 @@ frame, built into the owned `LocalDefMap` in `finish`. `frozen::served` builds s
 `from_settled`. A facts query that carries a scope across rounds as a memo keeps it `Settled`
 and extends a `to_building` copy. That last part goes to frontend-nameres (`nameres/facts`).
 
+> frontend-nameres (2026-10-29 21:24): the facts part of R10.3 is accepted, and it lands with R10, not before. None of its types are in the tree (no `ItemScope<S>`, `Building<'f>`, `to_building` or `DefMap::from_settled`), and R10 is deferred until hir-def has built (R10's note, 21:05). It lands with collect's H6, in the same change as R10.2/R10.6. Where it goes in `nameres/facts/`: a unit query (`unit.rs`: `local_scope`, `scc_state`) and a round's macro step (`macros.rs`) build each member scope as `ItemScope<Building<'f>>` in their own query frame and settle it into the `ModuleScope` they return. A scope carried from one round to the next (an inactive module's fact, or the previous round's row) stays `Settled` in its memo, and a query that extends it works on a `to_building` copy. Assembly (`driver.rs`) holds no building scope: per R10.10 (H6), `collect_crate` builds the map from the final round's `ModuleScope` handles through `DefMap::from_table`. `collect_block` takes and settles a `BuildingDefMap<'f>`.
+
 ### R10.4 `Visibility::is_visible_from_def_map` (`visibility.rs` 82, db-expand)
 
 ```rust
@@ -1996,6 +2005,12 @@ and extends a `to_building` copy. That last part goes to frontend-nameres (`name
 
 The callers (`resolver.rs`, `collector.rs`, `facts/unit.rs`, `path_resolution.rs`,
 `tests/paths.rs`) pass a `&DefMap` or a `&BuildingDefMap` and don't change.
+
+> not applied by db-expand (22:34): waits on R10.1. `trait DefMapRead` is not in the tree, so
+> `&impl DefMapRead` names nothing (`rg 'trait DefMapRead' crates/hir-def` finds nothing), and
+> R10.1 is deferred by Andrew's decision. Until then `is_visible_from_def_map` keeps
+> `def_map: &'db DefMap` (`visibility.rs:81`). The change is one line once R10.1 lands; tell
+> db-expand when it does.
 
 ### R10.5 Why this shape
 
@@ -2357,6 +2372,8 @@ The file's imports gain `crate::nameres::crate_local_def_map`. `file_item_tree`,
 (`TestDB`'s `RUN_ORDER`).
 
 > forwarded to frontend-nameres (frontend-nameres-next1, `nameres/tests/`, collect's) (requests, pass 19; told by tmux).
+
+> frontend-nameres (2026-10-29 21:24): accepted, deferred with R10 as db-expand-names noted above. The test fails until R10 and H6 land (each growing column costs about log2 n reallocations), and a red test in `nameres/tests/budget.rs` would hold up hir-def's first build. It goes in the change that lands R10.3's facts part and H6, as written here, and the cold path it measures is `facts::collect_crate`.
 
 ## Speed of light
 

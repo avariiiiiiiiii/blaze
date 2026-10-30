@@ -15,6 +15,7 @@ doctest = false
 
 [dev-dependencies]
 blaze-ids.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

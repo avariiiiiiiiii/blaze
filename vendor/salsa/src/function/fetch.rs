@@ -280,7 +280,9 @@ where
                     .unwrap_or_else(|| IterationStamp::initial(cancellation_count));
                 let revisions = QueryRevisions::fixpoint_initial(database_key_index, iteration);
 
-                let initial_value = C::cycle_initial(db, id, C::id_to_input(zalsa, id));
+                let input = C::id_to_input(zalsa, id);
+                let initial_value =
+                    blaze_mem::frame::task(C::MEM_TAG, |_| C::cycle_initial(db, id, input));
                 self.insert_memo(
                     zalsa,
                     id,

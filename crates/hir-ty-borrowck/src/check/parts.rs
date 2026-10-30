@@ -15,12 +15,12 @@ use hir_ty::{
     next_solver::{GenericArgKind, Ty, TyKind},
 };
 
-use super::{Checker, InitAction, PlaceRef, explain::Explanation, mutability};
+use super::{Checker, Draft, InitAction, PlaceRef, explain::Explanation, mutability};
 use crate::{
-    Applicability, BorrowckDiagnostic, Child, PartSpan, Sublevel, cfg::Location, moves::Mpi,
+    Applicability, PartSpan, Sublevel, cfg::Location, mem::FVec, moves::Mpi,
 };
 
-impl<'db> Checker<'_, '_, 'db> {
+impl<'f, 'db> Checker<'_, 'f, '_, 'db> {
     /// Where rustc's `retrieve_borrow_spans(..).args_or_use()` points for loan `id`: the head
     /// of the closure that captures what it borrows, or the borrow.
     fn loan_span(&self, id: usize) -> PartSpan {
@@ -46,7 +46,7 @@ impl<'db> Checker<'_, '_, 'db> {
     /// loan `issued`.
     pub(super) fn conflicting_borrow_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         location: crate::cfg::Location,
         place: PlaceRef<'_>,
         new: BorrowKind,
@@ -73,8 +73,8 @@ impl<'db> Checker<'_, '_, 'db> {
         let desc = self.quoted(place, "value");
         let first = match diagnostic.code {
             "E0501" => {
-                diagnostic.label(new_span, format!("{second}borrow occurs here"));
-                diagnostic.label(issued_span, format!("{container} construction occurs here"));
+                diagnostic.label(new_span, text!(self, "{second}borrow occurs here"));
+                diagnostic.label(issued_span, text!(self, "{container} construction occurs here"));
                 "first "
             }
             "E0524" => {
@@ -90,7 +90,7 @@ impl<'db> Checker<'_, '_, 'db> {
                 "first "
             }
             "E0500" => {
-                diagnostic.label(new_span, format!("{container} construction occurs here"));
+                diagnostic.label(new_span, text!(self, "{container} construction occurs here"));
                 diagnostic.label(issued_span, "borrow occurs here");
                 "first "
             }
@@ -98,7 +98,8 @@ impl<'db> Checker<'_, '_, 'db> {
                 if new_span == issued_span {
                     diagnostic.label(
                         new_span,
-                        format!(
+                        text!(
+                            self,
                             "{desc} was mutably borrowed here in the previous iteration of the loop"
                         ),
                     );
@@ -109,10 +110,10 @@ impl<'db> Checker<'_, '_, 'db> {
                 "first "
             }
             _ => {
-                diagnostic.label(new_span, format!("{} borrow occurs here", mutability(new)));
+                diagnostic.label(new_span, text!(self, "{} borrow occurs here", mutability(new)));
                 diagnostic.label(
                     issued_span,
-                    format!("{} borrow occurs here", mutability(issued_loan.kind)),
+                    text!(self, "{} borrow occurs here", mutability(issued_loan.kind)),
                 );
                 match issued_loan.kind {
                     BorrowKind::Mut { kind: MutBorrowKind::Default | MutBorrowKind::TwoPhasedBorrow } => "mutable ",
@@ -125,20 +126,20 @@ impl<'db> Checker<'_, '_, 'db> {
         match (issued_capture, new_capture) {
             (Some(issued), Some(new)) if issued == new => diagnostic.label(
                 PartSpan::At(new.1),
-                format!("borrows occur due to use of {desc} in {container}"),
+                text!(self, "borrows occur due to use of {desc} in {container}"),
             ),
             _ => {
                 if let Some((_, capture)) = issued_capture {
                     let what = self.quoted(issued_place, "value");
                     diagnostic.label(
                         PartSpan::At(capture),
-                        format!("first borrow occurs due to use of {what} in {container}"),
+                        text!(self, "first borrow occurs due to use of {what} in {container}"),
                     );
                 }
                 if let Some((_, capture)) = new_capture {
                     diagnostic.label(
                         PartSpan::At(capture),
-                        format!("second borrow occurs due to use of {desc} in {container}"),
+                        text!(self, "second borrow occurs due to use of {desc} in {container}"),
                     );
                 }
             }
@@ -149,20 +150,20 @@ impl<'db> Checker<'_, '_, 'db> {
     /// rustc's `report_use_while_mutably_borrowed` (E0503).
     pub(super) fn use_while_borrowed_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         location: crate::cfg::Location,
         id: usize,
     ) {
         let loan = &self.loans.loans[id];
         let borrowed = PlaceRef { local: loan.local, projection: self.loans.projection(id) };
         let what = self.quoted(borrowed, "value");
-        diagnostic.label(self.loan_span(id), format!("{what} is borrowed here"));
-        diagnostic.label(PartSpan::At(diagnostic.span), format!("use of borrowed {what}"));
+        diagnostic.label(self.loan_span(id), text!(self, "{what} is borrowed here"));
+        diagnostic.label(PartSpan::At(diagnostic.span), text!(self, "use of borrowed {what}"));
         if let Some((closure, capture)) = self.capture_of(loan.assigned) {
             let container = self.container(closure);
             diagnostic.label(
                 PartSpan::At(capture),
-                format!("borrow occurs due to use of {what} in {container}"),
+                text!(self, "borrow occurs due to use of {what} in {container}"),
             );
         }
         let explanation = self.explain(location, id, None);
@@ -172,21 +173,23 @@ impl<'db> Checker<'_, '_, 'db> {
     /// rustc's `report_illegal_mutation_of_borrowed` (E0506).
     pub(super) fn assign_to_borrowed_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         location: crate::cfg::Location,
         place: PlaceRef<'_>,
         id: usize,
     ) {
         let what = self.quoted(place, "value");
-        diagnostic.label(self.loan_span(id), format!("{what} is borrowed here"));
+        diagnostic.label(self.loan_span(id), text!(self, "{what} is borrowed here"));
         diagnostic.label(
             PartSpan::At(diagnostic.span),
-            format!("{what} is assigned to here but it was already borrowed"),
+            text!(self, "{what} is assigned to here but it was already borrowed"),
         );
         if let Some((closure, capture)) = self.capture_of(self.loans.loans[id].assigned) {
             let container = self.container(closure);
-            diagnostic
-                .label(PartSpan::At(capture), format!("borrow occurs due to use in {container}"));
+            diagnostic.label(
+                PartSpan::At(capture),
+                text!(self, "borrow occurs due to use in {container}"),
+            );
         }
         let explanation = self.explain(location, id, None);
         self.add_explanation(explanation, diagnostic, "", None);
@@ -195,7 +198,7 @@ impl<'db> Checker<'_, '_, 'db> {
     /// rustc's `report_move_out_while_borrowed` (E0505).
     pub(super) fn move_out_while_borrowed_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         location: crate::cfg::Location,
         place: PlaceRef<'_>,
         id: usize,
@@ -204,13 +207,16 @@ impl<'db> Checker<'_, '_, 'db> {
         let borrowed = PlaceRef { local: loan.local, projection: self.loans.projection(id) };
         let value = self.quoted(place, "value");
         let borrow = self.quoted(borrowed, "value");
-        diagnostic.label(PartSpan::At(diagnostic.span), format!("move out of {value} occurs here"));
-        diagnostic.label(self.loan_span(id), format!("borrow of {borrow} occurs here"));
+        diagnostic
+            .label(PartSpan::At(diagnostic.span), text!(self, "move out of {value} occurs here"));
+        diagnostic.label(self.loan_span(id), text!(self, "borrow of {borrow} occurs here"));
         let capture = self.capture_of(loan.assigned);
         if let Some((closure, capture)) = capture {
             let container = self.container(closure);
-            diagnostic
-                .label(PartSpan::At(capture), format!("borrow occurs due to use in {container}"));
+            diagnostic.label(
+                PartSpan::At(capture),
+                text!(self, "borrow occurs due to use in {container}"),
+            );
         }
         let explanation = self.explain(location, id, None);
         let borrow_span = capture.is_none().then_some(loan.span);
@@ -222,7 +228,7 @@ impl<'db> Checker<'_, '_, 'db> {
 
     /// The suggestion of rustc's `report_move_out_while_borrowed` to clone what the borrow
     /// `expr` borrows: of the operand of `&`, or of what an auto-borrow borrows.
-    fn suggest_cloning_borrow(&self, diagnostic: &mut BorrowckDiagnostic, expr: ExprId) {
+    fn suggest_cloning_borrow(&self, diagnostic: &mut Draft<'f>, expr: ExprId) {
         let infer = self.ctx.infer;
         if let Expr::Ref { expr: borrowed, .. } = self.ctx.store.expr(expr) {
             if let Some(ty) = infer.type_of_expr.get(borrowed) {
@@ -246,7 +252,7 @@ impl<'db> Checker<'_, '_, 'db> {
 
     /// rustc's `suggest_cloning`, without the suggestion for a value a `move` closure
     /// captures and the notes of what bounds a generic type's `Clone` needs.
-    fn suggest_cloning(&self, diagnostic: &mut BorrowckDiagnostic, ty: Ty<'db>, expr: ExprId) {
+    fn suggest_cloning(&self, diagnostic: &mut Draft<'f>, ty: Ty<'db>, expr: ExprId) {
         if self.ctx.implements_clone(ty) {
             if !self.in_move_closure() {
                 self.suggest_cloning_inner(diagnostic, ty, expr);
@@ -264,7 +270,7 @@ impl<'db> Checker<'_, '_, 'db> {
             return;
         }
         let interner = self.ctx.infcx.interner;
-        let fields_clone = crate::regions::adt_variants(db, adt).into_iter().all(|variant| {
+        let fields_clone = adt.variants(db).all(|variant| {
             db.field_types(variant).iter().all(|(_, field)| {
                 self.ctx.implements_clone(field.ty().instantiate(interner, args).skip_norm_wip())
             })
@@ -272,20 +278,20 @@ impl<'db> Checker<'_, '_, 'db> {
         if !fields_clone {
             return;
         }
-        diagnostic.children.push(Child {
-            level: Sublevel::Note,
-            message: format!("if `{def:?}` implemented `Clone`, you could clone the value"),
-            spans: vec![PartSpan::Def(adt)],
-            labels: vec![
-                (PartSpan::Def(adt), "consider implementing `Clone` for this type".to_owned()),
-                (PartSpan::At(MirSpan::ExprId(expr)), "you could clone this value".to_owned()),
+        diagnostic.child(
+            Sublevel::Note,
+            text!(self, "if `{def:?}` implemented `Clone`, you could clone the value"),
+            &[PartSpan::Def(adt)],
+            &[
+                (PartSpan::Def(adt), "consider implementing `Clone` for this type"),
+                (PartSpan::At(MirSpan::ExprId(expr)), "you could clone this value"),
             ],
-        });
+        );
     }
 
     /// rustc's `suggest_cloning_inner`, but for the field shorthand `S { x }`, which this is
     /// never asked of: the operand of a borrow is not a field of a struct expression.
-    fn suggest_cloning_inner(&self, diagnostic: &mut BorrowckDiagnostic, ty: Ty<'db>, expr: ExprId) {
+    fn suggest_cloning_inner(&self, diagnostic: &mut Draft<'f>, ty: Ty<'db>, expr: ExprId) {
         let store = self.ctx.store;
         if self.clones_a_reference(expr)
             || self.in_move_closure()
@@ -310,28 +316,28 @@ impl<'db> Checker<'_, '_, 'db> {
                 break;
             }
         }
-        let mut parts = Vec::with_capacity(2);
-        let mut suggestion = ".clone()";
+        let mut parts: FVec<'_, (PartSpan, &str)> = Vec::new_in(self.ctx.frame);
+        let mut suggestion = ".clone()"; // clone: the suggested text, not a call
         if inner != expr {
             if raw_pointer {
-                parts.push((PartSpan::Before(MirSpan::ExprId(expr)), "(".to_owned()));
-                suggestion = ").clone()";
+                parts.push((PartSpan::Before(MirSpan::ExprId(expr)), "("));
+                suggestion = ").clone()"; // clone: the suggested text, not a call
             } else {
-                parts.push((PartSpan::Head(expr, inner), String::new()));
+                parts.push((PartSpan::Head(expr, inner), ""));
             }
         }
         let end = match (inner != expr, raw_pointer) {
             (true, false) => PartSpan::Tail(expr, inner),
             _ => PartSpan::After(MirSpan::ExprId(expr)),
         };
-        parts.push((end, suggestion.to_owned()));
+        parts.push((end, suggestion));
         let message = match ty.kind() {
             TyKind::Adt(def, _) if self.is_rc_or_arc(def.def_id()) => {
                 "clone the value to increment its reference count"
             }
             _ => "consider cloning the value if the performance cost is acceptable",
         };
-        diagnostic.suggest(message, parts, Applicability::MachineApplicable, false);
+        diagnostic.suggest(message, &parts, Applicability::MachineApplicable, false);
     }
 
     /// rustc's `clone_on_reference`: `expr` is `x.clone()` of the type of `x`.
@@ -370,7 +376,7 @@ impl<'db> Checker<'_, '_, 'db> {
     /// without `mut`: E0596 and E0594.
     pub(super) fn mutability_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         place: PlaceRef<'_>,
         assign: bool,
         not_declared_mut: bool,
@@ -384,7 +390,7 @@ impl<'db> Checker<'_, '_, 'db> {
         {
             diagnostic.suggest(
                 "consider changing this to be mutable",
-                vec![(PartSpan::Before(MirSpan::BindingId(binding)), "mut ".to_owned())],
+                &[(PartSpan::Before(MirSpan::BindingId(binding)), "mut ")],
                 Applicability::MachineApplicable,
                 true,
             );
@@ -394,7 +400,7 @@ impl<'db> Checker<'_, '_, 'db> {
     /// rustc's `report_illegal_reassignment` (E0384).
     pub(super) fn reassignment_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         place: PlaceRef<'_>,
         from_argument: bool,
     ) {
@@ -403,7 +409,7 @@ impl<'db> Checker<'_, '_, 'db> {
             let name = self.quoted(place, "value");
             diagnostic.label(
                 PartSpan::At(MirSpan::BindingId(binding)),
-                format!("first assignment to {name}"),
+                text!(self, "first assignment to {name}"),
             );
         }
         if let Some(binding) = binding
@@ -412,14 +418,14 @@ impl<'db> Checker<'_, '_, 'db> {
             let at = PartSpan::Before(MirSpan::BindingId(binding));
             diagnostic.suggest(
                 "consider making this binding mutable",
-                vec![(at, "mut ".to_owned())],
+                &[(at, "mut ")],
                 Applicability::MachineApplicable,
                 true,
             );
             if !from_argument && matches!(self.ctx.scan.scrutinee_of(binding), Some(Some(_))) {
                 diagnostic.suggest(
                     "to modify the original value, take a borrow instead",
-                    vec![(at, "ref mut ".to_owned())],
+                    &[(at, "ref mut ")],
                     Applicability::MaybeIncorrect,
                     true,
                 );
@@ -436,7 +442,7 @@ impl<'db> Checker<'_, '_, 'db> {
     /// returned: `drop` is where the variable `name` is dropped.
     pub(super) fn local_does_not_live_long_enough_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         location: crate::cfg::Location,
         id: usize,
         name: &str,
@@ -446,7 +452,8 @@ impl<'db> Checker<'_, '_, 'db> {
         let capture = self.capture_of(self.loans.loans[id].assigned);
         let borrow_span = capture.map_or(self.loans.loans[id].span, |(_, it)| it);
         diagnostic.label(PartSpan::At(borrow_span), "borrowed value does not live long enough");
-        diagnostic.label(PartSpan::At(drop), format!("`{name}` dropped here while still borrowed"));
+        diagnostic
+            .label(PartSpan::At(drop), text!(self, "`{name}` dropped here while still borrowed"));
         if let Some((closure, _)) = capture {
             let within = match self.container(closure) {
                 "coroutine" => "value captured here by coroutine",
@@ -462,7 +469,7 @@ impl<'db> Checker<'_, '_, 'db> {
     /// suggestion of a `let` that holds the temporary: the note in its place.
     pub(super) fn temporary_does_not_live_long_enough_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         location: crate::cfg::Location,
         id: usize,
         drop: MirSpan,
@@ -483,7 +490,7 @@ impl<'db> Checker<'_, '_, 'db> {
     /// `place`, whose type `dropped` implements `Drop`, needs loan `id`'s place.
     pub(super) fn conflicts_with_destructor_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         location: crate::cfg::Location,
         id: usize,
         place: PlaceRef<'_>,
@@ -494,10 +501,12 @@ impl<'db> Checker<'_, '_, 'db> {
         let what = self.quoted(place, "temporary value");
         let borrowed = PlaceRef { local: loan.local, projection: self.loans.projection(id) };
         let label = match self.describe(borrowed) {
-            Some(borrowed) => format!(
+            Some(borrowed) => text!(
+                self,
                 "here, drop of {what} needs exclusive access to `{borrowed}`, because the type `{dropped:?}` implements the `Drop` trait"
             ),
-            None => format!(
+            None => text!(
+                self,
                 "here is drop of {what}; whose type `{dropped:?}` implements the `Drop` trait"
             ),
         };
@@ -517,35 +526,37 @@ impl<'db> Checker<'_, '_, 'db> {
     /// at `capture`; `returned` is where it is returned, when it is.
     pub(super) fn escaping_closure_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         closure: ExprId,
         capture: Option<MirSpan>,
         what: &str,
         returned: Option<MirSpan>,
     ) {
         let kind = self.closure_kind_name(closure);
-        diagnostic.label(PartSpan::ClosureHead(closure), format!("may outlive borrowed value {what}"));
+        diagnostic
+            .label(PartSpan::ClosureHead(closure), text!(self, "may outlive borrowed value {what}"));
         if let Some(capture) = capture {
-            diagnostic.label(PartSpan::At(capture), format!("{what} is borrowed here"));
+            diagnostic.label(PartSpan::At(capture), text!(self, "{what} is borrowed here"));
         }
         // An `async` or `gen` block takes `move` after its keyword, which no part can point at.
         if kind == "closure" {
             diagnostic.suggest(
-                format!(
+                text!(
+                    self,
                     "to force the {kind} to take ownership of {what} (and any other referenced variables), use the `move` keyword"
                 ),
-                vec![(PartSpan::Before(MirSpan::ExprId(closure)), "move ".to_owned())],
+                &[(PartSpan::Before(MirSpan::ExprId(closure)), "move ")],
                 Applicability::MachineApplicable,
                 true,
             );
         }
         if let Some(returned) = returned {
-            diagnostic.children.push(Child {
-                level: Sublevel::Note,
-                message: format!("{kind} is returned here"),
-                spans: vec![PartSpan::At(returned)],
-                labels: Vec::new(),
-            });
+            diagnostic.child(
+                Sublevel::Note,
+                text!(self, "{kind} is returned here"),
+                &[PartSpan::At(returned)],
+                &[],
+            );
         }
     }
 
@@ -555,7 +566,7 @@ impl<'db> Checker<'_, '_, 'db> {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn use_of_moved_parts(
         &self,
-        diagnostic: &mut BorrowckDiagnostic,
+        diagnostic: &mut Draft<'f>,
         location: Location,
         action: InitAction,
         used: PlaceRef<'_>,
@@ -565,7 +576,7 @@ impl<'db> Checker<'_, '_, 'db> {
         partial: bool,
     ) {
         let partially = if partial { "partially " } else { "" };
-        let mut seen: Vec<PartSpan> = Vec::new();
+        let mut seen: FVec<'_, PartSpan> = Vec::new_in(self.ctx.frame);
         let mut loop_move = false;
         for &id in moves {
             let move_out = self.moves.moves[id];
@@ -585,13 +596,13 @@ impl<'db> Checker<'_, '_, 'db> {
             if span != PartSpan::At(diagnostic.span) || in_loop {
                 let into = if closure.is_some() { " into closure" } else { "" };
                 let iteration = if in_loop { ", in previous iteration of loop" } else { "" };
-                diagnostic.label(span, format!("value {partially}moved{into} here{iteration}"));
+                diagnostic.label(span, text!(self, "value {partially}moved{into} here{iteration}"));
             }
             if !in_loop && let Some((closure, capture)) = closure {
                 let container = self.container(closure);
                 diagnostic.label(
                     PartSpan::At(capture),
-                    format!("variable {partially}moved due to use in {container}"),
+                    text!(self, "variable {partially}moved due to use in {container}"),
                 );
             }
         }
@@ -603,15 +614,17 @@ impl<'db> Checker<'_, '_, 'db> {
                 InitAction::PartialAssignment => "assignment to part",
             };
             let container = self.container(closure);
-            diagnostic
-                .label(PartSpan::At(capture), format!("{what} occurs due to use in {container}"));
+            diagnostic.label(
+                PartSpan::At(capture),
+                text!(self, "{what} occurs due to use in {container}"),
+            );
         }
         if !loop_move {
             let verb = action.past_tense();
             let partial = if partial { "partial " } else { "" };
             diagnostic.label(
                 PartSpan::At(diagnostic.span),
-                format!("value {verb} here after {partial}move"),
+                text!(self, "value {verb} here after {partial}move"),
             );
         }
         let place = PlaceRef { local: self.moves.local(path), projection: self.moves.projection(path) };
@@ -622,7 +635,7 @@ impl<'db> Checker<'_, '_, 'db> {
                 true => self.ctx.bindings.get(&place.local).copied(),
                 false => None,
             };
-            type_no_copy(diagnostic, binding, partial, &self.quoted(place, "value"), ty);
+            type_no_copy(diagnostic, binding, partial, self.quoted(place, "value"), ty);
         }
     }
 
@@ -684,16 +697,18 @@ impl<'db> Checker<'_, '_, 'db> {
 
 /// The `Copy` note of rustc's `report_use_of_moved_or_uninitialized` (E0382): at the variable
 /// when the moved place is one, else a note.
-pub(super) fn type_no_copy(
-    diagnostic: &mut BorrowckDiagnostic,
+pub(super) fn type_no_copy<'f>(
+    diagnostic: &mut Draft<'f>,
     binding: Option<hir_def::hir::BindingId>,
     partial: bool,
     place: &str,
     ty: Ty<'_>,
 ) {
     let what = if partial { "partial move" } else { "move" };
-    let text =
-        format!("{what} occurs because {place} has type `{ty:?}`, which does not implement the `Copy` trait");
+    let text = text!(
+        diagnostic,
+        "{what} occurs because {place} has type `{ty:?}`, which does not implement the `Copy` trait"
+    );
     match binding {
         Some(binding) => diagnostic.label(PartSpan::At(MirSpan::BindingId(binding)), text),
         None => diagnostic.note(text),

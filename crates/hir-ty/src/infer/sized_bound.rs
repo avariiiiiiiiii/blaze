@@ -4,13 +4,11 @@
 //! (`needs_mut`), and the traits a probe over the traits of every crate picks from instead.
 
 use base_db::all_crates;
-use either::Either;
 use hir_def::{
-    AssocItemId, FunctionId, GenericDefId, ItemContainerId, Lookup, ModuleDefId, TraitId,
-    hir::ExprId, nameres::crate_def_map, signatures::FunctionSignature,
+    FunctionId, GenericDefId, ItemContainerId, Lookup, TraitId, hir::ExprId,
+    signatures::FunctionSignature,
 };
 use hir_expand::name::Name;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{IntoKind as _, Ty as _};
 
 use crate::{
@@ -19,6 +17,7 @@ use crate::{
     infer::InferenceContext,
     method_resolution::{
         CandidateId, CandidateSource, MethodError, MethodResolutionContext, Mode, Pick,
+        TraitSet, TraitsInScope, in_crate_trait_value_items,
     },
     next_solver::{AnyImplId, Ty, TyKind},
 };
@@ -28,7 +27,7 @@ fn differs_from(pick: &Pick<'_>, other: &Pick<'_>) -> bool {
     pick.self_ty != other.self_ty || pick.item != other.item
 }
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Pushes `MethodCallIllegalSizedBound` for the call of `method`, picked as `pick` for a
     /// receiver of type `self_ty`; `bound` is whose own clauses hold the `Self: Sized` bound.
     pub(crate) fn push_illegal_sized_bound(
@@ -45,6 +44,7 @@ impl<'db> InferenceContext<'db> {
         let mut needs_mut = false;
         if let TyKind::Ref(region, t_type, mutability) = self_ty.kind() {
             let trait_type = Ty::new_ref(self.interner(), region, t_type, mutability.invert());
+            // clone: an interned name (a refcount), on the error path.
             if let Ok(new_pick) = self.lookup_probe(call_expr, receiver, name.clone(), trait_type)
                 && differs_from(pick, &new_pick)
             {
@@ -80,7 +80,7 @@ impl<'db> InferenceContext<'db> {
                     }
                     CandidateSource::Trait(_) => None,
                 })
-                .collect(),
+                .collect(), // alloc: the diagnostic's own list, on the error path
             _ => Box::default(),
         };
 
@@ -103,34 +103,24 @@ impl<'db> InferenceContext<'db> {
         self_ty: Ty<'db>,
     ) -> Result<Pick<'db>, MethodError<'db>> {
         let db = self.db;
-        // alloc: the error path's set of every trait with an item of the name.
-        let mut traits: FxHashSet<TraitId> = match self.get_traits_in_scope() {
-            Either::Left(it) => (*it).clone(),
-            Either::Right(it) => it.clone(),
-        };
-        let has_value_item = |trait_: TraitId| {
-            trait_.trait_items(db).items.iter().any(|(item_name, item)| {
-                *item_name == name
-                    && matches!(item, AssocItemId::FunctionId(_) | AssocItemId::ConstId(_))
-            })
-        };
+        let in_scope = TraitsInScope::of_resolver(db, &self.resolver);
+        // alloc: the error path's set of every trait with an item of the name, interned once.
+        let mut traits: Vec<TraitId> = in_scope.all(db).collect();
         for &krate in all_crates(db).iter() {
-            for (_, module) in crate_def_map(db, krate).modules(db) {
-                traits.extend(module.scope(db).declarations().filter_map(|def| match def {
-                    ModuleDefId::TraitId(it) if has_value_item(it) => Some(it),
-                    _ => None,
-                }));
-            }
+            // clone: an interned name (a refcount), the query's key.
+            let items = in_crate_trait_value_items(db, krate, name.clone());
+            traits.extend(items.iter().map(|&(it, _)| it));
         }
         let ctx = MethodResolutionContext {
             infcx: &self.table.infer_ctxt,
             resolver: &self.resolver,
             param_env: self.table.param_env,
-            traits_in_scope: &traits,
+            traits_in_scope: TraitsInScope::Set(TraitSet::new(&mut traits)),
             edition: self.edition,
             features: self.features,
             call_span: call_expr.into(),
             receiver_span: receiver.into(),
+            frame: self.frame,
         };
         ctx.probe_for_name(Mode::MethodCall, name, self_ty)
     }

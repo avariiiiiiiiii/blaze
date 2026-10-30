@@ -18,7 +18,7 @@ use hir_def::{
     lang_item::LangItems,
     layout::{TagEncoding, Variants},
     resolver::{HasResolver, ValueNs},
-    signatures::{EnumSignature, StaticFlags, StaticSignature, StructFlags, StructSignature},
+    signatures::{StaticFlags, StaticSignature, StructFlags, StructSignature},
 };
 use hir_expand::mod_path::path;
 use la_arena::ArenaMap;
@@ -795,6 +795,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         } else {
             memory_map.vtable = mem::take(&mut self.vtable_map);
             memory_map.vtable.shrink_to_fit();
+            memory_map.memory.shrink_to_fit();
             // alloc: the constant's map, kept with it
             MemoryMap::Complex(Box::new(memory_map))
         };
@@ -3200,7 +3201,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     ) -> Result<'db, Interval> {
         let body = super::optimize::interpreted_body(
             self.db,
-            konst.into(),
+            super::MirOwner::Body(konst.into()),
             subst.store(),
             self.param_env.store(),
         )
@@ -4068,7 +4069,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 return Ok(());
                             }
                             let bytes = this.read_memory(addr, size)?.to_vec();
-                            mm.insert(addr_usize, bytes.clone().into());
+                            mm.memory.insert(addr_usize, &bytes);
                             this.note_align(mm, addr_usize);
                             rec(this, &bytes, t, locals, mm, stack_depth_limit - 1)?;
                         }
@@ -4081,7 +4082,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 if let Some(size) = this.size_of_unsized_struct(t, meta)? {
                                     let addr = Address::from_bytes(addr)?;
                                     let b = this.read_memory(addr, size)?;
-                                    mm.insert(addr.to_usize(), b.into());
+                                    mm.memory.insert(addr.to_usize(), b);
                                     this.note_align(mm, addr.to_usize());
                                 }
                                 return Ok(());
@@ -4109,7 +4110,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                                 return Ok(());
                             }
                             let b = this.read_memory(addr, size)?;
-                            mm.insert(addr.to_usize(), b.into());
+                            mm.memory.insert(addr.to_usize(), b);
                             this.note_align(mm, addr.to_usize());
                             // Elements that take no room may be `usize::MAX` in number.
                             let plain = element_size == 0
@@ -4287,7 +4288,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
                 return Ok(());
             };
             let memory = memory.to_vec();
-            mm.insert(start, memory.clone().into());
+            mm.memory.insert(start, &memory);
             mm.note_align(start, align);
             for word in memory.chunks_exact(this.ptr_size()) {
                 let inner = from_bytes!(usize, word);
@@ -4600,9 +4601,9 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         consumed: Option<Ty<'db>>,
         then: Then,
     ) -> Result<'db, Option<StackFrame<'db>>> {
-        let mir_body = super::optimize::interpreted_closure_body(
+        let mir_body = super::optimize::interpreted_body(
             self.db,
-            closure,
+            super::MirOwner::Closure(closure),
             generic_args.store(),
             self.param_env.store(),
         )
@@ -4739,7 +4740,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
 
             let mir_body = super::optimize::interpreted_body(
                 self.db,
-                imp.into(),
+                super::MirOwner::Body(imp.into()),
                 generic_args.store(),
                 self.param_env.store(),
             )
@@ -5064,27 +5065,12 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
     }
 
     fn const_eval_discriminant(&self, variant: EnumVariantId) -> Result<'db, i128> {
-        let r = self.db.const_eval_discriminant(variant);
-        match r {
-            Ok(r) => Ok(r),
-            Err(e) => {
-                let db = self.db;
-                let loc = variant.lookup(db);
-                let edition = self.crate_id.data(self.db).edition;
-                // alloc: error path
-                let name = format!(
-                    "{}::{}",
-                    EnumSignature::of(self.db, loc.parent).name.display(db, edition),
-                    loc.parent
-                        .enum_variants(self.db)
-                        .variant_name_by_id(variant)
-                        .unwrap()
-                        .display(db, edition),
-                );
-                // alloc: error path
-                Err(MirEvalError::ConstEvalError(name, Box::new(e)))
-            }
-        }
+        self.db.const_eval_discriminant(variant).map_err(|e| {
+            let edition = self.crate_id.data(self.db).edition;
+            let name = super::lower::variant_path(self.db, variant, edition);
+            // alloc: error path
+            MirEvalError::ConstEvalError(name, Box::new(e))
+        })
     }
 
     fn drop_place(
@@ -5329,7 +5315,7 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
         {
             let body = super::optimize::interpreted_body(
                 self.db,
-                drop_impl.into(),
+                super::MirOwner::Body(drop_impl.into()),
                 drop_args.store(),
                 self.param_env.store(),
             )

@@ -22,10 +22,12 @@ use blaze_ids::radix;
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId};
 use hir_expand::{MacroCallKind, MacroDefKind, builtin::BuiltinFnLikeExpander};
+use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use syntax::{
-    AstNode, AstToken, Edition, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange,
-    ast::{self, HasLoopBody as _},
+    Edition, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _, AstToken as _, HasLoopBody as _},
 };
 
 use super::{
@@ -33,7 +35,7 @@ use super::{
     CheckCfg, Values, meta, well_known,
 };
 use crate::{
-    cx::{Cx, derive_paths},
+    cx::{Cx, derive_paths_view},
     lints::edit_distance::find_best_match_for_name,
     lower::Phase,
     model::{Applicability, Diag, MultiSpan, Span, Sublevel},
@@ -87,9 +89,12 @@ impl<'c> Set<'c> {
 impl<'c> Expected<'c> {
     fn new(check: &'c CheckCfg, cfg: &'c CfgOptions) -> Expected<'c> {
         let mut expected = Expected {
+            // alloc: setup, once per check, the expected names
             names: Vec::new(),
             index: FxHashMap::default(),
+            // alloc: setup, as above
             values: Vec::new(),
+            // alloc: setup, as above
             well_known: well_known::WELL_KNOWN.iter().map(|&(name, ..)| name).collect(),
             exhaustive_names: check.exhaustive_names(),
         };
@@ -151,21 +156,21 @@ impl<'c> Expected<'c> {
 
 /// A cfg name rustc reads, with its value: rustc's `parse_name_value`'s arguments.
 struct Check {
-    name: String,
+    name: Symbol,
     /// Written `r#name`.
     raw: bool,
     name_range: TextRange,
-    value: Option<(String, TextRange)>,
+    value: Option<(Symbol, TextRange)>,
     /// The predicate's (`name = "value"`).
     range: TextRange,
 }
 
 /// Where rustc's expansion is when it reads a cfg: `node` of `file`, itself or the node around
 /// it (`include`).
-#[derive(Clone)]
-struct Anchor {
+#[derive(Clone, Copy)]
+struct Anchor<'db> {
     file: HirFileId,
-    node: SyntaxNode,
+    node: ast::Node<'db>,
     include: bool,
 }
 
@@ -177,17 +182,23 @@ struct Origin {
     macro_help: Option<(&'static str, String)>,
 }
 
-struct Lints<'a, 'db> {
-    cx: &'a Cx<'a, 'db>,
-    walk: &'a Walk<'a>,
+struct Lints<'a, 'c, 'db> {
+    cx: &'a Cx<'c, 'db>,
+    walk: &'a Walk<'db>,
     check: &'a CheckCfg,
     expected: Expected<'a>,
     root: HirFileId,
     build_script: bool,
     emitted: Vec<Emitted>,
+    /// What of a tree is read, by index ([`Lints::tree`]): one buffer for every tree.
+    read: Vec<(u32, Read)>,
+    /// The scratch of `read`'s sort: one buffer for every tree.
+    scratch: Vec<(u32, Read)>,
+    /// The checks of one predicate: one buffer for every predicate.
+    checks: Vec<Check>,
 }
 
-pub(super) fn lints(cx: &Cx<'_, '_>, check: &CheckCfg, walk: &Walk<'_>) -> Vec<Emitted> {
+pub(super) fn lints<'db>(cx: &Cx<'_, 'db>, check: &CheckCfg, walk: &Walk<'db>) -> Vec<Emitted> {
     let mut lints = Lints {
         cx,
         walk,
@@ -198,7 +209,14 @@ pub(super) fn lints(cx: &Cx<'_, '_>, check: &CheckCfg, walk: &Walk<'_>) -> Vec<E
             .krate
             .display_name(cx.db)
             .is_some_and(|it| it.crate_name().symbol().as_str() == "build_script_build"),
+        // alloc: empty, allocates nothing
         emitted: Vec::new(),
+        // alloc: empty; then one buffer for the check
+        read: Vec::new(),
+        // alloc: as above
+        scratch: Vec::new(),
+        // alloc: as above
+        checks: Vec::new(),
     };
     for tree in &walk.trees {
         lints.tree(tree);
@@ -217,40 +235,59 @@ enum Read {
     Predicate,
 }
 
-impl Lints<'_, '_> {
-    fn tree(&mut self, tree: &Tree) {
-        let mut read: Vec<(&SyntaxNode, Read)> = Vec::new();
-        for ((node, &kind), &attrs) in tree.nodes.iter().zip(&tree.kinds).zip(&tree.attrs) {
+impl<'db> Lints<'_, '_, 'db> {
+    fn tree(&mut self, tree: &Tree<'db>) {
+        // Each node read is an index: into `nodes`, then `off`, then `replaced`.
+        let (nodes, off) = (tree.nodes.len(), tree.off.len());
+        let node = |at: u32| -> ast::Node<'db> {
+            let at = at as usize;
+            match at {
+                _ if at < nodes => tree.nodes[at],
+                _ if at < nodes + off => tree.off[at - nodes],
+                _ => tree.replaced[at - nodes - off],
+            }
+        };
+        let index = |at: usize| u32::try_from(at).expect("a tree has fewer than 2^32 nodes");
+        let mut read = std::mem::take(&mut self.read);
+        read.clear();
+        for (at, (&kind, &attrs)) in tree.kinds.iter().zip(&tree.attrs).enumerate() {
             if attrs && ast::AnyHasAttrs::can_cast(kind) {
-                read.push((node, Read::Attrs));
+                read.push((index(at), Read::Attrs));
             }
             if matches!(kind, SyntaxKind::CFG_PRED_EXPR | SyntaxKind::CFG_PRED_PAT) {
-                read.push((node, Read::Predicate));
+                read.push((index(at), Read::Predicate));
             }
         }
-        read.extend(tree.off.iter().map(|it| (it, Read::Attrs)));
-        read.extend(tree.replaced.iter().map(|it| (it, Read::Replaced)));
-        radix::sort_by_key(&mut read, |(it, _)| {
-            radix::pack_32(it.text_range().start().into(), !u32::from(it.text_range().end()))
-        });
-        for (node, what) in read {
+        read.extend((0..off).map(|at| (index(nodes + at), Read::Attrs)));
+        read.extend((0..tree.replaced.len()).map(|at| (index(nodes + off + at), Read::Replaced)));
+        radix::sort_copy_by_key_in(
+            &mut read,
+            |&(at, _)| {
+                let range = node(at).text_range();
+                radix::pack_32(range.start().into(), !u32::from(range.end()))
+            },
+            &mut self.scratch,
+        );
+        for &(at, what) in &read {
+            let node = node(at);
             match what {
                 Read::Attrs => self.attrs(tree, node, None),
                 Read::Replaced => {
-                    let invoked = ast::Item::cast(node.clone()).and_then(|it| self.invoking_meta(&it));
-                    self.attrs(tree, node, Some(invoked.as_ref()))
+                    let invoked = ast::Item::cast(node).and_then(|it| self.invoking_meta(it));
+                    self.attrs(tree, node, Some(invoked))
                 }
                 Read::Predicate => {
-                    let predicate = ast::CfgPredExpr::cast(node.clone())
+                    let predicate = ast::CfgPredExpr::cast(node)
                         .and_then(|it| it.cfg_predicate())
-                        .or_else(|| ast::CfgPredPat::cast(node.clone()).and_then(|it| it.cfg_predicate()));
+                        .or_else(|| ast::CfgPredPat::cast(node).and_then(|it| it.cfg_predicate()));
                     if let Some(predicate) = predicate {
-                        let anchor = Anchor { file: tree.file, node: node.clone(), include: false };
-                        self.predicate(tree.file, &predicate, &anchor);
+                        let anchor = Anchor { file: tree.file, node, include: false };
+                        self.predicate(tree.file, predicate, &anchor);
                     }
                 }
             }
         }
+        self.read = read;
         if let Some(call) = tree.call {
             self.cfg_select(call);
         }
@@ -258,9 +295,9 @@ impl Lints<'_, '_> {
 
     /// The `#[cfg]`s and `#[cfg_attr]`s of `owner`, outer then inner, in order, up to the first
     /// that is false; for an item an attribute macro replaces (`stop`), up to that macro's.
-    fn attrs(&mut self, tree: &Tree, owner: &SyntaxNode, stop: Option<Option<&ast::Meta>>) {
-        let Some(attrs) = ast::AnyHasAttrs::cast(owner.clone()) else { return };
-        let anchor = Anchor { file: tree.file, node: owner.clone(), include: false };
+    fn attrs(&mut self, tree: &Tree<'db>, owner: ast::Node<'db>, stop: Option<Option<ast::Meta<'db>>>) {
+        let Some(attrs) = ast::AnyHasAttrs::cast(owner) else { return };
+        let anchor = Anchor { file: tree.file, node: owner, include: false };
         for attr in ast::attrs_including_inner(&attrs) {
             let Some(meta) = attr.meta() else { continue };
             if self.meta(tree.file, meta, stop, &anchor).is_break() {
@@ -272,12 +309,12 @@ impl Lints<'_, '_> {
     fn meta(
         &mut self,
         file: HirFileId,
-        meta: ast::Meta,
-        stop: Option<Option<&ast::Meta>>,
-        anchor: &Anchor,
+        meta: ast::Meta<'db>,
+        stop: Option<Option<ast::Meta<'db>>>,
+        anchor: &Anchor<'db>,
     ) -> ControlFlow<()> {
         if let Some(stop) = stop
-            && stop.is_none_or(|it| *it == meta)
+            && stop.is_none_or(|it| it == meta)
         {
             return ControlFlow::Break(());
         }
@@ -289,16 +326,16 @@ impl Lints<'_, '_> {
             },
             ast::Meta::CfgMeta(it) => {
                 let Some(predicate) = it.cfg_predicate() else { return ControlFlow::Continue(()) };
-                self.predicate(file, &predicate, anchor);
-                match cfg.check(&CfgExpr::parse_from_ast(predicate)) == Some(false) {
+                self.predicate(file, predicate, anchor);
+                match cfg.check(&CfgExpr::parse_from_view(predicate)) == Some(false) {
                     true => ControlFlow::Break(()),
                     false => ControlFlow::Continue(()),
                 }
             }
             ast::Meta::CfgAttrMeta(it) => {
                 let Some(predicate) = it.cfg_predicate() else { return ControlFlow::Continue(()) };
-                self.predicate(file, &predicate, anchor);
-                if cfg.check(&CfgExpr::parse_from_ast(predicate)) != Some(false) {
+                self.predicate(file, predicate, anchor);
+                if cfg.check(&CfgExpr::parse_from_view(predicate)) != Some(false) {
                     for meta in it.metas() {
                         self.meta(file, meta, stop, anchor)?;
                     }
@@ -310,20 +347,21 @@ impl Lints<'_, '_> {
     }
 
     /// The attribute of `item` that invokes the attribute macro replacing it.
-    fn invoking_meta(&self, item: &ast::Item) -> Option<ast::Meta> {
+    fn invoking_meta(&self, item: ast::Item<'db>) -> Option<ast::Meta<'db>> {
         let db = self.cx.db;
-        let call = self.cx.sema.expand_attr_macro(item)?.value.file_id.macro_file()?;
+        let call = self.cx.vsema.expand_attr_macro(item)?.value.file_id.macro_file()?;
         let loc = call.loc(db);
         let MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else { return None };
-        Some(censored_attr_ids.invoc_attr().find_attr_range(db, loc.krate, *ast_id).1)
+        Some(censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1)
     }
 
-    fn predicate(&mut self, file: HirFileId, predicate: &ast::CfgPredicate, anchor: &Anchor) {
-        let mut checks = Vec::new();
+    fn predicate(&mut self, file: HirFileId, predicate: ast::CfgPredicate<'_>, anchor: &Anchor<'db>) {
+        let mut checks = std::mem::take(&mut self.checks);
         ast_checks(predicate, &mut checks);
-        for check in checks {
+        for check in checks.drain(..) {
             self.lint(file, check, anchor);
         }
+        self.checks = checks;
     }
 
     /// The arms of a `cfg_select!` that `call` is the expansion of, as rustc's
@@ -334,20 +372,21 @@ impl Lints<'_, '_> {
         if !matches!(loc.def.kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::CfgSelect)) {
             return;
         }
-        let node = loc.to_node(db);
-        let Some(tt) = ast::MacroCall::cast(node.value.clone()).and_then(|it| it.token_tree()) else { return };
-        let tokens: Vec<SyntaxToken> = tt
+        let node = loc.to_node_view(db);
+        let Some(tt) = ast::MacroCall::cast(node.value).and_then(|it| it.token_tree()) else { return };
+        let toks: Vec<meta::Tok<'_>> = tt
             .syntax()
             .descendants_with_tokens()
             .filter_map(NodeOrToken::into_token)
             .filter(|it| !it.kind().is_trivia())
+            .map(|it| meta::Tok { kind: it.kind(), text: it.text(), range: it.text_range() })
+            // alloc: once per `cfg_select!`, its tokens to parse
             .collect();
-        let Some(inner) = tokens.get(1..tokens.len().saturating_sub(1)) else { return };
-        let toks: Vec<meta::Tok<'_>> =
-            inner.iter().map(|it| meta::Tok { kind: it.kind(), text: it.text(), range: it.text_range() }).collect();
+        let Some(inner) = toks.get(1..toks.len().saturating_sub(1)) else { return };
         let anchor = Anchor { file: node.file_id, node: node.value, include: true };
+        // alloc: once per `cfg_select!`, its checks
         let mut checks = Vec::new();
-        let mut parser = meta::Parser::new(&toks, self.cx.edition);
+        let mut parser = meta::Parser::new(inner, self.cx.edition);
         while !parser.at_end() {
             while parser.eat_attr() {}
             if !parser.eat_underscore() {
@@ -365,9 +404,9 @@ impl Lints<'_, '_> {
 
     /// rustc's `parse_name_value` once the name and value are read: the lint, if the cfg is
     /// not expected.
-    fn lint(&mut self, file: HirFileId, check: Check, anchor: &Anchor) {
+    fn lint(&mut self, file: HirFileId, check: Check, anchor: &Anchor<'db>) {
         let value = check.value.as_ref().map(|(it, _)| it.as_str());
-        let mut diag = match self.expected.get(&check.name) {
+        let mut diag = match self.expected.get(check.name.as_str()) {
             Some(Some(values)) if !values.contains(value) => self.value_diag(file, &check),
             None if self.expected.exhaustive_names => self.name_diag(file, &check),
             _ => return,
@@ -391,6 +430,7 @@ impl Lints<'_, '_> {
         let origin = self.origin(file, check.name_range);
         let mut diag = Diag::lint(
             "unexpected_cfgs",
+            // alloc: the diagnostic's text, as is all of `name_diag`'s
             format!("unexpected `cfg` condition name: `{}`", meta::shown(name, edition)),
             self.span(file, check.range),
         );
@@ -409,6 +449,7 @@ impl Lints<'_, '_> {
             let between = name_span.shrink_to_hi().with_hi(u32::from(value_span.range().start()));
             diag.multipart_suggestion(
                 "there is a similar config predicate: `version(\"..\")`",
+                // alloc: the diagnostic's text
                 vec![(between, "(".to_owned()), (value_span.shrink_to_hi(), ")".to_owned())],
                 Applicability::MachineApplicable,
             );
@@ -417,10 +458,13 @@ impl Lints<'_, '_> {
             && !check.raw
         {
             diag.suggestion_verbose(
+                // clone: the diagnostic's span and text
                 name_span.clone(),
+                // alloc: the diagnostic's text
                 format!(
                     "you may have meant to use `{boolean}` (notice the capitalization). Doing so makes this predicate evaluate to `{boolean}` unconditionally"
                 ),
+                // alloc: the diagnostic's text
                 boolean.to_string(),
                 Applicability::MachineApplicable,
             );
@@ -430,10 +474,12 @@ impl Lints<'_, '_> {
             let maybe = Applicability::MaybeIncorrect;
             match expected.get(best).flatten() {
                 Some(best_values) => {
+                    // alloc: the diagnostic's list of values
                     let mut possibilities: Vec<&str> = best_values.order.iter().flatten().copied().collect();
                     possibilities.sort_unstable();
                     let expected_values = |diag: &mut Diag| {
                         if !possibilities.is_empty() {
+                            // alloc: the diagnostic's text
                             diag.help(format!("expected values for `{best}` are: {}", listed(&possibilities, |it| it)));
                         }
                     };
@@ -442,6 +488,7 @@ impl Lints<'_, '_> {
                             let both = name_span.to(value_span);
                             if best_values.contains(Some(*value)) {
                                 diag.suggestion(
+                                    // clone: the diagnostic's span
                                     name_span.clone(),
                                     "there is a config with a similar name and value",
                                     shown,
@@ -452,6 +499,7 @@ impl Lints<'_, '_> {
                             } else {
                                 expected_values(&mut diag);
                                 let code = match possibilities.first() {
+                                    // alloc: the diagnostic's text
                                     Some(first) => format!("{shown} = \"{first}\""),
                                     None => shown.into_owned(),
                                 };
@@ -460,16 +508,19 @@ impl Lints<'_, '_> {
                         }
                         None => {
                             expected_values(&mut diag);
+                            // clone: the diagnostic's span
                             diag.suggestion(name_span.clone(), "there is a config with a similar name", shown, maybe);
                         }
                     }
                 }
                 None => {
+                    // clone: the diagnostic's span
                     diag.suggestion(name_span.clone(), "there is a config with a similar name", shown, maybe);
                 }
             }
         } else {
             let mut similar: Vec<&str> = match value {
+                // alloc: empty, allocates nothing
                 Some(_) => Vec::new(),
                 None => expected
                     .names
@@ -477,20 +528,24 @@ impl Lints<'_, '_> {
                     .zip(&expected.values)
                     .filter(|(_, values)| values.as_ref().is_some_and(|it| it.contains(Some(name))))
                     .map(|(it, _)| *it)
+                    // alloc: the diagnostic's list of names
                     .collect(),
             };
             if !similar.is_empty() && similar.len() <= 3 {
                 similar.sort_unstable();
                 for it in similar {
                     diag.suggestion(
+                        // clone: the diagnostic's span and text
                         name_span.clone(),
                         "found config with similar value",
+                        // alloc: the diagnostic's text
                         format!("{it} = \"{name}\""),
                         Applicability::MaybeIncorrect,
                     );
                 }
             }
             let mut names: Vec<&str> =
+                // alloc: the diagnostic's list of names
                 expected.names.iter().copied().filter(|it| !expected.well_known.contains(it)).collect();
             names.sort_unstable();
             let shown = names.len().min(MAX_SHOWN);
@@ -498,10 +553,13 @@ impl Lints<'_, '_> {
             names.truncate(shown);
             if !names.is_empty() {
                 let more = match and_more {
+                    // alloc: empty, allocates nothing
                     0 => String::new(),
+                    // alloc: the diagnostic's text
                     n => format!(" and {n} more"),
                 };
                 let listed = listed(&names, |it| meta::shown(it, edition));
+                // alloc: the diagnostic's text
                 diag.sub(Sublevel::Help, format!("expected names are: {listed}{more}"), MultiSpan::default(), true);
             }
         }
@@ -515,6 +573,7 @@ impl Lints<'_, '_> {
             diag.note(CARGO_NOTE);
         } else {
             self.macro_help(&mut diag, &origin);
+            // alloc: the diagnostic's text
             diag.help(format!("to expect this configuration use `--check-cfg={}`", arg(false)));
             diag.note(RUSTC_NOTE);
         }
@@ -530,12 +589,15 @@ impl Lints<'_, '_> {
         let value = check.value.as_ref().map(|(it, range)| (it.as_str(), self.span(file, *range)));
         let origin = self.origin(file, check.name_range);
         let message = match &value {
+            // alloc: the diagnostic's text, as is all of `value_diag`'s
             Some((value, _)) => format!("unexpected `cfg` condition value: `{value}`"),
+            // alloc: as above
             None => "unexpected `cfg` condition value: (none)".to_owned(),
         };
         let mut diag = Diag::lint("unexpected_cfgs", message, self.span(file, check.range));
         let Some(Some(values)) = expected.get(name) else { return diag };
         let have_none = values.contains(None);
+        // alloc: the diagnostic's list of values
         let possibilities: Vec<&str> = values.order.iter().flatten().copied().collect();
         let is_well_known = expected.well_known.contains(name);
         let maybe = Applicability::MaybeIncorrect;
@@ -546,10 +608,12 @@ impl Lints<'_, '_> {
                     .iter()
                     .map(|&(it, ..)| it)
                     .filter(|it| expected.has_value(it, Some(*value)))
+                    // alloc: the diagnostic's list of names
                     .collect();
                 names.sort_unstable();
                 names
             }
+            // alloc: empty, allocates nothing
             _ => Vec::new(),
         };
         if let Some((value, _)) = &value
@@ -557,13 +621,16 @@ impl Lints<'_, '_> {
         {
             for it in valid_names.into_iter().take(3) {
                 diag.suggestion_verbose(
+                    // clone: the diagnostic's span
                     name_span.clone(),
+                    // alloc: the diagnostic's text
                     format!("`{value}` is an expected value for `{it}`"),
                     it,
                     maybe,
                 );
             }
         } else if !possibilities.is_empty() {
+            // clone: the diagnostic's list of values, sorted
             let mut sorted = possibilities.clone();
             sorted.sort_unstable();
             let shown = sorted.len().min(MAX_SHOWN);
@@ -571,16 +638,21 @@ impl Lints<'_, '_> {
             sorted.truncate(shown);
             let none = if have_none { "(none), " } else { "" };
             let more = match and_more {
+                // alloc: empty, allocates nothing
                 0 => String::new(),
+                // alloc: the diagnostic's text
                 n => format!(" and {n} more"),
             };
+            // alloc: the diagnostic's text
             diag.note(format!("expected values for `{name}` are: {none}{}{more}", listed(&sorted, |it| it)));
             match &value {
                 Some((value, value_span)) => {
                     if let Some(best) = find_best_match_for_name(&possibilities, value, None) {
                         diag.suggestion(
+                            // clone: the diagnostic's span
                             value_span.clone(),
                             "there is a expected value with a similar name",
+                            // alloc: the diagnostic's text
                             format!("\"{best}\""),
                             maybe,
                         );
@@ -588,6 +660,7 @@ impl Lints<'_, '_> {
                 }
                 None => {
                     if let [only] = possibilities[..] {
+                        // alloc: the diagnostic's text
                         diag.suggestion(name_span.shrink_to_hi(), "specify a config value", format!(" = \"{only}\""), maybe);
                     }
                 }
@@ -596,13 +669,16 @@ impl Lints<'_, '_> {
             if let Some((_, value_span)) = &value {
                 diag.suggestion(name_span.shrink_to_hi().to(value_span), "remove the value", "", maybe);
             }
+            // alloc: the diagnostic's text
             diag.note(format!("no expected value for `{name}`"));
         } else {
             let span = match &value {
                 Some((_, value_span)) => name_span.to(value_span),
+                // clone: the diagnostic's span
                 None => name_span.clone(),
             };
             diag.suggestion(span, "remove the condition", "", maybe);
+            // alloc: the diagnostic's text
             diag.note(format!("no expected values for `{name}`"));
         }
 
@@ -611,6 +687,7 @@ impl Lints<'_, '_> {
         if self.check.cargo {
             if name == "feature" && !origin.external {
                 match &value {
+                    // alloc: the diagnostic's text
                     Some((value, _)) => diag.help(format!("consider adding `{value}` as a feature in `Cargo.toml`")),
                     None => diag.help("consider defining some features in `Cargo.toml`"),
                 };
@@ -621,6 +698,7 @@ impl Lints<'_, '_> {
             diag.note(CARGO_NOTE);
         } else {
             if can_add_value {
+                // alloc: the diagnostic's text
                 diag.help(format!("to expect this configuration use `--check-cfg={}`", arg(false)));
             }
             self.macro_help(&mut diag, &origin);
@@ -633,10 +711,12 @@ impl Lints<'_, '_> {
     fn cargo_help(&self, diag: &mut Diag, arg: &impl Fn(bool) -> String) {
         let unescaped = arg(false);
         diag.help("consider using a Cargo feature instead");
+        // alloc: the diagnostic's text, as is all of `cargo_help`'s and `macro_help`'s
         diag.help(format!(
             "or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:\n [lints.rust]\n unexpected_cfgs = {{ level = \"warn\", check-cfg = ['{unescaped}'] }}"
         ));
         if !self.build_script {
+            // alloc: as above
             diag.help(format!(
                 "or consider adding `println!(\"cargo::rustc-check-cfg={}\");` to the top of the `build.rs`",
                 arg(true)
@@ -647,9 +727,11 @@ impl Lints<'_, '_> {
     /// rustc's `rustc_macro_help` and `cargo_macro_help`, which say the same.
     fn macro_help(&self, diag: &mut Diag, origin: &Origin) {
         if let Some((kind, path)) = &origin.macro_help {
+            // alloc: as above
             diag.note(format!(
                 "using a cfg inside a {kind} will use the cfgs from the destination crate and not the ones from the defining crate"
             ));
+            // alloc: as above
             diag.help(format!("try referring to `{path}` crate for guidance on how handle this unexpected cfg"));
         }
     }
@@ -691,16 +773,17 @@ impl Lints<'_, '_> {
     fn macro_path(&self, call: MacroCallId) -> Option<String> {
         let db = self.cx.db;
         let loc = call.loc(db);
-        let node = loc.to_node(db).value;
-        let path = |it: ast::Path| -> String { it.syntax().text().to_string().split_whitespace().collect() };
+        let node = loc.to_node_view(db).value;
+        // alloc: the diagnostic's text, a macro's path
+        let path = |it: ast::Path<'_>| -> String { it.syntax().text().split_whitespace().collect() };
         match &loc.kind {
             MacroCallKind::FnLike { .. } => ast::MacroCall::cast(node)?.path().map(path),
             MacroCallKind::Derive { derive_index, .. } => {
                 let attr = ast::Attr::cast(node)?;
-                derive_paths(&attr).into_iter().nth(*derive_index as usize).map(|(_, it)| it)
+                derive_paths_view(attr).into_iter().nth(*derive_index as usize).map(|(_, it)| it)
             }
             MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
-                censored_attr_ids.invoc_attr().find_attr_range(db, loc.krate, *ast_id).1.path().map(path)
+                censored_attr_ids.invoc_attr().find_attr_range_view(db, loc.krate, *ast_id).1.path().map(path)
             }
         }
     }
@@ -708,21 +791,21 @@ impl Lints<'_, '_> {
     /// The node the lint of a cfg read at `anchor` is buffered for: the nearest that has an id
     /// when rustc reads it, through the macro call an expansion came from and the `mod` item a
     /// file is the module of.
-    fn at(&self, anchor: &Anchor) -> InFile<SyntaxNodePtr> {
+    fn at(&self, anchor: &Anchor<'db>) -> InFile<SyntaxNodePtr> {
         let cx = self.cx;
-        let (mut file, mut node, mut include) = (anchor.file, anchor.node.clone(), anchor.include);
+        let Anchor { mut file, mut node, mut include } = *anchor;
         loop {
-            let start = if include { Some(node.clone()) } else { node.parent() };
-            let mut top = node.clone();
+            let start = if include { Some(node) } else { node.parent() };
+            let mut top = node;
             for it in std::iter::successors(start, |it| it.parent()) {
-                if has_lint_id(&it) {
-                    return InFile::new(file, SyntaxNodePtr::new(&it));
+                if has_lint_id(it) {
+                    return InFile::new(file, ast::ptr(it));
                 }
                 top = it;
             }
             if let Some(call) = file.macro_file() {
                 let loc = call.loc(cx.db);
-                let called = loc.to_node(cx.db);
+                let called = loc.to_node_view(cx.db);
                 include = !matches!(loc.kind, MacroCallKind::Attr { .. });
                 (file, node) = (called.file_id, called.value);
                 continue;
@@ -730,13 +813,13 @@ impl Lints<'_, '_> {
             let declared = match file == self.root {
                 true => None,
                 false => cx
-                    .sema
+                    .vsema
                     .hir_file_to_module_defs(file)
                     .find(|it| it.krate(cx.db) == cx.krate)
-                    .and_then(|it| it.declaration_source(cx.db)),
+                    .and_then(|it| it.declaration_source_view(cx.db)),
             };
-            let Some(declared) = declared else { return InFile::new(file, SyntaxNodePtr::new(&top)) };
-            (file, node, include) = (declared.file_id, declared.value.syntax().clone(), false);
+            let Some(declared) = declared else { return InFile::new(file, ast::ptr(top)) };
+            (file, node, include) = (declared.file_id, declared.value.syntax(), false);
         }
     }
 }
@@ -748,24 +831,34 @@ const CARGO_NOTE: &str = "see <https://doc.rust-lang.org/nightly/rustc/check-cfg
 fn check_cfg_arg(name: &str, value: Option<&str>, quotes: bool) -> String {
     match value {
         Some(value) => {
+            // alloc: the diagnostic's text, as is all of `check_cfg_arg`'s
             let value = value.escape_debug().to_string();
             let values = match quotes {
+                // alloc: as above
                 true => format!("\\\"{}\\\"", value.replace('"', "\\\\\\\\\"")),
+                // alloc: as above
                 false => format!("\"{value}\""),
             };
+            // alloc: as above
             format!("cfg({name}, values({values}))")
         }
+        // alloc: as above
         None => format!("cfg({name})"),
     }
 }
 
 /// rustc's `DiagSymbolList`: each in backticks, joined by `and` (with commas from three).
 fn listed<'s, S: std::fmt::Display>(items: &[&'s str], show: impl Fn(&'s str) -> S) -> String {
+    // alloc: the diagnostic's text, as is all of `listed`'s
     let items: Vec<String> = items.iter().map(|&it| format!("`{}`", show(it))).collect();
     match items.as_slice() {
+        // alloc: empty, allocates nothing
         [] => String::new(),
+        // clone: as above
         [one] => one.clone(),
+        // alloc: as above
         [a, b] => format!("{a} and {b}"),
+        // alloc: as above
         [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
     }
 }
@@ -774,7 +867,7 @@ fn listed<'s, S: std::fmt::Display>(items: &[&'s str], show: impl Fn(&'s str) ->
 /// item, a statement with a `;`, an expression, a pattern, a type and the other nodes
 /// `assign_id!` numbers; not a macro call, nor a block that is not an expression (a function's
 /// body, a loop's, the `then` of an `if`, the `else` of a `let`).
-fn has_lint_id(node: &SyntaxNode) -> bool {
+fn has_lint_id(node: ast::Node<'_>) -> bool {
     use SyntaxKind::*;
     let kind = node.kind();
     match kind {
@@ -782,13 +875,13 @@ fn has_lint_id(node: &SyntaxNode) -> bool {
         BLOCK_EXPR => !bare_block(node),
         VARIANT | WHERE_PRED | RECORD_FIELD | TUPLE_FIELD | RECORD_PAT_FIELD | RECORD_EXPR_FIELD | PARAM | SELF_PARAM
         | TYPE_PARAM | LIFETIME_PARAM | CONST_PARAM | MATCH_ARM | LET_STMT => true,
-        EXPR_STMT => ast::ExprStmt::cast(node.clone()).is_some_and(|it| it.semicolon_token().is_some()),
+        EXPR_STMT => ast::ExprStmt::cast(node).is_some_and(|it| it.semicolon_token().is_some()),
         _ => ast::Item::can_cast(kind) || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind) || ast::Type::can_cast(kind),
     }
 }
 
 /// Whether the block `node` is one rustc's AST has as a block, not as an expression.
-fn bare_block(node: &SyntaxNode) -> bool {
+fn bare_block(node: ast::Node<'_>) -> bool {
     let Some(parent) = node.parent() else { return false };
     let body = match parent.kind() {
         SyntaxKind::FN | SyntaxKind::LET_ELSE => return true,
@@ -804,7 +897,7 @@ fn bare_block(node: &SyntaxNode) -> bool {
 /// rustc's `parse_cfg_entry` of a predicate as the AST has it: each name it checks, in order.
 /// What rustc refuses (`not` of other than one, a list it does not know, a value that is no
 /// string) checks nothing in it.
-fn ast_checks(predicate: &ast::CfgPredicate, out: &mut Vec<Check>) {
+fn ast_checks(predicate: ast::CfgPredicate<'_>, out: &mut Vec<Check>) {
     match predicate {
         ast::CfgPredicate::CfgAtom(atom) => {
             if let Some(check) = atom_check(atom, None) {
@@ -814,11 +907,11 @@ fn ast_checks(predicate: &ast::CfgPredicate, out: &mut Vec<Check>) {
         ast::CfgPredicate::CfgComposite(composite) => {
             let Some(keyword) = composite.keyword() else { return };
             match keyword.text() {
-                "any" | "all" => composite.cfg_predicates().for_each(|it| ast_checks(&it, out)),
+                "any" | "all" => composite.cfg_predicates().for_each(|it| ast_checks(it, out)),
                 "not" => {
                     let mut predicates = composite.cfg_predicates();
                     if let (Some(only), None) = (predicates.next(), predicates.next()) {
-                        ast_checks(&only, out);
+                        ast_checks(only, out);
                     }
                 }
                 "target" => {
@@ -832,7 +925,7 @@ fn ast_checks(predicate: &ast::CfgPredicate, out: &mut Vec<Check>) {
                         {
                             return;
                         }
-                        if let Some(check) = atom_check(&atom, Some("target_")) {
+                        if let Some(check) = atom_check(atom, Some("target_")) {
                             out.push(check);
                         }
                     }
@@ -845,7 +938,7 @@ fn ast_checks(predicate: &ast::CfgPredicate, out: &mut Vec<Check>) {
 
 /// The check of `name` or `name = "value"`, its name prefixed in `target(..)`, where the
 /// whole is the name's span too.
-fn atom_check(atom: &ast::CfgAtom, prefix: Option<&str>) -> Option<Check> {
+fn atom_check(atom: ast::CfgAtom<'_>, prefix: Option<&str>) -> Option<Check> {
     let ident = atom.ident_token()?;
     let text = ident.text();
     let (name, raw) = match text.strip_prefix("r#") {
@@ -859,15 +952,23 @@ fn atom_check(atom: &ast::CfgAtom, prefix: Option<&str>) -> Option<Check> {
         None => None,
         Some(_) => {
             let token = atom.string_token()?;
-            let value = ast::String::cast(token.clone())?.value().ok()?.into_owned();
+            let value = Symbol::intern(&ast::String::cast(token)?.value().ok()?);
             Some((value, token.text_range()))
         }
     };
     let range = atom.syntax().text_range();
     Some(match prefix {
-        Some(prefix) => Check { name: format!("{prefix}{name}"), raw, name_range: range, value, range },
-        None => Check { name: name.to_owned(), raw, name_range: ident.text_range(), value, range },
+        Some(prefix) => Check { name: prefixed(prefix, name), raw, name_range: range, value, range },
+        None => Check { name: Symbol::intern(name), raw, name_range: ident.text_range(), value, range },
     })
+}
+
+/// `prefix` then `name`, interned: joined on the stack for a name of up to 64 bytes.
+fn prefixed(prefix: &str, name: &str) -> Symbol {
+    let mut text: SmallVec<[u8; 64]> = SmallVec::new();
+    text.extend_from_slice(prefix.as_bytes());
+    text.extend_from_slice(name.as_bytes());
+    Symbol::intern(std::str::from_utf8(&text).expect("two names joined"))
 }
 
 /// rustc's `parse_cfg_entry` of a predicate it parsed from tokens (`cfg_select!`'s).
@@ -890,10 +991,10 @@ fn meta_checks(inner: &meta::Inner<'_>, out: &mut Vec<Check>) {
                     }
                     let Some(value) = lit.value_str() else { continue };
                     out.push(Check {
-                        name: format!("target_{}", ident.name),
+                        name: prefixed("target_", ident.name),
                         raw: ident.raw,
                         name_range: sub.range(),
-                        value: Some((value.into_owned(), lit.range)),
+                        value: Some((Symbol::intern(&value), lit.range)),
                         range: sub.range(),
                     });
                 }
@@ -904,13 +1005,13 @@ fn meta_checks(inner: &meta::Inner<'_>, out: &mut Vec<Check>) {
             let Some(ident) = item.ident().filter(|it| !meta::is_path_segment_keyword(it.name)) else { return };
             let value = match &item.kind {
                 meta::Kind::NameValue(lit) => match lit.value_str() {
-                    Some(value) => Some((value.into_owned(), lit.range)),
+                    Some(value) => Some((Symbol::intern(&value), lit.range)),
                     None => return,
                 },
                 _ => None,
             };
             out.push(Check {
-                name: ident.name.to_owned(),
+                name: Symbol::intern(ident.name),
                 raw: ident.raw,
                 name_range: item.path_range(),
                 value,
@@ -931,6 +1032,49 @@ mod tests {
         assert_eq!(check_cfg_arg("foo", Some("bar"), true), r#"cfg(foo, values(\"bar\"))"#);
         assert_eq!(check_cfg_arg("quote", Some("quote\""), false), r#"cfg(quote, values("quote\""))"#);
         assert_eq!(check_cfg_arg("quote", Some("quote\""), true), r#"cfg(quote, values(\"quote\\\\\"\"))"#);
+    }
+
+    /// Reading the cfgs of a tree again allocates nothing: the read list, its sort's scratch and
+    /// the checks' buffer are kept, the views are `Copy`, and an expected cfg makes no text.
+    #[test]
+    fn reading_a_trees_cfgs_again_allocates_nothing() {
+        use std::fmt::Write as _;
+
+        for fns in [4, 400] {
+            let mut fixture = String::from("//- /lib.rs crate:main edition:2021\n#![cfg_attr(foo, allow(unused))]\n");
+            for at in 0..fns {
+                writeln!(fixture, "#[cfg_attr(foo, inline)]\n#[cfg(foo)]\npub fn f_{at}() {{}}\npub fn g_{at}(x: u32) -> u32 {{ x }}")
+                    .unwrap();
+            }
+            let checked = crate::tests::checked(&fixture);
+            let db = &checked.db;
+            hir::attach_db(db, || {
+                let sema = hir::Semantics::new(db);
+                let krate = hir::check::workspace_crates(db)[0];
+                let frame = crate::tests::frame();
+                let cx = Cx::new(&sema, krate, checked.files(), &frame);
+                let walk = cx.walk();
+                let mut check = CheckCfg::default();
+                check.add("cfg(foo)").unwrap();
+                let mut lints = Lints {
+                    cx: &cx,
+                    walk,
+                    check: &check,
+                    expected: Expected::new(&check, walk.cfg),
+                    root: cx.krate.root_module(cx.db).definition_source_file_id(cx.db),
+                    build_script: false,
+                    emitted: Vec::new(),
+                    read: Vec::new(),
+                    scratch: Vec::new(),
+                    checks: Vec::new(),
+                };
+                let tree = walk.files().next().unwrap();
+                lints.tree(tree);
+                assert!(lints.read.len() > fns, "{} read at {fns} functions", lints.read.len());
+                blaze_alloc_count::assert_at_most(0, "reading a tree's cfgs again", || lints.tree(tree));
+                assert!(lints.emitted.is_empty(), "an expected cfg is not linted");
+            });
+        }
     }
 
     #[test]

@@ -297,13 +297,20 @@ impl<C: Channels> Client<C> {
                 other => self.connect_failed(at, &format!("a connect completed as {other:?}"), &mut answers),
             },
             Role::Send(at) => match done {
-                Done::Sent => {
+                Done::Sent(spare) => {
                     if let Link::Up(up) = &mut self.links[at] {
                         up.sending = None;
+                        // The buffer sent is the next staged one, its room kept.
+                        if up.staged.capacity() == 0 {
+                            up.staged = spare;
+                        }
                     }
                     self.pump_all(&mut answers, effects);
                 }
-                Done::Failed(error) => self.drop_link(at, &format!("sending failed: {error}"), &mut answers, effects),
+                Done::Broken { error, .. } | Done::Failed(error) => {
+                    // alloc: an error path.
+                    self.drop_link(at, &format!("sending failed: {error}"), &mut answers, effects)
+                }
                 other => self.drop_link(at, &format!("a send completed as {other:?}"), &mut answers, effects),
             },
             Role::Recv(at) => {
@@ -319,7 +326,8 @@ impl<C: Channels> Client<C> {
                         Ok(false) => self.drop_link(at, "the server closed the connection", &mut answers, effects),
                         Err(why) => self.drop_link(at, &why, &mut answers, effects),
                     },
-                    Done::Failed(error) => {
+                    Done::Broken { error, .. } | Done::Failed(error) => {
+                        // alloc: an error path.
                         self.drop_link(at, &format!("receiving failed: {error}"), &mut answers, effects)
                     }
                     other => self.drop_link(at, &format!("a receive completed as {other:?}"), &mut answers, effects),
@@ -555,7 +563,9 @@ impl<C: Channels> Client<C> {
                 Ok(Some(head)) => (head.head + head.body).saturating_sub(up.plain.len()),
                 _ => 0,
             };
-            effects.push(Effect::Recv { conn: up.conn, most: owed.clamp(RECV_LEAST, RECV_MOST), tag });
+            let most = owed.clamp(RECV_LEAST, RECV_MOST);
+            // alloc: none here; the driver reserves the room the bytes come into.
+            effects.push(Effect::Recv { conn: up.conn, most, into: Vec::new(), tag });
         }
         Ok(())
     }

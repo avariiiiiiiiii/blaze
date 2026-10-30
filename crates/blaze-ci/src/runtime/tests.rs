@@ -277,6 +277,8 @@ fn a_workers_warm_reads_allocate_only_what_each_response_owns() {
         outcome: TestOutcome::Passed,
         output: b"ok\n".to_vec(),
         millis: 3,
+        outside: false,
+        executable: 0,
     };
     incoming.push(&frames::encode(&Envelope::new(40, Response::TestResult(result.clone()))).unwrap());
     let mut kept = None;

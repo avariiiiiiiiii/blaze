@@ -21,6 +21,8 @@ mod unit;
 mod tests;
 
 use base_db::{Db, Crate};
+use blaze_mem::Frame;
+use rustc_hash::FxBuildHasher;
 
 use crate::{
     ModuleId,
@@ -28,20 +30,39 @@ use crate::{
     nameres::{DefMap, LocalDefMap, ModuleData},
 };
 
-/// The crate's def map with every scope handed over (`ScopeSlot::Collected`), diagnostics
-/// grouped: what `crate_local_def_map` wraps in a `DefMapPair`. Runs inside that query only.
-pub(super) fn collect_crate(db: &Db, krate: Crate) -> (DefMap, LocalDefMap) {
-    driver::collect_crate(db, krate)
+/// What a query keeps while it runs, in the frame its `frame::task` opened: all of it goes when
+/// the query returns, and what it returns is built from it at its exact size.
+pub(crate) type FrameVec<'f, T> = Vec<T, &'f Frame>;
+
+pub(crate) type FrameMap<'f, K, V> = hashbrown::HashMap<K, V, FxBuildHasher, &'f Frame>;
+
+pub(crate) fn map_in<'f, K, V>(frame: &'f Frame) -> FrameMap<'f, K, V> {
+    hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame)
 }
 
-/// A block's def map from the empty one `block_def_map` makes, scopes handed over.
+pub(crate) type FrameSet<'f, K> = hashbrown::HashSet<K, FxBuildHasher, &'f Frame>;
+
+pub(crate) fn set_in<'f, K>(frame: &'f Frame) -> FrameSet<'f, K> {
+    hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame)
+}
+
+/// The crate's def map with every scope handed over (`ScopeSlot::Collected`), diagnostics
+/// grouped: what `crate_local_def_map` wraps in a `DefMapPair`. Runs inside that query only, in
+/// its frame.
+pub(super) fn collect_crate(db: &Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap) {
+    driver::collect_crate(db, frame, krate)
+}
+
+/// A block's def map from the empty one `block_def_map` makes, scopes handed over. Runs inside
+/// that query only, in its frame.
 pub(super) fn collect_block(
     db: &Db,
+    frame: &Frame,
     def_map: DefMap,
     tree_id: TreeId,
     crate_local_def_map: &LocalDefMap,
 ) -> DefMap {
-    driver::collect_block(db, def_map, tree_id, crate_local_def_map)
+    driver::collect_block(db, frame, def_map, tree_id, crate_local_def_map)
 }
 
 /// The `ModuleScope` (as `salsa::Id`) of a `ScopeSlot::Fact(scope)`.

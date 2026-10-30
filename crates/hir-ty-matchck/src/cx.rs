@@ -106,6 +106,8 @@ pub(crate) struct Cx<'a, 'db> {
     pub(crate) pointer_bits: u64,
     pub(crate) exhaustive_patterns: bool,
     pub(crate) deref_patterns: bool,
+    /// An uninhabited witness is printed `!`, not `_`.
+    pub(crate) never_patterns: bool,
     /// Whether a deref pattern was lowered in the match being checked.
     pub(crate) has_deref_pat: Cell<bool>,
     /// What the analysis running now linted.

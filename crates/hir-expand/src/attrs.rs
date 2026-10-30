@@ -18,19 +18,22 @@ use std::{borrow::Cow, cell::OnceCell, convert::Infallible, fmt, ops::ControlFlo
 
 use ::tt::TextRange;
 use base_db::{Db, Crate};
+use blaze_mem::{Tag, frame};
 use cfg::{CfgExpr, CfgOptions};
 use either::Either;
 use itertools::Itertools;
 use mbe::{DelimiterKind, Punct};
 use smallvec::SmallVec;
 use span::{RealSpanMap, Span, SyntaxContext};
-use syntax::{AstNode, SmolStr, ast, unescape, view};
+use syntax::{
+    AstNode, SmolStr, ast, unescape,
+    view::{self, AstNode as _},
+};
 use syntax_bridge::DocCommentDesugarMode;
 
 use crate::{
     AstId,
     mod_path::ModPath,
-    span_map::SpanMap,
     tt::{self, TopSubtree},
 };
 
@@ -87,8 +90,51 @@ impl AstPathExt for Option<ast::Path> {
     }
 }
 
+impl AstPathExt for view::Path<'_> {
+    fn is1(&self, segment: &str) -> bool {
+        with_one_segment_view(self, |it| it == segment).unwrap_or(false)
+    }
+
+    fn as_one_segment(&self) -> Option<SmolStr> {
+        with_one_segment_view(self, |it| SmolStr::new(it))
+    }
+
+    fn as_up_to_two_segment(&self) -> Option<(SmolStr, Option<SmolStr>)> {
+        let parent = self.qualifier().as_one_segment();
+        let this = self.segment()?.name_ref()?.text().trim_start_matches("r#").into();
+        if let Some(parent) = parent { Some((parent, Some(this))) } else { Some((this, None)) }
+    }
+}
+
+impl AstPathExt for Option<view::Path<'_>> {
+    fn is1(&self, segment: &str) -> bool {
+        self.is_some_and(|it| it.is1(segment))
+    }
+
+    fn as_one_segment(&self) -> Option<SmolStr> {
+        self.and_then(|it| it.as_one_segment())
+    }
+
+    fn as_up_to_two_segment(&self) -> Option<(SmolStr, Option<SmolStr>)> {
+        self.and_then(|it| it.as_up_to_two_segment())
+    }
+}
+
 pub trait AstKeyValueMetaExt {
     fn value_string(&self) -> Option<SmolStr>;
+}
+
+impl AstKeyValueMetaExt for view::KeyValueMeta<'_> {
+    fn value_string(&self) -> Option<SmolStr> {
+        if let Some(view::Expr::Literal(value)) = self.expr()
+            && let view::LiteralKind::String(value) = value.kind()
+            && let Ok(value) = value.value()
+        {
+            Some((*value).into())
+        } else {
+            None
+        }
+    }
 }
 
 impl AstKeyValueMetaExt for ast::KeyValueMeta {
@@ -170,21 +216,44 @@ pub fn expand_cfg_attr_with_doc_comments<'a, DocComment, BreakValue>(
 
 /// [`expand_cfg_attr`] over views: the callback is passed each attribute `cfg_attr` leaves,
 /// in order, and the outermost [`view::Attr`] it is in.
-pub(crate) fn expand_view_cfg_attr<'t, 'a, BreakValue>(
-    mut attrs: impl Iterator<Item = view::Attr<'t>>,
-    mut cfg_options: impl FnMut() -> &'a CfgOptions,
+#[inline]
+pub fn expand_cfg_attr_view<'t, 'a, BreakValue>(
+    attrs: impl Iterator<Item = view::Attr<'t>>,
+    cfg_options: impl FnMut() -> &'a CfgOptions,
     mut callback: impl FnMut(view::Meta<'t>, view::Attr<'t>) -> ControlFlow<BreakValue>,
+) -> Option<BreakValue> {
+    expand_cfg_attr_with_doc_comments_view::<Infallible, _>(
+        attrs.map(Either::Left),
+        cfg_options,
+        move |Either::Left((meta, top_attr))| callback(meta, top_attr),
+    )
+}
+
+/// [`expand_cfg_attr_with_doc_comments`] over views.
+pub fn expand_cfg_attr_with_doc_comments_view<'t, 'a, DocComment, BreakValue>(
+    mut attrs: impl Iterator<Item = Either<view::Attr<'t>, DocComment>>,
+    mut cfg_options: impl FnMut() -> &'a CfgOptions,
+    mut callback: impl FnMut(
+        Either<(view::Meta<'t>, view::Attr<'t>), DocComment>,
+    ) -> ControlFlow<BreakValue>,
 ) -> Option<BreakValue> {
     // alloc: none until a `cfg_attr` holds more than one attribute
     let mut stack = SmallVec::<[(view::Meta<'t>, view::Attr<'t>); 1]>::new();
     'process_attrs: loop {
         let (mut meta, top_attr) = match stack.pop() {
             Some(it) => it,
-            None => {
-                let attr = attrs.next()?;
-                let Some(meta) = attr.meta() else { continue };
-                (meta, attr)
-            }
+            None => match attrs.next()? {
+                Either::Left(attr) => {
+                    let Some(meta) = attr.meta() else { continue };
+                    (meta, attr)
+                }
+                Either::Right(doc_comment) => {
+                    if let ControlFlow::Break(break_value) = callback(Either::Right(doc_comment)) {
+                        return Some(break_value);
+                    }
+                    continue;
+                }
+            },
         };
 
         while let view::Meta::UnsafeMeta(unsafe_meta) = meta {
@@ -200,7 +269,7 @@ pub(crate) fn expand_view_cfg_attr<'t, 'a, BreakValue>(
                 stack.extend(meta.metas().map(|meta| (meta, top_attr)));
                 stack[prev_stack_len..].reverse();
             }
-        } else if let ControlFlow::Break(break_value) = callback(meta, top_attr) {
+        } else if let ControlFlow::Break(break_value) = callback(Either::Left((meta, top_attr))) {
             return Some(break_value);
         }
     }
@@ -231,14 +300,14 @@ pub(crate) fn is_item_tree_filtered_attr(name: &str) -> bool {
     ITEM_TREE_FILTERED.get(name).is_some()
 }
 
-/// This collects attributes exactly as the item tree needs them. This is used for the item tree,
-/// as well as for resolving [`AttrId`]s.
+/// This collects attributes exactly as the item tree needs them, of an owner's attributes as
+/// [`ast::attrs_including_inner`] gives them. This is used for the item tree, as well as for
+/// resolving [`AttrId`]s.
 pub fn collect_item_tree_attrs<'a, BreakValue>(
-    owner: &dyn ast::HasAttrs, // dyn: once per item, into syntax's attrs_including_inner; a generic would copy the cfg_attr expansion per node type
+    attrs: ast::AttrsIncludingInner,
     cfg_options: impl Fn() -> &'a CfgOptions,
     mut on_attr: impl FnMut(ast::Meta, ast::Attr) -> ControlFlow<BreakValue>,
 ) -> Option<Either<BreakValue, CfgExpr>> {
-    let attrs = ast::attrs_including_inner(owner);
     expand_cfg_attr(
         attrs,
         || cfg_options(),
@@ -259,6 +328,42 @@ pub fn collect_item_tree_attrs<'a, BreakValue>(
                 }
                 _ => attr.path().is_some_and(|path| {
                     with_one_segment(&path, is_item_tree_filtered_attr) == Some(true)
+                }),
+            };
+            if !filter && let ControlFlow::Break(v) = on_attr(attr, top_attr) {
+                return ControlFlow::Break(Either::Left(v));
+            }
+            ControlFlow::Continue(())
+        },
+    )
+}
+
+/// [`collect_item_tree_attrs`] of a view of the owner: the same metas, as the item tree takes
+/// them. One concrete owner type, so one instance and no `dyn`.
+pub fn collect_item_tree_attrs_view<'t, 'a, BreakValue>(
+    owner: view::AnyHasAttrs<'t>,
+    cfg_options: impl Fn() -> &'a CfgOptions,
+    mut on_attr: impl FnMut(view::Meta<'t>, view::Attr<'t>) -> ControlFlow<BreakValue>,
+) -> Option<Either<BreakValue, CfgExpr>> {
+    expand_cfg_attr_view(
+        view::attrs_including_inner(&owner),
+        || cfg_options(),
+        |attr, top_attr| {
+            // The filter of `collect_item_tree_attrs`: an attribute filtered out must not be
+            // shadowable by a macro.
+            let filter = match attr {
+                view::Meta::CfgMeta(attr) => {
+                    let Some(cfg_predicate) = attr.cfg_predicate() else {
+                        return ControlFlow::Continue(());
+                    };
+                    let cfg = CfgExpr::parse_from_view(cfg_predicate);
+                    if cfg_options().check(&cfg) == Some(false) {
+                        return ControlFlow::Break(Either::Right(cfg));
+                    }
+                    true
+                }
+                _ => attr.path().is_some_and(|path| {
+                    with_one_segment_view(&path, is_item_tree_filtered_attr) == Some(true)
                 }),
             };
             if !filter && let ControlFlow::Break(v) = on_attr(attr, top_attr) {
@@ -363,7 +468,7 @@ impl Attr {
 
 fn parse_path_comma_token_tree<'a>(
     db: &'a Db,
-    args: &'a tt::TopSubtree,
+    args: &'a tt::Tree,
 ) -> impl Iterator<Item = (ModPath, Span, tt::TokenTreesView<'a>)> {
     args.token_trees()
         .split(|tt| matches!(tt, tt::TtElement::Leaf(tt::Leaf::Punct(Punct { char: ',', .. }))))
@@ -439,24 +544,90 @@ impl AttrId {
         self,
         db: &Db,
         krate: Crate,
-        owner: &dyn ast::HasAttrs, // dyn: once per item, into syntax's attrs_including_inner; a generic would copy the cfg_attr expansion per node type
+        owner: &impl ast::HasAttrs,
     ) -> (ast::Attr, ast::Meta) {
-        self.find_attr_range_with_source_opt(db, krate, owner).unwrap_or_else(|| {
-            panic!("used an incorrect `AttrId`; crate={krate:?}, attr_id={self:?}");
-        })
+        self.find_attr_range_in(db, krate, ast::attrs_including_inner(owner))
+            .unwrap_or_else(|| self.incorrect(krate))
+    }
+
+    #[cold]
+    fn incorrect(self, krate: Crate) -> ! {
+        panic!("used an incorrect `AttrId`; crate={krate:?}, attr_id={self:?}");
     }
 
     /// Returns the containing `ast::Attr` (note that it may contain other attributes as well due
     /// to `cfg_attr`) and its [`ast::Meta`].
+    #[inline]
     pub(crate) fn find_attr_range_with_source_opt(
         self,
         db: &Db,
         krate: Crate,
-        owner: &dyn ast::HasAttrs, // dyn: once per item, into syntax's attrs_including_inner; a generic would copy the cfg_attr expansion per node type
+        owner: &impl ast::HasAttrs,
+    ) -> Option<(ast::Attr, ast::Meta)> {
+        self.find_attr_range_in(db, krate, ast::attrs_including_inner(owner))
+    }
+
+    /// [`AttrId::find_attr_range_with_source_opt`] of an owner's attributes, as
+    /// [`ast::attrs_including_inner`] gives them: one instance for every kind of owner.
+    fn find_attr_range_in(
+        self,
+        db: &Db,
+        krate: Crate,
+        attrs: ast::AttrsIncludingInner,
     ) -> Option<(ast::Attr, ast::Meta)> {
         let cfg_options = OnceCell::new();
         let mut index = 0;
         let result = collect_item_tree_attrs(
+            attrs,
+            || cfg_options.get_or_init(|| krate.cfg_options(db)),
+            |meta, top_attr| {
+                if index == self.id {
+                    return ControlFlow::Break((top_attr, meta));
+                }
+                index += 1;
+                ControlFlow::Continue(())
+            },
+        );
+        match result {
+            Some(Either::Left(it)) => Some(it),
+            _ => None,
+        }
+    }
+
+    /// [`Self::find_attr_range`] as views: the containing `Attr` and its `Meta`.
+    pub fn find_attr_range_view<'db, N: AstNode + view::Typed>(
+        self,
+        db: &'db Db,
+        krate: Crate,
+        owner: AstId<N>,
+    ) -> (view::Attr<'db>, view::Meta<'db>)
+    where
+        N::Of<'db>: view::HasAttrs<'db>,
+    {
+        self.find_attr_range_with_source_view(db, krate, view::AnyHasAttrs::new(owner.to_view(db)))
+    }
+
+    /// [`Self::find_attr_range_with_source`] of a view of the owner.
+    pub fn find_attr_range_with_source_view<'t>(
+        self,
+        db: &Db,
+        krate: Crate,
+        owner: view::AnyHasAttrs<'t>,
+    ) -> (view::Attr<'t>, view::Meta<'t>) {
+        self.find_attr_range_with_source_opt_view(db, krate, owner)
+            .unwrap_or_else(|| self.incorrect(krate))
+    }
+
+    /// [`Self::find_attr_range_with_source_opt`] of a view of the owner.
+    pub(crate) fn find_attr_range_with_source_opt_view<'t>(
+        self,
+        db: &Db,
+        krate: Crate,
+        owner: view::AnyHasAttrs<'t>,
+    ) -> Option<(view::Attr<'t>, view::Meta<'t>)> {
+        let cfg_options = OnceCell::new();
+        let mut index = 0;
+        let result = collect_item_tree_attrs_view(
             owner,
             || cfg_options.get_or_init(|| krate.cfg_options(db)),
             |meta, top_attr| {
@@ -480,35 +651,46 @@ impl AttrId {
         owner: AstId<ast::Adt>,
         derive_index: u32,
     ) -> TextRange {
-        let (_, derive_attr) = self.find_attr_range(db, krate, owner);
-        let ast::Meta::TokenTreeMeta(derive_attr) = derive_attr else {
+        let (_, derive_attr) = self.find_attr_range_view(db, krate, owner);
+        let view::Meta::TokenTreeMeta(derive_attr) = derive_attr else {
             return derive_attr.syntax().text_range();
         };
         let Some(tt) = derive_attr.token_tree() else {
             return derive_attr.syntax().text_range();
         };
-        // Fake the span map, as we don't really need spans here, just the offsets of the node in the file.
-        let span_map = RealSpanMap::absolute(span::EditionedFileId::current_edition(
-            span::FileId::from_raw(0),
-        ));
-        let tt = syntax_bridge::syntax_node_to_token_tree(
-            tt.syntax(),
-            SpanMap::RealSpanMap(&span_map),
-            span_map.span_for_range(tt.syntax().text_range()),
-            DocCommentDesugarMode::ProcMacro,
-        );
-        let Some((_, _, derive_tts)) =
-            parse_path_comma_token_tree(db, &tt).nth(derive_index as usize)
-        else {
-            return derive_attr.syntax().text_range();
-        };
-        let (Some(first_span), Some(last_span)) = (derive_tts.first_span(), derive_tts.last_span())
-        else {
-            return derive_attr.syntax().text_range();
-        };
-        let start = first_span.range.start();
-        let end = last_span.range.end();
-        TextRange::new(start, end)
+        // Only the offsets in the file are read, so the spans are absolute: no map is made.
+        let spans = AbsoluteSpans(span::EditionedFileId::current_edition(span::FileId::from_raw(0)));
+        frame::task(Tag::Expand, |frame| {
+            let tt = syntax_bridge::call_input_in(
+                tt.syntax(),
+                spans,
+                RealSpanMap::absolute_span(spans.0, tt.syntax().text_range()),
+                DocCommentDesugarMode::ProcMacro,
+                frame,
+            );
+            let Some((_, _, derive_tts)) =
+                parse_path_comma_token_tree(db, &tt).nth(derive_index as usize)
+            else {
+                return derive_attr.syntax().text_range();
+            };
+            let (Some(first_span), Some(last_span)) =
+                (derive_tts.first_span(), derive_tts.last_span())
+            else {
+                return derive_attr.syntax().text_range();
+            };
+            TextRange::new(first_span.range.start(), last_span.range.end())
+        })
+    }
+}
+
+/// [`RealSpanMap::absolute`]'s spans, relative to the file's root, without its two boxes.
+#[derive(Clone, Copy)]
+struct AbsoluteSpans(span::EditionedFileId);
+
+impl syntax_bridge::SpanMapper for AbsoluteSpans {
+    #[inline]
+    fn span_for(&self, range: TextRange) -> Span {
+        RealSpanMap::absolute_span(self.0, range)
     }
 }
 
@@ -537,7 +719,7 @@ struct S;
 
         let mut kept = Vec::new();
         let _ = collect_item_tree_attrs::<Infallible>(
-            &item,
+            ast::attrs_including_inner(&item),
             || &cfg,
             |meta, _| {
                 kept.push(meta.syntax().text().to_string());

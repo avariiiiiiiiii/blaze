@@ -1,6 +1,9 @@
 //! The labels, notes and suggestions of the errors against rustc's: the `.stderr` of its
 //! `tests/ui/error-codes` tests for E0499, E0505, E0596 and E0597, with what each part points
-//! at written as its source text.
+//! at written as its source text. And the budget: the check of a body with no error takes
+//! nothing from the global allocator.
+
+use std::cell::Cell;
 
 use base_db::all_crates;
 use hir_def::{
@@ -13,9 +16,14 @@ use hir_ty::mir::MirSpan;
 use hir_ty_mir as _;
 use test_fixture::WithFixture;
 
-use crate::{Applicability, BorrowckDiagnostic, PartSpan, Sublevel};
+use crate::{Applicability, BorrowckDiagnostic, Mode, PartSpan, Sublevel, borrowck_in_mode};
 
 type TestDB = base_db::Db;
+
+thread_local! {
+    /// What the parts of the checks run on this thread took from the global allocator.
+    pub(super) static GLOBAL: Cell<u64> = const { Cell::new(0) };
+}
 
 const FIXTURE: &str = r#"
 //- minicore: sized, copy
@@ -92,11 +100,10 @@ fn source(db: &TestDB, source_map: &BodySourceMap, span: MirSpan) -> String {
         other => panic!("{other:?} has no source"),
     }
     .unwrap_or_else(|_| panic!("{span:?} has no source"));
-    let root = source.file_id.parse_or_expand(db);
-    let node = source.value.syntax_node_ptr().to_node(&root);
+    let node = syntax::view::to_node(source.value.syntax_node_ptr(), source.file_id.root(db));
     match span {
         MirSpan::ExprEnd(_) => node.last_token().unwrap().text().to_owned(),
-        _ => node.text().to_string(),
+        _ => node.text().to_owned(),
     }
 }
 
@@ -248,4 +255,129 @@ fn e0597_points_at_the_drop_and_the_later_call() {
             assert!(error.children.is_empty() && error.suggestions.is_empty(), "{error:?}")
         },
     );
+}
+
+/// Bodies with no error that reach each part: two-phase borrows, loans in scope at calls
+/// that may unwind and across a loop's way back, guards, an index after an index of a
+/// slice, a union, a `static mut`, closures by reference and by value, a returned
+/// `impl Trait`, moves out and reinitialization.
+const CLEAN: &str = r#"
+//- minicore: sized, copy, clone, fn
+struct Point { x: u32, y: u32 }
+struct Stack { items: [u32; 4], len: usize }
+enum Shape { Circle(Point), Square(u32), Empty }
+union U { a: u32, b: f32 }
+static mut COUNT: u32 = 0;
+
+impl Stack {
+    fn len(&self) -> usize { self.len }
+    fn top(&self) -> &u32 { &self.items[0] }
+    fn push(&mut self, value: u32) {
+        self.items[self.len] = value;
+        self.len += 1;
+    }
+}
+
+fn borrows(p: &mut Point) -> u32 {
+    let a = &p.x;
+    let b = &p.y;
+    let sum = *a + *b;
+    p.x = sum;
+    let c = &mut p.y;
+    *c += 1;
+    p.x + p.y
+}
+
+fn two_phase(s: &mut Stack) {
+    s.push(s.len() as u32);
+}
+
+fn loops(s: &mut Stack) {
+    let mut i = 0;
+    while i < 3 {
+        let top = s.top();
+        s.push(*top);
+        i += 1;
+    }
+}
+
+fn guards(shape: Shape, limit: u32) -> u32 {
+    match shape {
+        Shape::Circle(point) if point.x > limit => point.y,
+        Shape::Circle(point) => point.x,
+        Shape::Square(side) if side > limit => side,
+        Shape::Square(_) | Shape::Empty => 0,
+    }
+}
+
+fn indexes(rows: &[&[u32]], grid: &mut [[u32; 4]; 4], i: usize, j: usize) -> u32 {
+    grid[i][j] += 1;
+    rows[1][i] + grid[j][i]
+}
+
+fn unions() -> u32 {
+    let mut u = U { a: 1 };
+    u.a = 2;
+    unsafe { u.a }
+}
+
+fn statics() -> u32 {
+    unsafe {
+        COUNT += 1;
+        COUNT
+    }
+}
+
+fn closures(p: Point) -> u32 {
+    let mut n = p.x;
+    let mut add = |k: u32| n += k;
+    add(1);
+    add(2);
+    let read = move || p.y;
+    n + read()
+}
+
+fn opaque<'a>(p: &'a Point) -> impl Copy + 'a {
+    &p.x
+}
+
+fn moves(shape: Shape) -> Shape {
+    let mut held = shape;
+    let taken = held;
+    held = Shape::Empty;
+    match held {
+        Shape::Empty => taken,
+        other => other,
+    }
+}
+"#;
+
+#[test]
+fn a_body_with_no_error_takes_nothing_from_the_global_allocator() {
+    let (db, _) = TestDB::with_single_file(CLEAN);
+    hir_ty::attach_db(&db, || {
+        let mut bodies = 0;
+        for &krate in all_crates(&db).iter() {
+            let def_map = crate_def_map(&db, krate);
+            for (_, module) in def_map.modules(&db) {
+                for def in module.scope(&db).declarations() {
+                    let ModuleDefId::FunctionId(it) = def else { continue };
+                    for mode in [Mode::Nll, Mode::Polonius] {
+                        // The first run warms what outlives a check: the queries it asks and
+                        // the types it interns.
+                        let first = borrowck_in_mode(&db, it.into(), mode);
+                        assert!(first.skipped.is_none(), "{it:?}: {:?}", first.skipped);
+                        assert!(first.not_checked.is_none(), "{it:?}");
+                        assert!(first.diagnostics.is_empty(), "{:?}", first.diagnostics);
+                        GLOBAL.with(|it| it.set(0));
+                        let _ = borrowck_in_mode(&db, it.into(), mode);
+                        let global = GLOBAL.with(Cell::get);
+                        assert_eq!(global, 0, "{it:?} in {mode:?}: global allocations");
+                    }
+                    bodies += 1;
+                }
+            }
+        }
+        assert!(bodies >= 10, "{bodies} bodies");
+    });
 }

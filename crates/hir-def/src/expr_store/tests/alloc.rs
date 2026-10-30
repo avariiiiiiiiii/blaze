@@ -1,14 +1,24 @@
 //! Allocation budgets of the store's hot paths: reading a store, a memo hit of a body or its
-//! scopes, and a scope lookup allocate nothing.
+//! scopes, a scope lookup, and the syntax side of lowering's walk allocate nothing.
 
 use std::hint::black_box;
 
 use blaze_alloc_count::assert_at_most;
+use span::Edition;
+use syntax::{
+    AstPtr, SourceFile,
+    ast as tag,
+    view::{self as ast, AstNode as _},
+};
 use test_fixture::WithFixture;
 
 use crate::{
     DefWithBodyId, ModuleDefId,
-    expr_store::{Body, scope::ExprScopes},
+    expr_store::{
+        Body, ExprPtr,
+        lower::{comma_follows_token, may_have_attrs},
+        scope::ExprScopes,
+    },
     nameres::crate_def_map,
     test_db::{TestDB, TestDBExt},
 };
@@ -87,6 +97,35 @@ fn a_scope_lookup_allocates_nothing() {
                 black_box(scopes.resolve_name_in_scope(scope, &name));
                 black_box(scopes.scope_chain(Some(scope)).count());
             }
+        }
+    });
+}
+
+/// What lowering reads of the syntax at each node (the cfg fast path, the source map's
+/// pointers, names' text, the trailing-comma check) allocates nothing, over every node.
+#[test]
+fn the_syntax_side_of_the_walk_allocates_nothing() {
+    let parse = SourceFile::parse(CODE, Edition::CURRENT);
+    let root = parse.root();
+    assert!(root.descendants().count() > 50, "too small to measure");
+    assert_at_most(0, "reading every node's syntax as lowering does", || {
+        for node in root.descendants() {
+            if let Some(owner) = ast::AnyHasAttrs::cast(node) {
+                black_box(may_have_attrs(&owner));
+            }
+            if let Some(expr) = ast::Expr::cast(node) {
+                black_box(ExprPtr::of(expr));
+            }
+            if let Some(pat) = ast::Pat::cast(node) {
+                black_box(AstPtr::<tag::Pat>::of(pat));
+            }
+            if let Some(name) = ast::Name::cast(node) {
+                black_box(name.text());
+            }
+            if let Some(name_ref) = ast::NameRef::cast(node) {
+                black_box(name_ref.text());
+            }
+            black_box(comma_follows_token(node.last_token()));
         }
     });
 }

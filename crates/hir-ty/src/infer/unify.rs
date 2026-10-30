@@ -3,6 +3,8 @@
 use std::fmt;
 
 use base_db::{Db, Crate};
+use blaze_ids::bits::{BitSlice, BitSliceMut, words_for};
+use blaze_mem::scratch;
 use hir_def::{GenericParamId, TraitId};
 use rustc_type_ir::{
     TyVid, TypeFoldable, TypeVisitableExt,
@@ -10,12 +12,10 @@ use rustc_type_ir::{
     solve::Certainty,
 };
 use smallvec::SmallVec;
-use thin_vec::ThinVec;
 
 use crate::{
     InferBodyId, InferenceDiagnostic, Span,
     db::HirDatabase,
-    infer::columns::VarSet,
     next_solver::{
         Canonical, ClauseKind, Const, ConstKind, DbInterner, ErrorGuaranteed, GenericArg,
         GenericArgs, ParamEnv, Predicate, PredicateKind, Region, SolverDefId, Term, TraitRef, Ty,
@@ -150,7 +150,9 @@ pub(crate) struct InferenceTable<'db> {
     pub(crate) param_env: ParamEnv<'db>,
     pub(crate) infer_ctxt: InferCtxt<'db>,
     pub(super) fulfillment_cx: FulfillmentCtxt<'db>,
-    pub(super) diverging_type_vars: VarSet,
+    /// The words of the set of type variables a coercion of `!` reached, by index: lent from
+    /// the thread's shelf, since the table has no frame lifetime (R2), and warm across bodies.
+    diverging_type_vars: scratch::Lent<Vec<u64>>,
     /// Each converted once, when the solver returns it, as rustc's `FromSolverError` does.
     trait_errors: Vec<FulfillmentError<'db>>,
 }
@@ -172,7 +174,8 @@ impl<'db> InferenceTable<'db> {
             param_env: trait_env,
             fulfillment_cx: FulfillmentCtxt::new(&infer_ctxt),
             infer_ctxt,
-            diverging_type_vars: VarSet::default(),
+            diverging_type_vars: scratch::lend_u64s(),
+            // alloc: an error path, unallocated until the body's first trait error
             trait_errors: Vec::new(),
         }
     }
@@ -294,8 +297,20 @@ impl<'db> InferenceTable<'db> {
     /// only for its type variable, and it has none.
     pub(super) fn set_diverging(&mut self, ty: Ty<'db>) {
         if let Some(vid) = ty.ty_vid() {
-            self.diverging_type_vars.insert(vid.as_u32());
+            let var = vid.as_u32();
+            let words = &mut *self.diverging_type_vars;
+            let len = words_for(var as usize + 1);
+            if words.len() < len {
+                // alloc: only while the thread's buffer grows past the most it ever held
+                words.resize(len, 0);
+            }
+            BitSliceMut::<u32>::from_words(&mut words[..]).insert(var);
         }
+    }
+
+    /// The type variables [`Self::set_diverging`] marked.
+    pub(super) fn diverging_type_vars(&self) -> BitSlice<'_, u32> {
+        BitSlice::from_words(&self.diverging_type_vars[..])
     }
 
     pub(crate) fn next_ty_var(&self, span: Span) -> Ty<'db> {
@@ -554,7 +569,7 @@ impl<'db> InferenceTable<'db> {
     /// until it does `?D` could be the `Dyn` of another impl with a `from_element`.
     pub(crate) fn resolve_projections_within(&mut self, ty: Ty<'db>) -> Ty<'db> {
         let interner = self.interner();
-        let traits: Vec<_> = ty
+        let traits = ty
             .walk()
             .filter_map(|arg| arg.as_type())
             .filter(|ty| ty.has_non_region_infer())
@@ -565,14 +580,15 @@ impl<'db> InferenceTable<'db> {
                     Some(alias.trait_ref(interner))
                 }
                 _ => None,
-            })
-            .collect();
-        if traits.is_empty() {
-            return ty;
-        }
+            });
+        let mut registered = false;
         for trait_ref in traits {
+            registered = true;
             let cause = ObligationCause::new(Span::Dummy);
             self.register_predicate(Obligation::new(interner, cause, self.param_env, trait_ref));
+        }
+        if !registered {
+            return ty;
         }
         self.resolve_vars_with_obligations(ty)
     }
@@ -584,7 +600,7 @@ impl<'db> InferenceTable<'db> {
             .any(|error| SolverDiagnostic::from_fulfillment_error(&self.infer_ctxt, error).is_some())
     }
 
-    fn emit_trait_errors(&mut self, diagnostics: &mut ThinVec<InferenceDiagnostic>) {
+    fn emit_trait_errors(&mut self, diagnostics: &mut impl Extend<InferenceDiagnostic>) {
         diagnostics.extend(std::mem::take(&mut self.trait_errors).iter().filter_map(|error| {
             SolverDiagnostic::from_fulfillment_error(&self.infer_ctxt, error)
                 .map(InferenceDiagnostic::SolverDiagnostic)
@@ -602,7 +618,7 @@ impl fmt::Debug for InferenceTable<'_> {
 }
 
 pub(super) mod resolve_completely {
-    use rustc_hash::FxHashSet;
+    use blaze_mem::Frame;
     use rustc_type_ir::{
         DebruijnIndex, Flags, InferConst, InferTy, PredicateProxy, TypeFlags, TypeFoldable,
         TypeFolder, TypeSuperFoldable, TypeVisitableExt, inherent::IntoKind,
@@ -612,35 +628,41 @@ pub(super) mod resolve_completely {
 
     use crate::{
         InferenceDiagnostic, Span,
-        infer::unify::InferenceTable,
+        infer::{
+            columns::{FrameSet, frame_set},
+            unify::InferenceTable,
+        },
         next_solver::{
-            Const, ConstKind, DbInterner, DefaultAny, GenericArg, Goal, Predicate, Region, Term,
-            TermKind, Ty, TyKind,
+            Const, ConstKind, DbInterner, DefaultAny, GenericArg, Region, Term, TermKind, Ty,
+            TyKind,
             infer::{resolve::ReplaceInferWithError, traits::ObligationCause},
             normalize::deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals,
         },
     };
 
-    pub(crate) struct WriteBackCtxt<'db> {
+    pub(crate) struct WriteBackCtxt<'db, 'f> {
         table: InferenceTable<'db>,
+        /// What inference reported, as [`super::super::diagnostics::Diagnostics`] kept it.
         diagnostics: ThinVec<InferenceDiagnostic>,
         /// "type annotations needed" for the variables left unresolved, reported only if the
         /// body has no other error.
-        unresolved_vars: ThinVec<InferenceDiagnostic>,
+        unresolved_vars: Vec<InferenceDiagnostic, &'f Frame>,
         has_errors: bool,
-        spans_emitted_type_must_be_known_for: FxHashSet<Span>,
+        spans_emitted_type_must_be_known_for: FrameSet<'f, Span>,
         types: &'db DefaultAny<'db>,
+        frame: &'f Frame,
     }
 
-    impl<'db> WriteBackCtxt<'db> {
+    impl<'db, 'f> WriteBackCtxt<'db, 'f> {
         pub(crate) fn new(
             table: InferenceTable<'db>,
             diagnostics: ThinVec<InferenceDiagnostic>,
-            vars_emitted_type_must_be_known_for: FxHashSet<Term<'db>>,
+            vars_emitted_type_must_be_known_for: FrameSet<'f, Term<'db>>,
+            frame: &'f Frame,
         ) -> Self {
-            let spans_emitted_type_must_be_known_for = vars_emitted_type_must_be_known_for
-                .into_iter()
-                .filter_map(|term| match term.kind() {
+            let mut spans_emitted_type_must_be_known_for = frame_set(frame);
+            spans_emitted_type_must_be_known_for.extend(
+                vars_emitted_type_must_be_known_for.into_iter().filter_map(|term| match term.kind() {
                     TermKind::Ty(ty) => match ty.kind() {
                         TyKind::Infer(InferTy::TyVar(vid)) => {
                             Some(table.infer_ctxt.type_var_span(vid))
@@ -653,16 +675,17 @@ pub(super) mod resolve_completely {
                         }
                         _ => None,
                     },
-                })
-                .collect();
+                }),
+            );
 
             Self {
                 types: table.interner().default_types(),
                 table,
                 diagnostics,
-                unresolved_vars: ThinVec::new(),
+                unresolved_vars: Vec::new_in(frame),
                 has_errors: false,
                 spans_emitted_type_must_be_known_for,
+                frame,
             }
         }
 
@@ -670,6 +693,7 @@ pub(super) mod resolve_completely {
         where
             T: TypeFoldable<DbInterner<'db>>,
         {
+            // clone: a `TypeFoldable` of interned ids, so a copy, never a deep clone
             self.resolve_completely_with_default(value_ref, value_ref.clone());
         }
 
@@ -680,22 +704,21 @@ pub(super) mod resolve_completely {
             let value = std::mem::replace(value_ref, default);
 
             let value = self.table.resolve_vars_if_possible(value);
-
-            let mut goals = vec![];
-
-            // FIXME(next-solver): Handle `goals`.
-
-            *value_ref = value.fold_with(&mut Resolver::new(self, true, &mut goals));
+            *value_ref = value.fold_with(&mut Resolver::new(self, true));
         }
 
-        pub(crate) fn resolve_diagnostics(mut self) -> (ThinVec<InferenceDiagnostic>, bool) {
+        /// The body's diagnostics, resolved, as the result keeps them: made once at their
+        /// number, nothing when there are none.
+        pub(crate) fn resolve_diagnostics(mut self) -> (Box<[InferenceDiagnostic]>, bool) {
             let has_errors = self.has_errors;
 
-            self.table.emit_trait_errors(&mut self.diagnostics);
+            let mut diagnostics = Vec::new_in(self.frame);
+            diagnostics.extend(std::mem::take(&mut self.diagnostics));
+            self.table.emit_trait_errors(&mut diagnostics);
 
             // Ignore diagnostics made from resolving diagnostics.
-            let unresolved_vars = std::mem::take(&mut self.unresolved_vars);
-            let mut diagnostics = std::mem::take(&mut self.diagnostics);
+            let unresolved_vars =
+                std::mem::replace(&mut self.unresolved_vars, Vec::new_in(self.frame));
             diagnostics.retain_mut(|diagnostic| {
                 self.resolve_completely(diagnostic);
 
@@ -717,21 +740,21 @@ pub(super) mod resolve_completely {
             if !diagnostics.iter().any(InferenceDiagnostic::taints_body) {
                 diagnostics.extend(unresolved_vars);
             }
-            diagnostics.shrink_to_fit();
-
-            (diagnostics, has_errors)
+            // alloc: the result's list, once at its length (a `Vec`'s drain is `TrustedLen`)
+            (diagnostics.drain(..).collect(), has_errors)
         }
     }
 
-    struct DiagnoseInferVars<'a, 'db> {
-        ctx: &'a mut WriteBackCtxt<'db>,
+    struct DiagnoseInferVars<'a, 'db, 'f> {
+        ctx: &'a mut WriteBackCtxt<'db, 'f>,
         top_term: Term<'db>,
     }
 
-    impl<'db> DiagnoseInferVars<'_, 'db> {
+    impl<'db> DiagnoseInferVars<'_, 'db, '_> {
         const TYPE_FLAGS: TypeFlags = TypeFlags::HAS_INFER.union(TypeFlags::HAS_NON_REGION_ERROR);
 
-        fn err_on_span(&mut self, span: Span) {
+        /// The error of the variable `var`, made at `span`.
+        fn err_on_span(&mut self, span: Span, var: Term<'db>) {
             if !self.ctx.spans_emitted_type_must_be_known_for.insert(span) {
                 // Suppress duplicate diagnostics.
                 return;
@@ -748,11 +771,12 @@ pub(super) mod resolve_completely {
                 top_term: Some(GenericArg::from(top_term).store()),
                 kind: crate::solver_errors::TypeAnnotationNeeded::E0282,
                 ambiguity: None,
+                origin: crate::solver_errors::variable_origin(&self.ctx.table.infer_ctxt, var),
             });
         }
     }
 
-    impl<'db> TypeFolder<DbInterner<'db>> for DiagnoseInferVars<'_, 'db> {
+    impl<'db> TypeFolder<DbInterner<'db>> for DiagnoseInferVars<'_, 'db, '_> {
         fn cx(&self) -> DbInterner<'db> {
             self.ctx.table.interner()
         }
@@ -769,7 +793,7 @@ pub(super) mod resolve_completely {
                 }
                 TyKind::Infer(infer_ty) => match infer_ty {
                     InferTy::TyVar(vid) => {
-                        self.err_on_span(self.ctx.table.infer_ctxt.type_var_span(vid));
+                        self.err_on_span(self.ctx.table.infer_ctxt.type_var_span(vid), t.into());
                         self.ctx.has_errors = true;
                         self.ctx.types.types.error
                     }
@@ -804,7 +828,7 @@ pub(super) mod resolve_completely {
                 ConstKind::Infer(infer_ct) => match infer_ct {
                     InferConst::Var(vid) => {
                         if let Some(span) = self.ctx.table.infer_ctxt.const_var_span(vid) {
-                            self.err_on_span(span);
+                            self.err_on_span(span, c.into());
                         }
                         self.ctx.has_errors = true;
                         self.ctx.types.consts.error
@@ -836,14 +860,13 @@ pub(super) mod resolve_completely {
         }
     }
 
-    pub(super) struct Resolver<'a, 'db> {
-        ctx: &'a mut WriteBackCtxt<'db>,
+    pub(super) struct Resolver<'a, 'db, 'f> {
+        ctx: &'a mut WriteBackCtxt<'db, 'f>,
         /// Whether we should normalize, disabled when resolving predicates.
         should_normalize: bool,
-        nested_goals: &'a mut Vec<Goal<'db, Predicate<'db>>>,
     }
 
-    impl<'a, 'db> Resolver<'a, 'db> {
+    impl<'a, 'db, 'f> Resolver<'a, 'db, 'f> {
         /// What makes deep normalization do anything to a term its caller has already
         /// resolved: an alias that may not be rigid, an error (it taints the inference
         /// context), or a variable left unresolved.
@@ -852,11 +875,10 @@ pub(super) mod resolve_completely {
             .union(TypeFlags::HAS_INFER.difference(TypeFlags::HAS_RE_INFER));
 
         pub(super) fn new(
-            ctx: &'a mut WriteBackCtxt<'db>,
+            ctx: &'a mut WriteBackCtxt<'db, 'f>,
             should_normalize: bool,
-            nested_goals: &'a mut Vec<Goal<'db, Predicate<'db>>>,
-        ) -> Resolver<'a, 'db> {
-            Resolver { ctx, nested_goals, should_normalize }
+        ) -> Resolver<'a, 'db, 'f> {
+            Resolver { ctx, should_normalize }
         }
 
         fn handle_term<T>(
@@ -883,14 +905,13 @@ pub(super) mod resolve_completely {
                 // FIXME: This should not use a dummy span.
                 let cause = ObligationCause::new(Span::Dummy);
                 let at = self.ctx.table.at(&cause);
+                // alloc: the solver's argument type; empty, so unallocated, outside a binder
                 let universes = vec![None; outer_exclusive_binder(value).as_usize()];
                 match deeply_normalize_with_skipped_universes_and_ambiguous_coroutine_goals(
                     at, value, universes,
                 ) {
-                    Ok((value, goals)) => {
-                        self.nested_goals.extend(goals);
-                        value
-                    }
+                    // FIXME(next-solver): Handle the goals normalization returns.
+                    Ok((value, _goals)) => value,
                     Err(errors) => {
                         self.ctx.table.record_trait_errors(errors);
                         value
@@ -904,7 +925,7 @@ pub(super) mod resolve_completely {
         }
     }
 
-    impl<'db> TypeFolder<DbInterner<'db>> for Resolver<'_, 'db> {
+    impl<'db> TypeFolder<DbInterner<'db>> for Resolver<'_, 'db, '_> {
         fn cx(&self) -> DbInterner<'db> {
             self.ctx.table.interner()
         }

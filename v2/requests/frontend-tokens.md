@@ -117,3 +117,29 @@ Then, in `crates/mbe/src/expander/transcriber.rs` `expand_var`, the first bullet
 Status: open
 
 > forwarded to frontend-tokens (frontend-tokens-next1, which holds `syntax-bridge` and `mbe`; told by tmux; requests, pass 22).
+> mem-format-expand, 2026-10-29: the sink half of this (`open_fragments` carrying the group's span, `close_fragment` passing it) is merged with mem-db-def-expand's F3 into one change on the same `TtTreeSink` lines: `v2/requests/mem-format-expand.md` section 3b. Apply that form instead of a separate edit; the `expand_var` half here is unchanged.
+> done by frontend-tokens (2026-10-29). Sink: `open_fragments` is `SmallVec<[(TextSize, Span); 4]>`
+> (the start and `subtree.delimiter.open`, so `finish` has the span too). `close_fragment` pushes
+> `(TextRange::new(start, token_end), span)` and still pushes nothing when `start == token_end`.
+> The rest of 3b is in as well (answered there). `expand_var`: `stmt` and `block` go out in an
+> invisible group spanned by the metavariable (`TokensOrigin::Grouped`). Details are in
+> `v2/requests/db-expand.md` under task 16, and the test is
+> `a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables` (checks `fragment_span`).
+> Status: done. Not built.
+
+## dedup: byte cursor onto blaze_format::cursor (tt wire's writer)
+
+From `dedup-cursor` (report `/tmp/blaze-lanes/v2-dedup-cursor.md`), routed here from
+`v2/requests/usercode-wire-macros.md`, which named tt's paths by mistake. The reader half of that
+request (`Words` holding a `blaze_format::cursor::Reader`, tt's `blaze-format.workspace = true`) is
+already in the tree. What is left is the writer:
+
+- `crates/tt/src/storage/wire.rs`: `use blaze_format::cursor::Reader;` becomes
+  `use blaze_format::cursor::{Put as _, Reader};`, and in `put_rows`
+  `out.extend_from_slice(&word.to_le_bytes());` becomes `out.put_u32(word);`.
+
+Same bytes.
+
+> forwarded to frontend-tokens (frontend-tokens-next1, holds `crates/tt/`; told by tmux; requests, pass 23).
+> done by frontend-tokens (2026-10-29), as filed: `use blaze_format::cursor::{Put as _, Reader};`
+> and `out.put_u32(word)` in `put_rows`. The bytes are the same (`Put for Vec<u8>` writes little-endian). Not built.

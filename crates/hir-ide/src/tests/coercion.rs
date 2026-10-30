@@ -1148,3 +1148,73 @@ fn main() {
 "#,
     );
 }
+
+#[test]
+fn coerce_fn_items_in_match_with_many_arms() {
+    check_no_mismatches(
+        r"
+fn foo1(x: u32) -> isize { 1 }
+fn foo2(x: u32) -> isize { 2 }
+fn foo3(x: u32) -> isize { 3 }
+fn foo4(x: u32) -> isize { 4 }
+fn foo5(x: u32) -> isize { 5 }
+fn foo6(x: u32) -> isize { 6 }
+fn test() {
+    let x = match 1 {
+        1 => foo1,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+        2 => foo2,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+        3 => foo3,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+        4 => foo4,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+        5 => foo5,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+        _ => foo6,
+          // ^^^^ adjustments: Pointer(ReifyFnPointer)
+    };
+    x;
+}",
+    );
+    check_types(
+        r"
+fn foo1(x: u32) -> isize { 1 }
+fn foo2(x: u32) -> isize { 2 }
+fn foo3(x: u32) -> isize { 3 }
+fn foo4(x: u32) -> isize { 4 }
+fn foo5(x: u32) -> isize { 5 }
+fn foo6(x: u32) -> isize { 6 }
+fn test() {
+    let x = match 1 {
+        1 => foo1,
+        2 => foo2,
+        3 => foo3,
+        4 => foo4,
+        5 => foo5,
+        _ => foo6,
+    };
+    x;
+  //^ fn(u32) -> isize
+}",
+    );
+}
+
+#[test]
+fn call_argument_expectations_from_expected_output() {
+    check_types(
+        r"
+//- minicore: fn
+struct Wrap<T>(T);
+fn wrap<T>(t: T) -> Wrap<T> { Wrap(t) }
+fn test() {
+    let w: Wrap<&[u8]> = wrap(&[1, 2, 3]);
+    let f = |a, b| (a, b);
+    let p: (u8, u16) = f(1, 2);
+    p.0;
+  //^^^ u8
+    p.1;
+  //^^^ u16
+}",
+    );
+}

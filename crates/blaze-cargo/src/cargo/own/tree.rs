@@ -95,7 +95,6 @@ pub fn command(args: Args<'_>) -> anyhow::Result<i32> {
             build: None,
             platform: None,
             offline: read.has("--offline") || read.has("--frozen"),
-            store: None,
             rustc_version: Some(crate::cargo::toolchain::ours_release()),
         };
         let mut out = String::new();

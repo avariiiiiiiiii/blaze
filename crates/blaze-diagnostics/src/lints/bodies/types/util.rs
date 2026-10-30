@@ -14,11 +14,9 @@ use hir::{InFile, db::HirDatabase};
 use hir_def::{
     AdtId, AttrDefId, CallableDefId, FunctionId, HasModule,
     attrs::AttrFlags,
-    expr_store::scope::ExprScopes,
     hir::{Expr, ExprId, Literal},
-    resolver::{ValueNs, resolver_for_scope},
+    resolver::ValueNs,
 };
-use hir_expand::mod_path::PathKind;
 use hir_ty::{
     method_resolution::CandidateId,
     next_solver::{
@@ -81,44 +79,17 @@ pub(crate) fn method_fn(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<FunctionId> 
     b.infer.method_resolution(expr).map(|(def, _)| def)
 }
 
-/// What the path `expr` names in the value namespace (rustc's `qpath_res`). In the order of
-/// cost: an associated item as type checking resolved it (a table lookup); a function, tuple
-/// struct or variant by the `FnDef` type checking gave the path, when it can't name a local (a
-/// path of more than one segment, or one no binding in scope is named as); else the scope's
-/// resolver, which builds the scope chain. The last two once per path of the body, however many
-/// passes ask.
+/// What the path `expr` names in the value namespace (rustc's `qpath_res`): an associated item
+/// as type checking picked it, else what inference resolved the path to. Two table lookups.
 pub(crate) fn path_value(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<ValueNs> {
-    let Expr::Path(path) = b.store().expr(expr) else { return None };
+    let Expr::Path(_) = b.store().expr(expr) else { return None };
     if let Some((assoc, _)) = b.infer.assoc_resolutions_for_expr(expr) {
         return Some(match assoc {
             CandidateId::FunctionId(it) => ValueNs::FunctionId(it),
             CandidateId::ConstId(it) => ValueNs::ConstId(it),
         });
     }
-    b.path_value(expr, || {
-        let db = b.db();
-        let scopes = ExprScopes::of(db, b.owner);
-        let scope = scopes.scope_for(expr);
-        if let TyKind::FnDef(CallableIdWrapper(callable), _) = b.infer.expr_ty(expr).kind() {
-            let local = match (path.mod_path(), scope) {
-                (Some(mod_path), Some(scope)) => match mod_path.as_ident() {
-                    Some(name) if mod_path.kind == PathKind::Plain => {
-                        scopes.resolve_name_in_scope(scope, name).is_some()
-                    }
-                    _ => false,
-                },
-                _ => true,
-            };
-            if !local {
-                return Some(match callable {
-                    CallableDefId::FunctionId(it) => ValueNs::FunctionId(it),
-                    CallableDefId::StructId(it) => ValueNs::StructId(it),
-                    CallableDefId::EnumVariantId(it) => ValueNs::EnumVariantId(it),
-                });
-            }
-        }
-        resolver_for_scope(db, b.owner, scope).resolve_path_in_value_ns_fully(db, path, b.store().expr_path_hygiene(expr))
-    })
+    b.infer.value_resolution(expr.into())
 }
 
 /// The diagnostic item the path `expr` names (`f32::NAN`, `std::ptr::null`).
@@ -225,6 +196,7 @@ impl<'db> Solver<'db> {
 /// rustc's `Span::find_ancestor_inside`: `span`, or the call of the macro it came from, and of
 /// the macro that call came from, .., the first that is inside `outer`.
 pub(crate) fn ancestor_inside(span: &Span, outer: &Span) -> Option<Span> {
+    // clone: a lint's span, asked only for a lint's suggestion
     let mut at = span.clone();
     loop {
         if at.file == outer.file && outer.lo <= at.lo && at.hi <= outer.hi {

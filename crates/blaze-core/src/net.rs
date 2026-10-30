@@ -3,7 +3,7 @@
 //! through the ring, through a kqueue).
 
 use std::{
-    io::{self, Read as _, Write as _},
+    io::{self, Write as _},
     net::{SocketAddr, TcpListener, TcpStream},
     os::{
         fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd},
@@ -16,7 +16,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::Address;
+use crate::{Address, RECV_MOST};
 
 pub(crate) enum Listener {
     /// `path` is the file it made, removed when it is dropped; `None` for an inherited one.
@@ -218,17 +218,30 @@ impl Socket {
         }
     }
 
-    pub(crate) fn read(&self, bytes: &mut [u8]) -> io::Result<usize> {
+    /// At most `most` bytes, and at most [`RECV_MOST`], appended to `into`, read straight into
+    /// its spare room: `into` grows to `into.len() + most.min(RECV_MOST)` at most and never
+    /// shrinks. 0 once the peer hung up.
+    pub(crate) fn read_into(&self, into: &mut Vec<u8>, most: usize) -> io::Result<usize> {
+        let most = most.min(RECV_MOST);
+        // alloc: none once `into` has room for `most` more, as a reused buffer has.
+        into.reserve(most);
+        let room = into.spare_capacity_mut().as_mut_ptr().cast::<u8>();
         loop {
-            let read = match self {
-                Socket::Unix(stream) => (&*stream).read(bytes),
-                Socket::Tcp(stream) => (&*stream).read(bytes),
-            };
-            match read {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            // SAFETY: the socket's open descriptor and `most` bytes of `into`'s spare room
+            // (reserved above), which the call only writes.
+            let got = unsafe { libc::recv(self.fd(), room.cast(), most, 0) };
+            if let Ok(got) = usize::try_from(got) {
+                // SAFETY: the call wrote `got` bytes, at most `most`, from the start of the
+                // spare room, right after `into`'s length.
+                unsafe { into.set_len(into.len() + got) };
+                return Ok(got);
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
                 // The peer reset it: as good as hung up, for a reader.
-                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => return Ok(0),
-                other => return other,
+                io::ErrorKind::ConnectionReset => return Ok(0),
+                _ => return Err(error),
             }
         }
     }

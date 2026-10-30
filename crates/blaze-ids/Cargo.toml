@@ -30,5 +30,14 @@ serde_json.workspace = true
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true
 
+# The targets blake3-servil's build script builds for (`src/b3.rs` chooses the same).
+[target.'cfg(all(target_endian = "little", any(all(target_arch = "x86_64", target_os = "linux"), all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")))))'.dependencies]
+blake3-servil.workspace = true
+
+# blake3-servil against official BLAKE3 on blaze's shapes; prints both, run by hand.
+[[bench]]
+name = "blake3"
+harness = false
+
 [lints]
 workspace = true

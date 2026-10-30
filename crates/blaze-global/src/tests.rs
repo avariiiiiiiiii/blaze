@@ -104,7 +104,7 @@ impl Raw {
         if tag == self.listen {
             let Done::Accepted { conn } = done else { panic!("the raw listen ended: {done:?}") };
             let recv = self.tag();
-            effects.push(Effect::Recv { conn, most: 1 << 24, tag: recv });
+            effects.push(Effect::Recv { conn, most: 1 << 24, into: Vec::new(), tag: recv });
             self.conns.push((conn, Vec::new(), recv));
             return;
         }
@@ -139,7 +139,7 @@ impl Raw {
         }
         let recv = self.tag();
         self.conns[at].2 = recv;
-        effects.push(Effect::Recv { conn, most: 1 << 24, tag: recv });
+        effects.push(Effect::Recv { conn, most: 1 << 24, into: Vec::new(), tag: recv });
     }
 }
 

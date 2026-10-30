@@ -9,9 +9,10 @@
 
 use super::{
     accept::Accept,
-    args::{ArgParser, Ident, LitKind, MetaItem, MetaItemOrLit, MetaList, NameValue, Path},
+    args::{ArgParser, LitKind, MetaItem, MetaItemOrLit, MetaList, NameValue},
     parsers::parse_version,
 };
+use syntax::TextRange;
 use crate::{
     checks::features::attributes,
     model::{Diag, Level, MultiSpan},
@@ -46,6 +47,7 @@ pub(crate) fn entry(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit) -> bool {
             Some("target") => target(cx, meta, list),
             Some("version") => version(cx, item, list),
             _ => {
+                // alloc: the error's expected names
                 let mut possibilities = vec!["any", "all", "not", "target"];
                 if cx.feature("cfg_version") {
                     possibilities.push("version");
@@ -95,25 +97,23 @@ fn version(cx: &mut Accept<'_, '_, '_>, item: &MetaItemOrLit, list: &MetaList) -
 /// `parse_cfg_entry_target`: `target(os = "..", ..)`, each a `target_os = ".."`. The gate of
 /// `target(..)` itself is that of an empty one; each entry's, that of its `target_` name.
 fn target(cx: &mut Accept<'_, '_, '_>, meta: &MetaItem, list: &MetaList) -> bool {
-    let compact = MetaItem {
-        path: meta.path.clone(),
-        args: ArgParser::List(MetaList { items: Vec::new(), range: list.range }),
-    };
-    gates(cx, &MetaItemOrLit::Item(compact));
+    // alloc: empty, allocates only when a gate is hit
+    let mut out = Vec::new();
+    attributes::target_compact(cx.cx, &cx.session.features, cx.attr.file, meta.range(), &mut out);
+    for diag in out.drain(..) {
+        cx.emit_err(diag);
+    }
     for sub in list.mixed() {
         let Some((name, value)) = cx.expect_name_value_item(sub, None) else { continue };
         if is_path_segment_keyword(&name.name) {
             cx.expected_identifier(name.range);
             return false;
         }
-        let entry = MetaItem {
-            path: Path {
-                segments: vec![Ident { name: format!("target_{}", name.name), range: name.range }],
-                range: name.range,
-            },
-            args: ArgParser::NameValue(value.clone()),
-        };
-        gates(cx, &MetaItemOrLit::Item(entry));
+        let range = TextRange::new(name.range.start(), value.args_range().end());
+        attributes::try_gate_target(cx.cx, &cx.session.features, cx.attr.file, &name.name, range, &mut out);
+        for diag in out.drain(..) {
+            cx.emit_err(diag);
+        }
         string_value(cx, Some(value));
     }
     true

@@ -54,15 +54,9 @@ fn why_not(db: &Db, id: StaticId) -> Option<&'static str> {
     };
     let Some(block) = module.block(db) else { return Some("not of a module's block") };
     // A block in a block is in the same body: a body with a macro call has a block of its own.
-    // SAFETY: `to_static` requires the `ModuleId` not to outlive the revision of `db` it was
-    // read in. `outer` is a local of this call, read with `db` and used only with it (here and
-    // in `owners`), and nothing derived from it is returned: `why_not` gives a `&'static str`
-    // or `None`, and `owners` gives `DefWithBodyId`s, which hold no borrow of the module. If
-    // it escaped, a later revision could read an id salsa has since reused.
-    let mut outer = unsafe { block.module(db).to_static() };
+    let mut outer = block.module(db);
     while let Some(it) = outer.block(db) {
-        // SAFETY: as above: `it`'s module replaces `outer`, a local that does not escape.
-        outer = unsafe { it.module(db).to_static() };
+        outer = it.module(db);
     }
     let Some(owner) = owners(db, outer)
         .into_iter()
@@ -209,7 +203,7 @@ fn declared(db: &Db, scope: &ItemScope, bodies: &mut Vec<DefWithBodyId>) {
 
 /// The bodies of what `module`, of no block, declares: one of them is the body a block of
 /// the module is in.
-fn owners(db: &Db, module: hir_def::ModuleId) -> Vec<DefWithBodyId> {
+fn owners<'db>(db: &'db Db, module: hir_def::ModuleIdLt<'db>) -> Vec<DefWithBodyId> {
     let def_map = module.def_map(db);
     let Some((_, data)) = def_map.modules(db).find(|(it, _)| *it == module) else {
         return Vec::new();

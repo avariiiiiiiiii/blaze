@@ -1,6 +1,7 @@
 //! A wrapper around [`TyLoweringContext`] specifically for lowering paths.
 
 use base_db::Db;
+use blaze_mem::Frame;
 use either::Either;
 use hir_def::{
     AdtId, AssocItemId, GenericDefId, GenericParamId, HasModule, Lookup, TraitId, TypeParamId,
@@ -23,7 +24,6 @@ use rustc_type_ir::{
     AliasTerm, AliasTy, AliasTyKind,
     inherent::{GenericArgs as _, Ty as _},
 };
-use smallvec::SmallVec;
 
 use crate::{
     GenericArgsProhibitedReason, IncorrectGenericsLenKind, PathGenericsSource,
@@ -533,7 +533,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         db,
                         def,
                         param,
-                        assoc_name.clone(),
+                        *assoc_name,
                     )
                 else {
                     // FIXME: Emit an error.
@@ -554,7 +554,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                         db,
                         impl_trait.def_id.0.into(),
                         TypeParamId::trait_self(impl_trait.def_id.0),
-                        assoc_name.clone(),
+                        *assoc_name,
                     )
                 else {
                     // FIXME: Emit an error.
@@ -957,6 +957,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             }
         }
 
+        let frame = self.ctx.frame;
         substs_from_args_and_bindings(
             self.ctx.db,
             self.ctx.store,
@@ -967,6 +968,7 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
             lowering_assoc_type_generics,
             explicit_self_ty,
             &mut LowererCtx { ctx: self, generics_source, span },
+            frame,
         )
     }
 
@@ -1004,15 +1006,16 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
     ) -> Option<impl Iterator<Item = (Clause<'db>, GenericPredicateSource)> + use<'a, 'b, 'db>>
     {
         let interner = self.ctx.interner;
+        let frame = self.ctx.frame;
         self.current_or_prev_segment.args_and_bindings.map(|args_and_bindings| {
             args_and_bindings.bindings.iter().enumerate().flat_map(move |(binding_idx, binding)| {
                 let found = associated_type_by_name_including_super_traits_allow_ambiguity(
                     self.ctx.db,
                     trait_ref,
-                    binding.name.clone(),
+                    *binding.name,
                 );
                 let (associated_ty, super_trait_args) = match found {
-                    None => return SmallVec::new(),
+                    None => return Vec::new_in(frame),
                     Some(t) => t,
                 };
                 let args =
@@ -1043,8 +1046,9 @@ impl<'a, 'b, 'db> PathLoweringContext<'a, 'b, 'db> {
                     AliasTermKind::ProjectionTy { def_id: associated_ty.into() },
                     args,
                 );
-                let mut predicates: SmallVec<[_; 1]> = SmallVec::with_capacity(
+                let mut predicates = Vec::with_capacity_in(
                     binding.type_ref.as_ref().map_or(0, |_| 1) + binding.bounds.len(),
+                    frame,
                 );
                 if let Some(type_ref) = binding.type_ref {
                     let lifetime_elision =
@@ -1318,6 +1322,7 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
     lowering_assoc_type_generics: bool,
     explicit_self_ty: Option<Ty<'db>>,
     ctx: &mut impl GenericArgsLowerer<'db>,
+    frame: &Frame,
 ) -> GenericArgs<'db> {
     let interner = DbInterner::new_no_crate(db);
 
@@ -1348,8 +1353,7 @@ pub(crate) fn substs_from_args_and_bindings<'db>(
         ctx,
     );
 
-    let mut substs: SmallVec<[GenericArg<'db>; 8]> =
-        SmallVec::with_capacity(def_generics.len(true));
+    let mut substs = Vec::with_capacity_in(def_generics.len(true), frame);
 
     substs.extend(
         def_generics.iter_parent_id().enumerate().map(|(idx, id)| ctx.parent_arg(idx as u32, id)),

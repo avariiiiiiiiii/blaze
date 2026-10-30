@@ -16,7 +16,7 @@ use std::ops::ControlFlow;
 
 use blaze_ids::{bits::BitSet, radix};
 use cfg::CfgExpr;
-use hir::{HirFileId, InFile, ModuleSource, Name};
+use hir::{HirFileId, InFile, ModuleSourceView, Name};
 use hir_def::{
     AdtId, BuiltinDeriveImplId, ConstId, EnumVariantId, FieldId, FunctionId, HasModule, ImplId,
     StaticId, TraitId, TypeAliasId, builtin_derive::BuiltinDeriveImplTrait,
@@ -25,8 +25,8 @@ use intern::sym;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, T,
-    ast::{self, HasModuleItem},
+    SyntaxKind, SyntaxNodePtr, T,
+    view::{self as ast, AstNode as _, HasModuleItem as _},
 };
 
 use crate::cx::Cx;
@@ -215,17 +215,17 @@ impl Defs {
         walk.modules.reserve_exact(module_ids.len());
         for &module in &module_ids {
             walk.modules.push(ModuleItems::default());
-            let source = module.definition_source(cx.db);
+            let source = module.definition_source_view(cx.db);
             let file = source.file_id;
-            let root = cx.sema.parse_or_expand(file);
-            let items = match &source.value {
-                ModuleSource::SourceFile(it) => {
-                    ast::SourceFile::cast(SyntaxNodePtr::new(it.syntax()).to_node(&root)).map(|it| it.items())
+            let root = cx.vsema.parse_or_expand(file);
+            let items = match source.value {
+                ModuleSourceView::SourceFile(it) => {
+                    ast::SourceFile::cast(ast::to_node(ast::ptr(it.syntax()), root)).map(|it| it.items())
                 }
-                ModuleSource::Module(it) => ast::Module::cast(SyntaxNodePtr::new(it.syntax()).to_node(&root))
+                ModuleSourceView::Module(it) => ast::Module::cast(ast::to_node(ast::ptr(it.syntax()), root))
                     .and_then(|it| it.item_list())
                     .map(|it| it.items()),
-                ModuleSource::BlockExpr(_) => continue,
+                ModuleSourceView::BlockExpr(_) => continue,
             };
             for item in items.into_iter().flatten() {
                 walk.item(InFile::new(file, item), Container::Module, Parent::Module);
@@ -366,30 +366,30 @@ struct Walk<'c, 'a, 'db> {
     unported: bool,
 }
 
-impl Walk<'_, '_, '_> {
-    fn item(&mut self, item: InFile<ast::Item>, container: Container, parent: Parent) {
+impl<'db> Walk<'_, '_, 'db> {
+    fn item(&mut self, item: InFile<ast::Item<'db>>, container: Container, parent: Parent) {
         if !enabled(self.cx, item.value.syntax()) {
             return;
         }
-        if let ast::Item::MacroCall(call) = &item.value {
+        if let ast::Item::MacroCall(call) = item.value {
             if let Some(expansion) = self.expand(item.with_value(call)) {
                 self.expansion(expansion, container, parent);
             }
             return;
         }
-        if self.cx.sema.is_attr_macro_call(item.as_ref()) {
-            if let Some(expansion) = self.cx.sema.expand_attr_macro(&item.value) {
+        if self.cx.vsema.is_attr_macro_call(item.value) {
+            if let Some(expansion) = self.cx.vsema.expand_attr_macro(item.value) {
                 self.expansion(expansion.value, container, parent);
             }
             return;
         }
-        if let ast::Item::MacroDef(it) = &item.value
-            && ast::HasVisibility::visibility(it).is_some()
+        if let ast::Item::MacroDef(it) = item.value
+            && ast::HasVisibility::visibility(&it).is_some()
         {
             self.unported = true;
         }
         let file = item.file_id;
-        let def = self.define(&item, container, parent);
+        let def = self.define(item, container, parent);
         let (list_container, list_kind) = match (&item.value, def) {
             (ast::Item::Module(_) | ast::Item::MacroRules(_) | ast::Item::MacroDef(_), _)
             | (ast::Item::Trait(_) | ast::Item::Impl(_), None) => return,
@@ -421,9 +421,9 @@ impl Walk<'_, '_, '_> {
     }
 
     /// What a macro call or an attribute macro of an item expands to, in place of it.
-    fn expansion(&mut self, root: InFile<SyntaxNode>, container: Container, parent: Parent) {
+    fn expansion(&mut self, root: InFile<ast::Node<'db>>, container: Container, parent: Parent) {
         for child in root.value.children() {
-            if is_item(&child)
+            if is_item(child)
                 && let Some(item) = ast::Item::cast(child)
             {
                 self.item(root.with_value(item), container, parent);
@@ -433,14 +433,14 @@ impl Walk<'_, '_, '_> {
 
     /// `node`, inside the item whose nested items have `parent`: dispatched on its kind, so that
     /// a node that is no item, macro call or anonymous definition costs its children's walk.
-    fn node(&mut self, file: HirFileId, node: SyntaxNode, parent: Parent) {
+    fn node(&mut self, file: HirFileId, node: ast::Node<'db>, parent: Parent) {
         let kind = node.kind();
-        if ast::AnyHasAttrs::can_cast(kind) && !enabled(self.cx, &node) {
+        if ast::AnyHasAttrs::can_cast(kind) && !enabled(self.cx, node) {
             return;
         }
-        if is_item(&node) {
+        if is_item(node) {
             if kind == SyntaxKind::ASM_EXPR {
-                self.global_asm(&node);
+                self.global_asm(node);
             } else if let Some(item) = ast::Item::cast(node) {
                 self.item(InFile::new(file, item), Container::Module, parent);
             }
@@ -448,7 +448,7 @@ impl Walk<'_, '_, '_> {
         }
         if kind == SyntaxKind::MACRO_CALL {
             let Some(call) = ast::MacroCall::cast(node) else { return };
-            let Some(expansion) = self.expand(InFile::new(file, &call)) else { return };
+            let Some(expansion) = self.expand(InFile::new(file, call)) else { return };
             match expansion.value.kind() {
                 SyntaxKind::MACRO_ITEMS | SyntaxKind::MACRO_STMTS => {
                     for child in expansion.value.children() {
@@ -459,8 +459,8 @@ impl Walk<'_, '_, '_> {
             }
             return;
         }
-        let parent = match is_anon(&node) {
-            true => Parent::Anon(anon_key(file, &node)),
+        let parent = match is_anon(node) {
+            true => Parent::Anon(anon_key(file, node)),
             false => parent,
         };
         for child in node.children() {
@@ -468,15 +468,15 @@ impl Walk<'_, '_, '_> {
         }
     }
 
-    fn global_asm(&mut self, node: &SyntaxNode) {
+    fn global_asm(&mut self, node: ast::Node<'_>) {
         let names = node.descendants().any(|it| matches!(it.kind(), SyntaxKind::ASM_SYM | SyntaxKind::ASM_CONST));
         self.unported |= names;
     }
 
-    fn expand(&self, call: InFile<&ast::MacroCall>) -> Option<InFile<SyntaxNode>> {
-        let id = self.cx.sema.to_def2(call)?;
+    fn expand(&self, call: InFile<ast::MacroCall<'db>>) -> Option<InFile<ast::Node<'db>>> {
+        let id = self.cx.vsema.to_def(call.value)?;
         let file: HirFileId = id.into();
-        Some(InFile::new(file, self.cx.sema.parse_or_expand(file)))
+        Some(InFile::new(file, self.cx.vsema.parse_or_expand(file)))
     }
 
     fn push(&mut self, def: Def) -> DefIdx {
@@ -488,10 +488,10 @@ impl Walk<'_, '_, '_> {
     }
 
     /// Records `item` as a definition with its variants, fields and derives.
-    fn define(&mut self, item: &InFile<ast::Item>, container: Container, parent: Parent) -> Option<DefIdx> {
+    fn define(&mut self, item: InFile<ast::Item<'db>>, container: Container, parent: Parent) -> Option<DefIdx> {
         let cx = self.cx;
         let db = cx.db;
-        let node = Some(item.as_ref().map(|it| SyntaxNodePtr::new(it.syntax())));
+        let node = Some(item.map(|it| ast::ptr(it.syntax())));
         let assoc = matches!(container, Container::Trait(_) | Container::Impl(_));
         let foreign = matches!(container, Container::Extern);
         let parent = match container {
@@ -499,9 +499,9 @@ impl Walk<'_, '_, '_> {
             Container::Module | Container::Extern => parent,
         };
         let def = |id, kind, name| Def { id, kind, node, name, parent, foreign };
-        let (def, adt) = match &item.value {
+        let (def, adt) = match item.value {
             ast::Item::Fn(it) => {
-                let function = cx.sema.to_def2(item.with_value(it))?;
+                let function = cx.vsema.to_def(it)?;
                 let id = FunctionId::try_from(function).ok()?;
                 let kind = match assoc {
                     true => Kind::AssocFn { method: function.has_self_param(db) },
@@ -510,37 +510,37 @@ impl Walk<'_, '_, '_> {
                 (def(Id::Fn(id), kind, Some(function.name(db))), None)
             }
             ast::Item::Const(it) => {
-                let konst = cx.sema.to_def2(item.with_value(it))?;
+                let konst = cx.vsema.to_def(it)?;
                 let kind = if assoc { Kind::AssocConst } else { Kind::Const };
                 let name = konst.name(db).unwrap_or_else(|| Name::new_symbol_root(sym::underscore));
                 (def(Id::Const(ConstId::from(konst)), kind, Some(name)), None)
             }
             ast::Item::Static(it) => {
-                let it = cx.sema.to_def2(item.with_value(it))?;
+                let it = cx.vsema.to_def(it)?;
                 (def(Id::Static(StaticId::from(it)), Kind::Static, Some(it.name(db))), None)
             }
             ast::Item::Struct(it) => {
-                let it = cx.sema.to_def2(item.with_value(it))?;
+                let it = cx.vsema.to_def(it)?;
                 let id = AdtId::StructId(it.into());
                 (def(Id::Adt(id), Kind::Struct, Some(it.name(db))), Some(id))
             }
             ast::Item::Union(it) => {
-                let it = cx.sema.to_def2(item.with_value(it))?;
+                let it = cx.vsema.to_def(it)?;
                 let id = AdtId::UnionId(it.into());
                 (def(Id::Adt(id), Kind::Union, Some(it.name(db))), Some(id))
             }
             ast::Item::Enum(it) => {
-                let it = cx.sema.to_def2(item.with_value(it))?;
+                let it = cx.vsema.to_def(it)?;
                 let id = AdtId::EnumId(it.into());
                 (def(Id::Adt(id), Kind::Enum, Some(it.name(db))), Some(id))
             }
             ast::Item::Trait(it) => {
                 let kind = if it.eq_token().is_some() { Kind::TraitAlias } else { Kind::Trait };
-                let it = cx.sema.to_def2(item.with_value(it))?;
+                let it = cx.vsema.to_def(it)?;
                 (def(Id::Trait(TraitId::from(it)), kind, Some(it.name(db))), None)
             }
             ast::Item::TypeAlias(it) => {
-                let it = cx.sema.to_def2(item.with_value(it))?;
+                let it = cx.vsema.to_def(it)?;
                 let kind = match (assoc, foreign) {
                     (true, _) => Kind::AssocTy,
                     (_, true) => Kind::ForeignTy,
@@ -549,11 +549,11 @@ impl Walk<'_, '_, '_> {
                 (def(Id::Alias(TypeAliasId::from(it)), kind, Some(it.name(db))), None)
             }
             ast::Item::Impl(it) => {
-                let id = ImplId::try_from(cx.sema.to_def2(item.with_value(it))?).ok()?;
+                let id = ImplId::try_from(cx.vsema.to_def(it)?).ok()?;
                 (def(Id::Impl(id), Kind::Impl { of_trait: it.trait_().is_some() }, None), None)
             }
             ast::Item::Use(_) => {
-                let ptr = item.as_ref().map(|it| SyntaxNodePtr::new(it.syntax()));
+                let ptr = item.map(|it| ast::ptr(it.syntax()));
                 (def(Id::Use(ptr), Kind::Use, None), None)
             }
             _ => return None,
@@ -588,8 +588,8 @@ impl Walk<'_, '_, '_> {
         self.modules.last_mut().expect("items are walked within a module")
     }
 
-    fn fields_and_variants(&mut self, item: &InFile<ast::Item>, adt: DefIdx) {
-        let fields = match &item.value {
+    fn fields_and_variants(&mut self, item: InFile<ast::Item<'db>>, adt: DefIdx) {
+        let fields = match item.value {
             ast::Item::Struct(it) => it.field_list(),
             ast::Item::Union(it) => it.record_field_list().map(ast::FieldList::RecordFieldList),
             ast::Item::Enum(it) => {
@@ -598,11 +598,11 @@ impl Walk<'_, '_, '_> {
                     if !enabled(self.cx, variant.syntax()) {
                         continue;
                     }
-                    let Some(id) = self.cx.sema.to_def2(item.with_value(&variant)) else { continue };
+                    let Some(id) = self.cx.vsema.to_def(variant) else { continue };
                     let index = self.push(Def {
                         id: Id::Variant(id.into()),
                         kind: Kind::Variant,
-                        node: Some(item.with_value(SyntaxNodePtr::new(variant.syntax()))),
+                        node: Some(item.with_value(ast::ptr(variant.syntax()))),
                         name: Some(id.name(db)),
                         parent: Parent::Def(adt),
                         foreign: false,
@@ -617,12 +617,12 @@ impl Walk<'_, '_, '_> {
         self.fields(item.file_id, fields, adt);
     }
 
-    fn fields(&mut self, file: HirFileId, list: Option<ast::FieldList>, owner: DefIdx) {
+    fn fields(&mut self, file: HirFileId, list: Option<ast::FieldList<'db>>, owner: DefIdx) {
         match list {
             Some(ast::FieldList::RecordFieldList(it)) => {
                 for field in it.fields() {
                     if enabled(self.cx, field.syntax()) {
-                        let def = self.cx.sema.to_def2(InFile::new(file, &field));
+                        let def = self.cx.vsema.to_def(field);
                         self.field(file, field.syntax(), def, owner);
                     }
                 }
@@ -630,7 +630,7 @@ impl Walk<'_, '_, '_> {
             Some(ast::FieldList::TupleFieldList(it)) => {
                 for field in it.fields() {
                     if enabled(self.cx, field.syntax()) {
-                        let def = self.cx.sema.to_def2(InFile::new(file, &field));
+                        let def = self.cx.vsema.to_def(field);
                         self.field(file, field.syntax(), def, owner);
                     }
                 }
@@ -639,12 +639,12 @@ impl Walk<'_, '_, '_> {
         }
     }
 
-    fn field(&mut self, file: HirFileId, node: &SyntaxNode, field: Option<hir::Field>, owner: DefIdx) {
+    fn field(&mut self, file: HirFileId, node: ast::Node<'_>, field: Option<hir::Field>, owner: DefIdx) {
         let Some(field) = field else { return };
         let index = self.push(Def {
             id: Id::Field(FieldId::from(field)),
             kind: Kind::Field,
-            node: Some(InFile::new(file, SyntaxNodePtr::new(node))),
+            node: Some(InFile::new(file, ast::ptr(node))),
             name: Some(field.name(self.cx.db)),
             parent: Parent::Def(owner),
             foreign: false,
@@ -697,7 +697,7 @@ impl Walk<'_, '_, '_> {
 
 /// Whether `node` is an item of HIR's: an item, an associated item or an item of an `extern`
 /// block, not a macro call (which is what it expands to); a `global_asm!` is one.
-fn is_item(node: &SyntaxNode) -> bool {
+fn is_item(node: ast::Node<'_>) -> bool {
     match node.kind() {
         SyntaxKind::MACRO_CALL => false,
         SyntaxKind::ASM_EXPR => matches!(
@@ -711,7 +711,7 @@ fn is_item(node: &SyntaxNode) -> bool {
 /// Whether `node` is a definition of its own in rustc's HIR that items in it have as their
 /// parent: a closure, an `async` or `gen` block (a coroutine), a `const` block, or an
 /// anonymous constant (an array's length, a const argument, a discriminant).
-pub(super) fn is_anon(node: &SyntaxNode) -> bool {
+pub(super) fn is_anon(node: ast::Node<'_>) -> bool {
     match node.kind() {
         SyntaxKind::CLOSURE_EXPR => true,
         SyntaxKind::BLOCK_EXPR => {
@@ -723,7 +723,7 @@ pub(super) fn is_anon(node: &SyntaxNode) -> bool {
                 SyntaxKind::CONST_ARG | SyntaxKind::VARIANT => true,
                 SyntaxKind::ARRAY_EXPR => {
                     let has_semi = parent.children_with_tokens().any(|it| it.kind() == SyntaxKind::SEMICOLON);
-                    has_semi && parent.children().filter(|it| ast::Expr::can_cast(it.kind())).nth(1).as_ref() == Some(node)
+                    has_semi && parent.children().filter(|it| ast::Expr::can_cast(it.kind())).nth(1) == Some(node)
                 }
                 _ => false,
             },
@@ -734,45 +734,37 @@ pub(super) fn is_anon(node: &SyntaxNode) -> bool {
 
 /// What a closure or an anonymous constant is known by: its node inside any parentheses, which
 /// is the node the front end maps the expression back to.
-pub(super) fn anon_key(file: HirFileId, node: &SyntaxNode) -> InFile<SyntaxNodePtr> {
-    let inner = |node: &SyntaxNode| {
+pub(super) fn anon_key<'t>(file: HirFileId, node: ast::Node<'t>) -> InFile<SyntaxNodePtr> {
+    let inner = |node: ast::Node<'t>| {
         (node.kind() == SyntaxKind::PAREN_EXPR)
             .then(|| node.children().find(|it| ast::Expr::can_cast(it.kind())))
             .flatten()
     };
-    let mut ptr = SyntaxNodePtr::new(node);
+    let mut ptr = ast::ptr(node);
     let mut next = inner(node);
     while let Some(node) = next {
-        ptr = SyntaxNodePtr::new(&node);
-        next = inner(&node);
+        ptr = ast::ptr(node);
+        next = inner(node);
     }
     InFile::new(file, ptr)
-}
-
-/// `node` as `N`, if it is one. rowan's `cast` takes the node by value, and a `SyntaxNode` clone
-/// is a reference count, with no allocation; the kind is tested first, so a node of another
-/// kind costs nothing.
-pub(super) fn cast<N: AstNode>(node: &SyntaxNode) -> Option<N> {
-    // clone: a refcount, no allocation; `cast` takes the node by value.
-    if N::can_cast(node.kind()) { N::cast(node.clone()) } else { None }
 }
 
 /// Whether the `cfg`s of `node`, an attribute owner, keep it, its `cfg_attr`s expanded. A node's
 /// attributes are its first children, so one without an attribute first has none and costs one
 /// step.
-fn enabled(cx: &Cx<'_, '_>, node: &SyntaxNode) -> bool {
+fn enabled(cx: &Cx<'_, '_>, node: ast::Node<'_>) -> bool {
     if node.first_child().is_none_or(|it| it.kind() != SyntaxKind::ATTR) {
         return true;
     }
-    let Some(owner) = cast::<ast::AnyHasAttrs>(node) else { return true };
+    let Some(owner) = ast::AnyHasAttrs::cast(node) else { return true };
     let cfg = cx.krate.cfg(cx.db);
-    let off = hir_expand::attrs::expand_cfg_attr(
+    let off = hir_expand::attrs::expand_cfg_attr_view(
         ast::HasAttrs::attrs(&owner),
         || cfg,
         |meta, _| {
             if let ast::Meta::CfgMeta(meta) = meta
                 && let Some(predicate) = meta.cfg_predicate()
-                && cfg.check(&CfgExpr::parse_from_ast(predicate)) == Some(false)
+                && cfg.check(&CfgExpr::parse_from_view(predicate)) == Some(false)
             {
                 return ControlFlow::Break(());
             }

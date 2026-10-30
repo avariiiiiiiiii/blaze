@@ -5,7 +5,7 @@
 //! never comes to name another key. Two columns map a node back to its key, in pages that double
 //! and never move: 12 bytes a key.
 //!
-//! The map from a key to its node is the SwissTable of `crates/intern/src/arena.rs`
+//! The map from a key to its node is a SwissTable probed with `blaze_mem::swiss`
 //! (docs/v2/plan/design/hardware.md, "interner and memo lookups"), its slots holding only the
 //! node: groups of seven 4-byte slots and a control word of tag bytes in 40 bytes, found with no
 //! lock and no write; a tag match compares the key through the node's key columns. A miss takes
@@ -23,6 +23,8 @@
 
 use std::cell::{Cell, OnceCell};
 
+use blaze_mem::swiss::{self, Ctrl};
+
 use crate::Id;
 use crate::key::DatabaseKeyIndex;
 use crate::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -32,11 +34,8 @@ use crate::zalsa::IngredientIndex;
 /// Nodes are below this: an edge word keeps its top bit for the edge's kind.
 pub(crate) const NODE_LIMIT: u32 = 1 << 31;
 
-/// Slots in a group: tag bytes 0 to 6 of the control word; byte 7 stays 0 and is masked out of
-/// every match.
+/// Slots in a group: tag bytes 0 to 6 of the control word; byte 7 stays 0.
 const GROUP: usize = 7;
-const LOW_BITS: u64 = 0x0001_0101_0101_0101;
-const HIGH_BITS: u64 = 0x0080_8080_8080_8080;
 
 /// Table `i` of a shard has `1 << i` groups, so 32 levels hold far more than [`NODE_LIMIT`].
 const LEVELS: usize = 32;
@@ -81,8 +80,8 @@ struct Writer(Mutex<usize>);
 
 /// The node to key columns of `1 << (FIRST_PAGE_BITS + p)` nodes.
 struct KeyPage {
-    ids: Box<[AtomicU64]>,
-    ingredients: Box<[AtomicU32]>,
+    ids: super::Words<AtomicU64>,
+    ingredients: super::Words<AtomicU32>,
 }
 
 pub(crate) struct Nodes {
@@ -130,22 +129,6 @@ fn parts(key: DatabaseKeyIndex) -> (u64, u32) {
     (key.key_index().as_bits(), key.ingredient_index().as_u32())
 }
 
-fn tag(hash: u64) -> u64 {
-    0x80 | (hash >> 57)
-}
-
-/// A byte's high bit set for each slot byte of `word` that may equal `tag`: every equal byte,
-/// and rarely the byte above one (the borrow of the subtraction), which the caller checks.
-fn matching(word: u64, tag: u64) -> u64 {
-    let x = word ^ (LOW_BITS * tag);
-    x.wrapping_sub(LOW_BITS) & !x & HIGH_BITS
-}
-
-/// A byte's high bit set for each empty slot byte of `word`.
-fn empty(word: u64) -> u64 {
-    !word & HIGH_BITS
-}
-
 /// The page of `node` and its offset there.
 #[inline]
 fn locate(node: u32) -> (usize, usize) {
@@ -175,51 +158,24 @@ impl Table {
     /// The node of the key, probing groups from the hash's home until one with an empty slot.
     #[inline]
     fn find(&self, keys: &Nodes, hash: u64, id: u64, ingredient: u32) -> Option<u32> {
-        let mask = self.groups.len() - 1;
-        let tag = tag(hash);
-        let mut at = hash as usize & mask;
-        loop {
-            let group = &self.groups[at];
-            let word = group.ctrl.load(Ordering::Acquire);
-            let mut hits = matching(word, tag);
-            while hits != 0 {
-                let byte = (hits.trailing_zeros() / 8) as usize;
-                hits &= hits - 1;
-                // A byte matched only by the borrow may be a slot not published in `word`.
-                if (word >> (byte * 8)) & 0xff != tag {
-                    continue;
-                }
-                // Relaxed: the tag's `Acquire` above ordered the slot's and its key's stores
-                // before us.
-                let node = group.nodes[byte].load(Ordering::Relaxed);
-                if keys.parts(node) == (id, ingredient) {
-                    return Some(node);
-                }
-            }
-            if empty(word) != 0 {
-                return None;
-            }
-            at = (at + 1) & mask;
-        }
+        let ctrl = |at: usize| Ctrl::<GROUP>(self.groups[at].ctrl.load(Ordering::Acquire));
+        swiss::find(hash, swiss::tag(hash), self.groups.len(), ctrl, |at| {
+            // Relaxed: the tag's `Acquire` above ordered the slot's and its key's stores
+            // before us; only tags published in the loaded word are matched.
+            let node = self.groups[at.group].nodes[at.slot].load(Ordering::Relaxed);
+            (keys.parts(node) == (id, ingredient)).then_some(node)
+        })
     }
 
     /// Fills the first empty slot from the hash's home group. Called by the holder of the
     /// shard's lock, the only writer, on a table that stays at most three quarters full.
     fn put(&self, hash: u64, node: u32, publish: Ordering) {
-        let mask = self.groups.len() - 1;
-        let mut at = hash as usize & mask;
-        loop {
-            let group = &self.groups[at];
-            let word = group.ctrl.load(Ordering::Relaxed);
-            let free = empty(word);
-            if free != 0 {
-                let byte = (free.trailing_zeros() / 8) as usize;
-                group.nodes[byte].store(node, Ordering::Relaxed);
-                group.ctrl.store(word | (tag(hash) << (byte * 8)), publish);
-                return;
-            }
-            at = (at + 1) & mask;
-        }
+        let at = swiss::vacant(hash, self.groups.len(), |at: usize| {
+            Ctrl::<GROUP>(self.groups[at].ctrl.load(Ordering::Relaxed))
+        });
+        let group = &self.groups[at.group];
+        group.nodes[at.slot].store(node, Ordering::Relaxed);
+        group.ctrl.store(at.tagged(swiss::tag(hash)).0, publish);
     }
 }
 
@@ -381,11 +337,8 @@ impl Nodes {
         if let Some(old) = current {
             // Relaxed: every write to the table was made by a holder of the lock we hold.
             for group in &old.groups {
-                let mut full = group.ctrl.load(Ordering::Relaxed) & HIGH_BITS;
-                while full != 0 {
-                    let byte = (full.trailing_zeros() / 8) as usize;
-                    full &= full - 1;
-                    let node = group.nodes[byte].load(Ordering::Relaxed);
+                for slot in Ctrl::<GROUP>(group.ctrl.load(Ordering::Relaxed)).full() {
+                    let node = group.nodes[slot].load(Ordering::Relaxed);
                     let (id, ingredient) = self.parts(node);
                     grown.put(hash_parts(id, ingredient), node, Ordering::Relaxed);
                 }

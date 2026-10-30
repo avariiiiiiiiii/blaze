@@ -7,7 +7,7 @@ use std::{
 };
 
 use blaze_api::{
-    Request, Response, Status,
+    Request, ResponseRef, Status,
     client::{Client, ClientError},
 };
 #[cfg(unix)]
@@ -22,30 +22,24 @@ const POLL: Duration = Duration::from_millis(1);
 
 /// What the commands ask of the daemon, which the tests fake.
 pub trait Api {
-    /// Sends `request` and hands each of its responses to `on`, owned, until its Done (handed
-    /// too); Done's `ok`.
-    fn call<F: FnMut(Response)>(&mut self, request: Request, on: F) -> Result<bool, ClientError>;
+    /// Sends `request` and hands each of its responses to `on`, read where it lies in its frame
+    /// ([`ResponseRef`]), until its Done (handed too); Done's `ok`. `on`'s second argument says
+    /// whether another whole response is already held ([`Client::call_ref`]'s), so a caller that
+    /// prints writes what it holds only when it is false: one write per burst the daemon sent.
+    fn call<F: FnMut(ResponseRef<'_>, bool)>(&mut self, request: Request, on: F) -> Result<bool, ClientError>;
 }
 
-/// One request per connection: a response to any other is the daemon's mistake, said as one.
+/// One request per connection: anything held once its Done has come (a response to another
+/// request, or more of this one) is the daemon's mistake, said as one.
 impl Api for Client {
-    fn call<F: FnMut(Response)>(&mut self, request: Request, mut on: F) -> Result<bool, ClientError> {
-        let id = self.send(request)?;
-        loop {
-            let envelope = self.receive()?;
-            if envelope.id != id {
-                let said = format!("the daemon answered request {} on a connection that sent only {id}", envelope.id);
-                return Err(ClientError::Refused(blaze_api::ApiError::new(said, None)));
-            }
-            let done = match envelope.body {
-                Response::Done { ok } => Some(ok),
-                _ => None,
-            };
-            on(envelope.body);
-            if let Some(ok) = done {
-                return Ok(ok);
-            }
+    fn call<F: FnMut(ResponseRef<'_>, bool)>(&mut self, request: Request, on: F) -> Result<bool, ClientError> {
+        let ok = self.call_ref(request, on)?;
+        if self.buffered() {
+            let said = "the daemon sent more on a connection whose one request had its Done";
+            // alloc: error path, the daemon's mistake.
+            return Err(ClientError::Refused(blaze_api::ApiError::new(said, None)));
         }
+        Ok(ok)
     }
 }
 
@@ -153,15 +147,17 @@ fn started() -> anyhow::Result<std::path::PathBuf> {
 }
 
 /// `blaze stop`: the daemon made durable and ended, waited for until its socket is gone.
+// dyn: the CLI's output writer, written a few times per command.
 pub fn stop(err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     let Some(mut client) = connect(Start::Never)? else {
         writeln!(err, "no daemon is running")?;
         return Ok(0);
     };
     let mut said = Vec::new();
-    let ok = Api::call(&mut client, Request::Stop, |response| {
-        if let Response::Error(error) = response {
-            said.push(error.what);
+    let ok = Api::call(&mut client, Request::Stop, |response, _| {
+        if let ResponseRef::Error(error) = response {
+            // alloc: error path, the daemon's errors, said once it is done.
+            said.push(error.what.to_owned());
         }
     })?;
     for what in said {
@@ -207,6 +203,7 @@ fn answers(_: &Path) -> bool {
 }
 
 /// `blaze status`: what the daemon is doing, on stdout.
+// dyn: the CLI's output writer, written a few times per command.
 pub fn status(out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     let Some(mut client) = connect(Start::Never)? else {
         writeln!(out, "no daemon is running")?;
@@ -214,9 +211,10 @@ pub fn status(out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, color:
     };
     let mut status = None;
     let mut said = Vec::new();
-    let ok = Api::call(&mut client, Request::Status, |response| match response {
-        Response::Status(it) => status = Some(it),
-        Response::Error(error) => said.push(error.what),
+    let ok = Api::call(&mut client, Request::Status, |response, _| match response {
+        ResponseRef::Status(it) => status = Some(it),
+        // alloc: error path, the daemon's errors, said once it is done.
+        ResponseRef::Error(error) => said.push(error.what.to_owned()),
         _ => {}
     })?;
     for what in said {
@@ -233,6 +231,7 @@ pub fn status(out: &mut dyn std::io::Write, err: &mut dyn std::io::Write, color:
 /// starts the daemon at the first connection. `blaze daemon uninstall`: the daemon stopped,
 /// the units unloaded and removed.
 #[cfg(unix)]
+// dyn: the CLI's output writer, written a few times per command.
 pub fn units(verb: DaemonVerb, err: &mut dyn std::io::Write, color: bool) -> anyhow::Result<i32> {
     use anyhow::Context as _;
     use blaze_api::units;
@@ -274,6 +273,7 @@ pub fn units(verb: DaemonVerb, err: &mut dyn std::io::Write, color: bool) -> any
 }
 
 #[cfg(not(unix))]
+// dyn: the CLI's output writer, written a few times per command.
 pub fn units(_: DaemonVerb, _: &mut dyn std::io::Write, _: bool) -> anyhow::Result<i32> {
     anyhow::bail!("blaze daemon: socket activation is systemd's and launchd's, and this system has neither")
 }
@@ -310,4 +310,4 @@ pub fn bytes(count: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

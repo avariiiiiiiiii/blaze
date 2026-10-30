@@ -21,8 +21,10 @@ use std::os::unix::net::{SocketAddr, UnixListener, UnixStream};
 use uds_windows::{UnixListener, UnixStream};
 
 #[cfg(unix)]
+#[allow(unsafe_code, reason = "who a peer is: system calls std has no wrapper for")]
 mod unix;
 #[cfg(windows)]
+#[allow(unsafe_code, reason = "who a peer and a path are: Win32's security calls")]
 pub mod windows;
 
 #[cfg(unix)]

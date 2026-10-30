@@ -17,8 +17,8 @@
 
 use hir::{InFile, ModuleDef, PathResolution};
 use syntax::{
-    AstNode, SyntaxNode, SyntaxNodePtr, TextRange,
-    ast::{self, HasGenericArgs, HasGenericParams, HasName, HasTypeBounds},
+    TextRange,
+    view::{self as ast, AstNode, HasGenericArgs, HasGenericParams, HasName, HasTypeBounds},
 };
 
 use super::{
@@ -31,37 +31,48 @@ use crate::{
     model::{Applicability, Diag, Span},
 };
 
-pub(super) fn type_alias(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
-    let ast::Item::TypeAlias(alias) = &item.node.value else { return Vec::new() };
+pub(super) fn type_alias<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate) -> Vec<Found> {
+    // alloc: empty, allocates nothing
+    let ast::Item::TypeAlias(alias) = item.node.value else { return Vec::new() };
     if !matches!(item.container, Container::Module) {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
-    let params: Vec<ast::GenericParam> = alias.generic_param_list().map(|it| it.generic_params().collect()).unwrap_or_default();
-    let inline: Vec<(TextRange, Vec<TextRange>)> = params.iter().filter_map(inline_bounds).collect();
+    let list = alias.generic_param_list();
+    let params = || list.iter().flat_map(|it| it.generic_params());
+    let inline = || params().filter_map(inline_bounds);
     let clause = alias.where_clause();
-    let preds: Vec<ast::WherePred> = clause.iter().flat_map(|it| it.predicates()).collect();
-    if inline.is_empty() && preds.is_empty() {
-        return Vec::new();
+    let preds = || clause.iter().flat_map(|it| it.predicates());
+    let (has_inline, has_preds) = (inline().next().is_some(), preds().next().is_some());
+    if !has_inline && !has_preds {
+        return Vec::new(); // alloc: empty, allocates nothing
     }
     let ty = alias.ty();
     let checked = krate.checked_type_aliases
         || ty.as_ref().is_some_and(|it| it.syntax().descendants().any(|it| ast::ImplTraitType::can_cast(it.kind())));
     if checked {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
+    // From here on at least one of the two lints fires.
     let span = |range: TextRange| cx.span(item.node.with_value(range));
+    // alloc: the `T::Assoc` suggestions of the lints that fire
     let qselves: Vec<Span> = ty.iter().flat_map(|ty| shorthand_qselves(cx, ty.syntax())).map(&span).collect();
-    let mut found = Vec::new();
-    if let (Some(clause), false) = (&clause, preds.is_empty()) {
-        let spans: Vec<Span> = preds.iter().map(|it| span(it.syntax().text_range())).collect();
-        let affects = preds.iter().any(affects_object_lifetime_defaults);
-        let removed = vec![(span(clause.syntax().text_range()), String::new())];
+    let mut found = Vec::with_capacity(2);
+    if let Some(clause) = &clause
+        && has_preds
+    {
+        // alloc: the primary spans of the `where` clause lint, which fires
+        let spans: Vec<Span> = preds().map(|it| span(it.syntax().text_range())).collect();
+        let affects = preds().any(affects_object_lifetime_defaults);
+        let removed = vec![(span(clause.syntax().text_range()), String::new())]; // alloc: its suggestion
         found.push(bounds_lint(cx, item, true, spans, removed, &qselves, affects));
     }
-    if !inline.is_empty() {
-        let spans: Vec<Span> = inline.iter().flat_map(|(_, bounds)| bounds.iter().map(|it| span(*it))).collect();
-        let affects = params.iter().any(|it| matches!(it, ast::GenericParam::TypeParam(p) if outlives(p.type_bound_list())));
-        let removed = inline.iter().map(|(pred, _)| (span(*pred), String::new())).collect();
+    if has_inline {
+        let bounds = inline().flat_map(|(_, list)| list.bounds());
+        // alloc: the primary spans of the bounds lint, which fires
+        let spans: Vec<Span> = bounds.map(|it| span(it.syntax().text_range())).collect();
+        let affects = params().any(|it| matches!(&it, ast::GenericParam::TypeParam(p) if outlives(p.type_bound_list())));
+        // alloc: its suggestion, one removal per parameter
+        let removed = inline().map(|(pred, _)| (span(pred), String::new())).collect();
         found.push(bounds_lint(cx, item, false, spans, removed, &qselves, affects));
     }
     found
@@ -70,7 +81,7 @@ pub(super) fn type_alias(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Fou
 #[allow(clippy::too_many_arguments)]
 fn bounds_lint(
     cx: &Cx<'_, '_>,
-    item: &Item,
+    item: &Item<'_>,
     in_where_clause: bool,
     spans: Vec<Span>,
     removed: Vec<(Span, String)>,
@@ -82,7 +93,7 @@ fn bounds_lint(
         false => "bounds on generic parameters in type aliases are not enforced",
     };
     let label = spans.last().cloned().expect("a bound");
-    let mut diag = Diag::lint("type_alias_bounds", message, spans[0].clone());
+    let mut diag = Diag::lint("type_alias_bounds", message, spans[0].clone()); // clone: the firing lint's own span
     diag.span.primary = spans;
     diag.span_label(label, "will not be checked at usage sites of the type alias");
     diag.note(
@@ -103,33 +114,33 @@ fn bounds_lint(
     for qself in qselves {
         diag.multipart_suggestion(
             "fully qualify this associated type",
+            // alloc: a suggestion of the firing lint
             vec![(qself.shrink_to_lo(), "<".to_owned()), (qself.shrink_to_hi(), " as /* Trait */>".to_owned())],
             Applicability::HasPlaceholders,
         );
     }
     crate::lints::code_fact(cx, &mut diag, item.ptr());
     if let Some((id, name)) = super::item_id(cx, item) {
-        diag.fact(blaze_items::Fact::Signature(cx.key(id)), format!("the signature of `{name}`"));
+        diag.fact(blaze_items::Fact::Signature(cx.key(id)), format!("the signature of `{name}`")); // alloc: the firing lint's fact
     }
     Found::lint(diag, Phase::Late, item.ptr())
 }
 
 /// A parameter's inline bounds: the predicate HIR makes of them (from after the parameter's
-/// name to the end of its bounds) and each bound.
-fn inline_bounds(param: &ast::GenericParam) -> Option<(TextRange, Vec<TextRange>)> {
+/// name to the end of its bounds) and its bound list, which has at least one bound.
+fn inline_bounds(param: ast::GenericParam<'_>) -> Option<(TextRange, ast::TypeBoundList<'_>)> {
     let (name_end, list) = match param {
         ast::GenericParam::TypeParam(it) => (it.name()?.syntax().text_range().end(), it.type_bound_list()?),
         ast::GenericParam::LifetimeParam(it) => (it.lifetime()?.syntax().text_range().end(), it.type_bound_list()?),
         ast::GenericParam::ConstParam(_) => return None,
     };
-    let bounds: Vec<TextRange> = list.bounds().map(|it| it.syntax().text_range()).collect();
-    let last = bounds.last()?;
-    Some((TextRange::new(name_end, last.end()), bounds))
+    let last = list.bounds().last()?;
+    Some((TextRange::new(name_end, last.syntax().text_range().end()), list))
 }
 
 /// `T: 'a`, with `T` a type parameter and no `for<..>`: a bound that sets the default lifetime
 /// of trait objects passed to the alias.
-fn affects_object_lifetime_defaults(pred: &ast::WherePred) -> bool {
+fn affects_object_lifetime_defaults(pred: ast::WherePred<'_>) -> bool {
     if pred.for_binder().is_some() {
         return false;
     }
@@ -140,67 +151,66 @@ fn affects_object_lifetime_defaults(pred: &ast::WherePred) -> bool {
     param && outlives(pred.type_bound_list())
 }
 
-fn outlives(list: Option<ast::TypeBoundList>) -> bool {
+fn outlives(list: Option<ast::TypeBoundList<'_>>) -> bool {
     list.into_iter().flat_map(|it| it.bounds()).any(|it| it.lifetime().is_some())
 }
 
 /// The `T` of each `T::Assoc` in a type, `T` a type parameter.
-fn shorthand_qselves(cx: &Cx<'_, '_>, ty: &SyntaxNode) -> Vec<TextRange> {
-    let mut found = Vec::new();
-    for path in ty.descendants().filter_map(ast::Path::cast) {
-        let Some(qualifier) = path.qualifier() else { continue };
+fn shorthand_qselves<'db>(cx: &Cx<'_, 'db>, ty: ast::Node<'db>) -> impl Iterator<Item = TextRange> {
+    ty.descendants().filter_map(ast::Path::cast).filter_map(move |path| {
+        let qualifier = path.qualifier()?;
         if qualifier.qualifier().is_some() || path.segment().and_then(|it| it.type_anchor()).is_some() {
-            continue;
+            return None;
         }
-        if let Some(PathResolution::TypeParam(_)) = cx.sema.resolve_path(&qualifier) {
-            found.push(qualifier.syntax().text_range());
+        match cx.vsema.resolve_path(qualifier) {
+            Some(PathResolution::TypeParam(_)) => Some(qualifier.syntax().text_range()),
+            _ => None,
         }
-    }
-    found
+    })
 }
 
 /// `drop_bounds` of an item's bounds, then `dyn_drop` of its `dyn Drop` types.
-pub(super) fn drop(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
-    let Some(drop) = krate.drop else { return Vec::new() };
-    let is_drop = |path: Option<ast::Path>| {
-        path.and_then(|it| cx.sema.resolve_path(&it)).is_some_and(|it| {
+pub(super) fn drop<'db>(cx: &Cx<'_, 'db>, item: &Item<'db>, krate: &Krate) -> Vec<Found> {
+    let Some(drop) = krate.drop else { return Vec::new() }; // alloc: empty, allocates nothing
+    let is_drop = |path: Option<ast::Path<'_>>| {
+        path.and_then(|it| cx.vsema.resolve_path(it)).is_some_and(|it| {
             matches!(it, PathResolution::Def(ModuleDef::Trait(t)) if hir_def::TraitId::from(t) == drop)
         })
     };
-    let bound_path = |bound: &ast::TypeBound| match bound.ty() {
-        Some(ast::Type::PathType(it)) => it.path(),
-        _ => None,
-    };
-    let mut found = Vec::new();
+    let mut found = Vec::new(); // alloc: empty until a lint fires; holds only what fires
     if matches!(item.container, Container::Module) {
-        for (bounded, bound) in clauses(&item.node) {
-            if !is_drop(bound_path(&bound.value)) {
-                continue;
+        clauses(item.node, |bounded, bound| {
+            if !is_drop(bound_path(bound.value)) {
+                return;
             }
-            let Some(needs_drop) = krate.needs_drop(cx) else { continue };
+            let Some(needs_drop) = krate.needs_drop(cx) else { return };
             let clause = match bounded {
+                // alloc: the firing lint's message
                 Some(node) => format!("{}: Drop", node.text()),
+                // alloc: the firing lint's message
                 None => "Self: Drop".to_owned(),
             };
+            // alloc: the firing lint's message
             let message = format!(
                 "bounds on `{clause}` are most likely incorrect, consider instead using `{needs_drop}` to detect whether a type can be trivially dropped"
             );
             let mut diag = Diag::lint("drop_bounds", message, cx.span(bound.as_ref().map(|it| it.syntax().text_range())));
             crate::lints::code_fact(cx, &mut diag, item.ptr());
             found.push(Found::lint(diag, Phase::Late, item.ptr()));
-        }
+        });
     }
-    for ty in item.own::<ast::DynTraitType>() {
+    for ty in item.own::<ast::DynTraitType<'_>>() {
         for bound in ty.value.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-            if !is_drop(bound_path(&bound)) {
+            if !is_drop(bound_path(bound)) {
                 continue;
             }
             let Some(needs_drop) = krate.needs_drop(cx) else { continue };
+            // alloc: the firing lint's message
             let message = format!(
                 "types that do not implement `Drop` can still have drop glue, consider instead using `{needs_drop}` to detect whether a type is trivially dropped"
             );
             let mut diag = Diag::lint("dyn_drop", message, cx.span(ty.with_value(bound.syntax().text_range())));
-            let at = ty.as_ref().map(|it| SyntaxNodePtr::new(it.syntax()));
+            let at = ty.map(|it| ast::ptr(it.syntax()));
             crate::lints::code_fact(cx, &mut diag, at);
             found.push(Found::lint(diag, Phase::Late, at));
         }
@@ -208,11 +218,18 @@ pub(super) fn drop(cx: &Cx<'_, '_>, item: &Item, krate: &Krate) -> Vec<Found> {
     found
 }
 
-/// An item's explicit trait bounds, each with the node whose text is the type it bounds as
-/// rustc prints the clause (`None`: `Self`), read only for a lint: its parameters' bounds, its
-/// `where` clause's, a trait's supertraits, and its `impl Trait` parameters; in that order.
-fn clauses(item: &InFile<ast::Item>) -> Vec<(Option<SyntaxNode>, InFile<ast::TypeBound>)> {
-    let mut found = Vec::new();
+/// The path of a bound's trait, when it is a path.
+fn bound_path(bound: ast::TypeBound<'_>) -> Option<ast::Path<'_>> {
+    match bound.ty() {
+        Some(ast::Type::PathType(it)) => it.path(),
+        _ => None,
+    }
+}
+
+/// An item's explicit trait bounds, each given to `each` with the node whose text is the type it
+/// bounds as rustc prints the clause (`None`: `Self`): its parameters' bounds, its `where`
+/// clause's, a trait's supertraits, and its `impl Trait` parameters; in that order.
+fn clauses<'t>(item: InFile<ast::Item<'t>>, mut each: impl FnMut(Option<ast::Node<'t>>, InFile<ast::TypeBound<'t>>)) {
     let node = item.value.syntax();
     let params = node.children().find_map(ast::GenericParamList::cast);
     for param in params.iter().flat_map(|it| it.type_or_const_params()) {
@@ -220,20 +237,20 @@ fn clauses(item: &InFile<ast::Item>) -> Vec<(Option<SyntaxNode>, InFile<ast::Typ
             && let Some(name) = param.name()
         {
             for bound in param.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-                found.push((Some(name.syntax().clone()), item.with_value(bound)));
+                each(Some(name.syntax()), item.with_value(bound));
             }
         }
     }
     if let ast::Item::Trait(it) = &item.value {
         for bound in it.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-            found.push((None, item.with_value(bound)));
+            each(None, item.with_value(bound));
         }
     }
     let clause = node.children().find_map(ast::WhereClause::cast);
     for pred in clause.iter().flat_map(|it| it.predicates()) {
         let Some(ty) = pred.ty() else { continue };
         for bound in pred.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-            found.push((Some(ty.syntax().clone()), item.with_value(bound)));
+            each(Some(ty.syntax()), item.with_value(bound));
         }
     }
     if let ast::Item::Fn(f) = &item.value {
@@ -241,10 +258,9 @@ fn clauses(item: &InFile<ast::Item>) -> Vec<(Option<SyntaxNode>, InFile<ast::Typ
             let apits = ty.syntax().descendants().filter(|it| ast::ImplTraitType::can_cast(it.kind()));
             for apit in apits.filter_map(ast::ImplTraitType::cast) {
                 for bound in apit.type_bound_list().into_iter().flat_map(|it| it.bounds()) {
-                    found.push((Some(apit.syntax().clone()), item.with_value(bound)));
+                    each(Some(apit.syntax()), item.with_value(bound));
                 }
             }
         }
     }
-    found
 }

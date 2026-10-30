@@ -4,12 +4,13 @@
 use base_db::{Crate, Db, RunOrder, all_crates, relevant_crates, set_run_order};
 use hir_expand::{InFile, files::FilePosition};
 use span::FileId;
-use syntax::{AstNode, algo, ast};
+use itertools::Itertools;
+use syntax::view::{self as ast, AstNode};
 
 use crate::{
     Lookup, ModuleDefId, ModuleId,
     expr_store::{Body, scope::ExprScopes},
-    nameres::{DefMap, ModuleSource, block_def_map, crate_def_map},
+    nameres::{DefMap, block_def_map, crate_def_map},
     src::HasSource,
 };
 
@@ -99,7 +100,7 @@ fn mod_at_position(db: &Db, def_map: &DefMap, position: FilePosition) -> ModuleI
     let mut size = None;
     let mut res = def_map.root;
     for (module, data) in def_map.modules(db) {
-        let src = data.definition_source(db);
+        let src = data.definition_source_view(db);
         // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
         // `position.file_id` is created before the def map, causing it to have to wrong crate
         // attached often, which means it won't compare equal. This should not be a problem in real
@@ -112,11 +113,7 @@ fn mod_at_position(db: &Db, def_map: &DefMap, position: FilePosition) -> ModuleI
             continue;
         }
 
-        let range = match src.value {
-            ModuleSource::SourceFile(it) => it.syntax().text_range(),
-            ModuleSource::Module(it) => it.syntax().text_range(),
-            ModuleSource::BlockExpr(it) => it.syntax().text_range(),
-        };
+        let range = src.value.node().text_range();
 
         if !range.contains(position.offset) {
             continue;
@@ -151,7 +148,7 @@ fn block_at_position<'db>(
     let mut size = None;
     let mut fn_def = None;
     for (_, module) in def_map.modules(db) {
-        let file_id = module.definition_source(db).file_id;
+        let file_id = module.definition_source_file_id();
         // We're not comparing the `base_db::EditionedFileId`, but rather the VFS `FileId`, because
         // `position.file_id` is created before the def map, causing it to have to wrong crate
         // attached often, which means it won't compare equal. This should not be a problem in real
@@ -165,7 +162,7 @@ fn block_at_position<'db>(
         }
         for decl in module.scope(db).declarations() {
             if let ModuleDefId::FunctionId(it) = decl {
-                let range = it.lookup(db).source(db).value.syntax().text_range();
+                let range = it.lookup(db).source_view(db).value.syntax().text_range();
 
                 if !range.contains(position.offset) {
                     continue;
@@ -195,13 +192,16 @@ fn block_at_position<'db>(
     let source_map = &Body::with_source_map(db, def_with_body).1;
     let scopes = ExprScopes::body_expr_scopes(db, def_with_body);
 
-    let root_syntax_node = file_id.parse(db).syntax_node();
-    let scope_iter =
-        algo::ancestors_at_offset(&root_syntax_node, position.offset).filter_map(|node| {
+    let root = file_id.parse(db).root();
+    let scope_iter = root
+        .token_at_offset(position.offset)
+        .map(|token| token.parent_ancestors())
+        .kmerge_by(|node1, node2| node1.text_range().len() < node2.text_range().len())
+        .filter_map(|node| {
             let block = ast::BlockExpr::cast(node)?;
             let expr = ast::Expr::from(block);
             let expr_id =
-                source_map.node_expr(InFile::new(file_id.into(), &expr))?.as_expr().unwrap();
+                source_map.node_expr_view(InFile::new(file_id.into(), expr))?.as_expr().unwrap();
             let scope = scopes.scope_for(expr_id).unwrap();
             Some(scope)
         });

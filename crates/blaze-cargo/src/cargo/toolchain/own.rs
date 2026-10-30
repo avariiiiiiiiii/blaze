@@ -206,6 +206,7 @@ fn fetch_from(
     dir: &Path,
     source: impl FnOnce() -> anyhow::Result<Source>,
 ) -> Result<(), String> {
+    // dyn: what failed, said once when the download fails.
     let failed = |e: &dyn std::fmt::Display| {
         format!(
             "blaze builds with Rust {0}, which it downloads once, and the download failed. \

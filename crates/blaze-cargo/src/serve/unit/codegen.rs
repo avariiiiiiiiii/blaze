@@ -23,11 +23,13 @@ use blaze_items::ItemKey;
 use blaze_link::{Change, Image, Native, Output};
 use blaze_units::schema::{self, Mode, Unit};
 use hir_ty_codegen::v2::{
-    Backends, BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, RootKind, Roots,
+    Backends, BodyChecks, BuildTime, Databases, HashSource, HirFrontend, HirInstance, ItemHashes, LinkInputs,
+    RootKind, Roots,
 };
 
-use super::{Job, UnitReader, files::Mounted, graph::flag, script};
-use crate::serve::work::Image as KeptImage;
+use super::{Job, Real, UnitReader, files::Mounted, graph::flag, script};
+
+type KeptImage = crate::serve::work::Image<Real>;
 
 #[cfg(test)]
 mod tests;
@@ -253,6 +255,20 @@ pub(crate) struct Generated<'db> {
     pub(crate) roots: Roots,
     pub(crate) frontend: HirFrontend<'db>,
     pub(crate) policy: Policy,
+    /// The span tables and debug names the build's code names: read once, by the first
+    /// link or test selection that needs them, and none for a library.
+    side: std::cell::OnceCell<LinkInputs>,
+}
+
+impl Generated<'_> {
+    /// What the link takes beside the code ([`HirFrontend::link_inputs`]).
+    pub(crate) fn side(&self) -> Result<&LinkInputs, String> {
+        if let Some(side) = self.side.get() {
+            return Ok(side);
+        }
+        let side = self.frontend.link_inputs(&self.built).map_err(|it| it.what)?;
+        Ok(self.side.get_or_init(|| side))
+    }
 }
 
 /// The code generator's view of the job's front end, its files named as rustc names them. Every
@@ -284,22 +300,26 @@ struct Reading<'a> {
 }
 
 impl blaze_codegen::driver::Lookup for Reading<'_> {
-    fn get(&self, key: &blaze_cas::Key) -> Result<Option<Vec<u8>>, String> {
+    fn read(&self, key: &blaze_cas::Key) -> Result<Option<&[u8]>, String> {
         match self.store.get(self.guard, key) {
-            Ok(entry) => Ok(entry.map(|it| it.bytes.to_vec())),
+            Ok(entry) => Ok(entry.map(|it| it.bytes)),
             Err(corrupt) => Err(corrupt.to_string()),
         }
     }
 }
 
 /// `unit`'s functions compiled from its roots: `Err` with the code generator's errors, each
-/// naming the function it could not compile.
+/// naming the function it could not compile. `checks` is the unit's check running beside it:
+/// told the bodies the build reaches, it stops the build once it failed. `None` for a crate
+/// whose check outcome is already known.
 pub(crate) fn generate<'db>(
     job: &Job,
     reader: &'db UnitReader,
     unit: usize,
     makes: &Makes,
     mounted: &Arc<Mounted>,
+    // dyn: `HirFrontend::with_checks` takes it; called once a level of the walk
+    checks: Option<&'db dyn BodyChecks>,
 ) -> Result<Result<Generated<'db>, Vec<String>>, String> {
     let u = job.unit(unit).map_err(|it| it.what)?;
     let krate = job
@@ -307,8 +327,15 @@ pub(crate) fn generate<'db>(
         .krate(unit)
         .ok_or_else(|| format!("unit {unit} (`{}`) has no crate in the front end", u.target.name))?;
     let toolchain = toolchain(job, unit)?;
+    // The process's code generator compiles for one toolchain: the first unit sets it up, and
+    // a unit of another is refused here, naming both.
+    hir_ty_codegen::v2::select(&toolchain)?;
     let policy = policy(job, unit, toolchain)?;
-    let frontend = frontend(job, reader, mounted);
+    let frontend = frontend(job, reader, mounted).with_policy(&policy);
+    let frontend = match checks {
+        Some(checks) => frontend.with_checks(checks),
+        None => frontend,
+    };
     let roots = match frontend.roots(krate, root_kind(u, makes)) {
         Ok(it) => it,
         Err(error) => return Ok(Err(vec![error.what])),
@@ -319,10 +346,10 @@ pub(crate) fn generate<'db>(
     let built = {
         let guard = blaze_cas::enter();
         let store = Reading { store: &job.input.store, guard: &guard };
-        Build::new(&backends, &frontend, &policy, &job.shared.memo).run(&asked, &store)
+        Build::new(&backends, &frontend, &policy, &job.shared.memo).run_with_statics(&asked, &roots.statics, &store)
     };
     match built {
-        Ok(built) => Ok(Ok(Generated { built, roots, frontend, policy })),
+        Ok(built) => Ok(Ok(Generated { built, roots, frontend, policy, side: std::cell::OnceCell::new() })),
         Err(errors) => Ok(Err(errors.into_iter().map(|it| it.what).collect())),
     }
 }
@@ -487,13 +514,14 @@ pub(crate) fn link(
     };
     let output = blaze_link::target::output(triple(job, u), shared, debug, true).map_err(|it| it.to_string())?;
     let (libs, search) = natives(job, unit, &generated.frontend)?;
-    let located = blaze_link::target::locate(&output, &libs, &search).map_err(|it| it.to_string())?;
-    let side = generated.frontend.link_inputs(built).map_err(|it| it.what)?;
+    let sysroot = crate::cargo::toolchain::sysroot().ok_or("blaze's toolchain is not installed")?;
+    let located =
+        blaze_link::target::locate(&output, &libs, &search, &sysroot).map_err(|it| it.to_string())?;
+    let side = generated.side()?;
 
-    let kept = images.iter().position(|it| it.path == path).map(|at| images.swap_remove(at).kept.into_any());
-    let kept = kept.and_then(|it| it.downcast::<Linked>().ok());
+    let kept = images.iter().position(|it| it.path == path).map(|at| images.swap_remove(at).kept);
     let mut linked = match kept.filter(|it| it.output == output) {
-        Some(it) => *it,
+        Some(it) => it,
         None => {
             let to = blaze_core::FileName::new(path.trim_start_matches('/'))
                 .ok_or_else(|| format!("`{path}` is no file the linker can name"))?;
@@ -559,12 +587,15 @@ pub(crate) fn link(
     let change = Change {
         added: built.functions.iter().filter(|it| added_keys.binary_search(&it.key).is_ok()).collect(),
         removed,
+        // A whole build tiers nothing up, so no slot runs another function than its own.
+        slots: Vec::new(),
         // A static's value is not in its key: every static is put again.
         statics: built.statics.iter().collect(),
         removed_statics: std::mem::take(&mut linked.statics),
         names,
         unnamed,
-        debug_names: side.debug_names,
+        // clone: once per image linked, a unit links one or two
+        debug_names: side.debug_names.clone(),
         natives: bytes_of
             .iter()
             .map(|(order, bytes)| Native {
@@ -584,7 +615,7 @@ pub(crate) fn link(
     linked.statics = statics;
     linked.natives = new_natives;
     linked.names = kept_names;
-    images.push(KeptImage { path: path.to_owned(), kept: Box::new(linked) });
+    images.push(KeptImage { path: path.to_owned(), kept: linked });
     Ok((bytes, read))
 }
 

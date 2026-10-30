@@ -74,9 +74,12 @@ use hir_expand::{
 use la_arena::{Idx, RawIdx};
 use span::{AstIdNode, Edition, FileAstId, SyntaxContext};
 use stdx::never;
-use syntax::{SyntaxKind, ast, match_ast};
+use syntax::{
+    SyntaxKind, ast, match_ast,
+    view::{self, AstNode as _},
+};
 
-use crate::{BlockId, attrs::parse_extra_crate_attrs};
+use crate::BlockId;
 
 pub(crate) use crate::item_tree::{
     attrs::*,
@@ -235,22 +238,21 @@ fn file_item_tree_query(
 /// tree, to the byte.
 pub(crate) fn lower_whole(db: &Db, file_id: HirFileId, krate: Crate) -> ItemTree {
     let mut ctx = lower::Ctx::new(db, file_id, krate);
-    let syntax = file_id.parse_or_expand(db);
+    let syntax = file_id.root(db);
     match_ast! {
         match syntax {
-            ast::SourceFile(file) => {
-                let root_file_id = krate.root_file_id(db);
-                let extra_top_attrs = (file_id == root_file_id)
-                    .then(|| parse_extra_crate_attrs(db, krate))
-                    .flatten()
-                    .map(|crate_attrs| (crate_attrs, root_file_id.span_file_id(db)));
-                ctx.lower_top_attrs(&file, extra_top_attrs);
-                ctx.lower_module_items(&file)
+            view::SourceFile(file) => {
+                let crate_attrs = match file_id == krate.root_file_id(db) {
+                    true => base_db::applied_crate_attr_files(db, krate),
+                    false => &[],
+                };
+                ctx.lower_top_attrs(file, crate_attrs);
+                ctx.lower_module_items(file)
             },
-            ast::MacroItems(items) => {
-                ctx.lower_module_items(&items)
+            view::MacroItems(items) => {
+                ctx.lower_module_items(items)
             },
-            ast::MacroStmts(stmts) => {
+            view::MacroStmts(stmts) => {
                 // The produced statements can include items, which should be added as top-level
                 // items.
                 ctx.lower_macro_stmts(stmts)
@@ -273,10 +275,10 @@ pub(crate) fn block_item_tree_query(
 ) -> ItemTree {
     let _p = tracing::info_span!("block_item_tree_query", ?block).entered();
     let ast_id = block.ast_id(db);
-    let block = ast_id.to_node(db);
+    let block = ast_id.to_view(db);
 
     let ctx = lower::Ctx::new(db, ast_id.file_id, krate);
-    ctx.lower_block(&block)
+    ctx.lower_block(block)
 }
 
 block::columns! {

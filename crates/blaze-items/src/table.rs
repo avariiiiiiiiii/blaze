@@ -15,6 +15,7 @@ use base_db::{Db, Crate};
 use blaze_ids::{ContentId, bits::Ranked};
 use blaze_mem::{Frame, Tag, frame};
 use blaze_query::QueryKind;
+use hir_ty::next_solver::goal_store::{FactObject, FactRef};
 
 use crate::{
     CodeHash, DeepHash, Fact, InterfaceHash, ItemHashes, ItemKey, ItemKind, LayoutHash, NameHash,
@@ -195,7 +196,7 @@ pub struct FactSet {
     objects: Box<[u32]>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum Object {
     None,
     Field(u32),
@@ -204,6 +205,10 @@ enum Object {
 
 fn tag(kind: QueryKind) -> u8 {
     u8::try_from(kind.0 - kinds::SIGNATURE.0).expect("blaze-items: a fact kind past u8")
+}
+
+fn kind_of(tag: u8) -> QueryKind {
+    QueryKind(kinds::SIGNATURE.0 + u16::from(tag))
 }
 
 fn split(fact: &Fact) -> (u8, ContentId, Object) {
@@ -226,37 +231,73 @@ fn split(fact: &Fact) -> (u8, ContentId, Object) {
             (tag, trait_.0, Object::Id(self_ty.0))
         }
         Fact::Resolves { scope, name } => (tag, scope.0, Object::Id(name.0)),
+        Fact::Target(krate) | Fact::Crate(krate) => (tag, krate, Object::None),
     }
 }
 
-fn join(tag: u8, subject: ContentId, object: Object) -> Fact {
+/// The fact `split` gives these parts of; `None` for a kind that is no fact's, or an object
+/// that is not its kind's.
+fn joined(tag: u8, subject: ContentId, object: Object) -> Option<Fact> {
     let item = ItemKey(subject);
-    let id = || match object {
-        Object::Id(it) => it,
-        Object::None | Object::Field(_) => unreachable!("fact kind {tag} without an id object"),
+    let alone = |fact: Fact| matches!(object, Object::None).then_some(fact);
+    let id = match object {
+        Object::Id(it) => Some(it),
+        Object::None | Object::Field(_) => None,
     };
-    match QueryKind(kinds::SIGNATURE.0 + u16::from(tag)) {
-        kinds::SIGNATURE => Fact::Signature(item),
-        kinds::LAYOUT => Fact::Layout(item),
+    Some(match kind_of(tag) {
+        kinds::SIGNATURE => return alone(Fact::Signature(item)),
+        kinds::LAYOUT => return alone(Fact::Layout(item)),
         kinds::FIELD => match object {
             Object::Field(field) => Fact::Field { ty: item, field },
-            Object::None | Object::Id(_) => unreachable!("a field fact without a field"),
+            Object::None | Object::Id(_) => return None,
         },
-        kinds::METHOD => Fact::Method { self_ty: SimplifiedType(subject), name: NameHash(id()) },
-        kinds::IMPLEMENTS => Fact::Implements { trait_: item, self_ty: SimplifiedType(id()) },
-        kinds::RESOLVES => Fact::Resolves { scope: item, name: NameHash(id()) },
-        kinds::CODE => Fact::Code(item),
-        kinds::CONST_VALUE => Fact::ConstValue(item),
-        kinds::NAME => Fact::Name(item),
-        kinds::CAPTURES => Fact::Captures(item),
-        kinds::AUTO_TRAITS => Fact::AutoTraits(item),
-        kinds::COHERENCE => Fact::Coherence(item),
-        kinds::SPECIALIZES => Fact::Specializes(item),
-        kinds::DROP_CHECK => Fact::DropCheck(item),
-        kinds::VTABLE => Fact::Vtable { trait_: item, self_ty: SimplifiedType(id()) },
-        kinds::DERIVE => Fact::Derive(item),
-        other => unreachable!("{other:?} is no fact kind"),
-    }
+        kinds::METHOD => Fact::Method { self_ty: SimplifiedType(subject), name: NameHash(id?) },
+        kinds::IMPLEMENTS => Fact::Implements { trait_: item, self_ty: SimplifiedType(id?) },
+        kinds::RESOLVES => Fact::Resolves { scope: item, name: NameHash(id?) },
+        kinds::CODE => return alone(Fact::Code(item)),
+        kinds::CONST_VALUE => return alone(Fact::ConstValue(item)),
+        kinds::NAME => return alone(Fact::Name(item)),
+        kinds::CAPTURES => return alone(Fact::Captures(item)),
+        kinds::AUTO_TRAITS => return alone(Fact::AutoTraits(item)),
+        kinds::COHERENCE => return alone(Fact::Coherence(item)),
+        kinds::SPECIALIZES => return alone(Fact::Specializes(item)),
+        kinds::DROP_CHECK => return alone(Fact::DropCheck(item)),
+        kinds::VTABLE => Fact::Vtable { trait_: item, self_ty: SimplifiedType(id?) },
+        kinds::DERIVE => return alone(Fact::Derive(item)),
+        kinds::TARGET => return alone(Fact::Target(subject)),
+        kinds::CRATE => return alone(Fact::Crate(subject)),
+        _ => return None,
+    })
+}
+
+/// A fact of this set, which `split` wrote.
+fn join(tag: u8, subject: ContentId, object: Object) -> Fact {
+    joined(tag, subject, object)
+        .unwrap_or_else(|| unreachable!("fact kind {tag} with {object:?} is no fact"))
+}
+
+/// `fact` as hir-ty's goal store keeps it ([`FactRef`]): its kind, subject and object as
+/// [`split`] gives them.
+pub(crate) fn fact_ref(fact: &Fact) -> FactRef {
+    let (_, subject, object) = split(fact);
+    let object = match object {
+        Object::None => FactObject::None,
+        Object::Field(field) => FactObject::Field(field),
+        Object::Id(it) => FactObject::Id(it),
+    };
+    FactRef { kind: fact.kind(), subject, object }
+}
+
+/// The fact a [`FactRef`] read from the store names; `None` for a kind or an object that is no
+/// fact's: a record is data, which this build may not have written.
+pub(crate) fn fact_of_ref(fact: FactRef) -> Option<Fact> {
+    let tag = u8::try_from(fact.kind.0.checked_sub(kinds::SIGNATURE.0)?).ok()?;
+    let object = match fact.object {
+        FactObject::None => Object::None,
+        FactObject::Field(field) => Object::Field(field),
+        FactObject::Id(it) => Object::Id(it),
+    };
+    joined(tag, fact.subject, object)
 }
 
 impl FromIterator<Fact> for FactSet {
@@ -307,7 +348,7 @@ impl FactSet {
     fn fact(&self, row: usize) -> Fact {
         let tag = self.kinds[row];
         let subject = self.ids[self.subjects[row] as usize];
-        let object = match (QueryKind(kinds::SIGNATURE.0 + u16::from(tag)), self.objects[row]) {
+        let object = match (kind_of(tag), self.objects[row]) {
             (kinds::FIELD, field) => Object::Field(field),
             (_, NO_OBJECT) => Object::None,
             (_, at) => Object::Id(self.ids[at as usize]),
@@ -321,7 +362,8 @@ impl FactSet {
     }
 
     /// The rows of facts of `kind` about `subject` (a fact's first id: the item, the
-    /// simplified self type of a method, the trait of an impl question, the scope of a name).
+    /// simplified self type of a method, the trait of an impl question, the scope of a name, the
+    /// crate of a target or of a crate fact).
     fn range(&self, kind: QueryKind, subject: ContentId) -> std::ops::Range<usize> {
         let Ok(subject) = self.ids.binary_search(&subject) else { return 0..0 };
         let at = (tag(kind), subject as u32);

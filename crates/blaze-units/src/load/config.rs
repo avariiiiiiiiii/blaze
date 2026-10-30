@@ -3,12 +3,10 @@
 //! [`Snapshot`] every later query reads the same configuration from.
 
 use std::path::Path;
-use std::rc::Rc;
 
 use blaze_format::SchemaHash;
 use blaze_ids::ContentId;
 use blaze_manifest::Config;
-use blaze_manifest::files::Files;
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use serde::{Deserialize, Serialize};
 
@@ -133,7 +131,7 @@ impl Query for ConfigChain {
 
 /// The configuration `read` describes, reading its files through `files`: every file read at
 /// once, so nothing later reads one the snapshot does not have.
-pub(crate) fn build(read: &ConfigRead, files: Rc<dyn Files>) -> anyhow::Result<Config> {
+pub(crate) fn build(read: &ConfigRead, files: Snap) -> anyhow::Result<Config<Snap>> {
     let mut config = Config::load_with(Path::new(&read.cwd), read.env.clone(), files)?;
     config.start(&read.command, &read.cli)?;
     config.cli_unstable(&read.unstable)?;

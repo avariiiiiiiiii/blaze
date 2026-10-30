@@ -1,4 +1,6 @@
 mod api;
+mod budget;
+mod bodies;
 mod db;
 mod infer;
 mod lower;
@@ -154,24 +156,13 @@ fn a_check_of_a_crate_is_its_modules_checked_one_by_one() {
         assert_eq!(modules.len(), 3, "`main`, `a` and `b`; `a::inner` goes with `a`");
         let one_by_one: Vec<_> = modules
             .iter()
-            .flat_map(|&it| crate::check::check_module(&db, it, false, None))
+            .flat_map(|&it| crate::check::check_module(&db, it, false, &crate::check::every_body))
             .collect();
-        let batch = crate::check::check_crate(&db, krate, false, None);
+        let batch = crate::check::check_crate(&db, krate, false, &crate::check::every_body);
         assert_eq!(kinds(&batch), kinds(&one_by_one));
         assert_eq!(format!("{batch:?}"), format!("{one_by_one:?}"));
     });
     set_run_order(before);
-}
-
-#[test]
-fn small_modules_share_a_task() {
-    let db = TestDB::with_files(MODULES);
-    crate::attach_db(&db, || {
-        let krate = crate::check::workspace_crates(&db)[0];
-        let modules = crate::check::file_modules(&db, krate);
-        // `main` has five items with itself; `a` three and `b` two take one task together.
-        assert_eq!(crate::check::tasks(&db, &modules), [0, 1]);
-    });
 }
 
 #[test]
@@ -181,7 +172,7 @@ fn a_check_of_some_bodies_leaves_the_others_out() {
         let krate = crate::check::workspace_crates(&db)[0];
         let main = crate::DefWithBody::from(function(&db, "main"));
         let only_main = |it: crate::DefWithBody| it == main;
-        let found = crate::check::check_crate(&db, krate, false, Some(&only_main));
+        let found = crate::check::check_crate(&db, krate, false, &only_main);
         assert_eq!(kinds(&found), ["TypeMismatch"], "{found:?}");
     });
 }
@@ -249,6 +240,31 @@ fn a_body_with_type_errors_is_refused_not_passed() {
             hir_ty_borrowck::checked(&db, def),
             Err(Refused::NotChecked { owner: def, why: NotChecked::TypeErrors })
         );
+    });
+}
+
+#[test]
+fn a_body_match_checking_refused_gets_no_borrow_check_error() {
+    let db = TestDB::with_files(
+        r#"
+//- minicore: sized, copy
+struct S;
+fn consume(_: S) {}
+fn refused(b: bool) {
+    let s = S;
+    consume(s);
+    consume(s);
+    match b {
+        true => {}
+    }
+}
+"#,
+    );
+    crate::attach_db(&db, || {
+        let def = function(&db, "refused");
+        let result = hir_ty_borrowck::borrowck(&db, def);
+        assert_eq!(result.not_checked, Some(NotChecked::MatchErrors));
+        assert!(result.diagnostics.is_empty(), "rustc reports E0004 alone: {:?}", result.diagnostics);
     });
 }
 

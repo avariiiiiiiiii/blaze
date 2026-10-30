@@ -22,8 +22,7 @@ pub enum PrettifyWsKind {
 #[deprecated = "use `hir_expand::prettify_macro_expansion()` instead"]
 pub fn prettify_macro_expansion(
     syn: SyntaxNode,
-    // dyn: asked once a `$crate`, in text made for a person to read.
-    dollar_crate_replacement: &mut dyn FnMut(&SyntaxToken, &SyntaxFactory) -> Option<SyntaxToken>,
+    dollar_crate_replacement: &mut impl FnMut(&SyntaxToken, &SyntaxFactory) -> Option<SyntaxToken>,
     inspect_mods: impl FnOnce(&[(Position, PrettifyWsKind)]),
 ) -> SyntaxNode {
     let mut indent = 0;
@@ -227,6 +226,44 @@ mod tests {
             });
             editor.finish().new_root().clone()
         }
+    }
+
+    #[test]
+    #[expect(deprecated)]
+    fn replaces_each_dollar_crate() {
+        // `$crate::x` as an expansion has it: `$crate` one identifier, which no parse makes.
+        let mut builder = syntax::SyntaxTreeBuilder::default();
+        builder.start_node(SOURCE_FILE);
+        builder.start_node(PATH);
+        builder.start_node(PATH);
+        builder.start_node(PATH_SEGMENT);
+        builder.start_node(NAME_REF);
+        builder.token(IDENT, "$crate");
+        builder.finish_node();
+        builder.finish_node();
+        builder.finish_node();
+        builder.token(T![::], "::");
+        builder.start_node(PATH_SEGMENT);
+        builder.start_node(NAME_REF);
+        builder.token(IDENT, "x");
+        builder.finish_node();
+        builder.finish_node();
+        builder.finish_node();
+        builder.finish_node();
+        let syn = builder.finish().syntax_node();
+
+        let mut asked = Vec::new();
+        let pretty = prettify_macro_expansion(
+            syn,
+            &mut |token, make| {
+                asked.push(token.text().to_owned());
+                Some(make.ident("krate"))
+            },
+            |_| (),
+        );
+        assert_eq!(asked, ["$crate"]);
+        let pretty = pretty.to_string();
+        assert!(pretty.contains("krate::x") && !pretty.contains('$'), "{pretty}");
     }
 
     #[test]

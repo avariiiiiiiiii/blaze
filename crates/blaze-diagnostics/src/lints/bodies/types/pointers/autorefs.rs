@@ -77,6 +77,7 @@ fn check(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
         "implicit autoref creates a reference to the dereference of a raw pointer",
         source_callsite(span(b, expr)?),
     );
+    // alloc: the lint's text, for a lint found
     diag.span_label(raw_ptr_span, format!("this raw pointer has type `{raw_ptr_ty}`"));
     diag.note("creating a reference requires the pointer target to be valid and imposes aliasing requirements");
     if through_overloaded_deref {
@@ -84,12 +85,16 @@ fn check(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
     } else {
         let autoref_ty = b.cx.ty(&type_info(b, inner)?.adjusted());
         diag.span_note(
+            // clone: a lint's span, for a lint found
             inner_span.clone(),
+            // alloc: the lint's text, for a lint found
             format!("autoref is being applied to this expression, resulting in: `{autoref_ty}`"),
         );
     }
     if let Some(method) = method {
+        // alloc: the lint's text, for a lint found
         let name = FunctionSignature::of(b.db(), method).name.as_str().to_owned();
+        // alloc: the lint's text, for a lint found
         diag.span_note(fn_def_span(b, method), format!("method calls to `{name}` require a reference"));
     }
     let mutbl = match borrow_mutbl {
@@ -99,6 +104,7 @@ fn check(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
     let deref = if is_coming_from_deref { "*" } else { "" };
     diag.multipart_suggestion(
         "try using a raw pointer method instead; or if this reference is intentional, make it explicit",
+        // alloc: the lint's text, for a lint found
         vec![(inner_span.shrink_to_lo(), format!("({mutbl}{deref}")), (inner_span.shrink_to_hi(), ")".to_owned())],
         Applicability::MaybeIncorrect,
     );

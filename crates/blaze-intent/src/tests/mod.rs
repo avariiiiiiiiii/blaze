@@ -11,10 +11,10 @@ use std::collections::BTreeMap;
 use blaze_core::FileName;
 use blaze_ids::ContentId;
 use blaze_vfs::{Mode, Op, Vfs};
-use syntax::{Edition, SourceFile, SyntaxKind, SyntaxNode, TextRange, WalkEvent};
+use syntax::{Edition, SourceFile, SyntaxKind, TextRange, WalkEvent, view::Node};
 
 /// Every node and token of a tree, by kind and range, bodies parsed.
-pub(crate) fn shape(node: &SyntaxNode) -> Vec<(SyntaxKind, TextRange)> {
+pub(crate) fn shape(node: Node<'_>) -> Vec<(SyntaxKind, TextRange)> {
     node.preorder_with_tokens()
         .filter_map(|event| match event {
             WalkEvent::Enter(it) => Some((it.kind(), it.text_range())),
@@ -27,7 +27,7 @@ pub(crate) fn shape(node: &SyntaxNode) -> Vec<(SyntaxKind, TextRange)> {
 #[track_caller]
 pub(crate) fn assert_fresh(tree: &syntax::Parse<SourceFile>, text: &str) {
     let fresh = SourceFile::parse(text, Edition::CURRENT);
-    assert_eq!(shape(&tree.syntax_node()), shape(&fresh.syntax_node()), "{text}");
+    assert_eq!(shape(tree.root()), shape(fresh.root()), "{text}");
     let errors = |parse: &syntax::Parse<SourceFile>| {
         let mut all: Vec<(TextRange, String)> =
             parse.errors_with_bodies().iter().map(|it| (it.range(), it.to_string())).collect();

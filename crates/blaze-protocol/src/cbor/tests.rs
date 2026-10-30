@@ -548,6 +548,88 @@ fn strings_are_borrowed_from_the_bytes() {
     assert_eq!((read.path, read.bytes), ("src/lib.rs", &[1u8, 2, 3][..]));
 }
 
+/// A list read in place holds the bytes it was read from, gives the items a `Vec` gives, and is
+/// refused where a `Vec` is, by both codecs; JSON lends no item's bytes.
+#[test]
+fn a_list_is_read_where_it_lies_and_refused_as_a_vec_is() {
+    use super::{List, Raw};
+
+    #[derive(Deserialize)]
+    struct Lent<'a> {
+        #[serde(borrow)]
+        names: List<'a, &'a str>,
+        #[serde(borrow)]
+        rows: List<'a, List<'a, u8>>,
+    }
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct Owned {
+        rows: Vec<Vec<u8>>,
+        names: Vec<String>,
+    }
+    #[derive(Serialize)]
+    struct Other<N> {
+        rows: Vec<Vec<u8>>,
+        names: N,
+    }
+    let mut random = Random(SplitMix64::new(0x6c69_7374));
+    for _ in 0..300 {
+        let names = (0..random.below(30)).map(|_| random.text()).collect();
+        let rows = (0..random.below(4))
+            .map(|_| (0..random.below(30)).map(|_| random.below(256) as u8).collect())
+            .collect();
+        let bytes = to_vec(&Owned { rows, names }).unwrap();
+        let owned = from_slice::<Owned>(&bytes).unwrap();
+        let lent = from_slice::<Lent<'_>>(&bytes).unwrap();
+        assert_eq!(lent.names.iter().map(str::to_owned).collect::<Vec<_>>(), owned.names);
+        let rows: Vec<Vec<u8>> = lent.rows.iter().map(|row| row.iter().collect()).collect();
+        assert_eq!(rows, owned.rows);
+        assert_eq!((lent.names.len(), lent.rows.len()), (owned.names.len(), owned.rows.len()));
+        let within = bytes.as_ptr_range();
+        assert!(lent.names.iter().all(|it| it.is_empty() || within.contains(&it.as_ptr())));
+        let old = reference::from_slice::<Lent<'_>>(&bytes).unwrap();
+        assert!(old.names == lent.names && old.rows == lent.rows);
+    }
+    let not_names = to_vec(&Other { rows: Vec::new(), names: ("a", 3u8) }).unwrap();
+    assert!(from_slice::<Owned>(&not_names).is_err());
+    let lent = from_slice::<Lent<'_>>(&not_names).err().expect("an integer is no name");
+    assert!(lent.to_string().contains("integer `3`"), "{lent}");
+    assert!(reference::from_slice::<Lent<'_>>(&not_names).is_err());
+    let not_a_list = to_vec(&Other { rows: Vec::new(), names: "a" }).unwrap();
+    assert!(from_slice::<Owned>(&not_a_list).is_err());
+    assert!(from_slice::<Lent<'_>>(&not_a_list).is_err());
+    assert!(serde_json::from_str::<Raw<'_>>("[1]").is_err());
+}
+
+/// A list's item past the depth limit is refused where a `Vec`'s is.
+#[test]
+fn a_list_keeps_the_depth_limit() {
+    use super::List;
+
+    #[derive(Deserialize)]
+    struct Lent<'a> {
+        #[serde(borrow)]
+        _items: List<'a, IgnoredAny>,
+    }
+    for depth in [250usize, 255, 256, 257, 300] {
+        let mut bytes = vec![0x81; depth];
+        bytes.push(0xf6);
+        let owned = from_slice::<Vec<IgnoredAny>>(&bytes).map(drop);
+        let lent = from_slice::<List<'_, IgnoredAny>>(&bytes).map(drop);
+        assert_eq!(owned, lent, "{depth}");
+        assert_eq!(reference::from_slice::<List<'_, IgnoredAny>>(&bytes).map(drop), lent, "{depth}");
+        let mut field = vec![0xa1, 0x66];
+        field.extend_from_slice(b"_items");
+        field.extend_from_slice(&bytes);
+        let owned = from_slice::<Owned>(&field).map(drop);
+        assert_eq!(from_slice::<Lent<'_>>(&field).map(drop), owned, "{depth}");
+    }
+
+    #[derive(Deserialize)]
+    struct Owned {
+        _items: Vec<IgnoredAny>,
+    }
+}
+
 /// An offence is named where [`super::check`] names it, at the start of its item.
 #[test]
 fn an_offence_is_named_where_the_checker_names_it() {

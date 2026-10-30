@@ -1,5 +1,5 @@
 use super::RequestedFeatures;
-use super::dep_cache::RegistryQueryer;
+use super::dep_cache::{Query, RegistryQueryer};
 use super::errors::ActivateResult;
 use super::types::{ActivationsKey, ConflictMap, ConflictReason, FeaturesSet, ResolveOpts};
 use crate::graph::Graph;
@@ -168,7 +168,7 @@ impl ResolverContext {
 
     pub(super) fn resolve_replacements(
         &self,
-        registry: &RegistryQueryer<'_, impl Registry>,
+        registry: &RegistryQueryer<'_, impl Registry, impl Query>,
     ) -> HashMap<PackageId, PackageId> {
         self.activations
             .values()

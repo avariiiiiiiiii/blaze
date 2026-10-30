@@ -53,11 +53,16 @@ pub mod visibility;
 pub mod test_items;
 
 #[cfg(test)]
+mod alloc_budgets;
+#[cfg(test)]
 mod macro_expansion_tests;
+#[cfg(test)]
+mod nameres_budgets;
 #[cfg(test)]
 mod test_db;
 
 use std::{
+    alloc::Allocator,
     fmt,
     hash::{Hash, Hasher},
 };
@@ -68,7 +73,7 @@ use hir_expand::{
     MacroCallStyles, MacroDefId, MacroDefKind,
     attrs::AttrId,
     builtin::{BuiltinAttrExpander, BuiltinDeriveExpander, BuiltinFnLikeExpander, EagerExpander},
-    eager::expand_eager_macro_input,
+    eager::{EagerCall, expand_eager_macro_input_view},
     impl_intern_lookup,
     mod_path::ModPath,
     name::Name,
@@ -939,6 +944,16 @@ impl AdtId {
             }
         }
     }
+
+    /// The adt's variants, in order: its one of a struct or union, an enum's as declared.
+    pub fn variants(self, db: &Db) -> impl Iterator<Item = VariantId> + '_ {
+        let (one, all) = match self {
+            AdtId::StructId(it) => (Some(VariantId::StructId(it)), None),
+            AdtId::UnionId(it) => (Some(VariantId::UnionId(it)), None),
+            AdtId::EnumId(it) => (None, Some(it.enum_variants(db).variants.values())),
+        };
+        one.into_iter().chain(all.into_iter().flatten().map(|&(it, _)| VariantId::EnumVariantId(it)))
+    }
 }
 
 /// A macro
@@ -1167,12 +1182,7 @@ impl ExpressionStoreOwnerId {
     pub fn generic_def(self, db: &Db) -> GenericDefId {
         match self {
             ExpressionStoreOwnerId::Signature(generic_def_id) => generic_def_id,
-            ExpressionStoreOwnerId::Body(def_with_body_id) => match def_with_body_id {
-                DefWithBodyId::FunctionId(id) => GenericDefId::FunctionId(id),
-                DefWithBodyId::StaticId(id) => GenericDefId::StaticId(id),
-                DefWithBodyId::ConstId(id) => GenericDefId::ConstId(id),
-                DefWithBodyId::VariantId(it) => it.lookup(db).parent.into(),
-            },
+            ExpressionStoreOwnerId::Body(def_with_body_id) => def_with_body_id.generic_def(db),
             ExpressionStoreOwnerId::VariantFields(variant_id) => match variant_id {
                 VariantId::EnumVariantId(it) => it.lookup(db).parent.into(),
                 VariantId::StructId(it) => it.into(),
@@ -1231,6 +1241,37 @@ impl GenericDefId {
             GenericDefId::AdtId(AdtId::EnumId(it)) => file_id_and_params_of_item_loc(db, it),
             GenericDefId::TraitId(it) => file_id_and_params_of_item_loc(db, it),
             GenericDefId::ImplId(it) => file_id_and_params_of_item_loc(db, it),
+            GenericDefId::ConstId(it) => (it.lookup(db).id.file_id, None),
+            GenericDefId::StaticId(it) => (it.lookup(db).id.file_id, None),
+        }
+    }
+
+    /// [`Self::file_id_and_params_of`] as a view of the database's tree: the same list.
+    pub fn file_id_and_params_of_view(
+        self,
+        db: &Db,
+    ) -> (HirFileId, Option<syntax::view::GenericParamList<'_>>) {
+        fn of_item_loc<'db, Loc>(
+            db: &'db Db,
+            def: impl Lookup<Data = Loc>,
+        ) -> (HirFileId, Option<syntax::view::GenericParamList<'db>>)
+        where
+            Loc: src::HasSource,
+            Loc::Value: syntax::view::Typed,
+            for<'t> <Loc::Value as syntax::view::Typed>::Of<'t>: syntax::view::HasGenericParams<'t>,
+        {
+            let src = def.lookup(db).source_view(db);
+            (src.file_id, syntax::view::HasGenericParams::generic_param_list(&src.value))
+        }
+
+        match self {
+            GenericDefId::FunctionId(it) => of_item_loc(db, it),
+            GenericDefId::TypeAliasId(it) => of_item_loc(db, it),
+            GenericDefId::AdtId(AdtId::StructId(it)) => of_item_loc(db, it),
+            GenericDefId::AdtId(AdtId::UnionId(it)) => of_item_loc(db, it),
+            GenericDefId::AdtId(AdtId::EnumId(it)) => of_item_loc(db, it),
+            GenericDefId::TraitId(it) => of_item_loc(db, it),
+            GenericDefId::ImplId(it) => of_item_loc(db, it),
             GenericDefId::ConstId(it) => (it.lookup(db).id.file_id, None),
             GenericDefId::StaticId(it) => (it.lookup(db).id.file_id, None),
         }
@@ -1647,25 +1688,22 @@ pub fn macro_call_as_call_id(
     macro_depth: u32,
     recursion_limit: u32,
     resolver: impl Fn(&ModPath) -> Option<MacroDefId> + Copy,
-    eager_callback: &mut dyn FnMut(
-        InFile<(syntax::AstPtr<ast::MacroCall>, span::FileAstId<ast::MacroCall>)>,
-        MacroCallId,
-    ),
+    eager_calls: &mut Vec<EagerCall, impl Allocator>,
 ) -> Result<ExpandResult<Option<MacroCallId>>, UnresolvedMacro> {
-    let def = resolver(path).ok_or_else(|| UnresolvedMacro { path: path.clone() })?;
+    let def = resolver(path).ok_or(UnresolvedMacro { path: *path })?;
 
     let res = match def.kind {
-        MacroDefKind::BuiltInEager(..) => expand_eager_macro_input(
+        MacroDefKind::BuiltInEager(..) => expand_eager_macro_input_view(
             db,
             krate,
-            &ast_id.to_node(db),
+            ast_id.to_view(db),
             ast_id,
             def,
             call_site,
             macro_depth,
             recursion_limit,
             &|path| resolver(path).filter(MacroDefId::is_fn_like),
-            eager_callback,
+            eager_calls,
         ),
         _ if def.is_fn_like() => ExpandResult {
             value: Some(def.make_call(
@@ -1677,7 +1715,7 @@ pub fn macro_call_as_call_id(
             )),
             err: None,
         },
-        _ => return Err(UnresolvedMacro { path: path.clone() }),
+        _ => return Err(UnresolvedMacro { path: *path }),
     };
     Ok(res)
 }
@@ -1760,11 +1798,19 @@ pub fn include_macro_invoc(
     db: &Db,
     krate: Crate,
 ) -> Box<[(MacroCallId, EditionedFileId)]> {
-    crate_def_map(db, krate)
-        .modules(db)
-        .flat_map(|(_, m)| m.scope(db).iter_macro_invoc())
-        .filter_map(|(_, &invoc)| invoc.loc(db).include_file_id(db, invoc).map(|x| (invoc, x)))
-        .collect()
+    blaze_mem::frame::current(|frame| {
+        let mut found = Vec::new_in(frame);
+        found.extend(
+            crate_def_map(db, krate)
+                .modules(db)
+                .flat_map(|(_, m)| m.scope(db).iter_macro_invoc())
+                .filter_map(|(_, &invoc)| {
+                    invoc.loc(db).include_file_id(db, invoc).map(|x| (invoc, x))
+                }),
+        );
+        // alloc: the memo's calls, exact, once per crate
+        Box::from(&found[..])
+    })
 }
 
 #[cfg(test)]

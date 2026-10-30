@@ -11,18 +11,23 @@
 //! worklist over `(module, name)` pairs interned to `u32`: each fact is derived once and sent
 //! only to the consumers it is new for (difference propagation), with no recursion.
 
-use std::{collections::hash_map::Entry, iter, sync::LazyLock};
+use std::{iter, sync::LazyLock};
 
 use base_db::Crate;
+use blaze_mem::Frame;
+use hashbrown::{HashMap, HashSet, hash_map::Entry};
 use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
 use intern::Symbol;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxBuildHasher;
 use span::Edition;
 
-use crate::nameres::path_resolution::ResolveMode;
+use crate::nameres::{
+    facts::{FrameMap, FrameSet, FrameVec},
+    path_resolution::ResolveMode,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ImportShape {
@@ -97,33 +102,83 @@ impl Partition {
     }
 }
 
-/// The round's components: [`components`] of [`import_graph`].
-pub(crate) fn partition(shape: &ImportShape) -> Partition {
-    components(&import_graph(shape))
+/// The round's components: [`components`] of [`import_graph`], the graph in `frame`.
+pub(crate) fn partition(frame: &Frame, shape: &ImportShape) -> Partition {
+    components(frame, &import_graph(frame, shape))
 }
 
 /// A round's import graph in CSR form: module `m` reads `targets[offsets[m]..offsets[m + 1]]`,
 /// ascending and without repeats. A module reading itself is left out: it is in its own
 /// component whatever the edges.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct ImportGraph {
-    offsets: Vec<u32>,
-    targets: Vec<u32>,
+pub(super) struct ImportGraph<'f> {
+    offsets: FrameVec<'f, u32>,
+    targets: FrameVec<'f, u32>,
 }
 
-impl ImportGraph {
+/// The starts of `rows` rows counted from `keys`: row `r` is `starts[r]..starts[r + 1]`.
+fn row_starts<'f>(frame: &'f Frame, rows: usize, keys: impl Iterator<Item = u32>) -> FrameVec<'f, u32> {
+    let mut starts = Vec::with_capacity_in(rows + 1, frame);
+    starts.resize(rows + 1, 0);
+    for key in keys {
+        starts[key as usize + 1] += 1;
+    }
+    for at in 1..starts.len() {
+        starts[at] += starts[at - 1];
+    }
+    starts
+}
+
+impl<'f> ImportGraph<'f> {
     /// The graph of `edges` (`(reader, read)`) over `nodes` modules, by two counting sorts (by
     /// target, then stably by source), so it depends on the set of edges only, not their order
     /// or repeats.
-    pub(super) fn from_edges(nodes: u32, edges: &[(u32, u32)]) -> ImportGraph {
-        let kept = edges.iter().copied().filter(move |&(src, dst)| {
-            assert!(src < nodes && dst < nodes, "import graph edge {src} -> {dst} outside {nodes} modules");
-            src != dst
-        });
-        let mut graph = blaze_ids::radix::Csr::graph(nodes as usize, kept);
-        // Each source's targets are ascending, so a repeat is next to its first.
-        graph.dedup_rows();
-        let (offsets, targets) = graph.into_parts();
+    pub(super) fn from_edges(frame: &'f Frame, nodes: u32, edges: &[(u32, u32)]) -> ImportGraph<'f> {
+        let n = nodes as usize;
+        let kept = || {
+            edges.iter().copied().filter(move |&(src, dst)| {
+                assert!(src < nodes && dst < nodes, "import graph edge {src} -> {dst} outside {nodes} modules");
+                src != dst
+            })
+        };
+        // The sources of the edges into `t` are `by_target[into[t]..into[t + 1]]`.
+        let into = row_starts(frame, n, kept().map(|(_, dst)| dst));
+        let mut cursor = Vec::with_capacity_in(n, frame);
+        cursor.extend_from_slice(&into[..n]);
+        let mut by_target = Vec::with_capacity_in(into[n] as usize, frame);
+        by_target.resize(into[n] as usize, 0);
+        for (src, dst) in kept() {
+            let at = &mut cursor[dst as usize];
+            by_target[*at as usize] = src;
+            *at += 1;
+        }
+        // Stably by source over the targets in order: each source's targets come out ascending.
+        let mut offsets = row_starts(frame, n, by_target.iter().copied());
+        cursor.clear();
+        cursor.extend_from_slice(&offsets[..n]);
+        let mut targets = Vec::with_capacity_in(by_target.len(), frame);
+        targets.resize(by_target.len(), 0);
+        for target in 0..n {
+            for &src in &by_target[into[target] as usize..into[target + 1] as usize] {
+                let at = &mut cursor[src as usize];
+                targets[*at as usize] = target as u32;
+                *at += 1;
+            }
+        }
+        // A repeat is next to its first, as each source's targets are ascending.
+        let mut write = 0u32;
+        for m in 0..n {
+            let (start, end) = (offsets[m], offsets[m + 1]);
+            offsets[m] = write;
+            for read in start..end {
+                if read == start || targets[read as usize] != targets[write as usize - 1] {
+                    targets[write as usize] = targets[read as usize];
+                    write += 1;
+                }
+            }
+        }
+        offsets[n] = write;
+        targets.truncate(write as usize);
         ImportGraph { offsets, targets }
     }
 
@@ -146,13 +201,13 @@ impl ImportGraph {
 
 /// One DFS frame of [`components`]: the node, the position of its next edge, and whether no
 /// edge has yet reached a node visited before it (Pearce's `root`).
-struct Frame {
+struct DfsFrame {
     node: u32,
     edge: u32,
     root: bool,
 }
 
-const _: () = assert!(size_of::<Frame>() == 12);
+const _: () = assert!(size_of::<DfsFrame>() == 12);
 
 /// The strongly connected components of `graph`: Pearce's PEA_FIND_SCC2 ("A space-efficient
 /// algorithm for finding strongly connected components", 2016) with its recursion turned into
@@ -160,14 +215,15 @@ const _: () = assert!(size_of::<Frame>() == 12);
 /// low link, then the component, which is numbered from `n - 1` down as components complete;
 /// a completed node's number is always at least any live index, so the one comparison
 /// `rindex[w] < rindex[v]` serves both. A component completes after every component it reaches,
-/// so numbering in completion order is reverse topological.
-pub(super) fn components(graph: &ImportGraph) -> Partition {
+/// so numbering in completion order is reverse topological. Its work is in `frame`; the
+/// partition is owned.
+pub(super) fn components(frame: &Frame, graph: &ImportGraph<'_>) -> Partition {
     let n = graph.nodes();
     let (offsets, targets) = (&graph.offsets, &graph.targets);
-    let mut rindex: Vec<u32> = Vec::with_capacity(n as usize);
+    let mut rindex: FrameVec<'_, u32> = Vec::with_capacity_in(n as usize, frame);
     rindex.resize(n as usize, 0);
-    let mut frames: Vec<Frame> = Vec::with_capacity(n as usize);
-    let mut stack: Vec<u32> = Vec::with_capacity(n as usize);
+    let mut frames: FrameVec<'_, DfsFrame> = Vec::with_capacity_in(n as usize, frame);
+    let mut stack: FrameVec<'_, u32> = Vec::with_capacity_in(n as usize, frame);
     let mut index = 1u32;
     let mut found = 0u32;
 
@@ -177,30 +233,30 @@ pub(super) fn components(graph: &ImportGraph) -> Partition {
         }
         rindex[start as usize] = index;
         index += 1;
-        frames.push(Frame { node: start, edge: offsets[start as usize], root: true });
-        while let Some(frame) = frames.last_mut() {
-            let v = frame.node as usize;
+        frames.push(DfsFrame { node: start, edge: offsets[start as usize], root: true });
+        while let Some(top) = frames.last_mut() {
+            let v = top.node as usize;
             let end = offsets[v + 1];
             let mut child = NONE;
-            while frame.edge < end {
-                let w = targets[frame.edge as usize];
+            while top.edge < end {
+                let w = targets[top.edge as usize];
                 if rindex[w as usize] == 0 {
                     child = w;
                     break;
                 }
                 if rindex[w as usize] < rindex[v] {
                     rindex[v] = rindex[w as usize];
-                    frame.root = false;
+                    top.root = false;
                 }
-                frame.edge += 1;
+                top.edge += 1;
             }
             if child != NONE {
                 rindex[child as usize] = index;
                 index += 1;
-                frames.push(Frame { node: child, edge: offsets[child as usize], root: true });
+                frames.push(DfsFrame { node: child, edge: offsets[child as usize], root: true });
                 continue;
             }
-            let root = frame.root;
+            let root = top.root;
             frames.pop();
             if root {
                 let component = n - 1 - found;
@@ -234,27 +290,33 @@ pub(super) fn components(graph: &ImportGraph) -> Partition {
     for at in &mut rindex {
         *at = n - 1 - *at;
     }
-    let count = found as usize;
-    let mut partition = blaze_ids::radix::Csr::new();
-    partition.rebuild(
-        count,
-        rindex.iter().enumerate().map(|(module, &component)| (component, module as u32)),
-        &mut stack,
-    );
-    let (starts, members) = partition.into_parts();
+    // Members by component, a counting sort over the modules in order: each list ascending.
+    let starts = row_starts(frame, found as usize, rindex.iter().copied());
+    stack.clear();
+    stack.extend_from_slice(&starts[..found as usize]);
+    let mut members = Vec::with_capacity_in(n as usize, frame);
+    members.resize(n as usize, 0);
+    for (module, &component) in rindex.iter().enumerate() {
+        let at = &mut stack[component as usize];
+        members[*at as usize] = module as u32;
+        *at += 1;
+    }
     Partition {
-        of: rindex.into_boxed_slice(),
-        starts: starts.into_boxed_slice(),
-        members: members.into_boxed_slice(),
+        // alloc: the query's value, three exact columns, once per round
+        of: Box::from(&rindex[..]),
+        // alloc: as `of`
+        starts: Box::from(&starts[..]),
+        // alloc: as `of`
+        members: Box::from(&members[..]),
     }
 }
 
 /// The edges of a round: every module a module's imports and `pub(in path)` paths can read.
-pub(super) fn import_graph(shape: &ImportShape) -> ImportGraph {
-    let mut solver = Solver::new(shape);
+pub(super) fn import_graph<'f>(frame: &'f Frame, shape: &ImportShape) -> ImportGraph<'f> {
+    let mut solver = Solver::new(frame, shape);
     solver.seed();
     solver.run();
-    ImportGraph::from_edges(shape.modules.len() as u32, &solver.edges)
+    ImportGraph::from_edges(frame, shape.modules.len() as u32, &solver.edges)
 }
 
 /// Blaze's test harness module (`blaze-engine`'s `test_harness::MODULE`). A path of the harness
@@ -324,27 +386,27 @@ struct PathRow<'a> {
     prelude: bool,
 }
 
-struct Solver<'a> {
+struct Solver<'a, 'f> {
     shape: &'a ImportShape,
-    paths: Vec<PathRow<'a>>,
+    paths: FrameVec<'f, PathRow<'a>>,
     /// The path of each level.
-    level_path: Vec<u32>,
+    level_path: FrameVec<'f, u32>,
     /// The first module each level reached, kept here instead of in `seen`.
-    level_first: Vec<u32>,
-    pair_ids: FxHashMap<(u32, Name), u32>,
-    pairs: Vec<PairRow>,
+    level_first: FrameVec<'f, u32>,
+    pair_ids: FrameMap<'f, (u32, Name), u32>,
+    pairs: FrameVec<'f, PairRow>,
     /// Head of each module's list of pairs (through `PairRow::next_in_module`).
-    module_pairs: Vec<u32>,
+    module_pairs: FrameVec<'f, u32>,
     /// Head of each module's list of glob targets (in `links`).
-    module_globs: Vec<u32>,
-    links: Vec<Link>,
+    module_globs: FrameVec<'f, u32>,
+    links: FrameVec<'f, Link>,
     /// Every fact pushed but a set's first (inline in its row) and `GlobPair`s, which are made
     /// once each by construction.
-    seen: FxHashSet<u64>,
-    work: Vec<Fact>,
+    seen: FrameSet<'f, u64>,
+    work: FrameVec<'f, Fact>,
     /// The first level of every path that looks its first segment up in the std prelude too.
-    prelude_levels: Vec<u32>,
-    edges: Vec<(u32, u32)>,
+    prelude_levels: FrameVec<'f, u32>,
+    edges: FrameVec<'f, (u32, u32)>,
 }
 
 #[inline]
@@ -356,7 +418,7 @@ fn seen_key(kind: u64, a: u32, b: u32) -> u64 {
 /// here (the modules a level reaches, the modules a name denotes) have one, so most pushes cost
 /// a load from a dense column, not a hash probe.
 #[inline]
-fn first_or_seen(first: &mut u32, seen: &mut FxHashSet<u64>, key: u64, value: u32) -> bool {
+fn first_or_seen(first: &mut u32, seen: &mut FrameSet<'_, u64>, key: u64, value: u32) -> bool {
     if *first == NONE {
         *first = value;
         true
@@ -366,15 +428,15 @@ fn first_or_seen(first: &mut u32, seen: &mut FxHashSet<u64>, key: u64, value: u3
 }
 
 #[inline]
-fn link(links: &mut Vec<Link>, head: &mut u32, value: u32) {
+fn link(links: &mut FrameVec<'_, Link>, head: &mut u32, value: u32) {
     links.push(Link { value, next: *head });
     *head = (links.len() - 1) as u32;
 }
 
-impl<'a> Solver<'a> {
-    /// Every table sized from the shape once: exactly for the paths and levels, by estimate
-    /// (a few facts per path level) for the fixed point's.
-    fn new(shape: &'a ImportShape) -> Self {
+impl<'a, 'f> Solver<'a, 'f> {
+    /// Every table sized from the shape once, in `frame`: exactly for the paths and levels, by
+    /// estimate (a few facts per path level) for the fixed point's.
+    fn new(frame: &'f Frame, shape: &'a ImportShape) -> Self {
         let modules = shape.modules.len();
         let (mut paths, mut levels, mut locals, mut preludes) = (0usize, 0usize, 0usize, 0usize);
         for module in &shape.modules {
@@ -393,26 +455,26 @@ impl<'a> Solver<'a> {
             "an import shape of {modules} modules and {levels} path levels: the graph's IDs are 31 bits"
         );
         let estimate = levels + locals + paths;
-        let mut module_pairs = Vec::with_capacity(modules);
+        let mut module_pairs = Vec::with_capacity_in(modules, frame);
         module_pairs.resize(modules, NONE);
-        let mut module_globs = Vec::with_capacity(modules);
+        let mut module_globs = Vec::with_capacity_in(modules, frame);
         module_globs.resize(modules, NONE);
-        let mut level_first = Vec::with_capacity(levels);
+        let mut level_first = Vec::with_capacity_in(levels, frame);
         level_first.resize(levels, NONE);
         Solver {
             shape,
-            paths: Vec::with_capacity(paths),
-            level_path: Vec::with_capacity(levels),
+            paths: Vec::with_capacity_in(paths, frame),
+            level_path: Vec::with_capacity_in(levels, frame),
             level_first,
-            pair_ids: FxHashMap::with_capacity_and_hasher(estimate, Default::default()),
-            pairs: Vec::with_capacity(estimate),
+            pair_ids: HashMap::with_capacity_and_hasher_in(estimate, FxBuildHasher, frame),
+            pairs: Vec::with_capacity_in(estimate, frame),
             module_pairs,
             module_globs,
-            links: Vec::with_capacity(4 * estimate),
-            seen: FxHashSet::with_capacity_and_hasher(estimate, Default::default()),
-            work: Vec::with_capacity(estimate),
-            prelude_levels: Vec::with_capacity(paths),
-            edges: Vec::with_capacity(2 * levels + modules * (1 + preludes)),
+            links: Vec::with_capacity_in(4 * estimate, frame),
+            seen: HashSet::with_capacity_and_hasher_in(estimate, FxBuildHasher, frame),
+            work: Vec::with_capacity_in(estimate, frame),
+            prelude_levels: Vec::with_capacity_in(paths, frame),
+            edges: Vec::with_capacity_in(2 * levels + modules * (1 + preludes), frame),
         }
     }
 

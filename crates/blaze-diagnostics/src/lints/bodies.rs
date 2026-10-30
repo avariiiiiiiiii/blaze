@@ -4,6 +4,7 @@
 //! only when nothing failed.
 //!
 //! - `reachable`: `unreachable_code` (typeck).
+//! - `unstable_names`: `unstable_name_collisions` (typeck).
 //! - `patterns`: what match checking lints (`unreachable_patterns`, `bindings_with_variant_name`,
 //!   `irrefutable_let_patterns`).
 //! - `recursion`: `unconditional_recursion` (the MIR lints of calls, and of drops after drop
@@ -39,8 +40,9 @@ mod reachable;
 mod recursion;
 mod types;
 mod unsafety;
+mod unstable_names;
 
-use std::cell::{Cell, OnceCell, RefCell};
+use std::cell::{Cell, OnceCell};
 
 use base_db::Db;
 use blaze_ids::radix;
@@ -52,7 +54,6 @@ use hir_def::{
     expr_store::{Body, BodySourceMap, ExpressionStore, ExpressionStoreDiagnostics},
     hir::{Array, BindingId, Expr, ExprId, Pat, PatId, Statement},
     nameres::demand::every_body,
-    resolver::ValueNs,
     signatures::FunctionSignature,
     src::HasSource as _,
 };
@@ -85,10 +86,14 @@ pub(crate) fn before_abort(cx: &Cx<'_, '_>, codegen: bool) -> Vec<Found> {
     // alloc: the lints found, empty until one is.
     let mut found = Vec::new();
     let mut scratch = Scratch::default();
+    let mut pool = liveness::Pool::default();
     for owner in body_owners(cx) {
         let Some(mut b) = BodyCx::new(cx, owner) else { continue };
         b.lend(std::mem::take(&mut scratch));
         b.elaborated = codegen || b.is_const_context();
+        if runs.unstable_names {
+            found.extend(unstable_names::lints(&b));
+        }
         if runs.reachable {
             found.extend(reachable::lints(&b));
         }
@@ -105,7 +110,7 @@ pub(crate) fn before_abort(cx: &Cx<'_, '_>, codegen: bool) -> Vec<Found> {
             found.extend(recursion::calls(&b));
         }
         if runs.liveness {
-            found.extend(liveness::lints(&b));
+            found.extend(liveness::lints(&b, &mut pool));
         }
         if runs.recursion {
             found.extend(recursion::drops(&b));
@@ -161,6 +166,7 @@ pub(crate) const fn lint_set<const N: usize>(names: [&str; N]) -> LintSet {
 #[derive(Clone, Copy)]
 struct Runs {
     reachable: bool,
+    unstable_names: bool,
     patterns: bool,
     unsafety: bool,
     recursion: bool,
@@ -172,6 +178,7 @@ impl Runs {
     fn of(cx: &Cx<'_, '_>) -> Runs {
         Runs {
             reachable: may_fire(cx, &reachable::LINTS),
+            unstable_names: may_fire(cx, &unstable_names::LINTS),
             patterns: may_fire(cx, &patterns::LINTS),
             unsafety: may_fire(cx, &unsafety::LINTS),
             recursion: may_fire(cx, &recursion::LINTS),
@@ -181,17 +188,22 @@ impl Runs {
     }
 
     fn any(self) -> bool {
-        self.reachable || self.patterns || self.unsafety || self.recursion || self.liveness || self.panics
+        self.reachable
+            || self.unstable_names
+            || self.patterns
+            || self.unsafety
+            || self.recursion
+            || self.liveness
+            || self.panics
     }
 }
 
-/// The buffers a body's [`BodyCx::exprs`] and [`BodyCx::path_value`] are built in, handed
+/// The buffers a body's [`BodyCx::exprs`] are built in, handed
 /// from body to body so that a crate's bodies grow them to the largest body's size once.
 #[derive(Default)]
 pub(crate) struct Scratch {
     exprs: Vec<ExprId>,
     stack: Vec<ExprId>,
-    values: FxHashMap<ExprId, Option<ValueNs>>,
 }
 
 /// One body being linted, with what it was lowered to and inferred as.
@@ -215,8 +227,6 @@ pub(crate) struct BodyCx<'a, 'db> {
     /// those of an anonymous const in it (an array length) are the const's. Built the first
     /// time a pass asks ([`BodyCx::exprs`]), in `scratch`'s buffers.
     exprs: OnceCell<Vec<ExprId>>,
-    /// What each path asked of [`BodyCx::path_value`] names: the passes ask of the same callee.
-    values: RefCell<FxHashMap<ExprId, Option<ValueNs>>>,
     scratch: Cell<Scratch>,
 }
 
@@ -243,16 +253,12 @@ impl<'a, 'db> BodyCx<'a, 'db> {
             mir: OnceCell::new(),
             runtime_mir: OnceCell::new(),
             exprs: OnceCell::new(),
-            values: RefCell::new(FxHashMap::default()),
             scratch: Cell::new(Scratch::default()),
         })
     }
 
-    /// Builds [`BodyCx::exprs`] and [`BodyCx::path_value`] in `scratch`'s buffers, those of
-    /// the body linted before.
-    fn lend(&mut self, mut scratch: Scratch) {
-        scratch.values.clear();
-        *self.values.get_mut() = std::mem::take(&mut scratch.values);
+    /// Builds [`BodyCx::exprs`] in `scratch`'s buffers, those of the body linted before.
+    fn lend(&mut self, scratch: Scratch) {
         *self.scratch.get_mut() = scratch;
     }
 
@@ -262,19 +268,7 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         if let Some(exprs) = self.exprs.into_inner() {
             scratch.exprs = exprs;
         }
-        scratch.values = self.values.into_inner();
         scratch
-    }
-
-    /// What the path `expr` names in the value namespace, `resolve`d the first time it is asked
-    /// of the body. `resolve` must not ask it again.
-    pub(crate) fn path_value(&self, expr: ExprId, resolve: impl FnOnce() -> Option<ValueNs>) -> Option<ValueNs> {
-        if let Some(&value) = self.values.borrow().get(&expr) {
-            return value;
-        }
-        let value = resolve();
-        self.values.borrow_mut().insert(expr, value);
-        value
     }
 
     pub(crate) fn db(&self) -> &'db Db {
@@ -311,10 +305,10 @@ impl<'a, 'db> BodyCx<'a, 'db> {
     /// The expressions of the body, each before those in it, in the order rustc visits them.
     pub(crate) fn exprs(&self) -> &[ExprId] {
         self.exprs.get_or_init(|| {
-            let Scratch { mut exprs, mut stack, values } = self.scratch.take();
+            let Scratch { mut exprs, mut stack } = self.scratch.take();
             preorder(self.store(), self.body.root_expr(), &mut exprs, &mut stack);
             // alloc: an empty `Vec` allocates nothing; the scratch's buffer is put back after.
-            self.scratch.set(Scratch { exprs: Vec::new(), stack, values });
+            self.scratch.set(Scratch { exprs: Vec::new(), stack });
             exprs
         })
     }
@@ -417,7 +411,8 @@ impl<'a, 'db> BodyCx<'a, 'db> {
                 let param = self.source_map.self_param_syntax()?;
                 Some(param.map(|it| it.syntax_node_ptr()))
             }
-            MirSpan::Unknown => None,
+            // Lints read built MIR, which inlines nothing.
+            MirSpan::Unknown | MirSpan::Inlined(_) => None,
         }
     }
 
@@ -466,6 +461,7 @@ impl<'a, 'db> BodyCx<'a, 'db> {
     /// Records on `diag` that it read the code of the body.
     pub(crate) fn code_fact(&self, diag: &mut Diag) {
         let (item, def) = self.item();
+        // alloc: the fact's text, for a lint found
         let what = format!("the code of `{}`", self.cx.def_path(def));
         diag.fact(Fact::Code(self.cx.key(item)), what);
     }
@@ -598,10 +594,12 @@ fn body_owners(cx: &Cx<'_, '_>) -> Vec<DefWithBodyId> {
             let file = at.file_id.file_id(db);
             (rank.get(&file).copied().unwrap_or(usize::MAX), at.range.start(), index, owner)
         })
+        // alloc: the bodies to sort, once per crate
         .collect();
     radix::sort_by_key(&mut owners, |&(file, at, _, _)| {
         radix::pack_64(file as u64, u64::from(u32::from(at)))
     });
+    // alloc: the bodies in order, once per crate
     owners.into_iter().map(|(.., owner)| owner).collect()
 }
 

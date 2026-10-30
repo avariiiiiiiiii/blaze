@@ -34,11 +34,11 @@ fn fixture(program: &str) -> String {
 }
 
 fn checked(level: MirOptLevel) -> MirOptions {
-    MirOptions { level, ub_checks: true, lifetime_markers: false }
+    MirOptions { level, ub_checks: true, lifetime_markers: false, inline: false }
 }
 
 fn unchecked(level: MirOptLevel) -> MirOptions {
-    MirOptions { level, ub_checks: false, lifetime_markers: false }
+    MirOptions { level, ub_checks: false, lifetime_markers: false, inline: false }
 }
 
 fn asserts(mir: &str) -> usize {

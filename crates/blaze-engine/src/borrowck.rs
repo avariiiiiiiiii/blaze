@@ -77,8 +77,7 @@ pub(crate) fn command(mut args: impl Iterator<Item = String>) -> anyhow::Result<
         num_worker_threads: 1,
         proc_macro_processes: 1,
     };
-    let (mut db, vfs, _) =
-        load_cargo::load_workspace_at(&dir, &cargo_config, &load_config, &|_| ())?;
+    let (mut db, vfs, _) = load_cargo::load_workspace_at(&dir, &cargo_config, &load_config)?;
     let file = [root.clone(), dunce::canonicalize(&root)?]
         .into_iter()
         .find_map(|it| vfs.file_id(&VfsPath::from(AbsPathBuf::assert_utf8(it))))
@@ -172,12 +171,12 @@ fn load_project(
     load_config: &LoadCargoConfig,
 ) -> anyhow::Result<(RootDatabase, vfs::Vfs)> {
     let manifest = ProjectManifest::discover_single(root)?;
-    let mut workspace = ProjectWorkspace::load(manifest, cargo_config, &|_| ())?;
+    let mut workspace = ProjectWorkspace::load(manifest, cargo_config)?;
     if let ProjectWorkspaceKind::Cargo { error: Some(error), .. } = &workspace.kind {
         anyhow::bail!("`cargo metadata` failed in {root}: {error:#}");
     }
     if load_config.load_out_dirs_from_check {
-        let build_scripts = workspace.run_build_scripts(cargo_config, &|_| ())?;
+        let build_scripts = workspace.run_build_scripts(cargo_config)?;
         workspace.set_build_scripts(build_scripts);
     }
     let (db, vfs, _) = load_cargo::load_workspace(workspace, &cargo_config.extra_env, load_config)?;

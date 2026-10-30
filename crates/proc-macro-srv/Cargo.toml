@@ -13,6 +13,7 @@ rust-version.workspace = true
 doctest = false
 
 [dependencies]
+blaze-mem = { workspace = true, optional = true }
 paths = { workspace = true, optional = true }
 rustc-hash = { workspace = true, optional = true }
 # span = {workspace = true, default-features = false} does not work
@@ -22,6 +23,7 @@ stdx = { workspace = true, optional = true }
 tt = { workspace = true, optional = true }
 
 [dev-dependencies]
+blaze-alloc-count.workspace = true
 expect-test.workspace = true
 line-index.workspace = true
 
@@ -30,7 +32,7 @@ proc-macro-test.path = "./proc-macro-test"
 
 [features]
 default = []
-in-rust-tree = ["dep:intern", "dep:paths", "dep:rustc-hash", "dep:span", "dep:stdx", "dep:tt"]
+in-rust-tree = ["dep:blaze-mem", "dep:intern", "dep:paths", "dep:rustc-hash", "dep:span", "dep:stdx", "dep:tt"]
 
 [lints]
 workspace = true

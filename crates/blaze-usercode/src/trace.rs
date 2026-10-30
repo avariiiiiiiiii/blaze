@@ -206,9 +206,26 @@ pub trait Inputs {
     /// lent rather than copied, as [`crate::inputs::Env`] keeps it.
     fn env_all(&mut self) -> &[(OsString, OsString)];
     /// The names in the directory, each with whether it is a directory, pushed to `out` (given
-    /// empty) and sorted ([`Names::sort`]); `false` for no directory there. What [`package`]
-    /// walks.
+    /// empty) and sorted ([`Names::sort`]); `false` for no directory there. What [`walk`]
+    /// lists.
     fn names(&mut self, path: &Path, out: &mut Names<'_>) -> Result<bool, Self::Error>;
+    /// What `path` is as a view holds it, a link not followed: what [`walk`] hashes. A path
+    /// whose last name is not UTF-8 is an error, as a view has no such name.
+    fn entry(&mut self, path: &Path) -> Result<Entry, Self::Error>;
+    /// [`walk`]'s hash of everything below `dir`; a view's own, kept per directory, where the
+    /// inputs have one.
+    fn tree(&mut self, dir: &Path, package: bool) -> Result<Option<[u8; 32]>, Self::Error> {
+        walk(self, dir, package)
+    }
+}
+
+/// A path as a view holds it ([`Inputs::entry`]): a directory, or a file by its view content
+/// ID ([`blaze_vfs::FILE_DOMAIN`], of its bytes; a link's are its target) and git mode.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Entry {
+    Dir,
+    File(ContentId, blaze_vfs::Mode),
+    Missing,
 }
 
 /// A directory's names as [`Inputs::names`] gives them, in a task's frame, each with whether it
@@ -318,81 +335,60 @@ pub fn package_of(path: &Path) -> Option<&Path> {
 /// by its path from `dir` and its bytes, but what is in a directory whose name starts with a
 /// `.` and the package's own `target`. `None` for no directory there.
 pub fn package<I: Inputs + ?Sized>(inputs: &mut I, dir: &Path) -> Result<Option<[u8; 32]>, I::Error> {
-    walk(inputs, dir, true)
+    inputs.tree(dir, true)
 }
 
 /// The hash of every file below `dir`, as [`package`] hashes them; with `package`, a
-/// package's, without its hidden directories and its `target`.
+/// package's, without its hidden names and its `target`. The view's own hash of the same
+/// tree ([`blaze_query::Cx::tree`]) by the same type ([`blaze_query::TreeHash`]), one
+/// directory at a time, so a tree hashed off the disk and one in a view agree.
 pub fn walk<I: Inputs + ?Sized>(
     inputs: &mut I,
     dir: &Path,
     package: bool,
 ) -> Result<Option<[u8; 32]>, I::Error> {
     frame::task(Tag::Usercode, |frame| {
-        let mut top = Names::new_in(frame);
-        if !inputs.names(dir, &mut top)? {
-            return Ok(None);
-        }
-        let mut hasher = Hasher::new(match package {
-            true => os_domain!("blaze v2 package tree 1"),
-            false => os_domain!("blaze v2 tree 1"),
-        });
         scratch::with_path(|whole| {
             whole.push(dir);
-            walk_in(inputs, dir, whole, &mut top, (package, true), &mut hasher, frame)
-        })?;
-        Ok(Some(hasher.finish().0))
+            walk_in(inputs, whole, (package, true), frame)
+        })
     })
 }
 
-/// One directory of [`walk`], at `whole` below `dir` (`top` for `dir` itself): its names in
-/// order, then each of its directories the same way, so the walk's order is the paths'.
-/// `whole` is the one path buffer of the walk, pushed and popped, never joined anew; every
-/// listing is in the walk's frame, freed when the walk ends.
-fn walk_in<'f, I: Inputs + ?Sized>(
+/// One directory of [`walk`] at `whole`, `top` for the one asked for. `whole` is the one path
+/// buffer of the walk, pushed and popped, never joined anew; every listing is in the walk's
+/// frame, freed when the walk ends.
+fn walk_in<I: Inputs + ?Sized>(
     inputs: &mut I,
-    dir: &Path,
     whole: &mut PathBuf,
-    names: &mut Names<'f>,
     (package, top): (bool, bool),
-    hasher: &mut Hasher,
-    frame: &'f Frame,
-) -> Result<(), I::Error> {
+    frame: &Frame,
+) -> Result<Option<[u8; 32]>, I::Error> {
+    let mut names = Names::new_in(frame);
+    if !inputs.names(whole, &mut names)? {
+        return Ok(None);
+    }
     names.sort();
-    let names: &Names<'f> = names;
-    let mut deeper: Vec<(&OsStr, Names<'f>), &'f Frame> = Vec::new_in(frame);
-    for (name, is_dir) in names.iter() {
-        // ASCII is itself in every platform's encoded bytes, and only there.
-        if package && (name.as_encoded_bytes().starts_with(b".") || (top && name == "target")) {
-            continue;
-        }
+    let mut hash = blaze_query::TreeHash::new(package, top);
+    for (name, _) in names.iter() {
         whole.push(name);
-        let rel = os_bytes(whole.strip_prefix(dir).unwrap_or(whole.as_path()).as_os_str());
-        match is_dir {
-            true => {
-                let mut inner = Names::new_in(frame);
-                if inputs.names(whole, &mut inner)? {
-                    hasher.part(&rel).part(b"d");
-                    deeper.push((name, inner));
+        let Some(text) = name.to_str() else {
+            inputs.entry(whole)?;
+            panic!("{} is not UTF-8, which `Inputs::entry` refuses", whole.display());
+        };
+        if hash.keeps(text) {
+            match inputs.entry(whole)? {
+                Entry::Dir => {
+                    let below = walk_in(inputs, whole, (package, false), frame)?;
+                    hash.dir(text, below);
                 }
-            }
-            false => {
-                let hash = inputs.file(whole)?;
-                hasher.part(&rel);
-                match hash {
-                    Some(hash) => _ = hasher.part(&hash),
-                    None => _ = hasher.part(b"-"),
-                }
+                Entry::File(id, mode) => hash.file(text, Some((id, mode))),
+                Entry::Missing => hash.file(text, None),
             }
         }
         whole.pop();
     }
-    for (name, inner) in deeper.iter_mut() {
-        whole.push(*name);
-        walk_in(inputs, dir, whole, inner, (package, false), hasher, frame)?;
-        whole.pop();
-    }
-    Ok(())
+    Ok(Some(hash.finish()))
 }
 
 /// What a traced file that is a directory hashes as: what a look at it showed is that it is
@@ -932,6 +928,13 @@ mod tests {
 
     impl Inputs for Fixed {
         type Error = String;
+        fn entry(&mut self, path: &Path) -> Result<crate::trace::Entry, String> {
+            Ok(match (self.dirs.contains_key(path), self.files.get(path)) {
+                (true, _) => crate::trace::Entry::Dir,
+                (false, Some(hash)) => crate::trace::Entry::File(blaze_ids::ContentId(*hash), blaze_vfs::Mode::Regular),
+                (false, None) => crate::trace::Entry::Missing,
+            })
+        }
         fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
             if self.dirs.contains_key(path) {
                 return Ok(Some(DIRECTORY));
@@ -1063,6 +1066,9 @@ mod tests {
 
     impl Inputs for Asked {
         type Error = String;
+        fn entry(&mut self, path: &Path) -> Result<Entry, String> {
+            self.0.entry(path)
+        }
         fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
             self.1.push(format!("file {}", path.display()));
             self.0.file(path)
@@ -1144,6 +1150,12 @@ mod tests {
         struct Tree(BTreeMap<PathBuf, Vec<(&'static str, bool)>>);
         impl Inputs for Tree {
             type Error = String;
+            fn entry(&mut self, path: &Path) -> Result<Entry, String> {
+                Ok(match self.0.contains_key(path) {
+                    true => Entry::Dir,
+                    false => Entry::File(ContentId([7; 32]), blaze_vfs::Mode::Regular),
+                })
+            }
             fn file(&mut self, _: &Path) -> Result<Option<[u8; 32]>, String> {
                 Ok(Some([7; 32]))
             }

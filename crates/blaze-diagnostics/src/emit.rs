@@ -22,7 +22,7 @@
 pub mod codes;
 mod json;
 #[cfg(test)]
-mod reference;
+mod reference_tests;
 
 use std::borrow::Cow;
 
@@ -77,7 +77,7 @@ impl File {
     fn new(read: String) -> File {
         let len = read.len() as u32;
         let bom = if read.starts_with('\u{feff}') { '\u{feff}'.len_utf8() } else { 0 };
-        let mut crs = Vec::new();
+        let mut crs = Vec::new(); // alloc: only for a file with `\r\n`, placed for a diagnostic written
         let text = match bom == 0 && memchr::memmem::find(read.as_bytes(), b"\r\n").is_none() {
             true => read,
             false => {
@@ -175,7 +175,7 @@ impl Sources {
     /// in, that were not given to [`Sources::add`]: each once, in the order first pointed into.
     pub fn unread<'d>(&self, diags: impl IntoIterator<Item = &'d Diag>) -> Vec<&'d str> {
         let mut seen: hashbrown::HashSet<&'d str, FxBuildHasher> = hashbrown::HashSet::default();
-        let mut unread = Vec::new();
+        let mut unread = Vec::new(); // alloc: the files diagnostics written point into, the edge
         for diag in diags {
             each_file(diag, &mut |name| {
                 if !self.names.contains_key(name) && seen.insert(name) {
@@ -310,7 +310,7 @@ pub fn rendered(diag: &Diag, sources: &Sources, style: Style) -> String {
 /// can't show them), so one of [`summary`]'s notes naming them is the empty string.
 pub fn written(diag: &Diag, sources: &Sources, style: Style) -> String {
     if style.short && explains(diag) {
-        return String::new();
+        return String::new(); // alloc: empty, allocates nothing
     }
     write(diag, &Placed::new(diag, sources), style)
 }
@@ -321,7 +321,7 @@ pub fn written(diag: &Diag, sources: &Sources, style: Style) -> String {
 /// codes to explain is the empty string, as in [`written`].
 pub fn json(diag: &Diag, sources: &Sources, style: Style) -> String {
     if style.short && explains(diag) {
-        return String::new();
+        return String::new(); // alloc: empty, allocates nothing
     }
     let placed = Placed::new(diag, sources);
     let rendered = write(diag, &placed, style);
@@ -360,34 +360,36 @@ fn explains(diag: &Diag) -> bool {
 /// `DiagCtxtInner::print_error_count` gives them.
 pub fn summary<'d>(diags: impl IntoIterator<Item = &'d Diag> + Clone) -> Vec<Diag> {
     let (mut errors, mut warnings) = (0usize, 0usize);
+    // clone: the iterator, read twice; the diagnostics are borrowed
     for diag in diags.clone() {
         errors += usize::from(diag.level == Level::Error);
         warnings += usize::from(diag.level == Level::Warning);
     }
     if errors == 0 && warnings == 0 {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
     let warned = match warnings {
-        0 => String::new(),
-        1 => "1 warning emitted".to_owned(),
-        count => format!("{count} warnings emitted"),
+        0 => String::new(), // alloc: empty, allocates nothing
+        1 => "1 warning emitted".to_owned(), // alloc: a closing line written, the edge
+        count => format!("{count} warnings emitted"), // alloc: a closing line written, the edge
     };
     let aborted = match errors {
-        0 => String::new(),
-        1 => "aborting due to 1 previous error".to_owned(),
-        count => format!("aborting due to {count} previous errors"),
+        0 => String::new(), // alloc: empty, allocates nothing
+        1 => "aborting due to 1 previous error".to_owned(), // alloc: a closing line written, the edge
+        count => format!("aborting due to {count} previous errors"), // alloc: a closing line written, the edge
     };
     let mut closing = Vec::with_capacity(3);
     match (errors, warnings) {
         (0, _) => closing.push(Diag::new(Level::Warning, None, warned)),
         (_, 0) => closing.push(Diag::new(Level::Error, None, aborted)),
+        // alloc: a closing line written, the edge
         (_, _) => closing.push(Diag::new(Level::Error, None, format!("{aborted}; {warned}"))),
     }
     let mut explained: Vec<&str> = diags
         .into_iter()
         .filter_map(|it| it.code.as_ref().and_then(Code::error))
         .filter(|code| codes::explanation(code).is_some())
-        .collect();
+        .collect(); // alloc: the codes named in the closing lines, the edge
     explained.sort_unstable();
     explained.dedup();
     match &explained[..] {
@@ -395,6 +397,7 @@ pub fn summary<'d>(diags: impl IntoIterator<Item = &'d Diag> + Clone) -> Vec<Dia
         [code] => closing.push(Diag::new(
             Level::FailureNote,
             None,
+            // alloc: a closing line written, the edge
             format!("For more information about this error, try `rustc --explain {code}`."),
         )),
         [first, ..] => {
@@ -403,6 +406,7 @@ pub fn summary<'d>(diags: impl IntoIterator<Item = &'d Diag> + Clone) -> Vec<Dia
             closing.push(Diag::new(
                 Level::FailureNote,
                 None,
+                // alloc: a closing line written, the edge
                 format!(
                     "Some errors have detailed explanations: {}{more}",
                     explained[..shown].join(", ")
@@ -411,6 +415,7 @@ pub fn summary<'d>(diags: impl IntoIterator<Item = &'d Diag> + Clone) -> Vec<Dia
             closing.push(Diag::new(
                 Level::FailureNote,
                 None,
+                // alloc: a closing line written, the edge
                 format!("For more information about an error, try `rustc --explain {first}`."),
             ));
         }
@@ -527,7 +532,7 @@ fn render<'a>(diag: &'a Diag, placed: &Placed<'a>, style: Style) -> String {
                         group = group.element(
                             annotate_snippets::Level::NOTE
                                 .no_name()
-                                .message(format!("and {others} other candidate{plural}")),
+                                .message(format!("and {others} other candidate{plural}")), // alloc: rendering, the edge
                         );
                     }
                 }
@@ -628,6 +633,7 @@ fn collect_annotations<'a>(span: &'a MultiSpan, extra: Labels<'a>, placed: &Plac
         };
         match output.iter_mut().find(|(name, ..)| *name == at.file) {
             Some((.., annotations)) => annotations.push(annotation),
+            // alloc: none, the annotation inline in the `SmallVec`
             None => output.push((at.file.as_str(), file, smallvec![annotation])),
         }
     }
@@ -696,7 +702,7 @@ fn substitutions<'a>(
                 hi: file.norm(span.hi),
                 snippet: Cow::Borrowed(snippet.as_str()),
             })
-            .collect();
+            .collect(); // alloc: none up to 2 parts, inline in the `SmallVec`; rendering, the edge
         radix::sort_by_key(&mut kept, |it| it.lo);
         kept.retain(|it| is_different(file, &it.snippet, it.lo, it.hi));
         if !kept.is_empty() {
@@ -775,12 +781,13 @@ fn primary_span_formatted<'a>(
     }
     let snippet = snippet.trim();
     let label = if snippet.is_empty() || suggestion.style.hide_inline() {
-        format!("help: {}", suggestion.message)
+        format!("help: {}", suggestion.message) // alloc: a suggestion rendered, the edge
     } else {
         let confusion = match placed.get(&part_span.file).and_then(|it| it.snippet(part_span)) {
             Some(found) => confusion_of(found, snippet),
             None => Confusion::None,
         };
+        // alloc: a suggestion rendered, the edge
         format!("help: {}{}: `{snippet}`", suggestion.message, confusion.label_text())
     };
     Some((part_span, Cow::Owned(label)))

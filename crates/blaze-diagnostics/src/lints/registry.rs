@@ -135,12 +135,14 @@ impl Reason {
             Reason::FutureReleaseError(issue)
             | Reason::FutureReleaseSemanticsChange(issue)
             | Reason::Custom(_, issue) => {
+                // alloc: a note's text, as a diagnostic is built
                 format!("issue #{issue} <https://github.com/rust-lang/rust/issues/{issue}>")
             }
             Reason::EditionError(edition, page)
             | Reason::EditionSemanticsChange(edition, page)
             | Reason::EditionAndFutureReleaseError(edition, page)
             | Reason::EditionAndFutureReleaseSemanticsChange(edition, page) => {
+                // alloc: as above
                 format!(
                     "<https://doc.rust-lang.org/edition-guide/rust-{}/{page}.html>",
                     edition.number()
@@ -152,26 +154,33 @@ impl Reason {
     /// What rustc warns of it, in a crate of edition `current`.
     pub fn explanation(self, current: Edition) -> String {
         match self {
+            // alloc: a note's text, as a diagnostic is built
             Reason::FutureReleaseError(_) => "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!".to_owned(),
             Reason::FutureReleaseSemanticsChange(_) => {
+                // alloc: as above
                 "this will change its meaning in a future release!".to_owned()
             }
+            // alloc: as above
             Reason::EditionError(edition, _) => format!(
                 "this is accepted in the current edition (Rust {}) but is a hard error in Rust {}!",
                 current.number(),
                 edition.number()
             ),
             Reason::EditionSemanticsChange(edition, _) => {
+                // alloc: as above
                 format!("this changes meaning in Rust {}", edition.number())
             }
+            // alloc: as above
             Reason::EditionAndFutureReleaseError(edition, _) => format!(
                 "this was previously accepted by the compiler but is being phased out; it will become a hard error in Rust {} and in a future release in all editions!",
                 edition.number()
             ),
+            // alloc: as above
             Reason::EditionAndFutureReleaseSemanticsChange(edition, _) => format!(
                 "this changes meaning in Rust {} and in a future release in all editions!",
                 edition.number()
             ),
+            // alloc: as above
             Reason::Custom(text, _) => text.to_owned(),
         }
     }
@@ -314,6 +323,7 @@ pub struct Group {
 
 impl Group {
     fn new(name: &'static str, lints: Vec<&'static Lint>, alias_of: Option<&'static str>) -> Group {
+        // alloc: none, a `LintSet` is inline; and setup, once per process
         let members = lints.iter().map(|it| it.id).collect();
         Group { name, lints, alias_of, members }
     }
@@ -483,6 +493,7 @@ pub fn internal_group() -> &'static Group {
                 Some(at) if (BLAZE_END..INTERNAL_END).contains(&at) => &ALL[at],
                 _ => panic!("no internal lint `{name}`"),
             })
+            // alloc: setup, once per process
             .collect();
         Group::new(INTERNAL_GROUP, lints, None)
     })
@@ -525,6 +536,7 @@ fn build_groups() -> Vec<Group> {
     let builtin = lints();
     let mut groups: Vec<Group> = Vec::with_capacity(GROUP_COUNT);
     for (name, kind) in index::fcw_groups() {
+        // alloc: setup, once per process (`GROUPS`)
         let lints = builtin.iter().filter(|it| index::fcw_group(it) == Some(kind)).collect();
         groups.push(Group::new(name, lints, None));
     }
@@ -535,11 +547,13 @@ fn build_groups() -> Vec<Group> {
                 Some(at) if at < BUILTIN_END => &ALL[at],
                 _ => panic!("group `{name}` names no lint `{member}`"),
             })
+            // alloc: setup, as above
             .collect();
         groups.push(Group::new(name, lints, None));
     }
     for &(alias, of) in names::ALIASES {
         let lints = match other(of.as_bytes()) {
+            // clone: setup, as above
             Some(Entry::Group(at)) if usize::from(at) < groups.len() => groups[usize::from(at)].lints.clone(),
             _ => panic!("alias `{alias}` of no group `{of}`"),
         };
@@ -700,6 +714,7 @@ impl Store {
                     Some(group) => Checked::Tool(&group.lints, None),
                     None => {
                         if self.has_lints_of(tool) {
+                            // alloc: a lint no tool has, on an error's path
                             self.no_lint_suggestion(&format!("{tool}::{name}"), tool)
                         } else {
                             Checked::MissingTool
@@ -730,12 +745,14 @@ impl Store {
         let joined = Joined::new(tool, name);
         let complete = joined.bytes();
         if let Some(lint) = self.by_name(complete) {
+            // alloc: the name a warning suggests, for a clippy lint written without `clippy::`
             return Checked::Tool(lint.id.alone(), Some(format!("{tool}::{name}")));
         }
         if renaming(complete).is_some() {
             return Checked::NoLint(None);
         }
         match self.group(complete) {
+            // alloc: as above
             Some(group) => Checked::Tool(&group.lints, Some(format!("{tool}::{name}"))),
             None => self.no_lint_suggestion(name, tool),
         }
@@ -749,9 +766,12 @@ impl Store {
             return Checked::NoLint(Some((lower, false)));
         }
         let mut groups: Vec<&str> =
+            // alloc: a suggestion for an unknown lint, on an error's path
             self.groups().filter(|it| it.alias_of.is_none()).map(|it| it.name).collect();
         groups.sort_unstable();
+        // alloc: as above
         let names: Vec<&str> = groups.into_iter().chain(self.lints().map(|it| it.name)).collect();
+        // alloc: as above
         let mut lookups = vec![lower.as_str()];
         if let Some(last) = lower.split("::").last() {
             lookups.push(last);
@@ -759,6 +779,7 @@ impl Store {
         let found = edit_distance::find_best_match_for_names(&names, &lookups, None);
         let suggestion = found.map(|it| {
             let is_rustc = lower.contains("::") && !it.starts_with(tool);
+            // alloc: as above
             (it.to_owned(), is_rustc)
         });
         Checked::NoLint(suggestion)

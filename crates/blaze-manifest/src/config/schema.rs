@@ -60,6 +60,17 @@ pub struct CargoNetConfig {
     pub ssh: Option<CargoSshConfig>,
 }
 
+/// `[unstable]`: the `-Z` flags blaze reads, in the form cargo's `CliUnstable` takes them from
+/// configuration. Other keys are left unread, as cargo leaves keys it has no field for.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct CargoUnstableConfig {
+    pub unstable_options: Option<bool>,
+    pub bindeps: Option<bool>,
+    pub build_std: Option<Vec<String>>,
+    pub build_std_features: Option<Vec<String>>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct CargoSshConfig {

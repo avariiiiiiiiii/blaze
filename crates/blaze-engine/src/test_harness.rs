@@ -83,7 +83,7 @@ pub(crate) fn module(
     db: &RootDatabase,
     krate: hir::Crate,
     functions: impl IntoIterator<Item = hir::Function>,
-    file_name: &dyn Fn(vfs::FileId) -> Option<String>,
+    file_name: &impl Fn(vfs::FileId) -> Option<String>,
 ) -> Option<Harness> {
     use hir::HasSource as _;
     let edition = krate.edition(db);
@@ -346,5 +346,48 @@ fn expected(tree: &ast::TokenTree) -> Option<String> {
             Some(ast::String::cast(value.clone())?.value().ok()?.into_owned())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The harness lists every test of the crate by the name rustc is told its file has, and
+    /// names the root's file for the kind of tests they are.
+    #[test]
+    fn the_harness_names_each_test_by_the_file_it_is_told() {
+        use test_fixture::WithFixture;
+        let (db, file) = RootDatabase::with_single_file(
+            r#"
+#[test]
+fn passes() {}
+#[test]
+#[ignore]
+fn waits() {}
+fn helper() {}
+"#,
+        );
+        let asked = std::cell::Cell::new(0);
+        let harness = hir::attach_db(&db, || {
+            let sema = hir::Semantics::new(&db);
+            let root = sema.file_to_module_defs(file.file_id(&db)).next().unwrap();
+            let krate = root.krate(&db);
+            let functions = root.declarations(&db).into_iter().filter_map(|it| match it {
+                hir::ModuleDef::Function(it) => Some(it),
+                _ => None,
+            });
+            let name = |_: vfs::FileId| {
+                asked.set(asked.get() + 1);
+                Some("app/src/lib.rs".to_owned())
+            };
+            module(&db, krate, functions, &name).unwrap()
+        });
+        // Once for each test and once for the root.
+        assert_eq!(asked.get(), 3);
+        assert!(harness.text.starts_with(MARK));
+        assert!(harness.text.contains("passes") && harness.text.contains("waits"));
+        assert!(!harness.text.contains("helper"));
+        assert!(harness.text.contains("app/src/lib.rs") && harness.text.contains("UnitTest"));
     }
 }

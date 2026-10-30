@@ -172,6 +172,9 @@ mod tests {
         struct Same;
         impl blaze_usercode::trace::Inputs for Same {
             type Error = String;
+            fn entry(&mut self, _: &std::path::Path) -> Result<blaze_usercode::trace::Entry, String> {
+                Ok(blaze_usercode::trace::Entry::Missing)
+            }
             fn file(&mut self, _: &std::path::Path) -> Result<Option<[u8; 32]>, String> {
                 Ok(Some([1; 32]))
             }

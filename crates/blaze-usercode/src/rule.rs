@@ -40,7 +40,7 @@ pub fn widen<I: Inputs>(traced: &mut Traced, rule: &CargoRule, inputs: &mut I) -
         match is_dir {
             // Cargo watches a directory's every file, at any depth.
             true => {
-                if let Some(hash) = trace::walk(inputs, path, false)? {
+                if let Some(hash) = inputs.tree(path, false)? {
                     traced.dirs.push((path.join(TREE), hash));
                 }
             }
@@ -116,6 +116,13 @@ mod tests {
 
     impl Inputs for Fixed {
         type Error = String;
+        fn entry(&mut self, path: &Path) -> Result<crate::trace::Entry, String> {
+            Ok(match (self.dirs.contains_key(path), self.files.get(path)) {
+                (true, _) => crate::trace::Entry::Dir,
+                (false, Some(hash)) => crate::trace::Entry::File(blaze_ids::ContentId(*hash), blaze_vfs::Mode::Regular),
+                (false, None) => crate::trace::Entry::Missing,
+            })
+        }
         fn file(&mut self, path: &Path) -> Result<Option<[u8; 32]>, String> {
             if self.dirs.contains_key(path) {
                 return Ok(Some(DIRECTORY));

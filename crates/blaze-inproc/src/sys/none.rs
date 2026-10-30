@@ -81,6 +81,26 @@ impl View {
     }
 }
 
+pub(crate) enum Exec {}
+
+impl Exec {
+    pub(crate) fn new(_: usize, _: usize, _: impl FnOnce(&mut [u8], &mut [u8])) -> Result<Exec, Error> {
+        unsupported()
+    }
+
+    pub(crate) fn code_address(&self) -> u64 {
+        match *self {}
+    }
+
+    pub(crate) fn data_address(&self) -> u64 {
+        match *self {}
+    }
+
+    pub(crate) fn data(&mut self) -> &mut [u8] {
+        match *self {}
+    }
+}
+
 pub(crate) enum Stream {}
 
 impl Stream {
@@ -205,6 +225,10 @@ pub(crate) fn clone_file(_: &Path, _: &Path) -> Result<bool, Error> {
 
 pub(crate) fn threads(_: u32, _: &mut Vec<u64>) -> Result<(), Error> {
     unsupported()
+}
+
+pub(crate) fn service() -> Option<String> {
+    None
 }
 
 pub(crate) fn thread_id() -> u64 {

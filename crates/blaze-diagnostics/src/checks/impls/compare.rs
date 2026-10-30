@@ -19,14 +19,13 @@
 //! `compare_number_of_method_arguments`) (MIT or Apache-2.0).
 
 use blaze_items::{Fact, ItemId};
-use hir::HasSource as _;
 use syntax::{
-    AstNode, TextRange,
-    ast::{self, HasGenericParams as _, HasName as _},
+    TextRange,
+    view::{self as ast, AstNode as _, HasGenericParams as _, HasName as _},
 };
 
 use crate::{
-    cx::{Cx, signature_range},
+    cx::{Cx, signature_range_view as signature_range},
     lower::{
         Found, Phase,
         incoherent_impl::{ImplAt, assoc_def_span, assoc_item_span},
@@ -34,13 +33,16 @@ use crate::{
     model::{Diag, Span},
 };
 
-pub(super) fn check(cx: &Cx<'_, '_>, at: &ImplAt) -> Vec<Found> {
+pub(super) fn check(cx: &Cx<'_, '_>, at: &ImplAt<'_>) -> Vec<Found> {
     let db = cx.db;
-    let items = at.impl_.items(db);
+    let mut items: Vec<hir::AssocItem, _> = Vec::new_in(cx.frame());
+    items.extend(at.impl_.items_iter(db));
     let Some(trait_) = at.impl_.trait_(db) else { return inherent_duplicates(cx, at, &items) };
-    let trait_items = trait_.items(db);
+    let mut trait_items: Vec<hir::AssocItem, _> = Vec::new_in(cx.frame());
+    trait_items.extend(trait_.items_iter(db));
+    // alloc: empty until an error is found, allocates nothing
     let mut found = Vec::new();
-    let mut pairs: Vec<(hir::AssocItem, hir::AssocItem)> = Vec::new();
+    let mut pairs: Vec<(hir::AssocItem, hir::AssocItem), _> = Vec::new_in(cx.frame());
     for &item in &items {
         let Some(name) = item.name(db) else { continue };
         let Some(trait_item) = trait_items
@@ -76,14 +78,16 @@ fn item_id(item: hir::AssocItem) -> Option<ItemId> {
 /// E0201: `TraitImplDuplicate`.
 fn duplicate(
     cx: &Cx<'_, '_>,
-    at: &ImplAt,
+    at: &ImplAt<'_>,
     trait_: hir::Trait,
     name: &str,
     item: hir::AssocItem,
     first: hir::AssocItem,
     trait_item: hir::AssocItem,
 ) -> Vec<Found> {
+    // alloc: empty, allocates nothing
     let Some(span) = assoc_item_span(cx, item) else { return Vec::new() };
+    // alloc: on the error path, once the items differ
     let mut diag = Diag::error(Some("E0201"), format!("duplicate definitions with name `{name}`:"), span.clone());
     diag.span_label(span, "duplicate definition");
     if let Some(old) = assoc_item_span(cx, first) {
@@ -94,32 +98,36 @@ fn duplicate(
     }
     diag.fact(at.coherence(cx), "the items of the impl");
     diag.fact(Fact::Signature(cx.key(ItemId::Trait(trait_.into()))), "the items of the trait");
+    // alloc: on the error path, once the items differ
     vec![Found::new(diag, Phase::Resolve)]
 }
 
 /// `check_for_duplicate_items_in_impl`: E0592 of a second item of an inherent impl named as
 /// one before it.
-fn inherent_duplicates(cx: &Cx<'_, '_>, at: &ImplAt, items: &[hir::AssocItem]) -> Vec<Found> {
+fn inherent_duplicates(cx: &Cx<'_, '_>, at: &ImplAt<'_>, items: &[hir::AssocItem]) -> Vec<Found> {
     let db = cx.db;
-    let mut seen: Vec<(hir::Name, Option<Span>)> = Vec::new();
+    let mut seen: Vec<(hir::Name, hir::AssocItem), _> = Vec::new_in(cx.frame());
+    // alloc: empty until an error is found, allocates nothing
     let mut found = Vec::new();
     for &item in items {
         let Some(name) = item.name(db) else { continue };
-        let span = assoc_def_span(cx, item);
-        if let Some((_, former)) = seen.iter().find(|(it, _)| *it == name) {
-            let Some(span) = span else { continue };
+        if let Some(&(_, former)) = seen.iter().find(|(it, _)| *it == name) {
+            let Some(span) = assoc_def_span(cx, item) else { continue };
             let ident = name.as_str();
             let mut diag =
+                // alloc: the error's message
                 Diag::error(Some("E0592"), format!("duplicate definitions with name `{ident}`"), span.clone());
+            // alloc: the error's label
             diag.span_label(span, format!("duplicate definitions for `{ident}`"));
-            if let Some(former) = former.clone() {
+            if let Some(former) = assoc_def_span(cx, former) {
+                // alloc: the error's label
                 diag.span_label(former, format!("other definition for `{ident}`"));
             }
             diag.fact(at.coherence(cx), "the items of the impl");
             found.push(Found::new(diag, Phase::Items));
             continue;
         }
-        seen.push((name, span));
+        seen.push((name, item));
     }
     found
 }
@@ -127,11 +135,12 @@ fn inherent_duplicates(cx: &Cx<'_, '_>, at: &ImplAt, items: &[hir::AssocItem]) -
 /// `compare_impl_item` as far as it is decided here: each check stops the item's others.
 fn compare(
     cx: &Cx<'_, '_>,
-    at: &ImplAt,
+    at: &ImplAt<'_>,
     trait_: hir::Trait,
     item: hir::AssocItem,
     trait_item: hir::AssocItem,
 ) -> Vec<Found> {
+    // alloc: empty until an error is found, allocates nothing
     let mut found = Vec::new();
     if let (hir::AssocItem::Function(f), hir::AssocItem::Function(tf)) = (item, trait_item) {
         found.extend(self_type(cx, at, f, tf));
@@ -162,59 +171,76 @@ fn compare(
 fn self_string(cx: &Cx<'_, '_>, f: hir::Function, self_ty: &str) -> Option<String> {
     let ty = f.self_param(cx.db)?.ty(cx.db);
     if cx.ty(&ty) == self_ty {
+        // alloc: on the error path, once the items differ
         return Some("self".to_owned());
     }
     if let Some((inner, mutability)) = ty.as_reference()
         && cx.ty(&inner) == self_ty
     {
         return Some(match mutability {
+            // alloc: on the error path, once the items differ
             hir::Mutability::Shared => "&self".to_owned(),
+            // alloc: on the error path, once the items differ
             hir::Mutability::Mut => "&mut self".to_owned(),
         });
     }
+    // alloc: on the error path, once the items differ
     Some(format!("self: {}", cx.ty(&ty)))
 }
 
 /// `compare_self_type`: E0185 and E0186.
-fn self_type(cx: &Cx<'_, '_>, at: &ImplAt, f: hir::Function, tf: hir::Function) -> Vec<Found> {
+fn self_type(cx: &Cx<'_, '_>, at: &ImplAt<'_>, f: hir::Function, tf: hir::Function) -> Vec<Found> {
     let db = cx.db;
     let (in_trait, in_impl) = (tf.has_self_param(db), f.has_self_param(db));
     if in_trait == in_impl {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
-    let Some(source) = f.source(db) else { return Vec::new() };
-    let span = cx.span(source.as_ref().map(signature_range));
+    // alloc: empty, allocates nothing
+    let Some(source) = cx.vsema.source(f) else { return Vec::new() };
+    let span = cx.span(source.map(signature_range));
     let name = tf.name(db);
     let name = name.as_str();
     let trait_span =
         if tf.module(db).krate(db) == cx.krate { assoc_item_span(cx, hir::AssocItem::Function(tf)) } else { None };
     let mut diag = if in_impl {
         let impl_self = cx.ty(&at.impl_.self_ty(db));
+        // alloc: on the error path, once the items differ
         let Some(descr) = self_string(cx, f, &impl_self) else { return Vec::new() };
         let mut diag = Diag::error(
             Some("E0185"),
+            // alloc: on the error path, once the items differ
             format!("method `{name}` has a `{descr}` declaration in the impl, but not in the trait"),
+            // clone: the error's span
             span.clone(),
         );
+        // alloc: on the error path, once the items differ
         diag.span_label(span, format!("`{descr}` used in impl"));
         if let Some(trait_span) = trait_span {
+            // alloc: on the error path, once the items differ
             diag.span_label(trait_span, format!("trait method declared without `{descr}`"));
         }
         diag
     } else {
+        // alloc: on the error path, once the items differ
         let Some(descr) = self_string(cx, tf, "Self") else { return Vec::new() };
         let mut diag = Diag::error(
             Some("E0186"),
+            // alloc: on the error path, once the items differ
             format!("method `{name}` has a `{descr}` declaration in the trait, but not in the impl"),
+            // clone: the error's span
             span.clone(),
         );
+        // alloc: on the error path, once the items differ
         diag.span_label(span, format!("expected `{descr}` in impl"));
         if let Some(trait_span) = trait_span {
+            // alloc: on the error path, once the items differ
             diag.span_label(trait_span, format!("`{descr}` used in trait"));
         }
         diag
     };
     diag.fact(at.coherence(cx), "the items of the impl");
+    // alloc: on the error path, once the items differ
     vec![Found::new(diag, Phase::Items)]
 }
 
@@ -247,26 +273,25 @@ fn counts(cx: &Cx<'_, '_>, item: hir::AssocItem) -> (usize, usize) {
 /// lifetime or a type by its name, a const whole, an argument's `impl Trait` as written; else
 /// the place of the empty list), and the `impl Trait`s among them.
 fn generic_spans(cx: &Cx<'_, '_>, item: hir::AssocItem) -> Option<(Vec<Span>, Vec<Span>)> {
-    let db = cx.db;
     let (node, name, list, params) = match item {
         hir::AssocItem::Function(it) => {
-            let source = it.source(db)?;
+            let source = cx.vsema.source(it)?;
             let name = source.value.name();
             let list = source.value.generic_param_list();
             let params = source.value.param_list();
-            (source.map(|it| it.syntax().clone()), name, list, params)
+            (source.map(|it| it.syntax()), name, list, params)
         }
         hir::AssocItem::Const(it) => {
-            let source = it.source(db)?;
+            let source = cx.vsema.source(it)?;
             let name = source.value.name();
             let list = source.value.generic_param_list();
-            (source.map(|it| it.syntax().clone()), name, list, None)
+            (source.map(|it| it.syntax()), name, list, None)
         }
         hir::AssocItem::TypeAlias(it) => {
-            let source = it.source(db)?;
+            let source = cx.vsema.source(it)?;
             let name = source.value.name();
             let list = source.value.generic_param_list();
-            (source.map(|it| it.syntax().clone()), name, list, None)
+            (source.map(|it| it.syntax()), name, list, None)
         }
     };
     let span = |range: TextRange| cx.span(node.with_value(range));
@@ -274,24 +299,26 @@ fn generic_spans(cx: &Cx<'_, '_>, item: hir::AssocItem) -> Option<(Vec<Span>, Ve
         .iter()
         .flat_map(|it| it.generic_params())
         .filter_map(|param| {
-            let range = match &param {
+            let range = match param {
                 ast::GenericParam::LifetimeParam(it) => it.lifetime()?.syntax().text_range(),
                 ast::GenericParam::TypeParam(it) => it.name()?.syntax().text_range(),
                 ast::GenericParam::ConstParam(it) => it.syntax().text_range(),
             };
             Some(span(range))
         })
+        // alloc: on the error path, once the items differ
         .collect();
     let impl_traits: Vec<Span> = params
         .iter()
         .flat_map(|it| it.params())
         .filter_map(|it| it.ty())
-        .flat_map(|ty| ty.syntax().descendants().filter_map(ast::ImplTraitType::cast).collect::<Vec<_>>())
+        .flat_map(|ty| ty.syntax().descendants().filter_map(ast::ImplTraitType::cast))
         .map(|it| span(it.syntax().text_range()))
+        // alloc: on the error path, once the items differ
         .collect();
     spans.extend(impl_traits.iter().cloned());
     if spans.is_empty() {
-        let range = match (&list, &name) {
+        let range = match (list, name) {
             (Some(list), _) => list.syntax().text_range(),
             (None, Some(name)) => TextRange::empty(name.syntax().text_range().end()),
             (None, None) => return None,
@@ -307,18 +334,22 @@ fn number_of_generics(cx: &Cx<'_, '_>, item: hir::AssocItem, trait_item: hir::As
     let (impl_types, impl_consts) = counts(cx, item);
     let (trait_types, trait_consts) = counts(cx, trait_item);
     if impl_types + impl_consts == trait_types + trait_consts {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
+    // alloc: on the error path, once the items differ
     let Some((impl_spans, impl_traits)) = generic_spans(cx, item) else { return Vec::new() };
     let local = trait_item.module(db).krate(db) == cx.krate;
     let (trait_spans, trait_impl_traits) = match local {
         true => generic_spans(cx, trait_item).unwrap_or_default(),
+        // alloc: on the error path, once the items differ
         false => (assoc_def_span(cx, trait_item).into_iter().collect(), Vec::new()),
     };
     let name = trait_item.name(db);
     let name = name.as_ref().map_or("", |it| it.as_str());
     let kind = descr(cx, item);
     let plural = |n: usize| if n == 1 { "" } else { "s" };
+    // alloc: on the error path, once the items differ
     let mut found = Vec::new();
     for (what, trait_count, impl_count) in [("type", trait_types, impl_types), ("const", trait_consts, impl_consts)] {
         if impl_count == trait_count {
@@ -327,25 +358,32 @@ fn number_of_generics(cx: &Cx<'_, '_>, item: hir::AssocItem, trait_item: hir::As
         let Some(first) = impl_spans.first().cloned() else { continue };
         let mut diag = Diag::error(
             Some("E0049"),
+            // alloc: on the error path, once the items differ
             format!(
                 "{kind} `{name}` has {impl_count} {what} parameter{} but its trait declaration has {trait_count} {what} parameter{}",
                 plural(impl_count),
                 plural(trait_count),
             ),
+            // clone: the error's span
             first.clone(),
         );
         for span in &impl_spans[1..] {
+            // clone: the error's span
             diag.primary(span.clone());
         }
         let mut trait_spans = trait_spans.iter();
         if let Some(span) = trait_spans.next() {
+            // alloc: on the error path, once the items differ
             diag.span_label(span.clone(), format!("expected {trait_count} {what} parameter{}", plural(trait_count)));
         }
         for span in trait_spans {
+            // clone: the error's span
             diag.span_label(span.clone(), "");
         }
+        // alloc: on the error path, once the items differ
         diag.span_label(first, format!("found {impl_count} {what} parameter{}", plural(impl_count)));
         for span in trait_impl_traits.iter().chain(&impl_traits) {
+            // clone: the error's span
             diag.span_label(span.clone(), "`impl Trait` introduces an implicit type parameter");
         }
         found.push(Found::new(diag, Phase::Items));
@@ -353,10 +391,18 @@ fn number_of_generics(cx: &Cx<'_, '_>, item: hir::AssocItem, trait_item: hir::As
     found
 }
 
+/// How many inputs rustc's `decl.inputs` has: what [`input_ranges`] gives, counted.
+fn input_count(f: ast::Fn<'_>) -> usize {
+    let Some(list) = f.param_list() else { return 0 };
+    usize::from(list.self_param().is_some()) + list.params().count()
+}
+
 /// The places of a function's inputs as rustc's `decl.inputs` has them: an implicit `self`
-/// whole, else each input's type.
-fn input_ranges(f: &ast::Fn) -> Vec<TextRange> {
+/// whole, else each input's type. Only for an error, once the counts differ.
+fn input_ranges(f: ast::Fn<'_>) -> Vec<TextRange> {
+    // alloc: empty, allocates nothing
     let Some(list) = f.param_list() else { return Vec::new() };
+    // alloc: the inputs' places, for an error
     let mut ranges = Vec::new();
     if let Some(self_param) = list.self_param() {
         ranges.push(match self_param.ty() {
@@ -379,30 +425,37 @@ fn inputs_range(ranges: &[TextRange], count: usize) -> Option<TextRange> {
 
 /// `potentially_plural_count`.
 fn parameters(n: usize) -> String {
+    // alloc: on the error path, once the items differ
     format!("{n} parameter{}", if n == 1 { "" } else { "s" })
 }
 
 /// `compare_number_of_method_arguments`: E0050.
 fn number_of_arguments(cx: &Cx<'_, '_>, trait_: hir::Trait, f: hir::Function, tf: hir::Function) -> Vec<Found> {
     let db = cx.db;
-    let Some(source) = f.source(db) else { return Vec::new() };
-    let Some(trait_source) = tf.source(db) else { return Vec::new() };
-    let impl_inputs = input_ranges(&source.value);
-    let trait_inputs = input_ranges(&trait_source.value);
-    let (impl_count, trait_count) = (impl_inputs.len(), trait_inputs.len());
+    // alloc: empty, allocates nothing
+    let Some(source) = cx.vsema.source(f) else { return Vec::new() };
+    // alloc: empty, allocates nothing
+    let Some(trait_source) = cx.vsema.source(tf) else { return Vec::new() };
+    let (impl_count, trait_count) = (input_count(source.value), input_count(trait_source.value));
     if impl_count == trait_count {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
+    let impl_inputs = input_ranges(source.value);
+    let trait_inputs = input_ranges(trait_source.value);
     let impl_span = match inputs_range(&impl_inputs, impl_count) {
         Some(range) => cx.span(source.with_value(range)),
-        None => cx.span(source.as_ref().map(signature_range)),
+        None => cx.span(source.map(signature_range)),
     };
     let name = tf.name(db);
     let name = name.as_str();
+    // alloc: on the error path, once the items differ
     let path = format!("{}::{name}", cx.def_path(hir::ModuleDef::Trait(trait_)));
     let mut diag = Diag::error(
         Some("E0050"),
+        // alloc: on the error path, once the items differ
         format!("method `{name}` has {} but the declaration in trait `{path}` has {trait_count}", parameters(impl_count)),
+        // clone: the error's span
         impl_span.clone(),
     );
     if tf.module(db).krate(db) == cx.krate {
@@ -411,9 +464,12 @@ fn number_of_arguments(cx: &Cx<'_, '_>, trait_: hir::Trait, f: hir::Function, tf
             None => assoc_item_span(cx, hir::AssocItem::Function(tf)),
         };
         if let Some(trait_span) = trait_span {
+            // alloc: on the error path, once the items differ
             diag.span_label(trait_span, format!("trait requires {}", parameters(trait_count)));
         }
     }
+    // alloc: on the error path, once the items differ
     diag.span_label(impl_span, format!("expected {}, found {impl_count}", parameters(trait_count)));
+    // alloc: on the error path, once the items differ
     vec![Found::new(diag, Phase::Items)]
 }

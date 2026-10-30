@@ -158,7 +158,8 @@ fn source_range(db: &Db, def: InferBodyId<'_>, span: MirSpan) -> Option<(FileId,
             .find_map(|p| source_map.pat_syntax(*p).ok())?
             .map(|it| it.syntax_node_ptr()),
         MirSpan::SelfParam => self_param_syntax?.map(|it| it.syntax_node_ptr()),
-        MirSpan::Unknown => return None,
+        // The interpreter runs no optimized body, so no span of one reaches it.
+        MirSpan::Unknown | MirSpan::Inlined(_) => return None,
     };
     Some((span.file_id.original_file(db).file_id(db), span.value.text_range()))
 }

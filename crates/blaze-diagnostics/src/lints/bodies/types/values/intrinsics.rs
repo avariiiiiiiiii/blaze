@@ -60,6 +60,7 @@ impl LatePass for EnumIntrinsicsNonEnums {
             );
             diag.span_note(
                 arg_span,
+                // alloc: the lint's text, for a lint found
                 format!(
                     "the argument to `discriminant` should be a reference to an enum, but it was passed a reference to a `{ty}`, which is not an enum"
                 ),
@@ -71,6 +72,7 @@ impl LatePass for EnumIntrinsicsNonEnums {
                 "the return value of `mem::variant_count` is unspecified when called with a non-enum type",
                 span,
             );
+            // alloc: the lint's text, for a lint found
             diag.note(format!(
                 "the type parameter of `variant_count` should be an enum, but it was instantiated with the type `{ty}`, which is not an enum"
             ));

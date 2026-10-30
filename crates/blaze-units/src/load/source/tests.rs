@@ -415,6 +415,37 @@ fn a_line_of_serde_s_entry_reads_as_cargo_reads_it() {
 }
 
 #[test]
+fn a_file_s_lines_are_parsed_only_when_a_version_matches() {
+    let file = [
+        r#"{"name":"a","vers":"1.0.0","deps":[],"cksum":"01"}"#,
+        r#"{"name":"a","vers":"one"}"#,
+        "",
+        r#"{"vers":"1.1.0"}"#,
+        r#"{"name":"a","vers":"1.1.0","deps":"not a list","cksum":"02"}"#,
+        r#"{"name":"a","vers":"1.2.0","deps":[],"cksum":"03","yanked":true}"#,
+    ]
+    .join("\n");
+    let lines = super::index::Lines::new(file.into_bytes());
+    let parsed = |lines: &super::index::Lines| lines.parsed_count();
+    assert_eq!(parsed(&lines), 0);
+    let found = |min: &str| -> Vec<(String, Status)> {
+        let min = semver::Version::parse(min).unwrap();
+        lines.matching(|it| *it >= min).map(|it| (it.entry.version.to_string(), it.status)).collect()
+    };
+    assert_eq!(found("1.2.0"), [("1.2.0".to_owned(), Status::Yanked)]);
+    assert_eq!(parsed(&lines), 1);
+    assert_eq!(
+        found("0.0.0"),
+        [
+            ("1.0.0".to_owned(), Status::Candidate),
+            ("1.1.0".to_owned(), Status::Invalid),
+            ("1.2.0".to_owned(), Status::Yanked),
+        ]
+    );
+    assert_eq!(parsed(&lines), 3);
+}
+
+#[test]
 fn a_summary_s_features_are_in_name_order_whatever_the_line_s_order() {
     let line = r#"{"name":"a","vers":"1.0.0","deps":[],"cksum":"00","features":{"zz":[],"b":["zz"],"a1":[]},"features2":{"m":[],"a0":[]}}"#;
     let line = parse_line(line.as_bytes()).unwrap();

@@ -19,7 +19,7 @@ use crate::{
     },
 };
 
-impl<'db> InferenceContext<'db> {
+impl<'db, 'f> InferenceContext<'db, 'f> {
     /// Checks a `a <op>= b`
     pub(crate) fn infer_assign_op_expr(
         &mut self,
@@ -225,7 +225,7 @@ impl<'db> InferenceContext<'db> {
                         kind: Adjust::Borrow(AutoBorrow::Ref(mutbl)),
                         target: method.sig.inputs_and_output.inputs()[0].store(),
                     };
-                    self.write_expr_adj(lhs_expr, Box::new([autoref]));
+                    self.write_expr_adj(lhs_expr, &[autoref]);
                 }
                 if by_ref_binop
                     && let TyKind::Ref(_, _, mutbl) =
@@ -316,7 +316,7 @@ impl<'db> InferenceContext<'db> {
     ) -> Result<MethodCallee<'db>, Vec<NextSolverError<'db>>> {
         let (Some(trait_did), Some(op_method)) = (trait_did, op_method) else {
             // Bail if the operator trait is not defined.
-            return Err(vec![]);
+            return Err(vec![]); // alloc: empty
         };
 
         debug!(
@@ -399,7 +399,7 @@ impl<'db> InferenceContext<'db> {
                 let predicate = error.into_fulfillment_error(infcx).obligation.predicate;
                 StoredGoal::new(self.interner(), infcx.deeply_resolve_ignoring_regions(predicate))
             })
-            .collect()
+            .collect() // alloc: error path, the goals of an operator diagnostic
     }
 
     fn lang_item_for_bin_op(&self, op: BinaryOp) -> (Option<FunctionId>, Option<TraitId>) {

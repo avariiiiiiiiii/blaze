@@ -65,8 +65,11 @@ blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-new.workspace = true
 blaze-expand.workspace = true
+blaze-global.workspace = true
 blaze-graph.workspace = true
 blaze-history.workspace = true
+blaze-inproc.workspace = true
+blaze-intent.workspace = true
 blaze-image.workspace = true
 blaze-mem.workspace = true
 blaze-protocol.workspace = true
@@ -141,6 +144,7 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-usercode.workspace = true
 blaze-codegen.workspace = true
+blaze-lazy.workspace = true
 blaze-link.workspace = true
 load-cargo.workspace = true
 base-db.workspace = true
@@ -155,6 +159,8 @@ tikv-jemalloc-sys = "0.5.4"
 blaze-sha256.workspace = true
 
 [dev-dependencies]
+# Counts allocations for the budget tests (`serve/unit/test/tests.rs` installs it).
+blaze-alloc-count.workspace = true
 # The in-process fake of the cache gateway that `remote/gateway/tests.rs` talks to.
 hyper = { version = "1", default-features = false, features = ["server", "http1"] }
 tokio = { version = "1.47", features = ["net"] }

@@ -28,10 +28,11 @@
 //! `compiler/rustc_session/src/diagnostics.rs` (MIT or Apache-2.0).
 
 use hir::HirFileId;
+use smallvec::SmallVec;
 use span::Edition;
 use syntax::{
-    AstNode, AstToken, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
-    ast::{self, HasAttrs},
+    NodeOrToken, SmolStr, SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _, AstToken as _, HasAttrs as _},
 };
 
 use super::{Accepted, Finalize, GroupId, limit, no_args};
@@ -597,19 +598,25 @@ fn attribute_macro(name: &str) -> Option<Option<Template>> {
 
 /// expansion's and AST validation's `check_attr` of `attr`, and the errors of reading its
 /// value where rustc reads it before expansion makes a literal of a macro call there.
-pub(crate) fn validate(cx: &Cx<'_, '_>, attr: &Attr, errors: &mut Vec<Diag>) {
-    let AttrKind::Meta { written, .. } = &attr.kind else { return };
+pub(crate) fn validate<'db>(cx: &Cx<'_, 'db>, attr: &Attr<'db>, errors: &mut Vec<Diag>) {
+    let AttrKind::Meta { written, .. } = attr.kind else { return };
     with_path(attr, |path| validate_path(cx, attr, written, path, errors));
 }
 
 /// [`validate`] of `attr`, written in `written`, whose path is `path`.
-fn validate_path(cx: &Cx<'_, '_>, attr: &Attr, written: &ast::Attr, path: &[&str], errors: &mut Vec<Diag>) {
+fn validate_path<'db>(
+    cx: &Cx<'_, 'db>,
+    attr: &Attr<'db>,
+    written: ast::Attr<'db>,
+    path: &[&str],
+    errors: &mut Vec<Diag>,
+) {
     let name = match path {
         [one] => Some(*one),
         _ => None,
     };
     let args = attr.args();
-    if let Args::NameValue(Some(ast::Expr::MacroExpr(call))) = &args
+    if let Args::NameValue(Some(ast::Expr::MacroExpr(call))) = args
         && let Some(diag) = unexpanded_value(cx, attr, written, name, call)
     {
         errors.push(diag);
@@ -622,7 +629,7 @@ fn validate_path(cx: &Cx<'_, '_>, attr: &Attr, written: &ast::Attr, path: &[&str
     if let Some(name) = name
         && let Some(template) = attribute_macro(name)
     {
-        let Some(meta) = parse_meta(cx, attr, &args, edition, errors) else { return };
+        let Some(meta) = parse_meta(cx, attr, args, edition, errors) else { return };
         if let Some(template) = template
             && !compatible(&template, &meta)
         {
@@ -638,7 +645,7 @@ fn validate_path(cx: &Cx<'_, '_>, attr: &Attr, written: &ast::Attr, path: &[&str
     {
         // `cfg` and `cfg_attr` are gone by now; the rest of the unparsed ones are lint attributes.
         if LINT_ATTRS.contains(&name)
-            && let Some(meta) = parse_meta(cx, attr, &args, edition, errors)
+            && let Some(meta) = parse_meta(cx, attr, args, edition, errors)
             && !compatible(&LINT, &meta)
         {
             errors.push(malformed(cx, attr, name, &LINT, attr.inner));
@@ -646,7 +653,7 @@ fn validate_path(cx: &Cx<'_, '_>, attr: &Attr, written: &ast::Attr, path: &[&str
         return;
     }
     if matches!(args, Args::NameValue(_)) {
-        let _ = parse_meta(cx, attr, &args, edition, errors);
+        let _ = parse_meta(cx, attr, args, edition, errors);
     }
 }
 
@@ -655,10 +662,10 @@ fn validate_path(cx: &Cx<'_, '_>, attr: &Attr, written: &ast::Attr, path: &[&str
 /// `#[path]` of a module.
 fn unexpanded_value(
     cx: &Cx<'_, '_>,
-    attr: &Attr,
-    written: &ast::Attr,
+    attr: &Attr<'_>,
+    written: ast::Attr<'_>,
     name: Option<&str>,
-    call: &ast::MacroExpr,
+    call: ast::MacroExpr<'_>,
 ) -> Option<Diag> {
     let parent = written.syntax().parent()?;
     let literal = || {
@@ -678,7 +685,7 @@ fn unexpanded_value(
             }
             Some(diag)
         }
-        "path" if parent.kind() == SyntaxKind::MODULE && first_path(&parent, written) => {
+        "path" if parent.kind() == SyntaxKind::MODULE && first_path(parent, written) => {
             let mut diag = malformed(cx, attr, "path", &PATH, attr.inner);
             diag.stop();
             Some(diag)
@@ -687,20 +694,18 @@ fn unexpanded_value(
     }
 }
 
-fn in_root_file(cx: &Cx<'_, '_>, attr: &Attr) -> bool {
+fn in_root_file(cx: &Cx<'_, '_>, attr: &Attr<'_>) -> bool {
     cx.krate.root_module(cx.db).as_source_file_id(cx.db).is_some_and(|root| attr.file == HirFileId::from(root))
 }
 
 /// Whether `written` is the first `#[path]` of the item `item`.
-fn first_path(item: &SyntaxNode, written: &ast::Attr) -> bool {
-    let Some(item) = ast::AnyHasAttrs::cast(item.clone()) else { return false };
-    item.attrs()
-        .find(|it| it.simple_name().as_deref() == Some("path"))
-        .is_some_and(|it| it.syntax() == written.syntax())
+fn first_path(item: ast::Node<'_>, written: ast::Attr<'_>) -> bool {
+    let Some(item) = ast::AnyHasAttrs::cast(item) else { return false };
+    item.attrs().find(|it| it.simple_name() == Some("path")).is_some_and(|it| it.syntax() == written.syntax())
 }
 
 /// `cfg_accessible`'s `validate_input`.
-fn cfg_accessible(cx: &Cx<'_, '_>, attr: &Attr, meta: &Meta, errors: &mut Vec<Diag>) {
+fn cfg_accessible(cx: &Cx<'_, '_>, attr: &Attr<'_>, meta: &Meta, errors: &mut Vec<Diag>) {
     let Meta::List(items) = meta else { return };
     let (message, range) = match items.as_slice() {
         [] => ("`cfg_accessible` path is not specified", attr.range()),
@@ -728,7 +733,7 @@ struct Item {
     lit: bool,
     /// A path with no arguments (`MetaItemKind::Word`).
     is_word: bool,
-    /// For a word of one segment, its name.
+    /// For a word of one segment that is a list's only element, its name.
     word: Option<String>,
 }
 
@@ -747,32 +752,38 @@ fn compatible(template: &Template, meta: &Meta) -> bool {
 
 /// rustc's `emit_malformed_attribute` of an error: "malformed `name` attribute input", with
 /// the forms of `template` (none when there are more than 3).
-fn malformed(cx: &Cx<'_, '_>, attr: &Attr, name: &str, template: &Template, inner: bool) -> Diag {
+fn malformed(cx: &Cx<'_, '_>, attr: &Attr<'_>, name: &str, template: &Template, inner: bool) -> Diag {
     let span = cx.span(attr.in_file(attr.range()));
     let bang = if inner { "!" } else { "" };
     let mut suggestions = Vec::with_capacity(4);
     if template.word {
+        // alloc: the error's suggestion
         suggestions.push(format!("#{bang}[{name}]"));
     }
     for descr in template.list.into_iter().flatten() {
+        // alloc: the error's suggestion
         suggestions.push(format!("#{bang}[{name}({descr})]"));
     }
     for word in template.one_of {
+        // alloc: the error's suggestion
         suggestions.push(format!("#{bang}[{name}({word})]"));
     }
     for descr in template.name_value_str.into_iter().flatten() {
+        // alloc: the error's suggestion
         suggestions.push(format!("#{bang}[{name} = \"{descr}\"]"));
     }
     if suggestions.len() > 3 {
         suggestions.clear();
     }
     suggestions.sort();
+    // alloc: the error's message; clone: its span, used again for the suggestions
     let mut diag = Diag::error(None, format!("malformed `{name}` attribute input"), span.clone());
     if !suggestions.is_empty() {
         let message = if suggestions.len() == 1 { "must be of the form" } else { "the following are the possible correct uses" };
         diag.suggestions(span, message, suggestions, Applicability::HasPlaceholders, SuggestionStyle::ShowCode);
     }
     if let Some(link) = template.docs {
+        // alloc: the error's note
         diag.note(format!("for more information, visit <{link}>"));
     }
     diag
@@ -780,7 +791,13 @@ fn malformed(cx: &Cx<'_, '_>, attr: &Attr, name: &str, template: &Template, inne
 
 /// `validate_attr::parse_meta`: the attribute as a meta item, with the errors of reading it;
 /// `None` where it is not one.
-fn parse_meta(cx: &Cx<'_, '_>, attr: &Attr, args: &Args, edition: Edition, errors: &mut Vec<Diag>) -> Option<Meta> {
+fn parse_meta<'db>(
+    cx: &Cx<'_, 'db>,
+    attr: &Attr<'db>,
+    args: Args<'db>,
+    edition: Edition,
+    errors: &mut Vec<Diag>,
+) -> Option<Meta> {
     match args {
         Args::Word => Some(Meta::Word),
         Args::List(tt) => {
@@ -788,14 +805,14 @@ fn parse_meta(cx: &Cx<'_, '_>, attr: &Attr, args: &Args, edition: Edition, error
                 bad_delim(cx, attr, tt, errors);
             }
             let tokens = flatten(tt);
-            let mut parser = MetaParser { cx, attr, edition, tokens: &tokens, at: 0, expected: Vec::new(), errors };
+            let mut parser = MetaParser { cx, attr, edition, tokens: &tokens, at: 0, expected: SmallVec::new(), errors };
             parser.seq_top().map(Meta::List)
         }
         Args::NameValue(None) | Args::NameValue(Some(ast::Expr::MacroExpr(_))) => None,
         Args::NameValue(Some(ast::Expr::Literal(literal))) => {
             let token = literal.token();
             let span = cx.span(attr.in_file(token.text_range()));
-            match check_lit(cx, attr, &token, errors) {
+            match check_lit(cx, attr, token, errors) {
                 Lit::Suffixed => {
                     errors.push(suffixed(span));
                     None
@@ -812,13 +829,15 @@ fn parse_meta(cx: &Cx<'_, '_>, attr: &Attr, args: &Args, edition: Edition, error
 }
 
 /// `MetaBadDelim`: `#[path[..]]` or `#[path{..}]`.
-fn bad_delim(cx: &Cx<'_, '_>, attr: &Attr, tt: &ast::TokenTree, errors: &mut Vec<Diag>) {
-    let children: Vec<SyntaxElement> = tt.syntax().children_with_tokens().collect();
-    let (Some(open), Some(close)) = (children.first(), children.last()) else { return };
+fn bad_delim(cx: &Cx<'_, '_>, attr: &Attr<'_>, tt: ast::TokenTree<'_>, errors: &mut Vec<Diag>) {
+    let (Some(open), Some(close)) = (tt.syntax().first_child_or_token(), tt.syntax().last_child_or_token()) else {
+        return;
+    };
     let span = |range| cx.span(attr.in_file(range));
     let mut diag = Diag::error(None, "wrong meta list delimiters", span(tt.syntax().text_range()));
     diag.multipart_suggestion(
         "the delimiters should be `(` and `)`",
+        // alloc: the error's suggestion
         vec![(span(open.text_range()), "(".to_owned()), (span(close.text_range()), ")".to_owned())],
         Applicability::MachineApplicable,
     );
@@ -835,11 +854,12 @@ fn suffixed(span: Span) -> Diag {
 /// A token as rustc's lexer makes it: punctuation written together is one token (`::`, `==`,
 /// `->`), where the token tree has one per character.
 #[derive(Debug)]
-struct Tok {
+struct Tok<'t> {
     /// The first of the tokens it is made of.
-    token: SyntaxToken,
+    token: ast::Token<'t>,
     kind: SyntaxKind,
-    text: String,
+    /// Inline: a token's text, or punctuation glued of a few.
+    text: SmolStr,
     range: TextRange,
     /// Whether a line ends between the token before it and its end.
     newline_before: bool,
@@ -853,23 +873,23 @@ const GLUED: &[&str] = &[
 ];
 
 /// The tokens between a token tree's delimiters, nested trees opened, trivia left out.
-fn flatten(tt: &ast::TokenTree) -> Vec<Tok> {
-    let mut elements: Vec<SyntaxElement> = tt.syntax().children_with_tokens().collect();
-    if elements.first().is_some_and(|it| it.kind().is_l_delimiter()) {
-        elements.remove(0);
+fn flatten(tt: ast::TokenTree<'_>) -> SmallVec<[Tok<'_>; 16]> {
+    let mut elements = tt.syntax().children_with_tokens().peekable();
+    if elements.peek().is_some_and(|it| it.kind().is_l_delimiter()) {
+        elements.next();
     }
-    if elements.last().is_some_and(|it| it.kind().is_r_delimiter()) {
-        elements.pop();
-    }
-    let mut tokens = Vec::with_capacity(elements.len());
+    let mut tokens: SmallVec<[Tok<'_>; 16]> = SmallVec::new();
     let mut newline = false;
-    for element in elements {
+    while let Some(element) = elements.next() {
+        if elements.peek().is_none() && element.kind().is_r_delimiter() {
+            break;
+        }
         push_tokens(element, &mut newline, &mut tokens);
     }
     tokens
 }
 
-fn push_tokens(element: SyntaxElement, newline: &mut bool, tokens: &mut Vec<Tok>) {
+fn push_tokens<'t>(element: ast::Element<'t>, newline: &mut bool, tokens: &mut SmallVec<[Tok<'t>; 16]>) {
     match element {
         NodeOrToken::Node(node) => {
             for child in node.children_with_tokens() {
@@ -892,7 +912,8 @@ fn push_tokens(element: SyntaxElement, newline: &mut bool, tokens: &mut Vec<Tok>
                 && last.range.end() == range.start()
                 && is_glued(&last.text, text)
             {
-                last.text.push_str(text);
+                // alloc: none: glued punctuation is at most three bytes, kept inline
+                last.text = [last.text.as_str(), text].into_iter().collect();
                 last.range = TextRange::new(last.range.start(), range.end());
                 last.kind = match last.text.as_str() {
                     "::" => SyntaxKind::COLON2,
@@ -901,7 +922,7 @@ fn push_tokens(element: SyntaxElement, newline: &mut bool, tokens: &mut Vec<Tok>
                 };
                 return;
             }
-            tokens.push(Tok { kind, text: text.to_owned(), range, newline_before, token });
+            tokens.push(Tok { kind, text: SmolStr::new(text), range, newline_before, token });
         }
     }
 }
@@ -919,24 +940,25 @@ fn is_glued(first: &str, then: &str) -> bool {
 /// tokens it expected since it last took one (`expected_token_types`).
 struct MetaParser<'p, 'c, 'db> {
     cx: &'p Cx<'c, 'db>,
-    attr: &'p Attr,
+    attr: &'p Attr<'db>,
     edition: Edition,
-    tokens: &'p [Tok],
+    tokens: &'p [Tok<'db>],
     at: usize,
-    expected: Vec<&'static str>,
+    /// Rarely more than four between two tokens taken.
+    expected: SmallVec<[&'static str; 8]>,
     errors: &'p mut Vec<Diag>,
 }
 
-impl<'p> MetaParser<'p, '_, '_> {
+impl<'p, 'db> MetaParser<'p, '_, 'db> {
     fn span(&self, range: TextRange) -> Span {
         self.cx.span(self.attr.in_file(range))
     }
 
-    fn peek(&self) -> Option<&'p Tok> {
+    fn peek(&self) -> Option<&'p Tok<'db>> {
         self.tokens.get(self.at)
     }
 
-    fn prev(&self) -> Option<&'p Tok> {
+    fn prev(&self) -> Option<&'p Tok<'db>> {
         self.at.checked_sub(1).and_then(|it| self.tokens.get(it))
     }
 
@@ -995,6 +1017,14 @@ impl<'p> MetaParser<'p, '_, '_> {
             self.errors.push(diag);
             return None;
         }
+        // A word of one segment is the one token its range covers, the list's first.
+        if let [item] = items.as_mut_slice()
+            && item.is_word
+            && let Some(tok) = self.tokens.first().filter(|it| it.range == item.range)
+        {
+            // alloc: the name of a list's only word, which the templates compare
+            item.word = Some(tok.text.to_string());
+        }
         Some(items)
     }
 
@@ -1017,7 +1047,7 @@ impl<'p> MetaParser<'p, '_, '_> {
     fn take_lit(&mut self) {
         let Some(tok) = self.peek() else { return };
         self.bump();
-        if check_lit(self.cx, self.attr, &tok.token, self.errors) == Lit::Suffixed {
+        if check_lit(self.cx, self.attr, tok.token, self.errors) == Lit::Suffixed {
             let diag = suffixed(self.span(tok.range));
             self.errors.push(diag);
         }
@@ -1027,13 +1057,11 @@ impl<'p> MetaParser<'p, '_, '_> {
     /// where it is not one (rustc cancels that error for `InvalidMetaItem`).
     fn item(&mut self) -> Option<Item> {
         let start = self.peek()?.range.start();
-        let rooted = self.eat(SyntaxKind::COLON2, "`::`");
-        let mut segments = 0;
-        let mut last = None;
+        self.eat(SyntaxKind::COLON2, "`::`");
         loop {
-            let tok = self.peek().filter(|it| is_segment(it, self.edition))?;
-            last = Some(tok);
-            segments += 1;
+            if !self.peek().is_some_and(|it| is_segment(it, self.edition)) {
+                return None;
+            }
             self.bump();
             if !self.eat(SyntaxKind::COLON2, "`::`") {
                 break;
@@ -1050,8 +1078,7 @@ impl<'p> MetaParser<'p, '_, '_> {
         } else {
             is_word = true;
         }
-        let word = (is_word && segments == 1 && !rooted).then(|| last.map(|it| it.text.clone())).flatten();
-        Some(Item { range: TextRange::new(start, self.prev_end()), lit: false, is_word, word })
+        Some(Item { range: TextRange::new(start, self.prev_end()), lit: false, is_word, word: None })
     }
 
     /// `parse_paren_comma_seq` of `parse_meta_item_inner`, at its `(`: rustc's
@@ -1079,6 +1106,7 @@ impl<'p> MetaParser<'p, '_, '_> {
                     return None;
                 }
                 diag.suggestion_with_style(
+                    // alloc: the error's suggestion
                     vec![(self.span(at), ",".to_owned())],
                     "missing `,`",
                     Applicability::MaybeIncorrect,
@@ -1101,7 +1129,9 @@ impl<'p> MetaParser<'p, '_, '_> {
     /// identifiers after a `=`.
     fn invalid_meta_item(&mut self) -> Diag {
         let range = self.token_range();
+        // alloc: the error's message
         let descr = self.peek().map_or_else(|| "`<eof>`".to_owned(), |it| descr(it, self.edition));
+        // alloc: the error's message
         let mut diag = Diag::error(None, format!("expected unsuffixed literal, found {descr}"), self.span(range));
         if self.prev().is_some_and(|it| it.kind == SyntaxKind::EQ) && self.peek().is_some_and(is_ident) {
             let before = TextRange::empty(range.start());
@@ -1111,6 +1141,7 @@ impl<'p> MetaParser<'p, '_, '_> {
             let after = TextRange::empty(self.prev_end());
             diag.multipart_suggestion(
                 "surround the identifier with quotation marks to make it into a string literal",
+                // alloc: the error's suggestion
                 vec![(self.span(before), "\"".to_owned()), (self.span(after), "\"".to_owned())],
                 Applicability::MachineApplicable,
             );
@@ -1122,12 +1153,14 @@ impl<'p> MetaParser<'p, '_, '_> {
     /// `-`".
     fn expected_one_of(&self) -> Diag {
         let Some(found) = self.peek() else { return self.invalid_eof() };
+        // clone: on the error path, the expected tokens sorted for the message
         let mut expected = self.expected.clone();
         expected.sort_unstable();
         expected.dedup();
         let prev = self.prev();
         let found_span = self.span(found.range);
         if found.kind == SyntaxKind::EQ2 && prev.is_some_and(is_ident) && expected.contains(&"`=`") {
+            // clone: the error's span, used again for its suggestion
             let mut diag = Diag::error(None, "unexpected `==`", found_span.clone());
             diag.suggestion_verbose(found_span, "try using `=` instead", "=", Applicability::MachineApplicable);
             return diag;
@@ -1135,28 +1168,37 @@ impl<'p> MetaParser<'p, '_, '_> {
         let list = tokens_to_string(&expected);
         let actual = descr(found, self.edition);
         let (message, label) = match expected.len() {
+            // alloc: the error's message and label
             0 => (format!("unexpected token: {actual}"), "unexpected token after this".to_owned()),
+            // alloc: the error's message and label
             1 => (format!("expected {list}, found {actual}"), format!("expected {list}")),
             n => {
+                // alloc: the error's label; clone: the list, also in the message
                 let short = if n > 6 { format!("{n} possible tokens") } else { list.clone() };
+                // alloc: the error's message and label
                 (format!("expected one of {list}, found {actual}"), format!("expected one of {short}"))
             }
         };
+        // clone: the error's span, used again for its labels
         let mut diag = Diag::error(None, message, found_span.clone());
         if let Some(prev) = prev.filter(|it| is_ident(it)) {
             if matches!(prev.text.as_str(), "def" | "fun" | "func" | "function") {
                 diag.suggestion_with_style(
+                    // alloc: the error's suggestion
                     vec![(self.span(prev.range), "fn".to_owned())],
+                    // alloc: the error's suggestion
                     format!("write `fn` instead of `{}` to declare a function", prev.text),
                     Applicability::MachineApplicable,
                     SuggestionStyle::HideCodeInline,
                 );
             }
             if is_ident(found) && !prev.text.starts_with("r#") && !found.text.starts_with("r#") {
+                // alloc: on the error path, the keyword the two identifiers might spell
                 let concat = format!("{}{}", prev.text, found.text);
                 if SyntaxKind::from_keyword(&concat, self.edition).is_some() || is_reserved_keyword(&concat, self.edition) {
                     diag.suggestion_verbose(
                         self.span(TextRange::new(prev.range.start(), found.range.end())),
+                        // alloc: the error's suggestion
                         format!("consider removing the space to spell keyword `{concat}`"),
                         concat,
                         Applicability::MachineApplicable,
@@ -1187,36 +1229,44 @@ impl<'p> MetaParser<'p, '_, '_> {
 /// rustc's `tokens_to_string`: "`a`", "`a` or `b`", "`a`, `b`, or `c`".
 fn tokens_to_string(tokens: &[&str]) -> String {
     match tokens {
+        // alloc: empty, allocates nothing
         [] => String::new(),
+        // alloc: an error's message
         [one] => (*one).to_owned(),
+        // alloc: an error's message
         [a, b] => format!("{a} or {b}"),
+        // alloc: an error's message
         [init @ .., last] => format!("{}, or {last}", init.join(", ")),
     }
 }
 
 /// rustc's `token_descr`: "`-`", "keyword `fn`", "reserved identifier `_`".
-fn descr(tok: &Tok, edition: Edition) -> String {
+fn descr(tok: &Tok<'_>, edition: Edition) -> String {
     let text = &tok.text;
     if tok.kind == SyntaxKind::UNDERSCORE {
+        // alloc: an error's message
         return format!("reserved identifier `{text}`");
     }
     if is_reserved_keyword(text, edition) {
+        // alloc: an error's message
         return format!("reserved keyword `{text}`");
     }
     if SyntaxKind::from_keyword(text, edition).is_some_and(|it| it.is_strict_keyword(edition)) {
+        // alloc: an error's message
         return format!("keyword `{text}`");
     }
+    // alloc: an error's message
     format!("`{text}`")
 }
 
 /// rustc's `token::Ident`: an identifier or a keyword, `_`, `true` and `false` among them.
-fn is_ident(tok: &Tok) -> bool {
+fn is_ident(tok: &Tok<'_>) -> bool {
     tok.kind.is_any_identifier() || tok.kind == SyntaxKind::UNDERSCORE
 }
 
 /// A segment of a path rustc's `parse_path_segment_ident` takes: an identifier that is not a
 /// keyword of the edition, or `self`, `super`, `crate`, `Self`.
-fn is_segment(tok: &Tok, edition: Edition) -> bool {
+fn is_segment(tok: &Tok<'_>, edition: Edition) -> bool {
     matches!(
         tok.kind,
         SyntaxKind::IDENT | SyntaxKind::SELF_KW | SyntaxKind::SUPER_KW | SyntaxKind::CRATE_KW | SyntaxKind::SELF_TYPE_KW
@@ -1250,13 +1300,13 @@ enum Lit {
 
 /// `MetaItemLit::from_token_lit` of a literal token, with `report_lit_error`'s errors
 /// (`create_lit_error`).
-fn check_lit(cx: &Cx<'_, '_>, attr: &Attr, token: &SyntaxToken, errors: &mut Vec<Diag>) -> Lit {
+fn check_lit(cx: &Cx<'_, '_>, attr: &Attr<'_>, token: ast::Token<'_>, errors: &mut Vec<Diag>) -> Lit {
     let span = cx.span(attr.in_file(token.text_range()));
     let kind = token.kind();
     let text = token.text();
     match kind {
         SyntaxKind::INT_NUMBER => {
-            let Some(int) = ast::IntNumber::cast(token.clone()) else { return Lit::Other };
+            let Some(int) = ast::IntNumber::cast(token) else { return Lit::Other };
             let suffix = int.suffix();
             let symbol = &text[..text.len() - suffix.map_or(0, str::len)];
             match suffix {
@@ -1275,8 +1325,7 @@ fn check_lit(cx: &Cx<'_, '_>, attr: &Attr, token: &SyntaxToken, errors: &mut Vec
             }
         }
         SyntaxKind::FLOAT_NUMBER => {
-            let float = ast::FloatNumber::cast(token.clone());
-            match float.as_ref().and_then(ast::FloatNumber::suffix) {
+            match ast::FloatNumber::cast(token).and_then(ast::FloatNumber::suffix) {
                 None => Lit::Other,
                 Some("f16" | "f32" | "f64" | "f128") => Lit::Suffixed,
                 Some(other) => {
@@ -1296,7 +1345,9 @@ fn check_lit(cx: &Cx<'_, '_>, attr: &Attr, token: &SyntaxToken, errors: &mut Vec
                 SyntaxKind::CHAR => "char",
                 _ => "byte",
             };
+            // alloc: the error's message; clone: its span, used again for its label
             let mut diag = Diag::error(None, format!("suffixes on {what} literals are invalid"), span.clone());
+            // alloc: the error's label
             diag.span_label(span, format!("invalid suffix `{suffix}`"));
             errors.push(diag);
             Lit::Err
@@ -1309,12 +1360,17 @@ fn check_lit(cx: &Cx<'_, '_>, attr: &Attr, token: &SyntaxToken, errors: &mut Vec
 fn int_too_large(span: Span, radix: u32) -> Diag {
     let max = u128::MAX;
     let limit = match radix {
+        // alloc: the error's note
         2 => format!("{max:#b}"),
+        // alloc: the error's note
         8 => format!("{max:#o}"),
+        // alloc: the error's note
         16 => format!("{max:#x}"),
+        // alloc: the error's note
         _ => format!("{max}"),
     };
     let mut diag = Diag::error(None, "integer literal is too large", span);
+    // alloc: the error's note
     diag.note(format!("value exceeds limit of `{limit}`"));
     diag
 }
@@ -1324,17 +1380,21 @@ fn invalid_int_suffix(span: Span, symbol: &str, suffix: &str) -> Diag {
     let looks_like_width =
         suffix.len() > 1 && suffix.starts_with(['i', 'u']) && suffix[1..].chars().all(|it| it.is_ascii_digit());
     if looks_like_width {
+        // alloc: the error's message
         let mut diag = Diag::error(None, format!("invalid width `{}` for integer literal", &suffix[1..]), span);
         diag.help("valid widths are 8, 16, 32, 64 and 128");
         return diag;
     }
     if let Some(fixed) = fix_base_capitalisation(symbol, suffix) {
+        // clone: the error's span, used again for its suggestion
         let mut diag = Diag::error(None, "invalid base prefix for number literal", span.clone());
         diag.note("base prefixes (`0xff`, `0b1010`, `0o755`) are lowercase");
         diag.suggestion(span, "try making the prefix lowercase", fixed, Applicability::MaybeIncorrect);
         return diag;
     }
+    // alloc: the error's message; clone: its span, used again for its label
     let mut diag = Diag::error(None, format!("invalid suffix `{suffix}` for number literal"), span.clone());
+    // alloc: the error's label
     diag.span_label(span, format!("invalid suffix `{suffix}`"));
     diag.help("the suffix must be one of the numeric types (`u32`, `isize`, `f32`, etc.)");
     diag
@@ -1343,11 +1403,14 @@ fn invalid_int_suffix(span: Span, symbol: &str, suffix: &str) -> Diag {
 /// `InvalidFloatLiteralWidth` or `InvalidFloatLiteralSuffix`.
 fn invalid_float_suffix(span: Span, suffix: &str) -> Diag {
     if suffix.len() > 1 && suffix.starts_with('f') && suffix[1..].chars().all(|it| it.is_ascii_digit()) {
+        // alloc: the error's message
         let mut diag = Diag::error(None, format!("invalid width `{}` for float literal", &suffix[1..]), span);
         diag.help("valid widths are 32 and 64");
         return diag;
     }
+    // alloc: the error's message; clone: its span, used again for its label
     let mut diag = Diag::error(None, format!("invalid suffix `{suffix}` for float literal"), span.clone());
+    // alloc: the error's label
     diag.span_label(span, format!("invalid suffix `{suffix}`"));
     diag.help("valid suffixes are `f32` and `f64`");
     diag
@@ -1365,6 +1428,7 @@ fn fix_base_capitalisation(symbol: &str, suffix: &str) -> Option<String> {
     };
     let valid = symbol == "0"
         && chars.filter(|it| *it != '_').take_while(|it| *it != 'i' && *it != 'u').all(|it| it.to_digit(base).is_some());
+    // alloc: the error's suggestion
     valid.then(|| format!("0{}{}", base_char.to_ascii_lowercase(), &suffix[1..]))
 }
 

@@ -528,10 +528,14 @@ impl<S: ScopeSink> StoreVisitor for ExprScopeVisitor<'_, S> {
 
 #[cfg(test)]
 mod tests {
-    use hir_expand::{InFile, name::AsName};
+    use hir_expand::InFile;
+    use itertools::Itertools as _;
     use la_arena::ArenaMap;
     use span::FileId;
-    use syntax::{AstNode, algo::find_node_at_offset, ast};
+    use syntax::{
+        TextSize,
+        view::{self, AstNode as _},
+    };
     use test_fixture::WithFixture;
     use test_utils::{assert_eq_text, extract_offset};
 
@@ -655,6 +659,14 @@ mod tests {
         }
     }
 
+    /// The shortest `N` at `offset`, as `syntax::algo::find_node_at_offset` finds it.
+    fn find_at<'t, N: view::AstNode<'t>>(file: view::Node<'t>, offset: TextSize) -> Option<N> {
+        file.token_at_offset(offset)
+            .map(|token| token.parent_ancestors())
+            .kmerge_by(|a, b| a.text_range().len() < b.text_range().len())
+            .find_map(N::cast)
+    }
+
     fn do_check(#[rust_analyzer::rust_fixture] ra_fixture: &str, expected: &[&str]) {
         let (offset, code) = extract_offset(ra_fixture);
         let code = {
@@ -672,8 +684,8 @@ mod tests {
 
         let (file_id, _) = editioned_file_id.unpack(&db);
 
-        let file_syntax = editioned_file_id.parse(&db).syntax_node();
-        let marker: Option<ast::PathExpr> = find_node_at_offset(&file_syntax, offset);
+        let parse = editioned_file_id.parse(&db);
+        let marker = find_at::<view::PathExpr<'_>>(parse.root(), offset);
         let function = find_function(&db, file_id);
 
         let scopes = ExprScopes::of(&db, DefWithBodyId::from(function));
@@ -682,7 +694,7 @@ mod tests {
         let expr_id = marker
             .and_then(|marker| {
                 source_map
-                    .node_expr(InFile { file_id: editioned_file_id.into(), value: &marker.into() })
+                    .node_expr_view(InFile::new(editioned_file_id.into(), marker.into()))
                     .and_then(|expr| expr.as_expr())
             })
             .or_else(|| {
@@ -932,10 +944,12 @@ fn foo() {
 
         let (file_id, _) = editioned_file_id.unpack(&db);
 
-        let file = editioned_file_id.parse(&db).ok().unwrap();
-        let expected_name = find_node_at_offset::<ast::Name>(file.syntax(), expected_offset.into())
+        let parse = editioned_file_id.parse(&db);
+        assert!(parse.errors().is_empty(), "{:?}", parse.errors());
+        let file = parse.root();
+        let expected_name = find_at::<view::Name<'_>>(file, expected_offset.into())
             .expect("failed to find a name at the target offset");
-        let name_ref: ast::NameRef = find_node_at_offset(file.syntax(), offset).unwrap();
+        let name_ref = find_at::<view::NameRef<'_>>(file, offset).unwrap();
 
         let function = find_function(&db, file_id);
 
@@ -943,20 +957,21 @@ fn foo() {
         let (_, source_map) = Body::with_source_map(&db, function.into());
 
         let expr_scope = {
-            let expr_ast = name_ref.syntax().ancestors().find_map(ast::Expr::cast).unwrap();
+            let expr = name_ref.syntax().ancestors().find_map(view::Expr::cast).unwrap();
             let expr_id = source_map
-                .node_expr(InFile { file_id: editioned_file_id.into(), value: &expr_ast })
+                .node_expr_view(InFile::new(editioned_file_id.into(), expr))
                 .unwrap()
                 .as_expr()
                 .unwrap();
             scopes.scope_for(expr_id).unwrap()
         };
 
-        let resolved = scopes.resolve_name_in_scope(expr_scope, &name_ref.as_name()).unwrap();
+        let name = Name::new_root(name_ref.text());
+        let resolved = scopes.resolve_name_in_scope(expr_scope, &name).unwrap();
         let pat_src =
             source_map.pat_syntax(source_map.patterns_for_binding(resolved.binding())[0]).unwrap();
 
-        let local_name = pat_src.value.syntax_node_ptr().to_node(file.syntax());
+        let local_name = view::to_node(pat_src.value.syntax_node_ptr(), file);
         assert_eq!(local_name.text_range(), expected_name.syntax().text_range());
         check_model(&db, function);
     }

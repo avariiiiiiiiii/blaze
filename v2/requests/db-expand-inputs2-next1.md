@@ -9,3 +9,4 @@ From `dedup-codec-rng` (report `/tmp/blaze-lanes/v2-dedup-codec-rng.md`). `blaze
 3. Replace each `Rng(N)` constructor with `Rng::new(N)`: `Rng(7)`, `Rng(thread)`, `Rng(11)`, `Rng(3)`, `Rng(19)`, `Rng(23)`, `Rng(seed)`. Any `rng.next()` becomes `rng.next_u64()`. `fn seeded_view(rng: &mut Rng)` stays as it is.
 
 > forwarded to db (its window is gone) (from requests, pass 16; told by tmux).
+> applied by db-audit-dbsub-macros (2026-10-29 22:36): as written in `crates/base-db/src/tests.rs` (the `use` sits before `use cfg::..`, rustfmt's order); the file has no `rng.next()`, and every `below` there takes a nonzero `n`, so each stream is unchanged.

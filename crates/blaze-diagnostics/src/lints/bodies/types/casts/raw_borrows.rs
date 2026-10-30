@@ -43,7 +43,9 @@ impl LatePass for RawBorrowsViaReferences {
             return;
         }
         let (Some(at), Some(span)) = (b.expr_node(expr), expr_span(b, expr)) else { return };
+        // clone: a lint's span, for a lint found
         let mut diag = Diag::lint("raw_borrows_via_references", MESSAGE, span.clone());
+        // alloc: the lint's text, for a lint found
         let message = format!("consider using `&raw {mutbl}` for a safer and more explicit raw pointer");
         let place_span = expr_span(b, place).and_then(|it| ancestor_in_same_ctxt(&it, &span));
         let ty_span = cast_ty_span(b, expr).and_then(|it| ancestor_in_same_ctxt(&it, &span));
@@ -57,6 +59,7 @@ impl LatePass for RawBorrowsViaReferences {
                 let left = span.with_lo(span.lo.min(place_span.lo)).with_hi(span.lo.max(place_span.lo));
                 let right = place_span.with_lo(place_span.hi.min(ty_span.hi)).with_hi(place_span.hi.max(ty_span.hi));
                 diag.suggestion_with_style(
+                    // alloc: the lint's text, for a lint found
                     vec![(left, format!("&raw {mutbl} ")), (right, String::new())],
                     message,
                     Applicability::MachineApplicable,

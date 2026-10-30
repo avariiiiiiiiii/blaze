@@ -9,7 +9,13 @@
 //!   RA than `proc-macro2` token stream.
 
 #![cfg(feature = "in-rust-tree")]
-#![feature(proc_macro_internals, proc_macro_diagnostic, proc_macro_span, rustc_private)]
+#![feature(
+    allocator_api,
+    proc_macro_internals,
+    proc_macro_diagnostic,
+    proc_macro_span,
+    rustc_private
+)]
 #![expect(internal_features)]
 #![allow(unused_features, unused_crate_dependencies)]
 #![deny(deprecated_safe, clippy::undocumented_unsafe_blocks)]
@@ -31,7 +37,6 @@ mod token_stream;
 mod wire;
 
 use std::{
-    collections::hash_map::Entry,
     env,
     ffi::OsString,
     fs,
@@ -98,6 +103,8 @@ pub enum ProcMacroPanicMarker {
     Internal { reason: String },
 }
 
+// The server program's client of blaze, which this crate can't name (the program depends on it).
+// dyn: asked once per span question a macro asks, each a round trip to blaze.
 pub type ProcMacroClientHandle<'a> = &'a mut (dyn ProcMacroClientInterface + Sync + Send);
 
 pub trait ProcMacroClientInterface {
@@ -150,6 +157,7 @@ impl ProcMacroSrv<'_> {
         let number = self.expansions.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let snapped_env = self.env;
         let expander = self.expander(lib.as_ref()).map_err(|err| ExpandError::Internal {
+            // alloc: error path, naming why the library didn't load.
             reason: Some(format!("failed to load macro: {err}")),
         })?;
 
@@ -160,6 +168,8 @@ impl ProcMacroSrv<'_> {
         let result = thread::scope(|s| {
             let thread = thread::Builder::new()
                 .stack_size(EXPANDER_STACK_SIZE)
+                // The thread keeps the macro's thread locals from outliving the expansion.
+                // alloc: its name, beside spawning it.
                 .name(macro_name.to_owned())
                 .spawn_scoped(s, move || {
                     let _marked = scope::mark(number);
@@ -176,20 +186,17 @@ impl ProcMacroSrv<'_> {
                 });
             match thread.unwrap().join() {
                 Ok(res) => res.map_err(ExpandError::Panic),
-                Err(payload) => {
-                    if let Some(marker) = payload.downcast_ref::<ProcMacroPanicMarker>() {
-                        return match marker {
-                            ProcMacroPanicMarker::Cancelled { reason } => {
-                                Err(ExpandError::Cancelled { reason: Some(reason.clone()) })
-                            }
-                            ProcMacroPanicMarker::Internal { reason } => {
-                                Err(ExpandError::Internal { reason: Some(reason.clone()) })
-                            }
-                        };
-                    }
-
-                    std::panic::resume_unwind(payload)
-                }
+                Err(payload) => match payload.downcast::<ProcMacroPanicMarker>() {
+                    Ok(marker) => match *marker {
+                        ProcMacroPanicMarker::Cancelled { reason } => {
+                            Err(ExpandError::Cancelled { reason: Some(reason) })
+                        }
+                        ProcMacroPanicMarker::Internal { reason } => {
+                            Err(ExpandError::Internal { reason: Some(reason) })
+                        }
+                    },
+                    Err(payload) => std::panic::resume_unwind(payload),
+                },
             }
         });
         prev_env.rollback();
@@ -202,33 +209,36 @@ impl ProcMacroSrv<'_> {
         dylib_path: &Utf8Path,
     ) -> Result<Vec<(String, ProcMacroKind)>, String> {
         let expander = self.expander(dylib_path)?;
+        // alloc: the library's macros, listed once per library for the client, which owns them.
         Ok(expander.list_macros().map(|(k, v)| (k.to_owned(), v)).collect())
     }
 
+    /// The loaded library at `path`, loaded again when it changed since. A library already
+    /// loaded is found by `path` as given: only loading one stores a key.
     fn expander(&self, path: &Utf8Path) -> Result<Arc<dylib::Expander>, String> {
-        let expander = || {
-            let expander = dylib::Expander::new(path)
-                .map_err(|err| format!("Cannot create expander for {path}: {err}",));
-            expander.map(Arc::new)
-        };
+        let mut expanders = self.expanders.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(loaded) = expanders.get_mut(path) {
+            let time = fs::metadata(path).and_then(|it| it.modified()).ok();
+            if Some(loaded.modified_time()) != time {
+                *loaded = load(path)?;
+            }
+            // clone: the expander's `Arc`, a handle for this expansion.
+            return Ok(loaded.clone());
+        }
+        let loaded = load(path)?;
+        // alloc: clone: the library's key and its `Arc`'s second handle, once per library loaded.
+        expanders.insert(path.to_path_buf(), loaded.clone());
+        Ok(loaded)
+    }
+}
 
-        Ok(
-            match self
-                .expanders
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .entry(path.to_path_buf())
-            {
-                Entry::Vacant(v) => v.insert(expander()?).clone(),
-                Entry::Occupied(mut e) => {
-                    let time = fs::metadata(path).and_then(|it| it.modified()).ok();
-                    if Some(e.get().modified_time()) != time {
-                        e.insert(expander()?);
-                    }
-                    e.get().clone()
-                }
-            },
-        )
+/// The library at `path`, loaded: once per library, or per change to it.
+fn load(path: &Utf8Path) -> Result<Arc<dylib::Expander>, String> {
+    match dylib::Expander::new(path) {
+        // alloc: the loaded library's one shared handle.
+        Ok(expander) => Ok(Arc::new(expander)),
+        // alloc: error path, naming the library.
+        Err(err) => Err(format!("Cannot create expander for {path}: {err}")),
     }
 }
 
@@ -302,6 +312,7 @@ pub struct EnvSnapshot {
 
 impl Default for EnvSnapshot {
     fn default() -> EnvSnapshot {
+        // alloc: the server's environment, read once per server.
         EnvSnapshot { vars: env::vars_os().collect() }
     }
 }
@@ -309,7 +320,8 @@ impl Default for EnvSnapshot {
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 struct EnvChange<'snap> {
-    changed_vars: Vec<&'snap str>,
+    /// The variables set, each put back as the snapshot has it on drop.
+    changed_vars: &'snap [(String, String)],
     prev_working_dir: Option<PathBuf>,
     snap: &'snap EnvSnapshot,
     _guard: std::sync::MutexGuard<'snap, ()>,
@@ -335,24 +347,15 @@ impl<'snap> EnvChange<'snap> {
             }
             None => None,
         };
-        EnvChange {
-            snap,
-            changed_vars: new_vars
-                .iter()
-                .map(|(k, v)| {
-                    // SAFETY: `set_var` needs no other thread reading or writing the
-                    // environment as it changes. `ENV_LOCK` is held from here until this
-                    // `EnvChange` drops, after `expand` has joined the macro's thread, so no
-                    // expansion runs while it changes, and no other thread of the server reads
-                    // the environment. A thread that did (a macro's own thread left running, a
-                    // C library's `getenv`) would race with the write.
-                    unsafe { env::set_var(k, v) };
-                    &**k
-                })
-                .collect(),
-            prev_working_dir,
-            _guard: guard,
+        for (k, v) in new_vars {
+            // SAFETY: `set_var` needs no other thread reading or writing the environment as it
+            // changes. `ENV_LOCK` is held from here until this `EnvChange` drops, after `expand`
+            // has joined the macro's thread, so no expansion runs while it changes, and no other
+            // thread of the server reads the environment. A thread that did (a macro's own
+            // thread left running, a C library's `getenv`) would race with the write.
+            unsafe { env::set_var(k, v) };
         }
+        EnvChange { snap, changed_vars: new_vars, prev_working_dir, _guard: guard }
     }
 
     fn rollback(self) {}
@@ -360,7 +363,7 @@ impl<'snap> EnvChange<'snap> {
 
 impl Drop for EnvChange<'_> {
     fn drop(&mut self) {
-        for name in self.changed_vars.drain(..) {
+        for (name, _) in self.changed_vars {
             match self.snap.vars.get::<std::ffi::OsStr>(name.as_ref()) {
                 // SAFETY: `self._guard` still holds `ENV_LOCK` and the macro's thread has been
                 // joined, as in `apply`, so no other thread reads the environment as it changes.
@@ -384,6 +387,10 @@ impl Drop for EnvChange<'_> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 #[cfg(test)]
 pub fn proc_macro_test_dylib_path() -> paths::Utf8PathBuf {

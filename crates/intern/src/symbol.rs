@@ -18,19 +18,7 @@ use crate::table::{Jobs, Live, RestoreError, Shape, Table, serial};
 
 pub mod symbols;
 
-/// The order key of a name: its first 8 bytes big-endian, zero-padded. Two keys compare as the
-/// names' first 8 bytes do, so `order_key(a) < order_key(b)` implies `a < b` and only equal
-/// keys need the bytes compared.
-#[inline]
-pub const fn order_key(bytes: &[u8]) -> u64 {
-    let mut key = [0u8; 8];
-    let mut i = 0;
-    while i < 8 && i < bytes.len() {
-        key[i] = bytes[i];
-        i += 1;
-    }
-    u64::from_be_bytes(key)
-}
+pub use blaze_ids::names::order_key;
 
 /// A compiled-in symbol's text and its order key, read by [`Symbol::cmp_order`] without the
 /// table.

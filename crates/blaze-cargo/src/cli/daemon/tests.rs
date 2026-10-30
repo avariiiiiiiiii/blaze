@@ -1,8 +1,33 @@
 use std::path::Path;
 
-use blaze_api::Status;
+use blaze_api::{Response, Status};
 
 use super::*;
+
+/// Hands `on` each of `responses` as [`Client::call_ref`] does: encoded as the daemon sends it,
+/// read where it lies, with whether another follows it; the last Done's `ok`. The fakes of
+/// [`Api`] answer through it.
+pub(crate) fn hand(responses: &[Response], mut on: impl FnMut(ResponseRef<'_>, bool)) -> bool {
+    let mut ok = false;
+    for (at, response) in responses.iter().enumerate() {
+        if let Response::Done { ok: it } = response {
+            ok = *it;
+        }
+        let bytes = blaze_protocol::cbor::to_vec(response).unwrap();
+        on(blaze_protocol::cbor::from_slice::<ResponseRef<'_>>(&bytes).unwrap(), at + 1 < responses.len());
+    }
+    ok
+}
+
+#[test]
+fn a_response_handed_in_place_is_the_one_sent() {
+    let sent = [Response::Fetched { verb: blaze_api::FetchVerb::Updating, what: "crates.io index".to_owned() }, Response::Done {
+        ok: true,
+    }];
+    let mut got = Vec::new();
+    assert!(hand(&sent, |response, more| got.push((response.into_owned(), more))));
+    assert_eq!(got, [(sent[0].clone(), true), (sent[1].clone(), false)]);
+}
 
 #[test]
 fn a_start_that_never_listens_names_the_socket() {

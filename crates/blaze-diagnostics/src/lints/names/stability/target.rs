@@ -15,7 +15,11 @@
 
 use hir::InFile;
 use intern::Symbol;
-use syntax::{AstNode, SyntaxNode, SyntaxNodePtr, TextRange, ast};
+use smallvec::SmallVec;
+use syntax::{
+    SyntaxNodePtr, TextRange,
+    view::{self as ast, AstNode as _, Node},
+};
 
 use crate::{
     cx::Cx,
@@ -181,7 +185,7 @@ pub(super) struct Attribute {
 
 impl Attribute {
     /// The `#[deprecated]` `meta` written in `attr` on `on`.
-    pub(super) fn new(target: Target, on: InFile<&SyntaxNode>, meta: &ast::Meta, attr: &ast::Attr) -> Option<Attribute> {
+    pub(super) fn new(target: Target, on: InFile<Node<'_>>, meta: &ast::Meta<'_>, attr: &ast::Attr<'_>) -> Option<Attribute> {
         let path = meta.path()?.syntax().text_range();
         let whole = match attr.meta() {
             Some(it) if it.syntax() == meta.syntax() => attr.syntax().text_range(),
@@ -189,7 +193,7 @@ impl Attribute {
         };
         Some(Attribute {
             target,
-            on: on.map(SyntaxNodePtr::new),
+            on: on.map(ast::ptr),
             path: on.with_value(path),
             whole: on.with_value(whole),
         })
@@ -219,9 +223,11 @@ pub(super) fn useless(cx: &Cx<'_, '_>, attr: &Attribute, extern_types: bool) -> 
     if !is_useless(target) {
         return None;
     }
+    // alloc: the message of a `useless_deprecated` that fires
     let message = format!("the `deprecated` attribute cannot be used on {}", target.plural_name());
     let mut diag = Diag::lint("useless_deprecated", message, cx.span(attr.path));
     diag.suggestion_with_style(
+        // alloc: the suggestion of a `useless_deprecated` that fires
         vec![(cx.span(attr.whole), String::new())],
         "remove the attribute",
         Applicability::MachineApplicable,
@@ -229,6 +235,7 @@ pub(super) fn useless(cx: &Cx<'_, '_>, attr: &Attribute, extern_types: bool) -> 
     );
     let (applied, only) = applied(target, extern_types);
     let only = if only { "only " } else { "" };
+    // alloc: the help of a `useless_deprecated` that fires
     diag.help(format!("the `deprecated` attribute can {only}be applied to {}", and_list(&applied)));
     diag.warn(
         "this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!",
@@ -244,6 +251,7 @@ pub(super) fn no_effect(cx: &Cx<'_, '_>, attr: &Attribute, of_trait_impl: bool) 
         return None;
     }
     let span = cx.span(attr.whole);
+    // clone: the span of an `unused_attributes` that fires, for its label and its suggestion
     let mut diag = Diag::lint("unused_attributes", "this `#[deprecated]` annotation has no effect", span.clone());
     diag.suggestion(span, "remove the unnecessary deprecation attribute", "", Applicability::MachineApplicable);
     super::source_fact(cx, &mut diag, attr.on);
@@ -252,9 +260,10 @@ pub(super) fn no_effect(cx: &Cx<'_, '_>, attr: &Attribute, of_trait_impl: bool) 
 
 /// `allowed_targets_applied`: the targets named as those `#[deprecated]` can be applied to,
 /// groups of two or more that `target` is not in named as one; and whether there is one.
-fn applied(target: Target, extern_types: bool) -> (Vec<&'static str>, bool) {
-    let mut allowed: Vec<Target> = ALLOWED.iter().copied().filter(|it| extern_types || *it != Target::ForeignTy).collect();
-    let mut fake = Vec::new();
+fn applied(target: Target, extern_types: bool) -> (Names, bool) {
+    let mut allowed: SmallVec<[Target; ALLOWED.len()]> = SmallVec::new();
+    allowed.extend(ALLOWED.iter().copied().filter(|it| extern_types || *it != Target::ForeignTy));
+    let mut fake: SmallVec<[&'static str; 5]> = SmallVec::new();
     for (group, name) in [
         (FUNCTION_LIKE, "functions"),
         (FUNCTION_WITH_BODY_LIKE, "functions with a body"),
@@ -268,19 +277,28 @@ fn applied(target: Target, extern_types: bool) -> (Vec<&'static str>, bool) {
         allowed.retain(|it| !group.contains(it));
         fake.push(name);
     }
-    let mut names: Vec<&'static str> = fake.into_iter().chain(allowed.iter().map(|it| it.plural_name())).collect();
+    let mut names = Names::new();
+    names.extend(fake);
+    names.extend(allowed.iter().map(|it| it.plural_name()));
     names.sort_unstable();
     names.dedup();
     let only = names.len() == 1;
     (names, only)
 }
 
-/// `DiagArgValue::StrListSepByAnd`.
+/// The names [`applied`] gives: at most every allowed target and every group, inline.
+type Names = SmallVec<[&'static str; ALLOWED.len() + 5]>;
+
+/// `DiagArgValue::StrListSepByAnd`, for the help of a `useless_deprecated` that fires.
 fn and_list(items: &[&str]) -> String {
     match items {
+        // alloc: empty, allocates nothing
         [] => String::new(),
+        // alloc: the help of a diagnostic that fires
         [one] => (*one).to_owned(),
+        // alloc: the help of a diagnostic that fires
         [a, b] => format!("{a} and {b}"),
+        // alloc: the help of a diagnostic that fires
         [init @ .., last] => format!("{}, and {last}", init.join(", ")),
     }
 }

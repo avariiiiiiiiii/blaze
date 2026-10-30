@@ -28,7 +28,7 @@ use std::{
 use anyhow::Context as _;
 use blaze_source::SourceId;
 
-pub use download::{Blobs, Package};
+pub use download::Package;
 pub use query::IndexRegistry;
 pub use registry::Registry;
 pub use sources::{Locked, SourceConfig, SourceDef, SourceMap, Sources};
@@ -69,9 +69,10 @@ pub struct Context {
     /// `$CARGO_HOME`, as cargo finds it: the `CARGO_HOME` variable, else `~/.cargo`.
     pub cargo_home: PathBuf,
     pub net: NetConfig,
+    // dyn: the I/O driver, chosen once per process; each call is a network round trip.
     pub http: Arc<dyn http::Http>,
     /// blaze's store, which keeps `.crate` files by their sha256.
-    pub store: Option<Arc<dyn Blobs>>,
+    pub store: Option<&'static blaze_store::Store>,
     /// Whether a `.crate` is also written to cargo's cache,
     /// `$CARGO_HOME/registry/cache/<registry>/`, so that cargo finds it there offline.
     pub keep_crate_files: bool,
@@ -81,6 +82,7 @@ pub struct Context {
 }
 
 impl Context {
+    // dyn: the I/O driver, as on `Context::http`.
     pub fn new(cargo_home: PathBuf, http: Arc<dyn http::Http>) -> Context {
         Context {
             cargo_home,

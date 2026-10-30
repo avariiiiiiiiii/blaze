@@ -40,8 +40,8 @@ impl Contents {
         db: &RootDatabase,
         checkouts: (&Path, Option<&Path>),
         krate: Crate,
-        stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
-        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+        stable_crate_id: &impl Fn(Crate) -> Option<u64>,
+        process_reads: &impl Fn(Crate) -> Vec<(String, String)>,
     ) -> Option<ContentId> {
         *self
             .of(krate)
@@ -102,8 +102,8 @@ impl Contents {
         db: &RootDatabase,
         checkouts: (&Path, Option<&Path>),
         krate: Crate,
-        stable_crate_id: &dyn Fn(Crate) -> Option<u64>,
-        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+        stable_crate_id: &impl Fn(Crate) -> Option<u64>,
+        process_reads: &impl Fn(Crate) -> Vec<(String, String)>,
     ) -> Option<ContentId> {
         let data = krate.data(db);
         let mut hasher = Sha256::new();
@@ -227,8 +227,8 @@ impl Contents {
         db: &RootDatabase,
         krate: Crate,
         root: &Path,
-        known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
-        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+        known: &impl Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
+        process_reads: &impl Fn(Crate) -> Vec<(String, String)>,
     ) -> ContentId {
         let hash = || self.hash_library(db, krate, root, known, process_reads);
         if let Some(id) = *self.of(krate).get_or_init(|| Some(hash())) {
@@ -246,8 +246,8 @@ impl Contents {
         db: &RootDatabase,
         krate: Crate,
         root: &Path,
-        known: &dyn Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
-        process_reads: &dyn Fn(Crate) -> Vec<(String, String)>,
+        known: &impl Fn(Crate) -> Option<(Option<u64>, std::path::PathBuf)>,
+        process_reads: &impl Fn(Crate) -> Vec<(String, String)>,
     ) -> ContentId {
         let mut hasher = Sha256::new();
         let mut field = |bytes: &[u8]| {
@@ -387,5 +387,60 @@ mod tests {
         let nested = format!("{registry}/dep-0.1.0/registry/src/inner/lib.rs");
         assert_eq!(home(&nested), Some("/home/one/.cargo"));
         assert_eq!(home("/home/one/checkout/src/lib.rs"), None);
+    }
+
+    /// A crate of the checkout asks its identity and the variables it reads once, of itself
+    /// and of each crate of the checkout it is built on, and is hashed once; one of no checkout
+    /// asks only what is known of the crates it is built on.
+    #[test]
+    fn a_crate_asks_its_identity_and_reads_once_and_is_hashed_with_them() {
+        use std::cell::RefCell;
+        use test_fixture::WithFixture;
+        let (db, _) = RootDatabase::with_many_files(
+            r#"
+//- /app/src/lib.rs crate:app deps:dep env:CARGO_MANIFEST_DIR=/app
+pub fn f() {}
+//- /dep/src/lib.rs crate:dep deps:lib env:CARGO_MANIFEST_DIR=/dep
+pub fn g() {}
+//- /lib/src/lib.rs crate:lib library env:CARGO_MANIFEST_DIR=/lib
+pub fn h() {}
+"#,
+        );
+        let named = |name: &str| {
+            let crates = ide_db::base_db::all_crates(&db);
+            let named = |it: &&Crate| Contents::version(&db, **it).contains(name);
+            *crates.iter().find(named).unwrap()
+        };
+        let (app, dep, lib) = (named("app"), named("dep"), named("lib"));
+        let checkouts = (Path::new("/"), None);
+        let asked = RefCell::new(Vec::new());
+        let id = |krate: Crate| {
+            asked.borrow_mut().push(("id", krate));
+            Some(if krate == app { 1 } else { 2 })
+        };
+        let reads = |krate: Crate| {
+            asked.borrow_mut().push(("reads", krate));
+            vec![("VAR".to_owned(), "value".to_owned())]
+        };
+        let contents = Contents::default();
+        let first = contents.id(&db, checkouts, app, &id, &reads).unwrap();
+        let mut each = asked.take();
+        each.sort_unstable_by_key(|&(what, krate)| (what, krate == app, krate == dep));
+        assert_eq!(each, [("id", lib), ("id", dep), ("id", app), ("reads", dep), ("reads", app)]);
+        assert_eq!(contents.id(&db, checkouts, app, &id, &reads), Some(first));
+        assert!(asked.borrow().is_empty());
+
+        let other = |krate: Crate| Some(if krate == app { 3 } else { 2 });
+        let again = Contents::default().id(&db, checkouts, app, &other, &reads).unwrap();
+        assert_ne!(again, first);
+
+        let known = |krate: Crate| {
+            asked.borrow_mut().push(("known", krate));
+            None
+        };
+        let library = contents.library(&db, lib, Path::new("/lib"), &known, &reads);
+        assert_eq!(asked.take(), [("reads", lib)]);
+        assert_eq!(contents.library(&db, lib, Path::new("/lib"), &known, &reads), library);
+        assert!(asked.borrow().is_empty());
     }
 }

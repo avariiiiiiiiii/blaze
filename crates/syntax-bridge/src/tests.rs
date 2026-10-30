@@ -1,18 +1,20 @@
 use std::{
+    alloc::Global,
     path::{Path, PathBuf},
     sync::Arc,
 };
 
 use blaze_ids::rng::SplitMix64;
 use expect_test::expect;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
+use smallvec::smallvec;
 use span::{Edition, Span};
-use syntax::{AstNode, NodeOrToken, SyntaxNode, ast};
+use syntax::{NodeOrToken, ast, view};
 use test_utils::extract_annotations;
 use tt::{Leaf, Punct, Spacing, TopSubtreeBuilder, TtElement, buffer::Cursor};
 
 use crate::{
-    DocCommentDesugarMode,
+    Appended, DocCommentDesugarMode, Inserted, Removed, call_input,
     dummy_test_span_utils::{DUMMY, DummyTestSpanMap},
     parse_to_token_tree_static_span, reference, syntax_node_to_token_tree,
     syntax_node_to_token_tree_modified, to_matcher_input, to_parser_input,
@@ -20,13 +22,9 @@ use crate::{
 };
 
 fn check_punct_spacing(fixture: &str) {
-    let source_file = ast::SourceFile::parse(fixture, span::Edition::CURRENT).ok().unwrap();
-    let subtree = syntax_node_to_token_tree(
-        source_file.syntax(),
-        DummyTestSpanMap,
-        DUMMY,
-        DocCommentDesugarMode::Mbe,
-    );
+    let parse = ast::SourceFile::parse(fixture, span::Edition::CURRENT);
+    assert!(parse.errors().is_empty(), "the fixture parses");
+    let subtree = call_input(parse.root(), DummyTestSpanMap, DUMMY, DocCommentDesugarMode::Mbe);
     let mut annotations: FxHashMap<_, _> = extract_annotations(fixture)
         .into_iter()
         .map(|(range, annotation)| {
@@ -120,9 +118,10 @@ fn main() {
     )
     .unwrap();
 
-    let (parse, _) = token_tree_to_syntax_node(&tt, parser::TopEntryPoint::SourceFile, &mut |_| {
-        span::Edition::CURRENT
-    });
+    let (parse, _) =
+        token_tree_to_syntax_node(tt.view(), parser::TopEntryPoint::SourceFile, &mut |_| {
+            span::Edition::CURRENT
+        });
     let parse = parse.cast::<ast::SourceFile>().unwrap();
 
     expect![[r#"
@@ -188,8 +187,8 @@ fn corpus() -> Vec<(PathBuf, Arc<str>)> {
         .collect()
 }
 
-fn token_tree(node: &SyntaxNode) -> tt::TopSubtree {
-    syntax_node_to_token_tree(node, DummyTestSpanMap, DUMMY, DocCommentDesugarMode::Mbe)
+fn token_tree(node: view::Node<'_>) -> tt::TopSubtree {
+    call_input(node, DummyTestSpanMap, DUMMY, DocCommentDesugarMode::Mbe)
 }
 
 /// The sink's text buffer is the thread's string scratch: after a conversion it is back on the
@@ -198,56 +197,78 @@ fn token_tree(node: &SyntaxNode) -> tt::TopSubtree {
 #[test]
 fn a_sink_gives_its_text_buffer_back() {
     let text = "fn f() { let a_long_identifier = 1; }";
-    let node = ast::SourceFile::parse(text, Edition::CURRENT).syntax_node();
-    let tree = token_tree(&node);
+    let parse = ast::SourceFile::parse(text, Edition::CURRENT);
+    let tree = token_tree(parse.root());
     let mut edition = |_: span::SyntaxContext| Edition::CURRENT;
-    drop(token_tree_to_syntax_node(&tree, parser::TopEntryPoint::SourceFile, &mut edition));
+    drop(token_tree_to_syntax_node(tree.view(), parser::TopEntryPoint::SourceFile, &mut edition));
     let buf = blaze_mem::scratch::lend_string();
     assert!(buf.capacity() >= "a_long_identifier".len(), "the sink's buffer is on the shelf");
+}
+
+/// A parse's map is the worker's map copied out: its columns at their exact lengths (glued
+/// punctuation makes fewer pieces than tokens, which `with_capacity(tokens)` overshot), the
+/// same map a cold parse gives, and the worker's map back on the thread for the next parse.
+#[test]
+fn a_parse_gives_its_map_at_its_length() {
+    let text = "fn f() { a::b..=c; let d = (1, 2); }".repeat(50);
+    let parse = ast::SourceFile::parse(&text, Edition::CURRENT);
+    let tree = token_tree(parse.root());
+    let mut edition = |_: span::SyntaxContext| Edition::CURRENT;
+    let (_, cold) =
+        token_tree_to_syntax_node(tree.view(), parser::TopEntryPoint::SourceFile, &mut edition);
+    let (_, warm) =
+        token_tree_to_syntax_node(tree.view(), parser::TopEntryPoint::SourceFile, &mut edition);
+    assert!(warm == cold);
+    assert_eq!(warm.capacity(), warm.iter().count(), "the map's columns are exact");
+    let kept = crate::SINK_MAP.take().expect("the worker's map is back on the thread");
+    assert!(kept.capacity() >= warm.capacity());
 }
 
 #[test]
 fn an_outline_has_the_token_trees_of_a_full_parse() {
     for (path, text) in corpus() {
         let path = path.display();
-        let full = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT).syntax_node();
-        let outline = ast::SourceFile::parse_outline(text, Edition::CURRENT).syntax_node();
+        let full_parse = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT);
+        let outline_parse = ast::SourceFile::parse_outline(text, Edition::CURRENT);
+        let (full, outline) = (full_parse.root(), outline_parse.root());
         let mut in_full = FxHashMap::default();
         for node in full.descendants() {
             in_full.entry((node.kind(), node.text_range())).or_insert(node);
         }
-        let in_full = |node: &SyntaxNode| {
-            in_full
+        let in_full = |node: view::Node<'_>| {
+            *in_full
                 .get(&(node.kind(), node.text_range()))
                 .unwrap_or_else(|| panic!("{path}: {node:?} is not in the full parse"))
         };
 
-        let (tree, _) = outline.flat().expect("an outline is a flat tree");
+        let tree = outline.file();
         let lazies: Vec<u32> = tree.lazies().collect();
         for &at in &lazies {
-            let body = outline.flat_element(at).into_node().expect("a lazy element is a node");
+            let body = view::Node::at(outline.shared_file(), view::NodeId { part: view::NodeId::FILE, at })
+                .into_node()
+                .expect("a lazy element is a node");
             assert!(body.is_lazy(), "{path}: {body:?} was parsed before it was asked about");
-            assert_eq!(token_tree(&body), token_tree(in_full(&body)), "{path}: {body:?}");
+            assert_eq!(token_tree(body), token_tree(in_full(body)), "{path}: {body:?}");
             assert!(tree.is_parsed(at), "{path}: {body:?}");
             let owner = body.parent().expect("a body has an owner");
-            assert_eq!(token_tree(&owner), token_tree(in_full(&owner)), "{path}: {owner:?}");
+            assert_eq!(token_tree(owner), token_tree(in_full(owner)), "{path}: {owner:?}");
         }
 
-        let expected = token_tree(&full);
-        assert_eq!(token_tree(&outline), expected, "{path}");
+        let expected = token_tree(full);
+        assert_eq!(token_tree(outline), expected, "{path}");
     }
 }
 
 #[test]
 fn a_lazy_body_in_a_node_is_parsed_for_its_token_tree() {
     let text: Arc<str> = Arc::from("struct S;\nfn f() { let x = 1 + 2; g(x) }\n");
-    let outline = ast::SourceFile::parse_outline(text.clone(), Edition::CURRENT).syntax_node();
-    let (tree, _) = outline.flat().expect("an outline is a flat tree");
+    let outline = ast::SourceFile::parse_outline(text.clone(), Edition::CURRENT);
+    let tree = outline.root().file();
     let lazies: Vec<u32> = tree.lazies().collect();
     assert_eq!(lazies.len(), 1);
     assert!(!tree.is_parsed(lazies[0]));
-    let full = ast::SourceFile::parse_shared(text, Edition::CURRENT).syntax_node();
-    assert_eq!(token_tree(&outline), token_tree(&full));
+    let full = ast::SourceFile::parse_shared(text, Edition::CURRENT);
+    assert_eq!(token_tree(outline.root()), token_tree(full.root()));
     assert!(tree.is_parsed(lazies[0]));
 }
 
@@ -265,11 +286,11 @@ fn a_flat_tree_converts_as_the_cursor_does() {
                 let cursor = syntax_node_to_token_tree_modified(
                     &node,
                     DummyTestSpanMap,
-                    FxHashMap::default(),
-                    FxHashSet::default(),
+                    Appended::<_, Global>::default(),
+                    Removed::<_, Global>::default(),
                     DUMMY,
                     mode,
-                    |_, _| (true, Vec::new()),
+                    |_, _| (true, Inserted::new()),
                 );
                 assert_eq!(flat, cursor, "{path}: {node:?}");
                 assert_eq!(flat.to_string(), cursor.to_string(), "{path}: {node:?}");
@@ -307,11 +328,11 @@ fn a_views_call_input_is_the_cursors_token_tree() {
                     let cursor = syntax_node_to_token_tree_modified(
                         &node,
                         DummyTestSpanMap,
-                        FxHashMap::default(),
-                        FxHashSet::default(),
+                        Appended::<_, Global>::default(),
+                        Removed::<_, Global>::default(),
                         DUMMY,
                         mode,
-                        |_, _| (true, Vec::new()),
+                        |_, _| (true, Inserted::new()),
                     );
                     assert_eq!(new, cursor, "{path}: {view:?}, outline {}", parse.is_outline());
                     assert_eq!(new.to_string(), cursor.to_string(), "{path}: {view:?}");
@@ -363,8 +384,10 @@ fn a_views_modified_input_is_the_cursors() {
                     other => panic!("{path}: no node of {range:?} in the full parse: {other:?}"),
                 };
                 let mut rng = SplitMix64::new(seed);
-                let (mut remove, mut view_remove) = (FxHashSet::default(), FxHashSet::default());
-                let (mut append, mut view_append) = (FxHashMap::default(), FxHashMap::default());
+                let (mut remove, mut view_remove) =
+                    (Removed::<_, Global>::default(), Removed::<_, Global>::default());
+                let (mut append, mut view_append) =
+                    (Appended::<_, Global>::default(), Appended::<_, Global>::default());
                 let mut views = view.preorder_with_tokens();
                 for event in node.preorder_with_tokens() {
                     match (event, views.next()) {
@@ -379,7 +402,7 @@ fn a_views_modified_input_is_the_cursors() {
                                 view_remove.insert(seen.id());
                             }
                             if rng.one_in(10) {
-                                let leaves = vec![punct('$'), punct(',')];
+                                let leaves = smallvec![punct('$'), punct(',')];
                                 view_append.insert(seen.id(), leaves.clone());
                                 append.insert(element, leaves);
                             }
@@ -406,11 +429,11 @@ fn a_views_modified_input_is_the_cursors() {
                             {
                                 0 if enter && matches!(element, Node(_)) => {
                                     preorder.skip_subtree();
-                                    (false, vec![punct('#')])
+                                    (false, smallvec![punct('#')])
                                 }
-                                1 => (true, vec![punct('@')]),
-                                2 => (false, Vec::new()),
-                                _ => (true, Vec::new()),
+                                1 => (true, smallvec![punct('@')]),
+                                2 => (false, Inserted::new()),
+                                _ => (true, Inserted::new()),
                             }
                         },
                     );
@@ -430,11 +453,11 @@ fn a_views_modified_input_is_the_cursors() {
                             {
                                 0 if enter && matches!(element, Node(_)) => {
                                     preorder.skip_subtree();
-                                    (false, vec![punct('#')])
+                                    (false, smallvec![punct('#')])
                                 }
-                                1 => (true, vec![punct('@')]),
-                                2 => (false, Vec::new()),
-                                _ => (true, Vec::new()),
+                                1 => (true, smallvec![punct('@')]),
+                                2 => (false, Inserted::new()),
+                                _ => (true, Inserted::new()),
                             }
                         },
                     );
@@ -443,6 +466,34 @@ fn a_views_modified_input_is_the_cursors() {
             }
         }
     }
+}
+
+/// A modified conversion whose callback inserts a leaf at every event allocates the same as one
+/// that inserts none: the inserted leaves are inline, and the maps are the caller's.
+#[test]
+fn inserted_leaves_allocate_nothing() {
+    let text = "fn f() { let a = 1; let b = 2; }";
+    let parse = ast::SourceFile::parse(text, Edition::CURRENT);
+    let leaf = Leaf::Punct(Punct { char: '#', spacing: Spacing::Alone, span: DUMMY });
+    let convert = |insert: bool| {
+        let leaf = &leaf;
+        crate::call_input_modified(
+            parse.root(),
+            DummyTestSpanMap,
+            Appended::<_, Global>::default(),
+            Removed::<_, Global>::default(),
+            DUMMY,
+            DocCommentDesugarMode::Mbe,
+            move |_, _| {
+                // clone: a test's leaf, inline in the `SmallVec`.
+                (true, if insert { smallvec![leaf.clone()] } else { Inserted::new() })
+            },
+        )
+    };
+    drop((convert(false), convert(true)));
+    let (_, none) = blaze_alloc_count::measure(|| convert(false));
+    let (_, some) = blaze_alloc_count::measure(|| convert(true));
+    assert_eq!(none.allocations, some.allocations);
 }
 
 /// What a closure gives, or that it panicked: the new and the old conversion must fail alike too.
@@ -455,8 +506,8 @@ fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
 /// expansion.
 fn assert_same_as_reference(
     tree: &tt::TopSubtree,
-    edition: &mut dyn FnMut(span::SyntaxContext) -> Edition,
-    what: &dyn Fn() -> String,
+    edition: &mut impl FnMut(span::SyntaxContext) -> Edition,
+    what: &impl Fn() -> String,
 ) {
     for view in [tree.view().strip_invisible(), tree.token_trees(), tree.as_token_trees()] {
         let new = caught(|| to_parser_input(view, &mut *edition));
@@ -472,11 +523,11 @@ fn assert_same_as_reference(
         let old = reference::to_matcher_input(view, &mut *edition);
         assert!(reference::same_input(&new, &old), "{}: the matcher's input", what());
     }
-    assert_words_same_as_reference(tree, edition, what);
+    assert_words_same_as_reference(tree, &mut *edition, what);
     use parser::TopEntryPoint::*;
     for entry in [MacroItems, MacroStmts, Expr, Pattern, Type, MetaItem] {
         let new = caught(|| {
-            let (parse, map) = token_tree_to_syntax_node(tree, entry, &mut *edition);
+            let (parse, map) = token_tree_to_syntax_node(tree.view(), entry, &mut *edition);
             (parse.debug_dump(), map)
         });
         let old = caught(|| {
@@ -532,8 +583,8 @@ fn every_view(tree: &tt::TopSubtree) -> Vec<tt::TokenTreesView<'_>> {
 /// a matcher's input of the whole tree panics on: a lone `'` or a punct that is no token's.
 fn assert_words_same_as_reference(
     tree: &tt::TopSubtree,
-    edition: &mut dyn FnMut(span::SyntaxContext) -> Edition,
-    what: &dyn Fn() -> String,
+    edition: &mut impl FnMut(span::SyntaxContext) -> Edition,
+    what: &impl Fn() -> String,
 ) {
     let whole_panics = caught(|| reference::to_matcher_input(tree.view(), &mut *edition)).is_none();
     let mut copy = parser::Input::with_capacity(0);
@@ -628,15 +679,16 @@ fn parser_input_is_the_old_conversions() {
     };
     for (file, (path, text)) in corpus().into_iter().enumerate() {
         let path = path.display();
-        let full = ast::SourceFile::parse_shared(text, Edition::CURRENT).syntax_node();
+        let full = ast::SourceFile::parse_shared(text, Edition::CURRENT);
+        let root = full.root();
         let nodes =
-            std::iter::once(full.clone()).chain(full.descendants().filter(|it| it.kind() == syntax::SyntaxKind::FN));
+            std::iter::once(root).chain(root.descendants().filter(|it| it.kind() == syntax::SyntaxKind::FN));
         for (idx, node) in nodes.enumerate() {
             for mode in [DocCommentDesugarMode::Mbe, DocCommentDesugarMode::ProcMacro] {
-                let tree = syntax_node_to_token_tree(&node, DummyTestSpanMap, DUMMY, mode);
+                let tree = call_input(node, DummyTestSpanMap, DUMMY, mode);
                 assert_same_as_reference(&tree, &mut current, &|| format!("{path}: {node:?}"));
             }
-            let tree = token_tree(&node);
+            let tree = token_tree(node);
             let seed = (file as u64) << 20 | idx as u64;
             let mut rng = SplitMix64::new(seed);
             let mut out = TopSubtreeBuilder::new(tree.top_subtree().delimiter);
@@ -667,7 +719,7 @@ impl crate::SpanMapper for StaticSpanMap {
 }
 
 /// The tokens and nodes of `node` but its trivia, in preorder, as kind and text.
-fn structure(node: &SyntaxNode) -> Vec<(syntax::SyntaxKind, String)> {
+fn structure(node: view::Node<'_>) -> Vec<(syntax::SyntaxKind, String)> {
     node.descendants_with_tokens()
         .filter_map(|it| match it {
             NodeOrToken::Node(it) => Some((it.kind(), String::new())),
@@ -690,15 +742,11 @@ fn lexing_then_parsing_gives_the_files_tree() {
         if text.starts_with("#!") || text.starts_with("---") {
             continue;
         }
-        let full = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT).syntax_node();
+        let full_parse = ast::SourceFile::parse_shared(text.clone(), Edition::CURRENT);
+        let full = full_parse.root();
         let lexed = parse_to_token_tree_static_span(Edition::CURRENT, DUMMY, &text)
             .unwrap_or_else(|| panic!("{path}: the corpus lexes"));
-        let converted = syntax_node_to_token_tree(
-            &full,
-            StaticSpanMap,
-            DUMMY,
-            DocCommentDesugarMode::ProcMacro,
-        );
+        let converted = call_input(full, StaticSpanMap, DUMMY, DocCommentDesugarMode::ProcMacro);
         assert_eq!(lexed, converted, "{path}");
         // A doc comment is trivia in the file and an attribute in its tokens.
         let has_docs = full.descendants_with_tokens().any(|it| {
@@ -711,11 +759,11 @@ fn lexing_then_parsing_gives_the_files_tree() {
             continue;
         }
         let (parse, _) = token_tree_to_syntax_node(
-            &lexed,
+            lexed.view(),
             parser::TopEntryPoint::SourceFile,
             &mut |_| Edition::CURRENT,
         );
-        assert_eq!(structure(&parse.syntax_node()), structure(&full), "{path}");
+        assert_eq!(structure(parse.root()), structure(full), "{path}");
         parsed += 1;
     }
     assert!(parsed > 200, "only {parsed} files parsed back");
@@ -733,8 +781,8 @@ fn a_reused_input_converts_without_allocating() {
             move || if let [a, ..] = r#fn { yield_(*a >> 1) } else { loop {} }
         }
     "#;
-    let node = ast::SourceFile::parse(text, Edition::CURRENT).syntax_node();
-    let tree = token_tree(&node);
+    let parse = ast::SourceFile::parse(text, Edition::CURRENT);
+    let tree = token_tree(parse.root());
     let mut edition = |_: span::SyntaxContext| Edition::CURRENT;
     let mut input = parser::Input::with_capacity(0);
     crate::to_parser_input_into(tree.token_trees(), &mut edition, &mut input);

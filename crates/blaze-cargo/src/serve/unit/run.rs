@@ -15,8 +15,8 @@ use blaze_lazy::{Purpose, Refused};
 use blaze_units::schema::Mode;
 use rustc_hash::FxHashMap;
 
-use super::{Job, codegen, package_of};
-use crate::serve::work::{Runs, Writer};
+use super::{Job, Real, UnitWriter, codegen, package_of};
+use crate::serve::work::Runs;
 
 #[cfg(test)]
 mod tests;
@@ -32,10 +32,9 @@ pub(crate) enum Launch {
 /// What a dev profile's process needs of blaze that it does not have yet.
 pub(crate) const NOT_IN_PROCESS: &str = "blaze runs a dev profile's process on its code memory, \
     compiled lazily and tiered (docs/v2/plan/lanes/fastcompile/inproc.md, lazy.md), and this \
-    blaze can't yet: its linker does not lay a dev executable out for the start hook's overlay \
-    or commit it into code memory (the reservations in `Output`, `Image::commit_into`) and has \
-    no lazy placement, and its code generator has no lazy build (`Build::run` with `later`, \
-    `Build::compile_one`) or tiered mode";
+    blaze can't yet: its code generator has no lazy build (`Build::run` with `later`, \
+    `Build::compile_one`) or tiered mode, its linker has no lazy placement, and its daemon does not yet link a dev executable \
+    for the overlay (`Output::dev_run`) and commit it into code memory (`Image::commit_into`)";
 
 /// How the process of unit `unit` starts; `runner` says it runs under a
 /// `target.<triple>.runner`. What a `run` and a test binary both start through.
@@ -139,7 +138,7 @@ pub(crate) fn choose<'a>(
 }
 
 /// The program `start` runs, on the loop.
-struct Program {
+pub(crate) struct Program {
     command: Option<Command>,
     tag: Tag,
     running: bool,
@@ -151,7 +150,7 @@ pub(crate) fn start(
     bin: Option<&str>,
     args: &[String],
     tags: u64,
-) -> Result<Box<dyn Runs>, ApiError> {
+) -> Result<Program, ApiError> {
     let units = job.units();
     let default_run = {
         let mut packages: Vec<&str> =
@@ -196,6 +195,7 @@ pub(crate) fn start(
             write: Vec::new(),
             network: false,
             trace: false,
+            services: Vec::new(),
         },
     };
     let command = Command {
@@ -207,14 +207,14 @@ pub(crate) fn start(
         sandbox,
         memory: None,
     };
-    Ok(Box::new(Program { command: Some(command), tag: Tag(tags), running: false }))
+    Ok(Program { command: Some(command), tag: Tag(tags), running: false })
 }
 
-impl Runs for Program {
+impl Runs<Real> for Program {
     fn start(
         &mut self,
         _store: &Store,
-        _writer: Option<&mut dyn Writer>,
+        _writer: Option<&mut UnitWriter>,
         effects: &mut Vec<Effect>,
         _out: &mut Vec<Response>,
     ) -> Option<bool> {
@@ -232,7 +232,7 @@ impl Runs for Program {
         &mut self,
         completion: Completion,
         _store: &mut Store,
-        _writer: Option<&mut dyn Writer>,
+        _writer: Option<&mut UnitWriter>,
         _effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {

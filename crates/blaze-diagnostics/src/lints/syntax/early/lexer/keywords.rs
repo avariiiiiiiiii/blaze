@@ -94,11 +94,11 @@ impl Keywords<'_, '_, '_> {
     /// What the visitor walks of an attribute: its path, and the expression of `path = expr`.
     fn meta(&mut self, meta: ast::Meta) {
         match meta {
-            ast::Meta::PathMeta(it) => self.walk_opt(it.path().map(|it| it.syntax().clone())),
-            ast::Meta::TokenTreeMeta(it) => self.walk_opt(it.path().map(|it| it.syntax().clone())),
+            ast::Meta::PathMeta(it) => self.walk_opt(it.path()),
+            ast::Meta::TokenTreeMeta(it) => self.walk_opt(it.path()),
             ast::Meta::KeyValueMeta(it) => {
-                self.walk_opt(it.path().map(|it| it.syntax().clone()));
-                self.walk_opt(it.expr().map(|it| it.syntax().clone()));
+                self.walk_opt(it.path());
+                self.walk_opt(it.expr());
             }
             ast::Meta::UnsafeMeta(it) => {
                 if let Some(inner) = it.meta() {
@@ -109,9 +109,9 @@ impl Keywords<'_, '_, '_> {
         }
     }
 
-    fn walk_opt(&mut self, node: Option<SyntaxNode>) {
+    fn walk_opt(&mut self, node: Option<impl AstNode>) {
         if let Some(node) = node {
-            self.walk(&node);
+            self.walk(node.syntax());
         }
     }
 
@@ -172,10 +172,12 @@ impl Keywords<'_, '_, '_> {
         let (_, lint, year) = keyword;
         let cx = self.cx;
         let span = cx.span(InFile::new(self.tree.file, range));
+        // alloc: the diagnostic's text and span, as is all of `check`
         let mut diag = Diag::lint(lint, format!("`{name}` is a keyword in the {year} edition"), span.clone());
         diag.suggestion(
             span,
             "you can use a raw identifier to stay compatible",
+            // alloc: as above
             format!("{prefix}r#{name}"),
             Applicability::MachineApplicable,
         );

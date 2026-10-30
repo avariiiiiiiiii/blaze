@@ -57,7 +57,17 @@ fn binary(name: &str, jobs: Vec<Job>) -> Binary {
         mode: Mode::Process,
         jobs,
         loaded: None,
+        sandboxed: true,
     }
+}
+
+/// `binary` outside the sandbox.
+fn outside(name: &str, jobs: Vec<Job>) -> Binary {
+    Binary { sandboxed: false, ..binary(name, jobs) }
+}
+
+fn not_known() -> Trace {
+    Trace::Unknown(OUTSIDE.to_owned())
 }
 
 fn exited(code: Option<i32>, signal: Option<i32>, traced: Option<Traced>) -> Done {
@@ -99,8 +109,12 @@ struct Fake {
     sent: Vec<(Conn, Frame)>,
     /// How many sends the queue asked for.
     sends: usize,
+    /// The connections a send to breaks (`Done::Broken`), as one whose peer is gone does.
+    breaks: Vec<Conn>,
     hangups: Vec<Conn>,
     records: BTreeMap<FileName, Vec<u8>>,
+    /// The record reads the queue asked for.
+    reads: Vec<FileName>,
     next_conn: u64,
     results: Vec<Finished>,
     /// What the queue allocated in its `complete` calls, and nothing of the fake's.
@@ -121,8 +135,10 @@ impl Fake {
             recvs: Vec::new(),
             sent: Vec::new(),
             sends: 0,
+            breaks: Vec::new(),
             hangups: Vec::new(),
             records: BTreeMap::new(),
+            reads: Vec::new(),
             next_conn: 0,
             results: Vec::new(),
             allocations: 0,
@@ -160,19 +176,27 @@ impl Fake {
                         answers.push(Completion { tag, done: Done::Written });
                     }
                     Effect::Read { file, at, len, tag } => {
+                        self.reads.push(file.clone());
                         let all = self.records.get(&file).cloned().unwrap_or_default();
                         let at = (at as usize).min(all.len());
                         let bytes = all[at..(at + len).min(all.len())].to_vec();
                         answers.push(Completion { tag, done: Done::Read(bytes) });
                     }
-                    Effect::Send { conn, bytes, tag } => {
+                    Effect::Send { conn, mut bytes, tag } if self.breaks.contains(&conn) => {
+                        self.sends += 1;
+                        bytes.clear();
+                        let error = IoError("Broken pipe (os error 32)".into());
+                        answers.push(Completion { tag, done: Done::Broken { buffer: bytes, error } });
+                    }
+                    Effect::Send { conn, mut bytes, tag } => {
                         let mut frames = Frames::new();
                         frames.push(&bytes);
                         while let Some(frame) = frames.pop().unwrap() {
                             self.sent.push((conn, frame));
                         }
                         self.sends += 1;
-                        answers.push(Completion { tag, done: Done::Sent });
+                        bytes.clear();
+                        answers.push(Completion { tag, done: Done::Sent(bytes) });
                     }
                     Effect::Unlisten { tag } => {
                         self.listens.retain(|it| it.0 != tag);
@@ -320,7 +344,7 @@ fn tests_run_from_the_fork_server_longest_first_with_their_own_reads() {
     assert!(command.env.contains(&(confine::LIVE.into(), "/root/req/1/r0".into())));
     assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
     assert!(command.args.is_empty());
-    let Sandbox::On { read, write, network, trace } = &command.sandbox else { panic!("{command:?}") };
+    let Sandbox::On { read, write, network, trace, .. } = &command.sandbox else { panic!("{command:?}") };
     assert!(*trace && !*network);
     assert!(read.contains(&PathBuf::from("/root/req/1/t0")) && read.contains(&PathBuf::from("/ws")));
     assert_eq!(write, &vec![PathBuf::from("/tmp/t")]);
@@ -543,6 +567,146 @@ fn a_binary_that_cannot_start_loses_its_tests_with_why() {
         assert_eq!(fake.result(test).executed, Executed::Not(why.clone()));
     }
     assert!(fake.listens.is_empty());
+    assert!(fake.spawns.is_empty(), "nothing is started outside in its place: {:?}", fake.spawns);
+    assert!(fake.queue.finished());
+}
+
+/// Outside the sandbox the server is spawned at once, with no sandbox, no record and no
+/// `LIVE`; its tests run from it as inside, pass and fail as inside, and what each read is
+/// not known, so selection keeps nothing of it.
+#[test]
+fn a_binary_outside_the_sandbox_runs_its_tests_with_no_record() {
+    let mut fake = Fake::new(config(3), vec![outside("lib", vec![job("a", 30), job("b", 20), job("c", 10)])]);
+    assert!(fake.records.is_empty(), "no record is made: {:?}", fake.records);
+    let command = &fake.spawns[0].1;
+    assert_eq!(command.sandbox, Sandbox::Off);
+    assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t0".into())));
+    assert!(!command.env.iter().any(|it| it.0 == confine::LIVE), "{:?}", command.env);
+    assert!(command.env.contains(&("PATH".into(), "/usr/bin".into())));
+    let conn = fake.hello(0, &["a", "b", "c"]);
+    let runs = fake.runs(conn);
+    assert_eq!(indices(&runs), [0, 1, 2]);
+    let hits = Executed::Hits { slots: 8, hits: vec![1] };
+    fake.end_with(conn, runs[0].0, End::Exited(0), b"a ok", hits.clone());
+    fake.end(conn, runs[1].0, End::Exited(101), b"b failed");
+    fake.end(conn, runs[2].0, End::Signaled(6), b"");
+    assert_eq!((&fake.result("a").outcome, fake.result("a").output.as_slice()), (&Outcome::Passed, &b"a ok"[..]));
+    assert_eq!(fake.result("a").executed, hits);
+    assert_eq!(fake.result("b").outcome, Outcome::Failed(Failure::Code(101)));
+    assert_eq!(fake.result("c").outcome, Outcome::Failed(Failure::Signal(6)));
+    for test in ["a", "b", "c"] {
+        assert_eq!(fake.result(test).trace, not_known(), "{test}");
+    }
+    let mut inputs = crate::inputs::Disk::new(Vec::new());
+    assert!(fake.result("a").trace.traced(&mut inputs).unwrap().is_none());
+    assert!(fake.reads.is_empty() && fake.records.is_empty());
+    assert_eq!(fake.frames(conn), vec![Frame::Quit]);
+    fake.exit("/bin/lib", exited(Some(0), None, None));
+    assert!(fake.queue.finished());
+}
+
+/// A failed or retried test outside is judged as inside; one that can't be started says so
+/// without naming a sandbox.
+#[test]
+fn a_test_outside_is_retried_and_lost_as_inside() {
+    let mut flaky = job("flaky", 0);
+    flaky.retries = 1;
+    let mut fake = Fake::new(config(1), vec![outside("lib", vec![flaky])]);
+    let conn = fake.hello(0, &["flaky"]);
+    let first = fake.run(conn, 0);
+    fake.end(conn, first, End::Exited(1), b"first\n");
+    let second = fake.run(conn, 0);
+    fake.end(conn, second, End::Exited(0), b"second\n");
+    let flaky = fake.result("flaky");
+    assert_eq!((&flaky.outcome, flaky.attempts, &flaky.trace), (&Outcome::Passed, 2, &not_known()));
+
+    let mut fake = Fake::new(config(1), vec![outside("lib", vec![job("a", 0)])]);
+    let spawn = fake.spawn_of("/bin/lib");
+    fake.spawns.clear();
+    fake.complete(spawn, Done::Failed(IoError("no such file".into())));
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("a").outcome else { panic!("{:?}", fake.results) };
+    assert!(why.contains("/bin/lib could not be started: no such file"), "{why}");
+    assert!(fake.queue.finished());
+}
+
+/// A package's `unsandboxed-tests`: two binaries of one program, the sandboxed run with the
+/// rest of its tests and the outside run with those named. Each has its own socket and runs
+/// only its own tests; the outside one starts once the sandboxed tests have their results.
+#[test]
+fn an_outside_and_a_sandboxed_run_of_one_program_each_run_their_own_tests() {
+    let inside = binary("lib", vec![job("a", 30), job("b", 20)]);
+    let out = Binary { jobs: vec![job("writes_home", 50)], ..outside("lib", Vec::new()) };
+    assert_eq!((&inside.id, &inside.program), (&out.id, &out.program));
+    let mut fake = Fake::new(config(4), vec![inside, out]);
+    assert_eq!(fake.spawns.len(), 1, "the outside run waits: {:?}", fake.spawns);
+    assert!(matches!(fake.spawns[0].1.sandbox, Sandbox::On { trace: true, .. }));
+    assert_eq!(fake.records.keys().collect::<Vec<_>>(), [&name("req/1/r0")]);
+    let all = ["a", "b", "writes_home"];
+    let inside = fake.hello(0, &all);
+    let runs = fake.runs(inside);
+    assert_eq!(indices(&runs), [0, 1], "the outside test is not the sandboxed run's");
+    fake.append(0, &[Line::new(Seen::Read, "a", "/ws/a")]);
+    fake.end(inside, runs[0].0, End::Exited(0), b"");
+    assert_eq!(fake.spawns.len(), 1, "a sandboxed test has no result yet");
+    fake.end(inside, runs[1].0, End::Exited(0), b"");
+    assert_eq!(fake.result("a").trace, lines(&[(Seen::Read, "/ws/a")]));
+    assert_eq!((fake.result("a").binary, fake.result("b").binary), (0, 0));
+    assert_eq!(fake.frames(inside), vec![Frame::Quit]);
+    // Every sandboxed test has its result: the outside run starts, on its own socket.
+    assert_eq!(fake.spawns.len(), 2);
+    let command = &fake.spawns[1].1;
+    assert_eq!((command.sandbox.clone(), command.program.clone()), (Sandbox::Off, PathBuf::from("/bin/lib")));
+    assert!(command.env.contains(&(SOCKET.into(), "/root/req/1/t1".into())));
+    assert!(!command.env.iter().any(|it| it.0 == confine::LIVE));
+    assert!(!fake.records.contains_key(&name("req/1/r1")));
+    let out = fake.hello(1, &all);
+    let home = fake.run(out, 2);
+    fake.end(out, home, End::Exited(0), b"");
+    let result = fake.result("writes_home");
+    assert_eq!((result.binary, &result.outcome, &result.trace), (1, &Outcome::Passed, &not_known()));
+    assert!(fake.reads.iter().all(|it| *it == name("req/1/r0")), "{:?}", fake.reads);
+    assert_eq!(fake.frames(out), vec![Frame::Quit]);
+    let (first, second) = (fake.spawns[0].0, fake.spawns[1].0);
+    fake.complete(first, exited(Some(0), None, Some(Traced::default())));
+    assert!(!fake.queue.finished());
+    fake.complete(second, exited(Some(0), None, None));
+    assert!(fake.queue.finished());
+    assert_eq!(fake.results.len(), 3);
+}
+
+/// A stop before the sandboxed tests are done leaves the outside run unstarted, its tests
+/// not run.
+#[test]
+fn fail_fast_inside_leaves_the_outside_run_unstarted() {
+    let config = Config { fail_fast: true, ..config(1) };
+    let out = Binary { jobs: vec![job("x", 0)], ..outside("lib", Vec::new()) };
+    let mut fake = Fake::new(config, vec![binary("lib", vec![job("a", 0)]), out]);
+    let inside = fake.hello(0, &["a", "x"]);
+    let a = fake.run(inside, 0);
+    fake.end(inside, a, End::Exited(1), b"");
+    assert_eq!(fake.result("a").outcome, Outcome::Failed(Failure::Code(1)));
+    assert_eq!(fake.result("x").outcome, Outcome::NotRun);
+    assert_eq!(fake.spawns.len(), 1, "{:?}", fake.spawns);
+    assert!(fake.listens.iter().all(|it| it.1 != Address::Unix(name("req/1/t1"))));
+    let first = fake.spawns[0].0;
+    fake.complete(first, exited(Some(0), None, None));
+    assert!(fake.queue.finished());
+}
+
+/// A package that runs whole as libtest's threads, outside: no sandbox, and its trace is not
+/// known whatever its exit says.
+#[test]
+fn a_binary_run_whole_outside_has_no_sandbox() {
+    let mut old = outside("old", vec![job("x", 5)]);
+    old.mode = Mode::Threads { args: Vec::new(), timeout: Duration::from_secs(10) };
+    let mut fake = Fake::new(config(4), vec![old]);
+    assert!(fake.records.is_empty() && fake.listens.is_empty());
+    let command = &fake.spawns[0].1;
+    assert_eq!(command.sandbox, Sandbox::Off);
+    assert!(!command.env.iter().any(|it| it.0 == confine::LIVE || it.0 == SOCKET));
+    fake.exit("/bin/old", exited(Some(0), None, Some(Traced::default())));
+    let whole = &fake.results[0];
+    assert_eq!((&whole.outcome, &whole.trace), (&Outcome::Passed, &not_known()));
     assert!(fake.queue.finished());
 }
 
@@ -712,9 +876,16 @@ struct Played {
 
 /// Two binaries on two cores under the simulation's reordering and latency, on many seeds:
 /// every test ends once, with what it read and executed, and the queue ends with every
-/// process.
+/// process. With the second outside the sandbox, its tests' reads are not known and it
+/// starts after the first's tests have their results.
 #[test]
 fn the_queue_under_a_simulated_driver() {
+    for two_outside in [false, true] {
+        simulated(two_outside);
+    }
+}
+
+fn simulated(two_outside: bool) {
     for seed in 0..64 {
         let mut sim = Sim::new(seed, Faults::default());
         for program in ["/bin/one", "/bin/two"] {
@@ -725,7 +896,7 @@ fn the_queue_under_a_simulated_driver() {
         }
         let mut one = binary("one", vec![job("a", 30), job("fails", 20), job("c", 10)]);
         one.jobs[1].retries = 0;
-        let two = binary("two", vec![job("d", 50), job("e", 5)]);
+        let two = Binary { sandboxed: !two_outside, ..binary("two", vec![job("d", 50), job("e", 5)]) };
         let mut effects = Vec::new();
         let mut queue = Queue::new(config(2), vec![one, two], sim.now(), &mut effects);
         let mut played: Vec<Played> = [vec!["a", "fails", "c"], vec!["d", "e"]]
@@ -758,10 +929,14 @@ fn the_queue_under_a_simulated_driver() {
                     match frame {
                         Frame::Run { id, index } => {
                             let test = &server.tests[index as usize];
-                            let record = name(&format!("req/1/r{b}"));
-                            let mut bytes = sim.contents(&record);
-                            bytes.extend_from_slice(Line::new(Seen::Read, test, &format!("/ws/{test}")).text().as_bytes());
-                            sim.change(&record, &bytes);
+                            if two_outside && b == 1 {
+                                assert!(results.len() >= 3, "seed {seed}: two ran before one's tests had results");
+                            } else {
+                                let record = name(&format!("req/1/r{b}"));
+                                let mut bytes = sim.contents(&record);
+                                bytes.extend_from_slice(Line::new(Seen::Read, test, &format!("/ws/{test}")).text().as_bytes());
+                                sim.change(&record, &bytes);
+                            }
                             let end = match test.as_str() {
                                 "fails" => End::Exited(101),
                                 _ => End::Exited(0),
@@ -791,7 +966,11 @@ fn the_queue_under_a_simulated_driver() {
             };
             assert_eq!(result.outcome, expected, "seed {seed}");
             assert_eq!(result.output, test.as_bytes(), "seed {seed}");
-            assert_eq!(result.trace, lines(&[(Seen::Read, &format!("/ws/{test}"))]), "seed {seed}");
+            let trace = match two_outside && result.binary == 1 {
+                true => not_known(),
+                false => lines(&[(Seen::Read, &format!("/ws/{test}"))]),
+            };
+            assert_eq!(result.trace, trace, "seed {seed}");
             let index = played[result.binary].tests.iter().position(|it| it == test).unwrap() as u32;
             assert_eq!(result.executed, Executed::Hits { slots: 16, hits: vec![index] }, "seed {seed}");
         }
@@ -940,16 +1119,23 @@ fn ranks_are_a_set_with_a_cursor() {
 /// lists stay at what the cores need, however many tests run.
 #[test]
 fn the_steady_state_reuses_its_slabs() {
-    // One server, and four replicas (a fork of 10 s against a median test of 300 ms).
-    for fork in [0, 10_000_000_000] {
-        steady_state(fork);
+    // One server, and four replicas (a fork of 10 s against a median test of 300 ms); in the
+    // sandbox and outside it.
+    for sandboxed in [true, false] {
+        for fork in [0, 10_000_000_000] {
+            steady_state(fork, sandboxed);
+        }
     }
 }
 
-fn steady_state(fork: u64) {
+fn steady_state(fork: u64, sandboxed: bool) {
     let jobs: Vec<Job> = (0..600).map(|n| job(&format!("t{n}"), 600 - n)).collect();
     let names: Vec<String> = jobs.iter().map(|it| it.name.clone()).collect();
-    let mut fake = Fake::new(config(4), vec![binary("lib", jobs)]);
+    let plan = match sandboxed {
+        true => binary("lib", jobs),
+        false => outside("lib", jobs),
+    };
+    let mut fake = Fake::new(config(4), vec![plan]);
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let first = fake.hello_with(0, &names, fork, 1);
     let mut conns = vec![first];
@@ -964,7 +1150,9 @@ fn steady_state(fork: u64) {
             conns.clone().into_iter().flat_map(|conn| fake.runs(conn).into_iter().map(move |(id, index)| (conn, id, index))).collect();
         assert!(!runs.is_empty(), "nothing runs after {ended}");
         for (conn, id, index) in runs {
-            fake.append(0, &[Line::new(Seen::Read, "", "/lib/libc.so"), Line::new(Seen::Read, names[index as usize], "/ws/x")]);
+            if sandboxed {
+                fake.append(0, &[Line::new(Seen::Read, "", "/lib/libc.so"), Line::new(Seen::Read, names[index as usize], "/ws/x")]);
+            }
             let before = fake.allocations;
             fake.advance(Duration::from_millis(3));
             fake.end(conn, id, End::Exited(0), b"ok");
@@ -973,6 +1161,7 @@ fn steady_state(fork: u64) {
             // execution record and name, its own line (kept, then its result's two buffers),
             // the driver's record read (it owns the file name) and the send of the next run
             // (it owns the bytes). Nothing of the lines every test read, nothing per timer.
+            // Outside, no line and no read, and the reason its trace is not known.
             const PER_TEST: u64 = 8;
             let used = fake.allocations - before;
             assert!(ended < 100 || used <= PER_TEST, "test {ended}: {used} allocations, budget {PER_TEST}");
@@ -991,6 +1180,12 @@ fn steady_state(fork: u64) {
     assert_eq!(fake.results.len(), 600);
     assert!(fake.results.iter().all(|it| it.outcome == Outcome::Passed));
     let server = fake.queue.bins[0].server.as_ref().unwrap();
+    if !sandboxed {
+        assert!(fake.reads.is_empty() && fake.records.is_empty());
+        assert!(fake.results.iter().all(|it| it.trace == not_known()));
+        assert_eq!((server.common.len(), server.names.len()), (0, 4));
+        return;
+    }
     // The line of every scope is kept once; every name once (blaze's four, then two).
     assert_eq!(server.common.len(), 1);
     assert_eq!(server.names.len(), 6);
@@ -1117,6 +1312,30 @@ fn a_replica_that_dies_mid_test_fails_only_its_own_test() {
     assert_eq!(fake.frames(third), vec![Frame::Quit]);
     fake.exit("/bin/lib", exited(Some(0), None, None));
     assert!(fake.queue.finished());
+}
+
+/// A send that breaks loses the replica it was for, as a hangup does: its test is lost with why,
+/// nothing more goes to it, and the server's other replicas carry on.
+#[test]
+fn a_replica_a_send_to_breaks_is_lost() {
+    let names = names_of(4);
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut fake = Fake::new(config(2), vec![binary("lib", names.iter().map(|it| job(it, 0)).collect())]);
+    let first = fake.hello_with(0, &names, 1_000_000, 1);
+    assert_eq!(fake.replicate(first), Some(1));
+    let runs = fake.runs(first);
+    let second = fake.hello_with(0, &names, 1_000_000, 2);
+    fake.breaks.push(second);
+    fake.end(first, runs[0].0, End::Exited(0), b"");
+    let Outcome::Failed(Failure::Lost(why)) = &fake.result("t2").outcome else { panic!("{:?}", fake.results) };
+    assert!(why.contains("replica 1") && why.contains("could not be sent to"), "{why}");
+    assert!(fake.kills.is_empty(), "the server carries on");
+    assert!(fake.frames(second).is_empty(), "nothing reached it");
+    fake.end(first, runs[1].0, End::Exited(0), b"");
+    let t3 = fake.run(first, 3);
+    fake.end(first, t3, End::Exited(0), b"");
+    assert_eq!(fake.results.len(), 4);
+    assert_eq!(fake.frames(first), vec![Frame::Quit]);
 }
 
 /// A replica's ends are its own: one sent on another replica's connection breaks the protocol

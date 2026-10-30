@@ -11,13 +11,15 @@ mod features;
 pub(crate) mod impls;
 mod krate;
 mod macros;
-mod names;
+pub(crate) mod names;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use defs::head_range_view;
+
 use std::ops::ControlFlow;
 
-use syntax::ast::{self, HasAttrs};
+use syntax::view::{self, HasAttrs as _};
 
 use crate::{
     cx::Cx,
@@ -67,7 +69,9 @@ pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
 pub(crate) fn modules(cx: &Cx<'_, '_>) -> Vec<hir::Module> {
     let db = cx.db;
     let def_map = hir_def::nameres::crate_def_map(db, cx.krate.base());
+    // alloc: setup, once per check pass (a `Cx::modules()` cache is request 4)
     let mut order = Vec::new();
+    // alloc: setup, as above
     let mut stack = vec![def_map.root_module_id()];
     while let Some(id) = stack.pop() {
         order.push(hir::Module::from(id));
@@ -80,23 +84,33 @@ pub(crate) fn modules(cx: &Cx<'_, '_>) -> Vec<hir::Module> {
 
 /// The crate's attributes as rustc reads them: the crate root's `#![..]`, then those of
 /// `-Z crate-attr`, with `cfg_attr` expanded as the crate's cfg says.
-pub(crate) fn crate_attrs(cx: &Cx<'_, '_>) -> Vec<ast::Meta> {
-    let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
-    let tree = root.parse(cx.db).tree();
-    let extra = hir_def::attrs::parse_extra_crate_attrs(cx.db, cx.krate.into());
-    let attrs = tree.attrs().chain(extra.iter().flat_map(|it| it.attrs()));
+pub(crate) fn crate_attrs<'db>(cx: &Cx<'_, 'db>) -> Vec<view::Meta<'db>> {
+    // alloc: setup, the crate root's attributes, once per caller per check
     let mut metas = Vec::new();
-    hir_expand::attrs::expand_cfg_attr::<()>(attrs, || cx.krate.cfg(cx.db), |meta, _| {
+    each_crate_attr::<()>(cx, |meta| {
         metas.push(meta);
         ControlFlow::Continue(())
     });
     metas
 }
 
+/// Each of [`crate_attrs`] in order, until `each` breaks; nothing gathered.
+fn each_crate_attr<'db, B>(cx: &Cx<'_, 'db>, mut each: impl FnMut(view::Meta<'db>) -> ControlFlow<B>) -> Option<B> {
+    let root = cx.krate.root_module(cx.db).as_source_file_id(cx.db)?;
+    let tree = cx.vsema.parse(root);
+    let attrs = tree.attrs().chain(hir_def::attrs::cli_crate_attrs(cx.db, cx.krate.into()).map(|it| it.value));
+    hir_expand::attrs::expand_cfg_attr_view(attrs, || cx.krate.cfg(cx.db), |meta, _| each(meta))
+}
+
 /// Whether the crate has the attribute `#![name]` (or `#![name(..)]`, `#![name = ..]`).
 pub(crate) fn has_crate_attr(cx: &Cx<'_, '_>, name: &str) -> bool {
-    crate_attrs(cx).iter().any(|meta| {
-        meta.path().and_then(|path| path.as_single_name_ref()).is_some_and(|it| it.text() == name)
-            && !matches!(meta, ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_))
+    each_crate_attr(cx, |meta| {
+        let named = meta.path().and_then(|path| path.as_single_name_ref()).is_some_and(|it| it.text() == name)
+            && !matches!(meta, view::Meta::CfgMeta(_) | view::Meta::CfgAttrMeta(_));
+        match named {
+            true => ControlFlow::Break(()),
+            false => ControlFlow::Continue(()),
+        }
     })
+    .is_some()
 }

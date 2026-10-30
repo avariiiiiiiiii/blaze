@@ -201,10 +201,10 @@ impl Sim {
 
     /// Runs the GC with `held` as every pointer the program still holds.
     pub(crate) fn gc(&mut self, held: &[Ptr]) {
-        self.b.gc(|visit| {
+        self.b.gc(|live| {
             for p in held {
-                if let Prov::Concrete { alloc, tag } = p.prov {
-                    visit(alloc, tag);
+                if let Prov::Concrete { tag, .. } = p.prov {
+                    live.mark(tag);
                 }
             }
         });

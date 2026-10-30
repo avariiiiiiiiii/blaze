@@ -81,7 +81,8 @@ const fn slot(h: u64, pilot: u16, slots: usize) -> usize {
     fold(h ^ pilot as u64, K2) as usize & (slots - 1)
 }
 
-const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+/// `a == b`, callable in a `const`, where slices' `==` is not.
+pub const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -359,5 +360,15 @@ mod tests {
         assert_ne!(hash(b"a", 0), hash(b"a\0", 0));
         assert_ne!(hash(b"", 0), hash(b"\0", 0));
         assert_ne!(hash(b"abc", 0), hash(b"abc", 1));
+    }
+
+    const _: () = assert!(bytes_eq(b"lint", b"lint") && !bytes_eq(b"lint", b"lints") && bytes_eq(b"", b""));
+
+    proptest::proptest! {
+        #[test]
+        fn bytes_eq_is_slice_eq(a in proptest::collection::vec(0u8..4, 0..8), b in proptest::collection::vec(0u8..4, 0..8)) {
+            proptest::prop_assert_eq!(bytes_eq(&a, &b), a == b);
+            proptest::prop_assert!(bytes_eq(&a, &a));
+        }
     }
 }

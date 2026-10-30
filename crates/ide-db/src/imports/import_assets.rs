@@ -640,8 +640,7 @@ fn filter_candidates_by_after_path(
                 ItemInNs::Types(ModuleDef::TypeAlias(it)) => has_last_method(it.ty(db)),
                 // A trait? Might have an associated item.
                 ItemInNs::Types(ModuleDef::Trait(it)) => it
-                    .items(db)
-                    .into_iter()
+                    .items_iter(db)
                     .any(|assoc_item| assoc_item.name(db) == Some(last_after.clone())),
                 // Other items? can't resolve one more segment.
                 _ => false,

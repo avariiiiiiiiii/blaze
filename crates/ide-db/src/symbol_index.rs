@@ -374,17 +374,19 @@ impl<'db> SymbolIndex<'db> {
 
             // We call this without attaching because this runs in parallel, so we need to attach here.
             hir::attach_db(db, || {
-                let mut symbol_collector = SymbolCollector::new(db, true);
+                blaze_mem::frame::current(|frame| {
+                    let mut symbol_collector = SymbolCollector::new(db, frame, true);
 
-                source_root_crates(db, source_root_id.id(db))
-                    .iter()
-                    .flat_map(|&krate| Crate::from(krate).modules(db))
-                    // we specifically avoid calling other SymbolsDatabase queries here, even though they do the same thing,
-                    // as the index for a library is not going to really ever change, and we do not want to store
-                    // the module or crate indices for those in salsa unless we need to.
-                    .for_each(|module| symbol_collector.collect(module));
+                    source_root_crates(db, source_root_id.id(db))
+                        .iter()
+                        .flat_map(|&krate| Crate::from(krate).modules_iter(db))
+                        // we specifically avoid calling other SymbolsDatabase queries here, even though they do the same thing,
+                        // as the index for a library is not going to really ever change, and we do not want to store
+                        // the module or crate indices for those in salsa unless we need to.
+                        .for_each(|module| symbol_collector.collect(module));
 
-                SymbolIndex::new(symbol_collector.finish())
+                    SymbolIndex::new(symbol_collector.finish())
+                })
             })
         }
         library_symbols(db, InternedSourceRootId::new(db, source_root_id))
@@ -403,11 +405,14 @@ impl<'db> SymbolIndex<'db> {
             // We call this without attaching because this runs in parallel, so we need to attach here.
             hir::attach_db(db, || {
                 let module: Module = module.into();
-                SymbolIndex::new(SymbolCollector::new_module(
-                    db,
-                    module,
-                    !module.krate(db).origin(db).is_local(),
-                ))
+                blaze_mem::frame::current(|frame| {
+                    SymbolIndex::new(SymbolCollector::new_module(
+                        db,
+                        frame,
+                        module,
+                        !module.krate(db).origin(db).is_local(),
+                    ))
+                })
             })
         }
 
@@ -422,25 +427,27 @@ impl<'db> SymbolIndex<'db> {
 
             // We call this without attaching because this runs in parallel, so we need to attach here.
             hir::attach_db(db, || {
-                let mut collector = SymbolCollector::new(db, false);
+                blaze_mem::frame::current(|frame| {
+                    let mut collector = SymbolCollector::new(db, frame, false);
 
-                for krate in Crate::all(db) {
-                    if krate
-                        .display_name(db)
-                        .is_none_or(|name| name.canonical_name().as_str() == "build-script-build")
-                    {
-                        continue;
+                    for krate in Crate::all(db) {
+                        if krate.display_name(db).is_none_or(|name| {
+                            name.canonical_name().as_str() == "build-script-build"
+                        }) {
+                            continue;
+                        }
+                        if let CrateOrigin::Lang(
+                            LangCrateOrigin::Dependency | LangCrateOrigin::Other,
+                        ) = krate.origin(db)
+                        {
+                            // don't show dependencies of the sysroot
+                            continue;
+                        }
+                        collector.push_crate_root(krate);
                     }
-                    if let CrateOrigin::Lang(LangCrateOrigin::Dependency | LangCrateOrigin::Other) =
-                        krate.origin(db)
-                    {
-                        // don't show dependencies of the sysroot
-                        continue;
-                    }
-                    collector.push_crate_root(krate);
-                }
 
-                SymbolIndex::new(collector.finish())
+                    SymbolIndex::new(collector.finish())
+                })
             })
         }
 
@@ -716,10 +723,11 @@ pub(self) use crate::Trait as IsThisJustATrait;
         );
 
         let symbols: Vec<_> = Crate::from(db.test_crate())
-            .modules(&db)
-            .into_iter()
+            .modules_iter(&db)
             .map(|module_id| {
-                let mut symbols = SymbolCollector::new_module(&db, module_id, false);
+                let mut symbols = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+                    SymbolCollector::new_module(&db, frame, module_id, false)
+                });
                 symbols.sort_by(|a, b| a.name.cmp_order(&b.name));
                 (module_id, symbols)
             })
@@ -743,10 +751,11 @@ struct Duplicate;
         );
 
         let symbols: Vec<_> = Crate::from(db.test_crate())
-            .modules(&db)
-            .into_iter()
+            .modules_iter(&db)
             .map(|module_id| {
-                let mut symbols = SymbolCollector::new_module(&db, module_id, false);
+                let mut symbols = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+                    SymbolCollector::new_module(&db, frame, module_id, false)
+                });
                 symbols.sort_by(|a, b| a.name.cmp_order(&b.name));
                 (module_id, symbols)
             })

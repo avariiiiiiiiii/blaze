@@ -9,22 +9,24 @@
 //! builds the def map from the final round's `fact_handle`s: no scope is copied.
 
 use base_db::{Crate, Db};
+use blaze_mem::Frame;
 use hir_expand::{
     MacroCallId, MacroDefId,
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 use stdx::always;
+use syntax::ast;
 use triomphe::Arc;
 
 use crate::{
-    ExternCrateId, Lookup, ModuleDefId, ModuleId,
+    AstId, ExternCrateId, Lookup, ModuleDefId, ModuleId,
     item_scope::{GlobId, ImportId, ImportOrExternCrate},
     item_tree::{ImportKind, TreeId},
     nameres::{
-        BuiltinShadowMode, DefMap, DefMapCrateData, DiagnosticsByModule, LocalDefMap,
-        MacroSubNs, ModuleData, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot,
+        BuiltinShadowMode, DefMap, DefMapCrateData, DeriveHelpers, DiagnosticsByModule,
+        LocalDefMap, MacroSubNs, ModuleData, ModulesMap, ModulesSlot, ResolveMode, ScopeSlot,
         diagnostics::{DefDiagnostic, DefDiagnosticKind},
         uses::{DeriveHelperUse, MacroCallRecord, MacroVia, NameRecords, Use},
     },
@@ -33,11 +35,12 @@ use crate::{
 };
 
 use super::{
-    collect,
-    env::{ChildMode, ChildRequest, CrateEnv, SideTables, Sink},
+    FrameMap, FrameSet, FrameVec, collect,
+    env::{ChildMode, ChildRequest, CrateEnv, SideTables, SideTablesIn, Sink},
     graph::{ImportShape, ShapeImport, ShapeModule},
-    macros,
-    ops::{DeclOp, ImportOp, ImportSource, MacroOp, OpLog},
+    macros, map_in,
+    ops::{DeclOp, DeriveHelper, ImportOp, ImportSource, MacroOp, OpLog},
+    set_in,
     queries::{
         self, CrateEnvKey, FactKey, ModuleRound, ModuleRow, NO_ROUND, RoundKey, RoundKind,
         RoundModules, RoundOutcome, SccKey, SccState, Scope,
@@ -55,19 +58,19 @@ const FIXED_POINT_LIMIT: u32 = 8192;
 /// modules in the order their steps declared them, steps in module order. With them, the
 /// round's active set (`nameres-core.md` §9): read off the steps of the round before that ran,
 /// so a module no step touched costs a copy of its columns and no query.
-pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
+pub(crate) fn round_modules(db: &Db, frame: &Frame, round: RoundKey) -> RoundModules {
     let krate = round.krate(db);
     let r = round.round(db);
     if r == 0 {
-        let mut order = Vec::new(); // alloc: the round's value, once per crate.
-        let mut rows = Vec::new(); // alloc: as `order`.
-        let mut flags = Vec::new(); // alloc: as `order`.
-        let mut index = FxHashMap::default();
-        let mut stack = vec![queries::root_decl(db, krate)]; // alloc: the walk's stack, once per crate.
+        let mut order = Vec::new_in(frame);
+        let mut rows = Vec::new_in(frame);
+        let mut flags = Vec::new_in(frame);
+        let mut declared = set_in(frame);
+        let mut stack = Vec::new_in(frame);
+        stack.push(queries::root_decl(db, krate));
         while let Some(key) = stack.pop() {
             let decl = key.decl(db);
-            let fresh = index.insert(decl.module, order.len() as u32).is_none();
-            assert!(fresh, "nameres facts: {:?} is declared twice at round 0", decl.module);
+            assert!(declared.insert(decl.module), "nameres facts: {:?} is declared twice at round 0", decl.module);
             order.push(decl.module);
             rows.push(ModuleRow {
                 origin: decl.origin,
@@ -86,11 +89,14 @@ pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
         }
         let n = order.len();
         return RoundModules {
-            order: order.into_boxed_slice(),
-            rows: rows.into_boxed_slice(),
-            index,
-            flags: flags.into_boxed_slice(),
-            // alloc: the round's columns, once per crate.
+            // alloc: the round's columns, at exact size, once per crate.
+            order: Box::from(&order[..]),
+            // alloc: as `order`.
+            rows: rows.into_iter().collect(),
+            index: module_index(&order),
+            // alloc: as `order`.
+            flags: Box::from(&flags[..]),
+            // alloc: as `order`.
             active: (0..n as u32).collect(),
             // alloc: as `active`.
             last_step: vec![NO_ROUND; n].into_boxed_slice(),
@@ -104,17 +110,18 @@ pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
     let before = RoundKey::new(db, krate, r - 1);
     let previous = queries::round_modules(db, before);
     let root = queries::crate_root(db, krate);
-    // alloc: a round's order is the round before's plus its new modules: `O(m)` per round.
-    let mut order = previous.order.to_vec();
-    // clone: a round's table is the round before's plus its new modules: `O(m)` per round.
-    let mut rows = previous.rows.to_vec();
-    // clone: as `rows`.
-    let mut index = previous.index.clone();
+    // A round's columns are the round before's plus its new modules: `O(m)` per round.
+    let mut order = Vec::with_capacity_in(previous.order.len(), frame);
+    order.extend_from_slice(&previous.order);
+    let mut rows = Vec::with_capacity_in(previous.rows.len(), frame);
+    // clone: as `order`.
+    rows.extend(previous.rows.iter().cloned());
+    let mut declared = set_in(frame);
     // A module that did not step keeps its directives; one that did has what its step left.
-    // alloc: as `order`.
-    let mut flags: Vec<u8> = previous.flags.iter().map(|&it| it & RoundModules::PENDING).collect();
-    // clone: as `rows`.
-    let mut last_step = previous.last_step.to_vec();
+    let mut flags = Vec::with_capacity_in(previous.flags.len(), frame);
+    flags.extend(previous.flags.iter().map(|&it| it & RoundModules::PENDING));
+    let mut last_step = Vec::with_capacity_in(previous.last_step.len(), frame);
+    last_step.extend_from_slice(&previous.last_step);
     for at in previous.stepping() {
         let module = previous.order[at as usize];
         let step = queries::macro_step(db, FactKey::new(db, module, krate, r - 1));
@@ -133,7 +140,7 @@ pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
         flags[at as usize] = (flags[at as usize] & RoundModules::GAINS) | own;
         for (new, row) in step.new_modules.iter() {
             debug_assert_eq!(row.since, r, "a module the step of round {} declared", r - 1);
-            let fresh = index.insert(*new, order.len() as u32).is_none();
+            let fresh = !previous.index.contains_key(new) && declared.insert(*new);
             assert!(fresh, "nameres facts: {new:?} is declared twice, again by {module:?} at round {}", r - 1);
             order.push(*new);
             // clone: a new module's row, once.
@@ -146,6 +153,7 @@ pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
         }
     }
 
+    let index = module_index(&order);
     let kind = queries::round_kind(db, round);
     match kind {
         RoundKind::Normal | RoundKind::EagerWithErrors => {
@@ -163,10 +171,10 @@ pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
     // Where each module of the round before stands after it: the round its component last ran
     // at, and the round its facts last changed at.
     let n = previous.order.len();
-    // clone: as `rows`.
-    let mut ran = previous.ran.to_vec();
-    // clone: as `rows`.
-    let mut since = previous.since.to_vec();
+    let mut ran = Vec::with_capacity_in(order.len(), frame);
+    ran.extend_from_slice(&previous.ran);
+    let mut since = Vec::with_capacity_in(order.len(), frame);
+    since.extend_from_slice(&previous.since);
     let active_before = (r > 1).then(|| (queries::round_active(db, before), queries::partition(db, before)));
     for at in 0..n {
         let module = previous.order[at];
@@ -193,19 +201,34 @@ pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
     since.resize(order.len(), NO_ROUND);
 
     let touched = RoundModules::STEP | RoundModules::GAINS;
-    let active = (0u32..).zip(flags.iter()).filter(|&(_, &it)| it & touched != 0).map(|(at, _)| at);
-    // alloc: the round's active modules, a few.
-    let active = active.collect();
+    let active = || (0u32..).zip(flags.iter()).filter(|&(_, &it)| it & touched != 0).map(|(at, _)| at);
+    // alloc: the round's active modules, a few, at exact size.
+    let mut active_list = Vec::with_capacity(active().count());
+    active_list.extend(active());
     RoundModules {
-        order: order.into_boxed_slice(),
-        rows: rows.into_boxed_slice(),
+        // alloc: the round's columns, at exact size: `O(m)` per round.
+        order: Box::from(&order[..]),
+        // alloc: as `order`.
+        rows: rows.into_iter().collect(),
         index,
-        flags: flags.into_boxed_slice(),
-        active,
-        last_step: last_step.into_boxed_slice(),
-        ran: ran.into_boxed_slice(),
-        since: since.into_boxed_slice(),
+        // alloc: as `order`.
+        flags: Box::from(&flags[..]),
+        active: active_list.into_boxed_slice(),
+        // alloc: as `order`.
+        last_step: Box::from(&last_step[..]),
+        // alloc: as `order`.
+        ran: Box::from(&ran[..]),
+        // alloc: as `order`.
+        since: Box::from(&since[..]),
     }
+}
+
+/// The round's index of each module in `order`, sized once.
+fn module_index(order: &[ModuleId]) -> FxHashMap<ModuleId, u32> {
+    // alloc: the round's index, at its size, once per round.
+    let mut index = FxHashMap::with_capacity_and_hasher(order.len(), Default::default());
+    index.extend((0u32..).zip(order).map(|(at, &module)| (module, at)));
+    index
 }
 
 /// Whether `log` holds a macro directive of `module`: what its first step starts from.
@@ -222,7 +245,7 @@ fn index_of_in(index: &FxHashMap<ModuleId, u32>, module: ModuleId, round: u32) -
 /// declared, the ops of the declaring step with it as their target; then, for the crate root,
 /// the root ops of every other step of that round, steps in module order. Only the steps that
 /// ran are read: a module that did not step at the round before made no op.
-pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
+pub(crate) fn module_round(db: &Db, frame: &Frame, key: FactKey) -> ModuleRound {
     let (module, krate, r) = (key.module(db), key.krate(db), key.round(db));
     assert!(r >= 1, "nameres facts: module_round of {module:?} at round 0, whose ops are module_decls'");
     let modules = queries::round_modules(db, RoundKey::new(db, krate, r));
@@ -230,7 +253,7 @@ pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
         .row(module)
         .unwrap_or_else(|| panic!("nameres facts: {module:?} is not a module of round {r}"));
     let previous = queries::round_modules(db, RoundKey::new(db, krate, r - 1));
-    let mut ops = OpLog::default();
+    let mut ops = Vec::new_in(frame);
     if row.since == r {
         let declarer = declaring_module(modules, module, row, r);
         let step = queries::macro_step(db, FactKey::new(db, declarer, krate, r - 1));
@@ -268,8 +291,7 @@ pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
             }
         }
     }
-    ops.shrink_to_fit();
-    ModuleRound { ops }
+    ModuleRound { ops: OpLog::from_frame(ops) }
 }
 
 /// The module whose step of round `round - 1` declared `module` (declared at `round`): its
@@ -306,26 +328,25 @@ fn carried_op(op: &DeclOp) -> Option<DeclOp> {
 /// parent, the names that denote a local module by declaration, every import of rounds
 /// `0..=r`, the `pub(in path)` visibilities of those imports. Built from the round before's
 /// shape plus what each module gains at this round.
-pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
+pub(crate) fn import_shape(db: &Db, frame: &Frame, round: RoundKey) -> ImportShape {
     let (krate, r) = (round.krate(db), round.round(db));
     let modules = queries::round_modules(db, round);
     let root = queries::crate_root(db, krate);
     let edition = queries::crate_data(db, krate).edition;
-    let extern_prelude_self = queries::round_env(db, round)
-        .env(db)
-        .extern_prelude
-        .iter()
-        .filter(|&&(_, module, _)| module == root)
-        .map(|&(name, ..)| name)
-        .collect(); // alloc: the shape's value, a few names.
+    let extern_prelude = &queries::round_env(db, round).env(db).extern_prelude;
+    let names = || extern_prelude.iter().filter(|&&(_, module, _)| module == root).map(|&(name, ..)| name);
+    // alloc: the shape's value, a few names, at exact size.
+    let mut extern_prelude_self = Vec::with_capacity(names().count());
+    extern_prelude_self.extend(names());
     let previous = match r {
         0 => None,
         _ => Some(queries::import_shape(db, RoundKey::new(db, krate, r - 1))),
     };
     debug_assert!(previous.is_none_or(|it| it.modules.len() <= modules.order.len()));
 
+    // alloc: the shape's value, filled to its capacity: one per module of the round.
     let mut out = Vec::with_capacity(modules.order.len());
-    let mut scratch = ShapeScratch::default();
+    let mut scratch = ShapeScratch::new_in(frame);
     for (at, (&module, row)) in modules.order.iter().zip(modules.rows.iter()).enumerate() {
         let before = previous.and_then(|it| it.modules.get(at));
         if let Some(before) = before
@@ -365,7 +386,12 @@ pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
             other_paths: scratch.other_paths.as_slice().into(),
         });
     }
-    ImportShape { krate, edition, modules: out.into_boxed_slice(), extern_prelude_self }
+    ImportShape {
+        krate,
+        edition,
+        modules: out.into_boxed_slice(),
+        extern_prelude_self: extern_prelude_self.into_boxed_slice(),
+    }
 }
 
 /// The index of a module of the round in its order.
@@ -390,14 +416,17 @@ fn shapes(op: &DeclOp, module: ModuleId, root: ModuleId) -> bool {
 }
 
 /// One module's shape while it is built, reused from module to module.
-#[derive(Default)]
-struct ShapeScratch {
-    local_names: Vec<(Name, u32)>,
-    imports: Vec<ShapeImport>,
-    other_paths: Vec<ModPath>,
+struct ShapeScratch<'f> {
+    local_names: FrameVec<'f, (Name, u32)>,
+    imports: FrameVec<'f, ShapeImport>,
+    other_paths: FrameVec<'f, ModPath>,
 }
 
-impl ShapeScratch {
+impl<'f> ShapeScratch<'f> {
+    fn new_in(frame: &'f Frame) -> Self {
+        ShapeScratch { local_names: Vec::new_in(frame), imports: Vec::new_in(frame), other_paths: Vec::new_in(frame) }
+    }
+
     fn clear(&mut self) {
         self.local_names.clear();
         self.imports.clear();
@@ -576,7 +605,7 @@ pub(crate) fn round_row(db: &Db, round: RoundKey, module: ModuleId) -> Option<Mo
 /// round's handles, the crate-level ops of every log, the final steps' unresolved-macro
 /// diagnostics and the final units' unresolved imports (`collect` and `finish` of the old
 /// collector).
-pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDefMap) {
+pub(crate) fn collect_crate<'db>(db: &'db Db, frame: &Frame, krate: Crate) -> (DefMap, LocalDefMap) {
     let mut r = 0;
     while queries::round_kind(db, RoundKey::new(db, krate, r)) != RoundKind::Final {
         salsa::Database::unwind_if_revision_cancelled(db);
@@ -603,13 +632,13 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
     }
 
     let mut crate_ops = CrateOps {
-        diagnostics: Vec::new(), // alloc: the def map's own list.
+        diagnostics: Vec::new_in(frame),
         // clone: one count; the data is copied only if a log exports a derive or a proc macro.
         data: queries::crate_data(db, krate).clone(),
         data_changed: false,
         session_macros: false,
-        unresolved_extern_crates: FxHashSet::default(),
-        records: Records::default(),
+        unresolved_extern_crates: set_in(frame),
+        records: Records::new_in(frame),
     };
     for row in queries::round_modules(db, RoundKey::new(db, krate, 0)).rows.iter() {
         let key = row.decl.expect("a module of round 0 has its round-0 key");
@@ -628,7 +657,7 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
 
     // One state per component, by its anchor in module order.
     let partition = queries::partition(db, round);
-    let mut states: Vec<&'db SccState> = Vec::with_capacity(partition.len() as usize);
+    let mut states: Vec<&'db SccState, &Frame> = Vec::with_capacity_in(partition.len() as usize, frame);
     for (at, &module) in (0u32..).zip(modules.order.iter()) {
         if partition.anchor(partition.of(at)) == at {
             states.push(queries::scc_state(db, SccKey::new(db, module, krate, r)));
@@ -637,19 +666,19 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
 
     // The final round steps no module: each has the directives and tables of its last step, or
     // those it started with.
-    let mut derive_helpers_in_scope = FxHashMap::default();
-    let mut pending: Vec<macros::Carried<'db>> = Vec::new(); // alloc: only when a module left a call.
+    let mut derive_helpers: FrameMap<'_, _, FrameVec<'_, _>> = map_in(frame);
+    let mut pending: Vec<macros::Carried<'db>, &Frame> = Vec::new_in(frame);
     for (at, &module) in (0u32..).zip(modules.order.iter()) {
         let carried = macros::Carried::at(db, krate, modules, at);
         let tables = carried.tables();
-        let SideTables { derive_helpers, deferred_derives, .. } = &*tables;
+        let SideTables { derive_helpers: helpers_of, deferred_derives, .. } = &*tables;
         always!(
             deferred_derives.is_empty(),
             "the deferred builtin derives of {module:?}: {deferred_derives:#?}"
         );
-        for (&item, helpers) in derive_helpers {
+        for (&item, helpers) in helpers_of {
             // clone: the final tables are query values; each helper is copied into the map once.
-            derive_helpers_in_scope.entry(item).or_insert_with(Vec::new).extend(helpers.iter().cloned());
+            derive_helpers.entry(item).or_insert_with(|| Vec::new_in(frame)).extend(helpers.iter().cloned());
         }
         if modules.has_pending(at) {
             pending.push(carried);
@@ -658,7 +687,7 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
 
     let env = queries::round_env(db, round).env(db);
     let local = env.local_def_map();
-    let CrateOps { diagnostics, data, session_macros, unresolved_extern_crates, records, .. } =
+    let CrateOps { mut diagnostics, data, session_macros, unresolved_extern_crates, records, .. } =
         crate_ops;
     let mut def_map = DefMap {
         krate,
@@ -667,11 +696,13 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
         modules: ModulesSlot::Building(table),
         prelude: None,
         macro_use_prelude: FxHashMap::default(),
-        derive_helpers_in_scope,
+        derive_helpers_in_scope: owned_helpers(&derive_helpers),
         session_macros,
         names: NameRecords::default(),
-        diagnostics,
+        // alloc: empty, allocates nothing: the list is made from the frame's once it is whole.
+        diagnostics: Vec::new(),
         diagnostics_by_module: DiagnosticsByModule::default(),
+        records: None,
         data,
     };
     env.install(&mut def_map);
@@ -682,8 +713,8 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
     let (mut def_map, mut local) = if pending.is_empty() {
         (def_map, local)
     } else {
-        let cx = collect::cx(db, krate, false);
-        let mut sink = FinishSink { db, def_map, local, states: &states };
+        let cx = collect::cx(db, frame, krate, false);
+        let mut sink = FinishSink { db, def_map, local, states: &states, diagnostics: &mut diagnostics };
         for carried in &pending {
             macros::unresolved_macro_diagnostics(&cx, &mut sink, carried.directives());
         }
@@ -692,8 +723,7 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
 
     // Every import of the final round, in module then import order: a member's imports are
     // in its state in the order they were pushed, which is round order.
-    // alloc: one entry per import of the crate, once.
-    let mut imports: Vec<(u32, &'db ImportOp, Option<PerNs>)> = Vec::new();
+    let mut imports: Vec<(u32, &'db ImportOp, Option<PerNs>), &Frame> = Vec::new_in(frame);
     for state in &states {
         imports.extend(state.imports.iter().map(|(import, status)| {
             let at = *modules.index.get(&import.module).unwrap_or_else(|| {
@@ -707,14 +737,17 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
         if status.is_some() || in_unresolved_extern_crate(&import.path, &unresolved_extern_crates) {
             continue;
         }
-        def_map.diagnostics.push(DefDiagnostic::unresolved_import(
+        diagnostics.push(DefDiagnostic::unresolved_import(
             import.module,
             import.source.id.lookup(db).id,
             import.source.use_tree,
         ));
     }
+    // alloc: the def map's own list, at exact size, once per def map.
+    def_map.diagnostics = diagnostics.into_iter().collect();
     def_map.names = name_records(
         db,
+        frame,
         &def_map,
         &local,
         imports.iter().map(|&(_, import, status)| (import, status)),
@@ -729,16 +762,16 @@ pub(crate) fn collect_crate<'db>(db: &'db Db, krate: Crate) -> (DefMap, LocalDef
 }
 
 /// The crate-level ops of every log, in round then module order.
-struct CrateOps {
-    diagnostics: Vec<DefDiagnostic>,
+struct CrateOps<'f> {
+    diagnostics: FrameVec<'f, DefDiagnostic>,
     data: Arc<DefMapCrateData>,
     data_changed: bool,
     session_macros: bool,
-    unresolved_extern_crates: FxHashSet<Name>,
-    records: Records,
+    unresolved_extern_crates: FrameSet<'f, Name>,
+    records: Records<'f>,
 }
 
-impl CrateOps {
+impl CrateOps<'_> {
     fn take(&mut self, ops: &OpLog) {
         for op in ops.iter() {
             match op {
@@ -768,7 +801,7 @@ impl CrateOps {
 
 /// `finish`'s rule: an import whose path starts with the name of an `extern crate` that did not
 /// resolve gets no diagnostic of its own.
-fn in_unresolved_extern_crate(path: &ModPath, unresolved: &FxHashSet<Name>) -> bool {
+fn in_unresolved_extern_crate(path: &ModPath, unresolved: &FrameSet<'_, Name>) -> bool {
     matches!(
         (path.segments().first(), &path.kind),
         (Some(krate), PathKind::Plain | PathKind::Abs) if unresolved.contains(krate)
@@ -777,11 +810,10 @@ fn in_unresolved_extern_crate(path: &ModPath, unresolved: &FxHashSet<Name>) -> b
 
 /// The ops `NameRecords` is built from (the old `resolved_macro_paths`, `derive_helper_uses`
 /// and `not_introducing`), in log order.
-#[derive(Default)]
-struct Records {
-    macro_paths: Vec<MacroPath>,
-    derive_helpers: Vec<DeriveHelperUse>,
-    not_introducing: Vec<ExternCrateId>,
+struct Records<'f> {
+    macro_paths: FrameVec<'f, MacroPath>,
+    derive_helpers: FrameVec<'f, DeriveHelperUse>,
+    not_introducing: FrameVec<'f, ExternCrateId>,
 }
 
 /// The old `ResolvedMacroPath`.
@@ -793,7 +825,15 @@ struct MacroPath {
     call: Option<MacroCallId>,
 }
 
-impl Records {
+impl<'f> Records<'f> {
+    fn new_in(frame: &'f Frame) -> Self {
+        Records {
+            macro_paths: Vec::new_in(frame),
+            derive_helpers: Vec::new_in(frame),
+            not_introducing: Vec::new_in(frame),
+        }
+    }
+
     /// Keeps `op` if it is one of the three, and says whether it was.
     fn take(&mut self, op: &DeclOp) -> bool {
         match *op {
@@ -815,17 +855,17 @@ impl Records {
 /// unresolved; `local` is the crate's `LocalDefMap`, a block's too.
 fn name_records<'a>(
     db: &Db,
+    frame: &Frame,
     def_map: &DefMap,
     local: &LocalDefMap,
     imports: impl Iterator<Item = (&'a ImportOp, Option<PerNs>)>,
-    records: Records,
+    records: Records<'_>,
 ) -> NameRecords {
     let q = (local, db, ResolveMode::Import);
-    // alloc: the records' own lists, once per def map.
-    let mut uses = Vec::new();
-    let mut found = Vec::new(); // alloc: one reused buffer.
-    let mut unresolved = Vec::new(); // alloc: as `uses`.
-    let mut glob_targets = Vec::new(); // alloc: as `uses`.
+    let mut uses = Vec::new_in(frame);
+    let mut found = Vec::new_in(frame);
+    let mut unresolved = Vec::new_in(frame);
+    let mut glob_targets = Vec::new_in(frame);
     for (import, status) in imports {
         let ImportSource { use_tree, id, kind, is_prelude } = import.source;
         let own = match kind {
@@ -854,7 +894,7 @@ fn name_records<'a>(
             glob_targets.push((glob, target));
         }
     }
-    let mut macro_calls = Vec::new(); // alloc: as `uses`.
+    let mut macro_calls = Vec::new_in(frame);
     for it in &records.macro_paths {
         let MacroPath { module, ref path, subns, def, call } = *it;
         let Some((macro_id, via)) = def_map.macro_via(local, db, module, path, subns, def) else {
@@ -873,20 +913,37 @@ fn name_records<'a>(
                 Namespace::Macros,
                 subns,
                 true,
-                &mut uses,
+                &mut found,
             );
+            uses.extend(found.drain(..));
         }
     }
-    let mut seen = FxHashSet::default();
+    let mut seen = set_in(frame);
     uses.retain(|&it| seen.insert(it));
     NameRecords {
-        uses: uses.into_boxed_slice(),
-        unresolved: unresolved.into_boxed_slice(),
-        glob_targets: glob_targets.into_boxed_slice(),
-        macro_calls: macro_calls.into_boxed_slice(),
-        derive_helpers: records.derive_helpers.into_boxed_slice(),
-        not_introducing: records.not_introducing.into_boxed_slice(),
+        // alloc: the records' own lists, at exact size, once per def map.
+        uses: uses.into_iter().collect(),
+        // alloc: as `uses`.
+        unresolved: unresolved.into_iter().collect(),
+        // alloc: as `uses`.
+        glob_targets: glob_targets.into_iter().collect(),
+        // alloc: as `uses`.
+        macro_calls: macro_calls.into_iter().collect(),
+        // alloc: as `uses`.
+        derive_helpers: records.derive_helpers.into_iter().collect(),
+        // alloc: as `uses`.
+        not_introducing: records.not_introducing.into_iter().collect(),
     }
+}
+
+/// The def map's derive helpers, from a run's frame tables: the table and each list at exact
+/// size.
+fn owned_helpers(helpers: &FrameMap<'_, AstId<ast::Item>, FrameVec<'_, DeriveHelper>>) -> DeriveHelpers {
+    // alloc: the def map's table, at its size, once per def map.
+    let mut out = DeriveHelpers::with_capacity_and_hasher(helpers.len(), Default::default());
+    // alloc: each item's list, at exact size, once per def map; clone: each helper once.
+    out.extend(helpers.iter().map(|(&item, list)| (item, list.to_vec())));
+    out
 }
 
 /// A copy of a diagnostic of a log (a query value) for the def map, which owns its list.
@@ -918,15 +975,16 @@ fn copy_diagnostic(diagnostic: &DefDiagnostic) -> DefDiagnostic {
 
 /// The sink of `finish`'s unresolved-macro diagnostics: the assembled def map, which their
 /// paths resolve against as the old `finish` resolved them against the final map. It takes
-/// diagnostics only.
-struct FinishSink<'a, 'db> {
+/// diagnostics only, into the def map's list being built.
+struct FinishSink<'a, 'db, 'f> {
     db: &'db Db,
     def_map: DefMap,
     local: LocalDefMap,
     states: &'a [&'db SccState],
+    diagnostics: &'a mut FrameVec<'f, DefDiagnostic>,
 }
 
-impl<'db> Sink<'db> for FinishSink<'_, 'db> {
+impl<'db> Sink<'db> for FinishSink<'_, 'db, '_> {
     fn db(&self) -> &'db Db {
         self.db
     }
@@ -941,7 +999,7 @@ impl<'db> Sink<'db> for FinishSink<'_, 'db> {
 
     fn apply(&mut self, op: DeclOp) {
         match op {
-            DeclOp::Diagnostic(it) => self.def_map.diagnostics.push(it),
+            DeclOp::Diagnostic(it) => self.diagnostics.push(it),
             op => panic!("nameres facts: finish's unresolved-macro diagnostics made {op:?}"),
         }
     }
@@ -969,7 +1027,7 @@ impl<'db> Sink<'db> for FinishSink<'_, 'db> {
         panic!("nameres facts: finish's unresolved-macro diagnostics declared {:?}", request.child)
     }
 
-    fn take_macros(&mut self, into: &mut Vec<MacroOp>) {
+    fn take_macros(&mut self, into: &mut FrameVec<'_, MacroOp>) {
         // `apply` takes no directive, so there is none to move.
         let _ = into;
     }
@@ -982,15 +1040,16 @@ impl<'db> Sink<'db> for FinishSink<'_, 'db> {
 /// around) is final.
 pub(crate) fn collect_block<'db>(
     db: &'db Db,
+    frame: &Frame,
     def_map: DefMap,
     tree_id: TreeId,
     local: &'db LocalDefMap,
 ) -> DefMap {
     let krate = def_map.krate;
-    let cx = collect::cx(db, krate, true);
-    let mut sink = BlockSink { unit: Unit::block(&cx, def_map, local), records: Records::default() };
-    let mut side = SideTables::default();
-    let mut pending: Vec<MacroOp> = Vec::new(); // alloc: the block's worklist, once.
+    let cx = collect::cx(db, frame, krate, true);
+    let mut sink = BlockSink { unit: Unit::block(&cx, def_map, local), records: Records::new_in(frame) };
+    let mut side: SideTablesIn<'_> = SideTables::new_in(frame);
+    let mut pending: FrameVec<'_, MacroOp> = Vec::new_in(frame);
     collect::seed_block(&cx, &mut sink, &mut side, tree_id);
     sink.take_macros(&mut pending);
 
@@ -1035,35 +1094,38 @@ pub(crate) fn collect_block<'db>(
 
     // The old `finish`.
     macros::unresolved_macro_diagnostics(&cx, &mut sink, &pending);
-    let BlockSink { unit, records } = sink;
-    let unresolved: Vec<DefDiagnostic> = unit
-        .unresolved_imports()
-        .filter(|it| !in_unresolved_extern_crate(&it.path, unit.unresolved_extern_crates()))
-        .map(|it| DefDiagnostic::unresolved_import(it.module, it.source.id.lookup(db).id, it.source.use_tree))
-        // alloc: the block's unresolved imports, read before the unit gives up its map.
-        .collect();
-    let names = name_records(db, unit.def_map(), local, unit.import_outcomes(), records);
+    let BlockSink { mut unit, records } = sink;
+    // The block's diagnostics, then its unresolved imports, read before the unit gives up its
+    // map.
+    let mut diagnostics = unit.take_diagnostics();
+    diagnostics.extend(
+        unit.unresolved_imports()
+            .filter(|it| !in_unresolved_extern_crate(&it.path, unit.unresolved_extern_crates()))
+            .map(|it| DefDiagnostic::unresolved_import(it.module, it.source.id.lookup(db).id, it.source.use_tree)),
+    );
+    let names = name_records(db, frame, unit.def_map(), local, unit.import_outcomes(), records);
     let mut def_map = unit.into_def_map();
-    def_map.diagnostics.extend(unresolved);
+    // alloc: the def map's own list, at exact size, once per block.
+    def_map.diagnostics = diagnostics.into_iter().collect();
     def_map.names = names;
     always!(
         side.deferred_derives.is_empty(),
         "the deferred builtin derives of a block: {:#?}",
         side.deferred_derives
     );
-    def_map.derive_helpers_in_scope = std::mem::take(&mut side.derive_helpers);
+    def_map.derive_helpers_in_scope = owned_helpers(&side.derive_helpers);
     def_map.shrink_to_fit();
     def_map.hand_over_scopes(db);
     def_map
 }
 
 /// A block's unit, keeping the ops `NameRecords` is built from, which the unit does not hold.
-struct BlockSink<'db> {
-    unit: Unit<'db>,
-    records: Records,
+struct BlockSink<'db, 'f> {
+    unit: Unit<'db, 'f, &'f Frame>,
+    records: Records<'f>,
 }
 
-impl<'db> Sink<'db> for BlockSink<'db> {
+impl<'db> Sink<'db> for BlockSink<'db, '_> {
     fn db(&self) -> &'db Db {
         self.unit.db()
     }
@@ -1095,7 +1157,7 @@ impl<'db> Sink<'db> for BlockSink<'db> {
         self.unit.child(request)
     }
 
-    fn take_macros(&mut self, into: &mut Vec<MacroOp>) {
+    fn take_macros(&mut self, into: &mut FrameVec<'_, MacroOp>) {
         self.unit.take_macros(into);
     }
 
@@ -1378,8 +1440,8 @@ fn f() {
         for name in ["inner", "Inner", "Outer", "Local"] {
             assert_ne!(scope.get(&Name::new_root(name)), PerNs::none(), "`{name}` in the block");
         }
-        assert!(!new.diagnostics().is_empty(), "the unresolved import and macro are diagnosed");
-        assert_eq!(records(&old.names), records(&new.names), "the block's name records");
+        assert!(!new.diagnostics(&db).is_empty(), "the unresolved import and macro are diagnosed");
+        assert_eq!(records(old.name_records(&db)), records(new.name_records(&db)), "the block's name records");
     }
 
     /// What two collections' `NameRecords` must agree on without their ids, which differ: each
@@ -1427,8 +1489,8 @@ local!();
         let krate = db.fetch_test_crate();
         let old = old_crate_local_def_map(&db, krate);
         let new = new_crate_local_def_map(&db, krate);
-        let old = records(old.def_map(&db).name_records());
-        let new = records(new.def_map(&db).name_records());
+        let old = records(old.def_map(&db).name_records(&db));
+        let new = records(new.def_map(&db).name_records(&db));
         assert_eq!(old, new);
         assert!(!new.0.is_empty(), "the fixture's imports go through bindings: {new:?}");
         assert_eq!(new.1[0], 1, "one unresolved import");

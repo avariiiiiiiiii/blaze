@@ -16,13 +16,14 @@ use crate::{
 pub(crate) fn lower<'db>(cx: &Cx<'_, 'db>, d: &hir::CannotBeDereferenced<'db>) -> Vec<Found> {
     let span = cx.span_of_ptr(d.expr);
     let ty = cx.ty(&d.found);
-    let mut diag =
-        Diag::error(Some("E0614"), format!("type `{ty}` cannot be dereferenced"), span.clone());
+    let message = format!("type `{ty}` cannot be dereferenced"); // alloc: the error's message
+    let mut diag = Diag::error(Some("E0614"), message, span.clone()); // clone: the error's span
     diag.span_label(span, "can't be dereferenced");
     parentheses_needed(cx, d.expr, &mut diag);
     if let Some(deref) = hir::Trait::lang(cx.db, cx.krate, LangItem::Deref) {
-        diag.fact_opt(cx.implements_fact(deref, &d.found), format!("whether `{ty}` implements `Deref`"));
+        let fact = format!("whether `{ty}` implements `Deref`"); // alloc: the error's fact
+        diag.fact_opt(cx.implements_fact(deref, &d.found), fact);
     }
     code_fact(cx, d.expr.map(|it| it.syntax_node_ptr()), &mut diag);
-    vec![Found::new(diag, Phase::Bodies)]
+    vec![Found::new(diag, Phase::Bodies)] // alloc: the error found
 }

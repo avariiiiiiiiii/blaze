@@ -32,6 +32,7 @@ use blaze_ids::bits::BitSet;
 use cfg::CfgOptions;
 use hir::{HirFileId, InFile};
 use hir_def::unstable_features::UnstableFeatures;
+use intern::Symbol;
 use rustc_hash::FxHashMap;
 use syntax::{AstNode as _, SyntaxKind, SyntaxNodePtr, TextRange, ast};
 
@@ -73,6 +74,7 @@ impl CommandLine {
     /// are not lint flags and are passed by. `--emit` is read for [`CommandLine::codegen`].
     pub fn parse(args: &[String]) -> Result<CommandLine, String> {
         let mut flags = CommandLine::default();
+        // alloc: setup, the command line read once per check
         let mut emit = Vec::new();
         let mut args = args.iter();
         let levels = [
@@ -89,7 +91,9 @@ impl CommandLine {
         while let Some(arg) = args.next() {
             let mut value = |flag: &str| -> Result<Option<String>, String> {
                 if arg == flag {
+                    // alloc: setup, as above; and the error's text
                     let next = args.next().ok_or_else(|| format!("Argument to option '{}' missing", flag.trim_start_matches('-')))?;
+                    // clone: setup, as above
                     return Ok(Some(next.clone()));
                 }
                 let rest = arg.strip_prefix(flag);
@@ -101,8 +105,10 @@ impl CommandLine {
             };
             if let Some(cap) = value("--cap-lints")? {
                 if flags.cap.is_some() {
+                    // alloc: an error's text
                     return Err("Option 'cap-lints' given more than once".to_owned());
                 }
+                // alloc: an error's text
                 flags.cap = Some(Level::of_cap(&cap).ok_or_else(|| format!("unknown lint level: `{cap}`"))?);
                 continue;
             }
@@ -118,9 +124,12 @@ impl CommandLine {
                 for kind in list.split(',') {
                     let kind = kind.split_once('=').map_or(kind, |(kind, _)| kind);
                     if !EMIT_KINDS.contains(&kind) {
+                        // alloc: an error's text
                         let expected: Vec<String> = EMIT_KINDS.iter().map(|it| format!("`{it}`")).collect();
+                        // alloc: as above
                         return Err(format!("unknown emission type: `{kind}` - expected one of: {}", expected.join(", ")));
                     }
+                    // alloc: setup, the command line read once per check
                     emit.push(kind.to_owned());
                 }
                 continue;
@@ -134,6 +143,7 @@ impl CommandLine {
             }
             let Some((name, level)) = found else { continue };
             if name == "help" {
+                // alloc: an error's text
                 return Err(format!("`{} help` asks for rustc's list of lints, which blaze does not write", level.to_cmd_flag()));
             }
             flags.opts.push((name.replace('-', "_"), level));
@@ -184,7 +194,7 @@ pub(super) enum Source {
     /// An attribute: the name it sets the level of (the new one of a renamed lint, with its
     /// tool for a tool's), where the name is, and its `reason`. The span rustc gives where the
     /// name is ([`Cx::span`]) is made only when a note shows it.
-    Node { name: Box<str>, at: InFile<TextRange>, reason: Option<Box<str>> },
+    Node { name: Symbol, at: InFile<TextRange>, reason: Option<Symbol> },
     /// The command line: the name given, with `_` for `-`, and the level of its flag.
     CommandLine { name: Box<str>, level: Level },
 }
@@ -308,6 +318,7 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
             if future.explain_reason {
                 diag.warn(future.reason.explanation(self.cx.edition));
             }
+            // alloc: a note of a lint that fires
             diag.note(format!("for more information, see {}", future.reason.reference()));
         }
         self.explain(lint, spec, &mut diag);
@@ -328,7 +339,9 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
         match &self.sources[spec.source.0 as usize] {
             Source::Default => {
                 let note = match self.store.group_of(lint) {
+                    // alloc: a note of a lint that fires
                     Some(group) => format!("`#[{shown}({name})]` (part of `#[{shown}({group})]`) on by default"),
+                    // alloc: as above
                     None => format!("`#[{shown}({name})]` on by default"),
                 };
                 once(diag, Sublevel::Note, note);
@@ -337,13 +350,17 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
                 let flag = flagged.to_cmd_flag();
                 let hyphens = name.replace('_', "-");
                 if &**given == name {
+                    // alloc: a note of a lint that fires
                     once(diag, Sublevel::Note, format!("requested on the command line with `{flag} {hyphens}`"));
                 } else {
                     let given = given.replace('_', "-");
+                    // alloc: as above
                     once(diag, Sublevel::Note, format!("`{flag} {hyphens}` implied by `{flag} {given}`"));
                     if matches!(flagged, Level::Warn | Level::Deny) {
                         let help = match lint.id() == LintId::DEAD_CODE {
+                            // alloc: as above
                             true => format!("to override `{flag} {given}` add `#[expect({name})]` or `#[allow({name})]`"),
+                            // alloc: as above
                             false => format!("to override `{flag} {given}` add `#[allow({name})]`"),
                         };
                         once(diag, Sublevel::Help, help);
@@ -352,10 +369,11 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
             }
             Source::Node { name: attr, at, reason } => {
                 if let Some(reason) = reason {
-                    diag.note(&**reason);
+                    diag.note(reason.as_str());
                 }
                 diag.sub(Sublevel::Note, "the lint level is defined here", MultiSpan::of(self.cx.span(*at)), true);
-                if &**attr != name {
+                if attr.as_str() != name {
+                    // alloc: a note of a lint that fires
                     once(diag, Sublevel::Note, format!("`#[{shown}({name})]` implied by `#[{shown}({attr})]`"));
                 }
             }
@@ -364,6 +382,7 @@ impl<'a, 'b, 'db> Shared<'a, 'b, 'db> {
             && warnings >= Level::Deny
             && level < warnings
         {
+            // alloc: a note of a lint that fires
             once(diag, Sublevel::Note, format!("the `{name}` lint ignores `-D warnings`"));
         }
     }
@@ -440,9 +459,12 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
     }
 
     let unfulfilled = LintId::UNFULFILLED_LINT_EXPECTATIONS.lint();
+    // alloc: once per `#[expect]` name of the crate, ranked for rustc's order of what is
+    // unfulfilled; ranked before the test, as what the loop emits can fulfill another
     let mut expectations: Vec<_> = std::mem::take(&mut late.expectations)
         .into_iter()
         .map(|it| ((owner_rank(&sh, &it.node), attrs::place(cx.sema, &it.node)), it))
+        // alloc: as above
         .collect();
     expectations.sort_by(|a, b| a.0.cmp(&b.0));
     for (_, expectation) in expectations {
@@ -451,7 +473,7 @@ pub(crate) fn decide(cx: &Cx<'_, '_>, cmd: &CommandLine, found: Vec<Found>, abor
         }
         let mut diag = Diag::lint(unfulfilled.name, "this lint expectation is unfulfilled", expectation.key);
         if let Some(reason) = expectation.reason {
-            diag.note(reason.into_string());
+            diag.note(reason.as_str());
         }
         if expectation.is_unfulfilled {
             diag.note("the `unfulfilled_lint_expectations` lint can't be expected and will always produce this message");

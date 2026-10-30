@@ -253,7 +253,7 @@ pub(crate) fn serve(db: &mut ide_db::RootDatabase, crates: &[Crate]) -> Served {
     let Some(mode) = mode() else { return Served::default() };
     let mut all: FxHashMap<Crate, Option<[u8; 32]>> = FxHashMap::default();
     for &krate in crates {
-        for dep in krate.transitive_deps(db) {
+        for dep in krate.transitive_deps(db).iter().copied() {
             key(db, dep, &mut all);
         }
     }

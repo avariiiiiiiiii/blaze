@@ -49,7 +49,7 @@ impl WarmKey {
         });
         match &command.sandbox {
             Sandbox::Off => _ = hasher.update(b"off"),
-            Sandbox::On { read, write, network, trace } => {
+            Sandbox::On { read, write, network, trace, services } => {
                 hasher.update(b"on");
                 for list in [read, write] {
                     hasher.update(&(list.len() as u64).to_le_bytes());
@@ -58,6 +58,10 @@ impl WarmKey {
                     }
                 }
                 hasher.update(&[u8::from(*network), u8::from(*trace)]);
+                hasher.update(&(services.len() as u64).to_le_bytes());
+                for service in services {
+                    hasher.part(service.as_bytes());
+                }
             }
         }
         hasher.update(&command.memory.unwrap_or(u64::MAX).to_le_bytes());
@@ -359,7 +363,7 @@ mod tests {
             env: vec![("PATH".into(), path.into()), ("CARGO".into(), "c".into())],
             dir: "/ws".into(),
             stdin: Vec::new(),
-            sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true },
+            sandbox: Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: true, services: Vec::new() },
             memory: None,
         }
     }
@@ -377,6 +381,21 @@ mod tests {
         assert_eq!(WarmKey::of(&code, &command("/a"), &set), WarmKey::of(&code, &command("/b"), &set));
         let other = [("CARGO".into(), "d".into())];
         assert_ne!(WarmKey::of(&code, &command("/a"), &set), WarmKey::of(&code, &command("/a"), &other));
+    }
+
+    /// A process allowed other Mach lookups is another process.
+    #[test]
+    fn the_services_a_server_may_look_up_are_in_its_key() {
+        let set = [("CARGO".into(), "c".into())];
+        let code = ContentId::of("blaze v2 test 1", b"srv");
+        let mut named = command("/a");
+        let Sandbox::On { services, .. } = &mut named.sandbox else { panic!() };
+        services.push("dev.blaze.inproc.1".into());
+        assert_ne!(WarmKey::of(&code, &command("/a"), &set), WarmKey::of(&code, &named, &set));
+        let mut other = command("/a");
+        let Sandbox::On { services, .. } = &mut other.sandbox else { panic!() };
+        services.push("dev.blaze.inproc.2".into());
+        assert_ne!(WarmKey::of(&code, &named, &set), WarmKey::of(&code, &other, &set));
     }
 
     #[test]

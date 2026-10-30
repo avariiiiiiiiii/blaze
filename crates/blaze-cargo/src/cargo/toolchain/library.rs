@@ -399,8 +399,10 @@ pub unsafe fn publish() {
     };
     let dir = found().ok().cloned().or_else(copied);
     let dir = dir.map(|it| it.dir.into_os_string()).unwrap_or_default();
-    // SAFETY: no other thread runs, by this function's contract: the workers of the runtime a
-    // download starts (`download`) are joined as it drops, before this.
+    // SAFETY: `set_var` races only with another thread using the environment; `publish` is
+    // called from blaze-engine's `main` (`crates/blaze-engine/src/lib.rs`) before anything there
+    // starts a thread (the workers of the runtime a download starts are joined as it drops,
+    // before this); were one running, its `getenv` could read freed memory.
     unsafe { std::env::set_var(VAR, dir) };
 }
 
@@ -410,7 +412,9 @@ pub unsafe fn publish() {
 ///
 /// As [`publish`]'s: no other thread of the process may run during the call.
 pub unsafe fn publish_fetched(library: &Library) {
-    // SAFETY: no other thread runs, by this function's contract.
+    // SAFETY: `set_var` races only with another thread using the environment; `publish_fetched`
+    // is called only from `toolchain::settle` (`toolchain.rs`) on the main thread, after its
+    // scoped threads are joined; were one running, its `getenv` could read freed memory.
     unsafe { std::env::set_var(VAR, &library.dir) };
 }
 

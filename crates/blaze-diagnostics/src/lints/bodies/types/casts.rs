@@ -52,6 +52,7 @@ fn can_be_used_for_suggestions(span: &Span) -> bool {
 /// rustc's `Span::find_ancestor_in_same_ctxt`: `span`, or the call of the macro it came from,
 /// and of the macro that call came from, .., the first in the expansion `other` is in.
 fn ancestor_in_same_ctxt(span: &Span, other: &Span) -> Option<Span> {
+    // clone: a lint's span, asked only for a lint's suggestion
     let mut at = span.clone();
     while at.expansion != other.expansion {
         at = at.expansion?.call_site;

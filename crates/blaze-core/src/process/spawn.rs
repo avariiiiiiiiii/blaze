@@ -4,6 +4,10 @@
 //! spawn costs the same however large the warm daemon is, where a `fork` copies its page
 //! tables; the child joins its cgroup before its program runs, and the pidfd comes back with
 //! the pid. On macOS `posix_spawn`. Elsewhere std's spawn.
+//!
+//! A spawn whose exec meets `ETXTBSY` is made again, from the parent, of the same program
+//! ([`while_busy`], waiting as [`crate::busy`] says). Past its bound the spawn fails, naming the
+//! error; never another path, never a copy of the file.
 
 use std::{
     ffi::OsString,
@@ -20,6 +24,45 @@ use std::{
     },
     ptr,
 };
+
+use crate::busy;
+
+#[cfg(test)]
+mod tests;
+
+/// `start` made again for as long as its exec fails with `ETXTBSY`, waiting as [`busy::next`]
+/// says. In the parent, never in a child: each try is a new child, whose descriptors are
+/// copied from the parent's as they are then. A Linux child that retried its own `execve`
+/// would keep the copy of the writer's descriptor it was made with, and never run. The
+/// calling thread waits, as it waits for the spawn anyway: at most [`busy::MOST_NS`] in all,
+/// and only while the file is busy.
+fn while_busy<T>(mut start: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let (mut tried, mut waited) = (0, 0);
+    loop {
+        let error = match start() {
+            Ok(it) => return Ok(it),
+            Err(error) => error,
+        };
+        // Of every system call a spawn makes, only exec says `ETXTBSY`; by kind, since the
+        // Linux spawn names the step that failed.
+        if error.kind() != io::ErrorKind::ExecutableFileBusy {
+            return Err(error);
+        }
+        let Some(wait) = busy::next(tried, waited) else {
+            return Err(io::Error::new(
+                error.kind(),
+                // alloc: an error path.
+                format!(
+                    "still open for writing after {} ms of tries: {error}",
+                    busy::MOST_NS / 1_000_000
+                ),
+            ));
+        };
+        std::thread::sleep(std::time::Duration::from_nanos(wait));
+        tried += 1;
+        waited += wait;
+    }
+}
 
 /// What to start, borrowed: a command's own program, arguments, environment and directory, or
 /// those its sandbox made, so a spawn copies none of them.
@@ -58,7 +101,8 @@ pub(super) fn spawn(program: &Program<'_>, input: bool, procs: Option<&CStr>) ->
     #[cfg(target_os = "linux")]
     {
         let procs = procs.map(|path| open(path, libc::O_WRONLY)).transpose()?;
-        let (pid, pidfd) = clone(&plan, fds, procs.as_ref().map_or(-1, |it| it.as_raw_fd()))?;
+        let joins = procs.as_ref().map_or(-1, |it| it.as_raw_fd());
+        let (pid, pidfd) = while_busy(|| clone(&plan, fds, joins))?;
         Ok(Spawned { pid, pidfd, stdin, stdout, stderr })
     }
     #[cfg(target_os = "macos")]
@@ -77,15 +121,16 @@ pub(super) fn spawn(
 ) -> io::Result<Spawned> {
     use std::process::Stdio;
     debug_assert!(procs.is_none(), "no cgroups here");
-    let mut child = std::process::Command::new(program.program)
+    let mut command = std::process::Command::new(program.program);
+    command
         .args(program.args)
         .env_clear()
         .envs(program.env.iter().map(|(name, value)| (name, value)))
         .current_dir(program.dir)
         .stdin(if input { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+        .stderr(Stdio::piped());
+    let mut child = while_busy(|| command.spawn())?;
     let pid = child.id() as libc::pid_t;
     let stdin = child.stdin.take().map(OwnedFd::from);
     let stdout = OwnedFd::from(child.stdout.take().expect("a piped stdout"));
@@ -468,17 +513,19 @@ fn posix_spawn(plan: &Plan, fds: [RawFd; 3]) -> io::Result<libc::pid_t> {
         // SAFETY: made above.
         check(unsafe { libc::posix_spawnattr_setflags(&mut attr, flags) })?;
         let mut pid = 0;
-        // SAFETY: a NUL-terminated path, the actions and attributes made above, and two
-        // NULL-terminated arrays of NUL-terminated strings kept by `plan`.
-        check(unsafe {
-            libc::posix_spawn(
-                &mut pid,
-                plan.program,
-                &actions,
-                &attr,
-                plan.argv.as_ptr().cast(),
-                plan.envp.as_ptr().cast(),
-            )
+        while_busy(|| {
+            // SAFETY: a NUL-terminated path, the actions and attributes made above, and two
+            // NULL-terminated arrays of NUL-terminated strings kept by `plan`.
+            check(unsafe {
+                libc::posix_spawn(
+                    &mut pid,
+                    plan.program,
+                    &actions,
+                    &attr,
+                    plan.argv.as_ptr().cast(),
+                    plan.envp.as_ptr().cast(),
+                )
+            })
         })?;
         Ok(pid)
     })();

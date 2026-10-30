@@ -3,13 +3,16 @@ use hir_expand::name::Name;
 use intern::Symbol;
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
-    AstNode, AstPtr, AstToken, T,
-    ast::{self, HasName, IsString},
+    T,
+    view::{self as ast, AstNode, AstToken, HasName, IsString},
 };
 use tt::TextRange;
 
 use crate::{
-    expr_store::lower::{ExprCollector, FxIndexSet},
+    expr_store::{
+        ExprPtr,
+        lower::{ExprCollector, FxIndexSet, ImplTraitLowering},
+    },
     hir::{
         AsmOperand, AsmOptions, AsmPiece, ExprId, InlineAsm, InlineAsmKind,
         InlineAsmRegOrRegClass,
@@ -19,8 +22,8 @@ use crate::{
 impl ExprCollector<'_> {
     pub(super) fn lower_inline_asm(
         &mut self,
-        asm: ast::AsmExpr,
-        syntax_ptr: AstPtr<ast::Expr>,
+        asm: ast::AsmExpr<'_>,
+        syntax_ptr: ExprPtr,
     ) -> ExprId {
         let mut clobber_abis = FxIndexSet::default();
         // alloc: the operand list, once per `asm!` call; it becomes the boxed slice it stores.
@@ -31,12 +34,12 @@ impl ExprCollector<'_> {
         let mut named_args: FxHashMap<Symbol, usize> = Default::default();
         let mut reg_args: FxHashSet<usize> = Default::default();
         for piece in asm.asm_pieces() {
-            if !self.check_cfg(&piece) {
+            if !self.check_cfg(piece) {
                 continue;
             }
 
             let slot = operands.len();
-            let mut lower_reg = |reg: Option<ast::AsmRegSpec>| {
+            let mut lower_reg = |reg: Option<ast::AsmRegSpec<'_>>| {
                 let reg = reg?;
                 if let Some(string) = reg.string_token() {
                     reg_args.insert(slot);
@@ -177,9 +180,9 @@ impl ExprCollector<'_> {
                             }
                             ast::AsmOperand::AsmSym(s) => {
                                 let Some(path) = s.path().and_then(|p| {
-                                    self.lower_path(
+                                    self.lower_path_view(
                                         p,
-                                        &mut ExprCollector::impl_trait_error_allocator,
+                                        &mut ImplTraitLowering::Error,
                                     )
                                 }) else {
                                     continue;
@@ -201,7 +204,7 @@ impl ExprCollector<'_> {
         let mut template = Some(Vec::new());
         if options.contains(AsmOptions::RAW) {
             for it in asm.template() {
-                if !self.check_cfg(&it) {
+                if !self.check_cfg(it) {
                     continue;
                 }
                 let text = self
@@ -222,11 +225,10 @@ impl ExprCollector<'_> {
             asm.template()
                 .enumerate()
                 .filter_map(|(idx, it)| {
-                    if !self.check_cfg(&it) {
+                    if !self.check_cfg(it) {
                         return None;
                     }
-                    // clone: a syntax node's count bump, once per template string.
-                    Some((idx, it.clone(), self.expand_macros_to_string(it)?))
+                    Some((idx, it, self.expand_macros_to_string(it)?))
                 })
                 .for_each(|(idx, expr, (s, is_direct_literal))| {
                     if record {
@@ -247,7 +249,7 @@ impl ExprCollector<'_> {
                     let template_snippet = match expr {
                         ast::Expr::Literal(literal) => match literal.kind() {
                             // alloc: the parser takes an owned snippet, once per template string.
-                        ast::LiteralKind::String(s) => Some(s.text().to_owned()),
+                            ast::LiteralKind::String(s) => Some(s.text().to_owned()),
                             _ => None,
                         },
                         _ => None,

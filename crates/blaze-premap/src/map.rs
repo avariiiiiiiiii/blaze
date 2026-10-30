@@ -22,7 +22,8 @@ impl Memory {
     pub fn of(view: &View<'_>) -> Result<Memory, PremapError> {
         let meta = view.meta();
         let len = view.end() - meta.base;
-        let name = format!("blaze-premap-{}", hex(&meta.key.0.0[..8]));
+        let mut name = String::from("blaze-premap-"); // alloc: setup, once per image: its memory object's name
+        blaze_format::hex::encode_into(&meta.key.0.0[..8], &mut name);
         let mut memory = CodeMemory::new(&name, len, 0)?;
         let page = memory.page();
         if meta.base % page != 0 {
@@ -78,13 +79,4 @@ impl Memory {
     pub fn bytes(&self, range: CodeRange) -> Result<&[u8], PremapError> {
         Ok(self.memory.bytes(range)?)
     }
-}
-
-fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(out, "{byte:02x}");
-    }
-    out
 }

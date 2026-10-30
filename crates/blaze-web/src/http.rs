@@ -13,6 +13,7 @@ use std::{
 };
 
 use base64::Engine as _;
+use blaze_protocol::write_both;
 use sha1::{Digest, Sha1};
 
 use crate::{Graphs, Next};
@@ -369,23 +370,6 @@ fn head(out: &mut Vec<u8>, opcode: u8, len: usize) {
             out.extend((len as u64).to_be_bytes());
         }
     }
-}
-
-/// `first` then `then`, in one write when the stream takes both.
-fn write_both(to: &mut impl Write, mut first: &[u8], mut then: &[u8]) -> io::Result<()> {
-    while !first.is_empty() {
-        match to.write_vectored(&[io::IoSlice::new(first), io::IoSlice::new(then)]) {
-            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
-            Ok(n) if n < first.len() => first = &first[n..],
-            Ok(n) => {
-                then = &then[n - first.len()..];
-                first = &[];
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(error) => return Err(error),
-        }
-    }
-    to.write_all(then)
 }
 
 /// Writes one unmasked frame of `opcode`, as a server does.

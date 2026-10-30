@@ -150,8 +150,7 @@ pub(crate) fn accept(state: &mut State, cx: &mut Accept<'_, '_, '_>, args: &ArgP
         ["const_continue"] => no_args(cx, args, other("ConstContinue")),
         ["coroutine"] => no_args(cx, args, other("Coroutine")),
         ["repr"] => {
-            let reprs = repr(cx, args);
-            state.repr.extend(reprs);
+            repr(cx, args, &mut state.repr);
             Accepted::Group("repr")
         }
         ["rustc_align"] => {
@@ -217,7 +216,9 @@ pub(crate) fn check(group: GroupId, first: usize, fx: &mut Finalize<'_, '_, '_>,
                     "panic_handler" => "`#[panic_handler]`",
                     _ => "lang item",
                 };
+                // alloc: the error's message
                 let mut diag = Diag::error(None, format!("`#[target_feature]` cannot be applied to a {what} function"), fx.attr_span(first));
+                // alloc: the error's label
                 diag.span_label(fx.target_span(), format!("{what} function is not allowed to have `#[target_feature]`"));
                 fx.emit_err(diag);
             }
@@ -287,11 +288,13 @@ fn export_name(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> 
 fn objc(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, what: &str) -> Option<Parsed> {
     let nv = cx.expect_name_value(args, cx.attr_range(), None)?;
     let Some(value) = nv.value_as_str() else {
+        // alloc: the error's message
         let diag = cx.err(None, format!("`objc::{what}!` expected a string literal"), nv.value_range());
         cx.emit_err(diag);
         return None;
     };
     if value.contains('\0') {
+        // alloc: the error's message
         let diag = cx.err(None, format!("`objc::{what}!` may not contain null characters"), nv.value_range());
         cx.emit_err(diag);
         return None;
@@ -345,7 +348,9 @@ fn naked_compatible(fx: &mut Finalize<'_, '_, '_>, naked: usize) {
             continue;
         }
         let path_span = fx.span(index, attr.path_range());
+        // clone: the error's span
         let mut diag = Diag::error(Some("E0736"), "attribute incompatible with `#[unsafe(naked)]`", path_span.clone());
+        // alloc: the error's label
         diag.span_label(path_span, format!("the `{}` attribute is incompatible with `#[unsafe(naked)]`", attr.name()));
         diag.span_label(fx.attr_span(naked), "function marked with `#[unsafe(naked)]` here");
         fx.emit_err(diag);
@@ -476,6 +481,7 @@ fn sanitize(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
     if cx.target() == Target::Static
         && let Some((_, field)) = NAMES.iter().find(|(bit, _)| set & !ADDRESS & bit != 0)
     {
+        // alloc: the error's message
         let mut diag = cx.err(None, format!("`#[sanitize({field} = ...)]` attribute cannot be used on statics"), cx.attr_range());
         diag.help("`#[sanitize]` can be used on statics if only the address is sanitized");
         cx.emit_err(diag);
@@ -644,13 +650,12 @@ fn unroll(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
 }
 
 /// `ReprParser::extend`: each hint of one `#[repr(..)]`, with its target errors.
-fn repr(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Vec<(Repr, TextRange)> {
-    let Some(list) = cx.expect_list(args, cx.attr_range()) else { return Vec::new() };
+fn repr(cx: &mut Accept<'_, '_, '_>, args: &ArgParser, reprs: &mut Vec<(Repr, TextRange)>) {
+    let Some(list) = cx.expect_list(args, cx.attr_range()) else { return };
     if list.is_empty() {
         cx.check_target("()", Targets::AllowList(DATA));
-        return Vec::new();
+        return;
     }
-    let mut reprs = Vec::new();
     for param in list.mixed() {
         let Some(item) = param.meta_item() else {
             cx.expected_identifier(param.range());
@@ -660,7 +665,6 @@ fn repr(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Vec<(Repr, TextRange)>
             reprs.push((repr, param.range()));
         }
     }
-    reprs
 }
 
 const DATA: &[Policy] = &[
@@ -673,6 +677,9 @@ const DATA: &[Policy] = &[
 /// `parse_repr`.
 fn repr_hint(cx: &mut Accept<'_, '_, '_>, param: &MetaItem) -> Option<Repr> {
     const INTS: &[&str] = &["i8", "u8", "i16", "u16", "i32", "u32", "i64", "u64", "i128", "u128", "isize", "usize"];
+    /// Each of `INTS` as `check_target` writes its arguments.
+    const INT_ARGS: [&str; 12] =
+        ["(i8)", "(u8)", "(i16)", "(u16)", "(i32)", "(u32)", "(i64)", "(u64)", "(i128)", "(u128)", "(isize)", "(usize)"];
     let hint = param.path.word_sym();
     match hint {
         Some("align") => {
@@ -699,7 +706,12 @@ fn repr_hint(cx: &mut Accept<'_, '_, '_>, param: &MetaItem) -> Option<Repr> {
             }
         }
         Some(name @ ("Rust" | "C" | "transparent")) => {
-            cx.check_target(&format!("({name})"), Targets::AllowList(DATA));
+            let args = match name {
+                "Rust" => "(Rust)",
+                "C" => "(C)",
+                _ => "(transparent)",
+            };
+            cx.check_target(args, Targets::AllowList(DATA));
             cx.expect_no_args(&param.args)?;
             Some(match name {
                 "Rust" => Repr::Rust,
@@ -714,14 +726,16 @@ fn repr_hint(cx: &mut Accept<'_, '_, '_>, param: &MetaItem) -> Option<Repr> {
             Some(Repr::Simd)
         }
         Some(int) if INTS.contains(&int) => {
+            let at = INTS.iter().position(|it| *it == int).expect("`INTS` has the hint");
             cx.check_target(
-                &format!("({int})"),
+                INT_ARGS[at],
                 Targets::AllowList(&[Policy::Allow(Target::Enum), Policy::Warn(Target::MacroCall)]),
             );
             cx.expect_no_args(&param.args)?;
-            Some(Repr::Int(int.to_owned()))
+            Some(Repr::Int(INTS[at]))
         }
         _ => {
+            // alloc: the error's expected names
             let mut possibilities = vec!["align", "packed", "Rust", "C", "simd", "transparent"];
             possibilities.extend_from_slice(INTS);
             cx.expected_specific_argument(param.range(), &possibilities);
@@ -748,21 +762,26 @@ fn alignment(cx: &mut Accept<'_, '_, '_>, lit: &crate::checks::attrs::args::Lit)
     let error = match lit.int() {
         Some(value) if lit.suffix.is_none() => {
             if !value.is_power_of_two() {
+                // alloc: the error's reason
                 "not a power of two".to_owned()
             } else if value > 1 << 29 {
+                // alloc: the error's reason
                 "larger than 2^29".to_owned()
             } else {
                 let max = cx.session.target.pointer_width.map(|it| (1u128 << (it - 1)) - 1);
                 match max {
                     Some(max) if value > max => {
+                        // alloc: the error's reason
                         format!("alignment larger than `isize::MAX` bytes ({max} for the current target)")
                     }
                     _ => return Some(value as u64),
                 }
             }
         }
+        // alloc: the error's reason
         _ => "not an unsuffixed integer".to_owned(),
     };
+    // alloc: the error's message
     let diag = cx.err(Some("E0589"), format!("invalid alignment value: {error}"), lit.range);
     cx.emit_err(diag);
     None
@@ -992,7 +1011,8 @@ fn link_kind(cx: &mut Accept<'_, '_, '_>, value: &str, range: TextRange) -> Opti
 
 /// The errors of `modifiers = ".."`.
 fn link_modifiers(cx: &mut Accept<'_, '_, '_>, modifiers: &str, range: TextRange, kind: Option<LinkKind>) {
-    let mut seen: Vec<&str> = Vec::new();
+    // Each of the five modifiers `assign` is given at most once.
+    let (mut seen, mut count) = ([""; 5], 0);
     for modifier in modifiers.split(',') {
         let Some(name) = modifier.strip_prefix(['+', '-']) else {
             let diag = cx.err(
@@ -1004,11 +1024,13 @@ fn link_modifiers(cx: &mut Accept<'_, '_, '_>, modifiers: &str, range: TextRange
             continue;
         };
         let mut assign = |cx: &mut Accept<'_, '_, '_>, name: &'static str| {
-            if seen.contains(&name) {
+            if seen[..count].contains(&name) {
+                // alloc: the error's message
                 let diag = cx.err(None, format!("multiple `{name}` modifiers in a single `modifiers` argument"), range);
                 cx.emit_err(diag);
             } else {
-                seen.push(name);
+                seen[count] = name;
+                count += 1;
             }
         };
         let is_static = kind == Some(LinkKind::Static);
@@ -1062,6 +1084,7 @@ fn link_section(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed>
         let _segment = parts.next();
         let reason = match parts.next() {
             None | Some("") => Some(None),
+            // alloc: the error's section name
             Some(section) if section.len() > 16 => Some(Some(section.to_owned())),
             Some(_) => None,
         };
@@ -1074,6 +1097,7 @@ fn link_section(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed>
                     diag.help("an example of a valid Mach-O section specifier is `__TEXT,__cstring`");
                 }
                 Some(section) => {
+                    // alloc: the error's note
                     diag.note(format!("section name `{section}` is longer than 16 bytes"));
                 }
             }
@@ -1087,6 +1111,7 @@ fn link_section(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed>
 fn link_ordinal(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
     let ordinal = single_integer(cx, args)?;
     if u16::try_from(ordinal).is_err() {
+        // alloc: the error's message
         let mut diag = cx.err(None, format!("ordinal value in `link_ordinal` is too large: `{ordinal}`"), cx.attr_range());
         diag.note("the value may not exceed `u16::MAX`");
         cx.emit_err(diag);
@@ -1247,6 +1272,7 @@ fn custom_mir(cx: &mut Accept<'_, '_, '_>, args: &ArgParser) -> Option<Parsed> {
             if dialect == "built" || dialect == "analysis" && phase == "optimized" =>
         {
             failed = true;
+            // alloc: the error's message
             let mut diag = cx.err(None, format!("the {dialect} dialect is not compatible with the {phase} phase"), cx.attr_range());
             diag.span_label(cx.span(*dialect_range), "this dialect...");
             diag.span_label(cx.span(phase_range), "... is not compatible with this phase");

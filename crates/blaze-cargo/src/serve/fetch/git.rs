@@ -17,6 +17,7 @@ use std::{
 
 use anyhow::{Context as _, bail};
 use blaze_api::ApiError;
+use blaze_registry::http::Http;
 use blaze_source::{GitReference, SourceId};
 use blaze_units::query::Fetch;
 use blaze_vfs::Mode;
@@ -24,7 +25,7 @@ use blaze_vfs::Mode;
 use super::{Fetcher, failed};
 use crate::serve::work::{Source, SourceFile};
 
-pub(super) fn tree(fetcher: &Fetcher, fetch: &Fetch, commit: &str) -> Result<Source, ApiError> {
+pub(super) fn tree<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commit: &str) -> Result<Source, ApiError> {
     let commit = commit.to_ascii_lowercase();
     let short = commit.get(..8).unwrap_or(&commit);
     let top = format!("Unable to update {}#{short}", fetch.url);
@@ -32,7 +33,7 @@ pub(super) fn tree(fetcher: &Fetcher, fetch: &Fetch, commit: &str) -> Result<Sou
     Ok(Source { files, under: String::new() })
 }
 
-fn checkout(fetcher: &Fetcher, fetch: &Fetch, commit: &str) -> anyhow::Result<Vec<SourceFile>> {
+fn checkout<H: Http + 'static>(fetcher: &Fetcher<H>, fetch: &Fetch, commit: &str) -> anyhow::Result<Vec<SourceFile>> {
     if !(matches!(commit.len(), 40 | 64) && commit.bytes().all(|it| it.is_ascii_hexdigit())) {
         bail!("the locked revision `{commit}` is not a full commit id");
     }

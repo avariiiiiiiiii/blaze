@@ -103,7 +103,7 @@ impl<'db> Expr<'db> {
     pub fn gen_source_code(
         &self,
         sema_scope: &SemanticsScope<'db>,
-        many_formatter: &mut dyn FnMut(&Type<'db>) -> String,
+        many_formatter: &mut impl FnMut(&Type<'db>) -> String,
         cfg: FindPathConfig,
         display_target: DisplayTarget,
     ) -> Result<String, DisplaySourceCodeError> {

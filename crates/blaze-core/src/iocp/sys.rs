@@ -35,6 +35,9 @@ pub(super) const KEY_WAKE: usize = 1;
 /// A spawn's process ended: its `lpOverlapped` carries the bits of the spawn's handle, not an
 /// address.
 pub(super) const KEY_EXIT: usize = 2;
+/// The warm launcher's process ended: its `lpOverlapped` carries the bits of the launcher's
+/// handle, not an address.
+pub(super) const KEY_WARM: usize = 3;
 /// Keys from here are a job's: the bits of its spawn's handle, which are at least 2^32 (a live
 /// handle's generation is odd), so above every key before. Its `lpOverlapped` is a process id
 /// and its byte count the message (`JOB_OBJECT_MSG_*`), neither of them an address.
@@ -66,6 +69,55 @@ pub(super) fn wide(s: &OsStr) -> io::Result<Vec<u16>> {
     }
     wide.push(0);
     Ok(wide)
+}
+
+/// A NUL-terminated wide string of fewer than `N` units, made on the stack: a name a call takes
+/// once per spawn, made without allocating.
+pub(super) struct WideName<const N: usize> {
+    units: [u16; N],
+    len: usize,
+}
+
+impl<const N: usize> WideName<N> {
+    pub(super) fn new() -> WideName<N> {
+        WideName { units: [0; N], len: 0 }
+    }
+
+    pub(super) fn text(&mut self, text: &str) -> &mut WideName<N> {
+        for unit in text.encode_utf16() {
+            self.push(unit);
+        }
+        self
+    }
+
+    pub(super) fn number(&mut self, mut n: u64) -> &mut WideName<N> {
+        let mut digits = [0u16; 20];
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b'0' as u16 + (n % 10) as u16;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        for &unit in &digits[at..] {
+            self.push(unit);
+        }
+        self
+    }
+
+    fn push(&mut self, unit: u16) {
+        // The last unit stays the NUL.
+        assert!(self.len + 1 < N, "a name past the {N} units made for it");
+        self.units[self.len] = unit;
+        self.len += 1;
+    }
+
+    /// The name and its NUL.
+    pub(super) fn as_ptr(&self) -> *const u16 {
+        self.units.as_ptr()
+    }
 }
 
 /// `path` made absolute, `\`-separated and verbatim (`\\?\`), so no length limit or
@@ -421,4 +473,29 @@ pub(super) fn post(port: HANDLE, key: usize, bytes: u32, carried: usize) -> io::
     // SAFETY: an open port; `carried` is handed back as it is, and only a `KEY_IO` packet's
     // is read through, which is a head's.
     check(unsafe { PostQueuedCompletionStatus(port, bytes, key, carried as *const OVERLAPPED) })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A name made on the stack is what `format!` and [`wide`] make of the same parts, and
+    /// allocates nothing.
+    #[test]
+    fn a_wide_name_is_the_formatted_one() {
+        let mut rng = crate::sim::Rng::new(7);
+        for _ in 0..1000 {
+            let (pid, n, count) = (rng.next_u64() as u32, rng.next_u64() >> rng.below(64), rng.below(1000));
+            let (name, used) = blaze_alloc_count::measure(|| {
+                let mut name = WideName::<128>::new();
+                name.text(r"\\.\pipe\blaze-").number(u64::from(pid)).text("-").number(n).text("-out-").number(count);
+                name
+            });
+            assert_eq!(used.allocations, 0);
+            let wanted = wide(OsStr::new(&format!(r"\\.\pipe\blaze-{pid}-{n}-out-{count}"))).unwrap();
+            // SAFETY: the name's units, NUL-terminated within its room.
+            let made = unsafe { std::slice::from_raw_parts(name.as_ptr(), wanted.len()) };
+            assert_eq!(made, &wanted[..]);
+        }
+    }
 }

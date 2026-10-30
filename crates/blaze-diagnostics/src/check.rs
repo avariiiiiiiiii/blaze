@@ -17,7 +17,7 @@ use std::hash::{Hash, Hasher};
 use base_db::Db;
 use blaze_ids::radix;
 use blaze_mem::{Frame, Tag, frame};
-use hir::Semantics;
+use hir::{Semantics, check::bodies::Plan};
 use rustc_hash::FxHashSet;
 
 use crate::{
@@ -58,18 +58,43 @@ pub fn check_crate_with<'db>(
     files: Files<'_>,
     options: &Options,
 ) -> Vec<Diag> {
-    frame::task(Tag::Diagnostics, |frame| run(sema, krate, files, options, frame))
+    let plan = Plan::new(sema.db, &[krate], &hir::check::every_body);
+    frame::task(Tag::Diagnostics, |frame| run(sema, krate, files, options, &plan, frame))
 }
 
-/// The check of `krate`, its tables in `frame`.
-fn run(sema: &Semantics<'_>, krate: hir::Crate, files: Files<'_>, options: &Options, frame: &Frame) -> Vec<Diag> {
+/// [`check_crate`], its bodies checked by `plan`, a plan of `krate` alone with every body: what
+/// a build checks beside its codegen, which tells the plan the bodies it reaches
+/// ([`Plan::reached`]) so those are checked first. The same diagnostics as [`check_crate`].
+pub fn check_planned(
+    db: &Db,
+    krate: hir::Crate,
+    plan: &Plan<'_, impl Fn(hir::DefWithBody) -> bool + Sync + ?Sized>,
+    files: Files<'_>,
+    options: &Options,
+) -> Vec<Diag> {
+    let sema = Semantics::new(db);
+    frame::task(Tag::Diagnostics, |frame| run(&sema, krate, files, options, plan, frame))
+}
+
+/// The check of `krate`, its tables in `frame`, its bodies by `plan`.
+fn run(
+    sema: &Semantics<'_>,
+    krate: hir::Crate,
+    files: Files<'_>,
+    options: &Options,
+    plan: &Plan<'_, impl Fn(hir::DefWithBody) -> bool + Sync + ?Sized>,
+    frame: &Frame,
+) -> Vec<Diag> {
     let cx = Cx::new(sema, krate, files, frame).with_lints(&options.lints);
     let parsed = lower::parse::parsed(&cx);
     if parsed.fatal {
+        // alloc: a file that does not parse, the error path
         return written(parsed.found.into_iter().map(|it| it.diag).collect(), options);
     }
     let mut found: Vec<Found> = parsed.found;
-    for diagnostic in hir::check::check_crate(cx.db, krate, false, None) {
+    let mut checked = plan.run(cx.db, false);
+    assert_eq!(checked.len(), 1, "a plan of the one crate checked");
+    for diagnostic in checked.pop().expect("a plan of one crate") {
         found.extend(lower::lower(&cx, diagnostic));
     }
     found.extend(checks::check(&cx));
@@ -99,7 +124,7 @@ fn run(sema: &Semantics<'_>, krate: hir::Crate, files: Files<'_>, options: &Opti
 /// error, lints denied included.
 fn unstashed(stashed: Vec<Found>, written: &[Diag]) -> Vec<Diag> {
     if written.iter().any(Diag::is_error) {
-        return Vec::new();
+        return Vec::new(); // alloc: empty, allocates nothing
     }
     stashed
         .into_iter()
@@ -111,7 +136,7 @@ fn unstashed(stashed: Vec<Found>, written: &[Diag]) -> Vec<Diag> {
             );
             it.diag
         })
-        .collect()
+        .collect() // alloc: the stashed warnings written; none on a clean crate, which allocates nothing
 }
 
 /// Whether rustc stops before its late passes for `found`: an error that is not a lint's
@@ -161,15 +186,15 @@ type Key = [u8; 16];
 
 /// BLAKE3 over `it`'s `Hash` form, cut to 128 bits.
 fn key(it: &impl Hash) -> Key {
-    let mut hasher = Blake3(blake3::Hasher::new());
+    let mut hasher = Blake3(blaze_ids::b3::Hasher::new());
     it.hash(&mut hasher);
     let mut key = [0; 16];
-    key.copy_from_slice(&hasher.0.finalize().as_bytes()[..16]);
+    key.copy_from_slice(&hasher.0.finalize()[..16]);
     key
 }
 
 /// A [`Hasher`] that feeds BLAKE3.
-struct Blake3(blake3::Hasher);
+struct Blake3(blaze_ids::b3::Hasher);
 
 impl Hasher for Blake3 {
     fn write(&mut self, bytes: &[u8]) {
@@ -178,7 +203,7 @@ impl Hasher for Blake3 {
 
     fn finish(&self) -> u64 {
         let mut word = [0; 8];
-        word.copy_from_slice(&self.0.finalize().as_bytes()[..8]);
+        word.copy_from_slice(&self.0.finalize()[..8]);
         u64::from_le_bytes(word)
     }
 }

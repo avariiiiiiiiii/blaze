@@ -28,6 +28,7 @@ lands, `interner.rs` fails to compile on `reinit_cache` and nothing else. A no-o
 comment is all that needs to change.)
 
 > forwarded to db: db-ty-types' `interner.rs`, inside lane db.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree: `rg reinit_cache crates vendor` finds nothing (db-ty-types' "Applied requests of others" in `db-ty-types.md` says the same).
 
 ## 2. Lane db, `vendor/rustc_type_ir/src/search_graph/global_cache.rs`: goals and results as `u32`s
 
@@ -341,6 +342,7 @@ asserts. `NestedGoals`' private field is visible here: `global_cache` is a child
 `search_graph`.
 
 > forwarded to db: `vendor/rustc_type_ir` is lane db's.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree, and overtaken by its successor: `vendor/rustc_type_ir/src/search_graph/global_cache.rs` has goals and results as `Interned` `u32`s with nested goals in a side column, now in request 4 step 3's lock-free form (published rows, `Chunked` levels, `&self` reads).
 
 ## 3. db-ty-hir (sibling), `crates/hir/src/tests.rs`: a fixture test of the shared solver cache
 
@@ -365,6 +367,7 @@ per-thread cache's). This one checks the same through the real solver. hir-ty ha
 database of its own (shared rule 5).
 
 > forwarded to db: db-ty-hir's `crates/hir/src/tests.rs`, inside lane db.
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir/src/tests.rs:452` (`a_solved_goal_answers_the_same_from_the_cache_and_on_another_thread`: cold per goal, warm twice, then in `std::thread::scope`).
 
 ## 4. Lane db (db-salsa, then db-ty-types, rustc_type_ir): share solved goals across queries, as rustc does
 
@@ -418,3 +421,4 @@ them once per session. With 1 to 4, blaze solves them once per revision across e
 with lock-free reads where rustc takes a lock. That beats the benchmark on both counts.
 
 > forwarded to db: a design inside lane db (db-salsa, db-ty-types, `rustc_type_ir`).
+> checked by db-audit-dbsub-tysmall (22:33): in the tree, all four steps: `vendor/salsa/src/capture.rs`; `type DepNodeIndex = Option<salsa::Reads>` with `capture_reads`/`replay_reads` in `crates/hir-ty/src/next_solver/interner.rs:1176-1261`; the lock-free `GlobalCache` in `vendor/rustc_type_ir/src/search_graph/global_cache.rs`; the shared cache keyed by `Scope { nonce, krate, regions }` in `interner/tls_cache.rs:152-164`.

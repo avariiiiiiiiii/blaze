@@ -2420,20 +2420,20 @@ mod tests {
         let mut line = String::new();
         BufReader::new(&asked).read_line(&mut line).unwrap();
         assert!(!waiting.is_finished(), "the check did not wait for its checker");
-        let within = |what: &'static str, ask: Box<dyn FnOnce() -> Reply + Send>| {
+        fn within(what: &'static str, ask: impl FnOnce() -> Reply + Send + 'static) -> Reply {
             let (to, told) = std::sync::mpsc::channel();
             std::thread::spawn(move || _ = to.send(ask()));
             told.recv_timeout(Duration::from_secs(10))
                 .unwrap_or_else(|_| panic!("{what} waited for another build's check"))
-        };
+        }
         let status = {
             let daemon = daemon.clone();
-            within("`blaze status`", Box::new(move || daemon.handle(Request::Status)))
+            within("`blaze status`", move || daemon.handle(Request::Status))
         };
         assert!(matches!(status, Reply::Status(Status { ref workers, .. }) if workers.len() == 2));
         let other = {
             let daemon = daemon.clone();
-            within("a check of another build", Box::new(move || daemon.check(&answers, "check")))
+            within("a check of another build", move || daemon.check(&answers, "check"))
         };
         assert!(matches!(other, Reply::Checked { errors: None }), "{other:?}");
         // The stuck one hangs up, which ends its check.

@@ -116,6 +116,19 @@ the task's peak:
 
 > forwarded to mem (from requests, pass 17; told by tmux).
 
+> mem (2026-10-29): handed to child `mem-frame`, which owns `frame.rs` for now. It adds
+> `frame::measure` and applies its use in `blaze_graph::exec::measured`.
+
+> done by mem-frame (2026-10-29), not yet built: `pub fn frame::measure<R>(f) -> (R, usize)` as
+> asked. It is counted when a task ends and when a measure ends (a few thread-local loads and
+> stores), never per allocation, and allocates nothing. A nested task's peak counts on top of
+> what its enclosing frames used when it began. An outer frame that grows while an inner task
+> runs is added on top of that, so the measure errs high, never low. `exec::measured` is now
+> `let ((did, bytes), frames) = frame::measure(|| arena::measure(|| frame::task(admission::tag_of(live.kind), |_| runner.run(&live.work))))`,
+> `peak = bytes + frames as u64`. Test:
+> `frame_measure_counts_inner_tasks_on_top_of_outer_and_allocates_nothing`
+> (`crates/blaze-mem/src/tests.rs`).
+
 ## C6 (blaze-mem, lane mem): what `blaze_graph::arena::Bump` needs before it goes
 
 dedup-mem's note (v2/requests/mem.md, "copies of blaze-mem's allocators") is right that
@@ -138,12 +151,52 @@ Then `exec` runs work in `blaze_mem::frame::task(admission::tag_of(kind), |_| wo
 
 > forwarded to mem-core (from requests, pass 16; told by tmux).
 
+> mem (2026-10-29): item 1 is done as `frame::current` (and `frame::in_task`). Items 2 and 3
+> (NUMA placement, the cap) and the move that deletes `arena::{Bump, task, with, ..}` are with
+> child `mem-frame`. blaze-graph is free (core is DONE).
+
+> done by mem-frame (2026-10-29), not yet built:
+> - **NUMA.** `Region::reserve_on`, `Region::reserve_huge_on`, `Region::bind_node(node)` and
+>   `Region::node()`. What each system does, with no other path: on Linux, `mbind` with
+>   `MPOL_PREFERRED` over the whole reservation; a kernel without NUMA (`ENOSYS`) is accepted
+>   for node 0 only, and a decommit re-applies the node. On Windows a range's node is chosen
+>   when it is reserved (`VirtualAllocExNuma`), so `bind_node` on a region reserved elsewhere is
+>   an error unless the machine has one node and that node is 0. macOS and wasm have one memory
+>   node: node 0 is accepted, any other is an error. Chunks have a space per place (unplaced,
+>   then nodes 0 to 15, each reserved on its node), and `chunks::set_thread_node(Some(node))`
+>   places a thread's chunks and spans there. A pool worker bound on Linux sets its CPU's node
+>   (`pool.rs` `bind_to`), and a failure to place it fails the worker's start like a failed
+>   bind.
+> - **The cap.** It moved to `blaze_mem::frame::{Cap, Spills, Grant, Cancelled, set_cap, cap}`
+>   with `arena::Cap`'s semantics: past `spill_at`, `Spills` hears the bytes over it once per
+>   pass; a reserve over the limit waits; when every holder waits, the newest waiter that holds
+>   bytes is cancelled; a reserve of more than the whole limit panics. A thread holding bytes
+>   reserves with one compare-and-swap and gives back with one subtraction; the lock is taken
+>   only to start or end a holding, to wait, and to give back while someone waits. A task
+>   frame reserves its chunks past the thread's first `SHELF` (8), and its spans' committed
+>   pages. A frame the cap cancels unwinds with `frame::Cancelled` from inside the allocation
+>   that waited. `Scheduler::with_pool` installs a cap of the budget's `share(Tag::Frames)`
+>   (32/64) when the plane has a budget, with nothing listening to spills (frame memory is
+>   freed when its task ends). `run_pooled` and `run_io` post a task cancelled this way again,
+>   as one that returned `Err(Cancelled)`. `drive` reruns it on the same thread.
+> - **The move.** `exec` runs work in `frame::task(admission::tag_of(kind), |_| ..)`, and
+>   `drive` in `frame::task(Tag::Other, ..)`, since a machine node has no task kind.
+>   `blaze_graph::arena` keeps only `Counting`, `measure`, `held`, `own` and `machine_budget`.
+>   `Bump`, `task`, `with`, `Chunk`, `SPARE`, `TASK`, `Cap`, `Spills`, `Grant`, the chunk mapping
+>   and binding, their tests and the `blaze_check` model of `Cap` are deleted, along with
+>   `admission::Arena`. `rg 'arena::(with|task|Bump)' crates` finds nothing.
+
 ## mem-core-macos: a `Handle::from_bits` with an even generation reads a freed slot (blaze-mem)
 
 From `mem-core-macos` (report `/tmp/blaze-lanes/v2-mem-core-macos.md`), for whoever owns `crates/blaze-mem/src/handle.rs`. A slot's generation is even while free (and 0 once retired), and `Slab::get`, `get_mut`, `remove` and `contains` compare only `entry.generation == handle.generation`. A handle from `Handle::from_bits` with an even generation therefore matches a free or retired slot, and `get` then `assume_init`s a value already moved out: undefined behavior from safe code. Fix: match only odd generations, `entry.generation == handle.generation && handle.generation & 1 == 1` (or check in `from_bits`, returning `Option`). Test: insert, remove, then `get(Handle::from_bits(old.to_bits() + (1 << 32)))` is `None`. Until then `kqueue.rs`'s `conn_id` maps even generations to a slot no lookup finds.
 
 > forwarded to mem-core (from requests, pass 16; told by tmux).
 > forwarded by mem-core to lane mem (`crates/blaze-mem` is its; told by tmux, window `mem-next1`). mem-core's own `from_bits` calls (wheel, exec's table and throttle) only take bits of handles they issued, so none can make an even generation.
+
+> done by mem (2026-10-29): `Slab::get`, `get_mut`, `remove` and `contains` now match only an
+> occupied (odd) generation (`Entry::holds`, `crates/blaze-mem/src/handle.rs`). Test
+> `slab_refuses_a_made_up_even_generation`: the removed slot's even generation and generation 0
+> find nothing. A made-up even generation now simply misses, so the drivers' maps need no workaround.
 
 ## mem-core-macos: `FileName::is_valid(&str)` in lib.rs (optional)
 
@@ -894,6 +947,8 @@ If it is declared as a module of the library, keep it under `#[cfg(test)]`.
 
 ## dedyn: crates/blaze-core: `Driver` is never a trait object; one `Native` driver per target (user's call, 2026-10-29)
 
+> Applied in the tree (checked by dedyn 2026-10-29 21:22).
+
 APPLIED by dedyn-graph 2026-10-29 as written (sections 1-3 and the test); `rg 'dyn\s+(crate::|blaze_core::)?Driver\b' crates` finds only the trait's doc sentence.
 
 Supersedes the `?Sized` in "## dedyn: crates/blaze-core/src/lib.rs: `run_until_idle` is generic
@@ -1022,6 +1077,8 @@ f. `src/tests.rs` `a_warm_file_cycle_allocates_only_the_reads_bytes`:
 After this `rg -n 'dyn\s+(crate::|blaze_core::)?Driver\b' crates` finds nothing.
 
 ## dedyn: crates/blaze-core/src/uring.rs: io_uring refused is an error naming the errno, the likely cause and the fix (user's call, 2026-10-29)
+
+> Applied in the tree (mem-core-dedyn): `setup_refused` in `uring.rs`.
 
 APPLIED by dedyn-graph 2026-10-29: `Ring::new` as in section 1 and both tests as in section 3. `setup_refused` gives the same text, but it writes into one `String` with `write!` instead of the `format!`/`to_owned` per arm, so the error path is one allocation and hot_lint stays clean (`fmt::Write as _` imported).
 

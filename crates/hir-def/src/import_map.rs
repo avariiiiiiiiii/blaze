@@ -4,7 +4,7 @@ use std::{cmp::Ordering, fmt};
 
 use base_db::{Db, Crate};
 use blaze_ids::bits::BitSet;
-use fst::{Automaton, Streamer, raw::IndexedValue};
+use blaze_mem::Frame;
 use hir_expand::name::Name;
 use indexmap::IndexSet;
 use rustc_hash::{FxBuildHasher, FxHashSet};
@@ -46,8 +46,8 @@ const _: () = assert!(size_of::<ImportInfo>() == 24);
 /// Columns over a row per item, in the order the collection first meets each item: `items` (the
 /// key with its hash, found in one probe), the row's infos as a CSR range of `infos`, and a bit
 /// for "associated item of a trait". A row costs its set entry and index slot (about 34 bytes)
-/// and 4 for its CSR offset; each info 24, and 4 for its place in `importables`; plus the FST's
-/// share of the names' bytes. Nothing is allocated per row or per info.
+/// and 4 for its CSR offset; each info 24, and 4 for its place in `importables`; plus each run's
+/// lowercased name and 8 bytes for its two offsets. Nothing is allocated per row or per info.
 #[derive(Default)]
 pub struct ImportMap {
     /// Every importable item; an item's index is its row.
@@ -60,13 +60,15 @@ pub struct ImportMap {
     /// Bit `i` set: row `i` is an associated item of a trait.
     trait_assoc_items: BitSet,
     /// Indices into [`Self::infos`], sorted by their names lowercased (ASCII), ties in row
-    /// order. Indexed by the values returned by running `fst`.
-    ///
-    /// Since a name can refer to multiple items due to namespacing and import aliases, we store all
-    /// items with the same name right after each other. This allows us to find all items after the
-    /// fst gives us the index of the first one.
+    /// order, in runs of one name ([`Self::run_start`]).
     importables: Box<[u32]>,
-    fst: fst::Map<Vec<u8>>,
+    /// The name of each run of [`Self::importables`] equal up to ASCII case, lowercased, end to
+    /// end in byte order: run `r`'s is `keys[key_start[r]..key_start[r + 1]]`. Strictly
+    /// increasing, as the names are sorted.
+    keys: Box<[u8]>,
+    key_start: Box<[u32]>,
+    /// Run `r` is `importables[run_start[r]..run_start[r + 1]]`.
+    run_start: Box<[u32]>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Ord, PartialOrd)]
@@ -77,7 +79,7 @@ enum IsTraitAssocItem {
 
 #[salsa::tracked]
 impl ImportMap {
-    #[salsa::tracked(returns(ref))]
+    #[salsa::tracked(returns(ref), mem_tag = Nameres)]
     pub fn of(db: &Db, krate: Crate) -> Self {
         Self::import_map_query_impl(db, krate)
     }
@@ -85,6 +87,7 @@ impl ImportMap {
 
 impl ImportMap {
     pub fn dump(&self, db: &Db) -> String {
+        // alloc: a debug dump (the edge)
         let mut out = String::new();
         for (row, item) in self.items.iter().enumerate() {
             format_to!(out, "{:?} ({:?}) -> ", item, self.is_trait_assoc_item(row));
@@ -98,31 +101,22 @@ impl ImportMap {
 
     fn import_map_query_impl(db: &Db, krate: Crate) -> Self {
         let _p = tracing::info_span!("import_map_query").entered();
+        blaze_mem::frame::current(|frame| Self::build(db, krate, frame))
+    }
 
-        let found = Collector::collect(db, krate);
-        let rows = found.items.len();
+    fn build(db: &Db, krate: Crate, frame: &Frame) -> Self {
+        let found = Collector::collect(db, krate, frame);
+        let rows = found.rows.len();
 
         // Group the infos by row with a counting sort, which keeps the order they were found in
-        // within a row: count, prefix-sum to the starts, then place with the starts as cursors
-        // (which leaves each at its row's end) and shift them back.
-        let mut info_start = vec![0u32; rows + 1];
-        for &(row, _) in &found.infos {
-            info_start[row as usize + 1] += 1;
-        }
-        for row in 0..rows {
-            info_start[row + 1] += info_start[row];
-        }
-        let mut order = vec![0u32; found.infos.len()];
-        for (at, &(row, _)) in found.infos.iter().enumerate() {
-            let cursor = &mut info_start[row as usize];
-            order[*cursor as usize] = at as u32;
-            *cursor += 1;
-        }
-        info_start.copy_within(0..rows, 1);
-        info_start[0] = 0;
-        let infos: Box<[ImportInfo]> =
-            order.iter().map(|&at| found.infos[at as usize].1.clone()).collect();
+        // within a row. Both columns come out at their length and become the memo's.
+        // clone: an `ImportInfo` is plain data (`Name` is `Copy`), copied into the memo's column
+        let pairs = found.infos.iter().map(|(row, info)| (*row, info.clone()));
+        // alloc: the memo's offsets and infos, exact, and the sort's cursors (a u32 a row)
+        let (info_start, infos) = blaze_ids::radix::Csr::build(rows, pairs).into_parts();
+        let (info_start, infos) = (info_start.into_boxed_slice(), infos.into_boxed_slice());
 
+        // alloc: the memo's bits, exact
         let mut trait_assoc_items = BitSet::new(rows);
         for (row, &is_trait_assoc_item) in found.trait_assoc_items.iter().enumerate() {
             if is_trait_assoc_item {
@@ -130,17 +124,22 @@ impl ImportMap {
             }
         }
 
-        // Every info, in row order, stably sorted by its lowercased name. The order of UTF-8
-        // bytes is the order of chars, and lowercasing ASCII bytes leaves the others alone, so
-        // this is the FST's key order.
-        let mut importables: Vec<u32> = (0..infos.len() as u32).collect();
-        importables.sort_by(|&l, &r| {
+        // Every info, in row order, sorted by its lowercased name, ties by index: the stable
+        // order, with no merge buffer. The order of UTF-8 bytes is the order of chars, and
+        // lowercasing ASCII bytes leaves the others alone, so this is the keys' byte order.
+        // alloc: the memo's order, exact
+        let mut importables: Box<[u32]> = (0..infos.len() as u32).collect();
+        importables.sort_unstable_by(|&l, &r| {
             cmp_ascii_lowercase(infos[l as usize].name.as_str(), infos[r as usize].name.as_str())
+                .then(l.cmp(&r))
         });
 
-        // One FST key per run of names equal up to ASCII case, each written into one buffer.
-        let mut builder = fst::MapBuilder::memory();
-        let mut key = Vec::new();
+        // One key per run of names equal up to ASCII case, lowercased, end to end. A run is at
+        // least one info, and its key at most the bytes of one of their names.
+        let name_bytes: usize = infos.iter().map(|info| info.name.as_str().len()).sum();
+        let mut keys = Vec::with_capacity_in(name_bytes, frame);
+        let mut key_start = Vec::with_capacity_in(importables.len() + 1, frame);
+        let mut run_start = Vec::with_capacity_in(importables.len() + 1, frame);
         let mut start = 0;
         while start < importables.len() {
             let name = infos[importables[start] as usize].name.as_str();
@@ -150,19 +149,27 @@ impl ImportMap {
             {
                 end += 1;
             }
-            key.clear();
-            key.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
-            builder.insert(&key, ((start as u64) << 32) | end as u64).unwrap();
+            key_start.push(keys.len() as u32);
+            run_start.push(start as u32);
+            keys.extend(name.bytes().map(|b| b.to_ascii_lowercase()));
             start = end;
         }
+        key_start.push(keys.len() as u32);
+        run_start.push(importables.len() as u32);
 
+        // alloc: the memo's set, exact
+        let mut items = FxIndexSet::with_capacity_and_hasher(rows, FxBuildHasher);
+        items.extend(found.rows.iter().copied());
         ImportMap {
-            items: found.items,
-            info_start: info_start.into_boxed_slice(),
+            items,
+            info_start,
             infos,
             trait_assoc_items,
-            importables: importables.into_boxed_slice(),
-            fst: builder.into_map(),
+            importables,
+            // alloc: the memo's keys and their offsets, exact
+            keys: Box::from(&keys[..]),
+            key_start: Box::from(&key_start[..]),
+            run_start: Box::from(&run_start[..]),
         }
     }
 
@@ -177,6 +184,63 @@ impl ImportMap {
     /// The row an index into [`Self::infos`] belongs to: a binary search of the offsets.
     fn row_of_info(&self, info: u32) -> usize {
         self.info_start.partition_point(|&start| start <= info) - 1
+    }
+
+    /// How many runs of one name there are.
+    fn runs(&self) -> usize {
+        self.run_start.len().saturating_sub(1)
+    }
+
+    fn key(&self, run: usize) -> &[u8] {
+        &self.keys[self.key_start[run] as usize..self.key_start[run + 1] as usize]
+    }
+
+    fn run(&self, run: usize) -> &[u32] {
+        &self.importables[self.run_start[run] as usize..self.run_start[run + 1] as usize]
+    }
+
+    /// The first run whose key is not below `query`.
+    fn lower_bound(&self, query: &[u8]) -> usize {
+        let (mut lo, mut hi) = (0, self.runs());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.key(mid) < query {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// Each run whose key `mode` takes for `query`, lowercased: the key itself for
+    /// [`SearchMode::Exact`], a key it starts for [`SearchMode::Prefix`], a key it is a
+    /// subsequence of (by bytes) for [`SearchMode::Fuzzy`]; the runs fst's `Str`,
+    /// `Str::starts_with` and `Subsequence` automata took over the same keys, in key order.
+    fn search_runs(&self, mode: SearchMode, query: &[u8], mut each: impl FnMut(usize)) {
+        match mode {
+            SearchMode::Exact => {
+                let at = self.lower_bound(query);
+                if at < self.runs() && self.key(at) == query {
+                    each(at);
+                }
+            }
+            SearchMode::Prefix => {
+                for run in self.lower_bound(query)..self.runs() {
+                    if !self.key(run).starts_with(query) {
+                        break;
+                    }
+                    each(run);
+                }
+            }
+            SearchMode::Fuzzy => {
+                for run in 0..self.runs() {
+                    if is_subsequence(query, self.key(run)) {
+                        each(run);
+                    }
+                }
+            }
+        }
     }
 
     fn is_trait_assoc_item(&self, row: usize) -> IsTraitAssocItem {
@@ -194,36 +258,57 @@ fn cmp_ascii_lowercase(l: &str, r: &str) -> Ordering {
     l.cmp(r)
 }
 
-/// What the walk over the public modules finds, before it is laid out as columns.
-#[derive(Default)]
-struct Collector {
-    items: FxIndexSet<ItemInNs>,
-    /// Per row, whether the item is an associated item of a trait (as the first info found
-    /// for it says).
-    trait_assoc_items: Vec<bool>,
-    /// `(row, info)` in the order found.
-    infos: Vec<(u32, ImportInfo)>,
+/// Whether the bytes of `needle` appear in `hay` in order: fst's `Subsequence` automaton.
+fn is_subsequence(needle: &[u8], hay: &[u8]) -> bool {
+    let mut rest = hay;
+    needle.iter().all(|&byte| match rest.iter().position(|&it| it == byte) {
+        Some(at) => {
+            rest = &rest[at + 1..];
+            true
+        }
+        None => false,
+    })
 }
 
-impl Collector {
+/// What the walk over the public modules finds, before it is laid out as columns: the run's.
+struct Collector<'f> {
+    /// The row of each item found, in the order first met.
+    rows_of: hashbrown::HashMap<ItemInNs, u32, FxBuildHasher, &'f Frame>,
+    rows: Vec<ItemInNs, &'f Frame>,
+    /// Per row, whether the item is an associated item of a trait (as the first info found
+    /// for it says).
+    trait_assoc_items: Vec<bool, &'f Frame>,
+    /// `(row, info)` in the order found.
+    infos: Vec<(u32, ImportInfo), &'f Frame>,
+}
+
+impl<'f> Collector<'f> {
     fn add(&mut self, item: ItemInNs, is_trait_assoc_item: bool, info: ImportInfo) {
-        let (row, inserted) = self.items.insert_full(item);
-        if inserted {
+        let next = self.rows.len() as u32;
+        let row = *self.rows_of.entry(item).or_insert(next);
+        if row == next {
+            self.rows.push(item);
             self.trait_assoc_items.push(is_trait_assoc_item);
         }
-        self.infos.push((row as u32, info));
+        self.infos.push((row, info));
     }
 
-    fn collect(db: &Db, krate: Crate) -> Collector {
+    fn collect(db: &Db, krate: Crate, frame: &'f Frame) -> Collector<'f> {
         let _p = tracing::info_span!("collect_import_map").entered();
 
         let def_map = crate_def_map(db, krate);
-        let mut found = Collector::default();
+        let mut found = Collector {
+            rows_of: hashbrown::HashMap::with_hasher_in(FxBuildHasher, frame),
+            rows: Vec::new_in(frame),
+            trait_assoc_items: Vec::new_in(frame),
+            infos: Vec::new_in(frame),
+        };
 
         // We look only into modules that are public(ly reexported), starting with the crate root.
         let root = def_map.root_module_id();
-        let mut worklist = vec![root];
-        let mut visited = FxHashSet::default();
+        let mut worklist = Vec::new_in(frame);
+        worklist.push(root);
+        let mut visited = hashbrown::HashSet::with_hasher_in(FxBuildHasher, frame);
 
         while let Some(module) = worklist.pop() {
             if !visited.insert(module) {
@@ -262,7 +347,7 @@ impl Collector {
     fn visit(
         &mut self,
         db: &Db,
-        worklist: &mut Vec<ModuleId>,
+        worklist: &mut Vec<ModuleId, &'f Frame>,
         name: Name,
         module: ModuleId,
         item: ItemInNs,
@@ -396,8 +481,8 @@ impl Collector {
 }
 
 impl Eq for ImportMap {}
-/// The same items with the same infos and flags, in any row order. `fst` and `importables` are
-/// built from those, so they are not compared.
+/// The same items with the same infos and flags, in any row order. `importables` and the keys
+/// are built from those, so they are not compared.
 impl PartialEq for ImportMap {
     fn eq(&self, other: &Self) -> bool {
         self.items.len() == other.items.len()
@@ -419,11 +504,15 @@ impl fmt::Debug for ImportMap {
             .map(|(row, item)| {
                 let l = self.row_infos(row).len();
                 match item {
+                    // alloc: a debug dump (the edge)
                     ItemInNs::Types(it) => format!("- {it:?} (t) [{l}]",),
+                    // alloc: a debug dump (the edge)
                     ItemInNs::Values(it) => format!("- {it:?} (v) [{l}]",),
+                    // alloc: a debug dump (the edge)
                     ItemInNs::Macros(it) => format!("- {it:?} (m) [{l}]",),
                 }
             })
+            // alloc: a debug dump (the edge)
             .collect();
 
         importable_names.sort();
@@ -567,54 +656,40 @@ pub fn search_dependencies(
     krate: Crate,
     query: &Query,
 ) -> FxHashSet<(ItemInNs, Complete)> {
-    let _p = tracing::info_span!("search_dependencies", ?query).entered();
-
-    let import_maps: Vec<_> =
-        krate.data(db).dependencies.iter().map(|dep| ImportMap::of(db, dep.crate_id)).collect();
-
-    let mut op = fst::map::OpBuilder::new();
-
-    match query.search_mode {
-        SearchMode::Exact => {
-            let automaton = fst::automaton::Str::new(&query.lowercased);
-
-            for map in &import_maps {
-                op = op.add(map.fst.search(&automaton));
-            }
-            search_maps(db, &import_maps, op.union(), query)
-        }
-        SearchMode::Fuzzy => {
-            let automaton = fst::automaton::Subsequence::new(&query.lowercased);
-
-            for map in &import_maps {
-                op = op.add(map.fst.search(&automaton));
-            }
-            search_maps(db, &import_maps, op.union(), query)
-        }
-        SearchMode::Prefix => {
-            let automaton = fst::automaton::Str::new(&query.lowercased).starts_with();
-
-            for map in &import_maps {
-                op = op.add(map.fst.search(&automaton));
-            }
-            search_maps(db, &import_maps, op.union(), query)
-        }
-    }
+    // alloc: the caller's result, at the edge
+    let mut found = FxHashSet::default();
+    search_dependencies_into(db, krate, query, &mut found);
+    found
 }
 
-fn search_maps(
-    _db: &Db,
-    import_maps: &[&ImportMap],
-    mut stream: fst::map::Union<'_>,
+/// [`search_dependencies`] into `found`, which it adds to: with a set the caller keeps, a
+/// search allocates nothing once the set has grown to its results.
+pub fn search_dependencies_into(
+    db: &Db,
+    krate: Crate,
     query: &Query,
-) -> FxHashSet<(ItemInNs, Complete)> {
-    let mut res = FxHashSet::default();
-    while let Some((_, indexed_values)) = stream.next() {
-        for &IndexedValue { index: import_map_idx, value } in indexed_values {
-            let end = (value & 0xFFFF_FFFF) as usize;
-            let start = (value >> 32) as usize;
-            let map = import_maps[import_map_idx];
-            for &info_idx in &map.importables[start..end] {
+    found: &mut FxHashSet<(ItemInNs, Complete)>,
+) {
+    search_dependencies_each(db, krate, query, |item, complete| {
+        found.insert((item, complete));
+    });
+}
+
+/// Calls `f` on each importable name of `krate`'s dependencies that matches `query`, in the
+/// order the search finds them (dependencies in order, then each map's runs in key order, each
+/// run's infos in order); an item can come more than once.
+pub fn search_dependencies_each(
+    db: &Db,
+    krate: Crate,
+    query: &Query,
+    mut f: impl FnMut(ItemInNs, Complete),
+) {
+    let _p = tracing::info_span!("search_dependencies", ?query).entered();
+    let lowercased = query.lowercased.as_bytes();
+    for dep in krate.data(db).dependencies.iter() {
+        let map = ImportMap::of(db, dep.crate_id);
+        map.search_runs(query.search_mode, lowercased, |run| {
+            for &info_idx in map.run(run) {
                 let info = &map.infos[info_idx as usize];
                 if !query.search_mode.check(&query.query, query.case_sensitive, info.name.as_str())
                 {
@@ -622,13 +697,11 @@ fn search_maps(
                 }
                 let row = map.row_of_info(info_idx);
                 if query.matches_assoc_mode(map.is_trait_assoc_item(row)) {
-                    res.insert((map.items[row], info.complete));
+                    f(map.items[row], info.complete);
                 }
             }
-        }
+        });
     }
-
-    res
 }
 
 #[cfg(test)]
@@ -638,7 +711,11 @@ mod tests {
     use itertools::Itertools;
     use test_fixture::WithFixture;
 
-    use crate::{ItemContainerId, Lookup, nameres::assoc::TraitItems, test_db::TestDB};
+    use crate::{
+        ItemContainerId, Lookup,
+        nameres::assoc::TraitItems,
+        test_db::{TestDB, TestDBExt},
+    };
 
     use super::*;
 
@@ -1234,7 +1311,7 @@ pub mod fmt {
     /// `String` each. The model the differential test compares with.
     mod reference {
         use base_db::{Crate, Db};
-        use fst::{Automaton, Streamer, raw::IndexedValue};
+        use fst::{Automaton, IntoStreamer, Streamer, raw::IndexedValue};
         use itertools::Itertools;
         use rustc_hash::FxHashSet;
         use smallvec::SmallVec;
@@ -1524,6 +1601,62 @@ pub mod fmt {
             }
         }
 
+        /// The matches in the order fst finds them: dependencies in order, each one's keys in
+        /// order (its own FST, no union), each key's importables in order, every occurrence.
+        pub(super) fn search_each(db: &Db, krate: Crate, query: &Query) -> Vec<(ItemInNs, Complete)> {
+            let mut res = Vec::new();
+            for dep in krate.data(db).dependencies.iter() {
+                let map = build(db, dep.crate_id);
+                let lowercased = query.lowercased.as_str();
+                match query.search_mode {
+                    SearchMode::Exact => {
+                        visit_map(&map, fst::automaton::Str::new(lowercased), query, &mut res)
+                    }
+                    SearchMode::Fuzzy => visit_map(
+                        &map,
+                        fst::automaton::Subsequence::new(lowercased),
+                        query,
+                        &mut res,
+                    ),
+                    SearchMode::Prefix => visit_map(
+                        &map,
+                        fst::automaton::Str::new(lowercased).starts_with(),
+                        query,
+                        &mut res,
+                    ),
+                }
+            }
+            res
+        }
+
+        fn visit_map<A: Automaton>(
+            map: &OldImportMap,
+            automaton: A,
+            query: &Query,
+            res: &mut Vec<(ItemInNs, Complete)>,
+        ) {
+            let OldImportMap { map: index, importables, fst: keys } = map;
+            let mut stream = keys.search(automaton).into_stream();
+            while let Some((_, value)) = stream.next() {
+                let end = (value & 0xFFFF_FFFF) as usize;
+                let start = (value >> 32) as usize;
+                for &(item, info_idx) in &importables[start..end] {
+                    let (import_infos, assoc_mode) = &index[&item];
+                    let info = &import_infos[info_idx as usize];
+                    if query.matches_assoc_mode(*assoc_mode)
+                        && check(
+                            query.search_mode,
+                            &query.query,
+                            query.case_sensitive,
+                            info.name.as_str(),
+                        )
+                    {
+                        res.push((item, info.complete));
+                    }
+                }
+            }
+        }
+
         fn search_maps(
             maps: &[OldImportMap],
             mut stream: fst::map::Union<'_>,
@@ -1557,9 +1690,10 @@ pub mod fmt {
 
     /// Over seeded random crates (modules, re-exports, renames, globs, enums, traits, macros, a
     /// prelude), the columns give what the old map gave: the same rows in the same order, the
-    /// same infos and trait flags per row, the same importables and the same FST bytes; and
-    /// `search_dependencies` finds the same items for exact, prefix and fuzzy queries, either
-    /// case, in every associated-item mode.
+    /// same infos and trait flags per row, the same importables, and the FST's keys and runs in
+    /// its order; and `search_dependencies` over the sorted keys finds the same items as the
+    /// FST's union for exact, prefix and fuzzy queries, either case, in every associated-item
+    /// mode.
     #[test]
     fn differential_against_reference() {
         use crate::find_path::tests::{Shape, gen_fixture};
@@ -1591,12 +1725,23 @@ pub mod fmt {
                     })
                     .collect();
                 assert_eq!(importables, old.importables, "seed {seed}\n{fixture}");
-                assert_eq!(
-                    new.fst.as_fst().as_bytes(),
-                    old.fst.as_fst().as_bytes(),
-                    "seed {seed}\n{fixture}"
-                );
-                assert!(ImportMap::import_map_query_impl(&db, krate) == *new, "seed {seed}");
+                {
+                    use fst::Streamer;
+                    let mut stream = old.fst.stream();
+                    let mut run = 0;
+                    while let Some((key, value)) = stream.next() {
+                        assert_eq!(new.key(run), key, "seed {seed}, run {run}\n{fixture}");
+                        let bounds = (u64::from(new.run_start[run]) << 32)
+                            | u64::from(new.run_start[run + 1]);
+                        assert_eq!(bounds, value, "seed {seed}, run {run}\n{fixture}");
+                        run += 1;
+                    }
+                    assert_eq!(run, new.runs(), "seed {seed}\n{fixture}");
+                }
+                let rebuilt = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+                    ImportMap::build(&db, krate, frame)
+                });
+                assert!(rebuilt == *new, "seed {seed}");
             }
             names.sort();
             names.dedup();
@@ -1639,6 +1784,15 @@ pub mod fmt {
                             reference::search(&db, main, &query),
                             "seed {seed}, {query:?}\n{fixture}"
                         );
+                        let mut each = Vec::new();
+                        search_dependencies_each(&db, main, &query, |item, complete| {
+                            each.push((item, complete))
+                        });
+                        assert_eq!(
+                            each,
+                            reference::search_each(&db, main, &query),
+                            "seed {seed}, {query:?}\n{fixture}"
+                        );
                     }
                 }
             }
@@ -1678,5 +1832,151 @@ pub mod fmt {
                 }
             }
         }
+    }
+
+    /// `is_subsequence` takes the keys fst's `Subsequence` automaton takes, over random keys
+    /// of a small alphabet (with a multibyte char) and every short query of it.
+    #[test]
+    fn is_subsequence_against_fst() {
+        use fst::{IntoStreamer, Streamer};
+
+        let mut rng = blaze_ids::rng::SplitMix64::new(11);
+        let alphabet = ["a", "b", "_", "あ"];
+        let mut keys: Vec<String> = (0..300)
+            .map(|_| (0..rng.index(6)).map(|_| alphabet[rng.index(alphabet.len())]).collect())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        let set = fst::Set::from_iter(&keys).unwrap();
+        for query_len in 0..3 {
+            for at in 0..alphabet.len().pow(query_len) {
+                let query: String = (0..query_len)
+                    .map(|digit| alphabet[at / alphabet.len().pow(digit) % alphabet.len()])
+                    .collect();
+                let mut stream =
+                    set.search(fst::automaton::Subsequence::new(&query)).into_stream();
+                let mut taken = Vec::new();
+                while let Some(key) = stream.next() {
+                    taken.push(key.to_vec());
+                }
+                let ours: Vec<Vec<u8>> = keys
+                    .iter()
+                    .filter(|key| is_subsequence(query.as_bytes(), key.as_bytes()))
+                    .map(|key| key.as_bytes().to_vec())
+                    .collect();
+                assert_eq!(ours, taken, "{query:?}");
+            }
+        }
+    }
+
+    /// With the caller's set grown once, an exact, prefix or fuzzy search of the dependencies
+    /// allocates nothing.
+    #[test]
+    fn warm_search_allocates_nothing() {
+        let db = TestDB::with_files(
+            r#"
+//- /main.rs crate:main deps:dep
+//- /dep.rs crate:dep
+pub struct Fmt;
+pub mod fmt {
+    pub trait Display { fn fmt(&self); }
+    pub fn format() {}
+}
+"#,
+        );
+        let main = *all_crates(&db)
+            .iter()
+            .find(|krate| {
+                krate
+                    .extra_data(&db)
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|it| it.crate_name().as_str() == "main")
+            })
+            .unwrap();
+        let queries = [
+            Query::new("fmt".to_owned()),
+            Query::new("fo".to_owned()).prefix(),
+            Query::new("fmt".to_owned()).fuzzy(),
+            Query::new("FMT".to_owned()).fuzzy().case_sensitive(),
+        ];
+        let mut found = FxHashSet::default();
+        for query in &queries {
+            search_dependencies_into(&db, main, query, &mut found);
+        }
+        for query in &queries {
+            found.clear();
+            blaze_alloc_count::assert_at_most(0, "a warm import-map search", || {
+                search_dependencies_into(&db, main, query, &mut found)
+            });
+            assert_eq!(found, search_dependencies(&db, main, query), "{query:?}");
+        }
+    }
+
+    /// `search_dependencies_each` allocates nothing of its own, visits what
+    /// `search_dependencies` returns, and visits it in the same order every time, whatever
+    /// was searched before.
+    #[test]
+    fn each_is_free_and_in_a_fixed_order() {
+        let db = TestDB::with_files(
+            r#"
+//- /main.rs crate:main deps:dep,other
+//- /dep.rs crate:dep
+pub struct Fmt;
+pub mod fmt { pub fn format() {} pub use super::Fmt as Formatter; }
+//- /other.rs crate:other
+pub fn fmt() {}
+"#,
+        );
+        let main = *all_crates(&db)
+            .iter()
+            .find(|krate| {
+                krate
+                    .extra_data(&db)
+                    .display_name
+                    .as_ref()
+                    .is_some_and(|it| it.crate_name().as_str() == "main")
+            })
+            .unwrap();
+        let query = Query::new("f".to_owned()).prefix();
+        // alloc: test, room for every visit, so the measure counts only the search
+        let mut first = Vec::with_capacity(64);
+        search_dependencies_each(&db, main, &query, |item, complete| first.push((item, complete)));
+        assert!(first.len() < 64);
+        let _ = search_dependencies(&db, main, &Query::new("fmt".to_owned()).fuzzy());
+        // alloc: test, as `first`
+        let mut again = Vec::with_capacity(64);
+        blaze_alloc_count::assert_at_most(0, "a visiting import-map search", || {
+            search_dependencies_each(&db, main, &query, |item, complete| {
+                again.push((item, complete))
+            })
+        });
+        assert_eq!(first, again);
+        let visited: FxHashSet<_> = first.iter().copied().collect();
+        assert_eq!(visited, search_dependencies(&db, main, &query));
+    }
+
+    /// A build of a crate's import map, its inputs warm, allocates its nine columns and the
+    /// counting sort's cursors, and nothing else: the collection, the sort and the keys are
+    /// the frame's.
+    #[test]
+    fn build_is_its_columns() {
+        let db = TestDB::with_files(
+            r#"
+//- /main.rs crate:main
+pub struct S;
+pub enum E { A }
+pub trait T { fn m(); }
+pub mod m { pub fn f() {} pub use super::S as R; }
+"#,
+        );
+        let krate = db.fetch_test_crate();
+        let memo = ImportMap::of(&db, krate);
+        let built = blaze_mem::frame::task(blaze_mem::Tag::Nameres, |frame| {
+            blaze_alloc_count::assert_at_most(10, "an import-map build", || {
+                ImportMap::build(&db, krate, frame)
+            })
+        });
+        assert!(built == *memo);
     }
 }

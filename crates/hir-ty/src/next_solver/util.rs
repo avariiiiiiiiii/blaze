@@ -648,7 +648,7 @@ impl<'db> TypeFolder<DbInterner<'db>> for PlaceholderReplacer<'_, 'db> {
                 .inner
                 .borrow_mut()
                 .unwrap_region_constraints()
-                .opportunistic_resolve_var(self.infcx.interner, vid),
+                .shallow_resolve_region_var(self.infcx.interner, vid),
             _ => r0,
         };
 

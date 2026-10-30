@@ -18,7 +18,7 @@ use intern::Symbol;
 use span::Edition;
 use triomphe::Arc;
 
-use super::{Db, Lower, LowerError, Lowered, Ran, crates, lower};
+use super::{Db, Lower, LowerError, Lowered, Ran, crates, files, lower};
 
 const HOST: &str = "x86_64-unknown-linux-gnu";
 const LIBRARY: &str = "/rustc/abc/library";
@@ -631,6 +631,27 @@ fn a_refresh_refuses_a_root_file_gone_and_leaves_a_new_workspace_root_to_lower()
     assert!(error.what.contains("root file"), "{error}");
     let manifest: &'static [u8] = b"[workspace]\nmembers = [\"a\", \"b\", \"m\"]\n";
     assert_eq!(refresh(&[("Cargo.toml", Some(manifest))]), Ok(false), "the workspace's const-eval is every crate's");
+}
+
+#[test]
+fn a_walk_leaves_out_the_directories_skipped_and_only_those() {
+    let tree = MemTree::default();
+    let view = view(&tree);
+    let mounts = [Mount { at: "/w".to_owned(), origin: Origin::View, under: String::new() }];
+    let mounts = files::Mounts { mounts: &mounts, view, tree: &tree, read_view: std::cell::Cell::new(false) };
+    let walked = |skipped: &[String]| {
+        let mut out = Vec::new();
+        mounts.walk("/w", skipped, &mut out).unwrap();
+        out.into_iter().map(|it| it.path).collect::<Vec<_>>()
+    };
+    let every = walked(&[]);
+    assert_eq!(every.len(), FILES.len());
+    assert!(every.iter().any(|it| it == "/w/target/debug/stale.rs"));
+    assert!(mounts.read_view.get(), "the files were the view's");
+    let skipped = walked(&["/w/target".to_owned(), "/w/a/src/lib.rs".to_owned()]);
+    assert!(!skipped.iter().any(|it| it.starts_with("/w/target/") || it == "/w/a/src/lib.rs"), "{skipped:?}");
+    assert_eq!(skipped.len(), FILES.len() - 2);
+    assert_eq!(walked(&["/w/targe".to_owned()]), every, "a skipped path is a whole name, not a prefix");
 }
 
 #[test]

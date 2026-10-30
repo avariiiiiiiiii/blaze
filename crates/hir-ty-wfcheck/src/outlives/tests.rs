@@ -52,7 +52,7 @@ fn adts(db: &TestDB) -> Vec<AdtId> {
 fn field_tys<'db>(db: &'db TestDB) -> Vec<(AdtId, Ty<'db>)> {
     let mut tys = Vec::new();
     for adt in adts(db) {
-        for variant in variants(db, adt) {
+        for variant in adt.variants(db) {
             for (_, field) in db.field_types(variant).iter() {
                 tys.push((adt, field.ty().instantiate_identity().skip_norm_wip()));
             }

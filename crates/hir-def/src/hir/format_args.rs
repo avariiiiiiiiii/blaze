@@ -7,8 +7,8 @@ use rustc_parse_format as parse;
 use smallvec::{SmallVec, smallvec};
 use span::SyntaxContext;
 use syntax::{
-    AstPtr, TextRange,
-    ast::{self, IsString},
+    AstPtr, TextRange, ast,
+    view::{self, IsString as _},
 };
 
 use crate::hir::ExprId;
@@ -170,7 +170,7 @@ enum PositionUsedAs {
 use PositionUsedAs::*;
 
 pub(crate) fn parse(
-    s: &ast::String,
+    s: view::String<'_>,
     string_ptr: AstPtr<ast::Expr>,
     fmt_snippet: Option<String>,
     mut args: FormatArgumentsCollector,

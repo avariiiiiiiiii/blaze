@@ -151,5 +151,8 @@ fn color_as_cargo_decides() {
     #[cfg(not(windows))]
     assert_eq!(color(None, vars(&[("TERM", "dumb")]), true), Ok(false));
     let refused = color(None, vars(&[("CARGO_TERM_COLOR", "sometimes")]), true).unwrap_err();
-    assert!(!refused.contains("sometimes"));
+    assert_eq!(refused, "argument for --color must be auto, always, or never, but found `sometimes`");
+    // clap took `--color` in any case; cargo's `ColorChoice` takes lowercase only.
+    let refused = color(Some("ALWAYS"), vars(&[]), true).unwrap_err();
+    assert_eq!(refused, "argument for --color must be auto, always, or never, but found `ALWAYS`");
 }

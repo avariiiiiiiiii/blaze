@@ -21,9 +21,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TypedHole<'_>) -> Vec<Found> {
     let mut diag = Diag::error(
         None,
         "in expressions, `_` can only be used on the left-hand side of an assignment",
+        // clone: on the error path, for an error hir found
         span.clone(),
     );
     diag.span_label(span, "`_` not allowed here");
     code_fact(cx, &mut diag, at);
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Resolve)]
 }

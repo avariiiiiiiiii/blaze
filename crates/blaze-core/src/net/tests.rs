@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
 };
 
-use super::listen;
+use super::{Socket, listen};
 use crate::{Address, FileName};
 
 fn root(name: &str) -> PathBuf {
@@ -61,4 +61,55 @@ fn an_inherited_socket_elsewhere_or_of_another_kind_is_refused() {
     assert!(refused(&root, &inherited(1 << 20)).contains("not open"));
     assert!(!root.join("blaze.sock").exists(), "nothing is made in its place");
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+/// What a read appends is what std's safe read of the same stream gives, after the bytes the
+/// buffer kept; a buffer with room is not grown, and none is shrunk.
+#[test]
+fn a_read_appends_after_what_the_buffer_keeps_as_a_safe_read_would() {
+    use std::io::{Read as _, Write as _};
+
+    let sent = b"onetwothree";
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    let (mut theirs, mut reference) = UnixStream::pair().unwrap();
+    let ours = Socket::Unix(ours);
+    peer.write_all(sent).unwrap();
+    reference.write_all(sent).unwrap();
+    let mut into = Vec::with_capacity(64);
+    into.extend_from_slice(b"kept");
+    let room = into.capacity();
+    let mut safe = [0; 5];
+    theirs.read_exact(&mut safe).unwrap();
+    let mut got = 0;
+    while got < 5 {
+        got += ours.read_into(&mut into, 5 - got).unwrap();
+    }
+    assert_eq!(&into[..4], b"kept");
+    assert_eq!(&into[4..], &safe);
+    assert_eq!(into.capacity(), room, "a buffer with room is not grown");
+    let mut rest = Vec::new();
+    drop(peer);
+    while ours.read_into(&mut rest, 2).unwrap() > 0 {}
+    let mut safe_rest = Vec::new();
+    drop(reference);
+    theirs.read_to_end(&mut safe_rest).unwrap();
+    assert_eq!(rest, safe_rest);
+    let (len, room) = (rest.len(), rest.capacity());
+    assert_eq!(ours.read_into(&mut rest, 8).unwrap(), 0, "the peer hung up");
+    assert_eq!(rest.len(), len, "nothing is appended once the peer hung up");
+    assert!(rest.capacity() >= room, "a capacity never shrinks");
+}
+
+/// A read that asks for more than [`crate::RECV_MOST`] reserves only that much room.
+#[test]
+fn a_read_of_any_most_reserves_at_most_recv_most() {
+    use std::io::Write as _;
+
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    let ours = Socket::Unix(ours);
+    peer.write_all(b"x").unwrap();
+    let mut into = Vec::new();
+    assert_eq!(ours.read_into(&mut into, usize::MAX).unwrap(), 1);
+    assert_eq!(into, b"x");
+    assert!(into.capacity() <= 1 + crate::RECV_MOST, "{}", into.capacity());
 }

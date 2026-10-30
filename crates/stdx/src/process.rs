@@ -10,12 +10,11 @@ use std::{
 
 use crate::JodChild;
 
-pub fn streaming_output(
+fn streaming_output(
     out: ChildStdout,
     err: ChildStderr,
-    on_stdout_line: &mut dyn FnMut(&str),
-    on_stderr_line: &mut dyn FnMut(&str),
-    on_eof: &mut dyn FnMut(),
+    on_stdout_line: &mut impl FnMut(&str),
+    on_stderr_line: &mut impl FnMut(&str),
 ) -> io::Result<(Vec<u8>, Vec<u8>)> {
     let mut stdout = Vec::new();
     let mut stderr = Vec::new();
@@ -45,9 +44,6 @@ pub fn streaming_output(
                     on_stderr_line(line);
                 }
             }
-            if eof {
-                on_eof();
-            }
         }
     })?;
 
@@ -59,8 +55,8 @@ pub fn streaming_output(
 /// Panics if `cmd` is not configured to have `stdout` and `stderr` as `piped`.
 pub fn spawn_with_streaming_output(
     mut cmd: Command,
-    on_stdout_line: &mut dyn FnMut(&str),
-    on_stderr_line: &mut dyn FnMut(&str),
+    on_stdout_line: &mut impl FnMut(&str),
+    on_stderr_line: &mut impl FnMut(&str),
 ) -> io::Result<Output> {
     let cmd = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
 
@@ -70,7 +66,6 @@ pub fn spawn_with_streaming_output(
         child.stderr.take().unwrap(),
         on_stdout_line,
         on_stderr_line,
-        &mut || (),
     )?;
     let status = child.wait()?;
     Ok(Output { status, stdout, stderr })
@@ -88,7 +83,7 @@ mod imp {
     pub(crate) fn read2(
         mut out_pipe: ChildStdout,
         mut err_pipe: ChildStderr,
-        data: &mut dyn FnMut(bool, &mut Vec<u8>, bool),
+        data: &mut impl FnMut(bool, &mut Vec<u8>, bool),
     ) -> io::Result<()> {
         unsafe {
             libc::fcntl(out_pipe.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
@@ -177,7 +172,7 @@ mod imp {
     pub(crate) fn read2(
         out_pipe: ChildStdout,
         err_pipe: ChildStderr,
-        data: &mut dyn FnMut(bool, &mut Vec<u8>, bool),
+        data: &mut impl FnMut(bool, &mut Vec<u8>, bool),
     ) -> io::Result<()> {
         let mut out = Vec::new();
         let mut err = Vec::new();
@@ -256,6 +251,29 @@ mod imp {
     }
 }
 
+#[cfg(all(test, unix, not(target_family = "wasm")))]
+mod tests {
+    use std::process::Command;
+
+    #[test]
+    fn streams_each_line_and_keeps_the_output() {
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "echo one; echo two >&2; echo three; printf four"]);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let output = super::spawn_with_streaming_output(
+            cmd,
+            &mut |line| out.push(line.to_owned()),
+            &mut |line| err.push(line.to_owned()),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(out, ["one", "three", "four"]);
+        assert_eq!(err, ["two"]);
+        assert_eq!(output.stdout, b"one\nthree\nfour");
+        assert_eq!(output.stderr, b"two\n");
+    }
+}
+
 #[cfg(target_family = "wasm")]
 mod imp {
     use std::{
@@ -266,7 +284,7 @@ mod imp {
     pub(crate) fn read2(
         _out_pipe: ChildStdout,
         _err_pipe: ChildStderr,
-        _data: &mut dyn FnMut(bool, &mut Vec<u8>, bool),
+        _data: &mut impl FnMut(bool, &mut Vec<u8>, bool),
     ) -> io::Result<()> {
         panic!("no processes on wasm")
     }

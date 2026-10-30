@@ -7,13 +7,15 @@ mod matcher;
 pub(crate) mod model;
 mod transcriber;
 
+use std::alloc::Allocator;
+
 use base_db::Db;
 use blaze_mem::frame::Frame;
 use span::Span;
 
 pub(crate) use self::matcher::Matcher;
 use crate::{
-    ExpandError, ExpandErrorKind, ExpandResult, MacroCallStyle, MatchedArmIndex,
+    ExpandError, ExpandErrorKind, ExpandResult, MacroCallStyle, MadeIdents, MatchedArmIndex,
     parser::{Binder, MetaVarKind},
 };
 
@@ -27,22 +29,27 @@ pub(crate) fn expand_rules(
     marker: impl Fn(&mut Span) + Copy,
     call_style: MacroCallStyle,
     call_site: Span,
-) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
+) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex, MadeIdents)> {
     blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-        expand_rules_in(frame, db, rules, input, marker, call_style, call_site)
+        let build = tt::TopSubtreeBuilder::build;
+        expand_rules_in(frame, build, db, rules, input, marker, call_style, call_site)
     })
 }
 
-/// [`expand_rules`] with every match and transcription temporary in `frame`.
-fn expand_rules_in<'t>(
+/// [`expand_rules`] with every match and transcription temporary in `frame` and the output
+/// written out by `build`: [`tt::TopSubtreeBuilder::build`] for a tree that is kept, with its
+/// parser words, or [`tt::TopSubtreeBuilder::build_in`] a caller's frame for a temporary.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn expand_rules_in<'t, A: Allocator>(
     frame: &'t Frame,
+    build: impl Fn(tt::TopSubtreeBuilder) -> tt::TopSubtree<A> + Copy,
     db: &Db,
     rules: &[crate::Rule],
     input: &'t tt::TopSubtree,
     marker: impl Fn(&mut Span) + Copy,
     call_style: MacroCallStyle,
     call_site: Span,
-) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
+) -> ExpandResult<(tt::TopSubtree<A>, MatchedArmIndex, MadeIdents)> {
     // One set of buffers for every rule tried, and two matches swapped between the best so far
     // and the one being made, so a rule after the first allocates only where it outgrows them.
     let mut buffers = matcher::Buffers::new_in(frame);
@@ -60,10 +67,11 @@ fn expand_rules_in<'t>(
             // If we find a rule that applies without errors, we're done.
             // Unconditionally returning the transcription here makes the
             // `test_repeat_bad_var` test fail.
-            let ExpandResult { value, err: transcribe_err } =
-                transcriber::transcribe(&rule.rhs, &scratch.bindings, frame, marker, call_site);
+            let bindings = &scratch.bindings;
+            let ExpandResult { value: (tree, made), err: transcribe_err } =
+                transcriber::transcribe(&rule.rhs, bindings, frame, build, marker, call_site);
             if transcribe_err.is_none() {
-                return ExpandResult::ok((value, Some(idx as u32)));
+                return ExpandResult::ok((tree, Some(idx as u32), made));
             }
         }
         // Use the rule if we matched more tokens, or bound variables count
@@ -84,16 +92,25 @@ fn expand_rules_in<'t>(
     if let Some((match_, idx)) = best {
         // if we got here, there was no match without errors
         let rule = &rules[idx];
-        let ExpandResult { value, err: transcribe_err } =
-            transcriber::transcribe(&rule.rhs, &match_.bindings, frame, marker, call_site);
+        let ExpandResult { value: (tree, made), err: transcribe_err } =
+            transcriber::transcribe(&rule.rhs, &match_.bindings, frame, build, marker, call_site);
         // What rustc says when no rule matches; its ambiguity errors are the matcher's own.
         let match_err = match_.err.map(|err| {
             matcher::match_failure(db, frame, rules, input, call_style).unwrap_or(err)
         });
-        ExpandResult { value: (value, idx.try_into().ok()), err: match_err.or(transcribe_err) }
+        ExpandResult {
+            value: (tree, idx.try_into().ok(), made),
+            err: match_err.or(transcribe_err),
+        }
     } else {
         ExpandResult::new(
-            (tt::TopSubtree::empty(tt::DelimSpan::from_single(call_site)), None),
+            (
+                build(tt::TopSubtreeBuilder::new(tt::Delimiter::invisible_delim_spanned(
+                    tt::DelimSpan::from_single(call_site),
+                ))),
+                None,
+                MadeIdents::new(),
+            ),
             ExpandError::new(call_site, ExpandErrorKind::NoMatchingRule),
         )
     }
@@ -271,4 +288,7 @@ impl Fragment<'_> {
 enum TokensOrigin {
     Raw,
     Ast,
+    /// A statement or a block: one thing to rustc, so transcribed in a group without delimiters
+    /// spanned by its metavariable, the span the syntax tree's fragment keeps.
+    Grouped,
 }

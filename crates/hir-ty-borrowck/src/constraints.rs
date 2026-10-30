@@ -3,8 +3,9 @@
 //! for it read for errors and localized edges. The outlives graph is a CSR of constraint
 //! indices by `sup`, built once and kept until a constraint is added.
 
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 
+use blaze_ids::bits::{BitSlice, BitSliceMut};
 use hir_ty::mir::MirSpan;
 
 use super::{
@@ -12,6 +13,7 @@ use super::{
     regions::{Category, Outlives, Rv},
     relation::Csr,
 };
+use crate::mem::{FVec, Frame};
 
 const _: () = assert!(size_of::<Category>() == 1);
 const _: () = assert!(size_of::<MirSpan>() <= 8);
@@ -19,19 +21,33 @@ const _: () = assert!(size_of::<MirSpan>() <= 8);
 /// No location: the constraint holds at every point.
 const EVERYWHERE: u32 = u32::MAX;
 
-#[derive(Default)]
-pub(super) struct Constraints {
-    category: Vec<Category>,
-    sup: Vec<u32>,
-    sub: Vec<u32>,
+pub(super) struct Constraints<'f> {
+    category: FVec<'f, Category>,
+    sup: FVec<'f, u32>,
+    sub: FVec<'f, u32>,
     /// The block and statement, the block [`EVERYWHERE`] for none.
-    location: Vec<[u32; 2]>,
-    span: Vec<MirSpan>,
-    from_closure: Vec<u64>,
-    by_sup: OnceCell<Csr>,
+    location: FVec<'f, [u32; 2]>,
+    span: FVec<'f, MirSpan>,
+    from_closure: FVec<'f, u64>,
+    by_sup: OnceCell<Csr<'f>>,
+    /// The graph last built, whose arrays the next build reuses.
+    spare: Cell<Option<Csr<'f>>>,
 }
 
-impl Constraints {
+impl<'f> Constraints<'f> {
+    pub(super) fn new(frame: &'f Frame) -> Self {
+        Constraints {
+            category: Vec::new_in(frame),
+            sup: Vec::new_in(frame),
+            sub: Vec::new_in(frame),
+            location: Vec::new_in(frame),
+            span: Vec::new_in(frame),
+            from_closure: Vec::new_in(frame),
+            by_sup: OnceCell::new(),
+            spare: Cell::new(None),
+        }
+    }
+
     pub(super) fn push(&mut self, it: Outlives) {
         let at = self.category.len();
         self.category.push(it.category);
@@ -45,10 +61,10 @@ impl Constraints {
         if at.is_multiple_of(64) {
             self.from_closure.push(0);
         }
-        if it.from_closure {
-            self.from_closure[at / 64] |= 1 << (at % 64);
+        BitSliceMut::from_words(&mut self.from_closure[..]).set(at, it.from_closure);
+        if let Some(graph) = self.by_sup.take() {
+            *self.spare.get_mut() = Some(graph);
         }
-        self.by_sup.take();
     }
 
     pub(super) fn len(&self) -> usize {
@@ -84,11 +100,11 @@ impl Constraints {
             location: self.location(at),
             category: self.category[at],
             span: self.span[at],
-            from_closure: self.from_closure[at / 64] & (1 << (at % 64)) != 0,
+            from_closure: BitSlice::from_words(&self.from_closure[..]).contains(at),
         }
     }
 
-    pub(super) fn iter(&self) -> Iter<'_> {
+    pub(super) fn iter(&self) -> Iter<'_, 'f> {
         Iter { constraints: self, at: 0..self.len() }
     }
 
@@ -97,7 +113,14 @@ impl Constraints {
         self.by_sup
             .get_or_init(|| {
                 let regions = self.sup.iter().map(|&it| it as usize + 1).max().unwrap_or(0);
-                Csr::build(regions, (0..self.len()).map(|at| (self.sup[at], at as u32)))
+                let edges = (0..self.len()).map(|at| (self.sup[at], at as u32));
+                match self.spare.take() {
+                    Some(mut graph) => {
+                        graph.rebuild(regions, edges);
+                        graph
+                    }
+                    None => Csr::build(*self.sup.allocator(), regions, edges),
+                }
             })
             .of(sup)
     }
@@ -109,7 +132,7 @@ impl Constraints {
     }
 }
 
-impl Extend<Outlives> for Constraints {
+impl Extend<Outlives> for Constraints<'_> {
     fn extend<I: IntoIterator<Item = Outlives>>(&mut self, iter: I) {
         for it in iter {
             self.push(it);
@@ -117,12 +140,12 @@ impl Extend<Outlives> for Constraints {
     }
 }
 
-pub(super) struct Iter<'a> {
-    constraints: &'a Constraints,
+pub(super) struct Iter<'a, 'f> {
+    constraints: &'a Constraints<'f>,
     at: std::ops::Range<usize>,
 }
 
-impl Iterator for Iter<'_> {
+impl Iterator for Iter<'_, '_> {
     type Item = Outlives;
 
     fn next(&mut self) -> Option<Outlives> {
@@ -130,17 +153,19 @@ impl Iterator for Iter<'_> {
     }
 }
 
-impl<'a> IntoIterator for &'a Constraints {
+impl<'a, 'f> IntoIterator for &'a Constraints<'f> {
     type Item = Outlives;
-    type IntoIter = Iter<'a>;
+    type IntoIter = Iter<'a, 'f>;
 
-    fn into_iter(self) -> Iter<'a> {
+    fn into_iter(self) -> Iter<'a, 'f> {
         self.iter()
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use blaze_mem::{Tag, frame};
+
     use super::Constraints;
     use crate::{
         cfg::{Location, block},
@@ -150,7 +175,11 @@ mod tests {
 
     #[test]
     fn a_constraint_reads_back_as_it_was_added() {
-        let mut constraints = Constraints::default();
+        frame::task(Tag::Mir, |frame| a_constraint_reads_back_in(frame));
+    }
+
+    fn a_constraint_reads_back_in(frame: &crate::mem::Frame) {
+        let mut constraints = Constraints::new(frame);
         let mut added = Vec::new();
         for at in 0..150usize {
             let it = Outlives {

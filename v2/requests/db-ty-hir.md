@@ -35,6 +35,7 @@ Both are workspace dependencies already (`blaze-format` is in hir-ty's manifest)
 `crates/hir-ty-wfcheck/src/persist.rs` (`impl Persist for WfResult`). The manifest lint passes.
 
 > forwarded to db: `crates/hir-ty-wfcheck/Cargo.toml` is lane db's (both are workspace dependencies already).
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/Cargo.toml:18` (`la-arena`) and `:27` (`blaze-format`).
 
 ## 4. Lane db: `AnyDiagnostic` must stay `Send + Sync`; `hir-ty-wfcheck` gains `smallvec`
 
@@ -45,6 +46,7 @@ Both are workspace dependencies already (`blaze-format` is in hir-ty's manifest)
 the region walk's stacks on the stack); the manifest lint passes.
 
 > forwarded to db: `crates/hir/` and `crates/hir-ty-wfcheck/Cargo.toml` are lane db's (`smallvec` is a workspace dependency already).
+> checked by db-audit-dbsub-tysmall (22:33): in the tree at `crates/hir-ty-wfcheck/Cargo.toml:21` (`smallvec`); `Send + Sync` of `AnyDiagnostic` is held by the compiler: `crates/hir/src/check/bodies.rs:178` shares `OnceLock<Vec<AnyDiagnostic>>` slots with `Db::run_all`'s `F: Sync` task (`base-db/src/db.rs:313`).
 
 ## 5. Lane db: name the techniques in `docs/v2/plan/lanes/db/query-database.md`
 

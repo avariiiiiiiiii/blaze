@@ -37,7 +37,7 @@ pub trait Sink {
         path: &[u8],
         executable: bool,
         size: u64,
-        contents: &mut dyn Read,
+        contents: &mut impl Read,
     ) -> anyhow::Result<()>;
     fn symlink(&mut self, path: &[u8], target: &[u8]) -> anyhow::Result<()>;
 }
@@ -310,7 +310,7 @@ pub mod tests {
             path: &[u8],
             executable: bool,
             _: u64,
-            contents: &mut dyn Read,
+            contents: &mut impl Read,
         ) -> anyhow::Result<()> {
             let at = self.at(path);
             io::copy(contents, &mut std::fs::File::create(&at)?)?;

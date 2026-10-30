@@ -124,20 +124,19 @@ pub fn is_question(args: &[OsString]) -> bool {
 /// What blaze answers to what `command` asks rustc, given `stdin`, with the variables
 /// `command` has; `None` when it has no answer. Nothing runs.
 pub fn own_answer(command: &Command, stdin: &[u8]) -> Option<own::Answer> {
-    let var = |name: &str| var_of(command, name);
     let args: Vec<OsString> = command.get_args().map(OsStr::to_owned).collect();
-    answered_as(command.get_program(), &args, stdin, &var)
+    answered_as(command.get_program(), &args, stdin, own::Vars::Command(command))
 }
 
 /// What blaze answers to rustc asked `args` with `stdin`, in this process's environment;
 /// `None` when it has no answer. Nothing runs.
 pub fn ours(args: &[OsString], stdin: &[u8]) -> Option<Vec<u8>> {
-    own::answer(args, stdin, &|name| std::env::var_os(name))
+    own::answer(args, stdin, own::Vars::Process)
 }
 
 /// [`ours`] with the warnings rustc shows answering.
 pub fn ours_told(args: &[OsString], stdin: &[u8]) -> Option<own::Answer> {
-    own::answered(args, stdin, &|name| std::env::var_os(name))
+    own::answered(args, stdin, own::Vars::Process)
 }
 
 /// What rustc prints to standard output for text arguments, as text, failing with the
@@ -154,12 +153,12 @@ fn answered_as(
     program: &OsStr,
     args: &[OsString],
     stdin: &[u8],
-    var: &dyn Fn(&str) -> Option<OsString>,
+    vars: own::Vars<'_>,
 ) -> Option<own::Answer> {
     if Path::new(program).file_stem()? != "rustc" {
         return None;
     }
-    own::answered(args, stdin, var)
+    own::answered(args, stdin, vars)
 }
 
 fn no_answer(args: &[OsString]) -> anyhow::Error {
@@ -236,8 +235,7 @@ pub fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>> {
     {
         return Some(Err(e));
     }
-    let var = |name: &str| std::env::var_os(name);
-    Some(match answered_as(rustc, args, &stdin, &var) {
+    Some(match answered_as(rustc, args, &stdin, own::Vars::Process) {
         Some(answer) => io::stderr()
             .write_all(&answer.stderr)
             .and_then(|()| io::stdout().write_all(&answer.stdout))
@@ -247,14 +245,6 @@ pub fn reply(rustc: &OsStr, args: &[OsString]) -> Option<io::Result<i32>> {
             Ok(1)
         }
     })
-}
-
-/// The variable `name` as `command` will have it.
-fn var_of(command: &Command, name: &str) -> Option<OsString> {
-    match command.get_envs().find(|(it, _)| *it == name) {
-        Some((_, value)) => value.map(OsStr::to_owned),
-        None => std::env::var_os(name),
-    }
 }
 
 #[cfg(test)]
@@ -297,18 +287,14 @@ mod tests {
     /// toolchain file would pick, and a rustc that is no toolchain's is answered too.
     #[test]
     fn every_rustc_is_answered_as_blazes_release() {
-        let var = |name: &str| match name {
-            "RUSTUP_TOOLCHAIN" => Some(OsString::from("1.70.0")),
-            "RUSTC" => Some(OsString::from("/no/such/rustc")),
-            _ => None,
-        };
+        let vars = own::Vars::Only(&[("RUSTUP_TOOLCHAIN", "1.70.0"), ("RUSTC", "/no/such/rustc")]);
         let version = [OsString::from("--version")];
         for program in ["rustc", "/no/such/toolchain/bin/rustc", "/usr/bin/rustc"] {
-            let said = answered_as(OsStr::new(program), &version, &[], &var).unwrap();
+            let said = answered_as(OsStr::new(program), &version, &[], vars).unwrap();
             let said = String::from_utf8(said.stdout).unwrap();
             assert_eq!(said.trim(), format!("rustc {}", crate::cargo::toolchain::ours_says()));
         }
-        assert_eq!(answered_as(OsStr::new("clippy-driver"), &version, &[], &var), None);
+        assert_eq!(answered_as(OsStr::new("clippy-driver"), &version, &[], vars), None);
     }
 
     /// What rust-analyzer asks for the data layout of the target a proc macro's module is

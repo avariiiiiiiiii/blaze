@@ -110,6 +110,7 @@ pub(crate) struct Thread {
     unparked: Clock,
     /// Its `thread_local!` values, by key. An `Rc`, so a value lent to `LocalKey::with` stays
     /// alive while the runtime is not borrowed.
+    // dyn: a key's value of the test's own type, made once per thread and key.
     pub(crate) locals: Vec<(usize, Rc<dyn Any>)>,
     pub(crate) dropping_locals: bool,
     /// Where its last operation was, and what it was, for reports.

@@ -62,6 +62,7 @@ use rustc_type_ir::{
     FloatTy, IntTy, TypeVisitableExt as _, UintTy,
     inherent::{IntoKind as _, SliceLike as _},
 };
+use smallvec::SmallVec;
 use syntax::{
     AstNode as _, SyntaxNodePtr,
     ast::{self, HasAttrs as _, HasName as _},
@@ -83,9 +84,11 @@ pub(super) const LINTS: super::LintSet = super::lint_set(["arithmetic_overflow",
 /// before it aborts, or whose type checking or borrow checking failed.
 pub(super) fn lints<'db>(b: &BodyCx<'_, 'db>) -> Vec<Found> {
     if b.mir_tainted() || !b.elaborated || borrowck_failed(b) {
+        // alloc: empty, allocates nothing
         return Vec::new();
     }
     let db = b.db();
+    // alloc: the lints found, empty until one is
     let mut out = Vec::new();
     let mut state: Option<(Owner<'db>, Scratch<'db>)> = None;
     let mut run = |body: &'db MirBody<'db>| {
@@ -97,16 +100,19 @@ pub(super) fn lints<'db>(b: &BodyCx<'_, 'db>) -> Vec<Found> {
     };
     let closures = match runs_on(b) {
         true => {
+            // alloc: empty, allocates nothing
             let Some(body) = b.runtime_mir() else { return Vec::new() };
             run(body);
             &body.closures
         }
         false => match b.mir() {
             Some(body) => &body.closures,
+            // alloc: empty, allocates nothing
             None => return Vec::new(),
         },
     };
-    let mut stack: Vec<InternedClosureId<'db>> = closures.iter().rev().copied().collect();
+    let mut stack: SmallVec<[InternedClosureId<'db>; 4]> = SmallVec::new();
+    stack.extend(closures.iter().rev().copied());
     while let Some(closure) = stack.pop() {
         let Ok(body) = db.runtime_mir_body_for_closure(closure) else { continue };
         run(body);
@@ -221,6 +227,7 @@ impl fmt::Display for Panic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let int = |value: &Option<Scalar>, alternate: bool| match value {
             Some(it) => scalar::const_int(*it, alternate),
+            // alloc: the lint's text, for a lint found
             None => "_".to_owned(),
         };
         match self {
@@ -768,6 +775,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
             });
             let Some((GenericParamId::ConstParamId(param), _)) = generics.iter(false).nth(at) else { continue };
             let Some(name) = panics_when_zero(db, param) else { continue };
+            // alloc: the lint's text, for a lint found
             self.emit(span, Lint::UnconditionalPanic, format!("const parameter `{name}` is zero"));
         }
     }
@@ -1001,6 +1009,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
 
     /// `report_assert_as_lint`.
     fn report(&mut self, span: MirSpan, lint: Lint, panic: Panic) {
+        // alloc: the lint's text, for a lint found
         self.emit(span, lint, panic.to_string());
     }
 
@@ -1011,6 +1020,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         if self.b.in_external_macro(node) {
             return;
         }
+        // clone: a lint's span, for a lint found
         let mut diag = Diag::lint(lint.name(), lint.message(), span.clone());
         diag.span_label(span, label);
         let found = self.b.lint(diag, Phase::Mir, node);
@@ -1027,6 +1037,7 @@ impl<'a, 'b, 'db> Propagator<'a, 'b, 'db> {
         {
             let mut syntax = self.b.cx.syntax(node).value;
             while let Some(paren) = syntax.parent().and_then(ast::ParenExpr::cast) {
+                // clone: a node handle, a reference count, for a lint found
                 syntax = paren.syntax().clone();
             }
             let node = InFile::new(node.file_id, SyntaxNodePtr::new(&syntax));
@@ -1048,5 +1059,6 @@ fn panics_when_zero(db: &Db, param: ConstParamId) -> Option<String> {
     let sources = param.parent().child_source(db);
     let Either::Left(ast::TypeOrConstParam::Const(node)) = sources.value.get(param.local_id())? else { return None };
     let marked = node.attrs().any(|attr| attr.path().is_some_and(|path| path.syntax().text() == "rustc_panics_when_zero"));
+    // alloc: the lint's text, for a lint found
     marked.then(|| node.name().map(|it| it.text().to_string()))?
 }

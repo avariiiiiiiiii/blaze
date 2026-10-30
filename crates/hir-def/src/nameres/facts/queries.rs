@@ -4,6 +4,7 @@
 //! work is in `collect`, `unit`, `macros` and `driver`.
 
 use base_db::{Db, Crate};
+use blaze_mem::{Tag, frame};
 use hir_expand::{mod_path::ModPath, name::Name};
 use rustc_hash::FxHashMap;
 use triomphe::Arc;
@@ -374,25 +375,25 @@ pub(crate) fn crate_data(db: &Db, krate: Crate) -> Arc<DefMapCrateData> {
 /// The crate root's round-0 key: the extern prelude of the crate's dependencies.
 #[salsa::tracked]
 pub(crate) fn root_decl(db: &Db, krate: Crate) -> DeclKey {
-    collect::root_decl(db, krate)
+    frame::task(Tag::Nameres, |frame| collect::root_decl(db, frame, krate))
 }
 
 /// One module's round-0 declarations.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn module_decls(db: &Db, key: DeclKey) -> ModuleDecls {
-    collect::module_decls(db, key)
+    frame::task(Tag::Nameres, |frame| collect::module_decls(db, frame, key))
 }
 
 /// The module's `macro_rules!` after collection, the last definition of each name: what a
 /// `#[macro_use] mod` brings into its parent. Backdates unless they change.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> Box<[(Name, MacroId)]> {
-    module_decls(db, key)
-        .legacy
-        .iter()
-        .filter_map(|(name, macs)| Some((*name, *macs.last()?)))
-        // alloc: the query's value, once per execution
-        .collect()
+    let legacy = &module_decls(db, key).legacy;
+    let exports = || legacy.iter().filter_map(|(name, macs)| Some((*name, *macs.last()?)));
+    // alloc: the query's value, at exact size, once per execution
+    let mut out = Vec::with_capacity(exports().count());
+    out.extend(exports());
+    out.into_boxed_slice()
 }
 
 /// The ops the module and its round-0 descendants make in the crate root (`#[macro_export]`),
@@ -403,28 +404,30 @@ pub(crate) fn legacy_exports(db: &Db, key: DeclKey) -> Box<[(Name, MacroId)]> {
 #[salsa::tracked(returns(ref))]
 pub(crate) fn subtree_macro_exports(db: &Db, key: DeclKey) -> Box<[DeclOp]> {
     let root = crate_root(db, key.decl(db).krate);
-    // alloc: the query's value, once per execution
-    let mut out = Vec::new();
     let ops = &module_decls(db, key).ops;
     if !ops.writes_elsewhere() && !ops.has_children() {
         return Box::default();
     }
-    // In log order: a later `#[macro_export]` of a name replaces an earlier one in the root.
-    for op in ops.iter() {
-        match op {
-            DeclOp::Splice { key: child, .. } => {
-                let child_ops = &module_decls(db, *child).ops;
-                if child_ops.has_children() {
-                    let exports = subtree_macro_exports(db, *child).iter();
-                    out.extend(exports.filter_map(|it| it.clone_root_op(root)));
-                } else if child_ops.writes_elsewhere() {
-                    out.extend(child_ops.iter().filter_map(|it| it.clone_root_op(root)));
+    frame::task(Tag::Nameres, |frame| {
+        let mut out = Vec::new_in(frame);
+        // In log order: a later `#[macro_export]` of a name replaces an earlier one in the root.
+        for op in ops.iter() {
+            match op {
+                DeclOp::Splice { key: child, .. } => {
+                    let child_ops = &module_decls(db, *child).ops;
+                    if child_ops.has_children() {
+                        let exports = subtree_macro_exports(db, *child).iter();
+                        out.extend(exports.filter_map(|it| it.clone_root_op(root)));
+                    } else if child_ops.writes_elsewhere() {
+                        out.extend(child_ops.iter().filter_map(|it| it.clone_root_op(root)));
+                    }
                 }
+                op => out.extend(op.clone_root_op(root)),
             }
-            op => out.extend(op.clone_root_op(root)),
         }
-    }
-    out.into_boxed_slice()
+        // alloc: the query's value, at exact size, once per execution
+        out.into_iter().collect()
+    })
 }
 
 /// The key of `child`, a round-0 child of the module of `parent`: a look-up in the children of
@@ -437,7 +440,8 @@ pub(crate) fn child_key(db: &Db, parent: DeclKey, child: ModuleId) -> Option<Dec
 #[salsa::tracked]
 pub(crate) fn decl_handle(db: &Db, key: DeclKey) -> salsa::Id {
     let decl = key.decl(db);
-    let scope = unit::local_scope(db, decl.module, &decl.inherited, &module_decls(db, key).ops);
+    let ops = &module_decls(db, key).ops;
+    let scope = frame::task(Tag::Nameres, |frame| unit::local_scope(db, frame, decl.module, &decl.inherited, ops));
     let scope = crate::nameres::ModuleScope::new(db, decl.module, scope.scope, scope.children);
     salsa::plumbing::AsId::as_id(&scope)
 }
@@ -445,7 +449,7 @@ pub(crate) fn decl_handle(db: &Db, key: DeclKey) -> salsa::Id {
 /// Every module of the round, in order.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn round_modules(db: &Db, round: RoundKey) -> RoundModules {
-    driver::round_modules(db, round)
+    frame::task(Tag::Nameres, |frame| driver::round_modules(db, frame, round))
 }
 
 /// Which components of the round's partition run at the round.
@@ -489,19 +493,20 @@ pub(crate) fn ran_by(db: &Db, round: RoundKey, at: u32) -> u32 {
 /// What the module gains at a round `>= 1`.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn module_round(db: &Db, key: FactKey) -> ModuleRound {
-    driver::module_round(db, key)
+    frame::task(Tag::Nameres, |frame| driver::module_round(db, frame, key))
 }
 
 /// The round's import graph, for `graph::partition`. Backdates unless an import, a `mod` or
 /// an `extern crate self` changes.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn import_shape(db: &Db, round: RoundKey) -> ImportShape {
-    driver::import_shape(db, round)
+    frame::task(Tag::Nameres, |frame| driver::import_shape(db, frame, round))
 }
 
 #[salsa::tracked(returns(ref))]
 pub(crate) fn partition(db: &Db, round: RoundKey) -> Partition {
-    super::graph::partition(import_shape(db, round))
+    let shape = import_shape(db, round);
+    frame::task(Tag::Nameres, |frame| super::graph::partition(frame, shape))
 }
 
 /// The crate env the round's units and steps start from: the root's crate-level ops of every
@@ -514,7 +519,7 @@ pub(crate) fn round_env(db: &Db, round: RoundKey) -> CrateEnvKey {
 /// One component's resolution at one round.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn scc_state(db: &Db, key: SccKey) -> SccState {
-    unit::scc_state(db, key)
+    frame::task(Tag::Nameres, |frame| unit::scc_state(db, frame, key))
 }
 
 /// The round whose state `scc_state(key)` hands out: `key`'s round, or the last before it at
@@ -541,7 +546,7 @@ pub(crate) fn unresolved_named(db: &Db, key: FactKey) -> Box<[(Name, ModPath)]> 
 /// One module's macro resolution at one round.
 #[salsa::tracked(returns(ref))]
 pub(crate) fn macro_step(db: &Db, key: FactKey) -> MacroStep {
-    macros::macro_step(db, key)
+    frame::task(Tag::Nameres, |frame| macros::macro_step(db, frame, key))
 }
 
 #[salsa::tracked]

@@ -47,6 +47,11 @@ impl Mounted {
         })
     }
 
+    /// The path in the view of absolute `path`; `None` for one outside it.
+    pub(crate) fn in_view<'p>(&self, path: &'p str) -> Option<Cow<'p, str>> {
+        self.locate(path).filter(|(root, _)| *root == self.view).map(|(_, inner)| inner)
+    }
+
     /// The bytes of the file at absolute `path`, with its content ID; `Err` for bytes of the
     /// mapped image that fail their check.
     pub(crate) fn read(&self, path: &str) -> Result<Option<(ContentId, blaze_vfs::Mode, Bytes)>, Corrupt> {

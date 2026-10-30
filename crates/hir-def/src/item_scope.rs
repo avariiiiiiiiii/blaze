@@ -16,7 +16,7 @@ use std::{
 };
 
 use base_db::{Db, Crate};
-use blaze_ids::radix;
+use blaze_ids::{bits::Bits, radix};
 use blaze_mem::scratch;
 use either::Either;
 use hir_expand::{AstId, MacroCallId, attrs::AttrId, name::Name};
@@ -154,7 +154,9 @@ pub struct GlobId {
 impl<A: Allocator + Clone> PerNsGlobImports<A> {
     pub(crate) fn new_in(alloc: A) -> Self {
         PerNsGlobImports {
+            // clone: the allocator handle: a frame reference or the zero-sized `Global`
             types: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc.clone()),
+            // clone: the allocator handle: a frame reference or the zero-sized `Global`
             values: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc.clone()),
             macros: hashbrown::HashSet::with_hasher_in(FxBuildHasher, alloc),
         }
@@ -174,7 +176,9 @@ impl<A: Allocator + Clone> PerNsGlobImports<A> {
             hashbrown::HashSet::with_capacity_and_hasher_in(len, FxBuildHasher, alloc)
         };
         let mut marks = PerNsGlobImports {
+            // clone: the allocator handle: a frame reference or the zero-sized `Global`
             types: set(types().count(), alloc.clone()),
+            // clone: the allocator handle: a frame reference or the zero-sized `Global`
             values: set(values().count(), alloc.clone()),
             macros: set(macros().count(), alloc),
         };
@@ -251,6 +255,7 @@ impl Index {
     /// Room for `len` keys.
     fn with_capacity(len: usize) -> Index {
         let slots = (len * 4).div_ceil(3).next_power_of_two().max(16);
+        // alloc: the index's slots, once per scope of more than 8 names, when it is sealed
         Index { slots: std::iter::repeat_n(EMPTY, slots).collect() }
     }
 
@@ -617,6 +622,7 @@ impl<D, I> Default for Column<D, I> {
 
 impl<D, I> Clone for Column<D, I> {
     fn clone(&self) -> Self {
+        // clone: only with its ItemScope, which facts copies once per macro step
         Column { entries: self.entries.clone(), of: PhantomData }
     }
 }
@@ -817,24 +823,9 @@ impl<K: Copy + Eq + Hash, V: PartialEq> PartialEq for Keyed<K, V> {
 
 impl<K: Copy + Eq + Hash, V: Eq> Eq for Keyed<K, V> {}
 
-/// A bit per position of a list beside it, 64 to a word; the bits past the list's end are clear,
-/// so two of the same length are equal when their words are.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct Bits(ThinVec<u64>);
-
-impl Bits {
-    /// Sets bit `at` to `bit`, for the position the list just gave its newest element.
-    pub(crate) fn push(&mut self, at: usize, bit: bool) {
-        if at % 64 == 0 {
-            self.0.push(0);
-        }
-        self.0[at / 64] |= u64::from(bit) << (at % 64);
-    }
-
-    pub(crate) fn get(&self, at: usize) -> bool {
-        self.0.get(at / 64).is_some_and(|word| word >> (at % 64) & 1 == 1)
-    }
-}
+/// A bit per position of a list beside it, set by `set_growing` as the list grows, so it has
+/// the list's words and two of the same length are equal when their words are.
+pub(crate) type ListBits = Bits<ThinVec<u64>>;
 
 /// The items defined in or imported into a module or block.
 ///
@@ -876,9 +867,9 @@ pub struct ItemScope {
     /// The impls declared here, in declaration order.
     pub(crate) impls: ThinVec<ImplId>,
     /// A bit per impl of `impls`, by position: whether it is a trait impl.
-    pub(crate) trait_impl: Bits,
+    pub(crate) trait_impl: ListBits,
     /// A bit per impl of `impls`, by position: whether it is `#[rustc_reservation_impl]`.
-    pub(crate) reservation_impl: Bits,
+    pub(crate) reservation_impl: ListBits,
     pub(crate) builtin_derive_impls: ThinVec<BuiltinDeriveImplId>,
     pub(crate) extern_blocks: ThinVec<ExternBlockId>,
     pub(crate) unnamed_consts: ThinVec<ConstId>,
@@ -1045,12 +1036,14 @@ impl BuiltinScope {
 
 pub(crate) static BUILTIN_SCOPE: LazyLock<BuiltinScope> = LazyLock::new(|| {
     let all = BuiltinType::all_builtin_types();
+    // alloc: once per process (LazyLock)
     let names: Box<[Name]> = all.iter().map(|(name, _)| *name).collect();
     let defs = all.iter().map(|&(_, ty)| PerNs::types(ty.into(), Visibility::Public, None));
     let mut index = Index::with_capacity(names.len());
     for (pos, name) in names.iter().enumerate() {
         index.insert(name_hash(name), 0, pos);
     }
+    // alloc: once per process (LazyLock)
     BuiltinScope { names, defs: defs.collect(), index }
 });
 
@@ -1172,6 +1165,7 @@ impl ItemScope {
         if len <= LINEAR {
             self.names = Index::default();
             let all: SmallVec<[(u32, &Name); LINEAR]> =
+                // alloc: inline, at most 8 names; no heap
                 self.all_names().map(|(ns, _, name)| (ns, name)).collect();
             return (1..all.len()).all(|at| !all[..at].contains(&all[at]));
         }
@@ -1196,8 +1190,8 @@ impl ItemScope {
 
     /// Every name once, by text, for a scope of at most [`LINEAR`] names.
     fn sorted_small(&self) -> SmallVec<[u32; LINEAR]> {
-        // alloc: none, at most `LINEAR` positions inline
         let mut all: SmallVec<[u32; LINEAR]> =
+            // alloc: none, at most `LINEAR` positions inline
             self.all_names().map(|(ns, pos, _)| ns << 30 | pos as u32).collect();
         let kept = self.by_name(&mut all);
         all.truncate(kept);
@@ -1371,11 +1365,11 @@ impl ItemScope {
     }
 
     /// The impls where `bits` is set (or, with `set` false, clear), in declaration order.
-    fn impls_where(&self, bits: &Bits, set: bool) -> impl Iterator<Item = ImplId> + '_ {
+    fn impls_where(&self, bits: &ListBits, set: bool) -> impl Iterator<Item = ImplId> + '_ {
         self.impls
             .iter()
             .enumerate()
-            .filter(move |&(at, _)| bits.get(at) == set)
+            .filter(move |&(at, _)| bits.contains(at) == set)
             .map(|(_, &it)| it)
     }
 
@@ -1394,7 +1388,7 @@ impl ItemScope {
         self.impls
             .iter()
             .enumerate()
-            .filter(|&(at, _)| self.trait_impl.get(at) && !self.reservation_impl.get(at))
+            .filter(|&(at, _)| self.trait_impl.contains(at) && !self.reservation_impl.contains(at))
             .map(|(_, &it)| it)
     }
 
@@ -1634,8 +1628,8 @@ impl ItemScope {
     pub(crate) fn define_impl(&mut self, imp: ImplId, is_trait_impl: bool, is_reservation: bool) {
         let at = self.impls.len();
         self.impls.push(imp);
-        self.trait_impl.push(at, is_trait_impl);
-        self.reservation_impl.push(at, is_reservation);
+        self.trait_impl.set_growing(at, is_trait_impl);
+        self.reservation_impl.set_growing(at, is_reservation);
     }
 
     pub(crate) fn define_builtin_derive_impl(&mut self, imp: BuiltinDeriveImplId) {
@@ -1738,15 +1732,6 @@ impl ItemScope {
     // FIXME: This is only used in collection, we should move the relevant parts of it out of ItemScope
     pub(crate) fn unnamed_trait_vis(&self, tr: TraitId) -> Option<Visibility> {
         self.unnamed_trait_imports.iter().find(|&&(t, _)| t == tr).map(|(_, trait_)| trait_.vis)
-    }
-
-    pub(crate) fn push_unnamed_trait(
-        &mut self,
-        tr: TraitId,
-        vis: Visibility,
-        import: Option<ImportId>,
-    ) {
-        self.push_unnamed_trait_through(tr, vis, import.map(ImportOrExternCrate::Import));
     }
 
     /// Records `tr` as in scope unnamed, bound by `import`: a `use Tr as _` of this scope, or
@@ -2035,6 +2020,7 @@ impl ItemScope {
     }
 
     pub(crate) fn dump(&self, db: &Db, buf: &mut String) {
+        // alloc: a debug dump (the edge)
         let mut entries: Vec<_> = self.resolutions().collect();
         entries.sort_by_key(|(name, _)| *name);
 
@@ -2049,11 +2035,10 @@ impl ItemScope {
         };
 
         for (name, def) in entries {
-            let display_name: &dyn fmt::Display = match &name { // dyn: the debug dump, formatting text anyway
-                Some(name) => &name.display(db, Edition::LATEST),
-                None => &"_",
-            };
-            format_to!(buf, "- {display_name} :");
+            match &name {
+                Some(name) => format_to!(buf, "- {} :", name.display(db, Edition::LATEST)),
+                None => buf.push_str("- _ :"),
+            }
 
             if let Some(Item { import, .. }) = def.types {
                 buf.push_str(" type");
@@ -2093,6 +2078,7 @@ impl ItemScope {
         //
         // For tests involving a cursor position, this might include macros that
         // are _not_ visible at the cursor position.
+        // alloc: a debug dump (the edge)
         let mut legacy_macros = self.legacy_macros().collect::<Vec<_>>();
         legacy_macros.sort_by(|(a, _), (b, _)| Ord::cmp(a, b));
         for (name, macros) in legacy_macros {
@@ -2153,8 +2139,8 @@ impl ItemScope {
         exact(&mut unresolved);
         exact(&mut declarations);
         exact(&mut impls);
-        exact(&mut trait_impl.0);
-        exact(&mut reservation_impl.0);
+        trait_impl.shrink_to_fit();
+        reservation_impl.shrink_to_fit();
         exact(&mut builtin_derive_impls);
         exact(&mut unnamed_consts);
         exact(&mut unnamed_trait_imports);

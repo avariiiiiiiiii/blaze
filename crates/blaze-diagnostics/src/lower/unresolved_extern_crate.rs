@@ -6,10 +6,10 @@
 //! `locator.rs` (`CrateError::report`) (MIT or Apache-2.0).
 
 use hir::InFile;
-use syntax::AstNode;
+use syntax::view::AstNode as _;
 
 use crate::{
-    cx::{Cx, item_range},
+    cx::{Cx, item_range_view as item_range},
     lower::{Found, Phase},
     model::Diag,
 };
@@ -18,10 +18,12 @@ use crate::{
 const PROFILER_RUNTIME: &str = "profiler_builtins";
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedExternCrate) -> Vec<Found> {
-    let node = cx.node(d.decl);
+    let node = cx.node_view(d.decl);
+    // alloc: empty, allocates nothing
     let Some(name) = node.value.name_ref() else { return Vec::new() };
-    let name = name.text().to_owned();
+    let name = name.text();
     let span = cx.span(InFile::new(node.file_id, item_range(node.value.syntax())));
+    // alloc: the error's text, for an error hir found
     let mut diag = Diag::error(Some("E0463"), format!("can't find crate for `{name}`"), span.clone());
     if name == PROFILER_RUNTIME {
         diag.note("the compiler may have been built without the profiler runtime");
@@ -31,5 +33,6 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::UnresolvedExternCrate) -> Vec<Foun
         );
     }
     diag.span_label(span, "can't find crate");
+    // alloc: the error's parts, for an error hir found
     vec![Found::new(diag, Phase::Expand)]
 }

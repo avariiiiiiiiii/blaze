@@ -66,6 +66,7 @@ fn can_be_used_for_suggestions(span: &Span) -> bool {
 /// rustc's `Span::source_callsite`: the call of the outermost macro `span` came from, or
 /// `span`.
 fn source_callsite(span: &Span) -> Span {
+    // clone: a span, for a lint's suggestion
     let mut at = span.clone();
     while let Some(expansion) = at.expansion.take() {
         at = expansion.call_site;
@@ -78,8 +79,10 @@ fn source_callsite(span: &Span) -> Span {
 fn between(from: &Span, to: &Span) -> Span {
     let expansion = match to.expansion {
         None => None,
+        // clone: a span, for a lint's suggestion
         Some(_) => from.expansion.clone(),
     };
+    // clone: a span, for a lint's suggestion
     Span { file: from.file.clone(), lo: from.hi.min(to.lo), hi: from.hi.max(to.lo), expansion }
 }
 

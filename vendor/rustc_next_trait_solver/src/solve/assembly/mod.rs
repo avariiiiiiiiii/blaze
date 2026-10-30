@@ -480,7 +480,8 @@ where
         goal: Goal<I, G>,
         assemble_from: AssembleCandidatesFrom,
     ) -> Result<(Vec<Candidate<I>>, FailedCandidateInfo), RerunNonErased> {
-        let mut candidates = vec![];
+        // The callers give the list back to the scratch once they have merged it.
+        let mut candidates = self.search_graph.scratch().take_candidates();
         let mut failed_candidate_info =
             FailedCandidateInfo { param_env_head_usages: CandidateHeadUsages::default() };
         let Ok(normalized_self_ty) =
@@ -1321,29 +1322,37 @@ where
                     .assemble_and_evaluate_candidates(goal, AssembleCandidatesFrom::EnvAndBounds)?;
                 debug!(?candidates);
 
-                // If the trait goal has been proven by using the environment, we want to treat
-                // aliases as rigid if there are no applicable projection bounds in the environment.
-                if candidates.is_empty() {
-                    return inject_normalize_to_rigid_candidate(self);
-                }
+                let result = 'merge: {
+                    // If the trait goal has been proven by using the environment, we want to
+                    // treat aliases as rigid if there are no applicable projection bounds in the
+                    // environment.
+                    if candidates.is_empty() {
+                        break 'merge inject_normalize_to_rigid_candidate(self);
+                    }
 
-                // If we're normalizing an GAT, we bail if using a where-bound would constrain
-                // its generic arguments.
-                if let Some(result) = inject_forced_ambiguity_candidate(self) {
-                    return result;
-                }
+                    // If we're normalizing an GAT, we bail if using a where-bound would
+                    // constrain its generic arguments.
+                    if let Some(result) = inject_forced_ambiguity_candidate(self) {
+                        break 'merge result;
+                    }
 
-                // We still need to prefer where-bounds over alias-bounds however.
-                // See `tests/ui/winnowing/norm-where-bound-gt-alias-bound.rs`.
-                if candidates.iter().any(|c| matches!(c.source, CandidateSource::ParamEnv(_))) {
-                    candidates.retain(|c| matches!(c.source, CandidateSource::ParamEnv(_)));
-                }
+                    // We still need to prefer where-bounds over alias-bounds however.
+                    // See `tests/ui/winnowing/norm-where-bound-gt-alias-bound.rs`.
+                    if candidates
+                        .iter()
+                        .any(|c| matches!(c.source, CandidateSource::ParamEnv(_)))
+                    {
+                        candidates.retain(|c| matches!(c.source, CandidateSource::ParamEnv(_)));
+                    }
 
-                if let Some((response, _)) = self.try_merge_candidates(&candidates) {
-                    Ok(response)
-                } else {
-                    self.flounder(&candidates).map_err(Into::into)
-                }
+                    if let Some((response, _)) = self.try_merge_candidates(&candidates) {
+                        Ok(response)
+                    } else {
+                        self.flounder(&candidates).map_err(Into::into)
+                    }
+                };
+                self.search_graph.scratch().give_candidates(candidates);
+                result
             }
             TraitGoalProvenVia::Misc => {
                 let (mut candidates, _) =
@@ -1361,11 +1370,13 @@ where
                 // means we can just ignore inference constraints and don't have to special-case
                 // constraining the normalized-to `term`.
                 self.filter_specialized_impls(AllowInferenceConstraints::Yes, &mut candidates);
-                if let Some((response, _)) = self.try_merge_candidates(&candidates) {
+                let result = if let Some((response, _)) = self.try_merge_candidates(&candidates) {
                     Ok(response)
                 } else {
                     self.flounder(&candidates).map_err(Into::into)
-                }
+                };
+                self.search_graph.scratch().give_candidates(candidates);
+                result
             }
         }
     }
@@ -1394,12 +1405,16 @@ where
             return Ok((CandidateSource::ParamEnv(ParamEnvSource::NonGlobal), Certainty::Yes));
         }
 
-        match assumption.visit_with(&mut FindParamInClause {
+        let mut visitor = FindParamInClause {
+            universes: self.search_graph.scratch().take_universes(),
             ecx: self,
             param_env,
-            universes: vec![],
             recursion_depth: 0,
-        }) {
+        };
+        let found = assumption.visit_with(&mut visitor);
+        let FindParamInClause { ecx, universes, .. } = visitor;
+        ecx.search_graph.scratch().give_universes(universes);
+        match found {
             ControlFlow::Break(Err(NoSolution)) => Err(NoSolution),
             ControlFlow::Break(Ok(certainty)) => {
                 Ok((CandidateSource::ParamEnv(ParamEnvSource::NonGlobal), certainty))

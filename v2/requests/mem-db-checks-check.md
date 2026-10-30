@@ -119,6 +119,7 @@ coerces to `&FSet<'f, (PlaceKey<'p>, MirSpan)>` for `contains`.
 `impl<'db> Checker<'_, '_, '_, 'db>` (task 38's file: its only change).
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written; `use hir_ty::db::HirDatabase;` (in the tree before) stays, and B7.14 adds `Child`, `Sublevel`, `Suggestion`, `names::Text`, `std::fmt`. `parts.rs`'s impl is `impl<'f, 'db> Checker<'_, 'f, '_, 'db>`, not `<'_, '_, '_, 'db>`: B7.14's `Draft<'f>` sites there need `'f` named.
 
 ## B7.1 `check::check` (lines 41-286)
 
@@ -399,6 +400,7 @@ holds a capture index per mutation, a few dozen at most; `blaze_radix::sort` tak
 on integers both give the one sorted order.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written by the quotes, with B7.14's drafts in the output section (`checker.errors` -> `Draft::owned` into `out`). The moves phase also makes `Decoded` and `liveness`/`Loans::gather` take it (frontend-fast-borrowck's request in `db-ty-d-borrowck.md`), and the `Checker`'s `uninit`/`ever`/`in_scope` are `BitSet::new(frame, <width>)` loaded from `Rows` per block, in place of `for_rows_of`/`BitMatrix::row`.
 
 ## B7.2 The `Checker` (lines 616-674) and its helper types
 
@@ -552,6 +554,7 @@ was made from:
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written, with `errors: FVec<'f, Option<Draft<'f>>>` and `MoveError.diagnostic: Draft<'f>` per B7.14.
 
 ## B7.3 The per-access and per-statement paths: no allocation at all
 
@@ -559,6 +562,7 @@ These run on every body, error or not. After the change none of them allocates, 
 or the global allocator, on a body with no error.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): the subsections below, each in the tree.
 
 ### `PlaceRef::key` (lines 521-523)
 
@@ -579,6 +583,7 @@ after:
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:709 (`fn key(self) -> PlaceKey<'p>`).
 
 ### `access_place_only` (lines ~1246-1264), per access
 
@@ -612,6 +617,7 @@ hashing on an empty table):
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:915 (`(self.kept(place), span)` only on an error).
 
 ### `check_access_for_conflict` (lines ~1268-1384), per access
 
@@ -663,6 +669,7 @@ after:
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:1513 (`for &id in loans.of_local(..)`) and crates/hir-ty-borrowck/src/check.rs:1566 (`self.kept(place)`).
 
 ### `check_for_invalidation_at_unwind` (line ~1009), per terminator that may unwind, and `check_for_invalidation_at_exit` (line ~1419), per `Return`
 
@@ -722,12 +729,14 @@ empty slice, B2.1):
 loop sees the set the collected `Vec` had.)
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:1243 and crates/hir-ty-borrowck/src/check.rs:1654 (`std::mem::take(&mut self.in_scope)`).
 
 ### `mutate_place` (line ~1188)
 
 `&& !self.access_reported.contains(&(place.key(), span))` is unchanged text, now borrowed.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree: `access_reported` is an `FSet<(PlaceKey, MirSpan)>` (crates/hir-ty-borrowck/src/check.rs:844), so the `contains` borrows.
 
 ### `guard_conflict` (lines 680-728), per statement of a `match` guard
 
@@ -783,6 +792,7 @@ after (the description made in each branch that reports; the rest of each branch
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:900 (`Guard<'_, '_>`, `what` made in each reporting branch).
 
 ### `index_conflict` (line ~742)
 
@@ -791,6 +801,7 @@ unchanged (`fake.starts_with(projection)` on a `&&[PlaceElem]` derefs as on a `&
 walk passes `index_borrows.get(&it.span)`'s `&FVec<'_, PlaceKey<'_>>`, which derefs to it.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:967 (`protected: &[PlaceKey<'_>]`).
 
 ### `propagate_used_mut_upvars` (lines ~2232-2275), per closure the body makes
 
@@ -820,6 +831,7 @@ after:
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:2484 (`let count = fields.map_or(..)`).
 
 ### The locals bitsets at their uses
 
@@ -833,6 +845,7 @@ after:
   `!self.uninit_reported.insert(used.local)` -> `!self.uninit_reported.insert(raw(used.local))`.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:2555, 2658, 2685, 3107 (`raw(..)` at each).
 
 ### `check_movable_place` (lines ~2766, ~2805), per move out of a place it may not move from
 
@@ -846,6 +859,7 @@ Both `self.move_errors.push(MoveError { place: place.key(), location, span, kind
 (only when the move is an error: the moved type is not `Copy`).
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:3052 and 3083 (`let place = self.kept(place)`).
 
 ### `is_predecessor_of` (lines ~2777-2791) and its two callers
 
@@ -946,6 +960,7 @@ after:
 `explain.rs`'s `loop_head`: B7.9.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:3012 (`reaches`), 3038 (`reach_buffers`); `is_predecessor_of` is gone.
 
 ### What stays as it is, and why
 
@@ -963,10 +978,12 @@ after:
   is a speed change, not a memory one).
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): every subsection as written; the report sites in them build `Draft`s per B7.14.
 
 ## B7.4 The free functions of the setup, per body
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): the subsections below, each in the tree.
 
 ### `rustc_move_indices` (lines ~395-458)
 
@@ -1089,6 +1106,7 @@ fn rustc_move_indices<'f>(
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:570 (`-> FVec<'f, Option<usize>>`, frame bitsets).
 
 ### `upvar_sources` (lines ~462-485)
 
@@ -1111,6 +1129,7 @@ fn upvar_sources<'f, 'b>(
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:647 (`-> FMap<'f, LocalId, PlaceRef<'b>>`).
 
 ### `capture_temps` (lines ~3363-3385), `index_spans` (lines ~3353-3361), `static_muts` (lines ~3411-3428)
 
@@ -1147,6 +1166,7 @@ fn static_muts<'f>(ctx: &Ctx<'f, '_>, body: &MirBody<'_>) -> BitSet<'f> {
 `FxHashMap` did.)
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:3631, 3641, 3692 (frame maps, `static_muts -> BitSet<'f>`).
 
 ### `guard_borrows` and `Guard` (lines ~3108-3232)
 
@@ -1292,6 +1312,7 @@ fn guard_borrows<'f, 'b>(
 filtered `[a, b]` did, in that order. `Guard::default()` is used nowhere.)
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:3393 (`(FVec<'f, Guard<'f, 'b>>, FMap<'f, MirSpan, u32>)`).
 
 ### `index_borrows` (lines ~3238-3348)
 
@@ -1442,10 +1463,12 @@ fn index_borrows<'f, 'b, 'db>(
 output. `(LocalId, &[PlaceElem])` compares by contents, as the `Vec`s did.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written except `guard_borrows`: each `match`'s tested places are frozen with `mem::collect(frame, tested_of.into_iter().map(|it| &*it.leak()))` so `Guard.tested` is `&'f [PlaceKey<'b>]` (the quoted `map(Vec::leak)` gives `&mut` slices that `Guard` cannot share), and an arm's lists are taken with `mem::replace(.., (Vec::new_in(frame), Vec::new_in(frame)))` since a frame `Vec` has no `Default`. Same values, same order.
 
 ## B7.5 Move errors: the order of the output
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): the subsections below, each in the tree.
 
 ### Today's order, and rustc's
 
@@ -1472,6 +1495,7 @@ share a `rustc_key` (`rustc_moves` is injective), so `lib.rs`'s replacement logi
 depend on this order; only the order of `result.diagnostics` does.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:848-850 (`move_reported` frame vector, `move_reported_at` index map) and crates/hir-ty-borrowck/src/check.rs:435 (sorted by moves at output).
 
 ### `UseOfMoved` (lines ~378-388)
 
@@ -1505,6 +1529,7 @@ pub(super) struct UseOfMoved<'o> {
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:556 (`UseOfMoved<'o>`, `FVec<'o, ..>` key and place).
 
 ### `report_use_of_moved_or_uninitialized` (lines ~2842-2903), per use of a moved place
 
@@ -1584,6 +1609,7 @@ error stays where the first of its moves was reported, as `insert` on a `BTreeMa
 key's place, and the output sorts by the key anyway.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:3137-3185 (`out_frame`, `move_reported_at` lookup).
 
 ### `moved_indexes` (lines ~2905-2978), per use of a place moved or uninitialized
 
@@ -1611,6 +1637,7 @@ Vec::new();`, `let mut visit = |result: &mut Vec<usize>, location: Location| -> 
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:3196 (frame stack, back edges, `bits(frame, ..)` visited after dedup bits' rename).
 
 ### `report_move_errors` (lines ~2980-3028), once per body
 
@@ -1643,6 +1670,7 @@ usize)`, its `&error.place.1[..len]` unchanged text. `move_error_message` (line 
 `let place = PlaceRef { local: error.place.0, projection: error.place.1 };`.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written; the order is rustc's as the section gives it (`sort_unstable_by` on the move indices).
 
 ## B7.6 `unused_mut` (lines ~2326-2413), once per body
 
@@ -1778,6 +1806,7 @@ so the sort key is unique and the unstable sort gives the radix sort's order):
 one of `body.locals`, so going over them and testing `used_mut` gives that set.)
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written; the diagnostics are `Draft`s owned in `check`'s output (B7.14).
 
 ## B7.7 Region errors (lines ~1783-2186)
 
@@ -1787,6 +1816,7 @@ allocates nothing on such a body: `failing` is a frame vector pushed to only whe
 fails, the type tests walk the region values' bitset rows without collecting them.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): the subsections below, each in the tree.
 
 ### `report_region_errors`
 
@@ -1828,6 +1858,7 @@ is unchanged (R0.1: a frame vector, only for a failing region). Line ~1892 `let 
 FxHashSet::default();` -> `let mut reported = mem::set(self.ctx.frame);`.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:2022, 2029, 2125 (`mem::set`, frame `failing`).
 
 ### `propagate` (lines ~1958-2017), per failing region of a closure
 
@@ -1884,6 +1915,7 @@ after:
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:2200 (`longer_minus: FVec<'f, usize>`).
 
 ### `non_local_upper_bounds` (lines ~2041-2063)
 
@@ -1918,6 +1950,7 @@ Before: `-> Vec<usize>`, `return vec![universal];`, `let upper: Vec<usize> = (0.
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check.rs:2284 (`-> FVec<'f, usize>`).
 
 ### `type_test_holds` and `alias_test_holds` (lines ~2078-2186), per type test of every body
 
@@ -2014,6 +2047,7 @@ after:
 ~2166, its uses of `captured` (indexing, `is_some`) unchanged.)
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written.
 
 ## B7.8 `member_choices` (lines ~292-340), per body
 
@@ -2091,6 +2125,7 @@ fn member_choices<'f>(
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written.
 
 ## B7.9 `check/explain.rs`: what the explanations build
 
@@ -2100,6 +2135,7 @@ stays (for `VecDeque::with_capacity_in`); line 20-26 `use crate::{..}` gains
 `mem::{FDeque, FVec}`; line 80 becomes `impl<'f, 'db> Checker<'_, 'f, '_, 'db> {`.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): the subsections below, each in the tree.
 
 ### `borrowed_variable` (lines 236-254), per error with a borrow span
 
@@ -2118,6 +2154,7 @@ borrowed from the store, which the label's `text!` copies into the frame, B7.14)
 (`Ctx::store` is `&'a ExpressionStore` of `Ctx<'a, 'db>`, here `&'f`.)
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check/explain.rs:240 (`-> Option<(BindingId, &'f str)>`).
 
 ### `sub_region_live_at` (lines 259-277), per explained loan
 
@@ -2140,6 +2177,7 @@ after (each region is queued at most once, so `count` is the queue's bound and i
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check/explain.rs:268 (frame `FDeque`, `BitSet` seen).
 
 ### `loop_head` (lines 284-296), per explained loan whose region holds where the access is
 
@@ -2164,6 +2202,7 @@ stack per loop head of the region. After (one pair for the walk, B7.3):
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> checked by db-audit-mem (22:33): in the tree at crates/hir-ty-borrowck/src/check/explain.rs:290-291 (`reach_buffers`, `reaches`).
 
 ### `find_use` (lines 300-338), per explained loan
 
@@ -2195,6 +2234,7 @@ by the points; it starts at 16 and grows in the frame.)
 `Draft::owned`.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written; `explain.rs`'s `fn raw` went and it imports `super::{Checker, Draft, raw}`.
 
 ## B7.10 The budget test
 
@@ -2381,6 +2421,7 @@ test names the function where they do. That failure is theirs to clear, not a re
 the budget.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): `frame_only` at the end of `check.rs` as written. The test is in `check/tests.rs`, not a new `mod tests` in `check.rs`: `check.rs` already declares `mod tests;` for task 38's tests. `GLOBAL` is there as `pub(super)`, the fixture is `CLEAN` (`FIXTURE` is task 38's), and it uses that file's `TestDB = base_db::Db` (what `scan::tests::db::TestDB` aliases).
 
 ## B7.11 What this part asks of `mem-db-checks-regions` (`regions.rs`)
 
@@ -2400,9 +2441,14 @@ Settled: this part is written against R0.1 of `v2/requests/mem-db-checks-regions
    `.into_iter()` (B7.7).
 5. `opaque_captures(frame, db, opaque, len) -> Option<FVec<'f, bool>>`: `alias_test_holds`
    passes `self.ctx.frame` (B7.7).
-6. `adt_variants`, `path_binding`, `spells_generics`, `alias_def_id`, `rv_of`, `normalize`:
-   unchanged.
-7. `Regions<'f, 'db>`, `RegionValues<'f>` and `Constraints<'f>` per B3; `universals`,
+6. `adt_variants(db, adt) -> impl Iterator<Item = VariantId> + '_` (R8): neither `check.rs` nor
+   `explain.rs` calls it. `parts.rs` ~267's `adt_variants(db, adt).into_iter().all(..)` still
+   compiles (an iterator is `IntoIterator`; its `.into_iter()` may go). `names.rs` ~105 is in
+   B7.14. `member_regions(frame, ..)` (R8): not called by this part.
+7. `path_binding`, `spells_generics`, `alias_def_id`, `rv_of`, `normalize`: unchanged.
+8. `type_bounds_of` stays the iterator (`mem-db-checks-regions` withdrew its delete), as item
+   4 and B7.7 use it.
+9. `Regions<'f, 'db>`, `RegionValues<'f>` and `Constraints<'f>` per B3; `universals`,
    `type_bounds`, `members`, `choices`, `creator_positions`, `outlives`, `local_tys`,
    `related_placeholders`, `normalized_placeholders`, `unsuggested` keep their names and stay
    indexable, iterable and `contains`/`get`-able as this part uses them.
@@ -2414,6 +2460,7 @@ And of the parent (B5): `InitFlow::compute(frame, body, cfg, moves)` and
 these; B7.12 has the call sites against it.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): nothing to edit here; check.rs calls `regions.rs` with R0.1's signatures.
 
 ## B7.12 `check`'s calls of B5's analyses
 
@@ -2455,6 +2502,7 @@ after:
 ```
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): as written (`compute_polonius_scopes`/`compute_scopes`/`entry_sets` take `ctx`).
 
 ## B7.13 With `dedup: bits` (`v2/requests/db.md`): settled
 
@@ -2463,11 +2511,15 @@ superseded by "## dedup: bits: hir-ty-borrowck on frame words (supersedes the on
 section is applied after B2 and B7:
 
 - `bitset.rs` keeps `BitSet<'f> = blaze_ids::bits::BitSliceMut<'f>` and
-  `BitMatrix<'f> = blaze_ids::bits::BitMatrix<&'f mut [u64]>`, with the frame constructors
-  `bits`, `filled_bits`, `bits_for_rows_of`, `bits_copy` and `matrix`.
+  `BitMatrix<'f> = blaze_ids::bits::BitMatrix<usize, &'f mut [u64]>`, with the frame
+  constructors `bits`, `filled_bits`, `bits_for_rows_of`, `bits_copy` and `matrix`.
+  `matrix(frame, rows, columns)` builds it with
+  `BitMatrix::<usize, &mut [u64]>::from_words(rows, columns, data)`.
 - `Transfer` is implemented for `Bits<S: WordsMut>`, so `moves::apply` still drives
   `checker.uninit`/`ever` (`check.rs` ~235).
-- `BitMatrix`'s storage parameter is asked of `dedup-bits-next1`.
+- `BitMatrix`'s storage parameter has landed in `crates/blaze-ids/src/bits.rs` with the index
+  type first: `BitMatrix<I = usize, S = Vec<u64>>`. With the storage first, `overlap.rs`'s
+  `BitMatrix<usize>` and diagnostics' `BitMatrix<Index>` would break.
 
 Its section 2 renames B2's and B7's spellings across `crates/hir-ty-borrowck/src/`. This
 request keeps B2.1's spellings, and that rename turns them into the dedup's. This part uses:
@@ -2483,6 +2535,7 @@ request keeps B2.1's spellings, and that rename turns them into the dedup's. Thi
 With the sets in the frame, B7.10 and T1 hold under either spelling; nothing else in B7 changes.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): nothing to edit (settled).
 
 ## B7.14 Diagnostics drafted in the frame, owned once (T1)
 
@@ -2819,6 +2872,9 @@ impl fmt::Write for Text<'_> {
 }
 ```
 
+`from_external_macro` (lines 75-92) is not touched here. It reads a `SyntaxNode`, which
+`frontend-tree` may move to `syntax::view`, and nothing in B7 adds a `SyntaxNode` use.
+
 `local_name` (lines 22-28) returns `Option<&'a str>`: `Some(self.store[binding].name.as_str())`,
 no copy. Its callers only test it or print it (`explain.rs` 116-117, 198, 530; `check.rs`
 ~2856). `describe` (lines 31-70) returns `Option<&'a str>`, written into one `Text`:
@@ -2869,7 +2925,10 @@ no copy. Its callers only test it or print it (`explain.rs` 116-117, 198, 530; `
 ```
 
 `capture_name(&self, upvar: usize, out: &mut Text<'_>)` does the same: `out.push` the binding's
-name, `out.prefix(b'*')` for a `Deref`, and `out.push(".")` then the field. `variant_field_name`
+name, `out.prefix(b'*')` for a `Deref`, and `out.push(".")` then the field. Its variant lookup
+(line ~105) `adt_variants(self.db, def.def_id()).get(variant_idx as usize).copied()` becomes
+`adt_variants(self.db, def.def_id()).nth(variant_idx as usize)`, as `adt_variants` now
+returns an iterator (R8 of `v2/requests/mem-db-checks-regions.md`). `variant_field_name`
 and `field_name` gain `out: &mut Text<'_>` and write `data.name.as_str()` with `out.push`, or
 the index with `write!(out, "{field}")` (`fmt::Write`; infallible here, so
 `let _ = write!(..)` or `.expect(..)`), for `.to_string()`. Each name builds the same bytes as
@@ -2890,6 +2949,8 @@ every `format!` does today, and runs only when an error is reported. The walk (B
 nothing through a `dyn`.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck (21:40): the `names.rs` subsection only (`Text`, `local_name`/`describe` -> `Option<&'a str>`, `capture_name`/`variant_field_name`/`field_name` writing into a `Text`); the rest of B7.14 is db-mem-borrowck-check's. The variant lookup is `adt_variants(..).into_iter().nth(i)`, which serves both today's `Vec` and R8's iterator.
+> applied by db-mem-borrowck-check (21:46): the types and helpers, the `Checker`'s text helpers and every site in `check.rs`, `check/explain.rs` and `check/parts.rs` (task 38's `*_parts` builders: `text!(self, ..)` for each `format!`, `diagnostic.child(..)`/`suggest(.., &[..])` with frame slices, `type_no_copy` drafting through `text!(diagnostic, ..)`). The `names.rs` subsection is db-mem-borrowck's, applied above. Two `".clone()"` suggestion literals in `parts.rs` carry `// clone:` for hot_lint.
 
 ## B7.15 The bound, and how close the code comes to it
 
@@ -2942,3 +3003,5 @@ errors sorted by their moves (B7.5); `unused_mut` by local (B7.6); nothing itera
 into the output.
 
 > forwarded to db (`hir-ty-borrowck`) (from requests, pass 17; told by tmux).
+> applied by db-mem-borrowck-check (21:46): nothing to edit (the bound).
+

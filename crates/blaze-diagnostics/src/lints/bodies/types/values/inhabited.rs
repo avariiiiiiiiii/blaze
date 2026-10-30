@@ -59,6 +59,7 @@ impl<'s, 'db> Preds<'s, 'db> {
     /// inhabited, and only local opaque types are looked into.
     pub(super) fn new(solver: &'s Solver<'db>, krate: base_db::Crate) -> Preds<'s, 'db> {
         let db = solver.interner().db;
+        // alloc: empty, pushed to only for an `And` or `Or` of a type asked about
         Preds { solver, db, krate, pairs: Vec::new(), adts: FxHashMap::default() }
     }
 
@@ -121,9 +122,12 @@ impl<'s, 'db> Preds<'s, 'db> {
         // An ADT inside itself is an infinitely sized type, which is an error of its own.
         self.adts.insert(adt, Pred::True);
         let variants: SmallVec<[VariantId; 4]> = match adt {
+            // alloc: inline, a `SmallVec` of one allocates nothing
             AdtId::StructId(it) => [VariantId::StructId(it)].into_iter().collect(),
+            // alloc: inline, a `SmallVec` of one allocates nothing
             AdtId::UnionId(it) => [VariantId::UnionId(it)].into_iter().collect(),
             AdtId::EnumId(it) => {
+                // alloc: inline but for an enum of more than four variants, once per ADT (kept in `adts`)
                 it.enum_variants(self.db).variants.values().map(|&(it, _)| VariantId::EnumVariantId(it)).collect()
             }
         };

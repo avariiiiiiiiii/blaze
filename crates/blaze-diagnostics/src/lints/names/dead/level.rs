@@ -17,9 +17,11 @@ use hir::{HirFileId, InFile};
 use hir_expand::MacroCallKind;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, ast};
+use syntax::{
+    SyntaxKind, SyntaxNodePtr,
+    view::{self as ast, AstNode as _},
+};
 
-use super::defs::cast;
 use crate::{
     cx::Cx,
     lints::registry::{self, Level, LintId, Named},
@@ -64,7 +66,7 @@ impl Levels {
     }
 
     /// The level of `dead_code` at `node`.
-    pub(super) fn at(&self, cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>) -> LevelPlus {
+    pub(super) fn at<'db>(&self, cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> LevelPlus {
         let state = self.state(cx, node);
         let level = state.dead_code.unwrap_or(LevelPlus { level: default_level(), expect: None });
         if level.level == Level::Warn
@@ -78,26 +80,26 @@ impl Levels {
 
     /// What is set at `node`: the state of the nearest memoized node above it, then the
     /// attributes of the nodes with attributes between, outermost first, each memoized.
-    fn state(&self, cx: &Cx<'_, '_>, node: InFile<&SyntaxNode>) -> State {
-        let mut pending: SmallVec<[(SyntaxNodePtr, ast::AnyHasAttrs); 4]> = SmallVec::new();
+    fn state<'db>(&self, cx: &Cx<'_, 'db>, node: InFile<ast::Node<'db>>) -> State {
+        let mut pending: SmallVec<[(SyntaxNodePtr, ast::AnyHasAttrs<'db>); 4]> = SmallVec::new();
         let mut base = None;
-        let mut top = None;
+        let mut top = node.value;
         for ancestor in node.value.ancestors() {
-            if let Some(owner) = cast::<ast::AnyHasAttrs>(&ancestor)
+            if let Some(owner) = ast::AnyHasAttrs::cast(ancestor)
                 && ast::attrs_including_inner(&owner).next().is_some()
             {
-                let ptr = SyntaxNodePtr::new(&ancestor);
+                let ptr = ast::ptr(ancestor);
                 if let Some(&state) = self.owners.borrow().get(&node.with_value(ptr)) {
                     base = Some(state);
                     break;
                 }
                 pending.push((ptr, owner));
             }
-            top = Some(ancestor);
+            top = ancestor;
         }
         let mut state = match base {
             Some(it) => it,
-            None => self.above_file(cx, node.file_id, top.as_ref().unwrap_or(node.value)),
+            None => self.above_file(cx, node.file_id, top),
         };
         for (ptr, owner) in pending.into_iter().rev() {
             apply(cx, node.with_value(owner), ptr, &mut state);
@@ -107,12 +109,12 @@ impl Levels {
     }
 
     /// What is set above the root `top` of `file`.
-    fn above_file(&self, cx: &Cx<'_, '_>, file: HirFileId, top: &SyntaxNode) -> State {
+    fn above_file<'db>(&self, cx: &Cx<'_, 'db>, file: HirFileId, top: ast::Node<'db>) -> State {
         if let Some(&state) = self.files.borrow().get(&file) {
             return state;
         }
         let state = match above(cx, file, top) {
-            Some(node) => self.state(cx, node.as_ref()),
+            Some(node) => self.state(cx, node),
             None => State::default(),
         };
         self.files.borrow_mut().insert(file, state);
@@ -127,9 +129,9 @@ fn default_level() -> Level {
 /// Where the levels at the root `top` of `file` come from: the macro call it was expanded from
 /// (for a derive's or an attribute's, what is around the item), or the declaration of the
 /// module whose file it is.
-fn above(cx: &Cx<'_, '_>, file: HirFileId, top: &SyntaxNode) -> Option<InFile<SyntaxNode>> {
+fn above<'db>(cx: &Cx<'_, 'db>, file: HirFileId, top: ast::Node<'db>) -> Option<InFile<ast::Node<'db>>> {
     if let Some(call) = file.macro_file() {
-        let node = call.call_node(cx.db);
+        let node = call.call_node_view(cx.db);
         return match call.loc(cx.db).kind {
             MacroCallKind::FnLike { .. } => Some(node),
             MacroCallKind::Derive { .. } | MacroCallKind::Attr { .. } => {
@@ -142,20 +144,20 @@ fn above(cx: &Cx<'_, '_>, file: HirFileId, top: &SyntaxNode) -> Option<InFile<Sy
     if top.kind() != SyntaxKind::SOURCE_FILE {
         return None;
     }
-    let module = cx.sema.file_to_module_def(file.file_id(cx.db))?;
+    let module = cx.vsema.file_to_module_def(file.file_id(cx.db))?;
     if module.is_crate_root(cx.db) {
         return None;
     }
-    let declaration = module.declaration_source(cx.db)?;
-    Some(declaration.map(|it| it.syntax().clone())) // clone: a refcount, once per file
+    let declaration = module.declaration_source_view(cx.db)?;
+    Some(declaration.map(|it| it.syntax()))
 }
 
 /// The lint attributes of `owner` (whose node is `ptr`), in order, as they set `dead_code` and
 /// `warnings`.
-fn apply(cx: &Cx<'_, '_>, owner: InFile<ast::AnyHasAttrs>, ptr: SyntaxNodePtr, state: &mut State) {
+fn apply<'db>(cx: &Cx<'_, 'db>, owner: InFile<ast::AnyHasAttrs<'db>>, ptr: SyntaxNodePtr, state: &mut State) {
     let file = owner.file_id.original_file(cx.db).file_id(cx.db);
     let ptr = owner.with_value(ptr);
-    for (index, (attr, name)) in cx.sema.lint_attrs(file, cx.krate, owner.value).enumerate() {
+    for (index, (attr, name)) in cx.vsema.lint_attrs(file, cx.krate, owner.value).enumerate() {
         let level = match attr {
             hir::LintAttr::Allow => Level::Allow,
             hir::LintAttr::Expect => Level::Expect,

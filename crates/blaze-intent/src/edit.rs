@@ -3,7 +3,8 @@
 
 use blaze_api::{Edit, How};
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize, ast,
+    NodeOrToken, SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _, Node, Token},
 };
 
 use crate::{
@@ -46,8 +47,20 @@ pub fn file_of(edit: &Edit) -> &str {
 /// Makes `edit`, which is no rename, in `file` (the request's `index`th), adding what it
 /// touched to `out`.
 pub fn apply(file: &mut Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) -> Result<(), String> {
+    let (delete, insert) = splice_of(file, index, edit, out)?;
+    let inserted = TextRange::at(delete.start(), TextSize::of(insert.as_str()));
+    file.splice(delete, insert)?;
+    if let Edit::AddItem { .. } = edit {
+        added(file, index, inserted, out);
+    }
+    Ok(())
+}
+
+/// The one splice `edit` makes in `file` as the edits before it left it, adding what it touches
+/// to `out`.
+fn splice_of(file: &Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) -> Result<(TextRange, String), String> {
     let root = file.root();
-    let found = |item: &str| path::find(&root, item).map_err(|error| format!("{}: {error}", file.path));
+    let found = |item: &str| path::find(root, item).map_err(|error| format!("{}: {error}", file.path));
     match edit {
         Edit::ReplaceBody { body, item } => {
             let node = expect(found(&item.item)?, &[Kind::Fn], &item.item)?;
@@ -55,83 +68,76 @@ pub fn apply(file: &mut Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) 
             if !trimmed.starts_with('{') || !trimmed.ends_with('}') {
                 return Err(format!("the body given for `{}` is no block `{{ … }}`", item.item));
             }
-            let at = base_of(file, &node)?;
-            let function = ast::Fn::cast(node.clone()).expect("a fn node");
+            let at = base_of(file, node)?;
+            let function = ast::Fn::cast(node).expect("a fn node");
             match function.body() {
                 Some(block) => {
                     out.push(Touch { file: index, at, how: How::Body });
-                    file.splice(block.syntax().text_range(), body.clone())
+                    Ok((block.syntax().text_range(), body.clone()))
                 }
                 None => {
                     let semicolon = function.semicolon_token().ok_or_else(|| {
                         format!("`{}` has neither a body nor a `;` to put one in place of", item.item)
                     })?;
                     out.push(Touch { file: index, at, how: How::Whole });
-                    file.splice(semicolon.text_range(), format!(" {body}"))
+                    Ok((semicolon.text_range(), format!(" {body}")))
                 }
             }
         }
         Edit::ReplaceSignature { item, signature } => {
             let node = expect(found(&item.item)?, &[Kind::Fn], &item.item)?;
-            let start = first_own_token(&node).ok_or_else(|| format!("`{}` is empty", item.item))?;
-            let function = ast::Fn::cast(node.clone()).expect("a fn node");
+            let start = first_own_token(node).ok_or_else(|| format!("`{}` is empty", item.item))?;
+            let function = ast::Fn::cast(node).expect("a fn node");
             let end = match (function.body(), function.semicolon_token()) {
                 (Some(block), _) => block.syntax().text_range().start(),
                 (None, Some(semicolon)) => semicolon.text_range().start(),
                 (None, None) => node.text_range().end(),
             };
-            let end = trim_back(&file.text, start, end);
-            out.push(Touch { file: index, at: base_of(file, &node)?, how: How::Signature });
-            file.splice(TextRange::new(start, end), signature.clone())
+            let end = trim_back(file.text(), start, end);
+            out.push(Touch { file: index, at: base_of(file, node)?, how: How::Signature });
+            Ok((TextRange::new(start, end), signature.clone()))
         }
         Edit::ReplaceItem { item, text } => {
             let node = found(&item.item)?;
-            let top = path::top_of(&node).expect("a path names a top item or what is in one");
+            let top = path::top_of(node).expect("a path names a top item or what is in one");
             let how = if top == node { How::Whole } else { How::Fields };
-            out.push(Touch { file: index, at: base_of(file, &top)?, how });
-            file.splice(node.text_range(), text.clone())
+            out.push(Touch { file: index, at: base_of(file, top)?, how });
+            Ok((node.text_range(), text.clone()))
         }
         Edit::AddField { field, strukt } => {
             let node = expect(found(&strukt.item)?, &[Kind::Struct, Kind::Union, Kind::Variant], &strukt.item)?;
-            let top = path::top_of(&node).expect("a struct, union or variant is in a top item");
-            out.push(Touch { file: index, at: base_of(file, &top)?, how: How::Fields });
-            let (delete, insert) = add_field(&file.text, &node, field)?;
-            file.splice(delete, insert)
+            let top = path::top_of(node).expect("a struct, union or variant is in a top item");
+            out.push(Touch { file: index, at: base_of(file, top)?, how: How::Fields });
+            add_field(file.text(), node, field)
         }
         Edit::RemoveField { field, strukt } => {
             let node = expect(found(&strukt.item)?, &[Kind::Struct, Kind::Union, Kind::Variant], &strukt.item)?;
-            let target = path::members(&node)
-                .into_iter()
-                .find(|it| path::name_of(it).as_deref() == Some(field.as_str()))
+            let target = path::members(node)
+                .find(|it| path::name_of(*it).as_deref() == Some(field.as_str()))
                 .ok_or_else(|| format!("{}: `{}` has no field `{field}`", file.path, strukt.item))?;
-            let top = path::top_of(&node).expect("a struct, union or variant is in a top item");
-            out.push(Touch { file: index, at: base_of(file, &top)?, how: How::Fields });
-            file.splice(remove_entry(&file.text, &target), String::new())
+            let top = path::top_of(node).expect("a struct, union or variant is in a top item");
+            out.push(Touch { file: index, at: base_of(file, top)?, how: How::Fields });
+            Ok((remove_entry(file.text(), target), String::new()))
         }
         Edit::RemoveItem { item } => {
             let node = found(&item.item)?;
-            let top = path::top_of(&node).expect("a path names a top item or what is in one");
+            let top = path::top_of(node).expect("a path names a top item or what is in one");
             if top != node {
-                out.push(Touch { file: index, at: base_of(file, &top)?, how: How::Fields });
-                return file.splice(remove_entry(&file.text, &node), String::new());
+                out.push(Touch { file: index, at: base_of(file, top)?, how: How::Fields });
+                return Ok((remove_entry(file.text(), node), String::new()));
             }
-            out.push(Touch { file: index, at: base_of(file, &node)?, how: How::Removed });
-            out.push(Touch { file: index, at: scope_at(file, &node)?, how: How::Scope });
-            file.splice(remove_line(&file.text, file.end, node.text_range()), String::new())
+            out.push(Touch { file: index, at: base_of(file, node)?, how: How::Removed });
+            out.push(Touch { file: index, at: scope_at(file, node)?, how: How::Scope });
+            Ok((remove_line(file.text(), file.end, node.text_range()), String::new()))
         }
         Edit::AddItem { file: _, into, text } => {
             let container = container(file, into.as_deref())?;
-            let at = match &container {
+            let at = match container {
                 Some(node) => base_of(file, node)?,
                 None => At::File,
             };
             out.push(Touch { file: index, at, how: How::Scope });
-            let scope = container.unwrap_or_else(|| root.clone());
-            let (delete, insert) = add_item(&file.text, file.end, &scope, text)?;
-            let inserted = TextRange::at(delete.start(), TextSize::of(insert.as_str()));
-            file.splice(delete, insert)?;
-            added(file, index, inserted, out);
-            Ok(())
+            add_item(file.text(), file.end, container.unwrap_or(root), text)
         }
         Edit::AddUse { file: _, into, path: used } => {
             let used = used.trim();
@@ -139,36 +145,32 @@ pub fn apply(file: &mut Working, index: u32, edit: &Edit, out: &mut Vec<Touch>) 
                 return Err(format!("`{used}` is no path to use: give it without `use` and `;`"));
             }
             let container = container(file, into.as_deref())?;
-            if container.as_ref().is_some_and(|it| it.kind() != SyntaxKind::MODULE) {
+            if container.is_some_and(|it| it.kind() != SyntaxKind::MODULE) {
                 return Err(format!("{}: a use goes in a module, and `{}` is none", file.path, into.as_deref().unwrap_or("")));
             }
-            let scope = container.clone().unwrap_or_else(|| root.clone());
-            let wanted: String = used.chars().filter(|it| !it.is_whitespace()).collect();
-            let present = items_of(&scope).into_iter().any(|it| {
-                ast::Use::cast(it)
-                    .and_then(|it| it.use_tree())
-                    .is_some_and(|tree| {
-                        tree.syntax().text().to_string().chars().filter(|it| !it.is_whitespace()).collect::<String>()
-                            == wanted
-                    })
+            let scope = container.unwrap_or(root);
+            let wanted = used.chars().filter(|it| !it.is_whitespace());
+            let present = items_of(scope).any(|it| {
+                ast::Use::cast(it).and_then(|it| it.use_tree()).is_some_and(|tree| {
+                    tree.syntax().text().chars().filter(|it| !it.is_whitespace()).eq(wanted.clone())
+                })
             });
             if present {
                 return Err(format!("{}: `use {used};` is there already", file.path));
             }
-            let at = match &container {
+            let at = match container {
                 Some(node) => base_of(file, node)?,
                 None => At::File,
             };
             out.push(Touch { file: index, at, how: How::Scope });
-            let (delete, insert) = add_use(&file.text, file.end, &scope, used)?;
-            file.splice(delete, insert)
+            add_use(file.text(), file.end, scope, used)
         }
         Edit::Rename { .. } => unreachable!("a rename is made by `crate::rename`"),
     }
 }
 
 /// `node` when it is one of `kinds`, else an error naming what it is.
-fn expect(node: SyntaxNode, kinds: &[Kind], path: &str) -> Result<SyntaxNode, String> {
+fn expect<'t>(node: Node<'t>, kinds: &[Kind], path: &str) -> Result<Node<'t>, String> {
     match Kind::of(node.kind()) {
         Some(kind) if kinds.contains(&kind) => Ok(node),
         kind => {
@@ -182,24 +184,31 @@ fn expect(node: SyntaxNode, kinds: &[Kind], path: &str) -> Result<SyntaxNode, St
     }
 }
 
-/// The top item of the base tree `root` that starts at `offset`.
-pub fn item_at(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxNode> {
-    let token = root.token_at_offset(offset).right_biased()?;
-    token.parent_ancestors().find(|it| path::is_top(it) && it.text_range().start() == offset)
+/// The top item of the base tree `root` that starts at `offset`: found down from the root by
+/// binary search of each level's children, then up to the item.
+pub fn item_at(root: Node<'_>, offset: TextSize) -> Option<Node<'_>> {
+    if offset >= root.text_range().end() {
+        return None;
+    }
+    let first = match root.covering_element(TextRange::at(offset, 1.into())) {
+        NodeOrToken::Node(node) => node,
+        NodeOrToken::Token(token) => token.parent()?,
+    };
+    first.ancestors().find(|it| path::is_top(*it) && it.text_range().start() == offset)
 }
 
 /// The path an item touched is named by: in the base file, or as the edits left it when they
 /// added it; empty for the file's own module.
 pub fn path_at(file: &Working, at: &At) -> String {
     match at {
-        At::Item(offset) => path::of(&item_at(&file.base, *offset).expect("a touched item starts there")),
+        At::Item(offset) => path::of(item_at(file.base(), *offset).expect("a touched item starts there")),
         At::File => String::new(),
         At::Added(path) => path.clone(),
     }
 }
 
 /// Where a top item of the file as edited so far was in the base file.
-pub fn base_of(file: &Working, item: &SyntaxNode) -> Result<At, String> {
+pub fn base_of(file: &Working, item: Node<'_>) -> Result<At, String> {
     file.to_base(item.text_range().start()).map(At::Item).ok_or_else(|| {
         format!(
             "{}: `{}` was added by an earlier edit of this request: edit it in the edit that adds it",
@@ -210,17 +219,17 @@ pub fn base_of(file: &Working, item: &SyntaxNode) -> Result<At, String> {
 }
 
 /// The scope a top item is in: its module, impl or trait, or the file.
-fn scope_at(file: &Working, item: &SyntaxNode) -> Result<At, String> {
+fn scope_at(file: &Working, item: Node<'_>) -> Result<At, String> {
     match path::scope_of(item) {
-        Some(scope) => base_of(file, &scope),
+        Some(scope) => base_of(file, scope),
         None => Ok(At::File),
     }
 }
 
 /// The module, impl or trait `into` names, `None` for the file.
-fn container(file: &Working, into: Option<&str>) -> Result<Option<SyntaxNode>, String> {
+fn container<'f>(file: &'f Working, into: Option<&str>) -> Result<Option<Node<'f>>, String> {
     let Some(into) = into else { return Ok(None) };
-    let node = path::find(&file.root(), into).map_err(|error| format!("{}: {error}", file.path))?;
+    let node = path::find(file.root(), into).map_err(|error| format!("{}: {error}", file.path))?;
     let node = expect(node, &[Kind::Mod, Kind::Impl, Kind::Trait], into)?;
     if node.kind() == SyntaxKind::MODULE
         && node.child_where(|it| it == SyntaxKind::ITEM_LIST).is_none()
@@ -235,22 +244,19 @@ fn container(file: &Working, into: Option<&str>) -> Result<Option<SyntaxNode>, S
 
 /// The items a scope (the file, a module, an impl or a trait) holds, in order, uses and
 /// macro calls among them.
-fn items_of(scope: &SyntaxNode) -> Vec<SyntaxNode> {
+fn items_of<'t>(scope: Node<'t>) -> impl Iterator<Item = Node<'t>> {
     let list = match scope.kind() {
-        SyntaxKind::SOURCE_FILE => Some(scope.clone()),
+        SyntaxKind::SOURCE_FILE => Some(scope),
         SyntaxKind::MODULE => scope.child_where(|it| it == SyntaxKind::ITEM_LIST),
         _ => scope.child_where(|it| it == SyntaxKind::ASSOC_ITEM_LIST),
     };
-    list.map(|list| {
-        list.children()
-            .filter(|it| ast::Item::can_cast(it.kind()) || ast::AssocItem::can_cast(it.kind()))
-            .collect()
-    })
-    .unwrap_or_default()
+    list.into_iter()
+        .flat_map(Node::children)
+        .filter(|it| ast::Item::can_cast(it.kind()) || ast::AssocItem::can_cast(it.kind()))
 }
 
 /// The braces (or the file's ends) of a scope's list.
-fn list_bounds(scope: &SyntaxNode, end: usize) -> Option<(TextSize, TextSize)> {
+fn list_bounds(scope: Node<'_>, end: usize) -> Option<(TextSize, TextSize)> {
     if scope.kind() == SyntaxKind::SOURCE_FILE {
         let start = scope
             .children_with_tokens()
@@ -271,7 +277,7 @@ fn list_bounds(scope: &SyntaxNode, end: usize) -> Option<(TextSize, TextSize)> {
 
 /// The first token of an item that is neither an attribute, a comment nor whitespace: where its
 /// signature begins.
-fn first_own_token(node: &SyntaxNode) -> Option<TextSize> {
+fn first_own_token(node: Node<'_>) -> Option<TextSize> {
     node.children_with_tokens()
         .find(|it| it.kind() != SyntaxKind::ATTR && !it.kind().is_trivia())
         .map(|it| it.text_range().start())
@@ -284,7 +290,7 @@ fn trim_back(text: &str, start: TextSize, end: TextSize) -> TextSize {
 }
 
 /// The comma right after `node` among its siblings, past trivia.
-fn comma_after(node: &SyntaxNode) -> Option<SyntaxToken> {
+fn comma_after(node: Node<'_>) -> Option<Token<'_>> {
     let mut at = node.next_sibling_or_token();
     while let Some(element) = at {
         match element {
@@ -332,14 +338,14 @@ fn size(at: usize) -> TextSize {
 
 /// The splice adding `field` last to `node`'s fields, in the list's own style: one per line
 /// when the list spans lines, a trailing comma when the last field has one.
-fn add_field(text: &str, node: &SyntaxNode, field: &str) -> Result<(TextRange, String), String> {
+fn add_field(text: &str, node: Node<'_>, field: &str) -> Result<(TextRange, String), String> {
     let field = field.trim();
     let named = is_named(field);
     let list = node.child_where(|it| it == SyntaxKind::RECORD_FIELD_LIST || it == SyntaxKind::TUPLE_FIELD_LIST);
     let Some(list) = list else {
         let (open, close) = if named { (" { ", " }") } else { ("(", ")") };
         let insert = format!("{open}{field}{close}");
-        return Ok(match ast::Struct::cast(node.clone()).and_then(|it| it.semicolon_token()) {
+        return Ok(match ast::Struct::cast(node).and_then(|it| it.semicolon_token()) {
             Some(semicolon) if named => (semicolon.text_range(), insert),
             Some(semicolon) => (TextRange::empty(semicolon.text_range().start()), insert),
             None => {
@@ -371,21 +377,21 @@ fn add_field(text: &str, node: &SyntaxNode, field: &str) -> Result<(TextRange, S
     };
     let open = list.child_token(open).ok_or("a field list with no opening bracket")?;
     let close = list.child_token(close).ok_or("a field list with no closing bracket")?;
-    let fields: Vec<SyntaxNode> = path::members(node);
-    add_entry(text, &fields, open.text_range().end(), close.text_range().start(), field, record)
+    let last = path::members(node).last();
+    add_entry(text, last, open.text_range().end(), close.text_range().start(), field, record)
 }
 
-/// The splice adding `entry` after the last of `entries`, which lie between `open` and
+/// The splice adding `entry` after `last`, the last of the entries that lie between `open` and
 /// `close`.
 fn add_entry(
     text: &str,
-    entries: &[SyntaxNode],
+    last: Option<Node<'_>>,
     open: TextSize,
     close: TextSize,
     entry: &str,
     spaced: bool,
 ) -> Result<(TextRange, String), String> {
-    let Some(last) = entries.last() else {
+    let Some(last) = last else {
         let insert = if spaced { format!(" {entry} ") } else { entry.to_owned() };
         return Ok((TextRange::new(open, close), insert));
     };
@@ -411,20 +417,20 @@ fn add_entry(
 }
 
 /// The range that removes a field or variant with its comma, keeping the list's style.
-fn remove_entry(text: &str, entry: &SyntaxNode) -> TextRange {
+fn remove_entry(text: &str, entry: Node<'_>) -> TextRange {
     let list = entry.parent().expect("a field or variant is in a list");
-    let entries: Vec<SyntaxNode> = list.children().filter(|it| it.kind() == entry.kind()).collect();
-    let at = entries.iter().position(|it| it == entry).expect("an entry is in its list");
+    let kind = entry.kind();
+    let previous = std::iter::successors(entry.prev_sibling(), |it| it.prev_sibling()).find(|it| it.kind() == kind);
+    let next = std::iter::successors(entry.next_sibling(), |it| it.next_sibling()).find(|it| it.kind() == kind);
     let range = entry.text_range();
-    if entries.len() == 1 {
+    if let Some(next) = next {
+        return TextRange::new(range.start(), next.text_range().start());
+    }
+    let Some(previous) = previous else {
         let open = list.first_token().expect("a list opens").text_range().end();
         let close = list.last_token().expect("a list closes").text_range().start();
         return TextRange::new(open, close);
-    }
-    if let Some(next) = entries.get(at + 1) {
-        return TextRange::new(range.start(), next.text_range().start());
-    }
-    let previous = &entries[at - 1];
+    };
     match comma_after(entry) {
         Some(own) => {
             let start = comma_after(previous).expect("a list's entries before the last end in commas");
@@ -463,15 +469,14 @@ fn remove_line(text: &str, end: usize, range: TextRange) -> TextRange {
 }
 
 /// The splice adding `item` after the last item of `scope`.
-fn add_item(text: &str, end: usize, scope: &SyntaxNode, item: &str) -> Result<(TextRange, String), String> {
+fn add_item(text: &str, end: usize, scope: Node<'_>, item: &str) -> Result<(TextRange, String), String> {
     let item = item.trim();
     if item.is_empty() {
         return Err("the item to add is empty".to_owned());
     }
     let (open, close) = list_bounds(scope, end).ok_or("a scope with no item list")?;
-    let items = items_of(scope);
     let file = scope.kind() == SyntaxKind::SOURCE_FILE;
-    match items.last() {
+    match items_of(scope).last() {
         Some(last) => {
             let indent = indent_at(text, usize::from(last.text_range().start()));
             let at = line_end(text, usize::from(last.text_range().end()), usize::from(close));
@@ -491,16 +496,15 @@ fn add_item(text: &str, end: usize, scope: &SyntaxNode, item: &str) -> Result<(T
 }
 
 /// The splice adding `use used;` after the scope's last use, or before its first item.
-fn add_use(text: &str, end: usize, scope: &SyntaxNode, used: &str) -> Result<(TextRange, String), String> {
-    let items = items_of(scope);
+fn add_use(text: &str, end: usize, scope: Node<'_>, used: &str) -> Result<(TextRange, String), String> {
     let line = format!("use {used};");
-    if let Some(last) = items.iter().filter(|it| it.kind() == SyntaxKind::USE).last() {
+    if let Some(last) = items_of(scope).filter(|it| it.kind() == SyntaxKind::USE).last() {
         let indent = indent_at(text, usize::from(last.text_range().start()));
         let (_, close) = list_bounds(scope, end).ok_or("a scope with no item list")?;
         let at = line_end(text, usize::from(last.text_range().end()), usize::from(close));
         return Ok((TextRange::empty(size(at)), format!("\n{indent}{line}")));
     }
-    match items.first() {
+    match items_of(scope).next() {
         Some(first) => {
             let indent = indent_at(text, usize::from(first.text_range().start()));
             Ok((TextRange::empty(first.text_range().start()), format!("{line}\n\n{indent}")))
@@ -535,13 +539,11 @@ fn added(file: &Working, index: u32, inserted: TextRange, out: &mut Vec<Touch>) 
         NodeOrToken::Token(token) => token.parent().expect("a token has a parent"),
     };
     for node in start.ancestors() {
-        let items: Vec<SyntaxNode> = path::members(&node)
-            .into_iter()
-            .filter(|it| path::is_top(it) && inserted.contains_range(it.text_range()))
-            .collect();
-        if !items.is_empty() {
-            let touched = items.iter().map(|it| Touch { file: index, at: At::Added(path::of(it)), how: How::Added });
-            out.extend(touched);
+        let mut items = path::members(node)
+            .filter(|it| path::is_top(*it) && inserted.contains_range(it.text_range()))
+            .peekable();
+        if items.peek().is_some() {
+            out.extend(items.map(|it| Touch { file: index, at: At::Added(path::of(it)), how: How::Added }));
             return;
         }
     }

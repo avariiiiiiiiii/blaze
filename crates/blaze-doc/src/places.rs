@@ -238,8 +238,8 @@ impl<'a> Linking<'a> {
         if let Some(found) = self.roots.lock().unwrap().get(&krate) {
             return found.clone();
         }
-        let found = match krate.root_module(db).definition_source(db).value {
-            hir::ModuleSource::SourceFile(file) => crate::attrs::html_root_url(&file),
+        let found = match krate.root_module(db).definition_source_view(db).value {
+            hir::ModuleSourceView::SourceFile(file) => crate::attrs::html_root_url(file),
             _ => None,
         };
         self.roots.lock().unwrap().insert(krate, found.clone());
@@ -728,25 +728,24 @@ impl<'a> Walker<'a> {
     /// item a second time (`maybe_inline_local`, its `reexport_chain` check).
     fn through_public_reexport(&self, import: hir_def::item_scope::ImportId) -> bool {
         use hir_def::Lookup;
-        use syntax::{AstNode, ast};
+        use syntax::view::{self as ast, AstNode};
         let db = self.db;
         let loc = import.use_.lookup(db);
-        let tree = hir_def::src::use_tree_to_ast(db, loc.id, import.idx);
+        let tree = hir_def::src::use_tree_to_view(db, loc.id, import.idx);
         // `use a::{b::C}`: the leaf's path after those of the trees around it.
-        let mut segments: Vec<String> = vec![];
+        let mut segments: Vec<&str> = vec![];
         for tree in tree.syntax().ancestors().filter_map(ast::UseTree::cast) {
             if let Some(path) = tree.path() {
-                let mut outer: Vec<String> =
-                    path.segments().map(|it| it.syntax().text().to_string()).collect();
+                let mut outer: Vec<&str> = path.segments().map(|it| it.syntax().text()).collect();
                 outer.append(&mut segments);
                 segments = outer;
             }
         }
-        let Some((last, prefix)) = segments.split_last() else { return false };
+        let Some((&last, prefix)) = segments.split_last() else { return false };
         let here: Module = loc.container.into();
         let mut at = here;
-        for (i, segment) in prefix.iter().enumerate() {
-            let next = match segment.as_str() {
+        for (i, &segment) in prefix.iter().enumerate() {
+            let next = match segment {
                 "crate" if i == 0 => Some(here.krate(db).root_module(db)),
                 "self" if i == 0 => Some(here),
                 "super" => at.parent(db),
@@ -811,9 +810,9 @@ impl<'a> Walker<'a> {
 /// Whether a built-in attribute macro wrote the function: rust-analyzer's `#[global_allocator]`
 /// writes functions beside the `static` where rustc's writes nothing rustdoc shows.
 fn from_builtin_attr(db: &RootDatabase, def: ModuleDef) -> bool {
-    use hir::HasSource;
+    use hir::view::HasSourceView;
     let ModuleDef::Function(it) = def else { return false };
-    it.source(db)
+    it.source_view(db)
         .and_then(|it| it.file_id.macro_file())
         .is_some_and(|call| call.kind(db) == hir_expand::MacroKind::AttrBuiltIn)
 }
@@ -840,15 +839,15 @@ struct UseAttrs {
 impl UseAttrs {
     fn of(db: &RootDatabase, id: hir_def::UseId) -> UseAttrs {
         use hir_def::{Lookup, src::HasSource};
-        use syntax::ast::HasAttrs as _;
+        use syntax::view::HasAttrs as _;
         let flags = hir_def::attrs::AttrFlags::query(db, id.into());
         let mut out = UseAttrs {
             hidden: flags.contains(hir_def::attrs::AttrFlags::IS_DOC_HIDDEN),
             ..UseAttrs::default()
         };
-        let source = id.lookup(db).source(db);
+        let source = id.lookup(db).source_view(db);
         for attr in source.value.attrs() {
-            for word in crate::attrs::doc_words(&attr) {
+            for word in crate::attrs::doc_words(attr) {
                 match word.as_str() {
                     "inline" => out.inline = true,
                     "no_inline" => out.no_inline = true,

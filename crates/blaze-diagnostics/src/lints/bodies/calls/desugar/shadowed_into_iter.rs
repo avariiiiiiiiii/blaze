@@ -61,14 +61,12 @@ impl LatePass for ShadowedIntoIter {
         }
 
         let receiver_ty = util::ty(b, receiver);
-        let mut adjusted: Vec<Ty<'_>> = vec![receiver_ty];
-        if let Some(adjustments) = b.infer.expr_adjustment(receiver) {
-            adjusted.extend(adjustments.iter().map(|it| it.target.as_ref()));
-        }
-        let Some(&last) = adjusted.last() else { return };
-        let array_at = || adjusted.iter().take_while(|it| !is_ref_to_array(**it)).position(|it| it.is_array());
+        let adjustments = b.infer.expr_adjustment(receiver).unwrap_or_default();
+        let adjusted = || std::iter::once(receiver_ty).chain(adjustments.iter().map(|it| it.target.as_ref()));
+        let last = adjustments.last().map_or(receiver_ty, |it| it.target.as_ref());
+        let array_at = || adjusted().take_while(|it| !is_ref_to_array(*it)).position(|it| it.is_array());
         let boxed_slice_at =
-            || adjusted.iter().take_while(|it| !is_ref_to_boxed_slice(**it)).position(|it| is_boxed_slice(*it));
+            || adjusted().take_while(|it| !is_ref_to_boxed_slice(*it)).position(|it| is_boxed_slice(it));
         let (lint, target, edition, can_suggest_ufcs) = if is_ref_to_array(last)
             && let Some(index) = array_at()
         {
@@ -86,9 +84,11 @@ impl LatePass for ShadowedIntoIter {
             return;
         };
         let span = util::span(b, receiver).and_then(|it| ancestor_in_same_ctxt(&it, &expr_span));
+        // alloc: the lint's diagnostic
         let message = format!(
             "this method call resolves to `<&{target} as IntoIterator>::into_iter` (due to backwards compatibility), but will resolve to `<{target} as IntoIterator>::into_iter` in Rust {edition}"
         );
+        // clone: a node or span, for the lint's diagnostic
         let mut diag = Diag::lint(lint, message, name_span.clone());
         diag.suggestion(
             name_span,
@@ -99,6 +99,7 @@ impl LatePass for ShadowedIntoIter {
         match span {
             Some(span) if self.for_heads.contains(&expr) => {
                 diag.suggestion_with_style(
+                    // alloc: the lint's diagnostic
                     vec![(span.shrink_to_hi().to(&expr_span.shrink_to_hi()), String::new())],
                     "or remove `.into_iter()` to iterate by value",
                     Applicability::MaybeIncorrect,
@@ -107,8 +108,11 @@ impl LatePass for ShadowedIntoIter {
             }
             Some(span) if can_suggest_ufcs => {
                 diag.suggestion_with_style(
+                    // alloc: the lint's diagnostic
                     vec![
+                        // alloc: the lint's diagnostic
                         (expr_span.shrink_to_lo(), "IntoIterator::into_iter(".to_owned()),
+                        // alloc: the lint's diagnostic
                         (span.shrink_to_hi().to(&expr_span.shrink_to_hi()), ")".to_owned()),
                     ],
                     "or use `IntoIterator::into_iter(..)` instead of `.into_iter()` to explicitly iterate by value",
@@ -119,6 +123,7 @@ impl LatePass for ShadowedIntoIter {
             _ => {}
         }
         let called = b.cx.def_path(ModuleDefId::FunctionId(into_iter).into());
+        // alloc: the lint's diagnostic
         diag.fact(Fact::Signature(b.cx.key(ItemId::Function(into_iter))), format!("the signature of `{called}`"));
         out.push(b.lint(diag, Phase::Late, at));
     }
@@ -139,6 +144,7 @@ fn is_ref_to_boxed_slice(ty: Ty<'_>) -> bool {
 /// The span of the name of the method `expr` calls (rustc's `segment.ident.span`).
 fn method_name(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
     let node = util::syntax(b, expr)?;
+    // clone: a node or span, for the lint's diagnostic
     let call = ast::MethodCallExpr::cast(node.value.clone())?;
     let name = call.name_ref()?;
     Some(b.cx.span(node.with_value(name.syntax().text_range())))
@@ -147,6 +153,7 @@ fn method_name(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
 /// rustc's `Span::find_ancestor_in_same_ctxt`: `span`, or the call of the macro it came
 /// from, and of the macro that call came from, .., the first in the expansion `other` is in.
 fn ancestor_in_same_ctxt(span: &Span, other: &Span) -> Option<Span> {
+    // clone: a node or span, for the lint's diagnostic
     let mut at = span.clone();
     loop {
         if at.expansion == other.expansion {

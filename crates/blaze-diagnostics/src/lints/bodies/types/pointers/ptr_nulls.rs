@@ -148,6 +148,7 @@ fn emit_useless(b: &BodyCx<'_, '_>, expr: ExprId, useless: Useless, out: &mut Ve
                 span,
             );
             diag.help("wrap the function pointer inside an `Option` and use `Option::is_none` to check for null pointer value");
+            // alloc: the lint's text, for a lint found
             diag.span_label(label, format!("expression has type `{orig_ty}`"));
             diag
         }
@@ -157,11 +158,13 @@ fn emit_useless(b: &BodyCx<'_, '_>, expr: ExprId, useless: Useless, out: &mut Ve
                 "references are not nullable, so checking them for null will always return false",
                 span,
             );
+            // alloc: the lint's text, for a lint found
             diag.span_label(label, format!("expression has type `{orig_ty}`"));
             diag
         }
         Useless::FnRet { fn_name } => Diag::lint(
             "useless_ptr_null_checks",
+            // alloc: the lint's text, for a lint found
             format!("returned pointer of `{fn_name}` call is never null, so checking it for null will always return false"),
             span,
         ),
@@ -185,6 +188,7 @@ fn useless_check(b: &BodyCx<'_, '_>, mut e: ExprId) -> Option<Useless> {
         if let Some(def) = never_null
             && has_attr(b.db(), def, "rustc_never_returns_null_ptr")
         {
+            // alloc: the lint's text, for a lint found
             let fn_name = FunctionSignature::of(b.db(), def).name.as_str().to_owned();
             return Some(Useless::FnRet { fn_name });
         }

@@ -32,7 +32,7 @@ use crate::{
         ConstParamTypes, FieldTypes, GenericDefaults, Lowered, SelfAndAssocBounds,
         TrackedStructToken, WithDefinedOpaques,
     },
-    mir::{MirBody, MirEvalError, MirLowerError, MirOptions},
+    mir::{MirBody, MirEvalError, MirLowerError, MirOptions, MirOwner, MirStage},
     next_solver::{
         Allocation, Clause, EarlyBinder, GenericArgs, ParamEnv, PolyFnSig, StoredEarlyBinder,
         StoredGenericArgs, StoredPolyFnSig, StoredTraitRef, StoredTy, TraitRef, Ty, VariancesOf,
@@ -40,6 +40,12 @@ use crate::{
     providers,
     traits::{ParamEnvAndCrate, StoredParamEnvAndCrate},
 };
+
+/// What hir-ty's inference, lowering, method resolution, layout, const eval and trait
+/// solving allocate (docs/v2/plan/lanes/mem/db.md, contract 3).
+pub(crate) const INFER_TAG: blaze_mem::Tag = blaze_mem::Tag::Infer;
+/// What hir-ty's MIR queries allocate.
+pub(crate) const MIR_TAG: blaze_mem::Tag = blaze_mem::Tag::Mir;
 
 mod sealed {
     pub trait Sealed {}
@@ -55,8 +61,6 @@ pub trait HirDatabase: sealed::Sealed {
 
     // region:mir
 
-    // FIXME: Collapse `mir_body_for_closure` into `mir_body`
-    // and `monomorphized_mir_body_for_closure` into `monomorphized_mir_body`
     fn mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,
@@ -125,6 +129,29 @@ pub trait HirDatabase: sealed::Sealed {
     fn runtime_mir_body_for_coroutine_by_move<'db>(
         &'db self,
         def: InternedCoroutineId<'db>,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
+
+    /// The types an `async` block holds across a yield, by which its future implements an
+    /// auto trait: rustc's `mir_coroutine_witnesses` (`CoroutineLayout::field_tys` without
+    /// what `ignore_for_traits` marks). Generic in the parameters of the coroutine's parent,
+    /// with regions erased.
+    fn coroutine_witnesses<'db>(&'db self, def: InternedCoroutineId<'db>) -> &'db [StoredTy];
+
+    /// `owner`'s body at `stage`, from the memo of the query named for them.
+    fn mir<'db>(
+        &'db self,
+        owner: MirOwner<'db>,
+        stage: MirStage,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
+
+    /// `owner`'s body at `stage` with `subst` in place of its generic parameters, in `env`,
+    /// from the memo of the monomorphized query named for them.
+    fn monomorphized_mir<'db>(
+        &'db self,
+        owner: MirOwner<'db>,
+        stage: MirStage,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
     ) -> Result<&'db MirBody<'db>, MirLowerError<'db>>;
 
     /// The runtime body after rustc's MIR optimizations as `options` says
@@ -491,6 +518,31 @@ impl HirDatabase for Db {
     }
 
     #[inline]
+    fn coroutine_witnesses<'db>(&'db self, def: InternedCoroutineId<'db>) -> &'db [StoredTy] {
+        providers::coroutine_witnesses_query(self, def)
+    }
+
+    #[inline]
+    fn mir<'db>(
+        &'db self,
+        owner: MirOwner<'db>,
+        stage: MirStage,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::mir_at(self, owner, stage).map_err(Clone::clone)
+    }
+
+    #[inline]
+    fn monomorphized_mir<'db>(
+        &'db self,
+        owner: MirOwner<'db>,
+        stage: MirStage,
+        subst: StoredGenericArgs,
+        env: StoredParamEnvAndCrate,
+    ) -> Result<&'db MirBody<'db>, MirLowerError<'db>> {
+        providers::monomorphized_mir_at(self, owner, stage, subst, env).map_err(Clone::clone)
+    }
+
+    #[inline]
     fn optimized_mir_body<'db>(
         &'db self,
         def: InferBodyId<'db>,
@@ -723,6 +775,7 @@ impl HirDatabase for Db {
 
     #[inline]
     fn target_data_layout(&self, krate: Crate) -> Result<&TargetDataLayout, TargetLoadError> {
+        // clone: error path, an `Arc<str>` message
         crate::layout::target_data_layout_query(self, krate).map_err(|err| err.clone())
     }
 
@@ -952,13 +1005,13 @@ impl<'db> ClosureKey<'db> {
 
 /// The closures, `async` blocks and coroutines of a body, in the order of their expressions.
 // The unit makes the arguments something salsa interns: the owner alone is no salsa struct.
-#[salsa::tracked(returns(deref))]
+#[salsa::tracked(returns(deref), mem_tag = Infer)]
 fn closure_exprs(db: &Db, owner: ExpressionStoreOwnerId, _: ()) -> Box<[ExprId]> {
     ExpressionStore::of(db, owner)
         .exprs()
         .filter(|(_, expr)| matches!(expr, hir_def::hir::Expr::Closure { .. }))
         .map(|(id, _)| id)
-        .collect()
+        .collect() // alloc: the memo's stored list, once per body
 }
 
 #[salsa::interned(constructor = new_impl, debug, revisions = usize::MAX)]
@@ -1199,14 +1252,18 @@ impl<'db> GeneralConstId<'db> {
     pub fn name(self, db: &'db Db) -> String {
         match self {
             GeneralConstId::StaticId(it) => {
+                // alloc: error text, every caller formats a diagnostic or a difference
                 StaticSignature::of(db, it).name.display(db, Edition::CURRENT).to_string()
             }
             GeneralConstId::ConstId(const_id) => {
                 ConstSignature::of(db, const_id).name.as_ref().map_or_else(
+                    // alloc: error text
                     || "_".to_owned(),
+                    // alloc: error text
                     |name| name.display(db, Edition::CURRENT).to_string(),
                 )
             }
+            // alloc: error text
             GeneralConstId::AnonConstId(_) => "{const}".to_owned(),
         }
     }
@@ -1352,6 +1409,7 @@ pub mod kinds {
             "monomorphized_optimized_mir_body_for_coroutine_query";
         MONOMORPHIZED_OPTIMIZED_MIR_BODY_FOR_COROUTINE_BY_MOVE = 0x24a7,
             "monomorphized_optimized_mir_body_for_coroutine_by_move_query";
+        COROUTINE_WITNESSES = 0x24a8, "coroutine_witnesses_query";
 
         // Per-module impl tables.
         INHERENT_IMPLS_FOR_MODULE = 0x24b0, "InherentImpls::for_module";
@@ -1363,6 +1421,10 @@ pub mod kinds {
         TRAIT_IMPLS_MODULES_OF_TRAIT = 0x24b6, "TraitImpls::modules_of_trait";
         TRAIT_IMPLS_IN_MODULE_FOR_TRAIT = 0x24b7, "TraitImpls::in_module_for_trait";
         TRAIT_IMPLS_FOR_CRATE_AND_TRAIT = 0x24b8, "TraitImpls::for_crate_and_trait";
+
+        // Imports.
+        USED_IMPORTS_WITH_TRAITS = 0x24c0, "used_imports_with_traits";
+        USES_FN_CACHE = 0x24c1, "uses_fn_cache";
 
         // Inputs.
         FROZEN_IMPLS = 0x25e0, "FrozenImpls";
@@ -1462,6 +1524,7 @@ pub mod kinds {
                 Some(rest) => &rest[rest.find('>').map_or(0, |at| at + 1)..],
                 None => text,
             };
+            // alloc: test code
             text.trim_start().chars().take_while(|&c| c.is_alphanumeric() || c == '_').collect()
         }
 

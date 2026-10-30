@@ -246,16 +246,6 @@ impl From<Arc<[u8]>> for PartBytes {
     }
 }
 
-/// A copy: for a reader of `Arc<[u8]>`.
-impl From<PartBytes> for Arc<[u8]> {
-    fn from(bytes: PartBytes) -> Arc<[u8]> {
-        match bytes {
-            PartBytes::Owned(bytes) => bytes,
-            in_place => Arc::from(&*in_place),
-        }
-    }
-}
-
 /// The image of `key` whose parts are `parts`, one of each of [`Part::ALL`] in that order.
 pub fn write_image(key: ContentId, parts: [&[u8]; Part::ALL.len()]) -> Vec<u8> {
     let total: usize = parts.iter().map(|it| it.len().next_multiple_of(blaze_format::ALIGN)).sum();

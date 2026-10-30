@@ -11,7 +11,7 @@
 //! Apache-2.0).
 
 use hir::InFile;
-use syntax::{AstNode, ast};
+use syntax::view::{self as ast, AstNode as _};
 
 use crate::{
     cx::Cx,
@@ -20,7 +20,7 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::BadRtn) -> Vec<Found> {
-    let rtn = cx.node(d.rtn);
+    let rtn = cx.node_view(d.rtn);
     let file = rtn.file_id;
     let ty = rtn
         .value
@@ -42,5 +42,5 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::BadRtn) -> Vec<Found> {
         cx.span(InFile::new(file, range)),
     );
     site_fact(cx, &mut diag, InFile::new(file, rtn.value.syntax()));
-    vec![Found::new(diag, phase)]
+    vec![Found::new(diag, phase)] // alloc: the error found
 }

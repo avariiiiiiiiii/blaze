@@ -4,7 +4,7 @@
 use base_db::{Crate, all_crates};
 use hir_expand::name::Name;
 use span::Edition;
-use syntax::{AstNode, FlatTree};
+use syntax::FlatTree;
 use test_fixture::WithFixture;
 
 use crate::{
@@ -115,11 +115,10 @@ fn bodies(db: &TestDB, krate: Crate) -> Vec<(String, DefWithBodyId)> {
 }
 
 /// The tree of the file `def` is written in.
-fn file_tree(db: &TestDB, def: DefWithBodyId) -> std::sync::Arc<FlatTree> {
+fn file_tree(db: &TestDB, def: DefWithBodyId) -> &FlatTree {
     let syntax = body_syntax(db, def).as_ref().expect("a body written in a file");
     let file = syntax.file_id.file_id().expect("a body written in a file");
-    let parse = file.parse(db);
-    parse.tree().syntax().flat().expect("a flat tree").0.clone()
+    file.parse(db).root().shared_file()
 }
 
 #[test]
@@ -160,17 +159,16 @@ fn lowering_one_fn_parses_only_its_own_body() {
     let &(_, with) = dep.iter().find(|(name, _)| name == "with").expect("`S::with`");
 
     Body::of(&db, with);
-    let root = body_syntax(&db, with).as_ref().expect("a body written in a file").root(&db);
-    let (tree, _) = root.flat().expect("a flat tree");
+    let tree = body_syntax(&db, with).as_ref().expect("a body written in a file").tree(&db);
     assert!(tree.lazies().count() >= 2, "the anchor of `S::with` is the `impl`, with both bodies");
-    let entered = parsed(tree);
+    let entered = parsed(&tree);
     assert_eq!(entered.len(), 1, "{entered:?}");
     assert!(entered[0].contains("let z"), "{entered:?}");
 
     // The file's own tree: the item tree reads the inner attributes of `attributed`, and what
     // reads the attributes of `S::with` may enter its body; nothing else is parsed.
     let file = file_tree(&db, with);
-    for body in parsed(&file) {
+    for body in parsed(file) {
         assert!(body.contains("let z") || body.contains("#![allow(unused)]"), "{body:?}");
     }
 }

@@ -30,8 +30,8 @@ use hir_def::{
     unstable_features::UnstableFeatures,
 };
 use hir_expand::{
-    HirFileId, InFile, MacroCallId, MacroCallKind, MacroKind, RenderedExpandError, ValueResult,
-    mod_path::ModPath, name::Name,
+    ExpandErrorKind, HirFileId, InFile, MacroCallId, MacroCallKind, MacroKind, RenderedExpandError,
+    ValueResult, mod_path::ModPath, name::Name,
 };
 use hir_ide::{
     CastError, ElidedLifetimeSite, ExplicitDropMethodUseKind, InferBodyId, InferenceDiagnostic,
@@ -56,7 +56,7 @@ use stdx::{impl_from, never};
 use syntax::{
     AstNode, AstPtr, SyntaxError, SyntaxNodePtr, TextRange,
     ast::{self, HasGenericArgs, HasName},
-    match_ast,
+    match_ast, view,
 };
 use triomphe::Arc;
 
@@ -68,9 +68,10 @@ use crate::{
 };
 
 pub use hir_def::{VariantId, expr_store::MissingBodyItemKind};
+pub use hir_expand::BuiltinChild;
 pub use hir_ide::{
     GenericArgsProhibitedReason, IncorrectGenericsLenKind, MissingLifetimeKind, ReturnKind,
-    diagnostics::{CaseType, IncorrectCase},
+    diagnostics::{CaseType, IdentType, IncorrectCase},
 };
 pub use hir_ide::solver_errors::{TypeAnnotationNeeded, UnreportedSolverError};
 
@@ -100,10 +101,14 @@ impl ast::AstNode for SpanAst {
     }
 
     fn cast(syntax: syntax::SyntaxNode) -> Option<Self> {
-        ast::Expr::cast(syntax.clone())
-            .map(SpanAst::Expr)
-            .or_else(|| ast::Pat::cast(syntax.clone()).map(SpanAst::Pat))
-            .or_else(|| ast::Type::cast(syntax).map(SpanAst::Type))
+        let kind = syntax.kind();
+        if ast::Expr::can_cast(kind) {
+            ast::Expr::cast(syntax).map(SpanAst::Expr)
+        } else if ast::Pat::can_cast(kind) {
+            ast::Pat::cast(syntax).map(SpanAst::Pat)
+        } else {
+            ast::Type::cast(syntax).map(SpanAst::Type)
+        }
     }
 
     fn syntax(&self) -> &syntax::SyntaxNode {
@@ -127,6 +132,7 @@ macro_rules! diagnostics {
         $(
             impl<$db> From<$diag $(<$lt>)?> for $AnyDiagnostic<$db> {
                 fn from(d: $diag $(<$lt>)?) -> $AnyDiagnostic<$db> {
+                    // alloc: error path, one box per reported diagnostic
                     $AnyDiagnostic::$diag(Box::new(d))
                 }
             }
@@ -218,6 +224,7 @@ diagnostics![AnyDiagnostic<'db> ->
     UnresolvedMethodCall<'db>,
     UnresolvedModule,
     UnresolvedIdent,
+    UnresolvedPath,
     GenericArgsProhibited,
     ParenthesizedGenericArgsWithoutFnTrait,
     BadRtn,
@@ -314,6 +321,12 @@ pub struct MacroError {
     pub message: String,
     pub error: bool,
     pub kind: &'static str,
+    /// A builtin error's code: 802 for E0802.
+    pub code: Option<u16>,
+    /// A builtin error's primary spans after `range`.
+    pub also_at: Box<[InFile<TextRange>]>,
+    /// A builtin error's notes and helps, in rustc's order.
+    pub children: Box<[(BuiltinChild, Box<str>)]>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -525,7 +538,7 @@ type BorrowckParts =
 fn borrowck_parts(
     db: &Db,
     diagnostic: &hir_ty_borrowck::BorrowckDiagnostic,
-    node_of: &dyn Fn(hir_ide::mir::MirSpan) -> Option<InFile<SyntaxNodePtr>>,
+    node_of: &impl Fn(hir_ide::mir::MirSpan) -> Option<InFile<SyntaxNodePtr>>,
 ) -> BorrowckParts {
     use hir_ide::mir::MirSpan;
     use hir_ty_borrowck::PartSpan;
@@ -567,19 +580,20 @@ fn borrowck_parts(
             }
             PartSpan::MethodName(call) => {
                 let node = syntax(expr(call)?);
-                let name = ast::MethodCallExpr::cast(node.value.clone())?.name_ref()?;
-                node.with_value(name.syntax().text_range())
+                let name = ast::MethodCallExpr::cast(node.value)?.name_ref()?;
+                InFile::new(node.file_id, name.syntax().text_range())
             }
             // rustc's `fn_decl_span`: a closure through its parameters and return type, a
             // block all of it.
             PartSpan::ClosureHead(closure) => {
                 let node = syntax(expr(closure)?);
                 let range = node.value.text_range();
-                let end = ast::ClosureExpr::cast(node.value.clone()).and_then(|it| {
+                let end = ast::ClosureExpr::cast(node.value).and_then(|it| {
                     let ret = it.ret_type().map(|it| it.syntax().text_range().end());
                     ret.or_else(|| Some(it.param_list()?.syntax().text_range().end()))
                 });
-                node.with_value(end.map_or(range, |end| TextRange::new(range.start(), end)))
+                let end = end.map_or(range, |end| TextRange::new(range.start(), end));
+                InFile::new(node.file_id, end)
             }
             // rustc's `def_span`: from the item's start, past its attributes, through its name
             // and generics.
@@ -620,6 +634,7 @@ fn borrowck_parts(
         })
     };
     let labels = |labels: &[(PartSpan, String)]| -> Vec<(InFile<TextRange>, String)> {
+        // alloc: error path, the parts of a reported borrowck error
         labels.iter().filter_map(|(at, text)| Some((range(*at)?, text.clone()))).collect()
     };
     let children = diagnostic
@@ -627,10 +642,13 @@ fn borrowck_parts(
         .iter()
         .map(|child| BorrowckChild {
             level: child.level,
+            // clone: error path, a reported borrowck error's note
             message: child.message.clone(),
+            // alloc: error path, a reported borrowck error's note
             spans: child.spans.iter().filter_map(|&it| range(it)).collect(),
             labels: labels(&child.labels),
         })
+        // alloc: error path, the notes of a reported borrowck error
         .collect();
     let suggestions = diagnostic
         .suggestions
@@ -639,15 +657,18 @@ fn borrowck_parts(
             let parts = suggestion
                 .parts
                 .iter()
+                // clone: error path, a reported borrowck error's suggestion
                 .map(|(at, text)| Some((range(*at)?, text.clone())))
                 .collect::<Option<Vec<_>>>()?;
             Some(BorrowckSuggestion {
+                // clone: error path, a reported borrowck error's suggestion
                 message: suggestion.message.clone(),
                 parts,
                 applicability: suggestion.applicability,
                 verbose: suggestion.verbose,
             })
         })
+        // alloc: error path, the suggestions of a reported borrowck error
         .collect();
     (labels(&diagnostic.labels), children, suggestions)
 }
@@ -720,6 +741,17 @@ pub struct UnresolvedAssocItem<'db> {
 #[derive(Debug)]
 pub struct UnresolvedIdent {
     pub node: InFile<(ExprOrPatPtr, Option<TextRange>)>,
+}
+
+/// A path of a body (an expression, a struct literal's, a pattern's) that resolves to nothing:
+/// `segment` indexes the first of its segments that fails, the written segments after any
+/// `crate`/`self`/`super`/`$crate`. A prefix failing is rustc's E0433; the last segment E0425
+/// for a value, E0422 for a struct literal or record pattern, E0531 for a tuple struct
+/// pattern.
+#[derive(Debug)]
+pub struct UnresolvedPath {
+    pub node: InFile<ExprOrPatPtr>,
+    pub segment: u32,
 }
 
 #[derive(Debug)]
@@ -811,7 +843,9 @@ impl CallArgs {
     }
 
     fn new(db: &Db, target: DisplayTarget, args: &hir_ide::CallArguments) -> Self {
+        // alloc: error path, the types of a reported call's arguments as rustc prints them
         let show = |ty: &StoredTy| ty.as_ref().display(db, target).to_string();
+        // alloc: error path, as above
         let shows = |tys: &[StoredTy]| tys.iter().map(show).collect();
         CallArgs {
             callee: show(&args.callee),
@@ -821,7 +855,9 @@ impl CallArgs {
             formal_inputs: shows(&args.formal_inputs),
             expected_inputs: shows(&args.expected_inputs),
             provided: shows(&args.provided),
+            // clone: error path, out of the inference result a reported call borrows
             compatible_ends: args.compatible_ends.clone(),
+            // clone: error path, as above
             compatible: args.compatible.clone(),
         }
     }
@@ -916,6 +952,52 @@ pub struct TypeMismatch<'db> {
     /// them: an integer or float literal's type not decided yet is `{integer}` / `{float}`
     /// (after fallback `expected` and `actual` say `i32` / `f64`). `None` when neither held one.
     pub at_error: Option<(String, String)>,
+    pub cause: ObligationCauseCode,
+}
+
+/// Why inference required a type or a bound (rustc's `ObligationCauseCode`, the kinds the
+/// front end records), for the notes rustc adds to an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObligationCauseCode {
+    /// Nothing more to say than the span.
+    Misc,
+    /// The `bound_index`th predicate of `item` (counting its parents' first), required by a use
+    /// of `item` in an expression: rustc's "required by a bound in `item`".
+    WhereClauseInExpr { item: GenericDef, bound_index: u32, arg_index: Option<u32> },
+    /// A function argument's type must be `Sized`.
+    SizedArgumentType,
+    /// The declared return type of a body must be `Sized`.
+    SizedReturnType,
+    /// The tail of a block, or a `match`'s first arm (with no arm of a type other than `!`
+    /// before it).
+    BlockTailExpression,
+    /// The value of a `return` or of a body's tail.
+    ReturnValue,
+    /// The `else` of an `if` must agree with its `then`.
+    IfExpression,
+    /// A `match` arm must agree with the `prior_arms` arms before it whose type is not `!`.
+    MatchExpressionArm { prior_arms: u32 },
+    /// A `let`'s type must be `Sized`.
+    LetType,
+}
+
+impl From<hir_ide::next_solver::infer::traits::ObligationCauseCode> for ObligationCauseCode {
+    fn from(code: hir_ide::next_solver::infer::traits::ObligationCauseCode) -> Self {
+        use hir_ide::next_solver::infer::traits::ObligationCauseCode as C;
+        match code {
+            C::Misc => Self::Misc,
+            C::WhereClauseInExpr { item, bound_index, arg_index } => {
+                Self::WhereClauseInExpr { item: item.into(), bound_index, arg_index }
+            }
+            C::SizedArgumentType => Self::SizedArgumentType,
+            C::SizedReturnType => Self::SizedReturnType,
+            C::BlockTailExpression => Self::BlockTailExpression,
+            C::ReturnValue => Self::ReturnValue,
+            C::IfExpression => Self::IfExpression,
+            C::MatchExpressionArm { prior_arms } => Self::MatchExpressionArm { prior_arms },
+            C::LetType => Self::LetType,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1121,6 +1203,12 @@ pub struct TypeMustBeKnown<'db> {
     /// The goal left ambiguous, for an error of a goal still pending when inference is done
     /// (rustc's `maybe_report_ambiguity`); `None` for a type writeback found undecided.
     pub ambiguity: Option<TypeAmbiguity<'db>>,
+    /// Where the undecided variable (the first of `top_term` made for a parameter) was made and
+    /// the type or const parameter it was made for, declared on its `parent` (rustc's
+    /// `TypeVariableOrigin`: ", where the type for type parameter `T` is specified" and the
+    /// turbofish suggestion). A type parameter only when the variable was not made in a macro
+    /// expansion, as rustc's `extract_inference_diagnostics_data`.
+    pub origin: Option<(SpanSyntax, GenericParam)>,
 }
 
 /// An ambiguous goal and the goals rustc merges into its error as notes ("the type must also
@@ -1179,6 +1267,7 @@ pub enum SolverGoal<'db> {
 #[derive(Debug)]
 pub struct TraitSolverError<'db> {
     pub span: SpanSyntax,
+    pub cause: ObligationCauseCode,
     pub kind: TraitSolverErrorKind<'db>,
 }
 
@@ -1303,13 +1392,19 @@ pub struct PatternArgInExternFn {
 #[derive(Debug)]
 pub struct UnimplementedTrait<'db> {
     pub span: SpanSyntax,
+    pub cause: ObligationCauseCode,
     pub trait_predicate: crate::TraitClause<'db>,
     pub parent_trait_predicates: Vec<crate::TraitClause<'db>>,
+    /// For each of `parent_trait_predicates`, the impl that would prove it, whose where clause
+    /// required the predicate nearer the error: rustc's "required for `T` to implement `Trait`"
+    /// and "unsatisfied trait bound introduced here". `None` where it came from no impl.
+    pub parent_impls: Vec<Option<crate::Impl>>,
 }
 
 #[derive(Debug)]
 pub struct ClosureKindMismatch {
     pub span: SpanSyntax,
+    pub cause: ObligationCauseCode,
     pub expected: crate::FnTrait,
     pub found: crate::FnTrait,
     /// The closure, which rustc points at; `None` when it has no syntax.
@@ -1332,14 +1427,39 @@ pub struct ReturnOutsideFunction {
     pub kind: ReturnKind,
 }
 
-pub(crate) struct DiagnosticsCollector<'a, 'db> {
+pub(crate) struct DiagnosticsCollector<'a, 'db, F: ?Sized> {
     db: &'db Db,
     krate: base_db::Crate,
     edition: Edition,
     style_lints: bool,
     acc: &'a mut Vec<AnyDiagnostic<'db>>,
-    /// The bodies whose diagnostics are asked for, when not all of them are.
-    bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
+    /// The bodies whose diagnostics are asked for ([`crate::check::every_body`] for all).
+    bodies: &'a F,
+    /// The bodies a plan checks as tasks of their own, which the walk of a module leaves
+    /// ([`crate::check::bodies`]).
+    deferred: Option<crate::check::bodies::Defer<'a>>,
+}
+
+/// What a [`MacroError`] keeps of a builtin error besides its text: its code, its other primary
+/// spans and its notes and helps. Nothing for any other error.
+fn builtin_parts(
+    db: &Db,
+    err: &ExpandErrorKind,
+) -> (Option<u16>, Box<[InFile<TextRange>]>, Box<[(BuiltinChild, Box<str>)]>) {
+    let ExpandErrorKind::Builtin(builtin) = err else {
+        return (None, Box::default(), Box::default());
+    };
+    let also_at = builtin
+        .also_at
+        .iter()
+        .map(|&span| {
+            let at = hir_expand::resolve_span(db, span);
+            InFile::new(HirFileId::from(at.file_id), at.range)
+        })
+        // alloc: an error's few spans, on the error path
+        .collect();
+    // clone: an error's few lines, on the error path
+    (builtin.code, also_at, builtin.children.clone())
 }
 
 fn precise_macro_call_location(
@@ -1372,18 +1492,59 @@ fn precise_macro_call_location(
     }
 }
 
-impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
+impl<'a, 'db, F: Fn(crate::DefWithBody) -> bool + ?Sized> DiagnosticsCollector<'a, 'db, F> {
     pub(crate) fn collect(
         db: &'db Db,
         module: ModuleId,
         acc: &'a mut Vec<AnyDiagnostic<'db>>,
         style_lints: bool,
-        bodies: Option<&'a dyn Fn(crate::DefWithBody) -> bool>,
+        bodies: &'a F,
+    ) {
+        Self::collect_with(db, module, acc, style_lints, bodies, None);
+    }
+
+    /// [`DiagnosticsCollector::collect`] of a module whose bodies listed in `deferred` are
+    /// checked as tasks of their own: each is left where the walk meets it, its place marked.
+    pub(crate) fn collect_deferred(
+        db: &'db Db,
+        module: ModuleId,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+        bodies: &'a F,
+        deferred: crate::check::bodies::Defer<'a>,
+    ) {
+        Self::collect_with(db, module, acc, style_lints, bodies, Some(deferred));
+    }
+
+    fn collect_with(
+        db: &'db Db,
+        module: ModuleId,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+        bodies: &'a F,
+        deferred: Option<crate::check::bodies::Defer<'a>>,
     ) {
         let krate = module.krate(db);
         let edition = krate.data(db).edition;
-        DiagnosticsCollector { db, krate, edition, style_lints, acc, bodies }
+        DiagnosticsCollector { db, krate, edition, style_lints, acc, bodies, deferred }
             .collect_module(module);
+    }
+
+    /// The diagnostics of body `def`, whose types are written in `type_owner`'s generics, with
+    /// those of the items inside it that `bodies` accepts: what the walk of its module gives
+    /// where it meets the body.
+    pub(crate) fn collect_body(
+        db: &'db Db,
+        def: DefWithBodyId,
+        type_owner: TypeOwnerId,
+        acc: &'a mut Vec<AnyDiagnostic<'db>>,
+        style_lints: bool,
+        bodies: &'a F,
+    ) {
+        let krate = hir_def::HasModule::krate(&def, db);
+        let edition = krate.data(db).edition;
+        DiagnosticsCollector { db, krate, edition, style_lints, acc, bodies, deferred: None }
+            .check_body(def, type_owner);
     }
 
     fn emit_def_diagnostic(&mut self, diag: &DefDiagnosticKind) {
@@ -1393,6 +1554,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 self.acc.push(
                     UnresolvedModule {
                         decl: InFile::new(declaration.file_id, decl),
+                        // clone: error path, a reported diagnostic
                         candidates: candidates.clone(),
                     }
                     .into(),
@@ -1407,12 +1569,17 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             DefDiagnosticKind::MacroError { ast, path, err } => {
                 let item = ast.to_ptr(self.db);
                 let RenderedExpandError { message, error, kind } = err.render_to_string(self.db);
+                let (code, also_at, children) = builtin_parts(self.db, err);
                 self.acc.push(
                     MacroError {
                         range: InFile::new(ast.file_id, item.text_range()),
+                        // alloc: error path, a reported diagnostic's message
                         message: format!("{}: {message}", path.display(self.db, self.edition)),
                         error,
                         kind,
+                        code,
+                        also_at,
+                        children,
                     }
                     .into(),
                 )
@@ -1432,7 +1599,9 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 self.acc.push(
                     InactiveCode {
                         node: InFile::new(ast_id.file_id, ptr),
+                        // clone: error path, a reported diagnostic
                         cfg: cfg.clone(),
+                        // clone: error path, a reported diagnostic
                         opts: self.krate.cfg_options(self.db).clone(),
                     }
                     .into(),
@@ -1443,6 +1612,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 self.acc.push(
                     UnresolvedMacroCall {
                         range: location,
+                        // clone: error path, a reported diagnostic
                         path: path.clone(),
                         is_bang: matches!(ast, MacroCallKind::FnLike { .. }),
                     }
@@ -1478,6 +1648,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     MacroDefError {
                         node: InFile::new(ast.file_id, AstPtr::new(&node)),
                         name: node.name().map(|it| it.syntax().text_range()),
+                        // clone: error path, a reported diagnostic
                         message: message.clone(),
                     }
                     .into(),
@@ -1515,12 +1686,16 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         .text_range()
                         .start();
             }
-            self.acc.push(MacroError { range, message, error, kind }.into());
+            let (code, also_at, children) = builtin_parts(self.db, err.kind());
+            self.acc.push(
+                MacroError { range, message, error, kind, code, also_at, children }.into(),
+            );
         }
 
         if !parse_errors.is_empty() {
             let loc = macro_call_id.loc(self.db);
             let range = precise_macro_call_location(&loc.kind, self.db, loc.krate);
+            // clone: error path, a reported diagnostic
             self.acc.push(MacroExpansionParseError { range, errors: parse_errors.clone() }.into())
         }
     }
@@ -1639,7 +1814,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         discriminant(impl_item) == discriminant(id) && impl_name == name
                     })
                 })
-                .map(|(name, item)| (name.clone(), AssocItem::from(*item)));
+                .map(|(name, item)| (*name, AssocItem::from(*item)));
             for (name, assoc_item) in redundant {
                 self.acc.push(
                     TraitImplRedundantAssocItems {
@@ -1658,7 +1833,8 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         discriminant(impl_item) == discriminant(id) && impl_name == name
                     })
                 })
-                .map(|(name, item)| (name.clone(), AssocItem::from(*item)))
+                .map(|(name, item)| (*name, AssocItem::from(*item)))
+                // alloc: empty, so no allocation, unless items are missing: then reported
                 .collect();
 
             if !missing.is_empty() {
@@ -1751,7 +1927,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         let def_map = def.def_map(self.db);
         let scope = def_map.module(self.db, def).scope(self.db);
 
-        for diag in def_map.diagnostics_of(def) {
+        for diag in def_map.diagnostics_of(self.db, def) {
             self.emit_def_diagnostic(&diag.kind);
         }
 
@@ -1775,6 +1951,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         }
         let interner = DbInterner::new_with(self.db, self.krate);
         let infcx = interner.infer_ctxt().build(TypingMode::non_body_analysis());
+        // alloc: one scratch a module, reused by each of its impls
         let mut impl_assoc_items_scratch = Vec::new();
         scope.impls().for_each(|def| {
             impl_assoc_items_scratch.clear();
@@ -1790,6 +1967,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
         {
             self.emit_def_diagnostic(&DefDiagnosticKind::MacroDefError {
                 ast,
+                // alloc: error path, a reported diagnostic's message
                 message: e.to_string(),
             });
         }
@@ -1830,6 +2008,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     node,
                     at_end: matches!(diagnostic.span, MirSpan::ExprEnd(_)),
                     code: diagnostic.code,
+                    // clone: error path, a reported borrowck error
                     message: diagnostic.message.clone(),
                     labels,
                     children,
@@ -1853,7 +2032,9 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             self.acc.push(
                 InactiveCode {
                     node: InFile::new(file, ast_id_map.get(diag.ast_id).syntax_node_ptr()),
+                    // clone: error path, a reported diagnostic
                     cfg: diag.cfg.clone(),
+                    // clone: error path, a reported diagnostic
                     opts: diag.opts.clone(),
                 }
                 .into(),
@@ -1896,9 +2077,20 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
     }
 
     fn collect_def_with_body(&mut self, def: DefWithBodyId, type_owner: TypeOwnerId) {
-        if self.bodies.is_some_and(|asked| !asked(def.into())) {
+        if !(self.bodies)(def.into()) {
             return;
         }
+        let at = self.acc.len();
+        if let Some(deferred) = &mut self.deferred
+            && deferred.take(def, at)
+        {
+            return;
+        }
+        self.check_body(def, type_owner);
+    }
+
+    /// The checks of body `def`, which `bodies` asks for.
+    fn check_body(&mut self, def: DefWithBodyId, type_owner: TypeOwnerId) {
         let (body, source_map) = Body::with_source_map(self.db, def);
 
         self.collect_expr_store(body, source_map);
@@ -2032,9 +2224,9 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             // at what the user wrote, which has no `mut` to remove.
             if diagnostic.code == "unused_mut" {
                 let pat = node.value.to_node(&node.file_id.parse_or_expand(self.db));
-                let written = match ast::SelfParam::cast(pat.clone()) {
-                    Some(it) => it.mut_token().is_some(),
-                    None => ast::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()),
+                let written = match ast::SelfParam::can_cast(pat.kind()) {
+                    true => ast::SelfParam::cast(pat).is_some_and(|it| it.mut_token().is_some()),
+                    false => ast::IdentPat::cast(pat).is_some_and(|it| it.mut_token().is_some()),
                 };
                 if !written {
                     continue;
@@ -2046,6 +2238,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     node,
                     at_end: matches!(diagnostic.span, MirSpan::ExprEnd(_)),
                     code: diagnostic.code,
+                    // clone: error path, a reported borrowck error
                     message: diagnostic.message.clone(),
                     labels,
                     children,
@@ -2061,12 +2254,15 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                 ConstCheckError {
                     node,
                     code: diagnostic.code,
+                    // clone: error path, a reported const check error
                     message: diagnostic.message.clone(),
                 }
                 .into(),
             );
         }
+        // `blaze::const_impure` is fn-cache's lint: no other crate's `const fn` is walked for it.
         if let DefWithBodyId::FunctionId(func) = def
+            && hir_ide::fn_cache::uses_fn_cache(self.db, hir_def::HasModule::krate(&def, self.db))
             && const_check.is_empty()
             && hir_ide::mir::const_check::const_context(self.db, def)
                 == Some(hir_ide::mir::const_check::ConstContext::ConstFn)
@@ -2074,6 +2270,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             && impure.told
             && let Some(node) = node_of(impure.span)
         {
+            // alloc: error path, a reported lint's message
             let message = format!("const fn {}", impure.said());
             self.acc.push(ConstImpure { node, message }.into());
         }
@@ -2088,6 +2285,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     DefWithBodyId::VariantId(it) => it.lookup(db).ast_ptr(db).map(Into::into),
                 }
             });
+            // clone: error path, a reported diagnostic
             self.acc.push(BorrowckSkipped { node, reason: reason.clone() }.into());
         }
     }
@@ -2231,6 +2429,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                         }
                     }
                     let (signature, source_map) = FunctionSignature::with_source_map(db, function);
+                    // alloc: error path, the site of a reported wfcheck error
                     let mut find = Find { store: &signature.store, found: Vec::new() };
                     if let Some(ret_type) = signature.ret_type {
                         find.on_type(ret_type);
@@ -2245,7 +2444,7 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                             else {
                                 return None;
                             };
-                            let args = store[*path].generic_args()?.last()?.as_ref()?;
+                            let args = store.path(*path).generic_args()?.last()??;
                             let output = args.bindings.first()?.type_ref?;
                             source_map.type_syntax(output).ok()
                         })
@@ -2261,9 +2460,13 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
                     node,
                     at_end: false,
                     code: diagnostic.code,
+                    // clone: error path, a reported wfcheck error
                     message: diagnostic.message.clone(),
+                    // alloc: empty
                     labels: Vec::new(),
+                    // alloc: empty
                     children: Vec::new(),
+                    // alloc: empty
                     suggestions: Vec::new(),
                 }
                 .into(),
@@ -2314,26 +2517,30 @@ impl<'a, 'db> DiagnosticsCollector<'a, 'db> {
             self.acc.push(match diag {
                 ExpressionStoreDiagnostics::InactiveCode { node, cfg } => InactiveCode {
                     node: *node,
+                    // clone: error path, a reported diagnostic
                     cfg: cfg.clone(),
+                    // clone: error path, a reported diagnostic
                     opts: self.krate.cfg_options(self.db).clone(),
                 }
                 .into(),
                 ExpressionStoreDiagnostics::UnresolvedMacroCall { node, path } => {
                     UnresolvedMacroCall {
                         range: node.map(|ptr| ptr.text_range()),
+                        // clone: error path, a reported diagnostic
                         path: path.clone(),
                         is_bang: true,
                     }
                     .into()
                 }
                 ExpressionStoreDiagnostics::AwaitOutsideOfAsync { node, location } => {
+                    // clone: error path, a reported diagnostic
                     AwaitOutsideOfAsync { node: *node, location: location.clone() }.into()
                 }
                 ExpressionStoreDiagnostics::UnreachableLabel { node, name } => {
-                    UnreachableLabel { node: *node, name: name.clone() }.into()
+                    UnreachableLabel { node: *node, name: *name }.into()
                 }
                 ExpressionStoreDiagnostics::UndeclaredLabel { node, name } => {
-                    UndeclaredLabel { node: *node, name: name.clone() }.into()
+                    UndeclaredLabel { node: *node, name: *name }.into()
                 }
                 ExpressionStoreDiagnostics::PatternArgInExternFn { node } => {
                     PatternArgInExternFn { node: *node }.into()
@@ -2603,6 +2810,9 @@ impl<'db> AnyDiagnostic<'db> {
                 };
                 UnresolvedIdent { node }.into()
             }
+            &InferenceDiagnostic::UnresolvedPath { id, segment } => {
+                UnresolvedPath { node: expr_or_pat_syntax(id.unpack())?, segment }.into()
+            }
             &InferenceDiagnostic::BreakOutsideOfLoop { expr, is_break, bad_value_break } => {
                 let expr = expr_syntax(expr)?;
                 BreakOutsideOfLoop { expr, is_break, bad_value_break }.into()
@@ -2812,13 +3022,13 @@ impl<'db> AnyDiagnostic<'db> {
             &InferenceDiagnostic::MethodCallLateBoundLifetimeArgs { expr, def } => {
                 let syntax = expr_syntax(expr)?;
                 let file_id = syntax.file_id;
-                let syntax =
-                    syntax.with_value(syntax.value.cast::<ast::MethodCallExpr>()?).to_node(db);
-                let generics_or_segment = syntax
-                    .generic_arg_list()
-                    .map(Either::Left)
-                    .or_else(|| syntax.name_ref().map(Either::Right))?;
-                let generics_or_segment = InFile::new(file_id, AstPtr::new(&generics_or_segment));
+                let call = syntax.value.cast::<ast::MethodCallExpr>()?;
+                let call = call.try_to_view(file_id.root(db))?;
+                let generics_or_segment = match view::HasGenericArgs::generic_arg_list(&call) {
+                    Some(list) => AstPtr::<ast::GenericArgList>::of(list).wrap_left(),
+                    None => AstPtr::<ast::NameRef>::of(call.name_ref()?).wrap_right(),
+                };
+                let generics_or_segment = InFile::new(file_id, generics_or_segment);
                 LateBoundLifetimeArgs { generics_or_segment, def: def.into(), hard_error: false }
                     .into()
             }
@@ -2873,8 +3083,22 @@ impl<'db> AnyDiagnostic<'db> {
                 }
                 .into()
             }
-            &InferenceDiagnostic::TypeMustBeKnown { at_point, ref top_term, kind, ref ambiguity } => {
+            &InferenceDiagnostic::TypeMustBeKnown {
+                at_point,
+                ref top_term,
+                kind,
+                ref ambiguity,
+                origin,
+            } => {
                 let at_point = span_syntax(at_point)?;
+                let origin = origin.and_then(|(span, param)| {
+                    let span = span_syntax(span)?;
+                    let in_expansion = span.file_id.is_macro();
+                    match param {
+                        hir_def::GenericParamId::TypeParamId(_) if in_expansion => None,
+                        _ => Some((span, GenericParam::from(param))),
+                    }
+                });
                 let target = DisplayTarget::from_crate_and_edition(db, krate, edition);
                 let ambiguity = ambiguity.as_deref().map(|ambiguity| {
                     let note = |note: &'db solver_errors::AmbiguityNote| {
@@ -2897,13 +3121,13 @@ impl<'db> AnyDiagnostic<'db> {
                         unreachable!("we currently don't emit TypeMustBeKnown for lifetimes")
                     }
                 });
-                TypeMustBeKnown { at_point, top_term, kind, ambiguity }.into()
+                TypeMustBeKnown { at_point, top_term, kind, ambiguity, origin }.into()
             }
             &InferenceDiagnostic::UnionExprMustHaveExactlyOneField { expr } => {
                 let expr = expr_syntax(expr)?;
                 UnionExprMustHaveExactlyOneField { expr }.into()
             }
-            InferenceDiagnostic::TypeMismatch { node, expected, found, at_error } => {
+            InferenceDiagnostic::TypeMismatch { node, expected, found, at_error, cause } => {
                 let expr_or_pat = expr_or_pat_syntax(node.unpack())?;
                 let target = DisplayTarget::from_crate_and_edition(db, krate, edition);
                 let at_error = at_error.as_deref().map(|(expected, found)| {
@@ -2914,6 +3138,7 @@ impl<'db> AnyDiagnostic<'db> {
                 });
                 TypeMismatch {
                     at_error,
+                    cause: (*cause).into(),
                     expr_or_pat,
                     expected: Type {
                         owner: type_owner,
@@ -2929,7 +3154,7 @@ impl<'db> AnyDiagnostic<'db> {
             InferenceDiagnostic::SolverDiagnostic(d) => {
                 let span = span_syntax(d.span)?;
                 let target = DisplayTarget::from_crate_and_edition(db, krate, edition);
-                Self::solver_diagnostic(db, &d.kind, span, type_owner, target)?
+                Self::solver_diagnostic(db, &d.kind, span, d.cause.into(), type_owner, target)?
             }
             InferenceDiagnostic::ExplicitDropMethodUse { kind } => {
                 let expr_or_path = match kind {
@@ -3015,6 +3240,7 @@ impl<'db> AnyDiagnostic<'db> {
         db: &'db Db,
         d: &'db SolverDiagnosticKind,
         span: SpanSyntax,
+        cause: ObligationCauseCode,
         type_owner: TypeOwnerId,
         target: DisplayTarget,
     ) -> Option<AnyDiagnostic<'db>> {
@@ -3024,7 +3250,7 @@ impl<'db> AnyDiagnostic<'db> {
             ty: EarlyBinder::bind(interner, ty.as_ref()),
         };
         let goal = |goal| Self::solver_goal(db, goal, type_owner, target);
-        let error = |kind| -> AnyDiagnostic<'db> { TraitSolverError { span, kind }.into() };
+        let error = |kind| -> AnyDiagnostic<'db> { TraitSolverError { span, cause, kind }.into() };
         Some(match d {
             SolverDiagnosticKind::GoalUnmet { goal: unmet } => {
                 error(TraitSolverErrorKind::GoalUnmet(goal(unmet)))
@@ -3057,6 +3283,7 @@ impl<'db> AnyDiagnostic<'db> {
             SolverDiagnosticKind::TraitUnimplemented {
                 trait_predicate,
                 parent_trait_predicates,
+                parent_impls,
             } => {
                 let trait_predicate =
                     crate::TraitClause::new(interner, type_owner, trait_predicate.get(interner));
@@ -3066,7 +3293,16 @@ impl<'db> AnyDiagnostic<'db> {
                         crate::TraitClause::new(interner, type_owner, trait_predicate.get(interner))
                     })
                     .collect();
-                UnimplementedTrait { span, trait_predicate, parent_trait_predicates }.into()
+                // alloc: error path, the diagnostic's own list
+                let parent_impls = parent_impls.iter().map(|&it| it.map(crate::Impl::from)).collect();
+                UnimplementedTrait {
+                    span,
+                    cause,
+                    trait_predicate,
+                    parent_trait_predicates,
+                    parent_impls,
+                }
+                .into()
             }
             &SolverDiagnosticKind::ClosureKindMismatch { expected, found, is_async, ref closure } => {
                 let fn_trait = |kind| match (kind, is_async) {
@@ -3079,6 +3315,7 @@ impl<'db> AnyDiagnostic<'db> {
                 };
                 ClosureKindMismatch {
                     span,
+                    cause,
                     expected: fn_trait(expected),
                     found: fn_trait(found),
                     closure: Self::closure_syntax(db, closure.as_ref()),

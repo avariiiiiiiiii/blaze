@@ -2,6 +2,7 @@
 
 mod child_by_source;
 mod source_to_def;
+pub mod view;
 
 use std::{
     cell::RefCell,
@@ -15,7 +16,6 @@ use either::Either;
 use hir_def::{
     BuiltinDeriveImplId, DefWithBodyId, ExpressionStoreOwnerId, GenericDefId, HasModule, MacroId,
     StructId, TraitId, VariantId,
-    attrs::parse_extra_crate_attrs,
     expr_store::{Body, ExprOrPatSource, ExpressionStore, HygieneId, path::Path},
     hir::{BindingId, Expr, ExprId, ExprOrPatId, Unsafe},
     nameres::{ModuleOrigin, crate_def_map},
@@ -60,6 +60,7 @@ use crate::{
     Local, Macro, Module, ModuleDef, Name, OverloadedDeref, ScopeDef, Static, Struct, ToolModule,
     Trait, TupleField, Type, TypeAlias, TypeParam, Union, Variant,
     db::HirDatabase,
+    scratch::{DescendCalls, DescendFirsts, DescendGroups, DescendTokens, LintAttrs},
     semantics::source_to_def::{ChildContainer, SourceToDefCache, SourceToDefCtx},
     source_analyzer::{SourceAnalyzer, resolve_hir_path},
 };
@@ -191,8 +192,9 @@ impl<'db> ops::Deref for Semantics<'db> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum LintAttr {
+    #[default]
     Allow,
     Expect,
     Warn,
@@ -214,6 +216,8 @@ impl<'db> Semantics<'db> {
     ) -> Semantics<'db> {
         let mut impl_ = SemanticsImpl::new(db);
         impl_.s2d_cache.get_mut().within = Some(crates);
+        impl_.s2d_cache.get_mut().file_to_def_cache.clear();
+        impl_.s2d_cache.get_mut().included_file_cache.clear();
         Semantics { db, imp: impl_ }
     }
 
@@ -266,12 +270,13 @@ impl<'db> Semantics<'db> {
         node: &SyntaxNode,
         offset: TextSize,
     ) -> impl Iterator<Item = ast::NameLike> + 'slf {
-        node.token_at_offset(offset)
+        let descended = node
+            .token_at_offset(offset)
             .map(move |token| self.descend_into_macros_no_opaque(token, true))
-            .map(|descendants| descendants.into_iter().filter_map(move |it| it.value.parent()))
-            // re-order the tokens from token_at_offset by returning the ancestors with the smaller first nodes first
-            // See algo::ancestors_at_offset, which uses the same approach
-            .kmerge_by(|left, right| left.text_range().len().lt(&right.text_range().len()))
+            .map(|descendants| descendants.into_iter().filter_map(move |it| it.value.parent()));
+        // re-order the tokens from token_at_offset by returning the ancestors with the smaller first nodes first
+        // See algo::ancestors_at_offset, which uses the same approach
+        kmerge2(descended, |left, right| left.text_range().len().lt(&right.text_range().len()))
             .filter_map(ast::NameLike::cast)
     }
 
@@ -286,18 +291,16 @@ impl<'db> Semantics<'db> {
 
         let is_crate_root = file_id == krate.root_file(self.imp.db);
         let is_source_file = ast::SourceFile::can_cast(item.syntax().kind());
-        let extra_crate_attrs = (is_crate_root && is_source_file)
-            .then(|| {
-                parse_extra_crate_attrs(self.imp.db, krate.id)
-                    .into_iter()
-                    .flat_map(|src| src.attrs())
-            })
-            .into_iter()
-            .flatten();
+        let crate_attrs = match is_crate_root && is_source_file {
+            true => base_db::applied_crate_attr_files(self.imp.db, krate.id),
+            false => &[],
+        };
+        let crate_attrs =
+            crate_attrs.iter().flat_map(|&file| file.parse(self.imp.db).tree().attrs());
 
-        let mut result = Vec::new();
+        let mut result = blaze_mem::scratch::lend::<LintAttrs>();
         hir_expand::attrs::expand_cfg_attr::<Infallible>(
-            extra_crate_attrs.chain(ast::attrs_including_inner(&item)),
+            ast::attrs_including_inner(&item).chain(crate_attrs),
             cfg_options,
             |attr, _| {
                 let ast::Meta::TokenTreeMeta(attr) = attr else {
@@ -339,7 +342,7 @@ impl<'db> Semantics<'db> {
                 ControlFlow::Continue(())
             },
         );
-        result.into_iter()
+        crate::scratch::LentDrain::new(result)
     }
 
     pub fn resolve_range_pat(&self, range_pat: &ast::RangePat) -> Option<Struct> {
@@ -453,12 +456,21 @@ impl<'db> Semantics<'db> {
     }
 }
 
+impl Drop for SemanticsImpl<'_> {
+    fn drop(&mut self) {
+        let cache = mem::take(self.s2d_cache.get_mut());
+        let macro_calls = mem::take(self.macro_call_cache.get_mut());
+        cache.give(self.db, macro_calls);
+    }
+}
+
 impl<'db> SemanticsImpl<'db> {
     fn new(db: &'db Db) -> Self {
+        let (s2d_cache, macro_call_cache) = SourceToDefCache::take(db);
         SemanticsImpl {
             db,
-            s2d_cache: Default::default(),
-            macro_call_cache: Default::default(),
+            s2d_cache: RefCell::new(s2d_cache),
+            macro_call_cache: RefCell::new(macro_call_cache),
             signature_anon_consts_cache: Default::default(),
         }
     }
@@ -688,7 +700,7 @@ impl<'db> SemanticsImpl<'db> {
         let result = sa
             .resolver
             .def_map()
-            .derive_helpers_in_scope(InFile::new(sa.file_id, id))?
+            .derive_helpers_in_scope(self.db, InFile::new(sa.file_id, id))?
             .iter()
             .map(|(name, macro_, _)| {
                 let macro_name = Macro::from(*macro_).name(self.db).symbol().clone();
@@ -711,7 +723,7 @@ impl<'db> SemanticsImpl<'db> {
         let res: Vec<_> = sa
             .resolver
             .def_map()
-            .derive_helpers_in_scope(InFile::new(sa.file_id, id))?
+            .derive_helpers_in_scope(self.db, InFile::new(sa.file_id, id))?
             .iter()
             .filter(|&(name, _, _)| *name == attr_name)
             .filter_map(|&(_, macro_, call)| Some((macro_.into(), call.left()?)))
@@ -987,18 +999,18 @@ impl<'db> SemanticsImpl<'db> {
         };
         let span =
             HirFileId::from(tok.file_id).span_map(self.db).span_for_range(tok.value.text_range());
-        let Some(InMacroFile { file_id, value: mut mapped_tokens }) = self.with_ctx(|ctx| {
+        let Some(InMacroFile { file_id, value: last }) = self.with_ctx(|ctx| {
             Some(
                 ctx.cache
                     .get_or_insert_expansion(ctx.db, include)
                     .map_range_down(span)?
-                    .map(SmallVec::<[_; 2]>::from_iter),
+                    .map(Iterator::last),
             )
         }) else {
             return tok.into();
         };
         // We should only get one result at most
-        mapped_tokens.pop().map_or_else(|| tok.into(), |(tok, _)| InFile::new(file_id.into(), tok))
+        last.map_or_else(|| tok.into(), |(tok, _)| InFile::new(file_id.into(), tok))
     }
 
     /// Maps a node down by mapping its first and last token down.
@@ -1034,35 +1046,36 @@ impl<'db> SemanticsImpl<'db> {
             );
         } else {
             // Descend first and last token, then zip them to look for the node they belong to
-            let mut scratch: SmallVec<[_; 1]> = smallvec![];
-            self.descend_into_macros_all(
-                InFile::new(file.file_id, first),
-                false,
-                &mut |token, _ctx| scratch.push(token),
-            );
+            DescendFirsts::with(|firsts| {
+                self.descend_into_macros_all(
+                    InFile::new(file.file_id, first),
+                    false,
+                    &mut |token, _ctx| firsts.push(token),
+                );
 
-            let mut scratch = scratch.into_iter();
-            self.descend_into_macros_all(
-                InFile::new(file.file_id, last),
-                false,
-                &mut |InFile { value: last, file_id: last_fid }, _ctx| {
-                    if let Some(InFile { value: first, file_id: first_fid }) = scratch.next()
-                        && first_fid == last_fid
-                        && let Some(p) = first.parent()
-                    {
-                        let range = first.text_range().cover(last.text_range());
-                        let node = p
-                            .tree_top()
-                            .covering_element(range)
-                            .ancestors()
-                            .take_while(|it| it.text_range() == range)
-                            .find_map(N::cast);
-                        if let Some(node) = node {
-                            res.push(node);
+                let mut scratch = firsts.drain(..);
+                self.descend_into_macros_all(
+                    InFile::new(file.file_id, last),
+                    false,
+                    &mut |InFile { value: last, file_id: last_fid }, _ctx| {
+                        if let Some(InFile { value: first, file_id: first_fid }) = scratch.next()
+                            && first_fid == last_fid
+                            && let Some(p) = first.parent()
+                        {
+                            let range = first.text_range().cover(last.text_range());
+                            let node = p
+                                .tree_top()
+                                .covering_element(range)
+                                .ancestors()
+                                .take_while(|it| it.text_range() == range)
+                                .find_map(N::cast);
+                            if let Some(node) = node {
+                                res.push(node);
+                            }
                         }
-                    }
-                },
-            );
+                    },
+                );
+            });
         }
         res
     }
@@ -1221,7 +1234,7 @@ impl<'db> SemanticsImpl<'db> {
         &self,
         token: InFile<SyntaxToken>,
         always_descend_into_derives: bool,
-        f: &mut dyn FnMut(InFile<SyntaxToken>, SyntaxContext),
+        f: &mut impl FnMut(InFile<SyntaxToken>, SyntaxContext),
     ) {
         self.descend_into_macros_impl(token, always_descend_into_derives, &mut |tok, ctx| {
             f(tok, ctx);
@@ -1233,43 +1246,78 @@ impl<'db> SemanticsImpl<'db> {
         &self,
         InFile { value: token, file_id }: InFile<SyntaxToken>,
         always_descend_into_derives: bool,
-        f: &mut dyn FnMut(InFile<SyntaxToken>, SyntaxContext) -> ControlFlow<T>,
+        f: &mut impl FnMut(InFile<SyntaxToken>, SyntaxContext) -> ControlFlow<T>,
     ) -> Option<T> {
         let _p = tracing::info_span!("descend_into_macros_impl").entered();
 
         let db = self.db;
         let span = file_id.span_map(db).span_for_range(token.text_range());
 
-        // Process the expansion of a call, pushing all tokens with our span in the expansion back onto our stack
-        let process_expansion_for_token =
-            |ctx: &mut SourceToDefCtx<'_, '_>, stack: &mut Vec<_>, macro_file| {
-                let InMacroFile { file_id, value: mapped_tokens } = ctx
-                    .cache
-                    .get_or_insert_expansion(ctx.db, macro_file)
-                    .map_range_down(span)?
-                    .map(SmallVec::<[_; 2]>::from_iter);
-                // we have found a mapping for the token if the vec is non-empty
-                let res = mapped_tokens.is_empty().not().then_some(());
-                // requeue the tokens we got from mapping our current token down
-                stack.push((HirFileId::from(file_id), mapped_tokens));
-                res
-            };
+        DescendGroups::with(|groups| {
+            DescendTokens::with(|pending| {
+                DescendTokens::with(|current| {
+                    self.descend_into_macros_walk(
+                        file_id,
+                        token,
+                        span,
+                        always_descend_into_derives,
+                        f,
+                        groups,
+                        pending,
+                        current,
+                    )
+                })
+            })
+        })
+    }
 
-        // A stack of tokens to process, along with the file they came from
+    #[allow(clippy::too_many_arguments)]
+    fn descend_into_macros_walk<T>(
+        &self,
+        file_id: HirFileId,
+        token: SyntaxToken,
+        span: span::Span,
+        always_descend_into_derives: bool,
+        f: &mut impl FnMut(InFile<SyntaxToken>, SyntaxContext) -> ControlFlow<T>,
+        groups: &mut Vec<(HirFileId, u32)>,
+        pending: &mut Vec<(SyntaxToken, SyntaxContext)>,
+        current: &mut Vec<(SyntaxToken, SyntaxContext)>,
+    ) -> Option<T> {
+        let db = self.db;
+
+        // Process the expansion of a call, pushing all tokens with our span in the expansion back onto our stack
+        let process_expansion_for_token = |ctx: &mut SourceToDefCtx<'_, '_>,
+                                           groups: &mut Vec<(HirFileId, u32)>,
+                                           pending: &mut Vec<(SyntaxToken, SyntaxContext)>,
+                                           macro_file| {
+            let InMacroFile { file_id, value: mapped_tokens } =
+                ctx.cache.get_or_insert_expansion(ctx.db, macro_file).map_range_down(span)?;
+            // requeue the tokens we got from mapping our current token down
+            let before = pending.len();
+            pending.extend(mapped_tokens);
+            let mapped = u32::try_from(pending.len() - before)
+                .expect("a span mapped down to more than u32::MAX tokens");
+            groups.push((HirFileId::from(file_id), mapped));
+            // we have found a mapping for the token if any token was pushed
+            (mapped != 0).then_some(())
+        };
+
+        // Groups of tokens to process (`groups`, each the count of `pending`'s top tokens that
+        // are its), along with the file they came from.
         // These are tracked to know which macro calls we still have to look into
         // the tokens themselves aren't that interesting as the span that is being used to map
         // things down never changes.
-        let mut stack: Vec<(_, SmallVec<[_; 2]>)> = vec![];
         let include = file_id
             .file_id()
             .and_then(|file_id| self.s2d_cache.borrow_mut().get_or_insert_include_for(db, file_id));
         match include {
             Some(include) => {
                 // include! inputs are always from real files, so they only need to be handled once upfront
-                self.with_ctx(|ctx| process_expansion_for_token(ctx, &mut stack, include))?;
+                self.with_ctx(|ctx| process_expansion_for_token(ctx, groups, pending, include))?;
             }
             None => {
-                stack.push((file_id, smallvec![(token, span.ctx)]));
+                pending.push((token, span.ctx));
+                groups.push((file_id, 1));
             }
         }
 
@@ -1277,11 +1325,14 @@ impl<'db> SemanticsImpl<'db> {
 
         // Filters out all tokens that contain the given range (usually the macro call), any such
         // token is redundant as the corresponding macro call has already been processed
-        let filter_duplicates = |tokens: &mut SmallVec<_>, range: TextRange| {
+        let filter_duplicates = |tokens: &mut Vec<(SyntaxToken, SyntaxContext)>, range: TextRange| {
             tokens.retain(|(t, _): &mut (SyntaxToken, _)| !range.contains_range(t.text_range()))
         };
 
-        while let Some((expansion, ref mut tokens)) = stack.pop() {
+        while let Some((expansion, len)) = groups.pop() {
+            current.clear();
+            current.extend(pending.drain(pending.len() - len as usize..));
+            let tokens = &mut *current;
             // Reverse the tokens so we prefer first tokens (to accommodate for popping from the
             // back)
             // alternatively we could pop from the front but that would shift the content on every pop
@@ -1340,7 +1391,7 @@ impl<'db> SemanticsImpl<'db> {
                                     _ => item_range,
                                 };
                                 filter_duplicates(tokens, text_range);
-                                process_expansion_for_token(ctx, &mut stack, call_id)
+                                process_expansion_for_token(ctx, groups, pending, call_id)
                             })
                     });
 
@@ -1350,30 +1401,33 @@ impl<'db> SemanticsImpl<'db> {
 
                     if always_descend_into_derives {
                         let res = self.with_ctx(|ctx| {
-                            let (derives, adt) = token
-                                .parent_ancestors()
-                                .filter_map(ast::Adt::cast)
-                                .find_map(|adt| {
-                                    Some((
-                                        ctx.derive_macro_calls(InFile::new(expansion, &adt))?
-                                            .map(|(a, b, c)| (a, b, c.to_owned()))
-                                            .collect::<SmallVec<[_; 2]>>(),
-                                        adt,
-                                    ))
-                                })?;
-                            for (_, derive_attr, derives) in derives {
+                            DescendCalls::with(|calls| {
+                                let adt = token.parent_ancestors().filter_map(ast::Adt::cast).find(
+                                    |adt| {
+                                        let Some(found) =
+                                            ctx.derive_macro_calls(InFile::new(expansion, adt))
+                                        else {
+                                            return false;
+                                        };
+                                        for (_, derive_attr, derives) in found {
+                                            calls.push(derive_attr);
+                                            calls.extend(
+                                                derives.iter().filter_map(|&it| it?.left()),
+                                            );
+                                        }
+                                        true
+                                    },
+                                )?;
                                 // as there may be multiple derives registering the same helper
                                 // name, we gotta make sure to call this for all of them!
                                 // FIXME: We need to call `f` for all of them as well though!
-                                process_expansion_for_token(ctx, &mut stack, derive_attr);
-                                for derive in derives.into_iter().flatten() {
-                                    let Either::Left(derive) = derive else { continue };
-                                    process_expansion_for_token(ctx, &mut stack, derive);
+                                for &call in calls.iter() {
+                                    process_expansion_for_token(ctx, groups, pending, call);
                                 }
-                            }
-                            // remove all tokens that are within the derives expansion
-                            filter_duplicates(tokens, adt.syntax().text_range());
-                            Some(())
+                                // remove all tokens that are within the derives expansion
+                                filter_duplicates(tokens, adt.syntax().text_range());
+                                Some(())
+                            })
                         });
                         // if we found derives, we can early exit. There is no way we can be in any
                         // macro call at this point given we are not in a token tree
@@ -1415,12 +1469,12 @@ impl<'db> SemanticsImpl<'db> {
                             filter_duplicates(tokens, text_range);
 
                             self.with_ctx(|ctx| {
-                                process_expansion_for_token(ctx, &mut stack, file_id).or(file_id
-                                    .eager_arg(db)
-                                    .and_then(|arg| {
+                                process_expansion_for_token(ctx, groups, pending, file_id).or(
+                                    file_id.eager_arg(db).and_then(|arg| {
                                         // also descend into eager expansions
-                                        process_expansion_for_token(ctx, &mut stack, arg)
-                                    }))
+                                        process_expansion_for_token(ctx, groups, pending, arg)
+                                    }),
+                                )
                             })
                         }
                         Either::Right(_) if always_descend_into_derives => None,
@@ -1451,7 +1505,8 @@ impl<'db> SemanticsImpl<'db> {
                                         });
                                         Some(process_expansion_for_token(
                                             ctx,
-                                            &mut stack,
+                                            groups,
+                                            pending,
                                             derive_call,
                                         ))
                                     });
@@ -1485,7 +1540,7 @@ impl<'db> SemanticsImpl<'db> {
                             let id = expansion.ast_id_map(db).ast_id(&adt);
                             let helpers = resolver
                                 .def_map()
-                                .derive_helpers_in_scope(InFile::new(expansion, id))?;
+                                .derive_helpers_in_scope(db, InFile::new(expansion, id))?;
 
                             if !helpers.is_empty() {
                                 let text_range = attr.syntax().text_range();
@@ -1501,8 +1556,9 @@ impl<'db> SemanticsImpl<'db> {
                                     // as there may be multiple derives registering the same helper
                                     // name, we gotta make sure to call this for all of them!
                                     // FIXME: We need to call `f` for all of them as well though!
-                                    res = res
-                                        .or(process_expansion_for_token(ctx, &mut stack, derive));
+                                    res = res.or(process_expansion_for_token(
+                                        ctx, groups, pending, derive,
+                                    ));
                                 }
                                 res
                             })
@@ -1529,18 +1585,20 @@ impl<'db> SemanticsImpl<'db> {
         node: &SyntaxNode,
         offset: TextSize,
     ) -> impl Iterator<Item = impl Iterator<Item = SyntaxNode> + '_> + '_ {
-        node.token_at_offset(offset)
-            .map(move |token| self.descend_into_macros_exact(token))
-            .map(|descendants| {
-                descendants.into_iter().map(move |it| self.token_ancestors_with_macros(it))
-            })
+        kmerge2(
+            node.token_at_offset(offset)
+                .map(move |token| self.descend_into_macros_exact(token))
+                .map(|descendants| {
+                    descendants.into_iter().map(move |it| self.token_ancestors_with_macros(it))
+                }),
             // re-order the tokens from token_at_offset by returning the ancestors with the smaller first nodes first
             // See algo::ancestors_at_offset, which uses the same approach
-            .kmerge_by(|left, right| {
+            |left, right| {
                 left.clone()
                     .map(|node| node.text_range().len())
                     .lt(right.clone().map(|node| node.text_range().len()))
-            })
+            },
+        )
     }
 
     /// Attempts to map the node out of macro expanded files returning the original file range.
@@ -1641,9 +1699,10 @@ impl<'db> SemanticsImpl<'db> {
         node: &SyntaxNode,
         offset: TextSize,
     ) -> impl Iterator<Item = SyntaxNode> + '_ {
-        node.token_at_offset(offset)
-            .map(|token| self.token_ancestors_with_macros(token))
-            .kmerge_by(|node1, node2| node1.text_range().len() < node2.text_range().len())
+        kmerge2(
+            node.token_at_offset(offset).map(|token| self.token_ancestors_with_macros(token)),
+            |node1, node2| node1.text_range().len() < node2.text_range().len(),
+        )
     }
 
     /// Returns the `return` expressions in this function's body,
@@ -2252,7 +2311,7 @@ impl<'db> SemanticsImpl<'db> {
     fn with_all_infers_for_store(
         &self,
         owner: ExpressionStoreOwnerId,
-        callback: &mut dyn FnMut(&'db InferenceResult<'db>),
+        callback: &mut impl FnMut(&'db InferenceResult<'db>),
     ) {
         let mut handle_def_without_body = |def| {
             let mut cache = self.signature_anon_consts_cache.borrow_mut();
@@ -2772,10 +2831,16 @@ impl<'db> SemanticsScope<'db> {
     }
 
     /// Calls the passed closure `f` on all names in scope.
-    pub fn process_all_names(&self, f: &mut dyn FnMut(Name, ScopeDef<'db>)) {
-        let scope = self.resolver.names_in_scope(self.db);
-        for (name, entries) in scope {
-            for entry in entries {
+    pub fn process_all_names(&self, f: &mut impl FnMut(Name, ScopeDef<'db>)) {
+        thread_local! {
+            static NAMES_IN_SCOPE: RefCell<resolver::NamesInScope> =
+                RefCell::new(resolver::NamesInScope::default());
+        }
+        // Taken rather than borrowed: `f` may ask another scope for its names.
+        let mut scope = NAMES_IN_SCOPE.take();
+        self.resolver.names_in_scope_into(self.db, &mut scope);
+        for (name, entries) in scope.iter() {
+            for &entry in entries {
                 let def = match entry {
                     resolver::ScopeDef::ModuleDef(it) => ScopeDef::ModuleDef(it.into()),
                     resolver::ScopeDef::Unknown => ScopeDef::Unknown,
@@ -2797,21 +2862,22 @@ impl<'db> SemanticsScope<'db> {
                         }
                     }
                 };
-                f(name.clone(), def)
+                f(*name, def)
             }
         }
+        NAMES_IN_SCOPE.set(scope);
     }
 
     /// Checks if a trait is in scope, either because of an import or because we're in an impl of it.
     pub fn can_use_trait_methods(&self, t: Trait) -> bool {
-        self.resolver.traits_in_scope(self.db).contains(&t.id)
+        self.resolver.has_trait_in_scope(self.db, t.id)
     }
 
     /// Resolve a path as-if it was written at the given scope. This is
     /// necessary a heuristic, as it doesn't take hygiene into account.
     pub fn speculative_resolve(&self, ast_path: &ast::Path) -> Option<PathResolution<'db>> {
         let mut kind = PathKind::Plain;
-        let mut segments = vec![];
+        let mut segments = SmallVec::<[Name; 8]>::new();
         let mut first = true;
         for segment in ast_path.segments() {
             if first {
@@ -2838,11 +2904,16 @@ impl<'db> SemanticsScope<'db> {
             }
         }
 
+        self.speculative_resolve_mod_path(&ModPath::from_segments(kind, segments))
+    }
+
+    /// [`Self::speculative_resolve`] of a path already made a [`ModPath`].
+    pub fn speculative_resolve_mod_path(&self, path: &ModPath) -> Option<PathResolution<'db>> {
         resolve_hir_path(
             self.db,
             &self.resolver,
             self.infer_body,
-            Path::BarePath(&ModPath::from_segments(kind, segments)),
+            Path::BarePath(path),
             HygieneId::ROOT,
             None,
         )
@@ -2950,5 +3021,50 @@ impl RenameConflictsVisitor<'_> {
         }
 
         self.body.walk_child_exprs(expr, |expr| self.rename_conflicts(expr));
+    }
+}
+
+/// `Itertools::kmerge_by` of at most two iterators (what `token_at_offset` yields), without
+/// its heap: the same order, the iterator that gave the last item staying first on a tie.
+pub(crate) struct KMerge2<I: Iterator, F> {
+    first: Option<(I::Item, I)>,
+    second: Option<(I::Item, I)>,
+    less: F,
+}
+
+pub(crate) fn kmerge2<I: Iterator, F: FnMut(&I::Item, &I::Item) -> bool>(
+    mut iters: impl Iterator<Item = I>,
+    mut less: F,
+) -> KMerge2<I, F> {
+    let head = |it: Option<I>| it.and_then(|mut it| Some((it.next()?, it)));
+    let mut first = head(iters.next());
+    let mut second = head(iters.next());
+    debug_assert!(iters.next().is_none(), "`kmerge2` of more than two iterators");
+    if first.is_none() {
+        mem::swap(&mut first, &mut second);
+    }
+    if let (Some(a), Some(b)) = (&first, &second)
+        && less(&b.0, &a.0)
+    {
+        mem::swap(&mut first, &mut second);
+    }
+    KMerge2 { first, second, less }
+}
+
+impl<I: Iterator, F: FnMut(&I::Item, &I::Item) -> bool> Iterator for KMerge2<I, F> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        let (head, tail) = self.first.as_mut()?;
+        let Some(next) = tail.next() else {
+            return mem::replace(&mut self.first, self.second.take()).map(|(item, _)| item);
+        };
+        let item = mem::replace(head, next);
+        if let (Some(a), Some(b)) = (&self.first, &self.second)
+            && (self.less)(&b.0, &a.0)
+        {
+            mem::swap(&mut self.first, &mut self.second);
+        }
+        Some(item)
     }
 }

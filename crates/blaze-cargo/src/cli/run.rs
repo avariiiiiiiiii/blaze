@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use blaze_api::Artifact;
+use blaze_api::{Artifact, TargetKind};
 
 use super::{args::Flags, say};
 
@@ -18,18 +18,16 @@ use super::{args::Flags, say};
 /// holds the build to them.
 pub fn pick<'a>(artifacts: &'a [Artifact], flags: &Flags) -> Result<&'a Artifact, String> {
     let specific = !flags.bins.is_empty() || !flags.examples.is_empty();
-    let runnable = |it: &&Artifact| {
-        let kind = it.target.kind.first().map(String::as_str);
-        !it.profile.test && matches!(kind, Some("bin" | "example"))
-    };
+    let runnable =
+        |it: &&Artifact| !it.profile.test && matches!(it.target.kind, TargetKind::Bin | TargetKind::Example);
     let named = |it: &&Artifact| {
-        let kind = it.target.kind.first().map(String::as_str);
+        let kind = it.target.kind;
         let among = |names: &[Option<String>]| names.iter().flatten().any(|name| *name == it.target.name);
         // `--bin` without a name is cargo's to answer with the list; any bin is it here.
         let any = |names: &[Option<String>]| !names.is_empty() && names.iter().all(Option::is_none);
         let bins = any(&flags.bins) || among(&flags.bins);
         let examples = any(&flags.examples) || among(&flags.examples);
-        !specific || (kind == Some("bin") && bins) || (kind == Some("example") && examples)
+        !specific || (kind == TargetKind::Bin && bins) || (kind == TargetKind::Example && examples)
     };
     let bins: Vec<&Artifact> = artifacts.iter().filter(runnable).filter(named).collect();
     match bins.as_slice() {
@@ -54,24 +52,13 @@ pub fn pick<'a>(artifacts: &'a [Artifact], flags: &Flags) -> Result<&'a Artifact
         several => {
             let mut said = "`cargo run` can run at most one executable, but multiple were specified\nhelp: available targets:".to_owned();
             for it in several {
-                let kind = it.target.kind.first().map_or("bin", String::as_str);
+                let kind = it.target.kind.name();
                 let package = say::package_name(&it.package);
                 let _ = write!(said, "\n    {kind} `{}` in package `{package}`", it.target.name);
             }
             Err(said)
         }
     }
-}
-
-/// What `run` refuses of its command line before anything is built: a glob pattern among the
-/// packages (`commands/run.rs`) or the targets (`ops::run`), as cargo's `is_glob_pattern` sees one.
-pub fn refused(flags: &Flags) -> Option<String> {
-    let glob = |it: &str| it.contains(['*', '?', '[', ']']);
-    if let Some(pattern) = flags.packages.iter().find(|it| glob(it)) {
-        return Some(format!("`cargo run` does not support glob pattern `{pattern}` on package selection"));
-    }
-    let mut targets = flags.bins.iter().chain(&flags.examples).flatten();
-    targets.any(|it| glob(it)).then(|| "`cargo run` does not support glob patterns on target selection".to_owned())
 }
 
 /// The executable as cargo runs it from `cwd`: below it, relative, and `./foo` for one in it.
@@ -147,6 +134,7 @@ pub struct Told {
 /// cargo's `exec_replace`: on Unix this process becomes the program, which ends the command as
 /// it ends (with its code, or by its signal); elsewhere it waits for it and exits with its code,
 /// saying nothing of it under `-q` (`to_run_error`).
+// dyn: the CLI's output writer, written once per program run.
 pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
     let mut command = exec.command();
     #[cfg(unix)]
@@ -176,6 +164,7 @@ pub fn exec(exec: &Exec, err: &mut dyn Write, told: Told) -> i32 {
 
 /// cargo's `ProcessError` for a program that could not be started, with its cause; said under
 /// `-q` too.
+// dyn: the CLI's output writer, written once per program that could not start.
 fn never_executed(exec: &Exec, error: &std::io::Error, err: &mut dyn Write, told: Told) -> i32 {
     let what = format!("could not execute process {} (never executed)", exec.shown_at(told.verbose));
     let _ = err.write_all(caused(&what, &[error.to_string()], told.color).as_bytes());

@@ -64,6 +64,30 @@ impl IntoIterator for UsageSearchResult {
     }
 }
 
+/// Where [`FindUsages::search`] puts each reference it finds.
+enum UsageSink<'r> {
+    /// Records that one exists and stops the search.
+    First(&'r mut bool),
+    /// Keeps every reference, grouped by file.
+    All(&'r mut UsageSearchResult),
+}
+
+impl UsageSink<'_> {
+    /// Takes one reference; `true` stops the search.
+    fn push(&mut self, file_id: EditionedFileId, reference: FileReference) -> bool {
+        match self {
+            UsageSink::First(found) => {
+                **found = true;
+                true
+            }
+            UsageSink::All(res) => {
+                res.references.entry(file_id).or_default().push(reference);
+                false
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FileReference {
     /// The range of the reference in the original file
@@ -494,19 +518,13 @@ impl<'a, 'db> FindUsages<'a, 'db> {
 
     pub fn at_least_one(&self) -> bool {
         let mut found = false;
-        self.search(&mut |_, _| {
-            found = true;
-            true
-        });
+        self.search(&mut UsageSink::First(&mut found));
         found
     }
 
     pub fn all(self) -> UsageSearchResult {
         let mut res = UsageSearchResult::default();
-        self.search(&mut |file_id, reference| {
-            res.references.entry(file_id).or_default().push(reference);
-            false
-        });
+        self.search(&mut UsageSink::All(&mut res));
         res
     }
 
@@ -599,7 +617,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
     // FIXME: Extend this to other cases, such as associated types/consts/enum variants (note those can be `use`d).
     fn short_associated_function_fast_search(
         &self,
-        sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
+        sink: &mut UsageSink<'_>,
         search_scope: &SearchScope,
         name: &str,
     ) -> bool {
@@ -847,7 +865,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                 &SyntaxNode,
                 InFileWrapper<EditionedFileId, TextRange>,
             ) -> bool,
-            sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
+            sink: &mut UsageSink<'_>,
         ) {
             for (file_text, file_id, search_range) in files {
                 let tree = LazyCell::new(move || this.sema.parse(file_id).syntax().clone());
@@ -925,7 +943,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
         true
     }
 
-    pub fn search(&self, sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool) {
+    fn search(&self, sink: &mut UsageSink<'_>) {
         let _p = tracing::info_span!("FindUsages:search").entered();
         let sema = self.sema;
 
@@ -1130,7 +1148,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
         &self,
         self_ty: &hir::Type<'_>,
         name_ref: &ast::NameRef,
-        sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
+        sink: &mut UsageSink<'_>,
     ) -> bool {
         if self.is_excluded_name_ref(name_ref) {
             return false;
@@ -1153,7 +1171,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: ReferenceCategory::empty(),
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             _ => false,
         }
@@ -1162,7 +1180,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
     fn found_self_module_name_ref(
         &self,
         name_ref: &ast::NameRef,
-        sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
+        sink: &mut UsageSink<'_>,
     ) -> bool {
         if self.is_excluded_name_ref(name_ref) {
             return false;
@@ -1181,7 +1199,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category,
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             _ => false,
         }
@@ -1193,7 +1211,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
         range: TextRange,
         token: ast::String,
         res: Either<PathResolution<'db>, InlineAsmOperand>,
-        sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
+        sink: &mut UsageSink<'_>,
     ) -> bool {
         let def = res.either(Definition::from, Definition::from);
         if def == self.def {
@@ -1202,7 +1220,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                 name: FileReferenceNode::FormatStringEntry(token, range),
                 category: ReferenceCategory::READ,
             };
-            sink(file_id, reference)
+            sink.push(file_id, reference)
         } else {
             false
         }
@@ -1211,7 +1229,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
     fn found_lifetime(
         &self,
         lifetime: &ast::Lifetime,
-        sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
+        sink: &mut UsageSink<'_>,
     ) -> bool {
         match NameRefClass::classify_lifetime(self.sema, lifetime) {
             Some(NameRefClass::Definition(def, _)) if def == self.def => {
@@ -1221,7 +1239,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::Lifetime(lifetime.clone()),
                     category: ReferenceCategory::empty(),
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             _ => false,
         }
@@ -1230,7 +1248,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
     fn found_name_ref(
         &self,
         name_ref: &ast::NameRef,
-        sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
+        sink: &mut UsageSink<'_>,
     ) -> bool {
         if self.is_excluded_name_ref(name_ref) {
             return false;
@@ -1249,7 +1267,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: ReferenceCategory::new(self.sema, &def, name_ref),
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             // FIXME: special case type aliases, we can't filter between impl and trait defs here as we lack the substitutions
             // so we always resolve all assoc type aliases to both their trait def and impl defs
@@ -1265,7 +1283,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: ReferenceCategory::new(self.sema, &def, name_ref),
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             Some(NameRefClass::Definition(def, _))
                 if self.include_self_kw_refs.is_some()
@@ -1277,7 +1295,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: ReferenceCategory::new(self.sema, &def, name_ref),
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             Some(NameRefClass::FieldShorthand {
                 local_ref: local,
@@ -1302,7 +1320,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::NameRef(name_ref.clone()),
                     category: access,
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             _ => false,
         }
@@ -1318,7 +1336,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
     fn found_name(
         &self,
         name: &ast::Name,
-        sink: &mut dyn FnMut(EditionedFileId, FileReference) -> bool,
+        sink: &mut UsageSink<'_>,
     ) -> bool {
         match NameClass::classify(self.sema, name) {
             Some(NameClass::PatFieldShorthand { local_def: _, field_ref, adt_subst: _ })
@@ -1333,7 +1351,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     // FIXME: mutable patterns should have `Write` access
                     category: ReferenceCategory::READ,
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             Some(NameClass::ConstReference(def)) if self.def == def => {
                 let FileRange { file_id, range } = self.sema.original_range(name.syntax());
@@ -1342,7 +1360,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::Name(name.clone()),
                     category: ReferenceCategory::empty(),
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             Some(NameClass::Definition(def)) if def != self.def => {
                 match (&self.assoc_item_container, self.def) {
@@ -1367,7 +1385,7 @@ impl<'a, 'db> FindUsages<'a, 'db> {
                     name: FileReferenceNode::Name(name.clone()),
                     category: ReferenceCategory::empty(),
                 };
-                sink(file_id, reference)
+                sink.push(file_id, reference)
             }
             _ => false,
         }
@@ -1448,4 +1466,41 @@ fn is_name_ref_in_test(sema: &Semantics<'_, RootDatabase>, name_ref: &ast::NameR
 fn is_library_file(db: &RootDatabase, file_id: span::FileId) -> bool {
     let source_root = db.file_source_root(file_id).source_root_id(db);
     db.source_root(source_root).source_root(db).is_library
+}
+
+#[cfg(test)]
+mod tests {
+    use hir::Semantics;
+    use syntax::{AstNode, ast};
+    use test_fixture::WithFixture;
+
+    use crate::{RootDatabase, defs::NameClass};
+
+    /// The definition named at `$0`: its references through [`UsageSink::All`] and whether
+    /// [`UsageSink::First`] found one.
+    fn usages(#[rust_analyzer::rust_fixture] ra_fixture: &str) -> (usize, bool) {
+        let (db, position) = RootDatabase::with_position(ra_fixture);
+        let sema = Semantics::new(&db);
+        hir::attach_db(&db, || {
+            let file = sema.parse(position.file_id);
+            let name: ast::Name =
+                sema.find_node_at_offset_with_descend(file.syntax(), position.offset).unwrap();
+            let def = NameClass::classify(&sema, &name).and_then(NameClass::defined).unwrap();
+            let any = def.usages(&sema).at_least_one();
+            let all = def.usages(&sema).all();
+            (all.file_ranges().count(), any)
+        })
+    }
+
+    #[test]
+    fn sinks_on_the_text_search() {
+        assert_eq!(usages("fn foo$0() {}\nfn a() { foo(); foo(); }"), (2, true));
+        assert_eq!(usages("fn foo$0() {}\nfn a() {}"), (0, false));
+    }
+
+    #[test]
+    fn sinks_on_the_associated_function_fast_search() {
+        let fixture = "struct S;\nimpl S { fn new$0() -> S { S } }\nfn a() { S::new(); let _ = S::new(); }";
+        assert_eq!(usages(fixture), (2, true));
+    }
 }

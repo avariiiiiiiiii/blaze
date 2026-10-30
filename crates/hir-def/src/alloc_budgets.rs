@@ -150,6 +150,7 @@ impl Defs {
     }
 
     fn fields(&self, db: &TestDB) -> Vec<FieldId> {
+        // alloc: test setup, outside the measure
         let mut fields = Vec::new();
         for &parent in &self.variants {
             for (local_id, _) in parent.fields(db).fields().iter() {
@@ -244,11 +245,13 @@ fn gated_value_reads_allocate_nothing() {
     };
     assert!(named("exported"), "`#[export_name]` was not read");
     let sections: Vec<Symbol> =
+        // alloc: test setup, outside the measure
         defs.items.iter().filter_map(|&it| AttrFlags::link_section(&db, it)).collect();
     assert_eq!(sections, [Symbol::intern(".text.cold")]);
     let reprs = defs.adts.iter().filter(|&&it| AttrFlags::repr(&db, it).is_some()).count();
     assert_eq!(reprs, 1, "only `Repr` has a `#[repr]`");
     let messages: Vec<&str> =
+        // alloc: test setup, outside the measure
         defs.items.iter().filter_map(|&it| AttrFlags::must_use_message(&db, it).flatten()).collect();
     assert_eq!(messages, ["use the sum"]);
     blaze_alloc_count::assert_at_most(0, "the gated value reads of every item", read);
@@ -261,7 +264,9 @@ fn interning_a_known_loc_allocates_nothing() {
     let (db, krate) = fixture();
     let defs = Defs::of(&db, krate);
     assert!(defs.functions.len() > 6 && defs.structs.len() >= 3, "too small to measure");
+    // alloc: test setup, outside the measure
     let functions: Vec<_> = defs.functions.iter().map(|&it| (it, *it.lookup(&db))).collect();
+    // alloc: test setup, outside the measure
     let structs: Vec<_> = defs.structs.iter().map(|&it| (it, *it.lookup(&db))).collect();
     blaze_alloc_count::assert_at_most(0, "interning every function's and struct's loc again", || {
         for &(id, loc) in &functions {
@@ -305,6 +310,7 @@ fn upvar_reads_allocate_nothing() {
         .functions
         .iter()
         .map(|&it| ExpressionStoreOwnerId::Body(DefWithBodyId::FunctionId(it)))
+        // alloc: test setup, outside the measure
         .collect();
     let with_upvars = owners.iter().filter(|&&it| upvars_mentioned(&db, it).is_some()).count();
     assert_eq!(with_upvars, 1, "only `hot`'s closure captures a local");

@@ -298,25 +298,33 @@ pub(super) fn const_int(value: Scalar, alternate: bool) -> String {
     };
     let width = u32::from(value.size) * 8;
     let name = |prefix: char| match pointer_sized {
+        // alloc: a lint's message, for a panic found
         true => format!("{prefix}size"),
+        // alloc: a lint's message, for a panic found
         false => format!("{prefix}{width}"),
     };
     let (prefix, number) = if signed {
         let min = 1u128 << (width - 1);
         if value.bits == min {
+            // alloc: a lint's message, for a panic found
             return format!("{}::MIN", name('i'));
         }
         if value.bits == min - 1 {
+            // alloc: a lint's message, for a panic found
             return format!("{}::MAX", name('i'));
         }
+        // alloc: a lint's message, for a panic found
         ('i', value.int().to_string())
     } else {
         if value.bits == truncate(u128::MAX, value.size) {
+            // alloc: a lint's message, for a panic found
             return format!("{}::MAX", name('u'));
         }
+        // alloc: a lint's message, for a panic found
         ('u', value.bits.to_string())
     };
     match alternate {
+        // alloc: a lint's message, for a panic found
         true => format!("{number}_{}", name(prefix)),
         false => number,
     }

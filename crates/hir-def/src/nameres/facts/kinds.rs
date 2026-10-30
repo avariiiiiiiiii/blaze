@@ -2,51 +2,8 @@
 //! (`hir_def::nameres::kinds`). A query that is dropped keeps its number unused; a new one
 //! takes the next.
 
-pub use blaze_query::QueryKind;
-
-/// The numbers the resolver may give.
-pub const RANGE: std::ops::Range<u16> = 0x2200..0x2240;
-
-macro_rules! kinds {
-    ($($(#[$meta:meta])* $name:ident = $number:literal, $query:literal;)*) => {
-        $($(#[$meta])* pub const $name: QueryKind = QueryKind($number);)*
-
-        /// Every kind, with its query as the resolver names it: a function's name, or
-        /// `Type::method` for a method of a tracked `impl`.
-        pub const ALL: &[(QueryKind, &str)] = &[$(($name, $query)),*];
-
-        /// The kind of the query the resolver names `name`, as [`ALL`] names it.
-        pub fn of(name: &str) -> Option<QueryKind> {
-            match name {
-                $($query => Some($name),)*
-                _ => None,
-            }
-        }
-    };
-}
-
-/// Each number of [`RANGE`] with the query it is given to, built when compiled. Building it
-/// refuses a number outside the range or given twice.
-const NAMES: [Option<&str>; (RANGE.end - RANGE.start) as usize] = {
-    let mut names = [None; (RANGE.end - RANGE.start) as usize];
-    let mut at = 0;
-    while at < ALL.len() {
-        let (kind, name) = ALL[at];
-        assert!(RANGE.start <= kind.0 && kind.0 < RANGE.end, "a kind outside the resolver's range");
-        let slot = (kind.0 - RANGE.start) as usize;
-        assert!(names[slot].is_none(), "a kind given to two queries");
-        names[slot] = Some(name);
-        at += 1;
-    }
-    names
-};
-
-/// The query of `kind`, if it is the resolver's.
-pub fn name(kind: QueryKind) -> Option<&'static str> {
-    NAMES.get(kind.0.wrapping_sub(RANGE.start) as usize).copied().flatten()
-}
-
-kinds! {
+blaze_query::query_kinds! {
+    range: 0x2200..0x2240, owner: "the resolver";
     MODULE_DECLS = 0x2200, "module_decls";
     LEGACY_EXPORTS = 0x2201, "legacy_exports";
     SUBTREE_MACRO_EXPORTS = 0x2202, "subtree_macro_exports";

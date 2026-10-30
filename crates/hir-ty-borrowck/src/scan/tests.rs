@@ -2,7 +2,7 @@
 //! own as the checks ran them per body: every table the same, in the same order, for every
 //! body of a fixture that gives each of them entries.
 
-mod db;
+pub(crate) mod db;
 
 use base_db::all_crates;
 use hir_def::{
@@ -269,12 +269,24 @@ struct Seen {
     in_closures: usize,
 }
 
+fn same<K: Eq + std::hash::Hash, V: PartialEq, W>(
+    got: &crate::mem::FMap<'_, K, V>,
+    want: &FxHashMap<K, W>,
+    eq: impl Fn(&V, &W) -> bool,
+) -> bool {
+    got.len() == want.len() && want.iter().all(|(k, w)| got.get(k).is_some_and(|v| eq(v, w)))
+}
+
 fn check(db: &TestDB, def: DefWithBodyId, seen: &mut Seen) {
+    blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| check_in(frame, db, def, seen));
+}
+
+fn check_in(frame: &crate::mem::Frame, db: &TestDB, def: DefWithBodyId, seen: &mut Seen) {
     let owner = InferBodyId::DefWithBodyId(def);
     let infer = InferenceResult::of(db, owner);
     let store = ExpressionStore::of(db, owner.expression_store_owner(db));
     let interner = DbInterner::new_with(db, owner.krate(db));
-    let scan = Scan::new(store, infer, interner);
+    let scan = Scan::new(frame, store, infer, interner);
 
     let want = matched(store, infer);
     let got: FxHashSet<ExprId> = store.expr_ids().filter(|&it| scan.is_matched(it)).collect();
@@ -295,8 +307,8 @@ fn check(db: &TestDB, def: DefWithBodyId, seen: &mut Seen) {
 
     let (tested_by, bound_by, matches) = guarded(store);
     assert_eq!(scan.guarded.matches, matches.len(), "{def:?}: guarded matches");
-    assert_eq!(scan.guarded.tested_by, tested_by, "{def:?}: tested_by");
-    assert_eq!(scan.guarded.bound_by, bound_by, "{def:?}: bound_by");
+    assert!(same(&scan.guarded.tested_by, &tested_by, PartialEq::eq), "{def:?}: tested_by");
+    assert!(same(&scan.guarded.bound_by, &bound_by, PartialEq::eq), "{def:?}: bound_by");
     let want: Vec<(usize, usize, ExprId)> = matches
         .iter()
         .enumerate()
@@ -314,7 +326,7 @@ fn check(db: &TestDB, def: DefWithBodyId, seen: &mut Seen) {
     seen.bound_by += bound_by.len();
 
     let want = scrutinees(store);
-    assert_eq!(scan.scrutinees, want, "{def:?}: scrutinees");
+    assert!(same(&scan.scrutinees, &want, PartialEq::eq), "{def:?}: scrutinees");
     for (&binding, &scrutinee) in &want {
         assert_eq!(scan.scrutinee_of(binding), Some(scrutinee), "{def:?}: {binding:?}");
     }
@@ -322,14 +334,19 @@ fn check(db: &TestDB, def: DefWithBodyId, seen: &mut Seen) {
     seen.simple_lets += want.values().filter(|it| it.is_none()).count();
 
     let want = guard_bindings(store);
-    assert_eq!(scan.guard_bindings, want, "{def:?}: guard_bindings");
+    assert!(
+        same(&scan.guard_bindings, &want, |got, want: &Vec<BindingId>| {
+            got.as_slice() == want.as_slice()
+        }),
+        "{def:?}: guard_bindings"
+    );
     for (&expr, bindings) in &want {
         assert_eq!(scan.guard_bindings(expr), bindings.as_slice(), "{def:?}: {expr:?}");
     }
     seen.guard_bindings += want.len();
 
     let want = statement_values(store, infer, interner);
-    assert_eq!(scan.statement_values, want, "{def:?}: statement_values");
+    assert!(same(&scan.statement_values, &want, PartialEq::eq), "{def:?}: statement_values");
     seen.statement_values += want.len();
     seen.typed_statement_values += want.values().filter(|it| it.is_some()).count();
 

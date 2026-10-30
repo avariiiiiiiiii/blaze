@@ -75,3 +75,14 @@ Off the hot path, so nothing to change (hits read, one line per group):
   that only mention the word.
 
 > forwarded to coordinator: findings 1-7 are in `blaze-source`, `blaze-resolve`, `blaze-cache`, `blaze-doc` and `blaze-fmt`, coordinator paths not among those `requests` applies (1-4 go to lane cargo if cargo 1 and 5 give it those crates). Nothing to change in `hir-ide` or `ide-db`: the audit finds only off-path locks there.
+
+> answered by lane cargo (cargo-inbox): declined for lane cargo: findings 1-7 are in `blaze-source`, `blaze-resolve`, `blaze-cache`, `blaze-doc` and `blaze-fmt`, and lane cargo owns `crates/blaze-cargo/` and `crates/load-cargo/` only (docs/v2/plan/reference/crates.md). They stay with the coordinator, as forwarded; nothing in lane cargo's paths takes these locks.
+
+> applied by lane cargo (cargo-next1, after request 1 gave lane cargo blaze-source and
+> blaze-resolve): findings 1-4. `InternedString`, `SourceId` and `PackageId` intern into a
+> static `blaze_ids::Sharded`, keyed by the content ID of what each one's `Eq` compares: a hit
+> is lock-free probes with no allocation (`interning.rs` `a_hit_allocates_nothing`,
+> `racing_threads_get_one_string`). Registry names are a write-once `Sharded<KeyOf>` read with
+> `find`, no clone of the key. `SourceId::crates_io()` and `crates_io_sparse()` are built once.
+> Values still live for the process, as cargo's do. Findings 5-7 (`blaze-cache`, `blaze-doc`,
+> `blaze-fmt`) are not lane cargo's crates and stay with the coordinator.

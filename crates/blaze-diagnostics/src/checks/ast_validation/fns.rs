@@ -20,18 +20,17 @@
 //! `compiler/rustc_target/src/spec/mod.rs` (`supports_c_variadic_definitions`) (MIT or
 //! Apache-2.0).
 
-use std::borrow::Cow;
-
 use blaze_ids::radix;
 use hir::InFile;
+use smallvec::SmallVec;
 use syntax::{
-    AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, TextRange, TextSize,
-    ast::{self, HasName as _},
+    NodeOrToken, SyntaxKind, TextRange, TextSize,
+    view::{self as ast, AstNode as _, AstToken as _, HasName as _},
 };
 
 use super::{Ctxt, Out, V, attr_range, feature_err, is_named, items, text_of, unraw};
 use crate::{
-    cx::signature_range,
+    cx::signature_range_view as signature_range,
     lints::syntax::attrs::table::is_builtin_attr_name,
     model::{Applicability, Diag, Span},
 };
@@ -52,11 +51,16 @@ const ABIS: &[&str] = &[
     "win64-unwind", "x86-interrupt",
 ];
 
-/// The name of the ABI `string` (an ABI's string literal) gives, unescaped.
-pub(super) fn abi_text(string: &SyntaxToken) -> String {
-    match ast::String::cast(string.clone()).map(|it| it.value().map(Cow::into_owned)) {
-        Some(Ok(text)) => text,
-        _ => string.text().trim_matches('"').to_owned(),
+/// An ABI's string literal (`T![string]`, which always casts to `ast::String`).
+pub(super) fn abi_string(abi: ast::Abi<'_>) -> Option<ast::String<'_>> {
+    abi.string_token().and_then(ast::String::cast)
+}
+
+/// `f` of the name of the ABI `string` (an ABI's string literal) gives, unescaped.
+pub(super) fn with_abi_text<R>(string: ast::String<'_>, f: impl FnOnce(&str) -> R) -> R {
+    match string.value() {
+        Ok(text) => f(&*text),
+        Err(_) => f(string.text().trim_matches('"')),
     }
 }
 
@@ -65,17 +69,22 @@ pub(super) fn known_abi(text: &str) -> Option<&'static str> {
     ABIS.iter().copied().find(|it| *it == text)
 }
 
+/// `ExternAbi::from_str` of the ABI string literal `string`.
+pub(super) fn known_abi_of(string: ast::String<'_>) -> Option<&'static str> {
+    with_abi_text(string, known_abi)
+}
+
 /// The ABI a function's or a function pointer's `extern` gives (`FALLBACK`, `"C"`, for one
 /// without a string), when rustc knows it.
-pub(super) fn abi_of(abi: &ast::Abi) -> Option<&'static str> {
-    match abi.string_token() {
+pub(super) fn abi_of(abi: ast::Abi<'_>) -> Option<&'static str> {
+    match abi_string(abi) {
         None => Some("C"),
-        Some(string) => known_abi(&abi_text(&string)),
+        Some(string) => known_abi_of(string),
     }
 }
 
 /// `CoroutineKind`: a function's `async`, `gen` or `async gen`, where it is written.
-pub(super) fn coroutine_kind(item: &ast::Fn) -> Option<(TextRange, &'static str)> {
+pub(super) fn coroutine_kind(item: ast::Fn<'_>) -> Option<(TextRange, &'static str)> {
     match (item.async_token(), item.gen_token()) {
         (Some(async_), Some(gen_)) => Some((async_.text_range().cover(gen_.text_range()), "async gen")),
         (Some(async_), None) => Some((async_.text_range(), "async")),
@@ -96,35 +105,56 @@ pub(super) enum Splat {
 
 impl Splat {
     /// `SplatSemantic::from_extern`.
-    pub(super) fn of(abi: Option<&ast::Abi>) -> Splat {
+    pub(super) fn of(abi: Option<ast::Abi<'_>>) -> Splat {
         let Some(abi) = abi else { return Splat::Yes };
-        match abi.string_token() {
-            Some(string) if abi_text(&string) == "rust-call" => Splat::NoAbiCall(abi.syntax().text_range()),
+        match abi_string(abi) {
+            Some(string) if with_abi_text(string, |it| it == "rust-call") => {
+                Splat::NoAbiCall(abi.syntax().text_range())
+            }
             _ => Splat::Yes,
         }
     }
 }
 
+/// The parameters of a declaration, without a heap allocation for up to eight.
+pub(super) type Inputs<'db> = SmallVec<[Input<'db>; 8]>;
+
+/// A parameter's node: blaze's `self` parameter, or any other.
+#[derive(Clone, Copy)]
+enum InputNode<'db> {
+    SelfParam(ast::SelfParam<'db>),
+    Param(ast::Param<'db>),
+}
+
 /// A parameter of a declaration, as rustc's `FnDecl::inputs` has it.
-pub(super) struct Input {
-    pub(super) node: SyntaxNode,
+pub(super) struct Input<'db> {
+    node: InputNode<'db>,
     /// rustc's `Param::span`: without its attributes; of `self`, up to the `self`.
     pub(super) range: TextRange,
     variadic: bool,
     is_self: bool,
 }
 
+impl<'db> Input<'db> {
+    fn syntax(&self) -> ast::Node<'db> {
+        match self.node {
+            InputNode::SelfParam(it) => it.syntax(),
+            InputNode::Param(it) => it.syntax(),
+        }
+    }
+}
+
 /// The parameters of `list` `cfg` keeps, `self` first.
-pub(super) fn inputs(v: &V<'_, '_, '_, '_>, list: Option<&ast::ParamList>) -> Vec<Input> {
-    let Some(list) = list else { return Vec::new() };
-    let mut inputs = Vec::new();
+pub(super) fn inputs<'db>(v: &V<'_, '_, 'db>, list: Option<ast::ParamList<'db>>) -> Inputs<'db> {
+    let mut inputs = Inputs::new();
+    let Some(list) = list else { return inputs };
     if let Some(it) = list.self_param()
         && v.kept(it.syntax())
     {
         let start = unattributed_start(it.syntax());
         let end = it.name().map_or(it.syntax().text_range().end(), |name| name.syntax().text_range().end());
         inputs.push(Input {
-            node: it.syntax().clone(),
+            node: InputNode::SelfParam(it),
             range: TextRange::new(start, end.max(start)),
             variadic: false,
             is_self: true,
@@ -134,18 +164,19 @@ pub(super) fn inputs(v: &V<'_, '_, '_, '_>, list: Option<&ast::ParamList>) -> Ve
     // up to the `self`; a closure's is a pattern, the whole parameter.
     let fn_ptr = list.syntax().parent().is_some_and(|it| it.kind() == SyntaxKind::FN_PTR_TYPE);
     for param in list.params().filter(|it| v.kept(it.syntax())) {
-        let is_self = param_is_self(&param);
+        let is_self = param_is_self(param);
         let range = match param.pat() {
             Some(pat) if is_self && fn_ptr => pat.syntax().text_range(),
             _ => TextRange::new(unattributed_start(param.syntax()), param.syntax().text_range().end()),
         };
-        inputs.push(Input { node: param.syntax().clone(), range, variadic: param.dotdotdot_token().is_some(), is_self });
+        let variadic = param.dotdotdot_token().is_some();
+        inputs.push(Input { node: InputNode::Param(param), range, variadic, is_self });
     }
     inputs
 }
 
 /// Where a node starts once its attributes and doc comments are left out.
-fn unattributed_start(node: &SyntaxNode) -> TextSize {
+fn unattributed_start(node: ast::Node<'_>) -> TextSize {
     node.children_with_tokens()
         .find(|it| match it {
             NodeOrToken::Node(node) => !matches!(node.kind(), SyntaxKind::ATTR | SyntaxKind::DOC_COMMENT),
@@ -156,12 +187,12 @@ fn unattributed_start(node: &SyntaxNode) -> TextSize {
 
 /// `Param::is_self` of a parameter that is not blaze's `self` parameter: a closure's `self`
 /// pattern, or a function pointer's `self`, `&self` or `&mut self` the parser read as a type.
-fn param_is_self(param: &ast::Param) -> bool {
+fn param_is_self(param: ast::Param<'_>) -> bool {
     if let Some(pat) = param.pat() {
         return matches!(pat, ast::Pat::IdentPat(it) if it.name().is_some_and(|it| it.text() == "self"));
     }
     let mut ty = param.ty();
-    if let Some(ast::Type::RefType(it)) = &ty {
+    if let Some(ast::Type::RefType(it)) = ty {
         ty = it.ty();
     }
     match ty {
@@ -174,15 +205,16 @@ fn param_is_self(param: &ast::Param) -> bool {
 
 /// `check_fn_decl`: the number of parameters, where `...` is, `#[rustc_splat]`, the
 /// attributes of parameters, and `self` where it is not allowed.
-pub(super) fn check_decl(
-    v: &V<'_, '_, '_, '_>,
-    node: &SyntaxNode,
-    inputs: &[Input],
+pub(super) fn check_decl<'db>(
+    v: &V<'_, '_, 'db>,
+    node: ast::Node<'db>,
+    inputs: &[Input<'db>],
     self_allowed: bool,
     splat: Splat,
     out: &mut Out,
 ) {
     if inputs.len() > usize::from(u16::MAX) {
+        // alloc: the error's message
         let message = format!("function can not have more than {} arguments", u16::MAX);
         v.emit(out, node, Diag::error(None, message, v.span(inputs[0].range)));
     }
@@ -204,6 +236,7 @@ pub(super) fn check_decl(
         && first.is_self
     {
         let span = v.span(first.range);
+        // clone: a span, on the error path
         let mut diag = Diag::error(None, "`self` parameter is only allowed in associated functions", span.clone());
         diag.note("associated functions are those in `impl` or `trait` definitions");
         diag.span_label(span, "not semantically valid as function parameter");
@@ -212,17 +245,17 @@ pub(super) fn check_decl(
 }
 
 /// `check_decl_splatting`.
-fn splatting(
-    v: &V<'_, '_, '_, '_>,
-    node: &SyntaxNode,
-    inputs: &[Input],
+fn splatting<'db>(
+    v: &V<'_, '_, 'db>,
+    node: ast::Node<'db>,
+    inputs: &[Input<'db>],
     c_variadic: Option<TextRange>,
     splat: Splat,
     out: &mut Out,
 ) {
-    let mut splatted: Vec<(usize, TextRange)> = Vec::new();
+    let mut splatted: SmallVec<[(usize, TextRange); 2]> = SmallVec::new();
     for (index, input) in inputs.iter().enumerate() {
-        v.each_attr(&input.node, |meta, attr| {
+        v.each_attr(input.syntax(), |meta, attr| {
             if is_named(meta, "rustc_splat") {
                 splatted.push((index, attr_range(meta, attr)));
             }
@@ -234,13 +267,17 @@ fn splatting(
     let at = splatted.partition_point(|(index, _)| *index < NO_SPLATTED_ARG_INDEX);
     let (valid, invalid) = splatted.split_at(at);
     if let Some(&(first, _)) = invalid.first() {
+        // alloc: the error's message
         let message = format!(
             "`#[rustc_splat]` is only supported on argument index {} or less, this `#[rustc_splat]` is on index {first}",
             NO_SPLATTED_ARG_INDEX - 1
         );
+        // alloc: the error's spans
         let spans: Vec<Span> = invalid.iter().map(|it| v.span(it.1)).collect();
+        // clone: a span, on the error path
         let mut diag = Diag::error(None, message, spans[0].clone());
         for span in &spans[1..] {
+            // clone: as above
             diag.primary(span.clone());
         }
         diag.help("remove `#[rustc_splat]`, or use it on an argument closer to the start of the argument list");
@@ -250,10 +287,13 @@ fn splatting(
         v.emit(out, node, diag);
     }
     let Some(&(first_index, _)) = valid.first() else { return };
-    let many = |message: String, help: &str, extra: Option<TextRange>| {
+    let many = |message: &str, help: &str, extra: Option<TextRange>| {
+        // alloc: the error's spans
         let spans: Vec<Span> = valid.iter().map(|it| it.1).chain(extra).map(|it| v.span(it)).collect();
+        // clone: a span, on the error path
         let mut diag = Diag::error(None, message, spans[0].clone());
         for span in &spans[1..] {
+            // clone: as above
             diag.primary(span.clone());
         }
         diag.help(help);
@@ -261,7 +301,7 @@ fn splatting(
     };
     if valid.iter().any(|(index, _)| *index != first_index) {
         let diag = many(
-            "multiple `#[rustc_splat]`s are not allowed in the same function argument list".to_owned(),
+            "multiple `#[rustc_splat]`s are not allowed in the same function argument list",
             "remove `#[rustc_splat]` from all but one argument",
             None,
         );
@@ -269,7 +309,7 @@ fn splatting(
     }
     if let Some(variadic) = c_variadic {
         let diag = many(
-            "`...` and `#[rustc_splat]` are not allowed in the same function argument list".to_owned(),
+            "`...` and `#[rustc_splat]` are not allowed in the same function argument list",
             "remove `#[rustc_splat]` or remove `...`",
             Some(variadic),
         );
@@ -279,7 +319,7 @@ fn splatting(
         Splat::Yes => {}
         Splat::NoClosures(closure) => {
             let diag = many(
-                "`#[rustc_splat]` is not allowed on closure arguments".to_owned(),
+                "`#[rustc_splat]` is not allowed on closure arguments",
                 "remove `#[rustc_splat]` or turn the closure into a function",
                 Some(closure),
             );
@@ -287,7 +327,7 @@ fn splatting(
         }
         Splat::NoAbiCall(abi) => {
             let diag = many(
-                "`#[rustc_splat]` is not allowed in the arguments of functions with the `rust-call` ABI".to_owned(),
+                "`#[rustc_splat]` is not allowed in the arguments of functions with the `rust-call` ABI",
                 "remove `#[rustc_splat]` or change the ABI",
                 Some(abi),
             );
@@ -301,13 +341,13 @@ const PARAM_ATTRS: &[&str] = &["allow", "deny", "expect", "forbid", "rustc_splat
 
 /// `check_decl_attrs`: doc comments and builtin attributes other than the lint ones on
 /// parameters, in the order they are written.
-fn param_attrs(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, inputs: &[Input], out: &mut Out) {
+fn param_attrs<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, inputs: &[Input<'db>], out: &mut Out) {
     for input in inputs {
-        let mut found: Vec<(TextRange, bool)> = Vec::new();
-        for doc in input.node.children().filter(|it| it.kind() == SyntaxKind::DOC_COMMENT) {
+        let mut found: SmallVec<[(TextRange, bool); 4]> = SmallVec::new();
+        for doc in input.syntax().children().filter(|it| it.kind() == SyntaxKind::DOC_COMMENT) {
             found.push((doc.text_range(), true));
         }
-        v.each_attr(&input.node, |meta, attr| {
+        v.each_attr(input.syntax(), |meta, attr| {
             if matches!(meta, ast::Meta::CfgMeta(_) | ast::Meta::CfgAttrMeta(_)) {
                 return;
             }
@@ -325,8 +365,9 @@ fn param_attrs(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, inputs: &[Input], out: 
         for (range, doc) in found {
             let span = v.span(range);
             let diag = if doc {
-                let mut diag =
-                    Diag::error(None, "documentation comments cannot be applied to function parameters", span.clone());
+                let message = "documentation comments cannot be applied to function parameters";
+                // clone: a span, on the error path
+                let mut diag = Diag::error(None, message, span.clone());
                 diag.span_label(span, "doc comments are not allowed here");
                 diag
             } else {
@@ -345,28 +386,31 @@ fn param_attrs(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, inputs: &[Input], out: 
 /// call as it expands), with whether it is a `mut` name (`mut x`). A trait's method in Rust
 /// 2015 is not checked where rustc's parser already refused the pattern and put `_` in its
 /// place (`recover_arg_parse`).
-pub(super) fn patterns(
-    v: &V<'_, '_, '_, '_>,
-    inputs: &[Input],
+pub(super) fn patterns<'db>(
+    v: &V<'_, '_, 'db>,
+    inputs: &[Input<'db>],
     parser_recovers: bool,
     mut report: impl FnMut(Span, bool),
 ) {
     for input in inputs {
-        if let Some(it) = ast::SelfParam::cast(input.node.clone()) {
-            if it.amp_token().is_none()
-                && let (Some(mut_), Some(name)) = (it.mut_token(), it.name())
-            {
-                report(v.span(TextRange::new(mut_.text_range().start(), name.syntax().text_range().end())), true);
+        let param = match input.node {
+            InputNode::SelfParam(it) => {
+                if it.amp_token().is_none()
+                    && let (Some(mut_), Some(name)) = (it.mut_token(), it.name())
+                {
+                    report(v.span(TextRange::new(mut_.text_range().start(), name.syntax().text_range().end())), true);
+                }
+                continue;
             }
-            continue;
-        }
-        let Some(pat) = ast::Param::cast(input.node.clone()).and_then(|it| it.pat()) else { continue };
-        if parser_recovers && !named_param(&pat) {
+            InputNode::Param(it) => it,
+        };
+        let Some(pat) = param.pat() else { continue };
+        if parser_recovers && !named_param(pat) {
             continue;
         }
         let pat = expanded_pat(v, pat);
-        let span = || v.cx.span(pat.as_ref().map(|it| it.syntax().text_range()));
-        match &pat.value {
+        let span = || v.cx.span(pat.map(|it| it.syntax().text_range()));
+        match pat.value {
             ast::Pat::WildcardPat(_) => {}
             ast::Pat::IdentPat(it) if it.ref_token().is_none() && it.pat().is_none() => {
                 if it.mut_token().is_some() {
@@ -383,11 +427,11 @@ const MACRO_DEPTH: usize = 128;
 
 /// `pat` once the pattern macro calls in its place are expanded, as rustc's validator sees
 /// it, in the file it is written in.
-fn expanded_pat(v: &V<'_, '_, '_, '_>, pat: ast::Pat) -> InFile<ast::Pat> {
+fn expanded_pat<'db>(v: &V<'_, '_, 'db>, pat: ast::Pat<'db>) -> InFile<ast::Pat<'db>> {
     let mut pat = InFile::new(v.tree.file, pat);
     for _ in 0..MACRO_DEPTH {
-        let ast::Pat::MacroPat(call) = &pat.value else { break };
-        let Some(root) = call.macro_call().and_then(|it| v.cx.sema.expand_macro_call(&it)) else { break };
+        let ast::Pat::MacroPat(call) = pat.value else { break };
+        let Some(root) = call.macro_call().and_then(|it| v.cx.vsema.expand_macro_call(it)) else { break };
         let Some(next) = ast::Pat::cast(root.value) else { break };
         pat = InFile::new(root.file_id, next);
     }
@@ -396,13 +440,13 @@ fn expanded_pat(v: &V<'_, '_, '_, '_>, pat: ast::Pat) -> InFile<ast::Pat> {
 
 /// rustc's `Parser::is_named_param` of a parameter of a trait's method in Rust 2015: a name
 /// (after `&`, `&&` or `mut`) followed by `:`.
-fn named_param(pat: &ast::Pat) -> bool {
-    let plain = |pat: &ast::Pat| matches!(pat, ast::Pat::IdentPat(it) if it.ref_token().is_none() && it.mut_token().is_none() && it.pat().is_none());
+fn named_param(pat: ast::Pat<'_>) -> bool {
+    let plain = |pat: ast::Pat<'_>| matches!(pat, ast::Pat::IdentPat(it) if it.ref_token().is_none() && it.mut_token().is_none() && it.pat().is_none());
     match pat {
         ast::Pat::IdentPat(it) => it.ref_token().is_none() && it.pat().is_none(),
         ast::Pat::RefPat(it) if it.mut_token().is_none() => match it.pat() {
-            Some(ast::Pat::RefPat(inner)) if inner.mut_token().is_none() => inner.pat().is_some_and(|it| plain(&it)),
-            Some(inner) => plain(&inner),
+            Some(ast::Pat::RefPat(inner)) if inner.mut_token().is_none() => inner.pat().is_some_and(plain),
+            Some(inner) => plain(inner),
             None => false,
         },
         _ => false,
@@ -411,18 +455,23 @@ fn named_param(pat: &ast::Pat) -> bool {
 
 /// rustc's `visit_fn` of a function, after `visit_item`'s, `visit_foreign_item`'s or
 /// `visit_assoc_item`'s checks of it.
-pub(super) fn visit_fn(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn, ctxt: &Ctxt, out: &mut Out) {
-    let list = item.param_list();
-    let inputs = inputs(v, list.as_ref());
+pub(super) fn visit_fn<'db>(
+    v: &V<'_, '_, 'db>,
+    node: ast::Node<'db>,
+    item: ast::Fn<'db>,
+    ctxt: &Ctxt<'db>,
+    out: &mut Out,
+) {
+    let inputs = inputs(v, item.param_list());
     let abi = item.abi();
-    check_decl(v, node, &inputs, ctxt.is_assoc(), Splat::of(abi.as_ref()), out);
+    check_decl(v, node, &inputs, ctxt.is_assoc(), Splat::of(abi), out);
     match ctxt {
         Ctxt::Foreign(block) => {
-            items::safety_in_extern(v, node, item.safe_token().or(item.unsafe_token()), block, out);
+            items::safety_in_extern(v, node, item.safe_token().or(item.unsafe_token()), *block, out);
         }
         _ => items::safe_outside_extern(v, node, item.safe_token(), out),
     }
-    if let Some(abi) = &abi
+    if let Some(abi) = abi
         && let Some(name) = abi_of(abi)
     {
         let sig = Sig::of_fn(item, inputs.as_slice(), matches!(ctxt, Ctxt::Foreign(_)));
@@ -437,9 +486,12 @@ pub(super) fn visit_fn(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn,
     if let (Some(const_), Some((coroutine, kind))) = (item.const_token(), coroutine_kind(item)) {
         let const_span = v.span(const_.text_range());
         let coroutine_span = v.span(coroutine);
+        // alloc: the error's message
         let mut diag = Diag::error(None, format!("functions cannot be both `const` and `{kind}`"), coroutine_span.clone());
+        // clone: a span, on the error path
         diag.primary(const_span.clone());
         diag.span_label(const_span, "`const` because of this");
+        // alloc: the error's label
         diag.span_label(coroutine_span, format!("`{kind}` because of this"));
         diag.span_label(v.span(super::item_range(node)), "");
         v.emit(out, node, diag);
@@ -454,11 +506,13 @@ pub(super) fn visit_fn(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn,
             }
             let diag = if foreign {
                 let message = "patterns aren't allowed in foreign function declarations";
+                // clone: a span, on the error path
                 let mut diag = Diag::error(Some("E0130"), message, span.clone());
                 diag.span_label(span, "pattern not allowed in foreign function");
                 diag
             } else {
                 let message = "patterns aren't allowed in functions without bodies";
+                // clone: a span, on the error path
                 let mut diag = Diag::error(Some("E0642"), message, span.clone());
                 diag.span_label(span, "pattern not allowed in function without body");
                 diag
@@ -469,15 +523,16 @@ pub(super) fn visit_fn(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn,
 }
 
 /// rustc's `visit_fn` of a closure: `check_fn_decl`, `self` not allowed.
-pub(super) fn closure(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, out: &mut Out) {
-    let Some(closure) = ast::ClosureExpr::cast(node.clone()) else { return };
-    let inputs = inputs(v, closure.param_list().as_ref());
+pub(super) fn closure<'db>(v: &V<'_, '_, 'db>, node: ast::Node<'db>, out: &mut Out) {
+    let Some(closure) = ast::ClosureExpr::cast(node) else { return };
+    let inputs = inputs(v, closure.param_list());
     check_decl(v, node, &inputs, false, Splat::NoClosures(node.text_range()), out);
 }
 
 /// E0737 `RequiresRustAbi`: `#[track_caller]` at `attr` with the ABI written at `abi`.
-pub(super) fn requires_rust_abi(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, attr: TextRange, abi: Span, out: &mut Out) {
+pub(super) fn requires_rust_abi(v: &V<'_, '_, '_>, node: ast::Node<'_>, attr: TextRange, abi: Span, out: &mut Out) {
     let span = v.span(attr);
+    // clone: a span, on the error path
     let mut diag = Diag::error(Some("E0737"), "`#[track_caller]` can only be used with the Rust ABI", span.clone());
     diag.span_label(span, "using `#[track_caller]` here");
     diag.span_label(abi, "not using the Rust ABI because of this");
@@ -485,21 +540,20 @@ pub(super) fn requires_rust_abi(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, attr: 
 }
 
 /// `check_extern_fn_signature` of a function in an `extern` block, with the block's ABI.
-pub(super) fn extern_signature(
-    v: &V<'_, '_, '_, '_>,
-    node: &SyntaxNode,
-    item: &ast::Fn,
+pub(super) fn extern_signature<'db>(
+    v: &V<'_, '_, 'db>,
+    node: ast::Node<'db>,
+    item: ast::Fn<'db>,
     abi: &str,
-    ctxt: &Ctxt,
     out: &mut Out,
 ) {
-    let inputs = inputs(v, item.param_list().as_ref());
-    let sig = Sig::of_fn(item, &inputs, matches!(ctxt, Ctxt::Foreign(_)));
+    let inputs = inputs(v, item.param_list());
+    let sig = Sig::of_fn(item, &inputs, true);
     signature(v, node, abi, &sig, out);
 }
 
 /// What `check_extern_fn_signature` reads of a signature (`BorrowedFnSig`).
-pub(super) struct Sig<'i> {
+pub(super) struct Sig<'i, 'db> {
     /// `sig.span`: a function's signature, or a function pointer's type after its binder.
     span: TextRange,
     safe: Option<TextRange>,
@@ -507,17 +561,17 @@ pub(super) struct Sig<'i> {
     coroutine: Option<(TextRange, &'static str)>,
     /// `FnHeader::span`: from its first qualifier to its last.
     header: Option<TextRange>,
-    inputs: &'i [Input],
+    inputs: &'i [Input<'db>],
     /// Where an absent return type would be: after the parameters.
     params_end: TextSize,
-    ret: Option<ast::Type>,
-    name: Option<String>,
+    ret: Option<ast::Type<'db>>,
+    name: Option<ast::Name<'db>>,
     foreign: bool,
     fn_ptr: bool,
 }
 
-impl<'i> Sig<'i> {
-    fn of_fn(item: &ast::Fn, inputs: &'i [Input], foreign: bool) -> Sig<'i> {
+impl<'i, 'db> Sig<'i, 'db> {
+    fn of_fn(item: ast::Fn<'db>, inputs: &'i [Input<'db>], foreign: bool) -> Sig<'i, 'db> {
         let coroutine = coroutine_kind(item);
         let qualifiers = [
             item.abi().map(|it| it.syntax().text_range()),
@@ -534,13 +588,13 @@ impl<'i> Sig<'i> {
             inputs,
             params_end: params_end(item.param_list(), item.syntax()),
             ret: item.ret_type().and_then(|it| it.ty()),
-            name: item.name().map(|it| unraw(it.text()).to_owned()),
+            name: item.name(),
             foreign,
             fn_ptr: false,
         }
     }
 
-    pub(super) fn of_fn_ptr(ty: &ast::FnPtrType, inputs: &'i [Input]) -> Sig<'i> {
+    pub(super) fn of_fn_ptr(ty: ast::FnPtrType<'db>, inputs: &'i [Input<'db>]) -> Sig<'i, 'db> {
         let safe = safe_token(ty.syntax()).map(|it| it.text_range());
         let qualifiers =
             [ty.abi().map(|it| it.syntax().text_range()), safe.or(ty.unsafe_token().map(|it| it.text_range()))];
@@ -561,13 +615,13 @@ impl<'i> Sig<'i> {
 
     /// `decl.output.span()`: the return type, or where it would be.
     fn output(&self) -> TextRange {
-        self.ret.as_ref().map_or(TextRange::empty(self.params_end), |it| it.syntax().text_range())
+        self.ret.map_or(TextRange::empty(self.params_end), |it| it.syntax().text_range())
     }
 }
 
 /// rustc's `decl_span` of a function pointer type: from its qualifiers to its end, without
 /// its `for<..>`.
-pub(super) fn decl_range(node: &SyntaxNode) -> TextRange {
+pub(super) fn decl_range(node: ast::Node<'_>) -> TextRange {
     let start = node
         .children_with_tokens()
         .find(|it| match it {
@@ -579,11 +633,11 @@ pub(super) fn decl_range(node: &SyntaxNode) -> TextRange {
 }
 
 /// A function pointer type's `safe`, which blaze's tree keeps as a token of the type.
-pub(super) fn safe_token(node: &SyntaxNode) -> Option<SyntaxToken> {
+pub(super) fn safe_token(node: ast::Node<'_>) -> Option<ast::Token<'_>> {
     node.children_with_tokens().filter_map(NodeOrToken::into_token).find(|it| it.kind() == SyntaxKind::SAFE_KW)
 }
 
-fn params_end(list: Option<ast::ParamList>, owner: &SyntaxNode) -> TextSize {
+fn params_end(list: Option<ast::ParamList<'_>>, owner: ast::Node<'_>) -> TextSize {
     list.map_or(owner.text_range().end(), |it| it.syntax().text_range().end())
 }
 
@@ -612,7 +666,7 @@ fn canon(abi: &str, arch: Option<&str>) -> Canon {
 }
 
 /// `check_extern_fn_signature`: what the ABI `abi` allows of `sig`.
-pub(super) fn signature(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, sig: &Sig<'_>, out: &mut Out) {
+pub(super) fn signature(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_, '_>, out: &mut Out) {
     match canon(abi, v.arch()) {
         Canon::Unchecked => {}
         Canon::GpuKernel => {
@@ -629,13 +683,16 @@ pub(super) fn signature(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, sig
             let count = sig.inputs.len();
             if !matches!(count, 1 | 2) {
                 let ranges: Vec<TextRange> = match sig.inputs {
+                    // alloc: the error's spans
                     [] => vec![sig.span],
+                    // alloc: as above
                     inputs => inputs.iter().map(|it| it.range).collect(),
                 };
                 let mut diag = Diag::error(None, "invalid signature for `extern \"x86-interrupt\"` function", v.span(ranges[0]));
                 for range in &ranges[1..] {
                     diag.primary(v.span(*range));
                 }
+                // alloc: the error's note
                 diag.note(format!(
                     "functions with the \"x86-interrupt\" ABI must be have either 1 or 2 parameters (but found {count})"
                 ));
@@ -652,7 +709,7 @@ pub(super) fn signature(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, sig
 
 /// rustc's `span_until_non_whitespace` of `range` of `node`: up to the first character that
 /// is not white space after some white space.
-fn until_non_whitespace(node: &SyntaxNode, range: TextRange) -> TextRange {
+fn until_non_whitespace(node: ast::Node<'_>, range: TextRange) -> TextRange {
     let text = text_of(node, range);
     let mut seen_space = false;
     let mut len = 0;
@@ -668,7 +725,7 @@ fn until_non_whitespace(node: &SyntaxNode, range: TextRange) -> TextRange {
 }
 
 /// `reject_safe_fn` of the `"custom"` ABI.
-fn reject_safe_fn(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, sig: &Sig<'_>, out: &mut Out) {
+fn reject_safe_fn(v: &V<'_, '_, '_>, node: ast::Node<'_>, sig: &Sig<'_, '_>, out: &mut Out) {
     if sig.unsafe_.is_some() {
         return;
     }
@@ -687,6 +744,7 @@ fn reject_safe_fn(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, sig: &Sig<'_>, out: 
         }
         None if sig.foreign => {}
         None => {
+            // clone: a span, on the error path
             let mut diag = Diag::error(None, "functions with the \"custom\" ABI must be unsafe", span.clone());
             diag.suggestion_verbose(
                 span.shrink_to_lo(),
@@ -700,12 +758,14 @@ fn reject_safe_fn(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, sig: &Sig<'_>, out: 
 }
 
 /// `reject_coroutine`: `async` or `gen` with an ABI that cannot have it.
-fn reject_coroutine(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, sig: &Sig<'_>, out: &mut Out) {
+fn reject_coroutine(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_, '_>, out: &mut Out) {
     let Some((range, kind)) = sig.coroutine else { return };
-    let mut diag =
-        Diag::error(None, format!("functions with the \"{abi}\" ABI cannot be `{kind}`"), v.span(sig.span));
+    // alloc: the error's message
+    let message = format!("functions with the \"{abi}\" ABI cannot be `{kind}`");
+    let mut diag = Diag::error(None, message, v.span(sig.span));
     diag.suggestion_verbose(
         v.span(until_non_whitespace(node, range.cover(sig.span))),
+        // alloc: the error's suggestion
         format!("remove the `{kind}` keyword from this definition"),
         "",
         Applicability::MaybeIncorrect,
@@ -714,7 +774,7 @@ fn reject_coroutine(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, sig: &S
 }
 
 /// Whether `ty` is `!` or `()`.
-fn never_or_unit(ty: &ast::Type) -> (bool, bool) {
+fn never_or_unit(ty: ast::Type<'_>) -> (bool, bool) {
     match ty {
         ast::Type::NeverType(_) => (true, false),
         ast::Type::TupleType(it) => (false, it.fields().next().is_none()),
@@ -723,14 +783,16 @@ fn never_or_unit(ty: &ast::Type) -> (bool, bool) {
 }
 
 /// `reject_return`: a return type other than `!` or `()`.
-fn reject_return(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, sig: &Sig<'_>, out: &mut Out) {
-    let Some(ret) = &sig.ret else { return };
+fn reject_return(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_, '_>, out: &mut Out) {
+    let Some(ret) = sig.ret else { return };
     let (never, unit) = never_or_unit(ret);
     if never || unit {
         return;
     }
     let span = v.span(ret.syntax().text_range());
+    // alloc: the error's message, and a span clone on the error path
     let mut diag = Diag::error(None, format!("invalid signature for `extern \"{abi}\"` function"), span.clone());
+    // alloc: the error's note
     diag.note(format!("functions with the \"{abi}\" ABI cannot have a return type"));
     diag.span_help(span, "remove the return type");
     v.emit(out, node, diag);
@@ -738,9 +800,10 @@ fn reject_return(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, sig: &Sig<
 
 /// `reject_params_or_return`: any parameter, or a return type other than `()` (or `!` but for
 /// the `"custom"` ABI).
-fn reject_params_or_return(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, sig: &Sig<'_>, out: &mut Out) {
-    let mut ranges: Vec<TextRange> = sig.inputs.iter().map(|it| it.range).collect();
-    if let Some(ret) = &sig.ret {
+fn reject_params_or_return(v: &V<'_, '_, '_>, node: ast::Node<'_>, abi: &str, sig: &Sig<'_, '_>, out: &mut Out) {
+    let mut ranges: SmallVec<[TextRange; 8]> = SmallVec::new();
+    ranges.extend(sig.inputs.iter().map(|it| it.range));
+    if let Some(ret) = sig.ret {
         let (never, unit) = never_or_unit(ret);
         if !(unit || never && abi != "custom") {
             ranges.push(ret.syntax().text_range());
@@ -750,16 +813,20 @@ fn reject_params_or_return(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, abi: &str, 
     let header = sig.header.unwrap_or(TextRange::empty(sig.span.start()));
     let suggestion = TextRange::empty(header.end()).cover(sig.output());
     let padding = if header.is_empty() { "" } else { " " };
-    let symbol = sig.name.as_ref().map_or(String::new(), |it| format!(" {it}"));
+    let symbol = sig.name.map_or("", |it| unraw(it.text()));
+    let space = if sig.name.is_some() { " " } else { "" };
+    // alloc: the error's message
     let mut diag = Diag::error(None, format!("invalid signature for `extern \"{abi}\"` function"), v.span(first));
     for range in &ranges[1..] {
         diag.primary(v.span(*range));
     }
+    // alloc: the error's note
     diag.note(format!("functions with the \"{abi}\" ABI cannot have any parameters or return type"));
     diag.suggestion_verbose(
         v.span(suggestion),
         "remove the parameters and return type",
-        format!("{padding}fn{symbol}()"),
+        // alloc: the error's suggestion
+        format!("{padding}fn{space}{symbol}()"),
         Applicability::MaybeIncorrect,
     );
     v.emit(out, node, diag);
@@ -771,16 +838,16 @@ enum Variadics {
     /// Behind `c_variadic_experimental_arch`.
     Unstable,
     /// Never, with rustc's name of the target (`llvm_target`).
-    NotSupported(String),
+    NotSupported(&'static str),
 }
 
-fn variadics(v: &V<'_, '_, '_, '_>) -> Variadics {
+fn variadics(v: &V<'_, '_, '_>) -> Variadics {
     match v.arch().unwrap_or("") {
         "bpf" => {
             let big = v.walk.cfg.get_cfg_values("target_endian").any(|it| it.as_str() == "big");
-            Variadics::NotSupported(if big { "bpfeb" } else { "bpfel" }.to_owned())
+            Variadics::NotSupported(if big { "bpfeb" } else { "bpfel" })
         }
-        "spirv" => Variadics::NotSupported("spirv".to_owned()),
+        "spirv" => Variadics::NotSupported("spirv"),
         "riscv32" if v.walk.cfg.get_cfg_values("target_abi").any(|it| it.as_str() == "ilp32e") => Variadics::Unstable,
         "sparc" | "avr" | "m68k" | "msp430" => Variadics::Unstable,
         "aarch64" | "amdgpu" | "arm" | "arm64ec" | "csky" | "hexagon" | "loongarch32" | "loongarch64" | "mips"
@@ -791,20 +858,33 @@ fn variadics(v: &V<'_, '_, '_, '_>) -> Variadics {
 }
 
 /// `check_c_variadic_type`: what a function whose last parameter is `...` must be.
-fn c_variadic(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn, inputs: &[Input], ctxt: &Ctxt, out: &mut Out) {
+fn c_variadic<'db>(
+    v: &V<'_, '_, 'db>,
+    node: ast::Node<'db>,
+    item: ast::Fn<'db>,
+    inputs: &[Input<'db>],
+    ctxt: &Ctxt<'db>,
+    out: &mut Out,
+) {
     let Some(last) = inputs.last().filter(|it| it.variadic) else { return };
     let variadic = v.span(last.range);
     let sig_span = v.span(signature_range(item));
     if item.const_token().is_some() && !v.feature("const_c_variadic") {
+        // clone: a span, on the error path
         let diag = feature_err("const_c_variadic", "c-variadic const function definitions are unstable", sig_span.clone());
         v.emit(out, node, diag);
     }
     if let Some((coroutine, kind)) = coroutine_kind(item) {
         let coroutine = v.span(coroutine);
-        let mut diag =
-            Diag::error(None, format!("functions cannot be both `{kind}` and C-variadic"), coroutine.clone());
+        // alloc: the error's message
+        let message = format!("functions cannot be both `{kind}` and C-variadic");
+        // clone: a span, on the error path
+        let mut diag = Diag::error(None, message, coroutine.clone());
+        // clone: as above
         diag.primary(variadic.clone());
+        // alloc: the error's label
         diag.span_label(coroutine, format!("`{kind}` because of this"));
+        // clone: a span, on the error path
         diag.span_label(variadic.clone(), "C-variadic because of this");
         v.emit(out, node, diag);
     }
@@ -813,6 +893,7 @@ fn c_variadic(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn, inputs: 
     }
     match variadics(v) {
         Variadics::NotSupported(target) => {
+            // alloc: the error's message
             let message = format!("the `{target}` target does not support c-variadic functions");
             v.emit(out, node, Diag::error(None, message, variadic));
             return;
@@ -831,8 +912,8 @@ fn c_variadic(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn, inputs: 
         return;
     };
     let abi_range = abi.syntax().text_range();
-    if let Some(string) = abi.string_token() {
-        let Some(name) = known_abi(&abi_text(&string)) else { return };
+    if let Some(string) = abi_string(abi) {
+        let Some(name) = known_abi_of(string) else { return };
         c_variadic_abi(v, node, name, &variadic, v.span(abi_range), sig_span, out);
     }
     if item.unsafe_token().is_none() {
@@ -852,8 +933,8 @@ fn c_variadic(v: &V<'_, '_, '_, '_>, node: &SyntaxNode, item: &ast::Fn, inputs: 
 /// `check_c_variadic_abi`: the ABIs a C-variadic definition may have, of a naked function and
 /// of any other.
 fn c_variadic_abi(
-    v: &V<'_, '_, '_, '_>,
-    node: &SyntaxNode,
+    v: &V<'_, '_, '_>,
+    node: ast::Node<'_>,
     abi: &str,
     variadic: &Span,
     extern_span: Span,
@@ -872,20 +953,27 @@ fn c_variadic_abi(
             // A naked C-variadic `extern "C"` function is allowed.
         } else if supported {
             if !v.feature("c_variadic_naked_functions") {
+                // alloc: the error's message
                 let message = format!("Naked c-variadic `extern \"{abi}\"` functions are unstable");
                 v.emit(out, node, feature_err("c_variadic_naked_functions", message, sig_span));
             }
         } else {
+            // alloc: the error's message
             let message = format!("`...` is not supported for `extern \"{abi}\"` naked functions");
+            // clone: a span, on the error path
             let mut diag = Diag::error(None, message, variadic.clone());
             diag.help("C-variadic function must have a compatible calling convention");
+            // alloc: the error's label
             diag.span_label(extern_span, format!("`extern \"{abi}\"` because of this"));
             v.emit(out, node, diag);
         }
     } else if !is_c {
+        // alloc: the error's message
         let message = format!("`...` is not supported for `extern \"{abi}\"` functions");
+        // clone: a span, on the error path
         let mut diag = Diag::error(None, message, variadic.clone());
         diag.help(ONLY_C);
+        // alloc: the error's label
         diag.span_label(extern_span, format!("`extern \"{abi}\"` because of this"));
         v.emit(out, node, diag);
     }

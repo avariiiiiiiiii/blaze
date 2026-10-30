@@ -21,8 +21,8 @@ use hir::InFile;
 use hir_def::signatures::{StructFlags, StructSignature};
 use smallvec::SmallVec;
 use syntax::{
-    AstNode, TextRange,
-    ast::{self, HasName},
+    TextRange,
+    view::{self as ast, AstNode as _, HasName as _},
 };
 
 use super::{
@@ -379,7 +379,7 @@ impl Report<'_, '_, '_, '_> {
 
     fn ident_span(&self, def: DefIdx) -> Option<Span> {
         let cx = self.k.cx;
-        let node = cx.syntax(self.k.defs[def].node?);
+        let node = cx.syntax_view(self.k.defs[def].node?);
         let name = ast::AnyHasName::cast(node.value)?.name()?;
         Some(cx.span(InFile::new(node.file_id, name.syntax().text_range())))
     }
@@ -388,10 +388,10 @@ impl Report<'_, '_, '_, '_> {
     fn def_span(&self, def: DefIdx) -> Option<Span> {
         let cx = self.k.cx;
         let ptr = self.k.defs[def].node?;
-        let node = cx.syntax(ptr);
+        let node = cx.syntax_view(ptr);
         let range: TextRange = match self.k.defs[def].kind {
-            Kind::Variant | Kind::Field => crate::cx::item_range(&node.value),
-            _ => crate::cx::def_range(&node.value),
+            Kind::Variant | Kind::Field => crate::cx::item_range_view(node.value),
+            _ => crate::cx::def_range_view(node.value),
         };
         Some(cx.span(InFile::new(ptr.file_id, range)))
     }

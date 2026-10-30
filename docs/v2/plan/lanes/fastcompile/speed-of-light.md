@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: lane fastcompile's speed of light: the bound each component's work and the hardware set, the arithmetic, and how far the design is from it. First section: the stencil patcher's cost per IR instruction.
+summary: lane fastcompile's speed of light: the bound each component's work and the hardware set, the arithmetic, and how far the design is from it. An index to every component's bound, then the stencil patcher's cost per IR instruction and the library reader's.
 date: 2026-10-29
 ---
 # Lane fastcompile: speed of light
@@ -9,6 +9,22 @@ The bar is "Within 10% of the theoretical maximum, everywhere" in
 [principles.md](../../goals/principles.md). Each component has a section here, written by the
 agent that owns it; each edits only its own section. The machine figures are those of
 [link's speed of light](../link/speed-of-light.md#the-machine), unless a section says otherwise.
+
+The stencil's two components are below. Every other component's bound, arithmetic and distance
+from it are in its own note:
+
+| idea | component | bound |
+|---|---|---|
+| 1 | lazy compilation (`blaze-lazy`) | [lazy.md](lazy.md#speed-of-light) |
+| 2 | the share key (`hir-ty-share`) | [share.md](share.md#speed-of-light): \(T \approx 300 + 75 P_t + 135 P_c\) ns per options walked, about 95% of it |
+| 3 | exact test selection (`blaze-testsel`) | [select.md](select.md#speed-of-light) |
+| 4 | the stencil patcher and library (`blaze-stencil`) | below |
+| 5 | hash-consing (`blaze-hashcons`) | [hashcons.md](hashcons.md#speed-of-light) |
+| 6 | the overlay and the run channel (`blaze-inproc`) | [inproc.md](inproc.md#speed-of-light) |
+| 7 | the dependency image (`blaze-premap`) | [premap.md](premap.md#speed-of-light) |
+| 8 | the global cache (`blaze-global`) | [global.md](global.md#speed-of-light) |
+| 9, 10 | semantic edits and declared intent (`blaze-intent`) | [intent.md](intent.md#speed-of-light) |
+| 11, 12 | history and PGO/BOLT (`blaze-history`, `tools/pgo/`) | [sched.md](sched.md#speed-of-light) |
 
 ## The stencil patcher (`fastcompile-stencil-patch`)
 

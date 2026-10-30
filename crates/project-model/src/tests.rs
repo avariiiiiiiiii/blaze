@@ -256,7 +256,7 @@ fn smoke_test_real_sysroot_cargo() {
     let cwd = AbsPathBuf::assert_utf8(temp_dir().join("smoke_test_real_sysroot_cargo"));
     std::fs::create_dir_all(&cwd).unwrap();
     let loaded_sysroot =
-        sysroot.load_workspace(&RustSourceWorkspaceConfig::default_cargo(), false, &|_| ());
+        sysroot.load_workspace(&RustSourceWorkspaceConfig::default_cargo(), false);
     sysroot.set_loaded(loaded_sysroot);
     assert!(
         matches!(sysroot.workspace(), RustLibSrcWorkspace::Workspace { .. }),

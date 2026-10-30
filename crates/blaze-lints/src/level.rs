@@ -36,7 +36,7 @@ pub enum Target {
     Blaze(u8),
 }
 
-/// The lints of the group `blaze::hot` ([`blaze::HOT`], every lint of blaze's own), as a
+/// The lints of the group `blaze::hot` ([`blaze::HOT`]: the four hot lints, not the parallel ones), as a
 /// [`Target::Blaze`] has them.
 const BLAZE_HOT: u8 = {
     let mut bits = 0;

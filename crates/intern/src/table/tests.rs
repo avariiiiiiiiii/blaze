@@ -320,6 +320,7 @@ fn value_hash_is_deterministic_and_spreads() {
 }
 
 /// Four workers taking every fourth job, in no fixed order.
+// dyn: `blaze_image::Jobs`'s signature, one call per restore
 fn four_threads(n: usize, job: &(dyn Fn(usize) + Sync)) {
     std::thread::scope(|scope| {
         for worker in 0..4 {

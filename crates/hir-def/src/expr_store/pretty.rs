@@ -12,7 +12,10 @@ use itertools::Itertools;
 use rustc_abi::ExternAbi;
 use span::Edition;
 use stdx::never;
-use syntax::ast::{HasName, RangeOp};
+use syntax::{
+    ast::RangeOp,
+    view::{self, HasName as _, Typed},
+};
 
 use crate::{
     AdtId, DefWithBodyId, FunctionId, GenericDefId, MacroId, StructId, TypeParamId, VariantId,
@@ -59,12 +62,13 @@ fn item_name<Id, Loc>(db: &Db, id: Id, default: &str) -> String
 where
     Id: Lookup<Data = Loc>,
     Loc: HasSource,
-    Loc::Value: ast::HasName,
+    Loc::Value: Typed,
+    for<'t> <Loc::Value as Typed>::Of<'t>: view::HasName<'t>,
 {
     let loc = id.lookup(db);
-    let source = loc.source(db);
+    let source = loc.source_view(db);
     // alloc: printing, the edge (tests and the IDE).
-    source.value.name().map_or_else(|| default.to_owned(), |name| name.to_string())
+    source.value.name().map_or_else(|| default.to_owned(), |name| name.text().to_owned())
 }
 
 pub fn print_body_hir(

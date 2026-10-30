@@ -35,7 +35,7 @@
 
 use std::collections::{VecDeque, hash_map};
 
-use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, Tag};
+use blaze_core::{Address, Completion, Conn, Done, Effect, IoError, Tag, Tags};
 use blaze_format::cursor::{self, Put as _, Reader};
 use blaze_ids::{ContentId, radix};
 use rustc_hash::FxHashMap;
@@ -261,35 +261,6 @@ fn owed(buffer: &[u8]) -> usize {
     (8 + len as usize).saturating_sub(buffer.len())
 }
 
-fn place(at: &Address) -> String {
-    match at {
-        // alloc: `place` names the address in an error only (`fail`, a failed listen).
-        Address::Unix(name) => format!("unix:{name}"),
-        // alloc: as above.
-        Address::Inherited { fd, at } => format!("unix:{at} (fd {fd})"),
-        // alloc: as above.
-        Address::Tcp(addr) => format!("tcp:{addr}"),
-    }
-}
-
-/// The tags of one state machine: `base..base + 2^32`.
-struct Tags {
-    base: u64,
-    next: u64,
-}
-
-impl Tags {
-    fn next(&mut self) -> Tag {
-        let tag = Tag(self.base + (self.next & 0xffff_ffff));
-        self.next = self.next.wrapping_add(1);
-        tag
-    }
-
-    fn owns(&self, tag: Tag) -> bool {
-        tag.0.wrapping_sub(self.base) < 1 << 32
-    }
-}
-
 /// The laptop's side: one connection to `at`, asks pipelined on it, answers matched by key.
 pub struct Client {
     at: Address,
@@ -334,7 +305,7 @@ impl Client {
     pub fn new(at: Address, tags: u64) -> Client {
         Client {
             at,
-            tags: Tags { base: tags, next: 0 },
+            tags: Tags::new(tags),
             link: Link::Down,
             out: Vec::new(),
             waiting: ByHash::default(),
@@ -385,13 +356,18 @@ impl Client {
                 }
             }
             Role::Send => match done {
-                Done::Sent => {
+                Done::Sent(spare) => {
                     if let Link::Up(up) = &mut self.link {
                         up.sending = None;
                     }
+                    // The buffer sent holds the next asks, its room kept.
+                    if self.out.capacity() == 0 {
+                        self.out = spare;
+                    }
                     self.pump(effects);
                 }
-                Done::Failed(error) => {
+                Done::Broken { error, .. } | Done::Failed(error) => {
+                    // alloc: an error path.
                     self.fail(&format!("sending asks failed: {error}"), answers, effects)
                 }
                 other => self.fail(&format!("a send completed as {other:?}"), answers, effects),
@@ -419,7 +395,8 @@ impl Client {
                             Err(why) => self.fail(&why, answers, effects),
                         }
                     }
-                    Done::Failed(error) => {
+                    Done::Broken { error, .. } | Done::Failed(error) => {
+                        // alloc: an error path.
                         self.fail(&format!("receiving answers failed: {error}"), answers, effects)
                     }
                     other => {
@@ -460,7 +437,8 @@ impl Client {
             let tag = self.tags.next();
             up.recv = Some(tag);
             let most = owed(&up.buffer).clamp(CLIENT_RECV, CLIENT_RECV_MOST);
-            effects.push(Effect::Recv { conn: up.conn, most, tag });
+            // alloc: none here; the driver reserves the room the bytes come into.
+            effects.push(Effect::Recv { conn: up.conn, most, into: Vec::new(), tag });
         }
     }
 
@@ -521,7 +499,7 @@ impl Client {
     /// Fails every waiting fetch with `why` and gives up the connection; the next fetch makes
     /// another.
     fn fail(&mut self, why: &str, answers: &mut Vec<Completion>, effects: &mut Vec<Effect>) {
-        let at = place(&self.at);
+        let at = &self.at;
         let failed = |key: Key, tag| Completion {
             tag,
             done: Done::Failed(IoError(format!(
@@ -623,7 +601,7 @@ impl Server {
         }
         Ok(Server {
             at,
-            tags: Tags { base: tags, next: 0 },
+            tags: Tags::new(tags),
             listen: None,
             closing: Vec::new(),
             failed: None,
@@ -675,14 +653,14 @@ impl Server {
                     self.listen = None;
                     self.failed = Some(IoError(format!(
                         "listening at {} for the remote store: {error}",
-                        place(&self.at)
+                        self.at
                     )));
                 }
                 other => {
                     self.listen = None;
                     self.failed = Some(IoError(format!(
                         "listening at {} for the remote store completed as {other:?}",
-                        place(&self.at)
+                        self.at
                     )));
                 }
             }
@@ -701,7 +679,7 @@ impl Server {
         let Some(peer) = self.peers.get_mut(&conn) else { return corrupt };
         if peer.sending.is_some_and(|(sending, _)| sending == tag) {
             match done {
-                Done::Sent => {
+                Done::Sent(_) => {
                     if let Some((_, len)) = peer.sending.take() {
                         peer.queued -= len;
                     }
@@ -805,7 +783,8 @@ impl Server {
             let tag = self.tags.next();
             peer.recv = Some(tag);
             self.ops.insert(tag, conn);
-            effects.push(Effect::Recv { conn, most: SERVER_RECV, tag });
+            // alloc: none here; the driver reserves the room the bytes come into.
+            effects.push(Effect::Recv { conn, most: SERVER_RECV, into: Vec::new(), tag });
         }
     }
 
@@ -1018,17 +997,20 @@ mod tests {
                     self.inbox[C].push_back(done(tag, Done::Connected { conn: Conn(2 * n) }));
                     self.inbox[S].push_back(done(listen, Done::Accepted { conn: Conn(2 * n + 1) }));
                 }
-                Effect::Send { conn, bytes, tag } => {
+                Effect::Send { conn, mut bytes, tag } => {
                     let link = self.end(side, conn);
-                    let sent = if link[side].open && link[1 - side].open {
+                    let open = link[side].open && link[1 - side].open;
+                    if open {
                         link[1 - side].incoming.extend_from_slice(&bytes);
-                        Done::Sent
-                    } else {
-                        Done::Failed(IoError("the peer hung up".into()))
+                    }
+                    bytes.clear();
+                    let sent = match open {
+                        true => Done::Sent(bytes),
+                        false => Done::Broken { buffer: bytes, error: IoError("the peer hung up".into()) },
                     };
                     self.inbox[side].push_back(done(tag, sent));
                 }
-                Effect::Recv { conn, most, tag } => {
+                Effect::Recv { conn, most, tag, .. } => {
                     let link = self.end(side, conn);
                     assert!(link[side].open, "a receive on a connection hung up");
                     assert!(link[side].recv.is_none(), "two receives in flight on one connection");
@@ -1340,7 +1322,7 @@ mod tests {
         let asked: Vec<u8> = names.iter().flat_map(|name| ask(name)).collect();
         assert_eq!(sent_on(&effects, conn), Some(&asked[..]));
         effects.clear();
-        assert!(completed(&mut client, Completion { tag: send, done: Done::Sent }, &mut effects).is_empty());
+        assert!(completed(&mut client, Completion { tag: send, done: Done::Sent(Vec::new()) }, &mut effects).is_empty());
         (client, effects, recv)
     }
 
@@ -1653,7 +1635,7 @@ mod tests {
             let send = effect_on(&effects, conn, false).expect("a send while answers are owed");
             sent.push(unframe(sent_on(&effects, conn).unwrap()));
             effects.clear();
-            let done = Completion { tag: send, done: Done::Sent };
+            let done = Completion { tag: send, done: Done::Sent(Vec::new()) };
             assert!(server.complete(done, &store, &mut effects).is_empty());
             assert!(server.peers[&conn].queued <= QUEUED_MOST + frame);
         }
@@ -1680,11 +1662,10 @@ mod tests {
 
     #[test]
     fn tags_stay_in_their_range() {
-        let mut tags = Tags { base: CLIENT, next: u64::from(u32::MAX) };
-        assert_eq!(tags.next(), Tag(CLIENT + u64::from(u32::MAX)));
-        assert_eq!(tags.next(), Tag(CLIENT));
-        assert!(tags.owns(Tag(CLIENT)));
-        assert!(!tags.owns(Tag(CLIENT - 1)));
-        assert!(!tags.owns(Tag(SERVER)));
+        let client = Client::new(socket(), CLIENT);
+        assert!(client.owns(Tag(CLIENT)));
+        assert!(client.owns(Tag(CLIENT + u64::from(u32::MAX))));
+        assert!(!client.owns(Tag(CLIENT - 1)));
+        assert!(!client.owns(Tag(SERVER)));
     }
 }

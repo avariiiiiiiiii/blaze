@@ -1,7 +1,6 @@
 //! Lexing, bridging to parser (which does the actual parsing) and
 //! incremental reparsing.
 
-pub(crate) mod kept;
 mod reparsing;
 
 use std::sync::Arc;

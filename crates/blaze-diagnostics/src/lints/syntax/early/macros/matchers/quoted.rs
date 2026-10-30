@@ -150,7 +150,9 @@ impl Matchers {
     /// `,`), as `compile_declarative_macro` takes them: it stops at the first rule it cannot
     /// read on, and a rule it stopped in has what it read of it.
     pub(super) fn rules(tokens: &Tokens, macro_rules: bool, edition: Edition) -> (Matchers, Vec<Rule>) {
+        // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
         let mut m = Matchers { tts: Vec::new(), vars: Vec::new(), scratch: Vec::new(), edition };
+        // alloc: once per macro definition, only when a lint of it (allowed by default) may fire
         let mut rules = Vec::new();
         let top = tokens.get(tokens.top);
         let separator = if macro_rules { Punct::Semi } else { Punct::Comma };

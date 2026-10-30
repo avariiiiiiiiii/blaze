@@ -166,7 +166,7 @@ pub(super) fn rustc_outputs(mode: CompileMode, kind: &TargetKind, triple: &str, 
             let crate_types = kind.rustc_crate_types();
             let mut unsupported = Vec::new();
             let mut types = Vec::new();
-            for crate_type in &crate_types {
+            for crate_type in crate_types {
                 let flavor = if crate_type.is_linkable() { Flavor::Linkable } else { Flavor::Normal };
                 match file_types(crate_type, flavor, triple)? {
                     Some(it) => types.extend(it),

@@ -16,6 +16,7 @@
 //! | glob imports, shadowing | `Resolves { scope, name }` |
 //! | macro hygiene | `Resolves` in the def-site scope for def-site names; mixed-site names resolve at the call site |
 //! | auto-trait leakage | `AutoTraits(opaque)` |
+//! | the target's data layout | `Target(crate)` |
 
 use std::{alloc::Allocator, fmt::Write as _};
 
@@ -72,6 +73,7 @@ const SPECIALIZES: &str = "blaze v2 fact specializes 1";
 const DROP_CHECK: &str = "blaze v2 fact drop check 1";
 const VTABLE: &str = "blaze v2 fact vtable 1";
 const DERIVE: &str = "blaze v2 fact derive 1";
+const TARGET: &str = "blaze v2 fact target 1";
 const CONST_TYPE: &str = "blaze v2 fact const value type 1";
 
 fn domain(fact: &Fact) -> &'static str {
@@ -92,6 +94,7 @@ fn domain(fact: &Fact) -> &'static str {
         Fact::DropCheck(_) => DROP_CHECK,
         Fact::Vtable { .. } => VTABLE,
         Fact::Derive(_) => DERIVE,
+        Fact::Target(_) => TARGET,
     }
 }
 
@@ -229,6 +232,18 @@ fn value_in(db: &Db, fact: &Fact) -> Result<ContentId, Unhashable> {
             let Some(adt) = adt(db, key, fact) else { return absent() };
             write_derive(db, &mut h, adt)?;
         }
+        Fact::Target(krate) => {
+            let Some(krate) = key::resolve_crate(db, &krate) else { return absent() };
+            match &krate.workspace_data(db).target {
+                Ok(target) => {
+                    h.part(b"target").id(&target.content());
+                }
+                Err(err) => scratch::with_string(|text| {
+                    write!(text, "{err}").expect("writing to a string cannot fail");
+                    h.part(b"error").part(text.as_bytes());
+                }),
+            }
+        }
     }
     Ok(h.finish())
 }
@@ -311,6 +326,10 @@ pub fn vtable(db: &Db, trait_: TraitId, self_ty: &HirSimplifiedType<'_>) -> Fact
 
 pub fn derive(db: &Db, ty: AdtId) -> Fact {
     Fact::Derive(key::item_key(db, ItemId::Adt(ty)))
+}
+
+pub fn target(db: &Db, krate: base_db::Crate) -> Fact {
+    Fact::Target(key::crate_key(db, krate))
 }
 
 /// The item `subject` names, `None` if none does.

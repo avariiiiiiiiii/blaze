@@ -17,7 +17,7 @@
 //!     // requires that `a == b`, with `a` considered the "expected" type
 //! ```
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use rustc_type_ir::{
     FnSig, GenericArgKind, TypeFoldable, TypingMode, Variance,
@@ -31,10 +31,11 @@ use crate::next_solver::{
     TraitRef, Ty,
     fulfill::NextSolverError,
     infer::relate::lattice::{LatticeOp, LatticeOpKind},
+    recycle,
 };
 
 use super::{
-    InferCtxt, InferOk, InferResult, TypeTrace, ValuePairs,
+    InferCtxt, InferOk, InferResult, InferTables, TypeTrace, ValuePairs,
     traits::{Obligation, ObligationCause},
 };
 
@@ -55,21 +56,32 @@ impl<'db> InferCtxt<'db> {
     /// variables in the same state. This can be used to "branch off" many tests from the same
     /// common state.
     pub fn fork(&self) -> Self {
+        let InferTables { inner, canonicalizer, placeholder_assumptions, next_solver_overflows } =
+            self.fork_tables();
         Self {
             interner: self.interner,
             typing_mode: self.typing_mode,
-            // clone: a fork is a copy of the variable tables.
-            inner: self.inner.clone(),
+            inner: RefCell::new(inner),
             tainted_by_errors: Cell::new(self.tainted_by_errors.get()),
             universe: Cell::new(self.universe.get()),
-            // clone: the fork sees the same universes, so it needs their assumptions.
-            placeholder_assumptions: self.placeholder_assumptions.clone(),
+            placeholder_assumptions: RefCell::new(placeholder_assumptions),
             enable_next_solver_overflow_fcw: Cell::new(self.enable_next_solver_overflow_fcw.get()),
-            // clone: empty unless a root goal overflowed, and then a handful.
-            next_solver_overflows: self.next_solver_overflows.clone(),
+            next_solver_overflows: RefCell::new(next_solver_overflows),
             obligation_inspector: Cell::new(self.obligation_inspector.get()),
-            canonicalizer_state: Default::default(),
+            canonicalizer_state: RefCell::new(canonicalizer),
         }
+    }
+
+    /// The worker's warm tables (`recycle::infer_tables`) holding a copy of this context's.
+    fn fork_tables(&self) -> InferTables<'db> {
+        let mut tables = recycle::infer_tables();
+        // clone: a fork is a copy of the variable tables, into the worker's warm ones.
+        tables.inner.clone_from(&self.inner.borrow());
+        // clone: the fork sees the same universes, so it needs their assumptions.
+        tables.placeholder_assumptions.clone_from(&self.placeholder_assumptions.borrow());
+        // clone: empty unless a root goal overflowed, and then a handful.
+        tables.next_solver_overflows.clone_from(&self.next_solver_overflows.borrow());
+        tables
     }
 
     /// Forks the inference context, creating a new inference context with the same inference
@@ -79,20 +91,19 @@ impl<'db> InferCtxt<'db> {
         // Unlike `fork`, this invalidates all cache entries as they may depend on the
         // typing mode.
 
+        let InferTables { inner, canonicalizer, placeholder_assumptions, next_solver_overflows } =
+            self.fork_tables();
         Self {
             interner: self.interner,
             typing_mode,
-            // clone: a fork is a copy of the variable tables.
-            inner: self.inner.clone(),
+            inner: RefCell::new(inner),
             tainted_by_errors: Cell::new(self.tainted_by_errors.get()),
             universe: Cell::new(self.universe.get()),
-            // clone: the fork sees the same universes, so it needs their assumptions.
-            placeholder_assumptions: self.placeholder_assumptions.clone(),
+            placeholder_assumptions: RefCell::new(placeholder_assumptions),
             enable_next_solver_overflow_fcw: Cell::new(self.enable_next_solver_overflow_fcw.get()),
-            // clone: empty unless a root goal overflowed, and then a handful.
-            next_solver_overflows: self.next_solver_overflows.clone(),
+            next_solver_overflows: RefCell::new(next_solver_overflows),
             obligation_inspector: Cell::new(self.obligation_inspector.get()),
-            canonicalizer_state: Default::default(),
+            canonicalizer_state: RefCell::new(canonicalizer),
         }
     }
 

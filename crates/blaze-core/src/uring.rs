@@ -51,7 +51,7 @@ use blaze_radix as radix;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, Stamp, Tag,
+    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Names, RECV_MOST, Stamp, Tag,
     wheel::{self, Wheel},
 };
 
@@ -1304,8 +1304,9 @@ struct Connection {
     hung: bool,
     /// What its receive took and no `Recv` has yet, in order.
     inbox: VecDeque<u8>,
-    /// The `Recv`s waiting for bytes, in the order they were submitted, with their most.
-    recvs: VecDeque<(Tag, usize)>,
+    /// The `Recv`s waiting for bytes, in the order they were submitted, with their most and
+    /// the buffer each appends to.
+    recvs: VecDeque<(Tag, usize, Vec<u8>)>,
     /// Its multishot receive, while the kernel holds one.
     receiving: Option<Id>,
     /// Its receive is being cancelled: the inbox holds [`INBOX`] bytes no `Recv` took.
@@ -2250,6 +2251,12 @@ impl Uring {
                 | Op::Input { .. }
                 | Op::Recv { .. }
                 | Op::Wake { .. } => {}
+                // The kernel may still read its bytes: they stay in the slot, abandoned, and an
+                // empty buffer comes back in their place.
+                Op::Send { .. } => {
+                    let done = Done::unsent(Vec::new(), &why); // alloc: none, an empty `Vec`.
+                    self.ready.push(Completion { tag: pending.tag, done });
+                }
                 _ => self.ready.push(failed(pending.tag)),
             }
         }
@@ -2268,8 +2275,8 @@ impl Uring {
             self.ready.push(Completion { tag, done: spawn.end() });
         }
         for (_, conn) in self.conns.iter_mut() {
-            for (tag, _) in conn.recvs.drain(..) {
-                self.ready.push(failed(tag));
+            for (tag, _, into) in conn.recvs.drain(..) {
+                self.ready.push(Completion { tag, done: Done::unread(into, &why) });
             }
             conn.receiving = None;
         }
@@ -2581,13 +2588,20 @@ impl Uring {
                 Step::Ends(None)
             }
             Op::Send { bytes, put, .. } => {
+                // Its bytes are the asker's again once the send ends: the kernel reads them no more.
+                let unsent = |bytes: &mut Vec<u8>, res: i32| {
+                    Step::Ends(Some(Done::unsent(std::mem::take(bytes), io::Error::from_raw_os_error(-res))))
+                };
                 if res < 0 {
-                    return Step::Ends(failed(res));
+                    return unsent(bytes, res);
                 }
                 *put += res as usize;
                 match (*put < bytes.len(), res) {
-                    (false, _) => Step::Ends(Some(Done::Sent)),
-                    (true, 0) => Step::Ends(failed(-libc::EIO)),
+                    (false, _) => {
+                        bytes.clear();
+                        Step::Ends(Some(Done::Sent(std::mem::take(bytes))))
+                    }
+                    (true, 0) => unsent(bytes, -libc::EIO),
                     (true, _) => Step::Again,
                 }
             }
@@ -2754,11 +2768,12 @@ impl Uring {
         Conn(conn.to_bits())
     }
 
-    /// `conn`, used by one more request until [`Uring::release`] says it ended.
-    fn use_conn(&mut self, conn: Conn) -> io::Result<()> {
-        let connection = self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
+    /// `conn`, used by one more request until [`Uring::release`] says it ended; `false` for one
+    /// that names nothing or is hung up, which nothing more uses.
+    fn use_conn(&mut self, conn: Conn) -> bool {
+        let Some(connection) = self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung) else { return false };
         connection.users += 1;
-        Ok(())
+        true
     }
 
     fn release(&mut self, conn: Conn) {
@@ -2769,34 +2784,37 @@ impl Uring {
         }
     }
 
-    /// A receive of at most `most` bytes on `conn`: from what its receive took, in order,
-    /// once there is any.
-    fn recv(&mut self, conn: Conn, tag: Tag, most: usize) -> io::Result<()> {
-        let connection = self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung).ok_or_else(|| gone(conn))?;
-        connection.recvs.push_back((tag, most));
+    /// A receive of at most `most` bytes on `conn`, appended to `into`: from what its receive
+    /// took, in order, once there is any.
+    fn recv(&mut self, conn: Conn, tag: Tag, most: usize, into: Vec<u8>) {
+        let Some(connection) = self.conns.get_mut(conn_of(conn)).filter(|it| !it.hung) else {
+            self.ready.push(Completion { tag, done: Done::unread(into, gone(conn)) });
+            return;
+        };
+        connection.recvs.push_back((tag, most, into));
         self.deliver(conn);
-        Ok(())
     }
 
     /// Hands `conn`'s waiting `Recv`s what its inbox holds, or its end, and arms its receive
     /// where one waits for bytes not yet taken.
     fn deliver(&mut self, conn: Conn) {
         let Some(connection) = self.conns.get_mut(conn_of(conn)) else { return };
-        while let Some(&(tag, most)) = connection.recvs.front() {
+        while let Some((tag, most, into)) = connection.recvs.front_mut() {
+            let (tag, most) = (*tag, *most);
             let done = match &connection.ended {
-                _ if most == 0 => Done::Read(Vec::new()), // alloc: empty, nothing allocated.
+                _ if most == 0 => Done::Read(std::mem::take(into)),
                 _ if !connection.inbox.is_empty() => {
-                    let n = most.min(connection.inbox.len());
+                    let n = most.min(RECV_MOST).min(connection.inbox.len());
                     let (front, back) = connection.inbox.as_slices();
                     let split = front.len().min(n);
-                    let mut bytes = Vec::with_capacity(n);
-                    bytes.extend_from_slice(&front[..split]);
-                    bytes.extend_from_slice(&back[..n - split]);
+                    // alloc: none once the asker's buffer has room for `n` more.
+                    into.extend_from_slice(&front[..split]);
+                    into.extend_from_slice(&back[..n - split]);
                     connection.inbox.drain(..n);
-                    Done::Read(bytes)
+                    Done::Read(std::mem::take(into))
                 }
-                Some(Ok(())) => Done::Read(Vec::new()), // alloc: empty, nothing allocated.
-                Some(Err(why)) => Done::Failed(IoError(why.clone())), // clone: an error.
+                Some(Ok(())) => Done::Read(std::mem::take(into)),
+                Some(Err(why)) => Done::unread(std::mem::take(into), why),
                 None => break,
             };
             connection.recvs.pop_front();
@@ -2825,8 +2843,8 @@ impl Uring {
         connection.inbox.clear();
         connection.users += 1;
         let receiving = connection.receiving;
-        for (tag, _) in connection.recvs.drain(..) {
-            self.ready.push(Completion { tag, done: Done::Read(Vec::new()) }); // alloc: empty.
+        for (tag, _, into) in connection.recvs.drain(..) {
+            self.ready.push(Completion { tag, done: Done::Read(into) });
         }
         if let Some(id) = receiving {
             self.start(NOBODYS, Op::Cancel { target: data(id, 0) });
@@ -3410,17 +3428,23 @@ impl Driver for Uring {
                         self.start(tag, op);
                         Ok(None)
                     }),
-                Effect::Recv { conn, most, .. } => self.recv(conn, tag, most).map(|()| None),
-                Effect::Send { conn, bytes, .. } if bytes.is_empty() => self
-                    .conns
-                    .get(conn_of(conn))
-                    .filter(|it| !it.hung)
-                    .map(|_| Some(Done::Sent))
-                    .ok_or_else(|| gone(conn)),
-                Effect::Send { conn, bytes, .. } => self.use_conn(conn).map(|()| {
-                    self.start(tag, Op::Send { conn, bytes, put: 0 });
-                    None
-                }),
+                Effect::Recv { conn, most, into, .. } => {
+                    self.recv(conn, tag, most, into);
+                    Ok(None)
+                }
+                Effect::Send { conn, bytes, .. } if bytes.is_empty() => {
+                    Ok(Some(match self.conns.get(conn_of(conn)).is_some_and(|it| !it.hung) {
+                        true => Done::Sent(bytes),
+                        false => Done::unsent(bytes, gone(conn)),
+                    }))
+                }
+                Effect::Send { conn, bytes, .. } => match self.use_conn(conn) {
+                    true => {
+                        self.start(tag, Op::Send { conn, bytes, put: 0 });
+                        Ok(None)
+                    }
+                    false => Ok(Some(Done::unsent(bytes, gone(conn)))),
+                },
                 Effect::Hangup { conn, .. } => self.hang_up(conn, tag).map(|()| None),
             };
             match started {
@@ -3640,6 +3664,8 @@ mod tests {
                 exit.traced
             ),
             Done::Mapped(mapping) => format!("mapped {}", text(mapping.bytes())),
+            Done::Sent(bytes) => format!("sent, {} bytes back", bytes.len()),
+            Done::Broken { buffer, .. } => format!("broken, {} bytes back", buffer.len()),
             Done::Failed(_) => "failed".into(),
             other => format!("{other:?}"),
         }
@@ -3648,7 +3674,7 @@ mod tests {
     /// Processes with input, output, an exit code and a signal; one killed; one in a sandbox
     /// no driver was given the means to make; one whose program is not there.
     fn processes(driver: &mut impl Driver) -> BTreeMap<u64, Done> {
-        let unconfined = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false };
+        let unconfined = Sandbox::On { read: Vec::new(), write: Vec::new(), network: false, trace: false, services: Vec::new() };
         let mut effects = vec![
             Effect::Spawn { command: sh("tr a-z A-Z; echo oops >&2; exit 3", b"hello\n"), tag: Tag(1) },
             Effect::Spawn { command: sh("kill -TERM $$", b""), tag: Tag(2) },
@@ -3745,7 +3771,7 @@ mod tests {
         let root = dir("uring-confined");
         let mut driver = Uring::new(&root).unwrap().confined(Arc::new(Fake));
         let sandbox =
-            Sandbox::On { read: vec!["/usr".into()], write: Vec::new(), network: false, trace: true };
+            Sandbox::On { read: vec!["/usr".into()], write: Vec::new(), network: false, trace: true, services: Vec::new() };
         let mut effects = vec![Effect::Spawn {
             command: Box::new(Command { sandbox, ..command("/usr/bin/env", &["a", "b"], b"") }),
             tag: Tag(1),
@@ -3790,17 +3816,17 @@ mod tests {
             if !pinged {
                 pinged = true;
                 effects.push(Effect::Send { conn: client, bytes: b"ping".to_vec(), tag: Tag(4) });
-                effects.push(Effect::Recv { conn: server, most: 64, tag: Tag(5) });
+                effects.push(Effect::Recv { conn: server, most: 64, into: Vec::new(), tag: Tag(5) });
             }
             match tag {
                 5 => {
                     effects.push(Effect::Send { conn: server, bytes: b"pong".to_vec(), tag: Tag(6) });
-                    effects.push(Effect::Recv { conn: client, most: 64, tag: Tag(7) });
+                    effects.push(Effect::Recv { conn: client, most: 64, into: Vec::new(), tag: Tag(7) });
                 }
                 7 => effects.push(Effect::Hangup { conn: client, tag: Tag(8) }),
                 8 => {
-                    effects.push(Effect::Recv { conn: server, most: 64, tag: Tag(9) });
-                    effects.push(Effect::Recv { conn: client, most: 64, tag: Tag(10) });
+                    effects.push(Effect::Recv { conn: server, most: 64, into: Vec::new(), tag: Tag(9) });
+                    effects.push(Effect::Recv { conn: client, most: 64, into: Vec::new(), tag: Tag(10) });
                 }
                 9 => {
                     effects.push(Effect::Hangup { conn: server, tag: Tag(11) });
@@ -3821,13 +3847,13 @@ mod tests {
             (1, vec!["accepted".to_owned(), "Unlistened".to_owned()]),
             (2, one("Fired")),
             (3, one("connected")),
-            (4, one("Sent")),
+            (4, one("sent, 0 bytes back")),
             (5, read(b"ping")),
-            (6, one("Sent")),
+            (6, one("sent, 0 bytes back")),
             (7, read(b"pong")),
             (8, one("HungUp")),
             (9, read(b"")),
-            (10, one("failed")),
+            (10, one("broken, 0 bytes back")),
             (11, one("HungUp")),
             (12, one("failed")),
         ])
@@ -3964,7 +3990,7 @@ mod tests {
             });
         }
         let client = client.expect("connected");
-        ring.submit(&mut vec![Effect::Recv { conn: client, most: 16, tag: Tag(5) }]);
+        ring.submit(&mut vec![Effect::Recv { conn: client, most: 16, into: Vec::new(), tag: Tag(5) }]);
         let pid = ring.spawns.get(ring.spawning[&Tag(1)]).expect("in flight").pid;
         let began = Instant::now();
         drop(ring);
@@ -4088,7 +4114,7 @@ mod tests {
             match &done.done {
                 Done::Accepted { conn } => server = Some(*conn),
                 Done::Connected { conn } => client = Some(*conn),
-                Done::Sent => sent += 1,
+                Done::Sent(_) => sent += 1,
                 Done::Read(bytes) => {
                     assert!(!bytes.is_empty(), "ended after {} bytes", got.len());
                     got.extend_from_slice(bytes);
@@ -4098,16 +4124,16 @@ mod tests {
             }
             let (Some(server), Some(client)) = (server, client) else { return };
             if matches!(done.done, Done::Accepted { .. } | Done::Connected { .. }) {
-                effects.push(Effect::Recv { conn: server, most: 64 << 10, tag: next() });
+                effects.push(Effect::Recv { conn: server, most: 64 << 10, into: Vec::new(), tag: next() });
                 effects.push(Effect::Send { conn: client, bytes: message(0), tag: next() });
                 return;
             }
-            if matches!(done.done, Done::Sent) && sent < messages {
+            if matches!(done.done, Done::Sent(_)) && sent < messages {
                 effects.push(Effect::Send { conn: client, bytes: message(sent), tag: next() });
             }
             if matches!(done.done, Done::Read(_)) {
                 if got.len() < messages * 4096 {
-                    effects.push(Effect::Recv { conn: server, most: 64 << 10, tag: next() });
+                    effects.push(Effect::Recv { conn: server, most: 64 << 10, into: Vec::new(), tag: next() });
                 } else {
                     effects.push(Effect::Hangup { conn: client, tag: next() });
                     effects.push(Effect::Hangup { conn: server, tag: next() });
@@ -4680,10 +4706,10 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A warm send on a connection and a receive of it on the other side allocate the bytes
-    /// each receive hands back and nothing else.
+    /// A warm send on a connection and a receive of it on the other side, each handed the
+    /// buffer the last gave back, allocate nothing.
     #[test]
-    fn a_warm_send_and_receive_allocate_the_bytes_received_alone() {
+    fn a_warm_send_and_receive_into_buffers_handed_back_allocate_nothing() {
         let root = dir("uring-warm-conn");
         let mut ring = Uring::new(&root).unwrap();
         let at = Address::Unix(FileName::new("s.sock").unwrap());
@@ -4702,26 +4728,37 @@ mod tests {
             }
         }
         let (server, client) = (server.expect("accepted"), client.expect("connected"));
+        let (mut sending, mut receiving) = (Vec::with_capacity(64), Vec::with_capacity(64));
+        let mut effects = Vec::with_capacity(8);
         for round in 0..2 * WARM {
-            let mut effects = Vec::with_capacity(8);
-            effects.push(Effect::Send { conn: client, bytes: b"ping".to_vec(), tag: Tag(10 + 2 * round) });
-            effects.push(Effect::Recv { conn: server, most: 64, tag: Tag(11 + 2 * round) });
             out.clear();
-            let mut got = 0;
             let ((), used) = blaze_alloc_count::measure(|| {
+                sending.extend_from_slice(b"ping");
+                effects.push(Effect::Send { conn: client, bytes: std::mem::take(&mut sending), tag: Tag(10 + 2 * round) });
+                effects.push(Effect::Recv {
+                    conn: server,
+                    most: 64,
+                    into: std::mem::take(&mut receiving),
+                    tag: Tag(11 + 2 * round),
+                });
                 ring.submit(&mut effects);
                 let deadline = Instant::now() + Duration::from_secs(10);
-                let (mut seen, mut sent) = (0, false);
-                while (got < 4 || !sent) && Instant::now() < deadline {
+                let (mut seen, mut sent, mut read) = (0, false, false);
+                while (!read || !sent) && Instant::now() < deadline {
                     ring.poll(&mut out, Duration::from_millis(50));
-                    for it in &out[seen..] {
-                        match &it.done {
-                            Done::Sent => sent = true,
+                    for it in &mut out[seen..] {
+                        match &mut it.done {
+                            Done::Sent(bytes) => {
+                                sent = true;
+                                sending = std::mem::take(bytes);
+                            }
+                            Done::Read(bytes) if bytes.len() < 4 => {
+                                let into = std::mem::take(bytes);
+                                effects.push(Effect::Recv { conn: server, most: 64, into, tag: it.tag });
+                            }
                             Done::Read(bytes) => {
-                                got += bytes.len();
-                                if got < 4 {
-                                    effects.push(Effect::Recv { conn: server, most: 64, tag: it.tag });
-                                }
+                                read = true;
+                                receiving = std::mem::take(bytes);
                             }
                             _ => {}
                         }
@@ -4732,11 +4769,11 @@ mod tests {
                     }
                 }
             });
-            assert_eq!(got, 4, "{out:?}");
-            let reads = out.iter().filter(|it| matches!(&it.done, Done::Read(bytes) if !bytes.is_empty())).count();
-            assert!(out.iter().all(|it| matches!(it.done, Done::Sent | Done::Read(_))), "{out:?}");
+            assert!(out.iter().all(|it| matches!(it.done, Done::Sent(_) | Done::Read(_))), "{out:?}");
+            assert_eq!((&receiving[..], sending.len(), sending.capacity() >= 4), (&b"ping"[..], 0, true), "{out:?}");
+            receiving.clear();
             if round >= WARM {
-                assert!(used.allocations <= reads as u64, "round {round}: {} allocations, {reads} receives", used.allocations);
+                assert_eq!(used.allocations, 0, "round {round}");
             }
         }
         // Bits no connection was given (an even generation, as a free slot may have) name none.
@@ -4744,7 +4781,7 @@ mod tests {
         let mut seen = Vec::new();
         let mut send = vec![Effect::Send { conn: forged, bytes: b"x".to_vec(), tag: Tag(5) }];
         run_until_idle(&mut ring, &mut send, |done, _| seen.push(done.done));
-        assert!(matches!(seen[..], [Done::Failed(_)]), "{seen:?}");
+        assert!(matches!(&seen[..], [Done::Broken { buffer, .. }] if buffer.is_empty()), "{seen:?}");
         let mut effects = vec![
             Effect::Hangup { conn: client, tag: Tag(3) },
             Effect::Hangup { conn: server, tag: Tag(4) },

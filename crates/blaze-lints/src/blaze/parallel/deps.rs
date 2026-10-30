@@ -25,7 +25,7 @@ use base_db::Db;
 use hir_def::{
     FunctionId, ItemContainerId,
     expr_store::Body,
-    hir::{Expr, ExprId, LoopSource, Pat, PatId},
+    hir::{Expr, ExprId, LoopSource, Pat},
     lang_item::lang_items,
     signatures::FunctionSignature,
 };
@@ -38,7 +38,7 @@ use hir_ty::{
     next_solver::{Ty, TyKind, infer::InferCtxt},
     traits::implements_trait_unique,
 };
-use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind as _, SliceLike as _};
+use rustc_type_ir::inherent::{AdtDef as _, GenericArgs as _, IntoKind as _};
 
 use super::{
     effects::{self, DEEP, DIRECT, Effects, FRESH, STATIC, UNKNOWN, deep, derefs, direct, index_of},
@@ -52,8 +52,6 @@ pub(crate) struct Loop {
     pub(crate) expr: ExprId,
     /// The iterable after `in`.
     pub(crate) head: ExprId,
-    /// The pattern after `for`.
-    pub(crate) pat: PatId,
     /// The loop's own body, the block.
     pub(crate) body: ExprId,
     /// The block the loop jumps back to.
@@ -78,7 +76,7 @@ pub(crate) fn for_loops(body: &Body, mir: &MirBody<'_>) -> Vec<Loop> {
         let Some(&iter) = mir.binding_locals.get(binding) else { continue };
         let Expr::Block { tail: Some(tail), .. } = body.expr(inner) else { continue };
         let Expr::Match { expr: next_call, arms: [_, some] } = body.expr(tail) else { continue };
-        let Pat::TupleStruct { args: [pat], .. } = body.pat(some.pat) else { continue };
+        let Pat::TupleStruct { args: [_], .. } = body.pat(some.pat) else { continue };
         let span = |it: &MirSpan, expr: ExprId| *it == MirSpan::ExprId(expr);
         let mut header = None;
         let mut next = None;
@@ -95,7 +93,7 @@ pub(crate) fn for_loops(body: &Body, mir: &MirBody<'_>) -> Vec<Loop> {
             }
         }
         let (Some(header), Some(next)) = (header, next) else { continue };
-        found.push(Loop { expr: id, head: *head, pat: *pat, body: some.expr, header, next, iter });
+        found.push(Loop { expr: id, head: *head, body: some.expr, header, next, iter });
     }
     found
 }
@@ -154,6 +152,8 @@ pub(crate) struct Reduced {
     /// Whether it is of integers whose overflow is checked: in another order, the iteration
     /// that overflows, if one does, may be another.
     pub(crate) overflow: bool,
+    /// Whether it is of floats, which `#[blaze::reassociate]` lets be computed in any order.
+    pub(crate) float: bool,
 }
 
 /// What keeps a loop from running its iterations in any order.
@@ -169,6 +169,9 @@ pub(crate) enum Dependence {
     HashOrder { name: String },
     /// An iteration reads `name` at an index another iteration writes.
     CrossIndex { name: String },
+    /// A call has an effect the other iterations see in the order they run: I/O, a static
+    /// that changes, an atomic. `said` says what, of the loop.
+    Effect { said: String },
 }
 
 impl Dependence {
@@ -191,6 +194,9 @@ impl Dependence {
             Dependence::CrossIndex { name } => format!(
                 "an iteration reads `{name}` at an index another iteration writes"
             ),
+            Dependence::Effect { said } => {
+                format!("each iteration {said}, which the others see in the order they run")
+            }
         }
     }
 
@@ -215,6 +221,10 @@ impl Dependence {
             Dependence::CrossIndex { name } => format!(
                 "read `{name}` from a copy made before the loop, or keep the dependence serial"
             ),
+            Dependence::Effect { .. } => "compute each iteration's value in parallel into a \
+                                          `Vec` (`.par_iter().map(..).collect()`), then do the \
+                                          effect over it in order"
+                .to_owned(),
         }
     }
 }
@@ -302,7 +312,8 @@ pub(crate) struct Mir<'a, 'db> {
     pub(crate) mir: &'a MirBody<'db>,
     pub(crate) hir: &'a Body,
     pub(crate) std: &'a Std,
-    /// Whether the body is `#[blaze::reassociate]`.
+    /// Whether the body's item is `#[blaze::reassociate]`: its float reductions may be
+    /// computed in any order.
     pub(crate) reassociate: bool,
     successors: Vec<Vec<usize>>,
     live: Liveness,
@@ -319,13 +330,13 @@ impl<'a, 'db> Mir<'a, 'db> {
         mir: &'a MirBody<'db>,
         hir: &'a Body,
         std: &'a Std,
+        reassociate: bool,
     ) -> Mir<'a, 'db> {
         let successors = region::successors(mir);
         let live = Liveness::of(mir, &successors);
         let blocks: Vec<_> = mir.basic_blocks.iter().map(|(_, it)| it).collect();
         let mut defs = vec![Vec::new(); mir.locals.len()];
         let mut calls = Vec::with_capacity(blocks.len());
-        let mut reassociate = false;
         for (index, block) in blocks.iter().enumerate() {
             for (at, statement) in block.statements.iter().enumerate() {
                 if let StatementKind::Assign(place, _) = &statement.kind
@@ -340,10 +351,6 @@ impl<'a, 'db> Mir<'a, 'db> {
                 {
                     if derefs(destination) == 0 {
                         defs[index_of(destination.local)].push(Site::Call { block: index });
-                    }
-                    if let Some((f, _)) = effects::fn_item(func) {
-                        reassociate |= FunctionSignature::of(db, f).name.as_str()
-                            == "__blaze_reassociate";
                     }
                     Some(effects::call_summary(db, env, func, *intrinsic))
                 }
@@ -583,6 +590,8 @@ struct Tally {
     used: Vec<bool>,
     item_writes: bool,
     may_panic: bool,
+    /// The effects its calls have that show the order of the iterations, named.
+    effects: Vec<Dependence>,
 }
 
 impl<'db> Look<'_, '_, 'db> {
@@ -870,6 +879,7 @@ impl<'db> Look<'_, '_, 'db> {
             used: vec![false; n],
             item_writes: false,
             may_panic: next.has(effects::Effect::Panic),
+            effects: Vec::new(),
         };
         let inner = Cycles::of_graph(&m.successors, &self.inside, Some(self.lp.header));
         let mut work: u64 = 0;
@@ -903,7 +913,19 @@ impl<'db> Look<'_, '_, 'db> {
                 TerminatorKind::Call { func, args, destination, .. } => {
                     let Some((summary, fn_call)) = m.calls[index] else { return Err(Shared) };
                     if !summary.allowed() {
-                        return Err(Shared);
+                        // An effect blaze knows is one other iterations see in the order
+                        // they run: a dependence, named. What blaze can't see into is not.
+                        let Some(why) = summary.why.filter(|_| summary.only_ordered()) else {
+                            return Err(Shared);
+                        };
+                        let said = why.said(m.db);
+                        let seen = tally
+                            .effects
+                            .iter()
+                            .any(|it| matches!(it, Dependence::Effect { said: s } if *s == said));
+                        if !seen {
+                            tally.effects.push(Dependence::Effect { said });
+                        }
                     }
                     tally.may_panic |= summary.has(effects::Effect::Panic);
                     let len = effects::fn_item(func).is_some_and(|(f, _)| {
@@ -939,7 +961,7 @@ impl<'db> Look<'_, '_, 'db> {
                 _ => {}
             }
         }
-        let mut dependences = Vec::new();
+        let mut dependences = std::mem::take(&mut tally.effects);
         for &base in &tally.indexed {
             let at_other = tally.reads.iter().any(|&(read, len)| {
                 read.base == base && !len && !self.is_own(read.index)
@@ -1277,12 +1299,14 @@ impl<'db> Look<'_, '_, 'db> {
     ) -> Result<Reduced, Dependence> {
         match ty.kind() {
             TyKind::Int(_) | TyKind::Uint(_) | TyKind::Bool => {
-                Ok(Reduced { name, reduction, overflow })
+                Ok(Reduced { name, reduction, overflow, float: false })
             }
             TyKind::Adt(..) if reduction == Reduction::Insert => {
-                Ok(Reduced { name, reduction, overflow: false })
+                Ok(Reduced { name, reduction, overflow: false, float: false })
             }
-            TyKind::Float(_) if self.m.reassociate => Ok(Reduced { name, reduction, overflow: false }),
+            TyKind::Float(_) if self.m.reassociate => {
+                Ok(Reduced { name, reduction, overflow: false, float: true })
+            }
             TyKind::Float(_) => Err(Dependence::Float { name, reduction }),
             _ => Err(Dependence::Carried { name }),
         }

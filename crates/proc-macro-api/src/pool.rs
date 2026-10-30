@@ -14,6 +14,8 @@ use crate::{
 };
 
 /// Opens another connection to the same server program.
+// Set once per client, by the way it reaches its servers.
+// dyn: called once per connection opened, which spawns or connects a server.
 pub(crate) type Open = Box<dyn Fn() -> io::Result<ProcMacroServerProcess> + Send + Sync>;
 
 /// More connections to one server than any machine runs expansions at once.
@@ -72,7 +74,7 @@ impl ProcMacroServerPool {
         for process in first {
             inner.connections.push(process)?;
         }
-        Ok(ProcMacroServerPool(Arc::new(inner)))
+        Ok(ProcMacroServerPool(Arc::new(inner))) // alloc: once per client.
     }
 
     /// Why the server is gone, once every connection to it has ended.
@@ -107,10 +109,11 @@ impl ProcMacroServerPool {
                 message: "every connection to the proc-macro server is in use and another could \
                           not be opened"
                     .into(),
-                io: Some(Arc::new(error)),
+                io: Some(Arc::new(error)), // alloc: error path.
             })?;
             if process.version() != self.0.version {
                 return Err(ServerError {
+                    // alloc: error path, naming both versions.
                     message: format!(
                         "a new connection to the proc-macro server speaks API {}, the others {}",
                         process.version(),
@@ -129,6 +132,7 @@ impl ProcMacroServerPool {
     pub(crate) fn load_dylib(&self, dylib: &MacroDylib) -> Result<Vec<ProcMacro>, ServerError> {
         let _span = tracing::info_span!("ProcMacroServer::load_dylib").entered();
 
+        // alloc: once per library, shared by its macros.
         let dylib_path = Arc::new(dylib.path.clone());
         let dylib_last_modified =
             std::fs::metadata(dylib_path.as_path()).ok().and_then(|m| m.modified().ok());
@@ -141,12 +145,13 @@ impl ProcMacroServerPool {
         Ok(macros
             .into_iter()
             .map(|(name, kind)| ProcMacro {
-                pool: self.clone(),
+                pool: ProcMacroServerPool(Arc::clone(&self.0)),
                 name: name.into(),
                 kind,
-                dylib_path: dylib_path.clone(),
+                dylib_path: Arc::clone(&dylib_path),
                 dylib_last_modified,
             })
+            // alloc: once per library, its macros.
             .collect())
     }
 

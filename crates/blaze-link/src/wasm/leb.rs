@@ -5,17 +5,16 @@ pub(super) use blaze_format::leb::{
     PADDED, len_u64 as uleb_len, padded_i32 as padded_sleb, padded_u32 as padded_uleb,
     put_i64 as sleb_into, put_u64 as uleb_into, write_i64 as sleb, write_u64 as uleb,
 };
+use blaze_format::cursor::Put;
 
 pub(super) fn name(out: &mut Vec<u8>, name: &str) {
-    uleb(out, name.len() as u64);
-    out.extend(name.as_bytes());
+    out.put_bytes_uleb(name.as_bytes());
 }
 
 /// A section: its id, its size, then `contents`.
 pub(super) fn section(out: &mut Vec<u8>, id: u8, contents: &[u8]) {
-    out.push(id);
-    uleb(out, contents.len() as u64);
-    out.extend(contents);
+    out.put_u8(id);
+    out.put_bytes_uleb(contents);
 }
 
 /// A custom section: id 0, its size, its name, then `payload`.
@@ -54,13 +53,13 @@ mod tests {
     fn round_trips() {
         let unsigned = [0, 1, 127, 128, 300, 65_535, 1 << 20, u32::MAX];
         for value in unsigned {
-            assert_eq!(Reader::new(&u(value.into())).u32().unwrap(), value);
-            assert_eq!(Reader::new(&padded_uleb(value)).u32().unwrap(), value);
+            assert_eq!(Reader::new(&u(value.into())).uleb32().unwrap(), value);
+            assert_eq!(Reader::new(&padded_uleb(value)).uleb32().unwrap(), value);
         }
         let signed = [0, 1, -1, 63, 64, -64, -65, 1 << 20, i32::MIN, i32::MAX];
         for value in signed {
-            assert_eq!(Reader::new(&s(value.into())).i32().unwrap(), value);
-            assert_eq!(Reader::new(&padded_sleb(value)).i32().unwrap(), value);
+            assert_eq!(Reader::new(&s(value.into())).sleb32().unwrap(), value);
+            assert_eq!(Reader::new(&padded_sleb(value)).sleb32().unwrap(), value);
         }
     }
 

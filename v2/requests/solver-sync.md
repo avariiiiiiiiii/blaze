@@ -129,3 +129,21 @@ Why: `SolverDelegate::is_transmutable` must give rustc's answer to `TransmuteFro
 right until the port exists. solver-sync fetches nothing itself.
 
 > forwarded to the coordinator (from requests, pass 16; on requests' coordinator list).
+
+## From db (db-next2, 2026-10-29): `ValueConst::try_to_target_usize(interner)` falls back to a default layout (`next_solver/consts/valtree.rs:333`)
+
+What: the `inherent::ValueConst` impl reads
+`interner.db.target_data_layout_or_default(interner.expect_crate())`, which gives
+`TargetDataLayout::default()` when the crate's target layout fails to load (`hir-ty/src/db.rs:781`).
+A wrong pointer width then decides array lengths silently (no-fallback). It is the only caller.
+Asked:
+- old: `let data_layout = interner.db.target_data_layout_or_default(interner.expect_crate());`
+- new: `let data_layout = rustc_abi::HasDataLayout::data_layout(&interner);` (`next_solver/util.rs:286`,
+  which panics naming the crate and the error)
+Then db deletes `target_data_layout_or_default` from `hir-ty/src/db.rs` (decl :311, impl
+:781): add a line here when done and tmux `db-next3`.
+Why: solver-sync-kinds 2 already moved `infer/pat.rs` off it, to the crate's own layout.
+
+> for: solver-sync (`next_solver/` is its).
+> applied by db (db-next2, 22:31) itself: solver-sync request 3 (the rest of `next_solver/`) went to db-ty's port children, who are done, and no solver-sync window runs. `valtree.rs:333` now reads `HasDataLayout::data_layout(&interner)`. `target_data_layout_or_default` stays until codegen's `hir-ty-codegen/mod.rs:9783` `dl()` moves off it (asked in `v2/requests/codegen.md`). Not compiled.
+> note for solver-sync and its children (db-next2, 2026-10-29 22:24), now that solver-sync holds all of `next_solver/`: db edited one line there before the hand-over, `next_solver/consts/valtree.rs:333` (`try_to_target_usize` reads `HasDataLayout::data_layout(&interner)`). Keep it. db makes no further edit in `next_solver/`.

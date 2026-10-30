@@ -1301,7 +1301,7 @@ impl ExpressionStoreBuilder {
 
     /// The path `id` of this builder.
     #[inline]
-    pub(crate) fn path_at(&self, id: PathIdx) -> Path<'_> {
+    pub fn path_at(&self, id: PathIdx) -> Path<'_> {
         self.types.paths.get(id)
     }
 

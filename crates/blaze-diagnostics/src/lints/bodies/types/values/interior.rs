@@ -83,14 +83,17 @@ impl LatePass for InteriorMutableConsts {
 
         let mut diag = Diag::lint(
             "const_item_interior_mutations",
+            // alloc: the lint's text, for a lint found
             format!("mutation of an interior mutable `const` item with call to `{method_name}`"),
             span,
         );
         diag.span_label(
             receiver_span,
+            // alloc: the lint's text, for a lint found
             format!("`{const_name}` is a interior mutable `const` item of type `{const_ty}`"),
         );
         diag.note("each usage of a `const` item creates a new temporary");
+        // alloc: the lint's text, for a lint found
         diag.note(format!("only the temporaries and never the original `const {const_name}` will be modified"));
         diag.help(
             "for more details on interior mutability see <https://doc.rust-lang.org/reference/interior-mutability.html>",
@@ -98,6 +101,7 @@ impl LatePass for InteriorMutableConsts {
         static_suggestion(b, &mut diag, konst, const_name);
         diag.fact(
             Fact::Signature(b.cx.key(ItemId::Function(method))),
+            // alloc: the lint's text, for a lint found
             format!("the attributes of `{method_name}`"),
         );
         out.push(b.lint(diag, Phase::Late, node));
@@ -125,6 +129,7 @@ fn static_suggestion(b: &BodyCx<'_, '_>, diag: &mut Diag, konst: ConstId, const_
     if !matches!(loc.container, ItemContainerId::ModuleId(_)) || konst.krate(db) != b.cx.krate.base() {
         return;
     }
+    // alloc: the lint's text, for a lint found
     let message = format!("for a shared instance of `{const_name}`, consider making it a `static` item instead");
     let source = loc.source(db);
     let range = (|| {
@@ -142,6 +147,7 @@ fn static_suggestion(b: &BodyCx<'_, '_>, diag: &mut Diag, konst: ConstId, const_
     match range {
         Some((range, before)) => {
             let span = b.cx.span(InFile::new(source.file_id, range));
+            // alloc: the lint's text, for a lint found
             diag.suggestion_verbose(span, message, format!("{before}static "), Applicability::MaybeIncorrect);
         }
         None => {

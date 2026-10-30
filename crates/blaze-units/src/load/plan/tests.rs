@@ -2,6 +2,7 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
 use blaze_manifest::Config;
+use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::{Context, EitherManifest, Manifest, read_manifest};
 use blaze_manifest::profiles::{Profile as BaseProfile, ProfileRoot};
 use blaze_resolve::{InternedString, PackageId, SourceId};
@@ -168,7 +169,7 @@ fn lints_order() {
 }
 
 /// A configuration seen from `cwd` with `env` and `--config` arguments `cli`.
-fn config(cwd: &Path, env: &[(&str, &str)], cli: &[&str]) -> Config {
+fn config(cwd: &Path, env: &[(&str, &str)], cli: &[&str]) -> Config<Disk> {
     let mut vars = vec![("CARGO_HOME".to_owned(), cwd.join("cargo-home").display().to_string())];
     vars.extend(env.iter().map(|(name, value)| ((*name).to_owned(), (*value).to_owned())));
     Config::load(cwd, vars, &strings(cli)).unwrap()
@@ -484,7 +485,7 @@ impl Drop for Scratch {
     }
 }
 
-fn manifest(path: &Path, source: blaze_manifest::source::SourceId, config: Config) -> Manifest {
+fn manifest(path: &Path, source: blaze_manifest::source::SourceId, config: Config<Disk>) -> Manifest {
     match read_manifest(path, source, &Context::new(config)).unwrap() {
         EitherManifest::Real(it) => *it,
         EitherManifest::Virtual(_) => panic!("`{}` has no package", path.display()),
@@ -641,7 +642,8 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
         unsandboxed: &unsandboxed,
     };
     let planned = plan(&input).unwrap();
-    (ws, planned.plans, planned.finished)
+    let plans = planned.plans.into_iter().map(|it| it.expect("every unit is planned here")).collect();
+    (ws, plans, planned.finished)
 }
 
 /// The hex of a plan's `-C extra-filename`.

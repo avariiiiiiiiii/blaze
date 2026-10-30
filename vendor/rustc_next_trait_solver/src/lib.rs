@@ -14,6 +14,10 @@
 // `unsafe impl GenericTypeVisitable`, which a `forbid` would refuse.
 #![deny(unsafe_code)]
 
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
+
 pub mod canonical;
 pub mod coherence;
 pub mod delegate;

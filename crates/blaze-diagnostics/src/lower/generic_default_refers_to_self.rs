@@ -5,7 +5,7 @@
 //! (`SelfInGenericParamDefault`) (MIT or Apache-2.0).
 
 use hir::InFile;
-use syntax::AstNode;
+use syntax::view::AstNode as _;
 
 use crate::{
     cx::Cx,
@@ -14,7 +14,7 @@ use crate::{
 };
 
 pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericDefaultRefersToSelf) -> Vec<Found> {
-    let segment = cx.node(d.segment);
+    let segment = cx.node_view(d.segment);
     let range = match segment.value.name_ref() {
         Some(name) => name.syntax().text_range(),
         None => segment.value.syntax().text_range(),
@@ -23,5 +23,5 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::GenericDefaultRefersToSelf) -> Vec
     let mut diag =
         Diag::error(Some("E0735"), "generic parameters cannot use `Self` in their defaults", span);
     site_fact(cx, &mut diag, InFile::new(segment.file_id, segment.value.syntax()));
-    vec![Found::new(diag, Phase::Resolve)]
+    vec![Found::new(diag, Phase::Resolve)] // alloc: the error found
 }

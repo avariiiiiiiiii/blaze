@@ -1,9 +1,7 @@
 //! Random assortment of ide helpers for high-level ide features that don't fit in any other module.
 
-use std::collections::VecDeque;
-
-use hir::{Crate, HasAttrs, ItemInNs, ModuleDef, Name, Semantics};
-use span::{Edition, FileId};
+use hir::{Crate, ItemInNs, Name, Semantics};
+use span::Edition;
 use syntax::{
     AstToken, SyntaxKind, SyntaxToken, ToSmolStr, TokenAtOffset,
     ast::{self, make, syntax_factory::SyntaxFactory},
@@ -79,38 +77,6 @@ pub fn mod_path_to_ast_with_factory(
         make.path_segment(make.name_ref(&segment.display_no_db(edition).to_smolstr()))
     }));
     make.path_from_segments(segments, is_abs)
-}
-
-/// Iterates all `ModuleDef`s and `Impl` blocks of the given file.
-pub fn visit_file_defs<'db>(
-    sema: &Semantics<'db, RootDatabase>,
-    file_id: FileId,
-    cb: &mut dyn FnMut(Definition<'db>),
-) {
-    let db = sema.db;
-    let module = match sema.file_to_module_def(file_id) {
-        Some(it) => it,
-        None => return,
-    };
-    let mut defs: VecDeque<_> = module.declarations(db).into();
-    while let Some(def) = defs.pop_front() {
-        if let ModuleDef::Module(submodule) = def
-            && submodule.is_inline(db)
-        {
-            defs.extend(submodule.declarations(db));
-            submodule.impl_defs(db).into_iter().for_each(|impl_| cb(impl_.into()));
-        }
-        cb(def.into());
-    }
-    module.impl_defs(db).into_iter().for_each(|impl_| cb(impl_.into()));
-
-    let is_root = module.is_crate_root(db);
-    module
-        .legacy_macros(db)
-        .into_iter()
-        // don't show legacy macros declared in the crate-root that were already covered in declarations earlier
-        .filter(|it| !(is_root && it.attrs(db).is_macro_export()))
-        .for_each(|mac| cb(mac.into()));
 }
 
 /// Checks if the given lint is equal or is contained by the other lint which may or may not be a group.

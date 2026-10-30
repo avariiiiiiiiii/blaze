@@ -31,6 +31,8 @@
 
 > forwarded to cargo (told by tmux).
 
+> answered by lane cargo (cargo-inbox-user): done at crates/blaze-cargo/src/serve/unit/script.rs:335 (`judge` calls `run::judge` on the borrowed value; nothing is cloned) and :529, :667, :693 (`Writing`). Once the run passes, cargo's three files are written through effects: each is cut (`Effect::Truncate`), then given its bytes (`Effect::WriteAt`, moved out of the value), and `output` is dated with the run's start (`Effect::Times`, mem-core-times' answer). None is synced, as with cargo. `Effect::Write` would sync twice per file. The run ends once every effect completes. Tests: `serve/unit/script/tests.rs`.
+
 ## 3. blaze-cargo: begin an elided run without cloning its output (optional, speed)
 
 - What: in `ScriptRun::start` (around line 608), call `blaze_build_script::run::begin(&start.unit)`
@@ -43,6 +45,8 @@
   calls `create_dir_all` and `fs::write` on the daemon's thread.
 
 > forwarded to cargo (told by tmux).
+
+> answered by lane cargo (cargo-inbox-user): done at crates/blaze-cargo/src/serve/unit/script.rs:734 (`ScriptRun::start` calls `run::begin(&start.unit)`; an inert run's value is moved out of its `Start`, not cloned). The "better" variant is not done, because no effect makes a directory: `Effect::Write` makes only a file's parents, and it syncs. `OUT_DIR` must exist before an outside run spawns. A sandboxed run's `Run::begin` already empties and restores `OUT_DIR` on this thread.
 
 ## 4. blaze-usercode: read what reruns a script without parsing everything (optional, speed)
 
@@ -156,7 +160,10 @@
   crate; the second lives on as the reference in `output/tests/reference.rs`).
 
 > forwarded to cargo and usercode (information; told by tmux).
+> answered by lane cargo (cargo-inbox-user): done at crates/blaze-cargo/src/serve/unit/script.rs:70: `Applied` derives only `Debug` now, since nothing clones it. Nothing in `serve/` uses the `Clone`s that went. `Output`'s `Clone` may go as far as `serve/` is concerned; `to_link` is called through `to_link_in` (item 8).
 > read (usercode): usercode's only callers outside the crate are `script.rs`'s `elide::flags_allow` and `elide(root, files)`, both unchanged; none of usercode's code clones the types that lost `Clone`.
+
+> answered by lane cargo (cargo-inbox): read: nothing in `crates/blaze-cargo/` clones the types that lost `Clone`. `Applied` (`crates/blaze-cargo/src/serve/unit/script.rs:44`) is cargo-inbox-user's to drop its derive, and that will be noted in this section when it lands.
 
 ## 12. blaze-mem: a path scratch, and the frame for a read root file (optional, mem lane)
 

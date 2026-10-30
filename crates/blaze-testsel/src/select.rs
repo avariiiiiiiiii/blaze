@@ -17,16 +17,18 @@
 //! [`Choice::Cached`]; if it failed with these inputs, it runs. The store never replaces a
 //! value, so the history only grows; its end is found by doubling and halving.
 
-use std::{ffi::OsString, fmt, time::Duration};
+use std::{fmt, time::Duration};
 
 use blaze_cas::{Corrupt, Key, Mismatch, Ticket};
 use blaze_core::Traced;
 use blaze_ids::{ContentId, Hasher};
-use rustc_hash::FxHashMap;
 use blaze_usercode::{
     RunKey,
     index::{self, Shape},
-    test::{Attrs, Input, Passes, select::keepable},
+    test::{
+        Attrs, Input, Passes,
+        select::{SelectError, changed_input, keepable},
+    },
     trace::{self, Inputs, Report},
 };
 
@@ -106,7 +108,7 @@ pub enum Why {
 
 impl Why {
     /// The explanation, with a function named by `name_of` when it knows it.
-    pub fn describe(&self, name_of: &dyn Fn(&FnId) -> Option<String>) -> String {
+    pub fn describe(&self, name_of: &impl Fn(&FnId) -> Option<String>) -> String {
         let named = |id: &FnId| name_of(id).unwrap_or_else(|| format!("function {}", id.0));
         match self {
             Why::New => "new".to_owned(),
@@ -137,30 +139,6 @@ impl From<Change> for Why {
             Change::Changed(id) => Why::Changed(id),
             Change::Gone(id) => Why::Gone(id),
             Change::Unlogged => Why::Unlogged,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum SelectError<E> {
-    Corrupt(Corrupt),
-    /// A value under a key of ours that is not what we keep there: a key of another schema.
-    NotOurs { key: Key, why: String },
-    Inputs(E),
-}
-
-impl<E> From<Corrupt> for SelectError<E> {
-    fn from(it: Corrupt) -> SelectError<E> {
-        SelectError::Corrupt(it)
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for SelectError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            SelectError::Corrupt(it) => it.fmt(f),
-            SelectError::NotOurs { key, why } => write!(f, "the store's value of {:?} is not a test's: {why}", key.0),
-            SelectError::Inputs(it) => it.fmt(f),
         }
     }
 }
@@ -277,33 +255,6 @@ fn find<P: Passes + ?Sized, I: Inputs>(store: &P, run: &RunKey, inputs: &mut I) 
         }
         n += 1;
     }
-}
-
-/// The first input of `before` whose value `now` does not have.
-fn changed_input(before: &Traced, now: &Traced) -> Option<Input> {
-    let files: FxHashMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect();
-    let dirs: FxHashMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect();
-    let env: FxHashMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect();
-    for (path, hash) in &before.files {
-        if files.get(path) != Some(&hash) {
-            return Some(Input::File(path.clone()));
-        }
-    }
-    for (path, hash) in &before.dirs {
-        if dirs.get(path) != Some(&hash) {
-            return Some(Input::Dir(path.clone()));
-        }
-    }
-    for (name, value) in &before.env {
-        if env.get(name) != Some(&value) {
-            let name = match name == trace::ALL_ENV_NAME {
-                true => OsString::from("*"),
-                false => name.clone(),
-            };
-            return Some(Input::Env(name));
-        }
-    }
-    None
 }
 
 /// How a run went, to keep.

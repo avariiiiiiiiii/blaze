@@ -84,6 +84,7 @@ pub fn prepare(unit: &Unit, inherited: &[(OsString, OsString)], place: &Place) -
             write: vec![unit.out_dir.clone()], // clone: setup, the sandbox owns what it may write
             network: place.network,
             trace: true,
+            services: Vec::new(), // alloc: none, an empty list
         },
         memory: place.memory,
     };

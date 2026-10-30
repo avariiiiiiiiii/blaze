@@ -10,12 +10,14 @@
 
 use std::{any::Any, sync::Arc};
 
-use base_db::{Db, Crate, Env, all_crates};
+use base_db::{Db, Crate, all_crates};
 use hir_def::{AdtId, FunctionId, MacroId, ModuleDefId, StructId, nameres::crate_def_map};
 use hir_expand::{
     name::Name,
     parse_to_token_tree_static_span,
-    proc_macro::{ProcMacro, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind},
+    proc_macro::{
+        ProcMacro, ProcMacroCall, ProcMacroExpander, ProcMacroExpansionError, ProcMacroKind,
+    },
     tt,
 };
 use hir_ty::db::HirDatabase;
@@ -229,13 +231,7 @@ impl ProcMacroExpander for ConstMacroExpander {
     fn expand(
         &self,
         db: &Db,
-        subtree: &tt::TopSubtree,
-        attrs: Option<&tt::TopSubtree>,
-        _env: &Env,
-        def_site: Span,
-        call_site: Span,
-        mixed_site: Span,
-        _current_dir: String,
+        ProcMacroCall { subtree, attrs, def_site, call_site, mixed_site, .. }: ProcMacroCall<'_>,
     ) -> Result<tt::TopSubtree, ProcMacroExpansionError> {
         let (krate, func) = self.function(db).map_err(ProcMacroExpansionError::System)?;
         let hir = db;
@@ -301,7 +297,8 @@ impl ProcMacroExpander for ConstMacroExpander {
         })
     }
 
+    // dyn: hir-expand's `ProcMacroExpander::eq_dyn`; compared when a crate's macros are set
     fn eq_dyn(&self, other: &dyn ProcMacroExpander) -> bool {
-        (other as &dyn Any).downcast_ref::<Self>() == Some(self)
+        (other as &dyn Any).downcast_ref::<Self>() == Some(self) // dyn: the downcast `eq_dyn` needs
     }
 }

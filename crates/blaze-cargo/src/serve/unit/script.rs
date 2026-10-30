@@ -10,6 +10,11 @@
 //! A run outside the sandbox is one `BLAZE_SANDBOX=off` or the workspace's
 //! `unsandboxed-build-scripts` (a member's `build-script = false`) takes out: it runs every
 //! time, and nothing of it is kept.
+//!
+//! cargo's files of a run (`output`, `stderr`, `root-output`) are written through the loop's
+//! effects, never on its thread, and `output` is dated when the run began, as cargo dates it.
+//! `BLAZE_ELIDE=verify` compiles and runs an inert script as well, and fails the build where
+//! the run differs from what elision said.
 
 #![forbid(unsafe_code)]
 
@@ -27,21 +32,41 @@ use blaze_build_script::{
     unit as bs,
 };
 use blaze_cas::Store;
-use blaze_core::{Command, Completion, Done, Effect, Sandbox, Tag};
+use blaze_core::{Command, Completion, Done, Effect, FileName, Sandbox, Tag};
 use blaze_units::{
     query::{UnitPlan, Units},
     schema::{DebugInfo, Mode, Unit},
 };
 use blaze_usercode::{
-    run::{Begun, Run, Value},
+    run::{Begun, OutFile, Run, Value},
     script::{self, Place, Prepared},
 };
 
-use super::{Job, package_of, say};
+use super::{Job, Real, UnitWriter, package_of, say};
 use crate::serve::work::{Runs, Writer};
 
+/// The job's variable that asks an inert script compiled and run as well, and checked against
+/// what elision said of it: `verify`, or unset.
+pub(crate) const ELIDE: &str = "BLAZE_ELIDE";
+
+/// Whether the job asks `BLAZE_ELIDE=verify`; any other value of it is an error naming it.
+pub(crate) fn verifies(job: &Job) -> Result<bool, ApiError> {
+    verifies_in(&job.input.config.invocation.env)
+}
+
+fn verifies_in(env: &[(String, String)]) -> Result<bool, ApiError> {
+    match env.iter().find(|(name, _)| name == ELIDE) {
+        None => Ok(false),
+        Some((_, value)) if value == "verify" => Ok(true),
+        Some((_, value)) => Err(ApiError::new(
+            format!("{ELIDE}={value} is not a value blaze takes: `verify` runs an inert build script as well, unset runs none"),
+            None,
+        )),
+    }
+}
+
 /// What a build script's run told cargo, for what depends on it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct Applied {
     /// The run's package.
     pub(crate) package_id: String,
@@ -62,14 +87,14 @@ pub(crate) fn compile_of(units: &Units, run: usize) -> Option<usize> {
 /// What a script that provably prints only constants prints, read from its source through the
 /// VFS: it is then neither compiled nor run. `unit` is the script's compile or its run. Worked
 /// out once per job and script: its compile and its run both ask.
-pub(crate) fn inert(job: &Job, unit: usize) -> Option<Value> {
+pub(crate) fn inert(job: &Job, unit: usize) -> Option<&Value> {
     let units = job.units();
     let u = units.graph.units.get(unit)?;
     let compile = match u.mode {
         Mode::RunCustomBuild => compile_of(units, unit)?,
         _ => unit,
     };
-    job.inert.get(compile)?.get_or_init(|| work_out_inert(job, compile)).clone()
+    job.inert.get(compile)?.get_or_init(|| work_out_inert(job, compile)).as_ref()
 }
 
 fn work_out_inert(job: &Job, compile: usize) -> Option<Value> {
@@ -277,22 +302,16 @@ pub(crate) fn refused(unit: &bs::Unit, stdout: &[u8], link_dirs: &[PathBuf]) -> 
 }
 
 /// `value`, a run of `unit` started in `env`, as cargo makes of it: what it printed, once it
-/// succeeded, with its warnings; or why the build fails, with the output cargo shows.
+/// succeeded, with its warnings; or why the build fails, with the output cargo shows. Read
+/// from the bytes alone: cargo's files of the run are the caller's to write ([`ScriptRun`]).
 pub(crate) fn judge(
     unit: &bs::Unit,
     env: &[(OsString, OsString)],
     value: &Value,
-    began: std::time::SystemTime,
     checked: Option<&[PathBuf]>,
     of: Option<UnitOf>,
     color: bool,
 ) -> Judged {
-    let ran = blaze_build_script::run::Ran {
-        began,
-        status: status(value.code, value.signal),
-        stdout: value.stdout.clone(),
-        stderr: value.stderr.clone(),
-    };
     let cx = Context { nightly_features_allowed: true, ..Context::of(unit, env) };
     let line = |severity: &Severity, message: &str| {
         let level = match severity {
@@ -312,7 +331,8 @@ pub(crate) fn judge(
         };
         say::cargo(Level::Error, what, of.clone(), color)
     };
-    match ran.finish(unit, &cx) {
+    let status = status(value.code, value.signal);
+    match blaze_build_script::run::judge(unit, &cx, status, &value.stdout, &value.stderr) {
         Ok(output) => {
             let mut diagnostics: Vec<Diagnostic> =
                 output.log_messages.iter().map(|(severity, message)| line(severity, message)).collect();
@@ -345,19 +365,10 @@ pub(crate) fn executed(package_id: &str, output: &Output, out_dir: &str) -> Buil
     }
 }
 
-/// The files a run left in its `OUT_DIR`, by `/`-separated path under it: those the store's
-/// value has, else as the run wrote them.
-fn out_files(value: &Value, out_dir: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let mut files = Vec::new();
-    for file in &value.files {
-        let bytes = match &file.bytes {
-            Some(bytes) => bytes.clone(),
-            None => std::fs::read(out_dir.join(&file.path))
-                .map_err(|error| format!("{}: {error}", out_dir.join(&file.path).display()))?,
-        };
-        files.push((file.path.clone(), bytes));
-    }
-    Ok(files)
+/// The files a run left in its `OUT_DIR`, by `/`-separated path under it, moved out of its
+/// value. A directory (no bytes) is no file: it is there on disk, which the run restored.
+fn out_files(files: Vec<OutFile>) -> Vec<(String, Vec<u8>)> {
+    files.into_iter().filter_map(|file| Some((file.path, file.bytes?))).collect()
 }
 
 /// Every file under `dir`, by `/`-separated path: what a run outside the sandbox left.
@@ -400,7 +411,7 @@ pub(crate) fn fresh(job: &Job, unit: usize) -> bool {
     let Some(start) = slot.as_mut() else { return false };
     let start = &mut **start;
     match &start.how {
-        How::Inert(_) => true,
+        How::Inert => true,
         How::Outside(_) => false,
         How::Sandboxed(prepared) => {
             let guard = blaze_cas::enter();
@@ -421,11 +432,14 @@ pub(crate) struct Start {
     /// made once per run, so no check sorts the environment again or takes a shared lock.
     disk: blaze_usercode::inputs::Disk,
     how: How,
+    /// What elision says the script prints, when it is inert: its result when it is not run
+    /// ([`How::Inert`]), or what its run is checked against under `BLAZE_ELIDE=verify`.
+    elided: Option<Value>,
 }
 
 enum How {
-    /// It prints only this: not run.
-    Inert(Value),
+    /// It prints only what elision says ([`Start::elided`]): not run.
+    Inert,
     /// In the sandbox, its result kept by what it read.
     Sandboxed(Prepared),
     /// Outside the sandbox (`BLAZE_SANDBOX=off`, `unsandboxed-build-scripts`): every time,
@@ -445,16 +459,16 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     let Some(compile) = compile_of(units, run) else {
         return Err(ApiError::new(format!("the run of unit {run} has no build script compiled"), None));
     };
-    let inert = inert(job, run);
-    let program = match &inert {
+    let verify = verifies(job)?;
+    // clone: the run's own, kept with it until it ends; once per run of an inert script.
+    let elided = inert(job, run).cloned();
+    let program = match (&elided, verify) {
         // Never compiled: its program is named, not there.
-        Some(_) => None,
-        None => {
-            match job.made[compile].get().and_then(|it| it.main.clone()) {
-                Some(it) => Some(it),
-                None => return Ok(None),
-            }
-        }
+        (Some(_), false) => None,
+        _ => match job.made[compile].get().and_then(|it| it.main.clone()) {
+            Some(it) => Some(it),
+            None => return Ok(None),
+        },
     };
     let script_path = match &program {
         Some((path, _)) => PathBuf::from(path),
@@ -470,10 +484,9 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
     };
     let unit = script_unit(&of, run).map_err(|what| ApiError::new(what, Some(format!("the build script of unit {run}"))))?;
     let env = inherited(&job.input.config.invocation.env, job.plan(run)?);
-    let (Some((_, code)), None) = (program, inert.clone()) else {
-        let value = inert.ok_or_else(|| ApiError::new("a build script neither built nor inert", None))?;
+    let Some((_, code)) = program else {
         let disk = blaze_usercode::inputs::Disk::new(Vec::new());
-        return Ok(Some(Start { unit, env, disk, how: How::Inert(value) }));
+        return Ok(Some(Start { unit, env, disk, how: How::Inert, elided }));
     };
     let mut read = vec![
         unit.package.manifest_dir.clone(),
@@ -491,11 +504,11 @@ fn prepare(job: &Job, run: usize) -> Result<Option<Start>, ApiError> {
         true => How::Outside(Command { sandbox: Sandbox::Off, ..prepared.spec.command }),
         false => How::Sandboxed(prepared),
     };
-    Ok(Some(Start { unit, env, disk, how }))
+    Ok(Some(Start { unit, env, disk, how, elided }))
 }
 
 /// A build script's run, on the loop.
-struct ScriptRun {
+pub(crate) struct ScriptRun {
     job: Arc<Job>,
     unit: usize,
     tag: Tag,
@@ -505,10 +518,38 @@ struct ScriptRun {
 enum State {
     Ready(Box<Start>),
     Running { start: Box<Start>, run: Option<Run>, began: SystemTime, cancelled: bool },
+    Writing(Box<Writing>),
     Done,
 }
 
-pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<Box<dyn Runs>, ApiError> {
+/// cargo's files of a run that passed, in [`blaze_build_script::run::files`]' order (`output`
+/// or `stdout`, `stderr`, `root-output`), written as cargo writes them: each cut to nothing,
+/// then given its bytes, then the first dated when the run began. None is synced: cargo syncs
+/// none of them. The run ends ok once every effect of them completed.
+struct Writing {
+    files: [FileName; 3],
+    /// Each file's bytes until it is cut and they are written; none are for an empty file.
+    bytes: [Vec<u8>; 3],
+    /// When the run began, as `output`'s time.
+    modified_ns: u64,
+    /// The effects asked that have not completed.
+    left: u8,
+}
+
+/// The tags of [`Writing`]'s effects, after the run's own: a file's cut, its bytes (each
+/// `+ file`), and the first file's time.
+const CUT: u64 = 1;
+const BYTES: u64 = 4;
+const TIMED: u64 = 7;
+
+/// `path` as the driver names it, under its root `/`.
+fn file_name(path: &Path) -> Result<FileName, String> {
+    path.to_str()
+        .and_then(|it| FileName::new(it.trim_start_matches('/')))
+        .ok_or_else(|| format!("{} is not a path blaze can write cargo's files of a run at", path.display()))
+}
+
+pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<ScriptRun, ApiError> {
     let u = job.unit(unit)?;
     if !matches!(u.mode, Mode::RunCustomBuild) {
         return Err(ApiError::new(format!("unit {unit} (`{}`) is no build script's run", u.target.name), None));
@@ -526,12 +567,12 @@ pub(crate) fn start(job: &Arc<Job>, unit: usize, tags: u64) -> Result<Box<dyn Ru
             }
         },
     };
-    Ok(Box::new(ScriptRun { job: job.clone(), unit, tag: Tag(tags), state: State::Ready(Box::new(start)) }))
+    Ok(ScriptRun { job: job.clone(), unit, tag: Tag(tags), state: State::Ready(Box::new(start)) })
 }
 
 impl ScriptRun {
     fn of(&self) -> Option<UnitOf> {
-        self.job.unit(self.unit).ok().and_then(|it| self.job.unit_of(it).ok())
+        self.job.unit_of(self.unit).ok()
     }
 
     fn error(&mut self, what: String, out: &mut Vec<Response>) -> Option<bool> {
@@ -540,37 +581,45 @@ impl ScriptRun {
         Some(false)
     }
 
-    /// The run's end: judged, its warnings said, what it printed applied through `writer`.
+    /// The run's end: checked against what elision said of it under `BLAZE_ELIDE=verify`,
+    /// judged, its warnings said, what it printed applied through `writer`, and cargo's files
+    /// of it written ([`Writing`]). It ends once they are.
     fn finish(
         &mut self,
-        start: &Start,
-        value: &Value,
+        start: Box<Start>,
+        value: Value,
         began: SystemTime,
-        writer: Option<&mut dyn Writer>,
+        writer: Option<&mut UnitWriter>,
+        effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
         let job = self.job.clone();
+        if let Some(elided) = &start.elided
+            && let Err(error) = script::verify_elided(elided, &value)
+        {
+            return self.error(format!("the build script of `{}`: {}", start.unit.package.descr(), error.0), out);
+        }
         let link_dirs: Vec<PathBuf> = job.units().link_dirs.iter().map(PathBuf::from).collect();
         // What a run outside the sandbox prints is not checked: it could do anything anyway.
         let checked = match start.how {
             How::Outside(_) => None,
             _ => Some(link_dirs.as_slice()),
         };
-        let judged = judge(&start.unit, &start.env, value, began, checked, self.of(), job.input.color);
+        let judged = judge(&start.unit, &start.env, &value, checked, self.of(), job.input.color);
         out.extend(judged.diagnostics.into_iter().map(Response::Diagnostic));
         let Some(output) = judged.output else {
             self.state = State::Done;
             return Some(false);
         };
+        let Value { stdout, stderr, files, .. } = value;
         let out_dir = start.unit.out_dir.to_string_lossy().into_owned();
         let files = match start.how {
-            How::Inert(_) => Ok(Vec::new()),
-            How::Sandboxed(_) => out_files(value, &start.unit.out_dir),
-            How::Outside(_) => walk(&start.unit.out_dir),
-        };
-        let files = match files {
-            Ok(it) => it,
-            Err(what) => return self.error(what, out),
+            How::Inert => Vec::new(),
+            How::Sandboxed(_) => out_files(files),
+            How::Outside(_) => match walk(&start.unit.out_dir) {
+                Ok(it) => it,
+                Err(what) => return self.error(what, out),
+            },
         };
         let ran = load_cargo::v2::Ran { cfgs: output.cfgs.clone(), env: output.env.clone(), out_dir: out_dir.clone(), files };
         let Some(writer) = writer else {
@@ -587,33 +636,112 @@ impl ScriptRun {
         if job.scripts[self.unit].set(applied).is_err() {
             return self.error(format!("the build script run of unit {} ended twice in one job", self.unit), out);
         }
-        self.state = State::Done;
-        Some(true)
+        match Writing::begin(&start.unit, stdout, stderr, began, self.tag, effects) {
+            Ok(writing) => {
+                self.state = State::Writing(writing);
+                None
+            }
+            Err(what) => self.error(what, out),
+        }
+    }
+
+    /// A completion of one of [`Writing`]'s effects: the run ends ok once none is left.
+    fn written(&mut self, mut writing: Writing, completion: Completion, effects: &mut Vec<Effect>, out: &mut Vec<Response>) -> Option<bool> {
+        match writing.step(self.tag, completion, effects) {
+            Ok(true) => {
+                self.state = State::Done;
+                Some(true)
+            }
+            Ok(false) => {
+                self.state = State::Writing(writing);
+                None
+            }
+            Err(what) => self.error(what, out),
+        }
     }
 }
 
-impl Runs for ScriptRun {
+impl Writing {
+    /// cargo's files of a run of `unit` that printed `stdout` and `stderr` and began at `began`,
+    /// each asked cut first, with tags after the run's `tag`.
+    fn begin(
+        unit: &bs::Unit,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        began: SystemTime,
+        tag: Tag,
+        effects: &mut Vec<Effect>,
+    ) -> Result<Writing, String> {
+        let at = blaze_build_script::run::files(unit, &[], &[])
+            .map_err(|error| format!("cargo's files of the build script run of `{}`: {error}", unit.package.descr()))?;
+        let files = [file_name(&at.printed.0)?, file_name(&at.stderr.0)?, file_name(&at.root_output.0)?];
+        // alloc: the effect owns what it writes; `OUT_DIR`'s path, once per run.
+        let root_output = at.root_output.1.to_vec();
+        let since = began.duration_since(SystemTime::UNIX_EPOCH).ok();
+        let modified_ns = since
+            .and_then(|it| u64::try_from(it.as_nanos()).ok())
+            .ok_or_else(|| format!("{}: the run began at {began:?}, which is no time a file can be given", files[0]))?;
+        for (n, file) in (0u64..).zip(&files) {
+            // clone: a file's name for each effect of it, three files once per run.
+            effects.push(Effect::Truncate { file: file.clone(), len: 0, tag: Tag(tag.0 + CUT + n) });
+        }
+        Ok(Writing { files, bytes: [stdout, stderr, root_output], modified_ns, left: 3 })
+    }
+
+    /// `completion` of one of its effects, the run's tag being `tag`: the next effect of its
+    /// file asked, and true once none is left.
+    fn step(&mut self, tag: Tag, completion: Completion, effects: &mut Vec<Effect>) -> Result<bool, String> {
+        let own = completion.tag.0.wrapping_sub(tag.0);
+        if !(CUT..=TIMED).contains(&own) {
+            return Err(format!("cargo's files of a build script run were told of tag {} they never asked for", completion.tag.0));
+        }
+        let file = ((own - CUT) % 3) as usize;
+        match completion.done {
+            Done::Truncated if !self.bytes[file].is_empty() => {
+                let bytes = std::mem::take(&mut self.bytes[file]);
+                // clone: as for its cut.
+                let name = self.files[file].clone();
+                effects.push(Effect::WriteAt { file: name, at: 0, bytes, tag: Tag(tag.0 + BYTES + file as u64) });
+                self.left += 1;
+            }
+            // `output` has all its bytes: it is dated now, so no write of it comes after.
+            Done::Truncated | Done::Written if file == 0 => {
+                // clone: as for its cut.
+                let name = self.files[0].clone();
+                effects.push(Effect::Times { file: name, modified_ns: self.modified_ns, tag: Tag(tag.0 + TIMED) });
+                self.left += 1;
+            }
+            Done::Truncated | Done::Written | Done::Timed => {}
+            Done::Failed(error) => return Err(format!("writing {}: {error}", self.files[file])),
+            other => return Err(format!("writing {} ended as {other:?}", self.files[file])),
+        }
+        self.left -= 1;
+        Ok(self.left == 0)
+    }
+}
+
+impl Runs<Real> for ScriptRun {
     fn start(
         &mut self,
         store: &Store,
-        writer: Option<&mut dyn Writer>,
+        writer: Option<&mut UnitWriter>,
         effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
         let State::Ready(mut start) = std::mem::replace(&mut self.state, State::Done) else { return None };
-        // cargo's start of a run: `OUT_DIR` made, and the time it began.
-        let stdout = match &start.how {
-            How::Inert(value) => value.stdout.clone(),
-            _ => Vec::new(),
-        };
-        let began = match blaze_build_script::run::elided(&start.unit, stdout) {
-            Ok(it) => it.began,
+        // cargo's start of a run: `OUT_DIR` made, `invoked.timestamp` written, and the time it
+        // began, which its `output` is given.
+        let began = match blaze_build_script::run::begin(&start.unit) {
+            Ok(it) => it,
             Err(error) => return self.error(error.0, out),
         };
         match &start.how {
-            How::Inert(value) => {
-                let value = value.clone();
-                self.finish(&start, &value, began, writer, out)
+            How::Inert => {
+                let Some(value) = start.elided.take() else {
+                    let what = format!("the build script of `{}` is inert, but elision said nothing of it", start.unit.package.descr());
+                    return self.error(what, out);
+                };
+                self.finish(start, value, began, writer, effects, out)
             }
             How::Outside(command) => {
                 effects.push(Effect::Spawn { command: Box::new(command.clone()), tag: self.tag });
@@ -623,7 +751,7 @@ impl Runs for ScriptRun {
             How::Sandboxed(prepared) => {
                 let begun = Run::begin(prepared.spec.clone(), store, &mut start.disk, self.tag, effects);
                 match begun {
-                    Ok(Begun::Reused(value)) => self.finish(&start, &value, began, writer, out),
+                    Ok(Begun::Reused(value)) => self.finish(start, value, began, writer, effects, out),
                     Ok(Begun::Running(run)) => {
                         self.state = State::Running { start, run: Some(run), began, cancelled: false };
                         None
@@ -645,18 +773,23 @@ impl Runs for ScriptRun {
         &mut self,
         completion: Completion,
         store: &mut Store,
-        writer: Option<&mut dyn Writer>,
-        _effects: &mut Vec<Effect>,
+        writer: Option<&mut UnitWriter>,
+        effects: &mut Vec<Effect>,
         out: &mut Vec<Response>,
     ) -> Option<bool> {
-        let State::Running { mut start, run, began, cancelled } = std::mem::replace(&mut self.state, State::Done) else {
-            return None;
+        let (mut start, run, began, cancelled) = match std::mem::replace(&mut self.state, State::Done) {
+            State::Running { start, run, began, cancelled } => (start, run, began, cancelled),
+            State::Writing(writing) => return self.written(writing, completion, effects, out),
+            other => {
+                self.state = other;
+                return None;
+            }
         };
         if cancelled {
             // A run killed is no result: nothing of it is kept or applied.
             return Some(false);
         }
-        let Start { unit, env, disk, how } = &mut *start;
+        let Start { unit, env, disk, how, .. } = &mut *start;
         let value = match (run, &*how) {
             (Some(run), How::Sandboxed(prepared)) => {
                 let completed = run.complete(
@@ -690,7 +823,7 @@ impl Runs for ScriptRun {
                 other => return self.error(format!("the build script's spawn ended as {other:?}"), out),
             },
         };
-        self.finish(&start, &value, began, writer, out)
+        self.finish(start, value, began, writer, effects, out)
     }
 
     fn cancel(&mut self, effects: &mut Vec<Effect>) -> Option<bool> {
@@ -707,3 +840,6 @@ impl Runs for ScriptRun {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

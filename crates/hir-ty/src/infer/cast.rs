@@ -7,7 +7,6 @@ use hir_def::{
     signatures::{TraitFlags, TraitSignature},
 };
 use rustc_ast_ir::Mutability;
-use rustc_hash::FxHashSet;
 use rustc_type_ir::{
     InferTy, RegionKind, TypeVisitableExt, UintTy, elaborate,
     error::TypeError,
@@ -142,7 +141,7 @@ impl CastFailure {
         let pointers = Box::new(CastPointers {
             expr: expr.and_then(PointerKind::stored),
             cast: cast.and_then(PointerKind::stored),
-            added_auto_traits: Box::new([]),
+            added_auto_traits: Box::new([]), // alloc: empty
         });
         Self { error, pointers: Some(pointers) }
     }
@@ -183,7 +182,7 @@ impl<'db> CastCheck<'db> {
 
     pub(super) fn check(
         &mut self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
     ) -> Result<(), InferenceDiagnostic> {
         self.expr_ty = ctx.structurally_resolve_type(self.source_expr.into(), self.expr_ty);
         self.cast_ty = ctx.table.try_structurally_resolve_type(self.expr.into(), self.cast_ty);
@@ -224,7 +223,7 @@ impl<'db> CastCheck<'db> {
         self.do_check(ctx).map_err(|e| e.into_diagnostic(self.expr, self.expr_ty, self.cast_ty))
     }
 
-    fn do_check(&self, ctx: &mut InferenceContext<'db>) -> Result<(), CastFailure> {
+    fn do_check(&self, ctx: &mut InferenceContext<'db, '_>) -> Result<(), CastFailure> {
         let (t_from, t_cast) =
             match (CastTy::from_ty(ctx.db, self.expr_ty), CastTy::from_ty(ctx.db, self.cast_ty)) {
                 (Some(t_from), Some(t_cast)) => (t_from, t_cast),
@@ -341,7 +340,7 @@ impl<'db> CastCheck<'db> {
 
     fn check_ref_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         t_expr: Ty<'db>,
         m_expr: Mutability,
         t_cast: Ty<'db>,
@@ -387,7 +386,7 @@ impl<'db> CastCheck<'db> {
 
     fn check_ptr_ptr_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         src: Ty<'db>,
         dst: Ty<'db>,
     ) -> Result<(), CastFailure> {
@@ -485,18 +484,16 @@ impl<'db> CastCheck<'db> {
 
                         // Check that `SrcAuto` (+auto traits implied by `Src`) is a superset of `DstAuto`.
                         // Emit an FCW otherwise.
-                        let src_auto: FxHashSet<_> = src_tty
-                            .auto_traits()
-                            .into_iter()
-                            .chain(
-                                elaborate::supertrait_def_ids(ctx.interner(), src_principal)
-                                    .filter(|trait_| {
-                                        TraitSignature::of(ctx.db, trait_.0)
-                                            .flags
-                                            .contains(TraitFlags::AUTO)
-                                    }),
-                            )
-                            .collect();
+                        let mut src_auto = Vec::new_in(ctx.frame);
+                        src_auto.extend(src_tty.auto_traits().into_iter().chain(
+                            elaborate::supertrait_def_ids(ctx.interner(), src_principal).filter(
+                                |trait_| {
+                                    TraitSignature::of(ctx.db, trait_.0)
+                                        .flags
+                                        .contains(TraitFlags::AUTO)
+                                },
+                            ),
+                        ));
 
                         let mut added = dst_tty
                             .auto_traits()
@@ -508,6 +505,7 @@ impl<'db> CastCheck<'db> {
                         if added.peek().is_some() {
                             let mut failure = failure(CastError::PtrPtrAddingAutoTraits);
                             if let Some(pointers) = &mut failure.pointers {
+                                // alloc: error path, a refused cast's diagnostic
                                 pointers.added_auto_traits = added.collect();
                             }
                             return Err(failure);
@@ -563,7 +561,7 @@ impl<'db> CastCheck<'db> {
 
     fn check_ptr_addr_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         expr_ty: Ty<'db>,
     ) -> Result<(), CastFailure> {
         match pointer_kind(self.expr, expr_ty, ctx).map_err(|_| CastError::Unknown)? {
@@ -578,7 +576,7 @@ impl<'db> CastCheck<'db> {
 
     fn check_addr_ptr_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         cast_ty: Ty<'db>,
     ) -> Result<(), CastFailure> {
         match pointer_kind(self.expr, cast_ty, ctx).map_err(|_| CastError::Unknown)? {
@@ -596,7 +594,7 @@ impl<'db> CastCheck<'db> {
 
     fn check_fptr_ptr_cast(
         &self,
-        ctx: &mut InferenceContext<'db>,
+        ctx: &mut InferenceContext<'db, '_>,
         cast_ty: Ty<'db>,
     ) -> Result<(), CastFailure> {
         match pointer_kind(self.expr, cast_ty, ctx).map_err(|_| CastError::Unknown)? {
@@ -646,7 +644,7 @@ impl PointerKind<'_> {
 fn pointer_kind<'db>(
     expr: ExprId,
     ty: Ty<'db>,
-    ctx: &mut InferenceContext<'db>,
+    ctx: &mut InferenceContext<'db, '_>,
 ) -> Result<Option<PointerKind<'db>>, ()> {
     let ty = ctx.table.try_structurally_resolve_type(expr.into(), ty);
     if ty.references_non_lt_error() {

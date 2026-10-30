@@ -481,13 +481,5 @@ fn copy(operand: &Operand) -> Operand {
 }
 
 fn operand_ty<'db>(ctx: &Ctx<'_, 'db>, body: &MirBody<'db>, operand: &Operand) -> Ty<'db> {
-    let ty = match &operand.kind {
-        OperandKind::Copy(place) | OperandKind::Move(place) => {
-            place.as_ref().ty(body, &ctx.infcx, ctx.env).ty
-        }
-        OperandKind::Constant { ty, .. } => ty.as_ref(),
-        OperandKind::Allocation { allocation } => allocation.as_ref().ty,
-        OperandKind::Static(_) => return ctx.bool_ty(),
-    };
-    ctx.normalize(ty)
+    ctx.normalize(ctx.operand_ty(body, operand))
 }

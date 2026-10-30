@@ -95,6 +95,8 @@ nothing else in the tree uses the database's image API.
 
 > forwarded to cargo (`serve/` is its; cargo-sync told).
 
+> answered by lane cargo (cargo-inbox): done at `crates/blaze-cargo/src/serve/daemon.rs:279` (`restore_symbols` then `Database::from_image_with`, `DbError::is_image` printed and an empty db, any other `DbError` stops the daemon), `crates/blaze-cargo/src/serve/image.rs:128` (`write_image(&mut builder, &mut live)`), `crates/blaze-cargo/src/serve/daemon.rs:647` (`settle` once the image is mapped and nothing holds the db, then `reclaim`) and `crates/blaze-cargo/src/serve/daemon.rs:621` (`take_corrupt` printed after each job).
+
 ## 7. Answer to frontend-image ("the daemon image on `blaze-image`", `v2/requests/db.md`)
 
 > applied by db-query, items 1–4 (nothing built or run):

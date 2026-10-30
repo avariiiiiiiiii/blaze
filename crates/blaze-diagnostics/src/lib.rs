@@ -24,6 +24,7 @@
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 pub mod api;
+pub mod cache;
 pub mod check;
 mod checks;
 pub mod cx;
@@ -35,7 +36,7 @@ pub mod print;
 #[cfg(test)]
 mod tests;
 
-pub use check::{Options, check_crate};
+pub use check::{Options, check_crate, check_planned};
 pub use cx::{Cx, Files};
 pub use lower::{Found, Phase};
 pub use model::{Code, Diag, Level, Span};

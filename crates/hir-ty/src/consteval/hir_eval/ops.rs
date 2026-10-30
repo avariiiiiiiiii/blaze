@@ -26,6 +26,7 @@ pub(crate) enum Kind {
 }
 
 impl Kind {
+    #[cfg(test)]
     pub(crate) const ALL: [Kind; 12] = [
         Kind::I8,
         Kind::I16,

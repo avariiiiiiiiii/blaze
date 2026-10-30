@@ -26,7 +26,7 @@
 use std::{
     ffi::OsString,
     fmt,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use blaze_cas::{Key, Kind};
@@ -86,15 +86,15 @@ pub struct Root {
 /// The rule of one machine: what it pins and where its public sources are.
 #[derive(Clone, Debug)]
 pub struct Rule {
-    /// The pinned toolchain (`harness/toolchain`), as `Toolchain::id` names it.
-    pub toolchain: ContentId,
-    /// The system images of blaze's builders.
-    pub systems: Vec<ContentId>,
-    /// Where crate versions, the toolchain, system images and outputs are on this machine.
-    pub roots: Vec<Root>,
-    /// Variables whose values are public, so a run that read one with a value may be. Empty
-    /// on blaze's builders, whose runs see no environment of the machine.
-    pub public_env: Vec<OsString>,
+    toolchain: ContentId,
+    systems: Vec<ContentId>,
+    roots: Vec<Root>,
+    /// Each root by the hash of its components ([`component_hash`]) and its depth, sorted:
+    /// `(hash, depth, index in roots)`.
+    by_hash: Vec<(u64, u32, u32)>,
+    /// Bit `d` (63 for 63 and deeper): some root has `d` components.
+    depths: u64,
+    public_env: Vec<OsString>,
 }
 
 /// A key proven public: by a [`Rule`] check, or by a signed bundle manifest that lists it.
@@ -137,7 +137,9 @@ impl fmt::Display for Private {
 pub struct QueryMade<'a> {
     pub schema: SchemaHash,
     pub producer: ContentId,
-    pub inputs: &'a [(ContentId, Origin)],
+    pub inputs: &'a [ContentId],
+    /// Where each of `inputs` comes from, in its order.
+    pub origins: &'a [Origin],
 }
 
 /// A build script's or proc macro's run.
@@ -187,7 +189,62 @@ pub struct FunctionMade<'a> {
     pub imported: &'a [FnSource],
 }
 
+/// The hash of a path's components up to and with `component`, from `hash`, theirs before
+/// it: equal for paths `Path::starts_with` takes as equal, as a drive's letter is any case
+/// there, so every prefix (its kind and letters) hashes alike and the compare decides.
+fn component_hash(hash: u64, component: Component<'_>) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mix = |hash: u64, word: u64| (hash.rotate_left(5) ^ word).wrapping_mul(K);
+    let bytes = match component {
+        Component::Prefix(_) => return mix(hash, u64::MAX),
+        other => other.as_os_str().as_encoded_bytes(),
+    };
+    let mut words = bytes.chunks_exact(8);
+    let mut hash = hash;
+    for word in &mut words {
+        hash = mix(hash, u64::from_le_bytes(word.try_into().expect("8 bytes")));
+    }
+    let mut last = [0; 8];
+    last[..words.remainder().len()].copy_from_slice(words.remainder());
+    mix(mix(hash, u64::from_le_bytes(last)), bytes.len() as u64)
+}
+
+fn depth_bit(depth: u32) -> u64 {
+    1 << depth.min(63)
+}
+
 impl Rule {
+    /// The rule pinning `toolchain` and the builders' `systems`, with what is under each of
+    /// `roots`, and the variables of `public_env` public. Of two roots of one path the later
+    /// is taken.
+    pub fn new(toolchain: ContentId, systems: Vec<ContentId>, roots: Vec<Root>, public_env: Vec<OsString>) -> Rule {
+        let mut by_hash = Vec::with_capacity(roots.len());
+        let mut depths = 0;
+        for (at, root) in roots.iter().enumerate() {
+            let (hash, depth) = root.path.components().fold((0, 0), |(hash, depth), it| (component_hash(hash, it), depth + 1));
+            depths |= depth_bit(depth);
+            by_hash.push((hash, depth, at as u32));
+        }
+        by_hash.sort_unstable();
+        Rule { toolchain, systems, roots, by_hash, depths, public_env }
+    }
+
+    pub fn toolchain(&self) -> ContentId {
+        self.toolchain
+    }
+
+    pub fn systems(&self) -> &[ContentId] {
+        &self.systems
+    }
+
+    pub fn roots(&self) -> &[Root] {
+        &self.roots
+    }
+
+    pub fn public_env(&self) -> &[OsString] {
+        &self.public_env
+    }
+
     /// Whether `origin` is public here.
     pub fn origin(&self, origin: &Origin) -> Result<(), String> {
         match origin {
@@ -205,14 +262,43 @@ impl Rule {
         }
     }
 
-    /// Where `path` comes from: the origin of the longest root it is under.
+    /// Where `path` comes from: the origin of the longest root it is under. One walk of its
+    /// components, a probe at each depth some root has, and one compare of each root found.
     pub fn path(&self, path: &Path) -> Result<&Origin, String> {
+        let probe = |hash: u64, depth: u32| {
+            if self.depths & depth_bit(depth) == 0 {
+                return None;
+            }
+            let from = self.by_hash.partition_point(|it| (it.0, it.1) < (hash, depth));
+            self.by_hash[from..]
+                .iter()
+                .take_while(|it| (it.0, it.1) == (hash, depth))
+                .filter(|it| path.starts_with(&self.roots[it.2 as usize].path))
+                .map(|it| it.2)
+                .max()
+        };
+        let mut longest = probe(0, 0);
+        let (mut hash, mut depth) = (0, 0);
+        for component in path.components() {
+            hash = component_hash(hash, component);
+            depth += 1;
+            longest = probe(hash, depth).or(longest);
+        }
+        match longest {
+            Some(at) => Ok(&self.roots[at as usize].origin),
+            // alloc: an error path.
+            None => Err(format!("it reads {}, which is under no public source", path.display())),
+        }
+    }
+
+    /// [`Rule::path`] as the linear scan it is the same as: the tests' reference.
+    #[cfg(test)]
+    fn path_scanned(&self, path: &Path) -> Option<&Origin> {
         self.roots
             .iter()
             .filter(|root| path.starts_with(&root.path))
             .max_by_key(|root| root.path.components().count())
             .map(|root| &root.origin)
-            .ok_or_else(|| format!("it reads {}, which is under no public source", path.display()))
     }
 
     fn public_path(&self, path: &Path) -> Result<(), String> {
@@ -221,10 +307,13 @@ impl Rule {
     }
 
     pub fn query(&self, made: &QueryMade<'_>) -> Result<Public, Private> {
-        let ids: Vec<ContentId> = made.inputs.iter().map(|(id, _)| *id).collect();
-        let key = Key::of(made.schema, made.producer, &ids);
+        let key = Key::of(made.schema, made.producer, made.inputs);
         let private = |why: String| Private { key, why };
-        for (_, origin) in made.inputs {
+        if made.origins.len() != made.inputs.len() {
+            // alloc: an error path.
+            return Err(private(format!("{} origins for {} inputs", made.origins.len(), made.inputs.len())));
+        }
+        for origin in made.origins {
             self.origin(origin).map_err(private)?;
         }
         Ok(Public { key, kind: Kind::Query })
@@ -242,8 +331,9 @@ impl Rule {
         self.origin(made.code).map_err(|why| private(format!("its code: {why}")))?;
         self.origin(made.caller).map_err(|why| private(format!("what it runs for: {why}")))?;
         for (name, value) in made.given.vars() {
-            if let Some(path) = absolute(value) {
-                self.public_path(&path)
+            let path = Path::new(value);
+            if path.is_absolute() {
+                self.public_path(path)
                     .map_err(|why| private(format!("{} names a path: {why}", name.to_string_lossy())))?;
             }
         }
@@ -272,8 +362,8 @@ impl Rule {
     }
 
     pub fn function(&self, made: &FunctionMade<'_>) -> Result<Public, Private> {
-        let built_in: Vec<InstanceKey> = made.built_in.iter().map(|it| it.instance.key()).collect();
-        let stored = blaze_codegen::driver::stored(made.function.instance.key(), &built_in);
+        let instance = made.function.instance.key();
+        let stored = with_keys(made.built_in, |built_in| blaze_codegen::driver::stored(instance, built_in));
         let key = keys::release(&made.imports.blob_key(stored));
         let private = |why: String| Private { key, why };
         let spec = made.spec;
@@ -296,10 +386,10 @@ impl Rule {
         }
         let all = std::iter::once(made.function).chain(made.built_in).chain(made.imported);
         for source in all {
-            let what = source.instance.key().0;
-            self.origin(&source.code).map_err(|why| private(format!("the code of {what:x}: {why}")))?;
+            let what = || source.instance.key().0;
+            self.origin(&source.code).map_err(|why| private(format!("the code of {:x}: {why}", what())))?;
             for origin in &source.args {
-                self.origin(origin).map_err(|why| private(format!("a type argument of {what:x}: {why}")))?;
+                self.origin(origin).map_err(|why| private(format!("a type argument of {:x}: {why}", what())))?;
             }
         }
         Ok(Public { key, kind: Kind::Code })
@@ -315,10 +405,20 @@ impl Rule {
     }
 }
 
-/// `value` as a path when it is an absolute one.
-fn absolute(value: &OsString) -> Option<PathBuf> {
-    let path = Path::new(value);
-    path.is_absolute().then(|| path.to_path_buf())
+/// `f` of the instance keys of `sources`, in their order: on the stack for as many bodies as
+/// one function builds in.
+fn with_keys<R>(sources: &[FnSource], f: impl FnOnce(&[InstanceKey]) -> R) -> R {
+    const INLINE: usize = 16;
+    if sources.len() > INLINE {
+        // alloc: more bodies built into one function than are kept inline.
+        let keys: Vec<InstanceKey> = sources.iter().map(|it| it.instance.key()).collect();
+        return f(&keys);
+    }
+    let mut keys = [InstanceKey(ContentId([0; 32])); INLINE];
+    for (key, source) in keys.iter_mut().zip(sources) {
+        *key = source.instance.key();
+    }
+    f(&keys[..sources.len()])
 }
 
 /// What no published value may hold: the publisher's seed, and every value of the
@@ -410,10 +510,10 @@ mod tests {
     }
 
     fn rule() -> Rule {
-        Rule {
-            toolchain: TOOLCHAIN,
-            systems: vec![SYSTEM],
-            roots: vec![
+        Rule::new(
+            TOOLCHAIN,
+            vec![SYSTEM],
+            vec![
                 Root { path: "/reg/serde-1.0.219".into(), origin: serde() },
                 Root { path: "/toolchain".into(), origin: Origin::Toolchain(TOOLCHAIN) },
                 Root { path: "/usr".into(), origin: Origin::System(SYSTEM) },
@@ -421,8 +521,8 @@ mod tests {
                 Root { path: "/work/target/build".into(), origin: Origin::Outputs },
                 Root { path: "/reg/serde-1.0.219/vendored".into(), origin: Origin::Path },
             ],
-            public_env: vec!["TARGET".into()],
-        }
+            vec!["TARGET".into()],
+        )
     }
 
     fn private_origins() -> Vec<Origin> {
@@ -459,20 +559,69 @@ mod tests {
         assert!(rule.path(Path::new("/home/alice/.ssh/id_ed25519")).is_err());
     }
 
+    /// Paths and roots drawn from a few names, so roots nest, repeat and share prefixes.
+    fn drawn(rng: &mut blaze_ids::rng::SplitMix64, most: u64) -> PathBuf {
+        const NAMES: [&str; 6] = ["reg", "serde", "src", "a.rs", "work", "out"];
+        let mut path = PathBuf::from(if rng.next_u64() % 8 == 0 { "rel" } else { "/" });
+        for _ in 0..rng.next_u64() % most {
+            path.push(NAMES[(rng.next_u64() % NAMES.len() as u64) as usize]);
+        }
+        path
+    }
+
+    #[test]
+    fn the_indexed_lookup_is_the_longest_root_scan() {
+        let mut rng = blaze_ids::rng::SplitMix64::new(7);
+        let origins = [serde(), Origin::Workspace, Origin::Outputs, Origin::Path, Origin::Toolchain(TOOLCHAIN)];
+        for round in 0..200 {
+            let roots = (0..rng.next_u64() % 12)
+                .map(|n| Root { path: drawn(&mut rng, 5), origin: origins[n as usize % origins.len()].clone() })
+                .collect();
+            let rule = Rule::new(TOOLCHAIN, Vec::new(), roots, Vec::new());
+            for _ in 0..50 {
+                let path = drawn(&mut rng, 8);
+                assert_eq!(rule.path(&path).ok(), rule.path_scanned(&path), "round {round}: {}", path.display());
+            }
+        }
+        let doubled = Rule::new(TOOLCHAIN, Vec::new(), vec![Root { path: "/a//b/".into(), origin: serde() }], Vec::new());
+        assert_eq!(doubled.path(Path::new("/a/b/./c")), Ok(&serde()), "components, not bytes");
+        let everything = Rule::new(TOOLCHAIN, Vec::new(), vec![Root { path: "".into(), origin: Origin::Outputs }], Vec::new());
+        assert_eq!(everything.path(Path::new("/x")).ok(), Some(&Origin::Outputs), "an empty root is under everything");
+        assert_eq!(everything.path_scanned(Path::new("/x")), Some(&Origin::Outputs));
+    }
+
+    #[test]
+    fn a_path_is_classified_with_no_allocation() {
+        let rule = rule();
+        let path = Path::new("/reg/serde-1.0.219/vendored/zlib/src/deflate.c");
+        assert_eq!(rule.path(path), Ok(&Origin::Path));
+        let (found, used) = blaze_alloc_count::measure(|| rule.path(path).is_ok());
+        assert!(found);
+        assert_eq!(used, blaze_alloc_count::Used::default(), "a path's origin is found in place");
+    }
+
     #[test]
     fn a_query_is_public_when_every_input_is_and_keyed_as_the_store_keys_it() {
         let rule = rule();
         let schema = SchemaHash(ContentId([4; 32]));
         let producer = ContentId([5; 32]);
-        let inputs = [(ContentId([6; 32]), serde()), (ContentId([7; 32]), Origin::Toolchain(TOOLCHAIN))];
-        let public = rule.query(&QueryMade { schema, producer, inputs: &inputs }).unwrap();
-        assert_eq!(public.key(), Key::of(schema, producer, &[ContentId([6; 32]), ContentId([7; 32])]));
+        let inputs = [ContentId([6; 32]), ContentId([7; 32])];
+        let origins = [serde(), Origin::Toolchain(TOOLCHAIN)];
+        let made = QueryMade { schema, producer, inputs: &inputs, origins: &origins };
+        let public = rule.query(&made).unwrap();
+        assert_eq!(public.key(), Key::of(schema, producer, &inputs));
         assert_eq!(public.kind(), Kind::Query);
+        let (again, used) = blaze_alloc_count::measure(|| rule.query(&made).map(|it| it.key()));
+        assert_eq!(again, Ok(public.key()));
+        assert_eq!(used, blaze_alloc_count::Used::default(), "a public query is shown so with no allocation");
         for private in private_origins() {
-            let inputs = [(ContentId([6; 32]), serde()), (ContentId([8; 32]), private.clone())];
-            let error = rule.query(&QueryMade { schema, producer, inputs: &inputs }).unwrap_err();
-            assert_eq!(error.key, Key::of(schema, producer, &[ContentId([6; 32]), ContentId([8; 32])]));
+            let inputs = [ContentId([6; 32]), ContentId([8; 32])];
+            let origins = [serde(), private.clone()];
+            let error = rule.query(&QueryMade { schema, producer, inputs: &inputs, origins: &origins }).unwrap_err();
+            assert_eq!(error.key, Key::of(schema, producer, &inputs));
         }
+        let short = QueryMade { schema, producer, inputs: &inputs, origins: &origins[..1] };
+        assert!(rule.query(&short).unwrap_err().why.contains("1 origins for 2 inputs"));
     }
 
     fn given() -> Given {

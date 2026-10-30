@@ -16,17 +16,17 @@
 use std::{num::NonZero, ops::ControlFlow, sync::LazyLock};
 
 use base_db::{Db, Crate, CrateOrigin};
-use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr, name::Name};
+use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr_view, name::Name};
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
 use smallvec::SmallVec;
 use span::{AstIdNode, ErasedFileAstId};
 use syntax::{
-    AstNode, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxToken, T,
-    ast::{self, HasAttrs},
+    NodeOrToken, SyntaxKind, T,
+    view::{self as ast, AstNode, AstToken, HasAttrs},
 };
 
-use super::{AttrFlags, attr_value, attrs_source, collect_attrs_in, for_each_field, is_one};
+use super::{AttrFlags, Tree, attr_value, attrs_source, collect_attrs_in, for_each_field, is_one};
 use crate::{
     AdtId, AssocItemId, AttrDefId, BlockIdLt, FieldId, HasModule, ItemContainerId, ModuleDefId,
     ModuleId, ModuleIdLt, VariantId,
@@ -226,6 +226,18 @@ pub fn stability(db: &Db, def: StabilityDef) -> Option<&Stability> {
     }
 }
 
+/// What `def`'s own `#[deprecated]` says, nothing inherited: rustc's
+/// `SyntaxExtension::deprecation` of a macro.
+pub fn own_deprecation(db: &Db, def: StabilityDef) -> Option<&Deprecation> {
+    own(db, def)?.deprecation.as_ref()
+}
+
+/// What `def`'s own `#[stable]` or `#[unstable]` says in a crate with `staged_api`, nothing
+/// inherited: rustc's `SyntaxExtension::stability` of a macro.
+pub fn own_stability(db: &Db, def: StabilityDef) -> Option<&Stability> {
+    own(db, def)?.stability.as_ref()
+}
+
 fn deprecation_from(db: &Db, def: StabilityDef) -> Option<StabilityDef> {
     return match def {
         StabilityDef::Def(def) => deprecation_origin(db, def),
@@ -234,7 +246,7 @@ fn deprecation_from(db: &Db, def: StabilityDef) -> Option<StabilityDef> {
         }
     };
 
-    #[salsa::tracked(returns(copy))]
+    #[salsa::tracked(returns(copy), mem_tag = Nameres)]
     fn deprecation_origin(db: &Db, def: AttrDefId) -> Option<StabilityDef> {
         deprecation_or_parent(db, def.into(), || parent(db, def))
     }
@@ -268,7 +280,7 @@ fn stability_from(db: &Db, def: StabilityDef) -> Option<StabilityFrom> {
         }
     };
 
-    #[salsa::tracked(returns(copy))]
+    #[salsa::tracked(returns(copy), mem_tag = Nameres)]
     fn stability_origin(db: &Db, def: AttrDefId) -> Option<StabilityFrom> {
         let inherits = matches!(def, AttrDefId::EnumVariantId(_));
         stability_or_parent(db, def.into(), def.krate(db), || parent(db, def), inherits)
@@ -338,39 +350,42 @@ fn own(db: &Db, def: StabilityDef) -> Option<&Own> {
     (own != NONE).then_some(own)
 }
 
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 fn own_of_def(db: &Db, def: AttrDefId) -> Own {
-    let (source, outer_mod_decl, extra_crate_attrs, krate) = attrs_source(db, def);
+    let (source, outer_mod_decl, crate_attrs, krate) = attrs_source(db, def, Tree::Live);
     let context = Context::of(db, krate);
     let mut reader = Reader::default();
-    collect_attrs_in(db, &source, outer_mod_decl, extra_crate_attrs, krate, |meta| {
-        reader.read(&context, meta, |value| attr_value(db, def, krate, source.with_value(value)));
+    collect_attrs_in(db, source, outer_mod_decl, crate_attrs, krate, |meta, file| {
+        reader.read(&context, meta, |value| attr_value(db, def, krate, InFile::new(file, value)));
         ControlFlow::<()>::Continue(())
     });
     reader.finish()
 }
 
 /// The own attributes of each field of `variant` its cfg leaves in, by `LocalFieldId`.
-#[salsa::tracked(returns(ref))]
+#[salsa::tracked(returns(ref), mem_tag = Nameres)]
 fn own_of_fields(db: &Db, variant: VariantId) -> Box<[Own]> {
     let krate = variant.krate(db);
     let context = Context::of(db, krate);
-    let mut fields = Vec::new();
-    for_each_field(db, variant, |_, cfg, field| {
-        let mut reader = Reader::default();
-        expand_cfg_attr(
-            field.value.attrs(),
-            || cfg,
-            |meta, _| {
-                reader.read(&context, meta, |value| {
-                    attr_value(db, variant.into(), krate, field.with_value(value))
-                });
-                ControlFlow::<()>::Continue(())
-            },
-        );
-        fields.push(reader.finish());
-    });
-    fields.into_boxed_slice()
+    blaze_mem::frame::current(|frame| {
+        let mut fields = Vec::new_in(frame);
+        for_each_field(db, variant, Tree::Live, |_, cfg, field| {
+            let mut reader = Reader::default();
+            expand_cfg_attr_view(
+                field.value.attrs(),
+                || cfg,
+                |meta, _| {
+                    reader.read(&context, meta, |value| {
+                        attr_value(db, variant.into(), krate, field.with_value(value))
+                    });
+                    ControlFlow::<()>::Continue(())
+                },
+            );
+            fields.push(reader.finish());
+        });
+        // alloc: the memo's fields, exact, once per variant whose fields' stability is asked
+        fields.drain(..).collect()
+    })
 }
 
 /// What the parse of a crate's attributes depends on.
@@ -398,31 +413,31 @@ struct Reader {
 }
 
 impl Reader {
-    fn read(
+    fn read<'t>(
         &mut self,
         context: &Context,
-        meta: ast::Meta,
-        expand: impl FnOnce(ast::Expr) -> Option<Symbol>,
+        meta: ast::Meta<'t>,
+        expand: impl FnOnce(ast::Expr<'t>) -> Option<Symbol>,
     ) {
         let Some(path) = meta.path() else { return };
-        if is_one(&path, "deprecated") {
+        if is_one(path, "deprecated") {
             if self.deprecation.is_none() {
-                self.deprecation = parse_deprecation(context, &meta, expand);
+                self.deprecation = parse_deprecation(context, meta, expand);
             }
-        } else if is_one(&path, "stable") || is_one(&path, "unstable") {
+        } else if is_one(path, "stable") || is_one(path, "unstable") {
             // A stability attribute outside a staged crate is an error, and gives nothing.
             if context.staged
                 && self.stability.is_none()
-                && let ast::Meta::TokenTreeMeta(list) = &meta
-                && let Some(items) = list.token_tree().as_ref().and_then(items)
+                && let ast::Meta::TokenTreeMeta(list) = meta
+                && let Some(items) = list.token_tree().and_then(items)
             {
-                self.stability = match is_one(&path, "unstable") {
+                self.stability = match is_one(path, "unstable") {
                     true => parse_unstable(&items),
                     false => parse_stable(&items),
                 };
             }
-        } else if is_one(&path, "rustc_allowed_through_unstable_modules")
-            && let ast::Meta::KeyValueMeta(meta) = &meta
+        } else if is_one(path, "rustc_allowed_through_unstable_modules")
+            && let ast::Meta::KeyValueMeta(meta) = meta
             && let Some(value) = meta.expr().and_then(string_literal)
         {
             self.allowed_through_unstable_modules = Some(value);
@@ -445,18 +460,18 @@ impl Reader {
 /// `DeprecationParser`: `#[deprecated]`, `#[deprecated = ".."]` or `#[deprecated(since =
 /// "..", note = "..", suggestion = "..")]`. `expand` reads a key-value attribute's value, with
 /// its macros expanded.
-fn parse_deprecation(
+fn parse_deprecation<'t>(
     context: &Context,
-    meta: &ast::Meta,
-    expand: impl FnOnce(ast::Expr) -> Option<Symbol>,
+    meta: ast::Meta<'t>,
+    expand: impl FnOnce(ast::Expr<'t>) -> Option<Symbol>,
 ) -> Option<Deprecation> {
     let (mut since, mut note, mut suggestion) = (None, None, None);
     match meta {
         ast::Meta::PathMeta(_) => {}
         ast::Meta::KeyValueMeta(meta) => note = Some(expand(meta.expr()?)?),
         ast::Meta::TokenTreeMeta(meta) => {
-            for (key, value) in items(&meta.token_tree()?)? {
-                let slot = match key_text(&key) {
+            for (key, value) in items(meta.token_tree()?)? {
+                let slot = match key_text(key) {
                     "since" => &mut since,
                     "note" => &mut note,
                     "suggestion" => &mut suggestion,
@@ -486,10 +501,10 @@ fn parse_deprecation(
 }
 
 /// `parse_stability`: `#[stable(feature = "..", since = "..")]`.
-fn parse_stable(items: &Items) -> Option<Stability> {
+fn parse_stable(items: &Items<'_>) -> Option<Stability> {
     let (mut feature, mut since) = (None, None);
     for (key, value) in items {
-        let slot = match key_text(key) {
+        let slot = match key_text(*key) {
             "feature" => &mut feature,
             "since" => &mut since,
             _ => return None,
@@ -512,12 +527,12 @@ fn parse_stable(items: &Items) -> Option<Stability> {
 
 /// `parse_unstability`: `#[unstable(feature = "..", issue = "..", reason = "..", soft,
 /// implied_by = "..", old_name = "..")]`.
-fn parse_unstable(items: &Items) -> Option<Stability> {
+fn parse_unstable(items: &Items<'_>) -> Option<Stability> {
     let (mut feature, mut reason, mut issue, mut implied_by, mut old_name) =
         (None, None, None, None, None);
     let mut is_soft = false;
     for (key, value) in items {
-        let slot = match key_text(key) {
+        let slot = match key_text(*key) {
             "feature" => &mut feature,
             "reason" => &mut reason,
             "issue" => &mut issue,
@@ -545,21 +560,22 @@ fn parse_unstable(items: &Items) -> Option<Stability> {
 }
 
 /// An attribute list's item: its key, and what follows it.
-type Items = SmallVec<[(SyntaxToken, Value); 4]>;
+type Items<'t> = SmallVec<[(ast::Token<'t>, Value<'t>); 4]>;
 
-enum Value {
+enum Value<'t> {
     /// Nothing: `soft`.
     Word,
     /// `= "string"`.
-    Str(ast::String),
+    Str(ast::String<'t>),
     /// Anything else, which no key takes as its value.
     Other,
 }
 
 /// The items of an attribute's list, each starting with a name; `None` when one doesn't (a
 /// literal, rustc's "unsupported literal") or one is empty but the last.
-fn items(tt: &ast::TokenTree) -> Option<Items> {
-    let mut tokens: SmallVec<[NodeOrToken<SyntaxNode, SyntaxToken>; 16]> =
+fn items(tt: ast::TokenTree<'_>) -> Option<Items<'_>> {
+    let mut tokens: SmallVec<[ast::Element<'_>; 16]> =
+        // alloc: a 16-element stack buffer; spills only for a longer attribute list
         tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).skip(1).collect();
     if tokens.last().is_some_and(|it| it.kind() == T![')']) {
         tokens.pop();
@@ -581,29 +597,29 @@ fn items(tt: &ast::TokenTree) -> Option<Items> {
             [NodeOrToken::Token(eq), NodeOrToken::Token(value)]
                 if eq.kind() == T![=] && value.kind() == SyntaxKind::STRING =>
             {
-                ast::String::cast(value.clone()).map_or(Value::Other, Value::Str)
+                ast::String::cast(*value).map_or(Value::Other, Value::Str)
             }
             _ => Value::Other,
         };
-        items.push((key.clone(), value));
+        items.push((*key, value));
     }
     Some(items)
 }
 
-fn key_text(key: &SyntaxToken) -> &str {
+fn key_text(key: ast::Token<'_>) -> &str {
     let text = key.text();
     text.strip_prefix("r#").unwrap_or(text)
 }
 
 /// `insert_value_into_option_or_error`: a key given once, its value a string.
-fn insert(slot: &mut Option<Symbol>, value: &Value) -> Option<()> {
+fn insert(slot: &mut Option<Symbol>, value: &Value<'_>) -> Option<()> {
     let (None, Value::Str(value)) = (&slot, value) else { return None };
     *slot = Some(Symbol::intern(&value.value().ok()?));
     Some(())
 }
 
 /// The string literal `expr` is, through parentheses.
-fn string_literal(mut expr: ast::Expr) -> Option<Symbol> {
+fn string_literal(mut expr: ast::Expr<'_>) -> Option<Symbol> {
     while let ast::Expr::ParenExpr(paren) = &expr {
         expr = paren.expr()?;
     }
@@ -670,14 +686,14 @@ fn in_module(db: &Db, module: ModuleId) -> Option<StabilityDef> {
 /// ancestors, through the macro calls it is expanded from, that is one. A block def map
 /// exists only for a block a definition's syntax holds, so there is always one; not finding
 /// it is a bug of the def maps, and stops.
-#[salsa::tracked(returns(copy))]
+#[salsa::tracked(returns(copy), mem_tag = Nameres)]
 fn block_owner<'db>(db: &'db Db, block: BlockIdLt<'db>) -> StabilityDef {
     let ast_id = block.ast_id(db);
     let module = block.module(db);
-    InFile::new(ast_id.file_id, ast_id.to_node(db).syntax().clone())
-        .parent_ancestors_with_macros(db)
+    InFile::new(ast_id.file_id, ast_id.to_view(db).syntax())
+        .parent_ancestors_with_macros_view(db)
         .find(|it| is_definition(it.value.kind()))
-        .and_then(|node| definition_at(db, module, &node))
+        .and_then(|node| definition_at(db, module, node))
         .unwrap_or_else(|| {
             panic!("no definition of its module holds the block at {ast_id:?} with items")
         })
@@ -705,7 +721,7 @@ fn is_definition(kind: SyntaxKind) -> bool {
 fn definition_at(
     db: &Db,
     module: ModuleIdLt<'_>,
-    node: &InFile<SyntaxNode>,
+    node: InFile<ast::Node<'_>>,
 ) -> Option<StabilityDef> {
     let file = node.file_id;
     match node.value.kind() {
@@ -713,7 +729,7 @@ fn definition_at(
             let owner = node.value.ancestors().find(|it| {
                 matches!(it.kind(), SyntaxKind::STRUCT | SyntaxKind::UNION | SyntaxKind::VARIANT)
             })?;
-            let variant = match definition_at(db, module, &node.with_value(owner))? {
+            let variant = match definition_at(db, module, node.with_value(owner))? {
                 StabilityDef::Def(AttrDefId::AdtId(AdtId::StructId(it))) => VariantId::StructId(it),
                 StabilityDef::Def(AttrDefId::AdtId(AdtId::UnionId(it))) => VariantId::UnionId(it),
                 StabilityDef::Def(AttrDefId::EnumVariantId(it)) => VariantId::EnumVariantId(it),
@@ -721,7 +737,7 @@ fn definition_at(
             };
             let range = node.value.text_range();
             let mut found = None;
-            for_each_field(db, variant, |at, _, field| {
+            for_each_field(db, variant, Tree::Live, |at, _, field| {
                 if field.file_id == file && field.value.syntax().text_range() == range {
                     found = Some(at);
                 }
@@ -732,11 +748,14 @@ fn definition_at(
         SyntaxKind::VARIANT => {
             let owner = node.value.ancestors().find(|it| it.kind() == SyntaxKind::ENUM)?;
             let StabilityDef::Def(AttrDefId::AdtId(AdtId::EnumId(it))) =
-                definition_at(db, module, &node.with_value(owner))?
+                definition_at(db, module, node.with_value(owner))?
             else {
                 return None;
             };
-            let id = file.ast_id_map(db).ast_id(&ast::Variant::cast(node.value.clone())?).erase();
+            let id = file
+                .ast_id_map(db)
+                .ast_id_of_view::<syntax::ast::Variant>(ast::Variant::cast(node.value)?)
+                .erase();
             it.enum_variants(db)
                 .variants
                 .values()
@@ -744,7 +763,10 @@ fn definition_at(
                 .map(|(variant, _)| AttrDefId::EnumVariantId(*variant).into())
         }
         _ => {
-            let id = file.ast_id_map(db).ast_id(&ast::Item::cast(node.value.clone())?).erase();
+            let id = file
+                .ast_id_map(db)
+                .ast_id_of_view::<syntax::ast::Item>(ast::Item::cast(node.value)?)
+                .erase();
             let scope = module.def_map(db).module(db, module).scope(db);
             let in_items = |items: &[(Name, AssocItemId)]| -> Option<StabilityDef> {
                 items.iter().find_map(|&(_, item)| {

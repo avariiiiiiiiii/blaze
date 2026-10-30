@@ -357,7 +357,7 @@ fn predicted(history: &History, id: u32, deps: &[u32], key: Key) -> Spec {
 /// What the plane gives on opening one request of `specs` and closing it.
 fn open(plane: &mut Plane, specs: Vec<Spec>) -> Vec<PlaneOutput> {
     let request = RequestId(1);
-    let mut out = plane.step(PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true }).unwrap();
+    let mut out = plane.step(PlaneInput::Open { at_ns: 0, request, weight: 1, keep_going: true, idle: false }).unwrap();
     out.extend(plane.step(PlaneInput::Add { at_ns: 0, request, nodes: specs }).unwrap());
     out.extend(plane.step(PlaneInput::Close { at_ns: 0, request }).unwrap());
     out
@@ -470,4 +470,77 @@ fn a_history_is_the_planes_predictor() {
     assert_eq!((p.cost, p.peak), (Some(3_000_000), 4096));
     let back = History::decode(&predict.encode(), config(16)).unwrap();
     assert_eq!(back.predict(KIND, Some(&key)), p);
+}
+
+/// The median of the first `seen` of `runs` (at most [`RUNS`]) by sorting them: the reference
+/// [`Record::ran_us`] is held to.
+fn sorted_median(runs: [u32; RUNS], seen: u32) -> u64 {
+    let mut last: Vec<u64> = runs[..(seen as usize).min(RUNS)].iter().map(|&it| u64::from(it)).collect();
+    last.sort_unstable();
+    match last.len() {
+        0 => 0,
+        n if n % 2 == 1 => last[n / 2],
+        n => (last[n / 2 - 1] + last[n / 2]).div_ceil(2),
+    }
+}
+
+#[test]
+fn the_median_of_mins_and_maxes_is_the_sorted_one() {
+    let mut random = SplitMix64::new(11);
+    for _ in 0..100_000 {
+        let seen = random.below(7) as u32;
+        let width = [4, 12, 32][random.index(3)];
+        let runs: [u32; RUNS] = std::array::from_fn(|_| random.below(1 << width) as u32);
+        let record = Record { kind: KIND, key: [1, 2], seen, stamp: 1, peak: 0, runs };
+        assert_eq!(record.ran_us(), sorted_median(runs, seen), "{runs:?}, seen {seen}");
+    }
+    // Every order of four runs of four values, ties included, up to the most a run can be.
+    for code in 0..256u32 {
+        let runs = [code & 3, (code >> 2) & 3, (code >> 4) & 3, code >> 6].map(|it| it * (u32::MAX / 3));
+        for seen in 0..=5 {
+            let record = Record { kind: KIND, key: [1, 2], seen, stamp: 1, peak: 0, runs };
+            assert_eq!(record.ran_us(), sorted_median(runs, seen), "{runs:?}, seen {seen}");
+        }
+    }
+}
+
+#[test]
+fn a_record_after_an_empty_way_is_refused() {
+    let mut history = History::new(config(16));
+    history.observe(KIND, Some(&same_bucket(1)), 1000, 1);
+    history.observe(KIND, Some(&same_bucket(2)), 1000, 1);
+    let bytes = history.encode();
+    let estimates = u64::from_le_bytes(bytes[32..40].try_into().unwrap()) as usize;
+    let kinds_at = 40 + estimates + 8;
+    let kinds = u64::from_le_bytes(bytes[kinds_at - 8..kinds_at].try_into().unwrap()) as usize;
+    let records_at = kinds_at + kinds * KIND_BYTES + 8;
+    assert_eq!(bytes.len(), records_at + 2 * RECORD_BYTES);
+    let second_at = records_at + RECORD_BYTES;
+    let second = u32::from_le_bytes(bytes[second_at..second_at + 4].try_into().unwrap());
+    assert_ne!(second as usize % WAYS, 0, "the second key takes its bucket's second way");
+    // The second record alone: the first way of its bucket is empty.
+    let mut gapped = bytes[..records_at].to_vec();
+    gapped[records_at - 8..].copy_from_slice(&1u64.to_le_bytes());
+    gapped.extend_from_slice(&bytes[second_at..]);
+    assert_eq!(History::decode(&gapped, config(16)).map(|_| ()), Err(DecodeError::Gap { slot: second }));
+    assert!(History::decode(&bytes, config(16)).is_ok());
+}
+
+#[test]
+fn predicting_and_observing_allocate_nothing() {
+    let mut history = History::new(config(64));
+    let (seen, unseen) = (same_bucket(1), same_bucket(2));
+    history.observe(KIND, Some(&seen), 2_000_000, 64);
+    let reader = history.reader();
+    blaze_alloc_count::assert_at_most(0, "a seen key's prediction", || history.predict(KIND, Some(&seen)));
+    blaze_alloc_count::assert_at_most(0, "an unseen key's prediction", || history.predict(KIND, Some(&unseen)));
+    blaze_alloc_count::assert_at_most(0, "a keyless prediction", || history.predict(KIND, None));
+    blaze_alloc_count::assert_at_most(0, "an unseen kind's prediction", || history.predict(TaskKind(77), Some(&seen)));
+    blaze_alloc_count::assert_at_most(0, "a reader's read", || reader.get(KIND, &seen));
+    blaze_alloc_count::assert_at_most(0, "observing a seen kind's seen key, new key and no key", || {
+        history.observe(KIND, Some(&seen), 1_000_000, 32);
+        history.observe(KIND, Some(&unseen), 1_000_000, 32);
+        history.observe(KIND, None, 1_000_000, 32);
+    });
+    assert_eq!(reader.get(KIND, &unseen).map(|it| it.seen), Some(1));
 }

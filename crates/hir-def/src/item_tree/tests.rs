@@ -6,7 +6,7 @@ use span::Edition;
 use test_fixture::WithFixture;
 
 use crate::{
-    item_tree::{ItemTree, ModItemKind},
+    item_tree::{ItemTree, ModItemKind, RawVisibility},
     test_db::TestDB,
 };
 
@@ -420,7 +420,7 @@ fn an_edit_of_one_item_changes_only_its_rows() {
     db.set_file_text(file_id.file_id(&db), &EDITED.replace("pub fn f(", "pub fn renamed("));
     let (after, _) = owned_tree(&db, file);
 
-    let f = (before.top_level.iter().copied())
+    let f = (before.top_level().iter().copied())
         .find(|&item| {
             matches!(before.index(item), ModItemKind::Function(_, it) if before[it.name].as_str() == "f")
         })
@@ -428,20 +428,22 @@ fn an_edit_of_one_item_changes_only_its_rows() {
     let ModItemKind::Function(_, it) = after.index(f) else { panic!("`f`'s row is a fn") };
     assert_eq!(after[it.name].as_str(), "renamed");
 
-    assert_eq!(after.top_level, before.top_level);
-    assert_eq!(after.kinds, before.kinds);
-    assert_eq!(after.data, before.data);
-    assert_eq!(after.functions, before.functions);
-    assert_eq!(after.children, before.children);
-    assert_eq!((&after.structs, &after.mods, &after.uses), (&before.structs, &before.mods, &before.uses));
-    for (at, (old, new)) in before.ast_ids.iter().zip(&after.ast_ids).enumerate() {
+    assert_eq!(after.top_level(), before.top_level());
+    assert_eq!(after.kinds(), before.kinds());
+    assert_eq!(after.data(), before.data());
+    assert_eq!(after.functions(), before.functions());
+    assert_eq!(after.children(), before.children());
+    assert_eq!(
+        (after.structs(), after.mods(), after.uses()),
+        (before.structs(), before.mods(), before.uses())
+    );
+    for (at, (old, new)) in before.ast_ids().iter().zip(after.ast_ids()).enumerate() {
         if at != f.index as usize {
             assert_eq!(old, new, "the ast id of item {at}, not the one edited");
         }
     }
-    let changed: Vec<usize> = (0..before.names.len())
-        .filter(|&at| before.names[at] != after.names[at])
-        .collect();
+    let changed: Vec<usize> =
+        (0..before.names().len()).filter(|&at| before.names()[at] != after.names()[at]).collect();
     assert_eq!(changed, [it.name.raw as usize], "only the edited item's name");
 }
 
@@ -517,11 +519,11 @@ fn attributes_are_found_as_a_search_of_their_owners_finds_them() {
         .collect();
     let (db, file_id) = TestDB::with_single_file(&format!("#![c]\n{items}"));
     let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
-    assert!(tree.kinds.len() > 128, "more than two blocks of items");
-    for index in 0..tree.kinds.len() as u32 {
+    assert!(tree.kinds().len() > 128, "more than two blocks of items");
+    for index in 0..tree.kinds().len() as u32 {
         let id = ModItemId::new(index);
-        let searched = (tree.attr_owners.binary_search_by_key(&id, |owner| owner.owner).ok())
-            .map(|at| tree.attrs_of(&tree.attr_owners[at]));
+        let searched = (tree.attr_owners().binary_search_by_key(&id, |owner| owner.owner).ok())
+            .map(|at| tree.attrs_of(&tree.attr_owners()[at]));
         match (tree.attrs(id), searched) {
             (None, None) => {}
             (Some(found), Some(searched)) => assert!(same(found, searched), "item {index}"),
@@ -555,43 +557,16 @@ mac!();
 pub fn f() {}
 "#;
 
-/// The columns of `tree` that hold anything: lowering on a warm builder and decoding allocate
-/// once for each.
-fn non_empty_columns(tree: &ItemTree) -> u64 {
-    let lens = [
-        tree.top_level.len(),
-        tree.kinds.len(),
-        tree.data.len(),
-        tree.ast_ids.len(),
-        tree.children.len(),
-        tree.consts.len(),
-        tree.enums.len(),
-        tree.extern_blocks.len(),
-        tree.extern_crates.len(),
-        tree.functions.len(),
-        tree.impls.len(),
-        tree.macro2s.len(),
-        tree.macro_calls.len(),
-        tree.macro_rules.len(),
-        tree.mods.len(),
-        tree.statics.len(),
-        tree.structs.len(),
-        tree.traits.len(),
-        tree.type_aliases.len(),
-        tree.unions.len(),
-        tree.uses.len(),
-        tree.use_trees.len(),
-        tree.use_tree_lists.len(),
-        tree.ctor_vis.len(),
-        tree.names.len(),
-        tree.paths.len(),
-        tree.vis.len(),
-        tree.attr_owners.len(),
-        tree.attr_index.len(),
-        tree.attrs.len(),
-        tree.cfgs.len(),
-    ];
-    lens.iter().filter(|&&len| len > 0).count() as u64
+/// The paths with segments a decode of `tree` reads, of its paths, visibilities and attributes:
+/// each a `Vec` of its names (`Code for ModPath` in `crate::hir::persist`).
+fn decoded_paths(tree: &ItemTree) -> u64 {
+    let vis = tree.vis().iter().filter_map(|vis| match vis {
+        RawVisibility::Module(path, _) => Some(path),
+        _ => None,
+    });
+    let attrs = tree.attr_list().iter().map(|attr| &attr.path);
+    (tree.paths().iter().chain(vis).chain(attrs)).filter(|path| !path.segments().is_empty()).count()
+        as u64
 }
 
 /// Reads every item under `items` through the accessors the def map collector uses; returns how
@@ -636,7 +611,7 @@ fn read_all(tree: &ItemTree, items: &[crate::item_tree::ModItemId]) -> usize {
 fn reading_a_tree_allocates_nothing() {
     let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
     let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
-    assert_eq!(read_all(tree, tree.top_level_items()), tree.kinds.len(), "every item read");
+    assert_eq!(read_all(tree, tree.top_level_items()), tree.kinds().len(), "every item read");
     blaze_alloc_count::assert_at_most(0, "reading every item of a tree", || {
         std::hint::black_box(read_all(tree, tree.top_level_items()));
         std::hint::black_box(tree.top_level_attrs());
@@ -664,27 +639,26 @@ fn expanding_use_trees_whose_paths_are_interned_allocates_nothing() {
 }
 
 #[test]
-fn a_warm_builder_lowers_a_file_in_one_allocation_a_column() {
+fn a_warm_builder_lowers_a_file_in_one_allocation() {
     let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
     let (file, krate) = (HirFileId::from(file_id), db.test_crate());
     let cold = super::lower_whole(&db, file, krate);
-    let columns = non_empty_columns(&cold);
-    let warm = blaze_alloc_count::assert_at_most(columns, "lowering on a warm builder", || {
+    let warm = blaze_alloc_count::assert_at_most(1, "lowering on a warm builder", || {
         super::lower_whole(&db, file, krate)
     });
     assert_eq!(warm, cold);
 }
 
 #[test]
-fn decoding_a_tree_allocates_once_a_column() {
+fn decoding_a_tree_allocates_its_block_and_its_paths() {
     let (db, file_id) = TestDB::with_single_file(EVERY_KIND);
     let tree = crate::file_item_tree(&db, file_id.into(), db.test_crate());
     let buffer = blaze_format::Aligned::copy_from(&blaze_format::to_bytes(tree));
     let read = ItemTree::read(&buffer).expect("a tree written");
     assert_eq!(read.decode().expect("a tree written"), *tree);
     let decoded = blaze_alloc_count::assert_at_most(
-        non_empty_columns(tree),
-        "decoding a tree whose names are interned",
+        1 + decoded_paths(tree),
+        "decoding a tree whose names and paths are interned",
         || read.decode().expect("a tree written"),
     );
     assert_eq!(decoded, *tree);

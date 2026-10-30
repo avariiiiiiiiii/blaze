@@ -83,6 +83,20 @@ fn rerun_after(from: &str, to: &str) -> (usize, usize, Vec<String>) {
 }
 
 #[test]
+fn a_warm_check_of_every_body_allocates_nothing() {
+    let (db, _) = fixture();
+    crate::attach_db(&db, || {
+        let bodies = BODIES.map(|name| function(&db, name));
+        blaze_alloc_count::assert_at_most(0, "a warm check of every body", || {
+            for f in bodies {
+                InferenceResult::of(&db, InferBodyId::DefWithBodyId(f));
+                hir_ty_borrowck::borrowck(&db, f);
+            }
+        });
+    });
+}
+
+#[test]
 fn a_body_edit_reinfers_only_that_body() {
     let (infer, borrowck, executed) = rerun_after("let x = 2;", "let x = 25;");
     assert_eq!(infer, 1, "only `edited`: {executed:#?}");

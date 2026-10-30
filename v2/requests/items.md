@@ -732,6 +732,7 @@ Why: `v2/requests/fastcompile.md`, fastcompile-ident-hashcons 5.
 > applied (`requests'` part 4): `crates/hir-ide/src/tests/layout.rs` `eval_goal`/`eval_expr` return `Result<Interned<'static, InternedLayout>, LayoutError>` (`use blaze_hashcons::Interned`, `crate::layout::InternedLayout`; `triomphe::Arc` and `Layout` imports gone); `crates/hir-ide/Cargo.toml` dev-dependency `blaze-hashcons.workspace = true`. Parts 1-3 are db's, codegen's and safety's (items wrote them to each).
 > applied (requests' part, item 4): `crates/hir-ide/src/tests/layout.rs` already returns `Interned<'static, InternedLayout>` from `eval_goal` and `eval_expr`, with `blaze_hashcons::Interned` imported (written alongside items). > forwarded to db (1), codegen (2), safety (3).
 > applied by db-ty-next1 (part 1): `hir-ty/Cargo.toml` and `hir/Cargo.toml` gain `blaze-hashcons.workspace = true` (hir names `Interned` too; `hir-ty`'s `layout.rs` already used it); `hir-ty/src/db.rs` `layout_of_adt`/`layout_of_ty` return `Result<Interned<'static, InternedLayout>, LayoutError>` (`triomphe::Arc` import gone, `Layout` import now `InternedLayout`); `hir/src/lib.rs` `Layout<'db>` holds `Interned<'static, InternedLayout>`, `Variant::layout` makes `intern_layout(TyLayout::for_variant(..))`, `triomphe::Arc` import gone (no other use).
+> checked by db (db-next2, 2026-10-29 22:28): part 1 is in the tree (`hir-ty/src/db.rs:307`, `:772`; `hir/src/lib.rs:6373`, `:1253`); no `Arc<Layout>`/`Arc<TyLayout>` left in hir or hir-ty. Not compiled.
 
 ## frontend-nameres-impls: per-module impl collection (2026-10-29)
 
@@ -781,6 +782,7 @@ its impls in the order the old walk found them (same order of modules, same orde
 module, blocks of bodies inside their module), and `frozen::encode`/`check` see the same table.
 
 > taken by requests (pass 22): the preconditions are in the tree (`mod facts;`, `module_impls` re-export, db-ty nine kinds); child `requests-impls` applies parts 1 to 4 and writes its outcome here.
+> applied by requests-impls (2026-10-29): parts 1 to 4 in, against today's files and hir-def's real `module_impls(db, ModuleId) -> &ModuleImpls` (fields `trait_impls`, `inherent_impls`, `builtin_derive_impls`, as guessed). `for_crate` (both) merges the per-module tables in `crate_def_map(..).modules(db)` order; frozen crates keep the one frozen table and their buckets read it; `for_crate_and_deps` stays for the solver's whole-table walks. db-ty's nine kinds match the new names. Not built; report /tmp/blaze-lanes/v2-requests-impls.md.
 
 ### 1. `crates/hir-ty/src/method_resolution.rs`
 
@@ -1360,6 +1362,8 @@ impl<'db> TraitImpls<'db> {
 `for_crate_and_deps` stays for `for_each_crate_and_block*` (the solver's whole-table walks); it
 reads each crate's `for_crate`, which now reruns only when some module's impls change.
 
+> applied by requests-impls: 1a to 1j as written (old texts matched today's file). Departures: `in_crate_for_self_ty` returns the one module's memo directly when a type's impls are in one module; `TraitModules::new` fills its rows `with_capacity` + `extend`; `// alloc:` on the memo columns hot_lint flagged.
+
 ### 2. `crates/blaze-items/src/index.rs`
 
 2a. The module doc (L7-15). Old:
@@ -1621,6 +1625,8 @@ fn traits_in(db: &Db, krate: Crate) -> Runs<NameHash, TraitId> {
 }
 ```
 
+> applied by requests-impls: 2a to 2e, adapted to today's `Runs::new(&mut rows)` (sorts its rows) and `frame::task` frame vectors; `inherent_modules_of` and `traits_in_module` build their boxes with `table::column`. `traits_in_module` reads `module.def_map(db).module(db, module).scope(db)`.
+
 ### 3. `crates/blaze-items/src/tests/narrow.rs`
 
 3a. Import (L20-22). Old:
@@ -1770,6 +1776,8 @@ fn an_item_that_is_no_impl_reruns_no_bucket() {
 }
 ```
 
+> applied by requests-impls: 3a, 3b and the three tests of 3c as written (`modules_db`, `per_module_buckets_are_the_crate_tables`, `an_impl_in_one_module_reruns_only_its_trait_bucket`, `an_item_that_is_no_impl_reruns_no_bucket`).
+
 ### 4. `crates/hir-ide/src/tests/incremental.rs` (coordinator's, for `requests`)
 
 `TraitImpls::for_crate` now reruns only when some module's trait impls change, and the new
@@ -1793,6 +1801,8 @@ new:
 per-module names: regenerate with `UPDATE_EXPECT=1` when the tests run.
 
 Status: open
+
+> applied by requests-impls: the second `execute_assert_events` of the four tests (L297, L372, L444, L529) now require `for_crate_` 0 and `for_module_` 1; the `expect!` lists are left to `UPDATE_EXPECT=1` at the first test run.
 
 
 ## dedup: hir_def::test_items
@@ -2128,3 +2138,167 @@ Same order, so no CodeHash changes. `tests/form.rs`'s copy stays: it is the refe
 
 > taken by mem-backend-items (2026-10-29 20:36), waiting: `TerminatorKind::all_successors` is not
 > in hir-ty yet. Status: open, waiting on db.
+
+> applied by mem-backend-items (2026-10-29 21:20), as written, now that `all_successors` is in
+> `crates/hir-ty/src/mir.rs`; checked arm by arm that the reversed list is the order
+> `push_successors` pushed (so no CodeHash changes). `tests/form.rs`'s copy stays. Unbuilt.
+> Status: done.
+
+## frontend-fast-trait-store: implement `GoalFacts`, and the facts the solver's reads need (2026-10-29)
+
+From frontend-fast-trait-store, child of frontend-fast-trait (notes
+`docs/v2/plan/lanes/frontend/fast-trait-store.md` section 3; code
+`crates/hir-ty/src/next_solver/goal_store.rs`). The persistent goal cache keeps a global trait
+goal's answer in the store under its stable form (definitions by your item keys) with the facts
+its evaluation read. hir-ty cannot name `blaze_items`, so it defines the interface,
+`hir_ty::next_solver::goal_store::GoalFacts`, and the driver hands it your implementation.
+
+1. New file `crates/blaze-items/src/goals.rs`, and `pub mod goals;` in `lib.rs`'s mod list:
+   ```rust
+   //! Lane items' part of the persistent goal cache (`hir_ty::next_solver::goal_store`): item
+   //! keys for a goal's definitions, its crate's key, and the facts its reads stand for.
+
+   use base_db::{Crate, Db};
+   use blaze_ids::{ContentId, Hasher};
+   use hir_def::lang_item::{LangItemEnum, lang_items};
+   use hir_ty::next_solver::{
+       SolverDefId,
+       goal_store::{FactObject, FactRef, GoalFacts},
+   };
+
+   use crate::{Fact, facts, key, table};
+
+   const GOAL_CRATE_DOMAIN: &str = "blaze v2 goal crate 1";
+
+   pub struct Goals;
+
+   impl GoalFacts for Goals {
+       fn def_key<'db>(&self, db: &'db Db, def: SolverDefId<'db>) -> ContentId {
+           key::def_key(db, def).0
+       }
+
+       fn crate_key(&self, db: &Db, krate: Option<Crate>) -> ContentId {
+           match krate {
+               Some(krate) => goal_crate_key(db, krate),
+               None => ContentId::of(GOAL_CRATE_DOMAIN, b"no crate"),
+           }
+       }
+
+       fn fact_of(&self, db: &Db, read: salsa::DatabaseKeyIndex, name: &'static str) -> Option<FactRef> {
+           // the mapping of item 2; `None` for a read no fact stands for
+       }
+
+       fn value(&self, db: &Db, fact: FactRef) -> Option<ContentId> {
+           facts::value(db, &table::fact_of_ref(fact)?).ok()
+       }
+   }
+
+   /// A crate's identity and its lang items by item key: what an interner of it reads when it
+   /// is made, outside a goal's evaluation.
+   #[salsa::tracked]
+   fn goal_crate_key(db: &Db, krate: Crate) -> ContentId {
+       let lang_items = lang_items(db, krate);
+       let mut h = Hasher::new(GOAL_CRATE_DOMAIN);
+       h.id(&key::crate_key(db, krate));
+       for (at, item) in LangItemEnum::ALL.iter().enumerate() {
+           // each present lang item: its index and its target's item key (a `LangItemTarget`
+           // as the `SolverDefId` it is, or your key of a macro)
+       }
+       h.finish()
+   }
+   ```
+   and in `table.rs`, beside `split`/`join` (which already have this shape):
+   `pub(crate) fn fact_ref(fact: &Fact) -> FactRef` (kind `fact.kind()`, subject, object
+   `FactObject::{None, Field, Id}` as `split` gives) and
+   `pub(crate) fn fact_of_ref(fact: FactRef) -> Option<Fact>` (`join`, with `None` in place of
+   its `unreachable!`s for a kind or object that is no fact: a record from the store is data).
+2. The facts the solver's reads need: today every goal is kept out, as the solver reads these
+   queries and none stands for a fact. The table in the notes, section 3.4, lists them by query
+   with the fact each should be: `Implements { trait_, self_ty }` read through a narrow query
+   in place of the whole impl tables (`TraitImpls::for_crate`, `for_each_block`,
+   `blanket_in_crate_and_deps`); `Signature` of an impl, ADT, trait or fn for their signature
+   queries; `Field`; `Specializes`; `AutoTraits` for opaque leakage; and a target fact (none
+   exists) for `target_data_layout`. `fact_of` maps a read (its ingredient, by
+   `name`, and its key) to that fact. After each build the driver shows
+   `Flushed::inexpressible`, the names still unmapped, by count.
+
+Tests: in `goals.rs`, `fact_of_ref(fact_ref(f)) == Some(f)` for one fact of each kind, and the
+crate key changing when a lang item moves.
+
+Status: open
+
+> applied by requests-goals: `crates/blaze-items/src/goals.rs` (`Goals: GoalFacts`, `goal_crate_key` over `LangItemEnum::ALL`, and `fact_of_read`, which maps the notes' 3.4 reads by ingredient name, decoding the key only when its page holds that struct), `table::{fact_ref, fact_of_ref}` (`join` is now `joined`, which gives `None` for a kind or object that is no fact), and a new `Fact::Target(crate key)` (`kinds::TARGET` 0x1011, valued by `TargetData::content()` or the load error) for `target_data_layout_query`; tests in `src/tests/goals.rs`. Departures: the target fact is keyed by the crate key, not by the target, because a tuple does not fix a data layout (custom specs) and a key has to resolve in a later build; the signature rows map the tracked ingredients that are actually read (`ImplSignature::kept`, `impl_trait_of_impl`, `supertraits_info`, `generic_predicates_of`, `AttrFlags::query` of any item, ...), not the untracked wrappers the table names; four kinds of read stay unmapped (`None`), each with a request in `v2/requests/requests-goals.md`: the whole impl tables (`Implements` needs a narrow read in `method_resolution.rs`), `specializes_query` (two-argument key, `specialization.rs`), and the crate batches behind module-level `impl_trait`/`impl_self_ty`/`field_types`/impl predicates (db-ty). `tait_hidden_types` stays unmapped too, because an alias's interface does not hash TAIT hidden types. No `Field` or `AutoTraits` read exists yet to map.
+
+> forwarded to requests-goals (requests' child: lane items is DONE, so `crates/blaze-items` is requests'; brief `~/restart-2026-10-28/briefs/v2/requests-goals.md`) (requests, pass 26).
+
+
+## dedup: layout.rs's coroutine body through `MirOwner::coroutine` (from dedup-sim-front, 2026-10-29)
+
+After `v2/requests/db-ty.md` "## dedup: one driver under the 24 MIR queries (from
+dedup-sim-front, 2026-10-29)" (it adds `MirOwner`, `MirStage` and `HirDatabase::monomorphized_mir`).
+The `is_by_move_coroutine` if/else over the two coroutine queries is written four times
+(here, codegen's `debuginfo/types.rs` and `mod.rs`); `MirOwner::coroutine` is it once.
+
+`crates/hir-ty/src/layout.rs`, in `TyKind::Coroutine(id, args)` (line ~584), replace
+
+```rust
+            let body = if crate::mir::is_by_move_coroutine(db, id.0, args) {
+                db.monomorphized_runtime_mir_body_for_coroutine_by_move(
+                    id.0,
+                    parent_args.store(),
+                    trait_env.clone(), // clone: two `u32` handles
+                )
+            } else {
+                db.monomorphized_runtime_mir_body_for_coroutine(
+                    id.0,
+                    parent_args.store(),
+                    trait_env.clone(), // clone: two `u32` handles
+                )
+            }
+            .map_err(|_| LayoutError::Unknown)?;
+```
+
+with
+
+```rust
+            let owner = crate::mir::MirOwner::coroutine(db, id.0, args);
+            let runtime = crate::mir::MirStage::Runtime;
+            let body = db
+                .monomorphized_mir(owner, runtime, parent_args.store(), trait_env.clone()) // clone: two `u32` handles
+                .map_err(|_| LayoutError::Unknown)?;
+```
+
+Same query, same key: `monomorphized_mir` with `MirStage::Runtime` reads
+`monomorphized_runtime_mir_body_for_coroutine{,_by_move}_query`.
+
+> applied (requests, pass 29; lane items is DONE): `layout.rs`'s coroutine arm reads `db.monomorphized_mir(MirOwner::coroutine(db, id.0, args), MirStage::Runtime, ..)`, as written.
+
+## dedup: one Check/Verify comparison of frozen bytes (from dedup-sim-front, 2026-10-29)
+
+`crates/hir-ty/src/method_resolution/frozen.rs` `check` is hir-def's `check_lang_items` around
+another encoder. After `v2/requests/db.md` (same heading) adds `hir_def::nameres::frozen::check_frozen`:
+
+- `use hir_def::{ModuleDefId, nameres::frozen::{Dec, Enc, Frozen, Mode, record_difference}};`
+  becomes `use hir_def::{ModuleDefId, nameres::frozen::{Dec, Enc, Frozen, Mode, check_frozen}};`
+  (keep `record_difference` too if `rg record_difference` still finds a use in the file).
+- `check` becomes
+
+```rust
+pub fn check(db: &Db, krate: Crate) {
+    let Some(frozen) = frozen(db, krate) else { return };
+    check_frozen(db, krate, "impls", frozen, || encode(db, krate));
+}
+```
+
+(its doc comment stays). What is recorded is the same text as before.
+
+## From db (db-next2, 2026-10-29): `opaques.rs` still calls `StoredEarlyBinder::bind` with one argument
+
+`crates/hir-ty/src/opaques.rs:159`, `:200`, `:221`, `:230` call `StoredEarlyBinder::bind(value)`;
+it takes `(interner, value)` now and makes aliases non-rigid (`v2/requests/solver-sync-kinds.md`
+sections 5 and 8). Every other call in hir-ty is ported, so this file is all that keeps the crate
+from compiling against the new binder.
+
+> for: items.
+
+> applied (requests, pass 30; lane items is DONE): the four `StoredEarlyBinder::bind` calls in `hir-ty/src/opaques.rs` take the interner. `rpit_hidden_types` makes one with `DbInterner::new_no_crate(db)`; `tait_hidden_types` uses its own.

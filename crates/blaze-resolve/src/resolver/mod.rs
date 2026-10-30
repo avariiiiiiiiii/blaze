@@ -76,7 +76,7 @@ use crate::poll::PollExt;
 use crate::{Dependency, PackageId, PackageIdSpec, Registry, Resolve, ResolveVersion, Summary};
 
 use self::context::ResolverContext;
-use self::dep_cache::RegistryQueryer;
+use self::dep_cache::{Query, RegistryQueryer, registry_queryer};
 use self::features::RequestedFeatures;
 use self::types::{ConflictMap, ConflictReason, DepsFrame};
 use self::types::{FeaturesSet, RcVecIter, RemainingDeps, ResolverProgress};
@@ -112,9 +112,11 @@ pub struct ResolveSettings<'a> {
     pub offline_flag: Option<&'a str>,
     /// Called once if resolving takes long, where cargo prints `Resolving dependency
     /// graph...` to a terminal.
+    // dyn: at most once per resolve, to the caller's terminal; a generic copies the resolver.
     pub on_slow: Option<&'a dyn Fn()>,
     /// The packages under a directory (name and manifest path), for the hint on a path
     /// dependency naming a package that is not there.
+    // dyn: only while wording a failed resolve's error; a generic copies the resolver.
     pub path_packages: Option<&'a dyn Fn(&Path) -> Vec<(InternedString, PathBuf)>>,
 }
 
@@ -152,7 +154,7 @@ pub fn resolve(
     settings: &ResolveSettings<'_>,
 ) -> CargoResult<Resolve> {
     let first_version = None;
-    let mut registry = RegistryQueryer::new(registry, replacements, version_prefs);
+    let mut registry = registry_queryer(registry, replacements, version_prefs);
 
     // Global cache of the reasons for each time we backtrack.
     let mut past_conflicting_activations = conflict_cache::ConflictCache::new();
@@ -211,7 +213,7 @@ pub fn resolve(
 /// If all dependencies can be activated and resolved to a version in the
 /// dependency graph, `cx` is returned.
 fn activate_deps_loop(
-    registry: &mut RegistryQueryer<'_, impl Registry>,
+    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
     summaries: &[(Summary, ResolveOpts)],
     first_version: Option<VersionOrdering>,
     settings: &ResolveSettings<'_>,
@@ -621,7 +623,7 @@ fn activate_deps_loop(
 /// iterate through next.
 fn activate(
     cx: &mut ResolverContext,
-    registry: &mut RegistryQueryer<'_, impl Registry>,
+    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
     parent: Option<(&Summary, &Dependency)>,
     candidate: Summary,
     first_version: Option<VersionOrdering>,
@@ -791,7 +793,7 @@ impl RemainingCandidates {
 /// It will add the new conflict to the cache if one is found.
 fn generalize_conflicting(
     cx: &ResolverContext,
-    registry: &mut RegistryQueryer<'_, impl Registry>,
+    registry: &mut RegistryQueryer<'_, impl Registry, impl Query>,
     past_conflicting_activations: &mut conflict_cache::ConflictCache,
     parent: &Summary,
     dep: &Dependency,

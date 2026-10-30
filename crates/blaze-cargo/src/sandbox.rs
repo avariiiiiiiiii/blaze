@@ -130,6 +130,9 @@ pub struct Also<'a> {
     /// The program's environment as it is, in place of [`Spec::env`], which then has what of
     /// it is text, for the variables the sandbox reads itself (`TMPDIR`).
     pub env: Option<&'a [(OsString, OsString)]>,
+    /// Mach global names the program may look up beyond [`macos`]'s own few; read on macOS
+    /// only.
+    pub services: &'a [String],
 }
 
 /// The live record of a run of `blaze sandbox --v2`.
@@ -947,6 +950,7 @@ fn windows_backend(spec: &Spec, program: Option<&[OsString]>, also: Also<'_>) ->
         write: spec.writable.clone(), // clone: as `args`.
         network: also.network,
         trace: false,
+        services: Vec::new(), // alloc: none, an empty list; Windows has no Mach names.
         live: PathBuf::new(),
         report: PathBuf::new(),
         not_inputs: Vec::with_capacity(0),
@@ -1043,7 +1047,7 @@ fn probe(kind: Probe) -> Result<(), String> {
         Probe::V2 => {
             // alloc: the error, once.
             std::fs::write(&live.path, "").map_err(|it| format!("{}: {it}", live.path.display()))?;
-            Also { network: false, live: Some(&live), env: None }
+            Also { network: false, live: Some(&live), env: None, services: &[] }
         }
         Probe::Writable | Probe::Overlays => Also::default(),
     };

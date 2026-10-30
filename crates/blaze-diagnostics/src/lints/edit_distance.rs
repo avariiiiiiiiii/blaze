@@ -18,6 +18,7 @@ pub fn edit_distance(a: &str, b: &str, limit: usize) -> Option<usize> {
     }
     // alloc: a name that isn't ASCII, on an error's path.
     let a: Vec<char> = a.chars().collect();
+    // alloc: as above
     let b: Vec<char> = b.chars().collect();
     distance(&a, &b, limit)
 }
@@ -122,7 +123,9 @@ fn bit_parallel<T: Symbol>(text: &[T], pattern: &[T], limit: usize) -> Option<us
 fn rows<T: Symbol>(a: &[T], b: &[T]) -> usize {
     // alloc: three rows, only for a name of more than 64 characters.
     let mut prev_prev = vec![usize::MAX; b.len() + 1];
+    // alloc: as above
     let mut prev: Vec<usize> = (0..=b.len()).collect();
+    // alloc: as above
     let mut current = vec![0; b.len() + 1];
     for i in 1..=a.len() {
         current[0] = i;
@@ -204,6 +207,7 @@ fn find_best_match<'a>(
     let lookup_len = lookup.chars().count();
     let mut dist = dist.unwrap_or_else(|| cmp::max(lookup_len, 3) / 3);
     let mut best = None;
+    // alloc: a suggestion for a name that is not known, on an error's path
     let mut next_candidates = Vec::new();
     for candidate in candidates {
         let distance = match use_substring_score {
@@ -235,6 +239,7 @@ fn find_best_match<'a>(
     }
     // The same words sorted: only a candidate of the same length can be one, and it reuses one
     // buffer.
+    // alloc: as above
     let mut sorted: Vec<&str> = lookup.split('_').collect();
     sorted.sort_unstable();
     let mut words: Vec<&str> = Vec::with_capacity(sorted.len());

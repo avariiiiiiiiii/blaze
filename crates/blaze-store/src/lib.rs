@@ -138,6 +138,12 @@ pub fn build_name() -> Option<String> {
     Some(identity.0[..8].iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// What the store keys this process's values by, in full: the hash [`build_name`] gives sixteen
+/// hex digits of. `None` before [`compiles_against`] is told.
+pub fn identity() -> Option<[u8; KEY]> {
+    Identity::current().ok().map(|it| it.0)
+}
+
 static SOURCES: OnceLock<String> = OnceLock::new();
 
 /// Tells the store what this process was built from, when its build can say: a hash of every
@@ -339,6 +345,7 @@ pub fn pack_keys(name: &str, bytes: &[u8]) -> Result<Vec<[u8; KEY]>, &'static st
 
 /// Asked for a key, as it is on disk, that no sealed pack of the store has: brings the pack
 /// that has it into the store's directory, if it knows of one, and says whether it did.
+// dyn: installed once by blaze-cargo, above this crate; asked only for a key no pack has.
 pub type FetchMissing = Box<dyn Fn(&[u8; KEY]) -> bool + Send + Sync>;
 
 static FETCH_MISSING: OnceLock<FetchMissing> = OnceLock::new();

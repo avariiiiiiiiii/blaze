@@ -346,6 +346,7 @@ impl Form {
             MirSpan::BindingId(it) => (3, it.into_raw().into_u32()),
             MirSpan::SelfParam => (4, 0),
             MirSpan::Unknown => (5, 0),
+            MirSpan::Inlined(it) => (6, it),
         };
         self.spans.push(tag);
         self.spans.extend_from_slice(&at.to_le_bytes());
@@ -1182,6 +1183,8 @@ impl<'db> Cx<'db> {
                     f.bool(lib.verbatim);
                     f.bool(lib.whole_archive);
                     f.bool(lib.bundle);
+                    f.debug(&lib.as_needed);
+                    f.symbol(lib.import_name_type);
                 }
                 f.symbol(AttrFlags::wasm_import_module(db, it));
             }
@@ -2893,7 +2896,7 @@ impl<'b, 'db> Canon<'b, 'db> {
             c.blocks[at] = c.order.len() as u32;
             c.order.push(id);
             if let Some(terminator) = &body.basic_blocks[id].terminator {
-                push_successors(&terminator.kind, &mut c.stack);
+                c.stack.extend(terminator.kind.all_successors().into_iter().rev());
             }
         }
         let blocks = &c.blocks;
@@ -2986,43 +2989,6 @@ impl Drop for Canon<'_, '_> {
                 spare.canons.push(c);
             }
         });
-    }
-}
-
-/// Pushes the blocks a terminator may go to onto a walk's stack, the first on top.
-fn push_successors(kind: &TerminatorKind, stack: &mut Vec<BasicBlockId>) {
-    match kind {
-        TerminatorKind::Goto { target } => stack.push(*target),
-        TerminatorKind::SwitchInt { targets, .. } => {
-            stack.extend(targets.all_targets().iter().rev())
-        }
-        TerminatorKind::Drop { target, unwind, .. }
-        | TerminatorKind::DropAndReplace { target, unwind, .. }
-        | TerminatorKind::FalseUnwind { real_target: target, unwind } => {
-            stack.extend(*unwind);
-            stack.push(*target);
-        }
-        TerminatorKind::Call { target, cleanup, .. } => {
-            stack.extend(*cleanup);
-            stack.extend(*target);
-        }
-        TerminatorKind::Assert { target, cleanup, .. } => {
-            stack.extend(*cleanup);
-            stack.push(*target);
-        }
-        TerminatorKind::Yield { resume, drop, .. } => {
-            stack.extend(*drop);
-            stack.push(*resume);
-        }
-        TerminatorKind::FalseEdge { real_target, imaginary_target } => {
-            stack.push(*imaginary_target);
-            stack.push(*real_target);
-        }
-        TerminatorKind::UnwindResume
-        | TerminatorKind::Abort
-        | TerminatorKind::Return
-        | TerminatorKind::Unreachable
-        | TerminatorKind::CoroutineDrop => {}
     }
 }
 

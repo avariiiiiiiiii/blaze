@@ -3,10 +3,11 @@
 
 use base_db::Db;
 use blaze_mem::{Frame, Tag, frame};
-use hir_def::HasModule;
+use hir_def::{HasModule, hir::ExprId, resolver::HasResolver};
 
 use crate::{
     InferBodyId,
+    db::HirDatabase,
     next_solver::{
         DbInterner, StoredGenericArgs, TypingMode,
         infer::{DbInternerInferExt, InferCtxt},
@@ -83,6 +84,28 @@ impl<'db> Passes<'_, 'db> {
 /// The `InferCtxt` that `Ctx::new`, `Filler::new` and `MirLowerCtx::new` build for `owner`.
 pub fn new_infer_ctxt<'db>(db: &'db Db, owner: InferBodyId<'db>) -> InferCtxt<'db> {
     DbInterner::new_with(db, owner.krate(db)).infer_ctxt().build(TypingMode::non_body_analysis())
+}
+
+/// What `mir_body_query` builds for `def`, without salsa.
+pub fn lower<'db>(db: &'db Db, def: InferBodyId<'db>) -> Result<MirBody<'db>, MirLowerError<'db>> {
+    super::lower::lower_body(db, def)
+}
+
+/// What lowering `def` builds that this crate does not own: the `Resolver` `MirLowerCtx::new`
+/// makes, moved to the scopes of `tail` as a path there moves it, the `InferCtxt`, and the
+/// function's signature with its late-bound regions freed, as `lower_body_to_mir` asks for it.
+pub fn lowering_setup<'db>(db: &'db Db, def: InferBodyId<'db>, tail: ExprId) {
+    let mut resolver = def.resolver(db);
+    let guard = resolver.update_to_inner_scope(db, def.expression_store_owner(db), tail);
+    resolver.reset_to_guard(guard);
+    let _ = new_infer_ctxt(db, def);
+    if let Some(func) = def.as_function() {
+        let interner = DbInterner::new_with(db, def.krate(db));
+        let _ = interner.liberate_late_bound_regions(
+            func.into(),
+            db.callable_item_signature(func.into()).instantiate_identity().skip_norm_wip(),
+        );
+    }
 }
 
 /// `run_passes`, as its queries call it.

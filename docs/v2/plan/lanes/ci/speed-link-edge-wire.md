@@ -138,7 +138,8 @@ looks at a response once, like the CLI's printer.
 ## The server's shape
 
 The listener is a sans-IO state machine over `blaze_core`'s effects. It runs on whichever
-driver the daemon starts: io_uring on Linux, kqueue on macOS, IOCP on Windows, or threads.
+driver the daemon starts: io_uring on Linux, kqueue on macOS, IOCP on Windows. Where io_uring
+is unavailable the daemon stops with an error naming why ([decisions](../../process/decisions.md)).
 There is no per-request thread, lock or `Arc`: one receive and one send in flight per
 connection, and replies coalesce behind the send in flight. What io_uring could still give,
 registered buffers and zero-copy send, needs K2 and K3 in the effect API. Nothing in the

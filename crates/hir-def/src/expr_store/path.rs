@@ -272,7 +272,7 @@ const _: () = {
 
 #[cfg(target_pointer_width = "64")]
 const _: () = {
-    assert!(size_of::<ModPath>() == 16);
+    assert!(size_of::<ModPath>() == 24);
     assert!(size_of::<Name>() == 4);
     assert!(size_of::<TypeBound>() == 16);
 };
@@ -779,11 +779,6 @@ impl PathColumns {
             TypeBound::Use(args) => list(&self.use_args, args.start, args.len, USE_ARGS).map(drop),
             TypeBound::Error => Ok(()),
         }
-    }
-
-    /// A run of names held outside the columns (a where predicate's `for<..>`) inside them.
-    pub(crate) fn check_names(&self, names: Names) -> Checked {
-        list(&self.names, names.start, names.len, NAMES).map(drop)
     }
 }
 

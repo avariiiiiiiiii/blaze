@@ -167,7 +167,7 @@ impl FindPathScratch {
 }
 
 /// One segment of a candidate path: its name and the index of the segment before it in
-/// [`FindPathScratch::segments`] ([`NO_SEGMENT`] for the first). 16 bytes; a path of `n`
+/// [`FindPathScratch::segments`] ([`NO_SEGMENT`] for the first). 8 bytes; a path of `n`
 /// segments is read back in `n` loads.
 #[derive(Clone, Copy)]
 struct Segment {
@@ -175,7 +175,7 @@ struct Segment {
     parent: u32,
 }
 
-const _: () = assert!(size_of::<Segment>() == 16);
+const _: () = assert!(size_of::<Segment>() == 8);
 
 const NO_SEGMENT: u32 = u32::MAX;
 

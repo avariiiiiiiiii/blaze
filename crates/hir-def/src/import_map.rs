@@ -36,8 +36,8 @@ pub struct ImportInfo {
     pub complete: Complete,
 }
 
-/// 24 bytes: the name's symbol (8), the module's salsa id (8) and three bytes of flags.
-const _: () = assert!(size_of::<ImportInfo>() == 24);
+/// 16 bytes: the name's symbol (4), the module's salsa id (8) and three bytes of flags.
+const _: () = assert!(size_of::<ImportInfo>() == 16);
 
 /// A map from publicly exported items to its name.
 ///

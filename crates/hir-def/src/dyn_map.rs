@@ -91,7 +91,7 @@ pub mod keys {
     }
 
     /// The field of [`Maps`] that a key's policy reads.
-    pub trait Slot<AST, ID> {
+    pub trait Slot<AST: AstNode, ID> {
         fn slot(maps: &Maps) -> &KeyMap<AstPtr<AST>, ID>;
         fn slot_mut(maps: &mut Maps) -> &mut KeyMap<AstPtr<AST>, ID>;
     }

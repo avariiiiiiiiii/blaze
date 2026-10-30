@@ -317,7 +317,7 @@ struct PairRow {
     next_in_module: u32,
 }
 
-const _: () = assert!(size_of::<PairRow>() == 32);
+const _: () = assert!(size_of::<PairRow>() == 24);
 
 /// One import or `pub(in path)` path. Its levels are `first_level..=first_level + len`: level
 /// `i < len` looks segment `i` up, level `len` is what the path denotes.

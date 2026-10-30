@@ -437,9 +437,9 @@ impl Hash for EnumVariantLoc {
     }
 }
 
-// 32 bytes per variant (`AstId` 16, enum 8, name 8), no padding; hashed in 4 Fx rounds (file,
+// 28 bytes per variant (`AstId` 16, enum 8, name 4), no padding; hashed in 4 Fx rounds (file,
 // file-local id, enum, name).
-const _: () = assert!(size_of::<EnumVariantLoc>() == 32);
+const _: () = assert!(size_of::<EnumVariantLoc>() == 28);
 
 impl EnumVariantLoc {
     pub fn index(&self, db: &Db) -> usize {

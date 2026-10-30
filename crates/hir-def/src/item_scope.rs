@@ -333,7 +333,7 @@ struct Entry {
 }
 
 const _: () = assert!(size_of::<Option<salsa::Id>>() == 8);
-const _: () = assert!(size_of::<Entry>() == 40);
+const _: () = assert!(size_of::<Entry>() == 36);
 
 const DEF_MODULE: u8 = 0;
 const DEF_FUNCTION: u8 = 1;

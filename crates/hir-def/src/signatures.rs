@@ -626,18 +626,17 @@ pub struct StructSignature {
 }
 
 // Each signature `of` keeps is in its memo (in an `Arc` only when an image serves it), and
-// holds its store and generic params (72 bytes each today) and its own fields, whose bytes are
-// what these assert:
-// 160 bytes for a struct, union, enum or trait, 184 for a function or type alias, 88 for a
-// const or static (no generic params), 160 for an impl.
+// holds its store and generic params (704 and 72 bytes today) and its own fields, whose bytes
+// are what these assert: 8 for a struct, union, enum or trait, 40 for a function, 32 for a type
+// alias, 16 for a const or static (no generic params) or an impl.
 const _: () = assert!(
-    size_of::<StructSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 16
+    size_of::<StructSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 8
 );
 const _: () = assert!(
-    size_of::<UnionSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 16
+    size_of::<UnionSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 8
 );
 const _: () = assert!(
-    size_of::<EnumSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 16
+    size_of::<EnumSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 8
 );
 const _: () = assert!(size_of::<ConstSignature>() == size_of::<ExpressionStore>() + 16);
 const _: () = assert!(size_of::<StaticSignature>() == size_of::<ExpressionStore>() + 16);
@@ -645,7 +644,7 @@ const _: () = assert!(
     size_of::<ImplSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 16
 );
 const _: () = assert!(
-    size_of::<TraitSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 16
+    size_of::<TraitSignature>() == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 8
 );
 const _: () = assert!(
     size_of::<FunctionSignature>()
@@ -653,7 +652,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     size_of::<TypeAliasSignature>()
-        == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 40
+        == size_of::<ExpressionStore>() + size_of::<GenericParams>() + 32
 );
 // One word of flags per signature, tested with a mask.
 const _: () = assert!(size_of::<StructFlags>() == 2);

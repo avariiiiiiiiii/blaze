@@ -64,9 +64,9 @@ enum ScopeKind {
 }
 
 const _: () = assert!(size_of::<ScopeKind>() == 1);
-// 16 bytes an entry: a symbol, a hygiene and a binding id.
+// 12 bytes an entry: a symbol, a hygiene and a binding id.
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(size_of::<ScopeEntry>() == 16);
+const _: () = assert!(size_of::<ScopeEntry>() == 12);
 // 16 bytes a block scope: a salsa id (index and generation) and an `Option` of an arena id,
 // which has no niche.
 const _: () = assert!(size_of::<(BlockId, Option<LabelId>)>() == 16);

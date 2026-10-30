@@ -21,7 +21,7 @@ pub(super) struct ModDir {
     depth: u32,
 }
 
-const _: () = assert!(size_of::<ModDir>() == 16);
+const _: () = assert!(size_of::<ModDir>() == 12);
 
 impl ModDir {
     pub(super) fn root() -> ModDir {

@@ -12,7 +12,7 @@ mod described;
 mod listed;
 mod unsandboxed;
 /// blaze v2's lowering: a build's units (`blaze_units::query::Units`) into the front end's
-/// crate graph and files, for the daemon (docs/v2/cargo-notes.md section 6).
+/// crate graph and files, for the daemon (docs/v2/plan/lanes/cargo/notes.md section 6).
 pub mod v2;
 mod wasm;
 mod wrap;

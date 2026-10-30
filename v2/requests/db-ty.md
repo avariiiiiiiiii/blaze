@@ -125,8 +125,8 @@ optimized MIR), so it does not compile until these 11 have it. Their outputs alr
 ## 10. Coordinator: MIR's layout belongs to codegen
 
 What: move `crates/hir-ty/src/mir.rs` and `crates/hir-ty/src/mir/` (the MIR types) from db to
-codegen in `docs/v2/crates.md`.
-Why: `docs/v2/plan/data.md` gives MIR's columnar layout (locals as columns, blocks as ranges,
+codegen in `docs/v2/plan/reference/crates.md`.
+Why: `docs/v2/plan/design/data.md` gives MIR's columnar layout (locals as columns, blocks as ranges,
 statements as tag and data, places as base plus CSR projections) to codegen, which builds and
 reads every `MirBody` in `crates/hir-ty-mir`. The types sit in hir-ty only because borrowck and
 const eval read them; whoever changes the layout changes all their constructors. Until it moves,
@@ -139,7 +139,7 @@ db-ty does not change MIR's layout.
 What: let `db-ty-types` change `vendor/rustc_type_ir` and `db-ty-solver` change
 `vendor/rustc_next_trait_solver`, or apply their requests (`v2/requests/db-ty-types.md`,
 `v2/requests/db-ty-solver.md`).
-Why: "types and the trait solver are u32-indexed tables" (`docs/v2/db.md`, Done when) is half in
+Why: "types and the trait solver are u32-indexed tables" (`docs/v2/plan/lanes/db.md`, Done when) is half in
 those crates: the `Interner` trait's associated types and the search graph's `GlobalCache`.
 
 > forwarded to db: both vendor crates are lane db's own; db-ty is its child.
@@ -743,7 +743,73 @@ the capture it belongs to, for `move` closures too.
   mutating capture of a non-`move` closure; drop `closure_of`, `origin` and the module doc's
   "The front end gives neither ..." paragraph.
 
+### 4. Diagnostics (blaze-diagnostics) and ide-diagnostics: E0641 and the other cast errors rustc gives (task 23)
+
+`hir_ty::infer::cast` now refuses what rustc's `check_cast` refuses
+(`compiler/rustc_hir_typeck/src/cast.rs` at 16d1ffac), so `CastError` (re-exported as
+`hir::CastError`) has four new variants: `UnknownCastPtrKind` and `UnknownExprPtrKind` (E0641,
+`0 as *const _`), `CastEnumDrop` (a field-less enum with a `Drop` impl cast to an integer) and
+`ForeignNonExhaustiveAdt` (E0606 of an enum of another crate with a `#[non_exhaustive]`
+variant). `hir::InvalidCast` gains `expr_pointer`/`cast_pointer: Option<hir::CastPointerKind>`
+(`Thin`, `VTable(Option<Trait>)` with the principal, `Length`, `OfAlias`, `OfParam(TypeParam)`),
+set where rustc's report reads them, and `added_auto_traits: Vec<Trait>` of
+`PtrPtrAddingAutoTraits`. The workspace does not build until the two exhaustive matches have
+arms for the new variants:
+
+- `crates/blaze-diagnostics/src/lower/invalid_cast.rs`: rustc's messages
+  (`compiler/rustc_hir_typeck/src/errors.rs`: `CastUnknownPointer` "cannot cast to a pointer of
+  an unknown kind" / "cannot cast from ..." with "needs more type information" and the
+  "the type information given here is insufficient ..." note; `CastEnumDrop` "cannot cast enum
+  `{expr_ty}` which implements `Drop` to an integer `{cast_ty}`"; `ForeignNonExhaustiveAdt` E0606
+  with "cannot cast an enum with a non-exhaustive variant when it's defined in another crate").
+  `DifferingKinds`' notes ("the trait objects may have different vtables", "the pointers may
+  have different metadata", "the pointers have different metadata"), `IntToWideCast`'s
+  "a vtable"/"a length"/"type-specific metadata" and E0804's trait list can then come from the
+  fields instead of being worked out from the types.
+- `crates/ide-diagnostics/src/handlers/invalid_cast.rs`: the arms (the E0641 one is there,
+  commented out), and the commented-out test `order_dependent_cast_inference` can come back
+  (rustc's `tests/ui/cast/order-dependent-cast-inference.rs`).
+
+### 5. Diagnostics (blaze-diagnostics): pattern checking as rustc gives it (task 37), and `sym::Vec`
+
+hir now gives (from `compiler/rustc_hir_typeck/src/pat.rs` at 16d1ffac):
+
+- `MismatchedTupleStructPatArgCount { variant: hir::Variant, had_err: bool }`: rustc's "missing
+  parentheses" suggestion only when `!had_err`. The subpatterns are now checked against the
+  error type, as rustc's `on_error`, so their bindings report nothing more.
+- `InvalidRangePatType<'db>` (now with a lifetime) `{ lhs, rhs: Option<(Type, bool)> }`: each
+  end's type as inference had it (an undecided literal's as `{integer}` once hir-ide prints it,
+  item 2) and whether it fails. Also pushed for rustc's second `emit_err_pat_range` (both ends
+  infer to a type that is not `char` or numeric, both failing), and not pushed when an end's
+  type has an error (rustc downgrades it).
+- `NoSuchField` of a record pattern's unknown fields comes after `NonExhaustiveRecordPat` and
+  the union errors, before `RecordMissingFields`, as rustc emits them.
+- `hir::Crate::lang_origin(self, db) -> Option<LangCrateOrigin>`, no clone.
+
+Wanted:
+
+- `crates/blaze-diagnostics/src/lower/mismatched_tuple_struct_pat_arg_count.rs`: the variant
+  and `had_err` from `d`, not the path; `lower/invalid_range_pat_type.rs`: the labels from
+  `d.lhs`/`d.rhs`; `tests/bodies/patterns.rs`
+  `a_range_with_one_bad_end_names_the_type_of_the_other` un-ignored (after item 2's
+  `{integer}` print). `lower/expected_array_or_slice_pat.rs` can use `Crate::lang_origin`.
+- `crates/intern/src/symbol/symbols.rs` (not db-ty's): `Vec` beside the other type names, so
+  `expected_array_or_slice_pat.rs` compares a symbol, not a string.
+
 > forwarded to diagnostics (blaze-diagnostics and ide-diagnostics; told by tmux).
+
+### 6. Diagnostics (blaze-diagnostics): the value a path resolved to, from inference (task 17)
+
+`InferenceResult::value_resolution(ExprOrPatId) -> Option<ValueNs>` is what inference resolved
+each value path (expression or pattern) to, written in `infer/path.rs` `infer_path`, persisted
+and hashed with the result. An associated item's path is the function or const resolution gave
+(the impl's pick is still `assoc_resolutions_for_expr`).
+
+Wanted: `crates/blaze-diagnostics/src/lints/bodies/types/util.rs` `path_value`, keeping the
+`assoc_resolutions_for_expr` arm first, then
+`b.infer.value_resolution(expr.into())` in place of the `ExprScopes`/`FnDef`/
+`resolver_for_scope` steps (drop their imports). A path that does not resolve gives `None`, as
+now.
 
 ## db-ty-d-hir
 
@@ -794,6 +860,8 @@ inner `fn counting_pass` and replace from `let (by_target, _) = counting_pass(..
 (`radix` is already imported from `blaze_ids`; `starts` has `num_nodes + 1` entries and
 `targets` the targets in `(source, target)` order, as before). The doc comment stays true. Why:
 one counting sort in the tree; this one cloned its starts and kept a pair per edge in between.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## db-ty-d-lower
 
@@ -880,3 +948,51 @@ hir and hir-ty use what they add.
      a const parameter's own arguments, a variant's and a type-relative path's resolved segment
      stay their own. `generic_args_prohibited.rs`' `with_args.first() != Some(&h)` check still
      holds; it can read the segments from `all_args`.
+
+6. **db-unsafeck** (no tmux window yet), hand-over of `target_feature.rs`: before task 40 moved,
+   db-ty-d-lower made one edit there, in `crates/hir-ty/src/target_feature/tests.rs` at the end
+   of `implications_are_rustcs_of_each_arch`: six lines checking that an `aes` caller covers a
+   `neon` callee on AArch64 and not on x86 (`Declared::of`, `features(.., Some(arch))`,
+   `is_superset`). Keep it or drop it; `target_feature.rs` itself was not touched. And for the
+   **coordinator**: `.gitignore`'s `target*/` matches `crates/hir-ty/src/target_feature/`, so
+   that `tests.rs` has never been tracked, while the tracked `target_feature.rs` declares
+   `mod tests;` and a clean checkout fails to build. Fix: `!crates/hir-ty/src/target_feature/`
+   after `target*/`, or anchor the pattern (`/target*/`).
+
+> forwarded to db (from requests, pass 16; told by tmux).
+
+## db-ty-d-borrowck
+
+> forwarded to db (from requests, pass 17; told by tmux).
+
+### 1. Diagnostics (blaze-diagnostics): lower the parts of a borrow check error
+
+`hir::BorrowckError` now has `labels: Vec<(InFile<TextRange>, String)>`, `children:
+Vec<hir::BorrowckChild>` (`level: hir::BorrowckSublevel` `Note`/`Help`, `message`, `spans`,
+`labels`) and `suggestions: Vec<hir::BorrowckSuggestion>` (`message`, `parts: Vec<(InFile<
+TextRange>, String)>`, `applicability: hir::BorrowckApplicability`, `verbose`), in rustc's words
+and the order rustc adds them; a label at the primary span is the primary span's own. Wanted in
+`crates/blaze-diagnostics/src/lower/borrowck_error.rs`, `lower`, after `Diag::error`/`Diag::lint`:
+
+```rust
+for (at, text) in &d.labels {
+    let span = cx.span(*at);
+    match span == diag_span { true => diag.primary_label(text), false => diag.label(span, text) }
+}
+for child in &d.children {
+    // `BorrowckSublevel::Note` -> note, `Help` -> help; `spans` empty -> without a span,
+    // else a `MultiSpan` of `spans` with `labels` on it.
+}
+for s in &d.suggestions {
+    // `verbose` -> `SuggestionStyle::ShowAlways`, else `ShowCode`; applicability one to one.
+    diag.suggestion_with_style(s.parts.iter().map(|(at, text)| (cx.span(*at), text.clone())).collect(), &s.message, applicability, style);
+}
+```
+
+(with whatever `Diag`'s label/note API is named). Then `tests/lints/mir/borrowck.rs` can check
+the whole `.stderr` of E0499, E0502, E0503, E0505, E0506, E0596, E0597, E0384, E0382: rustc's
+`tests/ui/error-codes/E0*.rs` at `16d1ffac`. The module doc of `borrowck_error.rs` ("the labels
+and notes ... are not given yet") becomes untrue with this. `unused_mut` keeps its own path:
+the borrow checker gives it no parts.
+
+> forwarded to db (from requests, pass 17; told by tmux).

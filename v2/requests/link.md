@@ -644,7 +644,7 @@ numbers in "MAY BE UNSOUND (n)" below refer to this list:
 
 ## Re-check after speed-link-edge-live's note (18:25 PT)
 
-`speed-link-edge-live` says `slots/` now follows `docs/v2/design/unsafe.md`: the message is read,
+`speed-link-edge-live` says `slots/` now follows `docs/v2/plan/design/unsafe.md`: the message is read,
 not mapped, and every block has one op and a SAFETY comment (details in
 `docs/v2/plan/lanes/link/speed-link-edge-live.md`, section "Unsafe"). A rescan agrees: in `slots/`,
 the three lints leave only `slots/unix.rs:74`, where the comment's placement is worth a check (two
@@ -1307,7 +1307,7 @@ arithmetic are in `docs/v2/plan/lanes/link/speed-of-light.md`, "ELF writer and r
    synthesis is then O(splices + pages written), the bound.
 
 > Told by tmux: requests-link-fuzz-core-model-next1, requests-link-fuzz-core-stage.
-> forwarded to requests-link-fuzz (link is DONE; the core and writers are held by requests-link-fuzz's children, still running). Told by tmux; parts outside `blaze-link` (blaze-engine, `demo/`, `harness/live*`) it routes on.
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
 
 ## dedup: `blaze-link`'s `align_up` and bump arena onto blaze-mem (from dedup-mem)
 
@@ -1342,7 +1342,8 @@ arenas: `blaze-mem`). The test that held `reloc::align_up` now lives in
 
 Status: open
 
-> forwarded to requests-link-fuzz (link is DONE; the core and writers are held by requests-link-fuzz's children, still running). Told by tmux; parts outside `blaze-link` (blaze-engine, `demo/`, `harness/live*`) it routes on.
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): 1-3 as written (`reloc.rs` `align_up` deleted, `align_up_u64` at its two uses; `place.rs`'s nine `align_up(` -> `align_up_u64(`; `pe/image.rs` `page_of` -> `align_down_u64`). 4: the stage's arena was already `blaze_mem::Frame` (mem-backend-link L3, which this item names as the alternative: same reset per stage, its own reservation); no `bumpalo` user is left in blaze-link, so its `Cargo.toml` line is deleted. The `hir-ty-codegen` and root lines are in `v2/requests/requests.md` ("From requests-link-next: `bumpalo` left only").
 
 ## 19. From speed-link-edge-sol-live: a patch writes no read-only page of the image (`place.rs`, `live.rs`)
 
@@ -1376,7 +1377,7 @@ With 1, a one-function edit on Linux is: the message read (`openat`, `statx`, on
 `close`), 0 system calls for code and data, the cell's release store, and the answer
 (`openat`, `write`, `close`, `rename`), which is the bound of the live runtime section.
 
-> forwarded to requests-link-fuzz (link is DONE; the core and writers are held by requests-link-fuzz's children, still running). Told by tmux; parts outside `blaze-link` (blaze-engine, `demo/`, `harness/live*`) it routes on.
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
 
 ## 20. From speed-link-edge-sol-live: move v1's users onto `slots` (blaze-engine, `demo/`, `harness/live*`)
 
@@ -1408,7 +1409,8 @@ and `apply_as_they_come`. What is left is outside `crates/blaze-live`:
    three `stop.rs` and v1's part of `format.rs`, and `lib.rs`'s `Live` (blaze-live's owner
    removes them once 1 and 2 are in; nothing else in the workspace uses them).
 
-> forwarded to requests-link-fuzz (link is DONE; the core and writers are held by requests-link-fuzz's children, still running). Told by tmux; parts outside `blaze-link` (blaze-engine, `demo/`, `harness/live*`) it routes on.
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): blaze-link's part needed no change: `Output::live` already links a live program with the jump table, and the commit writes the `blaze_live::patch::Message` file that `live.rs` encodes (`commit.rs` `message_file`). 1 (blaze-engine: lane codegen; blaze-splice: link), 2 (`demo/`, `harness/live*`: coordinator) and 3 (blaze-live v1: link, held by requests-live) are a new section in `v2/requests/requests.md`, "From requests-link-next: move v1's live users onto `blaze_live::slots`".
 
 ## dedup: blaze-live's code mappings stay its own (a comment only)
 
@@ -1425,6 +1427,9 @@ sees why: above `fn map_twice` in `crates/blaze-live/src/slots/linux.rs`, add
 
 Status: open
 
+> taken by requests (link and speed-link-edge-sol-live are DONE): child `requests-live`; the outcome follows.
+> applied by requests (child requests-live): the two-line comment as written, above `map_twice`'s doc comment in `crates/blaze-live/src/slots/linux.rs`. It holds again now that mem-backend-live 1 is refused, so blaze-live has no dependencies.
+
 ## dedup: bits: blaze-link the linker's bit sets onto `blaze_ids::bits`
 
 From `dedup-bits-edge` (report `/tmp/blaze-lanes/v2-dedup-bits-edge.md`). Five hand-rolled bit
@@ -1432,6 +1437,9 @@ sets of `blaze-link` move onto `blaze_ids::bits` (`crates/blaze-ids/src/bits.rs`
 copy-on-write one, keep their storage under a name that is not a bit-set name and use its
 indexing. `blaze-ids` is already a dependency of the crate; no `Cargo.toml` change. Nothing
 here is persisted or hashed; members, iteration order and panics are the same.
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): 1, 3, 4, 5 as written; 2 in part (below).
 
 ### 1. `crates/blaze-link/src/native.rs`: `Bits` over `CowVec<u64>` kept, renamed `CowFlags`
 
@@ -1519,6 +1527,9 @@ Every other `Bits` in the file becomes `CowFlags`: the fields `discarded: Bits,`
 `listed: Bits,` (1148), `sections: Bits,`, `frames: Bits,`, `named: Bits,` (`Marks`, 1198-1201),
 and `Bits::default()` at lines 902, 2765, 3068 and in the test
 `bits_set_once_across_words_and_copies` (3180), which stays as it is otherwise.
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written (`CowFlags` on `locate`, every `Bits` renamed).
 
 ### 2. `crates/blaze-link/src/cow.rs`: `IdSet`'s two bit columns become `BitSet<u32>`
 
@@ -1624,6 +1635,9 @@ impl IdSet {
 (The rest of `IdSet`, `SymSet` and the test `id_sets_iterate_members_once_in_order` are
 unchanged. `Debug` of an `IdSet` now shows the members rather than words; nothing reads it.)
 
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): in part. Since mem-backend-link L4, `IdSet`'s columns are `Vec<u64, A>` in the stage's frame, and `blaze_ids::bits` has no storage for an allocator's `Vec` (`GrowWords: Default`, implemented for `Vec<u64>` only), so `IdSet` keeps its frame columns and takes `blaze_ids::bits::locate` for its index math. The blaze-ids change that lets item 2 land as `Bits<Vec<u64, A>, u32>` is in `v2/requests/requests.md` ("From requests-link-next: `blaze_ids::bits` storage in an allocator's `Vec`").
+
 ### 3. `crates/blaze-link/src/commit.rs`: `Pending::done` becomes a `BitSet`
 
 Imports, before / after:
@@ -1690,6 +1704,9 @@ In `complete` (line 206):
         pending.done.insert(at);
 ```
 
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written.
+
 ### 4. `crates/blaze-link/src/macho/dylib.rs`: `trie_exports`' `seen` becomes a `BitSet`
 
 Imports, before / after:
@@ -1729,6 +1746,9 @@ after (`insert` panics past the capacity as the indexing did, for an empty trie'
             return Err(format!("node {node:#x} is reached twice (a cycle)"));
         }
 ```
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written.
 
 ### 5. `crates/blaze-link/src/elf/read/strings.rs`: the NUL bitset's scans and rank
 
@@ -1841,3 +1861,6 @@ after:
 
 (`first_in` and `last_in` scan a word at a time as these did; the bits past the table's last
 byte are zero, as `nul_mask` leaves them.)
+
+> taken by requests (link and requests-link-fuzz are DONE): child `requests-link-next`; the outcome follows.
+> applied by requests (child requests-link-next): as written.

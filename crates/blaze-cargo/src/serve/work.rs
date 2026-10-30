@@ -1,4 +1,4 @@
-//! What a job of the daemon asks of the build (docs/v2/cargo-notes.md section 6): the steps
+//! What a job of the daemon asks of the build (docs/v2/plan/lanes/cargo/notes.md section 6): the steps
 //! between a plan and its outputs, behind traits so the loop runs the same in the daemon
 //! ([`crate::serve::unit::Real`]) and in the simulation ([`crate::serve::tests`]).
 //!

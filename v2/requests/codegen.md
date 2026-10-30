@@ -106,7 +106,7 @@ Why: `blaze_query::Cx` has no way to reach those today. The kinds are reserved i
 Where: `docs/v2/plan.md`.
 
 What: link `../v2-codegen.md` (status: plan) as the codegen lane's design notes. If lane
-notes now belong under `docs/v2/`, move it to `docs/v2/codegen-design.md` and fix the
+notes now belong under `docs/v2/`, move it to `docs/v2/plan/lanes/codegen.md` and fix the
 links in it.
 
 Why: docs-say-what-they-are. The notes are the lane's design and nothing links them yet.
@@ -205,9 +205,18 @@ modules v2 never reaches: `units.rs`, `cached.rs`, `flight.rs`, `counted.rs`, `p
    v1's `blaze-engine/src/lib.rs:827` sets it, so a v2 build reads `None`. Fix: drop the
    static. Make the program name of a file a query input of the view (what `Hashes::file_name`
    says), so the read is a memo lookup and the dependency is recorded.
+   > checked by codegen-mir-store (2026-10-29): done in the code. `SOURCE_PATHS` is gone; the
+   > naming rule is the salsa input singleton `SourceNames` (`location.rs`, set by
+   > `name_sources` with a key, HIGH durability), and `file_source_path` is a tracked query per
+   > `FileText`, so a read is a memo lookup with its dependency recorded and no lock.
 
 > forwarded to codegen: every finding is in lane codegen's own crates (`blaze-codegen`, `hir-ty-codegen`, `hir-ty-mir`); lane codegen is still running.
+
+> checked by codegen-engine (2026-10-29): no blaze-engine finding is open. The audit left
+> blaze-engine out; its one part, finding 6's setter, is gone: `SOURCE_PATHS` is now the
+> `SourceNames` input, and blaze-engine tells it through `name_sources` (`lib.rs:762`).
 > applied by codegen-v1 (2026-10-29): checked, nothing left in hir-ty-codegen outside `v2/`: items 4 (`asm.rs` lock-free tables, `inline_of` gone) and 5 (`backend.rs` per-thread `Counts`) are in the code.
+> checked by codegen-v2 (2026-10-29), findings 1-3, all done in the code already: 1, `blaze-codegen/src/memo.rs` is the append-only open-addressed table asked for (slots published by CAS, levels of twice the slots, `get` gives `&Template` with no lock and no shared write, `retain` frees under `&mut self` between builds); 2, `v2/frontend.rs`'s `Databases` holds one shared `&Db` and no idle pool, so `with` takes no lock; 3, `v2/release.rs` has no `KEPT`: `summarize` leaves the pre-linked module in the unit's own `Function::release` (`Kept`), which `emit` takes.
 
 ## 5. coordinator: vendor `cranelift-codegen` for sibling calls (from codegen-fold)
 
@@ -455,6 +464,7 @@ trade-off), `enable_alias_analysis` (only the `speed` egraph pass reads it). Two
    side as soon as the variant exists.
 
 > forwarded to codegen: lane codegen's paths, still running.
+> applied by codegen-v1 (2026-10-29): the `target.rs`/`mod.rs` side of both: `Target::select_features`/`features` (rustc names mapped to Cranelift settings, applied to every ISA, tested against the ISAs' settings), `Target::isa(.., opt)` and `mod.rs`'s ISAs by kind and level with `emit_at(context, speed)`. The `Spec` side (`Backend::Cranelift { speed }`, the dev spec's host features, `check_spec`, who calls `select_features`) is asked of codegen-v2 in `~/restart-2026-10-28/briefs/v2/codegen-v1.requests.md`.
 
 ## From safety (lane safety, 2026-10-29; design `docs/v2/plan/lanes/safety/notes.md`)
 
@@ -631,6 +641,25 @@ of one callee a function has. Not blocking: `hir-ty-codegen` builds without it.
 
 > forwarded to codegen: `blaze_codegen::Reloc` is lane codegen's.
 
+> applied by codegen-v2 (2026-10-29): `blaze_codegen::Reloc` is the 16-byte row asked (const-asserted, `crates/blaze-codegen/src/relocs.rs`), and every relocation list is a `Relocs<T>` table of rows sorted by `at`, distinct targets in first-use order and wide addends by row (`CompiledFunction::relocs`, `Data::relocs`, `Init::Bytes`, and `Relocs<Ref>` in templates); the old four-field struct is `blaze_codegen::Relocation`, what a table is built from and yields. Hashes and blobs frame the rows, the targets once each and the wide addends, so domains and keys moved: `blaze v2 data 2`, `blaze v2 code 3`, `blaze v2 template 3`, blob magic `BZT4`/`BZS2`, store keys `template`/`release template`/`folded`/`thunk`/`static` to 2. Every site in blaze-codegen and `hir-ty-codegen/v2` is converted; the sites in other lanes' crates are requested below.
+
+### To link: `crates/blaze-link` onto `Relocs` (from codegen-v2, 2026-10-29)
+
+Exact before/after for each site: `v2/requests/codegen-v2-relocs-link.md`. In short:
+- `src/stage.rs:18` import `Relocs` for `Reloc`; add `static NO_RELOCS: Relocs = Relocs::new();` after `CIE_DOMAIN` (line 35).
+- `src/stage.rs:183-205` `function_keys`/`key_count`, `:229-236` `reloc_syms`, `:568-587` `fixups`, `:592-603` `add_function`, `:785-787` `add_static`: intern each of `relocs.targets()` once and index the symbols by `row.target`; slices of `syms` are measured by `targets().len()`. Same fixups (now in offset order, which `write::split` already wants).
+- `src/tests.rs:7,57,63,73-74,569` and `src/intern.rs:351,499` (tests): `blaze_codegen::Relocation` by path (clashes with `object::write::Relocation`), `relocs: relocs.into()` / `Relocs::new()`.
+- Already broken at HEAD, not by this change: the test literals of `CompiledFunction` lack `coverage: None` (`tests.rs:58`, `intern.rs:494`), and `stage.rs`'s `wide` lacks the `Target::Coverage` arm asked in "From codegen (lead): what Z1, Z2 ..." below.
+
+### To fastcompile: `crates/blaze-premap` and `crates/blaze-lazy` onto `Relocs` (from codegen-v2, 2026-10-29)
+
+Exact before/after for each site: `v2/requests/codegen-v2-relocs-fastcompile.md`. In short:
+- `blaze-premap/src/key.rs:19` import, `:326-332` `relocs_into(&Relocs)` iterating `Relocation` (same bytes per relocation; `STATIC_DOMAIN` unchanged unless the faster rows-then-targets framing is taken, then `"blaze v2 premap static 2"`).
+- `blaze-premap/src/split.rs:151-156` and `blaze-lazy/src/plan.rs:218-227`: a static's own relocations as `Option<&Relocs>` flattened (no `as_slice`); `Some(*key)` in `named_functions`.
+- Tests: `blaze-premap/src/tests.rs:3,43,49,58-60,80,336`, `blaze-lazy/src/tests.rs:15,73,78,87`, `blaze-lazy/src/tests/plan.rs:4,15,112-113`: `Relocation` literals (by path where `settings::Relocation` is imported), `relocs.into()`, `Relocs::new()`.
+- Already broken at HEAD: `coverage: None` missing in `blaze-premap/src/tests.rs:44` and `blaze-lazy/src/tests.rs:82`; `key.rs` `target_into`'s `Target::Coverage` arm is asked below.
+- `blaze-global`, `blaze-stencil`, `blaze-cargo` and `blaze-api` need no change.
+
 ## From safety-audit
 
 From `safety-audit-linkgen` (child `-cg` for hir-ty-codegen). Every file below was BUSY (owners
@@ -644,13 +673,22 @@ MAY BE UNSOUND. Full reasoning: `/tmp/blaze-lanes/v2-safety-audit-linkgen.md` an
 
 ### blaze-codegen
 - `crates/blaze-codegen/src/memo.rs:183` block: no SAFETY. Proposed: `// SAFETY: a non-null slot holds a \`Box<Entry>\` that \`put\` leaked and published once; \`&mut self\` means no reader holds it, and the slot was nulled just above, so this is its only owner (else a double free).`
+  > applied by codegen-v2 (2026-10-29): the comment as proposed, above `drain`'s `Box::from_raw`; every other unsafe block of the memo already had one.
 
 ### blaze-engine
 - `crates/blaze-engine/src/lib.rs:7968` block: 3 ops (`getpgrp`, `getpid`, `killpg`). Split, with `#[cfg(unix)]` on a plain block and the same evaluation order: `#[cfg(unix)] {` / `// SAFETY: \`getpgrp\` takes no pointer and cannot fail.` `let group = unsafe { libc::getpgrp() };` / `// SAFETY: \`getpid\` takes no pointer and cannot fail.` `let me = unsafe { libc::getpid() };` / `if group == me {` `// SAFETY: this process leads its group (checked just above), which the daemon made for this worker alone, so \`killpg(0, ..)\` kills only what the worker started, and itself.` `unsafe { libc::killpg(0, libc::SIGKILL) }; } }`
 - `crates/blaze-engine/src/live.rs:212` block: 2 ops (`SetEvent`, `CloseHandle`). Split: `// SAFETY: \`event\` is the non-null handle \`OpenEventW\` opened with \`EVENT_MODIFY_STATE\`, the right \`SetEvent\` needs; it is closed only below.` `unsafe { SetEvent(event) };` then `// SAFETY: \`event\` is this function's own open handle, closed once here and not used after.` `unsafe { CloseHandle(event) };`
 
+> applied by codegen-engine (2026-10-29): both blocks split as written (`end_with_input`'s
+> `killpg` block, now near `lib.rs:7985`, and `live.rs` `wake`).
+
 ### hir-ty-mir
 - `crates/hir-ty-mir/src/lib.rs:1` crate: no unsafe; add `#![forbid(unsafe_code)]` (after the `//!` docs). Its only `unsafe` matches are a field pattern (`unsafe_: _`, `mir/lower.rs:1024`) and two strings (`mir/type_name.rs:483`, `mir/eval/shim/reflection.rs:601`). The `unsafe impl`s that `#[salsa::tracked]`/`#[salsa::input]` expand to come from `salsa-macro-rules`' external `macro_rules!`, which `unsafe_code` does not report; `blaze-items` and `hir-ty-borrowck` already pair `forbid(unsafe_code)` with tracked fns. `src/lib.rs` is the only target root.
+  > not applied, by codegen-mir-store (2026-10-29): the crate has an `unsafe` block now,
+  > `mir/eval/hooks.rs:37` (`Hooks::with`, `&mut *self.0.get()` on an `UnsafeCell`, with its
+  > `// SAFETY:`; codegen-mir's S1), so `#![forbid(unsafe_code)]` would not compile. The rule
+  > gives forbid to a crate with no unsafe module; this one has one. If `hooks.rs` goes back to
+  > safe code (a `RefCell`), the attribute goes in after the `//!` docs of `src/lib.rs`.
 
 ### hir-ty-codegen
 
@@ -807,6 +845,9 @@ The crate's unsafe is LLVM-C/inkwell FFI plus `backend.rs:527`, `mod.rs:8297`/`8
   batch.
 
 > forwarded to codegen: written by `requests`' child requests-nodes, which told the lane.
+
+> applied by codegen-engine (2026-10-29): `graph` says one `Event::Nodes` built by a new pure
+> `events::nodes` (one reused deps buffer, no `Event` per crate), tested through `NodeBatch::new`.
 
 ## From safety-fuzz-persist (2026-10-29): make `Assembled`'s store format public, for its fuzz target
 
@@ -1009,6 +1050,15 @@ comparing every `Location` and debug-info line of the MIR fixtures before and af
 
 > forwarded to codegen: `hir-ty-mir` is its.
 
+> applied by codegen-mir-store (2026-10-29): `failed_expansion` (`lower.rs`) reads the store's
+> macro calls instead of the map, `location_macros`/`located_concats` and `closures_around_query`
+> read the map only when the body called a location macro (or any macro), and `const_check` only
+> for what it reports; the position code (`source_range`, `location_of`) is unchanged. Needs
+> `ExpressionStore::macro_calls()` from format ("## codegen-mir-store: the store keeps its macro
+> calls without the source map", below); `eval.rs`'s unused `resolve_mir_span` is asked of
+> codegen-mir. Test: `hir-ty-mir/tests/mir/source_maps.rs` (no `Body::relative_` or
+> `with_source_map_` while lowering and evaluating macro-free bodies; the macros' places).
+
 ## frontend: `hir_ty_codegen::v2::Databases` takes the shared database (frontend.md item 10)
 
 What: `Databases::new` takes `Box<dyn HirDatabase + Send>` per worker (a salsa handle each;
@@ -1017,6 +1067,8 @@ worker (the database is `Sync`, decided), once db answers item 2 of "frontend: w
 frontend.md items 7-12 still need" in `v2/requests/db.md`.
 
 > forwarded to codegen.
+
+> done already (checked by codegen-v2, 2026-10-29): `Databases::new(db: &'db Db)` holds the one shared database and locks nothing (`v2/frontend.rs`); `crates/load-cargo/src/v2/db.rs` is gone, and the one caller, `blaze-cargo/src/serve/unit/codegen.rs:220`, passes `reader.db()` (`&Db`). Nothing left to request of cargo.
 
 ## frontend-text: caller locations, debug-info rows and blaze-engine's lines on the one line index (frontend.md item 6; 2026-10-29)
 
@@ -1168,6 +1220,10 @@ per tab), so `Place::Anchored` is the same for every offset.
 - Add `base-db.workspace = true` to `crates/blaze-engine/Cargo.toml` if it is not there; drop
   `ide-db` when nothing else uses it.
 
+> applied by codegen-engine (2026-10-29): item 4, the three sites on `base_db::line_index` as
+> written (`impl_place` with the `.expect`); `base-db` was already in the manifest, and `ide-db`
+> stays, since `RootDatabase`, `base_db`, `rust_doc` and the rest are still read through it.
+
 Why: frontend.md item 6 ("line and column are computed only when a diagnostic or debug info
 needs them, from a newline bitmap built with SIMD on first use"). One index per text, built
 once, ~0.13 bytes per byte of text, instead of a `Vec<u32>` per query per text.
@@ -1177,6 +1233,13 @@ and new places differ only where the old was not rustc's (at the `\n` of a `\r\n
 of a text ending in `\n`, in a text with nothing after its byte order mark), none of which a
 call or a statement can be at.
 Status: open
+
+> applied by codegen-mir-store (2026-10-29): item 1, `line_and_column` is on
+> `base_db::line_index`'s `place(..).display_column`, `line_starts` and `column_width` are gone,
+> and so is `unicode-width` from hir-ty-mir's manifest. Also: `column!()` is rustc's char column
+> (`lookup_char_pos(..).col + 1`), not the display one, through the new
+> `location::macro_location_of` that `placed` uses; codegen-v1 is asked to use it at its two
+> `column!()` sites (`~/restart-2026-10-28/briefs/v2/codegen-mir-store.requests.md`).
 
 ## speed-hir-store-stmts: statements become columns, `Statement` a view (hir-ty-mir)
 
@@ -1217,6 +1280,9 @@ reads a HIR statement (`location.rs`, `type_name.rs`, `places.rs` match `Expr::B
 its `id`/`tail`).
 
 > forwarded to codegen (window `codegen-next1`, told by tmux).
+
+> applied by codegen-mir-store (2026-10-29): all 29 sites in `lower.rs`, `is_super_let_block` and
+> `lower_block_to_place` take `Statements<'_>` and bind the statement fields by value.
 
 ### crates/hir-ty-mir/src/mir/lower.rs  (29)
 In `fn is_super_let_block` (~L3415-3432):
@@ -1329,6 +1395,10 @@ providers.
 > moved memo: the direct calls left are `*_promoted_mir_body_query` (still tracked in hir-ty-mir)
 > and the unmemoized `interpret_mir`.
 
+> applied by codegen-engine (2026-10-29): item 5 for blaze-engine. The `&Db` rewrites were
+> already in, and `base-db.workspace = true` was already in the manifest. The tool's last 8 sites
+> were `SourceDatabase` imports that `Db`'s inherent methods made unused. It left nothing.
+
 Why: a memo hit on `&Db` is a static call with no vtable (frontend.md item 15). The table is
 read only on a miss.
 
@@ -1414,6 +1484,29 @@ sampler's relaxed loads race them (item 12 d of `v2/requests/link.md`).
    summed by the sampler. That needs `blaze_live_counters` to hand out a thread's own block and
    the sampler to know every block; ask blaze-live's owner if 1 and 2 measure short.
 
+> applied by codegen-v1 (2026-10-29): items 1 and 2 in `tier.rs` and `llvm/lower.rs`: `Prepared::finish` starts each function's counters on a multiple of `tier::COUNTER_ALIGN` (16) through `counted_from` (tested), so the engine's `first + used` needs no change; each add is an `atomic_rmw add` in the alias region `tier::COUNTER_REGION`, which LLVM's lowering makes `monotonic` (other atomics stay seq-cst). Item 1 holds only if the array starts on 128 bytes: asked of link below ("To link: `blaze-live`'s counters on 128 bytes"). Item 3 left for measurement, as the item says.
+
+### To link: `blaze-live`'s counters on 128 bytes (from codegen-v1, 2026-10-29)
+
+What: in `crates/blaze-live/src/lib.rs`, give `COUNTERS` a 128-byte alignment, e.g.
+
+```rust
+#[repr(C, align(128))]
+struct Counters([std::sync::atomic::AtomicU64; format::COUNTERS]);
+
+static COUNTERS: Counters =
+    Counters([const { std::sync::atomic::AtomicU64::new(0) }; format::COUNTERS]);
+```
+
+with `blaze_live_counters` returning `COUNTERS.0.as_ptr() as *mut u64` and `sample.rs:249`
+reading `crate::COUNTERS.0[..used]`.
+Why: `hir-ty-codegen/tier.rs` now starts every function's counters on a multiple of 16 (128
+bytes from the array's start), so two functions never share a cache-line pair; with the
+array only 8-aligned, the pairs straddle and the fix is lost. The daemon's adds are now
+atomic and relaxed, as the comment on `COUNTERS` asks.
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ## dedup: blaze-engine off memmap2, onto blaze_core::fs::Mapped
 
 From `dedup-map` (report `/tmp/blaze-lanes/v2-dedup-map.md`). Every read-only file map moves onto
@@ -1447,6 +1540,9 @@ one type, `blaze_core::fs::Mapped` (`crates/blaze-core/src/fs/mapped.rs`): the s
 `&bytes` and `&*bytes` read as `&[u8]` exactly as with `Mmap`, so nothing else changes.
 
 Status: open
+
+> applied by codegen-engine (2026-10-29): both maps are `blaze_core::fs::Mapped::map`, `memmap2`
+> is out of the manifest and `blaze-core.workspace = true` is in.
 
 
 ## dedup: hir_def::test_items
@@ -1510,6 +1606,10 @@ alias (common.md, "The database is concrete").
 
 Status: open
 
+> applied by codegen-v2 (2026-10-29), the three `crates/hir-ty-codegen/v2/` items only: `hashes/tests.rs`, `refs/tests.rs` and `tests.rs` look their items up through `hir_def::test_items` as written in `v2/requests/db.md` (not yet in the tree, so they build once db lands it), with the imports left unused dropped. The `hir-ty-mir/tests/mir/main.rs` item is codegen-mir-store's.
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ## dedup: blaze-engine's build-script SHA-256 onto blaze-sha256
 
 From `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). The four SHA-256 copies
@@ -1538,6 +1638,9 @@ a proptest against the build scripts' copy). Its workspace dependency line is re
    - delete everything from `/// SHA-256 (FIPS 180-4).` (line 168) to the end of the file. The
      call sites (`Sha256::new()`, `hash.update(..)` inside the `field` closure, `hash.finish()`)
      are unchanged.
+
+> applied by codegen-engine (2026-10-29): `build.rs` hashes with `blaze_sha256::Sha256` (doc and
+> `use` as written, its own copy deleted) and the manifest has the build dependency.
 
 ## dedup: hir-ty-codegen/v2/fold.rs's hasher forwarders and SplitMix64 onto blaze-ids
 
@@ -1593,6 +1696,10 @@ the same bytes `Le` writes) and `blaze_ids::rng::SplitMix64` (`crates/blaze-ids/
    (the rest of `below` unchanged; the doc "SplitMix64. With `mutate`, ..." stays). Same draws for
    every seed, so no test's inputs change.
 
+> applied by codegen-v2 (2026-10-29): `Le`'s twelve integer writes are `blaze_ids::fixed_width_writes!()` and the test `Draws` draws from `blaze_ids::rng::SplitMix64`, both as asked.
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 
 ## speed-hir-store-paths: paths as columns (2026-10-29)
 
@@ -1647,6 +1754,8 @@ views by value; `ExprCollector::lower_path -> Option<PathIdx>`.
 Line numbers are as of 20:50; several of these files are being edited, so find each edit by its
 old text (where the same text is on several lines, the function named beside it picks).
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 
 ### crates/hir-ty-mir/src/mir/lower.rs
 
@@ -1668,14 +1777,24 @@ old text (where the same text is on several lines, the function named beside it 
 - line 1360: `path: path.clone(),` -> `path: path.mod_path().copied(),`
 - line 2161: `path: c.clone(),` -> `path: c.mod_path().copied(),`
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty-mir/src/mir/lower/pattern_matching.rs
 
 - line 598: `path: p.clone(),` -> `path: p.mod_path().copied(),`
+
+> applied by codegen-mir-store (2026-10-29): the `lower.rs` and `pattern_matching.rs` edits above
+> as written (`MirLowerError::UnresolvedName { path }` is `Option<ModPath>` from the db lane's
+> part); `eval.rs`'s is asked of codegen-mir.
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
 
 ### crates/hir-ty-mir/src/mir/eval.rs
 
 - line 5324: `&hir_def::expr_store::path::Path::from_known_path_with_no_generic(path![std::fmt::format]),` -> `hir_def::expr_store::path::Path::from_known_path_with_no_generic(&path![std::fmt::format]),`
   (the `path!` temporary lives to the end of the `let .. else`; the result borrows nothing)
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
 
 ### No change (checked)
 
@@ -1695,6 +1814,8 @@ old text (where the same text is on several lines, the function named beside it 
   working.
 
 Status: open
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
 
 ## dedup: one type identity (hashes.rs onto hir-ty-share)
 
@@ -1732,6 +1853,8 @@ identity holds its compiled code. Consequences:
 `hashes.rs` is being moved to `&Db` by `frontend-db` right now. The text below is written
 against that `&Db` state; apply it after that edit lands, or merge by function name.
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ### 1. `crates/hir-ty-codegen/Cargo.toml`
 
 Under `[dependencies]`, after `hir-ty-mir.workspace = true`, add the line below (it is the
@@ -1743,6 +1866,9 @@ hir-ty-share.workspace = true
 
 No cycle: `hir-ty-share` depends on `base-db`, `hir-def`, `hir-ty`, `hir-ty-mir`, `blaze-ids`
 and `blaze-items`, and none of these depends on `hir-ty-codegen`.
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
+> applied by codegen-v1 (2026-10-29): the line is in `crates/hir-ty-codegen/Cargo.toml` (manifest lint passes). Item 3 (`is_plain_data` in `mod.rs`) waits on `hir_ty_share::is_plain_data` being public (`v2/requests/fastcompile-ident-share.md`); it is not yet, so `FunctionCx::is_plain_data` stays until it is.
 
 ### 2. `crates/hir-ty-codegen/v2/hashes.rs` (replace the whole file)
 
@@ -1926,6 +2052,8 @@ not change, and its assertions hold under the shared spelling:
 - the callee's body edit and the local rename (both of `Hashes::code`, which is
   bit-identical).
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ### 3. `crates/hir-ty-codegen/mod.rs`: `FunctionCx::is_plain_data` onto `hir_ty_share::is_plain_data`
 
 In `reference_pointee`, before:
@@ -1959,6 +2087,8 @@ That changes no answer, because both reach `_ => false`. Share's
 `is_plain_data_is_the_code_generators` test checks it on the corpus against a copy of this
 method.
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ### Not part of this request (recorded so nobody merges them)
 
 - `v2/frontend.rs` `args_of` composes `Hashes::ty` and `Hashes::konst` over an instance's
@@ -1976,6 +2106,8 @@ method.
   `hir-ty-share/src/layout.rs`'s `Feed` and `blaze-hashcons`' `hash_std`. That is sibling
   `dedup-codec`'s, which has been told.
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ## dedup: bits: hir-ty-mir, hir-ty-codegen, blaze-codegen onto `blaze_ids::bits`
 
 From `dedup-bits-codegen` (report `/tmp/blaze-lanes/v2-dedup-bits-codegen.md`; parent
@@ -1986,6 +2118,8 @@ already depend on `blaze-ids`. Same members, same results, same panics on a bad 
 indexed out of bounds, and every caller here only asks below the domain it sized the set to.
 Nothing below is persisted or hashed. After it, `hir-ty-mir` names `rustc_index` nowhere, so it
 drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
 
 ### hir-ty-mir
 
@@ -2210,6 +2344,8 @@ drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
 5. `crates/hir-ty-mir/Cargo.toml`: delete the line `ra-ap-rustc_index.workspace = true`
    (`rg rustc_index crates/hir-ty-mir` finds nothing else after 3 and 4).
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ### hir-ty-codegen
 
 6. `crates/hir-ty-codegen/overlap.rs`, before:
@@ -2377,6 +2513,9 @@ drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
 
    (`use smallvec::SmallVec;` stays: `wanted` at about line 451 uses it too.)
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+> applied by codegen-v1 (2026-10-29): items 6 (`overlap.rs`) and 7 (`mod.rs`), as written; items 8 and 9 are in `v2/`, codegen-v2's.
+
 ### blaze-codegen
 
 10. `crates/blaze-codegen/src/imports.rs`: the `Bits` copy (node numbers, `u32`) goes.
@@ -2421,12 +2560,16 @@ drops `ra-ap-rustc_index`; `hir-ty-codegen` keeps it for `rustc_index::Idx`.
     (`call.args.get(at)`, `constants.get(key)`, `edges[node].get(edge)` and `index.get(..)` are
     not sets and stay.)
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ## dedup: kind_tag is pub (from dedup-scan)
 
 `crates/blaze-codegen/src/content.rs`: `pub(crate) fn kind_tag(kind: RelocKind) -> u8` →
 `pub fn kind_tag(kind: RelocKind) -> u8`, with the doc `/// The byte a [`RelocKind`] hashes as
 in a content key, and in blaze-premap's.` blaze-premap deletes its copy `reloc_tag`
 (fastcompile.md).
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
 
 ## dedup: one FrameRule in blaze-codegen (from dedup-scan)
 
@@ -2473,6 +2616,8 @@ adds `RaSignState`); both crates depend on blaze-codegen, which has serde's deri
   `FrameRule::on_entry(arch)` → `super::unwind::on_entry(arch)` in `llvm/emitted.rs`.
 - blaze-stencil re-exports it as its `Rule` (fastcompile.md).
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
 ## dedup: no-op landing pads once, in hir-ty-mir (from dedup-scan)
 
 `hir-ty-codegen/mod.rs`'s `fn resumes_only(body: &MirBody<'db>) -> FxHashSet<BasicBlockId>` is
@@ -2502,6 +2647,10 @@ Same set; the cleanup copy only skips ones already found.
   `Self::resumes_only(body)` → `hir_ty_mir::mir::noop_landing_pads(body)`; in `v2/refs.rs`
   `FunctionCx::resumes_only(body)` → the same.
 
+> forwarded to codegen (from requests, pass 16; told by tmux).
+> applied by codegen-v1 (2026-10-29): the `hir-ty-codegen/mod.rs` part (`resumes_only` deleted, the call is `hir_ty_mir::mir::noop_landing_pads(body)`); the `cleanup.rs`/`transform.rs`/`mir.rs` part asked of codegen-mir-store and `v2/refs.rs` of codegen-v2 (`~/restart-2026-10-28/briefs/v2/codegen-v1.requests.md`).
+> applied by codegen-mir-store (2026-10-29): `cleanup.rs` has `pub fn noop_landing_pads` (the fixpoint) and `remove_noop_landing_pads` uses it; `transform.rs` re-exports it `pub` (the remover stays `pub(super)`, as a `pub use` of a `pub(in crate::mir)` fn doesn't compile) and `mir.rs` adds it to `pub use transform::{..}`.
+
 ## dedup: optimize.rs successors are TerminatorKind::all_successors (from dedup-scan)
 
 `hir-ty-mir/src/mir/optimize.rs`'s `fn successors(kind: &TerminatorKind) ->
@@ -2510,3 +2659,46 @@ SmallVec<[BasicBlockId; 4]>` is borrowck's `cfg.rs` `successors` and blaze-items
 `TerminatorKind::all_successors` (db.md), delete `fn successors` and call
 `kind.all_successors()` where it was called (the stack becomes `SmallVec<[BasicBlockId; 2]>`
 where it was `[_; 4]`, or `.into_iter()` into the existing one). `successors_mut` stays.
+
+> forwarded to codegen (from requests, pass 16; told by tmux).
+
+## codegen-mir-store: the store keeps its macro calls without the source map (to format; 2026-10-29)
+
+From `codegen-mir-store` (child of codegen), for "frontend: MIR reads source maps only where a
+position is emitted" above. `crates/hir-def/src/expr_store.rs` and `expr_store/lower.rs` are
+format's.
+
+What: `ExpressionStore` keeps the `MacroCallId` of every macro call lowered into it, recorded
+whether or not the source map is (`record`), with
+```rust
+impl ExpressionStore {
+    /// Every macro call lowered into the store, in the order lowering met them: the calls of
+    /// [`ExpressionStoreSourceMap::macro_calls`], without the map.
+    pub fn macro_calls(&self) -> &[MacroCallId] { .. }
+}
+```
+- `ExpressionStoreBuilder` and `Scratch`: `macro_calls: Vec<MacroCallId>` beside `expansions`
+  (cleared in `Scratch::clear`, counted in `capacity`).
+- `expr_store/lower.rs`, both places that push `expansions` (~L2810 in `enter_expand`'s
+  callback, ~L2836 after a call expands): push the id to `macro_calls` first, outside
+  `if self.store.record`; `expansions` stays under it.
+- `finish`: `ExpressionOnlyStore` gets `macro_calls: Box<[MacroCallId]>` (from the scratch
+  `Vec`, empty boxed when none), and a store whose only content is macro calls still has an
+  `expr_only` (as `!expansions.is_empty()` makes one for the map). `macro_calls()` is `&[]`
+  without `expr_only`.
+- Both lowerings record it, so `Body::of`'s store stays equal to `relative`'s and
+  `with_source_map`'s (the existing `assert_eq!`s check it). A test in `tests/body.rs`: for every
+  fixture, the set of `macro_calls()` equals the set of ids of the map's `macro_calls()`.
+
+Why: MIR lowering refuses a body whose macro call failed to expand or expands to what rustc
+parses otherwise (`hir-ty-mir/src/mir/lower.rs` `failed_expansion`, on every `mir_body`); it
+read the calls from the source map, so every lowered body built its map a second time. Now
+`failed_expansion` reads `macro_calls()` and each call's site (`MacroCallLoc::to_node`);
+`location.rs` (`location_macros`, `located_concats`) and `type_name.rs`
+(`closures_around_query`) read the map only when `macro_calls()` names a `line!`, `column!`,
+`file!` or `concat!`, or any call at all. One `u32` per macro call. Written against this, in
+hir-ty-mir already (not compiled).
+
+Status: open
+
+> forwarded to mem-format (holds hir-def's `expr_store*`/`hir*` now; speed-hir is DONE; told by tmux).

@@ -82,7 +82,7 @@ for a query cycle. Salsa can't depend on blaze-graph, so the daemon hands it the
 
 ## 7. Docs (coordinator)
 
-`docs/v2-db.md` moved to `docs/v2/plan/lanes/db/query-database.md` (lane notes go in the lane's
+`docs/v2/plan/lanes/db.md` moved to `docs/v2/plan/lanes/db/query-database.md` (lane notes go in the lane's
 folder); the one link to it (`crates/blaze-query/src/lib.rs`) is updated. Index it wherever
 `python3 tools/docs.py check` wants lane notes listed.
 
@@ -3639,6 +3639,8 @@ they land. Design: `docs/v2/plan/lanes/dedup/macros.md`.
 
 The bytes are unchanged, so no format version bump. Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: `ProcMacroExpander` takes its call as one struct (proposal from dedup-macros, 2026-10-29)
 
 The trait's eight parameters (`db, subtree, attrs, env, def_site, call_site, mixed_site,
@@ -3679,6 +3681,8 @@ This is an interface change across lanes (usercode, cargo, coordinator's `blaze-
 so it is a proposal. If db takes it, dedup-macros writes the exact per-impl edits as requests to
 each owner. Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 
 ## dedup: stdx::edit_distance
 
@@ -3693,6 +3697,8 @@ against rustc's code). `stdx` is already a dependency of `hir-expand`. Apply onc
   is not `find_best_match_for_name`.
 
 Status: open
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 
 ## dedup: `hir_def::test_items`, a fixture's items by name for the tests above hir-def
@@ -3710,11 +3716,15 @@ databases becoming `type TestDB = base_db::Db;` (frontend-db), it takes `&Db`. T
 edits: `v2/requests/codegen.md`, `v2/requests/fastcompile-ident-share.md`, `v2/requests/items.md`,
 each under `## dedup: hir_def::test_items`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 1. `crates/hir-def/src/lib.rs`: after `pub mod visibility;` (line 49) add
 
 ```rust
 pub mod test_items;
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 2. New file `crates/hir-def/src/test_items.rs`
 
@@ -3801,6 +3811,8 @@ Its tests are its callers' (every helper is used by several suites above); hir-d
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: salsa's `Sip` hasher forwarders onto `blaze_ids::fixed_width_writes!`
 
 From `dedup-codec` (report `/tmp/blaze-lanes/v2-dedup-codec.md`). `vendor/salsa/src/fingerprint.rs`
@@ -3820,6 +3832,8 @@ in `crates/blaze-ids/src/std_hash.rs` (the same bytes; tested against the hand-w
    keep `write` and `finish`; replace the twelve methods `write_u8` through `write_isize` by the
    one line `blaze_ids::fixed_width_writes!();`. (`write_u8` becomes `self.write(&[i])`, as now;
    `write_isize` becomes `(i as i64).to_le_bytes()`, the bytes of `i as i64 as u64` now.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 
 ## speed-hir-store-paths: paths as columns (2026-10-29)
@@ -3875,6 +3889,8 @@ views by value; `ExprCollector::lower_path -> Option<PathIdx>`.
 Line numbers are as of 20:50; several of these files are being edited, so find each edit by its
 old text (where the same text is on several lines, the function named beside it picks).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 
 ### crates/hir-def/src/resolver.rs
 
@@ -3901,6 +3917,8 @@ value now, so `match *l` becomes `match l`.
 - line 645: `            Path::Normal(it) => &it.mod_path,` -> `            Path::Normal(it) => it.mod_path,`
 - line 871: `.resolve_path_in_type_ns_fully(db, &impl_data.store[target_trait.path])` -> `.resolve_path_in_type_ns_fully(db, impl_data.store.path(target_trait.path))`
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-def/src/upvars.rs
 
 - line 151: `    fn resolve_maybe_upvar(&mut self, expr: ExprId, path: &Path) {` -> `    fn resolve_maybe_upvar(&mut self, expr: ExprId, path: Path<'_>) {`
@@ -3909,12 +3927,16 @@ value now, so `match *l` becomes `match l`.
   `StoreVisitor::on_path` (`expr_store.rs`, the paths lane's) to take `path: Path<'_>` by
   value, per the signature rule.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-def/src/nameres/uses.rs
 
 - line 557: `resolver.record_path_uses(db, &path, Namespace::Types, hygiene, out);` -> `resolver.record_path_uses(db, path, Namespace::Types, hygiene, out);`
 - lines 535-551 stay: `Expr::Path(path)`, `Expr::RecordLit { path, .. }`, `Pat::Path(path)`,
   `Pat::TupleStruct { path, .. }`, `Pat::Record { path, .. }` bind `Path<'_>` from the
   by-value `store.exprs()`/`store.pats()` and pass it on as is.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 
 ### crates/hir-ty/src/lower/path.rs
@@ -3936,6 +3958,8 @@ by value under the rule) and `matches!(self.path, Path::LangItem(..))`; every
 `binding.bounds.iter()` unchanged); `:1186` `&args_and_bindings.args[..]`; `:1319`
 `is_some_and(|it| it.has_self_type)`; `:1550` `TypeRef::Path(path) => TypeLikeConst::Path(path)`
 (`store.type_ref` is by value).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### crates/hir-ty/src/lower.rs
 
@@ -3992,12 +4016,16 @@ Keep compiling as written: `:880`-`:882` and `:4109` (`TypeRef::Path(path)` from
 .is_empty()`, `it.parenthesized`, `it.args.iter()` unchanged); `:1100` (`FnType::binder` is
 unchanged).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty/src/consteval.rs
 
 - line 319: `    path: &Path,` -> `    path: Path<'_>,`
 
 `:393` `Expr::Path(path)` from `match expr` (`store.expr` by value) binds `Path<'_>` and passes
 it as is.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### crates/hir-ty/src/mir.rs
 
@@ -4023,6 +4051,8 @@ it as is.
 
 `mir.rs`'s `AsmOperand::Sym` hits are MIR's own `AsmOperand`, not hir-def's.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### Checked, nothing breaks
 
 - `crates/hir-ty/src/generics.rs:194`-`:210`: `TypeRef::Path(path)` by value; `type_anchor()`,
@@ -4041,6 +4071,8 @@ it as is.
   `infer.rs` and the items part's files (`mir/`, `variance/`, `target_feature/`, `autoderef.rs`,
   `utils.rs`, `primitive.rs`, `lang_items.rs`, `evict.rs`) has no hit.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 
 ### crates/hir-ty/src/infer.rs
 
@@ -4051,12 +4083,16 @@ it as is.
   (body stays: `path.type_anchor()`, `path.segments()`, `path.mod_path()` and
   `ctx.at_path(path, node)` all take the value).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty/src/infer/diagnostics.rs
 
 - line 138 (`at_path`): `        path: &'b Path,` -> `        path: Path<'b>,`
 - line 155 (`at_path_forget_diagnostics`): `        path: &'b Path,` -> `        path: Path<'b>,`
   (both `PathLoweringContext::new(&mut self.ctx, on_diagnostic, path)` calls stay; `new` takes
   `Path<'a>`.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### crates/hir-ty/src/infer/path.rs
 
@@ -4066,6 +4102,8 @@ it as is.
   (bodies stay: `if let Path::LangItem(..) = path` and `matches!(path, Path::LangItem(..))`
   match the value; `ctx.at_path(path, id)`, `ctx.at_path_forget_diagnostics(path)` and the
   `with_ty_lowering(|ctx| .. ctx.at_path(path, id) ..)` closure take the `Copy` value.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### crates/hir-ty/src/infer/expr.rs
 
@@ -4084,12 +4122,16 @@ self.infer_method_call(.., generic_args, ..)` (450), `is_syntactic_place_expr`'s
 `resolve_path_in_value_ns_fully(self.db, path, ..)` (225-237; `match self.store.expr(expr)` is
 by value), and `lookup_method_including_private(.., None, ..)` (1768).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty/src/infer/pat.rs
 
 - line 984: `fn resolve_record_pat(&mut self, pat: PatId, path: &Path) -> Result<ResolvedPat<'db>, ()> {` -> `fn resolve_record_pat(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {`
 - line 1011: `fn resolve_pat_path(&mut self, pat: PatId, path: &Path) -> Result<ResolvedPat<'db>, ()> {` -> `fn resolve_pat_path(&mut self, pat: PatId, path: Path<'_>) -> Result<ResolvedPat<'db>, ()> {`
 - line 1041 (`resolve_tuple_struct_pat`): `        path: &Path,` -> `        path: Path<'_>,`
   (the callers at 308-310 match `self.store.pat(pat_id)` by value and pass `path` as is.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### No edits
 
@@ -4102,6 +4144,8 @@ by value), and `lookup_method_including_private(.., None, ..)` (1768).
   `closure.rs`: only `next_solver` `GenericArgs`/`GenericArg` and `MethodCallee`/diagnostic
   names (false hits).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 
 ### crates/hir-ty-matchck/src/lower.rs
 
@@ -4111,6 +4155,8 @@ by value), and `lookup_method_including_private(.., None, ..)` (1768).
 `self.body.expr(..)` and pass it as is; line 326 passes it to `resolve_path_in_value_ns_fully`,
 which takes `Path<'_>`.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty-unsafeck/src/lib.rs
 
 - line 900: `fn check_static(&mut self, current: ExprId, path: &Path) {` -> `fn check_static(&mut self, current: ExprId, path: Path<'_>) {`
@@ -4119,11 +4165,15 @@ which takes `Path<'_>`.)
 `self.store`, so the `&mut self` call doesn't conflict; line 912 passes it to
 `resolve_path_in_value_ns` as is.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty-wfcheck/src/lib.rs
 
 - line 594: `store[*path].segments()` -> `store.path(*path).segments()`
 
 (`compare.rs`, `outlives.rs`, `outlives/tests.rs`: only `next_solver` hits, no edits.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### crates/hir-ty-borrowck/src/regions.rs
 
@@ -4157,6 +4207,8 @@ now `Option<GenericArgs>` by value); `path.qualifier().is_some_and(|it| it.is_se
 (`Qualifier::is_self_type` exists); `bound.as_path(store)` (line ~6632, gives `Path<'_>`);
 `TypeRef::Path(path)` from `store.type_ref(..)` (by value, lines 509, 5419, 6635, 6671, 6714).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty-borrowck/src/scan.rs, scan/tests.rs, loans.rs, qualifs.rs
 
 No edits: `Pat::Record { path, .. } | Pat::TupleStruct { path, .. } | Pat::Path(path)` and
@@ -4164,14 +4216,20 @@ No edits: `Pat::Record { path, .. } | Pat::TupleStruct { path, .. } | Pat::Path(
 `store.expr(..)`), passed to `spells_generics` (now `Path<'_>`) or
 `resolve_path_in_value_ns_fully` as is; `path.is_self_type()` (loans.rs 208) works on the view.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty-borrowck/src/check.rs, lib.rs, liveness.rs, names.rs, polonius.rs, moves.rs
 
 No edits: `next_solver` `GenericArgs`, MIR `AsmOperand`, and `self.bindings` / `store[binding]`
 (binding ids, not paths).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir-ty-matchck/src/cx.rs
 
 No edits: `next_solver` `GenericArgs` only.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 
 ### crates/hir/src/attrs.rs
@@ -4185,6 +4243,8 @@ No edits: `next_solver` `GenericArgs` only.
     let base_def = resolver.resolve_path_in_type_ns_fully(db, path)?;
 ```
 (lines 432-433; the shadowed `ModPath` stays alive to the end of the function.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### crates/hir/src/display.rs
 
@@ -4224,6 +4284,8 @@ No edits: `next_solver` `GenericArgs` only.
   (`write_where_predicates` gets the generics' own store at both calls, 148 and 780)
 
 Unchanged: 328-329 `TypeRef::Path(p) if p.is_self_type()` (by-value view), 793, 817-850 otherwise.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### crates/hir/src/source_analyzer.rs
 
@@ -4302,6 +4364,8 @@ views) passed to `resolve_hir_value_path` at 1065; the bodies of the five functi
 `path.mod_path()?`, `path.type_anchor()` and the resolver calls take it by value); 1336-1340
 `hir_path.mod_path()`, `parent_hir_path.segments().get(1).map(|it| it.name)`; 2183.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir/src/semantics.rs
 
 - line 2465: `let is_not_generated = |path: &Path| {` -> `let is_not_generated = |path: Path<'_>| {`
@@ -4312,6 +4376,8 @@ views) passed to `resolve_hir_value_path` at 1065; the bodies of the five functi
 
 Unchanged: 1730 `TypeRef::Path(path) => path` (by-value `type_ref` view) into `resolve_path_in_type_ns_fully`.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### crates/hir/src/diagnostics.rs
 
 - line 1924: `let args = store[*path].generic_args()?.last()?.as_ref()?;` -> `let args = store.path(*path).generic_args()?.last()??;`
@@ -4319,6 +4385,8 @@ Unchanged: 1730 `TypeRef::Path(path) => path` (by-value `type_ref` view) into `r
 Unchanged: 1771-1773 (`TypeBound::Path(path, _) | TypeBound::ForLifetime(_, path)` bind `&PathId`;
 `path.type_ref()`), 1840 `args.bindings.first()?.type_ref?`. Every other hit is a diagnostic's
 name (`UnresolvedMethodCall`, `GenericArgsProhibited`, ...).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### hir, no edit
 
@@ -4329,6 +4397,8 @@ name (`UnresolvedMethodCall`, `GenericArgsProhibited`, ...).
 - `source_analyzer.rs:387`: `where_predicate_must_hold(.., predicate)` (hir-ty `traits.rs`, the `lower` part's).
 
 Status: open
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## frontend-nameres-core-macros: `Debug` on `MacroSubNs` (2026-10-29)
 
@@ -4341,7 +4411,10 @@ Why: `collector.rs`'s `#[derive(Debug)] struct ResolvedMacroPath` (the `NameReco
 a `MacroSubNs` and does not compile without it. (The facts resolver's `DeclOp::ResolvedMacroPath`
 carries `bang: bool` instead, so it does not need this.)
 
-Status: open
+Status: withdrawn by frontend-nameres-core-macros (2026-10-29, at core's request: the facts op
+carries `bang: bool`). Whether collector.rs's `derive(Debug)` needs it is db-expand-names' call.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## dedup: bits: hir-ty-borrowck onto `blaze_ids::bits` (from dedup-bits-db)
 
@@ -4363,7 +4436,11 @@ now return `BitSlice`/`BitSliceMut` views, not `&[u64]`/`&mut [u64]`: take `.wor
 slice is wanted. `BitMatrix::insert` now returns `bool` (whether it was new), so a closure
 that ends in it gains braces (`liveness.rs`'s `locals_in` callers).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 1. `crates/hir-ty-borrowck/src/bitset.rs`: delete the file.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 2. `crates/hir-ty-borrowck/src/lib.rs`
 
@@ -4379,6 +4456,8 @@ After:
 ```rust
 mod cfg;
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 3. `crates/hir-ty-borrowck/src/dataflow.rs`
 
@@ -4556,6 +4635,8 @@ After:
     }
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 4. `crates/hir-ty-borrowck/src/loans.rs`
 
 Before:
@@ -4581,6 +4662,8 @@ use super::{
 
 No other change (`BitSet::new`, `insert`, `BitMatrix::new` keep their meaning).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 5. `crates/hir-ty-borrowck/src/moves.rs`
 
 Before:
@@ -4605,6 +4688,8 @@ use super::{
 ```
 
 No other change (`first_in`, `filled`, `kill_range` through `Transfer`, `insert`).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 6. `crates/hir-ty-borrowck/src/liveness.rs`
 
@@ -4707,6 +4792,8 @@ After:
 
 (`values[rv].union(..)` in this file is `IntervalSet::union`: unchanged.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 7. `crates/hir-ty-borrowck/src/check.rs`
 
 Before:
@@ -4744,6 +4831,8 @@ After:
         checker.in_scope.assign_words(borrows_entry.row(index(block)).words());
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 8. `crates/hir-ty-borrowck/src/check/explain.rs`
 
 Before:
@@ -4767,6 +4856,8 @@ use crate::{
     cfg::Location,
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 9. `crates/hir-ty-borrowck/src/scan.rs`
 
 Before:
@@ -4785,6 +4876,8 @@ use blaze_ids::bits::BitSet;
 
 use crate::regions::{Annotation, spells_generics};
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 10. `crates/hir-ty-borrowck/src/polonius.rs`
 
@@ -4809,6 +4902,8 @@ use super::{
 
 (`polonius.rs` already has `use blaze_ids::radix;`; the two may merge into
 `use blaze_ids::{bits::BitSet, radix};`.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 11. `crates/hir-ty-borrowck/src/inference.rs`
 
@@ -4841,6 +4936,8 @@ After:
         self.universals.iter_row(self.scc[rv] as usize)
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 12. `crates/hir-ty-borrowck/src/regions.rs`
 
 Before:
@@ -4863,6 +4960,8 @@ use super::{
 ```
 
 No other change (`BitMatrix::default`, `new`, `insert`, `contains`, `union_rows`).
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 13. `crates/hir-ty-borrowck/src/constraints.rs`: the inline `from_closure` words
 
@@ -4926,6 +5025,8 @@ After:
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: bits: hir-ty `infer/columns.rs` sets onto `blaze_ids::bits` (from dedup-bits-db)
 
 From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
@@ -4942,6 +5043,8 @@ its word slice, as a `Vec<u64>` does); `Hash` of `Presence` now also hashes `Ran
 (`words.len() * 64`, a function of the words), so in-memory hash values of `IndexColumn`/`Csr`
 change, which is harmless: nothing persists a `std::hash::Hash` value, and equality is the same.
 `hir-ty/Cargo.toml` already has `blaze-ids.workspace = true`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 1. `crates/hir-ty/src/infer/columns.rs`
 
@@ -5335,6 +5438,8 @@ After:
 
 (the rest of that test is unchanged: `iter()` yields `u32`, `contains(var)` takes a `u32`).
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 2. `crates/hir-ty/src/infer/unify.rs`
 
 Before:
@@ -5396,6 +5501,8 @@ After:
             self.diverging_type_vars.insert_growing(vid.as_u32());
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 3. `crates/hir-ty/src/infer/fallback.rs`
 
 Before:
@@ -5452,6 +5559,8 @@ After:
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: bits: hir-ty `TargetFeatureSet` onto `blaze_ids::bits::BitArray` (from dedup-bits-db)
 
 From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
@@ -5463,6 +5572,8 @@ features, and its `const fn` API takes `TargetFeature`s, used by `hir-ty-codegen
 logic deleted; `TargetFeature` becomes a `BitIndex`. Nothing changes for callers: the same API,
 72 bytes (asserted), the same `Eq`, and the same `Hash` value (an array and a `Bits` both hash
 the word slice, length first). `hir-ty/Cargo.toml` already has `blaze-ids.workspace = true`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### `crates/hir-ty/src/target_feature.rs`
 
@@ -5657,6 +5768,8 @@ are unchanged.
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: bits: hir-ty `ParamsInRepr` onto `blaze_ids::bits` (from dedup-bits-db)
 
 From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
@@ -5668,6 +5781,8 @@ memo is small next to the memo's own revision data, so the 16-byte layout is not
 the set kept on purpose. The same members; `contains` past the words is false, as `get` was.
 `ParamsInRepr` is private to the file, so nothing outside changes. `hir-ty/Cargo.toml` already
 has `blaze-ids.workspace = true` and `smallvec.workspace = true`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### `crates/hir-ty/src/representability.rs`
 
@@ -5832,6 +5947,8 @@ After:
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: TerminatorKind::all_successors (from dedup-scan)
 
 Four copies of "every successor, the unwind last" (borrowck `cfg.rs` `successors`, hir-ty-mir
@@ -5857,6 +5974,8 @@ pub fn all_successors(&self) -> SmallVec<[BasicBlockId; 2]> {
 call `kind.all_successors()` where it was called (`Cfg::successors(&self, block)` keeps its name).
 Callers in codegen.md and items.md.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: ARITH_OPS is ArithOp::ALL (from dedup-scan)
 
 `crates/hir-def/src/hir/columns.rs` and `crates/hir-ty/src/infer/persist.rs` each have
@@ -5864,6 +5983,8 @@ Callers in codegen.md and items.md.
 persisted codes. After frontend-tree adds `ArithOp::ALL` (frontend-tree.md), delete both consts
 and use `ArithOp::ALL` at each `ARITH_OPS` (columns.rs 571, 578, 2022, 2023; persist.rs 424, 431,
 2349, 2943). Same order, so every code decodes as before.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## dedup: block_may_start_with_inner_attr once, in syntax::view (from dedup-scan)
 
@@ -5874,6 +5995,8 @@ syntax's `block_may_start_with_inner_attr` and `block_comment_len` (in both `ast
 (frontend-tree.md), delete both functions from docs.rs and call
 `syntax::view::block_may_start_with_inner_attr(block, true)` where
 `block_may_start_with_inner_doc(block)` was.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## dedup: bits: hir-ty `mir/held.rs` off `rustc_index::DenseBitSet` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
 
@@ -5887,6 +6010,8 @@ every set of one analysis is made with the same size, so equality (`live_in[..] 
 unchanged. One check is weaker: `DenseBitSet::insert` asserts the bit is below the domain size,
 `BitSet::insert` only below the word capacity (the next multiple of 64); every index here is a
 local of the body, below `count`. `hir-ty/Cargo.toml` already has `blaze-ids.workspace = true`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### `crates/hir-ty/src/mir/held.rs`
 
@@ -5942,6 +6067,8 @@ meaning.
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## frontend-db: the `compile_fail` test that `HirDatabase` is not dyn-compatible doesn't run (2026-10-29)
 
 `frontend-db-ty` sealed `HirDatabase` and gave it `const NOT_DYN: ()`, so `dyn HirDatabase` is a
@@ -5956,6 +6083,8 @@ test only documents it. Choose one:
 Answer with a `>` line.
 
 Status: open
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ## dedup: blaze_query::query_kinds! (from dedup-scan)
 
@@ -6024,6 +6153,8 @@ macro_rules! query_kinds {
 Numbers and names are unchanged, so traces and the explainer read as before.
 `hir-def/src/expr_store/persist.rs`'s `kinds!` is another macro (column enums) and stays.
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: bits: hir-def `item_scope.rs` `Bits`, `signatures.rs` `VariantBits`, `import_map.rs` `trait_assoc_items` onto `blaze_ids::bits` (from dedup-bits-db)
 
 From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
@@ -6038,6 +6169,8 @@ fields). Two reads no longer panic on an index past the words (`VariantBits::get
 `contains` is false there); every index is a variant or row of the list beside it, so none is.
 The derived `Debug` now lists the members instead of the words. `hir-def/Cargo.toml` already has
 `blaze-ids.workspace = true`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 1. `crates/hir-def/src/item_scope.rs`
 
@@ -6162,6 +6295,8 @@ After:
         reservation_impl.shrink_to_fit();
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 2. `crates/hir-def/src/nameres/frozen.rs`
 
 Before:
@@ -6192,6 +6327,8 @@ After (the persisted bytes are unchanged: a bool a position):
             scope.reservation_impl.set_growing(at, self.bool()?);
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 3. `crates/hir-def/src/nameres/facts/tests.rs`
 
 Before:
@@ -6205,6 +6342,8 @@ After:
 ```rust
                     .map(|(at, &it)| (self.impl_(it), trait_impl.contains(at), reservation_impl.contains(at)))
 ```
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### 4. `crates/hir-def/src/signatures.rs`
 
@@ -6328,6 +6467,8 @@ After:
         assert!(VariantBits::new(65).into_words().spilled());
 ```
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### 5. `crates/hir-def/src/import_map.rs`
 
 Imports, before:
@@ -6407,6 +6548,8 @@ After:
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: bits: blaze-query `Marks` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
 
 From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
@@ -6415,6 +6558,8 @@ Why: `Marks` is a growable `u64`-word set of memo IDs with its own bit logic; it
 `blaze_ids::bits::BitSet<MemoId>` (`MemoId` is `u32`, a `BitIndex`), sized by `new` and grown
 by `insert_growing` as `Marks::insert` grew. Same members, same "whether it was new" result.
 `blaze-query/Cargo.toml` already has `blaze-ids.workspace = true`.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### `crates/blaze-query/src/lib.rs`
 
@@ -6512,6 +6657,8 @@ After:
 
 (`hot.contains(memo)`, `reached.contains(memo)` and `held.contains(memo)` are unchanged.)
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ### `crates/blaze-query/src/tests.rs`
 
 Imports: `Marks, ` leaves the `use crate::{ ... }` list, and the file gains
@@ -6541,6 +6688,8 @@ After:
 
 Status: open
 
+> forwarded to db (from requests, pass 16; told by tmux).
+
 ## dedup: bits: vendor/salsa `capture.rs` `Frame::old` onto `blaze_ids::bits::BitSet` (from dedup-bits-db)
 
 From `dedup-bits-db` (report `/tmp/blaze-lanes/v2-dedup-bits-db.md`), for lane `dedup-bits`.
@@ -6552,6 +6701,8 @@ then `insert` (one load, test and store, as before); `recycle` clears each bit i
 in `old` is a position in `read`. The buffer is still grown once, to the frame's `base`, and
 reused by later captures. `blaze-ids` depends on nothing of salsa's (blake3, blaze-radix, serde,
 smallvec, thin-vec), so the edge is acyclic; salsa already has it as a dev-dependency.
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### `vendor/salsa/Cargo.toml`
 
@@ -6572,6 +6723,8 @@ path = "../../crates/blaze-ids"
 
 (The tests that used it as a dev-dependency keep working: a normal dependency is visible to
 tests.)
+
+> forwarded to db (from requests, pass 16; told by tmux).
 
 ### `vendor/salsa/src/capture.rs`
 
@@ -6678,3 +6831,24 @@ After:
 ```
 
 Status: open
+
+> forwarded to db (from requests, pass 16; told by tmux).
+
+## 13. Forwards from db-matchck and db-unsafeck (db, 21:50)
+
+Two of db-matchck's requests (`v2/requests/db-matchck.md`) are for the coordinator:
+- 4 is already applied by requests-db-fixture. The matching hir arm is removed by db.
+- 10: `#[derive(PartialEq, Eq)]` on minicore's `Option` (`crates/test-utils/src/minicore.rs:1609`).
+  Without it, the `match_arm_statics` fixture is refused where rustc builds it.
+
+Inside lane db: 11 (`StructuralPartialEq` from the expanded derive) is with db-expand-next2, and
+7 (no borrow check of a refused body) with db-ty-next2.
+
+db-unsafeck's requests (`v2/requests/db-unsafeck.md`):
+- Diagnostics: 3, the six new `UnsafetyReason`s in `lower/missing_unsafe.rs`.
+- Tools: 6.
+- At integration: `impl_hir_database!` moves out of hir-ide along with its test dev-dependency.
+- Inside lane db: 4 (`wrap_binder!` lowering) is with db-expand, and 5 (static-path bitset)
+  with db-ty.
+
+> forwarded to db (from requests, pass 17; told by tmux).

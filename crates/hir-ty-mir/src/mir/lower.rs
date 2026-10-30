@@ -48,6 +48,7 @@ use crate::{
         },
     },
     inhabitedness::is_ty_uninhabited_from,
+    intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::CandidateId,
     mir::{
         AggregateKind, Arena, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind,
@@ -2660,6 +2661,7 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
         is_uninhabited: bool,
         span: MirSpan,
     ) -> Result<'db, Option<BasicBlockId>> {
+        let intrinsic = self.callee_intrinsic(&func)?;
         let b = if is_uninhabited { None } else { Some(self.new_basic_block()) };
         let cleanup = self.unwind_here();
         self.set_terminator(
@@ -2671,10 +2673,26 @@ impl<'a, 'db> MirLowerCtx<'a, 'db> {
                 target: b,
                 cleanup,
                 from_hir_call: true,
+                intrinsic,
             },
             span,
         );
         Ok(b)
+    }
+
+    /// The intrinsic a call of `func` calls, if `func` is the function item of one. rustc
+    /// refuses to make a function pointer of an intrinsic, so a call through one is none.
+    fn callee_intrinsic(&self, func: &Operand) -> Result<'db, Option<Intrinsic>> {
+        let ty = match &func.kind {
+            OperandKind::Allocation { allocation } => allocation.as_ref().ty,
+            OperandKind::Constant { ty, .. } => ty.as_ref(),
+            OperandKind::Copy(_) | OperandKind::Move(_) | OperandKind::Static(_) => {
+                return Ok(None);
+            }
+        };
+        let TyKind::FnDef(def, _) = ty.kind() else { return Ok(None) };
+        let CallableDefId::FunctionId(callee) = def.0 else { return Ok(None) };
+        intrinsic_of(self.db, callee).map_err(|unknown| MirLowerError::UnknownIntrinsic(unknown.0))
     }
 
     fn is_unterminated(&mut self, source: BasicBlockId) -> bool {

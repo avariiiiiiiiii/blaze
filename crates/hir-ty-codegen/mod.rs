@@ -87,7 +87,7 @@ use self::vtable::{Slot, Upcast, VtableLayout};
 pub use hir_ty_mir::mir::location::name_sources;
 use hir_ty_mir::mir::{
     AggregateKind, AssertKind, BasicBlockId, BinOp, CastKind, FrameStorage, LocalId, MirBody,
-    MirEvalError, MirOptLevel, MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem,
+    MirEvalError, MirOptLevel, MirOptions, MirPhase, MirSpan, Operand, OperandKind, PlaceTy, ProjectionElem,
     Rvalue, StatementKind, StoredPlace, TerminatorKind, UnOp, interpret_mir,
     location::{
         ConcatPart, column_width, concat_parts, line_and_column, located_concats, location_macros,
@@ -145,9 +145,12 @@ pub fn host_cpu() -> Option<(String, String)> {
         let name = unsafe { tm::LLVMGetHostCPUName() };
         // SAFETY: `name` is LLVM's string from just above, owned here and taken once.
         let name = unsafe { owned(name) };
-        // SAFETY: as for the name.
+        // SAFETY: LLVMGetHostCPUFeatures only reads the host CPU and needs no LLVM state set
+        // up first; it returns a string LLVM allocated, which this code now owns.
         let features = unsafe { tm::LLVMGetHostCPUFeatures() };
-        // SAFETY: as for the name.
+        // SAFETY: `features` is the NUL-terminated string LLVMGetHostCPUFeatures just
+        // allocated, owned here and given to `owned` once, which disposes of it; a second use
+        // would read freed memory.
         let features = unsafe { owned(features) };
         Some((name, features))
     }
@@ -163,6 +166,8 @@ mod units;
 use self::places::{row_location, source_location};
 mod promote;
 mod settled;
+mod lent;
+use lent::Lent;
 mod spare;
 pub(crate) use spare::with_context;
 mod stable;
@@ -1215,7 +1220,7 @@ impl CodegenUnit {
                 let instances = cg.instances.len();
                 if let Some(store) = store::Store::global() {
                     let mut misses: Vec<_> = cg.names.misses.take().into_iter().collect();
-                    misses.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
+                    blaze_ids::radix::sort_copy_by_key(&mut misses, |it| !it.1);
                     let (mut kept, writer) = (std::mem::take(&mut cg.kept), cg.writer.take());
                     // The object and the link do not wait for the store to have what was
                     // kept: whoever reads the store next does.
@@ -2444,12 +2449,12 @@ impl Kept {
         }
         if !unkept.is_empty() {
             let mut unkept: Vec<_> = unkept.iter().collect();
-            unkept.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
+            blaze_ids::radix::sort_copy_by_key(&mut unkept, |it| !*it.1);
             eprintln!("not kept: {unkept:?}");
         }
         if !unfound.is_empty() {
             let mut unfound: Vec<_> = unfound.iter().collect();
-            unfound.sort_unstable_by_key(|it| std::cmp::Reverse(it.1));
+            blaze_ids::radix::sort_copy_by_key(&mut unfound, |it| !*it.1);
             eprintln!("not found: {unfound:?}");
         }
     }
@@ -3475,15 +3480,31 @@ pub fn rustc_links_dead_code(links: bool) {
     backend::link_dead_code(links);
 }
 
-/// The body the code generator compiles of `def`: the runtime body, optimized at
-/// [`mir_opt_level_of`] its crate.
+/// What the bodies of `krate` are optimized for: [`mir_opt_level_of`] it, rustc's UB checks
+/// where its `-C debug-assertions` is on (`sess.ub_checks()` of the crate whose MIR it is,
+/// not [`ub_checks_of`], the calling crate's `ub_checks()`), and lifetime markers kept.
+fn mir_options_of(db: &dyn HirDatabase, krate: Crate) -> MirOptions {
+    MirOptions {
+        level: mir_opt_level_of(db, krate),
+        ub_checks: debug_assertions(db, krate),
+        lifetime_markers: true,
+    }
+}
+
+/// Whether `options` ask for nothing beyond the runtime body: no passes and no checks.
+fn is_runtime(options: MirOptions) -> bool {
+    options.level == MirOptLevel::Off && !options.ub_checks
+}
+
+/// The body the code generator compiles of `def`: the runtime body, optimized and checked as
+/// [`mir_options_of`] its crate asks.
 fn compiled_mir_body<'db>(
     db: &'db dyn HirDatabase,
     def: InferBodyId<'db>,
 ) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
-    match mir_opt_level_of(db, def.module(db).krate(db)) {
-        MirOptLevel::Off => db.runtime_mir_body(def),
-        level => db.optimized_mir_body(def, level),
+    match mir_options_of(db, def.module(db).krate(db)) {
+        options if is_runtime(options) => db.runtime_mir_body(def),
+        options => db.optimized_mir_body(def, options),
     }
 }
 
@@ -3491,9 +3512,26 @@ fn compiled_mir_body_for_closure<'db>(
     db: &'db dyn HirDatabase,
     closure: InternedClosureId<'db>,
 ) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
-    match mir_opt_level_of(db, closure.loc(db).owner.module(db).krate(db)) {
-        MirOptLevel::Off => db.runtime_mir_body_for_closure(closure),
-        level => db.optimized_mir_body_for_closure(closure, level),
+    match mir_options_of(db, closure.loc(db).owner.module(db).krate(db)) {
+        options if is_runtime(options) => db.runtime_mir_body_for_closure(closure),
+        options => db.optimized_mir_body_for_closure(closure, options),
+    }
+}
+
+/// The body of a coroutine (`by_move`: its by-move twin): the runtime body, with rustc's UB
+/// checks where [`mir_options_of`] its crate asks for them. Coroutines are not optimized
+/// further.
+fn compiled_mir_body_for_coroutine<'db>(
+    db: &'db dyn HirDatabase,
+    coroutine: InternedCoroutineId<'db>,
+    by_move: bool,
+) -> std::result::Result<&'db MirBody<'db>, hir_ty_mir::mir::MirLowerError<'db>> {
+    let options = mir_options_of(db, coroutine.loc(db).owner.module(db).krate(db));
+    match (options.ub_checks, by_move) {
+        (false, false) => db.runtime_mir_body_for_coroutine(coroutine),
+        (false, true) => db.runtime_mir_body_for_coroutine_by_move(coroutine),
+        (true, false) => db.optimized_mir_body_for_coroutine(coroutine, options),
+        (true, true) => db.optimized_mir_body_for_coroutine_by_move(coroutine, options),
     }
 }
 
@@ -3515,20 +3553,28 @@ fn instance_body<'db>(
     // The database keeps a monomorphized body of the runtime body only, which only
     // `BLAZE_MIR_OPT=0` compiles.
     let lean = *LEAN || mir_opt_level() != Some(MirOptLevel::Off);
+    // A body with rustc's UB checks is never the runtime one.
+    let checked = |owner: InferBodyId<'db>| mir_options_of(db, owner.module(db).krate(db)).ub_checks;
     let body = match instance.def {
-        InstanceDef::Fn(func) if lean => tally
+        InstanceDef::Fn(func) if lean || checked(func.into()) => tally
             .step(Step::Mir, || compiled_mir_body(db, func.into()))
             .and_then(|it| filled(it, &args, &env)),
-        InstanceDef::Closure(id) if lean => {
+        InstanceDef::Closure(id) if lean || checked(InternedClosureId::from_id(id).loc(db).owner) => {
             compiled_mir_body_for_closure(db, InternedClosureId::from_id(id))
                 .and_then(|it| filled(it, &args, &env))
         }
-        InstanceDef::Coroutine(id) if *LEAN => db
-            .runtime_mir_body_for_coroutine(InternedCoroutineId::from_id(id))
-            .and_then(|it| filled(it, &args, &env)),
-        InstanceDef::CoroutineByMove(id) if *LEAN => db
-            .runtime_mir_body_for_coroutine_by_move(InternedCoroutineId::from_id(id))
-            .and_then(|it| filled(it, &args, &env)),
+        InstanceDef::Coroutine(id)
+            if *LEAN || checked(InternedCoroutineId::from_id(id).loc(db).owner) =>
+        {
+            compiled_mir_body_for_coroutine(db, InternedCoroutineId::from_id(id), false)
+                .and_then(|it| filled(it, &args, &env))
+        }
+        InstanceDef::CoroutineByMove(id)
+            if *LEAN || checked(InternedCoroutineId::from_id(id).loc(db).owner) =>
+        {
+            compiled_mir_body_for_coroutine(db, InternedCoroutineId::from_id(id), true)
+                .and_then(|it| filled(it, &args, &env))
+        }
         InstanceDef::Fn(func) => {
             db.monomorphized_runtime_mir_body(func.into(), args, env).map(Cow::Borrowed)
         }
@@ -3636,7 +3682,7 @@ fn coroutine_layout_line<'db>(
         .map(|variant| {
             let mut offsets = upvars.clone();
             offsets.extend(variant.field_offsets.iter().map(|it| it.bytes()));
-            offsets.sort_unstable();
+            blaze_ids::radix::sort(&mut offsets);
             offsets.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
         })
         .collect();
@@ -5349,9 +5395,11 @@ fn root_body<'db>(
     let body = if opaque {
         let args = GenericArgs::new_from_slice(&[]).store();
         tally
-            .step(Step::Monomorphize, || match mir_opt_level_of(db, krate) {
-                MirOptLevel::Off => db.monomorphized_runtime_mir_body(owner, args, env.store()),
-                level => db.monomorphized_optimized_mir_body(owner, level, args, env.store()),
+            .step(Step::Monomorphize, || match mir_options_of(db, krate) {
+                options if is_runtime(options) => {
+                    db.monomorphized_runtime_mir_body(owner, args, env.store())
+                }
+                options => db.monomorphized_optimized_mir_body(owner, options, args, env.store()),
             })
             .map_err(|e| CodegenError::Frontend(format!("mir: {e:?}")))?
     } else {
@@ -8279,26 +8327,7 @@ struct KeptLayouts {
 
 impl KeptLayouts {
     fn new() -> Self {
-        Self { asked: Lent(Default::default()), variants: Lent(Default::default()) }
-    }
-}
-
-/// Values lent for as long as the list lives. Each is behind a pointer of its own, so the
-/// list growing moves the pointers, never what they point at.
-struct Lent<P>(std::cell::RefCell<Vec<P>>);
-
-/// A pointer whose target stays where it is when the pointer moves.
-trait Stable: std::ops::Deref {}
-impl<T> Stable for Arc<T> {}
-impl<T> Stable for Box<T> {}
-
-impl<P: Stable> Lent<P> {
-    fn alloc(&self, value: P) -> &P::Target {
-        let at: *const P::Target = &*value;
-        self.0.borrow_mut().push(value);
-        // SAFETY: `P` is `Stable`, so `at` stays valid while `value` is in the list, and
-        // nothing is taken out of the list before it is dropped, which `&self` outlives.
-        unsafe { &*at }
+        Self { asked: Lent::default(), variants: Lent::default() }
     }
 }
 
@@ -9127,7 +9156,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         let mut leaves = Vec::new();
         self.scalar_leaves(ty, 0, &mut leaves)?;
         // The members of a union lie over each other.
-        leaves.sort_by_key(|&(offset, _)| offset);
+        blaze_ids::radix::sort_copy_by_key(&mut leaves, |&(offset, _)| offset);
         leaves.dedup();
         // A homogeneous floating-point aggregate: one to four floats of one type and
         // nothing else, which go in as many vector registers.
@@ -10826,11 +10855,13 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
         Ok(())
     }
 
-    /// Calls the panic function core declares at `path` with pointer-sized `args`: the
+    /// Calls the panic function core declares at `path` with `args`, each passed as the type
+    /// it has (pointer-sized but for `panic_invalid_enum_construction`'s `u128`): the
     /// function itself, as any other call of it, or by its path when core isn't in the graph.
     fn call_panic(&mut self, path: &[&'static str], args: &[Value]) -> Result<()> {
         let mut sig = self.cg.make_signature();
-        sig.params.extend(args.iter().map(|_| AbiParam::new(ptr())));
+        let dfg = &self.builder.func.dfg;
+        sig.params.extend(args.iter().map(|&it| AbiParam::new(dfg.value_type(it))));
         let callee = match self.core_panic(path) {
             Some(func) => {
                 let none = GenericArgs::new_from_slice(&[]);
@@ -12970,6 +13001,26 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     }
 
     /// Branches to a call of core's `panic_const_*` when `cond` is set.
+    /// Calls `core::panicking::{name}` with `args` and the caller's location where `cond`
+    /// holds: the panics of rustc's UB checks (`check_pointers`, `check_enums`), which are
+    /// `#[track_caller]` and do not unwind.
+    fn ub_check_panic_if(&mut self, cond: Value, name: &'static str, args: &[Value]) -> Result<()> {
+        let panic_block = self.builder.create_block();
+        let ok_block = self.builder.create_block();
+        self.builder.set_cold_block(panic_block);
+        self.builder.ins().brif(cond, panic_block, &[], ok_block, &[]);
+
+        self.builder.switch_to_block(panic_block);
+        let location = self.caller_location()?;
+        let mut with = smallvec::SmallVec::<[Value; 3]>::from_slice(args);
+        with.push(location);
+        self.call_panic(&["panicking", name], &with)?;
+        self.builder.ins().trap(TrapCode::user(1).expect("non-zero trap code"));
+
+        self.builder.switch_to_block(ok_block);
+        Ok(())
+    }
+
     fn panic_if(&mut self, cond: Value, op: OverflowOp) -> Result<()> {
         let name = match op {
             OverflowOp::Add => "panic_const_add_overflow",
@@ -13108,7 +13159,7 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
     ) {
         // A local kept in a register gets its slot later, if ever: see `local_slot`.
         let mut registers: Vec<LocalId> = self.registers.keys().copied().collect();
-        registers.sort_unstable_by_key(|it| it.into_raw().into_u32());
+        blaze_ids::radix::sort_copy_by_key(&mut registers, |it| it.into_raw().into_u32());
         let count = shareable.len() + registers.len();
         if count < 2 {
             return;
@@ -13363,6 +13414,32 @@ impl<'cx, 'db> FunctionCx<'cx, 'db> {
                             let (len, _) = self.load_scalar(len)?;
                             let (index, _) = self.load_scalar(index)?;
                             self.bounds_panic_if(failed, index, len)?;
+                            None
+                        }
+                        AssertKind::MisalignedPointerDereference { required, found } => {
+                            let (required, _) = self.load_scalar(required)?;
+                            let (found, _) = self.load_scalar(found)?;
+                            let name = "panic_misaligned_pointer_dereference";
+                            self.ub_check_panic_if(failed, name, &[required, found])?;
+                            None
+                        }
+                        AssertKind::NullPointerDereference => {
+                            self.ub_check_panic_if(failed, "panic_null_pointer_dereference", &[])?;
+                            None
+                        }
+                        AssertKind::NullReferenceConstructed => {
+                            let name = "panic_null_reference_constructed";
+                            self.ub_check_panic_if(failed, name, &[])?;
+                            None
+                        }
+                        AssertKind::InvalidEnumConstruction(source) => {
+                            let (source, _) = self.load_scalar(source)?;
+                            let ty = self.builder.func.dfg.value_type(source);
+                            if ty != types::I128 {
+                                unsupported!("an invalid enum's value as {ty}, not `u128`");
+                            }
+                            let name = "panic_invalid_enum_construction";
+                            self.ub_check_panic_if(failed, name, &[source])?;
                             None
                         }
                         AssertKind::Overflow(BinOp::Add, ..) => Some(OverflowOp::Add),
@@ -19586,7 +19663,9 @@ fn moved_arguments(
     });
     let temps: rustc_hash::FxHashSet<LocalId> = found.iter().map(|it| it.0).collect();
     found.retain(|(_, from)| !temps.contains(from));
-    found.sort();
+    blaze_ids::radix::sort_copy_by_key(&mut found, |&(temp, from)| {
+        blaze_ids::radix::pack_32(temp.into_raw().into_u32(), from.into_raw().into_u32())
+    });
     found.dedup();
     found
 }

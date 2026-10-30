@@ -22,7 +22,7 @@ mod tokens;
 
 use hir::{HirFileId, InFile};
 use span::{Edition, SyntaxContext};
-use syntax::{AstNode, TextRange, TextSize, ast};
+use syntax::{AstNode, SyntaxNode, SyntaxNodePtr, TextRange, TextSize, ast};
 
 use self::{
     check::{Checker, Misuse},
@@ -36,85 +36,89 @@ use crate::{
     model::{Applicability, Diag},
 };
 
-pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
-    let krate = cx
-        .krate
+/// Where the lints buffered at the crate are placed: its root module's tree.
+pub(super) fn crate_at(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Option<InFile<SyntaxNodePtr>> {
+    cx.krate
         .root_module(cx.db)
         .as_source_file_id(cx.db)
         .and_then(|it| walk.tree(HirFileId::from(it)))
-        .map(|it| it.ptr(&it.root));
-    let mut out = Vec::new();
-    for tree in &walk.trees {
-        for node in &tree.nodes {
-            let Some(def) = ast::Macro::cast(node.clone()) else { continue };
-            let at = tree.ptr(node);
-            let span = |offset: TextSize| {
-                let ctx = match tree.file.macro_file() {
-                    None => SyntaxContext::root(tree.file.edition(cx.db)),
-                    Some(call) => call.expansion_span_map(cx.db).span_at(offset).ctx,
-                };
-                (ctx.edition(cx.db), ctx.is_root())
-            };
-            let Some(tokens) = Tokens::of(&def, &span) else { continue };
-            let (macro_rules, keyword) = match &def {
-                ast::Macro::MacroRules(it) => (true, it.macro_rules_token()),
-                ast::Macro::MacroDef(it) => (false, it.macro_token()),
-            };
-            let start = keyword.map_or(node.text_range().start(), |it| it.text_range().start());
-            let (m, rules) = Matchers::rules(&tokens, macro_rules, span(start).0);
+        .map(|it| it.ptr(&it.root))
+}
 
-            let mut checker = Checker::new(&m, &tokens);
-            let mut found = Vec::new();
-            for rule in &rules {
-                for lhs in rule.args.into_iter().chain(rule.lhs) {
-                    follow::check_lhs(&m, &tokens, lhs, &mut found);
-                }
-                if let (Some(lhs), Some(rhs)) = (rule.lhs, rule.rhs) {
-                    checker.rule(rule.args, lhs, rhs);
-                }
-            }
-            for misuse in &checker.misuses {
-                let mut diag = misuse_diag(cx, tree, &tokens, misuse);
-                source_fact(cx, &mut diag, at);
-                out.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));
-            }
-            if let Some(krate) = krate {
-                for it in found {
-                    let span = cx.span(InFile::new(tree.file, it.span));
-                    let mut diag = Diag::lint(
-                        "rust_2021_incompatible_or_patterns",
-                        "the meaning of the `pat` fragment specifier is changing in Rust 2021, which may affect this macro",
-                        span.clone(),
-                    );
-                    diag.suggestion(
-                        span,
-                        "use pat_param to preserve semantics",
-                        format!("${}:pat_param", printed(&tokens, it.name)),
-                        Applicability::MachineApplicable,
-                    );
-                    source_fact(cx, &mut diag, krate);
-                    out.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, krate));
-                }
-            }
-            for range in expr_2024::exprs(&tokens) {
-                let span = cx.span(InFile::new(tree.file, range));
-                let mut diag = Diag::lint(
-                    "edition_2024_expr_fragment_specifier",
-                    "the `expr` fragment specifier will accept more expressions in the 2024 edition",
-                    span.clone(),
-                );
-                diag.suggestion(
-                    span,
-                    "to keep the existing behavior, use the `expr_2021` fragment specifier",
-                    "expr_2021",
-                    Applicability::MachineApplicable,
-                );
-                source_fact(cx, &mut diag, at);
-                out.push(Emitted::new(diag, Phase::Resolve, Pass::Early, at));
-            }
+/// The lints of the macro definition `node` (a `MACRO_RULES` or `MACRO_DEF` of `tree`), as the
+/// early pass's one walk (`super::super::lints`) comes to it; `krate` is [`crate_at`].
+pub(super) fn definition(
+    cx: &Cx<'_, '_>,
+    krate: Option<InFile<SyntaxNodePtr>>,
+    tree: &Tree,
+    node: &SyntaxNode,
+    out: &mut Vec<Emitted>,
+) {
+    let Some(def) = ast::Macro::cast(node.clone()) else { return };
+    let at = tree.ptr(node);
+    let map = tree.file.macro_file().map(|call| call.expansion_span_map(cx.db));
+    let root = SyntaxContext::root(tree.file.edition(cx.db));
+    let span = |offset: TextSize| {
+        let ctx = map.map_or(root, |it| it.span_at(offset).ctx);
+        (ctx.edition(cx.db), ctx.is_root())
+    };
+    let Some(tokens) = Tokens::of(&def, &span) else { return };
+    let (macro_rules, keyword) = match &def {
+        ast::Macro::MacroRules(it) => (true, it.macro_rules_token()),
+        ast::Macro::MacroDef(it) => (false, it.macro_token()),
+    };
+    let start = keyword.map_or(node.text_range().start(), |it| it.text_range().start());
+    let (m, rules) = Matchers::rules(&tokens, macro_rules, span(start).0);
+
+    let mut checker = Checker::new(&m, &tokens);
+    let mut found = Vec::new();
+    for rule in &rules {
+        for lhs in rule.args.into_iter().chain(rule.lhs) {
+            follow::check_lhs(&m, &tokens, lhs, &mut found);
+        }
+        if let (Some(lhs), Some(rhs)) = (rule.lhs, rule.rhs) {
+            checker.rule(rule.args, lhs, rhs);
         }
     }
-    out
+    for misuse in &checker.misuses {
+        let mut diag = misuse_diag(cx, tree, &tokens, misuse);
+        source_fact(cx, &mut diag, at);
+        out.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));
+    }
+    if let Some(krate) = krate {
+        for it in found {
+            let span = cx.span(InFile::new(tree.file, it.span));
+            let mut diag = Diag::lint(
+                "rust_2021_incompatible_or_patterns",
+                "the meaning of the `pat` fragment specifier is changing in Rust 2021, which may affect this macro",
+                span.clone(),
+            );
+            diag.suggestion(
+                span,
+                "use pat_param to preserve semantics",
+                format!("${}:pat_param", printed(&tokens, it.name)),
+                Applicability::MachineApplicable,
+            );
+            source_fact(cx, &mut diag, krate);
+            out.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, krate));
+        }
+    }
+    for range in expr_2024::exprs(&tokens) {
+        let span = cx.span(InFile::new(tree.file, range));
+        let mut diag = Diag::lint(
+            "edition_2024_expr_fragment_specifier",
+            "the `expr` fragment specifier will accept more expressions in the 2024 edition",
+            span.clone(),
+        );
+        diag.suggestion(
+            span,
+            "to keep the existing behavior, use the `expr_2021` fragment specifier",
+            "expr_2021",
+            Applicability::MachineApplicable,
+        );
+        source_fact(cx, &mut diag, at);
+        out.push(Emitted::new(diag, Phase::Resolve, Pass::Early, at));
+    }
 }
 
 fn misuse_diag(cx: &Cx<'_, '_>, tree: &Tree, tokens: &Tokens, misuse: &Misuse) -> Diag {

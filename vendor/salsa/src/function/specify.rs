@@ -93,7 +93,7 @@ where
             && old_memo.value.is_some()
         {
             // A value produced by another query wins this revision.
-            let QueryOriginRef::Assigned(owner) = old_memo.header.origin() else {
+            let QueryOriginRef::Assigned(owner) = old_memo.header.origin(zalsa.graph()) else {
                 return;
             };
             debug_assert_eq!(owner, active_query_key);
@@ -174,12 +174,11 @@ pub(super) fn validate_specified_value(
 
     // If we are marking this as validated, it must be a value that was
     // assigned by `executor`.
-    match header.origin() {
+    match header.origin(zalsa.graph()) {
         QueryOriginRef::Assigned(by_query) => assert_eq!(by_query, executor),
-        _ => panic!(
+        origin => panic!(
             "expected a query assigned by `{:?}`, not `{:?}`",
-            executor,
-            header.origin(),
+            executor, origin,
         ),
     }
 

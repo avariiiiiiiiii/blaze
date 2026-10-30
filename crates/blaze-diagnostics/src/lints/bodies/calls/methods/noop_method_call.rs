@@ -119,7 +119,7 @@ fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
                 Applicability::MaybeIncorrect,
             );
         }
-        facts(b, &mut diag, receiver, method_name, trait_id, &trait_name, orig_ty);
+        facts(b, &mut diag, receiver, method_name, trait_id, trait_name.as_str(), orig_ty);
         diag
     } else {
         let ty = b.ty(erased(interner, b.infer.expr_ty(expr)));
@@ -133,7 +133,7 @@ fn noop_method_call(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Found> {
             ),
         };
         let mut diag = Diag::lint("suspicious_double_ref_op", message, span);
-        facts(b, &mut diag, receiver, method_name, trait_id, &trait_name, expr_ty.strip_references());
+        facts(b, &mut diag, receiver, method_name, trait_id, trait_name.as_str(), expr_ty.strip_references());
         diag
     };
     Some(b.lint(diag, Phase::Late, at))

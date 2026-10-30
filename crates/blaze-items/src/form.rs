@@ -2613,7 +2613,16 @@ impl<'db> Cx<'db> {
                 self.block(f, c, Some(*target));
                 self.block(f, c, *unwind);
             }
-            TerminatorKind::Call { func, args, destination, target, cleanup, from_hir_call } => {
+            // `intrinsic` is what `func` names, which is hashed.
+            TerminatorKind::Call {
+                func,
+                args,
+                destination,
+                target,
+                cleanup,
+                from_hir_call,
+                intrinsic: _,
+            } => {
                 f.u8(8);
                 self.operand(f, c, func);
                 self.operands(f, c, args);

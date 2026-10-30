@@ -170,6 +170,24 @@ impl Live {
             return Err("a patch whose code is not whole pages".to_owned());
         }
         let mapped = code.base.checked_add(self.slide).ok_or("patch address overflow")?;
+        // Every write over the executable is checked before anything is mapped or written.
+        for write in &code.writes {
+            let address = write.address.checked_add(self.slide).ok_or("patch address overflow")?;
+            let range = address..address.saturating_add(write.bytes.len() as u64);
+            if range.start < self.image.start || range.end > self.image.end {
+                return Err(format!(
+                    "a write at {:#x}..{:#x}, outside the executable at {:#x}..{:#x}",
+                    range.start, range.end, self.image.start, self.image.end
+                ));
+            }
+        }
+        // SAFETY: MAP_FIXED maps fresh read-write pages over `len` bytes at the page-aligned
+        // `mapped` (`code.base` whole pages, checked), all inside the room `reserve` set aside
+        // (`process.next..process.end`, checked above): nothing below `next` (earlier
+        // patches' code, which threads may run) or above `end` (statics of `first_values`)
+        // is replaced, and no thread jumps here before the writes below. The room is never
+        // unmapped, so the patch lives as long as the process; a failed apply moves `next`
+        // past it all the same (below), so no later patch maps over it.
         let result = unsafe {
             mmap(
                 mapped as *mut c_void,
@@ -186,6 +204,23 @@ impl Live {
                 std::io::Error::last_os_error()
             ));
         }
+        let applied = self.fill(code, mapped, end);
+        // From the mapping on, jumps or the unwinder may reach this memory, done or not: the
+        // room up to `end` is used either way.
+        self.process.next = end;
+        let published = self.publish();
+        applied.and(published)
+    }
+
+    /// Writes a mapped patch's code and data, its statics' first values and its jumps.
+    fn fill(&mut self, code: &Code, mapped: u64, end: u64) -> Result<(), String> {
+        let text_len = code.text.len() as u64;
+        let data_len = code.data.len() as u64;
+        let len = (text_len + data_len).next_multiple_of(PAGE);
+        // SAFETY: `mapped..mapped + len` was mapped read-write by `apply` (checked to be at
+        // `mapped`), page-aligned so any `u8` alignment holds, and nothing else refers to it
+        // yet: no jump reaches it before the writes below; the slice is not written after the
+        // text is made read-and-run.
         let memory = unsafe { std::slice::from_raw_parts_mut(mapped as *mut u8, len as usize) };
         memory[..code.text.len()].copy_from_slice(&code.text);
         memory[code.text.len()..code.text.len() + code.data.len()].copy_from_slice(&code.data);
@@ -193,6 +228,9 @@ impl Live {
             slide_at(memory, pointer as usize, self.slide)?;
         }
         if text_len != 0
+            // SAFETY: `text_len` bytes (whole pages, checked) at the page-aligned start of the
+            // mapping made above; taking write away affects only `memory`, which writes
+            // nothing after this, and no thread runs the pages yet.
             && unsafe { mprotect(mapped as *mut c_void, text_len as usize, PROT_READ | PROT_EXEC) }
                 != 0
         {
@@ -202,6 +240,8 @@ impl Live {
             ));
         }
         if data_len != 0
+            // SAFETY: `data_len` bytes at `mapped + text_len`, page-aligned since `text_len`
+            // is whole pages, of the mapping made above; they were read-write already.
             && unsafe {
                 mprotect(
                     (mapped + text_len) as *mut c_void,
@@ -212,7 +252,7 @@ impl Live {
         {
             return Err(format!("making patch data writable: {}", std::io::Error::last_os_error()));
         }
-        register_frames(memory, code.frames)?;
+        register_frames(&memory[..code.text.len()], code.frames)?;
         self.first_values(code, end)?;
 
         let kept: std::collections::HashSet<u64> =
@@ -233,6 +273,10 @@ impl Live {
             let original = self.originals.entry(address).or_default();
             if original.len() < bytes.len() {
                 let start = original.len();
+                // SAFETY: `address..address + bytes.len()` is in the executable's image
+                // (`apply` checked it against `image`), mapped readable as long as the process
+                // runs; only this thread writes code there. A static another thread writes
+                // meanwhile races this read (the rule `Live::poll` gives the program).
                 let more = unsafe {
                     std::slice::from_raw_parts(
                         (address + start as u64) as *const u8,
@@ -248,8 +292,7 @@ impl Live {
             self.write(address, &bytes)?;
             self.written.insert(address, write.bytes.len());
         }
-        self.process.next = end;
-        self.publish()
+        Ok(())
     }
 
     /// Writes the first value of each static new since the executable that the patch refers
@@ -269,6 +312,10 @@ impl Live {
             let mut page = address & !(PAGE - 1);
             while page < last {
                 if !self.lasting_pages.contains(&page) {
+                    // SAFETY: `page` is a page of the room above every patch (`value.address
+                    // >= end` and below `room_end`, checked above), which `reserve` set aside
+                    // and nothing else maps; `lasting_pages` says it is not mapped yet, so
+                    // nothing the program uses is replaced.
                     let result = unsafe {
                         mmap(
                             page as *mut c_void,
@@ -293,6 +340,9 @@ impl Live {
             for &pointer in &value.pointers {
                 slide_at(&mut bytes, pointer as usize, self.slide)?;
             }
+            // SAFETY: `address..last` is in pages mapped read-write just above (or by an earlier
+            // patch, in `lasting_pages`); `lasting` says no first value was written here, so no
+            // code reads the static yet; `bytes` is a fresh vector, so they cannot overlap.
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len())
             };
@@ -310,6 +360,9 @@ impl Live {
         let end = (address + bytes.len() as u64).next_multiple_of(PAGE);
         let len = end - page;
         let old = protection_at(address).unwrap_or(PROT_READ | PROT_EXEC);
+        // SAFETY: `page..end` covers `address..address + bytes.len()`, which `apply` checked
+        // is in the executable's image, mapped as long as the process runs. Adding write keeps
+        // read and run, so threads running these pages go on; `old` is put back below.
         if unsafe {
             mprotect(page as *mut c_void, len as usize, PROT_READ | PROT_WRITE | PROT_EXEC)
         } != 0
@@ -319,7 +372,14 @@ impl Live {
                 std::io::Error::last_os_error()
             ));
         }
+        // SAFETY: the bytes are in the image (checked by `apply`) and writable (just above);
+        // `bytes` is the caller's own buffer, so they cannot overlap. NOT upheld: a jump is
+        // written over a function's first bytes while other threads may be running them, and
+        // a static while they may read it; v1 relies on x86-64 writes of at most 8 aligned
+        // bytes appearing whole, which the Rust memory model does not promise (the jump-table
+        // design in `slots` never writes over code a thread can be in).
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
+        // SAFETY: the same pages as the first `mprotect`, given back the protection they had.
         if unsafe { mprotect(page as *mut c_void, len as usize, old) } != 0 {
             return Err(format!(
                 "restoring protection at {address:#x}: {}",
@@ -468,6 +528,9 @@ fn reserve(image: &Image) -> Result<(u64, u64), String> {
     let mut at = actual;
     for _ in 0..64 {
         if at.abs_diff(image.start + image.slide) <= REACH {
+            // SAFETY: MAP_FIXED_NOREPLACE fails rather than replace any mapping, so this maps
+            // only address space nothing uses; the pages have no access until a patch maps
+            // over them.
             let room = unsafe {
                 mmap(
                     at as *mut c_void,
@@ -493,6 +556,8 @@ fn forget_exited() {
     for entry in entries.flatten() {
         let process = std::fs::read_to_string(entry.path().join("process")).ok();
         let pid = process.as_deref().and_then(Process::decode).map(|it| it.pid);
+        // SAFETY: signal 0 sends nothing; `kill` only checks the pid exists. No memory is
+        // passed.
         let running = pid.is_some_and(|pid| unsafe { kill(pid as i32, 0) } == 0);
         if !running {
             _ = std::fs::remove_dir_all(entry.path());
@@ -592,32 +657,42 @@ fn protection_at(address: u64) -> Result<i32, String> {
     Err(format!("nothing is mapped at {address:#x}"))
 }
 
+/// Registers the patch's `.eh_frame` with the unwinder: libgcc's `__register_frame` (and LLVM's
+/// libunwind on ELF) takes the start of a run of CIEs and FDEs ending in a zero length, so the
+/// run is registered once, after its end is found in `text`: in the section, or in the four
+/// bytes right after it.
 fn register_frames(text: &[u8], (start, len): (u64, u64)) -> Result<(), String> {
     if len == 0 {
         return Ok(());
     }
-    let section = text
-        .get(start as usize..(start + len) as usize)
+    let start = usize::try_from(start).map_err(|_| "unwind tables past the end of the patch")?;
+    let end = usize::try_from(len)
+        .ok()
+        .and_then(|len| start.checked_add(len))
+        .filter(|&end| end <= text.len())
         .ok_or("unwind tables past the end of the patch")?;
-    let mut at = 0;
-    while at + 8 <= section.len() {
-        let length =
-            u32::from_le_bytes(section[at..at + 4].try_into().map_err(|_| "short unwind length")?)
-                as usize;
-        if length == 0 || length == u32::MAX as usize {
+    let mut at = start;
+    loop {
+        let length = text
+            .get(at..at + 4)
+            .filter(|_| at <= end)
+            .ok_or("unwind entries with no zero length ending them in the patch")?;
+        let length = u32::from_le_bytes(length.try_into().map_err(|_| "short unwind length")?);
+        if length == 0 {
             break;
         }
-        let end = at.checked_add(4 + length).ok_or("unwind entry overflows")?;
-        if end > section.len() {
-            return Err("unwind entry ends past the patch".to_owned());
+        if length == u32::MAX {
+            return Err("64-bit unwind entries, which the patch format has none of".to_owned());
         }
-        let common = u32::from_le_bytes(
-            section[at + 4..at + 8].try_into().map_err(|_| "short unwind entry")?,
-        );
-        if common != 0 {
-            unsafe { __register_frame(section[at..].as_ptr()) };
-        }
-        at = end;
+        at = (at + 4)
+            .checked_add(length as usize)
+            .filter(|&next| next <= end)
+            .ok_or("unwind entry ends past the patch")?;
     }
+    // SAFETY: `text[start..]` is a run of CIEs and FDEs ending in a zero length inside the
+    // patch's text (checked above), which is mapped read-and-run and never written or unmapped
+    // for the rest of the process (`apply` moves `next` past it even when it fails); the
+    // unwinder reads it from now on.
+    unsafe { __register_frame(text[start..].as_ptr()) };
     Ok(())
 }

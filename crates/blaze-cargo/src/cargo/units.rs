@@ -36,10 +36,12 @@ pub struct Record {
     pub link_line: Option<PathBuf>,
     /// The variables cargo set for the unit that say where the build puts its programs:
     /// `CARGO_BIN_EXE_<name>`, which `env!` reads in an integration test.
+    // BTreeMap: serialized with serde as a map.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
     /// The variables cargo set for rustc that the crate's source can read with `env!`
     /// ([`super::own_script::read_by_crates`]), for blaze to compile it as rustc did.
+    // BTreeMap: serialized with serde as a map.
     #[serde(default)]
     pub crate_env: BTreeMap<String, String>,
 }

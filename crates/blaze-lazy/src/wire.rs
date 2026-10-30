@@ -59,6 +59,8 @@ pub enum WireError {
     Trailing { kind: u32, extra: usize },
     LongWhy(usize),
     Utf8,
+    /// A `Failed` frame whose four bytes after the reason's length are not zero.
+    Padding,
     /// An answer sent to the daemon, which only asks come to.
     Unasked,
 }
@@ -75,6 +77,7 @@ impl fmt::Display for WireError {
             }
             WireError::LongWhy(len) => write!(f, "a failure reason of {len} bytes, past {MOST_WHY}"),
             WireError::Utf8 => write!(f, "a failure reason that is not UTF-8"),
+            WireError::Padding => write!(f, "a failure frame whose padding is not zero"),
             WireError::Unasked => write!(f, "an answer frame from the run process, which only asks"),
         }
     }
@@ -134,6 +137,9 @@ impl Frame<'_> {
             }
             _ => {
                 let len = u32_at(bytes, 16).expect("checked") as usize;
+                if u32_at(bytes, 20) != Some(0) {
+                    return Err(WireError::Padding);
+                }
                 if len > MOST_WHY {
                     return Err(WireError::LongWhy(len));
                 }

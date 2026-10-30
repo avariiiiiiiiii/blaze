@@ -11,6 +11,8 @@
 //! takes. Only the build's driver knows what code without a summary reaches, and says it
 //! ([`close`]).
 
+#![forbid(unsafe_code)]
+
 use std::collections::VecDeque;
 
 use rayon::prelude::*;
@@ -259,7 +261,7 @@ impl<'a> Graph<'a> {
             graph.start.push(graph.to.len() as u32);
             let from = graph.unused.len();
             graph.unused.extend_from_slice(&summary.unused);
-            graph.unused[from..].sort_unstable();
+            blaze_ids::radix::sort(&mut graph.unused[from..]);
             let kept = from + dedup(&mut graph.unused[from..]);
             graph.unused.truncate(kept);
             graph.unused_start.push(graph.unused.len() as u32);
@@ -348,7 +350,7 @@ impl<'a> Graph<'a> {
         for node in 0..self.len() {
             let from = edges.len();
             edges.extend(self.calls(node).iter().copied().filter(|&it| it != NONE));
-            edges[from..].sort_unstable();
+            blaze_ids::radix::sort(&mut edges[from..]);
             let kept = from + dedup(&mut edges[from..]);
             edges.truncate(kept);
             start.push(edges.len() as u32);
@@ -416,7 +418,7 @@ impl<'a> Graph<'a> {
                 }
             }
         }
-        callees.sort_unstable();
+        blaze_ids::radix::sort(&mut callees[..]);
         let constants = match passed.reached.get(importer) {
             true => passed
                 .of(importer)
@@ -476,7 +478,7 @@ impl<'a> Graph<'a> {
                 next.extend(self.calls(node).iter().map(|&it| (it, share, depth + 1)));
             }
         }
-        taken.sort_unstable();
+        blaze_ids::radix::sort(&mut taken[..]);
     }
 }
 
@@ -594,7 +596,7 @@ fn components(start: &[u32], edges: &[u32]) -> (Vec<u32>, Vec<u32>) {
                         break;
                     }
                 }
-                order[from..].sort_unstable();
+                blaze_ids::radix::sort(&mut order[from..]);
                 bounds.push(order.len() as u32);
             }
         }

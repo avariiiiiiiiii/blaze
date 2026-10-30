@@ -50,6 +50,8 @@ struct Workspace {
     /// The stream of the last run while it is written: `open` says it is.
     encoder: DeflateEncoder<Vec<u8>>,
     open: bool,
+    /// The record being kept, encoded: reused from one record to the next.
+    item: Vec<u8>,
 }
 
 /// Records of one build, in a row as they came.
@@ -138,6 +140,7 @@ impl Workspace {
             runs: Vec::new(),
             encoder: DeflateEncoder::new(Vec::new(), Compression::fast()),
             open: false,
+            item: Vec::new(),
         }
     }
 
@@ -173,13 +176,18 @@ impl Workspace {
             }
             _ => {}
         }
-        let item = match blaze_protocol::cbor::to_vec(record) {
-            Ok(item) => item,
-            Err(error) => {
-                eprintln!("build page: a record of build {build} does not encode: {error}");
-                return;
-            }
-        };
+        let mut item = std::mem::take(&mut self.item);
+        item.clear();
+        if let Err(error) = blaze_protocol::cbor::append(&mut item, record) {
+            eprintln!("build page: a record of build {build} does not encode: {error}");
+            self.item = item;
+            return;
+        }
+        self.keep_item(build, kind, &item);
+        self.item = item;
+    }
+
+    fn keep_item(&mut self, build: u64, kind: Kind, item: &[u8]) {
         if !(self.open && self.runs.last().is_some_and(|it| it.build == build)) {
             self.close();
             self.runs.push(Run {
@@ -195,10 +203,9 @@ impl Workspace {
         let len = (item.len() as u32).to_le_bytes();
         if kind == Kind::Other {
             run.other.extend_from_slice(&len);
-            run.other.extend_from_slice(&item);
+            run.other.extend_from_slice(item);
         } else {
-            let written =
-                self.encoder.write_all(&len).and_then(|()| self.encoder.write_all(&item));
+            let written = self.encoder.write_all(&len).and_then(|()| self.encoder.write_all(item));
             if let Err(error) = written {
                 eprintln!("build page: a record of build {build} is not kept: {error}");
                 return;

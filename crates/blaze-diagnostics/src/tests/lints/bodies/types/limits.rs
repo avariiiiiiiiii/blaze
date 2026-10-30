@@ -2,12 +2,10 @@
 //! byte for byte as `tests/ui/lint/` has them (rust-lang/rust `ad3d0bc141a`, MIT or
 //! Apache-2.0).
 
-use super::{Test, Ui, ui};
+use super::{Ui, ui};
 
-/// compiletest gives `-A unused` to every UI test but a `run-pass` one (`runtest.rs`,
-/// `AllowUnused`), which `Test::Passes` stands for; none of these is `run-pass`.
 fn check(name: &str, flags: &[&str], source: &str, stderr: &str) {
-    let actual = ui(Ui { name, test: Test::Passes, flags, source, ..Ui::default() });
+    let actual = ui(Ui { name, flags, source, ..Ui::default() });
     assert_eq!(actual, stderr, "{name}");
 }
 

@@ -415,6 +415,15 @@ fn a_line_of_serde_s_entry_reads_as_cargo_reads_it() {
 }
 
 #[test]
+fn a_summary_s_features_are_in_name_order_whatever_the_line_s_order() {
+    let line = r#"{"name":"a","vers":"1.0.0","deps":[],"cksum":"00","features":{"zz":[],"b":["zz"],"a1":[]},"features2":{"m":[],"a0":[]}}"#;
+    let line = parse_line(line.as_bytes()).unwrap();
+    let summary = super::index::index_summary(&line, SourceId::crates_io()).unwrap();
+    let names: Vec<&str> = summary.summary().features().keys().map(|it| it.as_str()).collect();
+    assert_eq!(names, ["a0", "a1", "b", "m", "zz"]);
+}
+
+#[test]
 fn prefix_paths_are_cargos() {
     assert_eq!(index_path("a"), "1/a");
     assert_eq!(index_path("ab"), "2/ab");

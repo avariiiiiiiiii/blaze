@@ -17,7 +17,7 @@ use hir_expand::{
     mod_path::{ModPath, PathKind, resolve_crate_root},
     name::{AsName, Name},
 };
-use intern::{Interned, sym};
+use intern::sym;
 use syntax::{
     AstPtr,
     ast::{self, AstNode, HasGenericArgs},
@@ -281,8 +281,7 @@ fn lower_path_on_stacks(
 
     let generic_args: Box<[Option<GenericArgs>]> =
         collector.path_generic_args.drain(g0..).collect();
-    let mod_path =
-        Interned::new(ModPath::from_segments(kind, collector.path_segments.drain(s0..)));
+    let mod_path = ModPath::from_segments(kind, collector.path_segments.drain(s0..));
 
     if let Some(old_lifetimes_constrained_by_input) = old_lifetimes_constrained_by_input {
         let type_alias_constrained_lifetimes = collector.get_constrained_lifetimes_if_type_alias(

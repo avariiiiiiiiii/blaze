@@ -160,12 +160,23 @@ impl Crate<'_, '_, '_> {
         }
     }
 
-    /// rustc's `entry_fn`: the `main` the crate root names, of an executable without
-    /// `#![no_main]`. Where the front end does not know whether the crate is an executable,
-    /// its `main` is taken to be the entry, which can only make fewer items dead.
+    /// rustc's `entry_fn`: the function marked `#[rustc_main]`, else the `main` the crate root
+    /// names, of an executable without `#![no_main]`. Where the front end does not know whether
+    /// the crate is an executable, its `main` is taken to be the entry, which can only make
+    /// fewer items dead.
     fn entry(&self) -> Option<DefIdx> {
         if self.executable == Some(false) || crate::checks::has_crate_attr(self.cx, "no_main") {
             return None;
+        }
+        let rustc_main = self.defs.modules.iter().flat_map(|it| &it.free).copied().find(|&def| {
+            let d = &self.defs[def];
+            d.kind == Kind::Fn
+                && d.node.is_some_and(|it| {
+                    attr_names(self.cx, &self.cx.syntax(it).value).iter().any(|(name, _)| name == "rustc_main")
+                })
+        });
+        if rustc_main.is_some() {
+            return rustc_main;
         }
         let db = self.cx.db;
         let root: ModuleId = self.cx.krate.root_module(db).into();

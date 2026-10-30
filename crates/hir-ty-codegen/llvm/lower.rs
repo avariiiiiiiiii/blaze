@@ -195,9 +195,13 @@ pub(super) fn entry_count<'ctx>(context: &'ctx Context, function: FunctionValue<
     let node = context
         .metadata_node(&[context.metadata_string("function_entry_count").into(), count.into()]);
     use inkwell::{llvm_sys::core, values::AsValueRef as _};
-    // SAFETY: both are of this module's context, and a function is a global.
+    // SAFETY: `node` is a metadata node of `context`, which owns it for `'ctx`; this only views
+    // it as metadata.
+    let node = unsafe { core::LLVMValueAsMetadata(node.as_value_ref()) };
+    // SAFETY: `function` is a global of a module of `context` and `node` metadata of the same
+    // context, both live for `'ctx`; metadata of another context would corrupt LLVM's
+    // uniquing.
     unsafe {
-        let node = core::LLVMValueAsMetadata(node.as_value_ref());
         core::LLVMGlobalSetMetadata(function.as_value_ref(), context.get_kind_id("prof"), node);
     }
 }
@@ -1101,7 +1105,8 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
     }
 
     fn offset(&self, base: PointerValue<'ctx>, by: IntValue<'ctx>) -> Lowered<PointerValue<'ctx>> {
-        // SAFETY: not `inbounds`, so any offset is defined.
+        // SAFETY: `base` and `by` are values of this function's module, live for `'ctx`, and the
+        // GEP is not `inbounds`, so any offset is defined (no poison).
         Ok(unsafe { self.builder.build_gep(self.context.i8_type(), base, &[by], "")? })
     }
 
@@ -1702,7 +1707,10 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         // An `offset` is of an address, whether or not it was loaded as an integer.
         if opcode == Opcode::Iadd && unwind::seh::is_in_bounds(self.func.srcloc(inst)) {
             let (base, by) = (self.pointer(l)?, self.int(r)?);
-            // SAFETY: `offset` stays within what `base` points into.
+            // SAFETY: only an `iadd` marked by `unwind::seh::in_bounds` gets here, and `mod.rs`
+            // marks only the add of the `offset` intrinsic (kept on its copy in a body built
+            // in), whose result Rust requires to stay within `base`'s allocation, as rustc
+            // emits it `inbounds`; otherwise the result would be poison.
             let address =
                 unsafe { b.build_in_bounds_gep(self.context.i8_type(), base, &[by], "")? };
             self.set(inst, Operand::Pointer(address));
@@ -1979,7 +1987,9 @@ impl<'ctx, 'f> Lowering<'ctx, 'f> {
         };
         let at = |lowering: &Self, offset: u32| {
             let offset = lowering.context.i64_type().const_int(offset.into(), false);
-            // SAFETY: the offset is within the slot, which the wrapper's offsets are of.
+            // SAFETY: `base` and `offset` are values of this module, live for `'ctx`; the GEP is
+            // not `inbounds`, so any offset is defined, and the wrapper's offsets are within
+            // the slot.
             unsafe { lowering.builder.build_gep(lowering.context.i8_type(), base, &[offset], "") }
         };
         let mut args: Vec<BasicMetadataValueEnum<'ctx>> = Vec::new();

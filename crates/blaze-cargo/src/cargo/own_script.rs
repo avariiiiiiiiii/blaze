@@ -16,6 +16,7 @@ use std::{
     sync::{Condvar, Mutex, PoisonError},
 };
 
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde_json::{Value, json};
 
 use super::{keyed, units::Record};
@@ -82,6 +83,7 @@ pub struct Described {
     pub root: PathBuf,
     pub edition: String,
     pub cfg: Vec<String>,
+    // BTreeMap: written into the description's JSON as a map, in order.
     pub env: BTreeMap<String, String>,
     /// The name each library is linked under and where it is in the description.
     pub deps: Vec<(String, usize)>,
@@ -282,7 +284,7 @@ fn compile_in(
         inputs: None,
     };
     crates.push(first);
-    let mut linked = BTreeMap::new();
+    let mut linked = FxHashMap::default();
     let deps = asked.externs();
     let deps =
         deps.iter().map(|(name, path)| Ok((name.clone(), add(&mut crates, &mut linked, path)?)));
@@ -318,7 +320,7 @@ pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
     fn walk(
         dir: &Path,
         files: &mut Vec<PathBuf>,
-        visiting: &mut std::collections::BTreeSet<PathBuf>,
+        visiting: &mut FxHashSet<PathBuf>,
     ) -> std::io::Result<()> {
         let real = std::fs::canonicalize(dir)?;
         if !visiting.insert(real.clone()) {
@@ -354,7 +356,7 @@ pub fn generated_fingerprint(described: &str) -> Result<[u8; 32], String> {
         let out = out.as_str().ok_or("a compile-time crate has a non-string OUT_DIR")?;
         let out = Path::new(out);
         let mut files = Vec::new();
-        walk(out, &mut files, &mut std::collections::BTreeSet::new())
+        walk(out, &mut files, &mut FxHashSet::default())
             .map_err(|why| format!("reading build-script output {}: {why}", out.display()))?;
         files.sort();
         key.field(out.as_os_str().as_encoded_bytes());
@@ -761,7 +763,7 @@ fn read_otherwise(
 /// where it is in them. `linked` has where each file already is.
 fn add(
     crates: &mut Vec<Described>,
-    linked: &mut BTreeMap<PathBuf, usize>,
+    linked: &mut FxHashMap<PathBuf, usize>,
     path: &Path,
 ) -> Result<usize, String> {
     // A library is named by its metadata to a crate rustc pipelines and by itself to the others.

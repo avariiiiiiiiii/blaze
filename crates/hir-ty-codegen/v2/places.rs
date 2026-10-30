@@ -2,7 +2,11 @@
 //! for each, the same whether the IR builder or the walk of the MIR ([`super::refs`]) asks.
 //! Equal references are one place, so both go through here.
 
-use std::{borrow::Cow, cell::OnceCell, hash::BuildHasher as _};
+use std::{
+    borrow::Cow,
+    cell::{OnceCell, RefCell},
+    hash::BuildHasher as _,
+};
 
 use blaze_codegen::{Target, backend::FrontRef, template::Refs};
 use cranelift_codegen::ir;
@@ -21,7 +25,7 @@ use hir_ty::{
 
 use super::{
     DataPlace, Hashes, HirInstance, HirStatic, Kind, Places,
-    convert::{DataTarget, Resolve},
+    convert::{DataTarget, Resolver},
 };
 use crate::{
     ConstBlob, DataIdentity, Instance, InstanceDef, erase_regions,
@@ -294,34 +298,74 @@ pub(crate) fn fill_type_ids(
     Ok(())
 }
 
+/// The place of a function request a backend made of its own accord for a symbol the unit's
+/// references lack: [`resolve_owning`] keeps it by name, [`resolve`] refuses it.
+pub(crate) const OWN: u32 = u32::MAX;
+
 /// Resolves a function's requests against the targets of its places.
-pub(crate) fn resolve<T>(
+pub(crate) fn resolve<T>(places: &Places, refs: &Refs, work: impl FnOnce(&Placed<'_>) -> T) -> T {
+    work(&Placed { places, refs, symbols: OnceCell::new(), own: None })
+}
+
+/// [`resolve`] for code a backend optimized, which may call symbols of its own the walk did
+/// not list (LLVM's `bcmp`, `memcpy`, `__udivti3`): those are kept by name and returned, in
+/// the order first called, for [`blaze_codegen::backend::Emitted::extra`].
+pub(crate) fn resolve_owning<T>(
     places: &Places,
     refs: &Refs,
-    work: impl FnOnce(&Resolve<'_>) -> T,
-) -> T {
-    let target = |place: u32| {
+    work: impl FnOnce(&Placed<'_>) -> T,
+) -> (T, Vec<String>) {
+    let placed = Placed { places, refs, symbols: OnceCell::new(), own: Some(RefCell::default()) };
+    let done = work(&placed);
+    (done, placed.own.map(RefCell::into_inner).unwrap_or_default())
+}
+
+/// A function's requests as the targets of its places. Its symbols are indexed on the first
+/// relocation at one: most functions have none (a libcall, the personality), and each after
+/// is one probe.
+pub(crate) struct Placed<'a> {
+    places: &'a Places,
+    refs: &'a Refs,
+    symbols: OnceCell<HashTable<(u64, u32)>>,
+    /// The symbols the backend named that `refs` does not list, when it may name its own.
+    own: Option<RefCell<Vec<String>>>,
+}
+
+impl Placed<'_> {
+    fn target(&self, place: u32) -> Result<Target, String> {
+        let refs = self.refs;
         refs.get(place as usize)
             .cloned()
             .ok_or_else(|| format!("place {place} of {} references", refs.len()))
-    };
-    let func = |index: u32, _: &FuncRequest| match places.funcs.get(index as usize) {
-        Some(&place) => target(place),
-        None => Err(format!("function {index} has no place")),
-    };
-    let data = |index: u32, _: &DataRequest| match places.datas.get(index as usize) {
-        Some(DataPlace::Place(place)) => target(*place).map(DataTarget::Target),
-        Some(DataPlace::Position(span)) => Ok(DataTarget::Target(Target::Position(*span))),
-        Some(DataPlace::Own) => Ok(DataTarget::Own),
-        Some(DataPlace::Text(text)) => Ok(DataTarget::Text(text.clone())),
-        Some(DataPlace::Nowhere) => Ok(DataTarget::Nowhere),
-        None => Err(format!("data {index} has no place")),
-    };
-    // The places of the symbols, made on the first relocation at one: most functions have
-    // none (a libcall, the personality), and one has a probe each after.
-    let symbols = OnceCell::new();
-    let symbol = |name: &str| {
-        let symbols = symbols.get_or_init(|| {
+    }
+}
+
+impl Resolver for Placed<'_> {
+    fn func(&self, index: u32, request: &FuncRequest) -> Result<Target, String> {
+        match self.places.funcs.get(index as usize) {
+            Some(&OWN) => match &request.target {
+                FuncTarget::Symbol(name) if self.own.is_some() => self.symbol(name),
+                _ => Err(format!("function {index} is the backend's own, and no symbol")),
+            },
+            Some(&place) => self.target(place),
+            None => Err(format!("function {index} has no place")),
+        }
+    }
+
+    fn data(&self, index: u32, _: &DataRequest) -> Result<DataTarget, String> {
+        match self.places.datas.get(index as usize) {
+            Some(DataPlace::Place(place)) => self.target(*place).map(DataTarget::Target),
+            Some(DataPlace::Position(span)) => Ok(DataTarget::Target(Target::Position(*span))),
+            Some(DataPlace::Own) => Ok(DataTarget::Own),
+            Some(DataPlace::Text(text)) => Ok(DataTarget::Text(text.clone())),
+            Some(DataPlace::Nowhere) => Ok(DataTarget::Nowhere),
+            None => Err(format!("data {index} has no place")),
+        }
+    }
+
+    fn symbol(&self, name: &str) -> Result<Target, String> {
+        let refs = self.refs;
+        let symbols = self.symbols.get_or_init(|| {
             let mut index: HashTable<(u64, u32)> = HashTable::new();
             for (at, it) in refs.iter().enumerate() {
                 if let Target::Extern(it) = it {
@@ -335,12 +379,24 @@ pub(crate) fn resolve<T>(
             |&(_, at): &(u64, u32)| matches!(&refs[at as usize], Target::Extern(it) if it == name);
         match symbols.find(symbol_hash(name), same) {
             Some(&(_, at)) => Ok(refs[at as usize].clone()),
-            None => Err(format!("the code calls `{name}`, which its references do not list")),
+            None => match &self.own {
+                Some(own) if !name.is_empty() => {
+                    let mut own = own.borrow_mut();
+                    if !own.iter().any(|it| it == name) {
+                        own.push(name.to_owned());
+                    }
+                    Ok(Target::Extern(name.to_owned()))
+                }
+                _ => Err(format!("the code calls `{name}`, which its references do not list")),
+            },
         }
-    };
-    let body = || match refs.len().checked_sub(1) {
-        Some(last) if last == places.refs as usize => Ok(refs[last].clone()),
-        _ => Err("a call of a fold's body from what is no thunk of it".to_owned()),
-    };
-    work(&Resolve { func: &func, data: &data, symbol: &symbol, body: &body })
+    }
+
+    fn body(&self) -> Result<Target, String> {
+        let refs = self.refs;
+        match refs.len().checked_sub(1) {
+            Some(last) if last == self.places.refs as usize => Ok(refs[last].clone()),
+            _ => Err("a call of a fold's body from what is no thunk of it".to_owned()),
+        }
+    }
 }

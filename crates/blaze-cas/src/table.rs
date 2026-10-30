@@ -189,7 +189,10 @@ impl<T: Keyed> Table<T> {
         for (_, level) in self.made() {
             if let Ok((at, _)) = self.probe(level, &key) {
                 let old = level.slots[at].swap(Box::into_raw(value), Ordering::AcqRel);
-                // SAFETY: the swap unlinked `old`; the one caller that swaps owns it now.
+                // SAFETY: `old` is not null: `probe` found a value in this slot, and a slot once
+                // set is only swapped for another `Box::into_raw`, never cleared. The swap
+                // unlinked it, and the one caller that swaps (the store, under `&mut`) owns it
+                // now; readers that found it keep reading it until the limbo frees it.
                 return Ok(unsafe { Box::from_raw(old) });
             }
         }

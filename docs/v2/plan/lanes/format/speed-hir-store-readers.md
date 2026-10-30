@@ -50,6 +50,11 @@ outside (or errors). That is a bug inherited from rust-analyzer, kept here becau
 results; the fix is reported to speed-hir-store (the columns make it a sort of the entries by
 scope at `finish`, a true CSR).
 
+Fixed by speed-hir-store on 2026-10-29. `Building` keeps each entry's scope beside it, and
+`finish` sorts the entries stably by scope, skipping the sort when they are already grouped.
+The model is now a list of entries per scope. `a_name_after_a_const_pattern_block_resolves_outside_it`
+pins rustc's answer.
+
 ## A body's syntax (`body.rs`)
 
 The hot path on a cache hit, `Body::of`, clones one `Arc`; `Body::relative` runs only when a

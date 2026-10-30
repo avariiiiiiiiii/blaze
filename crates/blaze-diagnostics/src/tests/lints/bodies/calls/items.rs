@@ -25,7 +25,7 @@ fn prelude(extra: &str) -> String {
 /// prelude of [`prelude`] with `extra` and `std_items`.
 fn ui_std(name: &str, flags: &str, extra: &str, std_items: &str, source: &str) -> String {
     let fixture = format!(
-        "//- minicore: {flags}\n//- /std.rs crate:std deps:core\n{}{std_items}\n\
+        "//- minicore: {flags}\n//- /std.rs crate:std deps:core\n#![feature(lang_items, rustc_attrs)]\n{}{std_items}\n\
          //- /{name} crate:main edition:2015 deps:std\n{source}",
         prelude(extra)
     );

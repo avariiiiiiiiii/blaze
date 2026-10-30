@@ -64,6 +64,10 @@ where
                 return memo;
             }
 
+            if let Some(memo) = self.fetch_unclaimed(zalsa, db, id, memo_ingredient_index) {
+                return memo;
+            }
+
             if let Some(memo) = self.fetch_cold(zalsa, zalsa_local, db, id, memo_ingredient_index) {
                 return memo;
             }
@@ -100,6 +104,29 @@ where
         } else {
             None
         }
+    }
+
+    /// A memo with a value whose inputs are all unchanged, verified with no claim; the claim is
+    /// taken only when the memo may have to run.
+    #[inline(never)]
+    fn fetch_unclaimed<'db>(
+        &'db self,
+        zalsa: &'db Zalsa,
+        db: &'db C::DbView,
+        id: Id,
+        memo_ingredient_index: MemoIngredientIndex,
+    ) -> Option<&'db Memo<C>> {
+        let memo = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index)?;
+        memo.value.as_ref()?;
+        if !memo
+            .header
+            .deep_verify_unclaimed(zalsa, db.into(), self.database_key_index(id), 0)
+        {
+            return None;
+        }
+        // SAFETY: memo is present in memo_map and we have verified that it is
+        // still valid for the current revision.
+        unsafe { Some(self.extend_memo_lifetime(memo)) }
     }
 
     fn fetch_cold<'db>(

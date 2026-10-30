@@ -16,12 +16,14 @@
 use hir::{HasSource, InFile, ModuleDef};
 use hir_def::{MacroId, ModuleDefId, ModuleId, visibility::Visibility};
 use hir_expand::mod_path::ModPath;
+use rustc_hash::FxHashSet;
+use smallvec::SmallVec;
 use syntax::{
     AstNode, SyntaxNode, SyntaxNodePtr,
     ast::{self, HasVisibility},
 };
 
-use super::used::{Binding, Entry, Ns, Tree, TreeKind, UseItem, Uses, entry, lookup};
+use super::used::{Binding, Entry, Ns, Tree, TreeKind, UseItem, Uses, entry};
 use crate::{
     cx::{Cx, item_range},
     lower::{Found, Phase},
@@ -35,32 +37,32 @@ pub(super) fn lints(cx: &Cx<'_, '_>, uses: &Uses) -> Vec<Found> {
     for item in &uses.items {
         for tree in &item.trees {
             match tree.kind {
-                TreeKind::Glob => found.extend(glob_visibility(cx, item, tree)),
+                TreeKind::Glob => found.extend(glob_visibility(cx, uses, item, tree)),
                 TreeKind::Simple => found.extend(private_extern_crate(cx, uses, item, tree)),
                 TreeKind::List => {}
             }
         }
     }
-    let mut modules: Vec<ModuleId> = uses.items.iter().map(|it| it.module).collect();
-    modules.dedup();
-    let mut seen = rustc_hash::FxHashSet::default();
-    modules.retain(|it| seen.insert(*it));
-    for module in modules {
-        found.extend(reexports(cx, uses, module));
+    let mut seen = FxHashSet::with_capacity_and_hasher(uses.globs.len(), Default::default());
+    for module in uses.items.iter().map(|it| it.module) {
+        if uses.globs.contains_key(&module) && seen.insert(module) {
+            found.extend(reexports(cx, uses, module));
+        }
     }
     found
 }
 
 /// rustc's check that a glob import re-exports something as visibly as it is declared: its
 /// visibility greater than `max_vis`, the greatest of those of what it imports.
-fn glob_visibility(cx: &Cx<'_, '_>, item: &UseItem, tree: &Tree) -> Option<Found> {
+fn glob_visibility(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree) -> Option<Found> {
     let db = cx.db;
     let Some(ModuleDefId::ModuleId(from)) = tree.source else { return None };
-    let home = nearest_module(cx, item.module);
-    if from == item.module {
+    // A private import is as visible as anything it can import, so `max_vis` never falls below it.
+    if from == item.module || item.node.value.visibility().is_none() {
         return None;
     }
-    let import_vis = item_visibility(cx, item)?;
+    let home = nearest_module(cx, item.module);
+    let import_vis = item_visibility(cx, uses, item)?;
     let scope = from.def_map(db).module(db, from).scope(db);
     let named: Vec<hir_def::TraitId> = scope
         .types()
@@ -148,44 +150,42 @@ fn private_extern_crate(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tre
 fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
     let db = cx.db;
     let mut found = Vec::new();
-    let globs: Vec<(&UseItem, &Tree, ModuleId)> = uses
-        .items
-        .iter()
-        .filter(|it| it.module == module)
-        .flat_map(|item| item.trees.iter().map(move |tree| (item, tree)))
-        .filter_map(|(item, tree)| match (tree.kind, tree.source) {
-            (TreeKind::Glob, Some(ModuleDefId::ModuleId(from))) if from != module => Some((item, tree, from)),
+    let globs: SmallVec<[(&UseItem, &Tree, ModuleId); 2]> = uses
+        .globs_of(module)
+        .filter_map(|(item, tree)| match tree.source {
+            Some(ModuleDefId::ModuleId(from)) if from != module => Some((item, tree, from)),
             _ => None,
         })
         .collect();
-    if globs.is_empty() {
+    // Both lints need a `pub` glob: the first of an ambiguity, or the one a private item hides.
+    if !globs.iter().any(|(item, _, _)| item.public) {
         return found;
     }
     let here = module.def_map(db).module(db, module).scope(db);
-    let mut names: Vec<hir_expand::name::Name> = Vec::new();
+    let mut names: Vec<&hir_expand::name::Name> = Vec::new();
+    let mut seen: FxHashSet<&hir_expand::name::Name> = FxHashSet::default();
     for (_, _, from) in &globs {
         for (name, _) in from.def_map(db).module(db, *from).scope(db).entries() {
-            if !names.contains(name) {
-                names.push(name.clone());
+            if seen.insert(name) {
+                names.push(name);
             }
         }
     }
     for name in names {
-        let current = here.get(&name);
+        let current = here.get(name);
         for ns in Ns::ALL {
-            let imported: Vec<(&UseItem, &Tree, Entry)> = globs
+            let Some(it) = entry(&current, ns) else { continue };
+            let imported: SmallVec<[(&UseItem, &Tree, Entry); 2]> = globs
                 .iter()
                 .filter_map(|(item, tree, from)| {
-                    let per = from.def_map(db).module(db, *from).name_in_scope(db, &name);
+                    let per = from.def_map(db).module(db, *from).name_in_scope(db, name);
                     let it = entry(&per, ns)?;
                     it.vis.is_visible_from(db, module).then_some((*item, *tree, it))
                 })
                 .collect();
             let Some(&(first_item, first_tree, first)) = imported.first() else { continue };
-            let current = entry(&current, ns);
-            let glob_binding = |it: &Entry| matches!(it.import, Some(Binding::Glob(_)));
-            match current {
-                Some(it) if glob_binding(&it) => {
+            match it {
+                it if matches!(it.import, Some(Binding::Glob(_))) => {
                     let public = first_item.public && first.vis == Visibility::Public;
                     let exported = it.import.is_some_and(|it| uses.exported_names.contains(&(it, name.clone(), ns)));
                     if !public || !exported {
@@ -212,7 +212,7 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
                     let at = InFile::new(first_item.node.file_id, SyntaxNodePtr::new(first_item.node.value.syntax()));
                     found.push(Found::lint(diag, Phase::Resolve, at));
                 }
-                Some(it) => {
+                it => {
                     if it.vis == Visibility::Public || matches!(it.def, ModuleDefId::MacroId(MacroId::MacroRulesId(_))) {
                         continue;
                     }
@@ -240,7 +240,6 @@ fn reexports(cx: &Cx<'_, '_>, uses: &Uses, module: ModuleId) -> Vec<Found> {
                     diag.fact(cx.resolves_fact(module.into(), &text), format!("what `{text}` is in the module"));
                     found.push(Found::lint(diag, Phase::Resolve, private.map(|it| SyntaxNodePtr::new(&it))));
                 }
-                None => {}
             }
         }
     }
@@ -304,7 +303,7 @@ fn nearest_module(cx: &Cx<'_, '_>, module: ModuleId) -> ModuleId {
 }
 
 /// The visibility a `use` item is declared with, resolved.
-fn item_visibility(cx: &Cx<'_, '_>, item: &UseItem) -> Option<Vis> {
+fn item_visibility(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem) -> Option<Vis> {
     let db = cx.db;
     let home = nearest_module(cx, item.module);
     let Some(vis) = item.node.value.visibility() else { return Some(Vis::Module(home)) };
@@ -316,7 +315,7 @@ fn item_visibility(cx: &Cx<'_, '_>, item: &UseItem) -> Option<Vis> {
         ast::VisibilityKind::In(path) => {
             let span_map = item.node.file_id.span_map(db);
             let path = ModPath::from_src(db, path, &mut |range| span_map.span_for_range(range).ctx)?;
-            match entry(&lookup(cx, home, path.kind, path.segments()), Ns::Types)?.def {
+            match entry(&uses.lookup(cx, home, path.kind, path.segments()), Ns::Types)?.def {
                 ModuleDefId::ModuleId(it) => Vis::module(cx, it),
                 _ => return None,
             }

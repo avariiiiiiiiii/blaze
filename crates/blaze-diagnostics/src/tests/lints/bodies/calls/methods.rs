@@ -12,12 +12,11 @@ mod noop_method_call;
 use super::{Ui, split_flag};
 use crate::{Options, lints::CommandLine};
 
-/// The options compiletest gives a UI test that is not `run-pass` (which none here is), then
-/// the test's own lint flags.
-fn compiletest(flags: &[&str]) -> Options {
+/// The options compiletest gives a UI test of `mode`, then the test's own lint flags.
+fn compiletest(mode: crate::tests::Mode, flags: &[&str]) -> Options {
     let args: Vec<String> = flags.iter().flat_map(|flag| split_flag(flag)).map(str::to_owned).collect();
     let own = Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() };
-    crate::tests::compiletest(crate::tests::Mode::Other, &own)
+    crate::tests::compiletest(mode, &own)
 }
 
 /// What every test's `core` starts with: `marker`'s `Sized` and `Copy`, `clone`'s `Clone` with
@@ -896,6 +895,8 @@ pub(crate) struct Library<'a> {
     /// `pub use crate::..;` lines.
     pub(crate) core_prelude: &'a str,
     /// The modules of `std` the test uses, as std writes them; `core` is its dependency.
+    /// [`ui_library`] gives it `#![feature(lang_items, rustc_attrs)]`, so its own `#![feature]`
+    /// line, if any, names only the others.
     pub(crate) std: &'a str,
     /// What std's prelude has beyond core's: `pub use crate::..;` lines.
     pub(crate) std_prelude: &'a str,
@@ -926,13 +927,14 @@ fn prelude(of_core: bool, uses: &str) -> String {
 }
 
 /// What rustc writes to stderr compiling the UI test `ui` against `library`: its `.stderr`.
-/// `ui`'s own `core` and `std` are minicore's, which these tests do not use, and its `test` is
-/// left out: none of these tests is `run-pass`, so compiletest gives each `-A unused`.
+/// `ui`'s own `core` and `std` are minicore's, which these tests do not use. std starts with
+/// the features its `#[lang]`s and `#[rustc_diagnostic_item]`s need, without which hir-def
+/// collects none of them.
 pub(crate) fn ui_library(ui: Ui<'_>, library: &Library<'_>) -> String {
     assert!(ui.core.is_empty() && ui.std.is_none(), "the library is `library`'s");
     let mut fixture = format!(
         "//- /core.rs crate:core edition:2024\n{CORE}{}\n{}\
-         //- /std.rs crate:std edition:2024 deps:core\n{}\n{}",
+         //- /std.rs crate:std edition:2024 deps:core\n#![feature(lang_items, rustc_attrs)]\n{}\n{}",
         library.core,
         prelude(true, library.core_prelude),
         library.std,
@@ -949,7 +951,7 @@ pub(crate) fn ui_library(ui: Ui<'_>, library: &Library<'_>) -> String {
     }
     let meta = if ui.meta.is_empty() { String::new() } else { format!(" {}", ui.meta) };
     fixture.push_str(&format!("//- /{} crate:main edition:{} deps:{deps}{meta}\n{}", ui.name, ui.edition, ui.source));
-    let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(ui.flags))
+    let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(ui.mode, ui.flags))
         .stderr_with(crate::emit::Style { ui_testing: true, ..crate::emit::Style::default() });
     crate::tests::normalized(&stderr)
 }

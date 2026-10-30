@@ -1225,7 +1225,7 @@ fn manifest_source(source: &str, config: &Config) -> Result<blaze_manifest::sour
         "sparse" => Ok(SourceId::for_registry(&source.parse()?)),
         "git" => {
             let mut url: url::Url = rest.parse()?;
-            let query: BTreeMap<String, String> = url.query_pairs().into_owned().collect();
+            let query: FxHashMap<String, String> = url.query_pairs().into_owned().collect();
             let reference = match (query.get("branch"), query.get("tag"), query.get("rev")) {
                 (Some(branch), _, _) => GitReference::Branch(branch.clone()),
                 (_, Some(tag), _) => GitReference::Tag(tag.clone()),

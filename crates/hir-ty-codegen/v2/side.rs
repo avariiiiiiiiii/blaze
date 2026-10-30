@@ -44,6 +44,7 @@ pub(crate) struct Scopes {
     pub(crate) of_span: Vec<SpanScope>,
 }
 
+/// A tag and a `u32`, one a statement of the body.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum SpanScope {
     /// Of the scope of the code before it: code of no expression, or of a pattern.
@@ -53,6 +54,8 @@ pub(crate) enum SpanScope {
     /// Of this scope and those it is inside of.
     In(u32),
 }
+
+const _: () = assert!(size_of::<SpanScope>() == 8);
 
 /// The table as written, borrowing what it tells of, and as read, borrowing the names from
 /// the stored bytes.

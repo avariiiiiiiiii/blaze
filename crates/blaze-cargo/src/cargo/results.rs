@@ -26,6 +26,7 @@ use std::{
     path::Path,
 };
 
+use rustc_hash::FxHashMap;
 use sha2::{Digest as _, Sha256};
 
 use super::sandboxed;
@@ -64,6 +65,7 @@ impl Seen {
 }
 
 /// The paths a test read, each with how much of it it saw.
+// BTreeMap: hashed in order into the second key, and kept in order as a set's text.
 pub type Reads = BTreeMap<String, Seen>;
 
 /// What the store has of a test.
@@ -359,8 +361,9 @@ const PASSED: &str = "tests-passed";
 /// again (`BLAZE_TESTS=verify`).
 pub struct Passed {
     file: Option<std::path::PathBuf>,
-    read: BTreeMap<Key, String>,
-    now: BTreeMap<Key, String>,
+    read: FxHashMap<Key, String>,
+    /// Written sorted by key ([`Self::write`]).
+    now: FxHashMap<Key, String>,
 }
 
 impl Passed {
@@ -380,7 +383,7 @@ impl Passed {
                 Some((first, from.to_owned()))
             })
             .collect();
-        Passed { file, read, now: BTreeMap::new() }
+        Passed { file, read, now: FxHashMap::default() }
     }
 
     /// Where the test of `first` passed, when it is kept here.
@@ -403,8 +406,9 @@ impl Passed {
         if self.now == self.read {
             return;
         }
-        let text: String =
-            self.now.iter().map(|(key, from)| format!("{}\t{from}\n", hex(key))).collect();
+        let mut now: Vec<(&Key, &String)> = self.now.iter().collect();
+        now.sort_unstable_by_key(|it| it.0);
+        let text: String = now.iter().map(|&(key, from)| format!("{}\t{from}\n", hex(key))).collect();
         write_whole(file, text.as_bytes());
         self.read = self.now.clone();
     }
@@ -431,6 +435,7 @@ fn marked(key: &Key, mark: &[u8]) -> Key {
 
 /// A set of paths a test read, each with how much it saw and what was at it, as
 /// [`Results::keep_set`] wrote it.
+// BTreeMap: compared in order against a test's `Reads`.
 fn read_set(bytes: &[u8]) -> Option<BTreeMap<String, (Seen, String)>> {
     let text = std::str::from_utf8(bytes).ok()?;
     let lines = text.lines().map(|it| {
@@ -512,6 +517,21 @@ mod tests {
         let passed = Passed::read(Some(&dir));
         assert_eq!(passed.get(&a), Some("commit abc (run 1)"));
         assert_eq!(passed.get(&b), None);
+        _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn passes_are_written_sorted_by_key() {
+        let dir = scratch("passed-sorted");
+        let mut passed = Passed::read(Some(&dir));
+        let mut keys: Vec<Key> = (0..32).map(|it| Results::first("abc", &format!("tests::t{it}"))).collect();
+        for key in &keys {
+            passed.insert(*key, "here".to_owned());
+        }
+        passed.write();
+        keys.sort();
+        let want: String = keys.iter().map(|key| format!("{}\there\n", hex(key))).collect();
+        assert_eq!(std::fs::read_to_string(dir.join(PASSED)).unwrap(), want);
         _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -88,3 +88,11 @@ Applied by core: 1 (`a_sandbox_is_made_by_the_confine_or_refused` runs on `Uring
 too; the shared scripts already did), 2 (`Threads::local_addr`), 3 (in docs/v2/plan/lanes/core/plane.md).
 
 > forwarded to concurrency: the pack writer is in `crates/blaze-cas`, lane concurrency's now (store is DONE); `fs::write_at` already gives macOS the same rule (`F_NOCACHE`, core-macos 4).
+
+> applied by concurrency: a commit writes each pack it touches as `Truncate` to the committed
+> length, then one `Effect::WriteAt` at the committed end of everything the commit added, then
+> `Sync` (`Op::WritePack` in `crates/blaze-cas/src/lib.rs`; `Append` is gone). Each commit pads
+> each pack to a 4 KiB block (`disk::BLOCK`), so offset and length are always block multiples,
+> and the real record ends live in the index. The write is one piece per pack per commit, so
+> it is 1 MiB or more whenever the commit added that much to the pack; a smaller commit's write
+> goes through the cache, as the request allows.

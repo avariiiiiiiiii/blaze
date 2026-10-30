@@ -444,7 +444,7 @@ impl Jobs {
     /// The roots the jobs' views read, kept by a collection.
     pub fn roots(&self) -> Vec<ContentId> {
         let mut jobs: Vec<(&JobId, &Job)> = self.jobs.iter().collect();
-        jobs.sort_unstable_by_key(|(id, _)| id.0);
+        blaze_ids::radix::sort_by_key(&mut jobs, |(id, _)| id.0);
         jobs.into_iter().flat_map(|(_, it)| it.views.iter().map(|view| view.view.root)).collect()
     }
 
@@ -453,7 +453,7 @@ impl Jobs {
         let mut order = std::mem::take(&mut self.order);
         order.clear();
         order.extend(self.jobs.keys().copied());
-        order.sort_unstable_by_key(|it| it.0);
+        blaze_ids::radix::sort_copy_by_key(&mut order, |it| it.0);
         order
     }
 

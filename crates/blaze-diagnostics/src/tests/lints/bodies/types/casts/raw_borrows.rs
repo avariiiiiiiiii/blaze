@@ -1,6 +1,6 @@
 //! `raw_borrows_via_references`: rustc's `tests/ui/lint/lint-raw-borrows-via-references.rs`.
 
-use super::{Test, Ui, ui};
+use super::{Ui, ui};
 
 #[test]
 fn lint_raw_borrows_via_references() {
@@ -222,7 +222,6 @@ warning: 10 warnings emitted
 "##;
     let stderr = ui(Ui {
         name: "lint-raw-borrows-via-references.rs",
-        test: Test::Passes,
         core: "add, sized",
         source,
         ..Ui::default()

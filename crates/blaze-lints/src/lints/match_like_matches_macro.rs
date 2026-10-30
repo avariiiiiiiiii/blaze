@@ -19,7 +19,7 @@ use crate::{
     msrvs,
 };
 
-const LINT: &str = "match_like_matches_macro";
+const LINT: super::Implemented = super::Implemented::MatchLikeMatchesMacro;
 
 pub(super) fn check_match(cx: &mut Cx<'_, '_, '_>, expr: &ast::MatchExpr) {
     if !cx.on(LINT) || !cx.conf().meets(msrvs::MATCHES_MACRO) {

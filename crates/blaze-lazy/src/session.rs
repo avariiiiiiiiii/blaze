@@ -66,7 +66,7 @@ impl Session {
     }
 
     /// Every lazy function and the address its slot starts at, for a region written at
-    /// `base`: what blaze-link puts in each one's cell (`Change::lazy`).
+    /// `base`: what blaze-link puts in each one's slot when it places the image.
     pub fn slots(&self, base: u64) -> impl Iterator<Item = (InstanceKey, u64)> + '_ {
         self.plan.lazy().iter().enumerate().map(move |(id, key)| (*key, self.entry(base, LazyId(id as u32))))
     }

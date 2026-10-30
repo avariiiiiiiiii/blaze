@@ -311,11 +311,6 @@ impl<S> ShardedTable<S> {
         }
     }
 
-    /// `shard`'s state, with no lock: `&mut` excludes every other user.
-    pub(super) fn state_mut(&mut self, shard: usize) -> &mut S {
-        &mut self.writers[shard].get_mut().state
-    }
-
     /// Frees every table a shard outgrew.
     pub(super) fn free_outgrown(&mut self) {
         for writer in self.writers.iter_mut() {
@@ -401,12 +396,9 @@ impl<S> Locked<'_, S> {
     }
 
     /// Keys in the shard.
+    #[cfg(test)]
     pub(super) fn len(&self) -> usize {
         self.writer.live
-    }
-
-    pub(super) fn state(&self) -> &S {
-        &self.writer.state
     }
 
     pub(super) fn state_mut(&mut self) -> &mut S {

@@ -299,6 +299,7 @@ mod durability;
 mod event;
 mod fingerprint;
 mod function;
+mod graph;
 mod hash;
 mod id;
 mod ingredient;

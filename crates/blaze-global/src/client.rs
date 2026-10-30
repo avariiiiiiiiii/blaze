@@ -20,10 +20,10 @@ use crate::{
     ByHash, Refused, Tags,
     bundle::{BundleId, Manifest},
     http,
-    public::Public,
-    sign::{Record, Signed, Trust},
+    public::{Private, Public, Secrets},
+    sign::{Publisher, Record, Signed, Trust},
     tls::{Channel, Channels, TlsClient},
-    wire::{self, BATCH_MOST, LONGEST_VALUE, Reader, RecvWindow, SendWindow},
+    wire::{self, BATCH_MOST, BODY_MOST, Reader, RecvWindow, SendWindow},
 };
 
 /// The most connections to the cache at once.
@@ -32,10 +32,6 @@ pub const CONNECTIONS: usize = 4;
 pub const PIPELINE: usize = 4;
 /// The most keys one fetch of keys of unknown length names.
 pub const BATCH_KEYS: usize = 256;
-/// A fetch of listed keys, or a publish, carries about this many bytes of values.
-pub const BATCH_BYTES: u64 = 16 << 20;
-/// The longest response body taken: one longest value and its framing.
-const RESPONSE_MOST: u64 = LONGEST_VALUE + (1 << 20);
 const RECV_LEAST: usize = 1 << 20;
 const RECV_MOST: usize = 1 << 26;
 
@@ -209,27 +205,33 @@ impl<C: Channels> Client<C> {
         }
         self.allowed = None;
         self.batching = false;
-        self.pump_later(effects);
+        self.pump_held(effects);
         tags
     }
 
-    /// Publishes `value` as `signed` says, for `public`; how it went comes through
-    /// [`Client::published`] with the tag returned.
-    pub fn publish(&mut self, public: &Public, signed: Signed, value: Vec<u8>, effects: &mut Vec<Effect>) -> Tag {
-        assert_eq!(signed.record.key, public.key(), "a record of another key than the one shown public");
-        assert_eq!(signed.record.kind, public.kind(), "a record of another kind than the key shown public");
-        assert_eq!(signed.record.len, value.len() as u64, "a record of another length than its value");
+    /// Publishes `value` as the value of `public`, signed by `publisher`, unless it holds one
+    /// of `secrets`; how it went comes through [`Client::published`] with the tag returned.
+    pub fn publish(
+        &mut self,
+        public: &Public,
+        value: Vec<u8>,
+        publisher: &Publisher,
+        secrets: &Secrets,
+        effects: &mut Vec<Effect>,
+    ) -> Result<Tag, Private> {
+        secrets.check(public.key(), &value)?;
+        let signed = publisher.sign(Record::of(public.key(), public.kind(), &value));
         let tag = self.tags.next();
         self.publishes.push_back((tag, signed, value));
-        self.pump_later(effects);
-        tag
+        self.pump_held(effects);
+        Ok(tag)
     }
 
     /// Asks for the manifest of `id`; it comes through [`Client::bundles`].
     pub fn bundle(&mut self, id: BundleId, effects: &mut Vec<Effect>) -> Tag {
         let tag = self.tags.next();
         self.bundles.push_back(BundleWork::Get { tag, id });
-        self.pump_later(effects);
+        self.pump_held(effects);
         tag
     }
 
@@ -238,7 +240,7 @@ impl<C: Channels> Client<C> {
     pub fn publish_bundle(&mut self, manifest: Manifest, effects: &mut Vec<Effect>) -> Tag {
         let tag = self.tags.next();
         self.bundles.push_back(BundleWork::Publish { tag, manifest });
-        self.pump_later(effects);
+        self.pump_held(effects);
         tag
     }
 
@@ -418,7 +420,7 @@ impl<C: Channels> Client<C> {
         let mut start = 0;
         let result = loop {
             let rest = &up.plain[start..];
-            let head = match http::response_head(rest, RESPONSE_MOST) {
+            let head = match http::response_head(rest, BODY_MOST) {
                 Ok(Some(head)) => head,
                 Ok(None) => break Ok(()),
                 Err(why) => break Err(format!("a malformed response: {why}")),
@@ -450,7 +452,7 @@ impl<C: Channels> Client<C> {
 
     /// [`Client::pump_all`] from a call that returns no completions: what fails waits for
     /// the next [`Client::complete`].
-    fn pump_later(&mut self, effects: &mut Vec<Effect>) {
+    fn pump_held(&mut self, effects: &mut Vec<Effect>) {
         let mut answers = Vec::new();
         self.pump_all(&mut answers, effects);
         self.undelivered.extend(answers);
@@ -480,7 +482,7 @@ impl<C: Channels> Client<C> {
         let Client { links, fetches, publishes, bundles, listed, tags, endpoint, .. } = self;
         let Link::Up(up) = &mut links[at] else { return Ok(()) };
         let up = &mut **up;
-        let mut request = Vec::new();
+        let mut head = Vec::new();
         while up.asked.len() < PIPELINE {
             let mut body = Vec::new();
             let (path, asked) = if let Some(work) = bundles.pop_front() {
@@ -501,7 +503,7 @@ impl<C: Channels> Client<C> {
                 let mut items = Vec::new();
                 while let Some((_, _, value)) = publishes.front() {
                     let len = value.len() as u64;
-                    if !items.is_empty() && (bytes + len > BATCH_BYTES || items.len() == BATCH_MOST) {
+                    if !items.is_empty() && (!wire::takes(bytes, len) || items.len() == BATCH_MOST) {
                         break;
                     }
                     bytes += len;
@@ -521,7 +523,7 @@ impl<C: Channels> Client<C> {
                 while let Some((_, key)) = fetches.front() {
                     let len = listed.get(key).map(|it| it.len);
                     let most = if len.is_some() { BATCH_MOST } else { BATCH_KEYS };
-                    if !keys.is_empty() && (keys.len() >= most || bytes + len.unwrap_or(0) > BATCH_BYTES) {
+                    if !keys.is_empty() && (keys.len() >= most || !wire::takes(bytes, len.unwrap_or(0))) {
                         break;
                     }
                     bytes += len.unwrap_or(0);
@@ -533,11 +535,11 @@ impl<C: Channels> Client<C> {
             } else {
                 break;
             };
-            http::write_request(&endpoint.host, path, &body, &mut request);
+            head.clear();
+            http::write_request_head(&endpoint.host, path, body.len(), &mut head);
+            up.channel.send(&head)?;
+            up.channel.send(&body)?;
             up.asked.push_back(asked);
-        }
-        if !request.is_empty() {
-            up.channel.send(&request)?;
         }
         up.channel.outgoing(&mut up.staged)?;
         if up.sending.is_none() && !up.staged.is_empty() {
@@ -548,7 +550,7 @@ impl<C: Channels> Client<C> {
         if up.recv.is_none() {
             let tag = tags.next();
             up.recv = Some(tag);
-            let owed = match http::response_head(&up.plain, RESPONSE_MOST) {
+            let owed = match http::response_head(&up.plain, BODY_MOST) {
                 Ok(Some(head)) => (head.head + head.body).saturating_sub(up.plain.len()),
                 _ => 0,
             };
@@ -730,7 +732,7 @@ impl<C: Channels> Remote for Client<C> {
         assert!(allowed, "the global cache is asked for {:x}, which was not shown public", key.0);
         self.fetches.push_back((tag, *key));
         if !self.batching {
-            self.pump_later(effects);
+            self.pump_held(effects);
         }
     }
 }

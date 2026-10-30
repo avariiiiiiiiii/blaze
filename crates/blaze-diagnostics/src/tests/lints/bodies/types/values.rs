@@ -5,10 +5,10 @@
 //! as rust-lang/rust `ad3d0bc141a` has them in `tests/ui/` (MIT or Apache-2.0), with the items
 //! of std they use written as `library/` writes them.
 
-use super::{Test, Ui, ui};
+use super::{Ui, ui};
 
-fn check(name: &str, test: Test, core: &str, std: &str, source: &str, stderr: &str) {
-    let actual = ui(Ui { name, test, core, std: Some(("", std)), source, ..Ui::default() });
+fn check(name: &str, core: &str, std: &str, source: &str, stderr: &str) {
+    let actual = ui(Ui { name, core, std: Some(("", std)), source, ..Ui::default() });
     assert_eq!(actual, stderr, "{name}");
 }
 
@@ -1098,7 +1098,6 @@ pub mod sync {
 fn transmute_imut_to_mut() {
     check(
         "transmute-imut-to-mut.rs",
-        Test::Passes,
         "sized",
         TRANSMUTE,
         include_str!("values/ui/transmute-imut-to-mut.rs"),
@@ -1111,7 +1110,6 @@ fn transmute_imut_to_mut() {
 fn force_warn_mutable_transmutes() {
     let actual = ui(Ui {
         name: "deny-by-default-lint.rs",
-        test: Test::Passes,
         core: "sized",
         std: Some(("", TRANSMUTE)),
         flags: &["--force-warn mutable_transmutes"],
@@ -1124,14 +1122,13 @@ fn force_warn_mutable_transmutes() {
 /// `tests/ui/transmute/transmute-bool-u8.rs`: `#![allow(unnecessary_transmutes)]` on the crate.
 #[test]
 fn transmute_bool_u8() {
-    check("transmute-bool-u8.rs", Test::Passes, "sized", TRANSMUTE, include_str!("values/ui/transmute-bool-u8.rs"), "");
+    check("transmute-bool-u8.rs", "sized", TRANSMUTE, include_str!("values/ui/transmute-bool-u8.rs"), "");
 }
 
 #[test]
 fn lint_enum_intrinsics_non_enums() {
     check(
         "lint-enum-intrinsics-non-enums.rs",
-        Test::Passes,
         "sized, discriminant",
         DISCRIMINANT,
         include_str!("values/ui/lint-enum-intrinsics-non-enums.rs"),
@@ -1143,7 +1140,6 @@ fn lint_enum_intrinsics_non_enums() {
 fn ptr_to_int_transmute_in_consts_issue_87525() {
     check(
         "ptr-to-int-transmute-in-consts-issue-87525.rs",
-        Test::Passes,
         "sized, add",
         TRANSMUTE,
         include_str!("values/ui/ptr-to-int-transmute-in-consts-issue-87525.rs"),
@@ -1155,7 +1151,6 @@ fn ptr_to_int_transmute_in_consts_issue_87525() {
 fn int_to_ptr() {
     check(
         "int_to_ptr.rs",
-        Test::Passes,
         "sized, add, fn",
         TRANSMUTE,
         include_str!("values/ui/int_to_ptr.rs"),
@@ -1167,7 +1162,6 @@ fn int_to_ptr() {
 fn unnecessary_transmutation() {
     check(
         "unnecessary-transmutation.rs",
-        Test::Passes,
         "sized",
         TRANSMUTE,
         include_str!("values/ui/unnecessary-transmutation.rs"),
@@ -1181,7 +1175,6 @@ fn unnecessary_transmutation() {
 fn invalid_value() {
     check(
         "invalid_value.rs",
-        Test::Passes,
         "sized, option, result, send, non_null, non_zero, pat, manually_drop, fn",
         UNINIT,
         include_str!("values/ui/invalid_value.rs"),
@@ -1193,7 +1186,6 @@ fn invalid_value() {
 fn const_item_interior_mutations_const_cell() {
     check(
         "const-item-interior-mutations-const-cell.rs",
-        Test::Passes,
         "sized, copy, option, result, fn, add, deref",
         CELLS,
         include_str!("values/ui/const-item-interior-mutations-const-cell.rs"),
@@ -1207,7 +1199,6 @@ fn const_item_interior_mutations_const_cell() {
 fn const_item_interior_mutations_const() {
     check(
         "const-item-interior-mutations-const.rs",
-        Test::Passes,
         "sized, copy, option, result, fn, eq, drop, fmt",
         SYNC,
         include_str!("values/ui/const-item-interior-mutations-const.rs"),
@@ -1219,7 +1210,6 @@ fn const_item_interior_mutations_const() {
 fn const_item_interior_mutations_const_atomics() {
     check(
         "const-item-interior-mutations-const-atomics.rs",
-        Test::Passes,
         "sized, copy, option, result, fn",
         ATOMICS,
         include_str!("values/ui/const-item-interior-mutations-const-atomics.rs"),
@@ -1231,7 +1221,6 @@ fn const_item_interior_mutations_const_atomics() {
 fn const_item_interior_mutations_const_deref() {
     check(
         "const-item-interior-mutations-const-deref.rs",
-        Test::Passes,
         "sized, copy, option, result, fn, deref",
         CELLS,
         include_str!("values/ui/const-item-interior-mutations-const-deref.rs"),

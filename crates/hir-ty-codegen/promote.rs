@@ -124,7 +124,9 @@ fn promote_in(
         }
     }
     // Stable, so that the accesses of a part stay in the order of the layout.
-    accesses.sort_by_key(|it| (it.slot, it.at));
+    blaze_ids::radix::sort_copy_by_key(&mut accesses, |it| {
+        blaze_ids::radix::pack_32(it.slot.as_u32(), blaze_ids::radix::signed_32(it.at))
+    });
     let mut dominators = None;
     let mut of_slots = accesses.chunk_by(|a, b| a.slot == b.slot).peekable();
     for slot in (0..func.sized_stack_slots.len()).map(StackSlot::new) {

@@ -140,6 +140,7 @@ impl Build {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
     use blaze_protocol::events::NodeState;
 

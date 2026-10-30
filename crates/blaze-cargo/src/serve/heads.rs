@@ -415,7 +415,7 @@ impl Heads {
                     .filter(|(number, cookie)| cookie.seen && !held.iter().any(|it| it.waits.contains(&(slot, **number))))
                     .map(|(number, _)| *number),
             );
-            swept.sort_unstable();
+            blaze_ids::radix::sort(&mut swept);
             for number in swept.drain(..) {
                 let cookie = checkout.cookies.remove(&number).expect("a cookie just found");
                 let tag = Tag(tags + (number % (1 << 31)) * 2 + 1);

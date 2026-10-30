@@ -44,6 +44,7 @@ use std::{
     thread::{self, JoinHandle, Thread},
 };
 
+use blaze_ids::radix;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 
 use crate::{
@@ -230,6 +231,7 @@ impl Pool {
     /// macOS; an error elsewhere). An error when a thread cannot be started or bound: the pool
     /// is not made smaller.
     pub fn new(topology: &Topology, bind: bool) -> io::Result<Pool> {
+        radix::set_ambient(ambient);
         if topology.cpus.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "a worker pool of no CPU"));
         }
@@ -410,32 +412,86 @@ impl Pool {
     /// every job it submitted has run. On a worker of a pool the wait pumps (as [`crate::pump`]
     /// says); elsewhere it parks.
     pub fn scope<'env, R>(&self, f: impl FnOnce(&Scope<'env>) -> R) -> R {
-        let pending = Pending {
-            count: AtomicUsize::new(1),
-            finished: AtomicBool::new(false),
-            owner: thread::current(),
-        };
-        let scope = Scope { shared: Arc::as_ptr(&self.shared), pending: &pending, _env: PhantomData };
-        let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
-        if pending.count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            pending.finished.store(true, Ordering::Release);
-        }
-        let mut idle = 0;
-        while !pending.finished.load(Ordering::Acquire) {
-            let pump = depth() < PUMP_DEPTH;
-            if pump && idle % 16 == 0 && run_one() {
-                idle = 0;
-                continue;
-            }
-            if idle < SPINS {
-                idle += 1;
-                std::hint::spin_loop();
-                continue;
-            }
-            park(&|| pending.finished.load(Ordering::Acquire), pump);
-        }
-        result.unwrap_or_else(|panic| resume_unwind(panic))
+        scope_in(&self.shared, f)
     }
+}
+
+/// [`Pool::scope`] on the pool `shared` is of, which outlives the call.
+fn scope_in<'env, R>(shared: &Shared, f: impl FnOnce(&Scope<'env>) -> R) -> R {
+    let pending = Pending {
+        count: AtomicUsize::new(1),
+        finished: AtomicBool::new(false),
+        owner: thread::current(),
+    };
+    let scope = Scope { shared: ptr::from_ref(shared), pending: &pending, _env: PhantomData };
+    let result = catch_unwind(AssertUnwindSafe(|| f(&scope)));
+    if pending.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+        pending.finished.store(true, Ordering::Release);
+    }
+    let mut idle = 0;
+    while !pending.finished.load(Ordering::Acquire) {
+        let pump = depth() < PUMP_DEPTH;
+        if pump && idle % 16 == 0 && run_one() {
+            idle = 0;
+            continue;
+        }
+        if idle < SPINS {
+            idle += 1;
+            std::hint::spin_loop();
+            continue;
+        }
+        park(&|| pending.finished.load(Ordering::Acquire), pump);
+    }
+    result.unwrap_or_else(|panic| resume_unwind(panic))
+}
+
+/// `job(0..jobs)` as jobs of a scope on `shared`'s pool; the first panic of one is raised once
+/// all have run.
+fn run_jobs(shared: &Shared, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+    let failed: Lock<Option<Box<dyn Any + Send>>> = Lock::new(None);
+    scope_in(shared, |scope| {
+        for at in 0..jobs {
+            scope.submit(None, move || job(at), |it| {
+                if let Err(panic) = it {
+                    failed.lock().get_or_insert(panic);
+                }
+            });
+        }
+    });
+    if let Some(panic) = failed.into_inner() {
+        resume_unwind(panic);
+    }
+}
+
+// SAFETY: `run_jobs` submits each job once to a scope, which returns only once every job of it
+// has run (a job's panic is caught and given to its `done`).
+unsafe impl radix::Workers for Pool {
+    fn threads(&self) -> usize {
+        self.workers()
+    }
+
+    fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+        run_jobs(&self.shared, jobs, job);
+    }
+}
+
+/// The pool of the worker a sort runs on, for [`radix`]'s parallel passes.
+struct Here<'a>(&'a Shared);
+
+// SAFETY: as `Pool`'s; the worker's `Local` keeps the pool's `Shared` for as long as it works.
+unsafe impl radix::Workers for Here<'_> {
+    fn threads(&self) -> usize {
+        self.0.slots.len()
+    }
+
+    fn run(&self, jobs: usize, job: &(dyn Fn(usize) + Sync)) {
+        run_jobs(self.0, jobs, job);
+    }
+}
+
+/// [`radix::Ambient`]: the pool this thread is a worker of.
+fn ambient(with: &mut dyn FnMut(&dyn radix::Workers)) -> bool {
+    with_local(|local| with(&Here(&*local.shared))).is_some()
 }
 
 impl Drop for Pool {
@@ -776,6 +832,9 @@ impl Local {
     }
 
     fn run(&self, job: Job) {
+        // Each job is a reclamation boundary: a value a shared table retires is freed once
+        // every job that was running when it was retired has ended.
+        let _task = blaze_reclaim::enter();
         // `job` catches its own panic and gives it to `done`; only `done`'s comes here.
         if let Err(panic) = catch_unwind(AssertUnwindSafe(|| run_task(|| job.run()))) {
             self.shared.stray.lock().get_or_insert(panic);
@@ -895,6 +954,7 @@ fn bind_to(cpu: &Cpu) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
     use std::{
         sync::{
@@ -1384,6 +1444,36 @@ mod tests {
         assert!(Pool::new(&Topology { cpus: Vec::new() }, false).is_err());
         let gap = Topology { cpus: vec![Cpu { id: 0, group: 1, socket: 0, node: 0, fast: true }] };
         assert!(Pool::new(&gap, false).is_err());
+    }
+
+    /// A radix sort of `PARALLEL` items or more runs its passes on the pool: given it, or
+    /// called on one of its workers. Either way it sorts as the standard stable sort.
+    #[test]
+    fn a_large_radix_sort_runs_on_the_pool() {
+        use blaze_ids::radix;
+        fn input() -> (Vec<(u64, u32)>, Vec<(u64, u32)>) {
+            let mut rng = Rng(11);
+            let pairs: Vec<(u64, u32)> =
+                (0..radix::PARALLEL as u32 + 7).map(|at| (rng.below(1000) << 20, at)).collect();
+            let mut want = pairs.clone();
+            want.sort_by_key(|it| it.0);
+            (pairs, want)
+        }
+        let pool = Arc::new(Pool::new(&Topology::flat(4), false).unwrap());
+        let (mut pairs, want) = input();
+        radix::on(&*pool).sort_pairs(&mut pairs);
+        assert_eq!(pairs, want);
+        let (tx, rx) = bounded::<bool>(1);
+        pool.submit(
+            None,
+            || {
+                let (mut pairs, want) = input();
+                radix::sort_pairs(&mut pairs);
+                pairs == want
+            },
+            move |it| _ = tx.send(it.unwrap()),
+        );
+        assert!(rx.recv_timeout(LONG).unwrap());
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

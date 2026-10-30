@@ -9,9 +9,10 @@
 //! only sections that came or went, and symbols whose definition changed, are touched.
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use blaze_ids::radix;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -21,9 +22,86 @@ use crate::model::{
 };
 use crate::stage::{Stage, error};
 use crate::state::{Def, Input, PieceId, Resolved, What};
-use crate::symbols::{Obj, SymKey};
+use crate::symbols::{Obj, SymKey, Symbols};
 use crate::unwind;
 use crate::{Change, LinkError, NativeKind, OutputKind};
+
+/// Symbols as one bit each, a bitset per symbol shard: insert and lookup O(1), and iteration
+/// in ascending [`Sym`] order (shard, then place in it), the order of a `BTreeSet<Sym>`, also
+/// between inserts. 1 bit per place of a shard up to its last member.
+#[derive(Clone)]
+struct SymBits {
+    shards: Vec<Vec<u64>>,
+}
+
+impl Default for SymBits {
+    fn default() -> Self {
+        SymBits { shards: vec![Vec::new(); Symbols::SHARDS] }
+    }
+}
+
+impl SymBits {
+    /// Whether `sym` was not in yet.
+    fn insert(&mut self, sym: Sym) -> bool {
+        let (shard, at) = Symbols::split(sym);
+        let words = &mut self.shards[shard];
+        if at / 64 >= words.len() {
+            words.resize(at / 64 + 1, 0);
+        }
+        let bit = 1u64 << (at % 64);
+        let new = words[at / 64] & bit == 0;
+        words[at / 64] |= bit;
+        new
+    }
+
+    fn contains(&self, sym: Sym) -> bool {
+        let (shard, at) = Symbols::split(sym);
+        self.shards[shard].get(at / 64).is_some_and(|word| word >> (at % 64) & 1 != 0)
+    }
+
+    fn extend(&mut self, syms: impl IntoIterator<Item = Sym>) {
+        for sym in syms {
+            self.insert(sym);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = Sym> + '_ {
+        self.shards.iter().enumerate().flat_map(|(shard, words)| {
+            words.iter().enumerate().flat_map(move |(word, &bits)| {
+                let mut bits = bits;
+                std::iter::from_fn(move || {
+                    if bits == 0 {
+                        return None;
+                    }
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    Some(Symbols::join(shard, word * 64 + bit))
+                })
+            })
+        })
+    }
+}
+
+/// The names Rust pieces refer to, and of them those some reference to is strong.
+#[derive(Default)]
+struct Wanted {
+    all: SymBits,
+    strong: SymBits,
+}
+
+impl Wanted {
+    /// `sym` wanted strongly, unless it is wanted already.
+    fn or_strong(&mut self, sym: Sym) {
+        if self.all.insert(sym) {
+            self.strong.insert(sym);
+        }
+    }
+
+    /// Whether every reference to `sym` is weak, if it is wanted.
+    fn weak(&self, sym: Sym) -> Option<bool> {
+        self.all.contains(sym).then(|| !self.strong.contains(sym))
+    }
+}
 
 /// Sections kept whatever refers to them, by name, as lld keeps them.
 fn kept_by_name(name: &str) -> bool {
@@ -206,8 +284,8 @@ impl<'a> Stage<'a> {
     }
 
     /// The names Rust pieces refer to, with whether every reference is weak.
-    fn wanted(&self) -> BTreeMap<Sym, bool> {
-        let mut out = BTreeMap::new();
+    fn wanted(&self) -> Wanted {
+        let mut out = Wanted::default();
         for sym in self.new.seen.iter() {
             let mut weak = true;
             let mut any = false;
@@ -220,7 +298,10 @@ impl<'a> Stage<'a> {
                 weak &= piece.weak.contains(sym);
             }
             if any {
-                out.insert(*sym, weak);
+                out.all.insert(*sym);
+                if !weak {
+                    out.strong.insert(*sym);
+                }
             }
         }
         out
@@ -229,7 +310,7 @@ impl<'a> Stage<'a> {
     /// Loads, resolves, collects and places the natives, and defines every name.
     pub fn resolve(&mut self) -> Result<(), LinkError> {
         let mut wanted = self.wanted();
-        let mut roots: Vec<Sym> = wanted.keys().copied().collect();
+        let mut roots: Vec<Sym> = wanted.all.iter().collect();
         let mut extra: Vec<String> = Vec::new();
         let entry = match &self.output.kind {
             OutputKind::Executable { entry } => Some(entry.clone()),
@@ -246,12 +327,12 @@ impl<'a> Stage<'a> {
         }
         let entry_name = entry.as_ref().map(|it| self.sym(SymKey::Name(it.as_str().into())));
         if let Some(entry) = entry_name {
-            wanted.entry(entry).or_insert(false);
+            wanted.or_strong(entry);
         }
         if let OutputKind::Shared { exports, .. } = &self.output.kind {
             for name in exports.clone() {
                 let sym = self.sym(SymKey::Name(name.as_str().into()));
-                wanted.entry(sym).or_insert(false);
+                wanted.or_strong(sym);
             }
         }
 
@@ -296,10 +377,12 @@ impl<'a> Stage<'a> {
         let mut groups: FxHashMap<String, (usize, usize)> = FxHashMap::default();
         let mut discarded: FxHashSet<(usize, u32)> = FxHashSet::default();
         let mut candidates: FxHashMap<Sym, Candidate> = FxHashMap::default();
+        // BTreeMap: walked in name order where it makes the commons' symbols.
         let mut commons: BTreeMap<Box<str>, (u64, u64)> = BTreeMap::new();
-        let mut undefined_strong: BTreeSet<Sym> = BTreeSet::new();
+        let mut undefined_strong = SymBits::default();
         let mut pulled: FxHashSet<(usize, u32)> = FxHashSet::default();
-        let mut fallbacks: BTreeMap<Sym, (usize, u32)> = BTreeMap::new();
+        // Sorted by symbol once, where the aliases are made.
+        let mut fallbacks: FxHashMap<Sym, (usize, u32)> = FxHashMap::default();
         // Names the link must define whatever refers to them: `/INCLUDE`, `/EXPORT`, what
         // weak externals fall back to, `__imp_X`'s `X`.
         let mut required: FxHashSet<Sym> = FxHashSet::default();
@@ -447,7 +530,7 @@ impl<'a> Stage<'a> {
                 done += 1;
             }
             let mut pull = Vec::new();
-            for sym in wanted.iter().filter(|it| !*it.1).map(|it| *it.0).chain(undefined_strong.iter().copied()) {
+            for sym in wanted.strong.iter().chain(undefined_strong.iter()) {
                 if candidates.contains_key(&sym) || rust_names.contains_key(&sym) {
                     continue;
                 }
@@ -472,6 +555,8 @@ impl<'a> Stage<'a> {
 
         // Weak externals the link left undefined: each is the symbol it falls back to.
         let mut aliases: FxHashMap<Sym, (usize, u32)> = FxHashMap::default();
+        let mut fallbacks: Vec<(Sym, (usize, u32))> = fallbacks.into_iter().collect();
+        radix::sort_copy_by_key(&mut fallbacks, |it| it.0.0);
         for (sym, (load, symbol)) in &fallbacks {
             if !candidates.contains_key(sym) && !rust_names.contains_key(sym) {
                 aliases.insert(*sym, (*load, *symbol));
@@ -684,14 +769,18 @@ impl<'a> Stage<'a> {
         }
         let by_obj: FxHashMap<Obj, usize> = loads.iter().enumerate().map(|(at, it)| (it.obj, at)).collect();
         let mut sorted: Vec<&(Obj, u32)> = kept.iter().filter(|it| !old.kept.contains(*it)).collect();
-        sorted.sort();
+        radix::sort_copy_by_key(&mut sorted, |&&(obj, section)| {
+            (u128::from(obj.native.0) << 64) | (u128::from(obj.member) << 32) | u128::from(section)
+        });
         for (obj, section) in sorted {
             let load = by_obj[obj];
             self.native_section(&loads, load, *section)?;
         }
         let mut sorted: Vec<&(usize, u32, u32)> =
             kept_frames.iter().filter(|(l, s, a)| !old.frames.contains(&(loads[*l].obj, *s, *a))).collect();
-        sorted.sort();
+        radix::sort_copy_by_key(&mut sorted, |&&(load, section, at)| {
+            (u128::from(load as u64) << 64) | (u128::from(section) << 32) | u128::from(at)
+        });
         for (load, section, at) in sorted {
             let records = &frames.iter().find(|it| it.0 == *load && it.1 == *section).expect("split").2;
             let record = records.iter().find(|it| it.range.start as u32 == *at).expect("a record");
@@ -726,7 +815,7 @@ impl<'a> Stage<'a> {
             }
         }
         let mut sorted: Vec<(Sym, Candidate)> = candidates.iter().map(|(s, c)| (*s, *c)).collect();
-        sorted.sort_by_key(|it| it.0);
+        radix::sort_by_key(&mut sorted, |it| it.0.0);
         for (sym, candidate) in sorted {
             let def = match candidate {
                 Candidate::Section { load, symbol, .. } => {
@@ -777,7 +866,7 @@ impl<'a> Stage<'a> {
             self.define(*sym, Def::Alias(*target));
         }
         let mut sorted: Vec<(Sym, (usize, u32))> = aliases.iter().map(|(s, at)| (*s, *at)).collect();
-        sorted.sort_unstable_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut sorted, |it| it.0.0);
         for (sym, (load, symbol)) in sorted {
             defined.insert(sym);
             self.define(sym, Def::Alias(loads[load].syms[symbol as usize]));
@@ -802,7 +891,7 @@ impl<'a> Stage<'a> {
             .collect();
         for id in native {
             let mut syms = defines.remove(&id).unwrap_or_default();
-            syms.sort_unstable();
+            radix::sort_copy_by_key(&mut syms, |it| it.0);
             syms.dedup();
             let piece = self.new.piece(id).expect("a live piece");
             if *piece.defines != *syms {
@@ -811,7 +900,7 @@ impl<'a> Stage<'a> {
         }
 
         // What is left: the linker's, a shared library's, weak, or an error.
-        let mut names: BTreeSet<Sym> = wanted.keys().copied().collect();
+        let mut names = wanted.all.clone();
         let mut native_weak: FxHashMap<Sym, bool> = FxHashMap::default();
         for (load, it) in loads.iter().enumerate() {
             for (at, section) in it.object.sections.iter().enumerate() {
@@ -891,13 +980,13 @@ impl<'a> Stage<'a> {
         let mut imports: Vec<(Sym, Import, usize)> = Vec::new();
         let executable = matches!(self.output.kind, OutputKind::Executable { .. });
         let mut specials = Vec::new();
-        for sym in names {
+        for sym in names.iter() {
             if defined.contains(&sym) {
                 continue;
             }
             let SymKey::Name(name) = self.symbols.key(sym).clone() else { continue };
             let weak = !required.contains(&sym)
-                && wanted.get(&sym).copied().unwrap_or(true)
+                && wanted.weak(sym).unwrap_or(true)
                 && native_weak.get(&sym).copied().unwrap_or(true);
             if let Some(special) = self.writer.special(&name) {
                 specials.push((sym, special));
@@ -1013,7 +1102,7 @@ impl<'a> Stage<'a> {
             }
         }
         let mut new: Vec<(Sym, Import)> = current.into_iter().collect();
-        new.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+        blaze_ids::names::sort_by_name(&mut new, |it| it.1.name.as_bytes());
         order.extend(new.into_iter().map(|(sym, import)| (sym, import, true)));
         for (at, (sym, _, active)) in order.iter().enumerate() {
             if *active {
@@ -1076,7 +1165,7 @@ impl<'a> Stage<'a> {
                 Fixup { at: f.at, apply: f.apply, target, addend: f.addend, minus: f.minus.map(|m| it.syms[m as usize]) }
             })
             .collect();
-        weak.sort_unstable();
+        radix::sort_copy_by_key(&mut weak, |it: &Sym| it.0);
         weak.dedup();
         let sym = self.sym(SymKey::Section(it.obj, section));
         let zero = matches!(s.data, crate::model::Data::Zero(_));
@@ -1130,7 +1219,7 @@ impl<'a> Stage<'a> {
             fixups.retain(|f| f.at != 4);
             fixups.push(Fixup { at: 4, apply: crate::model::Apply::Delta32, target: sym, addend: 4, minus: Some(cie) });
         }
-        fixups.sort_by_key(|f| f.at);
+        radix::sort_copy_by_key(&mut fixups, |f| f.at);
         let mut piece = self.piece(
             sym,
             Class::EhFrame,
@@ -1153,4 +1242,53 @@ impl<'a> Stage<'a> {
 /// Names the core asks for that an image need not define.
 fn extra_is_optional(key: &SymKey) -> bool {
     matches!(key, SymKey::Name(name) if &**name == "_init" || &**name == "_fini")
+}
+
+#[cfg(test)]
+mod sym_bits {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    #[test]
+    fn the_bits_answer_as_a_sorted_set_does_between_inserts() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let (mut bits, mut set) = (SymBits::default(), BTreeSet::new());
+        for round in 0..4_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let shard = (seed % Symbols::SHARDS as u64) as usize;
+            let at = match round % 3 {
+                0 => (seed >> 8) as usize % 200,
+                1 => (seed >> 8) as usize % 5_000,
+                _ => 63 + 64 * ((seed >> 8) as usize % 4),
+            };
+            let sym = Symbols::join(shard, at);
+            assert_eq!(bits.insert(sym), set.insert(sym));
+            let probe = Symbols::join(shard, (seed >> 20) as usize % 6_000);
+            assert_eq!(bits.contains(probe), set.contains(&probe));
+            if round % 97 == 0 {
+                assert_eq!(bits.iter().collect::<Vec<_>>(), set.iter().copied().collect::<Vec<_>>());
+            }
+        }
+        assert_eq!(bits.iter().collect::<Vec<_>>(), set.iter().copied().collect::<Vec<_>>());
+        let mut extended = SymBits::default();
+        extended.extend(set.iter().rev().copied());
+        assert_eq!(extended.iter().collect::<Vec<_>>(), set.iter().copied().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn wanted_is_strong_unless_wanted_already() {
+        let (weak, strong, absent) = (Symbols::join(3, 9), Symbols::join(0, 70), Symbols::join(63, 1));
+        let mut wanted = Wanted::default();
+        wanted.all.insert(weak);
+        wanted.or_strong(weak);
+        wanted.or_strong(strong);
+        assert_eq!(wanted.weak(weak), Some(true));
+        assert_eq!(wanted.weak(strong), Some(false));
+        assert_eq!(wanted.weak(absent), None);
+        assert_eq!(wanted.strong.iter().collect::<Vec<_>>(), vec![strong]);
+        assert_eq!(wanted.all.iter().collect::<Vec<_>>(), vec![strong, weak]);
+    }
 }

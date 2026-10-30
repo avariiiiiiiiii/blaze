@@ -1,7 +1,7 @@
 //! `static_mut_refs`: rustc's `tests/ui/lint/static-mut-refs*.rs` and the UI tests of
 //! `tests/ui/statics/` that give it.
 
-use super::{Test, Ui, ui};
+use super::{Mode, Ui, ui};
 
 #[test]
 fn static_mut_shared_parens() {
@@ -385,7 +385,7 @@ fn static_mut_refs_e2021() {
     let stderr = ui(Ui {
         name: "static-mut-refs.rs",
         edition: "2021",
-        test: Test::Fails,
+        mode: Mode::RunPass,
         core: STATIC_MUT_REFS_FLAGS,
         std: Some(("", FORMAT_STD)),
         source: STATIC_MUT_REFS,
@@ -410,7 +410,6 @@ fn static_mut_refs_e2024() {
     let stderr = ui(Ui {
         name: "static-mut-refs.rs",
         edition: "2024",
-        test: Test::Passes,
         core: STATIC_MUT_REFS_FLAGS,
         std: Some(("", FORMAT_STD)),
         source: STATIC_MUT_REFS,
@@ -506,7 +505,6 @@ error: aborting due to 1 previous error
     let stderr = ui(Ui {
         name: "static-mut-refs-interior-mutability.rs",
         edition: "2024",
-        test: Test::Passes,
         core: MUTEX_FLAGS,
         std: Some(("", MUTEX_STD)),
         source,
@@ -553,7 +551,6 @@ error: aborting due to 1 previous error
     let stderr = ui(Ui {
         name: "static-mut-refs-interior-mutability-no-sugg.rs",
         edition: "2024",
-        test: Test::Passes,
         core: MUTEX_FLAGS,
         std: Some(("", MUTEX_STD)),
         source,

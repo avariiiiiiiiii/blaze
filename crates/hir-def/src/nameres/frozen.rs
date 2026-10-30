@@ -993,9 +993,11 @@ impl Enc<'_> {
         let db = self.db;
         if let Some(block) = it.block(db) {
             // A block is made as its body is lowered: it is named by that body.
-            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
-            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
-            // when the query that made it reruns, which reruns this one too.
+            // SAFETY: `to_static` needs the id not to outlive the query computation it was made
+            // in. `block` finds its owner (`block_owner`, which caches it in this encoder's
+            // `block_owners`), its ast id and its def map; what gets written is the owner's path
+            // and indexes, never the id. The encoder is a local of one encoding and drops the
+            // cache with it, so no copy outlives the computation that read `it`.
             let block = unsafe { block.to_static() };
             let owner = self.block_owner(block)?;
             self.u8(1);
@@ -2922,9 +2924,11 @@ impl Dec<'_> {
             let parent = *self.own.get(parent).ok_or("a module before its parent")?;
             let name = name.clone().ok_or("a module with no name")?;
             let module =
-                // SAFETY: the def-map query running now makes this tracked struct and keeps it only
-                // in its own result; salsa deletes it only when this query reruns, which replaces
-                // that result.
+                // SAFETY: `to_static` needs the id not to outlive the query computation it was
+                // made in. The decode runs inside the def-map query that reads the frozen def map
+                // (`crate_local_def_map`, through `served`), and the ids go only into the `DefMap`
+                // it returns (`self.own`, then its modules), which salsa invalidates with that
+                // query.
                 unsafe { ModuleIdLt::new(db, krate, None, Some(parent), name).to_static() };
             self.own.push(module);
         }

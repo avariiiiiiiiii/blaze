@@ -25,7 +25,7 @@ use std::{
     num::NonZero,
     ptr,
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, PoisonError,
+        Arc, MutexGuard, OnceLock, PoisonError,
         atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     thread::{self, Thread},
@@ -43,16 +43,16 @@ pub const PUMP_DEPTH: usize = 16;
 pub(crate) const SPINS: u32 = 64;
 
 /// The executor's one kind of lock, held only to claim or hand over a slot (a key's flight, a
-/// wait's edge, a spare pool, a panic to raise later), never across a call into work or the
-/// database: no guard lives across a query, so none can deadlock or invert a priority
-/// (docs/v2/plan/design/concurrency.md, "No guard lives across a query call").
+/// wait's edge, a spare pool, a panic to raise later, a cap's bytes), never across a call into
+/// work or the database: no guard lives across a query, so none can deadlock or invert a
+/// priority (docs/v2/plan/design/concurrency.md, "No guard lives across a query call").
 #[allow(clippy::disallowed_types)]
-pub(crate) struct Lock<T>(Mutex<T>);
+pub(crate) struct Lock<T>(std::sync::Mutex<T>);
 
 #[allow(clippy::disallowed_types)]
 impl<T> Lock<T> {
     pub(crate) const fn new(value: T) -> Lock<T> {
-        Lock(Mutex::new(value))
+        Lock(std::sync::Mutex::new(value))
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, T> {

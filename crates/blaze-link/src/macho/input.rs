@@ -16,6 +16,7 @@ use object::macho::{self, RelocationInfo};
 use object::read::macho::{MachHeader as _, Nlist as _, Section as _, Segment as _};
 
 use blaze_codegen::Arch;
+use blaze_ids::radix;
 
 use crate::model::{
     Apply, Binding, Data, Name, Names, NativeFixup, Object, Section, SectionKind, Symbol, SymbolDef,
@@ -175,7 +176,7 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
             points.push((s as u32, offset));
         }
     }
-    points.sort_unstable();
+    radix::sort_copy_by_key(&mut points, |&(s, offset)| radix::pack_64(u64::from(s), offset));
     points.dedup();
     let mut bounds: Vec<u64> = Vec::with_capacity(points.len());
     let mut starts: Vec<u64> = Vec::with_capacity(inputs.len() + points.len());
@@ -258,7 +259,7 @@ pub(super) fn read(name: &str, bytes: &[u8], arch: Arch) -> Result<Object, Strin
     }
     // Stable: fixups of one place keep the order they were read in. Each atom's are then one
     // run of the object's column.
-    fixups.sort_by_key(|it| (it.0, it.1.at));
+    radix::sort_copy_by_key(&mut fixups, |it| radix::pack_64(u64::from(it.0), it.1.at));
     let mut at = 0;
     for group in fixups.chunk_by(|a, b| a.0 == b.0) {
         let end = at + group.len() as u32;
@@ -873,7 +874,7 @@ impl Reader<'_> {
         let first = self.inputs[s].first;
         let mut covered: Vec<u64> =
             self.fixups.iter().filter(|it| it.0 == first).map(|it| it.1.at).collect();
-        covered.sort_unstable();
+        radix::sort(&mut covered);
         // In entry order, so by offset: an FDE finds its CIE by binary search.
         let mut cies: Vec<(usize, Cie)> = Vec::new();
         let mut fields: Vec<(usize, u8)> = Vec::new();
@@ -964,7 +965,7 @@ impl Reader<'_> {
         let inputs = &self.inputs;
         let mut out: Vec<u32> =
             (0..inputs.len() as u32).filter(|&it| inputs[it as usize].size != 0).collect();
-        out.sort_unstable_by_key(|&it| (inputs[it as usize].addr, it));
+        radix::sort_by_key(&mut out, |&it| radix::pack_64(inputs[it as usize].addr, u64::from(it)));
         for pair in out.windows(2) {
             let (a, b) = (&inputs[pair[0] as usize], &inputs[pair[1] as usize]);
             if a.addr.saturating_add(a.size) > b.addr {

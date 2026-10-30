@@ -45,7 +45,7 @@ impl FnItems {
         let known = self.known;
         *self.seen.entry(def).or_insert_with(|| {
             let name = util::fn_item(db, def)?;
-            known.iter().copied().find(|it| *it == name)
+            known.iter().copied().find(|it| *it == name.as_str())
         })
     }
 }

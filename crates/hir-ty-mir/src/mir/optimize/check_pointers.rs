@@ -17,13 +17,13 @@
 //!
 //! [`MirOptions::ub_checks`]: crate::mir::MirOptions::ub_checks
 
-use hir_def::signatures::FunctionSignature;
 use intern::Symbol;
 use rustc_type_ir::inherent::{IntoKind, Ty as _};
 use smallvec::SmallVec;
 
 use crate::{
     db::GeneralConstId,
+    intrinsic::Intrinsic,
     mir::{
         AssertKind, BasicBlock, BasicBlockId, BinOp, BorrowKind, CastKind, FieldIndex, Local,
         LocalId, MirBody, MirLowerError, MirSpan, Operand, OperandKind, Place, Projection,
@@ -32,9 +32,6 @@ use crate::{
     },
     next_solver::{Const, GenericArgs, Ty, TyKind, UnevaluatedConst},
 };
-
-use super::inst_simplify::callee;
-
 type Result<'db, T> = std::result::Result<T, MirLowerError<'db>>;
 
 /// Which of rustc's two pointer checks.
@@ -88,28 +85,41 @@ pub(super) enum Lowered {
 }
 
 /// What `LowerIntrinsics` makes of the call `kind`, when it calls an intrinsic it lowers.
-pub(super) fn lowered_intrinsic(db: &dyn crate::db::HirDatabase, kind: &TerminatorKind) -> Option<Lowered> {
-    let TerminatorKind::Call { func, .. } = kind else { return None };
-    let func = callee(func)?;
-    if !FunctionSignature::is_intrinsic(db, func) {
-        return None;
-    }
-    let signature = FunctionSignature::of(db, func);
-    Some(match signature.name.as_str() {
-        "transmute" | "transmute_unchecked" => Lowered::Transmute,
-        "wrapping_add" | "wrapping_sub" | "wrapping_mul" | "three_way_compare"
-        | "unchecked_add" | "unchecked_sub" | "unchecked_mul" | "unchecked_div"
-        | "unchecked_rem" | "unchecked_shl" | "unchecked_shr" | "add_with_overflow"
-        | "sub_with_overflow" | "mul_with_overflow" | "offset" | "aggregate_raw_ptr"
-        | "ptr_metadata" => Lowered::Assign,
-        "read_via_copy" => Lowered::ReadViaCopy,
-        "write_via_move" => Lowered::WriteViaMove,
-        "discriminant_value" | "forget" | "ub_checks" | "overflow_checks" | "contract_checks" => {
-            Lowered::Destination
-        }
-        "copy_nonoverlapping" | "assume" => Lowered::Operands,
-        "slice_get_unchecked" => Lowered::SliceGetUnchecked,
-        "unreachable" => Lowered::Nothing,
+pub(super) fn lowered_intrinsic(kind: &TerminatorKind) -> Option<Lowered> {
+    let TerminatorKind::Call { intrinsic: Some(intrinsic), .. } = kind else { return None };
+    lowered(*intrinsic)
+}
+
+/// What `LowerIntrinsics` makes of a call of `intrinsic`, when it lowers it.
+pub(super) fn lowered(intrinsic: Intrinsic) -> Option<Lowered> {
+    Some(match intrinsic {
+        Intrinsic::Transmute | Intrinsic::TransmuteUnchecked => Lowered::Transmute,
+        Intrinsic::WrappingAdd
+        | Intrinsic::WrappingSub
+        | Intrinsic::WrappingMul
+        | Intrinsic::ThreeWayCompare
+        | Intrinsic::UncheckedAdd
+        | Intrinsic::UncheckedSub
+        | Intrinsic::UncheckedMul
+        | Intrinsic::UncheckedDiv
+        | Intrinsic::UncheckedRem
+        | Intrinsic::UncheckedShl
+        | Intrinsic::UncheckedShr
+        | Intrinsic::AddWithOverflow
+        | Intrinsic::SubWithOverflow
+        | Intrinsic::MulWithOverflow
+        | Intrinsic::Offset
+        | Intrinsic::AggregateRawPtr
+        | Intrinsic::PtrMetadata => Lowered::Assign,
+        Intrinsic::ReadViaCopy => Lowered::ReadViaCopy,
+        Intrinsic::WriteViaMove => Lowered::WriteViaMove,
+        Intrinsic::DiscriminantValue
+        | Intrinsic::Forget
+        | Intrinsic::UbChecks
+        | Intrinsic::OverflowChecks => Lowered::Destination,
+        Intrinsic::CopyNonoverlapping | Intrinsic::Assume => Lowered::Operands,
+        Intrinsic::SliceGetUnchecked => Lowered::SliceGetUnchecked,
+        Intrinsic::Unreachable => Lowered::Nothing,
         _ => return None,
     })
 }
@@ -124,13 +134,9 @@ pub(super) enum Site {
 
 /// The sites of `block` in the order rustc visits them: backwards, so that a split leaves the
 /// sites still to come where they were.
-pub(super) fn sites(
-    ctx: &Ctx<'_>,
-    body: &MirBody<'_>,
-    block: BasicBlockId,
-) -> SmallVec<[Site; 8]> {
+pub(super) fn sites(body: &MirBody<'_>, block: BasicBlockId) -> SmallVec<[Site; 8]> {
     let data = &body.basic_blocks[block];
-    let call = data.terminator.as_ref().and_then(|it| lowered_intrinsic(ctx.db, &it.kind));
+    let call = data.terminator.as_ref().and_then(|it| lowered_intrinsic(&it.kind));
     let statements = (0..data.statements.len()).rev().map(Site::Statement);
     call.map(Site::Call).into_iter().chain(statements).collect()
 }
@@ -330,7 +336,7 @@ pub(super) fn check_pointers<'db>(
     let consts = Consts::new(ctx)?;
     let blocks: Vec<BasicBlockId> = body.basic_blocks.iter().map(|(id, _)| id).collect();
     for &block in blocks.iter().rev() {
-        for site in sites(ctx, body, block) {
+        for site in sites(body, block) {
             let found = {
                 let mut finder = Finder { ctx, body, check, found: SmallVec::new() };
                 match site {

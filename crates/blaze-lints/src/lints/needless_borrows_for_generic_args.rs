@@ -16,7 +16,7 @@ use syntax::{
 
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "needless_borrows_for_generic_args";
+const LINT: super::Implemented = super::Implemented::NeedlessBorrowsForGenericArgs;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if !cx.on(LINT) || cx.expansion.is_some() {

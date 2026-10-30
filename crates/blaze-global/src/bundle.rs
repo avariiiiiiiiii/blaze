@@ -90,7 +90,7 @@ fn unhex(text: &str) -> Option<[u8; 32]> {
     let digit = |it: u8| (it as char).to_digit(16).map(|it| it as u8);
     let mut out = [0; 32];
     for (at, pair) in bytes.chunks_exact(2).enumerate() {
-        out[at] = digit(pair[0])? << 4 | digit(pair[1])?;
+        out[at] = (digit(pair[0])? << 4) | digit(pair[1])?;
     }
     Some(out)
 }

@@ -526,7 +526,9 @@ fn unit(pkg: &str, kind: &[&str], crate_types: &[&str], name: &str, platform: Op
             doctest: false,
             test: true,
         },
-        profile: dev(if kind == ["custom-build"] { 0 } else { 2 }),
+        // A build script is compiled with `build-override`'s `debug = 0`, and run with the
+        // profile of the library it is for.
+        profile: dev(if kind == ["custom-build"] && mode == Mode::Build { 0 } else { 2 }),
         platform: platform.map(str::to_owned),
         mode,
         checked_as_test: false,
@@ -598,7 +600,7 @@ fn plan_app(target: Option<&str>) -> (PathBuf, Vec<UnitPlan>, String) {
     ];
     let packages: FxHashMap<String, (PackageId, Package<'_>)> = ids
         .iter()
-        .map(|(key, id, manifest, _, is_member)| ((*key).to_owned(), (*id, Package { manifest, is_member: *is_member })))
+        .map(|(key, id, manifest, _, is_member)| ((*key).to_owned(), (*id, Package { manifest: *manifest, is_member: *is_member })))
         .collect();
     let manifests: FxHashMap<PackageId, (&Path, &Manifest)> =
         ids.iter().map(|(_, id, manifest, path, _)| (*id, (*path, *manifest))).collect();
@@ -689,7 +691,7 @@ fn plans_of_a_workspace() {
         ("CARGO_FEATURE_FOO_BAR", "1"),
         ("CARGO_CFG_TARGET_OS", "linux"),
         ("CARGO_MANIFEST_DIR", ws.display().to_string().as_str()),
-        ("DEBUG", "false"),
+        ("DEBUG", "true"),
         ("HOST", HOST),
         ("TARGET", HOST),
         ("NUM_JOBS", "4"),

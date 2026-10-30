@@ -14,7 +14,10 @@
 //! `compiler/rustc_ast_lowering/src/expr.rs` (`lower_expr_assign`: a destructuring assignment
 //! is a `let` of `LocalSource::AssignDesugar`) (MIT or Apache-2.0).
 
+use std::sync::OnceLock;
+
 use hir::InFile;
+use intern::Symbol;
 use hir_def::{
     AdtId, AttrDefId, EnumId, HasModule as _, Lookup as _,
     attrs::AttrFlags,
@@ -59,8 +62,8 @@ pub(super) fn passes() -> Vec<Box<dyn LatePass>> {
 }
 
 /// Statement `index` of the block `block`.
-fn statement<'a>(b: &'a BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<&'a Statement> {
-    match &b.store()[block] {
+fn statement<'db>(b: &BodyCx<'_, 'db>, block: ExprId, index: usize) -> Option<&'db Statement> {
+    match b.store().expr(block) {
         Expr::Block { statements, .. } => statements.get(index),
         _ => None,
     }
@@ -96,12 +99,32 @@ fn is_must_use(db: &dyn HirDatabase, def: AttrDefId) -> bool {
     AttrFlags::must_use_message(db, def).is_some()
 }
 
+/// The diagnostic items these passes look for, interned once, so that a check is a pointer
+/// compare.
+struct Items {
+    result: Symbol,
+    control_flow: Symbol,
+    box_new: Symbol,
+    /// rustc's guards of a lock, which `let _ = ` drops at once.
+    sync_guards: [Symbol; 3],
+}
+
+fn items() -> &'static Items {
+    static ITEMS: OnceLock<Items> = OnceLock::new();
+    ITEMS.get_or_init(|| Items {
+        result: Symbol::intern("Result"),
+        control_flow: Symbol::intern("ControlFlow"),
+        box_new: Symbol::intern("box_new"),
+        sync_guards: ["MutexGuard", "RwLockReadGuard", "RwLockWriteGuard"].map(Symbol::intern),
+    })
+}
+
 /// Whether `id` is core's enum `name` (`Result`, `ControlFlow`): its diagnostic item, or the
 /// enum of its lang-item variant `variant` (`Ok`, `Continue`).
-fn is_enum(b: &BodyCx<'_, '_>, id: EnumId, name: &str, variant: Option<hir_def::EnumVariantId>) -> bool {
+fn is_enum(b: &BodyCx<'_, '_>, id: EnumId, name: Symbol, variant: Option<hir_def::EnumVariantId>) -> bool {
     let db = b.db();
     variant.is_some_and(|it| it.lookup(db).parent == id)
-        || diagnostic_item(db, AttrDefId::AdtId(AdtId::EnumId(id))).is_some_and(|it| it == name)
+        || diagnostic_item(db, AttrDefId::AdtId(AdtId::EnumId(id))) == Some(name)
 }
 
 fn lang_items<'db>(solver: &Solver<'db>) -> &'db LangItems {
@@ -118,7 +141,7 @@ impl LatePass for PathStatements {
 
     fn check_stmt(&mut self, b: &BodyCx<'_, '_>, block: ExprId, index: usize, out: &mut Vec<Found>) {
         let Some(expr) = semi_expr(b, block, index) else { return };
-        let Expr::Path(_) = &b.store()[expr] else { return };
+        let Expr::Path(_) = b.store().expr(expr) else { return };
         let (Some(stmt), Some(at)) = (expr_stmt(b, expr), b.expr_node(expr)) else { return };
         let span = stmt_span(b, &stmt);
         let solver = Solver::of(b);
@@ -169,11 +192,11 @@ impl Local {
     /// The `let` a destructuring assignment `expr` is lowered to (`(a, _) = ..`, `_ = ..`):
     /// one whose target is not a place expression (rustc's `is_ordinary`).
     fn of_assignment(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Local> {
-        let Expr::Assignment { target, value } = &b.store()[expr] else { return None };
-        if matches!(b.store()[*target], Pat::Expr(_) | Pat::Missing) {
+        let Expr::Assignment { target, value } = b.store().expr(expr) else { return None };
+        if matches!(b.store().pat(target), Pat::Expr(_) | Pat::Missing) {
             return None;
         }
-        Some(Local { pat: *target, init: Some(*value), typed: false, assign: Some(expr) })
+        Some(Local { pat: target, init: Some(value), typed: false, assign: Some(expr) })
     }
 
     /// Where it is written; a `let` hir-def made (the moves of an `async fn`'s arguments,
@@ -187,9 +210,6 @@ impl Local {
         Some(Written { span: stmt_span(b, &stmt), at: stmt.map(|it| SyntaxNodePtr::new(&it)) })
     }
 }
-
-/// rustc's guards of a lock, which `let _ = ` drops at once.
-const SYNC_GUARDS: [&str; 3] = ["MutexGuard", "RwLockReadGuard", "RwLockWriteGuard"];
 
 /// `LetUnderscore`: a `_` in a `let` that drops a value with a destructor at once.
 struct LetUnderscore;
@@ -219,7 +239,7 @@ fn let_underscore(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
     let mut wild = Vec::new();
     let mut index = 0;
     store.walk_pats(local.pat, &mut |it| {
-        if matches!(store[it], Pat::Wild) {
+        if matches!(store.pat(it), Pat::Wild) {
             wild.push((index, it));
         }
         index += 1;
@@ -237,11 +257,11 @@ fn let_underscore(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
         let Some(local_at) = written.get_or_insert_with(|| local.written(b)) else { return };
         let lang = lang_items(&solver);
         let lock = match ty.as_adt() {
-            Some((AdtId::EnumId(id), args)) if is_enum(b, id, "Result", lang.ResultOk) => args.type_at(0),
+            Some((AdtId::EnumId(id), args)) if is_enum(b, id, items().result, lang.ResultOk) => args.type_at(0),
             _ => ty,
         };
         let is_sync_lock = lock.as_adt().is_some_and(|(adt, _)| {
-            diagnostic_item(b.db(), AttrDefId::AdtId(adt)).is_some_and(|it| SYNC_GUARDS.contains(&it.as_str()))
+            diagnostic_item(b.db(), AttrDefId::AdtId(adt)).is_some_and(|it| items().sync_guards.contains(&it))
         });
         let Some(pat_span) = b.pat_span(pat) else { continue };
         let init = if index == 0 { local.init.and_then(|it| b.expr_span(it)) } else { None };
@@ -315,20 +335,20 @@ impl LatePass for UnusedResults {
         let store = b.store();
         let db = b.db();
         let mut expr = stmt_expr;
-        while let Expr::Block { tail: Some(tail), .. } = &store[expr] {
-            expr = *tail;
+        while let Expr::Block { tail: Some(tail), .. } = store.expr(expr) {
+            expr = tail;
         }
-        match &store[expr] {
+        match store.expr(expr) {
             Expr::Return { .. } => return,
-            Expr::Await { expr: future } if awaits_must_use_async_fn(b, *future) => return,
+            Expr::Await { expr: future } if awaits_must_use_async_fn(b, future) => return,
             _ => {}
         }
         let ty = b.infer.expr_ty(expr);
         if ty.is_unit() || ty_must_use(b, &Solver::of(b), ty, Some(expr)) != MustUse::No {
             return;
         }
-        let callee = match &store[expr] {
-            Expr::Call { callee, .. } => match path_value(b, *callee) {
+        let callee = match store.expr(expr) {
+            Expr::Call { callee, .. } => match path_value(b, callee) {
                 Some(ValueNs::FunctionId(it)) => Some(it),
                 _ => None,
             },
@@ -365,12 +385,12 @@ fn awaits_must_use_async_fn(b: &BodyCx<'_, '_>, future: ExprId) -> bool {
 /// comparisons, arithmetic, logic, bit operations, borrows, unary operators and `offset_of!`.
 fn is_must_use_op(b: &BodyCx<'_, '_>, expr: ExprId) -> bool {
     let store = b.store();
-    match &store[expr] {
+    match store.expr(expr) {
         Expr::BinaryOp { op: Some(op), .. } => !matches!(op, BinaryOp::Assignment { .. }),
         Expr::Ref { .. } | Expr::UnaryOp { .. } | Expr::OffsetOf(_) => true,
         Expr::Const(body) => matches!(
-            &store[*body],
-            Expr::Block { tail: Some(tail), .. } if matches!(store[*tail], Expr::OffsetOf(_))
+            store.expr(body),
+            Expr::Block { tail: Some(tail), .. } if matches!(store.expr(tail), Expr::OffsetOf(_))
         ),
         _ => false,
     }
@@ -401,10 +421,10 @@ fn ty_must_use<'db>(b: &BodyCx<'_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, expr
                 return ty_must_use(b, solver, args.type_at(0), expr);
             }
             if let AdtId::EnumId(id) = adt {
-                if is_enum(b, id, "Result", lang.ResultOk) && uninhabited(args.type_at(1)) {
+                if is_enum(b, id, items().result, lang.ResultOk) && uninhabited(args.type_at(1)) {
                     return ty_must_use(b, solver, args.type_at(0), expr);
                 }
-                if is_enum(b, id, "ControlFlow", lang.ControlFlowContinue) && uninhabited(args.type_at(0)) {
+                if is_enum(b, id, items().control_flow, lang.ControlFlowContinue) && uninhabited(args.type_at(0)) {
                     return ty_must_use(b, solver, args.type_at(1), expr);
                 }
             }
@@ -425,8 +445,8 @@ fn ty_must_use<'db>(b: &BodyCx<'_, 'db>, solver: &Solver<'db>, ty: Ty<'db>, expr
             yes(predicates.principal_def_id().is_some_and(|it| is_must_use(db, AttrDefId::TraitId(it.0))))
         }
         TyKind::Tuple(tys) => {
-            let elements: Option<&[ExprId]> = match expr.map(|it| &b.store()[it]) {
-                Some(Expr::Tuple { exprs }) if exprs.len() == tys.len() => Some(&exprs[..]),
+            let elements: Option<&[ExprId]> = match expr.map(|it| b.store().expr(it)) {
+                Some(Expr::Tuple { exprs }) if exprs.len() == tys.len() => Some(exprs),
                 _ => None,
             };
             let mut all_trivial = true;
@@ -485,10 +505,10 @@ fn unit_binding(b: &BodyCx<'_, '_>, local: &Local, out: &mut Vec<Found>) {
     if local.typed || !b.infer.expr_ty(init).is_unit() || !b.infer.pat_ty(local.pat).is_unit() {
         return;
     }
-    if matches!(&store[init], Expr::Tuple { exprs } if exprs.is_empty()) {
+    if matches!(store.expr(init), Expr::Tuple { exprs } if exprs.is_empty()) {
         return;
     }
-    if matches!(&store[local.pat], Pat::Tuple { args, .. } if args.is_empty()) {
+    if matches!(store.pat(local.pat), Pat::Tuple { args, .. } if args.is_empty()) {
         return;
     }
     let Some(written) = local.written(b) else { return };
@@ -511,13 +531,13 @@ impl LatePass for NonShorthandFieldPatterns {
 
     fn check_pat(&mut self, b: &BodyCx<'_, '_>, pat: PatId, out: &mut Vec<Found>) {
         let store = b.store();
-        let Pat::Record { args, .. } = &store[pat] else { return };
+        let Pat::Record { args, .. } = store.pat(pat) else { return };
         if b.tainted {
             return;
         }
         let Some(at) = b.pat_node(pat) else { return };
         for field in args.iter() {
-            let Pat::Bind { id, subpat: None } = store[field.pat] else { continue };
+            let Pat::Bind { id, subpat: None } = store.pat(field.pat) else { continue };
             let binding = &store[id];
             if binding.name != field.name {
                 continue;
@@ -565,8 +585,8 @@ impl LatePass for UnusedAllocation {
     }
 
     fn check_expr(&mut self, b: &BodyCx<'_, '_>, expr: ExprId, out: &mut Vec<Found>) {
-        let Expr::Call { callee, args } = &b.store()[expr] else { return };
-        if args.len() != 1 || path_item(b, *callee).as_deref() != Some("box_new") {
+        let Expr::Call { callee, args } = b.store().expr(expr) else { return };
+        if args.len() != 1 || path_item(b, callee) != Some(items().box_new) {
             return;
         }
         let Some(adjustments) = b.infer.expr_adjustment(expr) else { return };

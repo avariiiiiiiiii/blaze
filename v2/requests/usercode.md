@@ -468,6 +468,8 @@ What: one target each, against these public APIs. Each target checks that the pa
 
 Why: unsafe.md, "Done when": every parser of untrusted bytes has a fuzz target.
 
+> forwarded to safety: `fuzz/` is lane safety's.
+
 ## 8. link (`crates/blaze-live/`, the live runtime): what a test executed, per test process
 
 What: two weak C symbols the live runtime defines and the fork server
@@ -486,6 +488,8 @@ for every later process, so stub misses undercount what a test ran; only per-pro
 zeroed at fork, are exact. Code that ran before the fork reaches every test. With these hooks,
 usercode adds the executed set to the fork server's `Ended` frame and feeds `Reached` from it.
 Until then, `Reached` is whatever the daemon gives today, which is sound when it is a superset.
+
+> forwarded to link: `crates/blaze-live/` is lane link's.
 
 ## From safety-fuzz-macrowasm (2026-10-29): bugs in `blaze-macro-wasm` found by reading, and three public functions to fuzz
 
@@ -564,3 +568,5 @@ wrapper of what is private now). The targets go through `Wasm::at`, `Session::ex
   then the linker of `Wasm::compile` (`wasi::add`, `add_host`, `wasi::rest`) and
   `instantiate_pre`. Unlike `Wasm::at`, it neither caches in `COMPILED`, which keeps every
   module a fuzz run loads, nor writes machine code beside a file.
+
+> forwarded to usercode: `crates/blaze-macro-wasm/` is lane usercode's.

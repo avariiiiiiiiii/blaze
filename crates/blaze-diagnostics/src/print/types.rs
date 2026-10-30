@@ -309,9 +309,9 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
     fn print_fn_def(&mut self, def: CallableIdWrapper, args: GenericArgs<'t>) {
         let sig = self.db.callable_item_signature(def.0).instantiate(self.interner, args).skip_normalization();
         let (kind, path) = match def.0 {
-            hir_ty::CallableDefId::FunctionId(it) => (BinderKind::Signature, Def::Function(it)),
-            hir_ty::CallableDefId::StructId(it) => (BinderKind::ForAll, Def::Adt(AdtId::StructId(it))),
-            hir_ty::CallableDefId::EnumVariantId(it) => (BinderKind::ForAll, Def::Variant(it)),
+            hir_def::CallableDefId::FunctionId(it) => (BinderKind::Signature, Def::Function(it)),
+            hir_def::CallableDefId::StructId(it) => (BinderKind::ForAll, Def::Adt(AdtId::StructId(it))),
+            hir_def::CallableDefId::EnumVariantId(it) => (BinderKind::ForAll, Def::Variant(it)),
         };
         self.wrap_binder(&sig, kind, |p, sig| p.print_fn_sig(*sig));
         self.write_str(" {");
@@ -896,9 +896,9 @@ pub(super) fn sort_string(cx: &Cx<'_, '_>, ty: Ty<'_>, mode: Mode) -> String {
 
 fn fn_def_kind(def: CallableIdWrapper) -> &'static str {
     match def.0 {
-        hir_ty::CallableDefId::StructId(_) => "struct constructor",
-        hir_ty::CallableDefId::EnumVariantId(_) => "enum constructor",
-        hir_ty::CallableDefId::FunctionId(_) => "fn item",
+        hir_def::CallableDefId::StructId(_) => "struct constructor",
+        hir_def::CallableDefId::EnumVariantId(_) => "enum constructor",
+        hir_def::CallableDefId::FunctionId(_) => "fn item",
     }
 }
 

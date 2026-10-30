@@ -32,8 +32,8 @@ def build(**fields: object) -> str:
 
 
 def pin(**fields: object) -> dict[str, object]:
-    given: dict[str, object] = {"name": "p.profdata", "sha256": SHA, "commit": COMMIT, "count": 7, "crate": None}
-    given.update(fields)
+    given: dict[str, object] = {"name": "p.profdata", "sha256": SHA, "commit": COMMIT, "count": 7}
+    given.update(crate=None, **fields)
     return given
 
 
@@ -138,8 +138,9 @@ class TrainingFile(unittest.TestCase):
             pgo.parse_training(json.dumps({"projects": [self.project(turns=[])]}))
         with self.assertRaises(typed_input.InputError):
             pgo.parse_training(json.dumps({"projects": [self.project(turns=[{"args": []}])]}))
+        twice = self.project(turns=[{"args": ["b"], "twice": True}])
         with self.assertRaises(SystemExit):
-            pgo.parse_training(json.dumps({"projects": [self.project(turns=[{"args": ["b"], "twice": True}])]}))
+            pgo.parse_training(json.dumps({"projects": [twice]}))
 
 
 class Pins(unittest.TestCase):
@@ -215,8 +216,9 @@ class Outputs(unittest.TestCase):
             root = Path(d)
             (root / "p.profdata").write_bytes(b"p")
             (root / "b.tar.xz").write_bytes(b"b")
-            good = pgo.Pin("p.profdata", hashlib.sha256(b"p").hexdigest(), COMMIT, 9, None, "blaze", "ef" * 20,
-                           None, pgo.Asset("b.tar.xz", hashlib.sha256(b"b").hexdigest()))
+            archive = pgo.Asset("b.tar.xz", hashlib.sha256(b"b").hexdigest())
+            digest = hashlib.sha256(b"p").hexdigest()
+            good = pgo.Pin("p.profdata", digest, COMMIT, 9, None, "blaze", "ef" * 20, None, archive)
             out = root / f"{MAC}.json"
             out.write_text(json.dumps({"target": MAC, "toolchain": "t", "pin": pgo.pin_json(good)}))
             self.assertEqual(pgo.read_output(out), (MAC, "t", good))
@@ -251,13 +253,14 @@ class Outputs(unittest.TestCase):
 
 class Steps(unittest.TestCase):
     def test_profile_count(self) -> None:
-        show = "Instrumentation level: IR\nTotal functions: 12\nTotal count: 34567\nMaximum function count: 9\n"
+        show = "Instrumentation level: IR\nTotal functions: 12\nTotal count: 34567\nMaximum count: 9\n"
         self.assertEqual(pgo.profile_count(show), 34567)
         with self.assertRaises(pgo.Failed):
             pgo.profile_count("Total functions: 12\n")
 
     def test_encoded_rustflags(self) -> None:
-        self.assertEqual(pgo.encoded_rustflags(["-Cprofile-use=/a b/c", "-Cx"]), "-Cprofile-use=/a b/c\x1f-Cx")
+        got = pgo.encoded_rustflags(["-Cprofile-use=/a b/c", "-Cx"])
+        self.assertEqual(got, "-Cprofile-use=/a b/c\x1f-Cx")
         with self.assertRaises(pgo.Failed):
             pgo.encoded_rustflags(["a\x1fb"])
 
@@ -276,7 +279,8 @@ class Steps(unittest.TestCase):
 
     def test_binaries(self) -> None:
         manifest = '[package]\nname = "e"\n[[bin]]\nname = "blaze-engine"\npath = "src/main.rs"\n'
-        self.assertEqual(pgo.binaries(manifest, ["blaze", "blaze-rustc"]), ["blaze", "blaze-engine", "blaze-rustc"])
+        got = pgo.binaries(manifest, ["blaze", "blaze-rustc"])
+        self.assertEqual(got, ["blaze", "blaze-engine", "blaze-rustc"])
         off = '[package]\nname = "e"\nautobins = false\n[[bin]]\nname = "blaze-engine"\n'
         self.assertEqual(pgo.binaries(off, ["blaze"]), ["blaze-engine"])
         engine = (HERE.parents[1] / "crates" / "blaze-engine" / "Cargo.toml").read_text()
@@ -290,7 +294,8 @@ class Steps(unittest.TestCase):
         self.assertEqual(pgo.index_path("a"), "1/a")
         self.assertEqual(pgo.index_path("syn"), "3/s/syn")
         self.assertEqual(pgo.index_path("Serde"), "se/rd/serde")
-        index = json.dumps({"vers": "1.0.0", "cksum": SHA}) + "\n" + json.dumps({"vers": "1.0.1", "cksum": "x"})
+        lines = [{"vers": "1.0.0", "cksum": SHA}, {"vers": "1.0.1", "cksum": "x"}]
+        index = "\n".join(json.dumps(line) for line in lines)
         self.assertEqual(pgo.listed_cksum(index, "c", "1.0.0"), SHA)
         with self.assertRaises(pgo.Failed):
             pgo.listed_cksum(index, "c", "1.0.1")

@@ -74,6 +74,10 @@ with per-task bump arenas and inline small vectors (principles.md "Arenas, not t
 
 > forwarded to codegen: `crates/hir-ty-codegen/Cargo.toml` is lane codegen's own; both are root workspace dependencies already (`bumpalo`, `smallvec`), so nothing is needed from the root.
 
+> done by codegen-adapter: `bumpalo.workspace = true` (line 19) and `smallvec.workspace = true`
+> (line 29) are in `crates/hir-ty-codegen/Cargo.toml` `[dependencies]`, with `hashbrown`
+> (line 21); the manifest lint is clean for the crate.
+
 ## From speed-backend-debug (per-function costs on v2's Cranelift path)
 
 1. **`v2/backend.rs` `compiled`: reuse one Cranelift `Context` per thread.** Today every unit
@@ -366,7 +370,33 @@ each a lane's worth), and `Built::reached`/`NativeLib` in `blaze-codegen` come f
 let side = super::side::of(&function.variables, &function.scopes, code).map_err(|e| failed(unit, e))?;
 ```
 (`side::of` gives the code's line rows and length to `side::encode`; the old two-argument
-`encode` is gone.) The header of `release.rs` cites `docs/v2-codegen.md`, now
+`encode` is gone.) Also, from the fast-code pass: `convert::function` takes the code by
+value and moves its bytes into the `CompiledFunction` (no `bytes.clone()`). In `release.rs`,
+`emitted` (`:255`) takes `code: crate::fragment::Code` and passes it to `convert::function`
+after `side::of(.., &code)`; its callers at `:204` and `:245` hand over the code they own.
+`places::resolve` gives a `&places::Placed` (a `convert::Resolver`, static dispatch), so the
+closure there is unchanged.
+
+> forwarded to codegen: between its children.
+
+## Fast-code pass (2026-10-29): requests
+
+1. **codegen (parent), `blaze-codegen`**: outside symbols as interned ids, not `String`s, in
+   `FrontRef::Extern`/`Weak`, `Target::Extern`/`Weak` and `Described::symbol`. Today each
+   describe allocates each symbol of its walk, and each relocation at one clones its `String`.
+   `intern::Symbol` is a `Copy` pointer with an order key (`crates/intern/src/symbol.rs`), so
+   compare, hash and sort stay what they are. And `Described::refs` borrowed from the front
+   end's memo (a `Frontend<'f>` giving `&'f [FrontRef]`), so a describe copies no list.
+2. **codegen (parent)**: the IR builder runs twice an instance, for the walk in `describe`
+   and again in `prepare`. One build kept from `describe` to `prepare` (a `Described` that
+   carries the prepared IR, or a `Frontend::describe` that is `prepare`'s first half) halves
+   the front of the dev path.
+3. **devspeed, `debuginfo.rs`**: `SlotPlaces::of` is a linear `find`, called once a local
+   when the side table is written. Keep `slots` sorted by slot and `binary_search_by_key`,
+   or index them by slot.
+4. Still open: `Homes::sees` as a salsa query (devspeed, `home.rs`, above).
+
+Notes: `docs/v2/plan/lanes/codegen/adapter.md` names the benchmarks. The header of `release.rs` cites `docs/v2-codegen.md`, now
 `docs/v2/plan/lanes/codegen.md`.
 
 > forwarded to codegen: its lane decides which child owns these.

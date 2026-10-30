@@ -8,7 +8,7 @@
 //! and `Box<dyn Send>`, the second's notes point into std (`$SRC_DIR/core/src/slice/mod.rs`),
 //! which a std written in the test can't give.
 
-use super::{Test, Ui, ui};
+use super::{Ui, ui};
 
 const FLAGS: &str = "sized, copy, clone, derive, option, result, fn, from, add, default, deref, \
                      manually_drop, phantom_data, index, slice, range, unsize, coerce_unsized, \
@@ -440,8 +440,8 @@ pub mod ffi {
 }
 "##;
 
-fn check(name: &str, test: Test, source: &str, stderr: &str) {
-    let actual = ui(Ui { name, test, core: FLAGS, std: Some((PRELUDE, STD)), source, ..Ui::default() });
+fn check(name: &str, source: &str, stderr: &str) {
+    let actual = ui(Ui { name, core: FLAGS, std: Some((PRELUDE, STD)), source, ..Ui::default() });
     assert_eq!(actual, stderr, "{name}");
 }
 
@@ -449,7 +449,6 @@ fn check(name: &str, test: Test, source: &str, stderr: &str) {
 fn lint_deref_nullptr() {
     check(
         "lint-deref-nullptr.rs",
-        Test::Passes,
         include_str!("pointers/ui/lint-deref-nullptr.rs"),
         include_str!("pointers/ui/lint-deref-nullptr.stderr"),
     );
@@ -459,7 +458,6 @@ fn lint_deref_nullptr() {
 fn ptr_null_checks() {
     check(
         "ptr_null_checks.rs",
-        Test::Passes,
         include_str!("pointers/ui/ptr_null_checks.rs"),
         include_str!("pointers/ui/ptr_null_checks.stderr"),
     );
@@ -469,7 +467,6 @@ fn ptr_null_checks() {
 fn invalid_null_args() {
     check(
         "invalid_null_args.rs",
-        Test::Passes,
         include_str!("pointers/ui/invalid_null_args.rs"),
         include_str!("pointers/ui/invalid_null_args.stderr"),
     );
@@ -479,7 +476,6 @@ fn invalid_null_args() {
 fn dangling_pointers_from_locals() {
     check(
         "dangling-pointers-from-locals.rs",
-        Test::Passes,
         include_str!("pointers/ui/dangling-pointers-from-locals.rs"),
         include_str!("pointers/ui/dangling-pointers-from-locals.stderr"),
     );
@@ -489,7 +485,6 @@ fn dangling_pointers_from_locals() {
 fn dangling_pointers_from_temporaries_types() {
     check(
         "types.rs",
-        Test::Passes,
         include_str!("pointers/ui/dangling-pointers-from-temporaries/types.rs"),
         include_str!("pointers/ui/dangling-pointers-from-temporaries/types.stderr"),
     );

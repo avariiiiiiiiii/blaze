@@ -132,9 +132,13 @@ impl Session {
         self.features.enabled(name)
     }
 
-    /// rustc's `feature_err` of the language feature `feature` at `span`.
-    pub(crate) fn feature_err(&self, feature: &str, span: Span, explain: impl Into<String>) -> Diag {
-        crate::checks::features::feature_err(&self.features, feature, span, explain)
+    /// rustc's `feature_err` of the language feature `feature` at `span`, which reads the
+    /// `#![feature]`s of the crate root besides its source.
+    pub(crate) fn feature_err(&self, cx: &Cx<'_, '_>, feature: &str, span: Span, explain: impl Into<String>) -> Diag {
+        let mut diag = crate::checks::features::feature_err(&self.features, feature, span, explain);
+        let root = cx.krate.root_module(cx.db);
+        diag.fact(Fact::Signature(cx.module_key(root)), "the `#![feature]`s of the crate root");
+        diag
     }
 }
 
@@ -258,9 +262,21 @@ impl<'a, 'c, 'db> Accept<'a, 'c, 'db> {
     /// crate enables it.
     pub(crate) fn gate(&mut self, feature: &str, range: TextRange, explain: impl Into<String>) {
         if !self.feature(feature) {
-            let diag = self.session.feature_err(feature, self.span(range), explain);
+            let diag = self.session.feature_err(self.cx, feature, self.span(range), explain);
             self.emit_err(diag);
         }
+    }
+
+    /// The error of one of `checks::features::attributes`' gates, when it gives one.
+    pub(crate) fn emit_gate(&mut self, diag: Option<Diag>) {
+        if let Some(diag) = diag {
+            self.emit_err(diag);
+        }
+    }
+
+    /// `range` of the file the attribute is written in.
+    pub(crate) fn in_file(&self, range: TextRange) -> InFile<TextRange> {
+        self.attr.in_file(range)
     }
 
     /// rustc's `expect_single_element_list`; `range` is of the node `args` is of.

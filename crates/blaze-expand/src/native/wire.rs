@@ -1,4 +1,4 @@
-//! The host's side of the encoding a stream crosses into and out of a native expander in
+//! The host's side of the encoding a stream crosses into and out of a macro on the bridge in
 //! (`proc_macro/lib.rs`, `wire`), from and to rust-analyzer's token trees, with each span a
 //! number of the [`Spans`] of the expansion. Up to [`Reader`] it is
 //! `crates/blaze-macro-wasm/src/wire.rs`, the same text after this comment (`tests.rs` holds

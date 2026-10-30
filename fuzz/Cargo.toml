@@ -17,16 +17,160 @@ repository.workspace = true
 [lib]
 doctest = false
 
+# One binary per target; `targets/cas_shared.rs` and `targets/macro_wasm_guest.rs` are modules of
+# their targets.
+[[bin]]
+name = "api_cbor"
+path = "targets/api_cbor.rs"
+
+[[bin]]
+name = "api_cbor_encode"
+path = "targets/api_cbor_encode.rs"
+
+[[bin]]
+name = "api_envelope"
+path = "targets/api_envelope.rs"
+
+[[bin]]
+name = "api_frame"
+path = "targets/api_frame.rs"
+
+[[bin]]
+name = "api_frames"
+path = "targets/api_frames.rs"
+
+[[bin]]
+name = "api_http_request"
+path = "targets/api_http_request.rs"
+
+[[bin]]
+name = "api_http_response"
+path = "targets/api_http_response.rs"
+
+[[bin]]
+name = "cas_cold"
+path = "targets/cas_cold.rs"
+
+[[bin]]
+name = "cas_entry"
+path = "targets/cas_entry.rs"
+
+[[bin]]
+name = "cas_head"
+path = "targets/cas_head.rs"
+
+[[bin]]
+name = "cas_index"
+path = "targets/cas_index.rs"
+
+[[bin]]
+name = "cas_pack"
+path = "targets/cas_pack.rs"
+
+[[bin]]
+name = "cas_remote"
+path = "targets/cas_remote.rs"
+
+[[bin]]
+name = "link_coff_archive"
+path = "targets/link_coff_archive.rs"
+
+[[bin]]
+name = "link_coff_import"
+path = "targets/link_coff_import.rs"
+
+[[bin]]
+name = "link_coff_object"
+path = "targets/link_coff_object.rs"
+
+[[bin]]
+name = "link_elf_archive"
+path = "targets/link_elf_archive.rs"
+
+[[bin]]
+name = "link_elf_object"
+path = "targets/link_elf_object.rs"
+
+[[bin]]
+name = "link_elf_shared"
+path = "targets/link_elf_shared.rs"
+
+[[bin]]
+name = "link_macho_archive"
+path = "targets/link_macho_archive.rs"
+
+[[bin]]
+name = "link_macho_dylib"
+path = "targets/link_macho_dylib.rs"
+
+[[bin]]
+name = "link_macho_object"
+path = "targets/link_macho_object.rs"
+
+[[bin]]
+name = "link_macho_tbd"
+path = "targets/link_macho_tbd.rs"
+
+[[bin]]
+name = "link_macho_trie"
+path = "targets/link_macho_trie.rs"
+
+[[bin]]
+name = "link_wasm_archive"
+path = "targets/link_wasm_archive.rs"
+
+[[bin]]
+name = "link_wasm_object"
+path = "targets/link_wasm_object.rs"
+
+[[bin]]
+name = "macro_wasm_host"
+path = "targets/macro_wasm_host.rs"
+
+[[bin]]
+name = "macro_wasm_lex"
+path = "targets/macro_wasm_lex.rs"
+
+[[bin]]
+name = "macro_wasm_validate"
+path = "targets/macro_wasm_validate.rs"
+
+[[bin]]
+name = "macro_wasm_wire"
+path = "targets/macro_wasm_wire.rs"
+
+[[bin]]
+name = "vfs_journal_bytes"
+path = "targets/vfs_journal_bytes.rs"
+
+[[bin]]
+name = "vfs_journal_model"
+path = "targets/vfs_journal_model.rs"
+
+[[bin]]
+name = "vfs_journal_records"
+path = "targets/vfs_journal_records.rs"
+
 [dependencies]
-blaze-fuzz.workspace = true
+base-db.workspace = true
 blaze-api.workspace = true
 blaze-cas.workspace = true
 blaze-codegen.workspace = true
+blaze-core.workspace = true
+blaze-fuzz.workspace = true
 blaze-ids.workspace = true
 blaze-link.workspace = true
 blaze-macro-wasm.workspace = true
-blaze-protocol.workspace = true
+# `cbor::reference`, the codec's oracle, which the CBOR targets compare the fast one with.
+blaze-protocol = { workspace = true, features = ["reference"] }
+blaze-query.workspace = true
 blaze-vfs.workspace = true
+hir-expand.workspace = true
+# The object-file targets build their seeds with `object::write`.
+object = { workspace = true, features = ["write"] }
+serde = { workspace = true, features = ["derive"] }
+span.workspace = true
+tt.workspace = true
 
 [lints]
 workspace = true

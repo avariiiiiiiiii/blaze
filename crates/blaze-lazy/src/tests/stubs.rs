@@ -56,18 +56,16 @@ fn the_x86_resolver_reads_the_cell_and_ends_in_a_jump_through_r11() {
         let disp = i32::from_le_bytes(code[load + 3..load + 7].try_into().unwrap());
         assert_eq!(i64::from(RESOLVER) + load as i64 + 7 + i64::from(disp), i64::from(CELL));
         assert!(code.windows(5).any(|it| it == [0x41, 0x5b, 0x41, 0xff, 0xe3]), "pop r11; jmp r11");
-        let jz = code.windows(2).position(|it| it[0] == 0x74 && code.get(it.len()..).is_some()).unwrap();
-        let _ = jz;
         let trap = code.windows(2).rposition(|it| it == [0x0f, 0x0b]).expect("ud2");
         let jz = code.windows(3).position(|it| it == [0x48, 0x85, 0xc0]).expect("test rax, rax") + 3;
         assert_eq!(code[jz], 0x74);
         assert_eq!(jz + 2 + code[jz + 1] as usize, trap);
         let probes = code.windows(8).filter(|it| *it == [0x48, 0xc7, 0x04, 0x24, 0, 0, 0, 0]).count();
-        let X86SaveSize = match isa {
+        let size = match isa {
             Isa::X86_64 { save, .. } => save.size(),
             Isa::Aarch64 { .. } => unreachable!(),
         };
-        assert_eq!(probes as u32, X86SaveSize.div_ceil(2048));
+        assert_eq!(probes as u32, size.div_ceil(2048));
     }
 }
 
@@ -103,7 +101,7 @@ fn an_aarch64_entry_puts_its_id_in_x16_and_branches_to_the_resolver() {
 
 #[test]
 fn aarch64_encoders_match_the_assembler() {
-    use stub_aarch64::*;
+    use crate::stub::aarch64::*;
     // As `llvm-mc -triple=aarch64 -mattr=+sve -show-encoding` writes them.
     let cases: &[(u32, u32, &str)] = &[
         (stp_x(0, 1, 31, 0), 0xa900_07e0, "stp x0, x1, [sp]"),
@@ -162,9 +160,4 @@ fn a_region_too_big_for_its_branches_is_refused() {
     let most = stub::most(&ISAS[4]);
     assert!(matches!(generate(&ISAS[4], most + 1, 0), Err(StubError::TooMany { .. })));
     assert!(most >= 1 << 22);
-}
-
-/// The AArch64 encoders, reachable from the tests.
-mod stub_aarch64 {
-    pub(super) use crate::stub::aarch64_for_tests::*;
 }

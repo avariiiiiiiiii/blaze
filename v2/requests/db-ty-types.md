@@ -138,6 +138,8 @@ needing them:
 The usual fix is to keep a `Send` part (crate, lang items, limits) apart from the database
 handle, which stays on its thread.
 
+> forwarded to db (db-ty-solver's `tls_cache.rs`, and the lines in db-ty-types' own `interner.rs`) and safety (finding what needs the impls once a build runs).
+
 ## 5. Every lane calling `DbInterner::conjure`: stop, then the method goes
 
 What: `DbInterner::conjure()` (`interner.rs`) transmutes the attached database reference to an
@@ -150,6 +152,8 @@ It is marked `FIXME(safety)` and has no sound `// SAFETY:` comment. Its callers:
 Each should take a `DbInterner` from its caller (`DbInterner::new_no_crate(db)`) instead. My own
 three uses (`generic_arg.rs` `type_at`/`region_at`/`const_at`) now read `default_types()`, which
 needs no database. Once the list above is empty, I delete `conjure`.
+
+> forwarded to db: the callers are in `crates/hir/` (db / db-ty-hir) and `crates/hir-ty/src/infer.rs` (db-ty-infer).
 
 ## Applied requests of others
 

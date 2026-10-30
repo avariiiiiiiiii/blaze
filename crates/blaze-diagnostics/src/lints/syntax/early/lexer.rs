@@ -39,7 +39,7 @@ use crate::{
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
-use self::lex::Lexed;
+use self::lex::{Lexed, LexedFile};
 
 pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'_>) -> Vec<Emitted> {
     let Some(root) = cx.krate.root_module(cx.db).as_source_file_id(cx.db) else { return Vec::new() };
@@ -51,13 +51,14 @@ pub(crate) fn lints<'db>(cx: &Cx<'_, 'db>, walk: &Walk<'_>) -> Vec<Emitted> {
     }
     let sources = sources(cx, walk);
     let mut gallery = Gallery::default();
+    let mut lexed = LexedFile::default();
     for (index, source) in sources.iter().enumerate() {
         let text = cx.file_text(source.file);
-        let lexed = lex::lex(text, source.edition);
-        for lexed in lexed.lexed {
-            emitted.push(lexer_lint(cx, source.file, text, lexed, krate));
+        lex::lex_into(text, source.edition, &mut lexed);
+        for found in lexed.lexed.drain(..) {
+            emitted.push(lexer_lint(cx, source.file, text, found, krate));
         }
-        for ident in lexed.idents {
+        for &ident in &lexed.idents {
             let symbol = lex::nfc(&text[ident.symbol_range()]);
             let order = (index as u32, u32::from(ident.range.start()), u32::from(ident.range.end()));
             gallery.symbols.entry(symbol).or_insert(Entry { order, place: Place::File(source.file, ident.range) });

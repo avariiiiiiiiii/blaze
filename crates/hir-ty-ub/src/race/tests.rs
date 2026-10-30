@@ -434,6 +434,26 @@ fn join_and_detach_errors() {
     assert_eq!(r.join(t2).unwrap_err().to_string(), "trying to join a detached thread");
 }
 
+#[test]
+fn names_and_termination() {
+    let mut r = Races::new(&deterministic());
+    let t1 = r.spawn();
+    let t2 = r.spawn();
+    r.set_thread_name(t2, b"worker");
+    assert_eq!(r.thread_name(MAIN), Some("main"));
+    assert_eq!(r.thread_name(t1), None);
+    assert_eq!(r.thread_display_name(t1), "unnamed-1");
+    assert_eq!(r.thread_display_name(t2), "worker");
+
+    run_to_exit(&mut r, t1);
+    // `main` returns while `t2` still runs: Miri's thread leak.
+    r.exit();
+    assert!(!r.all_terminated());
+    assert_eq!(r.schedule(MAIN, &[t2]), Ok(t2));
+    r.exit();
+    assert!(r.all_terminated());
+}
+
 /// Runs `thread` to its exit and goes back to the main thread.
 fn run_to_exit(r: &mut Races, thread: ThreadId) {
     assert_eq!(r.schedule(r.active(), &[thread]), Ok(thread));
@@ -462,19 +482,26 @@ fn single_thread_fast_path() {
     r.read(a, span, None, S).unwrap();
     assert!(!r.is_lazy(a));
 
-    // Joining the only other thread makes races impossible again (Miri: `thread_joined`).
+    // Miri turns detection off at a join only when every thread's time is within the joined
+    // thread's final clock (`thread_joined`), which never has the joiner's later steps.
     run_to_exit(&mut r, t1);
     r.join(t1).unwrap();
-    assert!(!r.is_multi_threaded());
-
-    // A detached thread that has not been joined keeps them possible.
-    let t2 = r.spawn();
-    r.detach(t2).unwrap();
-    run_to_exit(&mut r, t2);
-    let t3 = r.spawn();
-    run_to_exit(&mut r, t3);
-    r.join(t3).unwrap();
     assert!(r.is_multi_threaded());
+}
+
+#[test]
+fn single_thread_again_when_the_joinee_saw_everything() {
+    let mut r = Races::new(&deterministic());
+    let t1 = r.spawn();
+    run_to_exit(&mut r, t1);
+    // The joined thread's final clock covering every thread's time is the condition.
+    let main_clock = r.global.vector_clocks[0].clock.clone();
+    r.global.vector_clocks[1].clock.join(&main_clock);
+    r.join(t1).unwrap();
+    assert!(!r.is_multi_threaded());
+    // Nothing races now, and a new allocation needs no clocks.
+    r.new_alloc(id(1), 4, Some(MAIN));
+    assert!(r.is_lazy(id(1)));
 }
 
 #[test]
@@ -483,14 +510,19 @@ fn vector_index_reuse() {
     let t1 = r.spawn();
     assert_eq!(r.global.threads.vector_index[t1.index()], Some(VectorIdx(1)));
     run_to_exit(&mut r, t1);
-    // `main` hasn't seen `t1`'s end: its index can't be reused yet.
+    r.join(t1).unwrap();
+    // The join acquires the clock from before the exit's own increment, as in Miri, so no
+    // clock has caught up with `t1`'s last time: its index stays taken.
     let t2 = r.spawn();
     assert_eq!(r.global.threads.vector_index[t2.index()], Some(VectorIdx(2)));
     run_to_exit(&mut r, t2);
-    r.join(t1).unwrap();
+    // Once every clock that isn't an exited thread's has, the index is reused.
+    let last = r.global.vector_clocks[2].clock.clone();
+    r.global.vector_clocks[0].clock.join(&last);
     let t3 = r.spawn();
-    assert_eq!(r.global.threads.vector_index[t3.index()], Some(VectorIdx(1)));
-    assert_eq!(r.global.threads.vector_index[t1.index()], None);
+    assert_eq!(r.global.threads.vector_index[t3.index()], Some(VectorIdx(2)));
+    assert_eq!(r.global.threads.vector_index[t2.index()], None);
+    assert_eq!(r.global.vector_info[2], t3);
 }
 
 #[test]
@@ -915,9 +947,9 @@ fn sim_reports_sites() {
     assert_eq!(err.sites(), Some((site(ThreadId(1), 0), site(ThreadId(2), 0))));
 
     // An atomic access names itself too.
-    let t1: &[Op] = &[Yield, Load(at(1), SeqCst, 0)];
+    let t1: &[Op] = &[Load(at(1), SeqCst, 0)];
     let err = race(&[main, t1, t2]);
-    assert_eq!(err.sites(), Some((site(ThreadId(1), 1), site(ThreadId(2), 0))));
+    assert_eq!(err.sites(), Some((site(ThreadId(1), 0), site(ThreadId(2), 0))));
 }
 
 // --- tests/fail/data_race ---
@@ -1615,7 +1647,7 @@ fn sc_cpp20_sc_fence_fix() {
         let t3: &[Op] = &[Store(Y, 1, Relaxed)];
         let t4: &[Op] = &[Load(Y, Relaxed, 0), Fence(SeqCst), Load(X, Relaxed, 1)];
         let regs = regs(config, &[&main, t1, t2, t3, t4]);
-        assert_ne!((regs[1][..2], regs[4][..2]), ([1, 0], [1, 0]));
+        assert_ne!((regs[1][0], regs[1][1], regs[4][0], regs[4][1]), (1, 0, 1, 0));
     });
 }
 
@@ -1640,7 +1672,7 @@ fn sc_fence_release() {
         let t3: &[Op] = &[Load(K, Acquire, 0), Load(Y, Relaxed, 1)];
         let t4: &[Op] = &[Load(Z, Acquire, 0), Load(X, Relaxed, 1)];
         let regs = regs(config, &[&main, t1, t2, t3, t4]);
-        assert_ne!((regs[3][..2], regs[4][..2]), ([1, 0], [1, 0]));
+        assert_ne!((regs[3][0], regs[3][1], regs[4][0], regs[4][1]), (1, 0, 1, 0));
     });
 }
 
@@ -1746,8 +1778,9 @@ fn non_atomic_write_drops_the_store_buffer() {
     main.extend([Spawn(1), Join(1), Write(X, 5), Spawn(2), Join(2)]);
     let t1: &[Op] = &[Store(X, 1, Relaxed), Store(X, 2, Relaxed)];
     let t2: &[Op] = &[Load(X, Relaxed, 0)];
+    let progs: [&[Op]; 3] = [&main, t1, t2];
     for seed in 0..50 {
-        let mut sim = Sim::new(&fixed(seed), &[&main, t1, t2]);
+        let mut sim = Sim::new(&fixed(seed), &progs);
         let regs = sim.run().unwrap_or_else(|stop| panic!("{stop:?}"));
         assert_eq!(regs[2][0], 5);
         assert_eq!(sim.races.buffer_count(id(1)), 0);

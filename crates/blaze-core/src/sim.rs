@@ -10,10 +10,13 @@
 //! ends, and [`Sim::dial`] is a peer from outside (an agent's client, a webhook) that the test
 //! plays with [`Sim::peer_send`], [`Sim::peer_received`] and [`Sim::peer_hangup`].
 
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
+
+use rustc_hash::FxHashMap;
 
 use crate::{
     Address, Command, Completion, Conn, Done, Driver, Effect, Exit, FileName, IoError, Meta, Tag,
+    wheel::{self, Handle, Wheel},
 };
 
 /// What a simulated program does when spawned: how it ends, and how long it runs.
@@ -181,7 +184,6 @@ impl Op {
 
 #[derive(Debug)]
 struct Pending {
-    ready: Duration,
     effect: Effect,
     /// For a sync: how many changes the file had not synced when it was submitted.
     covers: usize,
@@ -191,17 +193,23 @@ pub struct Sim {
     rng: Rng,
     faults: Faults,
     now: Duration,
-    files: BTreeMap<FileName, SimFile>,
-    pending: Vec<Pending>,
-    watches: BTreeMap<Tag, FileName>,
+    files: FxHashMap<FileName, SimFile>,
+    /// Effects in flight by the tick of the virtual clock they are ready at. The clock ends
+    /// some 584 years in ([`wheel::ticks`]): one due later is due at its end.
+    pending: Wheel<Pending>,
+    /// The pending effect of each spawn in flight, for a kill to bring forward.
+    spawning: FxHashMap<Tag, Handle>,
+    /// What was ready at the last poll, kept for the next's.
+    ready: Vec<Pending>,
+    watches: FxHashMap<Tag, FileName>,
     /// Changes and ends of watches, accepts and ends of listens, and what sockets did, each
     /// ready at its time.
     told: Vec<(Duration, Completion)>,
-    programs: BTreeMap<PathBuf, Program>,
+    programs: FxHashMap<PathBuf, Program>,
     /// The run of each spawn in flight, decided when it was spawned.
-    runs: BTreeMap<Tag, Exit>,
-    listens: BTreeMap<Tag, Address>,
-    ends: BTreeMap<Conn, End>,
+    runs: FxHashMap<Tag, Exit>,
+    listens: FxHashMap<Tag, Address>,
+    ends: FxHashMap<Conn, End>,
     next_conn: u64,
     /// Receives waiting for bytes or a hang-up: tag, connection, at most.
     receiving: Vec<(Tag, Conn, usize)>,
@@ -213,16 +221,29 @@ impl Sim {
             rng: Rng::new(seed),
             faults,
             now: Duration::ZERO,
-            files: BTreeMap::new(),
-            pending: Vec::new(),
-            watches: BTreeMap::new(),
+            files: FxHashMap::default(),
+            pending: Wheel::new(),
+            spawning: FxHashMap::default(),
+            ready: Vec::new(),
+            watches: FxHashMap::default(),
             told: Vec::new(),
-            programs: BTreeMap::new(),
-            runs: BTreeMap::new(),
-            listens: BTreeMap::new(),
-            ends: BTreeMap::new(),
+            programs: FxHashMap::default(),
+            runs: FxHashMap::default(),
+            listens: FxHashMap::default(),
+            ends: FxHashMap::default(),
             next_conn: 0,
             receiving: Vec::new(),
+        }
+    }
+
+    /// `effect` ready `after` from now.
+    fn pend(&mut self, after: Duration, effect: Effect, covers: usize) {
+        let ready = wheel::ticks(self.now).saturating_add(wheel::ticks(after));
+        let tag = effect.tag();
+        let spawn = matches!(effect, Effect::Spawn { .. });
+        let handle = self.pending.insert(ready, Pending { effect, covers });
+        if spawn {
+            self.spawning.insert(tag, handle);
         }
     }
 
@@ -283,14 +304,18 @@ impl Sim {
     /// last of which may be torn. A whole-file write or rename that completed is kept whole;
     /// one in flight is not there.
     pub fn crash(&mut self) {
-        self.pending.clear();
+        self.pending.drain(|_, _| {});
+        self.spawning.clear();
         self.watches.clear();
         self.told.clear();
         self.runs.clear();
         self.listens.clear();
         self.ends.clear();
         self.receiving.clear();
-        for file in self.files.values_mut() {
+        // By name, so the seed's numbers go to the same files whatever the table's order.
+        let mut files: Vec<(&FileName, &mut SimFile)> = self.files.iter_mut().collect();
+        files.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (_, file) in files {
             let kept = self.rng.below(file.ops.len() as u64 + 1) as usize;
             let torn = file.ops.get(kept).and_then(|op| op.torn(&mut self.rng));
             file.sync(kept);
@@ -338,7 +363,7 @@ impl Sim {
         if self.files.contains_key(dir) {
             return Done::Failed(IoError(format!("{dir}: not a directory")));
         }
-        let mut found = BTreeMap::new();
+        let mut found = FxHashMap::default();
         for (file, sim) in self.files.iter().filter(|(it, _)| it.is_under(dir)) {
             let rest = &file.as_str()[dir.as_str().len() + 1..];
             for (at, _) in rest.match_indices('/') {
@@ -354,7 +379,9 @@ impl Sim {
         if found.is_empty() {
             return Done::Failed(IoError(format!("{dir}: no such directory")));
         }
-        Done::Listed(found.into_iter().collect())
+        let mut listed: Vec<(FileName, Meta)> = found.into_iter().collect();
+        listed.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Done::Listed(listed)
     }
 
     /// The file removed by something outside the state machine.
@@ -373,12 +400,14 @@ impl Sim {
 
     /// Tells the watches of `file` it changed.
     fn changed(&mut self, file: &FileName) {
-        let watching: Vec<Tag> = self
+        let mut watching: Vec<Tag> = self
             .watches
             .iter()
             .filter(|(_, dir)| file.is_under(dir))
             .map(|(&tag, _)| tag)
             .collect();
+        // By tag, so the seed's numbers go to the same watches whatever the table's order.
+        watching.sort_unstable();
         for tag in watching {
             let done = match self.rng.one_in(self.faults.lose_change_one_in) {
                 true => Done::Changed { files: Vec::new(), lost: true },
@@ -629,17 +658,20 @@ impl Driver for Sim {
                     continue;
                 }
                 Effect::Kill { tag } => {
-                    if let Some(pending) = self.pending.iter_mut().find(|it| {
-                        matches!(it.effect, Effect::Spawn { tag: spawn, .. } if spawn == tag)
-                    }) && let Some(exit) = self.runs.get_mut(&tag)
+                    if let Some(&handle) = self.spawning.get(&tag)
+                        && let Some(ready) = self.pending.deadline(handle)
+                        && let Some(exit) = self.runs.get_mut(&tag)
                     {
-                        let now = self.now;
                         let delay = Duration::from_nanos(
                             self.rng.below(self.faults.max_latency.as_nanos() as u64 + 1),
                         );
-                        pending.ready = pending.ready.min(now + delay);
                         exit.code = None;
                         exit.signal = Some(KILLED);
+                        let sooner = wheel::ticks(self.now).saturating_add(wheel::ticks(delay));
+                        if sooner < ready {
+                            let pending = self.pending.cancel(handle).expect("in the wheel");
+                            self.spawning.insert(tag, self.pending.insert(sooner, pending));
+                        }
                     }
                     continue;
                 }
@@ -738,8 +770,8 @@ impl Driver for Sim {
                 Effect::Spawn { ref command, tag } => match self.run(command) {
                     Ok(ran) => {
                         self.runs.insert(tag, ran.exit);
-                        let ready = self.now + ran.takes + self.delay();
-                        self.pending.push(Pending { ready, effect, covers: 0 });
+                        let after = ran.takes.saturating_add(self.delay());
+                        self.pend(after, effect, 0);
                         continue;
                     }
                     Err(why) => {
@@ -757,31 +789,32 @@ impl Driver for Sim {
                 Effect::Sync { file, .. } => self.files.get(file).map_or(0, |it| it.ops.len()),
                 _ => 0,
             };
-            self.pending.push(Pending { ready: self.now + delay, effect, covers });
+            self.pend(delay, effect, covers);
         }
     }
 
     /// Never waits: time jumps to the first completion when none is ready.
     fn poll(&mut self, out: &mut Vec<Completion>, _wait: Duration) -> usize {
-        let first = self.pending.iter().map(|it| it.ready).chain(self.told.iter().map(|it| it.0));
-        let Some(first) = first.min() else { return 0 };
+        let first = self.pending.next_deadline().map(Duration::from_nanos);
+        let Some(first) = first.into_iter().chain(self.told.iter().map(|it| it.0)).min() else {
+            return 0;
+        };
         self.now = self.now.max(first);
-        let mut ready = Vec::new();
-        let mut index = 0;
-        while index < self.pending.len() {
-            if self.pending[index].ready <= self.now {
-                ready.push(self.pending.swap_remove(index));
-            } else {
-                index += 1;
+        let mut ready = std::mem::take(&mut self.ready);
+        self.pending.advance(wheel::ticks(self.now), |_, pending| ready.push(pending));
+        for pending in &ready {
+            if let Effect::Spawn { tag, .. } = pending.effect {
+                self.spawning.remove(&tag);
             }
         }
-        // `swap_remove` already disturbed the order; shuffle so it is the seed's, not the vec's.
+        // In the order they were due; shuffled so it is the seed's.
         self.rng.shuffle(&mut ready);
         let before = out.len();
-        for pending in ready {
+        for pending in ready.drain(..) {
             let completion = self.complete(pending);
             out.push(completion);
         }
+        self.ready = ready;
         // What watches were told, in the order they were told: a watch's end comes last.
         let mut index = 0;
         while index < self.told.len() {
@@ -812,6 +845,8 @@ impl Driver for Sim {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::run_until_idle;
 
@@ -1058,6 +1093,46 @@ mod tests {
             let Done::Exited(killed) = &seen[&Tag(4)] else { panic!("seed {seed}: {seen:?}") };
             assert_eq!(killed.signal, Some(KILLED));
             assert!(!seen.contains_key(&Tag(99)));
+        }
+    }
+
+    /// Each timer fires at exactly its virtual time, the clock jumping to it, whatever else is
+    /// in flight; one far past the clock's end fires at its end.
+    #[test]
+    fn timers_fire_at_their_virtual_time() {
+        for seed in 0..100 {
+            let mut sim = Sim::new(seed, Faults::default());
+            let mut at = Vec::new();
+            sim.submit(&mut vec![
+                Effect::Timer { after: Duration::from_micros(7_000), tag: Tag(0) },
+                Effect::Timer { after: Duration::from_micros(3_000), tag: Tag(1) },
+                Effect::Timer { after: Duration::from_micros(3_000), tag: Tag(2) },
+                Effect::Timer { after: Duration::from_micros(12), tag: Tag(3) },
+                Effect::Timer { after: Duration::MAX, tag: Tag(4) },
+                Effect::Append { file: name("f"), bytes: vec![1], tag: Tag(5) },
+            ]);
+            let mut out = Vec::new();
+            while sim.in_flight() > 0 {
+                sim.poll(&mut out, Duration::ZERO);
+                for done in out.drain(..) {
+                    if done.done == Done::Fired {
+                        at.push((sim.now(), done.tag.0));
+                    }
+                }
+            }
+            at.sort_unstable();
+            let micros = |it| Duration::from_micros(it);
+            assert_eq!(
+                at,
+                [
+                    (micros(12), 3),
+                    (micros(3_000), 1),
+                    (micros(3_000), 2),
+                    (micros(7_000), 0),
+                    (Duration::from_nanos(u64::MAX), 4),
+                ],
+                "seed {seed}"
+            );
         }
     }
 

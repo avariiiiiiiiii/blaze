@@ -107,7 +107,7 @@ fn read_tree(root: &Path) -> anyhow::Result<Vec<SourceFile>> {
             }
         }
     }
-    files.sort_by(|a, b| a.path.cmp(&b.path));
+    blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
     Ok(files)
 }
 

@@ -1,799 +1,930 @@
-//! `unexpected_cfgs`: each name and value a `cfg` evaluates (`#[cfg]`, `#[cfg_attr]`, `cfg!`,
-//! `cfg_select!`) that `--check-cfg` does not expect, as rustc parses each predicate: every
-//! leaf of one that parses up to where it stops, the attributes of a node in order up to the
-//! first `cfg` that removes it, each lint at the node rustc buffers it for.
+//! `unexpected_cfgs`: each cfg name and value rustc reads that `--check-cfg` and the names
+//! rustc knows do not expect, as expansion reads them: the `#[cfg]`s and `#[cfg_attr]`s of every
+//! node it configures, in order, up to the first that is false (a `cfg_attr`'s own attributes
+//! when it holds), the predicate of each `cfg!` and of each arm of a `cfg_select!`.
+//!
+//! The lint is buffered for the node rustc's expansion is in when it reads the cfg: the nearest
+//! node around the attribute's that has an id, as a node's cfgs are read before it is given one
+//! (so `#[allow(unexpected_cfgs)]` on the node itself does not reach them).
 //!
 //! Follows rustc's `compiler/rustc_attr_parsing/src/attributes/cfg.rs` (`parse_cfg_entry`,
-//! `parse_cfg_entry_target`, `parse_name_value`), `compiler/rustc_attr_parsing/src/check_cfg.rs`
-//! (`unexpected_cfg_name`, `unexpected_cfg_value`), `compiler/rustc_attr_parsing/src/diagnostics.rs`
+//! `parse_cfg_entry_target`, `parse_name_value`), `attributes/cfg_select.rs`
+//! (`parse_cfg_select`), `compiler/rustc_attr_parsing/src/check_cfg.rs` (`unexpected_cfg_name`,
+//! `unexpected_cfg_value`), the messages of `compiler/rustc_attr_parsing/src/diagnostics.rs`
 //! (`UnexpectedCfgName`, `UnexpectedCfgValue` and their parts),
-//! `compiler/rustc_attr_parsing/src/attributes/cfg_select.rs` (`parse_cfg_select`),
-//! `compiler/rustc_parse/src/parser/cfg_select.rs` (`parse_delimited_token_tree`),
-//! `compiler/rustc_builtin_macros/src/cfg.rs` (`parse_cfg`), `compiler/rustc_expand/src/config.rs`
-//! (`StripUnconfigured`), `compiler/rustc_expand/src/expand.rs` (`assign_id!`: the
-//! `lint_node_id` a lint is buffered at) and `compiler/rustc_span/src/lib.rs`
-//! (`Span::in_external_macro`) (MIT or Apache-2.0).
+//! `compiler/rustc_session/src/config/cfg.rs` (`fill_well_known`, `ExpectedValues`) and
+//! `compiler/rustc_expand/src/expand.rs` (`InvocationCollector`: `take_first_attr`,
+//! `expand_cfg_true`, `expand_cfg_attr`, `assign_id!`) (MIT or Apache-2.0).
 
-use std::{borrow::Cow, cmp::Reverse};
+use std::{cmp::Reverse, ops::ControlFlow};
 
 use cfg::{CfgExpr, CfgOptions};
 use hir::{HirFileId, InFile, MacroCallId};
 use hir_expand::{MacroCallKind, MacroDefKind, builtin::BuiltinFnLikeExpander};
-use smallvec::SmallVec;
+use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
-    AstNode, Edition, SyntaxKind,
-    SyntaxKind::{
-        ATTR, BANG, BLOCK_EXPR, COMMA, CONST_PARAM, FAT_ARROW, L_BRACK, L_CURLY, L_PAREN, LET_STMT,
-        LIFETIME_PARAM, MACRO_CALL, MACRO_EXPR, MACRO_PAT, MACRO_TYPE, MATCH_ARM, PARAM, POUND,
-        R_BRACK, R_CURLY, R_PAREN, RECORD_EXPR_FIELD, RECORD_FIELD, RECORD_PAT_FIELD, SELF_PARAM,
-        TUPLE_FIELD, TYPE_PARAM, UNDERSCORE, VARIANT, WHERE_PRED,
-    },
-    SyntaxNode, SyntaxNodePtr, TextRange,
+    AstNode, AstToken, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, TextRange,
     ast::{self, HasLoopBody as _},
 };
 
 use super::{
-    CheckCfg, Expected, Set, ident, list,
-    meta::{self, Item, Kind, LitKind, Parser, Tok},
+    super::{Emitted, Pass, Tree, Walk, source_fact},
+    CheckCfg, Values, meta, well_known,
 };
 use crate::{
-    cx::Cx,
-    lints::{
-        edit_distance::find_best_match_for_name,
-        syntax::{Emitted, Pass, Tree, Walk, source_fact},
-    },
+    cx::{Cx, derive_paths},
+    lints::edit_distance::find_best_match_for_name,
     lower::Phase,
     model::{Applicability, Diag, MultiSpan, Span, Sublevel},
 };
 
 /// rustc's `MAX_CHECK_CFG_NAMES_OR_VALUES`.
-const MAX_LISTED: usize = 35;
+const MAX_SHOWN: usize = 35;
 
-const SEE_CARGO: &str = "see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration";
-const SEE_RUSTC: &str =
-    "see <https://doc.rust-lang.org/nightly/rustc/check-cfg.html> for more information about checking conditional configuration";
+/// The well-known names that also get the values of the target being built for.
+const TARGET_NAMES: &[&str] = &[
+    "target_abi",
+    "target_arch",
+    "target_endian",
+    "target_env",
+    "target_family",
+    "target_os",
+    "target_pointer_width",
+    "target_vendor",
+    "target_object_format",
+];
 
-pub(super) fn lints(cx: &Cx<'_, '_>, check: &CheckCfg, walk: &Walk<'_>, out: &mut Vec<Emitted>) {
-    let mut linter = Linter { cx, check, cfg: walk.cfg, out };
-    for tree in &walk.trees {
-        let edition = tree.file.edition(cx.db);
-        let mut skipped: Vec<&SyntaxNode> = tree.off.iter().chain(&tree.replaced).collect();
-        skipped.sort_by_key(|it| (it.text_range().start(), Reverse(it.text_range().end())));
-        let mut skipped = skipped.into_iter().peekable();
-        for node in &tree.nodes {
-            while let Some(it) = skipped.next_if(|it| before(it, node)) {
-                linter.owner(tree, edition, it);
-            }
-            linter.owner(tree, edition, node);
-            if ast::CfgPredExpr::can_cast(node.kind()) || ast::CfgPredPat::can_cast(node.kind()) {
-                linter.cfg_macro(tree, edition, node);
-            }
+/// What rustc's `CheckCfg` expects once `fill_well_known` ran: the names given, in the order
+/// given, then the well-known ones, each with its values (`None`: any).
+struct Expected<'c> {
+    names: Vec<&'c str>,
+    index: FxHashMap<&'c str, usize>,
+    values: Vec<Option<Set<'c>>>,
+    well_known: FxHashSet<&'static str>,
+    exhaustive_names: bool,
+}
+
+/// The values of a name, `None` for the name alone, in the order first added.
+#[derive(Default)]
+struct Set<'c> {
+    order: Vec<Option<&'c str>>,
+    has: FxHashSet<Option<&'c str>>,
+}
+
+impl<'c> Set<'c> {
+    fn insert(&mut self, value: Option<&'c str>) {
+        if self.has.insert(value) {
+            self.order.push(value);
         }
-        for it in skipped {
-            linter.owner(tree, edition, it);
-        }
-        if let Some(call) = tree.call
-            && matches!(call.loc(cx.db).def.kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::CfgSelect))
-        {
-            linter.cfg_select(call);
-        }
+    }
+
+    fn contains(&self, value: Option<&str>) -> bool {
+        self.has.contains(&value)
     }
 }
 
-/// Whether `a` comes before `b` in a pre-order walk.
-fn before(a: &SyntaxNode, b: &SyntaxNode) -> bool {
-    let (a, b) = (a.text_range(), b.text_range());
-    a.start() < b.start() || (a.start() == b.start() && a.end() > b.end())
+impl<'c> Expected<'c> {
+    fn new(check: &'c CheckCfg, cfg: &'c CfgOptions) -> Expected<'c> {
+        let mut expected = Expected {
+            names: Vec::new(),
+            index: FxHashMap::default(),
+            values: Vec::new(),
+            well_known: well_known::WELL_KNOWN.iter().map(|&(name, ..)| name).collect(),
+            exhaustive_names: check.exhaustive_names(),
+        };
+        for (name, values) in check.expecteds() {
+            let values = match values {
+                Values::Any => None,
+                Values::Some(values) => {
+                    let mut set = Set::default();
+                    values.iter().for_each(|it| set.insert(it.as_deref()));
+                    Some(set)
+                }
+            };
+            expected.push(name, values);
+        }
+        for &(name, start, values) in well_known::WELL_KNOWN {
+            let at = match expected.index.get(name) {
+                Some(&at) => at,
+                None => {
+                    let mut set = Set::default();
+                    if start == well_known::Start::NoValue {
+                        set.insert(None);
+                    }
+                    expected.push(name, Some(set))
+                }
+            };
+            if let Some(set) = &mut expected.values[at] {
+                values.iter().for_each(|&it| set.insert(Some(it)));
+            }
+        }
+        for name in TARGET_NAMES {
+            if let Some(&at) = expected.index.get(name)
+                && let Some(set) = &mut expected.values[at]
+            {
+                cfg.get_cfg_values(name).for_each(|it| set.insert(Some(it.as_str())));
+            }
+        }
+        expected
+    }
+
+    fn push(&mut self, name: &'c str, values: Option<Set<'c>>) -> usize {
+        let at = self.names.len();
+        self.names.push(name);
+        self.index.insert(name, at);
+        self.values.push(values);
+        at
+    }
+
+    /// rustc's `expecteds.get(name)`: `None` when the name is not expected, `Some(None)` when
+    /// any value is.
+    fn get(&self, name: &str) -> Option<Option<&Set<'c>>> {
+        self.index.get(name).map(|&it| self.values[it].as_ref())
+    }
+
+    /// rustc's `ExpectedValues::contains`.
+    fn has_value(&self, name: &str, value: Option<&str>) -> bool {
+        self.get(name).is_some_and(|it| it.is_none_or(|it| it.contains(value)))
+    }
 }
 
-struct Linter<'a, 'c, 'db> {
-    cx: &'a Cx<'c, 'db>,
-    check: &'a CheckCfg,
-    cfg: &'a CfgOptions,
-    out: &'a mut Vec<Emitted>,
-}
-
-/// A name, and maybe a value, a predicate tests (`CfgEntry::NameValue`).
-struct Leaf<'t> {
-    /// Without `r#`.
-    name: Cow<'t, str>,
+/// A cfg name rustc reads, with its value: rustc's `parse_name_value`'s arguments.
+struct Check {
+    name: String,
+    /// Written `r#name`.
     raw: bool,
     name_range: TextRange,
-    value: Option<(Cow<'t, str>, TextRange)>,
+    value: Option<(String, TextRange)>,
+    /// The predicate's (`name = "value"`).
     range: TextRange,
 }
 
-/// Which predicate an attribute or macro has.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Form {
-    /// `cfg(predicate)`: the one item of a list.
-    Cfg,
-    /// `cfg_attr(predicate, ..)`, `cfg!(predicate)`: the first item, whatever follows it.
-    First,
+/// Where rustc's expansion is when it reads a cfg: `node` of `file`, itself or the node around
+/// it (`include`).
+#[derive(Clone)]
+struct Anchor {
+    file: HirFileId,
+    node: SyntaxNode,
+    include: bool,
 }
 
-impl Linter<'_, '_, '_> {
-    /// The `cfg`s and `cfg_attr`s of `node` as rustc expands them: in order, the attributes a
-    /// `cfg_attr` that holds gives in its place, up to the first `cfg` that does not hold.
-    fn owner(&mut self, tree: &Tree, edition: Edition, node: &SyntaxNode) {
-        let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { return };
-        let mut attrs = ast::attrs_including_inner(&owner).peekable();
-        if attrs.peek().is_none() {
-            return;
+/// Of a cfg a macro made: whether it is of another crate's or a proc macro's
+/// (`Span::in_external_macro`), and for another crate's, what to say of it.
+#[derive(Default)]
+struct Origin {
+    external: bool,
+    macro_help: Option<(&'static str, String)>,
+}
+
+struct Lints<'a, 'db> {
+    cx: &'a Cx<'a, 'db>,
+    walk: &'a Walk<'a>,
+    check: &'a CheckCfg,
+    expected: Expected<'a>,
+    root: HirFileId,
+    build_script: bool,
+    emitted: Vec<Emitted>,
+}
+
+pub(super) fn lints(cx: &Cx<'_, '_>, check: &CheckCfg, walk: &Walk<'_>) -> Vec<Emitted> {
+    let mut lints = Lints {
+        cx,
+        walk,
+        check,
+        expected: Expected::new(check, walk.cfg),
+        root: cx.krate.root_module(cx.db).definition_source_file_id(cx.db),
+        build_script: cx
+            .krate
+            .display_name(cx.db)
+            .is_some_and(|it| it.crate_name().symbol().as_str() == "build_script_build"),
+        emitted: Vec::new(),
+    };
+    for tree in &walk.trees {
+        lints.tree(tree);
+    }
+    lints.emitted
+}
+
+/// What of a tree's node rustc reads cfgs of.
+#[derive(Clone, Copy)]
+enum Read {
+    /// Its attributes.
+    Attrs,
+    /// Its attributes before the attribute macro that replaces it.
+    Replaced,
+    /// The predicate of the `cfg!` it is the expansion of.
+    Predicate,
+}
+
+impl Lints<'_, '_> {
+    fn tree(&mut self, tree: &Tree) {
+        let mut read: Vec<(&SyntaxNode, Read)> = Vec::new();
+        for node in &tree.nodes {
+            if ast::AnyHasAttrs::can_cast(node.kind()) {
+                read.push((node, Read::Attrs));
+            }
+            if matches!(node.kind(), SyntaxKind::CFG_PRED_EXPR | SyntaxKind::CFG_PRED_PAT) {
+                read.push((node, Read::Predicate));
+            }
         }
-        let mut at = None;
-        let mut stack: SmallVec<[ast::Meta; 2]> = SmallVec::new();
-        'attrs: for attr in attrs {
+        read.extend(tree.off.iter().map(|it| (it, Read::Attrs)));
+        read.extend(tree.replaced.iter().map(|it| (it, Read::Replaced)));
+        read.sort_by_key(|(it, _)| (it.text_range().start(), Reverse(it.text_range().end())));
+        for (node, what) in read {
+            match what {
+                Read::Attrs => self.attrs(tree, node, None),
+                Read::Replaced => {
+                    let invoked = ast::Item::cast(node.clone()).and_then(|it| self.invoking_meta(&it));
+                    self.attrs(tree, node, Some(invoked.as_ref()))
+                }
+                Read::Predicate => {
+                    let predicate = ast::CfgPredExpr::cast(node.clone())
+                        .and_then(|it| it.cfg_predicate())
+                        .or_else(|| ast::CfgPredPat::cast(node.clone()).and_then(|it| it.cfg_predicate()));
+                    if let Some(predicate) = predicate {
+                        let anchor = Anchor { file: tree.file, node: node.clone(), include: false };
+                        self.predicate(tree.file, &predicate, &anchor);
+                    }
+                }
+            }
+        }
+        if let Some(call) = tree.call {
+            self.cfg_select(call);
+        }
+    }
+
+    /// The `#[cfg]`s and `#[cfg_attr]`s of `owner`, outer then inner, in order, up to the first
+    /// that is false; for an item an attribute macro replaces (`stop`), up to that macro's.
+    fn attrs(&mut self, tree: &Tree, owner: &SyntaxNode, stop: Option<Option<&ast::Meta>>) {
+        let Some(attrs) = ast::AnyHasAttrs::cast(owner.clone()) else { return };
+        let anchor = Anchor { file: tree.file, node: owner.clone(), include: false };
+        for attr in ast::attrs_including_inner(&attrs) {
             let Some(meta) = attr.meta() else { continue };
-            stack.push(meta);
-            'metas: while let Some(mut meta) = stack.pop() {
-                while let ast::Meta::UnsafeMeta(it) = &meta {
-                    let Some(inner) = it.meta() else { continue 'metas };
-                    meta = inner;
-                }
-                match meta {
-                    ast::Meta::CfgAttrMeta(it) => {
-                        let Some(predicate) = it.cfg_predicate() else { continue };
-                        predicate_leaves(it.syntax(), Form::First, edition, &mut |leaf| {
-                            self.leaf(tree.file, node, edition, leaf, &mut at)
-                        });
-                        if self.cfg.check(&CfgExpr::parse_from_ast(predicate)) != Some(false) {
-                            let len = stack.len();
-                            stack.extend(it.metas());
-                            stack[len..].reverse();
-                        }
-                    }
-                    ast::Meta::CfgMeta(it) => {
-                        predicate_leaves(it.syntax(), Form::Cfg, edition, &mut |leaf| {
-                            self.leaf(tree.file, node, edition, leaf, &mut at)
-                        });
-                        if it
-                            .cfg_predicate()
-                            .is_some_and(|it| self.cfg.check(&CfgExpr::parse_from_ast(it)) == Some(false))
-                        {
-                            break 'attrs;
-                        }
-                    }
-                    _ => {}
-                }
+            if self.meta(tree.file, meta, stop, &anchor).is_break() {
+                return;
             }
         }
     }
 
-    /// The predicate of `cfg!`, the root of its expansion.
-    fn cfg_macro(&mut self, tree: &Tree, edition: Edition, node: &SyntaxNode) {
-        let mut at = None;
-        predicate_leaves(node, Form::First, edition, &mut |leaf| self.leaf(tree.file, node, edition, leaf, &mut at));
-    }
-
-    /// The predicates of the `cfg_select!` call `call`, every branch's, up to where its
-    /// branches no longer parse.
-    fn cfg_select(&mut self, call: MacroCallId) {
-        let db = self.cx.db;
-        let node = call.loc(db).to_node(db);
-        let Some(tt) = ast::MacroCall::cast(node.value.clone()).and_then(|it| it.token_tree()) else { return };
-        let tokens = tokens_of(tt.syntax());
-        let toks = toks_of(&tokens);
-        let [_, inner @ .., _] = &toks[..] else { return };
-        let edition = node.file_id.edition(db);
-        let mut parser = Parser::new(inner, edition);
-        let mut leaves = Vec::new();
-        'branches: while !parser.at_end() {
-            while parser.eat(POUND) {
-                parser.eat(BANG);
-                if !skip_group(&mut parser) {
-                    break 'branches;
-                }
-            }
-            if !parser.eat(UNDERSCORE) {
-                let Some(item) = parser.item() else { break };
-                if entry(&item, &mut leaves).is_err() {
-                    break;
-                }
-            }
-            if !parser.eat(FAT_ARROW) {
-                break;
-            }
-            if parser.peek().is_some_and(|it| it.kind == L_CURLY) {
-                if !skip_group(&mut parser) {
-                    break;
-                }
-                parser.eat(COMMA);
-            } else {
-                let mut depth = 0usize;
-                while let Some(tok) = parser.peek() {
-                    parser.bump();
-                    match tok.kind {
-                        L_PAREN | L_BRACK | L_CURLY => depth += 1,
-                        R_PAREN | R_BRACK | R_CURLY => depth = depth.saturating_sub(1),
-                        COMMA if depth == 0 => break,
-                        _ => {}
-                    }
-                }
-            }
-        }
-        let mut at = None;
-        for leaf in &leaves {
-            self.leaf(node.file_id, &node.value, edition, leaf, &mut at);
-        }
-    }
-
-    /// The lint of `leaf` of a predicate of `owner` in `file`, if `--check-cfg` does not
-    /// expect it, at `at`, the node rustc buffers the lints of `owner`'s predicates at.
-    fn leaf(
+    fn meta(
         &mut self,
         file: HirFileId,
-        owner: &SyntaxNode,
-        edition: Edition,
-        leaf: &Leaf<'_>,
-        at: &mut Option<InFile<SyntaxNodePtr>>,
-    ) {
-        let mut diag = match self.check.expected(&leaf.name) {
-            Some(Expected::Some(set)) if !set.contains(leaf.value.as_ref().map(|it| &*it.0)) => {
-                self.value_lint(file, edition, leaf, &set)
+        meta: ast::Meta,
+        stop: Option<Option<&ast::Meta>>,
+        anchor: &Anchor,
+    ) -> ControlFlow<()> {
+        if let Some(stop) = stop
+            && stop.is_none_or(|it| *it == meta)
+        {
+            return ControlFlow::Break(());
+        }
+        let cfg = self.walk.cfg;
+        match meta {
+            ast::Meta::UnsafeMeta(it) => match it.meta() {
+                Some(meta) => self.meta(file, meta, stop, anchor),
+                None => ControlFlow::Continue(()),
+            },
+            ast::Meta::CfgMeta(it) => {
+                let Some(predicate) = it.cfg_predicate() else { return ControlFlow::Continue(()) };
+                self.predicate(file, &predicate, anchor);
+                match cfg.check(&CfgExpr::parse_from_ast(predicate)) == Some(false) {
+                    true => ControlFlow::Break(()),
+                    false => ControlFlow::Continue(()),
+                }
             }
-            None if self.check.exhaustive_names() => self.name_lint(file, edition, leaf),
+            ast::Meta::CfgAttrMeta(it) => {
+                let Some(predicate) = it.cfg_predicate() else { return ControlFlow::Continue(()) };
+                self.predicate(file, &predicate, anchor);
+                if cfg.check(&CfgExpr::parse_from_ast(predicate)) != Some(false) {
+                    for meta in it.metas() {
+                        self.meta(file, meta, stop, anchor)?;
+                    }
+                }
+                ControlFlow::Continue(())
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    }
+
+    /// The attribute of `item` that invokes the attribute macro replacing it.
+    fn invoking_meta(&self, item: &ast::Item) -> Option<ast::Meta> {
+        let db = self.cx.db;
+        let call = self.cx.sema.expand_attr_macro(item)?.value.file_id.macro_file()?;
+        let loc = call.loc(db);
+        let MacroCallKind::Attr { ast_id, censored_attr_ids, .. } = &loc.kind else { return None };
+        Some(censored_attr_ids.invoc_attr().find_attr_range(db, loc.krate, *ast_id).1)
+    }
+
+    fn predicate(&mut self, file: HirFileId, predicate: &ast::CfgPredicate, anchor: &Anchor) {
+        let mut checks = Vec::new();
+        ast_checks(predicate, &mut checks);
+        for check in checks {
+            self.lint(file, check, anchor);
+        }
+    }
+
+    /// The arms of a `cfg_select!` that `call` is the expansion of, as rustc's
+    /// `parse_cfg_select` reads them, up to the first it cannot.
+    fn cfg_select(&mut self, call: MacroCallId) {
+        let db = self.cx.db;
+        let loc = call.loc(db);
+        if !matches!(loc.def.kind, MacroDefKind::BuiltIn(_, BuiltinFnLikeExpander::CfgSelect)) {
+            return;
+        }
+        let node = loc.to_node(db);
+        let Some(tt) = ast::MacroCall::cast(node.value.clone()).and_then(|it| it.token_tree()) else { return };
+        let tokens: Vec<SyntaxToken> = tt
+            .syntax()
+            .descendants_with_tokens()
+            .filter_map(NodeOrToken::into_token)
+            .filter(|it| !it.kind().is_trivia())
+            .collect();
+        let Some(inner) = tokens.get(1..tokens.len().saturating_sub(1)) else { return };
+        let toks: Vec<meta::Tok<'_>> =
+            inner.iter().map(|it| meta::Tok { kind: it.kind(), text: it.text(), range: it.text_range() }).collect();
+        let anchor = Anchor { file: node.file_id, node: node.value, include: true };
+        let mut checks = Vec::new();
+        let mut parser = meta::Parser::new(&toks, self.cx.edition);
+        while !parser.at_end() {
+            while parser.eat_attr() {}
+            if !parser.eat_underscore() {
+                let Some(predicate) = parser.inner() else { break };
+                meta_checks(&predicate, &mut checks);
+            }
+            if !parser.eat_fat_arrow() || !parser.skip_delimited() {
+                break;
+            }
+        }
+        for check in checks {
+            self.lint(anchor.file, check, &anchor);
+        }
+    }
+
+    /// rustc's `parse_name_value` once the name and value are read: the lint, if the cfg is
+    /// not expected.
+    fn lint(&mut self, file: HirFileId, check: Check, anchor: &Anchor) {
+        let value = check.value.as_ref().map(|(it, _)| it.as_str());
+        let mut diag = match self.expected.get(&check.name) {
+            Some(Some(values)) if !values.contains(value) => self.value_diag(file, &check),
+            None if self.expected.exhaustive_names => self.name_diag(file, &check),
             _ => return,
         };
-        let at = *at.get_or_insert_with(|| lint_at(self.cx, file, owner));
+        let at = self.at(anchor);
         source_fact(self.cx, &mut diag, at);
-        self.out.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));
+        self.emitted.push(Emitted::new(diag, Phase::Resolve, Pass::Buffered, at));
     }
 
     fn span(&self, file: HirFileId, range: TextRange) -> Span {
         self.cx.span(InFile::new(file, range))
     }
 
-    /// The edition of the token at `range`, as rustc has it of the token's span.
-    fn edition_at(&self, file: HirFileId, range: TextRange, edition: Edition) -> Edition {
-        match file.macro_file() {
-            None => edition,
-            Some(call) => call.expansion_span_map(self.cx.db).span_at(range.start()).ctx.edition(self.cx.db),
-        }
-    }
-
-    /// Of the token at `range`: whether rustc's `in_external_macro` holds of its span, and the
-    /// kind and path of the other crate's macro that made it (`outer_expn_data`), if one did.
-    fn macro_of(&self, file: HirFileId, range: TextRange) -> (bool, Option<(&'static str, String)>) {
-        let db = self.cx.db;
-        let Some(call) = file.macro_file() else { return (false, None) };
-        let Some(outer) = call.expansion_span_map(db).span_at(range.start()).ctx.outer_expn(db) else {
-            return (false, None);
-        };
-        let loc = outer.loc(db);
-        let local = hir::Crate::from(loc.def.krate) == self.cx.krate;
-        let external = match loc.kind {
-            MacroCallKind::FnLike { .. } => !local,
-            _ => true,
-        };
-        if local {
-            return (external, None);
-        }
-        let named = match loc.kind {
-            MacroCallKind::FnLike { .. } => ast::MacroCall::cast(loc.to_node(db).value)
-                .and_then(|it| it.path())
-                .map(|path| ("macro", path_text(path.syntax()))),
-            _ => self.cx.expansion_of(outer).map(|it| (it.kind.descr(), it.name)),
-        };
-        (external, named)
-    }
-
     /// rustc's `unexpected_cfg_name`.
-    fn name_lint(&self, file: HirFileId, edition: Edition, leaf: &Leaf<'_>) -> Diag {
-        let (cx, check) = (self.cx, self.check);
-        let name = &*leaf.name;
-        let value = leaf.value.as_ref().map(|it| &*it.0);
-        let name_span = self.span(file, leaf.name_range);
-        let value_span = leaf.value.as_ref().map(|it| self.span(file, it.1));
-        let token_edition = self.edition_at(file, leaf.name_range, edition);
-        let (external, macro_help) = self.macro_of(file, leaf.name_range);
+    fn name_diag(&self, file: HirFileId, check: &Check) -> Diag {
+        let edition = self.cx.edition;
+        let expected = &self.expected;
+        let name = check.name.as_str();
+        let name_span = self.span(file, check.name_range);
+        let value = check.value.as_ref().map(|(it, range)| (it.as_str(), self.span(file, *range)));
+        let origin = self.origin(file, check.name_range);
         let mut diag = Diag::lint(
             "unexpected_cfgs",
-            format!("unexpected `cfg` condition name: `{}`", ident(name, cx.edition)),
-            self.span(file, leaf.range),
+            format!("unexpected `cfg` condition name: `{}`", meta::shown(name, edition)),
+            self.span(file, check.range),
         );
-        let names = check.names();
-        let mut is_feature = name == "feature";
 
-        if is_feature && check.from_cargo {
+        let mut is_feature = name == "feature";
+        let boolean = match name {
+            _ if name.eq_ignore_ascii_case("false") => Some(false),
+            _ if name.eq_ignore_ascii_case("true") => Some(true),
+            _ => None,
+        };
+        if is_feature && self.check.cargo {
             diag.help("consider defining some features in `Cargo.toml`");
-        } else if let Some(value_span) = &value_span
+        } else if let Some((_, value_span)) = &value
             && name == "version"
         {
+            let between = name_span.shrink_to_hi().with_hi(u32::from(value_span.range().start()));
             diag.multipart_suggestion(
                 "there is a similar config predicate: `version(\"..\")`",
-                vec![
-                    (name_span.shrink_to_hi().with_hi(value_span.lo), "(".to_owned()),
-                    (value_span.shrink_to_hi(), ")".to_owned()),
-                ],
+                vec![(between, "(".to_owned()), (value_span.shrink_to_hi(), ")".to_owned())],
                 Applicability::MachineApplicable,
             );
         } else if value.is_none()
-            && !leaf.raw
-            && let Some(boolean) = miscapitalized_boolean(name)
+            && let Some(boolean) = boolean
+            && !check.raw
         {
             diag.suggestion_verbose(
-                name_span,
+                name_span.clone(),
                 format!(
                     "you may have meant to use `{boolean}` (notice the capitalization). Doing so makes this predicate evaluate to `{boolean}` unconditionally"
                 ),
                 boolean.to_string(),
                 Applicability::MachineApplicable,
             );
-        } else if let Some(best) = find_best_match_for_name(&names, name, None) {
+        } else if let Some(best) = find_best_match_for_name(&expected.names, name, None) {
             is_feature |= best == "feature";
-            let best_ident = ident(best, token_edition);
-            let similar = |diag: &mut Diag, span: Span, message: &str, code: String| {
-                diag.suggestion(span, message, code, Applicability::MaybeIncorrect);
-            };
-            match check.expected(best) {
-                Some(Expected::Some(set)) => {
-                    let values = set.values();
-                    let expected = |diag: &mut Diag| {
-                        if !values.is_empty() {
-                            diag.help(format!(
-                                "expected values for `{}` are: {}",
-                                ident(best, cx.edition),
-                                list(&values)
-                            ));
+            let shown = meta::shown(best, edition);
+            let maybe = Applicability::MaybeIncorrect;
+            match expected.get(best).flatten() {
+                Some(best_values) => {
+                    let mut possibilities: Vec<&str> = best_values.order.iter().flatten().copied().collect();
+                    possibilities.sort_unstable();
+                    let expected_values = |diag: &mut Diag| {
+                        if !possibilities.is_empty() {
+                            diag.help(format!("expected values for `{best}` are: {}", listed(&possibilities, |it| it)));
                         }
                     };
-                    match (value, &value_span) {
-                        (Some(value), Some(_)) if set.contains(Some(value)) => similar(
-                            &mut diag,
-                            name_span,
-                            "there is a config with a similar name and value",
-                            best_ident.into_owned(),
-                        ),
-                        (Some(_), Some(value_span)) if set.none => similar(
-                            &mut diag,
-                            name_span.to(value_span),
-                            "there is a config with a similar name and no value",
-                            best_ident.into_owned(),
-                        ),
-                        (Some(_), Some(value_span)) => {
-                            let code = match values.first() {
-                                Some(first) => format!("{best_ident} = \"{first}\""),
-                                None => best_ident.into_owned(),
-                            };
-                            similar(
-                                &mut diag,
-                                name_span.to(value_span),
-                                "there is a config with a similar name and different values",
-                                code,
-                            );
-                            expected(&mut diag);
+                    match &value {
+                        Some((value, value_span)) => {
+                            let both = name_span.to(value_span);
+                            if best_values.contains(Some(*value)) {
+                                diag.suggestion(
+                                    name_span.clone(),
+                                    "there is a config with a similar name and value",
+                                    shown,
+                                    maybe,
+                                );
+                            } else if best_values.contains(None) {
+                                diag.suggestion(both, "there is a config with a similar name and no value", shown, maybe);
+                            } else {
+                                expected_values(&mut diag);
+                                let code = match possibilities.first() {
+                                    Some(first) => format!("{shown} = \"{first}\""),
+                                    None => shown.into_owned(),
+                                };
+                                diag.suggestion(both, "there is a config with a similar name and different values", code, maybe);
+                            }
                         }
-                        _ => {
-                            similar(&mut diag, name_span, "there is a config with a similar name", best_ident.into_owned());
-                            expected(&mut diag);
+                        None => {
+                            expected_values(&mut diag);
+                            diag.suggestion(name_span.clone(), "there is a config with a similar name", shown, maybe);
                         }
                     }
                 }
-                _ => similar(&mut diag, name_span, "there is a config with a similar name", best_ident.into_owned()),
+                None => {
+                    diag.suggestion(name_span.clone(), "there is a config with a similar name", shown, maybe);
+                }
             }
         } else {
-            if value.is_none() {
-                let similar_values: SmallVec<[&str; 3]> = names
+            let mut similar: Vec<&str> = match value {
+                Some(_) => Vec::new(),
+                None => expected
+                    .names
                     .iter()
-                    .copied()
-                    .filter(|it| matches!(check.expected(it), Some(Expected::Some(set)) if set.contains(Some(name))))
-                    .take(4)
-                    .collect();
-                if similar_values.len() <= 3 {
-                    for cfg_name in similar_values {
-                        diag.suggestion(
-                            name_span.clone(),
-                            "found config with similar value",
-                            format!("{cfg_name} = \"{name}\""),
-                            Applicability::MaybeIncorrect,
-                        );
-                    }
+                    .zip(&expected.values)
+                    .filter(|(_, values)| values.as_ref().is_some_and(|it| it.contains(Some(name))))
+                    .map(|(it, _)| *it)
+                    .collect(),
+            };
+            if !similar.is_empty() && similar.len() <= 3 {
+                similar.sort_unstable();
+                for it in similar {
+                    diag.suggestion(
+                        name_span.clone(),
+                        "found config with similar value",
+                        format!("{it} = \"{name}\""),
+                        Applicability::MaybeIncorrect,
+                    );
                 }
             }
-            let total = names.len();
-            let mut shown: Vec<&str> = match check.all_expected {
-                true => names,
-                false => names.into_iter().filter(|it| super::well_known(it).is_none()).collect(),
-            };
-            shown.sort_unstable();
-            let listed = if check.all_expected { shown.len() } else { shown.len().min(MAX_LISTED) };
-            shown.truncate(listed);
-            if !shown.is_empty() {
-                let shown: Vec<Cow<'_, str>> = shown.iter().map(|it| ident(it, token_edition)).collect();
-                let more = match total - listed {
+            let mut names: Vec<&str> =
+                expected.names.iter().copied().filter(|it| !expected.well_known.contains(it)).collect();
+            names.sort_unstable();
+            let shown = names.len().min(MAX_SHOWN);
+            let and_more = expected.names.len() - shown;
+            names.truncate(shown);
+            if !names.is_empty() {
+                let more = match and_more {
                     0 => String::new(),
                     n => format!(" and {n} more"),
                 };
-                diag.sub(Sublevel::Help, format!("expected names are: {}{more}", list(&shown)), MultiSpan::default(), true);
+                let listed = listed(&names, |it| meta::shown(it, edition));
+                diag.sub(Sublevel::Help, format!("expected names are: {listed}{more}"), MultiSpan::default(), true);
             }
         }
 
-        let check_cfg_arg = |escape: bool| to_check_cfg_arg(&ident(name, token_edition), value, escape);
-        if check.from_cargo {
-            macro_note(&mut diag, &macro_help);
-            if !is_feature && !external {
-                self.cargo_help(&mut diag, &check_cfg_arg);
+        let arg = |quotes| check_cfg_arg(&meta::shown(name, edition), value.as_ref().map(|(it, _)| *it), quotes);
+        if self.check.cargo {
+            self.macro_help(&mut diag, &origin);
+            if !is_feature && !origin.external {
+                self.cargo_help(&mut diag, &arg);
             }
-            diag.note(SEE_CARGO);
+            diag.note(CARGO_NOTE);
         } else {
-            macro_note(&mut diag, &macro_help);
-            diag.help(format!("to expect this configuration use `--check-cfg={}`", check_cfg_arg(false)));
-            diag.note(SEE_RUSTC);
+            self.macro_help(&mut diag, &origin);
+            diag.help(format!("to expect this configuration use `--check-cfg={}`", arg(false)));
+            diag.note(RUSTC_NOTE);
         }
         diag
     }
 
     /// rustc's `unexpected_cfg_value`.
-    fn value_lint(&self, file: HirFileId, edition: Edition, leaf: &Leaf<'_>, set: &Set<'_>) -> Diag {
-        let (cx, check) = (self.cx, self.check);
-        let name = &*leaf.name;
-        let value = leaf.value.as_ref().map(|it| &*it.0);
-        let name_span = self.span(file, leaf.name_range);
-        let value_span = leaf.value.as_ref().map(|it| self.span(file, it.1));
-        let token_edition = self.edition_at(file, leaf.name_range, edition);
-        let (external, macro_help) = self.macro_of(file, leaf.name_range);
-        let message = match value {
-            Some(value) => format!("unexpected `cfg` condition value: `{value}`"),
+    fn value_diag(&self, file: HirFileId, check: &Check) -> Diag {
+        let edition = self.cx.edition;
+        let expected = &self.expected;
+        let name = check.name.as_str();
+        let name_span = self.span(file, check.name_range);
+        let value = check.value.as_ref().map(|(it, range)| (it.as_str(), self.span(file, *range)));
+        let origin = self.origin(file, check.name_range);
+        let message = match &value {
+            Some((value, _)) => format!("unexpected `cfg` condition value: `{value}`"),
             None => "unexpected `cfg` condition value: (none)".to_owned(),
         };
-        let mut diag = Diag::lint("unexpected_cfgs", message, self.span(file, leaf.range));
-        let possibilities = set.values();
-        let well_known = super::well_known(name).is_some();
-        let renames: Vec<&str> = match value {
-            Some(value) if well_known => {
-                let mut renames: Vec<&str> = super::WELL_KNOWN
+        let mut diag = Diag::lint("unexpected_cfgs", message, self.span(file, check.range));
+        let Some(Some(values)) = expected.get(name) else { return diag };
+        let have_none = values.contains(None);
+        let possibilities: Vec<&str> = values.order.iter().flatten().copied().collect();
+        let is_well_known = expected.well_known.contains(name);
+        let maybe = Applicability::MaybeIncorrect;
+
+        let valid_names: Vec<&str> = match &value {
+            Some((value, _)) if is_well_known => {
+                let mut names: Vec<&str> = well_known::WELL_KNOWN
                     .iter()
-                    .map(|it| it.0)
-                    .filter(|it| matches!(check.expected(it), Some(Expected::Some(set)) if set.contains(Some(value))))
+                    .map(|&(it, ..)| it)
+                    .filter(|it| expected.has_value(it, Some(*value)))
                     .collect();
-                renames.sort_unstable();
-                renames
+                names.sort_unstable();
+                names
             }
             _ => Vec::new(),
         };
-
-        if let Some(value) = value
-            && !renames.is_empty()
+        if let Some((value, _)) = &value
+            && !valid_names.is_empty()
         {
-            for rename in renames.iter().take(3) {
+            for it in valid_names.into_iter().take(3) {
                 diag.suggestion_verbose(
                     name_span.clone(),
-                    format!("`{}` is an expected value for `{}`", ident(value, cx.edition), ident(rename, cx.edition)),
-                    rename.to_string(),
-                    Applicability::MaybeIncorrect,
+                    format!("`{value}` is an expected value for `{it}`"),
+                    it,
+                    maybe,
                 );
             }
         } else if !possibilities.is_empty() {
-            let listed = if check.all_expected { possibilities.len() } else { possibilities.len().min(MAX_LISTED) };
-            let more = match possibilities.len() - listed {
+            let mut sorted = possibilities.clone();
+            sorted.sort_unstable();
+            let shown = sorted.len().min(MAX_SHOWN);
+            let and_more = sorted.len() - shown;
+            sorted.truncate(shown);
+            let none = if have_none { "(none), " } else { "" };
+            let more = match and_more {
                 0 => String::new(),
                 n => format!(" and {n} more"),
             };
-            diag.note(format!(
-                "expected values for `{}` are: {}{}{more}",
-                ident(name, cx.edition),
-                if set.none { "(none), " } else { "" },
-                list(&possibilities[..listed]),
-            ));
-            if let (Some(value), Some(value_span)) = (value, &value_span) {
-                if let Some(best) = find_best_match_for_name(&possibilities, value, None) {
-                    diag.suggestion(
-                        value_span.clone(),
-                        "there is a expected value with a similar name",
-                        format!("\"{best}\""),
-                        Applicability::MaybeIncorrect,
-                    );
+            diag.note(format!("expected values for `{name}` are: {none}{}{more}", listed(&sorted, |it| it)));
+            match &value {
+                Some((value, value_span)) => {
+                    if let Some(best) = find_best_match_for_name(&possibilities, value, None) {
+                        diag.suggestion(
+                            value_span.clone(),
+                            "there is a expected value with a similar name",
+                            format!("\"{best}\""),
+                            maybe,
+                        );
+                    }
                 }
-            } else if let [first] = &possibilities[..] {
-                diag.suggestion(
-                    name_span.shrink_to_hi(),
-                    "specify a config value",
-                    format!(" = \"{first}\""),
-                    Applicability::MaybeIncorrect,
-                );
+                None => {
+                    if let [only] = possibilities[..] {
+                        diag.suggestion(name_span.shrink_to_hi(), "specify a config value", format!(" = \"{only}\""), maybe);
+                    }
+                }
             }
-        } else if set.none {
-            diag.note(format!("no expected value for `{}`", ident(name, cx.edition)));
-            if let Some(value_span) = &value_span {
-                diag.suggestion(
-                    name_span.shrink_to_hi().to(value_span),
-                    "remove the value",
-                    "",
-                    Applicability::MaybeIncorrect,
-                );
+        } else if have_none {
+            if let Some((_, value_span)) = &value {
+                diag.suggestion(name_span.shrink_to_hi().to(value_span), "remove the value", "", maybe);
             }
+            diag.note(format!("no expected value for `{name}`"));
         } else {
-            diag.note(format!("no expected values for `{}`", ident(name, cx.edition)));
-            let span = match &value_span {
-                Some(value_span) => name_span.to(value_span),
+            let span = match &value {
+                Some((_, value_span)) => name_span.to(value_span),
                 None => name_span.clone(),
             };
-            diag.suggestion(span, "remove the condition", "", Applicability::MaybeIncorrect);
+            diag.suggestion(span, "remove the condition", "", maybe);
+            diag.note(format!("no expected values for `{name}`"));
         }
 
-        let check_cfg_arg = |escape: bool| to_check_cfg_arg(&ident(name, token_edition), value, escape);
-        if check.from_cargo {
-            if name == "feature" && !external {
-                match value {
-                    Some(value) => diag.help(format!(
-                        "consider adding `{}` as a feature in `Cargo.toml`",
-                        ident(value, cx.edition)
-                    )),
+        let can_add_value = !is_well_known;
+        let arg = |quotes| check_cfg_arg(&meta::shown(name, edition), value.as_ref().map(|(it, _)| *it), quotes);
+        if self.check.cargo {
+            if name == "feature" && !origin.external {
+                match &value {
+                    Some((value, _)) => diag.help(format!("consider adding `{value}` as a feature in `Cargo.toml`")),
                     None => diag.help("consider defining some features in `Cargo.toml`"),
                 };
-            } else if !well_known && !external {
-                self.cargo_help(&mut diag, &check_cfg_arg);
+            } else if can_add_value && !origin.external {
+                self.cargo_help(&mut diag, &arg);
             }
-            macro_note(&mut diag, &macro_help);
-            diag.note(SEE_CARGO);
+            self.macro_help(&mut diag, &origin);
+            diag.note(CARGO_NOTE);
         } else {
-            if !well_known {
-                diag.help(format!("to expect this configuration use `--check-cfg={}`", check_cfg_arg(false)));
+            if can_add_value {
+                diag.help(format!("to expect this configuration use `--check-cfg={}`", arg(false)));
             }
-            macro_note(&mut diag, &macro_help);
-            diag.note(SEE_RUSTC);
+            self.macro_help(&mut diag, &origin);
+            diag.note(RUSTC_NOTE);
         }
         diag
     }
 
-    /// rustc's `cargo_help_sub`: no `build.rs` way for a build script itself.
-    fn cargo_help(&self, diag: &mut Diag, check_cfg_arg: &dyn Fn(bool) -> String) {
+    /// rustc's `cargo_help_sub`: no `build.rs` help in a build script.
+    fn cargo_help(&self, diag: &mut Diag, arg: &dyn Fn(bool) -> String) {
+        let unescaped = arg(false);
         diag.help("consider using a Cargo feature instead");
         diag.help(format!(
-            "or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:\n [lints.rust]\n unexpected_cfgs = {{ level = \"warn\", check-cfg = ['{}'] }}",
-            check_cfg_arg(false)
+            "or consider adding in `Cargo.toml` the `check-cfg` lint config for the lint:\n [lints.rust]\n unexpected_cfgs = {{ level = \"warn\", check-cfg = ['{unescaped}'] }}"
         ));
-        let build_script = self
-            .cx
-            .krate
-            .display_name(self.cx.db)
-            .is_some_and(|it| it.crate_name().as_str() == "build_script_build");
-        if !build_script {
+        if !self.build_script {
             diag.help(format!(
                 "or consider adding `println!(\"cargo::rustc-check-cfg={}\");` to the top of the `build.rs`",
-                check_cfg_arg(true)
+                arg(true)
             ));
         }
     }
-}
 
-/// `UnexpectedCfgRustcMacroHelp` and `UnexpectedCfgCargoMacroHelp`.
-fn macro_note(diag: &mut Diag, macro_help: &Option<(&'static str, String)>) {
-    if let Some((kind, name)) = macro_help {
-        diag.note(format!(
-            "using a cfg inside a {kind} will use the cfgs from the destination crate and not the ones from the defining crate"
-        ));
-        diag.help(format!("try referring to `{name}` crate for guidance on how handle this unexpected cfg"));
-    }
-}
-
-fn miscapitalized_boolean(name: &str) -> Option<bool> {
-    if name.eq_ignore_ascii_case("false") {
-        Some(false)
-    } else if name.eq_ignore_ascii_case("true") {
-        Some(true)
-    } else {
-        None
-    }
-}
-
-/// rustc's `to_check_cfg_arg`: with `escape`, its quotes escaped for `println!` in a shell.
-fn to_check_cfg_arg(name: &str, value: Option<&str>, escape: bool) -> String {
-    let Some(value) = value else { return format!("cfg({name})") };
-    let value = value.escape_debug().to_string();
-    let values = match escape {
-        true => format!("\\\"{}\\\"", value.replace('"', "\\\\\\\\\"")),
-        false => format!("\"{value}\""),
-    };
-    format!("cfg({name}, values({values}))")
-}
-
-/// Each leaf of the predicate of the `cfg` attribute, `cfg_attr` attribute or `cfg!`
-/// expansion `node`, as rustc parses it.
-fn predicate_leaves(node: &SyntaxNode, form: Form, edition: Edition, each: &mut dyn FnMut(&Leaf<'_>)) {
-    let tokens = tokens_of(node);
-    let toks = toks_of(&tokens);
-    let Some(open) = toks.iter().position(|it| it.kind == L_PAREN) else { return };
-    let mut leaves = Vec::new();
-    match form {
-        Form::Cfg => {
-            if open != 1 || toks.last().is_none_or(|it| it.kind != R_PAREN) {
-                return;
-            }
-            let mut parser = Parser::new(&toks[open + 1..toks.len() - 1], edition);
-            if let Some(items) = parser.items_to_end()
-                && let [item] = &items[..]
-            {
-                let _ = entry(item, &mut leaves);
-            }
+    /// rustc's `rustc_macro_help` and `cargo_macro_help`, which say the same.
+    fn macro_help(&self, diag: &mut Diag, origin: &Origin) {
+        if let Some((kind, path)) = &origin.macro_help {
+            diag.note(format!(
+                "using a cfg inside a {kind} will use the cfgs from the destination crate and not the ones from the defining crate"
+            ));
+            diag.help(format!("try referring to `{path}` crate for guidance on how handle this unexpected cfg"));
         }
-        Form::First => {
-            if let Some(item) = Parser::new(&toks[open + 1..], edition).item() {
-                let _ = entry(&item, &mut leaves);
+    }
+
+    /// Of the name at `range` of `file`: whether a macro made it, and which.
+    fn origin(&self, file: HirFileId, range: TextRange) -> Origin {
+        let db = self.cx.db;
+        let Some(call) = file.macro_file() else { return Origin::default() };
+        let written = InFile::new(file, range)
+            .original_node_file_range_opt(db)
+            .is_some_and(|(_, ctxt)| ctxt.is_root());
+        if written {
+            return Origin::default();
+        }
+        let loc = call.loc(db);
+        let other_crate = hir::Crate::from(loc.def.krate) != self.cx.krate;
+        let (kind, bang) = match &loc.kind {
+            MacroCallKind::FnLike { .. } => ("macro", true),
+            MacroCallKind::Derive { .. } => ("derive macro", false),
+            MacroCallKind::Attr { .. } => ("attribute macro", false),
+        };
+        let macro_help = match other_crate {
+            true => self.macro_path(call).map(|it| (kind, it)),
+            false => None,
+        };
+        Origin { external: !bang || other_crate, macro_help }
+    }
+
+    /// The path of the macro `call` calls, as written (rustc's name of an `ExpnKind::Macro`).
+    fn macro_path(&self, call: MacroCallId) -> Option<String> {
+        let db = self.cx.db;
+        let loc = call.loc(db);
+        let node = loc.to_node(db).value;
+        let path = |it: ast::Path| -> String { it.syntax().text().to_string().split_whitespace().collect() };
+        match &loc.kind {
+            MacroCallKind::FnLike { .. } => ast::MacroCall::cast(node)?.path().map(path),
+            MacroCallKind::Derive { derive_index, .. } => {
+                let attr = ast::Attr::cast(node)?;
+                derive_paths(&attr).into_iter().nth(*derive_index as usize).map(|(_, it)| it)
+            }
+            MacroCallKind::Attr { ast_id, censored_attr_ids, .. } => {
+                censored_attr_ids.invoc_attr().find_attr_range(db, loc.krate, *ast_id).1.path().map(path)
             }
         }
     }
-    for leaf in &leaves {
-        each(leaf);
-    }
-}
 
-/// rustc's `parse_cfg_entry`: the leaves of `item` up to where it stops, and whether it parsed.
-fn entry<'t>(item: &Item<'t>, leaves: &mut Vec<Leaf<'t>>) -> Result<(), ()> {
-    let meta = match item {
-        Item::Lit(lit) => return if lit.kind == LitKind::Bool { Ok(()) } else { Err(()) },
-        Item::Meta(meta) => meta,
-    };
-    match &meta.kind {
-        Kind::List(list) => match meta.word().filter(|it| !it.keyword).map(|it| it.name) {
-            Some("not") => match &list[..] {
-                [single] => entry(single, leaves),
-                _ => Err(()),
-            },
-            Some("any" | "all") => {
-                for sub in list {
-                    let _ = entry(sub, leaves);
+    /// The node the lint of a cfg read at `anchor` is buffered for: the nearest that has an id
+    /// when rustc reads it, through the macro call an expansion came from and the `mod` item a
+    /// file is the module of.
+    fn at(&self, anchor: &Anchor) -> InFile<SyntaxNodePtr> {
+        let cx = self.cx;
+        let (mut file, mut node, mut include) = (anchor.file, anchor.node.clone(), anchor.include);
+        loop {
+            let start = if include { Some(node.clone()) } else { node.parent() };
+            let mut top = node.clone();
+            for it in std::iter::successors(start, |it| it.parent()) {
+                if has_lint_id(&it) {
+                    return InFile::new(file, SyntaxNodePtr::new(&it));
                 }
-                Ok(())
+                top = it;
+            }
+            if let Some(call) = file.macro_file() {
+                let loc = call.loc(cx.db);
+                let called = loc.to_node(cx.db);
+                include = !matches!(loc.kind, MacroCallKind::Attr { .. });
+                (file, node) = (called.file_id, called.value);
+                continue;
+            }
+            let declared = match file == self.root {
+                true => None,
+                false => cx
+                    .sema
+                    .hir_file_to_module_defs(file)
+                    .find(|it| it.krate(cx.db) == cx.krate)
+                    .and_then(|it| it.declaration_source(cx.db)),
+            };
+            let Some(declared) = declared else { return InFile::new(file, SyntaxNodePtr::new(&top)) };
+            (file, node, include) = (declared.file_id, declared.value.syntax().clone(), false);
+        }
+    }
+}
+
+const RUSTC_NOTE: &str = "see <https://doc.rust-lang.org/nightly/rustc/check-cfg.html> for more information about checking conditional configuration";
+const CARGO_NOTE: &str = "see <https://doc.rust-lang.org/nightly/rustc/check-cfg/cargo-specifics.html> for more information about checking conditional configuration";
+
+/// rustc's `to_check_cfg_arg`, the value's quotes escaped for `build.rs` (`quotes`).
+fn check_cfg_arg(name: &str, value: Option<&str>, quotes: bool) -> String {
+    match value {
+        Some(value) => {
+            let value = value.escape_debug().to_string();
+            let values = match quotes {
+                true => format!("\\\"{}\\\"", value.replace('"', "\\\\\\\\\"")),
+                false => format!("\"{value}\""),
+            };
+            format!("cfg({name}, values({values}))")
+        }
+        None => format!("cfg({name})"),
+    }
+}
+
+/// rustc's `DiagSymbolList`: each in backticks, joined by `and` (with commas from three).
+fn listed<'s, S: std::fmt::Display>(items: &[&'s str], show: impl Fn(&'s str) -> S) -> String {
+    let items: Vec<String> = items.iter().map(|&it| format!("`{}`", show(it))).collect();
+    match items.as_slice() {
+        [] => String::new(),
+        [one] => one.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
+}
+
+/// Whether rustc's expansion has given `node` an id by the time it reads the cfgs in it: an
+/// item, a statement with a `;`, an expression, a pattern, a type and the other nodes
+/// `assign_id!` numbers; not a macro call, nor a block that is not an expression (a function's
+/// body, a loop's, the `then` of an `if`, the `else` of a `let`).
+fn has_lint_id(node: &SyntaxNode) -> bool {
+    use SyntaxKind::*;
+    let kind = node.kind();
+    match kind {
+        MACRO_CALL | MACRO_EXPR | MACRO_PAT | MACRO_TYPE | MACRO_ITEMS | MACRO_STMTS | SOURCE_FILE => false,
+        BLOCK_EXPR => !bare_block(node),
+        VARIANT | WHERE_PRED | RECORD_FIELD | TUPLE_FIELD | RECORD_PAT_FIELD | RECORD_EXPR_FIELD | PARAM | SELF_PARAM
+        | TYPE_PARAM | LIFETIME_PARAM | CONST_PARAM | MATCH_ARM | LET_STMT => true,
+        EXPR_STMT => ast::ExprStmt::cast(node.clone()).is_some_and(|it| it.semicolon_token().is_some()),
+        _ => ast::Item::can_cast(kind) || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind) || ast::Type::can_cast(kind),
+    }
+}
+
+/// Whether the block `node` is one rustc's AST has as a block, not as an expression.
+fn bare_block(node: &SyntaxNode) -> bool {
+    let Some(parent) = node.parent() else { return false };
+    let body = match parent.kind() {
+        SyntaxKind::FN | SyntaxKind::LET_ELSE => return true,
+        SyntaxKind::IF_EXPR => ast::IfExpr::cast(parent).and_then(|it| it.then_branch()),
+        SyntaxKind::LOOP_EXPR => ast::LoopExpr::cast(parent).and_then(|it| it.loop_body()),
+        SyntaxKind::WHILE_EXPR => ast::WhileExpr::cast(parent).and_then(|it| it.loop_body()),
+        SyntaxKind::FOR_EXPR => ast::ForExpr::cast(parent).and_then(|it| it.loop_body()),
+        _ => None,
+    };
+    body.is_some_and(|it| it.syntax() == node)
+}
+
+/// rustc's `parse_cfg_entry` of a predicate as the AST has it: each name it checks, in order.
+/// What rustc refuses (`not` of other than one, a list it does not know, a value that is no
+/// string) checks nothing in it.
+fn ast_checks(predicate: &ast::CfgPredicate, out: &mut Vec<Check>) {
+    match predicate {
+        ast::CfgPredicate::CfgAtom(atom) => {
+            if let Some(check) = atom_check(atom, None) {
+                out.push(check);
+            }
+        }
+        ast::CfgPredicate::CfgComposite(composite) => {
+            let Some(keyword) = composite.keyword() else { return };
+            match keyword.text() {
+                "any" | "all" => composite.cfg_predicates().for_each(|it| ast_checks(&it, out)),
+                "not" => {
+                    let mut predicates = composite.cfg_predicates();
+                    if let (Some(only), None) = (predicates.next(), predicates.next()) {
+                        ast_checks(&only, out);
+                    }
+                }
+                "target" => {
+                    for it in composite.cfg_predicates() {
+                        let ast::CfgPredicate::CfgAtom(atom) = it else { continue };
+                        if atom.eq_token().is_none() {
+                            continue;
+                        }
+                        if let Some(ident) = atom.ident_token()
+                            && meta::is_path_segment_keyword(ident.text())
+                        {
+                            return;
+                        }
+                        if let Some(check) = atom_check(&atom, Some("target_")) {
+                            out.push(check);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// The check of `name` or `name = "value"`, its name prefixed in `target(..)`, where the
+/// whole is the name's span too.
+fn atom_check(atom: &ast::CfgAtom, prefix: Option<&str>) -> Option<Check> {
+    let ident = atom.ident_token()?;
+    let text = ident.text();
+    let (name, raw) = match text.strip_prefix("r#") {
+        Some(name) => (name, true),
+        None => (text, false),
+    };
+    if meta::is_path_segment_keyword(name) {
+        return None;
+    }
+    let value = match atom.eq_token() {
+        None => None,
+        Some(_) => {
+            let token = atom.string_token()?;
+            let value = ast::String::cast(token.clone())?.value().ok()?.into_owned();
+            Some((value, token.text_range()))
+        }
+    };
+    let range = atom.syntax().text_range();
+    Some(match prefix {
+        Some(prefix) => Check { name: format!("{prefix}{name}"), raw, name_range: range, value, range },
+        None => Check { name: name.to_owned(), raw, name_range: ident.text_range(), value, range },
+    })
+}
+
+/// rustc's `parse_cfg_entry` of a predicate it parsed from tokens (`cfg_select!`'s).
+fn meta_checks(inner: &meta::Inner<'_>, out: &mut Vec<Check>) {
+    let Some(item) = inner.meta() else { return };
+    match &item.kind {
+        meta::Kind::List(list) => match item.ident().map(|it| it.name) {
+            Some("any" | "all") => list.iter().for_each(|it| meta_checks(it, out)),
+            Some("not") => {
+                if let [only] = list.as_slice() {
+                    meta_checks(only, out);
+                }
             }
             Some("target") => {
                 for sub in list {
-                    let Item::Meta(sub) = sub else { continue };
-                    let (Kind::NameValue(lit), Some(key)) = (&sub.kind, sub.word()) else { continue };
-                    if key.keyword {
-                        return Err(());
+                    let Some(meta) = sub.meta() else { continue };
+                    let (Some(ident), meta::Kind::NameValue(lit)) = (meta.ident(), &meta.kind) else { continue };
+                    if meta::is_path_segment_keyword(ident.name) {
+                        return;
                     }
-                    let name = Cow::Owned(format!("target_{}", key.name));
-                    let _ = name_value(name, false, sub.range, Some(lit), sub.range, leaves);
-                }
-                Ok(())
-            }
-            Some("version") => Ok(()),
-            _ => Err(()),
-        },
-        Kind::Word | Kind::NameValue(_) => {
-            let Some(name) = meta.word().filter(|it| !it.keyword) else { return Err(()) };
-            let value = match &meta.kind {
-                Kind::NameValue(lit) => Some(lit),
-                _ => None,
-            };
-            name_value(Cow::Borrowed(name.name), name.raw, meta.path_range, value, meta.range, leaves)
-        }
-    }
-}
-
-/// rustc's `parse_name_value`: the leaf, when its value is a string.
-fn name_value<'t>(
-    name: Cow<'t, str>,
-    raw: bool,
-    name_range: TextRange,
-    value: Option<&meta::Lit<'t>>,
-    range: TextRange,
-    leaves: &mut Vec<Leaf<'t>>,
-) -> Result<(), ()> {
-    let value = match value {
-        None => None,
-        Some(lit) => Some((lit.str_value().ok_or(())?, lit.range)),
-    };
-    leaves.push(Leaf { name, raw, name_range, value, range });
-    Ok(())
-}
-
-/// Skips the delimited group at the parser, which must start with an open delimiter.
-fn skip_group(parser: &mut Parser<'_, '_>) -> bool {
-    if !parser.peek().is_some_and(|it| matches!(it.kind, L_PAREN | L_BRACK | L_CURLY)) {
-        return false;
-    }
-    let mut depth = 0usize;
-    while let Some(tok) = parser.peek() {
-        parser.bump();
-        match tok.kind {
-            L_PAREN | L_BRACK | L_CURLY => depth += 1,
-            R_PAREN | R_BRACK | R_CURLY => {
-                depth -= 1;
-                if depth == 0 {
-                    return true;
+                    let Some(value) = lit.value_str() else { continue };
+                    out.push(Check {
+                        name: format!("target_{}", ident.name),
+                        raw: ident.raw,
+                        name_range: sub.range(),
+                        value: Some((value.into_owned(), lit.range)),
+                        range: sub.range(),
+                    });
                 }
             }
             _ => {}
-        }
-    }
-    false
-}
-
-fn tokens_of(node: &SyntaxNode) -> Vec<syntax::SyntaxToken> {
-    node.descendants_with_tokens()
-        .filter_map(|it| it.into_token())
-        .filter(|it| !it.kind().is_trivia())
-        .collect()
-}
-
-fn toks_of(tokens: &[syntax::SyntaxToken]) -> Vec<Tok<'_>> {
-    meta::glue(tokens.iter().map(|it| Tok { kind: it.kind(), text: it.text(), range: it.text_range() }).collect())
-}
-
-/// A path as rustc prints it: its tokens without what is between them.
-fn path_text(path: &SyntaxNode) -> String {
-    tokens_of(path).iter().map(|it| it.text()).collect()
-}
-
-/// The node rustc buffers a lint of `node`'s predicates at (`lint_node_id`): rustc evaluates
-/// a node's `cfg`s before the node has an id, so the nearest node around it that has one,
-/// through the `mod` item a file is of and the call an expansion is of.
-fn lint_at(cx: &Cx<'_, '_>, file: HirFileId, node: &SyntaxNode) -> InFile<SyntaxNodePtr> {
-    let db = cx.db;
-    let (mut file, mut node) = (file, node.clone());
-    loop {
-        let mut top = node.clone();
-        for ancestor in node.ancestors().skip(1) {
-            if has_id(&ancestor) {
-                return InFile::new(file, SyntaxNodePtr::new(&ancestor));
-            }
-            top = ancestor;
-        }
-        match file.macro_file() {
-            Some(call) => {
-                let called = call.loc(db).to_node(db);
-                file = called.file_id;
-                node = match called.value.kind() {
-                    ATTR => called.value.parent().unwrap_or(called.value),
-                    _ => called.value,
-                };
-            }
-            None => {
-                let declared = cx
-                    .sema
-                    .hir_file_to_module_def(file)
-                    .filter(|it| !it.is_crate_root(db))
-                    .and_then(|it| it.declaration_source(db));
-                let Some(declared) = declared else { return InFile::new(file, SyntaxNodePtr::new(&top)) };
-                if top != node {
-                    return declared.map(|it| SyntaxNodePtr::new(it.syntax()));
-                }
-                file = declared.file_id;
-                node = declared.value.syntax().clone();
-            }
+        },
+        meta::Kind::Word | meta::Kind::NameValue(_) => {
+            let Some(ident) = item.ident().filter(|it| !meta::is_path_segment_keyword(it.name)) else { return };
+            let value = match &item.kind {
+                meta::Kind::NameValue(lit) => match lit.value_str() {
+                    Some(value) => Some((value.into_owned(), lit.range)),
+                    None => return,
+                },
+                _ => None,
+            };
+            out.push(Check {
+                name: ident.name.to_owned(),
+                raw: ident.raw,
+                name_range: item.path_range(),
+                value,
+                range: item.range,
+            });
         }
     }
 }
 
-/// Whether rustc gives the node a `NodeId` it buffers lints at as it expands what is in it
-/// (`assign_id!`).
-fn has_id(node: &SyntaxNode) -> bool {
-    let kind = node.kind();
-    match kind {
-        MACRO_CALL | MACRO_EXPR | MACRO_PAT | MACRO_TYPE => false,
-        VARIANT | WHERE_PRED | RECORD_FIELD | TUPLE_FIELD | RECORD_PAT_FIELD | RECORD_EXPR_FIELD | PARAM
-        | SELF_PARAM | TYPE_PARAM | LIFETIME_PARAM | CONST_PARAM | MATCH_ARM | LET_STMT => true,
-        BLOCK_EXPR => !is_body(node),
-        _ => is_item_expr_pat_or_type(kind),
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-fn is_item_expr_pat_or_type(kind: SyntaxKind) -> bool {
-    ast::Item::can_cast(kind) || ast::Expr::can_cast(kind) || ast::Pat::can_cast(kind) || ast::Type::can_cast(kind)
-}
+    #[test]
+    fn check_cfg_args_are_written_as_rustc_writes_them() {
+        assert_eq!(check_cfg_arg("foo", None, false), "cfg(foo)");
+        assert_eq!(check_cfg_arg("foo", Some("bar"), false), r#"cfg(foo, values("bar"))"#);
+        assert_eq!(check_cfg_arg("foo", Some("bar"), true), r#"cfg(foo, values(\"bar\"))"#);
+        assert_eq!(check_cfg_arg("quote", Some("quote\""), false), r#"cfg(quote, values("quote\""))"#);
+        assert_eq!(check_cfg_arg("quote", Some("quote\""), true), r#"cfg(quote, values(\"quote\\\\\"\"))"#);
+    }
 
-/// Whether the block is a function's or loop's body or an `if`'s branch taken when it holds:
-/// a `Block` in rustc's AST, not an expression.
-fn is_body(block: &SyntaxNode) -> bool {
-    let Some(parent) = block.parent() else { return false };
-    let is = |it: Option<ast::BlockExpr>| it.is_some_and(|it| it.syntax() == block);
-    if let Some(it) = ast::Fn::cast(parent.clone()) {
-        return is(it.body());
+    #[test]
+    fn lists_are_joined_as_rustc_joins_them() {
+        assert_eq!(listed(&["a"], |it| it), "`a`");
+        assert_eq!(listed(&["a", "b"], |it| it), "`a` and `b`");
+        assert_eq!(listed(&["a", "b", "c"], |it| it), "`a`, `b`, and `c`");
     }
-    if let Some(it) = ast::WhileExpr::cast(parent.clone()) {
-        return is(it.loop_body());
-    }
-    if let Some(it) = ast::ForExpr::cast(parent.clone()) {
-        return is(it.loop_body());
-    }
-    if let Some(it) = ast::LoopExpr::cast(parent.clone()) {
-        return is(it.loop_body());
-    }
-    if let Some(it) = ast::IfExpr::cast(parent) {
-        return is(it.then_branch());
-    }
-    false
 }

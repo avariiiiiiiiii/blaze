@@ -8,15 +8,17 @@
 //! init functions [`Class::InitArray`] pieces of their priority holding the function's slot.
 //! The format: <https://github.com/WebAssembly/tool-conventions/blob/main/Linking.md>.
 
+use std::collections::hash_map::Entry;
 use std::ops::Range;
 
 use blaze_codegen::wasm::{Import, Signature};
+use rustc_hash::FxHashMap;
 
 use super::code::{self, Parts, Sig};
 use super::reader::{self, Reader};
 use super::reloc::{self, Kind};
 use crate::model::{
-    Apply, Archive, Binding, Class, Data, Group, Member, Names, NativeFile, NativeFixup, Object,
+    Apply, Archive, Binding, Class, Data, Group, Member, Name, Names, NativeFile, NativeFixup, Object,
     Section, SectionKind, Symbol, SymbolDef, SymbolKind,
 };
 use crate::output::NativeKind;
@@ -98,15 +100,30 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
     for member in file.members() {
         let member = member.map_err(|e| format!("an archive member: {e}"))?;
         let (offset, size) = member.file_range();
-        let start = usize::try_from(offset).map_err(|_| "an archive past the address space")?;
-        let end = usize::try_from(offset + size).map_err(|_| "an archive past the address space")?;
+        let member_name = String::from_utf8_lossy(member.name());
+        // `object` takes a member's size from its header without bounding it by the archive.
+        let range = offset
+            .checked_add(size)
+            .and_then(|end| Some(usize::try_from(offset).ok()?..usize::try_from(end).ok()?))
+            .filter(|it| it.end <= bytes.len())
+            .ok_or_else(|| {
+                format!(
+                    "the member `{member_name}` of {size} bytes at {offset} reaches past the \
+                     archive's {} bytes",
+                    bytes.len()
+                )
+            })?;
         by_offset.push(offset);
-        let name = names.push(&String::from_utf8_lossy(member.name()))?;
-        members.push(Member { name, bytes: start..end });
+        let name = names.push(&member_name)?;
+        members.push(Member { name, bytes: range });
     }
     let mut index = Vec::new();
     match file.symbols().map_err(|e| format!("the archive's index: {e}"))? {
         Some(symbols) => {
+            // A BSD `__.SYMDEF` names its strings by offset, so many entries may name one: each
+            // string is pushed once, keyed by where it is in the input (O(1) per entry, and the
+            // arena no bigger than the index's strings).
+            let mut pushed: FxHashMap<(usize, usize), Name> = FxHashMap::default();
             for symbol in symbols {
                 let symbol = symbol.map_err(|e| format!("the archive's index: {e}"))?;
                 let name = std::str::from_utf8(symbol.name())
@@ -117,7 +134,11 @@ fn archive(bytes: &[u8], whole: bool) -> Result<Archive, String> {
                 let member = by_offset
                     .binary_search(&member.file_range().0)
                     .map_err(|_| format!("the archive's index names `{name}` in no member"))?;
-                index.push((names.push(name)?, member as u32));
+                let name = match pushed.entry((name.as_ptr() as usize, name.len())) {
+                    Entry::Occupied(it) => *it.get(),
+                    Entry::Vacant(it) => *it.insert(names.push(name)?),
+                };
+                index.push((name, member as u32));
             }
         }
         None if members.is_empty() || whole => {}
@@ -1379,5 +1400,61 @@ mod tests {
         let error = read("libx.a", &bytes, &NativeKind::Archive { whole: false }).err().unwrap();
         assert!(error.contains("libx.a") && error.contains("index"), "{error}");
         assert!(read("libx.a", &bytes, &NativeKind::Archive { whole: true }).is_ok());
+    }
+
+    #[test]
+    fn a_member_past_the_end() {
+        // One header of a 100-byte member, and no bytes after it.
+        let mut bytes = b"!<arch>\n".to_vec();
+        bytes.extend(header("a.o/", 100));
+        let error = read("liba.a", &bytes, &NativeKind::Archive { whole: true }).err().unwrap();
+        assert!(error.contains("`a.o`") && error.contains("past the archive"), "{error}");
+    }
+
+    /// A member of `bsd`'s archive: `#1/<len>`, the name padded with NULs, then `data`.
+    fn bsd_member(out: &mut Vec<u8>, name: &str, data: &[u8]) {
+        let padded = (name.len() + 1).next_multiple_of(8);
+        out.extend(header(&format!("#1/{padded}"), padded + data.len()));
+        out.extend(name.as_bytes());
+        out.resize(out.len() + padded - name.len(), 0);
+        out.extend(data);
+        if out.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+    }
+
+    #[test]
+    fn a_bsd_index_names_one_string_many_times() {
+        // 640 entries of a `__.SYMDEF`, every one naming the same 4096-byte string.
+        let mut strings = vec![b'a'; 4096];
+        strings.push(0);
+        strings.resize(strings.len().next_multiple_of(4), 0);
+        let entries = 640;
+        let symdef_len = 4 + 8 * entries + 4 + strings.len();
+        let mut member = 8 + 60 + 16 + symdef_len;
+        member += member % 2;
+        let mut symdef = (8 * entries as u32).to_le_bytes().to_vec();
+        for _ in 0..entries {
+            symdef.extend(0u32.to_le_bytes());
+            symdef.extend((member as u32).to_le_bytes());
+        }
+        symdef.extend((strings.len() as u32).to_le_bytes());
+        symdef.extend(&strings);
+        let mut bytes = b"!<arch>\n".to_vec();
+        bsd_member(&mut bytes, "__.SYMDEF", &symdef);
+        assert_eq!(bytes.len(), member);
+        bsd_member(&mut bytes, "a.o", reader::MAGIC);
+
+        let NativeFile::Archive(archive) =
+            read("libb.a", &bytes, &NativeKind::Archive { whole: false }).unwrap()
+        else {
+            panic!("not an archive")
+        };
+        assert_eq!(archive.index.len(), entries);
+        assert!(archive.index.iter().all(|it| *it == archive.index[0]));
+        assert_eq!(archive.name(archive.index[0].0), "a".repeat(4096));
+        // The string once, and the member's name.
+        let member = archive.name(archive.members[0].name).len();
+        assert_eq!(archive.names.bytes(), 4096 + member);
     }
 }

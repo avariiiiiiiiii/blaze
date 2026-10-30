@@ -28,7 +28,7 @@ mod files;
 mod tests;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::HashMap,
     fmt,
     sync::{Mutex, MutexGuard, PoisonError},
 };
@@ -176,7 +176,7 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
     }
     let mut library: Vec<bool> = Vec::new();
     let mut set_of: FxHashMap<&str, usize> = FxHashMap::default();
-    let mut loads: BTreeMap<String, usize> = BTreeMap::new();
+    let mut loads: FxHashMap<String, usize> = FxHashMap::default();
     let mut std_set = None;
     for package in &units.packages {
         let Some(&is_std) = used.get(package.id.as_str()) else { continue };
@@ -198,7 +198,7 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
         };
         set_of.insert(package.id.as_str(), set);
     }
-    let mut excluded: BTreeSet<String> = BTreeSet::new();
+    let mut excluded: FxHashSet<String> = FxHashSet::default();
     excluded.insert(units.target_dir.clone());
     excluded.insert(units.build_dir.clone());
     for (index, unit) in units.graph.units.iter().enumerate() {
@@ -215,6 +215,11 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
             loads.insert(dir.to_owned(), set_of[unit.pkg_id.as_str()]);
         }
     }
+    // Walked by path: the order files get their ids in.
+    let mut loads: Vec<(String, usize)> = loads.into_iter().collect();
+    loads.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    let mut excluded: Vec<String> = excluded.into_iter().collect();
+    excluded.sort_unstable();
 
     let tree = files::Mounts { mounts: &config.mounts, view: root, tree: files };
     let mut db = Db::new();
@@ -238,10 +243,12 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
     _ = LocalRoots::builder(roots(false)).durability(Durability::MEDIUM).new(&db);
 
     let mut loaded = Vec::new();
-    for (load, &set) in &loads {
+    for (load, set) in &loads {
+        let set = *set;
         // What is under another load, or written by the build, is not this one's.
         let skipped: Vec<&String> = loads
-            .keys()
+            .iter()
+            .map(|(it, _)| it)
             .chain(excluded.iter())
             .filter(|it| *it != load && files::rest(it, load).is_some())
             .collect();
@@ -307,7 +314,7 @@ pub fn lower(lower: Lower<'_>) -> Result<Lowered, LowerError> {
             .iter()
             .filter(|(load, _)| files::rest(&src, load).is_some())
             .max_by_key(|(load, _)| load.len())
-            .map_or(other, |(_, &set)| SourceRootId(set as u32));
+            .map_or(other, |(_, set)| SourceRootId(*set as u32));
         let root_file = db.source_root(set).source_root(&db).file_for_path(&src_path).copied();
         let Some(root_file) = root_file else {
             return Err(LowerError::at(
@@ -483,7 +490,7 @@ impl Lowered {
             return Err(LowerError::at("not a proc macro's crate", lowering.what.clone()));
         };
         let macros = macros.map(|mut macros| {
-            macros.sort_unstable_by(|a, b| (a.name.as_str(), a.kind).cmp(&(b.name.as_str(), b.kind)));
+            macros.sort_unstable_by(|a, b| a.name.cmp_order(&b.name).then_with(|| a.kind.cmp(&b.kind)));
             macros
         });
         let mut db = self.db();

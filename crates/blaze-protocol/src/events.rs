@@ -5,6 +5,9 @@
 //!
 //! Times are nanoseconds since the build began and counts are integers: no floats.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -45,6 +48,22 @@ pub enum Event {
     /// A node of the build's graph (docs/driver.md), said once, before it first moves: what it
     /// is and the nodes it waits for.
     Node { id: u32, kind: NodeKind, name: String, deps: Vec<u32> },
+    /// Nodes of the graph said together, each as its [`Event::Node`] would say it, before any
+    /// of them first moves: node `i` of the `kinds.len()` is `first + i`, of kind `kinds[i]`,
+    /// named `names[name_at[i]..name_at[i + 1]]` (in bytes) and waiting for
+    /// `deps[deps_at[i]..deps_at[i + 1]]`. `name_at` and `deps_at` each hold `kinds.len() + 1`
+    /// offsets, from 0 to the length of `names` and of `deps`, never going back, and `name_at`
+    /// cuts no character. A dep is a node said before or another of these, given before or
+    /// after it here; none of these waits for itself through the others. A reader takes it
+    /// through [`NodeBatch::new`], which refuses one that is not so.
+    Nodes {
+        first: u32,
+        kinds: Vec<NodeKind>,
+        names: String,
+        name_at: Vec<u32>,
+        deps: Vec<u32>,
+        deps_at: Vec<u32>,
+    },
     /// A node of the graph is now in `state`.
     Moved { id: u32, state: NodeState },
     /// What held the build up: each node of it is the one the next waited for last, from the
@@ -64,6 +83,222 @@ pub enum Event {
     /// edit compiled again. A function is in one record of an object. The daemon sends these
     /// to no command: a cold build's are some megabytes.
     Functions { object: u32, whole: bool, functions: Vec<Function> },
+}
+
+impl Event {
+    /// The nodes of an [`Event::Nodes`], checked by [`NodeBatch::new`] with `order`; `None` for
+    /// another event.
+    pub fn nodes<'a>(&'a self, order: &mut Order) -> Option<Result<NodeBatch<'a>, Malformed>> {
+        match self {
+            Event::Nodes { first, kinds, names, name_at, deps, deps_at } => {
+                Some(NodeBatch::new(*first, kinds, names, name_at, deps, deps_at, order))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// An [`Event::Nodes`] whose columns agree, so that each node reads without a check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeBatch<'a> {
+    first: u32,
+    kinds: &'a [NodeKind],
+    names: &'a str,
+    name_at: &'a [u32],
+    deps: &'a [u32],
+    deps_at: &'a [u32],
+}
+
+/// A node of a [`NodeBatch`]: what its [`Event::Node`] would say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeOf<'a> {
+    pub id: u32,
+    pub kind: NodeKind,
+    pub name: &'a str,
+    pub deps: &'a [u32],
+}
+
+impl NodeOf<'_> {
+    pub fn event(&self) -> Event {
+        let (name, deps) = (self.name.to_owned(), self.deps.to_vec());
+        Event::Node { id: self.id, kind: self.kind, name, deps }
+    }
+}
+
+/// Why an [`Event::Nodes`] cannot be read: its columns disagree, or its nodes wait for each
+/// other in a cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Malformed(pub String);
+
+impl fmt::Display for Malformed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "a record of nodes is malformed: {}", self.0)
+    }
+}
+
+impl std::error::Error for Malformed {}
+
+/// What reads [`Event::Nodes`] records keeps from one to the next: the order of the last one
+/// read ([`Order::places`]) and the buffers that found it.
+#[derive(Debug, Default, Clone)]
+pub struct Order {
+    places: Vec<u32>,
+    waiting: Vec<u32>,
+    first_dependent: Vec<u32>,
+    /// Each edge's dependent and the next edge of the same dep.
+    dependents: Vec<(u32, u32)>,
+    ready: BinaryHeap<Reverse<u32>>,
+}
+
+const NO_EDGE: u32 = u32::MAX;
+
+impl Order {
+    /// The places of the last [`NodeBatch`] read with it, each after the others of the batch it
+    /// waits for, the first given first among those that can go: the order their
+    /// [`Event::Node`]s would come in.
+    pub fn places(&self) -> &[u32] {
+        &self.places
+    }
+}
+
+/// `at` holds offsets for `len` nodes into `end` entries: `len + 1` of them, from 0 to `end`,
+/// never going back.
+fn offsets(column: &str, at: &[u32], len: usize, end: usize) -> Result<(), Malformed> {
+    if at.len() != len + 1 || at[0] != 0 || at[len] as usize != end {
+        let offsets = at.len();
+        let why = format!("{column} of {offsets} offsets for {len} nodes and {end} entries");
+        return Err(Malformed(why));
+    }
+    match at.windows(2).position(|pair| pair[0] > pair[1]) {
+        Some(i) => Err(Malformed(format!("{column} goes back at node {i}"))),
+        None => Ok(()),
+    }
+}
+
+impl<'a> NodeBatch<'a> {
+    /// The columns of an [`Event::Nodes`], checked: refused unless they agree as the event
+    /// says. `order` is left with the order of their nodes ([`Order::places`]), or empty.
+    pub fn new(
+        first: u32,
+        kinds: &'a [NodeKind],
+        names: &'a str,
+        name_at: &'a [u32],
+        deps: &'a [u32],
+        deps_at: &'a [u32],
+        order: &mut Order,
+    ) -> Result<NodeBatch<'a>, Malformed> {
+        order.places.clear();
+        let len = kinds.len();
+        if u32::try_from(len).ok().and_then(|it| first.checked_add(it)).is_none() {
+            return Err(Malformed(format!("{len} ids from {first} past u32")));
+        }
+        offsets("name_at", name_at, len, names.len())?;
+        offsets("deps_at", deps_at, len, deps.len())?;
+        if let Some(i) = name_at.iter().position(|&at| !names.is_char_boundary(at as usize)) {
+            return Err(Malformed(format!("name_at cuts a character at node {i}")));
+        }
+        let batch = NodeBatch { first, kinds, names, name_at, deps, deps_at };
+        batch.order(order)?;
+        Ok(batch)
+    }
+
+    pub fn first(&self) -> u32 {
+        self.first
+    }
+
+    pub fn len(&self) -> usize {
+        self.kinds.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kinds.is_empty()
+    }
+
+    /// The node at `at`, below [`NodeBatch::len`].
+    pub fn node(&self, at: usize) -> NodeOf<'a> {
+        let names = self.names;
+        NodeOf {
+            id: self.first + at as u32,
+            kind: self.kinds[at],
+            name: &names[self.name_at[at] as usize..self.name_at[at + 1] as usize],
+            deps: self.deps_of(at),
+        }
+    }
+
+    /// Its nodes in the order given, the ids from [`NodeBatch::first`] on.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = NodeOf<'a>> + 'a {
+        let batch = *self;
+        (0..batch.len()).map(move |at| batch.node(at))
+    }
+
+    fn deps_of(&self, at: usize) -> &'a [u32] {
+        let deps = self.deps;
+        &deps[self.deps_at[at] as usize..self.deps_at[at + 1] as usize]
+    }
+
+    /// The place of `dep` in the batch, if it is one of it.
+    fn place(&self, dep: u32) -> Option<u32> {
+        let at = dep.wrapping_sub(self.first);
+        (at < self.kinds.len() as u32).then_some(at)
+    }
+
+    /// Puts its places in `order`, each after those it waits for, the first given first among
+    /// those that can go (Kahn's, by a heap): as given when each comes after its deps of the
+    /// batch, which costs one pass. Refuses a cycle.
+    fn order(&self, order: &mut Order) -> Result<(), Malformed> {
+        let len = self.len();
+        let Order { places, waiting, first_dependent, dependents, ready } = order;
+        places.clear();
+        let in_order = (0..len).all(|at| {
+            self.deps_of(at).iter().all(|&dep| self.place(dep).is_none_or(|it| (it as usize) < at))
+        });
+        if in_order {
+            places.extend(0..len as u32);
+            return Ok(());
+        }
+        waiting.clear();
+        waiting.resize(len, 0);
+        first_dependent.clear();
+        first_dependent.resize(len, NO_EDGE);
+        dependents.clear();
+        ready.clear();
+        for at in 0..len {
+            for &dep in self.deps_of(at) {
+                if let Some(it) = self.place(dep) {
+                    waiting[at] += 1;
+                    let edge = dependents.len() as u32;
+                    dependents.push((at as u32, first_dependent[it as usize]));
+                    first_dependent[it as usize] = edge;
+                }
+            }
+        }
+        ready.extend((0..len as u32).filter(|&at| waiting[at as usize] == 0).map(Reverse));
+        while let Some(Reverse(at)) = ready.pop() {
+            places.push(at);
+            let mut edge = first_dependent[at as usize];
+            while edge != NO_EDGE {
+                let (dependent, next) = dependents[edge as usize];
+                waiting[dependent as usize] -= 1;
+                if waiting[dependent as usize] == 0 {
+                    ready.push(Reverse(dependent));
+                }
+                edge = next;
+            }
+        }
+        if places.len() == len {
+            return Ok(());
+        }
+        const SHOWN: usize = 8;
+        let stuck: Vec<u32> =
+            (0..len).filter(|&at| waiting[at] > 0).map(|at| self.first + at as u32).collect();
+        let shown: Vec<String> = stuck.iter().take(SHOWN).map(u32::to_string).collect();
+        let more = match stuck.len().saturating_sub(SHOWN) {
+            0 => String::new(),
+            more => format!(" and {more} more"),
+        };
+        places.clear();
+        Err(Malformed(format!("nodes {}{more} wait for each other", shown.join(", "))))
+    }
 }
 
 /// A function compiling longer than this is a slow one: [`Event::Compiling`] says it.

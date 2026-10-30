@@ -9,6 +9,8 @@
 //! pipeline of its level. One function per compile: imports are shared through the
 //! summaries, never by compiling functions together (v1's units, `RA_JIT_UNITS`).
 
+#![forbid(unsafe_code)]
+
 #[cfg(feature = "llvm")]
 use std::sync::Arc;
 
@@ -261,7 +263,7 @@ fn emitted(
 ) -> Result<Emitted, CodegenError> {
     let isa: &dyn cranelift_codegen::isa::TargetIsa = &**crate::target().map_err(|e| failed(unit, e))?;
     let side = super::side::encode(&function.variables, &code.slots).map_err(|e| failed(unit, e))?;
-    let converted = super::places::resolve(&function.places, refs, |resolve| {
+    let (converted, extra) = super::places::resolve_owning(&function.places, refs, |resolve| {
         super::convert::function(
             unit.instance.key(),
             unit.arch,
@@ -272,9 +274,9 @@ fn emitted(
             &function.spans,
             side.as_ref().map(|it| it.1),
         )
-    })
-    .map_err(|e| failed(unit, e))?;
-    Ok(Emitted { function: converted, side: side.map(|it| it.0) })
+    });
+    let converted = converted.map_err(|e| failed(unit, e))?;
+    Ok(Emitted { function: converted, side: side.map(|it| it.0), extra })
 }
 
 #[cfg(not(feature = "llvm"))]
@@ -376,18 +378,19 @@ fn by_key(places: &Places, refs: &Refs, wanted: InstanceKey) -> Vec<u32> {
 /// Gives a place to each request LLVM's object asked for as it was read back: constants LLVM
 /// put beside the code that hold addresses are the function's own data, and a function it
 /// calls of its own accord (a libm routine, wide division) is the outside symbol of that
-/// name, which must be among the unit's references like any other.
+/// name: its place among the unit's references, or [`super::places::OWN`] when they lack it,
+/// which `emitted` keeps by name in the template (`Emitted::extra`).
 #[cfg(feature = "llvm")]
 fn placed_since(unit: &Unit, wants: &Wants, places: &mut Places, refs: &Refs) -> Result<(), CodegenError> {
     for request in &wants.requests.funcs[places.funcs.len()..] {
         let FuncTarget::Symbol(name) = &request.target else {
             return Err(failed(unit, "LLVM asked for a function that is no symbol"));
         };
+        if name.is_empty() {
+            return Err(failed(unit, "LLVM calls a symbol with no name"));
+        }
         let place = refs.iter().position(|it| matches!(it, Target::Extern(it) if it == name));
-        let place = place.ok_or_else(|| {
-            failed(unit, format!("LLVM calls `{name}` of its own accord, which the unit's references lack"))
-        })?;
-        places.funcs.push(place as u32);
+        places.funcs.push(place.map_or(super::places::OWN, |it| it as u32));
     }
     for request in &wants.requests.datas[places.datas.len()..] {
         match request {
@@ -627,8 +630,26 @@ mod tests {
         placed_since(&unit(), &wants, &mut places, &refs).unwrap();
         assert_eq!(places.funcs, [0, 1]);
         assert_eq!(places.datas, [DataPlace::Own]);
-        symbol(&mut wants, "sincos");
+        let sincos = symbol(&mut wants, "sincos");
+        placed_since(&unit(), &wants, &mut places, &refs).unwrap();
+        assert_eq!(places.funcs, [0, 1, super::super::places::OWN]);
+        symbol(&mut wants, "");
         assert!(placed_since(&unit(), &wants, &mut places, &refs).is_err());
+
+        // The symbol the references lack is kept by name for LLVM's code only, once however
+        // often it is called.
+        use super::super::convert::Resolver as _;
+        let request = &wants.requests.funcs[sincos as usize];
+        let strict = super::super::places::resolve(&places, &refs, |it| it.func(sincos, request));
+        assert!(strict.is_err());
+        let (targets, extra) = super::super::places::resolve_owning(&places, &refs, |it| {
+            [it.func(sincos, request), it.func(0, &wants.requests.funcs[0]), it.symbol("sincos")]
+        });
+        let [own, listed, again] = targets.map(Result::unwrap);
+        assert_eq!(own, Target::Extern("sincos".to_owned()));
+        assert_eq!(listed, Target::Extern("a".to_owned()));
+        assert_eq!(again, own);
+        assert_eq!(extra, ["sincos"]);
     }
 
     #[test]

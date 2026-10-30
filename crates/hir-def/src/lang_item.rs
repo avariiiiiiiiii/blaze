@@ -2,12 +2,9 @@
 //!
 //! This attribute to tell the compiler about semi built-in std library
 //! features, such as Fn family of traits.
-use std::sync::OnceLock;
-
 use base_db::SourceDatabase;
 use hir_expand::name::Name;
 use intern::{Symbol, sym};
-use rustc_hash::FxHashMap;
 use stdx::impl_from;
 
 use crate::{
@@ -418,6 +415,7 @@ macro_rules! language_item_table {
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
         #[allow(non_camel_case_types)]
+        #[repr(u16)]
         pub enum LangItemEnum {
             $(
                 $(#[$attr])*
@@ -447,29 +445,19 @@ macro_rules! language_item_table {
                 }
             }
 
-            /// The lang item `#[lang = "symbol"]` declares: one Fx hash of the symbol's pointer
-            /// and a probe, where a chain of compares took one per lang item before it.
+            /// The lang item `#[lang = "symbol"]` declares: the symbol's declared index and one
+            /// load, no hash. A symbol named twice keeps its first lang item.
             #[inline]
             pub fn from_symbol(symbol: &Symbol) -> Option<Self> {
-                static BY_SYMBOL: OnceLock<FxHashMap<Symbol, LangItemEnum>> = OnceLock::new();
-                BY_SYMBOL
-                    .get_or_init(|| {
-                        let mut table = FxHashMap::with_capacity_and_hasher(
-                            Self::SYMBOLS.len(),
-                            Default::default(),
-                        );
-                        // A symbol named twice keeps its first lang item, as the chain of
-                        // compares did.
-                        for &(symbol, which) in Self::SYMBOLS {
-                            table.entry(symbol).or_insert(which);
-                        }
-                        table
-                    })
-                    .get(symbol)
-                    .copied()
+                // Member `i` is the `i`th `#[lang]` item, which leads `ALL` and whose
+                // discriminant is `i`.
+                static BY_SYMBOL: intern::KnownNames =
+                    intern::KnownNames::new(&[ $( $module::Declared::$name, )* ]);
+                BY_SYMBOL.get(symbol).map(|at| Self::ALL[usize::from(at)])
             }
 
             /// Each lang item with the symbol of its `#[lang = ".."]`, in declaration order.
+            #[cfg(test)]
             const SYMBOLS: &[(Symbol, LangItemEnum)] = &[ $( ($module::$name, Self::$lang_item), )* ];
 
             /// [`Self::from_symbol`] as a chain of compares, the reference its table is checked
@@ -815,10 +803,19 @@ mod tests {
     #[test]
     fn symbol_table_matches_compares() {
         let mut symbols: Vec<Symbol> = LangItemEnum::SYMBOLS.iter().map(|&(it, _)| it).collect();
+        // The same texts interned at run time, and near misses of each.
+        let texts: Vec<String> = symbols.iter().map(|it| it.as_str().to_owned()).collect();
+        for text in &texts {
+            symbols.push(Symbol::intern(text));
+            symbols.push(Symbol::intern(&format!("{text}_")));
+            symbols.push(Symbol::intern(&text.to_uppercase()));
+            symbols.push(Symbol::intern(&text[..text.len() - 1]));
+        }
         symbols.extend(
             ["sized", "copy", "drop", "Default", "Debug", "", "not a lang item"].map(Symbol::intern),
         );
-        symbols.extend([sym::Default, sym::Output, sym::Item, sym::call, sym::fmt]);
+        symbols.extend([sym::Default, sym::Output, sym::Item, sym::call, sym::fmt, sym::self_]);
+        symbols.extend([sym::Integer::get(0), sym::Integer::get(300)]);
         for symbol in &symbols {
             assert_eq!(
                 LangItemEnum::from_symbol(symbol),
@@ -827,7 +824,21 @@ mod tests {
             );
         }
         assert_eq!(LangItemEnum::from_symbol(&sym::sized), Some(LangItemEnum::Sized));
+        assert_eq!(LangItemEnum::from_symbol(&Symbol::intern("sized")), Some(LangItemEnum::Sized));
+        assert_eq!(LangItemEnum::from_symbol(&sym::fn_), Some(LangItemEnum::Fn));
         assert_eq!(LangItemEnum::from_symbol(&Symbol::intern("not a lang item")), None);
+        // Items that are no `#[lang]` are never named by one.
+        assert_eq!(LangItemEnum::from_symbol(&sym::Default), None);
+    }
+
+    #[test]
+    fn discriminant_is_index_in_all() {
+        for (i, &which) in LangItemEnum::ALL.iter().enumerate() {
+            assert_eq!(which as u16 as usize, i, "{which:?}");
+        }
+        for (i, &(_, which)) in LangItemEnum::SYMBOLS.iter().enumerate() {
+            assert_eq!(LangItemEnum::ALL[i], which);
+        }
     }
 
     #[test]

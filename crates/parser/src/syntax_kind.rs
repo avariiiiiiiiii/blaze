@@ -3,6 +3,7 @@
 
 #[rustfmt::skip]
 mod generated;
+mod keywords;
 
 use crate::Edition;
 

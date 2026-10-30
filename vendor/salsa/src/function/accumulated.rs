@@ -73,7 +73,7 @@ where
             let Some(origin) = ingredient
                 .as_function()
                 .and_then(|function| function.memo(zalsa, k.key_index()))
-                .map(|memo| memo.header().origin())
+                .map(|memo| memo.header().origin(zalsa.graph()))
             else {
                 continue;
             };

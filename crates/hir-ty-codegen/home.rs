@@ -147,7 +147,7 @@ pub fn body_files(db: &dyn HirDatabase, instance: &Instance) -> Option<Box<[File
         return None;
     }
     let mut files: Vec<FileId> = mentions.bodies.into_iter().map(|it| body_file(db, it)).collect();
-    files.sort_unstable();
+    blaze_ids::radix::sort_copy_by_key(&mut files, |it| it.index());
     files.dedup();
     Some(files.into())
 }

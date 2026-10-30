@@ -20,13 +20,17 @@
 //! `compiler/rustc_hir_analysis/src/check_unused.rs` (`check_unused_traits`) (MIT or
 //! Apache-2.0).
 
+use std::sync::LazyLock;
+
 use base_db::{CrateOrigin, LangCrateOrigin};
+use memchr::memmem;
 use cfg::CfgAtom;
 use hir::InFile;
 use hir_def::{ModuleDefId, ModuleId};
 use hir_expand::name::Name;
 use intern::sym;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use syntax::{
     AstNode, NodeOrToken, SyntaxNode, SyntaxNodePtr, TextRange,
     ast::{self, HasName},
@@ -64,10 +68,10 @@ impl Unused {
             }
         }
 
-        let mut candidates = uses.candidates.clone();
-        let mut unused_trees: Vec<(usize, FxHashSet<usize>)> = Vec::new();
+        let mut candidates = Candidates::of(&uses.candidates);
+        let mut unused_trees: Vec<(usize, Trees)> = Vec::new();
         for (i, item) in uses.items.iter().enumerate() {
-            let mut unused = FxHashSet::default();
+            let mut unused = Trees::default();
             for (j, tree) in item.trees.iter().enumerate() {
                 if let Some(binding) = tree.binding
                     && uses.exported.contains(&binding)
@@ -78,7 +82,7 @@ impl Unused {
                     {
                         unused.insert(j);
                     }
-                    swap_remove(&mut candidates, binding);
+                    candidates.swap_remove(binding);
                     continue;
                 }
                 match tree.kind {
@@ -90,16 +94,16 @@ impl Unused {
                     TreeKind::Simple | TreeKind::Glob => {
                         let Some(binding) = tree.binding else { continue };
                         if is_used(uses, binding, tree) {
-                            swap_remove(&mut candidates, binding);
-                            unused.remove(&j);
-                        } else if !candidates.contains(&binding) {
+                            candidates.swap_remove(binding);
+                            unused.remove(j);
+                        } else if !candidates.contains(binding) {
                             unused.insert(j);
                         }
                     }
                 }
             }
             if !unused.is_empty() {
-                for &j in &unused {
+                for j in unused.iter() {
                     if let Some(binding) = item.trees[j].binding {
                         out.unused.insert(binding);
                     }
@@ -115,14 +119,12 @@ impl Unused {
             out.unused_imports(cx, &uses.items[*i], unused);
         }
 
-        let mut modules: Vec<ModuleId> = Vec::new();
-        for item in &uses.items {
-            if !modules.contains(&item.module) {
-                modules.push(item.module);
+        let mut seen: FxHashSet<ModuleId> = FxHashSet::with_capacity_and_hasher(uses.by_module.len(), Default::default());
+        for module in uses.items.iter().map(|it| it.module) {
+            if !seen.insert(module) {
+                continue;
             }
-        }
-        for module in modules {
-            for item in uses.items.iter().filter(|it| it.module == module) {
+            for item in uses.items_of(module) {
                 for tree in &item.trees {
                     let Some(binding) = tree.binding else { continue };
                     if tree.kind != TreeKind::Simple || out.unused.contains(&binding) {
@@ -136,7 +138,7 @@ impl Unused {
             }
         }
 
-        for binding in candidates {
+        for binding in candidates.order {
             let Some((item, tree)) = uses.tree(binding) else { continue };
             if item.public || uses.typeck.contains(&binding) {
                 continue;
@@ -182,7 +184,8 @@ impl Unused {
                 Diag::lint("unused_imports", "unused `#[macro_use]` import", span)
             };
             let module = hir::Module::from(krate.module);
-            diag.fact(cx.resolves_fact(module, &krate.name), format!("which macros of `{}` are used", krate.name));
+            let name = krate.name.as_str();
+            diag.fact(cx.resolves_fact(module, name), format!("which macros of `{name}` are used"));
             self.resolve.push(Found::lint(diag, Phase::Resolve, at));
         }
     }
@@ -191,26 +194,27 @@ impl Unused {
     fn extern_crate(&mut self, cx: &Cx<'_, '_>, uses: &Uses, krate: &ExternCrate, maybe_unused: &FxHashSet<hir_def::ExternCrateId>) {
         let node = &krate.node;
         let at = node.as_ref().map(|it| SyntaxNodePtr::new(it.syntax()));
-        let span = cx.span(node.as_ref().map(|it| item_range(it.syntax())));
+        let name = krate.name.as_str();
         let module = hir::Module::from(krate.module);
-        let fact = cx.resolves_fact(module, &krate.name);
-        if !krate.name.starts_with('_') && maybe_unused.contains(&krate.id) {
+        if !name.starts_with('_') && maybe_unused.contains(&krate.id) {
+            let span = cx.span(node.as_ref().map(|it| item_range(it.syntax())));
             let mut diag = Diag::lint("unused_extern_crates", "unused extern crate", span.clone());
             diag.span_label(span, "unused");
             let removal = cx.span(node.as_ref().map(|it| with_attrs(it.syntax())));
             diag.suggestion_verbose(removal, "remove the unused `extern crate`", "", Applicability::MachineApplicable);
-            diag.fact(fact, format!("what uses `{}`", krate.name));
+            diag.fact(cx.resolves_fact(module, name), format!("what uses `{name}`"));
             self.resolve.push(Found::lint(diag, Phase::Resolve, at));
             return;
         }
         if !cx.edition.at_least_2018()
-            || ast::HasAttrs::attrs(&node.value).next().is_some()
             || krate.renames
-            || !uses.extern_flags(cx).contains(&krate.name)
+            || !uses.extern_prelude.contains(&krate.name)
+            || ast::HasAttrs::attrs(&node.value).next().is_some()
             || no_implicit_prelude(cx, krate.module)
         {
             return;
         }
+        let span = cx.span(node.as_ref().map(|it| item_range(it.syntax())));
         let Some(ident) = node.value.name_ref() else { return };
         let item = item_range(node.value.syntax());
         let vis = match ast::HasVisibility::visibility(&node.value) {
@@ -226,12 +230,12 @@ impl Unused {
             code,
             Applicability::MachineApplicable,
         );
-        diag.fact(fact, format!("what `{}` is in the extern prelude", krate.name));
+        diag.fact(cx.resolves_fact(module, name), format!("what `{name}` is in the extern prelude"));
         self.resolve.push(Found::lint(diag, Phase::Resolve, at));
     }
 
     /// The `unused_imports` diagnostic of `item`, whose trees `unused` are unused.
-    fn unused_imports(&mut self, cx: &Cx<'_, '_>, item: &UseItem, unused: &FxHashSet<usize>) {
+    fn unused_imports(&mut self, cx: &Cx<'_, '_>, item: &UseItem, unused: &Trees) {
         let file = item.node.file_id;
         let children = children(item);
         let item_span = with_attrs(item.node.value.syntax());
@@ -277,7 +281,7 @@ impl Unused {
             diag.span_help(span, "if this is a test module, consider adding a `#[cfg(test)]` to the containing module");
         }
         let module = hir::Module::from(item.module);
-        for &j in unused {
+        for j in unused.iter() {
             if let Some(name) = &item.trees[j].name {
                 diag.fact(cx.resolves_fact(module, name.as_str()), format!("what uses `{}`", name.as_str()));
             }
@@ -287,11 +291,72 @@ impl Unused {
     }
 }
 
-/// Removes `binding` from `candidates` as an `IndexSet`'s `swap_remove` does: the last takes
-/// its place.
-fn swap_remove(candidates: &mut Vec<Binding>, binding: Binding) {
-    if let Some(at) = candidates.iter().position(|it| *it == binding) {
-        candidates.swap_remove(at);
+/// rustc's `maybe_unused_trait_imports`, an `IndexSet`: the order, and each binding's place in
+/// it. `contains` and `swap_remove` are one FxHash lookup each.
+struct Candidates {
+    order: Vec<Binding>,
+    at: FxHashMap<Binding, u32>,
+}
+
+impl Candidates {
+    fn of(candidates: &[Binding]) -> Candidates {
+        let order = candidates.to_vec();
+        let at = order.iter().enumerate().map(|(i, it)| (*it, i as u32)).collect();
+        Candidates { order, at }
+    }
+
+    fn contains(&self, binding: Binding) -> bool {
+        self.at.contains_key(&binding)
+    }
+
+    /// Removes `binding` as `IndexSet::swap_remove` does: the last takes its place.
+    fn swap_remove(&mut self, binding: Binding) {
+        let Some(at) = self.at.remove(&binding) else { return };
+        self.order.swap_remove(at as usize);
+        if let Some(&moved) = self.order.get(at as usize) {
+            self.at.insert(moved, at);
+        }
+    }
+}
+
+/// A set of an item's trees by index: one bit each, inline for up to 64 trees.
+#[derive(Default)]
+struct Trees(SmallVec<[u64; 1]>);
+
+impl Trees {
+    fn insert(&mut self, j: usize) {
+        let word = j / 64;
+        if self.0.len() <= word {
+            self.0.resize(word + 1, 0);
+        }
+        self.0[word] |= 1 << (j % 64);
+    }
+
+    fn remove(&mut self, j: usize) {
+        if let Some(word) = self.0.get_mut(j / 64) {
+            *word &= !(1 << (j % 64));
+        }
+    }
+
+    fn contains(&self, j: usize) -> bool {
+        self.0.get(j / 64).is_some_and(|word| word & (1 << (j % 64)) != 0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|it| *it == 0)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.0.iter().enumerate().flat_map(|(word, &bits)| {
+            let mut bits = bits;
+            std::iter::from_fn(move || {
+                (bits != 0).then(|| {
+                    let bit = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    word * 64 + bit
+                })
+            })
+        })
     }
 }
 
@@ -311,10 +376,8 @@ fn is_used(uses: &Uses, binding: Binding, tree: &Tree) -> bool {
 fn children(item: &UseItem) -> FxHashMap<usize, Vec<usize>> {
     let mut children: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
     for (j, tree) in item.trees.iter().enumerate() {
-        let Some(list) = tree.node.syntax().parent().and_then(ast::UseTreeList::cast) else { continue };
-        let parent = list.parent_use_tree().syntax().text_range();
-        if let Some(p) = item.trees.iter().position(|it| it.node.syntax().text_range() == parent) {
-            children.entry(p).or_default().push(j);
+        if let Some(parent) = tree.parent {
+            children.entry(parent as usize).or_default().push(j);
         }
     }
     children
@@ -331,7 +394,7 @@ enum Calc {
 fn calc_unused_spans(
     item: &UseItem,
     children: &FxHashMap<usize, Vec<usize>>,
-    unused: &FxHashSet<usize>,
+    unused: &Trees,
     j: usize,
     item_span: TextRange,
 ) -> Calc {
@@ -340,7 +403,7 @@ fn calc_unused_spans(
     let full_span = if j == 0 { item_span } else { span };
     match tree.kind {
         TreeKind::Simple | TreeKind::Glob => {
-            if unused.contains(&j) { Calc::Unused { spans: vec![span], remove: full_span } } else { Calc::Used }
+            if unused.contains(j) { Calc::Unused { spans: vec![span], remove: full_span } } else { Calc::Used }
         }
         TreeKind::List => {
             let nested = children.get(&j).map(Vec::as_slice).unwrap_or(&[]);
@@ -392,7 +455,7 @@ fn calc_unused_spans(
                 let child_tree = &item.trees[child];
                 contains_self |= child_tree.kind == TreeKind::Simple
                     && child_tree.node.path().is_some_and(|it| it.syntax().text() == "self")
-                    && !unused.contains(&child);
+                    && !unused.contains(child);
                 previous_unused = remove.is_some();
             }
             if unused_spans.is_empty() {
@@ -419,36 +482,38 @@ fn calc_unused_spans(
 /// rustc's `redundant_imports` of the single import `tree`: each namespace it imports in
 /// resolves to the same without it.
 fn redundant(cx: &Cx<'_, '_>, uses: &Uses, item: &UseItem, tree: &Tree, binding: Binding) -> Option<Found> {
-    if tree.self_import || tree.underscore || item.node.file_id.is_macro() {
+    if tree.self_import
+        || tree.underscore
+        || item.node.file_id.is_macro()
+        || uses.used.get(&binding) == Some(&Used::Other)
+        || uses.exported.contains(&binding)
+    {
         return None;
     }
-    let name = tree.name.clone()?;
+    let name = tree.name.as_ref()?;
     let source = tree.node.path()?.segment()?.name_ref()?;
     if let Some(rename) = tree.node.rename()
         && rename.name().is_none_or(|it| it.text() != source.text())
     {
         return None;
     }
-    if uses.used.get(&binding) == Some(&Used::Other) || uses.exported.contains(&binding) {
-        return None;
-    }
-    let mut found: Vec<(Option<Span>, bool)> = Vec::new();
-    let mut any = false;
+    let mut ranges: SmallVec<[(Option<InFile<TextRange>>, bool); 3]> = SmallVec::new();
     for ns in Ns::ALL {
         let Some(mine) = entry(&tree.imported, ns) else { continue };
-        any = true;
         if ns == Ns::Macros {
             return None;
         }
-        let (def, span, import) = without(cx, uses, item, binding, &name, ns)?;
+        let (def, range, import) = without(cx, uses, item, binding, name, ns)?;
         if def != mine.def {
             return None;
         }
-        found.push((span, import));
+        ranges.push((range, import));
     }
-    if !any {
+    if ranges.is_empty() {
         return None;
     }
+    let mut found: SmallVec<[(Option<Span>, bool); 3]> =
+        ranges.into_iter().map(|(range, import)| (range.map(|it| cx.span(it)), import)).collect();
     found.sort_by_key(|(span, import)| (span.as_ref().map(|it| (it.lo, it.hi)), *import));
     found.dedup();
     let text = source.text().to_string();
@@ -479,49 +544,39 @@ fn without(
     binding: Binding,
     name: &Name,
     ns: Ns,
-) -> Option<(ModuleDefId, Option<Span>, bool)> {
+) -> Option<(ModuleDefId, Option<InFile<TextRange>>, bool)> {
     let db = cx.db;
+    let in_glob = |from: ModuleDefId| match from {
+        ModuleDefId::ModuleId(from) => entry(&from.def_map(db).module(db, from).name_in_scope(db, name), ns),
+        _ => None,
+    };
     let mut at = item.module;
     loop {
         if at == item.module {
             let mut globs = uses
-                .items
-                .iter()
-                .filter(|it| it.module == at)
-                .flat_map(|it| it.trees.iter().map(move |tree| (it, tree)))
-                .filter(|(_, tree)| tree.kind == TreeKind::Glob && tree.binding != Some(binding))
+                .globs_of(at)
+                .filter(|(_, tree)| tree.binding != Some(binding))
                 .filter_map(|(it, tree)| {
-                    let Some(ModuleDefId::ModuleId(from)) = tree.source else { return None };
-                    let found = entry(&from.def_map(db).module(db, from).name_in_scope(db, name), ns)?;
+                    let found = in_glob(tree.source?)?;
                     found.vis.is_visible_from(db, at).then_some((it, tree, found))
                 });
             if let Some((glob_item, glob, found)) = globs.next() {
                 if globs.any(|(_, _, it)| it.def != found.def) {
                     return None;
                 }
-                let span = cx.span(InFile::new(glob_item.node.file_id, glob.node.syntax().text_range()));
-                return Some((found.def, Some(span), true));
+                return Some((found.def, Some(InFile::new(glob_item.node.file_id, glob.node.syntax().text_range())), true));
             }
         } else if let Some(found) = entry(&at.def_map(db).module(db, at).name_in_scope(db, name), ns) {
-            if let Some(Binding::Glob(_)) = found.import {
-                let differs = uses
-                    .items
-                    .iter()
-                    .filter(|it| it.module == at)
-                    .flat_map(|it| it.trees.iter())
-                    .filter_map(|tree| match (tree.kind, tree.source) {
-                        (TreeKind::Glob, Some(ModuleDefId::ModuleId(from))) => {
-                            entry(&from.def_map(db).module(db, from).name_in_scope(db, name), ns)
-                        }
-                        _ => None,
-                    })
-                    .any(|it| it.vis.is_visible_from(db, at) && it.def != found.def);
-                if differs {
-                    return None;
-                }
+            if let Some(Binding::Glob(_)) = found.import
+                && uses
+                    .globs_of(at)
+                    .filter_map(|(_, tree)| in_glob(tree.source?))
+                    .any(|it| it.vis.is_visible_from(db, at) && it.def != found.def)
+            {
+                return None;
             }
-            let (span, import) = binding_span(cx, uses, found)?;
-            return Some((found.def, Some(span), import));
+            let (range, import) = binding_range(cx, uses, found)?;
+            return Some((found.def, Some(range), import));
         }
         if !at.is_block_module(db) {
             break;
@@ -532,14 +587,13 @@ fn without(
         return None;
     }
     let root: ModuleId = cx.krate.root_module(db).into();
-    let text = name.as_str();
-    if let Some(krate) = uses.crates.iter().find(|it| it.module == root && it.name == text) {
+    if let Some(krate) = uses.crates.iter().find(|it| it.module == root && it.name == *name) {
         let loaded = krate.krate?;
-        let span = cx.span(krate.node.as_ref().map(|it| item_range(it.syntax())));
-        return Some((ModuleDefId::ModuleId(loaded.root_module(db).into()), Some(span), true));
+        let range = krate.node.as_ref().map(|it| item_range(it.syntax()));
+        return Some((ModuleDefId::ModuleId(loaded.root_module(db).into()), Some(range), true));
     }
-    if uses.extern_flags(cx).iter().any(|it| it == text) {
-        let dep = cx.krate.dependencies(db).into_iter().find(|it| it.name.as_str() == text)?;
+    if uses.extern_prelude.contains(name) {
+        let dep = cx.krate.dependencies(db).into_iter().find(|it| it.name == *name)?;
         return Some((ModuleDefId::ModuleId(dep.krate.root_module(db).into()), None, false));
     }
     let builtin = hir_def::builtin_type::BuiltinType::by_name(name)?;
@@ -547,19 +601,19 @@ fn without(
 }
 
 /// Where the binding `found` is, and whether it is an import's.
-fn binding_span(cx: &Cx<'_, '_>, uses: &Uses, found: Entry) -> Option<(Span, bool)> {
+fn binding_range(cx: &Cx<'_, '_>, uses: &Uses, found: Entry) -> Option<(InFile<TextRange>, bool)> {
     match found.import {
         Some(binding @ (Binding::Import(_) | Binding::Glob(_))) => {
             let (item, tree) = uses.tree(binding)?;
-            Some((cx.span(InFile::new(item.node.file_id, tree.node.syntax().text_range())), true))
+            Some((InFile::new(item.node.file_id, tree.node.syntax().text_range()), true))
         }
         Some(Binding::ExternCrate(id)) => {
             let krate = uses.extern_crate_of(id)?;
-            Some((cx.span(krate.node.as_ref().map(|it| item_range(it.syntax()))), true))
+            Some((krate.node.as_ref().map(|it| item_range(it.syntax())), true))
         }
         None => {
             let node = def_item(cx, found.def)?;
-            Some((cx.span(node.map(|it| item_range(&it))), false))
+            Some((node.map(|it| item_range(&it)), false))
         }
     }
 }
@@ -696,14 +750,29 @@ fn may_be_unused(cx: &Cx<'_, '_>, krate: hir::Crate) -> bool {
         CrateOrigin::Lang(_) => return false,
         _ => {}
     }
-    const KEPT: &[&str] = &["compiler_builtins", "panic_runtime", "global_allocator", "panic_handler", "eii"];
     for module in krate.modules(db) {
         let Some(file) = module.as_source_file_id(db) else { continue };
-        let text = cx.file_text(file.file_id(db));
-        let words = text.split(|c: char| !(c.is_alphanumeric() || c == '_'));
-        if words.clone().any(|word| KEPT.contains(&word) || word.starts_with("eii_")) {
+        if mentions_kept(cx.file_text(file.file_id(db)).as_bytes()) {
             return false;
         }
     }
     true
+}
+
+const KEPT: [&str; 5] = ["compiler_builtins", "panic_runtime", "global_allocator", "panic_handler", "eii"];
+
+/// Whether `text` has one of [`KEPT`] as a word, or a word starting `eii_`. One SIMD substring
+/// search per name (memchr's `memmem`, chosen for the machine at run time) over the source as
+/// it is in the database; no copy, no allocation.
+fn mentions_kept(text: &[u8]) -> bool {
+    static FINDERS: LazyLock<[memmem::Finder<'static>; 5]> = LazyLock::new(|| KEPT.map(memmem::Finder::new));
+    let ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    FINDERS.iter().zip(KEPT).any(|(finder, name)| {
+        finder.find_iter(text).any(|at| {
+            let end = at + name.len();
+            let starts = at == 0 || !ident(text[at - 1]);
+            let ends = text.get(end).is_none_or(|&b| !ident(b) || (name == "eii" && b == b'_'));
+            starts && ends
+        })
+    })
 }

@@ -8,7 +8,7 @@ use syntax::{AstNode, SyntaxKind, ast};
 
 use crate::check::Cx;
 
-const LINT: &str = "empty_enums";
+const LINT: super::Implemented = super::Implemented::EmptyEnums;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, item: &ast::Enum) {
     if !cx.on(LINT) {

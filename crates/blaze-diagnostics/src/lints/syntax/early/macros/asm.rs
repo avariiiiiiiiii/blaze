@@ -13,10 +13,9 @@
 //! `compiler/rustc_target/src/asm/mod.rs` (`InlineAsmArch::from_arch`) (MIT or Apache-2.0).
 
 use hir::{InFile, MacroCallId};
-use hir_expand::MacroDefKind;
 use ra_ap_rustc_parse_format as parse_format;
 use syntax::{
-    AstNode, AstToken as _, SyntaxNode, SyntaxNodePtr, T,
+    AstNode, AstToken as _, SyntaxKind, SyntaxNode, SyntaxNodePtr, T,
     ast::{self, HasLoopBody as _, IsString as _},
 };
 
@@ -102,25 +101,19 @@ impl Args {
     }
 }
 
-/// The lints of the crate's `asm!`, `global_asm!` and `naked_asm!` calls: none unless the
-/// target's `sess.asm_arch` (`InlineAsmArch::from_arch` of its `target_arch`) is x86 or x86_64.
-pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut emitted = Vec::new();
-    let Some(arch) = walk.cfg.get_cfg_values("target_arch").next() else { return emitted };
-    if !matches!(arch.as_str(), "x86" | "x86_64") {
-        return emitted;
-    }
-    for tree in &walk.trees {
-        let Some(call) = tree.call else { continue };
-        if !matches!(call.loc(cx.db).def.kind, MacroDefKind::BuiltIn(_, it) if it.is_asm()) {
-            continue;
-        }
-        let Some(asm) = tree.nodes.iter().find_map(|it| ast::AsmExpr::cast(it.clone())) else {
-            continue;
-        };
-        asm_lints(cx, tree, call, &asm, &mut emitted);
-    }
-    emitted
+/// Whether the target's `sess.asm_arch` (`InlineAsmArch::from_arch` of its `target_arch`) is
+/// x86 or x86_64: elsewhere the crate's `asm!`, `global_asm!` and `naked_asm!` calls give no
+/// lint.
+pub(super) fn x86(walk: &Walk<'_>) -> bool {
+    walk.cfg.get_cfg_values("target_arch").next().is_some_and(|arch| matches!(arch.as_str(), "x86" | "x86_64"))
+}
+
+/// The lints of `tree`, the expansion of `call`, a call of `asm!`, `global_asm!` or
+/// `naked_asm!` on x86 ([`x86`]).
+pub(super) fn lints(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, out: &mut Vec<Emitted>) {
+    let asm = tree.nodes.iter().find(|it| it.kind() == SyntaxKind::ASM_EXPR);
+    let Some(asm) = asm.and_then(|it| ast::AsmExpr::cast(it.clone())) else { return };
+    asm_lints(cx, tree, call, &asm, out);
 }
 
 fn asm_lints(

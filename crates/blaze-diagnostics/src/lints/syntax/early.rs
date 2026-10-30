@@ -29,20 +29,42 @@ mod validation;
 use hir::{HirFileId, InFile};
 use rustc_hash::FxHashMap;
 use span::SyntaxContext;
-use syntax::{SyntaxNode, SyntaxNodePtr, TextRange};
+use syntax::{SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange};
 
 use crate::{
     cx::Cx,
     lints::syntax::{Emitted, Tree, Walk},
 };
 
+/// rustc's combined early lint pass (`BuiltinCombinedEarlyLintPass`, one AST walk with every
+/// pass's methods inlined), and better: one walk over each tree's pre-order node column for
+/// every part here, AST validation and the parser's lints included (rustc walks the AST for
+/// those apart). Each node is read once; each part dispatches on its kind with a `match`.
+/// What is not of the nodes goes apart: the lexer over each file's text, expansions once per
+/// tree, `unused_labels` over each body's expression column.
 pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut emitted = lexer::lints(cx, walk);
-    emitted.extend(builtin::lints(cx, walk));
-    emitted.extend(labels::unused(cx));
-    emitted.extend(macros::lints(cx, walk));
-    emitted.extend(validation::lints(cx, walk));
-    emitted
+    let mut out = lexer::lints(cx, walk);
+    let expansions = Expansions::of(cx, walk);
+    let mut builtin = builtin::Builtin::new(cx, &expansions);
+    let mut validation = validation::Validation::new(cx, walk);
+    let krate = macros::crate_at(cx, walk);
+    builtin.krate(cx, walk, &mut out);
+    for (index, tree) in walk.trees.iter().enumerate() {
+        let index = index as u32;
+        builtin.tree(cx, tree, &mut out);
+        for node in &tree.nodes {
+            builtin.node(cx, walk, tree, node, &mut out);
+            validation.node(cx, tree, index, node, &mut out);
+            if matches!(node.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) {
+                macros::definition(cx, krate, tree, node, &mut out);
+            }
+        }
+        validation.tree(cx, tree, index);
+    }
+    out.extend(validation.finish());
+    out.extend(macros::lints(cx, walk));
+    out.extend(labels::unused(cx));
+    out
 }
 
 /// The syntax context rustc's span of `range` in `file` has: that of its first token

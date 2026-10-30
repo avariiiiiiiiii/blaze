@@ -18,6 +18,7 @@ mod read;
 mod tests;
 
 use blaze_codegen::Arch;
+use blaze_ids::radix;
 
 use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Special, Writer};
 use crate::{Format, LinkError, NativeKind, Output};
@@ -302,7 +303,14 @@ impl Writer for Elf {
     }
 
     fn order(&self, classes: &mut Vec<Class>) {
-        classes.sort_by(|a, b| order_key(a).cmp(&order_key(b)));
+        let rank = |class: &Class| {
+            let (segment, rank, _) = order_key(class);
+            radix::pack_32(segment as u32, rank)
+        };
+        radix::sort_by_key(classes, rank);
+        for run in classes.chunk_by_mut(|a, b| rank(a) == rank(b)) {
+            run.sort_by(|a, b| order_key(a).2.cmp(order_key(b).2));
+        }
     }
 
     /// Relro is read-only once the loader has relocated it (`-z now`): `Prot::R` here, so it

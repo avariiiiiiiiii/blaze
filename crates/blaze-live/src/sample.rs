@@ -189,19 +189,23 @@ fn run(dir: &Path, code: &Code, mut sample: Sample) {
         }
         let interval = ticks_of(sample.interval_us.max(LEAST_INTERVAL_US));
         next += interval;
-        // SAFETY: as above; waiting until a time that has passed returns at once.
-        unsafe {
-            let now = mach_absolute_time();
-            // A sampler that fell behind, as when the machine slept, keeps its pace from now
-            // rather than looking in a burst to catch up.
-            if next < now {
-                next = now + interval;
-            }
-            mach_wait_until(next);
+        // SAFETY: a clock read; it takes nothing and changes nothing.
+        let now = unsafe { mach_absolute_time() };
+        // A sampler that fell behind, as when the machine slept, keeps its pace from now
+        // rather than looking in a burst to catch up.
+        if next < now {
+            next = now + interval;
         }
+        // SAFETY: waits until `next`, returning at once for a time that has passed; it touches
+        // no memory.
+        unsafe { mach_wait_until(next) };
     }
-    // SAFETY: the port `mach_thread_self` gave.
-    unsafe { mach_port_deallocate(mach_task_self(), me) };
+    // SAFETY: `mach_task_self` takes nothing and returns this task's port name, which needs
+    // no release.
+    let task = unsafe { mach_task_self() };
+    // SAFETY: `me` is the right `mach_thread_self` gave at the start of `run`, given back
+    // once, here.
+    unsafe { mach_port_deallocate(task, me) };
 }
 
 /// Where `thread` is, if it is running.
@@ -238,11 +242,10 @@ fn counters(used: u64) -> Vec<(u32, u64)> {
     // Called through its address, so that the linker keeps the function for the daemon's
     // code to call by name rather than only a copy inlined here.
     let find: extern "C" fn() -> *mut u64 = crate::blaze_live_counters;
-    let start = std::hint::black_box(find)();
+    std::hint::black_box(find)();
     let used = (used as usize).min(format::COUNTERS);
-    (0..used)
-        // SAFETY: within the counters, which other threads add to as they like.
-        .map(|at| (at as u32, unsafe { start.add(at).read_volatile() }))
+    (crate::COUNTERS[..used].iter().enumerate())
+        .map(|(at, counter)| (at as u32, counter.load(std::sync::atomic::Ordering::Relaxed)))
         .filter(|(_, count)| *count != 0)
         .collect()
 }
@@ -273,17 +276,20 @@ struct Threads {
 impl Threads {
     fn list(&mut self, me: u32) {
         let (mut list, mut count) = (std::ptr::null_mut::<u32>(), 0u32);
-        // SAFETY: the kernel hands over an array of `count` ports, given back once they are
-        // copied out; the rights to the ports are given back by `give_back`.
-        let ports = unsafe {
-            let task = mach_task_self();
-            if task_threads(task, &mut list, &mut count) != 0 {
-                return;
-            }
-            let ports = std::slice::from_raw_parts(list, count as usize).to_vec();
-            vm_deallocate(task, list as usize, count as usize * size_of::<u32>());
-            ports
-        };
+        // SAFETY: `mach_task_self` takes nothing and returns this task's port name, which
+        // needs no release.
+        let task = unsafe { mach_task_self() };
+        // SAFETY: `list` and `count` are what the call fills in: an array the kernel allocates
+        // in this task, and its length.
+        if unsafe { task_threads(task, &mut list, &mut count) } != 0 {
+            return;
+        }
+        // SAFETY: the kernel gave `count` ports at `list`, page-aligned memory of this task;
+        // they are copied out before it is given back.
+        let ports = unsafe { std::slice::from_raw_parts(list, count as usize) }.to_vec();
+        // SAFETY: `list` is the kernel's array of `count` ports, copied out above and not used
+        // after; the rights to the ports are given back by `give_back`.
+        unsafe { vm_deallocate(task, list as usize, count as usize * size_of::<u32>()) };
         let all: Vec<(u32, u64)> = ports.into_iter().map(|port| (port, cpu_ns(port))).collect();
         let before = |port| self.all.iter().find(|it| it.0 == port).map(|it| it.1);
         let busy = all.iter().filter(|(port, ns)| {
@@ -297,9 +303,12 @@ impl Threads {
     }
 
     fn give_back(&mut self) {
-        // SAFETY: each port is one `task_threads` gave a right to.
+        // SAFETY: `mach_task_self` takes nothing and returns this task's port name, which
+        // needs no release.
         let task = unsafe { mach_task_self() };
         for (port, _) in self.all.drain(..) {
+            // SAFETY: each port is one `task_threads` gave a right to, given back once: `drain`
+            // takes it out of `all`.
             unsafe { mach_port_deallocate(task, port) };
         }
         self.busy.clear();

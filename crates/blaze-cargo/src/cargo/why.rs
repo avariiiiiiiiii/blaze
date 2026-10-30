@@ -104,7 +104,7 @@ fn explained(build: &blaze_ui::Build, took: u64) -> String {
         }
     }
     let mut compiled: Vec<_> = build.crates.iter().filter(|it| it.fns.compiled() > 0).collect();
-    compiled.sort_by_key(|it| std::cmp::Reverse(it.fns.compiled()));
+    blaze_ids::radix::sort_by_key(&mut compiled, |it| !it.fns.compiled());
     for krate in compiled.iter().take(LISTED) {
         let fns = krate.fns;
         let busy = match krate.busy_ns(took) {

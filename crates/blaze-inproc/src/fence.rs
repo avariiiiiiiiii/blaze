@@ -308,7 +308,40 @@ impl Thread {
     /// Claims a slot for thread `tid` of process `pid`, reporting `seen`; `None` when every
     /// slot is taken.
     pub fn claim(words: &impl Words, pid: u32, tid: u64, seen: u64) -> Option<usize> {
+        Thread::begin_claim(words);
+        Thread::finish_claim(words, pid, tid, seen)
+    }
+
+    /// The first half of [`Thread::claim`]: counts the birth, so a daemon looking meanwhile
+    /// knows not to trust its count of slots.
+    pub fn begin_claim(words: &impl Words) {
         words.word(W_BIRTHS).fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// The second half of [`Thread::claim`]. A slot online under this thread's own IDs was
+    /// left by a dead thread whose ID the OS gave this one: it is adopted, so the daemon never
+    /// counts two slots for one listed thread.
+    pub fn finish_claim(words: &impl Words, pid: u32, tid: u64, seen: u64) -> Option<usize> {
+        for index in 0..SLOTS {
+            let at = slot(index);
+            let word = words.word(at);
+            if word.load(Ordering::Relaxed) != state(pid, ONLINE) || words.word(at + 1).load(Ordering::SeqCst) != tid {
+                continue;
+            }
+            if word
+                .compare_exchange(state(pid, ONLINE), state(pid, CLAIMING), Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            if words.word(at + 1).load(Ordering::SeqCst) != tid {
+                word.store(state(pid, ONLINE), Ordering::SeqCst);
+                continue;
+            }
+            words.word(at + 2).store(seen, Ordering::SeqCst);
+            word.store(state(pid, ONLINE), Ordering::SeqCst);
+            return Some(index);
+        }
         for index in 0..SLOTS {
             let at = slot(index);
             let word = words.word(at);

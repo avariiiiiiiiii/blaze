@@ -92,8 +92,10 @@ impl ProcMacrosBuilder {
             // Sort proc macros to improve incrementality when only their order has changed (ideally the build system
             // will not change their order, but just to be sure).
             proc_macros.sort_unstable_by(|proc_macro, proc_macro2| {
-                (proc_macro.name.as_str(), proc_macro.kind)
-                    .cmp(&(proc_macro2.name.as_str(), proc_macro2.kind))
+                proc_macro
+                    .name
+                    .cmp_order(&proc_macro2.name)
+                    .then_with(|| proc_macro.kind.cmp(&proc_macro2.kind))
             });
         }
         self.0.insert(

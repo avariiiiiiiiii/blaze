@@ -318,7 +318,7 @@ impl Checker {
                     .into_iter()
                     .map(|it| it.definition_source_file_id(db).original_file(db).file_id(db))
                     .collect();
-                of_it.sort_unstable();
+                blaze_ids::radix::sort_copy_by_key(&mut of_it, |it| it.index());
                 of_it.dedup();
                 match runs {
                     true => ran.extend(of_it.iter().copied()),
@@ -400,7 +400,7 @@ impl Checker {
                 if missing.test { " as a test" } else { "" },
             );
         }
-        checked.sort_unstable();
+        blaze_ids::radix::sort_copy_by_key(&mut checked, |it| it.index());
         checked.dedup();
         Ok(Scope { checked, within: Arc::new(within), linted })
     }

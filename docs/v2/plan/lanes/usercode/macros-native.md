@@ -1,9 +1,18 @@
 ---
-status: plan
-summary: How blaze v2's native proc-macro expanders (#1297) are built, when they are used, and why bitflags has none.
+status: superseded
+summary: How blaze v2's native proc-macro expanders (#1297) were to be built, when they were to be used, why bitflags has none, and what of them lane fastcompile can take for the proc-macro bridge.
 date: 2026-10-29
+superseded_by: ../../design/compile-time.md#less-work-in-every-build
 ---
 # Native expanders (#1297)
+
+Superseded on 2026-10-29 by change 20 of
+[compile-time.md](../../design/compile-time.md#less-work-in-every-build). Under change 20, proc
+macros run as their own code on blaze's MIR evaluator and copy-and-patch tier, isolated by
+construction, and lane fastcompile builds that. No expander is vendored or written for #1297.
+What carries over to fastcompile's proc-macro bridge is in
+[For fastcompile](#for-fastcompile-the-proc-macro-bridge) at the end. The rest is the record of
+the plan.
 
 Part of [usercode](../usercode.md). Code: `crates/blaze-expand/src/native/`; requests:
 `v2/requests/usercode-macros-native.md`.
@@ -163,3 +172,85 @@ marks of every inner expansion, which changes hygiene (local names and `$crate` 
 and every span's expansion parent. So there is none, and no hook in `hir-expand` is requested.
 Making bitflags cheaper belongs in mbe (cached matching per definition), which is the format
 and db lanes'.
+
+## For fastcompile: the proc-macro bridge
+
+What this lane wrote that change 20's bridge can use. It is in `crates/blaze-expand/src/native/`,
+which now holds only the bridge, written and not built. The expander matching (`closure.rs`,
+`files.rs`, `verified.rs`, `find`, `Macro`) is deleted, and is in git at `df97d0934a`. The
+entry is `native::expand(Expander, db: Option<&dyn SourceDatabase>, input, attr, def_site,
+call_site, mixed_site)`, where `Expander` is a macro's `fn(TokenStream) -> TokenStream` or `fn(TokenStream, TokenStream) -> TokenStream`
+compiled against the shim. Tests run small macros through it: an echo, a parsed stream, the
+sites, an attribute, a panic, and an expansion within an expansion.
+
+- **The bridge's whole surface is 20 functions.** `proc_macro/lib.rs` is the wasm guest's
+  `proc_macro` (`crates/blaze-macro-wasm/guest/proc_macro.rs`, held equal by a test). Every one
+  of its imports goes to one trait, `__native::Host`:
+  - the three sites;
+  - `span_join`, `span_resolved_at`, `span_located_at`, `span_parent`, `span_source`,
+    `span_start`, `span_end`, `span_subspan`, `span_byte_range`, `span_line`, `span_column`;
+  - `span_debug`, `span_file`, `span_local_file`, `span_source_text`;
+  - `ts_from_str`, `literal_from_str`.
+
+  Those 20 are 20 of the guest's 24 `sys` imports. The other four are:
+  - `take`, which copies out the bytes of the last answer that gave text or a stream;
+  - `track_path`, `track_env_var` and `diagnostic`, which are no-ops in the shim as they stand.
+
+  Token streams cross only as whole inputs and outputs, in the wasm wire encoding. These are the
+  shims change 20 names as "the only way out", and each is a pure question of the database or
+  of the lexer.
+- **How questions are recorded, in the wasm host.** `crates/blaze-macro-wasm/src/lib.rs`
+  `State::ask_value` records each question a macro asks of a span: line and column, source
+  text, byte range, file, local file. The question is recorded as `Value::read`, a NUL, a
+  letter, then the span as start, end, and the index of its anchor and context among the
+  input's. The answer is recorded as `Value::said`. `what_it_read` puts each pair into the
+  expansion's `Traced` as an environment variable, so an output is found again only while the
+  database answers the same; `find_answered` answers those questions outside the store's lock.
+  A question it can't record sets `asked`, and the output is then not kept: a span with an
+  anchor or context the input lacks, `span_debug`, or a question answered with a span (a join
+  across anchors, `span_parent`, `span_source`). The bridge's
+  `host.rs` answers the same questions the same way but records none, because nothing keeps
+  its outputs yet. A cache of change 20's outputs has to record them as the wasm host does.
+- **The answers, exactly as the wasm host gives them.** `host.rs` implements `Host` against
+  `load_cargo::answer`. It numbers spans the same way the wasm host does: the def, call and
+  mixed sites are 1, 2 and 3, then the input's spans in order of first appearance. It also
+  handles the same fix-up-span and cross-anchor join cases, and gives the same defaults where
+  nothing can be asked (line and column 1, span 0). So a macro gives the same tokens under
+  either host. An evaluator-backed bridge can answer its shims with this code as it stands.
+- **Reentrancy and panics.** `with_host` sets a thread-local host. It restores the previous
+  host on drop, so an answer that expands another macro on the same thread is sound; the
+  `SAFETY` comment states the invariant. `caught` turns a macro's panic into its message
+  without printing it (one panic hook, installed once). Per-thread buffers (`Scratch`) are
+  taken out of a `Cell` for each call, so a nested expansion gets fresh ones.
+- **Reading the output with no tree per group.** `wire::Reader` reads the encoding in one
+  pass, straight into rust-analyzer's flat `TopSubtree`, and splits a negative literal into
+  `-` and the literal. A test checks it against the wasm host's two-pass reader.
+- **A differential check against the wasm host.** `difference(a, b)` names the first
+  differing token: text, rawness, spacing, kind, suffix, or a span's range, anchor or context.
+  The verify mode that used it (`BLAZE_NATIVE_MACROS=verify`, expanding each call both ways)
+  is gone with the expanders. Change 20's tier can be held to the wasm modules, and to rustc's
+  outputs, the same way until it replaces them.
+- **A key for the macro that misses nothing.** Change 20 caches outputs "by input tokens and
+  macro version". A version string misses inputs the output depends on. The deleted
+  `closure.rs` (in git at `df97d0934a`) computed the identity of a macro library's whole
+  closure, from the `rust-project.json` that
+  `own_macro.rs` writes beside each module. For each package that identity covers:
+  - name and version;
+  - the BLAKE3 of every file;
+  - features;
+  - the cfgs its sources name;
+  - its dependencies' names.
+
+  It read only libraries whose first crate was a verified one (`ROOTS`); a key for every
+  library drops that filter. Repeat loads checked it with a git-index-style stat cache, with
+  git's rule for files changed in the same clock tick they were read. A hit cost one `stat` per
+  file and allocated nothing. Two more inputs belong in the key:
+  - the environment variables the macro read (the guest's `tracked::env_var` calls
+    `std::env::var` in process, so the bridge must answer it from the expansion's traced
+    environment instead);
+  - the files it read.
+- **Where the bridge can be faster than all of this.** Change 20 runs the macro and blaze in
+  the same address space, so the wire encoding is optional. Streams can cross as `u32`
+  handles into a host arena of interned trees, as rustc's own bridge does, instead of being
+  encoded and rebuilt. The guest's `Rc<Vec<TokenTree>>` and `Rc<str>` would then become
+  handles, and there would be no allocation per token.

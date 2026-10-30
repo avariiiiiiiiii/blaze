@@ -365,7 +365,7 @@ impl Tables {
         // The linker takes the table in the order of the addresses, which is not the order
         // the functions came in: what a function needs of ours is defined after it.
         let mut entries = self.entries;
-        entries.sort_by_key(|entry| {
+        blaze_ids::radix::sort_by_key(&mut entries, |entry| {
             let symbol = product.object.symbol(product.function_symbol(entry.func));
             symbol.value
         });

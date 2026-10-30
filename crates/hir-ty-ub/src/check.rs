@@ -21,7 +21,7 @@ mod report;
 mod tests;
 mod valid;
 
-use std::{cell::RefCell, ops::Range};
+use std::ops::Range;
 
 use hir_def::{FunctionId, HasModule};
 use hir_ty::{
@@ -40,16 +40,10 @@ use self::valid::{Fail, Plans};
 use crate::{
     borrows::{self, Borrows, NewPermission, PtrKind},
     ids::{AccessKind, AllocId, AtomicOrd, Prov, SiteId, Span, ThreadId},
-    memory::{AlignMsg, Bytes, Kind, MemError, Memory},
+    memory::{AlignMsg, Bytes, Kind, Memory},
     race::{self, Races},
     ub::{Found, Ub},
 };
-
-thread_local! {
-    /// The first failure of [`Shadow::require_init`], which has no machine to record it in:
-    /// the evaluator stops with `Stop` and [`run_test`] takes it from here.
-    static UNINIT: RefCell<Option<MemError>> = const { RefCell::new(None) };
-}
 
 /// The shadow of a value the evaluator holds outside memory: [`Bytes`].
 #[derive(Clone, Default, Debug, PartialEq, Eq)]
@@ -74,19 +68,6 @@ impl eval::Shadow<Prov> for Shadow {
 
     fn prov_at(&self, at: usize, size: usize) -> Option<Prov> {
         self.0.prov_at(at, size)
-    }
-
-    // Miri: interpret/operand.rs, `read_scalar` of an immediate (`Scalar::Uninit` fails with
-    // `InvalidUninitBytes`).
-    fn require_init(&self, range: Range<usize>) -> MResult<()> {
-        self.0.require_init(range).map_err(|e| {
-            UNINIT.with_borrow_mut(|slot| {
-                if slot.is_none() {
-                    *slot = Some(e);
-                }
-            });
-            Stop
-        })
     }
 }
 
@@ -180,14 +161,18 @@ pub struct Checker<'db> {
     /// Where the running thread is.
     at: SiteId,
     thread: ThreadId,
-    /// By `ThreadId::index`: whether the thread has exited.
-    exited: Vec<bool>,
+    /// Whether `exit` ran for the main thread before `finish`.
+    main_exited: bool,
     /// The thread of each Tree Borrows frame, innermost last.
     frames: Vec<ThreadId>,
     /// By `AllocId::index`: where each allocation was made and freed, for reports.
     made_at: Vec<SiteId>,
     freed_at: Vec<SiteId>,
     leaks: bool,
+    /// The atomic load `read` just checked, whose value `atomic_load` asks for.
+    loaded: Option<(AllocId, Span)>,
+    /// Whether the bytes the last atomic `write` overwrote were all initialized.
+    overwrote_init: bool,
     found: Option<Found>,
     unsupported: Option<String>,
     runnable: Vec<ThreadId>,
@@ -200,7 +185,6 @@ impl<'db> Checker<'db> {
     }
 
     fn with_plans(ptr_size: u64, config: &Config, seed: u64, plans: Plans<'db>) -> Checker<'db> {
-        UNINIT.take();
         Checker {
             mem: Memory::with_pointer_size(ptr_size),
             borrows: Borrows::new(),
@@ -209,11 +193,13 @@ impl<'db> Checker<'db> {
             plans,
             at: SiteId::START,
             thread: ThreadId::MAIN,
-            exited: vec![false],
+            main_exited: false,
             frames: Vec::new(),
             made_at: Vec::new(),
             freed_at: Vec::new(),
             leaks: config.leaks,
+            loaded: None,
+            overwrote_init: false,
             found: None,
             unsupported: None,
             runnable: Vec::new(),
@@ -275,6 +261,7 @@ impl<'db> Checker<'db> {
     /// Miri: machine.rs, `before_memory_read` (data race, then borrow tracker).
     #[inline]
     fn plain_access(&mut self, alloc: AllocId, prov: Prov, span: Span, kind: AccessKind) -> MResult<()> {
+        self.loaded = None;
         let race = match kind {
             AccessKind::Read => self.races.read(alloc, span, None, self.at),
             AccessKind::Write => self.races.write(alloc, span, None, self.at),
@@ -297,17 +284,19 @@ impl<'db> Checker<'db> {
         prov: Prov,
         span: Span,
         kind: AccessKind,
-        ord: AtomicOrd,
-        rmw: bool,
+        (ord, rmw, cxchg_failed): (AtomicOrd, bool, bool),
     ) -> MResult<()> {
         if let Err(e) = self.borrows.access(alloc, prov, kind, span, self.at) {
             return Err(self.fail(e.into()));
         }
+        self.loaded = (kind == AccessKind::Read && !rmw && !cxchg_failed).then_some((alloc, span));
+        // A failed compare-exchange reads the latest store (`atomic_compare_exchange_scalar`).
         let race = match (kind, rmw) {
+            _ if cxchg_failed => self.races.failed_cxchg(alloc, span, ord, self.at),
             (AccessKind::Read, false) => self.races.read(alloc, span, Some(ord), self.at),
             (AccessKind::Read, true) => Ok(()),
             (AccessKind::Write, false) => self.races.write(alloc, span, Some(ord), self.at),
-            (AccessKind::Write, true) => self.races.rmw(alloc, span, Some(ord), self.at),
+            (AccessKind::Write, true) => self.races.rmw(alloc, span, ord, self.at),
         };
         race.map_err(|e| self.fail(e.into()))
     }
@@ -321,7 +310,9 @@ impl<'db> Checker<'db> {
         let span = Span::new(off, size);
         match access {
             Access::Plain => self.plain_access(alloc, prov, span, kind)?,
-            Access::Atomic { ord: o, rmw } => self.atomic_access(alloc, prov, span, kind, ord(o), rmw)?,
+            Access::Atomic { ord: o, rmw, cxchg_failed } => {
+                self.atomic_access(alloc, prov, span, kind, (ord(o), rmw, cxchg_failed))?
+            }
         }
         Ok(Some((alloc, off)))
     }
@@ -333,34 +324,29 @@ impl<'db> Checker<'db> {
 
     /// An in-place argument or the return place of a call, after `call`: retagged with a strong
     /// protector, as `&mut` on function entry, then written uninitialized through the new tag.
-    /// Returns the place with its new provenance, which the callee uses.
     // Miri: machine.rs, `protect_in_place_function_argument`; tree_borrows/mod.rs,
     // `tb_protect_place` (every permission `ReservedFrz`, strongly protected: what
     // `NewPermission::new` gives a protected `&mut` to a `Freeze` and `Unpin` pointee).
-    pub fn protect(&mut self, place: Ptr<Prov>, size: u64) -> MResult<Ptr<Prov>> {
-        let Some((alloc, off)) = self.locate(place, size)? else { return Ok(place) };
+    fn protect_place(&mut self, place: Ptr<Prov>, size: u64) -> MResult<()> {
+        let Some((alloc, off)) = self.locate(place, size)? else { return Ok(()) };
         let prov = place.prov.expect("memory names an allocation only for a pointer with provenance");
         let span = Span::new(off, size);
         let perm = NewPermission::new(PtrKind::Mut, borrows::RetagMode::FnEntry, true, true, &[]);
         let tag = match self.borrows.retag(alloc, prov, perm, span, self.at) {
             Ok(Some(tag)) => tag,
-            Ok(None) => return Ok(place),
+            Ok(None) => return Ok(()),
             Err(e) => return Err(self.fail(e.into())),
         };
         for i in 0..self.borrows.retag_accesses().len() {
             let (span, access) = self.borrows.retag_accesses()[i];
-            let race = match access {
-                AccessKind::Read => self.races.read(alloc, span, None, self.at),
-                AccessKind::Write => self.races.write(alloc, span, None, self.at),
-            };
-            if let Err(e) = race {
+            if let Err(e) = self.races.retag(alloc, span, access, self.at) {
                 return Err(self.fail(e.into()));
             }
         }
         let new = Prov::Concrete { alloc, tag };
         self.plain_access(alloc, new, span, AccessKind::Write)?;
         self.mem.uninit(alloc, span);
-        Ok(Ptr { addr: place.addr, prov: Some(new) })
+        Ok(())
     }
 
     fn record(column: &mut Vec<SiteId>, alloc: AllocId, at: SiteId) {
@@ -460,6 +446,9 @@ impl<'db> Machine<'db> for Checker<'db> {
     fn write(&mut self, ptr: Ptr<Prov>, size: u64, align: u64, access: Access, shadow: &Shadow) -> MResult<()> {
         debug_assert_eq!(shadow.0.len() as u64, size, "a write's shadow is its size");
         if let Some((alloc, off)) = self.access(ptr, size, align, access, AccessKind::Write)? {
+            if let Access::Atomic { rmw, .. } = access {
+                self.overwrote_init = rmw || self.mem.require_init(alloc, Span::new(off, size)).is_ok();
+            }
             self.mem.write(alloc, off, &shadow.0);
         }
         Ok(())
@@ -480,18 +469,33 @@ impl<'db> Machine<'db> for Checker<'db> {
         Ok(())
     }
 
-    // Miri: concurrency/weak_memory.rs, `buffered_atomic_read`.
-    fn atomic_load(&mut self, ptr: Ptr<Prov>, size: u64, o: EvalOrd, latest: &[u8]) -> MResult<Option<Vec<u8>>> {
-        let Some((alloc, off)) = self.locate(ptr, size)? else { return Ok(None) };
-        Ok(self.races.load_value(alloc, Span::new(off, size), ord(o), latest))
+    // Miri: interpret/operand.rs, `read_scalar` of an immediate (`Scalar::Uninit` fails with
+    // `InvalidUninitBytes`).
+    fn require_init(&mut self, shadow: &Shadow, range: Range<usize>) -> MResult<()> {
+        shadow.0.require_init(range).map_err(|e| self.fail(e.into()))
     }
 
-    // Miri: concurrency/weak_memory.rs, `buffered_atomic_write`.
-    fn atomic_store(&mut self, ptr: Ptr<Prov>, o: EvalOrd, bytes: &[u8]) -> MResult<()> {
-        let size = bytes.len() as u64;
-        if let Some((alloc, off)) = self.locate(ptr, size)? {
-            self.races.store_value(alloc, Span::new(off, size), ord(o), bytes);
+    // Miri: concurrency/weak_memory.rs, `buffered_atomic_read`. A read-modify-write reads the
+    // latest store (`buffered_atomic_rmw`), so only a load may read another.
+    fn atomic_load(&mut self, ptr: Ptr<Prov>, size: u64, _ord: EvalOrd, _latest: &[u8]) -> MResult<Option<Vec<u8>>> {
+        let Some((alloc, off)) = self.locate(ptr, size)? else { return Ok(None) };
+        let span = Span::new(off, size);
+        if self.loaded.take() != Some((alloc, span)) {
+            return Ok(None);
         }
+        match self.races.load_value(alloc, span) {
+            Ok(value) => Ok(value.map(<[u8]>::to_vec)),
+            Err(e) => Err(self.fail(e.into())),
+        }
+    }
+
+    // Miri: concurrency/weak_memory.rs, `buffered_atomic_write`: a location's first atomic
+    // store keeps what it held before as the store before it (`None`: not all initialized).
+    fn atomic_store(&mut self, ptr: Ptr<Prov>, o: EvalOrd, bytes: &[u8], old: &[u8]) -> MResult<()> {
+        let size = bytes.len() as u64;
+        let Some((alloc, off)) = self.locate(ptr, size)? else { return Ok(()) };
+        let old = self.overwrote_init.then_some(old);
+        self.races.store_value(alloc, Span::new(off, size), ord(o), bytes, old);
         Ok(())
     }
 
@@ -545,6 +549,10 @@ impl<'db> Machine<'db> for Checker<'db> {
         Ok(())
     }
 
+    fn protect(&mut self, place: Ptr<Prov>, size: u64) -> MResult<()> {
+        self.protect_place(place, size)
+    }
+
     fn ret(&mut self) -> MResult<()> {
         if self.frames.pop() != Some(self.thread) {
             return Err(self.stop_unsupported(
@@ -556,12 +564,16 @@ impl<'db> Machine<'db> for Checker<'db> {
         self.borrows.pop_frame(self.at).map_err(|e| self.fail(e.into()))
     }
 
-    fn spawn(&mut self) -> MResult<EvalThread> {
+    fn spawn(&mut self, thread: EvalThread) -> MResult<()> {
         let child = self.races.spawn();
-        if self.exited.len() <= child.index() {
-            self.exited.resize(child.index() + 1, false);
+        if child != ThreadId(thread) {
+            return Err(self.stop_unsupported(format!(
+                "the evaluator numbered a new thread {thread}, the race detector {}: both count \
+                 threads in creation order from the main thread's 0",
+                child.0
+            )));
         }
-        Ok(child.0)
+        Ok(())
     }
 
     fn schedule(&mut self, _running: EvalThread, runnable: &[EvalThread]) -> MResult<EvalThread> {
@@ -580,10 +592,24 @@ impl<'db> Machine<'db> for Checker<'db> {
         self.races.join(ThreadId(joined)).map_err(|e| self.fail(e.into()))
     }
 
+    // Miri: concurrency/thread.rs, `detach_thread`.
+    fn detach(&mut self, thread: EvalThread) -> MResult<()> {
+        self.races.detach(ThreadId(thread)).map_err(|e| self.fail(e.into()))
+    }
+
     fn exit(&mut self) -> MResult<()> {
         self.races.exit();
-        self.exited[self.thread.index()] = true;
+        self.main_exited |= self.thread == ThreadId::MAIN;
         Ok(())
+    }
+
+    // Miri: concurrency/thread.rs, `yield_active_thread`.
+    fn yield_now(&mut self) {
+        self.races.yield_active();
+    }
+
+    fn thread_name(&mut self, thread: EvalThread, name: &[u8]) {
+        self.races.set_thread_name(ThreadId(thread), name);
     }
 
     fn release(&mut self, object: u64) -> MResult<()> {
@@ -602,7 +628,11 @@ impl<'db> Machine<'db> for Checker<'db> {
         if !self.leaks {
             return Ok(());
         }
-        if self.exited.iter().skip(1).any(|&done| !done) {
+        if !self.main_exited {
+            self.races.exit();
+            self.main_exited = true;
+        }
+        if !self.races.all_terminated() {
             return Err(self.fail(Ub::ThreadsLeft));
         }
         self.mem.leaks().map_err(|leaks| self.fail(Ub::Leak(leaks)))
@@ -638,10 +668,7 @@ fn outcome<'db>(
     result: Result<(), MirEvalError<'db>>,
     seed: u64,
 ) -> Option<Outcome> {
-    let pending = UNINIT.take();
-    let found = checker.found.clone().or_else(|| {
-        pending.map(|e| Found { ub: Ub::Memory(e), thread: checker.thread, at: checker.at })
-    });
+    let found = checker.found.clone();
     let mut stack = Vec::new();
     let error = match &result {
         Ok(()) => None,

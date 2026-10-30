@@ -39,6 +39,9 @@ use crate::{
 /// Writers a store can have: a ticket names its writer's segment by number.
 pub(crate) const SEGMENTS_MOST: usize = 4096;
 
+/// The most a chunked value reserves before its pieces are read: past it, it grows as they are.
+const LIST_RESERVE: u64 = 64 << 20;
+
 /// What the store and every reader and writer of it share.
 pub(crate) struct Shared {
     view: AtomicPtr<View>,
@@ -587,11 +590,20 @@ impl<'a> Look<'a> {
             }
             Form::Chunked => {
                 let chunks = disk::decode_chunks(payload).map_err(|what| corrupt(what.into()))?;
-                let total: u64 = chunks.iter().map(|(_, len)| *len).sum();
+                let mut total = 0u64;
+                for (chunk, len) in &chunks {
+                    if *len > crate::chunk::MAX as u64 {
+                        return Err(corrupt(format!("its chunk {} is {len} bytes, longer than a chunk", chunk.0)));
+                    }
+                    total = total.checked_add(*len).ok_or_else(|| corrupt("its chunks' lengths overflow".into()))?;
+                }
                 if total != header.raw {
                     return Err(corrupt(format!("its chunks are {total} bytes, not the {} recorded", header.raw)));
                 }
-                let mut whole = Vec::with_capacity(total as usize);
+                // Grown as pieces are read, at most `LIST_RESERVE` reserved once the first is:
+                // one chunk may be listed any number of times, so the lengths, which nothing has
+                // verified yet, bound nothing.
+                let mut whole = Vec::new();
                 for (chunk, len) in chunks {
                     let piece = self
                         .find(&chunk)
@@ -602,6 +614,9 @@ impl<'a> Look<'a> {
                     let (_, piece) = self.value(piece, &chunk, why)?;
                     if piece.len() as u64 != len {
                         return Err(corrupt(format!("its chunk {} is of another length", chunk.0)));
+                    }
+                    if whole.is_empty() {
+                        whole.reserve_exact(piece.len().max(total.min(LIST_RESERVE) as usize));
                     }
                     whole.extend_from_slice(&piece);
                 }

@@ -48,6 +48,7 @@ const MAX_LINKS: usize = 40;
 pub(crate) type Blob = (Arc<[u8]>, Mode);
 
 /// What a transaction leaves at each path it touched: a new file, or nothing.
+// BTreeMap: range queries for the paths under a directory.
 pub(crate) type Pending = BTreeMap<String, Option<Blob>>;
 
 /// The paths an op reads or changes.
@@ -201,7 +202,7 @@ impl Tree {
 
     /// The node of a directory with these entries, in any order; names must be distinct.
     pub(crate) fn dir(&mut self, mut entries: Vec<Entry>) -> NodeId {
-        entries.sort_unstable_by(|a, b| self.name_bytes(a.0).cmp(self.name_bytes(b.0)));
+        blaze_ids::names::sort_by_name_in(&mut entries, |it| self.name_bytes(it.0));
         self.dir_sorted(&mut entries)
     }
 
@@ -447,12 +448,13 @@ impl Tree {
 
     /// The files under the directory `path`, as the transaction sees them so far.
     fn files_under(&self, base: NodeId, pending: &Pending, path: &str) -> Vec<(String, Blob)> {
-        let mut found: BTreeMap<String, Blob> = BTreeMap::new();
+        // The base's files are those `pending` has no say on, so no path is found twice.
+        let mut found: Vec<(String, Blob)> = Vec::new();
         let gone = pending.contains_key(path) || shadowed(pending, path);
         if !gone && let Some(dir) = self.lookup(base, path).filter(|it| self.is_dir(*it)) {
             for (file, node, mode) in self.files(dir, Mode::Regular, path) {
                 if !pending.contains_key(&file) && !shadowed(pending, &file) {
-                    found.insert(file, (self.bytes(node).expect("a file").clone(), mode));
+                    found.push((file, (self.bytes(node).expect("a file").clone(), mode)));
                 }
             }
         }
@@ -462,10 +464,12 @@ impl Tree {
                 break;
             }
             if let Some(blob) = blob {
-                found.insert(file.clone(), blob.clone());
+                found.push((file.clone(), blob.clone()));
             }
         }
-        found.into_iter().collect()
+        // Component order is not string order (`a-b` < `a/b`): sorted by path once.
+        found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        found
     }
 
     /// Checks `op` against `base` with the ops staged before it in `pending`, and stages it.

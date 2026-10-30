@@ -18,6 +18,8 @@ use std::{
     path::Path,
 };
 
+use rustc_hash::FxHashMap;
+
 use super::{
     cli::Invocation,
     plan,
@@ -129,8 +131,8 @@ impl Cached {
 }
 
 /// The first key of each test of a program that may be kept, and whether it reaches the world
-/// outside its code; and the program's [`Passed`].
-pub struct Keys(BTreeMap<String, (Key, bool)>, std::cell::RefCell<Passed>);
+/// outside its code; and the program's [`Passed`]. Walked sorted by name ([`Keys::settle`]).
+pub struct Keys(FxHashMap<String, (Key, bool)>, std::cell::RefCell<Passed>);
 
 /// What a run of a program of tests ended with, for [`Keys::settle`].
 pub struct Ended<'a> {
@@ -154,7 +156,11 @@ impl Keys {
     pub fn settle(&self, results: &mut Results, ended: &Ended<'_>) -> Vec<String> {
         let ran: Vec<&String> = match ended.ran {
             Some(names) => names.iter().collect(),
-            None => self.0.keys().collect(),
+            None => {
+                let mut all: Vec<&String> = self.0.keys().collect();
+                all.sort_unstable();
+                all
+            }
         };
         let failures: BTreeSet<&str> = match (ended.failed, ended.failures) {
             (false, _) => BTreeSet::new(),
@@ -226,7 +232,8 @@ pub fn pick(
     let mut results = results;
     let mut passed = Passed::read(results.is_some().then_some(dir));
     let (mut names, mut keys, mut always, mut reaching) =
-        (Vec::new(), BTreeMap::new(), Vec::new(), Vec::new());
+        (Vec::new(), FxHashMap::default(), Vec::new(), Vec::new());
+    // BTreeMap: `cached` is walked in name order here and by each of `run.rs`'s reports.
     let (mut cached, mut flaky, mut total, mut planned) =
         (BTreeMap::new(), Vec::new(), 0, Vec::new());
     for line in lines {

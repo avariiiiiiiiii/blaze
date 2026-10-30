@@ -28,6 +28,7 @@ mod used;
 use hir::{HirFileId, InFile};
 use hir_expand::MacroCallKind;
 use rustc_hash::FxHashMap;
+use smallvec::{SmallVec, smallvec};
 use syntax::{SyntaxNodePtr, TextRange};
 
 use crate::{
@@ -47,7 +48,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
     buffered.extend(globs::lints(cx, &uses));
     let mut unused = unused::Unused::of(cx, &uses);
     buffered.append(&mut unused.resolve);
-    buffered.extend(qualifications::lints(cx, &walk, &unused));
+    buffered.extend(qualifications::lints(cx, &walk, &uses, &unused));
     let mut keyed: Vec<_> = buffered
         .into_iter()
         .map(|found| (found.lint_at.clone().map(|at| places.place(cx, at)).unwrap_or_default(), found))
@@ -63,19 +64,23 @@ pub(super) fn lints(cx: &Cx<'_, '_>) -> Vec<Found> {
 /// it is reached through, outermost first, then its own; as the syntax lints' walk places them.
 pub(super) struct Places {
     /// Each module file's place: where its `mod` item is, itself placed.
-    files: FxHashMap<HirFileId, Vec<(u32, u32)>>,
+    files: FxHashMap<HirFileId, Place>,
 }
+
+/// A place, compared as rustc's walk order: inline up to four deep, which covers a node in a
+/// macro call in a module file in a module file.
+pub(super) type Place = SmallVec<[(u32, u32); 4]>;
 
 impl Places {
     fn of(cx: &Cx<'_, '_>) -> Places {
-        let mut files: FxHashMap<HirFileId, Vec<(u32, u32)>> = FxHashMap::default();
+        let mut files: FxHashMap<HirFileId, Place> = FxHashMap::default();
         for module in crate::checks::modules(cx) {
             let Some(file) = module.as_source_file_id(cx.db) else { continue };
             let file = HirFileId::from(file);
             if files.contains_key(&file) {
                 continue;
             }
-            let mut place = Vec::new();
+            let mut place = Place::new();
             if let Some(declared) = module.declaration_source_range(cx.db) {
                 let declared = declared.original_node_file_range_rooted(cx.db);
                 place = files.get(&HirFileId::from(declared.file_id)).cloned().unwrap_or_default();
@@ -87,8 +92,8 @@ impl Places {
     }
 
     /// The place of `at`.
-    pub(super) fn place(&self, cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Vec<(u32, u32)> {
-        let mut inner = vec![entered(at.value.text_range())];
+    pub(super) fn place(&self, cx: &Cx<'_, '_>, at: InFile<SyntaxNodePtr>) -> Place {
+        let mut inner: SmallVec<[(u32, u32); 2]> = smallvec![entered(at.value.text_range())];
         let mut file = at.file_id;
         while let Some(call) = file.macro_file() {
             let loc = call.loc(cx.db);

@@ -312,6 +312,9 @@ fn set_from_the_unit_or_passed_through() {
     whole.extend(env.passed_through().map(|(n, v)| (n.to_owned(), v.to_owned())));
     assert_eq!(whole, env.vars, "the two make the whole environment");
     assert_eq!(set.len(), env.from_unit.len(), "every name set from the unit is in the environment");
+    let in_order: Vec<&OsStr> = env.set_from_unit().map(|(name, _)| name).collect();
+    assert!(in_order.windows(2).all(|it| it[0] < it[1]), "set from the unit in name order");
+    assert!(in_order.iter().all(|name| env.from_unit.contains(*name)));
 
     // The same unit from another shell: what is set from the unit is the same.
     let other = super::env(&unit, &os(&[("PATH", "/nix/bin:/bin"), ("HOME", "/home/me")])).unwrap();

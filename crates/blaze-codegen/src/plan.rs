@@ -68,6 +68,7 @@ pub struct Profile {
     pub debuginfo: DebugInfo,
     pub panic: Panic,
     /// `[profile.<name>.package.<name>]`, by package name, and `"*"`.
+    // BTreeMap: `Profile` is serialized and hashed.
     pub packages: BTreeMap<String, Override>,
     /// `[profile.<name>.build-override]`.
     pub build_override: Override,

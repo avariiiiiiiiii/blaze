@@ -20,10 +20,13 @@ blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-live.workspace = true
+bumpalo.workspace = true
 gimli.workspace = true
+hashbrown.workspace = true
 object.workspace = true
 rayon.workspace = true
 rustc-hash.workspace = true
+smallvec.workspace = true
 
 [dev-dependencies]
 object = { workspace = true, features = ["write"] }

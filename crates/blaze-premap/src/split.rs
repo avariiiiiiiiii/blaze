@@ -29,6 +29,10 @@ use crate::PremapError;
 use crate::key::{KeyedFunction, KeyedStatic, static_definition};
 use crate::table::{SymbolId, TableView};
 
+/// The sections whose pieces the run's start orders across both sides; any other named
+/// section is one range per link.
+const ORDERED_SECTIONS: [&str; 4] = [".init_array", ".fini_array", "__DATA,__mod_init_func", ".CRT$XCU"];
+
 /// What codegen says is the dependencies', each list sorted.
 #[derive(Clone, Copy, Debug)]
 pub struct Owned<'a> {
@@ -171,6 +175,19 @@ pub fn image_part<'a>(
             instance: value.instance,
             definition: static_definition(value),
         });
+    }
+    for value in built.statics {
+        let Some(section) = value.section.as_deref() else { continue };
+        if is_dep_static(&value.item, &value.instance) || ORDERED_SECTIONS.contains(&section) {
+            continue;
+        }
+        if let Some(dep) = statics.iter().find(|it| it.section.as_deref() == Some(section)) {
+            return Err(PremapError::new(format!(
+                "the section `{section}` has the dependency static {:?} and the workspace static {:?}: \
+                 its `__start_`/`__stop_` range would span two images",
+                dep.item, value.item
+            )));
+        }
     }
     if statics.len() != owned.statics.len() {
         return Err(PremapError::new(format!(

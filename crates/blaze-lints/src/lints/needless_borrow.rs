@@ -18,7 +18,7 @@ use syntax::{
 use super::utils;
 use crate::{check::Cx, diag::Applicability, sugg::has_enclosing_paren};
 
-const LINT: &str = "needless_borrow";
+const LINT: super::Implemented = super::Implemented::NeedlessBorrow;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if !cx.on(LINT) || cx.expansion.is_some() {

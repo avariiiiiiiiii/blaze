@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     diag::{Diagnostic, MultiSpan, Span, Sublevel},
-    registry::{self, Group, Info, Named},
+    registry::{self, Group, Info, LintIndex, Named},
 };
 
 /// A lint level, in rustc's order: a level above another wins over it where one is capped.
@@ -79,8 +79,8 @@ impl Level {
 /// What a level set applies to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Target {
-    /// A lint of clippy's, without `clippy::`.
-    Lint(String),
+    /// A lint of clippy's.
+    Lint(LintIndex),
     Group(Group),
     /// `clippy::all`.
     All,
@@ -102,7 +102,7 @@ impl Target {
             return (!name.contains("::")).then_some(Target::Rustc(name));
         };
         Some(match registry::named(rest)? {
-            Named::Lint(info) => Target::Lint(info.name.to_owned()),
+            Named::Lint(info) => Target::Lint(info.index()),
             Named::Group(group) => Target::Group(group),
             Named::All => Target::All,
             Named::Renamed(new) => return Target::of(new),
@@ -110,9 +110,10 @@ impl Target {
         })
     }
 
-    fn covers(&self, lint: Lint<'_>) -> bool {
+    /// Whether it sets the level of `lint`, whose index is `index` when it is clippy's.
+    fn covers(&self, lint: Lint<'_>, index: Option<LintIndex>) -> bool {
         match (self, lint) {
-            (Target::Lint(name), Lint::Clippy(info)) => name == info.name,
+            (Target::Lint(it), Lint::Clippy(_)) => Some(*it) == index,
             (Target::Group(group), Lint::Clippy(info)) => *group == info.group,
             (Target::All, Lint::Clippy(info)) => info.group.in_all(),
             (Target::Warnings, Lint::Warnings) => true,
@@ -315,13 +316,17 @@ impl Levels {
     /// The level set for `lint`, if one is: each set in order, the command line's first, a
     /// set of `forbid` or of `--force-warn` kept over those after it.
     fn probe(&self, lint: Lint<'_>, sets: &[Set]) -> Option<Spec> {
-        let mut found: Option<Spec> = None;
+        let index = match lint {
+            Lint::Clippy(info) => Some(info.index()),
+            Lint::Warnings | Lint::Rustc(_) => None,
+        };
+        let mut found: Option<&Spec> = None;
         let attrs = sets.iter().map(|it| (&it.target, &it.spec));
         for (target, spec) in self.sets.iter().map(|(target, spec)| (target, spec)).chain(attrs) {
-            if !target.covers(lint) {
+            if !target.covers(lint, index) {
                 continue;
             }
-            if let Some(current) = &found {
+            if let Some(current) = found {
                 let sticky = current.level == Level::Forbid
                     || (current.level == Level::ForceWarn
                         && matches!(current.source, Source::CommandLine { .. }));
@@ -329,9 +334,9 @@ impl Levels {
                     continue;
                 }
             }
-            found = Some(spec.clone());
+            found = Some(spec);
         }
-        found
+        found.cloned()
     }
 }
 

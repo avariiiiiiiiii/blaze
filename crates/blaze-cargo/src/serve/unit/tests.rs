@@ -405,6 +405,7 @@ fn a_program_runs_with_cargos_variables_over_the_jobs() {
         ("SECRET_TOKEN".to_owned(), "hunter2".to_owned()),
     ];
     let process = run::process_env(&job, &it, "linux");
+    assert!(process.windows(2).all(|it| it[0].0 < it[1].0), "{process:?}");
     let get = |name: &str| process.iter().find(|(it, _)| it == name).map(|(_, value)| value.clone());
     assert_eq!(get("CARGO_PKG_NAME"), Some(OsString::from("p")));
     assert_eq!(get("SECRET_TOKEN"), Some(OsString::from("hunter2")));

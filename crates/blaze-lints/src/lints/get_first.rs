@@ -9,7 +9,7 @@ use syntax::{AstNode, ast};
 use super::utils;
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "get_first";
+const LINT: super::Implemented = super::Implemented::GetFirst;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if !cx.on(LINT) {

@@ -1494,7 +1494,7 @@ impl HirColumns<Frozen> {
 #[cfg(test)]
 mod tests {
     use hir_expand::mod_path::{ModPath, PathKind};
-    use intern::{Interned, Symbol};
+    use intern::Symbol;
 
     use super::*;
     use crate::{
@@ -1524,7 +1524,7 @@ mod tests {
     }
 
     fn path(text: &str) -> Path {
-        Path::BarePath(Interned::new(ModPath::from_segments(PathKind::Plain, [name(text)])))
+        Path::BarePath(ModPath::from_segments(PathKind::Plain, [name(text)]))
     }
 
     struct Values {

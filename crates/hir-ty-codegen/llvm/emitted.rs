@@ -8,6 +8,8 @@
 //! of each other they call by the names of requests, as they call anything else; constants
 //! more than one of them uses are a data object of their own.
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::{
     binemit::Reloc,
     gimli::{

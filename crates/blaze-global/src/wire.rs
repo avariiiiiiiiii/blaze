@@ -35,12 +35,22 @@ use crate::{
     sign::{SIGNED_LEN, Signed},
 };
 
+/// Whether a batch holding `bytes` of values takes a next of `len`.
+pub(crate) fn takes(bytes: u64, len: u64) -> bool {
+    bytes == 0 || bytes + len <= BATCH_BYTES
+}
+
 pub const VERSION: u16 = 1;
 
 /// The most bytes of one value: the remote tier's bound.
 pub const LONGEST_VALUE: u64 = blaze_cas::remote::LONGEST_VALUE;
 /// The most keys one fetch names.
 pub const BATCH_MOST: usize = 4096;
+/// A fetch's answer, or a publish, carries values of about this many bytes: it takes its
+/// first value whatever its length, then the next while they are no more than this.
+pub const BATCH_BYTES: u64 = 64 << 20;
+/// The most bytes of a body: a batch whose first value is the longest, and its framing.
+pub const BODY_MOST: u64 = LONGEST_VALUE + BATCH_BYTES + (8 << 20);
 /// The most bytes of one piece: more than any chunk the store cuts.
 pub const PIECE_MOST: usize = 1 << 20;
 /// Values from this long on travel as content-defined chunks.

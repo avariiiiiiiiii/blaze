@@ -5,7 +5,15 @@ Native expanders for serde_derive, thiserror-impl 1 and 2 and tokio-macros (#129
 `docs/v2/plan/lanes/usercode/macros-native.md`. Written, not built. The code reads the vendored
 copies below with `include_bytes!`, so it does not compile until request 1 is applied.
 
+> **Superseded, 2026-10-29.** Change 20 of `docs/v2/plan/design/compile-time.md` replaces
+> #1297: proc macros run as their own code on the MIR evaluator and the copy-and-patch tier,
+> built by lane fastcompile. Requests 1 to 4 are withdrawn; apply what is left of them no
+> further. Keep the root `native-proc-macro` and `blaze-expand`'s line for it: the bridge
+> left in `native/` uses it. Requests 6 and 7 replace the rest.
+
 ## 1. To the coordinator: vendor nine crates under `vendor/native-macros/`
+
+> withdrawn 2026-10-29: superseded by compile-time.md change 20.
 
 What: one directory per package, named `<name>-<version>`, holding exactly the files of its
 `.crate` as published on crates.io (the same as `~/.cargo/registry/src/index.crates.io-*/<name>-<version>/`
@@ -87,6 +95,9 @@ syn 2 the default set; proc-macro2 and quote default and proc-macro; serde_deriv
 
 ## 2. To the coordinator: workspace dependencies (root `Cargo.toml`)
 
+> withdrawn 2026-10-29: superseded by compile-time.md change 20. Keep the `native-proc-macro`
+> line already added; the bridge uses it.
+
 ```toml
 native-proc-macro = { package = "blaze-native-proc-macro", path = "crates/blaze-expand/src/native/proc_macro" }
 native-proc-macro2 = { package = "blaze-native-proc-macro2", path = "vendor/native-macros/proc-macro2-1.0.107" }
@@ -104,6 +115,8 @@ the workspace; nothing in `members` or `exclude` needs to change. `blake3`, `int
 > applied: `native-proc-macro` (its crate exists) in the root `[workspace.dependencies]`. The five entries on `vendor/native-macros/*` wait for request 1: a workspace dependency on a directory that does not exist stops the workspace from loading once blaze-expand names it, so they land with the vendoring (`requests` adds them the pass after the directories appear).
 
 ## 3. To the parent (usercode-macros): `crates/blaze-expand/Cargo.toml`
+
+> withdrawn 2026-10-29: superseded by compile-time.md change 20; request 7 says what to undo.
 
 Add to `[dependencies]`:
 
@@ -128,6 +141,9 @@ library miss), e.g.
 > forwarded to usercode: `crates/blaze-expand/` is lane usercode's; its five `native-*` lines wait for request 1.
 
 ## 4. To the coordinator: register the description hook
+
+> withdrawn 2026-10-29: superseded by compile-time.md change 20. Its key for a macro library
+> (request 6) may still want `own_macro::description_of`; that is fastcompile's to ask for.
 
 Where: `crates/blaze-engine/src/lib.rs`, `held_wide()`, beside `blaze_expand::install(…)`
 (blaze-cargo does not depend on blaze-expand; blaze-engine depends on both), and a function in
@@ -186,3 +202,50 @@ more than one step (bitflags' `__impl_*` macros are separate expansions, each wi
 contexts, so it could not be exact. The reasoning is in the notes.
 
 > forwarded to db: a note, nothing to change in `hir-expand`.
+
+## 6. To fastcompile (forwarded by the coordinator): what this lane has on the proc-macro bridge
+
+What: take what is useful of `crates/blaze-expand/src/native/` for change 20's proc-macro
+bridge. The list, with what each piece gives, is the section "For fastcompile: the proc-macro
+bridge" of `docs/v2/plan/lanes/usercode/macros-native.md`. In short:
+- the bridge's whole surface as one 20-function `Host` trait (`proc_macro/lib.rs`, the wasm
+  guest's `proc_macro` with its imports routed to a thread-local host);
+- `host.rs`, which answers those 20 exactly as the wasm host does, span numbering included;
+- reentrancy-safe host installation and panic capture;
+- a one-pass reader from the wire encoding into `TopSubtree`;
+- `difference`, a differential check against the wasm modules or rustc;
+- `native::expand(Expander, …)`, the bridge's entry for a macro compiled against the shim, with
+  tests that run small macros through it (spans, sites, parsed streams, attributes, panics,
+  an expansion within an expansion);
+- a design for the output cache's "macro version": a stat-cached content identity of a macro
+  library's whole closure. It was `closure.rs`, removed from the tree and kept in git at
+  `df97d0934a`. The key also has to cover the environment variables and files the macro read.
+
+Why: change 20 runs the macro's own code, so none of the vendored-copy matching applies, and
+that part is deleted. The bridge has to answer the same 20 questions the same way the wasm host
+does, or the outputs differ. What is left in `native/` depends on no vendored crate. It is
+written, not built.
+
+> forwarded to fastcompile.
+
+## 7. To the parent (usercode-macros): two `blaze-expand` dependencies to drop
+
+What: in `crates/blaze-expand/Cargo.toml`, remove `blake3` and `serde_json`. Since the turn-4
+change below, no code of the crate uses either. The other dependencies `native/` uses stay:
+`native-proc-macro`, `intern`, `ra-ap-rustc_lexer`, `rustc-hash`, `base-db`, `hir-expand`,
+`load-cargo`, `span` and `tt`.
+
+Why: `native/` is now only the bridge, matching what your `lib.rs` doc says of it. Deleted:
+- `closure.rs`, `files.rs` and `verified.rs`;
+- `Macro`, `find`, `describe_with`, `Closure`, `Package` and `report`.
+
+They are in git at `df97d0934a` if anyone wants them back. What is left:
+- `pub enum Expander { One(fn(TokenStream) -> TokenStream), Two(fn(TokenStream, TokenStream) -> TokenStream) }`;
+- `pub fn expand(expander, db: Option<&dyn SourceDatabase>, subtree, attrs, def_site, call_site, mixed_site) -> Result<TopSubtree, ProcMacroExpansionError>`;
+- `pub fn difference`;
+- `pub use TokenStream`;
+- `host.rs`, `wire.rs`, `lex.rs` and `proc_macro/`.
+
+It compiles with no vendored crate. A `System` error no longer names the macro; the caller does.
+
+> forwarded to usercode: usercode-macros's `blaze-expand`.

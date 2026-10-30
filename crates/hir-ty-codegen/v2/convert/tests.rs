@@ -63,7 +63,7 @@ fn requests() -> Requests {
     }
 }
 
-fn convert(code: &Code, requests: &Requests) -> Result<blaze_codegen::CompiledFunction, String> {
+fn convert(code: Code, requests: &Requests) -> Result<blaze_codegen::CompiledFunction, String> {
     let isa = &**crate::target().expect("the host's isa");
     let func = |_: u32, _: &FuncRequest| Ok(callee());
     let data = |index: u32, _: &DataRequest| {
@@ -89,7 +89,7 @@ fn relocations_point_at_their_targets() {
         ],
         Vec::new(),
     );
-    let compiled = convert(&code, &requests()).expect("converted");
+    let compiled = convert(code, &requests()).expect("converted");
     let targets: Vec<_> = compiled.relocs.iter().map(|it| it.target.clone()).collect();
     assert_eq!(targets[0], callee());
     assert_eq!(targets[1], Target::Data(compiled.data[1].id));
@@ -109,7 +109,7 @@ fn loading(datas: &[u32]) -> Code {
 
 #[test]
 fn data_points_only_at_data_before_it() {
-    let compiled = convert(&loading(&[1, 3]), &requests()).expect("converted");
+    let compiled = convert(loading(&[1, 3]), &requests()).expect("converted");
     for (index, data) in compiled.data.iter().enumerate() {
         for reloc in &data.relocs {
             if let Target::Data(id) = &reloc.target {
@@ -133,7 +133,7 @@ fn equal_data_is_one_object() {
     let mut requests = requests();
     let again = blob(b"inner\0\0\0", Vec::new(), Vec::new());
     requests.datas.push(DataRequest::Blob { blob: again, identity: DataIdentity::Shared });
-    let compiled = convert(&loading(&[1, 3, 4]), &requests).expect("converted");
+    let compiled = convert(loading(&[1, 3, 4]), &requests).expect("converted");
     assert_eq!(compiled.data.len(), 4);
 }
 
@@ -141,10 +141,10 @@ fn equal_data_is_one_object() {
 /// leave out what each other names.
 #[test]
 fn data_nothing_names_is_left_out() {
-    let compiled = convert(&loading(&[0]), &requests()).expect("converted");
+    let compiled = convert(loading(&[0]), &requests()).expect("converted");
     assert_eq!(compiled.data.len(), 1);
     assert_eq!(compiled.data[0].bytes, b"inner\0\0\0");
-    assert!(convert(&loading(&[]), &requests()).expect("converted").data.is_empty());
+    assert!(convert(loading(&[]), &requests()).expect("converted").data.is_empty());
 }
 
 #[test]
@@ -155,37 +155,37 @@ fn a_thunk_calls_the_body() {
         name: ModuleRelocTarget::User { namespace: crate::v2::fold::BODY, index: 0 },
         addend: -4,
     };
-    let compiled = convert(&code(vec![call], Vec::new()), &requests()).expect("converted");
+    let compiled = convert(code(vec![call], Vec::new()), &requests()).expect("converted");
     assert_eq!(compiled.relocs[0].target, Target::Extern("body".to_owned()));
 }
 
 #[test]
 fn line_rows_take_their_spans() {
     let lines = vec![LineRow { offset: 0, span: 1 }, LineRow { offset: 4, span: 0 }];
-    let compiled = convert(&code(Vec::new(), lines), &requests()).expect("converted");
+    let compiled = convert(code(Vec::new(), lines), &requests()).expect("converted");
     let lines: Vec<_> = compiled.lines.iter().map(|it| (it.at, it.span)).collect();
     assert_eq!(lines, vec![(0, span(1)), (4, span(0))]);
     let past = vec![LineRow { offset: 0, span: 2 }];
-    assert!(convert(&code(Vec::new(), past), &requests()).is_err());
+    assert!(convert(code(Vec::new(), past), &requests()).is_err());
 }
 
 #[test]
 fn what_v2_has_no_target_for_is_an_error() {
     let inlined = reloc(1, binemit::Reloc::X86CallPCRel4, crate::fragment::INLINED, 0);
-    assert!(convert(&code(vec![inlined], Vec::new()), &requests()).is_err());
+    assert!(convert(code(vec![inlined], Vec::new()), &requests()).is_err());
     let offset = ModuleReloc {
         offset: 1,
         kind: binemit::Reloc::X86PCRel4,
         name: ModuleRelocTarget::FunctionOffset(FuncId::from_u32(0), 8),
         addend: 0,
     };
-    assert!(convert(&code(vec![offset], Vec::new()), &requests()).is_err());
+    assert!(convert(code(vec![offset], Vec::new()), &requests()).is_err());
     let mut writable = requests();
     writable.datas[0] = DataRequest::Blob {
         blob: blob(b"x", Vec::new(), Vec::new()),
         identity: DataIdentity::Writable,
     };
-    assert!(convert(&loading(&[0]), &writable).is_err());
+    assert!(convert(loading(&[0]), &writable).is_err());
 }
 
 #[test]

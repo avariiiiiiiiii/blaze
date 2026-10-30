@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: How blaze-live applies a patch fast (one read of the message into a reused buffer, viewed in place, a pool of four tables brought between generations by their cells, one release store, page runs written once, a watcher thread instead of 5 ms polling), before and after per patch, what it measures against, and what is left; nothing in it was built or run.
+summary: How blaze-live applies a patch fast (one read of the message into a reused buffer, viewed in place, a pool of four tables brought between generations by their cells, one release store, page runs written once, a watcher thread instead of 5 ms polling), the safety audit's answers (memory a patch never writes again, image checks), before and after per patch, what it measures against, and what is left; nothing in it was built or run.
 date: 2026-10-29
 ---
 # speed-link-edge-live: the patch apply path of blaze-live
@@ -117,9 +117,8 @@ Linux. There are `const` size asserts on `Span` (24 bytes).
   pool of tables against a whole table per generation, and the encoder against the old one,
   byte for byte.
 - **Not yet bound by the workspace lints**: `blaze-live` has no dependencies and isn't
-  `[lints] workspace = true` (the `safety-audit` lane lists it), and the v1 modules
-  (`linux.rs`, `macos.rs`, `windows.rs`, `sample.rs`, `lib.rs`) are kept as they were, with
-  blocks of several operations. The unsafe in `slots/` is spread over the platform files rather
+  `[lints] workspace = true` (the `safety-audit` lane lists it). It can take them once
+  `v2/requests/link.md` item 12 is in. The unsafe in `slots/` is spread over the platform files rather
   than one `raw.rs`: each platform's file is the module that reaches its kernel, and the
   switch's unsafe is only `Writes::put`, `Switch::image` and the cell's first load.
 - **For the safety lane**: the pool's relaxed slot stores published by one release store,
@@ -128,6 +127,35 @@ Linux. There are `const` size asserts on `Span` (24 bytes).
   a cell loaded before the switch. The property is that every slot read is the old or the
   new generation's whole value. `Message::view` is the untrusted-bytes parser to fuzz; the
   corruption test in `patch.rs` is a start.
+
+## Safety audit
+
+The `safety-audit` lane's findings on blaze-live are in `v2/requests/link.md`, under "## From
+safety-audit". The answer, and what the linker owes, is item 12 there. Every proposed comment
+and split is applied, in the v1 modules too, since blaze-engine, blaze-cargo, the demos and the
+live harnesses still run on them. The checks below decline a patch rather than write it.
+
+- **Lasting memory (`slots/switch.rs` `Lasting`)**: code of a generation once registered or
+  published, its registered FDEs, each run's zero terminator and Windows UNWIND_INFO are never
+  written again, even after a rollback or eviction, since a thread may still be in that code
+  and the unwinder holds pointers into those tables (findings 7 and 8). This needs the linker
+  to keep patch placement monotonic across rollbacks and give each EhFrame run its own
+  terminator (item 12 a and b). Until then, such patches are declined.
+- **Data placement (`slots/`)**: data over the loader's table is refused, and each platform
+  checks that data lies in the image and in pages with some access (finding 10).
+- **v1**:
+  - A failed apply still moves `next` past the patch (finding 1).
+  - Writes must lie in the executable's image (3).
+  - macOS bounds are checked (4, 5), and so is the Windows function table (12).
+  - Linux registers its `.eh_frame` run once, with its terminator found first (6).
+  - The counters are atomics, loaded relaxed (11).
+- **Stated, not fixed**: v1 writes jumps over function entries and statics under running threads
+  (2), and both runtimes write data in place (9). The `lib.rs` and `slots` `poll` docs give the
+  program the rule, and the comments mark these as "NOT upheld". The fixes belong to the linker
+  (item 12 c and d).
+- **Tests**: `registered_unwind_entries_are_never_written_again`, plus bad-patch cases for
+  UNWIND_INFO past the writes and for data over the loader's table. The "third" step of
+  `patches_switch_the_table_and_roll_back` now places code past the earlier generation's.
 
 ## What is left
 

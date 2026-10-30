@@ -16,8 +16,9 @@
 //! submodule.
 //!
 //! Reading flags costs one walk of an item's attributes, once per item (the query is cached).
-//! Each attribute's name is found in a static index ([`word`]): a hash of its length and three of
-//! its bytes, one probe on average and one byte compare, never a `String` built. A value query
+//! Each attribute's name, and each name inside one the flags or a value query reads (`doc`,
+//! `repr`, `link`, ...), is found by a perfect hash built at compile time ([`name_set!`]): one
+//! hash of its bytes and one compare, never a `String` built. A value query
 //! (`lang`, `repr`, `export_name`, ...) runs only for an item whose flag says it has the
 //! attribute.
 
@@ -78,14 +79,14 @@ fn extract_doc_tt_attr(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
         if !name.kind().is_any_identifier() {
             continue;
         }
-        let name = name.text();
+        let name = DocWord::of(name.text());
         match iter.peek() {
             Some(NodeOrToken::Token(eq)) if eq.kind() == T![=] => {
                 iter.next();
                 let Some(NodeOrToken::Token(value)) = iter.next() else { continue };
                 let flag = match name {
-                    "alias" => AttrFlags::HAS_DOC_ALIASES,
-                    "keyword" => AttrFlags::HAS_DOC_KEYWORD,
+                    Some(DocWord::alias) => AttrFlags::HAS_DOC_ALIASES,
+                    Some(DocWord::keyword) => AttrFlags::HAS_DOC_KEYWORD,
                     _ => continue,
                 };
                 if ast::String::cast(value).is_some_and(|it| it.value().is_ok()) {
@@ -93,14 +94,14 @@ fn extract_doc_tt_attr(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
                 }
             }
             Some(NodeOrToken::Node(_)) => {
-                if name == "alias" {
+                if name == Some(DocWord::alias) {
                     iter.next();
                     attr_flags.insert(AttrFlags::HAS_DOC_ALIASES);
                 }
             }
             _ => match name {
-                "notable_trait" => attr_flags.insert(AttrFlags::IS_DOC_NOTABLE_TRAIT),
-                "hidden" => attr_flags.insert(AttrFlags::IS_DOC_HIDDEN),
+                Some(DocWord::notable_trait) => attr_flags.insert(AttrFlags::IS_DOC_NOTABLE_TRAIT),
+                Some(DocWord::hidden) => attr_flags.insert(AttrFlags::IS_DOC_HIDDEN),
                 _ => {}
             },
         }
@@ -112,13 +113,17 @@ fn extract_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
     if let Ok(NodeOrToken::Token(option)) = Itertools::exactly_one(tt)
         && option.kind().is_any_identifier()
     {
-        match option.text() {
-            "ignore_flyimport" => attr_flags.insert(AttrFlags::COMPLETE_IGNORE_FLYIMPORT),
-            "ignore_methods" => attr_flags.insert(AttrFlags::COMPLETE_IGNORE_METHODS),
-            "ignore_flyimport_methods" => {
+        match Completions::of(option.text()) {
+            Some(Completions::ignore_flyimport) => {
+                attr_flags.insert(AttrFlags::COMPLETE_IGNORE_FLYIMPORT)
+            }
+            Some(Completions::ignore_methods) => {
+                attr_flags.insert(AttrFlags::COMPLETE_IGNORE_METHODS)
+            }
+            Some(Completions::ignore_flyimport_methods) => {
                 attr_flags.insert(AttrFlags::COMPLETE_IGNORE_FLYIMPORT_METHODS)
             }
-            _ => {}
+            None => {}
         }
     }
 }
@@ -128,11 +133,11 @@ fn extract_ra_macro_style(attr_flags: &mut AttrFlags, tt: ast::TokenTree) {
     if let Ok(NodeOrToken::Token(option)) = Itertools::exactly_one(tt)
         && option.kind().is_any_identifier()
     {
-        match option.text() {
-            "braces" => attr_flags.insert(AttrFlags::MACRO_STYLE_BRACES),
-            "brackets" => attr_flags.insert(AttrFlags::MACRO_STYLE_BRACKETS),
-            "parentheses" => attr_flags.insert(AttrFlags::MACRO_STYLE_PARENTHESES),
-            _ => {}
+        match MacroStyle::of(option.text()) {
+            Some(MacroStyle::braces) => attr_flags.insert(AttrFlags::MACRO_STYLE_BRACES),
+            Some(MacroStyle::brackets) => attr_flags.insert(AttrFlags::MACRO_STYLE_BRACKETS),
+            Some(MacroStyle::parentheses) => attr_flags.insert(AttrFlags::MACRO_STYLE_PARENTHESES),
+            None => {}
         }
     }
 }
@@ -143,12 +148,14 @@ fn extract_rustc_skip_during_method_dispatch(attr_flags: &mut AttrFlags, tt: ast
         if let NodeOrToken::Token(kind) = kind
             && kind.kind().is_any_identifier()
         {
-            match kind.text() {
-                "array" => attr_flags.insert(AttrFlags::RUSTC_SKIP_ARRAY_DURING_METHOD_DISPATCH),
-                "boxed_slice" => {
+            match SkipDuringMethodDispatch::of(kind.text()) {
+                Some(SkipDuringMethodDispatch::array) => {
+                    attr_flags.insert(AttrFlags::RUSTC_SKIP_ARRAY_DURING_METHOD_DISPATCH)
+                }
+                Some(SkipDuringMethodDispatch::boxed_slice) => {
                     attr_flags.insert(AttrFlags::RUSTC_SKIP_BOXED_SLICE_DURING_METHOD_DISPATCH)
                 }
-                _ => {}
+                None => {}
             }
         }
     }
@@ -396,22 +403,100 @@ fn string_value_is(attr: &ast::KeyValueMeta, text: &str) -> bool {
     }
 }
 
-macro_rules! words {
-    ($($word:ident),* $(,)?) => {
-        /// An attribute name the flags or the value queries read, as a `u8` tag.
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        #[allow(non_camel_case_types)]
-        #[repr(u8)]
-        enum Word {
-            $($word,)*
-        }
-
-        /// Each [`Word`]'s text, at its tag's index.
-        const WORDS: &[(&str, Word)] = &[$((stringify!($word), Word::$word),)*];
+/// The text of a [`name_set!`] member: its own name unless it gives one.
+macro_rules! member_text {
+    ($member:ident) => {
+        stringify!($member)
+    };
+    ($member:ident = $text:literal) => {
+        $text
     };
 }
 
-words![
+/// Declares `enum $Enum`, a `u8` tag for each name of a fixed set, with `$Enum::ALL` and
+/// `$Enum::TEXTS` at the tags' indices and `$Enum::of`, the member a text is: a perfect hash
+/// built at compile time ([`blaze_phf`]), one hash of the bytes, two loads and one compare.
+macro_rules! name_set {
+    ($(#[$attr:meta])* enum $Enum:ident { $($member:ident $(= $text:literal)?),* $(,)? }) => {
+        $(#[$attr])*
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        #[allow(non_camel_case_types)]
+        #[repr(u8)]
+        enum $Enum {
+            $($member,)*
+        }
+
+        impl $Enum {
+            /// Every member, at its tag's index.
+            const ALL: &[$Enum] = &[$($Enum::$member,)*];
+            /// Each member's text, at its tag's index.
+            const TEXTS: &[&str] = &[$(member_text!($member $(= $text)?),)*];
+
+            /// The member `name` is, if any.
+            #[inline]
+            fn of(name: &str) -> Option<$Enum> {
+                blaze_phf::phf_table!(static TABLE = $Enum::TEXTS;);
+                TABLE.get(name).map(|at| $Enum::ALL[at])
+            }
+        }
+
+        const _: () = assert!($Enum::ALL.len() < u8::MAX as usize);
+    };
+}
+
+name_set! {
+    /// A `#[doc(..)]` atom the flags read.
+    enum DocWord { alias, hidden, keyword, notable_trait }
+}
+
+name_set! {
+    /// An option of `#[rust_analyzer::completions(..)]`.
+    enum Completions { ignore_flyimport, ignore_flyimport_methods, ignore_methods }
+}
+
+name_set! {
+    /// An option of `#[rust_analyzer::macro_style(..)]`.
+    enum MacroStyle { braces, brackets, parentheses }
+}
+
+name_set! {
+    /// A receiver `#[rustc_skip_during_method_dispatch(..)]` names.
+    enum SkipDuringMethodDispatch { array, boxed_slice }
+}
+
+name_set! {
+    /// A `#[repr(..)]` hint, `r#` stripped.
+    enum ReprWord {
+        align, packed, simd, transparent, C,
+        i8, i16, i32, i64, i128, isize,
+        u8, u16, u32, u64, u128, usize,
+    }
+}
+
+name_set! {
+    /// A key of `#[link(..)]` that a native library reads.
+    enum LinkKey { cfg, kind, modifiers, name }
+}
+
+name_set! {
+    /// A `#[link(kind = "..")]`.
+    enum LinkKind { dylib, framework, raw_dylib = "raw-dylib", static_ = "static" }
+}
+
+name_set! {
+    /// A modifier of `#[link(modifiers = "..")]`, its sign split off.
+    enum LinkModifier { bundle, verbatim, whole_archive = "whole-archive" }
+}
+
+/// The [`Word`] a name is, if any.
+#[inline]
+fn word(name: &str) -> Option<Word> {
+    Word::of(name)
+}
+
+name_set! {
+    /// An attribute name the flags or the value queries read.
+    enum Word {
     bench,
     completions,
     define_opaque,
@@ -477,62 +562,6 @@ words![
     track_caller,
     unstable,
     used,
-];
-
-/// Slots of [`WORD_INDEX`]: a power of two, at least three times the words, so a probe
-/// sequence stays short.
-const WORD_SLOTS: usize = 256;
-const _: () = assert!(WORDS.len() * 3 <= WORD_SLOTS && WORDS.len() < u8::MAX as usize);
-
-/// Where a name's probe sequence in [`WORD_INDEX`] starts: a multiplicative hash of its length,
-/// its first, middle and last bytes and the one before the last. Constant time whatever the
-/// length; the names that share a `rustc_` prefix differ in the others.
-#[inline]
-const fn word_slot(name: &[u8]) -> usize {
-    let len = name.len();
-    if len == 0 {
-        return 0;
-    }
-    let key = len as u64
-        | (name[0] as u64) << 8
-        | (name[len / 2] as u64) << 16
-        | (name[len - 1] as u64) << 24
-        | (name[len.saturating_sub(2)] as u64) << 32;
-    (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - WORD_SLOTS.trailing_zeros())) as usize
-}
-
-/// An open-addressed index over [`WORDS`], built at compile time: slot `i` holds one plus the
-/// index of the word whose linear probe sequence ended there, 0 when empty. 256 bytes, one cache
-/// line pair of it read per lookup.
-static WORD_INDEX: [u8; WORD_SLOTS] = {
-    let mut index = [0u8; WORD_SLOTS];
-    let mut i = 0;
-    while i < WORDS.len() {
-        let mut slot = word_slot(WORDS[i].0.as_bytes());
-        while index[slot] != 0 {
-            slot = (slot + 1) & (WORD_SLOTS - 1);
-        }
-        index[slot] = i as u8 + 1;
-        i += 1;
-    }
-    index
-};
-
-/// The [`Word`] a name is, if any: one hash, then a length and a byte compare per probed slot.
-#[inline]
-fn word(name: &str) -> Option<Word> {
-    let name = name.as_bytes();
-    let mut slot = word_slot(name);
-    loop {
-        let entry = WORD_INDEX[slot];
-        if entry == 0 {
-            return None;
-        }
-        let (text, word) = WORDS[usize::from(entry - 1)];
-        if text.as_bytes() == name {
-            return Some(word);
-        }
-        slot = (slot + 1) & (WORD_SLOTS - 1);
     }
 }
 
@@ -975,8 +1004,9 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
         if key.kind() != SyntaxKind::IDENT {
             continue;
         }
+        let key = LinkKey::of(key.text());
         match children.peek() {
-            Some(NodeOrToken::Node(group)) if key.text() == "cfg" => {
+            Some(NodeOrToken::Node(group)) if key == Some(LinkKey::cfg) => {
                 cfg = link_cfg(group);
                 children.next();
             }
@@ -988,32 +1018,33 @@ fn parse_link_tt(tt: &ast::TokenTree) -> Option<(NativeLib, Option<CfgExpr>)> {
                 else {
                     continue;
                 };
-                match key.text() {
-                    "name" => {
+                match key {
+                    Some(LinkKey::name) => {
                         lib.name = Symbol::intern(&value);
                         named = true;
                     }
-                    "kind" => {
-                        lib.kind = match &*value {
-                            "static" => NativeLibKind::Static,
-                            "dylib" => NativeLibKind::Dylib,
-                            "framework" => NativeLibKind::Framework,
-                            "raw-dylib" => NativeLibKind::RawDylib,
-                            _ => NativeLibKind::Unspecified,
+                    Some(LinkKey::kind) => {
+                        lib.kind = match LinkKind::of(&value) {
+                            Some(LinkKind::static_) => NativeLibKind::Static,
+                            Some(LinkKind::dylib) => NativeLibKind::Dylib,
+                            Some(LinkKind::framework) => NativeLibKind::Framework,
+                            Some(LinkKind::raw_dylib) => NativeLibKind::RawDylib,
+                            None => NativeLibKind::Unspecified,
                         }
                     }
-                    "modifiers" => {
+                    Some(LinkKey::modifiers) => {
                         for modifier in value.split(',') {
                             let (on, name) = modifier.split_at(modifier.len().min(1));
-                            match name {
-                                "verbatim" => lib.verbatim = on == "+",
-                                "whole-archive" => lib.whole_archive = on == "+",
-                                "bundle" => lib.bundle = on == "+",
-                                _ => (),
+                            let on = on == "+";
+                            match LinkModifier::of(name) {
+                                Some(LinkModifier::verbatim) => lib.verbatim = on,
+                                Some(LinkModifier::whole_archive) => lib.whole_archive = on,
+                                Some(LinkModifier::bundle) => lib.bundle = on,
+                                None => (),
                             }
                         }
                     }
-                    _ => (),
+                    Some(LinkKey::cfg) | None => (),
                 }
             }
             _ => (),
@@ -1956,7 +1987,6 @@ fn merge_repr(this: &mut ReprOptions, other: ReprOptions) {
 }
 
 fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
-    use crate::builtin_type::{BuiltinInt, BuiltinUint};
     use rustc_abi::{Align, Integer, IntegerType, ReprFlags, ReprOptions};
 
     let mut tts = TokenTreeChildren::new(tt).peekable();
@@ -1969,8 +1999,12 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
         if !ident.kind().is_any_identifier() {
             continue;
         }
-        let repr = match ident.text().trim_start_matches("r#") {
-            "packed" => {
+        let int = |int, signed| ReprOptions {
+            int: Some(IntegerType::Fixed(int, signed)),
+            ..Default::default()
+        };
+        let repr = match ReprWord::of(ident.text().trim_start_matches("r#")) {
+            Some(ReprWord::packed) => {
                 let pack = if let Some(NodeOrToken::Node(tt)) = tts.peek() {
                     let tt = tt.clone();
                     tts.next();
@@ -1990,7 +2024,7 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
                 let pack = Some(Align::from_bytes(pack).unwrap_or(Align::ONE));
                 ReprOptions { pack, ..Default::default() }
             }
-            "align" => {
+            Some(ReprWord::align) => {
                 let mut align = None;
                 if let Some(NodeOrToken::Node(tt)) = tts.peek() {
                     let tt = tt.clone();
@@ -2006,36 +2040,28 @@ fn parse_repr_tt(tt: &ast::TokenTree) -> Option<ReprOptions> {
                 }
                 ReprOptions { align, ..Default::default() }
             }
-            "C" => ReprOptions { flags: ReprFlags::IS_C, ..Default::default() },
-            "transparent" => ReprOptions { flags: ReprFlags::IS_TRANSPARENT, ..Default::default() },
-            "simd" => ReprOptions { flags: ReprFlags::IS_SIMD, ..Default::default() },
-            repr => {
-                let mut int = None;
-                if let Some(builtin) = BuiltinInt::from_suffix(repr)
-                    .map(Either::Left)
-                    .or_else(|| BuiltinUint::from_suffix(repr).map(Either::Right))
-                {
-                    int = Some(match builtin {
-                        Either::Left(bi) => match bi {
-                            BuiltinInt::Isize => IntegerType::Pointer(true),
-                            BuiltinInt::I8 => IntegerType::Fixed(Integer::I8, true),
-                            BuiltinInt::I16 => IntegerType::Fixed(Integer::I16, true),
-                            BuiltinInt::I32 => IntegerType::Fixed(Integer::I32, true),
-                            BuiltinInt::I64 => IntegerType::Fixed(Integer::I64, true),
-                            BuiltinInt::I128 => IntegerType::Fixed(Integer::I128, true),
-                        },
-                        Either::Right(bu) => match bu {
-                            BuiltinUint::Usize => IntegerType::Pointer(false),
-                            BuiltinUint::U8 => IntegerType::Fixed(Integer::I8, false),
-                            BuiltinUint::U16 => IntegerType::Fixed(Integer::I16, false),
-                            BuiltinUint::U32 => IntegerType::Fixed(Integer::I32, false),
-                            BuiltinUint::U64 => IntegerType::Fixed(Integer::I64, false),
-                            BuiltinUint::U128 => IntegerType::Fixed(Integer::I128, false),
-                        },
-                    });
-                }
-                ReprOptions { int, ..Default::default() }
+            Some(ReprWord::C) => ReprOptions { flags: ReprFlags::IS_C, ..Default::default() },
+            Some(ReprWord::transparent) => {
+                ReprOptions { flags: ReprFlags::IS_TRANSPARENT, ..Default::default() }
             }
+            Some(ReprWord::simd) => ReprOptions { flags: ReprFlags::IS_SIMD, ..Default::default() },
+            Some(ReprWord::isize) => {
+                ReprOptions { int: Some(IntegerType::Pointer(true)), ..Default::default() }
+            }
+            Some(ReprWord::i8) => int(Integer::I8, true),
+            Some(ReprWord::i16) => int(Integer::I16, true),
+            Some(ReprWord::i32) => int(Integer::I32, true),
+            Some(ReprWord::i64) => int(Integer::I64, true),
+            Some(ReprWord::i128) => int(Integer::I128, true),
+            Some(ReprWord::usize) => {
+                ReprOptions { int: Some(IntegerType::Pointer(false)), ..Default::default() }
+            }
+            Some(ReprWord::u8) => int(Integer::I8, false),
+            Some(ReprWord::u16) => int(Integer::I16, false),
+            Some(ReprWord::u32) => int(Integer::I32, false),
+            Some(ReprWord::u64) => int(Integer::I64, false),
+            Some(ReprWord::u128) => int(Integer::I128, false),
+            None => ReprOptions::default(),
         };
         merge_repr(&mut acc, repr);
     }

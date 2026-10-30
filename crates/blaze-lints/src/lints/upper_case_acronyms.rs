@@ -13,7 +13,7 @@ use syntax::{
 
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "upper_case_acronyms";
+const LINT: super::Implemented = super::Implemented::UpperCaseAcronyms;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, item: &ast::Item) {
     if !cx.on(LINT) {

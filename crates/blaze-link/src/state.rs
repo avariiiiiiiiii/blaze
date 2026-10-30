@@ -10,17 +10,20 @@
 //! arenas. A symbol's definition is a 16-byte [`Def`]; the pieces referring to it are a list in
 //! another arena, grown by doubling.
 
+#![forbid(unsafe_code)]
+
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use blaze_codegen::{InstanceKey, Line};
-use blaze_ids::ContentId;
-use rustc_hash::{FxHashMap, FxHashSet};
+use blaze_ids::{ContentId, radix};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::cow::{CowBytes, CowList, CowVec, ListRef};
-use crate::model::{Class, Fixup, Import, Library, NativeFile, Region, Special, Sym, Tls};
+use crate::model::{Class, Fixup, NativeFile, Region, Special, Sym, Tls};
+pub(crate) use crate::native::Resolved;
 use crate::position::Spans;
 use crate::reloc::GotKind;
 use crate::symbols::{IdNo, NameId, Obj, Symbols};
@@ -290,6 +293,24 @@ impl<'s> PieceRef<'s> {
         let at = (self.hot.addr - space.region.addr) as usize;
         space.bytes.read(at, self.hot.size as usize)
     }
+
+    /// The same, borrowed, or copied into `arena` when it spans written pages.
+    pub fn bytes_in<'b>(self, arena: &'b bumpalo::Bump) -> &'b [u8]
+    where
+        's: 'b,
+    {
+        let Some(space) = self.state.spaces.get(self.hot.region as usize) else { return &[] };
+        if space.zero || self.hot.zero() {
+            return &[];
+        }
+        let (at, len) = ((self.hot.addr - space.region.addr) as usize, self.hot.size as usize);
+        if let Some(it) = space.bytes.slice(at, len) {
+            return it;
+        }
+        let out = arena.alloc_slice_fill_copy(len, 0);
+        space.bytes.copy_to(at, out);
+        out
+    }
 }
 
 /// A region of the image and its bytes (empty for a zeroed one).
@@ -313,30 +334,13 @@ pub(crate) struct Input {
     pub file: Arc<NativeFile>,
 }
 
-/// What resolving the native inputs and the names gave, and what it was computed from.
-#[derive(Clone, Default)]
-pub(crate) struct Resolved {
-    pub imports: Vec<Import>,
-    /// Each import's symbol.
-    pub import_syms: Vec<Sym>,
-    pub libraries: Vec<Library>,
-    /// The native sections in the image.
-    pub kept: FxHashSet<(Obj, u32)>,
-    /// The native call frame records in the image: section and start.
-    pub frames: FxHashSet<(Obj, u32, u32)>,
-    /// The commons, by name: size and alignment.
-    pub commons: BTreeMap<NameId, (u64, u64)>,
-    /// What the objects' `/EXPORT` directives export: the name, the symbol, and whether it
-    /// is data.
-    pub exports: Vec<(String, String, bool)>,
-}
-
 #[derive(Clone)]
 pub(crate) struct State {
     pub generation: u64,
     pub specials: Vec<Special>,
     pub spaces: Vec<Space>,
     /// The names Rust code defines (`#[no_mangle]`, `main`), each the symbol it is.
+    // BTreeMap: changed by every stage and walked in order by each native resolve.
     pub names: Arc<BTreeMap<NameId, Sym>>,
     /// wasm: what codegen's functions and statics say each name is imported as.
     pub wasm_imports: Arc<FxHashMap<NameId, blaze_codegen::wasm::Import>>,
@@ -381,6 +385,8 @@ pub(crate) struct State {
     /// Per slot: the body it runs, and the next slot running the same body.
     cells: CowVec<Sym>,
     slot_next: CowVec<u32>,
+    /// The pieces removed, in order, across the state's lineage.
+    removals: CowVec<PieceId>,
 }
 
 impl State {
@@ -415,6 +421,7 @@ impl State {
             defs: vec![CowVec::default(); Symbols::SHARDS],
             cold: vec![CowVec::default(); Symbols::SHARDS],
             ref_items: CowList::default(),
+            removals: CowVec::default(),
             seen: CowVec::default(),
             classes: Arc::default(),
             functions: CowVec::default(),
@@ -504,9 +511,8 @@ impl State {
         }
         let items = self.ref_items.get(cold.refs);
         let Some(at) = items.iter().position(|it| *it == id) else { return };
-        let last = items.len() - 1;
         let items = self.ref_items.get_mut(cold.refs);
-        items.swap(at, last);
+        items.copy_within(at + 1.., at);
         self.cold_mut(sym).refs.len -= 1;
     }
 
@@ -566,7 +572,7 @@ impl State {
     pub fn targets(piece: PieceRef<'_>) -> SmallVec<[Sym; 8]> {
         let mut out: SmallVec<[Sym; 8]> =
             piece.fixups().iter().flat_map(|it| std::iter::once(it.target).chain(it.minus)).collect();
-        out.sort_unstable();
+        radix::sort_copy_by_key(&mut out, |it| it.0);
         out.dedup();
         out
     }
@@ -601,14 +607,20 @@ impl State {
         id
     }
 
-    /// Removes a piece and its symbols' definitions. Its columns stay readable through
-    /// [`State::any`]; its stale entries in referrer lists are skipped by [`State::refs`].
+    /// Removes a piece, its symbols' definitions and its entries in the referrer lists of
+    /// what it referred to. Its columns stay readable through [`State::any`].
     pub fn remove(&mut self, id: PieceId) -> bool {
         let Some(piece) = self.piece(id) else { return false };
         let syms: SmallVec<[Sym; 8]> = std::iter::once(piece.sym).chain(piece.defines().iter().copied()).collect();
+        let targets = Self::targets(piece);
+        let lines = piece.function().map(|it| it.lines);
         let lists = piece.lists();
         let loader = *self.loader.get(id as usize).expect("a piece's loader lists");
         self.hot_mut(id).flags &= !LIVE;
+        self.removals.push(id);
+        for target in targets {
+            self.ref_remove(target, id);
+        }
         for sym in syms {
             if matches!(self.def(sym), Def::Piece { piece, .. } if piece == id) {
                 self.set_def(sym, Def::None);
@@ -619,7 +631,20 @@ impl State {
         self.syms.free(lists.defines);
         self.rebase.free(loader.rebase);
         self.binds.free(loader.binds);
+        if let Some(lines) = lines {
+            self.lines.free(lines);
+        }
         true
+    }
+
+    /// How many pieces this state's lineage has removed.
+    pub fn removals(&self) -> u64 {
+        self.removals.len() as u64
+    }
+
+    /// The pieces removed after the first `mark` removals, in order.
+    pub fn removed_since(&self, mark: u64) -> impl Iterator<Item = PieceId> + '_ {
+        (mark as usize..self.removals.len()).map(|at| *self.removals.get(at).expect("in range"))
     }
 
     /// Replaces a live piece's fixups, keeping the referrer lists right.
@@ -681,6 +706,8 @@ impl State {
             || over(self.syms.garbage(), self.syms.live())
             || over(self.ref_items.garbage(), self.ref_items.live())
             || over(self.rebase.garbage(), self.rebase.live())
+            || over(self.binds.garbage(), self.binds.live())
+            || over(self.lines.garbage(), self.lines.live())
     }
 
     /// Copies every live list into fresh arenas and rebuilds the referrer lists, dropping

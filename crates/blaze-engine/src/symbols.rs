@@ -239,7 +239,7 @@ fn names_of(files: &[PathBuf]) -> Vec<anyhow::Result<Vec<Named>>> {
         let threads: Vec<_> = (0..threads).map(|_| scope.spawn(read)).collect();
         threads.into_iter().flat_map(|it| it.join().expect("reading symbols panicked")).collect()
     });
-    read.sort_by_key(|it| it.0);
+    blaze_ids::radix::sort_by_key(&mut read, |it| it.0);
     read.into_iter().map(|it| it.1).collect()
 }
 

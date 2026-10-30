@@ -18,7 +18,7 @@ fn noop_method_call() {
 
 /// std's `println!`, `io`'s `Write` and `_print`, `fs::File` with `Write for &File`, and
 /// `sync::LazyLock`, after [`STD_VEC`].
-const DOUBLE_REF_STD: &str = r#"#![feature(rustc_attrs, allow_internal_unstable)]
+const DOUBLE_REF_STD: &str = r#"#![feature(allow_internal_unstable)]
 
 pub use core::{borrow, fmt, iter, ops, option, result, slice};
 pub use core::{concat, format_args, format_args_nl};

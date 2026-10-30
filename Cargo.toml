@@ -84,6 +84,7 @@ hir-expand = { path = "crates/hir-expand", version = "0.0.0" }
 hir-ty = { path = "crates/hir-ty", version = "0.0.0" }
 hir-ty-borrowck = { path = "crates/hir-ty-borrowck", version = "0.0.0" }
 hir-ty-mir = { path = "crates/hir-ty-mir", version = "0.0.0" }
+hir-ty-share = { path = "crates/hir-ty-share", version = "0.0.0" }
 hir-ty-ub = { path = "crates/hir-ty-ub", version = "0.0.0" }
 hir-ty-wfcheck = { path = "crates/hir-ty-wfcheck", version = "0.0.0" }
 hir-ty-codegen = { path = "crates/hir-ty-codegen" }
@@ -110,6 +111,7 @@ blaze-web = { path = "crates/blaze-web" }
 # v2 (docs/v2/plan/reference/crates.md)
 blaze-api = { path = "crates/blaze-api" }
 blaze-cas = { path = "crates/blaze-cas" }
+blaze-check = { path = "crates/blaze-check" }
 blaze-ci = { path = "crates/blaze-ci" }
 blaze-codegen = { path = "crates/blaze-codegen" }
 blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
@@ -117,12 +119,16 @@ blaze-format = { path = "crates/blaze-format" }
 blaze-ids = { path = "crates/blaze-ids" }
 blaze-items = { path = "crates/blaze-items" }
 blaze-link = { path = "crates/blaze-link" }
+blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
 # fastcompile (docs/v2/plan/lanes/fastcompile/notes.md)
 blaze-global = { path = "crates/blaze-global" }
 blaze-hashcons = { path = "crates/blaze-hashcons" }
 blaze-history = { path = "crates/blaze-history" }
 blaze-inproc = { path = "crates/blaze-inproc" }
+blaze-intent = { path = "crates/blaze-intent" }
 blaze-lazy = { path = "crates/blaze-lazy" }
+blaze-premap = { path = "crates/blaze-premap" }
+blaze-stencil = { path = "crates/blaze-stencil" }
 blaze-testsel = { path = "crates/blaze-testsel" }
 blaze-query = { path = "crates/blaze-query" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
@@ -181,6 +187,11 @@ bumpalo = { version = "3.20", features = ["collections"] }
 blake3 = { version = "1.8", default-features = false, features = ["std", "neon"] }
 cargo_metadata = "0.23.1"
 camino = "1.2.2"
+# The Cranelift hir-ty-codegen compiles with.
+cranelift-codegen = "0.136"
+cranelift-frontend = "0.136"
+# `vendor/llvm-sys` by the patch above.
+llvm-sys = "231"
 crossbeam-channel = "0.5.15"
 crossbeam-deque = "0.8.6"
 base64 = "0.23"

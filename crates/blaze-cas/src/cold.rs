@@ -122,9 +122,27 @@ pub(crate) fn compress_long(raw: &[u8]) -> Result<Vec<u8>, String> {
     compressor.compress(raw).map_err(|error| format!("compressing {} bytes failed: {error}", raw.len()))
 }
 
+/// The length a zstd frame of `stored` bytes may decode to, checked before anything of that
+/// length is allocated: `raw` comes from a record header, which nothing has verified yet.
+/// Every frame here is one `ZSTD_compress2` of a whole value, which writes its length.
+fn zstd_length(stored: &[u8], raw: u64) -> Result<usize, String> {
+    match zstd::zstd_safe::get_frame_content_size(stored) {
+        Ok(Some(said)) if said == raw => {}
+        Ok(Some(said)) => return Err(format!("its frame holds {said} bytes, not the {raw} recorded")),
+        Ok(None) => return Err("its frame does not say how long it is".into()),
+        Err(_) => return Err("it is not a zstd frame".into()),
+    }
+    // Each block has a 3-byte header and decodes to at most 128 KiB (RFC 8878 3.1.1.2).
+    let most = (stored.len() as u64 / 3).saturating_mul(128 << 10);
+    if raw > most {
+        return Err(format!("{} bytes of zstd cannot decode to the {raw} recorded", stored.len()));
+    }
+    usize::try_from(raw).map_err(|_| "its length does not fit in memory".to_owned())
+}
+
 /// Exactly `raw` bytes, or why not.
 pub(crate) fn decompress(dictionary: &Prepared, stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
-    let raw = usize::try_from(raw).map_err(|_| "its length does not fit in memory".to_owned())?;
+    let raw = zstd_length(stored, raw)?;
     let bytes = zstd::bulk::Decompressor::with_prepared_dictionary(&dictionary.decoder)
         .and_then(|mut decompressor| decompressor.decompress(stored, raw))
         .map_err(|error| format!("it does not decompress: {error}"))?;
@@ -133,7 +151,7 @@ pub(crate) fn decompress(dictionary: &Prepared, stored: &[u8], raw: u64) -> Resu
 
 /// What [`compress_long`] made: exactly `raw` bytes, or why not.
 pub(crate) fn decompress_long(stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
-    let raw = usize::try_from(raw).map_err(|_| "its length does not fit in memory".to_owned())?;
+    let raw = zstd_length(stored, raw)?;
     let bytes = zstd::bulk::Decompressor::new()
         .and_then(|mut decompressor| {
             decompressor.set_parameter(DParameter::WindowLogMax(WINDOW_LOG))?;
@@ -157,6 +175,11 @@ pub(crate) fn lz4(raw: &[u8]) -> Option<Vec<u8>> {
 }
 
 pub(crate) fn unlz4(stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
+    // A block's densest byte, a match length's 255, is what an LZ4 block can grow by per byte;
+    // `raw` is unverified, and it is allocated before a byte is decoded.
+    if raw > (stored.len() as u64).saturating_mul(255).saturating_add(16) {
+        return Err(format!("{} bytes of LZ4 cannot decode to the {raw} recorded", stored.len()));
+    }
     let raw = usize::try_from(raw).map_err(|_| "its length does not fit in memory".to_owned())?;
     let bytes = lz4_flex::block::decompress(stored, raw)
         .map_err(|error| format!("it does not decompress: {error}"))?;
@@ -204,6 +227,25 @@ mod tests {
         assert!(decompress(&dictionary, &stored, value.len() as u64 + 1).is_err());
         assert!(decompress(&dictionary, &stored, value.len() as u64 - 1).is_err());
         assert!(decompress(&dictionary, b"not zstd at all", 10).is_err());
+    }
+
+    /// A record header's `raw` is not trusted before its bytes are decoded: a length its bytes
+    /// cannot reach is refused before anything that long is allocated.
+    #[test]
+    fn a_length_the_bytes_cannot_reach_is_refused_before_it_is_allocated() {
+        let samples: Vec<Vec<u8>> = (0..200).map(sample).collect();
+        let refs: Vec<&[u8]> = samples.iter().map(Vec::as_slice).collect();
+        let dictionary = Prepared::new(train(&refs).unwrap());
+        let huge = 1 << 40;
+        let tiny = [0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        for stored in [compress(&dictionary, &sample(4)).unwrap(), tiny.to_vec()] {
+            assert!(decompress(&dictionary, &stored, huge).is_err());
+            assert!(decompress_long(&stored, huge).is_err());
+        }
+        let stored = lz4(&sample(1).repeat(64)).unwrap();
+        let why = unlz4(&stored, huge).unwrap_err();
+        assert!(why.contains("cannot decode"), "{why}");
+        assert!(unlz4(&[0; 16], u64::MAX).is_err());
     }
 
     /// A long value whose repeats are further apart than zstd's default window reaches.

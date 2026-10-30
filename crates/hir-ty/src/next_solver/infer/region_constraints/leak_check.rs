@@ -289,7 +289,7 @@ impl<'db> MiniGraph<'db> {
         only_consider_snapshot: Option<&CombinedSnapshot>,
     ) -> Self {
         let mut nodes = FxIndexMap::default();
-        let mut edges = Vec::new();
+        let mut edges = Vec::with_capacity(region_constraints.data().constraints.len());
 
         // Note that if `R2: R1`, we get a callback `r1, r2`, so `target` is first parameter.
         Self::iterate_region_constraints(
@@ -357,28 +357,52 @@ struct Sccs {
 impl Sccs {
     /// Tarjan's algorithm, iterative, visiting nodes in index order and each node's successors
     /// in target order, as rustc's `VecGraph` sorts them.
-    fn new(num_nodes: usize, mut edges: Vec<(u32, u32)>) -> Sccs {
-        edges.sort_unstable();
-        let mut starts = vec![0u32; num_nodes + 1];
-        for &(source, _) in &edges {
-            starts[source as usize + 1] += 1;
+    /// `O(nodes + edges)`: the edges go to CSR by two stable counting passes (by target, then
+    /// by source), which is the `(source, target)` order of rustc's sort without comparing.
+    fn new(num_nodes: usize, edges: Vec<(u32, u32)>) -> Sccs {
+        /// A stable counting sort of `input` by `key` (below `num_nodes`), with where each
+        /// key's run starts.
+        fn counting_pass(
+            num_nodes: usize,
+            input: &[(u32, u32)],
+            key: fn(&(u32, u32)) -> u32,
+        ) -> (Vec<(u32, u32)>, Vec<u32>) {
+            let mut starts = vec![0u32; num_nodes + 1];
+            for edge in input {
+                starts[key(edge) as usize + 1] += 1;
+            }
+            for at in 0..num_nodes {
+                starts[at + 1] += starts[at];
+            }
+            let mut output = vec![(0u32, 0u32); input.len()];
+            let mut next = starts.clone();
+            for edge in input {
+                let slot = &mut next[key(edge) as usize];
+                output[*slot as usize] = *edge;
+                *slot += 1;
+            }
+            (output, starts)
         }
-        for at in 0..num_nodes {
-            starts[at + 1] += starts[at];
-        }
-        let targets: Vec<u32> = edges.iter().map(|&(_, target)| target).collect();
+        let (by_target, _) = counting_pass(num_nodes, &edges, |edge| edge.1);
+        drop(edges);
+        let (sorted, starts) = counting_pass(num_nodes, &by_target, |edge| edge.0);
+        drop(by_target);
+        let targets: Vec<u32> = sorted.iter().map(|&(_, target)| target).collect();
+        drop(sorted);
 
         const UNVISITED: u32 = u32::MAX;
         let mut index_of = vec![UNVISITED; num_nodes];
         let mut low = vec![0u32; num_nodes];
-        let mut on_stack = vec![false; num_nodes];
+        // A node is on the Tarjan stack exactly when it is visited and has no SCC yet.
         let mut scc_of = vec![UNVISITED; num_nodes];
-        let mut stack: Vec<u32> = Vec::new();
+        let mut stack: Vec<u32> = Vec::with_capacity(num_nodes);
         // The DFS: each frame is a node and the position of the next successor to visit.
         let mut frames: Vec<(u32, u32)> = Vec::new();
         let mut next_index = 0u32;
         let mut num_sccs = 0u32;
-        let mut members: Vec<Vec<u32>> = Vec::new();
+        // The members of SCC `s` are `members[member_starts[s]..member_starts[s + 1]]`.
+        let mut members: Vec<u32> = Vec::with_capacity(num_nodes);
+        let mut member_starts: Vec<u32> = vec![0];
 
         for root in 0..num_nodes as u32 {
             if index_of[root as usize] != UNVISITED {
@@ -388,7 +412,6 @@ impl Sccs {
             low[root as usize] = next_index;
             next_index += 1;
             stack.push(root);
-            on_stack[root as usize] = true;
             frames.push((root, starts[root as usize]));
             while let Some(frame) = frames.last_mut() {
                 let node = frame.0;
@@ -402,9 +425,8 @@ impl Sccs {
                         low[t] = next_index;
                         next_index += 1;
                         stack.push(target);
-                        on_stack[t] = true;
                         frames.push((target, starts[t]));
-                    } else if on_stack[t] {
+                    } else if scc_of[t] == UNVISITED {
                         low[n] = low[n].min(index_of[t]);
                     }
                     continue;
@@ -415,32 +437,31 @@ impl Sccs {
                     low[p] = low[p].min(low[n]);
                 }
                 if low[n] == index_of[n] {
-                    let mut scc = Vec::new();
                     loop {
                         let member = stack.pop().unwrap();
-                        on_stack[member as usize] = false;
                         scc_of[member as usize] = num_sccs;
-                        scc.push(member);
+                        members.push(member);
                         if member == node {
                             break;
                         }
                     }
-                    members.push(scc);
+                    member_starts.push(members.len() as u32);
                     num_sccs += 1;
                 }
             }
         }
 
         let mut successor_starts = Vec::with_capacity(num_sccs as usize + 1);
-        let mut successors = Vec::new();
+        let mut successors = Vec::with_capacity(targets.len());
         successor_starts.push(0);
-        for scc in 0..num_sccs {
+        for scc in 0..num_sccs as usize {
             let first = successors.len();
-            for &member in &members[scc as usize] {
+            let scc_members = member_starts[scc] as usize..member_starts[scc + 1] as usize;
+            for &member in &members[scc_members] {
                 let m = member as usize;
                 for &target in &targets[starts[m] as usize..starts[m + 1] as usize] {
                     let target_scc = scc_of[target as usize];
-                    if target_scc != scc {
+                    if target_scc as usize != scc {
                         successors.push(target_scc);
                     }
                 }

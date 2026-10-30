@@ -6,10 +6,11 @@ mod arena;
 mod intern;
 mod intern_slice;
 mod symbol;
+mod sync;
 
 pub use self::intern::{InternStorage, Internable, Interned, InternedRef, impl_internable};
 pub use self::intern_slice::{
     HeaderSlice, HeaderWithLength, InternSliceStorage, InternedSlice, InternedSliceRef,
     SliceInternable, impl_slice_internable,
 };
-pub use self::symbol::{Symbol, order_key, symbols as sym};
+pub use self::symbol::{KnownNames, Symbol, order_key, symbols as sym};

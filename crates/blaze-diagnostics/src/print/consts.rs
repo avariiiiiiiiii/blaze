@@ -106,9 +106,9 @@ impl<'p, 'a, 'db: 't, 't> Printer<'p, 'a, 'db, 't> {
             (ValTreeKind::Leaf(leaf), _) => self.print_scalar_int(*leaf, ty),
             (_, TyKind::FnDef(def, args)) => {
                 let def = match def.0 {
-                    hir_ty::CallableDefId::FunctionId(it) => Def::Function(it),
-                    hir_ty::CallableDefId::StructId(it) => Def::Adt(AdtId::StructId(it)),
-                    hir_ty::CallableDefId::EnumVariantId(it) => Def::Variant(it),
+                    hir_def::CallableDefId::FunctionId(it) => Def::Function(it),
+                    hir_def::CallableDefId::StructId(it) => Def::Adt(AdtId::StructId(it)),
+                    hir_def::CallableDefId::EnumVariantId(it) => Def::Variant(it),
                 };
                 self.print_value_path(def, args.as_slice());
             }
@@ -285,7 +285,7 @@ mod tests {
 
     #[test]
     fn integers_print_as_const_int_does() {
-        let size = |n| Size::from_bytes(n);
+        let size = |n: u64| Size::from_bytes(n);
         assert_eq!(const_int(ScalarInt::try_from_uint(255u8, size(1)).unwrap(), false, false), "u8::MAX");
         assert_eq!(const_int(ScalarInt::try_from_uint(7u8, size(1)).unwrap(), false, false), "7");
         assert_eq!(const_int(ScalarInt::try_from_int(-128i8, size(1)).unwrap(), true, false), "i8::MIN");

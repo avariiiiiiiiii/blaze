@@ -21,6 +21,7 @@ mod tests;
 use std::sync::Mutex;
 
 use blaze_codegen::Arch;
+use blaze_ids::radix;
 
 use crate::model::{Class, Counts, File, NativeFile, Placed, Plan, Prot, Region, Special, Writer};
 use crate::{Format, LinkError, NativeKind, Output, OutputKind};
@@ -205,7 +206,14 @@ impl Writer for Pe {
     }
 
     fn order(&self, classes: &mut Vec<Class>) {
-        classes.sort_by(|a, b| place(a).cmp(&place(b)));
+        let rank = |class: &Class| {
+            let (segment, rank, _) = place(class);
+            radix::pack_32(segment as u32, u32::from(rank))
+        };
+        radix::sort_by_key(classes, rank);
+        for run in classes.chunk_by_mut(|a, b| rank(a) == rank(b)) {
+            run.sort_by(|a, b| place(a).2.cmp(place(b).2));
+        }
         classes.dedup();
     }
 

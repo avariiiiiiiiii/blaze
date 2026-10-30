@@ -557,6 +557,20 @@ Apart from that, `span_at_from` and
 `span_for_range_from` give amortized two compares per token. For item 2, `token_tree_to_syntax_node`
 now builds its map with `SpanMap::with_capacity(parser_input.len())`.
 
+Status (span side) done by speed-span-ast, checked by speed-span (`crates/span/src/map.rs`):
+1. `SpanMap::span_at_from(offset, &mut u32) -> Span` and
+   `RealSpanMap::span_for_range_from(range, &mut u32) -> Span` (salsa feature, as
+   `span_for_range`): a galloping search from the hint, the same `Span` as `span_at` /
+   `span_for_range`, which stay. `&self`, hint a `Cell<u32>` per mapper starting at 0 (as
+   `hir-expand/src/span_map.rs` and `eager.rs` already do).
+2. `SpanMap` is `ends: Vec<TextSize>` beside `spans: Vec<Span>`; `Hash` is two slice hashes;
+   `SpanMap::with_capacity(n)`.
+3. `impl Drop` and the dropper thread are gone, from `SpanMap` and from `AstIdMap`.
+4. `by_anchor`: a lazy `OnceLock<Box<[u32]>>` permutation by `(anchor, range)`, reset by `push`
+   and `merge` instead of built in `finish()`; `ranges_with_span_exact` / `ranges_with_span` are
+   binary searches plus the run, same results in the same text order. hir-expand's doc comments
+   calling them a linear search (`lib.rs` near :1333 and :1354) are now out of date.
+
 ## format-hir-encode: untrusted salsa indices in HIR buffers (docs/v2/plan/design/unsafe.md)
 
 From format-hir-encode, for the lead (`crates/blaze-format/`) and format-span (`crates/span/`).
@@ -825,6 +839,12 @@ A split keeps the order of evaluation and binds only `Copy` values. Line numbers
 
 ### intern
 
+Status: done by speed-span for `arena.rs`, `intern.rs` and `intern_slice.rs` (as proposed;
+`arena.rs:135`'s `Table::new` is now normal-build only, beside a model-build twin). The two
+`symbol.rs` items are adapted to its current `Text` and handed to fix-orderkeys, which is
+editing that file (`v2/requests/speed.md`, "speed-span" item 2). `mbe` now has
+`#![forbid(unsafe_code)]` (listed under "Left for lanes" in the audit report).
+
 - `crates/intern/src/arena.rs:135` block (`Table::new`): 2 ops (two `zeroed` calls). Split:
   ```rust
   // SAFETY: all-zero bytes are a `Group`: a zero control word (every slot empty) and null pointers.
@@ -927,3 +947,5 @@ an invalid suffix. It is reached from blaze-macro-wasm's lexer and wire reader, 
 syntax-bridge may reach it too. Input: `fuzz/corpus/macro_wasm_lex/suffix-256.hex`.
 What: store a longer suffix (a `u16`/`u32` length, or the split kept in the symbol), or give
 the callers a fallible constructor.
+
+> forwarded to format: `crates/tt/` is lane format's.

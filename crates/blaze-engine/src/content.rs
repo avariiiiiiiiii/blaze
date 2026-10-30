@@ -172,7 +172,7 @@ impl Contents {
             (checkouts.0.to_string_lossy(), checkouts.1.map(Path::to_string_lossy));
         places.push((&*checkout, "$CHECKOUT"));
         places.extend(base.as_deref().map(|base| (base, "$CHECKOUT")));
-        places.sort_unstable_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+        blaze_ids::radix::sort_copy_by_key(&mut places, |(path, _)| !(path.len() as u64));
         for (path, stands_for) in places {
             env = env.replace(path, stands_for);
         }

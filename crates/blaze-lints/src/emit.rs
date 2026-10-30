@@ -6,9 +6,10 @@
 //! `normalize_whitespace`) and `json.rs` at rust-lang/rust 12433c307b5a497388ffe2f4e49dbf1ab8c71fa0
 //! (MIT or Apache-2.0), with the same version of `annotate-snippets` doing the layout.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use annotate_snippets::{AnnotationKind, Group, Patch, Renderer, Snippet};
+use rustc_hash::FxHashMap;
 use serde::Serialize;
 
 use crate::{
@@ -26,7 +27,7 @@ pub const WIDTH: usize = annotate_snippets::renderer::DEFAULT_TERM_WIDTH;
 
 /// The text of the files diagnostics point into, by the path they name them by.
 pub struct Sources {
-    files: BTreeMap<String, Option<Arc<File>>>,
+    files: FxHashMap<String, Option<Arc<File>>>,
     read: Box<dyn Fn(&str) -> Option<String> + Send + Sync>,
 }
 
@@ -77,7 +78,7 @@ impl File {
 impl Sources {
     /// Files read with `read`, once each.
     pub fn new(read: impl Fn(&str) -> Option<String> + Send + Sync + 'static) -> Sources {
-        Sources { files: BTreeMap::new(), read: Box::new(read) }
+        Sources { files: FxHashMap::default(), read: Box::new(read) }
     }
 
     /// Files whose text is given.

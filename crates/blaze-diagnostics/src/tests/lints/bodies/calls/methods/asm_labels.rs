@@ -2,7 +2,7 @@
 //! `tests/ui/asm` (MIT or Apache-2.0), kept byte for byte in `asm_labels/`, each built for the
 //! target its `//@ only-..` names (`target_arch`, which these lints read).
 
-use super::super::{Test, Ui};
+use super::super::Ui;
 use super::{Library, ui_library};
 
 /// What the tests use of `core` (`library/core/src/arch.rs`, `library/core/src/macros/mod.rs`).
@@ -69,7 +69,6 @@ fn named_labels_are_denied_but_in_naked_functions_that_are_not_generic() {
     );
     let ui = Ui {
         name: "named-asm-labels.rs",
-        test: Test::Fails,
         meta: "cfg:target_arch=x86_64",
         source: &source,
         ..Ui::default()
@@ -81,7 +80,6 @@ fn named_labels_are_denied_but_in_naked_functions_that_are_not_generic() {
 fn binary_labels_are_denied_on_x86() {
     let ui = Ui {
         name: "binary_asm_labels.rs",
-        test: Test::Fails,
         meta: "cfg:target_arch=x86_64",
         source: include_str!("asm_labels/binary_asm_labels.rs"),
         ..Ui::default()
@@ -93,7 +91,6 @@ fn binary_labels_are_denied_on_x86() {
 fn binary_labels_are_allowed_off_x86() {
     let ui = Ui {
         name: "binary_asm_labels_allowed.rs",
-        test: Test::Passes,
         meta: "cfg:target_arch=aarch64",
         source: include_str!("asm_labels/binary_asm_labels_allowed.rs"),
         ..Ui::default()
@@ -107,7 +104,6 @@ fn binary_labels_are_allowed_off_x86() {
 fn hexagon_register_pairs_are_not_labels() {
     let ui = Ui {
         name: "hexagon-register-pairs.rs",
-        test: Test::Fails,
         meta: "cfg:target_arch=hexagon",
         source: include_str!("asm_labels/hexagon-register-pairs.rs"),
         ..Ui::default()

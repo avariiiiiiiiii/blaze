@@ -416,7 +416,7 @@ pub fn breakdown(spans: &[Span], start_us: u64, end_us: u64) -> Vec<(String, u64
         cuts.push(it.start_us.clamp(start_us, end_us));
         cuts.push((it.start_us + it.dur_us).clamp(start_us, end_us));
     }
-    cuts.sort_unstable();
+    blaze_ids::radix::sort(&mut cuts);
     cuts.dedup();
     let mut rows: Vec<(String, u64)> = Vec::new();
     for pair in cuts.windows(2) {
@@ -472,7 +472,7 @@ pub fn table(spans: &[Span], start: u64, end: u64) -> String {
     let ms = |us: u64| us as f64 / 1000.0;
     let pct = |us: u64| us as f64 * 100.0 / total as f64;
     let mut top: Vec<&(String, u64)> = rows.iter().collect();
-    top.sort_by_key(|it| std::cmp::Reverse(it.1));
+    blaze_ids::radix::sort_copy_by_key(&mut top, |it| !it.1);
     let top: Vec<String> = top
         .iter()
         .take(6)

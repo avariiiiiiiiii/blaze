@@ -29,7 +29,7 @@ fn benchmark_parse_macro_rules() {
         let _pt = bench("mbe parse macro rules");
         rules
             .into_iter()
-            .sorted_by_key(|(id, _)| id.clone())
+            .sorted_by(|(a, _), (b, _)| a.cmp(b))
             .map(|(_, it)| {
                 DeclarativeMacro::parse_macro_rules(&it, |_| span::Edition::CURRENT).rules.len()
             })
@@ -64,7 +64,7 @@ fn benchmark_expand_macro_rules() {
 pub(crate) fn macro_rules_fixtures() -> FxHashMap<String, DeclarativeMacro> {
     macro_rules_fixtures_tt()
         .into_iter()
-        .sorted_by_key(|(id, _)| id.clone())
+        .sorted_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(id, tt)| (id, DeclarativeMacro::parse_macro_rules(&tt, |_| span::Edition::CURRENT)))
         .collect()
 }

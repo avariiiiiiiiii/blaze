@@ -208,3 +208,56 @@ Why: `crates/blaze-vfs/src/sync.rs` switches the store's atomics and `Mutex` to 
 under `cfg(blaze_check)`, and `store/tests.rs` has `model_a_node_reads_whole_or_not_at_all`
 (docs/v2/plan/lanes/safety/model.md). Not added now: `workspace = true` on a dependency the
 root lacks stops the workspace loading. A normal build is unchanged without it.
+
+> applied (vfs DONE): `crates/blaze-vfs/Cargo.toml` has `[target.'cfg(blaze_check)'.dependencies]` `blaze-check.workspace = true`.
+
+## speed-span (2026-10-29)
+
+> forwarded to format: 1 is `crates/intern/Cargo.toml` (the root `blaze-check` entry is in now) and 2 is `crates/intern/src/symbol.rs`, both lane format's.
+
+### 1. Coordinator: `blaze-check` for `intern`'s model build
+
+What: once `blaze-check` is a workspace dependency (safety's M1 1, `v2/requests/safety.md`),
+append to `crates/intern/Cargo.toml`:
+
+```toml
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+```
+
+Why: `crates/intern/src/sync.rs` switches `arena.rs`'s atomics and `Mutex` to the checker's under
+`cfg(blaze_check)`, and `arena.rs` has `model_racing_inserts_across_growth`
+(docs/v2/plan/lanes/safety/model.md). Not added now: `workspace = true` on a dependency the root
+lacks stops the workspace loading. A normal build is unchanged without it.
+
+### 2. fix-orderkeys (or whoever holds `crates/intern/src/symbol.rs` last): unsafe.md splits
+
+The safety-audit items for `symbol.rs` in `v2/requests/format.md` ("From safety-audit",
+"intern"), adapted to the file as it is now (`Text { key, str }`). Comments and block splits
+only, no behavior change:
+
+- `unsafe impl Sync for Symbol {}`: its own comment above it:
+  `// SAFETY: As for `Send`: a `Symbol` is a shared reference to a `Text` that is never written again.`
+- `Symbol::intern`'s `insert` closure, the one `unsafe { .. }` of five operations: replace the
+  block (and the SAFETY comment above it) with
+
+  ```rust
+  // SAFETY: `to` is fresh memory of `layout`, and `bytes_at` is where `Layout::extend` put
+  // the bytes in it, so the pointer stays in the allocation.
+  let bytes = unsafe { to.as_ptr().add(bytes_at) };
+  // SAFETY: `bytes` has room for `s.len()` bytes (the array part of `layout`) and is fresh
+  // memory, so it cannot overlap `s`.
+  unsafe { bytes.copy_from_nonoverlapping(s.as_ptr(), s.len()) };
+  // SAFETY: The `s.len()` bytes at `bytes` were just written, and the arena never moves,
+  // writes or frees them, so they live for `'static`.
+  let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes, s.len()) };
+  // SAFETY: `bytes` is a copy of `s`, a `&str`, so it is UTF-8.
+  let str: &'static str = unsafe { std::str::from_utf8_unchecked(bytes) };
+  // SAFETY: `layout` starts with a `Text` (`Layout::new`), so `to` is aligned for it and has
+  // room, and nothing was there to drop.
+  unsafe { to.cast::<Text>().write(Text { key, str }) };
+  ```
+
+Why: docs/v2/plan/design/unsafe.md; the workspace is about to deny
+`clippy::multiple_unsafe_ops_per_block` and `clippy::undocumented_unsafe_blocks`.
+`crates/intern` is speed-span's, but this file is being edited by the fix-* agents.

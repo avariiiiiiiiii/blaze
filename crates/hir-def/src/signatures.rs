@@ -158,7 +158,8 @@ bitflags! {
 }
 
 /// The lang items a struct is laid out or checked as no other struct is, with the flag each
-/// sets: at most eight pointer compares for a struct with a `#[lang]`, none for any other.
+/// sets, found by `STRUCT_LANG_ITEM_NAMES` (member `i` is entry `i`): one load for a struct with
+/// a `#[lang]`, none for any other.
 const STRUCT_LANG_ITEMS: [(Symbol, StructFlags); 8] = [
     (sym::phantom_data, StructFlags::IS_PHANTOM_DATA),
     (sym::owned_box, StructFlags::IS_BOX),
@@ -169,6 +170,17 @@ const STRUCT_LANG_ITEMS: [(Symbol, StructFlags); 8] = [
     (sym::f16b, StructFlags::IS_F16B),
     (sym::ppcf128, StructFlags::IS_PPC_F128),
 ];
+
+static STRUCT_LANG_ITEM_NAMES: intern::KnownNames = intern::KnownNames::new(&[
+    sym::Declared::phantom_data,
+    sym::Declared::owned_box,
+    sym::Declared::manually_drop,
+    sym::Declared::unsafe_cell,
+    sym::Declared::covariant_unsafe_cell,
+    sym::Declared::unsafe_pinned,
+    sym::Declared::f16b,
+    sym::Declared::ppcf128,
+]);
 
 impl StructFlags {
     /// The flags of a struct or union that its attributes set.
@@ -182,10 +194,9 @@ impl StructFlags {
 
     /// The flag of a struct that is the lang item `lang`.
     fn from_lang_item(lang: &Symbol) -> StructFlags {
-        STRUCT_LANG_ITEMS
-            .iter()
-            .find(|(it, _)| it == lang)
-            .map_or(StructFlags::empty(), |&(_, flag)| flag)
+        STRUCT_LANG_ITEM_NAMES
+            .get(lang)
+            .map_or(StructFlags::empty(), |at| STRUCT_LANG_ITEMS[usize::from(at)].1)
     }
 }
 
@@ -1098,7 +1109,6 @@ fn lower_fields<Field: ast::HasAttrs + ast::HasVisibility>(
                     crate::expr_store::ExpressionStoreDiagnostics::InactiveCode {
                         node: InFile::new(fields.file_id, SyntaxNodePtr::new(field.syntax())),
                         cfg,
-                        opts: cfg_options.clone(),
                     },
                 );
             }
@@ -1448,6 +1458,9 @@ mod tests {
         let interned = ["phantom_data", "owned_box", "ppcf128", "not_a_lang_item"].map(Symbol::intern);
         for lang in STRUCT_LANG_ITEMS.iter().map(|(it, _)| it.clone()).chain(others).chain(interned) {
             assert_eq!(StructFlags::from_lang_item(&lang), reference(&lang), "{lang:?}");
+        }
+        for (i, (lang, _)) in STRUCT_LANG_ITEMS.iter().enumerate() {
+            assert_eq!(STRUCT_LANG_ITEM_NAMES.get(lang), Some(i as u16), "{lang:?}");
         }
     }
 

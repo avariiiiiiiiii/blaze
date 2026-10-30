@@ -16,7 +16,7 @@ use syntax::{
 use super::utils::{self, MethodCall};
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "unnecessary_map_or";
+const LINT: super::Implemented = super::Implemented::UnnecessaryMapOr;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if !cx.on(LINT) || cx.expansion.is_some() {

@@ -10,7 +10,7 @@ use syntax::{AstNode, TextRange, ast};
 use super::utils::{self, MethodCall};
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "map_unwrap_or";
+const LINT: super::Implemented = super::Implemented::MapUnwrapOr;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if !cx.on(LINT) || cx.expansion.is_some() {

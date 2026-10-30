@@ -17,6 +17,7 @@ doctest = false
 # The version rustc 1.101 renders its diagnostics with (`rustc_errors`'s
 # `annotate_snippet_emitter_writer.rs`), so that ours read byte for byte as clippy's do.
 annotate-snippets = "=0.12.16"
+blaze-phf.workspace = true
 cfg.workspace = true
 hir.workspace = true
 hir-expand.workspace = true

@@ -43,6 +43,8 @@
 //! alone, as every function of a build that takes edits is: the database's code of it
 //! (`compiled_root`, `compiled_instance`), whose module is the same one-function unit.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::BinaryHeap,
     sync::{Condvar, LazyLock, Mutex, atomic::Ordering},
@@ -280,7 +282,7 @@ fn calls_after_imports(db: &dyn HirDatabase, pending: &Pending) -> Vec<FuncReque
         }
     }
     let mut called: Vec<u32> = called.into_iter().collect();
-    called.sort_unstable();
+    blaze_ids::radix::sort(&mut called);
     called.into_iter().map(|at| requests.funcs[at as usize].clone()).collect()
 }
 
@@ -332,7 +334,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             }
             tried = round.tried;
             wave = Vec::new();
-            round.done.sort_by_key(|it| it.0);
+            blaze_ids::radix::sort_by_key(&mut round.done, |it| it.0);
             for (_, outcomes, found) in round.done {
                 codes.extend(outcomes);
                 tried.add(self.symbols, found, &mut wave);

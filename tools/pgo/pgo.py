@@ -579,7 +579,8 @@ def wait_exit(bins: Path) -> None:
     another lane runs is never signalled."""
     deadline = time.monotonic() + EXIT_SECS
     while True:
-        alive = subprocess.run(["pgrep", "-f", str(bins)], stdout=subprocess.PIPE).stdout.split()
+        pattern = re.escape(f"{bins}{os.sep}")
+        alive = subprocess.run(["pgrep", "-f", pattern], stdout=subprocess.PIPE).stdout.split()
         if not alive:
             return
         if time.monotonic() > deadline:
@@ -858,9 +859,8 @@ def do_publish(publish: Publish) -> None:
     merged = merge_pins(pins, toolchain, entries)
     if publish.upload:
         repo, tag = release_of(pins.release)
-        env = dict(os.environ)
         cmd = ["gh", "release", "upload", tag, "--repo", repo, "--clobber", *map(str, uploads)]
-        run("upload the profiles", cmd, cwd=ROOT, env=env, secs=3600)
+        run("upload the profiles", cmd, secs=3600)
     PINS.write_text(dump_pins(merged))
     print(f"{PINS.relative_to(ROOT)} pins {', '.join(t for t, _ in entries)}", flush=True)
 

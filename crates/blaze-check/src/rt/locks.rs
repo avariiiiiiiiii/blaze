@@ -29,18 +29,17 @@ pub(crate) enum OnceState {
     Done,
 }
 
+/// A once cell's state in this execution; its value is in the cell itself.
 pub(crate) struct Once {
     pub(crate) state: OnceState,
-    /// The value, boxed by the cell that knows its type; null when it is the cell's own (set
-    /// outside the model) or there is none.
-    pub(crate) value: *mut (),
     sync: Clock,
 }
 
 /// What a once cell's operation found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Found {
-    /// Initialized: the value (null: the cell's own).
-    Done(*mut ()),
+    /// Initialized, and what initialized it happens before the caller's next event.
+    Done,
     /// Not initialized, and the caller now initializes it.
     Run,
     /// Not initialized (a `get`).
@@ -64,7 +63,7 @@ impl Runtime {
 
     pub(crate) fn once(&mut self, id: &std::sync::atomic::AtomicU64, set: bool) -> u32 {
         let state = if set { OnceState::Done } else { OnceState::Empty };
-        self.object(id, |_| Object::Once(Once { state, value: std::ptr::null_mut(), sync: Clock::ZERO }))
+        self.object(id, |_| Object::Once(Once { state, sync: Clock::ZERO }))
     }
 
     fn lock_mut(&mut self, obj: u32) -> &mut Mutex {
@@ -186,13 +185,11 @@ impl Runtime {
     }
 
     pub(crate) fn condvar_notify(&mut self, obj: u32, all: bool) {
-        let woken: Vec<u8> = match &mut self.objects[obj as usize].obj {
-            Object::Condvar(it) if all => std::mem::take(&mut it.waiters),
-            Object::Condvar(it) if !it.waiters.is_empty() => vec![it.waiters.remove(0)],
-            Object::Condvar(_) => Vec::new(),
-            _ => unreachable!("blaze-check: a condvar operation on another object"),
+        let Object::Condvar(condvar) = &mut self.objects[obj as usize].obj else {
+            unreachable!("blaze-check: a condvar operation on another object")
         };
-        for thread in woken {
+        let woken = if all { condvar.waiters.len() } else { condvar.waiters.len().min(1) };
+        for thread in condvar.waiters.drain(..woken) {
             let th = &mut self.threads[thread as usize];
             if th.state == super::State::Blocked(Wait::Notify(obj)) {
                 th.state = super::State::Runnable;
@@ -222,9 +219,9 @@ impl Runtime {
         let once = self.once_mut(obj);
         match once.state {
             OnceState::Done => {
-                let (value, sync) = (once.value, once.sync);
+                let sync = once.sync;
                 self.threads[me].clock.join(&sync);
-                Found::Done(value)
+                Found::Done
             }
             OnceState::Empty if init => {
                 once.state = OnceState::Running(me as u8);
@@ -235,13 +232,12 @@ impl Runtime {
         }
     }
 
-    /// The caller's initialization ended with `value` (boxed by the cell).
-    pub(crate) fn once_done(&mut self, obj: u32, value: *mut ()) {
+    /// The caller's initialization ended: the cell holds its value.
+    pub(crate) fn once_done(&mut self, obj: u32) {
         let me = self.tick();
         let clock = self.threads[me].clock;
         let once = self.once_mut(obj);
         once.state = OnceState::Done;
-        once.value = value;
         once.sync = clock;
         self.wake(Wait::Object(obj));
     }

@@ -82,7 +82,10 @@ pub fn turn(db: &mut RootDatabase, env: Env) -> Vec<Crate> {
         })
         .map(|(krate, _)| krate)
         .collect();
-    reading.sort_unstable();
+    blaze_ids::radix::sort_copy_by_key(&mut reading, |it| {
+        let id = salsa::plumbing::AsId::as_id(it);
+        blaze_ids::radix::pack_32(id.index(), id.generation())
+    });
     reading.dedup();
     set_process_env(db, env);
     reading

@@ -203,6 +203,8 @@ asks one per crate of its traits in scope instead of one `trait_value_item` per 
 these lines. Numbers `0x2457`..`0x245f`, `0x247b`..`0x247d` and `0x2487`..`0x248a` are kept for
 speed-types-probe's children (layout, coherence and opaques), which will request their own lines.
 
+> forwarded to db: `crates/hir-ty/src/db.rs` is lane db's.
+
 ## From speed-types-probe-layout (2026-10-29): one query kind (`crates/hir-ty/src/db.rs`)
 
 What: in `kinds!`, after `DESTRUCTOR = 0x2456, "destructor";`:
@@ -218,3 +220,5 @@ map, an inference context, the trait environment, a `Sized` goal) though it read
 struct's identity field type and the crate. Now once per struct and crate.
 `kinds_are_distinct_and_hir_tys` / `every_query_has_a_kind` fail without this line. `0x2457` is
 from the range kept for speed-types-probe's children; `0x2458`..`0x245f` stay unused.
+
+> forwarded to db: `crates/hir-ty/src/db.rs` is lane db's.

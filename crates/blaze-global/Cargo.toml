@@ -22,7 +22,6 @@ blaze-ids.workspace = true
 blaze-usercode.workspace = true
 memchr.workspace = true
 ring.workspace = true
-rustc-hash.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 toml.workspace = true

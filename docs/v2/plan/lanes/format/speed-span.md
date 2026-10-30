@@ -69,3 +69,18 @@ Tests (`arena.rs`): shard count scales with cores and locks are 128-aligned; the
 racing writers over seeded values agree on one address per value; SWAR match finds every equal
 slot byte and never byte 7; colliding hashes grow one shard; tags and groups tell values apart;
 lock-free find after insert; the bump allocator aligns and never overlaps.
+
+## Unsafe (docs/v2/plan/design/unsafe.md)
+
+- `intern` is unsafe by nature (raw arena memory, published pointers) behind a safe API; every
+  block is one operation with its own `// SAFETY:` (the safety-audit items in
+  `v2/requests/format.md`, applied), except `symbol.rs`, handed to fix-orderkeys while it edits
+  that file. The safe reference is the `HashMap` model in `arena.rs`'s tests.
+- Model checking: `crates/intern/src/sync.rs` switches `arena.rs`'s atomics and lock to
+  `blaze-check`'s under `cfg(blaze_check)`; `model_racing_inserts_across_growth` runs two writers
+  racing across a table growth and a lock-free reader, against the sequential model. `Table::new`
+  zeroes pages in a normal build (std atomics are plain words) and makes each atomic in a model
+  build. The manifest line waits on `blaze-check` becoming a workspace dependency
+  (`v2/requests/speed.md`, "speed-span" item 1).
+- `mbe`, `tt`, `syntax-bridge` and `const-ast` forbid `unsafe_code`; `span` denies it outside its
+  one module (`hygiene.rs`, salsa ids).

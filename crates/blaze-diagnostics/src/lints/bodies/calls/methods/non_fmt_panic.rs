@@ -277,9 +277,10 @@ impl NotLiteral<'_> {
             );
         }
         if suggest_panic_any && let Some((open, close, delimiter)) = find_delimiters(b, span) {
-            let message = match suggest_display || suggest_debug {
-                true => "or use std::panic::panic_any instead",
-                false => "use std::panic::panic_any instead",
+            let message = if suggest_display || suggest_debug {
+                "or use std::panic::panic_any instead"
+            } else {
+                "use std::panic::panic_any instead"
             };
             let parts = match delimiter {
                 '(' => vec![(inner(b, span, 0, open), "std::panic::panic_any".to_owned())],

@@ -1517,3 +1517,54 @@ mod tests {
     );
     assert_eq!(checked.messages(), E0063_ONLY);
 }
+
+#[test]
+fn a_range_typo_in_the_last_field_takes_the_place_of_its_mismatch() {
+    // tests/ui/structs/struct-record-suggestion.rs, its `a`: the E0308 of `5..Default::default()`
+    // is stashed and the E0063 with the range note takes its place. `#[derive]` keeps only
+    // `Default` and `assert_eq!` is a `let`, which leaves the lines where they are; `b` (the
+    // E0308 that gets the note itself, which prints `std::ops::Range`) needs std.
+    let source = r#"//@ run-rustfix
+#[derive(Default)]
+struct A {
+    b: u32,
+    c: u64,
+    d: usize,
+}
+
+fn a() {
+    let q = A { c: 5..Default::default() };
+    //~^ ERROR missing fields
+    //~| HELP separate the last named field with a comma
+    let r = A { c: 5, ..Default::default() };
+    let _ = (q, r);
+}
+
+fn main() {
+    a();
+}
+"#;
+    assert_eq!(
+        ui_core("struct-record-suggestion.rs", "default, derive, builtin_impls, range", source),
+        r#"error[E0063]: missing fields `b` and `d` in initializer of `A`
+  --> $DIR/struct-record-suggestion.rs:10:13
+   |
+LL |     let q = A { c: 5..Default::default() };
+   |             ^ missing `b` and `d`
+   |
+note: this expression may have been misinterpreted as a `..` range expression
+  --> $DIR/struct-record-suggestion.rs:10:20
+   |
+LL |     let q = A { c: 5..Default::default() };
+   |                    ^^^^^^^^^^^^^^^^^^^^^
+help: to set the remaining fields from `Default::default()`, separate the last named field with a comma
+   |
+LL |     let q = A { c: 5, ..Default::default() };
+   |                     +
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0063`.
+"#
+    );
+}

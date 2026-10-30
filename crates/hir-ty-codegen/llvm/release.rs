@@ -251,7 +251,7 @@ fn told_functions<'ctx>(
             .map(|&(offset, target, addend)| (offset as usize, Symbol::Data(target.as_u32()), addend))
             .chain(blob.fn_relocs.iter().map(|&(offset, target)| (offset as usize, Symbol::Func(target.as_u32()), 0)))
             .collect();
-        addresses.sort_unstable_by_key(|it| it.0);
+        blaze_ids::radix::sort_copy_by_key(&mut addresses, |it| it.0);
         let fits = addresses.windows(2).all(|it| it[0].0 + pointer <= it[1].0)
             && addresses.last().is_none_or(|it| it.0 + pointer <= blob.bytes.len());
         if !fits {
@@ -293,7 +293,9 @@ fn told_functions<'ctx>(
             };
             let address = match addend {
                 0 => address,
-                // SAFETY: a constant expression of an address `addend` bytes into the object.
+                // SAFETY: `address` is a global of `module` and the index an `i64` constant of
+                // `context`, so this builds a constant expression owned by `context`; not
+                // `inbounds`, so any `addend` is defined.
                 _ => unsafe { address.const_gep(context.i8_type(), &[context.i64_type().const_int(addend as u64, true)]) },
             };
             fields.push(address.into());
@@ -310,7 +312,8 @@ fn told_functions<'ctx>(
         told.set_constant(true);
         told.set_alignment(blob.align as u32);
         old.as_pointer_value().replace_all_uses_with(told.as_pointer_value());
-        // SAFETY: nothing refers to the declaration any more.
+        // SAFETY: `old` is owned by `module`, and `replace_all_uses_with` just above sent every
+        // use to `told`; `old` is not used after, so freeing it leaves nothing dangling.
         unsafe { old.delete() };
         told.set_name(&name);
     }
@@ -366,45 +369,66 @@ fn request_of(function: FunctionValue<'_>) -> Option<u32> {
 ///
 /// Both are values of one live module.
 unsafe fn only_calls(user: LLVMValueRef, function: LLVMValueRef) -> bool {
-    unsafe {
-        let call = !core::LLVMIsACallInst(user).is_null() || !core::LLVMIsAInvokeInst(user).is_null();
-        call && core::LLVMGetCalledValue(user) == function
-            && (0..core::LLVMGetNumArgOperands(user)).all(|at| core::LLVMGetOperand(user, at) != function)
+    // SAFETY: `user` is a live value of one module, as this fn's `# Safety` says; these only
+    // read its kind.
+    let call = !unsafe { core::LLVMIsACallInst(user) }.is_null()
+        // SAFETY: `user` is a live value of one module, as the `# Safety` says; this reads its
+        // kind.
+        || !unsafe { core::LLVMIsAInvokeInst(user) }.is_null();
+    if !call {
+        return false;
     }
+    // SAFETY: `user` is a live call or invoke (just checked), which has a called operand.
+    if unsafe { core::LLVMGetCalledValue(user) } != function {
+        return false;
+    }
+    // SAFETY: `user` is a live call or invoke, whose first operands are its arguments.
+    let args = unsafe { core::LLVMGetNumArgOperands(user) };
+    // SAFETY: `at` is below `args`, so an argument operand of the live `user`.
+    (0..args).all(|at| unsafe { core::LLVMGetOperand(user, at) } != function)
 }
 
 /// The calls and invokes of `function` in the module, each once.
 fn calls_of(function: FunctionValue<'_>) -> Vec<LLVMValueRef> {
     let mut calls = Vec::new();
     let target = function.as_value_ref();
-    // SAFETY: the uses of a live function are of its module.
-    unsafe {
-        let mut used = core::LLVMGetFirstUse(target);
-        while !used.is_null() {
-            let user = core::LLVMGetUser(used);
-            if only_calls(user, target) && !calls.contains(&user) {
-                calls.push(user);
-            }
-            used = core::LLVMGetNextUse(used);
+    // SAFETY: `target` is a live function of its module, which owns its use list; nothing
+    // changes it during this walk.
+    let mut used = unsafe { core::LLVMGetFirstUse(target) };
+    while !used.is_null() {
+        // SAFETY: `used` is a non-null use of `target`, live during the walk.
+        let user = unsafe { core::LLVMGetUser(used) };
+        // SAFETY: `user` and `target` are live values of one module, as `only_calls` asks.
+        if unsafe { only_calls(user, target) } && !calls.contains(&user) {
+            calls.push(user);
         }
+        // SAFETY: `used` is a live use of `target`; the list is unchanged during the walk.
+        used = unsafe { core::LLVMGetNextUse(used) };
     }
     calls
 }
 
 /// What a constant argument is, where it is an integer of at most 64 bits.
-fn arg_of(value: LLVMValueRef) -> Arg {
-    // SAFETY: `value` is an operand of a live instruction.
-    unsafe {
-        if core::LLVMIsAConstantInt(value).is_null() {
-            return Arg::Unknown;
+///
+/// # Safety
+///
+/// `value` is a live value of a module.
+unsafe fn arg_of(value: LLVMValueRef) -> Arg {
+    // SAFETY: `value` is a live value (the caller's operand of a live instruction, as the
+    // `# Safety` asks); this reads its kind.
+    if unsafe { core::LLVMIsAConstantInt(value) }.is_null() {
+        return Arg::Unknown;
+    }
+    // SAFETY: `value` is live; its type is owned by its context.
+    let ty = unsafe { core::LLVMTypeOf(value) };
+    // SAFETY: `ty` is the integer type of a constant int.
+    let bits = unsafe { core::LLVMGetIntTypeWidth(ty) };
+    match u8::try_from(bits) {
+        Ok(bits) if bits <= 64 => {
+            // SAFETY: `value` is a constant int of at most 64 bits (checked by the arm).
+            Arg::Int { bits, value: unsafe { core::LLVMConstIntGetZExtValue(value) } }
         }
-        let bits = core::LLVMGetIntTypeWidth(core::LLVMTypeOf(value));
-        match u8::try_from(bits) {
-            Ok(bits) if bits <= 64 => {
-                Arg::Int { bits, value: core::LLVMConstIntGetZExtValue(value) }
-            }
-            _ => Arg::Unknown,
-        }
+        _ => Arg::Unknown,
     }
 }
 
@@ -416,7 +440,8 @@ fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: 
         .get_param_iter()
         .enumerate()
         .filter(|(at, param)| {
-            // SAFETY: a parameter of a live function.
+            // SAFETY: `param` is a parameter of `function`, owned by `module` for `'ctx`; this
+            // only reads whether its use list is empty.
             let used = unsafe { !core::LLVMGetFirstUse(param.as_value_ref()).is_null() };
             !used && !in_memory(function, *at as u32)
         })
@@ -429,18 +454,29 @@ fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: 
                 continue;
             }
             let at = instruction.as_value_ref();
-            // SAFETY: a call or invoke of the module; what it calls may be any value.
+            // SAFETY: `at` is a live call or invoke of `module` (opcode checked above), so it has
+            // a called operand, owned by `module` for `'ctx`; it may be any value.
             let callee = unsafe { core::LLVMGetCalledValue(at) };
+            // SAFETY: `callee` is the called operand just read, a value of `module` live for
+            // `'ctx`; LLVMIsAFunction only reads its kind.
             if unsafe { core::LLVMIsAFunction(callee) }.is_null() {
                 continue;
             }
-            // SAFETY: it is a function.
+            // SAFETY: LLVMIsAFunction just above said `callee` is a function of `module`, live
+            // for `'ctx`.
             let Some(callee) = (unsafe { FunctionValue::new(callee) }) else { continue };
             let Some(request) = request_of(callee).filter(|it| instances(*it)) else { continue };
-            // SAFETY: the operands of a call are its arguments, then what it calls.
-            let args: Vec<Arg> = unsafe {
-                (0..core::LLVMGetNumArgOperands(at)).map(|it| arg_of(core::LLVMGetOperand(at, it))).collect()
-            };
+            // SAFETY: `at` is a live call or invoke of `module`, whose first operands are its
+            // arguments.
+            let count = unsafe { core::LLVMGetNumArgOperands(at) };
+            let args: Vec<Arg> = (0..count)
+                .map(|it| {
+                    // SAFETY: `it` is below `count`, so an argument operand of the live `at`.
+                    let operand = unsafe { core::LLVMGetOperand(at, it) };
+                    // SAFETY: `operand` is a live value of `module`, as `arg_of` asks.
+                    unsafe { arg_of(operand) }
+                })
+                .collect();
             match calls.iter_mut().find(|it| it.request == request) {
                 Some(called) => {
                     called.count += 1;
@@ -462,13 +498,20 @@ fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: 
     for other in module.get_functions() {
         let Some(request) = request_of(other).filter(|it| instances(*it)) else { continue };
         let target = other.as_value_ref();
-        // SAFETY: the uses of a live function are of its module.
-        let taken = unsafe {
-            let mut used = core::LLVMGetFirstUse(target);
+        let taken = {
+            // SAFETY: `target` is a live function of `module`, which owns its use list;
+            // nothing changes it during this walk.
+            let mut used = unsafe { core::LLVMGetFirstUse(target) };
             let mut taken = false;
             while !used.is_null() && !taken {
-                taken = !only_calls(core::LLVMGetUser(used), target);
-                used = core::LLVMGetNextUse(used);
+                // SAFETY: `used` is a non-null use of `target`, live during the walk.
+                let user = unsafe { core::LLVMGetUser(used) };
+                // SAFETY: `user` and `target` are live values of one module, as `only_calls`
+                // asks.
+                taken = !unsafe { only_calls(user, target) };
+                // SAFETY: `used` is a live use of `target`; the list is unchanged during the
+                // walk.
+                used = unsafe { core::LLVMGetNextUse(used) };
             }
             taken
         };
@@ -476,7 +519,7 @@ fn facts<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>, instances: 
             addressed.push(request);
         }
     }
-    addressed.sort_unstable();
+    blaze_ids::radix::sort(&mut addressed);
     addressed.dedup();
     let attrs = attrs_of(function);
     Facts { params, unused, calls, addressed, attrs, body: attrs }
@@ -597,7 +640,9 @@ fn apply<'ctx>(
             }
             _ => return Err(Unhandled::Shape("a constant of another type than its parameter")),
         };
-        // SAFETY: both are values of the module, of one type.
+        // SAFETY: `param` is a parameter of `function` and `constant` a constant of `context`,
+        // both live for `'ctx` and of one type (matched just above); a different type would
+        // break the IR's typing.
         unsafe { core::LLVMReplaceAllUsesWith(param.as_value_ref(), constant.as_value_ref()) };
     }
     let memory = attribute_kind("memory");
@@ -644,16 +689,26 @@ fn apply<'ctx>(
             }
         }
         for call in calls_of(callee) {
-            // SAFETY: a call of the module, its arguments of the types its callee is called
-            // through.
-            unsafe {
-                let args = core::LLVMGetNumArgOperands(call);
-                for &at in params.iter().filter(|&&at| at < args) {
-                    let arg = core::LLVMGetOperand(call, at);
-                    core::LLVMSetOperand(call, at, core::LLVMGetPoison(core::LLVMTypeOf(arg)));
-                    for name in UB_IF_POISON {
-                        core::LLVMRemoveCallSiteEnumAttribute(call, at + 1, attribute_kind(name));
-                    }
+            // SAFETY: `call` is a live call or invoke of `module` (from `calls_of`), changed
+            // below only in its operands and attributes.
+            let args = unsafe { core::LLVMGetNumArgOperands(call) };
+            for &at in params.iter().filter(|&&at| at < args) {
+                // SAFETY: `at` is below `args`, so an argument operand of `call`.
+                let arg = unsafe { core::LLVMGetOperand(call, at) };
+                // SAFETY: `arg` is live; its type is owned by the context.
+                let ty = unsafe { core::LLVMTypeOf(arg) };
+                // SAFETY: `ty` is a first-class type of the module's context, which owns the
+                // poison constant.
+                let poison = unsafe { core::LLVMGetPoison(ty) };
+                // SAFETY: `poison` has the type of the argument it replaces, so the call stays
+                // well typed; `at` is an argument operand of `call`.
+                unsafe { core::LLVMSetOperand(call, at, poison) };
+                for name in UB_IF_POISON {
+                    // SAFETY: `at + 1` is the attribute index of argument `at` of the live
+                    // `call`.
+                    unsafe {
+                        core::LLVMRemoveCallSiteEnumAttribute(call, at + 1, attribute_kind(name))
+                    };
                 }
             }
         }

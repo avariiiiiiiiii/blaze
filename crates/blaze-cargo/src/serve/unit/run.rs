@@ -11,6 +11,7 @@ use blaze_api::{ApiError, Artifact, Response};
 use blaze_cas::Store;
 use blaze_core::{Command, Completion, Done, Effect, Sandbox, Tag};
 use blaze_units::schema::Mode;
+use rustc_hash::FxHashMap;
 
 use super::{Job, package_of};
 use crate::serve::work::Runs;
@@ -25,7 +26,7 @@ pub(crate) fn process_env(job: &[(String, String)], artifact: &Artifact, os: &st
         "windows" => ";",
         _ => ":",
     };
-    let mut env: std::collections::BTreeMap<String, String> = job.iter().cloned().collect();
+    let mut env: FxHashMap<String, String> = job.iter().cloned().collect();
     for (name, value) in &artifact.env {
         let joined = match env.get(name).filter(|_| name == var) {
             Some(theirs) if theirs.starts_with(value.as_str()) => theirs.clone(),
@@ -42,6 +43,8 @@ pub(crate) fn process_env(job: &[(String, String)], artifact: &Artifact, os: &st
         };
         env.insert(name.clone(), joined);
     }
+    let mut env: Vec<(String, String)> = env.into_iter().collect();
+    env.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     env.into_iter().map(|(name, value)| (OsString::from(name), OsString::from(value))).collect()
 }
 

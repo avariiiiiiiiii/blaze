@@ -24,6 +24,7 @@ use hir_ty::{
     InferBodyId, ParamEnvAndCrate, PointerCast,
     db::HirDatabase,
     drop::DropGlue,
+    intrinsic::{Intrinsic, intrinsic_of},
     method_resolution::is_dyn_method,
     next_solver::{ConstKind, GenericArgs, ParamEnv, Region, Ty, TyKind},
     traits::StoredParamEnvAndCrate,
@@ -92,17 +93,47 @@ pub(crate) fn walked<'db>(
     db: &'db dyn HirDatabase,
     instance: &HirInstance,
 ) -> Result<&'db [Ref], String> {
+    memo(db, instance).map(|it| it.map_or(&[][..], |it| &it.refs))
+}
+
+/// The places among [`walked`] of the callees whose bodies the IR of `instance` builds in, in
+/// the order found: [`blaze_codegen::backend::Described::built_in`].
+pub(crate) fn built_in<'db>(
+    db: &'db dyn HirDatabase,
+    instance: &HirInstance,
+) -> Result<&'db [u32], String> {
+    match &instance.0 {
+        Kind::Allocator(_) => Ok(&[]),
+        _ => memo(db, instance).map(|it| it.map_or(&[][..], |it| &it.built_in)),
+    }
+}
+
+/// What the IR of an instance asks for, and which of its callees it builds in.
+#[derive(PartialEq, Eq, Debug)]
+pub(crate) struct Walked {
+    refs: Vec<Ref>,
+    built_in: Vec<u32>,
+}
+
+/// The walk of `instance`; `None` for one that names nothing.
+fn memo<'db>(
+    db: &'db dyn HirDatabase,
+    instance: &HirInstance,
+) -> Result<Option<&'db Walked>, String> {
     let walked = match &instance.0 {
         // Its assembly names nothing: `asm::wrapper` refuses a `sym`, and the backend an
         // assembly function with a relocation.
-        Kind::Asm(_) => return Ok(&[]),
+        Kind::Asm(_) => return Ok(None),
         Kind::Start(main) => start_walk(db, *main),
         Kind::Allocator(forward) => {
             return Err(format!("{forward:?}: an allocator entry, whose references are listed"));
         }
         Kind::Code(code, env) => code_walk(db, code.clone(), env.clone()),
     };
-    walked.as_deref().map_err(|what| format!("the references of {instance:?}: {what}"))
+    match walked {
+        Ok(walked) => Ok(Some(walked)),
+        Err(what) => Err(format!("the references of {instance:?}: {what}")),
+    }
 }
 
 // Nothing in its arguments is collected by salsa (no tracked struct, no interned value with
@@ -112,12 +143,12 @@ fn code_walk<'db>(
     db: &'db dyn HirDatabase,
     instance: Instance,
     env: StoredParamEnvAndCrate,
-) -> Result<Vec<Ref>, String> {
+) -> Result<Walked, String> {
     code_refs(db, &instance, &env)
 }
 
 #[salsa::tracked(returns(ref))]
-fn start_walk<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Vec<Ref>, String> {
+fn start_walk<'db>(db: &'db dyn HirDatabase, main: FunctionId) -> Result<Walked, String> {
     let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: main.krate(db) };
     scratch(db, env, None, false, |walk| walk.start_shim(main))
 }
@@ -127,7 +158,7 @@ fn code_refs(
     db: &dyn HirDatabase,
     instance: &Instance,
     env: &StoredParamEnvAndCrate,
-) -> Result<Vec<Ref>, String> {
+) -> Result<Walked, String> {
     let ty = || instance.args.as_ref().type_at(0);
     let shim_env = env.as_ref(db);
     match instance.def {
@@ -152,7 +183,7 @@ fn code_refs(
         | InstanceDef::Coroutine(_)
         | InstanceDef::CoroutineByMove(_) => (),
     }
-    let body = crate::instance_body(db, instance, env.clone()).map_err(told)?;
+    let body = crate::instance_body(db, instance, env.clone(), Some(Build::WALK)).map_err(told)?;
     let body = &*body;
     let (tracked, abi, variadic) = match instance.def {
         InstanceDef::Fn(func) => {
@@ -178,12 +209,12 @@ fn scratch<'db>(
     body: Option<&'db MirBody<'db>>,
     tracked: bool,
     work: impl for<'w, 'cx> FnOnce(&mut Walk<'w, 'cx, 'db>) -> Result<(), String>,
-) -> Result<Vec<Ref>, String> {
+) -> Result<Walked, String> {
     let isa = &**crate::target().map_err(told)?;
     let target = crate::selected_target().map_err(told)?;
     let mut cg = Recorder::new(db, isa, target, true);
     // The settings a walk reads are its own, never the thread's unit's: the walk is a query.
-    cg.unit = Some(Build { debug_assertions: true, aborts: false });
+    cg.unit = Some(Build::WALK);
     // About one reference a block, and the few of `outside`.
     let capacity = body.map_or(0, |it| it.basic_blocks.len()) + 8;
     let mut walked = None;
@@ -198,13 +229,14 @@ fn scratch<'db>(
             env: env.store(),
             listed: Listed::with_capacity(capacity),
             called: FxHashSet::with_capacity_and_hasher(capacity, Default::default()),
+            built_in: Vec::new(),
             drained: (0, 0),
         };
         let done = walk.outside().and_then(|()| work(&mut walk)).and_then(|()| walk.drain());
         walked = Some(done.map(|()| {
             let mut refs = walk.listed.refs;
             refs.shrink_to_fit();
-            refs
+            Walked { refs, built_in: walk.built_in }
         }));
         Ok(())
     })
@@ -226,6 +258,8 @@ pub(super) struct Walk<'w, 'cx, 'db> {
     /// The calls listed already, by their interned definition and arguments: a call made
     /// again costs a hash of two ids and no homing (`places::call_ref`).
     called: FxHashSet<(InstanceDef, GenericArgs<'db>)>,
+    /// The places in `listed` of the callees whose bodies are built in ([`Walked::built_in`]).
+    built_in: Vec<u32>,
     /// How many of the function and data requests of `fx.cg` are in `listed`.
     drained: (usize, usize),
 }
@@ -266,7 +300,8 @@ impl Listed {
         u32::try_from(self.refs.len()).expect("fewer than 2^32 references")
     }
 
-    fn add(&mut self, it: Ref) {
+    /// Lists `it` where it is not yet, giving its place.
+    fn add(&mut self, it: Ref) -> u32 {
         let it = match it {
             FrontRef::Extern(name) => return self.symbol(Cow::Owned(name)),
             it => it,
@@ -274,22 +309,29 @@ impl Listed {
         let hash = FxBuildHasher.hash_one(&it);
         let at = self.next();
         let refs = &self.refs;
-        let entry = self.at.entry(hash, |slot| refs[slot.at as usize] == it, |slot| slot.hash);
-        if let Entry::Vacant(vacant) = entry {
-            vacant.insert(Slot { hash, at });
-            self.refs.push(it);
+        match self.at.entry(hash, |slot| refs[slot.at as usize] == it, |slot| slot.hash) {
+            Entry::Occupied(found) => found.get().at,
+            Entry::Vacant(vacant) => {
+                vacant.insert(Slot { hash, at });
+                self.refs.push(it);
+                at
+            }
         }
     }
 
-    fn symbol(&mut self, name: Cow<'_, str>) {
+    fn symbol(&mut self, name: Cow<'_, str>) -> u32 {
         let hash = FxBuildHasher.hash_one(&*name);
         let at = self.next();
         let refs = &self.refs;
         let same =
             |slot: &Slot| matches!(&refs[slot.at as usize], FrontRef::Extern(it) if **it == *name);
-        if let Entry::Vacant(vacant) = self.symbols.entry(hash, same, |slot| slot.hash) {
-            vacant.insert(Slot { hash, at });
-            self.refs.push(FrontRef::Extern(name.into_owned()));
+        match self.symbols.entry(hash, same, |slot| slot.hash) {
+            Entry::Occupied(found) => found.get().at,
+            Entry::Vacant(vacant) => {
+                vacant.insert(Slot { hash, at });
+                self.refs.push(FrontRef::Extern(name.into_owned()));
+                at
+            }
         }
     }
 
@@ -344,7 +386,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             match &request.target {
                 FuncTarget::Symbol(symbol) => listed.symbol(Cow::Borrowed(symbol.as_str())),
                 target => listed.add(places::func_ref(db, homes, target)?),
-            }
+            };
         }
         for request in &requests.datas[drained.1..] {
             if let DataRequest::Static(id) = request {
@@ -377,13 +419,41 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
 
     /// A call of `def` with `args`, as `Recorder::callee` asks for it.
     pub(super) fn call(&mut self, def: InstanceDef, args: GenericArgs<'db>) -> Result<(), String> {
+        self.listed_call(def, args).map(drop)
+    }
+
+    /// [`Self::call`], giving the callee's place the first time it is listed.
+    fn listed_call(
+        &mut self,
+        def: InstanceDef,
+        args: GenericArgs<'db>,
+    ) -> Result<Option<u32>, String> {
         self.drain()?;
         if !self.called.insert((def, args)) {
-            return Ok(());
+            return Ok(None);
         }
         let it = places::call_ref(self.fx.cg.db, &mut self.homes, def, args, &self.env)?;
-        self.listed.add(it);
-        Ok(())
+        Ok(Some(self.listed.add(it)))
+    }
+
+    /// A call `call_as` makes of an instance, whose body the IR of a v2 unit builds in where
+    /// `always_inlinable_callee` gives one, as LLVM's always-inliner does at -O0. Its body's
+    /// requests are then the caller's, listed as `declare_inlined` makes them; the callee
+    /// stays listed, as a unit whose IR calls it after all (their signatures differ) needs.
+    fn instance_call(&mut self, def: InstanceDef, args: GenericArgs<'db>) -> Result<(), String> {
+        let Some(at) = self.listed_call(def, args)? else { return Ok(()) };
+        let Some((instance, body)) = self.fx.always_inlinable_callee(def, args) else {
+            return Ok(());
+        };
+        if !matches!(self.listed.refs[at as usize], FrontRef::Function(_)) {
+            return Err(format!(
+                "{instance:?} is built in, but its callers name it as {:?}",
+                self.listed.refs[at as usize]
+            ));
+        }
+        self.fx.cg.declare_inlined(&instance, body, self.fx.builder.func);
+        self.built_in.push(at);
+        self.drain()
     }
 
     /// A function of no crate of the build, by its symbol: `Recorder::import`.
@@ -613,7 +683,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         arg_tys: &[Ty<'db>],
         dst_ty: Ty<'db>,
     ) -> Result<(), String> {
-        self.call(def, args)?;
+        self.instance_call(def, args)?;
         let InstanceDef::Fn(func) = def else { return Ok(()) };
         let db = self.db();
         let signature = FunctionSignature::of(db, func);
@@ -874,7 +944,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             | CastKind::PtrToPtr
             | CastKind::PointerExposeAddress
             | CastKind::PointerFromExposedAddress
-            | CastKind::FnPtrToPtr => Ok(()),
+            | CastKind::FnPtrToPtr
+            | CastKind::Transmute => Ok(()),
             CastKind::IntToFloat | CastKind::FloatToInt | CastKind::FloatToFloat => {
                 self.float_cast(kind, from, to)
             }
@@ -973,12 +1044,12 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             }
             TerminatorKind::Drop { place, .. } => self.drop_value(self.place_ty(place).ty),
             TerminatorKind::Assert { msg, .. } => self.assert(msg),
-            TerminatorKind::Call { func, args, destination, target, .. } => {
+            TerminatorKind::Call { func, args, destination, target, intrinsic, .. } => {
                 // A promoted call already holds its value.
                 if target.is_some() && self.fx.constant_locals.contains(&destination.local) {
                     return Ok(());
                 }
-                self.call_terminator(func, args, destination)
+                self.call_terminator(func, args, destination, *intrinsic)
             }
             TerminatorKind::DropAndReplace { .. } | TerminatorKind::Abort => {
                 Err(format!("terminator {kind:?}"))
@@ -992,6 +1063,19 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         let name = match msg {
             AssertKind::BoundsCheck { .. } => {
                 return self.panic(&["panicking", "panic_bounds_check"]);
+            }
+            // The UB checks' (`check_pointers`, `check_enums`): `core::panicking`'s own.
+            AssertKind::MisalignedPointerDereference { .. } => {
+                return self.panic(&["panicking", "panic_misaligned_pointer_dereference"]);
+            }
+            AssertKind::NullPointerDereference => {
+                return self.panic(&["panicking", "panic_null_pointer_dereference"]);
+            }
+            AssertKind::NullReferenceConstructed => {
+                return self.panic(&["panicking", "panic_null_reference_constructed"]);
+            }
+            AssertKind::InvalidEnumConstruction(_) => {
+                return self.panic(&["panicking", "panic_invalid_enum_construction"]);
             }
             AssertKind::Overflow(BinOp::Add, ..) => "panic_const_add_overflow",
             AssertKind::Overflow(BinOp::Sub, ..) => "panic_const_sub_overflow",
@@ -1016,6 +1100,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         func: &Operand,
         args: &[Operand],
         destination: &StoredPlace,
+        intrinsic: Option<Intrinsic>,
     ) -> Result<(), String> {
         let dst_ty = self.place_ty(destination).ty;
         let fn_ty = self.operand_ty(func);
@@ -1051,9 +1136,7 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             self.operand(pointer)?;
             return self.drop_value(generic_args.type_at(0));
         }
-        let signature = FunctionSignature::of(db, func);
-        let intrinsic = FunctionSignature::is_intrinsic(db, func);
-        if intrinsic && signature.name.as_str() == "const_eval_select" {
+        if intrinsic == Some(Intrinsic::ConstEvalSelect) {
             let [tuple, _, runtime] = args else {
                 return Err(format!("const_eval_select with {} arguments", args.len()));
             };
@@ -1070,19 +1153,21 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
             let fields: Tys<'db> = fields.iter().collect();
             return self.call_direct(runtime, runtime_args, &fields, dst_ty);
         }
+        let signature = FunctionSignature::of(db, func);
+        let name = signature.name.symbol();
         if func.krate(db).data(db).origin.is_lang()
-            && matches!(signature.name.as_str(), "check_language_ub" | "check_library_ub")
+            && (*name == sym::check_language_ub || *name == sym::check_library_ub)
         {
             return Ok(());
         }
-        if intrinsic {
-            if self.intrinsic(func, generic_args, args, dst_ty)? {
+        if let Some(intrinsic) = intrinsic {
+            if self.intrinsic(intrinsic, generic_args, args, dst_ty)? {
                 return Ok(());
             }
             let overridden = AttrFlags::query(db, func.into())
                 .contains(AttrFlags::RUSTC_INTRINSIC_MUST_BE_OVERRIDDEN);
             if overridden || crate::compile_time_only(db, func) || !signature.has_body() {
-                return Err(format!("intrinsic `{}`", signature.name.as_str()));
+                return Err(format!("intrinsic `{intrinsic}`"));
             }
         }
         if let Some(name) = crate::link_name(db, func)
@@ -1144,8 +1229,8 @@ impl<'cx, 'db> Walk<'_, 'cx, 'db> {
         match ty.kind() {
             TyKind::FnDef(def, generic_args) => match def.0 {
                 CallableDefId::FunctionId(func) => {
-                    if FunctionSignature::is_intrinsic(db, func) {
-                        return Err("intrinsic called through an Fn trait".to_owned());
+                    if let Some(intrinsic) = intrinsic_of(db, func).map_err(|it| it.to_string())? {
+                        return Err(format!("intrinsic `{intrinsic}` called through an Fn trait"));
                     }
                     self.call_direct(func, generic_args, &arg_tys, dst_ty)
                 }

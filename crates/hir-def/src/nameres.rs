@@ -549,14 +549,14 @@ pub(crate) fn crate_local_def_map(db: &dyn SourceDatabase, crate_id: Crate) -> D
 
 #[salsa::tracked(returns(ref))]
 pub fn block_def_map<'db>(db: &'db dyn SourceDatabase, block_id: BlockIdLt<'db>) -> DefMap {
-    // SAFETY: the id was read from `db` in this computation and is used only while `db` is borrowed
-    // (as a key or in this query's result); salsa deletes a tracked struct only when the query that
-    // made it reruns, which reruns this one too.
+    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
+    // `block_id` is this query's own key, and the `'static` copy goes only into the `DefMap` this
+    // query returns and the modules it makes, which salsa invalidates with the key. Stored anywhere
+    // else, it could name a freed salsa slot in a later revision.
     let block_id = unsafe { block_id.to_static() };
     let ast_id = block_id.ast_id(db);
-    // SAFETY: the id was read from `db` in this computation and is used only while `db` is borrowed
-    // (as a key or in this query's result); salsa deletes a tracked struct only when the query that
-    // made it reruns, which reruns this one too.
+    // SAFETY: as for `block_id` above: the block's module goes only into the `DefMap` this query
+    // returns.
     let module = unsafe { block_id.module(db).to_static() };
 
     let visibility = Visibility::Module(module, VisibilityExplicitness::Implicit);
@@ -596,8 +596,11 @@ impl DefMap {
         block: Option<BlockInfo>,
     ) -> DefMap {
         let mut modules = ModulesMap::new();
-        // SAFETY: the def-map query running now makes this tracked struct and keeps it only in its
-        // own result; salsa deletes it only when this query reruns, which replaces that result.
+        // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
+        // `empty` runs only inside the queries that build a def map (`crate_local_def_map`, with
+        // `frozen::served`'s decode within it, and `block_def_map`), and the root id goes only into
+        // the `DefMap` that query returns. Stored elsewhere, it could name a freed salsa slot in a
+        // later revision.
         let root = unsafe {
             ModuleIdLt::new(
                 db,
@@ -666,9 +669,12 @@ impl DefMap {
 
     /// One module of the `DefMap`; depends on that module only.
     pub fn module<'a>(&'a self, db: &'a dyn SourceDatabase, id: ModuleIdLt<'_>) -> &'a ModuleData {
-        // SAFETY: the id was read from `db` in this computation and is used only while `db` is
-        // borrowed (as a key or in this query's result); salsa deletes a tracked struct only when
-        // the query that made it reruns, which reruns this one too.
+        // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. The
+        // `'static` copy keys the lookup in `self.modules`. In a collected map it is also the
+        // argument of the `Modules::module` query, whose key salsa keeps; there it is only hashed
+        // and compared with the table's ids, never read through, and a freed module's id (salsa
+        // ids carry a generation) matches no later one. Nothing else stores it. Read through after
+        // its revision, it would name a freed salsa slot.
         let id = unsafe { id.to_static() };
         let found = match &self.modules {
             ModulesSlot::Building(modules) => modules.get(&id),
@@ -1296,9 +1302,8 @@ impl Index<ModuleIdLt<'_>> for ModulesMap {
 
     fn index(&self, id: ModuleIdLt<'_>) -> &ModuleData {
         self.inner
-            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
-            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
-            // when the query that made it reruns, which reruns this one too.
+            // SAFETY: as in `DefMap::module`: the `'static` copy only keys this lookup and is
+            // dropped when it returns.
             .get(&unsafe { id.to_static() })
             .unwrap_or_else(|| panic!("ModuleId not found in ModulesMap: {id:#?}"))
     }

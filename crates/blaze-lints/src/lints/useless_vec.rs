@@ -14,7 +14,7 @@ use syntax::{
 use super::utils;
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "useless_vec";
+const LINT: super::Implemented = super::Implemented::UselessVec;
 
 /// clippy's `VEC_METHODS_SHADOWING_SLICE_METHODS`: methods of `Vec` that slices have too.
 const SLICE_METHODS: [&str; 3] = ["as_ptr", "is_empty", "len"];

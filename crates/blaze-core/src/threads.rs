@@ -12,7 +12,7 @@ use std::{
     io::{self, Write as _},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::JoinHandle,
@@ -29,7 +29,7 @@ use crate::{
 pub struct Threads {
     start: Instant,
     root: Arc<Path>,
-    work: Option<Sender<Effect>>,
+    work: Option<crossbeam_channel::Sender<Effect>>,
     done: Receiver<Completion>,
     finished: Sender<Completion>,
     workers: Vec<JoinHandle<()>>,
@@ -48,8 +48,7 @@ impl Threads {
     /// A driver whose files are under `root`, with `threads` threads for blocking calls.
     pub fn new(root: impl Into<PathBuf>, threads: usize) -> Threads {
         let root: Arc<Path> = root.into().into();
-        let (work, queue) = mpsc::channel::<Effect>();
-        let queue = Arc::new(Mutex::new(queue));
+        let (work, queue) = crossbeam_channel::unbounded::<Effect>();
         let (finished, done) = mpsc::channel();
         let workers = (0..threads.max(1))
             .map(|n| {
@@ -149,10 +148,14 @@ impl Drop for Threads {
     }
 }
 
-fn work_on(root: &Path, queue: &Mutex<Receiver<Effect>>, finished: &Sender<Completion>) {
-    loop {
-        let next = queue.lock().map(|it| it.recv());
-        let Ok(Ok(effect)) = next else { return };
+/// Runs the file effects this thread takes off `queue`, which every IO thread takes from with
+/// no lock, until the driver drops its end.
+fn work_on(
+    root: &Path,
+    queue: &crossbeam_channel::Receiver<Effect>,
+    finished: &Sender<Completion>,
+) {
+    while let Ok(effect) = queue.recv() {
         let tag = effect.tag();
         let done =
             run(root, effect).unwrap_or_else(|error| Done::Failed(IoError(error.to_string())));
@@ -650,7 +653,7 @@ impl Watching {
 /// A watch of FSEvents', which calls back on a queue of its own.
 #[cfg(target_os = "macos")]
 struct Watching {
-    stream: Mutex<Option<crate::fsevents::Stream>>,
+    stream: std::sync::Mutex<Option<crate::fsevents::Stream>>,
     tag: Tag,
     finished: Sender<Completion>,
 }
@@ -670,7 +673,7 @@ impl Watching {
             tag,
             Box::new(move |completion| _ = send.send(completion)),
         )?;
-        Ok(Watching { stream: Mutex::new(Some(stream)), tag, finished })
+        Ok(Watching { stream: std::sync::Mutex::new(Some(stream)), tag, finished })
     }
 
     fn stop(&self) {

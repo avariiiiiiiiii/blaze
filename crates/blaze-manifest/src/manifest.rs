@@ -1249,7 +1249,7 @@ fn to_real_manifest(
     let patch = patch(&normalized_toml, &mut manifest_ctx)?;
 
     {
-        let mut names_sources = BTreeMap::new();
+        let mut names_sources = FxHashMap::default();
         for dep in &deps {
             let name = dep.name_in_toml();
             let prev = names_sources.insert(name, &dep.source_id);
@@ -1324,6 +1324,7 @@ fn to_real_manifest(
         version: version.cloned().unwrap_or_else(|| semver::Version::new(0, 0, 0)),
         source_id,
     };
+    // BTreeMap: `closest_msg` in `build_summary_features` breaks ties in its key order.
     let declared_features: BTreeMap<String, Vec<String>> = normalized_toml
         .features
         .iter()

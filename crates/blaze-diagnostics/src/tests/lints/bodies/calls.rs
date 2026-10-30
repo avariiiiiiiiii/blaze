@@ -5,21 +5,20 @@ mod items;
 mod methods;
 mod statements;
 
-use crate::{Options, emit::Style, lints::CommandLine};
-
-/// Whether a UI test passes (`//@ check-pass`, `//@ run-pass`): compiletest gives it more flags.
-#[derive(Clone, Copy)]
-pub(crate) enum Test {
-    Passes,
-    Fails,
-}
+use crate::{
+    Options,
+    emit::Style,
+    lints::CommandLine,
+    tests::{Mode, compiletest},
+};
 
 /// A UI test: its file's name and edition, what its crate is built with, and its source byte
 /// for byte, so that the lines and columns are its `.stderr`'s.
 pub(crate) struct Ui<'a> {
     pub(crate) name: &'a str,
     pub(crate) edition: &'a str,
-    pub(crate) test: Test,
+    /// `Mode::RunPass` for a `//@ run-pass` test, which compiletest gives no `-A unused`.
+    pub(crate) mode: Mode,
     /// minicore's flags (`crates/test-utils/src/minicore.rs`) when the test needs core.
     pub(crate) core: &'a str,
     /// What std's prelude has beyond core's that the test uses, and the items of std it uses,
@@ -35,21 +34,8 @@ pub(crate) struct Ui<'a> {
 
 impl Default for Ui<'_> {
     fn default() -> Self {
-        Ui { name: "", edition: "2015", test: Test::Fails, core: "", std: None, meta: "", flags: &[], source: "" }
+        Ui { name: "", edition: "2015", mode: Mode::Other, core: "", std: None, meta: "", flags: &[], source: "" }
     }
-}
-
-/// The lint flags compiletest gives a UI test (`runtest.rs`, `make_compile_args`): `-A unused
-/// -W unused_attributes` before them for a test that passes, then the test's own.
-fn compiletest(test: Test, flags: &[&str]) -> Options {
-    let mut args: Vec<&str> = Vec::new();
-    if let Test::Passes = test {
-        args.extend(["-A", "unused", "-W", "unused_attributes"]);
-    }
-    args.extend(["-A", "internal_features", "-A", "incomplete_features", "-A", "unused_parens", "-A", "unused_braces"]);
-    args.extend(flags.iter().flat_map(|flag| split_flag(flag)));
-    let args: Vec<String> = args.into_iter().map(str::to_owned).collect();
-    Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() }
 }
 
 /// `-D path-statements` as the two arguments rustc reads it as.
@@ -58,6 +44,13 @@ fn split_flag(flag: &str) -> Vec<&str> {
         Some((level, lint)) => vec![level, lint],
         None => vec![flag],
     }
+}
+
+/// compiletest's options for `ui`, its lint flags before the test's own.
+fn options(ui: &Ui<'_>) -> Options {
+    let args: Vec<String> = ui.flags.iter().flat_map(|flag| split_flag(flag)).map(str::to_owned).collect();
+    let own = Options { lints: CommandLine::parse(&args).unwrap(), ..Options::default() };
+    compiletest(ui.mode, &own)
 }
 
 /// What rustc writes to stderr for `ui`: its `.stderr`.
@@ -69,7 +62,8 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
     let deps = match ui.std {
         Some((prelude, items)) => {
             assert!(!ui.core.is_empty(), "std's prelude is core's: give minicore's flags");
-            fixture.push_str("//- /std.rs crate:std deps:core\npub mod prelude {\n");
+            // Without the feature, hir-def collects none of the crate's `#[lang]` items.
+            fixture.push_str("//- /std.rs crate:std deps:core\n#![feature(lang_items, rustc_attrs)]\npub mod prelude {\n");
             for edition in ["rust_2015", "rust_2018", "rust_2021", "rust_2024"] {
                 fixture.push_str(&format!(
                     "    pub mod {edition} {{ pub use core::prelude::{edition}::*; pub use crate::__prelude::*; }}\n"
@@ -82,7 +76,7 @@ pub(crate) fn ui(ui: Ui<'_>) -> String {
     };
     let meta = if ui.meta.is_empty() { String::new() } else { format!(" {}", ui.meta) };
     fixture.push_str(&format!("//- /{} crate:main edition:{}{deps}{meta}\n{}", ui.name, ui.edition, ui.source));
-    let stderr = crate::tests::checked_with(&fixture, "$DIR/", &compiletest(ui.test, ui.flags))
+    let stderr = crate::tests::checked_with(&fixture, "$DIR/", &options(&ui))
         .stderr_with(Style { ui_testing: true, ..Style::default() });
     crate::tests::normalized(&stderr)
 }

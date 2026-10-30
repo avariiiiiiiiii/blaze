@@ -362,7 +362,7 @@ pub(super) fn from_elf(
         });
     }
 
-    defined.sort_by_key(|it| (it.section.0, it.address));
+    blaze_ids::radix::sort_by_key(&mut defined, |it| blaze_ids::radix::pack_64(it.section.0 as u64, it.address));
     let containing = |section: SectionIndex, address: u64| {
         let after =
             defined.partition_point(|it| (it.section.0, it.address) <= (section.0, address));
@@ -436,28 +436,8 @@ pub(super) fn from_elf(
 /// values of its crates), which says what its code may use as LLVM's does: the linker joins
 /// those of every object, and wasm-bindgen reads `reference-types` off the program's.
 pub(super) fn target_features(enabled: impl IntoIterator<Item = String>) -> (String, Vec<u8>) {
-    /// The features LLVM's wasm target knows, of the names rustc gives them too.
-    const KNOWN: &[&str] = &[
-        "atomics",
-        "bulk-memory",
-        "bulk-memory-opt",
-        "call-indirect-overlong",
-        "exception-handling",
-        "extended-const",
-        "fp16",
-        "gc",
-        "multimemory",
-        "multivalue",
-        "mutable-globals",
-        "nontrapping-fptoint",
-        "reference-types",
-        "relaxed-simd",
-        "sign-ext",
-        "simd128",
-        "tail-call",
-        "wide-arithmetic",
-    ];
-    let mut features = std::collections::BTreeSet::new();
+    // One bit per known feature, written in `KNOWN_FEATURES`' order: its names' byte order.
+    let mut features = 0u32;
     for feature in enabled {
         let implied = match feature.as_str() {
             "bulk-memory" => Some("bulk-memory-opt"),
@@ -465,18 +445,58 @@ pub(super) fn target_features(enabled: impl IntoIterator<Item = String>) -> (Str
             "relaxed-simd" => Some("simd128"),
             _ => None,
         };
-        features.extend(implied.map(str::to_owned));
-        features.insert(feature);
+        for name in std::iter::once(feature.as_str()).chain(implied) {
+            if let Some(at) = KNOWN_FEATURES.iter().position(|it| *it == name) {
+                features |= 1 << at;
+            }
+        }
     }
-    features.retain(|it| KNOWN.contains(&it.as_str()));
     let mut contents = Vec::new();
-    (features.len() as u32).encode(&mut contents);
-    for feature in &features {
-        contents.push(b'+');
-        feature.as_str().encode(&mut contents);
+    features.count_ones().encode(&mut contents);
+    for (at, &name) in KNOWN_FEATURES.iter().enumerate() {
+        if features >> at & 1 != 0 {
+            contents.push(b'+');
+            name.encode(&mut contents);
+        }
     }
     ("target_features".to_owned(), contents)
 }
+
+/// The features LLVM's wasm target knows, of the names rustc gives them too, sorted by bytes.
+const KNOWN_FEATURES: &[&str] = &[
+    "atomics",
+    "bulk-memory",
+    "bulk-memory-opt",
+    "call-indirect-overlong",
+    "exception-handling",
+    "extended-const",
+    "fp16",
+    "gc",
+    "multimemory",
+    "multivalue",
+    "mutable-globals",
+    "nontrapping-fptoint",
+    "reference-types",
+    "relaxed-simd",
+    "sign-ext",
+    "simd128",
+    "tail-call",
+    "wide-arithmetic",
+];
+
+const _: () = {
+    assert!(KNOWN_FEATURES.len() <= 32);
+    let mut at = 1;
+    while at < KNOWN_FEATURES.len() {
+        let (a, b) = (KNOWN_FEATURES[at - 1].as_bytes(), KNOWN_FEATURES[at].as_bytes());
+        let mut byte = 0;
+        while byte < a.len() && byte < b.len() && a[byte] == b[byte] {
+            byte += 1;
+        }
+        assert!(if byte < a.len() && byte < b.len() { a[byte] < b[byte] } else { a.len() < b.len() });
+        at += 1;
+    }
+};
 
 impl Writer {
     fn ty(&mut self, signature: &WasmSignature) -> u32 {
@@ -528,7 +548,7 @@ impl Writer {
         const CODE_SECTION: u32 = 3;
         const DATA_SECTION: u32 = 4;
         let relocs = |section: u32, relocs: &mut Vec<Reloc>| {
-            relocs.sort_by_key(|it| it.offset);
+            blaze_ids::radix::sort_by_key(&mut relocs[..], |it| it.offset);
             let mut contents = Vec::new();
             section.encode(&mut contents);
             (relocs.len() as u32).encode(&mut contents);
@@ -595,5 +615,55 @@ fn write_padded(place: &mut [u8], mut value: u32) {
     for (at, byte) in place.iter_mut().enumerate() {
         *byte = (value & 0x7f) as u8 | if at == last { 0 } else { 0x80 };
         value >>= 7;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+
+    /// `target_features` as it was over a set of names: the bytes the bitset must write.
+    fn reference(enabled: Vec<String>) -> (String, Vec<u8>) {
+        let mut features = BTreeSet::new();
+        for feature in enabled {
+            let implied = match feature.as_str() {
+                "bulk-memory" => Some("bulk-memory-opt"),
+                "reference-types" => Some("call-indirect-overlong"),
+                "relaxed-simd" => Some("simd128"),
+                _ => None,
+            };
+            features.extend(implied.map(str::to_owned));
+            features.insert(feature);
+        }
+        features.retain(|it| KNOWN_FEATURES.contains(&it.as_str()));
+        let mut contents = Vec::new();
+        (features.len() as u32).encode(&mut contents);
+        for feature in &features {
+            contents.push(b'+');
+            feature.as_str().encode(&mut contents);
+        }
+        ("target_features".to_owned(), contents)
+    }
+
+    #[test]
+    fn the_bitset_writes_the_bytes_the_set_did() {
+        let names: Vec<&str> =
+            KNOWN_FEATURES.iter().copied().chain(["sse2", "", "simd", "bulk-memory-opt2"]).collect();
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..2_000 {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let len = (seed % 12) as usize;
+            let enabled: Vec<String> = (0..len)
+                .map(|at| names[(seed >> (at * 5) % 60) as usize % names.len()].to_owned())
+                .collect();
+            assert_eq!(target_features(enabled.clone()), reference(enabled.clone()), "{enabled:?}");
+        }
+        assert_eq!(target_features(Vec::new()), reference(Vec::new()));
+        let all: Vec<String> = names.iter().map(|it| (*it).to_owned()).collect();
+        assert_eq!(target_features(all.clone()), reference(all));
     }
 }

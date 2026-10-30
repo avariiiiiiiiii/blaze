@@ -27,14 +27,13 @@ mod useless_format;
 mod useless_vec;
 mod utils;
 
-use rustc_hash::FxHashSet;
 use syntax::{AstNode, SyntaxNode, ast};
 
 use crate::{
     Level,
     check::Cx,
     level::{Levels, Lint},
-    registry,
+    registry::{self, Info, LintIndex},
 };
 
 /// When rustc runs a lint's pass, which orders what it emits.
@@ -51,68 +50,150 @@ enum Pass {
     AfterLate,
 }
 
-/// The lints implemented, and the pass clippy runs each in.
-const IMPLEMENTED: &[(&str, Pass)] = &[
-    ("bool_assert_comparison", Pass::Late),
-    ("byte_char_slices", Pass::Late),
-    ("clone_on_copy", Pass::Late),
-    ("collapsible_if", Pass::Late),
-    ("crate_in_macro_def", Pass::Early),
-    ("empty_enums", Pass::Late),
-    ("get_first", Pass::Late),
-    ("io_other_error", Pass::Late),
-    ("map_clone", Pass::Late),
-    ("map_unwrap_or", Pass::Late),
-    ("match_like_matches_macro", Pass::Late),
-    ("needless_bool", Pass::Late),
-    ("needless_borrow", Pass::Late),
-    ("needless_borrows_for_generic_args", Pass::Late),
-    ("needless_return", Pass::Late),
-    ("new_without_default", Pass::Late),
-    ("nonstandard_macro_braces", Pass::PreExpansion),
-    ("redundant_static_lifetimes", Pass::Early),
-    ("single_char_add_str", Pass::Late),
-    ("unnecessary_map_or", Pass::Late),
-    ("upper_case_acronyms", Pass::Late),
-    ("useless_borrows_in_formatting", Pass::Late),
-    ("useless_format", Pass::Late),
-    ("useless_vec", Pass::AfterLate),
-];
+macro_rules! implemented {
+    ($( $lint:ident = $name:literal, $pass:ident; )*) => {
+        /// A lint implemented here, by its index among them; a set of them is an [`On`].
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(u8)]
+        pub(crate) enum Implemented {
+            $( $lint, )*
+        }
 
-pub(crate) fn implemented(lint: &str) -> bool {
-    IMPLEMENTED.iter().any(|(it, _)| *it == lint)
+        impl Implemented {
+            /// Every lint implemented, in the order of their indices.
+            pub(crate) const ALL: &[Implemented] = &[$( Implemented::$lint, )*];
+
+            /// Its name, without `clippy::`.
+            pub(crate) const fn name(self) -> &'static str {
+                match self {
+                    $( Implemented::$lint => $name, )*
+                }
+            }
+
+            /// The pass clippy runs it in.
+            const fn pass(self) -> Pass {
+                match self {
+                    $( Implemented::$lint => Pass::$pass, )*
+                }
+            }
+        }
+    };
+}
+
+implemented! {
+    BoolAssertComparison = "bool_assert_comparison", Late;
+    ByteCharSlices = "byte_char_slices", Late;
+    CloneOnCopy = "clone_on_copy", Late;
+    CollapsibleIf = "collapsible_if", Late;
+    CrateInMacroDef = "crate_in_macro_def", Early;
+    EmptyEnums = "empty_enums", Late;
+    GetFirst = "get_first", Late;
+    IoOtherError = "io_other_error", Late;
+    MapClone = "map_clone", Late;
+    MapUnwrapOr = "map_unwrap_or", Late;
+    MatchLikeMatchesMacro = "match_like_matches_macro", Late;
+    NeedlessBool = "needless_bool", Late;
+    NeedlessBorrow = "needless_borrow", Late;
+    NeedlessBorrowsForGenericArgs = "needless_borrows_for_generic_args", Late;
+    NeedlessReturn = "needless_return", Late;
+    NewWithoutDefault = "new_without_default", Late;
+    NonstandardMacroBraces = "nonstandard_macro_braces", PreExpansion;
+    RedundantStaticLifetimes = "redundant_static_lifetimes", Early;
+    SingleCharAddStr = "single_char_add_str", Late;
+    UnnecessaryMapOr = "unnecessary_map_or", Late;
+    UpperCaseAcronyms = "upper_case_acronyms", Late;
+    UselessBorrowsInFormatting = "useless_borrows_in_formatting", Late;
+    UselessFormat = "useless_format", Late;
+    UselessVec = "useless_vec", AfterLate;
+}
+
+/// A set of [`Implemented`] lints: bit `i` for the lint of index `i`.
+pub(crate) type On = u32;
+
+const _: () = assert!(Implemented::ALL.len() <= On::BITS as usize);
+
+/// Each implemented lint's index in clippy's table, found when blaze compiles: a lint not of
+/// clippy's is a compile error here.
+const REGISTRY_INDEX: [LintIndex; Implemented::ALL.len()] = {
+    let mut indices = [match registry::lint_index_const(Implemented::ALL[0].name()) {
+        Some(it) => it,
+        None => panic!("an implemented lint is not clippy's"),
+    }; Implemented::ALL.len()];
+    let mut i = 1;
+    while i < Implemented::ALL.len() {
+        indices[i] = match registry::lint_index_const(Implemented::ALL[i].name()) {
+            Some(it) => it,
+            None => panic!("an implemented lint is not clippy's"),
+        };
+        i += 1;
+    }
+    indices
+};
+
+/// For each lint of clippy's table, by its index, the index of the implemented lint it is,
+/// or `u8::MAX`.
+static BY_REGISTRY: [u8; registry::LINT_COUNT] = {
+    let mut by_registry = [u8::MAX; registry::LINT_COUNT];
+    let mut i = 0;
+    while i < Implemented::ALL.len() {
+        by_registry[REGISTRY_INDEX[i].get()] = i as u8;
+        i += 1;
+    }
+    by_registry
+};
+
+impl Implemented {
+    /// What clippy declares of it.
+    #[inline]
+    pub(crate) fn info(self) -> &'static Info {
+        REGISTRY_INDEX[self as usize].info()
+    }
+
+    /// The implemented lint `lint` of clippy's is, if it is one.
+    #[inline]
+    pub(crate) fn of(lint: LintIndex) -> Option<Implemented> {
+        Implemented::ALL.get(usize::from(BY_REGISTRY[lint.get()])).copied()
+    }
+
+    #[inline]
+    pub(crate) const fn bit(self) -> On {
+        1 << self as u32
+    }
 }
 
 /// Which of rustc's passes over a crate emits `lint`, in their order, for code in the root
 /// file or not.
-pub(crate) fn phase(lint: &str, in_root_file: bool) -> u8 {
-    match IMPLEMENTED.iter().find(|(it, _)| *it == lint).map(|(_, pass)| *pass) {
-        Some(Pass::PreExpansion) if in_root_file => 0,
-        Some(Pass::PreExpansion | Pass::Early) => 1,
-        Some(Pass::AfterLate) => 3,
-        _ => 2,
+pub(crate) fn phase(lint: Implemented, in_root_file: bool) -> u8 {
+    match lint.pass() {
+        Pass::PreExpansion if in_root_file => 0,
+        Pass::PreExpansion | Pass::Early => 1,
+        Pass::AfterLate => 3,
+        Pass::Late => 2,
     }
 }
 
 /// Every lint implemented, by name.
 pub fn names() -> impl Iterator<Item = &'static str> {
-    IMPLEMENTED.iter().map(|(it, _)| *it)
+    Implemented::ALL.iter().map(|it| it.name())
 }
 
 /// The lints that may be at a level other than `allow` somewhere in a crate whose files have
 /// `texts`: those the command line or their group does not allow, and those the crate names
 /// in an attribute.
-pub(crate) fn on(levels: &Levels, texts: &[&str]) -> FxHashSet<&'static str> {
-    let mut on = FxHashSet::default();
-    for (name, _) in IMPLEMENTED {
-        let Some(info) = registry::lint(name) else { continue };
-        let named = |text: &str| {
-            text.contains(name) || text.contains(info.group.name()) || text.contains("clippy::all")
-        };
+pub(crate) fn on(levels: &Levels, texts: &[&str]) -> On {
+    let mut on = 0;
+    // Whether some file names `clippy::all`, and each group: asked once each, not per lint.
+    let mut all: Option<bool> = None;
+    let mut groups: [Option<bool>; registry::Group::ALL.len()] = [None; registry::Group::ALL.len()];
+    let named = |name: &str| texts.iter().any(|it| it.contains(name));
+    for &lint in Implemented::ALL {
+        let info = lint.info();
         if levels.of(Lint::Clippy(info), &[]).level != Level::Allow
-            || texts.iter().any(|it| named(it))
+            || named(info.name)
+            || *groups[info.group as usize].get_or_insert_with(|| named(info.group.name()))
+            || *all.get_or_insert_with(|| named("clippy::all"))
         {
-            on.insert(*name);
+            on |= lint.bit();
         }
     }
     on
@@ -120,13 +201,13 @@ pub(crate) fn on(levels: &Levels, texts: &[&str]) -> FxHashSet<&'static str> {
 
 /// Whether the walk goes into what derives expand to: only lints that run there need it.
 pub(crate) fn in_derives(cx: &Cx<'_, '_, '_>) -> bool {
-    cx.on("empty_enums")
+    cx.on(Implemented::EmptyEnums)
 }
 
 /// Whether the walk goes into what macro calls expand to, for the code handed to them: only
 /// lints that run on code a macro can be handed need it.
 pub(crate) fn in_calls(cx: &Cx<'_, '_, '_>) -> bool {
-    IMPLEMENTED.iter().any(|(name, _)| *name != "empty_enums" && cx.on(name))
+    cx.on_any(!Implemented::EmptyEnums.bit())
 }
 
 /// Runs the lints of `node`'s kind on it.
@@ -185,6 +266,76 @@ pub(crate) fn check_node(cx: &mut Cx<'_, '_, '_>, node: &SyntaxNode) {
         single_char_add_str::check(cx, &it);
         if let ast::Expr::ClosureExpr(it) = &it {
             needless_return::check_closure(cx, it);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn implemented_lints_are_clippys() {
+        assert_eq!(Implemented::ALL.len(), 24);
+        for (at, &lint) in Implemented::ALL.iter().enumerate() {
+            assert_eq!(lint as usize, at);
+            let info = registry::lint(lint.name()).expect("a lint of clippy's");
+            assert!(std::ptr::eq(lint.info(), info));
+            assert_eq!(Implemented::of(info.index()), Some(lint));
+            assert_eq!(lint.bit(), 1 << at);
+        }
+        let others = registry::lints().iter().filter(|it| Implemented::ALL.iter().all(|l| l.name() != it.name));
+        for info in others {
+            assert_eq!(Implemented::of(info.index()), None, "{}", info.name);
+        }
+        assert!(names().is_sorted());
+    }
+
+    #[test]
+    fn phases_by_pass() {
+        assert_eq!(phase(Implemented::NonstandardMacroBraces, true), 0);
+        assert_eq!(phase(Implemented::NonstandardMacroBraces, false), 1);
+        assert_eq!(phase(Implemented::CrateInMacroDef, true), 1);
+        assert_eq!(phase(Implemented::RedundantStaticLifetimes, false), 1);
+        assert_eq!(phase(Implemented::NeedlessBool, true), 2);
+        assert_eq!(phase(Implemented::UselessVec, false), 3);
+    }
+
+    /// `on` as it was: a set of names, asked of each lint with each text scanned.
+    fn on_by_names(levels: &Levels, texts: &[&str]) -> Vec<&'static str> {
+        let mut on = Vec::new();
+        for &lint in Implemented::ALL {
+            let (name, info) = (lint.name(), lint.info());
+            let named = |text: &str| {
+                text.contains(name) || text.contains(info.group.name()) || text.contains("clippy::all")
+            };
+            if levels.of(Lint::Clippy(info), &[]).level != Level::Allow || texts.iter().any(|it| named(it)) {
+                on.push(name);
+            }
+        }
+        on
+    }
+
+    #[test]
+    fn on_is_the_set_of_names_it_was() {
+        let flags = |args: &str| {
+            let args: Vec<String> = args.split_whitespace().map(str::to_owned).collect();
+            Levels::new(&crate::level::CommandLine::parse(&args).unwrap())
+        };
+        let cases: [(&str, &[&str]); 6] = [
+            ("", &[]),
+            ("-A clippy::all", &[]),
+            ("-A clippy::all", &["#![warn(clippy::needless_bool)]"]),
+            ("-A clippy::all", &["fn f() {}", "#[deny(clippy::pedantic)] mod m {}"]),
+            ("-W clippy::pedantic -A clippy::style", &["clippy::all"]),
+            ("-A warnings", &["#[expect(clippy::map_unwrap_or)]"]),
+        ];
+        for (args, texts) in cases {
+            let levels = flags(args);
+            let on = on(&levels, texts);
+            let by_set: Vec<&str> =
+                Implemented::ALL.iter().filter(|it| on & it.bit() != 0).map(|it| it.name()).collect();
+            assert_eq!(by_set, on_by_names(&levels, texts), "{args:?} {texts:?}");
         }
     }
 }

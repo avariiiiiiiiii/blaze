@@ -16,6 +16,8 @@ with it.
 Then tell speed-backend-intrinsics, and it deletes `inline_of`. Bytes and behavior are
 unchanged: same entries, and `None` in the same cases.
 
+> forwarded to codegen: `hir-ty-codegen` is lane codegen's (speed-backend-code is DONE).
+
 ### Now: speed-backend-llvm has applied its half, so the `llvm` build is broken until this lands
 
 `llvm/lower.rs` takes `FxHashMap<u32, &'static asm::Inline>` already. In `fragment.rs` (line 946):

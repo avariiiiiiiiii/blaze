@@ -45,6 +45,8 @@ pub(crate) struct UnionFindMark {
     outer_floor: u32,
 }
 
+/// Per variable: 4 bytes of `parent` (all `find` reads), 1 of `rank`, and the value. `find` is
+/// `O(log n)` worst case and near `O(1)` amortized; a union writes two undo rows in a snapshot.
 pub(crate) struct UnionFind<K, V> {
     parent: Vec<u32>,
     /// At most `log2` of the number of variables, so below 32.
@@ -195,6 +197,9 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
         }
     }
 
+    /// Path halving only on variables at or above the floor, which a rollback truncates, so
+    /// `find` never writes an undo row. Below the floor a path stays as it is: union by rank
+    /// keeps it at most `log2(len)` long, and halving never changes a root.
     #[inline(always)]
     fn root(&mut self, index: u32) -> u32 {
         let mut at = index;
@@ -204,9 +209,8 @@ impl<K: UnifyKey, V: UnifyValue> UnionFind<K, V> {
                 return at;
             }
             let grandparent = self.parent[parent as usize];
-            if grandparent != parent {
-                let i = at as usize;
-                self.set(at, grandparent, self.rank[i], self.value[i]);
+            if grandparent != parent && at >= self.floor {
+                self.parent[at as usize] = grandparent;
             }
             at = grandparent;
         }
@@ -470,6 +474,26 @@ mod tests {
         assert!(table.undo.is_empty());
         table.rollback_to(snapshot);
         assert_eq!(table.len(), 0);
+    }
+
+    #[test]
+    fn find_in_a_snapshot_writes_no_undo_rows() {
+        let mut table = UnionFind::<Key, Universe>::default();
+        let keys: Vec<_> = (0..8).map(|u| table.new_key(Universe(u))).collect();
+        for pair in keys.chunks(2) {
+            table.union(pair[0], pair[1]);
+        }
+        table.union(keys[1], keys[3]);
+        table.union(keys[5], keys[7]);
+        table.union(keys[3], keys[7]);
+        let snapshot = table.start_snapshot();
+        for &key in &keys {
+            table.find(key);
+        }
+        assert!(table.undo.is_empty());
+        table.commit(snapshot);
+        let root = table.find(keys[0]);
+        assert!(keys.iter().all(|&key| table.find(key) == root));
     }
 
     #[test]

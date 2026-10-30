@@ -245,7 +245,7 @@ fn write_node(path: &Path, to: &mut impl Write) -> io::Result<()> {
         let mut names: Vec<_> = std::fs::read_dir(path)?
             .map(|it| it.map(|it| it.file_name()))
             .collect::<Result<_, _>>()?;
-        names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        blaze_ids::names::sort_by_name(&mut names, |it: &std::ffi::OsString| it.as_bytes());
         for name in names {
             for word in ["entry", "(", "name"] {
                 string(to, word.as_bytes())?;

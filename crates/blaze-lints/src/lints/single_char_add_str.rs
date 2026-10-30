@@ -14,7 +14,7 @@ use syntax::{
 use super::utils;
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "single_char_add_str";
+const LINT: super::Implemented = super::Implemented::SingleCharAddStr;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if !cx.on(LINT) {

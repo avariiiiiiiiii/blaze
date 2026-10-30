@@ -1,9 +1,10 @@
 //! How the database reads a view's files: a [`Tree`] answers for any root, from any thread.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, ops::Bound, sync::Arc};
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_vfs::Mode;
+use rustc_hash::FxHashMap;
 
 use crate::table::{FxMap, ShortLock};
 
@@ -42,6 +43,7 @@ pub struct MemTree {
     roots: ShortLock<FxMap<ContentId, Arc<Files>>>,
 }
 
+// BTreeMap: hashed in path order into the root's ID, and listed by prefix range.
 type Files = BTreeMap<String, (ContentId, Mode, Arc<[u8]>)>;
 
 pub const MEM_ROOT_DOMAIN: &str = "blaze v2 db memory root 2";
@@ -88,9 +90,10 @@ impl Tree for MemTree {
             return None;
         }
         let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
-        let mut names: BTreeMap<String, bool> = BTreeMap::new();
-        for name in files.keys() {
-            let Some(rest) = name.strip_prefix(&prefix) else { continue };
+        let mut names: FxHashMap<String, bool> = FxHashMap::default();
+        let under = files.range::<str, _>((Bound::Included(prefix.as_str()), Bound::Unbounded));
+        for (name, _) in under {
+            let Some(rest) = name.strip_prefix(&prefix) else { break };
             match rest.split_once('/') {
                 Some((dir, _)) => {
                     names.insert(dir.to_owned(), true);
@@ -103,6 +106,38 @@ impl Tree for MemTree {
         if names.is_empty() && !path.is_empty() {
             return None;
         }
-        Some(names.into_iter().collect())
+        let mut names: Vec<(String, bool)> = names.into_iter().collect();
+        names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Some(names)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MemTree, Tree};
+
+    #[test]
+    fn a_listing_is_sorted_by_name_and_sees_only_its_directory() {
+        let tree = MemTree::default();
+        let root = tree.root(&[
+            ("a/b", b"1"),
+            ("a-x", b"2"),
+            ("a/c/d", b"3"),
+            ("a.rs", b"4"),
+            ("ab", b"5"),
+            ("a/c.rs", b"6"),
+            ("b", b"7"),
+        ]);
+        let names = |path| tree.list(root, path);
+        let owned = |it: &[(&str, bool)]| Some(it.iter().map(|&(n, d)| (n.to_owned(), d)).collect::<Vec<_>>());
+        assert_eq!(
+            names(""),
+            owned(&[("a", true), ("a-x", false), ("a.rs", false), ("ab", false), ("b", false)])
+        );
+        assert_eq!(names("a"), owned(&[("b", false), ("c", true), ("c.rs", false)]));
+        assert_eq!(names("a/c"), owned(&[("d", false)]));
+        assert_eq!(names("a/b"), None, "a file");
+        assert_eq!(names("ab/x"), None, "nothing there");
+        assert_eq!(names("a-"), None, "a prefix of a name is no directory");
     }
 }

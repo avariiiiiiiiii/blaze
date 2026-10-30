@@ -1,6 +1,6 @@
 [package]
 name = "blaze-expand"
-description = "blaze's proc-macro expansions, keyed by what they were given and what their sandbox traced them reading, and kept in the store; native expanders for verified macro crates"
+description = "blaze's proc-macro expansions, keyed by what they were given and what their sandbox traced them reading, and kept in the store; the in-process proc-macro bridge"
 publish = false
 
 version.workspace = true
@@ -21,13 +21,8 @@ rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
-# The verified copies the native expanders are (`src/native/verified.rs`).
+# The `proc_macro` of the in-process bridge (`src/native/proc_macro/`).
 native-proc-macro.workspace = true
-native-proc-macro2.workspace = true
-native-serde-derive.workspace = true
-native-thiserror-impl-1.workspace = true
-native-thiserror-impl-2.workspace = true
-native-tokio-macros.workspace = true
 
 base-db.workspace = true
 intern.workspace = true

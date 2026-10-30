@@ -1,4 +1,4 @@
-#![feature(rustc_attrs, allow_internal_unstable, decl_macro, lang_items)]
+#![feature(allow_internal_unstable, decl_macro)]
 
 pub use core::{any, hint, marker, option, result};
 pub use core::{assert, cfg, concat, const_format_args, debug_assert, format_args, unreachable};

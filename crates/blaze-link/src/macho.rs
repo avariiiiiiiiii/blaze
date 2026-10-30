@@ -286,13 +286,14 @@ pub(super) fn classify(segment: &str, section: &str, flags: u32) -> Result<Secti
         write: segment != "__TEXT",
         exec: false,
     };
-    if segment == "__DWARF" || segment == "__LLVM" || flags & macho::S_ATTR_DEBUG != 0 {
-        return Ok(SectionKind::Dropped);
-    }
+    // Before the debug check: LLVM marks `__compact_unwind` `S_ATTR_DEBUG`.
     match (segment, section) {
         ("__LD", "__compact_unwind") => return Ok(SectionKind::Unwind(compact_unwind())),
         ("__TEXT", "__eh_frame") => return Ok(SectionKind::EhFrame),
         _ => {}
+    }
+    if segment == "__DWARF" || segment == "__LLVM" || flags & macho::S_ATTR_DEBUG != 0 {
+        return Ok(SectionKind::Dropped);
     }
     if Segment::of(segment).is_none() || segment == "__LD" {
         return Err(format!(

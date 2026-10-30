@@ -1,5 +1,6 @@
-//! A [`Driver`] for macOS: one kqueue the polling thread waits on, for timers, processes,
-//! sockets and the end of work done elsewhere. File calls block, so they run on threads of the
+//! A [`Driver`] for macOS: one kqueue the polling thread waits on, for processes, sockets and
+//! the end of work done elsewhere; timers are a [`Wheel`] whose next deadline ends the wait,
+//! with no registration in the kernel. File calls block, so they run on threads of the
 //! driver's own; watches are FSEvents streams on dispatch queues of their own. Both hand their
 //! completions back through a channel and wake the kqueue with an `EVFILT_USER` trigger.
 //!
@@ -13,7 +14,7 @@ use std::{
     os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         mpsc::{self, Receiver, Sender},
     },
     thread::JoinHandle,
@@ -25,6 +26,7 @@ use rustc_hash::FxHashMap;
 use crate::{
     Address, Command, Completion, Confine, Conn, Done, Driver, Effect, IoError, Tag, fs, fsevents,
     net, process,
+    wheel::{self, Wheel},
 };
 
 /// The id of the trigger that says the channel has completions.
@@ -102,8 +104,6 @@ impl Notify {
 /// What an event is about, by the id in its `udata`.
 #[derive(Clone, Copy)]
 enum Owner {
-    /// Due `at` after the driver began.
-    Timer { tag: Tag, at: Duration },
     Exit(Tag),
     Output { tag: Tag, err: bool },
     Input(Tag),
@@ -155,7 +155,7 @@ pub struct Kqueue {
     root: Arc<Path>,
     notify: Arc<Notify>,
     done: Receiver<Completion>,
-    work: Option<Sender<Effect>>,
+    work: Option<crossbeam_channel::Sender<Effect>>,
     workers: Vec<JoinHandle<()>>,
     confine: Option<Arc<dyn Confine>>,
     /// Where a process's output and a connection's bytes are read into.
@@ -167,6 +167,8 @@ pub struct Kqueue {
     ready: Vec<Completion>,
     next_id: u64,
     owners: FxHashMap<u64, Owner>,
+    /// By ticks since `start`; the wait ends at the next one due.
+    timers: Wheel<Tag>,
     watches: FxHashMap<Tag, fsevents::Stream>,
     spawns: FxHashMap<Tag, Spawned>,
     listens: FxHashMap<Tag, Listening>,
@@ -198,8 +200,7 @@ impl Kqueue {
             0,
             TRIGGER,
         )?;
-        let (work, queue) = mpsc::channel::<Effect>();
-        let queue = Arc::new(Mutex::new(queue));
+        let (work, queue) = crossbeam_channel::unbounded::<Effect>();
         let workers = (0..threads.max(1))
             .map(|n| {
                 let (root, queue, notify) = (root.clone(), queue.clone(), notify.clone());
@@ -222,6 +223,7 @@ impl Kqueue {
             ready: Vec::new(),
             next_id: TRIGGER + 1,
             owners: FxHashMap::default(),
+            timers: Wheel::new(),
             watches: FxHashMap::default(),
             spawns: FxHashMap::default(),
             listens: FxHashMap::default(),
@@ -291,10 +293,8 @@ impl Kqueue {
                 Ok(())
             }
             Effect::Timer { after, tag } => {
-                let id = self.own(Owner::Timer { tag, at: self.start.elapsed().saturating_add(after) });
-                let nanos = isize::try_from(after.as_nanos()).unwrap_or(isize::MAX).max(1);
-                let flags = libc::EV_ADD | libc::EV_ONESHOT;
-                self.change(id as usize, libc::EVFILT_TIMER, flags, libc::NOTE_NSECONDS, nanos, id);
+                let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
+                self.timers.insert(due, tag);
                 Ok(())
             }
             Effect::Watch { dir, tag } => {
@@ -645,9 +645,23 @@ impl Kqueue {
         Ok(())
     }
 
-    /// Makes the changes asked for and waits up to `left` (forever for `None`) for events, and
-    /// acts on them.
+    /// Makes the changes asked for and waits up to `left` (forever for `None`), or until the
+    /// next timer is due, for events, and acts on them; then fires the timers due.
     fn wait(&mut self, left: Option<Duration>) {
+        let now = wheel::ticks(self.start.elapsed());
+        let until_timer = self.timers.next_deadline().map(|due| Duration::from_nanos(due.saturating_sub(now)));
+        let left = match (left, until_timer) {
+            (Some(left), Some(until_timer)) => Some(left.min(until_timer)),
+            (left, until_timer) => left.or(until_timer),
+        };
+        self.wait_events(left);
+        let ready = &mut self.ready;
+        self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
+            ready.push(Completion { tag, done: Done::Fired });
+        });
+    }
+
+    fn wait_events(&mut self, left: Option<Duration>) {
         let timeout = left.map(|it| libc::timespec {
             tv_sec: libc::time_t::try_from(it.as_secs()).unwrap_or(libc::time_t::MAX),
             tv_nsec: it.subsec_nanos().into(),
@@ -683,7 +697,6 @@ impl Kqueue {
         }
         // SAFETY: the call wrote `got` events.
         unsafe { events.set_len(got as usize) };
-        let mut fired = Vec::new();
         for event in &events {
             let id = event.udata as u64;
             if id == TRIGGER {
@@ -698,10 +711,6 @@ impl Kqueue {
                 continue;
             }
             match owner {
-                Owner::Timer { tag, at } => {
-                    self.disown(id);
-                    fired.push((at, tag));
-                }
                 Owner::Exit(tag) => {
                     self.disown(id);
                     if let Some(spawned) = self.spawns.get_mut(&tag) {
@@ -722,21 +731,12 @@ impl Kqueue {
             }
         }
         self.events = events;
-        // Timers that fired together, in the order they were due.
-        fired.sort();
-        for (_, tag) in fired {
-            self.ready.push(Completion { tag, done: Done::Fired });
-        }
     }
 
     /// The kqueue refused a change of `id`'s.
     fn refused(&mut self, id: u64, owner: Owner, error: io::Error) {
         let failed = |error: &io::Error| Done::Failed(IoError(error.to_string()));
         match owner {
-            Owner::Timer { tag, .. } => {
-                self.disown(id);
-                self.ready.push(Completion { tag, done: failed(&error) });
-            }
             Owner::Exit(tag) => {
                 self.disown(id);
                 let Some(spawned) = self.spawns.get_mut(&tag) else { return };
@@ -904,10 +904,10 @@ impl Driver for Kqueue {
     }
 }
 
-fn work_on(root: &Path, queue: &Mutex<Receiver<Effect>>, notify: &Notify) {
-    loop {
-        let next = queue.lock().map(|it| it.recv());
-        let Ok(Ok(effect)) = next else { return };
+/// Runs the file effects this thread takes off `queue`, which every file thread takes from
+/// with no lock, until the driver drops its end.
+fn work_on(root: &Path, queue: &crossbeam_channel::Receiver<Effect>, notify: &Notify) {
+    while let Ok(effect) = queue.recv() {
         let tag = effect.tag();
         let done = match effect {
             Effect::Map { file, .. } => fs::map(&root.join(file.as_str())).map(Done::Mapped),

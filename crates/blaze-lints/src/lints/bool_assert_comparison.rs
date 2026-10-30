@@ -8,7 +8,7 @@ use syntax::{AstNode, TextRange, TextSize, ast};
 
 use crate::{check::Cx, diag::Applicability, sugg::Sugg};
 
-const LINT: &str = "bool_assert_comparison";
+const LINT: super::Implemented = super::Implemented::BoolAssertComparison;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
     if !cx.on(LINT) {

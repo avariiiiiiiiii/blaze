@@ -410,7 +410,7 @@ impl Watched {
             }
         }
         let mut heat: Vec<(u64, u64)> = by_function.into_iter().collect();
-        heat.sort_unstable_by_key(|it| (std::cmp::Reverse(it.1), it.0));
+        blaze_ids::radix::sort_copy_by_key(&mut heat, |it| blaze_ids::radix::pack_64(!it.1, it.0));
         (heat, total)
     }
 
@@ -675,7 +675,7 @@ pub(crate) fn placed(uuid: [u8; 16], pid: u32, mut moved: Vec<(u64, u64)>, end: 
         }
     }
     program.placed.append(&mut moved);
-    program.placed.sort_unstable();
+    blaze_ids::radix::sort_copy_by_key(&mut program.placed, |it| blaze_ids::radix::pack_64(it.0, it.1));
     program.placed_end = program.placed_end.max(end);
 }
 

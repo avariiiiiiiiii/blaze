@@ -55,7 +55,10 @@
 
 use std::{
     ffi::{CString, OsString},
-    os::unix::ffi::OsStrExt as _,
+    os::{
+        fd::{AsFd as _, AsRawFd as _},
+        unix::ffi::OsStrExt as _,
+    },
     path::{Path, PathBuf},
 };
 
@@ -726,7 +729,7 @@ fn sandbox(
     if !made.network {
         flags |= libc::CLONE_NEWNET;
     }
-    if unsafe { libc::unshare(flags) } < 0 {
+    if raw::unshare(flags) < 0 {
         let refused = std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
         let mut why = os("a user namespace (unshare)");
         // A container's seccomp profile (Docker's default) refuses it with EPERM: say so, and
@@ -743,11 +746,7 @@ fn sandbox(
     write("/proc/self/uid_map", format!("{uid} {uid} 1"))?;
     write("/proc/self/gid_map", format!("{gid} {gid} 1"))?;
     let root = c(Path::new("/"));
-    let none = std::ptr::null::<libc::c_char>();
-    if unsafe {
-        libc::mount(none, root.as_ptr(), none, libc::MS_REC | libc::MS_PRIVATE, std::ptr::null())
-    } < 0
-    {
+    if raw::mount(None, &root, None, libc::MS_REC | libc::MS_PRIVATE, None) < 0 {
         return Err(os("making the mounts private"));
     }
     match &spec.view {
@@ -757,17 +756,19 @@ fn sandbox(
     if !made.network {
         loopback_up()?;
     }
-    if unsafe { libc::unshare(libc::CLONE_NEWPID) } < 0 {
+    if raw::unshare(libc::CLONE_NEWPID) < 0 {
         return Err(os("a PID namespace (unshare)"));
     }
     let cwd = c(&spec.cwd);
-    let init = unsafe { libc::fork() };
+    // SAFETY: this is the sandbox's first process, forked from the one thread of `blaze
+    // sandbox` (`run_in`), so it is one thread: nothing in it starts another.
+    let init = unsafe { raw::fork() };
     if init < 0 {
         return Err(os("fork"));
     }
     if init == 0 {
         // Gone with the sandbox's first process, and the whole namespace with it.
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        raw::die_with_parent();
         let code = match first_process(&cwd, made, probe) {
             Ok(code) => code,
             Err(error) => {
@@ -775,11 +776,14 @@ fn sandbox(
                 super::COULD_NOT
             }
         };
-        unsafe { libc::_exit(code) };
+        raw::exit(code);
     }
-    unsafe { libc::close(made.socket) };
+    // SAFETY: `made.socket` is the child's end of the supervisor's pair, owned by no
+    // `OwnedFd`; this process never uses it after, and the PID namespace's first process has
+    // its own copy.
+    unsafe { raw::close(made.socket) };
     let mut status = 0;
-    while unsafe { libc::waitpid(init, &mut status, 0) } < 0 {
+    while raw::wait(init, &mut status, 0) < 0 {
         if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
             return Err(os("waitpid"));
         }
@@ -793,10 +797,10 @@ fn sandbox(
 /// refuse every write but to the writable directories and `scratch`, and every TCP `bind` and
 /// `connect`, runs the program and waits for it, and kills what it left when it ends.
 fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result<i32, String> {
-    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } < 0 {
+    if raw::no_new_privs() < 0 {
         return Err(os("no new privileges (prctl)"));
     }
-    if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) } < 0 {
+    if raw::child_subreaper() < 0 {
         return Err(os("reaping what the program leaves (prctl)"));
     }
     let mut writable = spec.writable.clone();
@@ -806,27 +810,31 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
     }
     landlock::restrict(&writable, made.network)?;
     let cwd = c(&spec.cwd);
-    if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
+    if raw::chdir(&cwd) < 0 {
         return Err(os(&format!("the working directory {}", cwd.to_string_lossy())));
     }
     if probe {
         return Ok(0);
     }
-    let program = unsafe { libc::fork() };
+    // SAFETY: this is the sandbox's first process, forked from the one thread of `blaze
+    // sandbox` (`run_in`), so it is one thread: Landlock and `prctl` start none.
+    let program = unsafe { raw::fork() };
     if program < 0 {
         return Err(os("fork"));
     }
     if program == 0 {
-        unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) };
+        raw::die_with_parent();
         let error = exec(made);
         eprintln!("blaze: could not run {}: {error}", made.argv[0].to_string_lossy());
-        unsafe { libc::_exit(127) };
+        raw::exit(127);
     }
-    unsafe { libc::close(made.socket) };
+    // SAFETY: `made.socket` is the child's end of the supervisor's pair, owned by no
+    // `OwnedFd`; this process never uses it after, and the program's process has its own copy.
+    unsafe { raw::close(made.socket) };
     let mut code = None;
     let mut status = 0;
     while code.is_none() {
-        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        let pid = raw::wait(-1, &mut status, 0);
         if pid == program {
             code = Some(ended(status));
         } else if pid < 0
@@ -837,14 +845,14 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
     }
     // What the program left is killed, as the end of a PID namespace would: each child, and
     // each process that comes to this one as its parent ends, until none is left.
-    let me = unsafe { libc::getpid() };
+    let me = raw::pid();
     let children = format!("/proc/{me}/task/{me}/children");
     loop {
         let listed = std::fs::read_to_string(&children).unwrap_or_default();
         for pid in listed.split_whitespace().filter_map(|it| it.parse::<libc::pid_t>().ok()) {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            raw::kill(pid, libc::SIGKILL);
         }
-        if unsafe { libc::waitpid(-1, &mut status, 0) } < 0
+        if raw::wait(-1, &mut status, 0) < 0
             && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
         {
             break;
@@ -855,13 +863,16 @@ fn confined(spec: &Spec, scratch: &Path, made: &Made<'_>, probe: bool) -> Result
 
 /// Landlock, which lets a process without privileges restrict itself and what it runs.
 mod landlock {
-    use std::path::{Path, PathBuf};
+    use std::{
+        os::fd::AsRawFd as _,
+        path::{Path, PathBuf},
+    };
 
-    const CREATE_RULESET: libc::c_long = 444;
-    const ADD_RULE: libc::c_long = 445;
-    const RESTRICT_SELF: libc::c_long = 446;
-    const CREATE_RULESET_VERSION: libc::c_uint = 1;
-    const RULE_PATH_BENEATH: libc::c_int = 1;
+    pub(super) const CREATE_RULESET: libc::c_long = 444;
+    pub(super) const ADD_RULE: libc::c_long = 445;
+    pub(super) const RESTRICT_SELF: libc::c_long = 446;
+    pub(super) const CREATE_RULESET_VERSION: libc::c_uint = 1;
+    pub(super) const RULE_PATH_BENEATH: libc::c_int = 1;
 
     const WRITE_FILE: u64 = 1 << 1;
     const REMOVE_DIR: u64 = 1 << 4;
@@ -888,28 +899,21 @@ mod landlock {
     const DEVICES: &[&str] = &["null", "zero", "full", "tty", "random", "urandom", "pts"];
 
     #[repr(C)]
-    struct RulesetAttr {
+    pub(super) struct RulesetAttr {
         handled_access_fs: u64,
         handled_access_net: u64,
         scoped: u64,
     }
 
     #[repr(C, packed)]
-    struct PathBeneath {
+    pub(super) struct PathBeneath {
         allowed_access: u64,
         parent_fd: i32,
     }
 
     /// The version of Landlock this kernel has, or why it has none.
     pub(super) fn abi() -> Result<i64, String> {
-        let abi = unsafe {
-            libc::syscall(
-                CREATE_RULESET,
-                std::ptr::null::<RulesetAttr>(),
-                0usize,
-                CREATE_RULESET_VERSION,
-            )
-        };
+        let abi = super::raw::landlock_abi();
         if abi >= 1 {
             return Ok(abi);
         }
@@ -955,31 +959,27 @@ mod landlock {
             4 | 5 => 16,
             _ => 24,
         };
-        let ruleset =
-            unsafe { libc::syscall(CREATE_RULESET, &attr as *const RulesetAttr, size, 0) };
+        let ruleset = super::raw::landlock_ruleset(&attr, size);
         if ruleset < 0 {
             return Err(super::os("a Landlock ruleset"));
         }
         let ruleset = ruleset as libc::c_int;
         let add = |path: &Path, required: bool| -> Result<(), String> {
             let at = super::c(path);
-            let fd = unsafe { libc::open(at.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-            if fd < 0 {
+            let Some(fd) = super::raw::open(&at, libc::O_PATH | libc::O_CLOEXEC) else {
                 return match required {
                     true => Err(super::os(&path.display().to_string())),
                     false => Ok(()),
                 };
-            }
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let statted = unsafe { libc::fstat(fd, &mut stat) } == 0;
-            let is_dir = statted && stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
+            };
+            let stat = super::raw::stat_of(fd.as_raw_fd());
+            let is_dir = stat.is_some_and(|it| it.st_mode & libc::S_IFMT == libc::S_IFDIR);
             // A device's directory (`/dev/pts`) is given what its devices are.
             let allowed = if is_dir && required { dir } else { file };
-            let rule = PathBeneath { allowed_access: allowed, parent_fd: fd };
-            let rule = &rule as *const PathBeneath;
-            let added = unsafe { libc::syscall(ADD_RULE, ruleset, RULE_PATH_BENEATH, rule, 0u32) };
+            let rule = PathBeneath { allowed_access: allowed, parent_fd: fd.as_raw_fd() };
+            let added = super::raw::landlock_add_rule(ruleset, &rule);
             let error = super::os(&format!("{} written (landlock_add_rule)", path.display()));
-            unsafe { libc::close(fd) };
+            drop(fd);
             if added < 0 { Err(error) } else { Ok(()) }
         };
         for it in writable {
@@ -988,10 +988,12 @@ mod landlock {
         for it in DEVICES {
             add(&Path::new("/dev").join(it), false)?;
         }
-        if unsafe { libc::syscall(RESTRICT_SELF, ruleset, 0u32) } < 0 {
+        if super::raw::landlock_restrict_self(ruleset) < 0 {
             return Err(super::os("restricting the sandbox (landlock_restrict_self)"));
         }
-        unsafe { libc::close(ruleset) };
+        // SAFETY: `ruleset` is the descriptor `landlock_ruleset` made above, owned by no
+        // `OwnedFd` and not used after; the restriction holds without it.
+        unsafe { super::raw::close(ruleset) };
         Ok(())
     }
 }
@@ -1001,17 +1003,10 @@ mod landlock {
 /// it.
 fn machine(spec: &Spec) -> Result<(), String> {
     let root = c(Path::new("/"));
-    let none = std::ptr::null::<libc::c_char>();
     let opened = |at: &Path| -> Result<std::os::fd::OwnedFd, String> {
         let path = c(at);
-        let fd = unsafe {
-            libc::open(path.as_ptr(), libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        };
-        if fd < 0 {
-            return Err(os(&at.display().to_string()));
-        }
-        // SAFETY: `fd` was just opened and is owned here alone.
-        Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) })
+        raw::open(&path, libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .ok_or_else(|| os(&at.display().to_string()))
     };
     // The writable directories are reached through descriptors opened before anything is
     // made read-only or hidden, and bound back in place after: they stay the directories
@@ -1019,27 +1014,20 @@ fn machine(spec: &Spec) -> Result<(), String> {
     let writable = spec.writable.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
     let readable = spec.readable.iter().map(|it| opened(it)).collect::<Result<Vec<_>, _>>()?;
     let attr = MountAttr { attr_set: MOUNT_ATTR_RDONLY, attr_clr: 0, propagation: 0, userns_fd: 0 };
-    // SAFETY: `attr` is a `struct mount_attr` of the size given.
-    if unsafe {
-        libc::syscall(
-            SYS_MOUNT_SETATTR,
-            libc::AT_FDCWD,
-            root.as_ptr(),
-            AT_RECURSIVE,
-            &attr as *const MountAttr,
-            size_of::<MountAttr>(),
-        )
-    } < 0
-    {
+    if raw::mount_setattr(&root, AT_RECURSIVE, &attr) < 0 {
         return Err(os("making every mount read-only (mount_setattr)"));
     }
     let tmpfs = |at: &Path| -> Result<(), String> {
         let (kind, at_c) = (c(Path::new("tmpfs")), c(at));
         let options = c(Path::new("mode=1777"));
         let flags = libc::MS_NOSUID | libc::MS_NODEV;
-        if unsafe {
-            libc::mount(kind.as_ptr(), at_c.as_ptr(), kind.as_ptr(), flags, options.as_ptr().cast())
-        } < 0
+        if raw::mount(
+            Some(kind.as_c_str()),
+            &at_c,
+            Some(kind.as_c_str()),
+            flags,
+            Some(options.as_c_str()),
+        ) < 0
         {
             return Err(os(&format!("an empty {}", at.display())));
         }
@@ -1099,7 +1087,7 @@ fn machine(spec: &Spec) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
         let (from, to) = (c(&by_fd(fd, "")), c(dir));
         let flags = libc::MS_BIND | libc::MS_REC;
-        if unsafe { libc::mount(from.as_ptr(), to.as_ptr(), none, flags, std::ptr::null()) } < 0 {
+        if raw::mount(Some(from.as_c_str()), &to, None, flags, None) < 0 {
             return Err(os(&format!("{} seen read-only", dir.display())));
         }
     }
@@ -1107,24 +1095,13 @@ fn machine(spec: &Spec) -> Result<(), String> {
         std::fs::create_dir_all(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
         let (from, to) = (c(&by_fd(fd, "")), c(dir));
         let flags = libc::MS_BIND | libc::MS_REC;
-        if unsafe { libc::mount(from.as_ptr(), to.as_ptr(), none, flags, std::ptr::null()) } < 0 {
+        if raw::mount(Some(from.as_c_str()), &to, None, flags, None) < 0 {
             return Err(os(&format!("{} written for real", dir.display())));
         }
         // A bind keeps the read-only mark its source was given above.
         let attr =
             MountAttr { attr_set: 0, attr_clr: MOUNT_ATTR_RDONLY, propagation: 0, userns_fd: 0 };
-        // SAFETY: `attr` is a `struct mount_attr` of the size given.
-        if unsafe {
-            libc::syscall(
-                SYS_MOUNT_SETATTR,
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                AT_RECURSIVE,
-                &attr as *const MountAttr,
-                size_of::<MountAttr>(),
-            )
-        } < 0
-        {
+        if raw::mount_setattr(&to, AT_RECURSIVE, &attr) < 0 {
             return Err(os(&format!("{} written for real (mount_setattr)", dir.display())));
         }
     }
@@ -1165,9 +1142,13 @@ fn overlay(dir: &Path, lower: &Path, upper: &Path, work: &Path) -> Result<(), St
         options.extend(escaped(work));
         options.extend(extra);
         let options = CString::new(options).unwrap_or_default();
-        if unsafe {
-            libc::mount(kind.as_ptr(), at.as_ptr(), kind.as_ptr(), 0, options.as_ptr().cast())
-        } == 0
+        if raw::mount(
+            Some(kind.as_c_str()),
+            &at,
+            Some(kind.as_c_str()),
+            0,
+            Some(options.as_c_str()),
+        ) == 0
         {
             return Ok(());
         }
@@ -1253,16 +1234,9 @@ fn put_view(
         .iter()
         .map(|bind| {
             let path = c(&bind.outside);
-            let fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
-            if fd < 0 {
-                return Err(os(&format!(
-                    "{}, bound at {}",
-                    bind.outside.display(),
-                    bind.inside.display()
-                )));
-            }
-            // SAFETY: `fd` was just opened and is owned here alone.
-            Ok(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+            raw::open(&path, libc::O_PATH | libc::O_CLOEXEC).ok_or_else(|| {
+                os(&format!("{}, bound at {}", bind.outside.display(), bind.inside.display()))
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
     let root = Path::new(VIEW_ROOT);
@@ -1271,9 +1245,13 @@ fn put_view(
     };
     let tmpfs = |at: &Path, flags: libc::c_ulong, mode: &str| -> Result<(), String> {
         let (kind, at_c, options) = (c(Path::new("tmpfs")), c(at), c(Path::new(mode)));
-        if unsafe {
-            libc::mount(kind.as_ptr(), at_c.as_ptr(), kind.as_ptr(), flags, options.as_ptr().cast())
-        } < 0
+        if raw::mount(
+            Some(kind.as_c_str()),
+            &at_c,
+            Some(kind.as_c_str()),
+            flags,
+            Some(options.as_c_str()),
+        ) < 0
         {
             return Err(os(&format!("the view's {}", at.display())));
         }
@@ -1319,14 +1297,13 @@ fn put_view(
     }
     // Outer binds first, so that one inside another lands on what the outer one shows.
     let mut order: Vec<usize> = (0..view.binds.len()).collect();
-    order.sort_by_key(|&at| view.binds[at].inside.components().count());
+    blaze_ids::radix::sort_by_key(&mut order, |&at| view.binds[at].inside.components().count());
     let mut bound: Vec<String> = Vec::new();
     for at in order {
         let (it, source) = (&view.binds[at], &sources[at]);
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(source.as_raw_fd(), &mut stat) } < 0 {
+        let Some(stat) = raw::stat_of(source.as_raw_fd()) else {
             return Err(os(&it.outside.display().to_string()));
-        }
+        };
         let dir = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
         let to = mount_point(root, &it.inside, dir, &bound)?;
         let from = PathBuf::from(format!("/proc/self/fd/{}", source.as_raw_fd()));
@@ -1402,9 +1379,8 @@ fn mount_point(root: &Path, inside: &Path, dir: bool, bound: &[String]) -> Resul
 /// Binds `from` at `to`, with what is mounted below it, and sets `attr` on all of it.
 fn bind(from: &Path, to: &Path, attr: u64) -> Result<(), String> {
     let (from_c, to_c) = (c(from), c(to));
-    let none = std::ptr::null::<libc::c_char>();
     let flags = libc::MS_BIND | libc::MS_REC;
-    if unsafe { libc::mount(from_c.as_ptr(), to_c.as_ptr(), none, flags, std::ptr::null()) } < 0 {
+    if raw::mount(Some(from_c.as_c_str()), &to_c, None, flags, None) < 0 {
         return Err(os(&format!("binding {} at {}", from.display(), to.display())));
     }
     if attr != 0 {
@@ -1418,18 +1394,7 @@ fn set_attr(at: &Path, attr: u64, recursive: bool) -> Result<(), String> {
     let at_c = c(at);
     let attr = MountAttr { attr_set: attr, attr_clr: 0, propagation: 0, userns_fd: 0 };
     let flags = if recursive { AT_RECURSIVE } else { 0 };
-    // SAFETY: `attr` is a `struct mount_attr` of the size given.
-    if unsafe {
-        libc::syscall(
-            SYS_MOUNT_SETATTR,
-            libc::AT_FDCWD,
-            at_c.as_ptr(),
-            flags,
-            &attr as *const MountAttr,
-            size_of::<MountAttr>(),
-        )
-    } < 0
-    {
+    if raw::mount_setattr(&at_c, flags, &attr) < 0 {
         return Err(os(&format!("{} (mount_setattr)", at.display())));
     }
     Ok(())
@@ -1440,18 +1405,18 @@ fn set_attr(at: &Path, attr: u64, recursive: bool) -> Result<(), String> {
 /// of the program's reaches the machine's file system after.
 fn enter_view() -> Result<(), String> {
     let (root, here) = (c(Path::new(VIEW_ROOT)), c(Path::new(".")));
-    if unsafe { libc::chdir(root.as_ptr()) } < 0 {
+    if raw::chdir(&root) < 0 {
         return Err(os("the view's root"));
     }
     // The old root goes on top of the new one, and is taken off at once.
-    if unsafe { libc::syscall(libc::SYS_pivot_root, here.as_ptr(), here.as_ptr()) } < 0 {
+    if raw::pivot_root(&here, &here) < 0 {
         return Err(os("making the view the root (pivot_root)"));
     }
-    if unsafe { libc::umount2(here.as_ptr(), libc::MNT_DETACH) } < 0 {
+    if raw::umount_detach(&here) < 0 {
         return Err(os("detaching the machine's root from the view"));
     }
     let slash = c(Path::new("/"));
-    if unsafe { libc::chdir(slash.as_ptr()) } < 0 {
+    if raw::chdir(&slash) < 0 {
         return Err(os("the view's root"));
     }
     Ok(())
@@ -1466,35 +1431,35 @@ fn close_machine_files() {
         Err(_) => return,
     };
     for fd in fds {
-        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+        let Some(stat) = raw::stat_of(fd) else {
             continue;
-        }
+        };
         let kind = stat.st_mode & libc::S_IFMT;
         let file = matches!(kind, libc::S_IFREG | libc::S_IFBLK | libc::S_IFLNK);
         if kind == libc::S_IFDIR || (fd > 2 && file) {
-            unsafe { libc::close(fd) };
+            // SAFETY: this is the program's process just before it runs the program (`exec`).
+            // The `OwnedFd`s `machine` and `put_view` opened were dropped before the forks, and
+            // what other owner it has of such a descriptor (the recorder's live file, copied
+            // at the fork) is never used or dropped again: next it runs the program or ends by
+            // `raw::exit`, which runs no destructor. Nothing uses `fd` after.
+            unsafe { raw::close(fd) };
         }
     }
 }
 
 /// Brings up the network namespace's loopback, which a new one has down.
 fn loopback_up() -> Result<(), String> {
-    let socket = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-    if socket < 0 {
+    let Some(socket) = raw::datagram_socket() else {
         return Err(os("a socket for the loopback"));
-    }
+    };
     let mut request = IfReq { name: [0; 16], flags: 0, pad: [0; 22] };
     request.name[..2].copy_from_slice(b"lo");
-    // SAFETY: `request` is a `struct ifreq`.
-    let up = unsafe {
-        libc::ioctl(socket, libc::SIOCGIFFLAGS as _, &mut request) >= 0 && {
-            request.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
-            libc::ioctl(socket, libc::SIOCSIFFLAGS as _, &request) >= 0
-        }
+    let up = raw::interface_flags(socket.as_fd(), &mut request) >= 0 && {
+        request.flags |= (libc::IFF_UP | libc::IFF_RUNNING) as libc::c_short;
+        raw::set_interface_flags(socket.as_fd(), &request) >= 0
     };
     let error = os("bringing up the loopback");
-    unsafe { libc::close(socket) };
+    drop(socket);
     if up { Ok(()) } else { Err(error) }
 }
 
@@ -1508,10 +1473,7 @@ fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, Str
         // Before the machine's tree is detached: the kernel mounts a `/proc` in a user
         // namespace only where one is seen whole already.
         let proc_ = c(&Path::new(VIEW_ROOT).join("proc"));
-        if unsafe {
-            libc::mount(kind.as_ptr(), proc_.as_ptr(), kind.as_ptr(), flags, std::ptr::null())
-        } < 0
-        {
+        if raw::mount(Some(kind.as_c_str()), &proc_, Some(kind.as_c_str()), flags, None) < 0 {
             return Err(os("the view's /proc"));
         }
         enter_view()?;
@@ -1519,29 +1481,31 @@ fn first_process(cwd: &CString, made: &Made<'_>, probe: bool) -> Result<i32, Str
         let proc_ = c(Path::new("/proc"));
         // Where `/proc` can't be mounted again, the one there still shows each process
         // itself as `/proc/self`.
-        unsafe {
-            libc::mount(kind.as_ptr(), proc_.as_ptr(), kind.as_ptr(), flags, std::ptr::null())
-        };
+        raw::mount(Some(kind.as_c_str()), &proc_, Some(kind.as_c_str()), flags, None);
     }
-    if unsafe { libc::chdir(cwd.as_ptr()) } < 0 {
+    if raw::chdir(cwd) < 0 {
         return Err(os(&format!("the working directory {}", cwd.to_string_lossy())));
     }
     if probe {
         return Ok(0);
     }
-    let program = unsafe { libc::fork() };
+    // SAFETY: this is the PID namespace's first process, forked from the sandbox's first
+    // process, which is one thread (`sandbox`), so it is one thread too.
+    let program = unsafe { raw::fork() };
     if program < 0 {
         return Err(os("fork"));
     }
     if program == 0 {
         let error = exec(made);
         eprintln!("blaze: could not run {}: {error}", made.argv[0].to_string_lossy());
-        unsafe { libc::_exit(127) };
+        raw::exit(127);
     }
-    unsafe { libc::close(made.socket) };
+    // SAFETY: `made.socket` is the child's end of the supervisor's pair, owned by no
+    // `OwnedFd`; this process never uses it after, and the program's process has its own copy.
+    unsafe { raw::close(made.socket) };
     loop {
         let mut status = 0;
-        let pid = unsafe { libc::waitpid(-1, &mut status, 0) };
+        let pid = raw::wait(-1, &mut status, 0);
         if pid == program {
             return Ok(ended(status));
         }
@@ -1565,14 +1529,14 @@ fn exec(made: &Made<'_>) -> String {
         if let Err(error) = send(made.socket, listener) {
             return error;
         }
-        unsafe { libc::close(listener) };
+        // SAFETY: `listener` is the filter's descriptor `install` just made, owned by no
+        // `OwnedFd`; the supervisor has its own copy now, and this process doesn't use it.
+        unsafe { raw::close(listener) };
     }
-    unsafe { libc::close(made.socket) };
-    let mut argv: Vec<*const libc::c_char> = made.argv.iter().map(|it| it.as_ptr()).collect();
-    argv.push(std::ptr::null());
-    let mut envp: Vec<*const libc::c_char> = made.env.iter().map(|it| it.as_ptr()).collect();
-    envp.push(std::ptr::null());
-    unsafe { libc::execve(argv[0], argv.as_ptr(), envp.as_ptr()) };
+    // SAFETY: `made.socket` is this process's copy of the child's end of the supervisor's
+    // pair, owned by no `OwnedFd`; the program is not to have it, and nothing uses it after.
+    unsafe { raw::close(made.socket) };
+    raw::execve(made.argv, made.env);
     std::io::Error::last_os_error().to_string()
 }
 
@@ -1681,17 +1645,9 @@ fn filter_program(
 /// Installs `program` as this process's seccomp filter, and the descriptor the kernel asks
 /// through.
 fn install(program: &[libc::sock_filter]) -> Result<libc::c_int, String> {
-    let prog = libc::sock_fprog { len: program.len() as u16, filter: program.as_ptr().cast_mut() };
     // The process holds every capability of its user namespace until it runs the program, so
     // it may install a filter without `no_new_privs`; a confined one has set it.
-    let listener = unsafe {
-        libc::syscall(
-            libc::SYS_seccomp,
-            SECCOMP_SET_MODE_FILTER,
-            SECCOMP_FILTER_FLAG_NEW_LISTENER,
-            &prog as *const libc::sock_fprog,
-        )
-    };
+    let listener = raw::install_filter(program);
     if listener < 0 {
         if std::io::Error::last_os_error().raw_os_error() == Some(libc::EBUSY) {
             return Err("a seccomp filter: this process is in a sandbox already, whose seccomp \
@@ -1706,23 +1662,7 @@ fn install(program: &[libc::sock_filter]) -> Result<libc::c_int, String> {
 
 /// Sends the descriptor `fd` over `socket`.
 fn send(socket: libc::c_int, fd: libc::c_int) -> Result<(), String> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    let mut space = [0u8; 64];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = space.as_mut_ptr().cast();
-    msg.msg_controllen = unsafe { libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) } as _;
-    // SAFETY: the control buffer has room for one descriptor.
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        (*cmsg).cmsg_level = libc::SOL_SOCKET;
-        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
-        (*cmsg).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as _;
-        std::ptr::write_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>(), fd);
-    }
-    if unsafe { libc::sendmsg(socket, &msg, 0) } < 0 {
+    if raw::send_descriptor(socket, fd) < 0 {
         return Err(os("handing over the filter"));
     }
     Ok(())
@@ -1730,32 +1670,7 @@ fn send(socket: libc::c_int, fd: libc::c_int) -> Result<(), String> {
 
 /// The descriptor sent over `socket`, or `None` when the other end closed first.
 fn received(socket: libc::c_int) -> Option<libc::c_int> {
-    let mut byte = [0u8; 1];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
-    let mut space = [0u8; 64];
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = space.as_mut_ptr().cast();
-    msg.msg_controllen = space.len() as _;
-    loop {
-        let read = unsafe { libc::recvmsg(socket, &mut msg, libc::MSG_CMSG_CLOEXEC) };
-        if read < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-            continue;
-        }
-        if read <= 0 {
-            return None;
-        }
-        break;
-    }
-    // SAFETY: the kernel wrote the control message.
-    unsafe {
-        let cmsg = libc::CMSG_FIRSTHDR(&msg);
-        if cmsg.is_null() || (*cmsg).cmsg_type != libc::SCM_RIGHTS {
-            return None;
-        }
-        Some(std::ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>()))
-    }
+    raw::received_descriptor(socket)
 }
 
 /// Answers the kernel's notifications through `listener`, noting what each call reached,
@@ -1765,18 +1680,16 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
     // The kernel wakes the supervisor on the CPU of the thread it holds and switches to it
     // there, as gVisor has it, rather than waking it as any other waiter. A kernel before 6.6
     // has no such flag and refuses it: the calls are answered the same, each a wake-up later.
-    // SAFETY: the flag is the argument itself.
-    let flags = SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP;
-    unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_SET_FLAGS as _, flags) };
+    raw::set_notif_flags(listener, SECCOMP_USER_NOTIF_FD_SYNC_WAKE_UP);
     let mut scratch = Scratch::default();
-    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, first, 0) } as libc::c_int;
+    let pidfd = raw::pidfd_open(first);
     let mut fds = vec![libc::pollfd { fd: listener, events: libc::POLLIN, revents: 0 }];
-    if pidfd >= 0 {
-        fds.push(libc::pollfd { fd: pidfd, events: libc::POLLIN, revents: 0 });
+    if let Some(pidfd) = &pidfd {
+        fds.push(libc::pollfd { fd: pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 });
     }
     loop {
         fds.iter_mut().for_each(|it| it.revents = 0);
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) };
+        let ready = raw::poll(&mut fds, -1);
         if ready < 0 {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -1793,9 +1706,7 @@ fn supervise(listener: libc::c_int, first: libc::pid_t, recorder: &mut Recorder,
             break;
         }
     }
-    if pidfd >= 0 {
-        unsafe { libc::close(pidfd) };
-    }
+    drop(pidfd);
 }
 
 /// What the supervisor keeps beside the record.
@@ -1880,8 +1791,7 @@ fn answer(
     scratch: &mut Scratch,
 ) {
     let mut notif = Notif::default();
-    // SAFETY: `notif` is a zeroed `struct seccomp_notif`.
-    if unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_RECV as _, &mut notif) } < 0 {
+    if raw::notif_recv(listener, &mut notif) < 0 {
         return;
     }
     let refused = match call_of(notif.nr) {
@@ -1894,9 +1804,8 @@ fn answer(
             NotifResp { id: notif.id, val: 0, error: 0, flags: SECCOMP_USER_NOTIF_FLAG_CONTINUE }
         }
     };
-    // SAFETY: `resp` is a `struct seccomp_notif_resp`. A process that ended meanwhile makes
-    // it fail, which is nothing to answer.
-    unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_SEND as _, &resp) };
+    // A process that ended meanwhile makes it fail, which is nothing to answer.
+    raw::notif_send(listener, &resp);
 }
 
 /// Notes in `recorder` what the call `notif` of `call` reaches, and the error the sandbox
@@ -2220,14 +2129,11 @@ fn resolved(pid: u32, path: &str) -> Option<String> {
 
 /// `len` bytes of `pid`'s memory at `at`, as many as are there.
 fn bytes_at(pid: u32, at: u64, len: usize) -> Option<Vec<u8>> {
-    let mut buffer = vec![0u8; len];
-    let local = libc::iovec { iov_base: buffer.as_mut_ptr().cast(), iov_len: len };
-    let remote = libc::iovec { iov_base: at as *mut libc::c_void, iov_len: len };
-    let read = unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) };
-    if read <= 0 {
+    let mut buffer = Vec::with_capacity(len);
+    let remote = [libc::iovec { iov_base: at as *mut libc::c_void, iov_len: len }];
+    if raw::read_memory_into(pid as libc::pid_t, &remote, &mut buffer) <= 0 {
         return None;
     }
-    buffer.truncate(read as usize);
     Some(buffer)
 }
 
@@ -2241,20 +2147,16 @@ fn string_at(pid: u32, address: u64, into: &mut Vec<u8>) -> bool {
     // To the end of the page, which is mapped if the byte at `address` is, then on: the kernel
     // reads one part whole or not at all, and stops at the first it can't.
     let first = MOST - (address as usize % MOST);
-    let local = libc::iovec { iov_base: into.as_mut_ptr().cast(), iov_len: MOST };
     let next = (address + first as u64) as *mut libc::c_void;
     let remote = [
         libc::iovec { iov_base: address as *mut libc::c_void, iov_len: first },
         libc::iovec { iov_base: next, iov_len: MOST - first },
     ];
     let parts = if first == MOST { 1 } else { 2 };
-    let pid = pid as libc::pid_t;
-    // SAFETY: `into` has room for `MOST` bytes, and the kernel wrote the `read` it says.
-    let read = unsafe { libc::process_vm_readv(pid, &local, 1, remote.as_ptr(), parts, 0) };
-    if read <= 0 {
+    // `into` is empty with room for `MOST` bytes, and the parts are `MOST` bytes in all.
+    if raw::read_memory_into(pid as libc::pid_t, &remote[..parts], into) <= 0 {
         return false;
     }
-    unsafe { into.set_len(read as usize) };
     if let Ok(string) = std::ffi::CStr::from_bytes_until_nul(into) {
         let len = string.to_bytes().len();
         into.truncate(len);
@@ -2274,16 +2176,16 @@ fn proc_link(pid: u32, fd: Option<i32>, into: &mut Vec<u8>) -> bool {
     if named.is_err() {
         return false;
     }
+    let Ok(name) = std::ffi::CStr::from_bytes_until_nul(&name) else {
+        return false;
+    };
     into.clear();
     into.reserve(libc::PATH_MAX as usize);
-    // SAFETY: `name` ends with a nul, and `into` has room for what `readlink` writes.
-    let room = into.capacity();
-    let read = unsafe { libc::readlink(name.as_ptr().cast(), into.as_mut_ptr().cast(), room) };
+    let read = raw::readlink_into(name, into);
     // A link as long as the room may be cut short.
     if read < 0 || read as usize >= into.capacity() {
         return false;
     }
-    unsafe { into.set_len(read as usize) };
     true
 }
 
@@ -2346,10 +2248,12 @@ mod tests {
     #[test]
     fn a_string_is_read_to_its_nul_or_as_far_as_it_is_mapped() {
         // A multiple of the 4096 bytes `string_at` reads at most, on every architecture.
+        // SAFETY: `sysconf` takes an integer and touches no memory of this process.
         let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         assert_eq!(page % 4096, 0);
-        // SAFETY: two private pages of this process, the second given back before the last
-        // read, which is to stop at it.
+        // SAFETY: a new anonymous private mapping of two pages, where the kernel picks the
+        // address (null), so it overlaps nothing of this process; nothing but this test has
+        // its address. The second page is given back before the last reads, which stop there.
         let pages = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -2362,8 +2266,14 @@ mod tests {
         };
         assert_ne!(pages, libc::MAP_FAILED);
         let base = pages as u64;
-        let put = |at: usize, bytes: &[u8]| unsafe {
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), pages.cast::<u8>().add(at), bytes.len())
+        let put = |at: usize, bytes: &[u8]| {
+            // SAFETY: every `at` below is less than `2 * page`, so the offset stays inside the
+            // mapping.
+            let to = unsafe { pages.cast::<u8>().add(at) };
+            // SAFETY: `to..to + bytes.len()` is mapped and writable at each call (the writes
+            // across the end of the first page come before the second is given back), and
+            // `bytes` is a literal, not in it.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), to, bytes.len()) };
         };
         let pid = std::process::id();
         let mut into = Vec::new();
@@ -2376,11 +2286,18 @@ mod tests {
         assert_eq!(into, b"/x/y");
         put(10, b"\0");
         assert!(!read(10, &mut into), "an empty string");
-        assert_eq!(unsafe { libc::munmap(pages.cast::<u8>().add(page).cast(), page) }, 0);
+        // SAFETY: `page` bytes in is the start of the second page of the mapping.
+        let second = unsafe { pages.cast::<u8>().add(page) };
+        // SAFETY: `second` is page-aligned and the `page` bytes from it are the mapping's
+        // second page, which nothing writes after; `string_at` reads it only through the
+        // kernel, which finds it unmapped.
+        assert_eq!(unsafe { libc::munmap(second.cast(), page) }, 0);
         put(page - 3, b"/zz");
         assert!(read(page - 3, &mut into));
         assert_eq!(into, b"/zz", "to the end of what is mapped");
         assert!(!read(page, &mut into), "nothing mapped");
+        // SAFETY: `pages` is the start of the mapping, whose first page is all that is left;
+        // nothing uses it after.
         unsafe { libc::munmap(pages, page) };
     }
 
@@ -2772,7 +2689,7 @@ echo hi > /out/written
              /dev/random\n/dev/shm\n/dev/stderr\n/dev/stdin\n/dev/stdout\n/dev/tty\n\
              /dev/urandom\n/dev/zero\n"
         );
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let (uid, gid) = (super::raw::uid(), super::raw::gid());
         let user = if uid == 0 { "root" } else { "blaze" };
         assert_eq!(
             read("passwd"),

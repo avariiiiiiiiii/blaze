@@ -60,8 +60,10 @@ impl Visibility {
         from_module: ModuleIdLt<'db>,
     ) -> bool {
         let to_module = match self {
-            // SAFETY: `self` was resolved in `db`, the database borrowed for `'db`, and the id is
-            // read only during this call.
+            // SAFETY: `to_db` needs `m` to be an id of `db`. A `Visibility` is resolved against
+            // `db`'s def maps (`Visibility::resolve`, the collector) and asked only with the same
+            // database, so `m` is one of `db`'s modules, and the `'db` copy is read only during
+            // this call. A module of another database would name a slot of another table.
             Visibility::Module(m, _) => unsafe { m.to_db(db) },
             Visibility::PubCrate(krate) => return from_module.krate(db) == krate,
             Visibility::Public => return true,

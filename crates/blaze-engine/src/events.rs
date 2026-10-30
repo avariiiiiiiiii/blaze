@@ -88,7 +88,7 @@ pub(crate) fn graph(db: &ide_db::RootDatabase, crates: &[Crate]) {
             let ready = waits.is_none_or(|it| it.iter().all(|dep| index.contains_key(dep)));
             if ready {
                 let mut on: Vec<u32> = waits.into_iter().flatten().map(|dep| index[dep]).collect();
-                on.sort_unstable();
+                blaze_ids::radix::sort(&mut on);
                 let id = first + index.len() as u32;
                 index.insert(name, id);
                 nodes.push(node(name, id, on));

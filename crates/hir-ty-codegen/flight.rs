@@ -3,6 +3,8 @@
 //!
 //! Nothing of it runs until [`begin`] is told someone hears the build.
 
+#![forbid(unsafe_code)]
+
 use std::{
     sync::{
         LazyLock, Mutex,
@@ -61,14 +63,14 @@ pub fn under_way(longer: Duration) -> Vec<Flown> {
         .filter(|it| now - it.2 >= longer)
         .map(|(krate, name, since)| Flown { krate: *krate, name: name.clone(), took: now - *since })
         .collect();
-    flown.sort_by_key(|it| std::cmp::Reverse(it.took));
+    blaze_ids::radix::sort_by_key(&mut flown, |it| !it.took.as_nanos());
     flown
 }
 
 /// The compiles done since [`begin`] that took [`SLOW`] or more, longest first.
 pub fn slowest() -> Vec<Flown> {
     let mut done = std::mem::take(&mut *lock(&DONE));
-    done.sort_by_key(|it| std::cmp::Reverse(it.took));
+    blaze_ids::radix::sort_by_key(&mut done, |it| !it.took.as_nanos());
     done
 }
 

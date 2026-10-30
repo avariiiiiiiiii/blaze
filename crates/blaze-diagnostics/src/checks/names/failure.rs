@@ -8,7 +8,7 @@
 
 use hir::{InFile, ItemInNs, ModPath, ModuleDef, Name, PathKind, StructKind};
 use span::Edition;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, ast};
+use syntax::{AstNode, AstToken as _, SyntaxKind, SyntaxNode, TextRange, ast};
 
 use crate::{
     cx::Cx,

@@ -29,13 +29,11 @@
 use std::{
     alloc::{self, Layout},
     ptr::{self, NonNull},
-    sync::{
-        OnceLock,
-        atomic::{AtomicPtr, AtomicU64, Ordering},
-    },
+    sync::OnceLock,
 };
 
 use self::lock::{InsertLock, Locked};
+use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 /// Slots in a group: tag bytes 0 to 6 of the group's control word; byte 7 stays 0 and is
 /// masked out of every match.
@@ -92,6 +90,7 @@ struct Group {
     values: [AtomicPtr<u8>; GROUP],
 }
 
+#[cfg(not(blaze_check))]
 const _: () = assert!(size_of::<Group>() == 64);
 
 struct Table {
@@ -118,21 +117,42 @@ fn empty(word: u64) -> u64 {
     !word & HIGH_BITS
 }
 
-/// A zeroed boxed slice of `len` `T`s.
+/// A zeroed boxed slice of `len` `T`s: the allocator's zeroed pages, where building the slice
+/// element by element would write every byte of a table that is mostly never touched.
 ///
 /// # Safety
 ///
 /// All zero bytes must be a valid `T`.
+#[cfg(not(blaze_check))]
 unsafe fn zeroed<T>(len: usize) -> Box<[T]> {
-    // SAFETY: The caller's precondition.
+    // SAFETY: The caller's precondition: zero bytes are a `T`, so every element is initialized.
     unsafe { Box::<[T]>::new_zeroed_slice(len).assume_init() }
 }
 
 impl Table {
+    #[cfg(not(blaze_check))]
     fn new(groups: usize) -> Table {
         debug_assert!(groups.is_power_of_two());
-        // SAFETY: Zero is an empty control word, a null pointer and a zero hash.
-        unsafe { Table { groups: zeroed(groups), hashes: zeroed(groups * GROUP) } }
+        // SAFETY: All-zero bytes are a `Group`: a zero control word (every slot empty) and null
+        // pointers.
+        let slots: Box<[Group]> = unsafe { zeroed(groups) };
+        // SAFETY: All-zero bytes are an `AtomicU64` of 0.
+        let hashes: Box<[AtomicU64]> = unsafe { zeroed(groups * GROUP) };
+        Table { groups: slots, hashes }
+    }
+
+    /// The checker's atomics are not plain words, so a model build makes each one.
+    #[cfg(blaze_check)]
+    fn new(groups: usize) -> Table {
+        debug_assert!(groups.is_power_of_two());
+        let group = |_| Group {
+            ctrl: AtomicU64::new(0),
+            values: std::array::from_fn(|_| AtomicPtr::new(ptr::null_mut())),
+        };
+        Table {
+            groups: (0..groups).map(group).collect(),
+            hashes: (0..groups * GROUP).map(|_| AtomicU64::new(0)).collect(),
+        }
     }
 
     fn capacity(&self) -> usize {
@@ -327,12 +347,10 @@ mod lock {
         reason = "the one lock of `intern`, named and bounded as docs/v2/plan/design/concurrency.md asks"
     )]
 
-    use std::{
-        ops::{Deref, DerefMut},
-        sync::{Mutex, MutexGuard, PoisonError},
-    };
+    use std::ops::{Deref, DerefMut};
 
     use super::State;
+    use crate::sync::{Mutex, MutexGuard, PoisonError};
 
     /// The lock a shard's writers take to look again for a value and insert it. It is held
     /// only for that: the caller's `Eq` against the shard's values, one bump allocation, the
@@ -408,13 +426,14 @@ impl Bump {
             self.left = bytes;
             pad = 0;
         }
-        // SAFETY: `pad + size <= left`, the bytes of the current chunk from `cursor`.
-        unsafe {
-            let at = self.cursor.add(pad);
-            self.cursor = at.add(size);
-            self.left -= pad + size;
-            NonNull::new_unchecked(at)
-        }
+        // SAFETY: `pad + size <= left`, the bytes of the current chunk from `cursor`, so
+        // `cursor + pad` is in the chunk.
+        let at = unsafe { self.cursor.add(pad) };
+        // SAFETY: As for `at`: `at + size` is at most one past the chunk's last byte.
+        self.cursor = unsafe { at.add(size) };
+        self.left -= pad + size;
+        // SAFETY: `at` is inside a chunk from `chunk`, an allocation `own` never returns null.
+        unsafe { NonNull::new_unchecked(at) }
     }
 }
 
@@ -446,7 +465,65 @@ fn own(layout: Layout) -> NonNull<u8> {
     NonNull::new(at).unwrap_or_else(|| alloc::handle_alloc_error(layout))
 }
 
-#[cfg(test)]
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p intern --release
+/// model_`): every interleaving of racing inserts across a table growth, and a lock-free reader
+/// during it, against the sequential model (each value interned once, at one address, found
+/// once published).
+#[cfg(all(test, blaze_check))]
+mod model {
+    use super::*;
+
+    /// One hash for every value: one shard, one home group and tag, so seven values fill the
+    /// first table to half and the racing inserts grow it.
+    const HASH: u64 = 7;
+
+    fn read(at: NonNull<u8>) -> u64 {
+        // SAFETY: Every value of the model's store is a `u64`.
+        unsafe { *at.cast::<u64>().as_ref() }
+    }
+
+    fn intern(store: &Store, value: u64) -> usize {
+        let at = match store.entry(HASH, |at| read(at) == value) {
+            Entry::Found(at) => at,
+            Entry::Vacant(vacant) => vacant
+                // SAFETY: `insert` hands `write` fresh memory of `Layout::new::<u64>()`, aligned
+                // and written by no one else.
+                .insert(Layout::new::<u64>(), |to| unsafe { to.cast::<u64>().write(value) }),
+        };
+        assert_eq!(read(at), value);
+        at.as_ptr().addr()
+    }
+
+    #[test]
+    fn model_racing_inserts_across_growth() {
+        blaze_check::model(|| {
+            let store: &'static Store = Box::leak(Box::new(Store::new()));
+            let before: Vec<usize> = (0..6).map(|value| intern(store, value)).collect();
+            let first = before[0];
+            let a = blaze_check::thread::spawn(move || [6, 7, 8].map(|value| intern(store, value)));
+            let b = blaze_check::thread::spawn(move || [8, 7, 9].map(|value| intern(store, value)));
+            let reader = blaze_check::thread::spawn(move || {
+                let found = store.find(HASH, |at| read(at) == 0).map(|at| at.as_ptr().addr());
+                assert_eq!(found, Some(first), "a published value is always found");
+            });
+            let a = a.join().unwrap();
+            let b = b.join().unwrap();
+            reader.join().unwrap();
+            assert_eq!(a[1], b[1], "7 interned once");
+            assert_eq!(a[2], b[0], "8 interned once");
+            let mut all: Vec<usize> = before.iter().chain(&a).chain(&b).copied().collect();
+            all.sort_unstable();
+            all.dedup();
+            assert_eq!(all.len(), 10, "ten values, ten addresses");
+            assert_eq!(store.len(), 10);
+            for (value, &at) in before.iter().enumerate() {
+                assert_eq!(intern(store, value as u64), at);
+            }
+        });
+    }
+}
+
+#[cfg(all(test, not(blaze_check)))]
 mod tests {
     use std::collections::HashMap;
 
@@ -461,6 +538,8 @@ mod tests {
         match store.entry(hash, |at| read(at) == value) {
             Entry::Found(at) => at,
             Entry::Vacant(vacant) => vacant
+                // SAFETY: `insert` hands `write` fresh memory of `Layout::new::<u64>()`, aligned
+                // and written by no one else.
                 .insert(Layout::new::<u64>(), |to| unsafe { to.cast::<u64>().write(value) }),
         }
     }

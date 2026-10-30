@@ -47,10 +47,10 @@ use blaze_cas::Key;
 use blaze_core::{Address, Tag};
 
 pub use crate::{
-    bundle::{BundleId, BundleSpec, Download, Locked, Manifest},
+    bundle::{BundleId, BundleSpec, Download, Downloaded, Locked, Manifest},
     client::{Client, Endpoint, GotBundle, Published},
     public::{FnSource, FunctionMade, Origin, Private, Public, QueryMade, Root, Rule, RunMade, RunPart, Secrets},
-    server::Server,
+    server::{Server, record_key},
     sign::{PINNED, Publisher, PublisherKey, Record, Signed, Trust},
     tls::{Channel, Channels, Tls, TlsClient, TlsServer},
 };

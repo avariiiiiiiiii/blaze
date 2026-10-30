@@ -12,6 +12,7 @@
 
 use std::borrow::Cow;
 
+use blaze_ids::radix;
 use rayon::prelude::*;
 
 use crate::LinkError;
@@ -61,10 +62,10 @@ impl<'s> Layout<'s> {
                 (len > 0).then_some((offset, len, &space.bytes))
             })
             .collect();
-        spaces.sort_unstable_by_key(|it| it.0);
+        radix::sort_by_key(&mut spaces, |it| it.0);
         let mut parts: Vec<(u64, &[u8])> =
             state.parts.iter().filter(|it| !it.1.is_empty()).map(|(at, bytes)| (*at, &bytes[..])).collect();
-        parts.sort_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut parts, |it| it.0);
         Layout { spaces, parts }
     }
 
@@ -103,7 +104,7 @@ impl<'s> Layout<'s> {
 /// Sorts ranges and merges those that overlap or are closer than `gap`.
 fn merge(mut ranges: Vec<(u64, u64)>, gap: u64) -> Vec<(u64, u64)> {
     ranges.retain(|it| it.1 > 0);
-    ranges.sort_unstable();
+    radix::sort_copy_by_key(&mut ranges, |&(at, len)| radix::pack_64(at, len));
     let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
     for (at, len) in ranges {
         match merged.last_mut() {
@@ -132,11 +133,6 @@ fn runs(ranges: &[(u64, u64)]) -> Vec<(u64, u64)> {
 /// The bytes of `ranges` of `layout`'s file, built in parallel.
 fn fill(layout: &Layout<'_>, ranges: &[(u64, u64)]) -> Vec<(u64, Vec<u8>)> {
     ranges.par_iter().with_min_len(4).map(|&(at, len)| (at, layout.bytes(at, len))).collect()
-}
-
-/// The bytes of `state`'s file in `at..at + len`: zero where nothing is.
-pub(crate) fn file_bytes(state: &State, at: u64, len: u64) -> Vec<u8> {
-    Layout::of(state).bytes(at, len)
 }
 
 /// Every byte of `state`'s file, as runs of at most [`RUN`] bytes. The gaps between regions
@@ -282,7 +278,7 @@ impl<'a> Stage<'a> {
             }
         }
         let mut old_parts: Vec<(u64, &[u8])> = self.old.parts.iter().map(|(at, bytes)| (*at, &bytes[..])).collect();
-        old_parts.sort_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut old_parts, |it| it.0);
         for (offset, bytes) in self.new.parts.iter() {
             let same = old_parts
                 .binary_search_by_key(offset, |it| it.0)

@@ -17,7 +17,7 @@ use syntax::{SyntaxNodePtr, TextRange};
 
 use super::{Checker, Frame};
 use crate::{
-    ids::{AllocId, SiteId, ThreadId},
+    ids::{AllocId, SiteId},
     memory::MemError,
     ub::{Found, Ub},
 };
@@ -27,7 +27,7 @@ pub(super) fn render<'db>(db: &'db dyn HirDatabase, checker: &Checker<'db>, foun
     let mut out = String::new();
     let _ = writeln!(out, "error: {}", found.ub);
     r.at(&mut out, found.at);
-    let _ = writeln!(out, "   = note: on thread `{}`", thread_name(found.thread));
+    let _ = writeln!(out, "   = note: on thread `{}`", checker.races.thread_display_name(found.thread));
     match &found.ub {
         Ub::Aliasing(e) => {
             for event in e.history() {
@@ -65,7 +65,7 @@ pub(super) fn render<'db>(db: &'db dyn HirDatabase, checker: &Checker<'db>, foun
         _ => {}
     }
     if !stack.is_empty() {
-        let _ = writeln!(out, "   = note: BACKTRACE on thread `{}`:", thread_name(found.thread));
+        let _ = writeln!(out, "   = note: BACKTRACE on thread `{}`:", checker.races.thread_display_name(found.thread));
         for &(func, span, owner) in stack {
             let name = match func {
                 Either::Left(func) => FunctionSignature::of(db, func).name.as_str().to_owned(),
@@ -84,9 +84,6 @@ pub(super) fn render<'db>(db: &'db dyn HirDatabase, checker: &Checker<'db>, foun
     out
 }
 
-/// Miri's thread names: `main`, and `unnamed-N` for a thread not given one.
-pub(super) fn thread_name(thread: ThreadId) -> String {
-    if thread == ThreadId::MAIN { "main".to_owned() } else { format!("unnamed-{}", thread.0) }
 }
 
 fn site_of(column: &[SiteId], alloc: AllocId) -> SiteId {

@@ -19,6 +19,8 @@
 //! and optimize it: helix and nushell build in about twice the time of cargo's release build,
 //! and would with nothing imported. Codegen units that share their imports are #176.
 
+#![forbid(unsafe_code)]
+
 use std::{
     collections::VecDeque,
     hash::BuildHasher,

@@ -19,7 +19,6 @@
 //! [#147]: https://github.com/indexable-inc/blaze/issues/147
 
 use std::{
-    collections::BTreeSet,
     ffi::OsString,
     hash::BuildHasher as _,
     io::Write as _,
@@ -385,11 +384,12 @@ pub struct Recorder {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     interposed: bool,
     /// The processes that ran a program and have not said the interposer loaded since, by
-    /// process id: the program and the scope it ran in.
+    /// process id: the program and the scope it ran in. Walked in process id order once, as
+    /// the run ends ([`Recorder::ended`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pending: std::collections::BTreeMap<u64, (String, String)>,
+    pending: FxHashMap<u64, (String, String)>,
     reads: bool,
-    not_inputs: BTreeSet<String>,
+    not_inputs: FxHashSet<String>,
     /// Where writes are the program's: the overlays, the writable directories and the
     /// sandbox's own.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -435,7 +435,7 @@ impl Recorder {
             threads: FxHashMap::default(),
             known: FxHashSet::default(),
             interposed: false,
-            pending: std::collections::BTreeMap::new(),
+            pending: FxHashMap::default(),
             reads: spec.record_reads,
             not_inputs: spec.not_inputs.iter().map(|it| tidy(it)).collect(),
             written,
@@ -538,7 +538,9 @@ impl Recorder {
     /// from one that did.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn ended(&mut self) {
-        for (program, scope) in std::mem::take(&mut self.pending).into_values() {
+        let mut pending: Vec<(u64, (String, String))> = std::mem::take(&mut self.pending).into_iter().collect();
+        blaze_ids::radix::sort_by_key(&mut pending, |it| it.0);
+        for (_, (program, scope)) in pending {
             let why = format!("{program} ran without the interposer, so what it read is not known");
             self.reached(Seen::Incomplete, &scope, &why);
         }
@@ -1186,6 +1188,28 @@ mod tests {
                 "/bin/static ran without the interposer, so what it read is not known",
             )]
         );
+    }
+
+    #[test]
+    fn programs_never_traced_are_told_in_process_id_order() {
+        let spec = Spec { record_reads: true, ..Spec::default() };
+        let mut recorder = Recorder::new(&spec, &[]);
+        recorder.interposed();
+        let processes = [900u64, 3, 70, 1 << 40, 12, 5000];
+        for process in processes {
+            recorder.runs(process, &format!("/bin/p{process}"), String::new());
+        }
+        recorder.ended();
+        let mut sorted = processes;
+        sorted.sort();
+        let want: Vec<_> = sorted
+            .iter()
+            .map(|it| {
+                let why = format!("/bin/p{it} ran without the interposer, so what it read is not known");
+                trace::Line::new(Seen::Incomplete, "", &why)
+            })
+            .collect();
+        assert_eq!(recorder.lines().collect::<Vec<_>>(), want);
     }
 
     #[test]

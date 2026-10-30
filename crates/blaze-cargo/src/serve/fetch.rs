@@ -102,7 +102,7 @@ impl Fetcher {
             bytes: br#"{"v":1}"#.to_vec(),
             mode: Mode::Regular,
         });
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
         Ok(Source { files, under: String::new() })
     }
 

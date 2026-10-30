@@ -189,10 +189,10 @@ pub(crate) fn ub_tests(job: &Job, selection: Selection<'_>) -> Result<Vec<String
                 ignored,
             });
         }
-        tests[first..].sort_unstable_by(|a, b| a.name.cmp(&b.name));
+        blaze_ids::names::sort_by_name(&mut tests[first..], |it| it.name.as_bytes());
     }
     let mut by_key: Vec<u32> = (0..u32::try_from(tests.len()).expect("under 2^32 tests")).collect();
-    by_key.sort_unstable_by(|a, b| tests[*a as usize].key.cmp(&tests[*b as usize].key));
+    blaze_ids::names::sort_by_name_in(&mut by_key, |&it| tests[it as usize].key.as_bytes());
     if let Some(twice) = by_key.windows(2).find(|it| tests[it[0] as usize].key == tests[it[1] as usize].key) {
         let test = &tests[twice[0] as usize];
         let binary = &binaries[test.binary as usize];
@@ -400,7 +400,7 @@ pub(crate) fn start(
             jobs: Vec::new(),
         };
         let mut by_name: Vec<u32> = (0..tests.len() as u32).collect();
-        by_name.sort_unstable_by(|a, b| tests[*a as usize].name.cmp(&tests[*b as usize].name));
+        blaze_ids::names::sort_by_name_in(&mut by_name, |&it| tests[it as usize].name.as_bytes());
         let disk = blaze_usercode::inputs::Disk::new(binary.env.clone());
         suites.push(Suited { name: program.clone(), given: suite.given(), tests, by_name, binary: Some(binary), disk });
     }

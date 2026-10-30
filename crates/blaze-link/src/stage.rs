@@ -11,17 +11,19 @@
 //! symbol ids, the bytes of what it makes are borrowed from the change or allocated in its
 //! arena (freed when the stage ends), and nothing walks every piece except a full link.
 
+#![forbid(unsafe_code)]
+
 use std::sync::Arc;
 
 use blaze_codegen::{Arch, CompiledFunction, Data, Init, InstanceKey, Reloc, Static, Target, Unwind};
-use blaze_ids::Hasher;
+use blaze_ids::{Hasher, radix};
 use bumpalo::Bump;
 use bumpalo::collections::Vec as BumpVec;
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::cow::{IdSet, SymSet};
-use crate::model::{Apply, Class, Fixup, Object, Plan, Special, Sym, Writer};
+use crate::model::{Apply, Class, Fixup, Plan, Special, Sym, Writer};
 use crate::position::{self, Spans};
 use crate::reloc::{self, GotKind};
 use crate::state::{ClassId, Def, NewPiece, PieceId, PieceRef, State, What};
@@ -120,7 +122,9 @@ pub(crate) struct Stage<'a> {
     pub writer: &'a dyn Writer,
     pub plan: &'a Plan,
     pub symbols: &'a mut Symbols,
-    pub objects: &'a mut FxHashMap<Obj, Arc<Object>>,
+    pub objects: &'a mut FxHashMap<Obj, crate::native::Read>,
+    /// Each native input's bytes, borrowed for the stage ([`crate::native`]).
+    pub native: crate::native::Pass<'a>,
     pub old: &'a State,
     pub new: State,
     /// The image's file name.
@@ -352,8 +356,11 @@ impl<'a> Stage<'a> {
             let sym = self.target_sym(target);
             named.push((name, sym));
         }
-        if !change.unnamed.is_empty() || !named.is_empty() {
-            let symbols = &*self.symbols;
+        let symbols = &*self.symbols;
+        let names = &self.new.names;
+        let differs = named.iter().any(|(name, sym)| names.get(name) != Some(sym))
+            || change.unnamed.iter().any(|it| symbols.find_name(it).is_some_and(|it| names.contains_key(&it)));
+        if differs {
             let names = Arc::make_mut(&mut self.new.names);
             for name in &change.unnamed {
                 if let Some(name) = symbols.find_name(name) {
@@ -569,7 +576,7 @@ impl<'a> Stage<'a> {
             }
             fixups.push(Fixup { at: u64::from(reloc.at), apply, target: *sym, addend: reloc.addend, minus: None });
         }
-        weak.sort_unstable();
+        radix::sort_copy_by_key(&mut weak, |it: &Sym| it.0);
         weak.dedup();
         Ok((fixups.into_bump_slice(), weak.into_bump_slice()))
     }
@@ -907,7 +914,7 @@ impl<'a> Stage<'a> {
                 }
             }
         }
-        wanted.sort_unstable_by_key(|it| it.0);
+        radix::sort_copy_by_key(&mut wanted, |it| it.0.0);
         wanted.dedup_by_key(|it| it.0);
         let class = self.new.class_id(&Class::RelRo);
         for (sym, anchor, index) in wanted {
@@ -966,7 +973,7 @@ impl<'a> Stage<'a> {
                     }
                 }
             }
-            touched.sort_unstable();
+            radix::sort(&mut touched);
             touched.dedup();
             for id in std::mem::take(&mut touched) {
                 let live = self.new.piece(id).is_some_and(|it| matches!(it.what(), What::Shared));
@@ -1024,10 +1031,10 @@ impl<'a> Stage<'a> {
             let target = self.sym_name(&name);
             cells.push((GotKind::Address, target));
         }
-        plt.sort_unstable();
+        radix::sort_copy_by_key(&mut plt, |it| it.0);
         plt.dedup();
         cells.extend(plt.iter().map(|it| (GotKind::Address, *it)));
-        cells.sort_unstable();
+        radix::sort_copy_by_key(&mut cells, |&(kind, sym)| radix::pack_32(kind as u32, sym.0));
         cells.dedup();
         let got = self.new.class_id(&Class::Got);
         for (kind, target) in cells {
@@ -1076,7 +1083,7 @@ impl<'a> Stage<'a> {
     fn iat_ends(&mut self) {
         let mut names: Vec<crate::symbols::NameId> =
             self.new.resolved.libraries.iter().map(|it| self.symbols.name(&it.name)).collect();
-        for library in &self.old.resolved.libraries {
+        for library in self.old.resolved.libraries.iter() {
             let Some(name) = self.symbols.find_name(&library.name) else { continue };
             if names.contains(&name) {
                 continue;

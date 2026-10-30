@@ -15,7 +15,7 @@ use super::{CELL, ENTRY, RESOLVER};
 
 /// `bti c; movz w16, #0; movk w16, #0, lsl #16; b resolver`: `bti c` takes the `br x16` of
 /// blaze-link's slot stub on pages with BTI, and is a hint elsewhere.
-pub(super) const ENTRY_TEMPLATE: [u8; ENTRY as usize] = {
+pub(crate) const ENTRY_TEMPLATE: [u8; ENTRY as usize] = {
     let words = [BTI_C, movz_w(16, 0), movk_w16(16, 0), 0x1400_0000];
     let mut out = [0; ENTRY as usize];
     let mut i = 0;
@@ -30,7 +30,7 @@ pub(super) const ENTRY_TEMPLATE: [u8; ENTRY as usize] = {
     out
 };
 
-pub(super) fn fill_entry(entry: &mut [u8], at: u32, id: u32) {
+pub(crate) fn fill_entry(entry: &mut [u8], at: u32, id: u32) {
     put(entry, 4, movz_w(16, id & 0xffff));
     put(entry, 8, movk_w16(16, id >> 16));
     put(entry, 12, b(i64::from(RESOLVER) - i64::from(at + 12)));
@@ -40,55 +40,55 @@ fn put(bytes: &mut [u8], at: usize, word: u32) {
     bytes[at..at + 4].copy_from_slice(&word.to_le_bytes());
 }
 
-pub(super) const BTI_C: u32 = 0xd503_245f;
+pub(crate) const BTI_C: u32 = 0xd503_245f;
 const SP: u32 = 31;
 
-pub(super) const fn movz_w(rd: u32, imm16: u32) -> u32 {
+pub(crate) const fn movz_w(rd: u32, imm16: u32) -> u32 {
     0x5280_0000 | (imm16 & 0xffff) << 5 | rd
 }
 
 /// `movk wd, #imm16, lsl #16`.
-pub(super) const fn movk_w16(rd: u32, imm16: u32) -> u32 {
+pub(crate) const fn movk_w16(rd: u32, imm16: u32) -> u32 {
     0x72a0_0000 | (imm16 & 0xffff) << 5 | rd
 }
 
 /// `b` by `offset` bytes from the instruction.
-pub(super) const fn b(offset: i64) -> u32 {
+pub(crate) const fn b(offset: i64) -> u32 {
     0x1400_0000 | ((offset >> 2) as u32 & 0x03ff_ffff)
 }
 
 /// `stp xt, xt2, [xn, #offset]` and `ldp`, 64-bit, signed offset.
-pub(super) const fn stp_x(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
+pub(crate) const fn stp_x(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
     0xa900_0000 | ((offset / 8) as u32 & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt
 }
 
-pub(super) const fn ldp_x(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
+pub(crate) const fn ldp_x(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
     0xa940_0000 | ((offset / 8) as u32 & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt
 }
 
 /// `stp qt, qt2, [xn, #offset]` and `ldp`, 128-bit, signed offset.
-pub(super) const fn stp_q(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
+pub(crate) const fn stp_q(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
     0xad00_0000 | ((offset / 16) as u32 & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt
 }
 
-pub(super) const fn ldp_q(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
+pub(crate) const fn ldp_q(rt: u32, rt2: u32, rn: u32, offset: i32) -> u32 {
     0xad40_0000 | ((offset / 16) as u32 & 0x7f) << 15 | rt2 << 10 | rn << 5 | rt
 }
 
 /// `sub xd, xn, #imm12` and `add`, 64-bit, unshifted.
-pub(super) const fn sub_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+pub(crate) const fn sub_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
     0xd100_0000 | (imm12 & 0xfff) << 10 | rn << 5 | rd
 }
 
-pub(super) const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
+pub(crate) const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
     0x9100_0000 | (imm12 & 0xfff) << 10 | rn << 5 | rd
 }
 
 /// `str xzr, [sp]`: touches the page the stack grew into.
-pub(super) const PROBE_SP: u32 = 0xf900_03ff;
+pub(crate) const PROBE_SP: u32 = 0xf900_03ff;
 
 /// `addvl xd, xn, #imm`: adds `imm` vector lengths.
-pub(super) const fn addvl(rd: u32, rn: u32, imm: i32) -> u32 {
+pub(crate) const fn addvl(rd: u32, rn: u32, imm: i32) -> u32 {
     0x0420_5000 | rn << 16 | (imm as u32 & 0x3f) << 5 | rd
 }
 
@@ -100,51 +100,51 @@ const fn imm9(imm: i32) -> u32 {
 }
 
 /// `str zt, [xn, #imm, mul vl]` and `ldr`.
-pub(super) const fn str_z(zt: u32, rn: u32, imm: i32) -> u32 {
+pub(crate) const fn str_z(zt: u32, rn: u32, imm: i32) -> u32 {
     0xe580_4000 | imm9(imm) | rn << 5 | zt
 }
 
-pub(super) const fn ldr_z(zt: u32, rn: u32, imm: i32) -> u32 {
+pub(crate) const fn ldr_z(zt: u32, rn: u32, imm: i32) -> u32 {
     0x8580_4000 | imm9(imm) | rn << 5 | zt
 }
 
 /// `str pt, [xn, #imm, mul vl]` and `ldr`.
-pub(super) const fn str_p(pt: u32, rn: u32, imm: i32) -> u32 {
+pub(crate) const fn str_p(pt: u32, rn: u32, imm: i32) -> u32 {
     0xe580_0000 | imm9(imm) | rn << 5 | pt
 }
 
-pub(super) const fn ldr_p(pt: u32, rn: u32, imm: i32) -> u32 {
+pub(crate) const fn ldr_p(pt: u32, rn: u32, imm: i32) -> u32 {
     0x8580_0000 | imm9(imm) | rn << 5 | pt
 }
 
 /// `rdffr pd.b` and `wrffr pn.b`.
-pub(super) const fn rdffr(pd: u32) -> u32 {
+pub(crate) const fn rdffr(pd: u32) -> u32 {
     0x2519_f000 | pd
 }
 
-pub(super) const fn wrffr(pn: u32) -> u32 {
+pub(crate) const fn wrffr(pn: u32) -> u32 {
     0x2528_9000 | pn << 5
 }
 
 /// `ldr xt, label`, `offset` bytes from the instruction.
-pub(super) const fn ldr_literal(rt: u32, offset: i64) -> u32 {
+pub(crate) const fn ldr_literal(rt: u32, offset: i64) -> u32 {
     0x5800_0000 | ((offset >> 2) as u32 & 0x7ffff) << 5 | rt
 }
 
 /// `cbz xt, label`.
-pub(super) const fn cbz_x(rt: u32, offset: i64) -> u32 {
+pub(crate) const fn cbz_x(rt: u32, offset: i64) -> u32 {
     0xb400_0000 | ((offset >> 2) as u32 & 0x7ffff) << 5 | rt
 }
 
-pub(super) const STP_FP_LR_PRE: u32 = 0xa9bf_7bfd; // stp x29, x30, [sp, #-16]!
-pub(super) const MOV_FP_SP: u32 = 0x9100_03fd; // mov x29, sp
-pub(super) const MOV_SP_FP: u32 = 0x9100_03bf; // mov sp, x29
-pub(super) const LDP_FP_LR_POST: u32 = 0xa8c1_7bfd; // ldp x29, x30, [sp], #16
-pub(super) const MOV_W0_W16: u32 = 0x2a10_03e0; // mov w0, w16
-pub(super) const MOV_X17_X0: u32 = 0xaa00_03f1; // mov x17, x0
-pub(super) const BLR_X16: u32 = 0xd63f_0200;
-pub(super) const BR_X17: u32 = 0xd61f_0220;
-pub(super) const BRK_1: u32 = 0xd420_0020;
+pub(crate) const STP_FP_LR_PRE: u32 = 0xa9bf_7bfd; // stp x29, x30, [sp, #-16]!
+pub(crate) const MOV_FP_SP: u32 = 0x9100_03fd; // mov x29, sp
+pub(crate) const MOV_SP_FP: u32 = 0x9100_03bf; // mov sp, x29
+pub(crate) const LDP_FP_LR_POST: u32 = 0xa8c1_7bfd; // ldp x29, x30, [sp], #16
+pub(crate) const MOV_W0_W16: u32 = 0x2a10_03e0; // mov w0, w16
+pub(crate) const MOV_X17_X0: u32 = 0xaa00_03f1; // mov x17, x0
+pub(crate) const BLR_X16: u32 = 0xd63f_0200;
+pub(crate) const BR_X17: u32 = 0xd61f_0220;
+pub(crate) const BRK_1: u32 = 0xd420_0020;
 
 /// The bytes the general registers take.
 const GENERAL: u32 = 128;
@@ -159,7 +159,7 @@ const Z_STEP: i32 = 4;
 const P_LENGTHS: i32 = 3;
 
 /// Appends the resolver at `out.len()`, which is [`RESOLVER`].
-pub(super) fn resolver(out: &mut Vec<u8>, sve: bool) {
+pub(crate) fn resolver(out: &mut Vec<u8>, sve: bool) {
     debug_assert_eq!(out.len(), RESOLVER as usize);
     let mut words: Vec<u32> = Vec::with_capacity(160);
     words.extend([STP_FP_LR_PRE, MOV_FP_SP, sub_imm(SP, SP, GENERAL)]);

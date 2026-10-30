@@ -12,15 +12,19 @@
 
 use hir::{HirFileId, InFile, ModuleDef, PathResolution};
 use hir_def::ModuleId;
-use hir_expand::{mod_path::PathKind, name::AsName};
+use hir_expand::{
+    mod_path::PathKind,
+    name::{AsName, Name},
+};
+use rustc_hash::FxHashMap;
 use syntax::{
-    AstNode, SyntaxNode, SyntaxNodePtr, TextRange,
+    AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr, TextRange,
     ast::{self, HasGenericArgs, make},
 };
 
 use super::{
     unused::Unused,
-    used::{Ns, entry, lookup},
+    used::{Ns, Uses, entry},
 };
 use crate::{
     cx::Cx,
@@ -31,19 +35,40 @@ use crate::{
 
 /// rustc's `potentially_unnecessary_qualifications`, less those whose name alone is found
 /// through an import found unused or redundant, in the order late resolution comes to them.
-pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, unused: &Unused) -> Vec<Found> {
+pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses, unused: &Unused) -> Vec<Found> {
     let mut found = Vec::new();
+    let mut scratch = Scratch::default();
     for tree in &walk.trees {
         for node in &tree.nodes {
+            if node.kind() != SyntaxKind::PATH {
+                continue;
+            }
             let Some(path) = ast::Path::cast(node.clone()) else { continue };
-            found.extend(qualification(cx, tree.file, &path, unused));
+            found.extend(qualification(cx, tree.file, &path, uses, unused, &mut scratch));
         }
     }
     found
 }
 
-fn qualification(cx: &Cx<'_, '_>, file: HirFileId, path: &ast::Path, unused: &Unused) -> Option<Found> {
-    if path.parent_path().is_some() {
+/// What one path's check needs, kept from path to path: the segments, what each resolves to,
+/// and the one-segment path of each name, parsed once.
+#[derive(Default)]
+struct Scratch<'db> {
+    chain: Vec<ast::Path>,
+    segments: Vec<(ast::Path, ast::PathSegment)>,
+    resolved: Vec<Option<PathResolution<'db>>>,
+    alone: FxHashMap<Name, ast::Path>,
+}
+
+fn qualification<'db>(
+    cx: &Cx<'_, 'db>,
+    file: HirFileId,
+    path: &ast::Path,
+    uses: &Uses,
+    unused: &Unused,
+    scratch: &mut Scratch<'db>,
+) -> Option<Found> {
+    if path.qualifier().is_none() || path.parent_path().is_some() {
         return None;
     }
     let parent = path.syntax().parent()?;
@@ -58,7 +83,8 @@ fn qualification(cx: &Cx<'_, '_>, file: HirFileId, path: &ast::Path, unused: &Un
     } else {
         return None;
     };
-    let segments = segments(path)?;
+    let Scratch { chain, segments, resolved, alone } = scratch;
+    segments_into(path, chain, segments)?;
     if segments.len() < 2 || segments[0].1.coloncolon_token().is_some() {
         return None;
     }
@@ -68,17 +94,20 @@ fn qualification(cx: &Cx<'_, '_>, file: HirFileId, path: &ast::Path, unused: &Un
         return None;
     }
     let end = segments.iter().position(|(_, segment)| has_generic_args(segment)).map_or(segments.len(), |it| it + 1);
-    let resolved = resolved(cx, &segments);
+    resolve_into(cx, &segments[..end], resolved);
     let scope = cx.sema.scope(path.syntax())?;
     let module = ModuleId::from(scope.module());
-    let (seg, name) = (1..end).rev().find_map(|i| {
+    let (seg, name_ref, name) = (1..end).rev().find_map(|i| {
         let res = resolved[i]?;
-        let name = segments[i].1.name_ref()?;
-        let lexical = scope.speculative_resolve(&make::ext::ident_path(name.text()))?;
-        (lexical == res).then(|| (i, name))
+        let name_ref = segments[i].1.name_ref()?;
+        let name = name_ref.as_name();
+        let probe = alone.entry(name.clone()).or_insert_with(|| make::ext::ident_path(name_ref.text()));
+        let lexical = scope.speculative_resolve(probe)?;
+        (lexical == res).then_some((i, name_ref, name))
     })?;
     let ns = if seg + 1 == segments.len() { ns } else { Ns::Types };
-    let found_through = entry(&lookup(cx, module, PathKind::Plain, &[name.as_name()]), ns).and_then(|it| it.import);
+    let found_through =
+        entry(&uses.lookup(cx, module, PathKind::Plain, std::slice::from_ref(&name)), ns).and_then(|it| it.import);
     if found_through.is_some_and(|it| unused.unused.contains(&it) || unused.redundant.contains(&it)) {
         return None;
     }
@@ -91,51 +120,63 @@ fn qualification(cx: &Cx<'_, '_>, file: HirFileId, path: &ast::Path, unused: &Un
         "",
         Applicability::MachineApplicable,
     );
-    let text = name.text();
+    let text = name_ref.text();
     diag.fact(cx.resolves_fact(module.into(), text), format!("what `{text}` alone finds"));
     Some(Found::lint(diag, Phase::Resolve, InFile::new(file, SyntaxNodePtr::new(&parent))))
 }
 
-/// rustc's segments of `path`, each with the path it ends: those of the trait of `<T as
-/// Trait>::a` then the rest; of `<T>::a`, the rest.
-fn segments(path: &ast::Path) -> Option<Vec<(ast::Path, ast::PathSegment)>> {
-    let mut chain = vec![path.clone()];
-    while let Some(qualifier) = chain.last().and_then(|it| it.qualifier()) {
-        chain.push(qualifier);
-    }
-    chain.reverse();
+/// rustc's segments of `path` into `segments`, each with the path it ends: those of the trait
+/// of `<T as Trait>::a` then the rest; of `<T>::a`, the rest.
+fn segments_into(
+    path: &ast::Path,
+    chain: &mut Vec<ast::Path>,
+    segments: &mut Vec<(ast::Path, ast::PathSegment)>,
+) -> Option<()> {
+    segments.clear();
+    chain_into(path, chain);
     let first = chain[0].segment()?;
-    let mut segments = Vec::new();
     let rest = match first.type_anchor() {
         Some(anchor) => {
             if anchor.as_token().is_some() {
-                segments = segments_of(&first.qualifying_trait()?.path()?)?;
+                let mut inner = Vec::new();
+                chain_into(&first.qualifying_trait()?.path()?, &mut inner);
+                if inner[0].segment()?.type_anchor().is_some() {
+                    return None;
+                }
+                for path in inner {
+                    let segment = path.segment()?;
+                    segments.push((path, segment));
+                }
             }
-            &chain[1..]
+            1
         }
-        None => &chain[..],
+        None => 0,
     };
-    for path in rest {
-        segments.push((path.clone(), path.segment()?));
+    for path in chain.drain(rest..) {
+        let segment = path.segment()?;
+        segments.push((path, segment));
     }
-    Some(segments)
+    Some(())
 }
 
-fn segments_of(path: &ast::Path) -> Option<Vec<(ast::Path, ast::PathSegment)>> {
-    let mut chain = vec![path.clone()];
+/// `path` and its qualifiers into `chain`, outermost qualifier first.
+fn chain_into(path: &ast::Path, chain: &mut Vec<ast::Path>) {
+    chain.clear();
+    chain.push(path.clone());
     while let Some(qualifier) = chain.last().and_then(|it| it.qualifier()) {
         chain.push(qualifier);
     }
     chain.reverse();
-    if chain[0].segment()?.type_anchor().is_some() {
-        return None;
-    }
-    chain.into_iter().map(|path| Some((path.clone(), path.segment()?))).collect()
 }
 
-/// What each segment resolves to, up to the first that is not a module, enum or trait.
-fn resolved<'db>(cx: &Cx<'_, 'db>, segments: &[(ast::Path, ast::PathSegment)]) -> Vec<Option<PathResolution<'db>>> {
-    let mut resolved = Vec::with_capacity(segments.len());
+/// What each segment resolves to into `resolved`, up to the first that is not a module, enum
+/// or trait.
+fn resolve_into<'db>(
+    cx: &Cx<'_, 'db>,
+    segments: &[(ast::Path, ast::PathSegment)],
+    resolved: &mut Vec<Option<PathResolution<'db>>>,
+) {
+    resolved.clear();
     let mut open = true;
     for (path, _) in segments {
         if !open {
@@ -151,7 +192,6 @@ fn resolved<'db>(cx: &Cx<'_, 'db>, segments: &[(ast::Path, ast::PathSegment)]) -
         );
         resolved.push(res);
     }
-    resolved
 }
 
 /// rustc's `Segment::has_generic_args`: `::<..>`, `(..)` or `(..)` sugar's return type.

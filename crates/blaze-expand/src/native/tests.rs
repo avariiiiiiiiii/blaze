@@ -1,14 +1,8 @@
-use std::path::Path;
-
-use paths::AbsPathBuf;
+use native_proc_macro::{Ident, Span as MacroSpan, TokenTree as MacroTree};
 use span::{EditionedFileId, ErasedFileAstId, SpanAnchor, SyntaxContext, TextRange};
 use tt::{IdentIsRaw, LitKind, Spacing};
 
-use super::{
-    verified::{QUOTE, SERDE_DERIVE, SYN_2, SYN_3, THISERROR_IMPL_1, THISERROR_IMPL_2, TOKIO_MACROS},
-    wire::Tree,
-    *,
-};
+use super::{wire::Tree, *};
 
 const GUEST: &str = include_str!("../../../blaze-macro-wasm/guest/proc_macro.rs");
 const WASM_WIRE: &str = include_str!("../../../blaze-macro-wasm/src/wire.rs");
@@ -233,10 +227,6 @@ fn between<'a>(text: &'a str, from: &str, to: &str) -> &'a str {
     &text[start..end]
 }
 
-fn vendor(dir: &str) -> std::path::PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../vendor/native-macros").join(dir)
-}
-
 #[test]
 fn the_proc_macro_is_the_guests_but_for_its_imports_and_exports() {
     let shim = include_str!("proc_macro/lib.rs");
@@ -257,316 +247,6 @@ fn the_wire_and_the_lexer_are_the_wasm_hosts() {
     let wasm_lex = from(WASM_LEX, "\nuse intern::Symbol;")
         .replacen("use crate::wire::Tree;", "use super::wire::Tree;", 1);
     assert_eq!(lex, wasm_lex);
-}
-
-/// The verified copy whose crate is `root` of [`PACKAGES`], as a description of it would say.
-fn verified_closure(root: usize) -> Closure {
-    let all = closure_of(root);
-    let packages = all
-        .iter()
-        .map(|&at| {
-            let package = &PACKAGES[at];
-            let actual = &actual()[at];
-            Package {
-                name: package.name.to_owned(),
-                version: package.version.to_owned(),
-                files: actual.files.iter().map(|(path, hash)| ((*path).to_owned(), *hash)).collect(),
-                cfg: actual.cfg.clone().expect("blaze's proc-macro2 is known"),
-                deps: package
-                    .deps
-                    .iter()
-                    .map(|(name, dep)| {
-                        ((*name).to_owned(), all.iter().position(|it| it == dep).unwrap())
-                    })
-                    .collect(),
-            }
-        })
-        .collect();
-    Closure::new(packages)
-}
-
-fn package_of(closure: &mut Closure, name: &str, version: &str) -> &mut Package {
-    closure.packages.iter_mut().find(|it| it.name == name && it.version == version).unwrap()
-}
-
-#[test]
-fn the_verified_copy_matches_itself() {
-    for root in &ROOTS {
-        let closure = verified_closure(root.package);
-        assert_eq!(shaped(&closure), Ok(()));
-        assert_eq!(matches(&closure, root.package), Ok(()), "{}", PACKAGES[root.package].name);
-    }
-}
-
-#[test]
-fn one_changed_byte_is_another_package() {
-    let mut closure = verified_closure(SERDE_DERIVE);
-    let (path, bytes) =
-        PACKAGES[SYN_3].files.iter().find(|it| it.0 == "src/lib.rs").copied().unwrap();
-    let mut changed = bytes.to_vec();
-    changed[0] ^= 1;
-    let syn = package_of(&mut closure, "syn", "3.0.9");
-    let file = syn.files.iter_mut().find(|it| it.0 == path).unwrap();
-    file.1 = *blake3::hash(&changed).as_bytes();
-    let why = matches(&closure, SERDE_DERIVE).unwrap_err();
-    assert_eq!(why, "syn 3.0.9: its `src/lib.rs` is not the verified copy's");
-}
-
-#[test]
-fn a_file_more_or_less_is_another_package() {
-    let mut closure = verified_closure(TOKIO_MACROS);
-    let quote = package_of(&mut closure, "quote", "1.0.47");
-    quote.files.push(("zzz.rs".to_owned(), [0; 32]));
-    let why = matches(&closure, TOKIO_MACROS).unwrap_err();
-    assert_eq!(why, "quote 1.0.47: it has `zzz.rs`, which the verified copy has not");
-
-    let mut closure = verified_closure(TOKIO_MACROS);
-    package_of(&mut closure, "quote", "1.0.47").files.retain(|it| it.0 != "build.rs");
-    let why = matches(&closure, TOKIO_MACROS).unwrap_err();
-    assert_eq!(why, "quote 1.0.47: it has no `build.rs`");
-}
-
-#[test]
-fn one_more_feature_is_another_package() {
-    let mut closure = verified_closure(SERDE_DERIVE);
-    let syn = package_of(&mut closure, "syn", "3.0.9");
-    syn.cfg.push("feature=\"extra-traits\"".to_owned());
-    syn.cfg.sort();
-    let why = matches(&closure, SERDE_DERIVE).unwrap_err();
-    assert_eq!(why, "syn 3.0.9: it is built with `feature=\"extra-traits\"`, which the verified copy is not");
-
-    let mut closure = verified_closure(SERDE_DERIVE);
-    package_of(&mut closure, "syn", "3.0.9").cfg.retain(|it| it != "feature=\"full\"");
-    let why = matches(&closure, SERDE_DERIVE).unwrap_err();
-    assert_eq!(why, "syn 3.0.9: it is built without `feature=\"full\"`, which the verified copy is");
-
-    let mut closure = verified_closure(SERDE_DERIVE);
-    package_of(&mut closure, "proc-macro2", "1.0.107").cfg.retain(|it| it != "proc_macro_span");
-    let why = matches(&closure, SERDE_DERIVE).unwrap_err();
-    assert!(why.contains("without `proc_macro_span`"), "{why}");
-}
-
-#[test]
-fn another_syn_is_another_closure() {
-    let mut closure = verified_closure(THISERROR_IMPL_2);
-    let syn_2 = verified_closure(SYN_2).packages.remove(0);
-    *package_of(&mut closure, "syn", "3.0.9") = syn_2;
-    let why = matches(&closure, THISERROR_IMPL_2).unwrap_err();
-    assert_eq!(why, "syn 2.0.119 is where the verified copy has syn 3.0.9");
-
-    let mut closure = verified_closure(SERDE_DERIVE);
-    package_of(&mut closure, "serde_derive", "1.0.229").deps.retain(|it| it.0 != "quote");
-    let why = matches(&closure, SERDE_DERIVE).unwrap_err();
-    assert_eq!(
-        why,
-        "serde_derive 1.0.229 depends on [proc_macro2, syn] where the verified copy depends on \
-         [proc_macro2, quote, syn]"
-    );
-}
-
-#[test]
-fn what_no_source_names_is_not_compared() {
-    for root in &ROOTS {
-        assert!(!mentioned(root.package, "debug_assertions"), "{}", PACKAGES[root.package].name);
-    }
-    let mut closure = verified_closure(SERDE_DERIVE);
-    for package in &mut closure.packages {
-        package.cfg.retain(|it| it != "debug_assertions");
-    }
-    let syn = package_of(&mut closure, "syn", "3.0.9");
-    syn.cfg.push("debug_assertions".to_owned());
-    syn.cfg.sort();
-    assert_eq!(matches(&closure, SERDE_DERIVE), Ok(()));
-    let syn = package_of(&mut closure, "syn", "3.0.9");
-    syn.cfg.push("test".to_owned());
-    syn.cfg.sort();
-    assert!(matches(&closure, SERDE_DERIVE).is_err(), "syn's sources name `test`");
-    assert!(mentioned(SYN_3, "not-an-identifier"), "a name of other characters is compared");
-}
-
-#[test]
-fn the_build_of_proc_macro2_is_what_its_code_shows() {
-    assert_eq!(
-        proc_macro2_cfg(),
-        Ok(&[
-            "proc_macro_span",
-            "proc_macro_span_file",
-            "proc_macro_span_location",
-            "wrap_proc_macro"
-        ][..])
-    );
-}
-
-fn dylib(name: &str) -> AbsPathBuf {
-    AbsPathBuf::assert_utf8(std::env::temp_dir().join(format!("{name}.wasm")))
-}
-
-#[test]
-fn find_gives_an_expander_only_of_the_verified_copy() {
-    let serde = dylib("blaze-native-serde");
-    let closure = verified_closure(SERDE_DERIVE);
-    let found = find_in(&closure, &serde, "Serialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
-    let again = find_in(&closure, &serde, "Serialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
-    assert_eq!(found.identity(), again.identity());
-    let other = find_in(&closure, &serde, "Deserialize", ProcMacroKind::CustomDerive).unwrap().unwrap();
-    assert_ne!(found.identity(), other.identity());
-    assert!(find_in(&closure, &serde, "Serialize", ProcMacroKind::Attr).is_err());
-
-    let mut changed = verified_closure(SERDE_DERIVE);
-    let quote = package_of(&mut changed, "quote", "1.0.47");
-    quote.cfg.push("feature=\"nightly\"".to_owned());
-    quote.cfg.sort();
-    assert!(find_in(&changed, &serde, "Serialize", ProcMacroKind::CustomDerive).unwrap().is_none());
-    assert!(report().unwrap().contains("built with `feature=\"nightly\"`"));
-
-    let mut unsorted = verified_closure(SERDE_DERIVE);
-    package_of(&mut unsorted, "quote", "1.0.47").cfg.reverse();
-    let why = find_in(&unsorted, &serde, "Serialize", ProcMacroKind::CustomDerive).unwrap_err();
-    assert!(why.contains("the cfg of quote 1.0.47 is not sorted"), "{why}");
-}
-
-/// A crate of a description, as `load-cargo/src/described.rs` writes one.
-fn crate_of(dir: &Path, name: &str, version: &str, cfg: &[String], deps: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({
-        "display_name": name.replace('-', "_"),
-        "root_module": dir.join("src/lib.rs").to_str().unwrap(),
-        "edition": "2021",
-        "deps": deps,
-        "cfg": cfg,
-        "env": {
-            "CARGO_MANIFEST_DIR": dir.to_str().unwrap(),
-            "CARGO_PKG_NAME": name,
-            "CARGO_PKG_VERSION": version,
-        },
-        "is_workspace_member": false,
-        "is_proc_macro": false,
-    })
-}
-
-fn scratch_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("blaze-native-{name}-{}", std::process::id()));
-    _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
-#[test]
-fn a_description_is_read_as_a_closure() {
-    let root = scratch_dir("described");
-    let dir = root.join("serde_derive");
-    std::fs::create_dir_all(dir.join("src")).unwrap();
-    std::fs::write(dir.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
-    std::fs::write(dir.join("Cargo.toml"), "[package]\n").unwrap();
-    std::fs::write(dir.join(".cargo-ok"), "{\"v\":1}").unwrap();
-    let cfg = ["feature=\"default\"".to_owned(), "debug_assertions".to_owned()];
-    let description = |name: &str, version: &str| {
-        let it = serde_json::json!({ "crates": [crate_of(&dir, name, version, &cfg, serde_json::json!([]))] });
-        let file = root.join(format!("{name}.json"));
-        std::fs::write(&file, it.to_string()).unwrap();
-        file
-    };
-    let mut path = description("serde_derive", "1.0.229");
-    let closure = closure::closure_at(&mut path).unwrap().unwrap();
-    let package = &closure.packages[0];
-    assert_eq!((package.name.as_str(), package.version.as_str()), ("serde_derive", "1.0.229"));
-    assert_eq!(package.cfg, ["debug_assertions", "feature=\"default\""]);
-    let files: Vec<&str> = package.files.iter().map(|it| it.0.as_str()).collect();
-    assert_eq!(files, ["Cargo.toml", "src/lib.rs"]);
-    assert_eq!(package.files[1].1, *blake3::hash(b"pub fn f() {}\n").as_bytes());
-    assert!(matches!(closure.verdict(), Verdict::Other));
-
-    let mut path = description("my_macros", "0.1.0");
-    assert!(closure::closure_at(&mut path).unwrap().is_none());
-    let mut path = root.join("empty.json");
-    std::fs::write(&path, "{}").unwrap();
-    assert!(closure::closure_at(&mut path).is_err());
-    let mut path = root.join("missing.json");
-    assert!(closure::closure_at(&mut path).is_err());
-    _ = std::fs::remove_dir_all(&root);
-}
-
-/// The published files of the verified closure of `root` of [`PACKAGES`] under `dir`, one
-/// directory a package, and a description of them as blaze writes one: its path.
-fn published(dir: &Path, root: usize) -> std::path::PathBuf {
-    let all = closure_of(root);
-    let mut crates = Vec::new();
-    for &at in all {
-        let package = &PACKAGES[at];
-        let at_dir = dir.join(package.dir);
-        for (path, bytes) in package.files {
-            let file = at_dir.join(path);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(&file, bytes).unwrap();
-        }
-        let deps: Vec<serde_json::Value> = package
-            .deps
-            .iter()
-            .map(|(name, dep)| {
-                serde_json::json!({ "crate": all.iter().position(|it| it == dep).unwrap(), "name": name })
-            })
-            .collect();
-        let cfg = actual()[at].cfg.clone().unwrap();
-        crates.push(crate_of(&at_dir, package.name, package.version, &cfg, deps.into()));
-    }
-    let description = dir.join("rust-project.json");
-    std::fs::write(&description, serde_json::json!({ "crates": crates }).to_string()).unwrap();
-    description
-}
-
-#[test]
-fn find_follows_the_files_on_disk() {
-    let dir = scratch_dir("on-disk");
-    let description = published(&dir, SERDE_DERIVE);
-    let module = dylib("blaze-native-on-disk");
-    let none = dylib("blaze-native-undescribed");
-    {
-        let (module, none, description) = (module.clone(), none.clone(), description.clone());
-        describe_with(Box::new(move |dylib: &AbsPath, into: &mut std::path::PathBuf| {
-            if *dylib == *none {
-                return Ok(false);
-            }
-            if *dylib != *module {
-                return Err(format!("the test describes no {dylib}"));
-            }
-            into.push(&description);
-            Ok(true)
-        }))
-        .unwrap();
-    }
-    let serialize = || find(&module, "Serialize", ProcMacroKind::CustomDerive).unwrap();
-    assert!(serialize().is_some());
-    assert!(find(&module, "Deserialize", ProcMacroKind::CustomDerive).unwrap().is_some());
-    assert!(find(&none, "Serialize", ProcMacroKind::CustomDerive).unwrap().is_none());
-    assert!(find(&dylib("blaze-native-unknown"), "Serialize", ProcMacroKind::CustomDerive).is_err());
-
-    // Kept: asking again of unchanged files gives the closure kept the first time.
-    let mut path = description.clone();
-    let first = closure::closure_at(&mut path).unwrap().unwrap();
-    let mut path = description.clone();
-    let second = closure::closure_at(&mut path).unwrap().unwrap();
-    if let (closure::Held::Kept(a), closure::Held::Kept(b)) = (&first, &second) {
-        assert!(std::ptr::eq(*a, *b));
-    } else {
-        panic!("a closure of settled files is kept");
-    }
-
-    let lib = dir.join(PACKAGES[SYN_3].dir).join("src/lib.rs");
-    let bytes = std::fs::read(&lib).unwrap();
-    let mut longer = bytes.clone();
-    longer.push(b'\n');
-    std::fs::write(&lib, &longer).unwrap();
-    assert!(serialize().is_none());
-    assert!(report().unwrap().contains("syn 3.0.9: its `src/lib.rs` is not the verified copy's"));
-    std::fs::write(&lib, &bytes).unwrap();
-    assert!(serialize().is_some());
-
-    let extra = dir.join(PACKAGES[QUOTE].dir).join("zzz.rs");
-    std::fs::write(&extra, "").unwrap();
-    let mut path = description.clone();
-    let closure = closure::closure_at(&mut path).unwrap().unwrap();
-    let quote = closure.packages.iter().find(|it| it.name == "quote").unwrap();
-    assert!(quote.files.iter().any(|it| it.0 == "zzz.rs"));
-    _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -645,22 +325,6 @@ fn a_difference_names_what_differs() {
     assert!(difference(&shorter, &tree).is_some());
 }
 
-/// The macro `name` of the crate `package` of [`PACKAGES`], expanding `input` (and `attr`,
-/// for an attribute), its spans within the text of each, with no database to ask.
-fn expanded(
-    package: usize,
-    name: &str,
-    attr: Option<&str>,
-    input: &str,
-) -> Result<TopSubtree, ProcMacroExpansionError> {
-    let root = ROOTS.iter().position(|it| it.package == package).unwrap();
-    let entry = ROOTS[root].macros.iter().position(|it| it.name == name).unwrap();
-    let native = Macro { root, entry, identity: identity(root, entry) };
-    let input = tokens(input, span(0, input.len() as u32));
-    let attr = attr.map(|it| tokens(it, span(1000, 1000 + it.len() as u32)));
-    native.expand_with(None, &input, attr.as_ref(), span(5, 5), span(6, 6), span(7, 7))
-}
-
 /// The text of each token of `tree` in order, a group as its opening delimiter.
 fn words(tree: &TopSubtree) -> Vec<String> {
     tree.as_token_trees()
@@ -710,175 +374,102 @@ fn assert_spans_known(tree: &TopSubtree) {
     }
 }
 
-#[test]
-fn serde_derives_serialize() {
-    let out = expanded(SERDE_DERIVE, "Serialize", None, "struct Point { x: i32, y: i32 }").unwrap();
-    assert_has(&out, "impl _serde : : Serialize for Point");
-    assert_has(&out, "serialize_struct");
-    assert_has(&out, "\"Point\"");
-    assert_has(&out, "\"x\"");
-    assert_spans_known(&out);
+fn echo(input: TokenStream) -> TokenStream {
+    input
+}
 
-    let renamed = "#[serde(rename = \"pt\")] struct Point { #[serde(skip)] x: i32, y: i32 }";
-    let out = expanded(SERDE_DERIVE, "Serialize", None, renamed).unwrap();
-    assert_has(&out, "\"pt\"");
-    assert!(!words(&out).contains(&"\"x\"".to_owned()));
+fn parsed(_: TokenStream) -> TokenStream {
+    "fn made() -> u8 { -1i8 as u8 }".parse().expect("the text lexes")
+}
 
-    let generic = "struct Wrap<T> { inner: T }";
-    let out = expanded(SERDE_DERIVE, "Serialize", None, generic).unwrap();
-    assert_has(&out, "for Wrap < T >");
-    assert_has(&out, "T : _serde : : Serialize");
+fn named(_: TokenStream) -> TokenStream {
+    [Ident::new("at_call", MacroSpan::call_site()), Ident::new("at_mixed", MacroSpan::mixed_site())]
+        .into_iter()
+        .map(MacroTree::from)
+        .collect()
+}
 
-    let out = expanded(SERDE_DERIVE, "Serialize", None, "union U { a: u8 }").unwrap();
-    assert_has(&out, "compile_error");
+fn attributed(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let mut out = attr;
+    out.extend(item);
+    out
+}
+
+fn panics(_: TokenStream) -> TokenStream {
+    panic!("no {}", "way")
+}
+
+/// Expands another macro on this thread while it runs, as a host's answer can.
+fn nested(input: TokenStream) -> TokenStream {
+    let at = span(50, 55);
+    let inner = tokens("y + 1", at);
+    let out = expand(Expander::One(echo), None, &inner, None, at, at, at).expect("the inner expansion");
+    assert_eq!(difference(&out, &inner), None);
+    input
+}
+
+/// `expander` expanding `input` (and `attr`, for an attribute), its spans within the text of
+/// each, with no database to ask; the call site is the input's span.
+fn run(expander: Expander, attr: Option<&str>, input: &str) -> (TopSubtree, Result<TopSubtree, ProcMacroExpansionError>) {
+    let at = span(0, input.len() as u32);
+    let input = tokens(input, at);
+    let attr = attr.map(|it| tokens(it, span(1000, 1000 + it.len() as u32)));
+    let out = expand(expander, None, &input, attr.as_ref(), span(5, 5), at, span(7, 7));
+    (input, out)
 }
 
 #[test]
-fn serde_derives_deserialize() {
-    let input = "enum Shape { Circle(f64), Square { side: f64 } }";
-    let out = expanded(SERDE_DERIVE, "Deserialize", None, input).unwrap();
-    assert_has(&out, "Deserialize < ' de > for Shape");
-    assert_has(&out, "\"Circle\"");
-    assert_has(&out, "\"side\"");
-    assert_spans_known(&out);
-}
-
-#[test]
-fn thiserror_2_derives_error() {
-    let input = "enum E { #[error(\"bad {0}\")] Bad(u8), #[error(transparent)] Io(#[from] std::io::Error) }";
-    let out = expanded(THISERROR_IMPL_2, "Error", None, input).unwrap();
-    assert_has(&out, "thiserror : : __private21 : : Error for E");
-    assert_has(&out, "From < std : : io : : Error > for E");
-    assert_spans_known(&out);
-
-    let out = expanded(THISERROR_IMPL_2, "Error", None, "enum E { Bad(u8) }").unwrap();
-    assert_has(&out, "compile_error");
-}
-
-#[test]
-fn thiserror_1_derives_error() {
-    let input = "struct E { #[source] inner: std::io::Error }";
-    let out = expanded(THISERROR_IMPL_1, "Error", None, input).unwrap();
-    assert_has(&out, "std : : error : : Error for E");
-    assert_has(&out, "source");
-
-    let input = "#[error(\"failed: {0}\")] struct Failed(String);";
-    let out = expanded(THISERROR_IMPL_1, "Error", None, input).unwrap();
-    assert_has(&out, "core : : fmt : : Display for Failed");
-    assert_spans_known(&out);
-}
-
-#[test]
-fn tokio_expands_main_and_test() {
-    let input = "async fn main() { println!(\"hi\"); }";
-    let out = expanded(TOKIO_MACROS, "main", None, input).unwrap();
-    assert_has(&out, "Builder : : new_multi_thread ( )");
-    assert_has(&out, "block_on");
-    assert_has(&out, "fn main ( )");
-
-    let out = expanded(TOKIO_MACROS, "main", Some("flavor = \"current_thread\""), input).unwrap();
-    assert_has(&out, "Builder : : new_current_thread ( )");
-
-    let out = expanded(TOKIO_MACROS, "main", None, "fn main() {}").unwrap();
-    assert_has(&out, "compile_error");
-
-    let out = expanded(TOKIO_MACROS, "test", None, "async fn it_works() { assert!(true); }").unwrap();
-    assert_has(&out, "core : : prelude : : v1 : : test");
-    assert_has(&out, "fn it_works ( )");
-    assert_spans_known(&out);
-}
-
-#[test]
-fn tokio_expands_its_function_like_macros_and_panics_as_it_does() {
-    let out = expanded(TOKIO_MACROS, "select_priv_clean_pattern", None, "Some(ref mut x)").unwrap();
-    assert_eq!(words(&out), ["Some", "(", "x"]);
-
-    let out = expanded(TOKIO_MACROS, "select_priv_declare_output_enum", None, "(_ _ _)").unwrap();
-    assert_has(&out, "_2");
-    assert_has(&out, "u8");
-
-    let panicked = expanded(TOKIO_MACROS, "select_priv_declare_output_enum", None, "x");
-    assert!(
-        matches!(&panicked, Err(ProcMacroExpansionError::Panic(it)) if it == "unexpected macro input"),
-        "{panicked:?}"
-    );
-}
-
-#[test]
-fn every_package_is_its_vendored_copy() {
-    for package in &PACKAGES {
-        let dir = vendor(package.dir);
-        let mut on_disk = Vec::new();
-        walk(&dir, "", &mut on_disk).unwrap();
-        on_disk.sort();
-        let published: Vec<&str> =
-            on_disk.iter().filter_map(|it| it.0.strip_prefix(".published/")).collect();
-        let built: Vec<&str> =
-            on_disk.iter().map(|it| it.0.as_str()).filter(|it| !it.starts_with(".published/")).collect();
-        let listed: Vec<&str> = package.files.iter().map(|it| it.0).collect();
-        assert_eq!(built, listed, "{}: files.rs lists every file of its directory", package.dir);
-        let macro_crate = ROOTS.iter().any(|it| PACKAGES[it.package].dir == package.dir);
-        let replaced: &[&str] = if macro_crate { &["Cargo.toml", "src/lib.rs"] } else { &["Cargo.toml"] };
-        assert_eq!(published, replaced, "{}", package.dir);
-        for (path, bytes) in package.files {
-            let file = match replaced.contains(path) {
-                true => dir.join(".published").join(path),
-                false => dir.join(path),
-            };
-            assert_eq!(std::fs::read(&file).unwrap(), *bytes, "{}", file.display());
-        }
+fn a_macro_gets_its_input_as_it_was_given() {
+    for text in ["a::b(1u8, -2, \"s\") { c[0] } 'a", "x", "struct S;", "r#type - 2.5"] {
+        let (input, out) = run(Expander::One(echo), None, text);
+        assert_eq!(difference(&out.unwrap(), &input), None, "{text}");
     }
 }
 
 #[test]
-fn a_macro_crate_is_built_from_its_published_source_less_its_attributes() {
-    let attribute = |line: &str| {
-        let line = line.trim_start();
-        line.starts_with("#[proc_macro_derive(")
-            || line == "#[proc_macro_attribute]"
-            || line == "#[proc_macro]"
-    };
-    for root in &ROOTS {
-        let package = &PACKAGES[root.package];
-        let published = package.files.iter().find(|it| it.0 == "src/lib.rs").unwrap().1;
-        let published = std::str::from_utf8(published).unwrap();
-        let built = std::fs::read_to_string(vendor(package.dir).join("src/lib.rs")).unwrap();
-        let expected: String =
-            published.split_inclusive('\n').filter(|line| !attribute(line)).collect();
-        assert_eq!(built, expected, "{}", package.dir);
-        let declared = published.lines().filter(|line| attribute(line)).count();
-        assert_eq!(declared, root.macros.len(), "{}: one entry for each macro", package.dir);
-    }
+fn a_parsed_stream_is_at_the_call_site() {
+    let (_, out) = run(Expander::One(parsed), None, "anything here");
+    let out = out.unwrap();
+    assert_has(&out, "fn made ( ) - > u8 { - 1i8 as u8 }");
+    assert_spans_known(&out);
 }
 
 #[test]
-fn the_table_is_well_formed() {
-    for package in &PACKAGES {
-        let names: Vec<&str> = package.deps.iter().map(|it| it.0).collect();
-        assert!(names.is_sorted(), "{}", package.dir);
-        assert!(package.files.windows(2).all(|it| it[0].0 < it[1].0), "{}", package.dir);
-        let manifest = package.files.iter().find(|it| it.0 == "Cargo.toml").unwrap().1;
-        let manifest = std::str::from_utf8(manifest).unwrap();
-        let features = manifest.split("\n[features]\n").nth(1).unwrap_or_default();
-        let features = features.split("\n[").next().unwrap_or_default();
-        for feature in package.features {
-            let declared = features.lines().any(|line| {
-                line.split_once('=').is_some_and(|(name, _)| name.trim() == *feature)
-            });
-            assert!(declared, "{}: no feature `{feature}`", package.dir);
-        }
-        // Every file a library compiles from is under `src/` (`mentioned`).
-        for (path, bytes) in package.files.iter().filter(|it| compiled(it.0)) {
-            let text = std::str::from_utf8(bytes).unwrap();
-            for line in text.lines().map(str::trim_start).filter(|it| !it.starts_with("//")) {
-                for named in ["include!(", "include_str!(", "include_bytes!("] {
-                    assert!(!line.contains(named), "{}/{path}: {line}", package.dir);
-                }
-                if let Some(at) = line.strip_prefix("#[path = \"") {
-                    assert!(!at.contains(".."), "{}/{path}: {line}", package.dir);
-                }
-            }
-        }
-    }
-    assert_eq!(PACKAGES[QUOTE].build, Build::Nothing);
+fn the_sites_are_the_calls() {
+    let (_, out) = run(Expander::One(named), None, "a b");
+    let out = out.unwrap();
+    assert_eq!(words(&out), ["at_call", "at_mixed"]);
+    let spans: Vec<Span> = out
+        .as_token_trees()
+        .iter_flat_tokens()
+        .filter_map(|it| match it {
+            TokenTree::Leaf(Leaf::Ident(it)) => Some(it.span),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(spans, [span(0, 3), span(7, 7)]);
+}
+
+#[test]
+fn an_attribute_macro_gets_its_attribute_then_its_item() {
+    let (input, out) = run(Expander::Two(attributed), None, "fn f() {}");
+    assert_eq!(difference(&out.unwrap(), &input), None, "no attribute is an empty one");
+    let (input, out) = run(Expander::Two(attributed), Some("x y"), "fn f() {}");
+    let mut expected = vec!["x".to_owned(), "y".to_owned()];
+    expected.extend(words(&input));
+    assert_eq!(words(&out.unwrap()), expected);
+}
+
+#[test]
+fn a_panic_is_its_message() {
+    let (_, out) = run(Expander::One(panics), None, "a");
+    assert!(matches!(&out, Err(ProcMacroExpansionError::Panic(it)) if it == "no way"), "{out:?}");
+    let (input, out) = run(Expander::One(echo), None, "after a panic");
+    assert_eq!(difference(&out.unwrap(), &input), None);
+}
+
+#[test]
+fn an_expansion_within_an_expansion_has_its_own_host_and_buffers() {
+    let (input, out) = run(Expander::One(nested), None, "a + b");
+    assert_eq!(difference(&out.unwrap(), &input), None);
 }

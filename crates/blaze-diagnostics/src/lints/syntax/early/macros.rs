@@ -24,7 +24,7 @@ mod asm;
 mod matchers;
 
 use hir::{InFile, MacroCallId};
-use hir_expand::{ExpandTo, MacroCallKind, MacroDefKind, builtin::BuiltinAttrExpander};
+use hir_expand::{ExpandTo, MacroCallKind, MacroCallLoc, MacroDefKind, builtin::BuiltinAttrExpander};
 use syntax::{
     AstNode, AstToken as _, NodeOrToken, SyntaxKind, SyntaxNode, SyntaxNodePtr, SyntaxToken, T,
     TextSize,
@@ -39,26 +39,52 @@ use crate::{
 };
 
 /// The lints of macros and their expansions in the crate, as rustc's expansion buffers them,
-/// and those of its early and late lint passes the parts give.
+/// and those of its early and late lint passes the parts give: one pass over the trees of
+/// expansions, each call's location read once and its lints picked by the kind of its macro.
+/// Macro definitions are linted in the early pass's one walk ([`definition`]).
 pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
     let mut emitted = Vec::new();
+    let x86 = asm::x86(walk);
     for tree in &walk.trees {
         let Some(call) = tree.call else { continue };
-        emitted.extend(trailing_semicolon(cx, tree, call));
-        emitted.extend(incomplete_include(cx, tree, call));
-        emitted.extend(duplicate_attribute(cx, walk, call));
+        let loc = call.loc(cx.db);
+        let found = match loc.def.kind {
+            MacroDefKind::Declarative(..) => trailing_semicolon(cx, tree, call, loc),
+            MacroDefKind::BuiltInEager(..) => incomplete_include(cx, tree, call, loc),
+            MacroDefKind::BuiltInAttr(..) => duplicate_attribute(cx, walk, loc),
+            MacroDefKind::BuiltIn(_, it) if x86 && it.is_asm() => {
+                asm::lints(cx, tree, call, &mut emitted);
+                None
+            }
+            _ => None,
+        };
+        emitted.extend(found);
     }
-    emitted.extend(matchers::lints(cx, walk));
-    emitted.extend(asm::lints(cx, walk));
     emitted
+}
+
+/// The lints of a macro definition (`matchers`), which the early pass's one walk
+/// (`super::lints`) gives as it comes to one; `krate` is [`crate_at`].
+pub(super) fn definition(
+    cx: &Cx<'_, '_>,
+    krate: Option<InFile<SyntaxNodePtr>>,
+    tree: &Tree,
+    node: &SyntaxNode,
+    out: &mut Vec<Emitted>,
+) {
+    matchers::definition(cx, krate, tree, node, out);
+}
+
+/// Where the lints of macro definitions buffered at the crate are placed.
+pub(super) fn crate_at(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Option<InFile<SyntaxNodePtr>> {
+    matchers::crate_at(cx, walk)
 }
 
 /// `semicolon_in_expressions_from_macros` (`..._from_non_local_macros` for a macro of another
 /// crate): rustc parses what a `macro_rules!` macro called as an expression expands to as one
 /// expression, and when a `;` comes after it, buffers the lint at the `;` and drops it.
-fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId) -> Option<Emitted> {
+fn trailing_semicolon(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &MacroCallLoc) -> Option<Emitted> {
     let db = cx.db;
-    let loc = call.loc(db);
     let MacroDefKind::Declarative(def, _) = loc.def.kind else { return None };
     let MacroCallKind::FnLike { expand_to, .. } = &loc.kind else { return None };
     let node = loc.to_node(db);
@@ -159,9 +185,8 @@ fn span_of_token(cx: &Cx<'_, '_>, call: MacroCallId, token: span::Span) -> Span 
 /// `incomplete_include`: rustc parses what `include!` called as an expression or a statement
 /// reads as one expression (`ExpandInclude::make_expr`), and buffers the lint at the first
 /// token of the file after it.
-fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId) -> Option<Emitted> {
+fn incomplete_include(cx: &Cx<'_, '_>, tree: &Tree, call: MacroCallId, loc: &MacroCallLoc) -> Option<Emitted> {
     let db = cx.db;
-    let loc = call.loc(db);
     if !loc.def.is_include() {
         return None;
     }
@@ -207,9 +232,8 @@ fn next_token(root: &SyntaxNode, offset: TextSize) -> Option<SyntaxToken> {
 /// `duplicate_macro_attributes`: as rustc expands the builtin attribute `#[test]`, `#[bench]`,
 /// `#[test_case]` or `#[cfg_eval]`, the first other attribute of that name on the item it is on
 /// (`warn_on_duplicate_attribute`).
-fn duplicate_attribute(cx: &Cx<'_, '_>, walk: &Walk<'_>, call: MacroCallId) -> Option<Emitted> {
+fn duplicate_attribute(cx: &Cx<'_, '_>, walk: &Walk<'_>, loc: &MacroCallLoc) -> Option<Emitted> {
     let db = cx.db;
-    let loc = call.loc(db);
     let MacroDefKind::BuiltInAttr(_, expander) = loc.def.kind else { return None };
     let name = match expander {
         BuiltinAttrExpander::Test => "test",

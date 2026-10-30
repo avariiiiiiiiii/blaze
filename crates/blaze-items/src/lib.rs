@@ -29,6 +29,7 @@
 
 #![forbid(unsafe_code)]
 
+mod bound;
 mod facts;
 mod form;
 pub mod hash;
@@ -46,6 +47,7 @@ use hir_def::{
 };
 use serde::{Deserialize, Serialize};
 
+pub use bound::{BOUND_DOMAIN, bound_hash};
 pub use facts::*;
 pub use form::observes_names;
 pub use hash::{

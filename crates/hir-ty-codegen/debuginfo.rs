@@ -11,6 +11,8 @@
 //! A variable is told of when it is kept in one slot of the frame for as long as the function
 //! runs ([`VariableDebug`]), by where the slot is from the frame pointer.
 
+#![forbid(unsafe_code)]
+
 mod codeview;
 mod set;
 mod split;

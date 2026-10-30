@@ -1,6 +1,6 @@
 //! `function_casts_as_integer`: rustc's `tests/ui/lint/function_casts_as_integer.rs`.
 
-use super::{Test, Ui, ui};
+use super::{Ui, ui};
 
 /// `String` with `String::len`, which `function_casts_as_integer.rs` names unqualified, from
 /// std's prelude.
@@ -99,7 +99,6 @@ error: aborting due to 4 previous errors
 "##;
     let stderr = ui(Ui {
         name: "function_casts_as_integer.rs",
-        test: Test::Passes,
         core: "sized",
         std: Some(("pub use crate::string::String;", STRING_STD)),
         source,

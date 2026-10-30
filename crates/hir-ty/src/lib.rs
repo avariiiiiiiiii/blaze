@@ -23,6 +23,7 @@ pub mod builtin_derive;
 pub mod generics;
 pub mod infer;
 pub mod inhabitedness;
+pub mod intrinsic;
 mod lower;
 pub mod next_solver;
 mod opaques;

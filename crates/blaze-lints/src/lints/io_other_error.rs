@@ -13,7 +13,7 @@ use syntax::{
 use super::utils;
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "io_other_error";
+const LINT: super::Implemented = super::Implemented::IoOtherError;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if !cx.on(LINT) {

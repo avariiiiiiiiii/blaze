@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "useless_format";
+const LINT: super::Implemented = super::Implemented::UselessFormat;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
     if !cx.on(LINT) {

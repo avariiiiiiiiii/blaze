@@ -289,7 +289,7 @@ fn ingredients(db: &mut RootDatabase) -> String {
     let structs = usage.structs.iter().map(|it| ("struct", it.debug_name(), it));
     let queries = usage.queries.iter().map(|(&name, it)| ("query", name, it));
     let mut rows: Vec<_> = structs.chain(queries).collect();
-    rows.sort_by_key(|(_, _, it)| std::cmp::Reverse(it.size_of_fields() + it.size_of_metadata()));
+    blaze_ids::radix::sort_by_key(&mut rows, |(_, _, it)| !((it.size_of_fields() + it.size_of_metadata()) as u64));
     let mut table = String::from("kind\tcount\tfields\tmetadata\theap\tname\n");
     for (kind, name, it) in rows {
         let heap = it.heap_size_of_fields().map(|it| it.to_string()).unwrap_or_default();

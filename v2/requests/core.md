@@ -152,6 +152,7 @@ check on a warm build.
    be indexed without a lock.
 
 > forwarded to core: every finding is in lane core's own `crates/blaze-graph/`; lane core is still running.
+> applied (core DONE, so `requests`'): 1-3 and 7 were done in `pump.rs` and `pool.rs` (`Flight::state` an `AtomicU8` with a `OnceLock`, shards sized from the topology, `WAITS` taken only for a wait, `Pool::worker`); 4 and 5 as their status says. 6: `threads.rs` and `kqueue.rs` hand file effects to their IO threads through one `crossbeam_channel` MPMC queue, its `Receiver` cloned into each thread, with no lock; `crates/blaze-core/Cargo.toml` says `crossbeam-channel.workspace = true` (a new edge for the lock).
 
 ## From speed-link-edge-remote: two socket effects for the remote tier (2026-10-29)
 

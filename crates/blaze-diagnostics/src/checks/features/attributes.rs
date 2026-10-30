@@ -67,8 +67,7 @@ pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr) -> Option<
         *names.get_mut(len)? = Some(segment.name_ref()?);
         len += 1;
     }
-    let text = |it: &Option<ast::NameRef>| it.as_ref().map_or("", |it| unraw(it.text()));
-    let segments = [text(&names[0]), text(&names[1])];
+    let segments = [segment_text(&names[0]), segment_text(&names[1])];
     let gate = stability(&segments[..len])??;
     if features.enabled(gate.feature) || allows_unstable(cx, attr.file, attr.range(), gate.feature) {
         return None;
@@ -89,8 +88,10 @@ pub(crate) fn gate(cx: &Cx<'_, '_>, features: &Features, attr: &Attr) -> Option<
     Some(diag)
 }
 
-/// A raw identifier's name: rustc's path segments are written without `r#`.
-fn unraw(text: &str) -> &str {
+/// A segment's name as rustc's path has it: a raw identifier's without `r#`.
+fn segment_text(name: &Option<ast::NameRef>) -> &str {
+    let Some(name) = name else { return "" };
+    let text = name.text();
     text.strip_prefix("r#").unwrap_or(text)
 }
 
@@ -195,10 +196,9 @@ fn configure_meta(
     walk: &Walk<'_>,
     features: &Features,
     file: HirFileId,
-    meta: ast::Meta,
+    mut meta: ast::Meta,
     diags: &mut Vec<Diag>,
 ) -> bool {
-    let mut meta = meta;
     while let ast::Meta::UnsafeMeta(unsafe_meta) = &meta {
         let Some(inner) = unsafe_meta.meta() else { return true };
         meta = inner;

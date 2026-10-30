@@ -147,7 +147,7 @@ fn inherent_atomic_method(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<FunctionId
         return None;
     };
     let atomic = util::diagnostic_item(db, AttrDefId::AdtId(adt.def_id()))?;
-    (atomic == "Atomic").then_some(def)
+    (atomic.as_str() == "Atomic").then_some(def)
 }
 
 /// rustc's `match_ordering`: the variant of `Ordering` (std's diagnostic item `Ordering`) the
@@ -165,7 +165,7 @@ fn ordering(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Ordering> {
         _ => return None,
     };
     let item = util::diagnostic_item(db, AttrDefId::AdtId(AdtId::EnumId(loc.parent)))?;
-    (item == "Ordering").then_some(ordering)
+    (item.as_str() == "Ordering").then_some(ordering)
 }
 
 /// The lint at the ordering argument `arg`.

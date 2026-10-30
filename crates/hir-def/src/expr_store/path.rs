@@ -10,7 +10,6 @@ use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
-use intern::Interned;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Path {
@@ -18,7 +17,7 @@ pub enum Path {
     /// are in this category, and splitting `Path` this way allows it to be more thin. When the path has either generics
     /// or type anchor, it is `Path::Normal` with the generics filled with `None` even if there are none (practically
     /// this is not a problem since many more paths have generics than a type anchor).
-    BarePath(Interned<ModPath>),
+    BarePath(ModPath),
     /// `Path::Normal` will always have either generics or type anchor.
     Normal(Box<NormalPath>),
     /// A link to a lang item. It is used in desugaring of things like `it?`. We can show these
@@ -37,7 +36,7 @@ const _: () = {
 pub struct NormalPath {
     pub generic_args: Box<[Option<GenericArgs>]>,
     pub type_anchor: Option<TypeRefId>,
-    pub mod_path: Interned<ModPath>,
+    pub mod_path: ModPath,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,13 +100,13 @@ impl Path {
         Path::Normal(Box::new(NormalPath {
             generic_args: generic_args.into_boxed_slice(),
             type_anchor: None,
-            mod_path: Interned::new(path),
+            mod_path: path,
         }))
     }
 
     /// Converts a known mod path to `Path`.
     pub fn from_known_path_with_no_generic(path: ModPath) -> Path {
-        Path::BarePath(Interned::new(path))
+        Path::BarePath(path)
     }
 
     #[inline]
@@ -162,10 +161,10 @@ impl Path {
                 if mod_path.is_ident() {
                     return None;
                 }
-                Some(Path::BarePath(Interned::new(ModPath::from_segments(
+                Some(Path::BarePath(ModPath::from_segments(
                     mod_path.kind,
                     mod_path.segments()[..mod_path.segments().len() - 1].iter().cloned(),
-                ))))
+                )))
             }
             Path::Normal(path) => {
                 let mod_path = &path.mod_path;
@@ -174,10 +173,10 @@ impl Path {
                 }
                 let type_anchor = path.type_anchor;
                 let generic_args = &path.generic_args;
-                let qualifier_mod_path = Interned::new(ModPath::from_segments(
+                let qualifier_mod_path = ModPath::from_segments(
                     mod_path.kind,
                     mod_path.segments()[..mod_path.segments().len() - 1].iter().cloned(),
-                ));
+                );
                 let qualifier_generic_args = &generic_args[..generic_args.len() - 1];
                 if type_anchor.is_none() && qualifier_generic_args.iter().all(|it| it.is_none()) {
                     Some(Path::BarePath(qualifier_mod_path))
@@ -306,6 +305,6 @@ impl GenericArgs {
 
 impl From<Name> for Path {
     fn from(name: Name) -> Path {
-        Path::BarePath(Interned::new(ModPath::from_segments(PathKind::Plain, iter::once(name))))
+        Path::BarePath(ModPath::from_segments(PathKind::Plain, iter::once(name)))
     }
 }

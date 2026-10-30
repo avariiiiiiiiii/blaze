@@ -14,7 +14,7 @@ use syntax::{
 use super::utils;
 use crate::{check::Cx, diag::Applicability, sugg::Sugg};
 
-const LINT: &str = "needless_bool";
+const LINT: super::Implemented = super::Implemented::NeedlessBool;
 
 /// What a branch gives: a bool, or a `return` of one.
 #[derive(Clone, Copy, PartialEq, Eq)]

@@ -12,6 +12,7 @@ use crate::cycle::{CycleRecoveryStrategy, IterationStamp, ProvisionalStatus};
 use crate::database::RawDatabase;
 use crate::fingerprint::Fingerprint;
 use crate::function::delete::DeletedEntries;
+use crate::graph::Relocation;
 use crate::hash::{FxHashSet, FxIndexSet};
 use crate::ingredient::Ingredient;
 use crate::key::DatabaseKeyIndex;
@@ -606,6 +607,17 @@ where
         self.maybe_changed_after(db, input, revision)
     }
 
+    unsafe fn verify_unclaimed(
+        &self,
+        zalsa: &Zalsa,
+        db: RawDatabase<'_>,
+        input: Id,
+        revision: Revision,
+        depth: u32,
+    ) -> Option<VerifyResult> {
+        self.verify_memo_unclaimed(zalsa, db, input, revision, depth)
+    }
+
     unsafe fn collect_minimum_serialized_edges(
         &self,
         zalsa: &Zalsa,
@@ -677,6 +689,18 @@ where
             self.evict_least_recently_verified(table, capacity.get());
         }
         self.deleted_entries.clear();
+    }
+
+    fn relocate_edges(&mut self, table: &mut Table, relocation: &mut Relocation<'_>) {
+        let indices = &self.memo_ingredient_indices;
+        table.for_each_memo_table_mut::<Memo<C>>(
+            |struct_ingredient| indices.get_checked(struct_ingredient),
+            |memos, index| {
+                memos.map_memo(index, |memo: &mut Memo<C>| {
+                    memo.header.revisions.relocate_edges(relocation);
+                });
+            },
+        );
     }
 
     fn debug_name(&self) -> &'static str {
@@ -774,7 +798,7 @@ unsafe fn collect_minimum_serialized_edges(
     visited_edges.insert(edge);
 
     // Collect the minimum dependency tree.
-    for edge in memo.header().origin().edges() {
+    for edge in memo.header().origin(zalsa.graph()).edges() {
         // Avoid forming cycles.
         if visited_edges.contains(&edge) {
             continue;
@@ -824,7 +848,7 @@ fn flatten_cycle_head_dependencies(
         return;
     }
 
-    let inputs = memo_header.origin().inputs();
+    let inputs = memo_header.origin(zalsa.graph()).inputs();
 
     match cycle_recovery_strategy {
         // Queries with cycle handling already flattened their own dependencies when completing
@@ -908,7 +932,9 @@ where
 
 #[cfg(feature = "persistence")]
 mod persistence {
-    use super::{Configuration, IngredientImpl, Memo};
+    use super::memo::persistence::PersistedMemo;
+    use super::{Configuration, IngredientImpl};
+    use crate::graph::TaskGraph;
     use crate::hash::{FxHashSet, FxIndexSet};
     use crate::plumbing::{MemoIngredientMap, SalsaStructInDb};
     use crate::zalsa::Zalsa;
@@ -973,7 +999,7 @@ mod persistence {
 
                 if let Some(memo) = memo.filter(|memo| memo.should_serialize()) {
                     // Flatten the dependencies of this query down to the base inputs.
-                    let flattened_origin = match memo.header.origin() {
+                    let flattened_origin = match memo.header.origin(zalsa.graph()) {
                         QueryOriginRef::Derived(edges) => {
                             // SAFETY: Serialization's exclusive storage access prevents database writes.
                             unsafe {
@@ -1101,8 +1127,10 @@ mod persistence {
             M: de::MapAccess<'de>,
         {
             let DeserializeIngredient { zalsa, ingredient } = self;
+            let task = TaskGraph::default();
 
-            while let Some((key, memo)) = access.next_entry::<&str, Memo<C>>()? {
+            while let Some((key, memo)) = access.next_entry::<&str, PersistedMemo<C>>()? {
+                let memo = memo.record(zalsa.graph(), &task);
                 let (ingredient_index, id) = key
                     .split_once(':')
                     .ok_or_else(|| de::Error::custom("invalid database key"))?;

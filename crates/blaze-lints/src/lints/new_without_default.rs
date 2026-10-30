@@ -17,7 +17,7 @@ use syntax::{
 
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "new_without_default";
+const LINT: super::Implemented = super::Implemented::NewWithoutDefault;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, imp: &ast::Impl) {
     if !cx.on(LINT) || imp.trait_().is_some() || imp.where_clause().is_some() {

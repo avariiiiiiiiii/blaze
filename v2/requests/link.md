@@ -601,3 +601,258 @@ section names (or `Arc<str>` as a first step, so the clone per atom is a count b
 
 Why: no allocation per named section or per atom of one, and class comparisons on the core's
 sorting and lookups become one `u32` compare.
+
+> forwarded to link: its own `crates/blaze-link/`.
+
+## 12. From speed-link-edge-live: the safety audit of blaze-live, answered, and what the linker owes
+
+Status: open. Items a and b block jump-table patches after a rollback, and ELF patches with
+frames from the second one on; items c and d don't block. For lead `link` (`blaze-link` place
+and live writer, `blaze-splice`, `blaze-engine`'s counter code). Applied in `crates/blaze-live`
+by speed-link-edge-live, unbuilt (this lane may not build); details in
+`docs/v2/plan/lanes/link/speed-link-edge-live.md`, section "Safety audit".
+
+What was applied for "## From safety-audit" / blaze-live:
+- Every comment and split the audit proposed, in `lib.rs`, `linux.rs`, `macos.rs`, `windows.rs`,
+  `sample.rs`, `slots/unix.rs:74` and `slots/tests.rs:69`. Each unsafe block now has one
+  operation and a SAFETY comment. Where v1 can't uphold an invariant, the comment says "NOT upheld"
+  and names the rule the program must keep.
+- MAY BE UNSOUND 1: a failed apply now moves `next` past the patch and publishes it, so no later
+  patch maps over memory that jumps or the unwinder may already reach. This is on all three v1
+  platforms.
+- MAY BE UNSOUND 3: each write is checked to lie in the executable's image before anything is
+  mapped or written. The patch is declined otherwise.
+- MAY BE UNSOUND 4 (`checked_add` on macOS), 5 (each FDE bounded before it is registered) and 12
+  (the Windows function table must lie in the patch) are fixed.
+- MAY BE UNSOUND 6: Linux now registers the `.eh_frame` run once, after finding its zero length
+  inside the section or in the 4 bytes right after it in the patch's text. Without one, the patch
+  is declined.
+- MAY BE UNSOUND 7 and 8 (`slots/`): the switch keeps a set of lasting memory and refuses any
+  write over it. The set covers the code of every generation that was registered or published,
+  every registered FDE, each run's zero terminator, and Windows UNWIND_INFO (now sized and
+  bounded).
+- MAY BE UNSOUND 10 (`slots/`): data over the loader's jump table is refused. The platforms check
+  that each data span lies in the image (unix `dladdr` base, Windows allocation base) and refuse
+  pages with no access.
+- MAY BE UNSOUND 11: the counters are a `static [AtomicU64; COUNTERS]`, and the sampler loads them
+  relaxed with no unsafe.
+- MAY BE UNSOUND 2 and 9 are stated as the program's rule, in the `lib.rs` and `slots` `poll` docs
+  and in the "NOT upheld" comments. Finding 2 is v1's design and can't be fixed by a comment: the
+  fix is to move v1 onto the jump table.
+
+What the linker owes for these to hold without declining good patches:
+a. Patch code placement must never go back. `place.rs` reuses addresses after a rollback because
+   rollback restores the linker state. The switch now declines any code over a published
+   generation, since a thread may still be in it. Keep the patch-region cursor monotonic across
+   rollbacks, and never reuse an address that published code had.
+b. Each ELF patch's EhFrame run must end in its own zero terminator, placed after the previous
+   run's. Today each patch writes its run over the previous one's terminator, and the switch now
+   declines that, because the unwinder may be reading the terminator. For v1 ELF (`blaze-splice`),
+   append a zero length after the patch's `.eh_frame` in its text. A relocatable object's section
+   has none, and the runtime declines the patch unless the next 4 bytes happen to be zero.
+c. MAY BE UNSOUND 9: data a running program can reach must not be rewritten in place. Give a
+   changed static a fresh piece and redirect to it, or restart. If in-place data writes stay,
+   `Live::poll` should become `unsafe fn` with the rule in its `# Safety` (other threads touch no
+   static a patch rewrites while it runs).
+d. MAY BE UNSOUND 11 and 2, for blaze-engine and blaze-splice:
+   - The daemon's counter code must add to `blaze_live_counters` with a relaxed atomic add
+     (`ldadd` / `lock xadd`). Otherwise its adds still race the sampler.
+   - v1's jumps should move to the `slots` jump table. Short of that, write each jump as one
+     aligned atomic store, which a thread already inside the bytes can still resume into, so
+     stopping threads is the only full fix.
+
+Once these are in, `crates/blaze-live/Cargo.toml` can take `[lints] workspace = true`.
+
+> forwarded to link.
+
+## From safety-fuzz-link
+
+From `safety-fuzz-link` (child of `safety-fuzz`, lane `safety`), who wrote the fuzz targets of
+blaze-link's input readers: `fuzz/targets/link_{elf_object,elf_archive,elf_shared,macho_object,
+macho_archive,macho_dylib,macho_tbd,coff_object,coff_archive,coff_import,wasm_object,
+wasm_archive}.rs`, each against `fuzz_read` (item 7.6). Full notes:
+`/tmp/blaze-lanes/v2-safety-fuzz-link.md`. Nothing in `crates/` was edited.
+
+> forwarded to link.
+
+### 12. A fuzz entry that returns what a read made (`lib.rs`)
+
+Status: open, does not block (the targets run against `fuzz_read` now and check what a `bool`
+allows). For lead `link`.
+
+`fuzz_read` answers only whether a read succeeded, so a target can't check that what an accepted
+read made is inside its input and consistent. Today the targets check it only indirectly: an
+accepted ELF, Mach-O or COFF file must still be accepted with 64 bytes appended. Proposed, next
+to `fuzz_read` in `src/lib.rs`, both `#[doc(hidden)]`:
+
+```rust
+/// What a read made, as ranges and indices (for a fuzz target).
+#[doc(hidden)]
+pub enum FuzzRead {
+    Object {
+        /// Per section: `Data::len`, and for `Data::Input` its range of the bytes read.
+        sections: Vec<(u64, Option<std::ops::Range<u64>>)>,
+        /// Per `SymbolDef::Section` symbol: (section, value, size).
+        symbols: Vec<(u32, u64, u64)>,
+        /// `Object::symbols.len()`.
+        symbol_count: u32,
+        /// Per fixup: (section, at, `reloc::width(apply)`, symbol, minus).
+        fixups: Vec<(u32, u64, u8, u32, Option<u32>)>,
+        /// Per group: its sections (`Object::grouped[group.sections]`).
+        groups: Vec<Vec<u32>>,
+    },
+    Archive { members: Vec<std::ops::Range<usize>>, index: Vec<u32> },
+    Shared { symbols: usize, more: usize },
+}
+
+/// [`fuzz_read`], with what the read made; `None` when it fails.
+#[doc(hidden)]
+pub fn fuzz_read_parts(format: Format, arch: blaze_codegen::Arch, kind: NativeKind, bytes: &[u8]) -> Option<FuzzRead>;
+```
+
+With it, every target checks these, the invariant the readers' contract states:
+
+- every archive member's range is within `bytes.len()`;
+- every index entry is below the member count;
+- every `Data::Input` range is within `bytes.len()` and as long as the section's `len`;
+- every symbol's section is below the section count, and `value + size` (no overflow) is at
+  most that section's `len`;
+- every fixup's section is below the section count, its `at + width` is at most that
+  section's `len`, and its symbol and minus are below `symbol_count`;
+- every group's sections are below the section count.
+
+The PE and wasm archive bugs (1 and 2 below) break the first of these. Bug 2 doesn't panic
+today, so a `bool` can't show it.
+
+### Bugs found by reading
+
+Each one's input is in the corpus or generated by the named target's `seeds()`, so that
+target's `seeds` test fails until the bug is fixed.
+
+1. **PE: an archive member past the archive's end panics** (`pe/coff.rs` `archive`, ~291).
+   `Member::bytes` is `offset..offset + size` as `object` parses the header, and `object` does
+   not bound a member's size by the archive's length (`ArchiveMember::parse` only skips it).
+   Then `import_library` (~361) slices `&bytes[it.bytes.clone()]`, and so does
+   `descriptor_dll`'s caller (~306): both panic. Read as `NativeKind::Shared`, it is 68 bytes:
+   `!<arch>\n`, then one header `a.o/` of size 100 and no data
+   (`fuzz/corpus/link_coff_import/member-past-the-end.hex`):
+   `213c617263683e0a 612e6f2f202020202020202020202020 302020202020202020202020 302020202020
+   302020202020 3634342020202020 31303020202020202020 600a`.
+   As `NativeKind::Archive`, a GNU index naming `__IMPORT_DESCRIPTOR_a` in that member panics
+   in `descriptor_dll`'s slice (`fuzz/corpus/link_coff_archive/descriptor-member-past-the-end.hex`).
+   Fix: the ELF and Mach-O readers' check, `.filter(|it| it.end <= bytes.len())` with an error
+   naming the member (`elf/read/archive.rs` 38-44).
+2. **wasm: the same unchecked member range** (`wasm/object.rs` `archive`, 100-105). It doesn't
+   panic in the reader (the core reads members with `.get`), but an accepted archive has a
+   member outside its input: the same 68 bytes, read as `Archive { whole: true }`, are accepted
+   (`fuzz/corpus/link_wasm_archive/member-past-the-end.hex`). Same fix.
+3. **PE: a long import's name offset overflows** (`pe/coff.rs` `long_import`, ~1143).
+   `target.value() as usize + u64_at(thunk, 0) as usize` adds two input values unchecked, so a
+   thunk of `u64::MAX` and a name symbol at 1 panic on the overflow. `u16_at`/`u32_at`/`u64_at`
+   (166-176) also compute `at + 2`/`+ 4`/`+ 8` unchecked, which overflows for an `at` near
+   `usize::MAX`. Input: `thunk_past_usize()` in `fuzz/targets/link_coff_import.rs`, read as
+   `Shared`: an import library whose GNU index names `__IMPORT_DESCRIPTOR_foo` in member 0 (a
+   COFF object, `.idata$2` defining it and `.idata$6` `foo.dll`), and member 1 a long import
+   (`.idata$5` holding the 8 bytes `ff`×8 and defining `__imp_f`, an undefined
+   `__IMPORT_DESCRIPTOR_foo`, and an `ADDR32NB` at `.idata$5`+0 to a static symbol of value 1 in
+   `.idata$6`). Fix: `checked_add`, refusing on overflow, in `long_import` and the three
+   helpers (`bytes.get(at..at.checked_add(2)?)`).
+4. **Mach-O: a section's address plus an offset overflows** (`macho/input.rs` 666 and 935).
+   `self.inputs[s].addr + at` takes `addr` from the section header unchecked: a section at
+   `0xffff_ffff_ffff_fff8` with an x86-64 non-extern `SIGNED`/`BRANCH` relocation at offset 8
+   (666), or an `__eh_frame` FDE with a pc-relative pointer and no relocation (935), panics.
+   Fix: `wrapping_add` as the rest of each expression does (the address is only matched against
+   symbols), or refuse a section whose `addr + size` overflows when the inputs are read (~131).
+5. **Mach-O: an archive's name arena grows quadratically with its index** (`macho/archive.rs`
+   31-35). `index_bytes` sums every index entry's name length, but a BSD `__.SYMDEF` entry
+   names its string by offset, so every entry can name the same one. 640 entries naming one
+   4096-byte string make a 10 KB archive whose read asks for a 2.6 MB arena at once, past
+   `blaze_fuzz::allowed` (1.7 MB). At 1 MB the arena is about 32 GB. Input:
+   `one_name_many_times()` in `fuzz/targets/link_macho_archive.rs`. Fix: one `Name` per
+   distinct string offset (BSD) instead of one push per entry, or bound `index_bytes` by the
+   index's size and push names past it as they come.
+6. **wasm: the same arena** (`wasm/object.rs` `archive`, 120): one `names.push` per index
+   entry, and the reader takes BSD archives too. Input: `one_name_many_times()` in
+   `fuzz/targets/link_wasm_archive.rs`. Same fix.
+7. **Mach-O: a C object's `__compact_unwind` is dropped** (`macho.rs` `classify`, 278-283).
+   The debug check (`flags & S_ATTR_DEBUG != 0`, so `Dropped`) runs before the match on
+   `("__LD", "__compact_unwind")`, and LLVM gives `__compact_unwind` exactly `S_ATTR_DEBUG`
+   (`0x0200_0000`), so every clang object's unwind entries are dropped. `macho/tests.rs:526`
+   asserts that `classify("__LD", "__compact_unwind", 0x0200_0000)` is `Unwind`, and item 11
+   assumes it too. A fuzz target can't show this one (dropping is still a successful read).
+   Fix: match `__compact_unwind` (and `__eh_frame`) before the debug check.
+
+Not bugs, but the targets' allocation check may report them:
+
+- A valid export trie that is one chain of terminal nodes has names totalling about len²/128
+  bytes, and `trie_exports` pushes them all into one `Names` arena. The output needs those
+  bytes, so either the reader bounds a trie's total name bytes or `link_macho_dylib`'s
+  allocation bound has to change: say which.
+- `trie_exports` pushes every edge of a node (up to 255) before any child is checked against
+  `seen`, so overlapping nodes may grow `stack` past the bound before the cycle is found.
+- The ELF archive reader keeps one `String` per index entry, so a BSD index of shared names
+  costs quadratic memory in total, though no single allocation is large. The rayon threads of
+  its unindexed path aren't counted by `largest_allocation` at all.
+
+> sent to `link-next1` (no `link-pewasm-pe` or `link-macho-input` window was running); bugs 2
+> and 6 also to `link-pewasm-wasm-next1`.
+
+### 13. Two differential entries, for speed-link-edge-macho-dylib's request (safety.md, 2026-10-29)
+
+speed-link-edge-macho-dylib asked (in `v2/requests/safety.md`) for `.tbd` and export-trie
+targets checked against the readers kept in their tests: `tbd::tests::reference::read`, for
+platforms 1, 2 and 6, and `dylib::tests::reference_trie_exports`. Both references are
+`#[cfg(test)]`, and `fuzz_read` fixes platform 1, so a target can't reach either. Asked: the
+two references compiled outside `cfg(test)` (say `macho/tbd/reference.rs` and the trie walk
+beside `trie_exports`, used by the tests and these entries), and in `lib.rs`:
+
+```rust
+/// `macho::tbd::read("t.tbd", text, arch, platform)` against the reference reader: `Ok` with
+/// whether it accepted when both give the same symbols, inputs and install name or the same
+/// error (or the reference refuses nesting past 256), and the arena is exact
+/// (`arena_is_exact`); `Err` naming both answers otherwise.
+#[doc(hidden)]
+pub fn fuzz_tbd_differential(text: &str, arch: blaze_codegen::Arch, platform: u32) -> Result<bool, String>;
+
+/// `trie_exports(trie, 0, sections)` against the reference walk, `sections` being
+/// `dylib::tests::test_sections`: `Ok` with whether it accepted when the exports or the errors
+/// are equal, `Err` naming both answers otherwise.
+#[doc(hidden)]
+pub fn fuzz_trie_differential(trie: &[u8]) -> Result<bool, String>;
+```
+
+Until then `link_macho_tbd` and the new `link_macho_trie` (the input is the trie, placed in a
+valid dylib) check no panics, the allocation bound, alignment, and that a trie reads alike
+through `LC_DYLD_INFO_ONLY` and `LC_DYLD_EXPORTS_TRIE` for both arches. Their seeds are the
+tests' generators with the tests' seeds: `generate` and `edges_match_reference`'s texts, and
+`sample_trie` and `random_node`. `libSystem.B.tbd` is not a seed: it is Apple's and not in the
+tree, and `seeds()` reads no files (`sdk_libsystem_tbd` covers it). When the entries land, I
+switch both targets' reads to them, each platform in {1, 2, 6} for `.tbd`.
+
+> sent to `link-next1` and `speed-link-edge-macho-next1` (no `speed-link-edge-macho-dylib`
+> window was running).
+
+## 13. From link-core-write: a write of shared bytes, and of several ranges at once
+
+Where: `crates/blaze-core/src/lib.rs` (`Effect`), the io_uring, kqueue and threads backends.
+
+Why: a link's file is already in memory when it is written. After a full link each region is
+one buffer (`CowBytes` over a `Vec`), and `Effect::WriteAt` takes a `Vec<u8>`, so
+`file::whole` copies every byte of the image once more into the runs it writes (8 MiB each,
+aligned to 8 MiB, so they bypass the page cache under `DIRECT_LEAST`). An incremental link
+writes many small ranges (a piece, an 8-byte jump-table cell), each a `Vec` and an effect.
+
+Add:
+
+```rust
+    /// `parts` written in order from `at`, as one write (`pwritev` / `IORING_OP_WRITEV`):
+    /// each a range of shared bytes, not copied. Completes with [`Done::Written`].
+    WriteShared { file: FileName, at: u64, parts: Vec<(Mapping, std::ops::Range<usize>)>, tag: Tag },
+```
+
+With it a full link writes each region straight from its buffer and the headers from theirs
+(no copy of the image), and an incremental link sends one effect per run of nearby ranges, each
+range borrowed from the region's pages. Until then `file.rs` copies each run into its `Vec`
+once, the fewest copies `WriteAt` allows.
+
+> forwarded to link.

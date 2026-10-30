@@ -9,6 +9,7 @@ use crate::hash::TypeIdHasher;
 use crate::ingredient::{Ingredient, Jar};
 use crate::plumbing::SalsaStructInDb;
 use crate::runtime::Runtime;
+use crate::graph::Graph;
 use crate::table::Table;
 use crate::table::memo::MemoTableWithTypes;
 use crate::views::Views;
@@ -166,6 +167,9 @@ pub struct Zalsa {
     /// The runtime: revisions, the table of salsa structs and the graph of blocked tasks.
     runtime: Runtime,
 
+    /// Every memo's edges: dense nodes for the keys they name and one array of edge words.
+    graph: Graph,
+
     event_callback: Option<Box<dyn Fn(crate::Event) + Send + Sync>>,
 }
 
@@ -188,6 +192,7 @@ impl Zalsa {
             ingredients_vec: Vec::new(),
             ingredients_requiring_reset: Vec::new(),
             runtime: Runtime::default(),
+            graph: Graph::default(),
             memo_ingredient_indices: Default::default(),
             event_callback,
             #[cfg(not(feature = "inventory"))]
@@ -241,6 +246,12 @@ impl Zalsa {
     #[allow(dead_code)]
     pub(crate) fn table_mut(&mut self) -> &mut Table {
         self.runtime.table_mut()
+    }
+
+    /// The dependency graph every memo's edges are a range of.
+    #[inline]
+    pub(crate) fn graph(&self) -> &Graph {
+        &self.graph
     }
 
     /// Returns the [`MemoTable`][] for the salsa struct with the given id
@@ -455,8 +466,30 @@ impl Zalsa {
             self.ingredients_vec[ingredient.as_u32() as usize]
                 .reset_for_new_revision(self.runtime.table_mut());
         }
+        self.compact_edges_if_worth_it();
 
         new_revision
+    }
+
+    /// Copies the live edge ranges into a new array once dead ones (of replaced or dropped memos)
+    /// outweigh them: O(live edges), at most once per doubling of the array. Runs after every
+    /// ingredient's reset, so no memo waiting to be freed still holds a range.
+    fn compact_edges_if_worth_it(&mut self) {
+        if !self.graph.wants_compaction() {
+            return;
+        }
+        let Zalsa {
+            graph,
+            ingredients_vec,
+            runtime,
+            ..
+        } = self;
+        let table = runtime.table_mut();
+        graph.compact(|relocation| {
+            for ingredient in ingredients_vec.iter_mut() {
+                ingredient.relocate_edges(table, relocation);
+            }
+        });
     }
 
     /// **NOT SEMVER STABLE**

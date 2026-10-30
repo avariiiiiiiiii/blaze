@@ -10,7 +10,11 @@ use std::{
     any::Any,
     cell::RefCell,
     panic::Location,
-    sync::atomic::{AtomicU64, Ordering::Relaxed},
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering::Relaxed},
+    },
 };
 
 use crate::{
@@ -104,13 +108,14 @@ pub(crate) struct Thread {
     /// An unpark not yet consumed by a park, and what the unparkers knew.
     token: bool,
     unparked: Clock,
-    /// Its `thread_local!` values, by key.
-    pub(crate) locals: Vec<(usize, Box<dyn Any>)>,
+    /// Its `thread_local!` values, by key. An `Rc`, so a value lent to `LocalKey::with` stays
+    /// alive while the runtime is not borrowed.
+    pub(crate) locals: Vec<(usize, Rc<dyn Any>)>,
     pub(crate) dropping_locals: bool,
     /// Where its last operation was, and what it was, for reports.
     at: Option<At>,
     what: &'static str,
-    pub(crate) name: Option<String>,
+    pub(crate) name: Option<Arc<str>>,
 }
 
 impl Thread {
@@ -517,8 +522,28 @@ pub(crate) fn yield_now(at: At) -> Option<()> {
     Some(())
 }
 
+/// A schedule point after `f`, which may block the running thread: it returns what the
+/// thread then waits for.
+pub(crate) fn wait(
+    at: At,
+    what: &'static str,
+    f: impl FnOnce(&mut Runtime) -> Result<Option<Wait>, String>,
+) -> Option<()> {
+    let switch = with(|rt| {
+        rt.note(at, what);
+        let thread = rt.current();
+        if let Some(wait) = f(rt)? {
+            rt.threads[thread].state = State::Blocked(wait);
+        }
+        rt.threads[thread].op = None;
+        rt.schedule()
+    })?;
+    go_on(switch);
+    Some(())
+}
+
 /// A new model thread running `body`; its index and its execution's epoch.
-pub(crate) fn spawn(at: At, name: Option<String>, body: coro::Job) -> Option<(Tid, u64)> {
+pub(crate) fn spawn(at: At, name: Option<Arc<str>>, body: coro::Job) -> Option<(Tid, u64)> {
     let spawned = with(move |rt| {
         rt.note(at, "spawn");
         let parent = rt.current();
@@ -656,7 +681,7 @@ pub(crate) fn current() -> Option<(Tid, u64)> {
 }
 
 /// The name the running model thread was spawned with.
-pub(crate) fn current_name() -> Option<Option<String>> {
+pub(crate) fn current_name() -> Option<Option<Arc<str>>> {
     with(|rt| {
         let thread = rt.current();
         rt.threads[thread].name.clone()

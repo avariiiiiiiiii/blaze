@@ -192,7 +192,7 @@ impl<'a, 'c, 'db> Finalize<'a, 'c, 'db> {
     /// rustc's `feature_err(..).emit()` of `feature` at `span`, unless the crate enables it.
     pub(crate) fn gate(&mut self, feature: &str, span: Span, explain: impl Into<String>) {
         if !self.feature(feature) {
-            let diag = self.session.feature_err(feature, span, explain);
+            let diag = self.session.feature_err(self.cx, feature, span, explain);
             self.emit_err(diag);
         }
     }

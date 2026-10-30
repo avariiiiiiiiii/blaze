@@ -20,7 +20,6 @@ mod worker;
 mod tests;
 
 use std::{
-    collections::BTreeMap,
     convert::Infallible,
     fs,
     io::Write,
@@ -123,7 +122,7 @@ pub fn serve(config: &Config) -> Result<Infallible, String> {
 
     let mut out = Vec::new();
     let mut service = Service::new(Settings::of(config), state, &mut out);
-    let mut workers = BTreeMap::new();
+    let mut workers = FxHashMap::default();
     loop {
         let mut changed = false;
         for output in out.drain(..) {
@@ -156,7 +155,7 @@ fn dispatch(
     config: &Config,
     shared: &Arc<Shared>,
     to_github: &mpsc::Sender<Post>,
-    workers: &mut BTreeMap<JobId, mpsc::Sender<worker::Command>>,
+    workers: &mut FxHashMap<JobId, mpsc::Sender<worker::Command>>,
     changed: &mut bool,
     output: Output,
 ) {

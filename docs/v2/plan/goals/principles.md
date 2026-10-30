@@ -34,12 +34,18 @@ branch-free lexing, the scheduler against work-stealing runtimes, and incrementa
 against Unison and rustc's red-green graph, finer than both. Where we don't beat it, the notes
 say why and what it would take.
 
-**Behavior, not bytes.** blaze must match rustc in what programs do and which programs
-compile: semantics, layout (`size_of` is observable), trait selection, panics, overflow, and
-which errors and warnings a program gets. It need not match rustc's bytes anywhere: not the
-machine code, symbol names in dev builds, debug-info layout, file formats, or diagnostic
-wording. Where matching rustc's bytes would cost speed, take the fastest way that keeps the
-behavior.
+**It just works; conformance only where something depends on it.** The bar is that real
+programs build and run under blaze as they do under rustc, judged by the crate corpus and
+people's projects, not by matching rustc for its own sake.
+- **Match rustc where real code depends on it**, even unofficially: semantics, which programs
+  compile, trait selection, panics, overflow, layout, `--print` output that build scripts
+  read, and cargo's JSON. Layout stays rustc's because crates assert sizes
+  (`assert!(size_of::<T>() == 16)`) and unsafe code relies on it, and matching it costs nothing
+  since we compute it with rustc's algorithm anyway.
+- **Be free everywhere nobody can tell:** machine code, symbol names in dev builds, debug-info
+  layout, file and cache formats, `target/` internals no tool reads, diagnostic wording, and
+  `-Z` flags no project uses. Take the fastest way.
+- **When unsure, ask the corpus.** If changing something breaks no crate in it, it's free.
 
 **Deterministic**: the same inputs give the same bytes, whatever the scheduling, the core count
 or the machine. The invalidation oracle (section 11) depends on it.

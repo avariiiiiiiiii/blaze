@@ -25,6 +25,8 @@
 //! over `u32` indices (docs/v2/plan/design/data.md): keys sorted once, flags as bitsets, edges
 //! as one CSR array.
 
+#![deny(unsafe_code)]
+
 pub mod bytes;
 pub mod columns;
 

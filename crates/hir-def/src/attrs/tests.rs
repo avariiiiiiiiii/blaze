@@ -15,9 +15,10 @@ use syntax::{
 use test_fixture::WithFixture;
 
 use super::{
-    AttrFlags, DocAtom, WORD_INDEX, WORD_SLOTS, WORDS, extract_ra_completions,
-    extract_ra_macro_style, extract_rustc_skip_during_method_dispatch, match_attr_flags,
-    symbol_attr, word, word_slot,
+    AttrFlags, Completions, DocAtom, DocWord, LinkKey, LinkKind, LinkModifier, MacroStyle,
+    NativeLib, NativeLibKind, ReprWord, SkipDuringMethodDispatch, Word, extract_ra_completions,
+    extract_ra_macro_style, extract_rustc_skip_during_method_dispatch, link_cfg,
+    match_attr_flags, parse_link_tt, parse_repr_tt, symbol_attr, word,
 };
 use crate::{
     AdtId, AttrDefId, FieldId, FunctionId, ModuleDefId, VariantId, nameres::crate_def_map,
@@ -35,30 +36,60 @@ fn crate_attrs() {
     assert!(attrs.contains(AttrFlags::IS_NO_STD | AttrFlags::HAS_CFG));
 }
 
-#[test]
-fn every_word_is_found_at_its_tag() {
-    for (at, &(text, found)) in WORDS.iter().enumerate() {
-        assert_eq!(found as usize, at, "{text}");
-        assert_eq!(word(text), Some(found), "{text}");
-    }
+/// Each member of every name set found at its tag, and the near misses of each (a byte short or
+/// over, another case, `r#`) found as a linear search of the texts finds them.
+macro_rules! check_name_set {
+    ($Enum:ident) => {{
+        assert_eq!($Enum::ALL.len(), $Enum::TEXTS.len());
+        for (at, (&text, &member)) in $Enum::TEXTS.iter().zip($Enum::ALL).enumerate() {
+            assert_eq!(member as usize, at, "{text}");
+            assert_eq!($Enum::of(text), Some(member), "{text}");
+            assert_eq!($Enum::of(&text.to_owned()), Some(member), "{text}");
+        }
+        let model = |name: &str| {
+            $Enum::TEXTS.iter().position(|it| *it == name).map(|at| $Enum::ALL[at])
+        };
+        for &text in $Enum::TEXTS {
+            let near = [
+                text[..text.len() - 1].to_owned(),
+                text[1..].to_owned(),
+                format!("{text}x"),
+                format!("x{text}"),
+                format!("r#{text}"),
+                text.to_uppercase(),
+                text.to_lowercase(),
+                text.replace('_', "-"),
+                text.replace('-', "_"),
+            ];
+            for near in &near {
+                assert_eq!($Enum::of(near), model(near), "{near}");
+            }
+        }
+        for other in ["", "a", "_", "-", "ünused", "allow", "test", "cfg_attr"] {
+            assert_eq!($Enum::of(other), model(other), "{other}");
+        }
+    }};
 }
 
 #[test]
-fn a_word_is_one_probe_on_average() {
-    let mut probes = 0;
-    let mut longest = 0;
-    for &(text, _) in WORDS {
-        let mut slot = word_slot(text.as_bytes());
-        let mut these = 1;
-        while WORDS[usize::from(WORD_INDEX[slot] - 1)].0 != text {
-            slot = (slot + 1) & (WORD_SLOTS - 1);
-            these += 1;
-        }
-        probes += these;
-        longest = longest.max(these);
+fn every_name_set_finds_its_members_and_only_them() {
+    check_name_set!(Word);
+    check_name_set!(DocWord);
+    check_name_set!(Completions);
+    check_name_set!(MacroStyle);
+    check_name_set!(SkipDuringMethodDispatch);
+    check_name_set!(ReprWord);
+    check_name_set!(LinkKey);
+    check_name_set!(LinkKind);
+    check_name_set!(LinkModifier);
+}
+
+#[test]
+fn every_word_is_found_at_its_tag() {
+    for (at, (&text, &found)) in Word::TEXTS.iter().zip(Word::ALL).enumerate() {
+        assert_eq!(found as usize, at, "{text}");
+        assert_eq!(word(text), Some(found), "{text}");
     }
-    assert!(probes * 2 <= WORDS.len() * 3, "{probes} probes for {} words", WORDS.len());
-    assert!(longest <= 8, "a word {longest} probes long");
 }
 
 #[test]
@@ -84,8 +115,8 @@ fn other_names_are_no_word() {
     ] {
         assert_eq!(word(name), None, "{name}");
     }
-    let model = |name: &str| WORDS.iter().find(|(text, _)| *text == name).map(|&(_, it)| it);
-    for &(text, _) in WORDS {
+    let model = |name: &str| Word::TEXTS.iter().position(|it| *it == name).map(|at| Word::ALL[at]);
+    for &text in Word::TEXTS {
         let (after, before) = (format!("{text}x"), format!("x{text}"));
         for near in [&text[..text.len() - 1], &text[1..], after.as_str(), before.as_str()] {
             assert_eq!(word(near), model(near), "{near}");
@@ -343,7 +374,7 @@ fn meta_of(attr: &str) -> ast::Meta {
 /// and `#[inline(..)]` shapes the flags look into.
 fn corpus() -> Vec<String> {
     let mut corpus = Vec::new();
-    let names = WORDS.iter().map(|&(text, _)| text).chain(["allow", "test", "x"]);
+    let names = Word::TEXTS.iter().copied().chain(["allow", "test", "x"]);
     for name in names {
         for form in [
             format!("#[{name}]"),

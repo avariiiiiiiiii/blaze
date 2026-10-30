@@ -13,7 +13,10 @@
 
 use hir::{HasAttrs as _, InFile, ModuleDef, PathResolution};
 use span::Edition;
-use syntax::{AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize, ast};
+use syntax::{
+    AstNode, SyntaxKind, SyntaxNode, TextRange, TextSize,
+    ast::{self, HasGenericArgs as _, HasGenericParams as _, HasName as _, HasTypeBounds as _},
+};
 
 use super::{
     Signature,
@@ -154,72 +157,198 @@ pub(super) fn check(cx: &Cx<'_, '_>, signature: &Signature, ty: &ast::PathType, 
     let res = per_ns
         .as_ref()
         .and_then(|it| it.type_ns.clone().or_else(|| it.value_ns.clone()).or_else(|| it.macro_ns.clone()));
-    if let Some(res) = res {
-        if segments.len() == 1
-            && is_from_outer(cx, signature, &res)
+    let single = segments.len() == 1;
+    if let Some(res) = &res {
+        if single
+            && is_from_outer(cx, signature, res)
             && let Some(diag) = outer::check(cx, signature, path, &last.name, true)
         {
             return Some(found(cx, diag, signature, current, &last.name));
         }
-        if source.is_expected(&res) {
+        if source.is_expected(res) {
             return privacy::check(cx, signature, &prefixes, &segments[offset..], current)
                 .map(|diag| found(cx, diag, signature, current, &last.name));
         }
-        let path_str = names_to_string(&segments);
-        let message = format!("expected {}, found {} `{path_str}`", source.expected(), res_descr(cx, &res));
-        let mut diag = Diag::error(Some(source.code(true)), message, span.clone());
-        diag.span_label(span, format!("not a {}", source.expected()));
-        if let PathResolution::TypeParam(param) = res
-            && let Some(at) = param_span(cx, param)
-        {
-            diag.span_label(at, "found this type parameter");
-        }
+    } else if single && let Some(diag) = outer::check(cx, signature, path, &last.name, true) {
         return Some(found(cx, diag, signature, current, &last.name));
     }
+    // What the path names in the type namespace makes the error "expected type, found ..";
+    // in another one (`smart_resolve_report_errors`' `cross_namespace_res`) it is not found.
+    let same = per_ns.as_ref().and_then(|it| it.type_ns.clone());
+    let cross = if same.is_some() { None } else { res.clone() };
+    let path_str = names_to_string(&segments);
 
-    let single = segments.len() == 1;
-    if single && let Some(diag) = outer::check(cx, signature, path, &last.name, true) {
-        return Some(found(cx, diag, signature, current, &last.name));
-    }
-    let mut expected = source.expected();
-    let mod_path = &segments[..segments.len() - 1];
-    let (tick, mod_prefix, mod_str, in_module) = match mod_path {
-        [] => ("", String::new(), "this scope".to_owned(), None),
-        [first] if first.name == ROOT && cx.edition > Edition::Edition2015 => {
-            expected = "crate";
-            ("", String::new(), "the list of imported crates".to_owned(), None)
-        }
-        [first] if first.name == ROOT || first.name == "crate" => {
-            ("", String::new(), "the crate root".to_owned(), Some(cx.krate.root_module(cx.db)))
-        }
-        _ => {
-            let prefix = match module {
-                Some(def) => format!("{} ", def_descr(cx, def).unwrap_or("module")),
-                None => String::new(),
+    let (message, base, fallback, in_module) = match &same {
+        Some(res) => (
+            format!("expected {}, found {} `{path_str}`", source.expected(), res_descr(cx, res)),
+            span.clone(),
+            format!("not a {}", source.expected()),
+            None,
+        ),
+        None => {
+            let mut expected = source.expected();
+            let mod_path = &segments[..segments.len() - 1];
+            let (tick, mod_prefix, mod_str, in_module) = match mod_path {
+                [] => ("", String::new(), "this scope".to_owned(), None),
+                [first] if first.name == ROOT && cx.edition > Edition::Edition2015 => {
+                    expected = "crate";
+                    ("", String::new(), "the list of imported crates".to_owned(), None)
+                }
+                [first] if first.name == ROOT || first.name == "crate" => {
+                    ("", String::new(), "the crate root".to_owned(), Some(cx.krate.root_module(cx.db)))
+                }
+                _ => {
+                    let prefix = match module {
+                        Some(def) => format!("{} ", def_descr(cx, def).unwrap_or("module")),
+                        None => String::new(),
+                    };
+                    ("`", prefix, names_to_string(mod_path), module_of(module))
+                }
             };
-            ("`", prefix, names_to_string(mod_path), module_of(module))
+            (
+                format!("cannot find {expected} `{}` in {mod_prefix}{tick}{mod_str}{tick}", last.name),
+                cx.span(InFile::new(file, last.range)),
+                format!("not found in {tick}{mod_str}{tick}"),
+                in_module,
+            )
         }
     };
-    let message = format!("cannot find {expected} `{}` in {mod_prefix}{tick}{mod_str}{tick}", last.name);
+    let mut diag = Diag::error(Some(source.code(res.is_some())), message, base.clone());
+    if let Some(res) = &cross {
+        diag.note(format!("{} {} named `{path_str}` exists in another namespace", res_article(cx, res), res_descr(cx, res)));
+    }
+    if let Some(PathResolution::TypeParam(param)) = same
+        && let Some(at) = param_span(cx, param)
+    {
+        diag.span_label(at, "found this type parameter");
+    }
+
+    // `try_lookup_name_relaxed`: the items of the name to import, else the enums of variants of
+    // the name, and a name of a similar spelling.
+    let own = match &res {
+        Some(PathResolution::Def(def)) => Some(*def),
+        _ => None,
+    };
+    let (accessible, inaccessible) =
+        if single { imports(cx, current, source, &last.name, own) } else { (Vec::new(), Vec::new()) };
+    let mut suggested: Vec<String> = Vec::new();
+    if accessible.is_empty() && inaccessible.is_empty() && source == Source::Type {
+        suggested = variant_enums(cx, &mut diag, current, &last.name, res.is_none(), &span);
+    }
     let at = cx.span(InFile::new(file, last.range));
-    let mut diag = Diag::error(Some(source.code(false)), message, at.clone());
-    let lookup = in_module.unwrap_or(current);
-    let suggested = typo(cx, &mut diag, path.syntax(), in_module, source, &last.name, &at);
-    if !suggested {
-        if ["true", "false"].contains(&last.name.to_lowercase().as_str()) {
+    // `lookup_typo_candidate` of a longer path looks in the module its prefix names, if any.
+    let lookup = if single { None } else { in_module.or(module_of(module)) };
+    let typo = (single || lookup.is_some())
+        && typo(cx, &mut diag, path.syntax(), lookup, source, &last.name, &at, &suggested);
+    if !typo {
+        if res.is_none() && ["true", "false"].contains(&last.name.to_lowercase().as_str()) {
             diag.suggestion_verbose(
-                at.clone(),
+                at,
                 "you may want to use a bool value instead",
                 last.name.to_lowercase(),
                 Applicability::MaybeIncorrect,
             );
         }
-        diag.span_label(at, format!("not found in {tick}{mod_str}{tick}"));
+        diag.span_label(base, fallback);
     }
-    if single {
-        import_candidates(cx, &mut diag, current, source, &last.name);
+
+    // `report_with_use_injections`: the imports, else a generic parameter to add.
+    if !accessible.is_empty() || !inaccessible.is_empty() {
+        show_imports(cx, &mut diag, current, accessible, inaccessible, res.is_some());
+    } else if res.is_none()
+        && source == Source::Type
+        && single
+        && let Some((insert, sugg)) = missing_parameter(cx, signature, path, &last.name)
+    {
+        diag.suggestion_verbose(insert, "you might be missing a type parameter", sugg, Applicability::MaybeIncorrect);
     }
-    Some(found(cx, diag, signature, lookup, &last.name))
+    Some(found(cx, diag, signature, lookup.unwrap_or(current), &last.name))
+}
+
+/// rustc's `Res::article`.
+fn res_article(cx: &Cx<'_, '_>, res: &PathResolution<'_>) -> &'static str {
+    use hir::AsAssocItem as _;
+    match res {
+        PathResolution::Def(ModuleDef::Adt(hir::Adt::Enum(_))) => "an",
+        PathResolution::Def(ModuleDef::Function(it)) if it.as_assoc_item(cx.db).is_some() => "an",
+        PathResolution::Def(ModuleDef::Const(it)) if it.as_assoc_item(cx.db).is_some() => "an",
+        PathResolution::Def(ModuleDef::Macro(it))
+            if matches!(it.kind(cx.db), hir::MacroKind::Attr | hir::MacroKind::AttrBuiltIn) =>
+        {
+            "an"
+        }
+        _ => "a",
+    }
+}
+
+/// rustc's `suggest_adding_generic_parameter` for a path of a type: a parameter of the name
+/// after the last one of the item (rustc's `current_item`), when the name is one capital and
+/// the item a function (not `main`), struct, enum or union, or the path is in the generic
+/// arguments of another and the item has generics; not where the generics hold the path.
+fn missing_parameter(cx: &Cx<'_, '_>, signature: &Signature, path: &ast::Path, name: &str) -> Option<(Span, String)> {
+    let segment = path.segment()?;
+    if segment.generic_arg_list().is_some() || name == "Self" || name == "dyn" {
+        return None;
+    }
+    let mut chars = name.chars();
+    let single_upper = chars.next().is_some_and(char::is_uppercase) && chars.next().is_none();
+    let in_args = path.syntax().ancestors().any(|it| ast::GenericArgList::can_cast(it.kind()));
+    if !in_args && !single_upper {
+        return None;
+    }
+    let item = ast::Item::cast(outer::inner_item(&signature.node.value))?;
+    let suggests = match &item {
+        ast::Item::Fn(it) if it.name().is_some_and(|it| it.text() == "main") => false,
+        ast::Item::Fn(_) | ast::Item::Enum(_) | ast::Item::Struct(_) | ast::Item::Union(_) => true,
+        ast::Item::Impl(_) => in_args || !single_upper,
+        _ => !single_upper,
+    };
+    if !suggests {
+        return None;
+    }
+    // `ItemKind::generics`: the items with generics; statics and the rest have none.
+    let generic_item = match &item {
+        ast::Item::Fn(_)
+        | ast::Item::Enum(_)
+        | ast::Item::Struct(_)
+        | ast::Item::Union(_)
+        | ast::Item::TypeAlias(_)
+        | ast::Item::Trait(_)
+        | ast::Item::TraitAlias(_)
+        | ast::Item::Impl(_)
+        | ast::Item::Const(_) => ast::AnyHasGenericParams::cast(item.syntax().clone())?,
+        _ => return None,
+    };
+    let file = signature.node.file_id;
+    let at = |range: TextRange| cx.span(InFile::new(file, TextRange::empty(range.end())));
+    let Some(list) = generic_item.generic_param_list() else {
+        let after = match ast::AnyHasName::cast(item.syntax().clone()).and_then(|it| it.name()) {
+            Some(it) => it.syntax().text_range(),
+            None => ast::Impl::cast(item.syntax().clone())?.impl_token()?.text_range(),
+        };
+        return Some((at(after), format!("<{name}>")));
+    };
+    if list.syntax().text_range().contains_range(path.syntax().text_range()) {
+        return None;
+    }
+    let Some(param) = list.generic_params().last() else {
+        return Some((at(list.syntax().text_range()), format!("<{name}>")));
+    };
+    let end = match &param {
+        ast::GenericParam::TypeParam(it) => match it.type_bound_list().and_then(|it| it.bounds().last()) {
+            Some(bound) => bound.syntax().text_range(),
+            None => it.name()?.syntax().text_range(),
+        },
+        ast::GenericParam::LifetimeParam(it) => match it.type_bound_list().and_then(|it| it.bounds().last()) {
+            Some(bound) => bound.syntax().text_range(),
+            None => it.lifetime()?.syntax().text_range(),
+        },
+        ast::GenericParam::ConstParam(it) => match it.default_val() {
+            Some(default) => default.syntax().text_range(),
+            None => it.ty()?.syntax().text_range(),
+        },
+    };
+    Some((at(end), format!(", {name}")))
 }
 
 fn found(cx: &Cx<'_, '_>, mut diag: Diag, signature: &Signature, module: hir::Module, name: &str) -> Found {
@@ -381,6 +510,7 @@ fn typo(
     source: Source,
     name: &str,
     span: &Span,
+    suggested: &[String],
 ) -> bool {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut consider = |found: &hir::Name, def: hir::ScopeDef<'_>| {
@@ -403,7 +533,7 @@ fn typo(
     candidates.sort_by(|a, b| a.name.cmp(&b.name));
     let names: Vec<&str> = candidates.iter().map(|it| it.name.as_str()).collect();
     let Some(best) = find_best_match_for_name(&names, name, None) else { return false };
-    if best == name || best == "_" {
+    if best == name || best == "_" || suggested.iter().any(|it| it == best) {
         return false;
     }
     let best = best.to_owned();
@@ -435,37 +565,131 @@ struct Import {
     def: ModuleDef,
 }
 
-/// rustc's `lookup_import_candidates` and `show_candidates` in the type namespace.
-fn import_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, source: Source, name: &str) {
-    let cfg = hir::FindPathConfig { prefer_no_std: false, prefer_prelude: false, prefer_absolute: false, allow_unstable: true };
-    let crates = std::iter::once(cx.krate).chain(cx.krate.dependencies(cx.db).into_iter().map(|it| it.krate));
+/// rustc's `lookup_import_candidates` in the type namespace: the items named `name` the place
+/// expects, other than `own` (what the path names), that `module` can and can't import.
+fn imports(
+    cx: &Cx<'_, '_>,
+    module: hir::Module,
+    source: Source,
+    name: &str,
+    own: Option<ModuleDef>,
+) -> (Vec<Import>, Vec<Import>) {
     let mut accessible: Vec<Import> = Vec::new();
     let mut inaccessible: Vec<Import> = Vec::new();
+    for (local, def) in named(cx, name) {
+        if own == Some(def) {
+            continue;
+        }
+        let Some(descr) = def_descr(cx, def).filter(|it| source.is_expected_descr(it)) else { continue };
+        match import_path(cx, module, def, local) {
+            Some(Ok((path, of_crate))) => accessible.push(Import { path, of_crate, descr, def }),
+            Some(Err(path)) => inaccessible.push(Import { path, of_crate: true, descr, def }),
+            None => {}
+        }
+    }
+    (accessible, inaccessible)
+}
+
+/// The items of the crate and its dependencies named `name`, and whether each is the crate's.
+fn named(cx: &Cx<'_, '_>, name: &str) -> Vec<(bool, ModuleDef)> {
+    let crates = std::iter::once(cx.krate).chain(cx.krate.dependencies(cx.db).into_iter().map(|it| it.krate));
+    let mut out = Vec::new();
     for krate in crates {
         let local = krate == cx.krate;
         for of in krate.modules(cx.db) {
             for def in of.declarations(cx.db) {
-                if def.name(cx.db).is_none_or(|it| it.as_str() != name) {
-                    continue;
-                }
-                let Some(descr) = def_descr(cx, def).filter(|it| source.is_expected_descr(it)) else { continue };
-                let hidden = is_doc_hidden(cx, def);
-                match module.find_use_path(cx.db, hir::ItemInNs::Types(def), hir::PrefixKind::ByCrate, cfg) {
-                    Some(path) if local || !hidden => {
-                        let path = path.display(cx.db, cx.edition).to_string();
-                        let of_crate = path.starts_with("crate::");
-                        accessible.push(Import { path: in_edition(cx, path), of_crate, descr, def });
-                    }
-                    Some(_) => {}
-                    None if local => {
-                        let path = def.canonical_path(cx.db, cx.edition).unwrap_or_else(|| name.to_owned());
-                        inaccessible.push(Import { path: in_edition(cx, format!("crate::{path}")), of_crate: true, descr, def });
-                    }
-                    None => {}
+                if def.name(cx.db).is_some_and(|it| it.as_str() == name) {
+                    out.push((local, def));
                 }
             }
         }
     }
+    out
+}
+
+/// The path `module` imports `def` by (and whether it is from the crate root), or the path of
+/// a local item it can't see; nothing for a hidden or unreachable foreign one.
+fn import_path(cx: &Cx<'_, '_>, module: hir::Module, def: ModuleDef, local: bool) -> Option<Result<(String, bool), String>> {
+    let cfg = hir::FindPathConfig { prefer_no_std: false, prefer_prelude: false, prefer_absolute: false, allow_unstable: true };
+    match module.find_use_path(cx.db, hir::ItemInNs::Types(def), hir::PrefixKind::ByCrate, cfg) {
+        Some(path) if local || !is_doc_hidden(cx, def) => {
+            let path = path.display(cx.db, cx.edition).to_string();
+            let of_crate = path.starts_with("crate::");
+            Some(Ok((in_edition(cx, path), of_crate)))
+        }
+        Some(_) => None,
+        None if local => {
+            let path = def.canonical_path(cx.db, cx.edition)?;
+            Some(Err(in_edition(cx, format!("crate::{path}"))))
+        }
+        None => None,
+    }
+}
+
+/// `try_lookup_name_relaxed`'s enums of the variants named `name`, suggested for the path at
+/// `span`; the enums' paths, which no typo then repeats.
+fn variant_enums(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, name: &str, unresolved: bool, span: &Span) -> Vec<String> {
+    let crates = std::iter::once(cx.krate).chain(cx.krate.dependencies(cx.db).into_iter().map(|it| it.krate));
+    let mut found: Vec<(String, String)> = Vec::new();
+    for krate in crates {
+        let local = krate == cx.krate;
+        for of in krate.modules(cx.db) {
+            for def in of.declarations(cx.db) {
+                let ModuleDef::Adt(hir::Adt::Enum(it)) = def else { continue };
+                for variant in it.variants(cx.db) {
+                    if variant.name(cx.db).as_str() != name {
+                        continue;
+                    }
+                    let path = match import_path(cx, module, ModuleDef::EnumVariant(variant), local) {
+                        Some(Ok((path, _))) => path,
+                        _ => continue,
+                    };
+                    let Some((enum_path, _)) = path.rsplit_once("::") else { continue };
+                    if enum_path.starts_with("std::prelude::") {
+                        continue;
+                    }
+                    found.push((path.clone(), enum_path.to_owned()));
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        return Vec::new();
+    }
+    found.sort();
+    found.dedup();
+    let preamble = if unresolved {
+        let others = match found.len() {
+            1 => String::new(),
+            2 => " and 1 other".to_owned(),
+            n => format!(" and {n} others"),
+        };
+        format!("there is an enum variant `{}`{others}; ", found[0].0)
+    } else {
+        String::new()
+    };
+    let enums: Vec<String> = found.into_iter().map(|(_, it)| it).collect();
+    diag.suggestions(
+        span.clone(),
+        format!("{preamble}try using the variant's enum"),
+        enums.clone(),
+        Applicability::MachineApplicable,
+        SuggestionStyle::ShowCode,
+    );
+    enums
+}
+
+/// rustc's `show_candidates` of the imports `lookup_import_candidates` found; `instead` when
+/// the path named something else.
+fn show_imports(
+    cx: &Cx<'_, '_>,
+    diag: &mut Diag,
+    module: hir::Module,
+    mut accessible: Vec<Import>,
+    mut inaccessible: Vec<Import>,
+    instead: bool,
+) {
+    let instead = if instead { " instead" } else { "" };
     for found in [&mut accessible, &mut inaccessible] {
         found.sort_by(|a, b| a.path.cmp(&b.path));
         found.dedup_by(|a, b| a.path == b.path);
@@ -482,11 +706,11 @@ fn import_candidates(cx: &Cx<'_, '_>, diag: &mut Diag, module: hir::Module, sour
     }
     if !accessible.is_empty() {
         let msg = match accessible.as_slice() {
-            [only] => format!("consider importing this {}", only.descr),
+            [only] => format!("consider importing this {}{instead}", only.descr),
             many => {
                 let kind = if many.iter().all(|it| it.descr == many[0].descr) { many[0].descr } else { "item" };
                 let s = if kind.ends_with('s') { "es" } else { "s" };
-                format!("consider importing one of these {kind}{s}")
+                format!("consider importing one of these {kind}{s}{instead}")
             }
         };
         match use_placement(cx, module) {

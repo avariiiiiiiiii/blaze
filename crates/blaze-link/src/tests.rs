@@ -700,3 +700,387 @@ fn line_tables_are_written_from_the_span_tables() {
     let lines = elf.section_by_name(".debug_line").unwrap();
     assert!(!lines.data().unwrap().is_empty());
 }
+
+/// The state's columns, read and written as a stage does.
+mod columns {
+    use blaze_codegen::Line;
+    use blaze_format::SpanRef;
+
+    use super::{id, key};
+    use crate::model::{Apply, Class, Fixup, Sym};
+    use crate::state::{Def, NewPiece, PieceId, State, What};
+    use crate::symbols::{SymKey, Symbols};
+
+    fn fixup(at: u64, target: Sym) -> Fixup {
+        Fixup { at, apply: Apply::Abs64, target, addend: 0, minus: None }
+    }
+
+    fn add(state: &mut State, sym: Sym, fixups: &[Fixup], what: What) -> PieceId {
+        let class = state.class_id(&Class::Data);
+        let piece = NewPiece {
+            sym,
+            class,
+            rank: 0,
+            order: [u32::MAX; 3],
+            align: 8,
+            size: 8 * fixups.len().max(1) as u64,
+            zero: false,
+            fixups,
+            weak: &[],
+            defines: &[],
+            what,
+        };
+        let id = state.add(&piece);
+        state.set_def(sym, Def::Piece { piece: id, offset: 0 });
+        id
+    }
+
+    fn refs(state: &State, sym: Sym) -> Vec<PieceId> {
+        state.refs(sym).collect()
+    }
+
+    #[test]
+    fn dense_indexes_are_distinct_and_fit_the_column() {
+        let mut symbols = Symbols::default();
+        let names: Vec<String> = (0..20_000).map(|it| format!("name{it}")).collect();
+        let keys: Vec<SymKey> = names.iter().map(|it| SymKey::Name(symbols.name(it))).collect();
+        let syms = symbols.intern_all(&keys);
+        let len = symbols.dense_len();
+        let mut seen = vec![false; len];
+        for sym in &syms {
+            let at = Symbols::dense(*sym);
+            assert!(at < len, "{at} of {len}");
+            assert!(!std::mem::replace(&mut seen[at], true), "{sym:?} shares {at}");
+        }
+        assert!(len < syms.len() * 2, "the column of {} symbols is {len} long", syms.len());
+    }
+
+    #[test]
+    fn a_clone_keeps_its_lists_when_the_original_rewrites_them() {
+        let mut symbols = Symbols::default();
+        let [a, b, c, d] = ["a", "b", "c", "d"].map(|it| symbols.sym_name(it));
+        let mut old = State::new();
+        let one = add(&mut old, a, &[fixup(0, c)], What::Shared);
+        let two = add(&mut old, b, &[fixup(0, c), fixup(8, d)], What::Shared);
+        let mut new = old.clone();
+        new.set_fixups(one, &[fixup(0, d)]);
+        let three = add(&mut new, c, &[fixup(0, a)], What::Shared);
+
+        assert_eq!(old.piece(one).unwrap().fixups(), [fixup(0, c)]);
+        assert_eq!(new.piece(one).unwrap().fixups(), [fixup(0, d)]);
+        assert_eq!(new.piece(two).unwrap().fixups(), old.piece(two).unwrap().fixups());
+        assert_eq!(old.piece_count(), 2);
+        assert!(old.piece(three).is_none());
+        assert_eq!((refs(&old, c), refs(&old, d)), (vec![one, two], vec![two]));
+        assert_eq!((refs(&new, c), refs(&new, d), refs(&new, a)), (vec![two], vec![two, one], vec![three]));
+    }
+
+    #[test]
+    fn a_removed_piece_leaves_the_referrer_lists_and_its_definitions() {
+        let mut symbols = Symbols::default();
+        let [a, b, c, target] = ["a", "b", "c", "target"].map(|it| symbols.sym_name(it));
+        let mut state = State::new();
+        let pieces = [a, b, c].map(|sym| add(&mut state, sym, &[fixup(0, target)], What::Shared));
+        assert_eq!(refs(&state, target), pieces);
+        assert!(state.remove(pieces[1]));
+        assert!(!state.remove(pieces[1]), "a piece is removed once");
+        assert_eq!(refs(&state, target), [pieces[0], pieces[2]], "the rest keep their order");
+        assert!(matches!(state.def(b), Def::None));
+        assert!(state.piece(pieces[1]).is_none());
+        assert_eq!(state.any(pieces[1]).unwrap().sym, b, "its columns are still readable");
+        let again = add(&mut state, b, &[fixup(0, target)], What::Shared);
+        assert_ne!(again, pieces[1], "piece ids are never reused");
+        assert_eq!(refs(&state, target), [pieces[0], pieces[2], again]);
+    }
+
+    #[test]
+    fn compaction_keeps_every_live_list_and_drops_the_rest() {
+        let mut symbols = Symbols::default();
+        let target = symbols.sym_name("target");
+        let mut state = State::new();
+        let lines = [Line { at: 4, span: SpanRef { anchor: id(9), index: 2 } }];
+        let function = state.add_function(key(1), symbols.id(&id(1)), None, None, &lines);
+        let body = symbols.sym_name("body");
+        let kept = add(&mut state, body, &[fixup(0, target)], What::Function(function));
+        let mut gone = Vec::new();
+        for n in 0..2_000 {
+            let sym = symbols.sym_name(&format!("gone{n}"));
+            let fixups: Vec<Fixup> = (0..64).map(|at| fixup(at * 8, target)).collect();
+            gone.push(add(&mut state, sym, &fixups, What::Shared));
+        }
+        for id in &gone {
+            state.remove(*id);
+        }
+        assert!(state.wants_compaction(), "64 Ki dead fixups outweigh one live one");
+        let before = state.clone();
+        state.compact();
+        assert!(!state.wants_compaction());
+        assert_eq!(state.piece(kept).unwrap().fixups(), [fixup(0, target)]);
+        assert_eq!(refs(&state, target), [kept]);
+        let info = *state.piece(kept).unwrap().function().unwrap();
+        let kept_lines: Vec<(u32, u32)> = state.lines(&info).iter().map(|it| (it.at, it.span.index)).collect();
+        assert_eq!(kept_lines, [(4, 2)]);
+        assert_eq!(before.piece(kept).unwrap().fixups(), [fixup(0, target)], "the clone is untouched");
+        assert_eq!(state.piece_count(), before.piece_count(), "ids stay as they were");
+    }
+
+    #[test]
+    fn cells_know_their_body_and_each_body_its_slots() {
+        let mut symbols = Symbols::default();
+        let [s0, s1, s2, f, g] = ["s0", "s1", "s2", "f", "g"].map(|it| symbols.sym_name(it));
+        let mut state = State::new();
+        let slots = [s0, s1, s2].map(|it| state.new_slot(it));
+        assert_eq!(slots, [0, 1, 2]);
+        state.set_cell(0, Some(f));
+        state.set_cell(1, Some(f));
+        state.set_cell(2, Some(g));
+        let of = |state: &State, body| {
+            let mut out: Vec<u32> = state.slots_of(body).collect();
+            out.sort_unstable();
+            out
+        };
+        assert_eq!((of(&state, f), of(&state, g)), (vec![0, 1], vec![2]));
+        let old = state.clone();
+        state.set_cell(1, Some(g));
+        state.set_cell(0, None);
+        assert_eq!((of(&state, f), of(&state, g)), (vec![], vec![1, 2]));
+        assert_eq!(state.cell(0), None);
+        assert_eq!(state.filled_cells().collect::<Vec<_>>(), [(1, g), (2, g)]);
+        assert_eq!(old.filled_cells().collect::<Vec<_>>(), [(0, f), (1, f), (2, g)], "the clone is untouched");
+        assert_eq!(of(&old, f), [0, 1]);
+    }
+}
+
+/// Native resolution kept across stages: what a stage resolves again, and what it reuses.
+mod resolution {
+    use blaze_codegen::Target;
+    use object::write::{Object as Builder, Relocation, Symbol as Def, SymbolSection};
+    use object::{
+        Architecture, BinaryFormat, Endianness, Object as _, ObjectSection as _, RelocationFlags, SectionFlags,
+        SectionKind, SymbolFlags, SymbolKind, SymbolScope, elf,
+    };
+
+    use super::{CALLER, Change, Disk, Image, Linked, Native, NativeKind, TO, function, id, key, name, output, returns};
+    use crate::native::resolution_id;
+    use crate::state::What;
+
+    fn incremental() -> crate::Output {
+        output(true)
+    }
+
+    /// An ELF object: each function its own `.text.<name>` section, returning `value`; each
+    /// constructor an `.init_array` entry pointing at one of them.
+    fn object(functions: &[(&str, u8)], constructors: &[&str]) -> Vec<u8> {
+        let mut b = Builder::new(BinaryFormat::Elf, Architecture::X86_64, Endianness::Little);
+        let mut symbols = Vec::new();
+        for (it, value) in functions {
+            let text = b.add_section(Vec::new(), format!(".text.{it}").into_bytes(), SectionKind::Text);
+            let at = b.append_section_data(text, &returns(*value), 16);
+            let sym = b.add_symbol(Def {
+                name: it.as_bytes().to_vec(),
+                value: at,
+                size: 6,
+                kind: SymbolKind::Text,
+                scope: SymbolScope::Dynamic,
+                weak: false,
+                section: SymbolSection::Section(text),
+                flags: SymbolFlags::None,
+            });
+            symbols.push((*it, sym));
+        }
+        for it in constructors {
+            let init = b.add_section(Vec::new(), b".init_array".to_vec(), SectionKind::Elf(elf::SHT_INIT_ARRAY));
+            b.section_mut(init).flags = SectionFlags::Elf { sh_flags: u64::from(elf::SHF_ALLOC | elf::SHF_WRITE) };
+            let at = b.append_section_data(init, &[0; 8], 8);
+            let symbol = symbols.iter().find(|(name, _)| name == it).expect("a constructor's function").1;
+            b.add_relocation(init, Relocation {
+                offset: at,
+                symbol,
+                addend: 0,
+                flags: RelocationFlags::Elf { r_type: elf::R_X86_64_64 },
+            })
+            .unwrap();
+        }
+        b.write().unwrap()
+    }
+
+    /// A GNU archive of `members` (name, bytes, the symbols it defines), with its symbol index.
+    fn archive(members: &[(&str, &[u8], &[&str])]) -> Vec<u8> {
+        let header = |name: &str, size: usize| format!("{name:<16}{:<12}{:<6}{:<6}{:<8}{size:<10}`\n", 0, 0, 0, 644);
+        let names: Vec<&str> = members.iter().flat_map(|it| it.2.iter().copied()).collect();
+        let index_len = 4 + 4 * names.len() + names.iter().map(|it| it.len() + 1).sum::<usize>();
+        let mut offsets = Vec::new();
+        let mut at = 8 + 60 + index_len.next_multiple_of(2);
+        for (_, bytes, defines) in members {
+            offsets.extend(defines.iter().map(|_| at as u32));
+            at += 60 + bytes.len().next_multiple_of(2);
+        }
+        let mut out = b"!<arch>\n".to_vec();
+        out.extend_from_slice(header("/", index_len).as_bytes());
+        out.extend_from_slice(&(names.len() as u32).to_be_bytes());
+        for offset in offsets {
+            out.extend_from_slice(&offset.to_be_bytes());
+        }
+        for it in &names {
+            out.extend_from_slice(it.as_bytes());
+            out.push(0);
+        }
+        if out.len() % 2 != 0 {
+            out.push(b'\n');
+        }
+        for (member, bytes, _) in members {
+            out.extend_from_slice(header(&format!("{member}/"), bytes.len()).as_bytes());
+            out.extend_from_slice(bytes);
+            if out.len() % 2 != 0 {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
+    fn native<'a>(n: u8, file: &'a str, bytes: &'a [u8], kind: NativeKind) -> Native<'a> {
+        Native { id: id(n), name: file, bytes, kind, order: u32::from(n) }
+    }
+
+    /// The live native sections of the image.
+    fn sections(image: &Image) -> usize {
+        image.state.live_pieces().filter(|it| matches!(it.what(), What::Native { .. })).count()
+    }
+
+    #[test]
+    fn a_body_edit_resolves_nothing() {
+        let object = super::c_object();
+        let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("c_helper".into()))]);
+        let (rust, rust2) = (function(2, &returns(3), Vec::new()), function(3, &returns(4), Vec::new()));
+        let mut image = Image::new(name(TO), incremental()).unwrap();
+        let mut disk = Disk::default();
+        let change = Change {
+            added: vec![&start, &rust],
+            names: vec![("_start".into(), Target::Direct(key(1))), ("rust_fn".into(), Target::Function(key(2)))],
+            debug_names: vec![(key(1), "start".into()), (key(2), "rust".into())],
+            natives: vec![native(60, "helper.o", &object, NativeKind::Object)],
+            ..Change::default()
+        };
+        disk.link(&mut image, change).unwrap();
+        let before = resolution_id(&image.state.resolved);
+        let edit = Change {
+            added: vec![&rust2],
+            removed: vec![key(2)],
+            slots: vec![(key(2), key(3))],
+            debug_names: vec![(key(3), "rust2".into())],
+            ..Change::default()
+        };
+        disk.link(&mut image, edit).unwrap();
+        assert_eq!(resolution_id(&image.state.resolved), before, "an edit of a body resolves nothing");
+        let linked = Linked::of(disk.file(TO));
+        let helper = linked.rel32(linked.symbol("start") + 1);
+        assert_eq!(linked.through_stub(linked.rel32(helper + 1)), linked.symbol("rust2"));
+    }
+
+    /// (b)'s two links: `start` calling `c_one`, then `more` calling `c_two` too.
+    fn grow(image: &mut Image, disk: &mut Disk, object: &[u8]) {
+        let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("c_one".into()))]);
+        let change = Change {
+            added: vec![&start],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            debug_names: vec![(key(1), "start".into())],
+            natives: vec![native(61, "two.o", object, NativeKind::Object)],
+            ..Change::default()
+        };
+        disk.link(image, change).unwrap();
+        let more = function(4, &CALLER, vec![super::rel32(1, Target::Extern("c_two".into()))]);
+        let change = Change { added: vec![&more], debug_names: vec![(key(4), "more".into())], ..Change::default() };
+        disk.link(image, change).unwrap();
+    }
+
+    #[test]
+    fn a_new_reference_to_a_loaded_name_grows_the_image_and_dropping_it_collects() {
+        let object = object(&[("c_one", 1), ("c_two", 2)], &[]);
+        let mut image = Image::new(name(TO), incremental()).unwrap();
+        let mut disk = Disk::default();
+        let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("c_one".into()))]);
+        let change = Change {
+            added: vec![&start],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            debug_names: vec![(key(1), "start".into())],
+            natives: vec![native(61, "two.o", &object, NativeKind::Object)],
+            ..Change::default()
+        };
+        disk.link(&mut image, change).unwrap();
+        let (first, alone) = (resolution_id(&image.state.resolved), sections(&image));
+        let a = Linked::of(disk.file(TO));
+        let one = a.rel32(a.symbol("start") + 1);
+        assert_eq!(a.at(one, 6), returns(1));
+
+        let more = function(4, &CALLER, vec![super::rel32(1, Target::Extern("c_two".into()))]);
+        let change = Change { added: vec![&more], debug_names: vec![(key(4), "more".into())], ..Change::default() };
+        disk.link(&mut image, change).unwrap();
+        let b = Linked::of(disk.file(TO));
+        let two = b.rel32(b.symbol("more") + 1);
+        assert_eq!(b.at(two, 6), returns(2), "c_two's section is in the image");
+        assert_eq!(b.rel32(b.symbol("start") + 1), one, "c_one's section did not move");
+        assert_eq!(resolution_id(&image.state.resolved), first, "a loaded name grows, not rebuilds");
+        assert_eq!(sections(&image), alone + 1);
+
+        disk.link(&mut image, Change { removed: vec![key(4)], ..Change::default() }).unwrap();
+        assert_ne!(resolution_id(&image.state.resolved), first, "dropping the last reference rebuilds");
+        assert_eq!(sections(&image), alone, "c_two's section is collected");
+    }
+
+    #[test]
+    fn an_archive_member_is_pulled_only_while_something_needs_it() {
+        let a = object(&[("need_a", 1)], &["need_a"]);
+        let b = object(&[("need_b", 2)], &["need_b"]);
+        let library = archive(&[("a.o", &a, &["need_a"]), ("b.o", &b, &["need_b"])]);
+        let mut image = Image::new(name(TO), incremental()).unwrap();
+        let mut disk = Disk::default();
+        let start = function(1, &CALLER, vec![super::rel32(1, Target::Extern("need_a".into()))]);
+        let change = Change {
+            added: vec![&start],
+            names: vec![("_start".into(), Target::Direct(key(1)))],
+            debug_names: vec![(key(1), "start".into())],
+            natives: vec![native(62, "libneed.a", &library, NativeKind::Archive { whole: false })],
+            ..Change::default()
+        };
+        disk.link(&mut image, change).unwrap();
+        let constructors = |linked: &Linked| -> Vec<u64> {
+            let elf = linked.elf();
+            let Some(init) = elf.section_by_name(".init_array") else { return Vec::new() };
+            let data = linked.at(init.address(), init.size() as usize);
+            data.chunks_exact(8).map(|it| u64::from_le_bytes(it.try_into().unwrap())).filter(|it| *it != 0).collect()
+        };
+        let first = Linked::of(disk.file(TO));
+        let need_a = first.rel32(first.symbol("start") + 1);
+        assert_eq!(first.at(need_a, 6), returns(1));
+        assert_eq!(constructors(&first), [need_a], "only a.o is pulled");
+
+        let start2 = function(5, &CALLER, vec![super::rel32(1, Target::Extern("need_b".into()))]);
+        let change = Change {
+            added: vec![&start2],
+            removed: vec![key(1)],
+            names: vec![("_start".into(), Target::Direct(key(5)))],
+            debug_names: vec![(key(5), "start2".into())],
+            ..Change::default()
+        };
+        disk.link(&mut image, change).unwrap();
+        let second = Linked::of(disk.file(TO));
+        let need_b = second.rel32(second.symbol("start2") + 1);
+        assert_eq!(second.at(need_b, 6), returns(2));
+        assert_eq!(constructors(&second), [need_b], "a stale member's constructor must not run");
+    }
+
+    #[test]
+    fn resolution_is_the_same_on_any_number_of_threads() {
+        let object = object(&[("c_one", 1), ("c_two", 2)], &[]);
+        let run = |threads: usize| {
+            let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+            pool.install(|| {
+                let mut image = Image::new(name(TO), incremental()).unwrap();
+                let mut disk = Disk::default();
+                grow(&mut image, &mut disk, &object);
+                disk.file(TO).clone()
+            })
+        };
+        assert!(run(1).same(&run(4)));
+    }
+}

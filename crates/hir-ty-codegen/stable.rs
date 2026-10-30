@@ -2,6 +2,8 @@
 //! that code compiled by one run can be found by the next. A crate of the checkout is named
 //! by what is written in it, so an edit makes other names of everything in it.
 
+#![forbid(unsafe_code)]
+
 use std::{
     cell::RefCell,
     fmt::Write,

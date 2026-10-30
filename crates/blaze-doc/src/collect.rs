@@ -1071,7 +1071,7 @@ impl Builder<'_> {
                 out.traits.push(self.impl_doc(imp, Members::WithProvided));
             }
         }
-        out.traits.sort_by_key(|it| it.header.plain());
+        out.traits.sort_by(|a, b| a.header.cmp_plain(&b.header));
         out.auto = self.auto_impls(adt);
         out.blanket = self.blanket_impls(adt);
         out.deref = self.deref_methods(adt);
@@ -1338,8 +1338,8 @@ impl Builder<'_> {
                 out.implementors.push(self.impl_doc(imp, Members::TypesAndConsts));
             }
         }
-        out.implementors.sort_by_key(|it| it.header.plain());
-        out.foreign.sort_by_key(|it| it.header.plain());
+        out.implementors.sort_by(|a, b| a.header.cmp_plain(&b.header));
+        out.foreign.sort_by(|a, b| a.header.cmp_plain(&b.header));
         out
     }
 

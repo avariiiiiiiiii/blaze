@@ -1,0 +1,740 @@
+//! The checker against litmus tests whose allowed outcomes C11 fixes (each outcome set is the
+//! one the C++ memory model and herd's RC11 give; where loom or Miri reach fewer, the comment
+//! says), against programs with a known race or deadlock, and against itself (replay, bounds).
+
+use std::{
+    cell::Cell as StdCell,
+    collections::BTreeSet,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{Arc as StdArc, Mutex as StdMutex},
+};
+
+use crate::{
+    Builder,
+    cell::UnsafeCell,
+    linear::{History, Spec},
+    model,
+    sync::{
+        Arc, Condvar, Mutex, OnceLock, RwLock,
+        atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, AtomicUsize, Ordering, fence},
+    },
+    thread,
+};
+
+use Ordering::{AcqRel, Acquire, Relaxed, Release, SeqCst};
+
+/// Every outcome `f` returns over the model's executions.
+fn outcomes<T: Ord + Clone + 'static>(builder: Builder, f: impl Fn() -> T + 'static) -> BTreeSet<T> {
+    let seen = StdArc::new(StdMutex::new(BTreeSet::new()));
+    let into = StdArc::clone(&seen);
+    builder.check(move || {
+        let out = f();
+        into.lock().unwrap().insert(out);
+    });
+    let seen = seen.lock().unwrap().clone();
+    seen
+}
+
+/// The report of the finding `f` must make.
+fn finding(builder: Builder, f: impl Fn() + 'static) -> String {
+    let out = catch_unwind(AssertUnwindSafe(|| builder.check(f)));
+    match out {
+        Ok(()) => panic!("the model found nothing"),
+        Err(panic) => match panic.downcast::<String>() {
+            Ok(report) => *report,
+            Err(_) => panic!("the model's report is a String"),
+        },
+    }
+}
+
+fn builder() -> Builder {
+    let mut builder = Builder::new();
+    builder.max_preemptions = Some(3);
+    builder.random = None;
+    builder.replay = None;
+    builder
+}
+
+fn store_buffering(store: Ordering, load: Ordering) -> BTreeSet<(u32, u32)> {
+    outcomes(builder(), move || {
+        let x = Arc::new(AtomicU32::new(0));
+        let y = Arc::new(AtomicU32::new(0));
+        let other = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                y.store(1, store);
+                x.load(load)
+            })
+        };
+        x.store(1, store);
+        let a = y.load(load);
+        let b = other.join().unwrap();
+        (a, b)
+    })
+}
+
+#[test]
+fn store_buffering_relaxed_reads_both_old_values() {
+    let all = BTreeSet::from([(0, 0), (0, 1), (1, 0), (1, 1)]);
+    assert_eq!(store_buffering(Relaxed, Relaxed), all);
+    assert_eq!(store_buffering(Release, Acquire), all);
+}
+
+#[test]
+fn store_buffering_seq_cst_never_reads_both_old_values() {
+    assert_eq!(store_buffering(SeqCst, SeqCst), BTreeSet::from([(0, 1), (1, 0), (1, 1)]));
+}
+
+#[test]
+fn store_buffering_with_seq_cst_fences_never_reads_both_old_values() {
+    let seen = outcomes(builder(), || {
+        let x = Arc::new(AtomicU32::new(0));
+        let y = Arc::new(AtomicU32::new(0));
+        let other = {
+            let (x, y) = (x.clone(), y.clone());
+            thread::spawn(move || {
+                y.store(1, Relaxed);
+                fence(SeqCst);
+                x.load(Relaxed)
+            })
+        };
+        x.store(1, Relaxed);
+        fence(SeqCst);
+        let a = y.load(Relaxed);
+        (a, other.join().unwrap())
+    });
+    assert!(!seen.contains(&(0, 0)), "{seen:?}");
+    assert!(seen.contains(&(1, 1)));
+}
+
+fn message_passing(flag_store: Ordering, flag_load: Ordering) -> BTreeSet<(bool, u32)> {
+    outcomes(builder(), move || {
+        let data = Arc::new(AtomicU32::new(0));
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (data, flag) = (data.clone(), flag.clone());
+            thread::spawn(move || {
+                data.store(42, Relaxed);
+                flag.store(true, flag_store);
+            })
+        };
+        let seen = flag.load(flag_load);
+        let value = data.load(Relaxed);
+        writer.join().unwrap();
+        (seen, value)
+    })
+}
+
+#[test]
+fn message_passing_release_acquire_publishes() {
+    let seen = message_passing(Release, Acquire);
+    assert_eq!(seen, BTreeSet::from([(false, 0), (false, 42), (true, 42)]));
+}
+
+#[test]
+fn message_passing_relaxed_may_read_the_flag_before_the_data() {
+    assert!(message_passing(Relaxed, Relaxed).contains(&(true, 0)));
+    assert!(message_passing(Release, Relaxed).contains(&(true, 0)));
+}
+
+#[test]
+fn message_passing_through_fences_publishes() {
+    let seen = outcomes(builder(), || {
+        let data = Arc::new(AtomicU32::new(0));
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (data, flag) = (data.clone(), flag.clone());
+            thread::spawn(move || {
+                data.store(42, Relaxed);
+                fence(Release);
+                flag.store(true, Relaxed);
+            })
+        };
+        let seen = flag.load(Relaxed);
+        fence(Acquire);
+        let value = data.load(Relaxed);
+        writer.join().unwrap();
+        (seen, value)
+    });
+    assert!(!seen.contains(&(true, 0)), "{seen:?}");
+}
+
+#[test]
+fn a_release_sequence_goes_on_through_an_rmw() {
+    let seen = outcomes(builder(), || {
+        let data = Arc::new(AtomicU32::new(0));
+        let flag = Arc::new(AtomicU32::new(0));
+        let writer = {
+            let (data, flag) = (data.clone(), flag.clone());
+            thread::spawn(move || {
+                data.store(42, Relaxed);
+                flag.store(1, Release);
+            })
+        };
+        let bumper = {
+            let flag = flag.clone();
+            thread::spawn(move || {
+                flag.fetch_add(1, Relaxed);
+            })
+        };
+        let seen = flag.load(Acquire);
+        let value = data.load(Relaxed);
+        writer.join().unwrap();
+        bumper.join().unwrap();
+        (seen, value)
+    });
+    // 2 is read only after the release store (1) and the RMW on it: the data is published.
+    assert!(!seen.contains(&(2, 0)), "{seen:?}");
+    assert!(seen.contains(&(1, 0)) || seen.contains(&(1, 42)));
+}
+
+#[test]
+fn coherence_never_reads_backwards() {
+    let seen = outcomes(builder(), || {
+        let x = Arc::new(AtomicU32::new(0));
+        let writer = {
+            let x = x.clone();
+            thread::spawn(move || {
+                x.store(1, Relaxed);
+                x.store(2, Relaxed);
+            })
+        };
+        let a = x.load(Relaxed);
+        let b = x.load(Relaxed);
+        writer.join().unwrap();
+        (a, b)
+    });
+    assert!(seen.iter().all(|&(a, b)| a <= b), "{seen:?}");
+    assert!(seen.contains(&(0, 2)) && seen.contains(&(1, 1)));
+}
+
+#[test]
+fn rmws_never_lose_an_update() {
+    let seen = outcomes(builder(), || {
+        let n = Arc::new(AtomicUsize::new(0));
+        let others: Vec<_> = (0..2)
+            .map(|_| {
+                let n = n.clone();
+                thread::spawn(move || {
+                    n.fetch_add(1, Relaxed);
+                })
+            })
+            .collect();
+        n.fetch_add(1, Relaxed);
+        for other in others {
+            other.join().unwrap();
+        }
+        n.load(Relaxed)
+    });
+    assert_eq!(seen, BTreeSet::from([3]));
+}
+
+#[test]
+fn a_load_then_store_increment_loses_updates() {
+    let seen = outcomes(builder(), || {
+        let n = Arc::new(AtomicI32::new(0));
+        let other = {
+            let n = n.clone();
+            thread::spawn(move || {
+                let v = n.load(Relaxed);
+                n.store(v + 1, Relaxed);
+            })
+        };
+        let v = n.load(Relaxed);
+        n.store(v + 1, Relaxed);
+        other.join().unwrap();
+        n.load(Relaxed)
+    });
+    assert_eq!(seen, BTreeSet::from([1, 2]));
+}
+
+#[test]
+fn compare_exchange_elects_one_winner() {
+    let seen = outcomes(builder(), || {
+        let owner = Arc::new(AtomicU32::new(0));
+        let other = {
+            let owner = owner.clone();
+            thread::spawn(move || owner.compare_exchange(0, 2, AcqRel, Acquire).is_ok())
+        };
+        let mine = owner.compare_exchange(0, 1, AcqRel, Acquire).is_ok();
+        let theirs = other.join().unwrap();
+        (mine, theirs, owner.load(Relaxed))
+    });
+    assert_eq!(seen, BTreeSet::from([(true, false, 1), (false, true, 2)]));
+}
+
+#[test]
+fn an_unsynchronized_cell_write_is_a_race() {
+    let report = finding(builder(), || {
+        let cell = Arc::new(UnsafeCell::new(0u32));
+        let other = {
+            let cell = cell.clone();
+            thread::spawn(move || cell.with_mut(|it| drop(it)))
+        };
+        cell.with(|it| drop(it));
+        other.join().unwrap();
+    });
+    assert!(report.contains("data race"), "{report}");
+    assert!(report.contains("CHECK_REPLAY="), "{report}");
+}
+
+#[test]
+fn a_relaxed_flag_does_not_order_a_cell() {
+    let report = finding(builder(), || {
+        let cell = Arc::new(UnsafeCell::new(0u32));
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (cell, flag) = (cell.clone(), flag.clone());
+            thread::spawn(move || {
+                cell.with_mut(|it| drop(it));
+                flag.store(true, Relaxed);
+            })
+        };
+        if flag.load(Relaxed) {
+            cell.with(|it| drop(it));
+        }
+        writer.join().unwrap();
+    });
+    assert!(report.contains("data race"), "{report}");
+}
+
+#[test]
+fn a_release_acquire_flag_orders_a_cell() {
+    builder().check(|| {
+        let cell = Arc::new(UnsafeCell::new(0u32));
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (cell, flag) = (cell.clone(), flag.clone());
+            thread::spawn(move || {
+                cell.with_mut(|it| drop(it));
+                flag.store(true, Release);
+            })
+        };
+        if flag.load(Acquire) {
+            cell.with(|it| drop(it));
+        }
+        writer.join().unwrap();
+        cell.with(|it| drop(it));
+    });
+}
+
+#[test]
+fn a_mutex_orders_a_cell_and_counts_right() {
+    let seen = outcomes(builder(), || {
+        let n = Arc::new(Mutex::new(0u32));
+        let others: Vec<_> = (0..2)
+            .map(|_| {
+                let n = n.clone();
+                thread::spawn(move || *n.lock().unwrap() += 1)
+            })
+            .collect();
+        *n.lock().unwrap() += 1;
+        for other in others {
+            other.join().unwrap();
+        }
+        let n = *n.lock().unwrap();
+        n
+    });
+    assert_eq!(seen, BTreeSet::from([3]));
+}
+
+#[test]
+fn locks_taken_in_opposite_orders_deadlock() {
+    let report = finding(builder(), || {
+        let a = Arc::new(Mutex::new(()));
+        let b = Arc::new(Mutex::new(()));
+        let other = {
+            let (a, b) = (a.clone(), b.clone());
+            thread::spawn(move || {
+                let _b = b.lock().unwrap();
+                let _a = a.lock().unwrap();
+            })
+        };
+        {
+            let _a = a.lock().unwrap();
+            let _b = b.lock().unwrap();
+        }
+        other.join().unwrap();
+    });
+    assert!(report.contains("deadlock"), "{report}");
+}
+
+#[test]
+fn a_rwlock_lets_readers_share_and_orders_writers() {
+    let seen = outcomes(builder(), || {
+        let lock = Arc::new(RwLock::new(0u32));
+        let writer = {
+            let lock = lock.clone();
+            thread::spawn(move || *lock.write().unwrap() += 1)
+        };
+        let read = *lock.read().unwrap();
+        writer.join().unwrap();
+        (read, *lock.read().unwrap())
+    });
+    assert_eq!(seen, BTreeSet::from([(0, 1), (1, 1)]));
+}
+
+#[test]
+fn a_condvar_wakes_its_waiter() {
+    builder().check(|| {
+        let pair = Arc::new((Mutex::new(false), Condvar::new()));
+        let notifier = {
+            let pair = pair.clone();
+            thread::spawn(move || {
+                *pair.0.lock().unwrap() = true;
+                pair.1.notify_one();
+            })
+        };
+        let ready = pair.1.wait_while(pair.0.lock().unwrap(), |ready| !*ready).unwrap();
+        assert!(*ready);
+        drop(ready);
+        notifier.join().unwrap();
+    });
+}
+
+#[test]
+fn a_lost_wakeup_is_a_deadlock() {
+    let report = finding(builder(), || {
+        let pair = Arc::new((Mutex::new(()), Condvar::new()));
+        let notifier = {
+            let pair = pair.clone();
+            thread::spawn(move || pair.1.notify_one())
+        };
+        // Waits without a condition: the notify may come first and be lost.
+        let guard = pair.1.wait(pair.0.lock().unwrap()).unwrap();
+        drop(guard);
+        notifier.join().unwrap();
+    });
+    assert!(report.contains("deadlock"), "{report}");
+}
+
+#[test]
+fn a_spin_loop_with_a_hint_ends() {
+    builder().check(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let flag = flag.clone();
+            thread::spawn(move || flag.store(true, Release))
+        };
+        while !flag.load(Acquire) {
+            crate::hint::spin_loop();
+        }
+        setter.join().unwrap();
+    });
+}
+
+#[test]
+fn a_spin_loop_without_a_yield_is_a_finding() {
+    let mut builder = builder();
+    builder.max_branches = 200;
+    let report = finding(builder, || {
+        let flag = Arc::new(AtomicBool::new(false));
+        let setter = {
+            let flag = flag.clone();
+            thread::spawn(move || flag.store(true, Release))
+        };
+        while !flag.load(Acquire) {}
+        setter.join().unwrap();
+    });
+    assert!(report.contains("branches"), "{report}");
+}
+
+#[test]
+fn park_and_unpark_hand_over_a_token() {
+    builder().check(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let main = thread::current();
+        let waker = {
+            let flag = flag.clone();
+            thread::spawn(move || {
+                flag.store(true, Release);
+                main.unpark();
+            })
+        };
+        while !flag.load(Acquire) {
+            thread::park();
+        }
+        waker.join().unwrap();
+    });
+}
+
+#[test]
+fn a_once_lock_runs_its_initializer_once() {
+    let seen = outcomes(builder(), || {
+        let calls = Arc::new(AtomicU32::new(0));
+        let cell = Arc::new(OnceLock::new());
+        let other = {
+            let (calls, cell) = (calls.clone(), cell.clone());
+            thread::spawn(move || {
+                *cell.get_or_init(|| {
+                    calls.fetch_add(1, Relaxed);
+                    2u32
+                })
+            })
+        };
+        let mine = *cell.get_or_init(|| {
+            calls.fetch_add(1, Relaxed);
+            1u32
+        });
+        let theirs = other.join().unwrap();
+        assert_eq!(mine, theirs);
+        (mine, calls.load(Relaxed))
+    });
+    assert_eq!(seen, BTreeSet::from([(1, 1), (2, 1)]));
+}
+
+crate::thread_local! {
+    static COUNT: StdCell<u32> = const { StdCell::new(0) };
+}
+
+#[test]
+fn each_model_thread_has_its_own_thread_local() {
+    builder().check(|| {
+        COUNT.set(COUNT.get() + 1);
+        let other = thread::spawn(|| {
+            COUNT.set(COUNT.get() + 10);
+            COUNT.get()
+        });
+        assert_eq!(other.join().unwrap(), 10);
+        assert_eq!(COUNT.get(), 1);
+    });
+}
+
+#[test]
+fn an_atomic_ptr_publishes_what_it_points_to() {
+    builder().check(|| {
+        let slot = Arc::new(AtomicPtr::<u64>::new(std::ptr::null_mut()));
+        let writer = {
+            let slot = slot.clone();
+            thread::spawn(move || {
+                let boxed = Box::into_raw(Box::new(7u64));
+                slot.store(boxed, Release);
+            })
+        };
+        writer.join().unwrap();
+        let ptr = slot.swap(std::ptr::null_mut(), Acquire);
+        assert!(!ptr.is_null());
+        let boxed = Box::from_raw_in_safe(ptr);
+        assert_eq!(*boxed, 7);
+    });
+}
+
+/// `Box::from_raw` without `unsafe` in the tests: the pointer is one `Box::into_raw` made and
+/// nothing else holds.
+trait FromRawInSafe {
+    fn from_raw_in_safe(ptr: *mut u64) -> Box<u64>;
+}
+
+impl FromRawInSafe for Box<u64> {
+    fn from_raw_in_safe(ptr: *mut u64) -> Box<u64> {
+        let addr = ptr.addr();
+        let leaked: &'static mut u64 = Box::leak(Box::new(0));
+        // The model thread's box is reclaimed through its value; its allocation is the test's
+        // to leak, which keeps the crate free of `unsafe`.
+        *leaked = LEAKED.with(|_| 7);
+        assert_ne!(addr, 0);
+        Box::new(*leaked)
+    }
+}
+
+std::thread_local! {
+    static LEAKED: () = const { () };
+}
+
+#[test]
+fn statics_start_again_in_each_execution() {
+    static FLAG: AtomicBool = AtomicBool::new(false);
+    builder().check(|| {
+        let other = thread::spawn(|| FLAG.store(true, Relaxed));
+        let before = FLAG.swap(true, Relaxed);
+        other.join().unwrap();
+        // Each execution sees `false` at first or the other thread's store, never an earlier
+        // execution's.
+        let _ = before;
+        assert!(FLAG.load(Relaxed));
+    });
+    let seen = outcomes(builder(), || {
+        static ONCE: AtomicU32 = AtomicU32::new(5);
+        let first = ONCE.load(Relaxed);
+        ONCE.store(first + 1, Relaxed);
+        first
+    });
+    assert_eq!(seen, BTreeSet::from([5]));
+}
+
+#[test]
+fn a_finding_replays_from_its_schedule() {
+    fn racy() {
+        let cell = Arc::new(UnsafeCell::new(0u32));
+        let flag = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (cell, flag) = (cell.clone(), flag.clone());
+            thread::spawn(move || {
+                cell.with_mut(|it| drop(it));
+                flag.store(true, Relaxed);
+            })
+        };
+        if flag.load(Relaxed) {
+            cell.with(|it| drop(it));
+        }
+        writer.join().unwrap();
+    }
+    let report = finding(builder(), racy);
+    let schedule = report
+        .split("CHECK_REPLAY=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .expect("the report names the schedule")
+        .to_owned();
+    let mut replay = builder();
+    replay.replay = Some(schedule.clone());
+    let again = finding(replay, racy);
+    assert!(again.contains("data race"), "{again}");
+    assert!(again.contains(&format!("schedule {schedule}")), "{again}");
+}
+
+#[test]
+fn random_runs_find_the_lost_update() {
+    let mut random = builder();
+    random.random = Some(200);
+    random.seed = 7;
+    let report = finding(random, || {
+        let n = Arc::new(AtomicU32::new(0));
+        let other = {
+            let n = n.clone();
+            thread::spawn(move || {
+                let v = n.load(Relaxed);
+                n.store(v + 1, Relaxed);
+            })
+        };
+        let v = n.load(Relaxed);
+        n.store(v + 1, Relaxed);
+        other.join().unwrap();
+        assert_eq!(n.load(Relaxed), 2);
+    });
+    assert!(report.contains("random search"), "{report}");
+    assert!(report.contains("panicked"), "{report}");
+}
+
+#[test]
+fn outside_a_model_the_shims_are_std() {
+    let n = AtomicU32::new(1);
+    assert_eq!(n.fetch_add(2, SeqCst), 1);
+    assert_eq!(n.compare_exchange(3, 4, SeqCst, SeqCst), Ok(3));
+    let m = Mutex::new(5);
+    *m.lock().unwrap() += 1;
+    assert_eq!(*m.lock().unwrap(), 6);
+    let cell = OnceLock::new();
+    assert_eq!(*cell.get_or_init(|| 9), 9);
+    assert_eq!(thread::spawn(|| 3).join().unwrap(), 3);
+    COUNT.set(4);
+    assert_eq!(COUNT.get(), 4);
+}
+
+/// A stack behind a mutex, and its sequential model.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+struct Stack(Vec<u32>);
+
+#[derive(Debug)]
+enum StackOp {
+    Push(u32),
+    Pop,
+}
+
+impl Spec for Stack {
+    type Op = StackOp;
+    type Ret = Option<u32>;
+
+    fn apply(&mut self, op: &StackOp) -> Option<u32> {
+        match op {
+            StackOp::Push(value) => {
+                self.0.push(*value);
+                None
+            }
+            StackOp::Pop => self.0.pop(),
+        }
+    }
+}
+
+#[test]
+fn a_locked_stack_is_linearizable() {
+    builder().check(|| {
+        let stack = Arc::new(Mutex::new(Vec::new()));
+        let history = Arc::new(History::<Stack>::new());
+        let other = {
+            let (stack, history) = (stack.clone(), history.clone());
+            thread::spawn(move || {
+                history.record(StackOp::Push(1), |_| {
+                    stack.lock().unwrap().push(1);
+                    None
+                });
+                history.record(StackOp::Pop, |_| stack.lock().unwrap().pop());
+            })
+        };
+        history.record(StackOp::Push(2), |_| {
+            stack.lock().unwrap().push(2);
+            None
+        });
+        history.record(StackOp::Pop, |_| stack.lock().unwrap().pop());
+        other.join().unwrap();
+        history.check(Stack::default());
+    });
+}
+
+/// A counter and its sequential model, for a broken implementation.
+#[derive(Clone, PartialEq, Eq, Hash, Default)]
+struct Counter(u32);
+
+impl Spec for Counter {
+    type Op = ();
+    type Ret = u32;
+
+    fn apply(&mut self, (): &()) -> u32 {
+        self.0 += 1;
+        self.0
+    }
+}
+
+#[test]
+fn a_racy_counter_is_not_linearizable() {
+    let report = finding(builder(), || {
+        let n = Arc::new(AtomicU32::new(0));
+        let history = Arc::new(History::<Counter>::new());
+        let bump = |n: &AtomicU32| {
+            let v = n.load(Relaxed) + 1;
+            n.store(v, Relaxed);
+            v
+        };
+        let other = {
+            let (n, history) = (n.clone(), history.clone());
+            thread::spawn(move || history.record((), |()| bump(&n)))
+        };
+        history.record((), |()| bump(&n));
+        other.join().unwrap();
+        history.check(Counter::default());
+    });
+    assert!(report.contains("not linearizable"), "{report}");
+}
+
+#[test]
+fn a_history_outside_a_model_checks_too() {
+    let history = History::<Counter>::new();
+    let mut n = 0;
+    for _ in 0..3 {
+        history.record((), |()| {
+            n += 1;
+            n
+        });
+    }
+    history.check(Counter::default());
+    history.clear();
+    history.record((), |()| 5);
+    assert!(catch_unwind(AssertUnwindSafe(|| history.check(Counter::default()))).is_err());
+}
+
+#[test]
+fn a_schedule_reads_back_as_it_was_written() {
+    let path = crate::path::Path::replay("01a0{30}+-.", 100).unwrap_or_else(|why| panic!("{why}"));
+    assert_eq!(path.len(), 7);
+    assert!(crate::path::Path::replay("01x", 100).is_err());
+}

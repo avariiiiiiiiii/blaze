@@ -5,6 +5,8 @@
 //!
 //! Nothing of it runs until [`watch`] is given somewhere to say it.
 
+#![forbid(unsafe_code)]
+
 use std::{
     hash::{Hash, Hasher},
     sync::{

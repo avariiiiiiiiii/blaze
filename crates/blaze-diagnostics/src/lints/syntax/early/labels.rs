@@ -4,10 +4,9 @@
 //! `unused_labels` costs one pass over each body's expression column, a buffer of the labels it
 //! declares and a bitset over its dense `u32` label indices of those used, both reused across
 //! bodies: no hashing, nothing allocated per label (rustc keeps an `FxIndexMap` of every label it
-//! declares). The shadowing check runs inside the
-//! early pass's one walk (`builtin::lints`) and walks up from each label without collecting its
-//! ancestors; its names are compared in place, and a context is computed only once two names
-//! match.
+//! declares). The shadowing check runs inside the early pass's one walk (`super::lints`) and
+//! walks up from each label without collecting its ancestors; its names are compared in place,
+//! and a context is computed only once two names match.
 //!
 //! Follows rustc's `compiler/rustc_resolve/src/late.rs` (`with_resolved_label`, `resolve_label`,
 //! `resolve_block`) and `compiler/rustc_resolve/src/late/diagnostics.rs`
@@ -25,7 +24,7 @@ use super::ctxt;
 use crate::{
     cx::Cx,
     lints::syntax::{Emitted, Pass, Tree, source_fact},
-    lower::{Found, Phase},
+    lower::Phase,
     model::{Diag, Level, MultiSpan},
 };
 
@@ -111,7 +110,7 @@ pub(super) fn shadowing(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &m
     diag.span_label(cx.span(orig), "first declared here");
     diag.span_label(shadower, format!("label `{name}` already in scope"));
     source_fact(cx, &mut diag, labeled.map(|it| SyntaxNodePtr::new(&it)));
-    out.push(Emitted { found: Found::new(diag, Phase::Resolve), pass: Pass::Buffered });
+    out.push(Emitted::unplaced(diag, Phase::Resolve, Pass::Buffered));
 }
 
 /// rustc's `resolve_label` from the label ribs enclosing `labeled`: the range of the lifetime of

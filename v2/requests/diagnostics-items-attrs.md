@@ -15,3 +15,5 @@ of the lints sibling, rather than copying them:
 
 Why: the errors of `parse_attribute_list` (target errors, crate-level errors) are built from
 the same pieces as its lints, and must name the same targets in the same words.
+
+> forwarded to diagnostics: a sibling's files in lane diagnostics.

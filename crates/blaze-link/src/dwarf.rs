@@ -10,6 +10,8 @@
 
 use std::ops::Range;
 
+use blaze_ids::radix;
+
 use crate::unwind::{sleb, uleb};
 
 /// A placed function's debug view: its rows are `rows[lines]` of [`sections`]' rows.
@@ -84,7 +86,7 @@ pub(crate) fn sections(
         }
     }
     let mut order: Vec<u32> = (0..functions.len() as u32).collect();
-    order.sort_unstable_by_key(|it| functions[*it as usize].addr);
+    radix::sort_copy_by_key(&mut order, |it| functions[*it as usize].addr);
     let asz = usize::from(address_size);
     let addr = |out: &mut Vec<u8>, value: u64| -> Result<(), String> {
         match address_size {

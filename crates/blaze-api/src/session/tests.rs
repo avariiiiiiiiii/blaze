@@ -145,6 +145,7 @@ fn test_result(outcome: TestOutcome) -> Response {
     Response::TestResult(TestResult {
         binary: "tests".to_owned(),
         name: "a_test".to_owned(),
+        cached: None,
         outcome,
         output: Vec::new(),
         millis: 1,
@@ -321,6 +322,23 @@ fn opens_are_counted_and_each_needs_a_close() {
     assert_eq!(world.request(1, 4, Request::Close { root }), [done(1, 4, true)]);
     let replies = world.request(1, 5, Request::Close { root });
     assert_eq!(error_at(&replies), Some(format!("root {root:x}")));
+    assert_eq!(world.session.views(), 0);
+}
+
+#[test]
+fn a_gone_connection_closes_every_view_it_holds_of_every_root_and_no_other() {
+    let mut world = World::new();
+    let empty = world.vfs.empty();
+    let other = world.commit(&[("src/lib.rs", "fn f() {}")]);
+    for id in 1..=3 {
+        world.request(1, id, Request::Open { view: ViewRef::Root(View { root: empty }) });
+        world.request(1, 10 + id, Request::Open { view: ViewRef::Root(View { root: other }) });
+    }
+    world.request(2, 1, Request::Open { view: ViewRef::Root(View { root: other }) });
+    assert_eq!(world.session.views(), 7);
+    assert_eq!(world.gone(1), []);
+    assert_eq!(world.session.views(), 1);
+    assert_eq!(world.request(2, 2, Request::Close { root: other }), [done(2, 2, true)]);
     assert_eq!(world.session.views(), 0);
 }
 

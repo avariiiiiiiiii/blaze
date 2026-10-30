@@ -176,27 +176,38 @@ pub fn every_body(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefWithBodyId> {
 /// anything reaches them ([`may_declare_roots`]), and those declared in them that may too: the
 /// only bodies of a dependency a build lowers before codegen reaches them. Lowers no other body.
 pub fn bodies_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefWithBodyId> {
+    let mut bodies = Vec::new();
+    walk_bodies_saying(db, krate, Look::Roots, |owner, _| bodies.push(owner));
+    bodies
+}
+
+/// Visits the bodies of `krate` whose text may say what `look` looks for ([`Look::may_say`]),
+/// each with its blocks, and in turn those declared in them that may too. Lowers no other body.
+pub(crate) fn walk_bodies_saying<'db>(
+    db: &'db dyn SourceDatabase,
+    krate: Crate,
+    look: Look,
+    mut each: impl FnMut(DefWithBodyId, &BodyBlocks<'db>),
+) {
     // The macros of the blocks lowered so far: a `macro_rules!` of a block is seen by the
     // bodies declared in it, which are visited after it. Seen by the others too, which only
     // lowers more.
     let local = std::cell::RefCell::new(FxHashSet::<SmolStr>::default());
-    let mut bodies = Vec::new();
     let roots = crate_body_owners(db, krate);
     walk_bodies(
         db,
         roots,
-        |owner| may_declare_roots_with(db, owner, &local.borrow()),
+        |owner| look.may_say(db, owner, &local.borrow()),
         |owner, blocks| {
-            bodies.push(owner);
+            each(owner, blocks);
             for &(_, def_map) in &blocks.blocks {
                 for (_, module) in def_map.modules(db) {
-                    let found = declaring_macros_of_scope(db, module.scope(db), &local.borrow());
+                    let found = look.macros_of_scope(db, module.scope(db), &local.borrow());
                     local.borrow_mut().extend(found.iter().map(|it| SmolStr::new(it.as_str())));
                 }
             }
         },
     );
-    bodies
 }
 
 /// The body that `block` is in. Found from the syntax around the block, up to the innermost
@@ -206,9 +217,10 @@ pub fn bodies_declaring_roots(db: &dyn SourceDatabase, krate: Crate) -> Vec<DefW
 /// field's default) is in no body.
 pub fn block_owner(db: &dyn SourceDatabase, block: BlockId) -> Result<DefWithBodyId, String> {
     let item = owning_item(db, block.ast_id(db))?;
-    // SAFETY: the id was read from `db` in this computation and is used only while `db` is borrowed
-    // (as a key or in this query's result); salsa deletes a tracked struct only when the query that
-    // made it reruns, which reruns this one too.
+    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in.
+    // `module` and `outer` are locals of this walk, only asked for their def maps, scopes and
+    // blocks with `db` (where `DefMap::module` keys a query with one, only hashed and compared),
+    // and dropped before `block_owner` returns a `DefWithBodyId`; nothing else stores them.
     let mut module = unsafe { block.module(db).to_static() };
     let owner = loop {
         if let Some(owner) = owner_in_module(db, module, item) {
@@ -216,9 +228,7 @@ pub fn block_owner(db: &dyn SourceDatabase, block: BlockId) -> Result<DefWithBod
         }
         // The module of a block in a block of the same body is the outer block's.
         let outer = match module.block(db) {
-            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
-            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
-            // when the query that made it reruns, which reruns this one too.
+            // SAFETY: as for `module` above: a local of this walk, never stored.
             Some(outer) if module.is_block_module(db) => unsafe { outer.to_static() },
             _ => {
                 return Err(format!(
@@ -227,9 +237,7 @@ pub fn block_owner(db: &dyn SourceDatabase, block: BlockId) -> Result<DefWithBod
                 ));
             }
         };
-        // SAFETY: the id was read from `db` in this computation and is used only while `db` is
-        // borrowed (as a key or in this query's result); salsa deletes a tracked struct only when
-        // the query that made it reruns, which reruns this one too.
+        // SAFETY: as for `module` above: a local of this walk, never stored.
         module = unsafe { outer.module(db).to_static() };
     };
     if !Body::of(db, owner).blocks(db).any(|(it, _)| it == block) {
@@ -331,8 +339,107 @@ const ROOT_WORDS: &[&str] = &[
     "GlobalAlloc",
 ];
 
-fn is_root_word(text: &str) -> bool {
-    ROOT_WORDS.contains(&text.strip_prefix("r#").unwrap_or(text))
+/// What a scan of bodies' text looks for, to lower only the bodies that may declare such an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Look {
+    /// An item a build keeps whether or not anything reaches it: [`ROOT_WORDS`].
+    Roots,
+    /// An item with a diagnostic item, `#[rustc_diagnostic_item = ".."]`.
+    DiagnosticItems,
+}
+
+impl Look {
+    /// Whether `word`, an identifier without `r#`, is one this looks for.
+    fn says(self, word: &str) -> bool {
+        match self {
+            Look::Roots => ROOT_WORDS.contains(&word),
+            Look::DiagnosticItems => word == "rustc_diagnostic_item",
+        }
+    }
+
+    /// The names of the macros of `krate` and its dependencies that may write such an item.
+    fn macros(self, db: &dyn SourceDatabase, krate: Crate) -> &[Symbol] {
+        match self {
+            Look::Roots => macros_declaring_roots(db, krate),
+            Look::DiagnosticItems => macros_writing_diagnostic_items(db, krate),
+        }
+    }
+
+    /// Whether the body of `owner` may declare such an item: its text says a word this looks
+    /// for, or names a macro of its crate, of a crate it depends on (`Look::macros`) or of the
+    /// blocks around it (`local`) that may write one. Reads the body's syntax and lowers no body.
+    fn may_say(
+        self,
+        db: &dyn SourceDatabase,
+        owner: DefWithBodyId,
+        local: &FxHashSet<SmolStr>,
+    ) -> bool {
+        let Some(body) = body_syntax(db, owner) else { return false };
+        let declaring = self.macros(db, owner.module(db).krate(db));
+        any_word(&body, |word| {
+            self.says(word)
+                || local.contains(word)
+                || declaring.binary_search_by(|it| it.as_str().cmp(word)).is_ok()
+        })
+    }
+
+    /// The macros of `scope`, by every name it has them under, that may write such an item,
+    /// given that those named in `declaring` may.
+    fn macros_of_scope(
+        self,
+        db: &dyn SourceDatabase,
+        scope: &ItemScope,
+        declaring: &FxHashSet<SmolStr>,
+    ) -> Vec<Symbol> {
+        let mut found = Vec::new();
+        let mut calling = Vec::new();
+        for (name, id) in scope_macros(scope) {
+            self.classify(db, name, id, &mut found, &mut calling);
+        }
+        settle(found, calling, |word| declaring.contains(word.as_str()))
+    }
+
+    fn classify(
+        self,
+        db: &dyn SourceDatabase,
+        name: Symbol,
+        id: MacroId,
+        found: &mut Vec<Symbol>,
+        calling: &mut Vec<(Symbol, Vec<Symbol>)>,
+    ) {
+        match macro_text(db, id) {
+            MacroText::Anything => found.push(name),
+            MacroText::Nothing => {}
+            MacroText::Words(words) if words.iter().any(|it| self.says(it.as_str())) => {
+                found.push(name)
+            }
+            MacroText::Words(words) => calling.push((name, words)),
+        }
+    }
+
+    /// [`macros_declaring_roots`] and [`macros_writing_diagnostic_items`]: the macros of
+    /// `krate` that may write such an item, with those of its dependencies.
+    fn crate_macros(self, db: &dyn SourceDatabase, krate: Crate) -> Box<[Symbol]> {
+        let mut known: FxHashSet<Symbol> = FxHashSet::default();
+        for dep in &krate.data(db).dependencies {
+            known.extend(self.macros(db, dep.crate_id).iter().cloned());
+        }
+        let mut found = Vec::new();
+        let mut calling = Vec::new();
+        let mut seen = FxHashSet::default();
+        for (_, module) in crate_def_map(db, krate).modules(db) {
+            for (name, id) in scope_macros(module.scope(db)) {
+                if seen.insert((name.clone(), id)) {
+                    self.classify(db, name, id, &mut found, &mut calling);
+                }
+            }
+        }
+        let settled = settle(found, calling, |word| known.contains(word));
+        known.extend(settled);
+        let mut names: Vec<Symbol> = known.into_iter().collect();
+        names.sort_unstable_by(Symbol::cmp_order);
+        names.into()
+    }
 }
 
 /// Whether `f` accepts a word of `node`: an identifier, but those of a macro's metavariables
@@ -402,9 +509,10 @@ fn may_declare_roots_with(
     let Some(body) = body_syntax(db, owner) else { return false };
     let declaring = macros_declaring_roots(db, owner.module(db).krate(db));
     any_word(&body, |word| {
-        is_root_word(word)
-            || local.contains(word)
-            || declaring.binary_search_by(|it| it.as_str().cmp(word)).is_ok()
+        is_root_word(word) || local.contains(word) || {
+            let key = intern::order_key(word.as_bytes());
+            declaring.binary_search_by(|it| it.order_key().cmp(&key).then_with(|| it.as_str().cmp(word))).is_ok()
+        }
     })
 }
 

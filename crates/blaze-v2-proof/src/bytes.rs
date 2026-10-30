@@ -8,6 +8,8 @@
 //! tail is compared by one last vector that overlaps the bytes already found equal, so no path
 //! drops to a byte loop except on inputs shorter than one vector.
 
+#![allow(unsafe_code)]
+
 use std::{fs::File, io, path::Path, sync::OnceLock};
 
 /// A way to compare, in the order [`fastest`] prefers them.

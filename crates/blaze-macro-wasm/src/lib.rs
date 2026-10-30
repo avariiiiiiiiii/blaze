@@ -200,7 +200,11 @@ impl State {
     fn ask(&mut self, req: SubRequest) -> Option<SubResponse> {
         self.asked = true;
         let db = self.db?;
-        // SAFETY: see `Db`.
+        // SAFETY: `self.db` is `Some` only inside `Session::run`, which set it from a
+        // `&dyn SourceDatabase` borrowed for that call and clears it before returning or
+        // resuming an unwind; host functions, this one's callers, run only synchronously
+        // inside it, on its thread. So the database is live and only shared-borrowed here;
+        // read after `run`, the pointer would dangle.
         Some(load_cargo::answer(unsafe { &*db.0 }, req))
     }
 
@@ -208,7 +212,8 @@ impl State {
     /// the expansion is not to be kept when the span has an anchor or a context the input has
     /// not.
     fn ask_value(&mut self, value: Value, span: Span) -> Option<SubResponse> {
-        // SAFETY: see `Db`.
+        // SAFETY: as in `ask`: `self.db` is `Some` only while `Session::run` holds the database
+        // it points to, and this runs only inside that call, on its thread.
         let answer = self.db.map(|db| load_cargo::answer(unsafe { &*db.0 }, value.request(span)));
         let anchor = self.anchors.iter().position(|it| *it == span.anchor);
         let context = self.contexts.iter().position(|it| *it == span.ctx);
@@ -391,7 +396,11 @@ fn join(state: &mut State, first: Span, second: Span) -> Option<Span> {
             file_id: first.anchor.file_id,
             ast_id: ErasedFileAstId::from_raw(it.ast_id),
         };
-        // SAFETY: the context is one the database gave.
+        // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts:
+        // `it.ctx` is what `load_cargo::answer` read from the running expansion's database for
+        // this join (`state.ask`), in this process. Memory safety doesn't rest on it: a wrong
+        // value panics in `from_u32` or in salsa's checked lookup, or names another context's
+        // hygiene.
         let ctx = unsafe { SyntaxContext::from_u32(it.ctx) };
         return Some(Span { range: range(it.start, it.end), anchor, ctx });
     }
@@ -410,7 +419,10 @@ fn spanned(file_id: u32, ast_id: u32, start: u32, end: u32, ctx: u32) -> Span {
         file_id: EditionedFileId::from_raw(file_id),
         ast_id: ErasedFileAstId::from_raw(ast_id),
     };
-    // SAFETY: the context is one the database gave.
+    // SAFETY: `from_u32` asks for a value `into_u32` gave of this database's contexts: every
+    // caller passes a `ctx` that `load_cargo::answer` read from the running expansion's database
+    // in this process. Memory safety doesn't rest on it: a wrong value panics in `from_u32` or
+    // in salsa's checked lookup, or names another context's hygiene.
     Span { range: range(start, end), anchor, ctx: unsafe { SyntaxContext::from_u32(ctx) } }
 }
 

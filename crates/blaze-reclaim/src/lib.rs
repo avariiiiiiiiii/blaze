@@ -90,8 +90,10 @@ fn claim() -> &'static Slot {
                     // SAFETY: `new` is now linked on, so leaked for the process.
                     Ok(_) => unsafe { &*new },
                     Err(other) => {
-                        // SAFETY: `new` was never published; `other` is a linked, leaked block.
+                        // SAFETY: `new` was never published, so this is its only owner.
                         drop(unsafe { Box::from_raw(new) });
+                        // SAFETY: `other` is the block another thread linked on: leaked with
+                        // `Box::into_raw` and never freed, so it lives for the process.
                         unsafe { &*other }
                     }
                 }

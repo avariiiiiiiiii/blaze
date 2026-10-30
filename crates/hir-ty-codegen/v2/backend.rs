@@ -199,12 +199,14 @@ impl Backends<'_> {
                 colocate(&mut pending.func, &places, placer.refs());
             }
         }
+        let inlined = super::frontend::inlined(db, hashes, instance).map_err(fail)?;
         let function = Function {
             code,
             places,
             spans,
             variables,
             scopes,
+            inlined,
             hint: hint(db, instance),
             release: Default::default(),
             foldable: foldable(db, instance),
@@ -334,7 +336,7 @@ fn scoped(
     let outermost = scopes.scope_chain(scopes.scope_for(body.root_expr())).last();
     // The scope of each binding told of, and of no other: the walk stops once all are found.
     let mut wanted: SmallVec<[BindingId; 16]> = variables.iter().map(|it| it.binding).collect();
-    wanted.sort_unstable();
+    blaze_ids::radix::sort_copy_by_key(&mut wanted, |it| it.into_raw().into_u32());
     wanted.dedup();
     let mut bound = FxHashMap::with_capacity_and_hasher(wanted.len(), Default::default());
     let mut seen = FxHashSet::default();
@@ -392,14 +394,13 @@ fn scoped(
     };
     let mut of_span = Vec::with_capacity(spans.len());
     of_span.extend(spans.iter().map(|span| match *span {
-            MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => innermost(scopes.scope_for(expr)),
-            MirSpan::PatId(pat) => match tried.get(&pat) {
-                Some(&of) => innermost(scopes.scope_for(of)),
-                None => side::SpanScope::Before,
-            },
-            _ => side::SpanScope::Before,
-        })
-        .collect();
+        MirSpan::ExprId(expr) | MirSpan::ExprEnd(expr) => innermost(scopes.scope_for(expr)),
+        MirSpan::PatId(pat) => match tried.get(&pat) {
+            Some(&of) => innermost(scopes.scope_for(of)),
+            None => side::SpanScope::Before,
+        },
+        _ => side::SpanScope::Before,
+    }));
     (side::Scopes { parents, of_span }, of_binding)
 }
 
@@ -458,7 +459,7 @@ fn colocate(func: &mut ir::Function, places: &Places, refs: &[Ref]) {
 /// Compiles a prepared function with Cranelift, against `refs`.
 pub(crate) fn emit_cranelift(
     unit: &Unit,
-    mut function: Box<Function>,
+    function: Box<Function>,
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
     if function.places.refs as usize != refs.len() {
@@ -471,15 +472,14 @@ pub(crate) fn emit_cranelift(
             ),
         ));
     }
-    let Function { code, places, spans, variables, scopes, .. } = &mut *function;
-    let named = Named { spans, variables, scopes };
+    let Function { code, places, spans, variables, scopes, .. } = *function;
+    let named = Named { spans: &spans, variables: &variables, scopes: &scopes };
     match code {
         Built::Ir(pending) => {
-            let func = std::mem::replace(&mut pending.func, ir::Function::new());
-            let code = compiled(unit, func, &pending.named)?;
-            told(unit, places, &pending.wants.requests, &code, refs, named)
+            let code = compiled(unit, pending.func, &pending.named)?;
+            told(unit, &places, &pending.wants.requests, code, refs, named)
         }
-        Built::Assembled(code, requests) => told(unit, places, requests, code, refs, named),
+        Built::Assembled(code, requests) => told(unit, &places, &requests, code, refs, named),
     }
 }
 
@@ -502,7 +502,7 @@ impl Function {
 pub(crate) fn emitted(
     unit: &Unit,
     function: &Function,
-    code: &fragment::Code,
+    code: fragment::Code,
     refs: &Refs,
 ) -> Result<Emitted, CodegenError> {
     told(unit, &function.places, function.requests(), code, refs, function.named())
@@ -512,7 +512,7 @@ fn told(
     unit: &Unit,
     places: &Places,
     requests: &Requests,
-    code: &fragment::Code,
+    code: fragment::Code,
     refs: &Refs,
     Named { spans, variables, scopes }: Named<'_>,
 ) -> Result<Emitted, CodegenError> {
@@ -525,7 +525,7 @@ fn told(
         )));
     }
     let isa = isa(unit)?;
-    let side = side::of(variables, scopes, code).map_err(fail)?;
+    let side = side::of(variables, scopes, &code).map_err(fail)?;
     let compiled = resolve(places, refs, |resolve| {
         super::convert::function(
             unit.instance.key(),
@@ -539,7 +539,7 @@ fn told(
         )
     })
     .map_err(fail)?;
-    Ok(Emitted { function: compiled, side: side.map(|it| it.0) })
+    Ok(Emitted { function: compiled, side: side.map(|it| it.0), extra: Vec::new() })
 }
 
 /// Compiles `ir` in place of a prepared function's IR, its names being the function's: a
@@ -566,10 +566,10 @@ fn emit_ir(
         let code = compiled(unit, ir, &[])?;
         let none = side::Scopes::default();
         let named = Named { spans: &[], variables: &[], scopes: &none };
-        told(unit, &function.places, function.requests(), &code, refs, named)
+        told(unit, &function.places, function.requests(), code, refs, named)
     } else {
         let code = compiled(unit, ir, &pending.named)?;
-        emitted(unit, function, &code, refs)
+        emitted(unit, function, code, refs)
     }
 }
 

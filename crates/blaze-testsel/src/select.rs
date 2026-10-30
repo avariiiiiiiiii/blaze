@@ -17,11 +17,12 @@
 //! [`Choice::Cached`]; if it failed with these inputs, it runs. The store never replaces a
 //! value, so the history only grows; its end is found by doubling and halving.
 
-use std::{collections::BTreeMap, ffi::OsString, fmt, time::Duration};
+use std::{ffi::OsString, fmt, time::Duration};
 
 use blaze_cas::{Corrupt, Key, Mismatch, Ticket};
 use blaze_core::Traced;
 use blaze_ids::{ContentId, Hasher};
+use rustc_hash::FxHashMap;
 use blaze_usercode::{
     RunKey,
     index::{self, Shape},
@@ -280,9 +281,9 @@ fn find<P: Passes + ?Sized, I: Inputs>(store: &P, run: &RunKey, inputs: &mut I) 
 
 /// The first input of `before` whose value `now` does not have.
 fn changed_input(before: &Traced, now: &Traced) -> Option<Input> {
-    let files: BTreeMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect();
-    let dirs: BTreeMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect();
-    let env: BTreeMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect();
+    let files: FxHashMap<_, _> = now.files.iter().map(|(path, hash)| (path, hash)).collect();
+    let dirs: FxHashMap<_, _> = now.dirs.iter().map(|(path, hash)| (path, hash)).collect();
+    let env: FxHashMap<_, _> = now.env.iter().map(|(name, value)| (name, value)).collect();
     for (path, hash) in &before.files {
         if files.get(path) != Some(&hash) {
             return Some(Input::File(path.clone()));

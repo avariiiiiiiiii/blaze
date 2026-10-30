@@ -14,8 +14,9 @@ use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
 use crate::sync::atomic::AtomicBool;
 use crate::tracked_struct::{Disambiguator, DisambiguatorMap, IdentityHash, IdentityMap};
+use crate::zalsa::Zalsa;
 use crate::zalsa_local::{
-    EdgeFingerprint, OriginAndExtra, QueryEdge, QueryRevisions, QueryRevisionsExtra,
+    EdgeFingerprint, OriginAndExtra, QueryEdge, QueryRevisions, QueryRevisionsExtra, ZalsaLocal,
 };
 use crate::{
     Id,
@@ -433,6 +434,8 @@ impl QueryStack {
 
     pub(crate) fn pop_into_revisions(
         &mut self,
+        zalsa: &Zalsa,
+        zalsa_local: &ZalsaLocal,
         key: DatabaseKeyIndex,
         iteration: IterationStamp,
         #[cfg(debug_assertions)] push_len: usize,
@@ -443,7 +446,7 @@ impl QueryStack {
             push_len,
         );
         let completion = active_query.prepare_completion(iteration, false);
-        completion.finish(active_query.input_outputs.drain(..))
+        completion.finish(zalsa, zalsa_local, active_query.input_outputs.drain(..))
     }
 
     pub(crate) fn pop_detached_completion(
@@ -513,14 +516,20 @@ impl QueryCompletion {
         self
     }
 
+    /// Publishes the query's edges to the database's edge array and builds its revisions. The
+    /// edges were recorded in the task's own frame; the memo's publication orders them for
+    /// readers.
     pub(crate) fn finish(
         self,
+        zalsa: &Zalsa,
+        zalsa_local: &ZalsaLocal,
         input_outputs: impl ExactSizeIterator<Item = QueryEdge>,
     ) -> CompletedQuery {
+        let edges = zalsa_local.record_edges(zalsa, input_outputs);
         let origin_and_extra = if self.untracked_read {
-            OriginAndExtra::derived_untracked(input_outputs, self.extra)
+            OriginAndExtra::derived_untracked(edges, self.extra)
         } else {
-            OriginAndExtra::derived(input_outputs, self.extra)
+            OriginAndExtra::derived(edges, self.extra)
         };
         CompletedQuery {
             revisions: QueryRevisions {

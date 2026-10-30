@@ -5,7 +5,7 @@ use std::sync::{Mutex, OnceLock, PoisonError};
 use derive_where::derive_where;
 use rustc_hash::FxBuildHasher;
 
-use super::{AvailableDepth, Cx, NestedGoals};
+use super::{AvailableDepth, Cx, NestedGoals, RequiredDepth};
 use crate::data_structures::HashMap;
 use crate::search_graph::EvaluationResult;
 
@@ -27,7 +27,7 @@ struct Row<X: Cx> {
 #[derive_where(Debug; X: Cx)]
 pub(super) struct CacheData<'a, X: Cx> {
     pub(super) result: X::Result,
-    pub(super) required_depth: usize,
+    pub(super) required_depth: RequiredDepth,
     pub(super) encountered_overflow: bool,
     pub(super) nested_goals: &'a NestedGoals<X>,
 }
@@ -114,7 +114,7 @@ impl<X: Cx> GlobalCache<X> {
         debug_assert!(heads.is_empty());
         let goal = self.goals.intern(input);
         let index = self.results.intern(result);
-        let depth = u32::try_from(required_depth).expect("a solver depth past `u32::MAX`");
+        let depth = u32::try_from(required_depth.0).expect("a solver depth past `u32::MAX`");
         let writers = self.writers.get_or_init(|| (0..shard_count()).map(|_| Writer::new()).collect());
         let mut claimed = writers[goal as usize & (writers.len() - 1)]
             .0
@@ -169,20 +169,20 @@ impl<X: Cx> GlobalCache<X> {
     ) -> Option<CacheData<'a, X>> {
         let goal = self.goals.find(&input)?;
         if let Some(row) = self.success.get(goal).and_then(|head| self.row(head.load(Ordering::Acquire)))
-            && available_depth.cache_entry_is_applicable(row.depth as usize)
+            && available_depth.cache_entry_is_applicable(RequiredDepth(row.depth as usize))
         {
             let nested_goals = self.nested_goals_of(row);
             if candidate_is_applicable(nested_goals) {
                 return Some(CacheData {
                     result: *self.results.get(cx.get_tracked(&row.result)),
-                    required_depth: row.depth as usize,
+                    required_depth: RequiredDepth(row.depth as usize),
                     encountered_overflow: false,
                     nested_goals,
                 });
             }
         }
 
-        let additional_depth = available_depth.0;
+        let additional_depth = RequiredDepth(available_depth.0);
         if let Some(row) = self
             .with_overflow
             .get(goal)
@@ -220,9 +220,9 @@ impl<X: Cx> GlobalCache<X> {
     }
 
     /// The newest overflow row computed with `depth`, from the one `plus_one` names back.
-    fn overflow_row(&self, mut plus_one: u32, depth: usize) -> Option<&Row<X>> {
+    fn overflow_row(&self, mut plus_one: u32, depth: RequiredDepth) -> Option<&Row<X>> {
         while let Some(row) = self.row(plus_one) {
-            if row.depth as usize == depth {
+            if row.depth as usize == depth.0 {
                 return Some(row);
             }
             plus_one = row.next;

@@ -490,7 +490,7 @@ impl<'a> Driver<'a> {
             .map(|(at, (task, waits))| {
                 let mut deps: Vec<NodeId> =
                     waits.iter().filter_map(|it| index.get(it)).map(|&it| id(it)).collect();
-                deps.sort();
+                blaze_ids::radix::sort_copy_by_key(&mut deps, |it| it.0);
                 deps.dedup();
                 let (unit, kind) = match *task {
                     Task::Script(unit) => (unit, NodeKind::Script),
@@ -642,7 +642,7 @@ impl<'a> Driver<'a> {
         linked: &FxHashMap<usize, usize>,
     ) -> anyhow::Result<()> {
         let mut units: Vec<usize> = linked.keys().copied().collect();
-        units.sort_unstable();
+        blaze_ids::radix::sort(&mut units);
         let mut wanted = false;
         for &it in &units {
             wanted |= self.has_wasm_only(it)?;

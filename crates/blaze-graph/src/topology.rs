@@ -19,6 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -149,8 +150,10 @@ impl Topology {
         let mut rest: Vec<(u32, (u32, u32))> =
             place_of.into_iter().filter(|&(it, _)| it != group).collect();
         // The key ends in the group id, which is unique: a total order, whatever the map's.
-        rest.sort_unstable_by_key(|&(it, (its_socket, its_node))| {
-            (its_socket != socket, its_node != node, it.abs_diff(group), it)
+        radix::sort_copy_by_key(&mut rest, |&(it, (its_socket, its_node))| {
+            (u128::from(its_socket != socket) << 65)
+                | (u128::from(its_node != node) << 64)
+                | u128::from(radix::pack_32(it.abs_diff(group), it))
         });
         let rest = rest.into_iter().map(|(it, _)| it);
         std::iter::once(group).chain(rest).collect()
@@ -168,7 +171,7 @@ impl Topology {
 
 /// `cpus` by id, their groups numbered from 0 in the order of their first CPU.
 fn dense(mut cpus: Vec<Cpu>) -> Topology {
-    cpus.sort_by_key(|it| it.id);
+    radix::sort_copy_by_key(&mut cpus, |it| it.id);
     let mut renamed: FxHashMap<u32, u32> = FxHashMap::default();
     for cpu in &mut cpus {
         let next = u32::try_from(renamed.len()).unwrap_or(u32::MAX);

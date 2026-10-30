@@ -55,7 +55,7 @@ impl Frames {
     }
 
     /// [`Frames::next`] in place: the item stays in the buffer until the next push.
-    pub(crate) fn next_ref(&mut self) -> Result<Option<&[u8]>, ApiError> {
+    pub fn next_ref(&mut self) -> Result<Option<&[u8]>, ApiError> {
         let Some(len) = self.declared()? else { return Ok(None) };
         let start = self.at + 4;
         let end = start + len;
@@ -74,7 +74,7 @@ impl Frames {
     /// How many bytes to read next: what the frame under way still lacks, but no more than
     /// have arrived of it, so a buffer grows on the peer's word only as fast as its bytes come;
     /// and never fewer than `least`.
-    pub(crate) fn wanted(&self, least: usize) -> usize {
+    pub fn wanted(&self, least: usize) -> usize {
         let held = self.held();
         let Some(&[a, b, c, d]) = self.bytes.get(self.at..self.at + 4) else { return least };
         let len = u32::from_be_bytes([a, b, c, d]);
@@ -87,7 +87,7 @@ impl Frames {
 
     /// One read of at most `most` bytes from `from`, straight into the buffer; 0 once the peer
     /// has hung up.
-    pub(crate) fn fill(&mut self, from: &mut impl Read, most: usize) -> io::Result<usize> {
+    pub fn fill(&mut self, from: &mut impl Read, most: usize) -> io::Result<usize> {
         self.compact();
         let len = self.bytes.len();
         self.bytes.resize(len + most, 0);

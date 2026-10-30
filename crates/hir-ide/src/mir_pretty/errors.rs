@@ -82,6 +82,9 @@ impl MirLowerError<'_> {
                 }
                 writeln!(f, "]")?;
             }
+            MirLowerError::UnknownIntrinsic(name) => {
+                writeln!(f, "{}", hir_ty::intrinsic::UnknownIntrinsic(name.clone()))?
+            }
             MirLowerError::LayoutError(_)
             | MirLowerError::IncompleteExpr
             | MirLowerError::IncompletePattern

@@ -22,6 +22,9 @@ use std::{
 use blake3::hazmat::{self, ContextKey, HasherExt};
 use serde::{Deserialize, Serialize};
 
+pub mod names;
+pub mod radix;
+
 /// The BLAKE3 hash of what something is. Two things with one content ID are the same thing.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[repr(transparent)]

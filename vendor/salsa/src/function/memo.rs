@@ -7,6 +7,7 @@ use crate::cycle::{
     CycleHeads, CycleHeadsIterator, IterationStamp, ProvisionalStatus, empty_cycle_heads,
 };
 use crate::function::{ClaimResult, Configuration, IngredientImpl, Reentrancy};
+use crate::graph::Graph;
 use crate::key::DatabaseKeyIndex;
 use crate::revision::AtomicRevision;
 use crate::sync::atomic::Ordering;
@@ -235,8 +236,8 @@ impl MemoHeader {
     }
 
     #[inline]
-    pub(super) fn origin(&self) -> QueryOriginRef<'_> {
-        self.revisions.origin()
+    pub(super) fn origin<'a>(&'a self, graph: &'a Graph) -> QueryOriginRef<'a> {
+        self.revisions.origin(graph)
     }
 
     pub(super) fn can_evict_value(&self) -> bool {
@@ -245,7 +246,9 @@ impl MemoHeader {
         // or those with untracked inputs
         // as their values cannot be reconstructed.
         // Nor a provisional memo: fixpoint iteration reads its value.
-        matches!(self.origin(), QueryOriginRef::Derived(_)) && !self.may_be_provisional()
+        self.revisions.is_derived()
+            && !self.revisions.is_derived_untracked()
+            && !self.may_be_provisional()
     }
 
     /// True if this may be a provisional cycle-iteration result.
@@ -294,7 +297,7 @@ impl MemoHeader {
         zalsa: &Zalsa,
         database_key_index: DatabaseKeyIndex,
     ) {
-        for output in self.revisions.origin().outputs() {
+        for output in self.revisions.origin(zalsa.graph()).outputs() {
             output.mark_validated_output(zalsa, database_key_index);
         }
     }
@@ -329,7 +332,7 @@ impl MemoHeader {
     }
 
     pub(super) fn remove_outputs(&self, zalsa: &Zalsa, executor: DatabaseKeyIndex) {
-        for stale_output in self.revisions.origin().outputs() {
+        for stale_output in self.revisions.origin(zalsa.graph()).outputs() {
             stale_output.remove_stale_output(zalsa, executor);
         }
 
@@ -403,12 +406,14 @@ impl<C: Configuration> crate::table::memo::Memo for Memo<C> {
 }
 
 #[cfg(feature = "persistence")]
-mod persistence {
+pub(super) mod persistence {
     use crate::function::Configuration;
     use crate::function::memo::{Memo, MemoHeader};
     use crate::revision::AtomicRevision;
-    use crate::zalsa_local::QueryRevisions;
-    use crate::zalsa_local::persistence::{MappedQueryRevisions, PersistentQueryOrigin};
+    use crate::graph::{Graph, TaskGraph};
+    use crate::zalsa_local::persistence::{
+        MappedQueryRevisions, PersistedRevisions, PersistentQueryOrigin,
+    };
 
     use serde::Deserialize;
     use serde::ser::SerializeStruct;
@@ -480,7 +485,30 @@ mod persistence {
         }
     }
 
-    impl<'de, C> serde::Deserialize<'de> for Memo<C>
+    /// A deserialized memo whose edges are not yet in the database's graph.
+    #[derive(Deserialize)]
+    #[serde(rename = "Memo")]
+    pub(crate) struct PersistedMemo<C: Configuration> {
+        #[serde(bound = "C: Configuration")]
+        value: DeserializeValue<C>,
+        verified_at: AtomicRevision,
+        revisions: PersistedRevisions,
+    }
+
+    struct DeserializeValue<C: Configuration>(C::Output<'static>);
+
+    impl<C: Configuration> PersistedMemo<C> {
+        /// The memo, its edges written into `graph`.
+        pub(crate) fn record(self, graph: &Graph, task: &TaskGraph) -> Memo<C> {
+            Memo::new(
+                Some(self.value.0),
+                self.verified_at.load(),
+                self.revisions.record(graph, task),
+            )
+        }
+    }
+
+    impl<'de, C> serde::Deserialize<'de> for DeserializeValue<C>
     where
         C: Configuration,
     {
@@ -488,38 +516,9 @@ mod persistence {
         where
             D: serde::Deserializer<'de>,
         {
-            #[derive(Deserialize)]
-            #[serde(rename = "Memo")]
-            pub struct DeserializeMemo<C: Configuration> {
-                #[serde(bound = "C: Configuration")]
-                value: DeserializeValue<C>,
-                verified_at: AtomicRevision,
-                revisions: QueryRevisions,
-            }
-
-            struct DeserializeValue<C: Configuration>(C::Output<'static>);
-
-            impl<'de, C> serde::Deserialize<'de> for DeserializeValue<C>
-            where
-                C: Configuration,
-            {
-                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-                where
-                    D: serde::Deserializer<'de>,
-                {
-                    C::deserialize(deserializer)
-                        .map(DeserializeValue)
-                        .map_err(serde::de::Error::custom)
-                }
-            }
-
-            let memo = DeserializeMemo::<C>::deserialize(deserializer)?;
-
-            Ok(Memo::new(
-                Some(memo.value.0),
-                memo.verified_at.load(),
-                memo.revisions,
-            ))
+            C::deserialize(deserializer)
+                .map(DeserializeValue)
+                .map_err(serde::de::Error::custom)
         }
     }
 }

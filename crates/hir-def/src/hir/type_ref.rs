@@ -620,7 +620,7 @@ impl TypeColumns<Frozen> {
 #[cfg(test)]
 mod tests {
     use hir_expand::mod_path::{ModPath, PathKind};
-    use intern::{Interned, Symbol};
+    use intern::Symbol;
     use la_arena::RawIdx;
     use salsa::plumbing::FromId;
 
@@ -639,7 +639,7 @@ mod tests {
     }
 
     fn path(text: &str) -> Path {
-        Path::BarePath(Interned::new(ModPath::from_segments(PathKind::Plain, [name(text)])))
+        Path::BarePath(ModPath::from_segments(PathKind::Plain, [name(text)]))
     }
 
     fn type_param(local: u32) -> TypeParamId {

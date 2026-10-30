@@ -135,18 +135,51 @@ fn expression(cx: &Cx<'_, '_>, record: &Record, variant: hir::Variant) -> Option
             {
                 return None;
             }
-            let module = record.module(cx);
-            let private: Vec<hir::Field> = variant
-                .fields(cx.db)
-                .into_iter()
-                .filter(|it| module.is_some_and(|module| !it.is_visible_from(cx.db, module)))
-                .collect();
+            let private = private(cx, record, variant);
             Some(match private.is_empty() {
                 true => missing(cx, record, variant, &remaining),
                 false => private_fields(cx, record, variant, &private),
             })
         }
     }
+}
+
+/// The fields of `variant` not visible where the expression is.
+fn private(cx: &Cx<'_, '_>, record: &Record, variant: hir::Variant) -> Vec<hir::Field> {
+    let module = record.module(cx);
+    variant
+        .fields(cx.db)
+        .into_iter()
+        .filter(|it| module.is_some_and(|module| !it.is_visible_from(cx.db, module)))
+        .collect()
+}
+
+/// rustc's `StashKey::MaybeFruTypo`: what becomes of the E0308 `diag` of `value`, when it is
+/// the value of the last field of a struct expression. With no field left out it gets the
+/// range note itself (`suggest_fru_from_range_and_emit` of the E0308); with some it is
+/// stashed, and the E0063 that gives the range note takes its place
+/// (`try_steal_replace_and_emit_err`). False when it is not to be given.
+pub(crate) fn last_field_mismatch(cx: &Cx<'_, '_>, value: &InFile<syntax::SyntaxNode>, diag: &mut Diag) -> bool {
+    let Some(field) = value.value.parent().and_then(ast::RecordExprField::cast) else { return true };
+    let Some(record) = Record::of_field(value.file_id, &either::Either::Left(field.clone())) else { return true };
+    let Some(last) = record.fields.last() else { return true };
+    if record.is_pat || last.value.as_ref() != Some(&value.value) {
+        return true;
+    }
+    let Some(variant) = cx.sema.resolve_variant(field.parent_record_lit()) else { return true };
+    let remaining = remaining(cx, &record, variant);
+    if remaining.is_empty() {
+        fru_typo(cx, diag, &record, last, variant);
+        return true;
+    }
+    let names: Vec<String> = variant.fields(cx.db).iter().map(|it| it.name(cx.db).as_str().to_owned()).collect();
+    let gives_e0063 = record.rest.is_none()
+        && !record.fields.iter().any(|it| !names.contains(&it.name))
+        && !record.repeats().into_iter().any(|it| it)
+        && !matches!(variant, hir::Variant::Union(_))
+        && !foreign_non_exhaustive(cx, variant)
+        && private(cx, &record, variant).is_empty();
+    !(gives_e0063 && fru_range(cx, last, variant).is_some())
 }
 
 /// `..` with no base: E0797, or with `#![feature(default_field_values)]` the fields without
@@ -218,6 +251,26 @@ fn missing(cx: &Cx<'_, '_>, record: &Record, variant: hir::Variant, remaining: &
     diag
 }
 
+/// The last field's value when it is a range `a..b` of a field that is not a `Range`, and
+/// its two ends: the condition of `suggest_fru_from_range_and_emit`.
+fn fru_range(cx: &Cx<'_, '_>, last: &RecordField, variant: hir::Variant) -> Option<(ast::RangeExpr, ast::Expr, ast::Expr)> {
+    let range = last.value.clone().and_then(ast::RangeExpr::cast)?;
+    let (Some(start), Some(end)) = (range.start(), range.end()) else { return None };
+    if range.op_kind() != Some(ast::RangeOp::Exclusive) {
+        return None;
+    }
+    let range_adt = cx.sema.type_of_expr(&ast::Expr::RangeExpr(range.clone())).and_then(|it| it.original.as_adt());
+    let field_adt = variant
+        .fields(cx.db)
+        .into_iter()
+        .find(|it| it.name(cx.db).as_str() == last.name)
+        .and_then(|it| it.ty(cx.db).as_adt());
+    if range_adt.is_none() || field_adt == range_adt {
+        return None;
+    }
+    Some((range, start, end))
+}
+
 /// `TypeMismatchFruTypo` (`suggest_fru_from_range_and_emit`): the last field's value is a
 /// range `a..b` where the field is not a `Range`, likely `a, ..b` meant.
 fn fru_typo(
@@ -227,20 +280,7 @@ fn fru_typo(
     last: &RecordField,
     variant: hir::Variant,
 ) {
-    let Some(range) = last.value.clone().and_then(ast::RangeExpr::cast) else { return };
-    let (Some(start), Some(end)) = (range.start(), range.end()) else { return };
-    if range.op_kind() != Some(ast::RangeOp::Exclusive) {
-        return;
-    }
-    let range_adt = cx.sema.type_of_expr(&ast::Expr::RangeExpr(range.clone())).and_then(|it| it.original.as_adt());
-    let field_adt = variant
-        .fields(cx.db)
-        .into_iter()
-        .find(|it| it.name(cx.db).as_str() == last.name)
-        .and_then(|it| it.ty(cx.db).as_adt());
-    if range_adt.is_none() || field_adt == range_adt {
-        return;
-    }
+    let Some((range, start, end)) = fru_range(cx, last, variant) else { return };
     let start_range = start.syntax().text_range();
     let end_range = end.syntax().text_range();
     let between = range.syntax().text().slice(start_range.end() - range.syntax().text_range().start()..).to_string();

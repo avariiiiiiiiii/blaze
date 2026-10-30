@@ -50,6 +50,15 @@ pub(crate) enum Parsed {
     Doc(Doc),
     /// `#[macro_export]`, `#[macro_export(local_inner_macros)]`.
     MacroExport,
+    /// `#[stable]` or `#[unstable]`.
+    Stability(Stability),
+    /// `#[rustc_const_stable]` or `#[rustc_const_unstable]`.
+    ConstStability(Stability),
+    /// `#[rustc_default_body_unstable]`.
+    BodyStability(Stability),
+    RustcConstStableIndirect,
+    /// `#[deprecated]`, by its `since`.
+    Deprecated(DeprecatedSince),
 }
 
 /// rustc's `InlineAttr`.
@@ -121,3 +130,46 @@ pub(crate) struct Doc {
     pub(crate) inline: Vec<(DocInline, TextRange)>,
     pub(crate) masked: Option<TextRange>,
 }
+
+/// rustc's `Stability`, `PartialConstStability` and `DefaultBodyStability`, of what the
+/// stability checks read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Stability {
+    pub(crate) feature: String,
+    pub(crate) level: StabilityLevel,
+    /// The attribute that gives it, of the node's.
+    pub(crate) attr: usize,
+}
+
+/// rustc's `StabilityLevel`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StabilityLevel {
+    Unstable,
+    Stable(StableSince),
+}
+
+/// rustc's `StableSince`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StableSince {
+    Version(RustcVersion),
+    /// `CURRENT_RUSTC_VERSION`.
+    Current,
+    /// Not a version; an error was given.
+    Err,
+}
+
+/// rustc's `DeprecatedSince`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DeprecatedSince {
+    RustcVersion(RustcVersion),
+    /// `"TBD"`.
+    Future,
+    /// Outside the standard library, as written.
+    NonStandard(String),
+    Unspecified,
+    /// Not a version; an error was given.
+    Err,
+}
+
+/// rustc's `RustcVersion`: major, minor, patch.
+pub(crate) type RustcVersion = (u16, u16, u16);

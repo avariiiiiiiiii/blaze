@@ -19,8 +19,7 @@ mod sys;
 mod watch;
 
 use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, VecDeque},
+    collections::VecDeque,
     io,
     os::windows::io::{AsRawHandle as _, OwnedHandle, OwnedSocket},
     path::{Path, PathBuf},
@@ -48,7 +47,10 @@ use windows_sys::Win32::{
 };
 
 use self::sys::{KEY_EXIT, KEY_IO, KEY_JOB, KEY_WAKE, Port, Slot};
-use crate::{Address, Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Tag};
+use crate::{
+    Address, Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Tag,
+    wheel::{self, Wheel},
+};
 
 /// Packets taken from the port at once.
 const ENTRIES: usize = 64;
@@ -214,9 +216,8 @@ pub struct Iocp {
     next: u64,
     /// Completions made on the polling thread, in the order they happened.
     ready: Vec<Completion>,
-    /// Due, then the order they were asked for.
-    timers: BinaryHeap<Reverse<(Instant, u64, Tag)>>,
-    timers_asked: u64,
+    /// By ticks since `start`: due, then the order they were asked for.
+    timers: Wheel<Tag>,
     watches: FxHashMap<Tag, u64>,
     listens: FxHashMap<Tag, u64>,
     spawns: FxHashMap<Tag, Spawned>,
@@ -257,8 +258,7 @@ impl Iocp {
             requests: FxHashMap::default(),
             next: 0,
             ready: Vec::new(),
-            timers: BinaryHeap::new(),
-            timers_asked: 0,
+            timers: Wheel::new(),
             watches: FxHashMap::default(),
             listens: FxHashMap::default(),
             spawns: FxHashMap::default(),
@@ -391,11 +391,9 @@ impl Iocp {
                 Ok(())
             }
             Effect::Timer { after, tag } => {
-                let now = Instant::now();
-                // A timer past what a clock can say is due in some thirty years: never, here.
-                let due = now.checked_add(after).unwrap_or_else(|| now + Duration::from_secs(1 << 30));
-                self.timers.push(Reverse((due, self.timers_asked, tag)));
-                self.timers_asked += 1;
+                // A timer past what a tick count can say is due in some 584 years: never, here.
+                let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
+                self.timers.insert(due, tag);
                 Ok(())
             }
             Effect::Watch { dir, tag } => {
@@ -874,14 +872,10 @@ impl Iocp {
 
     /// Every timer due fired, in the order they were due, and what the threads sent taken.
     fn gather(&mut self, out: &mut Vec<Completion>) {
-        let now = Instant::now();
-        while let Some(&Reverse((due, _, tag))) = self.timers.peek() {
-            if due > now {
-                break;
-            }
-            self.timers.pop();
-            self.ready.push(Completion { tag, done: Done::Fired });
-        }
+        let ready = &mut self.ready;
+        self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
+            ready.push(Completion { tag, done: Done::Fired });
+        });
         while let Ok(back) = self.back.try_recv() {
             match back {
                 Back::Done(completion) => self.ready.push(completion),
@@ -996,8 +990,9 @@ impl Driver for Iocp {
             }
             let now = Instant::now();
             let mut left = deadline.map_or(Duration::MAX, |it| it.saturating_duration_since(now));
-            if let Some(Reverse((due, ..))) = self.timers.peek() {
-                left = left.min(due.saturating_duration_since(now));
+            if let Some(due) = self.timers.next_deadline() {
+                let at = wheel::ticks(now.saturating_duration_since(self.start));
+                left = left.min(Duration::from_nanos(due.saturating_sub(at)));
             }
             self.wait(left);
             self.gather(out);

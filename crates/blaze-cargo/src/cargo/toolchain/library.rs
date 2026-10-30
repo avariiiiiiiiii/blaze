@@ -330,7 +330,7 @@ fn download(from: &str, file: &str) -> anyhow::Result<Vec<u8>> {
 pub fn digest_of(dir: &Path) -> std::io::Result<String> {
     let mut found = Vec::new();
     list(dir, "", &mut found)?;
-    found.sort_unstable_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+    blaze_ids::names::sort_by_name(&mut found, |it| it.1.as_bytes());
     let mut all = Sha256::new();
     for (kind, path, full) in found {
         let bytes = match kind {

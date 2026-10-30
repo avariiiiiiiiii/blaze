@@ -179,6 +179,30 @@ fn deletes_and_renames_of_directories() {
 }
 
 #[test]
+fn a_directory_moves_with_its_staged_files_whatever_their_names_sort_as() {
+    let mut tree = Tree::new();
+    let base = tree
+        .apply(tree.empty(), &[write("d/a-b", "1"), write("d/a/b", "2"), write("d/a.c", "3"), write("d/z", "4")])
+        .unwrap();
+    // Staged before the move: a new file between the base's, one replaced, one deleted.
+    let ops = [
+        write("d/a/a", "5"),
+        write("d/a-b", "6"),
+        delete("d/z"),
+        rename("d", "e"),
+        delete("e/a.c"),
+        rename("e", "f/g"),
+    ];
+    let moved = tree.apply(base, &ops).unwrap();
+    let want: BTreeMap<String, Vec<u8>> =
+        [("f/g/a-b", "6"), ("f/g/a/a", "5"), ("f/g/a/b", "2")].map(|(path, it)| (path.into(), it.into())).into();
+    assert_eq!(files(&tree, moved), want);
+    // Deleting the directory takes every file under it, staged or not.
+    let gone = tree.apply(base, &[write("d/a/c", "7"), delete("d"), write("top", "t")]).unwrap();
+    assert_eq!(files(&tree, gone).into_keys().collect::<Vec<_>>(), vec!["top".to_owned()]);
+}
+
+#[test]
 fn diffs_skip_what_is_shared() {
     let mut tree = Tree::new();
     let base = tree

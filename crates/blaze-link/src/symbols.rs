@@ -10,6 +10,8 @@
 //! so the ids are the same whatever the core count. A lookup is one hash, one probe of a
 //! group and one compare of a 20-byte key (or the name's bytes).
 
+#![forbid(unsafe_code)]
+
 use std::cmp::Ordering;
 use std::fmt::Write as _;
 use std::hash::Hasher as _;

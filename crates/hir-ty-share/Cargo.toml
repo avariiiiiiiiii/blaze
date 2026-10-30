@@ -1,0 +1,40 @@
+[package]
+name = "hir-ty-share"
+description = "Which generic instances compile to one body: a key of everything an instance's code depends on beyond the layouts of its arguments"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+either.workspace = true
+rustc-hash.workspace = true
+salsa.workspace = true
+triomphe.workspace = true
+
+rustc_abi.workspace = true
+rustc_type_ir.workspace = true
+
+base-db.workspace = true
+hir-def.workspace = true
+hir-ty.workspace = true
+hir-ty-mir.workspace = true
+
+blaze-ids.workspace = true
+blaze-items.workspace = true
+
+[dev-dependencies]
+hir.workspace = true
+span.workspace = true
+syntax.workspace = true
+test-fixture.workspace = true
+
+[lints]
+workspace = true

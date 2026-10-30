@@ -1,22 +1,35 @@
 //! What a stage is to a running program: a patch it applies (new code and data, the slots
 //! that changed, the frames to register), or why it must start again.
+//!
+//! The patch borrows what it sends: a piece's bytes are read in place from the new state's
+//! pages (copied into the stage's arena only when they span written pages), its cells are
+//! the dirty slots alone, and the message is encoded into one buffer of its exact length.
 
-use blaze_live::patch::{Descriptor, Message, Patch, ARCH_AARCH64, ARCH_X86_64, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION};
+#![forbid(unsafe_code)]
 
-use crate::model::Class;
-use crate::stage::{Stage, describe};
-use crate::state::What;
-use crate::symbols::SymKey;
-use crate::Format;
 use blaze_codegen::Arch;
+use blaze_ids::radix;
+use blaze_live::patch::{
+    ARCH_AARCH64, ARCH_X86_64, DESCRIPTOR_MAGIC, DESCRIPTOR_VERSION, Descriptor, Message, PatchRef,
+};
+
+use crate::Format;
+use crate::model::Class;
+use crate::stage::{Content, Stage, error};
+use crate::state::{PieceId, State, What};
+use crate::symbols::SymKey;
+
+/// The 4 zero bytes that end a `.eh_frame`, written after the frames a patch adds.
+const EH_FRAME_END: [u8; 4] = [0; 4];
 
 impl Stage<'_> {
     /// The live descriptor's bytes: where the table, the patch regions and the directory
     /// are, as linked.
     pub fn fill_descriptor(&mut self) -> Result<(), crate::LinkError> {
         let Some(live) = &self.output.live else { return Ok(()) };
+        let missing = || error(None, "a live image laid out without its jump table");
         let at = |this: &Self, key: SymKey| -> Option<u64> {
-            let (piece, offset) = this.new.home(this.symbols.find(&key)?)?;
+            let (piece, offset) = this.new.home(this.symbols.find(key)?)?;
             Some(this.new.piece(piece)?.addr + offset)
         };
         let region = |this: &Self, class: Class| -> [u64; 2] {
@@ -25,14 +38,13 @@ impl Stage<'_> {
                 .map(|it| &this.new.spaces[it].region)
                 .map_or([0, 0], |it| [it.addr, it.addr + it.capacity])
         };
-        let missing = || crate::stage::error(None, "a live image laid out without its jump table");
         let descriptor = Descriptor {
             magic: DESCRIPTOR_MAGIC,
             version: DESCRIPTOR_VERSION,
             arch: match self.output.arch {
                 Arch::X86_64 => ARCH_X86_64,
                 Arch::Aarch64 => ARCH_AARCH64,
-                Arch::Wasm32 => return Err(crate::stage::error(None, "live patching of wasm")),
+                Arch::Wasm32 => return Err(error(None, "live patching of wasm")),
             },
             id: self.new.lineage,
             generation: self.new.generation,
@@ -43,18 +55,19 @@ impl Stage<'_> {
             patch_data: region(self, Class::PatchData),
             dir: [at(self, SymKey::LiveDir).ok_or_else(missing)?, live.path.len() as u64],
         };
-        let sym = self.symbols.find(&SymKey::Descriptor).ok_or_else(missing)?;
+        let sym = self.symbols.find(SymKey::Descriptor).ok_or_else(missing)?;
         let (piece, _) = self.new.home(sym).ok_or_else(missing)?;
-        self.bytes.insert(piece, std::borrow::Cow::Owned(descriptor.encode()));
+        let bytes = self.arena.alloc_slice_copy(&descriptor.encode());
+        self.contents.insert(piece, Content::Bytes(bytes));
         self.write.insert(piece);
         Ok(())
     }
 
-    /// What a program running the image before this stage is told.
-    pub fn message(&self) -> Message {
+    /// The encoded message for a program running the image before this stage.
+    pub fn message(&self) -> Vec<u8> {
         let id = self.new.lineage;
         let generation = self.new.generation;
-        let restart = |why: String| Message::Restart { id, generation, why };
+        let restart = |why: String| Message::Restart { id, generation, why }.encode();
         if self.full {
             return restart("the image was linked again from scratch".to_owned());
         }
@@ -65,38 +78,36 @@ impl Stage<'_> {
         if self.old.tls != self.new.tls {
             return restart("its thread-local storage changed".to_owned());
         }
-        let mut patch = Patch {
-            id,
-            generation,
-            base: self.old.generation,
-            functions: self.functions,
-            statics: self.statics,
-            ..Patch::default()
-        };
-        let cells = self.symbols.find(&SymKey::Cells).and_then(|it| self.new.home(it)).map(|it| it.0);
-        let descriptor = self.symbols.find(&SymKey::Descriptor).and_then(|it| self.new.home(it)).map(|it| it.0);
-        let mut ids: Vec<_> = self.write.iter().copied().collect();
-        ids.sort_unstable();
+        let home = |key: SymKey| self.symbols.find(key).and_then(|it| self.new.home(it)).map(|it| it.0);
+        let (cells, descriptor) = (home(SymKey::Cells), home(SymKey::Descriptor));
+        let ids = self.write.sorted();
+        let mut code: Vec<(u64, &[u8])> = Vec::with_capacity(ids.len());
+        let mut data: Vec<(u64, &[u8])> = Vec::with_capacity(ids.len());
+        let mut rebase: Vec<u64> = Vec::new();
+        let mut slots: Vec<(u32, u64)> = Vec::new();
+        let mut frames: Vec<(u64, u64)> = Vec::new();
+        let mut windows: Vec<(u64, u64, u64)> = Vec::new();
         for id in ids {
             let Some(piece) = self.new.piece(id) else { continue };
             let space = &self.new.spaces[piece.region as usize];
-            if Some(id) == descriptor || space.zero || piece.zero {
+            if Some(id) == descriptor || space.zero || piece.zero() {
                 continue;
             }
             if Some(id) == cells {
-                let old = self.old.piece(id).map(|it| self.old.bytes(it)).unwrap_or(&[]);
-                let new = self.new.bytes(piece);
-                for (slot, cell) in new.chunks_exact(8).enumerate() {
-                    if old.get(slot * 8..slot * 8 + 8) != Some(cell) {
-                        let value = u64::from_le_bytes(cell.try_into().expect("8 bytes"));
-                        patch.cells.push((slot as u32, value));
+                let mut dirty = self.dirty_cells.sorted();
+                dirty.retain(|slot| u64::from(*slot) * 8 + 8 <= piece.size);
+                slots.reserve(dirty.len());
+                for slot in dirty {
+                    let at = u64::from(slot) * 8;
+                    let value = word(&self.new, id, at).expect("a placed cells piece");
+                    if word(self.old, id, at) != Some(value) {
+                        slots.push((slot, value));
                     }
                 }
                 continue;
             }
-            let bytes = self.new.bytes(piece).to_vec();
             match &space.region.class {
-                Class::Patch => patch.code.push((piece.addr, bytes)),
+                Class::Patch => code.push((piece.addr, piece.bytes_in(self.arena))),
                 Class::PatchData
                 | Class::EhFrame
                 | Class::Rodata
@@ -104,51 +115,75 @@ impl Stage<'_> {
                 | Class::Data
                 | Class::Got
                 | Class::Named { .. }
-                | Class::Table => patch.data.push((piece.addr, bytes)),
+                | Class::Table => data.push((piece.addr, piece.bytes_in(self.arena))),
                 Class::Synthetic(_) => continue,
                 class => {
                     return restart(format!(
                         "{} changed in {class:?}, which a running program can't take",
-                        describe(self.symbols.key(piece.sym))
+                        self.symbols.describe(piece.sym)
                     ));
                 }
             }
-            patch.rebase.extend(piece.rebase.iter().map(|at| piece.addr + at));
-            if !piece.binds.is_empty() {
+            rebase.extend(piece.rebase().iter().map(|at| piece.addr + at));
+            if !piece.binds().is_empty() {
                 return restart(format!(
                     "{} refers to an import the loader binds only at start",
-                    describe(self.symbols.key(piece.sym))
+                    self.symbols.describe(piece.sym)
                 ));
             }
-            if self.fresh.contains(&id) {
-                match &piece.what {
-                    What::Fde | What::NativeFrame { fde: true, .. } => patch.frames.push((piece.addr, piece.size)),
-                    What::Function(info) => {
-                        if let Some((unwind, _, _)) = info.windows {
-                            if let Some((p, offset)) = self.new.home(unwind) {
-                                let addr = self.new.piece(p).map_or(0, |it| it.addr) + offset;
-                                patch.windows.push((piece.addr, piece.addr + piece.size, addr));
-                            }
-                        }
+            if !self.fresh.contains(id) {
+                continue;
+            }
+            match piece.what() {
+                What::Fde | What::NativeFrame { fde: true, .. } => frames.push((piece.addr, piece.size)),
+                What::Function(_) => {
+                    let unwind = piece.function().and_then(|it| it.windows).and_then(|it| self.new.home(it.0));
+                    if let Some((at, offset)) = unwind {
+                        let addr = self.new.piece(at).map_or(0, |it| it.addr) + offset;
+                        windows.push((piece.addr, piece.addr + piece.size, addr));
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
-        if !patch.frames.is_empty() && self.output.format == Format::Elf {
+        if !frames.is_empty() && self.output.format == Format::Elf {
             let Some(space) = self.new.space_of(&Class::EhFrame) else {
                 return restart("its new call frame information has no region".to_owned());
             };
             let region = &self.new.spaces[space].region;
             if region.size + 4 > region.capacity {
-                return restart(format!(
-                    "its call frame information fills its region ({} bytes)",
-                    region.capacity
-                ));
+                return restart(format!("its call frame information fills its region ({} bytes)", region.capacity));
             }
-            patch.data.push((region.addr + region.size, vec![0; 4]));
+            data.push((region.addr + region.size, &EH_FRAME_END));
         }
-        patch.rebase.sort_unstable();
-        Message::Patch(patch)
+        radix::sort(&mut rebase);
+        let patch = PatchRef {
+            id,
+            generation,
+            base: self.old.generation,
+            code: &code,
+            data: &data,
+            rebase: &rebase,
+            cells: &slots,
+            frames: &frames,
+            windows: &windows,
+            functions: self.functions,
+            statics: self.statics,
+        };
+        let mut out = Vec::with_capacity(patch.encoded_len());
+        patch.encode_into(&mut out);
+        out
     }
+}
+
+/// The 8 bytes at `at` in a placed piece, as a little-endian word.
+fn word(state: &State, id: PieceId, at: u64) -> Option<u64> {
+    let piece = state.piece(id)?;
+    let space = state.spaces.get(piece.region as usize)?;
+    if space.zero || piece.zero() || at + 8 > piece.size {
+        return None;
+    }
+    let mut out = [0; 8];
+    space.bytes.copy_to((piece.addr - space.region.addr + at) as usize, &mut out);
+    Some(u64::from_le_bytes(out))
 }

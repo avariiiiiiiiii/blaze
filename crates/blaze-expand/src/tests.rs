@@ -7,7 +7,7 @@ use blaze_usercode::{RunKey, index};
 use hir_expand::proc_macro::ProcMacroKind;
 use span::{EditionedFileId, Edition, ErasedFileAstId, Span, SpanAnchor, SyntaxContext, TextRange};
 
-use crate::{Call, Mode, Native, given, read, written};
+use crate::{Call, Mode, given, read, written};
 
 fn span(file: u32, ast: u32, start: u32, end: u32) -> Span {
     Span {
@@ -172,8 +172,4 @@ fn the_cache_has_one_mode_besides_keeping() {
     for old in ["off", "0", "all", "on"] {
         assert!(Mode::of(Some(old)).unwrap_err().contains(crate::CACHE));
     }
-    assert_eq!(Native::of(None), Ok(Native::On));
-    assert_eq!(Native::of(Some("verify")), Ok(Native::Verify));
-    assert_eq!(Native::of(Some("off")), Ok(Native::Off));
-    assert!(Native::of(Some("1")).is_err());
 }

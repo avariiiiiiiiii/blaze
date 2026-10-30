@@ -25,59 +25,71 @@ use super::{Expansions, allows_unsafe, ctxt, range_from_expansion};
 use crate::{
     cx::{Cx, item_range},
     lints::syntax::{Emitted, Pass, Tree, Walk, from_expansion, source_fact},
-    lower::{Found, Phase},
+    lower::Phase,
     model::{Applicability, Diag, SuggestionStyle},
 };
 
-/// rustc's combined early pass: one walk over each tree's pre-order node column, each node
-/// dispatched once on its kind to the checks that look at that kind, the shadowing of labels
-/// (`labels::shadowing`) included. Nothing is allocated per node: a statement buffer is reused
+/// The checks of this part, as the early pass's one walk (`super::lints`) calls them: each node
+/// once, dispatched on its kind to the checks that look at that kind, the shadowing of labels
+/// (`labels::shadowing`) included. Nothing is allocated per node: the statement buffer is reused
 /// across blocks, and a diagnostic's strings are built only once it is given.
-pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
-    let expansions = Expansions::of(cx, walk);
-    let mut out = Vec::new();
-    special_module_names(cx, walk, &expansions, &mut out);
-    let anonymous = cx.edition == Edition::Edition2015;
-    let mut stmts: Vec<Stmt> = Vec::new();
-    for tree in &walk.trees {
-        global_asm(cx, tree, &mut out);
-        // The range pattern whose `...` was linted with the `&` before it: nothing in it is
-        // linted again (`EllipsisInclusiveRangePatterns::node_id`).
-        let mut linted_ref: Option<TextRange> = None;
-        for node in &tree.nodes {
-            match node.kind() {
-                SyntaxKind::BLOCK_EXPR
-                | SyntaxKind::TRAIT
-                | SyntaxKind::IMPL
-                | SyntaxKind::EXTERN_BLOCK
-                | SyntaxKind::MACRO_RULES
-                | SyntaxKind::MACRO_DEF => unsafe_code(cx, walk, tree, node, &mut out),
-                SyntaxKind::FN => {
-                    unsafe_code(cx, walk, tree, node, &mut out);
-                    if anonymous {
-                        anonymous_parameters(cx, tree, node, &mut out);
-                    }
+pub(super) struct Builtin<'a, 'w> {
+    expansions: &'a Expansions<'w>,
+    anonymous: bool,
+    stmts: Vec<Stmt>,
+    /// The range pattern of the tree whose `...` was linted with the `&` before it: nothing in
+    /// it is linted again (`EllipsisInclusiveRangePatterns::node_id`).
+    linted_ref: Option<TextRange>,
+}
+
+impl<'a, 'w> Builtin<'a, 'w> {
+    pub(super) fn new(cx: &Cx<'_, '_>, expansions: &'a Expansions<'w>) -> Builtin<'a, 'w> {
+        Builtin { expansions, anonymous: cx.edition == Edition::Edition2015, stmts: Vec::new(), linted_ref: None }
+    }
+
+    /// What is checked once for the crate: `special_module_name`.
+    pub(super) fn krate(&self, cx: &Cx<'_, '_>, walk: &Walk<'_>, out: &mut Vec<Emitted>) {
+        special_module_names(cx, walk, self.expansions, out);
+    }
+
+    /// What is checked once for a tree, before its nodes: `global_asm!`.
+    pub(super) fn tree(&mut self, cx: &Cx<'_, '_>, tree: &Tree, out: &mut Vec<Emitted>) {
+        self.linted_ref = None;
+        global_asm(cx, tree, out);
+    }
+
+    pub(super) fn node(&mut self, cx: &Cx<'_, '_>, walk: &Walk<'_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec<Emitted>) {
+        match node.kind() {
+            SyntaxKind::BLOCK_EXPR
+            | SyntaxKind::TRAIT
+            | SyntaxKind::IMPL
+            | SyntaxKind::EXTERN_BLOCK
+            | SyntaxKind::MACRO_RULES
+            | SyntaxKind::MACRO_DEF => unsafe_code(cx, walk, tree, node, out),
+            SyntaxKind::FN => {
+                unsafe_code(cx, walk, tree, node, out);
+                if self.anonymous {
+                    anonymous_parameters(cx, tree, node, out);
                 }
-                SyntaxKind::REF_PAT | SyntaxKind::RANGE_PAT => {
-                    if linted_ref.is_some_and(|range| !range.contains_range(node.text_range())) {
-                        linted_ref = None;
-                    }
-                    if linted_ref.is_none() {
-                        linted_ref = ellipsis_range(cx, tree, node, &mut out);
-                    }
-                }
-                SyntaxKind::WHILE_EXPR => while_true(cx, tree, node, &mut out),
-                SyntaxKind::STMT_LIST => redundant_semicolons(cx, &expansions, tree, node, &mut stmts, &mut out),
-                SyntaxKind::PREFIX_EXPR => {
-                    ambiguous_negative_literal(cx, tree, node, &mut out);
-                    double_negation(cx, tree, node, &mut out);
-                }
-                SyntaxKind::LABEL => super::labels::shadowing(cx, tree, node, &mut out),
-                _ => {}
             }
+            SyntaxKind::REF_PAT | SyntaxKind::RANGE_PAT => {
+                if self.linted_ref.is_some_and(|range| !range.contains_range(node.text_range())) {
+                    self.linted_ref = None;
+                }
+                if self.linted_ref.is_none() {
+                    self.linted_ref = ellipsis_range(cx, tree, node, out);
+                }
+            }
+            SyntaxKind::WHILE_EXPR => while_true(cx, tree, node, out),
+            SyntaxKind::STMT_LIST => redundant_semicolons(cx, self.expansions, tree, node, &mut self.stmts, out),
+            SyntaxKind::PREFIX_EXPR => {
+                ambiguous_negative_literal(cx, tree, node, out);
+                double_negation(cx, tree, node, out);
+            }
+            SyntaxKind::LABEL => super::labels::shadowing(cx, tree, node, out),
+            _ => {}
         }
     }
-    out
 }
 
 /// A lint of the early lint pass at `at`, with the fact of the source it read.
@@ -213,13 +225,18 @@ fn special_module_names(cx: &Cx<'_, '_>, walk: &Walk<'_>, expansions: &Expansion
         if module.item_list().is_some() {
             continue;
         }
+        let Some(name) = module.name() else { continue };
+        let name = name.text();
+        let name = name.strip_prefix("r#").unwrap_or(name);
+        if name != "lib" && name != "main" {
+            continue;
+        }
         let Some(owner) = ast::AnyHasAttrs::cast(item.clone()) else { continue };
         if walk.attrs(&owner).iter().any(|(meta, _)| meta.simple_name().as_deref() == Some("path")) {
             continue;
         }
-        let Some(name) = module.name() else { continue };
         let span = cx.span(InFile::new(in_tree.file, range_of(&item)));
-        let mut diag = match name.text().trim_start_matches("r#") {
+        let mut diag = match name {
             "lib" => {
                 let mut diag = Diag::lint("special_module_name", "found module declaration for lib.rs", span);
                 diag.note("lib.rs is the root of this crate's library target");
@@ -335,12 +352,10 @@ fn ellipsis_range(cx: &Cx<'_, '_>, tree: &Tree, node: &SyntaxNode, out: &mut Vec
         diag
     };
     source_fact(cx, &mut diag, at);
-    let found = match diag.is_lint() {
-        true => Found::lint(diag, Phase::Resolve, at),
-        // An error of the early lint pass, placed where the pass emits it.
-        false => Found { diag, phase: Phase::Resolve, lint_at: Some(at) },
-    };
-    out.push(Emitted { found, pass: Pass::Early });
+    out.push(match diag.is_lint() {
+        true => Emitted::new(diag, Phase::Resolve, Pass::Early, at),
+        false => Emitted::placed(diag, Phase::Resolve, Pass::Early, at),
+    });
     parenthesise.then(|| node.text_range())
 }
 

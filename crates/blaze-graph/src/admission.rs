@@ -18,6 +18,7 @@
 
 use std::fmt;
 
+use blaze_ids::radix;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -114,7 +115,7 @@ mod in_order {
 /// The kinds of `by_kind` and their estimates, in order of the kinds' numbers.
 fn sorted(by_kind: &FxHashMap<TaskKind, Estimate>) -> Vec<(TaskKind, Estimate)> {
     let mut kinds: Vec<(TaskKind, Estimate)> = by_kind.iter().map(|(&k, &e)| (k, e)).collect();
-    kinds.sort_unstable_by_key(|it| it.0);
+    radix::sort_copy_by_key(&mut kinds, |it| it.0.0);
     kinds
 }
 
@@ -245,6 +246,56 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
+/// What a node is predicted to cost before it runs: its [`Spec::cost`](crate::Spec::cost) for
+/// the plane's critical-path order, when the predictor knows one, and its peak bytes for
+/// admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Prediction {
+    /// The node's cost, in the predictor's one unit for every node of a plane; `None` keeps
+    /// the spec's.
+    pub cost: Option<u64>,
+    /// The most bytes it is predicted to hold.
+    pub peak: u64,
+}
+
+impl Prediction {
+    /// `spec` with the prediction in: its memory never under the prediction's peak, its cost
+    /// the prediction's when it has one.
+    pub fn apply(self, spec: &mut crate::Spec) {
+        spec.memory = spec.memory.max(self.peak);
+        if let Some(cost) = self.cost {
+            spec.cost = cost;
+        }
+    }
+}
+
+/// What the plane asks for a node's [`Prediction`] and tells what the node then did. A
+/// prediction orders and admits work only: it never changes what is built.
+pub trait Predict: Send {
+    /// What a task of `kind` with `key` is predicted to cost.
+    fn predict(&self, kind: TaskKind, key: Option<crate::Key>) -> Prediction;
+    /// A task of `kind` with `key` ran for `ran_ns` of its own (not its waits) and held `peak`
+    /// bytes at most.
+    fn observe(&mut self, kind: TaskKind, key: Option<crate::Key>, ran_ns: u64, peak: u64);
+    /// What it learned, as bytes for the daemon's image.
+    fn encode(&self) -> Vec<u8>;
+}
+
+/// Today's predictor: peaks by kind, costs left as the specs give them.
+impl Predict for Estimates {
+    fn predict(&self, kind: TaskKind, _key: Option<crate::Key>) -> Prediction {
+        Prediction { cost: None, peak: Estimates::predict(self, kind) }
+    }
+
+    fn observe(&mut self, kind: TaskKind, _key: Option<crate::Key>, _ran_ns: u64, peak: u64) {
+        Estimates::observe(self, kind, peak);
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        Estimates::encode(self)
+    }
+}
+
 /// A task's arena: where everything the task allocates while it runs goes, so its peak is
 /// measured and its results, once written into the zero-copy format, outlive it.
 pub trait Arena {
@@ -283,6 +334,34 @@ mod tests {
             1..=3 => 0,
             _ => (1 + random.below(8)) << (10 + random.below(16)),
         }
+    }
+
+    #[test]
+    fn estimates_predict_peaks_and_keep_the_specs_costs() {
+        let mut predict: Box<dyn Predict> = Box::new(Estimates::new(64));
+        let key = Some(crate::Key([1; 32]));
+        assert_eq!(predict.predict(TaskKind(2), key), Prediction { cost: None, peak: 64 });
+        predict.observe(TaskKind(2), key, 5_000, 900);
+        let prediction = predict.predict(TaskKind(2), None);
+        assert_eq!(prediction, Prediction { cost: None, peak: 900 });
+        let mut estimates = Estimates::new(64);
+        estimates.observe(TaskKind(2), 900);
+        assert_eq!(predict.encode(), estimates.encode());
+
+        let mut spec = crate::Spec {
+            id: crate::NodeId(0),
+            kind: blaze_protocol::events::NodeKind::Codegen,
+            name: "f".into(),
+            deps: Vec::new(),
+            pool: crate::Pool::Work,
+            cost: 3,
+            key,
+            memory: 1000,
+        };
+        prediction.apply(&mut spec);
+        assert_eq!((spec.cost, spec.memory), (3, 1000));
+        Prediction { cost: Some(7), peak: 2000 }.apply(&mut spec);
+        assert_eq!((spec.cost, spec.memory), (7, 2000));
     }
 
     #[test]

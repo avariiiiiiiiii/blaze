@@ -15,6 +15,7 @@ use hir_def::{
     hir::{BindingId, ClosureKind, CoroutineSource, Expr, ExprId, Ordering, PatId},
 };
 use hir_expand::name::Name;
+use intern::Symbol;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use macros::{GenericTypeVisitable, TypeFoldable, TypeVisitable};
 use rustc_hash::FxHashMap;
@@ -31,6 +32,7 @@ use crate::{
     consteval::ConstEvalError,
     db::{HirDatabase, InternedClosure, InternedClosureId, InternedCoroutineId},
     infer::PointerCast,
+    intrinsic::Intrinsic,
     layout::LayoutError,
     next_solver::{
         Allocation, AllocationData, DbInterner, ErrorGuaranteed, GenericArgs, ParamEnv,
@@ -569,6 +571,9 @@ pub enum TerminatorKind {
         /// `true` if this is from a call in HIR rather than from an overloaded
         /// operator. True for overloaded function call.
         from_hir_call: bool,
+        /// The intrinsic `func` is, recognized once when the call is lowered; `None` for a
+        /// call of anything else, a function pointer's included.
+        intrinsic: Option<Intrinsic>,
         // This `Span` is the span of the function, without the dot and receiver
         // (e.g. `foo(a, b)` in `x.foo(a, b)`
         //fn_span: Span,
@@ -2141,6 +2146,8 @@ pub enum MirLowerError<'db> {
     UnresolvedLabel,
     UnresolvedUpvar(StoredPlace),
     InaccessibleLocal,
+    /// A call of a `#[rustc_intrinsic]` function whose name is none of rustc's intrinsics.
+    UnknownIntrinsic(Symbol),
 
     // monomorphization errors:
     GenericArgNotProvided(GenericParamId, StoredGenericArgs),
@@ -2164,7 +2171,7 @@ pub fn is_by_move_coroutine<'db>(
     let Expr::Closure {
         closure_kind: ClosureKind::Coroutine { source: CoroutineSource::Closure, .. },
         ..
-    } = &store[expr]
+    } = store.expr(expr)
     else {
         return false;
     };

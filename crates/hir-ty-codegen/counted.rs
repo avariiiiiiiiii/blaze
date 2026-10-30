@@ -5,6 +5,8 @@
 //! counts to ([`now`], [`within`]), until it is dropped. Countings nest: what an inner one
 //! counts, the ones around it count too.
 
+#![forbid(unsafe_code)]
+
 use std::{
     cell::RefCell,
     marker::PhantomData,

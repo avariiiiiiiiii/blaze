@@ -8,6 +8,8 @@
 //! whole program it was compiled with. A callee's edit changes the key of every function that
 //! imported it, and of no other.
 
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 
 use blaze_ids::{ContentId, Hasher};

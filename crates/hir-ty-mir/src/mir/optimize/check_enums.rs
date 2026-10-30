@@ -54,7 +54,7 @@ pub(super) fn check_enums<'db>(ctx: &Ctx<'db>, body: &mut MirBody<'db>) -> Resul
     let consts = Consts::new(ctx)?;
     let blocks: Vec<BasicBlockId> = body.basic_blocks.iter().map(|(id, _)| id).collect();
     for &block in blocks.iter().rev() {
-        for site in sites(ctx, body, block) {
+        for site in sites(body, block) {
             let Some((source, ty)) = transmute_at(ctx, body, block, site) else { continue };
             let Some(check) = find(ctx, body, &source, ty)? else { continue };
             let span = site_span(body, block, site);

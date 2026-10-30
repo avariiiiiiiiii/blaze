@@ -343,7 +343,7 @@ fn ort(of: &Of<'_>) -> anyhow::Result<Option<Download>> {
     }
     // As `resolve_dist` picks: one of exactly the features, else the first of those with the
     // most of them, when that has them all.
-    candidates.sort_by_key(|it| std::cmp::Reverse(it.0.intersection(&wanted).count()));
+    blaze_ids::radix::sort_by_key(&mut candidates, |it| !(it.0.intersection(&wanted).count() as u64));
     let exact = candidates.iter().find(|it| it.0 == wanted);
     let (features, url) = exact.unwrap_or(&candidates[0]);
     if features.intersection(&wanted).count() != wanted.len() {

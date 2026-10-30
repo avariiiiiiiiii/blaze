@@ -274,7 +274,7 @@ pub fn tests_reach(
     // One found later is mostly below one found earlier, and is then taken whole by it.
     let mut walked: Vec<u32> =
         sealed.iter().filter(|(_, it)| it.below.is_none()).map(|(&at, _)| at).collect();
-    walked.sort_unstable_by(|a, b| b.cmp(a));
+    blaze_ids::radix::sort_copy_by_key(&mut walked, |&it| !it);
     let added = walked.len();
     for at in walked {
         let below = Arc::new(below_of(&walk, &sealed, at));
@@ -337,7 +337,7 @@ pub fn tests_reach(
                 }
             }
             let type_id::Fingerprint(low, high) = hasher.finish();
-            found.sort_by_key(|it| it.kind);
+            blaze_ids::radix::sort_by_key(&mut found, |it| it.kind as u8);
             Reach { hash: u128::from(low) | u128::from(high) << 64, found }
         })
         .collect();
@@ -584,7 +584,7 @@ fn below_of(walk: &Walk<'_>, sealed: &FxHashMap<u32, Sealed>, start: u32) -> Bel
         }
         at += 1;
     }
-    below.found.sort_by_key(|it| it.kind);
+    blaze_ids::radix::sort_by_key(&mut below.found, |it| it.kind as u8);
     below
 }
 

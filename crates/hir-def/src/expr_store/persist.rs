@@ -26,7 +26,6 @@ use std::mem::{offset_of, size_of};
 use blaze_format::{
     FormatError, Part, Persist, Record, SchemaHash, Slice, Str, Writer, open_as, schema_of,
 };
-use cfg::{CfgAtom, CfgOptions};
 use either::Either;
 use hir_expand::{
     HirFileId, InFile, MacroCallId, MacroCallStyles, MacroDefId, MacroDefKind,
@@ -34,7 +33,7 @@ use hir_expand::{
     name::Name,
     proc_macro::{CustomProcMacroExpander, ProcMacroKind},
 };
-use intern::{Symbol, sym};
+use intern::Symbol;
 use la_arena::{Arena, ArenaMap, Idx, RawIdx};
 use rustc_abi::ExternAbi;
 use rustc_hash::FxHashMap;
@@ -219,7 +218,7 @@ blaze_format::record! {
     /// value of each beside it: an id raw (a packed one for expressions and patterns), a macro
     /// call's salsa id as its bits.
     #[derive(Clone, Copy)]
-    pub(crate) struct SourceMapRoot: 2 {
+    pub(crate) struct SourceMapRoot: 3 {
         pub(crate) expr_map_back: Slice<Src>,
         pub(crate) pat_map_back: Slice<Src>,
         pub(crate) label_map_back: Slice<Src>,
@@ -246,7 +245,7 @@ blaze_format::record! {
 blaze_format::record! {
     /// The root of a [`BodySourceMap`]'s buffer.
     #[derive(Clone, Copy)]
-    pub(crate) struct BodySourceMapRoot: 2 {
+    pub(crate) struct BodySourceMapRoot: 3 {
         pub(crate) store: SourceMapRoot,
         /// The pointer to `self`, when there is one.
         pub(crate) self_param: Slice<Src>,
@@ -2070,7 +2069,7 @@ impl<'a> ExpressionStoreSourceMapRef<'a> {
 impl Persist for ExpressionStoreSourceMap {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("ExpressionStoreSourceMap"),
-        Part::U64(2),
+        Part::U64(3),
         Part::Schema(<SourceMapRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = ExpressionStoreSourceMapRef<'a>;
@@ -2115,7 +2114,7 @@ impl<'a> BodySourceMapRef<'a> {
 impl Persist for BodySourceMap {
     const SCHEMA: SchemaHash = schema_of(&[
         Part::Str("BodySourceMap"),
-        Part::U64(2),
+        Part::U64(3),
         Part::Schema(<BodySourceMapRoot as Record>::SCHEMA),
     ]);
     type Ref<'a> = BodySourceMapRef<'a>;
@@ -2960,51 +2959,14 @@ impl<N: AstNode> Code for AstPtr<N> {
     }
 }
 
-impl Code for CfgOptions {
-    fn put(&self, w: &mut Words) {
-        let mut atoms: Vec<&CfgAtom> = self.into_iter().collect();
-        atoms.sort_unstable();
-        w.seq(atoms.into_iter());
-    }
-
-    /// Rebuilt from the default, which holds `true`, through the atoms' public API, which
-    /// refuses `true` and `false` but makes the same set as the one written.
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        let atoms: Vec<CfgAtom> = r.seq::<CfgAtom, _>()?;
-        if atoms.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(r.invalid("cfg options out of order"));
-        }
-        let mut has_true = false;
-        let mut rest = Vec::with_capacity(atoms.len());
-        for atom in atoms {
-            match &atom {
-                CfgAtom::Flag(flag) if *flag == sym::true_ => has_true = true,
-                CfgAtom::Flag(key) | CfgAtom::KeyValue { key, .. }
-                    if *key == sym::true_ || *key == sym::false_ =>
-                {
-                    return Err(r.invalid("a cfg option of `true` or `false` that is not `true`"));
-                }
-                _ => rest.push(atom),
-            }
-        }
-        if !has_true {
-            return Err(r.invalid("cfg options without `true`"));
-        }
-        let mut options = CfgOptions::default();
-        options.extend(rest);
-        Ok(options)
-    }
-}
-
 impl Code for ExpressionStoreDiagnostics {
     fn put(&self, w: &mut Words) {
         use ExpressionStoreDiagnostics::*;
         match self {
-            InactiveCode { node, cfg, opts } => {
+            InactiveCode { node, cfg } => {
                 w.u32(0);
                 node.put(w);
                 cfg.put(w);
-                opts.put(w);
             }
             UnresolvedMacroCall { node, path } => {
                 w.u32(1);
@@ -3045,7 +3007,7 @@ impl Code for ExpressionStoreDiagnostics {
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         use ExpressionStoreDiagnostics::*;
         Ok(match r.tag(8, "a diagnostic kind out of range")? {
-            0 => InactiveCode { node: r.get()?, cfg: r.get()?, opts: r.get()? },
+            0 => InactiveCode { node: r.get()?, cfg: r.get()? },
             1 => UnresolvedMacroCall { node: r.get()?, path: r.get()? },
             2 => UnreachableLabel { node: r.get()?, name: r.get()? },
             3 => AwaitOutsideOfAsync { node: r.get()?, location: r.get()? },

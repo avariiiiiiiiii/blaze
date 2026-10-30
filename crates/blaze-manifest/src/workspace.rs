@@ -2,7 +2,6 @@
 //! walking up from the current manifest; its members, from `members` globs and path
 //! dependencies, less `exclude`; its default members; and cargo's checks that they agree.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use annotate_snippets::{Level, Renderer};
@@ -402,7 +401,7 @@ impl<'c> Workspace<'c> {
     }
 
     fn validate_unique_names(&self) -> anyhow::Result<()> {
-        let mut names = BTreeMap::new();
+        let mut names = FxHashMap::default();
         for member in &self.members {
             let name = match self.get(member) {
                 EitherManifest::Real(m) => &m.package_id.name,

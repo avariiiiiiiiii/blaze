@@ -1,18 +1,20 @@
 //! What rustc's resolver says of the names in the signatures of items, where hir resolves them
 //! and reports nothing: the paths of types and traits in fields, signatures, impl headers,
 //! bounds, where clauses, generic defaults and type aliases (E0425, E0405, E0404, E0573, E0433,
-//! E0411, E0401, E0603) and their lifetimes (E0261, E0401). The names in bodies and in the
-//! constants of types (array lengths) are the front end's: `UnresolvedIdent` of their bodies
-//! and anon consts.
+//! E0411, E0401, E0603), their lifetimes (E0261, E0401), and re-exports more visible than
+//! their items (E0364, E0365). The names in bodies and in the constants of types (array
+//! lengths) are the front end's: `UnresolvedIdent` of their bodies and anon consts.
 //!
 //! Follows rustc's `compiler/rustc_resolve/src/late.rs` (`smart_resolve_path_fragment`,
-//! `resolve_lifetime`, `PathSource`) and `late/diagnostics.rs` (MIT or Apache-2.0).
+//! `resolve_lifetime`, `PathSource`), `late/diagnostics.rs` and `imports.rs` (MIT or
+//! Apache-2.0).
 
 mod failure;
 mod lifetimes;
 mod outer;
 mod paths;
 mod privacy;
+mod reexports;
 
 use blaze_items::{Fact, ItemId};
 use hir::{HasSource as _, InFile};
@@ -22,8 +24,9 @@ use syntax::{AstNode, SyntaxNode, WalkEvent, ast};
 use super::defs::{item_id, scopes};
 use crate::{cx::Cx, lower::Found};
 
+/// The imports first, as rustc finalizes them before it resolves the items.
 pub(crate) fn check(cx: &Cx<'_, '_>) -> Vec<Found> {
-    let mut found = Vec::new();
+    let mut found = reexports::check(cx);
     for signature in signatures(cx) {
         walk(cx, &signature, &mut found);
     }

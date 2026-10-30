@@ -1,10 +1,5 @@
-use hir_ty_mir::mir::Shadow as _;
-
-use super::{Shadow, UNINIT, report::thread_name, valid};
-use crate::{
-    ids::{Span, ThreadId},
-    memory::MemError,
-};
+use super::valid;
+use crate::ids::Span;
 
 // rustc_const_eval validity.rs, `fmt_range`: every arm.
 #[test]
@@ -45,22 +40,3 @@ fn value_error_display() {
     );
 }
 
-#[test]
-fn thread_names_are_miris() {
-    assert_eq!(thread_name(ThreadId::MAIN), "main");
-    assert_eq!(thread_name(ThreadId(3)), "unnamed-3");
-}
-
-// The evaluator calls `require_init` with no machine at hand: the first failure waits in the
-// slot for `run_test`, later ones don't replace it.
-#[test]
-fn require_init_keeps_the_first_failure() {
-    UNINIT.take();
-    let mut value = Shadow::init(4);
-    value.put(4, &Shadow(crate::memory::Bytes::uninit(4)));
-    assert!(value.require_init(0..4).is_ok());
-    assert!(value.require_init(2..8).is_err());
-    assert!(value.require_init(6..8).is_err());
-    assert_eq!(UNINIT.take(), Some(MemError::Uninit(None)));
-    assert_eq!(UNINIT.take(), None);
-}

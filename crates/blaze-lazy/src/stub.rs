@@ -34,7 +34,7 @@ use std::fmt;
 
 use crate::{LazyId, MOST_LAZY};
 
-mod aarch64;
+pub(crate) mod aarch64;
 mod cpu;
 mod x86_64;
 

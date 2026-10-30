@@ -10,6 +10,8 @@
 //! program may link against a build of the crates without it, so a lookup checks that the
 //! symbols are there.
 
+#![forbid(unsafe_code)]
+
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cranelift_codegen::{
@@ -436,7 +438,8 @@ impl Entry {
             hasher.update(bytes);
         };
         // 13: `ub_checks()` is the compiling crate's `debug-assertions`, as rustc has it.
-        field(b"blaze entry 13");
+        // 14: a body of a crate with `debug-assertions` has rustc's UB checks (`MirOptions`).
+        field(b"blaze entry 14");
         field(program.map_or(&[][..], |it| it));
         // Code of one producer is not what another would have given.
         field(super::Backend::from_env().ok()?.to_string().as_bytes());

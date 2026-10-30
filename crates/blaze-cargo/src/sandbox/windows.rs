@@ -16,7 +16,6 @@
 //! [#1390]: https://github.com/indexable-inc/blaze/issues/1390
 
 use std::{
-    collections::BTreeMap,
     ffi::{OsStr, OsString, c_void},
     fmt::Display,
     os::windows::ffi::OsStrExt as _,
@@ -27,6 +26,7 @@ use std::{
 };
 
 use blaze_usercode::confine::Spec;
+use rustc_hash::FxHashMap;
 use windows_sys::{
     Win32::{
         Foundation::{
@@ -174,9 +174,13 @@ pub fn run(spec: &Spec) -> Result<i32, String> {
     startup.lpAttributeList = made.attributes.list();
     let inherit = BOOL::from(!made.inherited.is_empty());
     let mut process = PROCESS_INFORMATION::default();
-    // SAFETY: the strings end in NUL, the command line is the program's to change, the block is
-    // a Unicode environment ending in two NULs, and the attribute list and what it points to
-    // (`made`) outlive the call.
+    // SAFETY: `program` and `dir` end in NUL (`wide`), `line` ends in NUL and is this frame's
+    // own buffer, which CreateProcessW may write into (`command_line`), and `block` is a UTF-16
+    // environment ending in two NULs (`environment`), as CREATE_UNICODE_ENVIRONMENT says. The
+    // attribute list and the capabilities, SIDs and handles it points into are in `made`, on the
+    // heap and live until `run` returns ([`Made`]). `startup` is an STARTUPINFOEXW whose `cb`
+    // says so, as EXTENDED_STARTUPINFO_PRESENT has Windows read it; `process` is a live
+    // PROCESS_INFORMATION for it to fill. A string without its NUL would be read past its end.
     let created = unsafe {
         CreateProcessW(
             program.as_ptr(),
@@ -196,29 +200,36 @@ pub fn run(spec: &Spec) -> Result<i32, String> {
     }
     let child = Handle(process.hProcess);
     let thread = Handle(process.hThread);
-    // SAFETY: both handles are open.
+    // SAFETY: `made.job` is the job `job()` made and `child` the process CreateProcessW just
+    // gave; each `Handle` owns its handle and closes it only when dropped, after this call. A
+    // closed handle's number may be another object's by now.
     if unsafe { AssignProcessToJobObject(made.job.0, child.0) } == 0 {
         let why = failed("holding the program in the sandbox's job", "AssignProcessToJobObject");
-        // SAFETY: the process is open and has not run.
+        // SAFETY: `child` owns the process handle and is not dropped yet; the process is
+        // suspended (CREATE_SUSPENDED), so it ran none of its code outside the job.
         unsafe { TerminateProcess(child.0, 1) };
         return Err(why);
     }
     let _registered = Registered::new(&made.job);
-    // SAFETY: the thread is open and suspended.
+    // SAFETY: `thread` owns the handle of the process's first thread, which CreateProcessW gave
+    // suspended, and is dropped only after this call. The process is in the job by now, so all it
+    // starts is held there too.
     if unsafe { ResumeThread(thread.0) } == u32::MAX {
         let why = failed("letting the program run", "ResumeThread");
         end(&made.job, 1);
         return Err(why);
     }
     drop(thread);
-    // SAFETY: the process is open.
+    // SAFETY: `child` owns the process handle until `run` returns, so the wait is on this
+    // process and no other object that took its number.
     if unsafe { WaitForSingleObject(child.0, INFINITE) } != WAIT_OBJECT_0 {
         let why = failed("waiting for the program, which started", "WaitForSingleObject");
         end(&made.job, 1);
         return Err(why);
     }
     let mut code = 0u32;
-    // SAFETY: the process is open and has ended.
+    // SAFETY: `child` still owns the process handle, and `code` is a live `u32` for the call to
+    // write and nothing else.
     if unsafe { GetExitCodeProcess(child.0, &mut code) } == 0 {
         let why = failed("taking the exit code of the program, which ran", "GetExitCodeProcess");
         end(&made.job, 1);
@@ -277,19 +288,28 @@ fn make(network: bool) -> Result<Made, String> {
     let standard = standard()?;
     let inherited: Vec<HANDLE> = standard.iter().flatten().map(|it| it.0).collect();
     let mut attributes = Attributes::new(if inherited.is_empty() { 1 } else { 2 })?;
-    attributes.set(
-        PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-        (&raw const *capabilities).cast(),
-        size_of::<SECURITY_CAPABILITIES>(),
-        "putting the program in the sandbox's AppContainer",
-    )?;
-    if !inherited.is_empty() {
+    // SAFETY: `capabilities` is one SECURITY_CAPABILITIES in a box, which `Made` keeps beside
+    // `attributes` (moving `Made` leaves it where it is), and what it points to, `granted`'s
+    // list and the SIDs of `container`, `run` and `network`, is kept there too.
+    unsafe {
         attributes.set(
-            PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            inherited.as_ptr().cast(),
-            inherited.len() * size_of::<HANDLE>(),
-            "passing the program its standard handles and no other",
-        )?;
+            PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            (&raw const *capabilities).cast(),
+            size_of::<SECURITY_CAPABILITIES>(),
+            "putting the program in the sandbox's AppContainer",
+        )
+    }?;
+    if !inherited.is_empty() {
+        // SAFETY: `inherited` is `len` handles on the heap, which `Made` keeps beside
+        // `attributes` and never changes; the handles are `standard`'s, also kept there.
+        unsafe {
+            attributes.set(
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                inherited.as_ptr().cast(),
+                inherited.len() * size_of::<HANDLE>(),
+                "passing the program its standard handles and no other",
+            )
+        }?;
     }
     Ok(Made {
         attributes,
@@ -351,7 +371,10 @@ struct Handle(HANDLE);
 impl Drop for Handle {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
-            // SAFETY: the handle is this one's to close.
+            // SAFETY: every `Handle` is made from a handle a call just returned to this module
+            // (CreateProcessW, DuplicateHandle, CreateJobObjectW, CreateMutexW), never copied
+            // into another `Handle`, so this is its one close; closing it twice could close
+            // whatever reused its number.
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -365,12 +388,15 @@ impl Container {
         let name = literal(PROFILE);
         let shown = literal("blaze sandbox");
         let mut sid: PSID = null_mut();
-        // SAFETY: the strings end in NUL; no capabilities are given the profile.
+        // SAFETY: `name` and `shown` end in NUL (`literal`) and live in this frame for the call,
+        // which only reads them; a null list of 0 capabilities is read as none; `sid` is a live
+        // PSID for it to set, freed by `Container`'s drop.
         let made = unsafe {
             CreateAppContainerProfile(name.as_ptr(), shown.as_ptr(), shown.as_ptr(), null(), 0, &mut sid)
         };
         if made == PROFILE_EXISTS {
-            // SAFETY: the name ends in NUL.
+            // SAFETY: `name` ends in NUL (`literal`) and lives in this frame; `sid`, still null
+            // as CreateAppContainerProfile failed, is a live PSID for the call to set.
             let found = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
             if found < 0 {
                 return Err(failed_with(
@@ -393,7 +419,9 @@ impl Container {
 impl Drop for Container {
     fn drop(&mut self) {
         if !self.0.is_null() {
-            // SAFETY: the SID is the profile functions', which are freed with FreeSid.
+            // SAFETY: `self.0` is the SID CreateAppContainerProfile or
+            // DeriveAppContainerSidFromAppContainerName made (`open`), which both say to free
+            // with FreeSid, and `Container` is never copied, so this frees it once.
             unsafe { FreeSid(self.0) };
         }
     }
@@ -412,7 +440,9 @@ impl Capability {
         let what = "the run's capability";
         let name = literal(&format!("blaze.sandbox.run.{:016x}{:016x}", random(what)?, random(what)?));
         let mut it = Capability { groups: null_mut(), group_count: 0, sids: null_mut(), count: 0 };
-        // SAFETY: the name ends in NUL; the lists it makes are freed when `it` is dropped.
+        // SAFETY: `name` ends in NUL (`literal`) and lives in this frame; the four out-pointers
+        // are live fields of `it`, and the lists the call makes there are freed only by
+        // `Capability`'s drop, which reads `count`s the same call set.
         let derived = unsafe {
             DeriveCapabilitySidsFromName(
                 name.as_ptr(),
@@ -432,7 +462,9 @@ impl Capability {
     }
 
     fn sid(&self) -> PSID {
-        // SAFETY: there is at least one.
+        // SAFETY: `new` returns a `Capability` only when `sids` is not null and `count` is at
+        // least 1, so the first entry is in the list DeriveCapabilitySidsFromName made, which
+        // lives until `self` drops; with none, this would read past the list.
         unsafe { *self.sids }
     }
 }
@@ -444,16 +476,19 @@ impl Drop for Capability {
                 continue;
             }
             for at in 0..count as usize {
-                // SAFETY: DeriveCapabilitySidsFromName made the list with `count` entries, so
-                // `at` is inside it.
+                // SAFETY: `list` is not null, so DeriveCapabilitySidsFromName made it with
+                // `count` entries (`new`), and `at < count`: the offset stays inside it.
                 let entry = unsafe { list.add(at) };
-                // SAFETY: as above, the entry is in the list and holds a SID's pointer.
+                // SAFETY: `entry` is inside the list (above), which is not freed until after
+                // this loop, and every entry the call wrote is an initialized PSID.
                 let sid = unsafe { *entry };
-                // SAFETY: each SID in the list was made with LocalAlloc and is freed only here.
+                // SAFETY: each SID of the list was made by LocalAlloc in
+                // DeriveCapabilitySidsFromName, which says to free it with LocalFree, and this
+                // drop, the one for a `Capability` that is never copied, frees it once.
                 unsafe { LocalFree(sid) };
             }
-            // SAFETY: the list was made with LocalAlloc, its SIDs are freed above, and this
-            // drop is the only one.
+            // SAFETY: the list itself was made by LocalAlloc too, its SIDs are freed above and
+            // nothing reads it after; this drop runs once.
             unsafe { LocalFree(list.cast()) };
         }
     }
@@ -462,7 +497,9 @@ impl Drop for Capability {
 fn well_known(kind: WELL_KNOWN_SID_TYPE, what: &str) -> Result<SidBuffer, String> {
     let mut buffer: SidBuffer = [0; (SECURITY_MAX_SID_SIZE / 4) as usize];
     let mut size = SECURITY_MAX_SID_SIZE;
-    // SAFETY: the buffer is `size` bytes.
+    // SAFETY: `buffer` is SECURITY_MAX_SID_SIZE bytes, the `size` the call is told, live and
+    // exclusive for it, and aligned for a SID's `u32` fields ([`SidBuffer`]); the call writes at
+    // most `size` bytes and sets `size` to what it wrote. A null domain is the local one.
     if unsafe { CreateWellKnownSid(kind, null_mut(), buffer.as_mut_ptr().cast(), &mut size) } == 0 {
         return Err(failed(format!("making the SID of {what}"), "CreateWellKnownSid"));
     }
@@ -474,7 +511,8 @@ fn well_known(kind: WELL_KNOWN_SID_TYPE, what: &str) -> Result<SidBuffer, String
 /// state (the clipboard, atoms, other processes' windows, the display and system settings,
 /// logging off).
 fn job() -> Result<Handle, String> {
-    // SAFETY: no attributes, no name.
+    // SAFETY: both arguments may be null, for the default security and no name; the call reads
+    // no memory of this process. The handle it gives, or null, is owned by the `Handle`.
     let job = Handle(unsafe { CreateJobObjectW(null(), null()) });
     if job.0.is_null() {
         return Err(failed("making the sandbox's job", "CreateJobObjectW"));
@@ -482,7 +520,8 @@ fn job() -> Result<Handle, String> {
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
     limits.BasicLimitInformation.LimitFlags =
         JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    set_job(&job, JobObjectExtendedLimitInformation, &limits, "limiting the sandbox's job")?;
+    // SAFETY: JobObjectExtendedLimitInformation names a JOBOBJECT_EXTENDED_LIMIT_INFORMATION.
+    unsafe { set_job(&job, JobObjectExtendedLimitInformation, &limits, "limiting the sandbox's job") }?;
     let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
         UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
             | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
@@ -493,12 +532,18 @@ fn job() -> Result<Handle, String> {
             | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
             | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
     };
-    set_job(&job, JobObjectBasicUIRestrictions, &ui, "keeping the sandbox's job off the desktop")?;
+    // SAFETY: JobObjectBasicUIRestrictions names a JOBOBJECT_BASIC_UI_RESTRICTIONS.
+    unsafe { set_job(&job, JobObjectBasicUIRestrictions, &ui, "keeping the sandbox's job off the desktop") }?;
     Ok(job)
 }
 
-fn set_job<T>(job: &Handle, class: JOBOBJECTINFOCLASS, info: &T, what: &str) -> Result<(), String> {
-    // SAFETY: `info` is the structure `class` names.
+/// # Safety
+///
+/// `T` is the structure `class` names: the call reads `info` as that structure, and one of
+/// another layout would be read wrongly or past its end.
+unsafe fn set_job<T>(job: &Handle, class: JOBOBJECTINFOCLASS, info: &T, what: &str) -> Result<(), String> {
+    // SAFETY: `info` is a live `T` of `size_of::<T>()` bytes, read only, and `T` is what `class`
+    // names (`# Safety`); `job` owns an open job handle.
     let set = unsafe { SetInformationJobObject(job.0, class, (info as *const T).cast(), size_of::<T>() as u32) };
     match set {
         0 => Err(failed(what, "SetInformationJobObject")),
@@ -509,12 +554,16 @@ fn set_job<T>(job: &Handle, class: JOBOBJECTINFOCLASS, info: &T, what: &str) -> 
 /// Ends every process of `job` with `code` and waits, for a while, for them to be gone, so what
 /// they had open is closed before the run's directories are taken back.
 fn end(job: &Handle, code: u32) {
-    // SAFETY: the job is open.
+    // SAFETY: `job` owns an open job handle, borrowed for the call; the call reads no memory of
+    // this process.
     unsafe { TerminateJobObject(job.0, code) };
     let started = Instant::now();
     loop {
         let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
-        // SAFETY: `info` is the structure the class names.
+        // SAFETY: JobObjectBasicAccountingInformation names a
+        // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, and `info` is a live, exclusive one of the size
+        // the call is told, which it writes and nothing more; a null length out-pointer is
+        // allowed. `job` owns an open job handle.
         let asked = unsafe {
             QueryInformationJobObject(
                 job.0,
@@ -542,16 +591,20 @@ fn standard() -> Result<[Option<Handle>; 3], String> {
     let which: [(STD_HANDLE, &str); 3] =
         [(STD_INPUT_HANDLE, "input"), (STD_OUTPUT_HANDLE, "output"), (STD_ERROR_HANDLE, "error")];
     for (at, (which, name)) in which.into_iter().enumerate() {
-        // SAFETY: no arguments but which.
+        // SAFETY: `which` is one of the three STD_HANDLE values; the call reads no memory of
+        // this process, and the handle it gives is the process's, not this function's to close.
         let handle = unsafe { GetStdHandle(which) };
         if handle.is_null() || handle == INVALID_HANDLE_VALUE {
             continue;
         }
         let mut copy: HANDLE = null_mut();
-        // SAFETY: no arguments; the pseudo-handle it gives needs no closing.
+        // SAFETY: the call takes nothing and reads no memory; the pseudo-handle it gives is a
+        // constant that is never closed, so nothing here closes it.
         let process = unsafe { GetCurrentProcess() };
-        // SAFETY: `handle` was just checked open and is this process's own; `copy` is a live
-        // HANDLE, owned by the `Handle` below, which closes it once.
+        // SAFETY: `handle` is this process's standard handle, just checked neither null nor
+        // INVALID_HANDLE_VALUE, and `process` names this process on both sides; `copy` is a
+        // live HANDLE for the call to set, owned from then on by the `Handle` below, which
+        // closes it once.
         let copied = unsafe { DuplicateHandle(process, handle, process, &mut copy, 0, 1, DUPLICATE_SAME_ACCESS) };
         if copied == 0 {
             return Err(failed(format!("passing the program the launcher's standard {name}"), "DuplicateHandle"));
@@ -567,13 +620,16 @@ struct Attributes(Vec<usize>);
 impl Attributes {
     fn new(count: u32) -> Result<Attributes, String> {
         let mut size = 0;
-        // SAFETY: a null list asks for its size alone.
+        // SAFETY: a null list asks for the size alone and is never written; `size` is a live
+        // `usize` for the call to set.
         unsafe { InitializeProcThreadAttributeList(null_mut(), count, 0, &mut size) };
         if size == 0 {
             return Err(failed("sizing the program's attribute list", "InitializeProcThreadAttributeList"));
         }
         let mut buffer = vec![0usize; size.div_ceil(size_of::<usize>())];
-        // SAFETY: the buffer is at least `size` bytes.
+        // SAFETY: `buffer` is at least `size` bytes, the size the call above asked for the same
+        // `count`, live and exclusive for it, and aligned to a pointer's alignment, which the
+        // list's fields need; a smaller buffer would be written past.
         if unsafe { InitializeProcThreadAttributeList(buffer.as_mut_ptr().cast(), count, 0, &mut size) } == 0 {
             return Err(failed("making the program's attribute list", "InitializeProcThreadAttributeList"));
         }
@@ -584,10 +640,16 @@ impl Attributes {
         self.0.as_mut_ptr().cast()
     }
 
-    /// Sets `attribute` to the `size` bytes at `value`, which the list points to and which
-    /// must outlive it.
-    fn set(&mut self, attribute: u32, value: *const c_void, size: usize, what: &str) -> Result<(), String> {
-        // SAFETY: the list is made, and `value` is `size` bytes.
+    /// Sets `attribute` to the `size` bytes at `value`, which the list points to.
+    ///
+    /// # Safety
+    ///
+    /// `value` is readable for `size` bytes, holds what `attribute` names, and stays there,
+    /// unchanged, until the list is dropped: the list keeps the pointer, and CreateProcessW
+    /// reads through it.
+    unsafe fn set(&mut self, attribute: u32, value: *const c_void, size: usize, what: &str) -> Result<(), String> {
+        // SAFETY: `self.0` was made a list for this many attributes by `new`, and is deleted
+        // only when `self` drops; `value` and `size` are as the caller promised (`# Safety`).
         let set = unsafe {
             UpdateProcThreadAttribute(self.list(), 0, attribute as usize, value, size, null_mut(), null())
         };
@@ -600,7 +662,9 @@ impl Attributes {
 
 impl Drop for Attributes {
     fn drop(&mut self) {
-        // SAFETY: the list was made.
+        // SAFETY: an `Attributes` exists only once InitializeProcThreadAttributeList made its
+        // list (`new`), and this drop deletes it once; the buffer is freed after, as the Vec
+        // drops.
         unsafe { DeleteProcThreadAttributeList(self.list()) };
     }
 }
@@ -611,12 +675,13 @@ struct Lock(Handle);
 impl Lock {
     fn take() -> Result<Lock, String> {
         let name = literal(LOCK);
-        // SAFETY: the name ends in NUL.
+        // SAFETY: `name` ends in NUL (`literal`) and lives in this frame for the call, which only
+        // reads it; null security is the default. The handle, or null, is owned by the `Handle`.
         let mutex = Handle(unsafe { CreateMutexW(null(), 0, name.as_ptr()) });
         if mutex.0.is_null() {
             return Err(failed(format!("opening the lock on the sandbox's grants {LOCK}"), "CreateMutexW"));
         }
-        // SAFETY: the mutex is open.
+        // SAFETY: `mutex` owns the open handle CreateMutexW gave, checked not null above.
         match unsafe { WaitForSingleObject(mutex.0, INFINITE) } {
             WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Lock(mutex)),
             _ => Err(failed(format!("taking the lock on the sandbox's grants {LOCK}"), "WaitForSingleObject")),
@@ -626,7 +691,10 @@ impl Lock {
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        // SAFETY: this thread holds the mutex.
+        // SAFETY: `take` returns a `Lock` only once this thread's wait took the mutex, and a
+        // `Lock` stays on that thread (its `HANDLE` is a raw pointer, so it is not `Send`);
+        // the handle is closed only after, as `self.0` drops. Releasing from another thread
+        // fails and leaves the lock held for the session.
         unsafe { ReleaseMutex((self.0).0) };
     }
 }
@@ -639,8 +707,12 @@ struct Dacl {
 
 impl Dacl {
     fn of(name: &[u16], path: &Path, what: &str) -> Result<Dacl, String> {
+        assert_eq!(name.last(), Some(&0), "a path's name for GetNamedSecurityInfoW ends in NUL");
         let mut it = Dacl { descriptor: null_mut(), dacl: null_mut() };
-        // SAFETY: the name ends in NUL; the descriptor is freed when `it` is dropped.
+        // SAFETY: `name` ends in NUL (asserted above; every caller has it from `wide`), so the
+        // call reads no further than the slice, and only reads it. The DACL and descriptor
+        // out-pointers are live fields of `it`, the others null as allowed; the DACL points into
+        // the descriptor, which `it`'s drop frees once.
         let code = unsafe {
             GetNamedSecurityInfoW(
                 name.as_ptr(),
@@ -661,9 +733,15 @@ impl Dacl {
 
     /// Whether one of `sids` has `mask` on what this is set on and, for a directory, on what is
     /// below it, by the entries that allow it.
+    /// A null DACL lets everyone in, so it covers any.
     fn covers(&self, sids: &[PSID], mask: u32, dir: bool) -> bool {
+        if self.dacl.is_null() {
+            return true;
+        }
         let mut info = ACL_SIZE_INFORMATION::default();
-        // SAFETY: the DACL is not null, and `info` is the structure the class names.
+        // SAFETY: `self.dacl` is not null (checked above), so it is the DACL GetNamedSecurityInfoW
+        // gave, inside the descriptor `self` frees only when dropped. AclSizeInformation names an
+        // ACL_SIZE_INFORMATION, and `info` is a live, exclusive one of the size the call is told.
         let asked = unsafe {
             GetAclInformation(
                 self.dacl,
@@ -678,23 +756,30 @@ impl Dacl {
         let (mut here, mut dirs, mut files) = (0, 0, 0);
         for at in 0..info.AceCount {
             let mut ace: *mut c_void = null_mut();
-            // SAFETY: `at` is below the count.
+            // SAFETY: `self.dacl` is a live DACL (above) and `at` is below the entry count it
+            // reported; `ace` is a live pointer for the call to set to the entry, inside the DACL.
             if unsafe { GetAce(self.dacl, at, &mut ace) } == 0 {
                 continue;
             }
-            // SAFETY: GetAce gave a pointer to an entry of the DACL, which `self` keeps alive;
-            // every entry starts with its header, at the 4-byte alignment entries have in an ACL.
+            // SAFETY: GetAce succeeded, so `ace` points to an entry of the DACL, which `self`
+            // keeps alive; every entry starts with its header, at the 4-byte alignment entries
+            // have in an ACL, and the header is `Copy`, so this reads it and holds no reference.
             let header = unsafe { *ace.cast::<ACE_HEADER>() };
             if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE {
                 continue;
             }
             let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
-            // SAFETY: the type, checked just above, says the entry is an ACCESS_ALLOWED_ACE.
+            // SAFETY: the header's type, checked just above, says the entry is an
+            // ACCESS_ALLOWED_ACE, whose size Windows checked when it made the DACL, so `Mask`
+            // is inside the entry, initialized and 4-byte aligned as the entry is.
             let mask_of = unsafe { (*allowed).Mask };
-            // SAFETY: as above; this takes the address of its SID, which starts at `SidStart`,
-            // and reads nothing.
+            // SAFETY: as above, the entry is an ACCESS_ALLOWED_ACE; this only takes the address
+            // of `SidStart`, where its SID begins, and reads nothing.
             let entry_sid = unsafe { (&raw mut (*allowed).SidStart).cast::<c_void>() };
-            // SAFETY: both are SIDs.
+            // SAFETY: `entry_sid` is the SID of an entry of the live DACL, and every one of
+            // `sids` is a SID of the run's `Made` (the container's, ALL APPLICATION PACKAGES or
+            // the run's capability: `run`, `covered`, `grant`), live while it is; the call only
+            // reads both.
             if !sids.iter().any(|it| unsafe { EqualSid(*it, entry_sid) } != 0) {
                 continue;
             }
@@ -720,7 +805,9 @@ impl Dacl {
 impl Drop for Dacl {
     fn drop(&mut self) {
         if !self.descriptor.is_null() {
-            // SAFETY: GetNamedSecurityInfoW made it with LocalAlloc.
+            // SAFETY: `descriptor` is not null, so GetNamedSecurityInfoW made it with LocalAlloc
+            // (`of`), and says to free it with LocalFree; `Dacl` is never copied, so this frees
+            // it once, and `dacl`, which points into it, is not read after.
             unsafe { LocalFree(self.descriptor) };
         }
     }
@@ -796,18 +883,23 @@ fn revoke(path: &Path, sid: PSID, what: &str) -> Result<(), String> {
 }
 
 fn set_dacl(name: &[u16], path: &Path, current: &Dacl, access: &EXPLICIT_ACCESS_W, what: &str) -> Result<(), String> {
+    assert_eq!(name.last(), Some(&0), "a path's name for SetNamedSecurityInfoW ends in NUL");
     let mut new: *mut ACL = null_mut();
-    // SAFETY: one entry, the current DACL as GetNamedSecurityInfoW gave it.
+    // SAFETY: `access` is one live EXPLICIT_ACCESS_W, the count the call is told, whose trustee
+    // is a SID of the run's `Made` (`trustee`); `current.dacl` is the DACL GetNamedSecurityInfoW
+    // gave, live while `current` is, and only read. `new` is a live pointer for the call to set.
     let code = unsafe { SetEntriesInAclW(1, access, current.dacl, &mut new) };
     if code != ERROR_SUCCESS {
         return Err(failed_with(format!("{what} on {}", path.display()), "SetEntriesInAclW", code as i32));
     }
-    // SAFETY: the name ends in NUL (`wide` made it), and `new` is the DACL SetEntriesInAclW
-    // just made, freed only below.
+    // SAFETY: `name` ends in NUL (asserted above; `wide` made it) and is only read, and `new` is
+    // the DACL SetEntriesInAclW just made, freed only below; owner, group and SACL are null as
+    // DACL_SECURITY_INFORMATION alone allows.
     let code = unsafe {
         SetNamedSecurityInfoW(name.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, null_mut(), null_mut(), new, null())
     };
-    // SAFETY: SetEntriesInAclW made `new` with LocalAlloc; nothing uses it after.
+    // SAFETY: SetEntriesInAclW made `new` with LocalAlloc and says to free it with LocalFree;
+    // SetNamedSecurityInfoW copied it, so nothing reads it after, and it is freed once.
     unsafe { LocalFree(new.cast()) };
     match code {
         ERROR_SUCCESS => Ok(()),
@@ -898,7 +990,9 @@ unsafe extern "system" fn interrupted(event: u32) -> BOOL {
     }
     let jobs = JOBS.lock().unwrap_or_else(PoisonError::into_inner);
     for &job in jobs.iter() {
-        // SAFETY: a job stays open while it is named in JOBS, whose lock this holds.
+        // SAFETY: a job is named in JOBS only while its `Registered` lives, which `run` declares
+        // after `made` (so drops it first) and which takes the job out under the lock this holds:
+        // the handle is open for the call, not one closed whose number another object took.
         unsafe { TerminateJobObject(job as HANDLE, STATUS_CONTROL_C_EXIT as u32) };
     }
     drop(jobs);
@@ -913,7 +1007,10 @@ fn on_interrupt() -> Result<(), String> {
     static INSTALLED: OnceLock<Result<(), String>> = OnceLock::new();
     INSTALLED
         .get_or_init(|| {
-            // SAFETY: `interrupted` only locks, ends a job and waits.
+            // SAFETY: `interrupted` has the PHANDLER_ROUTINE signature, is a `fn` item that lives
+            // as long as the process, and is sound on any thread for any event (its `# Safety`):
+            // it only locks JOBS and RUNS, ends jobs and waits. Windows calls it on a thread of its
+            // own, so it touches nothing that is not `Sync`.
             match unsafe { SetConsoleCtrlHandler(Some(interrupted), 1) } {
                 0 => Err(failed("passing the console's interrupt to the sandbox", "SetConsoleCtrlHandler")),
                 _ => Ok(()),
@@ -976,7 +1073,7 @@ fn append_arg(line: &mut Vec<u16>, arg: &OsStr) -> Result<(), String> {
 /// to case as Windows keeps it, a later one of a name in place of an earlier, and a NUL after.
 fn environment(env: &[(OsString, OsString)]) -> Result<Vec<u16>, String> {
     let equals = u16::from(b'=');
-    let mut sorted = BTreeMap::new();
+    let mut by_name: FxHashMap<Vec<u16>, (Vec<u16>, Vec<u16>)> = FxHashMap::default();
     for (name, value) in env {
         let units: Vec<u16> = name.encode_wide().collect();
         // A name may start with `=` (cmd's `=C:`), and has none after.
@@ -987,10 +1084,12 @@ fn environment(env: &[(OsString, OsString)]) -> Result<Vec<u16>, String> {
         if value.contains(&0) {
             return Err(format!("the variable {} has a NUL in it", name.to_string_lossy()));
         }
-        sorted.insert(upper(&units), (units, value));
+        by_name.insert(upper(&units), (units, value));
     }
+    let mut sorted: Vec<(Vec<u16>, (Vec<u16>, Vec<u16>))> = by_name.into_iter().collect();
+    sorted.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     let mut block = Vec::new();
-    for (name, value) in sorted.into_values() {
+    for (_, (name, value)) in sorted {
         block.extend(name);
         block.push(equals);
         block.extend(value);

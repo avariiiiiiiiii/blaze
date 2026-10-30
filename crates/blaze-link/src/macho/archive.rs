@@ -26,11 +26,20 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
         .symbols()
         .map_err(|e| format!("{name}: {e}"))?
         .ok_or_else(|| format!("{name}: an archive without a symbol index (run `ranlib` on it)"))?;
-    // Sized from the index, read in place once: a core name is at most one byte longer than
-    // its Mach-O one. The members' names, short and few, grow it at most once.
+    // A BSD `__.SYMDEF` names each entry's string by offset, so many entries may name one
+    // string: each distinct string is one `Name`, or the arena grows with the entries times
+    // the string's length. Keyed by where the string is in `bytes`; SipHash, since the
+    // offsets are the file's.
+    let mut by_offset: std::collections::HashMap<usize, Option<Name>> =
+        std::collections::HashMap::with_capacity(symbols.size_hint().0);
+    // Sized from the index's distinct names, read in place once: a core name is at most one
+    // byte longer than its Mach-O one. The members' names, short and few, grow it at most once.
     let mut index_bytes = 0;
     for symbol in symbols.clone() {
-        index_bytes += symbol.map_err(|e| format!("{name}: {e}"))?.name().len() + 1;
+        let raw = symbol.map_err(|e| format!("{name}: {e}"))?.name();
+        if by_offset.insert(raw.as_ptr() as usize - bytes.as_ptr() as usize, None).is_none() {
+            index_bytes += raw.len() + 1;
+        }
     }
     let mut names = Names::with_capacity(index_bytes);
 
@@ -63,7 +72,12 @@ pub(super) fn read(name: &str, bytes: &[u8]) -> Result<Archive, String> {
             let shown = String::from_utf8_lossy(symbol.name());
             format!("{name}: the index puts {shown} at offset {}, which is no member", symbol.offset().0)
         })?;
-        let core = super::push_core_name(&mut names, symbol.name()).map_err(|e| format!("{name}: {e}"))?;
+        let raw = symbol.name();
+        let slot = by_offset.entry(raw.as_ptr() as usize - bytes.as_ptr() as usize).or_default();
+        let core = match *slot {
+            Some(core) => core,
+            None => *slot.insert(super::push_core_name(&mut names, raw).map_err(|e| format!("{name}: {e}"))?),
+        };
         index.push((core, found as u32));
     }
     Ok(Archive { members, index, names })

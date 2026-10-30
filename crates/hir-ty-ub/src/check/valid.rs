@@ -684,10 +684,7 @@ impl<'db> Run<'_, '_, '_, 'db> {
                 let Parts { borrows, races, .. } = &mut self.parts;
                 let mut race = Ok(());
                 for &(span, access) in borrows.retag_accesses() {
-                    race = match access {
-                        AccessKind::Read => races.read(palloc, span, None, site),
-                        AccessKind::Write => races.write(palloc, span, None, site),
-                    };
+                    race = races.retag(palloc, span, access, site);
                     if race.is_err() {
                         break;
                     }

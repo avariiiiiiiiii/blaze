@@ -166,26 +166,9 @@ pub(crate) fn syntax(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<InFile<SyntaxNo
     Some(b.cx.syntax(b.expr_node(expr)?))
 }
 
-/// rustc's span of `expr`: where it is written, with the parentheses around it, which rustc's
-/// lowering gives the expression in them when their span contains its (`rustc_ast_lowering`,
-/// `ExprKind::Paren`). Parentheses a macro put around an expression it was handed do not
-/// contain it, and are left out.
+/// [`BodyCx::expr_span`], parentheses included.
 pub(crate) fn span(b: &BodyCx<'_, '_>, expr: ExprId) -> Option<Span> {
-    let node = b.expr_node(expr)?;
-    let mut span = b.cx.span_of(node);
-    let InFile { file_id, value } = b.cx.syntax(node);
-    let mut at = value;
-    while let Some(parent) = at.parent().filter(|it| ast::ParenExpr::can_cast(it.kind())) {
-        let outer = b.cx.span(InFile::new(file_id, parent.text_range()));
-        let contains = outer.file == span.file && outer.lo <= span.lo && span.hi <= outer.hi;
-        let parenthesized = b.cx.snippet(&outer).is_some_and(|it| it.starts_with('(') && it.ends_with(')'));
-        if !contains || !parenthesized {
-            break;
-        }
-        span = outer;
-        at = parent;
-    }
-    Some(span)
+    b.expr_span(expr)
 }
 
 /// rustc's printing of `ty`, a type of the body, as a type of the body's owner (that of the

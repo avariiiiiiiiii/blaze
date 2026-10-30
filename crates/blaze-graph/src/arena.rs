@@ -18,7 +18,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     sync::{
-        Arc, Condvar, Mutex, MutexGuard, PoisonError,
+        Arc, Condvar, MutexGuard, PoisonError,
         atomic::{AtomicI64, Ordering},
     },
     thread::ThreadId,
@@ -26,7 +26,7 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::{Budget, Cancelled, admission::Arena};
+use crate::{Budget, Cancelled, admission::Arena, pump::Lock};
 
 /// How far a thread's count may move before it is added to [`HELD`] (Linux's
 /// `percpu_counter`): an allocation then costs a few thread-local adds and no atomic, and
@@ -612,7 +612,7 @@ struct Shared {
     limit: u64,
     spill_at: u64,
     spill: Box<dyn Fn(u64) + Send + Sync>,
-    state: Mutex<State>,
+    state: Lock<State>,
     changed: Condvar,
 }
 
@@ -666,7 +666,7 @@ impl State {
 
 impl Shared {
     fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+        self.state.lock()
     }
 }
 
@@ -676,7 +676,7 @@ impl Cap {
             limit,
             spill_at,
             spill,
-            state: Mutex::new(State::default()),
+            state: Lock::new(State::default()),
             changed: Condvar::new(),
         }))
     }
@@ -1048,10 +1048,11 @@ fn least(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod tests {
     use std::{
         alloc::System,
-        sync::{Barrier, atomic::AtomicUsize},
+        sync::{Barrier, Mutex, atomic::AtomicUsize},
     };
 
     use super::*;

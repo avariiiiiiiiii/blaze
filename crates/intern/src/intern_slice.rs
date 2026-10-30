@@ -51,6 +51,8 @@ pub struct InternedSlice<T: SliceInternable> {
 // SAFETY: An `InternedSlice` is a shared reference to a header and a slice of `Send + Sync`
 // types that live for the process.
 unsafe impl<T: SliceInternable> Send for InternedSlice<T> {}
+// SAFETY: As for `Send`: an `InternedSlice` is a shared reference to a header and items that are
+// `Send + Sync`, live for the process and are never written again.
 unsafe impl<T: SliceInternable> Sync for InternedSlice<T> {}
 
 impl<T: SliceInternable> InternedSlice<T> {
@@ -103,13 +105,18 @@ fn fat<T: SliceInternable>(at: NonNull<u8>, len: usize) -> *mut Pointee<T> {
 /// `to` is writable memory of `layout::<T>(slice.len())`.
 unsafe fn write<T: SliceInternable>(to: NonNull<u8>, header: T::Header, slice: &[T::SliceType]) {
     let fat = fat::<T>(to, slice.len());
-    // SAFETY: Our precondition; the places are fields of the value `fat` points at.
-    unsafe {
-        (&raw mut (*fat).header).write(HeaderWithLength { header, length: slice.len() });
-        (&raw mut (*fat).slice)
-            .cast::<T::SliceType>()
-            .copy_from_nonoverlapping(slice.as_ptr(), slice.len());
-    }
+    // SAFETY: `fat` points at writable memory of `layout::<T>(slice.len())` (the precondition),
+    // so its `header` field is in bounds and aligned (`repr(C)`); this takes the field's address
+    // without reading it.
+    let header_at = unsafe { &raw mut (*fat).header };
+    // SAFETY: `header_at` is in bounds, aligned and not initialized yet; `write` drops nothing.
+    unsafe { header_at.write(HeaderWithLength { header, length: slice.len() }) };
+    // SAFETY: As for `header_at`: the address of the `slice` field, `slice.len()` items long.
+    let items_at = unsafe { &raw mut (*fat).slice }.cast::<T::SliceType>();
+    // SAFETY: `items_at` has room for `slice.len()` items and is aligned for them, and it is
+    // fresh memory, so it cannot overlap `slice`; `SliceType: Copy`, so copying the bytes is a
+    // copy.
+    unsafe { items_at.copy_from_nonoverlapping(slice.as_ptr(), slice.len()) };
 }
 
 /// # Safety
@@ -117,13 +124,15 @@ unsafe fn write<T: SliceInternable>(to: NonNull<u8>, header: T::Header, slice: &
 /// `at` points at the start of a published `Pointee<T>` of `T::storage()`, which lives for the
 /// process.
 unsafe fn pointee<T: SliceInternable>(at: NonNull<u8>) -> &'static Pointee<T> {
-    // SAFETY: Our precondition; the value starts with its `HeaderWithLength`, whose `length`
-    // is its slice's.
-    unsafe {
-        let header = at.cast::<HeaderWithLength<T::Header>>().as_ptr();
-        let length = (&raw const (*header).length).read();
-        &*fat::<T>(at, length)
-    }
+    let header = at.cast::<HeaderWithLength<T::Header>>().as_ptr();
+    // SAFETY: `at` starts a published `Pointee<T>` (the precondition), which starts with its
+    // initialized `HeaderWithLength`; this takes the `length` field's address.
+    let length_at = unsafe { &raw const (*header).length };
+    // SAFETY: `length_at` is the initialized `length` of a value never written again.
+    let length = unsafe { length_at.read() };
+    // SAFETY: `length` is the value's own slice length, so the fat pointer covers exactly the
+    // value, which lives for the process.
+    unsafe { &*fat::<T>(at, length) }
 }
 
 /// Compares interned `Ref`s using pointer equality.
@@ -185,6 +194,7 @@ pub struct InternedSliceRef<'a, T> {
 // SAFETY: As for `InternedSlice`: a shared reference to `Send + Sync` values that live for the
 // process.
 unsafe impl<T: Send + Sync> Send for InternedSliceRef<'_, T> {}
+// SAFETY: As for `Send`: a shared reference to `Send + Sync` values that live for the process.
 unsafe impl<T: Send + Sync> Sync for InternedSliceRef<'_, T> {}
 
 impl<'a, T: SliceInternable> InternedSliceRef<'a, T> {

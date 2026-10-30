@@ -3,9 +3,13 @@
 //! in shared chunks, CSR), [`CowBytes`] (a region's bytes, by page); and the dense sets a stage
 //! keeps ([`IdSet`], [`SymSet`]).
 
+#![forbid(unsafe_code)]
+
 use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
+
+use blaze_ids::radix;
 
 use crate::model::Sym;
 use crate::symbols::Symbols;
@@ -262,7 +266,7 @@ impl IdSet {
 
     pub fn sorted(&self) -> Vec<u32> {
         let mut out: Vec<u32> = self.iter().collect();
-        out.sort_unstable();
+        radix::sort(&mut out);
         out
     }
 
@@ -367,23 +371,28 @@ impl CowBytes {
 
     /// `at..at + len`, borrowed when it is in the unwritten buffer or in one written page.
     pub fn read(&self, at: usize, len: usize) -> Cow<'_, [u8]> {
-        let end = at.checked_add(len).filter(|it| *it <= self.len).expect("a read past the bytes' end");
-        if len == 0 {
-            return Cow::Borrowed(&[]);
-        }
-        let (first, last) = (at / PAGE, (end - 1) / PAGE);
-        if end <= self.base_len && self.pages[first..=last].iter().all(Option::is_none) {
-            return Cow::Borrowed(&self.base[at..end]);
-        }
-        if first == last {
-            if let Some(page) = &self.pages[first] {
-                let from = at % PAGE;
-                return Cow::Borrowed(&page[from..from + len]);
-            }
+        if let Some(it) = self.slice(at, len) {
+            return Cow::Borrowed(it);
         }
         let mut out = vec![0; len];
         self.copy_to(at, &mut out);
         Cow::Owned(out)
+    }
+
+    /// `at..at + len` if it can be borrowed (see [`CowBytes::read`]).
+    pub fn slice(&self, at: usize, len: usize) -> Option<&[u8]> {
+        let end = at.checked_add(len).filter(|it| *it <= self.len).expect("a read past the bytes' end");
+        if len == 0 {
+            return Some(&[]);
+        }
+        let (first, last) = (at / PAGE, (end - 1) / PAGE);
+        if end <= self.base_len && self.pages[first..=last].iter().all(Option::is_none) {
+            return Some(&self.base[at..end]);
+        }
+        match &self.pages[first] {
+            Some(page) if first == last => Some(&page[at % PAGE..at % PAGE + len]),
+            _ => None,
+        }
     }
 
     pub fn copy_to(&self, mut at: usize, mut out: &mut [u8]) {

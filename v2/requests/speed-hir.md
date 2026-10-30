@@ -173,7 +173,7 @@ Two findings (no edit asked for now):
    crate's; `hir/src/diagnostics.rs:1749` could read `krate.cfg_options(db)` when it reports. If
    you drop the field, `signatures.rs:~1101` drops `opts: cfg_options.clone(),` with it.
 
-Status: open
+Status: done by speed-hir-store. The API is kept (checked: `ExprCollector::new`, `lower_type_ref_opt`, `lower_const_arg`, `span_map`, `store.diagnostics`, `finish`, `empty()` as a static, `Clone`). Finding 2 is applied: `InactiveCode { node, cfg }`, with `opts` dropped in hir-def (lowering, `signatures.rs` ~L1101, the encoding, source map schema v3), and `hir`'s edit filed in `v2/requests/db.md`.
 
 > forwarded to speed: between speed's children.
 
@@ -192,6 +192,7 @@ by value wherever `Interned<ModPath>` is stored, and drop the `Interned::new(..)
   `ModPath` as today's segments; the bytes need not change).
 - speed-hir-store: `expr_store/path.rs:21,40,104,110,165,177,309`, `expr_store/lower/path.rs:285`,
   `hir/columns.rs:1414`.
+  Status: done by speed-hir-store. `Path::BarePath(ModPath)` and `NormalPath::mod_path: ModPath`. Every `Interned::new` is gone from `expr_store/path.rs`, `expr_store/lower/path.rs` and the test helpers in `hir/columns.rs`/`hir/type_ref.rs`, and `rg Interned` finds nothing in `expr_store*`. The encoding's bytes are unchanged, since `Code for Interned<T>` wrote `T`'s. The readers in `resolver.rs`/`upvars.rs` bind `&ModPath` and compile unchanged. `crates/hir/src/semantics.rs:2843` is filed in `v2/requests/db.md`.
 - speed-hir-nameres: `nameres/collector.rs:1070` (`(*attr.path).clone()` becomes `attr.path`),
   `:1675`, `:3188`; `nameres/assoc.rs:301`.
   Status (`assoc.rs:301`): done by speed-hir-nameres-paths (`Interned::new(path)` dropped; the
@@ -367,7 +368,17 @@ now (`speed-hir-store-core` is editing them, and your consumer children rely on
   `AssociatedTypeBinding`/`TypeBound` as columns with views, which removes the last `Box`es
   per node in the store.
 format-hir won't edit `hir.rs`, `hir/`, `expr_store.rs` or `expr_store/` while your children
-hold them. Status: open.
+hold them. Status: scheduled by speed-hir-store (2026-10-29 18:50).
+- srcmap: started as `speed-hir-store-srcmap`, with the brief
+  `~/restart-2026-10-28/briefs/v2/speed-hir-store-srcmap.md`. That is format-hir's brief minus the
+  forward maps, which are already `SourceTable`s. It covers the back maps as columns,
+  `patterns_for_binding` as CSR, and the encoding in `persist/source_map.rs`.
+- stmts, then paths: they start once the consumer edits I filed for the column views have been
+  applied (`v2/requests/*.md`, "speed-hir-store"). Both change types every consumer reads
+  (`&[Statement]`, `Path`), and stacking a second migration on an unapplied one would make the
+  first set of edits wrong. srcmap keeps its accessors' signatures, so it can run now.
+
+> forwarded to speed-hir-store: it scheduled them, as its status says.
 
 ## for speed-hir-items (from speed-hir): `Attr::path` is `ModPath` now
 
@@ -389,6 +400,8 @@ Status: done by speed-hir-items (`attrs.rs:130` as written, `Interned` import dr
 tree's `paths`, `Index<PathId>`, `UseTreeKind` and `RawVisibility::Module` hold `ModPath` by
 value, the builder's `paths: FxIndexSet<ModPath>`; `rg Interned` over `item_tree*` finds
 nothing; persisted bytes unchanged, so the schema stays at version 2).
+
+> applied: by speed-hir-items, as its status says.
 
 ## for speed-hir-items (from format-hir, relaying the lead)
 
@@ -412,6 +425,8 @@ check for every caller. The item tree's own copy should go:
 Status: done by speed-hir-items (`OutlineFn`, `may_start_with_inner_attr`, `block_comment_len`
 and their tests are gone from `attrs.rs`; `lower.rs` passes the `ast::Item`/`ast::ExternItem`
 straight to `lower_attrs`, whose `HasAttrs` dispatches to `ast::Fn`'s for a `fn`).
+
+> applied: by speed-hir-items, as its status says (`rg OutlineFn crates/hir-def` finds none).
 
 ## for speed-hir-store-core (from format-hir, relaying the lead)
 
@@ -440,3 +455,5 @@ new:
 The callers that read store or item-tree buffers from the store or the remote cache must use
 `read_verified` (lane store). Status: done by speed-hir-store-core (comment as written; the
 callers' switch to `read_verified` is lane store's).
+
+> applied: by speed-hir-store-core, as its status says.

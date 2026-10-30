@@ -1266,3 +1266,49 @@ Asked (each call is written and waits on the lane named):
 > forwarded to cargo (cargo-daemon, cargo-daemon-lower), codegen (`Roots::tests` `function`, `Built::inputs`), safety (`hir-ty-ub` `check.rs`), link (`Image::tables`). Usercode's `index::find(&Reader, &Guard, ..)` is applied (section 16).
 
 > applied (cargo-daemon): `serve/plane.rs` adds every batch as one `PlaneInput::AddNodes`. `Plane::fresh(count, name_bytes, deps)` reserves the ids and sizes the columns; `Plane::push(&mut Fresh, NodeRef, Task)` raises a thread task's memory to its kind's estimate. `serve/job.rs` sizes each batch exactly (names and deps summed first) and builds names and deps in one scratch `String` and `Vec` a batch, so planning a build of n units makes O(1) allocations, not 2n. `Spec` and `plane::Node` are gone from `serve`.
+
+## From cargo-load-plan (2026-10-29)
+
+For **cargo-load** (`load/units.rs`, `load/view.rs`), to build against `load/plan.rs`:
+
+- `PlanInput` gains these fields; pass them where `units.rs` builds it today:
+  - `manifests: &resolved.manifests`: each package's manifest path, for `CARGO_MANIFEST_DIR`/`_PATH`.
+  - `roots: &graph.roots`, for LTO, uplifting, `.d` copies and `CARGO_PRIMARY_PACKAGE`.
+  - `intent: spec.intent`. `cargo check` has no artifact directory, so nothing is uplifted
+    and `CARGO_BIN_EXE_*` is `placeholder:<name>`.
+  - `build_std: spec.build_std.is_some()`. Without it, std units' hashes stay out of their
+    dependents' hashes, as cargo without `-Zbuild-std` does.
+  - `sysroot: Option<&Path>`: what std's packages are hashed against. `None` is an error only
+    when the plan has to hash a std unit itself, which is the foreign load of std.
+  - `profile_dir: &dir_name`.
+  - `base_profile: &profiles.base_profile()`, kept in a local. It gives `PROFILE` from its
+    `root`, and the `Finished` text.
+  - `requested_profile` stays the profile's name.
+- `platform_rustflags(config, triple, host, target)` keeps its signature. It now errors for a
+  triple that is neither `host` nor `target`. When `--target` equals the host triple, it treats
+  the triple as the target.
+- `config.env(..)` must carry the process's `__CARGO_DEFAULT_LIB_METADATA`,
+  `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT`, `__CARGO_TEMPORARY_STOP_RLIB_UPLIFT_OPT_OUT`,
+  `RUSTC_WORKSPACE_WRAPPER`, `RUSTFLAGS` and `CARGO_ENCODED_RUSTFLAGS`. The plan reads them
+  there and nowhere else. They are part of the load's key.
+- Refuse `-Zhost-config` and `-Ztarget-applies-to-host` (and `[host]`). The plan ports cargo
+  without them: host units of a `--target` build get no rustflags.
+- `-vv` makes cargo cap the lints of non-local packages at `warn`, not `allow`. The plan has
+  no verbosity input, so the daemon has to pass `--cap-lints allow` itself. Say if you want
+  verbosity in `PlanInput`.
+
+For **cargo** (the lane, or **cargo-daemon**): a build script's run and every compile still
+need `CARGO`, `RUSTC` and `RUSTDOC` (paths to blaze's own programs), the dynamic library path
+and the jobserver (`CARGO_MAKEFLAGS`). The plan leaves them out because they are the daemon's.
+Name the values, or set them where the command is made.
+
+For **cargo-std** (`stdlib/`):
+- A std unit's `UnitPlan.metadata` must be `format!("{:016x}", c_metadata)` (cargo's
+  `UnitHash` Display), and `extra_filename` must be `-{:016x}` of its unit id. The plan reads
+  both back (`Meta::read`) to hash std into its dependents under `-Zbuild-std`.
+- These are the functions the plan calls; keep their signatures: `target_cfg`,
+  `CfgArgs::from_flags` (and `CfgArgs { proc_macro, .. }`), `cargo_cfg_env`, `file_name` (it
+  must know `bin`, `lib`, `rlib`, `dylib`, `cdylib`, `staticlib` and `proc-macro`),
+  `rustc_version` and `rustc_verbose_version`.
+
+> forwarded to cargo: between its own children (cargo-load, cargo-daemon).

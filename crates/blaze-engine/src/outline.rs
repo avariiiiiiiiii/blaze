@@ -344,7 +344,10 @@ fn outlines(db: &RootDatabase, listed: &Listed, files: &[FileId]) -> Vec<Option<
     if files.len() > 1 {
         let mut crates: Vec<_> =
             files.iter().flat_map(|&file| relevant_crates(db, file).iter().copied()).collect();
-        crates.sort_unstable();
+        blaze_ids::radix::sort_copy_by_key(&mut crates, |it| {
+            let id = salsa::plumbing::AsId::as_id(it);
+            blaze_ids::radix::pack_32(id.index(), id.generation())
+        });
         crates.dedup();
         crate::resolve_names(db, &crates);
     }
@@ -540,7 +543,7 @@ fn adding(db: &RootDatabase, listed: &Listed, file: FileId, text: &str) -> Optio
             })
             .collect()
     });
-    files.sort_unstable();
+    blaze_ids::radix::sort_copy_by_key(&mut files, |it| blaze_ids::radix::pack_32(it.0.index(), it.1 as u32));
     files.dedup();
     for &(other, edition) in &files {
         let tree = match other == file && away {

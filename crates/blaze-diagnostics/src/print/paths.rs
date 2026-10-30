@@ -582,7 +582,7 @@ fn trimmed_def_paths(cx: &Cx<'_, '_>, local: &LocalDefs, direct: &[hir::Crate]) 
         let Some(def) = def else { continue };
         map.entry(def)
             .and_modify(|it| {
-                if it.as_str() > name.as_str() {
+                if it.symbol().cmp_order(name.symbol()).is_gt() {
                     *it = name.clone();
                 }
             })

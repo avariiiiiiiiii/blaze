@@ -138,6 +138,9 @@ pub(crate) struct Function {
     pub(crate) variables: Vec<side::Variable>,
     /// The scopes `variables` are bound in.
     pub(crate) scopes: side::Scopes,
+    /// The code hashes of what its IR builds in, at any depth
+    /// ([`blaze_codegen::CompiledFunction::inlined`]).
+    pub(crate) inlined: Vec<CodeHash>,
     /// What its `#[inline]` asks of LLVM; `None` for closures, glue and shims.
     pub(crate) hint: fragment::Hint,
     /// Where [`release::summarize`] leaves what [`release::emit`] takes up.

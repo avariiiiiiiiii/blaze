@@ -269,9 +269,10 @@ impl Global {
         }
     }
 
-    /// The running thread joined `joinee`, which exited: it acquires the final clock, and if
-    /// it is now the only thread and has seen everything, races are impossible until the next
-    /// spawn (Miri: `thread_joined`).
+    /// The running thread joined `joinee`, which exited: it acquires the final clock. If no
+    /// other thread is live and every thread's time is within `joinee`'s clock, races are
+    /// impossible until the next spawn (Miri: `thread_joined`, which compares with the joinee's
+    /// clock, not the joiner's; that rarely holds, so detection mostly stays on).
     fn thread_joined(&mut self, joinee: ThreadId) {
         let index = self.active_index();
         let join_clock = self.threads.termination_clock[joinee.index()]
@@ -586,6 +587,23 @@ impl Races {
     /// The running thread.
     pub fn active(&self) -> ThreadId {
         self.global.active
+    }
+
+    /// Whether every thread, `main` too, has exited (Miri: `have_all_terminated`). At the end of
+    /// a run, after `main`'s [`Races::exit`], `false` is Miri's leak error "the main thread
+    /// terminated without waiting for all remaining threads".
+    pub fn all_terminated(&self) -> bool {
+        self.global.threads.state.iter().all(|&s| s == ThreadState::Terminated)
+    }
+
+    /// The name `thread` was given, if any; `main` is named "main" (Miri: `get_thread_name`).
+    pub fn thread_name(&self, thread: ThreadId) -> Option<&str> {
+        self.global.threads.name[thread.index()].as_deref()
+    }
+
+    /// The name reports use: the given one, or `unnamed-N` (Miri: `get_thread_display_name`).
+    pub fn thread_display_name(&self, thread: ThreadId) -> String {
+        self.global.threads.display_name(thread)
     }
 
     /// A new thread, made by the running one, which goes on running. Everything the parent did

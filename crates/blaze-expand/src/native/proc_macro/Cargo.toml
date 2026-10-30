@@ -1,7 +1,7 @@
 [package]
 name = "blaze-native-proc-macro"
 version = "0.0.0"
-description = "The proc_macro blaze's native expanders are built against: its wasm guest's, asking a native host"
+description = "The proc_macro of blaze's in-process proc-macro bridge: its wasm guest's, asking an in-process host"
 edition = "2024"
 publish = false
 

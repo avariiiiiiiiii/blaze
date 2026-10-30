@@ -56,3 +56,4 @@ unchanged: same entries, and `None` in the same cases.
 > `Option<&'static asm::Inline>` (`.copied()`), the call passes `block` itself, and the unused
 > `std::sync::Arc` import is gone. It compiles once `fragment.rs` `Wants::asm_blocks` returns
 > `FxHashMap<u32, &'static asm::Inline>` (speed-backend-code).
+> forwarded to codegen: `hir-ty-codegen` is lane codegen's (speed-backend-llvm is DONE).

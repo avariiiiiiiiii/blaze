@@ -391,9 +391,8 @@ impl State {
             if now != told {
                 self.pending.extend_from_slice(last);
             } else if matches!(record.event, Event::Functions { .. }) {
-                match blaze_protocol::cbor::to_vec(record) {
-                    Ok(item) => self.pending.extend_from_slice(&item),
-                    Err(error) => eprintln!("build page: a record does not encode: {error}"),
+                if let Err(error) = blaze_protocol::cbor::append(&mut self.pending, record) {
+                    eprintln!("build page: a record does not encode: {error}");
                 }
             }
             if self.pending.len() >= FRAME {

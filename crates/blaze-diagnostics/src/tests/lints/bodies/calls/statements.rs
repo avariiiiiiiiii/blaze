@@ -2,7 +2,8 @@
 //! `unit_bindings`, `non_shorthand_field_patterns` and `unused_allocation`, against rustc's UI
 //! tests.
 
-use super::{Test, Ui, ui};
+use super::{Ui, ui};
+use crate::tests::Mode;
 
 #[test]
 fn a_path_statement_has_no_effect_or_drops_its_value() {
@@ -211,7 +212,7 @@ warning: 1 warning emitted
 "##;
     let ui = ui(Ui {
         name: "issue-49588-non-shorthand-field-patterns-in-pattern-macro.rs",
-        test: Test::Passes,
+        mode: Mode::RunPass,
         source,
         ..Ui::default()
     });
@@ -394,7 +395,6 @@ warning: 1 warning emitted
 "##;
     let ui = ui(Ui {
         name: "let_underscore_drop.rs",
-        test: Test::Passes,
         core: "drop",
         std: Some(("", PRINTLN)),
         source,

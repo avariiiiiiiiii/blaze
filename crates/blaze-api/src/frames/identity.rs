@@ -13,10 +13,10 @@ use serde::{Serialize, de::DeserializeOwned};
 
 use super::{decode, encode, encode_into};
 use crate::{
-    ApiError, Artifact, BuildScriptRan, Cargo, Diagnostic, Envelope, FactRead, FetchVerb, Level,
-    LinkKind, Mismatch, Ranked, Reach, ReachedItem, Request, Response, Span, Status, Table,
-    Targets, TestOutcome, TestResult, Traced, Ub, UnitOf, UnitProfile, UnitStarted, UnitTarget,
-    Verb, ViewRef, Worked,
+    ApiError, Artifact, Basis, BuildScriptRan, Cached, Cargo, Diagnostic, Envelope, FactRead,
+    FetchVerb, Level, LinkKind, Mismatch, Ranked, Reach, ReachedItem, Request, Response, Span,
+    Status, Table, Targets, TestOutcome, TestResult, Traced, Ub, UnitOf, UnitProfile,
+    UnitStarted, UnitTarget, Verb, ViewRef, Worked,
 };
 
 const REQUESTS: usize = 19;
@@ -100,6 +100,15 @@ impl Gen {
 
     fn texts(&mut self, depth: u32) -> Vec<String> {
         self.many(depth, Gen::text)
+    }
+
+    fn outcome(&mut self) -> TestOutcome {
+        match self.below(4) {
+            0 => TestOutcome::Passed,
+            1 => TestOutcome::Failed,
+            2 => TestOutcome::Ignored,
+            _ => TestOutcome::Unreached,
+        }
     }
 
     fn pairs(&mut self, depth: u32) -> Vec<(String, String)> {
@@ -402,14 +411,17 @@ impl Gen {
             8 => Response::TestResult(TestResult {
                 name: self.text(),
                 binary: self.text(),
+                cached: self.maybe(|g| Cached {
+                    basis: match g.yes() {
+                        true => Basis::Executed,
+                        false => Basis::Reached { why: g.text() },
+                    },
+                    millis: g.wide(),
+                    outcome: g.outcome(),
+                }),
                 millis: self.wide(),
                 output: self.bytes(),
-                outcome: match self.below(4) {
-                    0 => TestOutcome::Passed,
-                    1 => TestOutcome::Failed,
-                    2 => TestOutcome::Ignored,
-                    _ => TestOutcome::Unreached,
-                },
+                outcome: self.outcome(),
             }),
             9 => Response::Ran {
                 code: self.maybe(|g| g.next() as i32),

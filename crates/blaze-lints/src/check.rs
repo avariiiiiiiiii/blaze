@@ -22,8 +22,8 @@ use crate::{
     conf::Conf,
     diag::{Diagnostic, Expansion, MacroKind, MultiSpan, Span, Sublevel},
     level::{CommandLine, Levels, Lint, Set, Source, Spec, Target},
-    lints,
-    registry::{self, Info},
+    lints::{self, Implemented},
+    registry::Info,
 };
 
 /// What a crate's lints are run with.
@@ -153,7 +153,7 @@ pub(crate) struct State<'a, 'db> {
     without_test: Option<CfgOptions>,
     name_of: NameOf<'a>,
     /// The lints that can be at a level other than `allow` somewhere in the crate.
-    on: FxHashSet<&'static str>,
+    on: lints::On,
     pending: Vec<Pending>,
     expectations: Vec<Expectation>,
 }
@@ -203,8 +203,15 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
 
     /// Whether `lint` can be at a level that is not `allow` in the crate: a lint that cannot is
     /// not run.
-    pub(crate) fn on(&self, lint: &str) -> bool {
-        self.state.on.contains(lint)
+    #[inline]
+    pub(crate) fn on(&self, lint: Implemented) -> bool {
+        self.state.on & lint.bit() != 0
+    }
+
+    /// Whether some lint of `lints` is [`Cx::on`].
+    #[inline]
+    pub(crate) fn on_any(&self, lints: lints::On) -> bool {
+        self.state.on & lints != 0
     }
 
     /// The text of the file being walked.
@@ -396,7 +403,7 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
     /// clippy's lint decorates it.
     pub(crate) fn lint(
         &mut self,
-        lint: &'static str,
+        lint: Implemented,
         at: &SyntaxNode,
         span: impl Into<MultiSpan>,
         message: impl Into<String>,
@@ -408,7 +415,7 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
     /// `when` in its walk: for a lint run on a node that it reports of a node inside it.
     pub(crate) fn lint_when(
         &mut self,
-        lint: &'static str,
+        lint: Implemented,
         at: &SyntaxNode,
         when: &SyntaxNode,
         span: impl Into<MultiSpan>,
@@ -427,7 +434,7 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
     /// left `after`: for what clippy says when a body has been walked.
     pub(crate) fn lint_after(
         &mut self,
-        lint: &'static str,
+        lint: Implemented,
         at: &SyntaxNode,
         after: &SyntaxNode,
         span: impl Into<MultiSpan>,
@@ -443,13 +450,13 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
 
     fn lint_placed(
         &mut self,
-        lint: &'static str,
+        lint: Implemented,
         at: &SyntaxNode,
         place: (u32, u32),
         span: MultiSpan,
         message: impl Into<String>,
     ) -> &mut Diagnostic {
-        let info = registry::lint(lint).unwrap_or_else(|| panic!("`{lint}` is not clippy's"));
+        let info = lint.info();
         let phase = lints::phase(lint, self.order == 0);
         // What clippy gathers to say after the late pass it says in the order of the source map,
         // which has the crate's files in the order rustc read them.
@@ -462,7 +469,7 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
             lint: info,
             at: InFile::new(file, at.clone()),
             diagnostic: Diagnostic {
-                lint: format!("clippy::{lint}"),
+                lint: format!("clippy::{}", info.name),
                 level: Level::Warn,
                 message: message.into(),
                 span,
@@ -620,9 +627,12 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
 
     /// Records the `#[expect]`s of lints of clippy's on `owner`.
     fn expectations_of(&mut self, owner: &ast::AnyHasAttrs) {
-        let has_expect = owner
-            .attrs()
-            .any(|it| it.syntax().text().contains_char('e') && it.to_string().contains("expect"));
+        // An `expect` level, written plainly or in a `cfg_attr`, is an `expect` identifier.
+        let has_expect = owner.attrs().any(|it| {
+            it.syntax().descendants_with_tokens().any(|it| {
+                it.as_token().is_some_and(|it| it.kind() == SyntaxKind::IDENT && it.text() == "expect")
+            })
+        });
         if !has_expect {
             return;
         }
@@ -631,9 +641,8 @@ impl<'a, 'db> Cx<'_, 'a, 'db> {
             if level != Level::Expect {
                 continue;
             }
-            let Target::Lint(name) = target else { continue };
-            let Some(lint) = registry::lint(&name) else { continue };
-            if !lints::implemented(lint.name) {
+            let Target::Lint(lint) = target else { continue };
+            if Implemented::of(lint).is_none() {
                 continue;
             }
             self.state.expectations.push(Expectation {

@@ -27,6 +27,9 @@ pub enum Ub {
     Leak(memory::Leaks),
     /// Every thread left is blocked.
     Deadlock(race::Deadlock),
+    /// The main thread returned while other threads still ran, which Miri fails before its
+    /// leak check (`src/tools/miri/src/eval.rs`).
+    ThreadsLeft,
 }
 
 /// A [`Ub`] with where the program was: the thread and the statement it was running.
@@ -43,9 +46,12 @@ impl fmt::Display for Ub {
             Ub::Memory(it) => write!(f, "Undefined Behavior: {it}"),
             Ub::Aliasing(it) => write!(f, "Undefined Behavior: {it}"),
             Ub::Race(it) => write!(f, "Undefined Behavior: {it}"),
-            Ub::Value(it) => write!(f, "Undefined Behavior: constructing invalid value: {it}"),
+            Ub::Value(it) => write!(f, "Undefined Behavior: {it}"),
             Ub::Leak(it) => write!(f, "memory leaked: {it}"),
             Ub::Deadlock(it) => write!(f, "deadlock: {it}"),
+            Ub::ThreadsLeft => {
+                f.write_str("the main thread terminated without waiting for all remaining threads")
+            }
         }
     }
 }

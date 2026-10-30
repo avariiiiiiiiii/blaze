@@ -3671,7 +3671,6 @@ impl<'db> ExprCollector<'db> {
                 self.store.diagnostics.push(ExpressionStoreDiagnostics::InactiveCode {
                     node: self.expander.in_file(SyntaxNodePtr::new(owner.syntax())),
                     cfg,
-                    opts: self.cfg_options.clone(),
                 });
                 false
             }

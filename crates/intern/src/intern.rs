@@ -145,6 +145,8 @@ pub struct InternedRef<'a, T> {
 
 // SAFETY: An `InternedRef` is a shared reference to a value that lives for the process.
 unsafe impl<T: Sync> Send for InternedRef<'_, T> {}
+// SAFETY: As for `Send`: sharing an `InternedRef` shares only a `&T` to a value that lives for
+// the process, which `T: Sync` makes safe.
 unsafe impl<T: Sync> Sync for InternedRef<'_, T> {}
 
 impl<'a, T: Internable> InternedRef<'a, T> {

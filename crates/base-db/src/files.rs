@@ -652,6 +652,7 @@ pub(crate) struct RootContent {
     pub(crate) is_library: bool,
     /// Each file's bucket and key (its path, encoded).
     keys: FxHashMap<FileId, (u8, Box<[u8]>)>,
+    // BTreeMap: hashed in key order into the root's content ID, edited in place between hashes.
     buckets: Vec<BTreeMap<Box<[u8]>, ContentId>>,
     hashes: Vec<ContentId>,
     /// The buckets whose hash is out of date, a bit each.

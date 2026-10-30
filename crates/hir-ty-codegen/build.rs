@@ -12,6 +12,8 @@
 //! The linking is llvm-sys's and not this script's because a crate's native libraries come right
 //! after its rlib on the link line, and inkwell, which calls LLVM, comes after this crate.
 
+#![forbid(unsafe_code)]
+
 use std::{
     env,
     path::{Path, PathBuf},

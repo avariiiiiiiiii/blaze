@@ -57,19 +57,39 @@ macro_rules! define_symbols {
             }
         )*
 
-        // The strings should be in `static`s so that symbol equality holds.
+        /// Every plain and named symbol, in declaration order: its index in one `static`
+        /// array, so that a declared symbol's index is a pointer subtraction
+        /// ([`Symbol::declared_index`]) and a fixed set of them is a table indexed by it
+        /// ([`crate::KnownNames`]).
+        #[allow(non_camel_case_types)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+        #[repr(u16)]
+        pub enum Declared {
+            $( $name, )*
+            $( $alias, )*
+        }
+
+        /// How many symbols [`Declared`] has.
+        pub const DECLARED: usize = [$( Declared::$name, )* $( Declared::$alias, )*].len();
+
+        // The strings are in one `static` so that symbol equality holds and a symbol's index
+        // is its offset in it.
+        static TEXTS: [Text; DECLARED] = [
+            $( Text::new(stringify!($name)), )*
+            $( Text::new($value), )*
+        ];
         $(
-            pub const $name: Symbol = {
-                static SYMBOL_STR: Text = Text::new(stringify!($name));
-                Symbol::from_static(&SYMBOL_STR)
-            };
+            pub const $name: Symbol = Symbol::from_static(&TEXTS[Declared::$name as usize]);
         )*
         $(
-            pub const $alias: Symbol = {
-                static SYMBOL_STR: Text = Text::new($value);
-                Symbol::from_static(&SYMBOL_STR)
-            };
+            pub const $alias: Symbol = Symbol::from_static(&TEXTS[Declared::$alias as usize]);
         )*
+
+        /// The index of `text` in [`TEXTS`], if it is one of them.
+        #[inline]
+        pub(crate) fn declared_index(text: &'static Text) -> Option<usize> {
+            TEXTS.element_offset(text)
+        }
 
         /// The store of symbols, holding every declared one so that interning a declared
         /// symbol's text gives it. A text declared twice gives the first.
@@ -668,4 +688,57 @@ define_symbols! {
     RangeMin,
     RangeMax,
     RangeSub,
+    // rustc's intrinsics (`hir_ty::intrinsic::Intrinsic`) that no other name above is:
+    abort_immediate, add_with_overflow, aggregate_raw_ptr, align_of, align_of_val,
+    amdgpu_dispatch_ptr, arith_offset, assert_inhabited, assert_mem_uninitialized_valid,
+    assert_zero_valid, assume, atomic_and, atomic_cxchg, atomic_cxchgweak, atomic_fence,
+    atomic_load, atomic_max, atomic_min, atomic_nand, atomic_or, atomic_singlethreadfence,
+    atomic_store, atomic_umax, atomic_umin, atomic_xadd, atomic_xchg, atomic_xor, atomic_xsub,
+    autodiff, bitreverse, black_box, breakpoint, bswap, caller_location, carrying_mul_add,
+    carryless_mul, catch_unwind, ceil, codeview_annotation, cold_path, compare_bytes,
+    const_allocate, const_deallocate, const_eval_select, const_make_global, contract_check_ensures,
+    contract_check_requires, copy_nonoverlapping, copysignf128, copysignf16, copysignf32,
+    copysignf64, cos, ctlz, ctlz_nonzero, ctpop, cttz, cttz_nonzero, discriminant_value,
+    disjoint_bitor, exact_div, exp, exp2, fabs, fadd_algebraic, fadd_fast, fdiv_algebraic,
+    fdiv_fast, field_offset, field_representing_type_actual_type_id, field_representing_type_name,
+    field_representing_type_offset, float_to_int_unchecked, floor, fma, fmul_algebraic, fmul_fast,
+    fmuladd, forget, frem_algebraic, frem_fast, fsub_algebraic, fsub_fast,
+    gpu_launch_sized_workgroup_mem, integer_max, integer_min, is_val_statically_known, log, log10,
+    log2, maximum_number_nsz_f128, maximum_number_nsz_f16, maximum_number_nsz_f32,
+    maximum_number_nsz_f64, maximumf128, maximumf16, maximumf32, maximumf64,
+    minimum_number_nsz_f128, minimum_number_nsz_f16, minimum_number_nsz_f32, minimum_number_nsz_f64,
+    minimumf128, minimumf16, minimumf32, minimumf64, mul_with_overflow, needs_drop,
+    nontemporal_store, offload, offload_get_num_devices, offset, offset_of, powf, powi,
+    prefetch_read_data, prefetch_read_instruction, prefetch_write_data, prefetch_write_instruction,
+    ptr_guaranteed_cmp, ptr_mask, ptr_metadata, ptr_offset_from, ptr_offset_from_unsigned, raw_eq,
+    read_via_copy, return_address, rotate_left, rotate_right, round, round_ties_even, rustc_peek,
+    saturating_add, saturating_sub, select_unpredictable, simd_add, simd_and, simd_arith_offset,
+    simd_as, simd_bitmask, simd_bitreverse, simd_bswap, simd_carryless_mul, simd_cast,
+    simd_cast_ptr, simd_ceil, simd_ctlz, simd_ctpop, simd_cttz, simd_div, simd_eq,
+    simd_expose_provenance, simd_extract, simd_extract_dyn, simd_fabs, simd_fcos, simd_fexp,
+    simd_fexp2, simd_flog, simd_flog10, simd_flog2, simd_floor, simd_fma, simd_fsin, simd_fsqrt,
+    simd_funnel_shl, simd_funnel_shr, simd_gather, simd_ge, simd_gt, simd_insert, simd_insert_dyn,
+    simd_le, simd_lt, simd_masked_load, simd_masked_store, simd_maximum_number_nsz,
+    simd_minimum_number_nsz, simd_mul, simd_ne, simd_neg, simd_or, simd_reduce_add_ordered,
+    simd_reduce_add_unordered, simd_reduce_all, simd_reduce_and, simd_reduce_any, simd_reduce_max,
+    simd_reduce_min, simd_reduce_mul_ordered, simd_reduce_mul_unordered, simd_reduce_or,
+    simd_reduce_xor, simd_relaxed_fma, simd_rem, simd_round, simd_round_ties_even,
+    simd_saturating_add, simd_saturating_sub, simd_scatter, simd_select, simd_select_bitmask,
+    simd_shl, simd_shr, simd_shuffle, simd_splat, simd_sub, simd_trunc,
+    simd_with_exposed_provenance, simd_xor, sin, size_of, size_of_val, slice_get_unchecked, sqrt,
+    sub_with_overflow, sve_tuple_create2, sve_tuple_create3, sve_tuple_create4, sve_tuple_get,
+    sve_tuple_set, three_way_compare, transmute, transmute_unchecked, trunc, type_id_array_len,
+    type_id_element_ty, type_id_eq, type_id_field_representing_type, type_id_fields,
+    type_id_function_ptr, type_id_generics, type_id_is_signed, type_id_non_exhaustive,
+    type_id_points_mutably, type_id_points_to, type_id_size_of, type_id_type_of,
+    type_id_variant_name, type_id_variant_non_exhaustive, type_id_variants, type_id_vtable,
+    type_name, typed_swap_nonoverlapping, ub_checks, unaligned_volatile_load,
+    unaligned_volatile_store, unchecked_add, unchecked_div, unchecked_funnel_shl,
+    unchecked_funnel_shr, unchecked_mul, unchecked_rem, unchecked_shl, unchecked_shr, unchecked_sub,
+    va_arg, va_copy, va_end, variant_count, volatile_copy_memory,
+    volatile_copy_nonoverlapping_memory, volatile_load, volatile_set_memory, volatile_store,
+    vtable_align, vtable_size, wrapping_add, wrapping_mul, wrapping_sub, write_box_via_move,
+    write_bytes, write_via_move,
+    // `core::ub_checks` functions codegen answers as constants.
+    check_language_ub, check_library_ub,
 }

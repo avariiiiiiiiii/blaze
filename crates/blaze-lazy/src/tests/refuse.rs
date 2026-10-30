@@ -1,45 +1,12 @@
-use std::collections::BTreeMap;
+use blaze_codegen::plan::{Mode, OptLevel};
 
-use blaze_codegen::{
-    Arch,
-    plan::{Mode, OptLevel, Override, Policy, Profile},
-    settings::{DebugInfo, Panic, Relocation, Toolchain},
-};
-use blaze_ids::ContentId;
-
+use super::policy;
 use crate::{
     Purpose, Refused, Session, allow,
     plan::Plan,
     session::SessionError,
     stub::{Abi, Isa, X86Save},
 };
-
-fn policy(level: OptLevel, mode: Mode) -> Policy {
-    Policy {
-        toolchain: Toolchain {
-            id: ContentId([1; 32]),
-            target: "x86_64-unknown-linux-gnu".to_owned(),
-            arch: Arch::X86_64,
-            cpu: "x86-64-v3".to_owned(),
-            features: Vec::new(),
-            cranelift: "0.136".to_owned(),
-            llvm: Some("23.1".to_owned()),
-            frame_pointers: true,
-            relocation: Relocation::Pic,
-        },
-        profile: Profile {
-            opt_level: level,
-            overflow_checks: true,
-            debug_assertions: true,
-            debuginfo: DebugInfo::Full,
-            panic: Panic::Unwind,
-            packages: BTreeMap::new(),
-            build_override: Override::default(),
-        },
-        mode,
-        fold: false,
-    }
-}
 
 #[test]
 fn a_dev_run_or_test_may_compile_lazily() {

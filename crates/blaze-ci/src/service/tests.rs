@@ -162,6 +162,7 @@ fn test_result(name: &str, outcome: TestOutcome, output: &str) -> Response {
     Response::TestResult(TestResult {
         binary: "blaze_ci".to_owned(),
         name: name.to_owned(),
+        cached: None,
         outcome,
         output: output.as_bytes().to_vec(),
         millis: 12,

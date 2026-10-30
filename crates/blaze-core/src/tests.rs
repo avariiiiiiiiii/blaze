@@ -125,6 +125,44 @@ fn every_driver_ends_the_script_the_same() {
     }
 }
 
+/// Timers asked for out of order, some due at once and one never in the test's time, fire in
+/// the order they are due on every driver, each counted out of what is in flight.
+#[test]
+fn every_driver_fires_timers_in_their_order() {
+    let run = |driver: &mut dyn Driver| {
+        let mut effects: Vec<Effect> = [9u64, 0, 4, 0, 13, 2, 7]
+            .into_iter()
+            .enumerate()
+            .map(|(n, it)| Effect::Timer { after: Duration::from_millis(3 * it), tag: Tag(n as u64) })
+            .collect();
+        effects.push(Effect::Timer { after: Duration::from_secs(1 << 40), tag: Tag(99) });
+        driver.submit(&mut effects);
+        let mut fired = Vec::new();
+        let mut out = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while driver.in_flight() > 1 && std::time::Instant::now() < deadline {
+            driver.poll(&mut out, Duration::from_millis(100));
+            for it in out.drain(..) {
+                assert_eq!(it.done, Done::Fired);
+                fired.push(it.tag.0);
+            }
+        }
+        assert_eq!(driver.in_flight(), 1, "the far timer is still in flight");
+        // The two due at once may fire together, in either order on a real clock.
+        fired[..2].sort_unstable();
+        fired
+    };
+    let want = vec![1, 3, 5, 2, 6, 0, 4];
+    assert_eq!(run(&mut Sim::new(3, Faults::default())), want);
+    assert_eq!(run(&mut Threads::new(&dir("timers-threads"), 1)), want);
+    #[cfg(target_os = "macos")]
+    assert_eq!(run(&mut crate::kqueue::Kqueue::new(dir("timers-kqueue"), 1).unwrap()), want);
+    #[cfg(windows)]
+    assert_eq!(run(&mut crate::iocp::Iocp::new(&dir("timers-iocp"), 1).unwrap()), want);
+    #[cfg(target_os = "linux")]
+    assert_eq!(run(&mut crate::uring::Uring::new(dir("timers-uring")).unwrap()), want);
+}
+
 /// A file written under a watched directory is heard of, on the drivers that watch.
 #[cfg(target_os = "linux")]
 #[test]

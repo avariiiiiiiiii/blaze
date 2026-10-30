@@ -48,7 +48,7 @@ use hir_ty::{
 };
 use rustc_hash::FxHashMap;
 use span::FileId;
-use syntax::{SyntaxNodePtr, TextRange, TextSize};
+use syntax::{AstNode as _, SyntaxNodePtr, TextRange, TextSize, ast};
 
 use crate::{
     cx::Cx,
@@ -164,8 +164,27 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         self.pat_node(pat)
     }
 
+    /// rustc's span of `expr`: where it is written, with the parentheses around it, which rustc's
+    /// lowering gives the expression in them when their span contains its (`rustc_ast_lowering`,
+    /// `ExprKind::Paren`). Parentheses a macro put around an expression it was handed do not
+    /// contain it, and are left out.
     pub(crate) fn expr_span(&self, expr: ExprId) -> Option<Span> {
-        Some(self.cx.span_of(self.expr_node(expr)?))
+        let node = self.expr_node(expr)?;
+        let mut span = self.cx.span_of(node);
+        let InFile { file_id, value } = self.cx.syntax(node);
+        let mut at = value;
+        while let Some(parent) = at.parent().filter(|it| ast::ParenExpr::can_cast(it.kind())) {
+            let outer = self.cx.span(InFile::new(file_id, parent.text_range()));
+            let contains = outer.file == span.file && outer.lo <= span.lo && span.hi <= outer.hi;
+            let parenthesized =
+                self.cx.snippet(&outer).is_some_and(|it| it.starts_with('(') && it.ends_with(')'));
+            if !contains || !parenthesized {
+                break;
+            }
+            span = outer;
+            at = parent;
+        }
+        Some(span)
     }
 
     pub(crate) fn pat_span(&self, pat: PatId) -> Option<Span> {
@@ -197,9 +216,13 @@ impl<'a, 'db> BodyCx<'a, 'db> {
         }
     }
 
-    /// The span rustc's MIR has for what `span` is of: an expression, the end of one (the last
-    /// character, rustc's `end_point` of a scope), a pattern, a binding or `self`.
+    /// The span rustc's MIR has for what `span` is of: an expression (with its parentheses, as
+    /// [`BodyCx::expr_span`]), the end of one (the last character, rustc's `end_point` of a
+    /// scope), a pattern, a binding or `self`.
     pub(crate) fn mir_span(&self, span: MirSpan) -> Option<Span> {
+        if let MirSpan::ExprId(expr) = span {
+            return self.expr_span(expr);
+        }
         let node = self.mir_node(span)?;
         let MirSpan::ExprEnd(_) = span else { return Some(self.cx.span_of(node)) };
         let last = self.cx.syntax(node).value.last_token()?;

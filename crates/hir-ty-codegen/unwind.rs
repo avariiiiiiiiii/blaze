@@ -2,6 +2,8 @@
 //! cannot cross a function we compiled. Ported from rustc's Cranelift backend. Windows has
 //! tables of its own, which are in [`seh`].
 
+#![forbid(unsafe_code)]
+
 use cranelift_codegen::{
     CompiledCode, Context, FinalizedMachExceptionHandler,
     gimli::{

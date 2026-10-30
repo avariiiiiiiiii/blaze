@@ -156,6 +156,15 @@ in that statement's tuple or array (clippy walks up through expressions to the `
 
 > forwarded to concurrency: `blaze-cas` and `blaze-reclaim` are its while it runs.
 
+> applied by concurrency (child `concurrency-safety`, report
+> `/tmp/blaze-lanes/v2-concurrency-safety.md`): all 24, the optional `table.rs` comment too;
+> comments, `# Safety` sections and block splits only, evaluation order kept. `Chunk::bytes` is
+> now `pub(crate) unsafe fn` with a `# Safety` section and a `// SAFETY:` at each caller
+> (`Look::record`, `Store::drain_record`). In `arm::stnp` the pointers are bound as
+> `(from_at, to_at)`, since `d` is an asm operand name there. `_mm_sfence()` in `x86::sse2` is
+> outside `unsafe` (SSE is baseline on x86_64); a sweep found no other block in either crate
+> that breaks the three lints.
+
 ### blaze-cas
 
 - `crates/blaze-cas/src/chunk.rs:94` unsafe fn `cut_avx512`: no `# Safety`. Proposed, after its doc: `///\n/// # Safety\n///\n/// The CPU has AVX-512F: `cut` and `paths` call it only after `is_x86_feature_detected!("avx512f")`.`
@@ -224,6 +233,8 @@ in that statement's tuple or array (clippy walks up through expressions to the `
 - usercode-concurrency item 3 (`blaze_cas::Reader`): exists, from `Store::reader()`.
 - Root `Cargo.toml` `blaze-reclaim = { path = "crates/blaze-reclaim" }`: already there.
 
+> applied: noted; a status report, nothing asked.
+
 ## Requests from concurrency (2026-10-29)
 
 ### R1. format: the lock ban in `crates/blaze-ids/` and `crates/intern/`
@@ -232,6 +243,8 @@ clippy reads only the nearest `clippy.toml`, so the hot-crate ban needs a copy p
 `crates/blaze-cas/clippy.toml` to `crates/blaze-ids/clippy.toml` and `crates/intern/clippy.toml`,
 landing with the fixes for the audit findings in `v2/requests/format.md` (until then the copy
 fails clippy on the locks those findings name).
+
+> forwarded to format: `crates/blaze-ids/` and `crates/intern/` are its.
 
 ### R2. core: the lock ban in `crates/blaze-graph/`, and each job a reclamation boundary
 
@@ -243,6 +256,8 @@ fails clippy on the locks those findings name).
   take `blaze_reclaim::enter()` for free (guards nest). Without it, values the store retires are
   freed only when the threads that read them next leave a guard they took themselves.
 
+> applied (core DONE): `crates/blaze-graph/clippy.toml` is a copy of blaze-cas's; `Cap`'s state is pump's `Lock` (the one allowed lock) and `Lock` names `std::sync::Mutex` in place, so no import trips the ban; each test module says `#[allow(clippy::disallowed_types, reason = ..)]` as `exec.rs`' did. `Local::run` (`pool.rs`) takes `let _task = blaze_reclaim::enter();` around each job, and blaze-graph depends on `blaze-reclaim.workspace = true` (a new edge for the lock).
+
 ### R3. fastcompile-global: frame the answers `blaze-global`'s `Remote` hands the store
 
 `crates/blaze-global/src/client.rs:663` and `:684` build `Done::Read(Answer::...encode())`.
@@ -251,9 +266,96 @@ answer), so a remote can hand on the receive buffer without a copy (C5). Once
 `concurrency-remote` lands `Answer::encode_framed`, use it at both sites. Until then those
 answers are refused as malformed (an error, never a wrong value).
 
+> forwarded to fastcompile: `crates/blaze-global/` is fastcompile-global's.
+
 ### R4. store (or the coordinator): `docs/v2-store.md`
 
 It still describes `put` appending to memory under one writer, `Append`, and flags indexed by
 row with a delta entry of 48 bytes. Describe instead: `Reader` and `Writer`, per-worker
 segments, spots retargeted to packs after mapping, `WriteAt` pack writes, and point at
 `docs/v2/plan/lanes/concurrency/store.md`.
+
+> forwarded to coordinator: `docs/v2-store.md` is not in any lane's paths in crates.md, so it falls to the coordinator.
+
+## From safety-fuzz-cas (2026-10-29)
+
+Fuzz targets for blaze-cas: `fuzz/targets/cas_{pack,head,index,entry,cold,remote}.rs`, with
+every Store/remote call in `fuzz/targets/cas_shared.rs` (a module, not a binary). The calls
+are `Store::{open, complete, owns, ready, broken, get, verify, put, flush, settle, fetch,
+fetched, reader}`, `Reader::get` with `blaze_cas::enter()`, and `remote::{Answer::{of, encode,
+decode}, Client::{new, complete, owns}, Server::{new, start, complete, owns}, LONGEST_VALUE}`.
+If you change those, adapt `cas_shared.rs` (or ask safety-fuzz-cas). Each input below is a
+corpus file, kept, and fails its target today (found by reading; nothing was run). The
+targets' first byte is a mode: `02` is "these pack bytes, every record header's CRC computed
+by the target" (the `00000000` in the hex are placeholders for it).
+
+> forwarded to concurrency: `crates/blaze-cas/` is its.
+
+### F1. A record's untrusted `raw` is allocated before the frame is read (cold.rs 126-163)
+
+`decompress`, `decompress_long` (zstd's bulk `decompress(stored, raw)` does
+`Vec::with_capacity(raw)`) and `unlz4` (lz4_flex `decompress(stored, raw)` does `vec![0; raw]`)
+take `raw` from the record header. A 16-byte payload with `raw = 2^40` asks for 1 TiB: abort,
+or a huge allocation for any `raw` up to what the machine has. `fuzz/corpus/cas_pack/zstd-raw-huge.hex`:
+
+    02 424c5a5041434b04 0000000000000000
+    424c5a52 02 01 0000 ffffffff 00000000 1000000000000000 0000000000010000
+    11×32 22×32 28b52ffd00000000 0000000000000000
+
+(`lz4-raw-huge.hex` is the same with kind 04, form 05.) Fix: bound `raw` by what the bytes can
+decode to before allocating: for zstd read the frame's content size
+(`zstd_safe::get_frame_content_size`, refuse unknown or `!= raw`) or decompress streaming into
+a buffer grown as output comes; for LZ4, refuse `raw > 255 * stored + 16` (a block's densest).
+
+### F2. Chunk lengths sum unchecked; `with_capacity(raw)` (read.rs 589-594)
+
+`chunks.iter().map(..).sum()` of untrusted u64s overflows (a panic in debug, a wrap in release
+that can then equal `raw`), and `Vec::with_capacity(total)` with `total == raw` (2^40) runs
+before any chunk is found. `fuzz/corpus/cas_pack/chunked-lengths-overflow.hex` (lens
+`u64::MAX` and 3, raw 2) and `chunked-raw-huge.hex` (one chunk of 2^40, raw 2^40). Fix:
+`checked_add` the lengths (overflow is `Corrupt`), and grow `whole` as pieces arrive (or cap the
+reservation at the sum of the pieces' `raw` once found).
+
+### F3. `indexed` is not checked to be a record boundary (lib.rs 2350-2352)
+
+Head decode checks `indexed <= committed`, not that it is 16-aligned. `indexed = committed - 1`
+makes `all[at..at + 4]` slice past `all` and panic in open. `fuzz/corpus/cas_head/indexed-not-a-record.hex`
+(packs 1, committed 4096, indexed 4095, the lone pack beside it):
+
+    02 424c5a4845414404 03000000 00000000 0100000000000000
+    ff00000000000000 0000000000000000 00000000 00000000 0000000000000000
+    01000000 00000000 00000000 00000000
+    00 000000 00000000 0010000000000000 ff0f000000000000 0000000000000000 00000000
+
+Fix: head decode refuses an `indexed` (and `dead`) that is not a multiple of 16, and the scan
+uses `all.get(at..at + 4)` so a short tail is the "neither a record nor zeros" error.
+
+### F4. `RECORD_HEADER + stored` overflows: a panic in debug, a hang in release (disk.rs 217)
+
+`span()` is `aligned(RECORD_HEADER + self.stored)`. `stored = 2^64 - 96` overflows: debug
+panics; release wraps to span 0, `end == at`, and `open_tier`'s loop (lib.rs 2353-2376) spins
+forever. Same pattern: read.rs 543 (`RECORD_HEADER + seg.stored`), lib.rs 1066 and 1179.
+`fuzz/corpus/cas_pack/stored-overflows-span.hex`:
+
+    02 424c5a5041434b04 0000000000000000
+    424c5a52 00 00 0000 00000000 00000000 a0ffffffffffffff 0000000000000000 11×32 22×32
+
+Fix: `RecordHeader::decode` refuses `stored > PACK_MOST` (no record is longer than a pack),
+and `span()` uses `checked_add` or is only ever called on decoded headers.
+
+### F5. A client reserves a frame's length before its bytes come (remote.rs 477)
+
+`up.buffer.reserve(owed(&up.buffer))` reserves up to `LONGEST_FRAME` (1 GiB) on an 8-byte
+prefix: any server (or anything on the connection) makes the client allocate 1 GiB per
+connection. `fuzz/corpus/cas_remote/frame-of-a-gigabyte.hex`: `00 00 0000 0000004000000000`
+(one fetch, then the 8 bytes `len = 2^30`). Fix: reserve at most what the next receive can
+bring (`CLIENT_RECV`) and let the buffer grow with the bytes; `pump`'s `most` likewise need not
+be the frame's whole length.
+
+### Note: the client and the store disagree on framing (not a new bug; R3)
+
+`Client::complete` hands `Done::Read(body)` (remote.rs 459/472, as its doc says), while
+`take_fetched` (lib.rs 2280) now expects the frame with its length. `cas_remote` checks each
+fetch through a real `Client` into a `Store` ends as its frame says, so its seeds fail until
+`concurrency-remote` makes the client hand on the frame. Nothing in `cas_remote` needs changing
+when it does.

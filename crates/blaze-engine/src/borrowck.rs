@@ -215,7 +215,7 @@ fn check_project(project: &str) -> anyhow::Result<()> {
                 files.push(file.file_id(&db));
             }
         }
-        files.sort();
+        blaze_ids::radix::sort_copy_by_key(&mut files, |it| it.index());
         files.dedup();
         files
     });

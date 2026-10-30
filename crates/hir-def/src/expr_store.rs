@@ -19,7 +19,8 @@ use std::{
 };
 
 use base_db::SourceDatabase;
-use cfg::{CfgExpr, CfgOptions};
+use blaze_ids::radix;
+use cfg::CfgExpr;
 use either::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId, mod_path::ModPath, name::Name};
 use la_arena::{Arena, ArenaMap, Idx};
@@ -499,9 +500,7 @@ impl ExpressionStoreDiagnostics {
     fn moved(&self, mv: &Move<'_>) -> Self {
         use ExpressionStoreDiagnostics::*;
         match self {
-            InactiveCode { node, cfg, opts } => {
-                InactiveCode { node: mv.raw(*node), cfg: cfg.clone(), opts: opts.clone() }
-            }
+            InactiveCode { node, cfg } => InactiveCode { node: mv.raw(*node), cfg: cfg.clone() },
             UnresolvedMacroCall { node, path } => {
                 UnresolvedMacroCall { node: mv.ptr(*node), path: path.clone() }
             }
@@ -628,7 +627,7 @@ pub enum MissingBodyItemKind {
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum ExpressionStoreDiagnostics {
-    InactiveCode { node: InFile<SyntaxNodePtr>, cfg: CfgExpr, opts: CfgOptions },
+    InactiveCode { node: InFile<SyntaxNodePtr>, cfg: CfgExpr },
     UnresolvedMacroCall { node: InFile<MacroCallPtr>, path: ModPath },
     UnreachableLabel { node: InFile<AstPtr<ast::Lifetime>>, name: Name },
     AwaitOutsideOfAsync { node: InFile<AstPtr<ast::AwaitExpr>>, location: String },
@@ -1341,9 +1340,9 @@ impl ExpressionStoreBuilder {
                 let mut ident_hygiene: Box<[_]> = ident_hygiene.into_iter().collect();
                 ident_hygiene.sort_unstable_by_key(|&(id, _)| id);
                 let mut block_editions: Box<[_]> = block_editions.into_iter().collect();
-                block_editions.sort_unstable_by_key(|&(id, _)| id);
+                radix::sort_copy_by_key(&mut block_editions, |&(id, _)| id.into_raw().into_u32());
                 let mut overflow_inheriting: Box<[_]> = overflow_inheriting.into_iter().collect();
-                overflow_inheriting.sort_unstable();
+                radix::sort_copy_by_key(&mut overflow_inheriting, |it| it.into_raw().into_u32());
                 Some(Box::new(ExpressionOnlyStore {
                     columns,
                     bindings,

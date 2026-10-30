@@ -10,7 +10,7 @@ use syntax::{AstNode, TextRange, ast};
 use super::format::{self, Arg, Trait};
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "useless_borrows_in_formatting";
+const LINT: super::Implemented = super::Implemented::UselessBorrowsInFormatting;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, call: &ast::MacroCall) {
     if !cx.on(LINT) {

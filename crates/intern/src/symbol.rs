@@ -63,6 +63,7 @@ pub struct Symbol {
 
 // SAFETY: A `Symbol` is a shared reference to a `Text` that is never written again.
 unsafe impl Send for Symbol {}
+// SAFETY: As for `Send`: a `Symbol` is a shared reference to a `Text` that is never written again.
 unsafe impl Sync for Symbol {}
 
 impl fmt::Debug for Symbol {
@@ -114,16 +115,20 @@ impl Symbol {
                     .expect("a symbol's layout");
                 let key = order_key(s.as_bytes());
                 vacant.insert(layout, |to| {
-                    // SAFETY: `to` is fresh memory of `layout`: a `Text` and, at `bytes_at`,
-                    // `s.len()` bytes. Neither moves or is freed, so the `&str` written points
-                    // at bytes that live for `'static`.
-                    unsafe {
-                        let bytes = to.as_ptr().add(bytes_at);
-                        bytes.copy_from_nonoverlapping(s.as_ptr(), s.len());
-                        let bytes = std::slice::from_raw_parts(bytes, s.len());
-                        let str: &'static str = std::str::from_utf8_unchecked(bytes);
-                        to.cast::<Text>().write(Text { key, str });
-                    }
+                    // SAFETY: `to` is fresh memory of `layout`, and `bytes_at` is where
+                    // `Layout::extend` put the bytes in it, so the pointer stays in the allocation.
+                    let bytes = unsafe { to.as_ptr().add(bytes_at) };
+                    // SAFETY: `bytes` has room for `s.len()` bytes (the array part of `layout`)
+                    // and is fresh memory, so it cannot overlap `s`.
+                    unsafe { bytes.copy_from_nonoverlapping(s.as_ptr(), s.len()) };
+                    // SAFETY: The `s.len()` bytes at `bytes` were just written, and the arena
+                    // never moves, writes or frees them, so they live for `'static`.
+                    let bytes: &'static [u8] = unsafe { std::slice::from_raw_parts(bytes, s.len()) };
+                    // SAFETY: `bytes` is a copy of `s`, a `&str`, so it is UTF-8.
+                    let str: &'static str = unsafe { std::str::from_utf8_unchecked(bytes) };
+                    // SAFETY: `layout` starts with a `Text` (`Layout::new`), so `to` is aligned
+                    // for it and has room, and nothing was there to drop.
+                    unsafe { to.cast::<Text>().write(Text { key, str }) };
                 })
             }
         };
@@ -159,6 +164,15 @@ impl Symbol {
         }
     }
 
+    /// The symbol's index in [`symbols::Declared`] when it is a declared one, from one
+    /// pointer subtraction and a bounds check; `None` for one interned at run time or of a list
+    /// such as [`symbols::Integer`]. Interning a declared symbol's text gives the declared
+    /// symbol, so a name read from source has its index too.
+    #[inline]
+    pub fn declared_index(&self) -> Option<u16> {
+        symbols::declared_index(self.as_static()).map(|it| it as u16)
+    }
+
     /// The `Text` the symbol points at.
     #[inline]
     pub(crate) fn as_static(&self) -> &'static Text {
@@ -170,6 +184,46 @@ impl Symbol {
 impl fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.as_str().fmt(f)
+    }
+}
+
+/// A fixed set of declared symbols (lang items, builtin attributes, target features) as the
+/// `u16` index of each in the set: a table by [`Symbol::declared_index`], built by `const fn`,
+/// so recognizing a member is a pointer subtraction and one load, with no hash and no string
+/// compared. 2 bytes a declared symbol.
+pub struct KnownNames {
+    by_declared: [u16; symbols::DECLARED],
+}
+
+impl KnownNames {
+    const NONE: u16 = u16::MAX;
+
+    /// The set whose member `i` is `members[i]`. A symbol named twice is the first member
+    /// that names it.
+    pub const fn new(members: &[symbols::Declared]) -> KnownNames {
+        assert!(members.len() < KnownNames::NONE as usize, "fewer than 65535 members");
+        let mut by_declared = [KnownNames::NONE; symbols::DECLARED];
+        let mut i = members.len();
+        while i > 0 {
+            i -= 1;
+            by_declared[members[i] as usize] = i as u16;
+        }
+        KnownNames { by_declared }
+    }
+
+    /// The index in the set of `symbol`, if it is a member.
+    #[inline]
+    pub fn get(&self, symbol: &Symbol) -> Option<u16> {
+        let at = *self.by_declared.get(usize::from(symbol.declared_index()?))?;
+        (at != KnownNames::NONE).then_some(at)
+    }
+
+    /// The index in the set of the declared symbol `declared`, if it is a member.
+    pub const fn get_declared(&self, declared: symbols::Declared) -> Option<u16> {
+        match self.by_declared[declared as usize] {
+            KnownNames::NONE => None,
+            at => Some(at),
+        }
     }
 }
 
@@ -218,6 +272,33 @@ mod tests {
         assert_ne!(sym::self_, sym::Self_);
         const DECLARED: Symbol = sym::self_;
         assert_eq!(DECLARED, Symbol::intern("self"));
+    }
+
+    #[test]
+    fn declared_indices() {
+        use crate::sym::Declared;
+        assert_eq!(sym::self_.declared_index(), Some(Declared::self_ as u16));
+        assert_eq!(Symbol::intern("self").declared_index(), Some(Declared::self_ as u16));
+        assert_eq!(sym::Self_.declared_index(), Some(Declared::Self_ as u16));
+        assert_eq!(Symbol::empty().declared_index(), Some(Declared::__empty as u16));
+        assert_eq!(Symbol::intern("not a declared symbol").declared_index(), None);
+        assert_eq!(sym::Integer::get(3).declared_index(), None);
+        assert_eq!(sym::RaGeneratedName::get(3).declared_index(), None);
+        assert!(sym::DECLARED <= u16::MAX as usize);
+    }
+
+    #[test]
+    fn known_names() {
+        use crate::sym::Declared;
+        static SET: KnownNames = KnownNames::new(&[Declared::fn_, Declared::self_, Declared::fn_]);
+        assert_eq!(SET.get(&sym::fn_), Some(0));
+        assert_eq!(SET.get(&Symbol::intern("fn")), Some(0));
+        assert_eq!(SET.get(&sym::self_), Some(1));
+        assert_eq!(SET.get(&sym::Self_), None);
+        assert_eq!(SET.get(&Symbol::intern("a runtime name")), None);
+        assert_eq!(SET.get(&sym::Integer::get(0)), None);
+        assert_eq!(SET.get_declared(Declared::self_), Some(1));
+        assert_eq!(SET.get_declared(Declared::crate_), None);
     }
 
     #[test]

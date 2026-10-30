@@ -74,11 +74,7 @@ impl Keywords<'_, '_, '_> {
                     }
                     _ => {}
                 },
-                NodeOrToken::Token(token) => {
-                    if let Some(parent) = token.parent() {
-                        self.token(&token, UnderMacro::No, &parent);
-                    }
-                }
+                NodeOrToken::Token(token) => self.token(&token, UnderMacro::No, None),
             }
         }
     }
@@ -120,47 +116,48 @@ impl Keywords<'_, '_, '_> {
                 continue;
             }
             if !prev_dollar {
-                self.token(&token, UnderMacro::Yes, owner);
+                self.token(&token, UnderMacro::Yes, Some(owner));
             }
             prev_dollar = false;
         }
     }
 
     /// `check_ident_token` of `token` if it is an identifier or a lifetime, the lint decided
-    /// at `at`.
-    fn token(&mut self, token: &SyntaxToken, under_macro: UnderMacro, at: &SyntaxNode) {
+    /// at `at`, or at the token's parent when `None`.
+    fn token(&mut self, token: &SyntaxToken, under_macro: UnderMacro, at: Option<&SyntaxNode>) {
+        let kind = token.kind();
+        if kind != SyntaxKind::IDENT && kind != SyntaxKind::LIFETIME_IDENT {
+            return;
+        }
         let text = token.text();
         let range = token.text_range();
-        match token.kind() {
-            SyntaxKind::IDENT if !text.starts_with("r#") => self.check(text, range, "", under_macro, at),
-            SyntaxKind::LIFETIME_IDENT => {
+        let (name, range, prefix) = match kind {
+            SyntaxKind::IDENT if !text.starts_with("r#") => (text, range, ""),
+            SyntaxKind::IDENT => return,
+            _ => {
                 let Some(name) = text.strip_prefix('\'') else { return };
                 match name.strip_prefix("r#") {
                     // Before 2021 rustc lexes `'r#name` as `'r`, `#` and the identifier `name`.
                     Some(rest) if !self.edition.at_least_2021() => {
-                        let range = TextRange::new(range.start() + TextSize::from(3), range.end());
-                        self.check(rest, range, "", under_macro, at);
+                        (rest, TextRange::new(range.start() + TextSize::from(3), range.end()), "")
                     }
-                    Some(_) => {}
-                    None => self.check(name, range, "'", under_macro, at),
+                    Some(_) => return,
+                    None => (name, range, "'"),
                 }
             }
-            _ => {}
+        };
+        let Some(keyword) = keyword(name, under_macro) else { return };
+        if self.edition >= keyword.0 {
+            return;
         }
+        let Some(at) = at.cloned().or_else(|| token.parent()) else { return };
+        self.check(name, range, prefix, keyword, &at);
     }
 
     /// `check_ident_token` of the identifier `name` at `range` (a lifetime's when `prefix` is
-    /// `'`, its span the lifetime's).
-    fn check(&mut self, name: &str, range: TextRange, prefix: &str, under_macro: UnderMacro, at: &SyntaxNode) {
-        let (lint, next, year) = match name {
-            "async" | "await" | "try" => ("keyword_idents_2018", Edition::Edition2018, "2018"),
-            "dyn" if under_macro == UnderMacro::No => ("keyword_idents_2018", Edition::Edition2018, "2018"),
-            "gen" => ("keyword_idents_2024", Edition::Edition2024, "2024"),
-            _ => return,
-        };
-        if self.edition >= next {
-            return;
-        }
+    /// `'`, its span the lifetime's), which a later edition makes the keyword `keyword`.
+    fn check(&mut self, name: &str, range: TextRange, prefix: &str, keyword: Keyword, at: &SyntaxNode) {
+        let (_, lint, year) = keyword;
         let cx = self.cx;
         let span = cx.span(InFile::new(self.tree.file, range));
         let mut diag = Diag::lint(lint, format!("`{name}` is a keyword in the {year} edition"), span.clone());
@@ -173,5 +170,21 @@ impl Keywords<'_, '_, '_> {
         let at: InFile<SyntaxNodePtr> = self.tree.ptr(at);
         source_fact(cx, &mut diag, at);
         self.out.push(Emitted::new(diag, Phase::Resolve, Pass::PreExpansion, at));
+    }
+}
+
+/// The edition that makes an identifier a keyword, the lint of it, and that edition's year.
+type Keyword = (Edition, &'static str, &'static str);
+
+/// The keyword a later edition makes of `name`: a match on its bytes, which compares lengths
+/// before bytes, so most identifiers cost one length compare.
+fn keyword(name: &str, under_macro: UnderMacro) -> Option<Keyword> {
+    const K2018: Keyword = (Edition::Edition2018, "keyword_idents_2018", "2018");
+    const K2024: Keyword = (Edition::Edition2024, "keyword_idents_2024", "2024");
+    match name.as_bytes() {
+        b"async" | b"await" | b"try" => Some(K2018),
+        b"dyn" if under_macro == UnderMacro::No => Some(K2018),
+        b"gen" => Some(K2024),
+        _ => None,
     }
 }

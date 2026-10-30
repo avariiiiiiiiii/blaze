@@ -8,7 +8,7 @@ use syntax::{AstNode, ast};
 use super::utils;
 use crate::{check::Cx, diag::Applicability, sugg::Sugg};
 
-const LINT: &str = "byte_char_slices";
+const LINT: super::Implemented = super::Implemented::ByteCharSlices;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::Expr) {
     if !cx.on(LINT) {

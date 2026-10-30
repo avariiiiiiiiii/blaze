@@ -542,3 +542,206 @@ fn a_cancelled_node_is_settled_and_encodes_as_its_name() {
     assert!(NodeState::Cancelled.settled());
     assert!(!NodeState::Ready.settled());
 }
+
+/// Columns of an [`crate::events::Event::Nodes`] built from nodes given as an `Event::Node`
+/// says each, the ids from `first` on.
+fn nodes_record(
+    first: u32,
+    nodes: &[(crate::events::NodeKind, &str, &[u32])],
+) -> crate::events::Event {
+    let mut kinds = Vec::new();
+    let (mut names, mut name_at) = (String::new(), vec![0]);
+    let (mut deps, mut deps_at) = (Vec::new(), vec![0]);
+    for &(kind, name, on) in nodes {
+        kinds.push(kind);
+        names.push_str(name);
+        name_at.push(names.len() as u32);
+        deps.extend_from_slice(on);
+        deps_at.push(deps.len() as u32);
+    }
+    crate::events::Event::Nodes { first, kinds, names, name_at, deps, deps_at }
+}
+
+/// A record of nodes is pinned like the others, and goes through the codec unchanged.
+#[test]
+fn a_record_of_nodes_is_these_bytes() {
+    use crate::events::{NodeKind, Record};
+    let event = nodes_record(1, &[(NodeKind::Std, "std", &[0]), (NodeKind::Names, "ab", &[1])]);
+    let record = Record { at_ns: 0, event };
+    let expected = [
+        "a2 6561745f6e73 00 656576656e74 a1 654e6f646573 a6", // {"at_ns": 0, "event": {"Nodes":
+        "64 64657073 82 00 01",                                //   "deps": [0, 1]
+        "65 6669727374 01",                                    //   "first": 1
+        "65 6b696e6473 82 63537464 654e616d6573",              //   "kinds": ["Std", "Names"]
+        "65 6e616d6573 65 7374646162",                         //   "names": "stdab"
+        "67 646570735f6174 83 00 01 02",                       //   "deps_at": [0, 1, 2]
+        "67 6e616d655f6174 83 00 03 05",                       //   "name_at": [0, 3, 5]}}
+    ];
+    let bytes = to_vec(&record).unwrap();
+    assert_eq!(hex(&bytes), expected.concat().replace(' ', ""));
+    check(&bytes).unwrap();
+    assert_eq!(from_slice::<Record>(&bytes).unwrap(), record);
+}
+
+/// A record of nodes reads as the `Event::Node` of each, ids from `first` on, in the order
+/// given; its order puts each after those of it that it waits for, the first given first
+/// among those that can go, at no cost when each already comes after them.
+#[test]
+fn a_record_of_nodes_reads_as_its_nodes() {
+    use crate::events::{Event, NodeKind, Order};
+    let mut order = Order::default();
+    let event = nodes_record(
+        10,
+        &[
+            (NodeKind::Codegen, "a\u{e9}", &[3, 12]),
+            (NodeKind::Link, "", &[]),
+            (NodeKind::Test, "c", &[11, 3, 11]),
+        ],
+    );
+    let batch = event.nodes(&mut order).unwrap().unwrap();
+    let each: Vec<Event> = batch.iter().map(|it| it.event()).collect();
+    let node = |id, kind, name: &str, deps: &[u32]| Event::Node {
+        id,
+        kind,
+        name: name.to_owned(),
+        deps: deps.to_vec(),
+    };
+    assert_eq!(
+        each,
+        [
+            node(10, NodeKind::Codegen, "a\u{e9}", &[3, 12]),
+            node(11, NodeKind::Link, "", &[]),
+            node(12, NodeKind::Test, "c", &[11, 3, 11]),
+        ]
+    );
+    // 10 waits for 12, which waits for 11.
+    assert_eq!(order.places(), [1, 2, 0]);
+    assert_eq!((batch.first(), batch.len(), batch.is_empty()), (10, 3, false));
+    let in_order = nodes_record(0, &[(NodeKind::Std, "std", &[]), (NodeKind::Names, "x", &[0])]);
+    in_order.nodes(&mut order).unwrap().unwrap();
+    assert_eq!(order.places(), [0, 1]);
+    let empty = nodes_record(u32::MAX, &[]);
+    assert!(empty.nodes(&mut order).unwrap().unwrap().is_empty());
+    assert!(order.places().is_empty());
+    assert!(Event::Unlisted { count: 1 }.nodes(&mut order).is_none());
+}
+
+/// The columns of an `Event::Nodes`, to edit in place.
+struct Columns<'a> {
+    first: &'a mut u32,
+    name_at: &'a mut Vec<u32>,
+    deps: &'a mut Vec<u32>,
+    deps_at: &'a mut Vec<u32>,
+}
+
+/// Columns that disagree, or nodes that wait for each other, are refused with why, never a
+/// panic, and leave no order.
+#[test]
+fn a_malformed_record_of_nodes_is_refused() {
+    use crate::events::{Event, NodeKind, Order};
+    // Ids 5 and 6: "std" waiting for 1, said before, and "é" waiting for 5.
+    let good = || {
+        nodes_record(5, &[(NodeKind::Std, "std", &[1]), (NodeKind::Names, "\u{e9}", &[5])])
+    };
+    let mut order = Order::default();
+    assert!(good().nodes(&mut order).unwrap().is_ok());
+    assert_eq!(order.places(), [0, 1]);
+    let cases: [(fn(Columns<'_>), &str); 11] = [
+        (|it| it.name_at.clear(), "name_at of 0 offsets for 2 nodes and 5 entries"),
+        (|it| _ = it.name_at.pop(), "name_at of 2 offsets for 2 nodes"),
+        (|it| it.name_at[0] = 1, "name_at of 3 offsets for 2 nodes"),
+        (|it| it.name_at[2] = 4, "name_at of 3 offsets for 2 nodes and 5 entries"),
+        (|it| it.name_at[1] = 6, "name_at goes back at node 1"),
+        (|it| it.name_at[1] = 4, "name_at cuts a character at node 1"),
+        (|it| it.deps_at[2] = 1, "deps_at of 3 offsets for 2 nodes and 2 entries"),
+        (|it| it.deps_at[1] = 3, "deps_at goes back at node 1"),
+        (|it| *it.first = u32::MAX - 1, "2 ids from 4294967294 past u32"),
+        (|it| it.deps[0] = 6, "nodes 5, 6 wait for each other"),
+        (|it| it.deps[1] = 6, "nodes 6 wait for each other"),
+    ];
+    for (edit, what) in cases {
+        let mut event = good();
+        let Event::Nodes { first, name_at, deps, deps_at, .. } = &mut event else {
+            unreachable!("an Event::Nodes")
+        };
+        edit(Columns { first, name_at, deps, deps_at });
+        good().nodes(&mut order).unwrap().unwrap();
+        let why = event.nodes(&mut order).unwrap().unwrap_err().to_string();
+        assert!(why.contains(what), "{why}, not {what}");
+        assert!(why.starts_with("a record of nodes is malformed: "), "{why}");
+        assert!(order.places().is_empty(), "{why}");
+    }
+}
+
+/// Random columns, many of them malformed, are read or refused but never panic the reader;
+/// of those read, the order is the one a plain search for the first node that can go gives.
+#[test]
+fn random_records_of_nodes_are_read_or_refused() {
+    use crate::events::{Event, NodeKind, Order};
+    let mut random = Random(0x9e37_79b9_7f4a_7c15);
+    let mut order = Order::default();
+    let (mut read, mut refused, mut out_of_order) = (0, 0, 0);
+    for _ in 0..4000 {
+        let len = (random.next() % 7) as usize;
+        let first = match random.next() % 50 {
+            0 => u32::MAX - 3,
+            _ => (random.next() % 20) as u32,
+        };
+        let names: String = (0..len).map(|_| random.text()).collect();
+        let below = |random: &mut Random, end: usize| (random.next() % (end as u64 + 1)) as u32;
+        let mut name_at: Vec<u32> = (0..=len).map(|_| below(&mut random, names.len())).collect();
+        // Deps from two before `first` to six after it: said before, of the batch, or past it.
+        let mut deps: Vec<u32> = (0..random.next() % 10)
+            .map(|_| first.wrapping_add((random.next() % 9) as u32).wrapping_sub(2))
+            .collect();
+        if random.next() % 3 == 0 {
+            deps.retain(|&it| it.wrapping_sub(first) >= len as u32);
+        }
+        let mut deps_at: Vec<u32> = (0..=len).map(|_| below(&mut random, deps.len())).collect();
+        // Mostly offsets that agree, so that cycles and orders are reached.
+        if random.next() % 4 != 0 {
+            for (at, end) in [(&mut name_at, names.len()), (&mut deps_at, deps.len())] {
+                at.sort_unstable();
+                at[0] = 0;
+                at[len] = end as u32;
+            }
+        }
+        let kinds = vec![NodeKind::Codegen; len];
+        let event = Event::Nodes { first, kinds, names, name_at, deps, deps_at };
+        match event.nodes(&mut order).unwrap() {
+            Err(_) => refused += 1,
+            Ok(batch) => {
+                read += 1;
+                let nodes: Vec<(u32, Vec<u32>)> =
+                    batch.iter().map(|it| (it.id, it.deps.to_vec())).collect();
+                let want = plain_order(&nodes);
+                assert_eq!(order.places(), want, "{event:?}");
+                let moved = want.iter().enumerate().any(|(at, &it)| it as usize != at);
+                out_of_order += usize::from(moved);
+            }
+        }
+    }
+    assert!(
+        read > 500 && refused > 500 && out_of_order > 20,
+        "{read} read, {refused} refused, {out_of_order} out of order"
+    );
+}
+
+/// The places of `nodes` (each its id and deps), each after those of them it waits for, by
+/// looking each time for the first that can go.
+fn plain_order(nodes: &[(u32, Vec<u32>)]) -> Vec<u32> {
+    let mut placed = vec![false; nodes.len()];
+    let mut order = Vec::new();
+    while order.len() < nodes.len() {
+        let can = (0..nodes.len()).find(|&at| {
+            !placed[at]
+                && nodes[at].1.iter().all(|dep| {
+                    nodes.iter().position(|it| it.0 == *dep).is_none_or(|it| placed[it])
+                })
+        });
+        let at = can.expect("a batch that was read has no cycle");
+        placed[at] = true;
+        order.push(at as u32);
+    }
+    order
+}

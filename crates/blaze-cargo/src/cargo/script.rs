@@ -564,7 +564,7 @@ impl Places {
             places.push((package.as_bytes().to_vec(), Self::PACKAGE));
         }
         // The longer first: the target directory is often in the package's.
-        places.sort_by_key(|it| std::cmp::Reverse(it.0.len()));
+        blaze_ids::radix::sort_by_key(&mut places, |it| !(it.0.len() as u64));
         Places(places)
     }
 

@@ -90,3 +90,5 @@
   still says one `Event::Node` a node, each owning a `String` and a `Vec<u32>`: a 10k-unit
   build still makes 20k small allocations, now in the plane. With `Event::Nodes`, the plane
   says one record a batch, copied from the columns it was given.
+
+> forwarded to requests-nodes: a child of `requests` (ci, core and core-plane are DONE), brief `~/restart-2026-10-28/briefs/v2/requests-nodes.md`; it requests the cargo and codegen readers' parts.

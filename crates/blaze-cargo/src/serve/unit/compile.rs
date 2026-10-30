@@ -11,8 +11,6 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeSet;
-
 use blaze_api::{ApiError, Artifact, Diagnostic, Level};
 use blaze_cas::{Key, Kind};
 use blaze_diagnostics::{Options, lints::CommandLine};
@@ -596,15 +594,17 @@ fn crate_files(job: &Job, krate: base_db::Crate) -> Vec<String> {
     let db: &dyn HirDatabase = &snapshot;
     let paths = job.lowered.paths();
     let def_map = hir_def::nameres::crate_def_map(db, krate);
-    let mut out = BTreeSet::new();
+    let mut out = Vec::new();
     for (_, module) in def_map.modules(db) {
         if let Some(file) = module.origin.file_id()
             && let Some(path) = paths.get(&file.file_id(db))
         {
-            out.insert(path.clone());
+            out.push(path);
         }
     }
-    out.into_iter().collect()
+    out.sort_unstable();
+    out.dedup();
+    out.into_iter().cloned().collect()
 }
 
 /// A dep-info file as rustc (`deps/foo-0123.d`: its outputs, then each source by the name

@@ -692,6 +692,7 @@ impl<'db> Elaborator<'_, 'db> {
             target: Some(succ),
             cleanup: unwind.action(),
             from_hir_call: false,
+            intrinsic: None,
         };
         Ok(self.new_block(unwind, vec![borrow], call))
     }

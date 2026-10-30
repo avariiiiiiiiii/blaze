@@ -1,11 +1,8 @@
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::cell::{RefCell, UnsafeCell};
 use std::fmt;
 use std::fmt::Formatter;
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
 use std::panic::UnwindSafe;
-use std::ptr::{self, NonNull};
+use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -21,9 +18,10 @@ use crate::active_query::{CompletedQuery, DetachedInputOutputs, QueryCompletion,
 use crate::cycle::{AtomicIterationStamp, CycleHeads, IterationStamp, empty_cycle_heads};
 use crate::durability::Durability;
 use crate::fingerprint::Fingerprint;
+use crate::graph::{self, EdgeSpan, Graph, Relocation, TaskGraph};
 use crate::key::DatabaseKeyIndex;
 use crate::runtime::Stamp;
-use crate::sync::atomic::AtomicBool;
+use crate::sync::atomic::{AtomicBool, AtomicU32};
 use crate::table::{PageIndex, Slot};
 use crate::tracked_struct::{Disambiguator, Identity, IdentityHash};
 use crate::zalsa::{IngredientIndex, Zalsa};
@@ -45,6 +43,9 @@ pub struct ZalsaLocal {
     /// Stores the most recent page for a given ingredient.
     /// This is thread-local to avoid contention.
     most_recent_pages: UnsafeCell<FxHashMap<IngredientIndex, PageIndex>>,
+
+    /// This task's cache of key to node and its reserved edge words ([`Graph::record`]).
+    graph: TaskGraph,
 
     cancelled: CancellationToken,
 }
@@ -91,8 +92,19 @@ impl ZalsaLocal {
         ZalsaLocal {
             query_stack: RefCell::new(QueryStack::default()),
             most_recent_pages: UnsafeCell::new(FxHashMap::default()),
+            graph: TaskGraph::default(),
             cancelled: CancellationToken::default(),
         }
+    }
+
+    /// Writes a finished query's edges into the database's edge array.
+    #[inline]
+    pub(crate) fn record_edges(
+        &self,
+        zalsa: &Zalsa,
+        edges: impl ExactSizeIterator<Item = QueryEdge>,
+    ) -> EdgeSpan {
+        zalsa.graph().record(&self.graph, edges)
     }
 
     /// The pages this task allocates in, which it gives up.
@@ -591,15 +603,36 @@ impl QueryRevisions {
         Some(self.fingerprints[position].fingerprint)
     }
 
-    /// Returns the semantic origin of this query.
+    /// Returns the semantic origin of this query, its edges read from `graph`.
     #[inline]
-    pub(crate) const fn origin(&self) -> QueryOriginRef<'_> {
-        self.origin_and_extra.origin()
+    pub(crate) fn origin<'a>(&'a self, graph: &'a Graph) -> QueryOriginRef<'a> {
+        self.origin_and_extra.origin(graph)
+    }
+
+    /// Whether the value was derived by running the function (tracked or not), so it has edges.
+    #[inline]
+    pub(crate) const fn is_derived(&self) -> bool {
+        self.origin_and_extra.is_derived()
+    }
+
+    /// The assigning query of a value set by `specify`.
+    #[inline]
+    pub(crate) const fn assigned_by(&self) -> Option<DatabaseKeyIndex> {
+        if self.origin_and_extra.is_derived() {
+            None
+        } else {
+            Some(self.origin_and_extra.assigned_key())
+        }
     }
 
     #[inline]
     pub(crate) const fn is_derived_untracked(&self) -> bool {
         self.origin_and_extra.is_derived_untracked()
+    }
+
+    /// Moves the edges into the array a compaction makes.
+    pub(crate) fn relocate_edges(&mut self, relocation: &mut Relocation<'_>) {
+        self.origin_and_extra.relocate(relocation);
     }
 
     /// Discard dependency and output edges that a never-changing query will
@@ -611,7 +644,8 @@ impl QueryRevisions {
     #[cfg(not(feature = "persistence"))]
     pub(crate) fn discard_edges_if_never_change(&mut self) {
         if self.durability != Durability::NEVER_CHANGE
-            || !matches!(self.origin(), QueryOriginRef::Derived(_))
+            || !self.is_derived()
+            || self.is_derived_untracked()
             || !self.cycle_heads().is_empty()
         {
             return;
@@ -832,7 +866,7 @@ impl QueryRevisions {
             changed_at: Revision::start(),
             durability: Durability::MAX,
             origin_and_extra: OriginAndExtra::derived(
-                std::iter::empty(),
+                EdgeSpan::EMPTY,
                 QueryRevisionsExtra::new(
                     #[cfg(feature = "accumulator")]
                     AccumulatedMap::default(),
@@ -981,7 +1015,7 @@ impl<'a> QueryOriginRef<'a> {
 
 // The discriminants reserve bit 1 for derived origins, allowing `Derived` and
 // `DerivedUntracked` to be recognized together.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 enum QueryOriginKind {
     /// The value was assigned as the output of another query.
@@ -998,44 +1032,318 @@ enum QueryOriginKind {
     DerivedUntracked = 0b10,
 }
 
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum DerivedOriginKind {
-    Derived = QueryOriginKind::Derived as u8,
-    DerivedUntracked = QueryOriginKind::DerivedUntracked as u8,
+/// Stores a query origin and optional revision data in one packed value.
+///
+/// The tag determines how `payload` and `metadata` must be interpreted:
+///
+/// | Origin   | Extra | `payload`                         | `metadata`          |
+/// |----------|-------|-----------------------------------|---------------------|
+/// | Assigned | No    | Assigning query's [`Id`]          | [`IngredientIndex`] |
+/// | Assigned | Yes   | `Box<WithExtra<Id>>`              | [`IngredientIndex`] |
+/// | Derived  | No    | The edges' [`EdgeSpan`]           | 0                   |
+/// | Derived  | Yes   | `Box<WithExtra<EdgeSpan>>`        | 0                   |
+///
+/// A derived origin's edges are a range of the database's edge array ([`Graph`]), 4 bytes an
+/// edge, so a memo without extra data owns no allocation at all.
+///
+/// These combinations are invariants of the type: all accesses to the payload rely on the tag
+/// accurately describing the initialized representation.
+#[repr(Rust, packed)]
+pub(crate) struct OriginAndExtra {
+    tag: OriginAndExtraTag,
+    payload: OriginAndExtraPayload,
+    metadata: u32,
 }
 
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum QueryEdgeLayout {
-    /// Every edge in the origin fits in [`PackedQueryEdge`].
-    ///
-    /// The origin stores one inline slice of `PackedQueryEdge`, reducing each retained edge from
-    /// 12 bytes to 8 bytes.
-    Packed = 0b000,
+const _: [(); std::mem::size_of::<OriginAndExtra>()] = [(); 13];
 
-    /// At least one edge in the origin does not fit in [`PackedQueryEdge`].
-    ///
-    /// The origin stores one inline slice of `QueryEdge`. Spilling the entire origin avoids
-    /// allocating a separate overflow object for each wide edge.
-    Wide = 0b100,
+/// SAFETY: [`OriginAndExtra`] uses its tag to maintain the active payload field. Its only owned
+/// allocation is a `Box<WithExtra<_>>` of `Send` data.
+unsafe impl Send for OriginAndExtra
+where
+    Id: Send,
+    QueryRevisionsExtraInner: Send,
+{
 }
 
-/// Encodes the semantic origin kind and retained edge layout in a single byte.
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-struct QueryOriginTag(u8);
+/// SAFETY: Same as above, and shared access to the boxed extra data is `Sync`.
+unsafe impl Sync for OriginAndExtra
+where
+    Id: Sync,
+    QueryRevisionsExtraInner: Sync,
+{
+}
 
-impl QueryOriginTag {
-    const KIND_MASK: u8 = 0b011;
-    const LAYOUT_MASK: u8 = 0b100;
-
-    const fn assigned() -> Self {
-        QueryOriginTag(QueryOriginKind::Assigned as u8)
+impl OriginAndExtra {
+    #[inline]
+    pub(crate) fn derived(edges: EdgeSpan, extra: QueryRevisionsExtra) -> Self {
+        Self::new_derived(edges, QueryOriginKind::Derived, extra)
     }
 
-    const fn derived(kind: DerivedOriginKind, layout: QueryEdgeLayout) -> Self {
-        QueryOriginTag(kind as u8 | layout as u8)
+    #[inline]
+    pub(crate) fn derived_untracked(edges: EdgeSpan, extra: QueryRevisionsExtra) -> Self {
+        Self::new_derived(edges, QueryOriginKind::DerivedUntracked, extra)
+    }
+
+    pub(crate) const fn assigned(key: DatabaseKeyIndex) -> Self {
+        Self {
+            tag: OriginAndExtraTag::new(QueryOriginKind::Assigned, false),
+            payload: OriginAndExtraPayload {
+                index: key.key_index(),
+            },
+            metadata: key.ingredient_index().as_u32(),
+        }
+    }
+
+    fn assigned_with_extra(key: DatabaseKeyIndex, extra: QueryRevisionsExtraInner) -> Self {
+        Self {
+            tag: OriginAndExtraTag::new(QueryOriginKind::Assigned, true),
+            payload: OriginAndExtraPayload {
+                allocation: WithExtra::boxed(extra, key.key_index()),
+            },
+            metadata: key.ingredient_index().as_u32(),
+        }
+    }
+
+    #[inline]
+    fn new_derived(edges: EdgeSpan, kind: QueryOriginKind, extra: QueryRevisionsExtra) -> Self {
+        match extra.0 {
+            Some(extra) => Self {
+                tag: OriginAndExtraTag::new(kind, true),
+                payload: OriginAndExtraPayload {
+                    allocation: WithExtra::boxed(extra, edges),
+                },
+                metadata: 0,
+            },
+            None => Self {
+                tag: OriginAndExtraTag::new(kind, false),
+                payload: OriginAndExtraPayload { span: edges },
+                metadata: 0,
+            },
+        }
+    }
+
+    const fn extra(&self) -> Option<&QueryRevisionsExtraInner> {
+        if self.tag.has_extra() {
+            // `WithExtra` is `repr(C)` with the extra data first.
+            // SAFETY: `payload.allocation` points to the live `WithExtra` owned by `self`.
+            Some(unsafe {
+                self.payload
+                    .allocation
+                    .cast::<QueryRevisionsExtraInner>()
+                    .as_ref()
+            })
+        } else {
+            None
+        }
+    }
+
+    const fn extra_mut(&mut self) -> Option<&mut QueryRevisionsExtraInner> {
+        if self.tag.has_extra() {
+            // SAFETY: As in `extra`, and the allocation is uniquely borrowed through `self`.
+            Some(unsafe {
+                self.payload
+                    .allocation
+                    .cast::<QueryRevisionsExtraInner>()
+                    .as_mut()
+            })
+        } else {
+            None
+        }
+    }
+
+    fn get_or_insert_extra(&mut self) -> &mut QueryRevisionsExtraInner {
+        if !self.tag.has_extra() {
+            let extra = QueryRevisionsExtraInner::empty();
+            let allocation = if self.is_derived() {
+                // SAFETY: Derived origins without extra data initialize `payload.span`.
+                let span = unsafe { self.payload.span };
+                WithExtra::boxed(extra, span)
+            } else {
+                // SAFETY: Assigned origins without extra data initialize `payload.index`.
+                let index = unsafe { self.payload.index };
+                WithExtra::boxed(extra, index)
+            };
+            self.payload = OriginAndExtraPayload { allocation };
+            self.tag = OriginAndExtraTag::new(self.tag.kind(), true);
+        }
+
+        self.extra_mut().unwrap()
+    }
+
+    /// The edges of a derived origin.
+    #[inline]
+    pub(crate) const fn span(&self) -> Option<EdgeSpan> {
+        match self.tag.kind() {
+            QueryOriginKind::Assigned => None,
+            QueryOriginKind::Derived | QueryOriginKind::DerivedUntracked => {
+                Some(if self.tag.has_extra() {
+                    // SAFETY: Derived origins with extra data own a `WithExtra<EdgeSpan>`.
+                    unsafe {
+                        self.payload
+                            .allocation
+                            .cast::<WithExtra<EdgeSpan>>()
+                            .as_ref()
+                            .origin
+                    }
+                } else {
+                    // SAFETY: Derived origins without extra data initialize `payload.span`.
+                    unsafe { self.payload.span }
+                })
+            }
+        }
+    }
+
+    /// Replaces a derived origin's edges; an assigned origin has none.
+    fn set_span(&mut self, edges: EdgeSpan) {
+        match (self.tag.kind(), self.tag.has_extra()) {
+            (QueryOriginKind::Assigned, _) => {}
+            (_, true) => {
+                // SAFETY: Derived origins with extra data own a `WithExtra<EdgeSpan>`, uniquely
+                // borrowed through `self`.
+                unsafe {
+                    self.payload
+                        .allocation
+                        .cast::<WithExtra<EdgeSpan>>()
+                        .as_mut()
+                        .origin = edges;
+                }
+            }
+            (_, false) => self.payload = OriginAndExtraPayload { span: edges },
+        }
+    }
+
+    /// Moves the edges into the array a compaction makes.
+    pub(crate) fn relocate(&mut self, relocation: &mut Relocation<'_>) {
+        if let Some(span) = self.span() {
+            self.set_span(relocation.relocate(span));
+        }
+    }
+
+    /// Drops the edges; their words are dead until the next compaction.
+    #[cfg(not(feature = "persistence"))]
+    fn clear_edges(&mut self) {
+        self.set_span(EdgeSpan::EMPTY);
+    }
+
+    #[inline]
+    const fn is_derived(&self) -> bool {
+        !matches!(self.tag.kind(), QueryOriginKind::Assigned)
+    }
+
+    const fn is_derived_untracked(&self) -> bool {
+        matches!(self.tag.kind(), QueryOriginKind::DerivedUntracked)
+    }
+
+    #[inline]
+    fn origin<'a>(&'a self, graph: &'a Graph) -> QueryOriginRef<'a> {
+        match self.tag.kind() {
+            QueryOriginKind::Assigned => QueryOriginRef::Assigned(self.assigned_key()),
+            kind => {
+                let span = self
+                    .span()
+                    .expect("salsa: a derived origin has an edge span");
+                let edges = QueryEdges::in_graph(graph, span);
+                if kind == QueryOriginKind::Derived {
+                    QueryOriginRef::Derived(edges)
+                } else {
+                    QueryOriginRef::DerivedUntracked(edges)
+                }
+            }
+        }
+    }
+
+    const fn assigned_key(&self) -> DatabaseKeyIndex {
+        let index = if self.tag.has_extra() {
+            // SAFETY: Assigned origins with extra data own a `WithExtra<Id>`.
+            unsafe {
+                self.payload
+                    .allocation
+                    .cast::<WithExtra<Id>>()
+                    .as_ref()
+                    .origin
+            }
+        } else {
+            // SAFETY: Assigned origins without extra data initialize `payload.index`.
+            unsafe { self.payload.index }
+        };
+        // SAFETY: Assigned origins initialize metadata from a valid ingredient index.
+        let ingredient = unsafe { IngredientIndex::new_unchecked(self.metadata) };
+        DatabaseKeyIndex::new(ingredient, index)
+    }
+
+    /// The bytes this origin owns or uses: its extra box, and its share of the edge array.
+    #[cfg(any(test, feature = "salsa_unstable"))]
+    fn allocation_size(&self) -> usize {
+        let edges = self
+            .span()
+            .map_or(0, |span| span.len as usize * size_of::<u32>());
+        let boxed = match (self.tag.kind(), self.tag.has_extra()) {
+            (_, false) => 0,
+            (QueryOriginKind::Assigned, true) => size_of::<WithExtra<Id>>(),
+            (_, true) => size_of::<WithExtra<EdgeSpan>>(),
+        };
+
+        #[cfg(feature = "salsa_unstable")]
+        if let Some(extra) = self.extra() {
+            return edges + boxed + extra.allocation_size();
+        }
+
+        edges + boxed
+    }
+}
+
+impl Drop for OriginAndExtra {
+    fn drop(&mut self) {
+        if !self.tag.has_extra() {
+            return;
+        }
+        // SAFETY: Origins with extra data own the `WithExtra` that `WithExtra::boxed` made, of
+        // the type the kind names; `Drop` runs once.
+        unsafe {
+            let allocation = self.payload.allocation;
+            match self.tag.kind() {
+                QueryOriginKind::Assigned => {
+                    drop(Box::from_raw(allocation.cast::<WithExtra<Id>>().as_ptr()))
+                }
+                QueryOriginKind::Derived | QueryOriginKind::DerivedUntracked => {
+                    drop(Box::from_raw(allocation.cast::<WithExtra<EdgeSpan>>().as_ptr()))
+                }
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for OriginAndExtra {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut f = f.debug_struct("OriginAndExtra");
+        match self.tag.kind() {
+            QueryOriginKind::Assigned => f.field("assigned", &self.assigned_key()),
+            QueryOriginKind::Derived => f.field("derived", &self.span()),
+            QueryOriginKind::DerivedUntracked => f.field("derived_untracked", &self.span()),
+        };
+        if let Some(extra) = self.extra() {
+            f.field("extra", extra);
+        }
+        f.finish()
+    }
+}
+
+/// The origin kind in the low two bits, and whether the payload is a `WithExtra` box.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct OriginAndExtraTag(u8);
+
+impl OriginAndExtraTag {
+    const KIND_MASK: u8 = 0b011;
+    const WITH_EXTRA: u8 = 0b100;
+
+    const fn new(kind: QueryOriginKind, extra: bool) -> Self {
+        OriginAndExtraTag(kind as u8 | if extra { Self::WITH_EXTRA } else { 0 })
+    }
+
+    const fn has_extra(self) -> bool {
+        self.0 & Self::WITH_EXTRA != 0
     }
 
     const fn kind(self) -> QueryOriginKind {
@@ -1046,654 +1354,32 @@ impl QueryOriginTag {
             _ => panic!("invalid query origin kind"),
         }
     }
-
-    const fn layout(self) -> QueryEdgeLayout {
-        if self.0 & Self::LAYOUT_MASK == 0 {
-            QueryEdgeLayout::Packed
-        } else {
-            QueryEdgeLayout::Wide
-        }
-    }
-}
-
-/// Stores a query origin and optional revision data in one packed value.
-///
-/// The tag determines how `payload` and `metadata` must be interpreted:
-///
-/// | Origin   | Extra | `payload`                                       | `metadata`          |
-/// |----------|-------|-------------------------------------------------|---------------------|
-/// | Assigned | No    | Assigning query's [`Id`]                        | [`IngredientIndex`] |
-/// | Assigned | Yes   | `Box<AssignedOriginAndExtra>`                   | [`IngredientIndex`] |
-/// | Derived  | No    | `SliceWithHeader<(), E>`                       | Edge count          |
-/// | Derived  | Yes   | `SliceWithHeader<QueryRevisionsExtraInner, E>` | Edge count          |
-///
-/// `E` is [`PackedQueryEdge`] or [`QueryEdge`], as recorded by [`QueryOriginTag`]. Assigned origins
-/// without extra data require no allocation. Assigned origins with extra data use a regular box.
-/// Derived origins always allocate their edge slice, placing the extra data in the same allocation
-/// as the edges when it exists.
-///
-/// These combinations are invariants of the type: all accesses to the payload, allocation header,
-/// and edge slice rely on the tag accurately describing the initialized representation.
-#[repr(Rust, packed)]
-pub(crate) struct OriginAndExtra {
-    tag: OriginAndExtraTag,
-    payload: OriginAndExtraPayload,
-    metadata: u32,
-}
-
-const _: [(); std::mem::size_of::<OriginAndExtra>()] = [(); 13];
-
-/// SAFETY: [`OriginAndExtra`] uses its tag and metadata to maintain the active payload field and its
-/// allocation layout. Assigned origins contain an `Id`, directly or after an extra header. Derived
-/// origins own an allocation containing packed or wide edges, optionally after an extra header.
-unsafe impl Send for OriginAndExtra
-where
-    Id: Send,
-    QueryRevisionsExtraInner: Send,
-    PackedQueryEdge: Send,
-    QueryEdge: Send,
-{
-}
-
-/// SAFETY: Same as above, and shared access to every active value or allocation is `Sync`.
-unsafe impl Sync for OriginAndExtra
-where
-    Id: Sync,
-    QueryRevisionsExtraInner: Sync,
-    PackedQueryEdge: Sync,
-    QueryEdge: Sync,
-{
-}
-
-impl OriginAndExtra {
-    #[inline]
-    pub(crate) fn derived<I>(input_outputs: I, extra: QueryRevisionsExtra) -> Self
-    where
-        I: ExactSizeIterator<Item = QueryEdge>,
-    {
-        Self::new_derived_with_kind(input_outputs, DerivedOriginKind::Derived, extra)
-    }
-
-    #[inline]
-    pub(crate) fn derived_untracked<I>(input_outputs: I, extra: QueryRevisionsExtra) -> Self
-    where
-        I: ExactSizeIterator<Item = QueryEdge>,
-    {
-        Self::new_derived_with_kind(input_outputs, DerivedOriginKind::DerivedUntracked, extra)
-    }
-
-    pub(crate) const fn assigned(key: DatabaseKeyIndex) -> Self {
-        Self {
-            tag: OriginAndExtraTag::without_extra(QueryOriginTag::assigned()),
-            payload: OriginAndExtraPayload {
-                index: key.key_index(),
-            },
-            metadata: key.ingredient_index().as_u32(),
-        }
-    }
-
-    fn assigned_with_extra(key: DatabaseKeyIndex, extra: QueryRevisionsExtraInner) -> Self {
-        let allocation = Box::into_raw(Box::new(AssignedOriginAndExtra {
-            extra,
-            index: key.key_index(),
-        }));
-        Self {
-            tag: OriginAndExtraTag::with_extra(QueryOriginTag::assigned()),
-            payload: OriginAndExtraPayload {
-                allocation: NonNull::new(allocation).unwrap().cast(),
-            },
-            metadata: key.ingredient_index().as_u32(),
-        }
-    }
-
-    #[inline]
-    fn new_derived_with_kind<I>(
-        input_outputs: I,
-        kind: DerivedOriginKind,
-        extra: QueryRevisionsExtra,
-    ) -> Self
-    where
-        I: ExactSizeIterator<Item = QueryEdge>,
-    {
-        match extra.0 {
-            Some(extra) => Self::new_derived_with_extra(input_outputs, kind, extra),
-            None => Self::new_derived_without_extra(input_outputs, kind),
-        }
-    }
-
-    #[inline]
-    fn new_derived_without_extra(
-        input_outputs: impl ExactSizeIterator<Item = QueryEdge>,
-        kind: DerivedOriginKind,
-    ) -> Self {
-        // SAFETY: The returned allocation uses `()` as its header. The tag records that there is no
-        // extra header and records the returned edge layout.
-        let (edge_layout, allocation, metadata) =
-            unsafe { Self::allocate_derived_with_header(input_outputs, ()) };
-        Self {
-            tag: OriginAndExtraTag::without_extra(QueryOriginTag::derived(kind, edge_layout)),
-            payload: OriginAndExtraPayload { allocation },
-            metadata,
-        }
-    }
-
-    #[inline]
-    fn new_derived_with_extra(
-        input_outputs: impl ExactSizeIterator<Item = QueryEdge>,
-        kind: DerivedOriginKind,
-        extra: QueryRevisionsExtraInner,
-    ) -> Self {
-        // SAFETY: The returned allocation uses `QueryRevisionsExtraInner` as its header. The tag
-        // records that extra data is present and records the returned edge layout.
-        let (edge_layout, allocation, metadata) =
-            unsafe { Self::allocate_derived_with_header(input_outputs, extra) };
-        Self {
-            tag: OriginAndExtraTag::with_extra(QueryOriginTag::derived(kind, edge_layout)),
-            payload: OriginAndExtraPayload { allocation },
-            metadata,
-        }
-    }
-
-    /// Allocates and initializes a derived origin with a header and inline edge slice.
-    ///
-    /// # Safety
-    ///
-    /// The returned pointer owns a completed `SliceWithHeader<H, E>` allocation, where `E` is
-    /// selected by the returned edge layout. The caller must immediately store it in an
-    /// [`OriginAndExtra`] whose tag records both whether `H` is `()` or
-    /// `QueryRevisionsExtraInner` and the returned edge layout, and whose metadata is the returned
-    /// length.
-    #[inline]
-    unsafe fn allocate_derived_with_header<H, I>(
-        mut input_outputs: I,
-        header: H,
-    ) -> (QueryEdgeLayout, NonNull<()>, u32)
-    where
-        I: ExactSizeIterator<Item = QueryEdge>,
-    {
-        let length = input_outputs.len();
-        let metadata = u32::try_from(length)
-            .expect("exceeded more than `u32::MAX` query edges; this should never happen");
-        let mut packed = SliceWithHeader::allocate(length);
-        for edge in input_outputs.by_ref() {
-            let Some(edge) = PackedQueryEdge::new(edge) else {
-                let mut wide = SliceWithHeader::allocate(length);
-                wide.extend(
-                    packed
-                        .initialized_slice()
-                        .iter()
-                        .copied()
-                        .map(PackedQueryEdge::edge),
-                );
-                drop(packed);
-                wide.push(edge);
-                wide.extend(input_outputs);
-                let allocation = wide.finish(header).into_raw();
-                return (QueryEdgeLayout::Wide, allocation, metadata);
-            };
-
-            packed.push(edge);
-        }
-
-        let allocation = packed.finish(header).into_raw();
-        (QueryEdgeLayout::Packed, allocation, metadata)
-    }
-
-    const fn extra(&self) -> Option<&QueryRevisionsExtraInner> {
-        match self.tag.layout() {
-            OriginAndExtraLayout::WithExtra => {
-                // Every allocation with extra data puts that data first.
-                // SAFETY: `payload.allocation` points to the live allocation owned by `self`.
-                Some(unsafe {
-                    self.payload
-                        .allocation
-                        .cast::<QueryRevisionsExtraInner>()
-                        .as_ref()
-                })
-            }
-            OriginAndExtraLayout::WithoutExtra => None,
-        }
-    }
-
-    const fn extra_mut(&mut self) -> Option<&mut QueryRevisionsExtraInner> {
-        match self.tag.layout() {
-            OriginAndExtraLayout::WithExtra => {
-                // Every allocation with extra data puts that data first.
-                // SAFETY: The allocation is uniquely borrowed through `self`.
-                Some(unsafe {
-                    self.payload
-                        .allocation
-                        .cast::<QueryRevisionsExtraInner>()
-                        .as_mut()
-                })
-            }
-            OriginAndExtraLayout::WithoutExtra => None,
-        }
-    }
-
-    fn get_or_insert_extra(&mut self) -> &mut QueryRevisionsExtraInner {
-        if matches!(self.tag.layout(), OriginAndExtraLayout::WithoutExtra) {
-            let extra = QueryRevisionsExtraInner::empty();
-            let replacement = match self.origin() {
-                QueryOriginRef::Assigned(key) => Self::assigned_with_extra(key, extra),
-                QueryOriginRef::Derived(edges) => {
-                    Self::derived(edges.iter(), QueryRevisionsExtra(Some(extra)))
-                }
-                QueryOriginRef::DerivedUntracked(edges) => {
-                    Self::derived_untracked(edges.iter(), QueryRevisionsExtra(Some(extra)))
-                }
-            };
-            *self = replacement;
-        }
-
-        self.extra_mut().unwrap()
-    }
-
-    #[cfg(not(feature = "persistence"))]
-    fn clear_edges(&mut self) {
-        // Avoid rebuilding the allocation when there are no edges to remove.
-        if self.metadata == 0 {
-            return;
-        }
-
-        let kind = match self.tag.origin().kind() {
-            QueryOriginKind::Assigned => panic!("assigned query origins have no edges"),
-            QueryOriginKind::Derived => DerivedOriginKind::Derived,
-            QueryOriginKind::DerivedUntracked => DerivedOriginKind::DerivedUntracked,
-        };
-
-        let extra = self
-            .extra_mut()
-            .map(|extra| std::mem::replace(extra, QueryRevisionsExtraInner::empty()));
-        *self = Self::new_derived_with_kind([].into_iter(), kind, QueryRevisionsExtra(extra));
-    }
-
-    const fn is_derived_untracked(&self) -> bool {
-        matches!(self.tag.origin().kind(), QueryOriginKind::DerivedUntracked)
-    }
-
-    const fn origin(&self) -> QueryOriginRef<'_> {
-        let tag = self.tag.origin();
-        match tag.kind() {
-            QueryOriginKind::Assigned => {
-                let index = match self.tag.layout() {
-                    OriginAndExtraLayout::WithoutExtra => {
-                        // SAFETY: Direct assigned origins initialize `payload.index`.
-                        unsafe { self.payload.index }
-                    }
-                    OriginAndExtraLayout::WithExtra => {
-                        // SAFETY: Indirect assigned origins use `AssignedOriginAndExtra`.
-                        unsafe {
-                            self.payload
-                                .allocation
-                                .cast::<AssignedOriginAndExtra>()
-                                .as_ref()
-                                .index
-                        }
-                    }
-                };
-                // SAFETY: Assigned origins initialize metadata from a valid ingredient index.
-                let ingredient = unsafe { IngredientIndex::new_unchecked(self.metadata) };
-                QueryOriginRef::Assigned(DatabaseKeyIndex::new(ingredient, index))
-            }
-            QueryOriginKind::Derived | QueryOriginKind::DerivedUntracked => {
-                let length = self.metadata as usize;
-                // SAFETY: Derived origins initialize `payload.allocation`, and the tag records the
-                // header and edge layout used to create that allocation.
-                let edges = unsafe {
-                    let allocation = self.payload.allocation;
-                    match (self.tag.layout(), tag.layout()) {
-                        (OriginAndExtraLayout::WithoutExtra, QueryEdgeLayout::Packed) => {
-                            QueryEdges::packed(
-                                SliceWithHeader::<(), PackedQueryEdge>::slice(allocation, length)
-                                    .as_ref(),
-                            )
-                        }
-                        (OriginAndExtraLayout::WithoutExtra, QueryEdgeLayout::Wide) => {
-                            QueryEdges::wide(
-                                SliceWithHeader::<(), QueryEdge>::slice(allocation, length).as_ref(),
-                            )
-                        }
-                        (OriginAndExtraLayout::WithExtra, QueryEdgeLayout::Packed) => {
-                            QueryEdges::packed(
-                                SliceWithHeader::<QueryRevisionsExtraInner, PackedQueryEdge>::slice(
-                                    allocation, length,
-                                )
-                                .as_ref(),
-                            )
-                        }
-                        (OriginAndExtraLayout::WithExtra, QueryEdgeLayout::Wide) => {
-                            QueryEdges::wide(
-                                SliceWithHeader::<QueryRevisionsExtraInner, QueryEdge>::slice(
-                                    allocation, length,
-                                )
-                                .as_ref(),
-                            )
-                        }
-                    }
-                };
-                match tag.kind() {
-                    QueryOriginKind::Derived => QueryOriginRef::Derived(edges),
-                    QueryOriginKind::DerivedUntracked => QueryOriginRef::DerivedUntracked(edges),
-                    QueryOriginKind::Assigned => unreachable!(),
-                }
-            }
-        }
-    }
-
-    #[cfg(any(test, feature = "salsa_unstable"))]
-    fn allocation_size(&self) -> usize {
-        let tag = self.tag.origin();
-        let memory = match (self.tag.layout(), tag.kind(), tag.layout()) {
-            (OriginAndExtraLayout::WithoutExtra, QueryOriginKind::Assigned, _) => 0,
-            (OriginAndExtraLayout::WithExtra, QueryOriginKind::Assigned, _) => {
-                std::mem::size_of::<AssignedOriginAndExtra>()
-            }
-            (_, _, QueryEdgeLayout::Packed) => self.derived_allocation_size::<PackedQueryEdge>(),
-            (_, _, QueryEdgeLayout::Wide) => self.derived_allocation_size::<QueryEdge>(),
-        };
-
-        #[cfg(feature = "salsa_unstable")]
-        if let Some(extra) = self.extra() {
-            return memory + extra.allocation_size();
-        }
-
-        memory
-    }
-
-    #[cfg(any(test, feature = "salsa_unstable"))]
-    const fn derived_allocation_size<E: Copy>(&self) -> usize {
-        let length = self.metadata as usize;
-        match self.tag.layout() {
-            OriginAndExtraLayout::WithoutExtra => SliceWithHeader::<(), E>::layout(length).0.size(),
-            OriginAndExtraLayout::WithExtra => {
-                SliceWithHeader::<QueryRevisionsExtraInner, E>::layout(length)
-                    .0
-                    .size()
-            }
-        }
-    }
-}
-
-impl Drop for OriginAndExtra {
-    fn drop(&mut self) {
-        let tag = self.tag.origin();
-        match (tag.kind(), self.tag.layout(), tag.layout()) {
-            (QueryOriginKind::Assigned, OriginAndExtraLayout::WithoutExtra, _) => {}
-            (QueryOriginKind::Assigned, OriginAndExtraLayout::WithExtra, _) => {
-                // SAFETY: Indirect assigned origins use `Box<AssignedOriginAndExtra>`.
-                let allocation = unsafe { self.payload.allocation };
-                // SAFETY: The allocation was created by `Box::into_raw` for this type.
-                drop(unsafe {
-                    Box::from_raw(allocation.cast::<AssignedOriginAndExtra>().as_ptr())
-                });
-            }
-            (QueryOriginKind::Derived | QueryOriginKind::DerivedUntracked, layout, edge_layout) => {
-                let length = self.metadata as usize;
-                // SAFETY: Derived origins initialize `payload.allocation`, and the tag records the
-                // header and edge layout used to create that allocation.
-                unsafe {
-                    let allocation = self.payload.allocation;
-                    match (layout, edge_layout) {
-                        (OriginAndExtraLayout::WithoutExtra, QueryEdgeLayout::Packed) => drop(
-                            SliceWithHeader::<(), PackedQueryEdge>::from_raw_parts(
-                                allocation, length,
-                            ),
-                        ),
-                        (OriginAndExtraLayout::WithoutExtra, QueryEdgeLayout::Wide) => drop(
-                            SliceWithHeader::<(), QueryEdge>::from_raw_parts(allocation, length),
-                        ),
-                        (OriginAndExtraLayout::WithExtra, QueryEdgeLayout::Packed) => drop(
-                            SliceWithHeader::<QueryRevisionsExtraInner, PackedQueryEdge>::from_raw_parts(
-                                allocation, length,
-                            ),
-                        ),
-                        (OriginAndExtraLayout::WithExtra, QueryEdgeLayout::Wide) => drop(
-                            SliceWithHeader::<QueryRevisionsExtraInner, QueryEdge>::from_raw_parts(
-                                allocation, length,
-                            ),
-                        ),
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl std::fmt::Debug for OriginAndExtra {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(extra) = self.extra() {
-            f.debug_struct("OriginAndExtra")
-                .field("origin", &self.origin())
-                .field("extra", extra)
-                .finish()
-        } else {
-            self.origin().fmt(f)
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-#[repr(u8)]
-enum OriginAndExtraLayout {
-    /// The origin has no extra revision data.
-    WithoutExtra = 0b0000,
-
-    /// The origin's allocation begins with extra revision data.
-    WithExtra = 0b1000,
-}
-
-/// Encodes whether the origin has extra revision data.
-#[derive(Clone, Copy)]
-#[repr(transparent)]
-struct OriginAndExtraTag(u8);
-
-impl OriginAndExtraTag {
-    const WITH_EXTRA_MASK: u8 = OriginAndExtraLayout::WithExtra as u8;
-
-    const fn without_extra(origin: QueryOriginTag) -> Self {
-        OriginAndExtraTag(origin.0)
-    }
-
-    const fn with_extra(origin: QueryOriginTag) -> Self {
-        OriginAndExtraTag(OriginAndExtraLayout::WithExtra as u8 | origin.0)
-    }
-
-    const fn layout(self) -> OriginAndExtraLayout {
-        if self.0 & Self::WITH_EXTRA_MASK == 0 {
-            OriginAndExtraLayout::WithoutExtra
-        } else {
-            OriginAndExtraLayout::WithExtra
-        }
-    }
-
-    const fn origin(self) -> QueryOriginTag {
-        QueryOriginTag(self.0 & !Self::WITH_EXTRA_MASK)
-    }
 }
 
 /// The payload of [`OriginAndExtra`].
+#[derive(Clone, Copy)]
 union OriginAndExtraPayload {
-    /// The allocation storing derived edges and, for origins with extra data, that data.
+    /// A `WithExtra` box, for origins with extra data.
     allocation: NonNull<()>,
 
     /// The identity of the assigning query for a directly stored assigned origin.
     index: Id,
+
+    /// The edges of a directly stored derived origin.
+    span: EdgeSpan,
 }
 
+/// Extra revision data and the origin's own payload, in one box. The extra data comes first, so
+/// [`OriginAndExtra::extra`] reads it without knowing the kind.
 #[repr(C)]
-struct AssignedOriginAndExtra {
+struct WithExtra<T> {
     extra: QueryRevisionsExtraInner,
-    index: Id,
+    origin: T,
 }
 
-/// Owns one allocation containing a header followed by an inline slice:
-///
-/// ```text
-/// +-----------+---------+---------+-----+
-/// | header: H | item: T | item: T | ... |
-/// +-----------+---------+---------+-----+
-/// ```
-///
-/// This type defines the physical layout and owns completed allocations reconstructed from
-/// [`OriginAndExtra`]. `OriginAndExtra` records the semantic origin and selects the concrete `H`
-/// and `T` encoded by its tag. Derived origins use `()` or [`QueryRevisionsExtraInner`] as the
-/// header and [`PackedQueryEdge`] or [`QueryEdge`] as the slice element.
-struct SliceWithHeader<H, T: Copy> {
-    allocation: NonNull<()>,
-    layout: Layout,
-    marker: PhantomData<(H, T)>,
-}
-
-impl<H, T: Copy> SliceWithHeader<H, T> {
-    /// Allocates storage for the header and slice, returning a builder that initializes the slice
-    /// incrementally. Construction may switch from packed to wide edges, so the caller retains the
-    /// header until it finishes the selected builder. The builder tracks the initialized prefix and
-    /// deallocates unfinished storage on drop. Once complete, the allocation is transferred to
-    /// [`OriginAndExtra`], which reconstructs borrowed slices or owned [`SliceWithHeader`] values
-    /// using the layout encoded in its tag.
-    #[inline]
-    fn allocate(length: usize) -> SliceWithHeaderBuilder<H, T> {
-        let (layout, slice_offset) = Self::layout(length);
-        let allocation = if layout.size() == 0 {
-            if std::mem::align_of::<H>() >= std::mem::align_of::<T>() {
-                NonNull::<H>::dangling().cast()
-            } else {
-                NonNull::<T>::dangling().cast()
-            }
-        } else {
-            // SAFETY: `layout` has non-zero size.
-            unsafe { NonNull::new(alloc(layout)) }.unwrap_or_else(|| handle_alloc_error(layout))
-        }
-        .cast();
-
-        // SAFETY: `slice_offset` was computed from the layout used for this allocation.
-        let slice = unsafe { allocation.cast::<u8>().byte_add(slice_offset).cast::<T>() };
-        SliceWithHeaderBuilder {
-            allocation,
-            slice,
-            layout,
-            length,
-            initialized: 0,
-            marker: PhantomData,
-        }
-    }
-
-    const fn layout(length: usize) -> (Layout, usize) {
-        let slice = match Layout::array::<T>(length) {
-            Ok(slice) => slice,
-            Err(_) => panic!("slice allocation is too large"),
-        };
-        let (layout, slice_offset) = match Layout::new::<H>().extend(slice) {
-            Ok(layout) => layout,
-            Err(_) => panic!("slice-with-header allocation is too large"),
-        };
-        (layout, slice_offset)
-    }
-
-    /// # Safety
-    ///
-    /// `allocation` must point to a live allocation completed by
-    /// `SliceWithHeaderBuilder::<H, T>::finish` for exactly `length` elements. Its header and all
-    /// elements must remain initialized and the allocation must remain alive for the lifetime of
-    /// the returned slice.
-    const unsafe fn slice(allocation: NonNull<()>, length: usize) -> NonNull<[T]> {
-        let (_, slice_offset) = Self::layout(length);
-        // SAFETY: Caller obligation and the offset was computed from the matching layout.
-        let slice = unsafe { allocation.cast::<u8>().byte_add(slice_offset).cast::<T>() };
-        NonNull::slice_from_raw_parts(slice, length)
-    }
-
-    /// # Safety
-    ///
-    /// `allocation` must point to a live allocation completed by
-    /// `SliceWithHeaderBuilder::<H, T>::finish` for exactly `length` elements. Its header and all
-    /// elements must be initialized, and the caller must transfer unique ownership of the
-    /// allocation to the returned value.
-    const unsafe fn from_raw_parts(allocation: NonNull<()>, length: usize) -> Self {
-        SliceWithHeader {
-            allocation,
-            layout: Self::layout(length).0,
-            marker: PhantomData,
-        }
-    }
-
-    fn into_raw(self) -> NonNull<()> {
-        ManuallyDrop::new(self).allocation
-    }
-}
-
-impl<H, T: Copy> Drop for SliceWithHeader<H, T> {
-    fn drop(&mut self) {
-        // SAFETY: The allocation starts with an initialized `H` and is uniquely owned. `T` is
-        // `Copy`, so no slice elements require dropping.
-        unsafe { ptr::drop_in_place(self.allocation.cast::<H>().as_ptr()) };
-        if self.layout.size() != 0 {
-            // SAFETY: `Drop` runs exactly once while the allocation is uniquely owned.
-            unsafe { dealloc(self.allocation.cast().as_ptr(), self.layout) };
-        }
-    }
-}
-
-/// Builds a [`SliceWithHeader`] allocation while tracking its initialized prefix.
-struct SliceWithHeaderBuilder<H, T: Copy> {
-    allocation: NonNull<()>,
-    slice: NonNull<T>,
-    layout: Layout,
-    length: usize,
-    initialized: usize,
-    marker: PhantomData<fn() -> H>,
-}
-
-impl<H, T: Copy> SliceWithHeaderBuilder<H, T> {
-    #[inline]
-    const fn push(&mut self, item: T) {
-        assert!(
-            self.initialized < self.length,
-            "attempted to initialize more slice elements than allocated"
-        );
-        // SAFETY: The initialized prefix is shorter than the allocation and this element has not
-        // been initialized yet.
-        unsafe { self.slice.add(self.initialized).write(item) };
-        self.initialized += 1;
-    }
-
-    #[inline]
-    fn extend(&mut self, items: impl IntoIterator<Item = T>) {
-        for item in items {
-            self.push(item);
-        }
-    }
-
-    #[inline]
-    const fn initialized_slice(&self) -> &[T] {
-        // SAFETY: `initialized` tracks the contiguous prefix written by `push`.
-        unsafe { std::slice::from_raw_parts(self.slice.as_ptr(), self.initialized) }
-    }
-
-    #[inline]
-    fn finish(self, header: H) -> SliceWithHeader<H, T> {
-        assert_eq!(
-            self.initialized, self.length,
-            "not all allocated slice elements were initialized"
-        );
-        let this = ManuallyDrop::new(self);
-        // SAFETY: The allocation starts with space for `H` and the header is initialized once.
-        unsafe { this.allocation.cast().write(header) };
-        SliceWithHeader {
-            allocation: this.allocation,
-            layout: this.layout,
-            marker: PhantomData,
-        }
-    }
-}
-
-impl<H, T: Copy> Drop for SliceWithHeaderBuilder<H, T> {
-    fn drop(&mut self) {
-        if self.layout.size() != 0 {
-            // SAFETY: `allocation` was created with `layout` and is still uniquely owned.
-            unsafe { dealloc(self.allocation.cast().as_ptr(), self.layout) };
-        }
+impl<T> WithExtra<T> {
+    fn boxed(extra: QueryRevisionsExtraInner, origin: T) -> NonNull<()> {
+        NonNull::from(Box::leak(Box::new(WithExtra { extra, origin }))).cast()
     }
 }
 
@@ -1785,60 +1471,8 @@ impl std::fmt::Debug for QueryEdge {
     }
 }
 
-/// A retained 8-byte query edge.
-///
-/// Query origins use this representation when every edge fits. Otherwise, the origin
-/// retains the existing full-width [`QueryEdge`] slice.
-///
-/// `metadata` has the following layout, from most significant to least significant
-/// bit:
-///
-/// ```text
-/// [ingredient: 12][generation: 20]
-/// ```
-///
-/// `index` stores the complete 32-bit key index separately. Only input edges can use
-/// this representation. Output edges, ingredient indices, and generations that do
-/// not fit use the wide [`QueryEdge`] layout.
-#[derive(Copy, Clone)]
-struct PackedQueryEdge {
-    index: u32,
-    metadata: u32,
-}
-
-const _: [(); std::mem::size_of::<PackedQueryEdge>()] = [(); 8];
-
-impl PackedQueryEdge {
-    const INGREDIENT_SHIFT: u32 = 20;
-    const GENERATION_MASK: u32 = 0xFFFFF;
-    const INGREDIENT_MASK: u32 = 0xFFF;
-
-    const fn new(edge: QueryEdge) -> Option<Self> {
-        let ingredient = edge.ingredient.as_u32();
-
-        if ingredient > Self::INGREDIENT_MASK || edge.generation > Self::GENERATION_MASK {
-            return None;
-        }
-
-        Some(PackedQueryEdge {
-            index: edge.index,
-            metadata: edge.generation | (ingredient << Self::INGREDIENT_SHIFT),
-        })
-    }
-
-    const fn edge(self) -> QueryEdge {
-        QueryEdge {
-            index: self.index,
-            generation: self.metadata & Self::GENERATION_MASK,
-            // SAFETY: `metadata` was built from an `IngredientIndex` in `PackedQueryEdge::new`.
-            ingredient: unsafe {
-                IngredientIndex::new_unchecked(self.metadata >> Self::INGREDIENT_SHIFT)
-            },
-        }
-    }
-}
-
-/// A read-only view over the retained edges for a query origin.
+/// A read-only view over the retained edges for a query origin: a range of the database's edge
+/// array, or (persisted origins, before they are recorded) a slice of full edges.
 #[derive(Copy, Clone)]
 pub struct QueryEdges<'a> {
     data: QueryEdgesData<'a>,
@@ -1846,63 +1480,55 @@ pub struct QueryEdges<'a> {
 
 #[derive(Copy, Clone)]
 enum QueryEdgesData<'a> {
-    Packed(&'a [PackedQueryEdge]),
+    Graph {
+        graph: &'a Graph,
+        words: &'a [AtomicU32],
+    },
     Wide(&'a [QueryEdge]),
 }
 
 impl<'a> QueryEdges<'a> {
-    const fn packed(edges: &'a [PackedQueryEdge]) -> Self {
+    #[inline]
+    pub(crate) fn in_graph(graph: &'a Graph, span: EdgeSpan) -> Self {
         QueryEdges {
-            data: QueryEdgesData::Packed(edges),
+            data: QueryEdgesData::Graph {
+                graph,
+                words: graph.words(span),
+            },
         }
     }
 
-    const fn wide(edges: &'a [QueryEdge]) -> Self {
+    pub(crate) const fn wide(edges: &'a [QueryEdge]) -> Self {
         QueryEdges {
             data: QueryEdgesData::Wide(edges),
         }
     }
 
-    #[cfg(feature = "accumulator")]
+    #[cfg(any(test, feature = "accumulator"))]
     pub(crate) const fn len(self) -> usize {
         match self.data {
-            QueryEdgesData::Packed(edges) => edges.len(),
+            QueryEdgesData::Graph { words, .. } => words.len(),
             QueryEdgesData::Wide(edges) => edges.len(),
         }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn allocation_size(self) -> usize {
-        match self.data {
-            QueryEdgesData::Packed(edges) => std::mem::size_of_val(edges),
-            QueryEdgesData::Wide(edges) => std::mem::size_of_val(edges),
-        }
-    }
-
+    #[inline]
     pub(crate) fn iter(self) -> QueryEdgeIter<'a> {
         let data = match self.data {
-            QueryEdgesData::Packed(edges) => QueryEdgeIterData::Packed(edges.iter()),
+            QueryEdgesData::Graph { graph, words } => QueryEdgeIterData::Graph {
+                graph,
+                words: words.iter(),
+            },
             QueryEdgesData::Wide(edges) => QueryEdgeIterData::Wide(edges.iter()),
         };
 
         QueryEdgeIter { data }
     }
 
-    pub(crate) fn iter_outputs(self) -> impl DoubleEndedIterator<Item = QueryEdge> + use<'a> {
-        let wide_edges = match self.data {
-            QueryEdgesData::Packed(_) => &[][..],
-            QueryEdgesData::Wide(edges) => edges,
-        };
-
-        wide_edges
-            .iter()
-            .copied()
-            .filter(|edge| matches!(edge.kind(), QueryEdgeKind::Output))
-    }
-
-    #[cfg(test)]
-    const fn is_packed(self) -> bool {
-        matches!(self.data, QueryEdgesData::Packed(_))
+    /// The output edges, in order. In the graph an output is told by its word's top bit, so the
+    /// inputs are skipped without looking up their keys.
+    pub(crate) fn iter_outputs(self) -> OutputEdgeIter<'a> {
+        OutputEdgeIter(self.iter())
     }
 }
 
@@ -1911,16 +1537,24 @@ pub struct QueryEdgeIter<'a> {
 }
 
 enum QueryEdgeIterData<'a> {
-    Packed(std::slice::Iter<'a, PackedQueryEdge>),
+    Graph {
+        graph: &'a Graph,
+        words: std::slice::Iter<'a, AtomicU32>,
+    },
     Wide(std::slice::Iter<'a, QueryEdge>),
 }
 
 impl Iterator for QueryEdgeIter<'_> {
     type Item = QueryEdge;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match &mut self.data {
-            QueryEdgeIterData::Packed(edges) => edges.next().copied().map(PackedQueryEdge::edge),
+            // Relaxed: the memo holding these edges was loaded with `Acquire`, and its edges
+            // were written before it was published.
+            QueryEdgeIterData::Graph { graph, words } => words
+                .next()
+                .map(|word| graph.decode(word.load(Ordering::Relaxed))),
             QueryEdgeIterData::Wide(edges) => edges.next().copied(),
         }
     }
@@ -1934,9 +1568,9 @@ impl Iterator for QueryEdgeIter<'_> {
 impl DoubleEndedIterator for QueryEdgeIter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         match &mut self.data {
-            QueryEdgeIterData::Packed(edges) => {
-                edges.next_back().copied().map(PackedQueryEdge::edge)
-            }
+            QueryEdgeIterData::Graph { graph, words } => words
+                .next_back()
+                .map(|word| graph.decode(word.load(Ordering::Relaxed))),
             QueryEdgeIterData::Wide(edges) => edges.next_back().copied(),
         }
     }
@@ -1945,13 +1579,59 @@ impl DoubleEndedIterator for QueryEdgeIter<'_> {
 impl ExactSizeIterator for QueryEdgeIter<'_> {
     fn len(&self) -> usize {
         match &self.data {
-            QueryEdgeIterData::Packed(edges) => edges.len(),
+            QueryEdgeIterData::Graph { words, .. } => words.len(),
             QueryEdgeIterData::Wide(edges) => edges.len(),
         }
     }
 }
 
 impl std::iter::FusedIterator for QueryEdgeIter<'_> {}
+
+/// The output edges of a [`QueryEdges`].
+pub struct OutputEdgeIter<'a>(QueryEdgeIter<'a>);
+
+impl OutputEdgeIter<'_> {
+    fn next_word(
+        words: &mut std::slice::Iter<'_, AtomicU32>,
+        back: bool,
+    ) -> Option<u32> {
+        loop {
+            let word = if back { words.next_back() } else { words.next() }?;
+            let word = word.load(Ordering::Relaxed);
+            if word & graph::OUTPUT != 0 {
+                return Some(word);
+            }
+        }
+    }
+
+    fn step(&mut self, back: bool) -> Option<QueryEdge> {
+        match &mut self.0.data {
+            QueryEdgeIterData::Graph { graph, words } => {
+                Self::next_word(words, back).map(|word| graph.decode(word))
+            }
+            QueryEdgeIterData::Wide(edges) => loop {
+                let edge = if back { edges.next_back() } else { edges.next() }?;
+                if edge.kind() == QueryEdgeKind::Output {
+                    return Some(*edge);
+                }
+            },
+        }
+    }
+}
+
+impl Iterator for OutputEdgeIter<'_> {
+    type Item = QueryEdge;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.step(false)
+    }
+}
+
+impl DoubleEndedIterator for OutputEdgeIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.step(true)
+    }
+}
 
 impl<'a> IntoIterator for QueryEdges<'a> {
     type Item = QueryEdge;
@@ -2009,10 +1689,10 @@ impl<'me> ActiveQueryGuard<'me> {
     }
 
     /// Append the given `outputs` to the query's output list.
-    pub(crate) fn seed_iteration(&self, previous: &QueryRevisions) {
+    pub(crate) fn seed_iteration(&self, zalsa: &Zalsa, previous: &QueryRevisions) {
         let durability = previous.durability;
         let changed_at = previous.changed_at;
-        let edges = previous.origin().edges();
+        let edges = previous.origin(zalsa.graph()).edges();
         let untracked_read = previous.is_derived_untracked();
 
         let tracked_ids = previous.tracked_struct_ids();
@@ -2056,11 +1736,14 @@ impl<'me> ActiveQueryGuard<'me> {
     }
 
     /// Invoked when the query has successfully completed execution.
-    fn complete(self, iteration: IterationStamp) -> CompletedQuery {
+    fn complete(self, zalsa: &Zalsa, iteration: IterationStamp) -> CompletedQuery {
+        let local_state = self.local_state;
         // SAFETY: We do not access the query stack reentrantly.
         let query = unsafe {
-            self.local_state.with_query_stack_unchecked_mut(|stack| {
+            local_state.with_query_stack_unchecked_mut(|stack| {
                 stack.pop_into_revisions(
+                    zalsa,
+                    local_state,
                     self.database_key_index,
                     iteration,
                     #[cfg(debug_assertions)]
@@ -2076,8 +1759,8 @@ impl<'me> ActiveQueryGuard<'me> {
     /// which summarizes the other queries that were accessed during this
     /// query's execution.
     #[inline]
-    pub(crate) fn pop(self, iteration: IterationStamp) -> CompletedQuery {
-        self.complete(iteration)
+    pub(crate) fn pop(self, zalsa: &Zalsa, iteration: IterationStamp) -> CompletedQuery {
+        self.complete(zalsa, iteration)
     }
 
     fn pop_detached_completion(
@@ -2110,7 +1793,12 @@ pub(crate) struct DetachedQuery<'me> {
     input_outputs: DetachedInputOutputs,
 }
 
-impl DetachedQuery<'_> {
+impl<'me> DetachedQuery<'me> {
+    /// The task the query ran on, whose graph records its edges.
+    pub(crate) fn zalsa_local(&self) -> &'me ZalsaLocal {
+        self.guard.local_state
+    }
+
     pub(crate) fn input_outputs(&self) -> &crate::hash::FxIndexSet<QueryEdge> {
         self.input_outputs.input_outputs()
     }
@@ -2151,21 +1839,28 @@ pub(crate) mod persistence {
 
     use super::{OriginAndExtra, QueryEdge, QueryEdges, QueryRevisions, QueryRevisionsExtra};
     use crate::DatabaseKeyIndex;
+    use crate::graph::{Graph, TaskGraph};
     use crate::sync::atomic::{AtomicBool, Ordering};
     use crate::{Durability, Revision};
 
     impl OriginAndExtra {
-        pub(crate) fn new(origin: PersistentQueryOrigin, extra: QueryRevisionsExtra) -> Self {
+        /// A persisted origin, its edges written into `graph`.
+        pub(crate) fn recorded(
+            origin: PersistentQueryOrigin,
+            extra: QueryRevisionsExtra,
+            graph: &Graph,
+            task: &TaskGraph,
+        ) -> Self {
             match origin {
                 PersistentQueryOrigin::Assigned(key) => match extra.0 {
                     Some(extra) => Self::assigned_with_extra(key, extra),
                     None => Self::assigned(key),
                 },
                 PersistentQueryOrigin::Derived(edges) => {
-                    Self::derived(edges.iter().copied(), extra)
+                    Self::derived(graph.record(task, edges.iter().copied()), extra)
                 }
                 PersistentQueryOrigin::DerivedUntracked(edges) => {
-                    Self::derived_untracked(edges.iter().copied(), extra)
+                    Self::derived_untracked(graph.record(task, edges.iter().copied()), extra)
                 }
             }
         }
@@ -2292,33 +1987,31 @@ pub(crate) mod persistence {
         }
     }
 
-    impl<'de> serde::Deserialize<'de> for QueryRevisions {
-        fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-        where
-            D: serde::Deserializer<'de>,
-        {
-            #[derive(serde::Deserialize)]
-            struct DeserializeQueryRevisions {
-                changed_at: Revision,
-                durability: Durability,
-                #[serde(rename = "origin")]
-                origin: PersistentQueryOrigin,
-                #[serde(with = "verified_final")]
-                verified_final: AtomicBool,
-                extra: QueryRevisionsExtra,
-            }
+    /// Deserialized revisions, whose edges are not yet in the database's graph: the deserializer
+    /// has no database, so [`PersistedRevisions::record`] writes them once it does.
+    #[derive(serde::Deserialize)]
+    #[serde(rename = "QueryRevisions")]
+    pub(crate) struct PersistedRevisions {
+        changed_at: Revision,
+        durability: Durability,
+        #[serde(rename = "origin")]
+        origin: PersistentQueryOrigin,
+        #[serde(with = "verified_final")]
+        verified_final: AtomicBool,
+        extra: QueryRevisionsExtra,
+    }
 
-            let revisions = DeserializeQueryRevisions::deserialize(deserializer)?;
-
-            Ok(QueryRevisions {
-                changed_at: revisions.changed_at,
-                durability: revisions.durability,
-                origin_and_extra: OriginAndExtra::new(revisions.origin, revisions.extra),
+    impl PersistedRevisions {
+        pub(crate) fn record(self, graph: &Graph, task: &TaskGraph) -> QueryRevisions {
+            QueryRevisions {
+                changed_at: self.changed_at,
+                durability: self.durability,
+                origin_and_extra: OriginAndExtra::recorded(self.origin, self.extra, graph, task),
                 #[cfg(feature = "accumulator")]
                 accumulated_inputs: Default::default(), // TODO: Support serializing accumulators
-                verified_final: revisions.verified_final,
+                verified_final: self.verified_final,
                 fingerprints: ThinVec::new(),
-            })
+            }
         }
     }
 
@@ -2344,222 +2037,174 @@ pub(crate) mod persistence {
 
 #[cfg(test)]
 mod tests {
-    use std::mem::size_of;
-
     #[cfg(feature = "persistence")]
     use super::QueryEdgeKind;
     #[cfg(feature = "persistence")]
     use super::persistence::PersistentQueryOrigin;
     #[cfg(not(feature = "shuttle"))]
-    use super::{
-        AssignedOriginAndExtra, QueryRevisionsExtra, QueryRevisionsExtraInner, SliceWithHeader,
-    };
-    use super::{OriginAndExtra, PackedQueryEdge, QueryEdge, QueryOriginRef};
+    use super::{QueryRevisionsExtra, QueryRevisionsExtraInner, WithExtra};
+    use super::{OriginAndExtra, QueryEdge, QueryOriginRef};
+    use crate::graph::{EdgeSpan, Graph, TaskGraph};
     use crate::{DatabaseKeyIndex, Id, IngredientIndex};
 
+    fn record(graph: &Graph, edges: &[QueryEdge]) -> EdgeSpan {
+        graph.record(&TaskGraph::default(), edges.iter().copied())
+    }
+
     #[test]
-    fn query_origin_packs_edges_that_fit() {
+    fn derived_origin_reads_its_edges_from_the_graph() {
+        let graph = Graph::default();
         let input = QueryEdge::input(key(231, 10_842_122, 41));
-        let other_input = QueryEdge::input(key(232, 10_842_123, 42));
-        let origin = OriginAndExtra::derived([input, other_input].into_iter(), Default::default());
-        let QueryOriginRef::Derived(edges) = origin.origin() else {
+        let output = QueryEdge::output(key(232, 10_842_123, 1 << 25));
+        let wide = QueryEdge::input(key(5000, 7, 3));
+        let span = record(&graph, &[input, output, wide]);
+        let origin = OriginAndExtra::derived(span, Default::default());
+        let QueryOriginRef::Derived(edges) = origin.origin(&graph) else {
             panic!("expected derived origin");
         };
 
-        assert!(edges.is_packed());
-        assert_eq!(edges.allocation_size(), 2 * size_of::<PackedQueryEdge>());
-        assert_eq!(edges.iter().collect::<Vec<_>>(), vec![input, other_input]);
+        assert_eq!(edges.len(), 3);
+        assert_eq!(edges.iter().collect::<Vec<_>>(), vec![input, output, wide]);
         assert_eq!(
             edges.iter().rev().collect::<Vec<_>>(),
-            vec![other_input, input]
+            vec![wide, output, input]
         );
         assert_eq!(
-            origin.origin().inputs().collect::<Vec<_>>(),
-            vec![input.key(), other_input.key()]
-        );
-        assert_eq!(origin.origin().outputs().collect::<Vec<_>>(), vec![]);
-    }
-
-    #[test]
-    fn query_origin_spills_all_edges_if_it_contains_an_output() {
-        let input = QueryEdge::input(key(231, 10_842_122, 41));
-        let output = QueryEdge::output(key(232, 10_842_123, 42));
-        let origin = OriginAndExtra::derived([input, output].into_iter(), Default::default());
-        let QueryOriginRef::Derived(edges) = origin.origin() else {
-            panic!("expected derived origin");
-        };
-
-        assert!(!edges.is_packed());
-        assert_eq!(edges.allocation_size(), 2 * size_of::<QueryEdge>());
-        assert_eq!(edges.iter().collect::<Vec<_>>(), vec![input, output]);
-        assert_eq!(
-            origin.origin().inputs().collect::<Vec<_>>(),
-            vec![input.key()]
+            origin.origin(&graph).inputs().collect::<Vec<_>>(),
+            vec![input.key(), wide.key()]
         );
         assert_eq!(
-            origin.origin().outputs().collect::<Vec<_>>(),
+            origin.origin(&graph).outputs().collect::<Vec<_>>(),
             vec![output.key()]
         );
+        assert_eq!(
+            edges.iter_outputs().rev().collect::<Vec<_>>(),
+            vec![output]
+        );
+        assert_eq!(origin.allocation_size(), 3 * size_of::<u32>());
     }
 
     #[test]
-    fn query_origin_packs_largest_supported_generation() {
-        let input = QueryEdge::input(key(231, 10_842_122, PackedQueryEdge::GENERATION_MASK));
-        let origin = OriginAndExtra::derived([input].into_iter(), Default::default());
-        let QueryOriginRef::Derived(edges) = origin.origin() else {
-            panic!("expected derived origin");
+    fn untracked_origin_keeps_its_kind() {
+        let graph = Graph::default();
+        let input = QueryEdge::input(key(1, 2, 0));
+        let origin = OriginAndExtra::derived_untracked(record(&graph, &[input]), Default::default());
+        assert!(origin.is_derived_untracked());
+        let QueryOriginRef::DerivedUntracked(edges) = origin.origin(&graph) else {
+            panic!("expected untracked derived origin");
         };
-
-        assert!(edges.is_packed());
         assert_eq!(edges.iter().collect::<Vec<_>>(), vec![input]);
-    }
-
-    #[test]
-    fn query_origin_spills_all_edges_if_generation_does_not_fit() {
-        let packed = QueryEdge::input(key(231, 10_842_122, 41));
-        let wide = QueryEdge::input(key(232, 10_842_123, PackedQueryEdge::GENERATION_MASK + 1));
-        let origin = OriginAndExtra::derived([packed, wide].into_iter(), Default::default());
-        let QueryOriginRef::Derived(edges) = origin.origin() else {
-            panic!("expected derived origin");
-        };
-
-        assert!(!edges.is_packed());
-        assert_eq!(edges.allocation_size(), 2 * size_of::<QueryEdge>());
-        assert_eq!(edges.iter().collect::<Vec<_>>(), vec![packed, wide]);
-    }
-
-    #[test]
-    fn query_origin_spills_if_ingredient_does_not_fit() {
-        let wide = QueryEdge::input(key(PackedQueryEdge::INGREDIENT_MASK + 1, 10_842_122, 41));
-        let origin = OriginAndExtra::derived([wide].into_iter(), Default::default());
-        let QueryOriginRef::Derived(edges) = origin.origin() else {
-            panic!("expected derived origin");
-        };
-
-        assert!(!edges.is_packed());
-        assert_eq!(edges.iter().collect::<Vec<_>>(), vec![wide]);
     }
 
     #[cfg(all(not(feature = "persistence"), not(feature = "shuttle")))]
     #[test]
-    fn clearing_edges_preserves_co_allocated_extra() {
-        let packed = QueryEdge::input(key(231, 10_842_122, 41));
-        let wide = QueryEdge::input(key(PackedQueryEdge::INGREDIENT_MASK + 1, 10_842_123, 42));
+    fn clearing_edges_preserves_extra() {
+        let graph = Graph::default();
+        let edge = QueryEdge::input(key(231, 10_842_122, 41));
+        let mut extra = QueryRevisionsExtraInner::empty();
+        extra.cycle_converged = true;
+        let mut origin = OriginAndExtra::derived_untracked(
+            record(&graph, &[edge]),
+            QueryRevisionsExtra(Some(extra)),
+        );
 
-        for edge in [packed, wide] {
-            let mut extra = QueryRevisionsExtraInner::empty();
-            extra.cycle_converged = true;
-            let mut origin = OriginAndExtra::derived_untracked(
-                [edge].into_iter(),
-                QueryRevisionsExtra(Some(extra)),
-            );
+        origin.clear_edges();
 
-            origin.clear_edges();
-
-            assert!(origin.extra().unwrap().cycle_converged);
-            let QueryOriginRef::DerivedUntracked(edges) = origin.origin() else {
-                panic!("expected untracked derived origin");
-            };
-            assert!(edges.is_packed());
-            assert!(edges.iter().next().is_none());
-            assert_eq!(
-                origin.allocation_size(),
-                SliceWithHeader::<QueryRevisionsExtraInner, PackedQueryEdge>::layout(0)
-                    .0
-                    .size()
-            );
-        }
+        assert!(origin.extra().unwrap().cycle_converged);
+        let QueryOriginRef::DerivedUntracked(edges) = origin.origin(&graph) else {
+            panic!("expected untracked derived origin");
+        };
+        assert!(edges.iter().next().is_none());
+        assert_eq!(origin.allocation_size(), size_of::<WithExtra<EdgeSpan>>());
     }
 
     #[cfg(not(feature = "shuttle"))]
     #[test]
-    fn stored_derived_origin_inlines_extra_before_packed_edges() {
+    fn inserting_extra_keeps_the_edges() {
+        let graph = Graph::default();
         let input = QueryEdge::input(key(231, 10_842_122, 41));
         let other_input = QueryEdge::input(key(232, 10_842_123, 42));
         let mut origin =
-            OriginAndExtra::derived([input, other_input].into_iter(), Default::default());
+            OriginAndExtra::derived(record(&graph, &[input, other_input]), Default::default());
 
         origin.get_or_insert_extra().cycle_converged = true;
 
-        assert_eq!(
-            origin.allocation_size(),
-            SliceWithHeader::<QueryRevisionsExtraInner, PackedQueryEdge>::layout(2)
-                .0
-                .size()
-        );
         assert!(origin.extra().unwrap().cycle_converged);
         assert_eq!(
-            origin.origin().edges().iter().collect::<Vec<_>>(),
+            origin.origin(&graph).edges().iter().collect::<Vec<_>>(),
             vec![input, other_input]
         );
-    }
-
-    #[cfg(not(feature = "shuttle"))]
-    #[test]
-    fn stored_derived_origin_builds_directly_with_extra() {
-        let input = QueryEdge::input(key(231, 10_842_122, 41));
-        let mut extra = QueryRevisionsExtraInner::empty();
-        extra.cycle_converged = true;
-
-        let origin = OriginAndExtra::derived([input].into_iter(), QueryRevisionsExtra(Some(extra)));
-
-        assert!(origin.extra().unwrap().cycle_converged);
-        assert_eq!(
-            origin.origin().edges().iter().collect::<Vec<_>>(),
-            vec![input]
-        );
         assert_eq!(
             origin.allocation_size(),
-            SliceWithHeader::<QueryRevisionsExtraInner, PackedQueryEdge>::layout(1)
-                .0
-                .size()
-        );
-    }
-
-    #[cfg(not(feature = "shuttle"))]
-    #[test]
-    fn stored_wide_origin_builds_directly_with_extra() {
-        let input = QueryEdge::input(key(PackedQueryEdge::INGREDIENT_MASK + 1, 10_842_122, 41));
-        let origin = OriginAndExtra::derived(
-            [input].into_iter(),
-            QueryRevisionsExtra(Some(QueryRevisionsExtraInner::empty())),
-        );
-
-        assert_eq!(
-            origin.origin().edges().iter().collect::<Vec<_>>(),
-            vec![input]
-        );
-        assert_eq!(
-            origin.allocation_size(),
-            SliceWithHeader::<QueryRevisionsExtraInner, QueryEdge>::layout(1)
-                .0
-                .size()
+            size_of::<WithExtra<EdgeSpan>>() + 2 * size_of::<u32>()
         );
     }
 
     #[cfg(not(feature = "shuttle"))]
     #[test]
     fn assigned_origin_with_extra_keeps_the_key() {
+        let graph = Graph::default();
         let key = key(231, 10_842_122, 41);
         let mut origin = OriginAndExtra::assigned(key);
         origin.get_or_insert_extra().cycle_converged = true;
 
-        assert_eq!(
-            origin.allocation_size(),
-            size_of::<AssignedOriginAndExtra>()
-        );
+        assert_eq!(origin.allocation_size(), size_of::<WithExtra<Id>>());
         assert!(origin.extra().unwrap().cycle_converged);
-        let QueryOriginRef::Assigned(stored_key) = origin.origin() else {
+        let QueryOriginRef::Assigned(stored_key) = origin.origin(&graph) else {
             panic!("expected assigned origin");
         };
         assert_eq!(stored_key, key);
+        assert_eq!(origin.span(), None);
+    }
+
+    /// A model of memos over compactions: the origins keep reading the edges they were given.
+    #[cfg(not(feature = "shuttle"))]
+    #[test]
+    fn relocated_origins_read_the_same_edges() {
+        let mut graph = Graph::default();
+        let task = TaskGraph::default();
+        let mut memos: Vec<(Vec<QueryEdge>, OriginAndExtra)> = (0..300u32)
+            .map(|i| {
+                let edges: Vec<QueryEdge> = (0..i % 23)
+                    .map(|j| {
+                        let key = key(j % 4, i * 5 + j, j % 2);
+                        if j % 7 == 3 {
+                            QueryEdge::output(key)
+                        } else {
+                            QueryEdge::input(key)
+                        }
+                    })
+                    .collect();
+                let span = graph.record(&task, edges.iter().copied());
+                let extra = if i % 5 == 0 {
+                    QueryRevisionsExtra(Some(QueryRevisionsExtraInner::empty()))
+                } else {
+                    QueryRevisionsExtra::default()
+                };
+                (edges, OriginAndExtra::derived(span, extra))
+            })
+            .collect();
+        memos.retain(|(edges, _)| edges.len() % 2 == 1);
+        for _ in 0..2 {
+            graph.compact(|relocation| {
+                for (_, origin) in &mut memos {
+                    origin.relocate(relocation);
+                }
+            });
+            for (edges, origin) in &memos {
+                assert_eq!(
+                    &origin.origin(&graph).edges().iter().collect::<Vec<_>>(),
+                    edges
+                );
+            }
+        }
     }
 
     #[cfg(feature = "persistence")]
     #[test]
     fn query_origin_serde_round_trip_preserves_edges() {
         let input = QueryEdge::input(key(231, 10_842_122, 41));
-        let output = QueryEdge::output(key(232, 10_842_123, PackedQueryEdge::GENERATION_MASK + 1));
+        let output = QueryEdge::output(key(232, 10_842_123, 1 << 25));
         let origin = PersistentQueryOrigin::derived_untracked([input, output]);
         let serialized = serde_json::to_string(&origin).unwrap();
         let deserialized_origin: PersistentQueryOrigin = serde_json::from_str(&serialized).unwrap();
@@ -2567,7 +2212,6 @@ mod tests {
             panic!("expected untracked derived origin");
         };
 
-        assert!(!edges.is_packed());
         assert_eq!(edges.iter().collect::<Vec<_>>(), vec![input, output]);
         assert_eq!(
             edges.iter().map(QueryEdge::kind).collect::<Vec<_>>(),

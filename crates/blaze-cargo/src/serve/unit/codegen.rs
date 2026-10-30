@@ -167,6 +167,7 @@ pub(crate) fn policy(job: &Job, unit: usize, toolchain: Toolchain) -> Result<Pol
     let base = &root.profile;
     let opt = opt_level(&base.opt_level)?;
     let info = debuginfo(&base.debuginfo)?;
+    // BTreeMap: it is `Profile::packages`, which is serialized and hashed.
     let mut packages = BTreeMap::new();
     for dep in job.graph.closure(unit as u32).into_iter().skip(1) {
         if job.graph.has(dep, flag::STD) {

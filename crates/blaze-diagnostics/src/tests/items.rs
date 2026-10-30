@@ -12,7 +12,11 @@ mod names;
 mod parse;
 mod resolve;
 
-use crate::{Options, emit::Style};
+use crate::{
+    Options,
+    emit::Style,
+    tests::{Mode, compiletest},
+};
 
 /// [`crate::tests::ui`] of a UI test that needs core's items: `flags` are minicore's
 /// (`crates/test-utils/src/minicore.rs`), and core is in the prelude as std is for rustc. The
@@ -27,8 +31,10 @@ pub(crate) fn ui_bin(name: &str, krate: &str, edition: &str, source: &str) -> St
     ui_fixture(&format!("//- /{name} crate:bin:{krate} edition:{edition}\n{source}"))
 }
 
-/// The `.stderr` of a fixture's crates, as [`crate::tests::ui`] writes it.
+/// The `.stderr` of a fixture's crates, as [`crate::tests::ui`] writes it: with compiletest's
+/// flags, in `-Z ui-testing` style, normalized.
 fn ui_fixture(fixture: &str) -> String {
-    let checked = crate::tests::checked_with(fixture, "$DIR/", &Options::default());
+    let options = compiletest(Mode::Other, &Options::default());
+    let checked = crate::tests::checked_with(fixture, "$DIR/", &options);
     crate::tests::normalized(&checked.stderr_with(Style { ui_testing: true, ..Style::default() }))
 }

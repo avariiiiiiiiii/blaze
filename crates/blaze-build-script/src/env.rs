@@ -9,24 +9,27 @@
 //! dependencies' variables (`-Z bindeps`) and the host runner (`-Z host-config`).
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     process::Command,
 };
+
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{Error, unit::Unit};
 
 /// A script's whole environment, and which of it cargo sets from the unit.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Env {
+    // BTreeMap: read in name order into the run's key and the child's environment.
     pub vars: BTreeMap<OsString, OsString>,
     /// The names of `vars` cargo sets from the unit, its configuration and the build (#805):
     /// `CARGO_*`, `OUT_DIR`, `TARGET`, `HOST`, the profile's, the tools', the `DEP_*` of its
     /// dependencies, `[env]`'s, the dynamic library path (with what cargo's own environment
     /// had of it after the unit's directories), the jobserver's `CARGO_MAKEFLAGS`. Every other
     /// variable of `vars` is passed through from the environment cargo was started with.
-    pub from_unit: BTreeSet<OsString>,
+    pub from_unit: FxHashSet<OsString>,
 }
 
 /// Where a variable of a script's environment comes from.
@@ -79,7 +82,8 @@ impl Env {
 /// away (`None`).
 #[derive(Default)]
 struct Explicit {
-    vars: BTreeMap<OsString, Option<OsString>>,
+    /// The last word on each name: applied to the inherited variables in any order.
+    vars: FxHashMap<OsString, Option<OsString>>,
 }
 
 impl Explicit {
@@ -455,7 +459,7 @@ pub fn env(unit: &Unit, inherited: &[(OsString, OsString)]) -> Result<Env, Error
     }
 
     let mut vars: BTreeMap<OsString, OsString> = inherited.iter().cloned().collect();
-    let mut from_unit = BTreeSet::new();
+    let mut from_unit = FxHashSet::default();
     for (name, value) in cmd.vars {
         match value {
             Some(value) => {

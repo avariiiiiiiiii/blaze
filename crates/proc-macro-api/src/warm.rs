@@ -21,7 +21,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap},
     ffi::OsString,
     fs::File,
     io::{self, BufRead, Read, Seek, SeekFrom, Write},
@@ -41,6 +41,7 @@ use blaze_usercode::{
     pool::{SOCKET, WarmKey},
     trace::{self, Line, Seen},
 };
+use rustc_hash::FxHashMap;
 
 #[cfg(test)]
 use std::{collections::VecDeque, sync::Mutex};
@@ -395,12 +396,14 @@ impl Environment {
         passed: &[(String, String)],
         call: impl IntoIterator<Item = (&'a str, &'a str)>,
     ) -> Vec<(OsString, OsString)> {
-        let mut seen: BTreeMap<OsString, OsString> = set().into_iter().collect();
+        let mut seen: FxHashMap<OsString, OsString> = set().into_iter().collect();
         let passed = passed.iter().map(|(name, value)| (name.as_str(), value.as_str()));
         for (name, value) in passed.chain(call) {
             seen.insert(name.into(), value.into());
         }
-        seen.into_iter().collect()
+        let mut seen: Vec<(OsString, OsString)> = seen.into_iter().collect();
+        seen.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        seen
     }
 
     /// What is sent to a server for an expansion with the crate's variables `call`: `passed`
@@ -437,6 +440,8 @@ pub(crate) struct Tracer {
     read: u64,
     next: u64,
     /// The lines of no scope so far, which are every expansion's.
+    // BTreeSet: walked in order on every expansion while it still grows; that order picks which
+    // spelling of one path `trace::assemble` keeps.
     common: BTreeSet<Line>,
     disk: Disk,
 }
@@ -661,6 +666,7 @@ mod tests {
         assert_eq!(get("X"), Some("crate".into()));
         assert_eq!(get("PATH"), Some("/a".into()));
         assert_eq!(get(SET[0].0), Some(SET[0].1.into()));
+        assert!(seen.windows(2).all(|it| it[0].0 < it[1].0), "sorted by name, each once: {seen:?}");
         let sent = Environment::sent(&passed, call);
         assert_eq!(sent.last(), Some(&("X".to_owned(), "crate".to_owned())));
     }

@@ -20,6 +20,8 @@
 //!
 //! [`blaze_live_counters`]: https://docs.rs/blaze-live
 
+#![forbid(unsafe_code)]
+
 use std::{
     cell::RefCell,
     sync::{Arc, Mutex},

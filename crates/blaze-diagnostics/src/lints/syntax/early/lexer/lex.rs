@@ -136,10 +136,20 @@ impl<'a> Normalized<'a> {
     }
 }
 
-/// What rustc's lexer buffers of `text`, a file of a crate of `edition`, and its identifiers.
-/// It stops where rustc's lexer stops with a fatal error (an unterminated literal or block
-/// comment, a bad raw string): rustc gives nothing after that.
-pub(super) fn lex(text: &str, edition: Edition) -> LexedFile {
+#[cfg(test)]
+fn lex(text: &str, edition: Edition) -> LexedFile {
+    let mut out = LexedFile::default();
+    lex_into(text, edition, &mut out);
+    out
+}
+
+/// What rustc's lexer buffers of `text`, a file of a crate of `edition`, and its identifiers,
+/// into `out`, cleared first: one buffer serves every file of the crate. It stops where rustc's
+/// lexer stops with a fatal error (an unterminated literal or block comment, a bad raw string):
+/// rustc gives nothing after that.
+pub(super) fn lex_into(text: &str, edition: Edition, out: &mut LexedFile) {
+    out.lexed.clear();
+    out.idents.clear();
     let normalized = Normalized::of(text);
     let src: &str = &normalized.text;
     let start = rustc_lexer::strip_shebang(src).unwrap_or(0) as u32;
@@ -149,20 +159,19 @@ pub(super) fn lex(text: &str, edition: Edition) -> LexedFile {
         pos: start,
         cursor: Cursor::new(&src[start as usize..], FrontmatterAllowed::Yes),
         edition,
-        out: LexedFile::default(),
+        out,
     };
     lexer.run();
-    lexer.out
 }
 
-struct Lexer<'a> {
+struct Lexer<'a, 'o> {
     src: &'a str,
     normalized: &'a Normalized<'a>,
     /// Where the cursor is in `src`.
     pos: u32,
     cursor: Cursor<'a>,
     edition: Edition,
-    out: LexedFile,
+    out: &'o mut LexedFile,
 }
 
 /// Whether rustc's lexer goes on after a token.
@@ -171,7 +180,7 @@ enum Next {
     Fatal,
 }
 
-impl<'a> Lexer<'a> {
+impl<'a> Lexer<'a, '_> {
     fn run(&mut self) {
         loop {
             let str_before = self.cursor.as_str();

@@ -12,8 +12,8 @@ Where: `crates/blaze-engine/src/lib.rs`, the call `blaze_expand::install();` (ab
 Why: expansions are kept in `blaze_cas::Store` through `blaze_usercode::index::{find, keep}`,
 not in `blaze-store`; blaze-expand needs the store, the toolchain's id and what warm servers
 pass through. `install` now returns an error for a bad `BLAZE_PROC_MACRO_CACHE` (only unset,
-`keep` or `check`; `off`, `0` and the other old modes are gone) or `BLAZE_NATIVE_MACROS`
-(`on`, `verify`, `off`).
+`keep` or `check`; `off`, `0` and the other old modes are gone). `BLAZE_NATIVE_MACROS` is
+gone with the native expanders (section 5).
 
 ```rust
 let environment = proc_macro_api::warm::Environment::new();
@@ -82,16 +82,26 @@ there.
 
 > forwarded to cargo
 
-## 5. Native expanders (child `usercode-macros-native`)
+## 5. Native expanders: withdrawn (2026-10-29)
 
-Apply `v2/requests/usercode-macros-native.md`: vendor the nine verified crates, add the six
-`native-*` workspace dependencies (`crates/blaze-expand/Cargo.toml` already names them, so the
-manifest lint reports them missing until then), and register `native::describe_with(…)` beside
-`blaze_expand::install`. Without the registration every load fails while
-`BLAZE_NATIVE_MACROS` is unset (its default, `on`), naming the macro; that is the intended
-no-fallback behavior, not something to paper over.
+Superseded by docs/v2/plan/design/compile-time.md change 20: proc macros run as their own code
+on blaze's MIR evaluator and copy-and-patch, built by lane fastcompile. Don't vendor the nine
+crates or add `native-proc-macro2`, `native-serde-derive`, `native-thiserror-impl-1`,
+`native-thiserror-impl-2` or `native-tokio-macros`; no `describe_with` hook is needed.
+`crates/blaze-expand/Cargo.toml` names only `native-proc-macro` now, the in-process bridge's
+`proc_macro` (`crates/blaze-expand/src/native/proc_macro/`), kept for fastcompile.
 
-> applied in part: see `v2/requests/usercode-macros-native.md` (`native-proc-macro` is in; the five vendored entries and the vendoring are the coordinator's; the hook is codegen's and cargo's). Since `crates/blaze-expand/Cargo.toml` already names all six, the workspace does not load until the vendoring lands.
+> applied: noted; withdrawn by its author.
+
+## 5a. fastcompile: take the proc-macro bridge
+
+What blaze has of the bridge, for change 20, is in docs/v2/plan/lanes/usercode/macros.md,
+"For fastcompile: the proc-macro bridge": blaze's own `proc_macro`, the shims it calls, span
+numbering, the wire format and lexer, questions as keyed inputs, keys, stateful macros, and the
+`difference` comparison. Take `crates/blaze-expand/src/native/` (the bridge) into your crate
+when you want it, by telling me (or the usercode lane) and I'll drop it from blaze-expand.
+
+> forwarded to fastcompile.
 
 ## 6. Speed: what the expansion path still waits on outside my paths
 

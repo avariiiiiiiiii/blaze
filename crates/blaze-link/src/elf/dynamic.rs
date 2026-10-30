@@ -6,6 +6,7 @@
 use std::collections::hash_map::Entry;
 
 use blaze_codegen::Arch;
+use blaze_ids::radix;
 use gimli::UnwindSection;
 use object::elf;
 use rayon::prelude::*;
@@ -31,18 +32,14 @@ pub(crate) fn first_error(results: Vec<Result<(), LinkError>>) -> Result<(), Lin
     results.into_iter().collect()
 }
 
-/// Sorts `items`, in parallel when there are many; free when they are sorted already (the
-/// core hands over addresses in order). Equal items are identical, so the order is the same
-/// whatever the sort.
-fn sort<T: Ord + Send>(items: &mut [T]) {
+/// Sorts relocations in their derived order: by addend, then stably by the fields before it.
+/// Free when they are sorted already (the core hands over addresses in order).
+fn sort_rela(items: &mut [Rela]) {
     if items.is_sorted() {
         return;
     }
-    if items.len() >= CHUNK {
-        items.par_sort_unstable();
-    } else {
-        items.sort_unstable();
-    }
+    radix::sort_copy_by_key(items, |it| radix::signed_64(it.addend));
+    radix::sort_copy_by_key(items, |it| radix::pack_64(it.at, radix::pack_32(it.r_type, it.sym)));
 }
 
 /// The synthetic regions of an output, in no particular order ([`super::Elf::order`] sorts).
@@ -618,7 +615,7 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
         })
         .collect();
     first_error(results)?;
-    sort(&mut relative);
+    sort_rela(&mut relative);
     let count = relative.len();
     relative.reserve_exact(other_cells);
 
@@ -665,7 +662,7 @@ fn relocations(writer: &Elf, placed: &Placed<'_>, shared: bool) -> Result<(Vec<R
             }
         }
     }
-    sort(&mut other);
+    sort_rela(&mut other);
     relative.extend(other);
     Ok((relative, count))
 }
@@ -754,7 +751,7 @@ fn eh_frame_hdr(placed: &Placed<'_>) -> Result<Vec<u8>, LinkError> {
             }
         }
     }
-    sort(&mut table);
+    radix::sort_copy_by_key(&mut table, |&(pc, fde): &(u64, u64)| radix::pack_64(pc, fde));
     let mut bytes = Vec::with_capacity(12 + 8 * table.len());
     bytes.u8(1);
     bytes.u8(gimli::DW_EH_PE_pcrel.0 | gimli::DW_EH_PE_sdata4.0);

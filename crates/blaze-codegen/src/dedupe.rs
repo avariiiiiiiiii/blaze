@@ -12,6 +12,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use blaze_ids::ContentId;
+use rustc_hash::FxHashMap;
 
 use crate::{CompiledFunction, Data, InstanceKey, Reloc, Target, Unwind, content::code_id};
 
@@ -19,6 +20,7 @@ use crate::{CompiledFunction, Data, InstanceKey, Reloc, Target, Unwind, content:
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Deduped {
     /// Each function merged away, with the one kept for it.
+    // BTreeMap: a build's output, sorted once when it is made.
     pub merged: BTreeMap<InstanceKey, InstanceKey>,
 }
 
@@ -112,7 +114,8 @@ pub fn dedupe(
 ) -> Deduped {
     let mut kept: HashMap<InstanceKey, InstanceKey> = HashMap::new();
     loop {
-        let mut groups: BTreeMap<ContentId, Vec<InstanceKey>> = BTreeMap::new();
+        // Unordered: each group is sorted on its own, and only fills `more`, a map by key.
+        let mut groups: FxHashMap<ContentId, Vec<InstanceKey>> = FxHashMap::default();
         for function in functions.iter().filter(|it| mergeable(&it.key)) {
             groups.entry(code_id(function)).or_default().push(function.key);
         }
@@ -267,5 +270,30 @@ mod tests {
         b.reverse();
         assert_eq!(dedupe(&mut a, &|_| true), dedupe(&mut b, &|_| true));
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn many_groups_merge_the_same_whatever_the_order() {
+        // 60 functions of 8 codes, each calling one of the first 20: groups merge over rounds.
+        let make = || -> Vec<CompiledFunction> {
+            (1..=60u8)
+                .map(|n| match n {
+                    1..=20 => function(n, n % 4, &[]),
+                    _ => function(n, 0x40 + n % 4, &[1 + n % 20]),
+                })
+                .collect()
+        };
+        let mut first = make();
+        let want = dedupe(&mut first, &|it| *it != key(7));
+        assert!(want.merged.len() > 20, "{}", want.merged.len());
+        for step in [7usize, 11, 13, 59] {
+            let mut functions = make();
+            let len = functions.len();
+            let permuted: Vec<CompiledFunction> =
+                (0..len).map(|at| functions[at * step % len].clone()).collect();
+            functions = permuted;
+            assert_eq!(dedupe(&mut functions, &|it| *it != key(7)), want);
+            assert_eq!(functions, first);
+        }
     }
 }

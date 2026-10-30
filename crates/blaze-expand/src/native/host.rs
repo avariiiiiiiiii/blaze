@@ -1,4 +1,4 @@
-//! What a native expander's `proc_macro` is answered (`proc_macro/lib.rs`, `__native::Host`):
+//! What the bridge's `proc_macro` is answered (`proc_macro/lib.rs`, `__native::Host`):
 //! what the wasm host answers a module (`crates/blaze-macro-wasm/src/lib.rs`, `add_host`), the
 //! same number for the same span and the same question of the database for the same call, so
 //! that a macro expands to the same tokens either way.

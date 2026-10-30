@@ -67,7 +67,7 @@ where
 
                 // Ordinary queries don't need a cycle iteration stamp. Keeping the default avoids
                 // allocating `QueryRevisionsExtra` after a revision-preserving cancellation.
-                (new_value, active_query.pop(IterationStamp::default()))
+                (new_value, active_query.pop(zalsa, IterationStamp::default()))
             }
             CycleRecoveryStrategy::FallbackImmediate | CycleRecoveryStrategy::Fixpoint => {
                 let _cancellation_guard =
@@ -424,7 +424,7 @@ impl MemoHeader {
         //   (and are owned by the query) are alive even if the query in this iteration no longer creates them.
         // * ensure the final returned memo depends on all inputs from all iterations.
         if self.may_be_provisional() && self.verified_at.load() == zalsa.current_revision() {
-            active_query.seed_iteration(&self.revisions);
+            active_query.seed_iteration(zalsa, &self.revisions);
         }
     }
 }
@@ -452,7 +452,7 @@ fn try_complete_query<'db>(
             })
         };
 
-        return QueryExecutionOutcome::Completed(active_query.pop(iteration));
+        return QueryExecutionOutcome::Completed(active_query.pop(zalsa, iteration));
     }
 
     let (max_iteration, depends_on_self) =
@@ -965,10 +965,11 @@ fn complete_cycle_query(
 
     seen.clear();
     let edge_fingerprints = flattened_edge_fingerprints(zalsa, &flattened);
+    let zalsa_local = detached_query.zalsa_local();
     let completion = detached_query
         .pop_completion(iteration, true)
         .with_edge_fingerprints(edge_fingerprints);
-    let completed_query = completion.finish(flattened.drain(..));
+    let completed_query = completion.finish(zalsa, zalsa_local, flattened.drain(..));
     #[cfg(feature = "accumulator")]
     assert!(
         completed_query

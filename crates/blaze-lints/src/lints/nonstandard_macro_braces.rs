@@ -10,7 +10,7 @@ use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange, ast};
 
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "nonstandard_macro_braces";
+const LINT: super::Implemented = super::Implemented::NonstandardMacroBraces;
 
 /// The macros clippy knows the brackets of, and the ones `standard-macro-braces` adds.
 fn braces(cx: &Cx<'_, '_, '_>) -> FxHashMap<String, (char, char)> {

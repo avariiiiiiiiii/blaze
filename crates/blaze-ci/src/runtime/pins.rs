@@ -4,7 +4,7 @@
 //! root as often again after reconnecting. A root the daemon no longer has then is reported to
 //! the service ([`Input::Unpinned`]).
 
-use std::{collections::BTreeMap, path::PathBuf, sync::mpsc};
+use std::{path::PathBuf, sync::mpsc};
 
 use blaze_api::{
     Request, Response, ViewRef,
@@ -12,6 +12,7 @@ use blaze_api::{
 };
 use blaze_ids::ContentId;
 use blaze_vfs::View;
+use rustc_hash::FxHashMap;
 
 use super::{api_error, log, said_or};
 use crate::service::Input;
@@ -28,12 +29,13 @@ pub(crate) enum Command {
 struct Pins {
     socket: PathBuf,
     client: Option<Client>,
-    held: BTreeMap<ContentId, u32>,
+    /// Sorted by root where it is walked, so roots are held again in that order.
+    held: FxHashMap<ContentId, u32>,
     service: mpsc::Sender<Input>,
 }
 
 pub(crate) fn run(socket: PathBuf, commands: mpsc::Receiver<Command>, service: mpsc::Sender<Input>) {
-    let mut pins = Pins { socket, client: None, held: BTreeMap::new(), service };
+    let mut pins = Pins { socket, client: None, held: FxHashMap::default(), service };
     for command in commands {
         match command {
             Command::Open { view, reply } => {
@@ -109,7 +111,8 @@ impl Pins {
             let mut client = Client::unix(&self.socket).map_err(|error| {
                 format!("could not reach the daemon at {}: {error}", self.socket.display())
             })?;
-            let held: Vec<(ContentId, u32)> = self.held.iter().map(|(root, count)| (*root, *count)).collect();
+            let mut held: Vec<(ContentId, u32)> = self.held.iter().map(|(root, count)| (*root, *count)).collect();
+            held.sort_unstable_by_key(|&(root, _)| root);
             for (root, count) in held {
                 for _ in 0..count {
                     match open(&mut client, ViewRef::Root(View { root })) {

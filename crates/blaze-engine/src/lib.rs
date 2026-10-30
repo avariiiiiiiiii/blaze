@@ -755,6 +755,27 @@ type SharedKey = (u64, PathBuf, Option<PathBuf>);
 type SharedPaths =
     Arc<std::sync::Mutex<FxHashMap<Crate, Arc<std::sync::OnceLock<FxHashSet<String>>>>>>;
 
+/// Tells the evaluator of constants what each file is called (`file!()` in a constant), as a
+/// tracked input of `db`: its place in the innermost of the loaded checkouts `roots` it is in.
+/// One database builds the programs of all of them, so the rule can't be one program's.
+fn name_sources(db: &mut RootDatabase, roots: &[(PathBuf, PathBuf)]) {
+    let mut roots: Vec<PathBuf> = roots.iter().map(|(_, root)| root.clone()).collect();
+    blaze_ids::radix::sort_by_key(&mut roots, |it| !(it.components().count() as u64));
+    roots.dedup();
+    let key = roots.iter().map(|it| it.display().to_string()).collect::<Vec<_>>().join("\0");
+    hir_ty_codegen::name_sources(db, &key, move |db, file| {
+        let source_root = db.file_source_root(file).source_root_id(db);
+        let source_root = db.source_root(source_root).source_root(db);
+        let path = source_root.path_for_file(&file)?.as_path()?.to_string();
+        let path = Path::new(&path);
+        if cargo::toolchain::library::has(path) {
+            return Some(path.to_string_lossy().into_owned());
+        }
+        let relative = roots.iter().find_map(|root| path.strip_prefix(root).ok());
+        Some(relative.unwrap_or(path).to_string_lossy().into_owned())
+    });
+}
+
 /// What rustc is told a file is called: its place in the checkout when it is a file of it.
 fn source_path(
     db: &dyn HirDatabase,
@@ -776,7 +797,7 @@ fn source_path(
 }
 
 impl<'a> Resolver<'a> {
-    /// The symbols of the program of `args`, which panic locations are named for from now on.
+    /// The symbols of the program of `args`.
     fn of(
         db: &'a RootDatabase,
         table: &'a SymbolTable,
@@ -823,10 +844,6 @@ impl<'a> Resolver<'a> {
         let (root, base) = (args.checkout.clone(), args.base.clone());
         let debug = args.debug;
         let apart = (debug.kept != plan::Kept::Linked).then(|| args.out.clone());
-        let named = (root.clone(), base.clone());
-        hir_ty_codegen::name_sources(move |db, file| {
-            source_path(db, &named.0, named.1.as_deref(), file)
-        });
         Resolver {
             db,
             table,
@@ -2957,6 +2974,7 @@ impl Checkouts {
         self.roots.extend(roots);
         self.splits.extend(splits);
         self.debug.extend(debug);
+        name_sources(db, &self.roots);
         Ok(())
     }
 
@@ -3587,7 +3605,7 @@ fn resolve_all(
                 .filter_map(|dep| index.get(&dep.crate_id))
                 .map(|&it| id(it))
                 .collect();
-            deps.sort();
+            blaze_ids::radix::sort_copy_by_key(&mut deps, |it| it.0);
             deps.dedup();
             let name = krate.extra_data(db).display_name.as_ref();
             let name = name.map(|it| it.to_string()).unwrap_or_default();
@@ -5670,7 +5688,7 @@ fn report(build: &Build) {
         entry.0 += 1;
     }
     let mut reasons: Vec<_> = reasons.into_iter().collect();
-    reasons.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+    blaze_ids::radix::sort_by_key(&mut reasons, |(_, (count, _))| !(*count as u64));
     for (reason, (count, example)) in reasons {
         eprintln!("  {count:>5}  {reason}  (e.g. {example})");
     }
@@ -9219,7 +9237,7 @@ fn run_holding(
     if !written.is_empty() {
         let paths = written_sources(&files, written.iter().copied());
         let mut edited: Vec<_> = paths.keys().copied().collect();
-        edited.sort_unstable();
+        blaze_ids::radix::sort_copy_by_key(&mut edited, |it| it.index());
         let sources = Sources { paths };
         let what = match edited.len() {
             1 => "the edited file".to_owned(),
@@ -9379,7 +9397,7 @@ fn run_holding(
                 })
                 .collect();
             let mut all: Vec<_> = paths.keys().copied().collect();
-            all.sort_unstable();
+            blaze_ids::radix::sort_copy_by_key(&mut all, |it| it.index());
             events::at(events::Step::Check, Some(&format!("{} files", all.len())));
             let sources = Sources { paths };
             let lints = !args.lints_capped;
@@ -10368,7 +10386,7 @@ fn run_holding(
         let homing = programs.iter().any(|it| it.known.homes());
         let mut homed = outlines.adding(&db, &listed, if homing { &texts } else { &[] });
         homed.extend(&editing);
-        homed.sort_unstable();
+        blaze_ids::radix::sort_copy_by_key(&mut homed, |it| it.index());
         homed.dedup();
         take_first_values(&db, &mut programs, &homed);
         home_in_rustcs(&db, &listed, &mut programs, &homed);
@@ -10450,7 +10468,7 @@ fn run_holding(
             let unbuilt = &mut program.unbuilt;
             unbuilt.stale |= changed != 0;
             unbuilt.edited.extend(edited);
-            unbuilt.edited.sort_unstable();
+            blaze_ids::radix::sort_copy_by_key(&mut unbuilt.edited, |it| it.index());
             unbuilt.edited.dedup();
         }
         let paths: FxHashMap<_, _> = files
@@ -11006,7 +11024,7 @@ impl Program {
         self.known.distrust(db, &other);
         // A file rustc did not read is edited for this program: its build checks it.
         self.unbuilt.edited.extend(unread);
-        self.unbuilt.edited.sort_unstable();
+        blaze_ids::radix::sort_copy_by_key(&mut self.unbuilt.edited, |it| it.index());
         self.unbuilt.edited.dedup();
     }
 
@@ -11089,7 +11107,10 @@ impl Program {
         }
         let mut stale: Vec<_> = edited.iter().flat_map(|it| it.transitive_rev_deps(db)).collect();
         stale.retain(|it| used.contains(it) && !built.contains(it));
-        stale.sort_unstable();
+        blaze_ids::radix::sort_copy_by_key(&mut stale, |it| {
+            let id = salsa::plumbing::AsId::as_id(it);
+            blaze_ids::radix::pack_32(id.index(), id.generation())
+        });
         stale.dedup();
         for &krate in &stale {
             let Some(root) = crate_root_file(db, krate.into()) else {

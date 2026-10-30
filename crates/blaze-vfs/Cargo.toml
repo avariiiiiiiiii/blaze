@@ -21,5 +21,8 @@ hashbrown.workspace = true
 rustc-hash.workspace = true
 serde = { workspace = true, features = ["derive"] }
 
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
 [lints]
 workspace = true

@@ -273,14 +273,22 @@ fn facts_lines(out: &mut String, diagnostic: &Diagnostic, color: bool) {
 }
 
 fn test_lines(out: &mut String, result: &TestResult, color: bool) {
-    let (code, verdict) = match result.outcome {
+    let outcome = result.cached.as_ref().map_or(result.outcome, |cached| cached.outcome);
+    let (code, verdict) = match outcome {
         TestOutcome::Passed => (GREEN, "ok"),
         TestOutcome::Failed => (RED, "FAILED"),
         TestOutcome::Ignored => (YELLOW, "ignored"),
         TestOutcome::Unreached => (DIM, "unreached"),
     };
     let verdict = Painted(code, verdict, color);
-    put!(out, "test {} ... {verdict} ({} ms)\n", result.name, result.millis);
+    match &result.cached {
+        None => {
+            put!(out, "test {} ... {verdict} ({} ms)\n", result.name, result.millis);
+        }
+        Some(cached) => {
+            put!(out, "test {} ... {verdict} (cached, {} ms)\n", result.name, cached.millis);
+        }
+    }
     if result.outcome == TestOutcome::Failed {
         bytes(out, &result.output);
     }
@@ -366,7 +374,7 @@ fn bytes(out: &mut String, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
-    use blaze_api::{ApiError, FactRead, Span};
+    use blaze_api::{ApiError, Basis, Cached, FactRead, Span};
     use blaze_ids::ContentId;
     use blaze_query::QueryKind;
 
@@ -526,6 +534,7 @@ mod tests {
         let mut result = TestResult {
             binary: "t".to_owned(),
             name: "parses".to_owned(),
+            cached: None,
             outcome: TestOutcome::Passed,
             output: b"noise\n".to_vec(),
             millis: 4,
@@ -534,9 +543,18 @@ mod tests {
         assert_eq!(passed, "test parses ... ok (4 ms)\n");
         result.outcome = TestOutcome::Failed;
         assert_eq!(
-            lines(&Response::TestResult(result), false),
+            lines(&Response::TestResult(result.clone()), false),
             "test parses ... FAILED (4 ms)\nnoise\n"
         );
+        let cached = Cached { basis: Basis::Executed, millis: 9, outcome: TestOutcome::Passed };
+        let kept = TestResult {
+            cached: Some(cached),
+            millis: 0,
+            output: Vec::new(),
+            outcome: TestOutcome::Unreached,
+            ..result
+        };
+        assert_eq!(lines(&Response::TestResult(kept), false), "test parses ... ok (cached, 9 ms)\n");
     }
 
     #[test]

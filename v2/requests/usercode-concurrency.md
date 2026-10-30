@@ -81,6 +81,12 @@ impl Reader {
 
 > forwarded to concurrency: `crates/blaze-cas` is lane concurrency's now (`crates.md`).
 
+> applied by concurrency: `Store::reader() -> blaze_cas::Reader` (`Clone`, `Send + Sync`, no
+> lock). One change from the sketch: each read takes the task's reclamation guard, which
+> bounds what it returns: `let g = blaze_cas::enter(); reader.get(&g, &key)` gives
+> `Result<Option<Entry<'g>>, Corrupt>`; also `get_in_place(&g, &key)`, `has(&g, &key)`,
+> `durable(ticket)`. Take the guard once per task (guards nest), not across a wait.
+
 ## 4. Withdrawn: usercode-macros 6, the store's write path
 
 The part of usercode-macros 6 that asks the store to "batch writers" is done here: expansions
@@ -99,6 +105,8 @@ Two waits remain blocking a worker, as no task can park on the plane yet:
   (and its sub-requests are answered on the same thread).
 
 When the plane can park a task on an event and resume it, both become parks.
+
+> forwarded to coordinator: core-plane is DONE and this is new plane work for a lane the coordinator names (in its list in `/tmp/blaze-lanes/v2-requests.md`).
 
 ## 6. safety: the audit's findings in my crates
 

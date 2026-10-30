@@ -28,25 +28,60 @@ pub(crate) enum DataTarget {
     Nowhere,
 }
 
-/// What each request of a function is, by its number.
-pub(crate) struct Resolve<'a> {
-    pub(crate) func: &'a dyn Fn(u32, &FuncRequest) -> Result<Target, String>,
-    pub(crate) data: &'a dyn Fn(u32, &DataRequest) -> Result<DataTarget, String>,
+/// What each request of a function is, by its number: asked once a relocation, so it is
+/// static dispatch, never `dyn` ([`super::places::Placed`] in a build).
+pub(crate) trait Resolver {
+    fn func(&self, index: u32, request: &FuncRequest) -> Result<Target, String>;
+    fn data(&self, index: u32, request: &DataRequest) -> Result<DataTarget, String>;
     /// A symbol the backend calls on its own: a libcall, the personality routine.
-    pub(crate) symbol: &'a dyn Fn(&str) -> Result<Target, String>,
+    fn symbol(&self, name: &str) -> Result<Target, String>;
     /// The folded body a fold's thunk calls ([`super::fold::BODY`]).
-    pub(crate) body: &'a dyn Fn() -> Result<Target, String>,
+    fn body(&self) -> Result<Target, String>;
+}
+
+/// A [`Resolver`] of four closures, for a test.
+#[cfg(test)]
+pub(crate) struct Resolve<F, D, S, B> {
+    pub(crate) func: F,
+    pub(crate) data: D,
+    pub(crate) symbol: S,
+    pub(crate) body: B,
+}
+
+#[cfg(test)]
+impl<F, D, S, B> Resolver for Resolve<F, D, S, B>
+where
+    F: Fn(u32, &FuncRequest) -> Result<Target, String>,
+    D: Fn(u32, &DataRequest) -> Result<DataTarget, String>,
+    S: Fn(&str) -> Result<Target, String>,
+    B: Fn() -> Result<Target, String>,
+{
+    fn func(&self, index: u32, request: &FuncRequest) -> Result<Target, String> {
+        (self.func)(index, request)
+    }
+
+    fn data(&self, index: u32, request: &DataRequest) -> Result<DataTarget, String> {
+        (self.data)(index, request)
+    }
+
+    fn symbol(&self, name: &str) -> Result<Target, String> {
+        (self.symbol)(name)
+    }
+
+    fn body(&self) -> Result<Target, String> {
+        (self.body)()
+    }
 }
 
 /// The function `code` is, `requests` being what its relocations name and `spans` what its
-/// line rows do.
+/// line rows do. Its bytes move into the result, uncopied.
 pub(crate) fn function(
     key: InstanceKey,
     arch: Arch,
     isa: &dyn TargetIsa,
-    code: &fragment::Code,
+    code: fragment::Code,
     requests: &Requests,
-    resolve: &Resolve<'_>,
+    resolve: &impl Resolver,
     spans: &[SpanRef],
     side: Option<ContentId>,
 ) -> Result<CompiledFunction, String> {
@@ -68,7 +103,7 @@ pub(crate) fn function(
     }
     let unwind = match &code.unwind {
         Some(unwind) => {
-            let personality = || (resolve.symbol)(PERSONALITY);
+            let personality = || resolve.symbol(PERSONALITY);
             let (unwind, lsda) = super::unwind::convert(isa, unwind, personality)?;
             if let Some(lsda) = lsda {
                 own.push(lsda);
@@ -77,14 +112,14 @@ pub(crate) fn function(
         }
         None => None,
     };
-    let lines = code
-        .lines
-        .iter()
-        .map(|row| match spans.get(row.span as usize) {
-            Some(&span) => Ok(Line { at: row.offset, span }),
-            None => Err(format!("a line row of statement {}, which the body has no span of", row.span)),
-        })
-        .collect::<Result<_, String>>()?;
+    let mut lines = Vec::with_capacity(code.lines.len());
+    for row in &code.lines {
+        let Some(&span) = spans.get(row.span as usize) else {
+            let at = row.span;
+            return Err(format!("a line row of statement {at}, which the body has no span of"));
+        };
+        lines.push(Line { at: row.offset, span });
+    }
     let align = u32::try_from(code.align).map_err(|e| e.to_string())?;
     if !align.is_power_of_two() {
         return Err(format!("code aligned to {align}, not a power of two"));
@@ -93,7 +128,7 @@ pub(crate) fn function(
         key,
         arch,
         align,
-        code: code.bytes.clone(),
+        code: code.bytes,
         relocs,
         data: own.data,
         inlined: Vec::new(),
@@ -109,7 +144,7 @@ pub(crate) fn value(
     arch: Arch,
     blob: &ConstBlob,
     requests: &Requests,
-    resolve: &Resolve<'_>,
+    resolve: &impl Resolver,
 ) -> Result<(Vec<Data>, Vec<Reloc>), String> {
     let mut own = OwnData { data: Vec::new(), word: word(arch)? };
     let named = blob.relocs.iter().map(|&(_, data, _)| data.as_u32() as usize);
@@ -145,7 +180,7 @@ impl OwnData {
     fn requests(
         &mut self,
         requests: &Requests,
-        resolve: &Resolve<'_>,
+        resolve: &impl Resolver,
         named: impl Iterator<Item = usize>,
     ) -> Result<Vec<Option<Target>>, String> {
         let mut used = vec![false; requests.datas.len()];
@@ -176,7 +211,7 @@ impl OwnData {
                 targets.push(None);
                 continue;
             }
-            let target = match (resolve.data)(index as u32, request)? {
+            let target = match resolve.data(index as u32, request)? {
                 DataTarget::Target(target) => target,
                 DataTarget::Own => {
                     let blob = own_blob(request)?;
@@ -197,7 +232,7 @@ impl OwnData {
         index: usize,
         before: &[Option<Target>],
         requests: &Requests,
-        resolve: &Resolve<'_>,
+        resolve: &impl Resolver,
     ) -> Result<Data, String> {
         let relocs = self.relocs(blob, index, before, requests, resolve)?;
         let align = u32::try_from(blob.align).map_err(|e| e.to_string())?;
@@ -212,7 +247,7 @@ impl OwnData {
         index: usize,
         before: &[Option<Target>],
         requests: &Requests,
-        resolve: &Resolve<'_>,
+        resolve: &impl Resolver,
     ) -> Result<Vec<Reloc>, String> {
         if !blob.type_ids.is_empty() {
             return Err("a constant with a `TypeId` the adapter did not fill".to_owned());
@@ -229,10 +264,10 @@ impl OwnData {
             let request = requests.funcs.get(func.as_u32() as usize).ok_or_else(|| {
                 format!("data {index} points at function {}, never requested", func.as_u32())
             })?;
-            let target = (resolve.func)(func.as_u32(), request)?;
+            let target = resolve.func(func.as_u32(), request)?;
             relocs.push(Reloc { at, kind: RelocKind::Abs64, target, addend: 0 });
         }
-        relocs.sort_by_key(|it| it.at);
+        blaze_ids::radix::sort_by_key(&mut relocs, |it| it.at);
         Ok(relocs)
     }
 
@@ -276,7 +311,7 @@ fn reloc_target(
     name: RelocName,
     requests: &Requests,
     datas: &[Option<Target>],
-    resolve: &Resolve<'_>,
+    resolve: &impl Resolver,
 ) -> Result<Target, String> {
     match name {
         RelocName::Func(index) => {
@@ -284,21 +319,21 @@ fn reloc_target(
                 .funcs
                 .get(index as usize)
                 .ok_or_else(|| format!("a relocation at function {index}, never requested"))?;
-            (resolve.func)(index, request)
+            resolve.func(index, request)
         }
         RelocName::Data(index) => datas
             .get(index as usize)
             .cloned()
             .flatten()
             .ok_or_else(|| format!("a relocation at data {index}, never requested")),
-        RelocName::User { namespace: super::fold::BODY, index: 0 } => (resolve.body)(),
+        RelocName::User { namespace: super::fold::BODY, index: 0 } => resolve.body(),
         RelocName::User { namespace: fragment::INLINED, .. } => {
             Err("a relocation at a reference of a body built in".to_owned())
         }
         RelocName::User { namespace, .. } => {
             Err(format!("a relocation in the unknown namespace {namespace}"))
         }
-        RelocName::LibCall(libcall) => (resolve.symbol)(&libcall_symbol(libcall)),
+        RelocName::LibCall(libcall) => resolve.symbol(&libcall_symbol(libcall)),
         RelocName::Known(symbol) => {
             Err(format!("a relocation at the linker's {symbol:?}, which v2 has no target for"))
         }

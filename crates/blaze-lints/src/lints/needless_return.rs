@@ -12,7 +12,7 @@ use syntax::{
 
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "needless_return";
+const LINT: super::Implemented = super::Implemented::NeedlessReturn;
 
 /// clippy's `RetReplacement`: what the `return` gives way to.
 #[derive(Clone, PartialEq, Eq)]

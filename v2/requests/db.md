@@ -458,6 +458,8 @@ Design and the mapping onto `MemoData`/`Edge`: `docs/v2/plan/lanes/db/speed-sals
 ### crates/hir-ty/src/mir.rs  (1 site; `is_by_move_coroutine`)
 - ~L2167  `} = &store[expr]`  ->  `} = store.expr(expr)`
 
+> applied (speed-types): `mir.rs` 2167. No other expression, pattern or type ref indexing is left in `mir.rs` or `mir/`.
+
 ### crates/hir-ty/src/next_solver/interner.rs  (1 site; `CoroutinesVisitor::on_expr`)
 - ~L2140  `} = self.store[expr]`  ->  `} = self.store.expr(expr)`
   (`kind @ (...)` binds the `Copy` `ClosureKind` by value, as before.)
@@ -852,10 +854,12 @@ references the code already made). Line numbers are as of 2026-10-29 18:40.
 ### base-db
 
 - `crates/base-db/src/lib.rs:5` crate: no `unsafe` in its compiled code (its `#[salsa::interned(unsafe(no_lifetime))]` at `lib.rs:59` and `editioned_file_id.rs:13` is a salsa option, and salsa's expansions are external-macro spans, which `unsafe_code` skips). Add `#![forbid(unsafe_code)]` after the `#![cfg_attr(feature = "in-rust-tree", ...)]` line.
+  > applied by db-expand-next1: `rg '\bunsafe\b' crates/base-db` finds only the two salsa options; added. hir-ty-borrowck already forbids `unsafe_code` under salsa's macros, so their expansions pass.
 
 ### hir-expand
 
 - `crates/hir-expand/src/lib.rs:8` crate: no `unsafe` in its compiled code. The `unsafe` in `builtin/attr_macro.rs:111-154` is token text inside `quote::quote!` (the code `#[global_allocator]` expands to in the user's crate), not code of hir-expand; `lib.rs:1578` is the salsa `unsafe(no_lifetime)` option. Add `#![forbid(unsafe_code)]` after `#![allow(rustdoc::private_intra_doc_links)]`.
+  > applied by db-expand-next1: checked; the only `unsafe` is quoted tokens in `attr_macro.rs` and the salsa option. Added.
 
 ### hir
 
@@ -870,24 +874,43 @@ references the code already made). Line numbers are as of 2026-10-29 18:40.
 The `to_static`/`to_db` calls all follow the house style `expr_store/lower.rs:2808` and `:3085` already use.
 
 - `crates/hir-def/src/lib.rs:657` block (`BlockIdLt::to_static`, a `transmute`): no SAFETY. Proposed: `` // SAFETY: `BlockIdLt<'db>` and `BlockId` differ only in a lifetime, so they have one layout and the bits are kept. The lifetime is what the caller answers for (`# Safety`): the id must not outlive the query computation it was made in, or it may name a freed salsa slot. `` Its `# Safety` also says "the `ModuleId`" where it means "the `BlockId`".
+  > applied by db-expand-next1: the block already had a true SAFETY (same meaning, its words kept); fixed the `# Safety` to say `BlockId`.
 - `crates/hir-def/src/lib.rs:665` block (`BlockId::to_db`): no SAFETY. Proposed: `` // SAFETY: the same type but for the lifetime, as in `to_static`. The caller makes `self` an id of `_db` (`# Safety`), so `'db`, the borrow of `_db`, is its lifetime. An id of another database would name a slot of another table. ``
+  > not applied: `lib.rs:671` already has a SAFETY saying the same (one type up to the lifetime; that `_db` made it is the caller's, per `# Safety`), checked true.
 - `crates/hir-def/src/lib.rs:694` block (`ModuleIdLt::to_static`): no SAFETY. Proposed: as for `lib.rs:657` with `ModuleIdLt<'db>`/`ModuleId`.
+  > not applied: `lib.rs:703` already has the equivalent SAFETY, checked true.
 - `crates/hir-def/src/lib.rs:747` block (`ModuleId::to_db`): no SAFETY. Proposed: as for `lib.rs:665` with `ModuleId`.
+  > not applied: `lib.rs:759` already has the equivalent SAFETY, checked true.
 - `crates/hir-def/src/find_path.rs:311`, `:328`, `:2616`, `:2634` blocks (`module_id.to_static()` into an `ItemInNs`): no SAFETY. Proposed, on the line above each block's line: `` // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. The `'static` id only keys this lookup (`find_in_scope`/`find_in_prelude` compare it with the def map's items) and is dropped before `find_path` returns; the `Choice` holds names, not ids. If it were stored, a later revision could read a freed salsa slot through it. ``
+  > applied by db-expand-next1: replaced the generic comment at all four. Checked `ItemScope::name_of`/`names_of` only binary-search the scope's own entries. Each comment names the one helper that site calls; the `find_in_scope` sites say the name it gives is not an id, and the main `Choice` holds segments of names.
 - `crates/hir-def/src/nameres.rs:552` block (`block_def_map`, `block_id.to_static()`): no SAFETY. Proposed: `` // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. `block_id` is this query's own key, and the `'static` copy goes only into the `DefMap` this query returns, which salsa invalidates with the key. Stored anywhere else, it could name a freed salsa slot in a later revision. ``
+  > applied by db-expand-next1, adding "and the modules it makes" (`DefMap::empty` puts the block into the root `ModuleIdLt::new`).
 - `crates/hir-def/src/nameres.rs:554` block (`block_id.module(db).to_static()`): no SAFETY. Proposed: `` // SAFETY: as for `block_id` above: the block's module goes only into the `DefMap` this query returns. ``
+  > applied by db-expand-next1.
 - `crates/hir-def/src/nameres.rs:593` block (`DefMap::empty`, `ModuleIdLt::new(..).to_static()`): no SAFETY. Proposed: `` // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. `empty` runs only inside the queries that build a def map (`crate_def_map`, `block_def_map`, and `frozen`'s decode within them), and the root id goes only into the `DefMap` that query returns. Stored elsewhere, it could name a freed salsa slot in a later revision. ``
+  > applied by db-expand-next1, naming the real query: `crate_def_map` is a plain function over `crate_local_def_map`, which runs `frozen::served`'s decode.
 - `crates/hir-def/src/nameres.rs:661` block (`DefMap::module`, `id.to_static()`): no SAFETY. Proposed: `` // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. The `'static` copy only keys the lookup in `self.modules` and is dropped when this returns; nothing stores it. ``
+  > applied by db-expand-next1, corrected: "nothing stores it" is false. In a collected map the id is the argument of the tracked `Modules::module(self, db, module: ModuleId)`, whose key salsa keeps. The comment says so and why that is sound: the id is only hashed and compared there, never read through, and salsa ids carry a generation, so a freed module's id matches no later one.
 - `crates/hir-def/src/nameres.rs:1288` block (`Index for ModulesMap`, `id.to_static()`): no SAFETY. Proposed: on the line above `.get(...)`, `` // SAFETY: as in `DefMap::module`: the `'static` copy only keys this lookup and is dropped when it returns. ``
+  > applied by db-expand-next1 (true here: a plain `FxHashMap::get`).
 - `crates/hir-def/src/visibility.rs:63` block (`Visibility::is_visible_from`, `m.to_db(db)`): no SAFETY. Proposed: `` // SAFETY: `to_db` needs `m` to be an id of `db`. A `Visibility` is resolved against `db`'s def maps (`Visibility::resolve`, the collector) and asked only with the same database, so `m` is one of `db`'s modules. A module of another database would name a slot of another table. ``
+  > applied by db-expand-next1, keeping the old comment's note that the `'db` copy is read only during the call.
 - `crates/hir-def/src/attrs/docs.rs:367` block (`as_mut_vec().clear()` in the guard's `drop`): no SAFETY. Proposed: `` // SAFETY: `as_mut_vec` needs the bytes to be UTF-8 again when the borrow ends; `clear` leaves none. The guard runs only when `remove_indent` unwound partway through, when the bytes may not be UTF-8, which is why `String::clear` is not used. ``
+  > not applied: no longer there. `remove_indent` (HEAD and the tree) now moves the text out (`mem::take(..).into_bytes()`), compacts the `Vec<u8>`, and makes the `String` again with one checked `String::from_utf8`. `attrs/docs.rs` has no `unsafe`, and the guard clears a `String` that is already empty.
 - `crates/hir-def/src/attrs/docs.rs:437` block (`as_bytes_mut().copy_within(..)`): no SAFETY. See the MAY BE UNSOUND note below; if kept as is: `` // SAFETY: `as_bytes_mut` needs the bytes to be UTF-8 again before the `str` is used. This moves the line, without its indent, down to `copy_into`, so the bytes from there to the next line's start may split a character until the `truncate` below; on a panic the guard clears the string. ``
+  > not applied: the block is gone (safe `Vec::copy_within`, see above).
 - `crates/hir-def/src/attrs/docs.rs:465` block (`as_mut_vec().truncate(copy_into)`): no SAFETY. Proposed: `` // SAFETY: `[0, copy_into)` is the lines copied down, each cut at a character boundary (`indent_size` is a `char_indices` offset), so what is left is UTF-8. ``
+  > not applied: the block is gone (safe `Vec::truncate`, then `String::from_utf8`).
 - `crates/hir-def/src/attrs/docs.rs:419-443` MAY BE UNSOUND (a library contract, not memory): between `as_bytes_mut` (`:437`) and the `truncate` (`:465`), the loop keeps using `guard.0.docs` as a `str` (`TextSize::of(&guard.0.docs)` and `&guard.0.docs[range]` at `:421`/`:424`) while the bytes between the copied text and the next line can be a split UTF-8 sequence. That breaks `str::as_bytes_mut`'s contract ("valid UTF-8 before the borrow ends and the underlying `str` is used"). In practice each read touches only untouched lines and boundaries, so nothing reads the bad bytes. Fix without changing behavior: take `let bytes = unsafe { guard.0.docs.as_mut_vec() }` once before the loop, slice lines from `bytes` (each untouched range is UTF-8: `str::from_utf8_unchecked` with its own SAFETY), and use `bytes.len()` for the length.
+  > not applied as proposed, because the code is already sound with no `unsafe`. Line lengths come from the source map and `docs_len` taken before the move, not from a `str`. Each line's indent is cut with `char_starts` over its bytes, which no copy has reached yet. The one UTF-8 check, `String::from_utf8`, is a single pass that SIMD-validates the result. The unsafe form would save only that pass, so `unsafe.md` ("only where it buys measured speed") keeps it safe. The safe-reference test asked for already exists: `attrs/docs.rs` `remove_indent_as_by_lines` checks equal bytes against `remove_indent_by_lines`, a dedent built into a new `String` with `char_indices`. It runs over 2000 xorshift cases of ASCII, `ü`, `日本` and `🦀`, tabs, blank and whitespace-only lines, and lines shorter than the indent, with sugared line, sugared block and desugared kinds mixed.
 - `crates/hir-def/src/nameres/collector.rs:3249` block (`ModuleIdLt::new(..).to_static()` for a new child module): no SAFETY. Proposed: `` // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. The collector runs inside the def-map query (`crate_def_map`/`block_def_map`), and the id goes only into the `DefMap` it builds (`modules`, the parent's children, the scope), which salsa invalidates with that query. Stored elsewhere, it could name a freed salsa slot in a later revision. ``
+  > applied by db-expand-next1, naming `crate_local_def_map` (the tracked query) for `crate_def_map`.
 - `crates/hir-def/src/nameres/demand.rs:209`, `:216`, `:224` blocks (`block_owner`, `to_static` of a module and an outer block): no SAFETY. Proposed, above `:209`: `` // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. `module` and `outer` are locals of this walk, only asked for their def maps and blocks with `db`, and dropped before `block_owner` returns a `DefWithBodyId`; nothing stores them. `` Above `:216` (inside the match arm, the line before it) and `:224`: `` // SAFETY: as for `module` above: a local of this walk, never stored. ``
+  > applied by db-expand-next1, corrected the first comment: `owner_in_module` calls `DefMap::module`, which keys the `Modules::module` query with the id (only hashed and compared). The comment says so instead of "nothing stores them".
 - `crates/hir-def/src/nameres/frozen.rs:996` block (`block.to_static()` while encoding a module): no SAFETY. Proposed: `` // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. `block` only finds its owner (`block_owner`), whose path is what gets written, and is dropped when this returns. ``
+  > applied by db-expand-next1, corrected: it is not dropped when this returns. `Enc::block_owner` caches it in the encoder's `block_owners`, and it also reads its ast id and its `block_def_map`. The comment says the encoder is a local of one encoding (`encode_maps` and the other two `Enc::new` sites, consumed by `finish`), so the cache dies with it.
 - `crates/hir-def/src/nameres/frozen.rs:2922` block (`ModuleIdLt::new(..).to_static()` while decoding a def map): no SAFETY. Proposed, above `let module =`: `` // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. The decode runs inside the def-map query that reads the frozen def map, and the ids go only into the `DefMap` it returns (`self.own`, then its modules), which salsa invalidates with that query. ``
+  > applied by db-expand-next1, naming the query (`crate_local_def_map`, through `served`, the only caller of `decode`).
 - `crates/hir-def/src/dyn_map.rs:187`, `:194`, `nameres/tests/paths.rs:772-794`: ok. `lib.rs:407` `#[salsa::interned(unsafe(no_lifetime))]`: a salsa option, not Rust unsafe.
 
 ### hir-ty (db's files)
@@ -1026,6 +1049,8 @@ with no allocation and no hashing. `Rc::make_mut` refills the same table in plac
 still holds the old `Rc`, `make_mut` copies once. The results are the same set as before.
 `InferenceContext` is per body and single-threaded, like its existing `OnceCell`/`RefCell` uses.
 
+> forwarded to db: `crates/hir-ty/src/infer.rs` is db-ty's; the `method_resolution.rs` half is done.
+
 ### crates/hir-ty/src/infer.rs  (3 edits; owner db-ty)
 - ~L1656, the field  `    traits_in_scope: FxHashSet<TraitId>,`  ->
   ```
@@ -1089,3 +1114,50 @@ With expressions as columns, `store.exprs()` decodes every node. `ExpressionStor
   `union_literals`, `guard_borrows`, `scrutinee_of`, `guard_bindings`, `statement_values`):
   better done once per body into one pass that fills all seven, since each decodes every node.
 Found by speed-hir-store-ty.
+
+> forwarded to db: `crates/hir-ty-borrowck/` is lane db's.
+
+## speed-hir-store: `ExpressionStoreDiagnostics::InactiveCode` loses `opts` (from speed-hir-store)
+
+Each cfg'd-out field, parameter or statement used to copy the crate's whole `CfgOptions` hash set
+into the store's diagnostics. The diagnostic also encoded it, and `moved()` copied it again
+whenever an edit elsewhere in the file moved the source map. The options are always the crate's,
+so the variant is now `InactiveCode { node, cfg }` (hir-def's lowering, `signatures.rs` and the
+encoding are already done; source map schema v3). One edit in `crates/hir/src/diagnostics.rs`
+(~L1749), reading them where it reports, as the `UnconfiguredCode` arm at ~L875 already does:
+
+```rust
+// before
+ExpressionStoreDiagnostics::InactiveCode { node, cfg, opts } => {
+    InactiveCode { node: *node, cfg: cfg.clone(), opts: opts.clone() }.into()
+}
+// after
+ExpressionStoreDiagnostics::InactiveCode { node, cfg } => {
+    InactiveCode { node: *node, cfg: cfg.clone(), opts: self.krate.cfg_options(self.db).clone() }
+        .into()
+}
+```
+
+From speed-hir-defs-sigs' finding. Other matches on the variant use `..` (`hir-ty-borrowck/src/lib.rs:179`,
+`blaze-diagnostics/.../asm_labels.rs:125`) and need no edit.
+
+> forwarded to db: `crates/hir/src/diagnostics.rs` is lane db's; hir-ide and ide-db match no `InactiveCode`.
+
+## speed-hir-store: `Path::BarePath` holds a `ModPath`, not an `Interned<ModPath>` (from speed-hir-store)
+
+`hir_expand::mod_path::ModPath` is now a 16-byte `Copy` value with interned segments
+(speed-hir-expand). hir-def's `Path::BarePath(ModPath)` and `NormalPath::mod_path: ModPath` no
+longer intern it a second time. One construction outside hir-def, `crates/hir/src/semantics.rs`:
+
+```rust
+// ~L2843, before
+&Path::BarePath(Interned::new(ModPath::from_segments(kind, segments))),
+// after
+&Path::BarePath(ModPath::from_segments(kind, segments)),
+```
+
+and its import at ~L43, `use intern::{Interned, Symbol, sym};` -> `use intern::{Symbol, sym};`
+(that line was the file's only use of `Interned`). The reads (`if let Path::BarePath(path) = path`
+at ~L2912) bind `&ModPath` and need no edit.
+
+> forwarded to db: `crates/hir/src/semantics.rs` is lane db's; hir-ide builds no `Interned<ModPath>`.

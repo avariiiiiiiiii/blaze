@@ -5,6 +5,8 @@
 //! defines under a name of the base replaces it there, for the linker takes the first
 //! definition it sees. Whatever the patch can't express starts a full build over.
 
+#![forbid(unsafe_code)]
+
 use std::{
     hash::{Hash, Hasher},
     sync::Arc,
@@ -1040,7 +1042,7 @@ impl Homes {
 
 /// One part in `parts` of `all`, in order and each once.
 fn part_of(mut all: Vec<u32>, part: usize, parts: usize) -> impl Iterator<Item = usize> {
-    all.sort_unstable();
+    blaze_ids::radix::sort(&mut all);
     all.dedup();
     all.into_iter().skip(part).step_by(parts).map(|it| it as usize)
 }

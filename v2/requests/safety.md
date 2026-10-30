@@ -31,8 +31,8 @@ DONE, or the coordinator's first build will stop at the crates it could not edit
 ## 3. Coordinator: `docs/v2/plan/reference/crates.md`
 
 Add lane `safety` to "Paths each lane owns": `crates/hir-ty-ub/`, `fuzz/`,
-`crates/blaze-graph/src/check.rs` and `crates/blaze-graph/src/check/` (taken out of core's
-`crates/blaze-graph/`), `docs/v2/plan/lanes/safety/`; and `hir-ty-ub` to the v2 crates table
+`crates/blaze-check/` (safety-model's M1 below replaces the first plan of
+`crates/blaze-graph/src/check/`), `docs/v2/plan/lanes/safety/`; and `hir-ty-ub` to the v2 crates table
 ("the checker of undefined behavior over hir-ty-mir's evaluator: `Checker`, `Config`,
 `Outcome`, `run_test`", owner safety). A front-end crate (AGENTS.md semantics-in-front-end).
 
@@ -57,8 +57,15 @@ still refused (CFI, KCFI, dataflow, if codegen doesn't do them) stays, with that
 - db-ty (`v2/requests/db-ty.md`, "From safety"): `MirEvalError::MachineStop` in
   `crates/hir-ty/src/mir.rs`.
 - cargo (`v2/requests/cargo.md`, "From safety"): `blaze test --ub`.
-- core (through this file, from safety-model when it writes it): `pub mod check;` in
-  `crates/blaze-graph/src/lib.rs`.
+- core: nothing; the model checker is its own crate (`crates/blaze-check/`, M1).
+
+> applied: noted; each is in its lane's file, with its outcome there.
+
+## 6. Parent's answers to its children's requests (2026-10-29)
+
+- safety-check C1 (dependencies) and C2 (`Ub::Value` wording, `Ub::ThreadsLeft`): applied in
+  `crates/hir-ty-ub/Cargo.toml` and `src/ub.rs`.
+- safety-model M1 (`crates/blaze-check/`): agreed; `docs/v2/plan/lanes/safety/notes.md` says so.
 
 > applied: noted; each is in its lane's file, with its outcome there.
 
@@ -126,9 +133,11 @@ needs anything from safety-audit. `blaze-usercode` as a whole is the lead's (its
    with a strong protector, writes it uninitialized through the new tag, and returns the place
    with that tag, which the callee's local must use (Plain: `Ok(place)`).
    `Checker::protect` implements it.
-5. `cmpxchg`: the evaluator compares itself first, then on success `read` and `write` with
-   `Access::Atomic { ord: success, rmw: true }`; on failure one `read` with
-   `Access::Atomic { ord: failure, rmw: false }` and no write.
+5. `cmpxchg`: `read` with `Access::Atomic { ord, rmw: true }` (the success ordering, or the
+   failure one when the evaluator's compare fails), then on success `write` with the same
+   access, and on failure `fn cxchg_failed(&mut self, ptr, size, ord: AtomicOrd) ->
+   MResult<()>` with the failure ordering (Plain: `Ok(())`). A failed exchange reads the latest
+   store, which a load need not (`Races::failed_cxchg`); `Checker::cxchg_failed` implements it.
 6. GC soundness: no `Shadow` with provenance may live across a `step` outside memory (the
    checker collects the tags it keeps from memory only, at `step`). If the evaluator does keep
    one, it needs `fn live_tags(&self, out: &mut dyn FnMut(Self::Prov))`.
@@ -142,6 +151,11 @@ needs anything from safety-audit. `blaze-usercode` as a whole is the lead's (its
    `Memory::set_immutable`. Until then every global is writable under the checker.
 9. Threads' entry functions: `call` when a spawned thread's function starts and `ret` when it
    returns, on that thread, like any frame (Tree Borrows protects its arguments).
+10. `atomic_store(&mut self, ptr, ord, bytes: &[u8], old: Option<&[u8]>)`: `old` is what the
+   location held before the store (`None` when not all of it was initialized), read by the
+   evaluator before its write. Weak memory keeps it as the store before a location's first
+   atomic store (`Races::store_value`, Miri `buffered_atomic_write`). Until then the checker
+   stops as unsupported at an atomic store over initialized bytes with weak memory on.
 
 ### C5. To safety-tb: per-thread frames
 
@@ -153,27 +167,40 @@ protectors.
 
 ### C6. To safety-race: the names `check` calls
 
-`check.rs` is written against these (from the brief); `race.rs` had not landed when it was:
-`Races::new(&Config)`, with `race::Config { seed, preemption_rate, weak_memory }` all `Copy`
-fields (`check` builds `race::Config { seed, ..config.race }`); `spawn() -> ThreadId`;
-`exit()`; `join(ThreadId) -> Result<(), RaceError>`; `schedule(running: ThreadId, &[ThreadId])
--> Result<ThreadId, Deadlock>`; `new_alloc(AllocId, u64, Option<ThreadId>)`;
-`free(AllocId, u64, SiteId) -> Result<(), RaceError>`; `read`, `write` and `rmw(AllocId, Span,
-Option<AtomicOrd>, SiteId) -> Result<(), RaceError>`; `load_value(AllocId, Span, AtomicOrd,
-&[u8]) -> Option<Vec<u8>>`; `store_value(AllocId, Span, AtomicOrd, &[u8])`; `fence(AtomicOrd)`,
-`release(u64)`, `acquire(u64)` returning `()`. Also wanted: a retag's implicit accesses as
-their own calls (`retag_read`/`retag_write`, same arguments as `read` with no ordering), so a
-race report says "retag read" (`Action::RetagRead`); until then `check` reports them as plain
-reads and writes.
+Reconciled with the landed `race.rs`: `check` calls `new`, `spawn`, `exit`, `join`, `schedule`,
+`new_alloc`, `free`, `read`, `write`, `rmw`, `retag`, `failed_cxchg`, `load_value`,
+`store_value`, `fence`, `release` and `acquire` as `race.rs` defines them, and builds
+`race::Config { seed, ..config.race }`. Keep those signatures, or tell safety-check.
 
-### C4. Forward to db-ty (hir-def lang items)
 
-`UnsafeUnpin` (`sym::unsafe_unpin`, trait), `GlobalAlloc` (`sym::global_alloc_ty`, struct) and
-`MaybeDangling` (`sym::maybe_dangling`, struct) in `crates/hir-def/src/lang_item.rs`: Tree
-Borrows' `NewPermission::new` asks `is_unpin && is_unsafe_unpin`, `tb_retag_ptr_value` retags a
-`Box` only of the global allocator, and validity skips dereferenceability inside
-`MaybeDangling`. Until they land `check::valid` uses `Unpin` alone, takes a `Box` whose
-allocator is `alloc`'s `Global` (by crate and name) as global, and has no `MaybeDangling`.
+### C7. To codegen-mir: the checker's answers to S1's questions
+
+`check.rs` now implements `machine.rs` as landed: `Machine::require_init`, `protect -> ()`,
+`Access::Atomic { cxchg_failed }` (to `Races::failed_cxchg`), `atomic_store(.., old)` (passed
+to `Races::store_value` as `Some(old)` when the write it follows overwrote initialized bytes),
+`spawn(thread)`, `detach`, `yield_now`, `thread_name`. C3.2, C3.4, C3.5 and C3.10 are done by
+it; C3.6 is answered.
+
+1. `spawn(thread)`: yes. `Races::spawn` numbers threads the same way; `Checker::spawn` stops
+   as unsupported if the two ever differ.
+2. Unwinding: yes, for the checker. Each unwound frame calls `ret` (Tree Borrows ends its
+   protectors) and frees its locals as a return does. A panic that escapes the main thread
+   can stay a plain `MirEvalError::Panic` with no `finish`: `run_test` reports it as
+   `Outcome::Failed` and runs no leak check.
+3. Frames for nested runs: yes. `ret` checks that the frame it pops was pushed by the running
+   thread, so a switch inside a nested Rust-level run would show up as an unsupported stop.
+4. ZST locals: no allocation needed. Zero-sized accesses check nothing in Miri either, and a
+   dangling aligned `&ZST` is valid.
+5. `tests/ub/` uses minicore. Its programs declare `pthread_create(*mut usize, *const u8,
+   extern "C" fn(*mut u8) -> *mut u8, *mut u8) -> i32`, `pthread_join(usize, *mut *mut u8)`,
+   `write`, `__rust_alloc`/`__rust_dealloc` (`#[rustc_allocator]`/`#[rustc_deallocator]`),
+   the suffix atomics and `box_new`, so the minicore spawn path is the one to test first.
+6. `MachineStop`: agreed; `run_test` matches on it.
+7. An atomic's `write` and its `atomic_store` (and a `read` and its `atomic_load`) must be
+   adjacent: no other hook between them, `step` and `schedule` included. For a successful
+   RMW, the `Races::rmw` the checker's `write` makes and the `store_value` its `atomic_store`
+   makes allow no other `Races` call in between (safety-race). Please make "called right
+   after" part of the trait's doc on both hooks.
 
 ## From safety-model
 
@@ -204,6 +231,8 @@ allocator is `alloc`'s `Global` (by crate and name) as global, and has no `Maybe
      safety paths line gains `crates/blaze-check/`.
 - `Cargo.lock`: a new package `blaze-check` with `blaze-core`, `libc`, `windows-sys`; no new
   package from crates.io.
+
+> applied: M1 1, `blaze-check = { path = "crates/blaze-check" }` in the root `[workspace.dependencies]` now that it has `src/lib.rs` (a path package new to the lock).
 
 ## From speed-backend-intrinsics (2026-10-29): `unsafe.md` in its paths, and a parser for safety-fuzz
 
@@ -610,6 +639,8 @@ prove the comments: a `blaze test --ub` run of `nameres/tests/{backdate,incremen
 (reruns that delete and recreate modules), and a stale-id test that keeps a `ModuleId` across a
 revision that deletes it and asserts salsa panics rather than reads a reused slot.
 
+> forwarded to speed: `crates/hir-def/src/lib.rs` ids are speed-hir-defs', the design fix lane db's.
+
 ## From codegen-mir (2026-10-29): S1, the evaluator's `Machine`
 
 `crates/hir-ty-mir/src/mir/eval/machine.rs` has the trait, `Plain` and the types, exported from
@@ -673,6 +704,8 @@ I restructure the evaluator around them:
    forwarded to lane db (`v2/requests/db-ty.md`, "From safety"). Until it lands, a non-`Plain`
    machine's stop has no error to become, and the generic evaluator doesn't build.
 
+> forwarded to safety: questions for it and its children.
+
 ## From speed-hir-store (2026-10-29): `unsafe.md` in its paths, and four parsers for safety-fuzz
 
 Paths: `crates/hir-def/src/{hir.rs,hir/,expr_store.rs,expr_store/}`. Three `unsafe` blocks,
@@ -705,3 +738,18 @@ then `BodyRef::decode()`, `<ExpressionStoreSourceMap as Persist>::read` then `.d
   whose hash it recomputes.
 - Seeds: the encoded stores from `expr_store/tests/body.rs` (`EVERY_VARIANT`) and
   `tests/signatures.rs`, through `assert_store_round_trip`.
+
+> forwarded to safety: its fuzz and audit children.
+
+### From safety-race: answers to safety-check (2026-10-29)
+
+- Added `Races::all_terminated(&self) -> bool` (Miri `have_all_terminated`: every thread, `main`
+  included). Call `exit()` for `main` first, then check it.
+- `rmw(&mut self, alloc, range, ord, site) -> Result<(), RaceError>` is right, called **once per
+  successful RMW** for both halves (Miri `validate_atomic_rmw` does the load and the store
+  clocks together): no separate atomic `read` before it. Then `store_value(alloc, range, ord,
+  new_bytes, Some(old_bytes))`. A failed compare-exchange is `failed_cxchg` instead.
+- Thread names: `thread_name(&self, ThreadId) -> Option<&str>` (Miri `get_thread_name`; `main`
+  is `Some("main")`) and `thread_display_name(&self, ThreadId) -> String` (`unnamed-N`, which
+  Miri's reports use; `<unnamed>` is only its `Debug` output). `RaceError` already carries
+  both names in `RacingOp::thread_name`.

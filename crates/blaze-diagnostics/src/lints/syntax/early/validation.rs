@@ -41,22 +41,29 @@ use crate::{
     model::{Applicability, Diag, Span, SuggestionStyle},
 };
 
-/// One pass over the nodes [`Walk`] already holds (flat-tree cursors: a root pointer and a
-/// `u32` index), fusing AST validation, the parser's lints and the type parameter check the
-/// way rustc's combined early lint pass fuses its lints, but without rustc's second walk for
-/// AST validation. Each node costs one `kind` read (a column load) and a `match` on it; a
-/// cursor is cloned and cast only for the few kinds a lint looks at, and nothing is allocated
-/// unless a lint fires. The only other nodes read are those of the subtrees `cfg` removes and
-/// attribute macros replace, which only the parser sees.
-pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut out = Vec::new();
-    let mut parsed = parser::Parsed::new(cx, walk);
-    for (index, tree) in walk.trees.iter().enumerate() {
-        let index = index as u32;
-        for node in &tree.nodes {
-            validate(cx, tree, node, &mut out);
-            parsed.check(cx, tree, index, node);
-        }
+/// The checks of this part, as the early pass's one walk (`super::lints`) calls them: AST
+/// validation, the parser's lints and the type parameter check fused into rustc's combined early
+/// pass, without rustc's second walk for AST validation. Each node costs one `kind` read and a
+/// `match` on it; a cursor is cloned and cast only for the few kinds a lint looks at, and
+/// nothing is allocated unless a lint fires. The only other nodes read are those of the
+/// subtrees `cfg` removes and attribute macros replace, which only the parser sees.
+pub(super) struct Validation {
+    parsed: parser::Parsed,
+}
+
+impl Validation {
+    pub(super) fn new(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Validation {
+        Validation { parsed: parser::Parsed::new(cx, walk) }
+    }
+
+    /// `node` of `tree`, the `index`th tree of the walk.
+    pub(super) fn node(&mut self, cx: &Cx<'_, '_>, tree: &Tree, index: u32, node: &SyntaxNode, out: &mut Vec<Emitted>) {
+        validate(cx, tree, node, out);
+        self.parsed.check(cx, tree, index, node);
+    }
+
+    /// After the nodes of `tree`: what the parser sees of it that the walk does not.
+    pub(super) fn tree(&mut self, cx: &Cx<'_, '_>, tree: &Tree, index: u32) {
         let unseen = tree.off.iter().chain(&tree.replaced);
         for root in unseen.clone() {
             let range = root.text_range();
@@ -65,12 +72,14 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>) -> Vec<Emitted> {
                 continue;
             }
             for node in root.descendants() {
-                parsed.check(cx, tree, index, &node);
+                self.parsed.check(cx, tree, index, &node);
             }
         }
     }
-    out.extend(parsed.finish());
-    out
+
+    pub(super) fn finish(self) -> impl Iterator<Item = Emitted> {
+        self.parsed.finish()
+    }
 }
 
 /// The lints AST validation buffers at `node`, in the order it buffers them, and

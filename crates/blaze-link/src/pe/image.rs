@@ -521,7 +521,7 @@ fn imports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
 /// by bisection), ordinals from 1 in that order.
 fn exports(placed: &Placed<'_>, region: &Region) -> Result<Vec<u8>, LinkError> {
     let mut exports: Vec<&Export> = placed.exports.iter().collect();
-    exports.sort_unstable_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    blaze_ids::names::sort_by_name(&mut exports, |it| it.name.as_bytes());
     for pair in exports.windows(2) {
         if pair[0].name == pair[1].name {
             return Err(error(format!("`{}` is exported twice", pair[0].name)));

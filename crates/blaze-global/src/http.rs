@@ -9,29 +9,38 @@ pub const HEAD_MOST: usize = 16 << 10;
 
 pub(crate) const CONTENT_TYPE: &str = "application/x-blaze-global";
 
+#[cfg(test)]
 pub(crate) fn write_request(host: &str, path: &str, body: &[u8], out: &mut Vec<u8>) {
-    use std::io::Write as _;
-    write!(
-        out,
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: blaze/{}\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: {}\r\n\r\n",
-        env!("CARGO_PKG_VERSION"),
-        body.len()
-    )
-    .expect("writing to a vector");
+    write_request_head(host, path, body.len(), out);
     out.extend_from_slice(body);
 }
 
+/// The head of a request whose body of `len` bytes follows it.
+pub(crate) fn write_request_head(host: &str, path: &str, len: usize, out: &mut Vec<u8>) {
+    use std::io::Write as _;
+    write!(
+        out,
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: blaze/{}\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: {len}\r\n\r\n",
+        env!("CARGO_PKG_VERSION"),
+    )
+    .expect("writing to a vector");
+}
+
 pub(crate) fn write_response(status: u16, body: &[u8], close: bool, out: &mut Vec<u8>) {
+    write_response_head(status, body.len(), close, out);
+    out.extend_from_slice(body);
+}
+
+/// The head of a response whose body of `len` bytes follows it.
+pub(crate) fn write_response_head(status: u16, len: usize, close: bool, out: &mut Vec<u8>) {
     use std::io::Write as _;
     let connection = if close { "Connection: close\r\n" } else { "" };
     write!(
         out,
-        "HTTP/1.1 {status} {}\r\nContent-Type: {CONTENT_TYPE}\r\n{connection}Content-Length: {}\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {CONTENT_TYPE}\r\n{connection}Content-Length: {len}\r\n\r\n",
         reason_phrase(status),
-        body.len()
     )
     .expect("writing to a vector");
-    out.extend_from_slice(body);
 }
 
 fn reason_phrase(status: u16) -> &'static str {
@@ -40,6 +49,8 @@ fn reason_phrase(status: u16) -> &'static str {
         400 => "Bad Request",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        411 => "Length Required",
+        500 => "Internal Server Error",
         413 => "Content Too Large",
         503 => "Service Unavailable",
         _ => "Error",

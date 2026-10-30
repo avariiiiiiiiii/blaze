@@ -8,6 +8,8 @@
 //! Builds nest (the body of a callee built in is built while its caller is), so each is a small
 //! stack of spares rather than one.
 
+#![forbid(unsafe_code)]
+
 use std::cell::RefCell;
 
 use cranelift_codegen::{Context, ir};

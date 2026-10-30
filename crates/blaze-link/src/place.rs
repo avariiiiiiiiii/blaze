@@ -14,6 +14,7 @@
 //! with only pieces whose keys tie compared by their symbols' contents. Classes are a dense
 //! index and sort in parallel.
 
+use blaze_ids::radix;
 use rayon::prelude::*;
 use rustc_hash::FxHashSet;
 
@@ -29,8 +30,6 @@ use crate::symbols::{SymKey, Symbols};
 const PATCH: u64 = 64 << 20;
 /// The least room of a growing region of an incremental image.
 const ROOM: u64 = 64 << 10;
-/// Below this many pieces a comparison sort beats the radix sort's passes.
-const RADIX: usize = 256;
 
 /// Whether a class grows in place in an incremental link (else its new pieces go to a
 /// patch region, or it never grows).
@@ -208,12 +207,8 @@ fn prefix(symbols: &Symbols, sym: Sym) -> u64 {
 
 /// Sorts entries by key, then ties by their symbols' contents: a total order, so the result
 /// is the same whatever order they came in.
-fn sort_entries(symbols: &Symbols, entries: &mut Vec<Entry>) {
-    if entries.len() < RADIX {
-        entries.sort_unstable_by(|a, b| a.key.cmp(&b.key).then_with(|| symbols.cmp(a.sym, b.sym)));
-        return;
-    }
-    radix(entries);
+fn sort_entries(symbols: &Symbols, entries: &mut [Entry]) {
+    by_key(entries);
     let mut start = 0;
     while start < entries.len() {
         let key = entries[start].key;
@@ -225,48 +220,11 @@ fn sort_entries(symbols: &Symbols, entries: &mut Vec<Entry>) {
     }
 }
 
-/// A least-significant-digit radix sort of entries by key, a byte per pass, skipping the
-/// bytes every key has the same: stable, O(n) per pass.
-fn radix(entries: &mut Vec<Entry>) {
-    let (mut and, mut or) = ([u64::MAX; 4], [0u64; 4]);
-    for entry in entries.iter() {
-        for word in 0..4 {
-            and[word] &= entry.key[word];
-            or[word] |= entry.key[word];
-        }
-    }
-    let mut other: Vec<Entry> = Vec::with_capacity(entries.len());
-    for word in (0..4).rev() {
-        let varies = and[word] ^ or[word];
-        for byte in 0..8 {
-            let shift = byte * 8;
-            if (varies >> shift) & 0xff == 0 {
-                continue;
-            }
-            let digit = |entry: &Entry| ((entry.key[word] >> shift) & 0xff) as usize;
-            let mut counts = [0usize; 256];
-            for entry in entries.iter() {
-                counts[digit(entry)] += 1;
-            }
-            let mut at = 0;
-            for count in &mut counts {
-                let here = *count;
-                *count = at;
-                at += here;
-            }
-            other.clear();
-            let spare = other.spare_capacity_mut();
-            for entry in entries.iter() {
-                let slot = &mut counts[digit(entry)];
-                spare[*slot].write(*entry);
-                *slot += 1;
-            }
-            // SAFETY: the counts are a permutation of 0..len (each digit's run starts where the
-            // previous ends and holds that many), so every slot below len was written once.
-            unsafe { other.set_len(entries.len()) };
-            std::mem::swap(entries, &mut other);
-        }
-    }
+/// Entries by key, stably: the 32-byte key's low half, then its high half (least significant
+/// first, so the second pass keeps the first's order among equal high halves).
+fn by_key(entries: &mut [Entry]) {
+    radix::sort_copy_by_key(entries, |it| radix::pack_64(it.key[2], it.key[3]));
+    radix::sort_copy_by_key(entries, |it| radix::pack_64(it.key[0], it.key[1]));
 }
 
 impl Stage<'_> {
@@ -343,7 +301,7 @@ impl Stage<'_> {
                 out.push((it, it, false));
             }
         }
-        for (name, symbol, data) in &self.new.resolved.exports {
+        for (name, symbol, data) in self.new.resolved.exports.iter() {
             if seen.insert(name) {
                 out.push((name, symbol, *data));
             }
@@ -719,13 +677,14 @@ mod tests {
             let entries: Vec<Entry> = (0..len)
                 .map(|at| {
                     let a = next();
-                    entry([NOT_IAT, (a & 3) << 32 | (a >> 60), 7, a & 0xff00_00ff_0000], at as u32, at as u32)
+                    let iat = if a & (1 << 20) == 0 { NOT_IAT } else { a >> 62 };
+                    entry([iat, (a & 3) << 32 | (a >> 60), 7 + ((a >> 40) & 1), a & 0xff00_00ff_0000], at as u32, at as u32)
                 })
                 .collect();
             let mut want = entries.clone();
             want.sort_by_key(|it| it.key);
             let mut got = entries;
-            radix(&mut got);
+            by_key(&mut got);
             let ids = |it: &[Entry]| it.iter().map(|e| e.id).collect::<Vec<_>>();
             assert_eq!(ids(&got), ids(&want), "{len} entries");
         }
@@ -759,7 +718,7 @@ mod tests {
         let mut entries: Vec<Entry> =
             syms.iter().rev().enumerate().map(|(at, sym)| entry([1, 2, 3, prefix(&symbols, *sym)], sym.0, at as u32)).collect();
         let mut many = entries.clone();
-        while many.len() < RADIX {
+        while many.len() <= radix::SMALL {
             let base = many.len() as u32;
             many.extend(entries.iter().map(|it| Entry { id: it.id + base, ..*it }));
         }

@@ -18,7 +18,6 @@ mod well_known;
 
 use std::borrow::Cow;
 
-use rustc_hash::FxHashSet;
 use syntax::Edition;
 
 use super::{Emitted, Pass, Walk};
@@ -40,6 +39,8 @@ pub struct CheckCfg {
     exhaustive_names: bool,
     /// The names given, in the order first given, with their values.
     expecteds: Vec<(String, Values)>,
+    /// The `--cfg`s given, each once, in the order first given.
+    cfgs: Vec<(String, Option<String>)>,
     /// rustc is run by cargo (`CARGO_CRATE_NAME` is set), as it is under blaze: the lint's help
     /// says what to write in `Cargo.toml` and `build.rs` rather than on the command line.
     pub cargo: bool,
@@ -67,6 +68,16 @@ impl CheckCfg {
     /// which names are keywords).
     pub fn add_in(&mut self, spec: &str, edition: Edition) -> Result<(), String> {
         self.add_diag(spec, edition).map_err(|it| rendered(&it))
+    }
+
+    /// One `--cfg` value, as rustc parses it for a crate of `edition`; the error is rustc's,
+    /// as it writes it. `explicit_builtin_cfgs_in_flags` lints those that set a cfg rustc sets.
+    pub fn add_cfg(&mut self, spec: &str, edition: Edition) -> Result<(), String> {
+        let cfg = parse_cfg(spec, edition)?;
+        if !self.cfgs.contains(&cfg) {
+            self.cfgs.push(cfg);
+        }
+        Ok(())
     }
 
     /// Whether any `--check-cfg` was given.
@@ -206,8 +217,12 @@ impl CheckCfg {
             };
             match self.expecteds.iter_mut().find(|(it, _)| it == name) {
                 None => self.expecteds.push((name.to_owned(), given())),
-                Some((_, expected)) => match expected {
-                    Values::Some(old) if !values_any_specified => {
+                Some((_, expected)) => {
+                    if values_any_specified {
+                        if matches!(expected, Values::Some(_)) {
+                            *expected = Values::Any;
+                        }
+                    } else if let Values::Some(old) = expected {
                         for value in &values {
                             let value = value.as_deref().map(str::to_owned);
                             if !old.contains(&value) {
@@ -215,9 +230,7 @@ impl CheckCfg {
                             }
                         }
                     }
-                    Values::Some(_) => *expected = Values::Any,
-                    Values::Any => {}
-                },
+                }
             }
         }
         Ok(())
@@ -287,7 +300,7 @@ pub(crate) fn parse_cfg_diag(spec: &str, edition: Edition) -> Result<(String, Op
 /// What this module lints: `explicit_builtin_cfgs_in_flags` of each `--cfg`, as the session is
 /// made, then `unexpected_cfgs` as expansion reads each cfg, when a `--check-cfg` was given.
 pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> Vec<Emitted> {
-    let mut emitted = builtin_cfgs(cx, cmd, walk);
+    let mut emitted = builtin_cfgs(cx, &cmd.check_cfg, walk);
     if cmd.check_cfg.is_given() {
         emitted.extend(unexpected::lints(cx, &cmd.check_cfg, walk));
     }
@@ -295,23 +308,16 @@ pub(crate) fn lints(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> Vec<
 }
 
 /// rustc's `disallow_cfgs`: a `--cfg` setting a cfg rustc sets itself, buffered for the crate.
-/// A `--cfg` rustc cannot read was refused as the command line was read.
-fn builtin_cfgs(cx: &Cx<'_, '_>, cmd: &CommandLine, walk: &Walk<'_>) -> Vec<Emitted> {
+fn builtin_cfgs(cx: &Cx<'_, '_>, check: &CheckCfg, walk: &Walk<'_>) -> Vec<Emitted> {
     let mut emitted = Vec::new();
-    if cmd.cfg.is_empty() {
+    if check.cfgs.is_empty() {
         return emitted;
     }
     let root = cx.krate.root_module(cx.db).definition_source_file_id(cx.db);
     let Some(tree) = walk.tree(root) else { return emitted };
     let at = tree.ptr(&tree.root);
-    let mut seen: FxHashSet<(String, Option<String>)> = FxHashSet::default();
-    for spec in &cmd.cfg {
-        let Ok(cfg) = parse_cfg_diag(spec, cx.edition) else { continue };
-        if !seen.insert(cfg.clone()) {
-            continue;
-        }
-        let (name, value) = cfg;
-        let Some(controlled_by) = controlled_by(&name, value.as_deref()) else { continue };
+    for (name, value) in &check.cfgs {
+        let Some(controlled_by) = controlled_by(name, value.as_deref()) else { continue };
         let shown = match &value {
             Some(value) => format!(r#"{name}="{value}""#),
             None => name.clone(),

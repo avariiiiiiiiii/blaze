@@ -704,7 +704,7 @@ impl<'db> Resolver<'db> {
                 res.add(name, ScopeDef::ModuleDef(ModuleDefId::MacroId(mac)));
             })
         });
-        def_map.macro_use_prelude().iter().sorted_by_key(|&(k, _)| k.clone()).for_each(
+        def_map.macro_use_prelude().iter().sorted_by(|a, b| a.0.cmp(b.0)).for_each(
             |(name, &(def, _extern_crate))| {
                 res.add(name, ScopeDef::ModuleDef(def.into()));
             },

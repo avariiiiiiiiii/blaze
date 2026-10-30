@@ -8,7 +8,7 @@ use syntax::{AstNode, SyntaxKind, ast};
 
 use crate::{check::Cx, conf::Version, diag::Applicability};
 
-const LINT: &str = "redundant_static_lifetimes";
+const LINT: super::Implemented = super::Implemented::RedundantStaticLifetimes;
 
 /// clippy's `msrvs::STATIC_IN_CONST`.
 const STATIC_IN_CONST: Version = Version(1, 17, 0);

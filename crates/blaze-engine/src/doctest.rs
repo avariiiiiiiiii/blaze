@@ -1385,7 +1385,7 @@ fn run(
         counted.refused.load(Ordering::Relaxed),
     );
     let mut ended = ended.into_inner().unwrap_or_else(|it| it.into_inner());
-    ended.sort_by_key(|(at, _)| *at);
+    blaze_ids::radix::sort_by_key(&mut ended, |(at, _)| *at);
     let (mut passed, mut ignored, mut failed) = (0, 0, Vec::new());
     for (at, result) in ended {
         match result {

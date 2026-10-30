@@ -537,10 +537,10 @@ impl Program {
     }
 
     fn tell(&mut self, record: &Record) {
-        match blaze_protocol::cbor::to_vec(record) {
-            Ok(item) => {
-                self.told_last = self.told.len();
-                self.told.extend_from_slice(&item);
+        let at = self.told.len();
+        match blaze_protocol::cbor::append(&mut self.told, record) {
+            Ok(()) => {
+                self.told_last = at;
                 self.told_count += 1;
                 self.appended += 1;
             }

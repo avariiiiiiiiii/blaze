@@ -6,8 +6,7 @@
 //! up, each request still running ends with an error naming the socket.
 
 use std::{
-    collections::BTreeMap,
-    io::{Read, Write},
+    io::Write,
     net::Shutdown,
     os::unix::net::UnixStream,
     sync::{Arc, PoisonError, mpsc},
@@ -21,6 +20,7 @@ use blaze_api::{
 };
 use blaze_ids::ContentId;
 use blaze_vfs::{Op, View};
+use rustc_hash::FxHashMap;
 
 use super::{EMPTY_HEAD, MOST_BATCH, Shared, api_error, batches, pins, said_or};
 use crate::{
@@ -57,12 +57,13 @@ struct Worker {
     /// Ids increase over every connection the job makes, so a late frame of an old one can't be
     /// taken for a new request's.
     next_id: u64,
-    running: BTreeMap<u64, RunId>,
+    /// Sorted by id where it is walked, so cancels and failures go out in request order.
+    running: FxHashMap<u64, RunId>,
 }
 
 impl Worker {
     fn new(job: JobId, shared: Arc<Shared>, me: mpsc::Sender<Command>) -> Worker {
-        Worker { job, shared, me, stream: None, next_id: 1, running: BTreeMap::new() }
+        Worker { job, shared, me, stream: None, next_id: 1, running: FxHashMap::default() }
     }
 
     fn run(mut self, commands: &mpsc::Receiver<Command>) {
@@ -79,7 +80,8 @@ impl Worker {
                     Err(what) => self.fail(run, what),
                 },
                 Command::Cancel => {
-                    let ids: Vec<u64> = self.running.keys().copied().collect();
+                    let mut ids: Vec<u64> = self.running.keys().copied().collect();
+                    ids.sort_unstable();
                     for id in ids {
                         // A connection that broke is reported by the reader as `Lost`.
                         let _ = self.send(Request::Cancel { id });
@@ -100,7 +102,9 @@ impl Worker {
                 }
                 Command::Lost(why) => {
                     self.stream = None;
-                    for (_, run) in std::mem::take(&mut self.running) {
+                    let mut lost: Vec<(u64, RunId)> = std::mem::take(&mut self.running).into_iter().collect();
+                    lost.sort_unstable_by_key(|&(id, _)| id);
+                    for (_, run) in lost {
                         self.fail(run, why.clone());
                     }
                 }
@@ -149,24 +153,22 @@ impl Worker {
 /// Reads the connection's responses until it ends.
 fn read(mut stream: UnixStream, socket: &str, to: &mpsc::Sender<Command>) {
     let mut frames = Frames::new();
-    let mut buffer = vec![0; 64 << 10];
     loop {
-        let read = match stream.read(&mut buffer) {
+        let most = frames.wanted(64 << 10);
+        match frames.fill(&mut stream, most) {
             Ok(0) => {
                 let _ = to.send(Command::Lost(format!("the daemon at {socket} hung up")));
                 return;
             }
-            Ok(read) => read,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Ok(_) => {}
             Err(error) => {
                 let _ = to.send(Command::Lost(format!("reading from the daemon at {socket} failed: {error}")));
                 return;
             }
-        };
-        frames.push(&buffer[..read]);
+        }
         loop {
-            match frames.next() {
-                Ok(Some(item)) => match frames::decode::<Response>(&item) {
+            match frames.next_ref() {
+                Ok(Some(item)) => match frames::decode::<Response>(item) {
                     Ok(envelope) => {
                         if to.send(Command::Received(envelope)).is_err() {
                             return;

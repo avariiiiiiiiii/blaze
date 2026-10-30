@@ -121,6 +121,13 @@ where
                 return result;
             }
 
+            if memo
+                .header
+                .deep_verify_unclaimed(zalsa, db.into(), database_key_index, 0)
+            {
+                return memo.header.verify_result_after(revision);
+            }
+
             if let Some(result) = self.maybe_changed_after_cold(
                 zalsa,
                 zalsa_local,
@@ -273,7 +280,121 @@ where
     }
 }
 
+impl<C> IngredientImpl<C>
+where
+    C: Configuration,
+{
+    /// [`Ingredient::verify_unclaimed`](crate::ingredient::Ingredient::verify_unclaimed) for a
+    /// function: the hot check, then the claim-free walk of the memo's edges.
+    pub(super) fn verify_memo_unclaimed(
+        &self,
+        zalsa: &Zalsa,
+        db: RawDatabase<'_>,
+        id: Id,
+        revision: Revision,
+        depth: u32,
+    ) -> Option<VerifyResult> {
+        let memo_ingredient_index = self.memo_ingredient_index(zalsa, id);
+        let database_key_index = self.database_key_index(id);
+        let Some(memo) = self.get_memo_from_table_for(zalsa, id, memo_ingredient_index) else {
+            return Some(VerifyResult::changed());
+        };
+        if let Some(result) = memo.header.maybe_changed_after_hot(
+            zalsa,
+            database_key_index,
+            revision,
+            #[cfg(feature = "detailed-trace")]
+            memo.value.is_some(),
+        ) {
+            return Some(result);
+        }
+        memo.header
+            .deep_verify_unclaimed(zalsa, db, database_key_index, depth)
+            .then(|| memo.header.verify_result_after(revision))
+    }
+}
+
+/// How deep the claim-free walk goes before it leaves the rest to a claimed check, so the stack
+/// stays bounded on a long chain of memos.
+const UNCLAIMED_DEPTH: u32 = 256;
+
 impl MemoHeader {
+    /// What a reader verified at `revision` learns from this memo, now verified.
+    #[inline]
+    fn verify_result_after(&self, revision: Revision) -> VerifyResult {
+        if self.revisions.changed_at > revision {
+            VerifyResult::changed()
+        } else {
+            VerifyResult::unchanged_for_memo(&self.revisions)
+        }
+    }
+
+    /// Verifies the memo by its edges with no claim (rustc's `try_mark_green`): true when every
+    /// input is unchanged, and the memo is then marked verified. False when it can't be decided
+    /// without a claim: the memo is (or was) part of a cycle, has outputs to mark, read untracked
+    /// state, or an input changed or may have to run. Only reads and the idempotent stores of a
+    /// verification (`verified_at`, the accumulated-inputs flag) happen here, so two tasks
+    /// walking the same memo agree, and one running it under a claim sees the same inputs.
+    pub(super) fn deep_verify_unclaimed(
+        &self,
+        zalsa: &Zalsa,
+        db: RawDatabase<'_>,
+        database_key_index: DatabaseKeyIndex,
+        depth: u32,
+    ) -> bool {
+        if depth >= UNCLAIMED_DEPTH
+            || self.may_be_provisional()
+            || self.was_cycle_participant()
+            || !self.cycle_heads().is_empty()
+        {
+            return false;
+        }
+        let QueryOriginRef::Derived(edges) = self.origin(zalsa.graph()) else {
+            return false;
+        };
+        let verified_at = self.verified_at.load();
+        #[cfg(feature = "accumulator")]
+        let mut inputs = InputAccumulatedValues::Empty;
+
+        for (position, edge) in edges.iter().enumerate() {
+            if edge.kind() == QueryEdgeKind::Output {
+                return false;
+            }
+            let dependency_index = edge.key();
+            // SAFETY: `db` is the database every ingredient of `zalsa` was created with.
+            let mut result = unsafe {
+                zalsa
+                    .lookup_ingredient(dependency_index.ingredient_index())
+                    .verify_unclaimed(
+                        zalsa,
+                        db,
+                        dependency_index.key_index(),
+                        verified_at,
+                        depth + 1,
+                    )
+            };
+            if let Some(VerifyResult::Changed) = result
+                && let Some(saw) = self.revisions.edge_fingerprint(position)
+                && let Some(unchanged) =
+                    unchanged_by_fingerprint(zalsa, dependency_index, saw, &self.revisions)
+            {
+                result = Some(unchanged);
+            }
+            match result {
+                #[cfg(feature = "accumulator")]
+                Some(VerifyResult::Unchanged { accumulated }) => inputs |= accumulated,
+                #[cfg(not(feature = "accumulator"))]
+                Some(VerifyResult::Unchanged { .. }) => {}
+                Some(VerifyResult::Changed) | None => return false,
+            }
+        }
+
+        #[cfg(feature = "accumulator")]
+        self.revisions.accumulated_inputs.store(inputs);
+        self.mark_as_verified(zalsa, database_key_index);
+        true
+    }
+
     fn maybe_changed_after_hot(
         &self,
         zalsa: &Zalsa,
@@ -475,7 +596,7 @@ impl MemoHeader {
         let zalsa = claim_guard.zalsa();
         let database_key_index = claim_guard.database_key_index();
 
-        match self.origin() {
+        match self.origin(zalsa.graph()) {
             QueryOriginRef::Derived(edges) => {
                 #[cfg(feature = "detailed-trace")]
                 crate::tracing::debug!(

@@ -24,9 +24,9 @@
 //! reads the store, and what it keeps it leaves in its worker's own buffer for the store's
 //! owner ([`puts`]); its statistics are its worker's ([`tally`]).
 //!
-//! A macro of a crate blaze has a native expander for ([`native`]) is expanded by it, and not
-//! kept: `BLAZE_NATIVE_MACROS=verify` expands it both ways and fails the expansion where they
-//! differ; `BLAZE_NATIVE_MACROS=off` uses none.
+//! [`native`] is blaze's in-process proc-macro bridge, the `proc_macro` a macro's own code runs
+//! against and the host that answers it, for the proc macros that run on blaze's own compiler
+//! (docs/v2/plan/design/compile-time.md, change 20, lane fastcompile). Nothing here calls it.
 //!
 //! [`compare`] holds the toolchain's server against blaze's, and keeps nothing while it does.
 
@@ -67,23 +67,12 @@ pub const LIBRARY: &str = "blaze v2 proc-macro library 1";
 
 /// The variable that says to check kept expansions.
 pub const CACHE: &str = "BLAZE_PROC_MACRO_CACHE";
-
-/// The variable that says how native expanders are used.
-pub const NATIVE: &str = "BLAZE_NATIVE_MACROS";
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     /// What is found is used.
     Keep,
     /// What is found is expanded again and compared.
     Check,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Native {
-    On,
-    Verify,
-    Off,
 }
 
 impl Mode {
@@ -96,20 +85,6 @@ impl Mode {
                 "{CACHE}={other:?} is not a mode: every expansion that can be kept is, and \
                  `check` expands what was kept again and compares"
             )),
-        }
-    }
-}
-
-impl Native {
-    /// The use `value` of [`NATIVE`] says.
-    pub fn of(value: Option<&str>) -> Result<Native, String> {
-        match value {
-            None => Ok(Native::On),
-            Some("verify") => Ok(Native::Verify),
-            Some("off") => Ok(Native::Off),
-            Some(other) => {
-                Err(format!("{NATIVE}={other:?} is not `verify` or `off` (or unset, to use them)"))
-            }
         }
     }
 }
@@ -128,7 +103,6 @@ pub struct Expansions {
 struct Installed {
     expansions: Expansions,
     mode: Mode,
-    native: Native,
 }
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
@@ -143,8 +117,7 @@ enum Lookup {
 }
 
 /// Keeps every proc-macro expansion of the workspaces loaded from here on in `expansions`.
-/// Says why not when [`CACHE`] or [`NATIVE`] has a value that is not one, or it was installed
-/// before.
+/// Says why not when [`CACHE`] has a value that is not a mode, or it was installed before.
 pub fn install(expansions: Expansions) -> Result<(), String> {
     let var = |name: &str| match std::env::var(name) {
         Ok(value) => Ok(Some(value)),
@@ -152,8 +125,7 @@ pub fn install(expansions: Expansions) -> Result<(), String> {
         Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} is not UTF-8")),
     };
     let mode = Mode::of(var(CACHE)?.as_deref())?;
-    let native = Native::of(var(NATIVE)?.as_deref())?;
-    let installed = Installed { expansions, mode, native };
+    let installed = Installed { expansions, mode };
     INSTALLED.set(installed).map_err(|_| "proc-macro expansions were installed twice".to_owned())?;
     load_cargo::wrap_expanders(wrap);
     Ok(())
@@ -181,11 +153,7 @@ fn wrap(
     name: &str,
     kind: ProcMacroKind,
 ) -> Arc<dyn ProcMacroExpander> {
-    let native = match installed().native {
-        Native::Off => Ok(None),
-        Native::On | Native::Verify => native::find(dylib, name, kind),
-    };
-    Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind, native })
+    Arc::new(Kept { inner, dylib: Dylib::at(dylib), name: name.into(), kind })
 }
 
 /// A library of proc macros, hashed the first time one of its macros expands.
@@ -225,8 +193,6 @@ struct Kept {
     dylib: Arc<Dylib>,
     name: Box<str>,
     kind: ProcMacroKind,
-    /// Its native expander, when blaze has one for it, or why finding one failed.
-    native: Result<Option<native::Macro>, String>,
 }
 
 /// A span as a key or a value has it: its byte range, and the numbers of its anchor and its
@@ -560,40 +526,6 @@ impl ProcMacroExpander for Kept {
             );
             return self.failed(expanded);
         }
-        let native = match &self.native {
-            Ok(native) => native.as_ref(),
-            Err(why) => return Err(self.error(format!("its native expander: {why}"))),
-        };
-        if let Some(native) = native {
-            let start = Instant::now();
-            let natively =
-                native.expand(db, subtree, attrs, env, def_site, call_site, mixed_site);
-            count(Counted::Native, start.elapsed());
-            if installed().native != Native::Verify {
-                return natively;
-            }
-            let normally = self.kept(
-                db,
-                subtree,
-                attrs,
-                env,
-                def_site,
-                call_site,
-                mixed_site,
-                current_dir,
-            )?;
-            let natively = natively.map_err(|error| {
-                self.error(format!("{NATIVE}=verify: its native expander failed: {error:?}"))
-            })?;
-            if let Some(difference) = native::difference(&natively, &normally) {
-                return Err(self.error(format!(
-                    "{NATIVE}=verify: its native expander's output differs from the macro's: \
-                     {difference}"
-                )));
-            }
-            count(Counted::Verified, Duration::ZERO);
-            return Ok(normally);
-        }
         if compare::enabled() {
             let expanded = self.inner.expand(
                 db,
@@ -692,10 +624,6 @@ enum Counted {
     Found,
     /// Expanded again under `check`, and the same as kept.
     Checked,
-    /// Expanded by a native expander.
-    Native,
-    /// Expanded both ways under `verify`, and the same.
-    Verified,
     /// Left for the store's owner to keep ([`puts`]).
     Kept,
     Asked,
@@ -736,15 +664,13 @@ fn counted(what: Counted) -> (u64, f64) {
 pub fn report() -> Option<String> {
     let (expanded, expanding) = counted(Counted::Expanded);
     let (found, finding) = counted(Counted::Found);
-    let (native, natively) = counted(Counted::Native);
-    if expanded + found + native == 0 {
+    if expanded + found == 0 {
         return None;
     }
     let (_, keying) = counted(Counted::Keyed);
     let mut said = format!(
         "proc macros: {expanded} expanded in {expanding:.2}s, {found} from the store in \
-         {finding:.2}s, {keying:.2}s to key and look for them, {native} natively in \
-         {natively:.2}s"
+         {finding:.2}s, {keying:.2}s to key and look for them"
     );
     let kinds = [
         ("derives", Counted::Derives),
@@ -764,7 +690,6 @@ pub fn report() -> Option<String> {
     let rest = [
         ("kept", Counted::Kept),
         ("checked against what was kept", Counted::Checked),
-        ("verified against their native expander", Counted::Verified),
         ("not kept, as they asked the database", Counted::Asked),
         ("not kept, as their output has spans the call has not", Counted::Unspanned),
         ("not kept, as their server traces nothing (BLAZE_SANDBOX=off)", Counted::Untraced),
@@ -779,9 +704,6 @@ pub fn report() -> Option<String> {
     }
     if let Some(compared) = compare::report() {
         said += &format!("; {compared}");
-    }
-    if let Some(native) = native::report() {
-        said += &format!("; {native}");
     }
     Some(said)
 }

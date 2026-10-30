@@ -4,6 +4,8 @@
 //! on (architecture, object format, calling convention, unwind tables) and never asks what
 //! the daemon itself was built for.
 
+#![forbid(unsafe_code)]
+
 use std::sync::OnceLock;
 
 use cranelift_codegen::{

@@ -5,6 +5,7 @@
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 
+use blaze_ids::radix;
 use blaze_resolve::{PackageId, SourceId, SourceKind};
 
 use crate::query::LoadError;
@@ -115,10 +116,6 @@ impl TargetKind {
             TargetKind::Lib(kinds) | TargetKind::ExampleLib(kinds) => kinds.clone(),
             _ => vec![CrateType::Bin],
         }
-    }
-
-    pub fn is_lib(&self) -> bool {
-        matches!(self, TargetKind::Lib(_))
     }
 
     pub fn is_bin(&self) -> bool {
@@ -640,12 +637,12 @@ pub(super) fn compute_metadata(input: &MetaInput<'_>, deps: &[Meta]) -> Result<M
 
     let mut c_metadata = shared.clone();
     let mut dep_metadata: Vec<UnitHash> = deps.iter().map(|it| UnitHash(it.c_metadata)).collect();
-    dep_metadata.sort();
+    radix::sort_copy_by_key(&mut dep_metadata, |it| it.0);
     dep_metadata.hash(&mut c_metadata);
 
     let mut unit_id = shared;
     let mut dep_ids: Vec<UnitHash> = deps.iter().map(|it| UnitHash(it.unit_id)).collect();
-    dep_ids.sort();
+    radix::sort_copy_by_key(&mut dep_ids, |it| it.0);
     dep_ids.hash(&mut unit_id);
     // `cargo rustc`'s extra arguments, which blaze never has.
     Vec::<String>::new().hash(&mut unit_id);

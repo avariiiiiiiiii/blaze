@@ -51,6 +51,7 @@ use std::{
     hash::{BuildHasherDefault, Hash, Hasher},
 };
 
+use blaze_ids::radix;
 use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -748,7 +749,7 @@ impl Batch {
         if self.order.len() < len {
             let mut cycle: Vec<NodeId> =
                 (0..len).filter(|&at| self.waiting[at] > 0).map(|at| nodes.id(at)).collect();
-            cycle.sort();
+            radix::sort_copy_by_key(&mut cycle, |it| it.0);
             self.order.clear();
             return Err(cycle);
         }
@@ -1140,7 +1141,9 @@ impl Plane {
         self.last_ns = at;
         self.dispatch(at, out, touched);
         let requests = &self.requests;
-        touched.sort_unstable_by_key(|&r| requests[r as usize].seq);
+        radix::sort_copy_by_key(touched, |&r| {
+            radix::pack_64(requests[r as usize].seq, u64::from(r))
+        });
         touched.dedup();
         for &r in touched.iter() {
             let request = &self.requests[r as usize];

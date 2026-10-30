@@ -235,6 +235,7 @@ pub struct Evaluator<'db> {
     /// much memory it can reach, its allocation does.
     stack_allocations: Vec<Allocated>,
     /// Every live block of the heap, by its offset in [`Self::heap`].
+    // BTreeMap: range queries by offset (the block an address is in).
     heap_blocks: BTreeMap<usize, HeapBlock>,
     /// The offsets of freed heap blocks, by size class and alignment, for the next block of
     /// that class and alignment.

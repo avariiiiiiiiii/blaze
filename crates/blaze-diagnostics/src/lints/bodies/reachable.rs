@@ -10,7 +10,7 @@
 //! `Diverges`) and MIR lowering's (`MirBody::unreachable_after_calls`).
 
 use hir::InFile;
-use hir_def::hir::{Expr, ExprId, Statement};
+use hir_def::hir::{Expr, ExprId, ExprOrPatId, Statement};
 use hir_ty::{Unreachable, UnreachableAt};
 use syntax::{AstNode, SyntaxNodePtr, ast};
 
@@ -51,8 +51,10 @@ pub(super) fn after_calls(b: &BodyCx<'_, '_>) -> Vec<Found> {
 
 fn lint(b: &BodyCx<'_, '_>, unreachable: &Unreachable) -> Option<Found> {
     let (kind, span, at) = place(b, &unreachable.what)?;
-    let after = b.source_map.expr_or_pat_syntax(unreachable.after).ok()?;
-    let after = b.cx.span_of(after.map(|it| it.syntax_node_ptr()));
+    let after = match unreachable.after {
+        ExprOrPatId::ExprId(expr) => b.expr_span(expr)?,
+        ExprOrPatId::PatId(pat) => b.pat_span(pat)?,
+    };
     let message = format!("unreachable {kind}");
     let mut diag = Diag::lint("unreachable_code", message.clone(), span.clone());
     diag.span_label(span, message);
@@ -66,8 +68,7 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
     let store = b.store();
     Some(match *what {
         UnreachableAt::Expr(expr) => {
-            let node = b.expr_node(expr)?;
-            ("expression", b.cx.span_of(node), node)
+            ("expression", b.expr_span(expr)?, b.expr_node(expr)?)
         }
         UnreachableAt::Call(expr) => {
             let node = b.expr_node(expr)?;
@@ -78,7 +79,7 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
                     let name = ast::MethodCallExpr::cast(call.value)?.name_ref()?;
                     b.cx.span(InFile::new(call.file_id, name.syntax().text_range()))
                 }
-                _ => b.cx.span_of(node),
+                _ => b.expr_span(expr)?,
             };
             ("call", span, node)
         }
@@ -90,8 +91,7 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
         UnreachableAt::Arm { match_expr, index } => {
             let Expr::Match { arms, .. } = store.expr(match_expr) else { return None };
             let body = arms.get(index as usize)?.expr;
-            let node = b.expr_node(body)?;
-            ("arm", b.cx.span_of(node), node)
+            ("arm", b.expr_span(body)?, b.expr_node(body)?)
         }
         UnreachableAt::IfBlock(if_expr) => {
             let Expr::If { condition, then_branch, .. } = store.expr(if_expr) else { return None };
@@ -99,8 +99,7 @@ fn place(b: &BodyCx<'_, '_>, what: &UnreachableAt) -> Option<(&'static str, Span
         }
         UnreachableAt::LetInit(let_expr) => {
             let Expr::Let { expr, .. } = store.expr(let_expr) else { return None };
-            let node = b.expr_node(expr)?;
-            ("block in `let` expression", b.cx.span_of(node), node)
+            ("block in `let` expression", b.expr_span(expr)?, b.expr_node(expr)?)
         }
     })
 }

@@ -14,6 +14,8 @@
 //! Dev builds only (Cranelift units with [`crate::settings::Spec::fold`]): a varying function
 //! becomes an indirect call in the body.
 
+#![forbid(unsafe_code)]
+
 use blaze_ids::{ContentId, Hasher};
 use serde::{Deserialize, Serialize};
 

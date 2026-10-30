@@ -286,6 +286,7 @@ fn normalize(path: &str) -> String {
 #[derive(Deserialize)]
 struct Checksums {
     package: Option<String>,
+    // BTreeMap: the check reports the first changed file in path order, the same on every run.
     files: BTreeMap<String, String>,
 }
 

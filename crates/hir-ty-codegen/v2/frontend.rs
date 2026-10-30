@@ -5,7 +5,7 @@
 use base_db::{Crate, CrateOrigin};
 use blaze_codegen::{
     CodegenError,
-    backend::{Address, Described, DescribedStatic, Frontend},
+    backend::{Address, Described, DescribedStatic, FrontRef, Frontend},
     plan::Origin,
 };
 use blaze_ids::{ContentId, Hasher};
@@ -20,8 +20,10 @@ use hir_ty::{
     next_solver::{DbInterner, GenericArgs, ParamEnv, TyKind},
 };
 use hir_ty_mir::mir::overflow::crate_checks_overflow;
+use rustc_hash::FxHashSet;
 use rustc_type_ir::inherent::{GenericArgs as _, IntoKind, SliceLike as _};
 use salsa::plumbing::FromId;
+use smallvec::{SmallVec, smallvec};
 
 use super::{Body, BuildTime, Hashes, HirInstance, HirStatic, Kind, refs, undescribed};
 use crate::{
@@ -114,6 +116,7 @@ impl<'db> HirFrontend<'db> {
         let overflow_checks = if generic { written_checks(db, &instance.0) } else { None };
         let symbol = symbol_of(db, &instance.0);
         let refs = refs::walk(db, instance, homes).map_err(fail)?;
+        let built_in = refs::built_in(db, instance).map_err(fail)?.to_vec();
         Ok(Described {
             item,
             code,
@@ -123,6 +126,7 @@ impl<'db> HirFrontend<'db> {
             address: if symbol.is_some() { Address::Significant } else { Address::Free },
             symbol,
             refs,
+            built_in,
         })
     }
 
@@ -191,6 +195,38 @@ impl Frontend for HirFrontend<'_> {
     ) -> Result<DescribedStatic<HirInstance, HirStatic>, CodegenError> {
         self.with(|db, homes| self.described_static(db, homes, value))
     }
+}
+
+/// The code hashes of the instances whose bodies the IR of `instance` builds in, at any depth,
+/// sorted, each once: its [`blaze_codegen::CompiledFunction::inlined`]. Nothing is allocated
+/// for one that builds nothing in, as nearly every one.
+pub(crate) fn inlined<'a>(
+    db: &'a dyn HirDatabase,
+    hashes: &dyn Hashes,
+    instance: &'a HirInstance,
+) -> Result<Vec<CodeHash>, String> {
+    let mut inlined = Vec::new();
+    let mut queue: SmallVec<[&HirInstance; 8]> = smallvec![instance];
+    let mut seen = FxHashSet::default();
+    while let Some(at) = queue.pop() {
+        let built_in = refs::built_in(db, at)?;
+        if built_in.is_empty() {
+            continue;
+        }
+        let refs = refs::walked(db, at)?;
+        for &place in built_in {
+            let Some(FrontRef::Function(callee)) = refs.get(place as usize) else {
+                return Err(format!("{at:?} builds in place {place}, which is no function"));
+            };
+            if seen.insert(callee) {
+                inlined.push(code_of(db, hashes, &callee.0)?);
+                queue.push(callee);
+            }
+        }
+    }
+    inlined.sort_unstable();
+    inlined.dedup();
+    Ok(inlined)
 }
 
 /// The body of a closure or coroutine, by its interned id.

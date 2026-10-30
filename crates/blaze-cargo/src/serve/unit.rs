@@ -132,7 +132,7 @@ impl Steps for Real {
         let mut files = Vec::new();
         library_files(&library.dir, "", &mut files)
             .map_err(|what| ApiError::new(what, Some(library.dir.display().to_string())))?;
-        files.sort_unstable_by(|a, b| a.path.as_bytes().cmp(b.path.as_bytes()));
+        blaze_ids::names::sort_by_name(&mut files, |it| it.path.as_bytes());
         Ok((blaze_units::stdlib::library_at(&library.commit), Source { files, under: String::new() }))
     }
 

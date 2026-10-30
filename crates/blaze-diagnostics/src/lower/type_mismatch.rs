@@ -64,7 +64,11 @@ pub(crate) fn lower(cx: &Cx<'_, '_>, d: &hir::TypeMismatch<'_>) -> Vec<Found> {
     {
         no_tail(cx, d, &node, block, &item, &ret)
     } else {
-        mismatch(cx, d, &node)
+        let mut diag = mismatch(cx, d, &node);
+        if !super::missing_fields::last_field_mismatch(cx, &node, &mut diag) {
+            return vec![];
+        }
+        diag
     };
     code_fact(cx, &mut diag, at);
     vec![Found::new(diag, Phase::Bodies)]

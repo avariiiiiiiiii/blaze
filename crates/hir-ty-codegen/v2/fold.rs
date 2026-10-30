@@ -18,6 +18,8 @@
 //! its arguments and its constants: a plain call and return, as Cranelift tail-calls only
 //! under `tail`, which no member is.
 
+#![forbid(unsafe_code)]
+
 use std::{
     cell::RefCell,
     hash::{Hash, Hasher as _},

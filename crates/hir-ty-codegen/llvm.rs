@@ -416,7 +416,9 @@ fn declared_only<'ctx>(module: &Module<'ctx>, function: FunctionValue<'ctx>) {
     let declaration =
         module.add_function(&name.to_string_lossy(), function.get_type(), Some(Linkage::External));
     function.replace_all_uses_with(declaration);
-    // SAFETY: nothing refers to the function any more.
+    // SAFETY: `function` is owned by `module`, and `replace_all_uses_with` just above left no
+    // use of it; `delete` erases and frees it, and this handle is not used after. A use left
+    // behind would point at freed memory.
     unsafe { function.delete() };
 }
 
@@ -604,7 +606,9 @@ fn imported<'ctx>(
         // A call of itself is of the body.
         if name == own_name {
             function.replace_all_uses_with(own);
-            // SAFETY: nothing refers to the declaration any more.
+            // SAFETY: `function` is owned by `imported` and is not `own` (filtered out above);
+            // `replace_all_uses_with(own)` just above left no use of it, and neither `names`
+            // nor the loop keeps it, so freeing it leaves nothing dangling.
             unsafe { function.delete() };
             continue;
         }
@@ -661,23 +665,33 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
                 if !matches!(opcode, InstructionOpcode::Call | InstructionOpcode::Invoke) {
                     continue;
                 }
-                // SAFETY: a call or an invoke is a call site.
+                // SAFETY: `instruction` is a call or an invoke (opcode checked just above)
+                // owned by `module`, which outlives this walk; `CallSiteValue` on anything
+                // else would read the wrong operand layout.
                 let call = unsafe { CallSiteValue::new(instruction.as_value_ref()) };
-                // SAFETY: the instruction is a call; what it calls may be any value. Not
-                // `get_called_fn_value`, which has no function for a call of another type.
+                // SAFETY: `instruction` is a live call or invoke of `module`, so it has a
+                // called operand, owned by `module` for this walk. Not `get_called_fn_value`,
+                // which has no function for a call of another type.
                 let callee = unsafe { core::LLVMGetCalledValue(instruction.as_value_ref()) };
+                // SAFETY: `callee` is the called operand just read, a value of `module` live
+                // for this walk; LLVMIsAFunction only reads its kind.
                 if unsafe { core::LLVMIsAFunction(callee) }.is_null() {
                     continue;
                 }
-                // SAFETY: it is a function.
+                // SAFETY: LLVMIsAFunction just above said `callee` is a function of `module`,
+                // live for `'ctx`; a non-function would make inkwell call function-only C APIs
+                // on it.
                 let Some(callee) = (unsafe { FunctionValue::new(callee) }) else { continue };
                 if callee.count_basic_blocks() == 0 {
                     continue;
                 }
-                // SAFETY: a call has the type it calls through.
-                let through = unsafe {
-                    FunctionType::new(core::LLVMGetCalledFunctionType(instruction.as_value_ref()))
-                };
+                // SAFETY: `instruction` is a live call or invoke of `module`; the type it is
+                // called through is owned by `context` and lives for `'ctx`.
+                let called =
+                    unsafe { core::LLVMGetCalledFunctionType(instruction.as_value_ref()) };
+                // SAFETY: `called` is a function type of `context`, which outlives `'ctx`; a
+                // non-function type would make `FunctionType` lie about its kind.
+                let through = unsafe { FunctionType::new(called) };
                 let ty = callee.get_type();
                 if through == ty {
                     continue;
@@ -705,14 +719,19 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
                 }
                 let made = match opcode {
                     InstructionOpcode::Invoke => {
-                        // SAFETY: an invoke has both.
-                        let (then, catch) = unsafe {
-                            let at = instruction.as_value_ref();
-                            (
-                                BasicBlock::new(core::LLVMGetNormalDest(at)),
-                                BasicBlock::new(core::LLVMGetUnwindDest(at)),
-                            )
-                        };
+                        let at = instruction.as_value_ref();
+                        // SAFETY: `at` is an invoke (this arm of the opcode match) of `module`,
+                        // live for this walk, and an invoke always has a normal destination.
+                        let then = unsafe { core::LLVMGetNormalDest(at) };
+                        // SAFETY: `then` is a block of `function`, owned by `module` for
+                        // `'ctx`; `BasicBlock::new` maps null to `None`.
+                        let then = unsafe { BasicBlock::new(then) };
+                        // SAFETY: `at` is a live invoke of `module`, which always has an
+                        // unwind destination.
+                        let catch = unsafe { core::LLVMGetUnwindDest(at) };
+                        // SAFETY: `catch` is a block of `function`, owned by `module` for
+                        // `'ctx`; null maps to `None`.
+                        let catch = unsafe { BasicBlock::new(catch) };
                         let (Some(then), Some(catch)) = (then, catch) else {
                             return Err(Unhandled::Shape("an invoke without its destinations"));
                         };
@@ -739,14 +758,17 @@ fn agree_calls<'ctx>(context: &'ctx Context, module: &Module<'ctx>) -> Result<()
                         made.add_attribute(loc, attribute);
                     }
                 }
-                // SAFETY: both are instructions.
+                // SAFETY: `made` is the call or invoke just built into `module`, an
+                // instruction owned by it for `'ctx`.
                 let made = unsafe { InstructionValue::new(made.as_value_ref()) };
-                unsafe {
-                    let location =
-                        debuginfo::LLVMInstructionGetDebugLoc(instruction.as_value_ref());
-                    if !location.is_null() {
-                        debuginfo::LLVMInstructionSetDebugLoc(made.as_value_ref(), location);
-                    }
+                // SAFETY: `instruction` is a live instruction of `module`; its location is
+                // metadata owned by `context`, which outlives the module.
+                let location =
+                    unsafe { debuginfo::LLVMInstructionGetDebugLoc(instruction.as_value_ref()) };
+                if !location.is_null() {
+                    // SAFETY: `made` is the instruction just built in `module`, and `location`
+                    // non-null metadata of the same context, which outlives both.
+                    unsafe { debuginfo::LLVMInstructionSetDebugLoc(made.as_value_ref(), location) };
                 }
                 instruction.replace_all_uses_with(&made);
                 instruction.erase_from_basic_block();
@@ -774,7 +796,9 @@ fn unshow<'ctx>(module: &Module<'ctx>, shown: &FxHashMap<u32, FunctionValue<'ctx
         });
         let address = body.as_global_value().as_pointer_value();
         address.replace_all_uses_with(function.as_global_value().as_pointer_value());
-        // SAFETY: nothing refers to the body any more.
+        // SAFETY: `body` is owned by `module`, and `replace_all_uses_with` just above sent every
+        // use of its address to `function`; this loop reads each body once and the caller does
+        // not read `shown` after `unshow`, so freeing it leaves nothing dangling.
         unsafe { body.delete() };
     }
 }
@@ -922,14 +946,16 @@ fn diagnosed() -> Context {
         _: *mut core::ffi::c_void,
     ) {
         use inkwell::llvm_sys::{LLVMDiagnosticSeverity, core as llvm};
-        // SAFETY: LLVM passes a diagnostic that lives through the call; the description is
-        // a message of its own that is disposed of here.
-        let (severity, text) = unsafe {
-            let message = llvm::LLVMGetDiagInfoDescription(info);
-            let text = std::ffi::CStr::from_ptr(message).to_string_lossy().into_owned();
-            llvm::LLVMDisposeMessage(message);
-            (llvm::LLVMGetDiagInfoSeverity(info), text)
-        };
+        // SAFETY: LLVM passes `info`, a diagnostic it owns that lives through this call; the
+        // description is a new message this handler owns.
+        let message = unsafe { llvm::LLVMGetDiagInfoDescription(info) };
+        // SAFETY: `message` is the NUL-terminated string LLVM just allocated, live until
+        // disposed of below.
+        let text = unsafe { std::ffi::CStr::from_ptr(message) }.to_string_lossy().into_owned();
+        // SAFETY: `message` was allocated by LLVM for this handler and is not read after this.
+        unsafe { llvm::LLVMDisposeMessage(message) };
+        // SAFETY: `info` lives through this call.
+        let severity = unsafe { llvm::LLVMGetDiagInfoSeverity(info) };
         match severity {
             LLVMDiagnosticSeverity::LLVMDSError => DIAGNOSED.with_borrow_mut(|it| it.push(text)),
             LLVMDiagnosticSeverity::LLVMDSWarning => eprintln!("LLVM warning: {text}"),
@@ -937,7 +963,8 @@ fn diagnosed() -> Context {
         }
     }
     let context = Context::create();
-    // SAFETY: the handler is a function for the life of the process and takes no context.
+    // SAFETY: `context` was just created and is owned here; `handle` is a `'static` function
+    // that takes no context pointer, so the null one it is given is never read.
     unsafe {
         inkwell::llvm_sys::core::LLVMContextSetDiagnosticHandler(
             context.raw(),
@@ -956,7 +983,9 @@ struct Kept(std::ptr::NonNull<LLVMBlazeOpaquePasses>);
 
 impl Kept {
     fn of(machine: &TargetMachine) -> Kept {
-        // SAFETY: the machine outlives what is made for it: [`Machinery`] drops this first.
+        // SAFETY: `machine` is a live target machine; `Machinery` declares `passes` before
+        // `machine`, so this object is dropped before the machine it points to. Dropped after,
+        // its pipelines would use a freed machine.
         let made = unsafe { LLVMBlazeCreatePasses(machine.as_mut_ptr()) };
         Kept(std::ptr::NonNull::new(made).expect("LLVM made no passes"))
     }
@@ -966,8 +995,10 @@ impl Kept {
     /// and nothing else set.
     fn run(&self, module: &Module<'_>, passes: &str, slp: bool) -> Result<(), Unhandled> {
         use inkwell::llvm_sys::error::{LLVMDisposeErrorMessage, LLVMGetErrorMessage};
-        // SAFETY: `self` is used by its one thread, with modules of the context it is bound to
-        // (the wrapper refuses another); the text is read for its length, during the call.
+        // SAFETY: `self.0` is live until `Drop`, and `Kept` is `!Send` (a `NonNull`), so only
+        // the thread that made it uses it; `module` is live for the call and the wrapper
+        // refuses one of another context (`vendor/llvm-sys/wrappers/passes.cpp`); `passes` is
+        // read for `passes.len()` bytes during the call only.
         let failed = unsafe {
             LLVMBlazeRunPasses(
                 self.0.as_ptr(),
@@ -980,20 +1011,22 @@ impl Kept {
         if failed.is_null() {
             return Ok(());
         }
-        // SAFETY: an error LLVM gave, taken once; its message is disposed of once read.
-        let message = unsafe {
-            let message = LLVMGetErrorMessage(failed);
-            let text = std::ffi::CStr::from_ptr(message).to_string_lossy().into_owned();
-            LLVMDisposeErrorMessage(message);
-            text
-        };
+        // SAFETY: `failed` is the non-null error LLVMBlazeRunPasses just returned, owned here;
+        // LLVMGetErrorMessage consumes it and returns a message this code owns.
+        let raw = unsafe { LLVMGetErrorMessage(failed) };
+        // SAFETY: `raw` is NUL-terminated and live until disposed of below.
+        let message = unsafe { std::ffi::CStr::from_ptr(raw) }.to_string_lossy().into_owned();
+        // SAFETY: `raw` came from LLVMGetErrorMessage, is disposed of once and not read after.
+        unsafe { LLVMDisposeErrorMessage(raw) };
         Err(Unhandled::Llvm(message))
     }
 }
 
 impl Drop for Kept {
     fn drop(&mut self) {
-        // SAFETY: made by `LLVMBlazeCreatePasses`, disposed of once.
+        // SAFETY: `self.0` was made by `LLVMBlazeCreatePasses` and `Kept` is not `Clone`, so
+        // this is its one disposal; the machine it was made for is still live (field order of
+        // `Machinery`).
         unsafe { LLVMBlazeDisposePasses(self.0.as_ptr()) }
     }
 }
@@ -1158,7 +1191,7 @@ fn told_constants<'ctx>(
                 .iter()
                 .map(|&(offset, target, addend)| (offset as usize, target.as_u32(), addend))
                 .collect();
-            relocs.sort_unstable_by_key(|it| it.0);
+            blaze_ids::radix::sort_copy_by_key(&mut relocs, |it| it.0);
             let fits = relocs.iter().all(|it| readonly.contains_key(&it.1))
                 && relocs.windows(2).all(|it| it[0].0 + pointer <= it[1].0)
                 && relocs.last().is_none_or(|it| it.0 + pointer <= blob.bytes.len());
@@ -1166,7 +1199,7 @@ fn told_constants<'ctx>(
                 .then_some((index, blob, relocs))
         })
         .collect();
-    told.sort_unstable_by_key(|it| it.0);
+    blaze_ids::radix::sort_by_key(&mut told, |it| it.0);
     let mut globals = Vec::with_capacity(told.len());
     for (index, blob, relocs) in &told {
         let mut fields: Vec<BasicTypeEnum<'ctx>> = Vec::new();
@@ -1209,7 +1242,9 @@ fn told_constants<'ctx>(
             let address = target.as_pointer_value();
             let address = match addend {
                 0 => address,
-                // SAFETY: a constant expression of an address `addend` bytes into the object.
+                // SAFETY: `address` is a global of `module` and the index an `i64` constant of
+                // `context`, so this builds a constant expression owned by `context`; not
+                // `inbounds`, so any `addend` is defined.
                 _ => unsafe {
                     address.const_gep(i8, &[context.i64_type().const_int(addend as u64, true)])
                 },

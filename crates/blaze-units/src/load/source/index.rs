@@ -13,6 +13,7 @@ use blaze_resolve::{
     DepKind, Dependency, IndexSummary, InternedString, PackageId, Platform, RustVersion, SourceId,
     Summary,
 };
+use rustc_hash::FxHashMap;
 use semver::{Version, VersionReq};
 use serde::Deserialize;
 use serde::de::{self, Deserializer};
@@ -27,8 +28,9 @@ pub(crate) struct IndexEntry {
     pub name: String,
     pub version: Version,
     pub deps: Vec<IndexDependency>,
-    /// `features` with `features2` added, as cargo adds them.
-    pub features: BTreeMap<String, Vec<String>>,
+    /// `features` with `features2` added, as cargo adds them. Unordered: the summary made of
+    /// the entry sorts them.
+    pub features: FxHashMap<String, Vec<String>>,
     /// The sha256 of the `.crate` file, in hex.
     pub checksum: String,
     pub links: Option<String>,
@@ -85,8 +87,8 @@ struct IndexPackage {
     vers: Version,
     deps: Vec<RegistryDependency>,
     #[serde(default)]
-    features: BTreeMap<String, Vec<String>>,
-    features2: Option<BTreeMap<String, Vec<String>>>,
+    features: FxHashMap<String, Vec<String>>,
+    features2: Option<FxHashMap<String, Vec<String>>>,
     cksum: String,
     yanked: Option<bool>,
     links: Option<String>,
@@ -206,7 +208,7 @@ pub(crate) fn parse_line(line: &[u8]) -> anyhow::Result<IndexLine> {
                 name,
                 version: vers,
                 deps: Vec::new(),
-                features: BTreeMap::new(),
+                features: FxHashMap::default(),
                 checksum: String::new(),
                 links: None,
                 rust_version,

@@ -18,7 +18,7 @@ use hir_ty::{
     InferBodyId,
     db::{HirDatabase, InternedClosureId},
 };
-use hir_ty_mir::mir::{MirBody, MirOptLevel, closure_path_suffix, impl_written_at, print_mir_body};
+use hir_ty_mir::mir::{MirBody, MirOptLevel, MirOptions, closure_path_suffix, impl_written_at, print_mir_body};
 use ide_db::RootDatabase;
 use rustc_hash::FxHashSet;
 
@@ -154,7 +154,7 @@ impl<'a> Dump<'a> {
             return runtime.ok();
         }
         let start = Instant::now();
-        let optimized = db.optimized_mir_body(def, self.level);
+        let optimized = db.optimized_mir_body(def, MirOptions::at(self.level));
         self.timing.optimized += start.elapsed();
         optimized.ok()
     }
@@ -173,7 +173,7 @@ impl<'a> Dump<'a> {
             return runtime.ok();
         }
         let start = Instant::now();
-        let optimized = db.optimized_mir_body_for_closure(closure, self.level);
+        let optimized = db.optimized_mir_body_for_closure(closure, MirOptions::at(self.level));
         self.timing.optimized += start.elapsed();
         optimized.ok()
     }

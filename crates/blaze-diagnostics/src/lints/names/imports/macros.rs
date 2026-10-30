@@ -33,24 +33,22 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
     let mut found = Vec::new();
     for tree in &walk.trees {
         for node in &tree.nodes {
+            if !matches!(node.kind(), SyntaxKind::MACRO_RULES | SyntaxKind::MACRO_DEF) {
+                continue;
+            }
             let Some(def) = ast::Macro::cast(node.clone()) else { continue };
             let Some(name) = def.name() else { continue };
-            let text = name.text().to_string();
-            if text.starts_with('_') || exported(walk, &def) {
+            let text = name.text();
+            if text.starts_with('_') || uses.macros_unknown.contains(&name.as_name()) || exported(walk, &def) {
                 continue;
             }
             let Some(it) = cx.sema.to_def(&def) else { continue };
             let id = MacroId::from(it);
-            if uses.macros_unknown.contains(&name.as_name()) {
-                continue;
-            }
             let at = tree.ptr(node);
-            let module = it.module(cx.db);
-            let fact = cx.resolves_fact(module, &text);
             if !uses.macros.contains(&id) {
                 let span = cx.span(InFile::new(tree.file, name.syntax().text_range()));
                 let mut diag = Diag::lint("unused_macros", format!("unused macro definition: `{text}`"), span);
-                diag.fact(fact, format!("what the calls of `{text}` resolve to"));
+                diag.fact(cx.resolves_fact(it.module(cx.db), text), format!("what the calls of `{text}` resolve to"));
                 found.push(Found::lint(diag, Phase::Resolve, at));
                 continue;
             }
@@ -58,6 +56,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
                 continue;
             }
             let matched = uses.arms.get(&id);
+            let mut fact = None;
             for (n, rule) in rules(&def).into_iter().enumerate() {
                 if rule.compile_error || matched.is_some_and(|it| it.contains(&(n as u32))) {
                     continue;
@@ -69,6 +68,7 @@ pub(super) fn lints(cx: &Cx<'_, '_>, walk: &Walk<'_>, uses: &Uses) -> Vec<Found>
                 for span in spans {
                     diag.primary(span);
                 }
+                let fact = fact.get_or_insert_with(|| cx.resolves_fact(it.module(cx.db), text));
                 diag.fact(fact.clone(), format!("which rules the calls of `{text}` match"));
                 found.push(Found::lint(diag, Phase::Resolve, at));
             }
@@ -162,14 +162,25 @@ fn inner(tt: &SyntaxNode) -> Vec<NodeOrToken<SyntaxNode, syntax::SyntaxToken>> {
 /// Whether a token tree has `compile_error!` followed by a delimited group in it, at any
 /// depth: rustc's `has_compile_error_macro`.
 fn has_compile_error(tt: &SyntaxNode) -> bool {
-    let elements = inner(tt);
-    elements.windows(3).any(|it| {
-        matches!(&it[0], NodeOrToken::Token(t) if t.kind() == SyntaxKind::IDENT && t.text() == "compile_error")
-            && matches!(&it[1], NodeOrToken::Token(t) if t.kind() == T![!])
-            && matches!(&it[2], NodeOrToken::Node(n) if n.kind() == SyntaxKind::TOKEN_TREE)
-    }) || elements
-        .iter()
-        .any(|it| matches!(it, NodeOrToken::Node(n) if n.kind() == SyntaxKind::TOKEN_TREE && has_compile_error(n)))
+    // How much of `compile_error ! (..)` the elements so far end with: nothing, the name, the `!`.
+    let mut seen = 0u8;
+    for element in tt.children_with_tokens() {
+        match element {
+            NodeOrToken::Token(token) => match token.kind() {
+                kind if kind.is_trivia() => {}
+                SyntaxKind::IDENT if token.text() == "compile_error" => seen = 1,
+                T![!] if seen == 1 => seen = 2,
+                _ => seen = 0,
+            },
+            NodeOrToken::Node(node) => {
+                if node.kind() == SyntaxKind::TOKEN_TREE && (seen == 2 || has_compile_error(&node)) {
+                    return true;
+                }
+                seen = 0;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]

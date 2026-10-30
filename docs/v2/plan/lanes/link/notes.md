@@ -166,6 +166,209 @@ function import (rustc's `--allow-undefined`); any other undefined name is an er
 `Placed::functions` lists native code pieces too. No jump table, no GOT, no DWARF, no live
 patching (a live wasm output is an error).
 
+## State and stages: cost
+
+What the state (`state.rs`, `cow.rs`, `symbols.rs`) and a stage (`stage.rs`, `live.rs`,
+`commit.rs`) cost, read off the code; nothing was measured.
+
+**Interning.** Every symbol, name and 32-byte id is interned once into a `u32`
+(`Sym`, `NameId`, `IdNo`). `SymKey` is `Copy` and 20 bytes (a tag and `u32`s; `Got`/`Plt`
+name the target `Sym`). `Symbols` is 64 shards of SwissTables (`hashbrown::HashTable<u32>`
+over a `Vec` of keys and their hashes). A key is hashed once with a folded multiply (FxHash
+words folded for names, the first 8 bytes for a content id), and the shard comes from hash
+bits 32..38. Growing a shard never rehashes. A lookup is one hash, one 16-wide group probe and
+one 20-byte compare. A batch (`intern_all`, `intern_wide`) is split by shard and each shard
+interned in input order by one rayon task; below 4096 keys it runs serially and gives the same
+ids. A `Sym` is `shard << 26 | index`; `Symbols::dense` maps it to `index * 64 + shard` for
+per-symbol columns.
+
+The benchmarks: mold interns names in one concurrent open-addressing map filled by every
+input file at once; wild keeps a database of prehashed names with dense `u32` symbol ids,
+filled in parallel by hash bucket. The ids here are deterministic whatever the thread count,
+which a CAS-based concurrent map does not give. The cost is one partition pass per batch.
+
+**Sizes.** A piece is columns, each a copy-on-write `CowVec` of 1024-element chunks:
+
+| column | bytes | read by |
+|---|---|---|
+| `Hot` (addr, size, sym, region, class, align, flags) | 32 | every pass |
+| `What` | 16 | stage, writer |
+| `Sort` (rank, order) | 16 | full placement |
+| lists: fixups, weak, defines (`ListRef` each 12) | 36 | relocation |
+| loader: rebase, binds | 24 | writer, live |
+| users | 4 | sweep |
+
+That is 128 bytes per piece plus its lists. Per symbol there is a `Def` (16), a `SymCold`
+(24: its referrer list, slot chain, seen flag) and the interner's key, hash and control byte.
+The lists are CSR ranges into `CowList` arenas of 64 KiB chunks (a list never straddles two).
+A write copies only the chunk it touches, and compaction runs only when the garbage outweighs
+the live data. `Fixup` (`model.rs`) is 32 bytes; 24 is possible (a 32-bit `at`, the `minus`
+symbol folded into a tag).
+
+**An incremental stage** costs what it touches:
+
+- Cloning the state is one `Arc` count per chunk: about 6 000 for a million pieces.
+- Its sets (`IdSet`, `SymSet`) are bitsets with an insertion list: membership is one load,
+  iteration costs the members, and clearing costs the highest id / 64 words.
+- A function made costs its keys (one interning batch for the whole change), its lists pushed
+  into the arenas, one chunk copy per column chunk first written (32 KiB for `Hot`), and one
+  16 KiB page copy per region page first written (`CowBytes`). A region is never copied whole.
+- Its bytes are borrowed from the change or allocated in the stage's `bumpalo` arena:
+  stubs, CIEs, Windows unwind info and locations. There is no `Vec` per piece.
+- Referrers come from per-symbol lists, so relocating again what refers to a changed symbol
+  costs those referrers. A jump-table slot is a cell in a column: setting one is O(1), and the
+  patch lists the dirty slots, not every slot.
+- A span table is compared by its bytes before decoding; a changed one rewrites only its own
+  positions (one lookup per span index).
+- The live message is built from borrowed slices and encoded into one buffer of its exact
+  length. A commit's effects are one queue cut by step counts, and the effects in flight are
+  a range of consecutive tags plus a bitset.
+
+**What is still O(image) per incremental link.** Some of it is mine:
+
+- the jump table's cells piece, written whole by the writer: 8 bytes × capacity;
+- `State::compact` when it runs, amortised over the garbage it drops.
+
+The rest is outside these files:
+
+- native resolution (being made incremental by `link-core-resolve`);
+- the writer's sorted `State::lists` if it is spliced through `Arc::make_mut`;
+- the format writers' synthesis of headers and tables.
+
+**Ahead and behind.** Neither mold nor wild patches an image in place: both relink from the
+inputs, so a one-function edit costs them a full link (mold's published figure is about a
+second or two for Chromium on many cores). Here it costs the function. Behind:
+
+- Full-link throughput is unmeasured. mold's single concurrent map skips the partition pass.
+- mold writes into a memory-mapped output; here regions are built from pages and written by
+  effects.
+- There is no benchmark yet against either on the same inputs.
+
+`tests.rs` checks the dense symbol index (distinct, and a column under twice the count) and
+that a clone's lists, referrers and cells stay as they were when the original rewrites them.
+It also checks that removal leaves the referrer lists in order without the removed piece, and
+that compaction keeps every live list and function lines. `cow.rs` and `symbols.rs` test chunk
+sharing, paged bytes, and that parallel interning gives the serial ids.
+
+## Placement and writing: cost
+
+What placement (`place.rs`), relocation and the writer's lists (`write.rs`), the file's writes
+(`file.rs`) and the tables they use (`reloc.rs`, `table.rs`, `unwind.rs`, `dwarf.rs`,
+`position.rs`) cost, read off the code; nothing was measured.
+
+**Per piece, full link.**
+
+- Placement:
+  - Each piece gets a 40-byte entry: a 32-byte key and its symbol. The key is the import
+    address table cell, rank and link-line order, and an order-keeping prefix of the symbol's
+    contents (its variant, then 7 bytes of its id or name).
+  - Classes are a dense index. Each class's entries are radix sorted (two passes over 16-byte
+    keys) in parallel with the other classes.
+  - Only entries whose keys tie are compared through `Symbols::cmp`.
+  - Then one pass writes each piece's 32-byte `Hot` row.
+- `Counts` is a parallel sum over the pieces, kept in `State::lists` for the next link.
+- Relocation:
+  - Each region is one zeroed buffer, split into a disjoint slice per piece in address order.
+    Each piece's bytes are copied in once.
+  - A piece with more than 2048 fixups (sorted, non-overlapping, no format relocations) is
+    split into jobs at fixup boundaries. Small pieces run in batches of at least 8.
+- The writer's lists (rebased addresses, binds, GOT cells, functions) come from one parallel
+  pass and a parallel sort.
+- The file is written as runs of at most 8 MiB, cut at multiples of 8 MiB, so the core sends
+  them past the page cache. The runs are built in parallel, each copying its bytes from the
+  region buffers once.
+
+**Per relocation.**
+
+- Before the parallel loop, every symbol the written pieces refer to is gathered (a parallel
+  fold), sorted, deduplicated and resolved once, in parallel, into a dense column.
+  - Each symbol takes 16 bytes: its value, its kind in a byte, and the index of its GOT cells
+    and PLT stub.
+  - The column is laid out per symbol shard and allocated zeroed, so pages that no symbol uses
+    are never touched.
+- A fixup then costs:
+  - one load for its target, and one for `minus` if it has one;
+  - one more for the cell when its kind goes through a GOT or PLT (a key read only for the TLV
+    kinds);
+  - a match on the kind byte, and `reloc::apply`.
+- `reloc::apply` returns `reloc::Bad` (`Copy`, at most 24 bytes). A message is built only when
+  a fixup fails, and the error kept is the first in address order, whatever the thread count.
+- Loader output is appended to per-batch buffers, so no piece allocates.
+- `table::stubs` writes every jump-table stub into one buffer in parallel from a static
+  template. `unwind.rs` keeps a record's at most 3 fields inline and finds CIEs by binary
+  search. `dwarf.rs` writes DWARF 4 directly into one buffer per section, sized beforehand.
+
+**Per incremental link.**
+
+- Placement:
+  - Only fresh pieces are placed, grouped by class and sorted by the same keys.
+  - A region whose order the program observes is laid out again from one scan of the `Hot`
+    column, shared by every such region in the link, and only when one changed.
+  - `Counts` is the last link's totals plus the difference over the pieces written, made or
+    removed.
+- Relocation:
+  - The column covers only the written pieces' targets.
+  - The pieces are relocated into one scratch buffer, then written into the regions'
+    copy-on-write pages.
+  - The jump table writes only its set cells, 8 bytes each. Its rebase list is rebuilt from
+    the filled cells, which is O(slots), only when a cell changed.
+- Lists:
+  - Each changed list is one linear merge: drop the entries whose piece (a bitset lookup) was
+    written or removed, and merge in the new ones. A list nothing touched is shared.
+  - GOT cells and binds are rebuilt from every piece only when the imports or the TLS layout
+    changed.
+  - The debug sections are reused unless a function was written, moved or removed, or a span
+    table changed.
+- The file:
+  - It gets only what changed: pieces whose bytes or place differ, the cells set, the tails
+    regions lost, and the 4 KiB blocks of synthetic regions and the headers that differ.
+  - Ranges less than 4 KiB apart are merged into one write.
+  - The undo is those ranges, not their bytes: a rollback reads the old bytes from the state
+    the history keeps (`file::restore`).
+- The commit clones the old file with `FICLONE`/`clonefile` and writes only the ranges, so the
+  old image stays whole for a rollback.
+
+**The benchmarks.**
+
+- Full link: mold and wild write the output in parallel through a memory-mapped file. mold
+  copies and relocates each output section's pieces across threads. wild resolves symbols
+  into a dense table of ids before a single parallel write pass. Both run near memory
+  bandwidth.
+- Incremental link: the bar is writing only the changed pieces into a block-shared clone of
+  the old file. Neither mold nor wild patches an image in place; wild lists incremental
+  linking as a goal.
+
+**Ahead and behind.**
+
+Ahead:
+
+- A one-function edit writes the function, its stub cell and the headers it changes. Its
+  callers are not touched, because they call through the jump table.
+- The old file costs no copy, because the clone shares its blocks.
+- Placement and relocation give the same image whatever the thread count, which a
+  first-come concurrent layout does not.
+
+Behind:
+
+- A full link copies the image twice: into the region buffers, then into the write runs.
+  mold and wild write once, into the mapping. `v2/requests/link.md` item 13 (a write of
+  shared bytes) removes the second copy.
+- `Placed` hands writers contiguous slices. So a changed list is copied whole (O(list)
+  `memcpy` per incremental link), and `file::finish` makes each region with a written page
+  contiguous again (O(region)) before the writer synthesizes, which is O(image) in the
+  writers. A paged `Placed` would make both O(change).
+- Nothing is measured against mold or wild on the same inputs.
+
+The tests are beside the code:
+
+- `place.rs`: the radix sort against a comparison sort, and that symbol prefixes keep the
+  content order.
+- `write.rs`: job splitting, a spliced list equal to the list built again, and the value
+  column.
+- `file.rs`: range merging, runs, and the layout read against a whole-file buffer.
+- `reloc.rs`, `table.rs`, `unwind.rs`, `dwarf.rs` (read back with `gimli`) and `position.rs`
+  keep their tests and add new ones.
+
 ## Tests
 
 `crates/blaze-link/src/tests.rs` links x86-64 ELF images end to end through a simulated disk

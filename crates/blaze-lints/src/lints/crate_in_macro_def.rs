@@ -8,7 +8,7 @@ use syntax::{AstNode, NodeOrToken, SyntaxKind, SyntaxNode, TextRange, ast, ast::
 
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "crate_in_macro_def";
+const LINT: super::Implemented = super::Implemented::CrateInMacroDef;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, rules: &ast::MacroRules) {
     if !cx.on(LINT) || !cx.in_file() {

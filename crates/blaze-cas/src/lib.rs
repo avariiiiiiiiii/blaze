@@ -43,7 +43,7 @@ use std::{collections::VecDeque, fmt, sync::Arc};
 
 use blaze_core::{Completion, Done, Effect, FileName, Mapping, Tag};
 use blaze_format::SchemaHash;
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::{ContentId, Hasher, radix};
 use blaze_reclaim::{Grace, Limbo};
 pub use blaze_reclaim::{Guard, enter};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -976,8 +976,12 @@ impl Store {
         }
         let mut spent = 0;
         let (mut demote, mut promote) = self.tier_moves();
-        demote.sort_unstable_by_key(|(_, loc, _)| (loc.kind.code(), loc.pack, loc.offset));
-        promote.sort_unstable_by_key(|(_, loc, _)| (loc.pack, loc.offset));
+        radix::sort_by_key(&mut demote, |(_, loc, _)| {
+            (u128::from(loc.kind.code()) << 96) | radix::pack_64(u64::from(loc.pack), loc.offset)
+        });
+        radix::sort_by_key(&mut promote, |(_, loc, _)| {
+            radix::pack_64(u64::from(loc.pack), loc.offset)
+        });
         'kinds: for group in demote.chunk_by(|a, b| a.1.kind == b.1.kind) {
             let kind = group[0].1.kind;
             if self.dictionary_of(kind).is_none() {

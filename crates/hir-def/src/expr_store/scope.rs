@@ -38,9 +38,11 @@ pub struct ExprScopes {
     /// A `Label`'s raw label id, a `Block`'s index in `blocks`, a `MacroDef`'s in `macro_defs`;
     /// 0 for `None`.
     data: Box<[u32]>,
-    /// Where each scope's entries begin and end in `scope_entries`. A range begins where the
-    /// entries were when its scope was made and ends after its last entry, so it covers the
-    /// entries of a scope made inside it before that (a block in a `const` pattern).
+    /// Where each scope's entries begin and end in `scope_entries`, which holds them grouped by
+    /// scope, each scope's in the order they were added. Grouped, not in walk order: a scope
+    /// made while another is still taking entries (a block in a `const` pattern) puts its entries
+    /// between the outer scope's, and a range over the walk order would give the outer scope
+    /// the inner one's names too.
     entries: Box<[[u32; 2]]>,
     scope_entries: Box<[ScopeEntry]>,
     // Cold: a block scope's block and label, a macro scope's macro.
@@ -237,7 +239,7 @@ impl NewScope {
 /// against.
 trait ScopeSink {
     fn push_scope(&mut self, parent: Option<ScopeId>, kind: NewScope) -> ScopeId;
-    /// Adds an entry to `scope`, the last of its range.
+    /// Adds an entry to `scope`, after its others.
     fn push_entry(&mut self, scope: ScopeId, entry: ScopeEntry);
     fn set_scope(&mut self, expr: ExprId, scope: ScopeId);
 }
@@ -248,8 +250,8 @@ struct Building {
     parent: Vec<u32>,
     kind: Vec<ScopeKind>,
     data: Vec<u32>,
-    entries: Vec<[u32; 2]>,
-    scope_entries: Vec<ScopeEntry>,
+    /// Each entry beside the raw id of its scope, in walk order.
+    scope_entries: Vec<(u32, ScopeEntry)>,
     blocks: Vec<(BlockId, Option<LabelId>)>,
     macro_defs: Vec<MacroDefId>,
     scope_by_expr: Vec<ScopeId>,
@@ -273,14 +275,11 @@ impl ScopeSink for Building {
         self.parent.push(parent.map_or(NO_SCOPE, |it| it.into_raw().into_u32()));
         self.kind.push(kind);
         self.data.push(data);
-        let at = self.scope_entries.len() as u32;
-        self.entries.push([at, at]);
         scope
     }
 
     fn push_entry(&mut self, scope: ScopeId, entry: ScopeEntry) {
-        self.scope_entries.push(entry);
-        self.entries[index(scope)][1] = self.scope_entries.len() as u32;
+        self.scope_entries.push((scope.into_raw().into_u32(), entry));
     }
 
     fn set_scope(&mut self, expr: ExprId, scope: ScopeId) {
@@ -295,12 +294,25 @@ impl ScopeSink for Building {
 impl Building {
     /// The columns, each copied into an allocation of its exact size, and `self` cleared.
     fn finish(&mut self) -> ExprScopes {
+        // Stable, so each scope keeps its entries in the order they were added; a body with no
+        // scope made inside another's entries is already grouped and skips the sort.
+        if !self.scope_entries.is_sorted_by_key(|&(scope, _)| scope) {
+            self.scope_entries.sort_by_key(|&(scope, _)| scope);
+        }
+        let mut entries: Box<[[u32; 2]]> = vec![[0, 0]; self.parent.len()].into_boxed_slice();
+        for (at, &(scope, _)) in self.scope_entries.iter().enumerate() {
+            let range = &mut entries[scope as usize];
+            if range[0] == range[1] {
+                range[0] = at as u32;
+            }
+            range[1] = at as u32 + 1;
+        }
         let scopes = ExprScopes {
             parent: Box::from(&*self.parent),
             kind: Box::from(&*self.kind),
             data: Box::from(&*self.data),
-            entries: Box::from(&*self.entries),
-            scope_entries: self.scope_entries.drain(..).collect(),
+            entries,
+            scope_entries: self.scope_entries.drain(..).map(|(_, entry)| entry).collect(),
             blocks: Box::from(&*self.blocks),
             macro_defs: Box::from(&*self.macro_defs),
             scope_by_expr: ScopeByExpr(Box::from(&*self.scope_by_expr)),
@@ -309,7 +321,6 @@ impl Building {
             parent,
             kind,
             data,
-            entries,
             scope_entries: _,
             blocks,
             macro_defs,
@@ -318,7 +329,6 @@ impl Building {
         parent.clear();
         kind.clear();
         data.clear();
-        entries.clear();
         blocks.clear();
         macro_defs.clear();
         scope_by_expr.clear();
@@ -530,25 +540,22 @@ mod tests {
         test_db::TestDB,
     };
 
-    /// The scopes as the arenas they were before they became columns: a parent and a kind with
-    /// its payload per scope, a range of one entries arena, an `ArenaMap` by expression.
+    /// The scopes as plain values: a parent, a kind with its payload and a list of entries per
+    /// scope, an `ArenaMap` by expression.
     #[derive(Default)]
     struct Model {
-        scopes: Vec<(Option<ScopeId>, NewScope, usize, usize)>,
-        entries: Vec<ScopeEntry>,
+        scopes: Vec<(Option<ScopeId>, NewScope, Vec<ScopeEntry>)>,
         scope_by_expr: ArenaMap<ExprId, ScopeId>,
     }
 
     impl ScopeSink for Model {
         fn push_scope(&mut self, parent: Option<ScopeId>, kind: NewScope) -> ScopeId {
-            let at = self.entries.len();
-            self.scopes.push((parent, kind, at, at));
+            self.scopes.push((parent, kind, Vec::new()));
             ScopeId::from_raw(RawIdx::from_u32(self.scopes.len() as u32 - 1))
         }
 
         fn push_entry(&mut self, scope: ScopeId, entry: ScopeEntry) {
-            self.entries.push(entry);
-            self.scopes[index(scope)].3 = self.entries.len();
+            self.scopes[index(scope)].2.push(entry);
         }
 
         fn set_scope(&mut self, expr: ExprId, scope: ScopeId) {
@@ -562,8 +569,7 @@ mod tests {
         }
 
         fn entries(&self, scope: ScopeId) -> &[ScopeEntry] {
-            let (_, _, start, end) = self.scopes[index(scope)];
-            &self.entries[start..end]
+            &self.scopes[index(scope)].2
         }
 
         fn kind(&self, scope: ScopeId) -> NewScope {
@@ -582,7 +588,8 @@ mod tests {
         assert_eq!(scopes.len(), model.scopes.len(), "the number of scopes");
         let all =
             || (0..model.scopes.len() as u32).map(|at| ScopeId::from_raw(RawIdx::from_u32(at)));
-        let names: Vec<&Name> = model.entries.iter().map(|it| &it.name).collect();
+        let names: Vec<&Name> =
+            model.scopes.iter().flat_map(|(_, _, entries)| entries).map(|it| &it.name).collect();
         for scope in all() {
             assert_eq!(scopes.scope_chain(Some(scope)).collect::<Vec<_>>(), model.chain(scope));
             assert_eq!(scopes.entries(scope), model.entries(scope), "the entries of {scope:?}");
@@ -965,6 +972,33 @@ fn foo(x: i32, y: u32) {
 }
 "#,
             7,
+        );
+    }
+
+    #[test]
+    fn a_const_pattern_block_keeps_its_names() {
+        do_check(
+            r"
+            fn quux() {
+                let w = 1;
+                let (a, const { let w = (); w }, b) = (1, (), 3);
+                $0
+            }",
+            &["a", "b", "w"],
+        );
+    }
+
+    #[test]
+    fn a_name_after_a_const_pattern_block_resolves_outside_it() {
+        do_check_local_name(
+            r#"
+fn foo() {
+    let w = 1;
+    let (a, const { let w = (); w }, b) = (1, (), 3);
+    w$0
+}
+"#,
+            19,
         );
     }
 

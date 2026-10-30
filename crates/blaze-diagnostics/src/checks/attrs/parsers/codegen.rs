@@ -9,7 +9,7 @@
 //! `loop_match.rs` and `body.rs`, with the texts of
 //! `compiler/rustc_attr_parsing/src/session_diagnostics.rs` (MIT or Apache-2.0).
 
-use syntax::{TextRange, TextSize};
+use syntax::TextRange;
 
 use super::{Accepted, Finalize, GroupId, no_args, single_integer};
 use crate::{
@@ -1266,12 +1266,4 @@ mod tests {
     fn paths_are_sorted_and_distinct() {
         assert!(PATHS.windows(2).all(|it| it[0] < it[1]));
     }
-
-    #[test]
-    fn a_text_size_is_a_byte_offset() {
-        assert_eq!(u32::from(syntax::TextSize::from(3)), 3);
-    }
 }
-
-#[allow(dead_code)]
-fn _text_size(_: TextSize) {}

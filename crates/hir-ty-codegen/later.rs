@@ -4,6 +4,8 @@
 //! core ([`ObjectCodegen::make_later`]): made as each function was put in, they took the
 //! thread that does that as long as the putting in itself.
 
+#![forbid(unsafe_code)]
+
 use super::*;
 
 /// What a function put in the object is.
@@ -278,7 +280,7 @@ impl<'db> Keeper<'_, 'db> {
                     .collect(),
                 None => Vec::new(),
             };
-            rows.sort_by_key(|row| row.0);
+            blaze_ids::radix::sort_copy_by_key(&mut rows, |row| row.0);
             let scopes = describe_scopes(db, *owner, variables, &rows, len, &mut debug);
             describe_variables(
                 db,

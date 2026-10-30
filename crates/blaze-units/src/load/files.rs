@@ -14,7 +14,7 @@
 //!   files, and a `Cargo.toml` kept in its canonical form makes a comment edit cut off.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
 use std::rc::Rc;
 
@@ -22,6 +22,7 @@ use blaze_ids::ContentId;
 use blaze_manifest::files::{FileKind, Files};
 use blaze_query::{Cancelled, Cx, Query, QueryKind};
 use blaze_format::SchemaHash;
+use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::invocation::Invocation;
@@ -154,7 +155,7 @@ fn dir_through(cx: &mut Cx<'_>, table: &MountTable, path: &str, view: bool) -> R
         },
         None if table.known.iter().any(|it| it == path) => {
             let prefix = if path == "/" { "/".to_owned() } else { format!("{path}/") };
-            let mut names: BTreeMap<String, bool> = BTreeMap::new();
+            let mut names: FxHashMap<String, bool> = FxHashMap::default();
             for mount in &table.mounts {
                 let Some(rest) = mount.at.strip_prefix(&prefix) else { continue };
                 match rest.split_once('/') {
@@ -178,7 +179,9 @@ fn dir_through(cx: &mut Cx<'_>, table: &MountTable, path: &str, view: bool) -> R
                     };
                 }
             }
-            Found::Here(names.into_iter().collect())
+            let mut names: Names = names.into_iter().collect();
+            names.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+            Found::Here(names)
         }
         None => Found::Unmounted,
     })
@@ -319,6 +322,7 @@ pub(crate) fn ancestors(path: &str) -> Vec<String> {
 }
 
 /// What a step read, by absolute path, and what it found.
+// BTreeMap: written into CBOR query values (`ManifestRead`).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug, Default)]
 pub(crate) struct Snapshot {
     pub files: BTreeMap<String, Found<Vec<u8>>>,
@@ -368,7 +372,7 @@ fn canonical_toml(bytes: &[u8]) -> Option<String> {
 }
 
 /// What a step was asked for that its snapshot did not have.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub(crate) enum Need {
     File(String),
     Dir(String),
@@ -378,7 +382,7 @@ pub(crate) enum Need {
 struct State {
     snapshot: Snapshot,
     used: Snapshot,
-    missed: BTreeSet<Need>,
+    missed: FxHashSet<Need>,
 }
 
 impl State {
@@ -406,6 +410,13 @@ impl State {
                 None
             }
         }
+    }
+
+    /// What the run missed, each once, in order.
+    fn take_missed(&mut self) -> Vec<Need> {
+        let mut missed: Vec<Need> = self.missed.drain().collect();
+        missed.sort_unstable();
+        missed
     }
 }
 
@@ -518,7 +529,7 @@ pub(crate) fn run_over<'db, R>(
         }
         let files: Rc<dyn Files> = Rc::new(Snap(state.clone()));
         let answer = step(cx, files)?;
-        let missed = std::mem::take(&mut state.borrow_mut().missed);
+        let missed = state.borrow_mut().take_missed();
         if missed.is_empty() {
             let used = std::mem::take(&mut state.borrow_mut().used);
             return Ok((answer, used));
@@ -573,6 +584,27 @@ mod tests {
         assert!(known_file(&known, "/Cargo.toml"));
         assert!(!known_file(&known, "/etc/passwd/x"));
         assert!(!known_file(&known, "/home/u/.cargo/registry/src/x/Cargo.toml"));
+    }
+
+    #[test]
+    fn what_a_run_missed_is_read_once_each_in_order() {
+        let mut state = State::default();
+        state.snapshot.files.insert("/w/a".to_owned(), Found::Absent);
+        assert_eq!(state.file("/w/c"), None);
+        assert_eq!(state.dir("/w"), None);
+        assert_eq!(state.file("/w/a"), Some(Found::Absent));
+        assert_eq!(state.file("/w/b"), None);
+        assert_eq!(state.file("/w/c"), None);
+        assert_eq!(state.dir("/v"), None);
+        let want = vec![
+            Need::File("/w/b".to_owned()),
+            Need::File("/w/c".to_owned()),
+            Need::Dir("/v".to_owned()),
+            Need::Dir("/w".to_owned()),
+        ];
+        assert_eq!(state.take_missed(), want);
+        assert!(state.take_missed().is_empty());
+        assert_eq!(state.used.files.keys().collect::<Vec<_>>(), ["/w/a"]);
     }
 
     #[test]

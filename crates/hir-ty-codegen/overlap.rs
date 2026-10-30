@@ -162,7 +162,9 @@ fn share_slots(
     }
     let slot = |at: usize| frame.slots[at].expect("a local's slot");
     let size = |func: &ir::Function, at: usize| func.sized_stack_slots[slot(at)].size;
-    order.sort_by_key(|&at| (std::cmp::Reverse(size(func, at)), at));
+    blaze_ids::radix::sort_by_key(&mut order, |&at| {
+        blaze_ids::radix::pack_64(u64::from(!size(func, at)), at as u64)
+    });
     // Each group: the slot it keeps, and every local any of its members conflicts with (the
     // rows of its members, or'ed), so that whether one more fits is one bit.
     let mut groups: Vec<(ir::StackSlot, DenseBitSet<usize>)> = Vec::new();

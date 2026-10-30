@@ -10,8 +10,9 @@
 //! Files are named relative to the driver's root, so the same state machine runs in a
 //! simulation, a temporary directory or the daemon's state directory unchanged.
 //!
-//! On macOS [`kqueue::Kqueue`] keeps timers, sockets, processes and FSEvents' watches on one
-//! kqueue and the file calls on threads. A process of [`Effect::Spawn`] in a sandbox is made
+//! On macOS [`kqueue::Kqueue`] keeps sockets, processes and FSEvents' watches on one kqueue,
+//! the file calls on threads, and timers in a [`wheel::Wheel`] its wait ends at, as every
+//! driver does. A process of [`Effect::Spawn`] in a sandbox is made
 //! by the [`Confine`] a driver is given; a driver given none refuses it.
 
 #[cfg(target_os = "linux")]

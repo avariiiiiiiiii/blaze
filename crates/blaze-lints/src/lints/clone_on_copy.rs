@@ -10,7 +10,7 @@ use syntax::{AstNode, ast};
 use super::utils;
 use crate::{check::Cx, diag::Applicability};
 
-const LINT: &str = "clone_on_copy";
+const LINT: super::Implemented = super::Implemented::CloneOnCopy;
 
 /// clippy's `ParentIsSuffixExpr`: what the clone is used in.
 #[derive(PartialEq, Eq)]

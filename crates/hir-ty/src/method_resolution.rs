@@ -870,9 +870,9 @@ fn macro_is_inert(db: &dyn HirDatabase, krate: Crate, name: &Symbol) -> bool {
     match name.as_str() {
         "macro_rules" => true,
         "include" => false,
-        name => {
+        _ => {
             let known = macros_writing_impls(db, krate);
-            matches!(known.binary_search_by(|(it, _)| it.as_str().cmp(name)), Ok(i) if !known[i].1)
+            matches!(known.binary_search_by(|(it, _)| it.cmp_order(name)), Ok(i) if !known[i].1)
         }
     }
 }
@@ -1199,7 +1199,10 @@ pub fn simplified_type_module(db: &dyn HirDatabase, ty: &SimplifiedType<'_>) -> 
 /// A `SimplifiedType` as the argument of a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, SalsaValue)]
 pub struct SelfTyKey<'db>(
-    // SAFETY: as for the maps below, it only contains `SolverDefId<'db>`.
+    // SAFETY: salsa may keep this value past `'db` only if nothing in it borrows from the
+    // database. `SimplifiedType<'db>` is `fast_reject::SimplifiedType<SolverDefId<'db>>`
+    // (`next_solver/ty.rs`), whose variants (`vendor/rustc_type_ir/src/fast_reject.rs`) hold
+    // only plain data and `SolverDefId<'db>`, which is `SalsaValue`; no `&'db`.
     #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))] pub SimplifiedType<'db>,
 );
 
@@ -1307,9 +1310,11 @@ impl<'db, T: Default> SelfTyGroups<'db, T> {
 /// with its run of impls in the order they were found.
 #[derive(Debug, PartialEq, Eq, SalsaValue)]
 pub struct InherentImpls<'db> {
-    // SAFETY: necessary due to `SimplifiedType<'db>`.
-    // It's safe to retain, as it only contains `SolverDefId<'db>` (which is `SalsaValue`),
-    // and no `&'db` references.
+    // SAFETY: salsa may keep this column past `'db` only if nothing in it borrows from the
+    // database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are
+    // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants
+    // (`vendor/rustc_type_ir/src/fast_reject.rs`) hold only plain data and `SolverDefId<'db>`,
+    // which is `SalsaValue`; no `&'db`.
     #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
     self_tys: SelfTys<'db>,
     impls: Runs<ImplId>,
@@ -1444,9 +1449,11 @@ pub struct TraitImpls<'db> {
     traits: Box<[TraitId]>,
     trait_rows: Box<[u32]>,
     blanket: Runs<ImplId>,
-    // SAFETY: necessary due to `SimplifiedType<'db>`.
-    // It's safe to retain, as it only contains `SolverDefId<'db>` (which is `SalsaValue`),
-    // and no `&'db` references.
+    // SAFETY: salsa may keep this column past `'db` only if nothing in it borrows from the
+    // database. `SelfTys<'db>` holds `u64`s and `SimplifiedType<'db>`s, which are
+    // `fast_reject::SimplifiedType<SolverDefId<'db>>` (`next_solver/ty.rs`), whose variants
+    // (`vendor/rustc_type_ir/src/fast_reject.rs`) hold only plain data and `SolverDefId<'db>`,
+    // which is `SalsaValue`; no `&'db`.
     #[salsa_value(unsafe(prove(SolverDefId<'db>: SalsaValue)))]
     self_tys: SelfTys<'db>,
     impls: Runs<ImplId>,

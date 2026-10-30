@@ -40,7 +40,7 @@ use blaze_vfs::{Change, Op, View};
 use serde::{Deserialize, Serialize};
 
 /// The version of every body's schema. A change to any type here is a new number.
-pub const SCHEMA: u32 = 7;
+pub const SCHEMA: u32 = 8;
 
 /// The most bytes a request the daemon reads may be: CBOR from a peer is decoded only up to
 /// this.
@@ -438,9 +438,30 @@ pub struct Artifact {
 pub struct TestResult {
     pub name: String,
     pub binary: String,
+    /// Not run: the result that stands, and what it was kept by. A cached result is
+    /// `Unreached` with `millis` 0.
+    pub cached: Option<Cached>,
     pub millis: u64,
     pub output: Vec<u8>,
     pub outcome: TestOutcome,
+}
+
+/// The run that stands for a test not run.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Cached {
+    pub basis: Basis,
+    /// How long the run that stands took.
+    pub millis: u64,
+    pub outcome: TestOutcome,
+}
+
+/// What a cached result was kept by.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub enum Basis {
+    /// The functions the run executed.
+    Executed,
+    /// What the test reaches, as its run's record was not whole, and why.
+    Reached { why: String },
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]

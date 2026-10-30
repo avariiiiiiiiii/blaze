@@ -62,6 +62,9 @@ pub(crate) struct Live {
     originals: HashMap<u64, Vec<u8>>,
     written: HashMap<u64, usize>,
     sequence: u64,
+    /// How long the executable's image is from `loaded`: every write over it is checked to be
+    /// in it.
+    image_len: u64,
 }
 
 impl Live {
@@ -90,6 +93,7 @@ impl Live {
             originals: HashMap::new(),
             written: HashMap::new(),
             sequence: 0,
+            image_len: image.len,
         };
         live.publish()?;
         Ok(live)
@@ -166,11 +170,31 @@ impl Live {
         if !(code.base.is_multiple_of(PAGE) && text_len.is_multiple_of(PAGE)) {
             return Err("a patch whose code is not whole pages".to_owned());
         }
-        // A patch that only puts back what earlier ones wrote has nothing to map.
-        if len != 0 {
-            self.map(code, len)?;
+        // Every write over the executable is checked before anything is mapped or written.
+        let image = self.loaded..self.loaded.saturating_add(self.image_len);
+        for write in &code.writes {
+            let address = write.address.wrapping_add(self.slide);
+            let range = address..address.saturating_add(write.bytes.len() as u64);
+            if range.start < image.start || range.end > image.end {
+                return Err(format!(
+                    "a write at {:#x}..{:#x}, outside the executable at {:#x}..{:#x}",
+                    range.start, range.end, image.start, image.end
+                ));
+            }
         }
+        // A patch that only puts back what earlier ones wrote has nothing to map.
+        let mapped = if len == 0 { Ok(()) } else { self.map(code, len) };
+        // From the commit on, jumps or the unwinder may reach this memory, done or not: the
+        // room up to `end` is used either way.
+        let applied = mapped.and_then(|()| self.redirect(code));
+        self.process.next = end;
+        let published = self.publish();
+        applied.and(published)
+    }
 
+    /// Writes the patch's jumps and statics, and puts back what the last patch wrote and this
+    /// one does not.
+    fn redirect(&mut self, code: &Code) -> Result<(), String> {
         let kept: std::collections::HashSet<u64> =
             code.writes.iter().map(|it| it.address).collect();
         let undone: Vec<u64> =
@@ -189,7 +213,10 @@ impl Live {
             let original = self.originals.entry(address).or_default();
             if original.len() < bytes.len() {
                 let start = original.len();
-                // SAFETY: the bytes are of the executable's image, which stays loaded.
+                // SAFETY: `address..address + bytes.len()` is in the executable's image
+                // (`apply` checked it against `loaded..loaded + image_len`), loaded as long as
+                // the process runs; only this thread writes code there. A static another thread
+                // writes meanwhile races this read (the rule `Live::poll` gives the program).
                 let more = unsafe {
                     std::slice::from_raw_parts(
                         (address + start as u64) as *const u8,
@@ -205,15 +232,18 @@ impl Live {
             self.write(address, &bytes)?;
             self.written.insert(address, write.bytes.len());
         }
-        self.process.next = end;
-        self.publish()
+        Ok(())
     }
 
     /// Maps the code and data of the patch, `len` bytes, where it was laid out.
     fn map(&self, code: &Code, len: u64) -> Result<(), String> {
         let text_len = code.text.len() as u64;
         let mapped = code.base.wrapping_add(self.slide);
-        // SAFETY: the pages are in the room `reserve` set aside, which nothing else uses.
+        // SAFETY: commits `len` bytes at the page-aligned `mapped` (checked), in the room
+        // `reserve` reserved, within `process.next..process.end` (checked by `apply`), so no
+        // earlier patch's code a thread may run is in them; the room is never released, and a
+        // failed apply moves `next` past this patch all the same, so it lives unchanged as long
+        // as the process.
         let result = unsafe {
             VirtualAlloc(mapped as *mut c_void, len as usize, MEM_COMMIT, PAGE_READWRITE)
         };
@@ -223,7 +253,9 @@ impl Live {
                 std::io::Error::last_os_error()
             ));
         }
-        // SAFETY: the pages were just committed, readable and writable, and are this one's.
+        // SAFETY: the pages were just committed read-write at `mapped`, page-aligned so any `u8`
+        // alignment holds; no thread reaches them before the jumps `apply` writes after `map`
+        // returns, and the slice doesn't outlive `map`.
         let memory = unsafe { std::slice::from_raw_parts_mut(mapped as *mut u8, len as usize) };
         memory[..code.text.len()].copy_from_slice(&code.text);
         memory[code.text.len()..code.text.len() + code.data.len()].copy_from_slice(&code.data);
@@ -232,7 +264,9 @@ impl Live {
         }
         if text_len != 0 {
             let mut old = 0;
-            // SAFETY: the code's pages are committed above.
+            // SAFETY: `text_len` bytes (whole pages, checked) at the page-aligned start of the
+            // pages committed above; `memory` writes nothing there after this, and no thread
+            // runs them yet.
             let protected = unsafe {
                 VirtualProtect(
                     mapped as *mut c_void,
@@ -247,29 +281,38 @@ impl Live {
                     std::io::Error::last_os_error()
                 ));
             }
-            // SAFETY: the range is the code just written.
-            unsafe {
-                FlushInstructionCache(
-                    GetCurrentProcess(),
-                    mapped as *const c_void,
-                    text_len as usize,
-                )
-            };
+            // SAFETY: it takes nothing and returns this process's pseudo-handle, which needs no
+            // closing.
+            let process = unsafe { GetCurrentProcess() };
+            // SAFETY: flushes the instruction cache over the code just written; it changes no
+            // memory.
+            unsafe { FlushInstructionCache(process, mapped as *const c_void, text_len as usize) };
         }
-        self.register_functions(mapped, code.frames)
+        self.register_functions(mapped, len, code.frames)
     }
 
     /// Has the unwinder find the functions of the patch, whose table at `start` of the code is
     /// sorted and relative to where the image is loaded: a Rust panic unwinds through them.
-    fn register_functions(&self, mapped: u64, (start, len): (u64, u64)) -> Result<(), String> {
+    fn register_functions(
+        &self,
+        mapped: u64,
+        patch: u64,
+        (start, len): (u64, u64),
+    ) -> Result<(), String> {
         if len == 0 {
             return Ok(());
         }
         if !len.is_multiple_of(FUNCTION) || !start.is_multiple_of(4) {
             return Err("a table of functions that is not whole entries".to_owned());
         }
+        if start.checked_add(len).is_none_or(|end| end > patch) {
+            return Err("a table of functions past the end of the patch".to_owned());
+        }
         let table = (mapped + start) as *const u8;
-        // SAFETY: the table is in the code just mapped, which is never unmapped.
+        // SAFETY: `len / FUNCTION` RUNTIME_FUNCTIONs at the 4-aligned `mapped + start`, inside
+        // the patch's `patch` bytes (checked above), which are never released or rewritten
+        // (`apply` moves `next` past them even when it fails); their addresses are relative to
+        // `loaded`.
         if unsafe { RtlAddFunctionTable(table, (len / FUNCTION) as u32, self.loaded) } == 0 {
             return Err("the unwinder refused the patch's table of functions".to_owned());
         }
@@ -278,7 +321,9 @@ impl Live {
 
     fn write(&self, address: u64, bytes: &[u8]) -> Result<(), String> {
         let mut old = 0;
-        // SAFETY: the bytes are of the executable's image, which stays loaded.
+        // SAFETY: `address..address + bytes.len()` is in the executable's image (checked by
+        // `apply`); PAGE_EXECUTE_READWRITE keeps read and run, so a thread running code on
+        // those pages keeps running; `old` is given back below.
         let writable = unsafe {
             VirtualProtect(address as *mut c_void, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old)
         };
@@ -288,20 +333,27 @@ impl Live {
                 std::io::Error::last_os_error()
             ));
         }
-        // SAFETY: the bytes were made writable above.
+        // SAFETY: the bytes were made writable above; `bytes` is the caller's buffer, so they
+        // don't overlap, and a byte copy needs no alignment. NOT upheld: a jump is written over
+        // a function's first bytes while other threads may be running them, and a static while
+        // they may use it (the jump-table design in `slots` never writes over code a thread
+        // can be in).
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), address as *mut u8, bytes.len()) };
         let mut was = 0;
-        // SAFETY: as above.
+        // SAFETY: the same bytes as above, given back the protection `old` that VirtualProtect
+        // said they had; nothing holds a reference into them.
         if unsafe { VirtualProtect(address as *mut c_void, bytes.len(), old, &mut was) } == 0 {
             return Err(format!(
                 "restoring protection at {address:#x}: {}",
                 std::io::Error::last_os_error()
             ));
         }
-        // SAFETY: the range was just written.
-        unsafe {
-            FlushInstructionCache(GetCurrentProcess(), address as *const c_void, bytes.len())
-        };
+        // SAFETY: it takes nothing and returns this process's pseudo-handle, which needs no
+        // closing.
+        let process = unsafe { GetCurrentProcess() };
+        // SAFETY: flushes the instruction cache over the bytes just written; it changes no
+        // memory.
+        unsafe { FlushInstructionCache(process, address as *const c_void, bytes.len()) };
         Ok(())
     }
 

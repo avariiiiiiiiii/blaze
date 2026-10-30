@@ -9,7 +9,7 @@ use syntax::{AstNode, TextRange, TextSize, ast};
 
 use crate::{check::Cx, diag::Applicability, msrvs};
 
-const LINT: &str = "collapsible_if";
+const LINT: super::Implemented = super::Implemented::CollapsibleIf;
 
 pub(super) fn check(cx: &mut Cx<'_, '_, '_>, expr: &ast::IfExpr) {
     if !cx.on(LINT) || !cx.in_file() || expr.else_branch().is_some() {

@@ -308,9 +308,10 @@ fn find_path_for_module<'db>(
             ctx.db,
             ctx.from_def_map,
             ctx.from,
-            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
-            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
-            // when the query that made it reruns, which reruns this one too.
+            // SAFETY: `to_static` needs the id not to outlive the query computation it was made
+            // in. The `'static` id only keys this lookup (`find_in_scope` compares it with the def
+            // map's items) and is dropped before `find_path` returns; the name it gives is not an
+            // id. If it were stored, a later revision could read a freed salsa slot through it.
             ItemInNs::Types(unsafe { module_id.to_static() }.into()),
             ctx.ignore_local_imports,
         );
@@ -328,9 +329,10 @@ fn find_path_for_module<'db>(
     }
 
     // - if the module is in the prelude, return it by that path
-    // SAFETY: the id was read from `db` in this computation and is used only while `db` is borrowed
-    // (as a key or in this query's result); salsa deletes a tracked struct only when the query that
-    // made it reruns, which reruns this one too.
+    // SAFETY: `to_static` needs the id not to outlive the query computation it was made in. The
+    // `'static` id only keys this lookup (`find_in_prelude` compares it with the def maps' items)
+    // and is dropped before `find_path` returns; the `Choice` holds segments of names, not ids. If
+    // it were stored, a later revision could read a freed salsa slot through it.
     let item = ItemInNs::Types(unsafe { module_id.to_static() }.into());
     if let Some(choice) = find_in_prelude(ctx.db, st, ctx.from_def_map, item, ctx.from) {
         return Some(choice);
@@ -2619,10 +2621,11 @@ pub mod future {
                     ctx.db,
                     ctx.from_def_map,
                     ctx.from,
-                    // SAFETY: the id was read from `db` in this computation and is used only while
-                    // `db` is borrowed (as a key or in this query's result); salsa deletes a
-                    // tracked struct only when the query that made it reruns, which reruns this one
-                    // too.
+                    // SAFETY: `to_static` needs the id not to outlive the query computation it was
+                    // made in. The `'static` id only keys this lookup (`find_in_scope` compares it
+                    // with the def map's items) and is dropped before `find_path` returns; the name
+                    // it gives is not an id. If it were stored, a later revision could read a freed
+                    // salsa slot through it.
                     ItemInNs::Types(unsafe { module_id.to_static() }.into()),
                     ctx.ignore_local_imports,
                 );
@@ -2641,9 +2644,11 @@ pub mod future {
                     has_prelude_segment: false,
                 });
             }
-            // SAFETY: the id was read from `db` in this computation and is used only while `db` is
-            // borrowed (as a key or in this query's result); salsa deletes a tracked struct only
-            // when the query that made it reruns, which reruns this one too.
+            // SAFETY: `to_static` needs the id not to outlive the query computation it was made
+            // in. The `'static` id only keys this lookup (`find_in_prelude` compares it with the
+            // def maps' items) and is dropped before `find_path` returns; the `Choice` holds names,
+            // not ids. If it were stored, a later revision could read a freed salsa slot through
+            // it.
             let item = ItemInNs::Types(unsafe { module_id.to_static() }.into());
             if let Some(choice) = find_in_prelude(ctx.db, ctx.from_def_map, item, ctx.from) {
                 return Some(choice);

@@ -3,12 +3,13 @@
 //! requests on a thread of its own (`IORING_SETUP_SQPOLL`), so a busy driver submits with no
 //! system call; an idle one lets that thread sleep and wakes it when it writes again.
 //!
-//! Reads, appends, syncs, timers, writes at an offset, whole-file writes and renames are the
-//! ring's. A file is opened once, kept open and registered in the ring's table of files, so
-//! requests name its slot. A whole file's write is one linked chain (written, synced, renamed
-//! over the old, its directory synced), and a rename is linked to its directories' syncs. A
-//! large aligned write at an offset bypasses the page cache from a registered buffer. A
-//! truncation, which comes only in recovery, is a call made where it is submitted.
+//! Reads, appends, syncs, writes at an offset, whole-file writes and renames are the ring's;
+//! timers are a [`Wheel`] whose next deadline ends the ring's wait. A file is opened once,
+//! kept open and registered in the ring's table of files, so requests name its slot. A whole
+//! file's write is one linked chain (written, synced, renamed over the old, its directory
+//! synced), and a rename is linked to its directories' syncs. A large aligned write at an
+//! offset bypasses the page cache from a registered buffer. A truncation, which comes only in
+//! recovery, is a call made where it is submitted.
 //!
 //! A spawned process is watched through the ring too: a poll of its pidfd for its exit, its
 //! output pipes read and its input written by the ring. A listen's accepts (one multishot
@@ -25,7 +26,7 @@
 
 use std::{
     cell::RefCell,
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     ffi::CString,
     io,
     os::{
@@ -45,12 +46,14 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use crate::{Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Tag};
+use crate::{
+    Command, Completion, Confine, Conn, Done, Driver, Effect, FileName, IoError, Tag,
+    wheel::{self, Wheel},
+};
 
 const OP_FSYNC: u8 = 3;
 const OP_WRITE_FIXED: u8 = 5;
 const OP_POLL_ADD: u8 = 6;
-const OP_TIMEOUT: u8 = 11;
 const OP_ACCEPT: u8 = 13;
 const OP_ASYNC_CANCEL: u8 = 14;
 const OP_CONNECT: u8 = 16;
@@ -839,10 +842,6 @@ enum Op {
     Sync {
         file: Rc<Fixed>,
     },
-    /// The kernel reads the time from here until it completes.
-    Timer {
-        after: Box<Timespec>,
-    },
     /// A whole file as one chain of linked requests: written to `temporary`, synced, renamed
     /// over the path (`names` are the two), and its directory `dir` synced. A link that fails
     /// cancels those after it; a short write asks the chain again from where it stopped.
@@ -1076,7 +1075,7 @@ pub struct Uring {
     /// Not freed while the kernel may still write into it (see `Drop`).
     provided: std::mem::ManuallyDrop<Provided>,
     /// Each file opened, for reading and appending.
-    files: BTreeMap<FileName, Rc<Fixed>>,
+    files: FxHashMap<FileName, Rc<Fixed>>,
     /// By the id in the `user_data` the ring hands back, which is never used for another
     /// request.
     pending: FxHashMap<u64, Pending>,
@@ -1094,12 +1093,14 @@ pub struct Uring {
     /// The completions reaped from the ring, kept for the next reap's.
     posted: Vec<(u64, i32, u32)>,
     /// The request reading each watch's events, by the watch's tag.
-    watches: BTreeMap<Tag, u64>,
+    watches: FxHashMap<Tag, u64>,
     /// The request accepting each listen's connections, by the listen's tag.
-    listens: BTreeMap<Tag, u64>,
-    spawns: BTreeMap<Tag, Spawning>,
-    conns: BTreeMap<Conn, Connection>,
+    listens: FxHashMap<Tag, u64>,
+    spawns: FxHashMap<Tag, Spawning>,
+    conns: FxHashMap<Conn, Connection>,
     next_conn: u64,
+    /// By ticks since `start`; a wait of the ring ends at the next one due.
+    timers: Wheel<Tag>,
     confine: Option<Arc<dyn Confine>>,
     /// Requests the kernel may still hold after the ring failed: kept, never freed, so it
     /// writes into nothing else.
@@ -1122,7 +1123,7 @@ impl Uring {
             table,
             registered,
             provided,
-            files: BTreeMap::new(),
+            files: FxHashMap::default(),
             pending: FxHashMap::default(),
             next: 0,
             waiting: VecDeque::new(),
@@ -1131,11 +1132,12 @@ impl Uring {
             direct_writes: 0,
             ready: Vec::new(),
             posted: Vec::new(),
-            watches: BTreeMap::new(),
-            listens: BTreeMap::new(),
-            spawns: BTreeMap::new(),
-            conns: BTreeMap::new(),
+            watches: FxHashMap::default(),
+            listens: FxHashMap::default(),
+            spawns: FxHashMap::default(),
+            conns: FxHashMap::default(),
             next_conn: 0,
+            timers: Wheel::new(),
             confine: None,
             abandoned: Vec::new(),
             offload: Offload::new()?,
@@ -1160,6 +1162,14 @@ impl Uring {
             }
             _ => None,
         }
+    }
+
+    /// Every timer due, fired in the order they were due.
+    fn fire_timers(&mut self) {
+        let ready = &mut self.ready;
+        self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
+            ready.push(Completion { tag, done: Done::Fired });
+        });
     }
 
     /// Forgets the descriptor kept for `name`: the name now is another file.
@@ -1300,14 +1310,6 @@ impl Uring {
                 let (fd, flags) = file.target();
                 Sqe { opcode: OP_FSYNC, flags, fd, user_data, ..Sqe::default() }
             }
-            Op::Timer { after } => Sqe {
-                opcode: OP_TIMEOUT,
-                fd: -1,
-                addr: &**after as *const Timespec as u64,
-                len: 1,
-                user_data,
-                ..Sqe::default()
-            },
             Op::Write { fd, dir, bytes, put, names, .. } => {
                 let fd = fd.as_raw_fd();
                 sqes[1] =
@@ -1565,14 +1567,21 @@ impl Uring {
             }
             self.abandoned.push(pending);
         }
-        for (tag, mut spawn) in std::mem::take(&mut self.spawns) {
+        // Timers need no ring, but end with it as everything in flight does.
+        self.timers.drain(|_, tag| self.ready.push(failed(tag)));
+        let mut spawns: Vec<(Tag, Spawning)> = self.spawns.drain().collect();
+        spawns.sort_unstable_by_key(|it| it.0);
+        for (tag, mut spawn) in spawns {
             if !spawn.exited {
                 _ = kill(spawn.pidfd.as_raw_fd());
             }
             spawn.failed = Some(why.clone());
             self.ready.push(Completion { tag, done: spawn.end() });
         }
-        for conn in self.conns.values_mut() {
+        let mut conns: Vec<Conn> = self.conns.keys().copied().collect();
+        conns.sort_unstable();
+        for conn in conns {
+            let conn = self.conns.get_mut(&conn).expect("listed");
             for (tag, _) in conn.recvs.drain(..) {
                 self.ready.push(failed(tag));
             }
@@ -1687,8 +1696,6 @@ impl Uring {
             }
             Op::Sync { .. } if res < 0 => Step::Ends(failed(res)),
             Op::Sync { .. } => Step::Ends(Some(Done::Synced)),
-            Op::Timer { .. } if res == -libc::ETIME || res == 0 => Step::Ends(Some(Done::Fired)),
-            Op::Timer { .. } => Step::Ends(failed(res)),
             Op::Write { bytes, put, temporary, file, chain, .. } => {
                 let Some([wrote, synced, renamed, dir]) = chain.take(link, res, WRITE_LINKS) else {
                     return Step::Held;
@@ -2477,11 +2484,8 @@ impl Driver for Uring {
                     }
                 }),
                 Effect::Timer { after, .. } => {
-                    let after = Box::new(Timespec {
-                        sec: after.as_secs() as i64,
-                        nsec: after.subsec_nanos() as i64,
-                    });
-                    self.start(tag, Op::Timer { after });
+                    let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
+                    self.timers.insert(due, tag);
                     Ok(None)
                 }
                 Effect::Map { file, .. } => crate::fs::map(&at(&file)).map(|it| Some(Done::Mapped(it))),
@@ -2529,17 +2533,22 @@ impl Driver for Uring {
     fn poll(&mut self, out: &mut Vec<Completion>, wait: Duration) -> usize {
         let before = out.len();
         self.reap();
+        self.fire_timers();
         out.append(&mut self.ready);
         if out.len() == before && self.in_flight > 0 {
             let deadline = Instant::now() + wait;
             while out.len() == before {
                 let left = deadline.saturating_duration_since(Instant::now());
-                if let Err(error) = self.ring.enter(Some(left)) {
+                let now = wheel::ticks(self.start.elapsed());
+                let until_timer =
+                    self.timers.next_deadline().map(|due| Duration::from_nanos(due.saturating_sub(now)));
+                if let Err(error) = self.ring.enter(Some(until_timer.map_or(left, |it| it.min(left)))) {
                     self.fail_unsubmitted(error);
                     out.append(&mut self.ready);
                     break;
                 }
                 self.reap();
+                self.fire_timers();
                 out.append(&mut self.ready);
                 if left.is_zero() {
                     break;
@@ -2566,6 +2575,8 @@ impl Driver for Uring {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
     use crate::{
         Address, Confined, FileName, Sandbox, Traced, Untraceable, run_until_idle,

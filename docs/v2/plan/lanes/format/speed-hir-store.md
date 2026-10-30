@@ -83,8 +83,9 @@ briefs live in `~/restart-2026-10-28/briefs/v2/`.
   the other signatures lower from the file's AST with absolute pointers, so any edit re-runs them
   and they backdate. Making signatures relative to an anchor, as bodies are, removes that
   (`signatures.rs`, speed-hir-defs).
-- **A path interns its `ModPath` per lowering** (`lower/path.rs`, `Interned::new`), one hash per
-  path. This is the next step after `Path` columns.
+- **Paths no longer intern their `ModPath` a second time.** `ModPath` is a 16-byte `Copy` value
+  with interned segments (speed-hir-expand), and `Path::BarePath(ModPath)` holds it directly: one
+  intern probe per lowered path instead of two, and one pointer fewer on every read.
 
 - **`Option<Idx>` is 8 bytes.** `la_arena::Idx` has no niche, so `Statement` stays 32 bytes,
   `MatchArm` 16 and `RefType` 16. A raw index that can't be `u32::MAX` (a `NonMaxU32`-style

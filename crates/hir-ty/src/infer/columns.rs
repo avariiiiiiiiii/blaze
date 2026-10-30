@@ -693,10 +693,22 @@ impl<K: DenseKey, T> CsrBuilder<K, T> {
             .map(|(index, range)| (K::from_index(index), &self.items[range.slice()]))
     }
 
+    /// O(keys) when inference wrote the lists in key order without replacing one (the flat
+    /// array is kept as it is), else one move of every live item.
     pub(crate) fn freeze(self) -> Csr<K, T> {
         let CsrBuilder { mut ranges, items, .. } = self;
         while ranges.last().is_some_and(|range| range.is_absent()) {
             ranges.pop();
+        }
+        let mut next = 0usize;
+        let in_order = ranges.iter().filter(|range| !range.is_absent()).all(|range| {
+            let here = range.start as usize == next;
+            next += range.len as usize;
+            here
+        });
+        if in_order && next == items.len() {
+            let (ranges, items) = (ranges.into_boxed_slice(), items.into_boxed_slice());
+            return Csr { ranges, items, key: PhantomData };
         }
         let mut items: Vec<Option<T>> = items.into_iter().map(Some).collect();
         let mut flat = Vec::with_capacity(items.len());

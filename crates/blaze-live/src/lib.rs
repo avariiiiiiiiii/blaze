@@ -9,8 +9,13 @@
 //! call, a vtable or a function pointer handed to a library, arrives at the new one.
 //!
 //! [`Live::poll`] applies what came in since it was last called. Call it where nothing of
-//! the program's is half done, such as between two frames: a function that is running
-//! when its patch lands finishes as it was, and the next call runs the new code.
+//! the program's is half done, such as between two frames: a function the calling thread is
+//! running when its patch lands finishes as it was, and the next call runs the new code.
+//! Other threads keep running while a patch is applied, and v1 writes its jumps over the
+//! entries of functions they may be in and its statics while they may use them: a program
+//! with other threads must keep them out of the functions and statics a patch changes while
+//! `poll` runs (and [`Live::apply_as_they_come`] gives no such place at all). The jump-table
+//! runtime in [`slots`] never writes over code a thread can be in.
 //!
 //! What a patch cannot do, it says, and the program has to be started again: an edit that
 //! changes a type the rest of the program can see writes the whole object again, and a
@@ -154,11 +159,19 @@ impl Live {
 
 /// The counters that code the daemon compiled to count its branches adds to, which the
 /// sampler reports with the samples. That code finds them by calling this, by name.
+// SAFETY: the `blaze_live_` prefix is this crate's, so no other item of a program exports
+// `blaze_live_counters`; a second one would fail the link or bind the daemon's code to the
+// wrong counters.
 #[unsafe(no_mangle)]
 pub extern "C" fn blaze_live_counters() -> *mut u64 {
-    static mut COUNTERS: [u64; format::COUNTERS] = [0; format::COUNTERS];
-    &raw mut COUNTERS as *mut u64
+    COUNTERS.as_ptr() as *mut u64
 }
+
+/// [`blaze_live_counters`]'s: an `AtomicU64` is a `u64` in memory, and the sampler loads each
+/// atomically. The daemon's code must add to them atomically too (relaxed is enough), or its
+/// adds race the sampler's loads.
+static COUNTERS: [std::sync::atomic::AtomicU64; format::COUNTERS] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; format::COUNTERS];
 
 /// What the daemon last said of the tiers of this program: the functions it spends its time
 /// in, the level each is compiled at, and what the daemon did of late. Nothing before

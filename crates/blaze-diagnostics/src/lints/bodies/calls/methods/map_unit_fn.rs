@@ -61,7 +61,7 @@ fn map_unit_fn(b: &BodyCx<'_, '_>, block: ExprId, index: usize) -> Option<Found>
         || from_expansion(&b.expr_span(receiver)?)
         || from_expansion(&b.expr_span(arg)?)
         || !is_impl_slice(b, receiver)
-        || method_fn(b, expr).and_then(|it| fn_item(b.db(), it)).as_deref() != Some("IteratorMap")
+        || !method_fn(b, expr).and_then(|it| fn_item(b.db(), it)).is_some_and(|it| it.as_str() == "IteratorMap")
     {
         return None;
     }

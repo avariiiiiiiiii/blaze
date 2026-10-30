@@ -15,3 +15,17 @@ suggestion there, but at the wrong span; the test is left out of
 `tests/lints/syntax/early/builtin.rs` until this is in.
 
 > forwarded to db: `crates/hir-expand/` (the mbe transcription's spans) is lane db's.
+
+## diagnostics-lints-syntax-early: the `;` hir-expand drops from an expression expansion (speed)
+
+`crates/hir-expand/src/lib.rs` (db): `token_tree_to_syntax_node` drops the `;` an `ExpandTo::Expr`
+expansion ends in (`without_last_semicolon`) and keeps nothing of it. To find that `;` and give
+`semicolon_in_expressions_from_macros`, `lints/syntax/early/macros.rs` (`dropped_semicolon`) has
+to expand every `macro_rules!` call in expression position a second time, uncached: that doubles
+the expansion cost of every expression macro in the crate. Please record the dropped `;`'s span
+in `ExpansionSpanMap` beside `matched_arm` (e.g. `pub dropped_semicolon: Option<Span>`, set in
+`parse_macro_expansion`). It is one `Option<Span>` per expansion, written once; then the lint
+reads it from `call.expansion_span_map(db)` and expands nothing. I switch to it in
+`macros.rs` the moment it lands.
+
+> forwarded to db: `crates/hir-expand/` is lane db's (speed-hir-expand works in it).

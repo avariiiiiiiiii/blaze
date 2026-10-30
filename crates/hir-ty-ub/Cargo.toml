@@ -14,6 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+either.workspace = true
 rustc-hash.workspace = true
 smallvec.workspace = true
 triomphe.workspace = true
@@ -21,9 +22,19 @@ rustc_abi.workspace = true
 rustc_type_ir.workspace = true
 base-db.workspace = true
 hir-def.workspace = true
+hir-expand.workspace = true
 hir-ty.workspace = true
 hir-ty-mir.workspace = true
 intern.workspace = true
+span.workspace = true
+syntax.workspace = true
+
+[dev-dependencies]
+# The tests' database, as `crates/hir-ide/src/tests/mir/eval.rs` builds one from source.
+hir-ide.workspace = true
+salsa.workspace = true
+test-fixture.workspace = true
+test-utils.workspace = true
 
 [lints]
 workspace = true

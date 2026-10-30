@@ -35,21 +35,21 @@ mod write;
 #[cfg(test)]
 mod tests;
 
+use std::collections::VecDeque;
 use std::fmt;
-use std::sync::Arc;
 
 use blaze_codegen::{CompiledFunction, InstanceKey, Static, Target};
 use blaze_core::{Effect, FileName};
 use blaze_ids::{ContentId, Hasher};
 use blaze_items::ItemKey;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 pub use output::{Debug, Format, Live, Native, NativeKind, Output, OutputKind, Platform};
 pub use position::{COLUMN, LINE, Position, SpanTable};
 
 use commit::{History, Pending, Undo, Writes};
-use model::{NativeFile, Object, Plan, Writer};
-use stage::Stage;
+use model::{NativeFile, Plan, Writer};
+use stage::{Contents, Stage};
 use state::{State, has_table};
 use symbols::{Obj, SymKey, Symbols};
 
@@ -86,7 +86,8 @@ pub struct Staged {
     base: u64,
     state: State,
     writes: Writes,
-    undo: Vec<(u64, Vec<u8>)>,
+    /// The ranges of the old file the commit overwrites.
+    undo: Vec<(u64, u64)>,
 }
 
 impl Staged {
@@ -123,9 +124,9 @@ pub struct Image {
     writer: Box<dyn Writer>,
     plan: Plan,
     symbols: Symbols,
-    objects: FxHashMap<Obj, Arc<Object>>,
+    objects: FxHashMap<Obj, native::Read>,
     state: State,
-    history: Vec<Undo>,
+    history: VecDeque<Undo>,
     pending: Option<Pending>,
     tags: u32,
     /// The last generation given out: generations are never reused.
@@ -160,7 +161,7 @@ impl Image {
             symbols: Symbols::default(),
             objects: FxHashMap::default(),
             state: State::new(),
-            history: Vec::new(),
+            history: VecDeque::new(),
             pending: None,
             tags: 0,
             generations: blaze_live::patch::FIRST_GENERATION,
@@ -178,19 +179,27 @@ impl Image {
         let table = has_table(&self.output, self.plan.indexed_code);
         let mut new = self.state.clone();
         new.generation = self.generations + 1;
+        if new.wants_compaction() {
+            new.compact();
+        }
+        let arena = bumpalo::Bump::new();
+        let contents = Contents::new(new.piece_count());
         let mut stage = Stage {
             output: &self.output,
             writer: &*self.writer,
             plan: &self.plan,
             symbols: &mut self.symbols,
             objects: &mut self.objects,
+            native: native::Pass::default(),
             old: &self.state,
             new,
             name: &self.name,
-            bytes: FxHashMap::default(),
-            fresh: FxHashSet::default(),
-            write: FxHashSet::default(),
-            changed: FxHashSet::default(),
+            arena: &arena,
+            contents,
+            fresh: Default::default(),
+            write: Default::default(),
+            changed: Default::default(),
+            dirty_cells: Default::default(),
             removed: Vec::new(),
             emptied: Vec::new(),
             touched: Vec::new(),
@@ -199,6 +208,9 @@ impl Image {
             table,
             functions: 0,
             statics: 0,
+            owned: Vec::new(),
+            scratch: Vec::new(),
+            spans_changed: false,
         };
         stage.inputs(&change)?;
         stage.apply(&change)?;
@@ -276,31 +288,31 @@ impl Image {
         if self.pending.is_some() {
             return Err(LinkError { function: None, what: "a commit is in flight".into() });
         }
-        let Some(undo) = self.history.last() else {
+        let Some(undo) = self.history.back() else {
             return Err(LinkError { function: None, what: "no commit to roll back".into() });
         };
         let from = self.state.generation;
         let to = undo.state.generation;
         let message = self.output.live.as_ref().map(|_| {
-            (from, blaze_live::patch::Message::RollBack { id: self.state.lineage, to })
+            (from, blaze_live::patch::Message::RollBack { id: self.state.lineage, to }.encode())
         });
         let writes = Writes {
             full: undo.full,
             len: undo.len,
             old_len: self.state.file_len,
-            writes: undo.writes.clone(),
+            writes: file::restore(&undo.state, undo.full, &undo.writes),
             remove: if message.is_some() { vec![to] } else { Vec::new() },
             message,
         };
         let steps = self.steps(writes)?;
-        let undo = self.history.pop().expect("looked at above");
+        let undo = self.history.pop_back().expect("looked at above");
         let current = std::mem::replace(&mut self.state, undo.state.clone());
         self.begin(steps, (current, History::Push(undo)), effects);
         Ok(())
     }
 
     pub fn slot(&self, function: &InstanceKey) -> Option<Slot> {
-        let sym = self.symbols.find(&SymKey::Slot(*function))?;
+        let sym = self.symbols.find_slot(function)?;
         let (piece, offset) = self.state.home(sym)?;
         let piece = self.state.piece(piece)?;
         if !matches!(self.symbols.key(piece.sym), SymKey::Stubs) {
@@ -390,13 +402,19 @@ pub fn default_libraries(output: &Output, natives: &[Native<'_>]) -> Result<Vec<
 
 /// What an image is across its generations: its first full link's pieces and inputs.
 fn lineage(stage: &Stage<'_>, to: &FileName) -> [u8; 16] {
-    let mut keys: Vec<String> =
-        stage.new.live_pieces().map(|(_, piece)| format!("{:?}", stage.symbols.key(piece.sym))).collect();
-    keys.sort_unstable();
-    let mut hasher = Hasher::new("blaze v2 link lineage 1");
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut keys: Vec<(u32, u32)> = Vec::with_capacity(stage.new.piece_count() as usize);
+    for piece in stage.new.live_pieces() {
+        let start = bytes.len();
+        stage.symbols.write_key(piece.sym, &mut bytes);
+        keys.push((start as u32, (bytes.len() - start) as u32));
+    }
+    let key = |it: &(u32, u32)| &bytes[it.0 as usize..(it.0 + it.1) as usize];
+    keys.sort_unstable_by(|a, b| key(a).cmp(key(b)));
+    let mut hasher = Hasher::new("blaze v2 link lineage 2");
     hasher.part(to.as_str().as_bytes()).part(format!("{:?}", stage.output).as_bytes());
-    for key in &keys {
-        hasher.part(key.as_bytes());
+    for it in &keys {
+        hasher.part(key(it));
     }
     for input in stage.new.inputs.iter() {
         hasher.id(&input.id);

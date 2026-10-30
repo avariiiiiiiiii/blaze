@@ -26,7 +26,7 @@ use hir_def::{AdtId, FieldId, builtin_derive::BuiltinDeriveImplTrait};
 use rustc_hash::{FxHashMap, FxHashSet};
 use syntax::{
     AstNode, SyntaxKind, SyntaxNode, SyntaxNodePtr,
-    ast::{self, BinaryOp, HasAttrs, RangeItem},
+    ast::{self, BinaryOp, HasArgList, HasAttrs, RangeItem},
 };
 
 use super::{
@@ -470,7 +470,11 @@ impl Mark<'_, '_, '_, '_> {
     /// constant (live), walked out of any pattern it is in.
     fn anon(&mut self, file: HirFileId, node: &SyntaxNode) {
         let ptr = InFile::new(file, SyntaxNodePtr::new(node));
-        let closure = node.kind() == SyntaxKind::CLOSURE_EXPR;
+        let closure = match node.kind() {
+            SyntaxKind::CLOSURE_EXPR => true,
+            SyntaxKind::BLOCK_EXPR => ast::BlockExpr::cast(node.clone()).is_some_and(|it| it.const_token().is_none()),
+            _ => false,
+        };
         let own = closure
             && self.propagated
             && self.k.levels.at(self.k.cx, &InFile::new(file, node.clone())).is_allow_or_expect();

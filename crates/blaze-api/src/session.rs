@@ -52,13 +52,15 @@ pub struct Session {
     pending: FxHashMap<u64, Pending>,
     /// The number of each request of a live connection not yet over, ordered so a gone
     /// connection's are one range.
+    // BTreeMap: range queries by connection.
     live: BTreeMap<RequestRef, u64>,
     /// Each job's request, and its candidate for a best-of-N.
     jobs: FxHashMap<JobId, (u64, Option<u32>)>,
     /// Commits waiting to be durable.
     tickets: FxHashMap<Ticket, u64>,
-    /// The views each connection opened with [`Request::Open`], by root, one per open.
-    held: BTreeMap<Conn, BTreeMap<ContentId, Vec<ViewId>>>,
+    /// The views each connection opened with [`Request::Open`], by root, one per open; sorted
+    /// by root where a gone connection's are closed.
+    held: FxHashMap<Conn, FxHashMap<ContentId, Vec<ViewId>>>,
     /// The database's view of the last job that ended on each of the latest [`KEPT`] roots,
     /// oldest first: what [`Request::Why`] reads, since a view's reruns are its own.
     kept: VecDeque<(ContentId, ViewId)>,
@@ -141,7 +143,7 @@ impl Session {
             live: BTreeMap::new(),
             jobs: FxHashMap::default(),
             tickets: FxHashMap::default(),
-            held: BTreeMap::new(),
+            held: FxHashMap::default(),
             kept: VecDeque::new(),
         }
     }
@@ -572,14 +574,17 @@ impl Session {
                 pending.what.cancel(cx.builder);
             }
         }
-        for files in self.held.remove(&conn).into_iter().flat_map(BTreeMap::into_values).flatten() {
+        let mut held: Vec<(ContentId, Vec<ViewId>)> =
+            self.held.remove(&conn).into_iter().flatten().collect();
+        held.sort_unstable_by_key(|&(root, _)| root);
+        for files in held.into_iter().flat_map(|(_, views)| views) {
             cx.vfs.close(files);
         }
     }
 
     /// The views the session holds open: the connections' and the jobs'.
     fn views(&self) -> u32 {
-        let held: usize = self.held.values().flat_map(BTreeMap::values).map(Vec::len).sum();
+        let held: usize = self.held.values().flat_map(FxHashMap::values).map(Vec::len).sum();
         let jobs: usize = self.pending.values().map(|it| it.what.views()).sum();
         u32::try_from(held + jobs).expect("fewer than 2^32 open views")
     }

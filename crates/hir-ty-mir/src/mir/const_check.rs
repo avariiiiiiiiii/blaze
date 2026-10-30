@@ -148,7 +148,8 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
             }
         }
         let Some(terminator) = &block.terminator else { continue };
-        let TerminatorKind::Call { func, from_hir_call: true, .. } = &terminator.kind else {
+        let TerminatorKind::Call { func, from_hir_call: true, intrinsic, .. } = &terminator.kind
+        else {
             continue;
         };
         let Some(expr) = written(terminator.span) else { continue };
@@ -178,12 +179,14 @@ pub fn const_check<'db>(db: &'db dyn HirDatabase, def: DefWithBodyId) -> ConstCh
                 }
                 // rustc's `IntrinsicNonConst`, for an intrinsic that is not `const` (nor
                 // `#[rustc_comptime]`, which `is_const_callable` accepts).
-                if FunctionSignature::is_intrinsic(db, callee) {
-                    let name = FunctionSignature::of(db, callee).name.as_str().to_owned();
+                if let Some(intrinsic) = intrinsic {
                     report(
                         "",
                         terminator.span,
-                        format!("cannot call non-const intrinsic `{name}` in {}", kind.plural()),
+                        format!(
+                            "cannot call non-const intrinsic `{intrinsic}` in {}",
+                            kind.plural()
+                        ),
                     );
                     continue;
                 }

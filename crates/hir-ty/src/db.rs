@@ -883,6 +883,7 @@ pub mod kinds {
         VARIANT_FIELD_IDS = 0x2454, "variant_field_ids";
         ENUM_VARIANT_IDS = 0x2455, "enum_variant_ids";
         DESTRUCTOR = 0x2456, "destructor";
+        STRUCT_TAIL_MAY_BE_UNSIZED = 0x2457, "struct_tail_may_be_unsized";
 
         // Method resolution, impls, coherence, specialization.
         LOOKUP_IMPL_METHOD = 0x2460, "lookup_impl_method_stored";
@@ -913,6 +914,8 @@ pub mod kinds {
         ORPHAN_RULES_HOLD = 0x2476, "orphan_rules_hold";
         SPECIALIZES = 0x2477, "specializes_query";
         IMPL_HAS_UNCONSTRAINED_PARAMS = 0x2478, "impl_has_unconstrained_params";
+        TRAIT_VALUE_ITEMS = 0x2479, "trait_value_items";
+        IN_CRATE_TRAIT_VALUE_ITEMS = 0x247a, "in_crate_trait_value_items";
 
         // Opaque types.
         IMPL_TYPE_ALIASES = 0x2480, "impl_type_aliases";

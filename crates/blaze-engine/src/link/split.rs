@@ -279,7 +279,7 @@ fn spread_unwind(
     };
     let data = sections[at].data.clone();
     let mut relocations = std::mem::take(&mut sections[at].relocations);
-    relocations.sort_by_key(|it| it.offset);
+    blaze_ids::radix::sort_copy_by_key(&mut relocations, |it| it.offset);
     let word = |at: usize| -> anyhow::Result<usize> {
         let bytes = data.get(at..at + 4).context("the unwind table ends inside an entry")?;
         Ok(u32::from_le_bytes(bytes.try_into()?) as usize)

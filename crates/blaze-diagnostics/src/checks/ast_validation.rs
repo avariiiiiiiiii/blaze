@@ -192,6 +192,17 @@ impl V<'_, '_, '_, '_> {
         })
     }
 
+    /// Each attribute of `node` once `cfg_attr` is expanded, with the `#[..]` it is written in.
+    fn each_attr(&self, node: &SyntaxNode, mut f: impl FnMut(&ast::Meta, &ast::Attr)) {
+        let Some(owner) = ast::AnyHasAttrs::cast(node.clone()) else { return };
+        let cfg = self.walk.cfg;
+        let _: Option<()> =
+            hir_expand::attrs::expand_cfg_attr(ast::attrs_including_inner(&owner), || cfg, |meta, attr| {
+                f(&meta, &attr);
+                ControlFlow::Continue(())
+            });
+    }
+
     fn has_attr(&self, node: &SyntaxNode, name: &str) -> bool {
         self.attr(node, name).is_some()
     }
@@ -366,9 +377,9 @@ fn until_non_whitespace(token: &SyntaxToken, end: TextSize) -> TextRange {
 
 /// rustc's `feature_err` of `feature` on a nightly compiler: E0658 with the feature's issue
 /// and how to enable it.
-fn feature_err(feature: &str, issue: Option<u32>, message: impl Into<String>, span: Span) -> Diag {
+fn feature_err(feature: &str, message: impl Into<String>, span: Span) -> Diag {
     let mut diag = Diag::error(Some("E0658"), message, span);
-    if let Some(issue) = issue {
+    if let Some(issue) = crate::lints::syntax::attrs::features::table::issue(feature) {
         diag.note(format!("see issue #{issue} <https://github.com/rust-lang/rust/issues/{issue}> for more information"));
     }
     diag.help(format!("add `#![feature({feature})]` to the crate attributes to enable"));

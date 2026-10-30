@@ -920,7 +920,7 @@ impl<V: Send + Sync + 'static> Map<V> {
     /// One shard of [`Map::edit_all_with`]: `edit` decides without the lock, then each edit
     /// still current is made under it. `edits` and `gone` are scratch, left empty.
     #[allow(clippy::too_many_arguments)]
-    fn edit_shard<S, A: std::alloc::Allocator, B: std::alloc::Allocator>(
+    fn edit_shard<S, A: std::alloc::Allocator + std::alloc::AllocatorNightly, B: std::alloc::Allocator + std::alloc::AllocatorNightly>(
         &self,
         shard: &Shard,
         task: &Guard,

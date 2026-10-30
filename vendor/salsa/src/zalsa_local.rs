@@ -1869,14 +1869,18 @@ impl<'me> ActiveQueryGuard<'me> {
         let untracked_read = previous.is_derived_untracked();
 
         let tracked_ids = previous.tracked_struct_ids();
+        // Only reads the graph, which a panic while reading leaves as it was.
+        let edges = std::panic::AssertUnwindSafe(edges);
 
         // SAFETY: We do not access the query stack reentrantly.
         unsafe {
             self.local_state.with_query_stack_unchecked_mut(|stack| {
                 #[cfg(debug_assertions)]
                 assert_eq!(stack.len(), self.push_len, "mismatched push and pop");
+                // The wrapper whole, not its field: a closure captures `edges.0` alone.
+                let edges = edges;
                 let frame = stack.last_mut().unwrap();
-                frame.seed_iteration(durability, changed_at, edges, untracked_read, tracked_ids);
+                frame.seed_iteration(durability, changed_at, edges.0, untracked_read, tracked_ids);
             })
         }
     }

@@ -112,7 +112,7 @@ impl<'a> LexedStr<'a> {
     #[cfg(feature = "fuzz")]
     pub fn lexes_alike(edition: Edition, text: &'a str) -> bool {
         let (fast, slow) = (Self::lex::<true>(edition, text), Self::lex::<false>(edition, text));
-        fast.tokens == slow.tokens
+        *fast.tokens == *slow.tokens
             && *fast.checkpoints == *slow.checkpoints
             && *fast.long == *slow.long
             && fast.errors().eq(slow.errors())

@@ -59,9 +59,9 @@ pub struct Reads {
 }
 
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Reads>() == 32);
+const _: () = assert!(std::mem::size_of::<Reads>() == 24);
 #[cfg(target_pointer_width = "64")]
-const _: () = assert!(std::mem::size_of::<Option<Reads>>() == 32);
+const _: () = assert!(std::mem::size_of::<Option<Reads>>() == 24);
 
 impl Reads {
     #[inline]

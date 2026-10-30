@@ -267,7 +267,7 @@ fn lower_error(error: blaze_lower::LowerError) -> ApiError {
 
 /// A job's front end as the loop keeps it ([`Writer::keep`]), with what it was lowered from:
 /// the next build of the head lowers into it only when it lowers the same.
-pub(crate) struct KeptLowered {
+pub struct KeptLowered {
     /// What its database keeps of the store ([`deps::session`]), its goals flushed when the
     /// next build lowers into it. Declared first: its goal store is uninstalled before the
     /// database it is keyed to drops.
@@ -289,7 +289,7 @@ pub(crate) struct KeptLowered {
 /// What a task reads the front end through ([`Steps::Reader`]): a shared reference to the job's
 /// lowered front end, as it stood when the loop posted the task. Its database is read by
 /// reference, never cloned.
-pub(crate) struct UnitReader {
+pub struct UnitReader {
     front: Arc<Lowered>,
     /// The dependencies' check outcomes its database was served ([`deps::serve`]): written
     /// with the front end, only while no reader holds it.
@@ -314,7 +314,7 @@ impl UnitReader {
 /// The job's front end as only the loop writes it: the one reference not lent to a reader,
 /// the writes asked for and not yet applied, and as each build script's run is applied, the
 /// identities of the units it was the last run in the closure of.
-pub(crate) struct UnitWriter {
+pub struct UnitWriter {
     /// What the front end's database keeps of the store ([`deps::session`]), declared first
     /// as in [`KeptLowered`].
     session: deps::Session,
@@ -705,7 +705,7 @@ pub(crate) fn checks_only(goal: Goal, unit: &Unit) -> bool {
 }
 
 /// A job's front as the loop holds it.
-pub(crate) struct JobFront(pub(crate) Arc<Job>);
+pub struct JobFront(pub(crate) Arc<Job>);
 
 impl Front<Real> for JobFront {
     fn fresh(&self, unit: usize) -> bool {
@@ -815,7 +815,7 @@ impl Kept for codegen::Linked {
 
 /// User code of a job, run on the loop: a build script's run, the build's tests, or its
 /// program.
-pub(crate) enum UnitRuns {
+pub enum UnitRuns {
     Script(script::ScriptRun),
     Tests(test::TestRun),
     Program(run::Program),

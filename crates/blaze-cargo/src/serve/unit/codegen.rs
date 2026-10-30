@@ -556,7 +556,7 @@ pub(crate) fn generate<'db>(
 /// An image kept linked at one path, and what is in it, so the next link of it is a change.
 /// Each column is sorted, so a link's diff against it is one merge pass: `O(n)` with no hashing
 /// and no allocation but the diff itself (keys are content hashes, 32 bytes each).
-pub(crate) struct Linked {
+pub struct Linked {
     image: Image,
     output: Output,
     functions: Vec<InstanceKey>,

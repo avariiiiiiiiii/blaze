@@ -13,8 +13,8 @@ use hir_ty::{ParamEnvAndCrate, next_solver::{DbInterner, ParamEnv}};
 
 use super::{HirInstance, Kind, places::Ref};
 use crate::{
-    ALLOCATOR_ENTRIES, Produced, compile_as, declares_global_allocator, fragment::FuncTarget,
-    global_allocator_export, linked_crates, ptr,
+    ALLOCATOR_ENTRIES, Produced, compile_as, declares_global_allocator, depended_crates,
+    fragment::FuncTarget, global_allocator_export, ptr,
 };
 
 /// One function of the shim: `symbol`, of `params` pointer-sized arguments and a pointer
@@ -42,7 +42,7 @@ pub(super) fn shim(
     let Some(boxed) = DbInterner::new_with(db, krate).lang_items().OwnedBox else {
         return Ok(Vec::new()); // alloc: empty, allocates nothing
     };
-    let program = linked_crates(db, [krate]);
+    let program = depended_crates(db, [krate]);
     if !program.contains(&boxed.krate(db)) {
         return Ok(Vec::new()); // alloc: empty, allocates nothing
     }

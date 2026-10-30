@@ -1253,7 +1253,7 @@ impl FromStore {
             return from;
         };
         let owned = &cg.own_statics.crates;
-        from.ids = super::linked_crates(db, owned.iter().copied())
+        from.ids = super::linked_crates(db, cg.symbols, owned.iter().copied())
             .into_iter()
             .filter(|krate| owned.contains(krate) || krate.data(db).origin.is_local())
             .filter_map(|krate| Some((krate, cg.names.content_id(krate)?)))
@@ -1562,6 +1562,23 @@ impl Base {
         let files: Vec<FileId> =
             // alloc: once per full build, kept in the base
             compiled.iter().map(|&(root, _)| body_file(db, root.into())).collect();
+        let instance_fns: Vec<Option<FunctionId>> = (instances.keys())
+            .map(|instance| match instance.def {
+                InstanceDef::Fn(func) => Some(func),
+                _ => None,
+            })
+            .collect();
+        // Asked on every thread first: of a program from the store, few are asked yet, and
+        // each is its function's inference and MIR.
+        cg.symbols.in_parallel(compiled.len() + instance_fns.len(), &|db, _, at| {
+            let func = match at.checked_sub(compiled.len()) {
+                None => Some(compiled[at].0),
+                Some(at) => instance_fns[at],
+            };
+            if let Some(func) = func {
+                _ = super::fncache::cached_closure(db, func);
+            }
+        });
         let cached = |func| super::fncache::cached_closure(db, func).is_some();
         let cached_roots =
             // alloc: once per full build, kept in the base

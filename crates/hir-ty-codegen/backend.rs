@@ -394,7 +394,7 @@ pub(super) struct Tally {
 }
 
 /// The words of [`Counts::words`]: three for each [`Produced`], one for each [`Count`], then
-/// LLVM's phases and the steps around the producer, in nanoseconds.
+/// LLVM's phases, in nanoseconds.
 mod word {
     pub(super) const CRANELIFT: usize = 0;
     pub(super) const LLVM: usize = 3;
@@ -407,8 +407,7 @@ mod word {
     pub(super) const IMPORTED: usize = 14;
     pub(super) const IMPORTED_SIZE: usize = 15;
     pub(super) const PHASES: usize = 16;
-    pub(super) const STEPS: usize = PHASES + super::Phase::COUNT;
-    pub(super) const COUNT: usize = STEPS + super::Step::COUNT;
+    pub(super) const COUNT: usize = PHASES + super::Phase::COUNT;
 }
 
 /// A count of [`Tally`]: which of a thread's [`Counts::words`] it is.
@@ -442,8 +441,6 @@ struct Counts {
     alone: Mutex<BTreeMap<String, usize>>,
     /// Why LLVM left a function to Cranelift, and how often.
     fallbacks: Mutex<BTreeMap<String, usize>>,
-    /// Where Cranelift's time went on this thread, with `BLAZE_STATS`.
-    passes: Mutex<Option<cranelift_codegen::timing::PassTimes>>,
     /// Whether a thread holds these counts. The counts of [`Registry::late`] are held by
     /// none and shared by all: their words are added to with `fetch_add`.
     held: AtomicBool,
@@ -462,7 +459,6 @@ impl Counts {
             reported: Lines([const { AtomicU64::new(0) }; word::COUNT]),
             alone: Mutex::new(BTreeMap::new()),
             fallbacks: Mutex::new(BTreeMap::new()),
-            passes: Mutex::new(None),
             held: AtomicBool::new(held),
             next: OnceLock::new(),
         }
@@ -550,7 +546,6 @@ impl Registry {
             sums: [0; word::COUNT],
             alone: BTreeMap::new(),
             fallbacks: BTreeMap::new(),
-            passes: None,
         };
         for counts in self.all() {
             counts.take(&mut taken.sums);
@@ -562,9 +557,6 @@ impl Registry {
                     *into.entry(reason).or_default() += count;
                 }
             }
-            if let Some(times) = counts.passes.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                taken.passes.get_or_insert_with(Default::default).add(&times);
-            }
         }
         taken
     }
@@ -574,7 +566,6 @@ struct Taken {
     sums: [u64; word::COUNT],
     alone: BTreeMap<String, usize>,
     fallbacks: BTreeMap<String, usize>,
-    passes: Option<cranelift_codegen::timing::PassTimes>,
 }
 
 /// The calling thread's counts, given back for the next thread when it ends.
@@ -582,12 +573,8 @@ struct Held(&'static Counts);
 
 impl Held {
     fn claim() -> Held {
-        // Cranelift times every pass of every function it compiles, with two reads of the
-        // clock and a token for each, for the report `BLAZE_STATS` asks for alone.
-        if !stats() {
-            // alloc: of no size, allocates nothing; once per thread
-            drop(cranelift_codegen::timing::set_thread_profiler(Box::new(Untimed)));
-        }
+        // Cranelift's own timer reads the clock twice for every pass of every function.
+        time_passes();
         Held(REGISTRY.claim())
     }
 }
@@ -606,19 +593,7 @@ fn counts() -> &'static Counts {
     HELD.try_with(|held| held.0).unwrap_or(&REGISTRY.late)
 }
 
-/// A profiler of Cranelift's that reads no clock: its token is of no size, so it is not
-/// allocated either.
-struct Untimed;
-
-impl cranelift_codegen::timing::Profiler for Untimed {
-    // dyn: cranelift's `Profiler::start_pass` returns `Box<dyn Any>`; a `()` is no allocation
-    fn start_pass(&self, _: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
-        // alloc: a `()` is of no size, which allocates nothing
-        Box::new(())
-    }
-}
-
-/// Whether `BLAZE_STATS` asks for the steps and Cranelift's passes to be reported.
+/// Whether `BLAZE_STATS` asks for the report of what the producers did.
 fn stats() -> bool {
     static STATS: OnceLock<bool> = OnceLock::new();
     *STATS.get_or_init(|| std::env::var_os("BLAZE_STATS").is_some())
@@ -642,6 +617,32 @@ impl Phase {
         [Phase::Lower, Phase::Verify, Phase::Optimize, Phase::Emit, Phase::Read, Phase::Export];
 }
 
+/// Has Cranelift time its passes on this thread into the profile ([`blaze_profile::pass`])
+/// from now on, in place of its own timer, which would time them whether asked or not.
+pub(super) fn time_passes() {
+    thread_local! {
+        static SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+    if !SET.replace(true) {
+        // alloc: of no size, allocates nothing; once per thread
+        drop(cranelift_codegen::timing::set_thread_profiler(Box::new(PassTimer)));
+    }
+}
+
+struct PassTimer;
+
+impl cranelift_codegen::timing::Profiler for PassTimer {
+    // dyn: cranelift's `Profiler::start_pass` returns `Box<dyn Any>`
+    fn start_pass(&self, pass: cranelift_codegen::timing::Pass) -> Box<dyn std::any::Any> {
+        match blaze_profile::pass(pass.description()) {
+            // alloc: once per pass, with BLAZE_PROFILE alone
+            Some(timed) => Box::new(timed) as Box<dyn std::any::Any>,
+            // alloc: a `()` is of no size, which allocates nothing
+            None => Box::new(()),
+        }
+    }
+}
+
 /// The steps of compiling one function that are not the producer's.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Step {
@@ -659,19 +660,6 @@ pub(super) enum Step {
     StoreRead,
     /// Encoding an entry and adding it to the store.
     StoreWrite,
-}
-
-impl Step {
-    const COUNT: usize = 7;
-    const ALL: [(Step, &str); Step::COUNT] = [
-        (Step::Infer, "infer"),
-        (Step::Mir, "mir"),
-        (Step::Monomorphize, "monomorphize"),
-        (Step::Translate, "translate"),
-        (Step::Describe, "describe"),
-        (Step::StoreRead, "store read"),
-        (Step::StoreWrite, "store write"),
-    ];
 }
 
 impl Produced {
@@ -744,28 +732,22 @@ impl Tally {
 
     #[cfg(feature = "llvm")]
     pub(super) fn time<T>(&self, phase: Phase, work: impl FnOnce() -> T) -> T {
+        let _pass = blaze_profile::pass(match phase {
+            Phase::Lower => "LLVM lower",
+            Phase::Verify => "LLVM verify",
+            Phase::Optimize => "LLVM optimize",
+            Phase::Emit => "LLVM emit",
+            Phase::Read => "LLVM read",
+            Phase::Export => "LLVM export",
+        });
         let start = Instant::now();
         let out = work();
         counts().add(word::PHASES + phase as usize, start.elapsed().as_nanos() as u64);
         out
     }
 
-    /// Adds the times of Cranelift's passes on this thread since it was last asked, with
-    /// `BLAZE_STATS`. Without it, the thread's Cranelift reads no clock from its next
-    /// function on ([`Held::claim`]).
-    pub(super) fn passes(&self) {
-        let counts = counts();
-        if !stats() {
-            return;
-        }
-        let times = cranelift_codegen::timing::take_current();
-        let mut passes = counts.passes.lock().unwrap_or_else(|e| e.into_inner());
-        passes.get_or_insert_with(Default::default).add(&times);
-    }
-
-    /// Runs `work` as part of `step`.
+    /// Runs `work` as part of `step`, a span of the profile.
     pub(super) fn step<T>(&self, step: Step, work: impl FnOnce() -> T) -> T {
-        // For blaze's trace: target `blaze` spans of 200 µs and longer.
         let _span = match step {
             Step::Infer => tracing::info_span!(target: "blaze", "infer"),
             Step::Mir => tracing::info_span!(target: "blaze", "mir"),
@@ -776,40 +758,20 @@ impl Tally {
             Step::StoreWrite => tracing::info_span!(target: "blaze", "store write"),
         }
         .entered();
-        let start = Instant::now();
-        let out = work();
-        self.add(step, start.elapsed());
-        out
-    }
-
-    pub(super) fn add(&self, step: Step, took: Duration) {
-        counts().add(word::STEPS + step as usize, took.as_nanos() as u64);
+        work()
     }
 
     /// Says what was compiled by which producer since the last call, on stderr. Times are
     /// summed over the threads that compiled.
     pub(super) fn report(&self) {
-        let Taken { sums, alone, fallbacks, passes } = REGISTRY.take();
+        let Taken { sums, alone, fallbacks } = REGISTRY.take();
         let wasted = Duration::from_nanos(sums[self.wasted.0]);
         let phases =
             Phase::ALL.map(|phase| Duration::from_nanos(sums[word::PHASES + phase as usize]));
         let (llvm, cranelift) = (self.llvm.take(&sums), self.cranelift.take(&sums));
         let large = sums[self.large.0];
-        let selected = Self::selected_llvm();
-        let stats = stats();
-        if !selected && !stats {
+        if !Self::selected_llvm() && !stats() {
             return;
-        }
-        if stats {
-            let steps = Step::ALL.map(|(step, name)| {
-                let took = Duration::from_nanos(sums[word::STEPS + step as usize]);
-                // alloc: a line of the report, once per build
-                format!("{name} {took:.1?}")
-            });
-            eprintln!("steps: {}", steps.join(", "));
-            if let Some(passes) = passes {
-                eprint!("cranelift passes:\n{passes}");
-            }
         }
         if let Some(llvm) = llvm {
             let phases = std::iter::zip(Phase::ALL, phases)
@@ -904,7 +866,7 @@ mod tests {
                     for _ in 0..1000 {
                         counts.add(word::LARGE, thread + 1);
                     }
-                    counts.add(word::STEPS, 1);
+                    counts.add(word::PHASES, 1);
                     counts.release();
                 });
             }
@@ -912,7 +874,7 @@ mod tests {
         registry.late.add(word::LARGE, 5);
         let taken = registry.take();
         assert_eq!(taken.sums[word::LARGE], 1000 * (1..=8).sum::<u64>() + 5);
-        assert_eq!(taken.sums[word::STEPS], 8);
+        assert_eq!(taken.sums[word::PHASES], 8);
         assert_eq!(registry.take().sums, [0; word::COUNT]);
     }
 

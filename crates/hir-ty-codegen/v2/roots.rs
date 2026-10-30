@@ -203,7 +203,7 @@ impl HirFrontend<'_> {
         }
         // Sorted by the crates' ids, not in the set's order, which its hasher decides.
         // alloc: once a program, its crates
-        let mut linked: Vec<Crate> = crate::linked_crates(db, [krate]).into_iter().collect();
+        let mut linked: Vec<Crate> = crate::depended_crates(db, [krate]).into_iter().collect();
         linked.sort_unstable_by_key(|it| salsa::plumbing::AsId::as_id(it));
         for linked in linked {
             add_kept(db, homes, linked, listed);

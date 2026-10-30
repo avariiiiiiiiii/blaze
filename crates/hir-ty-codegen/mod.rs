@@ -328,6 +328,9 @@ pub enum RustcStaticCopy {
 
 pub trait SymbolResolver {
     fn function(&self, func: FunctionId) -> Option<intern::Symbol>;
+    /// The dependencies of `krate` its code names, as rustc loads them: those a program of it
+    /// links. Every one, for a crate of the standard library.
+    fn named_dependencies(&self, krate: Crate) -> Vec<Crate>;
     fn static_(&self, id: StaticId) -> Option<intern::Symbol>;
     /// What rustc's copy under `symbol`, which [`Self::static_`] named, is to ours, when
     /// that is not simply the whole static.
@@ -1404,7 +1407,7 @@ impl OwnStatics {
         // With on-demand roots the build is of a program whose `main` is in `crates`, and only
         // what that depends on is linked. Without, anything may be linked on top.
         let program: FxHashSet<Crate> = if is_program {
-            linked_crates(db, crates.iter().copied())
+            linked_crates(db, symbols, crates.iter().copied())
         } else {
             // alloc: once per build, the crates that may be linked
             base_db::all_crates(db).iter().copied().collect()
@@ -3095,7 +3098,13 @@ fn in_source(db: &Db, id: InFile<span::ErasedFileAstId>) -> bool {
 #[salsa::tracked(returns(ref))]
 fn compiled_root<'db>(db: &'db Db, func: FunctionId) -> Result<CompiledFunction> {
     let _timer = watch::Timer::of(|| watch::Timed::Root(func));
-    let _span = tracing::info_span!(target: "blaze", "compiled_root").entered();
+    // Its name reads what its symbol does, which the compile reads anyway.
+    // alloc: the span's name, made only when the profile records it
+    let name = || {
+        hir_ty_mir::mir::type_name::rustc_function_name(db, func, &[])
+            .unwrap_or_else(|| FunctionSignature::of(db, func).name.as_str().to_owned())
+    };
+    let _span = tracing::info_span!(target: "blaze", "compiled_root", subject = %name()).entered();
     counted::compiles(func.krate(db));
     let _flight = flight::Flight::root(db, func);
     {
@@ -3266,12 +3275,30 @@ fn root_code(db: &Db, func: FunctionId, tier: bool) -> Result<Produced> {
     })
 }
 
-/// The crates of a program of `crates`: what they depend on, but not through a proc macro,
-/// which is a library of the compiler's.
+/// The crates of a program of `crates`: what they name ([`SymbolResolver::named_dependencies`]),
+/// and what that names in turn, but not through a proc macro, which is a library of the
+/// compiler's.
 fn linked_crates(
     db: &Db,
+    symbols: &dyn SymbolResolver,
     crates: impl IntoIterator<Item = Crate>,
 ) -> FxHashSet<Crate> {
+    let mut linked = FxHashSet::default();
+    // alloc: once per program linked, setup
+    let mut stack: Vec<Crate> = crates.into_iter().collect();
+    while let Some(krate) = stack.pop() {
+        if linked.insert(krate) {
+            let deps = symbols.named_dependencies(krate);
+            stack.extend(deps.into_iter().filter(|it| !it.data(db).target_kind.is_proc_macro()));
+        }
+    }
+    linked
+}
+
+/// The crates of a program of `crates` as the v2 units list them: everything they depend on,
+/// but not through a proc macro. That is more than [`linked_crates`], which rustc links, until
+/// the units have [`SymbolResolver::named_dependencies`] to ask.
+fn depended_crates(db: &Db, crates: impl IntoIterator<Item = Crate>) -> FxHashSet<Crate> {
     let mut linked = FxHashSet::default();
     // alloc: once per program linked, setup
     let mut stack: Vec<Crate> = crates.into_iter().collect();
@@ -3303,7 +3330,10 @@ fn compiled_instance<'db>(
     env: StoredParamEnvAndCrate,
 ) -> Result<CompiledFunction> {
     let _timer = watch::Timer::of(|| watch::Timed::instance(&instance, &env));
-    let _span = tracing::info_span!(target: "blaze", "compiled_instance").entered();
+    // Its name reads what its symbol does, which the compile reads anyway.
+    let _span = tracing::info_span!(target: "blaze", "compiled_instance",
+        subject = %backtrace_name(db, &instance))
+    .entered();
     counted::compiles(env.krate);
     let _flight = flight::Flight::instance(db, &instance, &env);
     tier::for_build(|| instance_code(db, instance, env, Detach::No, None)).map(Produced::code)
@@ -5610,6 +5640,7 @@ fn emit_with(
     {
         isa = &**target_of(features, Isa::FramePointer, speed)?;
     }
+    backend::time_passes();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match store {
             Some(store) => ctx
@@ -5619,7 +5650,6 @@ fn emit_with(
         }
         // alloc: the error's message
         .map_err(|e| format!("{:?}", e.inner))?;
-        backend::Tally::global().passes();
         let Some(compiled) = ctx.compiled_code() else {
             // alloc: the error's message
             return Err("no compiled code".to_owned());
@@ -5728,7 +5758,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         base: Option<&'a patch::Base>,
         hydrate: bool,
     ) -> Result<Self> {
-        let start = stdx::time::Instant::now();
+        let span = tracing::info_span!(target: "blaze", "setup module").entered();
         // clone: once per object, the module owns its target
         let isa = target()?.clone();
         // A program's own link takes out what nothing reaches section by section, as of
@@ -5744,7 +5774,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         builder.per_function_section(sections).per_data_object_section(data_sections);
         let mut module = ObjectModule::new(builder);
         let unwind = UnwindContext::new(&mut module).map_err(CodegenError::Backend)?;
-        let built = start.elapsed();
+        drop(span);
+        let span = tracing::info_span!(target: "blaze", "setup debug").entered();
         // A patch is added to a program that is linked already, and is read with it.
         let apart = symbols.debug_apart().filter(|_| base.is_none());
         let elf = module.isa().triple().binary_format == target_lexicon::BinaryFormat::Elf;
@@ -5759,9 +5790,10 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             .map(|context| debuginfo::Describer::new(context, elf))
         });
         let debugged = cached::Told::of(debug.is_some(), symbols.describes_variables());
-        let described = start.elapsed();
-        let mixed = settled::Mixed::of(db, symbols, &own_statics.crates);
-        let mixed_at = start.elapsed();
+        drop(span);
+        let mixed = tracing::info_span!(target: "blaze", "setup mixed")
+            .in_scope(|| settled::Mixed::of(db, symbols, &own_statics.crates));
+        let span = tracing::info_span!(target: "blaze", "setup settled").entered();
         // Without an identity for such a program, nothing of it is kept or found.
         let program = mixed.as_ref().map(|it| it.key);
         let store = store::Store::global().filter(|_| program != Some(None));
@@ -5771,7 +5803,8 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         if let Some(store) = store.filter(|_| base.is_none()) {
             store.settled();
         }
-        let settled_at = start.elapsed();
+        drop(span);
+        let _span = tracing::info_span!(target: "blaze", "setup names").entered();
         // A patch names what its base has from the store as the base did, to call it there.
         let names = match base.and_then(|it| it.frozen_ids()) {
             // clone: once per object, the names own their crates
@@ -5780,17 +5813,6 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             // clone: once per object, the names own their crates
             None => stable::StableNames::new(db, symbols, own_statics.crates.clone(), hydrate),
         };
-        if std::env::var_os("BLAZE_STATS").is_some() {
-            let us = |it: std::time::Duration| it.as_micros();
-            eprintln!(
-                "setup-us: module={} debug={} mixed={} settled={} names={}",
-                us(built),
-                us(described - built),
-                us(mixed_at - described),
-                us(settled_at - mixed_at),
-                us(start.elapsed() - settled_at),
-            );
-        }
         Ok(ObjectCodegen {
             db,
             symbols,
@@ -6184,7 +6206,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             return;
         }
         let roots = &roots[..];
-        let start = stdx::time::Instant::now();
+        let _span = tracing::info_span!(target: "blaze", "find stored roots").entered();
         let owned = &self.own_statics.crates;
         let next = std::sync::atomic::AtomicUsize::new(0);
         let named = std::sync::Mutex::new(Vec::with_capacity(roots.len()));
@@ -6233,7 +6255,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
             self.stored_roots.insert(func, whole.then(|| name.clone()));
         }
         if std::env::var_os("BLAZE_STATS").is_some() {
-            eprintln!("stored roots: {stored} of {} in {:.1?}", roots.len(), start.elapsed());
+            eprintln!("stored roots: {stored} of {}", roots.len());
         }
     }
 
@@ -6259,7 +6281,7 @@ impl<'a, 'db> ObjectCodegen<'a, 'db> {
         let Some(boxed) = DbInterner::new_with(db, krate).lang_items().OwnedBox else {
             return Ok(());
         };
-        let program = linked_crates(db, self.own_statics.crates.iter().copied());
+        let program = linked_crates(db, self.symbols, self.own_statics.crates.iter().copied());
         if !program.contains(&boxed.krate(db)) {
             return Ok(());
         }

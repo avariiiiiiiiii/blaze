@@ -513,6 +513,10 @@ impl Names<'_> {
 }
 
 impl SymbolResolver for Names<'_> {
+    fn named_dependencies(&self, krate: base_db::Crate) -> Vec<base_db::Crate> {
+        let named = hir::named_dependencies(self.db, krate.into());
+        named.into_iter().map(|it| it.into()).collect()
+    }
     fn function(&self, func: FunctionId) -> Option<Symbol> {
         if let Some(symbol) = exported_symbol(self.db, func) {
             return Some(Symbol::intern(&symbol)); // alloc: wasm, per name

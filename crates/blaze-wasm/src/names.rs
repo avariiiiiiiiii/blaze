@@ -72,6 +72,10 @@ impl Resolver<'_> {
 }
 
 impl SymbolResolver for Resolver<'_> {
+    fn named_dependencies(&self, krate: base_db::Crate) -> Vec<base_db::Crate> {
+        let named = hir::named_dependencies(self.db, krate.into());
+        named.into_iter().map(|it| it.into()).collect()
+    }
     fn source_path(&self, file: FileId) -> Option<Symbol> {
         let root = self.db.file_source_root(file).source_root_id(self.db);
         let root = self.db.source_root(root).source_root(self.db);

@@ -68,6 +68,7 @@ blaze-manifest.workspace = true
 blaze-metadata.workspace = true
 blaze-new.workspace = true
 blaze-global.workspace = true
+blaze-profile.workspace = true
 blaze-graph.workspace = true
 blaze-history.workspace = true
 blaze-inproc.workspace = true

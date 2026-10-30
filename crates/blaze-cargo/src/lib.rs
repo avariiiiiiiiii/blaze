@@ -45,7 +45,7 @@ pub mod socket;
 pub mod stub;
 pub mod symbols;
 pub mod toolchain;
-pub mod trace;
+pub use blaze_profile as trace;
 pub mod unstable;
 pub mod weaken;
 

@@ -95,6 +95,8 @@ HARNESSES = [
     ("core", ["coldbuild.py", "statics"], {}, on("macos"), None),
     # std's own writable statics (`thread_local!`s, `MIN`), from a unit built on another machine (#840).
     ("core", ["stdstatics.py"], {}, on("linux", "macos"), 2),
+    # A dependency no code names is not linked, its constructors with it, as rustc does not load it.
+    ("core", ["unnamedcrates.py"], {}, on("linux", "macos"), None),
     ("core", ["splices.py"], {}, EVERYWHERE, 2),
     ("core", ["live_e2e.py"], {}, on("linux-x86_64"), 1),
     # A type added beside another, the code moved to it and the old one deleted, each a patch.
@@ -162,6 +164,8 @@ HARNESSES = [
     ("store", ["storefull.py"], {}, on("linux", "windows"), 2),
     ("store", ["storeshared.py"], {}, EVERYWHERE, None),
     ("store", ["storeguards.py"], {}, on("linux"), None),
+    # A dependency's features and what its build script set and wrote, in the keys of its code.
+    ("store", ["depkeys.py", arg({})], {}, on("linux"), None),
     ("store", ["storetracked.py"], {}, on("linux", "macos"), 2),
     ("store", ["storebuilds.py"], {}, on("linux", "macos"), 2),
     # Typed JSON from the Python workspace: the harness job has to run ci.py under `uv run --frozen`.

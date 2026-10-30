@@ -27,6 +27,7 @@ mod attrs;
 mod body_analysis;
 mod from_id;
 mod match_lints;
+mod named;
 mod semantics;
 mod source_analyzer;
 
@@ -171,6 +172,7 @@ pub use crate::{
         ManualPartialEq, MatchLint, NonContiguousRangeEndpoints, OverlappingRangeEndpoints, PatternTypo, SpecialTy,
         UnreachablePattern,
     },
+    named::named_dependencies,
     semantics::{
         LintAttr, PathResolution, PathResolutionPerNs, SemanticsImpl, SemanticsScope,
         TypeInfo, VisibleTraits,

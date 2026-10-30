@@ -30,7 +30,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::sync::LazyLock;
 
-use crate::mem::{self, FVec};
+use crate::mem::FVec;
 use base_db::Db;
 use blaze_mem::frame::Frame;
 use hir_def::{

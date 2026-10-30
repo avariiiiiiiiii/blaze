@@ -32,7 +32,7 @@ pub(crate) fn hoist(info: IntInfo, x: MaybeInfiniteInt) -> Bound {
     match x {
         MaybeInfiniteInt::NegInfinity => Bound::NegInfinity,
         MaybeInfiniteInt::PosInfinity => Bound::PosInfinity,
-        MaybeInfiniteInt::Finite(_) => {
+        MaybeInfiniteInt::Finite { .. } => {
             let bits = if info.signed {
                 x.as_finite_int(info.bits).unwrap_or(0)
             } else {

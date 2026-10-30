@@ -3767,13 +3767,13 @@ impl<'db, M: Machine<'db>> Evaluator<'db, M> {
             });
         };
         if !M::CHECKS {
-            bytes.extend(metadata.get(self)?);
+            bytes.extend(metadata.get(self)?.iter().copied());
             return Ok(IntervalOrOwned::Owned(bytes));
         }
         let mut shadow = M::Shadow::pointer(bytes.len(), self.ptr(to).prov);
         let at = bytes.len();
         let (meta, meta_shadow) = self.value_shadowed(metadata)?;
-        bytes.extend(meta);
+        bytes.extend(meta.iter().copied());
         shadow.put(at, &meta_shadow);
         Ok(IntervalOrOwned::Shadowed(bytes, shadow))
     }

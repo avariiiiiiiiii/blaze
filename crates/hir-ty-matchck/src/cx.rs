@@ -185,7 +185,7 @@ impl<'a, 'db> Cx<'a, 'db> {
         self.int_info(ty).is_some_and(|info| {
             info.ptr_sized
                 && (crate::print::hoist(info, range.lo) == crate::print::Bound::PosInfinity
-                    || matches!(range.hi, MaybeInfiniteInt::Finite(0)))
+                    || matches!(range.hi, MaybeInfiniteInt::Finite { 0: 0, .. }))
         })
     }
 

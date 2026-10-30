@@ -82,7 +82,7 @@ fn inliner_callees<'db>(
 
 /// What [`walk`] found of the bodies it keeps.
 #[derive(Debug, PartialEq, Eq)]
-pub(super) struct Walked<B> {
+pub(super) struct Walked<B: Eq + Hash> {
     /// rustc's `mir_callgraph_cyclic`: the bodies a path back to the root goes through.
     pub(super) cyclic: FxHashSet<B>,
     /// The bodies the walk followed.

@@ -5194,7 +5194,7 @@ impl<'db> Type<'db> {
         args: &[Type<'db>],
     ) -> bool {
         let env = ParamEnvAndCrate { param_env: ParamEnv::empty(), krate: self.krate(db) };
-        traits::implements_trait_unique_with_infcx(db, env, trait_.id, &mut |infcx| {
+        traits::implements_trait_unique_with_infcx(db, env, trait_.id, |infcx| {
             let mut args = Self::instantiate_many_with_infer(iter::once(self).chain(args), infcx);
             GenericArgs::for_item(infcx.interner, trait_.id.into(), |_, param, _, _| {
                 if let GenericParamId::TypeParamId(_) = param
@@ -5211,7 +5211,7 @@ impl<'db> Type<'db> {
     /// Whether the two types unify with each one's generic parameters as inference variables,
     /// whatever owns them: `[u8]` and an impl's `[T]` do, `[u8]` and `[MaybeUninit<T>]` do not.
     pub fn unifies_with_any_params(&self, db: &'db Db, other: &Type<'db>) -> bool {
-        traits::could_unify_with_infcx(db, self.krate(db), &mut |infcx| {
+        traits::could_unify_with_infcx(db, self.krate(db), |infcx| {
             let a = Self::instantiate_many_with_infer([self], infcx).next().unwrap();
             let b = Self::instantiate_many_with_infer([other], infcx).next().unwrap();
             (a, b)
@@ -5224,7 +5224,7 @@ impl<'db> Type<'db> {
     /// may reach an impl the type's own crate cannot see.
     pub fn may_have_impl(&self, db: &'db Db, impl_: Impl, krate: Crate) -> bool {
         let Ok(id) = ImplId::try_from(impl_) else { return false };
-        traits::impl_may_apply(db, krate.id, id, &mut |infcx| {
+        traits::impl_may_apply(db, krate.id, id, |infcx| {
             Self::instantiate_many_with_infer([self], infcx).next().unwrap()
         })
     }

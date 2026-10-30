@@ -274,7 +274,7 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
     }
     let mut table = table::build(&entries)?;
     let fail = |what: std::fmt::Arguments<'_>| Err(PremapError::of(format_args!("the prelink of the dependency image {what}")));
-    let placed = |table: &Vec<u8>, id: &SymbolId| TableView::trusted(table).get(id).is_some();
+    let in_table = |table: &Vec<u8>, id: &SymbolId| TableView::trusted(table).get(id).is_some();
 
     if request.function_digests.len() != request.link.functions.len()
         || request.static_digests.len() != request.link.statics.len()
@@ -287,7 +287,7 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
     let mut contents = Vec::with_capacity(request.link.functions.len() + request.link.statics.len());
     for (function, digest) in request.link.functions.iter().zip(request.function_digests) {
         let id = SymbolId::function(&function.key);
-        if !placed(&table, &id) {
+        if !in_table(&table, &id) {
             return fail(format_args!("placed no {:?}", function.key));
         }
         contents.push(*digest);
@@ -296,7 +296,7 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
     let mut statics = Vec::with_capacity(request.link.statics.len());
     for (value, definition) in request.link.statics.iter().zip(request.static_digests) {
         let id = SymbolId::of_static(&value.item, &value.instance);
-        if !placed(&table, &id) {
+        if !in_table(&table, &id) {
             return fail(format_args!("placed no static {:?}", value.item));
         }
         contents.push(*definition);
@@ -305,7 +305,7 @@ pub fn build(linker: &impl Prelink, request: &Request<'_>, key: ImageKey) -> Res
     }
     statics.sort_unstable_by_key(|it| it.0);
     for (name, _) in request.link.names {
-        if !placed(&table, &SymbolId::name(name)) {
+        if !in_table(&table, &SymbolId::name(name)) {
             return fail(format_args!("defined no `{name}`"));
         }
     }
